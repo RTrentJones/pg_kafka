@@ -1,0 +1,61 @@
+{
+  "name": "pg_kafka Development Container",
+  "dockerComposeFile": "../docker-compose.yml",
+  "service": "pg_kafka_dev",
+  "workspaceFolder": "/home/postgres/workspace",
+
+  // Run as the postgres user (non-root)
+  "remoteUser": "postgres",
+
+  // Features to install in the container
+  "features": {
+    "ghcr.io/devcontainers/features/git:1": {
+      "version": "latest"
+    }
+  },
+
+  // VS Code extensions to install
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "vadimcn.vscode-lldb",
+        "serayuzgur.crates",
+        "tamasfe.even-better-toml",
+        "usernamehw.errorlens",
+        "ms-vscode.makefile-tools"
+      ],
+      "settings": {
+        "rust-analyzer.cargo.features": ["pg14"],
+        "rust-analyzer.checkOnSave.command": "clippy",
+        "rust-analyzer.checkOnSave.allTargets": false,
+        "rust-analyzer.check.extraArgs": ["--features", "pg14"],
+        "terminal.integrated.defaultProfile.linux": "bash",
+        "files.watcherExclude": {
+          "**/target/**": true
+        }
+      }
+    }
+  },
+
+  // Ports to forward
+  "forwardPorts": [5432, 9092],
+  "portsAttributes": {
+    "5432": {
+      "label": "PostgreSQL",
+      "onAutoForward": "notify"
+    },
+    "9092": {
+      "label": "Kafka Protocol",
+      "onAutoForward": "notify"
+    }
+  },
+
+  // Post-create commands
+  "postCreateCommand": "rustup update && cargo pgrx init --pg14 download",
+
+  // Environment variables
+  "remoteEnv": {
+    "RUST_LOG": "info"
+  }
+}

@@ -1,0 +1,6 @@
+comment = 'pg_kafka:  Created by pgrx'
+default_version = '@CARGO_VERSION@'
+module_pathname = '$libdir/pg_kafka'
+relocatable = false
+superuser = true
+trusted = false

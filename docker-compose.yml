@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  pg_kafka_dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: pg_kafka_dev
+    volumes:
+      # Mount your current directory (code) into the container
+      - .:/home/postgres/workspace
+
+      # Persist the Cargo cache so re-builds are fast
+      - cargo_cache:/home/postgres/.cargo/registry
+      - target_cache:/home/postgres/workspace/target
+    ports:
+      - "5432:5432"  # Access Postgres from host
+      - "9092:9092"  # Access Kafka Protocol from host
+    environment:
+      - RUST_LOG=info
+    # Security tweak to allow gdb/perf if you need to debug crashes
+    cap_add:
+      - SYS_PTRACE
+    security_opt:
+      - seccomp:unconfined
+
+volumes:
+  cargo_cache:
+  target_cache:
