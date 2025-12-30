@@ -2,7 +2,9 @@ use pgrx::prelude::*;
 use pgrx::bgworkers::BackgroundWorkerBuilder;
 
 // Module declarations for our extension components
-mod worker;  // Background worker implementation
+mod worker;    // Background worker implementation
+mod listener;  // TCP listener for Kafka protocol
+mod config;    // Configuration (GUC parameters)
 
 ::pgrx::pg_module_magic!();
 
@@ -21,6 +23,9 @@ mod worker;  // Background worker implementation
 #[pg_guard]
 pub unsafe extern "C" fn _PG_init() {
     use pgrx::bgworkers::BgWorkerStartTime;
+
+    // Initialize GUC configuration parameters
+    config::init();
 
     // Register the pg_kafka background worker with PostgreSQL.
     //
