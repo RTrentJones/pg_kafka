@@ -3,7 +3,6 @@
 // This module defines GUC (Grand Unified Configuration) parameters that can be
 // set in postgresql.conf or via ALTER SYSTEM/SET commands.
 
-use pgrx::prelude::*;
 use pgrx::{GucContext, GucFlags, GucRegistry, GucSetting};
 use std::ffi::CStr;
 

@@ -2,9 +2,9 @@ use pgrx::prelude::*;
 use pgrx::bgworkers::BackgroundWorkerBuilder;
 
 // Module declarations for our extension components
-mod worker;    // Background worker implementation
-mod listener;  // TCP listener for Kafka protocol
 mod config;    // Configuration (GUC parameters)
+mod kafka;     // Kafka protocol implementation (listener, protocol, messages)
+mod worker;    // Background worker implementation
 
 ::pgrx::pg_module_magic!();
 

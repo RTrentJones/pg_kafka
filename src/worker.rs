@@ -61,40 +61,100 @@ pub extern "C" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
 
     // Spawn the listener task on the LocalSet
     let listener_handle = local_set.spawn_local(async move {
-        if let Err(e) = crate::listener::run(shutdown_rx, &host, port, log_connections).await {
+        if let Err(e) = crate::kafka::run_listener(shutdown_rx, &host, port, log_connections).await {
             pgrx::error!("TCP listener error: {}", e);
         }
     });
 
-    // Step 7: Main event loop - alternates between driving async runtime and checking signals
-    // This approach cleanly separates blocking signal checks from async execution
+    // Step 7: Get the request queue receiver
+    // This is how we receive Kafka requests from the async tokio tasks
+    let request_rx = crate::kafka::request_receiver();
+
+    // Step 8: Main event loop
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // MAIN EVENT LOOP: The Heart of the Async/Sync Architecture
+    // ═══════════════════════════════════════════════════════════════════════════════
+    //
+    // This loop serves THREE critical functions:
+    //
+    // 1. PROCESS DATABASE REQUESTS (Sync World)
+    //    - Receive Kafka requests from the queue
+    //    - Execute blocking database operations via Postgres SPI
+    //    - Send responses back to async tasks
+    //    - WHY HERE: SPI can ONLY be called from the main thread in sync context
+    //
+    // 2. DRIVE ASYNC NETWORK I/O (Async World)
+    //    - Run tokio tasks that handle TCP connections
+    //    - Parse Kafka binary protocol from sockets
+    //    - Accept new client connections
+    //    - WHY SEPARATE: Async I/O is non-blocking and handles thousands of connections
+    //
+    // 3. CHECK FOR SHUTDOWN SIGNALS (Postgres Integration)
+    //    - Poll for SIGTERM from Postgres
+    //    - Ensure graceful shutdown on server stop
+    //    - WHY POLLING: pgrx requires regular latch checks for signal handling
+    //
+    // The TIMING is carefully balanced:
+    // - 100ms for async I/O: Long enough to batch network operations efficiently
+    // - 1ms for signal check: Short enough for responsive shutdown
+    // - Non-blocking queue check: No delay for processing database requests
+    //
+    // This architecture solves the fundamental incompatibility:
+    // - Tokio wants async functions (network I/O benefits from non-blocking)
+    // - Postgres SPI wants sync functions on main thread (database safety)
+    // - The queue bridges these worlds cleanly
+    // ═══════════════════════════════════════════════════════════════════════════════
+
     loop {
-        // Drive the async runtime forward for 100ms
-        // This processes TCP connections, accepts new clients, etc.
+        // ┌─────────────────────────────────────────────────────────────┐
+        // │ PART 1: Process Database Requests (SYNC, Blocking)         │
+        // └─────────────────────────────────────────────────────────────┘
+        // Process all pending requests without blocking.
+        // In Phase 2, this is where SPI INSERT/SELECT calls will happen.
+        // RIGHT NOW: Just hardcoded responses (no database yet).
+        // FUTURE: Spi::execute("INSERT INTO kafka.messages ...").
+        while let Ok(request) = request_rx.try_recv() {
+            process_request(request);
+        }
+
+        // ┌─────────────────────────────────────────────────────────────┐
+        // │ PART 2: Drive Async Network I/O (ASYNC, Non-blocking)      │
+        // └─────────────────────────────────────────────────────────────┘
+        // block_on() is NOT a mistake here. We're running a sync loop
+        // that periodically executes async code for 100ms.
+        // This drives the LocalSet forward, processing:
+        // - TCP accept() calls
+        // - Socket read()/write() calls
+        // - Kafka protocol parsing
+        // Then we return to sync context to process database requests.
         runtime.block_on(async {
-            // Run all pending tasks on LocalSet for a short duration
             tokio::select! {
+                // Timeout after 100ms to return to sync processing
                 _ = tokio::time::sleep(core::time::Duration::from_millis(100)) => {
-                    // Timeout reached, return to signal checking
+                    // Normal path: timeout reached, go check for database requests
                 }
+                // Fallback: If listener exits (shouldn't happen during normal operation)
                 _ = local_set.run_until(async {
-                    // This drives the LocalSet, but we'll timeout after 100ms
                     std::future::pending::<()>().await
                 }) => {
-                    // LocalSet completed (shouldn't happen unless listener exits)
+                    // LocalSet completed - listener task finished unexpectedly
                 }
             }
         });
 
-        // Step 8: Check for shutdown signal (blocking, but brief)
-        // This is the sync boundary - we're outside async context here
+        // ┌─────────────────────────────────────────────────────────────┐
+        // │ PART 3: Check for Shutdown Signal (POSTGRES Integration)   │
+        // └─────────────────────────────────────────────────────────────┘
+        // wait_latch(1ms) returns false when Postgres sends SIGTERM.
+        // This is the SYNC boundary - we're fully outside async context.
+        // CRITICAL: This must be polled regularly for graceful shutdown.
         if !BackgroundWorker::wait_latch(Some(core::time::Duration::from_millis(1))) {
             log!("pg_kafka background worker shutting down");
 
             // Signal the async listener to stop
             let _ = shutdown_tx.send(true);
 
-            // Step 9: Graceful shutdown - wait for listener to finish
+            // Step 10: Graceful shutdown - wait for listener to finish
             runtime.block_on(async {
                 // Give the listener configured timeout to shut down cleanly
                 // We need to drive the LocalSet to completion for the listener to actually finish
@@ -117,6 +177,62 @@ pub extern "C" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
             });
 
             break;
+        }
+    }
+}
+
+/// Process a Kafka request and send the response
+///
+/// In Step 3, we only handle ApiVersions requests with hardcoded responses.
+/// In Step 4, we'll add Metadata support.
+/// In Phase 2, we'll add SPI calls for database operations.
+fn process_request(request: crate::kafka::KafkaRequest) {
+    use crate::kafka::messages::{ApiVersion, KafkaResponse};
+
+    pgrx::log!("process_request() called!");
+
+    match request {
+        crate::kafka::KafkaRequest::ApiVersions {
+            correlation_id,
+            client_id,
+            response_tx,
+        } => {
+            pgrx::log!("Processing ApiVersions request, correlation_id: {}", correlation_id);
+            // Log the request if helpful for debugging
+            if let Some(id) = client_id {
+                pgrx::log!("ApiVersions request from client: {}", id);
+            }
+
+            // Build hardcoded ApiVersions response
+            // We claim to support:
+            // - ApiVersions (api_key 18): versions 0-3
+            // - Metadata (api_key 3): versions 0-9 (for Step 4)
+            let api_versions = vec![
+                ApiVersion {
+                    api_key: 18, // ApiVersions
+                    min_version: 0,
+                    max_version: 3,
+                },
+                ApiVersion {
+                    api_key: 3, // Metadata (we'll implement in Step 4)
+                    min_version: 0,
+                    max_version: 9,
+                },
+            ];
+
+            pgrx::log!("Building ApiVersions response with {} API versions", api_versions.len());
+
+            let response = KafkaResponse::ApiVersions {
+                correlation_id,
+                api_versions,
+            };
+
+            // Send response back to the async task via the connection-specific channel
+            if let Err(e) = response_tx.send(response) {
+                pgrx::warning!("Failed to send ApiVersions response: {}", e);
+            } else {
+                pgrx::log!("ApiVersions response sent successfully to async task");
+            }
         }
     }
 }
