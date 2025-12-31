@@ -152,10 +152,28 @@ pub struct PartitionMetadata {
 }
 
 // Global request queue: async tasks → main thread
-// We use unbounded channels because:
-// 1. Kafka clients can pipeline many requests
-// 2. Backpressure is handled at TCP level (flow control)
-// 3. We don't want to block async tasks on queue capacity
+//
+// WHY CROSSBEAM INSTEAD OF TOKIO CHANNELS?
+// =========================================
+//
+// We use crossbeam_channel instead of tokio::sync::mpsc because:
+//
+// 1. SYNC/ASYNC BOUNDARY:
+//    - The main worker thread is SYNC (cannot use .await)
+//    - Tokio channels require async context for recv()
+//    - Crossbeam provides sync try_recv() that works in sync code
+//
+// 2. ARCHITECTURE:
+//    - Async tokio tasks send requests via Sender (works from async)
+//    - Sync main thread receives via try_recv() (works from sync)
+//    - This is the bridge between the async network I/O and sync SPI
+//
+// 3. UNBOUNDED QUEUE:
+//    - Kafka clients can pipeline many requests
+//    - Backpressure is handled at TCP level (flow control)
+//    - We don't want to block async tasks on queue capacity
+//
+// See src/worker.rs:120 for the sync recv side: `while let Ok(req) = request_rx.try_recv()`
 static REQUEST_QUEUE: Lazy<(Sender<KafkaRequest>, Receiver<KafkaRequest>)> =
     Lazy::new(|| unbounded());
 

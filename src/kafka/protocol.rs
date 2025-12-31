@@ -16,6 +16,8 @@ use kafka_protocol::protocol::Encodable;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+use super::constants::*;
+use super::error::{KafkaError, Result};
 use super::messages::{KafkaRequest, KafkaResponse};
 
 /// Parse a Kafka request from a TCP socket
@@ -35,7 +37,7 @@ use super::messages::{KafkaRequest, KafkaResponse};
 pub async fn parse_request(
     socket: &mut TcpStream,
     response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
-) -> Result<Option<KafkaRequest>, Box<dyn std::error::Error>> {
+) -> Result<Option<KafkaRequest>> {
     // Step 1: Read the 4-byte size header (big-endian)
     pgrx::log!("Waiting to read size header...");
     let mut size_buf = [0u8; 4];
@@ -48,16 +50,15 @@ pub async fn parse_request(
         }
         Err(e) => {
             pgrx::warning!("Error reading size header: {}", e);
-            return Err(Box::new(e));
+            return Err(e.into());
         }
     }
 
     let size = i32::from_be_bytes(size_buf);
     pgrx::log!("Received request of size: {} bytes (size_buf: {:?})", size, size_buf);
 
-    if size <= 0 || size > 100_000_000 {
-        // 100MB limit to prevent DOS
-        return Err(format!("Invalid request size: {}", size).into());
+    if size <= 0 || size > MAX_REQUEST_SIZE {
+        return Err(KafkaError::InvalidRequestSize(size));
     }
 
     // Step 2: Read the request payload (header + body)
@@ -71,7 +72,10 @@ pub async fn parse_request(
     // Read api_key and api_version first to know which API this is
     pgrx::log!("Buffer remaining before parsing: {} bytes", payload_buf.remaining());
     if payload_buf.remaining() < 4 {
-        return Err(format!("Request too short to contain api_key and api_version (only {} bytes remaining)", payload_buf.remaining()).into());
+        return Err(KafkaError::RequestTooShort {
+            expected: 4,
+            actual: payload_buf.remaining(),
+        });
     }
     let api_key = payload_buf.get_i16();
     let _api_version = payload_buf.get_i16();
@@ -79,7 +83,10 @@ pub async fn parse_request(
     // Parse the rest of the RequestHeader (correlation_id + client_id)
     // For simplicity, we'll manually parse instead of using RequestHeader::decode
     if payload_buf.remaining() < 4 {
-        return Err("Request too short to contain correlation_id".into());
+        return Err(KafkaError::RequestTooShort {
+            expected: 4,
+            actual: payload_buf.remaining(),
+        });
     }
     let correlation_id = payload_buf.get_i32();
 
@@ -89,21 +96,21 @@ pub async fn parse_request(
 
     // Step 4: Match on api_key to determine request type
     match api_key {
-        18 => {
+        API_KEY_API_VERSIONS => {
             // ApiVersions request
             // The body is empty for ApiVersions, so we don't need to parse it
-            pgrx::log!("Parsed ApiVersions request (api_key=18)");
+            pgrx::log!("Parsed ApiVersions request (api_key={})", API_KEY_API_VERSIONS);
             Ok(Some(KafkaRequest::ApiVersions {
                 correlation_id,
                 client_id,
                 response_tx,
             }))
         }
-        3 => {
+        API_KEY_METADATA => {
             // Metadata request
             // For now, we'll parse the basic structure but accept any topic list
             // In Phase 2, we'll actually query the database for topic metadata
-            pgrx::log!("Parsed Metadata request (api_key=3, version={})", _api_version);
+            pgrx::log!("Parsed Metadata request (api_key={}, version={})", API_KEY_METADATA, _api_version);
 
             // Parse the rest of the request body to extract topic names
             // For Step 4, we'll just use a simplified approach and ignore the topic list
@@ -125,7 +132,7 @@ pub async fn parse_request(
             // Send error response immediately
             let error_response = KafkaResponse::Error {
                 correlation_id,
-                error_code: 35, // UNSUPPORTED_VERSION
+                error_code: ERROR_UNSUPPORTED_VERSION,
                 error_message: Some(format!("Unsupported API key: {}", api_key)),
             };
             let _ = response_tx.send(error_response);
@@ -144,7 +151,7 @@ pub async fn parse_request(
 pub async fn send_response(
     socket: &mut TcpStream,
     response: KafkaResponse,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<()> {
     let mut response_buf = BytesMut::new();
 
     match response {

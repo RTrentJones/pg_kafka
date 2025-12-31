@@ -5,8 +5,14 @@
 //
 // pgrx 0.16+ uses declarative macros for GUC definitions
 
-use pgrx::prelude::*;
 use pgrx::{GucContext, GucFlags, GucRegistry, GucSetting};
+
+use crate::kafka::constants::{
+    DEFAULT_HOST, DEFAULT_KAFKA_PORT, DEFAULT_SHUTDOWN_TIMEOUT_MS, MIN_SHUTDOWN_TIMEOUT_MS,
+};
+
+#[cfg(test)]
+use crate::kafka::constants::TEST_HOST;
 
 /// Configuration struct holding all pg_kafka settings
 pub struct Config {
@@ -18,6 +24,7 @@ pub struct Config {
 
 impl Config {
     /// Load configuration from GUC parameters
+    #[cfg(not(test))]
     pub fn load() -> Self {
         Config {
             port: PORT.get(),
@@ -25,9 +32,20 @@ impl Config {
                 .get()
                 .as_deref()
                 .map(|c| c.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "0.0.0.0".to_string()),
+                .unwrap_or_else(|| DEFAULT_HOST.to_string()),
             log_connections: LOG_CONNECTIONS.get(),
             shutdown_timeout_ms: SHUTDOWN_TIMEOUT_MS.get(),
+        }
+    }
+
+    /// Test-only version that returns defaults without accessing GUC
+    #[cfg(test)]
+    pub fn load() -> Self {
+        Config {
+            port: DEFAULT_KAFKA_PORT,
+            host: TEST_HOST.to_string(),
+            log_connections: false,
+            shutdown_timeout_ms: DEFAULT_SHUTDOWN_TIMEOUT_MS,
         }
     }
 }
@@ -35,10 +53,10 @@ impl Config {
 // GUC parameter definitions
 use std::ffi::CString;
 
-static PORT: GucSetting<i32> = GucSetting::<i32>::new(9092);
+static PORT: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_KAFKA_PORT);
 static HOST: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 static LOG_CONNECTIONS: GucSetting<bool> = GucSetting::<bool>::new(false);
-static SHUTDOWN_TIMEOUT_MS: GucSetting<i32> = GucSetting::<i32>::new(5000);
+static SHUTDOWN_TIMEOUT_MS: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_SHUTDOWN_TIMEOUT_MS);
 
 /// Initialize GUC parameters
 pub fn init() {
@@ -76,7 +94,7 @@ pub fn init() {
         c"Timeout for graceful shutdown in milliseconds",
         c"How long to wait for the TCP listener to shut down cleanly. Default: 5000ms.",
         &SHUTDOWN_TIMEOUT_MS,
-        100,
+        MIN_SHUTDOWN_TIMEOUT_MS,
         60000,
         GucContext::Suset,
         GucFlags::default(),

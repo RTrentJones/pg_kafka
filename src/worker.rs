@@ -7,6 +7,10 @@
 use pgrx::bgworkers::{BackgroundWorker, SignalWakeFlags};
 use pgrx::prelude::*;
 
+// Import conditional logging macros from lib.rs
+use crate::kafka::constants::*;
+use crate::{pg_log, pg_warning};
+
 /// Main entry point for the pg_kafka background worker.
 ///
 /// IMPORTANT: This function MUST follow pgrx background worker conventions:
@@ -186,12 +190,17 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
 /// In Step 3, we implemented ApiVersions.
 /// In Step 4, we're adding Metadata support with hardcoded topics.
 /// In Phase 2, we'll add SPI calls to query actual database tables.
-fn process_request(request: crate::kafka::KafkaRequest) {
+///
+/// # Testing
+/// This function is public to allow unit testing, but is not part of the
+/// public API and should not be called directly by external code.
+#[doc(hidden)]
+pub fn process_request(request: crate::kafka::KafkaRequest) {
     use crate::kafka::messages::{
         ApiVersion, BrokerMetadata, KafkaResponse, PartitionMetadata, TopicMetadata,
     };
 
-    pgrx::log!("process_request() called!");
+    pg_log!("process_request() called!");
 
     match request {
         crate::kafka::KafkaRequest::ApiVersions {
@@ -199,29 +208,29 @@ fn process_request(request: crate::kafka::KafkaRequest) {
             client_id,
             response_tx,
         } => {
-            pgrx::log!("Processing ApiVersions request, correlation_id: {}", correlation_id);
+            pg_log!("Processing ApiVersions request, correlation_id: {}", correlation_id);
             if let Some(id) = client_id {
-                pgrx::log!("ApiVersions request from client: {}", id);
+                pg_log!("ApiVersions request from client: {}", id);
             }
 
             // Build hardcoded ApiVersions response
             // We claim to support:
-            // - ApiVersions (api_key 18): versions 0-3
-            // - Metadata (api_key 3): versions 0-9
+            // - ApiVersions (API_KEY_API_VERSIONS): versions 0-3
+            // - Metadata (API_KEY_METADATA): versions 0-9
             let api_versions = vec![
                 ApiVersion {
-                    api_key: 18, // ApiVersions
+                    api_key: API_KEY_API_VERSIONS,
                     min_version: 0,
                     max_version: 3,
                 },
                 ApiVersion {
-                    api_key: 3, // Metadata
+                    api_key: API_KEY_METADATA,
                     min_version: 0,
                     max_version: 9,
                 },
             ];
 
-            pgrx::log!("Building ApiVersions response with {} API versions", api_versions.len());
+            pg_log!("Building ApiVersions response with {} API versions", api_versions.len());
 
             let response = KafkaResponse::ApiVersions {
                 correlation_id,
@@ -229,9 +238,9 @@ fn process_request(request: crate::kafka::KafkaRequest) {
             };
 
             if let Err(e) = response_tx.send(response) {
-                pgrx::warning!("Failed to send ApiVersions response: {}", e);
+                pg_warning!("Failed to send ApiVersions response: {}", e);
             } else {
-                pgrx::log!("ApiVersions response sent successfully to async task");
+                pg_log!("ApiVersions response sent successfully to async task");
             }
         }
         crate::kafka::KafkaRequest::Metadata {
@@ -240,9 +249,9 @@ fn process_request(request: crate::kafka::KafkaRequest) {
             topics: _requested_topics,
             response_tx,
         } => {
-            pgrx::log!("Processing Metadata request, correlation_id: {}", correlation_id);
+            pg_log!("Processing Metadata request, correlation_id: {}", correlation_id);
             if let Some(id) = client_id {
-                pgrx::log!("Metadata request from client: {}", id);
+                pg_log!("Metadata request from client: {}", id);
             }
 
             // Get configuration for our broker info
@@ -255,25 +264,25 @@ fn process_request(request: crate::kafka::KafkaRequest) {
             // - 1 broker (ourselves)
             // - 1 test topic with 1 partition
             let brokers = vec![BrokerMetadata {
-                node_id: 1,                    // We are broker 1
+                node_id: DEFAULT_BROKER_ID,
                 host: config.host.clone(),     // From GUC (default: 0.0.0.0)
                 port: config.port,             // From GUC (default: 9092)
                 rack: None,                    // No rack awareness in single-node setup
             }];
 
             let topics = vec![TopicMetadata {
-                error_code: 0, // No error
+                error_code: ERROR_NONE,
                 name: "test-topic".to_string(),
                 partitions: vec![PartitionMetadata {
-                    error_code: 0,      // No error
+                    error_code: ERROR_NONE,
                     partition_index: 0, // Partition 0 (first and only partition)
-                    leader_id: 1,       // Broker 1 (us) is the leader
-                    replica_nodes: vec![1], // Only broker 1 has the data
-                    isr_nodes: vec![1], // Broker 1 is in-sync (with itself)
+                    leader_id: DEFAULT_BROKER_ID,
+                    replica_nodes: vec![DEFAULT_BROKER_ID],
+                    isr_nodes: vec![DEFAULT_BROKER_ID],
                 }],
             }];
 
-            pgrx::log!(
+            pg_log!(
                 "Building Metadata response with {} brokers and {} topics",
                 brokers.len(),
                 topics.len()
@@ -286,10 +295,189 @@ fn process_request(request: crate::kafka::KafkaRequest) {
             };
 
             if let Err(e) = response_tx.send(response) {
-                pgrx::warning!("Failed to send Metadata response: {}", e);
+                pg_warning!("Failed to send Metadata response: {}", e);
             } else {
-                pgrx::log!("Metadata response sent successfully to async task");
+                pg_log!("Metadata response sent successfully to async task");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kafka::messages::KafkaResponse;
+    use crate::testing::helpers::*;
+
+    #[test]
+    fn test_api_versions_handler_success() {
+        // Test that ApiVersions request returns proper response
+        let (request, mut response_rx) =
+            mock_api_versions_request_with_client(42, "test-client".to_string());
+
+        // Process the request
+        process_request(request);
+
+        // Verify we got a response
+        let response = response_rx
+            .try_recv()
+            .expect("Should receive ApiVersions response");
+
+        // Verify it's an ApiVersions response
+        match response {
+            KafkaResponse::ApiVersions {
+                correlation_id,
+                api_versions,
+            } => {
+                assert_eq!(correlation_id, 42);
+                assert!(!api_versions.is_empty(), "Should have API versions");
+            }
+            _ => panic!("Expected ApiVersions response"),
+        }
+    }
+
+    #[test]
+    fn test_api_versions_handler_correlation_id() {
+        // Test that correlation_id is preserved
+        for test_correlation_id in [0, 1, 42, 999, i32::MAX] {
+            let (request, mut response_rx) = mock_api_versions_request(test_correlation_id);
+
+            process_request(request);
+
+            let response = response_rx.try_recv().expect("Should receive response");
+
+            match response {
+                KafkaResponse::ApiVersions {
+                    correlation_id, ..
+                } => {
+                    assert_eq!(
+                        correlation_id, test_correlation_id,
+                        "Correlation ID should be preserved"
+                    );
+                }
+                _ => panic!("Expected ApiVersions response"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_api_versions_handler_supported_versions() {
+        // Test that response includes correct API versions
+        let (request, mut response_rx) = mock_api_versions_request(1);
+
+        process_request(request);
+
+        let response = response_rx.try_recv().expect("Should receive response");
+
+        match response {
+            KafkaResponse::ApiVersions { api_versions, .. } => {
+                assert_eq!(api_versions.len(), 2, "Should support 2 APIs");
+
+                let api_versions_api = api_versions
+                    .iter()
+                    .find(|av| av.api_key == 18)
+                    .expect("Should support ApiVersions API");
+                assert_eq!(api_versions_api.min_version, 0);
+                assert_eq!(api_versions_api.max_version, 3);
+
+                let metadata_api = api_versions
+                    .iter()
+                    .find(|av| av.api_key == 3)
+                    .expect("Should support Metadata API");
+                assert_eq!(metadata_api.min_version, 0);
+                assert_eq!(metadata_api.max_version, 9);
+            }
+            _ => panic!("Expected ApiVersions response"),
+        }
+    }
+
+    #[test]
+    fn test_metadata_handler_all_topics() {
+        let (request, mut response_rx) = mock_metadata_request_with_client(99, "test-client".to_string(), None);
+
+        process_request(request);
+
+        let response = response_rx.try_recv().expect("Should receive response");
+
+        match response {
+            KafkaResponse::Metadata {
+                correlation_id,
+                brokers,
+                topics,
+            } => {
+                assert_eq!(correlation_id, 99);
+                assert!(!brokers.is_empty());
+                assert!(!topics.is_empty());
+
+                let test_topic = topics
+                    .iter()
+                    .find(|t| t.name == "test-topic")
+                    .expect("Should have test-topic");
+                assert_eq!(test_topic.error_code, ERROR_NONE);
+            }
+            _ => panic!("Expected Metadata response"),
+        }
+    }
+
+    #[test]
+    fn test_metadata_handler_broker_info() {
+        let (request, mut response_rx) = mock_metadata_request(101, None);
+
+        process_request(request);
+
+        let response = response_rx.try_recv().expect("Should receive response");
+
+        match response {
+            KafkaResponse::Metadata { brokers, .. } => {
+                assert_eq!(brokers.len(), 1);
+                let broker = &brokers[0];
+                assert_eq!(broker.node_id, DEFAULT_BROKER_ID);
+                assert_eq!(broker.port, DEFAULT_KAFKA_PORT);
+                assert!(!broker.host.is_empty());
+            }
+            _ => panic!("Expected Metadata response"),
+        }
+    }
+
+    #[test]
+    fn test_metadata_handler_partition_info() {
+        let (request, mut response_rx) = mock_metadata_request(102, None);
+
+        process_request(request);
+
+        let response = response_rx.try_recv().expect("Should receive response");
+
+        match response {
+            KafkaResponse::Metadata { topics, .. } => {
+                let test_topic = topics
+                    .iter()
+                    .find(|t| t.name == "test-topic")
+                    .expect("Should have test-topic");
+
+                assert_eq!(test_topic.partitions.len(), 1);
+
+                let partition = &test_topic.partitions[0];
+                assert_eq!(partition.error_code, ERROR_NONE);
+                assert_eq!(partition.partition_index, 0);
+                assert_eq!(partition.leader_id, DEFAULT_BROKER_ID);
+                assert_eq!(partition.replica_nodes, vec![DEFAULT_BROKER_ID]);
+                assert_eq!(partition.isr_nodes, vec![DEFAULT_BROKER_ID]);
+            }
+            _ => panic!("Expected Metadata response"),
+        }
+    }
+
+    #[test]
+    fn test_multiple_sequential_requests() {
+        // Test sequence: ApiVersions → Metadata
+        let (request1, mut response_rx1) = mock_api_versions_request(1);
+        process_request(request1);
+        let response1 = response_rx1.try_recv().expect("Should receive response 1");
+        assert!(matches!(response1, KafkaResponse::ApiVersions { .. }));
+
+        let (request2, mut response_rx2) = mock_metadata_request(2, None);
+        process_request(request2);
+        let response2 = response_rx2.try_recv().expect("Should receive response 2");
+        assert!(matches!(response2, KafkaResponse::Metadata { .. }));
     }
 }

@@ -2,9 +2,50 @@ use pgrx::prelude::*;
 use pgrx::bgworkers::BackgroundWorkerBuilder;
 
 // Module declarations for our extension components
-mod config;    // Configuration (GUC parameters)
-mod kafka;     // Kafka protocol implementation (listener, protocol, messages)
-mod worker;    // Background worker implementation
+mod config;        // Configuration (GUC parameters)
+pub mod kafka;     // Kafka protocol implementation (listener, protocol, messages)
+pub mod worker;    // Background worker implementation
+
+// Test utilities (only compiled in test builds)
+#[cfg(test)]
+pub mod testing;
+
+// ===== Conditional Logging Macros =====
+// These provide test-safe alternatives to pgrx logging functions
+
+/// Production logging - uses pgrx::log!()
+#[cfg(not(test))]
+#[macro_export]
+macro_rules! pg_log {
+    ($($arg:tt)*) => { pgrx::log!($($arg)*) };
+}
+
+/// Test logging - no-op (uncomment eprintln for debug output)
+#[cfg(test)]
+#[macro_export]
+macro_rules! pg_log {
+    ($($arg:tt)*) => {
+        // Uncomment for test debugging:
+        // eprintln!("[LOG] {}", format!($($arg)*));
+    };
+}
+
+/// Production warning - uses pgrx::warning!()
+#[cfg(not(test))]
+#[macro_export]
+macro_rules! pg_warning {
+    ($($arg:tt)*) => { pgrx::warning!($($arg)*) };
+}
+
+/// Test warning - no-op (uncomment eprintln for debug output)
+#[cfg(test)]
+#[macro_export]
+macro_rules! pg_warning {
+    ($($arg:tt)*) => {
+        // Uncomment for test debugging:
+        // eprintln!("[WARNING] {}", format!($($arg)*));
+    };
+}
 
 ::pgrx::pg_module_magic!();
 
