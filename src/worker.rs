@@ -16,7 +16,7 @@ use pgrx::prelude::*;
 /// 4. Must be marked with #[no_mangle] to ensure Postgres can find it
 #[pg_guard]
 #[no_mangle]
-pub extern "C" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
+pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     // Step 1: Attach to Postgres signal handling system
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
 

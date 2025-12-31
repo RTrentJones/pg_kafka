@@ -21,7 +21,7 @@ mod worker;    // Background worker implementation
 /// - https://www.postgresql.org/docs/current/bgworker.html
 /// - https://docs.rs/pgrx/latest/pgrx/bgworkers/index.html
 #[pg_guard]
-pub unsafe extern "C" fn _PG_init() {
+pub unsafe extern "C-unwind" fn _PG_init() {
     use pgrx::bgworkers::BgWorkerStartTime;
 
     // Initialize GUC configuration parameters

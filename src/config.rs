@@ -1,41 +1,30 @@
 // Configuration module for pg_kafka
 //
 // This module defines GUC (Grand Unified Configuration) parameters that can be
-// set in postgresql.conf or via ALTER SYSTEM/SET commands.
+// set in postgresql.conf or via SQL commands.
+//
+// pgrx 0.16+ uses declarative macros for GUC definitions
 
+use pgrx::prelude::*;
 use pgrx::{GucContext, GucFlags, GucRegistry, GucSetting};
-use std::ffi::CStr;
 
-/// Configuration for the pg_kafka extension
-///
-/// These settings can be configured in postgresql.conf:
-/// ```
-/// pg_kafka.port = 9092
-/// pg_kafka.host = '0.0.0.0'
-/// pg_kafka.log_connections = true
-/// ```
+/// Configuration struct holding all pg_kafka settings
 pub struct Config {
-    /// Port to listen on for Kafka protocol connections
     pub port: i32,
-
-    /// Host/interface to bind to (0.0.0.0 = all interfaces)
     pub host: String,
-
-    /// Whether to log each connection (can be noisy under load)
     pub log_connections: bool,
-
-    /// Timeout in milliseconds for graceful shutdown
     pub shutdown_timeout_ms: i32,
 }
 
 impl Config {
-    /// Get the current configuration from GUCs
+    /// Load configuration from GUC parameters
     pub fn load() -> Self {
-        Self {
+        Config {
             port: PORT.get(),
             host: HOST
                 .get()
-                .map(|cstr: &CStr| cstr.to_str().unwrap_or("0.0.0.0").to_string())
+                .as_deref()
+                .map(|c| c.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "0.0.0.0".to_string()),
             log_connections: LOG_CONNECTIONS.get(),
             shutdown_timeout_ms: SHUTDOWN_TIMEOUT_MS.get(),
@@ -43,61 +32,53 @@ impl Config {
     }
 }
 
-// GUC definitions - these are the actual configuration parameters
-// They are initialized in init() which is called from _PG_init()
+// GUC parameter definitions
+use std::ffi::CString;
 
 static PORT: GucSetting<i32> = GucSetting::<i32>::new(9092);
-static HOST: GucSetting<Option<&'static CStr>> = GucSetting::<Option<&'static CStr>>::new(None);
+static HOST: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 static LOG_CONNECTIONS: GucSetting<bool> = GucSetting::<bool>::new(false);
 static SHUTDOWN_TIMEOUT_MS: GucSetting<i32> = GucSetting::<i32>::new(5000);
 
 /// Initialize GUC parameters
-///
-/// This must be called from _PG_init() to register the parameters with Postgres.
-/// After registration, they can be set in postgresql.conf or via SQL commands.
 pub fn init() {
-    // Network configuration
     GucRegistry::define_int_guc(
-        "pg_kafka.port",
-        "Port to listen on for Kafka protocol connections",
-        "The TCP port that pg_kafka will bind to. Requires restart to take effect.",
+        c"pg_kafka.port",
+        c"Port to listen on for Kafka protocol connections",
+        c"The TCP port that pg_kafka will bind to. Default: 9092. Requires restart to take effect.",
         &PORT,
-        1024,      // min: privileged ports require root
-        65535,     // max: valid port range
-        GucContext::Postmaster, // Requires restart to change
+        1024,
+        65535,
+        GucContext::Postmaster,
         GucFlags::default(),
     );
 
     GucRegistry::define_string_guc(
-        "pg_kafka.host",
-        "Host/interface to bind to",
-        "The network interface to listen on. Use 0.0.0.0 for all interfaces, \
-         127.0.0.1 for localhost only. Requires restart to take effect.",
+        c"pg_kafka.host",
+        c"Host/interface to bind to",
+        c"The network interface to listen on. Use 0.0.0.0 for all interfaces. Requires restart.",
         &HOST,
-        GucContext::Postmaster, // Requires restart to change
+        GucContext::Postmaster,
         GucFlags::default(),
     );
 
-    // Observability configuration
     GucRegistry::define_bool_guc(
-        "pg_kafka.log_connections",
-        "Whether to log each connection",
-        "When enabled, logs every incoming connection. Can be very noisy under high load. \
-         Can be changed at runtime with SET or in postgresql.conf.",
+        c"pg_kafka.log_connections",
+        c"Whether to log each connection",
+        c"When enabled, logs every incoming connection. Can be changed at runtime.",
         &LOG_CONNECTIONS,
-        GucContext::Suset, // Superuser can change without restart
+        GucContext::Suset,
         GucFlags::default(),
     );
 
-    // Performance configuration
     GucRegistry::define_int_guc(
-        "pg_kafka.shutdown_timeout_ms",
-        "Timeout for graceful shutdown in milliseconds",
-        "How long to wait for the TCP listener to shut down cleanly before forcing termination.",
+        c"pg_kafka.shutdown_timeout_ms",
+        c"Timeout for graceful shutdown in milliseconds",
+        c"How long to wait for the TCP listener to shut down cleanly. Default: 5000ms.",
         &SHUTDOWN_TIMEOUT_MS,
-        100,       // min: 100ms
-        60000,     // max: 60 seconds
-        GucContext::Suset, // Can be changed without restart
+        100,
+        60000,
+        GucContext::Suset,
         GucFlags::default(),
     );
 
