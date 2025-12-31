@@ -7,10 +7,12 @@
 // but we need to handle the framing (size prefix) and routing (api_key matching) ourselves.
 
 use bytes::{Buf, BufMut, BytesMut};
-use kafka_protocol::messages::api_versions_request::ApiVersionsRequest;
 use kafka_protocol::messages::api_versions_response::ApiVersionsResponse;
-use kafka_protocol::messages::{RequestHeader, ResponseHeader};
-use kafka_protocol::protocol::{Decodable, Encodable};
+use kafka_protocol::messages::metadata_response::{
+    MetadataResponse, MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic,
+};
+use kafka_protocol::messages::{BrokerId, ResponseHeader, TopicName};
+use kafka_protocol::protocol::Encodable;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -72,7 +74,7 @@ pub async fn parse_request(
         return Err(format!("Request too short to contain api_key and api_version (only {} bytes remaining)", payload_buf.remaining()).into());
     }
     let api_key = payload_buf.get_i16();
-    let api_version = payload_buf.get_i16();
+    let _api_version = payload_buf.get_i16();
 
     // Parse the rest of the RequestHeader (correlation_id + client_id)
     // For simplicity, we'll manually parse instead of using RequestHeader::decode
@@ -90,9 +92,29 @@ pub async fn parse_request(
         18 => {
             // ApiVersions request
             // The body is empty for ApiVersions, so we don't need to parse it
+            pgrx::log!("Parsed ApiVersions request (api_key=18)");
             Ok(Some(KafkaRequest::ApiVersions {
                 correlation_id,
                 client_id,
+                response_tx,
+            }))
+        }
+        3 => {
+            // Metadata request
+            // For now, we'll parse the basic structure but accept any topic list
+            // In Phase 2, we'll actually query the database for topic metadata
+            pgrx::log!("Parsed Metadata request (api_key=3, version={})", _api_version);
+
+            // Parse the rest of the request body to extract topic names
+            // For Step 4, we'll just use a simplified approach and ignore the topic list
+            // The client_id was already skipped, and we have the remaining body in payload_buf
+
+            // TODO: Properly parse MetadataRequest body using kafka-protocol crate
+            // For now, return a request with empty topics list (means "all topics")
+            Ok(Some(KafkaRequest::Metadata {
+                correlation_id,
+                client_id,
+                topics: None, // None means "all topics"
                 response_tx,
             }))
         }
@@ -153,6 +175,57 @@ pub async fn send_response(
 
             // Encode response body
             api_version_response.encode(&mut response_buf, 3)?; // ApiVersions v3
+        }
+        KafkaResponse::Metadata {
+            correlation_id,
+            brokers,
+            topics,
+        } => {
+            // Build ResponseHeader
+            let header = ResponseHeader::default().with_correlation_id(correlation_id);
+
+            // Build MetadataResponse
+            let mut metadata_response = MetadataResponse::default();
+
+            // Add brokers
+            for broker in brokers {
+                let mut kafka_broker = MetadataResponseBroker::default();
+                kafka_broker.node_id = BrokerId(broker.node_id);
+                kafka_broker.host = broker.host.into();
+                kafka_broker.port = broker.port;
+                kafka_broker.rack = broker.rack.map(|r| r.into());
+                metadata_response.brokers.push(kafka_broker);
+            }
+
+            // Add topics
+            for topic in topics {
+                let mut kafka_topic = MetadataResponseTopic::default();
+                kafka_topic.error_code = topic.error_code;
+                kafka_topic.name = Some(TopicName(topic.name.into()));
+
+                // Add partitions for this topic
+                for partition in topic.partitions {
+                    let mut kafka_partition = MetadataResponsePartition::default();
+                    kafka_partition.error_code = partition.error_code;
+                    kafka_partition.partition_index = partition.partition_index;
+                    kafka_partition.leader_id = BrokerId(partition.leader_id);
+                    kafka_partition.replica_nodes = partition
+                        .replica_nodes
+                        .into_iter()
+                        .map(BrokerId)
+                        .collect();
+                    kafka_partition.isr_nodes = partition.isr_nodes.into_iter().map(BrokerId).collect();
+                    kafka_topic.partitions.push(kafka_partition);
+                }
+
+                metadata_response.topics.push(kafka_topic);
+            }
+
+            // Encode response header (v1 for Metadata v9)
+            header.encode(&mut response_buf, 1)?;
+
+            // Encode response body (using version 9 for broad compatibility)
+            metadata_response.encode(&mut response_buf, 9)?;
         }
         KafkaResponse::Error {
             correlation_id,

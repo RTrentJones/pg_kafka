@@ -183,11 +183,13 @@ pub extern "C" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
 
 /// Process a Kafka request and send the response
 ///
-/// In Step 3, we only handle ApiVersions requests with hardcoded responses.
-/// In Step 4, we'll add Metadata support.
-/// In Phase 2, we'll add SPI calls for database operations.
+/// In Step 3, we implemented ApiVersions.
+/// In Step 4, we're adding Metadata support with hardcoded topics.
+/// In Phase 2, we'll add SPI calls to query actual database tables.
 fn process_request(request: crate::kafka::KafkaRequest) {
-    use crate::kafka::messages::{ApiVersion, KafkaResponse};
+    use crate::kafka::messages::{
+        ApiVersion, BrokerMetadata, KafkaResponse, PartitionMetadata, TopicMetadata,
+    };
 
     pgrx::log!("process_request() called!");
 
@@ -198,7 +200,6 @@ fn process_request(request: crate::kafka::KafkaRequest) {
             response_tx,
         } => {
             pgrx::log!("Processing ApiVersions request, correlation_id: {}", correlation_id);
-            // Log the request if helpful for debugging
             if let Some(id) = client_id {
                 pgrx::log!("ApiVersions request from client: {}", id);
             }
@@ -206,7 +207,7 @@ fn process_request(request: crate::kafka::KafkaRequest) {
             // Build hardcoded ApiVersions response
             // We claim to support:
             // - ApiVersions (api_key 18): versions 0-3
-            // - Metadata (api_key 3): versions 0-9 (for Step 4)
+            // - Metadata (api_key 3): versions 0-9
             let api_versions = vec![
                 ApiVersion {
                     api_key: 18, // ApiVersions
@@ -214,7 +215,7 @@ fn process_request(request: crate::kafka::KafkaRequest) {
                     max_version: 3,
                 },
                 ApiVersion {
-                    api_key: 3, // Metadata (we'll implement in Step 4)
+                    api_key: 3, // Metadata
                     min_version: 0,
                     max_version: 9,
                 },
@@ -227,11 +228,67 @@ fn process_request(request: crate::kafka::KafkaRequest) {
                 api_versions,
             };
 
-            // Send response back to the async task via the connection-specific channel
             if let Err(e) = response_tx.send(response) {
                 pgrx::warning!("Failed to send ApiVersions response: {}", e);
             } else {
                 pgrx::log!("ApiVersions response sent successfully to async task");
+            }
+        }
+        crate::kafka::KafkaRequest::Metadata {
+            correlation_id,
+            client_id,
+            topics: _requested_topics,
+            response_tx,
+        } => {
+            pgrx::log!("Processing Metadata request, correlation_id: {}", correlation_id);
+            if let Some(id) = client_id {
+                pgrx::log!("Metadata request from client: {}", id);
+            }
+
+            // Get configuration for our broker info
+            let config = crate::config::Config::load();
+
+            // Step 4: Hardcoded metadata response
+            // In Phase 2, we'll query kafka.topics and kafka.messages tables via SPI
+            //
+            // For now, we return:
+            // - 1 broker (ourselves)
+            // - 1 test topic with 1 partition
+            let brokers = vec![BrokerMetadata {
+                node_id: 1,                    // We are broker 1
+                host: config.host.clone(),     // From GUC (default: 0.0.0.0)
+                port: config.port,             // From GUC (default: 9092)
+                rack: None,                    // No rack awareness in single-node setup
+            }];
+
+            let topics = vec![TopicMetadata {
+                error_code: 0, // No error
+                name: "test-topic".to_string(),
+                partitions: vec![PartitionMetadata {
+                    error_code: 0,      // No error
+                    partition_index: 0, // Partition 0 (first and only partition)
+                    leader_id: 1,       // Broker 1 (us) is the leader
+                    replica_nodes: vec![1], // Only broker 1 has the data
+                    isr_nodes: vec![1], // Broker 1 is in-sync (with itself)
+                }],
+            }];
+
+            pgrx::log!(
+                "Building Metadata response with {} brokers and {} topics",
+                brokers.len(),
+                topics.len()
+            );
+
+            let response = KafkaResponse::Metadata {
+                correlation_id,
+                brokers,
+                topics,
+            };
+
+            if let Err(e) = response_tx.send(response) {
+                pgrx::warning!("Failed to send Metadata response: {}", e);
+            } else {
+                pgrx::log!("Metadata response sent successfully to async task");
             }
         }
     }
