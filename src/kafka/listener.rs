@@ -99,7 +99,7 @@ async fn handle_connection(socket: TcpStream) -> Result<(), Box<dyn std::error::
         LengthDelimitedCodec::builder()
             .big_endian()
             .length_field_length(4)
-            .max_frame_length(100_000_000) // MAX_REQUEST_SIZE
+            .max_frame_length(super::constants::MAX_REQUEST_SIZE as usize)
             .new_codec(),
     );
 

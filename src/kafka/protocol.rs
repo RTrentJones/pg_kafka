@@ -6,18 +6,10 @@
 // The kafka-protocol crate provides auto-generated structs for all Kafka messages,
 // but we need to handle the framing (size prefix) and routing (api_key matching) ourselves.
 
-use bytes::{Buf, BufMut, BytesMut};
-use kafka_protocol::messages::api_versions_response::ApiVersionsResponse;
-use kafka_protocol::messages::metadata_response::{
-    MetadataResponse, MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic,
-};
+use bytes::{BufMut, BytesMut};
 use kafka_protocol::messages::produce_request::ProduceRequest;
-use kafka_protocol::messages::produce_response::{
-    PartitionProduceResponse as KafkaPartitionProduceResponse, ProduceResponse,
-    TopicProduceResponse as KafkaTopicProduceResponse,
-};
-use kafka_protocol::messages::{BrokerId, ResponseHeader, TopicName};
-use kafka_protocol::protocol::{Decodable, Encodable};
+use kafka_protocol::messages::ResponseHeader;
+use kafka_protocol::protocol::{decode_request_header_from_buffer, Decodable, Encodable};
 use kafka_protocol::records::RecordBatchDecoder;
 
 use super::constants::*;
@@ -45,62 +37,29 @@ pub fn parse_request(
 ) -> Result<Option<KafkaRequest>> {
     pg_log!("Parsing request from {} byte frame", frame.len());
 
-    // Parse RequestHeader to determine which API this is
-    let mut payload_buf = frame.freeze();
+    // Parse RequestHeader using kafka-protocol's decode function
+    // This automatically handles both non-flexible and flexible header formats
+    let mut payload_buf = frame;
 
-    // Read api_key and api_version first to know which API this is
-    pg_log!("Buffer remaining before parsing: {} bytes", payload_buf.remaining());
-    if payload_buf.remaining() < 4 {
-        return Err(KafkaError::RequestTooShort {
-            expected: 4,
-            actual: payload_buf.remaining(),
-        });
-    }
-    let api_key = payload_buf.get_i16();
-    let api_version = payload_buf.get_i16();
-
-    // Parse the rest of the RequestHeader (correlation_id + client_id)
-    // For simplicity, we'll manually parse instead of using RequestHeader::decode
-    if payload_buf.remaining() < 4 {
-        return Err(KafkaError::RequestTooShort {
-            expected: 4,
-            actual: payload_buf.remaining(),
-        });
-    }
-    let correlation_id = payload_buf.get_i32();
-
-    // Parse client_id from RequestHeader
-    // client_id is a nullable string: i16 length prefix, then UTF-8 bytes
-    // -1 length means null, 0 means empty string, >0 means that many bytes follow
-    if payload_buf.remaining() < 2 {
-        return Err(KafkaError::RequestTooShort {
-            expected: 2,
-            actual: payload_buf.remaining(),
-        });
-    }
-    let client_id_len = payload_buf.get_i16();
-    let client_id = if client_id_len < 0 {
-        None // Null client_id
-    } else {
-        // Read client_id bytes
-        if payload_buf.remaining() < client_id_len as usize {
-            return Err(KafkaError::RequestTooShort {
-                expected: client_id_len as usize,
-                actual: payload_buf.remaining(),
-            });
-        }
-        let mut client_id_bytes = vec![0u8; client_id_len as usize];
-        payload_buf.copy_to_slice(&mut client_id_bytes);
-        match String::from_utf8(client_id_bytes) {
-            Ok(s) => Some(s),
-            Err(e) => {
-                pg_warning!("Invalid UTF-8 in client_id: {}", e);
-                None
-            }
+    let header = match decode_request_header_from_buffer(&mut payload_buf) {
+        Ok(h) => h,
+        Err(e) => {
+            pg_warning!("Failed to decode RequestHeader: {}", e);
+            return Err(KafkaError::ProtocolCodec(e));
         }
     };
 
-    // Step 4: Match on api_key to determine request type
+    let api_key = header.request_api_key;
+    let api_version = header.request_api_version;
+    let correlation_id = header.correlation_id;
+    let client_id = header.client_id.map(|s| s.to_string());
+
+    pg_log!(
+        "Parsed RequestHeader: api_key={}, api_version={}, correlation_id={}, client_id={:?}",
+        api_key, api_version, correlation_id, client_id
+    );
+
+    // Match on api_key to determine request type
     match api_key {
         API_KEY_API_VERSIONS => {
             // ApiVersions request
@@ -426,24 +385,10 @@ pub fn encode_response(response: KafkaResponse) -> Result<BytesMut> {
         KafkaResponse::ApiVersions {
             correlation_id,
             api_version,
-            api_versions,
+            response: api_version_response,
         } => {
             // Build ResponseHeader
             let header = ResponseHeader::default().with_correlation_id(correlation_id);
-
-            // Build ApiVersionsResponse
-            let mut api_version_response = ApiVersionsResponse::default();
-            api_version_response.error_code = 0; // No error
-            api_version_response.throttle_time_ms = 0; // No throttling
-
-            // Convert our ApiVersion structs to kafka-protocol's ApiVersion structs
-            for av in api_versions {
-                let mut kafka_av = kafka_protocol::messages::api_versions_response::ApiVersion::default();
-                kafka_av.api_key = av.api_key;
-                kafka_av.min_version = av.min_version;
-                kafka_av.max_version = av.max_version;
-                api_version_response.api_keys.push(kafka_av);
-            }
 
             // Encode response header and body
             // IMPORTANT: Use the API version from the request for encoding
@@ -451,80 +396,23 @@ pub fn encode_response(response: KafkaResponse) -> Result<BytesMut> {
             // CRITICAL: ApiVersions always uses ResponseHeader v0, even for v3+!
             // This is different from other APIs where v3+ uses ResponseHeader v1.
             // See: https://github.com/Baylox/kafka-mock (19-byte example for v3)
-            let response_header_version = 0;  // Always v0 for ApiVersions!
-            let response_version = api_version;
+            let response_header_version = API_VERSIONS_RESPONSE_HEADER_VERSION;
 
-            // DEBUG: Track sizes
-            let before_header = response_buf.len();
             header.encode(&mut response_buf, response_header_version)?;
-            let after_header = response_buf.len();
-
-            // Encode response body with the requested API version
-            api_version_response.encode(&mut response_buf, response_version)?;
-            let after_body = response_buf.len();
-
-            // DEBUG: Write response bytes to file for analysis
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/tmp/pg_kafka_responses.log")
-            {
-                use std::io::Write;
-                let _ = writeln!(f, "ApiVersions v{} response: header={} bytes, body={} bytes, total={} bytes",
-                    api_version, after_header - before_header, after_body - after_header, response_buf.len());
-                let _ = writeln!(f, "  Bytes: {:?}", &response_buf[..]);
-            }
+            api_version_response.encode(&mut response_buf, api_version)?;
         }
         KafkaResponse::Metadata {
             correlation_id,
             api_version,
-            brokers,
-            topics,
+            response: metadata_response,
         } => {
             // Build ResponseHeader
             let header = ResponseHeader::default().with_correlation_id(correlation_id);
 
-            // Build MetadataResponse
-            let mut metadata_response = MetadataResponse::default();
-
-            // Add brokers
-            for broker in brokers {
-                let mut kafka_broker = MetadataResponseBroker::default();
-                kafka_broker.node_id = BrokerId(broker.node_id);
-                kafka_broker.host = broker.host.into();
-                kafka_broker.port = broker.port;
-                kafka_broker.rack = broker.rack.map(|r| r.into());
-                metadata_response.brokers.push(kafka_broker);
-            }
-
-            // Add topics
-            for topic in topics {
-                let mut kafka_topic = MetadataResponseTopic::default();
-                kafka_topic.error_code = topic.error_code;
-                kafka_topic.name = Some(TopicName(topic.name.into()));
-
-                // Add partitions for this topic
-                for partition in topic.partitions {
-                    let mut kafka_partition = MetadataResponsePartition::default();
-                    kafka_partition.error_code = partition.error_code;
-                    kafka_partition.partition_index = partition.partition_index;
-                    kafka_partition.leader_id = BrokerId(partition.leader_id);
-                    kafka_partition.replica_nodes = partition
-                        .replica_nodes
-                        .into_iter()
-                        .map(BrokerId)
-                        .collect();
-                    kafka_partition.isr_nodes = partition.isr_nodes.into_iter().map(BrokerId).collect();
-                    kafka_topic.partitions.push(kafka_partition);
-                }
-
-                metadata_response.topics.push(kafka_topic);
-            }
-
             // Encode response header
             // Metadata v9+ uses flexible format (ResponseHeader v1)
             // Metadata v0-v8 uses non-flexible format (ResponseHeader v0)
-            let response_header_version = if api_version >= 9 { 1 } else { 0 };
+            let response_header_version = if api_version >= FLEXIBLE_FORMAT_MIN_VERSION { 1 } else { 0 };
             header.encode(&mut response_buf, response_header_version)?;
 
             // Encode response body using the requested API version
@@ -533,39 +421,15 @@ pub fn encode_response(response: KafkaResponse) -> Result<BytesMut> {
         KafkaResponse::Produce {
             correlation_id,
             api_version,
-            responses,
+            response: produce_response,
         } => {
             // Build ResponseHeader
             let header = ResponseHeader::default().with_correlation_id(correlation_id);
 
-            // Build ProduceResponse
-            let mut produce_response = ProduceResponse::default();
-            produce_response.throttle_time_ms = 0;  // No throttling
-
-            // Convert our response types to kafka-protocol types
-            for topic_response in responses {
-                let mut kafka_topic_response = KafkaTopicProduceResponse::default();
-                kafka_topic_response.name = TopicName(topic_response.name.into());
-
-                // Add partition responses
-                for partition_response in topic_response.partitions {
-                    let mut kafka_partition_response = KafkaPartitionProduceResponse::default();
-                    kafka_partition_response.index = partition_response.partition_index;
-                    kafka_partition_response.error_code = partition_response.error_code;
-                    kafka_partition_response.base_offset = partition_response.base_offset;
-                    kafka_partition_response.log_append_time_ms = partition_response.log_append_time;
-                    kafka_partition_response.log_start_offset = partition_response.log_start_offset;
-
-                    kafka_topic_response.partition_responses.push(kafka_partition_response);
-                }
-
-                produce_response.responses.push(kafka_topic_response);
-            }
-
             // Encode response header
             // Produce v9+ uses flexible format (ResponseHeader v1)
             // Produce v0-v8 uses non-flexible format (ResponseHeader v0)
-            let response_header_version = if api_version >= 9 { 1 } else { 0 };
+            let response_header_version = if api_version >= FLEXIBLE_FORMAT_MIN_VERSION { 1 } else { 0 };
             header.encode(&mut response_buf, response_header_version)?;
 
             // Encode response body using the requested API version
@@ -599,17 +463,6 @@ pub fn encode_response(response: KafkaResponse) -> Result<BytesMut> {
                 response_buf.put_i16(-1); // Null string
             }
         }
-    }
-
-    // DEBUG: Log what we're encoding
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/pg_kafka_send.log")
-    {
-        use std::io::Write;
-        let _ = writeln!(f, "Encoded response: {} bytes", response_buf.len());
-        let _ = writeln!(f, "  Payload: {:?}", &response_buf[..]);
     }
 
     // Return the response payload

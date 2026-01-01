@@ -138,8 +138,8 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
         // Then we return to sync context to process database requests.
         runtime.block_on(async {
             tokio::select! {
-                // Timeout after 100ms to return to sync processing
-                _ = tokio::time::sleep(core::time::Duration::from_millis(100)) => {
+                // Timeout after ASYNC_IO_INTERVAL_MS to return to sync processing
+                _ = tokio::time::sleep(core::time::Duration::from_millis(crate::kafka::ASYNC_IO_INTERVAL_MS)) => {
                     // Normal path: timeout reached, go check for database requests
                 }
                 // Fallback: If listener exits (shouldn't happen during normal operation)
@@ -154,10 +154,10 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
         // ┌─────────────────────────────────────────────────────────────┐
         // │ PART 3: Check for Shutdown Signal (POSTGRES Integration)   │
         // └─────────────────────────────────────────────────────────────┘
-        // wait_latch(1ms) returns false when Postgres sends SIGTERM.
+        // wait_latch(SIGNAL_CHECK_INTERVAL_MS) returns false when Postgres sends SIGTERM.
         // This is the SYNC boundary - we're fully outside async context.
         // CRITICAL: This must be polled regularly for graceful shutdown.
-        if !BackgroundWorker::wait_latch(Some(core::time::Duration::from_millis(1))) {
+        if !BackgroundWorker::wait_latch(Some(core::time::Duration::from_millis(crate::kafka::SIGNAL_CHECK_INTERVAL_MS))) {
             log!("pg_kafka background worker shutting down");
 
             // Signal the async listener to stop
@@ -204,9 +204,8 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
 /// - `|client| { ... }`: This is a "closure" (anonymous function) that receives the SPI client
 /// - `?` operator: Propagates errors up the call stack (like try/catch in other languages)
 /// Get metadata for all topics in the database
-fn get_all_topics_metadata() -> Vec<crate::kafka::messages::TopicMetadata> {
+fn get_all_topics_metadata() -> Vec<kafka_protocol::messages::metadata_response::MetadataResponseTopic> {
     use crate::kafka::constants::*;
-    use crate::kafka::messages::{TopicMetadata, PartitionMetadata};
 
     // Query all topics from the database
     // We need to extract data inside the SPI connection closure due to lifetimes
@@ -226,17 +225,18 @@ fn get_all_topics_metadata() -> Vec<crate::kafka::messages::TopicMetadata> {
         let mut topics_metadata = Vec::new();
         for row in table {
             if let Ok(Some(name)) = row.get::<&str>(1) {
-                topics_metadata.push(TopicMetadata {
-                    error_code: ERROR_NONE,
-                    name: name.to_string(),
-                    partitions: vec![PartitionMetadata {
-                        error_code: ERROR_NONE,
-                        partition_index: 0,
-                        leader_id: DEFAULT_BROKER_ID,
-                        replica_nodes: vec![DEFAULT_BROKER_ID],
-                        isr_nodes: vec![DEFAULT_BROKER_ID],
-                    }],
-                });
+                let partition = crate::kafka::build_partition_metadata(
+                    0,
+                    DEFAULT_BROKER_ID,
+                    vec![DEFAULT_BROKER_ID],
+                    vec![DEFAULT_BROKER_ID],
+                );
+                let topic = crate::kafka::build_topic_metadata(
+                    name.to_string(),
+                    ERROR_NONE,
+                    vec![partition],
+                );
+                topics_metadata.push(topic);
             }
         }
         topics_metadata
@@ -258,10 +258,13 @@ fn get_or_create_topic(topic_name: &str) -> Result<i32, Box<dyn std::error::Erro
 
         let topic_id: i32 = Spi::get_one_with_args::<i32>(
             "INSERT INTO kafka.topics (name, partitions)
-             VALUES ($1, 1)
+             VALUES ($1, $2)
              ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
              RETURNING id",
-            &[topic_name_string.into()], // String implements IntoDatum and From for DatumWithOid
+            &[
+                topic_name_string.into(),
+                crate::kafka::DEFAULT_TOPIC_PARTITIONS.into(),
+            ],
         )?
         .ok_or_else(|| "Failed to get topic ID")?;
 
@@ -312,18 +315,17 @@ fn insert_records(
             // ============================================
             // STEP 1: Get current max offset with lock
             // ============================================
-            // Lock the partition for exclusive access to prevent race conditions.
-            // We lock a dummy row in the topics table (the partition's topic row).
-            // This ensures serialized access to partition offset calculation.
+            // Lock THIS SPECIFIC PARTITION for exclusive access to prevent race conditions.
+            // CRITICAL: We use PostgreSQL advisory locks to lock (topic_id, partition_id) pair.
+            // This allows concurrent writes to DIFFERENT partitions of the same topic,
+            // which is the whole point of partitioning!
             //
-            // Alternative: Advisory lock on (topic_id, partition_id)
-            // We use SELECT FOR UPDATE on the topic row because it's cleaner
-            // than advisory locks and prevents other transactions from inserting
-            // to this partition concurrently.
+            // pg_advisory_xact_lock(key1, key2) automatically releases at transaction end.
+            // The lock is held until the transaction commits/rolls back.
             client.select(
-                "SELECT id FROM kafka.topics WHERE id = $1 FOR UPDATE",
+                "SELECT pg_advisory_xact_lock($1, $2)",
                 None,
-                &[topic_id.into()],
+                &[topic_id.into(), partition_id.into()],
             )?;
 
             // Now get the max offset (no FOR UPDATE needed since we have topic lock)
@@ -445,9 +447,7 @@ fn hex_encode(data: &[u8]) -> String {
 /// public API and should not be called directly by external code.
 #[doc(hidden)]
 pub fn process_request(request: crate::kafka::KafkaRequest) {
-    use crate::kafka::messages::{
-        ApiVersion, BrokerMetadata, KafkaResponse, PartitionMetadata, TopicMetadata,
-    };
+    use crate::kafka::messages::KafkaResponse;
 
     pg_log!("process_request() called!");
 
@@ -463,37 +463,15 @@ pub fn process_request(request: crate::kafka::KafkaRequest) {
                 pg_log!("ApiVersions request from client: {}", id);
             }
 
-            // Build hardcoded ApiVersions response
-            // We claim to support:
-            // - ApiVersions (API_KEY_API_VERSIONS): versions 0-3
-            // - Metadata (API_KEY_METADATA): versions 0-9
-            // - Produce (API_KEY_PRODUCE): versions 3-9
-            //   Note: We only support v3+ because it uses RecordBatch format.
-            //   v0-v2 use legacy MessageSet format which kafka-protocol crate doesn't support.
-            let api_versions = vec![
-                ApiVersion {
-                    api_key: API_KEY_API_VERSIONS,
-                    min_version: 0,
-                    max_version: 3,
-                },
-                ApiVersion {
-                    api_key: API_KEY_METADATA,
-                    min_version: 0,
-                    max_version: 9,
-                },
-                ApiVersion {
-                    api_key: API_KEY_PRODUCE,
-                    min_version: 3,  // RecordBatch format only (v3+)
-                    max_version: 9,
-                },
-            ];
+            // Build ApiVersionsResponse using helper
+            let kafka_response = crate::kafka::build_api_versions_response();
 
-            pg_log!("Building ApiVersions response with {} API versions", api_versions.len());
+            pg_log!("Building ApiVersions response with {} API versions", kafka_response.api_keys.len());
 
             let response = KafkaResponse::ApiVersions {
                 correlation_id,
                 api_version,
-                api_versions,
+                response: kafka_response,
             };
 
             if let Err(e) = response_tx.send(response) {
@@ -528,17 +506,18 @@ pub fn process_request(request: crate::kafka::KafkaRequest) {
                 config.host.clone()
             };
 
-            // Build broker list
-            let brokers = vec![BrokerMetadata {
-                node_id: DEFAULT_BROKER_ID,
-                host: advertised_host,
-                port: config.port,
-                rack: None,
-            }];
+            // Build MetadataResponse using kafka-protocol types
+            let mut kafka_response = kafka_protocol::messages::metadata_response::MetadataResponse::default();
+
+            // Add broker
+            kafka_response.brokers.push(crate::kafka::build_broker_metadata(
+                DEFAULT_BROKER_ID,
+                advertised_host,
+                config.port,
+            ));
 
             // Build topic metadata based on what was requested
-            use crate::kafka::messages::{TopicMetadata, PartitionMetadata};
-            let topics = match requested_topics {
+            let topics_to_add = match requested_topics {
                 None => {
                     // Client wants all topics - query from database
                     pg_log!("Building metadata for ALL topics");
@@ -553,26 +532,28 @@ pub fn process_request(request: crate::kafka::KafkaRequest) {
                         match get_or_create_topic(&topic_name) {
                             Ok(_topic_id) => {
                                 // Return metadata for this topic
-                                topics_metadata.push(TopicMetadata {
-                                    error_code: ERROR_NONE,
-                                    name: topic_name,
-                                    partitions: vec![PartitionMetadata {
-                                        error_code: ERROR_NONE,
-                                        partition_index: 0,
-                                        leader_id: DEFAULT_BROKER_ID,
-                                        replica_nodes: vec![DEFAULT_BROKER_ID],
-                                        isr_nodes: vec![DEFAULT_BROKER_ID],
-                                    }],
-                                });
+                                let partition = crate::kafka::build_partition_metadata(
+                                    0,
+                                    DEFAULT_BROKER_ID,
+                                    vec![DEFAULT_BROKER_ID],
+                                    vec![DEFAULT_BROKER_ID],
+                                );
+                                let topic = crate::kafka::build_topic_metadata(
+                                    topic_name,
+                                    ERROR_NONE,
+                                    vec![partition],
+                                );
+                                topics_metadata.push(topic);
                             }
                             Err(e) => {
                                 pg_warning!("Failed to get/create topic '{}': {}", topic_name, e);
                                 // Return error for this topic
-                                topics_metadata.push(TopicMetadata {
-                                    error_code: ERROR_UNKNOWN_SERVER_ERROR,
-                                    name: topic_name,
-                                    partitions: vec![],
-                                });
+                                let topic = crate::kafka::build_topic_metadata(
+                                    topic_name,
+                                    ERROR_UNKNOWN_SERVER_ERROR,
+                                    vec![],
+                                );
+                                topics_metadata.push(topic);
                             }
                         }
                     }
@@ -580,17 +561,18 @@ pub fn process_request(request: crate::kafka::KafkaRequest) {
                 }
             };
 
+            kafka_response.topics = topics_to_add;
+
             pg_log!(
                 "Building Metadata response with {} brokers and {} topics",
-                brokers.len(),
-                topics.len()
+                kafka_response.brokers.len(),
+                kafka_response.topics.len()
             );
 
             let response = KafkaResponse::Metadata {
                 correlation_id,
                 api_version,
-                brokers,
-                topics,
+                response: kafka_response,
             };
 
             if let Err(e) = response_tx.send(response) {
@@ -628,11 +610,10 @@ pub fn process_request(request: crate::kafka::KafkaRequest) {
                 return;
             }
 
-            use crate::kafka::messages::{PartitionProduceResponse, TopicProduceResponse};
+            // Build ProduceResponse using kafka-protocol types
+            let mut kafka_response = crate::kafka::build_produce_response();
 
             // Process each topic
-            let mut topic_responses = Vec::new();
-
             for topic in topic_data {
                 let topic_name = topic.name.clone();
                 pg_log!("Processing topic: {}", topic_name);
@@ -657,9 +638,11 @@ pub fn process_request(request: crate::kafka::KafkaRequest) {
                     }
                 };
 
-                // Process each partition
-                let mut partition_responses = Vec::new();
+                // Build topic response
+                let mut topic_response = kafka_protocol::messages::produce_response::TopicProduceResponse::default();
+                topic_response.name = kafka_protocol::messages::TopicName(topic_name.clone().into());
 
+                // Process each partition
                 for partition in topic.partitions {
                     let partition_index = partition.partition_index;
                     pg_log!(
@@ -668,6 +651,9 @@ pub fn process_request(request: crate::kafka::KafkaRequest) {
                         partition.records.len()
                     );
 
+                    let mut partition_response = kafka_protocol::messages::produce_response::PartitionProduceResponse::default();
+                    partition_response.index = partition_index;
+
                     // Validate partition index (we only support partition 0 for now)
                     if partition_index != 0 {
                         pg_warning!(
@@ -675,13 +661,11 @@ pub fn process_request(request: crate::kafka::KafkaRequest) {
                             partition_index,
                             topic_name
                         );
-                        partition_responses.push(PartitionProduceResponse {
-                            partition_index,
-                            error_code: ERROR_UNKNOWN_TOPIC_OR_PARTITION,
-                            base_offset: -1,
-                            log_append_time: -1,
-                            log_start_offset: -1,
-                        });
+                        partition_response.error_code = ERROR_UNKNOWN_TOPIC_OR_PARTITION;
+                        partition_response.base_offset = -1;
+                        partition_response.log_append_time_ms = -1;
+                        partition_response.log_start_offset = -1;
+                        topic_response.partition_responses.push(partition_response);
                         continue;
                     }
 
@@ -693,13 +677,10 @@ pub fn process_request(request: crate::kafka::KafkaRequest) {
                                 partition.records.len(),
                                 base_offset
                             );
-                            partition_responses.push(PartitionProduceResponse {
-                                partition_index,
-                                error_code: ERROR_NONE,
-                                base_offset,
-                                log_append_time: -1, // Not tracking log append time yet
-                                log_start_offset: -1, // Not tracking log start offset yet
-                            });
+                            partition_response.error_code = ERROR_NONE;
+                            partition_response.base_offset = base_offset;
+                            partition_response.log_append_time_ms = -1; // Not tracking log append time yet
+                            partition_response.log_start_offset = -1; // Not tracking log start offset yet
                         }
                         Err(e) => {
                             pg_warning!(
@@ -708,28 +689,24 @@ pub fn process_request(request: crate::kafka::KafkaRequest) {
                                 partition_index,
                                 e
                             );
-                            partition_responses.push(PartitionProduceResponse {
-                                partition_index,
-                                error_code: ERROR_UNKNOWN_SERVER_ERROR,
-                                base_offset: -1,
-                                log_append_time: -1,
-                                log_start_offset: -1,
-                            });
+                            partition_response.error_code = ERROR_UNKNOWN_SERVER_ERROR;
+                            partition_response.base_offset = -1;
+                            partition_response.log_append_time_ms = -1;
+                            partition_response.log_start_offset = -1;
                         }
                     }
+
+                    topic_response.partition_responses.push(partition_response);
                 }
 
-                topic_responses.push(TopicProduceResponse {
-                    name: topic_name,
-                    partitions: partition_responses,
-                });
+                kafka_response.responses.push(topic_response);
             }
 
             // Send successful response
             let response = KafkaResponse::Produce {
                 correlation_id,
                 api_version,
-                responses: topic_responses,
+                response: kafka_response,
             };
 
             if let Err(e) = response_tx.send(response) {
@@ -765,10 +742,11 @@ mod tests {
         match response {
             KafkaResponse::ApiVersions {
                 correlation_id,
-                api_versions,
+                api_version: _,
+                response,
             } => {
                 assert_eq!(correlation_id, 42);
-                assert!(!api_versions.is_empty(), "Should have API versions");
+                assert!(!response.api_keys.is_empty(), "Should have API versions");
             }
             _ => panic!("Expected ApiVersions response"),
         }
@@ -786,7 +764,9 @@ mod tests {
 
             match response {
                 KafkaResponse::ApiVersions {
-                    correlation_id, ..
+                    correlation_id,
+                    api_version: _,
+                    response: _,
                 } => {
                     assert_eq!(
                         correlation_id, test_correlation_id,
@@ -808,17 +788,23 @@ mod tests {
         let response = response_rx.try_recv().expect("Should receive response");
 
         match response {
-            KafkaResponse::ApiVersions { api_versions, .. } => {
-                assert_eq!(api_versions.len(), 2, "Should support 2 APIs");
+            KafkaResponse::ApiVersions {
+                api_version: _,
+                correlation_id: _,
+                response,
+            } => {
+                assert_eq!(response.api_keys.len(), 3, "Should support 3 APIs");
 
-                let api_versions_api = api_versions
+                let api_versions_api = response
+                    .api_keys
                     .iter()
                     .find(|av| av.api_key == 18)
                     .expect("Should support ApiVersions API");
                 assert_eq!(api_versions_api.min_version, 0);
                 assert_eq!(api_versions_api.max_version, 3);
 
-                let metadata_api = api_versions
+                let metadata_api = response
+                    .api_keys
                     .iter()
                     .find(|av| av.api_key == 3)
                     .expect("Should support Metadata API");
@@ -840,16 +826,17 @@ mod tests {
         match response {
             KafkaResponse::Metadata {
                 correlation_id,
-                brokers,
-                topics,
+                api_version: _,
+                response,
             } => {
                 assert_eq!(correlation_id, 99);
-                assert!(!brokers.is_empty());
-                assert!(!topics.is_empty());
+                assert!(!response.brokers.is_empty());
+                assert!(!response.topics.is_empty());
 
-                let test_topic = topics
+                let test_topic = response
+                    .topics
                     .iter()
-                    .find(|t| t.name == "test-topic")
+                    .find(|t| t.name.as_ref().map(|n| n.0.as_str()) == Some("test-topic"))
                     .expect("Should have test-topic");
                 assert_eq!(test_topic.error_code, ERROR_NONE);
             }
@@ -866,10 +853,14 @@ mod tests {
         let response = response_rx.try_recv().expect("Should receive response");
 
         match response {
-            KafkaResponse::Metadata { brokers, .. } => {
-                assert_eq!(brokers.len(), 1);
-                let broker = &brokers[0];
-                assert_eq!(broker.node_id, DEFAULT_BROKER_ID);
+            KafkaResponse::Metadata {
+                api_version: _,
+                correlation_id: _,
+                response,
+            } => {
+                assert_eq!(response.brokers.len(), 1);
+                let broker = &response.brokers[0];
+                assert_eq!(broker.node_id.0, DEFAULT_BROKER_ID);
                 assert_eq!(broker.port, DEFAULT_KAFKA_PORT);
                 assert!(!broker.host.is_empty());
             }
@@ -886,10 +877,15 @@ mod tests {
         let response = response_rx.try_recv().expect("Should receive response");
 
         match response {
-            KafkaResponse::Metadata { topics, .. } => {
-                let test_topic = topics
+            KafkaResponse::Metadata {
+                api_version: _,
+                correlation_id: _,
+                response,
+            } => {
+                let test_topic = response
+                    .topics
                     .iter()
-                    .find(|t| t.name == "test-topic")
+                    .find(|t| t.name.as_ref().map(|n| n.0.as_str()) == Some("test-topic"))
                     .expect("Should have test-topic");
 
                 assert_eq!(test_topic.partitions.len(), 1);
@@ -897,9 +893,9 @@ mod tests {
                 let partition = &test_topic.partitions[0];
                 assert_eq!(partition.error_code, ERROR_NONE);
                 assert_eq!(partition.partition_index, 0);
-                assert_eq!(partition.leader_id, DEFAULT_BROKER_ID);
-                assert_eq!(partition.replica_nodes, vec![DEFAULT_BROKER_ID]);
-                assert_eq!(partition.isr_nodes, vec![DEFAULT_BROKER_ID]);
+                assert_eq!(partition.leader_id.0, DEFAULT_BROKER_ID);
+                assert_eq!(partition.replica_nodes, vec![kafka_protocol::messages::BrokerId(DEFAULT_BROKER_ID)]);
+                assert_eq!(partition.isr_nodes, vec![kafka_protocol::messages::BrokerId(DEFAULT_BROKER_ID)]);
             }
             _ => panic!("Expected Metadata response"),
         }

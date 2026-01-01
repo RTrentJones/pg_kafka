@@ -67,6 +67,45 @@ pub const MAX_SHUTDOWN_TIMEOUT_MS: i32 = 60000;
 /// In Phase 1, we act as a single broker with ID 1
 pub const DEFAULT_BROKER_ID: i32 = 1;
 
+// ===== Topic Configuration =====
+
+/// Default number of partitions for new topics
+///
+/// Phase 1 only supports single-partition topics.
+/// In future phases, this will become configurable per-topic.
+pub const DEFAULT_TOPIC_PARTITIONS: i32 = 1;
+
+// ===== Protocol Version Constants =====
+
+/// Kafka protocol version where flexible format begins
+///
+/// Starting with version 9, Kafka uses "flexible" format with tagged fields.
+/// This requires ResponseHeader v1 instead of v0.
+pub const FLEXIBLE_FORMAT_MIN_VERSION: i16 = 9;
+
+/// ResponseHeader version for ApiVersions responses
+///
+/// ApiVersions is special: it ALWAYS uses ResponseHeader v0, even for v3+ requests.
+/// This differs from other APIs where v3+ uses ResponseHeader v1 (flexible format).
+/// See: https://github.com/Baylox/kafka-mock
+pub const API_VERSIONS_RESPONSE_HEADER_VERSION: i16 = 0;
+
+// ===== Worker Timing Constants =====
+
+/// Async I/O processing interval (milliseconds)
+///
+/// How long to process async network I/O before checking for database requests.
+/// Balances network throughput vs database operation latency.
+/// Too high: Database operations wait longer for processing
+/// Too low: Overhead from frequent context switches
+pub const ASYNC_IO_INTERVAL_MS: u64 = 100;
+
+/// Signal check interval (milliseconds)
+///
+/// How often to check for Postgres shutdown signals (SIGTERM).
+/// Must be short for responsive shutdown, but not too short to avoid busy-waiting.
+pub const SIGNAL_CHECK_INTERVAL_MS: u64 = 1;
+
 // ===== Network Hosts =====
 
 /// Default host for production (bind to all interfaces)

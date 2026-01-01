@@ -67,36 +67,37 @@ pub enum KafkaRequest {
 }
 
 /// Kafka response types sent back from main thread to async tasks
+///
+/// Phase 2 Refactoring: We wrap kafka-protocol response types directly to eliminate
+/// the verbose conversion code in protocol.rs::encode_response()
 #[derive(Debug, Clone)]
 pub enum KafkaResponse {
-    /// ApiVersions response - lists supported API versions
+    /// ApiVersions response - wraps kafka-protocol's ApiVersionsResponse
     ApiVersions {
         /// Correlation ID from request - client uses this to match responses
         correlation_id: i32,
         /// API version to use for encoding the response
         api_version: i16,
-        /// List of supported API keys and their version ranges
-        api_versions: Vec<ApiVersion>,
+        /// The kafka-protocol response struct (ready to encode)
+        response: kafka_protocol::messages::api_versions_response::ApiVersionsResponse,
     },
-    /// Metadata response - provides topic and broker metadata
+    /// Metadata response - wraps kafka-protocol's MetadataResponse
     Metadata {
         /// Correlation ID from request
         correlation_id: i32,
         /// API version from the request (needed for response encoding)
         api_version: i16,
-        /// List of brokers in the cluster
-        brokers: Vec<BrokerMetadata>,
-        /// List of topics and their partitions
-        topics: Vec<TopicMetadata>,
+        /// The kafka-protocol response struct (ready to encode)
+        response: kafka_protocol::messages::metadata_response::MetadataResponse,
     },
-    /// Produce response - acknowledgment of written messages
+    /// Produce response - wraps kafka-protocol's ProduceResponse
     Produce {
         /// Correlation ID from request
         correlation_id: i32,
         /// API version from the request (needed for response encoding)
         api_version: i16,
-        /// Per-topic responses with partition offsets
-        responses: Vec<TopicProduceResponse>,
+        /// The kafka-protocol response struct (ready to encode)
+        response: kafka_protocol::messages::produce_response::ProduceResponse,
     },
     /// Error response for unsupported or malformed requests
     Error {
