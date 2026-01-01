@@ -38,7 +38,7 @@ jobs:
       run: |
         sudo apt-get update
         # libpq-dev is required to link against Postgres libraries
-        sudo apt-get install -y libpq-dev
+        sudo apt-get install -y libpq-dev libreadline-dev zlib1g-dev flex bison libxml2-dev libxslt-dev
 
     - name: Install pgrx
       # Installs the pgrx CLI tool which we use to manage the Postgres lifecycle
