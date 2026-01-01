@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `pg_kafka` is a PostgreSQL extension written in Rust (via pgrx) that embeds a Kafka-compatible wire protocol listener directly into the Postgres runtime. It allows standard Kafka clients to produce and consume messages using Postgres as the backing store.
 
-**Status:** Early Scaffolding Phase (Staff Engineer Portfolio Project)
+**Status:** Early Scaffolding Phase (Portfolio Project)
 
 **Current Implementation:** The project currently contains only the basic pgrx scaffolding with a simple `hello_pg_kafka()` function. The architecture described below represents the target design that is being implemented in phases.
 
@@ -41,7 +41,7 @@ docker exec -it pg_kafka_dev bash
 Once inside the container:
 
 ```bash
-# Update Rust toolchain (required for pgrx 0.12.6 dependencies)
+# Update Rust toolchain (required for pgrx 0.16.1 dependencies)
 rustup update
 
 # Initialize pgrx (if not already done - auto-runs via devcontainer postCreateCommand)
@@ -67,7 +67,7 @@ cargo pgrx package                   # Creates installable package
 cargo pgrx schema pg14               # Generate SQL schema files
 ```
 
-**Note:** The project includes a [rust-toolchain.toml](rust-toolchain.toml) that specifies Rust nightly, which is required for the `home` crate dependency that uses edition2024 features (needed by pgrx 0.12.6). The default feature is `pg14` as specified in [Cargo.toml](Cargo.toml).
+**Note:** The project includes a [rust-toolchain.toml](rust-toolchain.toml) that specifies Rust nightly, which is required for the `home` crate dependency that uses edition2024 features (needed by pgrx 0.16.1). The default feature is `pg14` as specified in [Cargo.toml](Cargo.toml).
 
 ## Current Codebase Structure
 
@@ -183,7 +183,7 @@ CREATE TABLE kafka.topics (
 - Implement Long Polling via ConditionVariable
 - Test: `kcat -C` reads data back
 
-### Phase 4: Shadow Mode (Staff Level Feature)
+### Phase 4: Shadow Mode (Key Feature)
 - Implement Logical Decoding client
 - Integrate rdkafka crate for external Kafka production
 - Only advance Replication Slot LSN after external broker ACK (At-Least-Once delivery)
@@ -197,7 +197,7 @@ CREATE TABLE kafka.topics (
 
 ## Key Dependencies
 
-- **pgrx 0.12.6:** Postgres extension framework for Rust (requires nightly toolchain)
+- **pgrx 0.16.1:** Postgres extension framework for Rust (requires nightly toolchain)
 - **tokio:** (Planned) Async runtime embedded in BackgroundWorker
 - **rdkafka:** (Planned) Rust Kafka client for Shadow Mode replication
 - Kafka Wire Protocol v2+ specification

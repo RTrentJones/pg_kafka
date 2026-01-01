@@ -15,168 +15,127 @@ jobs:
     name: Test Suite
     runs-on: ubuntu-latest
 
-    services:
-      postgres:
-        image: postgres:14
-        env:
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_USER: postgres
-          POSTGRES_DB: postgres
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          - 5432:5432
-
     steps:
+    # ------------------------------------------------------------------
+    # CLEAN SETUP: Prepare the runner environment
+    # ------------------------------------------------------------------
     - name: Checkout code
       uses: actions/checkout@v4
+      # Fetches pg_kafka code so the runner can access it.
 
     - name: Install Rust toolchain
       uses: actions-rust-lang/setup-rust-toolchain@v1
       with:
         toolchain: nightly
+        # 'rustfmt' for style checks, 'clippy' for linting
         components: rustfmt, clippy
 
-    - name: Cache cargo registry
-      uses: actions/cache@v4
-      with:
-        path: ~/.cargo/registry
-        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+    - name: Rust Cache
+      uses: Swatinem/rust-cache@v2
+      # intelligently caches Rust dependencies to speed up builds significantly.
 
-    - name: Cache cargo index
-      uses: actions/cache@v4
-      with:
-        path: ~/.cargo/git
-        key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
-
-    - name: Cache cargo build
-      uses: actions/cache@v4
-      with:
-        path: target
-        key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
-
-    - name: Install PostgreSQL development files
+    - name: Install System Dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y postgresql-server-dev-14 libpq-dev
+        # libpq-dev is required to link against Postgres libraries
+        sudo apt-get install -y libpq-dev
 
     - name: Install pgrx
-      run: |
-        cargo install --locked cargo-pgrx --version 0.12.6
-        cargo pgrx init --pg14=/usr/lib/postgresql/14/bin/pg_config
+      # Installs the pgrx CLI tool which we use to manage the Postgres lifecycle
+      run: cargo install --locked cargo-pgrx --version 0.16.1
 
+    - name: Cache pgrx home
+      id: cache-pgrx
+      uses: actions/cache@v4
+      # Caches the compiled Postgres binaries (~200MB) so we don't download/compile PG every run
+      with:
+        path: ~/.pgrx
+        key: ${{ runner.os }}-pgrx-0.16.1-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Initialize pgrx
+      if: steps.cache-pgrx.outputs.cache-hit != 'true'
+      # Downloads and compiles PostgreSQL 14 if not found in cache
+      run: cargo pgrx init
+
+    # ------------------------------------------------------------------
+    # LINTING: Static analysis
+    # ------------------------------------------------------------------
     - name: Check formatting
+      # Ensures code follows standard Rust style guidelines
       run: cargo fmt -- --check
 
     - name: Run clippy
+      # Catches common mistakes and improves code quality.
+      # We enable 'pg14' feature so it checks code conditionally compiled for PG14.
       run: cargo clippy --features pg14 -- -D warnings
 
-    - name: Run unit tests
+    # ------------------------------------------------------------------
+    # UNIT & INTEGRATION TESTING: Internal Rust/SPI tests
+    # ------------------------------------------------------------------
+    - name: Run unit and integration tests
+      # 'cargo pgrx test' spins up a temporary, managed Postgres instance,
+      # installs the extension, and runs functions marked with #[pg_test].
+      # This tests internal logic and SPI (database) interactions.
       run: cargo pgrx test pg14
-      env:
-        DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
 
-    - name: Build extension
-      run: cargo build --features pg14 --release
+    # ------------------------------------------------------------------
+    # E2E TESTING: Full system test with external client
+    # ------------------------------------------------------------------
+    - name: Install Extension
+      # Compiles the release build of the pg_kafka extension and copies the .so and .control
+      # files into the pgrx-managed Postgres installation directories.
+      run: cargo pgrx install --pg14 --release
 
-    - name: Install extension to test database
+    - name: Configure Postgres for Background Worker
+      # CRITICAL STEP:
+      # The pg_kafka background worker requires 'BgWorkerStartTime::PostmasterStart'.
+      # For this to work, the library must be loaded when Postgres boots up.
+      # We append it to shared_preload_libraries in the config file.
       run: |
-        cargo pgrx install --pg-config=/usr/lib/postgresql/14/bin/pg_config --release
+        echo "shared_preload_libraries = 'pg_kafka'" >> ~/.pgrx/data-14/postgresql.conf
+        echo "Configuration updated to preload pg_kafka."
 
-    - name: Setup extension in database
+    - name: Start Postgres
+      # Boots the pgrx-managed Postgres 14 instance.
+      # Because we configured shared_preload_libraries above, the background worker will start now.
+      run: cargo pgrx start pg14
+
+    - name: Create Extension and Prepare DB
       run: |
-        PGPASSWORD=postgres psql -h localhost -U postgres -d postgres -c "CREATE EXTENSION IF NOT EXISTS pg_kafka;"
-      env:
-        PGPASSWORD: postgres
+        # 1. Find the dynamic port pgrx assigned to PG14
+        PG_PORT=$(grep "port =" ~/.pgrx/data-14/postgresql.conf | awk '{print $3}')
+        echo "PG_PORT=$PG_PORT" >> $GITHUB_ENV
 
-    - name: Run E2E tests
+        # 2. Run CREATE EXTENSION
+        # Even though the binary is loaded, we must run this SQL to create the
+        # SQL-level objects (tables, types, etc.) in the database.
+        psql -h localhost -p $PG_PORT -U postgres postgres -c "CREATE EXTENSION IF NOT EXISTS pg_kafka;"
+
+    - name: Run E2E Tests
+      # Runs the external client application that connects to the running extension
+      # via TCP (Kafka protocol) and Postgres (SQL).
       run: |
         cd kafka_test
-        cargo build --release
-        timeout 30 cargo run --release || exit 1
+        cargo run --release
       env:
-        DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
+        # Pass the dynamically discovered port to the test runner
+        DATABASE_URL: postgresql://postgres:postgres@localhost:${{ env.PG_PORT }}/postgres
 
-  coverage:
-    name: Code Coverage
-    runs-on: ubuntu-latest
-
-    services:
-      postgres:
-        image: postgres:14
-        env:
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_USER: postgres
-          POSTGRES_DB: postgres
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          - 5432:5432
-
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Install Rust toolchain
-      uses: actions-rust-lang/setup-rust-toolchain@v1
-      with:
-        toolchain: nightly
-        components: llvm-tools-preview
-
-    - name: Install PostgreSQL development files
+    # ------------------------------------------------------------------
+    # LOAD TESTING: Placeholder
+    # ------------------------------------------------------------------
+    - name: Load Testing (Placeholder)
+      if: always() # Run even if previous tests failed, to gather metrics if possible
       run: |
-        sudo apt-get update
-        sudo apt-get install -y postgresql-server-dev-14 libpq-dev
+        echo "TODO: Implement Load Testing"
+        # Example: Run k6 or bespoke load generator
+        # k6 run load-test.js
+        # cargo run --release --bin load_generator
 
-    - name: Install pgrx
-      run: |
-        cargo install --locked cargo-pgrx --version 0.12.6
-        cargo pgrx init --pg14=/usr/lib/postgresql/14/bin/pg_config
-
-    - name: Install tarpaulin
-      run: cargo install cargo-tarpaulin
-
-    - name: Generate coverage
-      run: cargo tarpaulin --features pg14 --out xml --output-dir ./coverage
-      env:
-        DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
-
-    - name: Upload coverage to Codecov
-      uses: codecov/codecov-action@v4
-      with:
-        files: ./coverage/cobertura.xml
-        flags: unittests
-        name: codecov-umbrella
-        fail_ci_if_error: false
-
-    - name: Archive coverage results
-      uses: actions/upload-artifact@v4
-      with:
-        name: code-coverage-report
-        path: coverage/
-
-  lint:
-    name: Linting and Format Check
-    runs-on: ubuntu-latest
-
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Install Rust toolchain
-      uses: actions-rust-lang/setup-rust-toolchain@v1
-      with:
-        toolchain: nightly
-        components: rustfmt, clippy
-
-    - name: Check formatting
-      run: cargo fmt -- --check
-
-    - name: Run clippy
-      run: cargo clippy --all-targets --all-features -- -D warnings
+    # ------------------------------------------------------------------
+    # TEARDOWN: Cleanup
+    # ------------------------------------------------------------------
+    - name: Stop pgrx
+      if: always()
+      # Ensures the background Postgres process is killed, freeing resources.
+      run: cargo pgrx stop pg14

@@ -108,7 +108,7 @@ We cannot block the Postgres main loop. We must use pgrx's background worker sup
 2. **Wait:** If no rows return, we must simulate Kafka's "Long Poll."
 3. **Implementation:** Use Postgres `LISTEN/NOTIFY`. The Fetch handler waits on a condition variable. The Produce handler fires `NOTIFY` upon commit.
 
-### 5.3 Shadow Replication (The "Staff" Feature)
+### 5.3 Shadow Replication (The Key Scaling Feature)
 
 To achieve the "Soft Cutover," we avoid dual-writing in the application.
 
@@ -171,7 +171,7 @@ pg_create_logical_replication_slot('pg_kafka_shadow', 'pgoutput')
 - Implement `FetchRequest`.
 - Implement "Long Polling" via ConditionVariable.
 
-### Phase 4: Shadow Mode (Staff Level)
+### Phase 4: Shadow Mode (Key Scaling Feature)
 
 **Objective:** Data written to Port 9092 appears in Confluent Cloud.
 
@@ -182,7 +182,7 @@ pg_create_logical_replication_slot('pg_kafka_shadow', 'pgoutput')
 
 ---
 
-## 8. Why this is "Staff Engineering"
+## 8. Why this?
 
 - **Protocol Engineering:** Implementing binary wire protocols requires exactness and low-level buffer manipulation.
 - **Systems Integration:** Embedding an async runtime (tokio) inside a synchronous process model (postgres) is non-trivial.
