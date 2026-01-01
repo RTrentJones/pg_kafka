@@ -8,6 +8,9 @@
 // connections efficiently without blocking the Postgres main loop.
 
 use tokio::net::{TcpListener, TcpStream};
+use tokio_util::codec::{Framed, LengthDelimitedCodec};
+use futures::stream::StreamExt;
+use futures::sink::SinkExt;
 
 use super::messages;
 use super::protocol;
@@ -81,13 +84,24 @@ pub async fn run(
 /// Step 3: Parse Kafka protocol requests and send responses
 ///
 /// Flow:
-/// 1. Read request from socket
+/// 1. Read request from socket (using LengthDelimitedCodec for automatic framing)
 /// 2. Parse request and send to main thread via queue
 /// 3. Wait for response from main thread
 /// 4. Encode and send response back to client
 /// 5. Repeat until client disconnects
-async fn handle_connection(mut socket: TcpStream) -> Result<(), Box<dyn std::error::Error>> {
+async fn handle_connection(socket: TcpStream) -> Result<(), Box<dyn std::error::Error>> {
     pg_log!("New connection established, starting handle loop");
+
+    // Wrap socket in LengthDelimitedCodec for automatic size-prefix framing
+    // Kafka uses big-endian 4-byte size prefix
+    let mut framed = Framed::new(
+        socket,
+        LengthDelimitedCodec::builder()
+            .big_endian()
+            .length_field_length(4)
+            .max_frame_length(100_000_000) // MAX_REQUEST_SIZE
+            .new_codec(),
+    );
 
     // Create a channel for this specific connection's responses
     // The main thread will send responses back to us via this channel
@@ -99,9 +113,26 @@ async fn handle_connection(mut socket: TcpStream) -> Result<(), Box<dyn std::err
 
     // Connection loop: handle multiple requests on the same connection
     loop {
-        // Parse the next request from the socket
-        pg_log!("Calling parse_request...");
-        match protocol::parse_request(&mut socket, response_tx.clone()).await {
+        // Read the next frame from the socket
+        // LengthDelimitedCodec automatically handles size prefix
+        pg_log!("Waiting for next frame from client...");
+        let frame = match framed.next().await {
+            Some(Ok(bytes)) => bytes,
+            Some(Err(e)) => {
+                pg_warning!("Error reading frame: {}", e);
+                break;
+            }
+            None => {
+                // Client closed connection gracefully
+                pg_log!("Client closed connection (stream ended)");
+                break;
+            }
+        };
+
+        pg_log!("Received frame of {} bytes", frame.len());
+
+        // Parse the request from the frame bytes
+        match protocol::parse_request(frame, response_tx.clone()) {
             Ok(Some(request)) => {
                 pg_log!("Request parsed successfully, sending to main worker thread...");
                 // Send the parsed request to the main worker thread for processing
@@ -111,20 +142,30 @@ async fn handle_connection(mut socket: TcpStream) -> Result<(), Box<dyn std::err
                 }
                 pg_log!("Request sent to worker thread successfully via request_tx");
 
-
                 // Wait for the response from the main thread
                 // CRITICAL: Using tokio channel's async .recv() instead of blocking crossbeam recv()
                 // This allows the tokio runtime to continue processing other tasks
                 pg_log!("Waiting for response from main thread via response_rx...");
                 match response_rx.recv().await {
                     Some(response) => {
-                        pg_log!("Received response from main thread, sending to client...");
-                        // Encode and send the response back to the client
-                        if let Err(e) = protocol::send_response(&mut socket, response).await {
-                            pg_warning!("Failed to send response to client: {}", e);
-                            break;
+                        pg_log!("Received response from main thread, encoding...");
+                        // Encode the response
+                        match protocol::encode_response(response) {
+                            Ok(response_bytes) => {
+                                pg_log!("Sending {} byte response to client...", response_bytes.len());
+                                // Send the response frame
+                                // LengthDelimitedCodec automatically adds size prefix
+                                if let Err(e) = framed.send(response_bytes.freeze()).await {
+                                    pg_warning!("Failed to send response to client: {}", e);
+                                    break;
+                                }
+                                pg_log!("Response sent to client successfully");
+                            }
+                            Err(e) => {
+                                pg_warning!("Failed to encode response: {}", e);
+                                break;
+                            }
                         }
-                        pg_log!("Response sent to client successfully");
                     }
                     None => {
                         pg_warning!("Response channel closed by worker thread");
@@ -133,7 +174,7 @@ async fn handle_connection(mut socket: TcpStream) -> Result<(), Box<dyn std::err
                 }
             }
             Ok(None) => {
-                // Client closed the connection gracefully
+                // Parse error with error response already sent
                 break;
             }
             Err(e) => {

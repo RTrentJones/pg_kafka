@@ -19,8 +19,6 @@ use kafka_protocol::messages::produce_response::{
 use kafka_protocol::messages::{BrokerId, ResponseHeader, TopicName};
 use kafka_protocol::protocol::{Decodable, Encodable};
 use kafka_protocol::records::RecordBatchDecoder;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 
 use super::constants::*;
 use super::error::{KafkaError, Result};
@@ -29,12 +27,10 @@ use super::messages::{KafkaRequest, KafkaResponse};
 // Import conditional logging macros for test isolation
 use crate::{pg_log, pg_warning};
 
-/// Parse a Kafka request from a TCP socket
+/// Parse a Kafka request from a frame
 ///
-/// Kafka request format:
-/// ```
-/// [4 bytes: Size] [RequestHeader] [RequestBody]
-/// ```
+/// The frame has already been extracted by LengthDelimitedCodec, so we only need to parse:
+/// [RequestHeader] [RequestBody]
 ///
 /// RequestHeader contains:
 /// - api_key: i16 (which API this is, e.g., 18 = ApiVersions)
@@ -42,41 +38,15 @@ use crate::{pg_log, pg_warning};
 /// - correlation_id: i32 (client-assigned ID for matching responses)
 /// - client_id: nullable string (client identifier)
 ///
-/// Returns None if the connection is closed gracefully
-pub async fn parse_request(
-    socket: &mut TcpStream,
+/// Returns None if there's a parse error with error response already sent
+pub fn parse_request(
+    frame: BytesMut,
     response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
 ) -> Result<Option<KafkaRequest>> {
-    // Step 1: Read the 4-byte size header (big-endian)
-    pg_log!("Waiting to read size header...");
-    let mut size_buf = [0u8; 4];
-    match socket.read_exact(&mut size_buf).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-            // Client closed connection gracefully
-            pg_log!("Client closed connection (EOF on size read)");
-            return Ok(None);
-        }
-        Err(e) => {
-            pg_warning!("Error reading size header: {}", e);
-            return Err(e.into());
-        }
-    }
+    pg_log!("Parsing request from {} byte frame", frame.len());
 
-    let size = i32::from_be_bytes(size_buf);
-    pg_log!("Received request of size: {} bytes (size_buf: {:?})", size, size_buf);
-
-    if size <= 0 || size > MAX_REQUEST_SIZE {
-        return Err(KafkaError::InvalidRequestSize(size));
-    }
-
-    // Step 2: Read the request payload (header + body)
-    let mut payload = vec![0u8; size as usize];
-    socket.read_exact(&mut payload).await?;
-    pg_log!("Read payload: {} bytes, first 10 bytes: {:?}", payload.len(), &payload[..payload.len().min(10)]);
-
-    // Step 3: Parse RequestHeader to determine which API this is
-    let mut payload_buf = bytes::Bytes::from(payload);
+    // Parse RequestHeader to determine which API this is
+    let mut payload_buf = frame.freeze();
 
     // Read api_key and api_version first to know which API this is
     pg_log!("Buffer remaining before parsing: {} bytes", payload_buf.remaining());
@@ -144,22 +114,46 @@ pub async fn parse_request(
             }))
         }
         API_KEY_METADATA => {
-            // Metadata request
-            // For now, we'll parse the basic structure but accept any topic list
-            // In Phase 2, we'll actually query the database for topic metadata
+            // Metadata request - parse using kafka-protocol crate
             pg_log!("Parsed Metadata request (api_key={}, version={})", API_KEY_METADATA, api_version);
 
-            // Parse the rest of the request body to extract topic names
-            // For Step 4, we'll just use a simplified approach and ignore the topic list
-            // The client_id was already skipped, and we have the remaining body in payload_buf
+            // Use kafka-protocol crate to decode MetadataRequest
+            let metadata_req = match kafka_protocol::messages::metadata_request::MetadataRequest::decode(&mut payload_buf, api_version) {
+                Ok(req) => req,
+                Err(e) => {
+                    pg_warning!("Failed to decode MetadataRequest: {}", e);
+                    let error_response = KafkaResponse::Error {
+                        correlation_id,
+                        error_code: ERROR_CORRUPT_MESSAGE,
+                        error_message: Some(format!("Malformed MetadataRequest: {}", e)),
+                    };
+                    let _ = response_tx.send(error_response);
+                    return Ok(None);
+                }
+            };
 
-            // TODO: Properly parse MetadataRequest body using kafka-protocol crate
-            // For now, return a request with empty topics list (means "all topics")
+            // Extract requested topics (None means "all topics")
+            let topics = if metadata_req.topics.is_none() || metadata_req.topics.as_ref().unwrap().is_empty() {
+                pg_log!("Metadata request for ALL topics");
+                None
+            } else {
+                let topic_names: Vec<String> = metadata_req.topics.unwrap()
+                    .iter()
+                    .filter_map(|t| t.name.as_ref().map(|n| n.to_string()))
+                    .collect();
+                pg_log!("Metadata request for specific topics: {:?}", topic_names);
+                if topic_names.is_empty() {
+                    None
+                } else {
+                    Some(topic_names)
+                }
+            };
+
             Ok(Some(KafkaRequest::Metadata {
                 correlation_id,
                 client_id,
                 api_version,
-                topics: None, // None means "all topics"
+                topics,
                 response_tx,
             }))
         }
@@ -422,10 +416,10 @@ fn parse_record_batch(batch_bytes: &bytes::Bytes) -> Result<Vec<super::messages:
 /// ```
 /// [4 bytes: Size] [ResponseHeader] [ResponseBody]
 /// ```
-pub async fn send_response(
-    socket: &mut TcpStream,
-    response: KafkaResponse,
-) -> Result<()> {
+/// Encode a Kafka response into bytes
+///
+/// Returns the response payload (without size prefix, as LengthDelimitedCodec handles that)
+pub fn encode_response(response: KafkaResponse) -> Result<BytesMut> {
     let mut response_buf = BytesMut::new();
 
     match response {
@@ -607,37 +601,18 @@ pub async fn send_response(
         }
     }
 
-    // Prepend the size header (4 bytes, big-endian)
-    let size = response_buf.len() as i32;
-
-    // DEBUG: Log what we're about to send
-    let size_bytes = size.to_be_bytes();
+    // DEBUG: Log what we're encoding
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open("/tmp/pg_kafka_send.log")
     {
         use std::io::Write;
-        let _ = writeln!(f, "Sending: size_prefix={:?}, size={}, payload_len={}",
-            &size_bytes, size, response_buf.len());
+        let _ = writeln!(f, "Encoded response: {} bytes", response_buf.len());
         let _ = writeln!(f, "  Payload: {:?}", &response_buf[..]);
     }
 
-    socket.write_all(&size_bytes).await?;
-
-    // Write the response payload
-    socket.write_all(&response_buf).await?;
-
-    // Flush to ensure data is sent
-    socket.flush().await?;
-
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .append(true)
-        .open("/tmp/pg_kafka_send.log")
-    {
-        use std::io::Write;
-        let _ = writeln!(f, "  Successfully sent {} + {} = {} bytes", 4, response_buf.len(), 4 + response_buf.len());
-    }
-
-    Ok(())
+    // Return the response payload
+    // LengthDelimitedCodec will automatically add the 4-byte size prefix
+    Ok(response_buf)
 }

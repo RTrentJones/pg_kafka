@@ -203,6 +203,46 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
 /// - `Spi::connect()`: Opens a connection to the Postgres database
 /// - `|client| { ... }`: This is a "closure" (anonymous function) that receives the SPI client
 /// - `?` operator: Propagates errors up the call stack (like try/catch in other languages)
+/// Get metadata for all topics in the database
+fn get_all_topics_metadata() -> Vec<crate::kafka::messages::TopicMetadata> {
+    use crate::kafka::constants::*;
+    use crate::kafka::messages::{TopicMetadata, PartitionMetadata};
+
+    // Query all topics from the database
+    // We need to extract data inside the SPI connection closure due to lifetimes
+    Spi::connect(|client| {
+        let table = match client.select(
+            "SELECT name FROM kafka.topics ORDER BY name",
+            None,
+            &[],
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                pg_warning!("Failed to query topics from database: {}", e);
+                return Vec::new(); // Return empty list on error
+            }
+        };
+
+        let mut topics_metadata = Vec::new();
+        for row in table {
+            if let Ok(Some(name)) = row.get::<&str>(1) {
+                topics_metadata.push(TopicMetadata {
+                    error_code: ERROR_NONE,
+                    name: name.to_string(),
+                    partitions: vec![PartitionMetadata {
+                        error_code: ERROR_NONE,
+                        partition_index: 0,
+                        leader_id: DEFAULT_BROKER_ID,
+                        replica_nodes: vec![DEFAULT_BROKER_ID],
+                        isr_nodes: vec![DEFAULT_BROKER_ID],
+                    }],
+                });
+            }
+        }
+        topics_metadata
+    })
+}
+
 fn get_or_create_topic(topic_name: &str) -> Result<i32, Box<dyn std::error::Error>> {
     pg_log!("get_or_create_topic: '{}'", topic_name);
 
@@ -466,7 +506,7 @@ pub fn process_request(request: crate::kafka::KafkaRequest) {
             correlation_id,
             client_id,
             api_version,
-            topics: _requested_topics,
+            topics: requested_topics,
             response_tx,
         } => {
             pg_log!("Processing Metadata request, correlation_id: {}", correlation_id);
@@ -480,36 +520,65 @@ pub fn process_request(request: crate::kafka::KafkaRequest) {
             // CRITICAL: Convert bind address to advertised address
             // We bind to 0.0.0.0 (all interfaces) but must advertise a routable address
             // that clients can actually connect to. If host is 0.0.0.0, advertise localhost.
-            let advertised_host = if config.host == "0.0.0.0" {
+            let advertised_host = if config.host == "0.0.0.0" || config.host.is_empty() {
+                pg_log!("Converting bind address '{}' to advertised address 'localhost'", config.host);
                 "localhost".to_string()
             } else {
+                pg_log!("Using configured host '{}' as advertised address", config.host);
                 config.host.clone()
             };
 
-            // Step 4: Hardcoded metadata response
-            // In Phase 2, we'll query kafka.topics and kafka.messages tables via SPI
-            //
-            // For now, we return:
-            // - 1 broker (ourselves)
-            // - 1 test topic with 1 partition
+            // Build broker list
             let brokers = vec![BrokerMetadata {
                 node_id: DEFAULT_BROKER_ID,
-                host: advertised_host,         // Routable address (NOT 0.0.0.0)
-                port: config.port,             // From GUC (default: 9092)
-                rack: None,                    // No rack awareness in single-node setup
+                host: advertised_host,
+                port: config.port,
+                rack: None,
             }];
 
-            let topics = vec![TopicMetadata {
-                error_code: ERROR_NONE,
-                name: "test-topic".to_string(),
-                partitions: vec![PartitionMetadata {
-                    error_code: ERROR_NONE,
-                    partition_index: 0, // Partition 0 (first and only partition)
-                    leader_id: DEFAULT_BROKER_ID,
-                    replica_nodes: vec![DEFAULT_BROKER_ID],
-                    isr_nodes: vec![DEFAULT_BROKER_ID],
-                }],
-            }];
+            // Build topic metadata based on what was requested
+            use crate::kafka::messages::{TopicMetadata, PartitionMetadata};
+            let topics = match requested_topics {
+                None => {
+                    // Client wants all topics - query from database
+                    pg_log!("Building metadata for ALL topics");
+                    get_all_topics_metadata()
+                }
+                Some(topic_names) => {
+                    // Client wants specific topics - create them if needed and return metadata
+                    pg_log!("Building metadata for requested topics: {:?}", topic_names);
+                    let mut topics_metadata = Vec::new();
+                    for topic_name in topic_names {
+                        // Auto-create topic if it doesn't exist
+                        match get_or_create_topic(&topic_name) {
+                            Ok(_topic_id) => {
+                                // Return metadata for this topic
+                                topics_metadata.push(TopicMetadata {
+                                    error_code: ERROR_NONE,
+                                    name: topic_name,
+                                    partitions: vec![PartitionMetadata {
+                                        error_code: ERROR_NONE,
+                                        partition_index: 0,
+                                        leader_id: DEFAULT_BROKER_ID,
+                                        replica_nodes: vec![DEFAULT_BROKER_ID],
+                                        isr_nodes: vec![DEFAULT_BROKER_ID],
+                                    }],
+                                });
+                            }
+                            Err(e) => {
+                                pg_warning!("Failed to get/create topic '{}': {}", topic_name, e);
+                                // Return error for this topic
+                                topics_metadata.push(TopicMetadata {
+                                    error_code: ERROR_UNKNOWN_SERVER_ERROR,
+                                    name: topic_name,
+                                    partitions: vec![],
+                                });
+                            }
+                        }
+                    }
+                    topics_metadata
+                }
+            };
 
             pg_log!(
                 "Building Metadata response with {} brokers and {} topics",
