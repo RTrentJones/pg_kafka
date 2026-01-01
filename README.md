@@ -235,10 +235,32 @@ pg_kafka.shutdown_timeout_ms = 5000     -- Shutdown timeout (default: 5000ms)
 shared_preload_libraries = 'pg_kafka'
 ```
 
+## ⚡ Performance Tuning
+
+For high-throughput workloads (>10,000 messages/sec), consider applying aggressive autovacuum settings:
+
+```bash
+# Optional: Apply performance tuning for kafka.messages table
+psql -d your_database -f sql/tune_autovacuum.sql
+```
+
+This configures the `kafka.messages` table to vacuum more frequently, preventing index bloat in high-churn scenarios.
+
+**Benchmark Validation:** PostgreSQL can handle 1M+ reads/sec and 200K+ writes/sec on a single node when properly tuned. See [.github/PERFORMANCE.md](.github/PERFORMANCE.md) for detailed benchmarks and configuration recommendations.
+
+**Key Recommendations:**
+- Use `autovacuum_vacuum_scale_factor = 0.05` for high-throughput tables
+- Enable `huge_pages = on` for systems with 64GB+ RAM
+- Consider partitioning `kafka.messages` for retention policies (Phase 3+)
+
+See the [Performance Guide](.github/PERFORMANCE.md) for complete tuning recommendations.
+
 ## 📚 Documentation
 
 - **[CLAUDE.md](CLAUDE.md)** - Development workflow, commands, architecture overview
 - **[PROJECT.md](PROJECT.md)** - Complete design document with technical details
+- **[.github/PERFORMANCE.md](.github/PERFORMANCE.md)** - Performance tuning, benchmarks, and configuration recommendations
+- **[.github/SETUP.md](.github/SETUP.md)** - CI/CD pipeline setup guide
 - **[STEP4_SUMMARY.md](STEP4_SUMMARY.md)** - Phase 1 implementation summary
 - **[PHASE_1.5_PLAN.md](PHASE_1.5_PLAN.md)** - Unit test coverage plan
 - [pgrx Documentation](https://docs.rs/pgrx/latest/pgrx/)
