@@ -25,3 +25,6 @@ target
 *.iml
 **/*.rs.bk
 Cargo.lock
+
+# Claude generated files during development
+.documents/

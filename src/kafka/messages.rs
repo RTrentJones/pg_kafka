@@ -26,6 +26,8 @@ pub enum KafkaRequest {
         correlation_id: i32,
         /// Optional client identifier string
         client_id: Option<String>,
+        /// API version from the request (needed for response encoding)
+        api_version: i16,
         /// Channel to send the response back to the specific connection
         /// Using tokio::sync::mpsc for async-friendly response delivery
         response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
@@ -36,13 +38,31 @@ pub enum KafkaRequest {
         correlation_id: i32,
         /// Optional client identifier string
         client_id: Option<String>,
+        /// API version from the request (needed for response encoding)
+        api_version: i16,
         /// List of topics to get metadata for (None = all topics)
         topics: Option<Vec<String>>,
         /// Channel to send the response back to the specific connection
         response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
     },
+    /// Produce request - write messages to topic partitions
+    Produce {
+        /// Correlation ID from client - MUST be echoed back in response
+        correlation_id: i32,
+        /// Optional client identifier string
+        client_id: Option<String>,
+        /// API version from the request (needed for response encoding)
+        api_version: i16,
+        /// Acknowledgment level (0=none, 1=leader, -1=all ISR)
+        acks: i16,
+        /// Timeout for waiting for acknowledgments (milliseconds)
+        timeout_ms: i32,
+        /// Topic data (topic → partitions → records)
+        topic_data: Vec<TopicProduceData>,
+        /// Channel to send the response back to the specific connection
+        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
+    },
     // Future requests to add:
-    // Produce { ... },
     // Fetch { ... },
 }
 
@@ -53,6 +73,8 @@ pub enum KafkaResponse {
     ApiVersions {
         /// Correlation ID from request - client uses this to match responses
         correlation_id: i32,
+        /// API version to use for encoding the response
+        api_version: i16,
         /// List of supported API keys and their version ranges
         api_versions: Vec<ApiVersion>,
     },
@@ -60,10 +82,21 @@ pub enum KafkaResponse {
     Metadata {
         /// Correlation ID from request
         correlation_id: i32,
+        /// API version from the request (needed for response encoding)
+        api_version: i16,
         /// List of brokers in the cluster
         brokers: Vec<BrokerMetadata>,
         /// List of topics and their partitions
         topics: Vec<TopicMetadata>,
+    },
+    /// Produce response - acknowledgment of written messages
+    Produce {
+        /// Correlation ID from request
+        correlation_id: i32,
+        /// API version from the request (needed for response encoding)
+        api_version: i16,
+        /// Per-topic responses with partition offsets
+        responses: Vec<TopicProduceResponse>,
     },
     /// Error response for unsupported or malformed requests
     Error {
@@ -149,6 +182,71 @@ pub struct PartitionMetadata {
     /// In real Kafka: subset of replica_nodes that are caught up
     /// For pg_kafka: [1] (we're always in-sync with ourselves)
     pub isr_nodes: Vec<i32>,
+}
+
+/// Data for producing to a topic
+#[derive(Debug, Clone)]
+pub struct TopicProduceData {
+    /// Topic name
+    pub name: String,
+    /// Partitions to write to
+    pub partitions: Vec<PartitionProduceData>,
+}
+
+/// Data for producing to a partition
+#[derive(Debug, Clone)]
+pub struct PartitionProduceData {
+    /// Partition ID
+    pub partition_index: i32,
+    /// Records to write
+    pub records: Vec<Record>,
+}
+
+/// A single Kafka record/message
+#[derive(Debug, Clone)]
+pub struct Record {
+    /// Optional message key (used for partitioning and log compaction)
+    pub key: Option<Vec<u8>>,
+    /// Optional message value (payload)
+    pub value: Option<Vec<u8>>,
+    /// Message headers (key-value metadata)
+    pub headers: Vec<RecordHeader>,
+    /// Timestamp (milliseconds since epoch, optional)
+    pub timestamp: Option<i64>,
+}
+
+/// Record header (key-value metadata)
+#[derive(Debug, Clone)]
+pub struct RecordHeader {
+    /// Header key (UTF-8 string)
+    pub key: String,
+    /// Header value (binary data)
+    pub value: Vec<u8>,
+}
+
+/// Response for a topic in ProduceResponse
+#[derive(Debug, Clone)]
+pub struct TopicProduceResponse {
+    /// Topic name
+    pub name: String,
+    /// Per-partition responses
+    pub partitions: Vec<PartitionProduceResponse>,
+}
+
+/// Response for a partition in ProduceResponse
+#[derive(Debug, Clone)]
+pub struct PartitionProduceResponse {
+    /// Partition ID
+    pub partition_index: i32,
+    /// Error code (0 = success)
+    pub error_code: i16,
+    /// Base offset assigned to the first message in the batch
+    /// This is the partition_offset (NOT global_offset)
+    pub base_offset: i64,
+    /// Timestamp when the log was appended (-1 if not used)
+    pub log_append_time: i64,
+    /// Earliest available offset in this partition (-1 if not tracked)
+    pub log_start_offset: i64,
 }
 
 // Global request queue: async tasks → main thread

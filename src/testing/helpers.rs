@@ -26,6 +26,7 @@ pub fn mock_api_versions_request(
     let request = KafkaRequest::ApiVersions {
         correlation_id,
         client_id: None,
+        api_version: 3, // Default to v3 for tests
         response_tx,
     };
 
@@ -45,6 +46,7 @@ pub fn mock_api_versions_request_with_client(
     let request = KafkaRequest::ApiVersions {
         correlation_id,
         client_id: Some(client_id),
+        api_version: 3, // Default to v3 for tests
         response_tx,
     };
 
@@ -71,6 +73,7 @@ pub fn mock_metadata_request(
     let request = KafkaRequest::Metadata {
         correlation_id,
         client_id: None,
+        api_version: 4,  // Default to v4 for tests
         topics,
         response_tx,
     };
@@ -92,6 +95,7 @@ pub fn mock_metadata_request_with_client(
     let request = KafkaRequest::Metadata {
         correlation_id,
         client_id: Some(client_id),
+        api_version: 4,  // Default to v4 for tests
         topics,
         response_tx,
     };

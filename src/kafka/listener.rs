@@ -12,6 +12,9 @@ use tokio::net::{TcpListener, TcpStream};
 use super::messages;
 use super::protocol;
 
+// Import conditional logging macros for test isolation
+use crate::{pg_log, pg_warning};
+
 /// Run the TCP listener
 ///
 /// This is the main entry point for the Kafka protocol listener.
@@ -33,7 +36,7 @@ pub async fn run(
     let bind_addr = format!("{}:{}", host, port);
     let listener = TcpListener::bind(&bind_addr).await?;
 
-    pgrx::log!("pg_kafka TCP listener bound to {}", bind_addr);
+    pg_log!("pg_kafka TCP listener bound to {}", bind_addr);
 
     // Accept loop: wait for new connections OR shutdown signal
     loop {
@@ -44,26 +47,26 @@ pub async fn run(
                     Ok((socket, addr)) => {
                         // Log connection if configured
                         if log_connections {
-                            pgrx::log!("Accepted connection from {}", addr);
+                            pg_log!("Accepted connection from {}", addr);
                         }
 
                         // Spawn a new async task to handle this connection
                         // Use task_local::spawn_local since we're in a LocalSet (single-threaded)
                         tokio::task::spawn_local(async move {
                             if let Err(e) = handle_connection(socket).await {
-                                pgrx::warning!("Error handling connection: {}", e);
+                                pg_warning!("Error handling connection: {}", e);
                             }
                         });
                     }
                     Err(e) => {
-                        pgrx::warning!("Error accepting connection: {}", e);
+                        pg_warning!("Error accepting connection: {}", e);
                     }
                 }
             }
             // Wait for shutdown signal
             _ = shutdown_rx.changed() => {
                 if *shutdown_rx.borrow() {
-                    pgrx::log!("TCP listener received shutdown signal");
+                    pg_log!("TCP listener received shutdown signal");
                     break;
                 }
             }
@@ -84,7 +87,7 @@ pub async fn run(
 /// 4. Encode and send response back to client
 /// 5. Repeat until client disconnects
 async fn handle_connection(mut socket: TcpStream) -> Result<(), Box<dyn std::error::Error>> {
-    pgrx::log!("New connection established, starting handle loop");
+    pg_log!("New connection established, starting handle loop");
 
     // Create a channel for this specific connection's responses
     // The main thread will send responses back to us via this channel
@@ -97,34 +100,34 @@ async fn handle_connection(mut socket: TcpStream) -> Result<(), Box<dyn std::err
     // Connection loop: handle multiple requests on the same connection
     loop {
         // Parse the next request from the socket
-        pgrx::log!("Calling parse_request...");
+        pg_log!("Calling parse_request...");
         match protocol::parse_request(&mut socket, response_tx.clone()).await {
             Ok(Some(request)) => {
-                pgrx::log!("Request parsed successfully, sending to main worker thread...");
+                pg_log!("Request parsed successfully, sending to main worker thread...");
                 // Send the parsed request to the main worker thread for processing
                 if let Err(e) = request_tx.send(request) {
-                    pgrx::warning!("Failed to send request to worker thread: {}", e);
+                    pg_warning!("Failed to send request to worker thread: {}", e);
                     break;
                 }
-                pgrx::log!("Request sent to worker thread successfully via request_tx");
+                pg_log!("Request sent to worker thread successfully via request_tx");
 
 
                 // Wait for the response from the main thread
                 // CRITICAL: Using tokio channel's async .recv() instead of blocking crossbeam recv()
                 // This allows the tokio runtime to continue processing other tasks
-                pgrx::log!("Waiting for response from main thread via response_rx...");
+                pg_log!("Waiting for response from main thread via response_rx...");
                 match response_rx.recv().await {
                     Some(response) => {
-                        pgrx::log!("Received response from main thread, sending to client...");
+                        pg_log!("Received response from main thread, sending to client...");
                         // Encode and send the response back to the client
                         if let Err(e) = protocol::send_response(&mut socket, response).await {
-                            pgrx::warning!("Failed to send response to client: {}", e);
+                            pg_warning!("Failed to send response to client: {}", e);
                             break;
                         }
-                        pgrx::log!("Response sent to client successfully");
+                        pg_log!("Response sent to client successfully");
                     }
                     None => {
-                        pgrx::warning!("Response channel closed by worker thread");
+                        pg_warning!("Response channel closed by worker thread");
                         break;
                     }
                 }
@@ -134,7 +137,7 @@ async fn handle_connection(mut socket: TcpStream) -> Result<(), Box<dyn std::err
                 break;
             }
             Err(e) => {
-                pgrx::warning!("Error parsing request: {}", e);
+                pg_warning!("Error parsing request: {}", e);
                 break;
             }
         }

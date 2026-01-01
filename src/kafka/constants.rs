@@ -84,11 +84,17 @@ pub const ERROR_NONE: i16 = 0;
 /// Unknown server error
 pub const ERROR_UNKNOWN_SERVER_ERROR: i16 = -1;
 
+/// Corrupt message (invalid RecordBatch format)
+pub const ERROR_CORRUPT_MESSAGE: i16 = 2;
+
 /// Unknown topic or partition
 pub const ERROR_UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
 
 /// Unsupported version
 pub const ERROR_UNSUPPORTED_VERSION: i16 = 35;
+
+/// Invalid number of partitions
+pub const ERROR_INVALID_PARTITIONS: i16 = 37;
 
 #[cfg(test)]
 mod tests {
@@ -133,8 +139,10 @@ mod tests {
         // Verify against Kafka protocol error codes
         assert_eq!(ERROR_NONE, 0);
         assert_eq!(ERROR_UNKNOWN_SERVER_ERROR, -1);
+        assert_eq!(ERROR_CORRUPT_MESSAGE, 2);
         assert_eq!(ERROR_UNKNOWN_TOPIC_OR_PARTITION, 3);
         assert_eq!(ERROR_UNSUPPORTED_VERSION, 35);
+        assert_eq!(ERROR_INVALID_PARTITIONS, 37);
     }
 
     #[test]

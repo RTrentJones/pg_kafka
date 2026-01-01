@@ -11,14 +11,23 @@ use kafka_protocol::messages::api_versions_response::ApiVersionsResponse;
 use kafka_protocol::messages::metadata_response::{
     MetadataResponse, MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic,
 };
+use kafka_protocol::messages::produce_request::ProduceRequest;
+use kafka_protocol::messages::produce_response::{
+    PartitionProduceResponse as KafkaPartitionProduceResponse, ProduceResponse,
+    TopicProduceResponse as KafkaTopicProduceResponse,
+};
 use kafka_protocol::messages::{BrokerId, ResponseHeader, TopicName};
-use kafka_protocol::protocol::Encodable;
+use kafka_protocol::protocol::{Decodable, Encodable};
+use kafka_protocol::records::RecordBatchDecoder;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use super::constants::*;
 use super::error::{KafkaError, Result};
 use super::messages::{KafkaRequest, KafkaResponse};
+
+// Import conditional logging macros for test isolation
+use crate::{pg_log, pg_warning};
 
 /// Parse a Kafka request from a TCP socket
 ///
@@ -39,23 +48,23 @@ pub async fn parse_request(
     response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
 ) -> Result<Option<KafkaRequest>> {
     // Step 1: Read the 4-byte size header (big-endian)
-    pgrx::log!("Waiting to read size header...");
+    pg_log!("Waiting to read size header...");
     let mut size_buf = [0u8; 4];
     match socket.read_exact(&mut size_buf).await {
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
             // Client closed connection gracefully
-            pgrx::log!("Client closed connection (EOF on size read)");
+            pg_log!("Client closed connection (EOF on size read)");
             return Ok(None);
         }
         Err(e) => {
-            pgrx::warning!("Error reading size header: {}", e);
+            pg_warning!("Error reading size header: {}", e);
             return Err(e.into());
         }
     }
 
     let size = i32::from_be_bytes(size_buf);
-    pgrx::log!("Received request of size: {} bytes (size_buf: {:?})", size, size_buf);
+    pg_log!("Received request of size: {} bytes (size_buf: {:?})", size, size_buf);
 
     if size <= 0 || size > MAX_REQUEST_SIZE {
         return Err(KafkaError::InvalidRequestSize(size));
@@ -64,13 +73,13 @@ pub async fn parse_request(
     // Step 2: Read the request payload (header + body)
     let mut payload = vec![0u8; size as usize];
     socket.read_exact(&mut payload).await?;
-    pgrx::log!("Read payload: {} bytes, first 10 bytes: {:?}", payload.len(), &payload[..payload.len().min(10)]);
+    pg_log!("Read payload: {} bytes, first 10 bytes: {:?}", payload.len(), &payload[..payload.len().min(10)]);
 
     // Step 3: Parse RequestHeader to determine which API this is
     let mut payload_buf = bytes::Bytes::from(payload);
 
     // Read api_key and api_version first to know which API this is
-    pgrx::log!("Buffer remaining before parsing: {} bytes", payload_buf.remaining());
+    pg_log!("Buffer remaining before parsing: {} bytes", payload_buf.remaining());
     if payload_buf.remaining() < 4 {
         return Err(KafkaError::RequestTooShort {
             expected: 4,
@@ -78,7 +87,7 @@ pub async fn parse_request(
         });
     }
     let api_key = payload_buf.get_i16();
-    let _api_version = payload_buf.get_i16();
+    let api_version = payload_buf.get_i16();
 
     // Parse the rest of the RequestHeader (correlation_id + client_id)
     // For simplicity, we'll manually parse instead of using RequestHeader::decode
@@ -90,19 +99,47 @@ pub async fn parse_request(
     }
     let correlation_id = payload_buf.get_i32();
 
-    // Client ID is a nullable string (i16 length, then bytes)
-    // For ApiVersions, we'll just skip parsing the client_id properly for now
-    let client_id = None; // TODO: Parse client_id properly in future
+    // Parse client_id from RequestHeader
+    // client_id is a nullable string: i16 length prefix, then UTF-8 bytes
+    // -1 length means null, 0 means empty string, >0 means that many bytes follow
+    if payload_buf.remaining() < 2 {
+        return Err(KafkaError::RequestTooShort {
+            expected: 2,
+            actual: payload_buf.remaining(),
+        });
+    }
+    let client_id_len = payload_buf.get_i16();
+    let client_id = if client_id_len < 0 {
+        None // Null client_id
+    } else {
+        // Read client_id bytes
+        if payload_buf.remaining() < client_id_len as usize {
+            return Err(KafkaError::RequestTooShort {
+                expected: client_id_len as usize,
+                actual: payload_buf.remaining(),
+            });
+        }
+        let mut client_id_bytes = vec![0u8; client_id_len as usize];
+        payload_buf.copy_to_slice(&mut client_id_bytes);
+        match String::from_utf8(client_id_bytes) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                pg_warning!("Invalid UTF-8 in client_id: {}", e);
+                None
+            }
+        }
+    };
 
     // Step 4: Match on api_key to determine request type
     match api_key {
         API_KEY_API_VERSIONS => {
             // ApiVersions request
             // The body is empty for ApiVersions, so we don't need to parse it
-            pgrx::log!("Parsed ApiVersions request (api_key={})", API_KEY_API_VERSIONS);
+            pg_log!("Parsed ApiVersions request (api_key={}, api_version={})", API_KEY_API_VERSIONS, api_version);
             Ok(Some(KafkaRequest::ApiVersions {
                 correlation_id,
                 client_id,
+                api_version,
                 response_tx,
             }))
         }
@@ -110,7 +147,7 @@ pub async fn parse_request(
             // Metadata request
             // For now, we'll parse the basic structure but accept any topic list
             // In Phase 2, we'll actually query the database for topic metadata
-            pgrx::log!("Parsed Metadata request (api_key={}, version={})", API_KEY_METADATA, _api_version);
+            pg_log!("Parsed Metadata request (api_key={}, version={})", API_KEY_METADATA, api_version);
 
             // Parse the rest of the request body to extract topic names
             // For Step 4, we'll just use a simplified approach and ignore the topic list
@@ -121,13 +158,105 @@ pub async fn parse_request(
             Ok(Some(KafkaRequest::Metadata {
                 correlation_id,
                 client_id,
+                api_version,
                 topics: None, // None means "all topics"
+                response_tx,
+            }))
+        }
+        API_KEY_PRODUCE => {
+            // Produce request - write messages to topics
+            pg_log!("Parsed Produce request (api_key={}, version={})", API_KEY_PRODUCE, api_version);
+
+            // Use kafka-protocol crate to decode ProduceRequest
+            let produce_req = match ProduceRequest::decode(&mut payload_buf, api_version) {
+                Ok(req) => req,
+                Err(e) => {
+                    pg_warning!("Failed to decode ProduceRequest: {}", e);
+                    let error_response = KafkaResponse::Error {
+                        correlation_id,
+                        error_code: ERROR_CORRUPT_MESSAGE,
+                        error_message: Some(format!("Malformed ProduceRequest: {}", e)),
+                    };
+                    let _ = response_tx.send(error_response);
+                    return Ok(None);
+                }
+            };
+
+            let acks = produce_req.acks;
+            let timeout_ms = produce_req.timeout_ms;
+
+            pg_log!(
+                "ProduceRequest: acks={}, timeout_ms={}, topics={}",
+                acks,
+                timeout_ms,
+                produce_req.topic_data.len()
+            );
+
+            // Extract topic data from kafka-protocol types to our types
+            let mut topic_data = Vec::new();
+            for topic in produce_req.topic_data {
+                let topic_name = topic.name.to_string();
+                let mut partitions = Vec::new();
+
+                for partition in topic.partition_data {
+                    let partition_index = partition.index;
+
+                    // Parse RecordBatch from partition.records
+                    // RecordBatch is the binary format containing actual messages
+                    let records = match &partition.records {
+                        Some(batch_bytes) => match parse_record_batch(batch_bytes) {
+                            Ok(records) => records,
+                            Err(e) => {
+                                pg_warning!(
+                                    "Failed to parse RecordBatch for topic={}, partition={}: {}",
+                                    topic_name,
+                                    partition_index,
+                                    e
+                                );
+                                let error_response = KafkaResponse::Error {
+                                    correlation_id,
+                                    error_code: ERROR_CORRUPT_MESSAGE,
+                                    error_message: Some(format!("Invalid RecordBatch: {}", e)),
+                                };
+                                let _ = response_tx.send(error_response);
+                                return Ok(None);
+                            }
+                        },
+                        None => Vec::new(), // No records in this partition
+                    };
+
+                    pg_log!(
+                        "Parsed {} records for topic={}, partition={}",
+                        records.len(),
+                        topic_name,
+                        partition_index
+                    );
+
+                    partitions.push(super::messages::PartitionProduceData {
+                        partition_index,
+                        records,
+                    });
+                }
+
+                topic_data.push(super::messages::TopicProduceData {
+                    name: topic_name,
+                    partitions,
+                });
+            }
+
+            Ok(Some(KafkaRequest::Produce {
+                correlation_id,
+                client_id,
+                api_version,
+                acks,
+                timeout_ms,
+                topic_data,
                 response_tx,
             }))
         }
         _ => {
             // Unsupported API
-            pgrx::warning!("Unsupported API key: {}", api_key);
+            pg_warning!("Unsupported API key: {}", api_key);
 
             // Send error response immediately
             let error_response = KafkaResponse::Error {
@@ -138,6 +267,151 @@ pub async fn parse_request(
             let _ = response_tx.send(error_response);
 
             Ok(None)
+        }
+    }
+}
+
+/// Parse RecordBatch into individual Records
+///
+/// RecordBatch format is complex (see Kafka protocol spec):
+/// - Base offset (i64)
+/// - Batch length (i32)
+/// - Partition leader epoch (i32)
+/// - Magic byte (i8 = 2 for v0.11+)
+/// - CRC32C (u32)
+/// - Attributes (i16) - compression, timestamp type
+/// - Last offset delta (i32)
+/// - Base timestamp (i64)
+/// - Max timestamp (i64)
+/// - Producer ID, epoch, base sequence (for idempotence)
+/// - Records count (i32)
+/// - Records (varint-encoded)
+///
+/// The kafka-protocol crate handles all this complexity for us.
+fn parse_record_batch(batch_bytes: &bytes::Bytes) -> Result<Vec<super::messages::Record>> {
+    use super::messages::{Record, RecordHeader};
+    use bytes::Buf;
+
+    // Handle empty batch
+    if batch_bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    pg_log!("parse_record_batch: received {} bytes", batch_bytes.len());
+    pg_log!("First 20 bytes: {:?}", &batch_bytes[..batch_bytes.len().min(20)]);
+
+    let mut batch_buf = batch_bytes.clone();
+
+    // Try RecordBatch v2 format first (Kafka 0.11+)
+    // If that fails, fall back to MessageSet v0/v1 (legacy format)
+    match RecordBatchDecoder::decode(&mut batch_buf) {
+        Ok(record_set) => {
+            // RecordSet contains a Vec<Record> in the .records field
+            let mut records = Vec::new();
+            for record in record_set.records {
+                let key = record.key.map(|k: bytes::Bytes| k.to_vec());
+                let value = record.value.map(|v: bytes::Bytes| v.to_vec());
+                let timestamp = Some(record.timestamp);
+
+                // Parse headers from IndexMap to Vec
+                // Headers are IndexMap<StrBytes, Option<Bytes>>
+                let headers: Vec<RecordHeader> = record
+                    .headers
+                    .into_iter()
+                    .map(|(k, v)| RecordHeader {
+                        key: k.to_string(),
+                        value: v.map(|b: bytes::Bytes| b.to_vec()).unwrap_or_default(),
+                    })
+                    .collect();
+
+                records.push(Record {
+                    key,
+                    value,
+                    headers,
+                    timestamp,
+                });
+            }
+            Ok(records)
+        }
+        Err(e) => {
+            // RecordBatch v2 decode failed, try MessageSet v0/v1 (legacy format)
+            pg_log!("RecordBatch decode failed ({}), trying MessageSet v0/v1 format", e);
+
+            let mut buf = batch_bytes.clone();
+            let mut records = Vec::new();
+
+            // MessageSet format (v0/v1):
+            // Repeated: [Offset: 8 bytes][MessageSize: 4 bytes][Message]
+            // Message: [CRC: 4 bytes][Magic: 1 byte][Attributes: 1 byte][Key][Value]
+            // Key/Value: [Length: 4 bytes (i32, -1=null)][Data]
+
+            while buf.remaining() >= 12 {  // Minimum: 8 (offset) + 4 (size)
+                let _offset = buf.get_i64();  // Ignore offset (we assign our own)
+                let message_size = buf.get_i32();
+
+                if message_size < 0 || buf.remaining() < message_size as usize {
+                    pg_warning!("Invalid message size in MessageSet: {}", message_size);
+                    break;
+                }
+
+                // Parse the Message struct
+                let _crc = buf.get_u32();  // Skip CRC validation for now
+                let magic = buf.get_i8();
+                let _attributes = buf.get_i8();  // Compression, timestamp type
+
+                pg_log!("MessageSet magic byte: {}", magic);
+
+                // Parse key (nullable bytes)
+                let key = if buf.remaining() < 4 {
+                    None
+                } else {
+                    let key_len = buf.get_i32();
+                    if key_len < 0 {
+                        None
+                    } else if buf.remaining() >= key_len as usize {
+                        let mut key_bytes = vec![0u8; key_len as usize];
+                        buf.copy_to_slice(&mut key_bytes);
+                        Some(key_bytes)
+                    } else {
+                        pg_warning!("Insufficient bytes for key");
+                        break;
+                    }
+                };
+
+                // Parse value (nullable bytes)
+                let value = if buf.remaining() < 4 {
+                    None
+                } else {
+                    let value_len = buf.get_i32();
+                    if value_len < 0 {
+                        None
+                    } else if buf.remaining() >= value_len as usize {
+                        let mut value_bytes = vec![0u8; value_len as usize];
+                        buf.copy_to_slice(&mut value_bytes);
+                        Some(value_bytes)
+                    } else {
+                        pg_warning!("Insufficient bytes for value");
+                        break;
+                    }
+                };
+
+                records.push(Record {
+                    key,
+                    value,
+                    headers: Vec::new(),  // MessageSet v0/v1 doesn't support headers
+                    timestamp: None,  // v0 doesn't have timestamps, v1 does but we skip for simplicity
+                });
+            }
+
+            if records.is_empty() {
+                Err(KafkaError::Encoding(format!(
+                    "Failed to parse as both RecordBatch and MessageSet: {}",
+                    e
+                )))
+            } else {
+                pg_log!("Successfully parsed {} records from MessageSet format", records.len());
+                Ok(records)
+            }
         }
     }
 }
@@ -157,6 +431,7 @@ pub async fn send_response(
     match response {
         KafkaResponse::ApiVersions {
             correlation_id,
+            api_version,
             api_versions,
         } => {
             // Build ResponseHeader
@@ -165,6 +440,7 @@ pub async fn send_response(
             // Build ApiVersionsResponse
             let mut api_version_response = ApiVersionsResponse::default();
             api_version_response.error_code = 0; // No error
+            api_version_response.throttle_time_ms = 0; // No throttling
 
             // Convert our ApiVersion structs to kafka-protocol's ApiVersion structs
             for av in api_versions {
@@ -176,15 +452,38 @@ pub async fn send_response(
             }
 
             // Encode response header and body
-            // ResponseHeader version should match the API version from the request
-            // ApiVersions v3 uses ResponseHeader v1
-            header.encode(&mut response_buf, 1)?; // ResponseHeader v1 for ApiVersions v3
+            // IMPORTANT: Use the API version from the request for encoding
+            // Different versions have different wire formats (e.g., flexible vs non-flexible)
+            // CRITICAL: ApiVersions always uses ResponseHeader v0, even for v3+!
+            // This is different from other APIs where v3+ uses ResponseHeader v1.
+            // See: https://github.com/Baylox/kafka-mock (19-byte example for v3)
+            let response_header_version = 0;  // Always v0 for ApiVersions!
+            let response_version = api_version;
 
-            // Encode response body
-            api_version_response.encode(&mut response_buf, 3)?; // ApiVersions v3
+            // DEBUG: Track sizes
+            let before_header = response_buf.len();
+            header.encode(&mut response_buf, response_header_version)?;
+            let after_header = response_buf.len();
+
+            // Encode response body with the requested API version
+            api_version_response.encode(&mut response_buf, response_version)?;
+            let after_body = response_buf.len();
+
+            // DEBUG: Write response bytes to file for analysis
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/pg_kafka_responses.log")
+            {
+                use std::io::Write;
+                let _ = writeln!(f, "ApiVersions v{} response: header={} bytes, body={} bytes, total={} bytes",
+                    api_version, after_header - before_header, after_body - after_header, response_buf.len());
+                let _ = writeln!(f, "  Bytes: {:?}", &response_buf[..]);
+            }
         }
         KafkaResponse::Metadata {
             correlation_id,
+            api_version,
             brokers,
             topics,
         } => {
@@ -228,19 +527,70 @@ pub async fn send_response(
                 metadata_response.topics.push(kafka_topic);
             }
 
-            // Encode response header (v1 for Metadata v9)
-            header.encode(&mut response_buf, 1)?;
+            // Encode response header
+            // Metadata v9+ uses flexible format (ResponseHeader v1)
+            // Metadata v0-v8 uses non-flexible format (ResponseHeader v0)
+            let response_header_version = if api_version >= 9 { 1 } else { 0 };
+            header.encode(&mut response_buf, response_header_version)?;
 
-            // Encode response body (using version 9 for broad compatibility)
-            metadata_response.encode(&mut response_buf, 9)?;
+            // Encode response body using the requested API version
+            metadata_response.encode(&mut response_buf, api_version)?;
+        }
+        KafkaResponse::Produce {
+            correlation_id,
+            api_version,
+            responses,
+        } => {
+            // Build ResponseHeader
+            let header = ResponseHeader::default().with_correlation_id(correlation_id);
+
+            // Build ProduceResponse
+            let mut produce_response = ProduceResponse::default();
+            produce_response.throttle_time_ms = 0;  // No throttling
+
+            // Convert our response types to kafka-protocol types
+            for topic_response in responses {
+                let mut kafka_topic_response = KafkaTopicProduceResponse::default();
+                kafka_topic_response.name = TopicName(topic_response.name.into());
+
+                // Add partition responses
+                for partition_response in topic_response.partitions {
+                    let mut kafka_partition_response = KafkaPartitionProduceResponse::default();
+                    kafka_partition_response.index = partition_response.partition_index;
+                    kafka_partition_response.error_code = partition_response.error_code;
+                    kafka_partition_response.base_offset = partition_response.base_offset;
+                    kafka_partition_response.log_append_time_ms = partition_response.log_append_time;
+                    kafka_partition_response.log_start_offset = partition_response.log_start_offset;
+
+                    kafka_topic_response.partition_responses.push(kafka_partition_response);
+                }
+
+                produce_response.responses.push(kafka_topic_response);
+            }
+
+            // Encode response header
+            // Produce v9+ uses flexible format (ResponseHeader v1)
+            // Produce v0-v8 uses non-flexible format (ResponseHeader v0)
+            let response_header_version = if api_version >= 9 { 1 } else { 0 };
+            header.encode(&mut response_buf, response_header_version)?;
+
+            // Encode response body using the requested API version
+            produce_response.encode(&mut response_buf, api_version)?;
         }
         KafkaResponse::Error {
             correlation_id,
             error_code,
             error_message,
         } => {
-            // For error responses, we send a minimal response with the error code
-            // This is a simplified error response - in production we'd match the expected response format
+            // LIMITATION: Hand-rolled error response encoding
+            // ===============================================
+            // This is a simplified error response that may not match the expected format
+            // for the specific API that triggered the error. Real Kafka clients might fail
+            // to parse this if they expect a properly-formatted error response for their API.
+            //
+            // TODO(Phase 2): Match error response format to the specific API key that failed.
+            // For example, if ApiVersions fails, return a proper ApiVersionsResponse with error_code set.
+            // For now, this works with kcat which is lenient about error responses.
             let header = ResponseHeader::default().with_correlation_id(correlation_id);
             header.encode(&mut response_buf, 0)?;
 
@@ -259,13 +609,35 @@ pub async fn send_response(
 
     // Prepend the size header (4 bytes, big-endian)
     let size = response_buf.len() as i32;
-    socket.write_all(&size.to_be_bytes()).await?;
+
+    // DEBUG: Log what we're about to send
+    let size_bytes = size.to_be_bytes();
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/pg_kafka_send.log")
+    {
+        use std::io::Write;
+        let _ = writeln!(f, "Sending: size_prefix={:?}, size={}, payload_len={}",
+            &size_bytes, size, response_buf.len());
+        let _ = writeln!(f, "  Payload: {:?}", &response_buf[..]);
+    }
+
+    socket.write_all(&size_bytes).await?;
 
     // Write the response payload
     socket.write_all(&response_buf).await?;
 
     // Flush to ensure data is sent
     socket.flush().await?;
+
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .append(true)
+        .open("/tmp/pg_kafka_send.log")
+    {
+        use std::io::Write;
+        let _ = writeln!(f, "  Successfully sent {} + {} = {} bytes", 4, response_buf.len(), 4 + response_buf.len());
+    }
 
     Ok(())
 }
