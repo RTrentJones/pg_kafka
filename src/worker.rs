@@ -914,4 +914,227 @@ mod tests {
         let response2 = response_rx2.try_recv().expect("Should receive response 2");
         assert!(matches!(response2, KafkaResponse::Metadata { .. }));
     }
+
+    #[test]
+    fn test_produce_creates_topic() {
+        // Test that Produce request auto-creates a new topic
+        let test_topic = "auto-created-topic";
+        let records = vec![simple_record(None, "test message")];
+        let (request, mut response_rx) = mock_produce_request(200, test_topic, 0, records);
+
+        process_request(request);
+
+        let response = response_rx.try_recv().expect("Should receive Produce response");
+
+        match response {
+            KafkaResponse::Produce {
+                correlation_id,
+                api_version: _,
+                response,
+            } => {
+                assert_eq!(correlation_id, 200);
+                assert_eq!(response.responses.len(), 1);
+
+                let topic_response = &response.responses[0];
+                assert_eq!(topic_response.name.to_string(), test_topic);
+                assert_eq!(topic_response.partition_responses.len(), 1);
+
+                let partition_response = &topic_response.partition_responses[0];
+                assert_eq!(partition_response.error_code, ERROR_NONE);
+                assert_eq!(partition_response.base_offset, 0, "First message should have offset 0");
+            }
+            _ => panic!("Expected Produce response"),
+        }
+
+        // Verify topic was created in database
+        Spi::connect(|client| {
+            let result = client.select(
+                "SELECT COUNT(*) as count FROM kafka.topics WHERE name = $1",
+                None,
+                &[test_topic.into()],
+            ).expect("Query should succeed");
+
+            let count: i64 = result.first().get_by_name("count").unwrap().unwrap();
+            assert_eq!(count, 1, "Topic should be created in database");
+        });
+    }
+
+    #[test]
+    fn test_produce_single_message() {
+        // Test that a single message is inserted with correct offset
+        let test_topic = "single-message-topic";
+        let test_value = "Hello, Kafka!";
+        let records = vec![simple_record(Some("my-key"), test_value)];
+        let (request, mut response_rx) = mock_produce_request(201, test_topic, 0, records);
+
+        process_request(request);
+
+        let response = response_rx.try_recv().expect("Should receive Produce response");
+
+        match response {
+            KafkaResponse::Produce {
+                correlation_id,
+                api_version: _,
+                response,
+            } => {
+                assert_eq!(correlation_id, 201);
+                let partition_response = &response.responses[0].partition_responses[0];
+                assert_eq!(partition_response.error_code, ERROR_NONE);
+                assert_eq!(partition_response.base_offset, 0);
+            }
+            _ => panic!("Expected Produce response"),
+        }
+
+        // Verify message is in database
+        Spi::connect(|client| {
+            let result = client.select(
+                "SELECT partition_offset, value FROM kafka.messages m
+                 JOIN kafka.topics t ON m.topic_id = t.id
+                 WHERE t.name = $1 AND m.partition_id = 0
+                 ORDER BY partition_offset",
+                None,
+                &[test_topic.into()],
+            ).expect("Query should succeed");
+
+            assert_eq!(result.len(), 1, "Should have exactly 1 message");
+            let row = result.first();
+            let offset: i64 = row.get_by_name("partition_offset").unwrap().unwrap();
+            let value: Vec<u8> = row.get_by_name("value").unwrap().unwrap();
+
+            assert_eq!(offset, 0);
+            assert_eq!(value, test_value.as_bytes());
+        });
+    }
+
+    #[test]
+    fn test_produce_batch_messages() {
+        // Test that batch of messages gets consecutive offsets
+        let test_topic = "batch-topic";
+        let mut records = Vec::new();
+        for i in 0..10 {
+            records.push(simple_record(None, &format!("message-{}", i)));
+        }
+
+        let (request, mut response_rx) = mock_produce_request(202, test_topic, 0, records);
+
+        process_request(request);
+
+        let response = response_rx.try_recv().expect("Should receive Produce response");
+
+        match response {
+            KafkaResponse::Produce {
+                correlation_id,
+                api_version: _,
+                response,
+            } => {
+                assert_eq!(correlation_id, 202);
+                let partition_response = &response.responses[0].partition_responses[0];
+                assert_eq!(partition_response.error_code, ERROR_NONE);
+                assert_eq!(partition_response.base_offset, 0, "Batch should start at offset 0");
+            }
+            _ => panic!("Expected Produce response"),
+        }
+
+        // Verify all 10 messages have consecutive offsets
+        Spi::connect(|client| {
+            let result = client.select(
+                "SELECT COUNT(*) as count,
+                        MIN(partition_offset) as min_offset,
+                        MAX(partition_offset) as max_offset
+                 FROM kafka.messages m
+                 JOIN kafka.topics t ON m.topic_id = t.id
+                 WHERE t.name = $1 AND m.partition_id = 0",
+                None,
+                &[test_topic.into()],
+            ).expect("Query should succeed");
+
+            let row = result.first();
+            let count: i64 = row.get_by_name("count").unwrap().unwrap();
+            let min_offset: i64 = row.get_by_name("min_offset").unwrap().unwrap();
+            let max_offset: i64 = row.get_by_name("max_offset").unwrap().unwrap();
+
+            assert_eq!(count, 10, "Should have exactly 10 messages");
+            assert_eq!(min_offset, 0, "First offset should be 0");
+            assert_eq!(max_offset, 9, "Last offset should be 9 (consecutive from 0)");
+        });
+    }
+
+    #[test]
+    fn test_produce_with_headers() {
+        // Test that headers are correctly serialized to JSONB
+        let test_topic = "headers-topic";
+        let headers = vec![
+            ("correlation-id", b"12345".as_ref()),
+            ("source", b"test-client".as_ref()),
+        ];
+        let records = vec![record_with_headers(None, "message with headers", headers)];
+        let (request, mut response_rx) = mock_produce_request(203, test_topic, 0, records);
+
+        process_request(request);
+
+        let response = response_rx.try_recv().expect("Should receive Produce response");
+
+        match response {
+            KafkaResponse::Produce {
+                correlation_id,
+                api_version: _,
+                response,
+            } => {
+                assert_eq!(correlation_id, 203);
+                let partition_response = &response.responses[0].partition_responses[0];
+                assert_eq!(partition_response.error_code, ERROR_NONE);
+            }
+            _ => panic!("Expected Produce response"),
+        }
+
+        // Verify headers are in JSONB format
+        Spi::connect(|client| {
+            let result = client.select(
+                "SELECT headers FROM kafka.messages m
+                 JOIN kafka.topics t ON m.topic_id = t.id
+                 WHERE t.name = $1",
+                None,
+                &[test_topic.into()],
+            ).expect("Query should succeed");
+
+            assert_eq!(result.len(), 1);
+            let row = result.first();
+            let headers_json: pgrx::JsonB = row.get_by_name("headers").unwrap().unwrap();
+
+            // Headers should be a JSON array with 2 elements
+            let headers_value = headers_json.0;
+            assert!(headers_value.is_array(), "Headers should be JSONB array");
+            let headers_array = headers_value.as_array().unwrap();
+            assert_eq!(headers_array.len(), 2, "Should have 2 headers");
+        });
+    }
+
+    #[test]
+    fn test_produce_invalid_partition() {
+        // Test that partition > 0 returns an error (we only support single-partition topics)
+        let test_topic = "invalid-partition-topic";
+        let records = vec![simple_record(None, "test message")];
+        let (request, mut response_rx) = mock_produce_request(204, test_topic, 1, records); // partition 1 (invalid)
+
+        process_request(request);
+
+        let response = response_rx.try_recv().expect("Should receive Produce response");
+
+        match response {
+            KafkaResponse::Produce {
+                correlation_id,
+                api_version: _,
+                response,
+            } => {
+                assert_eq!(correlation_id, 204);
+                let partition_response = &response.responses[0].partition_responses[0];
+                assert_eq!(
+                    partition_response.error_code,
+                    ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+                    "Should return error for invalid partition"
+                );
+            }
+            _ => panic!("Expected Produce response"),
+        }
+    }
 }

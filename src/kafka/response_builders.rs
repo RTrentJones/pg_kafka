@@ -89,3 +89,13 @@ pub fn build_produce_response() -> ProduceResponse {
     response.throttle_time_ms = 0;
     response
 }
+
+/// Build an error MetadataResponse for protocol-level errors
+pub fn build_metadata_error_response() -> kafka_protocol::messages::metadata_response::MetadataResponse {
+    let mut response = kafka_protocol::messages::metadata_response::MetadataResponse::default();
+    response.throttle_time_ms = 0;
+    response.cluster_id = None;
+    response.controller_id = BrokerId(-1);
+    // Empty brokers and topics list for error response
+    response
+}
