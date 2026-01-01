@@ -1,5 +1,8 @@
 # pg_kafka 🐘➡️🕸️
 
+[![CI/CD Pipeline](https://github.com/YOUR_USERNAME/pg_kafka/actions/workflows/ci.yml/badge.svg)](https://github.com/YOUR_USERNAME/pg_kafka/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/YOUR_USERNAME/pg_kafka/branch/main/graph/badge.svg)](https://codecov.io/gh/YOUR_USERNAME/pg_kafka)
+
 **A high-performance PostgreSQL extension that speaks the Kafka Wire Protocol.**
 
 `pg_kafka` allows standard Kafka clients (Java, Python, Go, etc.) to produce and consume messages directly from a PostgreSQL database. It runs as a native background worker in Postgres itself, eliminating the network hop of external proxies and the operational overhead of managing a separate Kafka cluster for small-to-medium workloads.
