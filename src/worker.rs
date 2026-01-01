@@ -65,7 +65,8 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
 
     // Spawn the listener task on the LocalSet
     let listener_handle = local_set.spawn_local(async move {
-        if let Err(e) = crate::kafka::run_listener(shutdown_rx, &host, port, log_connections).await {
+        if let Err(e) = crate::kafka::run_listener(shutdown_rx, &host, port, log_connections).await
+        {
             pgrx::error!("TCP listener error: {}", e);
         }
     });
@@ -157,7 +158,9 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
         // wait_latch(SIGNAL_CHECK_INTERVAL_MS) returns false when Postgres sends SIGTERM.
         // This is the SYNC boundary - we're fully outside async context.
         // CRITICAL: This must be polled regularly for graceful shutdown.
-        if !BackgroundWorker::wait_latch(Some(core::time::Duration::from_millis(crate::kafka::SIGNAL_CHECK_INTERVAL_MS))) {
+        if !BackgroundWorker::wait_latch(Some(core::time::Duration::from_millis(
+            crate::kafka::SIGNAL_CHECK_INTERVAL_MS,
+        ))) {
             log!("pg_kafka background worker shutting down");
 
             // Signal the async listener to stop
@@ -167,10 +170,9 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
             runtime.block_on(async {
                 // Give the listener configured timeout to shut down cleanly
                 // We need to drive the LocalSet to completion for the listener to actually finish
-                let shutdown_result = tokio::time::timeout(
-                    shutdown_timeout,
-                    local_set.run_until(listener_handle),
-                ).await;
+                let shutdown_result =
+                    tokio::time::timeout(shutdown_timeout, local_set.run_until(listener_handle))
+                        .await;
 
                 match shutdown_result {
                     Ok(Ok(_)) => {
@@ -204,17 +206,14 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
 /// - `|client| { ... }`: This is a "closure" (anonymous function) that receives the SPI client
 /// - `?` operator: Propagates errors up the call stack (like try/catch in other languages)
 /// Get metadata for all topics in the database
-fn get_all_topics_metadata() -> Vec<kafka_protocol::messages::metadata_response::MetadataResponseTopic> {
+fn get_all_topics_metadata(
+) -> Vec<kafka_protocol::messages::metadata_response::MetadataResponseTopic> {
     use crate::kafka::constants::*;
 
     // Query all topics from the database
     // We need to extract data inside the SPI connection closure due to lifetimes
     Spi::connect(|client| {
-        let table = match client.select(
-            "SELECT name FROM kafka.topics ORDER BY name",
-            None,
-            &[],
-        ) {
+        let table = match client.select("SELECT name FROM kafka.topics ORDER BY name", None, &[]) {
             Ok(t) => t,
             Err(e) => {
                 pg_warning!("Failed to query topics from database: {}", e);
@@ -379,8 +378,9 @@ fn insert_records(
                         .iter()
                         .map(|h| (h.key.clone(), hex_encode(&h.value)))
                         .collect();
-                    serde_json::to_string(&headers_map)
-                        .map_err(|e| format!("Failed to serialize headers for record {}: {}", i, e))?
+                    serde_json::to_string(&headers_map).map_err(|e| {
+                        format!("Failed to serialize headers for record {}: {}", i, e)
+                    })?
                 };
 
                 // Convert key and value for IntoDatum compatibility
@@ -458,7 +458,11 @@ pub fn process_request(request: crate::kafka::KafkaRequest) {
             api_version,
             response_tx,
         } => {
-            pg_log!("Processing ApiVersions request, correlation_id: {}, api_version: {}", correlation_id, api_version);
+            pg_log!(
+                "Processing ApiVersions request, correlation_id: {}, api_version: {}",
+                correlation_id,
+                api_version
+            );
             if let Some(id) = client_id {
                 pg_log!("ApiVersions request from client: {}", id);
             }
@@ -466,7 +470,10 @@ pub fn process_request(request: crate::kafka::KafkaRequest) {
             // Build ApiVersionsResponse using helper
             let kafka_response = crate::kafka::build_api_versions_response();
 
-            pg_log!("Building ApiVersions response with {} API versions", kafka_response.api_keys.len());
+            pg_log!(
+                "Building ApiVersions response with {} API versions",
+                kafka_response.api_keys.len()
+            );
 
             let response = KafkaResponse::ApiVersions {
                 correlation_id,
@@ -487,7 +494,10 @@ pub fn process_request(request: crate::kafka::KafkaRequest) {
             topics: requested_topics,
             response_tx,
         } => {
-            pg_log!("Processing Metadata request, correlation_id: {}", correlation_id);
+            pg_log!(
+                "Processing Metadata request, correlation_id: {}",
+                correlation_id
+            );
             if let Some(id) = client_id {
                 pg_log!("Metadata request from client: {}", id);
             }
@@ -499,22 +509,31 @@ pub fn process_request(request: crate::kafka::KafkaRequest) {
             // We bind to 0.0.0.0 (all interfaces) but must advertise a routable address
             // that clients can actually connect to. If host is 0.0.0.0, advertise localhost.
             let advertised_host = if config.host == "0.0.0.0" || config.host.is_empty() {
-                pg_log!("Converting bind address '{}' to advertised address 'localhost'", config.host);
+                pg_log!(
+                    "Converting bind address '{}' to advertised address 'localhost'",
+                    config.host
+                );
                 "localhost".to_string()
             } else {
-                pg_log!("Using configured host '{}' as advertised address", config.host);
+                pg_log!(
+                    "Using configured host '{}' as advertised address",
+                    config.host
+                );
                 config.host.clone()
             };
 
             // Build MetadataResponse using kafka-protocol types
-            let mut kafka_response = kafka_protocol::messages::metadata_response::MetadataResponse::default();
+            let mut kafka_response =
+                kafka_protocol::messages::metadata_response::MetadataResponse::default();
 
             // Add broker
-            kafka_response.brokers.push(crate::kafka::build_broker_metadata(
-                DEFAULT_BROKER_ID,
-                advertised_host,
-                config.port,
-            ));
+            kafka_response
+                .brokers
+                .push(crate::kafka::build_broker_metadata(
+                    DEFAULT_BROKER_ID,
+                    advertised_host,
+                    config.port,
+                ));
 
             // Build topic metadata based on what was requested
             let topics_to_add = match requested_topics {
@@ -590,11 +609,18 @@ pub fn process_request(request: crate::kafka::KafkaRequest) {
             topic_data,
             response_tx,
         } => {
-            pg_log!("Processing Produce request, correlation_id: {}", correlation_id);
+            pg_log!(
+                "Processing Produce request, correlation_id: {}",
+                correlation_id
+            );
             if let Some(id) = &client_id {
                 pg_log!("Produce request from client: {}", id);
             }
-            pg_log!("Produce parameters: acks={}, timeout_ms={}", acks, timeout_ms);
+            pg_log!(
+                "Produce parameters: acks={}, timeout_ms={}",
+                acks,
+                timeout_ms
+            );
 
             // Handle acks=0 (fire-and-forget) - not yet supported
             if acks == 0 {
@@ -639,8 +665,10 @@ pub fn process_request(request: crate::kafka::KafkaRequest) {
                 };
 
                 // Build topic response
-                let mut topic_response = kafka_protocol::messages::produce_response::TopicProduceResponse::default();
-                topic_response.name = kafka_protocol::messages::TopicName(topic_name.clone().into());
+                let mut topic_response =
+                    kafka_protocol::messages::produce_response::TopicProduceResponse::default();
+                topic_response.name =
+                    kafka_protocol::messages::TopicName(topic_name.clone().into());
 
                 // Process each partition
                 for partition in topic.partitions {
@@ -817,7 +845,8 @@ mod tests {
 
     #[test]
     fn test_metadata_handler_all_topics() {
-        let (request, mut response_rx) = mock_metadata_request_with_client(99, "test-client".to_string(), None);
+        let (request, mut response_rx) =
+            mock_metadata_request_with_client(99, "test-client".to_string(), None);
 
         process_request(request);
 
@@ -894,8 +923,14 @@ mod tests {
                 assert_eq!(partition.error_code, ERROR_NONE);
                 assert_eq!(partition.partition_index, 0);
                 assert_eq!(partition.leader_id.0, DEFAULT_BROKER_ID);
-                assert_eq!(partition.replica_nodes, vec![kafka_protocol::messages::BrokerId(DEFAULT_BROKER_ID)]);
-                assert_eq!(partition.isr_nodes, vec![kafka_protocol::messages::BrokerId(DEFAULT_BROKER_ID)]);
+                assert_eq!(
+                    partition.replica_nodes,
+                    vec![kafka_protocol::messages::BrokerId(DEFAULT_BROKER_ID)]
+                );
+                assert_eq!(
+                    partition.isr_nodes,
+                    vec![kafka_protocol::messages::BrokerId(DEFAULT_BROKER_ID)]
+                );
             }
             _ => panic!("Expected Metadata response"),
         }
@@ -924,7 +959,9 @@ mod tests {
 
         process_request(request);
 
-        let response = response_rx.try_recv().expect("Should receive Produce response");
+        let response = response_rx
+            .try_recv()
+            .expect("Should receive Produce response");
 
         match response {
             KafkaResponse::Produce {
@@ -941,18 +978,23 @@ mod tests {
 
                 let partition_response = &topic_response.partition_responses[0];
                 assert_eq!(partition_response.error_code, ERROR_NONE);
-                assert_eq!(partition_response.base_offset, 0, "First message should have offset 0");
+                assert_eq!(
+                    partition_response.base_offset, 0,
+                    "First message should have offset 0"
+                );
             }
             _ => panic!("Expected Produce response"),
         }
 
         // Verify topic was created in database
         Spi::connect(|client| {
-            let result = client.select(
-                "SELECT COUNT(*) as count FROM kafka.topics WHERE name = $1",
-                None,
-                &[test_topic.into()],
-            ).expect("Query should succeed");
+            let result = client
+                .select(
+                    "SELECT COUNT(*) as count FROM kafka.topics WHERE name = $1",
+                    None,
+                    &[test_topic.into()],
+                )
+                .expect("Query should succeed");
 
             let count: i64 = result.first().get_by_name("count").unwrap().unwrap();
             assert_eq!(count, 1, "Topic should be created in database");
@@ -969,7 +1011,9 @@ mod tests {
 
         process_request(request);
 
-        let response = response_rx.try_recv().expect("Should receive Produce response");
+        let response = response_rx
+            .try_recv()
+            .expect("Should receive Produce response");
 
         match response {
             KafkaResponse::Produce {
@@ -987,14 +1031,16 @@ mod tests {
 
         // Verify message is in database
         Spi::connect(|client| {
-            let result = client.select(
-                "SELECT partition_offset, value FROM kafka.messages m
+            let result = client
+                .select(
+                    "SELECT partition_offset, value FROM kafka.messages m
                  JOIN kafka.topics t ON m.topic_id = t.id
                  WHERE t.name = $1 AND m.partition_id = 0
                  ORDER BY partition_offset",
-                None,
-                &[test_topic.into()],
-            ).expect("Query should succeed");
+                    None,
+                    &[test_topic.into()],
+                )
+                .expect("Query should succeed");
 
             assert_eq!(result.len(), 1, "Should have exactly 1 message");
             let row = result.first();
@@ -1019,7 +1065,9 @@ mod tests {
 
         process_request(request);
 
-        let response = response_rx.try_recv().expect("Should receive Produce response");
+        let response = response_rx
+            .try_recv()
+            .expect("Should receive Produce response");
 
         match response {
             KafkaResponse::Produce {
@@ -1030,23 +1078,28 @@ mod tests {
                 assert_eq!(correlation_id, 202);
                 let partition_response = &response.responses[0].partition_responses[0];
                 assert_eq!(partition_response.error_code, ERROR_NONE);
-                assert_eq!(partition_response.base_offset, 0, "Batch should start at offset 0");
+                assert_eq!(
+                    partition_response.base_offset, 0,
+                    "Batch should start at offset 0"
+                );
             }
             _ => panic!("Expected Produce response"),
         }
 
         // Verify all 10 messages have consecutive offsets
         Spi::connect(|client| {
-            let result = client.select(
-                "SELECT COUNT(*) as count,
+            let result = client
+                .select(
+                    "SELECT COUNT(*) as count,
                         MIN(partition_offset) as min_offset,
                         MAX(partition_offset) as max_offset
                  FROM kafka.messages m
                  JOIN kafka.topics t ON m.topic_id = t.id
                  WHERE t.name = $1 AND m.partition_id = 0",
-                None,
-                &[test_topic.into()],
-            ).expect("Query should succeed");
+                    None,
+                    &[test_topic.into()],
+                )
+                .expect("Query should succeed");
 
             let row = result.first();
             let count: i64 = row.get_by_name("count").unwrap().unwrap();
@@ -1055,7 +1108,10 @@ mod tests {
 
             assert_eq!(count, 10, "Should have exactly 10 messages");
             assert_eq!(min_offset, 0, "First offset should be 0");
-            assert_eq!(max_offset, 9, "Last offset should be 9 (consecutive from 0)");
+            assert_eq!(
+                max_offset, 9,
+                "Last offset should be 9 (consecutive from 0)"
+            );
         });
     }
 
@@ -1072,7 +1128,9 @@ mod tests {
 
         process_request(request);
 
-        let response = response_rx.try_recv().expect("Should receive Produce response");
+        let response = response_rx
+            .try_recv()
+            .expect("Should receive Produce response");
 
         match response {
             KafkaResponse::Produce {
@@ -1089,13 +1147,15 @@ mod tests {
 
         // Verify headers are in JSONB format
         Spi::connect(|client| {
-            let result = client.select(
-                "SELECT headers FROM kafka.messages m
+            let result = client
+                .select(
+                    "SELECT headers FROM kafka.messages m
                  JOIN kafka.topics t ON m.topic_id = t.id
                  WHERE t.name = $1",
-                None,
-                &[test_topic.into()],
-            ).expect("Query should succeed");
+                    None,
+                    &[test_topic.into()],
+                )
+                .expect("Query should succeed");
 
             assert_eq!(result.len(), 1);
             let row = result.first();
@@ -1118,7 +1178,9 @@ mod tests {
 
         process_request(request);
 
-        let response = response_rx.try_recv().expect("Should receive Produce response");
+        let response = response_rx
+            .try_recv()
+            .expect("Should receive Produce response");
 
         match response {
             KafkaResponse::Produce {
@@ -1129,8 +1191,7 @@ mod tests {
                 assert_eq!(correlation_id, 204);
                 let partition_response = &response.responses[0].partition_responses[0];
                 assert_eq!(
-                    partition_response.error_code,
-                    ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+                    partition_response.error_code, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
                     "Should return error for invalid partition"
                 );
             }

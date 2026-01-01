@@ -5,9 +5,9 @@
 
 use bytes::{Buf, BufMut, BytesMut};
 use std::io::{self, Read, Write};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// MockStream simulates a bidirectional TCP stream for testing
 ///

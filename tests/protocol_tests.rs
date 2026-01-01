@@ -9,7 +9,7 @@
 #[cfg(test)]
 mod protocol_tests {
     use bytes::BytesMut;
-    use kafka_protocol::messages::api_versions_response::{ApiVersionsResponse, ApiVersion};
+    use kafka_protocol::messages::api_versions_response::{ApiVersion, ApiVersionsResponse};
     use kafka_protocol::messages::metadata_response::MetadataResponse;
     use kafka_protocol::messages::ResponseHeader;
     use kafka_protocol::protocol::Encodable;

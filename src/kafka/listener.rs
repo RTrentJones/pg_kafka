@@ -7,10 +7,10 @@
 // in the pgrx background worker. This allows us to handle thousands of concurrent
 // connections efficiently without blocking the Postgres main loop.
 
+use futures::sink::SinkExt;
+use futures::stream::StreamExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
-use futures::stream::StreamExt;
-use futures::sink::SinkExt;
 
 use super::messages;
 use super::protocol;
@@ -152,7 +152,10 @@ async fn handle_connection(socket: TcpStream) -> Result<(), Box<dyn std::error::
                         // Encode the response
                         match protocol::encode_response(response) {
                             Ok(response_bytes) => {
-                                pg_log!("Sending {} byte response to client...", response_bytes.len());
+                                pg_log!(
+                                    "Sending {} byte response to client...",
+                                    response_bytes.len()
+                                );
                                 // Send the response frame
                                 // LengthDelimitedCodec automatically adds size prefix
                                 if let Err(e) = framed.send(response_bytes.freeze()).await {

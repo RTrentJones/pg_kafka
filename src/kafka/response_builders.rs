@@ -37,7 +37,7 @@ pub fn build_api_versions_response() -> ApiVersionsResponse {
     // v0-v2 use legacy MessageSet format which kafka-protocol crate doesn't support.
     let mut av3 = ApiVersion::default();
     av3.api_key = API_KEY_PRODUCE;
-    av3.min_version = 3;  // RecordBatch format only (v3+)
+    av3.min_version = 3; // RecordBatch format only (v3+)
     av3.max_version = 9;
     response.api_keys.push(av3);
 
@@ -91,7 +91,8 @@ pub fn build_produce_response() -> ProduceResponse {
 }
 
 /// Build an error MetadataResponse for protocol-level errors
-pub fn build_metadata_error_response() -> kafka_protocol::messages::metadata_response::MetadataResponse {
+pub fn build_metadata_error_response(
+) -> kafka_protocol::messages::metadata_response::MetadataResponse {
     let mut response = kafka_protocol::messages::metadata_response::MetadataResponse::default();
     response.throttle_time_ms = 0;
     response.cluster_id = None;

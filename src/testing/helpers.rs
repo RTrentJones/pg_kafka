@@ -75,7 +75,7 @@ pub fn mock_metadata_request(
     let request = KafkaRequest::Metadata {
         correlation_id,
         client_id: None,
-        api_version: 4,  // Default to v4 for tests
+        api_version: 4, // Default to v4 for tests
         topics,
         response_tx,
     };
@@ -97,7 +97,7 @@ pub fn mock_metadata_request_with_client(
     let request = KafkaRequest::Metadata {
         correlation_id,
         client_id: Some(client_id),
-        api_version: 4,  // Default to v4 for tests
+        api_version: 4, // Default to v4 for tests
         topics,
         response_tx,
     };
@@ -131,11 +131,7 @@ pub fn simple_record(key: Option<&str>, value: &str) -> Record {
 ///
 /// # Returns
 /// Record with key/value/headers as byte vectors
-pub fn record_with_headers(
-    key: Option<&str>,
-    value: &str,
-    headers: Vec<(&str, &[u8])>,
-) -> Record {
+pub fn record_with_headers(key: Option<&str>, value: &str, headers: Vec<(&str, &[u8])>) -> Record {
     let record_headers: Vec<RecordHeader> = headers
         .into_iter()
         .map(|(k, v)| RecordHeader {
@@ -218,8 +214,7 @@ mod tests {
 
     #[test]
     fn test_mock_api_versions_request_with_client() {
-        let (request, _rx) =
-            mock_api_versions_request_with_client(99, "test-client".to_string());
+        let (request, _rx) = mock_api_versions_request_with_client(99, "test-client".to_string());
         match request {
             KafkaRequest::ApiVersions {
                 correlation_id,
@@ -260,7 +255,10 @@ mod tests {
                 ..
             } => {
                 assert_eq!(correlation_id, 101);
-                assert_eq!(topics, Some(vec!["topic1".to_string(), "topic2".to_string()]));
+                assert_eq!(
+                    topics,
+                    Some(vec!["topic1".to_string(), "topic2".to_string()])
+                );
             }
             _ => panic!("Expected Metadata request"),
         }

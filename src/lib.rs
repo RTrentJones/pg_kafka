@@ -1,10 +1,10 @@
-use pgrx::prelude::*;
 use pgrx::bgworkers::BackgroundWorkerBuilder;
+use pgrx::prelude::*;
 
 // Module declarations for our extension components
-mod config;        // Configuration (GUC parameters)
-pub mod kafka;     // Kafka protocol implementation (listener, protocol, messages)
-pub mod worker;    // Background worker implementation
+mod config; // Configuration (GUC parameters)
+pub mod kafka; // Kafka protocol implementation (listener, protocol, messages)
+pub mod worker; // Background worker implementation
 
 // Test utilities (only compiled in test builds)
 #[cfg(test)]
@@ -100,7 +100,6 @@ mod tests {
     fn test_hello_pg_kafka() {
         assert_eq!("Hello, pg_kafka", crate::hello_pg_kafka());
     }
-
 }
 
 /// This module is required by `cargo pgrx test` invocations.

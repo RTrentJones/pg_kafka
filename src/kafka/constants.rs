@@ -161,7 +161,10 @@ mod tests {
 
     #[test]
     fn test_shutdown_timeout_range_valid() {
-        assert!(MIN_SHUTDOWN_TIMEOUT_MS > 0, "Shutdown timeout must be positive");
+        assert!(
+            MIN_SHUTDOWN_TIMEOUT_MS > 0,
+            "Shutdown timeout must be positive"
+        );
         assert!(
             MAX_SHUTDOWN_TIMEOUT_MS > MIN_SHUTDOWN_TIMEOUT_MS,
             "Max must be greater than min"
