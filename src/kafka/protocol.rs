@@ -107,23 +107,23 @@ pub fn parse_request(
                 };
 
             // Extract requested topics (None means "all topics")
-            let topics = if metadata_req.topics.is_none()
-                || metadata_req.topics.as_ref().unwrap().is_empty()
-            {
-                pg_log!("Metadata request for ALL topics");
-                None
-            } else {
-                let topic_names: Vec<String> = metadata_req
-                    .topics
-                    .unwrap()
-                    .iter()
-                    .filter_map(|t| t.name.as_ref().map(|n| n.to_string()))
-                    .collect();
-                pg_log!("Metadata request for specific topics: {:?}", topic_names);
-                if topic_names.is_empty() {
+            // Extract requested topics (None means "all topics")
+            let topics = match metadata_req.topics {
+                Some(ref t) if !t.is_empty() => {
+                    let topic_names: Vec<String> = t
+                        .iter()
+                        .filter_map(|t| t.name.as_ref().map(|n| n.to_string()))
+                        .collect();
+                    pg_log!("Metadata request for specific topics: {:?}", topic_names);
+                    if topic_names.is_empty() {
+                        None
+                    } else {
+                        Some(topic_names)
+                    }
+                }
+                _ => {
+                    pg_log!("Metadata request for ALL topics");
                     None
-                } else {
-                    Some(topic_names)
                 }
             };
 

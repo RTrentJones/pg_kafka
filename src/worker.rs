@@ -192,19 +192,6 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     }
 }
 
-/// Get or create a topic by name, returning its ID
-///
-/// This function uses PostgreSQL's SPI (Server Programming Interface) to:
-/// 1. Try to INSERT a new topic (will fail if it already exists due to UNIQUE constraint)
-/// 2. Use ON CONFLICT to return the existing ID if the topic already exists
-///
-/// This is more efficient than SELECT-then-INSERT because it's a single round-trip.
-///
-/// # Rust Explanation
-/// - `Result<i32, Box<dyn std::error::Error>>`: Returns topic ID on success, error on failure
-/// - `Spi::connect()`: Opens a connection to the Postgres database
-/// - `|client| { ... }`: This is a "closure" (anonymous function) that receives the SPI client
-/// - `?` operator: Propagates errors up the call stack (like try/catch in other languages)
 /// Get metadata for all topics in the database
 fn get_all_topics_metadata(
 ) -> Vec<kafka_protocol::messages::metadata_response::MetadataResponseTopic> {
@@ -242,6 +229,19 @@ fn get_all_topics_metadata(
     })
 }
 
+/// Get or create a topic by name, returning its ID
+///
+/// This function uses PostgreSQL's SPI (Server Programming Interface) to:
+/// 1. Try to INSERT a new topic (will fail if it already exists due to UNIQUE constraint)
+/// 2. Use ON CONFLICT to return the existing ID if the topic already exists
+///
+/// This is more efficient than SELECT-then-INSERT because it's a single round-trip.
+///
+/// # Rust Explanation
+/// - `Result<i32, Box<dyn std::error::Error>>`: Returns topic ID on success, error on failure
+/// - `Spi::connect()`: Opens a connection to the Postgres database
+/// - `|client| { ... }`: This is a "closure" (anonymous function) that receives the SPI client
+/// - `?` operator: Propagates errors up the call stack (like try/catch in other languages)
 fn get_or_create_topic(topic_name: &str) -> Result<i32, Box<dyn std::error::Error>> {
     pg_log!("get_or_create_topic: '{}'", topic_name);
 
@@ -265,7 +265,7 @@ fn get_or_create_topic(topic_name: &str) -> Result<i32, Box<dyn std::error::Erro
                 crate::kafka::DEFAULT_TOPIC_PARTITIONS.into(),
             ],
         )?
-        .ok_or_else(|| "Failed to get topic ID")?;
+        .ok_or("Failed to get topic ID")?;
 
         pg_log!("Topic '{}' has id={}", topic_name, topic_id);
         Ok(topic_id)
