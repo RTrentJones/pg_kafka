@@ -752,7 +752,7 @@ mod tests {
     use crate::kafka::messages::KafkaResponse;
     use crate::testing::helpers::*;
 
-    #[test]
+    #[pgrx::pg_test]
     fn test_api_versions_handler_success() {
         // Test that ApiVersions request returns proper response
         let (request, mut response_rx) =
@@ -780,7 +780,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[pgrx::pg_test]
     fn test_api_versions_handler_correlation_id() {
         // Test that correlation_id is preserved
         for test_correlation_id in [0, 1, 42, 999, i32::MAX] {
@@ -806,7 +806,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[pgrx::pg_test]
     fn test_api_versions_handler_supported_versions() {
         // Test that response includes correct API versions
         let (request, mut response_rx) = mock_api_versions_request(1);
@@ -843,7 +843,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[pgrx::pg_test]
     fn test_metadata_handler_all_topics() {
         let (request, mut response_rx) =
             mock_metadata_request_with_client(99, "test-client".to_string(), None);
@@ -873,7 +873,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[pgrx::pg_test]
     fn test_metadata_handler_broker_info() {
         let (request, mut response_rx) = mock_metadata_request(101, None);
 
@@ -897,7 +897,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[pgrx::pg_test]
     fn test_metadata_handler_partition_info() {
         let (request, mut response_rx) = mock_metadata_request(102, None);
 
@@ -936,7 +936,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[pgrx::pg_test]
     fn test_multiple_sequential_requests() {
         // Test sequence: ApiVersions → Metadata
         let (request1, mut response_rx1) = mock_api_versions_request(1);
@@ -950,7 +950,7 @@ mod tests {
         assert!(matches!(response2, KafkaResponse::Metadata { .. }));
     }
 
-    #[test]
+    #[pgrx::pg_test]
     fn test_produce_creates_topic() {
         // Test that Produce request auto-creates a new topic
         let test_topic = "auto-created-topic";
@@ -1001,7 +1001,7 @@ mod tests {
         });
     }
 
-    #[test]
+    #[pgrx::pg_test]
     fn test_produce_single_message() {
         // Test that a single message is inserted with correct offset
         let test_topic = "single-message-topic";
@@ -1052,7 +1052,7 @@ mod tests {
         });
     }
 
-    #[test]
+    #[pgrx::pg_test]
     fn test_produce_batch_messages() {
         // Test that batch of messages gets consecutive offsets
         let test_topic = "batch-topic";
@@ -1115,7 +1115,7 @@ mod tests {
         });
     }
 
-    #[test]
+    #[pgrx::pg_test]
     fn test_produce_with_headers() {
         // Test that headers are correctly serialized to JSONB
         let test_topic = "headers-topic";
@@ -1169,7 +1169,7 @@ mod tests {
         });
     }
 
-    #[test]
+    #[pgrx::pg_test]
     fn test_produce_invalid_partition() {
         // Test that partition > 0 returns an error (we only support single-partition topics)
         let test_topic = "invalid-partition-topic";
