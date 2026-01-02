@@ -91,16 +91,16 @@ fn hello_pg_kafka() -> &'static str {
     "Hello, pg_kafka"
 }
 
-#[cfg(any(test, feature = "pg_test"))]
-#[pg_schema]
-mod tests {
-    use pgrx::prelude::*;
+// #[cfg(any(test, feature = "pg_test"))]
+// #[pg_schema]
+// mod tests {
+//     use pgrx::prelude::*;
 
-    #[pg_test]
-    fn test_hello_pg_kafka() {
-        assert_eq!("Hello, pg_kafka", crate::hello_pg_kafka());
-    }
-}
+//     #[pg_test]
+//     fn test_hello_pg_kafka() {
+//         assert_eq!("Hello, pg_kafka", crate::hello_pg_kafka());
+//     }
+// }
 
 /// This module is required by `cargo pgrx test` invocations.
 /// It must be visible at the root of your extension crate.

@@ -40,6 +40,10 @@ pub enum KafkaError {
     /// Error from kafka-protocol crate (anyhow::Error)
     #[error("Protocol encoding/decoding error: {0}")]
     ProtocolCodec(#[from] anyhow::Error),
+
+    /// Internal storage/database error
+    #[error("Internal error: {0}")]
+    Internal(String),
 }
 
 /// Result type alias for Kafka operations
@@ -47,6 +51,13 @@ pub type Result<T> = std::result::Result<T, KafkaError>;
 
 // Re-export for convenience
 use crate::kafka::constants::MAX_REQUEST_SIZE;
+
+// Implement From for pgrx SpiError to enable ? operator in storage layer
+impl From<pgrx::spi::SpiError> for KafkaError {
+    fn from(err: pgrx::spi::SpiError) -> Self {
+        KafkaError::Internal(format!("Database error: {}", err))
+    }
+}
 
 #[cfg(test)]
 mod tests {

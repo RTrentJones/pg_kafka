@@ -33,10 +33,12 @@
 
 pub mod constants;
 pub mod error;
+pub mod handlers;
 pub mod listener;
 pub mod messages;
 pub mod protocol;
 pub mod response_builders;
+pub mod storage;
 
 // Re-export commonly used types for convenience
 pub use constants::*;
@@ -44,3 +46,4 @@ pub use error::{KafkaError, Result};
 pub use listener::run as run_listener;
 pub use messages::{request_receiver, request_sender, KafkaRequest, KafkaResponse};
 pub use response_builders::*;
+pub use storage::{KafkaStore, PostgresStore};
