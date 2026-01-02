@@ -83,22 +83,27 @@ jobs:
       # Downloads and compiles PostgreSQL 14 (~25 minutes on cold cache)
       run: cargo pgrx init --pg14 download
 
-    - name: Verify pgrx Installation
-      run: |
-        ls -lh ~/.pgrx/
-        echo "pgrx PostgreSQL 14 installation: $(du -sh ~/.pgrx/14.20 | cut -f1)"
-
     # ------------------------------------------------------------------
-    # LINTING: Static analysis
+    # LINTING: Fast checks first (fail fast)
     # ------------------------------------------------------------------
     - name: Check formatting
       # Ensures code follows standard Rust style guidelines
+      # Fast check (~5 seconds) - run before expensive operations
       run: cargo fmt -- --check
 
     - name: Run clippy
       # Catches common mistakes and improves code quality.
       # We enable 'pg14' feature so it checks code conditionally compiled for PG14.
+      # Relatively fast (~30 seconds with cache) - run before tests
       run: cargo clippy --features pg14 -- -D warnings
+
+    # ------------------------------------------------------------------
+    # PGRX SETUP: Only after linting passes
+    # ------------------------------------------------------------------
+    - name: Verify pgrx Installation
+      run: |
+        ls -lh ~/.pgrx/
+        echo "pgrx PostgreSQL 14 installation: $(du -sh ~/.pgrx/14.20 | cut -f1)"
 
     # ------------------------------------------------------------------
     # UNIT & INTEGRATION TESTING: Internal Rust/SPI tests
@@ -108,6 +113,9 @@ jobs:
       # installs the extension, and runs functions marked with #[pg_test].
       # This tests internal logic and SPI (database) interactions.
       run: cargo pgrx test pg14
+      env:
+        # Override RUSTFLAGS to avoid -D warnings (pgrx macros cause false positives)
+        RUSTFLAGS: ""
 
     # ------------------------------------------------------------------
     # E2E TESTING: Full system test with external client
