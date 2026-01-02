@@ -63,19 +63,30 @@ jobs:
 
     # ------------------------------------------------------------------
     # OPTIMIZATION: Cache Postgres binaries (~/.pgrx)
+    # CRITICAL: Only cache the compiled binaries, NOT runtime files
     # ------------------------------------------------------------------
-    - name: Cache pgrx home
+    - name: Cache pgrx PostgreSQL Binaries
       id: cache-pgrx
       uses: actions/cache@v4
       with:
-        path: ~/.pgrx
-        # Stable key that doesn't invalidate on Cargo.lock changes
-        key: ${{ runner.os }}-pgrx-home-0.16.1-v1
+        path: |
+          ~/.pgrx/14.20
+          ~/.pgrx/14.20_unpack
+          ~/.pgrx/config.toml
+        # Stable key - only invalidate when pgrx or PG version changes
+        key: ${{ runner.os }}-pgrx-pg14-0.16.1-pg14.20-v2
+        restore-keys: |
+          ${{ runner.os }}-pgrx-pg14-0.16.1-
 
     - name: Initialize pgrx
       if: steps.cache-pgrx.outputs.cache-hit != 'true'
-      # Downloads and compiles PostgreSQL 14 if not found in cache
+      # Downloads and compiles PostgreSQL 14 (~25 minutes on cold cache)
       run: cargo pgrx init
+
+    - name: Verify pgrx Installation
+      run: |
+        ls -lh ~/.pgrx/
+        echo "pgrx PostgreSQL 14 installation: $(du -sh ~/.pgrx/14.20 | cut -f1)"
 
     # ------------------------------------------------------------------
     # LINTING: Static analysis
