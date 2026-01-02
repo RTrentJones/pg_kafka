@@ -9,6 +9,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  PGRX_VERSION: 0.16.1
+  PG_VERSION: 14.20
 
 permissions:
   contents: read
@@ -36,13 +38,16 @@ jobs:
 
     - name: Rust Cache
       uses: Swatinem/rust-cache@v2
+      with:
+        # cache the main workspace AND the kafka_test crate
+        workspaces: |
+          . -> target
+          kafka_test -> kafka_test/target
       # intelligently caches Rust dependencies to speed up builds significantly.
 
     - name: Install System Dependencies
       run: |
         sudo apt-get update
-        # libpq-dev is required to link against Postgres libraries
-        # libreadline-dev, zlib1g-dev, etc. are required for compiling Postgres from source
         sudo apt-get install -y libpq-dev libreadline-dev zlib1g-dev flex bison libxml2-dev libxslt-dev
 
     # ------------------------------------------------------------------
@@ -54,12 +59,12 @@ jobs:
       with:
         path: ~/.cargo/bin/cargo-pgrx
         # Cache key includes runner OS and version, but NOT Cargo.lock
-        key: ${{ runner.os }}-cargo-pgrx-bin-0.16.1
+        key: ${{ runner.os }}-cargo-pgrx-bin-${{ env.PGRX_VERSION }}
 
     - name: Install pgrx
       if: steps.cache-cargo-pgrx.outputs.cache-hit != 'true'
       # Installs the pgrx CLI tool which we use to manage the Postgres lifecycle
-      run: cargo install --locked cargo-pgrx --version 0.16.1
+      run: cargo install --locked cargo-pgrx --version ${{ env.PGRX_VERSION }}
 
     # ------------------------------------------------------------------
     # OPTIMIZATION: Cache Postgres binaries (~/.pgrx)
@@ -70,31 +75,26 @@ jobs:
       uses: actions/cache@v4
       with:
         path: |
-          ~/.pgrx/14.20
-          ~/.pgrx/14.20_unpack
+          ~/.pgrx/${{ env.PG_VERSION }}
+          ~/.pgrx/${{ env.PG_VERSION }}_unpack
           ~/.pgrx/config.toml
         # Stable key - only invalidate when pgrx or PG version changes
-        key: ${{ runner.os }}-pgrx-pg14-0.16.1-pg14.20-v2
+        key: ${{ runner.os }}-pgrx-pg14-${{ env.PGRX_VERSION }}-pg${{ env.PG_VERSION }}-v2
         restore-keys: |
-          ${{ runner.os }}-pgrx-pg14-0.16.1-
+          ${{ runner.os }}-pgrx-pg14-${{ env.PGRX_VERSION }}-
 
     - name: Initialize pgrx
       if: steps.cache-pgrx.outputs.cache-hit != 'true'
       # Downloads and compiles PostgreSQL 14 (~25 minutes on cold cache)
-      run: cargo pgrx init --pg14 download
+      run: cargo pgrx init --pg14=${{ env.PG_VERSION }}
 
     # ------------------------------------------------------------------
     # LINTING: Fast checks first (fail fast)
     # ------------------------------------------------------------------
     - name: Check formatting
-      # Ensures code follows standard Rust style guidelines
-      # Fast check (~5 seconds) - run before expensive operations
       run: cargo fmt -- --check
 
     - name: Run clippy
-      # Catches common mistakes and improves code quality.
-      # We enable 'pg14' feature so it checks code conditionally compiled for PG14.
-      # Relatively fast (~30 seconds with cache) - run before tests
       run: cargo clippy --features pg14 -- -D warnings
 
     # ------------------------------------------------------------------
@@ -103,7 +103,7 @@ jobs:
     - name: Verify pgrx Installation
       run: |
         ls -lh ~/.pgrx/
-        echo "pgrx PostgreSQL 14 installation: $(du -sh ~/.pgrx/14.20 | cut -f1)"
+        echo "pgrx PostgreSQL 14 installation: $(du -sh ~/.pgrx/${{ env.PG_VERSION }} | cut -f1)"
 
     # ------------------------------------------------------------------
     # UNIT & INTEGRATION TESTING: Internal Rust/SPI tests
@@ -178,7 +178,6 @@ jobs:
       if: always()
       # Ensures the background Postgres process is killed, freeing resources.
       run: cargo pgrx stop pg14
-      # PERMISSIONS: Required for the AI reviewer to post comments on PRs
 
   # ------------------------------------------------------------------
   # AI REVIEWER: Automated Code Review via Gemini
