@@ -7,6 +7,9 @@
 // but we need to handle the framing (size prefix) and routing (api_key matching) ourselves.
 
 use bytes::{BufMut, BytesMut};
+use kafka_protocol::messages::fetch_request::FetchRequest;
+use kafka_protocol::messages::offset_commit_request::OffsetCommitRequest;
+use kafka_protocol::messages::offset_fetch_request::OffsetFetchRequest;
 use kafka_protocol::messages::produce_request::ProduceRequest;
 use kafka_protocol::messages::ResponseHeader;
 use kafka_protocol::protocol::{decode_request_header_from_buffer, Decodable, Encodable};
@@ -227,6 +230,198 @@ pub fn parse_request(
                 acks,
                 timeout_ms,
                 topic_data,
+                response_tx,
+            }))
+        }
+        API_KEY_FETCH => {
+            // Fetch request - read messages from topics
+            pg_log!(
+                "Parsed Fetch request (api_key={}, version={})",
+                API_KEY_FETCH,
+                api_version
+            );
+
+            // Use kafka-protocol crate to decode FetchRequest
+            let fetch_req = match FetchRequest::decode(&mut payload_buf, api_version) {
+                Ok(req) => req,
+                Err(e) => {
+                    pg_warning!("Failed to decode FetchRequest: {}", e);
+                    let error_response = KafkaResponse::Error {
+                        correlation_id,
+                        error_code: ERROR_CORRUPT_MESSAGE,
+                        error_message: Some(format!("Malformed FetchRequest: {}", e)),
+                    };
+                    let _ = response_tx.send(error_response);
+                    return Ok(None);
+                }
+            };
+
+            let max_wait_ms = fetch_req.max_wait_ms;
+            let min_bytes = fetch_req.min_bytes;
+            let max_bytes = fetch_req.max_bytes;
+
+            pg_log!(
+                "FetchRequest: max_wait_ms={}, min_bytes={}, max_bytes={}, topics={}",
+                max_wait_ms,
+                min_bytes,
+                max_bytes,
+                fetch_req.topics.len()
+            );
+
+            // Extract topic data from kafka-protocol types to our types
+            let mut topic_data = Vec::new();
+            for topic in fetch_req.topics {
+                let topic_name = topic.topic.to_string();
+                let mut partitions = Vec::new();
+
+                for partition in topic.partitions {
+                    partitions.push(super::messages::PartitionFetchData {
+                        partition_index: partition.partition,
+                        fetch_offset: partition.fetch_offset,
+                        partition_max_bytes: partition.partition_max_bytes,
+                    });
+                }
+
+                pg_log!(
+                    "Fetch from topic={}, {} partitions",
+                    topic_name,
+                    partitions.len()
+                );
+
+                topic_data.push(super::messages::TopicFetchData {
+                    name: topic_name,
+                    partitions,
+                });
+            }
+
+            Ok(Some(KafkaRequest::Fetch {
+                correlation_id,
+                client_id,
+                api_version,
+                max_wait_ms,
+                min_bytes,
+                max_bytes,
+                topic_data,
+                response_tx,
+            }))
+        }
+        API_KEY_OFFSET_COMMIT => {
+            // OffsetCommit request - commit consumed offsets
+            pg_log!(
+                "Parsed OffsetCommit request (api_key={}, version={})",
+                API_KEY_OFFSET_COMMIT,
+                api_version
+            );
+
+            // Use kafka-protocol crate to decode OffsetCommitRequest
+            let commit_req = match OffsetCommitRequest::decode(&mut payload_buf, api_version) {
+                Ok(req) => req,
+                Err(e) => {
+                    pg_warning!("Failed to decode OffsetCommitRequest: {}", e);
+                    let error_response = KafkaResponse::Error {
+                        correlation_id,
+                        error_code: ERROR_CORRUPT_MESSAGE,
+                        error_message: Some(format!("Malformed OffsetCommitRequest: {}", e)),
+                    };
+                    let _ = response_tx.send(error_response);
+                    return Ok(None);
+                }
+            };
+
+            let group_id = commit_req.group_id.to_string();
+
+            pg_log!(
+                "OffsetCommit for group_id={}, {} topics",
+                group_id,
+                commit_req.topics.len()
+            );
+
+            // Extract topic data from kafka-protocol types to our types
+            let mut topics = Vec::new();
+            for topic in commit_req.topics {
+                let topic_name = topic.name.to_string();
+                let mut partitions = Vec::new();
+
+                for partition in topic.partitions {
+                    partitions.push(super::messages::OffsetCommitPartitionData {
+                        partition_index: partition.partition_index,
+                        committed_offset: partition.committed_offset,
+                        metadata: partition
+                            .committed_metadata
+                            .map(|s| s.to_string())
+                            .filter(|s| !s.is_empty()),
+                    });
+                }
+
+                topics.push(super::messages::OffsetCommitTopicData {
+                    name: topic_name,
+                    partitions,
+                });
+            }
+
+            Ok(Some(KafkaRequest::OffsetCommit {
+                correlation_id,
+                client_id,
+                api_version,
+                group_id,
+                topics,
+                response_tx,
+            }))
+        }
+        API_KEY_OFFSET_FETCH => {
+            // OffsetFetch request - fetch committed offsets
+            pg_log!(
+                "Parsed OffsetFetch request (api_key={}, version={})",
+                API_KEY_OFFSET_FETCH,
+                api_version
+            );
+
+            // Use kafka-protocol crate to decode OffsetFetchRequest
+            let fetch_req = match OffsetFetchRequest::decode(&mut payload_buf, api_version) {
+                Ok(req) => req,
+                Err(e) => {
+                    pg_warning!("Failed to decode OffsetFetchRequest: {}", e);
+                    let error_response = KafkaResponse::Error {
+                        correlation_id,
+                        error_code: ERROR_CORRUPT_MESSAGE,
+                        error_message: Some(format!("Malformed OffsetFetchRequest: {}", e)),
+                    };
+                    let _ = response_tx.send(error_response);
+                    return Ok(None);
+                }
+            };
+
+            let group_id = fetch_req.group_id.to_string();
+
+            pg_log!("OffsetFetch for group_id={}", group_id);
+
+            // Extract topic data (None = fetch all topics for this group)
+            let topics = if let Some(topic_vec) = fetch_req.topics {
+                if topic_vec.is_empty() {
+                    None
+                } else {
+                    let mut topic_list = Vec::new();
+                    for topic in topic_vec {
+                        let topic_name = topic.name.to_string();
+                        let partition_indexes = topic.partition_indexes;
+
+                        topic_list.push(super::messages::OffsetFetchTopicData {
+                            name: topic_name,
+                            partition_indexes,
+                        });
+                    }
+                    Some(topic_list)
+                }
+            } else {
+                None
+            };
+
+            Ok(Some(KafkaRequest::OffsetFetch {
+                correlation_id,
+                client_id,
+                api_version,
+                group_id,
+                topics,
                 response_tx,
             }))
         }
@@ -475,6 +670,57 @@ pub fn encode_response(response: KafkaResponse) -> Result<BytesMut> {
 
             // Encode response body using the requested API version
             produce_response.encode(&mut response_buf, api_version)?;
+        }
+        KafkaResponse::Fetch {
+            correlation_id,
+            api_version,
+            response: fetch_response,
+        } => {
+            // Build ResponseHeader
+            let header = ResponseHeader::default().with_correlation_id(correlation_id);
+
+            // Encode response header
+            // Fetch v12+ uses flexible format (ResponseHeader v1)
+            // Fetch v0-v11 uses non-flexible format (ResponseHeader v0)
+            let response_header_version = if api_version >= 12 { 1 } else { 0 };
+            header.encode(&mut response_buf, response_header_version)?;
+
+            // Encode response body using the requested API version
+            fetch_response.encode(&mut response_buf, api_version)?;
+        }
+        KafkaResponse::OffsetCommit {
+            correlation_id,
+            api_version,
+            response: commit_response,
+        } => {
+            // Build ResponseHeader
+            let header = ResponseHeader::default().with_correlation_id(correlation_id);
+
+            // Encode response header
+            // OffsetCommit v8+ uses flexible format (ResponseHeader v1)
+            // OffsetCommit v0-v7 uses non-flexible format (ResponseHeader v0)
+            let response_header_version = if api_version >= 8 { 1 } else { 0 };
+            header.encode(&mut response_buf, response_header_version)?;
+
+            // Encode response body using the requested API version
+            commit_response.encode(&mut response_buf, api_version)?;
+        }
+        KafkaResponse::OffsetFetch {
+            correlation_id,
+            api_version,
+            response: fetch_response,
+        } => {
+            // Build ResponseHeader
+            let header = ResponseHeader::default().with_correlation_id(correlation_id);
+
+            // Encode response header
+            // OffsetFetch v6+ uses flexible format (ResponseHeader v1)
+            // OffsetFetch v0-v5 uses non-flexible format (ResponseHeader v0)
+            let response_header_version = if api_version >= 6 { 1 } else { 0 };
+            header.encode(&mut response_buf, response_header_version)?;
+
+            // Encode response body using the requested API version
+            fetch_response.encode(&mut response_buf, api_version)?;
         }
         KafkaResponse::Error {
             correlation_id,

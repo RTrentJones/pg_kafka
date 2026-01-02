@@ -41,6 +41,34 @@ pub fn build_api_versions_response() -> ApiVersionsResponse {
     av3.max_version = 9;
     response.api_keys.push(av3);
 
+    // Fetch (API_KEY_FETCH): versions 0-13
+    let mut av4 = ApiVersion::default();
+    av4.api_key = API_KEY_FETCH;
+    av4.min_version = 0;
+    av4.max_version = 13;
+    response.api_keys.push(av4);
+
+    // ListOffsets (API_KEY_LIST_OFFSETS): versions 0-7
+    let mut av5 = ApiVersion::default();
+    av5.api_key = API_KEY_LIST_OFFSETS;
+    av5.min_version = 0;
+    av5.max_version = 7;
+    response.api_keys.push(av5);
+
+    // OffsetCommit (API_KEY_OFFSET_COMMIT): versions 0-8
+    let mut av6 = ApiVersion::default();
+    av6.api_key = API_KEY_OFFSET_COMMIT;
+    av6.min_version = 0;
+    av6.max_version = 8;
+    response.api_keys.push(av6);
+
+    // OffsetFetch (API_KEY_OFFSET_FETCH): versions 0-8
+    let mut av7 = ApiVersion::default();
+    av7.api_key = API_KEY_OFFSET_FETCH;
+    av7.min_version = 0;
+    av7.max_version = 8;
+    response.api_keys.push(av7);
+
     response
 }
 

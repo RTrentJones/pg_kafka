@@ -62,8 +62,55 @@ pub enum KafkaRequest {
         /// Channel to send the response back to the specific connection
         response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
     },
-    // Future requests to add:
-    // Fetch { ... },
+    /// Fetch request - read messages from topic partitions
+    Fetch {
+        /// Correlation ID from client - MUST be echoed back in response
+        correlation_id: i32,
+        /// Optional client identifier string
+        client_id: Option<String>,
+        /// API version from the request (needed for response encoding)
+        api_version: i16,
+        /// Maximum time to wait for data (milliseconds) - used for long polling
+        max_wait_ms: i32,
+        /// Minimum bytes to wait for before responding (for batching efficiency)
+        min_bytes: i32,
+        /// Maximum bytes to return (total across all partitions)
+        max_bytes: i32,
+        /// Topic-partition fetch data
+        topic_data: Vec<TopicFetchData>,
+        /// Channel to send the response back to the specific connection
+        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
+    },
+    /// OffsetCommit request - commit consumed offsets for a consumer group
+    OffsetCommit {
+        /// Correlation ID from client - MUST be echoed back in response
+        correlation_id: i32,
+        /// Optional client identifier string
+        client_id: Option<String>,
+        /// API version from the request (needed for response encoding)
+        api_version: i16,
+        /// Consumer group ID
+        group_id: String,
+        /// Topic-partition offset data to commit
+        topics: Vec<OffsetCommitTopicData>,
+        /// Channel to send the response back to the specific connection
+        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
+    },
+    /// OffsetFetch request - fetch committed offsets for a consumer group
+    OffsetFetch {
+        /// Correlation ID from client - MUST be echoed back in response
+        correlation_id: i32,
+        /// Optional client identifier string
+        client_id: Option<String>,
+        /// API version from the request (needed for response encoding)
+        api_version: i16,
+        /// Consumer group ID
+        group_id: String,
+        /// Topics to fetch offsets for (None = all topics)
+        topics: Option<Vec<OffsetFetchTopicData>>,
+        /// Channel to send the response back to the specific connection
+        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
+    },
 }
 
 /// Kafka response types sent back from main thread to async tasks
@@ -98,6 +145,33 @@ pub enum KafkaResponse {
         api_version: i16,
         /// The kafka-protocol response struct (ready to encode)
         response: kafka_protocol::messages::produce_response::ProduceResponse,
+    },
+    /// Fetch response - wraps kafka-protocol's FetchResponse
+    Fetch {
+        /// Correlation ID from request
+        correlation_id: i32,
+        /// API version from the request (needed for response encoding)
+        api_version: i16,
+        /// The kafka-protocol response struct (ready to encode)
+        response: kafka_protocol::messages::fetch_response::FetchResponse,
+    },
+    /// OffsetCommit response - wraps kafka-protocol's OffsetCommitResponse
+    OffsetCommit {
+        /// Correlation ID from request
+        correlation_id: i32,
+        /// API version from the request (needed for response encoding)
+        api_version: i16,
+        /// The kafka-protocol response struct (ready to encode)
+        response: kafka_protocol::messages::offset_commit_response::OffsetCommitResponse,
+    },
+    /// OffsetFetch response - wraps kafka-protocol's OffsetFetchResponse
+    OffsetFetch {
+        /// Correlation ID from request
+        correlation_id: i32,
+        /// API version from the request (needed for response encoding)
+        api_version: i16,
+        /// The kafka-protocol response struct (ready to encode)
+        response: kafka_protocol::messages::offset_fetch_response::OffsetFetchResponse,
     },
     /// Error response for unsupported or malformed requests
     Error {
@@ -173,6 +247,55 @@ pub struct PartitionProduceResponse {
     pub log_append_time: i64,
     /// Earliest available offset in this partition (-1 if not tracked)
     pub log_start_offset: i64,
+}
+
+/// Data for fetching from a topic
+#[derive(Debug, Clone)]
+pub struct TopicFetchData {
+    /// Topic name
+    pub name: String,
+    /// Partitions to fetch from
+    pub partitions: Vec<PartitionFetchData>,
+}
+
+/// Data for fetching from a partition
+#[derive(Debug, Clone)]
+pub struct PartitionFetchData {
+    /// Partition ID
+    pub partition_index: i32,
+    /// Offset to start fetching from
+    pub fetch_offset: i64,
+    /// Maximum bytes to fetch from this partition
+    pub partition_max_bytes: i32,
+}
+
+/// Data for committing offsets for a topic
+#[derive(Debug, Clone)]
+pub struct OffsetCommitTopicData {
+    /// Topic name
+    pub name: String,
+    /// Partitions to commit offsets for
+    pub partitions: Vec<OffsetCommitPartitionData>,
+}
+
+/// Data for committing offset for a partition
+#[derive(Debug, Clone)]
+pub struct OffsetCommitPartitionData {
+    /// Partition ID
+    pub partition_index: i32,
+    /// Offset to commit (consumer will fetch from committed_offset + 1)
+    pub committed_offset: i64,
+    /// Optional metadata
+    pub metadata: Option<String>,
+}
+
+/// Data for fetching offsets for a topic
+#[derive(Debug, Clone)]
+pub struct OffsetFetchTopicData {
+    /// Topic name
+    pub name: String,
+    /// Partitions to fetch offsets for
+    pub partition_indexes: Vec<i32>,
 }
 
 // Global request queue: async tasks → main thread

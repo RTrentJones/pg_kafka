@@ -743,6 +743,616 @@ pub fn process_request(request: crate::kafka::KafkaRequest) {
                 pg_log!("Produce response sent successfully");
             }
         }
+        crate::kafka::KafkaRequest::Fetch {
+            correlation_id,
+            client_id: _,
+            api_version,
+            max_wait_ms: _,
+            min_bytes: _,
+            max_bytes: _,
+            topic_data,
+            response_tx,
+        } => {
+            pg_log!(
+                "Processing Fetch request, correlation_id: {}",
+                correlation_id
+            );
+
+            // Import types needed for FetchResponse
+            use kafka_protocol::messages::fetch_response::{
+                FetchResponse, FetchableTopicResponse, PartitionData,
+            };
+            use kafka_protocol::messages::TopicName;
+            use kafka_protocol::protocol::StrBytes;
+            use kafka_protocol::records::{
+                Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
+            };
+
+            let mut responses = Vec::new();
+
+            // Process each topic requested
+            for topic_fetch in topic_data {
+                let topic_name = topic_fetch.name.clone();
+
+                pg_log!("Fetching from topic: {}", topic_name);
+
+                // Look up topic_id
+                // TODO: Use prepared statements when pgrx supports them to prevent SQL injection
+                let topic_name_escaped = topic_name.replace("'", "''");
+                let topic_id_result = BackgroundWorker::transaction(|| {
+                    pgrx::Spi::get_one::<i32>(&format!(
+                        "SELECT id FROM kafka.topics WHERE name = '{}'",
+                        topic_name_escaped
+                    ))
+                });
+
+                let topic_id = match topic_id_result {
+                    Ok(Some(id)) => id,
+                    Ok(None) => {
+                        pg_warning!("Topic not found: {}", topic_name);
+                        // Return error response for this topic
+                        let mut error_partitions = Vec::new();
+                        for p in topic_fetch.partitions {
+                            let mut partition_data = PartitionData::default();
+                            partition_data.partition_index = p.partition_index;
+                            partition_data.error_code = ERROR_UNKNOWN_TOPIC_OR_PARTITION;
+                            partition_data.high_watermark = -1;
+                            error_partitions.push(partition_data);
+                        }
+                        let mut topic_response = FetchableTopicResponse::default();
+                        topic_response.topic = TopicName(StrBytes::from_string(topic_name));
+                        topic_response.partitions = error_partitions;
+                        responses.push(topic_response);
+                        continue;
+                    }
+                    Err(e) => {
+                        pg_warning!("Failed to query topic: {}", e);
+                        continue;
+                    }
+                };
+
+                let mut partition_responses = Vec::new();
+
+                // Process each partition
+                for partition_fetch in topic_fetch.partitions {
+                    let partition_id = partition_fetch.partition_index;
+                    let fetch_offset = partition_fetch.fetch_offset;
+
+                    pg_log!(
+                        "Fetching topic_id={}, partition={}, offset>={}",
+                        topic_id,
+                        partition_id,
+                        fetch_offset
+                    );
+
+                    // Query messages from database
+                    let records_result = BackgroundWorker::transaction(|| {
+                        let query = format!(
+                            "SELECT partition_offset, key, value
+                             FROM kafka.messages
+                             WHERE topic_id = {} AND partition_id = {}
+                               AND partition_offset >= {}
+                             ORDER BY partition_offset
+                             LIMIT 1000",
+                            topic_id, partition_id, fetch_offset
+                        );
+
+                        pgrx::Spi::connect(|client| {
+                            let mut records = Vec::new();
+                            let tup_table = client.select(&query, Some(1), &[])?;
+
+                            for row in tup_table {
+                                let offset: i64 = row[1].value()?.unwrap_or(0);
+                                let key: Option<Vec<u8>> = row[2].value()?;
+                                let value: Option<Vec<u8>> = row[3].value()?;
+                                // For now, use current time as timestamp
+                                // TODO: Properly convert PostgreSQL timestamp to milliseconds since epoch
+                                let timestamp_ms = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_millis()
+                                    as i64;
+
+                                records.push((offset, key, value, timestamp_ms));
+                            }
+
+                            Ok::<
+                                Vec<(i64, Option<Vec<u8>>, Option<Vec<u8>>, i64)>,
+                                Box<dyn std::error::Error>,
+                            >(records)
+                        })
+                    });
+
+                    let db_records = match records_result {
+                        Ok(records) => records,
+                        Err(e) => {
+                            pg_warning!("Failed to fetch records: {}", e);
+                            let mut partition_data = PartitionData::default();
+                            partition_data.partition_index = partition_id;
+                            partition_data.error_code = ERROR_UNKNOWN_SERVER_ERROR;
+                            partition_data.high_watermark = -1;
+                            partition_responses.push(partition_data);
+                            continue;
+                        }
+                    };
+
+                    pg_log!("Fetched {} records", db_records.len());
+
+                    // Get high watermark (next offset to be written)
+                    let high_watermark_result = BackgroundWorker::transaction(|| {
+                        pgrx::Spi::get_one::<i64>(&format!(
+                            "SELECT COALESCE(MAX(partition_offset) + 1, 0)
+                             FROM kafka.messages
+                             WHERE topic_id = {} AND partition_id = {}",
+                            topic_id, partition_id
+                        ))
+                    });
+
+                    let high_watermark = high_watermark_result.unwrap_or(Some(0)).unwrap_or(0);
+
+                    // Convert database records to Kafka RecordBatch format
+                    let records_bytes = if !db_records.is_empty() {
+                        let kafka_records: Vec<Record> = db_records
+                            .into_iter()
+                            .map(|(offset, key, value, timestamp_ms)| Record {
+                                transactional: false,
+                                control: false,
+                                partition_leader_epoch: 0,
+                                producer_id: -1,
+                                producer_epoch: -1,
+                                timestamp_type: TimestampType::Creation,
+                                offset,
+                                sequence: offset as i32,
+                                timestamp: timestamp_ms,
+                                key: key.map(bytes::Bytes::from),
+                                value: value.map(bytes::Bytes::from),
+                                headers: Default::default(),
+                            })
+                            .collect();
+
+                        // Encode records as RecordBatch using the pattern from the example
+                        let mut encoded = bytes::BytesMut::new();
+                        if let Err(e) = RecordBatchEncoder::encode(
+                            &mut encoded,
+                            kafka_records.iter(),
+                            &RecordEncodeOptions {
+                                version: 2,
+                                compression: Compression::None,
+                            },
+                        ) {
+                            pg_warning!("Failed to encode RecordBatch: {}", e);
+                            None
+                        } else {
+                            Some(encoded.freeze())
+                        }
+                    } else {
+                        None
+                    };
+
+                    let mut partition_data = PartitionData::default();
+                    partition_data.partition_index = partition_id;
+                    partition_data.error_code = ERROR_NONE;
+                    partition_data.high_watermark = high_watermark;
+                    partition_data.last_stable_offset = high_watermark;
+                    partition_data.log_start_offset = 0;
+                    partition_data.records = records_bytes;
+                    partition_responses.push(partition_data);
+                }
+
+                let mut topic_response = FetchableTopicResponse::default();
+                topic_response.topic = TopicName(StrBytes::from_string(topic_name));
+                topic_response.partitions = partition_responses;
+                responses.push(topic_response);
+            }
+
+            let mut kafka_response = FetchResponse::default();
+            kafka_response.throttle_time_ms = 0;
+            kafka_response.error_code = ERROR_NONE;
+            kafka_response.session_id = 0;
+            kafka_response.responses = responses;
+
+            let response = KafkaResponse::Fetch {
+                correlation_id,
+                api_version,
+                response: kafka_response,
+            };
+
+            if let Err(e) = response_tx.send(response) {
+                pg_warning!("Failed to send Fetch response: {}", e);
+            } else {
+                pg_log!("Fetch response sent successfully");
+            }
+        }
+        crate::kafka::KafkaRequest::OffsetCommit {
+            correlation_id,
+            client_id: _,
+            api_version,
+            group_id,
+            topics,
+            response_tx,
+        } => {
+            pg_log!(
+                "Processing OffsetCommit request, correlation_id: {}, group_id: {}",
+                correlation_id,
+                group_id
+            );
+
+            use kafka_protocol::messages::offset_commit_response::{
+                OffsetCommitResponse, OffsetCommitResponsePartition, OffsetCommitResponseTopic,
+            };
+            use kafka_protocol::messages::TopicName;
+            use kafka_protocol::protocol::StrBytes;
+
+            let mut response_topics = Vec::new();
+
+            // Process each topic
+            for topic in topics {
+                let topic_name = topic.name.clone();
+
+                // Look up topic_id
+                // TODO: Use prepared statements when pgrx supports them to prevent SQL injection
+                let topic_name_escaped = topic_name.replace("'", "''");
+                let topic_id_result = BackgroundWorker::transaction(|| {
+                    pgrx::Spi::get_one::<i32>(&format!(
+                        "SELECT id FROM kafka.topics WHERE name = '{}'",
+                        topic_name_escaped
+                    ))
+                });
+
+                let topic_id = match topic_id_result {
+                    Ok(Some(id)) => id,
+                    Ok(None) => {
+                        pg_warning!("Topic not found for OffsetCommit: {}", topic_name);
+                        // Return error for all partitions in this topic
+                        let mut error_partitions = Vec::new();
+                        for partition in topic.partitions {
+                            let mut partition_response = OffsetCommitResponsePartition::default();
+                            partition_response.partition_index = partition.partition_index;
+                            partition_response.error_code = ERROR_UNKNOWN_TOPIC_OR_PARTITION;
+                            error_partitions.push(partition_response);
+                        }
+
+                        let mut topic_response = OffsetCommitResponseTopic::default();
+                        topic_response.name = TopicName(StrBytes::from_string(topic_name));
+                        topic_response.partitions = error_partitions;
+                        response_topics.push(topic_response);
+                        continue;
+                    }
+                    Err(e) => {
+                        pg_warning!("Error looking up topic {}: {:?}", topic_name, e);
+                        let mut error_partitions = Vec::new();
+                        for partition in topic.partitions {
+                            let mut partition_response = OffsetCommitResponsePartition::default();
+                            partition_response.partition_index = partition.partition_index;
+                            partition_response.error_code = ERROR_UNKNOWN_SERVER_ERROR;
+                            error_partitions.push(partition_response);
+                        }
+
+                        let mut topic_response = OffsetCommitResponseTopic::default();
+                        topic_response.name = TopicName(StrBytes::from_string(topic_name));
+                        topic_response.partitions = error_partitions;
+                        response_topics.push(topic_response);
+                        continue;
+                    }
+                };
+
+                let mut partition_responses = Vec::new();
+
+                // Process each partition offset commit
+                for partition in topic.partitions {
+                    let partition_id = partition.partition_index;
+                    let committed_offset = partition.committed_offset;
+                    let metadata = partition.metadata.unwrap_or_default();
+
+                    // UPSERT committed offset
+                    // TODO: Use prepared statements when pgrx supports them
+                    let group_id_escaped = group_id.replace("'", "''");
+                    let metadata_escaped = metadata.replace("'", "''");
+                    let upsert_result = BackgroundWorker::transaction(|| {
+                        let query = if metadata.is_empty() {
+                            format!(
+                                "INSERT INTO kafka.consumer_offsets
+                                    (group_id, topic_id, partition_id, committed_offset, metadata)
+                                VALUES ('{}', {}, {}, {}, NULL)
+                                ON CONFLICT (group_id, topic_id, partition_id)
+                                DO UPDATE SET
+                                    committed_offset = EXCLUDED.committed_offset,
+                                    metadata = EXCLUDED.metadata,
+                                    commit_timestamp = NOW()",
+                                group_id_escaped, topic_id, partition_id, committed_offset
+                            )
+                        } else {
+                            format!(
+                                "INSERT INTO kafka.consumer_offsets
+                                    (group_id, topic_id, partition_id, committed_offset, metadata)
+                                VALUES ('{}', {}, {}, {}, '{}')
+                                ON CONFLICT (group_id, topic_id, partition_id)
+                                DO UPDATE SET
+                                    committed_offset = EXCLUDED.committed_offset,
+                                    metadata = EXCLUDED.metadata,
+                                    commit_timestamp = NOW()",
+                                group_id_escaped,
+                                topic_id,
+                                partition_id,
+                                committed_offset,
+                                metadata_escaped
+                            )
+                        };
+                        pgrx::Spi::run(&query)
+                    });
+
+                    let error_code = match upsert_result {
+                        Ok(_) => {
+                            pg_log!(
+                                "Committed offset {} for group={}, topic={}, partition={}",
+                                committed_offset,
+                                group_id,
+                                topic_name,
+                                partition_id
+                            );
+                            ERROR_NONE
+                        }
+                        Err(e) => {
+                            pg_warning!(
+                                "Failed to commit offset for partition {}: {:?}",
+                                partition_id,
+                                e
+                            );
+                            ERROR_UNKNOWN_SERVER_ERROR
+                        }
+                    };
+
+                    let mut partition_response = OffsetCommitResponsePartition::default();
+                    partition_response.partition_index = partition_id;
+                    partition_response.error_code = error_code;
+                    partition_responses.push(partition_response);
+                }
+
+                let mut topic_response = OffsetCommitResponseTopic::default();
+                topic_response.name = TopicName(StrBytes::from_string(topic_name));
+                topic_response.partitions = partition_responses;
+                response_topics.push(topic_response);
+            }
+
+            // Build response
+            let mut kafka_response = OffsetCommitResponse::default();
+            kafka_response.throttle_time_ms = 0;
+            kafka_response.topics = response_topics;
+
+            let response = KafkaResponse::OffsetCommit {
+                correlation_id,
+                api_version,
+                response: kafka_response,
+            };
+
+            if let Err(e) = response_tx.send(response) {
+                pg_warning!("Failed to send OffsetCommit response: {}", e);
+            } else {
+                pg_log!("OffsetCommit response sent successfully");
+            }
+        }
+        crate::kafka::KafkaRequest::OffsetFetch {
+            correlation_id,
+            client_id: _,
+            api_version,
+            group_id,
+            topics,
+            response_tx,
+        } => {
+            pg_log!(
+                "Processing OffsetFetch request, correlation_id: {}, group_id: {}",
+                correlation_id,
+                group_id
+            );
+
+            use kafka_protocol::messages::offset_fetch_response::{
+                OffsetFetchResponse, OffsetFetchResponsePartition, OffsetFetchResponseTopic,
+            };
+            use kafka_protocol::messages::TopicName;
+            use kafka_protocol::protocol::StrBytes;
+
+            let mut response_topics = Vec::new();
+
+            if let Some(topic_list) = topics {
+                // Fetch specific topics and partitions
+                for topic_request in topic_list {
+                    let topic_name = topic_request.name.clone();
+
+                    // Look up topic_id
+                    // TODO: Use prepared statements when pgrx supports them
+                    let topic_name_escaped = topic_name.replace("'", "''");
+                    let topic_id_result = BackgroundWorker::transaction(|| {
+                        pgrx::Spi::get_one::<i32>(&format!(
+                            "SELECT id FROM kafka.topics WHERE name = '{}'",
+                            topic_name_escaped
+                        ))
+                    });
+
+                    let topic_id = match topic_id_result {
+                        Ok(Some(id)) => id,
+                        Ok(None) => {
+                            pg_warning!("Topic not found for OffsetFetch: {}", topic_name);
+                            // Return error for all requested partitions
+                            let mut error_partitions = Vec::new();
+                            for partition_index in topic_request.partition_indexes {
+                                let mut partition_response =
+                                    OffsetFetchResponsePartition::default();
+                                partition_response.partition_index = partition_index;
+                                partition_response.error_code = ERROR_UNKNOWN_TOPIC_OR_PARTITION;
+                                partition_response.committed_offset = -1;
+                                error_partitions.push(partition_response);
+                            }
+
+                            let mut topic_response = OffsetFetchResponseTopic::default();
+                            topic_response.name = TopicName(StrBytes::from_string(topic_name));
+                            topic_response.partitions = error_partitions;
+                            response_topics.push(topic_response);
+                            continue;
+                        }
+                        Err(e) => {
+                            pg_warning!("Error looking up topic {}: {:?}", topic_name, e);
+                            let mut error_partitions = Vec::new();
+                            for partition_index in topic_request.partition_indexes {
+                                let mut partition_response =
+                                    OffsetFetchResponsePartition::default();
+                                partition_response.partition_index = partition_index;
+                                partition_response.error_code = ERROR_UNKNOWN_SERVER_ERROR;
+                                partition_response.committed_offset = -1;
+                                error_partitions.push(partition_response);
+                            }
+
+                            let mut topic_response = OffsetFetchResponseTopic::default();
+                            topic_response.name = TopicName(StrBytes::from_string(topic_name));
+                            topic_response.partitions = error_partitions;
+                            response_topics.push(topic_response);
+                            continue;
+                        }
+                    };
+
+                    let mut partition_responses = Vec::new();
+
+                    // Fetch committed offset for each requested partition
+                    for partition_index in topic_request.partition_indexes {
+                        let group_id_escaped = group_id.replace("'", "''");
+                        let offset_result = BackgroundWorker::transaction(|| {
+                            let query = format!(
+                                "SELECT committed_offset, metadata
+                                 FROM kafka.consumer_offsets
+                                 WHERE group_id = '{}' AND topic_id = {} AND partition_id = {}",
+                                group_id_escaped, topic_id, partition_index
+                            );
+
+                            pgrx::Spi::connect(|client| {
+                                let mut tup_table = client.select(&query, Some(1), &[])?;
+
+                                let result = if let Some(row) = tup_table.next() {
+                                    let committed_offset: i64 = row[1].value()?.unwrap_or(-1);
+                                    let metadata: Option<String> = row[2].value()?;
+                                    Some((committed_offset, metadata))
+                                } else {
+                                    None
+                                };
+                                Ok::<Option<(i64, Option<String>)>, Box<dyn std::error::Error>>(
+                                    result,
+                                )
+                            })
+                        });
+
+                        let mut partition_response = OffsetFetchResponsePartition::default();
+                        partition_response.partition_index = partition_index;
+
+                        match offset_result {
+                            Ok(Some((committed_offset, metadata))) => {
+                                partition_response.committed_offset = committed_offset;
+                                partition_response.metadata = metadata.map(StrBytes::from_string);
+                                partition_response.error_code = ERROR_NONE;
+                            }
+                            Ok(None) => {
+                                // No committed offset yet, return -1
+                                partition_response.committed_offset = -1;
+                                partition_response.error_code = ERROR_NONE;
+                            }
+                            Err(e) => {
+                                pg_warning!("Failed to fetch offset: {:?}", e);
+                                partition_response.committed_offset = -1;
+                                partition_response.error_code = ERROR_UNKNOWN_SERVER_ERROR;
+                            }
+                        }
+
+                        partition_responses.push(partition_response);
+                    }
+
+                    let mut topic_response = OffsetFetchResponseTopic::default();
+                    topic_response.name = TopicName(StrBytes::from_string(topic_name));
+                    topic_response.partitions = partition_responses;
+                    response_topics.push(topic_response);
+                }
+            } else {
+                // Fetch all topics for this consumer group
+                let group_id_escaped = group_id.replace("'", "''");
+                let all_offsets_result = BackgroundWorker::transaction(|| {
+                    let query = format!(
+                        "SELECT t.name, co.partition_id, co.committed_offset, co.metadata
+                         FROM kafka.consumer_offsets co
+                         JOIN kafka.topics t ON co.topic_id = t.id
+                         WHERE co.group_id = '{}'
+                         ORDER BY t.name, co.partition_id",
+                        group_id_escaped
+                    );
+
+                    pgrx::Spi::connect(|client| {
+                        let tup_table = client.select(&query, None, &[])?;
+
+                        let mut results: Vec<(String, i32, i64, Option<String>)> = Vec::new();
+                        for row in tup_table {
+                            let topic_name: String = row[1].value()?.unwrap_or_default();
+                            let partition_id: i32 = row[2].value()?.unwrap_or(0);
+                            let committed_offset: i64 = row[3].value()?.unwrap_or(-1);
+                            let metadata: Option<String> = row[4].value()?;
+                            results.push((topic_name, partition_id, committed_offset, metadata));
+                        }
+                        Ok::<Vec<(String, i32, i64, Option<String>)>, Box<dyn std::error::Error>>(
+                            results,
+                        )
+                    })
+                });
+
+                match all_offsets_result {
+                    Ok(offsets) => {
+                        // Group by topic
+                        let mut topics_map: std::collections::HashMap<
+                            String,
+                            Vec<OffsetFetchResponsePartition>,
+                        > = std::collections::HashMap::new();
+
+                        for (topic_name, partition_id, committed_offset, metadata) in offsets {
+                            let mut partition_response = OffsetFetchResponsePartition::default();
+                            partition_response.partition_index = partition_id;
+                            partition_response.committed_offset = committed_offset;
+                            partition_response.metadata = metadata.map(StrBytes::from_string);
+                            partition_response.error_code = ERROR_NONE;
+
+                            topics_map
+                                .entry(topic_name)
+                                .or_default()
+                                .push(partition_response);
+                        }
+
+                        for (topic_name, partitions) in topics_map {
+                            let mut topic_response = OffsetFetchResponseTopic::default();
+                            topic_response.name = TopicName(StrBytes::from_string(topic_name));
+                            topic_response.partitions = partitions;
+                            response_topics.push(topic_response);
+                        }
+                    }
+                    Err(e) => {
+                        pg_warning!(
+                            "Failed to fetch all offsets for group {}: {:?}",
+                            group_id,
+                            e
+                        );
+                    }
+                }
+            }
+
+            // Build response
+            let mut kafka_response = OffsetFetchResponse::default();
+            kafka_response.throttle_time_ms = 0;
+            kafka_response.error_code = ERROR_NONE;
+            kafka_response.topics = response_topics;
+
+            let response = KafkaResponse::OffsetFetch {
+                correlation_id,
+                api_version,
+                response: kafka_response,
+            };
+
+            if let Err(e) = response_tx.send(response) {
+                pg_warning!("Failed to send OffsetFetch response: {}", e);
+            } else {
+                pg_log!("OffsetFetch response sent successfully");
+            }
+        }
     }
 }
 

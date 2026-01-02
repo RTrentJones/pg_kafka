@@ -1,10 +1,13 @@
 -- pg_kafka extension schema
--- Phase 2: Producer support with dual-offset design
 --
 -- This schema creates tables for Kafka-compatible message storage with a unique
 -- dual-offset architecture that provides both:
 -- 1. Kafka protocol compatibility (partition_offset)
 -- 2. Cross-partition temporal ordering (global_offset)
+--
+-- Phase 3 additions:
+-- - Consumer offset tracking (consumer_offsets table)
+-- - Consumer group coordination (consumer_groups table)
 
 -- Create kafka schema for all extension objects
 CREATE SCHEMA IF NOT EXISTS kafka;
@@ -42,12 +45,46 @@ ON kafka.messages(topic_id, partition_id, partition_offset);
 CREATE INDEX idx_messages_global_offset
 ON kafka.messages(global_offset);
 
+-- Consumer offsets table: Track committed offsets per consumer group
+-- Phase 3: Consumer support
+CREATE TABLE kafka.consumer_offsets (
+    group_id TEXT NOT NULL,
+    topic_id INT NOT NULL,
+    partition_id INT NOT NULL,
+    committed_offset BIGINT NOT NULL,
+    metadata TEXT,  -- Optional client metadata
+    commit_timestamp TIMESTAMP NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (group_id, topic_id, partition_id),
+    FOREIGN KEY (topic_id) REFERENCES kafka.topics(id) ON DELETE CASCADE
+);
+
+-- Index for consumer group queries
+CREATE INDEX idx_consumer_offsets_group ON kafka.consumer_offsets(group_id);
+CREATE INDEX idx_consumer_offsets_timestamp ON kafka.consumer_offsets(commit_timestamp);
+
+-- Consumer groups table: Track active consumer group members
+-- Phase 3: Simplified consumer group coordination (static assignment only)
+CREATE TABLE kafka.consumer_groups (
+    group_id TEXT NOT NULL,
+    member_id TEXT NOT NULL,
+    topic_id INT NOT NULL,
+    partition_ids INT[] NOT NULL,  -- Static partition assignment
+    heartbeat_timestamp TIMESTAMP NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (group_id, member_id),
+    FOREIGN KEY (topic_id) REFERENCES kafka.topics(id) ON DELETE CASCADE
+);
+
+-- Index for heartbeat checks
+CREATE INDEX idx_consumer_groups_heartbeat ON kafka.consumer_groups(heartbeat_timestamp);
+
 -- Grant permissions
 -- Background worker and extension functions run as superuser by default,
 -- but we set up permissions for future user-facing functions
 GRANT USAGE ON SCHEMA kafka TO PUBLIC;
 GRANT SELECT ON kafka.topics TO PUBLIC;
 GRANT SELECT ON kafka.messages TO PUBLIC;
+GRANT SELECT ON kafka.consumer_offsets TO PUBLIC;
+GRANT SELECT ON kafka.consumer_groups TO PUBLIC;
 
 -- Comments for documentation
 COMMENT ON SCHEMA kafka IS 'pg_kafka extension schema for Kafka-compatible message storage';
@@ -67,3 +104,15 @@ COMMENT ON COLUMN kafka.messages.key IS 'Optional message key (nullable). Used f
 COMMENT ON COLUMN kafka.messages.value IS 'Message payload (nullable for tombstone messages in log compaction)';
 
 COMMENT ON COLUMN kafka.messages.headers IS 'Optional message headers as JSONB. Kafka headers are key-value pairs (binary values base64-encoded).';
+
+COMMENT ON TABLE kafka.consumer_offsets IS 'Consumer offset tracking per group/topic/partition. Stores committed offsets for Kafka consumers (Phase 3).';
+
+COMMENT ON COLUMN kafka.consumer_offsets.group_id IS 'Consumer group identifier (e.g., "my-consumer-group")';
+
+COMMENT ON COLUMN kafka.consumer_offsets.committed_offset IS 'Last committed partition offset for this consumer group. Consumer will fetch from committed_offset + 1.';
+
+COMMENT ON TABLE kafka.consumer_groups IS 'Consumer group membership tracking. pg_kafka uses simplified static assignment (no rebalancing).';
+
+COMMENT ON COLUMN kafka.consumer_groups.partition_ids IS 'Array of partition IDs statically assigned to this member. No automatic rebalancing.';
+
+COMMENT ON COLUMN kafka.consumer_groups.heartbeat_timestamp IS 'Last heartbeat from this consumer. Stale members (no heartbeat > 5min) may be cleaned up.';

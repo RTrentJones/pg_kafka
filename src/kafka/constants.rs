@@ -26,6 +26,21 @@ pub const API_KEY_FETCH: i16 = 1;
 /// Used to discover broker and topic/partition information
 pub const API_KEY_METADATA: i16 = 3;
 
+/// API key for OffsetCommit requests (Phase 3)
+///
+/// Used to commit consumed offsets for a consumer group
+pub const API_KEY_OFFSET_COMMIT: i16 = 8;
+
+/// API key for OffsetFetch requests (Phase 3)
+///
+/// Used to fetch committed offsets for a consumer group
+pub const API_KEY_OFFSET_FETCH: i16 = 9;
+
+/// API key for ListOffsets requests (Phase 3)
+///
+/// Used to query earliest/latest offsets for partitions
+pub const API_KEY_LIST_OFFSETS: i16 = 2;
+
 /// API key for ApiVersions requests
 ///
 /// Used to discover which API versions the broker supports
