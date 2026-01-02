@@ -1,7 +1,7 @@
 # pg_kafka 🐘➡️🕸️
 
-[![CI/CD Pipeline](https://github.com/YOUR_USERNAME/pg_kafka/actions/workflows/ci.yml/badge.svg)](https://github.com/YOUR_USERNAME/pg_kafka/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/YOUR_USERNAME/pg_kafka/branch/main/graph/badge.svg)](https://codecov.io/gh/YOUR_USERNAME/pg_kafka)
+[![CI/CD Pipeline](https://github.com/RTrentJones/pg_kafka/actions/workflows/ci.yml/badge.svg)](https://github.com/RTrentJones/pg_kafka/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/RTrentJones/pg_kafka/branch/main/graph/badge.svg)](https://codecov.io/gh/RTrentJones/pg_kafka)
 
 **A high-performance PostgreSQL extension that speaks the Kafka Wire Protocol.**
 
@@ -9,7 +9,7 @@
 
 ---
 
-⚠️ **Status: Phase 1 Complete - Metadata Support Functional**
+⚠️ **Status: Phase 2 Complete - Producer Support Functional**
 
 **Current Implementation:**
 - ✅ **Phase 1 Complete:** TCP listener with Kafka protocol support
@@ -19,28 +19,70 @@
   - ✅ Configurable port/host via GUC parameters
   - ✅ Full async/sync architecture (tokio ↔ Postgres SPI bridge)
 
+- ✅ **Phase 2 Complete:** Producer support with database persistence
+  - ✅ ProduceRequest/Response handling (API key 0)
+  - ✅ Dual-offset design (partition_offset + global_offset)
+  - ✅ SPI integration for database writes
+  - ✅ Topic auto-creation
+  - ✅ E2E tests with real Kafka client (rdkafka)
+  - ✅ Automated database verification
+  - ✅ CI/CD pipeline with GitHub Actions
+
 **What Works Now:**
 ```bash
 # Query broker metadata
 kcat -L -b localhost:9092
-# Returns: 1 broker (localhost:9092), 1 test topic with 1 partition
+
+# Produce messages to database
+echo "key1:value1" | kcat -P -b localhost:9092 -t my-topic -K:
+
+# Verify in database
+psql -c "SELECT * FROM kafka.messages;"
 ```
 
 **Next Steps:**
-- 🚧 Phase 1.5: Comprehensive unit test coverage (planned)
-- ⏳ Phase 2: Database integration (storage schema, Produce/Fetch APIs)
-- ⏳ Phase 3: Consumer features (long polling via LISTEN/NOTIFY)
+- ⏳ Phase 3: Consumer support (FetchRequest, long polling via LISTEN/NOTIFY)
 - ⏳ Phase 4: Shadow replication (Logical Decoding → external Kafka)
 
 ---
 
 ## 🚀 Why pg_kafka?
 
-Teams often choose Postgres for queues to keep infrastructure simple, but hit a "scaling cliff" that forces a painful rewrite to Kafka. `pg_kafka` bridges this gap:
+### Project Purpose
 
-1. **Dev/Test:** Use standard Kafka clients with zero infrastructure setup
-2. **Production:** Run on RDS/Aurora until you hit scale limits
-3. **Migration:** Use the built-in **Shadow Replicator** to dual-write to a real Kafka cluster and switch over with zero downtime
+This is a **learning project** and **technical exploration** to understand:
+- How Kafka's wire protocol actually works
+- How to build PostgreSQL extensions with Rust (pgrx)
+- The architectural tradeoffs between message queues and databases
+- Async/sync bridging patterns in systems programming
+
+While PostgreSQL *can* be used for queuing/pub-sub, it's rarely the first choice due to:
+- No standard Kafka protocol support
+- Custom implementations don't scale well
+- Eventual migration to real Kafka requires rewriting all client code
+
+**`pg_kafka` explores whether we can solve these friction points** by embedding a Kafka-compatible protocol listener directly into Postgres.
+
+### Potential Use Cases
+
+If this project reaches production quality, it could serve:
+
+1. **Local Development:** Run Kafka clients against Postgres (zero infrastructure)
+2. **Testing/CI:** Lightweight Kafka substitute for test suites
+3. **Prototyping:** Validate Kafka-based designs before infrastructure commitment
+4. **Migration Tool:** Shadow Mode enables zero-downtime cutover to real Kafka
+5. **Small-Scale Production:** Teams already on Postgres who need <50K msg/sec
+
+### When NOT to Use This
+
+❌ **Use Real Kafka for:**
+- Long-term event sourcing (months/years of retention needed)
+- Massive scale (>100K msg/sec sustained throughput)
+- Multi-datacenter replication
+- Production systems requiring Kafka's full feature set (exactly-once semantics, compaction, transactions)
+- Compliance requirements for immutable audit logs
+
+See [docs/architecture/ADR-001-partitioning-and-retention.md](docs/architecture/ADR-001-partitioning-and-retention.md) for detailed tradeoff analysis on retention and partitioning.
 
 ## 🛠️ Architecture
 
@@ -203,13 +245,19 @@ pg_kafka/
 
 - [x] **Phase 0:** Project scaffold, Docker environment, pgrx setup
 - [x] **Phase 1:** Metadata support ✅ **COMPLETE**
-  - [x] Step 1: Background worker scaffold with _PG_init registration
-  - [x] Step 2: TCP listener on port 9092 with tokio runtime
-  - [x] Step 3: ApiVersions request/response parsing
-  - [x] Step 4: Metadata request/response with hardcoded test topic
-- [ ] **Phase 1.5:** Unit test coverage (protocol, worker, integration tests)
-- [ ] **Phase 2:** Producer support (ProduceRequest, storage schema, SPI INSERT)
-- [ ] **Phase 3:** Consumer support (FetchRequest, Long Polling via LISTEN/NOTIFY)
+  - [x] Background worker scaffold with _PG_init registration
+  - [x] TCP listener on port 9092 with tokio runtime
+  - [x] ApiVersions request/response parsing
+  - [x] Metadata request/response
+- [x] **Phase 2:** Producer support ✅ **COMPLETE**
+  - [x] ProduceRequest/Response handling
+  - [x] Storage schema with dual-offset design
+  - [x] SPI INSERT integration
+  - [x] Topic auto-creation
+  - [x] E2E tests with rdkafka client
+  - [x] Automated database verification
+  - [x] CI/CD pipeline with GitHub Actions
+- [ ] **Phase 3:** Consumer support (FetchRequest, long polling via LISTEN/NOTIFY)
 - [ ] **Phase 4:** Shadow Mode (Logical Decoding, rdkafka integration, zero-downtime migration)
 
 ## 🔧 Configuration
@@ -246,23 +294,31 @@ psql -d your_database -f sql/tune_autovacuum.sql
 
 This configures the `kafka.messages` table to vacuum more frequently, preventing index bloat in high-churn scenarios.
 
-**Benchmark Validation:** PostgreSQL can handle 1M+ reads/sec and 200K+ writes/sec on a single node when properly tuned. See [.github/PERFORMANCE.md](.github/PERFORMANCE.md) for detailed benchmarks and configuration recommendations.
+**Benchmark Validation:** PostgreSQL can handle 1M+ reads/sec and 200K+ writes/sec on a single node when properly tuned. See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for detailed benchmarks and configuration recommendations.
 
 **Key Recommendations:**
 - Use `autovacuum_vacuum_scale_factor = 0.05` for high-throughput tables
 - Enable `huge_pages = on` for systems with 64GB+ RAM
 - Consider partitioning `kafka.messages` for retention policies (Phase 3+)
 
-See the [Performance Guide](.github/PERFORMANCE.md) for complete tuning recommendations.
+See the [Performance Guide](docs/PERFORMANCE.md) for complete tuning recommendations.
 
 ## 📚 Documentation
 
+### Getting Started
 - **[CLAUDE.md](CLAUDE.md)** - Development workflow, commands, architecture overview
 - **[PROJECT.md](PROJECT.md)** - Complete design document with technical details
-- **[.github/PERFORMANCE.md](.github/PERFORMANCE.md)** - Performance tuning, benchmarks, and configuration recommendations
 - **[.github/SETUP.md](.github/SETUP.md)** - CI/CD pipeline setup guide
+
+### Performance & Operations
+- **[docs/PERFORMANCE.md](docs/PERFORMANCE.md)** - Performance tuning, benchmarks, and configuration recommendations
+- **[docs/architecture/ADR-001-partitioning-and-retention.md](docs/architecture/ADR-001-partitioning-and-retention.md)** - Partitioning strategy and data retention tradeoffs
+
+### Development History
 - **[STEP4_SUMMARY.md](STEP4_SUMMARY.md)** - Phase 1 implementation summary
 - **[PHASE_1.5_PLAN.md](PHASE_1.5_PLAN.md)** - Unit test coverage plan
+
+### External References
 - [pgrx Documentation](https://docs.rs/pgrx/latest/pgrx/)
 - [Kafka Protocol Specification](https://kafka.apache.org/protocol)
 
@@ -300,27 +356,37 @@ The extension solves a fundamental incompatibility:
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### Current Request Flow (Phase 1)
+### Current Request Flow (Phase 2)
 
 1. Client connects to port 9092
-2. Sends ApiVersions or Metadata request
+2. Sends Kafka request (ApiVersions, Metadata, or Produce)
 3. Async task parses binary protocol → KafkaRequest
 4. Request sent to main thread via queue
-5. Main thread processes → builds hardcoded response
+5. Main thread processes request:
+   - **Metadata:** Query `kafka.topics` table
+   - **Produce:** Insert into `kafka.messages` via SPI
 6. Response sent back via tokio channel
 7. Async task encodes response → writes to socket
 
-### Future Request Flow (Phase 2+)
-
-Step 4 will become:
+**ProduceRequest Flow (Implemented):**
 ```rust
 // In process_request():
 Spi::connect(|client| {
+    // 1. Get or create topic
+    let topic_id = get_or_create_topic(&client, &topic_name)?;
+
+    // 2. Compute next partition offset (atomic)
+    let partition_offset = get_next_partition_offset(&client, topic_id, partition_id)?;
+
+    // 3. Insert message
     client.update(
-        "INSERT INTO kafka.messages (topic_id, partition_id, key, value)
-         VALUES ($1, $2, $3, $4) RETURNING offset",
+        "INSERT INTO kafka.messages
+         (topic_id, partition_id, partition_offset, key, value, headers)
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING global_offset",
         None, None
-    )
+    )?;
+
+    // 4. Return offset to client in ProduceResponse
 })
 ```
 
