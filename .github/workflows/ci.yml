@@ -9,8 +9,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  PGRX_VERSION: 0.16.1
-  PG_VERSION: 14.20
+  PGRX_VERSION: "0.16.1"
+  PG_VERSION: "14.20"
 
 permissions:
   contents: read
@@ -86,7 +86,7 @@ jobs:
     - name: Initialize pgrx
       if: steps.cache-pgrx.outputs.cache-hit != 'true'
       # Downloads and compiles PostgreSQL 14 (~25 minutes on cold cache)
-      run: cargo pgrx init --pg14=${{ env.PG_VERSION }}
+      run: cargo pgrx init --pg14 download
 
     # ------------------------------------------------------------------
     # LINTING: Fast checks first (fail fast)
@@ -106,13 +106,17 @@ jobs:
         echo "pgrx PostgreSQL 14 installation: $(du -sh ~/.pgrx/${{ env.PG_VERSION }} | cut -f1)"
 
     # ------------------------------------------------------------------
-    # UNIT & INTEGRATION TESTING: Internal Rust/SPI tests
+    # UNIT TESTING: Non-SPI tests only
     # ------------------------------------------------------------------
-    - name: Run unit and integration tests
-      # 'cargo pgrx test' spins up a temporary, managed Postgres instance,
-      # installs the extension, and runs functions marked with #[pg_test].
-      # This tests internal logic and SPI (database) interactions.
-      run: cargo pgrx test pg14
+    - name: Run unit tests
+      # Note: We skip 'cargo pgrx test' because pg_kafka uses PGC_POSTMASTER GUCs
+      # which require shared_preload_libraries BEFORE Postgres starts.
+      # cargo pgrx test creates the extension AFTER starting Postgres, causing:
+      # "FATAL: cannot create PGC_POSTMASTER variables after startup"
+      #
+      # Instead, we run non-SPI unit tests here (protocol, encoding, helpers).
+      # SPI/integration tests are in kafka_test/ E2E suite below.
+      run: cargo test --lib --features pg14
       env:
         # Override RUSTFLAGS to avoid -D warnings (pgrx macros cause false positives)
         RUSTFLAGS: ""
