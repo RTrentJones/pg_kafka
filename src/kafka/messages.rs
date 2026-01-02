@@ -198,8 +198,7 @@ pub struct PartitionProduceResponse {
 //    - We don't want to block async tasks on queue capacity
 //
 // See src/worker.rs:120 for the sync recv side: `while let Ok(req) = request_rx.try_recv()`
-static REQUEST_QUEUE: Lazy<(Sender<KafkaRequest>, Receiver<KafkaRequest>)> =
-    Lazy::new(unbounded);
+static REQUEST_QUEUE: Lazy<(Sender<KafkaRequest>, Receiver<KafkaRequest>)> = Lazy::new(unbounded);
 
 /// Get the sender side of the request queue (for async tasks)
 pub fn request_sender() -> Sender<KafkaRequest> {

@@ -312,6 +312,7 @@ See the [Performance Guide](docs/PERFORMANCE.md) for complete tuning recommendat
 
 ### Performance & Operations
 - **[docs/PERFORMANCE.md](docs/PERFORMANCE.md)** - Performance tuning, benchmarks, and configuration recommendations
+- **[docs/PROTOCOL_DEVIATIONS.md](docs/PROTOCOL_DEVIATIONS.md)** - Intentional Kafka protocol deviations and compatibility notes
 - **[docs/architecture/ADR-001-partitioning-and-retention.md](docs/architecture/ADR-001-partitioning-and-retention.md)** - Partitioning strategy and data retention tradeoffs
 
 ### Development History
