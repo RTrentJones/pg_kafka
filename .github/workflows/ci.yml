@@ -38,19 +38,35 @@ jobs:
       run: |
         sudo apt-get update
         # libpq-dev is required to link against Postgres libraries
+        # libreadline-dev, zlib1g-dev, etc. are required for compiling Postgres from source
         sudo apt-get install -y libpq-dev libreadline-dev zlib1g-dev flex bison libxml2-dev libxslt-dev
 
+    # ------------------------------------------------------------------
+    # OPTIMIZATION: Cache the CLI tool to avoid compiling it every run
+    # ------------------------------------------------------------------
+    - name: Cache cargo-pgrx binary
+      id: cache-cargo-pgrx
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/bin/cargo-pgrx
+        # Cache key includes runner OS and version, but NOT Cargo.lock
+        key: ${{ runner.os }}-cargo-pgrx-bin-0.16.1
+
     - name: Install pgrx
+      if: steps.cache-cargo-pgrx.outputs.cache-hit != 'true'
       # Installs the pgrx CLI tool which we use to manage the Postgres lifecycle
       run: cargo install --locked cargo-pgrx --version 0.16.1
 
+    # ------------------------------------------------------------------
+    # OPTIMIZATION: Cache Postgres binaries (~/.pgrx)
+    # ------------------------------------------------------------------
     - name: Cache pgrx home
       id: cache-pgrx
       uses: actions/cache@v4
-      # Caches the compiled Postgres binaries (~200MB) so we don't download/compile PG every run
       with:
         path: ~/.pgrx
-        key: ${{ runner.os }}-pgrx-0.16.1-${{ hashFiles('**/Cargo.lock') }}
+        # Stable key that doesn't invalidate on Cargo.lock changes
+        key: ${{ runner.os }}-pgrx-home-0.16.1-v1
 
     - name: Initialize pgrx
       if: steps.cache-pgrx.outputs.cache-hit != 'true'
