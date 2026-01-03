@@ -11,7 +11,7 @@ use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::message::Message;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use std::time::Duration;
-use postgres::{Client, NoTls};
+use tokio_postgres::NoTls;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -74,7 +74,15 @@ async fn test_producer() -> Result<(), Box<dyn std::error::Error>> {
 
     // Connect to PostgreSQL
     println!("Connecting to PostgreSQL...");
-    let mut client = Client::connect("host=localhost user=postgres dbname=postgres", NoTls)?;
+    let (client, connection) = tokio_postgres::connect("host=localhost port=28814 user=postgres dbname=postgres", NoTls).await?;
+
+    // Spawn connection handler
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("PostgreSQL connection error: {}", e);
+        }
+    });
+
     println!("✅ Connected to database\n");
 
     // Verify topic was created
@@ -82,7 +90,7 @@ async fn test_producer() -> Result<(), Box<dyn std::error::Error>> {
     let topic_row = client.query_one(
         "SELECT id, name FROM kafka.topics WHERE name = $1",
         &[&topic],
-    )?;
+    ).await?;
     let topic_id: i32 = topic_row.get(0);
     let topic_name: String = topic_row.get(1);
 
@@ -98,7 +106,7 @@ async fn test_producer() -> Result<(), Box<dyn std::error::Error>> {
          ORDER BY partition_offset DESC
          LIMIT 1",
         &[&topic_id],
-    )?;
+    ).await?;
 
     assert!(!rows.is_empty(), "No messages found in database!");
 
@@ -127,7 +135,7 @@ async fn test_producer() -> Result<(), Box<dyn std::error::Error>> {
     let count_row = client.query_one(
         "SELECT COUNT(*) FROM kafka.messages WHERE topic_id = $1",
         &[&topic_id],
-    )?;
+    ).await?;
     let message_count: i64 = count_row.get(0);
     println!("\n✅ Total messages in '{}': {}", topic, message_count);
 
@@ -328,14 +336,20 @@ async fn test_consumer_from_offset() -> Result<(), Box<dyn std::error::Error>> {
 
     // 2. Verify messages are in the database
     println!("\nStep 2: Verifying messages in database...");
-    let mut db_client = Client::connect("host=localhost user=postgres dbname=postgres", NoTls)?;
+    let (db_client, connection) = tokio_postgres::connect("host=localhost port=28814 user=postgres dbname=postgres", NoTls).await?;
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("PostgreSQL connection error: {}", e);
+        }
+    });
 
     let count_row = db_client.query_one(
         "SELECT COUNT(*) FROM kafka.messages m
          JOIN kafka.topics t ON m.topic_id = t.id
          WHERE t.name = $1",
         &[&topic],
-    )?;
+    ).await?;
     let db_count: i64 = count_row.get(0);
 
     assert!(db_count >= 10, "Not enough messages in database");
@@ -348,7 +362,7 @@ async fn test_consumer_from_offset() -> Result<(), Box<dyn std::error::Error>> {
          JOIN kafka.topics t ON m.topic_id = t.id
          WHERE t.name = $1 AND m.partition_id = 0",
         &[&topic],
-    )?;
+    ).await?;
     let high_watermark: i64 = hw_row.get(0);
     println!("✅ High watermark: {}", high_watermark);
 
@@ -434,7 +448,13 @@ async fn test_offset_commit_fetch() -> Result<(), Box<dyn std::error::Error>> {
 
     // 4. Verify offsets in database
     println!("\nStep 4: Verifying committed offsets in database...");
-    let mut db_client = Client::connect("host=localhost user=postgres dbname=postgres", NoTls)?;
+    let (db_client, connection) = tokio_postgres::connect("host=localhost port=28814 user=postgres dbname=postgres", NoTls).await?;
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("PostgreSQL connection error: {}", e);
+        }
+    });
 
     let offset_row = db_client.query_one(
         "SELECT co.committed_offset
@@ -442,7 +462,7 @@ async fn test_offset_commit_fetch() -> Result<(), Box<dyn std::error::Error>> {
          JOIN kafka.topics t ON co.topic_id = t.id
          WHERE co.group_id = $1 AND t.name = $2 AND co.partition_id = 0",
         &[&group_id, &topic],
-    )?;
+    ).await?;
 
     let committed_offset: i64 = offset_row.get(0);
     println!("✅ Database shows committed offset: {}", committed_offset);

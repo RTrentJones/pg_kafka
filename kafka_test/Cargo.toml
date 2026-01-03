@@ -6,4 +6,4 @@ edition = "2021"
 [dependencies]
 rdkafka = { version = "0.36", features = ["cmake-build"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-postgres = "0.19"
+tokio-postgres = "0.7"
