@@ -21,6 +21,11 @@ pub const API_KEY_PRODUCE: i16 = 0;
 /// Used to read messages from a topic partition
 pub const API_KEY_FETCH: i16 = 1;
 
+/// API key for ListOffsets requests (Phase 3)
+///
+/// Used to query earliest/latest offsets for partitions
+pub const API_KEY_LIST_OFFSETS: i16 = 2;
+
 /// API key for Metadata requests
 ///
 /// Used to discover broker and topic/partition information
@@ -36,10 +41,30 @@ pub const API_KEY_OFFSET_COMMIT: i16 = 8;
 /// Used to fetch committed offsets for a consumer group
 pub const API_KEY_OFFSET_FETCH: i16 = 9;
 
-/// API key for ListOffsets requests (Phase 3)
+/// API key for FindCoordinator requests (Phase 3B)
 ///
-/// Used to query earliest/latest offsets for partitions
-pub const API_KEY_LIST_OFFSETS: i16 = 2;
+/// Used to discover the coordinator for a consumer group
+pub const API_KEY_FIND_COORDINATOR: i16 = 10;
+
+/// API key for JoinGroup requests (Phase 3B)
+///
+/// Used for a consumer to join a consumer group
+pub const API_KEY_JOIN_GROUP: i16 = 11;
+
+/// API key for Heartbeat requests (Phase 3B)
+///
+/// Used to maintain consumer group membership
+pub const API_KEY_HEARTBEAT: i16 = 12;
+
+/// API key for LeaveGroup requests (Phase 3B)
+///
+/// Used for a consumer to leave a consumer group gracefully
+pub const API_KEY_LEAVE_GROUP: i16 = 13;
+
+/// API key for SyncGroup requests (Phase 3B)
+///
+/// Used to synchronize partition assignments within a consumer group
+pub const API_KEY_SYNC_GROUP: i16 = 14;
 
 /// API key for ApiVersions requests
 ///
@@ -149,6 +174,23 @@ pub const ERROR_UNSUPPORTED_VERSION: i16 = 35;
 
 /// Invalid number of partitions
 pub const ERROR_INVALID_PARTITIONS: i16 = 37;
+
+// ===== Consumer Group Coordinator Error Codes =====
+
+/// Coordinator not available
+pub const ERROR_COORDINATOR_NOT_AVAILABLE: i16 = 15;
+
+/// Not coordinator for group
+pub const ERROR_NOT_COORDINATOR: i16 = 16;
+
+/// Illegal generation (consumer group generation mismatch)
+pub const ERROR_ILLEGAL_GENERATION: i16 = 22;
+
+/// Unknown member ID
+pub const ERROR_UNKNOWN_MEMBER_ID: i16 = 25;
+
+/// Rebalance in progress
+pub const ERROR_REBALANCE_IN_PROGRESS: i16 = 27;
 
 #[cfg(test)]
 mod tests {

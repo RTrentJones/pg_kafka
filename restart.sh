@@ -26,4 +26,19 @@ echo "=== PostgreSQL status ==="
 cargo pgrx status pg14
 
 echo ""
-echo "✅ Done! You can now run ./test_client"
+echo "=== Recreating extension in database ==="
+~/.pgrx/14.20/pgrx-install/bin/psql -h localhost -p 28814 -U postgres -d postgres <<'EOF'
+DROP EXTENSION IF EXISTS pg_kafka CASCADE;
+CREATE EXTENSION pg_kafka;
+\dt kafka.*
+EOF
+
+echo ""
+echo "=== Building E2E test client ==="
+cd kafka_test
+cargo build --release
+cd ..
+
+echo ""
+echo "✅ Done! PostgreSQL is running with fresh extension."
+echo "Run E2E tests with: timeout 30 ./target/release/kafka_test"

@@ -63,6 +63,9 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     let log_connections = config.log_connections;
     let shutdown_timeout = core::time::Duration::from_millis(config.shutdown_timeout_ms as u64);
 
+    // Clone host for worker processing (will be borrowed by async closure)
+    let broker_host = host.clone();
+
     // Spawn the listener task on the LocalSet
     let listener_handle = local_set.spawn_local(async move {
         if let Err(e) = crate::kafka::run_listener(shutdown_rx, &host, port, log_connections).await
@@ -71,11 +74,15 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
         }
     });
 
-    // Step 7: Get the request queue receiver
+    // Step 7: Create consumer group coordinator
+    // This manages consumer group membership state in-memory
+    let coordinator = std::sync::Arc::new(crate::kafka::GroupCoordinator::new());
+
+    // Step 8: Get the request queue receiver
     // This is how we receive Kafka requests from the async tokio tasks
     let request_rx = crate::kafka::request_receiver();
 
-    // Step 8: Main event loop
+    // Step 9: Main event loop
     // ═══════════════════════════════════════════════════════════════════════════════
     // MAIN EVENT LOOP: The Heart of the Async/Sync Architecture
     // ═══════════════════════════════════════════════════════════════════════════════
@@ -122,8 +129,11 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
             // Background workers don't have implicit transactions like client sessions do.
             // BackgroundWorker::transaction() starts a transaction, calls our closure,
             // and commits/rolls back based on the result.
-            BackgroundWorker::transaction(|| {
-                process_request(request);
+            let coord = coordinator.clone();
+            let broker_h = broker_host.clone();
+            let broker_p = port;
+            BackgroundWorker::transaction(move || {
+                process_request(request, &coord, &broker_h, broker_p);
             });
         }
 
@@ -205,7 +215,12 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
 /// This function is public to allow unit testing, but is not part of the
 /// public API and should not be called directly by external code.
 #[doc(hidden)]
-pub fn process_request(request: crate::kafka::KafkaRequest) {
+pub fn process_request(
+    request: crate::kafka::KafkaRequest,
+    coordinator: &std::sync::Arc<crate::kafka::GroupCoordinator>,
+    broker_host: &str,
+    broker_port: i32,
+) {
     use crate::kafka::messages::KafkaResponse;
     use crate::kafka::{handlers, PostgresStore};
 
@@ -526,6 +541,271 @@ pub fn process_request(request: crate::kafka::KafkaRequest) {
                 pg_log!("OffsetFetch response sent successfully");
             }
         }
+        crate::kafka::KafkaRequest::FindCoordinator {
+            correlation_id,
+            api_version,
+            key,
+            key_type,
+            response_tx,
+            ..
+        } => {
+            let kafka_response =
+                match crate::kafka::handlers::handle_find_coordinator(
+                    broker_host.to_string(),
+                    broker_port,
+                    key,
+                    key_type,
+                ) {
+                    Ok(response) => response,
+                    Err(e) => {
+                        pg_warning!("Failed to handle FindCoordinator request: {}", e);
+                        let error_response = KafkaResponse::Error {
+                            correlation_id,
+                            error_code: crate::kafka::ERROR_UNKNOWN_SERVER_ERROR,
+                            error_message: Some(format!(
+                                "Failed to handle FindCoordinator request: {}",
+                                e
+                            )),
+                        };
+                        if let Err(e) = response_tx.send(error_response) {
+                            pg_warning!("Failed to send error response: {}", e);
+                        }
+                        return;
+                    }
+                };
+
+            let response = KafkaResponse::FindCoordinator {
+                correlation_id,
+                api_version,
+                response: kafka_response,
+            };
+
+            if let Err(e) = response_tx.send(response) {
+                pg_warning!("Failed to send FindCoordinator response: {}", e);
+            } else {
+                pg_log!("FindCoordinator response sent successfully");
+            }
+        }
+        crate::kafka::KafkaRequest::JoinGroup {
+            correlation_id,
+            api_version,
+            group_id,
+            member_id,
+            client_id,
+            session_timeout_ms,
+            rebalance_timeout_ms,
+            protocol_type,
+            protocols,
+            response_tx,
+            ..
+        } => {
+            let kafka_response = match crate::kafka::handlers::handle_join_group(
+                &coordinator,
+                group_id,
+                member_id,
+                client_id.unwrap_or_else(|| "unknown".to_string()),
+                session_timeout_ms,
+                rebalance_timeout_ms,
+                protocol_type,
+                protocols,
+            ) {
+                Ok(response) => response,
+                Err(e) => {
+                    pg_warning!("Failed to handle JoinGroup request: {}", e);
+                    let error_response = KafkaResponse::Error {
+                        correlation_id,
+                        error_code: crate::kafka::ERROR_UNKNOWN_SERVER_ERROR,
+                        error_message: Some(format!("Failed to handle JoinGroup request: {}", e)),
+                    };
+                    if let Err(e) = response_tx.send(error_response) {
+                        pg_warning!("Failed to send error response: {}", e);
+                    }
+                    return;
+                }
+            };
+
+            let response = KafkaResponse::JoinGroup {
+                correlation_id,
+                api_version,
+                response: kafka_response,
+            };
+
+            if let Err(e) = response_tx.send(response) {
+                pg_warning!("Failed to send JoinGroup response: {}", e);
+            } else {
+                pg_log!("JoinGroup response sent successfully");
+            }
+        }
+        crate::kafka::KafkaRequest::SyncGroup {
+            correlation_id,
+            api_version,
+            group_id,
+            member_id,
+            generation_id,
+            assignments,
+            response_tx,
+            ..
+        } => {
+            let kafka_response = match crate::kafka::handlers::handle_sync_group(
+                &coordinator,
+                group_id,
+                member_id,
+                generation_id,
+                assignments,
+            ) {
+                Ok(response) => response,
+                Err(e) => {
+                    pg_warning!("Failed to handle SyncGroup request: {}", e);
+                    let error_response = KafkaResponse::Error {
+                        correlation_id,
+                        error_code: crate::kafka::ERROR_UNKNOWN_SERVER_ERROR,
+                        error_message: Some(format!("Failed to handle SyncGroup request: {}", e)),
+                    };
+                    if let Err(e) = response_tx.send(error_response) {
+                        pg_warning!("Failed to send error response: {}", e);
+                    }
+                    return;
+                }
+            };
+
+            let response = KafkaResponse::SyncGroup {
+                correlation_id,
+                api_version,
+                response: kafka_response,
+            };
+
+            if let Err(e) = response_tx.send(response) {
+                pg_warning!("Failed to send SyncGroup response: {}", e);
+            } else {
+                pg_log!("SyncGroup response sent successfully");
+            }
+        }
+        crate::kafka::KafkaRequest::Heartbeat {
+            correlation_id,
+            api_version,
+            group_id,
+            member_id,
+            generation_id,
+            response_tx,
+            ..
+        } => {
+            let kafka_response = match crate::kafka::handlers::handle_heartbeat(
+                &coordinator,
+                group_id,
+                member_id,
+                generation_id,
+            ) {
+                Ok(response) => response,
+                Err(e) => {
+                    pg_warning!("Failed to handle Heartbeat request: {}", e);
+                    let error_response = KafkaResponse::Error {
+                        correlation_id,
+                        error_code: crate::kafka::ERROR_UNKNOWN_SERVER_ERROR,
+                        error_message: Some(format!("Failed to handle Heartbeat request: {}", e)),
+                    };
+                    if let Err(e) = response_tx.send(error_response) {
+                        pg_warning!("Failed to send error response: {}", e);
+                    }
+                    return;
+                }
+            };
+
+            let response = KafkaResponse::Heartbeat {
+                correlation_id,
+                api_version,
+                response: kafka_response,
+            };
+
+            if let Err(e) = response_tx.send(response) {
+                pg_warning!("Failed to send Heartbeat response: {}", e);
+            } else {
+                pg_log!("Heartbeat response sent successfully");
+            }
+        }
+        crate::kafka::KafkaRequest::LeaveGroup {
+            correlation_id,
+            api_version,
+            group_id,
+            member_id,
+            response_tx,
+            ..
+        } => {
+            let kafka_response = match crate::kafka::handlers::handle_leave_group(
+                &coordinator,
+                group_id,
+                member_id,
+            ) {
+                Ok(response) => response,
+                Err(e) => {
+                    pg_warning!("Failed to handle LeaveGroup request: {}", e);
+                    let error_response = KafkaResponse::Error {
+                        correlation_id,
+                        error_code: crate::kafka::ERROR_UNKNOWN_SERVER_ERROR,
+                        error_message: Some(format!("Failed to handle LeaveGroup request: {}", e)),
+                    };
+                    if let Err(e) = response_tx.send(error_response) {
+                        pg_warning!("Failed to send error response: {}", e);
+                    }
+                    return;
+                }
+            };
+
+            let response = KafkaResponse::LeaveGroup {
+                correlation_id,
+                api_version,
+                response: kafka_response,
+            };
+
+            if let Err(e) = response_tx.send(response) {
+                pg_warning!("Failed to send LeaveGroup response: {}", e);
+            } else {
+                pg_log!("LeaveGroup response sent successfully");
+            }
+        }
+        crate::kafka::KafkaRequest::ListOffsets {
+            correlation_id,
+            api_version,
+            topics,
+            response_tx,
+            ..
+        } => {
+            pg_log!(
+                "Processing ListOffsets request: correlation_id={}, topics={}",
+                correlation_id,
+                topics.len()
+            );
+
+            // Create storage instance
+            let store = PostgresStore;
+
+            let kafka_response = match crate::kafka::handlers::handle_list_offsets(&store, topics) {
+                Ok(response) => response,
+                Err(e) => {
+                    pg_warning!("Failed to handle ListOffsets request: {}", e);
+                    let error_response = KafkaResponse::Error {
+                        correlation_id,
+                        error_code: crate::kafka::ERROR_UNKNOWN_SERVER_ERROR,
+                        error_message: Some(format!("Failed to handle ListOffsets request: {}", e)),
+                    };
+                    if let Err(e) = response_tx.send(error_response) {
+                        pg_warning!("Failed to send error response: {}", e);
+                    }
+                    return;
+                }
+            };
+
+            let response = KafkaResponse::ListOffsets {
+                correlation_id,
+                api_version,
+                response: kafka_response,
+            };
+
+            if let Err(e) = response_tx.send(response) {
+                pg_warning!("Failed to send ListOffsets response: {}", e);
+            } else {
+                pg_log!("ListOffsets response sent successfully");
+            }
+        }
     }
 }
 
@@ -534,20 +814,36 @@ pub fn process_request(request: crate::kafka::KafkaRequest) {
 //     use super::*;
 //     use crate::kafka::messages::KafkaResponse;
 //     use crate::testing::helpers::*;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kafka::messages::KafkaResponse;
+    use crate::testing::helpers::*;
 
 //     #[pgrx::pg_test]
 //     fn test_api_versions_handler_success() {
 //         // Test that ApiVersions request returns proper response
 //         let (request, mut response_rx) =
 //             mock_api_versions_request_with_client(42, "test-client".to_string());
+    #[pgrx::pg_test]
+    fn test_api_versions_handler_success() {
+        // Test that ApiVersions request returns proper response
+        let (request, mut response_rx) =
+            mock_api_versions_request_with_client(42, "test-client".to_string());
 
 //         // Process the request
 //         process_request(request);
+        // Process the request
+        process_request(request);
 
 //         // Verify we got a response
 //         let response = response_rx
 //             .try_recv()
 //             .expect("Should receive ApiVersions response");
+        // Verify we got a response
+        let response = response_rx
+            .try_recv()
+            .expect("Should receive ApiVersions response");
 
 //         // Verify it's an ApiVersions response
 //         match response {
@@ -562,16 +858,36 @@ pub fn process_request(request: crate::kafka::KafkaRequest) {
 //             _ => panic!("Expected ApiVersions response"),
 //         }
 //     }
+        // Verify it's an ApiVersions response
+        match response {
+            KafkaResponse::ApiVersions {
+                correlation_id,
+                api_version: _,
+                response,
+            } => {
+                assert_eq!(correlation_id, 42);
+                assert!(!response.api_keys.is_empty(), "Should have API versions");
+            }
+            _ => panic!("Expected ApiVersions response"),
+        }
+    }
 
 //     #[pgrx::pg_test]
 //     fn test_api_versions_handler_correlation_id() {
 //         // Test that correlation_id is preserved
 //         for test_correlation_id in [0, 1, 42, 999, i32::MAX] {
 //             let (request, mut response_rx) = mock_api_versions_request(test_correlation_id);
+    #[pgrx::pg_test]
+    fn test_api_versions_handler_correlation_id() {
+        // Test that correlation_id is preserved
+        for test_correlation_id in [0, 1, 42, 999, i32::MAX] {
+            let (request, mut response_rx) = mock_api_versions_request(test_correlation_id);
 
 //             process_request(request);
+            process_request(request);
 
 //             let response = response_rx.try_recv().expect("Should receive response");
+            let response = response_rx.try_recv().expect("Should receive response");
 
 //             match response {
 //                 KafkaResponse::ApiVersions {
@@ -588,15 +904,36 @@ pub fn process_request(request: crate::kafka::KafkaRequest) {
 //             }
 //         }
 //     }
+            match response {
+                KafkaResponse::ApiVersions {
+                    correlation_id,
+                    api_version: _,
+                    response: _,
+                } => {
+                    assert_eq!(
+                        correlation_id, test_correlation_id,
+                        "Correlation ID should be preserved"
+                    );
+                }
+                _ => panic!("Expected ApiVersions response"),
+            }
+        }
+    }
 
 //     #[pgrx::pg_test]
 //     fn test_api_versions_handler_supported_versions() {
 //         // Test that response includes correct API versions
 //         let (request, mut response_rx) = mock_api_versions_request(1);
+    #[pgrx::pg_test]
+    fn test_api_versions_handler_supported_versions() {
+        // Test that response includes correct API versions
+        let (request, mut response_rx) = mock_api_versions_request(1);
 
 //         process_request(request);
+        process_request(request);
 
 //         let response = response_rx.try_recv().expect("Should receive response");
+        let response = response_rx.try_recv().expect("Should receive response");
 
 //         match response {
 //             KafkaResponse::ApiVersions {
@@ -605,6 +942,13 @@ pub fn process_request(request: crate::kafka::KafkaRequest) {
 //                 response,
 //             } => {
 //                 assert_eq!(response.api_keys.len(), 3, "Should support 3 APIs");
+        match response {
+            KafkaResponse::ApiVersions {
+                api_version: _,
+                correlation_id: _,
+                response,
+            } => {
+                assert_eq!(response.api_keys.len(), 3, "Should support 3 APIs");
 
 //                 let api_versions_api = response
 //                     .api_keys
@@ -613,6 +957,13 @@ pub fn process_request(request: crate::kafka::KafkaRequest) {
 //                     .expect("Should support ApiVersions API");
 //                 assert_eq!(api_versions_api.min_version, 0);
 //                 assert_eq!(api_versions_api.max_version, 3);
+                let api_versions_api = response
+                    .api_keys
+                    .iter()
+                    .find(|av| av.api_key == 18)
+                    .expect("Should support ApiVersions API");
+                assert_eq!(api_versions_api.min_version, 0);
+                assert_eq!(api_versions_api.max_version, 3);
 
 //                 let metadata_api = response
 //                     .api_keys
@@ -625,15 +976,32 @@ pub fn process_request(request: crate::kafka::KafkaRequest) {
 //             _ => panic!("Expected ApiVersions response"),
 //         }
 //     }
+                let metadata_api = response
+                    .api_keys
+                    .iter()
+                    .find(|av| av.api_key == 3)
+                    .expect("Should support Metadata API");
+                assert_eq!(metadata_api.min_version, 0);
+                assert_eq!(metadata_api.max_version, 9);
+            }
+            _ => panic!("Expected ApiVersions response"),
+        }
+    }
 
 //     #[pgrx::pg_test]
 //     fn test_metadata_handler_all_topics() {
 //         let (request, mut response_rx) =
 //             mock_metadata_request_with_client(99, "test-client".to_string(), None);
+    #[pgrx::pg_test]
+    fn test_metadata_handler_all_topics() {
+        let (request, mut response_rx) =
+            mock_metadata_request_with_client(99, "test-client".to_string(), None);
 
 //         process_request(request);
+        process_request(request);
 
 //         let response = response_rx.try_recv().expect("Should receive response");
+        let response = response_rx.try_recv().expect("Should receive response");
 
 //         match response {
 //             KafkaResponse::Metadata {
@@ -644,6 +1012,15 @@ pub fn process_request(request: crate::kafka::KafkaRequest) {
 //                 assert_eq!(correlation_id, 99);
 //                 assert!(!response.brokers.is_empty());
 //                 assert!(!response.topics.is_empty());
+        match response {
+            KafkaResponse::Metadata {
+                correlation_id,
+                api_version: _,
+                response,
+            } => {
+                assert_eq!(correlation_id, 99);
+                assert!(!response.brokers.is_empty());
+                assert!(!response.topics.is_empty());
 
 //                 let test_topic = response
 //                     .topics
@@ -655,14 +1032,29 @@ pub fn process_request(request: crate::kafka::KafkaRequest) {
 //             _ => panic!("Expected Metadata response"),
 //         }
 //     }
+                let test_topic = response
+                    .topics
+                    .iter()
+                    .find(|t| t.name.as_ref().map(|n| n.0.as_str()) == Some("test-topic"))
+                    .expect("Should have test-topic");
+                assert_eq!(test_topic.error_code, ERROR_NONE);
+            }
+            _ => panic!("Expected Metadata response"),
+        }
+    }
 
 //     #[pgrx::pg_test]
 //     fn test_metadata_handler_broker_info() {
 //         let (request, mut response_rx) = mock_metadata_request(101, None);
+    #[pgrx::pg_test]
+    fn test_metadata_handler_broker_info() {
+        let (request, mut response_rx) = mock_metadata_request(101, None);
 
 //         process_request(request);
+        process_request(request);
 
 //         let response = response_rx.try_recv().expect("Should receive response");
+        let response = response_rx.try_recv().expect("Should receive response");
 
 //         match response {
 //             KafkaResponse::Metadata {
@@ -679,14 +1071,34 @@ pub fn process_request(request: crate::kafka::KafkaRequest) {
 //             _ => panic!("Expected Metadata response"),
 //         }
 //     }
+        match response {
+            KafkaResponse::Metadata {
+                api_version: _,
+                correlation_id: _,
+                response,
+            } => {
+                assert_eq!(response.brokers.len(), 1);
+                let broker = &response.brokers[0];
+                assert_eq!(broker.node_id.0, DEFAULT_BROKER_ID);
+                assert_eq!(broker.port, DEFAULT_KAFKA_PORT);
+                assert!(!broker.host.is_empty());
+            }
+            _ => panic!("Expected Metadata response"),
+        }
+    }
 
 //     #[pgrx::pg_test]
 //     fn test_metadata_handler_partition_info() {
 //         let (request, mut response_rx) = mock_metadata_request(102, None);
+    #[pgrx::pg_test]
+    fn test_metadata_handler_partition_info() {
+        let (request, mut response_rx) = mock_metadata_request(102, None);
 
 //         process_request(request);
+        process_request(request);
 
 //         let response = response_rx.try_recv().expect("Should receive response");
+        let response = response_rx.try_recv().expect("Should receive response");
 
 //         match response {
 //             KafkaResponse::Metadata {
@@ -699,8 +1111,20 @@ pub fn process_request(request: crate::kafka::KafkaRequest) {
 //                     .iter()
 //                     .find(|t| t.name.as_ref().map(|n| n.0.as_str()) == Some("test-topic"))
 //                     .expect("Should have test-topic");
+        match response {
+            KafkaResponse::Metadata {
+                api_version: _,
+                correlation_id: _,
+                response,
+            } => {
+                let test_topic = response
+                    .topics
+                    .iter()
+                    .find(|t| t.name.as_ref().map(|n| n.0.as_str()) == Some("test-topic"))
+                    .expect("Should have test-topic");
 
 //                 assert_eq!(test_topic.partitions.len(), 1);
+                assert_eq!(test_topic.partitions.len(), 1);
 
 //                 let partition = &test_topic.partitions[0];
 //                 assert_eq!(partition.error_code, ERROR_NONE);
@@ -718,6 +1142,22 @@ pub fn process_request(request: crate::kafka::KafkaRequest) {
 //             _ => panic!("Expected Metadata response"),
 //         }
 //     }
+                let partition = &test_topic.partitions[0];
+                assert_eq!(partition.error_code, ERROR_NONE);
+                assert_eq!(partition.partition_index, 0);
+                assert_eq!(partition.leader_id.0, DEFAULT_BROKER_ID);
+                assert_eq!(
+                    partition.replica_nodes,
+                    vec![kafka_protocol::messages::BrokerId(DEFAULT_BROKER_ID)]
+                );
+                assert_eq!(
+                    partition.isr_nodes,
+                    vec![kafka_protocol::messages::BrokerId(DEFAULT_BROKER_ID)]
+                );
+            }
+            _ => panic!("Expected Metadata response"),
+        }
+    }
 
 //     #[pgrx::pg_test]
 //     fn test_multiple_sequential_requests() {
@@ -726,12 +1166,24 @@ pub fn process_request(request: crate::kafka::KafkaRequest) {
 //         process_request(request1);
 //         let response1 = response_rx1.try_recv().expect("Should receive response 1");
 //         assert!(matches!(response1, KafkaResponse::ApiVersions { .. }));
+    #[pgrx::pg_test]
+    fn test_multiple_sequential_requests() {
+        // Test sequence: ApiVersions → Metadata
+        let (request1, mut response_rx1) = mock_api_versions_request(1);
+        process_request(request1);
+        let response1 = response_rx1.try_recv().expect("Should receive response 1");
+        assert!(matches!(response1, KafkaResponse::ApiVersions { .. }));
 
 //         let (request2, mut response_rx2) = mock_metadata_request(2, None);
 //         process_request(request2);
 //         let response2 = response_rx2.try_recv().expect("Should receive response 2");
 //         assert!(matches!(response2, KafkaResponse::Metadata { .. }));
 //     }
+        let (request2, mut response_rx2) = mock_metadata_request(2, None);
+        process_request(request2);
+        let response2 = response_rx2.try_recv().expect("Should receive response 2");
+        assert!(matches!(response2, KafkaResponse::Metadata { .. }));
+    }
 
 //     #[pgrx::pg_test]
 //     fn test_produce_creates_topic() {
@@ -739,12 +1191,22 @@ pub fn process_request(request: crate::kafka::KafkaRequest) {
 //         let test_topic = "auto-created-topic";
 //         let records = vec![simple_record(None, "test message")];
 //         let (request, mut response_rx) = mock_produce_request(200, test_topic, 0, records);
+    #[pgrx::pg_test]
+    fn test_produce_creates_topic() {
+        // Test that Produce request auto-creates a new topic
+        let test_topic = "auto-created-topic";
+        let records = vec![simple_record(None, "test message")];
+        let (request, mut response_rx) = mock_produce_request(200, test_topic, 0, records);
 
 //         process_request(request);
+        process_request(request);
 
 //         let response = response_rx
 //             .try_recv()
 //             .expect("Should receive Produce response");
+        let response = response_rx
+            .try_recv()
+            .expect("Should receive Produce response");
 
 //         match response {
 //             KafkaResponse::Produce {
@@ -754,10 +1216,21 @@ pub fn process_request(request: crate::kafka::KafkaRequest) {
 //             } => {
 //                 assert_eq!(correlation_id, 200);
 //                 assert_eq!(response.responses.len(), 1);
+        match response {
+            KafkaResponse::Produce {
+                correlation_id,
+                api_version: _,
+                response,
+            } => {
+                assert_eq!(correlation_id, 200);
+                assert_eq!(response.responses.len(), 1);
 
 //                 let topic_response = &response.responses[0];
 //                 assert_eq!(topic_response.name.to_string(), test_topic);
 //                 assert_eq!(topic_response.partition_responses.len(), 1);
+                let topic_response = &response.responses[0];
+                assert_eq!(topic_response.name.to_string(), test_topic);
+                assert_eq!(topic_response.partition_responses.len(), 1);
 
 //                 let partition_response = &topic_response.partition_responses[0];
 //                 assert_eq!(partition_response.error_code, ERROR_NONE);
@@ -768,6 +1241,15 @@ pub fn process_request(request: crate::kafka::KafkaRequest) {
 //             }
 //             _ => panic!("Expected Produce response"),
 //         }
+                let partition_response = &topic_response.partition_responses[0];
+                assert_eq!(partition_response.error_code, ERROR_NONE);
+                assert_eq!(
+                    partition_response.base_offset, 0,
+                    "First message should have offset 0"
+                );
+            }
+            _ => panic!("Expected Produce response"),
+        }
 
 //         // Verify topic was created in database
 //         Spi::connect(|client| {
@@ -778,11 +1260,24 @@ pub fn process_request(request: crate::kafka::KafkaRequest) {
 //                     &[test_topic.into()],
 //                 )
 //                 .expect("Query should succeed");
+        // Verify topic was created in database
+        Spi::connect(|client| {
+            let result = client
+                .select(
+                    "SELECT COUNT(*) as count FROM kafka.topics WHERE name = $1",
+                    None,
+                    &[test_topic.into()],
+                )
+                .expect("Query should succeed");
 
 //             let count: i64 = result.first().get_by_name("count").unwrap().unwrap();
 //             assert_eq!(count, 1, "Topic should be created in database");
 //         });
 //     }
+            let count: i64 = result.first().get_by_name("count").unwrap().unwrap();
+            assert_eq!(count, 1, "Topic should be created in database");
+        });
+    }
 
 //     #[pgrx::pg_test]
 //     fn test_produce_single_message() {
@@ -791,12 +1286,23 @@ pub fn process_request(request: crate::kafka::KafkaRequest) {
 //         let test_value = "Hello, Kafka!";
 //         let records = vec![simple_record(Some("my-key"), test_value)];
 //         let (request, mut response_rx) = mock_produce_request(201, test_topic, 0, records);
+    #[pgrx::pg_test]
+    fn test_produce_single_message() {
+        // Test that a single message is inserted with correct offset
+        let test_topic = "single-message-topic";
+        let test_value = "Hello, Kafka!";
+        let records = vec![simple_record(Some("my-key"), test_value)];
+        let (request, mut response_rx) = mock_produce_request(201, test_topic, 0, records);
 
 //         process_request(request);
+        process_request(request);
 
 //         let response = response_rx
 //             .try_recv()
 //             .expect("Should receive Produce response");
+        let response = response_rx
+            .try_recv()
+            .expect("Should receive Produce response");
 
 //         match response {
 //             KafkaResponse::Produce {
@@ -811,6 +1317,19 @@ pub fn process_request(request: crate::kafka::KafkaRequest) {
 //             }
 //             _ => panic!("Expected Produce response"),
 //         }
+        match response {
+            KafkaResponse::Produce {
+                correlation_id,
+                api_version: _,
+                response,
+            } => {
+                assert_eq!(correlation_id, 201);
+                let partition_response = &response.responses[0].partition_responses[0];
+                assert_eq!(partition_response.error_code, ERROR_NONE);
+                assert_eq!(partition_response.base_offset, 0);
+            }
+            _ => panic!("Expected Produce response"),
+        }
 
 //         // Verify message is in database
 //         Spi::connect(|client| {
@@ -824,16 +1343,36 @@ pub fn process_request(request: crate::kafka::KafkaRequest) {
 //                     &[test_topic.into()],
 //                 )
 //                 .expect("Query should succeed");
+        // Verify message is in database
+        Spi::connect(|client| {
+            let result = client
+                .select(
+                    "SELECT partition_offset, value FROM kafka.messages m
+                 JOIN kafka.topics t ON m.topic_id = t.id
+                 WHERE t.name = $1 AND m.partition_id = 0
+                 ORDER BY partition_offset",
+                    None,
+                    &[test_topic.into()],
+                )
+                .expect("Query should succeed");
 
 //             assert_eq!(result.len(), 1, "Should have exactly 1 message");
 //             let row = result.first();
 //             let offset: i64 = row.get_by_name("partition_offset").unwrap().unwrap();
 //             let value: Vec<u8> = row.get_by_name("value").unwrap().unwrap();
+            assert_eq!(result.len(), 1, "Should have exactly 1 message");
+            let row = result.first();
+            let offset: i64 = row.get_by_name("partition_offset").unwrap().unwrap();
+            let value: Vec<u8> = row.get_by_name("value").unwrap().unwrap();
 
 //             assert_eq!(offset, 0);
 //             assert_eq!(value, test_value.as_bytes());
 //         });
 //     }
+            assert_eq!(offset, 0);
+            assert_eq!(value, test_value.as_bytes());
+        });
+    }
 
 //     #[pgrx::pg_test]
 //     fn test_produce_batch_messages() {
@@ -843,14 +1382,27 @@ pub fn process_request(request: crate::kafka::KafkaRequest) {
 //         for i in 0..10 {
 //             records.push(simple_record(None, &format!("message-{}", i)));
 //         }
+    #[pgrx::pg_test]
+    fn test_produce_batch_messages() {
+        // Test that batch of messages gets consecutive offsets
+        let test_topic = "batch-topic";
+        let mut records = Vec::new();
+        for i in 0..10 {
+            records.push(simple_record(None, &format!("message-{}", i)));
+        }
 
 //         let (request, mut response_rx) = mock_produce_request(202, test_topic, 0, records);
+        let (request, mut response_rx) = mock_produce_request(202, test_topic, 0, records);
 
 //         process_request(request);
+        process_request(request);
 
 //         let response = response_rx
 //             .try_recv()
 //             .expect("Should receive Produce response");
+        let response = response_rx
+            .try_recv()
+            .expect("Should receive Produce response");
 
 //         match response {
 //             KafkaResponse::Produce {
@@ -868,6 +1420,22 @@ pub fn process_request(request: crate::kafka::KafkaRequest) {
 //             }
 //             _ => panic!("Expected Produce response"),
 //         }
+        match response {
+            KafkaResponse::Produce {
+                correlation_id,
+                api_version: _,
+                response,
+            } => {
+                assert_eq!(correlation_id, 202);
+                let partition_response = &response.responses[0].partition_responses[0];
+                assert_eq!(partition_response.error_code, ERROR_NONE);
+                assert_eq!(
+                    partition_response.base_offset, 0,
+                    "Batch should start at offset 0"
+                );
+            }
+            _ => panic!("Expected Produce response"),
+        }
 
 //         // Verify all 10 messages have consecutive offsets
 //         Spi::connect(|client| {
@@ -883,11 +1451,29 @@ pub fn process_request(request: crate::kafka::KafkaRequest) {
 //                     &[test_topic.into()],
 //                 )
 //                 .expect("Query should succeed");
+        // Verify all 10 messages have consecutive offsets
+        Spi::connect(|client| {
+            let result = client
+                .select(
+                    "SELECT COUNT(*) as count,
+                        MIN(partition_offset) as min_offset,
+                        MAX(partition_offset) as max_offset
+                 FROM kafka.messages m
+                 JOIN kafka.topics t ON m.topic_id = t.id
+                 WHERE t.name = $1 AND m.partition_id = 0",
+                    None,
+                    &[test_topic.into()],
+                )
+                .expect("Query should succeed");
 
 //             let row = result.first();
 //             let count: i64 = row.get_by_name("count").unwrap().unwrap();
 //             let min_offset: i64 = row.get_by_name("min_offset").unwrap().unwrap();
 //             let max_offset: i64 = row.get_by_name("max_offset").unwrap().unwrap();
+            let row = result.first();
+            let count: i64 = row.get_by_name("count").unwrap().unwrap();
+            let min_offset: i64 = row.get_by_name("min_offset").unwrap().unwrap();
+            let max_offset: i64 = row.get_by_name("max_offset").unwrap().unwrap();
 
 //             assert_eq!(count, 10, "Should have exactly 10 messages");
 //             assert_eq!(min_offset, 0, "First offset should be 0");
@@ -897,6 +1483,14 @@ pub fn process_request(request: crate::kafka::KafkaRequest) {
 //             );
 //         });
 //     }
+            assert_eq!(count, 10, "Should have exactly 10 messages");
+            assert_eq!(min_offset, 0, "First offset should be 0");
+            assert_eq!(
+                max_offset, 9,
+                "Last offset should be 9 (consecutive from 0)"
+            );
+        });
+    }
 
 //     #[pgrx::pg_test]
 //     fn test_produce_with_headers() {
@@ -908,12 +1502,26 @@ pub fn process_request(request: crate::kafka::KafkaRequest) {
 //         ];
 //         let records = vec![record_with_headers(None, "message with headers", headers)];
 //         let (request, mut response_rx) = mock_produce_request(203, test_topic, 0, records);
+    #[pgrx::pg_test]
+    fn test_produce_with_headers() {
+        // Test that headers are correctly serialized to JSONB
+        let test_topic = "headers-topic";
+        let headers = vec![
+            ("correlation-id", b"12345".as_ref()),
+            ("source", b"test-client".as_ref()),
+        ];
+        let records = vec![record_with_headers(None, "message with headers", headers)];
+        let (request, mut response_rx) = mock_produce_request(203, test_topic, 0, records);
 
 //         process_request(request);
+        process_request(request);
 
 //         let response = response_rx
 //             .try_recv()
 //             .expect("Should receive Produce response");
+        let response = response_rx
+            .try_recv()
+            .expect("Should receive Produce response");
 
 //         match response {
 //             KafkaResponse::Produce {
@@ -927,6 +1535,18 @@ pub fn process_request(request: crate::kafka::KafkaRequest) {
 //             }
 //             _ => panic!("Expected Produce response"),
 //         }
+        match response {
+            KafkaResponse::Produce {
+                correlation_id,
+                api_version: _,
+                response,
+            } => {
+                assert_eq!(correlation_id, 203);
+                let partition_response = &response.responses[0].partition_responses[0];
+                assert_eq!(partition_response.error_code, ERROR_NONE);
+            }
+            _ => panic!("Expected Produce response"),
+        }
 
 //         // Verify headers are in JSONB format
 //         Spi::connect(|client| {
@@ -939,10 +1559,24 @@ pub fn process_request(request: crate::kafka::KafkaRequest) {
 //                     &[test_topic.into()],
 //                 )
 //                 .expect("Query should succeed");
+        // Verify headers are in JSONB format
+        Spi::connect(|client| {
+            let result = client
+                .select(
+                    "SELECT headers FROM kafka.messages m
+                 JOIN kafka.topics t ON m.topic_id = t.id
+                 WHERE t.name = $1",
+                    None,
+                    &[test_topic.into()],
+                )
+                .expect("Query should succeed");
 
 //             assert_eq!(result.len(), 1);
 //             let row = result.first();
 //             let headers_json: pgrx::JsonB = row.get_by_name("headers").unwrap().unwrap();
+            assert_eq!(result.len(), 1);
+            let row = result.first();
+            let headers_json: pgrx::JsonB = row.get_by_name("headers").unwrap().unwrap();
 
 //             // Headers should be a JSON array with 2 elements
 //             let headers_value = headers_json.0;
@@ -951,6 +1585,13 @@ pub fn process_request(request: crate::kafka::KafkaRequest) {
 //             assert_eq!(headers_array.len(), 2, "Should have 2 headers");
 //         });
 //     }
+            // Headers should be a JSON array with 2 elements
+            let headers_value = headers_json.0;
+            assert!(headers_value.is_array(), "Headers should be JSONB array");
+            let headers_array = headers_value.as_array().unwrap();
+            assert_eq!(headers_array.len(), 2, "Should have 2 headers");
+        });
+    }
 
 //     #[pgrx::pg_test]
 //     fn test_produce_invalid_partition() {
@@ -958,12 +1599,22 @@ pub fn process_request(request: crate::kafka::KafkaRequest) {
 //         let test_topic = "invalid-partition-topic";
 //         let records = vec![simple_record(None, "test message")];
 //         let (request, mut response_rx) = mock_produce_request(204, test_topic, 1, records); // partition 1 (invalid)
+    #[pgrx::pg_test]
+    fn test_produce_invalid_partition() {
+        // Test that partition > 0 returns an error (we only support single-partition topics)
+        let test_topic = "invalid-partition-topic";
+        let records = vec![simple_record(None, "test message")];
+        let (request, mut response_rx) = mock_produce_request(204, test_topic, 1, records); // partition 1 (invalid)
 
 //         process_request(request);
+        process_request(request);
 
 //         let response = response_rx
 //             .try_recv()
 //             .expect("Should receive Produce response");
+        let response = response_rx
+            .try_recv()
+            .expect("Should receive Produce response");
 
 //         match response {
 //             KafkaResponse::Produce {
@@ -982,3 +1633,20 @@ pub fn process_request(request: crate::kafka::KafkaRequest) {
 //         }
 //     }
 // }
+        match response {
+            KafkaResponse::Produce {
+                correlation_id,
+                api_version: _,
+                response,
+            } => {
+                assert_eq!(correlation_id, 204);
+                let partition_response = &response.responses[0].partition_responses[0];
+                assert_eq!(
+                    partition_response.error_code, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+                    "Should return error for invalid partition"
+                );
+            }
+            _ => panic!("Expected Produce response"),
+        }
+    }
+}

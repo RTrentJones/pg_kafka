@@ -124,6 +124,18 @@ pub trait KafkaStore {
     /// High watermark offset (0 if partition is empty)
     fn get_high_watermark(&self, topic_id: i32, partition_id: i32) -> Result<i64>;
 
+    /// Get earliest offset for a topic partition
+    ///
+    /// The earliest offset is the offset of the first available message.
+    ///
+    /// # Arguments
+    /// * `topic_id` - Topic ID
+    /// * `partition_id` - Partition ID
+    ///
+    /// # Returns
+    /// Earliest offset (0 if partition is empty)
+    fn get_earliest_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64>;
+
     // ===== Consumer Offset Operations =====
 
     /// Commit consumer offsets for a group

@@ -111,6 +111,124 @@ pub enum KafkaRequest {
         /// Channel to send the response back to the specific connection
         response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
     },
+    /// FindCoordinator request - discover the coordinator for a consumer group
+    FindCoordinator {
+        /// Correlation ID from client - MUST be echoed back in response
+        correlation_id: i32,
+        /// Optional client identifier string
+        client_id: Option<String>,
+        /// API version from the request (needed for response encoding)
+        api_version: i16,
+        /// Coordinator key (consumer group ID for consumer groups)
+        key: String,
+        /// Key type (0 = consumer group, 1 = transaction coordinator)
+        key_type: i8,
+        /// Channel to send the response back to the specific connection
+        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
+    },
+    /// JoinGroup request - consumer joins a consumer group
+    JoinGroup {
+        /// Correlation ID from client - MUST be echoed back in response
+        correlation_id: i32,
+        /// Optional client identifier string
+        client_id: Option<String>,
+        /// API version from the request (needed for response encoding)
+        api_version: i16,
+        /// Consumer group ID
+        group_id: String,
+        /// Session timeout in milliseconds
+        session_timeout_ms: i32,
+        /// Rebalance timeout in milliseconds (v1+)
+        rebalance_timeout_ms: i32,
+        /// Member ID ("" for first join, assigned ID for rejoin)
+        member_id: String,
+        /// Static group instance ID for static membership (v5+)
+        group_instance_id: Option<String>,
+        /// Protocol type (e.g., "consumer")
+        protocol_type: String,
+        /// Supported assignment strategies with metadata
+        protocols: Vec<JoinGroupProtocol>,
+        /// Channel to send the response back to the specific connection
+        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
+    },
+    /// SyncGroup request - synchronize partition assignments
+    SyncGroup {
+        /// Correlation ID from client - MUST be echoed back in response
+        correlation_id: i32,
+        /// Optional client identifier string
+        client_id: Option<String>,
+        /// API version from the request (needed for response encoding)
+        api_version: i16,
+        /// Consumer group ID
+        group_id: String,
+        /// Generation ID from JoinGroup response
+        generation_id: i32,
+        /// Member ID from JoinGroup response
+        member_id: String,
+        /// Static group instance ID (v3+)
+        group_instance_id: Option<String>,
+        /// Protocol type (v5+)
+        protocol_type: Option<String>,
+        /// Protocol name (v5+)
+        protocol_name: Option<String>,
+        /// Partition assignments (only leader sends non-empty)
+        assignments: Vec<SyncGroupAssignment>,
+        /// Channel to send the response back to the specific connection
+        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
+    },
+    /// Heartbeat request - maintain consumer group membership
+    Heartbeat {
+        /// Correlation ID from client - MUST be echoed back in response
+        correlation_id: i32,
+        /// Optional client identifier string
+        client_id: Option<String>,
+        /// API version from the request (needed for response encoding)
+        api_version: i16,
+        /// Consumer group ID
+        group_id: String,
+        /// Generation ID from JoinGroup response
+        generation_id: i32,
+        /// Member ID from JoinGroup response
+        member_id: String,
+        /// Static group instance ID (v3+)
+        group_instance_id: Option<String>,
+        /// Channel to send the response back to the specific connection
+        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
+    },
+    /// LeaveGroup request - consumer leaves a consumer group
+    LeaveGroup {
+        /// Correlation ID from client - MUST be echoed back in response
+        correlation_id: i32,
+        /// Optional client identifier string
+        client_id: Option<String>,
+        /// API version from the request (needed for response encoding)
+        api_version: i16,
+        /// Consumer group ID
+        group_id: String,
+        /// Member ID from JoinGroup response (v0-v2)
+        member_id: String,
+        /// Members leaving (v3+, batch support)
+        members: Vec<MemberIdentity>,
+        /// Channel to send the response back to the specific connection
+        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
+    },
+    /// ListOffsets request - query earliest/latest offsets for partitions
+    ListOffsets {
+        /// Correlation ID from client - MUST be echoed back in response
+        correlation_id: i32,
+        /// Optional client identifier string
+        client_id: Option<String>,
+        /// API version from the request (needed for response encoding)
+        api_version: i16,
+        /// Replica ID (-1 for consumer, broker ID for replicas)
+        replica_id: i32,
+        /// Isolation level (0=READ_UNCOMMITTED, 1=READ_COMMITTED) - v2+
+        isolation_level: i8,
+        /// Topics to list offsets for
+        topics: Vec<ListOffsetsTopicData>,
+        /// Channel to send the response back to the specific connection
+        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
+    },
 }
 
 /// Kafka response types sent back from main thread to async tasks
@@ -172,6 +290,60 @@ pub enum KafkaResponse {
         api_version: i16,
         /// The kafka-protocol response struct (ready to encode)
         response: kafka_protocol::messages::offset_fetch_response::OffsetFetchResponse,
+    },
+    /// FindCoordinator response - wraps kafka-protocol's FindCoordinatorResponse
+    FindCoordinator {
+        /// Correlation ID from request
+        correlation_id: i32,
+        /// API version from the request (needed for response encoding)
+        api_version: i16,
+        /// The kafka-protocol response struct (ready to encode)
+        response: kafka_protocol::messages::find_coordinator_response::FindCoordinatorResponse,
+    },
+    /// JoinGroup response - wraps kafka-protocol's JoinGroupResponse
+    JoinGroup {
+        /// Correlation ID from request
+        correlation_id: i32,
+        /// API version from the request (needed for response encoding)
+        api_version: i16,
+        /// The kafka-protocol response struct (ready to encode)
+        response: kafka_protocol::messages::join_group_response::JoinGroupResponse,
+    },
+    /// SyncGroup response - wraps kafka-protocol's SyncGroupResponse
+    SyncGroup {
+        /// Correlation ID from request
+        correlation_id: i32,
+        /// API version from the request (needed for response encoding)
+        api_version: i16,
+        /// The kafka-protocol response struct (ready to encode)
+        response: kafka_protocol::messages::sync_group_response::SyncGroupResponse,
+    },
+    /// Heartbeat response - wraps kafka-protocol's HeartbeatResponse
+    Heartbeat {
+        /// Correlation ID from request
+        correlation_id: i32,
+        /// API version from the request (needed for response encoding)
+        api_version: i16,
+        /// The kafka-protocol response struct (ready to encode)
+        response: kafka_protocol::messages::heartbeat_response::HeartbeatResponse,
+    },
+    /// LeaveGroup response - wraps kafka-protocol's LeaveGroupResponse
+    LeaveGroup {
+        /// Correlation ID from request
+        correlation_id: i32,
+        /// API version from the request (needed for response encoding)
+        api_version: i16,
+        /// The kafka-protocol response struct (ready to encode)
+        response: kafka_protocol::messages::leave_group_response::LeaveGroupResponse,
+    },
+    /// ListOffsets response - wraps kafka-protocol's ListOffsetsResponse
+    ListOffsets {
+        /// Correlation ID from request
+        correlation_id: i32,
+        /// API version from the request (needed for response encoding)
+        api_version: i16,
+        /// The kafka-protocol response struct (ready to encode)
+        response: kafka_protocol::messages::list_offsets_response::ListOffsetsResponse,
     },
     /// Error response for unsupported or malformed requests
     Error {
@@ -296,6 +468,56 @@ pub struct OffsetFetchTopicData {
     pub name: String,
     /// Partitions to fetch offsets for
     pub partition_indexes: Vec<i32>,
+}
+
+/// JoinGroup protocol (assignment strategy with metadata)
+#[derive(Debug, Clone)]
+pub struct JoinGroupProtocol {
+    /// Protocol name (e.g., "range", "roundrobin", "sticky")
+    pub name: String,
+    /// Protocol-specific subscription metadata (encoded MemberSubscription)
+    pub metadata: Vec<u8>,
+}
+
+/// SyncGroup assignment (member ID → partition assignment)
+#[derive(Debug, Clone)]
+pub struct SyncGroupAssignment {
+    /// Member ID to assign partitions to
+    pub member_id: String,
+    /// Encoded MemberAssignment for this member
+    pub assignment: Vec<u8>,
+}
+
+/// Member identity for LeaveGroup request (v3+)
+#[derive(Debug, Clone)]
+pub struct MemberIdentity {
+    /// Member ID leaving the group
+    pub member_id: String,
+    /// Static group instance ID (if using static membership)
+    pub group_instance_id: Option<String>,
+}
+
+/// Data for listing offsets for a topic
+#[derive(Debug, Clone)]
+pub struct ListOffsetsTopicData {
+    /// Topic name
+    pub name: String,
+    /// Partitions to list offsets for
+    pub partitions: Vec<ListOffsetsPartitionData>,
+}
+
+/// Data for listing offsets for a partition
+#[derive(Debug, Clone)]
+pub struct ListOffsetsPartitionData {
+    /// Partition ID
+    pub partition_index: i32,
+    /// Current leader epoch (for fencing, -1 if not used)
+    pub current_leader_epoch: i32,
+    /// Timestamp to query:
+    /// - -2 = earliest offset
+    /// - -1 = latest offset
+    /// - >= 0 = offset at timestamp (v1+)
+    pub timestamp: i64,
 }
 
 // Global request queue: async tasks → main thread

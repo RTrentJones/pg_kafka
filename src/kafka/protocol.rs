@@ -425,6 +425,292 @@ pub fn parse_request(
                 response_tx,
             }))
         }
+        API_KEY_FIND_COORDINATOR => {
+            // FindCoordinator request - discover the coordinator for a consumer group
+            pg_log!(
+                "Parsed FindCoordinator request (api_key={}, version={})",
+                API_KEY_FIND_COORDINATOR,
+                api_version
+            );
+
+            // Use kafka-protocol crate to decode FindCoordinatorRequest
+            let coord_req = match kafka_protocol::messages::find_coordinator_request::FindCoordinatorRequest::decode(&mut payload_buf, api_version) {
+                Ok(req) => req,
+                Err(e) => {
+                    pg_warning!("Failed to decode FindCoordinatorRequest: {}", e);
+                    let error_response = KafkaResponse::Error {
+                        correlation_id,
+                        error_code: ERROR_CORRUPT_MESSAGE,
+                        error_message: Some(format!("Malformed FindCoordinatorRequest: {}", e)),
+                    };
+                    let _ = response_tx.send(error_response);
+                    return Ok(None);
+                }
+            };
+
+            let key = coord_req.key.to_string();
+            let key_type = coord_req.key_type;
+
+            Ok(Some(KafkaRequest::FindCoordinator {
+                correlation_id,
+                client_id,
+                api_version,
+                key,
+                key_type,
+                response_tx,
+            }))
+        }
+        API_KEY_JOIN_GROUP => {
+            // JoinGroup request - consumer joins a consumer group
+            pg_log!(
+                "Parsed JoinGroup request (api_key={}, version={})",
+                API_KEY_JOIN_GROUP,
+                api_version
+            );
+
+            // Use kafka-protocol crate to decode JoinGroupRequest
+            let join_req = match kafka_protocol::messages::join_group_request::JoinGroupRequest::decode(&mut payload_buf, api_version) {
+                Ok(req) => req,
+                Err(e) => {
+                    pg_warning!("Failed to decode JoinGroupRequest: {}", e);
+                    let error_response = KafkaResponse::Error {
+                        correlation_id,
+                        error_code: ERROR_CORRUPT_MESSAGE,
+                        error_message: Some(format!("Malformed JoinGroupRequest: {}", e)),
+                    };
+                    let _ = response_tx.send(error_response);
+                    return Ok(None);
+                }
+            };
+
+            let group_id = join_req.group_id.to_string();
+            let session_timeout_ms = join_req.session_timeout_ms;
+            let rebalance_timeout_ms = join_req.rebalance_timeout_ms;
+            let member_id = join_req.member_id.to_string();
+            let group_instance_id = join_req.group_instance_id.map(|s| s.to_string());
+            let protocol_type = join_req.protocol_type.to_string();
+
+            // Extract protocols
+            let protocols = join_req
+                .protocols
+                .into_iter()
+                .map(|p| super::messages::JoinGroupProtocol {
+                    name: p.name.to_string(),
+                    metadata: p.metadata.to_vec(),
+                })
+                .collect();
+
+            Ok(Some(KafkaRequest::JoinGroup {
+                correlation_id,
+                client_id,
+                api_version,
+                group_id,
+                session_timeout_ms,
+                rebalance_timeout_ms,
+                member_id,
+                group_instance_id,
+                protocol_type,
+                protocols,
+                response_tx,
+            }))
+        }
+        API_KEY_SYNC_GROUP => {
+            // SyncGroup request - synchronize partition assignments
+            pg_log!(
+                "Parsed SyncGroup request (api_key={}, version={})",
+                API_KEY_SYNC_GROUP,
+                api_version
+            );
+
+            // Use kafka-protocol crate to decode SyncGroupRequest
+            let sync_req = match kafka_protocol::messages::sync_group_request::SyncGroupRequest::decode(&mut payload_buf, api_version) {
+                Ok(req) => req,
+                Err(e) => {
+                    pg_warning!("Failed to decode SyncGroupRequest: {}", e);
+                    let error_response = KafkaResponse::Error {
+                        correlation_id,
+                        error_code: ERROR_CORRUPT_MESSAGE,
+                        error_message: Some(format!("Malformed SyncGroupRequest: {}", e)),
+                    };
+                    let _ = response_tx.send(error_response);
+                    return Ok(None);
+                }
+            };
+
+            let group_id = sync_req.group_id.to_string();
+            let generation_id = sync_req.generation_id;
+            let member_id = sync_req.member_id.to_string();
+            let group_instance_id = sync_req.group_instance_id.map(|s| s.to_string());
+            let protocol_type = sync_req.protocol_type.map(|s| s.to_string());
+            let protocol_name = sync_req.protocol_name.map(|s| s.to_string());
+
+            // Extract assignments
+            let assignments = sync_req
+                .assignments
+                .into_iter()
+                .map(|a| super::messages::SyncGroupAssignment {
+                    member_id: a.member_id.to_string(),
+                    assignment: a.assignment.to_vec(),
+                })
+                .collect();
+
+            Ok(Some(KafkaRequest::SyncGroup {
+                correlation_id,
+                client_id,
+                api_version,
+                group_id,
+                generation_id,
+                member_id,
+                group_instance_id,
+                protocol_type,
+                protocol_name,
+                assignments,
+                response_tx,
+            }))
+        }
+        API_KEY_HEARTBEAT => {
+            // Heartbeat request - maintain consumer group membership
+            pg_log!(
+                "Parsed Heartbeat request (api_key={}, version={})",
+                API_KEY_HEARTBEAT,
+                api_version
+            );
+
+            // Use kafka-protocol crate to decode HeartbeatRequest
+            let heartbeat_req = match kafka_protocol::messages::heartbeat_request::HeartbeatRequest::decode(&mut payload_buf, api_version) {
+                Ok(req) => req,
+                Err(e) => {
+                    pg_warning!("Failed to decode HeartbeatRequest: {}", e);
+                    let error_response = KafkaResponse::Error {
+                        correlation_id,
+                        error_code: ERROR_CORRUPT_MESSAGE,
+                        error_message: Some(format!("Malformed HeartbeatRequest: {}", e)),
+                    };
+                    let _ = response_tx.send(error_response);
+                    return Ok(None);
+                }
+            };
+
+            let group_id = heartbeat_req.group_id.to_string();
+            let generation_id = heartbeat_req.generation_id;
+            let member_id = heartbeat_req.member_id.to_string();
+            let group_instance_id = heartbeat_req.group_instance_id.map(|s| s.to_string());
+
+            Ok(Some(KafkaRequest::Heartbeat {
+                correlation_id,
+                client_id,
+                api_version,
+                group_id,
+                generation_id,
+                member_id,
+                group_instance_id,
+                response_tx,
+            }))
+        }
+        API_KEY_LEAVE_GROUP => {
+            // LeaveGroup request - consumer leaves a consumer group
+            pg_log!(
+                "Parsed LeaveGroup request (api_key={}, version={})",
+                API_KEY_LEAVE_GROUP,
+                api_version
+            );
+
+            // Use kafka-protocol crate to decode LeaveGroupRequest
+            let leave_req = match kafka_protocol::messages::leave_group_request::LeaveGroupRequest::decode(&mut payload_buf, api_version) {
+                Ok(req) => req,
+                Err(e) => {
+                    pg_warning!("Failed to decode LeaveGroupRequest: {}", e);
+                    let error_response = KafkaResponse::Error {
+                        correlation_id,
+                        error_code: ERROR_CORRUPT_MESSAGE,
+                        error_message: Some(format!("Malformed LeaveGroupRequest: {}", e)),
+                    };
+                    let _ = response_tx.send(error_response);
+                    return Ok(None);
+                }
+            };
+
+            let group_id = leave_req.group_id.to_string();
+            let member_id = leave_req.member_id.to_string();
+
+            // Extract members (v3+)
+            let members = leave_req
+                .members
+                .into_iter()
+                .map(|m| super::messages::MemberIdentity {
+                    member_id: m.member_id.to_string(),
+                    group_instance_id: m.group_instance_id.map(|s| s.to_string()),
+                })
+                .collect();
+
+            Ok(Some(KafkaRequest::LeaveGroup {
+                correlation_id,
+                client_id,
+                api_version,
+                group_id,
+                member_id,
+                members,
+                response_tx,
+            }))
+        }
+        API_KEY_LIST_OFFSETS => {
+            // ListOffsets request - query earliest/latest offsets
+            pg_log!(
+                "Parsed ListOffsets request (api_key={}, version={})",
+                API_KEY_LIST_OFFSETS,
+                api_version
+            );
+
+            // Use kafka-protocol crate to decode ListOffsetsRequest
+            let list_req = match kafka_protocol::messages::list_offsets_request::ListOffsetsRequest::decode(&mut payload_buf, api_version) {
+                Ok(req) => req,
+                Err(e) => {
+                    pg_warning!("Failed to decode ListOffsetsRequest: {}", e);
+                    let error_response = KafkaResponse::Error {
+                        correlation_id,
+                        error_code: ERROR_CORRUPT_MESSAGE,
+                        error_message: Some(format!("Malformed ListOffsetsRequest: {}", e)),
+                    };
+                    let _ = response_tx.send(error_response);
+                    return Ok(None);
+                }
+            };
+
+            let replica_id = list_req.replica_id.0;  // Extract i32 from BrokerId
+            let isolation_level = list_req.isolation_level;
+
+            // Extract topics and partitions
+            let topics: Vec<super::messages::ListOffsetsTopicData> = list_req
+                .topics
+                .into_iter()
+                .map(|topic| {
+                    let partitions = topic
+                        .partitions
+                        .into_iter()
+                        .map(|partition| super::messages::ListOffsetsPartitionData {
+                            partition_index: partition.partition_index,
+                            current_leader_epoch: partition.current_leader_epoch,
+                            timestamp: partition.timestamp,
+                        })
+                        .collect();
+
+                    super::messages::ListOffsetsTopicData {
+                        name: topic.name.to_string(),
+                        partitions,
+                    }
+                })
+                .collect();
+
+            Ok(Some(KafkaRequest::ListOffsets {
+                correlation_id,
+                client_id,
+                api_version,
+                replica_id,
+                isolation_level,
+                topics,
+                response_tx,
+            }))
+        }
         _ => {
             // Unsupported API
             pg_warning!("Unsupported API key: {}", api_key);
@@ -721,6 +1007,108 @@ pub fn encode_response(response: KafkaResponse) -> Result<BytesMut> {
 
             // Encode response body using the requested API version
             fetch_response.encode(&mut response_buf, api_version)?;
+        }
+        KafkaResponse::FindCoordinator {
+            correlation_id,
+            api_version,
+            response: coord_response,
+        } => {
+            // Build ResponseHeader
+            let header = ResponseHeader::default().with_correlation_id(correlation_id);
+
+            // Encode response header
+            // FindCoordinator v3+ uses flexible format (ResponseHeader v1)
+            // FindCoordinator v0-v2 uses non-flexible format (ResponseHeader v0)
+            let response_header_version = if api_version >= 3 { 1 } else { 0 };
+            header.encode(&mut response_buf, response_header_version)?;
+
+            // Encode response body using the requested API version
+            coord_response.encode(&mut response_buf, api_version)?;
+        }
+        KafkaResponse::JoinGroup {
+            correlation_id,
+            api_version,
+            response: join_response,
+        } => {
+            // Build ResponseHeader
+            let header = ResponseHeader::default().with_correlation_id(correlation_id);
+
+            // Encode response header
+            // JoinGroup v6+ uses flexible format (ResponseHeader v1)
+            // JoinGroup v0-v5 uses non-flexible format (ResponseHeader v0)
+            let response_header_version = if api_version >= 6 { 1 } else { 0 };
+            header.encode(&mut response_buf, response_header_version)?;
+
+            // Encode response body using the requested API version
+            join_response.encode(&mut response_buf, api_version)?;
+        }
+        KafkaResponse::SyncGroup {
+            correlation_id,
+            api_version,
+            response: sync_response,
+        } => {
+            // Build ResponseHeader
+            let header = ResponseHeader::default().with_correlation_id(correlation_id);
+
+            // Encode response header
+            // SyncGroup v4+ uses flexible format (ResponseHeader v1)
+            // SyncGroup v0-v3 uses non-flexible format (ResponseHeader v0)
+            let response_header_version = if api_version >= 4 { 1 } else { 0 };
+            header.encode(&mut response_buf, response_header_version)?;
+
+            // Encode response body using the requested API version
+            sync_response.encode(&mut response_buf, api_version)?;
+        }
+        KafkaResponse::Heartbeat {
+            correlation_id,
+            api_version,
+            response: heartbeat_response,
+        } => {
+            // Build ResponseHeader
+            let header = ResponseHeader::default().with_correlation_id(correlation_id);
+
+            // Encode response header
+            // Heartbeat v4+ uses flexible format (ResponseHeader v1)
+            // Heartbeat v0-v3 uses non-flexible format (ResponseHeader v0)
+            let response_header_version = if api_version >= 4 { 1 } else { 0 };
+            header.encode(&mut response_buf, response_header_version)?;
+
+            // Encode response body using the requested API version
+            heartbeat_response.encode(&mut response_buf, api_version)?;
+        }
+        KafkaResponse::LeaveGroup {
+            correlation_id,
+            api_version,
+            response: leave_response,
+        } => {
+            // Build ResponseHeader
+            let header = ResponseHeader::default().with_correlation_id(correlation_id);
+
+            // Encode response header
+            // LeaveGroup v4+ uses flexible format (ResponseHeader v1)
+            // LeaveGroup v0-v3 uses non-flexible format (ResponseHeader v0)
+            let response_header_version = if api_version >= 4 { 1 } else { 0 };
+            header.encode(&mut response_buf, response_header_version)?;
+
+            // Encode response body using the requested API version
+            leave_response.encode(&mut response_buf, api_version)?;
+        }
+        KafkaResponse::ListOffsets {
+            correlation_id,
+            api_version,
+            response: list_response,
+        } => {
+            // Build ResponseHeader
+            let header = ResponseHeader::default().with_correlation_id(correlation_id);
+
+            // Encode response header
+            // ListOffsets v6+ uses flexible format (ResponseHeader v1)
+            // ListOffsets v0-v5 uses non-flexible format (ResponseHeader v0)
+            let response_header_version = if api_version >= 6 { 1 } else { 0 };
+            header.encode(&mut response_buf, response_header_version)?;
+
+            // Encode response body using the requested API version
+            list_response.encode(&mut response_buf, api_version)?;
         }
         KafkaResponse::Error {
             correlation_id,

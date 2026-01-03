@@ -32,6 +32,7 @@
 // - The queue cleanly separates concerns and prevents deadlocks
 
 pub mod constants;
+pub mod coordinator;
 pub mod error;
 pub mod handlers;
 pub mod listener;
@@ -42,6 +43,7 @@ pub mod storage;
 
 // Re-export commonly used types for convenience
 pub use constants::*;
+pub use coordinator::GroupCoordinator;
 pub use error::{KafkaError, Result};
 pub use listener::run as run_listener;
 pub use messages::{request_receiver, request_sender, KafkaRequest, KafkaResponse};

@@ -44,6 +44,10 @@ pub enum KafkaError {
     /// Internal storage/database error
     #[error("Internal error: {0}")]
     Internal(String),
+
+    /// Consumer group coordinator error
+    #[error("Coordinator error (code {0}): {1}")]
+    CoordinatorError(i16, String),
 }
 
 /// Result type alias for Kafka operations

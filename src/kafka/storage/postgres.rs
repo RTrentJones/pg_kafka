@@ -274,6 +274,23 @@ impl KafkaStore for PostgresStore {
         .map_err(|e: KafkaError| KafkaError::Internal(format!("get_high_watermark failed: {}", e)))
     }
 
+    fn get_earliest_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64> {
+        Spi::connect(|client| {
+            let table = client.select(
+                "SELECT COALESCE(MIN(partition_offset), 0) as earliest_offset
+                 FROM kafka.messages
+                 WHERE topic_id = $1 AND partition_id = $2",
+                None,
+                &[topic_id.into(), partition_id.into()],
+            )?;
+
+            let earliest_offset: i64 = table.first().get_by_name("earliest_offset")?.unwrap_or(0);
+
+            Ok(earliest_offset)
+        })
+        .map_err(|e: KafkaError| KafkaError::Internal(format!("get_earliest_offset failed: {}", e)))
+    }
+
     fn commit_offset(
         &self,
         group_id: &str,

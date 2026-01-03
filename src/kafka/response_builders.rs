@@ -62,12 +62,49 @@ pub fn build_api_versions_response() -> ApiVersionsResponse {
     av6.max_version = 8;
     response.api_keys.push(av6);
 
-    // OffsetFetch (API_KEY_OFFSET_FETCH): versions 0-8
+    // OffsetFetch (API_KEY_OFFSET_FETCH): versions 0-7
+    // Note: v8+ changed response format to support multiple groups
+    // We currently only support the single-group format (v0-7)
     let mut av7 = ApiVersion::default();
     av7.api_key = API_KEY_OFFSET_FETCH;
     av7.min_version = 0;
-    av7.max_version = 8;
+    av7.max_version = 7;
     response.api_keys.push(av7);
+
+    // FindCoordinator (API_KEY_FIND_COORDINATOR): versions 0-3
+    let mut av8 = ApiVersion::default();
+    av8.api_key = API_KEY_FIND_COORDINATOR;
+    av8.min_version = 0;
+    av8.max_version = 3;
+    response.api_keys.push(av8);
+
+    // JoinGroup (API_KEY_JOIN_GROUP): versions 0-7
+    let mut av9 = ApiVersion::default();
+    av9.api_key = API_KEY_JOIN_GROUP;
+    av9.min_version = 0;
+    av9.max_version = 7;
+    response.api_keys.push(av9);
+
+    // Heartbeat (API_KEY_HEARTBEAT): versions 0-4
+    let mut av10 = ApiVersion::default();
+    av10.api_key = API_KEY_HEARTBEAT;
+    av10.min_version = 0;
+    av10.max_version = 4;
+    response.api_keys.push(av10);
+
+    // LeaveGroup (API_KEY_LEAVE_GROUP): versions 0-4
+    let mut av11 = ApiVersion::default();
+    av11.api_key = API_KEY_LEAVE_GROUP;
+    av11.min_version = 0;
+    av11.max_version = 4;
+    response.api_keys.push(av11);
+
+    // SyncGroup (API_KEY_SYNC_GROUP): versions 0-4
+    let mut av12 = ApiVersion::default();
+    av12.api_key = API_KEY_SYNC_GROUP;
+    av12.min_version = 0;
+    av12.max_version = 4;
+    response.api_keys.push(av12);
 
     response
 }
