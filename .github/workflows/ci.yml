@@ -34,7 +34,7 @@ jobs:
       with:
         toolchain: nightly
         # 'rustfmt' for style checks, 'clippy' for linting
-        components: rustfmt, clippy
+        components: rustfmt, clippy, llvm-tools-preview
 
     - name: Rust Cache
       uses: Swatinem/rust-cache@v2
@@ -108,7 +108,10 @@ jobs:
     # ------------------------------------------------------------------
     # UNIT TESTING: Non-SPI tests only
     # ------------------------------------------------------------------
-    - name: Run unit tests
+    - name: Install cargo-llvm-cov
+      uses: taiki-e/install-action@cargo-llvm-cov
+
+    - name: Run unit tests and generate coverage
       # Note: We skip 'cargo pgrx test' because pg_kafka uses PGC_POSTMASTER GUCs
       # which require shared_preload_libraries BEFORE Postgres starts.
       # cargo pgrx test creates the extension AFTER starting Postgres, causing:
@@ -116,10 +119,17 @@ jobs:
       #
       # Instead, we run non-SPI unit tests here (protocol, encoding, helpers).
       # SPI/integration tests are in kafka_test/ E2E suite below.
-      run: cargo test --lib --features pg14
+      run: cargo llvm-cov --lib --features pg14 --lcov --output-path lcov.info
       env:
         # Override RUSTFLAGS to avoid -D warnings (pgrx macros cause false positives)
         RUSTFLAGS: ""
+
+    - name: Upload to Codecov
+      uses: codecov/codecov-action@v5
+      with:
+        files: lcov.info
+        token: ${{ secrets.CODECOV_TOKEN }}
+        fail_ci_if_error: true
 
     # ------------------------------------------------------------------
     # E2E TESTING: Full system test with external client
