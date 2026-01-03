@@ -367,9 +367,9 @@ impl GroupCoordinator {
             KafkaError::Internal(format!("Failed to acquire groups write lock: {}", e))
         })?;
 
-        let group = groups.get_mut(&group_id).ok_or_else(|| {
-            KafkaError::Internal(format!("Unknown group_id: {}", group_id))
-        })?;
+        let group = groups
+            .get_mut(&group_id)
+            .ok_or_else(|| KafkaError::Internal(format!("Unknown group_id: {}", group_id)))?;
 
         // Validate generation ID
         if group.generation_id != generation_id {
@@ -421,19 +421,14 @@ impl GroupCoordinator {
     ///
     /// Updates member's last_heartbeat timestamp.
     /// Returns error if member is unknown or generation mismatches.
-    pub fn heartbeat(
-        &self,
-        group_id: String,
-        member_id: String,
-        generation_id: i32,
-    ) -> Result<()> {
+    pub fn heartbeat(&self, group_id: String, member_id: String, generation_id: i32) -> Result<()> {
         let mut groups = self.groups.write().map_err(|e| {
             KafkaError::Internal(format!("Failed to acquire groups write lock: {}", e))
         })?;
 
-        let group = groups.get_mut(&group_id).ok_or_else(|| {
-            KafkaError::Internal(format!("Unknown group_id: {}", group_id))
-        })?;
+        let group = groups
+            .get_mut(&group_id)
+            .ok_or_else(|| KafkaError::Internal(format!("Unknown group_id: {}", group_id)))?;
 
         // Validate generation ID
         if group.generation_id != generation_id {
@@ -444,9 +439,10 @@ impl GroupCoordinator {
         }
 
         // Validate member ID and update heartbeat
-        let member = group.members.get_mut(&member_id).ok_or_else(|| {
-            KafkaError::Internal(format!("Unknown member_id: {}", member_id))
-        })?;
+        let member = group
+            .members
+            .get_mut(&member_id)
+            .ok_or_else(|| KafkaError::Internal(format!("Unknown member_id: {}", member_id)))?;
 
         member.last_heartbeat = SystemTime::now();
 
@@ -462,15 +458,11 @@ impl GroupCoordinator {
             KafkaError::Internal(format!("Failed to acquire groups write lock: {}", e))
         })?;
 
-        let group = groups.get_mut(&group_id).ok_or_else(|| {
-            KafkaError::Internal(format!("Unknown group_id: {}", group_id))
-        })?;
+        let group = groups
+            .get_mut(&group_id)
+            .ok_or_else(|| KafkaError::Internal(format!("Unknown group_id: {}", group_id)))?;
 
-        pg_log!(
-            "LeaveGroup: group_id={}, member_id={}",
-            group_id,
-            member_id
-        );
+        pg_log!("LeaveGroup: group_id={}, member_id={}", group_id, member_id);
 
         if group.remove_member(&member_id) {
             // Member removed successfully

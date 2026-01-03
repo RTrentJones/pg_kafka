@@ -9,7 +9,7 @@
 
 ---
 
-⚠️ **Status: Phase 2 Complete - Producer Support Functional**
+⚠️ **Status: Phase 3B Complete - Full Producer/Consumer Support**
 
 **Current Implementation:**
 - ✅ **Phase 1 Complete:** TCP listener with Kafka protocol support
@@ -24,9 +24,24 @@
   - ✅ Dual-offset design (partition_offset + global_offset)
   - ✅ SPI integration for database writes
   - ✅ Topic auto-creation
-  - ✅ E2E tests with real Kafka client (rdkafka)
-  - ✅ Automated database verification
+  - ✅ Repository Pattern storage abstraction
   - ✅ CI/CD pipeline with GitHub Actions
+
+- ✅ **Phase 3 Complete:** Consumer support with manual partition assignment
+  - ✅ FetchRequest/Response handling (API key 1)
+  - ✅ ListOffsets support for earliest/latest offsets (API key 2)
+  - ✅ OffsetCommit/OffsetFetch for consumer groups (API keys 8, 9)
+  - ✅ RecordBatch v2 encoding/decoding
+  - ✅ Empty fetch response handling
+
+- ✅ **Phase 3B Complete:** Consumer group coordinator
+  - ✅ FindCoordinator support (API key 10)
+  - ✅ JoinGroup for member registration (API key 11)
+  - ✅ Heartbeat for membership maintenance (API key 12)
+  - ✅ LeaveGroup for graceful departure (API key 13)
+  - ✅ SyncGroup for partition assignment (API key 14)
+  - ✅ Thread-safe in-memory coordinator state
+  - ⚠️ **Limitation:** Manual partition assignment only (no automatic rebalancing yet)
 
 **What Works Now:**
 ```bash
@@ -36,13 +51,22 @@ kcat -L -b localhost:9092
 # Produce messages to database
 echo "key1:value1" | kcat -P -b localhost:9092 -t my-topic -K:
 
+# Consume messages (manual assignment)
+kcat -C -b localhost:9092 -t my-topic -p 0 -o beginning
+
 # Verify in database
-psql -c "SELECT * FROM kafka.messages;"
+psql -c "SELECT * FROM kafka.messages ORDER BY partition_offset;"
+psql -c "SELECT * FROM kafka.consumer_offsets;"
 ```
 
+**API Coverage:** 12 of ~50 standard Kafka APIs (24%)
+- **Implemented:** Produce, Fetch, Metadata, ApiVersions, ListOffsets, OffsetCommit, OffsetFetch, FindCoordinator, JoinGroup, Heartbeat, LeaveGroup, SyncGroup
+- **See:** [docs/KAFKA_PROTOCOL_COVERAGE.md](docs/KAFKA_PROTOCOL_COVERAGE.md) for detailed analysis
+
 **Next Steps:**
-- ⏳ Phase 3: Consumer support (FetchRequest, long polling via LISTEN/NOTIFY)
-- ⏳ Phase 4: Shadow replication (Logical Decoding → external Kafka)
+- ⏳ Phase 4: Automatic partition assignment strategies (Range, RoundRobin)
+- ⏳ Phase 5: Automatic rebalancing and member timeout detection
+- ⏳ Phase 6: Shadow replication (Logical Decoding → external Kafka)
 
 ---
 
@@ -87,9 +111,10 @@ See [docs/architecture/ADR-001-partitioning-and-retention.md](docs/architecture/
 ## 🛠️ Architecture
 
 * **Language:** Rust (via [`pgrx`](https://github.com/pgcentralfoundation/pgrx) 0.16.1)
-* **Protocol:** Kafka v2+ (ApiVersions, Metadata implemented; Produce, Fetch planned)
-* **Storage:** Native Postgres Heap Tables (planned Phase 2)
+* **Protocol:** Kafka v2+ (12 APIs implemented: Produce, Fetch, Metadata, ApiVersions, ListOffsets, OffsetCommit, OffsetFetch, FindCoordinator, JoinGroup, Heartbeat, LeaveGroup, SyncGroup)
+* **Storage:** Repository Pattern with PostgreSQL backend (3 tables: messages, topics, consumer_offsets)
 * **Concurrency:** `tokio` async runtime embedded in Postgres Background Worker
+* **Consumer Groups:** Thread-safe in-memory coordinator with Arc<RwLock>
 
 ### Core Components (Current)
 
@@ -227,18 +252,31 @@ pg_kafka/
 │   │   ├── mod.rs          # Module organization, re-exports
 │   │   ├── listener.rs     # TCP listener, connection handling
 │   │   ├── protocol.rs     # Binary protocol parsing/encoding
-│   │   └── messages.rs     # Request/response types, message queues
+│   │   ├── messages.rs     # Request/response types, message queues
+│   │   ├── handlers.rs     # Request handlers (Produce, Fetch, OffsetCommit, etc.)
+│   │   ├── coordinator.rs  # Consumer group coordinator
+│   │   ├── constants.rs    # Protocol constants and error codes
+│   │   ├── error.rs        # Error types and conversions
+│   │   ├── response_builders.rs  # Response construction helpers
+│   │   └── storage/
+│   │       ├── mod.rs      # Storage abstraction (Repository Pattern)
+│   │       └── postgres.rs # PostgreSQL implementation
 │   └── bin/
 │       └── pgrx_embed.rs   # pgrx embedding binary (generated)
+├── kafka_test/             # E2E test suite with rdkafka client
+├── sql/                    # SQL schema files
+├── docs/                   # Documentation
+│   ├── KAFKA_PROTOCOL_COVERAGE.md
+│   ├── PROTOCOL_DEVIATIONS.md
+│   ├── PHASE_3B_COORDINATOR_DESIGN.md
+│   └── architecture/
 ├── Cargo.toml              # Rust dependencies: pgrx 0.16.1, tokio, kafka-protocol
 ├── rust-toolchain.toml     # Requires nightly for edition2024
+├── restart.sh              # Quick rebuild and restart script
 ├── Dockerfile.dev          # Development container with pgrx + kcat
 ├── docker-compose.yml      # Container orchestration
 ├── .devcontainer/          # VS Code devcontainer config
-├── CLAUDE.md               # Development guide for Claude Code
-├── PROJECT.md              # Detailed design document
-├── STEP4_SUMMARY.md        # Phase 1 completion summary
-└── PHASE_1.5_PLAN.md       # Unit test coverage plan
+└── CLAUDE.md               # Development guide for Claude Code
 ```
 
 ## 🗺️ Implementation Roadmap
@@ -257,8 +295,31 @@ pg_kafka/
   - [x] E2E tests with rdkafka client
   - [x] Automated database verification
   - [x] CI/CD pipeline with GitHub Actions
-- [ ] **Phase 3:** Consumer support (FetchRequest, long polling via LISTEN/NOTIFY)
-- [ ] **Phase 4:** Shadow Mode (Logical Decoding, rdkafka integration, zero-downtime migration)
+  - [x] Repository Pattern storage abstraction
+- [x] **Phase 3:** Consumer support ✅ **COMPLETE**
+  - [x] FetchRequest/Response handling
+  - [x] ListOffsets support (earliest/latest)
+  - [x] OffsetCommit/OffsetFetch for consumer groups
+  - [x] RecordBatch v2 encoding/decoding
+  - [x] Empty fetch response handling
+- [x] **Phase 3B:** Consumer group coordinator ✅ **COMPLETE**
+  - [x] FindCoordinator API
+  - [x] JoinGroup API
+  - [x] Heartbeat API
+  - [x] LeaveGroup API
+  - [x] SyncGroup API
+  - [x] Thread-safe coordinator state
+  - [x] Consumer offsets table
+  - [x] E2E tests with manual partition assignment
+- [ ] **Phase 4:** Automatic partition assignment
+  - [ ] Range assignment strategy
+  - [ ] RoundRobin assignment strategy
+  - [ ] Sticky assignment strategy (KIP-54)
+- [ ] **Phase 5:** Automatic rebalancing
+  - [ ] Trigger rebalance on member join/leave
+  - [ ] Member timeout detection
+  - [ ] Cooperative rebalancing (KIP-429)
+- [ ] **Phase 6:** Shadow Mode (Logical Decoding → external Kafka, zero-downtime migration)
 
 ## 🔧 Configuration
 
@@ -309,15 +370,21 @@ See the [Performance Guide](docs/PERFORMANCE.md) for complete tuning recommendat
 - **[CLAUDE.md](CLAUDE.md)** - Development workflow, commands, architecture overview
 - **[PROJECT.md](PROJECT.md)** - Complete design document with technical details
 - **[.github/SETUP.md](.github/SETUP.md)** - CI/CD pipeline setup guide
+- **[restart.sh](restart.sh)** - Quick rebuild and restart script for development
+
+### Protocol Implementation
+- **[docs/KAFKA_PROTOCOL_COVERAGE.md](docs/KAFKA_PROTOCOL_COVERAGE.md)** - Comprehensive analysis of implemented vs standard Kafka APIs (24% coverage)
+- **[docs/PROTOCOL_DEVIATIONS.md](docs/PROTOCOL_DEVIATIONS.md)** - Intentional Kafka protocol deviations and compatibility notes
+- **[docs/PHASE_3B_COORDINATOR_DESIGN.md](docs/PHASE_3B_COORDINATOR_DESIGN.md)** - Consumer group coordinator design and implementation
+
+### Testing & Quality
+- **[docs/TEST_STRATEGY.md](docs/TEST_STRATEGY.md)** - Test strategy and coverage analysis
+- **[docs/TEST_COVERAGE_ANALYSIS.md](docs/TEST_COVERAGE_ANALYSIS.md)** - Detailed coverage metrics
+- **[docs/REPOSITORY_PATTERN.md](docs/REPOSITORY_PATTERN.md)** - Storage abstraction layer design
 
 ### Performance & Operations
 - **[docs/PERFORMANCE.md](docs/PERFORMANCE.md)** - Performance tuning, benchmarks, and configuration recommendations
-- **[docs/PROTOCOL_DEVIATIONS.md](docs/PROTOCOL_DEVIATIONS.md)** - Intentional Kafka protocol deviations and compatibility notes
 - **[docs/architecture/ADR-001-partitioning-and-retention.md](docs/architecture/ADR-001-partitioning-and-retention.md)** - Partitioning strategy and data retention tradeoffs
-
-### Development History
-- **[STEP4_SUMMARY.md](STEP4_SUMMARY.md)** - Phase 1 implementation summary
-- **[PHASE_1.5_PLAN.md](PHASE_1.5_PLAN.md)** - Unit test coverage plan
 
 ### External References
 - [pgrx Documentation](https://docs.rs/pgrx/latest/pgrx/)

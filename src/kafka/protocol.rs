@@ -469,19 +469,23 @@ pub fn parse_request(
             );
 
             // Use kafka-protocol crate to decode JoinGroupRequest
-            let join_req = match kafka_protocol::messages::join_group_request::JoinGroupRequest::decode(&mut payload_buf, api_version) {
-                Ok(req) => req,
-                Err(e) => {
-                    pg_warning!("Failed to decode JoinGroupRequest: {}", e);
-                    let error_response = KafkaResponse::Error {
-                        correlation_id,
-                        error_code: ERROR_CORRUPT_MESSAGE,
-                        error_message: Some(format!("Malformed JoinGroupRequest: {}", e)),
-                    };
-                    let _ = response_tx.send(error_response);
-                    return Ok(None);
-                }
-            };
+            let join_req =
+                match kafka_protocol::messages::join_group_request::JoinGroupRequest::decode(
+                    &mut payload_buf,
+                    api_version,
+                ) {
+                    Ok(req) => req,
+                    Err(e) => {
+                        pg_warning!("Failed to decode JoinGroupRequest: {}", e);
+                        let error_response = KafkaResponse::Error {
+                            correlation_id,
+                            error_code: ERROR_CORRUPT_MESSAGE,
+                            error_message: Some(format!("Malformed JoinGroupRequest: {}", e)),
+                        };
+                        let _ = response_tx.send(error_response);
+                        return Ok(None);
+                    }
+                };
 
             let group_id = join_req.group_id.to_string();
             let session_timeout_ms = join_req.session_timeout_ms;
@@ -523,19 +527,23 @@ pub fn parse_request(
             );
 
             // Use kafka-protocol crate to decode SyncGroupRequest
-            let sync_req = match kafka_protocol::messages::sync_group_request::SyncGroupRequest::decode(&mut payload_buf, api_version) {
-                Ok(req) => req,
-                Err(e) => {
-                    pg_warning!("Failed to decode SyncGroupRequest: {}", e);
-                    let error_response = KafkaResponse::Error {
-                        correlation_id,
-                        error_code: ERROR_CORRUPT_MESSAGE,
-                        error_message: Some(format!("Malformed SyncGroupRequest: {}", e)),
-                    };
-                    let _ = response_tx.send(error_response);
-                    return Ok(None);
-                }
-            };
+            let sync_req =
+                match kafka_protocol::messages::sync_group_request::SyncGroupRequest::decode(
+                    &mut payload_buf,
+                    api_version,
+                ) {
+                    Ok(req) => req,
+                    Err(e) => {
+                        pg_warning!("Failed to decode SyncGroupRequest: {}", e);
+                        let error_response = KafkaResponse::Error {
+                            correlation_id,
+                            error_code: ERROR_CORRUPT_MESSAGE,
+                            error_message: Some(format!("Malformed SyncGroupRequest: {}", e)),
+                        };
+                        let _ = response_tx.send(error_response);
+                        return Ok(None);
+                    }
+                };
 
             let group_id = sync_req.group_id.to_string();
             let generation_id = sync_req.generation_id;
@@ -577,19 +585,23 @@ pub fn parse_request(
             );
 
             // Use kafka-protocol crate to decode HeartbeatRequest
-            let heartbeat_req = match kafka_protocol::messages::heartbeat_request::HeartbeatRequest::decode(&mut payload_buf, api_version) {
-                Ok(req) => req,
-                Err(e) => {
-                    pg_warning!("Failed to decode HeartbeatRequest: {}", e);
-                    let error_response = KafkaResponse::Error {
-                        correlation_id,
-                        error_code: ERROR_CORRUPT_MESSAGE,
-                        error_message: Some(format!("Malformed HeartbeatRequest: {}", e)),
-                    };
-                    let _ = response_tx.send(error_response);
-                    return Ok(None);
-                }
-            };
+            let heartbeat_req =
+                match kafka_protocol::messages::heartbeat_request::HeartbeatRequest::decode(
+                    &mut payload_buf,
+                    api_version,
+                ) {
+                    Ok(req) => req,
+                    Err(e) => {
+                        pg_warning!("Failed to decode HeartbeatRequest: {}", e);
+                        let error_response = KafkaResponse::Error {
+                            correlation_id,
+                            error_code: ERROR_CORRUPT_MESSAGE,
+                            error_message: Some(format!("Malformed HeartbeatRequest: {}", e)),
+                        };
+                        let _ = response_tx.send(error_response);
+                        return Ok(None);
+                    }
+                };
 
             let group_id = heartbeat_req.group_id.to_string();
             let generation_id = heartbeat_req.generation_id;
@@ -616,19 +628,23 @@ pub fn parse_request(
             );
 
             // Use kafka-protocol crate to decode LeaveGroupRequest
-            let leave_req = match kafka_protocol::messages::leave_group_request::LeaveGroupRequest::decode(&mut payload_buf, api_version) {
-                Ok(req) => req,
-                Err(e) => {
-                    pg_warning!("Failed to decode LeaveGroupRequest: {}", e);
-                    let error_response = KafkaResponse::Error {
-                        correlation_id,
-                        error_code: ERROR_CORRUPT_MESSAGE,
-                        error_message: Some(format!("Malformed LeaveGroupRequest: {}", e)),
-                    };
-                    let _ = response_tx.send(error_response);
-                    return Ok(None);
-                }
-            };
+            let leave_req =
+                match kafka_protocol::messages::leave_group_request::LeaveGroupRequest::decode(
+                    &mut payload_buf,
+                    api_version,
+                ) {
+                    Ok(req) => req,
+                    Err(e) => {
+                        pg_warning!("Failed to decode LeaveGroupRequest: {}", e);
+                        let error_response = KafkaResponse::Error {
+                            correlation_id,
+                            error_code: ERROR_CORRUPT_MESSAGE,
+                            error_message: Some(format!("Malformed LeaveGroupRequest: {}", e)),
+                        };
+                        let _ = response_tx.send(error_response);
+                        return Ok(None);
+                    }
+                };
 
             let group_id = leave_req.group_id.to_string();
             let member_id = leave_req.member_id.to_string();
@@ -662,21 +678,25 @@ pub fn parse_request(
             );
 
             // Use kafka-protocol crate to decode ListOffsetsRequest
-            let list_req = match kafka_protocol::messages::list_offsets_request::ListOffsetsRequest::decode(&mut payload_buf, api_version) {
-                Ok(req) => req,
-                Err(e) => {
-                    pg_warning!("Failed to decode ListOffsetsRequest: {}", e);
-                    let error_response = KafkaResponse::Error {
-                        correlation_id,
-                        error_code: ERROR_CORRUPT_MESSAGE,
-                        error_message: Some(format!("Malformed ListOffsetsRequest: {}", e)),
-                    };
-                    let _ = response_tx.send(error_response);
-                    return Ok(None);
-                }
-            };
+            let list_req =
+                match kafka_protocol::messages::list_offsets_request::ListOffsetsRequest::decode(
+                    &mut payload_buf,
+                    api_version,
+                ) {
+                    Ok(req) => req,
+                    Err(e) => {
+                        pg_warning!("Failed to decode ListOffsetsRequest: {}", e);
+                        let error_response = KafkaResponse::Error {
+                            correlation_id,
+                            error_code: ERROR_CORRUPT_MESSAGE,
+                            error_message: Some(format!("Malformed ListOffsetsRequest: {}", e)),
+                        };
+                        let _ = response_tx.send(error_response);
+                        return Ok(None);
+                    }
+                };
 
-            let replica_id = list_req.replica_id.0;  // Extract i32 from BrokerId
+            let replica_id = list_req.replica_id.0; // Extract i32 from BrokerId
             let isolation_level = list_req.isolation_level;
 
             // Extract topics and partitions

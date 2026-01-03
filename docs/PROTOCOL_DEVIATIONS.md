@@ -4,7 +4,7 @@ This document lists intentional deviations from the official Kafka protocol spec
 
 ## Summary
 
-`pg_kafka` implements a **subset** of the Kafka wire protocol. The following deviations are by design for Phase 2 (Producer Support).
+`pg_kafka` implements a **subset** of the Kafka wire protocol. The following deviations are by design for the current implementation (Phase 3B Complete).
 
 ## Producer API Deviations
 
@@ -20,39 +20,27 @@ This document lists intentional deviations from the official Kafka protocol spec
 - Would require additional async machinery to handle "send but don't wait" semantics
 - Users wanting fire-and-forget should use real Kafka
 
-**Error Response:**
-```rust
-ProduceResponse {
-    error_code: 42, // INVALID_REQUEST
-    error_message: Some("acks=0 not yet supported".to_string()),
-    ...
-}
-```
-
 **Client Impact:**
 - Clients using `acks=0` will receive error responses
 - Workaround: Use `acks=1` (leader acknowledgment) instead
 
-**Implementation:** [src/worker.rs:625-633](../src/worker.rs)
-
 ### 2. Compression Not Supported
 
-**Status:** Not Implemented (Phase 2)
+**Status:** Not Implemented
 **Kafka Behavior:** Supports gzip, snappy, lz4, zstd compression
 **pg_kafka Behavior:** Accepts only uncompressed messages
 
 **Rationale:**
 - Compression adds significant complexity
-- PostgreSQL already has TOAST (Transparent Oversized Storage Technique) for large values
-- Can be added in Phase 3+ if needed
+- PostgreSQL already has TOAST for large values
+- Can be added in future phases if needed
 
 **Client Impact:**
 - Clients must set `compression.type=none`
-- Compressed messages will be rejected with `UNSUPPORTED_COMPRESSION_TYPE`
 
 ### 3. Idempotent Producer Not Supported
 
-**Status:** Not Implemented (Phase 2)
+**Status:** Not Implemented
 **Kafka Behavior:** `enable.idempotence=true` prevents duplicate messages
 **pg_kafka Behavior:** No deduplication mechanism
 
@@ -67,7 +55,7 @@ ProduceResponse {
 
 ### 4. Transactions Not Supported
 
-**Status:** Not Implemented (Phase 2)
+**Status:** Not Implemented
 **Kafka Behavior:** Multi-partition atomic writes via `transactional.id`
 **pg_kafka Behavior:** No transaction coordinator
 
@@ -82,23 +70,96 @@ ProduceResponse {
 
 ## Consumer API Deviations
 
-**Status:** Phase 3 (Not Yet Implemented)
+**Status:** Phase 3B Complete (Partial Implementation)
 
-Consumer support is planned for Phase 3. Expected deviations:
+### 5. Consumer Groups (Partial Support) ✅ Implemented
 
-### 5. Consumer Groups (Partial Support)
+**Status:** Manual partition assignment only
+**Kafka Behavior:** Automatic partition assignment with rebalancing
+**pg_kafka Behavior:** Coordinator exists but no automatic assignment
 
-**Planned:** Simplified consumer group coordination
-**Deviation:** No full rebalance protocol (Join/Sync/Heartbeat/Leave)
+**What Works:**
+- ✅ FindCoordinator API
+- ✅ JoinGroup API (member registration)
+- ✅ Heartbeat API (membership maintenance)
+- ✅ LeaveGroup API (graceful departure)
+- ✅ SyncGroup API (partition assignment distribution)
+- ✅ Thread-safe coordinator state (Arc<RwLock>)
+- ✅ Consumer can manually assign partitions
 
-### 6. Offset Management (Simplified)
+**What's Missing:**
+- ❌ Automatic partition assignment strategies (Range, RoundRobin, Sticky)
+- ❌ Automatic rebalancing on member join/leave
+- ❌ Member timeout detection
+- ❌ Static group membership (KIP-345)
+- ❌ Cooperative rebalancing (KIP-429)
 
-**Planned:** Store offsets in `kafka.consumer_offsets` table
-**Deviation:** No compacted log semantics
+**Client Impact:**
+- Consumers must use manual partition assignment (BaseConsumer with assign())
+- Cannot use `subscribe()` which requires automatic rebalancing
+- Leader must compute partition assignments and distribute via SyncGroup
+
+**Workaround:**
+```rust
+// Instead of automatic subscription:
+// consumer.subscribe(&["my-topic"])?;  // ❌ Won't work
+
+// Use manual partition assignment:
+let mut assignment = TopicPartitionList::new();
+assignment.add_partition_offset("my-topic", 0, Offset::Beginning)?;
+consumer.assign(&assignment)?;  // ✅ Works
+```
+
+### 6. Offset Management ✅ Implemented
+
+**Status:** Fully implemented
+**Kafka Behavior:** Stores offsets in compacted __consumer_offsets topic
+**pg_kafka Behavior:** Stores offsets in `kafka.consumer_offsets` table
+
+**Implementation:**
+- ✅ OffsetCommit API stores offsets in PostgreSQL
+- ✅ OffsetFetch API retrieves committed offsets
+- ✅ Consumer groups can track progress across restarts
+- ✅ Supports offset metadata field
+
+**Difference:**
+- PostgreSQL table instead of Kafka's compacted topic
+- No log compaction (not needed with SQL UPDATE semantics)
+
+### 7. Fetch Request ✅ Implemented
+
+**Status:** Fully implemented
+**Kafka Behavior:** Returns RecordBatch format messages
+**pg_kafka Behavior:** Same, with limitations
+
+**What Works:**
+- ✅ FetchRequest/Response handling
+- ✅ RecordBatch v2 encoding
+- ✅ Empty fetch responses (returns empty bytes)
+- ✅ Partition watermarks (high watermark, log start offset)
+
+**What's Missing:**
+- ❌ Long polling optimization (no LISTEN/NOTIFY yet)
+- ❌ Fetch sessions (always uses fetch session ID 0)
+
+**Client Impact:**
+- Works with standard Kafka clients
+- May have higher CPU usage due to polling
+
+### 8. ListOffsets ✅ Implemented
+
+**Status:** Fully implemented for special timestamps
+**Kafka Behavior:** Returns offsets by timestamp or special values
+**pg_kafka Behavior:** Supports earliest (-2) and latest (-1) only
+
+**Implementation:**
+- ✅ Returns earliest offset (first message in partition)
+- ✅ Returns latest offset (high watermark)
+- ❌ Timestamp-based lookup not implemented (returns UNSUPPORTED_VERSION)
 
 ## Metadata API Deviations
 
-### 7. Single Broker Only
+### 9. Single Broker Only
 
 **Status:** By Design
 **Kafka Behavior:** Returns list of all brokers in cluster
@@ -106,102 +167,57 @@ Consumer support is planned for Phase 3. Expected deviations:
 
 **Rationale:**
 - `pg_kafka` is a single-node "broker" backed by PostgreSQL
-- No clustering/replication at the Kafka protocol level
 - High availability comes from PostgreSQL HA (Patroni, RDS Multi-AZ, etc.)
 
-**Client Impact:**
-- Metadata response always shows 1 broker
-- Clients cannot fail over to other brokers (use PostgreSQL HA instead)
+### 10. Dynamic Topic Creation
 
-### 8. Dynamic Topic Creation
-
-**Status:** Supported (Differs from Kafka default)
-**Kafka Behavior:** `auto.create.topics.enable` defaults to `false` in modern Kafka
-**pg_kafka Behavior:** Topics auto-created on first produce (always enabled)
-
-**Rationale:**
-- Simplifies development workflow
-- Aligns with PostgreSQL's "create if not exists" patterns
-- Can be disabled in future via GUC parameter if needed
+**Status:** Always enabled
+**Kafka Behavior:** `auto.create.topics.enable` defaults to `false`
+**pg_kafka Behavior:** Topics auto-created on first produce
 
 **Client Impact:**
 - Typos in topic names create unwanted topics
-- Consider implementing `pg_kafka.auto_create_topics` GUC in Phase 3
+
+### 11. Single Partition Per Topic (Current Limitation)
+
+**Status:** Current implementation
+**Kafka Behavior:** Supports multiple partitions per topic
+**pg_kafka Behavior:** Fixed at 1 partition per topic
+
+**Rationale:**
+- Simplifies Phase 3 implementation
+- Schema supports multiple partitions
+- Can be enabled in Phase 4
 
 ## API Version Support
 
-### Supported APIs
+### Supported APIs (12 total)
 
-| API Key | Name | Versions Supported |
-|---------|------|-------------------|
-| 0 | Produce | 0-9 |
-| 3 | Metadata | 0-12 |
-| 18 | ApiVersions | 0-3 |
+| API Key | Name | Versions | Status |
+|---------|------|----------|--------|
+| 0 | Produce | 3-9 | ✅ Full support |
+| 1 | Fetch | 0-13 | ✅ Full support |
+| 2 | ListOffsets | 0-7 | ✅ Partial (special offsets only) |
+| 3 | Metadata | 0-9 | ✅ Full support |
+| 8 | OffsetCommit | 0-8 | ✅ Full support |
+| 9 | OffsetFetch | 0-7 | ✅ Full support |
+| 10 | FindCoordinator | 0-3 | ✅ Full support |
+| 11 | JoinGroup | 0-7 | ✅ Full support |
+| 12 | Heartbeat | 0-4 | ✅ Full support |
+| 13 | LeaveGroup | 0-4 | ✅ Full support |
+| 14 | SyncGroup | 0-4 | ✅ Full support |
+| 18 | ApiVersions | 0-3 | ✅ Full support |
 
-### Unsupported APIs
+**Note:** OffsetFetch v8+ uses different response format. We support v0-7.
 
-All other Kafka APIs return `UNSUPPORTED_VERSION` or are not advertised in `ApiVersions` response.
+### Notable Missing APIs
 
-**Notable Missing APIs (Phase 2):**
-- Fetch (API key 1) - Planned for Phase 3
-- ListOffsets (API key 2) - Planned for Phase 3
-- OffsetCommit (API key 8) - Planned for Phase 3
-- OffsetFetch (API key 9) - Planned for Phase 3
-- FindCoordinator (API key 10) - May not implement
-- JoinGroup (API key 11) - Simplified in Phase 3
-- Heartbeat (API key 12) - Simplified in Phase 3
-- LeaveGroup (API key 13) - Simplified in Phase 3
-- SyncGroup (API key 14) - Simplified in Phase 3
-
-## Performance Deviations
-
-### 9. No Zero-Copy Transfers
-
-**Status:** By Design
-**Kafka Behavior:** Uses sendfile() for zero-copy data transfer
-**pg_kafka Behavior:** Data is copied from PostgreSQL → Rust → Network
-
-**Rationale:**
-- PostgreSQL SPI requires copying data into Rust memory
-- Zero-copy would require direct access to PostgreSQL shared buffers (unsafe)
-
-**Impact:** ~10-20% higher CPU usage compared to optimized Kafka
-
-### 10. No Log Segments
-
-**Status:** By Design
-**Kafka Behavior:** Data stored in immutable log segments on disk
-**pg_kafka Behavior:** Data stored in PostgreSQL heap tables
-
-**Rationale:**
-- PostgreSQL's storage engine handles all persistence
-- Partitioning strategy (Phase 3) provides similar segment-like behavior
-
-**Impact:**
-- Different performance characteristics (PostgreSQL B-tree vs Kafka append-only log)
-- Better random access, worse sequential throughput compared to Kafka
-
-## Security Deviations
-
-### 11. No SASL/SSL Support (Phase 2)
-
-**Status:** Not Implemented
-**Kafka Behavior:** Supports SASL (PLAIN, SCRAM, GSSAPI, OAUTHBEARER) and SSL/TLS
-**pg_kafka Behavior:** No authentication/encryption at Kafka protocol level
-
-**Rationale:**
-- Security should be handled at PostgreSQL level (pg_hba.conf, SSL)
-- Kafka protocol security adds complexity
-- Can be added in Phase 4 if needed
-
-**Client Impact:**
-- Use PostgreSQL's native authentication instead
-- Network encryption via PostgreSQL SSL/TLS
-
-**Workaround:**
-- Bind to `127.0.0.1` (localhost only) for development
-- Use PostgreSQL's SSL for encryption
-- Use firewall rules to restrict access to port 9092
+- DescribeGroups (API 15) - Planned for Phase 4
+- ListGroups (API 16) - Planned for Phase 4
+- CreateTopics (API 19) - May be added
+- DeleteTopics (API 20) - May be added
+- Transaction APIs (22-26) - Not planned
+- Admin/Security APIs - Not planned
 
 ## Compatibility Testing
 
@@ -209,58 +225,46 @@ All other Kafka APIs return `UNSUPPORTED_VERSION` or are not advertised in `ApiV
 
 | Client | Version | Status | Notes |
 |--------|---------|--------|-------|
-| kcat | 1.7.0+ | ✅ Works | Requires `acks=1` |
-| rdkafka (Rust) | 0.36+ | ✅ Works | E2E test suite |
-| kafka-python | TBD | ⏳ Untested | Should work with limitations |
-| confluent-kafka (Python) | TBD | ⏳ Untested | Should work with limitations |
-| KafkaJS | TBD | ⏳ Untested | Should work with limitations |
-| Java Producer | TBD | ⏳ Untested | Should work with limitations |
+| kcat | 1.7.0+ | ✅ Works | Producer and consumer tested |
+| rdkafka (Rust) | 0.36+ | ✅ Works | Full E2E test suite (5 scenarios) |
 
 ### Client Configuration
-
-To use pg_kafka with standard Kafka clients:
 
 ```properties
 # Producer settings
 bootstrap.servers=localhost:9092
-acks=1  # REQUIRED: acks=0 not supported
-compression.type=none  # REQUIRED: compression not supported
-enable.idempotence=false  # REQUIRED: not supported
-transactional.id=  # MUST be unset (transactions not supported)
+acks=1  # REQUIRED
+compression.type=none  # REQUIRED
+enable.idempotence=false  # REQUIRED
 
-# Retry settings (optional but recommended)
-retries=3
-max.in.flight.requests.per.connection=1  # For ordering guarantees
+# Consumer settings
+bootstrap.servers=localhost:9092
+group.id=my-consumer-group
+enable.auto.commit=false  # Manual commits recommended
+auto.offset.reset=earliest
 ```
 
 ## Future Work
 
-### Planned Improvements (Phase 3+)
+### Planned (Phase 4-6)
 
-1. **FetchRequest Support** - Enable consumer functionality
-2. **Long Polling** - Use PostgreSQL `LISTEN/NOTIFY` for efficient polling
-3. **Table Partitioning** - Time-based partitioning for retention management
-4. **Consumer Group Coordination** - Simplified version using PostgreSQL tables
+1. Automatic partition assignment strategies
+2. Automatic rebalancing
+3. Long polling (LISTEN/NOTIFY)
+4. Table partitioning
+5. DescribeGroups/ListGroups APIs
+6. Multi-partition topics
 
 ### May Not Implement
 
-1. **Log Compaction** - PostgreSQL doesn't have log-structured storage
-2. **Exactly-Once Semantics** - Requires idempotent producer + transactions
-3. **Replication Protocol** - Use PostgreSQL replication instead
-4. **Quotas** - Use PostgreSQL resource limits instead
-
-## Reporting Issues
-
-If you encounter unexpected behavior not documented here, please report:
-
-1. Client library and version
-2. Configuration settings
-3. Expected vs actual behavior
-4. Error messages from `pg_kafka` logs
-
-**Note:** Behavior not listed in this document should match standard Kafka protocol specification. If it doesn't, that's a bug!
+1. Log compaction
+2. Exactly-once semantics
+3. Replication protocol
+4. Quotas
+5. SASL authentication
 
 ---
 
-**Last Updated:** 2026-01-02
-**Applies To:** pg_kafka Phase 2 (Producer Support)
+**Last Updated:** 2026-01-03
+**Applies To:** pg_kafka Phase 3B Complete
+**API Coverage:** 12 of ~50 Kafka APIs (24%)

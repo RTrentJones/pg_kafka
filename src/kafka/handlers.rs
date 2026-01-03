@@ -553,11 +553,7 @@ pub fn handle_find_coordinator(
 ) -> Result<kafka_protocol::messages::find_coordinator_response::FindCoordinatorResponse> {
     use kafka_protocol::messages::find_coordinator_response::FindCoordinatorResponse;
 
-    pgrx::debug1!(
-        "FindCoordinator: key={}, key_type={}",
-        key,
-        key_type
-    );
+    pgrx::debug1!("FindCoordinator: key={}, key_type={}", key, key_type);
 
     // Build response - we are always the coordinator for all groups
     let mut response = FindCoordinatorResponse::default();
@@ -641,9 +637,7 @@ pub fn handle_join_group(
     response.error_code = ERROR_NONE;
     response.generation_id = generation_id;
     response.protocol_type = Some(protocol_type.into());
-    response.protocol_name = coord_protocols
-        .first()
-        .map(|(name, _)| name.clone().into());
+    response.protocol_name = coord_protocols.first().map(|(name, _)| name.clone().into());
     response.leader = assigned_member_id.clone().into();
     response.member_id = assigned_member_id.into();
 
@@ -691,12 +685,7 @@ pub fn handle_sync_group(
 
     // Sync group via coordinator
     let assignment = coordinator
-        .sync_group(
-            group_id,
-            member_id,
-            generation_id,
-            coord_assignments,
-        )
+        .sync_group(group_id, member_id, generation_id, coord_assignments)
         .map_err(|e| match e {
             KafkaError::Internal(msg) if msg.contains("Unknown member_id") => {
                 KafkaError::CoordinatorError(ERROR_UNKNOWN_MEMBER_ID, msg)
@@ -769,11 +758,7 @@ pub fn handle_leave_group(
 ) -> Result<kafka_protocol::messages::leave_group_response::LeaveGroupResponse> {
     use kafka_protocol::messages::leave_group_response::LeaveGroupResponse;
 
-    pgrx::debug1!(
-        "LeaveGroup: group_id={}, member_id={}",
-        group_id,
-        member_id
-    );
+    pgrx::debug1!("LeaveGroup: group_id={}, member_id={}", group_id, member_id);
 
     // Leave group via coordinator
     coordinator

@@ -6,20 +6,31 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `pg_kafka` is a PostgreSQL extension written in Rust (via pgrx) that embeds a Kafka-compatible wire protocol listener directly into the Postgres runtime. It allows standard Kafka clients to produce and consume messages using Postgres as the backing store.
 
-**Status:** Phase 2 Complete - Producer Support Functional (Portfolio/Learning Project)
+**Status:** Phase 3B Complete - Full Producer/Consumer Support (Portfolio/Learning Project)
 
 **Current Implementation:**
 - ✅ **Phase 1 Complete:** Metadata support (ApiVersions, Metadata requests)
-- ✅ **Phase 2 Complete:** Producer support (ProduceRequest, database storage, E2E tests)
+- ✅ **Phase 2 Complete:** Producer support (ProduceRequest, database storage, E2E tests, Repository Pattern)
+- ✅ **Phase 3 Complete:** Consumer support (FetchRequest, ListOffsets, OffsetCommit/Fetch)
+- ✅ **Phase 3B Complete:** Consumer group coordinator (FindCoordinator, JoinGroup, Heartbeat, LeaveGroup, SyncGroup)
 - ✅ **CI/CD:** GitHub Actions pipeline with automated testing
-- ⏳ **Phase 3:** Consumer support (FetchRequest, long polling)
-- ⏳ **Phase 4:** Shadow Mode (Logical Decoding → external Kafka)
+- ⏳ **Phase 4:** Automatic partition assignment strategies
+- ⏳ **Phase 5:** Automatic rebalancing
+- ⏳ **Phase 6:** Shadow Mode (Logical Decoding → external Kafka)
 
 **What Works Now:**
 - TCP listener on port 9092 with full Kafka wire protocol parsing
 - ProduceRequest handling with database persistence
+- FetchRequest with RecordBatch v2 encoding/decoding
+- Consumer group coordinator with manual partition assignment
+- OffsetCommit/OffsetFetch for consumer progress tracking
+- ListOffsets for earliest/latest offset queries
 - Dual-offset design (partition_offset + global_offset)
-- Automated E2E tests with real Kafka client (rdkafka)
+- Repository Pattern storage abstraction (KafkaStore trait + PostgresStore impl)
+- Automated E2E tests with real Kafka client (rdkafka) - 5 test scenarios passing
+
+**API Coverage:** 12 of ~50 standard Kafka APIs (24%)
+**Test Status:** All E2E tests passing ✅
 
 ## Development Setup
 
@@ -90,31 +101,39 @@ src/
 ├── kafka/
 │   ├── mod.rs          # Module organization, re-exports
 │   ├── listener.rs     # TCP listener, tokio runtime, connection handling
-│   ├── protocol.rs     # Binary protocol parsing (uses kafka-protocol crate)
-│   ├── messages.rs     # Request/response types, message queue
+│   ├── protocol.rs     # Binary protocol parsing/encoding (uses kafka-protocol crate)
+│   ├── messages.rs     # Request/response types, message queues
+│   ├── handlers.rs     # Request handlers (Produce, Fetch, OffsetCommit, etc.)
+│   ├── coordinator.rs  # Consumer group coordinator (Arc<RwLock> shared state)
 │   ├── response_builders.rs  # Response construction helpers
-│   ├── constants.rs    # Protocol constants
-│   └── error.rs        # Error types
-├── testing/
-│   ├── mod.rs          # Test infrastructure
-│   ├── mocks.rs        # Mock implementations for testing
-│   └── helpers.rs      # Test helper functions
+│   ├── constants.rs    # Protocol constants and error codes
+│   ├── error.rs        # Error types (KafkaError with anyhow conversion)
+│   └── storage/
+│       ├── mod.rs      # Storage abstraction layer (Repository Pattern)
+│       └── postgres.rs # PostgreSQL implementation (PostgresStore)
 └── bin/
     └── pgrx_embed.rs   # pgrx embedding binary (generated)
 
-tests/                  # pgrx integration tests
-kafka_test/             # E2E test binary using rdkafka client
+tests/                  # pgrx integration tests (limited due to PGC_POSTMASTER)
+kafka_test/             # E2E test suite using rdkafka client
     └── src/
-        └── main.rs     # Automated E2E test with database verification
+        └── main.rs     # Automated E2E tests (5 scenarios, all passing)
 
 sql/
-├── pg_kafka--0.0.0.sql # Schema definition (kafka.messages, kafka.topics)
+├── pg_kafka--0.0.0.sql # Schema definition (kafka.messages, kafka.topics, kafka.consumer_offsets)
 └── tune_autovacuum.sql # Optional performance tuning script
 
 docs/
-├── PERFORMANCE.md      # Performance guide and benchmarks
+├── KAFKA_PROTOCOL_COVERAGE.md  # Comprehensive API coverage analysis
+├── PROTOCOL_DEVIATIONS.md      # Intentional deviations from Kafka spec
+├── PHASE_3B_COORDINATOR_DESIGN.md  # Consumer group coordinator design
+├── TEST_STRATEGY.md            # Test approach and coverage
+├── REPOSITORY_PATTERN.md       # Storage abstraction design
+├── PERFORMANCE.md              # Performance guide and benchmarks
 └── architecture/
     └── ADR-001-partitioning-and-retention.md  # Design decisions
+
+restart.sh              # Quick rebuild and restart script for development
 
 .github/
 ├── workflows/
@@ -122,19 +141,23 @@ docs/
 └── SETUP.md            # CI/CD setup guide
 ```
 
-**Implemented (Phase 1-2):**
-- ✅ Kafka wire protocol parser using kafka-protocol crate
+**Implemented (Phase 1-3B):**
+- ✅ Kafka wire protocol parser using kafka-protocol crate v0.17
 - ✅ Background worker with TCP listener on port 9092
-- ✅ Storage schema with dual-offset design
+- ✅ Storage schema with dual-offset design (3 tables)
+- ✅ Repository Pattern storage abstraction (KafkaStore trait)
 - ✅ SPI integration for database operations
-- ✅ Request handlers: ApiVersions, Metadata, Produce
-- ✅ E2E tests with automated database verification
+- ✅ Request handlers: ApiVersions, Metadata, Produce, Fetch, ListOffsets, OffsetCommit, OffsetFetch, FindCoordinator, JoinGroup, Heartbeat, LeaveGroup, SyncGroup
+- ✅ Consumer group coordinator with thread-safe state management
+- ✅ RecordBatch v2 encoding/decoding
+- ✅ E2E tests with automated database verification (5 scenarios)
 - ✅ CI/CD pipeline with GitHub Actions
 
-**Planned (Phase 3-4):**
-- ⏳ Fetch request handler (Consumer support)
-- ⏳ Long polling via LISTEN/NOTIFY
-- ⏳ Consumer group management
+**Planned (Phase 4-6):**
+- ⏳ Automatic partition assignment strategies (Range, RoundRobin, Sticky)
+- ⏳ Automatic rebalancing on member join/leave
+- ⏳ Member timeout detection
+- ⏳ Long polling via LISTEN/NOTIFY (optional optimization)
 - ⏳ Shadow replication worker using Logical Decoding
 - ⏳ Table partitioning and retention policies
 
@@ -183,12 +206,15 @@ CREATE TABLE kafka.topics (
     partitions INT DEFAULT 1
 );
 
--- Partition state tracking (for offset computation)
-CREATE TABLE kafka.partition_state (
+-- Consumer group offset tracking (Phase 3)
+CREATE TABLE kafka.consumer_offsets (
+    group_id TEXT NOT NULL,
     topic_id INT NOT NULL,
     partition_id INT NOT NULL,
-    next_offset BIGINT NOT NULL DEFAULT 0,
-    PRIMARY KEY (topic_id, partition_id),
+    committed_offset BIGINT NOT NULL,
+    metadata TEXT,
+    commit_timestamp TIMESTAMP NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (group_id, topic_id, partition_id),
     FOREIGN KEY (topic_id) REFERENCES kafka.topics(id) ON DELETE CASCADE
 );
 ```
