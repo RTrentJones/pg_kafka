@@ -58,6 +58,20 @@ docker-compose up -d
 docker exec -it pg_kafka_dev bash
 ```
 
+### Git Hooks Setup (Required for Contributors)
+
+**Important:** Install git hooks to enforce code quality before commits:
+
+```bash
+./hooks/install.sh
+```
+
+This installs a pre-commit hook that runs:
+- `cargo fmt --check` - Ensures code formatting
+- `cargo clippy --features pg14 -- -D warnings` - Ensures no linting warnings
+
+See [hooks/README.md](hooks/README.md) for more details.
+
 ### Key Commands
 
 Once inside the container:
