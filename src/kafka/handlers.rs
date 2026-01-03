@@ -573,6 +573,7 @@ pub fn handle_find_coordinator(
 /// - Generation ID
 /// - Leader status
 /// - Member list (if leader)
+#[allow(clippy::too_many_arguments)]
 pub fn handle_join_group(
     coordinator: &crate::kafka::GroupCoordinator,
     group_id: String,
@@ -948,16 +949,14 @@ pub fn handle_describe_groups(
                         .map(|m| m.protocol_type.clone())
                         .unwrap_or_else(|| "consumer".to_string()),
                 );
-                described_group.protocol_data = StrBytes::from_string(
-                    group.protocol_name.clone().unwrap_or_default(),
-                );
+                described_group.protocol_data =
+                    StrBytes::from_string(group.protocol_name.clone().unwrap_or_default());
 
                 // Add member information
                 for member in group.members.values() {
                     let mut described_member = DescribedGroupMember::default();
                     described_member.member_id = StrBytes::from_string(member.member_id.clone());
-                    described_member.client_id =
-                        StrBytes::from_string(member.client_id.clone());
+                    described_member.client_id = StrBytes::from_string(member.client_id.clone());
                     described_member.client_host =
                         StrBytes::from_string(member.client_host.clone());
 

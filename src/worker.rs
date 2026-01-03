@@ -599,7 +599,7 @@ pub fn process_request(
             ..
         } => {
             let kafka_response = match crate::kafka::handlers::handle_join_group(
-                &coordinator,
+                coordinator,
                 group_id,
                 member_id,
                 client_id.unwrap_or_else(|| "unknown".to_string()),
@@ -646,7 +646,7 @@ pub fn process_request(
             ..
         } => {
             let kafka_response = match crate::kafka::handlers::handle_sync_group(
-                &coordinator,
+                coordinator,
                 group_id,
                 member_id,
                 generation_id,
@@ -689,7 +689,7 @@ pub fn process_request(
             ..
         } => {
             let kafka_response = match crate::kafka::handlers::handle_heartbeat(
-                &coordinator,
+                coordinator,
                 group_id,
                 member_id,
                 generation_id,
@@ -729,26 +729,25 @@ pub fn process_request(
             response_tx,
             ..
         } => {
-            let kafka_response =
-                match crate::kafka::handlers::handle_leave_group(&coordinator, group_id, member_id)
-                {
-                    Ok(response) => response,
-                    Err(e) => {
-                        pg_warning!("Failed to handle LeaveGroup request: {}", e);
-                        let error_response = KafkaResponse::Error {
-                            correlation_id,
-                            error_code: crate::kafka::ERROR_UNKNOWN_SERVER_ERROR,
-                            error_message: Some(format!(
-                                "Failed to handle LeaveGroup request: {}",
-                                e
-                            )),
-                        };
-                        if let Err(e) = response_tx.send(error_response) {
-                            pg_warning!("Failed to send error response: {}", e);
-                        }
-                        return;
+            let kafka_response = match crate::kafka::handlers::handle_leave_group(
+                coordinator,
+                group_id,
+                member_id,
+            ) {
+                Ok(response) => response,
+                Err(e) => {
+                    pg_warning!("Failed to handle LeaveGroup request: {}", e);
+                    let error_response = KafkaResponse::Error {
+                        correlation_id,
+                        error_code: crate::kafka::ERROR_UNKNOWN_SERVER_ERROR,
+                        error_message: Some(format!("Failed to handle LeaveGroup request: {}", e)),
+                    };
+                    if let Err(e) = response_tx.send(error_response) {
+                        pg_warning!("Failed to send error response: {}", e);
                     }
-                };
+                    return;
+                }
+            };
 
             let response = KafkaResponse::LeaveGroup {
                 correlation_id,
@@ -819,21 +818,25 @@ pub fn process_request(
                 groups.len()
             );
 
-            let kafka_response = match crate::kafka::handlers::handle_describe_groups(&coordinator, groups) {
-                Ok(response) => response,
-                Err(e) => {
-                    pg_warning!("Failed to handle DescribeGroups request: {}", e);
-                    let error_response = KafkaResponse::Error {
-                        correlation_id,
-                        error_code: crate::kafka::ERROR_UNKNOWN_SERVER_ERROR,
-                        error_message: Some(format!("Failed to handle DescribeGroups request: {}", e)),
-                    };
-                    if let Err(e) = response_tx.send(error_response) {
-                        pg_warning!("Failed to send error response: {}", e);
+            let kafka_response =
+                match crate::kafka::handlers::handle_describe_groups(coordinator, groups) {
+                    Ok(response) => response,
+                    Err(e) => {
+                        pg_warning!("Failed to handle DescribeGroups request: {}", e);
+                        let error_response = KafkaResponse::Error {
+                            correlation_id,
+                            error_code: crate::kafka::ERROR_UNKNOWN_SERVER_ERROR,
+                            error_message: Some(format!(
+                                "Failed to handle DescribeGroups request: {}",
+                                e
+                            )),
+                        };
+                        if let Err(e) = response_tx.send(error_response) {
+                            pg_warning!("Failed to send error response: {}", e);
+                        }
+                        return;
                     }
-                    return;
-                }
-            };
+                };
 
             let response = KafkaResponse::DescribeGroups {
                 correlation_id,
@@ -860,21 +863,25 @@ pub fn process_request(
                 states_filter.len()
             );
 
-            let kafka_response = match crate::kafka::handlers::handle_list_groups(&coordinator, states_filter) {
-                Ok(response) => response,
-                Err(e) => {
-                    pg_warning!("Failed to handle ListGroups request: {}", e);
-                    let error_response = KafkaResponse::Error {
-                        correlation_id,
-                        error_code: crate::kafka::ERROR_UNKNOWN_SERVER_ERROR,
-                        error_message: Some(format!("Failed to handle ListGroups request: {}", e)),
-                    };
-                    if let Err(e) = response_tx.send(error_response) {
-                        pg_warning!("Failed to send error response: {}", e);
+            let kafka_response =
+                match crate::kafka::handlers::handle_list_groups(coordinator, states_filter) {
+                    Ok(response) => response,
+                    Err(e) => {
+                        pg_warning!("Failed to handle ListGroups request: {}", e);
+                        let error_response = KafkaResponse::Error {
+                            correlation_id,
+                            error_code: crate::kafka::ERROR_UNKNOWN_SERVER_ERROR,
+                            error_message: Some(format!(
+                                "Failed to handle ListGroups request: {}",
+                                e
+                            )),
+                        };
+                        if let Err(e) = response_tx.send(error_response) {
+                            pg_warning!("Failed to send error response: {}", e);
+                        }
+                        return;
                     }
-                    return;
-                }
-            };
+                };
 
             let response = KafkaResponse::ListGroups {
                 correlation_id,

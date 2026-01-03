@@ -141,6 +141,7 @@ impl ConsumerGroup {
 
     /// Add a member to the group
     /// Returns (member_id, is_leader)
+    #[allow(clippy::too_many_arguments)]
     fn add_member(
         &mut self,
         member_id: String,
@@ -253,6 +254,8 @@ impl GroupCoordinator {
     /// Handle JoinGroup request
     ///
     /// Returns (member_id, generation_id, is_leader, members_for_leader)
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::type_complexity)]
     pub fn join_group(
         &self,
         group_id: String,
