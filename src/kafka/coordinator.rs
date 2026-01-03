@@ -239,7 +239,7 @@ impl ConsumerGroup {
 /// Uses RwLock for thread-safe access (readers can proceed in parallel, writers get exclusive access).
 pub struct GroupCoordinator {
     /// Consumer groups by group_id
-    groups: Arc<RwLock<HashMap<String, ConsumerGroup>>>,
+    pub groups: Arc<RwLock<HashMap<String, ConsumerGroup>>>,
 }
 
 impl GroupCoordinator {

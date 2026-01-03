@@ -904,3 +904,158 @@ pub fn handle_list_offsets(
 
     Ok(kafka_response)
 }
+
+/// Handle DescribeGroups request
+///
+/// Returns detailed information about consumer groups including members and state.
+/// This is critical for debugging consumer group issues and monitoring group health.
+pub fn handle_describe_groups(
+    coordinator: &super::GroupCoordinator,
+    groups: Vec<String>,
+) -> Result<kafka_protocol::messages::describe_groups_response::DescribeGroupsResponse> {
+    use kafka_protocol::messages::describe_groups_response::{
+        DescribeGroupsResponse, DescribedGroup, DescribedGroupMember,
+    };
+    use kafka_protocol::messages::GroupId;
+    use kafka_protocol::protocol::StrBytes;
+
+    let mut response = DescribeGroupsResponse::default();
+    response.throttle_time_ms = 0;
+
+    // Get coordinator state
+    let coordinator_groups = coordinator.groups.read().unwrap();
+
+    for group_id in groups {
+        let mut described_group = DescribedGroup::default();
+        described_group.group_id = GroupId(StrBytes::from_string(group_id.clone()));
+
+        match coordinator_groups.get(&group_id) {
+            Some(group) => {
+                // Group exists - return detailed information
+                described_group.error_code = ERROR_NONE;
+                described_group.group_state = StrBytes::from_string(match group.state {
+                    super::GroupState::Empty => "Empty".to_string(),
+                    super::GroupState::PreparingRebalance => "PreparingRebalance".to_string(),
+                    super::GroupState::CompletingRebalance => "CompletingRebalance".to_string(),
+                    super::GroupState::Stable => "Stable".to_string(),
+                    super::GroupState::Dead => "Dead".to_string(),
+                });
+                described_group.protocol_type = StrBytes::from_string(
+                    group
+                        .members
+                        .values()
+                        .next()
+                        .map(|m| m.protocol_type.clone())
+                        .unwrap_or_else(|| "consumer".to_string()),
+                );
+                described_group.protocol_data = StrBytes::from_string(
+                    group.protocol_name.clone().unwrap_or_default(),
+                );
+
+                // Add member information
+                for member in group.members.values() {
+                    let mut described_member = DescribedGroupMember::default();
+                    described_member.member_id = StrBytes::from_string(member.member_id.clone());
+                    described_member.client_id =
+                        StrBytes::from_string(member.client_id.clone());
+                    described_member.client_host =
+                        StrBytes::from_string(member.client_host.clone());
+
+                    // Member metadata (protocol subscription information)
+                    // For now, we just store the first protocol's metadata
+                    if let Some((_, metadata)) = member.protocols.first() {
+                        described_member.member_metadata = metadata.clone().into();
+                    }
+
+                    // Member assignment
+                    if let Some(assignment) = &member.assignment {
+                        described_member.member_assignment = assignment.clone().into();
+                    }
+
+                    // Static group instance ID (KIP-345)
+                    if let Some(instance_id) = &member.group_instance_id {
+                        described_member.group_instance_id =
+                            Some(StrBytes::from_string(instance_id.clone()));
+                    }
+
+                    described_group.members.push(described_member);
+                }
+            }
+            None => {
+                // Group doesn't exist - return error
+                described_group.error_code = ERROR_UNKNOWN_SERVER_ERROR;
+                described_group.group_state = StrBytes::from_string("Dead".to_string());
+                described_group.protocol_type = StrBytes::from_string("".to_string());
+                described_group.protocol_data = StrBytes::from_string("".to_string());
+            }
+        }
+
+        response.groups.push(described_group);
+    }
+
+    Ok(response)
+}
+
+/// Handle ListGroups request
+///
+/// Returns a list of all consumer groups currently known to the coordinator.
+/// This is useful for discovery, administration, and monitoring.
+pub fn handle_list_groups(
+    coordinator: &super::GroupCoordinator,
+    states_filter: Vec<String>,
+) -> Result<kafka_protocol::messages::list_groups_response::ListGroupsResponse> {
+    use kafka_protocol::messages::list_groups_response::{ListGroupsResponse, ListedGroup};
+    use kafka_protocol::messages::GroupId;
+    use kafka_protocol::protocol::StrBytes;
+
+    let mut response = ListGroupsResponse::default();
+    response.error_code = ERROR_NONE;
+    response.throttle_time_ms = 0;
+
+    // Get coordinator state
+    let coordinator_groups = coordinator.groups.read().unwrap();
+
+    // Filter groups by state if requested (v4+)
+    let filter_enabled = !states_filter.is_empty();
+
+    for (group_id, group) in coordinator_groups.iter() {
+        // Apply state filter if provided
+        if filter_enabled {
+            let state_str = match group.state {
+                super::GroupState::Empty => "Empty",
+                super::GroupState::PreparingRebalance => "PreparingRebalance",
+                super::GroupState::CompletingRebalance => "CompletingRebalance",
+                super::GroupState::Stable => "Stable",
+                super::GroupState::Dead => "Dead",
+            };
+
+            if !states_filter.contains(&state_str.to_string()) {
+                continue;
+            }
+        }
+
+        let mut listed_group = ListedGroup::default();
+        listed_group.group_id = GroupId(StrBytes::from_string(group_id.clone()));
+        listed_group.protocol_type = StrBytes::from_string(
+            group
+                .members
+                .values()
+                .next()
+                .map(|m| m.protocol_type.clone())
+                .unwrap_or_else(|| "consumer".to_string()),
+        );
+
+        // Add group state (v4+)
+        listed_group.group_state = StrBytes::from_string(match group.state {
+            super::GroupState::Empty => "Empty".to_string(),
+            super::GroupState::PreparingRebalance => "PreparingRebalance".to_string(),
+            super::GroupState::CompletingRebalance => "CompletingRebalance".to_string(),
+            super::GroupState::Stable => "Stable".to_string(),
+            super::GroupState::Dead => "Dead".to_string(),
+        });
+
+        response.groups.push(listed_group);
+    }
+
+    Ok(response)
+}

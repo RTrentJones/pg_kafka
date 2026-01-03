@@ -229,6 +229,34 @@ pub enum KafkaRequest {
         /// Channel to send the response back to the specific connection
         response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
     },
+    /// DescribeGroups request - get consumer group state and members
+    DescribeGroups {
+        /// Correlation ID from client - MUST be echoed back in response
+        correlation_id: i32,
+        /// Optional client identifier string
+        client_id: Option<String>,
+        /// API version from the request (needed for response encoding)
+        api_version: i16,
+        /// List of group IDs to describe
+        groups: Vec<String>,
+        /// Include authorized operations (v3+)
+        include_authorized_operations: bool,
+        /// Channel to send the response back to the specific connection
+        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
+    },
+    /// ListGroups request - list all consumer groups
+    ListGroups {
+        /// Correlation ID from client - MUST be echoed back in response
+        correlation_id: i32,
+        /// Optional client identifier string
+        client_id: Option<String>,
+        /// API version from the request (needed for response encoding)
+        api_version: i16,
+        /// States filter (v4+) - empty means all states
+        states_filter: Vec<String>,
+        /// Channel to send the response back to the specific connection
+        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
+    },
 }
 
 /// Kafka response types sent back from main thread to async tasks
@@ -344,6 +372,24 @@ pub enum KafkaResponse {
         api_version: i16,
         /// The kafka-protocol response struct (ready to encode)
         response: kafka_protocol::messages::list_offsets_response::ListOffsetsResponse,
+    },
+    /// DescribeGroups response - wraps kafka-protocol's DescribeGroupsResponse
+    DescribeGroups {
+        /// Correlation ID from request
+        correlation_id: i32,
+        /// API version from the request (needed for response encoding)
+        api_version: i16,
+        /// The kafka-protocol response struct (ready to encode)
+        response: kafka_protocol::messages::describe_groups_response::DescribeGroupsResponse,
+    },
+    /// ListGroups response - wraps kafka-protocol's ListGroupsResponse
+    ListGroups {
+        /// Correlation ID from request
+        correlation_id: i32,
+        /// API version from the request (needed for response encoding)
+        api_version: i16,
+        /// The kafka-protocol response struct (ready to encode)
+        response: kafka_protocol::messages::list_groups_response::ListGroupsResponse,
     },
     /// Error response for unsupported or malformed requests
     Error {

@@ -106,6 +106,20 @@ pub fn build_api_versions_response() -> ApiVersionsResponse {
     av12.max_version = 4;
     response.api_keys.push(av12);
 
+    // DescribeGroups (API_KEY_DESCRIBE_GROUPS): versions 0-5
+    let mut av13 = ApiVersion::default();
+    av13.api_key = API_KEY_DESCRIBE_GROUPS;
+    av13.min_version = 0;
+    av13.max_version = 5;
+    response.api_keys.push(av13);
+
+    // ListGroups (API_KEY_LIST_GROUPS): versions 0-4
+    let mut av14 = ApiVersion::default();
+    av14.api_key = API_KEY_LIST_GROUPS;
+    av14.min_version = 0;
+    av14.max_version = 4;
+    response.api_keys.push(av14);
+
     response
 }
 

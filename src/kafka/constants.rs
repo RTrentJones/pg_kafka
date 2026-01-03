@@ -66,6 +66,16 @@ pub const API_KEY_LEAVE_GROUP: i16 = 13;
 /// Used to synchronize partition assignments within a consumer group
 pub const API_KEY_SYNC_GROUP: i16 = 14;
 
+/// API key for DescribeGroups requests (Phase 4)
+///
+/// Used to get consumer group state and members
+pub const API_KEY_DESCRIBE_GROUPS: i16 = 15;
+
+/// API key for ListGroups requests (Phase 4)
+///
+/// Used to list all consumer groups
+pub const API_KEY_LIST_GROUPS: i16 = 16;
+
 /// API key for ApiVersions requests
 ///
 /// Used to discover which API versions the broker supports

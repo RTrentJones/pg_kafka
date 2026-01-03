@@ -806,6 +806,88 @@ pub fn process_request(
                 pg_log!("ListOffsets response sent successfully");
             }
         }
+        crate::kafka::KafkaRequest::DescribeGroups {
+            correlation_id,
+            api_version,
+            groups,
+            response_tx,
+            ..
+        } => {
+            pg_log!(
+                "Processing DescribeGroups request: correlation_id={}, groups={}",
+                correlation_id,
+                groups.len()
+            );
+
+            let kafka_response = match crate::kafka::handlers::handle_describe_groups(&coordinator, groups) {
+                Ok(response) => response,
+                Err(e) => {
+                    pg_warning!("Failed to handle DescribeGroups request: {}", e);
+                    let error_response = KafkaResponse::Error {
+                        correlation_id,
+                        error_code: crate::kafka::ERROR_UNKNOWN_SERVER_ERROR,
+                        error_message: Some(format!("Failed to handle DescribeGroups request: {}", e)),
+                    };
+                    if let Err(e) = response_tx.send(error_response) {
+                        pg_warning!("Failed to send error response: {}", e);
+                    }
+                    return;
+                }
+            };
+
+            let response = KafkaResponse::DescribeGroups {
+                correlation_id,
+                api_version,
+                response: kafka_response,
+            };
+
+            if let Err(e) = response_tx.send(response) {
+                pg_warning!("Failed to send DescribeGroups response: {}", e);
+            } else {
+                pg_log!("DescribeGroups response sent successfully");
+            }
+        }
+        crate::kafka::KafkaRequest::ListGroups {
+            correlation_id,
+            api_version,
+            states_filter,
+            response_tx,
+            ..
+        } => {
+            pg_log!(
+                "Processing ListGroups request: correlation_id={}, states_filter={}",
+                correlation_id,
+                states_filter.len()
+            );
+
+            let kafka_response = match crate::kafka::handlers::handle_list_groups(&coordinator, states_filter) {
+                Ok(response) => response,
+                Err(e) => {
+                    pg_warning!("Failed to handle ListGroups request: {}", e);
+                    let error_response = KafkaResponse::Error {
+                        correlation_id,
+                        error_code: crate::kafka::ERROR_UNKNOWN_SERVER_ERROR,
+                        error_message: Some(format!("Failed to handle ListGroups request: {}", e)),
+                    };
+                    if let Err(e) = response_tx.send(error_response) {
+                        pg_warning!("Failed to send error response: {}", e);
+                    }
+                    return;
+                }
+            };
+
+            let response = KafkaResponse::ListGroups {
+                correlation_id,
+                api_version,
+                response: kafka_response,
+            };
+
+            if let Err(e) = response_tx.send(response) {
+                pg_warning!("Failed to send ListGroups response: {}", e);
+            } else {
+                pg_log!("ListGroups response sent successfully");
+            }
+        }
     }
 }
 

@@ -731,6 +731,91 @@ pub fn parse_request(
                 response_tx,
             }))
         }
+        API_KEY_DESCRIBE_GROUPS => {
+            // DescribeGroups request - get consumer group state and members
+            pg_log!(
+                "Parsed DescribeGroups request (api_key={}, version={})",
+                API_KEY_DESCRIBE_GROUPS,
+                api_version
+            );
+
+            // Use kafka-protocol crate to decode DescribeGroupsRequest
+            let describe_req =
+                match kafka_protocol::messages::describe_groups_request::DescribeGroupsRequest::decode(
+                    &mut payload_buf,
+                    api_version,
+                ) {
+                    Ok(req) => req,
+                    Err(e) => {
+                        pg_warning!("Failed to decode DescribeGroupsRequest: {}", e);
+                        let error_response = KafkaResponse::Error {
+                            correlation_id,
+                            error_code: ERROR_CORRUPT_MESSAGE,
+                            error_message: Some(format!("Malformed DescribeGroupsRequest: {}", e)),
+                        };
+                        let _ = response_tx.send(error_response);
+                        return Ok(None);
+                    }
+                };
+
+            let groups: Vec<String> = describe_req
+                .groups
+                .into_iter()
+                .map(|g| g.to_string())
+                .collect();
+
+            let include_authorized_operations = describe_req.include_authorized_operations;
+
+            Ok(Some(KafkaRequest::DescribeGroups {
+                correlation_id,
+                client_id,
+                api_version,
+                groups,
+                include_authorized_operations,
+                response_tx,
+            }))
+        }
+        API_KEY_LIST_GROUPS => {
+            // ListGroups request - list all consumer groups
+            pg_log!(
+                "Parsed ListGroups request (api_key={}, version={})",
+                API_KEY_LIST_GROUPS,
+                api_version
+            );
+
+            // Use kafka-protocol crate to decode ListGroupsRequest
+            let list_req =
+                match kafka_protocol::messages::list_groups_request::ListGroupsRequest::decode(
+                    &mut payload_buf,
+                    api_version,
+                ) {
+                    Ok(req) => req,
+                    Err(e) => {
+                        pg_warning!("Failed to decode ListGroupsRequest: {}", e);
+                        let error_response = KafkaResponse::Error {
+                            correlation_id,
+                            error_code: ERROR_CORRUPT_MESSAGE,
+                            error_message: Some(format!("Malformed ListGroupsRequest: {}", e)),
+                        };
+                        let _ = response_tx.send(error_response);
+                        return Ok(None);
+                    }
+                };
+
+            let states_filter: Vec<String> = list_req
+                .states_filter
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect();
+
+            Ok(Some(KafkaRequest::ListGroups {
+                correlation_id,
+                client_id,
+                api_version,
+                states_filter,
+                response_tx,
+            }))
+        }
         _ => {
             // Unsupported API
             pg_warning!("Unsupported API key: {}", api_key);
@@ -1129,6 +1214,40 @@ pub fn encode_response(response: KafkaResponse) -> Result<BytesMut> {
 
             // Encode response body using the requested API version
             list_response.encode(&mut response_buf, api_version)?;
+        }
+        KafkaResponse::DescribeGroups {
+            correlation_id,
+            api_version,
+            response: describe_response,
+        } => {
+            // Build ResponseHeader
+            let header = ResponseHeader::default().with_correlation_id(correlation_id);
+
+            // Encode response header
+            // DescribeGroups v5+ uses flexible format (ResponseHeader v1)
+            // DescribeGroups v0-v4 uses non-flexible format (ResponseHeader v0)
+            let response_header_version = if api_version >= 5 { 1 } else { 0 };
+            header.encode(&mut response_buf, response_header_version)?;
+
+            // Encode response body using the requested API version
+            describe_response.encode(&mut response_buf, api_version)?;
+        }
+        KafkaResponse::ListGroups {
+            correlation_id,
+            api_version,
+            response: list_groups_response,
+        } => {
+            // Build ResponseHeader
+            let header = ResponseHeader::default().with_correlation_id(correlation_id);
+
+            // Encode response header
+            // ListGroups v3+ uses flexible format (ResponseHeader v1)
+            // ListGroups v0-v2 uses non-flexible format (ResponseHeader v0)
+            let response_header_version = if api_version >= 3 { 1 } else { 0 };
+            header.encode(&mut response_buf, response_header_version)?;
+
+            // Encode response body using the requested API version
+            list_groups_response.encode(&mut response_buf, api_version)?;
         }
         KafkaResponse::Error {
             correlation_id,
