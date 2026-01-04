@@ -103,7 +103,8 @@ jobs:
     - name: Verify pgrx Installation
       run: |
         ls -lh ~/.pgrx/
-        echo "pgrx PostgreSQL 14 installation: $(du -sh ~/.pgrx/14.* | cut -f1)"
+        # Show size of PG14 installation (handle both 14.* and 14.*_unpack)
+        du -sh ~/.pgrx/14.* 2>/dev/null | head -n 1 || echo "No PG14 installation found yet"
 
     # ------------------------------------------------------------------
     # UNIT TESTING: Non-SPI tests only
@@ -129,7 +130,8 @@ jobs:
       with:
         files: lcov.info
         token: ${{ secrets.CODECOV_TOKEN }}
-        fail_ci_if_error: true
+        fail_ci_if_error: false  # Don't fail CI if codecov upload fails
+      continue-on-error: true  # Continue even if this step fails
 
     # ------------------------------------------------------------------
     # E2E TESTING: Full system test with external client
@@ -138,16 +140,39 @@ jobs:
       # Compiles the release build of the pg_kafka extension and copies the .so and .control
       # files into the pgrx-managed Postgres installation directories.
       run: |
-        # Find the managed Postgres 14 path (handle potential version mismatch)
-        PG14_PATH=$(find ~/.pgrx -maxdepth 1 -type d -name "14.*" | head -n 1)
-        if [ -z "$PG14_PATH" ]; then
-          echo "Error: Could not find pgrx-managed Postgres 14 installation."
+        # Debug: List pgrx directory contents
+        echo "Contents of ~/.pgrx:"
+        ls -la ~/.pgrx/
+
+        # Find pg_config in the pgrx directory structure
+        PG_CONFIG=$(find ~/.pgrx -name pg_config -type f -executable 2>/dev/null | grep "14\." | head -n 1)
+
+        if [ -z "$PG_CONFIG" ]; then
+          echo "Error: Could not find pg_config for PostgreSQL 14."
+          echo "Searching for any pg_config files:"
+          find ~/.pgrx -name pg_config -type f
           exit 1
         fi
-        echo "Using Postgres installation at: $PG14_PATH"
-        export PATH="$PG14_PATH/pgrx-install/bin:$PATH"
 
-        cargo pgrx install --release --pg-config="$PG14_PATH/pgrx-install/bin/pg_config"
+        echo "Found pg_config at: $PG_CONFIG"
+
+        # Verify it works
+        $PG_CONFIG --version
+
+        # Add to PATH and install
+        export PATH="$(dirname $PG_CONFIG):$PATH"
+        cargo pgrx install --release --pg-config="$PG_CONFIG"
+
+    - name: Initialize Postgres Data Directory
+      # pgrx creates the data directory on first start, so we do a quick start/stop
+      # to ensure it exists before we modify the config
+      run: |
+        # Start postgres to create the data directory
+        cargo pgrx start pg14 || true
+        sleep 2
+        # Stop it so we can modify the config
+        cargo pgrx stop pg14 || true
+        sleep 1
 
     - name: Configure Postgres for Background Worker
       # CRITICAL STEP:
@@ -155,15 +180,22 @@ jobs:
       # For this to work, the library must be loaded when Postgres boots up.
       # We append it to shared_preload_libraries in the config file.
       run: |
-        # Find the pgrx data directory (handle potential version mismatch)
+        # Find the pgrx data directory (should exist now after initialization)
         PG14_DATA_DIR=$(find ~/.pgrx -maxdepth 1 -type d -name "data-14*" | head -n 1)
         if [ -z "$PG14_DATA_DIR" ]; then
           echo "Error: Could not find pgrx-managed Postgres 14 data directory."
+          ls -la ~/.pgrx/
           exit 1
         fi
         echo "Using Postgres data directory at: $PG14_DATA_DIR"
-        echo "shared_preload_libraries = 'pg_kafka'" >> "$PG14_DATA_DIR/postgresql.conf"
-        echo "Configuration updated to preload pg_kafka."
+
+        # Check if already configured (idempotency)
+        if ! grep -q "shared_preload_libraries.*pg_kafka" "$PG14_DATA_DIR/postgresql.conf"; then
+          echo "shared_preload_libraries = 'pg_kafka'" >> "$PG14_DATA_DIR/postgresql.conf"
+          echo "Configuration updated to preload pg_kafka."
+        else
+          echo "pg_kafka already configured in shared_preload_libraries."
+        fi
 
     - name: Start Postgres
       # Boots the pgrx-managed Postgres 14 instance.
