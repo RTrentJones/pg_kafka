@@ -137,7 +137,17 @@ jobs:
     - name: Install Extension
       # Compiles the release build of the pg_kafka extension and copies the .so and .control
       # files into the pgrx-managed Postgres installation directories.
-      run: cargo pgrx install --release
+      run: |
+        # Find the managed Postgres 14 path (handle potential version mismatch)
+        PG14_PATH=$(find ~/.pgrx -maxdepth 1 -type d -name "14.*" | head -n 1)
+        if [ -z "$PG14_PATH" ]; then
+          echo "Error: Could not find pgrx-managed Postgres 14 installation."
+          exit 1
+        fi
+        echo "Using Postgres installation at: $PG14_PATH"
+        export PATH="$PG14_PATH/pgrx-install/bin:$PATH"
+
+        cargo pgrx install --release --features pg14 --no-default-features
 
     - name: Configure Postgres for Background Worker
       # CRITICAL STEP:
