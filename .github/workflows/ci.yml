@@ -192,7 +192,7 @@ jobs:
         # Check if already configured (idempotency)
         if ! grep -q "shared_preload_libraries.*pg_kafka" "$PG14_DATA_DIR/postgresql.conf"; then
           # Use printf to ensure a preceding newline, preventing config corruption
-          printf "\nshared_preload_libraries = 'pg_kafka'\n" >> "$PG14_DATA_DIR/postgresql.conf"
+          printf "\nshared_preload_libraries = 'pg_kafka'\npg_kafka.host = '0.0.0.0'\n" >> "$PG14_DATA_DIR/postgresql.conf"
           echo "Configuration updated to preload pg_kafka."
         else
           echo "pg_kafka already configured in shared_preload_libraries."
@@ -226,6 +226,14 @@ jobs:
     - name: Check Background Worker Status
       # Debug step: Query pg_stat_activity to see if the worker is actually running
       run: psql -h localhost -p ${{ env.PG_PORT }} -U ${{ env.DB_USER }} -d postgres -c "SELECT pid, backend_type, wait_event_type FROM pg_stat_activity WHERE backend_type = 'pg_kafka_listener';"
+
+    - name: Wait for Kafka Port
+      # Ensure the background worker has actually bound to the port before testing
+      timeout-minutes: 1
+      run: |
+        echo "Waiting for port 9092..."
+        timeout 30s bash -c 'until echo > /dev/tcp/localhost/9092; do sleep 1; done'
+        echo "Port 9092 is open!"
 
     - name: Run E2E Tests
       # Runs the external client application that connects to the running extension
