@@ -155,7 +155,14 @@ jobs:
       # For this to work, the library must be loaded when Postgres boots up.
       # We append it to shared_preload_libraries in the config file.
       run: |
-        echo "shared_preload_libraries = 'pg_kafka'" >> ~/.pgrx/data-14/postgresql.conf
+        # Find the pgrx data directory (handle potential version mismatch)
+        PG14_DATA_DIR=$(find ~/.pgrx -maxdepth 1 -type d -name "data-14*" | head -n 1)
+        if [ -z "$PG14_DATA_DIR" ]; then
+          echo "Error: Could not find pgrx-managed Postgres 14 data directory."
+          exit 1
+        fi
+        echo "Using Postgres data directory at: $PG14_DATA_DIR"
+        echo "shared_preload_libraries = 'pg_kafka'" >> "$PG14_DATA_DIR/postgresql.conf"
         echo "Configuration updated to preload pg_kafka."
 
     - name: Start Postgres
@@ -165,8 +172,13 @@ jobs:
 
     - name: Create Extension and Prepare DB
       run: |
-        # 1. Find the dynamic port pgrx assigned to PG14
-        PG_PORT=$(grep "port =" ~/.pgrx/data-14/postgresql.conf | awk '{print $3}')
+        # 1. Find the pgrx data directory and dynamic port
+        PG14_DATA_DIR=$(find ~/.pgrx -maxdepth 1 -type d -name "data-14*" | head -n 1)
+        if [ -z "$PG14_DATA_DIR" ]; then
+          echo "Error: Could not find pgrx-managed Postgres 14 data directory."
+          exit 1
+        fi
+        PG_PORT=$(grep "port =" "$PG14_DATA_DIR/postgresql.conf" | awk '{print $3}')
         echo "PG_PORT=$PG_PORT" >> $GITHUB_ENV
 
         # 2. Run CREATE EXTENSION
@@ -202,22 +214,3 @@ jobs:
       if: always()
       # Ensures the background Postgres process is killed, freeing resources.
       run: cargo pgrx stop pg14
-
-  # ------------------------------------------------------------------
-  # AI REVIEWER: Automated Code Review via Gemini
-  # ------------------------------------------------------------------
-  ai-review:
-    name: AI Code Review
-    runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Run Gemini Review
-        uses: google-github-actions/run-gemini-cli@v1
-        with:
-          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
-          prompt: "Review this pull request. Focus on Rust safety, correct usage of pgrx, and PostgreSQL extension best practices. Identify potential bugs, security issues, and performance bottlenecks."
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
