@@ -219,6 +219,7 @@ jobs:
         DB_USER=$(whoami)
         echo "DB_USER=$DB_USER" >> $GITHUB_ENV
         echo "Using database user: $DB_USER"
+        psql -h localhost -p $PG_PORT -U "$DB_USER" -d postgres -c "CREATE DATABASE \"$DB_USER\";" || true
         psql -h localhost -p $PG_PORT -U "$DB_USER" -d "$DB_USER" -c "CREATE EXTENSION IF NOT EXISTS pg_kafka;"
 
     - name: Run E2E Tests
