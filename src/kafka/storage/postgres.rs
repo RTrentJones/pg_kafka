@@ -38,20 +38,25 @@ impl KafkaStore for PostgresStore {
     fn get_or_create_topic(&self, name: &str) -> Result<i32> {
         pgrx::debug1!("PostgresStore::get_or_create_topic: '{}'", name);
 
-        Spi::connect(|_client| {
+        Spi::connect_mut(|client| {
             let topic_name_string = name.to_string();
 
-            let topic_id: i32 = Spi::get_one_with_args::<i32>(
+            let table = client.update(
                 "INSERT INTO kafka.topics (name, partitions)
                  VALUES ($1, $2)
                  ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
                  RETURNING id",
+                None,
                 &[
                     topic_name_string.into(),
                     crate::kafka::DEFAULT_TOPIC_PARTITIONS.into(),
                 ],
-            )?
-            .ok_or_else(|| KafkaError::Internal("Failed to get topic ID".into()))?;
+            )?;
+
+            let topic_id: i32 = table
+                .first()
+                .get_by_name("id")?
+                .ok_or_else(|| KafkaError::Internal("Failed to get topic ID".into()))?;
 
             pgrx::debug1!("Topic '{}' has id={}", name, topic_id);
             Ok(topic_id)
@@ -306,40 +311,27 @@ impl KafkaStore for PostgresStore {
             partition_id,
             offset
         );
-
-        // SQL injection mitigation: escape single quotes
-        // TODO: Use prepared statements when pgrx adds support
-        let group_id_escaped = group_id.replace("'", "''");
-        let metadata_escaped = metadata.map(|m| m.replace("'", "''"));
-
         Spi::connect_mut(|client| {
-            let query = if let Some(meta) = metadata_escaped {
-                format!(
-                    "INSERT INTO kafka.consumer_offsets
-                        (group_id, topic_id, partition_id, committed_offset, metadata)
-                    VALUES ('{}', {}, {}, {}, '{}')
-                    ON CONFLICT (group_id, topic_id, partition_id)
-                    DO UPDATE SET
-                        committed_offset = EXCLUDED.committed_offset,
-                        metadata = EXCLUDED.metadata,
-                        commit_timestamp = NOW()",
-                    group_id_escaped, topic_id, partition_id, offset, meta
-                )
-            } else {
-                format!(
-                    "INSERT INTO kafka.consumer_offsets
-                        (group_id, topic_id, partition_id, committed_offset, metadata)
-                    VALUES ('{}', {}, {}, {}, NULL)
-                    ON CONFLICT (group_id, topic_id, partition_id)
-                    DO UPDATE SET
-                        committed_offset = EXCLUDED.committed_offset,
-                        metadata = EXCLUDED.metadata,
-                        commit_timestamp = NOW()",
-                    group_id_escaped, topic_id, partition_id, offset
-                )
-            };
+            let query = "INSERT INTO kafka.consumer_offsets
+                            (group_id, topic_id, partition_id, committed_offset, metadata)
+                        VALUES ($1, $2, $3, $4, $5)
+                        ON CONFLICT (group_id, topic_id, partition_id)
+                        DO UPDATE SET
+                            committed_offset = EXCLUDED.committed_offset,
+                            metadata = EXCLUDED.metadata,
+                            commit_timestamp = NOW()";
 
-            client.update(&query, None, &[])?;
+            client.update(
+                query,
+                None,
+                &[
+                    group_id.into(),
+                    topic_id.into(),
+                    partition_id.into(),
+                    offset.into(),
+                    metadata.into(),
+                ],
+            )?;
             Ok(())
         })
         .map_err(|e: KafkaError| KafkaError::Internal(format!("commit_offset failed: {}", e)))
@@ -351,18 +343,16 @@ impl KafkaStore for PostgresStore {
         topic_id: i32,
         partition_id: i32,
     ) -> Result<Option<CommittedOffset>> {
-        // SQL injection mitigation
-        let group_id_escaped = group_id.replace("'", "''");
-
         Spi::connect(|client| {
-            let query = format!(
-                "SELECT committed_offset, metadata
+            let query = "SELECT committed_offset, metadata
                  FROM kafka.consumer_offsets
-                 WHERE group_id = '{}' AND topic_id = {} AND partition_id = {}",
-                group_id_escaped, topic_id, partition_id
-            );
+                 WHERE group_id = $1 AND topic_id = $2 AND partition_id = $3";
 
-            let mut table = client.select(&query, Some(1), &[])?;
+            let mut table = client.select(
+                query,
+                Some(1),
+                &[group_id.into(), topic_id.into(), partition_id.into()],
+            )?;
 
             if let Some(row) = table.next() {
                 let offset: i64 = row.get_by_name("committed_offset")?.unwrap_or(-1);
@@ -377,20 +367,14 @@ impl KafkaStore for PostgresStore {
     }
 
     fn fetch_all_offsets(&self, group_id: &str) -> Result<Vec<(String, i32, CommittedOffset)>> {
-        // SQL injection mitigation
-        let group_id_escaped = group_id.replace("'", "''");
-
         Spi::connect(|client| {
-            let query = format!(
-                "SELECT t.name, co.partition_id, co.committed_offset, co.metadata
+            let query = "SELECT t.name, co.partition_id, co.committed_offset, co.metadata
                  FROM kafka.consumer_offsets co
                  JOIN kafka.topics t ON co.topic_id = t.id
-                 WHERE co.group_id = '{}'
-                 ORDER BY t.name, co.partition_id",
-                group_id_escaped
-            );
+                 WHERE co.group_id = $1
+                 ORDER BY t.name, co.partition_id";
 
-            let table = client.select(&query, None, &[])?;
+            let table = client.select(query, None, &[group_id.into()])?;
             let mut results = Vec::new();
 
             for row in table {
