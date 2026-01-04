@@ -214,9 +214,12 @@ jobs:
         echo "PG_PORT=$PG_PORT" >> $GITHUB_ENV
 
         # 2. Run CREATE EXTENSION
-        # Even though the binary is loaded, we must run this SQL to create the
-        # SQL-level objects (tables, types, etc.) in the database.
-        psql -h localhost -p $PG_PORT -U postgres postgres -c "CREATE EXTENSION IF NOT EXISTS pg_kafka;"
+        # pgrx creates a database with the current user's name, not "postgres"
+        # In GitHub Actions, the user is "runner"
+        DB_USER=$(whoami)
+        echo "DB_USER=$DB_USER" >> $GITHUB_ENV
+        echo "Using database user: $DB_USER"
+        psql -h localhost -p $PG_PORT -U "$DB_USER" -d "$DB_USER" -c "CREATE EXTENSION IF NOT EXISTS pg_kafka;"
 
     - name: Run E2E Tests
       # Runs the external client application that connects to the running extension
@@ -225,8 +228,8 @@ jobs:
         cd kafka_test
         cargo run --release
       env:
-        # Pass the dynamically discovered port to the test runner
-        DATABASE_URL: postgresql://postgres:postgres@localhost:${{ env.PG_PORT }}/postgres
+        # Pass the dynamically discovered port and user to the test runner
+        DATABASE_URL: postgresql://${{ env.DB_USER }}@localhost:${{ env.PG_PORT }}/${{ env.DB_USER }}
 
     # ------------------------------------------------------------------
     # LOAD TESTING: Placeholder
