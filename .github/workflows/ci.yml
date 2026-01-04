@@ -147,7 +147,7 @@ jobs:
         echo "Using Postgres installation at: $PG14_PATH"
         export PATH="$PG14_PATH/pgrx-install/bin:$PATH"
 
-        cargo pgrx install --release --features pg14 --no-default-features
+        cargo pgrx install --release --pg-config="$PG14_PATH/pgrx-install/bin/pg_config"
 
     - name: Configure Postgres for Background Worker
       # CRITICAL STEP:
