@@ -28,3 +28,7 @@ Cargo.lock
 
 # Claude generated files during development
 .documents/
+
+# Test Coverage directory
+.cov/
+lcov.info

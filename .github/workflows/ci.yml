@@ -75,8 +75,8 @@ jobs:
       uses: actions/cache@v4
       with:
         path: |
-          ~/.pgrx/${{ env.PG_VERSION }}
-          ~/.pgrx/${{ env.PG_VERSION }}_unpack
+          ~/.pgrx/14.*
+          ~/.pgrx/14.*_unpack
           ~/.pgrx/config.toml
         # Stable key - only invalidate when pgrx or PG version changes
         key: ${{ runner.os }}-pgrx-pg14-${{ env.PGRX_VERSION }}-pg${{ env.PG_VERSION }}-v2
@@ -103,7 +103,7 @@ jobs:
     - name: Verify pgrx Installation
       run: |
         ls -lh ~/.pgrx/
-        echo "pgrx PostgreSQL 14 installation: $(du -sh ~/.pgrx/${{ env.PG_VERSION }} | cut -f1)"
+        echo "pgrx PostgreSQL 14 installation: $(du -sh ~/.pgrx/14.* | cut -f1)"
 
     # ------------------------------------------------------------------
     # UNIT TESTING: Non-SPI tests only
@@ -137,7 +137,7 @@ jobs:
     - name: Install Extension
       # Compiles the release build of the pg_kafka extension and copies the .so and .control
       # files into the pgrx-managed Postgres installation directories.
-      run: cargo pgrx install --pg14 --release
+      run: cargo pgrx install --release
 
     - name: Configure Postgres for Background Worker
       # CRITICAL STEP:
