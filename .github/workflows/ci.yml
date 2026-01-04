@@ -48,7 +48,7 @@ jobs:
     - name: Install System Dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y libpq-dev libreadline-dev zlib1g-dev flex bison libxml2-dev libxslt-dev
+        sudo apt-get install -y libpq-dev libreadline-dev zlib1g-dev flex bison libxml2-dev libxslt-dev libssl-dev libsasl2-dev
 
     # ------------------------------------------------------------------
     # OPTIMIZATION: Cache the CLI tool to avoid compiling it every run
@@ -191,7 +191,8 @@ jobs:
 
         # Check if already configured (idempotency)
         if ! grep -q "shared_preload_libraries.*pg_kafka" "$PG14_DATA_DIR/postgresql.conf"; then
-          echo "shared_preload_libraries = 'pg_kafka'" >> "$PG14_DATA_DIR/postgresql.conf"
+          # Use printf to ensure a preceding newline, preventing config corruption
+          printf "\nshared_preload_libraries = 'pg_kafka'\n" >> "$PG14_DATA_DIR/postgresql.conf"
           echo "Configuration updated to preload pg_kafka."
         else
           echo "pg_kafka already configured in shared_preload_libraries."
@@ -222,6 +223,10 @@ jobs:
         psql -h localhost -p $PG_PORT -U "$DB_USER" -d postgres -c "CREATE DATABASE \"$DB_USER\";" || true
         psql -h localhost -p $PG_PORT -U "$DB_USER" -d "$DB_USER" -c "CREATE EXTENSION IF NOT EXISTS pg_kafka;"
 
+    - name: Check Background Worker Status
+      # Debug step: Query pg_stat_activity to see if the worker is actually running
+      run: psql -h localhost -p ${{ env.PG_PORT }} -U ${{ env.DB_USER }} -d postgres -c "SELECT pid, backend_type, wait_event_type FROM pg_stat_activity WHERE backend_type = 'pg_kafka_listener';"
+
     - name: Run E2E Tests
       # Runs the external client application that connects to the running extension
       # via TCP (Kafka protocol) and Postgres (SQL).
@@ -242,6 +247,14 @@ jobs:
         # Example: Run k6 or bespoke load generator
         # k6 run load-test.js
         # cargo run --release --bin load_generator
+
+    # ------------------------------------------------------------------
+    # DEBUGGING: Print logs on failure
+    # ------------------------------------------------------------------
+    - name: Print Postgres Logs
+      if: failure()
+      run: |
+        find ~/.pgrx -name "postgresql-*.log" -exec echo "=== {} ===" \; -exec cat {} \;
 
     # ------------------------------------------------------------------
     # TEARDOWN: Cleanup
