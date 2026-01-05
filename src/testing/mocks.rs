@@ -71,6 +71,7 @@ pub fn mock_config() -> crate::config::Config {
     crate::config::Config {
         port: DEFAULT_KAFKA_PORT,
         host: TEST_HOST.to_string(),
+        database: "pg_kafka_test".to_string(),
         log_connections: false,
         shutdown_timeout_ms: DEFAULT_SHUTDOWN_TIMEOUT_MS,
     }

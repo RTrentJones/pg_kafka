@@ -1,0 +1,41 @@
+#!/bin/bash
+# Helper script to run GitHub Actions workflows locally using act
+#
+# Usage:
+#   ./bin/test-ci-locally              # Run the default 'test' job
+#   ./bin/test-ci-locally -j build     # Run a specific job
+#   ./bin/test-ci-locally -l           # List all jobs
+#
+# Requirements:
+#   - act (https://github.com/nektos/act)
+#   - Docker
+#
+# Note: act runs GitHub Actions in Docker containers, so it may behave
+# slightly differently than the actual GitHub Actions environment.
+
+set -e
+
+# Check if act is installed
+if ! command -v act &> /dev/null; then
+    echo "❌ act is not installed"
+    echo "Install it with: curl https://raw.githubusercontent.com/nektos/act/master/install.sh | sudo bash"
+    exit 1
+fi
+
+# Check if Docker is running
+if ! docker info &> /dev/null; then
+    echo "❌ Docker is not running"
+    echo "Please start Docker and try again"
+    exit 1
+fi
+
+# Default to running the 'test' job
+if [ $# -eq 0 ]; then
+    echo "🚀 Running GitHub Actions 'test' job locally..."
+    echo ""
+    act -j test
+else
+    echo "🚀 Running act with args: $@"
+    echo ""
+    act "$@"
+fi

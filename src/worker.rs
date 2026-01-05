@@ -24,15 +24,18 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     // Step 1: Attach to Postgres signal handling system
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
 
-    // Step 2: Connect to the database (required for SPI access in future)
-    BackgroundWorker::connect_worker_to_spi(Some("postgres"), None);
-
-    // Step 3: Load configuration
+    // Step 2: Load configuration (GUCs are available after _PG_init)
     let config = crate::config::Config::load();
+
+    // Step 3: Connect to the configured database (required for SPI access)
+    // IMPORTANT: Must connect to the database where CREATE EXTENSION was run
+    BackgroundWorker::connect_worker_to_spi(Some(&config.database), None);
+
     log!(
-        "pg_kafka background worker started (port: {}, host: {})",
+        "pg_kafka background worker started (port: {}, host: {}, database: {})",
         config.port,
-        config.host
+        config.host,
+        config.database
     );
 
     // Step 4: Create shutdown channel for communicating between sync and async worlds
@@ -67,11 +70,39 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     let broker_host = host.clone();
 
     // Spawn the listener task on the LocalSet
+    pg_log!("Spawning TCP listener task on LocalSet");
     let listener_handle = local_set.spawn_local(async move {
-        if let Err(e) = crate::kafka::run_listener(shutdown_rx, &host, port, log_connections).await
-        {
-            pgrx::error!("TCP listener error: {}", e);
+        pg_log!("Listener task started, entering retry loop");
+        loop {
+            let rx = shutdown_rx.clone();
+            if *rx.borrow() {
+                pg_log!("Listener task: shutdown signal detected, exiting");
+                break;
+            }
+
+            pg_log!("Listener task: calling run_listener on {}:{}", host, port);
+            match crate::kafka::run_listener(rx, &host, port, log_connections).await {
+                Ok(_) => {
+                    pg_log!("TCP listener exited normally");
+                    break;
+                }
+                Err(e) => {
+                    pgrx::warning!("TCP listener error: {}. Restarting...", e);
+
+                    // Check shutdown before sleeping to avoid unnecessary delay
+                    if *shutdown_rx.borrow() {
+                        break;
+                    }
+                    // Make sleep interruptible by shutdown signal
+                    let mut rx = shutdown_rx.clone();
+                    tokio::select! {
+                        _ = tokio::time::sleep(core::time::Duration::from_millis(1000)) => {}
+                        _ = rx.changed() => {}
+                    }
+                }
+            }
         }
+        pg_log!("Listener task exiting");
     });
 
     // Step 7: Create consumer group coordinator
@@ -81,6 +112,16 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     // Step 8: Get the request queue receiver
     // This is how we receive Kafka requests from the async tokio tasks
     let request_rx = crate::kafka::request_receiver();
+
+    // CRITICAL: Drive the LocalSet once to ensure the listener task starts
+    // before entering the main loop. Without this, the spawned task might not
+    // begin execution until the first loop iteration.
+    pg_log!("Driving LocalSet to start listener task");
+    local_set.block_on(&runtime, async {
+        // Give the listener task a chance to start and bind to the port
+        tokio::time::sleep(core::time::Duration::from_millis(10)).await;
+    });
+    pg_log!("Entering main event loop");
 
     // Step 9: Main event loop
     // ═══════════════════════════════════════════════════════════════════════════════
@@ -140,26 +181,22 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
         // ┌─────────────────────────────────────────────────────────────┐
         // │ PART 2: Drive Async Network I/O (ASYNC, Non-blocking)      │
         // └─────────────────────────────────────────────────────────────┘
-        // block_on() is NOT a mistake here. We're running a sync loop
-        // that periodically executes async code for 100ms.
-        // This drives the LocalSet forward, processing:
+        // Drive the LocalSet forward for a short duration to process async tasks:
         // - TCP accept() calls
         // - Socket read()/write() calls
         // - Kafka protocol parsing
         // Then we return to sync context to process database requests.
-        runtime.block_on(async {
-            tokio::select! {
-                // Timeout after ASYNC_IO_INTERVAL_MS to return to sync processing
-                _ = tokio::time::sleep(core::time::Duration::from_millis(crate::kafka::ASYNC_IO_INTERVAL_MS)) => {
-                    // Normal path: timeout reached, go check for database requests
-                }
-                // Fallback: If listener exits (shouldn't happen during normal operation)
-                _ = local_set.run_until(async {
-                    std::future::pending::<()>().await
-                }) => {
-                    // LocalSet completed - listener task finished unexpectedly
-                }
-            }
+        //
+        // CRITICAL: Use LocalSet::block_on with the runtime to properly poll tasks.
+        // The timeout ensures we return to sync context to process database requests.
+        local_set.block_on(&runtime, async {
+            // Use timeout to limit async processing duration, then return to sync context
+            let _ = tokio::time::timeout(
+                core::time::Duration::from_millis(crate::kafka::ASYNC_IO_INTERVAL_MS),
+                std::future::pending::<()>(),
+            )
+            .await;
+            // Timeout is expected (Err) - it means we processed I/O for 100ms
         });
 
         // ┌─────────────────────────────────────────────────────────────┐
@@ -296,6 +333,9 @@ pub fn process_request(
                 );
                 config.host.clone()
             };
+
+            // Log the final advertised address to help debug connection issues
+            pg_log!("Kafka listener advertising address: {}", advertised_host);
 
             // Create storage and use handler
             let store = PostgresStore::new();

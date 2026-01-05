@@ -48,7 +48,7 @@ jobs:
     - name: Install System Dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y libpq-dev libreadline-dev zlib1g-dev flex bison libxml2-dev libxslt-dev
+        sudo apt-get install -y libpq-dev libreadline-dev zlib1g-dev flex bison libxml2-dev libxslt-dev libssl-dev libsasl2-dev netcat-openbsd
 
     # ------------------------------------------------------------------
     # OPTIMIZATION: Cache the CLI tool to avoid compiling it every run
@@ -98,14 +98,6 @@ jobs:
       run: cargo clippy --features pg14 -- -D warnings
 
     # ------------------------------------------------------------------
-    # PGRX SETUP: Only after linting passes
-    # ------------------------------------------------------------------
-    - name: Verify pgrx Installation
-      run: |
-        ls -lh ~/.pgrx/
-        echo "pgrx PostgreSQL 14 installation: $(du -sh ~/.pgrx/14.* | cut -f1)"
-
-    # ------------------------------------------------------------------
     # UNIT TESTING: Non-SPI tests only
     # ------------------------------------------------------------------
     - name: Install cargo-llvm-cov
@@ -129,7 +121,8 @@ jobs:
       with:
         files: lcov.info
         token: ${{ secrets.CODECOV_TOKEN }}
-        fail_ci_if_error: true
+        fail_ci_if_error: false  # Don't fail CI if codecov upload fails
+      continue-on-error: true  # Continue even if this step fails
 
     # ------------------------------------------------------------------
     # E2E TESTING: Full system test with external client
@@ -138,16 +131,39 @@ jobs:
       # Compiles the release build of the pg_kafka extension and copies the .so and .control
       # files into the pgrx-managed Postgres installation directories.
       run: |
-        # Find the managed Postgres 14 path (handle potential version mismatch)
-        PG14_PATH=$(find ~/.pgrx -maxdepth 1 -type d -name "14.*" | head -n 1)
-        if [ -z "$PG14_PATH" ]; then
-          echo "Error: Could not find pgrx-managed Postgres 14 installation."
+        # Debug: List pgrx directory contents
+        echo "Contents of ~/.pgrx:"
+        ls -la ~/.pgrx/
+
+        # Find pg_config in the pgrx directory structure
+        PG_CONFIG=$(find ~/.pgrx -name pg_config -type f -executable 2>/dev/null | grep "14\." | head -n 1)
+
+        if [ -z "$PG_CONFIG" ]; then
+          echo "Error: Could not find pg_config for PostgreSQL 14."
+          echo "Searching for any pg_config files:"
+          find ~/.pgrx -name pg_config -type f
           exit 1
         fi
-        echo "Using Postgres installation at: $PG14_PATH"
-        export PATH="$PG14_PATH/pgrx-install/bin:$PATH"
 
-        cargo pgrx install --release --pg-config="$PG14_PATH/pgrx-install/bin/pg_config"
+        echo "Found pg_config at: $PG_CONFIG"
+
+        # Verify it works
+        $PG_CONFIG --version
+
+        # Add to PATH and install
+        export PATH="$(dirname $PG_CONFIG):$PATH"
+        cargo pgrx install --release --pg-config="$PG_CONFIG"
+
+    - name: Initialize Postgres Data Directory
+      # pgrx creates the data directory on first start, so we do a quick start/stop
+      # to ensure it exists before we modify the config
+      run: |
+        # Start postgres to create the data directory
+        cargo pgrx start pg14 || true
+        sleep 2
+        # Stop it so we can modify the config
+        cargo pgrx stop pg14 || true
+        sleep 1
 
     - name: Configure Postgres for Background Worker
       # CRITICAL STEP:
@@ -155,8 +171,23 @@ jobs:
       # For this to work, the library must be loaded when Postgres boots up.
       # We append it to shared_preload_libraries in the config file.
       run: |
-        echo "shared_preload_libraries = 'pg_kafka'" >> ~/.pgrx/data-14/postgresql.conf
-        echo "Configuration updated to preload pg_kafka."
+        # Find the pgrx data directory (should exist now after initialization)
+        PG14_DATA_DIR=$(find ~/.pgrx -maxdepth 1 -type d -name "data-14*" | head -n 1)
+        if [ -z "$PG14_DATA_DIR" ]; then
+          echo "Error: Could not find pgrx-managed Postgres 14 data directory."
+          ls -la ~/.pgrx/
+          exit 1
+        fi
+        echo "Using Postgres data directory at: $PG14_DATA_DIR"
+
+        # Check if already configured (idempotency)
+        if ! grep -q "shared_preload_libraries.*pg_kafka" "$PG14_DATA_DIR/postgresql.conf"; then
+          # Use printf to ensure a preceding newline, preventing config corruption
+          printf "\nshared_preload_libraries = 'pg_kafka'\npg_kafka.host = '0.0.0.0'\n" >> "$PG14_DATA_DIR/postgresql.conf"
+          echo "Configuration updated to preload pg_kafka."
+        else
+          echo "pg_kafka already configured in shared_preload_libraries."
+        fi
 
     - name: Start Postgres
       # Boots the pgrx-managed Postgres 14 instance.
@@ -165,14 +196,31 @@ jobs:
 
     - name: Create Extension and Prepare DB
       run: |
-        # 1. Find the dynamic port pgrx assigned to PG14
-        PG_PORT=$(grep "port =" ~/.pgrx/data-14/postgresql.conf | awk '{print $3}')
+        # 1. Find the pgrx data directory and dynamic port
+        PG14_DATA_DIR=$(find ~/.pgrx -maxdepth 1 -type d -name "data-14*" | head -n 1)
+        if [ -z "$PG14_DATA_DIR" ]; then
+          echo "Error: Could not find pgrx-managed Postgres 14 data directory."
+          exit 1
+        fi
+        PG_PORT=$(grep "port =" "$PG14_DATA_DIR/postgresql.conf" | awk '{print $3}')
         echo "PG_PORT=$PG_PORT" >> $GITHUB_ENV
 
-        # 2. Run CREATE EXTENSION
-        # Even though the binary is loaded, we must run this SQL to create the
-        # SQL-level objects (tables, types, etc.) in the database.
-        psql -h localhost -p $PG_PORT -U postgres postgres -c "CREATE EXTENSION IF NOT EXISTS pg_kafka;"
+        # 2. Run CREATE EXTENSION in the postgres database
+        # IMPORTANT: The background worker connects to 'postgres' database via SPI,
+        # so the extension (and its schema) must be created there.
+        DB_USER=$(whoami)
+        echo "DB_USER=$DB_USER" >> $GITHUB_ENV
+        echo "Using database user: $DB_USER"
+        psql -h localhost -p $PG_PORT -U "$DB_USER" -d postgres -c "CREATE EXTENSION IF NOT EXISTS pg_kafka;"
+
+    - name: Wait for Kafka Port
+      # Ensure the background worker has actually bound to the port before testing
+      timeout-minutes: 1
+      run: |
+        echo "Waiting for port 9092..."
+        timeout 30s bash -c 'until nc -z 127.0.0.1 9092; do sleep 1; done'
+        echo "Port 9092 is open!"
+        sleep 3 # Wait for protocol readiness (Fixes CI race condition)
 
     - name: Run E2E Tests
       # Runs the external client application that connects to the running extension
@@ -182,18 +230,19 @@ jobs:
         cargo run --release
       env:
         # Pass the dynamically discovered port to the test runner
-        DATABASE_URL: postgresql://postgres:postgres@localhost:${{ env.PG_PORT }}/postgres
+        # IMPORTANT: Use 'postgres' database since that's where the worker connects via SPI
+        DATABASE_URL: postgresql://${{ env.DB_USER }}@localhost:${{ env.PG_PORT }}/postgres
 
-    # ------------------------------------------------------------------
-    # LOAD TESTING: Placeholder
-    # ------------------------------------------------------------------
-    - name: Load Testing (Placeholder)
-      if: always() # Run even if previous tests failed, to gather metrics if possible
+    - name: Dump Postgres Logs (On Failure)
+      if: failure()
       run: |
-        echo "TODO: Implement Load Testing"
-        # Example: Run k6 or bespoke load generator
-        # k6 run load-test.js
-        # cargo run --release --bin load_generator
+        echo "=== Postgres Logs ==="
+        find ~/.pgrx -name "14.log" -exec cat {} + 2>/dev/null || \
+        find ~/.pgrx -name "logfile" -exec tail -100 {} + 2>/dev/null || \
+        echo "No log files found"
+        echo ""
+        echo "=== Port 9092 Status ==="
+        ss -tlnp | grep 9092 || echo "Port 9092 not listening"
 
     # ------------------------------------------------------------------
     # TEARDOWN: Cleanup
@@ -202,22 +251,3 @@ jobs:
       if: always()
       # Ensures the background Postgres process is killed, freeing resources.
       run: cargo pgrx stop pg14
-
-  # ------------------------------------------------------------------
-  # AI REVIEWER: Automated Code Review via Gemini
-  # ------------------------------------------------------------------
-  ai-review:
-    name: AI Code Review
-    runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Run Gemini Review
-        uses: google-github-actions/run-gemini-cli@v1
-        with:
-          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
-          prompt: "Review this pull request. Focus on Rust safety, correct usage of pgrx, and PostgreSQL extension best practices. Identify potential bugs, security issues, and performance bottlenecks."
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

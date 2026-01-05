@@ -164,6 +164,14 @@ pub const DEFAULT_HOST: &str = "0.0.0.0";
 /// Default host for testing (localhost only)
 pub const TEST_HOST: &str = "localhost";
 
+// ===== Database Configuration =====
+
+/// Default database name for SPI connections
+///
+/// The background worker connects to this database for all SPI operations.
+/// This should match the database where CREATE EXTENSION was run.
+pub const DEFAULT_DATABASE: &str = "postgres";
+
 // ===== Kafka Error Codes =====
 // See: https://kafka.apache.org/protocol.html#protocol_error_codes
 
