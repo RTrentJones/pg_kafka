@@ -192,7 +192,7 @@ jobs:
         # Check if already configured (idempotency)
         if ! grep -q "shared_preload_libraries.*pg_kafka" "$PG14_DATA_DIR/postgresql.conf"; then
           # Use printf to ensure a preceding newline, preventing config corruption
-          printf "\nshared_preload_libraries = 'pg_kafka'\npg_kafka.host = '127.0.0.1'\n" >> "$PG14_DATA_DIR/postgresql.conf"
+          printf "\nshared_preload_libraries = 'pg_kafka'\npg_kafka.host = '::1'\n" >> "$PG14_DATA_DIR/postgresql.conf"
           echo "Configuration updated to preload pg_kafka."
         else
           echo "pg_kafka already configured in shared_preload_libraries."
