@@ -48,6 +48,42 @@ pub enum KafkaError {
     /// Consumer group coordinator error
     #[error("Coordinator error (code {0}): {1}")]
     CoordinatorError(i16, String),
+
+    /// Schema or required table not found
+    #[error("Schema not found: {0}")]
+    SchemaNotFound(String),
+
+    /// Topic does not exist
+    #[error("Topic not found: {0}")]
+    TopicNotFound(String),
+}
+
+use crate::kafka::constants::{
+    ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION, ERROR_UNSUPPORTED_VERSION,
+};
+
+impl KafkaError {
+    /// Convert this error to a Kafka protocol error code
+    ///
+    /// This allows returning proper Kafka error codes to clients instead of
+    /// generic server errors.
+    pub fn to_kafka_error_code(&self) -> i16 {
+        match self {
+            KafkaError::UnsupportedApiKey(_) => ERROR_UNSUPPORTED_VERSION,
+            KafkaError::TopicNotFound(_) => ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+            KafkaError::SchemaNotFound(_) => ERROR_UNKNOWN_SERVER_ERROR,
+            KafkaError::CoordinatorError(code, _) => *code,
+            KafkaError::Protocol { code, .. } => *code,
+            // All other errors map to unknown server error
+            KafkaError::InvalidRequestSize(_)
+            | KafkaError::RequestTooShort { .. }
+            | KafkaError::Io(_)
+            | KafkaError::Encoding(_)
+            | KafkaError::InvalidConfig(_)
+            | KafkaError::ProtocolCodec(_)
+            | KafkaError::Internal(_) => ERROR_UNKNOWN_SERVER_ERROR,
+        }
+    }
 }
 
 /// Result type alias for Kafka operations

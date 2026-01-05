@@ -2,7 +2,9 @@
 //!
 //! These mocks allow testing without the PostgreSQL runtime.
 
-use crate::kafka::constants::{DEFAULT_KAFKA_PORT, DEFAULT_SHUTDOWN_TIMEOUT_MS, TEST_HOST};
+use crate::kafka::constants::{
+    DEFAULT_DATABASE, DEFAULT_KAFKA_PORT, DEFAULT_SHUTDOWN_TIMEOUT_MS, TEST_HOST,
+};
 use crate::kafka::error::Result;
 use crate::kafka::messages::Record;
 use crate::kafka::storage::{CommittedOffset, FetchedMessage, KafkaStore, TopicMetadata};
@@ -71,7 +73,7 @@ pub fn mock_config() -> crate::config::Config {
     crate::config::Config {
         port: DEFAULT_KAFKA_PORT,
         host: TEST_HOST.to_string(),
-        database: "pg_kafka_test".to_string(),
+        database: DEFAULT_DATABASE.to_string(),
         log_connections: false,
         shutdown_timeout_ms: DEFAULT_SHUTDOWN_TIMEOUT_MS,
     }

@@ -21,25 +21,21 @@ use crate::{pg_log, pg_warning};
 /// Run the TCP listener
 ///
 /// This is the main entry point for the Kafka protocol listener.
-/// It binds to the configured host and port and spawns a new async task
+/// It accepts a pre-bound TcpListener and spawns a new async task
 /// for each incoming connection.
 ///
 /// The shutdown_rx channel is used to signal when the worker should stop.
 /// This allows graceful shutdown when Postgres sends SIGTERM.
 ///
-/// In Step 3, we parse Kafka protocol requests (ApiVersions) and send responses
-/// via the message queue to the background worker's main thread.
+/// NOTE: The TcpListener is created and bound in worker.rs BEFORE this function
+/// is called. This ensures that bind failures are fatal and immediate, not
+/// hidden in retry loops.
 pub async fn run(
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
-    host: &str,
-    port: i32,
+    listener: TcpListener,
     log_connections: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Bind to configured host and port
-    let bind_addr = format!("{}:{}", host, port);
-    let listener = TcpListener::bind(&bind_addr).await?;
-
-    pg_log!("pg_kafka TCP listener bound to {}", bind_addr);
+    pg_log!("pg_kafka TCP listener started");
 
     // Accept loop: wait for new connections OR shutdown signal
     loop {

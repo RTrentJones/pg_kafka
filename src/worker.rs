@@ -6,10 +6,52 @@
 
 use pgrx::bgworkers::{BackgroundWorker, SignalWakeFlags};
 use pgrx::prelude::*;
+use pgrx::Spi;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 
 // Import conditional logging macros from lib.rs
 use crate::kafka::constants::*;
 use crate::{pg_log, pg_warning};
+
+/// Verify that the kafka schema and required tables exist.
+/// Returns Ok(()) if all tables exist, Err with description if any are missing.
+fn verify_schema(database: &str) -> Result<(), String> {
+    let required_tables = ["topics", "messages", "consumer_offsets"];
+
+    let result: Result<Option<String>, pgrx::spi::SpiError> = Spi::connect(|client| {
+        for table in required_tables {
+            let query = format!(
+                "SELECT 1 FROM information_schema.tables \
+                 WHERE table_schema = 'kafka' AND table_name = '{}'",
+                table
+            );
+            match client.select(&query, None, &[]) {
+                Ok(tup_table) => {
+                    if tup_table.is_empty() {
+                        return Ok(Some(format!(
+                            "Required table kafka.{} does not exist. \
+                             Run 'CREATE EXTENSION pg_kafka' in database '{}'",
+                            table, database
+                        )));
+                    }
+                }
+                Err(e) => {
+                    return Ok(Some(format!(
+                        "Failed to check for table kafka.{}: {}",
+                        table, e
+                    )));
+                }
+            }
+        }
+        Ok(None) // All tables exist
+    });
+
+    match result {
+        Ok(None) => Ok(()),
+        Ok(Some(e)) => Err(e),
+        Err(e) => Err(format!("Schema verification failed: {}", e)),
+    }
+}
 
 /// Main entry point for the pg_kafka background worker.
 ///
@@ -30,6 +72,12 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     // Step 3: Connect to the configured database (required for SPI access)
     // IMPORTANT: Must connect to the database where CREATE EXTENSION was run
     BackgroundWorker::connect_worker_to_spi(Some(&config.database), None);
+
+    // Step 3b: Verify schema exists before starting listener
+    // This catches missing CREATE EXTENSION early with a clear error message
+    if let Err(e) = verify_schema(&config.database) {
+        pgrx::error!("pg_kafka schema not initialized: {}", e);
+    }
 
     log!(
         "pg_kafka background worker started (port: {}, host: {}, database: {})",
@@ -69,38 +117,37 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     // Clone host for worker processing (will be borrowed by async closure)
     let broker_host = host.clone();
 
+    // Step 6b: Bind TCP listener BEFORE starting async tasks
+    // This ensures bind failures are fatal and immediate, not hidden in retry loops
+    let bind_addr = format!("{}:{}", host, port);
+    let tcp_listener = local_set.block_on(&runtime, async {
+        tokio::net::TcpListener::bind(&bind_addr).await
+    });
+
+    let tcp_listener = match tcp_listener {
+        Ok(listener) => {
+            pg_log!("TCP listener bound to {}", bind_addr);
+            listener
+        }
+        Err(e) => {
+            pgrx::error!(
+                "FATAL: Cannot bind to {}: {}. Check if port {} is already in use.",
+                bind_addr,
+                e,
+                port
+            );
+        }
+    };
+
     // Spawn the listener task on the LocalSet
     pg_log!("Spawning TCP listener task on LocalSet");
     let listener_handle = local_set.spawn_local(async move {
-        pg_log!("Listener task started, entering retry loop");
-        loop {
-            let rx = shutdown_rx.clone();
-            if *rx.borrow() {
-                pg_log!("Listener task: shutdown signal detected, exiting");
-                break;
-            }
-
-            pg_log!("Listener task: calling run_listener on {}:{}", host, port);
-            match crate::kafka::run_listener(rx, &host, port, log_connections).await {
-                Ok(_) => {
-                    pg_log!("TCP listener exited normally");
-                    break;
-                }
-                Err(e) => {
-                    pgrx::warning!("TCP listener error: {}. Restarting...", e);
-
-                    // Check shutdown before sleeping to avoid unnecessary delay
-                    if *shutdown_rx.borrow() {
-                        break;
-                    }
-                    // Make sleep interruptible by shutdown signal
-                    let mut rx = shutdown_rx.clone();
-                    tokio::select! {
-                        _ = tokio::time::sleep(core::time::Duration::from_millis(1000)) => {}
-                        _ = rx.changed() => {}
-                    }
-                }
-            }
+        pg_log!("Listener task started");
+        // No retry loop needed - binding already succeeded above
+        if let Err(e) =
+            crate::kafka::listener::run(shutdown_rx, tcp_listener, log_connections).await
+        {
+            pgrx::warning!("TCP listener error: {}", e);
         }
         pg_log!("Listener task exiting");
     });
@@ -174,7 +221,23 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
             let broker_h = broker_host.clone();
             let broker_p = port;
             BackgroundWorker::transaction(move || {
-                process_request(request, &coord, &broker_h, broker_p);
+                // Wrap in catch_unwind to prevent handler panics from crashing the worker
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    process_request(request, &coord, &broker_h, broker_p);
+                }));
+
+                if let Err(panic_info) = result {
+                    // Extract panic message for logging
+                    let panic_msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                        s.to_string()
+                    } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "Unknown panic".to_string()
+                    };
+                    pg_warning!("Handler panic caught (worker survived): {}", panic_msg);
+                    // Note: Response channel may be closed, but worker continues
+                }
             });
         }
 
@@ -350,7 +413,7 @@ pub fn process_request(
                     pg_warning!("Failed to handle Metadata request: {}", e);
                     let error_response = KafkaResponse::Error {
                         correlation_id,
-                        error_code: ERROR_UNKNOWN_SERVER_ERROR,
+                        error_code: e.to_kafka_error_code(),
                         error_message: Some(format!("Failed to handle Metadata request: {}", e)),
                     };
                     if let Err(e) = response_tx.send(error_response) {
@@ -422,7 +485,7 @@ pub fn process_request(
                     pg_warning!("Failed to handle Produce request: {}", e);
                     let error_response = KafkaResponse::Error {
                         correlation_id,
-                        error_code: ERROR_UNKNOWN_SERVER_ERROR,
+                        error_code: e.to_kafka_error_code(),
                         error_message: Some(format!("Failed to handle Produce request: {}", e)),
                     };
                     if let Err(e) = response_tx.send(error_response) {
@@ -468,7 +531,7 @@ pub fn process_request(
                     pg_warning!("Failed to handle Fetch request: {}", e);
                     let error_response = KafkaResponse::Error {
                         correlation_id,
-                        error_code: ERROR_UNKNOWN_SERVER_ERROR,
+                        error_code: e.to_kafka_error_code(),
                         error_message: Some(format!("Failed to handle Fetch request: {}", e)),
                     };
                     if let Err(e) = response_tx.send(error_response) {
@@ -512,7 +575,7 @@ pub fn process_request(
                     pg_warning!("Failed to handle OffsetCommit request: {}", e);
                     let error_response = KafkaResponse::Error {
                         correlation_id,
-                        error_code: ERROR_UNKNOWN_SERVER_ERROR,
+                        error_code: e.to_kafka_error_code(),
                         error_message: Some(format!(
                             "Failed to handle OffsetCommit request: {}",
                             e
@@ -559,7 +622,7 @@ pub fn process_request(
                     pg_warning!("Failed to handle OffsetFetch request: {}", e);
                     let error_response = KafkaResponse::Error {
                         correlation_id,
-                        error_code: ERROR_UNKNOWN_SERVER_ERROR,
+                        error_code: e.to_kafka_error_code(),
                         error_message: Some(format!("Failed to handle OffsetFetch request: {}", e)),
                     };
                     if let Err(e) = response_tx.send(error_response) {
@@ -600,7 +663,7 @@ pub fn process_request(
                     pg_warning!("Failed to handle FindCoordinator request: {}", e);
                     let error_response = KafkaResponse::Error {
                         correlation_id,
-                        error_code: crate::kafka::ERROR_UNKNOWN_SERVER_ERROR,
+                        error_code: e.to_kafka_error_code(),
                         error_message: Some(format!(
                             "Failed to handle FindCoordinator request: {}",
                             e
@@ -653,7 +716,7 @@ pub fn process_request(
                     pg_warning!("Failed to handle JoinGroup request: {}", e);
                     let error_response = KafkaResponse::Error {
                         correlation_id,
-                        error_code: crate::kafka::ERROR_UNKNOWN_SERVER_ERROR,
+                        error_code: e.to_kafka_error_code(),
                         error_message: Some(format!("Failed to handle JoinGroup request: {}", e)),
                     };
                     if let Err(e) = response_tx.send(error_response) {
@@ -697,7 +760,7 @@ pub fn process_request(
                     pg_warning!("Failed to handle SyncGroup request: {}", e);
                     let error_response = KafkaResponse::Error {
                         correlation_id,
-                        error_code: crate::kafka::ERROR_UNKNOWN_SERVER_ERROR,
+                        error_code: e.to_kafka_error_code(),
                         error_message: Some(format!("Failed to handle SyncGroup request: {}", e)),
                     };
                     if let Err(e) = response_tx.send(error_response) {
@@ -739,7 +802,7 @@ pub fn process_request(
                     pg_warning!("Failed to handle Heartbeat request: {}", e);
                     let error_response = KafkaResponse::Error {
                         correlation_id,
-                        error_code: crate::kafka::ERROR_UNKNOWN_SERVER_ERROR,
+                        error_code: e.to_kafka_error_code(),
                         error_message: Some(format!("Failed to handle Heartbeat request: {}", e)),
                     };
                     if let Err(e) = response_tx.send(error_response) {
@@ -779,7 +842,7 @@ pub fn process_request(
                     pg_warning!("Failed to handle LeaveGroup request: {}", e);
                     let error_response = KafkaResponse::Error {
                         correlation_id,
-                        error_code: crate::kafka::ERROR_UNKNOWN_SERVER_ERROR,
+                        error_code: e.to_kafka_error_code(),
                         error_message: Some(format!("Failed to handle LeaveGroup request: {}", e)),
                     };
                     if let Err(e) = response_tx.send(error_response) {
@@ -823,7 +886,7 @@ pub fn process_request(
                     pg_warning!("Failed to handle ListOffsets request: {}", e);
                     let error_response = KafkaResponse::Error {
                         correlation_id,
-                        error_code: crate::kafka::ERROR_UNKNOWN_SERVER_ERROR,
+                        error_code: e.to_kafka_error_code(),
                         error_message: Some(format!("Failed to handle ListOffsets request: {}", e)),
                     };
                     if let Err(e) = response_tx.send(error_response) {
@@ -865,7 +928,7 @@ pub fn process_request(
                         pg_warning!("Failed to handle DescribeGroups request: {}", e);
                         let error_response = KafkaResponse::Error {
                             correlation_id,
-                            error_code: crate::kafka::ERROR_UNKNOWN_SERVER_ERROR,
+                            error_code: e.to_kafka_error_code(),
                             error_message: Some(format!(
                                 "Failed to handle DescribeGroups request: {}",
                                 e
@@ -910,7 +973,7 @@ pub fn process_request(
                         pg_warning!("Failed to handle ListGroups request: {}", e);
                         let error_response = KafkaResponse::Error {
                             correlation_id,
-                            error_code: crate::kafka::ERROR_UNKNOWN_SERVER_ERROR,
+                            error_code: e.to_kafka_error_code(),
                             error_message: Some(format!(
                                 "Failed to handle ListGroups request: {}",
                                 e
