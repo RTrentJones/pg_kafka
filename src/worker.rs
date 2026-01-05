@@ -297,6 +297,9 @@ pub fn process_request(
                 config.host.clone()
             };
 
+            // Log the final advertised address to help debug connection issues
+            pg_log!("Kafka listener advertising address: {}", advertised_host);
+
             // Create storage and use handler
             let store = PostgresStore::new();
             let kafka_response = match handlers::handle_metadata(
