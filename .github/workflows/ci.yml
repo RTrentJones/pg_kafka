@@ -180,11 +180,14 @@ jobs:
         fi
         echo "Using Postgres data directory at: $PG14_DATA_DIR"
 
+        # Get the current user for database configuration
+        DB_USER=$(whoami)
+
         # Check if already configured (idempotency)
         if ! grep -q "shared_preload_libraries.*pg_kafka" "$PG14_DATA_DIR/postgresql.conf"; then
           # Use printf to ensure a preceding newline, preventing config corruption
-          printf "\nshared_preload_libraries = 'pg_kafka'\npg_kafka.host = '0.0.0.0'\n" >> "$PG14_DATA_DIR/postgresql.conf"
-          echo "Configuration updated to preload pg_kafka."
+          printf "\nshared_preload_libraries = 'pg_kafka'\npg_kafka.host = '0.0.0.0'\npg_kafka.database = 'postgres'\n" >> "$PG14_DATA_DIR/postgresql.conf"
+          echo "Configuration updated to preload pg_kafka with host=0.0.0.0 and database=postgres."
         else
           echo "pg_kafka already configured in shared_preload_libraries."
         fi
