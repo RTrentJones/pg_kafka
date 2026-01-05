@@ -52,7 +52,7 @@
   },
 
   // Post-create commands
-  "postCreateCommand": "rustup update && cargo pgrx init --pg14 download",
+  "postCreateCommand": "rustup update && cargo pgrx init --pg14 download && curl -s https://raw.githubusercontent.com/nektos/act/master/install.sh | sudo bash",
 
   // Environment variables
   "remoteEnv": {
