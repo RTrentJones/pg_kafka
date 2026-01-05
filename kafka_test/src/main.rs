@@ -10,8 +10,16 @@ use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, Consumer, StreamConsumer};
 use rdkafka::message::Message;
 use rdkafka::producer::{FutureProducer, FutureRecord};
+use std::env;
 use std::time::Duration;
 use tokio_postgres::NoTls;
+
+/// Get database connection string from DATABASE_URL env var or use default
+fn get_database_url() -> String {
+    env::var("DATABASE_URL").unwrap_or_else(|_| {
+        "host=localhost port=28814 user=postgres dbname=postgres".to_string()
+    })
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -84,7 +92,8 @@ async fn test_producer() -> Result<(), Box<dyn std::error::Error>> {
 
     // Connect to PostgreSQL
     println!("Connecting to PostgreSQL...");
-    let (client, connection) = tokio_postgres::connect("host=localhost port=28814 user=postgres dbname=postgres", NoTls).await?;
+    let db_url = get_database_url();
+    let (client, connection) = tokio_postgres::connect(&db_url, NoTls).await?;
 
     // Spawn connection handler
     tokio::spawn(async move {
@@ -353,7 +362,8 @@ async fn test_consumer_from_offset() -> Result<(), Box<dyn std::error::Error>> {
 
     // 2. Verify messages are in the database
     println!("\nStep 2: Verifying messages in database...");
-    let (db_client, connection) = tokio_postgres::connect("host=localhost port=28814 user=postgres dbname=postgres", NoTls).await?;
+    let db_url = get_database_url();
+    let (db_client, connection) = tokio_postgres::connect(&db_url, NoTls).await?;
 
     tokio::spawn(async move {
         if let Err(e) = connection.await {
@@ -471,7 +481,8 @@ async fn test_offset_commit_fetch() -> Result<(), Box<dyn std::error::Error>> {
 
     // 4. Verify offsets in database
     println!("\nStep 4: Verifying committed offsets in database...");
-    let (db_client, connection) = tokio_postgres::connect("host=localhost port=28814 user=postgres dbname=postgres", NoTls).await?;
+    let db_url = get_database_url();
+    let (db_client, connection) = tokio_postgres::connect(&db_url, NoTls).await?;
 
     tokio::spawn(async move {
         if let Err(e) = connection.await {
