@@ -73,7 +73,6 @@ pub fn mock_config() -> crate::config::Config {
         host: TEST_HOST.to_string(),
         log_connections: false,
         shutdown_timeout_ms: DEFAULT_SHUTDOWN_TIMEOUT_MS,
-        database: "postgres".to_string(),
     }
 }
 
@@ -90,7 +89,6 @@ mod tests {
         assert_eq!(config.host, TEST_HOST);
         assert!(!config.log_connections);
         assert_eq!(config.shutdown_timeout_ms, DEFAULT_SHUTDOWN_TIMEOUT_MS);
-        assert_eq!(config.database, "postgres");
     }
 
     #[test]

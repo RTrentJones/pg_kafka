@@ -29,7 +29,6 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
 
     // Step 3: Connect to the configured database (required for SPI access)
     // IMPORTANT: Must connect to the database where CREATE EXTENSION was run
-    // Uses the pg_kafka.database GUC parameter (defaults to "postgres")
     BackgroundWorker::connect_worker_to_spi(Some(&config.database), None);
 
     log!(

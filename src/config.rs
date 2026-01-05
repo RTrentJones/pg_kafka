@@ -22,7 +22,6 @@ pub struct Config {
     pub database: String,
     pub log_connections: bool,
     pub shutdown_timeout_ms: i32,
-    pub database: String,
 }
 
 impl Config {
@@ -43,11 +42,6 @@ impl Config {
                 .unwrap_or_else(|| DEFAULT_DATABASE.to_string()),
             log_connections: LOG_CONNECTIONS.get(),
             shutdown_timeout_ms: SHUTDOWN_TIMEOUT_MS.get(),
-            database: DATABASE
-                .get()
-                .as_deref()
-                .map(|c| c.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "postgres".to_string()),
         }
     }
 
@@ -60,7 +54,6 @@ impl Config {
             database: DEFAULT_DATABASE.to_string(),
             log_connections: false,
             shutdown_timeout_ms: DEFAULT_SHUTDOWN_TIMEOUT_MS,
-            database: "postgres".to_string(),
         }
     }
 }
@@ -73,7 +66,6 @@ static HOST: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(No
 static DATABASE: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 static LOG_CONNECTIONS: GucSetting<bool> = GucSetting::<bool>::new(false);
 static SHUTDOWN_TIMEOUT_MS: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_SHUTDOWN_TIMEOUT_MS);
-static DATABASE: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 
 /// Initialize GUC parameters
 pub fn init() {
@@ -123,15 +115,6 @@ pub fn init() {
         MIN_SHUTDOWN_TIMEOUT_MS,
         60000,
         GucContext::Suset,
-        GucFlags::default(),
-    );
-
-    GucRegistry::define_string_guc(
-        c"pg_kafka.database",
-        c"Database to connect to for SPI operations",
-        c"The database name for storage operations. Defaults to 'postgres'.",
-        &DATABASE,
-        GucContext::Postmaster,
         GucFlags::default(),
     );
 
