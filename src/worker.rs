@@ -163,26 +163,20 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
         // ┌─────────────────────────────────────────────────────────────┐
         // │ PART 2: Drive Async Network I/O (ASYNC, Non-blocking)      │
         // └─────────────────────────────────────────────────────────────┘
-        // block_on() is NOT a mistake here. We're running a sync loop
-        // that periodically executes async code for 100ms.
-        // This drives the LocalSet forward, processing:
+        // Drive the LocalSet forward for a short duration to process async tasks:
         // - TCP accept() calls
         // - Socket read()/write() calls
         // - Kafka protocol parsing
         // Then we return to sync context to process database requests.
-        runtime.block_on(async {
-            tokio::select! {
-                // Timeout after ASYNC_IO_INTERVAL_MS to return to sync processing
-                _ = tokio::time::sleep(core::time::Duration::from_millis(crate::kafka::ASYNC_IO_INTERVAL_MS)) => {
-                    // Normal path: timeout reached, go check for database requests
-                }
-                // Fallback: If listener exits (shouldn't happen during normal operation)
-                _ = local_set.run_until(async {
-                    std::future::pending::<()>().await
-                }) => {
-                    // LocalSet completed - listener task finished unexpectedly
-                }
-            }
+        //
+        // CRITICAL: Use LocalSet::block_on with the runtime to properly poll tasks.
+        // The timeout ensures we return to sync context to process database requests.
+        local_set.block_on(&runtime, async {
+            let _ = tokio::time::timeout(
+                core::time::Duration::from_millis(crate::kafka::ASYNC_IO_INTERVAL_MS),
+                std::future::pending::<()>(),
+            )
+            .await;
         });
 
         // ┌─────────────────────────────────────────────────────────────┐
