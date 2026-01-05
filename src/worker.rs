@@ -24,15 +24,18 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     // Step 1: Attach to Postgres signal handling system
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
 
-    // Step 2: Connect to the database (required for SPI access in future)
-    BackgroundWorker::connect_worker_to_spi(Some("postgres"), None);
-
-    // Step 3: Load configuration
+    // Step 2: Load configuration (GUCs are available after _PG_init)
     let config = crate::config::Config::load();
+
+    // Step 3: Connect to the configured database (required for SPI access)
+    // IMPORTANT: Must connect to the database where CREATE EXTENSION was run
+    BackgroundWorker::connect_worker_to_spi(Some(&config.database), None);
+
     log!(
-        "pg_kafka background worker started (port: {}, host: {})",
+        "pg_kafka background worker started (port: {}, host: {}, database: {})",
         config.port,
-        config.host
+        config.host,
+        config.database
     );
 
     // Step 4: Create shutdown channel for communicating between sync and async worlds

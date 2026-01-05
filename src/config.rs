@@ -8,7 +8,8 @@
 use pgrx::{GucContext, GucFlags, GucRegistry, GucSetting};
 
 use crate::kafka::constants::{
-    DEFAULT_HOST, DEFAULT_KAFKA_PORT, DEFAULT_SHUTDOWN_TIMEOUT_MS, MIN_SHUTDOWN_TIMEOUT_MS,
+    DEFAULT_DATABASE, DEFAULT_HOST, DEFAULT_KAFKA_PORT, DEFAULT_SHUTDOWN_TIMEOUT_MS,
+    MIN_SHUTDOWN_TIMEOUT_MS,
 };
 
 #[cfg(test)]
@@ -18,6 +19,7 @@ use crate::kafka::constants::TEST_HOST;
 pub struct Config {
     pub port: i32,
     pub host: String,
+    pub database: String,
     pub log_connections: bool,
     pub shutdown_timeout_ms: i32,
 }
@@ -33,6 +35,11 @@ impl Config {
                 .as_deref()
                 .map(|c| c.to_string_lossy().into_owned())
                 .unwrap_or_else(|| DEFAULT_HOST.to_string()),
+            database: DATABASE
+                .get()
+                .as_deref()
+                .map(|c| c.to_string_lossy().into_owned())
+                .unwrap_or_else(|| DEFAULT_DATABASE.to_string()),
             log_connections: LOG_CONNECTIONS.get(),
             shutdown_timeout_ms: SHUTDOWN_TIMEOUT_MS.get(),
         }
@@ -44,6 +51,7 @@ impl Config {
         Config {
             port: DEFAULT_KAFKA_PORT,
             host: TEST_HOST.to_string(),
+            database: DEFAULT_DATABASE.to_string(),
             log_connections: false,
             shutdown_timeout_ms: DEFAULT_SHUTDOWN_TIMEOUT_MS,
         }
@@ -55,6 +63,7 @@ use std::ffi::CString;
 
 static PORT: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_KAFKA_PORT);
 static HOST: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
+static DATABASE: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 static LOG_CONNECTIONS: GucSetting<bool> = GucSetting::<bool>::new(false);
 static SHUTDOWN_TIMEOUT_MS: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_SHUTDOWN_TIMEOUT_MS);
 
@@ -76,6 +85,15 @@ pub fn init() {
         c"Host/interface to bind to",
         c"The network interface to listen on. Use 0.0.0.0 for all interfaces. Requires restart.",
         &HOST,
+        GucContext::Postmaster,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_string_guc(
+        c"pg_kafka.database",
+        c"Database to connect to for SPI operations",
+        c"The database where CREATE EXTENSION pg_kafka was run. Default: postgres. Requires restart.",
+        &DATABASE,
         GucContext::Postmaster,
         GucFlags::default(),
     );
