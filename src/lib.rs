@@ -98,7 +98,10 @@ fn hello_pg_kafka() -> &'static str {
     "Hello, pg_kafka"
 }
 
-// #[cfg(any(test, feature = "pg_test"))]
+// Include bootstrap SQL to create kafka schema and tables
+pgrx::extension_sql_file!("../sql/bootstrap.sql");
+
+// #[cfg(any(test, feature = "pg_test")]]
 // #[pg_schema]
 // mod tests {
 //     use pgrx::prelude::*;
