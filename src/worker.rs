@@ -187,13 +187,13 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
         // CRITICAL: Use LocalSet::block_on with the runtime to properly poll tasks.
         // The timeout ensures we return to sync context to process database requests.
         local_set.block_on(&runtime, async {
-            let timeout_result = tokio::time::timeout(
+            // Use timeout to limit async processing duration, then return to sync context
+            let _ = tokio::time::timeout(
                 core::time::Duration::from_millis(crate::kafka::ASYNC_IO_INTERVAL_MS),
                 std::future::pending::<()>(),
             )
             .await;
-            // Timeout is expected - it means we processed I/O for 100ms and now returning to sync
-            debug_assert!(timeout_result.is_err(), "pending() should never complete");
+            // Timeout is expected (Err) - it means we processed I/O for 100ms
         });
 
         // ┌─────────────────────────────────────────────────────────────┐

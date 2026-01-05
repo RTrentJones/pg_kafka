@@ -198,10 +198,38 @@ jobs:
           echo "pg_kafka already configured in shared_preload_libraries."
         fi
 
+    - name: Verify Configuration Before Start
+      run: |
+        PG14_DATA_DIR=$(find ~/.pgrx -maxdepth 1 -type d -name "data-14*" | head -n 1)
+        echo "=== postgresql.conf settings ==="
+        grep -E "(shared_preload_libraries|pg_kafka)" "$PG14_DATA_DIR/postgresql.conf" || echo "No pg_kafka config found!"
+        echo ""
+        echo "=== Checking if pg_kafka.so exists ==="
+        find ~/.pgrx -name "pg_kafka.so" -ls
+        echo ""
+        echo "=== Checking pg_kafka.control ==="
+        find ~/.pgrx -name "pg_kafka.control" -ls
+
     - name: Start Postgres
       # Boots the pgrx-managed Postgres 14 instance.
       # Because we configured shared_preload_libraries above, the background worker will start now.
       run: cargo pgrx start pg14
+
+    - name: Check Postgres Startup Logs
+      run: |
+        sleep 2
+        PG14_DATA_DIR=$(find ~/.pgrx -maxdepth 1 -type d -name "data-14*" | head -n 1)
+        echo "=== Recent Postgres Logs ==="
+        if [ -f "$PG14_DATA_DIR/logfile" ]; then
+          tail -50 "$PG14_DATA_DIR/logfile"
+        else
+          echo "No logfile at $PG14_DATA_DIR/logfile"
+          find "$PG14_DATA_DIR" -name "*.log" -o -name "logfile" 2>/dev/null
+        fi
+        echo ""
+        echo "=== Checking for pg_kafka background worker ==="
+        PG_PORT=$(grep "port =" "$PG14_DATA_DIR/postgresql.conf" | awk '{print $3}')
+        psql -h localhost -p "$PG_PORT" -U "$(whoami)" -d postgres -c "SELECT pid, backend_type, wait_event_type FROM pg_stat_activity WHERE backend_type LIKE '%pg_kafka%';" || echo "Could not query pg_stat_activity"
 
     - name: Create Extension and Prepare DB
       run: |

@@ -65,8 +65,11 @@ macro_rules! pg_warning {
 pub unsafe extern "C-unwind" fn _PG_init() {
     use pgrx::bgworkers::BgWorkerStartTime;
 
+    pgrx::log!("pg_kafka: _PG_init() called - extension loading");
+
     // Initialize GUC configuration parameters
     config::init();
+    pgrx::log!("pg_kafka: GUC configuration initialized");
 
     // Register the pg_kafka background worker with PostgreSQL.
     //
@@ -78,12 +81,16 @@ pub unsafe extern "C-unwind" fn _PG_init() {
     //
     // enable_spi_access() allows the worker to connect to the database and
     // execute SQL queries (we'll use this in Phase 2).
+    pgrx::log!("pg_kafka: Registering background worker 'pg_kafka_listener'");
     BackgroundWorkerBuilder::new("pg_kafka_listener")
         .set_function("pg_kafka_listener_main")
         .set_library("pg_kafka")
         .set_start_time(BgWorkerStartTime::PostmasterStart)
         .enable_spi_access()
         .load();
+
+    pgrx::log!("pg_kafka: Background worker registered successfully");
+    pgrx::log!("pg_kafka: _PG_init() completed");
 }
 
 #[pg_extern]
