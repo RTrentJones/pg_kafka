@@ -192,7 +192,7 @@ jobs:
         # Check if already configured (idempotency)
         if ! grep -q "shared_preload_libraries.*pg_kafka" "$PG14_DATA_DIR/postgresql.conf"; then
           # Use printf to ensure a preceding newline, preventing config corruption
-          printf "\nshared_preload_libraries = 'pg_kafka'\npg_kafka.host = '::1'\n" >> "$PG14_DATA_DIR/postgresql.conf"
+          printf "\nshared_preload_libraries = 'pg_kafka'\npg_kafka.host = '0.0.0.0'\n" >> "$PG14_DATA_DIR/postgresql.conf"
           echo "Configuration updated to preload pg_kafka."
         else
           echo "pg_kafka already configured in shared_preload_libraries."
@@ -260,7 +260,7 @@ jobs:
       timeout-minutes: 1
       run: |
         echo "Waiting for port 9092..."
-        timeout 30s bash -c 'until nc -z localhost 9092; do sleep 1; done'
+        timeout 30s bash -c 'until nc -z 127.0.0.1 9092; do sleep 1; done'
         echo "Port 9092 is open!"
         sleep 3 # Wait for protocol readiness (Fixes CI race condition)
 
@@ -293,9 +293,10 @@ jobs:
       run: |
         echo "=== FULL Postgres Logs ==="
         PG14_DATA_DIR=$(find ~/.pgrx -maxdepth 1 -type d -name "data-14*" | head -n 1)
-        if [ -f "$PG14_DATA_DIR/logfile" ]; then
-          cat "$PG14_DATA_DIR/logfile"
-        fi
+        # Try standard pgrx log location first, then data dir
+        find ~/.pgrx -name "14.log" -exec cat {} + || \
+        find "$PG14_DATA_DIR" -name "logfile" -exec cat {} + || \
+        echo "No log files found."
         echo ""
         echo "=== Background Worker Processes ==="
         ps aux | grep -E "(postgres|pg_kafka)" | grep -v grep || echo "No processes found"
