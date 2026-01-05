@@ -234,6 +234,7 @@ jobs:
         echo "Waiting for port 9092..."
         timeout 30s bash -c 'until nc -z localhost 9092; do sleep 1; done'
         echo "Port 9092 is open!"
+        sleep 3 # Wait for protocol readiness (Fixes CI race condition)
 
     - name: Run E2E Tests
       # Runs the external client application that connects to the running extension

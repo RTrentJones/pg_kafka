@@ -68,9 +68,32 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
 
     // Spawn the listener task on the LocalSet
     let listener_handle = local_set.spawn_local(async move {
-        if let Err(e) = crate::kafka::run_listener(shutdown_rx, &host, port, log_connections).await
-        {
-            pgrx::error!("TCP listener error: {}", e);
+        loop {
+            let rx = shutdown_rx.clone();
+            if *rx.borrow() {
+                break;
+            }
+
+            match crate::kafka::run_listener(rx, &host, port, log_connections).await {
+                Ok(_) => {
+                    pg_log!("TCP listener exited normally");
+                    break;
+                }
+                Err(e) => {
+                    pgrx::warning!("TCP listener error: {}. Restarting...", e);
+
+                    // Check shutdown before sleeping to avoid unnecessary delay
+                    if *shutdown_rx.borrow() {
+                        break;
+                    }
+                    // Make sleep interruptible by shutdown signal
+                    let mut rx = shutdown_rx.clone();
+                    tokio::select! {
+                        _ = tokio::time::sleep(core::time::Duration::from_millis(1000)) => {}
+                        _ = rx.changed() => {}
+                    }
+                }
+            }
         }
     });
 
