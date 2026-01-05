@@ -67,13 +67,17 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     let broker_host = host.clone();
 
     // Spawn the listener task on the LocalSet
+    pg_log!("Spawning TCP listener task on LocalSet");
     let listener_handle = local_set.spawn_local(async move {
+        pg_log!("Listener task started, entering retry loop");
         loop {
             let rx = shutdown_rx.clone();
             if *rx.borrow() {
+                pg_log!("Listener task: shutdown signal detected, exiting");
                 break;
             }
 
+            pg_log!("Listener task: calling run_listener on {}:{}", host, port);
             match crate::kafka::run_listener(rx, &host, port, log_connections).await {
                 Ok(_) => {
                     pg_log!("TCP listener exited normally");
@@ -95,6 +99,7 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
                 }
             }
         }
+        pg_log!("Listener task exiting");
     });
 
     // Step 7: Create consumer group coordinator
@@ -104,6 +109,16 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     // Step 8: Get the request queue receiver
     // This is how we receive Kafka requests from the async tokio tasks
     let request_rx = crate::kafka::request_receiver();
+
+    // CRITICAL: Drive the LocalSet once to ensure the listener task starts
+    // before entering the main loop. Without this, the spawned task might not
+    // begin execution until the first loop iteration.
+    pg_log!("Driving LocalSet to start listener task");
+    local_set.block_on(&runtime, async {
+        // Give the listener task a chance to start and bind to the port
+        tokio::time::sleep(core::time::Duration::from_millis(10)).await;
+    });
+    pg_log!("Entering main event loop");
 
     // Step 9: Main event loop
     // ═══════════════════════════════════════════════════════════════════════════════
@@ -172,11 +187,13 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
         // CRITICAL: Use LocalSet::block_on with the runtime to properly poll tasks.
         // The timeout ensures we return to sync context to process database requests.
         local_set.block_on(&runtime, async {
-            let _ = tokio::time::timeout(
+            let timeout_result = tokio::time::timeout(
                 core::time::Duration::from_millis(crate::kafka::ASYNC_IO_INTERVAL_MS),
                 std::future::pending::<()>(),
             )
             .await;
+            // Timeout is expected - it means we processed I/O for 100ms and now returning to sync
+            debug_assert!(timeout_result.is_err(), "pending() should never complete");
         });
 
         // ┌─────────────────────────────────────────────────────────────┐
