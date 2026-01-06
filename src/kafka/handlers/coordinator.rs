@@ -18,7 +18,7 @@ pub fn handle_find_coordinator(
 ) -> Result<kafka_protocol::messages::find_coordinator_response::FindCoordinatorResponse> {
     use kafka_protocol::messages::find_coordinator_response::FindCoordinatorResponse;
 
-    pgrx::debug1!("FindCoordinator: key={}, key_type={}", key, key_type);
+    crate::pg_debug!("FindCoordinator: key={}, key_type={}", key, key_type);
 
     // Build response - we are always the coordinator for all groups
     let mut response = FindCoordinatorResponse::default();
@@ -53,7 +53,7 @@ pub fn handle_join_group(
         JoinGroupResponse, JoinGroupResponseMember,
     };
 
-    pgrx::debug1!(
+    crate::pg_debug!(
         "JoinGroup: group_id={}, member_id={}, client_id={}",
         group_id,
         member_id,
@@ -78,7 +78,8 @@ pub fn handle_join_group(
 
     // Coordinator returns typed errors (UnknownMemberId, IllegalGeneration, etc.)
     // which map directly to Kafka protocol error codes via to_kafka_error_code()
-    let (assigned_member_id, generation_id, is_leader, members_metadata) = coordinator.join_group(
+    let (assigned_member_id, generation_id, is_leader, leader_id, members_metadata) = coordinator
+        .join_group(
         group_id.clone(),
         existing_member_id,
         client_id,
@@ -96,7 +97,7 @@ pub fn handle_join_group(
     response.generation_id = generation_id;
     response.protocol_type = Some(protocol_type.into());
     response.protocol_name = coord_protocols.first().map(|(name, _)| name.clone().into());
-    response.leader = assigned_member_id.clone().into();
+    response.leader = leader_id.into();
     response.member_id = assigned_member_id.into();
 
     // If this is the leader, include member list
@@ -127,7 +128,7 @@ pub fn handle_sync_group(
 ) -> Result<kafka_protocol::messages::sync_group_response::SyncGroupResponse> {
     use kafka_protocol::messages::sync_group_response::SyncGroupResponse;
 
-    pgrx::debug1!(
+    crate::pg_debug!(
         "SyncGroup: group_id={}, member_id={}, generation_id={}, assignments={}",
         group_id,
         member_id,
@@ -165,7 +166,7 @@ pub fn handle_heartbeat(
 ) -> Result<kafka_protocol::messages::heartbeat_response::HeartbeatResponse> {
     use kafka_protocol::messages::heartbeat_response::HeartbeatResponse;
 
-    pgrx::debug1!(
+    crate::pg_debug!(
         "Heartbeat: group_id={}, member_id={}, generation_id={}",
         group_id,
         member_id,
@@ -193,7 +194,7 @@ pub fn handle_leave_group(
 ) -> Result<kafka_protocol::messages::leave_group_response::LeaveGroupResponse> {
     use kafka_protocol::messages::leave_group_response::LeaveGroupResponse;
 
-    pgrx::debug1!("LeaveGroup: group_id={}, member_id={}", group_id, member_id);
+    crate::pg_debug!("LeaveGroup: group_id={}, member_id={}", group_id, member_id);
 
     // Coordinator returns typed errors (UnknownMemberId, CoordinatorNotAvailable)
     // which map directly to Kafka protocol error codes via to_kafka_error_code()

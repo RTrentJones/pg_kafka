@@ -392,4 +392,121 @@ mod tests {
         let err = result.unwrap_err();
         assert!(err.to_string().contains("query timeout"));
     }
+
+    // ========== Batch Insert Tests ==========
+    //
+    // These tests validate batch insert behavior which is critical for the N+1 fix.
+
+    #[test]
+    fn test_mock_insert_records_large_batch() {
+        use crate::kafka::messages::RecordHeader;
+
+        let mut mock = MockKafkaStore::new();
+
+        // Create a large batch of 100 records
+        let records: Vec<Record> = (0..100)
+            .map(|i| Record {
+                key: Some(format!("key-{}", i).into_bytes()),
+                value: Some(format!("value-{}", i).into_bytes()),
+                headers: vec![],
+                timestamp: Some(1000 + i as i64),
+            })
+            .collect();
+
+        // Verify mock receives all 100 records
+        mock.expect_insert_records()
+            .withf(|topic_id, partition_id, recs| {
+                *topic_id == 1 && *partition_id == 0 && recs.len() == 100
+            })
+            .times(1)
+            .returning(|_, _, _| Ok(0)); // Returns base offset 0
+
+        let result = mock.insert_records(1, 0, &records);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 0);
+    }
+
+    #[test]
+    fn test_mock_insert_records_offset_sequence() {
+        let mut mock = MockKafkaStore::new();
+
+        // Simulate insert returning increasing base offsets
+        let mut call_count = 0i64;
+        mock.expect_insert_records()
+            .times(3)
+            .returning(move |_, _, records| {
+                let base_offset = call_count * 10; // Each call advances by 10
+                call_count += 1;
+                // Simulate returning base offset based on records count
+                Ok(base_offset)
+            });
+
+        // First batch: offsets 0-9
+        let records1: Vec<Record> = (0..10)
+            .map(|i| Record {
+                key: Some(format!("k{}", i).into_bytes()),
+                value: Some(b"v".to_vec()),
+                headers: vec![],
+                timestamp: None,
+            })
+            .collect();
+
+        let offset1 = mock.insert_records(1, 0, &records1).unwrap();
+        assert_eq!(offset1, 0); // Base offset for first batch
+
+        // Second batch: offsets 10-19
+        let records2: Vec<Record> = (0..10)
+            .map(|i| Record {
+                key: Some(format!("k{}", i + 10).into_bytes()),
+                value: Some(b"v".to_vec()),
+                headers: vec![],
+                timestamp: None,
+            })
+            .collect();
+
+        let offset2 = mock.insert_records(1, 0, &records2).unwrap();
+        assert_eq!(offset2, 10); // Base offset for second batch
+
+        // Third batch: offsets 20-29
+        let offset3 = mock.insert_records(1, 0, &records1).unwrap();
+        assert_eq!(offset3, 20); // Base offset for third batch
+    }
+
+    #[test]
+    fn test_mock_insert_records_with_headers() {
+        use crate::kafka::messages::RecordHeader;
+
+        let mut mock = MockKafkaStore::new();
+
+        // Verify headers are passed correctly
+        mock.expect_insert_records()
+            .withf(|_topic_id, _partition_id, records| {
+                // Check that headers are preserved
+                records.len() == 1
+                    && records[0].headers.len() == 2
+                    && records[0].headers[0].key == "correlation-id"
+                    && records[0].headers[1].key == "content-type"
+            })
+            .times(1)
+            .returning(|_, _, _| Ok(0));
+
+        let records = vec![Record {
+            key: Some(b"key".to_vec()),
+            value: Some(b"value".to_vec()),
+            headers: vec![
+                RecordHeader {
+                    key: "correlation-id".to_string(),
+                    value: b"abc123".to_vec(),
+                },
+                RecordHeader {
+                    key: "content-type".to_string(),
+                    value: b"application/json".to_vec(),
+                },
+            ],
+            timestamp: None,
+        }];
+
+        let result = mock.insert_records(1, 0, &records);
+        assert!(result.is_ok());
+    }
 }

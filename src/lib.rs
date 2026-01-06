@@ -51,6 +51,25 @@ macro_rules! pg_warning {
     };
 }
 
+/// Production debug logging - uses pgrx::debug1!()
+#[cfg(not(test))]
+#[macro_export]
+macro_rules! pg_debug {
+    ($($arg:tt)*) => { pgrx::debug1!($($arg)*) };
+}
+
+/// Test debug logging - consumes args to avoid unused variable warnings
+#[cfg(test)]
+#[macro_export]
+macro_rules! pg_debug {
+    ($($arg:tt)*) => {
+        // Consume args to avoid unused variable warnings in test mode
+        // Uncomment for test debugging:
+        // eprintln!("[DEBUG] {}", format!($($arg)*));
+        let _ = format!($($arg)*);
+    };
+}
+
 ::pgrx::pg_module_magic!();
 
 /// Extension initialization hook - called exactly once when Postgres loads the extension.

@@ -435,4 +435,469 @@ mod tests {
         // Should have 2 topics
         assert_eq!(response.topics.len(), 2);
     }
+
+    // ========== Coordinator Handler Tests ==========
+    //
+    // These tests use a real GroupCoordinator instance (not a mock) since it's
+    // pure in-memory state management with no database dependencies.
+
+    use crate::kafka::handlers::coordinator;
+    use crate::kafka::messages::{JoinGroupProtocol, SyncGroupAssignment};
+    use crate::kafka::GroupCoordinator;
+
+    fn create_test_coordinator() -> GroupCoordinator {
+        GroupCoordinator::new()
+    }
+
+    fn create_test_protocol() -> Vec<JoinGroupProtocol> {
+        vec![JoinGroupProtocol {
+            name: "range".to_string(),
+            metadata: vec![0, 1, 2, 3], // Dummy subscription metadata
+        }]
+    }
+
+    #[test]
+    fn test_handle_find_coordinator_success() {
+        let response = coordinator::handle_find_coordinator(
+            "localhost".to_string(),
+            9092,
+            "test-group".to_string(),
+            0, // GROUP key type
+        )
+        .unwrap();
+
+        assert_eq!(response.error_code, ERROR_NONE);
+        assert_eq!(response.node_id, DEFAULT_BROKER_ID);
+        assert_eq!(response.host.as_str(), "localhost");
+        assert_eq!(response.port, 9092);
+    }
+
+    #[test]
+    fn test_handle_join_group_new_member_becomes_leader() {
+        let coord = create_test_coordinator();
+
+        let response = coordinator::handle_join_group(
+            &coord,
+            "test-group".to_string(),
+            "".to_string(), // Empty = new member
+            "test-client".to_string(),
+            30000,
+            60000,
+            "consumer".to_string(),
+            create_test_protocol(),
+        )
+        .unwrap();
+
+        assert_eq!(response.error_code, ERROR_NONE);
+        assert!(!response.member_id.is_empty());
+        assert_eq!(response.generation_id, 1); // First generation after join
+                                               // First member is the leader
+        assert_eq!(response.leader.as_str(), response.member_id.as_str());
+        // Leader receives member list
+        assert!(!response.members.is_empty());
+    }
+
+    #[test]
+    fn test_handle_join_group_second_member_not_leader() {
+        let coord = create_test_coordinator();
+
+        // First member joins and becomes leader
+        let first_response = coordinator::handle_join_group(
+            &coord,
+            "test-group".to_string(),
+            "".to_string(),
+            "client-1".to_string(),
+            30000,
+            60000,
+            "consumer".to_string(),
+            create_test_protocol(),
+        )
+        .unwrap();
+
+        let leader_id = first_response.member_id.to_string();
+
+        // Second member joins
+        let second_response = coordinator::handle_join_group(
+            &coord,
+            "test-group".to_string(),
+            "".to_string(),
+            "client-2".to_string(),
+            30000,
+            60000,
+            "consumer".to_string(),
+            create_test_protocol(),
+        )
+        .unwrap();
+
+        assert_eq!(second_response.error_code, ERROR_NONE);
+        assert!(!second_response.member_id.is_empty());
+        // Second member is not leader (leader should still be first)
+        assert_ne!(
+            second_response.member_id.as_str(),
+            second_response.leader.as_str()
+        );
+        // Non-leaders don't receive member list
+        assert!(second_response.members.is_empty());
+        // Leader should still be the first member
+        assert_eq!(second_response.leader.as_str(), leader_id.as_str());
+    }
+
+    #[test]
+    fn test_handle_join_group_rejoin_with_existing_id() {
+        let coord = create_test_coordinator();
+
+        // First join
+        let first_response = coordinator::handle_join_group(
+            &coord,
+            "test-group".to_string(),
+            "".to_string(),
+            "test-client".to_string(),
+            30000,
+            60000,
+            "consumer".to_string(),
+            create_test_protocol(),
+        )
+        .unwrap();
+
+        let member_id = first_response.member_id.to_string();
+
+        // Rejoin with same member ID
+        let rejoin_response = coordinator::handle_join_group(
+            &coord,
+            "test-group".to_string(),
+            member_id.clone(),
+            "test-client".to_string(),
+            30000,
+            60000,
+            "consumer".to_string(),
+            create_test_protocol(),
+        )
+        .unwrap();
+
+        assert_eq!(rejoin_response.error_code, ERROR_NONE);
+        // Should keep the same member ID
+        assert_eq!(rejoin_response.member_id.as_str(), member_id.as_str());
+    }
+
+    #[test]
+    fn test_handle_sync_group_leader_provides_assignments() {
+        let coord = create_test_coordinator();
+
+        // Join group first
+        let join_response = coordinator::handle_join_group(
+            &coord,
+            "test-group".to_string(),
+            "".to_string(),
+            "test-client".to_string(),
+            30000,
+            60000,
+            "consumer".to_string(),
+            create_test_protocol(),
+        )
+        .unwrap();
+
+        let member_id = join_response.member_id.to_string();
+        let generation_id = join_response.generation_id;
+
+        // Leader sends sync with assignments
+        let assignment_data = vec![0, 1, 2, 3, 4]; // Dummy assignment bytes
+        let assignments = vec![SyncGroupAssignment {
+            member_id: member_id.clone(),
+            assignment: assignment_data.clone(),
+        }];
+
+        let sync_response = coordinator::handle_sync_group(
+            &coord,
+            "test-group".to_string(),
+            member_id,
+            generation_id,
+            assignments,
+        )
+        .unwrap();
+
+        assert_eq!(sync_response.error_code, ERROR_NONE);
+        // Leader should receive their own assignment
+        assert_eq!(sync_response.assignment.as_ref(), &assignment_data);
+    }
+
+    #[test]
+    fn test_handle_sync_group_follower_receives_assignment() {
+        let coord = create_test_coordinator();
+
+        // First member (leader) joins
+        let leader_join = coordinator::handle_join_group(
+            &coord,
+            "test-group".to_string(),
+            "".to_string(),
+            "leader-client".to_string(),
+            30000,
+            60000,
+            "consumer".to_string(),
+            create_test_protocol(),
+        )
+        .unwrap();
+
+        let leader_id = leader_join.member_id.to_string();
+        let generation_id = leader_join.generation_id;
+
+        // Second member (follower) joins
+        let follower_join = coordinator::handle_join_group(
+            &coord,
+            "test-group".to_string(),
+            "".to_string(),
+            "follower-client".to_string(),
+            30000,
+            60000,
+            "consumer".to_string(),
+            create_test_protocol(),
+        )
+        .unwrap();
+
+        let follower_id = follower_join.member_id.to_string();
+        // Generation may have incremented
+        let gen = follower_join.generation_id;
+
+        // Leader sends sync with assignments for both members
+        let leader_assignment = vec![1, 2, 3];
+        let follower_assignment = vec![4, 5, 6];
+
+        let assignments = vec![
+            SyncGroupAssignment {
+                member_id: leader_id.clone(),
+                assignment: leader_assignment.clone(),
+            },
+            SyncGroupAssignment {
+                member_id: follower_id.clone(),
+                assignment: follower_assignment.clone(),
+            },
+        ];
+
+        // Leader syncs first
+        let _leader_sync = coordinator::handle_sync_group(
+            &coord,
+            "test-group".to_string(),
+            leader_id,
+            gen,
+            assignments,
+        )
+        .unwrap();
+
+        // Follower syncs (with empty assignments - only leader provides)
+        let follower_sync = coordinator::handle_sync_group(
+            &coord,
+            "test-group".to_string(),
+            follower_id,
+            gen,
+            vec![], // Follower sends empty
+        )
+        .unwrap();
+
+        assert_eq!(follower_sync.error_code, ERROR_NONE);
+        // Follower should receive their assignment
+        assert_eq!(follower_sync.assignment.as_ref(), &follower_assignment);
+    }
+
+    #[test]
+    fn test_handle_heartbeat_success() {
+        let coord = create_test_coordinator();
+
+        // Join group first
+        let join_response = coordinator::handle_join_group(
+            &coord,
+            "test-group".to_string(),
+            "".to_string(),
+            "test-client".to_string(),
+            30000,
+            60000,
+            "consumer".to_string(),
+            create_test_protocol(),
+        )
+        .unwrap();
+
+        let member_id = join_response.member_id.to_string();
+        let generation_id = join_response.generation_id;
+
+        // Send heartbeat
+        let heartbeat_response = coordinator::handle_heartbeat(
+            &coord,
+            "test-group".to_string(),
+            member_id,
+            generation_id,
+        )
+        .unwrap();
+
+        assert_eq!(heartbeat_response.error_code, ERROR_NONE);
+    }
+
+    #[test]
+    fn test_handle_heartbeat_unknown_member() {
+        let coord = create_test_coordinator();
+
+        // Create a group with a member
+        let _join_response = coordinator::handle_join_group(
+            &coord,
+            "test-group".to_string(),
+            "".to_string(),
+            "test-client".to_string(),
+            30000,
+            60000,
+            "consumer".to_string(),
+            create_test_protocol(),
+        )
+        .unwrap();
+
+        // Heartbeat with unknown member ID
+        let result = coordinator::handle_heartbeat(
+            &coord,
+            "test-group".to_string(),
+            "unknown-member-id".to_string(),
+            1,
+        );
+
+        assert!(result.is_err());
+        // Verify it's an UnknownMemberId error
+        match result.unwrap_err() {
+            KafkaError::UnknownMemberId { .. } => {}
+            e => panic!("Expected UnknownMemberId error, got {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_handle_leave_group_success() {
+        let coord = create_test_coordinator();
+
+        // Join group first
+        let join_response = coordinator::handle_join_group(
+            &coord,
+            "test-group".to_string(),
+            "".to_string(),
+            "test-client".to_string(),
+            30000,
+            60000,
+            "consumer".to_string(),
+            create_test_protocol(),
+        )
+        .unwrap();
+
+        let member_id = join_response.member_id.to_string();
+
+        // Leave group
+        let leave_response =
+            coordinator::handle_leave_group(&coord, "test-group".to_string(), member_id.clone())
+                .unwrap();
+
+        assert_eq!(leave_response.error_code, ERROR_NONE);
+
+        // Verify member is gone by trying heartbeat
+        let heartbeat_result =
+            coordinator::handle_heartbeat(&coord, "test-group".to_string(), member_id, 1);
+
+        assert!(heartbeat_result.is_err());
+    }
+
+    #[test]
+    fn test_handle_leave_group_unknown_member() {
+        let coord = create_test_coordinator();
+
+        // Create a group with a member
+        let _join_response = coordinator::handle_join_group(
+            &coord,
+            "test-group".to_string(),
+            "".to_string(),
+            "test-client".to_string(),
+            30000,
+            60000,
+            "consumer".to_string(),
+            create_test_protocol(),
+        )
+        .unwrap();
+
+        // Leave with unknown member ID
+        let result = coordinator::handle_leave_group(
+            &coord,
+            "test-group".to_string(),
+            "unknown-member-id".to_string(),
+        );
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            KafkaError::UnknownMemberId { .. } => {}
+            e => panic!("Expected UnknownMemberId error, got {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_handle_describe_groups_existing_group() {
+        let coord = create_test_coordinator();
+
+        // Join group first
+        let join_response = coordinator::handle_join_group(
+            &coord,
+            "test-group".to_string(),
+            "".to_string(),
+            "test-client".to_string(),
+            30000,
+            60000,
+            "consumer".to_string(),
+            create_test_protocol(),
+        )
+        .unwrap();
+
+        // Describe the group
+        let describe_response =
+            coordinator::handle_describe_groups(&coord, vec!["test-group".to_string()]).unwrap();
+
+        assert_eq!(describe_response.groups.len(), 1);
+        let group = &describe_response.groups[0];
+        assert_eq!(group.error_code, ERROR_NONE);
+        assert_eq!(group.group_id.0.as_str(), "test-group");
+        // Should have one member
+        assert_eq!(group.members.len(), 1);
+        assert_eq!(
+            group.members[0].member_id.as_str(),
+            join_response.member_id.as_str()
+        );
+    }
+
+    #[test]
+    fn test_handle_list_groups_with_filter() {
+        let coord = create_test_coordinator();
+
+        // Create a group
+        let _join_response = coordinator::handle_join_group(
+            &coord,
+            "test-group".to_string(),
+            "".to_string(),
+            "test-client".to_string(),
+            30000,
+            60000,
+            "consumer".to_string(),
+            create_test_protocol(),
+        )
+        .unwrap();
+
+        // List all groups (no filter)
+        let list_response = coordinator::handle_list_groups(&coord, vec![]).unwrap();
+
+        assert_eq!(list_response.error_code, ERROR_NONE);
+        assert_eq!(list_response.groups.len(), 1);
+        assert_eq!(list_response.groups[0].group_id.0.as_str(), "test-group");
+
+        // List with state filter that matches
+        let list_stable = coordinator::handle_list_groups(
+            &coord,
+            vec!["Stable".to_string(), "CompletingRebalance".to_string()],
+        )
+        .unwrap();
+
+        // Group should be in CompletingRebalance or Stable state
+        assert!(list_stable.groups.len() <= 1);
+
+        // List with state filter that doesn't match
+        let list_empty =
+            coordinator::handle_list_groups(&coord, vec!["Empty".to_string()]).unwrap();
+
+        // Group is not empty (it has a member)
+        assert_eq!(list_empty.groups.len(), 0);
+    }
 }

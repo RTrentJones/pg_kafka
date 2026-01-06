@@ -267,7 +267,7 @@ impl GroupCoordinator {
         protocol_type: String,
         protocols: Vec<(String, Vec<u8>)>,
         group_instance_id: Option<String>,
-    ) -> Result<(String, i32, bool, Vec<(String, Vec<u8>)>)> {
+    ) -> Result<(String, i32, bool, String, Vec<(String, Vec<u8>)>)> {
         let mut groups = self.groups.write().map_err(|e| {
             KafkaError::Internal(format!("Failed to acquire groups write lock: {}", e))
         })?;
@@ -345,10 +345,14 @@ impl GroupCoordinator {
             Vec::new()
         };
 
+        // Get the leader ID (should always exist after add_member)
+        let leader_id = group.leader.clone().unwrap_or_default();
+
         Ok((
             assigned_member_id,
             group.generation_id,
             is_leader,
+            leader_id,
             members_for_leader,
         ))
     }
