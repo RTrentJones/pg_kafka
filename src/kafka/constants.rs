@@ -140,6 +140,49 @@ pub const FLEXIBLE_FORMAT_MIN_VERSION: i16 = 9;
 /// See: https://github.com/Baylox/kafka-mock
 pub const API_VERSIONS_RESPONSE_HEADER_VERSION: i16 = 0;
 
+// ===== Flexible Format Thresholds =====
+// These define the minimum API version where flexible format (ResponseHeader v1) is used.
+// Below this version, ResponseHeader v0 is used.
+// See: https://kafka.apache.org/protocol.html
+
+/// Lookup table for response header version thresholds.
+///
+/// Returns the minimum API version where ResponseHeader v1 (flexible format) is used.
+/// For API versions below this threshold, ResponseHeader v0 is used.
+/// ApiVersions is a special case - it always uses v0.
+///
+/// Returns None for unknown API keys (which should use v0 as fallback).
+pub fn get_flexible_format_threshold(api_key: i16) -> Option<i16> {
+    match api_key {
+        API_KEY_API_VERSIONS => None, // Special case: always uses v0
+        API_KEY_PRODUCE => Some(9),
+        API_KEY_FETCH => Some(12),
+        API_KEY_LIST_OFFSETS => Some(6),
+        API_KEY_METADATA => Some(9),
+        API_KEY_OFFSET_COMMIT => Some(8),
+        API_KEY_OFFSET_FETCH => Some(6),
+        API_KEY_FIND_COORDINATOR => Some(3),
+        API_KEY_JOIN_GROUP => Some(6),
+        API_KEY_HEARTBEAT => Some(4),
+        API_KEY_LEAVE_GROUP => Some(4),
+        API_KEY_SYNC_GROUP => Some(4),
+        API_KEY_DESCRIBE_GROUPS => Some(5),
+        API_KEY_LIST_GROUPS => Some(3),
+        _ => None, // Unknown API keys default to v0
+    }
+}
+
+/// Determines the response header version for a given API key and version.
+///
+/// Returns 1 for flexible format (tagged fields), 0 for non-flexible format.
+/// ApiVersions always returns 0 regardless of version.
+pub fn get_response_header_version(api_key: i16, api_version: i16) -> i16 {
+    match get_flexible_format_threshold(api_key) {
+        Some(threshold) if api_version >= threshold => 1,
+        _ => 0,
+    }
+}
+
 // ===== Worker Timing Constants =====
 
 /// Async I/O processing interval (milliseconds)
@@ -269,5 +312,53 @@ mod tests {
             MAX_REQUEST_SIZE <= 1_000_000_000,
             "Max request size should be reasonable (< 1GB)"
         );
+    }
+
+    #[test]
+    fn test_get_response_header_version_api_versions() {
+        // ApiVersions always uses v0
+        assert_eq!(get_response_header_version(API_KEY_API_VERSIONS, 0), 0);
+        assert_eq!(get_response_header_version(API_KEY_API_VERSIONS, 3), 0);
+        assert_eq!(get_response_header_version(API_KEY_API_VERSIONS, 10), 0);
+    }
+
+    #[test]
+    fn test_get_response_header_version_metadata() {
+        // Metadata v9+ uses flexible format
+        assert_eq!(get_response_header_version(API_KEY_METADATA, 0), 0);
+        assert_eq!(get_response_header_version(API_KEY_METADATA, 8), 0);
+        assert_eq!(get_response_header_version(API_KEY_METADATA, 9), 1);
+        assert_eq!(get_response_header_version(API_KEY_METADATA, 12), 1);
+    }
+
+    #[test]
+    fn test_get_response_header_version_fetch() {
+        // Fetch v12+ uses flexible format
+        assert_eq!(get_response_header_version(API_KEY_FETCH, 0), 0);
+        assert_eq!(get_response_header_version(API_KEY_FETCH, 11), 0);
+        assert_eq!(get_response_header_version(API_KEY_FETCH, 12), 1);
+        assert_eq!(get_response_header_version(API_KEY_FETCH, 15), 1);
+    }
+
+    #[test]
+    fn test_get_response_header_version_coordinator_apis() {
+        // FindCoordinator v3+ uses flexible format
+        assert_eq!(get_response_header_version(API_KEY_FIND_COORDINATOR, 2), 0);
+        assert_eq!(get_response_header_version(API_KEY_FIND_COORDINATOR, 3), 1);
+
+        // SyncGroup/Heartbeat/LeaveGroup v4+ uses flexible format
+        assert_eq!(get_response_header_version(API_KEY_SYNC_GROUP, 3), 0);
+        assert_eq!(get_response_header_version(API_KEY_SYNC_GROUP, 4), 1);
+        assert_eq!(get_response_header_version(API_KEY_HEARTBEAT, 3), 0);
+        assert_eq!(get_response_header_version(API_KEY_HEARTBEAT, 4), 1);
+        assert_eq!(get_response_header_version(API_KEY_LEAVE_GROUP, 3), 0);
+        assert_eq!(get_response_header_version(API_KEY_LEAVE_GROUP, 4), 1);
+    }
+
+    #[test]
+    fn test_get_response_header_version_unknown_api() {
+        // Unknown API keys should return v0
+        assert_eq!(get_response_header_version(999, 0), 0);
+        assert_eq!(get_response_header_version(999, 100), 0);
     }
 }

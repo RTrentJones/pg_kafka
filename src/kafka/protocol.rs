@@ -15,6 +15,7 @@ use kafka_protocol::messages::ResponseHeader;
 use kafka_protocol::protocol::{decode_request_header_from_buffer, Decodable, Encodable};
 use kafka_protocol::records::RecordBatchDecoder;
 
+use super::constants;
 use super::constants::*;
 use super::error::{KafkaError, Result};
 use super::messages::{KafkaRequest, KafkaResponse};
@@ -1006,17 +1007,9 @@ pub fn encode_response(response: KafkaResponse) -> Result<BytesMut> {
             api_version,
             response: api_version_response,
         } => {
-            // Build ResponseHeader
             let header = ResponseHeader::default().with_correlation_id(correlation_id);
-
-            // Encode response header and body
-            // IMPORTANT: Use the API version from the request for encoding
-            // Different versions have different wire formats (e.g., flexible vs non-flexible)
-            // CRITICAL: ApiVersions always uses ResponseHeader v0, even for v3+!
-            // This is different from other APIs where v3+ uses ResponseHeader v1.
-            // See: https://github.com/Baylox/kafka-mock (19-byte example for v3)
-            let response_header_version = API_VERSIONS_RESPONSE_HEADER_VERSION;
-
+            let response_header_version =
+                constants::get_response_header_version(API_KEY_API_VERSIONS, api_version);
             header.encode(&mut response_buf, response_header_version)?;
             api_version_response.encode(&mut response_buf, api_version)?;
         }
@@ -1025,20 +1018,10 @@ pub fn encode_response(response: KafkaResponse) -> Result<BytesMut> {
             api_version,
             response: metadata_response,
         } => {
-            // Build ResponseHeader
             let header = ResponseHeader::default().with_correlation_id(correlation_id);
-
-            // Encode response header
-            // Metadata v9+ uses flexible format (ResponseHeader v1)
-            // Metadata v0-v8 uses non-flexible format (ResponseHeader v0)
-            let response_header_version = if api_version >= FLEXIBLE_FORMAT_MIN_VERSION {
-                1
-            } else {
-                0
-            };
+            let response_header_version =
+                constants::get_response_header_version(API_KEY_METADATA, api_version);
             header.encode(&mut response_buf, response_header_version)?;
-
-            // Encode response body using the requested API version
             metadata_response.encode(&mut response_buf, api_version)?;
         }
         KafkaResponse::Produce {
@@ -1046,20 +1029,10 @@ pub fn encode_response(response: KafkaResponse) -> Result<BytesMut> {
             api_version,
             response: produce_response,
         } => {
-            // Build ResponseHeader
             let header = ResponseHeader::default().with_correlation_id(correlation_id);
-
-            // Encode response header
-            // Produce v9+ uses flexible format (ResponseHeader v1)
-            // Produce v0-v8 uses non-flexible format (ResponseHeader v0)
-            let response_header_version = if api_version >= FLEXIBLE_FORMAT_MIN_VERSION {
-                1
-            } else {
-                0
-            };
+            let response_header_version =
+                constants::get_response_header_version(API_KEY_PRODUCE, api_version);
             header.encode(&mut response_buf, response_header_version)?;
-
-            // Encode response body using the requested API version
             produce_response.encode(&mut response_buf, api_version)?;
         }
         KafkaResponse::Fetch {
@@ -1067,16 +1040,10 @@ pub fn encode_response(response: KafkaResponse) -> Result<BytesMut> {
             api_version,
             response: fetch_response,
         } => {
-            // Build ResponseHeader
             let header = ResponseHeader::default().with_correlation_id(correlation_id);
-
-            // Encode response header
-            // Fetch v12+ uses flexible format (ResponseHeader v1)
-            // Fetch v0-v11 uses non-flexible format (ResponseHeader v0)
-            let response_header_version = if api_version >= 12 { 1 } else { 0 };
+            let response_header_version =
+                constants::get_response_header_version(API_KEY_FETCH, api_version);
             header.encode(&mut response_buf, response_header_version)?;
-
-            // Encode response body using the requested API version
             fetch_response.encode(&mut response_buf, api_version)?;
         }
         KafkaResponse::OffsetCommit {
@@ -1084,16 +1051,10 @@ pub fn encode_response(response: KafkaResponse) -> Result<BytesMut> {
             api_version,
             response: commit_response,
         } => {
-            // Build ResponseHeader
             let header = ResponseHeader::default().with_correlation_id(correlation_id);
-
-            // Encode response header
-            // OffsetCommit v8+ uses flexible format (ResponseHeader v1)
-            // OffsetCommit v0-v7 uses non-flexible format (ResponseHeader v0)
-            let response_header_version = if api_version >= 8 { 1 } else { 0 };
+            let response_header_version =
+                constants::get_response_header_version(API_KEY_OFFSET_COMMIT, api_version);
             header.encode(&mut response_buf, response_header_version)?;
-
-            // Encode response body using the requested API version
             commit_response.encode(&mut response_buf, api_version)?;
         }
         KafkaResponse::OffsetFetch {
@@ -1101,16 +1062,10 @@ pub fn encode_response(response: KafkaResponse) -> Result<BytesMut> {
             api_version,
             response: fetch_response,
         } => {
-            // Build ResponseHeader
             let header = ResponseHeader::default().with_correlation_id(correlation_id);
-
-            // Encode response header
-            // OffsetFetch v6+ uses flexible format (ResponseHeader v1)
-            // OffsetFetch v0-v5 uses non-flexible format (ResponseHeader v0)
-            let response_header_version = if api_version >= 6 { 1 } else { 0 };
+            let response_header_version =
+                constants::get_response_header_version(API_KEY_OFFSET_FETCH, api_version);
             header.encode(&mut response_buf, response_header_version)?;
-
-            // Encode response body using the requested API version
             fetch_response.encode(&mut response_buf, api_version)?;
         }
         KafkaResponse::FindCoordinator {
@@ -1118,16 +1073,10 @@ pub fn encode_response(response: KafkaResponse) -> Result<BytesMut> {
             api_version,
             response: coord_response,
         } => {
-            // Build ResponseHeader
             let header = ResponseHeader::default().with_correlation_id(correlation_id);
-
-            // Encode response header
-            // FindCoordinator v3+ uses flexible format (ResponseHeader v1)
-            // FindCoordinator v0-v2 uses non-flexible format (ResponseHeader v0)
-            let response_header_version = if api_version >= 3 { 1 } else { 0 };
+            let response_header_version =
+                constants::get_response_header_version(API_KEY_FIND_COORDINATOR, api_version);
             header.encode(&mut response_buf, response_header_version)?;
-
-            // Encode response body using the requested API version
             coord_response.encode(&mut response_buf, api_version)?;
         }
         KafkaResponse::JoinGroup {
@@ -1135,16 +1084,10 @@ pub fn encode_response(response: KafkaResponse) -> Result<BytesMut> {
             api_version,
             response: join_response,
         } => {
-            // Build ResponseHeader
             let header = ResponseHeader::default().with_correlation_id(correlation_id);
-
-            // Encode response header
-            // JoinGroup v6+ uses flexible format (ResponseHeader v1)
-            // JoinGroup v0-v5 uses non-flexible format (ResponseHeader v0)
-            let response_header_version = if api_version >= 6 { 1 } else { 0 };
+            let response_header_version =
+                constants::get_response_header_version(API_KEY_JOIN_GROUP, api_version);
             header.encode(&mut response_buf, response_header_version)?;
-
-            // Encode response body using the requested API version
             join_response.encode(&mut response_buf, api_version)?;
         }
         KafkaResponse::SyncGroup {
@@ -1152,16 +1095,10 @@ pub fn encode_response(response: KafkaResponse) -> Result<BytesMut> {
             api_version,
             response: sync_response,
         } => {
-            // Build ResponseHeader
             let header = ResponseHeader::default().with_correlation_id(correlation_id);
-
-            // Encode response header
-            // SyncGroup v4+ uses flexible format (ResponseHeader v1)
-            // SyncGroup v0-v3 uses non-flexible format (ResponseHeader v0)
-            let response_header_version = if api_version >= 4 { 1 } else { 0 };
+            let response_header_version =
+                constants::get_response_header_version(API_KEY_SYNC_GROUP, api_version);
             header.encode(&mut response_buf, response_header_version)?;
-
-            // Encode response body using the requested API version
             sync_response.encode(&mut response_buf, api_version)?;
         }
         KafkaResponse::Heartbeat {
@@ -1169,16 +1106,10 @@ pub fn encode_response(response: KafkaResponse) -> Result<BytesMut> {
             api_version,
             response: heartbeat_response,
         } => {
-            // Build ResponseHeader
             let header = ResponseHeader::default().with_correlation_id(correlation_id);
-
-            // Encode response header
-            // Heartbeat v4+ uses flexible format (ResponseHeader v1)
-            // Heartbeat v0-v3 uses non-flexible format (ResponseHeader v0)
-            let response_header_version = if api_version >= 4 { 1 } else { 0 };
+            let response_header_version =
+                constants::get_response_header_version(API_KEY_HEARTBEAT, api_version);
             header.encode(&mut response_buf, response_header_version)?;
-
-            // Encode response body using the requested API version
             heartbeat_response.encode(&mut response_buf, api_version)?;
         }
         KafkaResponse::LeaveGroup {
@@ -1186,16 +1117,10 @@ pub fn encode_response(response: KafkaResponse) -> Result<BytesMut> {
             api_version,
             response: leave_response,
         } => {
-            // Build ResponseHeader
             let header = ResponseHeader::default().with_correlation_id(correlation_id);
-
-            // Encode response header
-            // LeaveGroup v4+ uses flexible format (ResponseHeader v1)
-            // LeaveGroup v0-v3 uses non-flexible format (ResponseHeader v0)
-            let response_header_version = if api_version >= 4 { 1 } else { 0 };
+            let response_header_version =
+                constants::get_response_header_version(API_KEY_LEAVE_GROUP, api_version);
             header.encode(&mut response_buf, response_header_version)?;
-
-            // Encode response body using the requested API version
             leave_response.encode(&mut response_buf, api_version)?;
         }
         KafkaResponse::ListOffsets {
@@ -1203,16 +1128,10 @@ pub fn encode_response(response: KafkaResponse) -> Result<BytesMut> {
             api_version,
             response: list_response,
         } => {
-            // Build ResponseHeader
             let header = ResponseHeader::default().with_correlation_id(correlation_id);
-
-            // Encode response header
-            // ListOffsets v6+ uses flexible format (ResponseHeader v1)
-            // ListOffsets v0-v5 uses non-flexible format (ResponseHeader v0)
-            let response_header_version = if api_version >= 6 { 1 } else { 0 };
+            let response_header_version =
+                constants::get_response_header_version(API_KEY_LIST_OFFSETS, api_version);
             header.encode(&mut response_buf, response_header_version)?;
-
-            // Encode response body using the requested API version
             list_response.encode(&mut response_buf, api_version)?;
         }
         KafkaResponse::DescribeGroups {
@@ -1220,16 +1139,10 @@ pub fn encode_response(response: KafkaResponse) -> Result<BytesMut> {
             api_version,
             response: describe_response,
         } => {
-            // Build ResponseHeader
             let header = ResponseHeader::default().with_correlation_id(correlation_id);
-
-            // Encode response header
-            // DescribeGroups v5+ uses flexible format (ResponseHeader v1)
-            // DescribeGroups v0-v4 uses non-flexible format (ResponseHeader v0)
-            let response_header_version = if api_version >= 5 { 1 } else { 0 };
+            let response_header_version =
+                constants::get_response_header_version(API_KEY_DESCRIBE_GROUPS, api_version);
             header.encode(&mut response_buf, response_header_version)?;
-
-            // Encode response body using the requested API version
             describe_response.encode(&mut response_buf, api_version)?;
         }
         KafkaResponse::ListGroups {
@@ -1237,16 +1150,10 @@ pub fn encode_response(response: KafkaResponse) -> Result<BytesMut> {
             api_version,
             response: list_groups_response,
         } => {
-            // Build ResponseHeader
             let header = ResponseHeader::default().with_correlation_id(correlation_id);
-
-            // Encode response header
-            // ListGroups v3+ uses flexible format (ResponseHeader v1)
-            // ListGroups v0-v2 uses non-flexible format (ResponseHeader v0)
-            let response_header_version = if api_version >= 3 { 1 } else { 0 };
+            let response_header_version =
+                constants::get_response_header_version(API_KEY_LIST_GROUPS, api_version);
             header.encode(&mut response_buf, response_header_version)?;
-
-            // Encode response body using the requested API version
             list_groups_response.encode(&mut response_buf, api_version)?;
         }
         KafkaResponse::Error {

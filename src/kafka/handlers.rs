@@ -15,6 +15,50 @@ use super::storage::{CommittedOffset, KafkaStore};
 use kafka_protocol::messages::TopicName;
 use kafka_protocol::protocol::StrBytes;
 
+// ===== Helper Functions =====
+// These helpers reduce code duplication across handlers
+
+/// Result of resolving a topic name to its ID
+pub enum TopicResolution {
+    /// Topic found, contains topic_id
+    Found(i32),
+    /// Topic not found
+    NotFound,
+    /// Storage error occurred
+    Error(String),
+}
+
+/// Resolves a topic name to its topic_id using the storage layer.
+///
+/// Returns:
+/// - `TopicResolution::Found(topic_id)` if the topic exists
+/// - `TopicResolution::NotFound` if the topic doesn't exist
+/// - `TopicResolution::Error(msg)` if a storage error occurred
+pub fn resolve_topic_id<S: KafkaStore>(store: &S, topic_name: &str) -> TopicResolution {
+    match store.get_topic_metadata(Some(std::slice::from_ref(&topic_name.to_string()))) {
+        Ok(topics) => {
+            if let Some(tm) = topics.first() {
+                TopicResolution::Found(tm.id)
+            } else {
+                TopicResolution::NotFound
+            }
+        }
+        Err(e) => {
+            crate::pg_warning!("Failed to resolve topic '{}': {}", topic_name, e);
+            TopicResolution::Error(e.to_string())
+        }
+    }
+}
+
+/// Returns the appropriate Kafka error code for a topic resolution failure.
+pub fn topic_resolution_error_code(resolution: &TopicResolution) -> i16 {
+    match resolution {
+        TopicResolution::Found(_) => ERROR_NONE,
+        TopicResolution::NotFound => ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+        TopicResolution::Error(_) => ERROR_UNKNOWN_SERVER_ERROR,
+    }
+}
+
 /// Handle ApiVersions request
 ///
 /// This handler doesn't need storage - it just returns static protocol information
@@ -81,8 +125,9 @@ pub fn handle_metadata(
                         );
                         topics_metadata.push(topic);
                     }
-                    Err(_e) => {
+                    Err(e) => {
                         // Return error for this topic
+                        crate::pg_warning!("Failed to get_or_create topic '{}': {}", topic_name, e);
                         let topic = crate::kafka::build_topic_metadata(
                             topic_name,
                             ERROR_UNKNOWN_SERVER_ERROR,
@@ -147,7 +192,13 @@ pub fn handle_produce(
                     partition_response.log_append_time_ms = -1;
                     partition_response.log_start_offset = -1;
                 }
-                Err(_e) => {
+                Err(e) => {
+                    crate::pg_warning!(
+                        "Failed to insert records for topic_id={}, partition={}: {}",
+                        topic_id,
+                        partition_index,
+                        e
+                    );
                     partition_response.error_code = ERROR_UNKNOWN_SERVER_ERROR;
                     partition_response.base_offset = -1;
                     partition_response.log_append_time_ms = -1;
@@ -184,25 +235,26 @@ pub fn handle_fetch(
     for topic_fetch in topic_data {
         let topic_name = topic_fetch.name.clone();
 
-        // Look up topic by name
-        let topics = store.get_topic_metadata(Some(std::slice::from_ref(&topic_name)))?;
-        let topic_id = if let Some(tm) = topics.first() {
-            tm.id
-        } else {
-            // Topic not found - return error for all partitions
-            let mut error_partitions = Vec::new();
-            for p in topic_fetch.partitions {
-                let mut partition_data = PartitionData::default();
-                partition_data.partition_index = p.partition_index;
-                partition_data.error_code = ERROR_UNKNOWN_TOPIC_OR_PARTITION;
-                partition_data.high_watermark = -1;
-                error_partitions.push(partition_data);
+        // Look up topic by name using helper
+        let topic_id = match resolve_topic_id(store, &topic_name) {
+            TopicResolution::Found(id) => id,
+            resolution => {
+                // Topic not found or error - return error for all partitions
+                let error_code = topic_resolution_error_code(&resolution);
+                let mut error_partitions = Vec::new();
+                for p in topic_fetch.partitions {
+                    let mut partition_data = PartitionData::default();
+                    partition_data.partition_index = p.partition_index;
+                    partition_data.error_code = error_code;
+                    partition_data.high_watermark = -1;
+                    error_partitions.push(partition_data);
+                }
+                let mut topic_response = FetchableTopicResponse::default();
+                topic_response.topic = TopicName(StrBytes::from_string(topic_name));
+                topic_response.partitions = error_partitions;
+                responses.push(topic_response);
+                continue;
             }
-            let mut topic_response = FetchableTopicResponse::default();
-            topic_response.topic = TopicName(StrBytes::from_string(topic_name));
-            topic_response.partitions = error_partitions;
-            responses.push(topic_response);
-            continue;
         };
 
         let mut partition_responses = Vec::new();
@@ -217,7 +269,14 @@ pub fn handle_fetch(
             let db_records =
                 match store.fetch_records(topic_id, partition_id, fetch_offset, max_bytes) {
                     Ok(records) => records,
-                    Err(_e) => {
+                    Err(e) => {
+                        crate::pg_warning!(
+                            "Failed to fetch records for topic_id={}, partition={}, offset={}: {}",
+                            topic_id,
+                            partition_id,
+                            fetch_offset,
+                            e
+                        );
                         let mut partition_data = PartitionData::default();
                         partition_data.partition_index = partition_id;
                         partition_data.error_code = ERROR_UNKNOWN_SERVER_ERROR;
@@ -254,7 +313,7 @@ pub fn handle_fetch(
 
                 // Encode records as RecordBatch
                 let mut encoded = bytes::BytesMut::new();
-                if let Err(_e) = RecordBatchEncoder::encode(
+                if let Err(e) = RecordBatchEncoder::encode(
                     &mut encoded,
                     kafka_records.iter(),
                     &RecordEncodeOptions {
@@ -263,6 +322,12 @@ pub fn handle_fetch(
                     },
                 ) {
                     // On error, return empty bytes to avoid protocol errors
+                    crate::pg_warning!(
+                        "Failed to encode RecordBatch for topic_id={}, partition={}: {}",
+                        topic_id,
+                        partition_id,
+                        e
+                    );
                     Some(bytes::Bytes::new())
                 } else {
                     Some(encoded.freeze())
@@ -316,36 +381,17 @@ pub fn handle_offset_commit(
     for topic in topics {
         let topic_name = topic.name.clone();
 
-        // Look up topic_id
-        let topics_result = store.get_topic_metadata(Some(std::slice::from_ref(&topic_name)));
-        let topic_id = match topics_result {
-            Ok(topics) => {
-                if let Some(tm) = topics.first() {
-                    tm.id
-                } else {
-                    // Topic not found
-                    let mut error_partitions = Vec::new();
-                    for partition in topic.partitions {
-                        let mut partition_response = OffsetCommitResponsePartition::default();
-                        partition_response.partition_index = partition.partition_index;
-                        partition_response.error_code = ERROR_UNKNOWN_TOPIC_OR_PARTITION;
-                        error_partitions.push(partition_response);
-                    }
-
-                    let mut topic_response = OffsetCommitResponseTopic::default();
-                    topic_response.name = TopicName(StrBytes::from_string(topic_name));
-                    topic_response.partitions = error_partitions;
-                    response_topics.push(topic_response);
-                    continue;
-                }
-            }
-            Err(_e) => {
-                // Error looking up topic
+        // Look up topic_id using helper
+        let topic_id = match resolve_topic_id(store, &topic_name) {
+            TopicResolution::Found(id) => id,
+            resolution => {
+                // Topic not found or error - return error for all partitions
+                let error_code = topic_resolution_error_code(&resolution);
                 let mut error_partitions = Vec::new();
                 for partition in topic.partitions {
                     let mut partition_response = OffsetCommitResponsePartition::default();
                     partition_response.partition_index = partition.partition_index;
-                    partition_response.error_code = ERROR_UNKNOWN_SERVER_ERROR;
+                    partition_response.error_code = error_code;
                     error_partitions.push(partition_response);
                 }
 
@@ -374,7 +420,16 @@ pub fn handle_offset_commit(
                 metadata,
             ) {
                 Ok(_) => ERROR_NONE,
-                Err(_e) => ERROR_UNKNOWN_SERVER_ERROR,
+                Err(e) => {
+                    crate::pg_warning!(
+                        "Failed to commit offset for group='{}', topic_id={}, partition={}: {}",
+                        group_id,
+                        topic_id,
+                        partition_id,
+                        e
+                    );
+                    ERROR_UNKNOWN_SERVER_ERROR
+                }
             };
 
             let mut partition_response = OffsetCommitResponsePartition::default();
@@ -416,37 +471,17 @@ pub fn handle_offset_fetch(
         for topic_request in topic_list {
             let topic_name = topic_request.name.clone();
 
-            // Look up topic_id
-            let topics_result = store.get_topic_metadata(Some(std::slice::from_ref(&topic_name)));
-            let topic_id = match topics_result {
-                Ok(topics) => {
-                    if let Some(tm) = topics.first() {
-                        tm.id
-                    } else {
-                        // Topic not found
-                        let mut error_partitions = Vec::new();
-                        for partition_index in topic_request.partition_indexes {
-                            let mut partition_response = OffsetFetchResponsePartition::default();
-                            partition_response.partition_index = partition_index;
-                            partition_response.error_code = ERROR_UNKNOWN_TOPIC_OR_PARTITION;
-                            partition_response.committed_offset = -1;
-                            error_partitions.push(partition_response);
-                        }
-
-                        let mut topic_response = OffsetFetchResponseTopic::default();
-                        topic_response.name = TopicName(StrBytes::from_string(topic_name));
-                        topic_response.partitions = error_partitions;
-                        response_topics.push(topic_response);
-                        continue;
-                    }
-                }
-                Err(_e) => {
-                    // Error looking up topic
+            // Look up topic_id using helper
+            let topic_id = match resolve_topic_id(store, &topic_name) {
+                TopicResolution::Found(id) => id,
+                resolution => {
+                    // Topic not found or error - return error for all partitions
+                    let error_code = topic_resolution_error_code(&resolution);
                     let mut error_partitions = Vec::new();
                     for partition_index in topic_request.partition_indexes {
                         let mut partition_response = OffsetFetchResponsePartition::default();
                         partition_response.partition_index = partition_index;
-                        partition_response.error_code = ERROR_UNKNOWN_SERVER_ERROR;
+                        partition_response.error_code = error_code;
                         partition_response.committed_offset = -1;
                         error_partitions.push(partition_response);
                     }
@@ -479,7 +514,14 @@ pub fn handle_offset_fetch(
                         partition_response.committed_offset = -1;
                         partition_response.error_code = ERROR_NONE;
                     }
-                    Err(_e) => {
+                    Err(e) => {
+                        crate::pg_warning!(
+                            "Failed to fetch offset for group='{}', topic_id={}, partition={}: {}",
+                            group_id,
+                            topic_id,
+                            partition_index,
+                            e
+                        );
                         partition_response.committed_offset = -1;
                         partition_response.error_code = ERROR_UNKNOWN_SERVER_ERROR;
                     }
@@ -525,9 +567,13 @@ pub fn handle_offset_fetch(
                     response_topics.push(topic_response);
                 }
             }
-            Err(_e) => {
+            Err(e) => {
                 // Error - return empty response
-                // The error is logged by the storage layer
+                crate::pg_warning!(
+                    "Failed to fetch all offsets for group='{}': {}",
+                    group_id,
+                    e
+                );
             }
         }
     }
@@ -802,36 +848,17 @@ pub fn handle_list_offsets(
     for topic_request in topics {
         let topic_name = topic_request.name.clone();
 
-        // Look up topic_id
-        let topics_result = store.get_topic_metadata(Some(std::slice::from_ref(&topic_name)));
-        let topic_id = match topics_result {
-            Ok(topics) => {
-                if let Some(tm) = topics.first() {
-                    tm.id
-                } else {
-                    // Topic not found - return error for all partitions
-                    let mut error_partitions = Vec::new();
-                    for partition in topic_request.partitions {
-                        let mut partition_response = ListOffsetsPartitionResponse::default();
-                        partition_response.partition_index = partition.partition_index;
-                        partition_response.error_code = ERROR_UNKNOWN_TOPIC_OR_PARTITION;
-                        error_partitions.push(partition_response);
-                    }
-
-                    let mut topic_response = ListOffsetsTopicResponse::default();
-                    topic_response.name = TopicName(StrBytes::from_string(topic_name));
-                    topic_response.partitions = error_partitions;
-                    response_topics.push(topic_response);
-                    continue;
-                }
-            }
-            Err(_e) => {
-                // Error looking up topic
+        // Look up topic_id using helper
+        let topic_id = match resolve_topic_id(store, &topic_name) {
+            TopicResolution::Found(id) => id,
+            resolution => {
+                // Topic not found or error - return error for all partitions
+                let error_code = topic_resolution_error_code(&resolution);
                 let mut error_partitions = Vec::new();
                 for partition in topic_request.partitions {
                     let mut partition_response = ListOffsetsPartitionResponse::default();
                     partition_response.partition_index = partition.partition_index;
-                    partition_response.error_code = ERROR_UNKNOWN_SERVER_ERROR;
+                    partition_response.error_code = error_code;
                     error_partitions.push(partition_response);
                 }
 
@@ -859,7 +886,13 @@ pub fn handle_list_offsets(
                     // Earliest offset
                     match store.get_earliest_offset(topic_id, partition_id) {
                         Ok(offset) => offset,
-                        Err(_e) => {
+                        Err(e) => {
+                            crate::pg_warning!(
+                                "Failed to get earliest offset for topic_id={}, partition={}: {}",
+                                topic_id,
+                                partition_id,
+                                e
+                            );
                             partition_response.error_code = ERROR_UNKNOWN_SERVER_ERROR;
                             partition_responses.push(partition_response);
                             continue;
@@ -870,7 +903,13 @@ pub fn handle_list_offsets(
                     // Latest offset (high watermark)
                     match store.get_high_watermark(topic_id, partition_id) {
                         Ok(offset) => offset,
-                        Err(_e) => {
+                        Err(e) => {
+                            crate::pg_warning!(
+                                "Failed to get high watermark for topic_id={}, partition={}: {}",
+                                topic_id,
+                                partition_id,
+                                e
+                            );
                             partition_response.error_code = ERROR_UNKNOWN_SERVER_ERROR;
                             partition_responses.push(partition_response);
                             continue;
