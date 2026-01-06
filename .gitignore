@@ -24,7 +24,9 @@ target
 /target
 *.iml
 **/*.rs.bk
-Cargo.lock
+
+# NOTE: Cargo.lock IS committed for reproducible builds (extension = application)
+# See: https://doc.rust-lang.org/cargo/faq.html#why-have-cargolock-in-version-control
 
 # Claude generated files during development
 .documents/

@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+# Kafka client for E2E testing
 rdkafka = { version = "0.36", features = ["cmake-build"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-tokio-postgres = "0.7"
+
+# Async runtime
+tokio = { version = "1.48", features = ["rt-multi-thread", "macros"] }
+
+# Database client for verification
+tokio-postgres = "0.7.15"
