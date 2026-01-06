@@ -8,9 +8,11 @@
 use pgrx::{GucContext, GucFlags, GucRegistry, GucSetting};
 
 use crate::kafka::constants::{
-    DEFAULT_DATABASE, DEFAULT_HOST, DEFAULT_KAFKA_PORT, DEFAULT_SHUTDOWN_TIMEOUT_MS,
-    MIN_SHUTDOWN_TIMEOUT_MS,
+    DEFAULT_DATABASE, DEFAULT_KAFKA_PORT, DEFAULT_SHUTDOWN_TIMEOUT_MS, MIN_SHUTDOWN_TIMEOUT_MS,
 };
+
+#[cfg(not(test))]
+use crate::kafka::constants::DEFAULT_HOST;
 
 #[cfg(test)]
 use crate::kafka::constants::TEST_HOST;

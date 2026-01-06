@@ -11,23 +11,10 @@ use crate::kafka::storage::{CommittedOffset, FetchedMessage, KafkaStore, TopicMe
 use mockall::mock;
 use mockall::predicate::*;
 
-/// Mock implementation of KafkaStore trait using mockall
-///
-/// This auto-generated mock allows setting expectations on storage operations
-/// without requiring a real database connection. Use this in handler tests
-/// to isolate protocol logic from database concerns.
-///
-/// # Examples
-///
-/// ```no_run
-/// use pg_kafka::testing::mocks::MockKafkaStore;
-/// use mockall::predicate::*;
-///
-/// let mut mock = MockKafkaStore::new();
-/// mock.expect_get_or_create_topic()
-///     .with(eq("test-topic"))
-///     .returning(|_| Ok(1));
-/// ```
+// MockKafkaStore: Auto-generated mock for KafkaStore trait.
+// This allows setting expectations on storage operations without requiring
+// a real database connection. Use this in handler tests to isolate protocol
+// logic from database concerns.
 mock! {
     pub KafkaStore {}
 

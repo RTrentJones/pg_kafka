@@ -20,13 +20,15 @@ macro_rules! pg_log {
     ($($arg:tt)*) => { pgrx::log!($($arg)*) };
 }
 
-/// Test logging - no-op (uncomment eprintln for debug output)
+/// Test logging - consumes args to avoid unused variable warnings
 #[cfg(test)]
 #[macro_export]
 macro_rules! pg_log {
     ($($arg:tt)*) => {
+        // Consume args to avoid unused variable warnings in test mode
         // Uncomment for test debugging:
         // eprintln!("[LOG] {}", format!($($arg)*));
+        let _ = format!($($arg)*);
     };
 }
 
@@ -37,13 +39,15 @@ macro_rules! pg_warning {
     ($($arg:tt)*) => { pgrx::warning!($($arg)*) };
 }
 
-/// Test warning - no-op (uncomment eprintln for debug output)
+/// Test warning - consumes args to avoid unused variable warnings
 #[cfg(test)]
 #[macro_export]
 macro_rules! pg_warning {
     ($($arg:tt)*) => {
+        // Consume args to avoid unused variable warnings in test mode
         // Uncomment for test debugging:
         // eprintln!("[WARNING] {}", format!($($arg)*));
+        let _ = format!($($arg)*);
     };
 }
 
