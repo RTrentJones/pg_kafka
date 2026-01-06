@@ -290,4 +290,6 @@ jobs:
         with:
           toolchain: nightly
       - name: Check Cargo.lock is up-to-date
-        run: cargo update --locked --features pg14
+        # Use cargo check --locked to verify lockfile matches Cargo.toml
+        # This will fail if Cargo.lock needs updating
+        run: cargo check --locked --features pg14
