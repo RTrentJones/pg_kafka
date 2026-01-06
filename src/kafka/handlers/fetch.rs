@@ -4,7 +4,7 @@
 // These are read-focused APIs for consuming messages from topics.
 
 use super::helpers::{resolve_topic_id, topic_resolution_error_code, TopicResolution};
-use crate::kafka::constants::*;
+use crate::kafka::constants::{ERROR_NONE, ERROR_UNSUPPORTED_VERSION};
 use crate::kafka::error::Result;
 use crate::kafka::storage::KafkaStore;
 use kafka_protocol::messages::TopicName;
@@ -65,16 +65,20 @@ pub fn handle_fetch(
                 match store.fetch_records(topic_id, partition_id, fetch_offset, max_bytes) {
                     Ok(records) => records,
                     Err(e) => {
-                        crate::pg_warning!(
+                        // Use typed error's Kafka error code for proper protocol response
+                        let error_code = e.to_kafka_error_code();
+                        if e.is_server_error() {
+                            crate::pg_warning!(
                             "Failed to fetch records for topic_id={}, partition={}, offset={}: {}",
                             topic_id,
                             partition_id,
                             fetch_offset,
                             e
                         );
+                        }
                         let mut partition_data = PartitionData::default();
                         partition_data.partition_index = partition_id;
-                        partition_data.error_code = ERROR_UNKNOWN_SERVER_ERROR;
+                        partition_data.error_code = error_code;
                         partition_data.high_watermark = -1;
                         partition_responses.push(partition_data);
                         continue;
@@ -218,13 +222,17 @@ pub fn handle_list_offsets(
                     match store.get_earliest_offset(topic_id, partition_id) {
                         Ok(offset) => offset,
                         Err(e) => {
-                            crate::pg_warning!(
-                                "Failed to get earliest offset for topic_id={}, partition={}: {}",
-                                topic_id,
-                                partition_id,
-                                e
-                            );
-                            partition_response.error_code = ERROR_UNKNOWN_SERVER_ERROR;
+                            // Use typed error's Kafka error code
+                            let error_code = e.to_kafka_error_code();
+                            if e.is_server_error() {
+                                crate::pg_warning!(
+                                    "Failed to get earliest offset for topic_id={}, partition={}: {}",
+                                    topic_id,
+                                    partition_id,
+                                    e
+                                );
+                            }
+                            partition_response.error_code = error_code;
                             partition_responses.push(partition_response);
                             continue;
                         }
@@ -235,13 +243,17 @@ pub fn handle_list_offsets(
                     match store.get_high_watermark(topic_id, partition_id) {
                         Ok(offset) => offset,
                         Err(e) => {
-                            crate::pg_warning!(
-                                "Failed to get high watermark for topic_id={}, partition={}: {}",
-                                topic_id,
-                                partition_id,
-                                e
-                            );
-                            partition_response.error_code = ERROR_UNKNOWN_SERVER_ERROR;
+                            // Use typed error's Kafka error code
+                            let error_code = e.to_kafka_error_code();
+                            if e.is_server_error() {
+                                crate::pg_warning!(
+                                    "Failed to get high watermark for topic_id={}, partition={}: {}",
+                                    topic_id,
+                                    partition_id,
+                                    e
+                                );
+                            }
+                            partition_response.error_code = error_code;
                             partition_responses.push(partition_response);
                             continue;
                         }

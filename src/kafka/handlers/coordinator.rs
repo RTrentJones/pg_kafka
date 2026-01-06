@@ -3,8 +3,8 @@
 // Handlers for consumer group management APIs:
 // FindCoordinator, JoinGroup, SyncGroup, Heartbeat, LeaveGroup, DescribeGroups, ListGroups
 
-use crate::kafka::constants::*;
-use crate::kafka::error::{KafkaError, Result};
+use crate::kafka::constants::{DEFAULT_BROKER_ID, ERROR_NONE, ERROR_UNKNOWN_SERVER_ERROR};
+use crate::kafka::error::Result;
 
 /// Handle FindCoordinator request
 ///
@@ -76,27 +76,19 @@ pub fn handle_join_group(
         Some(member_id)
     };
 
-    let (assigned_member_id, generation_id, is_leader, members_metadata) = coordinator
-        .join_group(
-            group_id.clone(),
-            existing_member_id,
-            client_id,
-            client_host,
-            session_timeout_ms,
-            rebalance_timeout_ms,
-            protocol_type.clone(),
-            coord_protocols.clone(),
-            None, // group_instance_id
-        )
-        .map_err(|e| match e {
-            KafkaError::Internal(msg) if msg.contains("Unknown member_id") => {
-                KafkaError::CoordinatorError(ERROR_UNKNOWN_MEMBER_ID, msg)
-            }
-            KafkaError::Internal(msg) if msg.contains("Illegal generation") => {
-                KafkaError::CoordinatorError(ERROR_ILLEGAL_GENERATION, msg)
-            }
-            _ => e,
-        })?;
+    // Coordinator returns typed errors (UnknownMemberId, IllegalGeneration, etc.)
+    // which map directly to Kafka protocol error codes via to_kafka_error_code()
+    let (assigned_member_id, generation_id, is_leader, members_metadata) = coordinator.join_group(
+        group_id.clone(),
+        existing_member_id,
+        client_id,
+        client_host,
+        session_timeout_ms,
+        rebalance_timeout_ms,
+        protocol_type.clone(),
+        coord_protocols.clone(),
+        None, // group_instance_id
+    )?;
 
     // Build response
     let mut response = JoinGroupResponse::default();
@@ -149,21 +141,10 @@ pub fn handle_sync_group(
         .map(|a| (a.member_id, a.assignment))
         .collect();
 
-    // Sync group via coordinator
-    let assignment = coordinator
-        .sync_group(group_id, member_id, generation_id, coord_assignments)
-        .map_err(|e| match e {
-            KafkaError::Internal(msg) if msg.contains("Unknown member_id") => {
-                KafkaError::CoordinatorError(ERROR_UNKNOWN_MEMBER_ID, msg)
-            }
-            KafkaError::Internal(msg) if msg.contains("Illegal generation") => {
-                KafkaError::CoordinatorError(ERROR_ILLEGAL_GENERATION, msg)
-            }
-            KafkaError::Internal(msg) if msg.contains("Unknown group_id") => {
-                KafkaError::CoordinatorError(ERROR_COORDINATOR_NOT_AVAILABLE, msg)
-            }
-            _ => e,
-        })?;
+    // Coordinator returns typed errors (UnknownMemberId, IllegalGeneration, CoordinatorNotAvailable)
+    // which map directly to Kafka protocol error codes via to_kafka_error_code()
+    let assignment =
+        coordinator.sync_group(group_id, member_id, generation_id, coord_assignments)?;
 
     // Build response
     let mut response = SyncGroupResponse::default();
@@ -191,21 +172,9 @@ pub fn handle_heartbeat(
         generation_id
     );
 
-    // Send heartbeat via coordinator
-    coordinator
-        .heartbeat(group_id, member_id, generation_id)
-        .map_err(|e| match e {
-            KafkaError::Internal(msg) if msg.contains("Unknown member_id") => {
-                KafkaError::CoordinatorError(ERROR_UNKNOWN_MEMBER_ID, msg)
-            }
-            KafkaError::Internal(msg) if msg.contains("Illegal generation") => {
-                KafkaError::CoordinatorError(ERROR_ILLEGAL_GENERATION, msg)
-            }
-            KafkaError::Internal(msg) if msg.contains("Unknown group_id") => {
-                KafkaError::CoordinatorError(ERROR_COORDINATOR_NOT_AVAILABLE, msg)
-            }
-            _ => e,
-        })?;
+    // Coordinator returns typed errors (UnknownMemberId, IllegalGeneration, CoordinatorNotAvailable)
+    // which map directly to Kafka protocol error codes via to_kafka_error_code()
+    coordinator.heartbeat(group_id, member_id, generation_id)?;
 
     // Build response
     let mut response = HeartbeatResponse::default();
@@ -226,18 +195,9 @@ pub fn handle_leave_group(
 
     pgrx::debug1!("LeaveGroup: group_id={}, member_id={}", group_id, member_id);
 
-    // Leave group via coordinator
-    coordinator
-        .leave_group(group_id, member_id)
-        .map_err(|e| match e {
-            KafkaError::Internal(msg) if msg.contains("Unknown member_id") => {
-                KafkaError::CoordinatorError(ERROR_UNKNOWN_MEMBER_ID, msg)
-            }
-            KafkaError::Internal(msg) if msg.contains("Unknown group_id") => {
-                KafkaError::CoordinatorError(ERROR_COORDINATOR_NOT_AVAILABLE, msg)
-            }
-            _ => e,
-        })?;
+    // Coordinator returns typed errors (UnknownMemberId, CoordinatorNotAvailable)
+    // which map directly to Kafka protocol error codes via to_kafka_error_code()
+    coordinator.leave_group(group_id, member_id)?;
 
     // Build response
     let mut response = LeaveGroupResponse::default();

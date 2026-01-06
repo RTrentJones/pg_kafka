@@ -3,7 +3,7 @@
 // Handlers for ApiVersions and Metadata requests.
 // These are discovery-focused APIs that help clients understand broker capabilities.
 
-use crate::kafka::constants::*;
+use crate::kafka::constants::{DEFAULT_BROKER_ID, ERROR_NONE};
 use crate::kafka::error::Result;
 use crate::kafka::storage::KafkaStore;
 
@@ -74,13 +74,17 @@ pub fn handle_metadata(
                         topics_metadata.push(topic);
                     }
                     Err(e) => {
-                        // Return error for this topic
-                        crate::pg_warning!("Failed to get_or_create topic '{}': {}", topic_name, e);
-                        let topic = crate::kafka::build_topic_metadata(
-                            topic_name,
-                            ERROR_UNKNOWN_SERVER_ERROR,
-                            vec![],
-                        );
+                        // Use typed error's Kafka error code
+                        let error_code = e.to_kafka_error_code();
+                        if e.is_server_error() {
+                            crate::pg_warning!(
+                                "Failed to get_or_create topic '{}': {}",
+                                topic_name,
+                                e
+                            );
+                        }
+                        let topic =
+                            crate::kafka::build_topic_metadata(topic_name, error_code, vec![]);
                         topics_metadata.push(topic);
                     }
                 }

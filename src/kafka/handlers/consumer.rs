@@ -4,7 +4,7 @@
 // These track consumer group progress through partitions.
 
 use super::helpers::{resolve_topic_id, topic_resolution_error_code, TopicResolution};
-use crate::kafka::constants::*;
+use crate::kafka::constants::ERROR_NONE;
 use crate::kafka::error::Result;
 use crate::kafka::storage::{CommittedOffset, KafkaStore};
 use kafka_protocol::messages::TopicName;
@@ -68,14 +68,18 @@ pub fn handle_offset_commit(
             ) {
                 Ok(_) => ERROR_NONE,
                 Err(e) => {
-                    crate::pg_warning!(
-                        "Failed to commit offset for group='{}', topic_id={}, partition={}: {}",
-                        group_id,
-                        topic_id,
-                        partition_id,
-                        e
-                    );
-                    ERROR_UNKNOWN_SERVER_ERROR
+                    // Use typed error's Kafka error code
+                    let code = e.to_kafka_error_code();
+                    if e.is_server_error() {
+                        crate::pg_warning!(
+                            "Failed to commit offset for group='{}', topic_id={}, partition={}: {}",
+                            group_id,
+                            topic_id,
+                            partition_id,
+                            e
+                        );
+                    }
+                    code
                 }
             };
 
@@ -162,15 +166,19 @@ pub fn handle_offset_fetch(
                         partition_response.error_code = ERROR_NONE;
                     }
                     Err(e) => {
-                        crate::pg_warning!(
-                            "Failed to fetch offset for group='{}', topic_id={}, partition={}: {}",
-                            group_id,
-                            topic_id,
-                            partition_index,
-                            e
-                        );
+                        // Use typed error's Kafka error code
+                        let error_code = e.to_kafka_error_code();
+                        if e.is_server_error() {
+                            crate::pg_warning!(
+                                "Failed to fetch offset for group='{}', topic_id={}, partition={}: {}",
+                                group_id,
+                                topic_id,
+                                partition_index,
+                                e
+                            );
+                        }
                         partition_response.committed_offset = -1;
-                        partition_response.error_code = ERROR_UNKNOWN_SERVER_ERROR;
+                        partition_response.error_code = error_code;
                     }
                 }
 

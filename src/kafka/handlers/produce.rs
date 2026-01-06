@@ -2,7 +2,7 @@
 //
 // Handles ProduceRequest - writing messages to topics.
 
-use crate::kafka::constants::*;
+use crate::kafka::constants::{ERROR_NONE, ERROR_UNKNOWN_TOPIC_OR_PARTITION};
 use crate::kafka::error::Result;
 use crate::kafka::storage::KafkaStore;
 
@@ -54,13 +54,17 @@ pub fn handle_produce(
                     partition_response.log_start_offset = -1;
                 }
                 Err(e) => {
-                    crate::pg_warning!(
-                        "Failed to insert records for topic_id={}, partition={}: {}",
-                        topic_id,
-                        partition_index,
-                        e
-                    );
-                    partition_response.error_code = ERROR_UNKNOWN_SERVER_ERROR;
+                    // Use typed error's Kafka error code for proper protocol response
+                    let error_code = e.to_kafka_error_code();
+                    if e.is_server_error() {
+                        crate::pg_warning!(
+                            "Failed to insert records for topic_id={}, partition={}: {}",
+                            topic_id,
+                            partition_index,
+                            e
+                        );
+                    }
+                    partition_response.error_code = error_code;
                     partition_response.base_offset = -1;
                     partition_response.log_append_time_ms = -1;
                     partition_response.log_start_offset = -1;

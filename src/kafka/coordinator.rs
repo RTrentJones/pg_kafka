@@ -370,24 +370,25 @@ impl GroupCoordinator {
             KafkaError::Internal(format!("Failed to acquire groups write lock: {}", e))
         })?;
 
-        let group = groups
-            .get_mut(&group_id)
-            .ok_or_else(|| KafkaError::Internal(format!("Unknown group_id: {}", group_id)))?;
+        let group =
+            groups
+                .get_mut(&group_id)
+                .ok_or_else(|| KafkaError::CoordinatorNotAvailable {
+                    group_id: group_id.clone(),
+                })?;
 
         // Validate generation ID
         if group.generation_id != generation_id {
-            return Err(KafkaError::Internal(format!(
-                "Illegal generation: expected {}, got {}",
-                group.generation_id, generation_id
-            )));
+            return Err(KafkaError::illegal_generation(
+                &group_id,
+                generation_id,
+                group.generation_id,
+            ));
         }
 
         // Validate member ID
         if !group.members.contains_key(&member_id) {
-            return Err(KafkaError::Internal(format!(
-                "Unknown member_id: {}",
-                member_id
-            )));
+            return Err(KafkaError::unknown_member(&group_id, &member_id));
         }
 
         pg_log!(
@@ -429,23 +430,27 @@ impl GroupCoordinator {
             KafkaError::Internal(format!("Failed to acquire groups write lock: {}", e))
         })?;
 
-        let group = groups
-            .get_mut(&group_id)
-            .ok_or_else(|| KafkaError::Internal(format!("Unknown group_id: {}", group_id)))?;
+        let group =
+            groups
+                .get_mut(&group_id)
+                .ok_or_else(|| KafkaError::CoordinatorNotAvailable {
+                    group_id: group_id.clone(),
+                })?;
 
         // Validate generation ID
         if group.generation_id != generation_id {
-            return Err(KafkaError::Internal(format!(
-                "Illegal generation: expected {}, got {}",
-                group.generation_id, generation_id
-            )));
+            return Err(KafkaError::illegal_generation(
+                &group_id,
+                generation_id,
+                group.generation_id,
+            ));
         }
 
         // Validate member ID and update heartbeat
         let member = group
             .members
             .get_mut(&member_id)
-            .ok_or_else(|| KafkaError::Internal(format!("Unknown member_id: {}", member_id)))?;
+            .ok_or_else(|| KafkaError::unknown_member(&group_id, &member_id))?;
 
         member.last_heartbeat = SystemTime::now();
 
@@ -461,9 +466,12 @@ impl GroupCoordinator {
             KafkaError::Internal(format!("Failed to acquire groups write lock: {}", e))
         })?;
 
-        let group = groups
-            .get_mut(&group_id)
-            .ok_or_else(|| KafkaError::Internal(format!("Unknown group_id: {}", group_id)))?;
+        let group =
+            groups
+                .get_mut(&group_id)
+                .ok_or_else(|| KafkaError::CoordinatorNotAvailable {
+                    group_id: group_id.clone(),
+                })?;
 
         pg_log!("LeaveGroup: group_id={}, member_id={}", group_id, member_id);
 
@@ -472,10 +480,7 @@ impl GroupCoordinator {
             // Future: Trigger rebalance for remaining members
             Ok(())
         } else {
-            Err(KafkaError::Internal(format!(
-                "Unknown member_id: {}",
-                member_id
-            )))
+            Err(KafkaError::unknown_member(&group_id, &member_id))
         }
     }
 
