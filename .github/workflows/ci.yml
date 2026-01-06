@@ -32,8 +32,43 @@ jobs:
         with:
           toolchain: nightly
           components: rustfmt, clippy
+
       - name: Check formatting
         run: cargo fmt -- --check
+
+      # pgrx setup required for clippy (pgrx-pg-sys needs PostgreSQL headers)
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpq-dev libreadline-dev zlib1g-dev flex bison libxml2-dev libxslt-dev libssl-dev
+
+      - name: Cache cargo-pgrx binary
+        id: cache-cargo-pgrx
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-pgrx
+          key: ${{ runner.os }}-cargo-pgrx-bin-${{ env.PGRX_VERSION }}
+
+      - name: Install pgrx
+        if: steps.cache-cargo-pgrx.outputs.cache-hit != 'true'
+        run: cargo install --locked cargo-pgrx --version ${{ env.PGRX_VERSION }}
+
+      - name: Cache pgrx PostgreSQL Binaries
+        id: cache-pgrx
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pgrx/14.*
+            ~/.pgrx/14.*_unpack
+            ~/.pgrx/config.toml
+          key: ${{ runner.os }}-pgrx-pg14-${{ env.PGRX_VERSION }}-pg${{ env.PG_VERSION }}-v2
+          restore-keys: |
+            ${{ runner.os }}-pgrx-pg14-${{ env.PGRX_VERSION }}-
+
+      - name: Initialize pgrx
+        if: steps.cache-pgrx.outputs.cache-hit != 'true'
+        run: cargo pgrx init --pg14 download
+
       - name: Run clippy
         run: cargo clippy --features pg14 -- -D warnings
 
@@ -289,6 +324,40 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: nightly
+
+      # pgrx setup required for cargo check (pgrx-pg-sys needs PostgreSQL headers)
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpq-dev libreadline-dev zlib1g-dev flex bison libxml2-dev libxslt-dev libssl-dev
+
+      - name: Cache cargo-pgrx binary
+        id: cache-cargo-pgrx
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-pgrx
+          key: ${{ runner.os }}-cargo-pgrx-bin-${{ env.PGRX_VERSION }}
+
+      - name: Install pgrx
+        if: steps.cache-cargo-pgrx.outputs.cache-hit != 'true'
+        run: cargo install --locked cargo-pgrx --version ${{ env.PGRX_VERSION }}
+
+      - name: Cache pgrx PostgreSQL Binaries
+        id: cache-pgrx
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pgrx/14.*
+            ~/.pgrx/14.*_unpack
+            ~/.pgrx/config.toml
+          key: ${{ runner.os }}-pgrx-pg14-${{ env.PGRX_VERSION }}-pg${{ env.PG_VERSION }}-v2
+          restore-keys: |
+            ${{ runner.os }}-pgrx-pg14-${{ env.PGRX_VERSION }}-
+
+      - name: Initialize pgrx
+        if: steps.cache-pgrx.outputs.cache-hit != 'true'
+        run: cargo pgrx init --pg14 download
+
       - name: Check Cargo.lock is up-to-date
         # Use cargo check --locked to verify lockfile matches Cargo.toml
         # This will fail if Cargo.lock needs updating
