@@ -73,10 +73,48 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     // IMPORTANT: Must connect to the database where CREATE EXTENSION was run
     BackgroundWorker::connect_worker_to_spi(Some(&config.database), None);
 
-    // Step 3b: Verify schema exists before starting listener
-    // This catches missing CREATE EXTENSION early with a clear error message
-    if let Err(e) = verify_schema(&config.database) {
-        pgrx::error!("pg_kafka schema not initialized: {}", e);
+    // Step 3b: Wait for schema to exist before starting listener
+    // The background worker starts when Postgres boots, but CREATE EXTENSION
+    // may not have run yet. We retry with a delay to handle this timing issue.
+    const MAX_SCHEMA_WAIT_MS: u64 = 60_000; // 60 seconds max wait
+    const SCHEMA_CHECK_INTERVAL_MS: u64 = 500;
+    let mut waited_ms = 0u64;
+    let database_name = config.database.clone();
+    loop {
+        // SPI calls require a transaction context
+        let result = BackgroundWorker::transaction(|| verify_schema(&database_name));
+        match result {
+            Ok(()) => {
+                if waited_ms > 0 {
+                    log!("pg_kafka schema found after waiting {} ms", waited_ms);
+                }
+                break;
+            }
+            Err(e) => {
+                if waited_ms >= MAX_SCHEMA_WAIT_MS {
+                    pgrx::error!(
+                        "pg_kafka schema not initialized after {} seconds: {}. \
+                         Run 'CREATE EXTENSION pg_kafka' in database '{}'",
+                        MAX_SCHEMA_WAIT_MS / 1000,
+                        e,
+                        config.database
+                    );
+                }
+                if waited_ms == 0 {
+                    log!(
+                        "Waiting for pg_kafka schema (run 'CREATE EXTENSION pg_kafka' in database '{}')",
+                        config.database
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(SCHEMA_CHECK_INTERVAL_MS));
+                waited_ms = waited_ms.saturating_add(SCHEMA_CHECK_INTERVAL_MS);
+            }
+        }
+        // Check for shutdown signal while waiting
+        if BackgroundWorker::sigterm_received() {
+            log!("Shutdown signal received while waiting for schema");
+            return;
+        }
     }
 
     log!(

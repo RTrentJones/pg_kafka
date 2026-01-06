@@ -16,9 +16,8 @@ use tokio_postgres::NoTls;
 
 /// Get database connection string from DATABASE_URL env var or use default
 fn get_database_url() -> String {
-    env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "host=localhost port=28814 user=postgres dbname=postgres".to_string()
-    })
+    env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "host=localhost port=28814 user=postgres dbname=postgres".to_string())
 }
 
 #[tokio::main]
@@ -71,9 +70,7 @@ async fn test_producer() -> Result<(), Box<dyn std::error::Error>> {
 
     let (partition, offset) = producer
         .send(
-            FutureRecord::to(topic)
-                .payload(payload)
-                .key(key),
+            FutureRecord::to(topic).payload(payload).key(key),
             Duration::from_secs(5),
         )
         .await
@@ -106,10 +103,12 @@ async fn test_producer() -> Result<(), Box<dyn std::error::Error>> {
 
     // Verify topic was created
     println!("Checking topic creation...");
-    let topic_row = client.query_one(
-        "SELECT id, name FROM kafka.topics WHERE name = $1",
-        &[&topic],
-    ).await?;
+    let topic_row = client
+        .query_one(
+            "SELECT id, name FROM kafka.topics WHERE name = $1",
+            &[&topic],
+        )
+        .await?;
     let topic_id: i32 = topic_row.get(0);
     let topic_name: String = topic_row.get(1);
 
@@ -118,14 +117,16 @@ async fn test_producer() -> Result<(), Box<dyn std::error::Error>> {
 
     // Verify message was inserted
     println!("\nChecking message insertion...");
-    let rows = client.query(
-        "SELECT topic_id, partition_id, partition_offset, key, value
+    let rows = client
+        .query(
+            "SELECT topic_id, partition_id, partition_offset, key, value
          FROM kafka.messages
          WHERE topic_id = $1
          ORDER BY partition_offset DESC
          LIMIT 1",
-        &[&topic_id],
-    ).await?;
+            &[&topic_id],
+        )
+        .await?;
 
     assert!(!rows.is_empty(), "No messages found in database!");
 
@@ -151,10 +152,12 @@ async fn test_producer() -> Result<(), Box<dyn std::error::Error>> {
     println!("   Value: {}", String::from_utf8_lossy(&db_value));
 
     // Count total messages for this topic
-    let count_row = client.query_one(
-        "SELECT COUNT(*) FROM kafka.messages WHERE topic_id = $1",
-        &[&topic_id],
-    ).await?;
+    let count_row = client
+        .query_one(
+            "SELECT COUNT(*) FROM kafka.messages WHERE topic_id = $1",
+            &[&topic_id],
+        )
+        .await?;
     let message_count: i64 = count_row.get(0);
     println!("\n✅ Total messages in '{}': {}", topic, message_count);
 
@@ -180,15 +183,16 @@ async fn test_consumer_basic() -> Result<(), Box<dyn std::error::Error>> {
 
     let (partition, offset) = producer
         .send(
-            FutureRecord::to(topic)
-                .payload(test_value)
-                .key(test_key),
+            FutureRecord::to(topic).payload(test_value).key(test_key),
             Duration::from_secs(5),
         )
         .await
         .map_err(|(err, _msg)| err)?;
 
-    println!("✅ Message produced: partition={}, offset={}", partition, offset);
+    println!(
+        "✅ Message produced: partition={}, offset={}",
+        partition, offset
+    );
 
     // 2. Create consumer with manual partition assignment (bypasses consumer groups)
     println!("\nStep 2: Creating consumer with manual partition assignment...");
@@ -197,7 +201,7 @@ async fn test_consumer_basic() -> Result<(), Box<dyn std::error::Error>> {
 
     let consumer: BaseConsumer = ClientConfig::new()
         .set("bootstrap.servers", "localhost:9092")
-        .set("group.id", "manual-consumer")  // Required even for manual assignment
+        .set("group.id", "manual-consumer") // Required even for manual assignment
         .create()?;
 
     println!("✅ Consumer created");
@@ -221,7 +225,9 @@ async fn test_consumer_basic() -> Result<(), Box<dyn std::error::Error>> {
         match consumer.poll(Duration::from_millis(100)) {
             Some(Ok(msg)) => {
                 let msg_key = msg.key().map(|k| String::from_utf8_lossy(k).to_string());
-                let msg_value = msg.payload().map(|v| String::from_utf8_lossy(v).to_string());
+                let msg_value = msg
+                    .payload()
+                    .map(|v| String::from_utf8_lossy(v).to_string());
                 let msg_offset = msg.offset();
                 let msg_partition = msg.partition();
 
@@ -276,9 +282,7 @@ async fn test_consumer_multiple_messages() -> Result<(), Box<dyn std::error::Err
 
         producer
             .send(
-                FutureRecord::to(topic)
-                    .payload(&value)
-                    .key(&key),
+                FutureRecord::to(topic).payload(&value).key(&key),
                 Duration::from_secs(5),
             )
             .await
@@ -294,7 +298,7 @@ async fn test_consumer_multiple_messages() -> Result<(), Box<dyn std::error::Err
 
     let consumer: BaseConsumer = ClientConfig::new()
         .set("bootstrap.servers", "localhost:9092")
-        .set("group.id", "manual-multi-consumer")  // Required even for manual assignment
+        .set("group.id", "manual-multi-consumer") // Required even for manual assignment
         .create()?;
 
     let mut assignment = TopicPartitionList::new();
@@ -308,7 +312,8 @@ async fn test_consumer_multiple_messages() -> Result<(), Box<dyn std::error::Err
     while received_count < message_count && start.elapsed() < timeout {
         match consumer.poll(Duration::from_millis(100)) {
             Some(Ok(msg)) => {
-                let msg_value = msg.payload()
+                let msg_value = msg
+                    .payload()
                     .map(|v| String::from_utf8_lossy(v).to_string())
                     .unwrap_or_default();
 
@@ -325,7 +330,10 @@ async fn test_consumer_multiple_messages() -> Result<(), Box<dyn std::error::Err
         }
     }
 
-    assert_eq!(received_count, message_count, "Did not receive all messages");
+    assert_eq!(
+        received_count, message_count,
+        "Did not receive all messages"
+    );
     println!("✅ All {} messages received", received_count);
 
     println!("\n✅ Test 3: Multiple messages test PASSED\n");
@@ -349,9 +357,7 @@ async fn test_consumer_from_offset() -> Result<(), Box<dyn std::error::Error>> {
         let key = format!("offset-key-{}", i);
         producer
             .send(
-                FutureRecord::to(topic)
-                    .payload(&value)
-                    .key(&key),
+                FutureRecord::to(topic).payload(&value).key(&key),
                 Duration::from_secs(5),
             )
             .await
@@ -371,25 +377,32 @@ async fn test_consumer_from_offset() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let count_row = db_client.query_one(
-        "SELECT COUNT(*) FROM kafka.messages m
+    let count_row = db_client
+        .query_one(
+            "SELECT COUNT(*) FROM kafka.messages m
          JOIN kafka.topics t ON m.topic_id = t.id
          WHERE t.name = $1",
-        &[&topic],
-    ).await?;
+            &[&topic],
+        )
+        .await?;
     let db_count: i64 = count_row.get(0);
 
     assert!(db_count >= 10, "Not enough messages in database");
-    println!("✅ Database has {} messages for topic '{}'", db_count, topic);
+    println!(
+        "✅ Database has {} messages for topic '{}'",
+        db_count, topic
+    );
 
     // 3. Query high watermark
-    let hw_row = db_client.query_one(
-        "SELECT COALESCE(MAX(m.partition_offset) + 1, 0) as high_watermark
+    let hw_row = db_client
+        .query_one(
+            "SELECT COALESCE(MAX(m.partition_offset) + 1, 0) as high_watermark
          FROM kafka.messages m
          JOIN kafka.topics t ON m.topic_id = t.id
          WHERE t.name = $1 AND m.partition_id = 0",
-        &[&topic],
-    ).await?;
+            &[&topic],
+        )
+        .await?;
     let high_watermark: i64 = hw_row.get(0);
     println!("✅ High watermark: {}", high_watermark);
 
@@ -415,9 +428,7 @@ async fn test_offset_commit_fetch() -> Result<(), Box<dyn std::error::Error>> {
         let key = format!("commit-key-{}", i);
         producer
             .send(
-                FutureRecord::to(topic)
-                    .payload(&value)
-                    .key(&key),
+                FutureRecord::to(topic).payload(&value).key(&key),
                 Duration::from_secs(5),
             )
             .await
@@ -432,7 +443,7 @@ async fn test_offset_commit_fetch() -> Result<(), Box<dyn std::error::Error>> {
         .set("bootstrap.servers", "localhost:9092")
         .set("group.id", group_id)
         .set("session.timeout.ms", "6000")
-        .set("enable.auto.commit", "false")  // Manual offset management
+        .set("enable.auto.commit", "false") // Manual offset management
         .create()?;
 
     // Manually assign partition (pg_kafka doesn't support automatic rebalancing yet)
@@ -490,13 +501,15 @@ async fn test_offset_commit_fetch() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let offset_row = db_client.query_one(
-        "SELECT co.committed_offset
+    let offset_row = db_client
+        .query_one(
+            "SELECT co.committed_offset
          FROM kafka.consumer_offsets co
          JOIN kafka.topics t ON co.topic_id = t.id
          WHERE co.group_id = $1 AND t.name = $2 AND co.partition_id = 0",
-        &[&group_id, &topic],
-    ).await?;
+            &[&group_id, &topic],
+        )
+        .await?;
 
     let committed_offset: i64 = offset_row.get(0);
     println!("✅ Database shows committed offset: {}", committed_offset);
@@ -508,7 +521,7 @@ async fn test_offset_commit_fetch() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nStep 5: Creating new consumer to verify resume from committed offset...");
     let consumer2: StreamConsumer = ClientConfig::new()
         .set("bootstrap.servers", "localhost:9092")
-        .set("group.id", group_id)  // Same group ID
+        .set("group.id", group_id) // Same group ID
         .set("session.timeout.ms", "6000")
         .set("enable.auto.commit", "false")
         .create()?;
