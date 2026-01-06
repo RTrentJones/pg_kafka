@@ -992,7 +992,7 @@ fn parse_record_batch(batch_bytes: &bytes::Bytes) -> Result<Vec<super::messages:
 /// Encode and send a Kafka response to a TCP socket
 ///
 /// Kafka response format:
-/// ```
+/// ```text
 /// [4 bytes: Size] [ResponseHeader] [ResponseBody]
 /// ```
 /// Encode a Kafka response into bytes

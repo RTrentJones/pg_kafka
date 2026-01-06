@@ -12,7 +12,7 @@
 //! # State Machine
 //!
 //! Consumer groups transition through these states:
-//! ```
+//! ```text
 //! Empty → PreparingRebalance → CompletingRebalance → Stable → Empty
 //!   ↑                                                          ↓
 //!   └──────────────────────────────────────────────────────────┘
