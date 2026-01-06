@@ -187,5 +187,8 @@ pub trait KafkaStore {
 // Submodules
 pub mod postgres;
 
+#[cfg(test)]
+mod tests;
+
 // Re-export main types
 pub use postgres::PostgresStore;

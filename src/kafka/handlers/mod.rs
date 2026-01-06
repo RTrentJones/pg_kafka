@@ -24,6 +24,9 @@ mod helpers;
 mod metadata;
 mod produce;
 
+#[cfg(test)]
+mod tests;
+
 // Re-export all handlers
 pub use consumer::{handle_offset_commit, handle_offset_fetch};
 pub use coordinator::{
