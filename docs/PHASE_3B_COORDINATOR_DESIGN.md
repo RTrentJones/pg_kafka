@@ -1,8 +1,9 @@
 # Phase 3B: Consumer Group Coordinator Protocol Design
 
-**Date**: 2026-01-03
-**Status**: Design Phase
+**Date**: 2026-01-06
+**Status**: ✅ Complete
 **Goal**: Implement full Kafka consumer group coordinator protocol to enable consumer E2E tests
+**Result**: All 5 coordinator APIs implemented, E2E tests passing
 
 ---
 
@@ -26,29 +27,29 @@ This is the final piece needed to enable the disabled consumer E2E tests in [kaf
 - ✅ **Storage Layer**: PostgresStore has methods for offset management
 - ✅ **Repository Pattern**: Clean separation between storage and handlers
 
-### What's Missing (Phase 3B)
-- ❌ **FindCoordinator API** (key 10): Returns coordinator for a consumer group
-- ❌ **JoinGroup API** (key 11): Consumer joins a group and gets member ID
-- ❌ **SyncGroup API** (key 14): Leader receives assignments, followers wait
-- ❌ **Heartbeat API** (key 12): Periodic keep-alive from consumers
-- ❌ **LeaveGroup API** (key 13): Graceful consumer departure
-- ❌ **Consumer Group State**: In-memory tracking of group membership
-- ❌ **Partition Assignment**: Logic to assign partitions to consumers
+### What's Implemented (Phase 3B Complete)
+- ✅ **FindCoordinator API** (key 10): Returns coordinator for a consumer group
+- ✅ **JoinGroup API** (key 11): Consumer joins a group and gets member ID
+- ✅ **SyncGroup API** (key 14): Leader receives assignments, followers wait
+- ✅ **Heartbeat API** (key 12): Periodic keep-alive from consumers
+- ✅ **LeaveGroup API** (key 13): Graceful consumer departure
+- ✅ **Consumer Group State**: In-memory tracking with Arc<RwLock<HashMap>>
+- ⚠️ **Partition Assignment**: Manual assignment only (automatic strategies planned for Phase 4)
 
-### Why Consumer Tests Failed
+### Why Consumer Tests Originally Failed (Resolved)
 
-The disabled consumer tests in [kafka_test/src/main.rs](../kafka_test/src/main.rs) failed with:
+Before Phase 3B, the consumer tests in [kafka_test/src/main.rs](../kafka_test/src/main.rs) failed with:
 ```
 Error: BrokerTransportFailure
 Error: AllBrokersDown
 ```
 
-This happens because rdkafka consumer clients perform this sequence:
-1. Send **FindCoordinator** request → Gets rejected (unsupported API)
-2. Client treats this as broker failure
-3. All subsequent operations fail
+This happened because rdkafka consumer clients perform this sequence:
+1. Send **FindCoordinator** request → Got rejected (unsupported API)
+2. Client treated this as broker failure
+3. All subsequent operations failed
 
-**The fix**: Implement the 5 missing coordinator APIs.
+**Resolution**: Implemented all 5 coordinator APIs. Consumer tests now pass ✅
 
 ---
 

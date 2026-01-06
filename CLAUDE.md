@@ -112,19 +112,31 @@ src/
 ├── lib.rs              # Extension entry point, _PG_init hook, schema creation
 ├── config.rs           # GUC configuration (pg_kafka.port, pg_kafka.host, etc.)
 ├── worker.rs           # Background worker main loop, request processing, SPI calls
+├── testing/            # Test utilities and mocks
+│   ├── mod.rs          # Test module exports
+│   └── mocks.rs        # MockKafkaStore for unit testing handlers/storage
 ├── kafka/
 │   ├── mod.rs          # Module organization, re-exports
 │   ├── listener.rs     # TCP listener, tokio runtime, connection handling
 │   ├── protocol.rs     # Binary protocol parsing/encoding (uses kafka-protocol crate)
 │   ├── messages.rs     # Request/response types, message queues
-│   ├── handlers.rs     # Request handlers (Produce, Fetch, OffsetCommit, etc.)
 │   ├── coordinator.rs  # Consumer group coordinator (Arc<RwLock> shared state)
 │   ├── response_builders.rs  # Response construction helpers
-│   ├── constants.rs    # Protocol constants and error codes
-│   ├── error.rs        # Error types (KafkaError with anyhow conversion)
-│   └── storage/
-│       ├── mod.rs      # Storage abstraction layer (Repository Pattern)
-│       └── postgres.rs # PostgreSQL implementation (PostgresStore)
+│   ├── constants.rs    # Protocol constants and Kafka error codes
+│   ├── error.rs        # Typed errors with Kafka error code mapping (to_kafka_error_code())
+│   ├── handlers/       # Protocol request handlers (modular organization)
+│   │   ├── mod.rs      # Handler re-exports
+│   │   ├── consumer.rs # OffsetCommit/OffsetFetch handlers
+│   │   ├── coordinator.rs  # Group coordination handlers (JoinGroup, Heartbeat, etc.)
+│   │   ├── fetch.rs    # Fetch/ListOffsets handlers
+│   │   ├── helpers.rs  # Topic resolution utilities (TopicResolution enum)
+│   │   ├── metadata.rs # ApiVersions/Metadata handlers
+│   │   ├── produce.rs  # ProduceRequest handler
+│   │   └── tests.rs    # Handler unit tests (14 tests with MockKafkaStore)
+│   └── storage/        # Storage abstraction layer (Repository Pattern)
+│       ├── mod.rs      # KafkaStore trait definition
+│       ├── postgres.rs # PostgreSQL implementation (PostgresStore)
+│       └── tests.rs    # Storage layer tests (22 tests)
 └── bin/
     └── pgrx_embed.rs   # pgrx embedding binary (generated)
 
@@ -148,10 +160,11 @@ docs/
     └── ADR-001-partitioning-and-retention.md  # Design decisions
 
 restart.sh              # Quick rebuild and restart script for development
+Cargo.lock              # Locked dependencies for reproducible builds
 
 .github/
 ├── workflows/
-│   └── ci.yml          # GitHub Actions CI/CD pipeline
+│   └── ci.yml          # GitHub Actions CI/CD pipeline (lint, test, security, lockfile)
 └── SETUP.md            # CI/CD setup guide
 ```
 
@@ -294,7 +307,7 @@ CREATE TABLE kafka.consumer_offsets (
 
 ## Non-Goals (v1)
 
-- Full Protocol Compliance: No Consumer Groups, Transactions, or Compression in v1
+- Full Protocol Compliance: Consumer Groups have manual assignment only (no automatic rebalancing), no Transactions or Compression
 - High Availability: Rely on standard Postgres HA (Patroni/RDS) rather than Kafka's ISR
 - Broker Clustering: Single-node "broker" design
 

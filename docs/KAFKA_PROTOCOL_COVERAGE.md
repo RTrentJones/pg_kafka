@@ -1,6 +1,6 @@
 # Kafka Protocol Coverage Analysis
 
-**Date**: 2026-01-03
+**Date**: 2026-01-06
 **pg_kafka Version**: Phase 3B Complete
 **Analysis**: Comprehensive review of implemented vs standard Kafka protocol
 
@@ -8,10 +8,13 @@
 
 ## Executive Summary
 
-**API Coverage**: 12 of ~50 standard Kafka APIs (24%)
-**Build Status**: ✅ Compiles successfully with zero warnings
-**Quality**: Clean architecture with Repository Pattern separation
-**Critical Issue**: ⚠️ ListOffsets advertised but not implemented
+| Metric | Value |
+|--------|-------|
+| **API Coverage** | 12 of ~50 standard Kafka APIs (24%) |
+| **Build Status** | ✅ Compiles with zero warnings |
+| **Test Suite** | 73 tests (68 unit + 5 E2E) |
+| **Architecture** | Repository Pattern with typed errors |
+| **Client Compatibility** | ✅ kcat, rdkafka verified |
 
 ---
 
@@ -165,66 +168,41 @@ Consumer Flow (Current):
 
 ---
 
-## Recommendations
+## Roadmap
 
-### Immediate (Phase 4) - Enhanced Consumer Group Visibility
-**Timeline**: 1-2 days
+### Phase 4: Consumer Group Enhancements
 
-1. **📋 Implement DescribeGroups** (API Key 15)
-   - Critical for debugging consumer groups
-   - Query GroupCoordinator state
-   - Return group members and assignments
+**Priority 1: Group Visibility APIs**
+- **DescribeGroups** (API 15) - Debug consumer group state and assignments
+- **ListGroups** (API 16) - Discover all active consumer groups
 
-2. **📋 Implement ListGroups** (API Key 16)
-   - Trivial implementation
-   - List all groups from GroupCoordinator
+**Priority 2: Automatic Assignment**
+- Range assignment strategy
+- RoundRobin assignment strategy
+- Compute assignments in SyncGroup when leader sends empty assignments
 
-### Short-Term (Phase 4) - Complete Consumer Experience
-**Timeline**: 1-2 weeks
+**Priority 3: Automatic Rebalancing**
+- Trigger rebalance on member join/leave
+- Member timeout detection (background heartbeat checker)
+- Move to PreparingRebalance state automatically
 
-1. **Partition Assignment Strategies**
-   - Implement range assignment
-   - Implement roundrobin assignment
-   - Compute in SyncGroup handler when leader sends empty assignments
+**Priority 4: Multi-Partition Support**
+- Configurable partition count per topic
+- Key-based partition assignment (`hash(key) % num_partitions`)
+- Update metadata response with correct partition count
 
-2. **Automatic Rebalancing**
-   - Trigger rebalance on member join/leave
-   - Move to PreparingRebalance state
-   - All members must rejoin with new generation
+### Phase 5: Administration APIs
 
-3. **Member Timeout Detection**
-   - Background task checking heartbeat timestamps
-   - Remove members exceeding session_timeout_ms
-   - Trigger rebalance on removal
+- **CreateTopics/DeleteTopics** - Programmatic topic management
+- **DeleteGroups** - Consumer group cleanup
+- **Compression Support** - gzip, snappy, lz4, zstd
 
-4. **Multi-Partition Topics**
-   - Make partition count configurable
-   - Distribute partitions across consumers
-   - Test with 3+ partitions
+### Future Considerations
 
-### Medium-Term (Phase 5) - Administration APIs
-**Timeline**: 2-3 weeks
-
-1. **CreateTopics/DeleteTopics**
-   - Better control than auto-creation
-   - Configure partitions, replication (future)
-
-2. **DeleteGroups**
-   - Cleanup inactive groups
-   - Administrative tool
-
-3. **Compression Support**
-   - gzip, snappy, lz4, zstd
-   - Bandwidth optimization
-   - Decompress in Produce, compress in Fetch
-
-### Long-Term (Future) - Advanced Features
-**Timeline**: Months
-
-1. **Static Group Membership** (KIP-345)
-2. **Cooperative Rebalancing** (KIP-429)
-3. **Idempotent Producer**
-4. **Transactions** (if needed)
+- Static Group Membership (KIP-345)
+- Cooperative Rebalancing (KIP-429)
+- Idempotent Producer
+- Transactions (if needed)
 
 ---
 
@@ -261,15 +239,25 @@ Consumer Flow (Current):
 - **Testing**: E2E tests with rdkafka
 - **Documentation**: Comprehensive design docs
 
-### Test Coverage
-| Component | Unit Tests | Integration Tests | E2E Tests |
-|-----------|------------|-------------------|-----------|
-| Producer | ❌ | ⚠️ Some | ✅ Full |
-| Consumer | ❌ | ⚠️ Some | ✅ Ready |
-| Coordinator | ✅ Basic | ❌ | ✅ Ready |
-| Storage | ❌ | ⚠️ Some | ✅ Full |
+### Test Coverage (73 total)
 
-**Recommendation**: Add comprehensive unit tests for coordinator state machine
+| Category | Count | Location |
+|----------|-------|----------|
+| Protocol parsing | 10 | `tests/protocol_tests.rs` |
+| Binary encoding | 8 | `tests/encoding_tests.rs` |
+| Property-based | 10 | `tests/property_tests.rs` |
+| Handler logic | 14 | `src/kafka/handlers/tests.rs` |
+| Storage layer | 22 | `src/kafka/storage/tests.rs` |
+| Helpers | 4 | `tests/helpers.rs` |
+| **Unit Total** | **68** | |
+| **E2E Scenarios** | **5** | `kafka_test/src/main.rs` |
+
+**E2E Test Scenarios:**
+1. Producer functionality with database verification
+2. Basic consumer with manual partition assignment
+3. Consumer multiple messages sequentially
+4. Consumer from specific offset
+5. OffsetCommit/OffsetFetch round-trip
 
 ---
 
@@ -302,7 +290,8 @@ Consumer Flow (Current):
 
 ---
 
-**Overall Assessment**: Phase 3B Complete - pg_kafka now provides full producer/consumer support with manual partition assignment. The implementation is clean, well-tested, and ready for automatic assignment strategies in Phase 4.
+**Overall Assessment**: Phase 3B Complete - pg_kafka provides full producer/consumer support with manual partition assignment. The implementation features clean architecture (Repository Pattern), comprehensive test coverage (73 tests), and typed error handling. Ready for automatic assignment strategies in Phase 4.
 
-**Last Updated:** 2026-01-03
+**Last Updated:** 2026-01-06
 **Phase:** 3B Complete
+**Tests:** 73 passing (68 unit + 5 E2E)

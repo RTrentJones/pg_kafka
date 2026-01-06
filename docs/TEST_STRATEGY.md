@@ -28,15 +28,17 @@ FATAL SQLSTATE[XX000]: cannot create PGC_POSTMASTER variables after startup
 
 ### ✅ Unit Tests (`cargo test --lib`)
 
-**Location:** `tests/` directory
+**Location:** `tests/` directory and `src/kafka/` modules
 
 | File | Tests | Coverage |
 |------|-------|----------|
-| protocol_tests.rs | 10 | Protocol parsing, request/response encoding |
-| encoding_tests.rs | 8 | Binary encoding, framing |
-| property_tests.rs | 10 | Property-based fuzzing |
-| helpers.rs | 6 | Mock factories, test utilities |
-| **Total** | **34** | **Non-SPI logic** |
+| tests/protocol_tests.rs | 10 | Protocol parsing, request/response encoding |
+| tests/encoding_tests.rs | 8 | Binary encoding, framing |
+| tests/property_tests.rs | 10 | Property-based fuzzing |
+| tests/helpers.rs | 6 | Mock factories, test utilities |
+| src/kafka/handlers/tests.rs | 14 | Handler logic with MockKafkaStore |
+| src/kafka/storage/tests.rs | 22 | Storage types and MockKafkaStore coverage |
+| **Total** | **68** | **Non-SPI logic + handler/storage unit tests** |
 
 **What's Tested:**
 - ✅ Kafka wire protocol parsing
@@ -44,12 +46,15 @@ FATAL SQLSTATE[XX000]: cannot create PGC_POSTMASTER variables after startup
 - ✅ Error type display and conversion
 - ✅ Mock request builders
 - ✅ Property-based testing (arbitrary inputs)
+- ✅ Handler logic with MockKafkaStore (produce, fetch, metadata, offsets)
+- ✅ Storage layer types (TopicMetadata, FetchedMessage, CommittedOffset)
+- ✅ KafkaStore trait contract verification
 
-**What's NOT Tested:**
-- ❌ SPI database operations
-- ❌ Background worker lifecycle
-- ❌ GUC configuration loading
-- ❌ Request processing with database
+**What's NOT Tested (via unit tests):**
+- ❌ SPI database operations (tested via E2E)
+- ❌ Background worker lifecycle (tested via E2E)
+- ❌ GUC configuration loading (tested via E2E)
+- ❌ PostgresStore implementation (tested via E2E)
 
 ### ✅ E2E Integration Tests (`kafka_test/`)
 

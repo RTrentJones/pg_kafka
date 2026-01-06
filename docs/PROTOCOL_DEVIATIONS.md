@@ -4,7 +4,17 @@ This document lists intentional deviations from the official Kafka protocol spec
 
 ## Summary
 
-`pg_kafka` implements a **subset** of the Kafka wire protocol. The following deviations are by design for the current implementation (Phase 3B Complete).
+`pg_kafka` implements a **subset** of the Kafka wire protocol (24% API coverage). The following deviations are intentional design decisions that optimize for PostgreSQL's strengths while maintaining compatibility with standard Kafka clients.
+
+| Category | Status |
+|----------|--------|
+| **Producer APIs** | ✅ Full support (with documented limitations) |
+| **Consumer APIs** | ✅ Full support (manual partition assignment) |
+| **Coordinator APIs** | ✅ Partial (no automatic rebalancing) |
+| **Admin APIs** | ❌ Not implemented |
+| **Transaction APIs** | ❌ Not planned |
+
+**Current Implementation:** Phase 3B Complete
 
 ## Producer API Deviations
 
@@ -61,12 +71,12 @@ This document lists intentional deviations from the official Kafka protocol spec
 
 **Rationale:**
 - Kafka transactions require two-phase commit across partitions
-- Phase 2 focuses on single-partition producer support
-- May be added in Phase 4 using PostgreSQL's native transaction support
+- Current focus is on single-partition producer/consumer support
+- Could potentially leverage PostgreSQL's native transaction support in future phases
 
 **Client Impact:**
 - Clients using Kafka transactions will fail
-- Workaround: Use PostgreSQL transactions at application level
+- Workaround: Use PostgreSQL transactions at application level (each produce is already atomic)
 
 ## Consumer API Deviations
 
@@ -185,9 +195,14 @@ consumer.assign(&assignment)?;  // ✅ Works
 **pg_kafka Behavior:** Fixed at 1 partition per topic
 
 **Rationale:**
-- Simplifies Phase 3 implementation
-- Schema supports multiple partitions
-- Can be enabled in Phase 4
+- Simplifies current implementation (Phase 3B)
+- Database schema already supports multiple partitions (`partition_id` column)
+- Multi-partition support planned for future phases
+
+**Technical Note:**
+- The `kafka.messages` table stores `partition_id` and could support multiple partitions today
+- What's missing is partition assignment logic (which partition receives which message)
+- Key-based partitioning (`hash(key) % num_partitions`) would be straightforward to add
 
 ## API Version Support
 
@@ -209,6 +224,36 @@ consumer.assign(&assignment)?;  // ✅ Works
 | 18 | ApiVersions | 0-3 | ✅ Full support |
 
 **Note:** OffsetFetch v8+ uses different response format. We support v0-7.
+
+## Error Handling
+
+pg_kafka implements typed error handling that maps internal errors to Kafka protocol error codes:
+
+```rust
+pub enum KafkaError {
+    UnknownTopic { topic: String },
+    UnknownMemberId { group_id: String, member_id: String },
+    IllegalGeneration { group_id: String, generation: i32, expected: i32 },
+    NotCoordinator { group_id: String },
+    // ... more variants
+}
+
+impl KafkaError {
+    pub fn to_kafka_error_code(&self) -> i16 {
+        match self {
+            KafkaError::UnknownTopic { .. } => 3,  // UNKNOWN_TOPIC_OR_PARTITION
+            KafkaError::UnknownMemberId { .. } => 25, // UNKNOWN_MEMBER_ID
+            KafkaError::IllegalGeneration { .. } => 22, // ILLEGAL_GENERATION
+            // ... more mappings
+        }
+    }
+}
+```
+
+**Key Design Decision:** Errors are typed rather than string-based, enabling:
+- Compile-time exhaustiveness checking
+- Direct mapping to Kafka protocol error codes
+- Consistent error responses across all handlers
 
 ### Notable Missing APIs
 
@@ -246,25 +291,43 @@ auto.offset.reset=earliest
 
 ## Future Work
 
-### Planned (Phase 4-6)
+### Phase 4: Automatic Partition Assignment
 
-1. Automatic partition assignment strategies
-2. Automatic rebalancing
-3. Long polling (LISTEN/NOTIFY)
-4. Table partitioning
-5. DescribeGroups/ListGroups APIs
-6. Multi-partition topics
+| Feature | Description | Complexity |
+|---------|-------------|------------|
+| Range Assignment | Assign partitions by range to consumers | Medium |
+| RoundRobin Assignment | Distribute partitions evenly | Medium |
+| Sticky Assignment | Minimize partition movement on rebalance | High |
+
+### Phase 5: Automatic Rebalancing
+
+| Feature | Description | Complexity |
+|---------|-------------|------------|
+| Member Timeout Detection | Detect and remove stale members | Medium |
+| Trigger Rebalance | Rebalance on member join/leave | High |
+| Cooperative Rebalancing (KIP-429) | Incremental rebalancing | Very High |
+
+### Phase 6: Shadow Mode
+
+| Feature | Description | Complexity |
+|---------|-------------|------------|
+| Logical Decoding | Tail PostgreSQL WAL | High |
+| External Kafka Production | Forward to real Kafka cluster | Medium |
+| At-Least-Once Delivery | Acknowledge only after external ACK | Medium |
 
 ### May Not Implement
 
-1. Log compaction
-2. Exactly-once semantics
-3. Replication protocol
-4. Quotas
-5. SASL authentication
+| Feature | Rationale |
+|---------|-----------|
+| Log compaction | PostgreSQL UPDATE provides similar semantics |
+| Exactly-once semantics | Requires full transaction coordinator |
+| Replication protocol | Rely on PostgreSQL HA (Patroni, RDS) |
+| Quotas | Not needed for target use cases |
+| SASL authentication | Use PostgreSQL authentication instead |
 
 ---
 
-**Last Updated:** 2026-01-03
+**Last Updated:** 2026-01-06
 **Applies To:** pg_kafka Phase 3B Complete
 **API Coverage:** 12 of ~50 Kafka APIs (24%)
+**Test Status:** 73 tests passing (68 unit + 5 E2E)
