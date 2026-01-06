@@ -33,6 +33,7 @@
 
 pub mod constants;
 pub mod coordinator;
+pub mod dispatch;
 pub mod error;
 pub mod handlers;
 pub mod listener;

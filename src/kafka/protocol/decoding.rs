@@ -640,10 +640,7 @@ fn parse_join_group(
     let protocols = join_req
         .protocols
         .into_iter()
-        .map(|p| super::super::messages::JoinGroupProtocol {
-            name: p.name.to_string(),
-            metadata: p.metadata.to_vec(),
-        })
+        .map(super::super::messages::JoinGroupProtocol::from)
         .collect();
 
     Ok(Some(KafkaRequest::JoinGroup {
@@ -701,10 +698,7 @@ fn parse_sync_group(
     let assignments = sync_req
         .assignments
         .into_iter()
-        .map(|a| super::super::messages::SyncGroupAssignment {
-            member_id: a.member_id.to_string(),
-            assignment: a.assignment.to_vec(),
-        })
+        .map(super::super::messages::SyncGroupAssignment::from)
         .collect();
 
     Ok(Some(KafkaRequest::SyncGroup {
@@ -805,10 +799,7 @@ fn parse_leave_group(
     let members = leave_req
         .members
         .into_iter()
-        .map(|m| super::super::messages::MemberIdentity {
-            member_id: m.member_id.to_string(),
-            group_instance_id: m.group_instance_id.map(|s| s.to_string()),
-        })
+        .map(super::super::messages::MemberIdentity::from)
         .collect();
 
     Ok(Some(KafkaRequest::LeaveGroup {
@@ -862,13 +853,7 @@ fn parse_list_offsets(
             let partitions = topic
                 .partitions
                 .into_iter()
-                .map(
-                    |partition| super::super::messages::ListOffsetsPartitionData {
-                        partition_index: partition.partition_index,
-                        current_leader_epoch: partition.current_leader_epoch,
-                        timestamp: partition.timestamp,
-                    },
-                )
+                .map(super::super::messages::ListOffsetsPartitionData::from)
                 .collect();
 
             super::super::messages::ListOffsetsTopicData {

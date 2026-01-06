@@ -566,6 +566,52 @@ pub struct ListOffsetsPartitionData {
     pub timestamp: i64,
 }
 
+// ========== From implementations for type conversions ==========
+// These reduce boilerplate conversion code in decoding.rs
+
+impl From<kafka_protocol::messages::join_group_request::JoinGroupRequestProtocol>
+    for JoinGroupProtocol
+{
+    fn from(p: kafka_protocol::messages::join_group_request::JoinGroupRequestProtocol) -> Self {
+        JoinGroupProtocol {
+            name: p.name.to_string(),
+            metadata: p.metadata.to_vec(),
+        }
+    }
+}
+
+impl From<kafka_protocol::messages::sync_group_request::SyncGroupRequestAssignment>
+    for SyncGroupAssignment
+{
+    fn from(a: kafka_protocol::messages::sync_group_request::SyncGroupRequestAssignment) -> Self {
+        SyncGroupAssignment {
+            member_id: a.member_id.to_string(),
+            assignment: a.assignment.to_vec(),
+        }
+    }
+}
+
+impl From<kafka_protocol::messages::leave_group_request::MemberIdentity> for MemberIdentity {
+    fn from(m: kafka_protocol::messages::leave_group_request::MemberIdentity) -> Self {
+        MemberIdentity {
+            member_id: m.member_id.to_string(),
+            group_instance_id: m.group_instance_id.map(|s| s.to_string()),
+        }
+    }
+}
+
+impl From<kafka_protocol::messages::list_offsets_request::ListOffsetsPartition>
+    for ListOffsetsPartitionData
+{
+    fn from(p: kafka_protocol::messages::list_offsets_request::ListOffsetsPartition) -> Self {
+        ListOffsetsPartitionData {
+            partition_index: p.partition_index,
+            current_leader_epoch: p.current_leader_epoch,
+            timestamp: p.timestamp,
+        }
+    }
+}
+
 // Global request queue: async tasks → main thread
 //
 // WHY CROSSBEAM INSTEAD OF TOKIO CHANNELS?

@@ -3,7 +3,7 @@
 // This module provides mock implementations and utilities for testing
 // the Kafka protocol implementation without requiring real TCP connections.
 
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{BufMut, BytesMut};
 use std::io::{self, Read, Write};
 use std::pin::Pin;
 use std::task::{Context, Poll};

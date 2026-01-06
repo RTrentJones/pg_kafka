@@ -399,8 +399,6 @@ mod tests {
 
     #[test]
     fn test_mock_insert_records_large_batch() {
-        use crate::kafka::messages::RecordHeader;
-
         let mut mock = MockKafkaStore::new();
 
         // Create a large batch of 100 records
@@ -434,7 +432,7 @@ mod tests {
         let mut call_count = 0i64;
         mock.expect_insert_records()
             .times(3)
-            .returning(move |_, _, records| {
+            .returning(move |_, _, _records| {
                 let base_offset = call_count * 10; // Each call advances by 10
                 call_count += 1;
                 // Simulate returning base offset based on records count

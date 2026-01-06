@@ -36,7 +36,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 impl KafkaStore for PostgresStore {
     fn get_or_create_topic(&self, name: &str) -> Result<i32> {
-        pgrx::debug1!("PostgresStore::get_or_create_topic: '{}'", name);
+        crate::pg_debug!("PostgresStore::get_or_create_topic: '{}'", name);
 
         Spi::connect_mut(|client| {
             let topic_name_string = name.to_string();
@@ -58,14 +58,14 @@ impl KafkaStore for PostgresStore {
                 .get_by_name("id")?
                 .ok_or_else(|| KafkaError::Internal("Failed to get topic ID".into()))?;
 
-            pgrx::debug1!("Topic '{}' has id={}", name, topic_id);
+            crate::pg_debug!("Topic '{}' has id={}", name, topic_id);
             Ok(topic_id)
         })
         .map_err(|e: KafkaError| KafkaError::Internal(format!("get_or_create_topic failed: {}", e)))
     }
 
     fn get_topic_metadata(&self, names: Option<&[String]>) -> Result<Vec<TopicMetadata>> {
-        pgrx::debug1!("PostgresStore::get_topic_metadata");
+        crate::pg_debug!("PostgresStore::get_topic_metadata");
 
         Spi::connect(|client| {
             let mut topics = Vec::new();
@@ -118,7 +118,7 @@ impl KafkaStore for PostgresStore {
             return Ok(0);
         }
 
-        pgrx::debug1!(
+        crate::pg_debug!(
             "PostgresStore::insert_records: {} records for topic_id={}, partition_id={}",
             records.len(),
             topic_id,
@@ -149,50 +149,55 @@ impl KafkaStore for PostgresStore {
 
             let base_offset = max_offset + 1;
 
-            pgrx::debug1!(
+            crate::pg_debug!(
                 "Current max_offset={}, new base_offset={}",
                 max_offset,
                 base_offset
             );
 
-            // Step 3: Insert all records
-            for (i, record) in records.iter().enumerate() {
-                let offset = base_offset + i as i64;
+            // Step 3: Build parallel arrays for UNNEST-based bulk insert
+            // This is type-safe (no SQL injection) and PostgreSQL-optimized
+            let count = records.len();
+            let topic_ids: Vec<i32> = vec![topic_id; count];
+            let partition_ids: Vec<i32> = vec![partition_id; count];
+            let offsets: Vec<i64> = (0..count).map(|i| base_offset + i as i64).collect();
+            let keys: Vec<Option<Vec<u8>>> = records.iter().map(|r| r.key.clone()).collect();
+            let values: Vec<Option<Vec<u8>>> = records.iter().map(|r| r.value.clone()).collect();
+            let headers: Vec<String> = records
+                .iter()
+                .map(|r| {
+                    if r.headers.is_empty() {
+                        "{}".to_string()
+                    } else {
+                        let headers_map: HashMap<String, String> = r
+                            .headers
+                            .iter()
+                            .map(|h| (h.key.clone(), hex_encode(&h.value)))
+                            .collect();
+                        serde_json::to_string(&headers_map).unwrap_or_else(|_| "{}".to_string())
+                    }
+                })
+                .collect();
 
-                // Serialize headers to JSONB
-                let headers_json = if record.headers.is_empty() {
-                    "{}".to_string()
-                } else {
-                    let headers_map: HashMap<String, String> = record
-                        .headers
-                        .iter()
-                        .map(|h| (h.key.clone(), hex_encode(&h.value)))
-                        .collect();
-                    serde_json::to_string(&headers_map).map_err(|e| {
-                        KafkaError::Internal(format!("Failed to serialize headers: {}", e))
-                    })?
-                };
-
-                let key_vec: Option<Vec<u8>> = record.key.clone();
-                let value_vec: Option<Vec<u8>> = record.value.clone();
-
-                client.update(
+            // Execute single INSERT with UNNEST - type-safe parameterized query
+            client
+                .update(
                     "INSERT INTO kafka.messages (topic_id, partition_id, partition_offset, key, value, headers)
-                     VALUES ($1, $2, $3, $4, $5, $6::jsonb)",
+                     SELECT * FROM unnest($1::int[], $2::int[], $3::bigint[], $4::bytea[], $5::bytea[], $6::jsonb[])",
                     None,
                     &[
-                        topic_id.into(),
-                        partition_id.into(),
-                        offset.into(),
-                        key_vec.into(),
-                        value_vec.into(),
-                        headers_json.into(),
+                        topic_ids.into(),
+                        partition_ids.into(),
+                        offsets.into(),
+                        keys.into(),
+                        values.into(),
+                        headers.into(),
                     ],
-                ).map_err(|e| KafkaError::Internal(format!("Failed to insert record: {}", e)))?;
-            }
+                )
+                .map_err(|e| KafkaError::Internal(format!("Failed to insert records: {}", e)))?;
 
-            pgrx::debug1!(
-                "Successfully inserted {} records (offsets {} to {})",
+            crate::pg_debug!(
+                "Successfully inserted {} records (offsets {} to {}) in single query",
                 records.len(),
                 base_offset,
                 base_offset + records.len() as i64 - 1
@@ -213,7 +218,7 @@ impl KafkaStore for PostgresStore {
         fetch_offset: i64,
         max_bytes: i32,
     ) -> Result<Vec<FetchedMessage>> {
-        pgrx::debug1!(
+        crate::pg_debug!(
             "PostgresStore::fetch_records: topic_id={}, partition_id={}, fetch_offset={}, max_bytes={}",
             topic_id,
             partition_id,
@@ -256,7 +261,7 @@ impl KafkaStore for PostgresStore {
                 });
             }
 
-            pgrx::debug1!("Fetched {} messages", messages.len());
+            crate::pg_debug!("Fetched {} messages", messages.len());
             Ok(messages)
         })
         .map_err(|e: KafkaError| KafkaError::Internal(format!("fetch_records failed: {}", e)))
@@ -304,7 +309,7 @@ impl KafkaStore for PostgresStore {
         offset: i64,
         metadata: Option<&str>,
     ) -> Result<()> {
-        pgrx::debug1!(
+        crate::pg_debug!(
             "PostgresStore::commit_offset: group_id={}, topic_id={}, partition_id={}, offset={}",
             group_id,
             topic_id,

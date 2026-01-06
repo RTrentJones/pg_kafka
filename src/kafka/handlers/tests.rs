@@ -638,7 +638,7 @@ mod tests {
         .unwrap();
 
         let leader_id = leader_join.member_id.to_string();
-        let generation_id = leader_join.generation_id;
+        let _generation_id = leader_join.generation_id;
 
         // Second member (follower) joins
         let follower_join = coordinator::handle_join_group(
