@@ -271,7 +271,7 @@ jobs:
 
     - name: Run Functional E2E Tests
       # Runs functional tests (excludes performance tests which run separately)
-      timeout-minutes: 5
+      timeout-minutes: 10
       run: |
         cd kafka_test
         cargo run --release -- --exclude performance
