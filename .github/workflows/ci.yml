@@ -244,8 +244,12 @@ jobs:
         # Check if already configured (idempotency)
         if ! grep -q "shared_preload_libraries.*pg_kafka" "$PG14_DATA_DIR/postgresql.conf"; then
           # Use printf to ensure a preceding newline, preventing config corruption
-          printf "\nshared_preload_libraries = 'pg_kafka'\npg_kafka.host = '0.0.0.0'\n" >> "$PG14_DATA_DIR/postgresql.conf"
-          echo "Configuration updated to preload pg_kafka."
+          # Note: synchronous_commit=off disables fsync wait for WAL flush
+          # This dramatically improves write throughput in CI (from ~10 to 500+ msgs/sec)
+          # by eliminating the "fsync tax" on slow CI runner disks.
+          # NEVER use this in production - it trades durability for speed.
+          printf "\nshared_preload_libraries = 'pg_kafka'\npg_kafka.host = '0.0.0.0'\nsynchronous_commit = off\n" >> "$PG14_DATA_DIR/postgresql.conf"
+          echo "Configuration updated to preload pg_kafka (with synchronous_commit=off for CI)."
         else
           echo "pg_kafka already configured in shared_preload_libraries."
         fi
