@@ -299,6 +299,14 @@ mod tests {
             .with(mockall::predicate::eq("my-topic"))
             .returning(|_| Ok(5));
 
+        mock.expect_get_topic_metadata().returning(|_| {
+            Ok(vec![TopicMetadata {
+                name: "my-topic".to_string(),
+                id: 5,
+                partition_count: 1,
+            }])
+        });
+
         let response = metadata::handle_metadata(
             &mock,
             Some(vec!["my-topic".to_string()]),
