@@ -68,6 +68,8 @@ use kafka_test::{
     // Consumer group tests
     test_consumer_group_lifecycle,
     test_consumer_group_two_members,
+    test_rebalance_after_leave,
+    test_session_timeout_rebalance,
     test_consumer_multiple_messages,
     test_consumer_rejoin_after_leave,
     test_duplicate_consumer_join,
@@ -239,6 +241,18 @@ fn get_all_tests() -> Vec<TestDef> {
             name: "test_consumer_group_lifecycle",
             test_fn: wrap_test!(test_consumer_group_lifecycle),
             parallel_safe: true,
+        },
+        TestDef {
+            category: "consumer_group",
+            name: "test_rebalance_after_leave",
+            test_fn: wrap_test!(test_rebalance_after_leave),
+            parallel_safe: false, // Uses shared group state
+        },
+        TestDef {
+            category: "consumer_group",
+            name: "test_session_timeout_rebalance",
+            test_fn: wrap_test!(test_session_timeout_rebalance),
+            parallel_safe: false, // Has sleep delays
         },
         // Partition tests
         TestDef {

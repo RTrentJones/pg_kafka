@@ -6,31 +6,33 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `pg_kafka` is a PostgreSQL extension written in Rust (via pgrx) that embeds a Kafka-compatible wire protocol listener directly into the Postgres runtime. It allows standard Kafka clients to produce and consume messages using Postgres as the backing store.
 
-**Status:** Phase 3B Complete - Full Producer/Consumer Support (Portfolio/Learning Project)
+**Status:** Phase 5 Complete - Automatic Rebalancing (Portfolio/Learning Project)
 
 **Current Implementation:**
 - ✅ **Phase 1 Complete:** Metadata support (ApiVersions, Metadata requests)
 - ✅ **Phase 2 Complete:** Producer support (ProduceRequest, database storage, E2E tests, Repository Pattern)
 - ✅ **Phase 3 Complete:** Consumer support (FetchRequest, ListOffsets, OffsetCommit/Fetch)
 - ✅ **Phase 3B Complete:** Consumer group coordinator (FindCoordinator, JoinGroup, Heartbeat, LeaveGroup, SyncGroup)
+- ✅ **Phase 4 Complete:** Automatic partition assignment strategies (Range, RoundRobin, Sticky)
+- ✅ **Phase 5 Complete:** Automatic rebalancing (LeaveGroup trigger, timeout detection, REBALANCE_IN_PROGRESS)
 - ✅ **CI/CD:** GitHub Actions pipeline with automated testing
-- ⏳ **Phase 4:** Automatic partition assignment strategies
-- ⏳ **Phase 5:** Automatic rebalancing
 - ⏳ **Phase 6:** Shadow Mode (Logical Decoding → external Kafka)
 
 **What Works Now:**
 - TCP listener on port 9092 with full Kafka wire protocol parsing
 - ProduceRequest handling with database persistence
 - FetchRequest with RecordBatch v2 encoding/decoding
-- Consumer group coordinator with manual partition assignment
+- Consumer group coordinator with automatic partition assignment (Range, RoundRobin, Sticky strategies)
+- Automatic rebalancing on member leave or session timeout
+- DescribeGroups/ListGroups for consumer group visibility
 - OffsetCommit/OffsetFetch for consumer progress tracking
 - ListOffsets for earliest/latest offset queries
 - Dual-offset design (partition_offset + global_offset)
 - Repository Pattern storage abstraction (KafkaStore trait + PostgresStore impl)
-- Automated E2E tests with real Kafka client (rdkafka) - 5 test scenarios passing
+- Automated E2E tests with real Kafka client (rdkafka)
 
-**API Coverage:** 12 of ~50 standard Kafka APIs (24%)
-**Test Status:** All E2E tests passing ✅
+**API Coverage:** 14 of ~50 standard Kafka APIs (28%)
+**Test Status:** All unit tests (163) and E2E tests passing ✅
 
 ## Development Setup
 
@@ -373,15 +375,14 @@ To debug:
 
 ## Non-Goals (v1)
 
-- Full Protocol Compliance: Consumer Groups have manual assignment only (no automatic rebalancing), no Transactions or Compression
+- Full Protocol Compliance: No Transactions or Compression support
 - High Availability: Rely on standard Postgres HA (Patroni/RDS) rather than Kafka's ISR
 - Broker Clustering: Single-node "broker" design
 
-## Planned Features (Phase 4-6)
+## Planned Features (Phase 6)
 
-- Automatic partition assignment strategies (Range, RoundRobin, Sticky)
-- Automatic rebalancing on member join/leave
-- Member timeout detection
 - Long polling via LISTEN/NOTIFY (optional optimization)
 - Shadow replication worker using Logical Decoding
 - Table partitioning and retention policies
+- Cooperative rebalancing (KIP-429)
+- Static group membership (KIP-345)

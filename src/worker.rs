@@ -13,6 +13,10 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use crate::kafka::constants::*;
 use crate::{pg_log, pg_warning};
 
+/// How often to check for member timeouts (in main loop iterations)
+/// With ~100ms per iteration, 10 iterations = ~1 second between checks
+const TIMEOUT_CHECK_INTERVAL_ITERATIONS: u32 = 10;
+
 /// Verify that the kafka schema and required tables exist.
 /// Returns Ok(()) if all tables exist, Err with description if any are missing.
 fn verify_schema(database: &str) -> Result<(), String> {
@@ -213,13 +217,18 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     // MAIN EVENT LOOP: The Heart of the Async/Sync Architecture
     // ═══════════════════════════════════════════════════════════════════════════════
     //
-    // This loop serves THREE critical functions:
+    // This loop serves FOUR critical functions:
     //
     // 1. PROCESS DATABASE REQUESTS (Sync World)
     //    - Receive Kafka requests from the queue
     //    - Execute blocking database operations via Postgres SPI
     //    - Send responses back to async tasks
     //    - WHY HERE: SPI can ONLY be called from the main thread in sync context
+    //
+    // 1.5. CHECK MEMBER TIMEOUTS (Phase 5: Automatic Rebalancing)
+    //    - Periodically scan consumer groups for timed-out members
+    //    - Remove dead members and trigger rebalance
+    //    - WHY HERE: Runs ~every 1 second to detect stale consumers
     //
     // 2. DRIVE ASYNC NETWORK I/O (Async World)
     //    - Run tokio tasks that handle TCP connections
@@ -236,12 +245,16 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     // - 100ms for async I/O: Long enough to batch network operations efficiently
     // - 1ms for signal check: Short enough for responsive shutdown
     // - Non-blocking queue check: No delay for processing database requests
+    // - ~1 second for timeout check: Reasonable granularity for session detection
     //
     // This architecture solves the fundamental incompatibility:
     // - Tokio wants async functions (network I/O benefits from non-blocking)
     // - Postgres SPI wants sync functions on main thread (database safety)
     // - The queue bridges these worlds cleanly
     // ═══════════════════════════════════════════════════════════════════════════════
+
+    // Counter for throttling periodic tasks (timeout checks)
+    let mut loop_iteration: u32 = 0;
 
     loop {
         // ┌─────────────────────────────────────────────────────────────┐
@@ -277,6 +290,23 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
                     // Note: Response channel may be closed, but worker continues
                 }
             });
+        }
+
+        // ┌─────────────────────────────────────────────────────────────┐
+        // │ PART 1.5: Check Member Timeouts (Phase 5: Rebalancing)     │
+        // └─────────────────────────────────────────────────────────────┘
+        // Periodically check for members that have stopped sending heartbeats.
+        // This enables automatic rebalancing when consumers die without LeaveGroup.
+        loop_iteration = loop_iteration.wrapping_add(1);
+        if loop_iteration.is_multiple_of(TIMEOUT_CHECK_INTERVAL_ITERATIONS) {
+            let removed = coordinator.check_and_remove_timed_out_members();
+            for (group_id, member_id) in removed {
+                pg_log!(
+                    "Timeout: Removed member {} from group {}, triggering rebalance",
+                    member_id,
+                    group_id
+                );
+            }
         }
 
         // ┌─────────────────────────────────────────────────────────────┐

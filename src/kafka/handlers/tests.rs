@@ -763,7 +763,26 @@ mod tests {
         let member_id = join_response.member_id.to_string();
         let generation_id = join_response.generation_id;
 
-        // Send heartbeat
+        // Complete sync to get to Stable state (Phase 5: heartbeat returns REBALANCE_IN_PROGRESS
+        // when group is not in Stable state)
+        let assignment_data = vec![0, 1, 2, 3, 4];
+        let assignments = vec![SyncGroupAssignment {
+            member_id: member_id.clone(),
+            assignment: assignment_data,
+        }];
+        let mock = MockKafkaStore::new();
+
+        coordinator::handle_sync_group(
+            &coord,
+            &mock,
+            "test-group".to_string(),
+            member_id.clone(),
+            generation_id,
+            assignments,
+        )
+        .unwrap();
+
+        // Send heartbeat - should succeed now that group is Stable
         let heartbeat_response = coordinator::handle_heartbeat(
             &coord,
             "test-group".to_string(),

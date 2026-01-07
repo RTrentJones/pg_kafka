@@ -62,7 +62,9 @@ pub use setup::TestContext;
 pub use consumer::{
     test_consumer_basic, test_consumer_from_offset, test_consumer_multiple_messages,
 };
-pub use consumer_group::test_consumer_group_lifecycle;
+pub use consumer_group::{
+    test_consumer_group_lifecycle, test_rebalance_after_leave, test_session_timeout_rebalance,
+};
 pub use offset_management::{test_offset_boundaries, test_offset_commit_fetch};
 pub use partition::test_multi_partition_produce;
 pub use producer::{test_batch_produce, test_producer};

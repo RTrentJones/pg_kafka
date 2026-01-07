@@ -473,13 +473,22 @@ impl GroupCoordinator {
 
         member.last_heartbeat = SystemTime::now();
 
+        // Check if group is rebalancing - force client to rejoin
+        if group.state == GroupState::PreparingRebalance
+            || group.state == GroupState::CompletingRebalance
+        {
+            return Err(KafkaError::RebalanceInProgress {
+                group_id: group_id.clone(),
+            });
+        }
+
         Ok(())
     }
 
     /// Handle LeaveGroup request
     ///
     /// Removes member from the group.
-    /// Triggers rebalance for remaining members (future optimization).
+    /// If members remain and group was Stable, triggers rebalance.
     pub fn leave_group(&self, group_id: String, member_id: String) -> Result<()> {
         let mut groups = self.groups.write().map_err(|e| {
             KafkaError::Internal(format!("Failed to acquire groups write lock: {}", e))
@@ -496,11 +505,77 @@ impl GroupCoordinator {
 
         if group.remove_member(&member_id) {
             // Member removed successfully
-            // Future: Trigger rebalance for remaining members
+            // Trigger rebalance for remaining members if group is still active
+            if !group.members.is_empty() && group.state == GroupState::Stable {
+                group.start_rebalance();
+                pg_log!(
+                    "LeaveGroup triggered rebalance for {} remaining members in group {}",
+                    group.members.len(),
+                    group_id
+                );
+            }
             Ok(())
         } else {
             Err(KafkaError::unknown_member(&group_id, &member_id))
         }
+    }
+
+    /// Check all groups for timed-out members and trigger rebalance
+    ///
+    /// This method should be called periodically (e.g., every ~1 second) from the
+    /// background worker main loop to detect and remove members that have stopped
+    /// sending heartbeats.
+    ///
+    /// # Returns
+    /// List of (group_id, member_id) pairs that were removed due to timeout
+    pub fn check_and_remove_timed_out_members(&self) -> Vec<(String, String)> {
+        let mut removed = Vec::new();
+
+        let mut groups = match self.groups.write() {
+            Ok(g) => g,
+            Err(_) => {
+                // Lock poisoned, skip this check
+                return removed;
+            }
+        };
+
+        for (group_id, group) in groups.iter_mut() {
+            // Skip empty or dead groups
+            if group.state == GroupState::Empty || group.state == GroupState::Dead {
+                continue;
+            }
+
+            // Find timed-out members
+            let timed_out: Vec<String> = group
+                .members
+                .iter()
+                .filter(|(_, member)| member.is_timed_out())
+                .map(|(id, _)| id.clone())
+                .collect();
+
+            // Remove timed-out members
+            for member_id in &timed_out {
+                pg_log!(
+                    "Member {} timed out in group {} (session_timeout exceeded)",
+                    member_id,
+                    group_id
+                );
+                group.remove_member(member_id);
+                removed.push((group_id.clone(), member_id.clone()));
+            }
+
+            // Trigger rebalance if members were removed and group still has members
+            if !timed_out.is_empty() && !group.members.is_empty() {
+                group.start_rebalance();
+                pg_log!(
+                    "Timeout triggered rebalance for {} remaining members in group {}",
+                    group.members.len(),
+                    group_id
+                );
+            }
+        }
+
+        removed
     }
 
     /// Get group state for debugging/testing
@@ -799,5 +874,268 @@ mod tests {
 
         assert_eq!(group.members.len(), 1);
         assert_eq!(group.leader, Some("member-2".to_string()));
+    }
+
+    // ===== Phase 5: Automatic Rebalancing Tests =====
+
+    #[test]
+    fn test_leave_group_triggers_rebalance_with_remaining_members() {
+        let coordinator = GroupCoordinator::new();
+
+        // Add two members to the group
+        let (member1, ..) = coordinator
+            .join_group(
+                "test-group".to_string(),
+                None,
+                "client-1".to_string(),
+                "localhost".to_string(),
+                30000,
+                60000,
+                "consumer".to_string(),
+                vec![("range".to_string(), vec![])],
+                None,
+            )
+            .unwrap();
+
+        let (member2, ..) = coordinator
+            .join_group(
+                "test-group".to_string(),
+                None,
+                "client-2".to_string(),
+                "localhost".to_string(),
+                30000,
+                60000,
+                "consumer".to_string(),
+                vec![("range".to_string(), vec![])],
+                None,
+            )
+            .unwrap();
+
+        // Complete the sync to get to Stable state
+        coordinator
+            .sync_group(
+                "test-group".to_string(),
+                member1.clone(),
+                1,
+                vec![(member1.clone(), vec![]), (member2.clone(), vec![])],
+            )
+            .unwrap();
+        coordinator
+            .sync_group("test-group".to_string(), member2.clone(), 1, vec![])
+            .unwrap();
+
+        // Verify group is now Stable
+        {
+            let groups = coordinator.groups.read().unwrap();
+            let group = groups.get("test-group").unwrap();
+            assert_eq!(group.state, GroupState::Stable);
+            assert_eq!(group.members.len(), 2);
+        }
+
+        // Leave with one member - should trigger rebalance
+        coordinator
+            .leave_group("test-group".to_string(), member1)
+            .unwrap();
+
+        // Verify state is PreparingRebalance and one member remains
+        {
+            let groups = coordinator.groups.read().unwrap();
+            let group = groups.get("test-group").unwrap();
+            assert_eq!(group.state, GroupState::PreparingRebalance);
+            assert_eq!(group.members.len(), 1);
+        }
+    }
+
+    #[test]
+    fn test_heartbeat_returns_rebalance_in_progress() {
+        let coordinator = GroupCoordinator::new();
+
+        // Add a member
+        let (member_id, generation_id, ..) = coordinator
+            .join_group(
+                "test-group".to_string(),
+                None,
+                "client-1".to_string(),
+                "localhost".to_string(),
+                30000,
+                60000,
+                "consumer".to_string(),
+                vec![("range".to_string(), vec![])],
+                None,
+            )
+            .unwrap();
+
+        // Group is in PreparingRebalance state after join
+        // Heartbeat should return RebalanceInProgress
+        let result = coordinator.heartbeat("test-group".to_string(), member_id, generation_id);
+
+        assert!(matches!(
+            result,
+            Err(KafkaError::RebalanceInProgress { .. })
+        ));
+    }
+
+    #[test]
+    fn test_heartbeat_succeeds_in_stable_state() {
+        let coordinator = GroupCoordinator::new();
+
+        // Add a member
+        let (member_id, generation_id, ..) = coordinator
+            .join_group(
+                "test-group".to_string(),
+                None,
+                "client-1".to_string(),
+                "localhost".to_string(),
+                30000,
+                60000,
+                "consumer".to_string(),
+                vec![("range".to_string(), vec![])],
+                None,
+            )
+            .unwrap();
+
+        // Complete sync to get to Stable state
+        coordinator
+            .sync_group(
+                "test-group".to_string(),
+                member_id.clone(),
+                generation_id,
+                vec![(member_id.clone(), vec![1, 2, 3])],
+            )
+            .unwrap();
+
+        // Verify group is Stable
+        {
+            let groups = coordinator.groups.read().unwrap();
+            let group = groups.get("test-group").unwrap();
+            assert_eq!(group.state, GroupState::Stable);
+        }
+
+        // Heartbeat should succeed in Stable state
+        let result = coordinator.heartbeat("test-group".to_string(), member_id, generation_id);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_member_timeout_detection() {
+        let coordinator = GroupCoordinator::new();
+
+        // Add member with very short timeout (1ms)
+        coordinator
+            .join_group(
+                "test-group".to_string(),
+                None,
+                "client-1".to_string(),
+                "localhost".to_string(),
+                1, // 1ms session timeout
+                1000,
+                "consumer".to_string(),
+                vec![("range".to_string(), vec![])],
+                None,
+            )
+            .unwrap();
+
+        // Complete sync to get to stable state
+        {
+            let groups = coordinator.groups.read().unwrap();
+            let group = groups.get("test-group").unwrap();
+            assert_eq!(group.members.len(), 1);
+        }
+
+        // Wait for timeout to expire
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // Check and remove timed-out members
+        let removed = coordinator.check_and_remove_timed_out_members();
+
+        // Member should have been removed
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].0, "test-group");
+
+        // Verify member is gone
+        {
+            let groups = coordinator.groups.read().unwrap();
+            let group = groups.get("test-group").unwrap();
+            assert_eq!(group.members.len(), 0);
+        }
+    }
+
+    #[test]
+    fn test_timeout_triggers_rebalance_for_remaining_members() {
+        let coordinator = GroupCoordinator::new();
+
+        // Add two members - first with short timeout, second with long timeout
+        let (member1, ..) = coordinator
+            .join_group(
+                "test-group".to_string(),
+                None,
+                "client-1".to_string(),
+                "localhost".to_string(),
+                1, // 1ms session timeout - will expire
+                1000,
+                "consumer".to_string(),
+                vec![("range".to_string(), vec![])],
+                None,
+            )
+            .unwrap();
+
+        let (member2, ..) = coordinator
+            .join_group(
+                "test-group".to_string(),
+                None,
+                "client-2".to_string(),
+                "localhost".to_string(),
+                300000, // 5 minute timeout - won't expire
+                1000,
+                "consumer".to_string(),
+                vec![("range".to_string(), vec![])],
+                None,
+            )
+            .unwrap();
+
+        // Complete sync to get to Stable state
+        coordinator
+            .sync_group(
+                "test-group".to_string(),
+                member1.clone(),
+                1,
+                vec![(member1.clone(), vec![]), (member2.clone(), vec![])],
+            )
+            .unwrap();
+        coordinator
+            .sync_group("test-group".to_string(), member2.clone(), 1, vec![])
+            .unwrap();
+
+        // Verify stable state with 2 members
+        {
+            let groups = coordinator.groups.read().unwrap();
+            let group = groups.get("test-group").unwrap();
+            assert_eq!(group.state, GroupState::Stable);
+            assert_eq!(group.members.len(), 2);
+        }
+
+        // Keep member2 alive by sending heartbeat
+        coordinator
+            .heartbeat("test-group".to_string(), member2.clone(), 1)
+            .unwrap();
+
+        // Wait for member1's timeout to expire
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // Check and remove timed-out members
+        let removed = coordinator.check_and_remove_timed_out_members();
+
+        // Member1 should have been removed
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].1, member1);
+
+        // Verify group is now in PreparingRebalance with 1 member
+        {
+            let groups = coordinator.groups.read().unwrap();
+            let group = groups.get("test-group").unwrap();
+            assert_eq!(group.state, GroupState::PreparingRebalance);
+            assert_eq!(group.members.len(), 1);
+            assert!(group.members.contains_key(&member2));
+        }
     }
 }
