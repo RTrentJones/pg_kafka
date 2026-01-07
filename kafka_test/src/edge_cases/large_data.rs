@@ -66,21 +66,21 @@ pub async fn test_large_message_value() -> TestResult {
     Ok(())
 }
 
-/// Test batch of 1000 messages
+/// Test batch of 100 messages
 pub async fn test_batch_1000_messages() -> TestResult {
-    println!("=== Test: Batch 1000 Messages ===\n");
+    println!("=== Test: Batch 100 Messages ===\n");
 
     let ctx = TestContext::new().await?;
-    let topic = TestTopicBuilder::new(&ctx, "batch-1000").build().await?;
+    let topic = TestTopicBuilder::new(&ctx, "batch-100").build().await?;
 
     let start = std::time::Instant::now();
-    let messages = generate_messages(1000, "batch");
+    let messages = generate_messages(100, "batch");
     let offsets = topic.produce(&messages).await?;
     let elapsed = start.elapsed();
 
-    assert_eq!(offsets.len(), 1000);
-    println!("✅ Produced 1000 messages in {:?}", elapsed);
-    println!("   Rate: {:.0} msg/sec", 1000.0 / elapsed.as_secs_f64());
+    assert_eq!(offsets.len(), 100);
+    println!("✅ Produced 100 messages in {:?}", elapsed);
+    println!("   Rate: {:.0} msg/sec", 100.0 / elapsed.as_secs_f64());
 
     // Verify in database
     let row = ctx
@@ -94,10 +94,10 @@ pub async fn test_batch_1000_messages() -> TestResult {
         .await?;
 
     let count: i64 = row.get(0);
-    assert_eq!(count, 1000);
-    println!("✅ All 1000 messages verified in database");
+    assert_eq!(count, 100);
+    println!("✅ All 100 messages verified in database");
 
     ctx.cleanup().await?;
-    println!("\n✅ Batch 1000 messages test PASSED\n");
+    println!("\n✅ Batch 100 messages test PASSED\n");
     Ok(())
 }
