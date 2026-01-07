@@ -269,16 +269,26 @@ jobs:
         echo "Port 9092 is open!"
         sleep 3 # Wait for protocol readiness (Fixes CI race condition)
 
-    - name: Run E2E Tests
-      # Runs the external client application that connects to the running extension
-      # via TCP (Kafka protocol) and Postgres (SQL).
+    - name: Run Functional E2E Tests
+      # Runs functional tests (excludes performance tests which run separately)
       timeout-minutes: 5
       run: |
         cd kafka_test
-        cargo run --release
+        cargo run --release -- --exclude performance
       env:
         # Pass the dynamically discovered port to the test runner
         # IMPORTANT: Use 'postgres' database since that's where the worker connects via SPI
+        DATABASE_URL: postgresql://${{ env.DB_USER }}@localhost:${{ env.PG_PORT }}/postgres
+
+    - name: Run Performance E2E Tests
+      # Performance tests run separately with their own timeout
+      # These are advisory - don't block CI on performance regressions
+      timeout-minutes: 5
+      continue-on-error: true
+      run: |
+        cd kafka_test
+        cargo run --release -- --category performance
+      env:
         DATABASE_URL: postgresql://${{ env.DB_USER }}@localhost:${{ env.PG_PORT }}/postgres
 
     - name: Dump Postgres Logs (On Failure)

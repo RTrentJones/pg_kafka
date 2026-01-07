@@ -118,6 +118,10 @@ struct Args {
     #[arg(short, long)]
     category: Option<String>,
 
+    /// Exclude tests in these categories (can be specified multiple times)
+    #[arg(short = 'x', long)]
+    exclude: Vec<String>,
+
     /// Run only this specific test
     #[arg(short, long)]
     test: Option<String>,
@@ -626,6 +630,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tests_to_run: Vec<&TestDef> = all_tests
         .iter()
         .filter(|t| {
+            // Exclude by category
+            if args.exclude.iter().any(|ex| ex == t.category) {
+                return false;
+            }
             // Filter by category
             if let Some(ref cat) = args.category {
                 if t.category != cat.as_str() {

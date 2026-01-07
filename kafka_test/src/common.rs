@@ -43,6 +43,7 @@ pub async fn create_db_client() -> Result<Client, Box<dyn std::error::Error>> {
 pub fn create_producer() -> Result<FutureProducer, Box<dyn std::error::Error>> {
     let producer: FutureProducer = ClientConfig::new()
         .set("bootstrap.servers", get_bootstrap_servers())
+        .set("broker.address.family", "v4")
         .set("message.timeout.ms", "5000")
         .set("client.id", "test-client")
         .create()?;
@@ -54,6 +55,7 @@ pub fn create_producer() -> Result<FutureProducer, Box<dyn std::error::Error>> {
 pub fn create_batch_producer() -> Result<FutureProducer, Box<dyn std::error::Error>> {
     let producer: FutureProducer = ClientConfig::new()
         .set("bootstrap.servers", get_bootstrap_servers())
+        .set("broker.address.family", "v4")
         .set("message.timeout.ms", "30000")
         .set("batch.num.messages", "100")
         .set("linger.ms", "10")
@@ -66,6 +68,7 @@ pub fn create_batch_producer() -> Result<FutureProducer, Box<dyn std::error::Err
 pub fn create_base_consumer(group_id: &str) -> Result<BaseConsumer, Box<dyn std::error::Error>> {
     let consumer: BaseConsumer = ClientConfig::new()
         .set("bootstrap.servers", get_bootstrap_servers())
+        .set("broker.address.family", "v4")
         .set("group.id", group_id)
         .create()?;
 
@@ -78,6 +81,7 @@ pub fn create_manual_commit_consumer(
 ) -> Result<BaseConsumer, Box<dyn std::error::Error>> {
     let consumer: BaseConsumer = ClientConfig::new()
         .set("bootstrap.servers", get_bootstrap_servers())
+        .set("broker.address.family", "v4")
         .set("group.id", group_id)
         .set("session.timeout.ms", "6000")
         .set("enable.auto.commit", "false")
@@ -92,6 +96,7 @@ pub fn create_stream_consumer(
 ) -> Result<StreamConsumer, Box<dyn std::error::Error>> {
     let consumer: StreamConsumer = ClientConfig::new()
         .set("bootstrap.servers", get_bootstrap_servers())
+        .set("broker.address.family", "v4")
         .set("group.id", group_id)
         .set("session.timeout.ms", "10000")
         .set("heartbeat.interval.ms", "1000")
@@ -111,6 +116,7 @@ pub fn create_stream_consumer_with_config(
 ) -> Result<StreamConsumer, Box<dyn std::error::Error>> {
     let consumer: StreamConsumer = ClientConfig::new()
         .set("bootstrap.servers", get_bootstrap_servers())
+        .set("broker.address.family", "v4")
         .set("group.id", group_id)
         .set("session.timeout.ms", session_timeout_ms.to_string())
         .set("enable.auto.commit", auto_commit.to_string())
