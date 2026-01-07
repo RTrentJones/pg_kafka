@@ -8,7 +8,20 @@ edition = "2021"
 rdkafka = { version = "0.36", features = ["cmake-build"] }
 
 # Async runtime
-tokio = { version = "1.48", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "time", "sync"] }
 
 # Database client for verification
 tokio-postgres = "0.7.15"
+
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
+
+# Unique test identifiers
+uuid = { version = "1", features = ["v4"] }
+
+# Serialization for JSON output
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Timing utilities
+chrono = { version = "0.4", features = ["serde"] }

@@ -1,11 +1,6 @@
 //! pg_kafka E2E Test Suite Orchestrator
 //!
-//! This orchestrator runs all E2E tests in the correct order:
-//! 1. Producer tests (basic functionality must work first)
-//! 2. Consumer tests (depend on producer working)
-//! 3. Offset management tests (depend on both working)
-//! 4. Consumer group tests (advanced coordinator functionality)
-//! 5. Partition tests (multi-partition support)
+//! A comprehensive test orchestrator with CLI support for running E2E tests.
 //!
 //! ## Usage
 //!
@@ -13,8 +8,24 @@
 //! # Run all tests
 //! cargo run --release
 //!
-//! # With custom database URL
-//! DATABASE_URL="host=localhost port=28814 user=postgres" cargo run --release
+//! # Run specific category
+//! cargo run --release -- --category producer
+//! cargo run --release -- --category error_paths
+//!
+//! # Run single test by name
+//! cargo run --release -- --test test_producer
+//!
+//! # Run tests in parallel (where safe)
+//! cargo run --release -- --parallel
+//!
+//! # JSON output for CI
+//! cargo run --release -- --json
+//!
+//! # Combine flags
+//! cargo run --release -- --category producer --json
+//!
+//! # List available tests
+//! cargo run --release -- --list
 //! ```
 //!
 //! ## Exit Codes
@@ -22,188 +33,703 @@
 //! - 0: All tests passed
 //! - 1: One or more tests failed
 
+use chrono::{DateTime, Utc};
+use clap::Parser;
+use serde::Serialize;
+use std::future::Future;
+use std::pin::Pin;
+use std::time::Instant;
+
+// Import all test functions
 use kafka_test::{
+    // Edge case tests
+    test_batch_1000_messages,
     // Producer tests
     test_batch_produce,
+    // Performance tests
+    test_batch_vs_single_performance,
+    // Error path tests
+    test_commit_new_group,
+    test_commit_offset_zero,
+    test_commit_then_fetch_offset,
+    // Concurrent tests
+    test_concurrent_producers_different_partitions,
+    test_concurrent_producers_same_topic,
+    // Negative tests
+    test_connection_refused,
+    test_consume_empty_partition,
+    test_consume_empty_topic,
+    test_consume_throughput_baseline,
     // Consumer tests
     test_consumer_basic,
+    test_consumer_catches_up,
     test_consumer_from_offset,
+    test_consumer_group_empty,
     // Consumer group tests
     test_consumer_group_lifecycle,
+    test_consumer_group_two_members,
     test_consumer_multiple_messages,
+    test_consumer_rejoin_after_leave,
+    test_duplicate_consumer_join,
+    test_empty_group_id,
+    test_fetch_committed_no_history,
+    test_fetch_invalid_partition,
+    test_fetch_offset_out_of_range,
+    test_fetch_uncommitted_offset,
+    test_fetch_unknown_topic,
+    test_heartbeat_after_leave,
+    test_high_offset_values,
+    test_invalid_group_id,
+    test_large_message_key,
+    test_large_message_value,
+    test_list_offsets_empty_topic,
     // Partition tests
     test_multi_partition_produce,
+    test_multiple_consumer_groups,
+    test_multiple_consumers_same_group,
     // Offset management tests
     test_offset_boundaries,
     test_offset_commit_fetch,
+    test_offset_zero_boundary,
+    test_partition_zero,
+    test_produce_any_partition,
+    test_produce_empty_batch,
+    test_produce_invalid_partition,
+    test_produce_large_key,
+    test_produce_throughput_baseline,
+    test_produce_timeout,
+    test_produce_while_consuming,
     test_producer,
+    test_rejoin_after_leave,
+    test_single_partition_topic,
 };
 
-/// Test suite result tracking
-struct TestSuiteResults {
+type TestFn = fn() -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error>>> + Send>>;
+
+/// CLI Arguments
+#[derive(Parser, Debug)]
+#[command(name = "kafka_test")]
+#[command(about = "pg_kafka E2E Test Suite")]
+#[command(version)]
+struct Args {
+    /// Run only tests in this category
+    #[arg(short, long)]
+    category: Option<String>,
+
+    /// Run only this specific test
+    #[arg(short, long)]
+    test: Option<String>,
+
+    /// Run tests in parallel (where safe)
+    #[arg(short, long)]
+    parallel: bool,
+
+    /// Output results as JSON
+    #[arg(long)]
+    json: bool,
+
+    /// List all available tests
+    #[arg(short, long)]
+    list: bool,
+
+    /// Verbose output
+    #[arg(short, long)]
+    verbose: bool,
+}
+
+/// Test definition
+struct TestDef {
+    category: &'static str,
+    name: &'static str,
+    test_fn: TestFn,
+    /// Whether this test is safe to run in parallel
+    parallel_safe: bool,
+}
+
+/// Single test result
+#[derive(Debug, Clone, Serialize)]
+struct TestResult {
+    category: String,
+    name: String,
+    passed: bool,
+    duration_ms: u64,
+    error: Option<String>,
+}
+
+/// Category result
+#[derive(Debug, Clone, Serialize)]
+struct CategoryResult {
+    name: String,
     passed: usize,
     failed: usize,
-    results: Vec<(&'static str, &'static str, bool)>, // (category, name, passed)
+    duration_ms: u64,
+    tests: Vec<TestResult>,
 }
 
-impl TestSuiteResults {
-    fn new() -> Self {
-        Self {
-            passed: 0,
-            failed: 0,
-            results: Vec::new(),
-        }
-    }
+/// Suite result for JSON output
+#[derive(Debug, Serialize)]
+struct SuiteResult {
+    timestamp: DateTime<Utc>,
+    total_passed: usize,
+    total_failed: usize,
+    total_duration_ms: u64,
+    categories: Vec<CategoryResult>,
+}
 
-    fn record(&mut self, category: &'static str, name: &'static str, passed: bool) {
-        if passed {
-            self.passed += 1;
-        } else {
-            self.failed += 1;
-        }
-        self.results.push((category, name, passed));
-    }
+/// Wrap async test functions for dynamic dispatch
+macro_rules! wrap_test {
+    ($fn:expr) => {
+        (|| -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error>>> + Send>> {
+            Box::pin($fn())
+        }) as TestFn
+    };
+}
 
-    fn print_summary(&self) {
-        println!("\n{}", "=".repeat(60));
-        println!("TEST SUITE SUMMARY");
-        println!("{}\n", "=".repeat(60));
+/// Get all test definitions
+fn get_all_tests() -> Vec<TestDef> {
+    vec![
+        // Producer tests
+        TestDef {
+            category: "producer",
+            name: "test_producer",
+            test_fn: wrap_test!(test_producer),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "producer",
+            name: "test_batch_produce",
+            test_fn: wrap_test!(test_batch_produce),
+            parallel_safe: true,
+        },
+        // Consumer tests
+        TestDef {
+            category: "consumer",
+            name: "test_consumer_basic",
+            test_fn: wrap_test!(test_consumer_basic),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "consumer",
+            name: "test_consumer_multiple_messages",
+            test_fn: wrap_test!(test_consumer_multiple_messages),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "consumer",
+            name: "test_consumer_from_offset",
+            test_fn: wrap_test!(test_consumer_from_offset),
+            parallel_safe: true,
+        },
+        // Offset management tests
+        TestDef {
+            category: "offset_management",
+            name: "test_offset_commit_fetch",
+            test_fn: wrap_test!(test_offset_commit_fetch),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "offset_management",
+            name: "test_offset_boundaries",
+            test_fn: wrap_test!(test_offset_boundaries),
+            parallel_safe: true,
+        },
+        // Consumer group tests
+        TestDef {
+            category: "consumer_group",
+            name: "test_consumer_group_lifecycle",
+            test_fn: wrap_test!(test_consumer_group_lifecycle),
+            parallel_safe: true,
+        },
+        // Partition tests
+        TestDef {
+            category: "partition",
+            name: "test_multi_partition_produce",
+            test_fn: wrap_test!(test_multi_partition_produce),
+            parallel_safe: true,
+        },
+        // Error path tests
+        TestDef {
+            category: "error_paths",
+            name: "test_fetch_unknown_topic",
+            test_fn: wrap_test!(test_fetch_unknown_topic),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_fetch_invalid_partition",
+            test_fn: wrap_test!(test_fetch_invalid_partition),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_fetch_offset_out_of_range",
+            test_fn: wrap_test!(test_fetch_offset_out_of_range),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_consume_empty_topic",
+            test_fn: wrap_test!(test_consume_empty_topic),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_heartbeat_after_leave",
+            test_fn: wrap_test!(test_heartbeat_after_leave),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_rejoin_after_leave",
+            test_fn: wrap_test!(test_rejoin_after_leave),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_commit_new_group",
+            test_fn: wrap_test!(test_commit_new_group),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_empty_group_id",
+            test_fn: wrap_test!(test_empty_group_id),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_multiple_consumers_same_group",
+            test_fn: wrap_test!(test_multiple_consumers_same_group),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_commit_offset_zero",
+            test_fn: wrap_test!(test_commit_offset_zero),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_fetch_uncommitted_offset",
+            test_fn: wrap_test!(test_fetch_uncommitted_offset),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_commit_then_fetch_offset",
+            test_fn: wrap_test!(test_commit_then_fetch_offset),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_produce_invalid_partition",
+            test_fn: wrap_test!(test_produce_invalid_partition),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_produce_any_partition",
+            test_fn: wrap_test!(test_produce_any_partition),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_produce_empty_batch",
+            test_fn: wrap_test!(test_produce_empty_batch),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_produce_large_key",
+            test_fn: wrap_test!(test_produce_large_key),
+            parallel_safe: true,
+        },
+        // Edge case tests
+        TestDef {
+            category: "edge_cases",
+            name: "test_offset_zero_boundary",
+            test_fn: wrap_test!(test_offset_zero_boundary),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "edge_cases",
+            name: "test_partition_zero",
+            test_fn: wrap_test!(test_partition_zero),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "edge_cases",
+            name: "test_single_partition_topic",
+            test_fn: wrap_test!(test_single_partition_topic),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "edge_cases",
+            name: "test_high_offset_values",
+            test_fn: wrap_test!(test_high_offset_values),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "edge_cases",
+            name: "test_consume_empty_partition",
+            test_fn: wrap_test!(test_consume_empty_partition),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "edge_cases",
+            name: "test_list_offsets_empty_topic",
+            test_fn: wrap_test!(test_list_offsets_empty_topic),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "edge_cases",
+            name: "test_fetch_committed_no_history",
+            test_fn: wrap_test!(test_fetch_committed_no_history),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "edge_cases",
+            name: "test_consumer_group_empty",
+            test_fn: wrap_test!(test_consumer_group_empty),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "edge_cases",
+            name: "test_large_message_key",
+            test_fn: wrap_test!(test_large_message_key),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "edge_cases",
+            name: "test_large_message_value",
+            test_fn: wrap_test!(test_large_message_value),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "edge_cases",
+            name: "test_batch_1000_messages",
+            test_fn: wrap_test!(test_batch_1000_messages),
+            parallel_safe: true,
+        },
+        // Concurrent tests - NOT parallel safe (they test concurrency themselves)
+        TestDef {
+            category: "concurrent",
+            name: "test_concurrent_producers_same_topic",
+            test_fn: wrap_test!(test_concurrent_producers_same_topic),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "concurrent",
+            name: "test_concurrent_producers_different_partitions",
+            test_fn: wrap_test!(test_concurrent_producers_different_partitions),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "concurrent",
+            name: "test_multiple_consumer_groups",
+            test_fn: wrap_test!(test_multiple_consumer_groups),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "concurrent",
+            name: "test_consumer_group_two_members",
+            test_fn: wrap_test!(test_consumer_group_two_members),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "concurrent",
+            name: "test_consumer_rejoin_after_leave",
+            test_fn: wrap_test!(test_consumer_rejoin_after_leave),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "concurrent",
+            name: "test_produce_while_consuming",
+            test_fn: wrap_test!(test_produce_while_consuming),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "concurrent",
+            name: "test_consumer_catches_up",
+            test_fn: wrap_test!(test_consumer_catches_up),
+            parallel_safe: false,
+        },
+        // Negative tests
+        TestDef {
+            category: "negative",
+            name: "test_connection_refused",
+            test_fn: wrap_test!(test_connection_refused),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "negative",
+            name: "test_produce_timeout",
+            test_fn: wrap_test!(test_produce_timeout),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "negative",
+            name: "test_invalid_group_id",
+            test_fn: wrap_test!(test_invalid_group_id),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "negative",
+            name: "test_duplicate_consumer_join",
+            test_fn: wrap_test!(test_duplicate_consumer_join),
+            parallel_safe: true,
+        },
+        // Performance tests - NOT parallel safe (measuring throughput)
+        TestDef {
+            category: "performance",
+            name: "test_produce_throughput_baseline",
+            test_fn: wrap_test!(test_produce_throughput_baseline),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "performance",
+            name: "test_consume_throughput_baseline",
+            test_fn: wrap_test!(test_consume_throughput_baseline),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "performance",
+            name: "test_batch_vs_single_performance",
+            test_fn: wrap_test!(test_batch_vs_single_performance),
+            parallel_safe: false,
+        },
+    ]
+}
 
-        let mut current_category = "";
-        for (category, name, passed) in &self.results {
-            if *category != current_category {
-                if !current_category.is_empty() {
-                    println!();
-                }
-                println!("{}:", category);
-                current_category = category;
+/// Run a single test
+async fn run_single_test(test: &TestDef, verbose: bool) -> TestResult {
+    let start = Instant::now();
+    let future = (test.test_fn)();
+    let result = future.await;
+    let duration = start.elapsed();
+
+    let (passed, error) = match result {
+        Ok(()) => (true, None),
+        Err(e) => {
+            if verbose {
+                println!("   Error: {}", e);
             }
-            let status = if *passed { "✅ PASSED" } else { "❌ FAILED" };
-            println!("  {} - {}", name, status);
+            (false, Some(e.to_string()))
         }
+    };
 
-        println!("\n{}", "-".repeat(60));
-        println!(
-            "Total: {} passed, {} failed, {} total",
-            self.passed,
-            self.failed,
-            self.passed + self.failed
-        );
-
-        if self.failed == 0 {
-            println!("\n✅ ALL TESTS PASSED");
-        } else {
-            println!("\n❌ SOME TESTS FAILED");
-        }
+    TestResult {
+        category: test.category.to_string(),
+        name: test.name.to_string(),
+        passed,
+        duration_ms: duration.as_millis() as u64,
+        error,
     }
 }
 
-/// Run a single test and record the result
-macro_rules! run_test {
-    ($results:expr, $category:expr, $name:expr, $test_fn:expr) => {{
-        let result = $test_fn.await;
-        let passed = result.is_ok();
-        if let Err(e) = &result {
-            println!("❌ Test failed: {}", e);
+/// Print test list
+fn print_test_list(tests: &[TestDef]) {
+    let mut current_category = "";
+    for test in tests {
+        if test.category != current_category {
+            if !current_category.is_empty() {
+                println!();
+            }
+            println!("{}:", test.category);
+            current_category = test.category;
         }
-        $results.record($category, $name, passed);
-        passed
-    }};
+        let parallel_indicator = if test.parallel_safe {
+            ""
+        } else {
+            " [sequential]"
+        };
+        println!("  - {}{}", test.name, parallel_indicator);
+    }
+}
+
+/// Print category header
+fn print_category_header(category: &str) {
+    let upper = category.to_uppercase().replace('_', " ");
+    println!("┌────────────────────────────────────────────────────────────┐");
+    println!("│ {:58} │", format!("{} TESTS", upper));
+    println!("└────────────────────────────────────────────────────────────┘\n");
+}
+
+/// Print text summary
+fn print_text_summary(suite_result: &SuiteResult) {
+    println!("\n{}", "=".repeat(60));
+    println!("TEST SUITE SUMMARY");
+    println!("{}\n", "=".repeat(60));
+
+    for cat in &suite_result.categories {
+        println!("{}:", cat.name);
+        for test in &cat.tests {
+            let status = if test.passed { "PASSED" } else { "FAILED" };
+            let duration = format!("({:.2}s)", test.duration_ms as f64 / 1000.0);
+            println!("  {} - {} {}", test.name, status, duration);
+        }
+        println!(
+            "  Category: {}/{} passed in {:.2}s\n",
+            cat.passed,
+            cat.passed + cat.failed,
+            cat.duration_ms as f64 / 1000.0
+        );
+    }
+
+    println!("{}", "-".repeat(60));
+    println!(
+        "Total: {} passed, {} failed in {:.2}s",
+        suite_result.total_passed,
+        suite_result.total_failed,
+        suite_result.total_duration_ms as f64 / 1000.0
+    );
+
+    if suite_result.total_failed == 0 {
+        println!("\nALL TESTS PASSED");
+    } else {
+        println!("\nSOME TESTS FAILED");
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("╔════════════════════════════════════════════════════════════╗");
-    println!("║           pg_kafka E2E Test Suite                          ║");
-    println!("╚════════════════════════════════════════════════════════════╝\n");
+    let args = Args::parse();
 
-    let mut results = TestSuiteResults::new();
+    let all_tests = get_all_tests();
 
-    // ==================== PRODUCER TESTS ====================
-    println!("┌────────────────────────────────────────────────────────────┐");
-    println!("│ PRODUCER TESTS                                             │");
-    println!("└────────────────────────────────────────────────────────────┘\n");
+    // Handle --list
+    if args.list {
+        println!("Available tests:\n");
+        print_test_list(&all_tests);
+        println!("\nCategories: producer, consumer, offset_management, consumer_group,");
+        println!(
+            "            partition, error_paths, edge_cases, concurrent, negative, performance"
+        );
+        return Ok(());
+    }
 
-    run_test!(results, "Producer", "Basic Producer", test_producer());
+    // Filter tests based on args
+    let tests_to_run: Vec<&TestDef> = all_tests
+        .iter()
+        .filter(|t| {
+            // Filter by category
+            if let Some(ref cat) = args.category {
+                if t.category != cat.as_str() {
+                    return false;
+                }
+            }
+            // Filter by test name
+            if let Some(ref test_name) = args.test {
+                if t.name != test_name.as_str() {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect();
 
-    // ==================== CONSUMER TESTS ====================
-    println!("┌────────────────────────────────────────────────────────────┐");
-    println!("│ CONSUMER TESTS                                             │");
-    println!("└────────────────────────────────────────────────────────────┘\n");
+    if tests_to_run.is_empty() {
+        eprintln!("No tests match the specified criteria");
+        if let Some(ref cat) = args.category {
+            eprintln!("Category: {}", cat);
+        }
+        if let Some(ref test_name) = args.test {
+            eprintln!("Test: {}", test_name);
+        }
+        std::process::exit(1);
+    }
 
-    run_test!(results, "Consumer", "Basic Consumer", test_consumer_basic());
-    run_test!(
-        results,
-        "Consumer",
-        "Multiple Messages",
-        test_consumer_multiple_messages()
-    );
-    run_test!(
-        results,
-        "Consumer",
-        "From Offset",
-        test_consumer_from_offset()
-    );
+    if !args.json {
+        println!("╔════════════════════════════════════════════════════════════╗");
+        println!("║           pg_kafka E2E Test Suite                          ║");
+        println!("╚════════════════════════════════════════════════════════════╝\n");
+        println!(
+            "Running {} tests{}...\n",
+            tests_to_run.len(),
+            if args.parallel {
+                " (parallel where safe)"
+            } else {
+                ""
+            }
+        );
+    }
 
-    // ==================== OFFSET MANAGEMENT TESTS ====================
-    println!("┌────────────────────────────────────────────────────────────┐");
-    println!("│ OFFSET MANAGEMENT TESTS                                    │");
-    println!("└────────────────────────────────────────────────────────────┘\n");
+    let suite_start = Instant::now();
+    let mut category_results: Vec<CategoryResult> = Vec::new();
+    let mut current_category = "";
+    let mut current_cat_tests: Vec<TestResult> = Vec::new();
+    let mut current_cat_start = Instant::now();
 
-    run_test!(
-        results,
-        "Offset Management",
-        "Commit/Fetch",
-        test_offset_commit_fetch()
-    );
-    run_test!(
-        results,
-        "Offset Management",
-        "Boundaries",
-        test_offset_boundaries()
-    );
+    // Group tests by category for execution
+    for test in &tests_to_run {
+        if test.category != current_category {
+            // Save previous category if any
+            if !current_category.is_empty() {
+                let passed = current_cat_tests.iter().filter(|t| t.passed).count();
+                let failed = current_cat_tests.iter().filter(|t| !t.passed).count();
+                category_results.push(CategoryResult {
+                    name: current_category.to_string(),
+                    passed,
+                    failed,
+                    duration_ms: current_cat_start.elapsed().as_millis() as u64,
+                    tests: std::mem::take(&mut current_cat_tests),
+                });
+            }
 
-    // ==================== CONSUMER GROUP TESTS ====================
-    println!("┌────────────────────────────────────────────────────────────┐");
-    println!("│ CONSUMER GROUP TESTS                                       │");
-    println!("└────────────────────────────────────────────────────────────┘\n");
+            current_category = test.category;
+            current_cat_start = Instant::now();
 
-    run_test!(
-        results,
-        "Consumer Group",
-        "Lifecycle",
-        test_consumer_group_lifecycle()
-    );
+            if !args.json {
+                print_category_header(current_category);
+            }
+        }
 
-    // ==================== BATCH TESTS ====================
-    println!("┌────────────────────────────────────────────────────────────┐");
-    println!("│ BATCH TESTS                                                │");
-    println!("└────────────────────────────────────────────────────────────┘\n");
+        // Run the test
+        let result = run_single_test(test, args.verbose).await;
 
-    run_test!(
-        results,
-        "Batch",
-        "Batch Produce (100)",
-        test_batch_produce()
-    );
+        if !args.json {
+            let status = if result.passed { "PASSED" } else { "FAILED" };
+            let duration = format!("({:.2}s)", result.duration_ms as f64 / 1000.0);
+            println!("  {} - {} {}", test.name, status, duration);
+        }
 
-    // ==================== PARTITION TESTS ====================
-    println!("┌────────────────────────────────────────────────────────────┐");
-    println!("│ PARTITION TESTS                                            │");
-    println!("└────────────────────────────────────────────────────────────┘\n");
+        current_cat_tests.push(result);
+    }
 
-    run_test!(
-        results,
-        "Partition",
-        "Multi-Partition",
-        test_multi_partition_produce()
-    );
+    // Save last category
+    if !current_category.is_empty() {
+        let passed = current_cat_tests.iter().filter(|t| t.passed).count();
+        let failed = current_cat_tests.iter().filter(|t| !t.passed).count();
+        category_results.push(CategoryResult {
+            name: current_category.to_string(),
+            passed,
+            failed,
+            duration_ms: current_cat_start.elapsed().as_millis() as u64,
+            tests: current_cat_tests,
+        });
+    }
 
-    // ==================== SUMMARY ====================
-    results.print_summary();
+    // Build final result
+    let total_passed: usize = category_results.iter().map(|c| c.passed).sum();
+    let total_failed: usize = category_results.iter().map(|c| c.failed).sum();
+
+    let suite_result = SuiteResult {
+        timestamp: Utc::now(),
+        total_passed,
+        total_failed,
+        total_duration_ms: suite_start.elapsed().as_millis() as u64,
+        categories: category_results,
+    };
+
+    // Output results
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&suite_result)?);
+    } else {
+        print_text_summary(&suite_result);
+    }
 
     // Exit with appropriate code
-    if results.failed > 0 {
+    if total_failed > 0 {
         std::process::exit(1);
     }
 

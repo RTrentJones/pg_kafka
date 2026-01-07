@@ -42,13 +42,18 @@ pub fn handle_metadata(
             stored_topics
                 .into_iter()
                 .map(|tm| {
-                    let partition = crate::kafka::build_partition_metadata(
-                        0,
-                        DEFAULT_BROKER_ID,
-                        vec![DEFAULT_BROKER_ID],
-                        vec![DEFAULT_BROKER_ID],
-                    );
-                    crate::kafka::build_topic_metadata(tm.name, ERROR_NONE, vec![partition])
+                    // Build partition metadata for all partitions
+                    let partitions: Vec<_> = (0..tm.partition_count)
+                        .map(|partition_id| {
+                            crate::kafka::build_partition_metadata(
+                                partition_id,
+                                DEFAULT_BROKER_ID,
+                                vec![DEFAULT_BROKER_ID],
+                                vec![DEFAULT_BROKER_ID],
+                            )
+                        })
+                        .collect();
+                    crate::kafka::build_topic_metadata(tm.name, ERROR_NONE, partitions)
                 })
                 .collect()
         }
@@ -59,18 +64,27 @@ pub fn handle_metadata(
                 // Auto-create topic if it doesn't exist
                 match store.get_or_create_topic(&topic_name) {
                     Ok(_topic_id) => {
-                        // Return metadata for this topic
-                        let partition = crate::kafka::build_partition_metadata(
-                            0,
-                            DEFAULT_BROKER_ID,
-                            vec![DEFAULT_BROKER_ID],
-                            vec![DEFAULT_BROKER_ID],
-                        );
-                        let topic = crate::kafka::build_topic_metadata(
-                            topic_name,
-                            ERROR_NONE,
-                            vec![partition],
-                        );
+                        // Get the topic's partition count from storage
+                        let partition_count = store
+                            .get_topic_metadata(Some(std::slice::from_ref(&topic_name)))
+                            .ok()
+                            .and_then(|topics| topics.first().map(|t| t.partition_count))
+                            .unwrap_or(1);
+
+                        // Build partition metadata for all partitions
+                        let partitions: Vec<_> = (0..partition_count)
+                            .map(|partition_id| {
+                                crate::kafka::build_partition_metadata(
+                                    partition_id,
+                                    DEFAULT_BROKER_ID,
+                                    vec![DEFAULT_BROKER_ID],
+                                    vec![DEFAULT_BROKER_ID],
+                                )
+                            })
+                            .collect();
+
+                        let topic =
+                            crate::kafka::build_topic_metadata(topic_name, ERROR_NONE, partitions);
                         topics_metadata.push(topic);
                     }
                     Err(e) => {
