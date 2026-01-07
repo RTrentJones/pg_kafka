@@ -22,6 +22,13 @@ pub fn handle_produce(
         // Get or create topic
         let topic_id = store.get_or_create_topic(&topic_name)?;
 
+        // Get partition count for this topic
+        let partition_count = store
+            .get_topic_metadata(Some(std::slice::from_ref(&topic_name)))
+            .ok()
+            .and_then(|topics| topics.first().map(|t| t.partition_count))
+            .unwrap_or(1);
+
         // Build topic response
         let mut topic_response =
             kafka_protocol::messages::produce_response::TopicProduceResponse::default();
@@ -35,8 +42,8 @@ pub fn handle_produce(
                 kafka_protocol::messages::produce_response::PartitionProduceResponse::default();
             partition_response.index = partition_index;
 
-            // Validate partition index (we only support partition 0 for now)
-            if partition_index != 0 {
+            // Validate partition index against actual partition count
+            if partition_index < 0 || partition_index >= partition_count {
                 partition_response.error_code = ERROR_UNKNOWN_TOPIC_OR_PARTITION;
                 partition_response.base_offset = -1;
                 partition_response.log_append_time_ms = -1;

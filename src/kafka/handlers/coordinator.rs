@@ -119,14 +119,17 @@ pub fn handle_join_group(
 /// Handle SyncGroup request
 ///
 /// Leader provides partition assignments, followers receive their assignment.
+/// If leader sends empty assignments, server computes assignments automatically.
 pub fn handle_sync_group(
     coordinator: &crate::kafka::GroupCoordinator,
+    store: &impl crate::kafka::KafkaStore,
     group_id: String,
     member_id: String,
     generation_id: i32,
     assignments: Vec<crate::kafka::messages::SyncGroupAssignment>,
 ) -> Result<kafka_protocol::messages::sync_group_response::SyncGroupResponse> {
     use kafka_protocol::messages::sync_group_response::SyncGroupResponse;
+    use std::collections::HashMap;
 
     crate::pg_debug!(
         "SyncGroup: group_id={}, member_id={}, generation_id={}, assignments={}",
@@ -137,10 +140,47 @@ pub fn handle_sync_group(
     );
 
     // Convert assignments to coordinator format
-    let coord_assignments: Vec<(String, Vec<u8>)> = assignments
+    let mut coord_assignments: Vec<(String, Vec<u8>)> = assignments
         .into_iter()
         .map(|a| (a.member_id, a.assignment))
         .collect();
+
+    // Check if leader sent empty assignments - if so, compute server-side
+    let assignments_empty =
+        coord_assignments.is_empty() || coord_assignments.iter().all(|(_, bytes)| bytes.is_empty());
+
+    if assignments_empty {
+        // Get subscribed topics from group members
+        if let Ok(topics) = coordinator.get_subscribed_topics(&group_id) {
+            if !topics.is_empty() {
+                // Get partition counts for each topic
+                let mut topic_partitions: HashMap<String, i32> = HashMap::new();
+                for topic in &topics {
+                    if let Ok(metadata) =
+                        store.get_topic_metadata(Some(std::slice::from_ref(topic)))
+                    {
+                        if let Some(tm) = metadata.first() {
+                            topic_partitions.insert(topic.clone(), tm.partition_count);
+                        }
+                    }
+                }
+
+                // Compute assignments server-side
+                if !topic_partitions.is_empty() {
+                    if let Ok(computed) =
+                        coordinator.compute_assignments(&group_id, &topic_partitions)
+                    {
+                        crate::pg_debug!(
+                            "SyncGroup: computed {} assignments server-side for group {}",
+                            computed.len(),
+                            group_id
+                        );
+                        coord_assignments = computed.into_iter().collect();
+                    }
+                }
+            }
+        }
+    }
 
     // Coordinator returns typed errors (UnknownMemberId, IllegalGeneration, CoordinatorNotAvailable)
     // which map directly to Kafka protocol error codes via to_kafka_error_code()

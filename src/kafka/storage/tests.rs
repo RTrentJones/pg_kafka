@@ -9,6 +9,7 @@
 // NOTE: Integration tests for PostgresStore are in tests/ directory using pgrx.
 
 #[cfg(test)]
+#[allow(clippy::module_inception)]
 mod tests {
     use crate::kafka::error::KafkaError;
     use crate::kafka::messages::Record;

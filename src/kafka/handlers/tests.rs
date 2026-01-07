@@ -5,6 +5,7 @@
 // correct responses for various scenarios.
 
 #[cfg(test)]
+#[allow(clippy::module_inception)]
 mod tests {
     use crate::kafka::constants::*;
     use crate::kafka::error::KafkaError;
@@ -28,6 +29,15 @@ mod tests {
             .with(mockall::predicate::eq("test-topic"))
             .times(1)
             .returning(|_| Ok(1));
+
+        // Expect partition count lookup
+        mock.expect_get_topic_metadata().returning(|_| {
+            Ok(vec![TopicMetadata {
+                name: "test-topic".to_string(),
+                id: 1,
+                partition_count: 1,
+            }])
+        });
 
         mock.expect_insert_records()
             .times(1)
@@ -62,7 +72,16 @@ mod tests {
 
         mock.expect_get_or_create_topic().returning(|_| Ok(1));
 
-        // Request partition 5 which we don't support (only partition 0)
+        // Return partition count = 1, so only partition 0 is valid
+        mock.expect_get_topic_metadata().returning(|_| {
+            Ok(vec![TopicMetadata {
+                name: "test-topic".to_string(),
+                id: 1,
+                partition_count: 1,
+            }])
+        });
+
+        // Request partition 5 which exceeds partition_count
         let topic_data = vec![TopicProduceData {
             name: "test-topic".to_string(),
             partitions: vec![PartitionProduceData {
@@ -86,6 +105,15 @@ mod tests {
         let mut mock = MockKafkaStore::new();
 
         mock.expect_get_or_create_topic().returning(|_| Ok(1));
+
+        // Return partition count = 1, so partition 0 is valid
+        mock.expect_get_topic_metadata().returning(|_| {
+            Ok(vec![TopicMetadata {
+                name: "test-topic".to_string(),
+                id: 1,
+                partition_count: 1,
+            }])
+        });
 
         mock.expect_insert_records()
             .returning(|_, _, _| Err(KafkaError::database("insert failed")));
@@ -444,6 +472,7 @@ mod tests {
     use crate::kafka::handlers::coordinator;
     use crate::kafka::messages::{JoinGroupProtocol, SyncGroupAssignment};
     use crate::kafka::GroupCoordinator;
+    // Note: MockKafkaStore is already imported in outer scope
 
     fn create_test_coordinator() -> GroupCoordinator {
         GroupCoordinator::new()
@@ -606,8 +635,12 @@ mod tests {
             assignment: assignment_data.clone(),
         }];
 
+        // Create mock store (not called since leader provides assignments)
+        let mock = MockKafkaStore::new();
+
         let sync_response = coordinator::handle_sync_group(
             &coord,
+            &mock,
             "test-group".to_string(),
             member_id,
             generation_id,
@@ -672,9 +705,13 @@ mod tests {
             },
         ];
 
+        // Create mock store (not called since leader provides assignments)
+        let mock = MockKafkaStore::new();
+
         // Leader syncs first
         let _leader_sync = coordinator::handle_sync_group(
             &coord,
+            &mock,
             "test-group".to_string(),
             leader_id,
             gen,
@@ -685,6 +722,7 @@ mod tests {
         // Follower syncs (with empty assignments - only leader provides)
         let follower_sync = coordinator::handle_sync_group(
             &coord,
+            &mock,
             "test-group".to_string(),
             follower_id,
             gen,

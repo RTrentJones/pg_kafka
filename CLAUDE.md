@@ -72,17 +72,9 @@ This installs a pre-commit hook that runs:
 
 See [hooks/README.md](hooks/README.md) for more details.
 
-### Key Commands
-
-Once inside the container:
+## Build & Test Commands
 
 ```bash
-# Update Rust toolchain (required for pgrx 0.16.1 dependencies)
-rustup update
-
-# Initialize pgrx (if not already done - auto-runs via devcontainer postCreateCommand)
-cargo pgrx init --pg14 download
-
 # Build and check
 cargo build --features pg14          # Build the extension
 cargo check --features pg14          # Quick compile check
@@ -92,9 +84,29 @@ cargo fmt                            # Format code
 # Run Postgres with the extension loaded (interactive PSQL shell)
 cargo pgrx run pg14
 
-# Testing
-cargo pgrx test pg14                 # Run all tests
-cargo test --features pg14           # Run unit tests only
+# Postgres lifecycle
+cargo pgrx start pg14                # Start postgres in background
+cargo pgrx stop pg14                 # Stop postgres
+cargo pgrx status pg14               # Check if running
+
+# Unit tests (fast, no PostgreSQL required)
+cargo test --features pg14                           # Run all unit tests
+cargo test --features pg14 protocol_tests            # Run specific test module
+cargo test --features pg14 test_encode_decode        # Run single test by name
+cargo test --features pg14 -- --nocapture            # Show println! output
+
+# pgrx integration tests (limited - see note below)
+cargo pgrx test pg14
+
+# E2E tests (requires running PostgreSQL with extension)
+cargo pgrx start pg14
+cd kafka_test && cargo run --release
+
+# Quick development iteration (kills postgres, rebuilds, restarts, recreates extension)
+./restart.sh
+
+# Test coverage
+cargo llvm-cov --lib --features pg14 --lcov --output-path lcov.info
 
 # Package for installation
 cargo pgrx package                   # Creates installable package
@@ -103,9 +115,11 @@ cargo pgrx package                   # Creates installable package
 cargo pgrx schema pg14               # Generate SQL schema files
 ```
 
+**Note on pgrx tests:** This extension uses `PGC_POSTMASTER` GUCs which require `shared_preload_libraries` BEFORE Postgres starts. `cargo pgrx test` creates the extension AFTER startup, causing "FATAL: cannot create PGC_POSTMASTER variables after startup". Most integration testing is done via the E2E suite in `kafka_test/`.
+
 **Note:** The project includes a [rust-toolchain.toml](rust-toolchain.toml) that specifies Rust nightly, which is required for the `home` crate dependency that uses edition2024 features (needed by pgrx 0.16.1). The default feature is `pg14` as specified in [Cargo.toml](Cargo.toml).
 
-## Current Codebase Structure
+## Codebase Structure
 
 ```
 src/
@@ -161,50 +175,74 @@ docs/
 
 restart.sh              # Quick rebuild and restart script for development
 Cargo.lock              # Locked dependencies for reproducible builds
-
-.github/
-├── workflows/
-│   └── ci.yml          # GitHub Actions CI/CD pipeline (lint, test, security, lockfile)
-└── SETUP.md            # CI/CD setup guide
 ```
 
-**Implemented (Phase 1-3B):**
-- ✅ Kafka wire protocol parser using kafka-protocol crate v0.17
-- ✅ Background worker with TCP listener on port 9092
-- ✅ Storage schema with dual-offset design (3 tables)
-- ✅ Repository Pattern storage abstraction (KafkaStore trait)
-- ✅ SPI integration for database operations
-- ✅ Request handlers: ApiVersions, Metadata, Produce, Fetch, ListOffsets, OffsetCommit, OffsetFetch, FindCoordinator, JoinGroup, Heartbeat, LeaveGroup, SyncGroup
-- ✅ Consumer group coordinator with thread-safe state management
-- ✅ RecordBatch v2 encoding/decoding
-- ✅ E2E tests with automated database verification (5 scenarios)
-- ✅ CI/CD pipeline with GitHub Actions
+## Architecture
 
-**Planned (Phase 4-6):**
-- ⏳ Automatic partition assignment strategies (Range, RoundRobin, Sticky)
-- ⏳ Automatic rebalancing on member join/leave
-- ⏳ Member timeout detection
-- ⏳ Long polling via LISTEN/NOTIFY (optional optimization)
-- ⏳ Shadow replication worker using Logical Decoding
-- ⏳ Table partitioning and retention policies
+### Async/Sync Bridge Pattern
 
-## Architecture (Target Design)
+The core architectural challenge is bridging async Kafka protocol handling with sync PostgreSQL SPI calls. The extension runs **one BackgroundWorker process** managed by Postgres Postmaster:
 
-### Core Components
+```
+TCP:9092 → Tokio Runtime (listener.rs) → crossbeam-channel → Background Worker (worker.rs) → SPI
+```
 
-The extension introduces **two persistent BackgroundWorker processes** managed by the Postgres Postmaster:
+1. **Async Layer** (`src/kafka/listener.rs`): Tokio runtime accepts TCP connections, parses Kafka wire protocol
+2. **Message Queue** (`src/kafka/messages.rs`): `crossbeam-channel` bridges async→sync with `RequestMessage`/`ResponseMessage`
+3. **Sync Layer** (`src/worker.rs`): Background worker processes requests via SPI within postgres transactions
 
-1. **Protocol Listener (Ingress):**
-   - Binds to TCP port 9092
-   - Rust tokio runtime running inside a Postgres BackgroundWorker
-   - Flow: Accepts connections → Parses Request bytes → Maps to SPI calls → Writes to Postgres Tables
-   - **Critical constraint:** Cannot block the Postgres main loop. Uses pgrx's background worker support with embedded tokio runtime.
+**Critical constraint:** The tokio runtime cannot call SPI directly (different thread context). All database operations must go through the background worker.
 
-2. **Replicator (Egress/Shadow Mode):**
-   - Reads Postgres WAL and produces to external Kafka
-   - Uses Postgres Logical Decoding (via pgoutput plugin)
-   - Flow: Tails WAL → Decodes INSERT → Sends ProduceRequest to Real Kafka
-   - **Key feature:** Enables zero-downtime migration from pg_kafka to real Kafka
+**Connection multiplexing:** Postgres processes are heavy (10MB+). Cannot spawn one process per Kafka client. The tokio listener runs in one BGWorker process, handling thousands of TCP connections but using only one SPI connection to the DB.
+
+### Repository Pattern (KafkaStore Trait)
+
+Storage is abstracted via the `KafkaStore` trait (`src/kafka/storage/mod.rs`):
+
+```rust
+pub trait KafkaStore {
+    fn get_or_create_topic(&self, name: &str) -> Result<i32>;
+    fn insert_records(&self, topic_id: i32, partition_id: i32, records: &[Record]) -> Result<i64>;
+    fn fetch_records(&self, topic_id: i32, partition_id: i32, fetch_offset: i64, max_bytes: i32) -> Result<Vec<FetchedMessage>>;
+    fn commit_offset(&self, group_id: &str, topic_id: i32, partition_id: i32, offset: i64, metadata: Option<&str>) -> Result<()>;
+    // ... more methods
+}
+```
+
+- `PostgresStore` (`src/kafka/storage/postgres.rs`): Production implementation using SPI
+- `MockKafkaStore` (`src/testing/mocks.rs`): Test double for handler unit tests
+
+This separation enables testing handlers without a running database.
+
+### Handler Organization
+
+Protocol handlers live in `src/kafka/handlers/`:
+- Each Kafka API has a handler function taking `&dyn KafkaStore` for testability
+- `helpers.rs`: `TopicResolution` enum for topic lookup logic shared across handlers
+- `tests.rs`: 14 handler tests using `MockKafkaStore`
+
+### Error Handling
+
+`KafkaError` (`src/kafka/error.rs`) provides typed errors that map to Kafka protocol error codes:
+
+```rust
+impl KafkaError {
+    pub fn to_kafka_error_code(&self) -> i16 {
+        match self {
+            KafkaError::UnknownTopic { .. } => ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+            KafkaError::UnknownMemberId { .. } => ERROR_UNKNOWN_MEMBER_ID,
+            // ... every variant maps to a specific Kafka error code
+        }
+    }
+}
+```
+
+### Consumer Group Coordinator
+
+In-memory state management (`src/kafka/coordinator.rs`):
+- `Arc<RwLock<HashMap<String, GroupState>>>` for thread-safe group state
+- Currently supports manual partition assignment only (no automatic rebalancing)
+- Tracks: generation IDs, member registry, partition assignments
 
 ### Storage Schema
 
@@ -221,19 +259,15 @@ CREATE TABLE kafka.messages (
     value BYTEA,
     headers JSONB,
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (topic_id, partition_id, partition_offset),
-    FOREIGN KEY (topic_id) REFERENCES kafka.topics(id) ON DELETE CASCADE,
-    UNIQUE (global_offset)  -- Ensures global ordering is strictly monotonic
+    PRIMARY KEY (topic_id, partition_id, partition_offset)
 );
 
--- Metadata
 CREATE TABLE kafka.topics (
     id SERIAL PRIMARY KEY,
     name TEXT UNIQUE NOT NULL,
     partitions INT DEFAULT 1
 );
 
--- Consumer group offset tracking (Phase 3)
 CREATE TABLE kafka.consumer_offsets (
     group_id TEXT NOT NULL,
     topic_id INT NOT NULL,
@@ -241,82 +275,45 @@ CREATE TABLE kafka.consumer_offsets (
     committed_offset BIGINT NOT NULL,
     metadata TEXT,
     commit_timestamp TIMESTAMP NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (group_id, topic_id, partition_id),
-    FOREIGN KEY (topic_id) REFERENCES kafka.topics(id) ON DELETE CASCADE
+    PRIMARY KEY (group_id, topic_id, partition_id)
 );
 ```
 
 **Why Dual Offsets?**
 - `global_offset`: Provides total temporal ordering across ALL messages (useful for replication, debugging)
 - `partition_offset`: Kafka clients expect per-partition monotonic offsets starting from 0
-- Allows queries like "show me all messages in temporal order" AND "fetch from partition X starting at offset Y"
 
-### Protocol Implementation
+## Configuration
 
-**ProduceRequest Handler:**
-1. Parse binary frame (Size + Header + Body)
-2. Attach to Postgres Shared Memory (SPI Context)
-3. Start Postgres Transaction
-4. Execute `INSERT INTO kafka.messages ... RETURNING offset`
-5. Serialize ProduceResponse with new offset
+```sql
+-- In postgresql.conf:
+shared_preload_libraries = 'pg_kafka'
 
-**FetchRequest Handler:**
-1. Query: `SELECT * FROM kafka.messages WHERE topic_id=$1 AND partition_id=$2 AND "offset" >= $3 LIMIT $4`
-2. Implement Long Poll using Postgres `LISTEN/NOTIFY`
-3. Fetch handler waits on condition variable; Produce handler fires `NOTIFY` upon commit
+-- Network configuration (requires restart)
+pg_kafka.port = 9092              -- TCP port (default: 9092)
+pg_kafka.host = '0.0.0.0'         -- Bind address (default: 0.0.0.0)
 
-## Technical Constraints
+-- Runtime configuration
+pg_kafka.log_connections = false  -- Log each connection
+pg_kafka.shutdown_timeout_ms = 5000
+```
 
-### Connection Multiplexing
-- Postgres processes are heavy (10MB+). Cannot spawn one process per Kafka client.
-- **Solution:** The tokio listener runs in one BGWorker process, handling thousands of TCP connections but using only one SPI connection to the DB.
+## Testing with Kafka Clients
 
-### Async/Sync Integration
-- If tokio blocks on a DB lock, port 9092 stops responding
-- **Solution:** Use pgrx's `run_in_background` for SPI calls to keep async runtime responsive for heartbeats
+```bash
+# List topics (after cargo pgrx start pg14)
+kcat -L -b localhost:9092
 
-### Offset Guarantees
-- BIGSERIAL can have gaps if transactions roll back
-- Kafka clients tolerate offset gaps, but must ensure strictly monotonic increase
-- Postgres Sequence guarantees this property
+# Produce messages
+echo "key1:value1" | kcat -P -b localhost:9092 -t my-topic -K:
 
-## Implementation Phases
+# Consume messages
+kcat -C -b localhost:9092 -t my-topic -p 0 -o beginning
 
-### Phase 1: Metadata Support
-- Scaffold pgrx extension
-- Implement `ApiVersions` and `Metadata` requests
-- Bind TCP listener in `_PG_init`
-- Test: `kcat -L -b localhost:9092` returns metadata
-
-### Phase 2: Producer
-- Implement `ProduceRequest` parser
-- Wire up SPI INSERT
-- Handle ACKs logic
-- Test: `kcat -P` writes data to Postgres table
-
-### Phase 3: Consumer
-- Implement `FetchRequest`
-- Implement Long Polling via ConditionVariable
-- Test: `kcat -C` reads data back
-
-### Phase 4: Shadow Mode (Key Feature)
-- Implement Logical Decoding client
-- Integrate rdkafka crate for external Kafka production
-- Only advance Replication Slot LSN after external broker ACK (At-Least-Once delivery)
-- Test: Data written to port 9092 appears in external Kafka cluster
-
-## Non-Goals (v1)
-
-- Full Protocol Compliance: Consumer Groups have manual assignment only (no automatic rebalancing), no Transactions or Compression
-- High Availability: Rely on standard Postgres HA (Patroni/RDS) rather than Kafka's ISR
-- Broker Clustering: Single-node "broker" design
-
-## Key Dependencies
-
-- **pgrx 0.16.1:** Postgres extension framework for Rust (requires nightly toolchain)
-- **tokio:** (Planned) Async runtime embedded in BackgroundWorker
-- **rdkafka:** (Planned) Rust Kafka client for Shadow Mode replication
-- Kafka Wire Protocol v2+ specification
+# Verify in database
+psql -h localhost -p 28814 -U postgres -d postgres -c \
+  "SELECT topic_id, partition_id, partition_offset, key, value FROM kafka.messages;"
+```
 
 ## Development Workflow
 
@@ -328,14 +325,14 @@ CREATE TABLE kafka.consumer_offsets (
 4. **Test in psql**: Functions are available in the `public` schema by default
 5. **Write tests** in the `tests` module using `#[pg_test]` attribute
 
-### Testing Workflow
+### Adding a New Kafka API Handler
 
-```sql
--- After running: cargo pgrx run pg14
--- You'll be in a psql shell:
-
-SELECT hello_pg_kafka();  -- Test your extension functions
-```
+1. Create handler function in appropriate file under `src/kafka/handlers/`
+2. Handler should take `&dyn KafkaStore` parameter for testability
+3. Use `KafkaError` variants for error handling (they map to Kafka error codes)
+4. Add unit tests in `src/kafka/handlers/tests.rs` using `MockKafkaStore`
+5. Wire up handler in `src/worker.rs` request processing loop
+6. Add E2E test in `kafka_test/src/main.rs`
 
 ### Debugging
 
@@ -365,3 +362,26 @@ To debug:
 - Postgres has its own memory management
 - Use pgrx's `PgMemoryContexts` for allocations that must survive function calls
 - Background workers need careful memory handling
+
+## Key Dependencies
+
+- **pgrx 0.16.1:** Postgres extension framework for Rust (requires nightly toolchain)
+- **tokio 1.48:** Async runtime embedded in BackgroundWorker
+- **kafka-protocol 0.17:** Kafka wire protocol parsing/encoding
+- **crossbeam-channel 0.5:** Message passing between async and sync layers
+- **rdkafka 0.36:** E2E testing with real Kafka client (in kafka_test/)
+
+## Non-Goals (v1)
+
+- Full Protocol Compliance: Consumer Groups have manual assignment only (no automatic rebalancing), no Transactions or Compression
+- High Availability: Rely on standard Postgres HA (Patroni/RDS) rather than Kafka's ISR
+- Broker Clustering: Single-node "broker" design
+
+## Planned Features (Phase 4-6)
+
+- Automatic partition assignment strategies (Range, RoundRobin, Sticky)
+- Automatic rebalancing on member join/leave
+- Member timeout detection
+- Long polling via LISTEN/NOTIFY (optional optimization)
+- Shadow replication worker using Logical Decoding
+- Table partitioning and retention policies

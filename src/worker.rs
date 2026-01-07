@@ -597,6 +597,7 @@ pub fn process_request(
             ..
         } => {
             let coord = coordinator.clone();
+            let store = PostgresStore::new();
             dispatch_response(
                 "SyncGroup",
                 correlation_id,
@@ -604,6 +605,7 @@ pub fn process_request(
                 || {
                     handlers::handle_sync_group(
                         &coord,
+                        &store,
                         group_id,
                         member_id,
                         generation_id,

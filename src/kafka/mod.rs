@@ -31,6 +31,7 @@
 // - Database operations are inherently blocking anyway
 // - The queue cleanly separates concerns and prevents deadlocks
 
+pub mod assignment;
 pub mod constants;
 pub mod coordinator;
 pub mod dispatch;

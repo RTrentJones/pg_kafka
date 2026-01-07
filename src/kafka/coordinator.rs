@@ -124,6 +124,11 @@ pub struct ConsumerGroup {
 
     /// Current group state
     pub state: GroupState,
+
+    /// Previous partition assignments (for sticky strategy)
+    /// Stored after successful SyncGroup completion
+    /// Maps member_id -> encoded MemberAssignment bytes
+    pub previous_assignments: HashMap<String, Vec<u8>>,
 }
 
 impl ConsumerGroup {
@@ -136,6 +141,7 @@ impl ConsumerGroup {
             leader: None,
             members: HashMap::new(),
             state: GroupState::Empty,
+            previous_assignments: HashMap::new(),
         }
     }
 
@@ -225,6 +231,15 @@ impl ConsumerGroup {
     /// Complete sync phase and move to Stable
     /// This happens when leader provides assignments
     fn complete_sync(&mut self) {
+        // Save current assignments for sticky strategy
+        self.previous_assignments.clear();
+        for (member_id, member) in &self.members {
+            if let Some(assignment) = &member.assignment {
+                self.previous_assignments
+                    .insert(member_id.clone(), assignment.clone());
+            }
+        }
+
         self.state = GroupState::Stable;
         pg_log!(
             "Group {} completed sync phase (generation {})",
@@ -495,6 +510,145 @@ impl GroupCoordinator {
             .read()
             .ok()
             .and_then(|groups| groups.get(group_id).cloned())
+    }
+
+    /// Compute partition assignments for all members in a group
+    ///
+    /// This is called when the leader sends an empty SyncGroup request,
+    /// indicating the server should compute assignments.
+    ///
+    /// # Arguments
+    /// * `group_id` - Consumer group ID
+    /// * `topic_partitions` - Map of topic_name -> partition_count
+    ///
+    /// # Returns
+    /// Map of member_id -> encoded MemberAssignment bytes
+    pub fn compute_assignments(
+        &self,
+        group_id: &str,
+        topic_partitions: &HashMap<String, i32>,
+    ) -> Result<HashMap<String, Vec<u8>>> {
+        use crate::kafka::assignment::strategies::StickyStrategy;
+        use crate::kafka::assignment::{
+            create_strategy, AssignmentInput, AssignmentStrategy, MemberAssignment,
+            MemberSubscription,
+        };
+
+        let groups = self.groups.read().map_err(|e| {
+            KafkaError::Internal(format!("Failed to acquire groups read lock: {}", e))
+        })?;
+
+        let group = groups
+            .get(group_id)
+            .ok_or_else(|| KafkaError::CoordinatorNotAvailable {
+                group_id: group_id.to_string(),
+            })?;
+
+        // Parse subscriptions from member protocol metadata
+        let mut subscriptions = HashMap::new();
+        for (member_id, member) in &group.members {
+            // Find the protocol matching the chosen strategy
+            if let Some((_, metadata)) = member
+                .protocols
+                .iter()
+                .find(|(name, _)| Some(name) == group.protocol_name.as_ref())
+            {
+                match MemberSubscription::parse(metadata) {
+                    Ok(sub) => {
+                        subscriptions.insert(member_id.clone(), sub);
+                    }
+                    Err(e) => {
+                        pg_log!(
+                            "Failed to parse subscription for member {}: {}",
+                            member_id,
+                            e
+                        );
+                        // Use empty subscription as fallback
+                        subscriptions.insert(member_id.clone(), MemberSubscription::default());
+                    }
+                }
+            } else {
+                // No matching protocol, use empty subscription
+                subscriptions.insert(member_id.clone(), MemberSubscription::default());
+            }
+        }
+
+        // Create assignment input
+        let input = AssignmentInput::new(subscriptions, topic_partitions.clone());
+
+        // Get strategy name (default to "range")
+        let strategy_name = group.protocol_name.as_deref().unwrap_or("range");
+
+        // Create strategy - for sticky, include previous assignments
+        let assignments = if strategy_name.contains("sticky") {
+            // Parse previous assignments for sticky strategy
+            let mut previous = HashMap::new();
+            for (member_id, bytes) in &group.previous_assignments {
+                if let Ok(assign) = MemberAssignment::parse(bytes) {
+                    previous.insert(member_id.clone(), assign);
+                }
+            }
+            let strategy = StickyStrategy::with_previous(previous);
+            strategy.assign(&input)
+        } else {
+            // Use standard strategy
+            let strategy = create_strategy(strategy_name).ok_or_else(|| {
+                KafkaError::Internal(format!("Unknown assignment strategy: {}", strategy_name))
+            })?;
+            strategy.assign(&input)
+        };
+
+        // Encode assignments to bytes
+        let encoded: HashMap<String, Vec<u8>> = assignments
+            .into_iter()
+            .map(|(id, assignment)| (id, assignment.encode()))
+            .collect();
+
+        pg_log!(
+            "Computed assignments for group {} using strategy {}: {} members",
+            group_id,
+            strategy_name,
+            encoded.len()
+        );
+
+        Ok(encoded)
+    }
+
+    /// Get topics subscribed by members in a group
+    ///
+    /// Parses subscription metadata from all members to determine
+    /// which topics need partition information.
+    pub fn get_subscribed_topics(&self, group_id: &str) -> Result<Vec<String>> {
+        use crate::kafka::assignment::MemberSubscription;
+
+        let groups = self.groups.read().map_err(|e| {
+            KafkaError::Internal(format!("Failed to acquire groups read lock: {}", e))
+        })?;
+
+        let group = groups
+            .get(group_id)
+            .ok_or_else(|| KafkaError::CoordinatorNotAvailable {
+                group_id: group_id.to_string(),
+            })?;
+
+        let mut topics = std::collections::HashSet::new();
+
+        for member in group.members.values() {
+            // Try to parse subscription from the chosen protocol
+            if let Some((_, metadata)) = member
+                .protocols
+                .iter()
+                .find(|(name, _)| Some(name) == group.protocol_name.as_ref())
+            {
+                if let Ok(sub) = MemberSubscription::parse(metadata) {
+                    for topic in sub.topics {
+                        topics.insert(topic);
+                    }
+                }
+            }
+        }
+
+        Ok(topics.into_iter().collect())
     }
 }
 
