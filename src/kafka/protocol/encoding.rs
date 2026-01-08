@@ -11,12 +11,21 @@ use super::super::constants::*;
 use super::super::error::Result;
 use super::super::messages::KafkaResponse;
 
-/// Encode and send a Kafka response to a TCP socket
+/// Helper macro for encoding standard Kafka responses.
 ///
-/// Kafka response format:
-/// ```text
-/// [4 bytes: Size] [ResponseHeader] [ResponseBody]
-/// ```
+/// All standard API responses follow the same pattern:
+/// 1. Create ResponseHeader with correlation_id
+/// 2. Look up header version based on API key and version
+/// 3. Encode header, then encode body
+macro_rules! encode_standard_response {
+    ($buf:expr, $corr_id:expr, $api_ver:expr, $api_key:expr, $body:expr) => {{
+        let header = ResponseHeader::default().with_correlation_id($corr_id);
+        let header_version = constants::get_response_header_version($api_key, $api_ver);
+        header.encode($buf, header_version)?;
+        $body.encode($buf, $api_ver)?;
+    }};
+}
+
 /// Encode a Kafka response into bytes
 ///
 /// Returns the response payload (without size prefix, as LengthDelimitedCodec handles that)
@@ -27,201 +36,218 @@ pub fn encode_response(response: KafkaResponse) -> Result<BytesMut> {
         KafkaResponse::ApiVersions {
             correlation_id,
             api_version,
-            response: api_version_response,
-        } => {
-            let header = ResponseHeader::default().with_correlation_id(correlation_id);
-            let response_header_version =
-                constants::get_response_header_version(API_KEY_API_VERSIONS, api_version);
-            header.encode(&mut response_buf, response_header_version)?;
-            api_version_response.encode(&mut response_buf, api_version)?;
-        }
+            response: body,
+        } => encode_standard_response!(
+            &mut response_buf,
+            correlation_id,
+            api_version,
+            API_KEY_API_VERSIONS,
+            body
+        ),
+
         KafkaResponse::Metadata {
             correlation_id,
             api_version,
-            response: metadata_response,
-        } => {
-            let header = ResponseHeader::default().with_correlation_id(correlation_id);
-            let response_header_version =
-                constants::get_response_header_version(API_KEY_METADATA, api_version);
-            header.encode(&mut response_buf, response_header_version)?;
-            metadata_response.encode(&mut response_buf, api_version)?;
-        }
+            response: body,
+        } => encode_standard_response!(
+            &mut response_buf,
+            correlation_id,
+            api_version,
+            API_KEY_METADATA,
+            body
+        ),
+
         KafkaResponse::Produce {
             correlation_id,
             api_version,
-            response: produce_response,
-        } => {
-            let header = ResponseHeader::default().with_correlation_id(correlation_id);
-            let response_header_version =
-                constants::get_response_header_version(API_KEY_PRODUCE, api_version);
-            header.encode(&mut response_buf, response_header_version)?;
-            produce_response.encode(&mut response_buf, api_version)?;
-        }
+            response: body,
+        } => encode_standard_response!(
+            &mut response_buf,
+            correlation_id,
+            api_version,
+            API_KEY_PRODUCE,
+            body
+        ),
+
         KafkaResponse::Fetch {
             correlation_id,
             api_version,
-            response: fetch_response,
-        } => {
-            let header = ResponseHeader::default().with_correlation_id(correlation_id);
-            let response_header_version =
-                constants::get_response_header_version(API_KEY_FETCH, api_version);
-            header.encode(&mut response_buf, response_header_version)?;
-            fetch_response.encode(&mut response_buf, api_version)?;
-        }
+            response: body,
+        } => encode_standard_response!(
+            &mut response_buf,
+            correlation_id,
+            api_version,
+            API_KEY_FETCH,
+            body
+        ),
+
         KafkaResponse::OffsetCommit {
             correlation_id,
             api_version,
-            response: commit_response,
-        } => {
-            let header = ResponseHeader::default().with_correlation_id(correlation_id);
-            let response_header_version =
-                constants::get_response_header_version(API_KEY_OFFSET_COMMIT, api_version);
-            header.encode(&mut response_buf, response_header_version)?;
-            commit_response.encode(&mut response_buf, api_version)?;
-        }
+            response: body,
+        } => encode_standard_response!(
+            &mut response_buf,
+            correlation_id,
+            api_version,
+            API_KEY_OFFSET_COMMIT,
+            body
+        ),
+
         KafkaResponse::OffsetFetch {
             correlation_id,
             api_version,
-            response: fetch_response,
-        } => {
-            let header = ResponseHeader::default().with_correlation_id(correlation_id);
-            let response_header_version =
-                constants::get_response_header_version(API_KEY_OFFSET_FETCH, api_version);
-            header.encode(&mut response_buf, response_header_version)?;
-            fetch_response.encode(&mut response_buf, api_version)?;
-        }
+            response: body,
+        } => encode_standard_response!(
+            &mut response_buf,
+            correlation_id,
+            api_version,
+            API_KEY_OFFSET_FETCH,
+            body
+        ),
+
         KafkaResponse::FindCoordinator {
             correlation_id,
             api_version,
-            response: coord_response,
-        } => {
-            let header = ResponseHeader::default().with_correlation_id(correlation_id);
-            let response_header_version =
-                constants::get_response_header_version(API_KEY_FIND_COORDINATOR, api_version);
-            header.encode(&mut response_buf, response_header_version)?;
-            coord_response.encode(&mut response_buf, api_version)?;
-        }
+            response: body,
+        } => encode_standard_response!(
+            &mut response_buf,
+            correlation_id,
+            api_version,
+            API_KEY_FIND_COORDINATOR,
+            body
+        ),
+
         KafkaResponse::JoinGroup {
             correlation_id,
             api_version,
-            response: join_response,
-        } => {
-            let header = ResponseHeader::default().with_correlation_id(correlation_id);
-            let response_header_version =
-                constants::get_response_header_version(API_KEY_JOIN_GROUP, api_version);
-            header.encode(&mut response_buf, response_header_version)?;
-            join_response.encode(&mut response_buf, api_version)?;
-        }
+            response: body,
+        } => encode_standard_response!(
+            &mut response_buf,
+            correlation_id,
+            api_version,
+            API_KEY_JOIN_GROUP,
+            body
+        ),
+
         KafkaResponse::SyncGroup {
             correlation_id,
             api_version,
-            response: sync_response,
-        } => {
-            let header = ResponseHeader::default().with_correlation_id(correlation_id);
-            let response_header_version =
-                constants::get_response_header_version(API_KEY_SYNC_GROUP, api_version);
-            header.encode(&mut response_buf, response_header_version)?;
-            sync_response.encode(&mut response_buf, api_version)?;
-        }
+            response: body,
+        } => encode_standard_response!(
+            &mut response_buf,
+            correlation_id,
+            api_version,
+            API_KEY_SYNC_GROUP,
+            body
+        ),
+
         KafkaResponse::Heartbeat {
             correlation_id,
             api_version,
-            response: heartbeat_response,
-        } => {
-            let header = ResponseHeader::default().with_correlation_id(correlation_id);
-            let response_header_version =
-                constants::get_response_header_version(API_KEY_HEARTBEAT, api_version);
-            header.encode(&mut response_buf, response_header_version)?;
-            heartbeat_response.encode(&mut response_buf, api_version)?;
-        }
+            response: body,
+        } => encode_standard_response!(
+            &mut response_buf,
+            correlation_id,
+            api_version,
+            API_KEY_HEARTBEAT,
+            body
+        ),
+
         KafkaResponse::LeaveGroup {
             correlation_id,
             api_version,
-            response: leave_response,
-        } => {
-            let header = ResponseHeader::default().with_correlation_id(correlation_id);
-            let response_header_version =
-                constants::get_response_header_version(API_KEY_LEAVE_GROUP, api_version);
-            header.encode(&mut response_buf, response_header_version)?;
-            leave_response.encode(&mut response_buf, api_version)?;
-        }
+            response: body,
+        } => encode_standard_response!(
+            &mut response_buf,
+            correlation_id,
+            api_version,
+            API_KEY_LEAVE_GROUP,
+            body
+        ),
+
         KafkaResponse::ListOffsets {
             correlation_id,
             api_version,
-            response: list_response,
-        } => {
-            let header = ResponseHeader::default().with_correlation_id(correlation_id);
-            let response_header_version =
-                constants::get_response_header_version(API_KEY_LIST_OFFSETS, api_version);
-            header.encode(&mut response_buf, response_header_version)?;
-            list_response.encode(&mut response_buf, api_version)?;
-        }
+            response: body,
+        } => encode_standard_response!(
+            &mut response_buf,
+            correlation_id,
+            api_version,
+            API_KEY_LIST_OFFSETS,
+            body
+        ),
+
         KafkaResponse::DescribeGroups {
             correlation_id,
             api_version,
-            response: describe_response,
-        } => {
-            let header = ResponseHeader::default().with_correlation_id(correlation_id);
-            let response_header_version =
-                constants::get_response_header_version(API_KEY_DESCRIBE_GROUPS, api_version);
-            header.encode(&mut response_buf, response_header_version)?;
-            describe_response.encode(&mut response_buf, api_version)?;
-        }
+            response: body,
+        } => encode_standard_response!(
+            &mut response_buf,
+            correlation_id,
+            api_version,
+            API_KEY_DESCRIBE_GROUPS,
+            body
+        ),
+
         KafkaResponse::ListGroups {
             correlation_id,
             api_version,
-            response: list_groups_response,
-        } => {
-            let header = ResponseHeader::default().with_correlation_id(correlation_id);
-            let response_header_version =
-                constants::get_response_header_version(API_KEY_LIST_GROUPS, api_version);
-            header.encode(&mut response_buf, response_header_version)?;
-            list_groups_response.encode(&mut response_buf, api_version)?;
-        }
+            response: body,
+        } => encode_standard_response!(
+            &mut response_buf,
+            correlation_id,
+            api_version,
+            API_KEY_LIST_GROUPS,
+            body
+        ),
+
         KafkaResponse::CreateTopics {
             correlation_id,
             api_version,
-            response: create_topics_response,
-        } => {
-            let header = ResponseHeader::default().with_correlation_id(correlation_id);
-            let response_header_version =
-                constants::get_response_header_version(API_KEY_CREATE_TOPICS, api_version);
-            header.encode(&mut response_buf, response_header_version)?;
-            create_topics_response.encode(&mut response_buf, api_version)?;
-        }
+            response: body,
+        } => encode_standard_response!(
+            &mut response_buf,
+            correlation_id,
+            api_version,
+            API_KEY_CREATE_TOPICS,
+            body
+        ),
+
         KafkaResponse::DeleteTopics {
             correlation_id,
             api_version,
-            response: delete_topics_response,
-        } => {
-            let header = ResponseHeader::default().with_correlation_id(correlation_id);
-            let response_header_version =
-                constants::get_response_header_version(API_KEY_DELETE_TOPICS, api_version);
-            header.encode(&mut response_buf, response_header_version)?;
-            delete_topics_response.encode(&mut response_buf, api_version)?;
-        }
+            response: body,
+        } => encode_standard_response!(
+            &mut response_buf,
+            correlation_id,
+            api_version,
+            API_KEY_DELETE_TOPICS,
+            body
+        ),
+
         KafkaResponse::CreatePartitions {
             correlation_id,
             api_version,
-            response: create_partitions_response,
-        } => {
-            let header = ResponseHeader::default().with_correlation_id(correlation_id);
-            let response_header_version =
-                constants::get_response_header_version(API_KEY_CREATE_PARTITIONS, api_version);
-            header.encode(&mut response_buf, response_header_version)?;
-            create_partitions_response.encode(&mut response_buf, api_version)?;
-        }
+            response: body,
+        } => encode_standard_response!(
+            &mut response_buf,
+            correlation_id,
+            api_version,
+            API_KEY_CREATE_PARTITIONS,
+            body
+        ),
+
         KafkaResponse::DeleteGroups {
             correlation_id,
             api_version,
-            response: delete_groups_response,
-        } => {
-            let header = ResponseHeader::default().with_correlation_id(correlation_id);
-            let response_header_version =
-                constants::get_response_header_version(API_KEY_DELETE_GROUPS, api_version);
-            header.encode(&mut response_buf, response_header_version)?;
-            delete_groups_response.encode(&mut response_buf, api_version)?;
-        }
+            response: body,
+        } => encode_standard_response!(
+            &mut response_buf,
+            correlation_id,
+            api_version,
+            API_KEY_DELETE_GROUPS,
+            body
+        ),
         KafkaResponse::Error {
             correlation_id,
             error_code,

@@ -27,7 +27,7 @@ pub async fn test_produce_throughput_baseline() -> TestResult {
         .await?;
 
     let producer = create_producer()?;
-    let message_count = 50; // Reduced from 500 for faster CI
+    let message_count = 500;
 
     println!("   Producing {} messages...", message_count);
     let start = Instant::now();
@@ -88,7 +88,7 @@ pub async fn test_consume_throughput_baseline() -> TestResult {
         .await?;
 
     // First produce messages
-    let messages = generate_messages(50, "consume-throughput"); // Reduced from 500 for faster CI
+    let messages = generate_messages(500, "consume-throughput");
     topic.produce(&messages).await?;
     println!("   Pre-produced {} messages", messages.len());
 
@@ -149,7 +149,7 @@ pub async fn test_batch_vs_single_performance() -> TestResult {
     let single_topic = TestTopicBuilder::new(&ctx, "perf-single").build().await?;
 
     let producer = create_producer()?;
-    let message_count = 20; // Reduced from 100 for faster CI
+    let message_count = 100;
 
     println!("   Single-message mode ({} messages)...", message_count);
     let start_single = Instant::now();

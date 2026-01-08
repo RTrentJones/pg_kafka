@@ -408,6 +408,9 @@ pub fn process_request(
     use crate::kafka::messages::KafkaResponse;
     use crate::kafka::{handlers, PostgresStore};
 
+    // Create store once - it's a stateless unit struct (zero-cost)
+    let store = PostgresStore::new();
+
     match request {
         // ===== ApiVersions (infallible - no storage) =====
         crate::kafka::KafkaRequest::ApiVersions {
@@ -436,7 +439,6 @@ pub fn process_request(
             response_tx,
             ..
         } => {
-            let store = PostgresStore::new();
             let advertised_host = broker_host.to_string();
             let advertised_port = broker_port;
 
@@ -487,7 +489,6 @@ pub fn process_request(
                 return;
             }
 
-            let store = PostgresStore::new();
             dispatch_response(
                 "Produce",
                 response_tx,
@@ -515,7 +516,6 @@ pub fn process_request(
             response_tx,
             ..
         } => {
-            let store = PostgresStore::new();
             dispatch_response(
                 "Fetch",
                 response_tx,
@@ -544,7 +544,6 @@ pub fn process_request(
             response_tx,
             ..
         } => {
-            let store = PostgresStore::new();
             dispatch_response(
                 "OffsetCommit",
                 response_tx,
@@ -573,7 +572,6 @@ pub fn process_request(
             response_tx,
             ..
         } => {
-            let store = PostgresStore::new();
             dispatch_response(
                 "OffsetFetch",
                 response_tx,
@@ -682,7 +680,6 @@ pub fn process_request(
             ..
         } => {
             let coord = coordinator.clone();
-            let store = PostgresStore::new();
             dispatch_response(
                 "SyncGroup",
                 response_tx,
@@ -778,7 +775,6 @@ pub fn process_request(
             response_tx,
             ..
         } => {
-            let store = PostgresStore::new();
             dispatch_response(
                 "ListOffsets",
                 response_tx,
@@ -863,7 +859,6 @@ pub fn process_request(
             response_tx,
             ..
         } => {
-            let store = PostgresStore::new();
             dispatch_response(
                 "CreateTopics",
                 response_tx,
@@ -891,7 +886,6 @@ pub fn process_request(
             response_tx,
             ..
         } => {
-            let store = PostgresStore::new();
             dispatch_response(
                 "DeleteTopics",
                 response_tx,
@@ -920,7 +914,6 @@ pub fn process_request(
             response_tx,
             ..
         } => {
-            let store = PostgresStore::new();
             dispatch_response(
                 "CreatePartitions",
                 response_tx,
@@ -949,7 +942,6 @@ pub fn process_request(
             response_tx,
             ..
         } => {
-            let store = PostgresStore::new();
             let coord = coordinator.clone();
             dispatch_response(
                 "DeleteGroups",

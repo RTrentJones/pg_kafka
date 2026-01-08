@@ -400,6 +400,7 @@ dependencies = [
 name = "kafka_test"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "chrono",
  "clap",
  "rdkafka",

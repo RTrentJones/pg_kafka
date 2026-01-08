@@ -79,6 +79,8 @@ use kafka_test::{
     test_consumer_group_lifecycle,
     test_consumer_group_two_members,
     test_rebalance_after_leave,
+    // Pipelining tests
+    test_request_pipelining,
     test_session_timeout_rebalance,
     test_consumer_multiple_messages,
     test_consumer_rejoin_after_leave,
@@ -536,6 +538,12 @@ fn get_all_tests() -> Vec<TestDef> {
             name: "test_consumer_catches_up",
             test_fn: wrap_test!(test_consumer_catches_up),
             parallel_safe: false,
+        },
+        TestDef {
+            category: "concurrent",
+            name: "test_request_pipelining",
+            test_fn: wrap_test!(test_request_pipelining),
+            parallel_safe: true, // Uses its own connection
         },
         // Negative tests
         TestDef {

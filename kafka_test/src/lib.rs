@@ -74,7 +74,7 @@ pub use producer::{test_batch_produce, test_producer};
 pub use concurrent::{
     test_concurrent_producers_different_partitions, test_concurrent_producers_same_topic,
     test_consumer_catches_up, test_consumer_group_two_members, test_consumer_rejoin_after_leave,
-    test_multiple_consumer_groups, test_produce_while_consuming,
+    test_multiple_consumer_groups, test_produce_while_consuming, test_request_pipelining,
 };
 pub use edge_cases::{
     test_batch_1000_messages, test_consume_empty_partition, test_consumer_group_empty,
