@@ -40,7 +40,7 @@ pub async fn run(
     listener: TcpListener,
     request_tx: Sender<KafkaRequest>,
     shutdown_rx: std::sync::mpsc::Receiver<()>,
-    log_connections: bool,
+    _log_connections: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("pg_kafka TCP listener started");
 
@@ -67,10 +67,8 @@ pub async fn run(
 
         match accept_result {
             Ok(Ok((socket, addr))) => {
-                // Log connection if configured
-                if log_connections {
-                    info!("Accepted connection from {}", addr);
-                }
+                // Always log connections for debugging
+                info!("Accepted connection from {}", addr);
 
                 // Clone the sender for this connection
                 let conn_request_tx = request_tx.clone();
@@ -95,16 +93,22 @@ pub async fn run(
     Ok(())
 }
 
-/// Handle a single client connection
+/// Handle a single client connection with request pipelining support
 ///
-/// Step 3: Parse Kafka protocol requests and send responses
+/// This function supports Kafka request pipelining by splitting the socket into
+/// separate reader and writer halves that operate concurrently:
+/// - Reader task: Continuously reads requests and dispatches them to the worker
+/// - Writer task: Continuously waits for responses and sends them back
 ///
-/// Flow:
-/// 1. Read request from socket (using LengthDelimitedCodec for automatic framing)
-/// 2. Parse request and send to main thread via channel
-/// 3. Wait for response from main thread
-/// 4. Encode and send response back to client
-/// 5. Repeat until client disconnects
+/// This allows clients to send multiple requests without waiting for responses,
+/// which is required by rdkafka's AdminClient implementation.
+///
+/// ## Ordering Guarantee
+/// Kafka requires: if Request A comes before Request B, Response A must come before Response B.
+/// Our architecture guarantees this:
+/// 1. reader.next() reads from TCP in order → pushes to request_tx (FIFO) in order
+/// 2. Worker pops from request_rx in order → processes synchronously → pushes to response_tx in order
+/// 3. response_rx receives in order → writer.send() writes to TCP in order
 ///
 /// # Thread Safety
 /// This function runs in the network thread and MUST NOT call pgrx functions.
@@ -112,11 +116,11 @@ async fn handle_connection(
     socket: TcpStream,
     request_tx: Sender<KafkaRequest>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    debug!("New connection established, starting handle loop");
+    debug!("New connection established, starting pipelined handle loop");
 
     // Wrap socket in LengthDelimitedCodec for automatic size-prefix framing
     // Kafka uses big-endian 4-byte size prefix
-    let mut framed = Framed::new(
+    let framed = Framed::new(
         socket,
         LengthDelimitedCodec::builder()
             .big_endian()
@@ -125,87 +129,83 @@ async fn handle_connection(
             .new_codec(),
     );
 
-    // Create a channel for this specific connection's responses
-    // The main thread will send responses back to us via this channel
-    // Using tokio unbounded channel for async-friendly receive
+    // Split the framed socket into independent reader and writer halves
+    // This enables concurrent reading and writing for pipelining support
+    let (mut writer, mut reader) = framed.split();
+
+    // Create a channel for this connection's responses
+    // The main thread will send responses back via this channel
     let (response_tx, mut response_rx) = tokio::sync::mpsc::unbounded_channel();
 
-    // Connection loop: handle multiple requests on the same connection
-    loop {
-        // Read the next frame from the socket
-        // LengthDelimitedCodec automatically handles size prefix
-        debug!("Waiting for next frame from client...");
-        let frame = match framed.next().await {
-            Some(Ok(bytes)) => bytes,
-            Some(Err(e)) => {
-                warn!("Error reading frame: {}", e);
-                break;
+    // Spawn the Writer Task
+    // This task sits and waits for responses from the DB.
+    // It runs completely independently of the reader.
+    let writer_handle: tokio::task::JoinHandle<Result<(), String>> = tokio::spawn(async move {
+        while let Some(response) = response_rx.recv().await {
+            debug!("Writer received response, encoding...");
+            let response_bytes = match protocol::encode_response(response) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    error!("Failed to encode response: {}", e);
+                    return Err(format!("Encoding error: {}", e));
+                }
+            };
+
+            debug!(
+                "Sending {} byte response to client...",
+                response_bytes.len()
+            );
+            if let Err(e) = writer.send(response_bytes.freeze()).await {
+                warn!("Failed to send response to client: {}", e);
+                return Err(format!("Write error: {}", e));
             }
-            None => {
-                // Client closed connection gracefully
-                debug!("Client closed connection (stream ended)");
+            debug!("Response sent to client successfully");
+        }
+        Ok(())
+    });
+
+    // Run the Reader Loop (Main Task)
+    // This loop ONLY reads and dispatches. It never waits for the DB response.
+    while let Some(frame_result) = reader.next().await {
+        let frame = match frame_result {
+            Ok(f) => f,
+            Err(e) => {
+                warn!("Error reading frame: {}", e);
                 break;
             }
         };
 
         debug!("Received frame of {} bytes", frame.len());
 
-        // Parse the request from the frame bytes
+        // Parse and attach the SAME response_tx clone for every request
+        // This ensures all responses route back to our writer task
         match protocol::parse_request(frame, response_tx.clone()) {
             Ok(Some(request)) => {
-                debug!("Request parsed successfully, sending to main worker thread...");
-                // Send the parsed request to the main worker thread for processing
-                // Use send() which blocks if channel is full (backpressure)
+                debug!("Request parsed successfully, dispatching to worker...");
                 if let Err(e) = request_tx.send(request) {
-                    error!("Failed to send request to worker thread: {}", e);
+                    error!("Worker channel closed: {}", e);
                     break;
-                }
-                debug!("Request sent to worker thread successfully");
-
-                // Wait for the response from the main thread
-                // CRITICAL: Using tokio channel's async .recv() instead of blocking
-                // This allows the tokio runtime to continue processing other tasks
-                debug!("Waiting for response from main thread...");
-                match response_rx.recv().await {
-                    Some(response) => {
-                        debug!("Received response from main thread, encoding...");
-                        // Encode the response
-                        match protocol::encode_response(response) {
-                            Ok(response_bytes) => {
-                                debug!(
-                                    "Sending {} byte response to client...",
-                                    response_bytes.len()
-                                );
-                                // Send the response frame
-                                // LengthDelimitedCodec automatically adds size prefix
-                                if let Err(e) = framed.send(response_bytes.freeze()).await {
-                                    warn!("Failed to send response to client: {}", e);
-                                    break;
-                                }
-                                debug!("Response sent to client successfully");
-                            }
-                            Err(e) => {
-                                error!("Failed to encode response: {}", e);
-                                break;
-                            }
-                        }
-                    }
-                    None => {
-                        warn!("Response channel closed by worker thread");
-                        break;
-                    }
                 }
             }
             Ok(None) => {
-                // Parse error with error response already sent
-                break;
+                // Parse error - error response already queued via response_tx
+                // Continue reading more requests (don't break connection)
+                debug!("Parse returned None, continuing...");
             }
             Err(e) => {
-                warn!("Error parsing request: {}", e);
+                warn!("Framing/Parse error: {}", e);
                 break;
             }
         }
     }
 
+    // Cleanup: Drop response_tx to signal writer task to exit
+    drop(response_tx);
+
+    // Wait briefly for writer to finish sending any pending responses
+    // Use a timeout to avoid blocking forever if writer is stuck
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(100), writer_handle).await;
+
+    debug!("Connection handler exiting");
     Ok(())
 }

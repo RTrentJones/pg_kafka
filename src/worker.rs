@@ -156,7 +156,13 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     let host = config.host.clone();
     let log_connections = config.log_connections;
     let shutdown_timeout = Duration::from_millis(config.shutdown_timeout_ms as u64);
-    let broker_host = host.clone();
+    // Convert 0.0.0.0 to localhost for advertised host (used in Metadata and FindCoordinator)
+    // 0.0.0.0 is not routable from clients - they need a resolvable hostname
+    let broker_host = if host == "0.0.0.0" || host.is_empty() {
+        "localhost".to_string()
+    } else {
+        host.clone()
+    };
 
     // Step 5: Create bounded request channel (backpressure at 10,000 pending requests)
     // This is the bridge between the network thread and the database thread.
@@ -203,8 +209,8 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
         .name("pg_kafka-net".to_string())
         .spawn(move || {
             // Initialize tracing subscriber for this thread
-            // Default to error-only to prevent log bloat in CI
-            // Enable with RUST_LOG=pg_kafka=info for debugging
+            // Use error level to reduce log output in production
+            // Enable with RUST_LOG=pg_kafka=debug for debugging
             let _ = tracing_subscriber::fmt()
                 .with_env_filter(
                     tracing_subscriber::EnvFilter::from_default_env()
@@ -430,13 +436,9 @@ pub fn process_request(
             response_tx,
             ..
         } => {
-            let config = crate::config::Config::load();
-            let advertised_host = if config.host == "0.0.0.0" || config.host.is_empty() {
-                "localhost".to_string()
-            } else {
-                config.host.clone()
-            };
             let store = PostgresStore::new();
+            let advertised_host = broker_host.to_string();
+            let advertised_port = broker_port;
 
             dispatch_response(
                 "Metadata",
@@ -446,7 +448,7 @@ pub fn process_request(
                         &store,
                         requested_topics,
                         advertised_host,
-                        config.port,
+                        advertised_port,
                     )
                 },
                 |r| KafkaResponse::Metadata {

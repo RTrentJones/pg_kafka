@@ -22,6 +22,7 @@ pub fn handle_find_coordinator(
 
     // Build response - we are always the coordinator for all groups
     let mut response = FindCoordinatorResponse::default();
+    response.throttle_time_ms = 0;
     response.error_code = ERROR_NONE;
     response.error_message = None;
     response.node_id = DEFAULT_BROKER_ID.into();
@@ -93,6 +94,7 @@ pub fn handle_join_group(
 
     // Build response
     let mut response = JoinGroupResponse::default();
+    response.throttle_time_ms = 0;
     response.error_code = ERROR_NONE;
     response.generation_id = generation_id;
     response.protocol_type = Some(protocol_type.into());
@@ -189,6 +191,7 @@ pub fn handle_sync_group(
 
     // Build response
     let mut response = SyncGroupResponse::default();
+    response.throttle_time_ms = 0;
     response.error_code = ERROR_NONE;
     response.assignment = assignment.into();
 
@@ -219,6 +222,7 @@ pub fn handle_heartbeat(
 
     // Build response
     let mut response = HeartbeatResponse::default();
+    response.throttle_time_ms = 0;
     response.error_code = ERROR_NONE;
 
     Ok(response)
@@ -242,6 +246,7 @@ pub fn handle_leave_group(
 
     // Build response
     let mut response = LeaveGroupResponse::default();
+    response.throttle_time_ms = 0;
     response.error_code = ERROR_NONE;
 
     Ok(response)

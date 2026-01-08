@@ -1146,11 +1146,6 @@ fn parse_delete_groups(
     api_version: i16,
     response_tx: tokio::sync::mpsc::UnboundedSender<super::super::messages::KafkaResponse>,
 ) -> Result<Option<KafkaRequest>> {
-    debug!(
-        "Parsed DeleteGroups request (api_key={}, version={})",
-        API_KEY_DELETE_GROUPS, api_version
-    );
-
     let delete_req =
         match kafka_protocol::messages::delete_groups_request::DeleteGroupsRequest::decode(
             payload_buf,

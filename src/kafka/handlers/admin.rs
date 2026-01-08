@@ -118,6 +118,7 @@ pub fn handle_create_topics(
     }
 
     let mut response = CreateTopicsResponse::default();
+    response.throttle_time_ms = 0;
     response.topics = results;
     Ok(response)
 }
@@ -170,6 +171,7 @@ pub fn handle_delete_topics(
     }
 
     let mut response = DeleteTopicsResponse::default();
+    response.throttle_time_ms = 0;
     response.responses = results;
     Ok(response)
 }
@@ -237,6 +239,7 @@ pub fn handle_create_partitions(
     }
 
     let mut response = CreatePartitionsResponse::default();
+    response.throttle_time_ms = 0;
     response.results = results;
     Ok(response)
 }
@@ -298,6 +301,7 @@ pub fn handle_delete_groups(
     }
 
     let mut response = DeleteGroupsResponse::default();
+    response.throttle_time_ms = 0;
     response.results = results;
     Ok(response)
 }
