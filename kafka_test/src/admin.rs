@@ -54,10 +54,13 @@ pub async fn test_create_topic() -> TestResult {
     let partitions: i32 = row.get(0);
     assert_eq!(partitions, 3, "Topic should have 3 partitions");
 
-    // Cleanup - delete the topic
-    let _ = admin
-        .delete_topics(&[&topic_name], &AdminOptions::new())
-        .await;
+    // Cleanup - wait for completion to prevent race conditions with next test
+    if let Err(e) = admin
+        .delete_topics(&[&topic_name], &opts)
+        .await
+    {
+        eprintln!("    Cleanup warning: {:?}", e);
+    }
 
     println!("    Created topic '{}' with 3 partitions", topic_name);
     Ok(())
@@ -92,10 +95,13 @@ pub async fn test_create_topic_already_exists() -> TestResult {
         err
     );
 
-    // Cleanup
-    let _ = admin
-        .delete_topics(&[&topic_name], &AdminOptions::new())
-        .await;
+    // Cleanup - wait for completion to prevent race conditions with next test
+    if let Err(e) = admin
+        .delete_topics(&[&topic_name], &opts)
+        .await
+    {
+        eprintln!("    Cleanup warning: {:?}", e);
+    }
 
     println!(
         "    Correctly rejected duplicate topic creation for '{}'",
@@ -209,10 +215,13 @@ pub async fn test_create_partitions() -> TestResult {
     let partitions: i32 = row.get(0);
     assert_eq!(partitions, 5, "Topic should have 5 partitions now");
 
-    // Cleanup
-    let _ = admin
-        .delete_topics(&[&topic_name], &AdminOptions::new())
-        .await;
+    // Cleanup - wait for completion to prevent race conditions with next test
+    if let Err(e) = admin
+        .delete_topics(&[&topic_name], &opts)
+        .await
+    {
+        eprintln!("    Cleanup warning: {:?}", e);
+    }
 
     println!("    Increased partitions for '{}' from 2 to 5", topic_name);
     Ok(())
@@ -249,10 +258,13 @@ pub async fn test_create_partitions_cannot_decrease() -> TestResult {
         err
     );
 
-    // Cleanup
-    let _ = admin
-        .delete_topics(&[&topic_name], &AdminOptions::new())
-        .await;
+    // Cleanup - wait for completion to prevent race conditions with next test
+    if let Err(e) = admin
+        .delete_topics(&[&topic_name], &opts)
+        .await
+    {
+        eprintln!("    Cleanup warning: {:?}", e);
+    }
 
     println!(
         "    Correctly rejected partition decrease for '{}'",
@@ -331,10 +343,13 @@ pub async fn test_delete_group_non_empty() -> TestResult {
     // Consumer will be dropped here, leaving the group
     drop(consumer);
 
-    // Cleanup
-    let _ = admin
-        .delete_topics(&[&topic_name], &AdminOptions::new())
-        .await;
+    // Cleanup - wait for completion to prevent race conditions with next test
+    if let Err(e) = admin
+        .delete_topics(&[&topic_name], &opts)
+        .await
+    {
+        eprintln!("    Cleanup warning: {:?}", e);
+    }
 
     println!(
         "    Correctly rejected deletion of non-empty group '{}'",
@@ -377,10 +392,13 @@ pub async fn test_create_multiple_topics() -> TestResult {
 
     assert_eq!(count, 3, "All 3 topics should exist in database");
 
-    // Cleanup
-    let _ = admin
-        .delete_topics(&[&topic1, &topic2, &topic3], &AdminOptions::new())
-        .await;
+    // Cleanup - wait for completion to prevent race conditions with next test
+    if let Err(e) = admin
+        .delete_topics(&[&topic1, &topic2, &topic3], &opts)
+        .await
+    {
+        eprintln!("    Cleanup warning: {:?}", e);
+    }
 
     println!("    Created 3 topics in single request");
     Ok(())
