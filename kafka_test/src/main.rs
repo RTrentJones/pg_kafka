@@ -124,6 +124,12 @@ use kafka_test::{
     test_long_poll_multiple_waiters,
     test_long_poll_producer_wakeup,
     test_long_poll_timeout,
+    // Compression tests
+    test_compressed_producer_gzip,
+    test_compressed_producer_lz4,
+    test_compressed_producer_snappy,
+    test_compressed_producer_zstd,
+    test_compression_roundtrip,
 };
 
 type TestFn = fn() -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error>>> + Send>>;
@@ -639,6 +645,37 @@ fn get_all_tests() -> Vec<TestDef> {
             name: "test_long_poll_multiple_waiters",
             test_fn: wrap_test!(test_long_poll_multiple_waiters),
             parallel_safe: false, // Tests timing-sensitive behavior
+        },
+        // Compression tests (Phase 8)
+        TestDef {
+            category: "compression",
+            name: "test_compressed_producer_gzip",
+            test_fn: wrap_test!(test_compressed_producer_gzip),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "compression",
+            name: "test_compressed_producer_snappy",
+            test_fn: wrap_test!(test_compressed_producer_snappy),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "compression",
+            name: "test_compressed_producer_lz4",
+            test_fn: wrap_test!(test_compressed_producer_lz4),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "compression",
+            name: "test_compressed_producer_zstd",
+            test_fn: wrap_test!(test_compressed_producer_zstd),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "compression",
+            name: "test_compression_roundtrip",
+            test_fn: wrap_test!(test_compression_roundtrip),
+            parallel_safe: true,
         },
     ]
 }

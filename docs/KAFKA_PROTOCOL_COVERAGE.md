@@ -1,7 +1,7 @@
 # Kafka Protocol Coverage Analysis
 
 **Date**: 2026-01-08
-**pg_kafka Version**: Phase 7 Complete + Long Polling Enhancement
+**pg_kafka Version**: Phase 8 Complete (Compression Support)
 **Analysis**: Comprehensive review of implemented vs standard Kafka protocol
 
 ---
@@ -12,7 +12,7 @@
 |--------|-------|
 | **API Coverage** | 18 of ~50 standard Kafka APIs (36%) |
 | **Build Status** | ✅ Compiles with zero warnings |
-| **Test Suite** | 181 unit tests + 90 E2E tests |
+| **Test Suite** | 184 unit tests + 95 E2E tests |
 | **Architecture** | Repository Pattern with typed errors |
 | **Client Compatibility** | ✅ kcat, rdkafka verified |
 
@@ -32,7 +32,6 @@
 | Produce | 0 | v3-v9 | ✅ Complete | RecordBatch v2 format only |
 
 **Limitations**:
-- No compression support (gzip, snappy, lz4, zstd)
 - No idempotent producer support
 - No transaction support
 
@@ -146,6 +145,7 @@ Consumer Flow (Current):
 
 - **Phase 6** ✅ Admin APIs (CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups)
 - **Phase 7** ✅ Multi-Partition Topics with key-based routing
+- **Phase 8** ✅ Compression Support (gzip, snappy, lz4, zstd)
 
 ### Enhancements
 
@@ -153,11 +153,10 @@ Consumer Flow (Current):
 
 ### Future Phases
 
-- **Phase 8** - Compression Support (gzip, snappy, lz4, zstd)
+- **Phase 9** - Shadow Mode (Logical Decoding → external Kafka)
 - **Cooperative Rebalancing** (KIP-429)
 - **Static Group Membership** (KIP-345)
 - **Idempotent Producer** - Deduplication support
-- **Shadow Mode** - Logical decoding to external Kafka
 
 ---
 
@@ -168,7 +167,7 @@ Consumer Flow (Current):
 |---------|---------------|----------|-------|
 | Wire Protocol | v0-v17+ | v0-v13 | Supports flexible format (v9+) |
 | RecordBatch | v0, v1, v2 | v2 only | MessageSet v0/v1 deprecated |
-| Compression | All codecs | None | Not implemented |
+| Compression | All codecs | All codecs | gzip, snappy, lz4, zstd fully supported |
 | Transactions | Yes | No | Not planned |
 | SASL/ACLs | Yes | No | Use PostgreSQL auth |
 
@@ -230,34 +229,32 @@ Consumer Flow (Current):
 **Current State**: Comprehensive Kafka-compatible broker with 18 APIs implemented
 **Coverage**: 36% of standard Kafka protocol (full producer/consumer/coordinator/admin support)
 **Architecture**: Clean, maintainable, well-documented with Repository Pattern
-**Test Status**: All 181 unit tests and 90 E2E tests passing ✅
+**Test Status**: All 184 unit tests and 95 E2E tests passing ✅
 
 **Readiness**:
-- ✅ **Producer**: Production-ready (with compression limitations)
+- ✅ **Producer**: Production-ready with full compression support
 - ✅ **Consumer**: Fully functional with long polling and automatic partition assignment
 - ✅ **Coordinator**: Complete with automatic rebalancing
 - ✅ **Admin APIs**: CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups
 - ✅ **Multi-Partition**: Key-based routing with murmur2 hash
 - ✅ **Long Polling**: max_wait_ms/min_bytes support
+- ✅ **Compression**: gzip, snappy, lz4, zstd (inbound/outbound)
 
-**Recent Achievements (Phase 6-7 + Enhancements)**:
-1. ✅ Admin APIs (CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups)
-2. ✅ Multi-partition topics with configurable partition count
-3. ✅ Key-based partition routing (Kafka-compatible murmur2 hash)
-4. ✅ Long polling with max_wait_ms/min_bytes support
-5. ✅ In-memory notification for fast consumer wakeup
-6. ✅ Configurable poll interval fallback
+**Recent Achievements (Phase 8)**:
+1. ✅ Compression support (gzip, snappy, lz4, zstd)
+2. ✅ Automatic inbound decompression via kafka-protocol crate
+3. ✅ Configurable outbound compression via GUC
+4. ✅ Full E2E test coverage for all compression codecs
 
 **Future Phases**:
-1. Phase 8: Compression support (gzip, snappy, lz4, zstd)
+1. Phase 9: Shadow mode (logical decoding to external Kafka)
 2. Cooperative rebalancing (KIP-429)
 3. Static group membership (KIP-345)
-4. Shadow mode (logical decoding to external Kafka)
 
 ---
 
-**Overall Assessment**: Phase 7 Complete with Long Polling Enhancement - pg_kafka provides full producer/consumer support with long polling, multi-partition topics, and admin APIs. The implementation features clean architecture (Repository Pattern), comprehensive test coverage (181+ unit tests, 69 E2E tests), and typed error handling.
+**Overall Assessment**: Phase 8 Complete - pg_kafka provides full producer/consumer support with compression, long polling, multi-partition topics, and admin APIs. The implementation features clean architecture (Repository Pattern), comprehensive test coverage (184+ unit tests, 95 E2E tests), and typed error handling.
 
 **Last Updated:** 2026-01-08
-**Phase:** 7 Complete + Long Polling
-**Tests:** 181 unit tests + 69 E2E tests
+**Phase:** 8 Complete (Compression Support)
+**Tests:** 184 unit tests + 95 E2E tests

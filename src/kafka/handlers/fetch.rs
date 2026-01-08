@@ -9,20 +9,21 @@ use crate::kafka::error::Result;
 use crate::kafka::storage::KafkaStore;
 use kafka_protocol::messages::TopicName;
 use kafka_protocol::protocol::StrBytes;
+use kafka_protocol::records::Compression;
 
 /// Handle Fetch request
 ///
-/// Fetches messages from storage and encodes them as Kafka RecordBatch
+/// Fetches messages from storage and encodes them as Kafka RecordBatch.
+/// The compression parameter controls the encoding compression for the response.
 pub fn handle_fetch(
     store: &impl KafkaStore,
     topic_data: Vec<crate::kafka::messages::TopicFetchData>,
+    compression: Compression,
 ) -> Result<kafka_protocol::messages::fetch_response::FetchResponse> {
     use kafka_protocol::messages::fetch_response::{
         FetchResponse, FetchableTopicResponse, PartitionData,
     };
-    use kafka_protocol::records::{
-        Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
-    };
+    use kafka_protocol::records::{Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType};
 
     let mut responses = Vec::new();
 
@@ -117,7 +118,7 @@ pub fn handle_fetch(
                     kafka_records.iter(),
                     &RecordEncodeOptions {
                         version: 2,
-                        compression: Compression::None,
+                        compression,
                     },
                 ) {
                     // On error, return empty bytes to avoid protocol errors

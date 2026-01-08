@@ -174,7 +174,12 @@ mod tests {
             }],
         }];
 
-        let response = fetch::handle_fetch(&mock, topic_data).unwrap();
+        let response = fetch::handle_fetch(
+            &mock,
+            topic_data,
+            kafka_protocol::records::Compression::None,
+        )
+        .unwrap();
 
         assert_eq!(response.responses.len(), 1);
         let partition_data = &response.responses[0].partitions[0];
@@ -198,7 +203,12 @@ mod tests {
             }],
         }];
 
-        let response = fetch::handle_fetch(&mock, topic_data).unwrap();
+        let response = fetch::handle_fetch(
+            &mock,
+            topic_data,
+            kafka_protocol::records::Compression::None,
+        )
+        .unwrap();
 
         let partition_data = &response.responses[0].partitions[0];
         assert_eq!(partition_data.error_code, ERROR_UNKNOWN_TOPIC_OR_PARTITION);

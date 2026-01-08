@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `pg_kafka` is a PostgreSQL extension written in Rust (via pgrx) that embeds a Kafka-compatible wire protocol listener directly into the Postgres runtime. It allows standard Kafka clients to produce and consume messages using Postgres as the backing store.
 
-**Status:** Phase 7 Complete - Multi-Partition Topics (Portfolio/Learning Project)
+**Status:** Phase 8 Complete - Compression Support (Portfolio/Learning Project)
 
 **Current Implementation:**
 - ✅ **Phase 1 Complete:** Metadata support (ApiVersions, Metadata requests)
@@ -17,14 +17,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - ✅ **Phase 5 Complete:** Automatic rebalancing (LeaveGroup trigger, timeout detection, REBALANCE_IN_PROGRESS)
 - ✅ **Phase 6 Complete:** Admin APIs (CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups)
 - ✅ **Phase 7 Complete:** Multi-Partition Topics (key-based routing, default partition config)
+- ✅ **Phase 8 Complete:** Compression Support (gzip, snappy, lz4, zstd)
 - ✅ **Enhancement:** Long Polling (max_wait_ms/min_bytes support, in-memory notification)
 - ✅ **CI/CD:** GitHub Actions pipeline with automated testing
-- ⏳ **Phase 8:** Compression Support (gzip, snappy, lz4, zstd)
+- ⏳ **Phase 9:** Shadow Mode (Logical Decoding → external Kafka)
 
 **What Works Now:**
 - TCP listener on port 9092 with full Kafka wire protocol parsing
 - ProduceRequest handling with database persistence
 - FetchRequest with RecordBatch v2 encoding/decoding
+- Compression support: gzip, snappy, lz4, zstd (inbound automatic, outbound configurable)
 - Consumer group coordinator with automatic partition assignment (Range, RoundRobin, Sticky strategies)
 - Automatic rebalancing on member leave or session timeout
 - DescribeGroups/ListGroups for consumer group visibility
@@ -37,7 +39,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Automated E2E tests with real Kafka client (rdkafka)
 
 **API Coverage:** 18 of ~50 standard Kafka APIs (36%)
-**Test Status:** All unit tests (175) and E2E tests (90) passing ✅
+**Test Status:** All unit tests (184) and E2E tests (95) passing ✅
 
 ## Development Setup
 
@@ -305,6 +307,7 @@ pg_kafka.host = '0.0.0.0'         -- Bind address (default: 0.0.0.0)
 pg_kafka.log_connections = false  -- Log each connection
 pg_kafka.shutdown_timeout_ms = 5000
 pg_kafka.default_partitions = 1   -- Default partitions for auto-created topics
+pg_kafka.compression_type = 'none' -- Outbound compression (none, gzip, snappy, lz4, zstd)
 ```
 
 ## Testing with Kafka Clients
@@ -382,14 +385,13 @@ To debug:
 
 ## Non-Goals (v1)
 
-- Full Protocol Compliance: No Transactions, Compression, or acks=0 (fire-and-forget) support
+- Full Protocol Compliance: No Transactions or acks=0 (fire-and-forget) support
 - High Availability: Rely on standard Postgres HA (Patroni/RDS) rather than Kafka's ISR
 - Broker Clustering: Single-node "broker" design
 
-## Planned Features (Phase 6)
+## Planned Features (Future Phases)
 
-- Long polling via LISTEN/NOTIFY (optional optimization)
-- Shadow replication worker using Logical Decoding
+- Phase 9: Shadow replication worker using Logical Decoding
 - Table partitioning and retention policies
 - Cooperative rebalancing (KIP-429)
 - Static group membership (KIP-345)

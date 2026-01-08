@@ -19,6 +19,7 @@
 //! - **negative**: Expected failure tests (4 tests)
 //! - **performance**: Throughput baseline tests (3 tests)
 //! - **long_poll**: Long polling tests (4 tests)
+//! - **compression**: Compression tests (5 tests)
 //!
 //! ## Usage
 //!
@@ -44,6 +45,7 @@ pub mod setup;
 
 // Test modules
 pub mod admin;
+pub mod compression;
 pub mod concurrent;
 pub mod consumer;
 pub mod consumer_group;
@@ -111,8 +113,14 @@ pub use admin::{
     test_delete_group_non_empty, test_delete_topic, test_delete_topic_not_found,
 };
 
-// Long polling tests (Phase 8)
+// Long polling tests
 pub use long_poll::{
     test_long_poll_immediate_return, test_long_poll_multiple_waiters,
     test_long_poll_producer_wakeup, test_long_poll_timeout,
+};
+
+// Compression tests (Phase 8)
+pub use compression::{
+    test_compressed_producer_gzip, test_compressed_producer_lz4, test_compressed_producer_snappy,
+    test_compressed_producer_zstd, test_compression_roundtrip,
 };

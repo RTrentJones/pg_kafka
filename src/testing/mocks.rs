@@ -3,8 +3,8 @@
 //! These mocks allow testing without the PostgreSQL runtime.
 
 use crate::kafka::constants::{
-    DEFAULT_DATABASE, DEFAULT_KAFKA_PORT, DEFAULT_SHUTDOWN_TIMEOUT_MS, DEFAULT_TOPIC_PARTITIONS,
-    TEST_HOST,
+    DEFAULT_COMPRESSION_TYPE, DEFAULT_DATABASE, DEFAULT_KAFKA_PORT, DEFAULT_SHUTDOWN_TIMEOUT_MS,
+    DEFAULT_TOPIC_PARTITIONS, TEST_HOST,
 };
 use crate::kafka::error::Result;
 use crate::kafka::messages::Record;
@@ -77,6 +77,7 @@ pub fn mock_config() -> crate::config::Config {
         default_partitions: DEFAULT_TOPIC_PARTITIONS,
         fetch_poll_interval_ms: DEFAULT_FETCH_POLL_INTERVAL_MS,
         enable_long_polling: true,
+        compression_type: DEFAULT_COMPRESSION_TYPE.to_string(),
     }
 }
 

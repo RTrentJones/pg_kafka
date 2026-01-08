@@ -159,6 +159,7 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     let default_partitions = config.default_partitions;
     let fetch_poll_interval_ms = config.fetch_poll_interval_ms;
     let enable_long_polling = config.enable_long_polling;
+    let compression = parse_compression_type(&config.compression_type);
     // Convert 0.0.0.0 to localhost for advertised host (used in Metadata and FindCoordinator)
     // 0.0.0.0 is not routable from clients - they need a resolvable hostname
     let broker_host = if host == "0.0.0.0" || host.is_empty() {
@@ -351,6 +352,7 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
                 let broker_p = port;
                 let default_parts = default_partitions;
                 let notifier = notify_tx.clone();
+                let comp = compression;
 
                 BackgroundWorker::transaction(move || {
                     // Wrap in catch_unwind to prevent handler panics from crashing the worker
@@ -362,6 +364,7 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
                             broker_p,
                             default_parts,
                             &notifier,
+                            comp,
                         );
                     }));
 
@@ -426,6 +429,7 @@ pub fn process_request(
     broker_port: i32,
     default_partitions: i32,
     notify_tx: &crossbeam_channel::Sender<crate::kafka::InternalNotification>,
+    compression: kafka_protocol::records::Compression,
 ) {
     use crate::kafka::dispatch::{dispatch_infallible, dispatch_response};
     use crate::kafka::messages::KafkaResponse;
@@ -583,7 +587,7 @@ pub fn process_request(
             dispatch_response(
                 "Fetch",
                 response_tx,
-                || handlers::handle_fetch(&store, topic_data),
+                || handlers::handle_fetch(&store, topic_data, compression),
                 |r| KafkaResponse::Fetch {
                     correlation_id,
                     api_version,

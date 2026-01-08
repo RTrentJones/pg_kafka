@@ -14,7 +14,7 @@ This document lists intentional deviations from the official Kafka protocol spec
 | **Admin APIs** | ✅ Full support (CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups) |
 | **Transaction APIs** | ❌ Not planned |
 
-**Current Implementation:** Phase 7 Complete + Long Polling Enhancement
+**Current Implementation:** Phase 8 Complete (Compression Support)
 
 ## Producer API Deviations
 
@@ -34,19 +34,27 @@ This document lists intentional deviations from the official Kafka protocol spec
 - Clients using `acks=0` will receive error responses
 - Workaround: Use `acks=1` (leader acknowledgment) instead
 
-### 2. Compression Not Supported
+### 2. Compression ✅ Fully Supported (Phase 8)
 
-**Status:** Not Implemented
+**Status:** Fully Implemented
 **Kafka Behavior:** Supports gzip, snappy, lz4, zstd compression
-**pg_kafka Behavior:** Accepts only uncompressed messages
+**pg_kafka Behavior:** Full support for all compression codecs
 
-**Rationale:**
-- Compression adds significant complexity
-- PostgreSQL already has TOAST for large values
-- Can be added in future phases if needed
+**Implementation:**
+- ✅ **Inbound (Producer → Server)**: Automatic decompression via `kafka-protocol` crate
+- ✅ **Outbound (Server → Consumer)**: Configurable via `pg_kafka.compression_type` GUC
+- ✅ **Supported codecs**: none, gzip, snappy, lz4, zstd
+
+**Configuration:**
+```sql
+-- Set outbound compression (default: none)
+SET pg_kafka.compression_type = 'gzip';
+```
 
 **Client Impact:**
-- Clients must set `compression.type=none`
+- Clients can use any compression type (gzip, snappy, lz4, zstd)
+- Server decompresses messages before storage
+- Server compresses responses based on GUC setting
 
 ### 3. Idempotent Producer Not Supported
 
@@ -285,8 +293,8 @@ impl KafkaError {
 ```properties
 # Producer settings
 bootstrap.servers=localhost:9092
-acks=1  # REQUIRED
-compression.type=none  # REQUIRED
+acks=1  # REQUIRED (acks=0 not supported)
+compression.type=gzip  # Optional: none, gzip, snappy, lz4, zstd
 enable.idempotence=false  # REQUIRED
 
 # Consumer settings
@@ -326,6 +334,6 @@ auto.offset.reset=earliest
 ---
 
 **Last Updated:** 2026-01-08
-**Applies To:** pg_kafka Phase 7 Complete + Long Polling
+**Applies To:** pg_kafka Phase 8 Complete (Compression Support)
 **API Coverage:** 18 of ~50 Kafka APIs (36%)
-**Test Status:** 181 unit tests + 69 E2E tests passing
+**Test Status:** 184 unit tests + 95 E2E tests passing

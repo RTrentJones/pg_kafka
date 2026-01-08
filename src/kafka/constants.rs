@@ -293,6 +293,28 @@ pub const ERROR_GROUP_ID_NOT_FOUND: i16 = 69;
 /// Non-empty group (cannot delete group with members)
 pub const ERROR_NON_EMPTY_GROUP: i16 = 68;
 
+// ===== Compression =====
+
+use kafka_protocol::records::Compression;
+
+/// Parse a compression type string into a Compression enum.
+///
+/// Supports: none, gzip, snappy, lz4, zstd (case-insensitive).
+/// Invalid values fall back to None.
+pub fn parse_compression_type(s: &str) -> Compression {
+    match s.to_lowercase().as_str() {
+        "gzip" => Compression::Gzip,
+        "snappy" => Compression::Snappy,
+        "lz4" => Compression::Lz4,
+        "zstd" => Compression::Zstd,
+        "none" | "" => Compression::None,
+        _ => Compression::None,
+    }
+}
+
+/// Default compression type for FetchResponse encoding
+pub const DEFAULT_COMPRESSION_TYPE: &str = "none";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,5 +422,33 @@ mod tests {
         // Unknown API keys should return v0
         assert_eq!(get_response_header_version(999, 0), 0);
         assert_eq!(get_response_header_version(999, 100), 0);
+    }
+
+    #[test]
+    fn test_parse_compression_type_valid_values() {
+        assert_eq!(parse_compression_type("none"), Compression::None);
+        assert_eq!(parse_compression_type("gzip"), Compression::Gzip);
+        assert_eq!(parse_compression_type("snappy"), Compression::Snappy);
+        assert_eq!(parse_compression_type("lz4"), Compression::Lz4);
+        assert_eq!(parse_compression_type("zstd"), Compression::Zstd);
+    }
+
+    #[test]
+    fn test_parse_compression_type_case_insensitive() {
+        assert_eq!(parse_compression_type("GZIP"), Compression::Gzip);
+        assert_eq!(parse_compression_type("Gzip"), Compression::Gzip);
+        assert_eq!(parse_compression_type("SNAPPY"), Compression::Snappy);
+        assert_eq!(parse_compression_type("LZ4"), Compression::Lz4);
+        assert_eq!(parse_compression_type("ZSTD"), Compression::Zstd);
+        assert_eq!(parse_compression_type("NONE"), Compression::None);
+    }
+
+    #[test]
+    fn test_parse_compression_type_invalid_fallback() {
+        // Invalid values should fall back to None
+        assert_eq!(parse_compression_type("invalid"), Compression::None);
+        assert_eq!(parse_compression_type(""), Compression::None);
+        assert_eq!(parse_compression_type("deflate"), Compression::None);
+        assert_eq!(parse_compression_type("bzip2"), Compression::None);
     }
 }
