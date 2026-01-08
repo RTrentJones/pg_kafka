@@ -109,6 +109,8 @@ jobs:
     - name: Rust Cache
       uses: Swatinem/rust-cache@v2
       with:
+        # Cache version - bump when system dependencies change (e.g., adding libzstd-dev)
+        prefix-key: v1
         # cache the main workspace AND the kafka_test crate
         workspaces: |
           . -> target
