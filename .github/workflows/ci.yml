@@ -106,21 +106,22 @@ jobs:
         # 'rustfmt' for style checks, 'clippy' for linting
         components: rustfmt, clippy, llvm-tools-preview
 
+    # Install system deps BEFORE Rust Cache so librdkafka builds with zstd support
+    - name: Install System Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libpq-dev libreadline-dev zlib1g-dev flex bison libxml2-dev libxslt-dev libssl-dev libsasl2-dev libzstd-dev netcat-openbsd
+
     - name: Rust Cache
       uses: Swatinem/rust-cache@v2
       with:
         # Cache version - bump when system dependencies change (e.g., adding libzstd-dev)
-        prefix-key: v1
+        prefix-key: v2
         # cache the main workspace AND the kafka_test crate
         workspaces: |
           . -> target
           kafka_test -> kafka_test/target
       # intelligently caches Rust dependencies to speed up builds significantly.
-
-    - name: Install System Dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y libpq-dev libreadline-dev zlib1g-dev flex bison libxml2-dev libxslt-dev libssl-dev libsasl2-dev libzstd-dev netcat-openbsd
 
     # ------------------------------------------------------------------
     # OPTIMIZATION: Cache the CLI tool to avoid compiling it every run
