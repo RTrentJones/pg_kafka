@@ -3,7 +3,8 @@
 //! These mocks allow testing without the PostgreSQL runtime.
 
 use crate::kafka::constants::{
-    DEFAULT_DATABASE, DEFAULT_KAFKA_PORT, DEFAULT_SHUTDOWN_TIMEOUT_MS, TEST_HOST,
+    DEFAULT_DATABASE, DEFAULT_KAFKA_PORT, DEFAULT_SHUTDOWN_TIMEOUT_MS, DEFAULT_TOPIC_PARTITIONS,
+    TEST_HOST,
 };
 use crate::kafka::error::Result;
 use crate::kafka::messages::Record;
@@ -19,7 +20,7 @@ mock! {
     pub KafkaStore {}
 
     impl KafkaStore for KafkaStore {
-        fn get_or_create_topic<'a>(&self, name: &'a str) -> Result<i32>;
+        fn get_or_create_topic<'a>(&self, name: &'a str, default_partitions: i32) -> Result<i32>;
         fn get_topic_metadata<'a>(&self, names: Option<&'a [String]>) -> Result<Vec<TopicMetadata>>;
         fn insert_records<'a>(&self, topic_id: i32, partition_id: i32, records: &'a [Record]) -> Result<i64>;
         fn fetch_records(
@@ -72,6 +73,7 @@ pub fn mock_config() -> crate::config::Config {
         database: DEFAULT_DATABASE.to_string(),
         log_connections: false,
         shutdown_timeout_ms: DEFAULT_SHUTDOWN_TIMEOUT_MS,
+        default_partitions: DEFAULT_TOPIC_PARTITIONS,
     }
 }
 
@@ -109,10 +111,16 @@ mod tests {
         // Test that expectations work correctly
         mock.expect_get_or_create_topic()
             .times(1)
-            .returning(|_| Ok(1));
+            .returning(|_, _| Ok(1));
 
-        let result = mock.get_or_create_topic("test-topic");
+        let result = mock.get_or_create_topic("test-topic", 1);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 1);
+    }
+
+    #[test]
+    fn test_mock_config_has_default_partitions() {
+        let config = mock_config();
+        assert_eq!(config.default_partitions, DEFAULT_TOPIC_PARTITIONS);
     }
 }

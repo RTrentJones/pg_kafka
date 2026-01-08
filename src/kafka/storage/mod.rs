@@ -63,14 +63,15 @@ pub trait KafkaStore {
     /// Get or create a topic by name
     ///
     /// If the topic exists, returns its ID.
-    /// If it doesn't exist, creates it with default partition count and returns the new ID.
+    /// If it doesn't exist, creates it with specified partition count and returns the new ID.
     ///
     /// # Arguments
     /// * `name` - Topic name
+    /// * `default_partitions` - Number of partitions to create if topic doesn't exist
     ///
     /// # Returns
     /// Topic ID on success, error otherwise
-    fn get_or_create_topic(&self, name: &str) -> Result<i32>;
+    fn get_or_create_topic(&self, name: &str, default_partitions: i32) -> Result<i32>;
 
     /// Get metadata for topics
     ///

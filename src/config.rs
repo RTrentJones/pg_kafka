@@ -8,7 +8,8 @@
 use pgrx::{GucContext, GucFlags, GucRegistry, GucSetting};
 
 use crate::kafka::constants::{
-    DEFAULT_DATABASE, DEFAULT_KAFKA_PORT, DEFAULT_SHUTDOWN_TIMEOUT_MS, MIN_SHUTDOWN_TIMEOUT_MS,
+    DEFAULT_DATABASE, DEFAULT_KAFKA_PORT, DEFAULT_SHUTDOWN_TIMEOUT_MS, DEFAULT_TOPIC_PARTITIONS,
+    MIN_SHUTDOWN_TIMEOUT_MS,
 };
 
 #[cfg(not(test))]
@@ -24,6 +25,7 @@ pub struct Config {
     pub database: String,
     pub log_connections: bool,
     pub shutdown_timeout_ms: i32,
+    pub default_partitions: i32,
 }
 
 impl Config {
@@ -44,6 +46,7 @@ impl Config {
                 .unwrap_or_else(|| DEFAULT_DATABASE.to_string()),
             log_connections: LOG_CONNECTIONS.get(),
             shutdown_timeout_ms: SHUTDOWN_TIMEOUT_MS.get(),
+            default_partitions: DEFAULT_PARTITIONS.get(),
         }
     }
 
@@ -56,6 +59,7 @@ impl Config {
             database: DEFAULT_DATABASE.to_string(),
             log_connections: false,
             shutdown_timeout_ms: DEFAULT_SHUTDOWN_TIMEOUT_MS,
+            default_partitions: DEFAULT_TOPIC_PARTITIONS,
         }
     }
 }
@@ -68,6 +72,7 @@ static HOST: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(No
 static DATABASE: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 static LOG_CONNECTIONS: GucSetting<bool> = GucSetting::<bool>::new(false);
 static SHUTDOWN_TIMEOUT_MS: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_SHUTDOWN_TIMEOUT_MS);
+static DEFAULT_PARTITIONS: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_TOPIC_PARTITIONS);
 
 /// Initialize GUC parameters
 pub fn init() {
@@ -116,6 +121,17 @@ pub fn init() {
         &SHUTDOWN_TIMEOUT_MS,
         MIN_SHUTDOWN_TIMEOUT_MS,
         60000,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"pg_kafka.default_partitions",
+        c"Default number of partitions for auto-created topics",
+        c"When a topic is auto-created via produce, this sets the partition count. Default: 1.",
+        &DEFAULT_PARTITIONS,
+        1,
+        10000,
         GucContext::Suset,
         GucFlags::default(),
     );

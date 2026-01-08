@@ -156,6 +156,7 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     let host = config.host.clone();
     let log_connections = config.log_connections;
     let shutdown_timeout = Duration::from_millis(config.shutdown_timeout_ms as u64);
+    let default_partitions = config.default_partitions;
     // Convert 0.0.0.0 to localhost for advertised host (used in Metadata and FindCoordinator)
     // 0.0.0.0 is not routable from clients - they need a resolvable hostname
     let broker_host = if host == "0.0.0.0" || host.is_empty() {
@@ -337,11 +338,12 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
                 let coord = coordinator.clone();
                 let broker_h = broker_host.clone();
                 let broker_p = port;
+                let default_parts = default_partitions;
 
                 BackgroundWorker::transaction(move || {
                     // Wrap in catch_unwind to prevent handler panics from crashing the worker
                     let result = catch_unwind(AssertUnwindSafe(|| {
-                        process_request(request, &coord, &broker_h, broker_p);
+                        process_request(request, &coord, &broker_h, broker_p, default_parts);
                     }));
 
                     if let Err(panic_info) = result {
@@ -403,6 +405,7 @@ pub fn process_request(
     coordinator: &std::sync::Arc<crate::kafka::GroupCoordinator>,
     broker_host: &str,
     broker_port: i32,
+    default_partitions: i32,
 ) {
     use crate::kafka::dispatch::{dispatch_infallible, dispatch_response};
     use crate::kafka::messages::KafkaResponse;
@@ -451,6 +454,7 @@ pub fn process_request(
                         requested_topics,
                         advertised_host,
                         advertised_port,
+                        default_partitions,
                     )
                 },
                 |r| KafkaResponse::Metadata {
@@ -492,7 +496,7 @@ pub fn process_request(
             dispatch_response(
                 "Produce",
                 response_tx,
-                || handlers::handle_produce(&store, topic_data),
+                || handlers::handle_produce(&store, topic_data, default_partitions),
                 |r| KafkaResponse::Produce {
                     correlation_id,
                     api_version,

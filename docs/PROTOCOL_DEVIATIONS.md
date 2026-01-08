@@ -4,7 +4,7 @@ This document lists intentional deviations from the official Kafka protocol spec
 
 ## Summary
 
-`pg_kafka` implements a **subset** of the Kafka wire protocol (24% API coverage). The following deviations are intentional design decisions that optimize for PostgreSQL's strengths while maintaining compatibility with standard Kafka clients.
+`pg_kafka` implements a **subset** of the Kafka wire protocol (36% API coverage). The following deviations are intentional design decisions that optimize for PostgreSQL's strengths while maintaining compatibility with standard Kafka clients.
 
 | Category | Status |
 |----------|--------|
@@ -14,7 +14,7 @@ This document lists intentional deviations from the official Kafka protocol spec
 | **Admin APIs** | ✅ Full support (CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups) |
 | **Transaction APIs** | ❌ Not planned |
 
-**Current Implementation:** Phase 6 Complete
+**Current Implementation:** Phase 7 Complete
 
 ## Producer API Deviations
 
@@ -80,13 +80,13 @@ This document lists intentional deviations from the official Kafka protocol spec
 
 ## Consumer API Deviations
 
-**Status:** Phase 3B Complete (Partial Implementation)
+**Status:** Phase 5 Complete (Full Implementation)
 
-### 5. Consumer Groups (Partial Support) ✅ Implemented
+### 5. Consumer Groups ✅ Fully Implemented
 
-**Status:** Manual partition assignment only
+**Status:** Full support with automatic partition assignment and rebalancing
 **Kafka Behavior:** Automatic partition assignment with rebalancing
-**pg_kafka Behavior:** Coordinator exists but no automatic assignment
+**pg_kafka Behavior:** Same, with Range, RoundRobin, and Sticky strategies
 
 **What Works:**
 - ✅ FindCoordinator API
@@ -94,31 +94,20 @@ This document lists intentional deviations from the official Kafka protocol spec
 - ✅ Heartbeat API (membership maintenance)
 - ✅ LeaveGroup API (graceful departure)
 - ✅ SyncGroup API (partition assignment distribution)
+- ✅ DescribeGroups/ListGroups APIs
 - ✅ Thread-safe coordinator state (Arc<RwLock>)
-- ✅ Consumer can manually assign partitions
+- ✅ Automatic partition assignment (Range, RoundRobin, Sticky strategies)
+- ✅ Automatic rebalancing on member join/leave
+- ✅ Member timeout detection (session timeout)
+- ✅ REBALANCE_IN_PROGRESS error handling
 
-**What's Missing:**
-- ❌ Automatic partition assignment strategies (Range, RoundRobin, Sticky)
-- ❌ Automatic rebalancing on member join/leave
-- ❌ Member timeout detection
+**What's Not Implemented:**
 - ❌ Static group membership (KIP-345)
 - ❌ Cooperative rebalancing (KIP-429)
 
 **Client Impact:**
-- Consumers must use manual partition assignment (BaseConsumer with assign())
-- Cannot use `subscribe()` which requires automatic rebalancing
-- Leader must compute partition assignments and distribute via SyncGroup
-
-**Workaround:**
-```rust
-// Instead of automatic subscription:
-// consumer.subscribe(&["my-topic"])?;  // ❌ Won't work
-
-// Use manual partition assignment:
-let mut assignment = TopicPartitionList::new();
-assignment.add_partition_offset("my-topic", 0, Offset::Beginning)?;
-consumer.assign(&assignment)?;  // ✅ Works
-```
+- Full consumer group functionality works with standard Kafka clients
+- Both manual partition assignment and automatic subscription supported
 
 ### 6. Offset Management ✅ Implemented
 
@@ -188,29 +177,44 @@ consumer.assign(&assignment)?;  // ✅ Works
 **Client Impact:**
 - Typos in topic names create unwanted topics
 
-### 11. Single Partition Per Topic (Current Limitation)
+### 11. Multi-Partition Topics ✅ Implemented (Phase 7)
 
-**Status:** Current implementation
-**Kafka Behavior:** Supports multiple partitions per topic
-**pg_kafka Behavior:** Fixed at 1 partition per topic
+**Status:** Fully implemented
+**Kafka Behavior:** Supports multiple partitions per topic with key-based routing
+**pg_kafka Behavior:** Same, with configurable default partition count
+
+**Implementation:**
+- ✅ Topics can have any number of partitions (set via CreateTopics or `pg_kafka.default_partitions` GUC)
+- ✅ Key-based partition routing using murmur2 hash (Kafka-compatible)
+- ✅ Explicit partition assignment in ProduceRequest supported
+- ✅ Metadata reports correct partition count
+
+**Technical Details:**
+- Uses `murmur2` crate with `KAFKA_SEED` for hash compatibility with Kafka
+- When partition_index == -1, server computes: `murmur2(key) % partition_count`
+
+### 12. Null Key Partition Routing (Minor Deviation)
+
+**Status:** Minor deviation from Kafka behavior
+**Kafka Behavior:** Uses "sticky partitioner" for null keys (batches to same partition until batch completes)
+**pg_kafka Behavior:** Uses random partition selection for null keys
 
 **Rationale:**
-- Simplifies current implementation (Phase 3B)
-- Database schema already supports multiple partitions (`partition_id` column)
-- Multi-partition support planned for future phases
+- Sticky partitioner requires tracking batch state across requests
+- Random distribution provides similar overall distribution
+- Kafka clients typically handle null-key partitioning client-side anyway
 
-**Technical Note:**
-- The `kafka.messages` table stores `partition_id` and could support multiple partitions today
-- What's missing is partition assignment logic (which partition receives which message)
-- Key-based partitioning (`hash(key) % num_partitions`) would be straightforward to add
+**Client Impact:**
+- Messages without keys may not batch to the same partition
+- No impact on ordering guarantees (null keys have no ordering guarantee in Kafka either)
 
 ## API Version Support
 
-### Supported APIs (12 total)
+### Supported APIs (18 total)
 
 | API Key | Name | Versions | Status |
 |---------|------|----------|--------|
-| 0 | Produce | 3-9 | ✅ Full support |
+| 0 | Produce | 3-9 | ✅ Full support (with key-based routing) |
 | 1 | Fetch | 0-13 | ✅ Full support |
 | 2 | ListOffsets | 0-7 | ✅ Partial (special offsets only) |
 | 3 | Metadata | 0-9 | ✅ Full support |
@@ -221,7 +225,13 @@ consumer.assign(&assignment)?;  // ✅ Works
 | 12 | Heartbeat | 0-4 | ✅ Full support |
 | 13 | LeaveGroup | 0-4 | ✅ Full support |
 | 14 | SyncGroup | 0-4 | ✅ Full support |
+| 15 | DescribeGroups | 0-4 | ✅ Full support |
+| 16 | ListGroups | 0-4 | ✅ Full support |
 | 18 | ApiVersions | 0-3 | ✅ Full support |
+| 19 | CreateTopics | 0-7 | ✅ Full support |
+| 20 | DeleteTopics | 0-6 | ✅ Full support |
+| 37 | CreatePartitions | 0-3 | ✅ Full support |
+| 42 | DeleteGroups | 0-2 | ✅ Full support |
 
 **Note:** OffsetFetch v8+ uses different response format. We support v0-7.
 
@@ -257,12 +267,9 @@ impl KafkaError {
 
 ### Notable Missing APIs
 
-- DescribeGroups (API 15) - Planned for Phase 4
-- ListGroups (API 16) - Planned for Phase 4
-- CreateTopics (API 19) - May be added
-- DeleteTopics (API 20) - May be added
 - Transaction APIs (22-26) - Not planned
 - Admin/Security APIs - Not planned
+- Log compaction - Not planned (PostgreSQL UPDATE provides similar semantics)
 
 ## Compatibility Testing
 
@@ -291,29 +298,20 @@ auto.offset.reset=earliest
 
 ## Future Work
 
-### Phase 4: Automatic Partition Assignment
-
-| Feature | Description | Complexity |
-|---------|-------------|------------|
-| Range Assignment | Assign partitions by range to consumers | Medium |
-| RoundRobin Assignment | Distribute partitions evenly | Medium |
-| Sticky Assignment | Minimize partition movement on rebalance | High |
-
-### Phase 5: Automatic Rebalancing
-
-| Feature | Description | Complexity |
-|---------|-------------|------------|
-| Member Timeout Detection | Detect and remove stale members | Medium |
-| Trigger Rebalance | Rebalance on member join/leave | High |
-| Cooperative Rebalancing (KIP-429) | Incremental rebalancing | Very High |
-
-### Phase 6: Shadow Mode
+### Shadow Mode (Future Phase)
 
 | Feature | Description | Complexity |
 |---------|-------------|------------|
 | Logical Decoding | Tail PostgreSQL WAL | High |
 | External Kafka Production | Forward to real Kafka cluster | Medium |
 | At-Least-Once Delivery | Acknowledge only after external ACK | Medium |
+
+### Advanced Consumer Features (Future)
+
+| Feature | Description | Complexity |
+|---------|-------------|------------|
+| Static Group Membership (KIP-345) | Stable member IDs across restarts | Medium |
+| Cooperative Rebalancing (KIP-429) | Incremental rebalancing | Very High |
 
 ### May Not Implement
 
@@ -328,6 +326,6 @@ auto.offset.reset=earliest
 ---
 
 **Last Updated:** 2026-01-08
-**Applies To:** pg_kafka Phase 6 Complete
+**Applies To:** pg_kafka Phase 7 Complete
 **API Coverage:** 18 of ~50 Kafka APIs (36%)
-**Test Status:** 201 unit tests + 61 E2E tests passing
+**Test Status:** 175 unit tests + 90 E2E tests passing

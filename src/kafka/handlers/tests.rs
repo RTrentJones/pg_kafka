@@ -26,9 +26,12 @@ mod tests {
 
         // Expect topic lookup and record insertion
         mock.expect_get_or_create_topic()
-            .with(mockall::predicate::eq("test-topic"))
+            .with(
+                mockall::predicate::eq("test-topic"),
+                mockall::predicate::always(),
+            )
             .times(1)
-            .returning(|_| Ok(1));
+            .returning(|_, _| Ok(1));
 
         // Expect partition count lookup
         mock.expect_get_topic_metadata().returning(|_| {
@@ -56,7 +59,7 @@ mod tests {
             }],
         }];
 
-        let response = produce::handle_produce(&mock, topic_data).unwrap();
+        let response = produce::handle_produce(&mock, topic_data, 1).unwrap();
 
         assert_eq!(response.responses.len(), 1);
         let topic_response = &response.responses[0];
@@ -70,7 +73,7 @@ mod tests {
     fn test_handle_produce_unknown_partition() {
         let mut mock = MockKafkaStore::new();
 
-        mock.expect_get_or_create_topic().returning(|_| Ok(1));
+        mock.expect_get_or_create_topic().returning(|_, _| Ok(1));
 
         // Return partition count = 1, so only partition 0 is valid
         mock.expect_get_topic_metadata().returning(|_| {
@@ -90,7 +93,7 @@ mod tests {
             }],
         }];
 
-        let response = produce::handle_produce(&mock, topic_data).unwrap();
+        let response = produce::handle_produce(&mock, topic_data, 1).unwrap();
 
         let partition_response = &response.responses[0].partition_responses[0];
         assert_eq!(
@@ -104,7 +107,7 @@ mod tests {
     fn test_handle_produce_insert_error() {
         let mut mock = MockKafkaStore::new();
 
-        mock.expect_get_or_create_topic().returning(|_| Ok(1));
+        mock.expect_get_or_create_topic().returning(|_, _| Ok(1));
 
         // Return partition count = 1, so partition 0 is valid
         mock.expect_get_topic_metadata().returning(|_| {
@@ -131,7 +134,7 @@ mod tests {
             }],
         }];
 
-        let response = produce::handle_produce(&mock, topic_data).unwrap();
+        let response = produce::handle_produce(&mock, topic_data, 1).unwrap();
 
         let partition_response = &response.responses[0].partition_responses[0];
         assert_eq!(partition_response.error_code, ERROR_UNKNOWN_SERVER_ERROR);
@@ -285,7 +288,7 @@ mod tests {
         });
 
         let response =
-            metadata::handle_metadata(&mock, None, "localhost".to_string(), 9092).unwrap();
+            metadata::handle_metadata(&mock, None, "localhost".to_string(), 9092, 1).unwrap();
 
         assert_eq!(response.topics.len(), 2);
         assert_eq!(response.brokers.len(), 1);
@@ -296,8 +299,11 @@ mod tests {
         let mut mock = MockKafkaStore::new();
 
         mock.expect_get_or_create_topic()
-            .with(mockall::predicate::eq("my-topic"))
-            .returning(|_| Ok(5));
+            .with(
+                mockall::predicate::eq("my-topic"),
+                mockall::predicate::always(),
+            )
+            .returning(|_, _| Ok(5));
 
         mock.expect_get_topic_metadata().returning(|_| {
             Ok(vec![TopicMetadata {
@@ -312,6 +318,7 @@ mod tests {
             Some(vec!["my-topic".to_string()]),
             "localhost".to_string(),
             9092,
+            1,
         )
         .unwrap();
 

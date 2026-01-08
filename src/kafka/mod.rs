@@ -40,6 +40,7 @@ pub mod error;
 pub mod handlers;
 pub mod listener;
 pub mod messages;
+pub mod partitioner;
 pub mod protocol;
 pub mod response_builders;
 pub mod storage;

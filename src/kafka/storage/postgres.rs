@@ -35,8 +35,12 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 impl KafkaStore for PostgresStore {
-    fn get_or_create_topic(&self, name: &str) -> Result<i32> {
-        crate::pg_debug!("PostgresStore::get_or_create_topic: '{}'", name);
+    fn get_or_create_topic(&self, name: &str, default_partitions: i32) -> Result<i32> {
+        crate::pg_debug!(
+            "PostgresStore::get_or_create_topic: '{}' (default_partitions={})",
+            name,
+            default_partitions
+        );
 
         Spi::connect_mut(|client| {
             let topic_name_string = name.to_string();
@@ -47,10 +51,7 @@ impl KafkaStore for PostgresStore {
                  ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
                  RETURNING id",
                 None,
-                &[
-                    topic_name_string.into(),
-                    crate::kafka::DEFAULT_TOPIC_PARTITIONS.into(),
-                ],
+                &[topic_name_string.into(), default_partitions.into()],
             )?;
 
             let topic_id: i32 = table

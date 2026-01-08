@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `pg_kafka` is a PostgreSQL extension written in Rust (via pgrx) that embeds a Kafka-compatible wire protocol listener directly into the Postgres runtime. It allows standard Kafka clients to produce and consume messages using Postgres as the backing store.
 
-**Status:** Phase 6 Complete - Admin APIs (Portfolio/Learning Project)
+**Status:** Phase 7 Complete - Multi-Partition Topics (Portfolio/Learning Project)
 
 **Current Implementation:**
 - ✅ **Phase 1 Complete:** Metadata support (ApiVersions, Metadata requests)
@@ -16,8 +16,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - ✅ **Phase 4 Complete:** Automatic partition assignment strategies (Range, RoundRobin, Sticky)
 - ✅ **Phase 5 Complete:** Automatic rebalancing (LeaveGroup trigger, timeout detection, REBALANCE_IN_PROGRESS)
 - ✅ **Phase 6 Complete:** Admin APIs (CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups)
+- ✅ **Phase 7 Complete:** Multi-Partition Topics (key-based routing, default partition config)
 - ✅ **CI/CD:** GitHub Actions pipeline with automated testing
-- ⏳ **Phase 7:** Shadow Mode (Logical Decoding → external Kafka)
+- ⏳ **Phase 8:** Shadow Mode (Logical Decoding → external Kafka)
 
 **What Works Now:**
 - TCP listener on port 9092 with full Kafka wire protocol parsing
@@ -29,12 +30,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - OffsetCommit/OffsetFetch for consumer progress tracking
 - ListOffsets for earliest/latest offset queries
 - Admin operations: CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups
+- Multi-partition topics with key-based partition routing (murmur2 hash)
 - Dual-offset design (partition_offset + global_offset)
 - Repository Pattern storage abstraction (KafkaStore trait + PostgresStore impl)
 - Automated E2E tests with real Kafka client (rdkafka)
 
 **API Coverage:** 18 of ~50 standard Kafka APIs (36%)
-**Test Status:** All unit tests (166) and E2E tests passing ✅
+**Test Status:** All unit tests (175) and E2E tests (90) passing ✅
 
 ## Development Setup
 
@@ -139,6 +141,7 @@ src/
 │   ├── protocol.rs     # Binary protocol parsing/encoding (uses kafka-protocol crate)
 │   ├── messages.rs     # Request/response types, message queues
 │   ├── coordinator.rs  # Consumer group coordinator (Arc<RwLock> shared state)
+│   ├── partitioner.rs  # Key-based partition routing (murmur2 hash, Phase 7)
 │   ├── response_builders.rs  # Response construction helpers
 │   ├── constants.rs    # Protocol constants and Kafka error codes
 │   ├── error.rs        # Typed errors with Kafka error code mapping (to_kafka_error_code())
@@ -300,6 +303,7 @@ pg_kafka.host = '0.0.0.0'         -- Bind address (default: 0.0.0.0)
 -- Runtime configuration
 pg_kafka.log_connections = false  -- Log each connection
 pg_kafka.shutdown_timeout_ms = 5000
+pg_kafka.default_partitions = 1   -- Default partitions for auto-created topics
 ```
 
 ## Testing with Kafka Clients

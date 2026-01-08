@@ -19,11 +19,19 @@ pub fn handle_api_versions() -> kafka_protocol::messages::api_versions_response:
 ///
 /// Returns metadata for all topics or specific requested topics.
 /// Auto-creates topics if they don't exist when specifically requested.
+///
+/// # Arguments
+/// * `store` - Storage backend
+/// * `requested_topics` - Specific topics to query, or None for all topics
+/// * `broker_host` - Hostname for broker metadata
+/// * `broker_port` - Port for broker metadata
+/// * `default_partitions` - Partition count for auto-created topics
 pub fn handle_metadata(
     store: &impl KafkaStore,
     requested_topics: Option<Vec<String>>,
     broker_host: String,
     broker_port: i32,
+    default_partitions: i32,
 ) -> Result<kafka_protocol::messages::metadata_response::MetadataResponse> {
     let mut response = kafka_protocol::messages::metadata_response::MetadataResponse::default();
 
@@ -65,7 +73,7 @@ pub fn handle_metadata(
             let mut topics_metadata = Vec::new();
             for topic_name in topic_names {
                 // Auto-create topic if it doesn't exist
-                match store.get_or_create_topic(&topic_name) {
+                match store.get_or_create_topic(&topic_name, default_partitions) {
                     Ok(_topic_id) => {
                         // Get the topic's partition count from storage
                         let partition_count = store

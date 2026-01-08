@@ -1,24 +1,25 @@
 # Full Kafka API Compliance Plan for pg_kafka
 
-## Current State (Post Phase 5)
+## Current State (Post Phase 7)
 
-**APIs Implemented:** 14 of ~50 (28%)
-**Tests:** 158 unit + 50+ E2E (all passing)
-**Architecture:** Repository Pattern, typed errors, clean handler structure
+**APIs Implemented:** 18 of ~50 (36%)
+**Tests:** 175 unit + 90 E2E (all passing)
+**Architecture:** Repository Pattern, typed errors, clean handler structure, key-based partition routing
 
 ### Implemented APIs
 | Category | APIs |
 |----------|------|
 | Metadata | ApiVersions (18), Metadata (3) |
-| Producer | Produce (0) |
+| Producer | Produce (0) with key-based partition routing |
 | Consumer | Fetch (1), ListOffsets (2), OffsetCommit (8), OffsetFetch (9) |
 | Coordinator | FindCoordinator (10), JoinGroup (11), SyncGroup (14), Heartbeat (12), LeaveGroup (13), DescribeGroups (15), ListGroups (16) |
+| Admin | CreateTopics (19), DeleteTopics (20), CreatePartitions (37), DeleteGroups (42) |
 
 ---
 
 ## Implementation Phases
 
-### Phase 6: Admin APIs (Priority: HIGH)
+### Phase 6: Admin APIs ✅ COMPLETE
 **Goal:** Programmatic topic and group management
 
 #### 6.1 CreateTopics (API 19)
@@ -59,7 +60,7 @@ fn handle_create_topics(store: &impl KafkaStore, topics: Vec<CreateTopicRequest>
 
 ---
 
-### Phase 7: Multi-Partition Topics (Priority: HIGH)
+### Phase 7: Multi-Partition Topics ✅ COMPLETE
 **Goal:** Enable horizontal scaling with multiple partitions per topic
 
 #### 7.1 Partition Count Configuration

@@ -98,7 +98,10 @@ use kafka_test::{
     test_large_message_value,
     test_list_offsets_empty_topic,
     // Partition tests
+    test_key_distribution,
+    test_key_routing_deterministic,
     test_multi_partition_produce,
+    test_null_key_distribution,
     test_multiple_consumer_groups,
     test_multiple_consumers_same_group,
     // Offset management tests
@@ -330,6 +333,24 @@ fn get_all_tests() -> Vec<TestDef> {
             category: "partition",
             name: "test_multi_partition_produce",
             test_fn: wrap_test!(test_multi_partition_produce),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "partition",
+            name: "test_key_routing_deterministic",
+            test_fn: wrap_test!(test_key_routing_deterministic),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "partition",
+            name: "test_key_distribution",
+            test_fn: wrap_test!(test_key_distribution),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "partition",
+            name: "test_null_key_distribution",
+            test_fn: wrap_test!(test_null_key_distribution),
             parallel_safe: true,
         },
         // Error path tests

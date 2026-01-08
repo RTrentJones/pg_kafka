@@ -67,7 +67,10 @@ pub use consumer_group::{
     test_consumer_group_lifecycle, test_rebalance_after_leave, test_session_timeout_rebalance,
 };
 pub use offset_management::{test_offset_boundaries, test_offset_commit_fetch};
-pub use partition::test_multi_partition_produce;
+pub use partition::{
+    test_key_distribution, test_key_routing_deterministic, test_multi_partition_produce,
+    test_null_key_distribution,
+};
 pub use producer::{test_batch_produce, test_producer};
 
 // Re-export new test functions

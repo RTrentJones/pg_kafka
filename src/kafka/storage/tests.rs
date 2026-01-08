@@ -102,11 +102,14 @@ mod tests {
         let mut mock = MockKafkaStore::new();
 
         mock.expect_get_or_create_topic()
-            .with(mockall::predicate::eq("new-topic"))
+            .with(
+                mockall::predicate::eq("new-topic"),
+                mockall::predicate::eq(1),
+            )
             .times(1)
-            .returning(|_| Ok(1));
+            .returning(|_, _| Ok(1));
 
-        let result = mock.get_or_create_topic("new-topic");
+        let result = mock.get_or_create_topic("new-topic", 1);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 1);
     }
@@ -116,9 +119,9 @@ mod tests {
         let mut mock = MockKafkaStore::new();
 
         mock.expect_get_or_create_topic()
-            .returning(|_| Err(KafkaError::database("connection failed")));
+            .returning(|_, _| Err(KafkaError::database("connection failed")));
 
-        let result = mock.get_or_create_topic("any-topic");
+        let result = mock.get_or_create_topic("any-topic", 1);
         assert!(result.is_err());
     }
 
@@ -359,7 +362,7 @@ mod tests {
         // Set up multiple expectations for a realistic scenario
         mock.expect_get_or_create_topic()
             .times(1)
-            .returning(|_| Ok(1));
+            .returning(|_, _| Ok(1));
 
         mock.expect_insert_records()
             .times(1)
@@ -370,7 +373,7 @@ mod tests {
             .returning(|_, _| Ok(1));
 
         // Execute in sequence
-        let topic_id = mock.get_or_create_topic("test").unwrap();
+        let topic_id = mock.get_or_create_topic("test", 1).unwrap();
         assert_eq!(topic_id, 1);
 
         let base_offset = mock.insert_records(1, 0, &[]).unwrap();
