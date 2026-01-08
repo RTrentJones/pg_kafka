@@ -118,7 +118,7 @@ jobs:
     - name: Install System Dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y libpq-dev libreadline-dev zlib1g-dev flex bison libxml2-dev libxslt-dev libssl-dev libsasl2-dev netcat-openbsd
+        sudo apt-get install -y libpq-dev libreadline-dev zlib1g-dev flex bison libxml2-dev libxslt-dev libssl-dev libsasl2-dev libzstd-dev netcat-openbsd
 
     # ------------------------------------------------------------------
     # OPTIMIZATION: Cache the CLI tool to avoid compiling it every run
