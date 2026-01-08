@@ -18,28 +18,30 @@ use tokio::sync::mpsc::UnboundedSender;
 /// This eliminates repetitive error handling boilerplate across all request handlers.
 /// It handles both success and error cases uniformly:
 /// - On success: wraps the result using the provided wrapper function and sends
-/// - On error: logs the error, creates an error response, and sends
+/// - On error: wraps the error using the error wrapper function and sends an API-specific error response
 ///
 /// # Type Parameters
 /// * `R` - The handler's successful response type
 /// * `F` - Handler function type
 /// * `W` - Response wrapper function type
+/// * `E` - Error wrapper function type
 ///
 /// # Arguments
 /// * `handler_name` - Name of the handler for logging
-/// * `correlation_id` - Request correlation ID for response/error
 /// * `response_tx` - Channel to send the response
 /// * `handler` - The handler function to call
 /// * `wrap_response` - Function to wrap successful result into KafkaResponse
-pub fn dispatch_response<R, F, W>(
+/// * `wrap_error` - Function to wrap error code into API-specific KafkaResponse
+pub fn dispatch_response<R, F, W, E>(
     handler_name: &str,
-    correlation_id: i32,
     response_tx: UnboundedSender<KafkaResponse>,
     handler: F,
     wrap_response: W,
+    wrap_error: E,
 ) where
     F: FnOnce() -> Result<R, KafkaError>,
     W: FnOnce(R) -> KafkaResponse,
+    E: FnOnce(i16) -> KafkaResponse,
 {
     match handler() {
         Ok(result) => {
@@ -52,11 +54,7 @@ pub fn dispatch_response<R, F, W>(
         }
         Err(e) => {
             pg_warning!("Failed to handle {} request: {}", handler_name, e);
-            let error_response = KafkaResponse::Error {
-                correlation_id,
-                error_code: e.to_kafka_error_code(),
-                error_message: Some(format!("Failed to handle {} request: {}", handler_name, e)),
-            };
+            let error_response = wrap_error(e.to_kafka_error_code());
             if let Err(send_err) = response_tx.send(error_response) {
                 pg_warning!("Failed to send error response: {}", send_err);
             }
@@ -97,13 +95,17 @@ mod tests {
 
         dispatch_response(
             "Test",
-            42,
             tx,
             || Ok::<i32, KafkaError>(100),
             |result| KafkaResponse::Error {
                 correlation_id: result,
                 error_code: 0,
                 error_message: None,
+            },
+            |error_code| KafkaResponse::Error {
+                correlation_id: 42,
+                error_code,
+                error_message: Some("error".to_string()),
             },
         );
 
@@ -127,7 +129,6 @@ mod tests {
 
         dispatch_response(
             "Test",
-            42,
             tx,
             || Err::<i32, KafkaError>(KafkaError::Internal("test error".into())),
             |_result| KafkaResponse::Error {
@@ -135,17 +136,24 @@ mod tests {
                 error_code: 0,
                 error_message: None,
             },
+            |error_code| KafkaResponse::Error {
+                correlation_id: 42,
+                error_code,
+                error_message: Some("API-specific error".to_string()),
+            },
         );
 
         let response = rx.try_recv().expect("Should receive error response");
         match response {
             KafkaResponse::Error {
                 correlation_id,
+                error_code,
                 error_message,
-                ..
             } => {
                 assert_eq!(correlation_id, 42);
-                assert!(error_message.unwrap().contains("test error"));
+                // Error code for Internal is -1 (see error.rs)
+                assert_eq!(error_code, -1);
+                assert_eq!(error_message.unwrap(), "API-specific error");
             }
             _ => panic!("Expected error response"),
         }

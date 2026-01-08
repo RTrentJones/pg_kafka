@@ -9,12 +9,12 @@ This document lists intentional deviations from the official Kafka protocol spec
 | Category | Status |
 |----------|--------|
 | **Producer APIs** | ✅ Full support (with documented limitations) |
-| **Consumer APIs** | ✅ Full support (manual partition assignment) |
-| **Coordinator APIs** | ✅ Partial (no automatic rebalancing) |
-| **Admin APIs** | ❌ Not implemented |
+| **Consumer APIs** | ✅ Full support (with automatic rebalancing) |
+| **Coordinator APIs** | ✅ Full support (Range, RoundRobin, Sticky strategies) |
+| **Admin APIs** | ✅ Full support (CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups) |
 | **Transaction APIs** | ❌ Not planned |
 
-**Current Implementation:** Phase 3B Complete
+**Current Implementation:** Phase 6 Complete
 
 ## Producer API Deviations
 
@@ -327,7 +327,7 @@ auto.offset.reset=earliest
 
 ---
 
-**Last Updated:** 2026-01-06
-**Applies To:** pg_kafka Phase 3B Complete
-**API Coverage:** 12 of ~50 Kafka APIs (24%)
-**Test Status:** 73 tests passing (68 unit + 5 E2E)
+**Last Updated:** 2026-01-08
+**Applies To:** pg_kafka Phase 6 Complete
+**API Coverage:** 18 of ~50 Kafka APIs (36%)
+**Test Status:** 201 unit tests + 61 E2E tests passing

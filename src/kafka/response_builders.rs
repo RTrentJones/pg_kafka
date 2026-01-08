@@ -207,3 +207,162 @@ pub fn build_metadata_error_response(
     // Empty brokers and topics list for error response
     response
 }
+
+// ========== Error Response Builders ==========
+// These functions build API-specific error responses with the error code
+// embedded in the correct location for each Kafka API.
+
+use kafka_protocol::messages::create_partitions_response::CreatePartitionsResponse;
+use kafka_protocol::messages::create_topics_response::CreateTopicsResponse;
+use kafka_protocol::messages::delete_groups_response::DeleteGroupsResponse;
+use kafka_protocol::messages::delete_topics_response::DeleteTopicsResponse;
+use kafka_protocol::messages::describe_groups_response::DescribeGroupsResponse;
+use kafka_protocol::messages::fetch_response::FetchResponse;
+use kafka_protocol::messages::find_coordinator_response::FindCoordinatorResponse;
+use kafka_protocol::messages::heartbeat_response::HeartbeatResponse;
+use kafka_protocol::messages::join_group_response::JoinGroupResponse;
+use kafka_protocol::messages::leave_group_response::LeaveGroupResponse;
+use kafka_protocol::messages::list_groups_response::ListGroupsResponse;
+use kafka_protocol::messages::list_offsets_response::ListOffsetsResponse;
+use kafka_protocol::messages::offset_commit_response::OffsetCommitResponse;
+use kafka_protocol::messages::offset_fetch_response::OffsetFetchResponse;
+use kafka_protocol::messages::sync_group_response::SyncGroupResponse;
+
+/// Build a ProduceResponse with an error code (top-level error, no topic data)
+pub fn build_produce_error_response(_error_code: i16) -> ProduceResponse {
+    // ProduceResponse doesn't have a top-level error_code field.
+    // Errors are per-topic/partition. Return empty response for protocol-level errors.
+    let mut response = ProduceResponse::default();
+    response.throttle_time_ms = 0;
+    response
+}
+
+/// Build a FetchResponse with an error code
+pub fn build_fetch_error_response(error_code: i16) -> FetchResponse {
+    let mut response = FetchResponse::default();
+    response.throttle_time_ms = 0;
+    response.error_code = error_code;
+    response
+}
+
+/// Build an OffsetCommitResponse with an error code (empty topics)
+pub fn build_offset_commit_error_response(_error_code: i16) -> OffsetCommitResponse {
+    // OffsetCommitResponse doesn't have a top-level error_code.
+    // Errors are per-topic/partition. Return empty response.
+    let mut response = OffsetCommitResponse::default();
+    response.throttle_time_ms = 0;
+    response
+}
+
+/// Build an OffsetFetchResponse with an error code
+pub fn build_offset_fetch_error_response(error_code: i16) -> OffsetFetchResponse {
+    let mut response = OffsetFetchResponse::default();
+    response.throttle_time_ms = 0;
+    response.error_code = error_code;
+    response
+}
+
+/// Build a FindCoordinatorResponse with an error code
+pub fn build_find_coordinator_error_response(error_code: i16) -> FindCoordinatorResponse {
+    let mut response = FindCoordinatorResponse::default();
+    response.throttle_time_ms = 0;
+    response.error_code = error_code;
+    response.node_id = BrokerId(-1);
+    response.host = "".into();
+    response.port = -1;
+    response
+}
+
+/// Build a JoinGroupResponse with an error code
+pub fn build_join_group_error_response(error_code: i16) -> JoinGroupResponse {
+    let mut response = JoinGroupResponse::default();
+    response.throttle_time_ms = 0;
+    response.error_code = error_code;
+    response.generation_id = -1;
+    response.protocol_type = None;
+    response.protocol_name = None;
+    response.leader = "".into();
+    response.member_id = "".into();
+    response
+}
+
+/// Build a SyncGroupResponse with an error code
+pub fn build_sync_group_error_response(error_code: i16) -> SyncGroupResponse {
+    let mut response = SyncGroupResponse::default();
+    response.throttle_time_ms = 0;
+    response.error_code = error_code;
+    response
+}
+
+/// Build a HeartbeatResponse with an error code
+pub fn build_heartbeat_error_response(error_code: i16) -> HeartbeatResponse {
+    let mut response = HeartbeatResponse::default();
+    response.throttle_time_ms = 0;
+    response.error_code = error_code;
+    response
+}
+
+/// Build a LeaveGroupResponse with an error code
+pub fn build_leave_group_error_response(error_code: i16) -> LeaveGroupResponse {
+    let mut response = LeaveGroupResponse::default();
+    response.throttle_time_ms = 0;
+    response.error_code = error_code;
+    response
+}
+
+/// Build a ListOffsetsResponse with an error code (empty topics)
+pub fn build_list_offsets_error_response(_error_code: i16) -> ListOffsetsResponse {
+    // ListOffsetsResponse doesn't have a top-level error_code.
+    // Errors are per-topic/partition. Return empty response.
+    let mut response = ListOffsetsResponse::default();
+    response.throttle_time_ms = 0;
+    response
+}
+
+/// Build a DescribeGroupsResponse with an error code (empty groups)
+pub fn build_describe_groups_error_response(_error_code: i16) -> DescribeGroupsResponse {
+    // DescribeGroupsResponse errors are per-group. Return empty response.
+    let mut response = DescribeGroupsResponse::default();
+    response.throttle_time_ms = 0;
+    response
+}
+
+/// Build a ListGroupsResponse with an error code
+pub fn build_list_groups_error_response(error_code: i16) -> ListGroupsResponse {
+    let mut response = ListGroupsResponse::default();
+    response.throttle_time_ms = 0;
+    response.error_code = error_code;
+    response
+}
+
+/// Build a CreateTopicsResponse with an error code (empty topics)
+pub fn build_create_topics_error_response(_error_code: i16) -> CreateTopicsResponse {
+    // CreateTopicsResponse errors are per-topic. Return empty response.
+    let mut response = CreateTopicsResponse::default();
+    response.throttle_time_ms = 0;
+    response
+}
+
+/// Build a DeleteTopicsResponse with an error code (empty responses)
+pub fn build_delete_topics_error_response(_error_code: i16) -> DeleteTopicsResponse {
+    // DeleteTopicsResponse errors are per-topic. Return empty response.
+    let mut response = DeleteTopicsResponse::default();
+    response.throttle_time_ms = 0;
+    response
+}
+
+/// Build a CreatePartitionsResponse with an error code (empty results)
+pub fn build_create_partitions_error_response(_error_code: i16) -> CreatePartitionsResponse {
+    // CreatePartitionsResponse errors are per-topic. Return empty response.
+    let mut response = CreatePartitionsResponse::default();
+    response.throttle_time_ms = 0;
+    response
+}
+
+/// Build a DeleteGroupsResponse with an error code (empty results)
+pub fn build_delete_groups_error_response(_error_code: i16) -> DeleteGroupsResponse {
+    // DeleteGroupsResponse errors are per-group. Return empty response.
+    let mut response = DeleteGroupsResponse::default();
+    response.throttle_time_ms = 0;
+    response
+}

@@ -227,15 +227,20 @@ pub fn encode_response(response: KafkaResponse) -> Result<BytesMut> {
             error_code,
             error_message,
         } => {
-            // LIMITATION: Hand-rolled error response encoding
-            // ===============================================
-            // This is a simplified error response that may not match the expected format
-            // for the specific API that triggered the error. Real Kafka clients might fail
-            // to parse this if they expect a properly-formatted error response for their API.
+            // Protocol/Decoding Error Response
+            // =================================
+            // This variant is used ONLY for protocol-level errors that occur during request
+            // decoding, BEFORE we know which API is being requested. Examples:
+            // - Invalid request header
+            // - Unsupported API key
+            // - Decode failures before API type is determined
             //
-            // TODO(Phase 2): Match error response format to the specific API key that failed.
-            // For example, if ApiVersions fails, return a proper ApiVersionsResponse with error_code set.
-            // For now, this works with kcat which is lenient about error responses.
+            // For handler-level errors (after we know the API type), use the appropriate
+            // API-specific error response via the dispatch mechanism in worker.rs.
+            //
+            // Note: This hand-rolled format works with lenient clients like kcat, but strict
+            // clients may fail to parse it. This is acceptable since these are protocol errors
+            // that shouldn't happen in normal operation.
             let header = ResponseHeader::default().with_correlation_id(correlation_id);
             header.encode(&mut response_buf, 0)?;
 

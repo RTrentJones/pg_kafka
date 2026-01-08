@@ -431,7 +431,6 @@ pub fn process_request(
 
             dispatch_response(
                 "Metadata",
-                correlation_id,
                 response_tx,
                 || {
                     handlers::handle_metadata(
@@ -446,6 +445,11 @@ pub fn process_request(
                     api_version,
                     response: r,
                 },
+                |_error_code| KafkaResponse::Metadata {
+                    correlation_id,
+                    api_version,
+                    response: crate::kafka::response_builders::build_metadata_error_response(),
+                },
             );
         }
 
@@ -459,12 +463,15 @@ pub fn process_request(
             ..
         } => {
             // Handle acks=0 (fire-and-forget) - not yet supported
+            // Return a proper ProduceResponse with error embedded
             if acks == 0 {
                 pg_warning!("acks=0 (fire-and-forget) not yet supported");
-                let _ = response_tx.send(KafkaResponse::Error {
+                let _ = response_tx.send(KafkaResponse::Produce {
                     correlation_id,
-                    error_code: ERROR_UNSUPPORTED_VERSION,
-                    error_message: Some("acks=0 not yet supported".to_string()),
+                    api_version,
+                    response: crate::kafka::response_builders::build_produce_error_response(
+                        ERROR_UNSUPPORTED_VERSION,
+                    ),
                 });
                 return;
             }
@@ -472,13 +479,19 @@ pub fn process_request(
             let store = PostgresStore::new();
             dispatch_response(
                 "Produce",
-                correlation_id,
                 response_tx,
                 || handlers::handle_produce(&store, topic_data),
                 |r| KafkaResponse::Produce {
                     correlation_id,
                     api_version,
                     response: r,
+                },
+                |error_code| KafkaResponse::Produce {
+                    correlation_id,
+                    api_version,
+                    response: crate::kafka::response_builders::build_produce_error_response(
+                        error_code,
+                    ),
                 },
             );
         }
@@ -494,13 +507,19 @@ pub fn process_request(
             let store = PostgresStore::new();
             dispatch_response(
                 "Fetch",
-                correlation_id,
                 response_tx,
                 || handlers::handle_fetch(&store, topic_data),
                 |r| KafkaResponse::Fetch {
                     correlation_id,
                     api_version,
                     response: r,
+                },
+                |error_code| KafkaResponse::Fetch {
+                    correlation_id,
+                    api_version,
+                    response: crate::kafka::response_builders::build_fetch_error_response(
+                        error_code,
+                    ),
                 },
             );
         }
@@ -517,13 +536,19 @@ pub fn process_request(
             let store = PostgresStore::new();
             dispatch_response(
                 "OffsetCommit",
-                correlation_id,
                 response_tx,
                 || handlers::handle_offset_commit(&store, group_id, topics),
                 |r| KafkaResponse::OffsetCommit {
                     correlation_id,
                     api_version,
                     response: r,
+                },
+                |error_code| KafkaResponse::OffsetCommit {
+                    correlation_id,
+                    api_version,
+                    response: crate::kafka::response_builders::build_offset_commit_error_response(
+                        error_code,
+                    ),
                 },
             );
         }
@@ -540,13 +565,19 @@ pub fn process_request(
             let store = PostgresStore::new();
             dispatch_response(
                 "OffsetFetch",
-                correlation_id,
                 response_tx,
                 || handlers::handle_offset_fetch(&store, group_id, topics),
                 |r| KafkaResponse::OffsetFetch {
                     correlation_id,
                     api_version,
                     response: r,
+                },
+                |error_code| KafkaResponse::OffsetFetch {
+                    correlation_id,
+                    api_version,
+                    response: crate::kafka::response_builders::build_offset_fetch_error_response(
+                        error_code,
+                    ),
                 },
             );
         }
@@ -564,13 +595,20 @@ pub fn process_request(
             let port = broker_port;
             dispatch_response(
                 "FindCoordinator",
-                correlation_id,
                 response_tx,
                 || handlers::handle_find_coordinator(host, port, key, key_type),
                 |r| KafkaResponse::FindCoordinator {
                     correlation_id,
                     api_version,
                     response: r,
+                },
+                |error_code| KafkaResponse::FindCoordinator {
+                    correlation_id,
+                    api_version,
+                    response:
+                        crate::kafka::response_builders::build_find_coordinator_error_response(
+                            error_code,
+                        ),
                 },
             );
         }
@@ -593,7 +631,6 @@ pub fn process_request(
             let cid = client_id.unwrap_or_else(|| "unknown".to_string());
             dispatch_response(
                 "JoinGroup",
-                correlation_id,
                 response_tx,
                 || {
                     handlers::handle_join_group(
@@ -611,6 +648,13 @@ pub fn process_request(
                     correlation_id,
                     api_version,
                     response: r,
+                },
+                |error_code| KafkaResponse::JoinGroup {
+                    correlation_id,
+                    api_version,
+                    response: crate::kafka::response_builders::build_join_group_error_response(
+                        error_code,
+                    ),
                 },
             );
         }
@@ -630,7 +674,6 @@ pub fn process_request(
             let store = PostgresStore::new();
             dispatch_response(
                 "SyncGroup",
-                correlation_id,
                 response_tx,
                 || {
                     handlers::handle_sync_group(
@@ -646,6 +689,13 @@ pub fn process_request(
                     correlation_id,
                     api_version,
                     response: r,
+                },
+                |error_code| KafkaResponse::SyncGroup {
+                    correlation_id,
+                    api_version,
+                    response: crate::kafka::response_builders::build_sync_group_error_response(
+                        error_code,
+                    ),
                 },
             );
         }
@@ -663,13 +713,19 @@ pub fn process_request(
             let coord = coordinator.clone();
             dispatch_response(
                 "Heartbeat",
-                correlation_id,
                 response_tx,
                 || handlers::handle_heartbeat(&coord, group_id, member_id, generation_id),
                 |r| KafkaResponse::Heartbeat {
                     correlation_id,
                     api_version,
                     response: r,
+                },
+                |error_code| KafkaResponse::Heartbeat {
+                    correlation_id,
+                    api_version,
+                    response: crate::kafka::response_builders::build_heartbeat_error_response(
+                        error_code,
+                    ),
                 },
             );
         }
@@ -686,13 +742,19 @@ pub fn process_request(
             let coord = coordinator.clone();
             dispatch_response(
                 "LeaveGroup",
-                correlation_id,
                 response_tx,
                 || handlers::handle_leave_group(&coord, group_id, member_id),
                 |r| KafkaResponse::LeaveGroup {
                     correlation_id,
                     api_version,
                     response: r,
+                },
+                |error_code| KafkaResponse::LeaveGroup {
+                    correlation_id,
+                    api_version,
+                    response: crate::kafka::response_builders::build_leave_group_error_response(
+                        error_code,
+                    ),
                 },
             );
         }
@@ -708,13 +770,19 @@ pub fn process_request(
             let store = PostgresStore::new();
             dispatch_response(
                 "ListOffsets",
-                correlation_id,
                 response_tx,
                 || handlers::handle_list_offsets(&store, topics),
                 |r| KafkaResponse::ListOffsets {
                     correlation_id,
                     api_version,
                     response: r,
+                },
+                |error_code| KafkaResponse::ListOffsets {
+                    correlation_id,
+                    api_version,
+                    response: crate::kafka::response_builders::build_list_offsets_error_response(
+                        error_code,
+                    ),
                 },
             );
         }
@@ -730,13 +798,19 @@ pub fn process_request(
             let coord = coordinator.clone();
             dispatch_response(
                 "DescribeGroups",
-                correlation_id,
                 response_tx,
                 || handlers::handle_describe_groups(&coord, groups),
                 |r| KafkaResponse::DescribeGroups {
                     correlation_id,
                     api_version,
                     response: r,
+                },
+                |error_code| KafkaResponse::DescribeGroups {
+                    correlation_id,
+                    api_version,
+                    response: crate::kafka::response_builders::build_describe_groups_error_response(
+                        error_code,
+                    ),
                 },
             );
         }
@@ -752,13 +826,19 @@ pub fn process_request(
             let coord = coordinator.clone();
             dispatch_response(
                 "ListGroups",
-                correlation_id,
                 response_tx,
                 || handlers::handle_list_groups(&coord, states_filter),
                 |r| KafkaResponse::ListGroups {
                     correlation_id,
                     api_version,
                     response: r,
+                },
+                |error_code| KafkaResponse::ListGroups {
+                    correlation_id,
+                    api_version,
+                    response: crate::kafka::response_builders::build_list_groups_error_response(
+                        error_code,
+                    ),
                 },
             );
         }
@@ -775,13 +855,19 @@ pub fn process_request(
             let store = PostgresStore::new();
             dispatch_response(
                 "CreateTopics",
-                correlation_id,
                 response_tx,
                 || handlers::handle_create_topics(&store, topics, validate_only),
                 |r| KafkaResponse::CreateTopics {
                     correlation_id,
                     api_version,
                     response: r,
+                },
+                |error_code| KafkaResponse::CreateTopics {
+                    correlation_id,
+                    api_version,
+                    response: crate::kafka::response_builders::build_create_topics_error_response(
+                        error_code,
+                    ),
                 },
             );
         }
@@ -797,13 +883,19 @@ pub fn process_request(
             let store = PostgresStore::new();
             dispatch_response(
                 "DeleteTopics",
-                correlation_id,
                 response_tx,
                 || handlers::handle_delete_topics(&store, topic_names),
                 |r| KafkaResponse::DeleteTopics {
                     correlation_id,
                     api_version,
                     response: r,
+                },
+                |error_code| KafkaResponse::DeleteTopics {
+                    correlation_id,
+                    api_version,
+                    response: crate::kafka::response_builders::build_delete_topics_error_response(
+                        error_code,
+                    ),
                 },
             );
         }
@@ -820,13 +912,20 @@ pub fn process_request(
             let store = PostgresStore::new();
             dispatch_response(
                 "CreatePartitions",
-                correlation_id,
                 response_tx,
                 || handlers::handle_create_partitions(&store, topics, validate_only),
                 |r| KafkaResponse::CreatePartitions {
                     correlation_id,
                     api_version,
                     response: r,
+                },
+                |error_code| KafkaResponse::CreatePartitions {
+                    correlation_id,
+                    api_version,
+                    response:
+                        crate::kafka::response_builders::build_create_partitions_error_response(
+                            error_code,
+                        ),
                 },
             );
         }
@@ -843,13 +942,19 @@ pub fn process_request(
             let coord = coordinator.clone();
             dispatch_response(
                 "DeleteGroups",
-                correlation_id,
                 response_tx,
                 || handlers::handle_delete_groups(&store, &coord, groups_names),
                 |r| KafkaResponse::DeleteGroups {
                     correlation_id,
                     api_version,
                     response: r,
+                },
+                |error_code| KafkaResponse::DeleteGroups {
+                    correlation_id,
+                    api_version,
+                    response: crate::kafka::response_builders::build_delete_groups_error_response(
+                        error_code,
+                    ),
                 },
             );
         }

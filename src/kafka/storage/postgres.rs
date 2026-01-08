@@ -226,8 +226,12 @@ impl KafkaStore for PostgresStore {
             max_bytes
         );
 
-        // Calculate limit based on max_bytes (rough estimate: ~1KB per message)
-        let limit = std::cmp::min(max_bytes / 1024, 1000);
+        // Calculate limit based on max_bytes
+        // Use conservative estimate of ~100 bytes per message minimum to avoid starving
+        // high-throughput consumers with small messages. The hard cap is raised to 10,000
+        // rows since the actual byte limit is enforced when building the response.
+        // Note: max_bytes is typically 1MB (1,048,576), giving limit of 10,000 with /100.
+        let limit = (max_bytes / 100).clamp(100, 10_000);
 
         Spi::connect(|client| {
             let table = client.select(

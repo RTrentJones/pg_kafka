@@ -377,7 +377,7 @@ To debug:
 
 ## Non-Goals (v1)
 
-- Full Protocol Compliance: No Transactions or Compression support
+- Full Protocol Compliance: No Transactions, Compression, or acks=0 (fire-and-forget) support
 - High Availability: Rely on standard Postgres HA (Patroni/RDS) rather than Kafka's ISR
 - Broker Clustering: Single-node "broker" design
 
