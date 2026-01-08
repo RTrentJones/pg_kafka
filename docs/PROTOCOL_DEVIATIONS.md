@@ -14,7 +14,7 @@ This document lists intentional deviations from the official Kafka protocol spec
 | **Admin APIs** | ✅ Full support (CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups) |
 | **Transaction APIs** | ❌ Not planned |
 
-**Current Implementation:** Phase 7 Complete
+**Current Implementation:** Phase 7 Complete + Long Polling Enhancement
 
 ## Producer API Deviations
 
@@ -136,14 +136,14 @@ This document lists intentional deviations from the official Kafka protocol spec
 - ✅ RecordBatch v2 encoding
 - ✅ Empty fetch responses (returns empty bytes)
 - ✅ Partition watermarks (high watermark, log start offset)
+- ✅ Long polling (max_wait_ms/min_bytes support) - Phase 8
 
 **What's Missing:**
-- ❌ Long polling optimization (no LISTEN/NOTIFY yet)
 - ❌ Fetch sessions (always uses fetch session ID 0)
 
 **Client Impact:**
 - Works with standard Kafka clients
-- May have higher CPU usage due to polling
+- Low latency with long polling enabled (default: on)
 
 ### 8. ListOffsets ✅ Implemented
 
@@ -326,6 +326,6 @@ auto.offset.reset=earliest
 ---
 
 **Last Updated:** 2026-01-08
-**Applies To:** pg_kafka Phase 7 Complete
+**Applies To:** pg_kafka Phase 7 Complete + Long Polling
 **API Coverage:** 18 of ~50 Kafka APIs (36%)
-**Test Status:** 175 unit tests + 90 E2E tests passing
+**Test Status:** 181 unit tests + 69 E2E tests passing

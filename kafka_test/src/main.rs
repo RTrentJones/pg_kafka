@@ -119,6 +119,11 @@ use kafka_test::{
     test_producer,
     test_rejoin_after_leave,
     test_single_partition_topic,
+    // Long polling tests
+    test_long_poll_immediate_return,
+    test_long_poll_multiple_waiters,
+    test_long_poll_producer_wakeup,
+    test_long_poll_timeout,
 };
 
 type TestFn = fn() -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error>>> + Send>>;
@@ -610,6 +615,31 @@ fn get_all_tests() -> Vec<TestDef> {
             test_fn: wrap_test!(test_batch_vs_single_performance),
             parallel_safe: false,
         },
+        // Long polling tests (Phase 8)
+        TestDef {
+            category: "long_poll",
+            name: "test_long_poll_immediate_return",
+            test_fn: wrap_test!(test_long_poll_immediate_return),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "long_poll",
+            name: "test_long_poll_timeout",
+            test_fn: wrap_test!(test_long_poll_timeout),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "long_poll",
+            name: "test_long_poll_producer_wakeup",
+            test_fn: wrap_test!(test_long_poll_producer_wakeup),
+            parallel_safe: false, // Tests timing-sensitive behavior
+        },
+        TestDef {
+            category: "long_poll",
+            name: "test_long_poll_multiple_waiters",
+            test_fn: wrap_test!(test_long_poll_multiple_waiters),
+            parallel_safe: false, // Tests timing-sensitive behavior
+        },
     ]
 }
 
@@ -715,8 +745,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         print_test_list(&all_tests);
         println!("\nCategories: admin, producer, consumer, offset_management, consumer_group,");
         println!(
-            "            partition, error_paths, edge_cases, concurrent, negative, performance"
+            "            partition, error_paths, edge_cases, concurrent, negative, performance,"
         );
+        println!("            long_poll");
         return Ok(());
     }
 

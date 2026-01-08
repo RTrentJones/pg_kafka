@@ -15,9 +15,10 @@
 //! - **partition**: Multi-partition functionality tests
 //! - **error_paths**: Error condition tests (16 tests)
 //! - **edge_cases**: Boundary and edge case tests (11 tests)
-//! - **concurrent**: Concurrency tests (7 tests)
+//! - **concurrent**: Concurrency tests (8 tests)
 //! - **negative**: Expected failure tests (4 tests)
 //! - **performance**: Throughput baseline tests (3 tests)
+//! - **long_poll**: Long polling tests (4 tests)
 //!
 //! ## Usage
 //!
@@ -48,6 +49,7 @@ pub mod consumer;
 pub mod consumer_group;
 pub mod edge_cases;
 pub mod error_paths;
+pub mod long_poll;
 pub mod negative;
 pub mod offset_management;
 pub mod partition;
@@ -107,4 +109,10 @@ pub use admin::{
     test_create_multiple_topics, test_create_partitions, test_create_partitions_cannot_decrease,
     test_create_topic, test_create_topic_already_exists, test_delete_group_empty,
     test_delete_group_non_empty, test_delete_topic, test_delete_topic_not_found,
+};
+
+// Long polling tests (Phase 8)
+pub use long_poll::{
+    test_long_poll_immediate_return, test_long_poll_multiple_waiters,
+    test_long_poll_producer_wakeup, test_long_poll_timeout,
 };

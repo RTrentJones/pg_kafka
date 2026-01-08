@@ -215,7 +215,7 @@ pub async fn test_key_distribution() -> TestResult {
 pub async fn test_null_key_distribution() -> TestResult {
     println!("=== Test: Null Key Distribution ===\n");
 
-    let topic = "null-key-distribution";
+    let topic = format!("null-key-dist-{}", uuid::Uuid::new_v4());
     let num_partitions = 4i32;
     let num_messages = 50;
 
@@ -246,7 +246,7 @@ pub async fn test_null_key_distribution() -> TestResult {
         let value = format!("value-{}", i);
 
         // No key specified
-        let record = FutureRecord::<(), str>::to(topic).payload(&value);
+        let record = FutureRecord::<(), str>::to(&topic).payload(&value);
 
         match producer.send(record, Duration::from_secs(5)).await {
             Ok((partition, _offset)) => {

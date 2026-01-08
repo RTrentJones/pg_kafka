@@ -67,6 +67,7 @@ mock! {
 ///
 /// Avoids calling pgrx GUC functions which require Postgres runtime
 pub fn mock_config() -> crate::config::Config {
+    use crate::kafka::constants::DEFAULT_FETCH_POLL_INTERVAL_MS;
     crate::config::Config {
         port: DEFAULT_KAFKA_PORT,
         host: TEST_HOST.to_string(),
@@ -74,6 +75,8 @@ pub fn mock_config() -> crate::config::Config {
         log_connections: false,
         shutdown_timeout_ms: DEFAULT_SHUTDOWN_TIMEOUT_MS,
         default_partitions: DEFAULT_TOPIC_PARTITIONS,
+        fetch_poll_interval_ms: DEFAULT_FETCH_POLL_INTERVAL_MS,
+        enable_long_polling: true,
     }
 }
 

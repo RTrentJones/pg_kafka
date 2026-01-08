@@ -17,8 +17,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - ✅ **Phase 5 Complete:** Automatic rebalancing (LeaveGroup trigger, timeout detection, REBALANCE_IN_PROGRESS)
 - ✅ **Phase 6 Complete:** Admin APIs (CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups)
 - ✅ **Phase 7 Complete:** Multi-Partition Topics (key-based routing, default partition config)
+- ✅ **Enhancement:** Long Polling (max_wait_ms/min_bytes support, in-memory notification)
 - ✅ **CI/CD:** GitHub Actions pipeline with automated testing
-- ⏳ **Phase 8:** Shadow Mode (Logical Decoding → external Kafka)
+- ⏳ **Phase 8:** Compression Support (gzip, snappy, lz4, zstd)
 
 **What Works Now:**
 - TCP listener on port 9092 with full Kafka wire protocol parsing

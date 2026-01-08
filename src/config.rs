@@ -8,8 +8,9 @@
 use pgrx::{GucContext, GucFlags, GucRegistry, GucSetting};
 
 use crate::kafka::constants::{
-    DEFAULT_DATABASE, DEFAULT_KAFKA_PORT, DEFAULT_SHUTDOWN_TIMEOUT_MS, DEFAULT_TOPIC_PARTITIONS,
-    MIN_SHUTDOWN_TIMEOUT_MS,
+    DEFAULT_DATABASE, DEFAULT_FETCH_POLL_INTERVAL_MS, DEFAULT_KAFKA_PORT,
+    DEFAULT_SHUTDOWN_TIMEOUT_MS, DEFAULT_TOPIC_PARTITIONS, MAX_FETCH_POLL_INTERVAL_MS,
+    MIN_FETCH_POLL_INTERVAL_MS, MIN_SHUTDOWN_TIMEOUT_MS,
 };
 
 #[cfg(not(test))]
@@ -26,6 +27,10 @@ pub struct Config {
     pub log_connections: bool,
     pub shutdown_timeout_ms: i32,
     pub default_partitions: i32,
+    /// Polling interval for long polling fallback (milliseconds)
+    pub fetch_poll_interval_ms: i32,
+    /// Whether long polling is enabled
+    pub enable_long_polling: bool,
 }
 
 impl Config {
@@ -47,6 +52,8 @@ impl Config {
             log_connections: LOG_CONNECTIONS.get(),
             shutdown_timeout_ms: SHUTDOWN_TIMEOUT_MS.get(),
             default_partitions: DEFAULT_PARTITIONS.get(),
+            fetch_poll_interval_ms: FETCH_POLL_INTERVAL_MS.get(),
+            enable_long_polling: ENABLE_LONG_POLLING.get(),
         }
     }
 
@@ -60,6 +67,8 @@ impl Config {
             log_connections: false,
             shutdown_timeout_ms: DEFAULT_SHUTDOWN_TIMEOUT_MS,
             default_partitions: DEFAULT_TOPIC_PARTITIONS,
+            fetch_poll_interval_ms: DEFAULT_FETCH_POLL_INTERVAL_MS,
+            enable_long_polling: true,
         }
     }
 }
@@ -73,6 +82,9 @@ static DATABASE: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::ne
 static LOG_CONNECTIONS: GucSetting<bool> = GucSetting::<bool>::new(false);
 static SHUTDOWN_TIMEOUT_MS: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_SHUTDOWN_TIMEOUT_MS);
 static DEFAULT_PARTITIONS: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_TOPIC_PARTITIONS);
+static FETCH_POLL_INTERVAL_MS: GucSetting<i32> =
+    GucSetting::<i32>::new(DEFAULT_FETCH_POLL_INTERVAL_MS);
+static ENABLE_LONG_POLLING: GucSetting<bool> = GucSetting::<bool>::new(true);
 
 /// Initialize GUC parameters
 pub fn init() {
@@ -132,6 +144,26 @@ pub fn init() {
         &DEFAULT_PARTITIONS,
         1,
         10000,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"pg_kafka.fetch_poll_interval_ms",
+        c"Polling interval for long polling fallback (milliseconds)",
+        c"How often to poll the database when waiting for data in FetchRequest. Default: 100ms.",
+        &FETCH_POLL_INTERVAL_MS,
+        MIN_FETCH_POLL_INTERVAL_MS,
+        MAX_FETCH_POLL_INTERVAL_MS,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_bool_guc(
+        c"pg_kafka.enable_long_polling",
+        c"Enable long polling for FetchRequest",
+        c"When enabled, FetchRequest will wait up to max_wait_ms for data. Default: true.",
+        &ENABLE_LONG_POLLING,
         GucContext::Suset,
         GucFlags::default(),
     );

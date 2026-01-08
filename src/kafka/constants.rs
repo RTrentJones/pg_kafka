@@ -145,6 +145,20 @@ pub const DEFAULT_BROKER_ID: i32 = 1;
 /// In future phases, this will become configurable per-topic.
 pub const DEFAULT_TOPIC_PARTITIONS: i32 = 1;
 
+// ===== Long Polling Configuration =====
+
+/// Default poll interval for long polling fallback (milliseconds)
+///
+/// When waiting for new data in a FetchRequest, this is how often we poll
+/// the database if no in-memory notification arrives.
+pub const DEFAULT_FETCH_POLL_INTERVAL_MS: i32 = 100;
+
+/// Minimum poll interval (milliseconds)
+pub const MIN_FETCH_POLL_INTERVAL_MS: i32 = 10;
+
+/// Maximum poll interval (milliseconds)
+pub const MAX_FETCH_POLL_INTERVAL_MS: i32 = 5000;
+
 // ===== Protocol Version Constants =====
 
 /// Kafka protocol version where flexible format begins

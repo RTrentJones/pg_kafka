@@ -157,6 +157,8 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     let log_connections = config.log_connections;
     let shutdown_timeout = Duration::from_millis(config.shutdown_timeout_ms as u64);
     let default_partitions = config.default_partitions;
+    let fetch_poll_interval_ms = config.fetch_poll_interval_ms;
+    let enable_long_polling = config.enable_long_polling;
     // Convert 0.0.0.0 to localhost for advertised host (used in Metadata and FindCoordinator)
     // 0.0.0.0 is not routable from clients - they need a resolvable hostname
     let broker_host = if host == "0.0.0.0" || host.is_empty() {
@@ -169,6 +171,12 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     // This is the bridge between the network thread and the database thread.
     let (request_tx, request_rx) =
         crossbeam_channel::bounded::<crate::kafka::KafkaRequest>(REQUEST_CHANNEL_CAPACITY);
+
+    // Step 5b: Create notification channel for long polling support
+    // This channel sends notifications from the database thread to the network thread
+    // when new messages are produced. Used to wake up waiting FetchRequest handlers.
+    let (notify_tx, notify_rx) =
+        crossbeam_channel::unbounded::<crate::kafka::InternalNotification>();
 
     // Step 6: Create shutdown signal channel
     // Simple mpsc channel - network thread checks for message to shutdown
@@ -250,8 +258,11 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
                 if let Err(e) = crate::kafka::listener::run(
                     tcp_listener,
                     request_tx,
+                    notify_rx,
                     shutdown_rx,
                     log_connections,
+                    enable_long_polling,
+                    fetch_poll_interval_ms,
                 )
                 .await
                 {
@@ -339,11 +350,19 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
                 let broker_h = broker_host.clone();
                 let broker_p = port;
                 let default_parts = default_partitions;
+                let notifier = notify_tx.clone();
 
                 BackgroundWorker::transaction(move || {
                     // Wrap in catch_unwind to prevent handler panics from crashing the worker
                     let result = catch_unwind(AssertUnwindSafe(|| {
-                        process_request(request, &coord, &broker_h, broker_p, default_parts);
+                        process_request(
+                            request,
+                            &coord,
+                            &broker_h,
+                            broker_p,
+                            default_parts,
+                            &notifier,
+                        );
                     }));
 
                     if let Err(panic_info) = result {
@@ -406,9 +425,11 @@ pub fn process_request(
     broker_host: &str,
     broker_port: i32,
     default_partitions: i32,
+    notify_tx: &crossbeam_channel::Sender<crate::kafka::InternalNotification>,
 ) {
     use crate::kafka::dispatch::{dispatch_infallible, dispatch_response};
     use crate::kafka::messages::KafkaResponse;
+    use crate::kafka::storage::KafkaStore;
     use crate::kafka::{handlers, PostgresStore};
 
     // Create store once - it's a stateless unit struct (zero-cost)
@@ -493,23 +514,62 @@ pub fn process_request(
                 return;
             }
 
-            dispatch_response(
-                "Produce",
-                response_tx,
-                || handlers::handle_produce(&store, topic_data, default_partitions),
-                |r| KafkaResponse::Produce {
-                    correlation_id,
-                    api_version,
-                    response: r,
-                },
-                |error_code| KafkaResponse::Produce {
-                    correlation_id,
-                    api_version,
-                    response: crate::kafka::response_builders::build_produce_error_response(
-                        error_code,
-                    ),
-                },
-            );
+            // Keep a copy of topic_data for notifications
+            let topics_for_notify = topic_data.clone();
+
+            // Handle produce and send notifications on success
+            match handlers::handle_produce(&store, topic_data, default_partitions) {
+                Ok(response) => {
+                    // Send notifications for each successfully produced partition
+                    // This wakes up any consumers waiting in long poll
+                    for topic_response in &response.responses {
+                        let topic_name = topic_response.name.0.as_str();
+                        if let Ok(Some(topic_id)) = store.get_topic_id(topic_name) {
+                            for partition_response in &topic_response.partition_responses {
+                                // Only notify if produce succeeded (error_code == 0)
+                                if partition_response.error_code == ERROR_NONE {
+                                    let partition_id = partition_response.index;
+                                    // Get the new high watermark
+                                    if let Ok(hwm) =
+                                        store.get_high_watermark(topic_id, partition_id)
+                                    {
+                                        let notification =
+                                            crate::kafka::InternalNotification::NewMessages {
+                                                topic_id,
+                                                partition_id,
+                                                high_watermark: hwm,
+                                            };
+                                        let _ = notify_tx.send(notification);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Send the response
+                    let _ = response_tx.send(KafkaResponse::Produce {
+                        correlation_id,
+                        api_version,
+                        response,
+                    });
+                }
+                Err(e) => {
+                    let error_code = e.to_kafka_error_code();
+                    if e.is_server_error() {
+                        pg_warning!("Produce handler error: {}", e);
+                    }
+                    let _ = response_tx.send(KafkaResponse::Produce {
+                        correlation_id,
+                        api_version,
+                        response: crate::kafka::response_builders::build_produce_error_response(
+                            error_code,
+                        ),
+                    });
+                }
+            }
+
+            // Suppress unused variable warning - kept for potential future use
+            let _ = topics_for_notify;
         }
 
         // ===== Fetch =====

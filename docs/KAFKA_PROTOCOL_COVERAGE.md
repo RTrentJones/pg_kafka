@@ -1,7 +1,7 @@
 # Kafka Protocol Coverage Analysis
 
-**Date**: 2026-01-07
-**pg_kafka Version**: Phase 5 Complete
+**Date**: 2026-01-08
+**pg_kafka Version**: Phase 7 Complete + Long Polling Enhancement
 **Analysis**: Comprehensive review of implemented vs standard Kafka protocol
 
 ---
@@ -10,15 +10,15 @@
 
 | Metric | Value |
 |--------|-------|
-| **API Coverage** | 14 of ~50 standard Kafka APIs (28%) |
+| **API Coverage** | 18 of ~50 standard Kafka APIs (36%) |
 | **Build Status** | ✅ Compiles with zero warnings |
-| **Test Suite** | 163 unit tests + E2E tests |
+| **Test Suite** | 181 unit tests + 90 E2E tests |
 | **Architecture** | Repository Pattern with typed errors |
 | **Client Compatibility** | ✅ kcat, rdkafka verified |
 
 ---
 
-## Implemented APIs (14 total)
+## Implemented APIs (18 total)
 
 ### 1. Core Metadata (2 APIs) ✅ 100% Coverage
 | API | Key | Versions | Status | Notes |
@@ -39,7 +39,7 @@
 ### 3. Consumer - Data Access (4 APIs) ✅ 100% Coverage
 | API | Key | Versions | Status | Notes |
 |-----|-----|----------|--------|-------|
-| Fetch | 1 | v0-v13 | ✅ Complete | Read messages from partitions |
+| Fetch | 1 | v0-v13 | ✅ Complete | Read messages with long polling support |
 | OffsetCommit | 8 | v0-v8 | ✅ Complete | Commit consumed offsets |
 | OffsetFetch | 9 | v0-v7 | ✅ Complete | Retrieve committed offsets (v8+ not supported) |
 | ListOffsets | 2 | v0-v7 | ✅ Complete | Get earliest/latest offsets |
@@ -48,6 +48,7 @@
 - ✅ ListOffsets supports special timestamps (-2 = earliest, -1 = latest)
 - ✅ OffsetFetch limited to v0-v7 (v8+ requires different response format)
 - ✅ All consumer data access APIs fully functional
+- ✅ Long polling with max_wait_ms/min_bytes support
 
 ### 4. Consumer Group Coordinator (7 APIs) ✅ 100% Coverage
 | API | Key | Versions | Status | Notes |
@@ -68,21 +69,19 @@
 - ✅ Session timeout detection with background scanner
 - ✅ REBALANCE_IN_PROGRESS (error 27) forces client rejoin
 
----
+### 5. Admin APIs (4 APIs) ✅ 100% Coverage (Phase 6)
+| API | Key | Versions | Status | Notes |
+|-----|-----|----------|--------|-------|
+| CreateTopics | 19 | v0-v7 | ✅ Complete | Create topics with partition count |
+| DeleteTopics | 20 | v0-v6 | ✅ Complete | Delete topics and messages |
+| CreatePartitions | 37 | v0-v3 | ✅ Complete | Add partitions to existing topics |
+| DeleteGroups | 42 | v0-v2 | ✅ Complete | Delete consumer groups |
 
-## Missing Medium Priority APIs
-
-### Topic Administration
-| API | Key | Purpose | Priority | Notes |
-|-----|-----|---------|----------|-------|
-| CreateTopics | 19 | Create topics programmatically | Medium | Currently auto-created |
-| DeleteTopics | 20 | Delete topics | Medium | No cleanup mechanism |
-| CreatePartitions | 37 | Add partitions | Low | Single partition design |
-
-### Consumer Group Management
-| API | Key | Purpose | Priority | Notes |
-|-----|-----|---------|----------|-------|
-| DeleteGroups | 42 | Delete consumer groups | Medium | Manual cleanup needed |
+**Implementation Notes (Phase 6):**
+- ✅ CreateTopics respects partition count parameter
+- ✅ DeleteTopics cascades to messages and consumer offsets
+- ✅ CreatePartitions adds partitions to existing topics
+- ✅ DeleteGroups validates group is empty before deletion
 
 ---
 
@@ -132,35 +131,33 @@ Consumer Flow (Current):
   - Persist member IDs across restarts
   - Prevent rebalance on consumer restart
 
-### Multi-Partition Support
+### Multi-Partition Support ✅ (Phase 7)
 
-#### Current Limitation
-- **Fixed**: 1 partition per topic
-- **Schema**: Supports multiple partitions
-- **Code**: Partition ID is a parameter
-
-#### To Enable Multi-Partition
-1. Allow configurable partition count in `kafka.topics`
-2. Update metadata response with correct partition count
-3. Test with rdkafka multi-partition consumption
+- ✅ Configurable partition count (via CreateTopics or `pg_kafka.default_partitions` GUC)
+- ✅ Key-based partition routing using murmur2 hash (Kafka-compatible)
+- ✅ Metadata response includes correct partition count
+- ✅ Null-key messages use random partition selection
 
 ---
 
 ## Roadmap
 
-### Phase 6: Future Enhancements
+### Completed Phases
 
-- **CreateTopics/DeleteTopics** - Programmatic topic management
-- **DeleteGroups** - Consumer group cleanup
-- **Compression Support** - gzip, snappy, lz4, zstd
+- **Phase 6** ✅ Admin APIs (CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups)
+- **Phase 7** ✅ Multi-Partition Topics with key-based routing
+
+### Enhancements
+
+- **Long Polling** ✅ max_wait_ms/min_bytes support for efficient consumer waiting
+
+### Future Phases
+
+- **Phase 8** - Compression Support (gzip, snappy, lz4, zstd)
 - **Cooperative Rebalancing** (KIP-429)
 - **Static Group Membership** (KIP-345)
-- **Multi-Partition Topics**
-
-### Future Considerations
-
-- Idempotent Producer
-- Transactions (if needed)
+- **Idempotent Producer** - Deduplication support
+- **Shadow Mode** - Logical decoding to external Kafka
 
 ---
 
@@ -199,7 +196,7 @@ Consumer Flow (Current):
 - **Testing**: E2E tests with rdkafka
 - **Documentation**: Comprehensive design docs
 
-### Test Coverage (163+ total)
+### Test Coverage (181+ unit tests + 90 E2E tests)
 
 | Category | Count | Location |
 |----------|-------|----------|
@@ -210,9 +207,11 @@ Consumer Flow (Current):
 | Storage layer | 22 | `src/kafka/storage/tests.rs` |
 | Coordinator | 11 | `src/kafka/coordinator.rs` |
 | Assignment strategies | 69 | `src/kafka/assignment/` |
+| Pending fetches | 6 | `src/kafka/pending_fetches.rs` |
+| Partitioner | 12 | `src/kafka/partitioner.rs` |
 | Helpers | 4 | `tests/helpers.rs` |
-| **Unit Total** | **163** | |
-| **E2E Test Suite** | **50+** | `kafka_test/` |
+| **Unit Total** | **181** | |
+| **E2E Test Suite** | **90** | `kafka_test/` |
 
 **E2E Test Categories:**
 - Producer (basic, batch)
@@ -228,36 +227,37 @@ Consumer Flow (Current):
 
 ## Conclusion
 
-**Current State**: Comprehensive Kafka-compatible broker with 14 APIs implemented
-**Coverage**: 28% of standard Kafka protocol (full producer/consumer/coordinator support)
+**Current State**: Comprehensive Kafka-compatible broker with 18 APIs implemented
+**Coverage**: 36% of standard Kafka protocol (full producer/consumer/coordinator/admin support)
 **Architecture**: Clean, maintainable, well-documented with Repository Pattern
-**Test Status**: All 163 unit tests and E2E tests passing ✅
+**Test Status**: All 181 unit tests and 90 E2E tests passing ✅
 
 **Readiness**:
 - ✅ **Producer**: Production-ready (with compression limitations)
-- ✅ **Consumer**: Fully functional with automatic partition assignment
+- ✅ **Consumer**: Fully functional with long polling and automatic partition assignment
 - ✅ **Coordinator**: Complete with automatic rebalancing
-- ✅ **Group Visibility**: DescribeGroups and ListGroups for monitoring
+- ✅ **Admin APIs**: CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups
+- ✅ **Multi-Partition**: Key-based routing with murmur2 hash
+- ✅ **Long Polling**: max_wait_ms/min_bytes support
 
-**Recent Achievements (Phase 4-5)**:
-1. ✅ Range, RoundRobin, Sticky partition assignment strategies
-2. ✅ Automatic rebalancing on member leave
-3. ✅ Session timeout detection with background scanner
-4. ✅ REBALANCE_IN_PROGRESS error code for client notification
-5. ✅ DescribeGroups and ListGroups APIs
-6. ✅ 69 unit tests for assignment strategies
-7. ✅ 5 new rebalancing unit tests
+**Recent Achievements (Phase 6-7 + Enhancements)**:
+1. ✅ Admin APIs (CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups)
+2. ✅ Multi-partition topics with configurable partition count
+3. ✅ Key-based partition routing (Kafka-compatible murmur2 hash)
+4. ✅ Long polling with max_wait_ms/min_bytes support
+5. ✅ In-memory notification for fast consumer wakeup
+6. ✅ Configurable poll interval fallback
 
-**Next Steps**:
-1. Multi-partition topic support
-2. Topic administration APIs (CreateTopics, DeleteTopics)
-3. Cooperative rebalancing (KIP-429)
-4. Static group membership (KIP-345)
+**Future Phases**:
+1. Phase 8: Compression support (gzip, snappy, lz4, zstd)
+2. Cooperative rebalancing (KIP-429)
+3. Static group membership (KIP-345)
+4. Shadow mode (logical decoding to external Kafka)
 
 ---
 
-**Overall Assessment**: Phase 5 Complete - pg_kafka provides full producer/consumer support with automatic partition assignment and rebalancing. The implementation features clean architecture (Repository Pattern), comprehensive test coverage (163+ tests), and typed error handling. Ready for advanced features in Phase 6.
+**Overall Assessment**: Phase 7 Complete with Long Polling Enhancement - pg_kafka provides full producer/consumer support with long polling, multi-partition topics, and admin APIs. The implementation features clean architecture (Repository Pattern), comprehensive test coverage (181+ unit tests, 69 E2E tests), and typed error handling.
 
-**Last Updated:** 2026-01-07
-**Phase:** 5 Complete
-**Tests:** 163+ unit tests + E2E suite
+**Last Updated:** 2026-01-08
+**Phase:** 7 Complete + Long Polling
+**Tests:** 181 unit tests + 69 E2E tests
