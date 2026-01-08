@@ -169,21 +169,19 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
 
     // Step 7: Bind TCP listener on main thread BEFORE spawning network thread
     // This ensures bind failures are fatal and immediate
+    //
+    // IMPORTANT: We use std::net::TcpListener here, NOT tokio::net::TcpListener.
+    // Tokio resources are tied to the runtime that created them. If we created a
+    // tokio listener here and dropped the runtime, the listener would be broken.
+    // Instead, we bind with std, then convert to tokio in the network thread.
     let bind_addr = format!("{}:{}", host, port);
 
-    // Create a temporary runtime just for binding
-    let bind_runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            pgrx::error!("Failed to create tokio runtime for bind: {}", e);
-        }
-    };
-
-    let tcp_listener = match bind_runtime.block_on(tokio::net::TcpListener::bind(&bind_addr)) {
+    let std_listener = match std::net::TcpListener::bind(&bind_addr) {
         Ok(listener) => {
+            // Set non-blocking mode for tokio compatibility
+            if let Err(e) = listener.set_nonblocking(true) {
+                pgrx::error!("Failed to set non-blocking mode: {}", e);
+            }
             pg_log!("TCP listener bound to {}", bind_addr);
             listener
         }
@@ -196,7 +194,6 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
             );
         }
     };
-    drop(bind_runtime); // No longer needed
 
     // Step 8: Spawn the network thread
     // This thread runs a multi-threaded tokio runtime for handling all network I/O.
@@ -230,8 +227,19 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
                 }
             };
 
-            // Run the listener
+            // Run the listener inside the runtime context
+            // IMPORTANT: from_std() must be called inside block_on() to have reactor context
             rt.block_on(async move {
+                // Convert std listener to tokio listener inside the async context
+                // This ensures the listener is registered with THIS runtime's reactor
+                let tcp_listener = match tokio::net::TcpListener::from_std(std_listener) {
+                    Ok(listener) => listener,
+                    Err(e) => {
+                        tracing::error!("Failed to convert std listener to tokio: {}", e);
+                        return;
+                    }
+                };
+
                 if let Err(e) = crate::kafka::listener::run(
                     tcp_listener,
                     request_tx,
