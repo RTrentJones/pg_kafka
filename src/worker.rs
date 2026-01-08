@@ -206,11 +206,12 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
         .name("pg_kafka-net".to_string())
         .spawn(move || {
             // Initialize tracing subscriber for this thread
-            // Output goes to stderr which Postgres captures
+            // Default to error-only to prevent log bloat in CI
+            // Enable with RUST_LOG=pg_kafka=info for debugging
             let _ = tracing_subscriber::fmt()
                 .with_env_filter(
                     tracing_subscriber::EnvFilter::from_default_env()
-                        .add_directive("pg_kafka=info".parse().unwrap()),
+                        .add_directive("pg_kafka=error".parse().unwrap()),
                 )
                 .with_target(false)
                 .try_init();

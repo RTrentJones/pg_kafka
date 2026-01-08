@@ -741,6 +741,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // Verify broker is ready before running tests
+    // This prevents false failures when broker is still initializing
+    if !args.json {
+        print!("Verifying broker connection... ");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+    }
+
+    let mut attempts = 0;
+    let max_attempts = 5;
+    loop {
+        match kafka_test::setup::verify_server_ready().await {
+            Ok(()) => {
+                if !args.json {
+                    println!("OK");
+                }
+                break;
+            }
+            Err(e) => {
+                attempts += 1;
+                if attempts >= max_attempts {
+                    eprintln!("FAILED after {} attempts: {}", max_attempts, e);
+                    std::process::exit(1);
+                }
+                if !args.json {
+                    print!("retry {}... ", attempts);
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        }
+    }
+
     let suite_start = Instant::now();
     let mut category_results: Vec<CategoryResult> = Vec::new();
     let mut current_category = "";
