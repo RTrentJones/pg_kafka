@@ -72,16 +72,9 @@ pub fn handle_metadata(
             // Client wants specific topics - create them if needed and return metadata
             let mut topics_metadata = Vec::new();
             for topic_name in topic_names {
-                // Auto-create topic if it doesn't exist
+                // Auto-create topic if it doesn't exist (returns both topic_id and partition_count)
                 match store.get_or_create_topic(&topic_name, default_partitions) {
-                    Ok(_topic_id) => {
-                        // Get the topic's partition count from storage
-                        let partition_count = store
-                            .get_topic_metadata(Some(std::slice::from_ref(&topic_name)))
-                            .ok()
-                            .and_then(|topics| topics.first().map(|t| t.partition_count))
-                            .unwrap_or(1);
-
+                    Ok((_topic_id, partition_count)) => {
                         // Build partition metadata for all partitions
                         let partitions: Vec<_> = (0..partition_count)
                             .map(|partition_id| {

@@ -35,7 +35,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 impl KafkaStore for PostgresStore {
-    fn get_or_create_topic(&self, name: &str, default_partitions: i32) -> Result<i32> {
+    fn get_or_create_topic(&self, name: &str, default_partitions: i32) -> Result<(i32, i32)> {
         crate::pg_debug!(
             "PostgresStore::get_or_create_topic: '{}' (default_partitions={})",
             name,
@@ -49,18 +49,26 @@ impl KafkaStore for PostgresStore {
                 "INSERT INTO kafka.topics (name, partitions)
                  VALUES ($1, $2)
                  ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
-                 RETURNING id",
+                 RETURNING id, partitions",
                 None,
                 &[topic_name_string.into(), default_partitions.into()],
             )?;
 
-            let topic_id: i32 = table
-                .first()
+            let row = table.first();
+            let topic_id: i32 = row
                 .get_by_name("id")?
                 .ok_or_else(|| KafkaError::Internal("Failed to get topic ID".into()))?;
+            let partition_count: i32 = row
+                .get_by_name("partitions")?
+                .ok_or_else(|| KafkaError::Internal("Failed to get partition count".into()))?;
 
-            crate::pg_debug!("Topic '{}' has id={}", name, topic_id);
-            Ok(topic_id)
+            crate::pg_debug!(
+                "Topic '{}' has id={}, partitions={}",
+                name,
+                topic_id,
+                partition_count
+            );
+            Ok((topic_id, partition_count))
         })
         .map_err(|e: KafkaError| KafkaError::Internal(format!("get_or_create_topic failed: {}", e)))
     }

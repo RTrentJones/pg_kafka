@@ -103,6 +103,13 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     // Step 3b: Wait for schema to exist before starting listener
     // The background worker starts when Postgres boots, but CREATE EXTENSION
     // may not have run yet. We retry with a delay to handle this timing issue.
+    //
+    // Design note: We use polling (500ms interval) rather than event-based notification
+    // because PostgreSQL doesn't provide a cross-process notification mechanism for
+    // schema creation that works reliably during startup. The polling overhead is
+    // minimal since this only runs once at startup, and 500ms strikes a balance
+    // between responsiveness and CPU usage. The loop also checks SIGTERM to ensure
+    // clean shutdown if Postgres stops before the schema is ready.
     const MAX_SCHEMA_WAIT_MS: u64 = 60_000; // 60 seconds max wait
     const SCHEMA_CHECK_INTERVAL_MS: u64 = 500;
     let mut waited_ms = 0u64;
@@ -160,6 +167,7 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     let fetch_poll_interval_ms = config.fetch_poll_interval_ms;
     let enable_long_polling = config.enable_long_polling;
     let compression = parse_compression_type(&config.compression_type);
+    let log_timing = config.log_timing;
     // Convert 0.0.0.0 to localhost for advertised host (used in Metadata and FindCoordinator)
     // 0.0.0.0 is not routable from clients - they need a resolvable hostname
     let broker_host = if host == "0.0.0.0" || host.is_empty() {
@@ -354,7 +362,22 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
                 let notifier = notify_tx.clone();
                 let comp = compression;
 
+                // Timing instrumentation (enabled via pg_kafka.log_timing GUC)
+                // Measures transaction overhead vs handler execution time
+                let tx_start = if log_timing {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
+
+                // Use a Cell to capture handler duration from inside the closure
+                let handler_duration = std::cell::Cell::new(Duration::ZERO);
+                // Wrap in AssertUnwindSafe to satisfy UnwindSafe requirement
+                let handler_duration_ref = AssertUnwindSafe(&handler_duration);
+
                 BackgroundWorker::transaction(move || {
+                    let handler_start = std::time::Instant::now();
+
                     // Wrap in catch_unwind to prevent handler panics from crashing the worker
                     let result = catch_unwind(AssertUnwindSafe(|| {
                         process_request(
@@ -368,6 +391,9 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
                         );
                     }));
 
+                    // Capture handler duration before transaction commit
+                    handler_duration_ref.set(handler_start.elapsed());
+
                     if let Err(panic_info) = result {
                         let panic_msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
                             s.to_string()
@@ -379,6 +405,24 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
                         pg_warning!("Handler panic caught (worker survived): {}", panic_msg);
                     }
                 });
+
+                // Log timing results (only when log_timing is enabled)
+                if let Some(start) = tx_start {
+                    let total_duration = start.elapsed();
+                    let handler_dur = handler_duration.get();
+                    let tx_overhead = total_duration.saturating_sub(handler_dur);
+                    log!(
+                        "TIMING: total={}us handler={}us tx_overhead={}us ({}%)",
+                        total_duration.as_micros(),
+                        handler_dur.as_micros(),
+                        tx_overhead.as_micros(),
+                        if total_duration.as_micros() > 0 {
+                            (tx_overhead.as_micros() * 100) / total_duration.as_micros()
+                        } else {
+                            0
+                        }
+                    );
+                }
             }
 
             Err(RecvTimeoutError::Timeout) => {
@@ -504,24 +548,54 @@ pub fn process_request(
             response_tx,
             ..
         } => {
-            // Handle acks=0 (fire-and-forget) - not yet supported
-            // Return a proper ProduceResponse with error embedded
+            // Handle acks=0 (fire-and-forget)
+            // Per Kafka protocol: respond immediately without waiting for DB commit.
+            // Data is still written best-effort; errors are logged but not sent to client.
             if acks == 0 {
-                pg_warning!("acks=0 (fire-and-forget) not yet supported");
+                // Send immediate empty success response (true fire-and-forget semantics)
                 let _ = response_tx.send(KafkaResponse::Produce {
                     correlation_id,
                     api_version,
-                    response: crate::kafka::response_builders::build_produce_error_response(
-                        ERROR_UNSUPPORTED_VERSION,
-                    ),
+                    response: crate::kafka::response_builders::build_produce_response(),
                 });
+
+                // Process the produce request best-effort (client already got response)
+                match handlers::handle_produce(&store, topic_data.clone(), default_partitions) {
+                    Ok(response) => {
+                        // Send notifications for long-polling consumers
+                        for topic_response in &response.responses {
+                            let topic_name = topic_response.name.0.as_str();
+                            if let Ok(Some(topic_id)) = store.get_topic_id(topic_name) {
+                                for partition_response in &topic_response.partition_responses {
+                                    if partition_response.error_code == ERROR_NONE {
+                                        let partition_id = partition_response.index;
+                                        if let Ok(hwm) =
+                                            store.get_high_watermark(topic_id, partition_id)
+                                        {
+                                            let notification =
+                                                crate::kafka::InternalNotification::NewMessages {
+                                                    topic_id,
+                                                    partition_id,
+                                                    high_watermark: hwm,
+                                                };
+                                            let _ = notify_tx.send(notification);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // Log error but don't notify client (per acks=0 contract)
+                        if e.is_server_error() {
+                            pg_warning!("acks=0 produce error (data may be lost): {}", e);
+                        }
+                    }
+                }
                 return;
             }
 
-            // Keep a copy of topic_data for notifications
-            let topics_for_notify = topic_data.clone();
-
-            // Handle produce and send notifications on success
+            // Handle produce and send notifications on success (acks >= 1)
             match handlers::handle_produce(&store, topic_data, default_partitions) {
                 Ok(response) => {
                     // Send notifications for each successfully produced partition
@@ -571,9 +645,6 @@ pub fn process_request(
                     });
                 }
             }
-
-            // Suppress unused variable warning - kept for potential future use
-            let _ = topics_for_notify;
         }
 
         // ===== Fetch =====

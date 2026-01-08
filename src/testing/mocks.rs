@@ -20,7 +20,7 @@ mock! {
     pub KafkaStore {}
 
     impl KafkaStore for KafkaStore {
-        fn get_or_create_topic<'a>(&self, name: &'a str, default_partitions: i32) -> Result<i32>;
+        fn get_or_create_topic<'a>(&self, name: &'a str, default_partitions: i32) -> Result<(i32, i32)>;
         fn get_topic_metadata<'a>(&self, names: Option<&'a [String]>) -> Result<Vec<TopicMetadata>>;
         fn insert_records<'a>(&self, topic_id: i32, partition_id: i32, records: &'a [Record]) -> Result<i64>;
         fn fetch_records(
@@ -78,6 +78,7 @@ pub fn mock_config() -> crate::config::Config {
         fetch_poll_interval_ms: DEFAULT_FETCH_POLL_INTERVAL_MS,
         enable_long_polling: true,
         compression_type: DEFAULT_COMPRESSION_TYPE.to_string(),
+        log_timing: false,
     }
 }
 
@@ -113,13 +114,14 @@ mod tests {
         let mut mock = MockKafkaStore::new();
 
         // Test that expectations work correctly
+        // Returns (topic_id, partition_count)
         mock.expect_get_or_create_topic()
             .times(1)
-            .returning(|_, _| Ok(1));
+            .returning(|_, _| Ok((1, 1)));
 
         let result = mock.get_or_create_topic("test-topic", 1);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), 1);
+        assert_eq!(result.unwrap(), (1, 1));
     }
 
     #[test]

@@ -29,15 +29,9 @@ pub fn handle_produce(
     for topic in topic_data {
         let topic_name: String = topic.name.clone();
 
-        // Get or create topic
-        let topic_id = store.get_or_create_topic(&topic_name, default_partitions)?;
-
-        // Get partition count for this topic
-        let partition_count = store
-            .get_topic_metadata(Some(std::slice::from_ref(&topic_name)))
-            .ok()
-            .and_then(|topics| topics.first().map(|t| t.partition_count))
-            .unwrap_or(1);
+        // Get or create topic (returns both topic_id and partition_count in single query)
+        let (topic_id, partition_count) =
+            store.get_or_create_topic(&topic_name, default_partitions)?;
 
         // Build topic response
         let mut topic_response =

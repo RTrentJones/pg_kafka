@@ -24,7 +24,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **What Works Now:**
 - TCP listener on port 9092 with full Kafka wire protocol parsing
-- ProduceRequest handling with database persistence
+- ProduceRequest handling with database persistence (acks=0 and acks>=1 supported)
 - FetchRequest with RecordBatch v2 encoding/decoding
 - Compression support: gzip, snappy, lz4, zstd (inbound automatic, outbound configurable)
 - Consumer group coordinator with automatic partition assignment (Range, RoundRobin, Sticky strategies)
@@ -308,6 +308,7 @@ pg_kafka.log_connections = false  -- Log each connection
 pg_kafka.shutdown_timeout_ms = 5000
 pg_kafka.default_partitions = 1   -- Default partitions for auto-created topics
 pg_kafka.compression_type = 'none' -- Outbound compression (none, gzip, snappy, lz4, zstd)
+pg_kafka.log_timing = false       -- Enable timing instrumentation for benchmarking
 ```
 
 ## Testing with Kafka Clients
@@ -385,7 +386,7 @@ To debug:
 
 ## Non-Goals (v1)
 
-- Full Protocol Compliance: No Transactions or acks=0 (fire-and-forget) support
+- Full Protocol Compliance: No Transactions support (acks=0 fire-and-forget IS supported)
 - High Availability: Rely on standard Postgres HA (Patroni/RDS) rather than Kafka's ISR
 - Broker Clustering: Single-node "broker" design
 

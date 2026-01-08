@@ -101,17 +101,18 @@ mod tests {
     fn test_mock_get_or_create_topic() {
         let mut mock = MockKafkaStore::new();
 
+        // Returns (topic_id, partition_count)
         mock.expect_get_or_create_topic()
             .with(
                 mockall::predicate::eq("new-topic"),
                 mockall::predicate::eq(1),
             )
             .times(1)
-            .returning(|_, _| Ok(1));
+            .returning(|_, _| Ok((1, 1)));
 
         let result = mock.get_or_create_topic("new-topic", 1);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), 1);
+        assert_eq!(result.unwrap(), (1, 1));
     }
 
     #[test]
@@ -360,9 +361,10 @@ mod tests {
         let mut mock = MockKafkaStore::new();
 
         // Set up multiple expectations for a realistic scenario
+        // get_or_create_topic returns (topic_id, partition_count)
         mock.expect_get_or_create_topic()
             .times(1)
-            .returning(|_, _| Ok(1));
+            .returning(|_, _| Ok((1, 1)));
 
         mock.expect_insert_records()
             .times(1)
@@ -373,8 +375,9 @@ mod tests {
             .returning(|_, _| Ok(1));
 
         // Execute in sequence
-        let topic_id = mock.get_or_create_topic("test", 1).unwrap();
+        let (topic_id, partition_count) = mock.get_or_create_topic("test", 1).unwrap();
         assert_eq!(topic_id, 1);
+        assert_eq!(partition_count, 1);
 
         let base_offset = mock.insert_records(1, 0, &[]).unwrap();
         assert_eq!(base_offset, 0);

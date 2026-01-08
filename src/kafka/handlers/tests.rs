@@ -24,23 +24,14 @@ mod tests {
     fn test_handle_produce_success() {
         let mut mock = MockKafkaStore::new();
 
-        // Expect topic lookup and record insertion
+        // Expect topic lookup - now returns (topic_id, partition_count) in single call
         mock.expect_get_or_create_topic()
             .with(
                 mockall::predicate::eq("test-topic"),
                 mockall::predicate::always(),
             )
             .times(1)
-            .returning(|_, _| Ok(1));
-
-        // Expect partition count lookup
-        mock.expect_get_topic_metadata().returning(|_| {
-            Ok(vec![TopicMetadata {
-                name: "test-topic".to_string(),
-                id: 1,
-                partition_count: 1,
-            }])
-        });
+            .returning(|_, _| Ok((1, 1))); // (topic_id=1, partition_count=1)
 
         mock.expect_insert_records()
             .times(1)
@@ -73,16 +64,9 @@ mod tests {
     fn test_handle_produce_unknown_partition() {
         let mut mock = MockKafkaStore::new();
 
-        mock.expect_get_or_create_topic().returning(|_, _| Ok(1));
-
-        // Return partition count = 1, so only partition 0 is valid
-        mock.expect_get_topic_metadata().returning(|_| {
-            Ok(vec![TopicMetadata {
-                name: "test-topic".to_string(),
-                id: 1,
-                partition_count: 1,
-            }])
-        });
+        // Return (topic_id=1, partition_count=1), so only partition 0 is valid
+        mock.expect_get_or_create_topic()
+            .returning(|_, _| Ok((1, 1)));
 
         // Request partition 5 which exceeds partition_count
         let topic_data = vec![TopicProduceData {
@@ -107,16 +91,9 @@ mod tests {
     fn test_handle_produce_insert_error() {
         let mut mock = MockKafkaStore::new();
 
-        mock.expect_get_or_create_topic().returning(|_, _| Ok(1));
-
-        // Return partition count = 1, so partition 0 is valid
-        mock.expect_get_topic_metadata().returning(|_| {
-            Ok(vec![TopicMetadata {
-                name: "test-topic".to_string(),
-                id: 1,
-                partition_count: 1,
-            }])
-        });
+        // Return (topic_id=1, partition_count=1), so partition 0 is valid
+        mock.expect_get_or_create_topic()
+            .returning(|_, _| Ok((1, 1)));
 
         mock.expect_insert_records()
             .returning(|_, _, _| Err(KafkaError::database("insert failed")));
@@ -308,20 +285,13 @@ mod tests {
     fn test_handle_metadata_specific_topic() {
         let mut mock = MockKafkaStore::new();
 
+        // get_or_create_topic now returns (topic_id, partition_count) in single call
         mock.expect_get_or_create_topic()
             .with(
                 mockall::predicate::eq("my-topic"),
                 mockall::predicate::always(),
             )
-            .returning(|_, _| Ok(5));
-
-        mock.expect_get_topic_metadata().returning(|_| {
-            Ok(vec![TopicMetadata {
-                name: "my-topic".to_string(),
-                id: 5,
-                partition_count: 1,
-            }])
-        });
+            .returning(|_, _| Ok((5, 1))); // (topic_id=5, partition_count=1)
 
         let response = metadata::handle_metadata(
             &mock,

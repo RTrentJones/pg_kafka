@@ -33,6 +33,8 @@ pub struct Config {
     pub enable_long_polling: bool,
     /// Compression type for FetchResponse encoding (none, gzip, snappy, lz4, zstd)
     pub compression_type: String,
+    /// Enable timing instrumentation for performance research
+    pub log_timing: bool,
 }
 
 impl Config {
@@ -61,6 +63,7 @@ impl Config {
                 .as_deref()
                 .map(|c| c.to_string_lossy().into_owned())
                 .unwrap_or_else(|| DEFAULT_COMPRESSION_TYPE.to_string()),
+            log_timing: LOG_TIMING.get(),
         }
     }
 
@@ -77,6 +80,7 @@ impl Config {
             fetch_poll_interval_ms: DEFAULT_FETCH_POLL_INTERVAL_MS,
             enable_long_polling: true,
             compression_type: DEFAULT_COMPRESSION_TYPE.to_string(),
+            log_timing: false,
         }
     }
 }
@@ -94,6 +98,7 @@ static FETCH_POLL_INTERVAL_MS: GucSetting<i32> =
     GucSetting::<i32>::new(DEFAULT_FETCH_POLL_INTERVAL_MS);
 static ENABLE_LONG_POLLING: GucSetting<bool> = GucSetting::<bool>::new(true);
 static COMPRESSION_TYPE: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
+static LOG_TIMING: GucSetting<bool> = GucSetting::<bool>::new(false);
 
 /// Initialize GUC parameters
 pub fn init() {
@@ -182,6 +187,15 @@ pub fn init() {
         c"Compression type for FetchResponse encoding",
         c"Compression codec for outbound messages: none, gzip, snappy, lz4, zstd. Default: none.",
         &COMPRESSION_TYPE,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_bool_guc(
+        c"pg_kafka.log_timing",
+        c"Enable timing instrumentation for performance research",
+        c"When enabled, logs transaction and handler timing for each request. Use for benchmarking.",
+        &LOG_TIMING,
         GucContext::Suset,
         GucFlags::default(),
     );

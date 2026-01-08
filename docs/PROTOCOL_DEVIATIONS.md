@@ -18,21 +18,26 @@ This document lists intentional deviations from the official Kafka protocol spec
 
 ## Producer API Deviations
 
-### 1. acks=0 (Fire-and-Forget) Not Supported
+### 1. acks=0 (Fire-and-Forget) ✅ Supported
 
-**Status:** Rejected
+**Status:** Implemented
 **Kafka Behavior:** Client sends message, does not wait for acknowledgment
-**pg_kafka Behavior:** Returns error response with `INVALID_REQUEST`
+**pg_kafka Behavior:** Immediate empty success response, best-effort database write
 
-**Rationale:**
-- `acks=0` violates ACID guarantees that are a core benefit of using PostgreSQL
-- No way to return offset to client (fire-and-forget means no response)
-- Would require additional async machinery to handle "send but don't wait" semantics
-- Users wanting fire-and-forget should use real Kafka
+**Implementation:**
+- Response sent immediately without waiting for database commit
+- Data is still written to PostgreSQL (best-effort)
+- Errors are logged but not returned to client (per acks=0 contract)
+- Long-polling consumers are notified if write succeeds
+
+**Trade-offs:**
+- True fire-and-forget semantics (client doesn't wait)
+- Data loss possible if PostgreSQL fails after response sent
+- Suitable for high-throughput analytics pipelines where some loss is acceptable
 
 **Client Impact:**
-- Clients using `acks=0` will receive error responses
-- Workaround: Use `acks=1` (leader acknowledgment) instead
+- Works with standard Kafka clients using `acks=0`
+- Same behavior as real Kafka for fire-and-forget use cases
 
 ### 2. Compression ✅ Fully Supported (Phase 8)
 
@@ -293,7 +298,7 @@ impl KafkaError {
 ```properties
 # Producer settings
 bootstrap.servers=localhost:9092
-acks=1  # REQUIRED (acks=0 not supported)
+acks=1  # Default (acks=0 also supported for fire-and-forget)
 compression.type=gzip  # Optional: none, gzip, snappy, lz4, zstd
 enable.idempotence=false  # REQUIRED
 
