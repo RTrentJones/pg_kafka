@@ -184,8 +184,10 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     // Step 5b: Create notification channel for long polling support
     // This channel sends notifications from the database thread to the network thread
     // when new messages are produced. Used to wake up waiting FetchRequest handlers.
+    // Bounded to prevent OOM if produce rate >> consume rate. Dropped notifications
+    // are acceptable - fetch handlers fall back to polling.
     let (notify_tx, notify_rx) =
-        crossbeam_channel::unbounded::<crate::kafka::InternalNotification>();
+        crossbeam_channel::bounded::<crate::kafka::InternalNotification>(10_000);
 
     // Step 6: Create shutdown signal channel
     // Simple mpsc channel - network thread checks for message to shutdown
