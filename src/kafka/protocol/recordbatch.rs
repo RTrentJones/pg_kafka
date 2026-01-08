@@ -2,14 +2,17 @@
 //
 // Handles parsing of Kafka RecordBatch format into individual records.
 // Supports both RecordBatch v2 (Kafka 0.11+) and legacy MessageSet v0/v1.
+//
+// ## Thread Safety
+//
+// This module runs in the network thread and MUST NOT use pgrx logging.
+// All logging uses the `tracing` crate.
 
 use super::super::error::{KafkaError, Result};
 use super::super::messages::{Record, RecordHeader};
 use bytes::Buf;
 use kafka_protocol::records::RecordBatchDecoder;
-
-// Import conditional logging macros for test isolation
-use crate::{pg_log, pg_warning};
+use tracing::{debug, warn};
 
 /// Parse RecordBatch into individual Records
 ///
@@ -34,8 +37,8 @@ pub fn parse_record_batch(batch_bytes: &bytes::Bytes) -> Result<Vec<Record>> {
         return Ok(Vec::new());
     }
 
-    pg_log!("parse_record_batch: received {} bytes", batch_bytes.len());
-    pg_log!(
+    debug!("parse_record_batch: received {} bytes", batch_bytes.len());
+    debug!(
         "First 20 bytes: {:?}",
         &batch_bytes[..batch_bytes.len().min(20)]
     );
@@ -75,7 +78,7 @@ pub fn parse_record_batch(batch_bytes: &bytes::Bytes) -> Result<Vec<Record>> {
         }
         Err(e) => {
             // RecordBatch v2 decode failed, try MessageSet v0/v1 (legacy format)
-            pg_log!(
+            debug!(
                 "RecordBatch decode failed ({}), trying MessageSet v0/v1 format",
                 e
             );
@@ -104,7 +107,7 @@ fn parse_message_set_legacy(
         let message_size = buf.get_i32();
 
         if message_size < 0 || buf.remaining() < message_size as usize {
-            pg_warning!("Invalid message size in MessageSet: {}", message_size);
+            warn!("Invalid message size in MessageSet: {}", message_size);
             break;
         }
 
@@ -125,7 +128,7 @@ fn parse_message_set_legacy(
                 buf.copy_to_slice(&mut key_bytes);
                 Some(key_bytes)
             } else {
-                pg_warning!("Insufficient bytes for key");
+                warn!("Insufficient bytes for key");
                 break;
             }
         };
@@ -142,7 +145,7 @@ fn parse_message_set_legacy(
                 buf.copy_to_slice(&mut value_bytes);
                 Some(value_bytes)
             } else {
-                pg_warning!("Insufficient bytes for value");
+                warn!("Insufficient bytes for value");
                 break;
             }
         };
@@ -161,7 +164,7 @@ fn parse_message_set_legacy(
             original_error
         )))
     } else {
-        pg_log!(
+        debug!(
             "Successfully parsed {} records from MessageSet format",
             records.len()
         );

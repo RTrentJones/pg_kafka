@@ -2,34 +2,35 @@
 //
 // This module contains all Kafka-specific code:
 // - Binary protocol parsing/encoding
-// - Request/response types and message queues
+// - Request/response types
 // - TCP listener for accepting Kafka client connections
-// - Request handlers (ApiVersions, Metadata, Produce, Fetch)
+// - Request handlers (ApiVersions, Metadata, Produce, Fetch, etc.)
 //
-// Architecture Overview:
-// =====================
+// ## Two-Thread Architecture
 //
-// This module bridges two worlds:
+// This module bridges two threads:
 //
-// 1. ASYNC WORLD (Tokio):
+// 1. **Network Thread** (spawned, runs tokio multi-thread runtime):
 //    - Fast, non-blocking network I/O
 //    - Handles thousands of concurrent TCP connections
 //    - Parses binary Kafka protocol
-//    - Runs in a single-threaded tokio LocalSet (pgrx requirement)
+//    - Sends requests to main thread via crossbeam bounded channel
+//    - Uses `tracing` crate for logging (NOT pgrx - thread safety)
 //
-// 2. SYNC WORLD (Main Thread):
+// 2. **Database Thread** (main BGWorker):
 //    - Blocking database operations via Postgres SPI
-//    - Thread-safe (required for Postgres FFI)
-//    - Processes requests sequentially
+//    - Blocks on channel recv (instant wake-up when requests arrive)
+//    - Processes requests sequentially within transactions
+//    - Uses pgrx logging (safe on main thread)
 //
-// The MESSAGE QUEUE is the bridge:
-//   Async tasks → [Request Queue] → Main thread processes → [Response Queue] → Async tasks
+// The CROSSBEAM CHANNEL is the bridge:
+//   Network thread → [bounded(10_000)] → Database thread → [per-connection mpsc] → Network
 //
 // Why this architecture?
-// - Postgres SPI is NOT thread-safe and CANNOT be called from async/tokio context
-// - Network I/O benefits massively from async (one thread handles many connections)
-// - Database operations are inherently blocking anyway
-// - The queue cleanly separates concerns and prevents deadlocks
+// - Postgres SPI is NOT thread-safe and CANNOT be called from spawned threads
+// - Network I/O runs in parallel with database operations
+// - Blocking recv eliminates the 100ms latency floor of the old time-slicing design
+// - Bounded channel provides backpressure when DB can't keep up
 
 pub mod assignment;
 pub mod constants;
@@ -48,6 +49,6 @@ pub use constants::*;
 pub use coordinator::{GroupCoordinator, GroupState};
 pub use error::{KafkaError, Result};
 pub use listener::run as run_listener;
-pub use messages::{request_receiver, request_sender, KafkaRequest, KafkaResponse};
+pub use messages::{KafkaRequest, KafkaResponse};
 pub use response_builders::*;
 pub use storage::{KafkaStore, PostgresStore};

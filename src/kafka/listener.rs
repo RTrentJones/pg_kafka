@@ -3,20 +3,24 @@
 // This module implements the TCP listener that binds to the configured port
 // and accepts Kafka client connections. In Step 3, we parse Kafka protocol requests.
 //
-// Architecture note: The listener runs inside a tokio runtime, which is embedded
-// in the pgrx background worker. This allows us to handle thousands of concurrent
-// connections efficiently without blocking the Postgres main loop.
+// ## Thread Safety
+//
+// This module runs in a SPAWNED THREAD separate from the main Postgres BGWorker.
+// It MUST NOT call any pgrx functions (pg_log!, pgrx::error!, SPI, etc.).
+// All logging uses the `tracing` crate which is thread-safe.
+//
+// Architecture: The listener runs a multi-threaded tokio runtime and sends
+// parsed Kafka requests to the main thread via a crossbeam bounded channel.
 
+use crossbeam_channel::Sender;
 use futures::sink::SinkExt;
 use futures::stream::StreamExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
+use tracing::{debug, error, info, warn};
 
-use super::messages;
+use super::messages::KafkaRequest;
 use super::protocol;
-
-// Import conditional logging macros for test isolation
-use crate::{pg_log, pg_warning};
 
 /// Run the TCP listener
 ///
@@ -24,50 +28,66 @@ use crate::{pg_log, pg_warning};
 /// It accepts a pre-bound TcpListener and spawns a new async task
 /// for each incoming connection.
 ///
-/// The shutdown_rx channel is used to signal when the worker should stop.
-/// This allows graceful shutdown when Postgres sends SIGTERM.
+/// # Arguments
+/// * `listener` - Pre-bound TcpListener (bound in worker.rs)
+/// * `request_tx` - Channel sender for forwarding parsed requests to main thread
+/// * `shutdown_rx` - Channel receiver for shutdown signal from main thread
+/// * `log_connections` - Whether to log each new connection
 ///
-/// NOTE: The TcpListener is created and bound in worker.rs BEFORE this function
-/// is called. This ensures that bind failures are fatal and immediate, not
-/// hidden in retry loops.
+/// # Thread Safety
+/// This function runs in a spawned thread and MUST NOT call pgrx functions.
 pub async fn run(
-    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     listener: TcpListener,
+    request_tx: Sender<KafkaRequest>,
+    shutdown_rx: std::sync::mpsc::Receiver<()>,
     log_connections: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    pg_log!("pg_kafka TCP listener started");
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    info!("pg_kafka TCP listener started");
 
     // Accept loop: wait for new connections OR shutdown signal
     loop {
-        tokio::select! {
-            // Wait for new connection
-            result = listener.accept() => {
-                match result {
-                    Ok((socket, addr)) => {
-                        // Log connection if configured
-                        if log_connections {
-                            pg_log!("Accepted connection from {}", addr);
-                        }
-
-                        // Spawn a new async task to handle this connection
-                        // Use task_local::spawn_local since we're in a LocalSet (single-threaded)
-                        tokio::task::spawn_local(async move {
-                            if let Err(e) = handle_connection(socket).await {
-                                pg_warning!("Error handling connection: {}", e);
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        pg_warning!("Error accepting connection: {}", e);
-                    }
-                }
+        // Check for shutdown signal (non-blocking)
+        match shutdown_rx.try_recv() {
+            Ok(()) => {
+                info!("TCP listener received shutdown signal");
+                break;
             }
-            // Wait for shutdown signal
-            _ = shutdown_rx.changed() => {
-                if *shutdown_rx.borrow() {
-                    pg_log!("TCP listener received shutdown signal");
-                    break;
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                // No shutdown signal, continue
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                info!("Shutdown channel disconnected, exiting");
+                break;
+            }
+        }
+
+        // Accept with timeout to allow periodic shutdown checks
+        let accept_result =
+            tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept()).await;
+
+        match accept_result {
+            Ok(Ok((socket, addr))) => {
+                // Log connection if configured
+                if log_connections {
+                    info!("Accepted connection from {}", addr);
                 }
+
+                // Clone the sender for this connection
+                let conn_request_tx = request_tx.clone();
+
+                // Spawn a new async task to handle this connection
+                // Use tokio::spawn (not spawn_local) since we're in multi-thread runtime
+                tokio::spawn(async move {
+                    if let Err(e) = handle_connection(socket, conn_request_tx).await {
+                        warn!("Error handling connection from {}: {}", addr, e);
+                    }
+                });
+            }
+            Ok(Err(e)) => {
+                warn!("Error accepting connection: {}", e);
+            }
+            Err(_) => {
+                // Timeout - normal, continue to check shutdown signal
             }
         }
     }
@@ -81,12 +101,18 @@ pub async fn run(
 ///
 /// Flow:
 /// 1. Read request from socket (using LengthDelimitedCodec for automatic framing)
-/// 2. Parse request and send to main thread via queue
+/// 2. Parse request and send to main thread via channel
 /// 3. Wait for response from main thread
 /// 4. Encode and send response back to client
 /// 5. Repeat until client disconnects
-async fn handle_connection(socket: TcpStream) -> Result<(), Box<dyn std::error::Error>> {
-    pg_log!("New connection established, starting handle loop");
+///
+/// # Thread Safety
+/// This function runs in the network thread and MUST NOT call pgrx functions.
+async fn handle_connection(
+    socket: TcpStream,
+    request_tx: Sender<KafkaRequest>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    debug!("New connection established, starting handle loop");
 
     // Wrap socket in LengthDelimitedCodec for automatic size-prefix framing
     // Kafka uses big-endian 4-byte size prefix
@@ -104,70 +130,68 @@ async fn handle_connection(socket: TcpStream) -> Result<(), Box<dyn std::error::
     // Using tokio unbounded channel for async-friendly receive
     let (response_tx, mut response_rx) = tokio::sync::mpsc::unbounded_channel();
 
-    // Get the global request sender
-    let request_tx = messages::request_sender();
-
     // Connection loop: handle multiple requests on the same connection
     loop {
         // Read the next frame from the socket
         // LengthDelimitedCodec automatically handles size prefix
-        pg_log!("Waiting for next frame from client...");
+        debug!("Waiting for next frame from client...");
         let frame = match framed.next().await {
             Some(Ok(bytes)) => bytes,
             Some(Err(e)) => {
-                pg_warning!("Error reading frame: {}", e);
+                warn!("Error reading frame: {}", e);
                 break;
             }
             None => {
                 // Client closed connection gracefully
-                pg_log!("Client closed connection (stream ended)");
+                debug!("Client closed connection (stream ended)");
                 break;
             }
         };
 
-        pg_log!("Received frame of {} bytes", frame.len());
+        debug!("Received frame of {} bytes", frame.len());
 
         // Parse the request from the frame bytes
         match protocol::parse_request(frame, response_tx.clone()) {
             Ok(Some(request)) => {
-                pg_log!("Request parsed successfully, sending to main worker thread...");
+                debug!("Request parsed successfully, sending to main worker thread...");
                 // Send the parsed request to the main worker thread for processing
+                // Use send() which blocks if channel is full (backpressure)
                 if let Err(e) = request_tx.send(request) {
-                    pg_warning!("Failed to send request to worker thread: {}", e);
+                    error!("Failed to send request to worker thread: {}", e);
                     break;
                 }
-                pg_log!("Request sent to worker thread successfully via request_tx");
+                debug!("Request sent to worker thread successfully");
 
                 // Wait for the response from the main thread
-                // CRITICAL: Using tokio channel's async .recv() instead of blocking crossbeam recv()
+                // CRITICAL: Using tokio channel's async .recv() instead of blocking
                 // This allows the tokio runtime to continue processing other tasks
-                pg_log!("Waiting for response from main thread via response_rx...");
+                debug!("Waiting for response from main thread...");
                 match response_rx.recv().await {
                     Some(response) => {
-                        pg_log!("Received response from main thread, encoding...");
+                        debug!("Received response from main thread, encoding...");
                         // Encode the response
                         match protocol::encode_response(response) {
                             Ok(response_bytes) => {
-                                pg_log!(
+                                debug!(
                                     "Sending {} byte response to client...",
                                     response_bytes.len()
                                 );
                                 // Send the response frame
                                 // LengthDelimitedCodec automatically adds size prefix
                                 if let Err(e) = framed.send(response_bytes.freeze()).await {
-                                    pg_warning!("Failed to send response to client: {}", e);
+                                    warn!("Failed to send response to client: {}", e);
                                     break;
                                 }
-                                pg_log!("Response sent to client successfully");
+                                debug!("Response sent to client successfully");
                             }
                             Err(e) => {
-                                pg_warning!("Failed to encode response: {}", e);
+                                error!("Failed to encode response: {}", e);
                                 break;
                             }
                         }
                     }
                     None => {
-                        pg_warning!("Response channel closed by worker thread");
+                        warn!("Response channel closed by worker thread");
                         break;
                     }
                 }
@@ -177,7 +201,7 @@ async fn handle_connection(socket: TcpStream) -> Result<(), Box<dyn std::error::
                 break;
             }
             Err(e) => {
-                pg_warning!("Error parsing request: {}", e);
+                warn!("Error parsing request: {}", e);
                 break;
             }
         }

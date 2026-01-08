@@ -3,19 +3,42 @@
 // This module implements the persistent background worker that runs the Kafka
 // protocol listener. The worker is started by Postgres when the extension loads
 // (via shared_preload_libraries in postgresql.conf).
+//
+// ## Two-Thread Architecture
+//
+// This module uses a producer-consumer pattern with two threads:
+//
+// 1. **Network Thread** (spawned): Runs a tokio multi-thread runtime
+//    - Handles all TCP connections and Kafka protocol parsing
+//    - Sends requests via bounded crossbeam channel
+//    - Uses `tracing` for logging (NOT pgrx - thread safety)
+//
+// 2. **Database Thread** (main BGWorker): Blocks on channel recv
+//    - Processes requests via SPI within transactions
+//    - Instant wake-up when requests arrive (no polling delay)
+//    - Uses pgrx logging (safe on main thread)
+//
+// This eliminates the 100ms latency floor from the previous time-slicing design.
 
+use crossbeam_channel::RecvTimeoutError;
 use pgrx::bgworkers::{BackgroundWorker, SignalWakeFlags};
 use pgrx::prelude::*;
 use pgrx::Spi;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::time::{Duration, Instant};
 
 // Import conditional logging macros from lib.rs
 use crate::kafka::constants::*;
 use crate::{pg_log, pg_warning};
 
-/// How often to check for member timeouts (in main loop iterations)
-/// With ~100ms per iteration, 10 iterations = ~1 second between checks
-const TIMEOUT_CHECK_INTERVAL_ITERATIONS: u32 = 10;
+/// How often to check for member timeouts
+const TIMEOUT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Timeout for blocking recv - allows periodic signal checks
+const RECV_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// Capacity of the bounded request channel (backpressure threshold)
+const REQUEST_CHANNEL_CAPACITY: usize = 10_000;
 
 /// Verify that the kafka schema and required tables exist.
 /// Returns Ok(()) if all tables exist, Err with description if any are missing.
@@ -128,45 +151,38 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
         config.database
     );
 
-    // Step 4: Create shutdown channel for communicating between sync and async worlds
-    // The watch channel allows the sync signal handler to notify async tasks
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    // Step 4: Clone config values for use in threads
+    let port = config.port;
+    let host = config.host.clone();
+    let log_connections = config.log_connections;
+    let shutdown_timeout = Duration::from_millis(config.shutdown_timeout_ms as u64);
+    let broker_host = host.clone();
 
-    // Step 5: Create tokio runtime for async TCP listener
-    // CRITICAL: Must use current_thread runtime, NOT multi-threaded!
-    // Postgres FFI cannot be called from multiple threads, and pgrx enforces this.
-    // The current_thread runtime runs all tasks on a single thread.
-    let runtime = match tokio::runtime::Builder::new_current_thread()
+    // Step 5: Create bounded request channel (backpressure at 10,000 pending requests)
+    // This is the bridge between the network thread and the database thread.
+    let (request_tx, request_rx) =
+        crossbeam_channel::bounded::<crate::kafka::KafkaRequest>(REQUEST_CHANNEL_CAPACITY);
+
+    // Step 6: Create shutdown signal channel
+    // Simple mpsc channel - network thread checks for message to shutdown
+    let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
+
+    // Step 7: Bind TCP listener on main thread BEFORE spawning network thread
+    // This ensures bind failures are fatal and immediate
+    let bind_addr = format!("{}:{}", host, port);
+
+    // Create a temporary runtime just for binding
+    let bind_runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
     {
         Ok(rt) => rt,
         Err(e) => {
-            pgrx::error!("Failed to create tokio runtime: {}", e);
+            pgrx::error!("Failed to create tokio runtime for bind: {}", e);
         }
     };
 
-    // Step 6: Start the TCP listener as a local task
-    // We use LocalSet for single-threaded async execution
-    let local_set = tokio::task::LocalSet::new();
-
-    // Clone config for async context
-    let port = config.port;
-    let host = config.host.clone();
-    let log_connections = config.log_connections;
-    let shutdown_timeout = core::time::Duration::from_millis(config.shutdown_timeout_ms as u64);
-
-    // Clone host for worker processing (will be borrowed by async closure)
-    let broker_host = host.clone();
-
-    // Step 6b: Bind TCP listener BEFORE starting async tasks
-    // This ensures bind failures are fatal and immediate, not hidden in retry loops
-    let bind_addr = format!("{}:{}", host, port);
-    let tcp_listener = local_set.block_on(&runtime, async {
-        tokio::net::TcpListener::bind(&bind_addr).await
-    });
-
-    let tcp_listener = match tcp_listener {
+    let tcp_listener = match bind_runtime.block_on(tokio::net::TcpListener::bind(&bind_addr)) {
         Ok(listener) => {
             pg_log!("TCP listener bound to {}", bind_addr);
             listener
@@ -180,125 +196,167 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
             );
         }
     };
+    drop(bind_runtime); // No longer needed
 
-    // Spawn the listener task on the LocalSet
-    pg_log!("Spawning TCP listener task on LocalSet");
-    let listener_handle = local_set.spawn_local(async move {
-        pg_log!("Listener task started");
-        // No retry loop needed - binding already succeeded above
-        if let Err(e) =
-            crate::kafka::listener::run(shutdown_rx, tcp_listener, log_connections).await
-        {
-            pgrx::warning!("TCP listener error: {}", e);
-        }
-        pg_log!("Listener task exiting");
-    });
+    // Step 8: Spawn the network thread
+    // This thread runs a multi-threaded tokio runtime for handling all network I/O.
+    // CRITICAL: This thread must NEVER call pgrx functions - use tracing for logging.
+    pg_log!("Spawning network thread with tokio multi-thread runtime");
+    let network_handle = std::thread::Builder::new()
+        .name("pg_kafka-net".to_string())
+        .spawn(move || {
+            // Initialize tracing subscriber for this thread
+            // Output goes to stderr which Postgres captures
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::from_default_env()
+                        .add_directive("pg_kafka=info".parse().unwrap()),
+                )
+                .with_target(false)
+                .try_init();
 
-    // Step 7: Create consumer group coordinator
+            // Create multi-threaded tokio runtime
+            let rt = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .worker_threads(2)
+                .thread_name("pg_kafka-io")
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    tracing::error!("Failed to create tokio runtime: {}", e);
+                    return;
+                }
+            };
+
+            // Run the listener
+            rt.block_on(async move {
+                if let Err(e) = crate::kafka::listener::run(
+                    tcp_listener,
+                    request_tx,
+                    shutdown_rx,
+                    log_connections,
+                )
+                .await
+                {
+                    tracing::error!("TCP listener error: {}", e);
+                }
+            });
+        })
+        .expect("Failed to spawn network thread");
+
+    // Step 9: Create consumer group coordinator
     // This manages consumer group membership state in-memory
+    // Arc<RwLock> makes it safe to access from the coordinator handlers
     let coordinator = std::sync::Arc::new(crate::kafka::GroupCoordinator::new());
 
-    // Step 8: Get the request queue receiver
-    // This is how we receive Kafka requests from the async tokio tasks
-    let request_rx = crate::kafka::request_receiver();
+    pg_log!("Entering main event loop (two-thread architecture)");
 
-    // CRITICAL: Drive the LocalSet once to ensure the listener task starts
-    // before entering the main loop. Without this, the spawned task might not
-    // begin execution until the first loop iteration.
-    pg_log!("Driving LocalSet to start listener task");
-    local_set.block_on(&runtime, async {
-        // Give the listener task a chance to start and bind to the port
-        tokio::time::sleep(core::time::Duration::from_millis(10)).await;
-    });
-    pg_log!("Entering main event loop");
-
-    // Step 9: Main event loop
+    // Step 10: Main event loop
     // ═══════════════════════════════════════════════════════════════════════════════
-    // MAIN EVENT LOOP: The Heart of the Async/Sync Architecture
+    // MAIN EVENT LOOP: Two-Thread Producer-Consumer Architecture
     // ═══════════════════════════════════════════════════════════════════════════════
     //
-    // This loop serves FOUR critical functions:
+    // This loop is now dramatically simpler than the previous time-slicing design:
     //
-    // 1. PROCESS DATABASE REQUESTS (Sync World)
-    //    - Receive Kafka requests from the queue
-    //    - Execute blocking database operations via Postgres SPI
-    //    - Send responses back to async tasks
-    //    - WHY HERE: SPI can ONLY be called from the main thread in sync context
+    // 1. BLOCK ON CHANNEL (Instant Wake-up)
+    //    - recv_timeout() blocks until a request arrives OR timeout expires
+    //    - No polling, no CPU usage when idle
+    //    - Instant wake-up when network thread sends a request
     //
-    // 1.5. CHECK MEMBER TIMEOUTS (Phase 5: Automatic Rebalancing)
-    //    - Periodically scan consumer groups for timed-out members
-    //    - Remove dead members and trigger rebalance
-    //    - WHY HERE: Runs ~every 1 second to detect stale consumers
+    // 2. PROCESS DATABASE REQUEST (SPI in Transaction)
+    //    - Execute the request within BackgroundWorker::transaction()
+    //    - Send response back via the request's response channel
     //
-    // 2. DRIVE ASYNC NETWORK I/O (Async World)
-    //    - Run tokio tasks that handle TCP connections
-    //    - Parse Kafka binary protocol from sockets
-    //    - Accept new client connections
-    //    - WHY SEPARATE: Async I/O is non-blocking and handles thousands of connections
+    // 3. CHECK MEMBER TIMEOUTS (Periodic, ~1 second)
+    //    - Scan consumer groups for timed-out members
+    //    - Trigger rebalancing if needed
     //
-    // 3. CHECK FOR SHUTDOWN SIGNALS (Postgres Integration)
-    //    - Poll for SIGTERM from Postgres
-    //    - Ensure graceful shutdown on server stop
-    //    - WHY POLLING: pgrx requires regular latch checks for signal handling
+    // 4. CHECK SHUTDOWN SIGNAL (On Each Timeout)
+    //    - BackgroundWorker::sigterm_received() checks for Postgres shutdown
+    //    - Graceful shutdown when detected
     //
-    // The TIMING is carefully balanced:
-    // - 100ms for async I/O: Long enough to batch network operations efficiently
-    // - 1ms for signal check: Short enough for responsive shutdown
-    // - Non-blocking queue check: No delay for processing database requests
-    // - ~1 second for timeout check: Reasonable granularity for session detection
-    //
-    // This architecture solves the fundamental incompatibility:
-    // - Tokio wants async functions (network I/O benefits from non-blocking)
-    // - Postgres SPI wants sync functions on main thread (database safety)
-    // - The queue bridges these worlds cleanly
+    // The network thread runs independently, handling all TCP I/O in parallel.
+    // This eliminates the 100ms latency floor from the previous design.
     // ═══════════════════════════════════════════════════════════════════════════════
 
-    // Counter for throttling periodic tasks (timeout checks)
-    let mut loop_iteration: u32 = 0;
+    let mut last_timeout_check = Instant::now();
 
     loop {
         // ┌─────────────────────────────────────────────────────────────┐
-        // │ PART 1: Process Database Requests (SYNC, Blocking)         │
+        // │ Check for Postgres Shutdown Signal                         │
         // └─────────────────────────────────────────────────────────────┘
-        // Process all pending requests without blocking.
-        // Each request is processed in its own transaction using BackgroundWorker::transaction().
-        // This is required for SPI calls (INSERT/SELECT) to work correctly.
-        while let Ok(request) = request_rx.try_recv() {
-            // CRITICAL: Wrap each request in a transaction
-            // Background workers don't have implicit transactions like client sessions do.
-            // BackgroundWorker::transaction() starts a transaction, calls our closure,
-            // and commits/rolls back based on the result.
-            let coord = coordinator.clone();
-            let broker_h = broker_host.clone();
-            let broker_p = port;
-            BackgroundWorker::transaction(move || {
-                // Wrap in catch_unwind to prevent handler panics from crashing the worker
-                let result = catch_unwind(AssertUnwindSafe(|| {
-                    process_request(request, &coord, &broker_h, broker_p);
-                }));
+        if BackgroundWorker::sigterm_received() {
+            log!("pg_kafka background worker shutting down");
 
-                if let Err(panic_info) = result {
-                    // Extract panic message for logging
-                    let panic_msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
-                        s.to_string()
-                    } else if let Some(s) = panic_info.downcast_ref::<String>() {
-                        s.clone()
-                    } else {
-                        "Unknown panic".to_string()
-                    };
-                    pg_warning!("Handler panic caught (worker survived): {}", panic_msg);
-                    // Note: Response channel may be closed, but worker continues
+            // Signal the network thread to stop
+            let _ = shutdown_tx.send(());
+
+            // Wait for network thread to finish (with timeout)
+            let join_start = Instant::now();
+            loop {
+                if network_handle.is_finished() {
+                    log!("pg_kafka network thread shut down cleanly");
+                    break;
                 }
-            });
+                if join_start.elapsed() > shutdown_timeout {
+                    pgrx::warning!("pg_kafka network thread shutdown timed out");
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+
+            break;
         }
 
         // ┌─────────────────────────────────────────────────────────────┐
-        // │ PART 1.5: Check Member Timeouts (Phase 5: Rebalancing)     │
+        // │ Wait for Next Request (Blocking with Timeout)              │
         // └─────────────────────────────────────────────────────────────┘
-        // Periodically check for members that have stopped sending heartbeats.
-        // This enables automatic rebalancing when consumers die without LeaveGroup.
-        loop_iteration = loop_iteration.wrapping_add(1);
-        if loop_iteration.is_multiple_of(TIMEOUT_CHECK_INTERVAL_ITERATIONS) {
+        // This is the key performance improvement: we block until work arrives.
+        // No CPU usage when idle, instant wake-up when requests come in.
+        match request_rx.recv_timeout(RECV_TIMEOUT) {
+            Ok(request) => {
+                // ┌─────────────────────────────────────────────────────┐
+                // │ Process Database Request (SPI in Transaction)      │
+                // └─────────────────────────────────────────────────────┘
+                let coord = coordinator.clone();
+                let broker_h = broker_host.clone();
+                let broker_p = port;
+
+                BackgroundWorker::transaction(move || {
+                    // Wrap in catch_unwind to prevent handler panics from crashing the worker
+                    let result = catch_unwind(AssertUnwindSafe(|| {
+                        process_request(request, &coord, &broker_h, broker_p);
+                    }));
+
+                    if let Err(panic_info) = result {
+                        let panic_msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                            s.to_string()
+                        } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                            s.clone()
+                        } else {
+                            "Unknown panic".to_string()
+                        };
+                        pg_warning!("Handler panic caught (worker survived): {}", panic_msg);
+                    }
+                });
+            }
+
+            Err(RecvTimeoutError::Timeout) => {
+                // No requests within timeout - this is normal, continue to check signals
+            }
+
+            Err(RecvTimeoutError::Disconnected) => {
+                // Channel closed - network thread has exited
+                log!("Request channel disconnected, shutting down");
+                break;
+            }
+        }
+
+        // ┌─────────────────────────────────────────────────────────────┐
+        // │ Check Member Timeouts (Periodic, ~1 second)                │
+        // └─────────────────────────────────────────────────────────────┘
+        if last_timeout_check.elapsed() >= TIMEOUT_CHECK_INTERVAL {
             let removed = coordinator.check_and_remove_timed_out_members();
             for (group_id, member_id) in removed {
                 pg_log!(
@@ -307,65 +365,7 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
                     group_id
                 );
             }
-        }
-
-        // ┌─────────────────────────────────────────────────────────────┐
-        // │ PART 2: Drive Async Network I/O (ASYNC, Non-blocking)      │
-        // └─────────────────────────────────────────────────────────────┘
-        // Drive the LocalSet forward for a short duration to process async tasks:
-        // - TCP accept() calls
-        // - Socket read()/write() calls
-        // - Kafka protocol parsing
-        // Then we return to sync context to process database requests.
-        //
-        // CRITICAL: Use LocalSet::block_on with the runtime to properly poll tasks.
-        // The timeout ensures we return to sync context to process database requests.
-        local_set.block_on(&runtime, async {
-            // Use timeout to limit async processing duration, then return to sync context
-            let _ = tokio::time::timeout(
-                core::time::Duration::from_millis(crate::kafka::ASYNC_IO_INTERVAL_MS),
-                std::future::pending::<()>(),
-            )
-            .await;
-            // Timeout is expected (Err) - it means we processed I/O for 100ms
-        });
-
-        // ┌─────────────────────────────────────────────────────────────┐
-        // │ PART 3: Check for Shutdown Signal (POSTGRES Integration)   │
-        // └─────────────────────────────────────────────────────────────┘
-        // wait_latch(SIGNAL_CHECK_INTERVAL_MS) returns false when Postgres sends SIGTERM.
-        // This is the SYNC boundary - we're fully outside async context.
-        // CRITICAL: This must be polled regularly for graceful shutdown.
-        if !BackgroundWorker::wait_latch(Some(core::time::Duration::from_millis(
-            crate::kafka::SIGNAL_CHECK_INTERVAL_MS,
-        ))) {
-            log!("pg_kafka background worker shutting down");
-
-            // Signal the async listener to stop
-            let _ = shutdown_tx.send(true);
-
-            // Step 10: Graceful shutdown - wait for listener to finish
-            runtime.block_on(async {
-                // Give the listener configured timeout to shut down cleanly
-                // We need to drive the LocalSet to completion for the listener to actually finish
-                let shutdown_result =
-                    tokio::time::timeout(shutdown_timeout, local_set.run_until(listener_handle))
-                        .await;
-
-                match shutdown_result {
-                    Ok(Ok(_)) => {
-                        log!("pg_kafka TCP listener shut down cleanly");
-                    }
-                    Ok(Err(e)) => {
-                        pgrx::warning!("pg_kafka TCP listener error during shutdown: {:?}", e);
-                    }
-                    Err(_) => {
-                        pgrx::warning!("pg_kafka TCP listener shutdown timed out");
-                    }
-                }
-            });
-
-            break;
+            last_timeout_check = Instant::now();
         }
     }
 }

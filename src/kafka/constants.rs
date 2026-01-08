@@ -207,21 +207,9 @@ pub fn get_response_header_version(api_key: i16, api_version: i16) -> i16 {
     }
 }
 
-// ===== Worker Timing Constants =====
-
-/// Async I/O processing interval (milliseconds)
-///
-/// How long to process async network I/O before checking for database requests.
-/// Balances network throughput vs database operation latency.
-/// Too high: Database operations wait longer for processing
-/// Too low: Overhead from frequent context switches
-pub const ASYNC_IO_INTERVAL_MS: u64 = 100;
-
-/// Signal check interval (milliseconds)
-///
-/// How often to check for Postgres shutdown signals (SIGTERM).
-/// Must be short for responsive shutdown, but not too short to avoid busy-waiting.
-pub const SIGNAL_CHECK_INTERVAL_MS: u64 = 1;
+// Note: ASYNC_IO_INTERVAL_MS and SIGNAL_CHECK_INTERVAL_MS were removed.
+// The two-thread architecture now uses blocking recv_timeout() in worker.rs
+// with constants defined there (RECV_TIMEOUT, TIMEOUT_CHECK_INTERVAL).
 
 // ===== Network Hosts =====
 

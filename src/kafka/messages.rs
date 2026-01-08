@@ -1,21 +1,15 @@
-// Message queue module for pg_kafka
+// Message types module for pg_kafka
 //
-// This module defines the message types and queues used to communicate between
-// the async tokio tasks (network I/O) and the sync background worker main thread
-// (SPI database operations).
+// This module defines the message types used to communicate between
+// the network thread (tokio) and the database thread (main BGWorker).
 //
-// Architecture:
-// - Tokio tasks parse Kafka requests from TCP sockets → send to REQUEST_QUEUE
-// - Background worker receives from REQUEST_QUEUE → processes → sends to RESPONSE_QUEUE
-// - Tokio tasks receive from RESPONSE_QUEUE → encode → write to TCP sockets
+// ## Two-Thread Architecture
 //
-// Why this design?
-// - Postgres SPI (database operations) cannot be called from async/tokio context
-// - SPI must run on the background worker's main thread
-// - The queue bridges the async networking world and sync database world
-
-use crossbeam_channel::{unbounded, Receiver, Sender};
-use once_cell::sync::Lazy;
+// - Network thread: Parses Kafka requests, sends via crossbeam channel
+// - Database thread: Receives requests, processes via SPI, sends responses
+// - Response channel: Per-connection tokio mpsc for async response handling
+//
+// The crossbeam channel is created in worker.rs and passed to the listener.
 
 /// Kafka request types that can be sent from async tasks to the main worker thread
 #[derive(Debug)]
@@ -732,37 +726,8 @@ impl From<kafka_protocol::messages::list_offsets_request::ListOffsetsPartition>
     }
 }
 
-// Global request queue: async tasks → main thread
-//
-// WHY CROSSBEAM INSTEAD OF TOKIO CHANNELS?
-// =========================================
-//
-// We use crossbeam_channel instead of tokio::sync::mpsc because:
-//
-// 1. SYNC/ASYNC BOUNDARY:
-//    - The main worker thread is SYNC (cannot use .await)
-//    - Tokio channels require async context for recv()
-//    - Crossbeam provides sync try_recv() that works in sync code
-//
-// 2. ARCHITECTURE:
-//    - Async tokio tasks send requests via Sender (works from async)
-//    - Sync main thread receives via try_recv() (works from sync)
-//    - This is the bridge between the async network I/O and sync SPI
-//
-// 3. UNBOUNDED QUEUE:
-//    - Kafka clients can pipeline many requests
-//    - Backpressure is handled at TCP level (flow control)
-//    - We don't want to block async tasks on queue capacity
-//
-// See src/worker.rs:120 for the sync recv side: `while let Ok(req) = request_rx.try_recv()`
-static REQUEST_QUEUE: Lazy<(Sender<KafkaRequest>, Receiver<KafkaRequest>)> = Lazy::new(unbounded);
-
-/// Get the sender side of the request queue (for async tasks)
-pub fn request_sender() -> Sender<KafkaRequest> {
-    REQUEST_QUEUE.0.clone()
-}
-
-/// Get the receiver side of the request queue (for main worker thread)
-pub fn request_receiver() -> Receiver<KafkaRequest> {
-    REQUEST_QUEUE.1.clone()
-}
+// Note: The request channel is now created in worker.rs and passed explicitly
+// to the listener. This enables:
+// - Bounded channels for backpressure (10,000 capacity)
+// - Cleaner ownership model (no global static)
+// - Easier testing with injected channels

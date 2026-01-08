@@ -1,6 +1,11 @@
 // Request decoding module
 //
 // Handles parsing of Kafka requests from binary wire protocol format.
+//
+// ## Thread Safety
+//
+// This module runs in the network thread and MUST NOT use pgrx logging.
+// All logging uses the `tracing` crate.
 
 use bytes::BytesMut;
 use kafka_protocol::messages::fetch_request::FetchRequest;
@@ -8,14 +13,12 @@ use kafka_protocol::messages::offset_commit_request::OffsetCommitRequest;
 use kafka_protocol::messages::offset_fetch_request::OffsetFetchRequest;
 use kafka_protocol::messages::produce_request::ProduceRequest;
 use kafka_protocol::protocol::{decode_request_header_from_buffer, Decodable};
+use tracing::{debug, warn};
 
 use super::super::constants::*;
 use super::super::error::{KafkaError, Result};
 use super::super::messages::KafkaRequest;
 use super::recordbatch::parse_record_batch;
-
-// Import conditional logging macros for test isolation
-use crate::{pg_log, pg_warning};
 
 /// Parse a Kafka request from a frame
 ///
@@ -33,7 +36,7 @@ pub fn parse_request(
     frame: BytesMut,
     response_tx: tokio::sync::mpsc::UnboundedSender<super::super::messages::KafkaResponse>,
 ) -> Result<Option<KafkaRequest>> {
-    pg_log!("Parsing request from {} byte frame", frame.len());
+    debug!("Parsing request from {} byte frame", frame.len());
 
     // Parse RequestHeader using kafka-protocol's decode function
     // This automatically handles both non-flexible and flexible header formats
@@ -42,7 +45,7 @@ pub fn parse_request(
     let header = match decode_request_header_from_buffer(&mut payload_buf) {
         Ok(h) => h,
         Err(e) => {
-            pg_warning!("Failed to decode RequestHeader: {}", e);
+            warn!("Failed to decode RequestHeader: {}", e);
             return Err(KafkaError::ProtocolCodec(e));
         }
     };
@@ -52,12 +55,9 @@ pub fn parse_request(
     let correlation_id = header.correlation_id;
     let client_id = header.client_id.map(|s| s.to_string());
 
-    pg_log!(
+    debug!(
         "Parsed RequestHeader: api_key={}, api_version={}, correlation_id={}, client_id={:?}",
-        api_key,
-        api_version,
-        correlation_id,
-        client_id
+        api_key, api_version, correlation_id, client_id
     );
 
     // Match on api_key to determine request type
@@ -186,7 +186,7 @@ pub fn parse_request(
         ),
         _ => {
             // Unsupported API
-            pg_warning!("Unsupported API key: {}", api_key);
+            warn!("Unsupported API key: {}", api_key);
 
             // Send error response immediately
             let error_response = super::super::messages::KafkaResponse::Error {
@@ -208,10 +208,9 @@ fn parse_api_versions(
     response_tx: tokio::sync::mpsc::UnboundedSender<super::super::messages::KafkaResponse>,
 ) -> Result<Option<KafkaRequest>> {
     // ApiVersions request - the body is empty
-    pg_log!(
+    debug!(
         "Parsed ApiVersions request (api_key={}, api_version={})",
-        API_KEY_API_VERSIONS,
-        api_version
+        API_KEY_API_VERSIONS, api_version
     );
     Ok(Some(KafkaRequest::ApiVersions {
         correlation_id,
@@ -228,10 +227,9 @@ fn parse_metadata(
     api_version: i16,
     response_tx: tokio::sync::mpsc::UnboundedSender<super::super::messages::KafkaResponse>,
 ) -> Result<Option<KafkaRequest>> {
-    pg_log!(
+    debug!(
         "Parsed Metadata request (api_key={}, version={})",
-        API_KEY_METADATA,
-        api_version
+        API_KEY_METADATA, api_version
     );
 
     // Use kafka-protocol crate to decode MetadataRequest
@@ -241,7 +239,7 @@ fn parse_metadata(
     ) {
         Ok(req) => req,
         Err(e) => {
-            pg_warning!("Failed to decode MetadataRequest: {}", e);
+            warn!("Failed to decode MetadataRequest: {}", e);
             let error_response = super::super::messages::KafkaResponse::Error {
                 correlation_id,
                 error_code: ERROR_CORRUPT_MESSAGE,
@@ -259,7 +257,7 @@ fn parse_metadata(
                 .iter()
                 .filter_map(|t| t.name.as_ref().map(|n| n.to_string()))
                 .collect();
-            pg_log!("Metadata request for specific topics: {:?}", topic_names);
+            debug!("Metadata request for specific topics: {:?}", topic_names);
             if topic_names.is_empty() {
                 None
             } else {
@@ -267,7 +265,7 @@ fn parse_metadata(
             }
         }
         _ => {
-            pg_log!("Metadata request for ALL topics");
+            debug!("Metadata request for ALL topics");
             None
         }
     };
@@ -288,17 +286,16 @@ fn parse_produce(
     api_version: i16,
     response_tx: tokio::sync::mpsc::UnboundedSender<super::super::messages::KafkaResponse>,
 ) -> Result<Option<KafkaRequest>> {
-    pg_log!(
+    debug!(
         "Parsed Produce request (api_key={}, version={})",
-        API_KEY_PRODUCE,
-        api_version
+        API_KEY_PRODUCE, api_version
     );
 
     // Use kafka-protocol crate to decode ProduceRequest
     let produce_req = match ProduceRequest::decode(payload_buf, api_version) {
         Ok(req) => req,
         Err(e) => {
-            pg_warning!("Failed to decode ProduceRequest: {}", e);
+            warn!("Failed to decode ProduceRequest: {}", e);
             let error_response = super::super::messages::KafkaResponse::Error {
                 correlation_id,
                 error_code: ERROR_CORRUPT_MESSAGE,
@@ -312,7 +309,7 @@ fn parse_produce(
     let acks = produce_req.acks;
     let timeout_ms = produce_req.timeout_ms;
 
-    pg_log!(
+    debug!(
         "ProduceRequest: acks={}, timeout_ms={}, topics={}",
         acks,
         timeout_ms,
@@ -333,11 +330,9 @@ fn parse_produce(
                 Some(batch_bytes) => match parse_record_batch(batch_bytes) {
                     Ok(records) => records,
                     Err(e) => {
-                        pg_warning!(
+                        warn!(
                             "Failed to parse RecordBatch for topic={}, partition={}: {}",
-                            topic_name,
-                            partition_index,
-                            e
+                            topic_name, partition_index, e
                         );
                         let error_response = super::super::messages::KafkaResponse::Error {
                             correlation_id,
@@ -351,7 +346,7 @@ fn parse_produce(
                 None => Vec::new(),
             };
 
-            pg_log!(
+            debug!(
                 "Parsed {} records for topic={}, partition={}",
                 records.len(),
                 topic_name,
@@ -388,16 +383,15 @@ fn parse_fetch(
     api_version: i16,
     response_tx: tokio::sync::mpsc::UnboundedSender<super::super::messages::KafkaResponse>,
 ) -> Result<Option<KafkaRequest>> {
-    pg_log!(
+    debug!(
         "Parsed Fetch request (api_key={}, version={})",
-        API_KEY_FETCH,
-        api_version
+        API_KEY_FETCH, api_version
     );
 
     let fetch_req = match FetchRequest::decode(payload_buf, api_version) {
         Ok(req) => req,
         Err(e) => {
-            pg_warning!("Failed to decode FetchRequest: {}", e);
+            warn!("Failed to decode FetchRequest: {}", e);
             let error_response = super::super::messages::KafkaResponse::Error {
                 correlation_id,
                 error_code: ERROR_CORRUPT_MESSAGE,
@@ -412,7 +406,7 @@ fn parse_fetch(
     let min_bytes = fetch_req.min_bytes;
     let max_bytes = fetch_req.max_bytes;
 
-    pg_log!(
+    debug!(
         "FetchRequest: max_wait_ms={}, min_bytes={}, max_bytes={}, topics={}",
         max_wait_ms,
         min_bytes,
@@ -433,7 +427,7 @@ fn parse_fetch(
             });
         }
 
-        pg_log!(
+        debug!(
             "Fetch from topic={}, {} partitions",
             topic_name,
             partitions.len()
@@ -464,16 +458,15 @@ fn parse_offset_commit(
     api_version: i16,
     response_tx: tokio::sync::mpsc::UnboundedSender<super::super::messages::KafkaResponse>,
 ) -> Result<Option<KafkaRequest>> {
-    pg_log!(
+    debug!(
         "Parsed OffsetCommit request (api_key={}, version={})",
-        API_KEY_OFFSET_COMMIT,
-        api_version
+        API_KEY_OFFSET_COMMIT, api_version
     );
 
     let commit_req = match OffsetCommitRequest::decode(payload_buf, api_version) {
         Ok(req) => req,
         Err(e) => {
-            pg_warning!("Failed to decode OffsetCommitRequest: {}", e);
+            warn!("Failed to decode OffsetCommitRequest: {}", e);
             let error_response = super::super::messages::KafkaResponse::Error {
                 correlation_id,
                 error_code: ERROR_CORRUPT_MESSAGE,
@@ -486,7 +479,7 @@ fn parse_offset_commit(
 
     let group_id = commit_req.group_id.to_string();
 
-    pg_log!(
+    debug!(
         "OffsetCommit for group_id={}, {} topics",
         group_id,
         commit_req.topics.len()
@@ -531,16 +524,15 @@ fn parse_offset_fetch(
     api_version: i16,
     response_tx: tokio::sync::mpsc::UnboundedSender<super::super::messages::KafkaResponse>,
 ) -> Result<Option<KafkaRequest>> {
-    pg_log!(
+    debug!(
         "Parsed OffsetFetch request (api_key={}, version={})",
-        API_KEY_OFFSET_FETCH,
-        api_version
+        API_KEY_OFFSET_FETCH, api_version
     );
 
     let fetch_req = match OffsetFetchRequest::decode(payload_buf, api_version) {
         Ok(req) => req,
         Err(e) => {
-            pg_warning!("Failed to decode OffsetFetchRequest: {}", e);
+            warn!("Failed to decode OffsetFetchRequest: {}", e);
             let error_response = super::super::messages::KafkaResponse::Error {
                 correlation_id,
                 error_code: ERROR_CORRUPT_MESSAGE,
@@ -552,7 +544,7 @@ fn parse_offset_fetch(
     };
 
     let group_id = fetch_req.group_id.to_string();
-    pg_log!("OffsetFetch for group_id={}", group_id);
+    debug!("OffsetFetch for group_id={}", group_id);
 
     let topics = if let Some(topic_vec) = fetch_req.topics {
         if topic_vec.is_empty() {
@@ -591,10 +583,9 @@ fn parse_find_coordinator(
     api_version: i16,
     response_tx: tokio::sync::mpsc::UnboundedSender<super::super::messages::KafkaResponse>,
 ) -> Result<Option<KafkaRequest>> {
-    pg_log!(
+    debug!(
         "Parsed FindCoordinator request (api_key={}, version={})",
-        API_KEY_FIND_COORDINATOR,
-        api_version
+        API_KEY_FIND_COORDINATOR, api_version
     );
 
     let coord_req =
@@ -604,7 +595,7 @@ fn parse_find_coordinator(
         ) {
             Ok(req) => req,
             Err(e) => {
-                pg_warning!("Failed to decode FindCoordinatorRequest: {}", e);
+                warn!("Failed to decode FindCoordinatorRequest: {}", e);
                 let error_response = super::super::messages::KafkaResponse::Error {
                     correlation_id,
                     error_code: ERROR_CORRUPT_MESSAGE,
@@ -635,10 +626,9 @@ fn parse_join_group(
     api_version: i16,
     response_tx: tokio::sync::mpsc::UnboundedSender<super::super::messages::KafkaResponse>,
 ) -> Result<Option<KafkaRequest>> {
-    pg_log!(
+    debug!(
         "Parsed JoinGroup request (api_key={}, version={})",
-        API_KEY_JOIN_GROUP,
-        api_version
+        API_KEY_JOIN_GROUP, api_version
     );
 
     let join_req = match kafka_protocol::messages::join_group_request::JoinGroupRequest::decode(
@@ -647,7 +637,7 @@ fn parse_join_group(
     ) {
         Ok(req) => req,
         Err(e) => {
-            pg_warning!("Failed to decode JoinGroupRequest: {}", e);
+            warn!("Failed to decode JoinGroupRequest: {}", e);
             let error_response = super::super::messages::KafkaResponse::Error {
                 correlation_id,
                 error_code: ERROR_CORRUPT_MESSAGE,
@@ -693,10 +683,9 @@ fn parse_sync_group(
     api_version: i16,
     response_tx: tokio::sync::mpsc::UnboundedSender<super::super::messages::KafkaResponse>,
 ) -> Result<Option<KafkaRequest>> {
-    pg_log!(
+    debug!(
         "Parsed SyncGroup request (api_key={}, version={})",
-        API_KEY_SYNC_GROUP,
-        api_version
+        API_KEY_SYNC_GROUP, api_version
     );
 
     let sync_req = match kafka_protocol::messages::sync_group_request::SyncGroupRequest::decode(
@@ -705,7 +694,7 @@ fn parse_sync_group(
     ) {
         Ok(req) => req,
         Err(e) => {
-            pg_warning!("Failed to decode SyncGroupRequest: {}", e);
+            warn!("Failed to decode SyncGroupRequest: {}", e);
             let error_response = super::super::messages::KafkaResponse::Error {
                 correlation_id,
                 error_code: ERROR_CORRUPT_MESSAGE,
@@ -751,10 +740,9 @@ fn parse_heartbeat(
     api_version: i16,
     response_tx: tokio::sync::mpsc::UnboundedSender<super::super::messages::KafkaResponse>,
 ) -> Result<Option<KafkaRequest>> {
-    pg_log!(
+    debug!(
         "Parsed Heartbeat request (api_key={}, version={})",
-        API_KEY_HEARTBEAT,
-        api_version
+        API_KEY_HEARTBEAT, api_version
     );
 
     let heartbeat_req = match kafka_protocol::messages::heartbeat_request::HeartbeatRequest::decode(
@@ -763,7 +751,7 @@ fn parse_heartbeat(
     ) {
         Ok(req) => req,
         Err(e) => {
-            pg_warning!("Failed to decode HeartbeatRequest: {}", e);
+            warn!("Failed to decode HeartbeatRequest: {}", e);
             let error_response = super::super::messages::KafkaResponse::Error {
                 correlation_id,
                 error_code: ERROR_CORRUPT_MESSAGE,
@@ -798,10 +786,9 @@ fn parse_leave_group(
     api_version: i16,
     response_tx: tokio::sync::mpsc::UnboundedSender<super::super::messages::KafkaResponse>,
 ) -> Result<Option<KafkaRequest>> {
-    pg_log!(
+    debug!(
         "Parsed LeaveGroup request (api_key={}, version={})",
-        API_KEY_LEAVE_GROUP,
-        api_version
+        API_KEY_LEAVE_GROUP, api_version
     );
 
     let leave_req = match kafka_protocol::messages::leave_group_request::LeaveGroupRequest::decode(
@@ -810,7 +797,7 @@ fn parse_leave_group(
     ) {
         Ok(req) => req,
         Err(e) => {
-            pg_warning!("Failed to decode LeaveGroupRequest: {}", e);
+            warn!("Failed to decode LeaveGroupRequest: {}", e);
             let error_response = super::super::messages::KafkaResponse::Error {
                 correlation_id,
                 error_code: ERROR_CORRUPT_MESSAGE,
@@ -848,10 +835,9 @@ fn parse_list_offsets(
     api_version: i16,
     response_tx: tokio::sync::mpsc::UnboundedSender<super::super::messages::KafkaResponse>,
 ) -> Result<Option<KafkaRequest>> {
-    pg_log!(
+    debug!(
         "Parsed ListOffsets request (api_key={}, version={})",
-        API_KEY_LIST_OFFSETS,
-        api_version
+        API_KEY_LIST_OFFSETS, api_version
     );
 
     let list_req = match kafka_protocol::messages::list_offsets_request::ListOffsetsRequest::decode(
@@ -860,7 +846,7 @@ fn parse_list_offsets(
     ) {
         Ok(req) => req,
         Err(e) => {
-            pg_warning!("Failed to decode ListOffsetsRequest: {}", e);
+            warn!("Failed to decode ListOffsetsRequest: {}", e);
             let error_response = super::super::messages::KafkaResponse::Error {
                 correlation_id,
                 error_code: ERROR_CORRUPT_MESSAGE,
@@ -909,10 +895,9 @@ fn parse_describe_groups(
     api_version: i16,
     response_tx: tokio::sync::mpsc::UnboundedSender<super::super::messages::KafkaResponse>,
 ) -> Result<Option<KafkaRequest>> {
-    pg_log!(
+    debug!(
         "Parsed DescribeGroups request (api_key={}, version={})",
-        API_KEY_DESCRIBE_GROUPS,
-        api_version
+        API_KEY_DESCRIBE_GROUPS, api_version
     );
 
     let describe_req =
@@ -922,7 +907,7 @@ fn parse_describe_groups(
         ) {
             Ok(req) => req,
             Err(e) => {
-                pg_warning!("Failed to decode DescribeGroupsRequest: {}", e);
+                warn!("Failed to decode DescribeGroupsRequest: {}", e);
                 let error_response = super::super::messages::KafkaResponse::Error {
                     correlation_id,
                     error_code: ERROR_CORRUPT_MESSAGE,
@@ -958,10 +943,9 @@ fn parse_list_groups(
     api_version: i16,
     response_tx: tokio::sync::mpsc::UnboundedSender<super::super::messages::KafkaResponse>,
 ) -> Result<Option<KafkaRequest>> {
-    pg_log!(
+    debug!(
         "Parsed ListGroups request (api_key={}, version={})",
-        API_KEY_LIST_GROUPS,
-        api_version
+        API_KEY_LIST_GROUPS, api_version
     );
 
     let list_req = match kafka_protocol::messages::list_groups_request::ListGroupsRequest::decode(
@@ -970,7 +954,7 @@ fn parse_list_groups(
     ) {
         Ok(req) => req,
         Err(e) => {
-            pg_warning!("Failed to decode ListGroupsRequest: {}", e);
+            warn!("Failed to decode ListGroupsRequest: {}", e);
             let error_response = super::super::messages::KafkaResponse::Error {
                 correlation_id,
                 error_code: ERROR_CORRUPT_MESSAGE,
@@ -1005,10 +989,9 @@ fn parse_create_topics(
     api_version: i16,
     response_tx: tokio::sync::mpsc::UnboundedSender<super::super::messages::KafkaResponse>,
 ) -> Result<Option<KafkaRequest>> {
-    pg_log!(
+    debug!(
         "Parsed CreateTopics request (api_key={}, version={})",
-        API_KEY_CREATE_TOPICS,
-        api_version
+        API_KEY_CREATE_TOPICS, api_version
     );
 
     let create_req =
@@ -1018,7 +1001,7 @@ fn parse_create_topics(
         ) {
             Ok(req) => req,
             Err(e) => {
-                pg_warning!("Failed to decode CreateTopicsRequest: {}", e);
+                warn!("Failed to decode CreateTopicsRequest: {}", e);
                 let error_response = super::super::messages::KafkaResponse::Error {
                     correlation_id,
                     error_code: ERROR_CORRUPT_MESSAGE,
@@ -1060,10 +1043,9 @@ fn parse_delete_topics(
     api_version: i16,
     response_tx: tokio::sync::mpsc::UnboundedSender<super::super::messages::KafkaResponse>,
 ) -> Result<Option<KafkaRequest>> {
-    pg_log!(
+    debug!(
         "Parsed DeleteTopics request (api_key={}, version={})",
-        API_KEY_DELETE_TOPICS,
-        api_version
+        API_KEY_DELETE_TOPICS, api_version
     );
 
     let delete_req =
@@ -1073,7 +1055,7 @@ fn parse_delete_topics(
         ) {
             Ok(req) => req,
             Err(e) => {
-                pg_warning!("Failed to decode DeleteTopicsRequest: {}", e);
+                warn!("Failed to decode DeleteTopicsRequest: {}", e);
                 let error_response = super::super::messages::KafkaResponse::Error {
                     correlation_id,
                     error_code: ERROR_CORRUPT_MESSAGE,
@@ -1111,10 +1093,9 @@ fn parse_create_partitions(
     api_version: i16,
     response_tx: tokio::sync::mpsc::UnboundedSender<super::super::messages::KafkaResponse>,
 ) -> Result<Option<KafkaRequest>> {
-    pg_log!(
+    debug!(
         "Parsed CreatePartitions request (api_key={}, version={})",
-        API_KEY_CREATE_PARTITIONS,
-        api_version
+        API_KEY_CREATE_PARTITIONS, api_version
     );
 
     let create_req =
@@ -1124,7 +1105,7 @@ fn parse_create_partitions(
         ) {
             Ok(req) => req,
             Err(e) => {
-                pg_warning!("Failed to decode CreatePartitionsRequest: {}", e);
+                warn!("Failed to decode CreatePartitionsRequest: {}", e);
                 let error_response = super::super::messages::KafkaResponse::Error {
                     correlation_id,
                     error_code: ERROR_CORRUPT_MESSAGE,
@@ -1165,10 +1146,9 @@ fn parse_delete_groups(
     api_version: i16,
     response_tx: tokio::sync::mpsc::UnboundedSender<super::super::messages::KafkaResponse>,
 ) -> Result<Option<KafkaRequest>> {
-    pg_log!(
+    debug!(
         "Parsed DeleteGroups request (api_key={}, version={})",
-        API_KEY_DELETE_GROUPS,
-        api_version
+        API_KEY_DELETE_GROUPS, api_version
     );
 
     let delete_req =
@@ -1178,7 +1158,7 @@ fn parse_delete_groups(
         ) {
             Ok(req) => req,
             Err(e) => {
-                pg_warning!("Failed to decode DeleteGroupsRequest: {}", e);
+                warn!("Failed to decode DeleteGroupsRequest: {}", e);
                 let error_response = super::super::messages::KafkaResponse::Error {
                     correlation_id,
                     error_code: ERROR_CORRUPT_MESSAGE,
