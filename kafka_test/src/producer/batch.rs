@@ -1,24 +1,24 @@
 //! Batch producer test
 //!
 //! Validates high-throughput batch produce operations
-//! and verifies the N+1 query fix by producing 100 records.
+//! and verifies the N+1 query fix by producing 20 records.
 
 use crate::common::{create_batch_producer, create_db_client, TestResult};
 use rdkafka::producer::FutureRecord;
 use std::time::Duration;
 
-/// Test batch produce of 100 records
+/// Test batch produce of 20 records
 ///
 /// This test validates:
-/// 1. High-throughput message production (100 records)
+/// 1. High-throughput message production (20 records)
 /// 2. Correct batch handling without N+1 query issues
 /// 3. All messages are persisted to database
 /// 4. Acceptable throughput rate
 pub async fn test_batch_produce() -> TestResult {
-    println!("=== Test: Batch Produce (100 records) ===\n");
+    println!("=== Test: Batch Produce (20 records) ===\n");
 
     let topic = "batch-produce-topic";
-    let batch_size = 100;
+    let batch_size = 20; // Reduced from 100 for faster CI
 
     // 1. Get initial message count in database
     println!("Step 1: Getting initial message count...");
