@@ -120,6 +120,34 @@ pub fn build_api_versions_response() -> ApiVersionsResponse {
     av14.max_version = 4;
     response.api_keys.push(av14);
 
+    // CreateTopics (API_KEY_CREATE_TOPICS): versions 0-5
+    let mut av15 = ApiVersion::default();
+    av15.api_key = API_KEY_CREATE_TOPICS;
+    av15.min_version = 0;
+    av15.max_version = 5;
+    response.api_keys.push(av15);
+
+    // DeleteTopics (API_KEY_DELETE_TOPICS): versions 0-4
+    let mut av16 = ApiVersion::default();
+    av16.api_key = API_KEY_DELETE_TOPICS;
+    av16.min_version = 0;
+    av16.max_version = 4;
+    response.api_keys.push(av16);
+
+    // CreatePartitions (API_KEY_CREATE_PARTITIONS): versions 0-2
+    let mut av17 = ApiVersion::default();
+    av17.api_key = API_KEY_CREATE_PARTITIONS;
+    av17.min_version = 0;
+    av17.max_version = 2;
+    response.api_keys.push(av17);
+
+    // DeleteGroups (API_KEY_DELETE_GROUPS): versions 0-2
+    let mut av18 = ApiVersion::default();
+    av18.api_key = API_KEY_DELETE_GROUPS;
+    av18.min_version = 0;
+    av18.max_version = 2;
+    response.api_keys.push(av18);
+
     response
 }
 

@@ -399,4 +399,170 @@ impl KafkaStore for PostgresStore {
         })
         .map_err(|e: KafkaError| KafkaError::Internal(format!("fetch_all_offsets failed: {}", e)))
     }
+
+    // ===== Admin Topic Operations (Phase 6) =====
+
+    fn topic_exists(&self, name: &str) -> Result<bool> {
+        crate::pg_debug!("PostgresStore::topic_exists: '{}'", name);
+
+        Spi::connect(|client| {
+            let table = client.select(
+                "SELECT 1 FROM kafka.topics WHERE name = $1",
+                Some(1),
+                &[name.into()],
+            )?;
+
+            Ok(!table.is_empty())
+        })
+        .map_err(|e: KafkaError| KafkaError::Internal(format!("topic_exists failed: {}", e)))
+    }
+
+    fn create_topic(&self, name: &str, partition_count: i32) -> Result<i32> {
+        crate::pg_debug!(
+            "PostgresStore::create_topic: '{}' with {} partitions",
+            name,
+            partition_count
+        );
+
+        Spi::connect_mut(|client| {
+            let table = client.update(
+                "INSERT INTO kafka.topics (name, partitions)
+                 VALUES ($1, $2)
+                 RETURNING id",
+                None,
+                &[name.into(), partition_count.into()],
+            )?;
+
+            let topic_id: i32 = table
+                .first()
+                .get_by_name("id")?
+                .ok_or_else(|| KafkaError::Internal("Failed to get topic ID".into()))?;
+
+            crate::pg_debug!("Created topic '{}' with id={}", name, topic_id);
+            Ok(topic_id)
+        })
+        .map_err(|e: KafkaError| KafkaError::Internal(format!("create_topic failed: {}", e)))
+    }
+
+    fn get_topic_id(&self, name: &str) -> Result<Option<i32>> {
+        crate::pg_debug!("PostgresStore::get_topic_id: '{}'", name);
+
+        Spi::connect(|client| {
+            let mut table = client.select(
+                "SELECT id FROM kafka.topics WHERE name = $1",
+                Some(1),
+                &[name.into()],
+            )?;
+
+            if let Some(row) = table.next() {
+                let id: i32 = row.get_by_name("id")?.unwrap_or(0);
+                Ok(Some(id))
+            } else {
+                Ok(None)
+            }
+        })
+        .map_err(|e: KafkaError| KafkaError::Internal(format!("get_topic_id failed: {}", e)))
+    }
+
+    fn delete_topic(&self, topic_id: i32) -> Result<()> {
+        crate::pg_debug!("PostgresStore::delete_topic: topic_id={}", topic_id);
+
+        Spi::connect_mut(|client| {
+            // Delete messages first (foreign key constraint)
+            client.update(
+                "DELETE FROM kafka.messages WHERE topic_id = $1",
+                None,
+                &[topic_id.into()],
+            )?;
+
+            // Delete consumer offsets
+            client.update(
+                "DELETE FROM kafka.consumer_offsets WHERE topic_id = $1",
+                None,
+                &[topic_id.into()],
+            )?;
+
+            // Delete topic
+            client.update(
+                "DELETE FROM kafka.topics WHERE id = $1",
+                None,
+                &[topic_id.into()],
+            )?;
+
+            crate::pg_debug!("Deleted topic with id={}", topic_id);
+            Ok(())
+        })
+        .map_err(|e: KafkaError| KafkaError::Internal(format!("delete_topic failed: {}", e)))
+    }
+
+    fn get_topic_partition_count(&self, name: &str) -> Result<Option<i32>> {
+        crate::pg_debug!("PostgresStore::get_topic_partition_count: '{}'", name);
+
+        Spi::connect(|client| {
+            let mut table = client.select(
+                "SELECT partitions FROM kafka.topics WHERE name = $1",
+                Some(1),
+                &[name.into()],
+            )?;
+
+            if let Some(row) = table.next() {
+                let partitions: i32 = row.get_by_name("partitions")?.unwrap_or(1);
+                Ok(Some(partitions))
+            } else {
+                Ok(None)
+            }
+        })
+        .map_err(|e: KafkaError| {
+            KafkaError::Internal(format!("get_topic_partition_count failed: {}", e))
+        })
+    }
+
+    fn set_topic_partition_count(&self, name: &str, partition_count: i32) -> Result<()> {
+        crate::pg_debug!(
+            "PostgresStore::set_topic_partition_count: '{}' to {}",
+            name,
+            partition_count
+        );
+
+        Spi::connect_mut(|client| {
+            client.update(
+                "UPDATE kafka.topics SET partitions = $2 WHERE name = $1",
+                None,
+                &[name.into(), partition_count.into()],
+            )?;
+
+            crate::pg_debug!(
+                "Updated topic '{}' partition count to {}",
+                name,
+                partition_count
+            );
+            Ok(())
+        })
+        .map_err(|e: KafkaError| {
+            KafkaError::Internal(format!("set_topic_partition_count failed: {}", e))
+        })
+    }
+
+    // ===== Admin Consumer Group Operations (Phase 6) =====
+
+    fn delete_consumer_group_offsets(&self, group_id: &str) -> Result<()> {
+        crate::pg_debug!(
+            "PostgresStore::delete_consumer_group_offsets: '{}'",
+            group_id
+        );
+
+        Spi::connect_mut(|client| {
+            client.update(
+                "DELETE FROM kafka.consumer_offsets WHERE group_id = $1",
+                None,
+                &[group_id.into()],
+            )?;
+
+            crate::pg_debug!("Deleted consumer offsets for group '{}'", group_id);
+            Ok(())
+        })
+        .map_err(|e: KafkaError| {
+            KafkaError::Internal(format!("delete_consumer_group_offsets failed: {}", e))
+        })
+    }
 }

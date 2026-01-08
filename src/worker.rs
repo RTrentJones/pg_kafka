@@ -762,5 +762,96 @@ pub fn process_request(
                 },
             );
         }
+
+        // ===== CreateTopics (Phase 6) =====
+        crate::kafka::KafkaRequest::CreateTopics {
+            correlation_id,
+            api_version,
+            topics,
+            validate_only,
+            response_tx,
+            ..
+        } => {
+            let store = PostgresStore::new();
+            dispatch_response(
+                "CreateTopics",
+                correlation_id,
+                response_tx,
+                || handlers::handle_create_topics(&store, topics, validate_only),
+                |r| KafkaResponse::CreateTopics {
+                    correlation_id,
+                    api_version,
+                    response: r,
+                },
+            );
+        }
+
+        // ===== DeleteTopics (Phase 6) =====
+        crate::kafka::KafkaRequest::DeleteTopics {
+            correlation_id,
+            api_version,
+            topic_names,
+            response_tx,
+            ..
+        } => {
+            let store = PostgresStore::new();
+            dispatch_response(
+                "DeleteTopics",
+                correlation_id,
+                response_tx,
+                || handlers::handle_delete_topics(&store, topic_names),
+                |r| KafkaResponse::DeleteTopics {
+                    correlation_id,
+                    api_version,
+                    response: r,
+                },
+            );
+        }
+
+        // ===== CreatePartitions (Phase 6) =====
+        crate::kafka::KafkaRequest::CreatePartitions {
+            correlation_id,
+            api_version,
+            topics,
+            validate_only,
+            response_tx,
+            ..
+        } => {
+            let store = PostgresStore::new();
+            dispatch_response(
+                "CreatePartitions",
+                correlation_id,
+                response_tx,
+                || handlers::handle_create_partitions(&store, topics, validate_only),
+                |r| KafkaResponse::CreatePartitions {
+                    correlation_id,
+                    api_version,
+                    response: r,
+                },
+            );
+        }
+
+        // ===== DeleteGroups (Phase 6) =====
+        crate::kafka::KafkaRequest::DeleteGroups {
+            correlation_id,
+            api_version,
+            groups_names,
+            response_tx,
+            ..
+        } => {
+            let store = PostgresStore::new();
+            let coord = coordinator.clone();
+            dispatch_response(
+                "DeleteGroups",
+                correlation_id,
+                response_tx,
+                || handlers::handle_delete_groups(&store, &coord, groups_names),
+                |r| KafkaResponse::DeleteGroups {
+                    correlation_id,
+                    api_version,
+                    response: r,
+                },
+            );
+        }
     }
 }

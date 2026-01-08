@@ -17,6 +17,7 @@
 // - consumer: OffsetCommit and OffsetFetch handlers
 // - coordinator: Consumer group coordination (JoinGroup, SyncGroup, Heartbeat, etc.)
 
+mod admin;
 mod consumer;
 mod coordinator;
 mod fetch;
@@ -28,6 +29,9 @@ mod produce;
 mod tests;
 
 // Re-export all handlers
+pub use admin::{
+    handle_create_partitions, handle_create_topics, handle_delete_groups, handle_delete_topics,
+};
 pub use consumer::{handle_offset_commit, handle_offset_fetch};
 pub use coordinator::{
     handle_describe_groups, handle_find_coordinator, handle_heartbeat, handle_join_group,

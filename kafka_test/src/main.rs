@@ -42,6 +42,16 @@ use std::time::Instant;
 
 // Import all test functions
 use kafka_test::{
+    // Admin tests
+    test_create_multiple_topics,
+    test_create_partitions,
+    test_create_partitions_cannot_decrease,
+    test_create_topic,
+    test_create_topic_already_exists,
+    test_delete_group_empty,
+    test_delete_group_non_empty,
+    test_delete_topic,
+    test_delete_topic_not_found,
     // Edge case tests
     test_batch_1000_messages,
     // Producer tests
@@ -194,6 +204,61 @@ macro_rules! wrap_test {
 /// Get all test definitions
 fn get_all_tests() -> Vec<TestDef> {
     vec![
+        // Admin API tests
+        TestDef {
+            category: "admin",
+            name: "test_create_topic",
+            test_fn: wrap_test!(test_create_topic),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "admin",
+            name: "test_create_topic_already_exists",
+            test_fn: wrap_test!(test_create_topic_already_exists),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "admin",
+            name: "test_delete_topic",
+            test_fn: wrap_test!(test_delete_topic),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "admin",
+            name: "test_delete_topic_not_found",
+            test_fn: wrap_test!(test_delete_topic_not_found),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "admin",
+            name: "test_create_partitions",
+            test_fn: wrap_test!(test_create_partitions),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "admin",
+            name: "test_create_partitions_cannot_decrease",
+            test_fn: wrap_test!(test_create_partitions_cannot_decrease),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "admin",
+            name: "test_delete_group_empty",
+            test_fn: wrap_test!(test_delete_group_empty),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "admin",
+            name: "test_delete_group_non_empty",
+            test_fn: wrap_test!(test_delete_group_non_empty),
+            parallel_safe: false, // Uses shared consumer group state
+        },
+        TestDef {
+            category: "admin",
+            name: "test_create_multiple_topics",
+            test_fn: wrap_test!(test_create_multiple_topics),
+            parallel_safe: true,
+        },
         // Producer tests
         TestDef {
             category: "producer",
@@ -619,7 +684,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.list {
         println!("Available tests:\n");
         print_test_list(&all_tests);
-        println!("\nCategories: producer, consumer, offset_management, consumer_group,");
+        println!("\nCategories: admin, producer, consumer, offset_management, consumer_group,");
         println!(
             "            partition, error_paths, edge_cases, concurrent, negative, performance"
         );

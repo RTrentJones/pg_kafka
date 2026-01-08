@@ -182,6 +182,75 @@ pub trait KafkaStore {
     /// # Returns
     /// Map of (topic_name, partition_id) -> CommittedOffset
     fn fetch_all_offsets(&self, group_id: &str) -> Result<Vec<(String, i32, CommittedOffset)>>;
+
+    // ===== Admin Topic Operations (Phase 6) =====
+
+    /// Check if a topic exists
+    ///
+    /// # Arguments
+    /// * `name` - Topic name
+    ///
+    /// # Returns
+    /// true if topic exists, false otherwise
+    fn topic_exists(&self, name: &str) -> Result<bool>;
+
+    /// Create a topic with specified partition count
+    ///
+    /// # Arguments
+    /// * `name` - Topic name
+    /// * `partition_count` - Number of partitions
+    ///
+    /// # Returns
+    /// Topic ID on success
+    fn create_topic(&self, name: &str, partition_count: i32) -> Result<i32>;
+
+    /// Get topic ID by name
+    ///
+    /// # Arguments
+    /// * `name` - Topic name
+    ///
+    /// # Returns
+    /// Topic ID if exists, None otherwise
+    fn get_topic_id(&self, name: &str) -> Result<Option<i32>>;
+
+    /// Delete a topic and all its messages
+    ///
+    /// # Arguments
+    /// * `topic_id` - Topic ID
+    ///
+    /// # Returns
+    /// Ok on success
+    fn delete_topic(&self, topic_id: i32) -> Result<()>;
+
+    /// Get the partition count for a topic
+    ///
+    /// # Arguments
+    /// * `name` - Topic name
+    ///
+    /// # Returns
+    /// Partition count if topic exists, None otherwise
+    fn get_topic_partition_count(&self, name: &str) -> Result<Option<i32>>;
+
+    /// Set the partition count for a topic
+    ///
+    /// # Arguments
+    /// * `name` - Topic name
+    /// * `partition_count` - New partition count
+    ///
+    /// # Returns
+    /// Ok on success
+    fn set_topic_partition_count(&self, name: &str, partition_count: i32) -> Result<()>;
+
+    // ===== Admin Consumer Group Operations (Phase 6) =====
+
+    /// Delete all committed offsets for a consumer group
+    ///
+    /// # Arguments
+    /// * `group_id` - Consumer group ID
+    ///
+    /// # Returns
+    /// Ok on success
+    fn delete_consumer_group_offsets(&self, group_id: &str) -> Result<()>;
 }
 
 // Submodules

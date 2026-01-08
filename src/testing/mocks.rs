@@ -46,6 +46,15 @@ mock! {
             partition_id: i32,
         ) -> Result<Option<CommittedOffset>>;
         fn fetch_all_offsets<'a>(&self, group_id: &'a str) -> Result<Vec<(String, i32, CommittedOffset)>>;
+        // Admin Topic Operations (Phase 6)
+        fn topic_exists<'a>(&self, name: &'a str) -> Result<bool>;
+        fn create_topic<'a>(&self, name: &'a str, partition_count: i32) -> Result<i32>;
+        fn get_topic_id<'a>(&self, name: &'a str) -> Result<Option<i32>>;
+        fn delete_topic(&self, topic_id: i32) -> Result<()>;
+        fn get_topic_partition_count<'a>(&self, name: &'a str) -> Result<Option<i32>>;
+        fn set_topic_partition_count<'a>(&self, name: &'a str, partition_count: i32) -> Result<()>;
+        // Admin Consumer Group Operations (Phase 6)
+        fn delete_consumer_group_offsets<'a>(&self, group_id: &'a str) -> Result<()>;
     }
 }
 

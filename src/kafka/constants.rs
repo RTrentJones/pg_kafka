@@ -81,6 +81,26 @@ pub const API_KEY_LIST_GROUPS: i16 = 16;
 /// Used to discover which API versions the broker supports
 pub const API_KEY_API_VERSIONS: i16 = 18;
 
+/// API key for CreateTopics requests (Phase 6)
+///
+/// Used to programmatically create topics
+pub const API_KEY_CREATE_TOPICS: i16 = 19;
+
+/// API key for DeleteTopics requests (Phase 6)
+///
+/// Used to programmatically delete topics
+pub const API_KEY_DELETE_TOPICS: i16 = 20;
+
+/// API key for CreatePartitions requests (Phase 6)
+///
+/// Used to add partitions to existing topics
+pub const API_KEY_CREATE_PARTITIONS: i16 = 37;
+
+/// API key for DeleteGroups requests (Phase 6)
+///
+/// Used to delete consumer groups
+pub const API_KEY_DELETE_GROUPS: i16 = 42;
+
 // ===== Configuration Defaults =====
 
 /// Default Kafka protocol port
@@ -168,6 +188,10 @@ pub fn get_flexible_format_threshold(api_key: i16) -> Option<i16> {
         API_KEY_SYNC_GROUP => Some(4),
         API_KEY_DESCRIBE_GROUPS => Some(5),
         API_KEY_LIST_GROUPS => Some(3),
+        API_KEY_CREATE_TOPICS => Some(5),
+        API_KEY_DELETE_TOPICS => Some(4),
+        API_KEY_CREATE_PARTITIONS => Some(2),
+        API_KEY_DELETE_GROUPS => Some(2),
         _ => None, // Unknown API keys default to v0
     }
 }
@@ -252,6 +276,20 @@ pub const ERROR_UNKNOWN_MEMBER_ID: i16 = 25;
 
 /// Rebalance in progress
 pub const ERROR_REBALANCE_IN_PROGRESS: i16 = 27;
+
+// ===== Admin API Error Codes =====
+
+/// Invalid topic exception (invalid topic name)
+pub const ERROR_INVALID_TOPIC_EXCEPTION: i16 = 17;
+
+/// Topic already exists
+pub const ERROR_TOPIC_ALREADY_EXISTS: i16 = 36;
+
+/// Group ID not found
+pub const ERROR_GROUP_ID_NOT_FOUND: i16 = 69;
+
+/// Non-empty group (cannot delete group with members)
+pub const ERROR_NON_EMPTY_GROUP: i16 = 68;
 
 #[cfg(test)]
 mod tests {

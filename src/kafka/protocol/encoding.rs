@@ -178,6 +178,50 @@ pub fn encode_response(response: KafkaResponse) -> Result<BytesMut> {
             header.encode(&mut response_buf, response_header_version)?;
             list_groups_response.encode(&mut response_buf, api_version)?;
         }
+        KafkaResponse::CreateTopics {
+            correlation_id,
+            api_version,
+            response: create_topics_response,
+        } => {
+            let header = ResponseHeader::default().with_correlation_id(correlation_id);
+            let response_header_version =
+                constants::get_response_header_version(API_KEY_CREATE_TOPICS, api_version);
+            header.encode(&mut response_buf, response_header_version)?;
+            create_topics_response.encode(&mut response_buf, api_version)?;
+        }
+        KafkaResponse::DeleteTopics {
+            correlation_id,
+            api_version,
+            response: delete_topics_response,
+        } => {
+            let header = ResponseHeader::default().with_correlation_id(correlation_id);
+            let response_header_version =
+                constants::get_response_header_version(API_KEY_DELETE_TOPICS, api_version);
+            header.encode(&mut response_buf, response_header_version)?;
+            delete_topics_response.encode(&mut response_buf, api_version)?;
+        }
+        KafkaResponse::CreatePartitions {
+            correlation_id,
+            api_version,
+            response: create_partitions_response,
+        } => {
+            let header = ResponseHeader::default().with_correlation_id(correlation_id);
+            let response_header_version =
+                constants::get_response_header_version(API_KEY_CREATE_PARTITIONS, api_version);
+            header.encode(&mut response_buf, response_header_version)?;
+            create_partitions_response.encode(&mut response_buf, api_version)?;
+        }
+        KafkaResponse::DeleteGroups {
+            correlation_id,
+            api_version,
+            response: delete_groups_response,
+        } => {
+            let header = ResponseHeader::default().with_correlation_id(correlation_id);
+            let response_header_version =
+                constants::get_response_header_version(API_KEY_DELETE_GROUPS, api_version);
+            header.encode(&mut response_buf, response_header_version)?;
+            delete_groups_response.encode(&mut response_buf, api_version)?;
+        }
         KafkaResponse::Error {
             correlation_id,
             error_code,

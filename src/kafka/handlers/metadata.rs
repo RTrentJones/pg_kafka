@@ -27,6 +27,9 @@ pub fn handle_metadata(
 ) -> Result<kafka_protocol::messages::metadata_response::MetadataResponse> {
     let mut response = kafka_protocol::messages::metadata_response::MetadataResponse::default();
 
+    // Set controller ID - needed for admin operations like CreateTopics
+    response.controller_id = kafka_protocol::messages::BrokerId(DEFAULT_BROKER_ID);
+
     // Add broker
     response.brokers.push(crate::kafka::build_broker_metadata(
         DEFAULT_BROKER_ID,

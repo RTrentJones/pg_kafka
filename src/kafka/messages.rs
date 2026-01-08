@@ -257,6 +257,68 @@ pub enum KafkaRequest {
         /// Channel to send the response back to the specific connection
         response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
     },
+    /// CreateTopics request - create topics programmatically (Phase 6)
+    CreateTopics {
+        /// Correlation ID from client - MUST be echoed back in response
+        correlation_id: i32,
+        /// Optional client identifier string
+        client_id: Option<String>,
+        /// API version from the request (needed for response encoding)
+        api_version: i16,
+        /// Topics to create with configuration
+        topics: Vec<CreateTopicRequest>,
+        /// Timeout for the request in milliseconds
+        timeout_ms: i32,
+        /// If true, check if topics can be created but don't actually create them
+        validate_only: bool,
+        /// Channel to send the response back to the specific connection
+        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
+    },
+    /// DeleteTopics request - delete topics programmatically (Phase 6)
+    DeleteTopics {
+        /// Correlation ID from client - MUST be echoed back in response
+        correlation_id: i32,
+        /// Optional client identifier string
+        client_id: Option<String>,
+        /// API version from the request (needed for response encoding)
+        api_version: i16,
+        /// Topic names to delete
+        topic_names: Vec<String>,
+        /// Timeout for the request in milliseconds
+        timeout_ms: i32,
+        /// Channel to send the response back to the specific connection
+        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
+    },
+    /// CreatePartitions request - add partitions to existing topics (Phase 6)
+    CreatePartitions {
+        /// Correlation ID from client - MUST be echoed back in response
+        correlation_id: i32,
+        /// Optional client identifier string
+        client_id: Option<String>,
+        /// API version from the request (needed for response encoding)
+        api_version: i16,
+        /// Topics with new partition counts
+        topics: Vec<CreatePartitionsTopicRequest>,
+        /// Timeout for the request in milliseconds
+        timeout_ms: i32,
+        /// If true, check if partitions can be created but don't actually create them
+        validate_only: bool,
+        /// Channel to send the response back to the specific connection
+        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
+    },
+    /// DeleteGroups request - delete consumer groups (Phase 6)
+    DeleteGroups {
+        /// Correlation ID from client - MUST be echoed back in response
+        correlation_id: i32,
+        /// Optional client identifier string
+        client_id: Option<String>,
+        /// API version from the request (needed for response encoding)
+        api_version: i16,
+        /// Group IDs to delete
+        groups_names: Vec<String>,
+        /// Channel to send the response back to the specific connection
+        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
+    },
 }
 
 /// Kafka response types sent back from main thread to async tasks
@@ -390,6 +452,42 @@ pub enum KafkaResponse {
         api_version: i16,
         /// The kafka-protocol response struct (ready to encode)
         response: kafka_protocol::messages::list_groups_response::ListGroupsResponse,
+    },
+    /// CreateTopics response - wraps kafka-protocol's CreateTopicsResponse
+    CreateTopics {
+        /// Correlation ID from request
+        correlation_id: i32,
+        /// API version from the request (needed for response encoding)
+        api_version: i16,
+        /// The kafka-protocol response struct (ready to encode)
+        response: kafka_protocol::messages::create_topics_response::CreateTopicsResponse,
+    },
+    /// DeleteTopics response - wraps kafka-protocol's DeleteTopicsResponse
+    DeleteTopics {
+        /// Correlation ID from request
+        correlation_id: i32,
+        /// API version from the request (needed for response encoding)
+        api_version: i16,
+        /// The kafka-protocol response struct (ready to encode)
+        response: kafka_protocol::messages::delete_topics_response::DeleteTopicsResponse,
+    },
+    /// CreatePartitions response - wraps kafka-protocol's CreatePartitionsResponse
+    CreatePartitions {
+        /// Correlation ID from request
+        correlation_id: i32,
+        /// API version from the request (needed for response encoding)
+        api_version: i16,
+        /// The kafka-protocol response struct (ready to encode)
+        response: kafka_protocol::messages::create_partitions_response::CreatePartitionsResponse,
+    },
+    /// DeleteGroups response - wraps kafka-protocol's DeleteGroupsResponse
+    DeleteGroups {
+        /// Correlation ID from request
+        correlation_id: i32,
+        /// API version from the request (needed for response encoding)
+        api_version: i16,
+        /// The kafka-protocol response struct (ready to encode)
+        response: kafka_protocol::messages::delete_groups_response::DeleteGroupsResponse,
     },
     /// Error response for unsupported or malformed requests
     Error {
@@ -564,6 +662,28 @@ pub struct ListOffsetsPartitionData {
     /// - -1 = latest offset
     /// - >= 0 = offset at timestamp (v1+)
     pub timestamp: i64,
+}
+
+// ========== Admin API Request Types ==========
+
+/// Request data for creating a single topic (Phase 6)
+#[derive(Debug, Clone)]
+pub struct CreateTopicRequest {
+    /// Topic name
+    pub name: String,
+    /// Number of partitions (use -1 for broker default)
+    pub num_partitions: i32,
+    /// Replication factor (use -1 for broker default)
+    pub replication_factor: i16,
+}
+
+/// Request data for adding partitions to a topic (Phase 6)
+#[derive(Debug, Clone)]
+pub struct CreatePartitionsTopicRequest {
+    /// Topic name
+    pub name: String,
+    /// Total number of partitions after the operation
+    pub count: i32,
 }
 
 // ========== From implementations for type conversions ==========

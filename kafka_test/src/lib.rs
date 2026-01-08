@@ -42,6 +42,7 @@ pub mod fixtures;
 pub mod setup;
 
 // Test modules
+pub mod admin;
 pub mod concurrent;
 pub mod consumer;
 pub mod consumer_group;
@@ -96,4 +97,11 @@ pub use negative::{
 pub use performance::{
     test_batch_vs_single_performance, test_consume_throughput_baseline,
     test_produce_throughput_baseline,
+};
+
+// Admin API tests
+pub use admin::{
+    test_create_multiple_topics, test_create_partitions, test_create_partitions_cannot_decrease,
+    test_create_topic, test_create_topic_already_exists, test_delete_group_empty,
+    test_delete_group_non_empty, test_delete_topic, test_delete_topic_not_found,
 };

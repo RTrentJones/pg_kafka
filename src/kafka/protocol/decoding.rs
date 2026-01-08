@@ -156,6 +156,34 @@ pub fn parse_request(
             api_version,
             response_tx,
         ),
+        API_KEY_CREATE_TOPICS => parse_create_topics(
+            &mut payload_buf,
+            correlation_id,
+            client_id,
+            api_version,
+            response_tx,
+        ),
+        API_KEY_DELETE_TOPICS => parse_delete_topics(
+            &mut payload_buf,
+            correlation_id,
+            client_id,
+            api_version,
+            response_tx,
+        ),
+        API_KEY_CREATE_PARTITIONS => parse_create_partitions(
+            &mut payload_buf,
+            correlation_id,
+            client_id,
+            api_version,
+            response_tx,
+        ),
+        API_KEY_DELETE_GROUPS => parse_delete_groups(
+            &mut payload_buf,
+            correlation_id,
+            client_id,
+            api_version,
+            response_tx,
+        ),
         _ => {
             // Unsupported API
             pg_warning!("Unsupported API key: {}", api_key);
@@ -964,6 +992,214 @@ fn parse_list_groups(
         client_id,
         api_version,
         states_filter,
+        response_tx,
+    }))
+}
+
+// ========== Admin API Parsers (Phase 6) ==========
+
+fn parse_create_topics(
+    payload_buf: &mut BytesMut,
+    correlation_id: i32,
+    client_id: Option<String>,
+    api_version: i16,
+    response_tx: tokio::sync::mpsc::UnboundedSender<super::super::messages::KafkaResponse>,
+) -> Result<Option<KafkaRequest>> {
+    pg_log!(
+        "Parsed CreateTopics request (api_key={}, version={})",
+        API_KEY_CREATE_TOPICS,
+        api_version
+    );
+
+    let create_req =
+        match kafka_protocol::messages::create_topics_request::CreateTopicsRequest::decode(
+            payload_buf,
+            api_version,
+        ) {
+            Ok(req) => req,
+            Err(e) => {
+                pg_warning!("Failed to decode CreateTopicsRequest: {}", e);
+                let error_response = super::super::messages::KafkaResponse::Error {
+                    correlation_id,
+                    error_code: ERROR_CORRUPT_MESSAGE,
+                    error_message: Some(format!("Malformed CreateTopicsRequest: {}", e)),
+                };
+                let _ = response_tx.send(error_response);
+                return Ok(None);
+            }
+        };
+
+    let topics: Vec<super::super::messages::CreateTopicRequest> = create_req
+        .topics
+        .into_iter()
+        .map(|t| super::super::messages::CreateTopicRequest {
+            name: t.name.to_string(),
+            num_partitions: t.num_partitions,
+            replication_factor: t.replication_factor,
+        })
+        .collect();
+
+    let timeout_ms = create_req.timeout_ms;
+    let validate_only = create_req.validate_only;
+
+    Ok(Some(KafkaRequest::CreateTopics {
+        correlation_id,
+        client_id,
+        api_version,
+        topics,
+        timeout_ms,
+        validate_only,
+        response_tx,
+    }))
+}
+
+fn parse_delete_topics(
+    payload_buf: &mut BytesMut,
+    correlation_id: i32,
+    client_id: Option<String>,
+    api_version: i16,
+    response_tx: tokio::sync::mpsc::UnboundedSender<super::super::messages::KafkaResponse>,
+) -> Result<Option<KafkaRequest>> {
+    pg_log!(
+        "Parsed DeleteTopics request (api_key={}, version={})",
+        API_KEY_DELETE_TOPICS,
+        api_version
+    );
+
+    let delete_req =
+        match kafka_protocol::messages::delete_topics_request::DeleteTopicsRequest::decode(
+            payload_buf,
+            api_version,
+        ) {
+            Ok(req) => req,
+            Err(e) => {
+                pg_warning!("Failed to decode DeleteTopicsRequest: {}", e);
+                let error_response = super::super::messages::KafkaResponse::Error {
+                    correlation_id,
+                    error_code: ERROR_CORRUPT_MESSAGE,
+                    error_message: Some(format!("Malformed DeleteTopicsRequest: {}", e)),
+                };
+                let _ = response_tx.send(error_response);
+                return Ok(None);
+            }
+        };
+
+    // Extract topic names from the request
+    // Note: In newer versions, topics field contains TopicName, in older versions it's topic_names
+    let topic_names: Vec<String> = delete_req
+        .topic_names
+        .into_iter()
+        .map(|t| t.to_string())
+        .collect();
+
+    let timeout_ms = delete_req.timeout_ms;
+
+    Ok(Some(KafkaRequest::DeleteTopics {
+        correlation_id,
+        client_id,
+        api_version,
+        topic_names,
+        timeout_ms,
+        response_tx,
+    }))
+}
+
+fn parse_create_partitions(
+    payload_buf: &mut BytesMut,
+    correlation_id: i32,
+    client_id: Option<String>,
+    api_version: i16,
+    response_tx: tokio::sync::mpsc::UnboundedSender<super::super::messages::KafkaResponse>,
+) -> Result<Option<KafkaRequest>> {
+    pg_log!(
+        "Parsed CreatePartitions request (api_key={}, version={})",
+        API_KEY_CREATE_PARTITIONS,
+        api_version
+    );
+
+    let create_req =
+        match kafka_protocol::messages::create_partitions_request::CreatePartitionsRequest::decode(
+            payload_buf,
+            api_version,
+        ) {
+            Ok(req) => req,
+            Err(e) => {
+                pg_warning!("Failed to decode CreatePartitionsRequest: {}", e);
+                let error_response = super::super::messages::KafkaResponse::Error {
+                    correlation_id,
+                    error_code: ERROR_CORRUPT_MESSAGE,
+                    error_message: Some(format!("Malformed CreatePartitionsRequest: {}", e)),
+                };
+                let _ = response_tx.send(error_response);
+                return Ok(None);
+            }
+        };
+
+    let topics: Vec<super::super::messages::CreatePartitionsTopicRequest> = create_req
+        .topics
+        .into_iter()
+        .map(|t| super::super::messages::CreatePartitionsTopicRequest {
+            name: t.name.to_string(),
+            count: t.count,
+        })
+        .collect();
+
+    let timeout_ms = create_req.timeout_ms;
+    let validate_only = create_req.validate_only;
+
+    Ok(Some(KafkaRequest::CreatePartitions {
+        correlation_id,
+        client_id,
+        api_version,
+        topics,
+        timeout_ms,
+        validate_only,
+        response_tx,
+    }))
+}
+
+fn parse_delete_groups(
+    payload_buf: &mut BytesMut,
+    correlation_id: i32,
+    client_id: Option<String>,
+    api_version: i16,
+    response_tx: tokio::sync::mpsc::UnboundedSender<super::super::messages::KafkaResponse>,
+) -> Result<Option<KafkaRequest>> {
+    pg_log!(
+        "Parsed DeleteGroups request (api_key={}, version={})",
+        API_KEY_DELETE_GROUPS,
+        api_version
+    );
+
+    let delete_req =
+        match kafka_protocol::messages::delete_groups_request::DeleteGroupsRequest::decode(
+            payload_buf,
+            api_version,
+        ) {
+            Ok(req) => req,
+            Err(e) => {
+                pg_warning!("Failed to decode DeleteGroupsRequest: {}", e);
+                let error_response = super::super::messages::KafkaResponse::Error {
+                    correlation_id,
+                    error_code: ERROR_CORRUPT_MESSAGE,
+                    error_message: Some(format!("Malformed DeleteGroupsRequest: {}", e)),
+                };
+                let _ = response_tx.send(error_response);
+                return Ok(None);
+            }
+        };
+
+    let groups_names: Vec<String> = delete_req
+        .groups_names
+        .into_iter()
+        .map(|g| g.to_string())
+        .collect();
+
+    Ok(Some(KafkaRequest::DeleteGroups {
+        correlation_id,
+        client_id,
+        api_version,
+        groups_names,
         response_tx,
     }))
 }

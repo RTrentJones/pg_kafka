@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `pg_kafka` is a PostgreSQL extension written in Rust (via pgrx) that embeds a Kafka-compatible wire protocol listener directly into the Postgres runtime. It allows standard Kafka clients to produce and consume messages using Postgres as the backing store.
 
-**Status:** Phase 5 Complete - Automatic Rebalancing (Portfolio/Learning Project)
+**Status:** Phase 6 Complete - Admin APIs (Portfolio/Learning Project)
 
 **Current Implementation:**
 - ✅ **Phase 1 Complete:** Metadata support (ApiVersions, Metadata requests)
@@ -15,8 +15,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - ✅ **Phase 3B Complete:** Consumer group coordinator (FindCoordinator, JoinGroup, Heartbeat, LeaveGroup, SyncGroup)
 - ✅ **Phase 4 Complete:** Automatic partition assignment strategies (Range, RoundRobin, Sticky)
 - ✅ **Phase 5 Complete:** Automatic rebalancing (LeaveGroup trigger, timeout detection, REBALANCE_IN_PROGRESS)
+- ✅ **Phase 6 Complete:** Admin APIs (CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups)
 - ✅ **CI/CD:** GitHub Actions pipeline with automated testing
-- ⏳ **Phase 6:** Shadow Mode (Logical Decoding → external Kafka)
+- ⏳ **Phase 7:** Shadow Mode (Logical Decoding → external Kafka)
 
 **What Works Now:**
 - TCP listener on port 9092 with full Kafka wire protocol parsing
@@ -27,12 +28,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - DescribeGroups/ListGroups for consumer group visibility
 - OffsetCommit/OffsetFetch for consumer progress tracking
 - ListOffsets for earliest/latest offset queries
+- Admin operations: CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups
 - Dual-offset design (partition_offset + global_offset)
 - Repository Pattern storage abstraction (KafkaStore trait + PostgresStore impl)
 - Automated E2E tests with real Kafka client (rdkafka)
 
-**API Coverage:** 14 of ~50 standard Kafka APIs (28%)
-**Test Status:** All unit tests (163) and E2E tests passing ✅
+**API Coverage:** 18 of ~50 standard Kafka APIs (36%)
+**Test Status:** All unit tests (166) and E2E tests passing ✅
 
 ## Development Setup
 

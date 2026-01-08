@@ -725,6 +725,17 @@ impl GroupCoordinator {
 
         Ok(topics.into_iter().collect())
     }
+
+    /// Remove a consumer group from the coordinator
+    ///
+    /// This is used by DeleteGroups to remove empty groups.
+    /// Should only be called after confirming the group has no active members.
+    pub fn remove_group(&self, group_id: &str) {
+        if let Ok(mut groups) = self.groups.write() {
+            groups.remove(group_id);
+            pg_log!("Removed group '{}' from coordinator", group_id);
+        }
+    }
 }
 
 impl Default for GroupCoordinator {
