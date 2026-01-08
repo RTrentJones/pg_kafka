@@ -1,5 +1,8 @@
 # Repository Pattern Implementation
 
+**Status:** Active (Phase 8 Complete)
+**Last Updated:** 2026-01-08
+
 This document describes the Repository Pattern architecture implemented in pg_kafka to separate storage logic from protocol handling.
 
 ## Overview
@@ -51,9 +54,9 @@ pub trait KafkaStore {
 - SQL injection mitigation via `.replace("'", "''")`
 - TODO: Prepared statements when pgrx adds support
 
-### 2. Handler Layer ([src/kafka/handlers.rs](../src/kafka/handlers.rs))
+### 2. Handler Layer ([src/kafka/handlers/](../src/kafka/handlers/))
 
-The handler layer contains pure Kafka protocol logic.
+The handler layer contains pure Kafka protocol logic (organized as module directory with 22 unit tests).
 
 **Key Handlers:**
 ```rust
@@ -312,3 +315,8 @@ The Repository Pattern refactoring successfully:
 - ✅ Passes existing tests
 
 The architecture is now more maintainable, testable, and secure while maintaining full backward compatibility.
+
+**Test Coverage:**
+- Handler tests: 22 unit tests in `src/kafka/handlers/tests.rs`
+- Storage tests: 22 unit tests in `src/kafka/storage/tests.rs`
+- Mock infrastructure: `MockKafkaStore` in `src/testing/mocks.rs`

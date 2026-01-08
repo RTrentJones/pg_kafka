@@ -12,7 +12,7 @@
 |--------|-------|
 | **API Coverage** | 18 of ~50 standard Kafka APIs (36%) |
 | **Build Status** | ✅ Compiles with zero warnings |
-| **Test Suite** | 184 unit tests + 95 E2E tests |
+| **Test Suite** | 184 unit tests + 74 E2E tests |
 | **Architecture** | Repository Pattern with typed errors |
 | **Client Compatibility** | ✅ kcat, rdkafka verified |
 
@@ -195,32 +195,35 @@ Consumer Flow (Current):
 - **Testing**: E2E tests with rdkafka
 - **Documentation**: Comprehensive design docs
 
-### Test Coverage (181+ unit tests + 90 E2E tests)
+### Test Coverage (184 unit tests + 74 E2E tests)
 
 | Category | Count | Location |
 |----------|-------|----------|
-| Protocol parsing | 10 | `tests/protocol_tests.rs` |
-| Binary encoding | 8 | `tests/encoding_tests.rs` |
-| Property-based | 10 | `tests/property_tests.rs` |
-| Handler logic | 19 | `src/kafka/handlers/tests.rs` |
+| Assignment strategies | 61 | `src/kafka/assignment/` |
+| Protocol encoding | 34 | `tests/` |
+| Handler logic | 22 | `src/kafka/handlers/tests.rs` |
 | Storage layer | 22 | `src/kafka/storage/tests.rs` |
-| Coordinator | 11 | `src/kafka/coordinator.rs` |
-| Assignment strategies | 69 | `src/kafka/assignment/` |
-| Pending fetches | 6 | `src/kafka/pending_fetches.rs` |
-| Partitioner | 12 | `src/kafka/partitioner.rs` |
-| Helpers | 4 | `tests/helpers.rs` |
-| **Unit Total** | **181** | |
-| **E2E Test Suite** | **90** | `kafka_test/` |
+| Infrastructure | 20 | Config, mocks, helpers |
+| Error handling | 10 | `src/kafka/error.rs` |
+| Coordinator | 8 | `src/kafka/coordinator.rs` |
+| Partitioner | 7 | `src/kafka/partitioner.rs` |
+| **Unit Total** | **184** | |
+| **E2E Test Suite** | **74** | `kafka_test/` |
 
-**E2E Test Categories:**
-- Producer (basic, batch)
-- Consumer (basic, from offset, multiple)
-- Consumer Groups (lifecycle, rebalance)
-- Offset Management (commit/fetch, boundaries)
+**E2E Test Categories (74 tests):**
+- Admin APIs (9 tests)
+- Producer (2 tests)
+- Consumer (3 tests)
+- Consumer Groups (3 tests)
+- Offset Management (2 tests)
+- Partitioning (4 tests)
 - Error Paths (16 tests)
 - Edge Cases (11 tests)
-- Concurrent Operations (7 tests)
+- Concurrent Operations (8 tests)
+- Negative (4 tests)
 - Performance Baselines (3 tests)
+- Long Polling (4 tests)
+- Compression (5 tests)
 
 ---
 
@@ -229,7 +232,7 @@ Consumer Flow (Current):
 **Current State**: Comprehensive Kafka-compatible broker with 18 APIs implemented
 **Coverage**: 36% of standard Kafka protocol (full producer/consumer/coordinator/admin support)
 **Architecture**: Clean, maintainable, well-documented with Repository Pattern
-**Test Status**: All 184 unit tests and 95 E2E tests passing ✅
+**Test Status**: All 184 unit tests and 74 E2E tests passing ✅
 
 **Readiness**:
 - ✅ **Producer**: Production-ready with full compression support
@@ -253,8 +256,8 @@ Consumer Flow (Current):
 
 ---
 
-**Overall Assessment**: Phase 8 Complete - pg_kafka provides full producer/consumer support with compression, long polling, multi-partition topics, and admin APIs. The implementation features clean architecture (Repository Pattern), comprehensive test coverage (184+ unit tests, 95 E2E tests), and typed error handling.
+**Overall Assessment**: Phase 8 Complete - pg_kafka provides full producer/consumer support with compression, long polling, multi-partition topics, and admin APIs. The implementation features clean architecture (Repository Pattern), comprehensive test coverage (184 unit tests, 74 E2E tests), and typed error handling.
 
 **Last Updated:** 2026-01-08
 **Phase:** 8 Complete (Compression Support)
-**Tests:** 184 unit tests + 95 E2E tests
+**Tests:** 184 unit tests + 74 E2E tests

@@ -1,10 +1,12 @@
 # Full Kafka API Compliance Plan for pg_kafka
 
-## Current State (Post Phase 7)
+**Last Updated:** 2026-01-08
+
+## Current State (Phase 8 Complete)
 
 **APIs Implemented:** 18 of ~50 (36%)
-**Tests:** 175 unit + 90 E2E (all passing)
-**Architecture:** Repository Pattern, typed errors, clean handler structure, key-based partition routing
+**Tests:** 184 unit + 74 E2E (all passing)
+**Architecture:** Repository Pattern, typed errors, clean handler structure, key-based partition routing, compression support
 
 ### Implemented APIs
 | Category | APIs |
@@ -90,33 +92,22 @@ fn compute_partition(key: Option<&[u8]>, partition_count: i32, explicit: i32) ->
 
 ---
 
-### Phase 8: Compression Support (Priority: MEDIUM)
+### Phase 8: Compression Support ✅ COMPLETE
 **Goal:** Support gzip, snappy, lz4, zstd compression
 
-#### 8.1 Add Dependencies
-**Files to modify:**
-- `Cargo.toml`:
-```toml
-flate2 = "1.0"    # gzip
-snap = "1.1"      # snappy
-lz4 = "1.24"      # lz4
-zstd = "0.13"     # zstd
+#### Implementation (Completed)
+- **Inbound (Producer → Server):** Automatic decompression via `kafka-protocol` crate
+- **Outbound (Server → Consumer):** Configurable via `pg_kafka.compression_type` GUC
+- **Supported codecs:** none, gzip, snappy, lz4, zstd
+
+**Configuration:**
+```sql
+SET pg_kafka.compression_type = 'lz4';  -- Recommended for balanced performance
 ```
 
-#### 8.2 Decompression in Protocol Layer
-**Files to create:**
-- `src/kafka/compression.rs` - Codec implementations
-
-**Files to modify:**
-- `src/kafka/protocol/recordbatch.rs` - Decompress before parsing records
-- `src/kafka/handlers/produce.rs` - Store uncompressed (PostgreSQL handles storage compression)
-
-#### 8.3 Optional Response Compression
-- Honor client's `compression.type` preference in FetchResponse
-
 **Testing:**
-- Unit tests for each codec
-- E2E with compressed producer config
+- 5 E2E compression tests (gzip, snappy, lz4, zstd, roundtrip)
+- Unit tests for compression parameter handling
 
 ---
 
@@ -217,18 +208,18 @@ CREATE TABLE kafka.transactions (
 
 ## Implementation Order & Estimates
 
-| Phase | Scope | Effort | Dependencies |
+| Phase | Scope | Status | Dependencies |
 |-------|-------|--------|--------------|
-| **6** | Admin APIs | 5-7 days | None |
-| **7** | Multi-Partition | 3-5 days | Phase 6 (CreatePartitions) |
-| **8** | Compression | 5-7 days | None |
-| **9** | Idempotent Producer | 4-5 days | None |
-| **10** | Transactions | 15-20 days | Phase 9 |
-| **11** | Security | 10-15 days | None (optional) |
-| **12** | Advanced Coordinator | 5-7 days | None |
+| **6** | Admin APIs | ✅ Complete | None |
+| **7** | Multi-Partition | ✅ Complete | Phase 6 (CreatePartitions) |
+| **8** | Compression | ✅ Complete | None |
+| **9** | Idempotent Producer | Planned | None |
+| **10** | Transactions | Planned | Phase 9 |
+| **11** | Security | Optional | None |
+| **12** | Advanced Coordinator | Planned | None |
 
-**Total for Core Parity (Phases 6-9):** ~20 days
-**Total for Full Parity (All Phases):** ~50-60 days
+**Completed:** Phases 1-8
+**Remaining for Full Parity:** Phases 9-12
 
 ---
 
@@ -256,8 +247,8 @@ Each phase includes:
 3. **E2E tests** - rdkafka client in `kafka_test/`
 
 **Coverage targets:**
-- Maintain 158+ unit tests
-- Add 10-15 E2E tests per major phase
+- Maintain 184+ unit tests
+- Current: 74 E2E tests across all categories
 
 ---
 
@@ -274,9 +265,9 @@ Each phase includes:
 
 ## Success Criteria
 
-- [ ] Phase 6: kcat/rdkafka can create/delete topics programmatically
-- [ ] Phase 7: Multi-consumer groups work on multi-partition topics
-- [ ] Phase 8: Compressed messages accepted and stored
+- [x] Phase 6: kcat/rdkafka can create/delete topics programmatically ✅
+- [x] Phase 7: Multi-consumer groups work on multi-partition topics ✅
+- [x] Phase 8: Compressed messages accepted and stored ✅
 - [ ] Phase 9: `enable.idempotence=true` works without duplicates
 - [ ] Phase 10: Transactional producer commits atomically
-- [ ] All tests passing, zero compilation warnings
+- [x] All tests passing, zero compilation warnings ✅

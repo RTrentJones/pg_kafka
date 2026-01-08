@@ -39,7 +39,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Automated E2E tests with real Kafka client (rdkafka)
 
 **API Coverage:** 18 of ~50 standard Kafka APIs (36%)
-**Test Status:** All unit tests (184) and E2E tests (95) passing ✅
+**Test Status:** All unit tests (184) and E2E tests (74) passing ✅
 
 ## Development Setup
 

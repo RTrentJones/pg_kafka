@@ -432,6 +432,62 @@ pgbench -c 10 -j 4 -T 60 -f produce_benchmark.sql
 - **Replication Throughput:** Match producer throughput (50k msg/sec)
 - **Zero Data Loss:** All messages replicated before LSN advance
 
+## Phase 8: Compression Performance
+
+### Overview
+
+pg_kafka supports all standard Kafka compression codecs: gzip, snappy, lz4, and zstd. Compression is handled transparently - inbound messages are automatically decompressed, outbound compression is configurable.
+
+### Compression Trade-offs
+
+| Codec | CPU Overhead | Size Reduction | Best For |
+|-------|--------------|----------------|----------|
+| **none** | 0% | 0% | Low-latency, already compressed data |
+| **snappy** | ~2-5% | 30-40% | High throughput, low latency |
+| **lz4** | ~3-5% | 40-50% | Balanced (recommended default) |
+| **gzip** | ~10-15% | 60-70% | Storage-constrained environments |
+| **zstd** | ~5-10% | 50-60% | Best compression/speed ratio |
+
+### Configuration
+
+```sql
+-- Outbound compression (runtime changeable)
+SET pg_kafka.compression_type = 'lz4';  -- Recommended for balanced performance
+
+-- Check current setting
+SHOW pg_kafka.compression_type;
+```
+
+### Recommendations
+
+**High Throughput Workloads:**
+- Use `lz4` or `snappy` for minimal CPU overhead
+- Target: 50,000+ msg/sec with <5% CPU increase
+
+**Storage-Constrained Environments:**
+- Use `zstd` or `gzip` for maximum compression
+- Trade-off: ~10-15% higher CPU usage
+
+**Network-Bound Clients:**
+- Enable compression to reduce bandwidth
+- Particularly beneficial for large message payloads (>1KB)
+
+**Default Recommendation:**
+- `none` for backward compatibility
+- `lz4` for new deployments (best balance)
+
+### Inbound Decompression
+
+Producer-compressed messages are automatically decompressed by the `kafka-protocol` crate. This is transparent and requires no configuration:
+
+```
+Producer (gzip) → TCP → pg_kafka (auto-decompress) → PostgreSQL (uncompressed)
+```
+
+**Note:** Messages are stored uncompressed in PostgreSQL. This enables SQL queries on message content but increases storage requirements. Future phases may add optional storage compression.
+
+---
+
 ## Future Optimizations
 
 ### Phase 3+
@@ -456,4 +512,6 @@ pgbench -c 10 -j 4 -T 60 -f produce_benchmark.sql
 
 ---
 
-**Status:** Phase 2 implementation does NOT yet include partitioning or retention policies. These are critical for production deployments and must be implemented in Phase 3.
+**Status:** Phase 8 Complete. Compression support is fully implemented. Partitioning and retention policies are planned for future phases and are critical for production deployments.
+
+**Last Updated:** 2026-01-08

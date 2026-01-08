@@ -1,8 +1,13 @@
 # ADR-001: Partitioning and Retention Strategy
 
-**Status:** Proposed (Phase 3)
+**Status:** Proposed (Future Phase)
 **Date:** 2026-01-02
+**Last Reviewed:** 2026-01-08
 **Context:** Based on PostgreSQL queue/pubsub benchmark findings
+
+> **Note:** This is a future architectural proposal. As of Phase 8, pg_kafka does not implement
+> table partitioning or automatic retention. The current `kafka.messages` table grows unbounded.
+> This feature is planned for a future phase to address production scaling needs.
 
 ## Summary
 

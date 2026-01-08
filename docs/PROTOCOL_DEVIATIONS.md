@@ -341,4 +341,4 @@ auto.offset.reset=earliest
 **Last Updated:** 2026-01-08
 **Applies To:** pg_kafka Phase 8 Complete (Compression Support)
 **API Coverage:** 18 of ~50 Kafka APIs (36%)
-**Test Status:** 184 unit tests + 95 E2E tests passing
+**Test Status:** 184 unit tests + 74 E2E tests passing
