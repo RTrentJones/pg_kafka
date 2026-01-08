@@ -69,5 +69,5 @@ panic = "unwind"
 [profile.release]
 panic = "unwind"
 opt-level = 3
-lto = "fat"
+lto = "thin"  # "thin" provides most benefits of "fat" with smaller intermediate files
 codegen-units = 1
