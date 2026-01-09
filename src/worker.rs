@@ -80,6 +80,30 @@ fn verify_schema(database: &str) -> Result<(), String> {
     }
 }
 
+/// Extract producer metadata from the first partition with valid metadata (Phase 9)
+///
+/// Idempotent producers embed producer_id, producer_epoch, and base_sequence in the
+/// RecordBatch header. This function scans all topic partitions to find the first
+/// batch with valid producer metadata (producer_id >= 0).
+///
+/// Returns Some(ProducerMetadata) if found, None for non-idempotent producers.
+fn extract_producer_metadata(
+    topic_data: &[crate::kafka::messages::TopicProduceData],
+) -> Option<crate::kafka::messages::ProducerMetadata> {
+    for topic in topic_data {
+        for partition_data in &topic.partitions {
+            if let Some(ref metadata) = partition_data.producer_metadata {
+                // Only return metadata for actual idempotent producers (producer_id >= 0)
+                // Non-idempotent producers have producer_id = -1
+                if metadata.producer_id >= 0 {
+                    return Some(metadata.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Main entry point for the pg_kafka background worker.
 ///
 /// IMPORTANT: This function MUST follow pgrx background worker conventions:
@@ -562,8 +586,9 @@ pub fn process_request(
                 });
 
                 // Process the produce request best-effort (client already got response)
-                // Note: Idempotent producer support (Phase 9) requires producer metadata from RecordBatch
-                // For acks=0, we skip idempotency validation since there's no guarantee anyway
+                // Phase 9 Note: For acks=0 (fire-and-forget), we intentionally skip idempotency validation
+                // by passing None for producer_metadata. There's no delivery guarantee anyway, so
+                // enforcing sequence validation would be misleading and waste resources.
                 match handlers::handle_produce(&store, topic_data.clone(), default_partitions, None)
                 {
                     Ok(response) => {
@@ -601,10 +626,15 @@ pub fn process_request(
             }
 
             // Handle produce and send notifications on success (acks >= 1)
-            // TODO: Extract producer metadata from RecordBatch for full Phase 9 idempotency support
-            // Currently passing None - idempotent producers will work after InitProducerId
-            // but sequence validation is not yet integrated into the produce flow
-            match handlers::handle_produce(&store, topic_data, default_partitions, None) {
+            // Phase 9: Extract producer metadata for idempotent producer validation
+            // This enables sequence checking, deduplication, and producer fencing
+            let producer_metadata = extract_producer_metadata(&topic_data);
+            match handlers::handle_produce(
+                &store,
+                topic_data,
+                default_partitions,
+                producer_metadata.as_ref(),
+            ) {
                 Ok(response) => {
                     // Send notifications for each successfully produced partition
                     // This wakes up any consumers waiting in long poll

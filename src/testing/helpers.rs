@@ -172,6 +172,7 @@ pub fn mock_produce_request(
     let partition_data = PartitionProduceData {
         partition_index: partition,
         records,
+        producer_metadata: None,
     };
 
     let topic_data = TopicProduceData {

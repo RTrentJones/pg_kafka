@@ -538,6 +538,9 @@ pub struct PartitionProduceData {
     pub partition_index: i32,
     /// Records to write
     pub records: Vec<Record>,
+    /// Producer metadata extracted from RecordBatch header (Phase 9)
+    /// None for non-idempotent producers or when metadata extraction fails
+    pub producer_metadata: Option<ProducerMetadata>,
 }
 
 /// A single Kafka record/message

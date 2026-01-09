@@ -18,7 +18,7 @@ use tracing::{debug, warn};
 use super::super::constants::*;
 use super::super::error::{KafkaError, Result};
 use super::super::messages::KafkaRequest;
-use super::recordbatch::parse_record_batch;
+use super::recordbatch::{parse_record_batch_with_metadata, ParsedRecordBatch};
 
 /// Parse a Kafka request from a frame
 ///
@@ -332,10 +332,13 @@ fn parse_produce(
         for partition in topic.partition_data {
             let partition_index = partition.index;
 
-            // Parse RecordBatch from partition.records
-            let records = match &partition.records {
-                Some(batch_bytes) => match parse_record_batch(batch_bytes) {
-                    Ok(records) => records,
+            // Parse RecordBatch from partition.records (Phase 9: extract producer metadata)
+            let (records, producer_metadata) = match &partition.records {
+                Some(batch_bytes) => match parse_record_batch_with_metadata(batch_bytes) {
+                    Ok(ParsedRecordBatch {
+                        records,
+                        producer_metadata,
+                    }) => (records, Some(producer_metadata)),
                     Err(e) => {
                         warn!(
                             "Failed to parse RecordBatch for topic={}, partition={}: {}",
@@ -350,19 +353,21 @@ fn parse_produce(
                         return Ok(None);
                     }
                 },
-                None => Vec::new(),
+                None => (Vec::new(), None),
             };
 
             debug!(
-                "Parsed {} records for topic={}, partition={}",
+                "Parsed {} records for topic={}, partition={} (producer_id={:?})",
                 records.len(),
                 topic_name,
-                partition_index
+                partition_index,
+                producer_metadata.as_ref().map(|m| m.producer_id)
             );
 
             partitions.push(super::super::messages::PartitionProduceData {
                 partition_index,
                 records,
+                producer_metadata,
             });
         }
 

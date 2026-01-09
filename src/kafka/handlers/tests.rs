@@ -47,6 +47,7 @@ mod tests {
                     headers: vec![],
                     timestamp: None,
                 }],
+                producer_metadata: None,
             }],
         }];
 
@@ -74,6 +75,7 @@ mod tests {
             partitions: vec![PartitionProduceData {
                 partition_index: 5,
                 records: vec![],
+                producer_metadata: None,
             }],
         }];
 
@@ -108,6 +110,7 @@ mod tests {
                     headers: vec![],
                     timestamp: None,
                 }],
+                producer_metadata: None,
             }],
         }];
 
@@ -1097,6 +1100,7 @@ mod tests {
                     headers: vec![],
                     timestamp: None,
                 }],
+                producer_metadata: None,
             }],
         }];
 
@@ -1137,6 +1141,7 @@ mod tests {
                     headers: vec![],
                     timestamp: None,
                 }],
+                producer_metadata: None,
             }],
         }];
 
@@ -1179,6 +1184,7 @@ mod tests {
                     headers: vec![],
                     timestamp: None,
                 }],
+                producer_metadata: None,
             }],
         }];
 
@@ -1221,6 +1227,7 @@ mod tests {
                     headers: vec![],
                     timestamp: None,
                 }],
+                producer_metadata: None,
             }],
         }];
 
