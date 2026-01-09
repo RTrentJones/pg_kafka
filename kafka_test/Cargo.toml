@@ -5,10 +5,17 @@ edition = "2021"
 
 [dependencies]
 # Kafka client for E2E testing
-rdkafka = { version = "0.36", features = ["cmake-build"] }
+rdkafka = { version = "0.36", features = ["cmake-build", "zstd"] }
 
 # Async runtime
-tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "time", "sync", "net", "io-util"] }
+tokio = { version = "1.48", features = [
+    "rt-multi-thread",
+    "macros",
+    "time",
+    "sync",
+    "net",
+    "io-util",
+] }
 
 # For protocol encoding/decoding
 bytes = "1"
