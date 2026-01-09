@@ -252,6 +252,75 @@ pub trait KafkaStore {
     /// # Returns
     /// Ok on success
     fn delete_consumer_group_offsets(&self, group_id: &str) -> Result<()>;
+
+    // ===== Idempotent Producer Operations (Phase 9) =====
+
+    /// Allocate a new producer ID with epoch 0
+    ///
+    /// Creates a new entry in the producer_ids table and returns the allocated
+    /// producer ID with initial epoch 0.
+    ///
+    /// # Arguments
+    /// * `client_id` - Optional client identifier for debugging
+    /// * `transactional_id` - Optional transactional ID (for Phase 10)
+    ///
+    /// # Returns
+    /// Tuple of (producer_id, epoch) where epoch is always 0 for new producers
+    fn allocate_producer_id(
+        &self,
+        client_id: Option<&str>,
+        transactional_id: Option<&str>,
+    ) -> Result<(i64, i16)>;
+
+    /// Get the current epoch for a producer ID
+    ///
+    /// # Arguments
+    /// * `producer_id` - The producer ID to look up
+    ///
+    /// # Returns
+    /// The current epoch if producer exists, None otherwise
+    fn get_producer_epoch(&self, producer_id: i64) -> Result<Option<i16>>;
+
+    /// Increment the producer epoch (for reconnection/fencing)
+    ///
+    /// Atomically increments the epoch for the given producer ID.
+    /// Used when a producer reconnects and needs a new epoch.
+    ///
+    /// # Arguments
+    /// * `producer_id` - The producer ID to update
+    ///
+    /// # Returns
+    /// The new epoch value, or error if producer not found
+    fn increment_producer_epoch(&self, producer_id: i64) -> Result<i16>;
+
+    /// Check and update sequence number for idempotent producer
+    ///
+    /// Validates that the sequence number is exactly `last_sequence + 1` for
+    /// the given (producer_id, topic_id, partition_id) tuple. If valid, updates
+    /// the last_sequence to `base_sequence + record_count - 1`.
+    ///
+    /// # Arguments
+    /// * `producer_id` - The producer ID
+    /// * `producer_epoch` - The producer epoch (for fencing check)
+    /// * `topic_id` - The topic ID
+    /// * `partition_id` - The partition ID
+    /// * `base_sequence` - The first sequence number in the batch
+    /// * `record_count` - Number of records in the batch
+    ///
+    /// # Returns
+    /// * `Ok(())` if sequence is valid and was recorded
+    /// * `Err(DuplicateSequence)` if sequence already seen
+    /// * `Err(OutOfOrderSequence)` if there's a gap in the sequence
+    /// * `Err(ProducerFenced)` if the epoch is stale
+    fn check_and_update_sequence(
+        &self,
+        producer_id: i64,
+        producer_epoch: i16,
+        topic_id: i32,
+        partition_id: i32,
+        base_sequence: i32,
+        record_count: i32,
+    ) -> Result<()>;
 }
 
 // Submodules

@@ -18,4 +18,4 @@ mod recordbatch;
 // Re-export public functions
 pub use decoding::parse_request;
 pub use encoding::encode_response;
-pub use recordbatch::parse_record_batch;
+pub use recordbatch::{parse_record_batch, parse_record_batch_with_metadata, ParsedRecordBatch};

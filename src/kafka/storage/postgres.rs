@@ -578,4 +578,228 @@ impl KafkaStore for PostgresStore {
             KafkaError::Internal(format!("delete_consumer_group_offsets failed: {}", e))
         })
     }
+
+    // ===== Idempotent Producer Operations (Phase 9) =====
+
+    fn allocate_producer_id(
+        &self,
+        client_id: Option<&str>,
+        transactional_id: Option<&str>,
+    ) -> Result<(i64, i16)> {
+        crate::pg_debug!(
+            "PostgresStore::allocate_producer_id: client_id={:?}, transactional_id={:?}",
+            client_id,
+            transactional_id
+        );
+
+        Spi::connect_mut(|client| {
+            let table = client.update(
+                "INSERT INTO kafka.producer_ids (client_id, transactional_id, epoch)
+                 VALUES ($1, $2, 0)
+                 RETURNING producer_id, epoch",
+                None,
+                &[client_id.into(), transactional_id.into()],
+            )?;
+
+            let row = table.first();
+            let producer_id: i64 = row
+                .get_by_name("producer_id")?
+                .ok_or_else(|| KafkaError::Internal("Failed to get producer_id".into()))?;
+            let epoch: i16 = row.get_by_name("epoch")?.unwrap_or(0);
+
+            crate::pg_debug!("Allocated producer_id={}, epoch={}", producer_id, epoch);
+            Ok((producer_id, epoch))
+        })
+        .map_err(|e: KafkaError| {
+            KafkaError::Internal(format!("allocate_producer_id failed: {}", e))
+        })
+    }
+
+    fn get_producer_epoch(&self, producer_id: i64) -> Result<Option<i16>> {
+        crate::pg_debug!(
+            "PostgresStore::get_producer_epoch: producer_id={}",
+            producer_id
+        );
+
+        Spi::connect(|client| {
+            let mut table = client.select(
+                "SELECT epoch FROM kafka.producer_ids WHERE producer_id = $1",
+                Some(1),
+                &[producer_id.into()],
+            )?;
+
+            if let Some(row) = table.next() {
+                let epoch: i16 = row.get_by_name("epoch")?.unwrap_or(0);
+                Ok(Some(epoch))
+            } else {
+                Ok(None)
+            }
+        })
+        .map_err(|e: KafkaError| KafkaError::Internal(format!("get_producer_epoch failed: {}", e)))
+    }
+
+    fn increment_producer_epoch(&self, producer_id: i64) -> Result<i16> {
+        crate::pg_debug!(
+            "PostgresStore::increment_producer_epoch: producer_id={}",
+            producer_id
+        );
+
+        Spi::connect_mut(|client| {
+            let table = client.update(
+                "UPDATE kafka.producer_ids
+                 SET epoch = epoch + 1, last_active_at = NOW()
+                 WHERE producer_id = $1
+                 RETURNING epoch",
+                None,
+                &[producer_id.into()],
+            )?;
+
+            if table.is_empty() {
+                return Err(KafkaError::unknown_producer_id(producer_id));
+            }
+
+            let new_epoch: i16 = table
+                .first()
+                .get_by_name("epoch")?
+                .ok_or_else(|| KafkaError::Internal("Failed to get new epoch".into()))?;
+
+            crate::pg_debug!(
+                "Incremented producer_id={} to epoch={}",
+                producer_id,
+                new_epoch
+            );
+            Ok(new_epoch)
+        })
+        .map_err(|e| match e {
+            KafkaError::UnknownProducerId { .. } => e,
+            _ => KafkaError::Internal(format!("increment_producer_epoch failed: {}", e)),
+        })
+    }
+
+    fn check_and_update_sequence(
+        &self,
+        producer_id: i64,
+        producer_epoch: i16,
+        topic_id: i32,
+        partition_id: i32,
+        base_sequence: i32,
+        record_count: i32,
+    ) -> Result<()> {
+        crate::pg_debug!(
+            "PostgresStore::check_and_update_sequence: producer_id={}, epoch={}, topic_id={}, partition_id={}, base_seq={}, count={}",
+            producer_id,
+            producer_epoch,
+            topic_id,
+            partition_id,
+            base_sequence,
+            record_count
+        );
+
+        Spi::connect_mut(|client| {
+            // Step 1: Verify producer epoch (fencing check)
+            let epoch_table = client.select(
+                "SELECT epoch FROM kafka.producer_ids WHERE producer_id = $1",
+                Some(1),
+                &[producer_id.into()],
+            )?;
+
+            if epoch_table.is_empty() {
+                return Err(KafkaError::unknown_producer_id(producer_id));
+            }
+
+            let current_epoch: i16 = epoch_table
+                .first()
+                .get_by_name("epoch")?
+                .unwrap_or(0);
+
+            if producer_epoch < current_epoch {
+                return Err(KafkaError::producer_fenced(
+                    producer_id,
+                    producer_epoch,
+                    current_epoch,
+                ));
+            }
+
+            // Step 2: Use advisory lock to serialize sequence checks for this producer+partition
+            // Using a hash of (producer_id, topic_id, partition_id) to create a unique lock
+            let lock_key = ((topic_id as i64) << 32) | (partition_id as i64);
+            client.select(
+                "SELECT pg_advisory_xact_lock($1, $2)",
+                None,
+                &[producer_id.into(), lock_key.into()],
+            )?;
+
+            // Step 3: Get current last_sequence for this producer/topic/partition
+            let seq_table = client.select(
+                "SELECT last_sequence FROM kafka.producer_sequences
+                 WHERE producer_id = $1 AND topic_id = $2 AND partition_id = $3",
+                Some(1),
+                &[producer_id.into(), topic_id.into(), partition_id.into()],
+            )?;
+
+            let last_sequence: i32 = if seq_table.is_empty() {
+                -1 // First batch for this producer/partition
+            } else {
+                seq_table
+                    .first()
+                    .get_by_name("last_sequence")?
+                    .unwrap_or(-1)
+            };
+
+            let expected_sequence = last_sequence + 1;
+
+            // Step 4: Validate sequence
+            if base_sequence < expected_sequence {
+                // Duplicate - sequence is behind expected
+                return Err(KafkaError::duplicate_sequence(
+                    producer_id,
+                    partition_id,
+                    base_sequence,
+                    expected_sequence,
+                ));
+            } else if base_sequence > expected_sequence {
+                // Gap - sequence is ahead of expected
+                return Err(KafkaError::out_of_order_sequence(
+                    producer_id,
+                    partition_id,
+                    base_sequence,
+                    expected_sequence,
+                ));
+            }
+
+            // Step 5: Sequence is valid - update last_sequence
+            let new_last_sequence = base_sequence + record_count - 1;
+
+            client.update(
+                "INSERT INTO kafka.producer_sequences (producer_id, topic_id, partition_id, last_sequence)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (producer_id, topic_id, partition_id)
+                 DO UPDATE SET last_sequence = EXCLUDED.last_sequence, updated_at = NOW()",
+                None,
+                &[
+                    producer_id.into(),
+                    topic_id.into(),
+                    partition_id.into(),
+                    new_last_sequence.into(),
+                ],
+            )?;
+
+            crate::pg_debug!(
+                "Updated sequence for producer_id={}, partition_id={}: {} -> {}",
+                producer_id,
+                partition_id,
+                last_sequence,
+                new_last_sequence
+            );
+
+            Ok(())
+        })
+        .map_err(|e| match e {
+            KafkaError::UnknownProducerId { .. }
+            | KafkaError::ProducerFenced { .. }
+            | KafkaError::DuplicateSequence { .. }
+            | KafkaError::OutOfOrderSequence { .. } => e,
+            _ => KafkaError::Internal(format!("check_and_update_sequence failed: {}", e)),
+        })
+    }
 }

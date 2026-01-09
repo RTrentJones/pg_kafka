@@ -50,7 +50,7 @@ mod tests {
             }],
         }];
 
-        let response = produce::handle_produce(&mock, topic_data, 1).unwrap();
+        let response = produce::handle_produce(&mock, topic_data, 1, None).unwrap();
 
         assert_eq!(response.responses.len(), 1);
         let topic_response = &response.responses[0];
@@ -77,7 +77,7 @@ mod tests {
             }],
         }];
 
-        let response = produce::handle_produce(&mock, topic_data, 1).unwrap();
+        let response = produce::handle_produce(&mock, topic_data, 1, None).unwrap();
 
         let partition_response = &response.responses[0].partition_responses[0];
         assert_eq!(
@@ -111,7 +111,7 @@ mod tests {
             }],
         }];
 
-        let response = produce::handle_produce(&mock, topic_data, 1).unwrap();
+        let response = produce::handle_produce(&mock, topic_data, 1, None).unwrap();
 
         let partition_response = &response.responses[0].partition_responses[0];
         assert_eq!(partition_response.error_code, ERROR_UNKNOWN_SERVER_ERROR);
@@ -951,5 +951,290 @@ mod tests {
 
         // Group is not empty (it has a member)
         assert_eq!(list_empty.groups.len(), 0);
+    }
+
+    // ========== InitProducerId Handler Tests (Phase 9) ==========
+
+    use crate::kafka::handlers::init_producer_id;
+    use crate::kafka::messages::ProducerMetadata;
+
+    #[test]
+    fn test_handle_init_producer_id_new_producer() {
+        let mut mock = MockKafkaStore::new();
+
+        // Expect allocation of new producer ID with epoch 0
+        mock.expect_allocate_producer_id()
+            .times(1)
+            .returning(|_, _| Ok((1000, 0))); // producer_id=1000, epoch=0
+
+        let response = init_producer_id::handle_init_producer_id(
+            &mock,
+            None, // No transactional ID
+            -1,   // New producer
+            -1,   // New producer
+            Some("test-client"),
+        )
+        .unwrap();
+
+        assert_eq!(response.error_code, ERROR_NONE);
+        assert_eq!(response.producer_id.0, 1000);
+        assert_eq!(response.producer_epoch, 0);
+    }
+
+    #[test]
+    fn test_handle_init_producer_id_existing_producer_reconnect() {
+        let mut mock = MockKafkaStore::new();
+
+        // First, check the current epoch
+        mock.expect_get_producer_epoch()
+            .times(1)
+            .returning(|_| Ok(Some(0))); // Current epoch is 0
+
+        // Then increment the epoch
+        mock.expect_increment_producer_epoch()
+            .times(1)
+            .returning(|_| Ok(1)); // New epoch is 1
+
+        let response = init_producer_id::handle_init_producer_id(
+            &mock,
+            None, // No transactional ID
+            1000, // Existing producer ID
+            0,    // Current epoch
+            Some("test-client"),
+        )
+        .unwrap();
+
+        assert_eq!(response.error_code, ERROR_NONE);
+        assert_eq!(response.producer_id.0, 1000);
+        assert_eq!(response.producer_epoch, 1); // Epoch was bumped
+    }
+
+    #[test]
+    fn test_handle_init_producer_id_producer_fenced() {
+        let mut mock = MockKafkaStore::new();
+
+        // Return current epoch that is higher than the client's epoch
+        mock.expect_get_producer_epoch()
+            .times(1)
+            .returning(|_| Ok(Some(5))); // Current epoch is 5, but client has 3
+
+        let result = init_producer_id::handle_init_producer_id(
+            &mock,
+            None,
+            1000, // Producer ID
+            3,    // Old epoch (current is 5)
+            Some("test-client"),
+        );
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            KafkaError::ProducerFenced {
+                producer_id,
+                epoch,
+                expected_epoch,
+            } => {
+                assert_eq!(producer_id, 1000);
+                assert_eq!(epoch, 3);
+                assert_eq!(expected_epoch, 5);
+            }
+            e => panic!("Expected ProducerFenced error, got {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_handle_init_producer_id_unknown_producer() {
+        let mut mock = MockKafkaStore::new();
+
+        // Producer doesn't exist
+        mock.expect_get_producer_epoch()
+            .times(1)
+            .returning(|_| Ok(None));
+
+        let result = init_producer_id::handle_init_producer_id(
+            &mock,
+            None,
+            9999, // Unknown producer ID
+            0,
+            Some("test-client"),
+        );
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            KafkaError::UnknownProducerId { producer_id } => {
+                assert_eq!(producer_id, 9999);
+            }
+            e => panic!("Expected UnknownProducerId error, got {:?}", e),
+        }
+    }
+
+    // ========== Produce Handler with Idempotency Tests (Phase 9) ==========
+
+    #[test]
+    fn test_handle_produce_with_idempotent_producer_success() {
+        let mut mock = MockKafkaStore::new();
+
+        // Expect topic lookup
+        mock.expect_get_or_create_topic()
+            .returning(|_, _| Ok((1, 1)));
+
+        // Expect sequence check to pass
+        mock.expect_check_and_update_sequence()
+            .times(1)
+            .returning(|_, _, _, _, _, _| Ok(()));
+
+        // Expect record insertion
+        mock.expect_insert_records()
+            .times(1)
+            .returning(|_, _, _| Ok(0));
+
+        let topic_data = vec![TopicProduceData {
+            name: "test-topic".to_string(),
+            partitions: vec![PartitionProduceData {
+                partition_index: 0,
+                records: vec![Record {
+                    key: Some(b"key1".to_vec()),
+                    value: Some(b"value1".to_vec()),
+                    headers: vec![],
+                    timestamp: None,
+                }],
+            }],
+        }];
+
+        let producer_metadata = ProducerMetadata {
+            producer_id: 1000,
+            producer_epoch: 0,
+            base_sequence: 0,
+        };
+
+        let response =
+            produce::handle_produce(&mock, topic_data, 1, Some(&producer_metadata)).unwrap();
+
+        assert_eq!(response.responses.len(), 1);
+        let partition_response = &response.responses[0].partition_responses[0];
+        assert_eq!(partition_response.error_code, ERROR_NONE);
+        assert_eq!(partition_response.base_offset, 0);
+    }
+
+    #[test]
+    fn test_handle_produce_duplicate_sequence_rejected() {
+        let mut mock = MockKafkaStore::new();
+
+        mock.expect_get_or_create_topic()
+            .returning(|_, _| Ok((1, 1)));
+
+        // Sequence check fails with duplicate error
+        mock.expect_check_and_update_sequence()
+            .times(1)
+            .returning(|_, _, _, _, _, _| Err(KafkaError::duplicate_sequence(1000, 0, 5, 10)));
+
+        let topic_data = vec![TopicProduceData {
+            name: "test-topic".to_string(),
+            partitions: vec![PartitionProduceData {
+                partition_index: 0,
+                records: vec![Record {
+                    key: None,
+                    value: Some(b"test".to_vec()),
+                    headers: vec![],
+                    timestamp: None,
+                }],
+            }],
+        }];
+
+        let producer_metadata = ProducerMetadata {
+            producer_id: 1000,
+            producer_epoch: 0,
+            base_sequence: 5, // Duplicate - already processed
+        };
+
+        let response =
+            produce::handle_produce(&mock, topic_data, 1, Some(&producer_metadata)).unwrap();
+
+        let partition_response = &response.responses[0].partition_responses[0];
+        assert_eq!(
+            partition_response.error_code,
+            ERROR_DUPLICATE_SEQUENCE_NUMBER
+        );
+        assert_eq!(partition_response.base_offset, -1);
+    }
+
+    #[test]
+    fn test_handle_produce_out_of_order_sequence_rejected() {
+        let mut mock = MockKafkaStore::new();
+
+        mock.expect_get_or_create_topic()
+            .returning(|_, _| Ok((1, 1)));
+
+        // Sequence check fails with out-of-order error
+        mock.expect_check_and_update_sequence()
+            .times(1)
+            .returning(|_, _, _, _, _, _| Err(KafkaError::out_of_order_sequence(1000, 0, 15, 10)));
+
+        let topic_data = vec![TopicProduceData {
+            name: "test-topic".to_string(),
+            partitions: vec![PartitionProduceData {
+                partition_index: 0,
+                records: vec![Record {
+                    key: None,
+                    value: Some(b"test".to_vec()),
+                    headers: vec![],
+                    timestamp: None,
+                }],
+            }],
+        }];
+
+        let producer_metadata = ProducerMetadata {
+            producer_id: 1000,
+            producer_epoch: 0,
+            base_sequence: 15, // Gap - expected 10
+        };
+
+        let response =
+            produce::handle_produce(&mock, topic_data, 1, Some(&producer_metadata)).unwrap();
+
+        let partition_response = &response.responses[0].partition_responses[0];
+        assert_eq!(
+            partition_response.error_code,
+            ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER
+        );
+        assert_eq!(partition_response.base_offset, -1);
+    }
+
+    #[test]
+    fn test_handle_produce_non_idempotent_skips_validation() {
+        let mut mock = MockKafkaStore::new();
+
+        mock.expect_get_or_create_topic()
+            .returning(|_, _| Ok((1, 1)));
+
+        // No sequence check expected when producer_id is -1
+        mock.expect_insert_records()
+            .times(1)
+            .returning(|_, _, _| Ok(0));
+
+        let topic_data = vec![TopicProduceData {
+            name: "test-topic".to_string(),
+            partitions: vec![PartitionProduceData {
+                partition_index: 0,
+                records: vec![Record {
+                    key: None,
+                    value: Some(b"test".to_vec()),
+                    headers: vec![],
+                    timestamp: None,
+                }],
+            }],
+        }];
+
+        // Non-idempotent producer (producer_id = -1)
+        let producer_metadata = ProducerMetadata {
+            producer_id: -1,
+            producer_epoch: -1,
+            base_sequence: -1,
+        };
+
+        let response =
+            produce::handle_produce(&mock, topic_data, 1, Some(&producer_metadata)).unwrap();
+
+        let partition_response = &response.responses[0].partition_responses[0];
+        assert_eq!(partition_response.error_code, ERROR_NONE);
     }
 }

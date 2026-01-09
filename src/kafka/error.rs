@@ -17,10 +17,11 @@
 use thiserror::Error;
 
 use crate::kafka::constants::{
-    ERROR_COORDINATOR_NOT_AVAILABLE, ERROR_CORRUPT_MESSAGE, ERROR_ILLEGAL_GENERATION,
-    ERROR_INVALID_PARTITIONS, ERROR_NOT_COORDINATOR, ERROR_REBALANCE_IN_PROGRESS,
-    ERROR_UNKNOWN_MEMBER_ID, ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
-    ERROR_UNSUPPORTED_VERSION, MAX_REQUEST_SIZE,
+    ERROR_COORDINATOR_NOT_AVAILABLE, ERROR_CORRUPT_MESSAGE, ERROR_DUPLICATE_SEQUENCE_NUMBER,
+    ERROR_ILLEGAL_GENERATION, ERROR_INVALID_PARTITIONS, ERROR_NOT_COORDINATOR,
+    ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER, ERROR_PRODUCER_FENCED, ERROR_REBALANCE_IN_PROGRESS,
+    ERROR_UNKNOWN_MEMBER_ID, ERROR_UNKNOWN_PRODUCER_ID, ERROR_UNKNOWN_SERVER_ERROR,
+    ERROR_UNKNOWN_TOPIC_OR_PARTITION, ERROR_UNSUPPORTED_VERSION, MAX_REQUEST_SIZE,
 };
 
 /// Errors that can occur during Kafka protocol operations
@@ -88,6 +89,37 @@ pub enum KafkaError {
     #[error("Rebalance in progress for group: {group_id}")]
     RebalanceInProgress { group_id: String },
 
+    // ===== Idempotent Producer Errors (Phase 9) =====
+    /// Duplicate sequence number (idempotent producer deduplication)
+    #[error("Duplicate sequence {sequence} for producer {producer_id} on partition {partition_id} (expected {expected})")]
+    DuplicateSequence {
+        producer_id: i64,
+        partition_id: i32,
+        sequence: i32,
+        expected: i32,
+    },
+
+    /// Out of order sequence number (gap in sequence)
+    #[error("Out of order sequence {sequence} for producer {producer_id} on partition {partition_id} (expected {expected})")]
+    OutOfOrderSequence {
+        producer_id: i64,
+        partition_id: i32,
+        sequence: i32,
+        expected: i32,
+    },
+
+    /// Producer fenced (epoch mismatch - newer producer took over)
+    #[error("Producer fenced: producer {producer_id} epoch {epoch} is older than current epoch {expected_epoch}")]
+    ProducerFenced {
+        producer_id: i64,
+        epoch: i16,
+        expected_epoch: i16,
+    },
+
+    /// Unknown producer ID (producer ID not found in storage)
+    #[error("Unknown producer ID: {producer_id}")]
+    UnknownProducerId { producer_id: i64 },
+
     // ===== Storage/Database Errors =====
     /// Database operation failed
     #[error("Database error: {message}")]
@@ -151,6 +183,12 @@ impl KafkaError {
             KafkaError::UnknownMemberId { .. } => ERROR_UNKNOWN_MEMBER_ID,
             KafkaError::IllegalGeneration { .. } => ERROR_ILLEGAL_GENERATION,
             KafkaError::RebalanceInProgress { .. } => ERROR_REBALANCE_IN_PROGRESS,
+
+            // Idempotent producer errors → specific codes
+            KafkaError::DuplicateSequence { .. } => ERROR_DUPLICATE_SEQUENCE_NUMBER,
+            KafkaError::OutOfOrderSequence { .. } => ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER,
+            KafkaError::ProducerFenced { .. } => ERROR_PRODUCER_FENCED,
+            KafkaError::UnknownProducerId { .. } => ERROR_UNKNOWN_PRODUCER_ID,
 
             // Storage/Schema errors → UNKNOWN_SERVER_ERROR
             KafkaError::Database { .. } => ERROR_UNKNOWN_SERVER_ERROR,
@@ -239,6 +277,50 @@ impl KafkaError {
             generation,
             expected,
         }
+    }
+
+    /// Create a duplicate sequence error (Phase 9)
+    pub fn duplicate_sequence(
+        producer_id: i64,
+        partition_id: i32,
+        sequence: i32,
+        expected: i32,
+    ) -> Self {
+        KafkaError::DuplicateSequence {
+            producer_id,
+            partition_id,
+            sequence,
+            expected,
+        }
+    }
+
+    /// Create an out of order sequence error (Phase 9)
+    pub fn out_of_order_sequence(
+        producer_id: i64,
+        partition_id: i32,
+        sequence: i32,
+        expected: i32,
+    ) -> Self {
+        KafkaError::OutOfOrderSequence {
+            producer_id,
+            partition_id,
+            sequence,
+            expected,
+        }
+    }
+
+    /// Create a producer fenced error (Phase 9)
+    pub fn producer_fenced(producer_id: i64, epoch: i16, expected_epoch: i16) -> Self {
+        KafkaError::ProducerFenced {
+            producer_id,
+            epoch,
+            expected_epoch,
+        }
+    }
+
+    /// Create an unknown producer ID error (Phase 9)
+    pub fn unknown_producer_id(producer_id: i64) -> Self {
+        KafkaError::UnknownProducerId { producer_id }
     }
 }
 

@@ -130,6 +130,8 @@ use kafka_test::{
     test_compressed_producer_snappy,
     test_compressed_producer_zstd,
     test_compression_roundtrip,
+    // Idempotent producer tests
+    test_idempotent_producer_basic,
 };
 
 type TestFn = fn() -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error>>> + Send>>;
@@ -675,6 +677,13 @@ fn get_all_tests() -> Vec<TestDef> {
             category: "compression",
             name: "test_compression_roundtrip",
             test_fn: wrap_test!(test_compression_roundtrip),
+            parallel_safe: true,
+        },
+        // Idempotent producer tests (Phase 9)
+        TestDef {
+            category: "idempotent",
+            name: "test_idempotent_producer_basic",
+            test_fn: wrap_test!(test_idempotent_producer_basic),
             parallel_safe: true,
         },
     ]

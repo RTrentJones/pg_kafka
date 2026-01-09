@@ -313,6 +313,25 @@ pub enum KafkaRequest {
         /// Channel to send the response back to the specific connection
         response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
     },
+    /// InitProducerId request - allocate producer IDs for idempotent producers (Phase 9)
+    InitProducerId {
+        /// Correlation ID from client - MUST be echoed back in response
+        correlation_id: i32,
+        /// Optional client identifier string
+        client_id: Option<String>,
+        /// API version from the request (needed for response encoding)
+        api_version: i16,
+        /// Optional transactional ID (for transactional producers - Phase 10)
+        transactional_id: Option<String>,
+        /// Transaction timeout in milliseconds (for transactional producers)
+        transaction_timeout_ms: i32,
+        /// Existing producer ID for reconnection (-1 for new producer)
+        producer_id: i64,
+        /// Existing producer epoch for reconnection (-1 for new producer)
+        producer_epoch: i16,
+        /// Channel to send the response back to the specific connection
+        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
+    },
 }
 
 /// Kafka response types sent back from main thread to async tasks
@@ -483,6 +502,15 @@ pub enum KafkaResponse {
         /// The kafka-protocol response struct (ready to encode)
         response: kafka_protocol::messages::delete_groups_response::DeleteGroupsResponse,
     },
+    /// InitProducerId response - wraps kafka-protocol's InitProducerIdResponse (Phase 9)
+    InitProducerId {
+        /// Correlation ID from request
+        correlation_id: i32,
+        /// API version from the request (needed for response encoding)
+        api_version: i16,
+        /// The kafka-protocol response struct (ready to encode)
+        response: kafka_protocol::messages::init_producer_id_response::InitProducerIdResponse,
+    },
     /// Error response for unsupported or malformed requests
     Error {
         /// Correlation ID from request
@@ -523,6 +551,20 @@ pub struct Record {
     pub headers: Vec<RecordHeader>,
     /// Timestamp (milliseconds since epoch, optional)
     pub timestamp: Option<i64>,
+}
+
+/// Producer metadata from RecordBatch header (Phase 9 - Idempotent Producer)
+///
+/// This struct captures the producer identity and sequence information
+/// from a RecordBatch for idempotent producer validation.
+#[derive(Debug, Clone, Default)]
+pub struct ProducerMetadata {
+    /// Producer ID allocated by InitProducerId (-1 for non-idempotent producers)
+    pub producer_id: i64,
+    /// Producer epoch for fencing (-1 for non-idempotent producers)
+    pub producer_epoch: i16,
+    /// Base sequence number for this batch (first record's sequence)
+    pub base_sequence: i32,
 }
 
 /// Record header (key-value metadata)

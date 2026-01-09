@@ -148,6 +148,13 @@ pub fn build_api_versions_response() -> ApiVersionsResponse {
     av18.max_version = 2;
     response.api_keys.push(av18);
 
+    // InitProducerId (API_KEY_INIT_PRODUCER_ID): versions 0-4 (Phase 9)
+    let mut av19 = ApiVersion::default();
+    av19.api_key = API_KEY_INIT_PRODUCER_ID;
+    av19.min_version = 0;
+    av19.max_version = 4;
+    response.api_keys.push(av19);
+
     response
 }
 
@@ -220,6 +227,7 @@ use kafka_protocol::messages::describe_groups_response::DescribeGroupsResponse;
 use kafka_protocol::messages::fetch_response::FetchResponse;
 use kafka_protocol::messages::find_coordinator_response::FindCoordinatorResponse;
 use kafka_protocol::messages::heartbeat_response::HeartbeatResponse;
+use kafka_protocol::messages::init_producer_id_response::InitProducerIdResponse;
 use kafka_protocol::messages::join_group_response::JoinGroupResponse;
 use kafka_protocol::messages::leave_group_response::LeaveGroupResponse;
 use kafka_protocol::messages::list_groups_response::ListGroupsResponse;
@@ -364,5 +372,16 @@ pub fn build_delete_groups_error_response(_error_code: i16) -> DeleteGroupsRespo
     // DeleteGroupsResponse errors are per-group. Return empty response.
     let mut response = DeleteGroupsResponse::default();
     response.throttle_time_ms = 0;
+    response
+}
+
+/// Build an InitProducerIdResponse with an error code (Phase 9)
+pub fn build_init_producer_id_error_response(error_code: i16) -> InitProducerIdResponse {
+    use kafka_protocol::messages::ProducerId;
+    let mut response = InitProducerIdResponse::default();
+    response.throttle_time_ms = 0;
+    response.error_code = error_code;
+    response.producer_id = ProducerId(-1);
+    response.producer_epoch = -1;
     response
 }

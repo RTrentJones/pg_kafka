@@ -1,7 +1,7 @@
 # Kafka Protocol Coverage Analysis
 
-**Date**: 2026-01-08
-**pg_kafka Version**: Phase 8 Complete (Compression Support)
+**Date**: 2026-01-09
+**pg_kafka Version**: Phase 9 Complete (Idempotent Producer)
 **Analysis**: Comprehensive review of implemented vs standard Kafka protocol
 
 ---
@@ -10,15 +10,15 @@
 
 | Metric | Value |
 |--------|-------|
-| **API Coverage** | 18 of ~50 standard Kafka APIs (36%) |
+| **API Coverage** | 19 of ~50 standard Kafka APIs (38%) |
 | **Build Status** | ✅ Compiles with zero warnings |
-| **Test Suite** | 184 unit tests + 74 E2E tests |
+| **Test Suite** | 192 unit tests + 74 E2E tests |
 | **Architecture** | Repository Pattern with typed errors |
 | **Client Compatibility** | ✅ kcat, rdkafka verified |
 
 ---
 
-## Implemented APIs (18 total)
+## Implemented APIs (19 total)
 
 ### 1. Core Metadata (2 APIs) ✅ 100% Coverage
 | API | Key | Versions | Status | Notes |
@@ -26,14 +26,17 @@
 | ApiVersions | 18 | v0-v3 | ✅ Complete | Returns supported API versions |
 | Metadata | 3 | v0-v9 | ✅ Complete | Topic and broker discovery |
 
-### 2. Producer (1 API) ✅ 100% Coverage
+### 2. Producer (2 APIs) ✅ 100% Coverage
 | API | Key | Versions | Status | Notes |
 |-----|-----|----------|--------|-------|
-| Produce | 0 | v3-v9 | ✅ Complete | RecordBatch v2 format only |
+| Produce | 0 | v3-v9 | ✅ Complete | RecordBatch v2 format with sequence validation |
+| InitProducerId | 22 | v0-v4 | ✅ Complete | Allocate producer ID for idempotency |
 
-**Limitations**:
-- No idempotent producer support
-- No transaction support
+**Implementation Notes (Phase 9)**:
+- ✅ Idempotent producer support with sequence validation
+- ✅ Deduplication (DUPLICATE_SEQUENCE_NUMBER, OUT_OF_ORDER_SEQUENCE_NUMBER)
+- ✅ Producer epoch fencing (PRODUCER_FENCED)
+- ❌ No full transaction support (transactional_id allocation only)
 
 ### 3. Consumer - Data Access (4 APIs) ✅ 100% Coverage
 | API | Key | Versions | Status | Notes |
@@ -87,12 +90,14 @@
 ## Missing Low Priority APIs
 
 ### Not Planned (Single-Node Design)
-- **Transactions**: InitProducerId (22), AddPartitionsToTxn (24), EndTxn (26), etc.
+- **Transactions**: AddPartitionsToTxn (24), EndTxn (26), TxnOffsetCommit (28), etc.
 - **Security**: SaslHandshake (17), CreateAcls (30), etc.
 - **Cluster Management**: ElectLeaders (43), AlterReplicaLogDirs (34), etc.
 - **Quotas**: DescribeClientQuotas (48), AlterClientQuotas (49)
 
 **Rationale**: pg_kafka is designed as single-node broker using PostgreSQL's native features for these concerns.
+
+**Note**: InitProducerId (22) is implemented for idempotent producer support, but full transactional semantics (AddPartitionsToTxn, EndTxn, etc.) are not planned for v1.
 
 ---
 
@@ -146,6 +151,7 @@ Consumer Flow (Current):
 - **Phase 6** ✅ Admin APIs (CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups)
 - **Phase 7** ✅ Multi-Partition Topics with key-based routing
 - **Phase 8** ✅ Compression Support (gzip, snappy, lz4, zstd)
+- **Phase 9** ✅ Idempotent Producer (InitProducerId, sequence validation, deduplication)
 
 ### Enhancements
 
@@ -153,10 +159,10 @@ Consumer Flow (Current):
 
 ### Future Phases
 
-- **Phase 9** - Shadow Mode (Logical Decoding → external Kafka)
+- **Phase 10** - Shadow Mode (Logical Decoding → external Kafka)
+- **Phase 11** - Transaction Support (full ACID semantics)
 - **Cooperative Rebalancing** (KIP-429)
 - **Static Group Membership** (KIP-345)
-- **Idempotent Producer** - Deduplication support
 
 ---
 
@@ -195,19 +201,20 @@ Consumer Flow (Current):
 - **Testing**: E2E tests with rdkafka
 - **Documentation**: Comprehensive design docs
 
-### Test Coverage (184 unit tests + 74 E2E tests)
+### Test Coverage (192 unit tests + 74 E2E tests)
 
 | Category | Count | Location |
 |----------|-------|----------|
 | Assignment strategies | 61 | `src/kafka/assignment/` |
 | Protocol encoding | 34 | `tests/` |
-| Handler logic | 22 | `src/kafka/handlers/tests.rs` |
+| Handler logic | 22 | `src/kafka/handlers/tests.rs` (includes Phase 9) |
 | Storage layer | 22 | `src/kafka/storage/tests.rs` |
 | Infrastructure | 20 | Config, mocks, helpers |
 | Error handling | 10 | `src/kafka/error.rs` |
 | Coordinator | 8 | `src/kafka/coordinator.rs` |
 | Partitioner | 7 | `src/kafka/partitioner.rs` |
-| **Unit Total** | **184** | |
+| Property-based | 8 | Proptest fuzzing |
+| **Unit Total** | **192** | |
 | **E2E Test Suite** | **74** | `kafka_test/` |
 
 **E2E Test Categories (74 tests):**
@@ -229,35 +236,40 @@ Consumer Flow (Current):
 
 ## Conclusion
 
-**Current State**: Comprehensive Kafka-compatible broker with 18 APIs implemented
-**Coverage**: 36% of standard Kafka protocol (full producer/consumer/coordinator/admin support)
+**Current State**: Comprehensive Kafka-compatible broker with 19 APIs implemented
+**Coverage**: 38% of standard Kafka protocol (full producer/consumer/coordinator/admin support)
 **Architecture**: Clean, maintainable, well-documented with Repository Pattern
-**Test Status**: All 184 unit tests and 74 E2E tests passing ✅
+**Test Status**: All 192 unit tests and 74 E2E tests passing ✅
 
 **Readiness**:
-- ✅ **Producer**: Production-ready with full compression support
+- ✅ **Producer**: Production-ready with idempotency and compression support
 - ✅ **Consumer**: Fully functional with long polling and automatic partition assignment
 - ✅ **Coordinator**: Complete with automatic rebalancing
 - ✅ **Admin APIs**: CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups
 - ✅ **Multi-Partition**: Key-based routing with murmur2 hash
 - ✅ **Long Polling**: max_wait_ms/min_bytes support
 - ✅ **Compression**: gzip, snappy, lz4, zstd (inbound/outbound)
+- ✅ **Idempotency**: InitProducerId with sequence validation and deduplication
 
-**Recent Achievements (Phase 8)**:
-1. ✅ Compression support (gzip, snappy, lz4, zstd)
-2. ✅ Automatic inbound decompression via kafka-protocol crate
-3. ✅ Configurable outbound compression via GUC
-4. ✅ Full E2E test coverage for all compression codecs
+**Recent Achievements (Phase 9)**:
+1. ✅ InitProducerId API (API key 22, versions 0-4)
+2. ✅ Producer ID allocation with epoch tracking
+3. ✅ Sequence validation per partition (DUPLICATE_SEQUENCE_NUMBER, OUT_OF_ORDER_SEQUENCE_NUMBER)
+4. ✅ Producer epoch fencing (PRODUCER_FENCED error)
+5. ✅ Database schema for producer_ids and producer_sequences
+6. ✅ PostgreSQL advisory locks for sequence serialization
+7. ✅ 8 new unit tests for idempotent producer behavior
 
 **Future Phases**:
-1. Phase 9: Shadow mode (logical decoding to external Kafka)
-2. Cooperative rebalancing (KIP-429)
-3. Static group membership (KIP-345)
+1. Phase 10: Shadow mode (logical decoding to external Kafka)
+2. Phase 11: Transaction support (full ACID semantics)
+3. Cooperative rebalancing (KIP-429)
+4. Static group membership (KIP-345)
 
 ---
 
-**Overall Assessment**: Phase 8 Complete - pg_kafka provides full producer/consumer support with compression, long polling, multi-partition topics, and admin APIs. The implementation features clean architecture (Repository Pattern), comprehensive test coverage (184 unit tests, 74 E2E tests), and typed error handling.
+**Overall Assessment**: Phase 9 Complete - pg_kafka provides full producer/consumer support with idempotency, compression, long polling, multi-partition topics, and admin APIs. The implementation features clean architecture (Repository Pattern), comprehensive test coverage (192 unit tests, 74 E2E tests), and typed error handling with full Kafka error code mapping.
 
-**Last Updated:** 2026-01-08
-**Phase:** 8 Complete (Compression Support)
-**Tests:** 184 unit tests + 74 E2E tests
+**Last Updated:** 2026-01-09
+**Phase:** 9 Complete (Idempotent Producer)
+**Tests:** 192 unit tests + 74 E2E tests

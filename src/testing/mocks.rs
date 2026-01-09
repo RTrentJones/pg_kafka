@@ -56,6 +56,23 @@ mock! {
         fn set_topic_partition_count<'a>(&self, name: &'a str, partition_count: i32) -> Result<()>;
         // Admin Consumer Group Operations (Phase 6)
         fn delete_consumer_group_offsets<'a>(&self, group_id: &'a str) -> Result<()>;
+        // Idempotent Producer Operations (Phase 9)
+        fn allocate_producer_id<'a>(
+            &self,
+            client_id: Option<&'a str>,
+            transactional_id: Option<&'a str>,
+        ) -> Result<(i64, i16)>;
+        fn get_producer_epoch(&self, producer_id: i64) -> Result<Option<i16>>;
+        fn increment_producer_epoch(&self, producer_id: i64) -> Result<i16>;
+        fn check_and_update_sequence(
+            &self,
+            producer_id: i64,
+            producer_epoch: i16,
+            topic_id: i32,
+            partition_id: i32,
+            base_sequence: i32,
+            record_count: i32,
+        ) -> Result<()>;
     }
 }
 

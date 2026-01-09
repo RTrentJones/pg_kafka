@@ -101,6 +101,11 @@ pub const API_KEY_CREATE_PARTITIONS: i16 = 37;
 /// Used to delete consumer groups
 pub const API_KEY_DELETE_GROUPS: i16 = 42;
 
+/// API key for InitProducerId requests (Phase 9)
+///
+/// Used to allocate producer IDs for idempotent/transactional producers
+pub const API_KEY_INIT_PRODUCER_ID: i16 = 22;
+
 // ===== Configuration Defaults =====
 
 /// Default Kafka protocol port
@@ -206,7 +211,8 @@ pub fn get_flexible_format_threshold(api_key: i16) -> Option<i16> {
         API_KEY_DELETE_TOPICS => Some(4),
         API_KEY_CREATE_PARTITIONS => Some(2),
         API_KEY_DELETE_GROUPS => Some(2),
-        _ => None, // Unknown API keys default to v0
+        API_KEY_INIT_PRODUCER_ID => Some(2), // InitProducerId v2+ uses flexible format
+        _ => None,                           // Unknown API keys default to v0
     }
 }
 
@@ -292,6 +298,20 @@ pub const ERROR_GROUP_ID_NOT_FOUND: i16 = 69;
 
 /// Non-empty group (cannot delete group with members)
 pub const ERROR_NON_EMPTY_GROUP: i16 = 68;
+
+// ===== Idempotent Producer Error Codes (Phase 9) =====
+
+/// Duplicate sequence number (idempotent producer deduplication)
+pub const ERROR_DUPLICATE_SEQUENCE_NUMBER: i16 = 46;
+
+/// Out of order sequence number (gap in sequence)
+pub const ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER: i16 = 47;
+
+/// Producer fenced (epoch mismatch - newer producer took over)
+pub const ERROR_PRODUCER_FENCED: i16 = 91;
+
+/// Unknown producer ID (producer ID not found)
+pub const ERROR_UNKNOWN_PRODUCER_ID: i16 = 59;
 
 // ===== Compression =====
 

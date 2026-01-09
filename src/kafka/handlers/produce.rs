@@ -2,9 +2,11 @@
 //
 // Handles ProduceRequest - writing messages to topics.
 // Phase 7: Added server-side partition routing for partition_index == -1
+// Phase 9: Added idempotent producer sequence validation
 
 use crate::kafka::constants::{ERROR_NONE, ERROR_UNKNOWN_TOPIC_OR_PARTITION};
 use crate::kafka::error::Result;
+use crate::kafka::messages::ProducerMetadata;
 use crate::kafka::partitioner::compute_partition;
 use crate::kafka::storage::KafkaStore;
 use std::collections::HashMap;
@@ -18,10 +20,12 @@ use std::collections::HashMap;
 /// * `store` - Storage backend
 /// * `topic_data` - Topics and records to produce
 /// * `default_partitions` - Partition count for auto-created topics
+/// * `producer_metadata` - Optional producer metadata for idempotent producers (Phase 9)
 pub fn handle_produce(
     store: &impl KafkaStore,
     topic_data: Vec<crate::kafka::messages::TopicProduceData>,
     default_partitions: i32,
+    producer_metadata: Option<&ProducerMetadata>,
 ) -> Result<kafka_protocol::messages::produce_response::ProduceResponse> {
     let mut kafka_response = crate::kafka::build_produce_response();
 
@@ -79,6 +83,29 @@ pub fn handle_produce(
                 partition_response.log_start_offset = -1;
                 topic_response.partition_responses.push(partition_response);
                 continue;
+            }
+
+            // Phase 9: Validate sequence for idempotent producers BEFORE inserting
+            if let Some(meta) = producer_metadata {
+                if meta.producer_id >= 0 {
+                    // Idempotent producer - check and update sequence
+                    if let Err(e) = store.check_and_update_sequence(
+                        meta.producer_id,
+                        meta.producer_epoch,
+                        topic_id,
+                        partition_index,
+                        meta.base_sequence,
+                        records.len() as i32,
+                    ) {
+                        // Sequence validation failed - return error for this partition
+                        partition_response.error_code = e.to_kafka_error_code();
+                        partition_response.base_offset = -1;
+                        partition_response.log_append_time_ms = -1;
+                        partition_response.log_start_offset = -1;
+                        topic_response.partition_responses.push(partition_response);
+                        continue;
+                    }
+                }
             }
 
             // Insert records

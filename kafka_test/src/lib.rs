@@ -20,6 +20,7 @@
 //! - **performance**: Throughput baseline tests (3 tests)
 //! - **long_poll**: Long polling tests (4 tests)
 //! - **compression**: Compression tests (5 tests)
+//! - **idempotent**: Idempotent producer tests (1 test)
 //!
 //! ## Usage
 //!
@@ -51,6 +52,7 @@ pub mod consumer;
 pub mod consumer_group;
 pub mod edge_cases;
 pub mod error_paths;
+pub mod idempotent;
 pub mod long_poll;
 pub mod negative;
 pub mod offset_management;
@@ -124,3 +126,6 @@ pub use compression::{
     test_compressed_producer_gzip, test_compressed_producer_lz4, test_compressed_producer_snappy,
     test_compressed_producer_zstd, test_compression_roundtrip,
 };
+
+// Idempotent producer tests (Phase 9)
+pub use idempotent::test_idempotent_producer_basic;

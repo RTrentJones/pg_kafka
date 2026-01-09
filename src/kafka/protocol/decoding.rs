@@ -184,6 +184,13 @@ pub fn parse_request(
             api_version,
             response_tx,
         ),
+        API_KEY_INIT_PRODUCER_ID => parse_init_producer_id(
+            &mut payload_buf,
+            correlation_id,
+            client_id,
+            api_version,
+            response_tx,
+        ),
         _ => {
             // Unsupported API
             warn!("Unsupported API key: {}", api_key);
@@ -1175,6 +1182,61 @@ fn parse_delete_groups(
         client_id,
         api_version,
         groups_names,
+        response_tx,
+    }))
+}
+
+// ========== Idempotent Producer API Parsers (Phase 9) ==========
+
+fn parse_init_producer_id(
+    payload_buf: &mut BytesMut,
+    correlation_id: i32,
+    client_id: Option<String>,
+    api_version: i16,
+    response_tx: tokio::sync::mpsc::UnboundedSender<super::super::messages::KafkaResponse>,
+) -> Result<Option<KafkaRequest>> {
+    debug!(
+        "Parsed InitProducerId request (api_key={}, version={})",
+        API_KEY_INIT_PRODUCER_ID, api_version
+    );
+
+    let init_req =
+        match kafka_protocol::messages::init_producer_id_request::InitProducerIdRequest::decode(
+            payload_buf,
+            api_version,
+        ) {
+            Ok(req) => req,
+            Err(e) => {
+                warn!("Failed to decode InitProducerIdRequest: {}", e);
+                let error_response = super::super::messages::KafkaResponse::Error {
+                    correlation_id,
+                    error_code: ERROR_CORRUPT_MESSAGE,
+                    error_message: Some(format!("Malformed InitProducerIdRequest: {}", e)),
+                };
+                let _ = response_tx.send(error_response);
+                return Ok(None);
+            }
+        };
+
+    let transactional_id = init_req.transactional_id.map(|s| s.to_string());
+    let transaction_timeout_ms = init_req.transaction_timeout_ms;
+    // Extract the inner i64 from ProducerId wrapper type
+    let producer_id = init_req.producer_id.0;
+    let producer_epoch = init_req.producer_epoch;
+
+    debug!(
+        "InitProducerIdRequest: transactional_id={:?}, producer_id={}, producer_epoch={}",
+        transactional_id, producer_id, producer_epoch
+    );
+
+    Ok(Some(KafkaRequest::InitProducerId {
+        correlation_id,
+        client_id,
+        api_version,
+        transactional_id,
+        transaction_timeout_ms,
+        producer_id,
+        producer_epoch,
         response_tx,
     }))
 }

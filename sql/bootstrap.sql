@@ -116,3 +116,49 @@ COMMENT ON TABLE kafka.consumer_groups IS 'Consumer group membership tracking. p
 COMMENT ON COLUMN kafka.consumer_groups.partition_ids IS 'Array of partition IDs statically assigned to this member. No automatic rebalancing.';
 
 COMMENT ON COLUMN kafka.consumer_groups.heartbeat_timestamp IS 'Last heartbeat from this consumer. Stale members (no heartbeat > 5min) may be cleaned up.';
+
+-- =============================================================================
+-- Phase 9: Idempotent Producer Support
+-- =============================================================================
+
+-- Producer IDs table: Allocates producer IDs for idempotent/transactional producers
+CREATE TABLE kafka.producer_ids (
+    producer_id BIGSERIAL PRIMARY KEY,
+    epoch SMALLINT NOT NULL DEFAULT 0,
+    client_id TEXT,
+    transactional_id TEXT,  -- NULL for non-transactional idempotent producers
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    last_active_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+-- Index for transactional ID lookup (InitProducerId with existing transactional_id)
+CREATE INDEX idx_producer_ids_txn_id
+ON kafka.producer_ids(transactional_id) WHERE transactional_id IS NOT NULL;
+
+-- Producer sequences table: Tracks sequence numbers for idempotent deduplication
+CREATE TABLE kafka.producer_sequences (
+    producer_id BIGINT NOT NULL,
+    topic_id INT NOT NULL,
+    partition_id INT NOT NULL,
+    last_sequence INT NOT NULL DEFAULT -1,  -- Last successfully written sequence (-1 = none)
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (producer_id, topic_id, partition_id),
+    FOREIGN KEY (topic_id) REFERENCES kafka.topics(id) ON DELETE CASCADE
+);
+
+-- Grant permissions for Phase 9 tables
+GRANT SELECT ON kafka.producer_ids TO PUBLIC;
+GRANT SELECT ON kafka.producer_sequences TO PUBLIC;
+
+-- Comments for Phase 9
+COMMENT ON TABLE kafka.producer_ids IS 'Producer ID allocation for idempotent producers. Each idempotent producer gets a unique ID and epoch.';
+
+COMMENT ON COLUMN kafka.producer_ids.producer_id IS 'Unique producer ID allocated by InitProducerId API';
+
+COMMENT ON COLUMN kafka.producer_ids.epoch IS 'Producer epoch, incremented on each InitProducerId call for same producer. Used for fencing.';
+
+COMMENT ON COLUMN kafka.producer_ids.transactional_id IS 'Optional transactional ID for transactional producers (Phase 10)';
+
+COMMENT ON TABLE kafka.producer_sequences IS 'Sequence number tracking for idempotent producer deduplication';
+
+COMMENT ON COLUMN kafka.producer_sequences.last_sequence IS 'Last successfully written sequence number. Next expected = last_sequence + 1';

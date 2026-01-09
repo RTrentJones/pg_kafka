@@ -15,14 +15,14 @@ kcat -C -b localhost:9092 -t my-topic -p 0 -o beginning
 
 | Component | Status | Details |
 |-----------|--------|---------|
-| **Protocol Layer** | Production-ready | 12 Kafka APIs implemented (24% coverage) |
-| **Producer** | Production-ready | Full ProduceRequest/Response with persistence |
-| **Consumer** | Production-ready | Fetch, ListOffsets, manual partition assignment |
-| **Consumer Groups** | Partial | Coordinator exists; manual assignment only |
-| **Test Suite** | 73 tests | 68 unit tests + 5 E2E scenarios |
+| **Protocol Layer** | Production-ready | 19 Kafka APIs implemented (38% coverage) |
+| **Producer** | Production-ready | Full ProduceRequest with idempotency support |
+| **Consumer** | Production-ready | Fetch, ListOffsets, automatic partition assignment |
+| **Consumer Groups** | Complete | Full coordinator with auto-rebalancing |
+| **Test Suite** | 266 tests | 192 unit tests + 74 E2E scenarios |
 | **CI/CD** | Complete | GitHub Actions with lint, test, security audit |
 
-**Current Phase:** 3B Complete - Full Producer/Consumer Support
+**Current Phase:** Phase 9 Complete - Idempotent Producer
 
 ---
 
@@ -31,14 +31,19 @@ kcat -C -b localhost:9092 -t my-topic -p 0 -o beginning
 ### What Works Today
 
 - **Full Kafka Wire Protocol** - Binary protocol parsing using `kafka-protocol` crate
+- **Idempotent Producer** - InitProducerId API with sequence validation and deduplication
 - **Producer Support** - ProduceRequest with database persistence and offset tracking
 - **Consumer Support** - FetchRequest with RecordBatch v2 encoding
-- **Consumer Groups** - FindCoordinator, JoinGroup, Heartbeat, LeaveGroup, SyncGroup
+- **Consumer Groups** - FindCoordinator, JoinGroup, Heartbeat, LeaveGroup, SyncGroup with automatic rebalancing
+- **Partition Assignment** - Range, RoundRobin, and Sticky strategies
 - **Offset Management** - OffsetCommit/OffsetFetch for consumer progress tracking
+- **Admin APIs** - CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups
+- **Compression** - gzip, snappy, lz4, zstd (inbound/outbound)
+- **Multi-Partition Topics** - Key-based routing with murmur2 hash
 - **Topic Auto-Creation** - Topics created on first produce
 - **Dual-Offset Design** - Both `partition_offset` (Kafka-compatible) and `global_offset` (temporal ordering)
 
-### Implemented APIs (12 total)
+### Implemented APIs (19 total)
 
 | API | Key | Description |
 |-----|-----|-------------|
@@ -53,7 +58,14 @@ kcat -C -b localhost:9092 -t my-topic -p 0 -o beginning
 | Heartbeat | 12 | Maintain group membership |
 | LeaveGroup | 13 | Graceful group departure |
 | SyncGroup | 14 | Distribute partition assignments |
+| DescribeGroups | 15 | Get consumer group state and members |
+| ListGroups | 16 | List all consumer groups |
 | ApiVersions | 18 | Protocol version negotiation |
+| CreateTopics | 19 | Create topics with partition count |
+| DeleteTopics | 20 | Delete topics and messages |
+| InitProducerId | 22 | Allocate producer ID for idempotency |
+| CreatePartitions | 37 | Add partitions to existing topics |
+| DeleteGroups | 42 | Delete consumer groups |
 
 ---
 
@@ -163,6 +175,26 @@ CREATE TABLE kafka.consumer_offsets (
     commit_timestamp TIMESTAMP NOT NULL DEFAULT NOW(),
     PRIMARY KEY (group_id, topic_id, partition_id)
 );
+
+-- Idempotent producer support (Phase 9)
+CREATE TABLE kafka.producer_ids (
+    producer_id BIGSERIAL PRIMARY KEY,
+    epoch SMALLINT NOT NULL DEFAULT 0,
+    client_id TEXT,
+    transactional_id TEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    last_active_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE kafka.producer_sequences (
+    producer_id BIGINT NOT NULL,
+    topic_id INT NOT NULL,
+    partition_id INT NOT NULL,
+    last_sequence INT NOT NULL DEFAULT -1,
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (producer_id, topic_id, partition_id),
+    FOREIGN KEY (topic_id) REFERENCES kafka.topics(id) ON DELETE CASCADE
+);
 ```
 
 ---
@@ -211,13 +243,17 @@ docs/                       # Architecture decisions, protocol coverage
 
 | Category | Tests | Description |
 |----------|-------|-------------|
-| Protocol | 10 | Request/response parsing and encoding |
-| Encoding | 8 | Binary encoding, framing |
-| Property | 10 | Property-based fuzzing with proptest |
-| Handlers | 14 | Handler logic with MockKafkaStore |
+| Assignment | 61 | Partition assignment strategies |
+| Protocol | 34 | Request/response parsing and encoding |
+| Handlers | 22 | Handler logic with MockKafkaStore |
 | Storage | 22 | Storage types and trait verification |
-| E2E | 5 | Full integration with rdkafka client |
-| **Total** | **68 + 5** | |
+| Infrastructure | 20 | Config, mocks, helpers |
+| Error Handling | 10 | KafkaError variants |
+| Coordinator | 8 | Consumer group coordinator |
+| Partitioner | 7 | Key-based partition routing |
+| Property | 8 | Property-based fuzzing with proptest |
+| E2E | 74 | Full integration with rdkafka client |
+| **Total** | **192 + 74** | |
 
 ### Running Tests
 
@@ -266,12 +302,19 @@ pg_kafka.shutdown_timeout_ms = 5000
 - [x] **Phase 2:** Producer with database persistence, CI/CD
 - [x] **Phase 3:** Consumer with FetchRequest, ListOffsets, RecordBatch v2
 - [x] **Phase 3B:** Consumer group coordinator (manual assignment)
+- [x] **Phase 4:** Automatic partition assignment (Range, RoundRobin, Sticky)
+- [x] **Phase 5:** Automatic rebalancing, member timeout detection
+- [x] **Phase 6:** Admin APIs (CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups)
+- [x] **Phase 7:** Multi-Partition Topics (key-based routing)
+- [x] **Phase 8:** Compression Support (gzip, snappy, lz4, zstd)
+- [x] **Phase 9:** Idempotent Producer (InitProducerId, sequence validation)
 
 ### Planned
 
-- [ ] **Phase 4:** Automatic partition assignment (Range, RoundRobin, Sticky)
-- [ ] **Phase 5:** Automatic rebalancing, member timeout detection
-- [ ] **Phase 6:** Shadow Mode (Logical Decoding → external Kafka)
+- [ ] **Phase 10:** Shadow Mode (Logical Decoding → external Kafka)
+- [ ] **Phase 11:** Transaction Support (full ACID semantics)
+- [ ] **Cooperative Rebalancing** (KIP-429)
+- [ ] **Static Group Membership** (KIP-345)
 
 ---
 

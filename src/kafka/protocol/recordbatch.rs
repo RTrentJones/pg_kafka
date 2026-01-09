@@ -9,10 +9,99 @@
 // All logging uses the `tracing` crate.
 
 use super::super::error::{KafkaError, Result};
-use super::super::messages::{Record, RecordHeader};
+use super::super::messages::{ProducerMetadata, Record, RecordHeader};
 use bytes::Buf;
 use kafka_protocol::records::RecordBatchDecoder;
 use tracing::{debug, warn};
+
+/// Result of parsing a RecordBatch, containing both records and producer metadata
+#[derive(Debug, Clone)]
+pub struct ParsedRecordBatch {
+    /// The parsed records from the batch
+    pub records: Vec<Record>,
+    /// Producer metadata for idempotent producer validation (Phase 9)
+    pub producer_metadata: ProducerMetadata,
+}
+
+/// Extract producer metadata from RecordBatch v2 header bytes
+///
+/// RecordBatch v2 header layout (first 61 bytes):
+/// - baseOffset: i64 (8 bytes) - offset 0
+/// - batchLength: i32 (4 bytes) - offset 8
+/// - partitionLeaderEpoch: i32 (4 bytes) - offset 12
+/// - magic: i8 (1 byte, should be 2) - offset 16
+/// - crc: u32 (4 bytes) - offset 17
+/// - attributes: i16 (2 bytes) - offset 21
+/// - lastOffsetDelta: i32 (4 bytes) - offset 23
+/// - baseTimestamp: i64 (8 bytes) - offset 27
+/// - maxTimestamp: i64 (8 bytes) - offset 35
+/// - producerId: i64 (8 bytes) - offset 43 <-- what we need
+/// - producerEpoch: i16 (2 bytes) - offset 51 <-- what we need
+/// - baseSequence: i32 (4 bytes) - offset 53 <-- what we need
+/// - recordsCount: i32 (4 bytes) - offset 57
+fn extract_producer_metadata(batch_bytes: &bytes::Bytes) -> ProducerMetadata {
+    // Need at least 57 bytes to read producer metadata
+    if batch_bytes.len() < 57 {
+        debug!(
+            "RecordBatch too short ({} bytes) for producer metadata, using defaults",
+            batch_bytes.len()
+        );
+        return ProducerMetadata::default();
+    }
+
+    let mut buf = batch_bytes.clone();
+
+    // Skip to magic byte at offset 16 to verify it's RecordBatch v2
+    buf.advance(16);
+    let magic = buf.get_i8();
+
+    if magic != 2 {
+        debug!(
+            "RecordBatch magic={}, expected 2 (v2 format), using default producer metadata",
+            magic
+        );
+        return ProducerMetadata {
+            producer_id: -1,
+            producer_epoch: -1,
+            base_sequence: -1,
+        };
+    }
+
+    // Skip crc (4), attributes (2), lastOffsetDelta (4), baseTimestamp (8), maxTimestamp (8)
+    // That's 26 bytes from offset 17 to reach producerId at offset 43
+    buf.advance(26); // Now at offset 43
+
+    let producer_id = buf.get_i64();
+    let producer_epoch = buf.get_i16();
+    let base_sequence = buf.get_i32();
+
+    debug!(
+        "Extracted producer metadata: producer_id={}, producer_epoch={}, base_sequence={}",
+        producer_id, producer_epoch, base_sequence
+    );
+
+    ProducerMetadata {
+        producer_id,
+        producer_epoch,
+        base_sequence,
+    }
+}
+
+/// Parse RecordBatch with producer metadata extraction (Phase 9)
+///
+/// Returns both records and producer metadata for idempotent producer validation.
+pub fn parse_record_batch_with_metadata(batch_bytes: &bytes::Bytes) -> Result<ParsedRecordBatch> {
+    // Extract producer metadata first (before decoding consumes the buffer)
+    let producer_metadata = extract_producer_metadata(batch_bytes);
+
+    // Parse records using existing function
+    let records = parse_record_batch(batch_bytes)?;
+
+    Ok(ParsedRecordBatch {
+        records,
+        producer_metadata,
+    })
+}
 
 /// Parse RecordBatch into individual Records
 ///

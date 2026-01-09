@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `pg_kafka` is a PostgreSQL extension written in Rust (via pgrx) that embeds a Kafka-compatible wire protocol listener directly into the Postgres runtime. It allows standard Kafka clients to produce and consume messages using Postgres as the backing store.
 
-**Status:** Phase 8 Complete - Compression Support (Portfolio/Learning Project)
+**Status:** Phase 9 Complete - Idempotent Producer (Portfolio/Learning Project)
 
 **Current Implementation:**
 - ✅ **Phase 1 Complete:** Metadata support (ApiVersions, Metadata requests)
@@ -18,13 +18,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - ✅ **Phase 6 Complete:** Admin APIs (CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups)
 - ✅ **Phase 7 Complete:** Multi-Partition Topics (key-based routing, default partition config)
 - ✅ **Phase 8 Complete:** Compression Support (gzip, snappy, lz4, zstd)
+- ✅ **Phase 9 Complete:** Idempotent Producer (InitProducerId, sequence validation, deduplication)
 - ✅ **Enhancement:** Long Polling (max_wait_ms/min_bytes support, in-memory notification)
 - ✅ **CI/CD:** GitHub Actions pipeline with automated testing
-- ⏳ **Phase 9:** Shadow Mode (Logical Decoding → external Kafka)
+- ⏳ **Phase 10:** Shadow Mode (Logical Decoding → external Kafka)
 
 **What Works Now:**
 - TCP listener on port 9092 with full Kafka wire protocol parsing
 - ProduceRequest handling with database persistence (acks=0 and acks>=1 supported)
+- Idempotent producer support with InitProducerId API and sequence validation
+- Producer deduplication (DUPLICATE_SEQUENCE_NUMBER, OUT_OF_ORDER_SEQUENCE_NUMBER detection)
 - FetchRequest with RecordBatch v2 encoding/decoding
 - Compression support: gzip, snappy, lz4, zstd (inbound automatic, outbound configurable)
 - Consumer group coordinator with automatic partition assignment (Range, RoundRobin, Sticky strategies)
@@ -38,8 +41,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Repository Pattern storage abstraction (KafkaStore trait + PostgresStore impl)
 - Automated E2E tests with real Kafka client (rdkafka)
 
-**API Coverage:** 18 of ~50 standard Kafka APIs (36%)
-**Test Status:** All unit tests (184) and E2E tests (74) passing ✅
+**API Coverage:** 19 of ~50 standard Kafka APIs (38%)
+**Test Status:** All unit tests (192) and E2E tests (74) passing ✅
 
 ## Development Setup
 
@@ -154,9 +157,10 @@ src/
 │   │   ├── coordinator.rs  # Group coordination handlers (JoinGroup, Heartbeat, etc.)
 │   │   ├── fetch.rs    # Fetch/ListOffsets handlers
 │   │   ├── helpers.rs  # Topic resolution utilities (TopicResolution enum)
+│   │   ├── init_producer_id.rs  # InitProducerId handler (Phase 9)
 │   │   ├── metadata.rs # ApiVersions/Metadata handlers
-│   │   ├── produce.rs  # ProduceRequest handler
-│   │   └── tests.rs    # Handler unit tests (14 tests with MockKafkaStore)
+│   │   ├── produce.rs  # ProduceRequest handler (with sequence validation)
+│   │   └── tests.rs    # Handler unit tests (22 tests with MockKafkaStore)
 │   └── storage/        # Storage abstraction layer (Repository Pattern)
 │       ├── mod.rs      # KafkaStore trait definition
 │       ├── postgres.rs # PostgreSQL implementation (PostgresStore)
@@ -287,11 +291,35 @@ CREATE TABLE kafka.consumer_offsets (
     commit_timestamp TIMESTAMP NOT NULL DEFAULT NOW(),
     PRIMARY KEY (group_id, topic_id, partition_id)
 );
+
+-- Phase 9: Idempotent Producer support
+CREATE TABLE kafka.producer_ids (
+    producer_id BIGSERIAL PRIMARY KEY,
+    epoch SMALLINT NOT NULL DEFAULT 0,
+    client_id TEXT,
+    transactional_id TEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    last_active_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE kafka.producer_sequences (
+    producer_id BIGINT NOT NULL,
+    topic_id INT NOT NULL,
+    partition_id INT NOT NULL,
+    last_sequence INT NOT NULL DEFAULT -1,
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (producer_id, topic_id, partition_id),
+    FOREIGN KEY (topic_id) REFERENCES kafka.topics(id) ON DELETE CASCADE
+);
 ```
 
 **Why Dual Offsets?**
 - `global_offset`: Provides total temporal ordering across ALL messages (useful for replication, debugging)
 - `partition_offset`: Kafka clients expect per-partition monotonic offsets starting from 0
+
+**Idempotent Producer Tables:**
+- `producer_ids`: Tracks allocated producer IDs with epochs (fencing mechanism)
+- `producer_sequences`: Per-partition sequence tracking for deduplication
 
 ## Configuration
 
@@ -392,7 +420,8 @@ To debug:
 
 ## Planned Features (Future Phases)
 
-- Phase 9: Shadow replication worker using Logical Decoding
+- Phase 10: Shadow replication worker using Logical Decoding
+- Phase 11: Transaction support (full ACID semantics)
 - Table partitioning and retention policies
 - Cooperative rebalancing (KIP-429)
 - Static group membership (KIP-345)

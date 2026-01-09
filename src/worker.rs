@@ -562,7 +562,10 @@ pub fn process_request(
                 });
 
                 // Process the produce request best-effort (client already got response)
-                match handlers::handle_produce(&store, topic_data.clone(), default_partitions) {
+                // Note: Idempotent producer support (Phase 9) requires producer metadata from RecordBatch
+                // For acks=0, we skip idempotency validation since there's no guarantee anyway
+                match handlers::handle_produce(&store, topic_data.clone(), default_partitions, None)
+                {
                     Ok(response) => {
                         // Send notifications for long-polling consumers
                         for topic_response in &response.responses {
@@ -598,7 +601,10 @@ pub fn process_request(
             }
 
             // Handle produce and send notifications on success (acks >= 1)
-            match handlers::handle_produce(&store, topic_data, default_partitions) {
+            // TODO: Extract producer metadata from RecordBatch for full Phase 9 idempotency support
+            // Currently passing None - idempotent producers will work after InitProducerId
+            // but sequence validation is not yet integrated into the produce flow
+            match handlers::handle_produce(&store, topic_data, default_partitions, None) {
                 Ok(response) => {
                     // Send notifications for each successfully produced partition
                     // This wakes up any consumers waiting in long poll
@@ -1099,6 +1105,45 @@ pub fn process_request(
                     response: crate::kafka::response_builders::build_delete_groups_error_response(
                         error_code,
                     ),
+                },
+            );
+        }
+
+        // ===== InitProducerId (Phase 9) =====
+        crate::kafka::KafkaRequest::InitProducerId {
+            correlation_id,
+            api_version,
+            transactional_id,
+            producer_id: existing_producer_id,
+            producer_epoch: existing_epoch,
+            client_id,
+            response_tx,
+            ..
+        } => {
+            dispatch_response(
+                "InitProducerId",
+                response_tx,
+                || {
+                    handlers::handle_init_producer_id(
+                        &store,
+                        transactional_id,
+                        existing_producer_id,
+                        existing_epoch,
+                        client_id.as_deref(),
+                    )
+                },
+                |r| KafkaResponse::InitProducerId {
+                    correlation_id,
+                    api_version,
+                    response: r,
+                },
+                |error_code| KafkaResponse::InitProducerId {
+                    correlation_id,
+                    api_version,
+                    response:
+                        crate::kafka::response_builders::build_init_producer_id_error_response(
+                            error_code,
+                        ),
                 },
             );
         }

@@ -16,12 +16,14 @@
 // - fetch: FetchRequest and ListOffsetsRequest handlers
 // - consumer: OffsetCommit and OffsetFetch handlers
 // - coordinator: Consumer group coordination (JoinGroup, SyncGroup, Heartbeat, etc.)
+// - init_producer_id: InitProducerId handler for idempotent producers (Phase 9)
 
 mod admin;
 mod consumer;
 mod coordinator;
 mod fetch;
 mod helpers;
+mod init_producer_id;
 mod metadata;
 mod produce;
 
@@ -39,5 +41,6 @@ pub use coordinator::{
 };
 pub use fetch::{handle_fetch, handle_list_offsets};
 pub use helpers::{resolve_topic_id, topic_resolution_error_code, TopicResolution};
+pub use init_producer_id::handle_init_producer_id;
 pub use metadata::{handle_api_versions, handle_metadata};
 pub use produce::handle_produce;

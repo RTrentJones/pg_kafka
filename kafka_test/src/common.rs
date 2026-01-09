@@ -64,6 +64,20 @@ pub fn create_batch_producer() -> Result<FutureProducer, Box<dyn std::error::Err
     Ok(producer)
 }
 
+/// Create an idempotent Kafka producer (Phase 9)
+pub fn create_idempotent_producer() -> Result<FutureProducer, Box<dyn std::error::Error>> {
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", get_bootstrap_servers())
+        .set("broker.address.family", "v4")
+        .set("message.timeout.ms", "5000")
+        .set("enable.idempotence", "true")
+        .set("max.in.flight.requests.per.connection", "5")
+        .set("retries", "3")
+        .create()?;
+
+    Ok(producer)
+}
+
 /// Create a BaseConsumer with manual partition assignment capability
 pub fn create_base_consumer(group_id: &str) -> Result<BaseConsumer, Box<dyn std::error::Error>> {
     let consumer: BaseConsumer = ClientConfig::new()

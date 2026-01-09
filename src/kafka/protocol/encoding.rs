@@ -248,6 +248,19 @@ pub fn encode_response(response: KafkaResponse) -> Result<BytesMut> {
             API_KEY_DELETE_GROUPS,
             body
         ),
+
+        KafkaResponse::InitProducerId {
+            correlation_id,
+            api_version,
+            response: body,
+        } => encode_standard_response!(
+            &mut response_buf,
+            correlation_id,
+            api_version,
+            API_KEY_INIT_PRODUCER_ID,
+            body
+        ),
+
         KafkaResponse::Error {
             correlation_id,
             error_code,
