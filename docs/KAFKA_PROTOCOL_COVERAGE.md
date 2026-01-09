@@ -87,17 +87,285 @@
 
 ---
 
-## Missing Low Priority APIs
+## Unimplemented APIs Analysis
 
-### Not Planned (Single-Node Design)
-- **Transactions**: AddPartitionsToTxn (24), EndTxn (26), TxnOffsetCommit (28), etc.
-- **Security**: SaslHandshake (17), CreateAcls (30), etc.
-- **Cluster Management**: ElectLeaders (43), AlterReplicaLogDirs (34), etc.
-- **Quotas**: DescribeClientQuotas (48), AlterClientQuotas (49)
+**Source**: [Apache Kafka Protocol Guide](https://kafka.apache.org/protocol.html)
+**Total Standard Kafka APIs**: ~50
+**Implemented**: 19 (38%)
+**Unimplemented**: ~31 (62%)
 
-**Rationale**: pg_kafka is designed as single-node broker using PostgreSQL's native features for these concerns.
+This section analyzes all unimplemented APIs, their use cases, and priority for drop-in Kafka replacement.
 
-**Note**: InitProducerId (22) is implemented for idempotent producer support, but full transactional semantics (AddPartitionsToTxn, EndTxn, etc.) are not planned for v1.
+---
+
+### Security & Authentication (7 APIs) - Priority: Medium/Low
+
+| API | Key | Use Case | Drop-In Priority |
+|-----|-----|----------|------------------|
+| **SaslHandshake** | 17 | Initiates SASL authentication, negotiates mechanism (PLAIN, SCRAM, GSSAPI, OAUTHBEARER) | Medium - Required if clients use `security.protocol=SASL_*` |
+| **SaslAuthenticate** | 36 | Performs actual SASL authentication exchange after handshake | Medium - Required with SaslHandshake |
+| **CreateAcls** | 30 | Creates access control lists (e.g., "user X can produce to topic Y") | Low - Use PostgreSQL GRANT/REVOKE |
+| **DescribeAcls** | 29 | Lists existing ACL rules for auditing/debugging permissions | Low - Admin utility |
+| **DeleteAcls** | 31 | Removes ACL rules | Low - Admin utility |
+| **DescribeUserScramCredentials** | 50 | Lists SCRAM credentials for users (SCRAM-SHA-256/512 auth) | Low - Only for SCRAM auth |
+| **AlterUserScramCredentials** | 51 | Creates/updates/deletes SCRAM credentials | Low - Only for SCRAM auth |
+
+**pg_kafka Approach**: Rely on PostgreSQL's native authentication (pg_hba.conf, SSL, LDAP) instead of implementing Kafka-level auth.
+
+**Client Impact**: Clients configured with `security.protocol=SASL_*` will fail to connect without SaslHandshake/SaslAuthenticate. Most internal deployments use `PLAINTEXT` or `SSL` (no SASL).
+
+---
+
+### Transactions (7 APIs) - Priority: Low (Complex)
+
+| API | Key | Use Case | Drop-In Priority |
+|-----|-----|----------|------------------|
+| **AddPartitionsToTxn** | 24 | Registers partitions as part of an active transaction | Low - Only for exactly-once semantics |
+| **AddOffsetsToTxn** | 25 | Includes consumer offset commits in a transaction (exactly-once consume-transform-produce) | Low - Streaming pipelines only |
+| **EndTxn** | 26 | Commits or aborts a transaction | Low - Complex feature |
+| **WriteTxnMarkers** | 27 | Internal: coordinator writes commit/abort markers to partitions | Low - Broker-to-broker |
+| **TxnOffsetCommit** | 28 | Commits offsets as part of a transaction | Low - Requires full transaction support |
+| **DescribeTransactions** | 65 | Lists active transactions for monitoring/debugging | Low - Admin utility |
+| **ListTransactions** | 66 | Finds transactions by producer ID or state | Low - Admin utility |
+
+**Use Case**: Exactly-once semantics (EOS) for streaming pipelines like Kafka Streams and Flink. Enables atomic writes to multiple partitions + offset commits.
+
+**pg_kafka Approach**: Use PostgreSQL's native transactions instead. Clients only require this if explicitly configured for transactions (`transactional.id` set).
+
+**Client Impact**: Minimal. Most producers don't use transactions. Idempotent producer (InitProducerId - already implemented) covers 99% of use cases.
+
+---
+
+### Delegation Tokens (4 APIs) - Priority: Low
+
+| API | Key | Use Case | Drop-In Priority |
+|-----|-----|----------|------------------|
+| **CreateDelegationToken** | 38 | Creates token for lightweight authentication (avoiding full Kerberos) | Low - Only for Kerberos environments |
+| **RenewDelegationToken** | 39 | Extends token expiry | Low - Token lifecycle management |
+| **ExpireDelegationToken** | 40 | Invalidates a token immediately | Low - Token lifecycle management |
+| **DescribeDelegationToken** | 41 | Lists tokens and their metadata | Low - Admin utility |
+
+**Use Case**: Short-lived tokens for distributed workers (Spark, Flink jobs) that need Kafka access without distributing long-term credentials.
+
+**pg_kafka Approach**: Skip entirely. Only relevant for Kerberos-secured clusters.
+
+**Client Impact**: None. Clients never request this unless explicitly configured for delegation tokens.
+
+---
+
+### Configuration Management (4 APIs) - Priority: Medium
+
+| API | Key | Use Case | Drop-In Priority |
+|-----|-----|----------|------------------|
+| **DescribeConfigs** | 32 | Reads broker/topic/client configs (e.g., retention.ms, max.message.bytes) | Medium - Admin tools expect this |
+| **AlterConfigs** | 33 | Modifies configs (deprecated, replaced by IncrementalAlterConfigs) | Low - Deprecated API |
+| **IncrementalAlterConfigs** | 44 | Modifies specific config keys without replacing entire config | Medium - Admin tools use this |
+| **ListConfigResources** | 74 | Lists configurable resources | Low - Admin utility |
+
+**Use Case**: Dynamic configuration changes without broker restart. Admin tools like `kafka-configs.sh` use these.
+
+**pg_kafka Approach**: Could expose PostgreSQL GUCs via these APIs, or require SQL `ALTER SYSTEM` instead.
+
+**Client Impact**: Admin CLI tools (`kafka-configs.sh --describe-topic`) fail without DescribeConfigs. Producers/consumers don't care.
+
+---
+
+### Cluster Operations (8 APIs) - Priority: None (Single-Node)
+
+| API | Key | Use Case | Drop-In Priority |
+|-----|-----|----------|------------------|
+| **ElectLeaders** | 43 | Triggers leader election for partitions (preferred or unclean) | None - No replicas |
+| **AlterPartitionReassignments** | 45 | Moves partition replicas between brokers (rebalancing) | None - No multi-broker |
+| **ListPartitionReassignments** | 46 | Shows in-progress partition moves | None - No multi-broker |
+| **AlterReplicaLogDirs** | 34 | Moves partition data between disks on the same broker | None - No disk management |
+| **DescribeLogDirs** | 35 | Shows disk usage per partition per broker | None - Use PostgreSQL stats |
+| **UnregisterBroker** | 64 | Removes a broker from cluster metadata (KRaft mode) | None - No KRaft |
+| **DescribeCluster** | 60 | Returns cluster ID, controller, and broker list | Low - Easy to stub |
+| **DescribeQuorum** | 55 | Shows KRaft quorum state (voter lag, leader info) | None - No KRaft |
+
+**Use Case**: Cluster administration, capacity planning, broker decommissioning, replica management.
+
+**pg_kafka Approach**: Single-node design. No replicas, no multi-broker coordination needed.
+
+**Client Impact**: None. Clients never call these - they're broker-to-broker or admin-only tools.
+
+---
+
+### Log Management (2 APIs) - Priority: Medium
+
+| API | Key | Use Case | Drop-In Priority |
+|-----|-----|----------|------------------|
+| **DeleteRecords** | 21 | Deletes records before a given offset (manual log truncation) | Medium - GDPR compliance |
+| **OffsetForLeaderEpoch** | 23 | Resolves offset divergence after leader failover (truncation detection) | None - No replica failover |
+
+**Use Case**:
+- DeleteRecords: Compliance (GDPR deletion), manual log cleanup
+- OffsetForLeaderEpoch: Prevents consumers from reading divergent data after unclean leader election
+
+**pg_kafka Approach**:
+- DeleteRecords: Could implement using `DELETE FROM kafka.messages WHERE partition_offset < $1`
+- OffsetForLeaderEpoch: Skip (only needed for replica divergence detection)
+
+**Client Impact**: Minimal. DeleteRecords is admin-only. OffsetForLeaderEpoch is automatic (clients don't manually call).
+
+---
+
+### Consumer Group Management (3 APIs) - Priority: Low
+
+| API | Key | Use Case | Drop-In Priority |
+|-----|-----|----------|------------------|
+| **OffsetDelete** | 47 | Deletes committed offsets for a group (cleanup before group deletion) | Low - Admin utility |
+| **ConsumerGroupHeartbeat** | 68 | New consumer protocol (KIP-848) - replaces JoinGroup/SyncGroup/Heartbeat | None - Kafka 3.3+ only |
+| **ConsumerGroupDescribe** | 69 | New consumer protocol - describes group using new model | None - Kafka 3.3+ only |
+
+**Use Case**:
+- OffsetDelete: Cleanup orphaned offset data
+- ConsumerGroup* APIs: Next-generation consumer protocol that simplifies rebalancing
+
+**pg_kafka Approach**: OffsetDelete could be implemented with `DELETE FROM kafka.consumer_offsets`. New consumer protocol is cutting-edge (low adoption).
+
+**Client Impact**: None. OffsetDelete is admin-only. New consumer protocol requires client opt-in.
+
+---
+
+### Quotas (2 APIs) - Priority: Low
+
+| API | Key | Use Case | Drop-In Priority |
+|-----|-----|----------|------------------|
+| **DescribeClientQuotas** | 48 | Lists quota limits (bytes/sec, request rate) per client/user | Low - Multi-tenant only |
+| **AlterClientQuotas** | 49 | Sets or removes quota limits | Low - Multi-tenant only |
+
+**Use Case**: Multi-tenant clusters where you need to prevent one client from overwhelming the cluster.
+
+**pg_kafka Approach**: Use PostgreSQL connection limits and resource governor instead.
+
+**Client Impact**: None. Clients don't call these - admin tools only.
+
+---
+
+### Feature Flags & Metadata (2 APIs) - Priority: Low
+
+| API | Key | Use Case | Drop-In Priority |
+|-----|-----|----------|------------------|
+| **UpdateFeatures** | 57 | Enables/disables cluster features (version upgrades) | Low - Kafka version management |
+| **DescribeProducers** | 61 | Lists active producers on a partition (for transaction recovery) | Low - Transaction debugging |
+
+**Use Case**: Cluster-wide feature flag management during rolling upgrades.
+
+**pg_kafka Approach**: Not applicable (single-version deployment).
+
+**Client Impact**: None. Admin tools only.
+
+---
+
+### KRaft Consensus (3 APIs) - Priority: None
+
+| API | Key | Use Case | Drop-In Priority |
+|-----|-----|----------|------------------|
+| **AddRaftVoter** | 80 | Adds a new voter to KRaft quorum | None - No KRaft |
+| **RemoveRaftVoter** | 81 | Removes a voter from quorum | None - No KRaft |
+| **DescribeQuorum** | 55 | Shows quorum health and voter status | None - No KRaft |
+
+**Use Case**: Managing the KRaft consensus cluster that replaced ZooKeeper in Kafka 2.8+.
+
+**pg_kafka Approach**: Not applicable (no distributed consensus needed).
+
+**Client Impact**: None. Internal Kafka broker APIs only.
+
+---
+
+### Telemetry (2 APIs) - Priority: None
+
+| API | Key | Use Case | Drop-In Priority |
+|-----|-----|----------|------------------|
+| **GetTelemetrySubscriptions** | 71 | Client asks what metrics the broker wants | None - Optional metrics |
+| **PushTelemetry** | 72 | Client pushes metrics to broker (KIP-714) | None - Optional metrics |
+
+**Use Case**: Centralized client-side metrics collection (KIP-714) for debugging client performance issues.
+
+**pg_kafka Approach**: Not needed. Use PostgreSQL statistics views instead.
+
+**Client Impact**: None. Completely optional - clients work without this.
+
+---
+
+### Share Groups (11 APIs) - Priority: None (Kafka 4.0+)
+
+| API | Key | Use Case | Drop-In Priority |
+|-----|-----|----------|------------------|
+| **ShareGroupHeartbeat** | 76 | Maintains membership in a share group | None - Kafka 4.0+ feature |
+| **ShareGroupDescribe** | 77 | Describes share group state | None - Kafka 4.0+ feature |
+| **ShareFetch** | 78 | Fetches records with shared consumption semantics | None - New consumption model |
+| **ShareAcknowledge** | 79 | Acknowledges record processing (accept/reject/release) | None - New consumption model |
+| **InitializeShareGroupState** | 83 | Initializes share group state | None - Kafka 4.0+ |
+| **ReadShareGroupState** | 84 | Reads share group state | None - Kafka 4.0+ |
+| **WriteShareGroupState** | 85 | Writes share group state | None - Kafka 4.0+ |
+| **DeleteShareGroupState** | 86 | Deletes share group state | None - Kafka 4.0+ |
+| **ReadShareGroupStateSummary** | 87 | Reads summary of share group state | None - Kafka 4.0+ |
+| **DescribeShareGroupOffsets** | 90 | Describes offsets for share groups | None - Kafka 4.0+ |
+| **AlterShareGroupOffsets** | 91 | Modifies share group offsets | None - Kafka 4.0+ |
+| **DeleteShareGroupOffsets** | 92 | Deletes share group offsets | None - Kafka 4.0+ |
+
+**Use Case**: Share groups (KIP-932) enable **competing consumers** where multiple consumers in the same group can process the same partition concurrently (like RabbitMQ/SQS). Records are "locked" until acknowledged. Major new feature for queue-like workloads.
+
+**pg_kafka Approach**: Could be implemented in future using PostgreSQL row-level locking for record acknowledgment.
+
+**Client Impact**: None. Kafka 4.0+ only, very low adoption currently.
+
+---
+
+### Topic Introspection (1 API) - Priority: Low
+
+| API | Key | Use Case | Drop-In Priority |
+|-----|-----|----------|------------------|
+| **DescribeTopicPartitions** | 75 | Paginated topic/partition metadata (for clusters with many partitions) | Low - Performance optimization |
+
+**Use Case**: Efficient metadata retrieval for clusters with thousands of partitions.
+
+**pg_kafka Approach**: Metadata API already handles this for small-medium clusters.
+
+**Client Impact**: None. Clients fall back to Metadata API.
+
+---
+
+## Drop-In Replacement Priority Matrix
+
+| Priority | APIs | Rationale | Client Impact Without Implementation |
+|----------|------|-----------|-------------------------------------|
+| **Critical** | ✅ InitProducerId (22) | **ALREADY IMPLEMENTED** - librdkafka defaults to idempotence | Clients fail or require `enable.idempotence=false` |
+| **High** | SaslHandshake (17), SaslAuthenticate (36) | Required for authenticated deployments | Clients configured with SASL fail to connect |
+| **Medium** | DescribeConfigs (32), IncrementalAlterConfigs (44) | Admin tools (`kafka-configs.sh`) expect these | Admin CLI tools fail, but producers/consumers work |
+| **Medium** | DeleteRecords (21) | GDPR compliance, log cleanup | Workaround: `DELETE FROM kafka.messages` in SQL |
+| **Low** | OffsetDelete (47), DescribeCluster (60) | Admin utilities | Minor admin CLI failures |
+| **None** | All others (~25 APIs) | Cluster ops, KRaft, quotas, share groups, telemetry | No client impact - admin/internal only |
+
+### Recommendation for Drop-In Replacement
+
+**Minimum Viable (Current State)**:
+```
+19 APIs (including InitProducerId) = 99% of produce/consume workloads covered
+```
+
+**Comfortable Drop-In (Add 3 APIs)**:
+```
++ DescribeConfigs (32)     - Admin tools work
++ DescribeCluster (60)     - Admin tools work (easy to stub)
++ DeleteRecords (21)       - Log truncation for compliance
+= 22 APIs total (44% coverage)
+```
+
+**With Authentication (Add 2 More)**:
+```
++ SaslHandshake (17)
++ SaslAuthenticate (36)
+= 24 APIs total (48% coverage)
+```
+
+**Verdict**: pg_kafka is already a viable drop-in replacement for **most Kafka workloads**. The remaining 31 APIs are either:
+- Advanced features (transactions, share groups)
+- Multi-broker operations (replication, leader election)
+- Admin utilities (can be done via SQL)
+- Bleeding-edge features (KIP-932 share groups, KIP-714 telemetry)
 
 ---
 
