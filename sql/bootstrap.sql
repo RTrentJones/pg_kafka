@@ -30,6 +30,10 @@ CREATE TABLE kafka.messages (
     value BYTEA,
     headers JSONB,
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    -- Phase 10: Transaction tracking columns
+    producer_id BIGINT,                -- Producer ID for transactional messages (NULL for non-transactional)
+    producer_epoch SMALLINT,           -- Producer epoch for fencing
+    txn_state TEXT,                    -- NULL (committed/non-txn), 'pending' (uncommitted), 'aborted'
     PRIMARY KEY (topic_id, partition_id, partition_offset),
     FOREIGN KEY (topic_id) REFERENCES kafka.topics(id) ON DELETE CASCADE,
     UNIQUE (global_offset)  -- Ensures global ordering is strictly monotonic
@@ -44,6 +48,12 @@ ON kafka.messages(topic_id, partition_id, partition_offset);
 -- Supports: SELECT * FROM kafka.messages WHERE global_offset > ? ORDER BY global_offset
 CREATE INDEX idx_messages_global_offset
 ON kafka.messages(global_offset);
+
+-- Index for read_committed filtering (Phase 10: exclude pending transactional messages)
+-- Supports: SELECT * FROM kafka.messages WHERE ... AND (txn_state IS NULL)
+CREATE INDEX idx_messages_txn_pending
+ON kafka.messages(topic_id, partition_id, partition_offset)
+WHERE txn_state = 'pending';
 
 -- Consumer offsets table: Track committed offsets per consumer group
 -- Phase 3: Consumer support
@@ -105,6 +115,12 @@ COMMENT ON COLUMN kafka.messages.value IS 'Message payload (nullable for tombsto
 
 COMMENT ON COLUMN kafka.messages.headers IS 'Optional message headers as JSONB. Kafka headers are key-value pairs (binary values base64-encoded).';
 
+COMMENT ON COLUMN kafka.messages.producer_id IS 'Producer ID for transactional messages. NULL for non-transactional messages. (Phase 10)';
+
+COMMENT ON COLUMN kafka.messages.producer_epoch IS 'Producer epoch for fencing. Used with producer_id to identify unique producer instance. (Phase 10)';
+
+COMMENT ON COLUMN kafka.messages.txn_state IS 'Transaction state: NULL (committed or non-transactional), ''pending'' (uncommitted), ''aborted'' (rolled back). (Phase 10)';
+
 COMMENT ON TABLE kafka.consumer_offsets IS 'Consumer offset tracking per group/topic/partition. Stores committed offsets for Kafka consumers (Phase 3).';
 
 COMMENT ON COLUMN kafka.consumer_offsets.group_id IS 'Consumer group identifier (e.g., "my-consumer-group")';
@@ -162,3 +178,62 @@ COMMENT ON COLUMN kafka.producer_ids.transactional_id IS 'Optional transactional
 COMMENT ON TABLE kafka.producer_sequences IS 'Sequence number tracking for idempotent producer deduplication';
 
 COMMENT ON COLUMN kafka.producer_sequences.last_sequence IS 'Last successfully written sequence number. Next expected = last_sequence + 1';
+
+-- =============================================================================
+-- Phase 10: Transaction Support
+-- =============================================================================
+
+-- Transactions table: Tracks active transaction state per transactional_id
+-- Each transactional producer has one row tracking its current transaction state
+CREATE TABLE kafka.transactions (
+    transactional_id TEXT PRIMARY KEY,
+    producer_id BIGINT NOT NULL REFERENCES kafka.producer_ids(producer_id),
+    producer_epoch SMALLINT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'Empty',
+    -- States: 'Empty', 'Ongoing', 'PrepareCommit', 'PrepareAbort', 'CompleteCommit', 'CompleteAbort'
+    timeout_ms INT NOT NULL DEFAULT 60000,
+    started_at TIMESTAMP,
+    last_updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+-- Index for timeout scanning (find stale transactions)
+CREATE INDEX idx_transactions_timeout
+ON kafka.transactions(state, started_at)
+WHERE state = 'Ongoing';
+
+-- Pending transactional offsets table: Stores offset commits within an active transaction
+-- These offsets are moved to consumer_offsets on commit, deleted on abort
+CREATE TABLE kafka.txn_pending_offsets (
+    transactional_id TEXT NOT NULL REFERENCES kafka.transactions(transactional_id) ON DELETE CASCADE,
+    group_id TEXT NOT NULL,
+    topic_id INT NOT NULL REFERENCES kafka.topics(id) ON DELETE CASCADE,
+    partition_id INT NOT NULL,
+    pending_offset BIGINT NOT NULL,
+    metadata TEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (transactional_id, group_id, topic_id, partition_id)
+);
+
+-- Unique index for transactional_id lookup (fencing - one producer per transactional_id)
+CREATE UNIQUE INDEX idx_producer_ids_txn_id_unique
+ON kafka.producer_ids(transactional_id)
+WHERE transactional_id IS NOT NULL;
+
+-- Grant permissions for Phase 10 tables
+GRANT SELECT ON kafka.transactions TO PUBLIC;
+GRANT SELECT ON kafka.txn_pending_offsets TO PUBLIC;
+
+-- Comments for Phase 10
+COMMENT ON TABLE kafka.transactions IS 'Transaction state tracking for transactional producers. One row per transactional_id.';
+
+COMMENT ON COLUMN kafka.transactions.transactional_id IS 'Unique identifier for the transactional producer (e.g., "order-processor-1")';
+
+COMMENT ON COLUMN kafka.transactions.state IS 'Transaction state: Empty (no active txn), Ongoing (active), PrepareCommit/PrepareAbort (ending), CompleteCommit/CompleteAbort (finished)';
+
+COMMENT ON COLUMN kafka.transactions.timeout_ms IS 'Transaction timeout in milliseconds. Transactions exceeding this are auto-aborted.';
+
+COMMENT ON COLUMN kafka.transactions.started_at IS 'When the current transaction started (NULL if state is Empty)';
+
+COMMENT ON TABLE kafka.txn_pending_offsets IS 'Pending offset commits within an active transaction. Moved to consumer_offsets on commit.';
+
+COMMENT ON COLUMN kafka.txn_pending_offsets.pending_offset IS 'Offset to be committed when transaction completes successfully';

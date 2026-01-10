@@ -11,6 +11,9 @@
 //
 // The crossbeam channel is created in worker.rs and passed to the listener.
 
+/// Type alias for TxnOffsetCommit topic data: (topic_name, [(partition, offset, metadata)])
+pub type TxnOffsetCommitTopics = Vec<(String, Vec<(i32, i64, Option<String>)>)>;
+
 /// Kafka request types that can be sent from async tasks to the main worker thread
 #[derive(Debug)]
 pub enum KafkaRequest {
@@ -53,6 +56,8 @@ pub enum KafkaRequest {
         timeout_ms: i32,
         /// Topic data (topic → partitions → records)
         topic_data: Vec<TopicProduceData>,
+        /// Optional transactional ID for transactional producers (Phase 10)
+        transactional_id: Option<String>,
         /// Channel to send the response back to the specific connection
         response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
     },
@@ -70,6 +75,8 @@ pub enum KafkaRequest {
         min_bytes: i32,
         /// Maximum bytes to return (total across all partitions)
         max_bytes: i32,
+        /// Isolation level (0=READ_UNCOMMITTED, 1=READ_COMMITTED) - Phase 10
+        isolation_level: i8,
         /// Topic-partition fetch data
         topic_data: Vec<TopicFetchData>,
         /// Channel to send the response back to the specific connection
@@ -332,6 +339,84 @@ pub enum KafkaRequest {
         /// Channel to send the response back to the specific connection
         response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
     },
+    /// AddPartitionsToTxn request - register partitions in a transaction (Phase 10)
+    AddPartitionsToTxn {
+        /// Correlation ID from client - MUST be echoed back in response
+        correlation_id: i32,
+        /// Optional client identifier string
+        client_id: Option<String>,
+        /// API version from the request (needed for response encoding)
+        api_version: i16,
+        /// Transactional ID
+        transactional_id: String,
+        /// Producer ID
+        producer_id: i64,
+        /// Producer epoch
+        producer_epoch: i16,
+        /// Topics and partitions to add
+        topics: Vec<(String, Vec<i32>)>,
+        /// Channel to send the response back
+        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
+    },
+    /// AddOffsetsToTxn request - add consumer offsets to a transaction (Phase 10)
+    AddOffsetsToTxn {
+        /// Correlation ID from client - MUST be echoed back in response
+        correlation_id: i32,
+        /// Optional client identifier string
+        client_id: Option<String>,
+        /// API version from the request (needed for response encoding)
+        api_version: i16,
+        /// Transactional ID
+        transactional_id: String,
+        /// Producer ID
+        producer_id: i64,
+        /// Producer epoch
+        producer_epoch: i16,
+        /// Consumer group ID
+        group_id: String,
+        /// Channel to send the response back
+        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
+    },
+    /// EndTxn request - commit or abort a transaction (Phase 10)
+    EndTxn {
+        /// Correlation ID from client - MUST be echoed back in response
+        correlation_id: i32,
+        /// Optional client identifier string
+        client_id: Option<String>,
+        /// API version from the request (needed for response encoding)
+        api_version: i16,
+        /// Transactional ID
+        transactional_id: String,
+        /// Producer ID
+        producer_id: i64,
+        /// Producer epoch
+        producer_epoch: i16,
+        /// true = commit, false = abort
+        committed: bool,
+        /// Channel to send the response back
+        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
+    },
+    /// TxnOffsetCommit request - commit offsets as part of a transaction (Phase 10)
+    TxnOffsetCommit {
+        /// Correlation ID from client - MUST be echoed back in response
+        correlation_id: i32,
+        /// Optional client identifier string
+        client_id: Option<String>,
+        /// API version from the request (needed for response encoding)
+        api_version: i16,
+        /// Transactional ID
+        transactional_id: String,
+        /// Consumer group ID
+        group_id: String,
+        /// Producer ID
+        producer_id: i64,
+        /// Producer epoch
+        producer_epoch: i16,
+        /// Topics with partition offsets
+        topics: TxnOffsetCommitTopics,
+        /// Channel to send the response back
+        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
+    },
 }
 
 /// Kafka response types sent back from main thread to async tasks
@@ -510,6 +595,43 @@ pub enum KafkaResponse {
         api_version: i16,
         /// The kafka-protocol response struct (ready to encode)
         response: kafka_protocol::messages::init_producer_id_response::InitProducerIdResponse,
+    },
+    /// AddPartitionsToTxn response (Phase 10)
+    AddPartitionsToTxn {
+        /// Correlation ID from request
+        correlation_id: i32,
+        /// API version from the request
+        api_version: i16,
+        /// The kafka-protocol response struct
+        response:
+            kafka_protocol::messages::add_partitions_to_txn_response::AddPartitionsToTxnResponse,
+    },
+    /// AddOffsetsToTxn response (Phase 10)
+    AddOffsetsToTxn {
+        /// Correlation ID from request
+        correlation_id: i32,
+        /// API version from the request
+        api_version: i16,
+        /// The kafka-protocol response struct
+        response: kafka_protocol::messages::add_offsets_to_txn_response::AddOffsetsToTxnResponse,
+    },
+    /// EndTxn response (Phase 10)
+    EndTxn {
+        /// Correlation ID from request
+        correlation_id: i32,
+        /// API version from the request
+        api_version: i16,
+        /// The kafka-protocol response struct
+        response: kafka_protocol::messages::end_txn_response::EndTxnResponse,
+    },
+    /// TxnOffsetCommit response (Phase 10)
+    TxnOffsetCommit {
+        /// Correlation ID from request
+        correlation_id: i32,
+        /// API version from the request
+        api_version: i16,
+        /// The kafka-protocol response struct
+        response: kafka_protocol::messages::txn_offset_commit_response::TxnOffsetCommitResponse,
     },
     /// Error response for unsupported or malformed requests
     Error {

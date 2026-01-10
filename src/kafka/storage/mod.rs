@@ -6,6 +6,8 @@
 // 2. Clean separation of concerns - protocol logic doesn't know about SQL
 // 3. Transaction safety - transaction boundaries remain explicit in worker.rs
 
+use std::time::Duration;
+
 use super::error::Result;
 use super::messages::Record;
 
@@ -46,6 +48,74 @@ pub struct CommittedOffset {
     pub offset: i64,
     /// Optional metadata
     pub metadata: Option<String>,
+}
+
+/// Transaction state (Phase 10)
+///
+/// Represents the lifecycle state of a Kafka transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransactionState {
+    /// No active transaction
+    Empty,
+    /// Transaction is active and accepting records
+    Ongoing,
+    /// Transaction is preparing to commit
+    PrepareCommit,
+    /// Transaction is preparing to abort
+    PrepareAbort,
+    /// Transaction has been committed
+    CompleteCommit,
+    /// Transaction has been aborted
+    CompleteAbort,
+}
+
+impl TransactionState {
+    /// Convert from database string representation
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "Empty" => Some(Self::Empty),
+            "Ongoing" => Some(Self::Ongoing),
+            "PrepareCommit" => Some(Self::PrepareCommit),
+            "PrepareAbort" => Some(Self::PrepareAbort),
+            "CompleteCommit" => Some(Self::CompleteCommit),
+            "CompleteAbort" => Some(Self::CompleteAbort),
+            _ => None,
+        }
+    }
+
+    /// Convert to database string representation
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Empty => "Empty",
+            Self::Ongoing => "Ongoing",
+            Self::PrepareCommit => "PrepareCommit",
+            Self::PrepareAbort => "PrepareAbort",
+            Self::CompleteCommit => "CompleteCommit",
+            Self::CompleteAbort => "CompleteAbort",
+        }
+    }
+}
+
+/// Consumer isolation level (Phase 10)
+///
+/// Controls visibility of transactional messages during fetch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IsolationLevel {
+    /// See all records including uncommitted transactional messages
+    #[default]
+    ReadUncommitted = 0,
+    /// Only see committed records (filters out pending and aborted)
+    ReadCommitted = 1,
+}
+
+impl IsolationLevel {
+    /// Create from Kafka protocol value
+    pub fn from_i8(value: i8) -> Self {
+        match value {
+            1 => Self::ReadCommitted,
+            _ => Self::ReadUncommitted,
+        }
+    }
 }
 
 /// Abstract storage interface for Kafka data operations
@@ -321,6 +391,211 @@ pub trait KafkaStore {
         base_sequence: i32,
         record_count: i32,
     ) -> Result<bool>;
+
+    // ===== Transaction Operations (Phase 10) =====
+
+    /// Look up or create producer by transactional_id
+    ///
+    /// If transactional_id exists: bump epoch (fences old producer), return existing producer_id.
+    /// If not found: allocate new producer_id, set transactional_id.
+    /// Also creates/updates row in kafka.transactions table with state='Empty'.
+    ///
+    /// # Arguments
+    /// * `transactional_id` - The transactional ID to look up or create
+    /// * `transaction_timeout_ms` - Transaction timeout in milliseconds
+    /// * `client_id` - Optional client identifier for debugging
+    ///
+    /// # Returns
+    /// Tuple of (producer_id, epoch)
+    fn get_or_create_transactional_producer(
+        &self,
+        transactional_id: &str,
+        transaction_timeout_ms: i32,
+        client_id: Option<&str>,
+    ) -> Result<(i64, i16)>;
+
+    /// Begin a transaction
+    ///
+    /// Sets transaction state to 'Ongoing' and records start time.
+    /// Must be called before producing transactional records.
+    ///
+    /// # Arguments
+    /// * `transactional_id` - The transactional ID
+    /// * `producer_id` - The producer ID
+    /// * `producer_epoch` - The producer epoch (for fencing check)
+    fn begin_transaction(
+        &self,
+        transactional_id: &str,
+        producer_id: i64,
+        producer_epoch: i16,
+    ) -> Result<()>;
+
+    /// Validate that producer owns an active transaction
+    ///
+    /// Checks that the transaction exists, is in 'Ongoing' state, and the
+    /// producer_id/epoch match.
+    ///
+    /// # Arguments
+    /// * `transactional_id` - The transactional ID
+    /// * `producer_id` - The producer ID to validate
+    /// * `producer_epoch` - The producer epoch to validate
+    fn validate_transaction(
+        &self,
+        transactional_id: &str,
+        producer_id: i64,
+        producer_epoch: i16,
+    ) -> Result<()>;
+
+    /// Insert records with transaction metadata
+    ///
+    /// Similar to insert_records but sets txn_state='pending' and records
+    /// producer_id/epoch for transaction tracking.
+    ///
+    /// # Arguments
+    /// * `topic_id` - Topic ID
+    /// * `partition_id` - Partition ID
+    /// * `records` - Slice of records to insert
+    /// * `producer_id` - Producer ID for transaction tracking
+    /// * `producer_epoch` - Producer epoch for fencing
+    ///
+    /// # Returns
+    /// Base partition offset assigned to the first record
+    fn insert_transactional_records(
+        &self,
+        topic_id: i32,
+        partition_id: i32,
+        records: &[Record],
+        producer_id: i64,
+        producer_epoch: i16,
+    ) -> Result<i64>;
+
+    /// Store pending offset commit within a transaction
+    ///
+    /// Stores offset in txn_pending_offsets table. Will be moved to
+    /// consumer_offsets on commit, deleted on abort.
+    ///
+    /// # Arguments
+    /// * `transactional_id` - The transactional ID
+    /// * `group_id` - Consumer group ID
+    /// * `topic_id` - Topic ID
+    /// * `partition_id` - Partition ID
+    /// * `offset` - Offset to commit
+    /// * `metadata` - Optional metadata
+    fn store_txn_pending_offset(
+        &self,
+        transactional_id: &str,
+        group_id: &str,
+        topic_id: i32,
+        partition_id: i32,
+        offset: i64,
+        metadata: Option<&str>,
+    ) -> Result<()>;
+
+    /// Commit a transaction
+    ///
+    /// 1. UPDATE messages SET txn_state=NULL WHERE producer_id=X AND txn_state='pending'
+    /// 2. INSERT INTO consumer_offsets SELECT ... FROM txn_pending_offsets
+    /// 3. DELETE FROM txn_pending_offsets WHERE transactional_id=X
+    /// 4. UPDATE transactions SET state='CompleteCommit'
+    ///
+    /// # Arguments
+    /// * `transactional_id` - The transactional ID
+    /// * `producer_id` - The producer ID (for fencing check)
+    /// * `producer_epoch` - The producer epoch (for fencing check)
+    fn commit_transaction(
+        &self,
+        transactional_id: &str,
+        producer_id: i64,
+        producer_epoch: i16,
+    ) -> Result<()>;
+
+    /// Abort a transaction
+    ///
+    /// 1. UPDATE messages SET txn_state='aborted' WHERE producer_id=X AND txn_state='pending'
+    /// 2. DELETE FROM txn_pending_offsets WHERE transactional_id=X
+    /// 3. UPDATE transactions SET state='CompleteAbort'
+    ///
+    /// # Arguments
+    /// * `transactional_id` - The transactional ID
+    /// * `producer_id` - The producer ID (for fencing check)
+    /// * `producer_epoch` - The producer epoch (for fencing check)
+    fn abort_transaction(
+        &self,
+        transactional_id: &str,
+        producer_id: i64,
+        producer_epoch: i16,
+    ) -> Result<()>;
+
+    /// Get current transaction state
+    ///
+    /// # Arguments
+    /// * `transactional_id` - The transactional ID
+    ///
+    /// # Returns
+    /// Current transaction state, or None if transactional_id not found
+    fn get_transaction_state(&self, transactional_id: &str) -> Result<Option<TransactionState>>;
+
+    /// Fetch records with isolation level filtering
+    ///
+    /// Like fetch_records but respects isolation level:
+    /// - ReadUncommitted: returns all records (existing behavior)
+    /// - ReadCommitted: filters out records where txn_state='pending' or 'aborted'
+    ///
+    /// # Arguments
+    /// * `topic_id` - Topic ID
+    /// * `partition_id` - Partition ID
+    /// * `fetch_offset` - Offset to start fetching from
+    /// * `max_bytes` - Maximum bytes to fetch (approximate limit)
+    /// * `isolation_level` - Consumer isolation level
+    ///
+    /// # Returns
+    /// Vector of fetched messages respecting isolation level
+    fn fetch_records_with_isolation(
+        &self,
+        topic_id: i32,
+        partition_id: i32,
+        fetch_offset: i64,
+        max_bytes: i32,
+        isolation_level: IsolationLevel,
+    ) -> Result<Vec<FetchedMessage>>;
+
+    /// Get last stable offset for a partition
+    ///
+    /// Returns the lowest offset of any pending transaction, or the high
+    /// watermark if no transactions are pending. Used by read_committed
+    /// consumers to know how far they can safely read.
+    ///
+    /// # Arguments
+    /// * `topic_id` - Topic ID
+    /// * `partition_id` - Partition ID
+    ///
+    /// # Returns
+    /// Last stable offset
+    fn get_last_stable_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64>;
+
+    /// Abort timed-out transactions
+    ///
+    /// Finds transactions in 'Ongoing' state that have exceeded their timeout
+    /// and aborts them.
+    ///
+    /// # Arguments
+    /// * `timeout` - Duration after which transactions are considered timed out
+    ///
+    /// # Returns
+    /// List of transactional_ids that were aborted
+    fn abort_timed_out_transactions(&self, timeout: Duration) -> Result<Vec<String>>;
+
+    /// Clean up aborted messages
+    ///
+    /// Deletes messages with txn_state='aborted' that are older than the
+    /// specified duration. Optional background cleanup.
+    ///
+    /// # Arguments
+    /// * `older_than` - Only delete aborted messages older than this duration
+    ///
+    /// # Returns
+    /// Number of messages deleted
+    fn cleanup_aborted_messages(&self, older_than: Duration) -> Result<u64>;
 }
 
 // Submodules

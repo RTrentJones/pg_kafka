@@ -51,7 +51,7 @@ mod tests {
             }],
         }];
 
-        let response = produce::handle_produce(&mock, topic_data, 1, None).unwrap();
+        let response = produce::handle_produce(&mock, topic_data, 1, None, None).unwrap();
 
         assert_eq!(response.responses.len(), 1);
         let topic_response = &response.responses[0];
@@ -79,7 +79,7 @@ mod tests {
             }],
         }];
 
-        let response = produce::handle_produce(&mock, topic_data, 1, None).unwrap();
+        let response = produce::handle_produce(&mock, topic_data, 1, None, None).unwrap();
 
         let partition_response = &response.responses[0].partition_responses[0];
         assert_eq!(
@@ -114,7 +114,7 @@ mod tests {
             }],
         }];
 
-        let response = produce::handle_produce(&mock, topic_data, 1, None).unwrap();
+        let response = produce::handle_produce(&mock, topic_data, 1, None, None).unwrap();
 
         let partition_response = &response.responses[0].partition_responses[0];
         assert_eq!(partition_response.error_code, ERROR_UNKNOWN_SERVER_ERROR);
@@ -134,16 +134,18 @@ mod tests {
             }])
         });
 
-        mock.expect_fetch_records().returning(|_, _, _, _| {
-            Ok(vec![FetchedMessage {
-                partition_offset: 0,
-                key: Some(b"key1".to_vec()),
-                value: Some(b"value1".to_vec()),
-                timestamp: 1234567890,
-            }])
-        });
+        mock.expect_fetch_records_with_isolation()
+            .returning(|_, _, _, _, _| {
+                Ok(vec![FetchedMessage {
+                    partition_offset: 0,
+                    key: Some(b"key1".to_vec()),
+                    value: Some(b"value1".to_vec()),
+                    timestamp: 1234567890,
+                }])
+            });
 
         mock.expect_get_high_watermark().returning(|_, _| Ok(1));
+        mock.expect_get_last_stable_offset().returning(|_, _| Ok(1));
 
         let topic_data = vec![TopicFetchData {
             name: "test-topic".to_string(),
@@ -158,6 +160,7 @@ mod tests {
             &mock,
             topic_data,
             kafka_protocol::records::Compression::None,
+            crate::kafka::storage::IsolationLevel::ReadUncommitted,
         )
         .unwrap();
 
@@ -187,6 +190,7 @@ mod tests {
             &mock,
             topic_data,
             kafka_protocol::records::Compression::None,
+            crate::kafka::storage::IsolationLevel::ReadUncommitted,
         )
         .unwrap();
 
@@ -972,9 +976,10 @@ mod tests {
 
         let response = init_producer_id::handle_init_producer_id(
             &mock,
-            None, // No transactional ID
-            -1,   // New producer
-            -1,   // New producer
+            None,  // No transactional ID
+            60000, // Transaction timeout (unused for non-transactional)
+            -1,    // New producer
+            -1,    // New producer
             Some("test-client"),
         )
         .unwrap();
@@ -1000,9 +1005,10 @@ mod tests {
 
         let response = init_producer_id::handle_init_producer_id(
             &mock,
-            None, // No transactional ID
-            1000, // Existing producer ID
-            0,    // Current epoch
+            None,  // No transactional ID
+            60000, // Transaction timeout (unused for non-transactional)
+            1000,  // Existing producer ID
+            0,     // Current epoch
             Some("test-client"),
         )
         .unwrap();
@@ -1024,8 +1030,9 @@ mod tests {
         let result = init_producer_id::handle_init_producer_id(
             &mock,
             None,
-            1000, // Producer ID
-            3,    // Old epoch (current is 5)
+            60000, // Transaction timeout (unused for non-transactional)
+            1000,  // Producer ID
+            3,     // Old epoch (current is 5)
             Some("test-client"),
         );
 
@@ -1056,7 +1063,8 @@ mod tests {
         let result = init_producer_id::handle_init_producer_id(
             &mock,
             None,
-            9999, // Unknown producer ID
+            60000, // Transaction timeout (unused for non-transactional)
+            9999,  // Unknown producer ID
             0,
             Some("test-client"),
         );
@@ -1111,7 +1119,7 @@ mod tests {
         };
 
         let response =
-            produce::handle_produce(&mock, topic_data, 1, Some(&producer_metadata)).unwrap();
+            produce::handle_produce(&mock, topic_data, 1, Some(&producer_metadata), None).unwrap();
 
         assert_eq!(response.responses.len(), 1);
         let partition_response = &response.responses[0].partition_responses[0];
@@ -1154,7 +1162,7 @@ mod tests {
         };
 
         let response =
-            produce::handle_produce(&mock, topic_data, 1, Some(&producer_metadata)).unwrap();
+            produce::handle_produce(&mock, topic_data, 1, Some(&producer_metadata), None).unwrap();
 
         let partition_response = &response.responses[0].partition_responses[0];
         // Kafka spec: Duplicates return SUCCESS (error_code=0), not error
@@ -1195,7 +1203,7 @@ mod tests {
         };
 
         let response =
-            produce::handle_produce(&mock, topic_data, 1, Some(&producer_metadata)).unwrap();
+            produce::handle_produce(&mock, topic_data, 1, Some(&producer_metadata), None).unwrap();
 
         let partition_response = &response.responses[0].partition_responses[0];
         assert_eq!(
@@ -1239,9 +1247,598 @@ mod tests {
         };
 
         let response =
-            produce::handle_produce(&mock, topic_data, 1, Some(&producer_metadata)).unwrap();
+            produce::handle_produce(&mock, topic_data, 1, Some(&producer_metadata), None).unwrap();
 
         let partition_response = &response.responses[0].partition_responses[0];
         assert_eq!(partition_response.error_code, ERROR_NONE);
+    }
+
+    // ========== Transaction Handler Tests (Phase 10) ==========
+
+    use crate::kafka::handlers::transaction;
+    use crate::kafka::storage::TransactionState;
+
+    // ========== AddPartitionsToTxn Tests ==========
+
+    #[test]
+    fn test_add_partitions_success_empty_to_ongoing() {
+        let mut mock = MockKafkaStore::new();
+
+        // Validate transaction succeeds
+        mock.expect_validate_transaction()
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+
+        // State is Empty, should transition to Ongoing
+        mock.expect_get_transaction_state()
+            .times(1)
+            .returning(|_| Ok(Some(TransactionState::Empty)));
+
+        // Should begin transaction
+        mock.expect_begin_transaction()
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+
+        // Topic exists with 4 partitions
+        mock.expect_get_topic_partition_count()
+            .times(1)
+            .returning(|_| Ok(Some(4)));
+
+        let topics = vec![("test-topic".to_string(), vec![0, 1])];
+
+        let response =
+            transaction::handle_add_partitions_to_txn(&mock, "txn-1", 1000, 0, topics).unwrap();
+
+        // Should have one topic result
+        assert_eq!(response.results_by_topic_v3_and_below.len(), 1);
+        let topic_result = &response.results_by_topic_v3_and_below[0];
+        assert_eq!(topic_result.results_by_partition.len(), 2);
+
+        // Both partitions should succeed
+        for partition_result in &topic_result.results_by_partition {
+            assert_eq!(partition_result.partition_error_code, ERROR_NONE);
+        }
+    }
+
+    #[test]
+    fn test_add_partitions_success_already_ongoing() {
+        let mut mock = MockKafkaStore::new();
+
+        mock.expect_validate_transaction()
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+
+        // State is Ongoing - should NOT call begin_transaction
+        mock.expect_get_transaction_state()
+            .times(1)
+            .returning(|_| Ok(Some(TransactionState::Ongoing)));
+
+        // begin_transaction should NOT be called (no expect set)
+
+        mock.expect_get_topic_partition_count()
+            .times(1)
+            .returning(|_| Ok(Some(4)));
+
+        let topics = vec![("test-topic".to_string(), vec![0])];
+
+        let response =
+            transaction::handle_add_partitions_to_txn(&mock, "txn-1", 1000, 0, topics).unwrap();
+
+        assert_eq!(response.results_by_topic_v3_and_below.len(), 1);
+        assert_eq!(
+            response.results_by_topic_v3_and_below[0].results_by_partition[0].partition_error_code,
+            ERROR_NONE
+        );
+    }
+
+    #[test]
+    fn test_add_partitions_invalid_partition() {
+        let mut mock = MockKafkaStore::new();
+
+        mock.expect_validate_transaction()
+            .returning(|_, _, _| Ok(()));
+        mock.expect_get_transaction_state()
+            .returning(|_| Ok(Some(TransactionState::Ongoing)));
+        // Topic has only 2 partitions
+        mock.expect_get_topic_partition_count()
+            .returning(|_| Ok(Some(2)));
+
+        // Request partition 0 (valid) and partition 5 (invalid >= 2)
+        let topics = vec![("test-topic".to_string(), vec![0, 5])];
+
+        let response =
+            transaction::handle_add_partitions_to_txn(&mock, "txn-1", 1000, 0, topics).unwrap();
+
+        let partitions = &response.results_by_topic_v3_and_below[0].results_by_partition;
+        assert_eq!(partitions.len(), 2);
+
+        // Partition 0 should succeed
+        assert_eq!(partitions[0].partition_index, 0);
+        assert_eq!(partitions[0].partition_error_code, ERROR_NONE);
+
+        // Partition 5 should fail
+        assert_eq!(partitions[1].partition_index, 5);
+        assert_eq!(
+            partitions[1].partition_error_code,
+            ERROR_UNKNOWN_TOPIC_OR_PARTITION
+        );
+    }
+
+    #[test]
+    fn test_add_partitions_auto_creates_topic() {
+        // AddPartitionsToTxn auto-creates topics (matching Kafka behavior)
+        // because rdkafka calls this before the topic exists
+        let mut mock = MockKafkaStore::new();
+
+        mock.expect_validate_transaction()
+            .returning(|_, _, _| Ok(()));
+        mock.expect_get_transaction_state()
+            .returning(|_| Ok(Some(TransactionState::Ongoing)));
+        // Topic doesn't exist initially
+        mock.expect_get_topic_partition_count()
+            .returning(|_| Ok(None));
+        // Handler auto-creates the topic
+        mock.expect_get_or_create_topic()
+            .returning(|_, _| Ok((1, 1))); // topic_id=1, partition_count=1
+
+        let topics = vec![("new-topic".to_string(), vec![0])];
+
+        let response =
+            transaction::handle_add_partitions_to_txn(&mock, "txn-1", 1000, 0, topics).unwrap();
+
+        // Should succeed because topic was auto-created
+        assert_eq!(
+            response.results_by_topic_v3_and_below[0].results_by_partition[0].partition_error_code,
+            ERROR_NONE
+        );
+    }
+
+    #[test]
+    fn test_add_partitions_invalid_state() {
+        let mut mock = MockKafkaStore::new();
+
+        mock.expect_validate_transaction()
+            .returning(|_, _, _| Ok(()));
+        // State is CompleteCommit - invalid for AddPartitionsToTxn
+        mock.expect_get_transaction_state()
+            .returning(|_| Ok(Some(TransactionState::CompleteCommit)));
+
+        let topics = vec![("test-topic".to_string(), vec![0])];
+
+        let result = transaction::handle_add_partitions_to_txn(&mock, "txn-1", 1000, 0, topics);
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            KafkaError::InvalidTxnState { .. } => {}
+            e => panic!("Expected InvalidTransactionState error, got {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_add_partitions_txn_not_found() {
+        let mut mock = MockKafkaStore::new();
+
+        mock.expect_validate_transaction()
+            .returning(|_, _, _| Ok(()));
+        // Transaction doesn't exist
+        mock.expect_get_transaction_state().returning(|_| Ok(None));
+
+        let topics = vec![("test-topic".to_string(), vec![0])];
+
+        let result =
+            transaction::handle_add_partitions_to_txn(&mock, "unknown-txn", 1000, 0, topics);
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            KafkaError::TransactionalIdNotFound { .. } => {}
+            e => panic!("Expected TransactionalIdNotFound error, got {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_add_partitions_producer_fenced() {
+        let mut mock = MockKafkaStore::new();
+
+        // Validation fails with ProducerFenced
+        mock.expect_validate_transaction()
+            .returning(|_, _, _| Err(KafkaError::producer_fenced(1000, 0, 1)));
+
+        let topics = vec![("test-topic".to_string(), vec![0])];
+
+        let result = transaction::handle_add_partitions_to_txn(&mock, "txn-1", 1000, 0, topics);
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            KafkaError::ProducerFenced { .. } => {}
+            e => panic!("Expected ProducerFenced error, got {:?}", e),
+        }
+    }
+
+    // ========== AddOffsetsToTxn Tests ==========
+
+    #[test]
+    fn test_add_offsets_success_ongoing() {
+        let mut mock = MockKafkaStore::new();
+
+        mock.expect_validate_transaction()
+            .returning(|_, _, _| Ok(()));
+        mock.expect_get_transaction_state()
+            .returning(|_| Ok(Some(TransactionState::Ongoing)));
+
+        let response =
+            transaction::handle_add_offsets_to_txn(&mock, "txn-1", 1000, 0, "consumer-group")
+                .unwrap();
+
+        assert_eq!(response.error_code, ERROR_NONE);
+    }
+
+    #[test]
+    fn test_add_offsets_starts_transaction() {
+        let mut mock = MockKafkaStore::new();
+
+        mock.expect_validate_transaction()
+            .returning(|_, _, _| Ok(()));
+        // State is Empty
+        mock.expect_get_transaction_state()
+            .returning(|_| Ok(Some(TransactionState::Empty)));
+        // Should begin transaction
+        mock.expect_begin_transaction()
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+
+        let response =
+            transaction::handle_add_offsets_to_txn(&mock, "txn-1", 1000, 0, "consumer-group")
+                .unwrap();
+
+        assert_eq!(response.error_code, ERROR_NONE);
+    }
+
+    #[test]
+    fn test_add_offsets_invalid_state() {
+        let mut mock = MockKafkaStore::new();
+
+        mock.expect_validate_transaction()
+            .returning(|_, _, _| Ok(()));
+        mock.expect_get_transaction_state()
+            .returning(|_| Ok(Some(TransactionState::PrepareCommit)));
+
+        let result =
+            transaction::handle_add_offsets_to_txn(&mock, "txn-1", 1000, 0, "consumer-group");
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            KafkaError::InvalidTxnState { .. } => {}
+            e => panic!("Expected InvalidTransactionState error, got {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_add_offsets_txn_not_found() {
+        let mut mock = MockKafkaStore::new();
+
+        mock.expect_validate_transaction()
+            .returning(|_, _, _| Ok(()));
+        mock.expect_get_transaction_state().returning(|_| Ok(None));
+
+        let result =
+            transaction::handle_add_offsets_to_txn(&mock, "unknown-txn", 1000, 0, "consumer-group");
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            KafkaError::TransactionalIdNotFound { .. } => {}
+            e => panic!("Expected TransactionalIdNotFound error, got {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_add_offsets_producer_fenced() {
+        let mut mock = MockKafkaStore::new();
+
+        mock.expect_validate_transaction()
+            .returning(|_, _, _| Err(KafkaError::producer_fenced(1000, 0, 1)));
+
+        let result =
+            transaction::handle_add_offsets_to_txn(&mock, "txn-1", 1000, 0, "consumer-group");
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            KafkaError::ProducerFenced { .. } => {}
+            e => panic!("Expected ProducerFenced error, got {:?}", e),
+        }
+    }
+
+    // ========== EndTxn Tests ==========
+
+    #[test]
+    fn test_end_txn_commit_success() {
+        let mut mock = MockKafkaStore::new();
+
+        mock.expect_validate_transaction()
+            .returning(|_, _, _| Ok(()));
+        mock.expect_get_transaction_state()
+            .returning(|_| Ok(Some(TransactionState::Ongoing)));
+        mock.expect_commit_transaction()
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+
+        let response = transaction::handle_end_txn(
+            &mock, "txn-1", 1000, 0, true, // committed
+        )
+        .unwrap();
+
+        assert_eq!(response.error_code, ERROR_NONE);
+    }
+
+    #[test]
+    fn test_end_txn_abort_success() {
+        let mut mock = MockKafkaStore::new();
+
+        mock.expect_validate_transaction()
+            .returning(|_, _, _| Ok(()));
+        mock.expect_get_transaction_state()
+            .returning(|_| Ok(Some(TransactionState::Ongoing)));
+        mock.expect_abort_transaction()
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+
+        let response = transaction::handle_end_txn(
+            &mock, "txn-1", 1000, 0, false, // abort
+        )
+        .unwrap();
+
+        assert_eq!(response.error_code, ERROR_NONE);
+    }
+
+    #[test]
+    fn test_end_txn_empty_noop() {
+        let mut mock = MockKafkaStore::new();
+
+        mock.expect_validate_transaction()
+            .returning(|_, _, _| Ok(()));
+        // State is Empty - should be a no-op
+        mock.expect_get_transaction_state()
+            .returning(|_| Ok(Some(TransactionState::Empty)));
+
+        // Neither commit_transaction nor abort_transaction should be called
+        // (no expects set for them)
+
+        let response = transaction::handle_end_txn(&mock, "txn-1", 1000, 0, true).unwrap();
+
+        assert_eq!(response.error_code, ERROR_NONE);
+    }
+
+    #[test]
+    fn test_end_txn_invalid_state() {
+        let mut mock = MockKafkaStore::new();
+
+        mock.expect_validate_transaction()
+            .returning(|_, _, _| Ok(()));
+        // State is already CompleteCommit - can't end again
+        mock.expect_get_transaction_state()
+            .returning(|_| Ok(Some(TransactionState::CompleteCommit)));
+
+        let result = transaction::handle_end_txn(&mock, "txn-1", 1000, 0, true);
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            KafkaError::InvalidTxnState { .. } => {}
+            e => panic!("Expected InvalidTransactionState error, got {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_end_txn_txn_not_found() {
+        let mut mock = MockKafkaStore::new();
+
+        mock.expect_validate_transaction()
+            .returning(|_, _, _| Ok(()));
+        mock.expect_get_transaction_state().returning(|_| Ok(None));
+
+        let result = transaction::handle_end_txn(&mock, "unknown-txn", 1000, 0, true);
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            KafkaError::TransactionalIdNotFound { .. } => {}
+            e => panic!("Expected TransactionalIdNotFound error, got {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_end_txn_producer_fenced() {
+        let mut mock = MockKafkaStore::new();
+
+        mock.expect_validate_transaction()
+            .returning(|_, _, _| Err(KafkaError::producer_fenced(1000, 0, 1)));
+
+        let result = transaction::handle_end_txn(&mock, "txn-1", 1000, 0, true);
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            KafkaError::ProducerFenced { .. } => {}
+            e => panic!("Expected ProducerFenced error, got {:?}", e),
+        }
+    }
+
+    // ========== TxnOffsetCommit Tests ==========
+
+    #[test]
+    fn test_txn_offset_commit_success() {
+        let mut mock = MockKafkaStore::new();
+
+        mock.expect_validate_transaction()
+            .returning(|_, _, _| Ok(()));
+        mock.expect_get_transaction_state()
+            .returning(|_| Ok(Some(TransactionState::Ongoing)));
+        mock.expect_get_topic_id().returning(|_| Ok(Some(1)));
+        mock.expect_store_txn_pending_offset()
+            .times(1)
+            .returning(|_, _, _, _, _, _| Ok(()));
+
+        let topics = vec![(
+            "test-topic".to_string(),
+            vec![(0, 100i64, Some("metadata".to_string()))],
+        )];
+
+        let response = transaction::handle_txn_offset_commit(
+            &mock,
+            "txn-1",
+            1000,
+            0,
+            "consumer-group",
+            topics,
+        )
+        .unwrap();
+
+        assert_eq!(response.topics.len(), 1);
+        assert_eq!(response.topics[0].partitions.len(), 1);
+        assert_eq!(response.topics[0].partitions[0].error_code, ERROR_NONE);
+    }
+
+    #[test]
+    fn test_txn_offset_commit_multiple_partitions() {
+        let mut mock = MockKafkaStore::new();
+
+        mock.expect_validate_transaction()
+            .returning(|_, _, _| Ok(()));
+        mock.expect_get_transaction_state()
+            .returning(|_| Ok(Some(TransactionState::Ongoing)));
+        mock.expect_get_topic_id().returning(|_| Ok(Some(1)));
+        // Should be called 3 times, once for each partition
+        mock.expect_store_txn_pending_offset()
+            .times(3)
+            .returning(|_, _, _, _, _, _| Ok(()));
+
+        let topics = vec![(
+            "test-topic".to_string(),
+            vec![(0, 10i64, None), (1, 20i64, None), (2, 30i64, None)],
+        )];
+
+        let response = transaction::handle_txn_offset_commit(
+            &mock,
+            "txn-1",
+            1000,
+            0,
+            "consumer-group",
+            topics,
+        )
+        .unwrap();
+
+        assert_eq!(response.topics[0].partitions.len(), 3);
+        for partition in &response.topics[0].partitions {
+            assert_eq!(partition.error_code, ERROR_NONE);
+        }
+    }
+
+    #[test]
+    fn test_txn_offset_commit_unknown_topic() {
+        let mut mock = MockKafkaStore::new();
+
+        mock.expect_validate_transaction()
+            .returning(|_, _, _| Ok(()));
+        mock.expect_get_transaction_state()
+            .returning(|_| Ok(Some(TransactionState::Ongoing)));
+        // Topic doesn't exist
+        mock.expect_get_topic_id().returning(|_| Ok(None));
+
+        let topics = vec![("unknown-topic".to_string(), vec![(0, 100i64, None)])];
+
+        let response = transaction::handle_txn_offset_commit(
+            &mock,
+            "txn-1",
+            1000,
+            0,
+            "consumer-group",
+            topics,
+        )
+        .unwrap();
+
+        assert_eq!(
+            response.topics[0].partitions[0].error_code,
+            ERROR_UNKNOWN_TOPIC_OR_PARTITION
+        );
+    }
+
+    #[test]
+    fn test_txn_offset_commit_invalid_state_empty() {
+        let mut mock = MockKafkaStore::new();
+
+        mock.expect_validate_transaction()
+            .returning(|_, _, _| Ok(()));
+        // State is Empty - TxnOffsetCommit requires Ongoing
+        mock.expect_get_transaction_state()
+            .returning(|_| Ok(Some(TransactionState::Empty)));
+
+        let topics = vec![("test-topic".to_string(), vec![(0, 100i64, None)])];
+
+        let result = transaction::handle_txn_offset_commit(
+            &mock,
+            "txn-1",
+            1000,
+            0,
+            "consumer-group",
+            topics,
+        );
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            KafkaError::InvalidTxnState { .. } => {}
+            e => panic!("Expected InvalidTransactionState error, got {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_txn_offset_commit_producer_fenced() {
+        let mut mock = MockKafkaStore::new();
+
+        mock.expect_validate_transaction()
+            .returning(|_, _, _| Err(KafkaError::producer_fenced(1000, 0, 1)));
+
+        let topics = vec![("test-topic".to_string(), vec![(0, 100i64, None)])];
+
+        let result = transaction::handle_txn_offset_commit(
+            &mock,
+            "txn-1",
+            1000,
+            0,
+            "consumer-group",
+            topics,
+        );
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            KafkaError::ProducerFenced { .. } => {}
+            e => panic!("Expected ProducerFenced error, got {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_txn_offset_commit_store_error() {
+        let mut mock = MockKafkaStore::new();
+
+        mock.expect_validate_transaction()
+            .returning(|_, _, _| Ok(()));
+        mock.expect_get_transaction_state()
+            .returning(|_| Ok(Some(TransactionState::Ongoing)));
+        mock.expect_get_topic_id().returning(|_| Ok(Some(1)));
+        // Store fails
+        mock.expect_store_txn_pending_offset()
+            .returning(|_, _, _, _, _, _| Err(KafkaError::database("store failed")));
+
+        let topics = vec![("test-topic".to_string(), vec![(0, 100i64, None)])];
+
+        let response = transaction::handle_txn_offset_commit(
+            &mock,
+            "txn-1",
+            1000,
+            0,
+            "consumer-group",
+            topics,
+        )
+        .unwrap();
+
+        assert_eq!(
+            response.topics[0].partitions[0].error_code,
+            ERROR_UNKNOWN_SERVER_ERROR
+        );
     }
 }

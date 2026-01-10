@@ -17,6 +17,7 @@
 // - consumer: OffsetCommit and OffsetFetch handlers
 // - coordinator: Consumer group coordination (JoinGroup, SyncGroup, Heartbeat, etc.)
 // - init_producer_id: InitProducerId handler for idempotent producers (Phase 9)
+// - transaction: Transaction handlers (Phase 10)
 
 mod admin;
 mod consumer;
@@ -26,6 +27,7 @@ mod helpers;
 mod init_producer_id;
 mod metadata;
 mod produce;
+mod transaction;
 
 #[cfg(test)]
 mod tests;
@@ -44,3 +46,7 @@ pub use helpers::{resolve_topic_id, topic_resolution_error_code, TopicResolution
 pub use init_producer_id::handle_init_producer_id;
 pub use metadata::{handle_api_versions, handle_metadata};
 pub use produce::handle_produce;
+pub use transaction::{
+    handle_add_offsets_to_txn, handle_add_partitions_to_txn, handle_end_txn,
+    handle_txn_offset_commit,
+};

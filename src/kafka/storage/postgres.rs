@@ -3,11 +3,14 @@
 // This module implements the storage layer using PostgreSQL and pgrx SPI.
 // It assumes it runs within a transaction context managed by the caller.
 
-use super::{CommittedOffset, FetchedMessage, KafkaStore, TopicMetadata};
+use super::{
+    CommittedOffset, FetchedMessage, IsolationLevel, KafkaStore, TopicMetadata, TransactionState,
+};
 use crate::kafka::error::{KafkaError, Result};
 use crate::kafka::messages::Record;
 use pgrx::prelude::*;
 use std::collections::HashMap;
+use std::time::Duration;
 
 /// PostgreSQL-backed implementation of KafkaStore
 ///
@@ -806,6 +809,739 @@ impl KafkaStore for PostgresStore {
             | KafkaError::DuplicateSequence { .. }
             | KafkaError::OutOfOrderSequence { .. } => e,
             _ => KafkaError::Internal(format!("check_and_update_sequence failed: {}", e)),
+        })
+    }
+
+    // ===== Transaction Operations (Phase 10) =====
+
+    fn get_or_create_transactional_producer(
+        &self,
+        transactional_id: &str,
+        transaction_timeout_ms: i32,
+        client_id: Option<&str>,
+    ) -> Result<(i64, i16)> {
+        crate::pg_debug!(
+            "PostgresStore::get_or_create_transactional_producer: transactional_id={}, timeout_ms={}",
+            transactional_id,
+            transaction_timeout_ms
+        );
+
+        Spi::connect_mut(|client| {
+            // Look up existing producer by transactional_id
+            let existing = client.select(
+                "SELECT producer_id, epoch FROM kafka.producer_ids WHERE transactional_id = $1",
+                Some(1),
+                &[transactional_id.into()],
+            )?;
+
+            let (producer_id, epoch) = if existing.is_empty() {
+                // New transactional producer - allocate producer_id
+                let table = client.update(
+                    "INSERT INTO kafka.producer_ids (client_id, transactional_id, epoch)
+                     VALUES ($1, $2, 0)
+                     RETURNING producer_id, epoch",
+                    None,
+                    &[client_id.into(), transactional_id.into()],
+                )?;
+
+                let row = table.first();
+                let producer_id: i64 = row
+                    .get_by_name("producer_id")?
+                    .ok_or_else(|| KafkaError::Internal("Failed to get producer_id".into()))?;
+                let epoch: i16 = row.get_by_name("epoch")?.unwrap_or(0);
+
+                crate::pg_debug!(
+                    "Allocated new transactional producer_id={}, epoch={}",
+                    producer_id,
+                    epoch
+                );
+                (producer_id, epoch)
+            } else {
+                // Existing transactional producer - bump epoch (fences old producer)
+                let row = existing.first();
+                let producer_id: i64 = row.get_by_name("producer_id")?.unwrap_or(0);
+
+                let table = client.update(
+                    "UPDATE kafka.producer_ids
+                     SET epoch = epoch + 1, last_active_at = NOW()
+                     WHERE producer_id = $1
+                     RETURNING epoch",
+                    None,
+                    &[producer_id.into()],
+                )?;
+
+                let new_epoch: i16 = table
+                    .first()
+                    .get_by_name("epoch")?
+                    .ok_or_else(|| KafkaError::Internal("Failed to get new epoch".into()))?;
+
+                crate::pg_debug!(
+                    "Bumped epoch for existing transactional producer_id={}, new_epoch={}",
+                    producer_id,
+                    new_epoch
+                );
+                (producer_id, new_epoch)
+            };
+
+            // Create or update transaction record with state='Empty'
+            client.update(
+                "INSERT INTO kafka.transactions (transactional_id, producer_id, producer_epoch, state, timeout_ms)
+                 VALUES ($1, $2, $3, 'Empty', $4)
+                 ON CONFLICT (transactional_id) DO UPDATE SET
+                     producer_id = EXCLUDED.producer_id,
+                     producer_epoch = EXCLUDED.producer_epoch,
+                     state = 'Empty',
+                     timeout_ms = EXCLUDED.timeout_ms,
+                     started_at = NULL,
+                     last_updated_at = NOW()",
+                None,
+                &[
+                    transactional_id.into(),
+                    producer_id.into(),
+                    epoch.into(),
+                    transaction_timeout_ms.into(),
+                ],
+            )?;
+
+            Ok((producer_id, epoch))
+        })
+        .map_err(|e: KafkaError| {
+            KafkaError::Internal(format!("get_or_create_transactional_producer failed: {}", e))
+        })
+    }
+
+    fn begin_transaction(
+        &self,
+        transactional_id: &str,
+        producer_id: i64,
+        producer_epoch: i16,
+    ) -> Result<()> {
+        crate::pg_debug!(
+            "PostgresStore::begin_transaction: transactional_id={}, producer_id={}, epoch={}",
+            transactional_id,
+            producer_id,
+            producer_epoch
+        );
+
+        Spi::connect_mut(|client| {
+            // Verify ownership and update state to 'Ongoing'
+            let table = client.update(
+                "UPDATE kafka.transactions
+                 SET state = 'Ongoing', started_at = NOW(), last_updated_at = NOW()
+                 WHERE transactional_id = $1 AND producer_id = $2 AND producer_epoch = $3
+                   AND state IN ('Empty', 'CompleteCommit', 'CompleteAbort')
+                 RETURNING state",
+                None,
+                &[transactional_id.into(), producer_id.into(), producer_epoch.into()],
+            )?;
+
+            if table.is_empty() {
+                // Check if transaction exists with different producer/epoch
+                let exists = client.select(
+                    "SELECT state, producer_id, producer_epoch FROM kafka.transactions WHERE transactional_id = $1",
+                    Some(1),
+                    &[transactional_id.into()],
+                )?;
+
+                if exists.is_empty() {
+                    return Err(KafkaError::transactional_id_not_found(transactional_id));
+                }
+
+                let row = exists.first();
+                let current_producer_id: i64 = row.get_by_name("producer_id")?.unwrap_or(0);
+                let current_epoch: i16 = row.get_by_name("producer_epoch")?.unwrap_or(0);
+                let state: String = row.get_by_name("state")?.unwrap_or_default();
+
+                if current_producer_id != producer_id || current_epoch != producer_epoch {
+                    return Err(KafkaError::producer_fenced(producer_id, producer_epoch, current_epoch));
+                }
+
+                // State is not valid for beginning a transaction
+                return Err(KafkaError::invalid_txn_state(
+                    transactional_id,
+                    "Empty, CompleteCommit, or CompleteAbort",
+                    &state,
+                ));
+            }
+
+            crate::pg_debug!("Transaction {} started", transactional_id);
+            Ok(())
+        })
+        .map_err(|e| match e {
+            KafkaError::TransactionalIdNotFound { .. }
+            | KafkaError::ProducerFenced { .. }
+            | KafkaError::InvalidTxnState { .. } => e,
+            _ => KafkaError::Internal(format!("begin_transaction failed: {}", e)),
+        })
+    }
+
+    fn validate_transaction(
+        &self,
+        transactional_id: &str,
+        producer_id: i64,
+        producer_epoch: i16,
+    ) -> Result<()> {
+        crate::pg_debug!(
+            "PostgresStore::validate_transaction: transactional_id={}, producer_id={}, epoch={}",
+            transactional_id,
+            producer_id,
+            producer_epoch
+        );
+
+        Spi::connect(|client| {
+            let table = client.select(
+                "SELECT state, producer_id, producer_epoch FROM kafka.transactions WHERE transactional_id = $1",
+                Some(1),
+                &[transactional_id.into()],
+            )?;
+
+            if table.is_empty() {
+                return Err(KafkaError::transactional_id_not_found(transactional_id));
+            }
+
+            let row = table.first();
+            let current_producer_id: i64 = row.get_by_name("producer_id")?.unwrap_or(0);
+            let current_epoch: i16 = row.get_by_name("producer_epoch")?.unwrap_or(0);
+            let state: String = row.get_by_name("state")?.unwrap_or_default();
+
+            if current_producer_id != producer_id || current_epoch != producer_epoch {
+                return Err(KafkaError::producer_fenced(producer_id, producer_epoch, current_epoch));
+            }
+
+            // Note: We only validate ownership here, not state.
+            // State validation is done by the handlers which know the expected states
+            // for their specific operations (e.g., AddPartitionsToTxn allows Empty or Ongoing).
+            let _ = state; // Acknowledge we read state but don't check it here
+
+            Ok(())
+        })
+        .map_err(|e| match e {
+            KafkaError::TransactionalIdNotFound { .. }
+            | KafkaError::ProducerFenced { .. }
+            | KafkaError::InvalidTxnState { .. } => e,
+            _ => KafkaError::Internal(format!("validate_transaction failed: {}", e)),
+        })
+    }
+
+    fn insert_transactional_records(
+        &self,
+        topic_id: i32,
+        partition_id: i32,
+        records: &[Record],
+        producer_id: i64,
+        producer_epoch: i16,
+    ) -> Result<i64> {
+        if records.is_empty() {
+            return Ok(0);
+        }
+
+        crate::pg_debug!(
+            "PostgresStore::insert_transactional_records: {} records for topic_id={}, partition_id={}, producer_id={}",
+            records.len(),
+            topic_id,
+            partition_id,
+            producer_id
+        );
+
+        Spi::connect_mut(|client| {
+            // Step 1: Lock the partition using advisory lock
+            client.select(
+                "SELECT pg_advisory_xact_lock($1, $2)",
+                None,
+                &[topic_id.into(), partition_id.into()],
+            )?;
+
+            // Step 2: Get current max offset
+            let table = client.select(
+                "SELECT COALESCE(MAX(partition_offset), -1) as max_offset
+                 FROM kafka.messages
+                 WHERE topic_id = $1 AND partition_id = $2",
+                None,
+                &[topic_id.into(), partition_id.into()],
+            )?;
+
+            let max_offset: i64 = table
+                .first()
+                .get_by_name::<i64, _>("max_offset")?
+                .unwrap_or(-1);
+
+            let base_offset = max_offset + 1;
+
+            // Step 3: Build parallel arrays for UNNEST-based bulk insert
+            let count = records.len();
+            let topic_ids: Vec<i32> = vec![topic_id; count];
+            let partition_ids: Vec<i32> = vec![partition_id; count];
+            let offsets: Vec<i64> = (0..count).map(|i| base_offset + i as i64).collect();
+            let keys: Vec<Option<Vec<u8>>> = records.iter().map(|r| r.key.clone()).collect();
+            let values: Vec<Option<Vec<u8>>> = records.iter().map(|r| r.value.clone()).collect();
+            let headers: Vec<String> = records
+                .iter()
+                .map(|r| {
+                    if r.headers.is_empty() {
+                        "{}".to_string()
+                    } else {
+                        let headers_map: HashMap<String, String> = r
+                            .headers
+                            .iter()
+                            .map(|h| (h.key.clone(), hex_encode(&h.value)))
+                            .collect();
+                        serde_json::to_string(&headers_map).unwrap_or_else(|_| "{}".to_string())
+                    }
+                })
+                .collect();
+            let producer_ids: Vec<i64> = vec![producer_id; count];
+            let producer_epochs: Vec<i16> = vec![producer_epoch; count];
+            let txn_states: Vec<&str> = vec!["pending"; count];
+
+            // Execute single INSERT with UNNEST including transaction columns
+            client
+                .update(
+                    "INSERT INTO kafka.messages (topic_id, partition_id, partition_offset, key, value, headers, producer_id, producer_epoch, txn_state)
+                     SELECT * FROM unnest($1::int[], $2::int[], $3::bigint[], $4::bytea[], $5::bytea[], $6::jsonb[], $7::bigint[], $8::smallint[], $9::text[])",
+                    None,
+                    &[
+                        topic_ids.into(),
+                        partition_ids.into(),
+                        offsets.into(),
+                        keys.into(),
+                        values.into(),
+                        headers.into(),
+                        producer_ids.into(),
+                        producer_epochs.into(),
+                        txn_states.into(),
+                    ],
+                )
+                .map_err(|e| KafkaError::Internal(format!("Failed to insert transactional records: {}", e)))?;
+
+            crate::pg_debug!(
+                "Successfully inserted {} transactional records (offsets {} to {})",
+                records.len(),
+                base_offset,
+                base_offset + records.len() as i64 - 1
+            );
+
+            Ok(base_offset)
+        })
+        .map_err(|e| match e {
+            KafkaError::Internal(_) => e,
+            _ => KafkaError::Internal(format!("insert_transactional_records failed: {}", e)),
+        })
+    }
+
+    fn store_txn_pending_offset(
+        &self,
+        transactional_id: &str,
+        group_id: &str,
+        topic_id: i32,
+        partition_id: i32,
+        offset: i64,
+        metadata: Option<&str>,
+    ) -> Result<()> {
+        crate::pg_debug!(
+            "PostgresStore::store_txn_pending_offset: txn_id={}, group_id={}, topic_id={}, partition_id={}, offset={}",
+            transactional_id,
+            group_id,
+            topic_id,
+            partition_id,
+            offset
+        );
+
+        Spi::connect_mut(|client| {
+            client.update(
+                "INSERT INTO kafka.txn_pending_offsets (transactional_id, group_id, topic_id, partition_id, pending_offset, metadata)
+                 VALUES ($1, $2, $3, $4, $5, $6)
+                 ON CONFLICT (transactional_id, group_id, topic_id, partition_id)
+                 DO UPDATE SET pending_offset = EXCLUDED.pending_offset, metadata = EXCLUDED.metadata",
+                None,
+                &[
+                    transactional_id.into(),
+                    group_id.into(),
+                    topic_id.into(),
+                    partition_id.into(),
+                    offset.into(),
+                    metadata.into(),
+                ],
+            )?;
+            Ok(())
+        })
+        .map_err(|e: KafkaError| {
+            KafkaError::Internal(format!("store_txn_pending_offset failed: {}", e))
+        })
+    }
+
+    fn commit_transaction(
+        &self,
+        transactional_id: &str,
+        producer_id: i64,
+        producer_epoch: i16,
+    ) -> Result<()> {
+        crate::pg_debug!(
+            "PostgresStore::commit_transaction: transactional_id={}, producer_id={}, epoch={}",
+            transactional_id,
+            producer_id,
+            producer_epoch
+        );
+
+        Spi::connect_mut(|client| {
+            // Step 1: Validate transaction state
+            let txn_table = client.select(
+                "SELECT state, producer_id, producer_epoch FROM kafka.transactions WHERE transactional_id = $1",
+                Some(1),
+                &[transactional_id.into()],
+            )?;
+
+            if txn_table.is_empty() {
+                return Err(KafkaError::transactional_id_not_found(transactional_id));
+            }
+
+            let row = txn_table.first();
+            let current_producer_id: i64 = row.get_by_name("producer_id")?.unwrap_or(0);
+            let current_epoch: i16 = row.get_by_name("producer_epoch")?.unwrap_or(0);
+            let state: String = row.get_by_name("state")?.unwrap_or_default();
+
+            if current_producer_id != producer_id || current_epoch != producer_epoch {
+                return Err(KafkaError::producer_fenced(producer_id, producer_epoch, current_epoch));
+            }
+
+            if state != "Ongoing" {
+                return Err(KafkaError::invalid_txn_state(transactional_id, "Ongoing", &state));
+            }
+
+            // Step 2: Make messages visible (set txn_state = NULL)
+            client.update(
+                "UPDATE kafka.messages SET txn_state = NULL
+                 WHERE producer_id = $1 AND producer_epoch = $2 AND txn_state = 'pending'",
+                None,
+                &[producer_id.into(), producer_epoch.into()],
+            )?;
+
+            // Step 3: Move pending offsets to consumer_offsets
+            client.update(
+                "INSERT INTO kafka.consumer_offsets (group_id, topic_id, partition_id, committed_offset, metadata)
+                 SELECT group_id, topic_id, partition_id, pending_offset, metadata
+                 FROM kafka.txn_pending_offsets
+                 WHERE transactional_id = $1
+                 ON CONFLICT (group_id, topic_id, partition_id) DO UPDATE SET
+                     committed_offset = EXCLUDED.committed_offset,
+                     metadata = EXCLUDED.metadata,
+                     commit_timestamp = NOW()",
+                None,
+                &[transactional_id.into()],
+            )?;
+
+            // Step 4: Delete pending offsets
+            client.update(
+                "DELETE FROM kafka.txn_pending_offsets WHERE transactional_id = $1",
+                None,
+                &[transactional_id.into()],
+            )?;
+
+            // Step 5: Update transaction state to CompleteCommit
+            client.update(
+                "UPDATE kafka.transactions SET state = 'CompleteCommit', last_updated_at = NOW()
+                 WHERE transactional_id = $1",
+                None,
+                &[transactional_id.into()],
+            )?;
+
+            crate::pg_debug!("Transaction {} committed", transactional_id);
+            Ok(())
+        })
+        .map_err(|e| match e {
+            KafkaError::TransactionalIdNotFound { .. }
+            | KafkaError::ProducerFenced { .. }
+            | KafkaError::InvalidTxnState { .. } => e,
+            _ => KafkaError::Internal(format!("commit_transaction failed: {}", e)),
+        })
+    }
+
+    fn abort_transaction(
+        &self,
+        transactional_id: &str,
+        producer_id: i64,
+        producer_epoch: i16,
+    ) -> Result<()> {
+        crate::pg_debug!(
+            "PostgresStore::abort_transaction: transactional_id={}, producer_id={}, epoch={}",
+            transactional_id,
+            producer_id,
+            producer_epoch
+        );
+
+        Spi::connect_mut(|client| {
+            // Step 1: Validate transaction state
+            let txn_table = client.select(
+                "SELECT state, producer_id, producer_epoch FROM kafka.transactions WHERE transactional_id = $1",
+                Some(1),
+                &[transactional_id.into()],
+            )?;
+
+            if txn_table.is_empty() {
+                return Err(KafkaError::transactional_id_not_found(transactional_id));
+            }
+
+            let row = txn_table.first();
+            let current_producer_id: i64 = row.get_by_name("producer_id")?.unwrap_or(0);
+            let current_epoch: i16 = row.get_by_name("producer_epoch")?.unwrap_or(0);
+            let state: String = row.get_by_name("state")?.unwrap_or_default();
+
+            if current_producer_id != producer_id || current_epoch != producer_epoch {
+                return Err(KafkaError::producer_fenced(producer_id, producer_epoch, current_epoch));
+            }
+
+            if state != "Ongoing" {
+                return Err(KafkaError::invalid_txn_state(transactional_id, "Ongoing", &state));
+            }
+
+            // Step 2: Mark messages as aborted
+            client.update(
+                "UPDATE kafka.messages SET txn_state = 'aborted'
+                 WHERE producer_id = $1 AND producer_epoch = $2 AND txn_state = 'pending'",
+                None,
+                &[producer_id.into(), producer_epoch.into()],
+            )?;
+
+            // Step 3: Delete pending offsets
+            client.update(
+                "DELETE FROM kafka.txn_pending_offsets WHERE transactional_id = $1",
+                None,
+                &[transactional_id.into()],
+            )?;
+
+            // Step 4: Update transaction state to CompleteAbort
+            client.update(
+                "UPDATE kafka.transactions SET state = 'CompleteAbort', last_updated_at = NOW()
+                 WHERE transactional_id = $1",
+                None,
+                &[transactional_id.into()],
+            )?;
+
+            crate::pg_debug!("Transaction {} aborted", transactional_id);
+            Ok(())
+        })
+        .map_err(|e| match e {
+            KafkaError::TransactionalIdNotFound { .. }
+            | KafkaError::ProducerFenced { .. }
+            | KafkaError::InvalidTxnState { .. } => e,
+            _ => KafkaError::Internal(format!("abort_transaction failed: {}", e)),
+        })
+    }
+
+    fn get_transaction_state(&self, transactional_id: &str) -> Result<Option<TransactionState>> {
+        crate::pg_debug!(
+            "PostgresStore::get_transaction_state: transactional_id={}",
+            transactional_id
+        );
+
+        Spi::connect(|client| {
+            let mut table = client.select(
+                "SELECT state FROM kafka.transactions WHERE transactional_id = $1",
+                Some(1),
+                &[transactional_id.into()],
+            )?;
+
+            if let Some(row) = table.next() {
+                let state_str: String = row.get_by_name("state")?.unwrap_or_default();
+                Ok(TransactionState::parse(&state_str))
+            } else {
+                Ok(None)
+            }
+        })
+        .map_err(|e: KafkaError| {
+            KafkaError::Internal(format!("get_transaction_state failed: {}", e))
+        })
+    }
+
+    fn fetch_records_with_isolation(
+        &self,
+        topic_id: i32,
+        partition_id: i32,
+        fetch_offset: i64,
+        max_bytes: i32,
+        isolation_level: IsolationLevel,
+    ) -> Result<Vec<FetchedMessage>> {
+        crate::pg_debug!(
+            "PostgresStore::fetch_records_with_isolation: topic_id={}, partition_id={}, offset={}, isolation={:?}",
+            topic_id,
+            partition_id,
+            fetch_offset,
+            isolation_level
+        );
+
+        let limit = (max_bytes / 100).clamp(100, 10_000);
+
+        Spi::connect(|client| {
+            let query = match isolation_level {
+                IsolationLevel::ReadUncommitted => {
+                    // Return all records including pending
+                    "SELECT partition_offset, key, value,
+                            EXTRACT(EPOCH FROM created_at)::bigint * 1000 as timestamp_ms
+                     FROM kafka.messages
+                     WHERE topic_id = $1 AND partition_id = $2 AND partition_offset >= $3
+                     ORDER BY partition_offset
+                     LIMIT $4"
+                }
+                IsolationLevel::ReadCommitted => {
+                    // Filter out pending and aborted records
+                    "SELECT partition_offset, key, value,
+                            EXTRACT(EPOCH FROM created_at)::bigint * 1000 as timestamp_ms
+                     FROM kafka.messages
+                     WHERE topic_id = $1 AND partition_id = $2 AND partition_offset >= $3
+                       AND (txn_state IS NULL)
+                     ORDER BY partition_offset
+                     LIMIT $4"
+                }
+            };
+
+            let table = client.select(
+                query,
+                None,
+                &[
+                    topic_id.into(),
+                    partition_id.into(),
+                    fetch_offset.into(),
+                    limit.into(),
+                ],
+            )?;
+
+            let mut messages = Vec::new();
+            for row in table {
+                let partition_offset: i64 = row.get_by_name("partition_offset")?.unwrap_or(0);
+                let key: Option<Vec<u8>> = row.get_by_name("key")?;
+                let value: Option<Vec<u8>> = row.get_by_name("value")?;
+                let timestamp: i64 = row.get_by_name("timestamp_ms")?.unwrap_or(0);
+
+                messages.push(FetchedMessage {
+                    partition_offset,
+                    key,
+                    value,
+                    timestamp,
+                });
+            }
+
+            crate::pg_debug!(
+                "Fetched {} messages with isolation {:?}",
+                messages.len(),
+                isolation_level
+            );
+            Ok(messages)
+        })
+        .map_err(|e: KafkaError| {
+            KafkaError::Internal(format!("fetch_records_with_isolation failed: {}", e))
+        })
+    }
+
+    fn get_last_stable_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64> {
+        crate::pg_debug!(
+            "PostgresStore::get_last_stable_offset: topic_id={}, partition_id={}",
+            topic_id,
+            partition_id
+        );
+
+        Spi::connect(|client| {
+            // Get the minimum offset of pending messages, or high watermark if none
+            let table = client.select(
+                "SELECT COALESCE(
+                    (SELECT MIN(partition_offset) FROM kafka.messages
+                     WHERE topic_id = $1 AND partition_id = $2 AND txn_state = 'pending'),
+                    (SELECT COALESCE(MAX(partition_offset) + 1, 0) FROM kafka.messages
+                     WHERE topic_id = $1 AND partition_id = $2)
+                 ) as lso",
+                None,
+                &[topic_id.into(), partition_id.into()],
+            )?;
+
+            let lso: i64 = table.first().get_by_name("lso")?.unwrap_or(0);
+            Ok(lso)
+        })
+        .map_err(|e: KafkaError| {
+            KafkaError::Internal(format!("get_last_stable_offset failed: {}", e))
+        })
+    }
+
+    fn abort_timed_out_transactions(&self, timeout: Duration) -> Result<Vec<String>> {
+        let timeout_secs = timeout.as_secs() as i64;
+        crate::pg_debug!(
+            "PostgresStore::abort_timed_out_transactions: timeout={}s",
+            timeout_secs
+        );
+
+        Spi::connect_mut(|client| {
+            // Find and abort timed-out transactions
+            let table = client.select(
+                "SELECT transactional_id, producer_id, producer_epoch
+                 FROM kafka.transactions
+                 WHERE state = 'Ongoing'
+                   AND started_at < NOW() - ($1 || ' seconds')::interval",
+                None,
+                &[timeout_secs.into()],
+            )?;
+
+            let mut aborted = Vec::new();
+
+            for row in table {
+                let txn_id: String = row.get_by_name("transactional_id")?.unwrap_or_default();
+                let producer_id: i64 = row.get_by_name("producer_id")?.unwrap_or(0);
+                let producer_epoch: i16 = row.get_by_name("producer_epoch")?.unwrap_or(0);
+
+                // Mark messages as aborted
+                client.update(
+                    "UPDATE kafka.messages SET txn_state = 'aborted'
+                     WHERE producer_id = $1 AND producer_epoch = $2 AND txn_state = 'pending'",
+                    None,
+                    &[producer_id.into(), producer_epoch.into()],
+                )?;
+
+                // Delete pending offsets
+                client.update(
+                    "DELETE FROM kafka.txn_pending_offsets WHERE transactional_id = $1",
+                    None,
+                    &[txn_id.clone().into()],
+                )?;
+
+                // Update transaction state
+                client.update(
+                    "UPDATE kafka.transactions SET state = 'CompleteAbort', last_updated_at = NOW()
+                     WHERE transactional_id = $1",
+                    None,
+                    &[txn_id.clone().into()],
+                )?;
+
+                crate::pg_debug!("Aborted timed-out transaction: {}", txn_id);
+                aborted.push(txn_id);
+            }
+
+            Ok(aborted)
+        })
+        .map_err(|e: KafkaError| {
+            KafkaError::Internal(format!("abort_timed_out_transactions failed: {}", e))
+        })
+    }
+
+    fn cleanup_aborted_messages(&self, older_than: Duration) -> Result<u64> {
+        let older_than_secs = older_than.as_secs() as i64;
+        crate::pg_debug!(
+            "PostgresStore::cleanup_aborted_messages: older_than={}s",
+            older_than_secs
+        );
+
+        Spi::connect_mut(|client| {
+            // Use DELETE ... RETURNING to count deleted rows
+            let table = client.select(
+                "DELETE FROM kafka.messages
+                 WHERE txn_state = 'aborted'
+                   AND created_at < NOW() - ($1 || ' seconds')::interval
+                 RETURNING 1",
+                None,
+                &[older_than_secs.into()],
+            )?;
+
+            let deleted = table.len() as u64;
+            crate::pg_debug!("Deleted {} aborted messages", deleted);
+            Ok(deleted)
+        })
+        .map_err(|e: KafkaError| {
+            KafkaError::Internal(format!("cleanup_aborted_messages failed: {}", e))
         })
     }
 }

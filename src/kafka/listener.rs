@@ -288,13 +288,14 @@ async fn handle_connection(
                         max_wait_ms,
                         min_bytes,
                         max_bytes,
+                        isolation_level,
                         topic_data,
                         response_tx: original_response_tx,
                     } = request
                     {
                         debug!(
-                            "Fetch request with long polling: max_wait_ms={}, min_bytes={}",
-                            max_wait_ms, min_bytes
+                            "Fetch request with long polling: max_wait_ms={}, min_bytes={}, isolation_level={}",
+                            max_wait_ms, min_bytes, isolation_level
                         );
 
                         let long_poll_registry = registry.clone();
@@ -309,6 +310,7 @@ async fn handle_connection(
                                 max_wait_ms,
                                 min_bytes,
                                 max_bytes,
+                                isolation_level,
                                 topic_data,
                                 long_poll_request_tx,
                                 original_response_tx,
@@ -373,6 +375,7 @@ async fn handle_fetch_long_poll(
     max_wait_ms: i32,
     min_bytes: i32,
     max_bytes: i32,
+    isolation_level: i8,
     topic_data: Vec<TopicFetchData>,
     request_tx: Sender<KafkaRequest>,
     final_response_tx: UnboundedSender<KafkaResponse>,
@@ -394,6 +397,7 @@ async fn handle_fetch_long_poll(
             max_wait_ms: 0, // Don't long poll again in worker
             min_bytes: 0,   // Accept any amount of data
             max_bytes,
+            isolation_level,
             topic_data: topic_data.clone(),
             response_tx: inner_tx,
         };

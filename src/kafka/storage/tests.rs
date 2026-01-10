@@ -18,6 +18,71 @@ mod tests {
 
     // ========== Storage Types Tests ==========
 
+    // ========== Transaction Types Tests (Phase 10) ==========
+
+    use crate::kafka::storage::{IsolationLevel, TransactionState};
+
+    #[test]
+    fn test_transaction_state_from_str() {
+        // Test all valid states
+        assert_eq!(
+            TransactionState::parse("Empty"),
+            Some(TransactionState::Empty)
+        );
+        assert_eq!(
+            TransactionState::parse("Ongoing"),
+            Some(TransactionState::Ongoing)
+        );
+        assert_eq!(
+            TransactionState::parse("PrepareCommit"),
+            Some(TransactionState::PrepareCommit)
+        );
+        assert_eq!(
+            TransactionState::parse("PrepareAbort"),
+            Some(TransactionState::PrepareAbort)
+        );
+        assert_eq!(
+            TransactionState::parse("CompleteCommit"),
+            Some(TransactionState::CompleteCommit)
+        );
+        assert_eq!(
+            TransactionState::parse("CompleteAbort"),
+            Some(TransactionState::CompleteAbort)
+        );
+
+        // Test invalid states return None
+        assert_eq!(TransactionState::parse("invalid"), None);
+        assert_eq!(TransactionState::parse(""), None);
+        assert_eq!(TransactionState::parse("EMPTY"), None); // Case-sensitive
+    }
+
+    #[test]
+    fn test_transaction_state_as_str() {
+        assert_eq!(TransactionState::Empty.as_str(), "Empty");
+        assert_eq!(TransactionState::Ongoing.as_str(), "Ongoing");
+        assert_eq!(TransactionState::PrepareCommit.as_str(), "PrepareCommit");
+        assert_eq!(TransactionState::PrepareAbort.as_str(), "PrepareAbort");
+        assert_eq!(TransactionState::CompleteCommit.as_str(), "CompleteCommit");
+        assert_eq!(TransactionState::CompleteAbort.as_str(), "CompleteAbort");
+    }
+
+    #[test]
+    fn test_isolation_level_from_i8() {
+        // 0 = ReadUncommitted (default)
+        assert_eq!(IsolationLevel::from_i8(0), IsolationLevel::ReadUncommitted);
+
+        // 1 = ReadCommitted
+        assert_eq!(IsolationLevel::from_i8(1), IsolationLevel::ReadCommitted);
+
+        // Any other value defaults to ReadUncommitted
+        assert_eq!(IsolationLevel::from_i8(2), IsolationLevel::ReadUncommitted);
+        assert_eq!(IsolationLevel::from_i8(-1), IsolationLevel::ReadUncommitted);
+        assert_eq!(
+            IsolationLevel::from_i8(127),
+            IsolationLevel::ReadUncommitted
+        );
+    }
+
     #[test]
     fn test_topic_metadata_construction() {
         let metadata = TopicMetadata {
@@ -513,5 +578,306 @@ mod tests {
 
         let result = mock.insert_records(1, 0, &records);
         assert!(result.is_ok());
+    }
+
+    // ========== Transaction Mock Contract Tests (Phase 10) ==========
+    //
+    // These tests verify the MockKafkaStore correctly implements transaction methods
+
+    #[test]
+    fn test_mock_get_or_create_transactional_producer() {
+        let mut mock = MockKafkaStore::new();
+
+        mock.expect_get_or_create_transactional_producer()
+            .withf(|txn_id, timeout_ms, client_id| {
+                txn_id == "my-txn-id" && *timeout_ms == 60000 && *client_id == Some("test-client")
+            })
+            .times(1)
+            .returning(|_, _, _| Ok((1000, 0))); // (producer_id, epoch)
+
+        let result = mock
+            .get_or_create_transactional_producer("my-txn-id", 60000, Some("test-client"))
+            .unwrap();
+        assert_eq!(result.0, 1000); // producer_id
+        assert_eq!(result.1, 0); // epoch
+    }
+
+    #[test]
+    fn test_mock_get_or_create_transactional_producer_bumps_epoch() {
+        let mut mock = MockKafkaStore::new();
+
+        // Simulate epoch bumping on second call (producer fencing)
+        let mut call_count = 0i16;
+        mock.expect_get_or_create_transactional_producer()
+            .times(2)
+            .returning(move |_, _, _| {
+                let epoch = call_count;
+                call_count += 1;
+                Ok((1000, epoch)) // Same producer_id, incrementing epoch
+            });
+
+        // First call: epoch=0
+        let (pid1, epoch1) = mock
+            .get_or_create_transactional_producer("txn-1", 60000, None)
+            .unwrap();
+        assert_eq!(pid1, 1000);
+        assert_eq!(epoch1, 0);
+
+        // Second call: epoch=1 (old producer is fenced)
+        let (pid2, epoch2) = mock
+            .get_or_create_transactional_producer("txn-1", 60000, None)
+            .unwrap();
+        assert_eq!(pid2, 1000);
+        assert_eq!(epoch2, 1);
+    }
+
+    #[test]
+    fn test_mock_begin_transaction() {
+        let mut mock = MockKafkaStore::new();
+
+        mock.expect_begin_transaction()
+            .withf(|txn_id, producer_id, epoch| {
+                txn_id == "txn-1" && *producer_id == 1000 && *epoch == 0
+            })
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+
+        let result = mock.begin_transaction("txn-1", 1000, 0);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_mock_validate_transaction_success() {
+        let mut mock = MockKafkaStore::new();
+
+        mock.expect_validate_transaction()
+            .withf(|txn_id, producer_id, epoch| {
+                txn_id == "txn-1" && *producer_id == 1000 && *epoch == 0
+            })
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+
+        let result = mock.validate_transaction("txn-1", 1000, 0);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_mock_validate_transaction_fenced() {
+        let mut mock = MockKafkaStore::new();
+
+        mock.expect_validate_transaction()
+            .times(1)
+            .returning(|_, _, _| Err(KafkaError::producer_fenced(1000, 0, 1)));
+
+        let result = mock.validate_transaction("txn-1", 1000, 0);
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        match err {
+            KafkaError::ProducerFenced { .. } => {} // Expected
+            _ => panic!("Expected ProducerFenced error, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn test_mock_insert_transactional_records() {
+        let mut mock = MockKafkaStore::new();
+
+        mock.expect_insert_transactional_records()
+            .withf(
+                |topic_id, partition_id, records, producer_id, producer_epoch| {
+                    *topic_id == 1
+                        && *partition_id == 0
+                        && records.len() == 2
+                        && *producer_id == 1000
+                        && *producer_epoch == 0
+                },
+            )
+            .times(1)
+            .returning(|_, _, _, _, _| Ok(100)); // Returns base offset
+
+        let records = vec![
+            Record {
+                key: Some(b"k1".to_vec()),
+                value: Some(b"v1".to_vec()),
+                headers: vec![],
+                timestamp: None,
+            },
+            Record {
+                key: Some(b"k2".to_vec()),
+                value: Some(b"v2".to_vec()),
+                headers: vec![],
+                timestamp: None,
+            },
+        ];
+
+        let result = mock.insert_transactional_records(1, 0, &records, 1000, 0);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 100);
+    }
+
+    #[test]
+    fn test_mock_store_txn_pending_offset() {
+        let mut mock = MockKafkaStore::new();
+
+        mock.expect_store_txn_pending_offset()
+            .withf(
+                |txn_id, group_id, topic_id, partition_id, offset, metadata| {
+                    txn_id == "txn-1"
+                        && group_id == "test-group"
+                        && *topic_id == 1
+                        && *partition_id == 0
+                        && *offset == 100
+                        && *metadata == Some("meta")
+                },
+            )
+            .times(1)
+            .returning(|_, _, _, _, _, _| Ok(()));
+
+        let result = mock.store_txn_pending_offset("txn-1", "test-group", 1, 0, 100, Some("meta"));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_mock_commit_transaction() {
+        let mut mock = MockKafkaStore::new();
+
+        mock.expect_commit_transaction()
+            .withf(|txn_id, producer_id, epoch| {
+                txn_id == "txn-1" && *producer_id == 1000 && *epoch == 0
+            })
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+
+        let result = mock.commit_transaction("txn-1", 1000, 0);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_mock_abort_transaction() {
+        let mut mock = MockKafkaStore::new();
+
+        mock.expect_abort_transaction()
+            .withf(|txn_id, producer_id, epoch| {
+                txn_id == "txn-1" && *producer_id == 1000 && *epoch == 0
+            })
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+
+        let result = mock.abort_transaction("txn-1", 1000, 0);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_mock_get_transaction_state_variants() {
+        // Test that mock can return all TransactionState variants
+        let variants = vec![
+            TransactionState::Empty,
+            TransactionState::Ongoing,
+            TransactionState::PrepareCommit,
+            TransactionState::PrepareAbort,
+            TransactionState::CompleteCommit,
+            TransactionState::CompleteAbort,
+        ];
+
+        for expected_state in variants {
+            let mut mock = MockKafkaStore::new();
+            let state_clone = expected_state.clone();
+
+            mock.expect_get_transaction_state()
+                .times(1)
+                .returning(move |_| Ok(Some(state_clone.clone())));
+
+            let result = mock.get_transaction_state("txn-1").unwrap();
+            assert!(result.is_some());
+            assert_eq!(result.unwrap(), expected_state);
+        }
+    }
+
+    #[test]
+    fn test_mock_get_transaction_state_not_found() {
+        let mut mock = MockKafkaStore::new();
+
+        mock.expect_get_transaction_state()
+            .times(1)
+            .returning(|_| Ok(None));
+
+        let result = mock.get_transaction_state("unknown-txn").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_mock_abort_timed_out_transactions() {
+        let mut mock = MockKafkaStore::new();
+
+        mock.expect_abort_timed_out_transactions()
+            .times(1)
+            .returning(|_| Ok(vec!["txn-1".to_string(), "txn-2".to_string()]));
+
+        let result = mock
+            .abort_timed_out_transactions(std::time::Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], "txn-1");
+        assert_eq!(result[1], "txn-2");
+    }
+
+    #[test]
+    fn test_mock_cleanup_aborted_messages() {
+        let mut mock = MockKafkaStore::new();
+
+        mock.expect_cleanup_aborted_messages()
+            .times(1)
+            .returning(|_| Ok(42)); // 42 messages cleaned up
+
+        let result = mock
+            .cleanup_aborted_messages(std::time::Duration::from_secs(3600))
+            .unwrap();
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn test_mock_fetch_records_with_isolation() {
+        let mut mock = MockKafkaStore::new();
+
+        // Test read_committed: should only return committed messages
+        mock.expect_fetch_records_with_isolation()
+            .withf(|topic_id, partition_id, offset, max_bytes, isolation| {
+                *topic_id == 1
+                    && *partition_id == 0
+                    && *offset == 0
+                    && *max_bytes == 1024
+                    && *isolation == IsolationLevel::ReadCommitted
+            })
+            .times(1)
+            .returning(|_, _, _, _, _| {
+                // Only committed messages returned (pending filtered out)
+                Ok(vec![FetchedMessage {
+                    partition_offset: 0,
+                    key: Some(b"committed-key".to_vec()),
+                    value: Some(b"committed-value".to_vec()),
+                    timestamp: 12345,
+                }])
+            });
+
+        let result = mock
+            .fetch_records_with_isolation(1, 0, 0, 1024, IsolationLevel::ReadCommitted)
+            .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].key, Some(b"committed-key".to_vec()));
+    }
+
+    #[test]
+    fn test_mock_get_last_stable_offset() {
+        let mut mock = MockKafkaStore::new();
+
+        // LSO is the lowest pending offset, or HWM if no pending
+        mock.expect_get_last_stable_offset()
+            .withf(|topic_id, partition_id| *topic_id == 1 && *partition_id == 0)
+            .times(1)
+            .returning(|_, _| Ok(50)); // LSO at 50
+
+        let result = mock.get_last_stable_offset(1, 0).unwrap();
+        assert_eq!(result, 50);
     }
 }

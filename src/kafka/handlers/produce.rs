@@ -3,6 +3,7 @@
 // Handles ProduceRequest - writing messages to topics.
 // Phase 7: Added server-side partition routing for partition_index == -1
 // Phase 9: Added idempotent producer sequence validation
+// Phase 10: Added transactional mode support
 
 use crate::kafka::constants::{ERROR_NONE, ERROR_UNKNOWN_TOPIC_OR_PARTITION};
 use crate::kafka::error::Result;
@@ -16,17 +17,52 @@ use std::collections::HashMap;
 /// Inserts records into storage and returns base offsets for each partition.
 /// When partition_index == -1, uses key-based partition routing.
 ///
+/// For transactional producers:
+/// - Records are inserted with txn_state='pending' (invisible to read_committed consumers)
+/// - Records become visible when the transaction commits
+/// - Records are marked 'aborted' if the transaction aborts
+///
 /// # Arguments
 /// * `store` - Storage backend
 /// * `topic_data` - Topics and records to produce
 /// * `default_partitions` - Partition count for auto-created topics
 /// * `producer_metadata` - Optional producer metadata for idempotent producers (Phase 9)
+/// * `transactional_id` - Optional transactional ID for transactional producers (Phase 10)
 pub fn handle_produce(
     store: &impl KafkaStore,
     topic_data: Vec<crate::kafka::messages::TopicProduceData>,
     default_partitions: i32,
     producer_metadata: Option<&ProducerMetadata>,
+    transactional_id: Option<&str>,
 ) -> Result<kafka_protocol::messages::produce_response::ProduceResponse> {
+    // Phase 10: Validate transaction state if transactional
+    if let Some(txn_id) = transactional_id {
+        if let Some(meta) = producer_metadata {
+            if meta.producer_id >= 0 {
+                store.validate_transaction(txn_id, meta.producer_id, meta.producer_epoch)?;
+
+                // Ensure transaction is in Ongoing state
+                let state = store.get_transaction_state(txn_id)?;
+                match state {
+                    Some(crate::kafka::storage::TransactionState::Ongoing) => {
+                        // Good, transaction is active
+                    }
+                    Some(other) => {
+                        return Err(crate::kafka::error::KafkaError::invalid_txn_state(
+                            txn_id,
+                            format!("{:?}", other),
+                            "Produce",
+                        ));
+                    }
+                    None => {
+                        return Err(crate::kafka::error::KafkaError::transactional_id_not_found(
+                            txn_id,
+                        ));
+                    }
+                }
+            }
+        }
+    }
     let mut kafka_response = crate::kafka::build_produce_response();
 
     // Process each topic
@@ -117,7 +153,27 @@ pub fn handle_produce(
 
             // Insert records (skip for duplicates)
             if should_insert {
-                match store.insert_records(topic_id, partition_index, &records) {
+                // Phase 10: Use transactional insert if transactional_id is set
+                let insert_result = if transactional_id.is_some() {
+                    if let Some(meta) = producer_metadata {
+                        store.insert_transactional_records(
+                            topic_id,
+                            partition_index,
+                            &records,
+                            meta.producer_id,
+                            meta.producer_epoch,
+                        )
+                    } else {
+                        // Transactional mode requires producer metadata
+                        Err(crate::kafka::error::KafkaError::Internal(
+                            "Transactional produce requires producer metadata".to_string(),
+                        ))
+                    }
+                } else {
+                    store.insert_records(topic_id, partition_index, &records)
+                };
+
+                match insert_result {
                     Ok(base_offset) => {
                         partition_response.error_code = ERROR_NONE;
                         partition_response.base_offset = base_offset;

@@ -8,9 +8,12 @@ use crate::kafka::constants::{
 };
 use crate::kafka::error::Result;
 use crate::kafka::messages::Record;
-use crate::kafka::storage::{CommittedOffset, FetchedMessage, KafkaStore, TopicMetadata};
+use crate::kafka::storage::{
+    CommittedOffset, FetchedMessage, IsolationLevel, KafkaStore, TopicMetadata, TransactionState,
+};
 use mockall::mock;
 use mockall::predicate::*;
+use std::time::Duration;
 
 // MockKafkaStore: Auto-generated mock for KafkaStore trait.
 // This allows setting expectations on storage operations without requiring
@@ -73,6 +76,66 @@ mock! {
             base_sequence: i32,
             record_count: i32,
         ) -> Result<bool>;
+        // Transaction Operations (Phase 10)
+        fn get_or_create_transactional_producer<'a>(
+            &self,
+            transactional_id: &'a str,
+            transaction_timeout_ms: i32,
+            client_id: Option<&'a str>,
+        ) -> Result<(i64, i16)>;
+        fn begin_transaction<'a>(
+            &self,
+            transactional_id: &'a str,
+            producer_id: i64,
+            producer_epoch: i16,
+        ) -> Result<()>;
+        fn validate_transaction<'a>(
+            &self,
+            transactional_id: &'a str,
+            producer_id: i64,
+            producer_epoch: i16,
+        ) -> Result<()>;
+        fn insert_transactional_records<'a>(
+            &self,
+            topic_id: i32,
+            partition_id: i32,
+            records: &'a [Record],
+            producer_id: i64,
+            producer_epoch: i16,
+        ) -> Result<i64>;
+        fn store_txn_pending_offset<'a>(
+            &self,
+            transactional_id: &'a str,
+            group_id: &'a str,
+            topic_id: i32,
+            partition_id: i32,
+            offset: i64,
+            metadata: Option<&'a str>,
+        ) -> Result<()>;
+        fn commit_transaction<'a>(
+            &self,
+            transactional_id: &'a str,
+            producer_id: i64,
+            producer_epoch: i16,
+        ) -> Result<()>;
+        fn abort_transaction<'a>(
+            &self,
+            transactional_id: &'a str,
+            producer_id: i64,
+            producer_epoch: i16,
+        ) -> Result<()>;
+        fn get_transaction_state<'a>(&self, transactional_id: &'a str) -> Result<Option<TransactionState>>;
+        fn fetch_records_with_isolation(
+            &self,
+            topic_id: i32,
+            partition_id: i32,
+            fetch_offset: i64,
+            max_bytes: i32,
+            isolation_level: IsolationLevel,
+        ) -> Result<Vec<FetchedMessage>>;
+        fn get_last_stable_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64>;
+        fn abort_timed_out_transactions(&self, timeout: Duration) -> Result<Vec<String>>;
+        fn cleanup_aborted_messages(&self, older_than: Duration) -> Result<u64>;
     }
 }
 

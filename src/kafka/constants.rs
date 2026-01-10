@@ -106,6 +106,26 @@ pub const API_KEY_DELETE_GROUPS: i16 = 42;
 /// Used to allocate producer IDs for idempotent/transactional producers
 pub const API_KEY_INIT_PRODUCER_ID: i16 = 22;
 
+/// API key for AddPartitionsToTxn requests (Phase 10)
+///
+/// Used to register partitions in an active transaction
+pub const API_KEY_ADD_PARTITIONS_TO_TXN: i16 = 24;
+
+/// API key for AddOffsetsToTxn requests (Phase 10)
+///
+/// Used to include consumer offset commits in a transaction
+pub const API_KEY_ADD_OFFSETS_TO_TXN: i16 = 25;
+
+/// API key for EndTxn requests (Phase 10)
+///
+/// Used to commit or abort a transaction
+pub const API_KEY_END_TXN: i16 = 26;
+
+/// API key for TxnOffsetCommit requests (Phase 10)
+///
+/// Used to commit offsets as part of a transaction
+pub const API_KEY_TXN_OFFSET_COMMIT: i16 = 28;
+
 // ===== Configuration Defaults =====
 
 /// Default Kafka protocol port
@@ -212,6 +232,10 @@ pub fn get_flexible_format_threshold(api_key: i16) -> Option<i16> {
         API_KEY_CREATE_PARTITIONS => Some(2),
         API_KEY_DELETE_GROUPS => Some(2),
         API_KEY_INIT_PRODUCER_ID => Some(2), // InitProducerId v2+ uses flexible format
+        API_KEY_ADD_PARTITIONS_TO_TXN => Some(3), // AddPartitionsToTxn v3+ uses flexible format
+        API_KEY_ADD_OFFSETS_TO_TXN => Some(3), // AddOffsetsToTxn v3+ uses flexible format
+        API_KEY_END_TXN => Some(3),          // EndTxn v3+ uses flexible format
+        API_KEY_TXN_OFFSET_COMMIT => Some(3), // TxnOffsetCommit v3+ uses flexible format
         _ => None,                           // Unknown API keys default to v0
     }
 }
@@ -312,6 +336,20 @@ pub const ERROR_PRODUCER_FENCED: i16 = 91;
 
 /// Unknown producer ID (producer ID not found)
 pub const ERROR_UNKNOWN_PRODUCER_ID: i16 = 59;
+
+// ===== Transaction Error Codes (Phase 10) =====
+
+/// Concurrent transactions (producer has another active transaction)
+pub const ERROR_CONCURRENT_TRANSACTIONS: i16 = 53;
+
+/// Transactional ID not found
+pub const ERROR_TRANSACTIONAL_ID_NOT_FOUND: i16 = 79;
+
+/// Invalid transaction state (invalid state transition)
+pub const ERROR_INVALID_TXN_STATE: i16 = 90;
+
+/// Transaction timed out
+pub const ERROR_TRANSACTION_TIMED_OUT: i16 = 94;
 
 // ===== Compression =====
 

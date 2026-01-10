@@ -261,6 +261,55 @@ pub fn encode_response(response: KafkaResponse) -> Result<BytesMut> {
             body
         ),
 
+        // Phase 10: Transaction API responses
+        KafkaResponse::AddPartitionsToTxn {
+            correlation_id,
+            api_version,
+            response: body,
+        } => encode_standard_response!(
+            &mut response_buf,
+            correlation_id,
+            api_version,
+            crate::kafka::constants::API_KEY_ADD_PARTITIONS_TO_TXN,
+            body
+        ),
+
+        KafkaResponse::AddOffsetsToTxn {
+            correlation_id,
+            api_version,
+            response: body,
+        } => encode_standard_response!(
+            &mut response_buf,
+            correlation_id,
+            api_version,
+            crate::kafka::constants::API_KEY_ADD_OFFSETS_TO_TXN,
+            body
+        ),
+
+        KafkaResponse::EndTxn {
+            correlation_id,
+            api_version,
+            response: body,
+        } => encode_standard_response!(
+            &mut response_buf,
+            correlation_id,
+            api_version,
+            crate::kafka::constants::API_KEY_END_TXN,
+            body
+        ),
+
+        KafkaResponse::TxnOffsetCommit {
+            correlation_id,
+            api_version,
+            response: body,
+        } => encode_standard_response!(
+            &mut response_buf,
+            correlation_id,
+            api_version,
+            crate::kafka::constants::API_KEY_TXN_OFFSET_COMMIT,
+            body
+        ),
+
         KafkaResponse::Error {
             correlation_id,
             error_code,

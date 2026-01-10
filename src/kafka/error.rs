@@ -17,11 +17,13 @@
 use thiserror::Error;
 
 use crate::kafka::constants::{
-    ERROR_COORDINATOR_NOT_AVAILABLE, ERROR_CORRUPT_MESSAGE, ERROR_DUPLICATE_SEQUENCE_NUMBER,
-    ERROR_ILLEGAL_GENERATION, ERROR_INVALID_PARTITIONS, ERROR_NOT_COORDINATOR,
-    ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER, ERROR_PRODUCER_FENCED, ERROR_REBALANCE_IN_PROGRESS,
-    ERROR_UNKNOWN_MEMBER_ID, ERROR_UNKNOWN_PRODUCER_ID, ERROR_UNKNOWN_SERVER_ERROR,
-    ERROR_UNKNOWN_TOPIC_OR_PARTITION, ERROR_UNSUPPORTED_VERSION, MAX_REQUEST_SIZE,
+    ERROR_CONCURRENT_TRANSACTIONS, ERROR_COORDINATOR_NOT_AVAILABLE, ERROR_CORRUPT_MESSAGE,
+    ERROR_DUPLICATE_SEQUENCE_NUMBER, ERROR_ILLEGAL_GENERATION, ERROR_INVALID_PARTITIONS,
+    ERROR_INVALID_TXN_STATE, ERROR_NOT_COORDINATOR, ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER,
+    ERROR_PRODUCER_FENCED, ERROR_REBALANCE_IN_PROGRESS, ERROR_TRANSACTIONAL_ID_NOT_FOUND,
+    ERROR_TRANSACTION_TIMED_OUT, ERROR_UNKNOWN_MEMBER_ID, ERROR_UNKNOWN_PRODUCER_ID,
+    ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION, ERROR_UNSUPPORTED_VERSION,
+    MAX_REQUEST_SIZE,
 };
 
 /// Errors that can occur during Kafka protocol operations
@@ -120,6 +122,30 @@ pub enum KafkaError {
     #[error("Unknown producer ID: {producer_id}")]
     UnknownProducerId { producer_id: i64 },
 
+    // ===== Transaction Errors (Phase 10) =====
+    /// Transactional ID not found
+    #[error("Transactional ID not found: {transactional_id}")]
+    TransactionalIdNotFound { transactional_id: String },
+
+    /// Invalid transaction state transition
+    #[error("Invalid transaction state: {transactional_id} is in state {current_state}, cannot perform {operation}")]
+    InvalidTxnState {
+        transactional_id: String,
+        current_state: String,
+        operation: String,
+    },
+
+    /// Concurrent transactions (producer has another active transaction)
+    #[error("Concurrent transactions not allowed for producer {producer_id}")]
+    ConcurrentTransactions { producer_id: i64 },
+
+    /// Transaction timed out
+    #[error("Transaction timed out: {transactional_id} exceeded {timeout_ms}ms")]
+    TransactionTimedOut {
+        transactional_id: String,
+        timeout_ms: i32,
+    },
+
     // ===== Storage/Database Errors =====
     /// Database operation failed
     #[error("Database error: {message}")]
@@ -189,6 +215,12 @@ impl KafkaError {
             KafkaError::OutOfOrderSequence { .. } => ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER,
             KafkaError::ProducerFenced { .. } => ERROR_PRODUCER_FENCED,
             KafkaError::UnknownProducerId { .. } => ERROR_UNKNOWN_PRODUCER_ID,
+
+            // Transaction errors → specific codes
+            KafkaError::TransactionalIdNotFound { .. } => ERROR_TRANSACTIONAL_ID_NOT_FOUND,
+            KafkaError::InvalidTxnState { .. } => ERROR_INVALID_TXN_STATE,
+            KafkaError::ConcurrentTransactions { .. } => ERROR_CONCURRENT_TRANSACTIONS,
+            KafkaError::TransactionTimedOut { .. } => ERROR_TRANSACTION_TIMED_OUT,
 
             // Storage/Schema errors → UNKNOWN_SERVER_ERROR
             KafkaError::Database { .. } => ERROR_UNKNOWN_SERVER_ERROR,
@@ -321,6 +353,39 @@ impl KafkaError {
     /// Create an unknown producer ID error (Phase 9)
     pub fn unknown_producer_id(producer_id: i64) -> Self {
         KafkaError::UnknownProducerId { producer_id }
+    }
+
+    /// Create a transactional ID not found error (Phase 10)
+    pub fn transactional_id_not_found(transactional_id: impl Into<String>) -> Self {
+        KafkaError::TransactionalIdNotFound {
+            transactional_id: transactional_id.into(),
+        }
+    }
+
+    /// Create an invalid transaction state error (Phase 10)
+    pub fn invalid_txn_state(
+        transactional_id: impl Into<String>,
+        current_state: impl Into<String>,
+        operation: impl Into<String>,
+    ) -> Self {
+        KafkaError::InvalidTxnState {
+            transactional_id: transactional_id.into(),
+            current_state: current_state.into(),
+            operation: operation.into(),
+        }
+    }
+
+    /// Create a concurrent transactions error (Phase 10)
+    pub fn concurrent_transactions(producer_id: i64) -> Self {
+        KafkaError::ConcurrentTransactions { producer_id }
+    }
+
+    /// Create a transaction timed out error (Phase 10)
+    pub fn transaction_timed_out(transactional_id: impl Into<String>, timeout_ms: i32) -> Self {
+        KafkaError::TransactionTimedOut {
+            transactional_id: transactional_id.into(),
+            timeout_ms,
+        }
     }
 }
 
@@ -474,5 +539,32 @@ mod tests {
 
         let err = KafkaError::UnsupportedApiKey(42);
         assert!(matches!(err, KafkaError::UnsupportedApiKey { api_key: 42 }));
+    }
+
+    #[test]
+    fn test_transaction_errors() {
+        // TransactionalIdNotFound
+        let err = KafkaError::transactional_id_not_found("my-txn-id");
+        assert_eq!(err.to_kafka_error_code(), ERROR_TRANSACTIONAL_ID_NOT_FOUND);
+        assert!(!err.is_server_error());
+
+        // InvalidTxnState
+        let err = KafkaError::invalid_txn_state("my-txn-id", "Empty", "EndTxn");
+        assert_eq!(err.to_kafka_error_code(), ERROR_INVALID_TXN_STATE);
+        let msg = format!("{}", err);
+        assert!(msg.contains("my-txn-id"));
+        assert!(msg.contains("Empty"));
+        assert!(msg.contains("EndTxn"));
+
+        // ConcurrentTransactions
+        let err = KafkaError::concurrent_transactions(12345);
+        assert_eq!(err.to_kafka_error_code(), ERROR_CONCURRENT_TRANSACTIONS);
+
+        // TransactionTimedOut
+        let err = KafkaError::transaction_timed_out("my-txn-id", 60000);
+        assert_eq!(err.to_kafka_error_code(), ERROR_TRANSACTION_TIMED_OUT);
+        let msg = format!("{}", err);
+        assert!(msg.contains("my-txn-id"));
+        assert!(msg.contains("60000"));
     }
 }

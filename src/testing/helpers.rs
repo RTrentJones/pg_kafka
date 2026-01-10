@@ -187,6 +187,7 @@ pub fn mock_produce_request(
         acks: 1,        // Wait for leader acknowledgment
         timeout_ms: 5000,
         topic_data: vec![topic_data],
+        transactional_id: None, // Non-transactional for tests
         response_tx,
     };
 

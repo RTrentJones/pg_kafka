@@ -155,6 +155,36 @@ pub fn build_api_versions_response() -> ApiVersionsResponse {
     av19.max_version = 4;
     response.api_keys.push(av19);
 
+    // ===== Phase 10: Transaction APIs =====
+
+    // AddPartitionsToTxn (API_KEY_ADD_PARTITIONS_TO_TXN): versions 0-3
+    let mut av20 = ApiVersion::default();
+    av20.api_key = API_KEY_ADD_PARTITIONS_TO_TXN;
+    av20.min_version = 0;
+    av20.max_version = 3;
+    response.api_keys.push(av20);
+
+    // AddOffsetsToTxn (API_KEY_ADD_OFFSETS_TO_TXN): versions 0-3
+    let mut av21 = ApiVersion::default();
+    av21.api_key = API_KEY_ADD_OFFSETS_TO_TXN;
+    av21.min_version = 0;
+    av21.max_version = 3;
+    response.api_keys.push(av21);
+
+    // EndTxn (API_KEY_END_TXN): versions 0-3
+    let mut av22 = ApiVersion::default();
+    av22.api_key = API_KEY_END_TXN;
+    av22.min_version = 0;
+    av22.max_version = 3;
+    response.api_keys.push(av22);
+
+    // TxnOffsetCommit (API_KEY_TXN_OFFSET_COMMIT): versions 0-3
+    let mut av23 = ApiVersion::default();
+    av23.api_key = API_KEY_TXN_OFFSET_COMMIT;
+    av23.min_version = 0;
+    av23.max_version = 3;
+    response.api_keys.push(av23);
+
     response
 }
 

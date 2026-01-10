@@ -169,3 +169,61 @@ pub fn get_poll_timeout() -> Duration {
         .map(Duration::from_millis)
         .unwrap_or(POLL_TIMEOUT)
 }
+
+// ========== Transaction Support (Phase 10) ==========
+
+/// Create a transactional Kafka producer
+///
+/// Transactional producers enable exactly-once semantics by:
+/// - Atomic writes across multiple partitions
+/// - Integration with consumer offset commits
+pub fn create_transactional_producer(
+    transactional_id: &str,
+) -> Result<FutureProducer, Box<dyn std::error::Error>> {
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", get_bootstrap_servers())
+        .set("broker.address.family", "v4")
+        .set("message.timeout.ms", "5000")
+        .set("transactional.id", transactional_id)
+        .set("enable.idempotence", "true") // Required for transactions
+        .create()?;
+
+    Ok(producer)
+}
+
+/// Create a consumer with read_committed isolation level
+///
+/// This consumer only sees committed transactional messages,
+/// filtering out pending and aborted transactions.
+pub fn create_read_committed_consumer(
+    group_id: &str,
+) -> Result<BaseConsumer, Box<dyn std::error::Error>> {
+    let consumer: BaseConsumer = ClientConfig::new()
+        .set("bootstrap.servers", get_bootstrap_servers())
+        .set("broker.address.family", "v4")
+        .set("group.id", group_id)
+        .set("isolation.level", "read_committed")
+        .set("enable.auto.commit", "false")
+        .set("auto.offset.reset", "earliest")
+        .create()?;
+
+    Ok(consumer)
+}
+
+/// Create a consumer with read_uncommitted isolation level (default)
+///
+/// This consumer sees all messages including pending transactions.
+pub fn create_read_uncommitted_consumer(
+    group_id: &str,
+) -> Result<BaseConsumer, Box<dyn std::error::Error>> {
+    let consumer: BaseConsumer = ClientConfig::new()
+        .set("bootstrap.servers", get_bootstrap_servers())
+        .set("broker.address.family", "v4")
+        .set("group.id", group_id)
+        .set("isolation.level", "read_uncommitted")
+        .set("enable.auto.commit", "false")
+        .set("auto.offset.reset", "earliest")
+        .create()?;
+
+    Ok(consumer)
+}

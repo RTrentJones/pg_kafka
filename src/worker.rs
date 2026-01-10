@@ -571,6 +571,7 @@ pub fn process_request(
             api_version,
             acks,
             topic_data,
+            transactional_id,
             response_tx,
             ..
         } => {
@@ -589,8 +590,15 @@ pub fn process_request(
                 // Phase 9 Note: For acks=0 (fire-and-forget), we intentionally skip idempotency validation
                 // by passing None for producer_metadata. There's no delivery guarantee anyway, so
                 // enforcing sequence validation would be misleading and waste resources.
-                match handlers::handle_produce(&store, topic_data.clone(), default_partitions, None)
-                {
+                // Phase 10 Note: We also skip transactional support for acks=0 since there's no
+                // guarantee of delivery - transactions require acks >= 1 for meaningful guarantees.
+                match handlers::handle_produce(
+                    &store,
+                    topic_data.clone(),
+                    default_partitions,
+                    None,
+                    None,
+                ) {
                     Ok(response) => {
                         // Send notifications for long-polling consumers
                         for topic_response in &response.responses {
@@ -629,11 +637,13 @@ pub fn process_request(
             // Phase 9: Extract producer metadata for idempotent producer validation
             // This enables sequence checking, deduplication, and producer fencing
             let producer_metadata = extract_producer_metadata(&topic_data);
+            // Phase 10: Pass transactional_id for transactional producers
             match handlers::handle_produce(
                 &store,
                 topic_data,
                 default_partitions,
                 producer_metadata.as_ref(),
+                transactional_id.as_deref(),
             ) {
                 Ok(response) => {
                     // Send notifications for each successfully produced partition
@@ -690,13 +700,21 @@ pub fn process_request(
             correlation_id,
             api_version,
             topic_data,
+            isolation_level,
             response_tx,
             ..
         } => {
+            // Phase 10: Convert i8 isolation_level to IsolationLevel enum
+            let isolation = if isolation_level == 1 {
+                crate::kafka::storage::IsolationLevel::ReadCommitted
+            } else {
+                crate::kafka::storage::IsolationLevel::ReadUncommitted
+            };
+
             dispatch_response(
                 "Fetch",
                 response_tx,
-                || handlers::handle_fetch(&store, topic_data, compression),
+                || handlers::handle_fetch(&store, topic_data, compression, isolation),
                 |r| KafkaResponse::Fetch {
                     correlation_id,
                     api_version,
@@ -1139,16 +1157,16 @@ pub fn process_request(
             );
         }
 
-        // ===== InitProducerId (Phase 9) =====
+        // ===== InitProducerId (Phase 9, extended in Phase 10) =====
         crate::kafka::KafkaRequest::InitProducerId {
             correlation_id,
             api_version,
             transactional_id,
+            transaction_timeout_ms,
             producer_id: existing_producer_id,
             producer_epoch: existing_epoch,
             client_id,
             response_tx,
-            ..
         } => {
             dispatch_response(
                 "InitProducerId",
@@ -1157,6 +1175,7 @@ pub fn process_request(
                     handlers::handle_init_producer_id(
                         &store,
                         transactional_id,
+                        transaction_timeout_ms,
                         existing_producer_id,
                         existing_epoch,
                         client_id.as_deref(),
@@ -1174,6 +1193,171 @@ pub fn process_request(
                         crate::kafka::response_builders::build_init_producer_id_error_response(
                             error_code,
                         ),
+                },
+            );
+        }
+
+        // ===== Phase 10: Transaction APIs =====
+        crate::kafka::KafkaRequest::AddPartitionsToTxn {
+            correlation_id,
+            api_version,
+            transactional_id,
+            producer_id,
+            producer_epoch,
+            topics,
+            response_tx,
+            ..
+        } => {
+            dispatch_response(
+                "AddPartitionsToTxn",
+                response_tx,
+                || {
+                    handlers::handle_add_partitions_to_txn(
+                        &store,
+                        &transactional_id,
+                        producer_id,
+                        producer_epoch,
+                        topics,
+                    )
+                },
+                |r| KafkaResponse::AddPartitionsToTxn {
+                    correlation_id,
+                    api_version,
+                    response: r,
+                },
+                |error_code| {
+                    let mut response = kafka_protocol::messages::add_partitions_to_txn_response::AddPartitionsToTxnResponse::default();
+                    response.throttle_time_ms = 0;
+                    response.error_code = error_code;
+                    KafkaResponse::AddPartitionsToTxn {
+                        correlation_id,
+                        api_version,
+                        response,
+                    }
+                },
+            );
+        }
+
+        crate::kafka::KafkaRequest::AddOffsetsToTxn {
+            correlation_id,
+            api_version,
+            transactional_id,
+            producer_id,
+            producer_epoch,
+            group_id,
+            response_tx,
+            ..
+        } => {
+            dispatch_response(
+                "AddOffsetsToTxn",
+                response_tx,
+                || {
+                    handlers::handle_add_offsets_to_txn(
+                        &store,
+                        &transactional_id,
+                        producer_id,
+                        producer_epoch,
+                        &group_id,
+                    )
+                },
+                |r| KafkaResponse::AddOffsetsToTxn {
+                    correlation_id,
+                    api_version,
+                    response: r,
+                },
+                |error_code| {
+                    let mut response = kafka_protocol::messages::add_offsets_to_txn_response::AddOffsetsToTxnResponse::default();
+                    response.throttle_time_ms = 0;
+                    response.error_code = error_code;
+                    KafkaResponse::AddOffsetsToTxn {
+                        correlation_id,
+                        api_version,
+                        response,
+                    }
+                },
+            );
+        }
+
+        crate::kafka::KafkaRequest::EndTxn {
+            correlation_id,
+            api_version,
+            transactional_id,
+            producer_id,
+            producer_epoch,
+            committed,
+            response_tx,
+            ..
+        } => {
+            dispatch_response(
+                "EndTxn",
+                response_tx,
+                || {
+                    handlers::handle_end_txn(
+                        &store,
+                        &transactional_id,
+                        producer_id,
+                        producer_epoch,
+                        committed,
+                    )
+                },
+                |r| KafkaResponse::EndTxn {
+                    correlation_id,
+                    api_version,
+                    response: r,
+                },
+                |error_code| {
+                    let mut response =
+                        kafka_protocol::messages::end_txn_response::EndTxnResponse::default();
+                    response.throttle_time_ms = 0;
+                    response.error_code = error_code;
+                    KafkaResponse::EndTxn {
+                        correlation_id,
+                        api_version,
+                        response,
+                    }
+                },
+            );
+        }
+
+        crate::kafka::KafkaRequest::TxnOffsetCommit {
+            correlation_id,
+            api_version,
+            transactional_id,
+            group_id,
+            producer_id,
+            producer_epoch,
+            topics,
+            response_tx,
+            ..
+        } => {
+            dispatch_response(
+                "TxnOffsetCommit",
+                response_tx,
+                || {
+                    handlers::handle_txn_offset_commit(
+                        &store,
+                        &transactional_id,
+                        producer_id,
+                        producer_epoch,
+                        &group_id,
+                        topics,
+                    )
+                },
+                |r| KafkaResponse::TxnOffsetCommit {
+                    correlation_id,
+                    api_version,
+                    response: r,
+                },
+                |_error_code| {
+                    // Note: TxnOffsetCommit doesn't have a top-level error_code field,
+                    // errors are per-partition. For simplicity, return an empty response.
+                    let mut response = kafka_protocol::messages::txn_offset_commit_response::TxnOffsetCommitResponse::default();
+                    response.throttle_time_ms = 0;
+                    KafkaResponse::TxnOffsetCommit {
+                        correlation_id,
+                        api_version,
+                        response,
+                    }
                 },
             );
         }

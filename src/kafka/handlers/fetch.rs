@@ -2,11 +2,12 @@
 //
 // Handlers for FetchRequest and ListOffsetsRequest.
 // These are read-focused APIs for consuming messages from topics.
+// Phase 10: Added isolation_level support for transactional reads.
 
 use super::helpers::{resolve_topic_id, topic_resolution_error_code, TopicResolution};
 use crate::kafka::constants::{ERROR_NONE, ERROR_UNSUPPORTED_VERSION};
 use crate::kafka::error::Result;
-use crate::kafka::storage::KafkaStore;
+use crate::kafka::storage::{IsolationLevel, KafkaStore};
 use kafka_protocol::messages::TopicName;
 use kafka_protocol::protocol::StrBytes;
 use kafka_protocol::records::Compression;
@@ -15,10 +16,18 @@ use kafka_protocol::records::Compression;
 ///
 /// Fetches messages from storage and encodes them as Kafka RecordBatch.
 /// The compression parameter controls the encoding compression for the response.
+///
+/// Phase 10: Added isolation_level support:
+/// - ReadUncommitted (0): Returns all messages including pending transactions
+/// - ReadCommitted (1): Only returns committed messages (skips pending/aborted)
+///
+/// For ReadCommitted consumers, last_stable_offset (LSO) indicates the lowest
+/// offset of any pending transaction. Consumers can safely process up to LSO.
 pub fn handle_fetch(
     store: &impl KafkaStore,
     topic_data: Vec<crate::kafka::messages::TopicFetchData>,
     compression: Compression,
+    isolation_level: IsolationLevel,
 ) -> Result<kafka_protocol::messages::fetch_response::FetchResponse> {
     use kafka_protocol::messages::fetch_response::{
         FetchResponse, FetchableTopicResponse, PartitionData,
@@ -62,34 +71,49 @@ pub fn handle_fetch(
             let max_bytes = partition_fetch.partition_max_bytes;
 
             // Fetch messages from storage
-            let db_records =
-                match store.fetch_records(topic_id, partition_id, fetch_offset, max_bytes) {
-                    Ok(records) => records,
-                    Err(e) => {
-                        // Use typed error's Kafka error code for proper protocol response
-                        let error_code = e.to_kafka_error_code();
-                        if e.is_server_error() {
-                            crate::pg_warning!(
+            // Phase 10: Use isolation-aware fetch for transactional reads
+            let db_records = match store.fetch_records_with_isolation(
+                topic_id,
+                partition_id,
+                fetch_offset,
+                max_bytes,
+                isolation_level,
+            ) {
+                Ok(records) => records,
+                Err(e) => {
+                    // Use typed error's Kafka error code for proper protocol response
+                    let error_code = e.to_kafka_error_code();
+                    if e.is_server_error() {
+                        crate::pg_warning!(
                             "Failed to fetch records for topic_id={}, partition={}, offset={}: {}",
                             topic_id,
                             partition_id,
                             fetch_offset,
                             e
                         );
-                        }
-                        let mut partition_data = PartitionData::default();
-                        partition_data.partition_index = partition_id;
-                        partition_data.error_code = error_code;
-                        partition_data.high_watermark = -1;
-                        partition_responses.push(partition_data);
-                        continue;
                     }
-                };
+                    let mut partition_data = PartitionData::default();
+                    partition_data.partition_index = partition_id;
+                    partition_data.error_code = error_code;
+                    partition_data.high_watermark = -1;
+                    partition_responses.push(partition_data);
+                    continue;
+                }
+            };
 
             // Get high watermark
             let high_watermark = store
                 .get_high_watermark(topic_id, partition_id)
                 .unwrap_or(0);
+
+            // Phase 10: Get last stable offset for ReadCommitted consumers
+            // LSO is the lowest offset of any pending transaction, or HWM if none pending
+            let last_stable_offset = match isolation_level {
+                IsolationLevel::ReadCommitted => store
+                    .get_last_stable_offset(topic_id, partition_id)
+                    .unwrap_or(high_watermark),
+                IsolationLevel::ReadUncommitted => high_watermark,
+            };
 
             // Convert database records to Kafka RecordBatch format
             let records_bytes = if !db_records.is_empty() {
@@ -142,7 +166,7 @@ pub fn handle_fetch(
             partition_data.partition_index = partition_id;
             partition_data.error_code = ERROR_NONE;
             partition_data.high_watermark = high_watermark;
-            partition_data.last_stable_offset = high_watermark;
+            partition_data.last_stable_offset = last_stable_offset;
             partition_data.log_start_offset = 0;
             partition_data.records = records_bytes;
             partition_responses.push(partition_data);

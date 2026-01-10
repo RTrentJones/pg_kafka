@@ -17,7 +17,7 @@ use tracing::{debug, warn};
 
 use super::super::constants::*;
 use super::super::error::{KafkaError, Result};
-use super::super::messages::KafkaRequest;
+use super::super::messages::{KafkaRequest, TxnOffsetCommitTopics};
 use super::recordbatch::{parse_record_batch_with_metadata, ParsedRecordBatch};
 
 /// Parse a Kafka request from a frame
@@ -191,6 +191,34 @@ pub fn parse_request(
             api_version,
             response_tx,
         ),
+        API_KEY_ADD_PARTITIONS_TO_TXN => parse_add_partitions_to_txn(
+            &mut payload_buf,
+            correlation_id,
+            client_id,
+            api_version,
+            response_tx,
+        ),
+        API_KEY_ADD_OFFSETS_TO_TXN => parse_add_offsets_to_txn(
+            &mut payload_buf,
+            correlation_id,
+            client_id,
+            api_version,
+            response_tx,
+        ),
+        API_KEY_END_TXN => parse_end_txn(
+            &mut payload_buf,
+            correlation_id,
+            client_id,
+            api_version,
+            response_tx,
+        ),
+        API_KEY_TXN_OFFSET_COMMIT => parse_txn_offset_commit(
+            &mut payload_buf,
+            correlation_id,
+            client_id,
+            api_version,
+            response_tx,
+        ),
         _ => {
             // Unsupported API
             warn!("Unsupported API key: {}", api_key);
@@ -315,11 +343,14 @@ fn parse_produce(
 
     let acks = produce_req.acks;
     let timeout_ms = produce_req.timeout_ms;
+    // Phase 10: Extract transactional_id for transactional producers (v3+)
+    let transactional_id = produce_req.transactional_id.map(|s| s.to_string());
 
     debug!(
-        "ProduceRequest: acks={}, timeout_ms={}, topics={}",
+        "ProduceRequest: acks={}, timeout_ms={}, transactional_id={:?}, topics={}",
         acks,
         timeout_ms,
+        transactional_id,
         produce_req.topic_data.len()
     );
 
@@ -384,6 +415,7 @@ fn parse_produce(
         acks,
         timeout_ms,
         topic_data,
+        transactional_id,
         response_tx,
     }))
 }
@@ -417,12 +449,15 @@ fn parse_fetch(
     let max_wait_ms = fetch_req.max_wait_ms;
     let min_bytes = fetch_req.min_bytes;
     let max_bytes = fetch_req.max_bytes;
+    // Phase 10: Extract isolation_level (v4+, defaults to 0 for older versions)
+    let isolation_level = fetch_req.isolation_level;
 
     debug!(
-        "FetchRequest: max_wait_ms={}, min_bytes={}, max_bytes={}, topics={}",
+        "FetchRequest: max_wait_ms={}, min_bytes={}, max_bytes={}, isolation_level={}, topics={}",
         max_wait_ms,
         min_bytes,
         max_bytes,
+        isolation_level,
         fetch_req.topics.len()
     );
 
@@ -458,6 +493,7 @@ fn parse_fetch(
         max_wait_ms,
         min_bytes,
         max_bytes,
+        isolation_level,
         topic_data,
         response_tx,
     }))
@@ -1242,6 +1278,275 @@ fn parse_init_producer_id(
         transaction_timeout_ms,
         producer_id,
         producer_epoch,
+        response_tx,
+    }))
+}
+
+// ===== Phase 10: Transaction API Parsing =====
+
+fn parse_add_partitions_to_txn(
+    payload_buf: &mut BytesMut,
+    correlation_id: i32,
+    client_id: Option<String>,
+    api_version: i16,
+    response_tx: tokio::sync::mpsc::UnboundedSender<super::super::messages::KafkaResponse>,
+) -> Result<Option<KafkaRequest>> {
+    debug!(
+        "Parsing AddPartitionsToTxn request (api_key={}, version={})",
+        API_KEY_ADD_PARTITIONS_TO_TXN, api_version
+    );
+
+    let req = match kafka_protocol::messages::add_partitions_to_txn_request::AddPartitionsToTxnRequest::decode(
+        payload_buf,
+        api_version,
+    ) {
+        Ok(req) => req,
+        Err(e) => {
+            warn!("Failed to decode AddPartitionsToTxnRequest: {}", e);
+            let error_response = super::super::messages::KafkaResponse::Error {
+                correlation_id,
+                error_code: ERROR_CORRUPT_MESSAGE,
+                error_message: Some(format!("Malformed AddPartitionsToTxnRequest: {}", e)),
+            };
+            let _ = response_tx.send(error_response);
+            return Ok(None);
+        }
+    };
+
+    // Handle both v3 and below (single transaction) and v4+ (batch transactions) formats
+    // v4+ introduced batching multiple transactions in one request, but we extract the first one
+    let (transactional_id, producer_id, producer_epoch, topics) = if api_version >= 4 {
+        // v4+: Use transactions field (array of batched transactions)
+        // For now, we only support single transaction per request (extract first)
+        if let Some(first_txn) = req.transactions.first() {
+            let txn_id = first_txn.transactional_id.to_string();
+            let pid = first_txn.producer_id.0;
+            let epoch = first_txn.producer_epoch;
+            let topics_data: Vec<(String, Vec<i32>)> = first_txn
+                .topics
+                .iter()
+                .map(|t| {
+                    let topic_name = t.name.to_string();
+                    let partition_ids: Vec<i32> = t.partitions.to_vec();
+                    (topic_name, partition_ids)
+                })
+                .collect();
+            (txn_id, pid, epoch, topics_data)
+        } else {
+            warn!("AddPartitionsToTxn v4+ with empty transactions array");
+            let error_response = super::super::messages::KafkaResponse::Error {
+                correlation_id,
+                error_code: ERROR_CORRUPT_MESSAGE,
+                error_message: Some("Empty transactions array".to_string()),
+            };
+            let _ = response_tx.send(error_response);
+            return Ok(None);
+        }
+    } else {
+        // v0-v3: Use v3_and_below fields (single transaction)
+        let txn_id = req.v3_and_below_transactional_id.to_string();
+        let pid = req.v3_and_below_producer_id.0;
+        let epoch = req.v3_and_below_producer_epoch;
+        let topics_data: Vec<(String, Vec<i32>)> = req
+            .v3_and_below_topics
+            .iter()
+            .map(|t| {
+                let topic_name = t.name.to_string();
+                let partition_ids: Vec<i32> = t.partitions.to_vec();
+                (topic_name, partition_ids)
+            })
+            .collect();
+        (txn_id, pid, epoch, topics_data)
+    };
+
+    debug!(
+        "AddPartitionsToTxnRequest: transactional_id={}, producer_id={}, topics={:?}",
+        transactional_id, producer_id, topics
+    );
+
+    Ok(Some(KafkaRequest::AddPartitionsToTxn {
+        correlation_id,
+        client_id,
+        api_version,
+        transactional_id,
+        producer_id,
+        producer_epoch,
+        topics,
+        response_tx,
+    }))
+}
+
+fn parse_add_offsets_to_txn(
+    payload_buf: &mut BytesMut,
+    correlation_id: i32,
+    client_id: Option<String>,
+    api_version: i16,
+    response_tx: tokio::sync::mpsc::UnboundedSender<super::super::messages::KafkaResponse>,
+) -> Result<Option<KafkaRequest>> {
+    debug!(
+        "Parsing AddOffsetsToTxn request (api_key={}, version={})",
+        API_KEY_ADD_OFFSETS_TO_TXN, api_version
+    );
+
+    let req =
+        match kafka_protocol::messages::add_offsets_to_txn_request::AddOffsetsToTxnRequest::decode(
+            payload_buf,
+            api_version,
+        ) {
+            Ok(req) => req,
+            Err(e) => {
+                warn!("Failed to decode AddOffsetsToTxnRequest: {}", e);
+                let error_response = super::super::messages::KafkaResponse::Error {
+                    correlation_id,
+                    error_code: ERROR_CORRUPT_MESSAGE,
+                    error_message: Some(format!("Malformed AddOffsetsToTxnRequest: {}", e)),
+                };
+                let _ = response_tx.send(error_response);
+                return Ok(None);
+            }
+        };
+
+    let transactional_id = req.transactional_id.to_string();
+    let producer_id = req.producer_id.0;
+    let producer_epoch = req.producer_epoch;
+    let group_id = req.group_id.to_string();
+
+    debug!(
+        "AddOffsetsToTxnRequest: transactional_id={}, producer_id={}, group_id={}",
+        transactional_id, producer_id, group_id
+    );
+
+    Ok(Some(KafkaRequest::AddOffsetsToTxn {
+        correlation_id,
+        client_id,
+        api_version,
+        transactional_id,
+        producer_id,
+        producer_epoch,
+        group_id,
+        response_tx,
+    }))
+}
+
+fn parse_end_txn(
+    payload_buf: &mut BytesMut,
+    correlation_id: i32,
+    client_id: Option<String>,
+    api_version: i16,
+    response_tx: tokio::sync::mpsc::UnboundedSender<super::super::messages::KafkaResponse>,
+) -> Result<Option<KafkaRequest>> {
+    debug!(
+        "Parsing EndTxn request (api_key={}, version={})",
+        API_KEY_END_TXN, api_version
+    );
+
+    let req = match kafka_protocol::messages::end_txn_request::EndTxnRequest::decode(
+        payload_buf,
+        api_version,
+    ) {
+        Ok(req) => req,
+        Err(e) => {
+            warn!("Failed to decode EndTxnRequest: {}", e);
+            let error_response = super::super::messages::KafkaResponse::Error {
+                correlation_id,
+                error_code: ERROR_CORRUPT_MESSAGE,
+                error_message: Some(format!("Malformed EndTxnRequest: {}", e)),
+            };
+            let _ = response_tx.send(error_response);
+            return Ok(None);
+        }
+    };
+
+    let transactional_id = req.transactional_id.to_string();
+    let producer_id = req.producer_id.0;
+    let producer_epoch = req.producer_epoch;
+    let committed = req.committed;
+
+    debug!(
+        "EndTxnRequest: transactional_id={}, producer_id={}, committed={}",
+        transactional_id, producer_id, committed
+    );
+
+    Ok(Some(KafkaRequest::EndTxn {
+        correlation_id,
+        client_id,
+        api_version,
+        transactional_id,
+        producer_id,
+        producer_epoch,
+        committed,
+        response_tx,
+    }))
+}
+
+fn parse_txn_offset_commit(
+    payload_buf: &mut BytesMut,
+    correlation_id: i32,
+    client_id: Option<String>,
+    api_version: i16,
+    response_tx: tokio::sync::mpsc::UnboundedSender<super::super::messages::KafkaResponse>,
+) -> Result<Option<KafkaRequest>> {
+    debug!(
+        "Parsing TxnOffsetCommit request (api_key={}, version={})",
+        API_KEY_TXN_OFFSET_COMMIT, api_version
+    );
+
+    let req =
+        match kafka_protocol::messages::txn_offset_commit_request::TxnOffsetCommitRequest::decode(
+            payload_buf,
+            api_version,
+        ) {
+            Ok(req) => req,
+            Err(e) => {
+                warn!("Failed to decode TxnOffsetCommitRequest: {}", e);
+                let error_response = super::super::messages::KafkaResponse::Error {
+                    correlation_id,
+                    error_code: ERROR_CORRUPT_MESSAGE,
+                    error_message: Some(format!("Malformed TxnOffsetCommitRequest: {}", e)),
+                };
+                let _ = response_tx.send(error_response);
+                return Ok(None);
+            }
+        };
+
+    let transactional_id = req.transactional_id.to_string();
+    let group_id = req.group_id.to_string();
+    let producer_id = req.producer_id.0;
+    let producer_epoch = req.producer_epoch;
+
+    // Convert topics to (topic_name, partitions) format
+    // where partitions is Vec<(partition_id, offset, metadata)>
+    let topics: TxnOffsetCommitTopics = req
+        .topics
+        .iter()
+        .map(|t| {
+            let topic_name = t.name.to_string();
+            let partitions: Vec<(i32, i64, Option<String>)> = t
+                .partitions
+                .iter()
+                .map(|p| {
+                    let metadata = p.committed_metadata.as_ref().map(|s| s.to_string());
+                    (p.partition_index, p.committed_offset, metadata)
+                })
+                .collect();
+            (topic_name, partitions)
+        })
+        .collect();
+
+    debug!(
+        "TxnOffsetCommitRequest: transactional_id={}, group_id={}, producer_id={}, topics={:?}",
+        transactional_id, group_id, producer_id, topics
+    );
+
+    Ok(Some(KafkaRequest::TxnOffsetCommit {
+        correlation_id,
+        client_id,
+        api_version,
+        transactional_id,
+        group_id,
+        producer_id,
+        producer_epoch,
+        topics,
         response_tx,
     }))
 }

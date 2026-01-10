@@ -134,6 +134,14 @@ use kafka_test::{
     test_idempotent_producer_basic,
     test_replay_deduplication,
     test_true_deduplication_manual_replay,
+    // Transaction tests
+    test_producer_fencing,
+    test_read_committed_after_commit,
+    test_read_committed_filters_pending,
+    test_read_uncommitted_sees_pending,
+    test_transactional_batch,
+    test_transactional_producer_abort,
+    test_transactional_producer_commit,
 };
 
 type TestFn = fn() -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error>>> + Send>>;
@@ -698,6 +706,49 @@ fn get_all_tests() -> Vec<TestDef> {
             category: "idempotent",
             name: "test_true_deduplication_manual_replay",
             test_fn: wrap_test!(test_true_deduplication_manual_replay),
+            parallel_safe: true,
+        },
+        // Transaction tests (Phase 10)
+        TestDef {
+            category: "transaction",
+            name: "test_transactional_producer_commit",
+            test_fn: wrap_test!(test_transactional_producer_commit),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "transaction",
+            name: "test_transactional_producer_abort",
+            test_fn: wrap_test!(test_transactional_producer_abort),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "transaction",
+            name: "test_transactional_batch",
+            test_fn: wrap_test!(test_transactional_batch),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "transaction",
+            name: "test_producer_fencing",
+            test_fn: wrap_test!(test_producer_fencing),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "transaction",
+            name: "test_read_committed_filters_pending",
+            test_fn: wrap_test!(test_read_committed_filters_pending),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "transaction",
+            name: "test_read_uncommitted_sees_pending",
+            test_fn: wrap_test!(test_read_uncommitted_sees_pending),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "transaction",
+            name: "test_read_committed_after_commit",
+            test_fn: wrap_test!(test_read_committed_after_commit),
             parallel_safe: true,
         },
     ]

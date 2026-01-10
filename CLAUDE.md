@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `pg_kafka` is a PostgreSQL extension written in Rust (via pgrx) that embeds a Kafka-compatible wire protocol listener directly into the Postgres runtime. It allows standard Kafka clients to produce and consume messages using Postgres as the backing store.
 
-**Status:** Phase 9 Complete - Idempotent Producer (Portfolio/Learning Project)
+**Status:** Phase 10 Complete - Transaction Support (Portfolio/Learning Project)
 
 **Current Implementation:**
 - ✅ **Phase 1 Complete:** Metadata support (ApiVersions, Metadata requests)
@@ -19,15 +19,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - ✅ **Phase 7 Complete:** Multi-Partition Topics (key-based routing, default partition config)
 - ✅ **Phase 8 Complete:** Compression Support (gzip, snappy, lz4, zstd)
 - ✅ **Phase 9 Complete:** Idempotent Producer (InitProducerId, sequence validation, deduplication)
+- ✅ **Phase 10 Complete:** Transaction Support (AddPartitionsToTxn, AddOffsetsToTxn, EndTxn, TxnOffsetCommit)
 - ✅ **Enhancement:** Long Polling (max_wait_ms/min_bytes support, in-memory notification)
 - ✅ **CI/CD:** GitHub Actions pipeline with automated testing
-- ⏳ **Phase 10:** Shadow Mode (Logical Decoding → external Kafka)
+- ⏳ **Phase 11:** Shadow Mode (Logical Decoding → external Kafka)
 
 **What Works Now:**
 - TCP listener on port 9092 with full Kafka wire protocol parsing
 - ProduceRequest handling with database persistence (acks=0 and acks>=1 supported)
 - Idempotent producer support with InitProducerId API and sequence validation
 - Producer deduplication (DUPLICATE_SEQUENCE_NUMBER, OUT_OF_ORDER_SEQUENCE_NUMBER detection)
+- Transaction support (AddPartitionsToTxn, AddOffsetsToTxn, EndTxn, TxnOffsetCommit)
+- Read-committed isolation level for consumers (filters pending/aborted transactions)
 - FetchRequest with RecordBatch v2 encoding/decoding
 - Compression support: gzip, snappy, lz4, zstd (inbound automatic, outbound configurable)
 - Consumer group coordinator with automatic partition assignment (Range, RoundRobin, Sticky strategies)
@@ -41,8 +44,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Repository Pattern storage abstraction (KafkaStore trait + PostgresStore impl)
 - Automated E2E tests with real Kafka client (rdkafka)
 
-**API Coverage:** 19 of ~50 standard Kafka APIs (38%)
-**Test Status:** All unit tests (192) and E2E tests (74) passing ✅
+**API Coverage:** 23 of ~50 standard Kafka APIs (46%)
+**Test Status:** All unit tests (193) and E2E tests (74) passing ✅
 
 ## Development Setup
 
@@ -311,6 +314,33 @@ CREATE TABLE kafka.producer_sequences (
     PRIMARY KEY (producer_id, topic_id, partition_id),
     FOREIGN KEY (topic_id) REFERENCES kafka.topics(id) ON DELETE CASCADE
 );
+
+-- Phase 10: Transaction support
+CREATE TABLE kafka.transactions (
+    transactional_id TEXT PRIMARY KEY,
+    producer_id BIGINT NOT NULL REFERENCES kafka.producer_ids(producer_id),
+    producer_epoch SMALLINT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'Empty',  -- Empty, Ongoing, PrepareCommit, etc.
+    timeout_ms INT NOT NULL DEFAULT 60000,
+    started_at TIMESTAMP,
+    last_updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE kafka.txn_pending_offsets (
+    transactional_id TEXT NOT NULL REFERENCES kafka.transactions(transactional_id) ON DELETE CASCADE,
+    group_id TEXT NOT NULL,
+    topic_id INT NOT NULL REFERENCES kafka.topics(id) ON DELETE CASCADE,
+    partition_id INT NOT NULL,
+    pending_offset BIGINT NOT NULL,
+    metadata TEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (transactional_id, group_id, topic_id, partition_id)
+);
+
+-- Messages table also includes (for transaction visibility):
+-- producer_id BIGINT,
+-- producer_epoch SMALLINT,
+-- txn_state TEXT  -- NULL=committed, 'pending'=uncommitted, 'aborted'=aborted
 ```
 
 **Why Dual Offsets?**
@@ -320,6 +350,11 @@ CREATE TABLE kafka.producer_sequences (
 **Idempotent Producer Tables:**
 - `producer_ids`: Tracks allocated producer IDs with epochs (fencing mechanism)
 - `producer_sequences`: Per-partition sequence tracking for deduplication
+
+**Transaction Tables (Phase 10):**
+- `transactions`: Tracks transaction state by transactional_id
+- `txn_pending_offsets`: Pending offset commits until transaction completes
+- `messages.txn_state`: Controls visibility (NULL=visible, 'pending'=invisible to read_committed)
 
 ## Configuration
 

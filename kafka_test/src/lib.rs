@@ -59,6 +59,7 @@ pub mod offset_management;
 pub mod partition;
 pub mod performance;
 pub mod producer;
+pub mod transaction;
 
 // Re-export infrastructure
 pub use assertions::*;
@@ -129,3 +130,10 @@ pub use compression::{
 
 // Idempotent producer tests (Phase 9)
 pub use idempotent::{test_idempotent_producer_basic, test_replay_deduplication, test_true_deduplication_manual_replay};
+
+// Transaction tests (Phase 10)
+pub use transaction::{
+    test_producer_fencing, test_read_committed_after_commit, test_read_committed_filters_pending,
+    test_read_uncommitted_sees_pending, test_transactional_batch, test_transactional_producer_abort,
+    test_transactional_producer_commit,
+};
