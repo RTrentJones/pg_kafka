@@ -135,5 +135,5 @@ pub use idempotent::{test_idempotent_producer_basic, test_true_deduplication_man
 pub use transaction::{
     test_producer_fencing, test_read_committed_after_commit, test_read_committed_filters_pending,
     test_read_uncommitted_sees_pending, test_transactional_batch, test_transactional_producer_abort,
-    test_transactional_producer_commit,
+    test_transactional_producer_commit, test_txn_offset_commit,
 };

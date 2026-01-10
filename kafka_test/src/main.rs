@@ -141,6 +141,7 @@ use kafka_test::{
     test_transactional_batch,
     test_transactional_producer_abort,
     test_transactional_producer_commit,
+    test_txn_offset_commit,
 };
 
 type TestFn = fn() -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error>>> + Send>>;
@@ -742,6 +743,12 @@ fn get_all_tests() -> Vec<TestDef> {
             category: "transaction",
             name: "test_read_committed_after_commit",
             test_fn: wrap_test!(test_read_committed_after_commit),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "transaction",
+            name: "test_txn_offset_commit",
+            test_fn: wrap_test!(test_txn_offset_commit),
             parallel_safe: true,
         },
     ]

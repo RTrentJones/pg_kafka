@@ -34,6 +34,9 @@ use crate::{pg_log, pg_warning};
 /// How often to check for member timeouts
 const TIMEOUT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
+/// How often to check for timed-out transactions (less frequent than member timeouts)
+const TXN_TIMEOUT_CHECK_INTERVAL: Duration = Duration::from_secs(10);
+
 /// Timeout for blocking recv - allows periodic signal checks
 const RECV_TIMEOUT: Duration = Duration::from_millis(100);
 
@@ -343,6 +346,7 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     // ═══════════════════════════════════════════════════════════════════════════════
 
     let mut last_timeout_check = Instant::now();
+    let mut last_txn_timeout_check = Instant::now();
 
     loop {
         // ┌─────────────────────────────────────────────────────────────┐
@@ -475,6 +479,32 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
                 );
             }
             last_timeout_check = Instant::now();
+        }
+
+        // ┌─────────────────────────────────────────────────────────────┐
+        // │ Check Transaction Timeouts (Periodic, ~10 seconds)         │
+        // └─────────────────────────────────────────────────────────────┘
+        if last_txn_timeout_check.elapsed() >= TXN_TIMEOUT_CHECK_INTERVAL {
+            // Must run within a BackgroundWorker transaction for SPI access
+            BackgroundWorker::transaction(|| {
+                use crate::kafka::{KafkaStore, PostgresStore};
+                let store = PostgresStore::new();
+                let default_timeout = Duration::from_secs(60);
+                match store.abort_timed_out_transactions(default_timeout) {
+                    Ok(aborted) => {
+                        for txn_id in aborted {
+                            pg_log!(
+                                "Transaction timeout: Aborted timed-out transaction '{}'",
+                                txn_id
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        pg_warning!("Failed to check transaction timeouts: {}", e);
+                    }
+                }
+            });
+            last_txn_timeout_check = Instant::now();
         }
     }
 }
