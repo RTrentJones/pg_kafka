@@ -2680,4 +2680,222 @@ mod tests {
             panic!("Expected ApiVersions request");
         }
     }
+
+    // ========== Edge Case Tests (Added for Coverage) ==========
+
+    #[test]
+    fn test_parse_add_partitions_to_txn_request_v4() {
+        // Tests the v4+ batch transaction format (different from v3)
+        let (tx, _rx) = create_test_channel();
+
+        let mut request = add_partitions_to_txn_request::AddPartitionsToTxnRequest::default();
+
+        // v4+ uses the transactions array field for batched transactions
+        let mut txn = add_partitions_to_txn_request::AddPartitionsToTxnTransaction::default();
+        txn.transactional_id = TransactionalId::from(StrBytes::from_static_str("batch-txn"));
+        txn.producer_id = ProducerId(44444);
+        txn.producer_epoch = 1;
+
+        let mut topic = add_partitions_to_txn_request::AddPartitionsToTxnTopic::default();
+        topic.name = TopicName::from(StrBytes::from_static_str("batch-topic"));
+        topic.partitions = vec![0, 1];
+        txn.topics.push(topic);
+
+        request.transactions.push(txn);
+
+        let frame = build_request_frame(API_KEY_ADD_PARTITIONS_TO_TXN, 4, 4001, 2, &request, 4);
+
+        let result = parse_request(frame, tx);
+        assert!(result.is_ok());
+        let parsed = result.unwrap();
+        assert!(parsed.is_some());
+
+        if let Some(KafkaRequest::AddPartitionsToTxn {
+            transactional_id,
+            producer_id,
+            producer_epoch,
+            topics,
+            ..
+        }) = parsed
+        {
+            assert_eq!(transactional_id, "batch-txn");
+            assert_eq!(producer_id, 44444);
+            assert_eq!(producer_epoch, 1);
+            assert_eq!(topics.len(), 1);
+            assert_eq!(topics[0].0, "batch-topic");
+            assert_eq!(topics[0].1, vec![0, 1]);
+        } else {
+            panic!("Expected AddPartitionsToTxn request");
+        }
+    }
+
+    #[test]
+    fn test_parse_fetch_request_multiple_topics() {
+        // Tests multi-topic fetch requests
+        let (tx, mut rx) = create_test_channel();
+
+        let mut request = fetch_request::FetchRequest::default();
+        request.max_wait_ms = 1000;
+        request.min_bytes = 1;
+        request.max_bytes = 1048576;
+
+        // Topic 1 with 2 partitions
+        let mut topic1 = fetch_request::FetchTopic::default();
+        topic1.topic = TopicName::from(StrBytes::from_static_str("topic-a"));
+        let mut p0 = fetch_request::FetchPartition::default();
+        p0.partition = 0;
+        p0.fetch_offset = 0;
+        p0.partition_max_bytes = 32768;
+        let mut p1 = fetch_request::FetchPartition::default();
+        p1.partition = 1;
+        p1.fetch_offset = 100;
+        p1.partition_max_bytes = 32768;
+        topic1.partitions.push(p0);
+        topic1.partitions.push(p1);
+
+        // Topic 2 with 1 partition
+        let mut topic2 = fetch_request::FetchTopic::default();
+        topic2.topic = TopicName::from(StrBytes::from_static_str("topic-b"));
+        let mut p2 = fetch_request::FetchPartition::default();
+        p2.partition = 0;
+        p2.fetch_offset = 50;
+        p2.partition_max_bytes = 32768;
+        topic2.partitions.push(p2);
+
+        request.topics.push(topic1);
+        request.topics.push(topic2);
+
+        let frame = build_request_frame(API_KEY_FETCH, 4, 2002, 1, &request, 4);
+
+        let result = parse_request(frame, tx);
+        assert!(result.is_ok(), "parse_request failed");
+        let parsed = result.unwrap();
+
+        // Check if an error response was sent
+        if parsed.is_none() {
+            if let Ok(error) = rx.try_recv() {
+                panic!("Received error response: {:?}", error);
+            }
+        }
+
+        assert!(parsed.is_some(), "Expected Some, got None");
+
+        if let Some(KafkaRequest::Fetch { topic_data, .. }) = parsed {
+            assert_eq!(topic_data.len(), 2);
+            assert_eq!(topic_data[0].name, "topic-a");
+            assert_eq!(topic_data[0].partitions.len(), 2);
+            assert_eq!(topic_data[0].partitions[0].fetch_offset, 0);
+            assert_eq!(topic_data[0].partitions[1].fetch_offset, 100);
+            assert_eq!(topic_data[1].name, "topic-b");
+            assert_eq!(topic_data[1].partitions.len(), 1);
+            assert_eq!(topic_data[1].partitions[0].fetch_offset, 50);
+        } else {
+            panic!("Expected Fetch request");
+        }
+    }
+
+    #[test]
+    fn test_parse_produce_request_with_transactional_id() {
+        // Tests transactional produce (v3+ supports transactional_id)
+        let (tx, _rx) = create_test_channel();
+
+        let mut request = produce_request::ProduceRequest::default();
+        request.transactional_id = Some(TransactionalId::from(StrBytes::from_static_str(
+            "txn-producer",
+        )));
+        request.acks = -1;
+        request.timeout_ms = 30000;
+
+        let frame = build_request_frame(API_KEY_PRODUCE, 7, 3003, 1, &request, 7);
+
+        let result = parse_request(frame, tx);
+        assert!(result.is_ok());
+        let parsed = result.unwrap();
+        assert!(parsed.is_some());
+
+        if let Some(KafkaRequest::Produce {
+            transactional_id,
+            acks,
+            ..
+        }) = parsed
+        {
+            assert!(transactional_id.is_some());
+            assert_eq!(transactional_id.unwrap(), "txn-producer");
+            assert_eq!(acks, -1);
+        } else {
+            panic!("Expected Produce request");
+        }
+    }
+
+    #[test]
+    fn test_parse_offset_commit_request_with_metadata() {
+        // Tests offset commit with consumer metadata field
+        let (tx, _rx) = create_test_channel();
+
+        let mut request = offset_commit_request::OffsetCommitRequest::default();
+        request.group_id =
+            kafka_protocol::messages::GroupId::from(StrBytes::from_static_str("metadata-group"));
+
+        let mut topic = offset_commit_request::OffsetCommitRequestTopic::default();
+        topic.name = TopicName::from(StrBytes::from_static_str("metadata-topic"));
+
+        let mut partition = offset_commit_request::OffsetCommitRequestPartition::default();
+        partition.partition_index = 0;
+        partition.committed_offset = 999;
+        partition.committed_metadata = Some(StrBytes::from_static_str("consumer-state-data"));
+        topic.partitions.push(partition);
+        request.topics.push(topic);
+
+        let frame = build_request_frame(API_KEY_OFFSET_COMMIT, 8, 701, 2, &request, 8);
+
+        let result = parse_request(frame, tx);
+        assert!(result.is_ok());
+        let parsed = result.unwrap();
+        assert!(parsed.is_some());
+
+        if let Some(KafkaRequest::OffsetCommit {
+            group_id, topics, ..
+        }) = parsed
+        {
+            assert_eq!(group_id, "metadata-group");
+            assert_eq!(topics.len(), 1);
+            assert_eq!(topics[0].partitions[0].committed_offset, 999);
+            assert_eq!(
+                topics[0].partitions[0].metadata,
+                Some("consumer-state-data".to_string())
+            );
+        } else {
+            panic!("Expected OffsetCommit request");
+        }
+    }
+
+    #[test]
+    fn test_parse_unsupported_api_key() {
+        // Tests error handling for valid-but-unsupported API keys
+        // API key 17 = SaslHandshake (valid Kafka API, but not implemented here)
+        let (tx, mut rx) = create_test_channel();
+
+        use kafka_protocol::messages::sasl_handshake_request::SaslHandshakeRequest;
+
+        let mut request = SaslHandshakeRequest::default();
+        request.mechanism = StrBytes::from_static_str("PLAIN");
+
+        // SaslHandshake uses non-flexible header (version 1)
+        let frame = build_request_frame(17, 1, 9999, 1, &request, 1);
+
+        let result = parse_request(frame, tx);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none()); // Should return None for unsupported API
+
+        // Should have sent an error response
+        let response = rx.try_recv();
+        assert!(response.is_ok(), "Expected error response to be sent");
+
+        if let Ok(super::super::super::messages::KafkaResponse::Error { error_code, .. }) = response
+        {
+            assert_eq!(error_code, ERROR_UNSUPPORTED_VERSION);
+        } else {
+            panic!("Expected Error response");
+        }
+    }
 }
