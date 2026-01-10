@@ -415,3 +415,347 @@ pub fn build_init_producer_id_error_response(error_code: i16) -> InitProducerIdR
     response.producer_epoch = -1;
     response
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========== API Versions Response Tests ==========
+
+    #[test]
+    fn test_build_api_versions_response() {
+        let response = build_api_versions_response();
+
+        assert_eq!(response.error_code, ERROR_NONE);
+        assert_eq!(response.throttle_time_ms, 0);
+
+        // Should have 23 API versions (all supported APIs)
+        assert_eq!(response.api_keys.len(), 23);
+
+        // Verify ApiVersions entry
+        let api_versions = response
+            .api_keys
+            .iter()
+            .find(|a| a.api_key == API_KEY_API_VERSIONS)
+            .expect("ApiVersions should be present");
+        assert_eq!(api_versions.min_version, 0);
+        assert_eq!(api_versions.max_version, 3);
+
+        // Verify Produce entry (should support v3+ only for RecordBatch)
+        let produce = response
+            .api_keys
+            .iter()
+            .find(|a| a.api_key == API_KEY_PRODUCE)
+            .expect("Produce should be present");
+        assert_eq!(produce.min_version, 3);
+        assert_eq!(produce.max_version, 9);
+
+        // Verify Metadata entry
+        let metadata = response
+            .api_keys
+            .iter()
+            .find(|a| a.api_key == API_KEY_METADATA)
+            .expect("Metadata should be present");
+        assert_eq!(metadata.min_version, 0);
+        assert_eq!(metadata.max_version, 9);
+
+        // Verify InitProducerId entry (Phase 9)
+        let init_producer = response
+            .api_keys
+            .iter()
+            .find(|a| a.api_key == API_KEY_INIT_PRODUCER_ID)
+            .expect("InitProducerId should be present");
+        assert_eq!(init_producer.min_version, 0);
+        assert_eq!(init_producer.max_version, 4);
+
+        // Verify transaction APIs (Phase 10)
+        let add_partitions = response
+            .api_keys
+            .iter()
+            .find(|a| a.api_key == API_KEY_ADD_PARTITIONS_TO_TXN)
+            .expect("AddPartitionsToTxn should be present");
+        assert_eq!(add_partitions.min_version, 0);
+        assert_eq!(add_partitions.max_version, 3);
+    }
+
+    #[test]
+    fn test_api_versions_includes_all_consumer_apis() {
+        let response = build_api_versions_response();
+
+        // Consumer group APIs
+        let api_keys: Vec<i16> = response.api_keys.iter().map(|a| a.api_key).collect();
+
+        assert!(api_keys.contains(&API_KEY_FIND_COORDINATOR));
+        assert!(api_keys.contains(&API_KEY_JOIN_GROUP));
+        assert!(api_keys.contains(&API_KEY_SYNC_GROUP));
+        assert!(api_keys.contains(&API_KEY_HEARTBEAT));
+        assert!(api_keys.contains(&API_KEY_LEAVE_GROUP));
+        assert!(api_keys.contains(&API_KEY_OFFSET_COMMIT));
+        assert!(api_keys.contains(&API_KEY_OFFSET_FETCH));
+    }
+
+    #[test]
+    fn test_api_versions_includes_admin_apis() {
+        let response = build_api_versions_response();
+
+        let api_keys: Vec<i16> = response.api_keys.iter().map(|a| a.api_key).collect();
+
+        assert!(api_keys.contains(&API_KEY_CREATE_TOPICS));
+        assert!(api_keys.contains(&API_KEY_DELETE_TOPICS));
+        assert!(api_keys.contains(&API_KEY_CREATE_PARTITIONS));
+        assert!(api_keys.contains(&API_KEY_DELETE_GROUPS));
+    }
+
+    // ========== Metadata Builder Tests ==========
+
+    #[test]
+    fn test_build_broker_metadata() {
+        let broker = build_broker_metadata(0, "localhost".to_string(), 9092);
+
+        assert_eq!(broker.node_id.0, 0);
+        assert_eq!(broker.host.as_str(), "localhost");
+        assert_eq!(broker.port, 9092);
+        assert!(broker.rack.is_none());
+    }
+
+    #[test]
+    fn test_build_broker_metadata_with_custom_values() {
+        let broker = build_broker_metadata(42, "kafka.example.com".to_string(), 19092);
+
+        assert_eq!(broker.node_id.0, 42);
+        assert_eq!(broker.host.as_str(), "kafka.example.com");
+        assert_eq!(broker.port, 19092);
+    }
+
+    #[test]
+    fn test_build_topic_metadata() {
+        let partitions = vec![build_partition_metadata(0, 0, vec![0], vec![0])];
+        let topic = build_topic_metadata("test-topic".to_string(), ERROR_NONE, partitions);
+
+        assert_eq!(topic.error_code, ERROR_NONE);
+        assert_eq!(topic.name.unwrap().0.as_str(), "test-topic");
+        assert_eq!(topic.partitions.len(), 1);
+    }
+
+    #[test]
+    fn test_build_topic_metadata_with_error() {
+        let topic = build_topic_metadata(
+            "unknown-topic".to_string(),
+            ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+            vec![],
+        );
+
+        assert_eq!(topic.error_code, ERROR_UNKNOWN_TOPIC_OR_PARTITION);
+        assert_eq!(topic.name.unwrap().0.as_str(), "unknown-topic");
+        assert!(topic.partitions.is_empty());
+    }
+
+    #[test]
+    fn test_build_partition_metadata() {
+        let partition = build_partition_metadata(0, 1, vec![1, 2, 3], vec![1, 2]);
+
+        assert_eq!(partition.error_code, ERROR_NONE);
+        assert_eq!(partition.partition_index, 0);
+        assert_eq!(partition.leader_id.0, 1);
+        assert_eq!(partition.replica_nodes.len(), 3);
+        assert_eq!(partition.isr_nodes.len(), 2);
+    }
+
+    #[test]
+    fn test_build_partition_metadata_single_replica() {
+        let partition = build_partition_metadata(5, 0, vec![0], vec![0]);
+
+        assert_eq!(partition.partition_index, 5);
+        assert_eq!(partition.leader_id.0, 0);
+        assert_eq!(partition.replica_nodes.len(), 1);
+        assert_eq!(partition.isr_nodes.len(), 1);
+    }
+
+    // ========== Produce Response Tests ==========
+
+    #[test]
+    fn test_build_produce_response() {
+        let response = build_produce_response();
+
+        assert_eq!(response.throttle_time_ms, 0);
+        assert!(response.responses.is_empty());
+    }
+
+    #[test]
+    fn test_build_produce_error_response() {
+        let response = build_produce_error_response(ERROR_UNKNOWN_TOPIC_OR_PARTITION);
+
+        // ProduceResponse doesn't have top-level error, so we just verify it's valid
+        assert_eq!(response.throttle_time_ms, 0);
+    }
+
+    // ========== Fetch Response Tests ==========
+
+    #[test]
+    fn test_build_fetch_error_response() {
+        let response = build_fetch_error_response(ERROR_UNKNOWN_TOPIC_OR_PARTITION);
+
+        assert_eq!(response.throttle_time_ms, 0);
+        assert_eq!(response.error_code, ERROR_UNKNOWN_TOPIC_OR_PARTITION);
+    }
+
+    #[test]
+    fn test_build_fetch_error_response_none() {
+        let response = build_fetch_error_response(ERROR_NONE);
+
+        assert_eq!(response.error_code, ERROR_NONE);
+    }
+
+    // ========== Offset Commit/Fetch Response Tests ==========
+
+    #[test]
+    fn test_build_offset_commit_error_response() {
+        let response = build_offset_commit_error_response(ERROR_NOT_COORDINATOR);
+
+        assert_eq!(response.throttle_time_ms, 0);
+    }
+
+    #[test]
+    fn test_build_offset_fetch_error_response() {
+        let response = build_offset_fetch_error_response(ERROR_NOT_COORDINATOR);
+
+        assert_eq!(response.throttle_time_ms, 0);
+        assert_eq!(response.error_code, ERROR_NOT_COORDINATOR);
+    }
+
+    // ========== Coordinator Response Tests ==========
+
+    #[test]
+    fn test_build_find_coordinator_error_response() {
+        let response = build_find_coordinator_error_response(ERROR_COORDINATOR_NOT_AVAILABLE);
+
+        assert_eq!(response.throttle_time_ms, 0);
+        assert_eq!(response.error_code, ERROR_COORDINATOR_NOT_AVAILABLE);
+        assert_eq!(response.node_id.0, -1);
+        assert_eq!(response.host.as_str(), "");
+        assert_eq!(response.port, -1);
+    }
+
+    #[test]
+    fn test_build_join_group_error_response() {
+        let response = build_join_group_error_response(ERROR_UNKNOWN_MEMBER_ID);
+
+        assert_eq!(response.throttle_time_ms, 0);
+        assert_eq!(response.error_code, ERROR_UNKNOWN_MEMBER_ID);
+        assert_eq!(response.generation_id, -1);
+        assert!(response.protocol_type.is_none());
+        assert!(response.protocol_name.is_none());
+        assert_eq!(response.leader.as_str(), "");
+        assert_eq!(response.member_id.as_str(), "");
+    }
+
+    #[test]
+    fn test_build_sync_group_error_response() {
+        let response = build_sync_group_error_response(ERROR_REBALANCE_IN_PROGRESS);
+
+        assert_eq!(response.throttle_time_ms, 0);
+        assert_eq!(response.error_code, ERROR_REBALANCE_IN_PROGRESS);
+    }
+
+    #[test]
+    fn test_build_heartbeat_error_response() {
+        let response = build_heartbeat_error_response(ERROR_REBALANCE_IN_PROGRESS);
+
+        assert_eq!(response.throttle_time_ms, 0);
+        assert_eq!(response.error_code, ERROR_REBALANCE_IN_PROGRESS);
+    }
+
+    #[test]
+    fn test_build_leave_group_error_response() {
+        let response = build_leave_group_error_response(ERROR_UNKNOWN_MEMBER_ID);
+
+        assert_eq!(response.throttle_time_ms, 0);
+        assert_eq!(response.error_code, ERROR_UNKNOWN_MEMBER_ID);
+    }
+
+    // ========== List/Describe Response Tests ==========
+
+    #[test]
+    fn test_build_list_offsets_error_response() {
+        let response = build_list_offsets_error_response(ERROR_UNKNOWN_TOPIC_OR_PARTITION);
+
+        assert_eq!(response.throttle_time_ms, 0);
+    }
+
+    #[test]
+    fn test_build_describe_groups_error_response() {
+        let response = build_describe_groups_error_response(ERROR_NOT_COORDINATOR);
+
+        assert_eq!(response.throttle_time_ms, 0);
+    }
+
+    #[test]
+    fn test_build_list_groups_error_response() {
+        let response = build_list_groups_error_response(ERROR_COORDINATOR_NOT_AVAILABLE);
+
+        assert_eq!(response.throttle_time_ms, 0);
+        assert_eq!(response.error_code, ERROR_COORDINATOR_NOT_AVAILABLE);
+    }
+
+    // ========== Admin API Response Tests ==========
+
+    #[test]
+    fn test_build_create_topics_error_response() {
+        let response = build_create_topics_error_response(ERROR_TOPIC_ALREADY_EXISTS);
+
+        assert_eq!(response.throttle_time_ms, 0);
+    }
+
+    #[test]
+    fn test_build_delete_topics_error_response() {
+        let response = build_delete_topics_error_response(ERROR_UNKNOWN_TOPIC_OR_PARTITION);
+
+        assert_eq!(response.throttle_time_ms, 0);
+    }
+
+    #[test]
+    fn test_build_create_partitions_error_response() {
+        let response = build_create_partitions_error_response(ERROR_INVALID_PARTITIONS);
+
+        assert_eq!(response.throttle_time_ms, 0);
+    }
+
+    #[test]
+    fn test_build_delete_groups_error_response() {
+        let response = build_delete_groups_error_response(ERROR_NON_EMPTY_GROUP);
+
+        assert_eq!(response.throttle_time_ms, 0);
+    }
+
+    // ========== Idempotent Producer Response Tests ==========
+
+    #[test]
+    fn test_build_init_producer_id_error_response() {
+        let response = build_init_producer_id_error_response(ERROR_PRODUCER_FENCED);
+
+        assert_eq!(response.throttle_time_ms, 0);
+        assert_eq!(response.error_code, ERROR_PRODUCER_FENCED);
+        assert_eq!(response.producer_id.0, -1);
+        assert_eq!(response.producer_epoch, -1);
+    }
+
+    #[test]
+    fn test_build_init_producer_id_error_response_concurrent_transactions() {
+        let response = build_init_producer_id_error_response(ERROR_CONCURRENT_TRANSACTIONS);
+
+        assert_eq!(response.error_code, ERROR_CONCURRENT_TRANSACTIONS);
+    }
+
+    // ========== Metadata Error Response Tests ==========
+
+    #[test]
+    fn test_build_metadata_error_response() {
+        let response = build_metadata_error_response();
+
+        assert_eq!(response.throttle_time_ms, 0);
+        assert!(response.cluster_id.is_none());
+        assert_eq!(response.controller_id.0, -1);
+        assert!(response.brokers.is_empty());
+        assert!(response.topics.is_empty());
+    }
+}

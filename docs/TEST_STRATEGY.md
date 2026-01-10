@@ -1,7 +1,7 @@
 # Test Strategy
 
-**Status:** Phase 8 Complete
-**Last Updated:** 2026-01-08
+**Status:** Phase 10 Complete
+**Last Updated:** 2026-01-10
 
 ---
 
@@ -9,9 +9,9 @@
 
 | Category | Count | Coverage |
 |----------|-------|----------|
-| Unit Tests | 184 | Core logic, handlers, storage |
+| Unit Tests | 287 | Core logic, handlers, storage, protocol |
 | E2E Tests | 74 | Full protocol integration |
-| **Total** | **258** | **Comprehensive** |
+| **Total** | **361** | **Comprehensive** |
 
 ---
 
@@ -130,5 +130,57 @@ GitHub Actions runs both test suites:
 
 ---
 
-**Test Count:** 258 (184 unit + 74 E2E)
+## Code Coverage
+
+### Coverage Targets
+
+| Metric | Target | Notes |
+|--------|--------|-------|
+| Project Coverage | 80%+ | Testable code only |
+| Patch Coverage | 90%+ | New/modified code must be well-tested |
+| Handler Tests | 95%+ | Core protocol logic |
+
+### Generating Coverage Reports
+
+```bash
+# Summary only
+cargo llvm-cov --lib --features pg14 --summary-only
+
+# HTML report (recommended for analysis)
+cargo llvm-cov --lib --features pg14 --html --output-dir coverage-report
+open coverage-report/index.html
+
+# LCOV format (for CI/Codecov)
+cargo llvm-cov --lib --features pg14 --lcov --output-path lcov.info
+
+# Fail if below threshold
+cargo llvm-cov --lib --features pg14 --fail-under-lines 80
+```
+
+### Coverage Enforcement
+
+Coverage is enforced in CI via:
+1. **Codecov Integration** - Uploads coverage and blocks PRs below threshold
+2. **CI Threshold Check** - `--fail-under-lines 80` in workflow
+
+See `codecov.yml` for configuration details.
+
+### Intentionally Uncovered Code
+
+Some code cannot be unit tested due to pgrx/SPI dependencies. These are excluded from coverage requirements:
+
+| File | Reason | Tested By |
+|------|--------|-----------|
+| `src/kafka/storage/postgres.rs` | SPI calls | E2E tests |
+| `src/worker.rs` | Main loop, SPI | E2E tests |
+| `src/kafka/listener.rs` | Async runtime | E2E tests |
+| `src/config.rs` | GUC loading | E2E tests |
+| `src/lib.rs` | `_PG_init` hook | E2E tests |
+
+See `docs/PGRX_TESTING_GUIDE.md` for the full testing strategy.
+
+---
+
+**Test Count:** 361 (287 unit + 74 E2E)
+**Coverage Target:** 80%+ (testable code)
 **All Tests Passing:** ✅

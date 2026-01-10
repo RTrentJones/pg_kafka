@@ -1,0 +1,63 @@
+# Codecov Configuration
+# https://docs.codecov.com/docs/codecov-yaml
+#
+# Coverage targets and enforcement for pg_kafka
+# Note: Some code cannot be unit tested due to pgrx/SPI constraints.
+# Those files are excluded and covered by E2E tests in kafka_test/
+
+codecov:
+  require_ci_to_pass: yes
+  notify:
+    wait_for_ci: true
+
+coverage:
+  precision: 2
+  round: down
+  range: "70...100"
+
+  status:
+    # Project-wide coverage target
+    project:
+      default:
+        # Target: 80% of testable code
+        # Excludes SPI-dependent files (E2E tested separately)
+        target: 80%
+        threshold: 2%  # Allow 2% fluctuation
+        if_ci_failed: error
+        informational: false  # Block PRs below threshold
+
+    # Coverage on new/modified code
+    patch:
+      default:
+        # New code should be well-tested
+        target: 90%
+        threshold: 5%  # Some flexibility for generated code
+        informational: false  # Block PRs below threshold
+
+# Files excluded from coverage calculation
+# These are either:
+# - pgrx-generated code
+# - SPI-dependent (tested via E2E suite in kafka_test/)
+# - Runtime code (async/tokio - tested via E2E)
+ignore:
+  - "src/bin/**"                      # pgrx embedding binary
+  - "**/*_embed.rs"                   # pgrx generated files
+  - "src/lib.rs"                      # _PG_init hook (pgrx macros)
+  - "src/config.rs"                   # GUC loading (requires postgres)
+  - "src/worker.rs"                   # Main BGWorker loop (SPI-dependent)
+  - "src/kafka/listener.rs"           # Async TCP listener (E2E tested)
+  - "src/kafka/messages.rs"           # Message queue types (async runtime)
+  - "src/kafka/storage/postgres.rs"   # PostgresStore (SPI-dependent)
+
+# Comment configuration for PR reviews
+comment:
+  layout: "header, diff, flags, files"
+  behavior: default
+  require_changes: true  # Only comment when coverage changes
+
+# Flag configuration for test suites
+flags:
+  unit:
+    paths:
+      - src/
+    carryforward: true

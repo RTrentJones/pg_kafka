@@ -45,7 +45,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Automated E2E tests with real Kafka client (rdkafka)
 
 **API Coverage:** 23 of ~50 standard Kafka APIs (46%)
-**Test Status:** All unit tests (193) and E2E tests (74) passing ✅
+**Test Status:** All unit tests (287) and E2E tests (74) passing ✅
+**Coverage Target:** 80%+ (testable code)
 
 ## Development Setup
 
@@ -122,6 +123,8 @@ cd kafka_test && cargo run --release
 
 # Test coverage
 cargo llvm-cov --lib --features pg14 --lcov --output-path lcov.info
+cargo llvm-cov --lib --features pg14 --summary-only           # Quick summary
+cargo llvm-cov --lib --features pg14 --html --output-dir coverage-report  # HTML report
 
 # Package for installation
 cargo pgrx package                   # Creates installable package
@@ -130,9 +133,27 @@ cargo pgrx package                   # Creates installable package
 cargo pgrx schema pg14               # Generate SQL schema files
 ```
 
-**Note on pgrx tests:** This extension uses `PGC_POSTMASTER` GUCs which require `shared_preload_libraries` BEFORE Postgres starts. `cargo pgrx test` creates the extension AFTER startup, causing "FATAL: cannot create PGC_POSTMASTER variables after startup". Most integration testing is done via the E2E suite in `kafka_test/`.
+**Note on pgrx tests:** This extension uses `PGC_POSTMASTER` GUCs which require `shared_preload_libraries` BEFORE Postgres starts. `cargo pgrx test` creates the extension AFTER startup, causing "FATAL: cannot create PGC_POSTMASTER variables after startup". Most integration testing is done via the E2E suite in `kafka_test/`. See `docs/PGRX_TESTING_GUIDE.md` for the full testing strategy.
 
 **Note:** The project includes a [rust-toolchain.toml](rust-toolchain.toml) that specifies Rust nightly, which is required for the `home` crate dependency that uses edition2024 features (needed by pgrx 0.16.1). The default feature is `pg14` as specified in [Cargo.toml](Cargo.toml).
+
+## Code Coverage Requirements
+
+**Targets:**
+- Project Coverage: 80%+ (testable code only)
+- Patch Coverage: 90%+ (new/modified code)
+
+**Enforcement:**
+- CI enforces coverage via Codecov (see `codecov.yml`)
+- PRs with coverage below threshold will be blocked
+- Files in `codecov.yml` ignore list are excluded (SPI-dependent code tested via E2E)
+
+**Quick Check:**
+```bash
+cargo llvm-cov --lib --features pg14 --summary-only
+```
+
+See `docs/TEST_STRATEGY.md` for detailed coverage information.
 
 ## Codebase Structure
 

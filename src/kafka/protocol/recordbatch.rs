@@ -260,3 +260,250 @@ fn parse_message_set_legacy(
         Ok(records)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+
+    // ========== Empty/Edge Case Tests ==========
+
+    #[test]
+    fn test_parse_record_batch_empty() {
+        let batch_bytes = Bytes::new();
+        let result = parse_record_batch(&batch_bytes);
+
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_parse_record_batch_with_metadata_empty() {
+        let batch_bytes = Bytes::new();
+        let result = parse_record_batch_with_metadata(&batch_bytes);
+
+        assert!(result.is_ok());
+        let parsed = result.unwrap();
+        assert!(parsed.records.is_empty());
+        // Default producer metadata for empty batch (uses ProducerMetadata::default())
+        assert_eq!(parsed.producer_metadata.producer_id, 0);
+        assert_eq!(parsed.producer_metadata.producer_epoch, 0);
+        assert_eq!(parsed.producer_metadata.base_sequence, 0);
+    }
+
+    // ========== Producer Metadata Extraction Tests ==========
+
+    #[test]
+    fn test_extract_producer_metadata_too_short() {
+        // Less than 57 bytes - should return defaults (ProducerMetadata::default())
+        let short_bytes = Bytes::from(vec![0u8; 30]);
+        let metadata = extract_producer_metadata(&short_bytes);
+
+        // Default() returns 0 values
+        assert_eq!(metadata.producer_id, 0);
+        assert_eq!(metadata.producer_epoch, 0);
+        assert_eq!(metadata.base_sequence, 0);
+    }
+
+    #[test]
+    fn test_extract_producer_metadata_wrong_magic() {
+        // Create a buffer with enough bytes but wrong magic (not 2)
+        let mut buf = vec![0u8; 60];
+        buf[16] = 1; // Magic byte = 1 (legacy format)
+
+        let bytes = Bytes::from(buf);
+        let metadata = extract_producer_metadata(&bytes);
+
+        // Should return defaults for non-v2 format
+        assert_eq!(metadata.producer_id, -1);
+        assert_eq!(metadata.producer_epoch, -1);
+        assert_eq!(metadata.base_sequence, -1);
+    }
+
+    #[test]
+    fn test_extract_producer_metadata_valid_v2() {
+        // Create a minimal valid RecordBatch v2 header
+        let mut buf = vec![0u8; 61];
+
+        // Magic byte at offset 16
+        buf[16] = 2;
+
+        // Producer ID at offset 43 (i64 big-endian)
+        let producer_id: i64 = 12345;
+        buf[43..51].copy_from_slice(&producer_id.to_be_bytes());
+
+        // Producer epoch at offset 51 (i16 big-endian)
+        let producer_epoch: i16 = 5;
+        buf[51..53].copy_from_slice(&producer_epoch.to_be_bytes());
+
+        // Base sequence at offset 53 (i32 big-endian)
+        let base_sequence: i32 = 100;
+        buf[53..57].copy_from_slice(&base_sequence.to_be_bytes());
+
+        let bytes = Bytes::from(buf);
+        let metadata = extract_producer_metadata(&bytes);
+
+        assert_eq!(metadata.producer_id, 12345);
+        assert_eq!(metadata.producer_epoch, 5);
+        assert_eq!(metadata.base_sequence, 100);
+    }
+
+    #[test]
+    fn test_extract_producer_metadata_negative_values() {
+        // Test with -1 values (non-idempotent producer)
+        let mut buf = vec![0u8; 61];
+        buf[16] = 2; // Magic = 2
+
+        // Producer ID = -1
+        buf[43..51].copy_from_slice(&(-1i64).to_be_bytes());
+        // Producer epoch = -1
+        buf[51..53].copy_from_slice(&(-1i16).to_be_bytes());
+        // Base sequence = -1
+        buf[53..57].copy_from_slice(&(-1i32).to_be_bytes());
+
+        let bytes = Bytes::from(buf);
+        let metadata = extract_producer_metadata(&bytes);
+
+        assert_eq!(metadata.producer_id, -1);
+        assert_eq!(metadata.producer_epoch, -1);
+        assert_eq!(metadata.base_sequence, -1);
+    }
+
+    // ========== MessageSet Legacy Format Tests ==========
+
+    #[test]
+    fn test_parse_message_set_legacy_invalid() {
+        // Too short for any valid message
+        let bytes = Bytes::from(vec![0u8; 5]);
+        let result = parse_message_set_legacy(&bytes, "test error");
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_message_set_legacy_negative_message_size() {
+        // Create buffer with negative message size
+        let mut buf = vec![0u8; 20];
+        // Offset (8 bytes) - don't care
+        // Message size = -1 (invalid)
+        buf[8..12].copy_from_slice(&(-1i32).to_be_bytes());
+
+        let bytes = Bytes::from(buf);
+        let result = parse_message_set_legacy(&bytes, "test error");
+
+        // Should fail because no valid records parsed
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_message_set_legacy_simple_message() {
+        // Create a simple legacy MessageSet v0 message
+        let mut buf = Vec::new();
+
+        // Offset (8 bytes) - we ignore this
+        buf.extend_from_slice(&0i64.to_be_bytes());
+
+        // Message size (4 bytes) - CRC(4) + Magic(1) + Attr(1) + Key(-1) + Value(5 bytes)
+        // = 4 + 1 + 1 + 4 + 4 + 5 = 19 bytes
+        let msg_size: i32 = 19;
+        buf.extend_from_slice(&msg_size.to_be_bytes());
+
+        // CRC (4 bytes) - we don't validate
+        buf.extend_from_slice(&0u32.to_be_bytes());
+
+        // Magic (1 byte)
+        buf.push(0);
+
+        // Attributes (1 byte)
+        buf.push(0);
+
+        // Key length = -1 (null key)
+        buf.extend_from_slice(&(-1i32).to_be_bytes());
+
+        // Value length = 5
+        buf.extend_from_slice(&5i32.to_be_bytes());
+
+        // Value = "hello"
+        buf.extend_from_slice(b"hello");
+
+        let bytes = Bytes::from(buf);
+        let result = parse_message_set_legacy(&bytes, "test error");
+
+        assert!(result.is_ok());
+        let records = result.unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(records[0].key.is_none());
+        assert_eq!(records[0].value, Some(b"hello".to_vec()));
+        assert!(records[0].headers.is_empty()); // Legacy format has no headers
+    }
+
+    #[test]
+    fn test_parse_message_set_legacy_with_key() {
+        let mut buf = Vec::new();
+
+        // Offset
+        buf.extend_from_slice(&0i64.to_be_bytes());
+
+        // Message size = CRC(4) + Magic(1) + Attr(1) + KeyLen(4) + Key(3) + ValLen(4) + Val(5) = 22
+        buf.extend_from_slice(&22i32.to_be_bytes());
+
+        // CRC
+        buf.extend_from_slice(&0u32.to_be_bytes());
+
+        // Magic + Attributes
+        buf.push(0);
+        buf.push(0);
+
+        // Key length = 3
+        buf.extend_from_slice(&3i32.to_be_bytes());
+        buf.extend_from_slice(b"key");
+
+        // Value length = 5
+        buf.extend_from_slice(&5i32.to_be_bytes());
+        buf.extend_from_slice(b"value");
+
+        let bytes = Bytes::from(buf);
+        let result = parse_message_set_legacy(&bytes, "test error");
+
+        assert!(result.is_ok());
+        let records = result.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].key, Some(b"key".to_vec()));
+        assert_eq!(records[0].value, Some(b"value".to_vec()));
+    }
+
+    // ========== ParsedRecordBatch Tests ==========
+
+    #[test]
+    fn test_parsed_record_batch_clone() {
+        let batch = ParsedRecordBatch {
+            records: vec![Record {
+                key: Some(b"test".to_vec()),
+                value: Some(b"data".to_vec()),
+                headers: vec![],
+                timestamp: Some(1234567890),
+            }],
+            producer_metadata: ProducerMetadata {
+                producer_id: 100,
+                producer_epoch: 2,
+                base_sequence: 50,
+            },
+        };
+
+        let cloned = batch.clone();
+        assert_eq!(cloned.records.len(), 1);
+        assert_eq!(cloned.producer_metadata.producer_id, 100);
+    }
+
+    #[test]
+    fn test_parsed_record_batch_debug() {
+        let batch = ParsedRecordBatch {
+            records: vec![],
+            producer_metadata: ProducerMetadata::default(),
+        };
+
+        // Should be Debug printable
+        let debug_str = format!("{:?}", batch);
+        assert!(debug_str.contains("ParsedRecordBatch"));
+    }
+}
