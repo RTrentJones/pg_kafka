@@ -86,10 +86,10 @@ pub fn handle_produce(
             }
 
             // Phase 9: Validate sequence for idempotent producers BEFORE inserting
-            if let Some(meta) = producer_metadata {
+            let should_insert = if let Some(meta) = producer_metadata {
                 if meta.producer_id >= 0 {
                     // Idempotent producer - check and update sequence
-                    if let Err(e) = store.check_and_update_sequence(
+                    match store.check_and_update_sequence(
                         meta.producer_id,
                         meta.producer_epoch,
                         topic_id,
@@ -97,41 +97,57 @@ pub fn handle_produce(
                         meta.base_sequence,
                         records.len() as i32,
                     ) {
-                        // Sequence validation failed - return error for this partition
-                        partition_response.error_code = e.to_kafka_error_code();
+                        Ok(should_insert) => should_insert, // true=insert, false=duplicate (skip insert)
+                        Err(e) => {
+                            // Sequence validation failed - return error for this partition
+                            partition_response.error_code = e.to_kafka_error_code();
+                            partition_response.base_offset = -1;
+                            partition_response.log_append_time_ms = -1;
+                            partition_response.log_start_offset = -1;
+                            topic_response.partition_responses.push(partition_response);
+                            continue;
+                        }
+                    }
+                } else {
+                    true // Non-idempotent producer - always insert
+                }
+            } else {
+                true // No metadata - always insert
+            };
+
+            // Insert records (skip for duplicates)
+            if should_insert {
+                match store.insert_records(topic_id, partition_index, &records) {
+                    Ok(base_offset) => {
+                        partition_response.error_code = ERROR_NONE;
+                        partition_response.base_offset = base_offset;
+                        partition_response.log_append_time_ms = -1;
+                        partition_response.log_start_offset = -1;
+                    }
+                    Err(e) => {
+                        // Use typed error's Kafka error code for proper protocol response
+                        let error_code = e.to_kafka_error_code();
+                        if e.is_server_error() {
+                            crate::pg_warning!(
+                                "Failed to insert records for topic_id={}, partition={}: {}",
+                                topic_id,
+                                partition_index,
+                                e
+                            );
+                        }
+                        partition_response.error_code = error_code;
                         partition_response.base_offset = -1;
                         partition_response.log_append_time_ms = -1;
                         partition_response.log_start_offset = -1;
-                        topic_response.partition_responses.push(partition_response);
-                        continue;
                     }
                 }
-            }
-
-            // Insert records
-            match store.insert_records(topic_id, partition_index, &records) {
-                Ok(base_offset) => {
-                    partition_response.error_code = ERROR_NONE;
-                    partition_response.base_offset = base_offset;
-                    partition_response.log_append_time_ms = -1;
-                    partition_response.log_start_offset = -1;
-                }
-                Err(e) => {
-                    // Use typed error's Kafka error code for proper protocol response
-                    let error_code = e.to_kafka_error_code();
-                    if e.is_server_error() {
-                        crate::pg_warning!(
-                            "Failed to insert records for topic_id={}, partition={}: {}",
-                            topic_id,
-                            partition_index,
-                            e
-                        );
-                    }
-                    partition_response.error_code = error_code;
-                    partition_response.base_offset = -1;
-                    partition_response.log_append_time_ms = -1;
-                    partition_response.log_start_offset = -1;
-                }
+            } else {
+                // Duplicate detected - return success (error_code=0) but skip insert
+                // This is the correct Kafka idempotency behavior
+                partition_response.error_code = ERROR_NONE;
+                partition_response.base_offset = 0; // Duplicate - offset doesn't matter
+                partition_response.log_append_time_ms = -1;
+                partition_response.log_start_offset = -1;
             }
 
             topic_response.partition_responses.push(partition_response);

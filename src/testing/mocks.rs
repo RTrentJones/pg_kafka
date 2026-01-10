@@ -72,7 +72,7 @@ mock! {
             partition_id: i32,
             base_sequence: i32,
             record_count: i32,
-        ) -> Result<()>;
+        ) -> Result<bool>;
     }
 }
 

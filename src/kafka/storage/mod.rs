@@ -308,8 +308,8 @@ pub trait KafkaStore {
     /// * `record_count` - Number of records in the batch
     ///
     /// # Returns
-    /// * `Ok(())` if sequence is valid and was recorded
-    /// * `Err(DuplicateSequence)` if sequence already seen
+    /// * `Ok(true)` if sequence is valid and should be inserted (new message)
+    /// * `Ok(false)` if sequence is a duplicate (skip insert, return success to client)
     /// * `Err(OutOfOrderSequence)` if there's a gap in the sequence
     /// * `Err(ProducerFenced)` if the epoch is stale
     fn check_and_update_sequence(
@@ -320,7 +320,7 @@ pub trait KafkaStore {
         partition_id: i32,
         base_sequence: i32,
         record_count: i32,
-    ) -> Result<()>;
+    ) -> Result<bool>;
 }
 
 // Submodules

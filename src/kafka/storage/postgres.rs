@@ -684,7 +684,7 @@ impl KafkaStore for PostgresStore {
         partition_id: i32,
         base_sequence: i32,
         record_count: i32,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         crate::pg_debug!(
             "PostgresStore::check_and_update_sequence: producer_id={}, epoch={}, topic_id={}, partition_id={}, base_seq={}, count={}",
             producer_id,
@@ -721,12 +721,15 @@ impl KafkaStore for PostgresStore {
             }
 
             // Step 2: Use advisory lock to serialize sequence checks for this producer+partition
-            // Using a hash of (producer_id, topic_id, partition_id) to create a unique lock
-            let lock_key = ((topic_id as i64) << 32) | (partition_id as i64);
+            // Combine producer_id, topic_id, partition_id into a single bigint lock key
+            // Using XOR and shifts to create a unique hash that fits in i64
+            let lock_key: i64 = producer_id
+                ^ ((topic_id as i64) << 20)
+                ^ ((partition_id as i64) << 40);
             client.select(
-                "SELECT pg_advisory_xact_lock($1, $2)",
+                "SELECT pg_advisory_xact_lock($1)",
                 None,
-                &[producer_id.into(), lock_key.into()],
+                &[lock_key.into()],
             )?;
 
             // Step 3: Get current last_sequence for this producer/topic/partition
@@ -751,12 +754,15 @@ impl KafkaStore for PostgresStore {
             // Step 4: Validate sequence
             if base_sequence < expected_sequence {
                 // Duplicate - sequence is behind expected
-                return Err(KafkaError::duplicate_sequence(
+                // Kafka spec: Return success (don't error), skip insert, don't update sequence
+                crate::pg_debug!(
+                    "Duplicate detected: producer_id={}, partition_id={}, base_sequence={}, expected={}",
                     producer_id,
                     partition_id,
                     base_sequence,
-                    expected_sequence,
-                ));
+                    expected_sequence
+                );
+                return Ok(false); // Duplicate - skip insert
             } else if base_sequence > expected_sequence {
                 // Gap - sequence is ahead of expected
                 return Err(KafkaError::out_of_order_sequence(
@@ -792,7 +798,7 @@ impl KafkaStore for PostgresStore {
                 new_last_sequence
             );
 
-            Ok(())
+            Ok(true) // Valid sequence - proceed with insert
         })
         .map_err(|e| match e {
             KafkaError::UnknownProducerId { .. }

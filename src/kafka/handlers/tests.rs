@@ -1080,10 +1080,10 @@ mod tests {
         mock.expect_get_or_create_topic()
             .returning(|_, _| Ok((1, 1)));
 
-        // Expect sequence check to pass
+        // Expect sequence check to pass (returns true = insert)
         mock.expect_check_and_update_sequence()
             .times(1)
-            .returning(|_, _, _, _, _, _| Ok(()));
+            .returning(|_, _, _, _, _, _| Ok(true));
 
         // Expect record insertion
         mock.expect_insert_records()
@@ -1126,10 +1126,12 @@ mod tests {
         mock.expect_get_or_create_topic()
             .returning(|_, _| Ok((1, 1)));
 
-        // Sequence check fails with duplicate error
+        // Sequence check detects duplicate (returns Ok(false) - skip insert, return success)
         mock.expect_check_and_update_sequence()
             .times(1)
-            .returning(|_, _, _, _, _, _| Err(KafkaError::duplicate_sequence(1000, 0, 5, 10)));
+            .returning(|_, _, _, _, _, _| Ok(false)); // Duplicate - skip insert
+
+        // No expect_insert_records - should be skipped for duplicates
 
         let topic_data = vec![TopicProduceData {
             name: "test-topic".to_string(),
@@ -1155,11 +1157,9 @@ mod tests {
             produce::handle_produce(&mock, topic_data, 1, Some(&producer_metadata)).unwrap();
 
         let partition_response = &response.responses[0].partition_responses[0];
-        assert_eq!(
-            partition_response.error_code,
-            ERROR_DUPLICATE_SEQUENCE_NUMBER
-        );
-        assert_eq!(partition_response.base_offset, -1);
+        // Kafka spec: Duplicates return SUCCESS (error_code=0), not error
+        assert_eq!(partition_response.error_code, ERROR_NONE);
+        assert_eq!(partition_response.base_offset, 0); // Duplicate - offset 0
     }
 
     #[test]
