@@ -187,15 +187,6 @@ jobs:
         token: ${{ secrets.CODECOV_TOKEN }}
         fail_ci_if_error: true  # Fail CI if coverage drops below threshold
 
-    - name: Verify Coverage Threshold
-      # Ensure testable code maintains 80%+ coverage
-      # Files excluded in codecov.yml are SPI-dependent (E2E tested)
-      run: |
-        echo "Checking coverage threshold..."
-        cargo llvm-cov --lib --features pg14 --fail-under-lines 80
-      env:
-        RUSTFLAGS: ""
-
     # ------------------------------------------------------------------
     # E2E TESTING: Full system test with external client
     # ------------------------------------------------------------------
