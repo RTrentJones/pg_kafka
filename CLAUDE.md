@@ -410,6 +410,78 @@ psql -h localhost -p 28814 -U postgres -d postgres -c \
 5. Wire up handler in `src/worker.rs` request processing loop
 6. Add E2E test in `kafka_test/src/main.rs`
 
+## E2E Testing Best Practices (kafka_test/)
+
+### Test Infrastructure
+
+Tests use shared infrastructure from `kafka_test/src/`:
+- **common.rs**: Client factories (`create_producer()`, `create_idempotent_producer()`, `create_transactional_producer()`, `create_stream_consumer()`, etc.)
+- **setup.rs**: `TestContext` for RAII-based isolation with automatic cleanup
+- **fixtures.rs**: Builders (`TestTopicBuilder`, `TestConsumerBuilder`, `TestProducerBuilder`)
+- **assertions.rs**: Domain-specific assertions (`assert_topic_exists()`, `assert_message_count()`, etc.)
+
+### Standard Test Structure
+
+Every test follows a 4-step pattern:
+
+```rust
+pub async fn test_feature_name() -> TestResult {
+    println!("=== Test: Feature Name ===\n");
+
+    // 1. SETUP: Create context and unique resources
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("feature").await;
+    let group = ctx.unique_group("consumer").await;
+
+    // 2. ACTION: Execute test scenario
+    println!("Step 1: Performing action...");
+    let producer = create_producer()?;
+    producer.send(FutureRecord::to(&topic).payload("test"), Duration::from_secs(5)).await?;
+    println!("✅ Action completed\n");
+
+    // 3. VERIFY: Assert via database queries
+    println!("=== Database Verification ===\n");
+    let count_row = ctx.db().query_one(
+        "SELECT COUNT(*) FROM kafka.messages m JOIN kafka.topics t ON m.topic_id = t.id WHERE t.name = $1",
+        &[&topic]
+    ).await?;
+    let count: i64 = count_row.get(0);
+    assert_eq!(count, 1, "Expected 1 message");
+    println!("✅ Verification passed\n");
+
+    // 4. CLEANUP: Automatic via TestContext drop (or explicit)
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+```
+
+### Key Principles
+
+1. **Always use unique resource names**: `ctx.unique_topic()` and `ctx.unique_group()` prevent test pollution
+2. **Two-level verification**: Verify both Kafka protocol response AND database state
+3. **Use shared client factories**: `create_producer()`, `create_idempotent_producer()`, `create_transactional_producer()`
+4. **Use ctx.db() for queries**: Don't call `create_db_client()` separately when using TestContext
+5. **Mark parallel safety**: Set `parallel_safe: false` in main.rs for timing-sensitive or concurrent tests
+6. **Verbose output**: Print step-by-step progress with checkmarks for CI debugging
+
+### Adding New E2E Tests
+
+1. Create test in appropriate category directory (e.g., `producer/`, `consumer/`, `idempotent/`)
+2. Export from the category's `mod.rs`
+3. Re-export from `lib.rs`
+4. Register in `main.rs` with category and `parallel_safe` flag
+5. Follow the standard 4-step structure
+6. Use TestContext for isolation
+
+### When rdkafka Doesn't Support a Feature
+
+If rdkafka lacks support for a Kafka feature:
+1. Test using raw TCP protocol encoding (see `idempotent/protocol_encoding.rs` for helpers)
+2. Verify behavior via database queries using `ctx.db()`
+3. Document the approach in test comments
+4. Reference unit tests in `src/kafka/handlers/tests.rs` for comprehensive coverage
+
 ### Debugging
 
 The devcontainer includes:

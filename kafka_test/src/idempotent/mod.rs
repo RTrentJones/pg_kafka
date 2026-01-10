@@ -9,8 +9,6 @@
 mod basic;
 mod deduplication;
 mod protocol_encoding;
-mod replay_test;
 
 pub use basic::test_idempotent_producer_basic;
 pub use deduplication::test_true_deduplication_manual_replay;
-pub use replay_test::test_replay_deduplication;

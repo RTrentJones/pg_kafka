@@ -129,7 +129,7 @@ pub use compression::{
 };
 
 // Idempotent producer tests (Phase 9)
-pub use idempotent::{test_idempotent_producer_basic, test_replay_deduplication, test_true_deduplication_manual_replay};
+pub use idempotent::{test_idempotent_producer_basic, test_true_deduplication_manual_replay};
 
 // Transaction tests (Phase 10)
 pub use transaction::{

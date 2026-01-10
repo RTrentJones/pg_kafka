@@ -6,11 +6,12 @@
 //! Unlike smart clients (rdkafka) that hide retry logic, this "dumb client"
 //! approach gives us deterministic control over duplicate transmissions.
 
-use crate::common::{create_db_client, TestResult};
 use super::protocol_encoding::{
     encode_init_producer_id_request, encode_produce_request, parse_init_response,
     parse_produce_response, read_response, send_request,
 };
+use crate::common::TestResult;
+use crate::setup::TestContext;
 use tokio::net::TcpStream;
 
 /// Test TRUE deduplication with manual protocol replay
@@ -27,13 +28,17 @@ use tokio::net::TcpStream;
 pub async fn test_true_deduplication_manual_replay() -> TestResult {
     println!("=== Test: TRUE Deduplication with Manual Protocol Replay ===\n");
 
+    // Setup test context for isolation
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("dedup-manual").await;
+
     // Step 1: Connect to broker via raw TCP
-    println!("Connecting to broker at 127.0.0.1:9092...");
+    println!("Step 1: Connecting to broker at 127.0.0.1:9092...");
     let mut stream = TcpStream::connect("127.0.0.1:9092").await?;
     println!("✅ Connected to broker\n");
 
     // Step 2: Send InitProducerId request to get a producer_id
-    println!("Sending InitProducerId request...");
+    println!("Step 2: Sending InitProducerId request...");
     let init_request = encode_init_producer_id_request(1, None);
     send_request(&mut stream, &init_request).await?;
 
@@ -42,15 +47,14 @@ pub async fn test_true_deduplication_manual_replay() -> TestResult {
     println!("✅ InitProducerId returned producer_id={}\n", producer_id);
 
     // Step 3: Craft ProduceRequest with RecordBatch containing producer metadata
-    println!("Encoding ProduceRequest with producer metadata...");
-    let topic = "dedup-test";
+    println!("Step 3: Encoding ProduceRequest with producer metadata...");
     let partition = 0;
     let producer_epoch = 0i16;
     let base_sequence = 0i32; // First message for this producer
 
     let produce_request = encode_produce_request(
-        2,                      // correlation_id
-        topic,
+        2,                    // correlation_id
+        &topic,
         partition,
         producer_id,
         producer_epoch,
@@ -61,22 +65,22 @@ pub async fn test_true_deduplication_manual_replay() -> TestResult {
     println!("✅ ProduceRequest encoded ({} bytes)\n", produce_request.len());
 
     // Step 4: Send EXACT SAME request TWICE
-    println!("=== CRITICAL TEST: Sending IDENTICAL request twice ===");
+    println!("=== CRITICAL TEST: Sending IDENTICAL request twice ===\n");
 
-    println!("Sending request #1...");
+    println!("Step 4a: Sending request #1...");
     send_request(&mut stream, &produce_request).await?;
     let response1 = read_response(&mut stream).await?;
     let error_code1 = parse_produce_response(&response1)?;
-    println!("✅ Response #1: error_code={}", error_code1);
+    println!("✅ Response #1: error_code={}\n", error_code1);
 
-    println!("Sending request #2 (IDENTICAL BYTES)...");
+    println!("Step 4b: Sending request #2 (IDENTICAL BYTES)...");
     send_request(&mut stream, &produce_request).await?; // SAME BYTES!
     let response2 = read_response(&mut stream).await?;
     let error_code2 = parse_produce_response(&response2)?;
     println!("✅ Response #2: error_code={}\n", error_code2);
 
     // Step 5: Verify both responses are SUCCESS (error_code=0)
-    println!("=== Verifying Protocol Responses ===");
+    println!("=== Verifying Protocol Responses ===\n");
     assert_eq!(
         error_code1, 0,
         "First request should succeed, got error_code={}",
@@ -93,9 +97,9 @@ pub async fn test_true_deduplication_manual_replay() -> TestResult {
     println!("✅ Duplicate request succeeded (error_code=0) - Correct behavior!\n");
 
     // Step 6: THE TRUTH - Query database to verify deduplication
-    println!("=== Verifying Database State ===");
-    let client = create_db_client().await?;
-    let count_row = client
+    println!("=== Verifying Database State ===\n");
+    let count_row = ctx
+        .db()
         .query_one(
             "SELECT COUNT(*) FROM kafka.messages m
              JOIN kafka.topics t ON m.topic_id = t.id
@@ -118,8 +122,9 @@ pub async fn test_true_deduplication_manual_replay() -> TestResult {
     println!("✅ Database has exactly 1 message (not 2)\n");
 
     // Step 7: Verify producer metadata was stored correctly
-    println!("=== Verifying Producer Metadata ===");
-    let producer_row = client
+    println!("=== Verifying Producer Metadata ===\n");
+    let producer_row = ctx
+        .db()
         .query_one(
             "SELECT producer_id, epoch FROM kafka.producer_ids WHERE producer_id = $1",
             &[&producer_id],
@@ -132,7 +137,8 @@ pub async fn test_true_deduplication_manual_replay() -> TestResult {
         stored_producer_id, stored_epoch
     );
 
-    let seq_row = client
+    let seq_row = ctx
+        .db()
         .query_one(
             "SELECT last_sequence FROM kafka.producer_sequences
              WHERE producer_id = $1 AND partition_id = $2",
@@ -142,7 +148,13 @@ pub async fn test_true_deduplication_manual_replay() -> TestResult {
     let last_sequence: i32 = seq_row.get(0);
     println!("✅ Last sequence: {}\n", last_sequence);
 
-    assert_eq!(last_sequence, 0, "Last sequence should be 0 (base_sequence + record_count - 1 = 0 + 1 - 1 = 0)");
+    assert_eq!(
+        last_sequence, 0,
+        "Last sequence should be 0 (base_sequence + record_count - 1 = 0 + 1 - 1 = 0)"
+    );
+
+    // Cleanup
+    ctx.cleanup().await?;
 
     println!("╔════════════════════════════════════════════════════════════╗");
     println!("║          TRUE DEDUPLICATION TEST PASSED ✅                 ║");
