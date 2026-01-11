@@ -53,12 +53,8 @@ impl TestContext {
     ///
     /// The name is tracked for automatic cleanup.
     pub async fn unique_topic(&self, base: &str) -> String {
-        let name = format!(
-            "{}-{}-{}",
-            base,
-            self.test_id,
-            Uuid::new_v4().to_string()[..8].to_string()
-        );
+        let uuid_str = Uuid::new_v4().to_string();
+        let name = format!("{}-{}-{}", base, self.test_id, &uuid_str[..8]);
         self.topics_created.lock().await.push(name.clone());
         name
     }
@@ -67,12 +63,8 @@ impl TestContext {
     ///
     /// The group is tracked for automatic cleanup.
     pub async fn unique_group(&self, base: &str) -> String {
-        let name = format!(
-            "{}-{}-{}",
-            base,
-            self.test_id,
-            Uuid::new_v4().to_string()[..8].to_string()
-        );
+        let uuid_str = Uuid::new_v4().to_string();
+        let name = format!("{}-{}-{}", base, self.test_id, &uuid_str[..8]);
         self.groups_created.lock().await.push(name.clone());
         name
     }

@@ -159,11 +159,7 @@ pub async fn assert_shadow_config_exists(db: &Client, topic_name: &str) -> TestR
 }
 
 /// Assert shadow config mode
-pub async fn assert_shadow_mode(
-    db: &Client,
-    topic_name: &str,
-    expected_mode: &str,
-) -> TestResult {
+pub async fn assert_shadow_mode(db: &Client, topic_name: &str, expected_mode: &str) -> TestResult {
     let row = db
         .query_one(
             r#"
@@ -224,9 +220,9 @@ pub async fn verify_message_forwarded_correctly(
     // Find matching message in external Kafka
     let external_messages = consume_from_external(topic_name, 100, timeout).await?;
 
-    let found = external_messages.iter().any(|msg| {
-        msg.key == local_key && msg.value == local_value
-    });
+    let found = external_messages
+        .iter()
+        .any(|msg| msg.key == local_key && msg.value == local_value);
 
     if !found {
         return Err(format!(

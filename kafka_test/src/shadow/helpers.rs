@@ -132,7 +132,10 @@ async fn get_or_create_topic_id(
 ) -> Result<i32, Box<dyn std::error::Error>> {
     // Try to get existing topic
     let row = db
-        .query_opt("SELECT id FROM kafka.topics WHERE name = $1", &[&topic_name])
+        .query_opt(
+            "SELECT id FROM kafka.topics WHERE name = $1",
+            &[&topic_name],
+        )
         .await?;
 
     match row {

@@ -34,8 +34,8 @@ pub use basic_forwarding::{
     test_dual_write_async, test_dual_write_sync, test_external_only_mode, test_local_only_mode,
 };
 pub use dialup::{
-    test_dialup_0_percent, test_dialup_10_percent, test_dialup_25_percent, test_dialup_50_percent,
-    test_dialup_75_percent, test_dialup_100_percent,
+    test_dialup_0_percent, test_dialup_100_percent, test_dialup_10_percent, test_dialup_25_percent,
+    test_dialup_50_percent, test_dialup_75_percent,
 };
 pub use error_handling::{test_dual_write_external_down, test_external_only_fallback};
 pub use percentage_routing::{

@@ -53,7 +53,7 @@ pub async fn test_true_deduplication_manual_replay() -> TestResult {
     let base_sequence = 0i32; // First message for this producer
 
     let produce_request = encode_produce_request(
-        2,                    // correlation_id
+        2, // correlation_id
         &topic,
         partition,
         producer_id,
@@ -62,7 +62,10 @@ pub async fn test_true_deduplication_manual_replay() -> TestResult {
         vec!["test-value-1"], // One record
     );
 
-    println!("✅ ProduceRequest encoded ({} bytes)\n", produce_request.len());
+    println!(
+        "✅ ProduceRequest encoded ({} bytes)\n",
+        produce_request.len()
+    );
 
     // Step 4: Send EXACT SAME request TWICE
     println!("=== CRITICAL TEST: Sending IDENTICAL request twice ===\n");

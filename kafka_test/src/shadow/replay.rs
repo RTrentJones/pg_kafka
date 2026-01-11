@@ -88,10 +88,7 @@ pub async fn test_replay_historical_messages() -> TestResult {
     // Get topic_id
     let row = ctx
         .db()
-        .query_one(
-            "SELECT id FROM kafka.topics WHERE name = $1",
-            &[&topic],
-        )
+        .query_one("SELECT id FROM kafka.topics WHERE name = $1", &[&topic])
         .await?;
     let topic_id: i32 = row.get(0);
 
