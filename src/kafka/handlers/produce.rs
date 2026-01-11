@@ -29,7 +29,7 @@ use std::collections::HashMap;
 /// * `producer_metadata` - Optional producer metadata for idempotent producers (Phase 9)
 /// * `transactional_id` - Optional transactional ID for transactional producers (Phase 10)
 pub fn handle_produce(
-    store: &impl KafkaStore,
+    store: &dyn KafkaStore,
     topic_data: Vec<crate::kafka::messages::TopicProduceData>,
     default_partitions: i32,
     producer_metadata: Option<&ProducerMetadata>,

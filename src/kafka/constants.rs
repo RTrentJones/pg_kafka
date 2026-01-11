@@ -373,6 +373,79 @@ pub fn parse_compression_type(s: &str) -> Compression {
 /// Default compression type for FetchResponse encoding
 pub const DEFAULT_COMPRESSION_TYPE: &str = "none";
 
+// ===== Shadow Mode Configuration (Phase 11) =====
+
+/// Default shadow mode enabled state
+pub const DEFAULT_SHADOW_MODE_ENABLED: bool = false;
+
+/// Default shadow bootstrap servers (empty = disabled)
+pub const DEFAULT_SHADOW_BOOTSTRAP_SERVERS: &str = "";
+
+/// Default shadow security protocol
+pub const DEFAULT_SHADOW_SECURITY_PROTOCOL: &str = "SASL_SSL";
+
+/// Default shadow SASL mechanism
+pub const DEFAULT_SHADOW_SASL_MECHANISM: &str = "PLAIN";
+
+/// Default shadow batch size (messages per batch)
+pub const DEFAULT_SHADOW_BATCH_SIZE: i32 = 1000;
+
+/// Minimum shadow batch size
+pub const MIN_SHADOW_BATCH_SIZE: i32 = 1;
+
+/// Maximum shadow batch size
+pub const MAX_SHADOW_BATCH_SIZE: i32 = 100_000;
+
+/// Default shadow linger time (milliseconds)
+pub const DEFAULT_SHADOW_LINGER_MS: i32 = 10;
+
+/// Minimum shadow linger time
+pub const MIN_SHADOW_LINGER_MS: i32 = 0;
+
+/// Maximum shadow linger time
+pub const MAX_SHADOW_LINGER_MS: i32 = 60_000;
+
+/// Default shadow retry backoff (milliseconds)
+pub const DEFAULT_SHADOW_RETRY_BACKOFF_MS: i32 = 100;
+
+/// Minimum shadow retry backoff
+pub const MIN_SHADOW_RETRY_BACKOFF_MS: i32 = 10;
+
+/// Maximum shadow retry backoff
+pub const MAX_SHADOW_RETRY_BACKOFF_MS: i32 = 60_000;
+
+/// Default shadow max retries per message
+pub const DEFAULT_SHADOW_MAX_RETRIES: i32 = 3;
+
+/// Minimum shadow max retries
+pub const MIN_SHADOW_MAX_RETRIES: i32 = 0;
+
+/// Maximum shadow max retries
+pub const MAX_SHADOW_MAX_RETRIES: i32 = 100;
+
+/// Default shadow sync mode (async or sync)
+pub const DEFAULT_SHADOW_SYNC_MODE: &str = "async";
+
+/// Default shadow metrics enabled
+pub const DEFAULT_SHADOW_METRICS_ENABLED: bool = true;
+
+/// Default shadow OpenTelemetry endpoint (empty = disabled)
+pub const DEFAULT_SHADOW_OTEL_ENDPOINT: &str = "";
+
+// ===== Shadow Mode Error Codes =====
+
+/// Shadow mode forwarding failed
+pub const ERROR_SHADOW_FORWARD_FAILED: i16 = 1001;
+
+/// Shadow mode not configured
+pub const ERROR_SHADOW_NOT_CONFIGURED: i16 = 1002;
+
+/// Shadow mode external Kafka unavailable
+pub const ERROR_SHADOW_KAFKA_UNAVAILABLE: i16 = 1003;
+
+/// Shadow mode replay operation failed
+pub const ERROR_SHADOW_REPLAY_FAILED: i16 = 1004;
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -38,7 +38,7 @@ use crate::kafka::messages::TxnOffsetCommitTopics;
 /// # Returns
 /// AddPartitionsToTxnResponse with per-partition error codes
 pub fn handle_add_partitions_to_txn(
-    store: &impl KafkaStore,
+    store: &dyn KafkaStore,
     transactional_id: &str,
     producer_id: i64,
     producer_epoch: i16,
@@ -160,7 +160,7 @@ pub fn handle_add_partitions_to_txn(
 /// # Returns
 /// AddOffsetsToTxnResponse with error code
 pub fn handle_add_offsets_to_txn(
-    store: &impl KafkaStore,
+    store: &dyn KafkaStore,
     transactional_id: &str,
     producer_id: i64,
     producer_epoch: i16,
@@ -215,7 +215,7 @@ pub fn handle_add_offsets_to_txn(
 /// # Returns
 /// EndTxnResponse with error code
 pub fn handle_end_txn(
-    store: &impl KafkaStore,
+    store: &dyn KafkaStore,
     transactional_id: &str,
     producer_id: i64,
     producer_epoch: i16,
@@ -276,7 +276,7 @@ pub fn handle_end_txn(
 /// # Returns
 /// TxnOffsetCommitResponse with per-partition error codes
 pub fn handle_txn_offset_commit(
-    store: &impl KafkaStore,
+    store: &dyn KafkaStore,
     transactional_id: &str,
     producer_id: i64,
     producer_epoch: i16,

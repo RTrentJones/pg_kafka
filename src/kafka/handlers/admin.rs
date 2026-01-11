@@ -32,7 +32,7 @@ use crate::kafka::storage::KafkaStore;
 /// Creates topics with the specified configuration. Topics that already exist
 /// will return TOPIC_ALREADY_EXISTS error.
 pub fn handle_create_topics(
-    store: &impl KafkaStore,
+    store: &dyn KafkaStore,
     topics: Vec<CreateTopicRequest>,
     validate_only: bool,
 ) -> Result<CreateTopicsResponse> {
@@ -128,7 +128,7 @@ pub fn handle_create_topics(
 /// Deletes topics and all their messages. Consumer offsets for deleted topics
 /// are also removed.
 pub fn handle_delete_topics(
-    store: &impl KafkaStore,
+    store: &dyn KafkaStore,
     topic_names: Vec<String>,
 ) -> Result<DeleteTopicsResponse> {
     let mut results = Vec::new();
@@ -181,7 +181,7 @@ pub fn handle_delete_topics(
 /// Increases the partition count for existing topics.
 /// Cannot decrease partition count.
 pub fn handle_create_partitions(
-    store: &impl KafkaStore,
+    store: &dyn KafkaStore,
     topics: Vec<CreatePartitionsTopicRequest>,
     validate_only: bool,
 ) -> Result<CreatePartitionsResponse> {
@@ -249,7 +249,7 @@ pub fn handle_create_partitions(
 /// Deletes consumer groups. Groups with active members cannot be deleted
 /// (returns NON_EMPTY_GROUP error).
 pub fn handle_delete_groups(
-    store: &impl KafkaStore,
+    store: &dyn KafkaStore,
     coordinator: &GroupCoordinator,
     group_names: Vec<String>,
 ) -> Result<DeleteGroupsResponse> {

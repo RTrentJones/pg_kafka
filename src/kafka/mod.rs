@@ -45,6 +45,7 @@ pub mod partitioner;
 pub mod pending_fetches;
 pub mod protocol;
 pub mod response_builders;
+pub mod shadow;
 pub mod storage;
 
 // Re-export commonly used types for convenience
@@ -56,4 +57,5 @@ pub use messages::{KafkaRequest, KafkaResponse};
 pub use notifications::InternalNotification;
 pub use pending_fetches::PendingFetchRegistry;
 pub use response_builders::*;
+pub use shadow::{ShadowConfig, ShadowError, ShadowMode, SyncMode, TopicShadowConfig};
 pub use storage::{KafkaStore, PostgresStore};

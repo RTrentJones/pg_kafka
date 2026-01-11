@@ -24,7 +24,7 @@ use kafka_protocol::records::Compression;
 /// For ReadCommitted consumers, last_stable_offset (LSO) indicates the lowest
 /// offset of any pending transaction. Consumers can safely process up to LSO.
 pub fn handle_fetch(
-    store: &impl KafkaStore,
+    store: &dyn KafkaStore,
     topic_data: Vec<crate::kafka::messages::TopicFetchData>,
     compression: Compression,
     isolation_level: IsolationLevel,
@@ -195,7 +195,7 @@ pub fn handle_fetch(
 /// - -1 = latest offset (high watermark)
 /// - >= 0 = offset at timestamp (not yet implemented)
 pub fn handle_list_offsets(
-    store: &impl KafkaStore,
+    store: &dyn KafkaStore,
     topics: Vec<crate::kafka::messages::ListOffsetsTopicData>,
 ) -> Result<kafka_protocol::messages::list_offsets_response::ListOffsetsResponse> {
     use kafka_protocol::messages::list_offsets_response::{

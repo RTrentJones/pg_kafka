@@ -60,6 +60,12 @@ uuid = { version = "1.19", features = ["v4"] }
 murmur2 = "0.1"
 rand = "0.8"
 
+# Shadow mode: External Kafka producer (Phase 11)
+# CRITICAL: Do NOT add "ssl-vendored" feature! Postgres links against system OpenSSL.
+# Bundling a different OpenSSL version will cause symbol conflicts and crash Postgres.
+# The "ssl" feature uses system OpenSSL from librdkafka-dev package.
+rdkafka = { version = "0.36", features = ["cmake-build", "sasl", "ssl", "zstd"] }
+
 [dev-dependencies]
 pgrx-tests = "=0.16.1"
 tokio-test = "0.4.4"
