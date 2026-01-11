@@ -19,35 +19,35 @@
 //! This allows enabling shadow mode via `ALTER SYSTEM` + `pg_reload_conf()` without
 //! requiring a PostgreSQL restart.
 //!
-//! ## Sync-Only Forwarding
+//! ## Sync and Async Forwarding
 //!
-//! This uses `futures::executor::block_on()` for sync forwarding, which works
-//! without a tokio runtime context. This is essential because the DB worker
-//! thread doesn't have access to the tokio runtime (that lives in the network thread).
+//! Forwarding mode is controlled by the per-topic `sync_mode` setting:
+//!
+//! - **Sync mode**: Uses `futures::executor::block_on()` for sync forwarding, which
+//!   works without a tokio runtime context. Blocks the DB worker thread until delivery.
+//!
+//! - **Async mode**: Sends messages via crossbeam channel to the network thread,
+//!   which has a tokio runtime. Fire-and-forget, non-blocking on the DB worker thread.
 //!
 //! ## Thread Safety
 //!
 //! The inner store and producer are wrapped appropriately for safe access.
 //! The forwarder maintains internal mutable state for primary detection caching.
 
-use super::config::{ShadowConfig, TopicConfigCache, TopicShadowConfig, WriteMode};
+use super::config::{ShadowConfig, SyncMode, TopicConfigCache, TopicShadowConfig, WriteMode};
 use super::forwarder::ForwardDecision;
 use super::primary::PrimaryStatus;
 use super::producer::ShadowProducer;
+use super::routing::make_forward_decision;
+use super::ForwardRequest;
 use crate::kafka::error::Result;
 use crate::kafka::messages::Record;
 use crate::kafka::storage::{
     CommittedOffset, FetchedMessage, IsolationLevel, KafkaStore, TopicMetadata, TransactionState,
 };
-use murmur2::murmur2;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
-
-/// Murmur2 hash for percentage routing (same seed as Kafka partitioner)
-fn murmur2_hash(data: &[u8]) -> u32 {
-    murmur2(data, 0x9747b28c)
-}
 
 /// Metrics for shadow forwarding operations
 #[derive(Debug, Default)]
@@ -100,6 +100,8 @@ pub struct ShadowStore<S: KafkaStore> {
     primary_status: Mutex<PrimaryStatus>,
     /// Shadow forwarding metrics
     metrics: ShadowMetrics,
+    /// Channel for async forwarding to network thread (Phase 11)
+    forward_tx: RwLock<Option<crossbeam_channel::Sender<ForwardRequest>>>,
 }
 
 impl<S: KafkaStore> ShadowStore<S> {
@@ -118,7 +120,18 @@ impl<S: KafkaStore> ShadowStore<S> {
             topic_cache: Arc::new(TopicConfigCache::new()),
             primary_status: Mutex::new(PrimaryStatus::new()),
             metrics: ShadowMetrics::new(),
+            forward_tx: RwLock::new(None),
         }
+    }
+
+    /// Set the forward channel for async forwarding
+    ///
+    /// Must be called after construction to enable async forwarding mode.
+    /// When sync_mode is Async, messages are sent via this channel to the
+    /// network thread for non-blocking forwarding.
+    pub fn set_forward_channel(&self, tx: crossbeam_channel::Sender<ForwardRequest>) {
+        let mut guard = self.forward_tx.write().expect("forward_tx lock poisoned");
+        *guard = Some(tx);
     }
 
     /// Get the topic configuration cache
@@ -211,38 +224,25 @@ impl<S: KafkaStore> ShadowStore<S> {
 
     /// Decide whether to forward a message based on percentage routing
     ///
-    /// Uses deterministic murmur2 hashing on the key (or offset if no key)
+    /// Delegates to the shared routing module for consistent behavior
+    /// with ShadowForwarder.
     fn decide_forward(
         &self,
         key: Option<&[u8]>,
         offset: i64,
         forward_percentage: u8,
     ) -> ForwardDecision {
-        if forward_percentage == 0 {
-            return ForwardDecision::Skip;
-        }
-        if forward_percentage >= 100 {
-            return ForwardDecision::Forward;
-        }
-
-        // Use key hash if available, otherwise use offset
-        let hash = if let Some(key_bytes) = key {
-            murmur2_hash(key_bytes)
-        } else {
-            offset as u32
-        };
-
-        if (hash % 100) < forward_percentage as u32 {
-            ForwardDecision::Forward
-        } else {
-            ForwardDecision::Skip
-        }
+        make_forward_decision(key, offset, forward_percentage)
     }
 
-    /// Forward records to external Kafka (sync mode)
+    /// Forward records to external Kafka
     ///
     /// Called after successful local insert for DualWrite mode.
     /// Logs errors but doesn't fail - local write already succeeded.
+    ///
+    /// Respects sync_mode from topic config:
+    /// - Sync: Block on each send using block_on() (existing behavior)
+    /// - Async: Send via channel to network thread (non-blocking, fire-and-forget)
     fn forward_records_best_effort(
         &self,
         topic_config: &TopicShadowConfig,
@@ -250,48 +250,100 @@ impl<S: KafkaStore> ShadowStore<S> {
         records: &[Record],
         base_offset: i64,
     ) {
-        let producer = match self.ensure_producer() {
-            Some(p) => p,
-            None => {
-                tracing::debug!("No producer available for shadow forwarding");
-                return;
-            }
-        };
-
         let external_topic = topic_config.effective_external_topic();
 
-        for (i, record) in records.iter().enumerate() {
-            let offset = base_offset + i as i64;
+        match topic_config.sync_mode {
+            SyncMode::Async => {
+                // Async mode: send via channel to network thread (non-blocking)
+                let forward_tx = self.forward_tx.read().expect("forward_tx lock poisoned");
+                let tx = match forward_tx.as_ref() {
+                    Some(tx) => tx,
+                    None => {
+                        tracing::debug!("No forward channel available for async forwarding");
+                        return;
+                    }
+                };
 
-            // Check percentage routing
-            match self.decide_forward(
-                record.key.as_deref(),
-                offset,
-                topic_config.forward_percentage,
-            ) {
-                ForwardDecision::Skip => {
-                    self.metrics.skipped.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
-                ForwardDecision::Forward => {
-                    // Forward synchronously using send_sync
-                    if let Err(e) = producer.send_sync(
-                        external_topic,
-                        Some(partition_id),
+                for (i, record) in records.iter().enumerate() {
+                    let offset = base_offset + i as i64;
+
+                    // Check percentage routing
+                    match self.decide_forward(
                         record.key.as_deref(),
-                        record.value.as_deref(),
-                        DEFAULT_FORWARD_TIMEOUT_MS,
+                        offset,
+                        topic_config.forward_percentage,
                     ) {
-                        tracing::warn!(
-                            "Shadow forward failed for {}[{}] offset {}: {:?}",
-                            external_topic,
-                            partition_id,
-                            offset,
-                            e
-                        );
-                        self.metrics.failed.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        self.metrics.forwarded.fetch_add(1, Ordering::Relaxed);
+                        ForwardDecision::Skip => {
+                            self.metrics.skipped.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        ForwardDecision::Forward => {
+                            // Non-blocking send to network thread
+                            let req = ForwardRequest::new(
+                                external_topic.to_string(),
+                                partition_id,
+                                record.key.clone(),
+                                record.value.clone(),
+                                offset,
+                            );
+
+                            // Backpressure: drop on channel full, increment failed counter
+                            if tx.try_send(req).is_err() {
+                                tracing::warn!(
+                                    "Forward channel full, dropping async forward request"
+                                );
+                                self.metrics.failed.fetch_add(1, Ordering::Relaxed);
+                            }
+                            // Note: forwarded metric updated in network thread on success
+                        }
+                    }
+                }
+            }
+
+            SyncMode::Sync => {
+                // Sync mode: block on each send using block_on()
+                let producer = match self.ensure_producer() {
+                    Some(p) => p,
+                    None => {
+                        tracing::debug!("No producer available for shadow forwarding");
+                        return;
+                    }
+                };
+
+                for (i, record) in records.iter().enumerate() {
+                    let offset = base_offset + i as i64;
+
+                    // Check percentage routing
+                    match self.decide_forward(
+                        record.key.as_deref(),
+                        offset,
+                        topic_config.forward_percentage,
+                    ) {
+                        ForwardDecision::Skip => {
+                            self.metrics.skipped.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        ForwardDecision::Forward => {
+                            // Forward synchronously using send_sync
+                            if let Err(e) = producer.send_sync(
+                                external_topic,
+                                Some(partition_id),
+                                record.key.as_deref(),
+                                record.value.as_deref(),
+                                DEFAULT_FORWARD_TIMEOUT_MS,
+                            ) {
+                                tracing::warn!(
+                                    "Shadow forward failed for {}[{}] offset {}: {:?}",
+                                    external_topic,
+                                    partition_id,
+                                    offset,
+                                    e
+                                );
+                                self.metrics.failed.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                self.metrics.forwarded.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
                     }
                 }
             }
@@ -514,24 +566,23 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
                 let config = topic_config.expect("ExternalOnly requires shadow config");
 
                 if self.forward_records_required(&config, partition_id, records) {
-                    // External succeeded - still write locally for now
-                    // In full implementation, we might skip local write entirely
-                    // but for safety during migration, we write to both
+                    // External succeeded - skip local write entirely
+                    // Consumers should be configured to read from external Kafka
                     tracing::debug!(
-                        "ExternalOnly: forwarding succeeded for {} records to topic {}",
-                        records.len(),
-                        topic_id
+                        "ExternalOnly: {} records forwarded to external Kafka, skipping local",
+                        records.len()
                     );
-                    // Return a placeholder offset - consumers reading from pg_kafka
-                    // won't see these if we don't write locally
-                    // For now, write locally too for safety
-                    self.inner.insert_records(topic_id, partition_id, records)
+                    self.metrics
+                        .forwarded
+                        .fetch_add(records.len() as u64, Ordering::Relaxed);
+                    // Return a synthetic offset (not stored locally)
+                    // Clients should switch to consuming from external Kafka
+                    Ok(0)
                 } else {
-                    // Fallback to local storage
+                    // External failed - fallback to local storage
                     tracing::info!(
-                        "ExternalOnly fallback: writing {} records to local storage for topic {}",
-                        records.len(),
-                        topic_id
+                        "ExternalOnly fallback: {} records written locally due to external failure",
+                        records.len()
                     );
                     self.metrics
                         .fallback_local

@@ -43,6 +43,7 @@ pub fn handle_add_partitions_to_txn(
     producer_id: i64,
     producer_epoch: i16,
     topics: Vec<(String, Vec<i32>)>, // (topic_name, partition_ids)
+    default_partitions: i32,
 ) -> Result<AddPartitionsToTxnResponse> {
     // Validate the transaction state
     store.validate_transaction(transactional_id, producer_id, producer_epoch)?;
@@ -72,9 +73,6 @@ pub fn handle_add_partitions_to_txn(
     // Build response with results for each partition
     let mut response = AddPartitionsToTxnResponse::default();
     let mut topic_results = Vec::new();
-
-    // Default partitions for auto-created topics (TODO: make configurable)
-    let default_partitions = 1;
 
     for (topic_name, partition_ids) in topics {
         let mut partition_results = Vec::new();

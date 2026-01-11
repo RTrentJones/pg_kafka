@@ -17,6 +17,7 @@ use super::config::{ShadowConfig, SyncMode, TopicConfigCache, TopicShadowConfig}
 use super::error::{ShadowError, ShadowResult};
 use super::primary::PrimaryStatus;
 use super::producer::ShadowProducer;
+use super::routing::compute_routing_hash;
 use std::sync::Arc;
 
 /// Default timeout for sync forwards (milliseconds)
@@ -234,27 +235,11 @@ impl TopicConfigCache {
     }
 }
 
-/// Compute a deterministic routing hash
-///
-/// Uses murmur2 hash (same as Kafka partitioner) to ensure consistent routing.
-/// If no key is provided, uses the global offset for deterministic routing.
-fn compute_routing_hash(key: Option<&[u8]>, global_offset: i64) -> u32 {
-    let data = match key {
-        Some(k) if !k.is_empty() => k,
-        _ => {
-            // Use global offset bytes as the routing key
-            return (global_offset.unsigned_abs() % 100) as u32;
-        }
-    };
-
-    // Use murmur2 hash (same as Kafka partitioner)
-    murmur2::murmur2(data, 0x9747b28c)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::kafka::shadow::config::ShadowMode;
+    use crate::kafka::shadow::routing::compute_routing_hash;
 
     #[test]
     fn test_compute_routing_hash_with_key() {

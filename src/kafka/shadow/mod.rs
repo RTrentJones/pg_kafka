@@ -45,6 +45,7 @@ pub mod forwarder;
 pub mod primary;
 pub mod producer;
 pub mod replay;
+pub mod routing;
 pub mod store;
 
 #[cfg(test)]
@@ -59,4 +60,43 @@ pub use forwarder::{ForwardDecision, ForwardMessage, ForwardResult, ShadowForwar
 pub use primary::{is_primary, PrimaryStatus};
 pub use producer::{ShadowProducer, ShadowProducerBuilder};
 pub use replay::{ReplayEngine, ReplayProgress, ReplayRequest, ReplayResult};
+pub use routing::{compute_routing_hash, make_forward_decision};
 pub use store::{ShadowMetrics, ShadowStore};
+
+/// Message sent from DB thread to network thread for async forwarding
+///
+/// When sync_mode is Async, the ShadowStore sends ForwardRequest messages
+/// via a crossbeam channel to the network thread, which handles the actual
+/// forwarding asynchronously without blocking the DB worker thread.
+#[derive(Debug, Clone)]
+pub struct ForwardRequest {
+    /// External topic name to forward to
+    pub topic_name: String,
+    /// Partition ID for the message
+    pub partition_id: i32,
+    /// Message key (optional)
+    pub key: Option<Vec<u8>>,
+    /// Message value (optional)
+    pub value: Option<Vec<u8>>,
+    /// Local offset for metrics/replay tracking
+    pub local_offset: i64,
+}
+
+impl ForwardRequest {
+    /// Create a new forward request
+    pub fn new(
+        topic_name: String,
+        partition_id: i32,
+        key: Option<Vec<u8>>,
+        value: Option<Vec<u8>>,
+        local_offset: i64,
+    ) -> Self {
+        Self {
+            topic_name,
+            partition_id,
+            key,
+            value,
+            local_offset,
+        }
+    }
+}

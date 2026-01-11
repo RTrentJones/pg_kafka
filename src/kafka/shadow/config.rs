@@ -107,7 +107,7 @@ pub struct TopicShadowConfig {
     pub forward_percentage: u8,
     /// External topic name (None = same as local)
     pub external_topic_name: Option<String>,
-    /// Sync mode for this topic (deprecated - now always sync)
+    /// Sync mode for this topic (async = non-blocking via channel, sync = blocking)
     pub sync_mode: SyncMode,
     /// Write mode (dual_write or external_only)
     pub write_mode: WriteMode,

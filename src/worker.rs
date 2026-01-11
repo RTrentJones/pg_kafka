@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 // Import conditional logging macros from lib.rs
 use crate::kafka::constants::*;
-use crate::kafka::shadow::ShadowStore;
+use crate::kafka::shadow::{ShadowConfig, ShadowStore};
 use crate::kafka::{KafkaStore, PostgresStore};
 use crate::{pg_log, pg_warning};
 
@@ -235,6 +235,25 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     let (notify_tx, notify_rx) =
         crossbeam_channel::bounded::<crate::kafka::InternalNotification>(10_000);
 
+    // Step 5c: Create forward channel for async shadow forwarding (Phase 11)
+    // This channel sends ForwardRequest messages from the DB thread to the network
+    // thread for non-blocking forwarding to external Kafka when sync_mode=async.
+    // Bounded to prevent OOM - on channel full, requests are dropped (fire-and-forget).
+    let (forward_tx, forward_rx) =
+        crossbeam_channel::bounded::<crate::kafka::shadow::ForwardRequest>(10_000);
+
+    // Set forward_tx on ShadowStore for async forwarding
+    shadow_store.set_forward_channel(forward_tx);
+
+    // Step 5d: Read shadow config for network thread (if shadow mode is enabled)
+    // The network thread needs this to create its own producer for async forwarding
+    let shadow_config_for_network: Option<std::sync::Arc<ShadowConfig>> =
+        if config.shadow_mode_enabled && !config.shadow_bootstrap_servers.is_empty() {
+            Some(std::sync::Arc::new(ShadowConfig::from_config(&config)))
+        } else {
+            None
+        };
+
     // Step 6: Create shutdown signal channel
     // Simple mpsc channel - network thread checks for message to shutdown
     let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
@@ -316,6 +335,8 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
                     tcp_listener,
                     request_tx,
                     notify_rx,
+                    forward_rx,
+                    shadow_config_for_network,
                     shutdown_rx,
                     log_connections,
                     enable_long_polling,
@@ -1317,6 +1338,7 @@ pub fn process_request(
                         producer_id,
                         producer_epoch,
                         topics,
+                        default_partitions,
                     )
                 },
                 |r| KafkaResponse::AddPartitionsToTxn {
