@@ -59,6 +59,7 @@ pub mod offset_management;
 pub mod partition;
 pub mod performance;
 pub mod producer;
+pub mod shadow;
 pub mod transaction;
 
 // Re-export infrastructure
@@ -136,4 +137,24 @@ pub use transaction::{
     test_producer_fencing, test_read_committed_after_commit, test_read_committed_filters_pending,
     test_read_uncommitted_sees_pending, test_transactional_batch, test_transactional_producer_abort,
     test_transactional_producer_commit, test_txn_offset_commit,
+};
+
+// Shadow mode tests (Phase 11)
+pub use shadow::{
+    // Basic forwarding
+    test_dual_write_async, test_dual_write_sync, test_external_only_mode, test_local_only_mode,
+    // Percentage routing
+    test_deterministic_routing, test_fifty_percent_forwarding, test_hundred_percent_forwarding,
+    test_zero_percent_forwarding,
+    // Dial-up tests
+    test_dialup_0_percent, test_dialup_10_percent, test_dialup_25_percent, test_dialup_50_percent,
+    test_dialup_75_percent, test_dialup_100_percent,
+    // Topic mapping
+    test_topic_name_mapping,
+    // Transaction integration
+    test_aborted_transaction_not_forwarded, test_committed_transaction_forwarded,
+    // Error handling
+    test_dual_write_external_down, test_external_only_fallback,
+    // Replay
+    test_replay_historical_messages,
 };

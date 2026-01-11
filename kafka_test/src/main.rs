@@ -142,6 +142,27 @@ use kafka_test::{
     test_transactional_producer_abort,
     test_transactional_producer_commit,
     test_txn_offset_commit,
+    // Shadow mode tests (Phase 11)
+    test_aborted_transaction_not_forwarded,
+    test_committed_transaction_forwarded,
+    test_deterministic_routing,
+    test_dialup_0_percent,
+    test_dialup_10_percent,
+    test_dialup_25_percent,
+    test_dialup_50_percent,
+    test_dialup_75_percent,
+    test_dialup_100_percent,
+    test_dual_write_async,
+    test_dual_write_external_down,
+    test_dual_write_sync,
+    test_external_only_fallback,
+    test_external_only_mode,
+    test_fifty_percent_forwarding,
+    test_hundred_percent_forwarding,
+    test_local_only_mode,
+    test_replay_historical_messages,
+    test_topic_name_mapping,
+    test_zero_percent_forwarding,
 };
 
 type TestFn = fn() -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error>>> + Send>>;
@@ -751,6 +772,134 @@ fn get_all_tests() -> Vec<TestDef> {
             test_fn: wrap_test!(test_txn_offset_commit),
             parallel_safe: true,
         },
+        // Shadow mode tests (Phase 11) - NOT parallel safe (uses external Kafka)
+        // Basic forwarding tests
+        TestDef {
+            category: "shadow",
+            name: "test_dual_write_sync",
+            test_fn: wrap_test!(test_dual_write_sync),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "shadow",
+            name: "test_dual_write_async",
+            test_fn: wrap_test!(test_dual_write_async),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "shadow",
+            name: "test_external_only_mode",
+            test_fn: wrap_test!(test_external_only_mode),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "shadow",
+            name: "test_local_only_mode",
+            test_fn: wrap_test!(test_local_only_mode),
+            parallel_safe: false,
+        },
+        // Percentage routing tests
+        TestDef {
+            category: "shadow",
+            name: "test_zero_percent_forwarding",
+            test_fn: wrap_test!(test_zero_percent_forwarding),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "shadow",
+            name: "test_hundred_percent_forwarding",
+            test_fn: wrap_test!(test_hundred_percent_forwarding),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "shadow",
+            name: "test_fifty_percent_forwarding",
+            test_fn: wrap_test!(test_fifty_percent_forwarding),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "shadow",
+            name: "test_deterministic_routing",
+            test_fn: wrap_test!(test_deterministic_routing),
+            parallel_safe: false,
+        },
+        // Dial-up tests (high volume)
+        TestDef {
+            category: "shadow",
+            name: "test_dialup_0_percent",
+            test_fn: wrap_test!(test_dialup_0_percent),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "shadow",
+            name: "test_dialup_10_percent",
+            test_fn: wrap_test!(test_dialup_10_percent),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "shadow",
+            name: "test_dialup_25_percent",
+            test_fn: wrap_test!(test_dialup_25_percent),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "shadow",
+            name: "test_dialup_50_percent",
+            test_fn: wrap_test!(test_dialup_50_percent),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "shadow",
+            name: "test_dialup_75_percent",
+            test_fn: wrap_test!(test_dialup_75_percent),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "shadow",
+            name: "test_dialup_100_percent",
+            test_fn: wrap_test!(test_dialup_100_percent),
+            parallel_safe: false,
+        },
+        // Topic mapping test
+        TestDef {
+            category: "shadow",
+            name: "test_topic_name_mapping",
+            test_fn: wrap_test!(test_topic_name_mapping),
+            parallel_safe: false,
+        },
+        // Transaction integration tests
+        TestDef {
+            category: "shadow",
+            name: "test_committed_transaction_forwarded",
+            test_fn: wrap_test!(test_committed_transaction_forwarded),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "shadow",
+            name: "test_aborted_transaction_not_forwarded",
+            test_fn: wrap_test!(test_aborted_transaction_not_forwarded),
+            parallel_safe: false,
+        },
+        // Error handling tests
+        TestDef {
+            category: "shadow",
+            name: "test_dual_write_external_down",
+            test_fn: wrap_test!(test_dual_write_external_down),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "shadow",
+            name: "test_external_only_fallback",
+            test_fn: wrap_test!(test_external_only_fallback),
+            parallel_safe: false,
+        },
+        // Replay test
+        TestDef {
+            category: "shadow",
+            name: "test_replay_historical_messages",
+            test_fn: wrap_test!(test_replay_historical_messages),
+            parallel_safe: false,
+        },
     ]
 }
 
@@ -858,7 +1007,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!(
             "            partition, error_paths, edge_cases, concurrent, negative, performance,"
         );
-        println!("            long_poll");
+        println!("            long_poll, compression, idempotent, transaction, shadow");
         return Ok(());
     }
 

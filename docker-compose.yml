@@ -18,12 +18,80 @@ services:
       - "9092:9092"  # Access Kafka Protocol from host
     environment:
       - RUST_LOG=info
+      # Shadow mode configuration for testing (Phase 11)
+      - PG_KAFKA_SHADOW_BOOTSTRAP_SERVERS=external-kafka:9093
+      - PG_KAFKA_SHADOW_SECURITY_PROTOCOL=SASL_PLAINTEXT
+      - PG_KAFKA_SHADOW_SASL_MECHANISM=PLAIN
+      - PG_KAFKA_SHADOW_SASL_USERNAME=test-user
+      - PG_KAFKA_SHADOW_SASL_PASSWORD=test-password
     # Security tweak to allow gdb/perf if you need to debug crashes
     cap_add:
       - SYS_PTRACE
     security_opt:
       - seccomp:unconfined
+    depends_on:
+      external-kafka:
+        condition: service_healthy
+    networks:
+      - pg_kafka_network
+
+  # External Kafka for shadow mode testing (Phase 11)
+  # Uses KRaft mode (no ZooKeeper) with SASL/PLAIN authentication
+  external-kafka:
+    image: apache/kafka:3.7.0
+    container_name: external_kafka
+    hostname: external-kafka
+    ports:
+      - "9093:9093"    # External Kafka listener (SASL_PLAINTEXT)
+    environment:
+      # KRaft mode configuration (no ZooKeeper)
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@external-kafka:9094
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+
+      # Listeners configuration
+      KAFKA_LISTENERS: SASL_PLAINTEXT://0.0.0.0:9093,CONTROLLER://0.0.0.0:9094
+      KAFKA_ADVERTISED_LISTENERS: SASL_PLAINTEXT://external-kafka:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,SASL_PLAINTEXT:SASL_PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: SASL_PLAINTEXT
+
+      # SASL/PLAIN authentication
+      KAFKA_SASL_ENABLED_MECHANISMS: PLAIN
+      KAFKA_SASL_MECHANISM_INTER_BROKER_PROTOCOL: PLAIN
+      KAFKA_LISTENER_NAME_SASL__PLAINTEXT_SASL_ENABLED_MECHANISMS: PLAIN
+      KAFKA_LISTENER_NAME_SASL__PLAINTEXT_PLAIN_SASL_JAAS_CONFIG: |
+        org.apache.kafka.common.security.plain.PlainLoginModule required
+        username="admin"
+        password="admin-secret"
+        user_admin="admin-secret"
+        user_test-user="test-password";
+
+      # Storage configuration
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+
+      # Topic defaults
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9093 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    networks:
+      - pg_kafka_network
+
+networks:
+  pg_kafka_network:
+    driver: bridge
 
 volumes:
   cargo_cache:
   target_cache:
+  kafka_data:
