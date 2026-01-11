@@ -92,7 +92,10 @@ pub async fn test_compression_roundtrip() -> TestResult {
     let stored_key: String = rows[0].get("key");
     assert_eq!(stored_value, test_value, "Value should match");
     assert_eq!(stored_key, test_key, "Key should match");
-    println!("   Database contains decompressed message: {}", stored_value);
+    println!(
+        "   Database contains decompressed message: {}",
+        stored_value
+    );
 
     // Step 3: Consume the message
     println!("\nStep 3: Consuming message via Kafka protocol...");

@@ -207,8 +207,13 @@ pub async fn test_fifty_percent_forwarding() -> TestResult {
         "Checking external Kafka (expecting {}-{} messages)...",
         min_expected, max_expected
     );
-    assert_external_message_count_in_range(&topic, min_expected, max_expected, Duration::from_secs(10))
-        .await?;
+    assert_external_message_count_in_range(
+        &topic,
+        min_expected,
+        max_expected,
+        Duration::from_secs(10),
+    )
+    .await?;
 
     let messages = consume_from_external(&topic, max_expected + 5, Duration::from_secs(5)).await?;
     let actual_percentage = (messages.len() as f64 / message_count as f64) * 100.0;
@@ -278,7 +283,8 @@ pub async fn test_deterministic_routing() -> TestResult {
     println!("=== Verification ===\n");
     tokio::time::sleep(Duration::from_millis(1000)).await;
 
-    let messages = consume_from_external(&topic, message_count + 5, Duration::from_secs(10)).await?;
+    let messages =
+        consume_from_external(&topic, message_count + 5, Duration::from_secs(10)).await?;
     let external_count = messages.len();
 
     println!(

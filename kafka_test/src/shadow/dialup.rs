@@ -52,7 +52,10 @@ async fn run_dialup_test(
     println!("✅ Shadow mode enabled\n");
 
     // 2. ACTION - Produce 500 messages with unique keys
-    println!("Step 3: Producing {} messages to pg_kafka...", MESSAGE_COUNT);
+    println!(
+        "Step 3: Producing {} messages to pg_kafka...",
+        MESSAGE_COUNT
+    );
     let producer = create_batch_producer()?;
 
     for i in 0..MESSAGE_COUNT {
@@ -87,7 +90,11 @@ async fn run_dialup_test(
 
     println!("  Produced:  {}", MESSAGE_COUNT);
     println!("  Forwarded: {} ({:.1}%)", forwarded, actual_percentage);
-    println!("  Skipped:   {} ({:.1}%)\n", skipped, 100.0 - actual_percentage);
+    println!(
+        "  Skipped:   {} ({:.1}%)\n",
+        skipped,
+        100.0 - actual_percentage
+    );
 
     // Verify percentage within tolerance
     if percentage == 0 {
@@ -105,7 +112,10 @@ async fn run_dialup_test(
             )
             .into());
         }
-        println!("✅ All {} messages forwarded (as expected for 100%)\n", MESSAGE_COUNT);
+        println!(
+            "✅ All {} messages forwarded (as expected for 100%)\n",
+            MESSAGE_COUNT
+        );
     } else {
         // Other percentages within tolerance
         let tolerance = (expected_max_pct - expected_min_pct) / 2.0;
