@@ -9,4 +9,4 @@ mod timeout;
 mod wakeup;
 
 pub use timeout::{test_long_poll_immediate_return, test_long_poll_timeout};
-pub use wakeup::{test_long_poll_producer_wakeup, test_long_poll_multiple_waiters};
+pub use wakeup::{test_long_poll_multiple_waiters, test_long_poll_producer_wakeup};

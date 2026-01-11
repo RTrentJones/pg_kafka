@@ -144,7 +144,11 @@ pub async fn test_concurrent_producers_different_partitions() -> TestResult {
         }
     }
 
-    assert_eq!(total, 15, "Expected 15 messages (3 partitions * 5 each), got {}", total);
+    assert_eq!(
+        total, 15,
+        "Expected 15 messages (3 partitions * 5 each), got {}",
+        total
+    );
     println!("✅ Produced {} messages across 3 partitions", total);
 
     // Verify each partition has 5 messages

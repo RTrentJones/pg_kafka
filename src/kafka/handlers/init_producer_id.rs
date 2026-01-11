@@ -35,7 +35,7 @@ use kafka_protocol::messages::ProducerId;
 /// # Returns
 /// InitProducerIdResponse with allocated (producer_id, epoch) or error
 pub fn handle_init_producer_id(
-    store: &impl KafkaStore,
+    store: &dyn KafkaStore,
     transactional_id: Option<String>,
     transaction_timeout_ms: i32,
     existing_producer_id: i64,

@@ -54,7 +54,10 @@ pub async fn test_read_committed_filters_pending() -> TestResult {
         )
         .await
         .map_err(|(err, _msg)| err)?;
-    println!("  Message queued: partition={}, offset={}\n", partition, offset);
+    println!(
+        "  Message queued: partition={}, offset={}\n",
+        partition, offset
+    );
 
     // Verify message is pending in database
     let topic_row = client
@@ -180,7 +183,10 @@ pub async fn test_read_uncommitted_sees_pending() -> TestResult {
         )
         .await
         .map_err(|(err, _msg)| err)?;
-    println!("  Message queued: partition={}, offset={}\n", partition, offset);
+    println!(
+        "  Message queued: partition={}, offset={}\n",
+        partition, offset
+    );
 
     // Verify message is pending in database
     let topic_row = client
@@ -300,7 +306,10 @@ pub async fn test_read_committed_after_commit() -> TestResult {
         )
         .await
         .map_err(|(err, _msg)| err)?;
-    println!("  Message queued: partition={}, offset={}\n", partition, offset);
+    println!(
+        "  Message queued: partition={}, offset={}\n",
+        partition, offset
+    );
 
     // Verify message is initially pending
     let topic_row = client
@@ -370,10 +379,7 @@ pub async fn test_read_committed_after_commit() -> TestResult {
         }
         Some(Ok(msg)) => {
             println!("  Message received: offset={}\n", msg.offset());
-            assert_eq!(
-                msg.offset(), offset,
-                "Should receive the committed message"
-            );
+            assert_eq!(msg.offset(), offset, "Should receive the committed message");
         }
         Some(Err(e)) => {
             println!("  Poll error: {}\n", e);

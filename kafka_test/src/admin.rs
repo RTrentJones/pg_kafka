@@ -55,10 +55,7 @@ pub async fn test_create_topic() -> TestResult {
     assert_eq!(partitions, 3, "Topic should have 3 partitions");
 
     // Cleanup - wait for completion to prevent race conditions with next test
-    if let Err(e) = admin
-        .delete_topics(&[&topic_name], &opts)
-        .await
-    {
+    if let Err(e) = admin.delete_topics(&[&topic_name], &opts).await {
         eprintln!("    Cleanup warning: {:?}", e);
     }
 
@@ -96,10 +93,7 @@ pub async fn test_create_topic_already_exists() -> TestResult {
     );
 
     // Cleanup - wait for completion to prevent race conditions with next test
-    if let Err(e) = admin
-        .delete_topics(&[&topic_name], &opts)
-        .await
-    {
+    if let Err(e) = admin.delete_topics(&[&topic_name], &opts).await {
         eprintln!("    Cleanup warning: {:?}", e);
     }
 
@@ -216,10 +210,7 @@ pub async fn test_create_partitions() -> TestResult {
     assert_eq!(partitions, 5, "Topic should have 5 partitions now");
 
     // Cleanup - wait for completion to prevent race conditions with next test
-    if let Err(e) = admin
-        .delete_topics(&[&topic_name], &opts)
-        .await
-    {
+    if let Err(e) = admin.delete_topics(&[&topic_name], &opts).await {
         eprintln!("    Cleanup warning: {:?}", e);
     }
 
@@ -259,10 +250,7 @@ pub async fn test_create_partitions_cannot_decrease() -> TestResult {
     );
 
     // Cleanup - wait for completion to prevent race conditions with next test
-    if let Err(e) = admin
-        .delete_topics(&[&topic_name], &opts)
-        .await
-    {
+    if let Err(e) = admin.delete_topics(&[&topic_name], &opts).await {
         eprintln!("    Cleanup warning: {:?}", e);
     }
 
@@ -344,10 +332,7 @@ pub async fn test_delete_group_non_empty() -> TestResult {
     drop(consumer);
 
     // Cleanup - wait for completion to prevent race conditions with next test
-    if let Err(e) = admin
-        .delete_topics(&[&topic_name], &opts)
-        .await
-    {
+    if let Err(e) = admin.delete_topics(&[&topic_name], &opts).await {
         eprintln!("    Cleanup warning: {:?}", e);
     }
 

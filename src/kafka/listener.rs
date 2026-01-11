@@ -34,6 +34,80 @@ use super::messages::{KafkaRequest, KafkaResponse, TopicFetchData};
 use super::notifications::InternalNotification;
 use super::pending_fetches::PendingFetchRegistry;
 use super::protocol;
+use super::shadow::{ForwardRequest, ShadowConfig, ShadowProducer};
+
+/// Shadow forwarder task for async forwarding
+///
+/// Receives ForwardRequest messages from the DB thread via crossbeam channel
+/// and forwards them to external Kafka asynchronously (fire-and-forget).
+async fn run_shadow_forwarder(forward_rx: Receiver<ForwardRequest>, config: Arc<ShadowConfig>) {
+    info!("Shadow forwarder task started");
+
+    // Create the producer lazily on first message
+    let producer = match ShadowProducer::new(config) {
+        Ok(p) => Arc::new(p),
+        Err(e) => {
+            warn!(
+                "Failed to create shadow producer for async forwarding: {:?}",
+                e
+            );
+            return;
+        }
+    };
+
+    info!("Shadow producer created for async forwarding");
+
+    loop {
+        // Use spawn_blocking to receive from crossbeam channel in async context
+        let rx = forward_rx.clone();
+        let result =
+            tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_millis(100))).await;
+
+        match result {
+            Ok(Ok(req)) => {
+                // Fire-and-forget: log failure but continue
+                let topic = req.topic_name.clone();
+                let partition = req.partition_id;
+                let offset = req.local_offset;
+
+                if let Err(e) = producer
+                    .send_async(
+                        &req.topic_name,
+                        Some(req.partition_id),
+                        req.key.as_deref(),
+                        req.value.as_deref(),
+                    )
+                    .await
+                {
+                    warn!(
+                        "Async forward failed for {}[{}] offset {}: {:?}",
+                        topic, partition, offset, e
+                    );
+                    // Note: No retry queue - this is intentional fire-and-forget
+                } else {
+                    debug!(
+                        "Async forward succeeded for {}[{}] offset {}",
+                        topic, partition, offset
+                    );
+                }
+            }
+            Ok(Err(crossbeam_channel::RecvTimeoutError::Timeout)) => {
+                // Normal timeout, continue
+            }
+            Ok(Err(crossbeam_channel::RecvTimeoutError::Disconnected)) => {
+                info!("Forward channel disconnected, stopping shadow forwarder");
+                break;
+            }
+            Err(_) => {
+                // spawn_blocking panicked
+                error!("Shadow forwarder recv task panicked");
+                break;
+            }
+        }
+    }
+
+    info!("Shadow forwarder task stopped");
+}
 
 /// Run the TCP listener
 ///
@@ -45,6 +119,8 @@ use super::protocol;
 /// * `listener` - Pre-bound TcpListener (bound in worker.rs)
 /// * `request_tx` - Channel sender for forwarding parsed requests to main thread
 /// * `notify_rx` - Channel receiver for notifications from DB thread (long polling)
+/// * `forward_rx` - Channel receiver for async shadow forwarding requests
+/// * `shadow_config` - Optional shadow mode configuration for async forwarding
 /// * `shutdown_rx` - Channel receiver for shutdown signal from main thread
 /// * `_log_connections` - Whether to log each new connection
 /// * `enable_long_polling` - Whether to enable long polling for FetchRequest
@@ -52,10 +128,13 @@ use super::protocol;
 ///
 /// # Thread Safety
 /// This function runs in a spawned thread and MUST NOT call pgrx functions.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     listener: TcpListener,
     request_tx: Sender<KafkaRequest>,
     notify_rx: Receiver<InternalNotification>,
+    forward_rx: Receiver<ForwardRequest>,
+    shadow_config: Option<Arc<ShadowConfig>>,
     shutdown_rx: std::sync::mpsc::Receiver<()>,
     _log_connections: bool,
     enable_long_polling: bool,
@@ -111,6 +190,18 @@ pub async fn run(
             }
         }
     });
+
+    // Spawn the shadow forwarder task (async forwarding from DB thread)
+    // This task receives ForwardRequest messages and sends them to external Kafka
+    let _forward_handle = if let Some(config) = shadow_config {
+        let forwarder_rx = forward_rx;
+        Some(tokio::spawn(async move {
+            run_shadow_forwarder(forwarder_rx, config).await;
+        }))
+    } else {
+        debug!("Shadow config not provided, async forwarding disabled");
+        None
+    };
 
     // Accept loop: wait for new connections OR shutdown signal
     loop {

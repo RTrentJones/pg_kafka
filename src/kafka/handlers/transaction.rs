@@ -38,11 +38,12 @@ use crate::kafka::messages::TxnOffsetCommitTopics;
 /// # Returns
 /// AddPartitionsToTxnResponse with per-partition error codes
 pub fn handle_add_partitions_to_txn(
-    store: &impl KafkaStore,
+    store: &dyn KafkaStore,
     transactional_id: &str,
     producer_id: i64,
     producer_epoch: i16,
     topics: Vec<(String, Vec<i32>)>, // (topic_name, partition_ids)
+    default_partitions: i32,
 ) -> Result<AddPartitionsToTxnResponse> {
     // Validate the transaction state
     store.validate_transaction(transactional_id, producer_id, producer_epoch)?;
@@ -72,9 +73,6 @@ pub fn handle_add_partitions_to_txn(
     // Build response with results for each partition
     let mut response = AddPartitionsToTxnResponse::default();
     let mut topic_results = Vec::new();
-
-    // Default partitions for auto-created topics (TODO: make configurable)
-    let default_partitions = 1;
 
     for (topic_name, partition_ids) in topics {
         let mut partition_results = Vec::new();
@@ -160,7 +158,7 @@ pub fn handle_add_partitions_to_txn(
 /// # Returns
 /// AddOffsetsToTxnResponse with error code
 pub fn handle_add_offsets_to_txn(
-    store: &impl KafkaStore,
+    store: &dyn KafkaStore,
     transactional_id: &str,
     producer_id: i64,
     producer_epoch: i16,
@@ -215,7 +213,7 @@ pub fn handle_add_offsets_to_txn(
 /// # Returns
 /// EndTxnResponse with error code
 pub fn handle_end_txn(
-    store: &impl KafkaStore,
+    store: &dyn KafkaStore,
     transactional_id: &str,
     producer_id: i64,
     producer_epoch: i16,
@@ -276,7 +274,7 @@ pub fn handle_end_txn(
 /// # Returns
 /// TxnOffsetCommitResponse with per-partition error codes
 pub fn handle_txn_offset_commit(
-    store: &impl KafkaStore,
+    store: &dyn KafkaStore,
     transactional_id: &str,
     producer_id: i64,
     producer_epoch: i16,

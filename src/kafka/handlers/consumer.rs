@@ -14,7 +14,7 @@ use kafka_protocol::protocol::StrBytes;
 ///
 /// Commits consumer offsets for a consumer group
 pub fn handle_offset_commit(
-    store: &impl KafkaStore,
+    store: &dyn KafkaStore,
     group_id: String,
     topics: Vec<crate::kafka::messages::OffsetCommitTopicData>,
 ) -> Result<kafka_protocol::messages::offset_commit_response::OffsetCommitResponse> {
@@ -107,7 +107,7 @@ pub fn handle_offset_commit(
 ///
 /// Fetches committed offsets for a consumer group
 pub fn handle_offset_fetch(
-    store: &impl KafkaStore,
+    store: &dyn KafkaStore,
     group_id: String,
     topics: Option<Vec<crate::kafka::messages::OffsetFetchTopicData>>,
 ) -> Result<kafka_protocol::messages::offset_fetch_response::OffsetFetchResponse> {

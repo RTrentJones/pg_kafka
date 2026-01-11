@@ -4,9 +4,9 @@
 //! This validates TxnOffsetCommit API functionality.
 
 use crate::common::{create_db_client, create_producer, create_transactional_producer, TestResult};
+use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::producer::{FutureRecord, Producer};
-use rdkafka::config::ClientConfig;
 use rdkafka::{Message, Offset, TopicPartitionList};
 use std::time::Duration;
 use uuid::Uuid;
@@ -65,7 +65,10 @@ pub async fn test_txn_offset_commit() -> TestResult {
             .map_err(|(e, _)| e)?;
     }
     seed_producer.flush(Duration::from_secs(5))?;
-    println!("  Seeded {} messages to source topic\n", source_messages.len());
+    println!(
+        "  Seeded {} messages to source topic\n",
+        source_messages.len()
+    );
 
     // Step 2: Consume messages from source topic
     println!("Step 2: Consuming messages from source topic...");
@@ -105,7 +108,10 @@ pub async fn test_txn_offset_commit() -> TestResult {
         "Should consume all {} messages",
         source_messages.len()
     );
-    println!("  Consumed {} messages, last offset: {}\n", consumed_count, last_offset);
+    println!(
+        "  Consumed {} messages, last offset: {}\n",
+        consumed_count, last_offset
+    );
 
     // Step 3: Create transactional producer and begin transaction
     println!("Step 3: Beginning transaction...");
@@ -141,12 +147,18 @@ pub async fn test_txn_offset_commit() -> TestResult {
     let cgm = consumer.group_metadata();
     match cgm {
         Some(metadata) => {
-            txn_producer.send_offsets_to_transaction(&commit_tpl, &metadata, Duration::from_secs(10))?;
+            txn_producer.send_offsets_to_transaction(
+                &commit_tpl,
+                &metadata,
+                Duration::from_secs(10),
+            )?;
             println!("  Sent offset {} to transaction\n", commit_offset);
         }
         None => {
             // If group_metadata returns None, we can still test via database verification
-            println!("  Note: group_metadata() returned None, skipping send_offsets_to_transaction");
+            println!(
+                "  Note: group_metadata() returned None, skipping send_offsets_to_transaction"
+            );
             println!("  Will verify via database instead\n");
         }
     }
@@ -207,7 +219,10 @@ pub async fn test_txn_offset_commit() -> TestResult {
     match committed_offset_row {
         Some(row) => {
             let committed: i64 = row.get(0);
-            println!("  Consumer offset committed: {} (expected: {})", committed, commit_offset);
+            println!(
+                "  Consumer offset committed: {} (expected: {})",
+                committed, commit_offset
+            );
             assert_eq!(
                 committed, commit_offset,
                 "Committed offset should match expected"

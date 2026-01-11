@@ -56,7 +56,10 @@ pub async fn test_transactional_producer_commit() -> TestResult {
             println!("  Failed to deliver message: {}", err);
             err
         })?;
-    println!("  Message queued: partition={}, offset={}\n", partition, offset);
+    println!(
+        "  Message queued: partition={}, offset={}\n",
+        partition, offset
+    );
 
     // Commit the transaction
     println!("Committing transaction...");
@@ -98,10 +101,7 @@ pub async fn test_transactional_producer_commit() -> TestResult {
 
     // Check message visibility
     let topic_row = client
-        .query_one(
-            "SELECT id FROM kafka.topics WHERE name = $1",
-            &[&topic],
-        )
+        .query_one("SELECT id FROM kafka.topics WHERE name = $1", &[&topic])
         .await?;
     let topic_id: i32 = topic_row.get(0);
 
@@ -180,7 +180,10 @@ pub async fn test_transactional_producer_abort() -> TestResult {
             println!("  Failed to deliver message: {}", err);
             err
         })?;
-    println!("  Message queued: partition={}, offset={}\n", partition, offset);
+    println!(
+        "  Message queued: partition={}, offset={}\n",
+        partition, offset
+    );
 
     // Abort the transaction
     println!("Aborting transaction...");
@@ -222,10 +225,7 @@ pub async fn test_transactional_producer_abort() -> TestResult {
 
     // Check message state
     let topic_row = client
-        .query_one(
-            "SELECT id FROM kafka.topics WHERE name = $1",
-            &[&topic],
-        )
+        .query_one("SELECT id FROM kafka.topics WHERE name = $1", &[&topic])
         .await?;
     let topic_id: i32 = topic_row.get(0);
 
@@ -321,7 +321,10 @@ pub async fn test_transactional_batch() -> TestResult {
             )
             .await
             .map_err(|(err, _msg)| err)?;
-        println!("  Queued: key={}, partition={}, offset={}", key, partition, offset);
+        println!(
+            "  Queued: key={}, partition={}, offset={}",
+            key, partition, offset
+        );
         offsets.push(offset);
     }
     println!();
@@ -385,14 +388,29 @@ pub async fn test_producer_fencing() -> TestResult {
     producer1.init_transactions(Duration::from_secs(10))?;
     println!("  First producer initialized\n");
 
-    // Get epoch for first producer
-    let row1 = client
-        .query_one(
-            "SELECT producer_epoch FROM kafka.transactions WHERE transactional_id = $1",
-            &[&txn_id],
-        )
-        .await?;
-    let epoch1: i16 = row1.get(0);
+    // Get epoch for first producer (with retry for timing)
+    let epoch1 = {
+        let mut retries = 0;
+        let max_retries = 10;
+        loop {
+            let row = client
+                .query_opt(
+                    "SELECT producer_epoch FROM kafka.transactions WHERE transactional_id = $1",
+                    &[&txn_id],
+                )
+                .await?;
+            match row {
+                Some(r) => break r.get::<_, i16>(0),
+                None if retries < max_retries => {
+                    retries += 1;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                None => {
+                    return Err("Transaction record not found after init_transactions".into());
+                }
+            }
+        }
+    };
     println!("  First producer epoch: {}", epoch1);
 
     // Begin transaction on first producer
@@ -402,7 +420,9 @@ pub async fn test_producer_fencing() -> TestResult {
     // Produce a message with first producer (should succeed)
     let result1 = producer1
         .send(
-            FutureRecord::to(&topic).payload("before-fencing").key("key"),
+            FutureRecord::to(&topic)
+                .payload("before-fencing")
+                .key("key"),
             Duration::from_secs(5),
         )
         .await;
@@ -415,14 +435,39 @@ pub async fn test_producer_fencing() -> TestResult {
     producer2.init_transactions(Duration::from_secs(10))?;
     println!("  Second producer initialized (should have fenced first)\n");
 
-    // Get epoch for second producer
-    let row2 = client
-        .query_one(
-            "SELECT producer_epoch FROM kafka.transactions WHERE transactional_id = $1",
-            &[&txn_id],
-        )
-        .await?;
-    let epoch2: i16 = row2.get(0);
+    // Get epoch for second producer (with retry for epoch bump to propagate)
+    let epoch2 = {
+        let mut retries = 0;
+        let max_retries = 10;
+        loop {
+            let row = client
+                .query_opt(
+                    "SELECT producer_epoch FROM kafka.transactions WHERE transactional_id = $1",
+                    &[&txn_id],
+                )
+                .await?;
+            match row {
+                Some(r) => {
+                    let epoch: i16 = r.get(0);
+                    // Wait for epoch to be bumped (should be > epoch1)
+                    if epoch > epoch1 || retries >= max_retries {
+                        break epoch;
+                    }
+                    retries += 1;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                None if retries < max_retries => {
+                    retries += 1;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                None => {
+                    return Err(
+                        "Transaction record not found after second init_transactions".into(),
+                    );
+                }
+            }
+        }
+    };
     println!("  Second producer epoch: {}", epoch2);
 
     // Verify epoch was bumped
@@ -432,7 +477,10 @@ pub async fn test_producer_fencing() -> TestResult {
         epoch2,
         epoch1
     );
-    println!("  Epoch bumped: {} -> {} (fencing confirmed)\n", epoch1, epoch2);
+    println!(
+        "  Epoch bumped: {} -> {} (fencing confirmed)\n",
+        epoch1, epoch2
+    );
 
     // Try to produce with the fenced producer
     println!("Attempting to produce with fenced producer...");
@@ -446,7 +494,10 @@ pub async fn test_producer_fencing() -> TestResult {
     match result2 {
         Ok((partition, offset)) => {
             // Message was queued - try to commit (this should fail)
-            println!("  Message queued: partition={}, offset={}", partition, offset);
+            println!(
+                "  Message queued: partition={}, offset={}",
+                partition, offset
+            );
             println!("  Attempting to commit with fenced producer...");
 
             let commit_result = producer1.commit_transaction(Duration::from_secs(10));
@@ -524,7 +575,10 @@ pub async fn test_producer_fencing() -> TestResult {
     let final_epoch: i16 = txn_state.get(1);
 
     println!("  Transaction state: {}", final_state);
-    println!("  Current epoch: {} (should match second producer: {})", final_epoch, epoch2);
+    println!(
+        "  Current epoch: {} (should match second producer: {})",
+        final_epoch, epoch2
+    );
 
     // The epoch should be the newer one (from producer2)
     assert_eq!(final_epoch, epoch2, "Epoch should match second producer");

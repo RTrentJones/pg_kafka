@@ -23,7 +23,7 @@ pub enum TopicResolution {
 /// - `TopicResolution::Found(topic_id)` if the topic exists
 /// - `TopicResolution::NotFound` if the topic doesn't exist
 /// - `TopicResolution::Error(code)` if a storage error occurred
-pub fn resolve_topic_id<S: KafkaStore>(store: &S, topic_name: &str) -> TopicResolution {
+pub fn resolve_topic_id<S: KafkaStore + ?Sized>(store: &S, topic_name: &str) -> TopicResolution {
     match store.get_topic_metadata(Some(std::slice::from_ref(&topic_name.to_string()))) {
         Ok(topics) => {
             if let Some(tm) = topics.first() {

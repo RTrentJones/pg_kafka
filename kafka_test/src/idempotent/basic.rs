@@ -123,10 +123,7 @@ pub async fn test_idempotent_producer_basic() -> TestResult {
         .await?;
 
     let producer_ids_exists: bool = schema_check[0].get(0);
-    assert!(
-        producer_ids_exists,
-        "kafka.producer_ids table should exist"
-    );
+    assert!(producer_ids_exists, "kafka.producer_ids table should exist");
     println!("✅ kafka.producer_ids table exists\n");
 
     // Verify sequence tracking schema exists (Phase 9)

@@ -186,7 +186,7 @@ impl TestTopic {
 
     /// Produce a single message and return its offset
     pub async fn produce_one(&self, msg: &TestMessage) -> Result<i64, Box<dyn std::error::Error>> {
-        let offsets = self.produce(&[msg.clone()]).await?;
+        let offsets = self.produce(std::slice::from_ref(msg)).await?;
         Ok(offsets[0])
     }
 }

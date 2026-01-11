@@ -27,7 +27,7 @@ pub fn handle_api_versions() -> kafka_protocol::messages::api_versions_response:
 /// * `broker_port` - Port for broker metadata
 /// * `default_partitions` - Partition count for auto-created topics
 pub fn handle_metadata(
-    store: &impl KafkaStore,
+    store: &dyn KafkaStore,
     requested_topics: Option<Vec<String>>,
     broker_host: String,
     broker_port: i32,

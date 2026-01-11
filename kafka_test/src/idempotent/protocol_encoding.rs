@@ -27,9 +27,13 @@ use kafka_protocol::messages::produce_request::{
     TopicProduceData as ProtoTopicProduceData,
 };
 use kafka_protocol::messages::produce_response::ProduceResponse;
-use kafka_protocol::messages::{ProducerId, RequestHeader, ResponseHeader, TopicName, TransactionalId};
+use kafka_protocol::messages::{
+    ProducerId, RequestHeader, ResponseHeader, TopicName, TransactionalId,
+};
 use kafka_protocol::protocol::{Decodable, Encodable, StrBytes};
-use kafka_protocol::records::{Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType};
+use kafka_protocol::records::{
+    Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -56,7 +60,8 @@ pub fn encode_init_producer_id_request(
     transactional_id: Option<String>,
 ) -> Bytes {
     let mut request = InitProducerIdRequest::default();
-    request.transactional_id = transactional_id.map(|s| TransactionalId::from(StrBytes::from_string(s)));
+    request.transactional_id =
+        transactional_id.map(|s| TransactionalId::from(StrBytes::from_string(s)));
     request.transaction_timeout_ms = 60000;
     request.producer_id = ProducerId(-1); // -1 = request new ID
     request.producer_epoch = -1;
@@ -114,10 +119,10 @@ pub fn encode_produce_request(
             transactional: false,
             control: false,
             partition_leader_epoch: -1,
-            producer_id,        // CRITICAL for idempotency
-            producer_epoch,     // CRITICAL for idempotency
+            producer_id,    // CRITICAL for idempotency
+            producer_epoch, // CRITICAL for idempotency
             timestamp_type: TimestampType::Creation,
-            offset: i as i64,   // Offset delta within batch
+            offset: i as i64,                   // Offset delta within batch
             sequence: base_sequence + i as i32, // CRITICAL for idempotency
             timestamp: now,
             key: None,
@@ -132,7 +137,7 @@ pub fn encode_produce_request(
         &mut encoded_batch,
         kafka_records.iter(),
         &RecordEncodeOptions {
-            version: 2,  // RecordBatch v2 for idempotent producers
+            version: 2, // RecordBatch v2 for idempotent producers
             compression: Compression::None,
         },
     )

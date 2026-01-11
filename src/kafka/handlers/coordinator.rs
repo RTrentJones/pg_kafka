@@ -124,7 +124,7 @@ pub fn handle_join_group(
 /// If leader sends empty assignments, server computes assignments automatically.
 pub fn handle_sync_group(
     coordinator: &crate::kafka::GroupCoordinator,
-    store: &impl crate::kafka::KafkaStore,
+    store: &dyn crate::kafka::KafkaStore,
     group_id: String,
     member_id: String,
     generation_id: i32,

@@ -1287,7 +1287,7 @@ mod tests {
         let topics = vec![("test-topic".to_string(), vec![0, 1])];
 
         let response =
-            transaction::handle_add_partitions_to_txn(&mock, "txn-1", 1000, 0, topics).unwrap();
+            transaction::handle_add_partitions_to_txn(&mock, "txn-1", 1000, 0, topics, 1).unwrap();
 
         // Should have one topic result
         assert_eq!(response.results_by_topic_v3_and_below.len(), 1);
@@ -1322,7 +1322,7 @@ mod tests {
         let topics = vec![("test-topic".to_string(), vec![0])];
 
         let response =
-            transaction::handle_add_partitions_to_txn(&mock, "txn-1", 1000, 0, topics).unwrap();
+            transaction::handle_add_partitions_to_txn(&mock, "txn-1", 1000, 0, topics, 1).unwrap();
 
         assert_eq!(response.results_by_topic_v3_and_below.len(), 1);
         assert_eq!(
@@ -1347,7 +1347,7 @@ mod tests {
         let topics = vec![("test-topic".to_string(), vec![0, 5])];
 
         let response =
-            transaction::handle_add_partitions_to_txn(&mock, "txn-1", 1000, 0, topics).unwrap();
+            transaction::handle_add_partitions_to_txn(&mock, "txn-1", 1000, 0, topics, 1).unwrap();
 
         let partitions = &response.results_by_topic_v3_and_below[0].results_by_partition;
         assert_eq!(partitions.len(), 2);
@@ -1384,7 +1384,7 @@ mod tests {
         let topics = vec![("new-topic".to_string(), vec![0])];
 
         let response =
-            transaction::handle_add_partitions_to_txn(&mock, "txn-1", 1000, 0, topics).unwrap();
+            transaction::handle_add_partitions_to_txn(&mock, "txn-1", 1000, 0, topics, 1).unwrap();
 
         // Should succeed because topic was auto-created
         assert_eq!(
@@ -1405,7 +1405,7 @@ mod tests {
 
         let topics = vec![("test-topic".to_string(), vec![0])];
 
-        let result = transaction::handle_add_partitions_to_txn(&mock, "txn-1", 1000, 0, topics);
+        let result = transaction::handle_add_partitions_to_txn(&mock, "txn-1", 1000, 0, topics, 1);
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -1426,7 +1426,7 @@ mod tests {
         let topics = vec![("test-topic".to_string(), vec![0])];
 
         let result =
-            transaction::handle_add_partitions_to_txn(&mock, "unknown-txn", 1000, 0, topics);
+            transaction::handle_add_partitions_to_txn(&mock, "unknown-txn", 1000, 0, topics, 1);
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -1445,7 +1445,7 @@ mod tests {
 
         let topics = vec![("test-topic".to_string(), vec![0])];
 
-        let result = transaction::handle_add_partitions_to_txn(&mock, "txn-1", 1000, 0, topics);
+        let result = transaction::handle_add_partitions_to_txn(&mock, "txn-1", 1000, 0, topics, 1);
 
         assert!(result.is_err());
         match result.unwrap_err() {

@@ -268,6 +268,6 @@ Each phase includes:
 - [x] Phase 6: kcat/rdkafka can create/delete topics programmatically ✅
 - [x] Phase 7: Multi-consumer groups work on multi-partition topics ✅
 - [x] Phase 8: Compressed messages accepted and stored ✅
-- [ ] Phase 9: `enable.idempotence=true` works without duplicates
+- [X] Phase 9: `enable.idempotence=true` works without duplicates
 - [ ] Phase 10: Transactional producer commits atomically
 - [x] All tests passing, zero compilation warnings ✅

@@ -100,14 +100,14 @@ pub async fn test_request_pipelining() -> TestResult {
     println!("Reading responses...");
     let mut received_ids = Vec::new();
 
-    for i in 0..num_requests {
+    for (i, &expected_id) in correlation_ids.iter().enumerate().take(num_requests) {
         let received_id = read_response_correlation_id(&mut stream).await?;
         received_ids.push(received_id);
         println!(
             "  Response {}: correlation_id={} (expected={})",
             i + 1,
             received_id,
-            correlation_ids[i]
+            expected_id
         );
     }
 
@@ -115,7 +115,8 @@ pub async fn test_request_pipelining() -> TestResult {
     println!("\nVerifying response order...");
     for (i, (&expected, &received)) in correlation_ids.iter().zip(received_ids.iter()).enumerate() {
         assert_eq!(
-            expected, received,
+            expected,
+            received,
             "Response {} has wrong correlation ID: expected {}, got {}",
             i + 1,
             expected,

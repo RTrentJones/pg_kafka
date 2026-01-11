@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `pg_kafka` is a PostgreSQL extension written in Rust (via pgrx) that embeds a Kafka-compatible wire protocol listener directly into the Postgres runtime. It allows standard Kafka clients to produce and consume messages using Postgres as the backing store.
 
-**Status:** Phase 10 Complete - Transaction Support (Portfolio/Learning Project)
+**Status:** Phase 11 Complete - Shadow Mode (Portfolio/Learning Project)
 
 **Current Implementation:**
 - ✅ **Phase 1 Complete:** Metadata support (ApiVersions, Metadata requests)
@@ -20,9 +20,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - ✅ **Phase 8 Complete:** Compression Support (gzip, snappy, lz4, zstd)
 - ✅ **Phase 9 Complete:** Idempotent Producer (InitProducerId, sequence validation, deduplication)
 - ✅ **Phase 10 Complete:** Transaction Support (AddPartitionsToTxn, AddOffsetsToTxn, EndTxn, TxnOffsetCommit)
+- ✅ **Phase 11 Complete:** Shadow Mode (external Kafka forwarding, SASL/SSL, per-topic config, replay)
 - ✅ **Enhancement:** Long Polling (max_wait_ms/min_bytes support, in-memory notification)
 - ✅ **CI/CD:** GitHub Actions pipeline with automated testing
-- ⏳ **Phase 11:** Shadow Mode (Logical Decoding → external Kafka)
 
 **What Works Now:**
 - TCP listener on port 9092 with full Kafka wire protocol parsing
@@ -42,10 +42,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Multi-partition topics with key-based partition routing (murmur2 hash)
 - Dual-offset design (partition_offset + global_offset)
 - Repository Pattern storage abstraction (KafkaStore trait + PostgresStore impl)
+- Shadow mode for forwarding to external Kafka with SASL/SSL, per-topic config, replay support
 - Automated E2E tests with real Kafka client (rdkafka)
 
 **API Coverage:** 23 of ~50 standard Kafka APIs (46%)
-**Test Status:** All unit tests (287) and E2E tests (74) passing ✅
+**Test Status:** All unit tests (406) and E2E tests (74) passing ✅
 **Coverage Target:** 80%+ (testable code)
 
 ## Development Setup

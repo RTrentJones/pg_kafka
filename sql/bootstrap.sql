@@ -237,3 +237,90 @@ COMMENT ON COLUMN kafka.transactions.started_at IS 'When the current transaction
 COMMENT ON TABLE kafka.txn_pending_offsets IS 'Pending offset commits within an active transaction. Moved to consumer_offsets on commit.';
 
 COMMENT ON COLUMN kafka.txn_pending_offsets.pending_offset IS 'Offset to be committed when transaction completes successfully';
+
+-- =============================================================================
+-- Phase 11: Shadow Mode (included from shadow_mode.sql)
+-- =============================================================================
+-- NOTE: Shadow mode tables are defined inline below rather than via \i
+-- to avoid SQL file include issues with pgrx extension packaging.
+
+-- Shadow mode configuration per topic
+CREATE TABLE kafka.shadow_config (
+    topic_id INT PRIMARY KEY REFERENCES kafka.topics(id) ON DELETE CASCADE,
+    mode TEXT NOT NULL DEFAULT 'local_only',
+    forward_percentage INT NOT NULL DEFAULT 0,
+    external_topic_name TEXT,
+    sync_mode TEXT NOT NULL DEFAULT 'sync',  -- Now always sync (async deprecated)
+    write_mode TEXT NOT NULL DEFAULT 'dual_write',  -- dual_write or external_only
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    CONSTRAINT valid_mode CHECK (mode IN ('local_only', 'shadow')),
+    CONSTRAINT valid_percentage CHECK (forward_percentage >= 0 AND forward_percentage <= 100),
+    CONSTRAINT valid_sync_mode CHECK (sync_mode IN ('async', 'sync')),
+    CONSTRAINT valid_write_mode CHECK (write_mode IN ('dual_write', 'external_only'))
+);
+
+-- Tracking table for forwarding state
+CREATE TABLE kafka.shadow_tracking (
+    topic_id INT NOT NULL,
+    partition_id INT NOT NULL,
+    local_offset BIGINT NOT NULL,
+    external_offset BIGINT,
+    forwarded_at TIMESTAMP,
+    error_message TEXT,
+    retry_count INT NOT NULL DEFAULT 0,
+    PRIMARY KEY (topic_id, partition_id, local_offset),
+    FOREIGN KEY (topic_id) REFERENCES kafka.topics(id) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_shadow_tracking_pending
+ON kafka.shadow_tracking(topic_id, partition_id, local_offset)
+WHERE external_offset IS NULL;
+
+CREATE INDEX idx_shadow_tracking_errors
+ON kafka.shadow_tracking(topic_id, partition_id)
+WHERE error_message IS NOT NULL;
+
+-- Per-partition metrics
+CREATE TABLE kafka.shadow_metrics (
+    topic_id INT NOT NULL,
+    partition_id INT NOT NULL,
+    messages_forwarded BIGINT NOT NULL DEFAULT 0,
+    messages_skipped BIGINT NOT NULL DEFAULT 0,
+    messages_failed BIGINT NOT NULL DEFAULT 0,
+    last_forwarded_offset BIGINT NOT NULL DEFAULT -1,
+    last_forwarded_at TIMESTAMP,
+    PRIMARY KEY (topic_id, partition_id)
+);
+
+-- Monitoring view
+CREATE VIEW kafka.shadow_status AS
+SELECT
+    t.name AS topic_name,
+    COALESCE(sc.mode, 'local_only') AS mode,
+    COALESCE(sc.forward_percentage, 0) AS forward_percentage,
+    COALESCE(sc.sync_mode, 'async') AS sync_mode,
+    sc.external_topic_name,
+    COALESCE(SUM(sm.messages_forwarded), 0)::BIGINT AS total_forwarded,
+    COALESCE(SUM(sm.messages_skipped), 0)::BIGINT AS total_skipped,
+    COALESCE(SUM(sm.messages_failed), 0)::BIGINT AS total_failed,
+    MAX(sm.last_forwarded_offset) AS last_forwarded_offset,
+    MAX(sm.last_forwarded_at) AS last_forwarded_at,
+    (SELECT MAX(partition_offset) FROM kafka.messages WHERE topic_id = t.id) -
+        COALESCE(MAX(sm.last_forwarded_offset), 0) AS lag
+FROM kafka.topics t
+LEFT JOIN kafka.shadow_config sc ON t.id = sc.topic_id
+LEFT JOIN kafka.shadow_metrics sm ON t.id = sm.topic_id
+GROUP BY t.id, t.name, sc.mode, sc.forward_percentage, sc.sync_mode, sc.external_topic_name;
+
+-- Grant permissions
+GRANT SELECT ON kafka.shadow_config TO PUBLIC;
+GRANT SELECT ON kafka.shadow_tracking TO PUBLIC;
+GRANT SELECT ON kafka.shadow_metrics TO PUBLIC;
+GRANT SELECT ON kafka.shadow_status TO PUBLIC;
+
+-- Comments
+COMMENT ON TABLE kafka.shadow_config IS 'Per-topic shadow mode configuration for forwarding to external Kafka.';
+COMMENT ON TABLE kafka.shadow_tracking IS 'Tracks which messages have been forwarded and their external offsets.';
+COMMENT ON TABLE kafka.shadow_metrics IS 'Aggregated shadow mode metrics per topic/partition.';
+COMMENT ON VIEW kafka.shadow_status IS 'Unified view of shadow mode health, lag, and error counts.';
