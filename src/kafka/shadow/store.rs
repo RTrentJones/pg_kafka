@@ -233,7 +233,12 @@ impl<S: KafkaStore> ShadowStore<S> {
 
         if !config.is_configured() {
             pgrx::warning!(
-                "⚠️  SHADOW MODE WARNING: pg_kafka.shadow_mode_enabled=true but pg_kafka.shadow_bootstrap_servers is not configured. Messages will NOT be forwarded to external Kafka!"
+                "⚠️  SHADOW MODE WARNING: \
+                 pg_kafka.shadow_mode_enabled={} \
+                 pg_kafka.shadow_bootstrap_servers='{}' \
+                 Shadow mode is NOT properly configured - messages will NOT be forwarded!",
+                config.enabled,
+                config.bootstrap_servers
             );
             return None;
         }

@@ -296,16 +296,31 @@ jobs:
         # IMPORTANT: Use 'postgres' database since that's where the worker connects via SPI
         DATABASE_URL: postgresql://${{ env.DB_USER }}@localhost:${{ env.PG_PORT }}/postgres
 
+    # Start external Kafka for shadow mode tests
+    - name: Start External Kafka
+      run: |
+        docker-compose up -d external-kafka
+        echo "Waiting for Kafka to be healthy..."
+        timeout 60 bash -c 'until docker-compose ps external-kafka | grep -q "(healthy)"; do
+          echo "Waiting for Kafka healthcheck..."
+          sleep 2
+        done'
+        echo "External Kafka is ready"
+
+    # Run shadow mode E2E tests (now required to pass)
     - name: Run Shadow Mode E2E Tests
-      # Shadow mode tests run separately to isolate external Kafka interactions
-      # These are advisory - don't block CI while shadow mode is being developed
-      timeout-minutes: 5
-      continue-on-error: true
+      timeout-minutes: 15
       run: |
         cd kafka_test
         cargo run --release -- --category shadow
       env:
         DATABASE_URL: postgresql://${{ env.DB_USER }}@localhost:${{ env.PG_PORT }}/postgres
+
+    # Cleanup external Kafka
+    - name: Stop External Kafka
+      if: always()
+      run: |
+        docker-compose down -v
 
     - name: Run Performance E2E Tests
       # Performance tests run separately with their own timeout

@@ -4,6 +4,7 @@
 //! and verifying forwarding behavior.
 
 use crate::common::TestResult;
+use crate::shadow::external_client::get_external_bootstrap_servers;
 use tokio_postgres::Client;
 
 /// Shadow mode configuration for a topic
@@ -55,6 +56,32 @@ pub async fn enable_shadow_mode(
     // First ensure topic exists
     let topic_id = get_or_create_topic_id(db, topic_name).await?;
 
+    // Configure global GUCs for shadow mode
+    let bootstrap_servers = get_external_bootstrap_servers();
+    println!("  Setting pg_kafka.shadow_bootstrap_servers = '{}'", bootstrap_servers);
+
+    db.execute(
+        "ALTER SYSTEM SET pg_kafka.shadow_mode_enabled = true",
+        &[],
+    ).await?;
+
+    db.execute(
+        &format!("ALTER SYSTEM SET pg_kafka.shadow_bootstrap_servers = '{}'", bootstrap_servers),
+        &[],
+    ).await?;
+
+    db.execute(
+        "ALTER SYSTEM SET pg_kafka.shadow_security_protocol = 'PLAINTEXT'",
+        &[],
+    ).await?;
+
+    // Reload configuration so background worker sees new GUCs
+    println!("  Reloading PostgreSQL configuration...");
+    db.execute("SELECT pg_reload_conf()", &[]).await?;
+
+    // Wait for GUC reload to propagate (pg_reload_conf is async)
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+
     let mode_str = match config.mode {
         ShadowMode::LocalOnly => "local_only",
         ShadowMode::Shadow => "shadow",
@@ -92,17 +119,24 @@ pub async fn enable_shadow_mode(
     )
     .await?;
 
-    // Wait for background config reload (happens every 30 seconds)
-    // Sleep 31 seconds to ensure at least one reload cycle completes
-    println!("⏳ Waiting for shadow config reload (31s)...");
-    tokio::time::sleep(std::time::Duration::from_secs(31)).await;
+    // Trigger immediate config reload via SQL function (< 1 second)
+    println!("⏳ Triggering shadow config reload...");
+    db.execute("SELECT reload_shadow_config()", &[])
+        .await?;
+
+    // Give worker time to process reload (next loop iteration ~100ms)
+    // Use 500ms to be safe (5x the loop interval)
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     println!("✅ Config reload complete");
 
     Ok(())
 }
 
-/// Disable shadow mode for a topic
+/// Disable shadow mode for a topic and reset GUCs
 pub async fn disable_shadow_mode(db: &Client, topic_name: &str) -> TestResult {
+    println!("=== Disabling shadow mode ===");
+
+    // Disable shadow mode for topic
     db.execute(
         r#"
         UPDATE kafka.shadow_config sc
@@ -113,6 +147,21 @@ pub async fn disable_shadow_mode(db: &Client, topic_name: &str) -> TestResult {
         &[&topic_name],
     )
     .await?;
+
+    // Reset global GUCs
+    db.execute("ALTER SYSTEM RESET pg_kafka.shadow_mode_enabled", &[]).await?;
+    db.execute("ALTER SYSTEM RESET pg_kafka.shadow_bootstrap_servers", &[]).await?;
+    db.execute("ALTER SYSTEM RESET pg_kafka.shadow_security_protocol", &[]).await?;
+
+    // Reload config
+    db.execute("SELECT pg_reload_conf()", &[]).await?;
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+
+    // Trigger shadow config reload
+    db.execute("SELECT reload_shadow_config()", &[]).await?;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    println!("✅ Shadow mode disabled");
     Ok(())
 }
 

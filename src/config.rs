@@ -357,18 +357,18 @@ pub fn init() {
     GucRegistry::define_string_guc(
         c"pg_kafka.shadow_bootstrap_servers",
         c"External Kafka bootstrap servers",
-        c"Comma-separated list of external Kafka brokers (e.g., 'kafka1:9092,kafka2:9092'). Requires restart.",
+        c"Comma-separated list of external Kafka brokers (e.g., 'kafka1:9092,kafka2:9092'). Reloadable with pg_reload_conf().",
         &SHADOW_BOOTSTRAP_SERVERS,
-        GucContext::Postmaster,
+        GucContext::Sighup,
         GucFlags::default(),
     );
 
     GucRegistry::define_string_guc(
         c"pg_kafka.shadow_security_protocol",
         c"Security protocol for external Kafka",
-        c"Security protocol: SASL_SSL, SASL_PLAINTEXT, SSL, PLAINTEXT. Default: SASL_SSL. Requires restart.",
+        c"Security protocol: SASL_SSL, SASL_PLAINTEXT, SSL, PLAINTEXT. Default: SASL_SSL. Reloadable with pg_reload_conf().",
         &SHADOW_SECURITY_PROTOCOL,
-        GucContext::Postmaster,
+        GucContext::Sighup,
         GucFlags::default(),
     );
 

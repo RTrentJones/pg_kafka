@@ -71,6 +71,28 @@ impl TestContext {
 
     /// Manually trigger cleanup (also called automatically on drop)
     pub async fn cleanup(&self) -> TestResult {
+        // Reset shadow mode GUCs (test isolation)
+        // Use best-effort (ignore errors) since cleanup should be robust
+        let _ = self.db_client.execute(
+            "ALTER SYSTEM RESET pg_kafka.shadow_mode_enabled",
+            &[],
+        ).await;
+
+        let _ = self.db_client.execute(
+            "ALTER SYSTEM RESET pg_kafka.shadow_bootstrap_servers",
+            &[],
+        ).await;
+
+        let _ = self.db_client.execute(
+            "ALTER SYSTEM RESET pg_kafka.shadow_security_protocol",
+            &[],
+        ).await;
+
+        // Reload config (best-effort)
+        let _ = self.db_client.execute("SELECT pg_reload_conf()", &[]).await;
+
+        // No need to wait here - next test will wait during setup
+
         let topics = self.topics_created.lock().await;
         let groups = self.groups_created.lock().await;
 

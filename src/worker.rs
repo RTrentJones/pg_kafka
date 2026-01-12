@@ -569,9 +569,20 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
         }
 
         // ┌─────────────────────────────────────────────────────────────┐
-        // │ Shadow Config Reload & Metrics Flush (Periodic, ~30 secs)  │
+        // │ Shadow Config Reload & Metrics Flush                        │
+        // │ Triggers: Periodic (30s) OR Immediate (SQL function)        │
         // └─────────────────────────────────────────────────────────────┘
-        if last_shadow_config_check.elapsed() >= SHADOW_CONFIG_RELOAD_INTERVAL {
+        let should_reload = last_shadow_config_check.elapsed() >= SHADOW_CONFIG_RELOAD_INTERVAL
+            || crate::RELOAD_SHADOW_CONFIG_REQUESTED.load(std::sync::atomic::Ordering::Relaxed);
+
+        if should_reload {
+            // Clear the request flag if it was set
+            if crate::RELOAD_SHADOW_CONFIG_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
+                crate::RELOAD_SHADOW_CONFIG_REQUESTED
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                pg_log!("Processing immediate shadow config reload request");
+            }
+
             let shadow_reload = AssertUnwindSafe(&shadow_store);
             BackgroundWorker::transaction(move || {
                 // Reload topic shadow configurations
