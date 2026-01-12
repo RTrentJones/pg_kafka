@@ -432,6 +432,15 @@ pub const DEFAULT_SHADOW_METRICS_ENABLED: bool = true;
 /// Default shadow OpenTelemetry endpoint (empty = disabled)
 pub const DEFAULT_SHADOW_OTEL_ENDPOINT: &str = "";
 
+/// Shadow config reload interval (milliseconds)
+pub const DEFAULT_SHADOW_CONFIG_RELOAD_MS: i32 = 30_000; // 30 seconds
+
+/// Minimum shadow config reload interval (milliseconds)
+pub const MIN_SHADOW_CONFIG_RELOAD_MS: i32 = 100; // 0.1 seconds
+
+/// Maximum shadow config reload interval (milliseconds)
+pub const MAX_SHADOW_CONFIG_RELOAD_MS: i32 = 300_000; // 5 minutes
+
 // ===== Shadow Mode Error Codes =====
 
 /// Shadow mode forwarding failed

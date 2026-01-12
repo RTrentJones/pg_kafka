@@ -58,22 +58,36 @@ pub async fn enable_shadow_mode(
 
     // Configure global GUCs for shadow mode
     let bootstrap_servers = get_external_bootstrap_servers();
-    println!("  Setting pg_kafka.shadow_bootstrap_servers = '{}'", bootstrap_servers);
+    println!(
+        "  Setting pg_kafka.shadow_bootstrap_servers = '{}'",
+        bootstrap_servers
+    );
+
+    db.execute("ALTER SYSTEM SET pg_kafka.shadow_mode_enabled = true", &[])
+        .await?;
 
     db.execute(
-        "ALTER SYSTEM SET pg_kafka.shadow_mode_enabled = true",
+        &format!(
+            "ALTER SYSTEM SET pg_kafka.shadow_bootstrap_servers = '{}'",
+            bootstrap_servers
+        ),
         &[],
-    ).await?;
-
-    db.execute(
-        &format!("ALTER SYSTEM SET pg_kafka.shadow_bootstrap_servers = '{}'", bootstrap_servers),
-        &[],
-    ).await?;
+    )
+    .await?;
 
     db.execute(
         "ALTER SYSTEM SET pg_kafka.shadow_security_protocol = 'PLAINTEXT'",
         &[],
-    ).await?;
+    )
+    .await?;
+
+    // Set fast reload interval for tests (2 seconds instead of default 30 seconds)
+    db.execute(
+        "ALTER SYSTEM SET pg_kafka.shadow_config_reload_interval_ms = 2000",
+        &[],
+    )
+    .await?;
+    println!("  Setting shadow_config_reload_interval_ms = 2000ms for fast testing");
 
     // Reload configuration so background worker sees new GUCs
     println!("  Reloading PostgreSQL configuration...");
@@ -119,16 +133,13 @@ pub async fn enable_shadow_mode(
     )
     .await?;
 
-    // Trigger immediate config reload via SQL function (< 1 second)
-    println!("⏳ Triggering shadow config reload...");
-    db.execute("SELECT reload_shadow_config()", &[])
-        .await?;
-
-    // Give worker time to process reload
-    // Worker checks reload flag every 100ms when idle, but if requests are queued
-    // it won't check until there's a 100ms gap. Use 2000ms to be safe.
+    // Wait for periodic shadow config reload
+    // The worker reloads shadow config every shadow_config_reload_interval_ms (configurable GUC).
+    // Default is 30 seconds, but tests should set it to 1-2 seconds for faster execution.
+    // TODO: Once shadow_config_reload_interval_ms GUC is implemented, read it here and wait that long.
+    println!("⏳ Waiting for periodic shadow config reload (2 seconds)...");
     tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
-    println!("✅ Config reload complete");
+    println!("✅ Config should be reloaded");
 
     Ok(())
 }
@@ -150,16 +161,24 @@ pub async fn disable_shadow_mode(db: &Client, topic_name: &str) -> TestResult {
     .await?;
 
     // Reset global GUCs
-    db.execute("ALTER SYSTEM RESET pg_kafka.shadow_mode_enabled", &[]).await?;
-    db.execute("ALTER SYSTEM RESET pg_kafka.shadow_bootstrap_servers", &[]).await?;
-    db.execute("ALTER SYSTEM RESET pg_kafka.shadow_security_protocol", &[]).await?;
+    db.execute("ALTER SYSTEM RESET pg_kafka.shadow_mode_enabled", &[])
+        .await?;
+    db.execute("ALTER SYSTEM RESET pg_kafka.shadow_bootstrap_servers", &[])
+        .await?;
+    db.execute("ALTER SYSTEM RESET pg_kafka.shadow_security_protocol", &[])
+        .await?;
+    db.execute(
+        "ALTER SYSTEM RESET pg_kafka.shadow_config_reload_interval_ms",
+        &[],
+    )
+    .await?;
 
     // Reload config
     db.execute("SELECT pg_reload_conf()", &[]).await?;
     tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
 
-    // Trigger shadow config reload
-    db.execute("SELECT reload_shadow_config()", &[]).await?;
+    // Wait for periodic shadow config reload
+    println!("⏳ Waiting for periodic shadow config reload (2 seconds)...");
     tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
 
     println!("✅ Shadow mode disabled");

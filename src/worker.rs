@@ -39,9 +39,6 @@ const TIMEOUT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 /// How often to check for timed-out transactions (less frequent than member timeouts)
 const TXN_TIMEOUT_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 
-/// How often to reload shadow config and flush metrics (Phase 11)
-const SHADOW_CONFIG_RELOAD_INTERVAL: Duration = Duration::from_secs(30);
-
 /// How often to reload GUC configuration (allows runtime-changeable settings to take effect)
 const GUC_CONFIG_RELOAD_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -570,28 +567,13 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
 
         // ┌─────────────────────────────────────────────────────────────┐
         // │ Shadow Config Reload & Metrics Flush                        │
-        // │ Triggers: Periodic (30s) OR Immediate (SQL function)        │
+        // │ Triggers: Periodic (configurable via GUC, default 30s)      │
         // └─────────────────────────────────────────────────────────────┘
-        let should_reload = last_shadow_config_check.elapsed() >= SHADOW_CONFIG_RELOAD_INTERVAL
-            || crate::RELOAD_SHADOW_CONFIG_REQUESTED.load(std::sync::atomic::Ordering::Relaxed);
 
-        if should_reload {
-            // Clear the request flag if it was set
-            let immediate_request =
-                crate::RELOAD_SHADOW_CONFIG_REQUESTED.load(std::sync::atomic::Ordering::Relaxed);
-            if immediate_request {
-                crate::RELOAD_SHADOW_CONFIG_REQUESTED
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
-                pg_log!("Processing immediate shadow config reload request");
-
-                // CRITICAL: When shadow config reload is requested via SQL function,
-                // we must also reload RuntimeContext to pick up new GUC values
-                // (shadow_bootstrap_servers, shadow_mode_enabled, etc.)
-                // Without this, ensure_producer() would use stale config and fail to connect.
-                runtime_context.reload();
-                pg_log!("Reloaded GUC configuration for shadow mode");
-            }
-
+        let elapsed = last_shadow_config_check.elapsed();
+        let reload_interval_ms = crate::config::SHADOW_CONFIG_RELOAD_INTERVAL_MS.get();
+        let reload_interval = Duration::from_millis(reload_interval_ms as u64);
+        if elapsed >= reload_interval {
             let shadow_reload = AssertUnwindSafe(&shadow_store);
             BackgroundWorker::transaction(move || {
                 // Reload topic shadow configurations

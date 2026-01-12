@@ -15,6 +15,7 @@ use crate::kafka::constants::{
     // Shadow mode constants (Phase 11)
     DEFAULT_SHADOW_BATCH_SIZE,
     DEFAULT_SHADOW_BOOTSTRAP_SERVERS,
+    DEFAULT_SHADOW_CONFIG_RELOAD_MS,
     DEFAULT_SHADOW_LINGER_MS,
     DEFAULT_SHADOW_MAX_RETRIES,
     DEFAULT_SHADOW_METRICS_ENABLED,
@@ -28,11 +29,13 @@ use crate::kafka::constants::{
     DEFAULT_TOPIC_PARTITIONS,
     MAX_FETCH_POLL_INTERVAL_MS,
     MAX_SHADOW_BATCH_SIZE,
+    MAX_SHADOW_CONFIG_RELOAD_MS,
     MAX_SHADOW_LINGER_MS,
     MAX_SHADOW_MAX_RETRIES,
     MAX_SHADOW_RETRY_BACKOFF_MS,
     MIN_FETCH_POLL_INTERVAL_MS,
     MIN_SHADOW_BATCH_SIZE,
+    MIN_SHADOW_CONFIG_RELOAD_MS,
     MIN_SHADOW_LINGER_MS,
     MIN_SHADOW_MAX_RETRIES,
     MIN_SHADOW_RETRY_BACKOFF_MS,
@@ -242,6 +245,8 @@ static SHADOW_DEFAULT_SYNC_MODE: GucSetting<Option<CString>> =
 static SHADOW_METRICS_ENABLED: GucSetting<bool> =
     GucSetting::<bool>::new(DEFAULT_SHADOW_METRICS_ENABLED);
 static SHADOW_OTEL_ENDPOINT: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
+pub static SHADOW_CONFIG_RELOAD_INTERVAL_MS: GucSetting<i32> =
+    GucSetting::<i32>::new(DEFAULT_SHADOW_CONFIG_RELOAD_MS);
 
 /// Initialize GUC parameters
 pub fn init() {
@@ -476,6 +481,17 @@ pub fn init() {
         c"OTLP endpoint for sending shadow mode traces (e.g., 'http://localhost:4317'). Empty to disable.",
         &SHADOW_OTEL_ENDPOINT,
         GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"pg_kafka.shadow_config_reload_interval_ms",
+        c"Shadow config reload interval in milliseconds",
+        c"How often to check for shadow config updates from the database. Default 30000ms (30s). Tests can set to 1000-2000ms for faster iteration. Reloadable with pg_reload_conf().",
+        &SHADOW_CONFIG_RELOAD_INTERVAL_MS,
+        MIN_SHADOW_CONFIG_RELOAD_MS,
+        MAX_SHADOW_CONFIG_RELOAD_MS,
+        GucContext::Sighup,
         GucFlags::default(),
     );
 

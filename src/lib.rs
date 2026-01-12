@@ -1,6 +1,5 @@
 use pgrx::bgworkers::BackgroundWorkerBuilder;
 use pgrx::prelude::*;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 // Module declarations for our extension components
 mod config; // Configuration (GUC parameters)
@@ -11,11 +10,10 @@ pub mod worker; // Background worker implementation
 #[cfg(test)]
 pub mod testing;
 
-// ===== Shadow Config Reload Trigger =====
-/// Flag to trigger immediate shadow config reload from SQL
-/// Set by kafka.reload_shadow_config() SQL function
-/// Checked by worker loop on every iteration (~100ms)
-pub static RELOAD_SHADOW_CONFIG_REQUESTED: AtomicBool = AtomicBool::new(false);
+// Note: Previously had RELOAD_SHADOW_CONFIG_REQUESTED atomic flag here.
+// Removed because PostgreSQL uses separate processes (not threads), so static
+// variables aren't shared between the SQL function process and worker process.
+// Use shadow_config_reload_interval_ms GUC instead for testing.
 
 // ===== Conditional Logging Macros =====
 // These provide test-safe alternatives to pgrx logging functions
@@ -128,35 +126,10 @@ fn hello_pg_kafka() -> &'static str {
     "Hello, pg_kafka"
 }
 
-/// Trigger immediate shadow mode configuration reload
-///
-/// This function sets a flag that the background worker checks on every
-/// loop iteration. When set, the worker immediately reloads shadow mode
-/// configuration from kafka.shadow_config table instead of waiting for
-/// the next periodic reload (normally 30 seconds).
-///
-/// This is primarily useful for testing, where waiting 30+ seconds for
-/// config changes to take effect is prohibitive.
-///
-/// Returns the approximate number of milliseconds until config will be reloaded.
-///
-/// # Example
-/// ```sql
-/// -- Update shadow config
-/// UPDATE kafka.shadow_config SET forward_percentage = 100
-/// WHERE topic_id = 1;
-///
-/// -- Trigger immediate reload (no wait needed)
-/// SELECT reload_shadow_config();
-///
-/// -- Config is now active within ~100ms
-/// ```
-#[pg_extern]
-fn reload_shadow_config() -> i32 {
-    RELOAD_SHADOW_CONFIG_REQUESTED.store(true, Ordering::Relaxed);
-    pgrx::log!("Shadow config reload requested via SQL function");
-    100 // Approximate milliseconds until reload
-}
+// Note: Removed reload_shadow_config() SQL function.
+// It didn't work because PostgreSQL uses separate processes, not threads.
+// Static variables aren't shared between backend and worker processes.
+// Use shadow_config_reload_interval_ms GUC for fast reloads during testing.
 
 // Include bootstrap SQL to create kafka schema and tables
 pgrx::extension_sql_file!("../sql/bootstrap.sql");
