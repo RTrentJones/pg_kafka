@@ -233,14 +233,17 @@ pub async fn run(
 
         match accept_result {
             Ok(Ok((socket, addr))) => {
-                // Always log connections for debugging
-                info!("Accepted connection from {}", addr);
+                // Log connections if enabled
+                if log_connections {
+                    info!("Kafka client connected from {}", addr);
+                }
 
                 // Clone resources for this connection
                 let conn_request_tx = request_tx.clone();
                 let conn_registry = registry.clone();
                 let poll_interval = fetch_poll_interval_ms;
                 let long_poll_enabled = enable_long_polling;
+                let should_log = log_connections;
 
                 // Spawn a new async task to handle this connection
                 // Use tokio::spawn (not spawn_local) since we're in multi-thread runtime
@@ -251,10 +254,15 @@ pub async fn run(
                         conn_registry,
                         long_poll_enabled,
                         poll_interval,
+                        should_log,
                     )
                     .await
                     {
-                        warn!("Error handling connection from {}: {}", addr, e);
+                        if should_log {
+                            warn!("Error handling connection from {}: {}", addr, e);
+                        }
+                    } else if should_log {
+                        info!("Kafka client disconnected from {}", addr);
                     }
                 });
             }
@@ -302,6 +310,7 @@ async fn handle_connection(
     registry: Arc<PendingFetchRegistry>,
     enable_long_polling: bool,
     poll_interval_ms: i32,
+    _log_connections: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     debug!("New connection established, starting pipelined handle loop");
 
