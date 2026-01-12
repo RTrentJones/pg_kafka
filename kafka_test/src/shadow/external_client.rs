@@ -24,11 +24,39 @@ pub fn get_external_bootstrap_servers() -> String {
     env::var("EXTERNAL_KAFKA_BOOTSTRAP_SERVERS").unwrap_or_else(|_| "localhost:9093".to_string())
 }
 
-/// Get internal Kafka bootstrap servers for CONTAINER-based pg_kafka extension
-/// This is the INTERNAL listener (port 9094) accessed from inside pg_kafka_dev container
+/// Get internal Kafka bootstrap servers for pg_kafka extension to use
+///
+/// This determines the address that pg_kafka will use to connect to external Kafka:
+/// - In Docker (pg_kafka in container): external-kafka:9094 (INTERNAL listener via docker network)
+/// - On host/CI (pg_kafka on host): localhost:9093 (EXTERNAL listener via port forwarding)
+///
+/// Detection: Check if running in Docker by looking for /.dockerenv or container hostname
 pub fn get_internal_bootstrap_servers() -> String {
-    env::var("INTERNAL_KAFKA_BOOTSTRAP_SERVERS")
-        .unwrap_or_else(|_| "external-kafka:9094".to_string())
+    // Allow explicit override via environment variable
+    if let Ok(servers) = env::var("INTERNAL_KAFKA_BOOTSTRAP_SERVERS") {
+        return servers;
+    }
+
+    // Detect if pg_kafka is running inside Docker
+    // Note: The test process runs on host, but pg_kafka extension runs wherever Postgres is
+    // In CI, Postgres runs directly on the runner (not in Docker)
+    // In docker-compose dev, Postgres runs inside pg_kafka_dev container
+
+    // Check for CI environment (GitHub Actions sets CI=true)
+    if env::var("CI").is_ok() {
+        // CI: pg_kafka runs on host, external Kafka in Docker with port forwarding
+        return "localhost:9093".to_string();
+    }
+
+    // Check if we're running in Docker (test process itself)
+    // If tests run inside container, pg_kafka is also in container
+    if std::path::Path::new("/.dockerenv").exists() {
+        return "external-kafka:9094".to_string();
+    }
+
+    // Default: Assume host environment (local dev without docker-compose)
+    // Use localhost:9093 as that's the forwarded port
+    "localhost:9093".to_string()
 }
 
 /// Get SASL username for external Kafka

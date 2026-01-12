@@ -710,11 +710,29 @@ pub fn get_external_bootstrap_servers() -> String {
     "localhost:9093"  // EXTERNAL listener via port forwarding
 }
 
-/// For CONTAINER-based pg_kafka extension (runs inside pg_kafka_dev)
+/// For pg_kafka extension - auto-detects environment
 pub fn get_internal_bootstrap_servers() -> String {
-    "external-kafka:9094"  // INTERNAL listener via docker network
+    // CI environment (pg_kafka on host): localhost:9093
+    // Docker environment (pg_kafka in container): external-kafka:9094
+    // Override via INTERNAL_KAFKA_BOOTSTRAP_SERVERS env var
 }
 ```
+
+### Environment Detection Logic
+
+The test code auto-detects the runtime environment:
+
+| Environment | pg_kafka Location | External Kafka Address |
+|-------------|-------------------|------------------------|
+| CI (GitHub Actions) | Host runner | `localhost:9093` |
+| Docker dev (docker-compose) | pg_kafka_dev container | `external-kafka:9094` |
+| Local dev (no Docker) | Host | `localhost:9093` |
+
+Detection order:
+1. `INTERNAL_KAFKA_BOOTSTRAP_SERVERS` env var (explicit override)
+2. `CI` env var present → `localhost:9093`
+3. `/.dockerenv` exists → `external-kafka:9094`
+4. Default → `localhost:9093`
 
 ```rust
 // kafka_test/src/shadow/helpers.rs
