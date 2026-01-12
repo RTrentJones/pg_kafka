@@ -554,7 +554,7 @@ This document describes the shadow mode lifecycle in pg_kafka, including configu
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
-## CRITICAL ISSUE: Docker Networking (BLOCKING)
+## Docker Networking Issue (FIXED)
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────┐
@@ -638,30 +638,33 @@ Option C: Use docker host IP (brittle)
 |-------------|--------|-------|
 | pg_kafka running on 9092 | Required | `cargo pgrx start pg14` |
 | External Kafka on 9093 | Required | Docker or local Kafka |
-| **Docker network fix** | **BLOCKING** | See critical issue above |
+| Docker network fix | ✅ Fixed | Dual listener setup implemented |
 | PLAINTEXT protocol | Default | Tests assume no SASL |
 | Sequential execution | Required | `parallel_safe: false` |
 | ~90 second total runtime | Expected | First test takes 35s |
 | Config reload interval | Auto-set | Tests set to 2000ms |
 
-## Recommended Fix for docker-compose.yml
+## Implemented Fix (docker-compose.yml)
+
+The dual-listener configuration has been implemented:
 
 ```yaml
 external-kafka:
-  image: apache/kafka:3.7.0
-  # ... existing config ...
   environment:
-    # ... existing KRaft config ...
-
     # DUAL LISTENER SETUP for container + host access
+    # - INTERNAL:9094 for container-to-container (pg_kafka_dev -> external-kafka)
+    # - EXTERNAL:9093 for host access (E2E tests, kcat from host)
+    # - CONTROLLER:29094 for KRaft controller
     KAFKA_LISTENERS: INTERNAL://0.0.0.0:9094,EXTERNAL://0.0.0.0:9093,CONTROLLER://0.0.0.0:29094
     KAFKA_ADVERTISED_LISTENERS: INTERNAL://external-kafka:9094,EXTERNAL://localhost:9093
     KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
     KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
 
 pg_kafka_dev:
-  # ... existing config ...
   environment:
     # Use INTERNAL listener for container-to-container
     - PG_KAFKA_SHADOW_BOOTSTRAP_SERVERS=external-kafka:9094
+  depends_on:
+    external-kafka:
+      condition: service_healthy
 ```
