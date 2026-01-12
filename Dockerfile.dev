@@ -6,6 +6,8 @@ RUN apt-get update && apt-get install -y \
     clang \
     gcc \
     libssl-dev \
+    libsasl2-dev \
+    libzstd-dev \
     pkg-config \
     libreadline-dev \
     zlib1g-dev \
