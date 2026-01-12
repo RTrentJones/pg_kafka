@@ -19,8 +19,8 @@ services:
     environment:
       - RUST_LOG=info
       # Shadow mode configuration for testing (Phase 11)
-      # Using PLAINTEXT for dev simplicity - add SASL when needed
-      - PG_KAFKA_SHADOW_BOOTSTRAP_SERVERS=external-kafka:9093
+      # Using INTERNAL listener for container-to-container communication
+      - PG_KAFKA_SHADOW_BOOTSTRAP_SERVERS=external-kafka:9094
       - PG_KAFKA_SHADOW_SECURITY_PROTOCOL=PLAINTEXT
     # Security tweak to allow gdb/perf if you need to debug crashes
     privileged: true
@@ -28,9 +28,9 @@ services:
       - SYS_PTRACE
     security_opt:
       - seccomp:unconfined
-    # depends_on:  # Uncomment when external-kafka is fixed
-    #   external-kafka:
-    #     condition: service_healthy
+    depends_on:
+      external-kafka:
+        condition: service_healthy
     networks:
       - pg_kafka_network
 
@@ -42,22 +42,22 @@ services:
     container_name: external_kafka
     hostname: external-kafka
     ports:
-      - "9093:9093"    # External Kafka listener
+      - "9093:9093"    # EXTERNAL listener for host access
     environment:
       # KRaft mode configuration (no ZooKeeper)
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@external-kafka:9094
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@external-kafka:29094
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
 
-      # Listeners configuration (PLAINTEXT - no auth for dev simplicity)
-      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9093,CONTROLLER://0.0.0.0:9094
-      # Use localhost for advertised listeners so host-based CI tests can connect
-      # Note: For container-to-container communication (e.g., pg_kafka_dev -> external-kafka),
-      # you would need to use a dual-listener setup or host network mode
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9093
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
-      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # DUAL LISTENER SETUP for container + host access
+      # - INTERNAL:9094 for container-to-container (pg_kafka_dev -> external-kafka)
+      # - EXTERNAL:9093 for host access (E2E tests, kcat from host)
+      # - CONTROLLER:29094 for KRaft controller
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:9094,EXTERNAL://0.0.0.0:9093,CONTROLLER://0.0.0.0:29094
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://external-kafka:9094,EXTERNAL://localhost:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
 
       # Storage configuration
       KAFKA_LOG_DIRS: /var/lib/kafka/data

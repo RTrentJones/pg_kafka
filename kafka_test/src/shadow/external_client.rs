@@ -2,6 +2,13 @@
 //!
 //! Creates rdkafka clients configured to connect to the external Kafka
 //! broker on port 9093 with SASL/PLAIN authentication.
+//!
+//! NOTE: There are TWO different bootstrap server addresses:
+//! - EXTERNAL (localhost:9093): For host-based test code to verify messages
+//! - INTERNAL (external-kafka:9094): For pg_kafka extension inside container
+//!
+//! The E2E tests run on the HOST and connect via localhost:9093.
+//! The pg_kafka extension runs INSIDE the container and needs external-kafka:9094.
 
 use crate::common::TestResult;
 use rdkafka::config::ClientConfig;
@@ -11,9 +18,17 @@ use rdkafka::Message;
 use std::env;
 use std::time::Duration;
 
-/// Get external Kafka bootstrap servers
+/// Get external Kafka bootstrap servers for HOST-based test verification
+/// This is the EXTERNAL listener (port 9093) accessed from the host machine
 pub fn get_external_bootstrap_servers() -> String {
     env::var("EXTERNAL_KAFKA_BOOTSTRAP_SERVERS").unwrap_or_else(|_| "localhost:9093".to_string())
+}
+
+/// Get internal Kafka bootstrap servers for CONTAINER-based pg_kafka extension
+/// This is the INTERNAL listener (port 9094) accessed from inside pg_kafka_dev container
+pub fn get_internal_bootstrap_servers() -> String {
+    env::var("INTERNAL_KAFKA_BOOTSTRAP_SERVERS")
+        .unwrap_or_else(|_| "external-kafka:9094".to_string())
 }
 
 /// Get SASL username for external Kafka
