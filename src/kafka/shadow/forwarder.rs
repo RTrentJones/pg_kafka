@@ -17,7 +17,7 @@ use super::config::{ShadowConfig, SyncMode, TopicConfigCache, TopicShadowConfig}
 use super::error::{ShadowError, ShadowResult};
 use super::primary::PrimaryStatus;
 use super::producer::ShadowProducer;
-use super::routing::compute_routing_hash;
+use super::routing::make_forward_decision;
 use std::sync::Arc;
 
 /// Default timeout for sync forwards (milliseconds)
@@ -122,24 +122,8 @@ impl ShadowForwarder {
             return ForwardDecision::Skip;
         }
 
-        // Check percentage routing
-        if topic_config.forward_percentage >= 100 {
-            return ForwardDecision::Forward;
-        }
-
-        if topic_config.forward_percentage == 0 {
-            return ForwardDecision::Skip;
-        }
-
-        // Use deterministic hash for percentage routing
-        let hash = compute_routing_hash(key, global_offset);
-        let bucket = hash % 100;
-
-        if bucket < topic_config.forward_percentage as u32 {
-            ForwardDecision::Forward
-        } else {
-            ForwardDecision::Skip
-        }
+        // Delegate percentage routing to shared function
+        make_forward_decision(key, global_offset, topic_config.forward_percentage)
     }
 
     /// Forward a single message
@@ -239,40 +223,6 @@ impl TopicConfigCache {
 mod tests {
     use super::*;
     use crate::kafka::shadow::config::ShadowMode;
-    use crate::kafka::shadow::routing::compute_routing_hash;
-
-    #[test]
-    fn test_compute_routing_hash_with_key() {
-        let hash1 = compute_routing_hash(Some(b"key1"), 0);
-        let hash2 = compute_routing_hash(Some(b"key1"), 0);
-        assert_eq!(hash1, hash2, "Same key should produce same hash");
-
-        let hash3 = compute_routing_hash(Some(b"key2"), 0);
-        assert_ne!(
-            hash1, hash3,
-            "Different keys should produce different hashes"
-        );
-    }
-
-    #[test]
-    fn test_compute_routing_hash_without_key() {
-        let hash1 = compute_routing_hash(None, 42);
-        let hash2 = compute_routing_hash(None, 42);
-        assert_eq!(hash1, hash2, "Same offset should produce same hash");
-
-        let hash3 = compute_routing_hash(None, 57);
-        assert_ne!(
-            hash1, hash3,
-            "Different offsets should produce different hashes"
-        );
-    }
-
-    #[test]
-    fn test_compute_routing_hash_empty_key_uses_offset() {
-        let hash_empty = compute_routing_hash(Some(b""), 42);
-        let hash_none = compute_routing_hash(None, 42);
-        assert_eq!(hash_empty, hash_none, "Empty key should use offset");
-    }
 
     #[test]
     fn test_forward_decision_with_percentage() {
@@ -345,36 +295,5 @@ mod tests {
         assert_eq!(result.skipped, 0);
         assert_eq!(result.failed, 0);
         assert!(result.first_error.is_none());
-    }
-
-    #[test]
-    fn test_percentage_routing_distribution() {
-        // Test that percentage routing is approximately correct
-        let mut forward_count = 0;
-        let mut skip_count = 0;
-        let percentage = 30u8;
-
-        for i in 0..1000 {
-            let hash = compute_routing_hash(None, i);
-            let bucket = hash % 100;
-            if bucket < percentage as u32 {
-                forward_count += 1;
-            } else {
-                skip_count += 1;
-            }
-        }
-
-        // Should be roughly 30% forward, 70% skip (with some variance)
-        // Allow 10% variance for randomness
-        assert!(
-            forward_count >= 200 && forward_count <= 400,
-            "Forward count {} should be roughly 30%",
-            forward_count
-        );
-        assert!(
-            skip_count >= 600 && skip_count <= 800,
-            "Skip count {} should be roughly 70%",
-            skip_count
-        );
     }
 }
