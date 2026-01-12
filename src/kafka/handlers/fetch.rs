@@ -7,10 +7,10 @@
 use super::helpers::{resolve_topic_id, topic_resolution_error_code, TopicResolution};
 use crate::kafka::constants::{ERROR_NONE, ERROR_UNSUPPORTED_VERSION};
 use crate::kafka::error::Result;
-use crate::kafka::storage::{IsolationLevel, KafkaStore};
+use crate::kafka::handler_context::HandlerContext;
+use crate::kafka::storage::IsolationLevel;
 use kafka_protocol::messages::TopicName;
 use kafka_protocol::protocol::StrBytes;
-use kafka_protocol::records::Compression;
 
 /// Handle Fetch request
 ///
@@ -24,11 +24,12 @@ use kafka_protocol::records::Compression;
 /// For ReadCommitted consumers, last_stable_offset (LSO) indicates the lowest
 /// offset of any pending transaction. Consumers can safely process up to LSO.
 pub fn handle_fetch(
-    store: &dyn KafkaStore,
+    ctx: &HandlerContext,
     topic_data: Vec<crate::kafka::messages::TopicFetchData>,
-    compression: Compression,
     isolation_level: IsolationLevel,
 ) -> Result<kafka_protocol::messages::fetch_response::FetchResponse> {
+    let store = ctx.store;
+    let compression = ctx.compression;
     use kafka_protocol::messages::fetch_response::{
         FetchResponse, FetchableTopicResponse, PartitionData,
     };
@@ -195,9 +196,10 @@ pub fn handle_fetch(
 /// - -1 = latest offset (high watermark)
 /// - >= 0 = offset at timestamp (not yet implemented)
 pub fn handle_list_offsets(
-    store: &dyn KafkaStore,
+    ctx: &HandlerContext,
     topics: Vec<crate::kafka::messages::ListOffsetsTopicData>,
 ) -> Result<kafka_protocol::messages::list_offsets_response::ListOffsetsResponse> {
+    let store = ctx.store;
     use kafka_protocol::messages::list_offsets_response::{
         ListOffsetsPartitionResponse, ListOffsetsResponse, ListOffsetsTopicResponse,
     };

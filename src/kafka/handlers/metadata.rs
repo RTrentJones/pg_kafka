@@ -5,7 +5,7 @@
 
 use crate::kafka::constants::{DEFAULT_BROKER_ID, ERROR_NONE};
 use crate::kafka::error::Result;
-use crate::kafka::storage::KafkaStore;
+use crate::kafka::handler_context::HandlerContext;
 
 /// Handle ApiVersions request
 ///
@@ -21,18 +21,16 @@ pub fn handle_api_versions() -> kafka_protocol::messages::api_versions_response:
 /// Auto-creates topics if they don't exist when specifically requested.
 ///
 /// # Arguments
-/// * `store` - Storage backend
+/// * `ctx` - Handler context containing store, broker metadata, and default partitions
 /// * `requested_topics` - Specific topics to query, or None for all topics
-/// * `broker_host` - Hostname for broker metadata
-/// * `broker_port` - Port for broker metadata
-/// * `default_partitions` - Partition count for auto-created topics
 pub fn handle_metadata(
-    store: &dyn KafkaStore,
+    ctx: &HandlerContext,
     requested_topics: Option<Vec<String>>,
-    broker_host: &str,
-    broker_port: i32,
-    default_partitions: i32,
 ) -> Result<kafka_protocol::messages::metadata_response::MetadataResponse> {
+    let store = ctx.store;
+    let broker_host = ctx.broker.host();
+    let broker_port = ctx.broker.port();
+    let default_partitions = ctx.default_partitions;
     let mut response = kafka_protocol::messages::metadata_response::MetadataResponse::default();
 
     // Set controller ID - needed for admin operations like CreateTopics

@@ -7,9 +7,9 @@
 
 use crate::kafka::constants::{ERROR_NONE, ERROR_UNKNOWN_TOPIC_OR_PARTITION};
 use crate::kafka::error::Result;
+use crate::kafka::handler_context::HandlerContext;
 use crate::kafka::messages::ProducerMetadata;
 use crate::kafka::partitioner::compute_partition;
-use crate::kafka::storage::KafkaStore;
 use std::collections::HashMap;
 
 /// Handle Produce request
@@ -23,18 +23,18 @@ use std::collections::HashMap;
 /// - Records are marked 'aborted' if the transaction aborts
 ///
 /// # Arguments
-/// * `store` - Storage backend
+/// * `ctx` - Handler context (store, coordinator, broker metadata, etc.)
 /// * `topic_data` - Topics and records to produce
-/// * `default_partitions` - Partition count for auto-created topics
 /// * `producer_metadata` - Optional producer metadata for idempotent producers (Phase 9)
 /// * `transactional_id` - Optional transactional ID for transactional producers (Phase 10)
 pub fn handle_produce(
-    store: &dyn KafkaStore,
+    ctx: &HandlerContext,
     topic_data: Vec<crate::kafka::messages::TopicProduceData>,
-    default_partitions: i32,
     producer_metadata: Option<&ProducerMetadata>,
     transactional_id: Option<&str>,
 ) -> Result<kafka_protocol::messages::produce_response::ProduceResponse> {
+    let store = ctx.store;
+    let default_partitions = ctx.default_partitions;
     // Phase 10: Validate transaction state if transactional
     if let Some(txn_id) = transactional_id {
         if let Some(meta) = producer_metadata {

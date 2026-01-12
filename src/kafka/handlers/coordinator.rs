@@ -5,17 +5,19 @@
 
 use crate::kafka::constants::{DEFAULT_BROKER_ID, ERROR_NONE, ERROR_UNKNOWN_SERVER_ERROR};
 use crate::kafka::error::Result;
+use crate::kafka::handler_context::HandlerContext;
 
 /// Handle FindCoordinator request
 ///
 /// Returns the coordinator broker for a consumer group.
 /// In our single-node setup, we always return ourselves as the coordinator.
 pub fn handle_find_coordinator(
-    broker_host: &str,
-    broker_port: i32,
+    ctx: &HandlerContext,
     key: String,
     key_type: i8,
 ) -> Result<kafka_protocol::messages::find_coordinator_response::FindCoordinatorResponse> {
+    let broker_host = ctx.broker.host();
+    let broker_port = ctx.broker.port();
     use kafka_protocol::messages::find_coordinator_response::FindCoordinatorResponse;
 
     crate::pg_debug!("FindCoordinator: key={}, key_type={}", key, key_type);
@@ -41,7 +43,7 @@ pub fn handle_find_coordinator(
 /// - Member list (if leader)
 #[allow(clippy::too_many_arguments)]
 pub fn handle_join_group(
-    coordinator: &crate::kafka::GroupCoordinator,
+    ctx: &HandlerContext,
     group_id: String,
     member_id: String,
     client_id: String,
@@ -50,6 +52,7 @@ pub fn handle_join_group(
     protocol_type: String,
     protocols: Vec<crate::kafka::messages::JoinGroupProtocol>,
 ) -> Result<kafka_protocol::messages::join_group_response::JoinGroupResponse> {
+    let coordinator = ctx.coordinator;
     use kafka_protocol::messages::join_group_response::{
         JoinGroupResponse, JoinGroupResponseMember,
     };
@@ -123,13 +126,14 @@ pub fn handle_join_group(
 /// Leader provides partition assignments, followers receive their assignment.
 /// If leader sends empty assignments, server computes assignments automatically.
 pub fn handle_sync_group(
-    coordinator: &crate::kafka::GroupCoordinator,
-    store: &dyn crate::kafka::KafkaStore,
+    ctx: &HandlerContext,
     group_id: String,
     member_id: String,
     generation_id: i32,
     assignments: Vec<crate::kafka::messages::SyncGroupAssignment>,
 ) -> Result<kafka_protocol::messages::sync_group_response::SyncGroupResponse> {
+    let coordinator = ctx.coordinator;
+    let store = ctx.store;
     use kafka_protocol::messages::sync_group_response::SyncGroupResponse;
     use std::collections::HashMap;
 
@@ -202,11 +206,12 @@ pub fn handle_sync_group(
 ///
 /// Updates member's last heartbeat timestamp.
 pub fn handle_heartbeat(
-    coordinator: &crate::kafka::GroupCoordinator,
+    ctx: &HandlerContext,
     group_id: String,
     member_id: String,
     generation_id: i32,
 ) -> Result<kafka_protocol::messages::heartbeat_response::HeartbeatResponse> {
+    let coordinator = ctx.coordinator;
     use kafka_protocol::messages::heartbeat_response::HeartbeatResponse;
 
     crate::pg_debug!(
@@ -232,10 +237,11 @@ pub fn handle_heartbeat(
 ///
 /// Consumer gracefully leaves the consumer group.
 pub fn handle_leave_group(
-    coordinator: &crate::kafka::GroupCoordinator,
+    ctx: &HandlerContext,
     group_id: String,
     member_id: String,
 ) -> Result<kafka_protocol::messages::leave_group_response::LeaveGroupResponse> {
+    let coordinator = ctx.coordinator;
     use kafka_protocol::messages::leave_group_response::LeaveGroupResponse;
 
     crate::pg_debug!("LeaveGroup: group_id={}, member_id={}", group_id, member_id);
@@ -257,9 +263,10 @@ pub fn handle_leave_group(
 /// Returns detailed information about consumer groups including members and state.
 /// This is critical for debugging consumer group issues and monitoring group health.
 pub fn handle_describe_groups(
-    coordinator: &crate::kafka::GroupCoordinator,
+    ctx: &HandlerContext,
     groups: Vec<String>,
 ) -> Result<kafka_protocol::messages::describe_groups_response::DescribeGroupsResponse> {
+    let coordinator = ctx.coordinator;
     use crate::kafka::GroupState;
     use kafka_protocol::messages::describe_groups_response::{
         DescribeGroupsResponse, DescribedGroup, DescribedGroupMember,
@@ -347,9 +354,10 @@ pub fn handle_describe_groups(
 /// Returns a list of all consumer groups currently known to the coordinator.
 /// This is useful for discovery, administration, and monitoring.
 pub fn handle_list_groups(
-    coordinator: &crate::kafka::GroupCoordinator,
+    ctx: &HandlerContext,
     states_filter: Vec<String>,
 ) -> Result<kafka_protocol::messages::list_groups_response::ListGroupsResponse> {
+    let coordinator = ctx.coordinator;
     use crate::kafka::GroupState;
     use kafka_protocol::messages::list_groups_response::{ListGroupsResponse, ListedGroup};
     use kafka_protocol::messages::GroupId;

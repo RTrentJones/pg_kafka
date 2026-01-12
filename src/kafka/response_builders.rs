@@ -510,7 +510,7 @@ mod tests {
 
     #[test]
     fn test_build_broker_metadata() {
-        let broker = build_broker_metadata(0, "localhost".to_string(), 9092);
+        let broker = build_broker_metadata(0, "localhost", 9092);
 
         assert_eq!(broker.node_id.0, 0);
         assert_eq!(broker.host.as_str(), "localhost");
@@ -520,7 +520,7 @@ mod tests {
 
     #[test]
     fn test_build_broker_metadata_with_custom_values() {
-        let broker = build_broker_metadata(42, "kafka.example.com".to_string(), 19092);
+        let broker = build_broker_metadata(42, "kafka.example.com", 19092);
 
         assert_eq!(broker.node_id.0, 42);
         assert_eq!(broker.host.as_str(), "kafka.example.com");

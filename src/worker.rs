@@ -667,22 +667,18 @@ pub fn process_request(
             response_tx,
             ..
         } => {
-            // Use broker_metadata accessors (zero allocation)
-            let advertised_host = broker_metadata.host();
-            let advertised_port = broker_metadata.port();
+            let ctx = crate::kafka::HandlerContext::new(
+                store,
+                coordinator,
+                broker_metadata,
+                default_partitions,
+                compression,
+            );
 
             dispatch_response(
                 "Metadata",
                 response_tx,
-                || {
-                    handlers::handle_metadata(
-                        store,
-                        requested_topics,
-                        advertised_host,
-                        advertised_port,
-                        default_partitions,
-                    )
-                },
+                || handlers::handle_metadata(&ctx, requested_topics),
                 |r| KafkaResponse::Metadata {
                     correlation_id,
                     api_version,
@@ -723,13 +719,15 @@ pub fn process_request(
                 // enforcing sequence validation would be misleading and waste resources.
                 // Phase 10 Note: We also skip transactional support for acks=0 since there's no
                 // guarantee of delivery - transactions require acks >= 1 for meaningful guarantees.
-                match handlers::handle_produce(
+                let ctx = crate::kafka::HandlerContext::with_notifier(
                     store,
-                    topic_data.clone(),
+                    coordinator,
+                    broker_metadata,
                     default_partitions,
-                    None,
-                    None,
-                ) {
+                    compression,
+                    notify_tx,
+                );
+                match handlers::handle_produce(&ctx, topic_data.clone(), None, None) {
                     Ok(response) => {
                         // Send notifications for long-polling consumers
                         for topic_response in &response.responses {
@@ -771,10 +769,17 @@ pub fn process_request(
 
             // Phase 10: Pass transactional_id for transactional producers
             // Phase 11: Shadow forwarding is now handled internally by ShadowStore.insert_records()
-            match handlers::handle_produce(
+            let ctx = crate::kafka::HandlerContext::with_notifier(
                 store,
-                topic_data,
+                coordinator,
+                broker_metadata,
                 default_partitions,
+                compression,
+                notify_tx,
+            );
+            match handlers::handle_produce(
+                &ctx,
+                topic_data,
                 producer_metadata.as_ref(),
                 transactional_id.as_deref(),
             ) {
@@ -844,10 +849,18 @@ pub fn process_request(
                 crate::kafka::storage::IsolationLevel::ReadUncommitted
             };
 
+            let ctx = crate::kafka::HandlerContext::new(
+                store,
+                coordinator,
+                broker_metadata,
+                default_partitions,
+                compression,
+            );
+
             dispatch_response(
                 "Fetch",
                 response_tx,
-                || handlers::handle_fetch(store, topic_data, compression, isolation),
+                || handlers::handle_fetch(&ctx, topic_data, isolation),
                 |r| KafkaResponse::Fetch {
                     correlation_id,
                     api_version,
@@ -872,10 +885,18 @@ pub fn process_request(
             response_tx,
             ..
         } => {
+            let ctx = crate::kafka::HandlerContext::new(
+                store,
+                coordinator,
+                broker_metadata,
+                default_partitions,
+                compression,
+            );
+
             dispatch_response(
                 "OffsetCommit",
                 response_tx,
-                || handlers::handle_offset_commit(store, group_id, topics),
+                || handlers::handle_offset_commit(&ctx, group_id, topics),
                 |r| KafkaResponse::OffsetCommit {
                     correlation_id,
                     api_version,
@@ -900,10 +921,18 @@ pub fn process_request(
             response_tx,
             ..
         } => {
+            let ctx = crate::kafka::HandlerContext::new(
+                store,
+                coordinator,
+                broker_metadata,
+                default_partitions,
+                compression,
+            );
+
             dispatch_response(
                 "OffsetFetch",
                 response_tx,
-                || handlers::handle_offset_fetch(store, group_id, topics),
+                || handlers::handle_offset_fetch(&ctx, group_id, topics),
                 |r| KafkaResponse::OffsetFetch {
                     correlation_id,
                     api_version,
@@ -928,13 +957,18 @@ pub fn process_request(
             response_tx,
             ..
         } => {
-            // Use broker_metadata accessors (zero allocation)
-            let host = broker_metadata.host();
-            let port = broker_metadata.port();
+            let ctx = crate::kafka::HandlerContext::new(
+                store,
+                coordinator,
+                broker_metadata,
+                default_partitions,
+                compression,
+            );
+
             dispatch_response(
                 "FindCoordinator",
                 response_tx,
-                || handlers::handle_find_coordinator(host, port, key, key_type),
+                || handlers::handle_find_coordinator(&ctx, key, key_type),
                 |r| KafkaResponse::FindCoordinator {
                     correlation_id,
                     api_version,
@@ -965,14 +999,21 @@ pub fn process_request(
             response_tx,
             ..
         } => {
-            let coord = coordinator.clone();
+            let ctx = crate::kafka::HandlerContext::new(
+                store,
+                coordinator,
+                broker_metadata,
+                default_partitions,
+                compression,
+            );
             let cid = client_id.unwrap_or_else(|| "unknown".to_string());
+
             dispatch_response(
                 "JoinGroup",
                 response_tx,
                 || {
                     handlers::handle_join_group(
-                        &coord,
+                        &ctx,
                         group_id,
                         member_id,
                         cid,
@@ -1008,14 +1049,20 @@ pub fn process_request(
             response_tx,
             ..
         } => {
-            let coord = coordinator.clone();
+            let ctx = crate::kafka::HandlerContext::new(
+                store,
+                coordinator,
+                broker_metadata,
+                default_partitions,
+                compression,
+            );
+
             dispatch_response(
                 "SyncGroup",
                 response_tx,
                 || {
                     handlers::handle_sync_group(
-                        &coord,
-                        store,
+                        &ctx,
                         group_id,
                         member_id,
                         generation_id,
@@ -1047,11 +1094,18 @@ pub fn process_request(
             response_tx,
             ..
         } => {
-            let coord = coordinator.clone();
+            let ctx = crate::kafka::HandlerContext::new(
+                store,
+                coordinator,
+                broker_metadata,
+                default_partitions,
+                compression,
+            );
+
             dispatch_response(
                 "Heartbeat",
                 response_tx,
-                || handlers::handle_heartbeat(&coord, group_id, member_id, generation_id),
+                || handlers::handle_heartbeat(&ctx, group_id, member_id, generation_id),
                 |r| KafkaResponse::Heartbeat {
                     correlation_id,
                     api_version,
@@ -1076,11 +1130,18 @@ pub fn process_request(
             response_tx,
             ..
         } => {
-            let coord = coordinator.clone();
+            let ctx = crate::kafka::HandlerContext::new(
+                store,
+                coordinator,
+                broker_metadata,
+                default_partitions,
+                compression,
+            );
+
             dispatch_response(
                 "LeaveGroup",
                 response_tx,
-                || handlers::handle_leave_group(&coord, group_id, member_id),
+                || handlers::handle_leave_group(&ctx, group_id, member_id),
                 |r| KafkaResponse::LeaveGroup {
                     correlation_id,
                     api_version,
@@ -1104,10 +1165,18 @@ pub fn process_request(
             response_tx,
             ..
         } => {
+            let ctx = crate::kafka::HandlerContext::new(
+                store,
+                coordinator,
+                broker_metadata,
+                default_partitions,
+                compression,
+            );
+
             dispatch_response(
                 "ListOffsets",
                 response_tx,
-                || handlers::handle_list_offsets(store, topics),
+                || handlers::handle_list_offsets(&ctx, topics),
                 |r| KafkaResponse::ListOffsets {
                     correlation_id,
                     api_version,
@@ -1131,11 +1200,18 @@ pub fn process_request(
             response_tx,
             ..
         } => {
-            let coord = coordinator.clone();
+            let ctx = crate::kafka::HandlerContext::new(
+                store,
+                coordinator,
+                broker_metadata,
+                default_partitions,
+                compression,
+            );
+
             dispatch_response(
                 "DescribeGroups",
                 response_tx,
-                || handlers::handle_describe_groups(&coord, groups),
+                || handlers::handle_describe_groups(&ctx, groups),
                 |r| KafkaResponse::DescribeGroups {
                     correlation_id,
                     api_version,
@@ -1159,11 +1235,18 @@ pub fn process_request(
             response_tx,
             ..
         } => {
-            let coord = coordinator.clone();
+            let ctx = crate::kafka::HandlerContext::new(
+                store,
+                coordinator,
+                broker_metadata,
+                default_partitions,
+                compression,
+            );
+
             dispatch_response(
                 "ListGroups",
                 response_tx,
-                || handlers::handle_list_groups(&coord, states_filter),
+                || handlers::handle_list_groups(&ctx, states_filter),
                 |r| KafkaResponse::ListGroups {
                     correlation_id,
                     api_version,
@@ -1188,10 +1271,18 @@ pub fn process_request(
             response_tx,
             ..
         } => {
+            let ctx = crate::kafka::HandlerContext::new(
+                store,
+                coordinator,
+                broker_metadata,
+                default_partitions,
+                compression,
+            );
+
             dispatch_response(
                 "CreateTopics",
                 response_tx,
-                || handlers::handle_create_topics(store, topics, validate_only),
+                || handlers::handle_create_topics(&ctx, topics, validate_only),
                 |r| KafkaResponse::CreateTopics {
                     correlation_id,
                     api_version,
@@ -1215,10 +1306,18 @@ pub fn process_request(
             response_tx,
             ..
         } => {
+            let ctx = crate::kafka::HandlerContext::new(
+                store,
+                coordinator,
+                broker_metadata,
+                default_partitions,
+                compression,
+            );
+
             dispatch_response(
                 "DeleteTopics",
                 response_tx,
-                || handlers::handle_delete_topics(store, topic_names),
+                || handlers::handle_delete_topics(&ctx, topic_names),
                 |r| KafkaResponse::DeleteTopics {
                     correlation_id,
                     api_version,
@@ -1243,10 +1342,18 @@ pub fn process_request(
             response_tx,
             ..
         } => {
+            let ctx = crate::kafka::HandlerContext::new(
+                store,
+                coordinator,
+                broker_metadata,
+                default_partitions,
+                compression,
+            );
+
             dispatch_response(
                 "CreatePartitions",
                 response_tx,
-                || handlers::handle_create_partitions(store, topics, validate_only),
+                || handlers::handle_create_partitions(&ctx, topics, validate_only),
                 |r| KafkaResponse::CreatePartitions {
                     correlation_id,
                     api_version,
@@ -1271,11 +1378,18 @@ pub fn process_request(
             response_tx,
             ..
         } => {
-            let coord = coordinator.clone();
+            let ctx = crate::kafka::HandlerContext::new(
+                store,
+                coordinator,
+                broker_metadata,
+                default_partitions,
+                compression,
+            );
+
             dispatch_response(
                 "DeleteGroups",
                 response_tx,
-                || handlers::handle_delete_groups(store, &coord, groups_names),
+                || handlers::handle_delete_groups(&ctx, groups_names),
                 |r| KafkaResponse::DeleteGroups {
                     correlation_id,
                     api_version,
@@ -1302,12 +1416,20 @@ pub fn process_request(
             client_id,
             response_tx,
         } => {
+            let ctx = crate::kafka::HandlerContext::new(
+                store,
+                coordinator,
+                broker_metadata,
+                default_partitions,
+                compression,
+            );
+
             dispatch_response(
                 "InitProducerId",
                 response_tx,
                 || {
                     handlers::handle_init_producer_id(
-                        store,
+                        &ctx,
                         transactional_id,
                         transaction_timeout_ms,
                         existing_producer_id,
@@ -1342,17 +1464,24 @@ pub fn process_request(
             response_tx,
             ..
         } => {
+            let ctx = crate::kafka::HandlerContext::new(
+                store,
+                coordinator,
+                broker_metadata,
+                default_partitions,
+                compression,
+            );
+
             dispatch_response(
                 "AddPartitionsToTxn",
                 response_tx,
                 || {
                     handlers::handle_add_partitions_to_txn(
-                        store,
+                        &ctx,
                         &transactional_id,
                         producer_id,
                         producer_epoch,
                         topics,
-                        default_partitions,
                     )
                 },
                 |r| KafkaResponse::AddPartitionsToTxn {
@@ -1383,12 +1512,20 @@ pub fn process_request(
             response_tx,
             ..
         } => {
+            let ctx = crate::kafka::HandlerContext::new(
+                store,
+                coordinator,
+                broker_metadata,
+                default_partitions,
+                compression,
+            );
+
             dispatch_response(
                 "AddOffsetsToTxn",
                 response_tx,
                 || {
                     handlers::handle_add_offsets_to_txn(
-                        store,
+                        &ctx,
                         &transactional_id,
                         producer_id,
                         producer_epoch,
@@ -1423,12 +1560,20 @@ pub fn process_request(
             response_tx,
             ..
         } => {
+            let ctx = crate::kafka::HandlerContext::new(
+                store,
+                coordinator,
+                broker_metadata,
+                default_partitions,
+                compression,
+            );
+
             dispatch_response(
                 "EndTxn",
                 response_tx,
                 || {
                     handlers::handle_end_txn(
-                        store,
+                        &ctx,
                         &transactional_id,
                         producer_id,
                         producer_epoch,
@@ -1465,12 +1610,20 @@ pub fn process_request(
             response_tx,
             ..
         } => {
+            let ctx = crate::kafka::HandlerContext::new(
+                store,
+                coordinator,
+                broker_metadata,
+                default_partitions,
+                compression,
+            );
+
             dispatch_response(
                 "TxnOffsetCommit",
                 response_tx,
                 || {
                     handlers::handle_txn_offset_commit(
-                        store,
+                        &ctx,
                         &transactional_id,
                         producer_id,
                         producer_epoch,
