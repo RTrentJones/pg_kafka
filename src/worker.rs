@@ -39,8 +39,8 @@ const TIMEOUT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 /// How often to check for timed-out transactions (less frequent than member timeouts)
 const TXN_TIMEOUT_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 
-/// How often to reload GUC configuration (allows runtime-changeable settings to take effect)
-const GUC_CONFIG_RELOAD_INTERVAL: Duration = Duration::from_secs(30);
+// Configuration reload interval is now controlled by pg_kafka.config_reload_interval_ms GUC
+// (default 30s, tests can set to 1-2s for fast iteration)
 
 /// Timeout for blocking recv - allows periodic signal checks
 const RECV_TIMEOUT: Duration = Duration::from_millis(100);
@@ -386,8 +386,7 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
 
     let mut last_timeout_check = Instant::now();
     let mut last_txn_timeout_check = Instant::now();
-    let mut last_shadow_config_check = Instant::now();
-    let mut last_guc_reload = Instant::now();
+    let mut last_config_reload = Instant::now();
 
     // Phase 11: Initial shadow config load
     {
@@ -566,14 +565,24 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
         }
 
         // ┌─────────────────────────────────────────────────────────────┐
-        // │ Shadow Config Reload & Metrics Flush                        │
-        // │ Triggers: Periodic (configurable via GUC, default 30s)      │
+        // │ Configuration Reload (GUCs + Shadow Config)                 │
+        // │ Triggers: Periodic (configurable via config_reload_interval_ms GUC, default 30s) │
         // └─────────────────────────────────────────────────────────────┘
+        // Unified reload cycle:
+        // 1. Reload GUCs (runtime-changeable settings like compression, log settings, etc.)
+        // 2. Reload shadow topic configurations from database
+        // 3. Flush shadow metrics
+        // This allows configuration changes to take effect without restarting Postgres.
+        // PostMasterContext GUCs (port, host) still require restart.
 
-        let elapsed = last_shadow_config_check.elapsed();
-        let reload_interval_ms = crate::config::SHADOW_CONFIG_RELOAD_INTERVAL_MS.get();
+        let reload_interval_ms = crate::config::CONFIG_RELOAD_INTERVAL_MS.get();
         let reload_interval = Duration::from_millis(reload_interval_ms as u64);
-        if elapsed >= reload_interval {
+        if last_config_reload.elapsed() >= reload_interval {
+            // 1. Reload GUCs
+            runtime_context.reload();
+            pg_log!("Reloaded GUC configuration");
+
+            // 2. Reload shadow config and flush metrics
             let shadow_reload = AssertUnwindSafe(&shadow_store);
             BackgroundWorker::transaction(move || {
                 // Reload topic shadow configurations
@@ -593,19 +602,8 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
                     pg_warning!("Failed to flush shadow metrics: {:?}", e);
                 }
             });
-            last_shadow_config_check = Instant::now();
-        }
 
-        // ┌─────────────────────────────────────────────────────────────┐
-        // │ GUC Config Reload (Periodic, ~30 secs)                      │
-        // └─────────────────────────────────────────────────────────────┘
-        // Reload runtime-changeable GUC settings (compression, log settings, etc.)
-        // This allows configuration changes to take effect without restarting Postgres.
-        // PostMasterContext GUCs (port, host) still require restart.
-        if last_guc_reload.elapsed() >= GUC_CONFIG_RELOAD_INTERVAL {
-            runtime_context.reload();
-            pg_log!("Reloaded GUC configuration");
-            last_guc_reload = Instant::now();
+            last_config_reload = Instant::now();
         }
     }
 }

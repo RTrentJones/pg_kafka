@@ -82,12 +82,13 @@ pub async fn enable_shadow_mode(
     .await?;
 
     // Set fast reload interval for tests (2 seconds instead of default 30 seconds)
+    // This controls unified GUC + shadow config reload cycle
     db.execute(
-        "ALTER SYSTEM SET pg_kafka.shadow_config_reload_interval_ms = 2000",
+        "ALTER SYSTEM SET pg_kafka.config_reload_interval_ms = 2000",
         &[],
     )
     .await?;
-    println!("  Setting shadow_config_reload_interval_ms = 2000ms for fast testing");
+    println!("  Setting config_reload_interval_ms = 2000ms for fast testing");
 
     // Reload configuration so background worker sees new GUCs
     println!("  Reloading PostgreSQL configuration...");
@@ -133,12 +134,15 @@ pub async fn enable_shadow_mode(
     )
     .await?;
 
-    // Wait for periodic shadow config reload
-    // The worker reloads shadow config every shadow_config_reload_interval_ms (configurable GUC).
-    // Default is 30 seconds, but tests should set it to 1-2 seconds for faster execution.
-    // TODO: Once shadow_config_reload_interval_ms GUC is implemented, read it here and wait that long.
-    println!("⏳ Waiting for periodic shadow config reload (2 seconds)...");
-    tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+    // Wait for unified config reload (GUCs + shadow config)
+    // IMPORTANT: Worker starts with default config_reload_interval_ms (30s).
+    // We must wait for the first reload cycle (30s) so worker sees our new value (2s).
+    // After that, subsequent reloads happen every 2s.
+    //
+    // First test in suite: 30s wait (picks up new interval)
+    // Subsequent tests: 2s wait (already using fast interval)
+    println!("⏳ Waiting for config reload cycle (up to 30s for first reload, then 2s)...");
+    tokio::time::sleep(std::time::Duration::from_millis(31000)).await;
     println!("✅ Config should be reloaded");
 
     Ok(())
@@ -168,7 +172,7 @@ pub async fn disable_shadow_mode(db: &Client, topic_name: &str) -> TestResult {
     db.execute("ALTER SYSTEM RESET pg_kafka.shadow_security_protocol", &[])
         .await?;
     db.execute(
-        "ALTER SYSTEM RESET pg_kafka.shadow_config_reload_interval_ms",
+        "ALTER SYSTEM RESET pg_kafka.config_reload_interval_ms",
         &[],
     )
     .await?;
@@ -177,8 +181,8 @@ pub async fn disable_shadow_mode(db: &Client, topic_name: &str) -> TestResult {
     db.execute("SELECT pg_reload_conf()", &[]).await?;
     tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
 
-    // Wait for periodic shadow config reload
-    println!("⏳ Waiting for periodic shadow config reload (2 seconds)...");
+    // Wait for unified config reload cycle
+    println!("⏳ Waiting for config reload cycle (2 seconds)...");
     tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
 
     println!("✅ Shadow mode disabled");

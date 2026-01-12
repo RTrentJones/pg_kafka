@@ -91,7 +91,7 @@ impl TestContext {
         let _ = self
             .db_client
             .execute(
-                "ALTER SYSTEM RESET pg_kafka.shadow_config_reload_interval_ms",
+                "ALTER SYSTEM RESET pg_kafka.config_reload_interval_ms",
                 &[],
             )
             .await;
