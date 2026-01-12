@@ -52,7 +52,10 @@ services:
 
       # Listeners configuration (PLAINTEXT - no auth for dev simplicity)
       KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9093,CONTROLLER://0.0.0.0:9094
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://external-kafka:9093
+      # Use localhost for advertised listeners so host-based CI tests can connect
+      # Note: For container-to-container communication (e.g., pg_kafka_dev -> external-kafka),
+      # you would need to use a dual-listener setup or host network mode
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9093
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
 
