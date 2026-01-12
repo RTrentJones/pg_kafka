@@ -124,9 +124,10 @@ pub async fn enable_shadow_mode(
     db.execute("SELECT reload_shadow_config()", &[])
         .await?;
 
-    // Give worker time to process reload (next loop iteration ~100ms)
-    // Use 500ms to be safe (5x the loop interval)
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // Give worker time to process reload
+    // Worker checks reload flag every 100ms when idle, but if requests are queued
+    // it won't check until there's a 100ms gap. Use 2000ms to be safe.
+    tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
     println!("✅ Config reload complete");
 
     Ok(())
@@ -159,7 +160,7 @@ pub async fn disable_shadow_mode(db: &Client, topic_name: &str) -> TestResult {
 
     // Trigger shadow config reload
     db.execute("SELECT reload_shadow_config()", &[]).await?;
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
 
     println!("✅ Shadow mode disabled");
     Ok(())

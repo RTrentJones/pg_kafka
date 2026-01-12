@@ -303,10 +303,17 @@ impl<S: KafkaStore> ShadowStore<S> {
         records: &[Record],
         base_offset: i64,
     ) {
+        pgrx::log!(
+            "🔍 forward_records_best_effort called with {} records, sync_mode={:?}",
+            records.len(),
+            topic_config.sync_mode
+        );
         let external_topic = topic_config.effective_external_topic();
 
         match topic_config.sync_mode {
             SyncMode::Async => {
+                pgrx::log!("🔍 Async mode selected");
+
                 // Async mode: send via channel to network thread (non-blocking)
                 let forward_tx = self.forward_tx.read().expect("forward_tx lock poisoned");
                 let tx = match forward_tx.as_ref() {
@@ -354,23 +361,24 @@ impl<S: KafkaStore> ShadowStore<S> {
             }
 
             SyncMode::Sync => {
-                tracing::debug!("Shadow mode: sync mode, ensuring producer");
+                pgrx::log!("🔍 Sync mode selected, ensuring producer...");
                 // Sync mode: block on each send using block_on()
                 let producer = match self.ensure_producer() {
                     Some(p) => {
-                        tracing::debug!("Shadow mode: producer available");
+                        pgrx::log!("🔍 Producer available!");
                         p
                     }
                     None => {
-                        tracing::warn!("Shadow mode: NO producer available for shadow forwarding");
+                        pgrx::warning!("❌ NO producer available for shadow forwarding");
                         return;
                     }
                 };
 
-                tracing::debug!(
-                    "Shadow mode: forwarding {} records to {}",
+                pgrx::log!(
+                    "🔍 Forwarding {} records to {} partition {}",
                     records.len(),
-                    external_topic
+                    external_topic,
+                    partition_id
                 );
 
                 for (i, record) in records.iter().enumerate() {
@@ -603,20 +611,33 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
     // ===== Message Operations =====
 
     fn insert_records(&self, topic_id: i32, partition_id: i32, records: &[Record]) -> Result<i64> {
+        pgrx::log!(
+            "🔍 ShadowStore::insert_records called for topic_id={} partition={} records={}",
+            topic_id,
+            partition_id,
+            records.len()
+        );
+
         // Skip shadow forwarding if:
         // 1. Shadow mode is not enabled globally
         // 2. We're running on a standby (only primary forwards)
         let is_enabled = self.is_enabled();
         let is_primary = self.is_primary();
 
+        pgrx::log!(
+            "🔍 Shadow checks: is_enabled={} is_primary={}",
+            is_enabled,
+            is_primary
+        );
+
         if !is_enabled {
-            tracing::debug!(
+            pgrx::log!(
                 "Shadow mode: is_enabled=false, skipping forward for topic_id={}",
                 topic_id
             );
         }
         if !is_primary {
-            tracing::debug!(
+            pgrx::log!(
                 "Shadow mode: is_primary=false, skipping forward for topic_id={}",
                 topic_id
             );
@@ -626,7 +647,7 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
             return self.inner.insert_records(topic_id, partition_id, records);
         }
 
-        tracing::debug!(
+        pgrx::log!(
             "Shadow mode: enabled and primary, checking topic config for topic_id={}",
             topic_id
         );
@@ -635,12 +656,12 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
         let topic_config = self.topic_cache.get(topic_id);
 
         if topic_config.is_none() {
-            tracing::debug!(
+            pgrx::log!(
                 "Shadow mode: no topic config found for topic_id={}, skipping forward",
                 topic_id
             );
         } else {
-            tracing::debug!("Shadow mode: found topic config for topic_id={}", topic_id);
+            pgrx::log!("Shadow mode: found topic config for topic_id={}", topic_id);
         }
 
         // Determine write mode
@@ -650,7 +671,7 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
             .map(|c| c.write_mode)
             .unwrap_or(WriteMode::DualWrite); // No config = local only (DualWrite but no forward)
 
-        tracing::debug!(
+        pgrx::log!(
             "Shadow mode: write_mode={:?} for topic_id={}",
             write_mode,
             topic_id
@@ -661,11 +682,13 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
                 // Always write locally first
                 let base_offset = self.inner.insert_records(topic_id, partition_id, records)?;
 
+                pgrx::log!("🔍 Local insert completed, base_offset={}", base_offset);
+
                 // Then forward to external (best-effort, doesn't affect return)
                 if let Some(config) = topic_config {
                     if config.should_forward() {
-                        tracing::debug!(
-                            "Shadow mode: calling forward_records_best_effort for topic_id={}",
+                        pgrx::log!(
+                            "🔍 Calling forward_records_best_effort for topic_id={}",
                             topic_id
                         );
                         self.forward_records_best_effort(
@@ -675,13 +698,13 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
                             base_offset,
                         );
                     } else {
-                        tracing::debug!(
+                        pgrx::log!(
                             "Shadow mode: should_forward()=false for topic_id={}",
                             topic_id
                         );
                     }
                 } else {
-                    tracing::debug!(
+                    pgrx::log!(
                         "Shadow mode: topic_config is None, not forwarding for topic_id={}",
                         topic_id
                     );
