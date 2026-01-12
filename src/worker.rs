@@ -577,10 +577,19 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
 
         if should_reload {
             // Clear the request flag if it was set
-            if crate::RELOAD_SHADOW_CONFIG_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
+            let immediate_request =
+                crate::RELOAD_SHADOW_CONFIG_REQUESTED.load(std::sync::atomic::Ordering::Relaxed);
+            if immediate_request {
                 crate::RELOAD_SHADOW_CONFIG_REQUESTED
                     .store(false, std::sync::atomic::Ordering::Relaxed);
                 pg_log!("Processing immediate shadow config reload request");
+
+                // CRITICAL: When shadow config reload is requested via SQL function,
+                // we must also reload RuntimeContext to pick up new GUC values
+                // (shadow_bootstrap_servers, shadow_mode_enabled, etc.)
+                // Without this, ensure_producer() would use stale config and fail to connect.
+                runtime_context.reload();
+                pg_log!("Reloaded GUC configuration for shadow mode");
             }
 
             let shadow_reload = AssertUnwindSafe(&shadow_store);

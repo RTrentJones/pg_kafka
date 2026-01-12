@@ -299,9 +299,9 @@ jobs:
     # Start external Kafka for shadow mode tests
     - name: Start External Kafka
       run: |
-        docker-compose up -d external-kafka
+        docker compose up -d external-kafka
         echo "Waiting for Kafka to be healthy..."
-        timeout 60 bash -c 'until docker-compose ps external-kafka | grep -q "(healthy)"; do
+        timeout 60 bash -c 'until docker compose ps external-kafka | grep -q "(healthy)"; do
           echo "Waiting for Kafka healthcheck..."
           sleep 2
         done'
@@ -320,7 +320,7 @@ jobs:
     - name: Stop External Kafka
       if: always()
       run: |
-        docker-compose down -v
+        docker compose down -v
 
     - name: Run Performance E2E Tests
       # Performance tests run separately with their own timeout
