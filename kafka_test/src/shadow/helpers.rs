@@ -5,7 +5,44 @@
 
 use crate::common::TestResult;
 use crate::shadow::external_client::get_external_bootstrap_servers;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio_postgres::Client;
+
+/// One-time flag to track if initial config reload has been done
+static SHADOW_SETUP_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Shadow mode test suite setup - call once before running shadow tests
+///
+/// This sets the config reload interval to 2 seconds and waits for the initial
+/// 30-second reload cycle. After this, all tests can use the fast 2-second interval.
+pub async fn shadow_test_setup(db: &Client) -> TestResult {
+    if SHADOW_SETUP_DONE.load(Ordering::Acquire) {
+        // Setup already done
+        return Ok(());
+    }
+
+    println!("=== Shadow Test Suite Setup ===");
+    println!("Setting fast config reload interval (2s) and waiting for initial reload...");
+
+    // Set fast reload interval
+    db.execute(
+        "ALTER SYSTEM SET pg_kafka.config_reload_interval_ms = 2000",
+        &[],
+    )
+    .await?;
+
+    // Reload configuration
+    db.execute("SELECT pg_reload_conf()", &[]).await?;
+
+    // Wait for initial 30s reload cycle (worker picks up new 2s interval)
+    println!("⏳ Waiting for initial config reload (30s)...");
+    tokio::time::sleep(std::time::Duration::from_millis(31000)).await;
+    println!("✅ Config reload interval now set to 2s");
+    println!("✅ Subsequent tests will reload in ~2s\n");
+
+    SHADOW_SETUP_DONE.store(true, Ordering::Release);
+    Ok(())
+}
 
 /// Shadow mode configuration for a topic
 #[derive(Debug, Clone)]
@@ -53,6 +90,9 @@ pub async fn enable_shadow_mode(
     topic_name: &str,
     config: &ShadowTopicConfig,
 ) -> TestResult {
+    // Ensure one-time setup is done (sets fast reload interval and waits for initial reload)
+    shadow_test_setup(db).await?;
+
     // First ensure topic exists
     let topic_id = get_or_create_topic_id(db, topic_name).await?;
 
@@ -80,15 +120,6 @@ pub async fn enable_shadow_mode(
         &[],
     )
     .await?;
-
-    // Set fast reload interval for tests (2 seconds instead of default 30 seconds)
-    // This controls unified GUC + shadow config reload cycle
-    db.execute(
-        "ALTER SYSTEM SET pg_kafka.config_reload_interval_ms = 2000",
-        &[],
-    )
-    .await?;
-    println!("  Setting config_reload_interval_ms = 2000ms for fast testing");
 
     // Reload configuration so background worker sees new GUCs
     println!("  Reloading PostgreSQL configuration...");
@@ -134,15 +165,10 @@ pub async fn enable_shadow_mode(
     )
     .await?;
 
-    // Wait for unified config reload (GUCs + shadow config)
-    // IMPORTANT: Worker starts with default config_reload_interval_ms (30s).
-    // We must wait for the first reload cycle (30s) so worker sees our new value (2s).
-    // After that, subsequent reloads happen every 2s.
-    //
-    // First test in suite: 30s wait (picks up new interval)
-    // Subsequent tests: 2s wait (already using fast interval)
-    println!("⏳ Waiting for config reload cycle (up to 30s for first reload, then 2s)...");
-    tokio::time::sleep(std::time::Duration::from_millis(31000)).await;
+    // Wait for config reload (shadow_test_setup already did the initial 30s wait)
+    // Worker is now using the fast 2s reload interval
+    println!("⏳ Waiting for config reload cycle (2s + 1s buffer = 3s)...");
+    tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
     println!("✅ Config should be reloaded");
 
     Ok(())
