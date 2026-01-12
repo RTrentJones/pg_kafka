@@ -4,7 +4,7 @@
 //! and verifying forwarding behavior.
 
 use crate::common::TestResult;
-use crate::shadow::external_client::get_external_bootstrap_servers;
+use crate::shadow::external_client::get_internal_bootstrap_servers;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio_postgres::Client;
 
@@ -97,9 +97,11 @@ pub async fn enable_shadow_mode(
     let topic_id = get_or_create_topic_id(db, topic_name).await?;
 
     // Configure global GUCs for shadow mode
-    let bootstrap_servers = get_external_bootstrap_servers();
+    // NOTE: Use INTERNAL bootstrap servers because pg_kafka runs INSIDE the container
+    // and needs to reach external-kafka via docker network (port 9094)
+    let bootstrap_servers = get_internal_bootstrap_servers();
     println!(
-        "  Setting pg_kafka.shadow_bootstrap_servers = '{}'",
+        "  Setting pg_kafka.shadow_bootstrap_servers = '{}' (INTERNAL listener for container)",
         bootstrap_servers
     );
 

@@ -644,17 +644,48 @@ Option C: Use docker host IP (brittle)
 | ~90 second total runtime | Expected | First test takes 35s |
 | Config reload interval | Auto-set | Tests set to 2000ms |
 
-## Implemented Fix (docker-compose.yml)
+## Implemented Fix (docker-compose.yml + test code)
 
-The dual-listener configuration has been implemented:
+### Understanding the Dual-Address Architecture
+
+There are TWO different bootstrap server addresses needed because:
+- **E2E tests** run on the **HOST machine** (via `cargo run` in kafka_test/)
+- **pg_kafka extension** runs **INSIDE the pg_kafka_dev container**
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                              HOST MACHINE                                     │
+│                                                                              │
+│   ┌────────────────────────────────────────────────────────────────────┐    │
+│   │  E2E Test Process (kafka_test)                                      │    │
+│   │  Connects to external Kafka via localhost:9093 (EXTERNAL listener)  │    │
+│   │  Connects to PostgreSQL via localhost:5432 (port forwarded)         │    │
+│   └──────────────────────────────┬─────────────────────────────────────┘    │
+│                                  │                                           │
+│                                  │ Port forwarding                           │
+│                                  ▼                                           │
+├─────────────────────────── DOCKER NETWORK ──────────────────────────────────┤
+│                                                                              │
+│   ┌─────────────────────┐         ┌─────────────────────────────────┐       │
+│   │   pg_kafka_dev      │         │   external-kafka                │       │
+│   │   container         │         │   container                     │       │
+│   │                     │         │                                 │       │
+│   │   pg_kafka extension│────────▶│   :9094 (INTERNAL listener)     │       │
+│   │   Uses GUC:         │ docker  │   Advertises: external-kafka:9094│      │
+│   │   external-kafka:9094 network │                                 │       │
+│   │                     │         │   :9093 (EXTERNAL listener)     │◀──────┤
+│   │                     │         │   Advertises: localhost:9093    │  port │
+│   └─────────────────────┘         └─────────────────────────────────┘  fwd  │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Docker Compose Configuration
 
 ```yaml
 external-kafka:
   environment:
     # DUAL LISTENER SETUP for container + host access
-    # - INTERNAL:9094 for container-to-container (pg_kafka_dev -> external-kafka)
-    # - EXTERNAL:9093 for host access (E2E tests, kcat from host)
-    # - CONTROLLER:29094 for KRaft controller
     KAFKA_LISTENERS: INTERNAL://0.0.0.0:9094,EXTERNAL://0.0.0.0:9093,CONTROLLER://0.0.0.0:29094
     KAFKA_ADVERTISED_LISTENERS: INTERNAL://external-kafka:9094,EXTERNAL://localhost:9093
     KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
@@ -667,4 +698,33 @@ pg_kafka_dev:
   depends_on:
     external-kafka:
       condition: service_healthy
+```
+
+### Test Code Configuration
+
+```rust
+// kafka_test/src/shadow/external_client.rs
+
+/// For HOST-based test verification (E2E tests run on host)
+pub fn get_external_bootstrap_servers() -> String {
+    "localhost:9093"  // EXTERNAL listener via port forwarding
+}
+
+/// For CONTAINER-based pg_kafka extension (runs inside pg_kafka_dev)
+pub fn get_internal_bootstrap_servers() -> String {
+    "external-kafka:9094"  // INTERNAL listener via docker network
+}
+```
+
+```rust
+// kafka_test/src/shadow/helpers.rs
+
+pub async fn enable_shadow_mode(...) {
+    // GUC is for pg_kafka (inside container) - use INTERNAL address
+    let bootstrap_servers = get_internal_bootstrap_servers();  // "external-kafka:9094"
+    db.execute(&format!(
+        "ALTER SYSTEM SET pg_kafka.shadow_bootstrap_servers = '{}'",
+        bootstrap_servers
+    ), &[]).await?;
+}
 ```
