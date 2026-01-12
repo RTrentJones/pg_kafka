@@ -120,29 +120,36 @@ async fn run_shadow_forwarder(forward_rx: Receiver<ForwardRequest>, config: Arc<
 /// * `request_tx` - Channel sender for forwarding parsed requests to main thread
 /// * `notify_rx` - Channel receiver for notifications from DB thread (long polling)
 /// * `forward_rx` - Channel receiver for async shadow forwarding requests
-/// * `shadow_config` - Optional shadow mode configuration for async forwarding
+/// * `runtime_context` - Runtime context for accessing configuration
 /// * `shutdown_rx` - Channel receiver for shutdown signal from main thread
-/// * `_log_connections` - Whether to log each new connection
-/// * `enable_long_polling` - Whether to enable long polling for FetchRequest
-/// * `fetch_poll_interval_ms` - Polling interval for long polling fallback
 ///
 /// # Thread Safety
 /// This function runs in a spawned thread and MUST NOT call pgrx functions.
-#[allow(clippy::too_many_arguments)]
 pub async fn run(
     listener: TcpListener,
     request_tx: Sender<KafkaRequest>,
     notify_rx: Receiver<InternalNotification>,
     forward_rx: Receiver<ForwardRequest>,
-    shadow_config: Option<Arc<ShadowConfig>>,
+    runtime_context: Arc<crate::kafka::RuntimeContext>,
     shutdown_rx: std::sync::mpsc::Receiver<()>,
-    _log_connections: bool,
-    enable_long_polling: bool,
-    fetch_poll_interval_ms: i32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Extract config values from RuntimeContext
+    let config = runtime_context.config();
+    let enable_long_polling = config.enable_long_polling;
+    let log_connections = config.log_connections;
+    let fetch_poll_interval_ms = config.fetch_poll_interval_ms;
+
+    // Create shadow config if enabled
+    let shadow_config: Option<Arc<ShadowConfig>> =
+        if config.shadow_mode_enabled && !config.shadow_bootstrap_servers.is_empty() {
+            Some(Arc::new(ShadowConfig::from_config(&config)))
+        } else {
+            None
+        };
+
     info!(
-        "pg_kafka TCP listener started (long_polling={})",
-        enable_long_polling
+        "pg_kafka TCP listener started (long_polling={}, log_connections={})",
+        enable_long_polling, log_connections
     );
 
     // Create the pending fetch registry for long polling

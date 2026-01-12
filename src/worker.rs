@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 // Import conditional logging macros from lib.rs
 use crate::kafka::constants::*;
-use crate::kafka::shadow::{ShadowConfig, ShadowStore};
+use crate::kafka::shadow::ShadowStore;
 use crate::kafka::{KafkaStore, PostgresStore};
 use crate::{pg_log, pg_warning};
 
@@ -41,6 +41,9 @@ const TXN_TIMEOUT_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 
 /// How often to reload shadow config and flush metrics (Phase 11)
 const SHADOW_CONFIG_RELOAD_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How often to reload GUC configuration (allows runtime-changeable settings to take effect)
+const GUC_CONFIG_RELOAD_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Timeout for blocking recv - allows periodic signal checks
 const RECV_TIMEOUT: Duration = Duration::from_millis(100);
@@ -126,7 +129,11 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
 
     // Step 2: Load configuration (GUCs are available after _PG_init)
-    let config = crate::config::Config::load();
+    // Create RuntimeContext for centralized config access across all modules
+    let runtime_context = std::sync::Arc::new(crate::kafka::RuntimeContext::new(
+        crate::config::Config::load(),
+    ));
+    let config = runtime_context.config();
 
     // Step 3: Connect to the configured database (required for SPI access)
     // IMPORTANT: Must connect to the database where CREATE EXTENSION was run
@@ -194,8 +201,10 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     // Always create ShadowStore wrapping PostgresStore. Shadow mode can be
     // enabled/disabled at runtime via pg_kafka.shadow_mode_enabled GUC.
     // The producer is lazily initialized on first use when enabled.
-    let shadow_store: std::sync::Arc<ShadowStore<PostgresStore>> =
-        std::sync::Arc::new(ShadowStore::new(PostgresStore::new()));
+    // Pass RuntimeContext to enable centralized config access.
+    let shadow_store: std::sync::Arc<ShadowStore<PostgresStore>> = std::sync::Arc::new(
+        ShadowStore::with_context(PostgresStore::new(), runtime_context.clone()),
+    );
 
     if config.shadow_mode_enabled {
         log!(
@@ -207,20 +216,21 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     // Step 4: Clone config values for use in threads
     let port = config.port;
     let host = config.host.clone();
-    let log_connections = config.log_connections;
     let shutdown_timeout = Duration::from_millis(config.shutdown_timeout_ms as u64);
     let default_partitions = config.default_partitions;
-    let fetch_poll_interval_ms = config.fetch_poll_interval_ms;
-    let enable_long_polling = config.enable_long_polling;
     let compression = parse_compression_type(&config.compression_type);
     let log_timing = config.log_timing;
+
     // Convert 0.0.0.0 to localhost for advertised host (used in Metadata and FindCoordinator)
     // 0.0.0.0 is not routable from clients - they need a resolvable hostname
-    let broker_host = if host == "0.0.0.0" || host.is_empty() {
+    let advertised_host = if host == "0.0.0.0" || host.is_empty() {
         "localhost".to_string()
     } else {
         host.clone()
     };
+
+    // Create BrokerMetadata once (eliminates string allocations on every Metadata/FindCoordinator request)
+    let broker_metadata = crate::kafka::BrokerMetadata::new(advertised_host, port);
 
     // Step 5: Create bounded request channel (backpressure at 10,000 pending requests)
     // This is the bridge between the network thread and the database thread.
@@ -245,14 +255,9 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     // Set forward_tx on ShadowStore for async forwarding
     shadow_store.set_forward_channel(forward_tx);
 
-    // Step 5d: Read shadow config for network thread (if shadow mode is enabled)
-    // The network thread needs this to create its own producer for async forwarding
-    let shadow_config_for_network: Option<std::sync::Arc<ShadowConfig>> =
-        if config.shadow_mode_enabled && !config.shadow_bootstrap_servers.is_empty() {
-            Some(std::sync::Arc::new(ShadowConfig::from_config(&config)))
-        } else {
-            None
-        };
+    // Step 5d: Pass RuntimeContext to network thread for config access
+    // The network thread will use this to access shadow config and other settings dynamically
+    let runtime_context_for_network = runtime_context.clone();
 
     // Step 6: Create shutdown signal channel
     // Simple mpsc channel - network thread checks for message to shutdown
@@ -336,11 +341,8 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
                     request_tx,
                     notify_rx,
                     forward_rx,
-                    shadow_config_for_network,
+                    runtime_context_for_network,
                     shutdown_rx,
-                    log_connections,
-                    enable_long_polling,
-                    fetch_poll_interval_ms,
                 )
                 .await
                 {
@@ -388,6 +390,7 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     let mut last_timeout_check = Instant::now();
     let mut last_txn_timeout_check = Instant::now();
     let mut last_shadow_config_check = Instant::now();
+    let mut last_guc_reload = Instant::now();
 
     // Phase 11: Initial shadow config load
     {
@@ -442,8 +445,7 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
                 // │ Process Database Request (SPI in Transaction)      │
                 // └─────────────────────────────────────────────────────┘
                 let coord = coordinator.clone();
-                let broker_h = broker_host.clone();
-                let broker_p = port;
+                let broker = broker_metadata.clone(); // Cheap Arc pointer copy
                 let default_parts = default_partitions;
                 let notifier = notify_tx.clone();
                 let comp = compression;
@@ -472,8 +474,7 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
                         process_request(
                             request,
                             &coord,
-                            &broker_h,
-                            broker_p,
+                            &broker,
                             default_parts,
                             &notifier,
                             comp,
@@ -592,6 +593,18 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
             });
             last_shadow_config_check = Instant::now();
         }
+
+        // ┌─────────────────────────────────────────────────────────────┐
+        // │ GUC Config Reload (Periodic, ~30 secs)                      │
+        // └─────────────────────────────────────────────────────────────┘
+        // Reload runtime-changeable GUC settings (compression, log settings, etc.)
+        // This allows configuration changes to take effect without restarting Postgres.
+        // PostMasterContext GUCs (port, host) still require restart.
+        if last_guc_reload.elapsed() >= GUC_CONFIG_RELOAD_INTERVAL {
+            runtime_context.reload();
+            pg_log!("Reloaded GUC configuration");
+            last_guc_reload = Instant::now();
+        }
     }
 }
 
@@ -612,8 +625,7 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
 pub fn process_request(
     request: crate::kafka::KafkaRequest,
     coordinator: &std::sync::Arc<crate::kafka::GroupCoordinator>,
-    broker_host: &str,
-    broker_port: i32,
+    broker_metadata: &crate::kafka::BrokerMetadata,
     default_partitions: i32,
     notify_tx: &crossbeam_channel::Sender<crate::kafka::InternalNotification>,
     compression: kafka_protocol::records::Compression,
@@ -655,8 +667,9 @@ pub fn process_request(
             response_tx,
             ..
         } => {
-            let advertised_host = broker_host.to_string();
-            let advertised_port = broker_port;
+            // Use broker_metadata accessors (zero allocation)
+            let advertised_host = broker_metadata.host();
+            let advertised_port = broker_metadata.port();
 
             dispatch_response(
                 "Metadata",
@@ -915,8 +928,9 @@ pub fn process_request(
             response_tx,
             ..
         } => {
-            let host = broker_host.to_string();
-            let port = broker_port;
+            // Use broker_metadata accessors (zero allocation)
+            let host = broker_metadata.host();
+            let port = broker_metadata.port();
             dispatch_response(
                 "FindCoordinator",
                 response_tx,

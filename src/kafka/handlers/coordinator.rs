@@ -11,7 +11,7 @@ use crate::kafka::error::Result;
 /// Returns the coordinator broker for a consumer group.
 /// In our single-node setup, we always return ourselves as the coordinator.
 pub fn handle_find_coordinator(
-    broker_host: String,
+    broker_host: &str,
     broker_port: i32,
     key: String,
     key_type: i8,
@@ -26,7 +26,7 @@ pub fn handle_find_coordinator(
     response.error_code = ERROR_NONE;
     response.error_message = None;
     response.node_id = DEFAULT_BROKER_ID.into();
-    response.host = broker_host.into();
+    response.host = broker_host.to_string().into();
     response.port = broker_port;
 
     Ok(response)

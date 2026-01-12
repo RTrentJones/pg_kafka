@@ -33,7 +33,9 @@
 // - Bounded channel provides backpressure when DB can't keep up
 
 pub mod assignment;
+pub mod broker_metadata;
 pub mod constants;
+pub mod context;
 pub mod coordinator;
 pub mod dispatch;
 pub mod error;
@@ -49,7 +51,9 @@ pub mod shadow;
 pub mod storage;
 
 // Re-export commonly used types for convenience
+pub use broker_metadata::BrokerMetadata;
 pub use constants::*;
+pub use context::RuntimeContext;
 pub use coordinator::{GroupCoordinator, GroupState};
 pub use error::{KafkaError, Result};
 pub use listener::run as run_listener;

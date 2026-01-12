@@ -29,7 +29,7 @@ pub fn handle_api_versions() -> kafka_protocol::messages::api_versions_response:
 pub fn handle_metadata(
     store: &dyn KafkaStore,
     requested_topics: Option<Vec<String>>,
-    broker_host: String,
+    broker_host: &str,
     broker_port: i32,
     default_partitions: i32,
 ) -> Result<kafka_protocol::messages::metadata_response::MetadataResponse> {

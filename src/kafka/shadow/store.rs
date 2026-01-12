@@ -102,6 +102,8 @@ pub struct ShadowStore<S: KafkaStore> {
     metrics: ShadowMetrics,
     /// Channel for async forwarding to network thread (Phase 11)
     forward_tx: RwLock<Option<crossbeam_channel::Sender<ForwardRequest>>>,
+    /// Runtime context for accessing configuration (optional to support tests)
+    runtime_context: Option<Arc<crate::kafka::RuntimeContext>>,
 }
 
 impl<S: KafkaStore> ShadowStore<S> {
@@ -121,6 +123,27 @@ impl<S: KafkaStore> ShadowStore<S> {
             primary_status: Mutex::new(PrimaryStatus::new()),
             metrics: ShadowMetrics::new(),
             forward_tx: RwLock::new(None),
+            runtime_context: None,
+        }
+    }
+
+    /// Create a new ShadowStore with RuntimeContext for config access
+    ///
+    /// This constructor is preferred in production as it enables centralized
+    /// config management via RuntimeContext, avoiding redundant Config::load() calls.
+    ///
+    /// # Arguments
+    /// * `inner` - The store to wrap (typically PostgresStore)
+    /// * `runtime_context` - Runtime context for accessing configuration
+    pub fn with_context(inner: S, runtime_context: Arc<crate::kafka::RuntimeContext>) -> Self {
+        Self {
+            inner,
+            producer: RwLock::new(None),
+            topic_cache: Arc::new(TopicConfigCache::new()),
+            primary_status: Mutex::new(PrimaryStatus::new()),
+            metrics: ShadowMetrics::new(),
+            forward_tx: RwLock::new(None),
+            runtime_context: Some(runtime_context),
         }
     }
 
@@ -191,11 +214,17 @@ impl<S: KafkaStore> ShadowStore<S> {
             return Some(producer.clone());
         }
 
-        // Read current config from GUCs
+        // Read current config from RuntimeContext if available, otherwise fallback to direct load
         #[cfg(not(test))]
         let config = {
             use crate::config::Config;
-            let cfg = Config::load();
+            let cfg = if let Some(ref ctx) = self.runtime_context {
+                // Use RuntimeContext for centralized config access (preferred)
+                ctx.config()
+            } else {
+                // Fallback for tests or if RuntimeContext not provided
+                Arc::new(Config::load())
+            };
             ShadowConfig::from_config(&cfg)
         };
 

@@ -189,10 +189,10 @@ pub fn build_api_versions_response() -> ApiVersionsResponse {
 }
 
 /// Build a MetadataResponseBroker for our single-node broker
-pub fn build_broker_metadata(node_id: i32, host: String, port: i32) -> MetadataResponseBroker {
+pub fn build_broker_metadata(node_id: i32, host: &str, port: i32) -> MetadataResponseBroker {
     let mut broker = MetadataResponseBroker::default();
     broker.node_id = BrokerId(node_id);
-    broker.host = host.into();
+    broker.host = host.to_string().into();
     broker.port = port;
     broker.rack = None;
     broker
