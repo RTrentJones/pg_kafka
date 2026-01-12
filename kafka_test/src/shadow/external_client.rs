@@ -28,16 +28,29 @@ pub fn get_external_sasl_password() -> String {
 
 /// Create a producer for external Kafka (9093)
 pub fn create_external_producer() -> Result<FutureProducer, Box<dyn std::error::Error>> {
-    let producer: FutureProducer = ClientConfig::new()
-        .set("bootstrap.servers", get_external_bootstrap_servers())
-        .set("security.protocol", "SASL_PLAINTEXT")
-        .set("sasl.mechanism", "PLAIN")
-        .set("sasl.username", get_external_sasl_username())
-        .set("sasl.password", get_external_sasl_password())
-        .set("message.timeout.ms", "10000")
-        .set("broker.address.family", "v4")
-        .create()?;
+    // Check if SASL is configured via environment
+    let use_sasl = env::var("EXTERNAL_KAFKA_USE_SASL")
+        .unwrap_or_else(|_| "false".to_string())
+        .parse::<bool>()
+        .unwrap_or(false);
 
+    let mut config = ClientConfig::new();
+    config
+        .set("bootstrap.servers", get_external_bootstrap_servers())
+        .set("message.timeout.ms", "10000")
+        .set("broker.address.family", "v4");
+
+    if use_sasl {
+        config
+            .set("security.protocol", "SASL_PLAINTEXT")
+            .set("sasl.mechanism", "PLAIN")
+            .set("sasl.username", get_external_sasl_username())
+            .set("sasl.password", get_external_sasl_password());
+    } else {
+        config.set("security.protocol", "PLAINTEXT");
+    }
+
+    let producer: FutureProducer = config.create()?;
     Ok(producer)
 }
 
@@ -45,18 +58,31 @@ pub fn create_external_producer() -> Result<FutureProducer, Box<dyn std::error::
 pub fn create_external_consumer(
     group_id: &str,
 ) -> Result<BaseConsumer, Box<dyn std::error::Error>> {
-    let consumer: BaseConsumer = ClientConfig::new()
+    // Check if SASL is configured via environment
+    let use_sasl = env::var("EXTERNAL_KAFKA_USE_SASL")
+        .unwrap_or_else(|_| "false".to_string())
+        .parse::<bool>()
+        .unwrap_or(false);
+
+    let mut config = ClientConfig::new();
+    config
         .set("bootstrap.servers", get_external_bootstrap_servers())
-        .set("security.protocol", "SASL_PLAINTEXT")
-        .set("sasl.mechanism", "PLAIN")
-        .set("sasl.username", get_external_sasl_username())
-        .set("sasl.password", get_external_sasl_password())
         .set("group.id", group_id)
         .set("auto.offset.reset", "earliest")
         .set("enable.auto.commit", "false")
-        .set("broker.address.family", "v4")
-        .create()?;
+        .set("broker.address.family", "v4");
 
+    if use_sasl {
+        config
+            .set("security.protocol", "SASL_PLAINTEXT")
+            .set("sasl.mechanism", "PLAIN")
+            .set("sasl.username", get_external_sasl_username())
+            .set("sasl.password", get_external_sasl_password());
+    } else {
+        config.set("security.protocol", "PLAINTEXT");
+    }
+
+    let consumer: BaseConsumer = config.create()?;
     Ok(consumer)
 }
 

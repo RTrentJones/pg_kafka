@@ -92,6 +92,12 @@ pub async fn enable_shadow_mode(
     )
     .await?;
 
+    // Wait for background config reload (happens every 30 seconds)
+    // Sleep 31 seconds to ensure at least one reload cycle completes
+    println!("⏳ Waiting for shadow config reload (31s)...");
+    tokio::time::sleep(std::time::Duration::from_secs(31)).await;
+    println!("✅ Config reload complete");
+
     Ok(())
 }
 

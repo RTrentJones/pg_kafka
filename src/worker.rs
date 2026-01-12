@@ -409,7 +409,7 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
 
     loop {
         // ┌─────────────────────────────────────────────────────────────┐
-        // │ Check for Postgres Shutdown Signal                         │
+        // │ Check for Postgres Shutdown Signal                          │
         // └─────────────────────────────────────────────────────────────┘
         if BackgroundWorker::sigterm_received() {
             log!("pg_kafka background worker shutting down");

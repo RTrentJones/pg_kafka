@@ -232,20 +232,39 @@ impl<S: KafkaStore> ShadowStore<S> {
         let config = ShadowConfig::default();
 
         if !config.is_configured() {
-            tracing::debug!("Shadow mode enabled but not configured (missing bootstrap_servers)");
+            pgrx::warning!(
+                "⚠️  SHADOW MODE WARNING: pg_kafka.shadow_mode_enabled=true but pg_kafka.shadow_bootstrap_servers is not configured. Messages will NOT be forwarded to external Kafka!"
+            );
             return None;
         }
 
+        tracing::info!(
+            "Shadow mode: Attempting to connect to external Kafka at {}",
+            config.bootstrap_servers
+        );
+
         // Create the producer
-        match ShadowProducer::new(Arc::new(config)) {
+        match ShadowProducer::new(Arc::new(config.clone())) {
             Ok(producer) => {
                 let producer = Arc::new(producer);
                 *guard = Some(producer.clone());
-                tracing::info!("Shadow producer initialized");
+                tracing::info!(
+                    "✅ Shadow producer successfully initialized and connected to {}",
+                    config.bootstrap_servers
+                );
                 Some(producer)
             }
             Err(e) => {
-                tracing::warn!("Failed to initialize shadow producer: {:?}", e);
+                pgrx::warning!(
+                    "⚠️  SHADOW MODE CONNECTION FAILED: Cannot connect to external Kafka at '{}'. Error: {:?}\n\
+                     Messages will be stored locally but NOT forwarded. Check:\n\
+                     1. Is the Kafka broker accessible from PostgreSQL?\n\
+                     2. Are bootstrap_servers correct? (use 'localhost:9093' if Kafka is on host, not 'external-kafka:9093')\n\
+                     3. Are SASL/SSL credentials correct?\n\
+                     4. Is the broker accepting connections?",
+                    config.bootstrap_servers,
+                    e
+                );
                 None
             }
         }
@@ -330,14 +349,24 @@ impl<S: KafkaStore> ShadowStore<S> {
             }
 
             SyncMode::Sync => {
+                tracing::debug!("Shadow mode: sync mode, ensuring producer");
                 // Sync mode: block on each send using block_on()
                 let producer = match self.ensure_producer() {
-                    Some(p) => p,
+                    Some(p) => {
+                        tracing::debug!("Shadow mode: producer available");
+                        p
+                    }
                     None => {
-                        tracing::debug!("No producer available for shadow forwarding");
+                        tracing::warn!("Shadow mode: NO producer available for shadow forwarding");
                         return;
                     }
                 };
+
+                tracing::debug!(
+                    "Shadow mode: forwarding {} records to {}",
+                    records.len(),
+                    external_topic
+                );
 
                 for (i, record) in records.iter().enumerate() {
                     let offset = base_offset + i as i64;
@@ -349,10 +378,20 @@ impl<S: KafkaStore> ShadowStore<S> {
                         topic_config.forward_percentage,
                     ) {
                         ForwardDecision::Skip => {
+                            tracing::trace!(
+                                "Shadow mode: skipping record {} due to percentage routing",
+                                offset
+                            );
                             self.metrics.skipped.fetch_add(1, Ordering::Relaxed);
                             continue;
                         }
                         ForwardDecision::Forward => {
+                            tracing::trace!(
+                                "Shadow mode: forwarding record {} to {}[{}]",
+                                offset,
+                                external_topic,
+                                partition_id
+                            );
                             // Forward synchronously using send_sync
                             if let Err(e) = producer.send_sync(
                                 external_topic,
@@ -362,7 +401,7 @@ impl<S: KafkaStore> ShadowStore<S> {
                                 DEFAULT_FORWARD_TIMEOUT_MS,
                             ) {
                                 tracing::warn!(
-                                    "Shadow forward failed for {}[{}] offset {}: {:?}",
+                                    "Shadow forward FAILED for {}[{}] offset {}: {:?}",
                                     external_topic,
                                     partition_id,
                                     offset,
@@ -370,6 +409,12 @@ impl<S: KafkaStore> ShadowStore<S> {
                                 );
                                 self.metrics.failed.fetch_add(1, Ordering::Relaxed);
                             } else {
+                                tracing::trace!(
+                                    "Shadow forward SUCCESS for {}[{}] offset {}",
+                                    external_topic,
+                                    partition_id,
+                                    offset
+                                );
                                 self.metrics.forwarded.fetch_add(1, Ordering::Relaxed);
                             }
                         }
@@ -556,12 +601,42 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
         // Skip shadow forwarding if:
         // 1. Shadow mode is not enabled globally
         // 2. We're running on a standby (only primary forwards)
-        if !self.is_enabled() || !self.is_primary() {
+        let is_enabled = self.is_enabled();
+        let is_primary = self.is_primary();
+
+        if !is_enabled {
+            tracing::debug!(
+                "Shadow mode: is_enabled=false, skipping forward for topic_id={}",
+                topic_id
+            );
+        }
+        if !is_primary {
+            tracing::debug!(
+                "Shadow mode: is_primary=false, skipping forward for topic_id={}",
+                topic_id
+            );
+        }
+
+        if !is_enabled || !is_primary {
             return self.inner.insert_records(topic_id, partition_id, records);
         }
 
+        tracing::debug!(
+            "Shadow mode: enabled and primary, checking topic config for topic_id={}",
+            topic_id
+        );
+
         // Get topic configuration (if any)
         let topic_config = self.topic_cache.get(topic_id);
+
+        if topic_config.is_none() {
+            tracing::debug!(
+                "Shadow mode: no topic config found for topic_id={}, skipping forward",
+                topic_id
+            );
+        } else {
+            tracing::debug!("Shadow mode: found topic config for topic_id={}", topic_id);
+        }
 
         // Determine write mode
         let write_mode = topic_config
@@ -569,6 +644,12 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
             .filter(|c| c.should_forward())
             .map(|c| c.write_mode)
             .unwrap_or(WriteMode::DualWrite); // No config = local only (DualWrite but no forward)
+
+        tracing::debug!(
+            "Shadow mode: write_mode={:?} for topic_id={}",
+            write_mode,
+            topic_id
+        );
 
         match write_mode {
             WriteMode::DualWrite => {
@@ -578,13 +659,27 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
                 // Then forward to external (best-effort, doesn't affect return)
                 if let Some(config) = topic_config {
                     if config.should_forward() {
+                        tracing::debug!(
+                            "Shadow mode: calling forward_records_best_effort for topic_id={}",
+                            topic_id
+                        );
                         self.forward_records_best_effort(
                             &config,
                             partition_id,
                             records,
                             base_offset,
                         );
+                    } else {
+                        tracing::debug!(
+                            "Shadow mode: should_forward()=false for topic_id={}",
+                            topic_id
+                        );
                     }
+                } else {
+                    tracing::debug!(
+                        "Shadow mode: topic_config is None, not forwarding for topic_id={}",
+                        topic_id
+                    );
                 }
 
                 Ok(base_offset)
