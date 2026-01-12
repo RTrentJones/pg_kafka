@@ -3,17 +3,19 @@
   "dockerComposeFile": "../docker-compose.yml",
   "service": "pg_kafka_dev",
   "workspaceFolder": "/home/postgres/workspace",
-
   // Run as the postgres user (non-root)
   "remoteUser": "postgres",
-
   // Features to install in the container
   "features": {
     "ghcr.io/devcontainers/features/git:1": {
       "version": "latest"
+    },
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {
+      "version": "latest",
+      "enableNonRootDocker": "true",
+      "moby": "true"
     }
   },
-
   // VS Code extensions to install
   "customizations": {
     "vscode": {
@@ -26,10 +28,15 @@
         "ms-vscode.makefile-tools"
       ],
       "settings": {
-        "rust-analyzer.cargo.features": ["pg14"],
+        "rust-analyzer.cargo.features": [
+          "pg14"
+        ],
         "rust-analyzer.checkOnSave.command": "clippy",
         "rust-analyzer.checkOnSave.allTargets": false,
-        "rust-analyzer.check.extraArgs": ["--features", "pg14"],
+        "rust-analyzer.check.extraArgs": [
+          "--features",
+          "pg14"
+        ],
         "terminal.integrated.defaultProfile.linux": "bash",
         "files.watcherExclude": {
           "**/target/**": true
@@ -37,9 +44,11 @@
       }
     }
   },
-
   // Ports to forward
-  "forwardPorts": [5432, 9092],
+  "forwardPorts": [
+    5432,
+    9092
+  ],
   "portsAttributes": {
     "5432": {
       "label": "PostgreSQL",
@@ -50,12 +59,11 @@
       "onAutoForward": "notify"
     }
   },
-
-  // Post-create commands
-  "postCreateCommand": "rustup update && cargo pgrx init --pg14 download && curl -s https://raw.githubusercontent.com/nektos/act/master/install.sh | sudo bash",
-
+  // Post-create commands removed - base image already has nightly toolchain
+  // rust-toolchain.toml ensures correct version is used automatically
+  // Run 'rustup update' manually if needed (may fail with cross-device link error)
   // Environment variables
-  "remoteEnv": {
-    "RUST_LOG": "info"
-  }
+  "RUST_LOG": "info",
+  "RUSTUP_PERMIT_COPY_RENAME": "true"
+}
 }

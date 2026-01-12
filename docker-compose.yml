@@ -19,30 +19,30 @@ services:
     environment:
       - RUST_LOG=info
       # Shadow mode configuration for testing (Phase 11)
+      # Using PLAINTEXT for dev simplicity - add SASL when needed
       - PG_KAFKA_SHADOW_BOOTSTRAP_SERVERS=external-kafka:9093
-      - PG_KAFKA_SHADOW_SECURITY_PROTOCOL=SASL_PLAINTEXT
-      - PG_KAFKA_SHADOW_SASL_MECHANISM=PLAIN
-      - PG_KAFKA_SHADOW_SASL_USERNAME=test-user
-      - PG_KAFKA_SHADOW_SASL_PASSWORD=test-password
+      - PG_KAFKA_SHADOW_SECURITY_PROTOCOL=PLAINTEXT
     # Security tweak to allow gdb/perf if you need to debug crashes
+    privileged: true
     cap_add:
       - SYS_PTRACE
     security_opt:
       - seccomp:unconfined
-    depends_on:
-      external-kafka:
-        condition: service_healthy
+    # depends_on:  # Uncomment when external-kafka is fixed
+    #   external-kafka:
+    #     condition: service_healthy
     networks:
       - pg_kafka_network
 
   # External Kafka for shadow mode testing (Phase 11)
-  # Uses KRaft mode (no ZooKeeper) with SASL/PLAIN authentication
+  # Uses KRaft mode (no ZooKeeper) with PLAINTEXT for simplicity
+  # TODO: Add SASL/PLAIN auth when needed for production-like testing
   external-kafka:
     image: apache/kafka:3.7.0
     container_name: external_kafka
     hostname: external-kafka
     ports:
-      - "9093:9093"    # External Kafka listener (SASL_PLAINTEXT)
+      - "9093:9093"    # External Kafka listener
     environment:
       # KRaft mode configuration (no ZooKeeper)
       KAFKA_NODE_ID: 1
@@ -50,22 +50,11 @@ services:
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@external-kafka:9094
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
 
-      # Listeners configuration
-      KAFKA_LISTENERS: SASL_PLAINTEXT://0.0.0.0:9093,CONTROLLER://0.0.0.0:9094
-      KAFKA_ADVERTISED_LISTENERS: SASL_PLAINTEXT://external-kafka:9093
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,SASL_PLAINTEXT:SASL_PLAINTEXT
-      KAFKA_INTER_BROKER_LISTENER_NAME: SASL_PLAINTEXT
-
-      # SASL/PLAIN authentication
-      KAFKA_SASL_ENABLED_MECHANISMS: PLAIN
-      KAFKA_SASL_MECHANISM_INTER_BROKER_PROTOCOL: PLAIN
-      KAFKA_LISTENER_NAME_SASL__PLAINTEXT_SASL_ENABLED_MECHANISMS: PLAIN
-      KAFKA_LISTENER_NAME_SASL__PLAINTEXT_PLAIN_SASL_JAAS_CONFIG: |
-        org.apache.kafka.common.security.plain.PlainLoginModule required
-        username="admin"
-        password="admin-secret"
-        user_admin="admin-secret"
-        user_test-user="test-password";
+      # Listeners configuration (PLAINTEXT - no auth for dev simplicity)
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9093,CONTROLLER://0.0.0.0:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://external-kafka:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
 
       # Storage configuration
       KAFKA_LOG_DIRS: /var/lib/kafka/data

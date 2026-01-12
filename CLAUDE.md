@@ -46,7 +46,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Automated E2E tests with real Kafka client (rdkafka)
 
 **API Coverage:** 23 of ~50 standard Kafka APIs (46%)
-**Test Status:** All unit tests (406) and E2E tests (74) passing ✅
+**Test Status:** 192 unit tests + 104 E2E tests = 296 total ✅
 **Coverage Target:** 80%+ (testable code)
 
 ## Development Setup
@@ -194,9 +194,29 @@ src/
     └── pgrx_embed.rs   # pgrx embedding binary (generated)
 
 tests/                  # pgrx integration tests (limited due to PGC_POSTMASTER)
-kafka_test/             # E2E test suite using rdkafka client
+kafka_test/             # E2E test suite (74 tests)
     └── src/
-        └── main.rs     # Automated E2E tests (5 scenarios, all passing)
+        ├── main.rs               # Test orchestrator with CLI
+        ├── lib.rs                # Test re-exports
+        ├── common.rs             # Client factories
+        ├── setup.rs              # TestContext for isolation
+        ├── fixtures.rs           # Test builders
+        ├── assertions.rs         # Domain assertions
+        ├── producer/             # Producer tests
+        ├── consumer/             # Consumer tests
+        ├── consumer_group/       # Consumer group tests
+        ├── offset_management/    # Offset commit/fetch tests
+        ├── partition/            # Multi-partition tests
+        ├── compression/          # Compression tests
+        ├── idempotent/           # Idempotent producer tests
+        ├── transaction/          # Transaction tests
+        ├── shadow/               # Shadow mode tests (Phase 11)
+        ├── long_poll/            # Long polling tests
+        ├── error_paths/          # Error handling tests
+        ├── edge_cases/           # Boundary condition tests
+        ├── concurrent/           # Concurrency tests
+        ├── negative/             # Expected failure tests
+        └── performance/          # Performance benchmarks
 
 sql/
 ├── pg_kafka--0.0.0.sql # Schema definition (kafka.messages, kafka.topics, kafka.consumer_offsets)
@@ -394,7 +414,60 @@ pg_kafka.shutdown_timeout_ms = 5000
 pg_kafka.default_partitions = 1   -- Default partitions for auto-created topics
 pg_kafka.compression_type = 'none' -- Outbound compression (none, gzip, snappy, lz4, zstd)
 pg_kafka.log_timing = false       -- Enable timing instrumentation for benchmarking
+pg_kafka.enable_long_polling = true  -- Enable long polling for FetchRequest
+pg_kafka.fetch_poll_interval_ms = 100  -- Fallback polling interval (100-60000ms)
+
+-- See "Shadow Mode Configuration" section below for shadow mode settings
 ```
+
+## Shadow Mode Configuration (Phase 11)
+
+Shadow mode allows pg_kafka to forward messages to an external Kafka cluster while still storing them locally. This enables dual-write patterns for migration, validation, or hybrid architectures.
+
+```sql
+-- Enable shadow mode globally
+pg_kafka.shadow_mode_enabled = true                    -- Default: false
+
+-- External Kafka connection
+pg_kafka.shadow_bootstrap_servers = 'kafka1:9092,kafka2:9092'  -- Required
+pg_kafka.shadow_security_protocol = 'SASL_SSL'         -- Default: PLAINTEXT
+pg_kafka.shadow_sasl_mechanism = 'SCRAM-SHA-256'       -- Default: PLAIN
+pg_kafka.shadow_sasl_username = 'your_username'        -- Default: empty
+pg_kafka.shadow_sasl_password = 'your_password'        -- Default: empty
+pg_kafka.shadow_ssl_ca_location = '/path/to/ca-cert'   -- Default: empty
+
+-- Batching and retry configuration
+pg_kafka.shadow_batch_size = 100                       -- Messages per batch (1-10000)
+pg_kafka.shadow_linger_ms = 100                        -- Batch delay (0-5000ms)
+pg_kafka.shadow_retry_backoff_ms = 100                 -- Retry delay (10-60000ms)
+pg_kafka.shadow_max_retries = 3                        -- Max retries (0-100)
+pg_kafka.shadow_default_sync_mode = 'async'            -- Default: async
+
+-- Observability
+pg_kafka.shadow_metrics_enabled = true                 -- Enable metrics collection
+pg_kafka.shadow_otel_endpoint = 'http://otel:4317'     -- OpenTelemetry endpoint
+```
+
+**Per-Topic Shadow Configuration:**
+
+Shadow mode can be configured per-topic via the `kafka.topic_shadow_config` table:
+
+```sql
+-- Forward specific topics with different settings
+INSERT INTO kafka.topic_shadow_config (topic_name, enabled, external_topic, sync_mode, shadow_percentage)
+VALUES
+  ('orders', true, 'prod-orders', 'sync', 100),      -- 100% sync forwarding
+  ('analytics', true, 'prod-analytics', 'async', 50), -- 50% async sampling
+  ('internal', false, NULL, NULL, 0);                -- No forwarding
+
+-- Replay historical messages to external Kafka
+SELECT kafka.replay_to_shadow('orders', '2026-01-01'::timestamp, '2026-01-02'::timestamp);
+```
+
+**Use Cases:**
+- **Migration**: Dual-write to external Kafka during pg_kafka → Kafka migration
+- **Validation**: Compare pg_kafka behavior against production Kafka
+- **Hybrid Architecture**: Store locally + forward to centralized Kafka cluster
 
 ## Testing with Kafka Clients
 
@@ -441,6 +514,53 @@ Tests use shared infrastructure from `kafka_test/src/`:
 - **setup.rs**: `TestContext` for RAII-based isolation with automatic cleanup
 - **fixtures.rs**: Builders (`TestTopicBuilder`, `TestConsumerBuilder`, `TestProducerBuilder`)
 - **assertions.rs**: Domain-specific assertions (`assert_topic_exists()`, `assert_message_count()`, etc.)
+
+### Test Categories (104 tests)
+
+| Category | Tests | Purpose |
+|----------|-------|---------|
+| **admin** | 9 | CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups |
+| **producer/** | 2 | Basic produce, batch produce |
+| **consumer/** | 3 | Basic consume, from offset, multiple messages |
+| **consumer_group/** | 3 | Lifecycle, two-member groups, rebalancing |
+| **offset_management/** | 2 | Commit/fetch, boundary conditions |
+| **partition/** | 4 | Multi-partition topics, key routing, distribution |
+| **compression/** | 5 | gzip, snappy, lz4, zstd, roundtrip verification |
+| **idempotent/** | 2 | InitProducerId, deduplication (Phase 9) |
+| **transaction/** | 8 | Transactions, isolation levels, EOS, fencing (Phase 10) |
+| **shadow/** | 20 | External forwarding, SASL/SSL, topic mapping, replay, dial-up tests (Phase 11) |
+| **long_poll/** | 4 | Timeout behavior, immediate return, producer wakeup |
+| **error_paths/** | 16 | Invalid partitions, unknown topics, coordinator errors |
+| **edge_cases/** | 11 | Empty topics, large messages, boundary values |
+| **concurrent/** | 8 | Multi-producer, multi-consumer, request pipelining |
+| **negative/** | 4 | Connection refused, timeouts, expected failures |
+| **performance/** | 3 | Throughput baselines (produce, consume, batch) |
+
+### Running E2E Tests with CLI Options
+
+```bash
+# Run all tests
+cd kafka_test && cargo run --release
+
+# Run specific category
+cargo run --release -- --category compression
+cargo run --release -- --category shadow
+
+# Run single test by name
+cargo run --release -- --test test_idempotent_producer_deduplication
+
+# Run tests in parallel (where safe)
+cargo run --release -- --parallel
+
+# JSON output for CI
+cargo run --release -- --json
+
+# List all available tests
+cargo run --release -- --list
+
+# Combine flags
+cargo run --release -- --category transaction --json
+```
 
 ### Standard Test Structure
 
@@ -543,14 +663,14 @@ To debug:
 
 ## Non-Goals (v1)
 
-- Full Protocol Compliance: No Transactions support (acks=0 fire-and-forget IS supported)
+- Full Kafka Protocol Compliance: Focus on core APIs, not 100% feature parity
 - High Availability: Rely on standard Postgres HA (Patroni/RDS) rather than Kafka's ISR
-- Broker Clustering: Single-node "broker" design
+- Broker Clustering: Single-node "broker" design (scale via Postgres replication)
 
-## Planned Features (Future Phases)
+## Future Enhancements
 
-- Phase 10: Shadow replication worker using Logical Decoding
-- Phase 11: Transaction support (full ACID semantics)
-- Table partitioning and retention policies
+- Table partitioning and retention policies (for high-volume use cases)
 - Cooperative rebalancing (KIP-429)
 - Static group membership (KIP-345)
+- Log compaction (KIP-58)
+- Read replica support via PostgreSQL streaming replication
