@@ -186,24 +186,49 @@ mod tests {
         ) -> crate::kafka::error::Result<(i32, i32)> {
             Ok((1, 1))
         }
+
+        fn get_topic_metadata(
+            &self,
+            _names: Option<&[String]>,
+        ) -> crate::kafka::error::Result<Vec<crate::kafka::storage::TopicMetadata>> {
+            Ok(vec![])
+        }
+
         fn insert_records(
             &self,
             _topic_id: i32,
             _partition_id: i32,
-            _records: &[crate::kafka::storage::Record],
+            _records: &[crate::kafka::messages::Record],
         ) -> crate::kafka::error::Result<i64> {
             Ok(0)
         }
+
         fn fetch_records(
             &self,
             _topic_id: i32,
             _partition_id: i32,
             _fetch_offset: i64,
             _max_bytes: i32,
-            _isolation_level: crate::kafka::storage::IsolationLevel,
         ) -> crate::kafka::error::Result<Vec<crate::kafka::storage::FetchedMessage>> {
             Ok(vec![])
         }
+
+        fn get_high_watermark(
+            &self,
+            _topic_id: i32,
+            _partition_id: i32,
+        ) -> crate::kafka::error::Result<i64> {
+            Ok(0)
+        }
+
+        fn get_earliest_offset(
+            &self,
+            _topic_id: i32,
+            _partition_id: i32,
+        ) -> crate::kafka::error::Result<i64> {
+            Ok(0)
+        }
+
         fn commit_offset(
             &self,
             _group_id: &str,
@@ -214,51 +239,66 @@ mod tests {
         ) -> crate::kafka::error::Result<()> {
             Ok(())
         }
+
         fn fetch_offset(
             &self,
             _group_id: &str,
             _topic_id: i32,
             _partition_id: i32,
-        ) -> crate::kafka::error::Result<Option<i64>> {
+        ) -> crate::kafka::error::Result<Option<crate::kafka::storage::CommittedOffset>> {
             Ok(None)
         }
-        fn get_topic_metadata(
+
+        fn fetch_all_offsets(
             &self,
-            _topic_name: Option<&str>,
-        ) -> crate::kafka::error::Result<Vec<crate::kafka::storage::TopicMetadata>> {
+            _group_id: &str,
+        ) -> crate::kafka::error::Result<Vec<(String, i32, crate::kafka::storage::CommittedOffset)>>
+        {
             Ok(vec![])
         }
-        fn get_earliest_offset(
-            &self,
-            _topic_id: i32,
-            _partition_id: i32,
-        ) -> crate::kafka::error::Result<i64> {
-            Ok(0)
+
+        fn topic_exists(&self, _name: &str) -> crate::kafka::error::Result<bool> {
+            Ok(true)
         }
-        fn get_latest_offset(
-            &self,
-            _topic_id: i32,
-            _partition_id: i32,
-        ) -> crate::kafka::error::Result<i64> {
-            Ok(0)
-        }
+
         fn create_topic(
             &self,
             _name: &str,
-            _num_partitions: i32,
+            _partition_count: i32,
         ) -> crate::kafka::error::Result<i32> {
             Ok(1)
         }
-        fn delete_topic(&self, _name: &str) -> crate::kafka::error::Result<()> {
+
+        fn get_topic_id(&self, _name: &str) -> crate::kafka::error::Result<Option<i32>> {
+            Ok(Some(1))
+        }
+
+        fn delete_topic(&self, _topic_id: i32) -> crate::kafka::error::Result<()> {
             Ok(())
         }
-        fn add_partitions(
+
+        fn get_topic_partition_count(
             &self,
-            _topic_name: &str,
-            _new_partition_count: i32,
+            _name: &str,
+        ) -> crate::kafka::error::Result<Option<i32>> {
+            Ok(Some(1))
+        }
+
+        fn set_topic_partition_count(
+            &self,
+            _name: &str,
+            _partition_count: i32,
         ) -> crate::kafka::error::Result<()> {
             Ok(())
         }
+
+        fn delete_consumer_group_offsets(
+            &self,
+            _group_id: &str,
+        ) -> crate::kafka::error::Result<()> {
+            Ok(())
+        }
+
         fn allocate_producer_id(
             &self,
             _client_id: Option<&str>,
@@ -266,43 +306,80 @@ mod tests {
         ) -> crate::kafka::error::Result<(i64, i16)> {
             Ok((1, 0))
         }
+
+        fn get_producer_epoch(
+            &self,
+            _producer_id: i64,
+        ) -> crate::kafka::error::Result<Option<i16>> {
+            Ok(Some(0))
+        }
+
+        fn increment_producer_epoch(&self, _producer_id: i64) -> crate::kafka::error::Result<i16> {
+            Ok(1)
+        }
+
         fn check_and_update_sequence(
             &self,
             _producer_id: i64,
+            _producer_epoch: i16,
             _topic_id: i32,
             _partition_id: i32,
-            _sequence: i32,
-        ) -> crate::kafka::error::Result<crate::kafka::storage::SequenceCheckResult> {
-            Ok(crate::kafka::storage::SequenceCheckResult::Valid)
+            _base_sequence: i32,
+            _record_count: i32,
+        ) -> crate::kafka::error::Result<bool> {
+            Ok(true)
         }
+
+        fn get_or_create_transactional_producer(
+            &self,
+            _transactional_id: &str,
+            _transaction_timeout_ms: i32,
+            _client_id: Option<&str>,
+        ) -> crate::kafka::error::Result<(i64, i16)> {
+            Ok((1, 0))
+        }
+
         fn begin_transaction(
             &self,
             _transactional_id: &str,
             _producer_id: i64,
             _producer_epoch: i16,
-            _timeout_ms: i32,
         ) -> crate::kafka::error::Result<()> {
             Ok(())
         }
-        fn add_partitions_to_txn(
+
+        fn validate_transaction(
             &self,
             _transactional_id: &str,
             _producer_id: i64,
             _producer_epoch: i16,
-            _topic_partitions: &[(i32, Vec<i32>)],
         ) -> crate::kafka::error::Result<()> {
             Ok(())
         }
-        fn add_offsets_to_txn(
+
+        fn insert_transactional_records(
             &self,
-            _transactional_id: &str,
+            _topic_id: i32,
+            _partition_id: i32,
+            _records: &[crate::kafka::messages::Record],
             _producer_id: i64,
             _producer_epoch: i16,
+        ) -> crate::kafka::error::Result<i64> {
+            Ok(0)
+        }
+
+        fn store_txn_pending_offset(
+            &self,
+            _transactional_id: &str,
             _group_id: &str,
-            _offsets: &[(i32, i32, i64, Option<String>)],
+            _topic_id: i32,
+            _partition_id: i32,
+            _offset: i64,
+            _metadata: Option<&str>,
         ) -> crate::kafka::error::Result<()> {
             Ok(())
         }
+
         fn commit_transaction(
             &self,
             _transactional_id: &str,
@@ -311,6 +388,7 @@ mod tests {
         ) -> crate::kafka::error::Result<()> {
             Ok(())
         }
+
         fn abort_transaction(
             &self,
             _transactional_id: &str,
@@ -318,6 +396,46 @@ mod tests {
             _producer_epoch: i16,
         ) -> crate::kafka::error::Result<()> {
             Ok(())
+        }
+
+        fn get_transaction_state(
+            &self,
+            _transactional_id: &str,
+        ) -> crate::kafka::error::Result<Option<crate::kafka::storage::TransactionState>> {
+            Ok(None)
+        }
+
+        fn fetch_records_with_isolation(
+            &self,
+            _topic_id: i32,
+            _partition_id: i32,
+            _fetch_offset: i64,
+            _max_bytes: i32,
+            _isolation_level: crate::kafka::storage::IsolationLevel,
+        ) -> crate::kafka::error::Result<Vec<crate::kafka::storage::FetchedMessage>> {
+            Ok(vec![])
+        }
+
+        fn get_last_stable_offset(
+            &self,
+            _topic_id: i32,
+            _partition_id: i32,
+        ) -> crate::kafka::error::Result<i64> {
+            Ok(0)
+        }
+
+        fn abort_timed_out_transactions(
+            &self,
+            _timeout: std::time::Duration,
+        ) -> crate::kafka::error::Result<Vec<String>> {
+            Ok(vec![])
+        }
+
+        fn cleanup_aborted_messages(
+            &self,
+            _older_than: std::time::Duration,
+        ) -> crate::kafka::error::Result<u64> {
+            Ok(0)
         }
     }
 

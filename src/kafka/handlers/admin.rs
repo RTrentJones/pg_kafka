@@ -314,10 +314,18 @@ mod tests {
     use super::*;
     use crate::testing::mocks::MockKafkaStore;
 
-    fn make_test_context(store: &MockKafkaStore) -> HandlerContext {
-        let coordinator = crate::kafka::GroupCoordinator::new();
-        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
-        HandlerContext::new(store, &coordinator, &broker, 1, kafka_protocol::records::Compression::None)
+    fn make_test_context<'a>(
+        store: &'a MockKafkaStore,
+        coordinator: &'a crate::kafka::GroupCoordinator,
+        broker: &'a crate::kafka::BrokerMetadata,
+    ) -> HandlerContext<'a> {
+        HandlerContext::new(
+            store,
+            coordinator,
+            broker,
+            1,
+            kafka_protocol::records::Compression::None,
+        )
     }
 
     #[test]
@@ -332,7 +340,9 @@ mod tests {
             replication_factor: 1,
         }];
 
-        let ctx = make_test_context(&store);
+        let coordinator = crate::kafka::GroupCoordinator::new();
+        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = make_test_context(&store, &coordinator, &broker);
         let result = handle_create_topics(&ctx, topics, false);
         assert!(result.is_ok());
 
@@ -350,7 +360,9 @@ mod tests {
             replication_factor: 1,
         }];
 
-        let ctx = make_test_context(&store);
+        let coordinator = crate::kafka::GroupCoordinator::new();
+        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = make_test_context(&store, &coordinator, &broker);
         let result = handle_create_topics(&ctx, topics, false);
         assert!(result.is_ok());
 
@@ -370,7 +382,9 @@ mod tests {
             replication_factor: 1,
         }];
 
-        let ctx = make_test_context(&store);
+        let coordinator = crate::kafka::GroupCoordinator::new();
+        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = make_test_context(&store, &coordinator, &broker);
         let result = handle_create_topics(&ctx, topics, true);
         assert!(result.is_ok());
 
@@ -389,7 +403,9 @@ mod tests {
             replication_factor: 1,
         }];
 
-        let ctx = make_test_context(&store);
+        let coordinator = crate::kafka::GroupCoordinator::new();
+        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = make_test_context(&store, &coordinator, &broker);
         let result = handle_create_topics(&ctx, topics, false);
         assert!(result.is_ok());
 
@@ -403,7 +419,9 @@ mod tests {
         store.expect_get_topic_id().returning(|_| Ok(Some(1)));
         store.expect_delete_topic().returning(|_| Ok(()));
 
-        let ctx = make_test_context(&store);
+        let coordinator = crate::kafka::GroupCoordinator::new();
+        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = make_test_context(&store, &coordinator, &broker);
         let result = handle_delete_topics(&ctx, vec!["test-topic".to_string()]);
         assert!(result.is_ok());
 
@@ -417,7 +435,9 @@ mod tests {
         let mut store = MockKafkaStore::new();
         store.expect_get_topic_id().returning(|_| Ok(None));
 
-        let ctx = make_test_context(&store);
+        let coordinator = crate::kafka::GroupCoordinator::new();
+        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = make_test_context(&store, &coordinator, &broker);
         let result = handle_delete_topics(&ctx, vec!["nonexistent".to_string()]);
         assert!(result.is_ok());
 
@@ -443,7 +463,9 @@ mod tests {
             count: 3,
         }];
 
-        let ctx = make_test_context(&store);
+        let coordinator = crate::kafka::GroupCoordinator::new();
+        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = make_test_context(&store, &coordinator, &broker);
         let result = handle_create_partitions(&ctx, topics, false);
         assert!(result.is_ok());
 
@@ -464,7 +486,9 @@ mod tests {
             count: 3, // Less than current 5
         }];
 
-        let ctx = make_test_context(&store);
+        let coordinator = crate::kafka::GroupCoordinator::new();
+        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = make_test_context(&store, &coordinator, &broker);
         let result = handle_create_partitions(&ctx, topics, false);
         assert!(result.is_ok());
 

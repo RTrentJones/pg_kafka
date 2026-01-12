@@ -53,7 +53,7 @@ mod tests {
             }],
         }];
 
-        // Create HandlerContext
+        // Create HandlerContext AFTER setting expectations
         let coordinator = GroupCoordinator::new();
         let broker = BrokerMetadata::new("localhost".to_string(), 9092);
         let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
@@ -86,7 +86,7 @@ mod tests {
             }],
         }];
 
-        // Create HandlerContext
+        // Create HandlerContext AFTER setting expectations
         let coordinator = GroupCoordinator::new();
         let broker = BrokerMetadata::new("localhost".to_string(), 9092);
         let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
@@ -126,7 +126,7 @@ mod tests {
             }],
         }];
 
-        // Create HandlerContext
+        // Create HandlerContext AFTER setting expectations
         let coordinator = GroupCoordinator::new();
         let broker = BrokerMetadata::new("localhost".to_string(), 9092);
         let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
@@ -173,7 +173,7 @@ mod tests {
             }],
         }];
 
-        // Create HandlerContext
+        // Create HandlerContext AFTER setting expectations
         let coordinator = GroupCoordinator::new();
         let broker = BrokerMetadata::new("localhost".to_string(), 9092);
         let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
@@ -207,7 +207,7 @@ mod tests {
             }],
         }];
 
-        // Create HandlerContext
+        // Create HandlerContext AFTER setting expectations
         let coordinator = GroupCoordinator::new();
         let broker = BrokerMetadata::new("localhost".to_string(), 9092);
         let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
@@ -248,7 +248,7 @@ mod tests {
             }],
         }];
 
-        // Create HandlerContext
+        // Create HandlerContext AFTER setting expectations
         let coordinator = GroupCoordinator::new();
         let broker = BrokerMetadata::new("localhost".to_string(), 9092);
         let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
@@ -283,7 +283,7 @@ mod tests {
             }],
         }];
 
-        // Create HandlerContext
+        // Create HandlerContext AFTER setting expectations
         let coordinator = GroupCoordinator::new();
         let broker = BrokerMetadata::new("localhost".to_string(), 9092);
         let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
@@ -316,7 +316,7 @@ mod tests {
             ])
         });
 
-        // Create HandlerContext
+        // Create HandlerContext AFTER setting expectations
         let coordinator = GroupCoordinator::new();
         let broker = BrokerMetadata::new("localhost".to_string(), 9092);
         let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
@@ -339,16 +339,12 @@ mod tests {
             )
             .returning(|_, _| Ok((5, 1))); // (topic_id=5, partition_count=1)
 
-        // Create HandlerContext
+        // Create HandlerContext AFTER setting expectations
         let coordinator = GroupCoordinator::new();
         let broker = BrokerMetadata::new("localhost".to_string(), 9092);
         let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
 
-        let response = metadata::handle_metadata(
-            &ctx,
-            Some(vec!["my-topic".to_string()]),
-        )
-        .unwrap();
+        let response = metadata::handle_metadata(&ctx, Some(vec!["my-topic".to_string()])).unwrap();
 
         assert_eq!(response.topics.len(), 1);
     }
@@ -379,7 +375,7 @@ mod tests {
             }],
         }];
 
-        // Create HandlerContext
+        // Create HandlerContext AFTER setting expectations
         let coordinator = GroupCoordinator::new();
         let broker = BrokerMetadata::new("localhost".to_string(), 9092);
         let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
@@ -407,7 +403,7 @@ mod tests {
             }],
         }];
 
-        // Create HandlerContext
+        // Create HandlerContext AFTER setting expectations
         let coordinator = GroupCoordinator::new();
         let broker = BrokerMetadata::new("localhost".to_string(), 9092);
         let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
@@ -448,7 +444,7 @@ mod tests {
             partition_indexes: vec![0],
         }]);
 
-        // Create HandlerContext
+        // Create HandlerContext AFTER setting expectations
         let coordinator = GroupCoordinator::new();
         let broker = BrokerMetadata::new("localhost".to_string(), 9092);
         let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
@@ -481,7 +477,7 @@ mod tests {
             partition_indexes: vec![0],
         }]);
 
-        // Create HandlerContext
+        // Create HandlerContext AFTER setting expectations
         let coordinator = GroupCoordinator::new();
         let broker = BrokerMetadata::new("localhost".to_string(), 9092);
         let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
@@ -519,14 +515,13 @@ mod tests {
             ])
         });
 
-        // Create HandlerContext
+        // Create HandlerContext AFTER setting expectations
         let coordinator = GroupCoordinator::new();
         let broker = BrokerMetadata::new("localhost".to_string(), 9092);
         let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
 
         // Request with None = fetch all
-        let response =
-            consumer::handle_offset_fetch(&ctx, "test-group".to_string(), None).unwrap();
+        let response = consumer::handle_offset_fetch(&ctx, "test-group".to_string(), None).unwrap();
 
         // Should have 2 topics
         assert_eq!(response.topics.len(), 2);
@@ -854,13 +849,9 @@ mod tests {
         .unwrap();
 
         // Send heartbeat - should succeed now that group is Stable
-        let heartbeat_response = coordinator::handle_heartbeat(
-            &ctx,
-            "test-group".to_string(),
-            member_id,
-            generation_id,
-        )
-        .unwrap();
+        let heartbeat_response =
+            coordinator::handle_heartbeat(&ctx, "test-group".to_string(), member_id, generation_id)
+                .unwrap();
 
         assert_eq!(heartbeat_response.error_code, ERROR_NONE);
     }
@@ -1045,8 +1036,7 @@ mod tests {
         assert!(list_stable.groups.len() <= 1);
 
         // List with state filter that doesn't match
-        let list_empty =
-            coordinator::handle_list_groups(&ctx, vec!["Empty".to_string()]).unwrap();
+        let list_empty = coordinator::handle_list_groups(&ctx, vec!["Empty".to_string()]).unwrap();
 
         // Group is not empty (it has a member)
         assert_eq!(list_empty.groups.len(), 0);
@@ -1066,6 +1056,7 @@ mod tests {
             .times(1)
             .returning(|_, _| Ok((1000, 0))); // producer_id=1000, epoch=0
 
+        // Create HandlerContext AFTER setting expectations
         let coordinator = GroupCoordinator::new();
         let broker = BrokerMetadata::new("localhost".to_string(), 9092);
         let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
@@ -1099,6 +1090,7 @@ mod tests {
             .times(1)
             .returning(|_| Ok(1)); // New epoch is 1
 
+        // Create HandlerContext AFTER setting expectations
         let coordinator = GroupCoordinator::new();
         let broker = BrokerMetadata::new("localhost".to_string(), 9092);
         let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
@@ -1127,6 +1119,7 @@ mod tests {
             .times(1)
             .returning(|_| Ok(Some(5))); // Current epoch is 5, but client has 3
 
+        // Create HandlerContext AFTER setting expectations
         let coordinator = GroupCoordinator::new();
         let broker = BrokerMetadata::new("localhost".to_string(), 9092);
         let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
@@ -1164,6 +1157,7 @@ mod tests {
             .times(1)
             .returning(|_| Ok(None));
 
+        // Create HandlerContext AFTER setting expectations
         let coordinator = GroupCoordinator::new();
         let broker = BrokerMetadata::new("localhost".to_string(), 9092);
         let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
@@ -1226,6 +1220,7 @@ mod tests {
             base_sequence: 0,
         };
 
+        // Create HandlerContext AFTER setting expectations
         let coordinator = GroupCoordinator::new();
         let broker = BrokerMetadata::new("localhost".to_string(), 9092);
         let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
@@ -1408,6 +1403,7 @@ mod tests {
             .times(1)
             .returning(|_| Ok(Some(4)));
 
+        // Create HandlerContext AFTER setting expectations
         let coordinator = GroupCoordinator::new();
         let broker = BrokerMetadata::new("localhost".to_string(), 9092);
         let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
@@ -1447,6 +1443,7 @@ mod tests {
             .times(1)
             .returning(|_| Ok(Some(4)));
 
+        // Create HandlerContext AFTER setting expectations
         let coordinator = GroupCoordinator::new();
         let broker = BrokerMetadata::new("localhost".to_string(), 9092);
         let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
@@ -1535,21 +1532,18 @@ mod tests {
 
     #[test]
     fn test_add_partitions_invalid_state() {
-
         let mut mock = MockKafkaStore::new();
-
-
-
-        let coordinator = GroupCoordinator::new();
-        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
-
 
         mock.expect_validate_transaction()
             .returning(|_, _, _| Ok(()));
         // State is CompleteCommit - invalid for AddPartitionsToTxn
         mock.expect_get_transaction_state()
             .returning(|_| Ok(Some(TransactionState::CompleteCommit)));
+
+        // Create HandlerContext AFTER setting expectations
+        let coordinator = GroupCoordinator::new();
+        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
 
         let topics = vec![("test-topic".to_string(), vec![0])];
 
@@ -1564,20 +1558,17 @@ mod tests {
 
     #[test]
     fn test_add_partitions_txn_not_found() {
-
         let mut mock = MockKafkaStore::new();
-
-
-
-        let coordinator = GroupCoordinator::new();
-        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
-
 
         mock.expect_validate_transaction()
             .returning(|_, _, _| Ok(()));
         // Transaction doesn't exist
         mock.expect_get_transaction_state().returning(|_| Ok(None));
+
+        // Create HandlerContext AFTER setting expectations
+        let coordinator = GroupCoordinator::new();
+        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
 
         let topics = vec![("test-topic".to_string(), vec![0])];
 
@@ -1593,19 +1584,16 @@ mod tests {
 
     #[test]
     fn test_add_partitions_producer_fenced() {
-
         let mut mock = MockKafkaStore::new();
-
-
-
-        let coordinator = GroupCoordinator::new();
-        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
-
 
         // Validation fails with ProducerFenced
         mock.expect_validate_transaction()
             .returning(|_, _, _| Err(KafkaError::producer_fenced(1000, 0, 1)));
+
+        // Create HandlerContext AFTER setting expectations
+        let coordinator = GroupCoordinator::new();
+        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
 
         let topics = vec![("test-topic".to_string(), vec![0])];
 
@@ -1622,20 +1610,17 @@ mod tests {
 
     #[test]
     fn test_add_offsets_success_ongoing() {
-
         let mut mock = MockKafkaStore::new();
-
-
-
-        let coordinator = GroupCoordinator::new();
-        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
-
 
         mock.expect_validate_transaction()
             .returning(|_, _, _| Ok(()));
         mock.expect_get_transaction_state()
             .returning(|_| Ok(Some(TransactionState::Ongoing)));
+
+        // Create HandlerContext AFTER setting expectations
+        let coordinator = GroupCoordinator::new();
+        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
 
         let response =
             transaction::handle_add_offsets_to_txn(&ctx, "txn-1", 1000, 0, "consumer-group")
@@ -1646,15 +1631,7 @@ mod tests {
 
     #[test]
     fn test_add_offsets_starts_transaction() {
-
         let mut mock = MockKafkaStore::new();
-
-
-
-        let coordinator = GroupCoordinator::new();
-        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
-
 
         mock.expect_validate_transaction()
             .returning(|_, _, _| Ok(()));
@@ -1666,6 +1643,11 @@ mod tests {
             .times(1)
             .returning(|_, _, _| Ok(()));
 
+        // Create HandlerContext AFTER setting expectations
+        let coordinator = GroupCoordinator::new();
+        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+
         let response =
             transaction::handle_add_offsets_to_txn(&ctx, "txn-1", 1000, 0, "consumer-group")
                 .unwrap();
@@ -1675,20 +1657,17 @@ mod tests {
 
     #[test]
     fn test_add_offsets_invalid_state() {
-
         let mut mock = MockKafkaStore::new();
-
-
-
-        let coordinator = GroupCoordinator::new();
-        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
-
 
         mock.expect_validate_transaction()
             .returning(|_, _, _| Ok(()));
         mock.expect_get_transaction_state()
             .returning(|_| Ok(Some(TransactionState::PrepareCommit)));
+
+        // Create HandlerContext AFTER setting expectations
+        let coordinator = GroupCoordinator::new();
+        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
 
         let result =
             transaction::handle_add_offsets_to_txn(&ctx, "txn-1", 1000, 0, "consumer-group");
@@ -1702,19 +1681,16 @@ mod tests {
 
     #[test]
     fn test_add_offsets_txn_not_found() {
-
         let mut mock = MockKafkaStore::new();
-
-
-
-        let coordinator = GroupCoordinator::new();
-        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
-
 
         mock.expect_validate_transaction()
             .returning(|_, _, _| Ok(()));
         mock.expect_get_transaction_state().returning(|_| Ok(None));
+
+        // Create HandlerContext AFTER setting expectations
+        let coordinator = GroupCoordinator::new();
+        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
 
         let result =
             transaction::handle_add_offsets_to_txn(&ctx, "unknown-txn", 1000, 0, "consumer-group");
@@ -1728,18 +1704,15 @@ mod tests {
 
     #[test]
     fn test_add_offsets_producer_fenced() {
-
         let mut mock = MockKafkaStore::new();
-
-
-
-        let coordinator = GroupCoordinator::new();
-        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
-
 
         mock.expect_validate_transaction()
             .returning(|_, _, _| Err(KafkaError::producer_fenced(1000, 0, 1)));
+
+        // Create HandlerContext AFTER setting expectations
+        let coordinator = GroupCoordinator::new();
+        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
 
         let result =
             transaction::handle_add_offsets_to_txn(&ctx, "txn-1", 1000, 0, "consumer-group");
@@ -1755,15 +1728,7 @@ mod tests {
 
     #[test]
     fn test_end_txn_commit_success() {
-
         let mut mock = MockKafkaStore::new();
-
-
-
-        let coordinator = GroupCoordinator::new();
-        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
-
 
         mock.expect_validate_transaction()
             .returning(|_, _, _| Ok(()));
@@ -1773,8 +1738,13 @@ mod tests {
             .times(1)
             .returning(|_, _, _| Ok(()));
 
+        // Create HandlerContext AFTER setting expectations
+        let coordinator = GroupCoordinator::new();
+        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+
         let response = transaction::handle_end_txn(
-            &mock, "txn-1", 1000, 0, true, // committed
+            &ctx, "txn-1", 1000, 0, true, // committed
         )
         .unwrap();
 
@@ -1783,15 +1753,7 @@ mod tests {
 
     #[test]
     fn test_end_txn_abort_success() {
-
         let mut mock = MockKafkaStore::new();
-
-
-
-        let coordinator = GroupCoordinator::new();
-        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
-
 
         mock.expect_validate_transaction()
             .returning(|_, _, _| Ok(()));
@@ -1801,8 +1763,13 @@ mod tests {
             .times(1)
             .returning(|_, _, _| Ok(()));
 
+        // Create HandlerContext AFTER setting expectations
+        let coordinator = GroupCoordinator::new();
+        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+
         let response = transaction::handle_end_txn(
-            &mock, "txn-1", 1000, 0, false, // abort
+            &ctx, "txn-1", 1000, 0, false, // abort
         )
         .unwrap();
 
@@ -1811,15 +1778,7 @@ mod tests {
 
     #[test]
     fn test_end_txn_empty_noop() {
-
         let mut mock = MockKafkaStore::new();
-
-
-
-        let coordinator = GroupCoordinator::new();
-        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
-
 
         mock.expect_validate_transaction()
             .returning(|_, _, _| Ok(()));
@@ -1830,6 +1789,11 @@ mod tests {
         // Neither commit_transaction nor abort_transaction should be called
         // (no expects set for them)
 
+        // Create HandlerContext AFTER setting expectations
+        let coordinator = GroupCoordinator::new();
+        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+
         let response = transaction::handle_end_txn(&ctx, "txn-1", 1000, 0, true).unwrap();
 
         assert_eq!(response.error_code, ERROR_NONE);
@@ -1837,21 +1801,18 @@ mod tests {
 
     #[test]
     fn test_end_txn_invalid_state() {
-
         let mut mock = MockKafkaStore::new();
-
-
-
-        let coordinator = GroupCoordinator::new();
-        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
-
 
         mock.expect_validate_transaction()
             .returning(|_, _, _| Ok(()));
         // State is already CompleteCommit - can't end again
         mock.expect_get_transaction_state()
             .returning(|_| Ok(Some(TransactionState::CompleteCommit)));
+
+        // Create HandlerContext AFTER setting expectations
+        let coordinator = GroupCoordinator::new();
+        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
 
         let result = transaction::handle_end_txn(&ctx, "txn-1", 1000, 0, true);
 
@@ -1864,19 +1825,16 @@ mod tests {
 
     #[test]
     fn test_end_txn_txn_not_found() {
-
         let mut mock = MockKafkaStore::new();
-
-
-
-        let coordinator = GroupCoordinator::new();
-        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
-
 
         mock.expect_validate_transaction()
             .returning(|_, _, _| Ok(()));
         mock.expect_get_transaction_state().returning(|_| Ok(None));
+
+        // Create HandlerContext AFTER setting expectations
+        let coordinator = GroupCoordinator::new();
+        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
 
         let result = transaction::handle_end_txn(&ctx, "unknown-txn", 1000, 0, true);
 
@@ -1889,18 +1847,15 @@ mod tests {
 
     #[test]
     fn test_end_txn_producer_fenced() {
-
         let mut mock = MockKafkaStore::new();
-
-
-
-        let coordinator = GroupCoordinator::new();
-        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
-
 
         mock.expect_validate_transaction()
             .returning(|_, _, _| Err(KafkaError::producer_fenced(1000, 0, 1)));
+
+        // Create HandlerContext AFTER setting expectations
+        let coordinator = GroupCoordinator::new();
+        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
 
         let result = transaction::handle_end_txn(&ctx, "txn-1", 1000, 0, true);
 
@@ -1915,15 +1870,7 @@ mod tests {
 
     #[test]
     fn test_txn_offset_commit_success() {
-
         let mut mock = MockKafkaStore::new();
-
-
-
-        let coordinator = GroupCoordinator::new();
-        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
-
 
         mock.expect_validate_transaction()
             .returning(|_, _, _| Ok(()));
@@ -1934,19 +1881,19 @@ mod tests {
             .times(1)
             .returning(|_, _, _, _, _, _| Ok(()));
 
+        // Create HandlerContext AFTER setting expectations
+        let coordinator = GroupCoordinator::new();
+        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+
         let topics = vec![(
             "test-topic".to_string(),
             vec![(0, 100i64, Some("metadata".to_string()))],
         )];
 
-        let response = transaction::handle_txn_offset_commit(&ctx,
-            "txn-1",
-            1000,
-            0,
-            "consumer-group",
-            topics,
-        )
-        .unwrap();
+        let response =
+            transaction::handle_txn_offset_commit(&ctx, "txn-1", 1000, 0, "consumer-group", topics)
+                .unwrap();
 
         assert_eq!(response.topics.len(), 1);
         assert_eq!(response.topics[0].partitions.len(), 1);
@@ -1955,15 +1902,7 @@ mod tests {
 
     #[test]
     fn test_txn_offset_commit_multiple_partitions() {
-
         let mut mock = MockKafkaStore::new();
-
-
-
-        let coordinator = GroupCoordinator::new();
-        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
-
 
         mock.expect_validate_transaction()
             .returning(|_, _, _| Ok(()));
@@ -1975,19 +1914,19 @@ mod tests {
             .times(3)
             .returning(|_, _, _, _, _, _| Ok(()));
 
+        // Create HandlerContext AFTER setting expectations
+        let coordinator = GroupCoordinator::new();
+        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+
         let topics = vec![(
             "test-topic".to_string(),
             vec![(0, 10i64, None), (1, 20i64, None), (2, 30i64, None)],
         )];
 
-        let response = transaction::handle_txn_offset_commit(&ctx,
-            "txn-1",
-            1000,
-            0,
-            "consumer-group",
-            topics,
-        )
-        .unwrap();
+        let response =
+            transaction::handle_txn_offset_commit(&ctx, "txn-1", 1000, 0, "consumer-group", topics)
+                .unwrap();
 
         assert_eq!(response.topics[0].partitions.len(), 3);
         for partition in &response.topics[0].partitions {
@@ -1997,15 +1936,7 @@ mod tests {
 
     #[test]
     fn test_txn_offset_commit_unknown_topic() {
-
         let mut mock = MockKafkaStore::new();
-
-
-
-        let coordinator = GroupCoordinator::new();
-        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
-
 
         mock.expect_validate_transaction()
             .returning(|_, _, _| Ok(()));
@@ -2014,16 +1945,16 @@ mod tests {
         // Topic doesn't exist
         mock.expect_get_topic_id().returning(|_| Ok(None));
 
+        // Create HandlerContext AFTER setting expectations
+        let coordinator = GroupCoordinator::new();
+        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+
         let topics = vec![("unknown-topic".to_string(), vec![(0, 100i64, None)])];
 
-        let response = transaction::handle_txn_offset_commit(&ctx,
-            "txn-1",
-            1000,
-            0,
-            "consumer-group",
-            topics,
-        )
-        .unwrap();
+        let response =
+            transaction::handle_txn_offset_commit(&ctx, "txn-1", 1000, 0, "consumer-group", topics)
+                .unwrap();
 
         assert_eq!(
             response.topics[0].partitions[0].error_code,
@@ -2033,15 +1964,7 @@ mod tests {
 
     #[test]
     fn test_txn_offset_commit_invalid_state_empty() {
-
         let mut mock = MockKafkaStore::new();
-
-
-
-        let coordinator = GroupCoordinator::new();
-        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
-
 
         mock.expect_validate_transaction()
             .returning(|_, _, _| Ok(()));
@@ -2049,15 +1972,15 @@ mod tests {
         mock.expect_get_transaction_state()
             .returning(|_| Ok(Some(TransactionState::Empty)));
 
+        // Create HandlerContext AFTER setting expectations
+        let coordinator = GroupCoordinator::new();
+        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+
         let topics = vec![("test-topic".to_string(), vec![(0, 100i64, None)])];
 
-        let result = transaction::handle_txn_offset_commit(&ctx,
-            "txn-1",
-            1000,
-            0,
-            "consumer-group",
-            topics,
-        );
+        let result =
+            transaction::handle_txn_offset_commit(&ctx, "txn-1", 1000, 0, "consumer-group", topics);
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -2068,28 +1991,20 @@ mod tests {
 
     #[test]
     fn test_txn_offset_commit_producer_fenced() {
-
         let mut mock = MockKafkaStore::new();
-
-
-
-        let coordinator = GroupCoordinator::new();
-        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
-
 
         mock.expect_validate_transaction()
             .returning(|_, _, _| Err(KafkaError::producer_fenced(1000, 0, 1)));
 
+        // Create HandlerContext AFTER setting expectations
+        let coordinator = GroupCoordinator::new();
+        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+
         let topics = vec![("test-topic".to_string(), vec![(0, 100i64, None)])];
 
-        let result = transaction::handle_txn_offset_commit(&ctx,
-            "txn-1",
-            1000,
-            0,
-            "consumer-group",
-            topics,
-        );
+        let result =
+            transaction::handle_txn_offset_commit(&ctx, "txn-1", 1000, 0, "consumer-group", topics);
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -2100,15 +2015,7 @@ mod tests {
 
     #[test]
     fn test_txn_offset_commit_store_error() {
-
         let mut mock = MockKafkaStore::new();
-
-
-
-        let coordinator = GroupCoordinator::new();
-        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
-
 
         mock.expect_validate_transaction()
             .returning(|_, _, _| Ok(()));
@@ -2119,16 +2026,16 @@ mod tests {
         mock.expect_store_txn_pending_offset()
             .returning(|_, _, _, _, _, _| Err(KafkaError::database("store failed")));
 
+        // Create HandlerContext AFTER setting expectations
+        let coordinator = GroupCoordinator::new();
+        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+
         let topics = vec![("test-topic".to_string(), vec![(0, 100i64, None)])];
 
-        let response = transaction::handle_txn_offset_commit(&ctx,
-            "txn-1",
-            1000,
-            0,
-            "consumer-group",
-            topics,
-        )
-        .unwrap();
+        let response =
+            transaction::handle_txn_offset_commit(&ctx, "txn-1", 1000, 0, "consumer-group", topics)
+                .unwrap();
 
         assert_eq!(
             response.topics[0].partitions[0].error_code,
