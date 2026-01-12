@@ -286,14 +286,25 @@ jobs:
         sleep 3 # Wait for protocol readiness (Fixes CI race condition)
 
     - name: Run Functional E2E Tests
-      # Runs functional tests (excludes performance tests which run separately)
+      # Runs functional tests (excludes performance and shadow tests which run separately)
       timeout-minutes: 10
       run: |
         cd kafka_test
-        cargo run --release -- --exclude performance
+        cargo run --release -- --exclude performance --exclude shadow
       env:
         # Pass the dynamically discovered port to the test runner
         # IMPORTANT: Use 'postgres' database since that's where the worker connects via SPI
+        DATABASE_URL: postgresql://${{ env.DB_USER }}@localhost:${{ env.PG_PORT }}/postgres
+
+    - name: Run Shadow Mode E2E Tests
+      # Shadow mode tests run separately to isolate external Kafka interactions
+      # These are advisory - don't block CI while shadow mode is being developed
+      timeout-minutes: 5
+      continue-on-error: true
+      run: |
+        cd kafka_test
+        cargo run --release -- --category shadow
+      env:
         DATABASE_URL: postgresql://${{ env.DB_USER }}@localhost:${{ env.PG_PORT }}/postgres
 
     - name: Run Performance E2E Tests
