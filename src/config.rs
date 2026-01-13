@@ -520,3 +520,298 @@ pub fn init() {
 
     pgrx::log!("pg_kafka GUC parameters initialized (including shadow mode)");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kafka::constants::{
+        DEFAULT_COMPRESSION_TYPE, DEFAULT_DATABASE, DEFAULT_FETCH_POLL_INTERVAL_MS,
+        DEFAULT_KAFKA_PORT, DEFAULT_SHADOW_BATCH_SIZE, DEFAULT_SHADOW_BOOTSTRAP_SERVERS,
+        DEFAULT_SHADOW_LINGER_MS, DEFAULT_SHADOW_MAX_RETRIES, DEFAULT_SHADOW_METRICS_ENABLED,
+        DEFAULT_SHADOW_MODE_ENABLED, DEFAULT_SHADOW_OTEL_ENDPOINT, DEFAULT_SHADOW_RETRY_BACKOFF_MS,
+        DEFAULT_SHADOW_SASL_MECHANISM, DEFAULT_SHADOW_SECURITY_PROTOCOL, DEFAULT_SHADOW_SYNC_MODE,
+        DEFAULT_SHUTDOWN_TIMEOUT_MS, DEFAULT_TOPIC_PARTITIONS, MAX_CONFIG_RELOAD_MS,
+        MAX_FETCH_POLL_INTERVAL_MS, MAX_SHADOW_BATCH_SIZE, MAX_SHADOW_LINGER_MS,
+        MAX_SHADOW_MAX_RETRIES, MAX_SHADOW_RETRY_BACKOFF_MS, MIN_CONFIG_RELOAD_MS,
+        MIN_FETCH_POLL_INTERVAL_MS, MIN_SHADOW_BATCH_SIZE, MIN_SHADOW_LINGER_MS,
+        MIN_SHADOW_MAX_RETRIES, MIN_SHADOW_RETRY_BACKOFF_MS, MIN_SHUTDOWN_TIMEOUT_MS, TEST_HOST,
+    };
+
+    // ========== Config::load() Tests ==========
+
+    #[test]
+    fn test_config_load_returns_defaults() {
+        let config = Config::load();
+        assert_eq!(config.port, DEFAULT_KAFKA_PORT);
+        assert_eq!(config.host, TEST_HOST);
+        assert_eq!(config.database, DEFAULT_DATABASE);
+    }
+
+    #[test]
+    fn test_config_default_port_value() {
+        let config = Config::load();
+        assert_eq!(config.port, 9092);
+    }
+
+    #[test]
+    fn test_config_default_host_value() {
+        let config = Config::load();
+        assert_eq!(config.host, TEST_HOST);
+        assert_eq!(config.host, "localhost");
+    }
+
+    #[test]
+    fn test_config_default_database_value() {
+        let config = Config::load();
+        assert_eq!(config.database, "postgres");
+    }
+
+    #[test]
+    fn test_config_default_partitions_value() {
+        let config = Config::load();
+        assert_eq!(config.default_partitions, DEFAULT_TOPIC_PARTITIONS);
+        assert_eq!(config.default_partitions, 1);
+    }
+
+    #[test]
+    fn test_config_default_compression_type() {
+        let config = Config::load();
+        assert_eq!(config.compression_type, DEFAULT_COMPRESSION_TYPE);
+        assert_eq!(config.compression_type, "none");
+    }
+
+    #[test]
+    fn test_config_default_long_polling_enabled() {
+        let config = Config::load();
+        assert!(config.enable_long_polling);
+    }
+
+    #[test]
+    fn test_config_default_fetch_poll_interval() {
+        let config = Config::load();
+        assert_eq!(
+            config.fetch_poll_interval_ms,
+            DEFAULT_FETCH_POLL_INTERVAL_MS
+        );
+        assert_eq!(config.fetch_poll_interval_ms, 100);
+    }
+
+    #[test]
+    fn test_config_default_shutdown_timeout() {
+        let config = Config::load();
+        assert_eq!(config.shutdown_timeout_ms, DEFAULT_SHUTDOWN_TIMEOUT_MS);
+        assert_eq!(config.shutdown_timeout_ms, 5000);
+    }
+
+    #[test]
+    fn test_config_default_log_connections_disabled() {
+        let config = Config::load();
+        assert!(!config.log_connections);
+    }
+
+    #[test]
+    fn test_config_default_log_timing_disabled() {
+        let config = Config::load();
+        assert!(!config.log_timing);
+    }
+
+    // ========== Shadow Mode Config Tests ==========
+
+    #[test]
+    fn test_config_default_shadow_mode_disabled() {
+        let config = Config::load();
+        assert_eq!(config.shadow_mode_enabled, DEFAULT_SHADOW_MODE_ENABLED);
+        assert!(!config.shadow_mode_enabled);
+    }
+
+    #[test]
+    fn test_config_default_shadow_batch_size() {
+        let config = Config::load();
+        assert_eq!(config.shadow_batch_size, DEFAULT_SHADOW_BATCH_SIZE);
+        assert_eq!(config.shadow_batch_size, 1000);
+    }
+
+    #[test]
+    fn test_config_default_shadow_linger_ms() {
+        let config = Config::load();
+        assert_eq!(config.shadow_linger_ms, DEFAULT_SHADOW_LINGER_MS);
+        assert_eq!(config.shadow_linger_ms, 10);
+    }
+
+    #[test]
+    fn test_config_default_shadow_retry_settings() {
+        let config = Config::load();
+        assert_eq!(
+            config.shadow_retry_backoff_ms,
+            DEFAULT_SHADOW_RETRY_BACKOFF_MS
+        );
+        assert_eq!(config.shadow_max_retries, DEFAULT_SHADOW_MAX_RETRIES);
+        assert_eq!(config.shadow_retry_backoff_ms, 100);
+        assert_eq!(config.shadow_max_retries, 3);
+    }
+
+    #[test]
+    fn test_config_default_shadow_security_protocol() {
+        let config = Config::load();
+        assert_eq!(
+            config.shadow_security_protocol,
+            DEFAULT_SHADOW_SECURITY_PROTOCOL
+        );
+        assert_eq!(config.shadow_security_protocol, "SASL_SSL");
+    }
+
+    #[test]
+    fn test_config_default_shadow_sasl_mechanism() {
+        let config = Config::load();
+        assert_eq!(config.shadow_sasl_mechanism, DEFAULT_SHADOW_SASL_MECHANISM);
+        assert_eq!(config.shadow_sasl_mechanism, "PLAIN");
+    }
+
+    #[test]
+    fn test_config_default_shadow_sync_mode() {
+        let config = Config::load();
+        assert_eq!(config.shadow_default_sync_mode, DEFAULT_SHADOW_SYNC_MODE);
+        assert_eq!(config.shadow_default_sync_mode, "async");
+    }
+
+    #[test]
+    fn test_config_default_shadow_metrics_enabled() {
+        let config = Config::load();
+        assert_eq!(
+            config.shadow_metrics_enabled,
+            DEFAULT_SHADOW_METRICS_ENABLED
+        );
+        assert!(config.shadow_metrics_enabled);
+    }
+
+    #[test]
+    fn test_config_default_shadow_credentials_empty() {
+        let config = Config::load();
+        assert!(config.shadow_sasl_username.is_empty());
+        assert!(config.shadow_sasl_password.is_empty());
+        assert!(config.shadow_ssl_ca_location.is_empty());
+    }
+
+    #[test]
+    fn test_config_default_shadow_bootstrap_servers_empty() {
+        let config = Config::load();
+        assert_eq!(
+            config.shadow_bootstrap_servers,
+            DEFAULT_SHADOW_BOOTSTRAP_SERVERS
+        );
+        assert!(config.shadow_bootstrap_servers.is_empty());
+    }
+
+    #[test]
+    fn test_config_default_shadow_otel_endpoint_empty() {
+        let config = Config::load();
+        assert_eq!(config.shadow_otel_endpoint, DEFAULT_SHADOW_OTEL_ENDPOINT);
+        assert!(config.shadow_otel_endpoint.is_empty());
+    }
+
+    #[test]
+    fn test_config_test_eval_license_key() {
+        let config = Config::load();
+        // Tests run in eval mode by default
+        assert_eq!(config.shadow_license_key, "eval");
+    }
+
+    // ========== Constants Validation Tests ==========
+
+    #[test]
+    fn test_shadow_batch_size_range() {
+        assert!(MIN_SHADOW_BATCH_SIZE <= DEFAULT_SHADOW_BATCH_SIZE);
+        assert!(DEFAULT_SHADOW_BATCH_SIZE <= MAX_SHADOW_BATCH_SIZE);
+        assert_eq!(MIN_SHADOW_BATCH_SIZE, 1);
+        assert_eq!(MAX_SHADOW_BATCH_SIZE, 100000);
+    }
+
+    #[test]
+    fn test_shadow_linger_ms_range() {
+        assert!(MIN_SHADOW_LINGER_MS <= DEFAULT_SHADOW_LINGER_MS);
+        assert!(DEFAULT_SHADOW_LINGER_MS <= MAX_SHADOW_LINGER_MS);
+        assert_eq!(MIN_SHADOW_LINGER_MS, 0);
+        assert_eq!(MAX_SHADOW_LINGER_MS, 60_000);
+    }
+
+    #[test]
+    fn test_shadow_retry_backoff_range() {
+        assert!(MIN_SHADOW_RETRY_BACKOFF_MS <= DEFAULT_SHADOW_RETRY_BACKOFF_MS);
+        assert!(DEFAULT_SHADOW_RETRY_BACKOFF_MS <= MAX_SHADOW_RETRY_BACKOFF_MS);
+        assert_eq!(MIN_SHADOW_RETRY_BACKOFF_MS, 10);
+        assert_eq!(MAX_SHADOW_RETRY_BACKOFF_MS, 60000);
+    }
+
+    #[test]
+    fn test_shadow_max_retries_range() {
+        assert!(MIN_SHADOW_MAX_RETRIES <= DEFAULT_SHADOW_MAX_RETRIES);
+        assert!(DEFAULT_SHADOW_MAX_RETRIES <= MAX_SHADOW_MAX_RETRIES);
+        assert_eq!(MIN_SHADOW_MAX_RETRIES, 0);
+        assert_eq!(MAX_SHADOW_MAX_RETRIES, 100);
+    }
+
+    #[test]
+    fn test_fetch_poll_interval_range() {
+        assert!(MIN_FETCH_POLL_INTERVAL_MS <= DEFAULT_FETCH_POLL_INTERVAL_MS);
+        assert!(DEFAULT_FETCH_POLL_INTERVAL_MS <= MAX_FETCH_POLL_INTERVAL_MS);
+        assert_eq!(MIN_FETCH_POLL_INTERVAL_MS, 10);
+        assert_eq!(MAX_FETCH_POLL_INTERVAL_MS, 5000);
+    }
+
+    #[test]
+    fn test_config_reload_interval_range() {
+        assert!(MIN_CONFIG_RELOAD_MS <= DEFAULT_CONFIG_RELOAD_MS);
+        assert!(DEFAULT_CONFIG_RELOAD_MS <= MAX_CONFIG_RELOAD_MS);
+        assert_eq!(MIN_CONFIG_RELOAD_MS, 100);
+        assert_eq!(MAX_CONFIG_RELOAD_MS, 300000);
+    }
+
+    #[test]
+    fn test_shutdown_timeout_minimum() {
+        assert!(MIN_SHUTDOWN_TIMEOUT_MS > 0);
+        assert_eq!(MIN_SHUTDOWN_TIMEOUT_MS, 100);
+    }
+
+    // ========== Config Struct Tests ==========
+
+    #[test]
+    fn test_config_all_fields_accessible() {
+        let config = Config::load();
+        // Ensure all fields are accessible and have expected types
+        let _port: i32 = config.port;
+        let _host: String = config.host;
+        let _database: String = config.database;
+        let _log_connections: bool = config.log_connections;
+        let _shutdown_timeout_ms: i32 = config.shutdown_timeout_ms;
+        let _default_partitions: i32 = config.default_partitions;
+        let _fetch_poll_interval_ms: i32 = config.fetch_poll_interval_ms;
+        let _enable_long_polling: bool = config.enable_long_polling;
+        let _compression_type: String = config.compression_type;
+        let _log_timing: bool = config.log_timing;
+        let _shadow_mode_enabled: bool = config.shadow_mode_enabled;
+        let _shadow_bootstrap_servers: String = config.shadow_bootstrap_servers;
+        let _shadow_security_protocol: String = config.shadow_security_protocol;
+        let _shadow_sasl_mechanism: String = config.shadow_sasl_mechanism;
+        let _shadow_sasl_username: String = config.shadow_sasl_username;
+        let _shadow_sasl_password: String = config.shadow_sasl_password;
+        let _shadow_ssl_ca_location: String = config.shadow_ssl_ca_location;
+        let _shadow_batch_size: i32 = config.shadow_batch_size;
+        let _shadow_linger_ms: i32 = config.shadow_linger_ms;
+        let _shadow_retry_backoff_ms: i32 = config.shadow_retry_backoff_ms;
+        let _shadow_max_retries: i32 = config.shadow_max_retries;
+        let _shadow_default_sync_mode: String = config.shadow_default_sync_mode;
+        let _shadow_metrics_enabled: bool = config.shadow_metrics_enabled;
+        let _shadow_otel_endpoint: String = config.shadow_otel_endpoint;
+        let _shadow_license_key: String = config.shadow_license_key;
+    }
+
+    #[test]
+    fn test_config_multiple_loads_consistent() {
+        let config1 = Config::load();
+        let config2 = Config::load();
+        assert_eq!(config1.port, config2.port);
+        assert_eq!(config1.host, config2.host);
+        assert_eq!(config1.shadow_mode_enabled, config2.shadow_mode_enabled);
+        assert_eq!(config1.shadow_batch_size, config2.shadow_batch_size);
+    }
+}

@@ -183,4 +183,122 @@ mod tests {
         let v2 = LicenseValidator::new("sponsor:");
         assert!(matches!(v2.status(), LicenseStatus::Invalid(_)));
     }
+
+    // ========== Additional Coverage Tests ==========
+
+    #[test]
+    fn test_license_status_clone() {
+        let status = LicenseStatus::Valid;
+        let cloned = status.clone();
+        assert_eq!(cloned, LicenseStatus::Valid);
+
+        let eval = LicenseStatus::Evaluation;
+        assert_eq!(eval.clone(), LicenseStatus::Evaluation);
+
+        let unlicensed = LicenseStatus::Unlicensed;
+        assert_eq!(unlicensed.clone(), LicenseStatus::Unlicensed);
+
+        let invalid = LicenseStatus::Invalid("reason".to_string());
+        let invalid_cloned = invalid.clone();
+        assert!(matches!(invalid_cloned, LicenseStatus::Invalid(ref s) if s == "reason"));
+    }
+
+    #[test]
+    fn test_license_status_debug_format() {
+        let valid = LicenseStatus::Valid;
+        assert!(format!("{:?}", valid).contains("Valid"));
+
+        let eval = LicenseStatus::Evaluation;
+        assert!(format!("{:?}", eval).contains("Evaluation"));
+
+        let unlicensed = LicenseStatus::Unlicensed;
+        assert!(format!("{:?}", unlicensed).contains("Unlicensed"));
+
+        let invalid = LicenseStatus::Invalid("test reason".to_string());
+        assert!(format!("{:?}", invalid).contains("Invalid"));
+        assert!(format!("{:?}", invalid).contains("test reason"));
+    }
+
+    #[test]
+    fn test_license_status_equality() {
+        assert_eq!(LicenseStatus::Valid, LicenseStatus::Valid);
+        assert_eq!(LicenseStatus::Evaluation, LicenseStatus::Evaluation);
+        assert_eq!(LicenseStatus::Unlicensed, LicenseStatus::Unlicensed);
+        assert_eq!(
+            LicenseStatus::Invalid("a".to_string()),
+            LicenseStatus::Invalid("a".to_string())
+        );
+        assert_ne!(
+            LicenseStatus::Invalid("a".to_string()),
+            LicenseStatus::Invalid("b".to_string())
+        );
+        assert_ne!(LicenseStatus::Valid, LicenseStatus::Evaluation);
+    }
+
+    #[test]
+    fn test_validator_warning_interval_constant() {
+        // Verify the warning interval is 1 hour
+        assert_eq!(LicenseValidator::WARNING_INTERVAL_SECS, 3600);
+    }
+
+    #[test]
+    fn test_validator_last_warning_starts_at_zero() {
+        let v = LicenseValidator::new("eval");
+        // The last_warning_epoch should start at 0 (never warned)
+        assert_eq!(
+            v.last_warning_epoch
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[test]
+    fn test_valid_license_various_formats() {
+        // Any format with non-empty sponsor_id and signature should be valid
+        let v1 = LicenseValidator::new("a:b");
+        assert_eq!(v1.status(), &LicenseStatus::Valid);
+
+        let v2 = LicenseValidator::new("sponsor-123:sig-abc-def-456");
+        assert_eq!(v2.status(), &LicenseStatus::Valid);
+
+        let v3 = LicenseValidator::new("user@company.com:signature123");
+        assert_eq!(v3.status(), &LicenseStatus::Valid);
+    }
+
+    #[test]
+    fn test_invalid_license_reason_message() {
+        let v = LicenseValidator::new("invalid");
+        if let LicenseStatus::Invalid(reason) = v.status() {
+            assert!(reason.contains("sponsor_id:signature"));
+        } else {
+            panic!("Expected Invalid status");
+        }
+    }
+
+    #[test]
+    fn test_is_licensed_returns_true_for_valid() {
+        let v = LicenseValidator::new("sponsor:sig");
+        assert!(v.is_licensed());
+    }
+
+    #[test]
+    fn test_is_licensed_returns_true_for_evaluation() {
+        let v = LicenseValidator::new("eval");
+        assert!(v.is_licensed());
+
+        let v2 = LicenseValidator::new("evaluation");
+        assert!(v2.is_licensed());
+    }
+
+    #[test]
+    fn test_is_licensed_returns_false_for_unlicensed() {
+        let v = LicenseValidator::new("");
+        assert!(!v.is_licensed());
+    }
+
+    #[test]
+    fn test_is_licensed_returns_false_for_invalid() {
+        let v = LicenseValidator::new("bad-format");
+        assert!(!v.is_licensed());
+    }
 }

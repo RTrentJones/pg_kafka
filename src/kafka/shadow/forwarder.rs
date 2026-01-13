@@ -305,4 +305,195 @@ mod tests {
         assert_eq!(result.failed, 0);
         assert!(result.first_error.is_none());
     }
+
+    // ========== ForwardMessage Tests ==========
+
+    #[test]
+    fn test_forward_message_construction() {
+        let msg = ForwardMessage {
+            topic: "test-topic".to_string(),
+            partition: 0,
+            key: Some(b"key".to_vec()),
+            value: Some(b"value".to_vec()),
+            global_offset: 100,
+            partition_offset: 50,
+        };
+        assert_eq!(msg.topic, "test-topic");
+        assert_eq!(msg.partition, 0);
+        assert_eq!(msg.key, Some(b"key".to_vec()));
+        assert_eq!(msg.value, Some(b"value".to_vec()));
+        assert_eq!(msg.global_offset, 100);
+        assert_eq!(msg.partition_offset, 50);
+    }
+
+    #[test]
+    fn test_forward_message_with_null_key() {
+        let msg = ForwardMessage {
+            topic: "null-key-topic".to_string(),
+            partition: 1,
+            key: None,
+            value: Some(b"value-only".to_vec()),
+            global_offset: 200,
+            partition_offset: 100,
+        };
+        assert!(msg.key.is_none());
+        assert!(msg.value.is_some());
+    }
+
+    #[test]
+    fn test_forward_message_with_null_value() {
+        let msg = ForwardMessage {
+            topic: "null-value-topic".to_string(),
+            partition: 2,
+            key: Some(b"key-only".to_vec()),
+            value: None,
+            global_offset: 300,
+            partition_offset: 150,
+        };
+        assert!(msg.key.is_some());
+        assert!(msg.value.is_none());
+    }
+
+    #[test]
+    fn test_forward_message_clone() {
+        let msg = ForwardMessage {
+            topic: "clone-topic".to_string(),
+            partition: 5,
+            key: Some(b"clone-key".to_vec()),
+            value: Some(b"clone-value".to_vec()),
+            global_offset: 999,
+            partition_offset: 500,
+        };
+        let cloned = msg.clone();
+        assert_eq!(cloned.topic, msg.topic);
+        assert_eq!(cloned.partition, msg.partition);
+        assert_eq!(cloned.key, msg.key);
+        assert_eq!(cloned.value, msg.value);
+        assert_eq!(cloned.global_offset, msg.global_offset);
+        assert_eq!(cloned.partition_offset, msg.partition_offset);
+    }
+
+    #[test]
+    fn test_forward_message_debug_format() {
+        let msg = ForwardMessage {
+            topic: "debug-topic".to_string(),
+            partition: 3,
+            key: None,
+            value: None,
+            global_offset: 0,
+            partition_offset: 0,
+        };
+        let debug = format!("{:?}", msg);
+        assert!(debug.contains("ForwardMessage"));
+        assert!(debug.contains("debug-topic"));
+    }
+
+    // ========== ForwardDecision Tests ==========
+
+    #[test]
+    fn test_forward_decision_forward_variant() {
+        let decision = ForwardDecision::Forward;
+        assert!(matches!(decision, ForwardDecision::Forward));
+        assert_eq!(decision, ForwardDecision::Forward);
+    }
+
+    #[test]
+    fn test_forward_decision_skip_variant() {
+        let decision = ForwardDecision::Skip;
+        assert!(matches!(decision, ForwardDecision::Skip));
+        assert_eq!(decision, ForwardDecision::Skip);
+    }
+
+    #[test]
+    fn test_forward_decision_equality() {
+        assert_eq!(ForwardDecision::Forward, ForwardDecision::Forward);
+        assert_eq!(ForwardDecision::Skip, ForwardDecision::Skip);
+        assert_ne!(ForwardDecision::Forward, ForwardDecision::Skip);
+    }
+
+    #[test]
+    fn test_forward_decision_debug_format() {
+        let forward = ForwardDecision::Forward;
+        let skip = ForwardDecision::Skip;
+        assert!(format!("{:?}", forward).contains("Forward"));
+        assert!(format!("{:?}", skip).contains("Skip"));
+    }
+
+    // ========== ForwardResult Tests ==========
+
+    #[test]
+    fn test_forward_result_with_values() {
+        let result = ForwardResult {
+            forwarded: 10,
+            skipped: 5,
+            failed: 2,
+            first_error: None,
+        };
+        assert_eq!(result.forwarded, 10);
+        assert_eq!(result.skipped, 5);
+        assert_eq!(result.failed, 2);
+    }
+
+    #[test]
+    fn test_forward_result_with_error() {
+        let result = ForwardResult {
+            forwarded: 8,
+            skipped: 0,
+            failed: 2,
+            first_error: Some(ShadowError::NotEnabled),
+        };
+        assert!(result.first_error.is_some());
+        assert_eq!(result.failed, 2);
+    }
+
+    #[test]
+    fn test_forward_result_debug_format() {
+        let result = ForwardResult::default();
+        let debug = format!("{:?}", result);
+        assert!(debug.contains("ForwardResult"));
+        assert!(debug.contains("forwarded"));
+        assert!(debug.contains("skipped"));
+    }
+
+    // ========== TopicConfigCache Extension Tests ==========
+
+    #[test]
+    fn test_topic_cache_get_topic_id() {
+        let cache = TopicConfigCache::new();
+        let config = TopicShadowConfig {
+            topic_id: 42,
+            topic_name: "id-test-topic".to_string(),
+            mode: ShadowMode::Shadow,
+            forward_percentage: 100,
+            external_topic_name: None,
+            sync_mode: SyncMode::Async,
+            write_mode: WriteMode::DualWrite,
+        };
+        cache.update(config);
+
+        let id = cache.get_topic_id("id-test-topic");
+        assert_eq!(id, Some(42));
+
+        let missing = cache.get_topic_id("nonexistent");
+        assert_eq!(missing, None);
+    }
+
+    #[test]
+    fn test_forward_decision_shadow_mode_with_sync() {
+        let cache = TopicConfigCache::new();
+        let config = TopicShadowConfig {
+            topic_id: 1,
+            topic_name: "shadow-sync".to_string(),
+            mode: ShadowMode::Shadow,
+            forward_percentage: 100,
+            external_topic_name: Some("external-topic".to_string()),
+            sync_mode: SyncMode::Sync,
+            write_mode: WriteMode::ExternalOnly,
+        };
+        cache.update(config);
+
+        let retrieved = cache.get(1).unwrap();
+        assert!(retrieved.should_forward(), "Shadow mode should forward");
+        assert_eq!(retrieved.sync_mode, SyncMode::Sync);
+    }
 }
