@@ -40,22 +40,20 @@ use super::shadow::{ForwardRequest, ShadowConfig, ShadowProducer};
 ///
 /// Receives ForwardRequest messages from the DB thread via crossbeam channel
 /// and forwards them to external Kafka asynchronously (fire-and-forget).
-async fn run_shadow_forwarder(forward_rx: Receiver<ForwardRequest>, config: Arc<ShadowConfig>) {
-    info!("Shadow forwarder task started");
+///
+/// This task uses RuntimeContext to check configuration dynamically, allowing
+/// shadow mode to be enabled/disabled at runtime via ALTER SYSTEM + pg_reload_conf().
+/// The producer is lazily created when shadow mode is first enabled and recreated
+/// if the bootstrap servers change.
+async fn run_shadow_forwarder(
+    forward_rx: Receiver<ForwardRequest>,
+    runtime_context: Arc<crate::kafka::RuntimeContext>,
+) {
+    info!("Shadow forwarder task started (dynamic config mode)");
 
-    // Create the producer lazily on first message
-    let producer = match ShadowProducer::new(config) {
-        Ok(p) => Arc::new(p),
-        Err(e) => {
-            warn!(
-                "Failed to create shadow producer for async forwarding: {:?}",
-                e
-            );
-            return;
-        }
-    };
-
-    info!("Shadow producer created for async forwarding");
+    // Track current producer and config for change detection
+    let mut producer: Option<Arc<ShadowProducer>> = None;
+    let mut current_bootstrap_servers: String = String::new();
 
     loop {
         // Use spawn_blocking to receive from crossbeam channel in async context
@@ -65,12 +63,63 @@ async fn run_shadow_forwarder(forward_rx: Receiver<ForwardRequest>, config: Arc<
 
         match result {
             Ok(Ok(req)) => {
+                // Check current config from RuntimeContext (dynamic reload support)
+                let config = runtime_context.config();
+
+                // Skip if shadow mode is not enabled or not configured
+                if !config.shadow_mode_enabled || config.shadow_bootstrap_servers.is_empty() {
+                    debug!(
+                        "Shadow mode disabled or not configured, dropping forward request for {}[{}]",
+                        req.topic_name, req.partition_id
+                    );
+                    continue;
+                }
+
+                // Check if config changed - recreate producer if bootstrap servers changed
+                if config.shadow_bootstrap_servers != current_bootstrap_servers {
+                    info!(
+                        "Shadow config changed: bootstrap_servers '{}' -> '{}'",
+                        current_bootstrap_servers, config.shadow_bootstrap_servers
+                    );
+
+                    let shadow_config = Arc::new(ShadowConfig::from_config(&config));
+                    match ShadowProducer::new(shadow_config) {
+                        Ok(p) => {
+                            current_bootstrap_servers = config.shadow_bootstrap_servers.clone();
+                            producer = Some(Arc::new(p));
+                            info!(
+                                "Shadow producer created/recreated for bootstrap_servers='{}'",
+                                current_bootstrap_servers
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to create shadow producer for '{}': {:?}",
+                                config.shadow_bootstrap_servers, e
+                            );
+                            // Clear producer so we retry on next config check
+                            producer = None;
+                            current_bootstrap_servers.clear();
+                            continue;
+                        }
+                    }
+                }
+
+                // Get producer (should exist if we passed the config check)
+                let p = match &producer {
+                    Some(p) => p.clone(),
+                    None => {
+                        warn!("No producer available, dropping forward request");
+                        continue;
+                    }
+                };
+
                 // Fire-and-forget: log failure but continue
                 let topic = req.topic_name.clone();
                 let partition = req.partition_id;
                 let offset = req.local_offset;
 
-                if let Err(e) = producer
+                if let Err(e) = p
                     .send_async(
                         &req.topic_name,
                         Some(req.partition_id),
@@ -139,13 +188,8 @@ pub async fn run(
     let log_connections = config.log_connections;
     let fetch_poll_interval_ms = config.fetch_poll_interval_ms;
 
-    // Create shadow config if enabled
-    let shadow_config: Option<Arc<ShadowConfig>> =
-        if config.shadow_mode_enabled && !config.shadow_bootstrap_servers.is_empty() {
-            Some(Arc::new(ShadowConfig::from_config(&config)))
-        } else {
-            None
-        };
+    // Note: Shadow config is now checked dynamically in run_shadow_forwarder
+    // to support runtime enable/disable via ALTER SYSTEM + pg_reload_conf()
 
     info!(
         "pg_kafka TCP listener started (long_polling={}, log_connections={})",
@@ -199,16 +243,12 @@ pub async fn run(
     });
 
     // Spawn the shadow forwarder task (async forwarding from DB thread)
-    // This task receives ForwardRequest messages and sends them to external Kafka
-    let _forward_handle = if let Some(config) = shadow_config {
-        let forwarder_rx = forward_rx;
-        Some(tokio::spawn(async move {
-            run_shadow_forwarder(forwarder_rx, config).await;
-        }))
-    } else {
-        debug!("Shadow config not provided, async forwarding disabled");
-        None
-    };
+    // This task receives ForwardRequest messages and sends them to external Kafka.
+    // Always spawned - config is checked dynamically to support runtime enable/disable.
+    let runtime_context_for_forwarder = runtime_context.clone();
+    let _forward_handle = tokio::spawn(async move {
+        run_shadow_forwarder(forward_rx, runtime_context_for_forwarder).await;
+    });
 
     // Accept loop: wait for new connections OR shutdown signal
     loop {
