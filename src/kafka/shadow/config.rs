@@ -136,6 +136,12 @@ impl TopicShadowConfig {
     }
 }
 
+/// Valid security protocols for Kafka connections
+pub const VALID_SECURITY_PROTOCOLS: &[&str] = &["PLAINTEXT", "SASL_PLAINTEXT", "SSL", "SASL_SSL"];
+
+/// Valid SASL mechanisms
+pub const VALID_SASL_MECHANISMS: &[&str] = &["PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512"];
+
 /// Global shadow mode configuration from GUCs
 #[derive(Debug, Clone)]
 pub struct ShadowConfig {
@@ -194,6 +200,149 @@ impl ShadowConfig {
     pub fn is_configured(&self) -> bool {
         self.enabled && !self.bootstrap_servers.is_empty()
     }
+
+    /// Validate the shadow configuration
+    ///
+    /// Returns Ok(()) if the configuration is valid, or a ConfigError with details.
+    /// Also emits warnings for potentially insecure configurations.
+    ///
+    /// # Validation Rules
+    ///
+    /// - `security_protocol` must be one of: PLAINTEXT, SASL_PLAINTEXT, SSL, SASL_SSL
+    /// - `sasl_mechanism` must be one of: PLAIN, SCRAM-SHA-256, SCRAM-SHA-512
+    /// - `bootstrap_servers` must be in valid host:port format when enabled
+    /// - `batch_size` is clamped to 1-100,000
+    ///
+    /// # Warnings
+    ///
+    /// - SASL_PLAINTEXT sends credentials over unencrypted connection
+    /// - PLAINTEXT has no security (use only for local development)
+    pub fn validate(&mut self) -> super::error::ShadowResult<()> {
+        use super::error::ShadowError;
+
+        // Validate security_protocol
+        let protocol_upper = self.security_protocol.to_uppercase();
+        if !VALID_SECURITY_PROTOCOLS.contains(&protocol_upper.as_str()) {
+            return Err(ShadowError::ConfigError(format!(
+                "Invalid security_protocol '{}'. Must be one of: {}",
+                self.security_protocol,
+                VALID_SECURITY_PROTOCOLS.join(", ")
+            )));
+        }
+        // Normalize to uppercase
+        self.security_protocol = protocol_upper.clone();
+
+        // Emit security warnings
+        if protocol_upper == "SASL_PLAINTEXT" {
+            tracing::warn!(
+                "Shadow mode using SASL_PLAINTEXT: credentials will be sent over unencrypted connection. \
+                 Consider using SASL_SSL for production deployments."
+            );
+        } else if protocol_upper == "PLAINTEXT" {
+            tracing::warn!(
+                "Shadow mode using PLAINTEXT: no authentication or encryption. \
+                 Only use for local development or trusted networks."
+            );
+        }
+
+        // Validate sasl_mechanism (only if using SASL)
+        if protocol_upper.starts_with("SASL") {
+            let mechanism_upper = self.sasl_mechanism.to_uppercase();
+            if !VALID_SASL_MECHANISMS.contains(&mechanism_upper.as_str()) {
+                return Err(ShadowError::ConfigError(format!(
+                    "Invalid sasl_mechanism '{}'. Must be one of: {}",
+                    self.sasl_mechanism,
+                    VALID_SASL_MECHANISMS.join(", ")
+                )));
+            }
+            // Normalize to uppercase
+            self.sasl_mechanism = mechanism_upper;
+        }
+
+        // Validate bootstrap_servers format when enabled
+        if self.enabled && !self.bootstrap_servers.is_empty() {
+            for server in self.bootstrap_servers.split(',') {
+                let server = server.trim();
+                if server.is_empty() {
+                    continue;
+                }
+                // Basic validation: must have host:port format
+                if !Self::is_valid_bootstrap_server(server) {
+                    return Err(ShadowError::ConfigError(format!(
+                        "Invalid bootstrap_servers format '{}'. Expected host:port",
+                        server
+                    )));
+                }
+            }
+        }
+
+        // Clamp batch_size to valid range (1-100,000)
+        if self.batch_size < 1 {
+            tracing::warn!(
+                "Shadow mode batch_size {} is below minimum, clamping to 1",
+                self.batch_size
+            );
+            self.batch_size = 1;
+        } else if self.batch_size > 100_000 {
+            tracing::warn!(
+                "Shadow mode batch_size {} exceeds maximum, clamping to 100,000",
+                self.batch_size
+            );
+            self.batch_size = 100_000;
+        }
+
+        // Clamp linger_ms to valid range (0-5000)
+        if self.linger_ms < 0 {
+            self.linger_ms = 0;
+        } else if self.linger_ms > 5000 {
+            tracing::warn!(
+                "Shadow mode linger_ms {} exceeds maximum, clamping to 5000",
+                self.linger_ms
+            );
+            self.linger_ms = 5000;
+        }
+
+        // Clamp max_retries to valid range (0-100)
+        if self.max_retries < 0 {
+            self.max_retries = 0;
+        } else if self.max_retries > 100 {
+            tracing::warn!(
+                "Shadow mode max_retries {} exceeds maximum, clamping to 100",
+                self.max_retries
+            );
+            self.max_retries = 100;
+        }
+
+        Ok(())
+    }
+
+    /// Check if a bootstrap server string is in valid host:port format
+    fn is_valid_bootstrap_server(server: &str) -> bool {
+        // Split by last colon (to handle IPv6 addresses like [::1]:9092)
+        if let Some(colon_pos) = server.rfind(':') {
+            let host = &server[..colon_pos];
+            let port_str = &server[colon_pos + 1..];
+
+            // Port must be a valid number
+            if let Ok(port) = port_str.parse::<u16>() {
+                // Port must be in valid range (1-65535)
+                if port == 0 {
+                    return false;
+                }
+                // Host must not be empty
+                if host.is_empty() {
+                    return false;
+                }
+                // Handle IPv6 addresses in brackets
+                if host.starts_with('[') && host.ends_with(']') {
+                    return host.len() > 2; // Must have content between brackets
+                }
+                // Simple hostname/IPv4 validation
+                return !host.contains(' '); // No spaces allowed
+            }
+        }
+        false
+    }
 }
 
 impl Default for ShadowConfig {
@@ -234,7 +383,10 @@ impl TopicConfigCache {
     pub fn get(&self, topic_id: i32) -> Option<TopicShadowConfig> {
         self.configs
             .read()
-            .expect("TopicConfigCache lock poisoned")
+            .unwrap_or_else(|poisoned| {
+                tracing::warn!("TopicConfigCache read lock was poisoned, recovering");
+                poisoned.into_inner()
+            })
             .get(&topic_id)
             .cloned()
     }
@@ -243,7 +395,10 @@ impl TopicConfigCache {
     pub fn update(&self, config: TopicShadowConfig) {
         self.configs
             .write()
-            .expect("TopicConfigCache lock poisoned")
+            .unwrap_or_else(|poisoned| {
+                tracing::warn!("TopicConfigCache write lock was poisoned, recovering");
+                poisoned.into_inner()
+            })
             .insert(config.topic_id, config);
     }
 
@@ -251,7 +406,10 @@ impl TopicConfigCache {
     pub fn remove(&self, topic_id: i32) {
         self.configs
             .write()
-            .expect("TopicConfigCache lock poisoned")
+            .unwrap_or_else(|poisoned| {
+                tracing::warn!("TopicConfigCache write lock was poisoned, recovering");
+                poisoned.into_inner()
+            })
             .remove(&topic_id);
     }
 
@@ -259,7 +417,10 @@ impl TopicConfigCache {
     pub fn clear(&self) {
         self.configs
             .write()
-            .expect("TopicConfigCache lock poisoned")
+            .unwrap_or_else(|poisoned| {
+                tracing::warn!("TopicConfigCache write lock was poisoned, recovering");
+                poisoned.into_inner()
+            })
             .clear();
     }
 
@@ -267,7 +428,10 @@ impl TopicConfigCache {
     pub fn all(&self) -> Vec<TopicShadowConfig> {
         self.configs
             .read()
-            .expect("TopicConfigCache lock poisoned")
+            .unwrap_or_else(|poisoned| {
+                tracing::warn!("TopicConfigCache read lock was poisoned, recovering");
+                poisoned.into_inner()
+            })
             .values()
             .cloned()
             .collect()
@@ -394,5 +558,209 @@ mod tests {
         assert_eq!(WriteMode::parse("external_only"), WriteMode::ExternalOnly);
         assert_eq!(WriteMode::parse("EXTERNAL_ONLY"), WriteMode::ExternalOnly);
         assert_eq!(WriteMode::parse("invalid"), WriteMode::DualWrite);
+    }
+
+    #[test]
+    fn test_valid_security_protocols() {
+        let mut config = ShadowConfig {
+            enabled: true,
+            bootstrap_servers: "localhost:9092".to_string(),
+            security_protocol: "PLAINTEXT".to_string(),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+        assert_eq!(config.security_protocol, "PLAINTEXT");
+
+        config.security_protocol = "sasl_ssl".to_string(); // lowercase
+        assert!(config.validate().is_ok());
+        assert_eq!(config.security_protocol, "SASL_SSL"); // normalized
+
+        config.security_protocol = "ssl".to_string();
+        assert!(config.validate().is_ok());
+        assert_eq!(config.security_protocol, "SSL");
+
+        config.security_protocol = "Sasl_Plaintext".to_string();
+        assert!(config.validate().is_ok());
+        assert_eq!(config.security_protocol, "SASL_PLAINTEXT");
+    }
+
+    #[test]
+    fn test_invalid_security_protocol_rejected() {
+        let mut config = ShadowConfig {
+            enabled: true,
+            bootstrap_servers: "localhost:9092".to_string(),
+            security_protocol: "INVALID".to_string(),
+            ..Default::default()
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("Invalid security_protocol"));
+        assert!(err.to_string().contains("INVALID"));
+    }
+
+    #[test]
+    fn test_valid_sasl_mechanisms() {
+        let mut config = ShadowConfig {
+            enabled: true,
+            bootstrap_servers: "localhost:9092".to_string(),
+            security_protocol: "SASL_SSL".to_string(),
+            sasl_mechanism: "PLAIN".to_string(),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+
+        config.sasl_mechanism = "scram-sha-256".to_string(); // lowercase
+        assert!(config.validate().is_ok());
+        assert_eq!(config.sasl_mechanism, "SCRAM-SHA-256"); // normalized
+
+        config.sasl_mechanism = "SCRAM-SHA-512".to_string();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_invalid_sasl_mechanism_rejected() {
+        let mut config = ShadowConfig {
+            enabled: true,
+            bootstrap_servers: "localhost:9092".to_string(),
+            security_protocol: "SASL_SSL".to_string(),
+            sasl_mechanism: "INVALID".to_string(),
+            ..Default::default()
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("Invalid sasl_mechanism"));
+    }
+
+    #[test]
+    fn test_sasl_mechanism_not_validated_for_non_sasl_protocol() {
+        // When not using SASL, the sasl_mechanism doesn't matter
+        let mut config = ShadowConfig {
+            enabled: true,
+            bootstrap_servers: "localhost:9092".to_string(),
+            security_protocol: "PLAINTEXT".to_string(),
+            sasl_mechanism: "INVALID".to_string(), // Should be ignored
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_bootstrap_servers_validation() {
+        let mut config = ShadowConfig {
+            enabled: true,
+            bootstrap_servers: "localhost:9092".to_string(),
+            security_protocol: "PLAINTEXT".to_string(),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+
+        // Multiple servers
+        config.bootstrap_servers = "kafka1:9092, kafka2:9092, kafka3:9092".to_string();
+        assert!(config.validate().is_ok());
+
+        // IPv4 address
+        config.bootstrap_servers = "192.168.1.100:9092".to_string();
+        assert!(config.validate().is_ok());
+
+        // IPv6 address in brackets
+        config.bootstrap_servers = "[::1]:9092".to_string();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_invalid_bootstrap_servers_rejected() {
+        let mut config = ShadowConfig {
+            enabled: true,
+            bootstrap_servers: "localhost".to_string(), // Missing port
+            security_protocol: "PLAINTEXT".to_string(),
+            ..Default::default()
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid bootstrap_servers"));
+
+        // Invalid port
+        config.bootstrap_servers = "localhost:abc".to_string();
+        assert!(config.validate().is_err());
+
+        // Port 0 is invalid
+        config.bootstrap_servers = "localhost:0".to_string();
+        assert!(config.validate().is_err());
+
+        // Empty host
+        config.bootstrap_servers = ":9092".to_string();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_batch_size_clamping() {
+        let mut config = ShadowConfig {
+            enabled: true,
+            bootstrap_servers: "localhost:9092".to_string(),
+            security_protocol: "PLAINTEXT".to_string(),
+            batch_size: 0,
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+        assert_eq!(config.batch_size, 1); // Clamped to minimum
+
+        config.batch_size = 200_000;
+        assert!(config.validate().is_ok());
+        assert_eq!(config.batch_size, 100_000); // Clamped to maximum
+
+        config.batch_size = 500;
+        assert!(config.validate().is_ok());
+        assert_eq!(config.batch_size, 500); // Unchanged
+    }
+
+    #[test]
+    fn test_linger_ms_clamping() {
+        let mut config = ShadowConfig {
+            enabled: true,
+            bootstrap_servers: "localhost:9092".to_string(),
+            security_protocol: "PLAINTEXT".to_string(),
+            linger_ms: -10,
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+        assert_eq!(config.linger_ms, 0); // Clamped to minimum
+
+        config.linger_ms = 10000;
+        assert!(config.validate().is_ok());
+        assert_eq!(config.linger_ms, 5000); // Clamped to maximum
+    }
+
+    #[test]
+    fn test_max_retries_clamping() {
+        let mut config = ShadowConfig {
+            enabled: true,
+            bootstrap_servers: "localhost:9092".to_string(),
+            security_protocol: "PLAINTEXT".to_string(),
+            max_retries: -5,
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+        assert_eq!(config.max_retries, 0); // Clamped to minimum
+
+        config.max_retries = 500;
+        assert!(config.validate().is_ok());
+        assert_eq!(config.max_retries, 100); // Clamped to maximum
+    }
+
+    #[test]
+    fn test_disabled_config_skips_bootstrap_validation() {
+        // When shadow mode is disabled, bootstrap_servers format is not validated
+        let mut config = ShadowConfig {
+            enabled: false,
+            bootstrap_servers: "invalid format".to_string(),
+            security_protocol: "PLAINTEXT".to_string(),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
     }
 }

@@ -198,20 +198,30 @@ impl<S: KafkaStore> ShadowStore<S> {
     /// When sync_mode is Async, messages are sent via this channel to the
     /// network thread for non-blocking forwarding.
     pub fn set_forward_channel(&self, tx: crossbeam_channel::Sender<ForwardRequest>) {
-        let mut guard = self.forward_tx.write().expect("forward_tx lock poisoned");
+        let mut guard = self.forward_tx.write().unwrap_or_else(|poisoned| {
+            tracing::warn!("forward_tx write lock was poisoned, recovering");
+            poisoned.into_inner()
+        });
         *guard = Some(tx);
     }
 
     /// Set license key and initialize validator (Commercial License)
     pub fn set_license_key(&self, license_key: &str) {
         let validator = LicenseValidator::new(license_key);
-        let mut guard = self.license.write().expect("license lock poisoned");
+        let mut guard = self.license.write().unwrap_or_else(|poisoned| {
+            tracing::warn!("license write lock was poisoned, recovering");
+            poisoned.into_inner()
+        });
         *guard = Some(validator);
     }
 
     /// Check license and emit rate-limited warnings if shadow mode is active
     fn check_license(&self) {
-        if let Some(ref validator) = *self.license.read().expect("license lock poisoned") {
+        let guard = self.license.read().unwrap_or_else(|poisoned| {
+            tracing::warn!("license read lock was poisoned, recovering");
+            poisoned.into_inner()
+        });
+        if let Some(ref validator) = *guard {
             validator.check_and_warn();
         }
     }
@@ -233,10 +243,10 @@ impl<S: KafkaStore> ShadowStore<S> {
 
     /// Check if we're running on the primary (not a standby)
     fn is_primary(&self) -> bool {
-        let mut status = self
-            .primary_status
-            .lock()
-            .expect("primary_status lock poisoned");
+        let mut status = self.primary_status.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("primary_status lock was poisoned, recovering");
+            poisoned.into_inner()
+        });
         status.check()
     }
 
@@ -276,11 +286,17 @@ impl<S: KafkaStore> ShadowStore<S> {
 
         // Fast path: check if already initialized with same config
         {
-            let guard = self.producer.read().expect("producer lock poisoned");
+            let guard = self.producer.read().unwrap_or_else(|poisoned| {
+                tracing::warn!("producer read lock was poisoned, recovering");
+                poisoned.into_inner()
+            });
             let bs_guard = self
                 .producer_bootstrap_servers
                 .read()
-                .expect("producer_bootstrap_servers lock poisoned");
+                .unwrap_or_else(|poisoned| {
+                    tracing::warn!("producer_bootstrap_servers read lock was poisoned, recovering");
+                    poisoned.into_inner()
+                });
 
             if let Some(ref producer) = *guard {
                 // Check if config has changed
@@ -305,11 +321,17 @@ impl<S: KafkaStore> ShadowStore<S> {
         }
 
         // Slow path: need to initialize or reinitialize
-        let mut guard = self.producer.write().expect("producer lock poisoned");
+        let mut guard = self.producer.write().unwrap_or_else(|poisoned| {
+            tracing::warn!("producer write lock was poisoned, recovering");
+            poisoned.into_inner()
+        });
         let mut bs_guard = self
             .producer_bootstrap_servers
             .write()
-            .expect("producer_bootstrap_servers lock poisoned");
+            .unwrap_or_else(|poisoned| {
+                tracing::warn!("producer_bootstrap_servers write lock was poisoned, recovering");
+                poisoned.into_inner()
+            });
 
         // Double-check after acquiring write lock
         if let Some(ref producer) = *guard {
@@ -405,7 +427,10 @@ impl<S: KafkaStore> ShadowStore<S> {
         match topic_config.sync_mode {
             SyncMode::Async => {
                 // Async mode: send via channel to network thread (non-blocking)
-                let forward_tx = self.forward_tx.read().expect("forward_tx lock poisoned");
+                let forward_tx = self.forward_tx.read().unwrap_or_else(|poisoned| {
+                    tracing::warn!("forward_tx read lock was poisoned, recovering");
+                    poisoned.into_inner()
+                });
                 let tx = match forward_tx.as_ref() {
                     Some(tx) => tx,
                     None => {
@@ -1142,10 +1167,15 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
                         .collect();
 
                     let key = (producer_id, producer_epoch);
-                    let mut pending = self
-                        .pending_txn_messages
-                        .write()
-                        .expect("pending_txn_messages lock poisoned");
+                    let mut pending =
+                        self.pending_txn_messages
+                            .write()
+                            .unwrap_or_else(|poisoned| {
+                                tracing::warn!(
+                                    "pending_txn_messages write lock was poisoned, recovering"
+                                );
+                                poisoned.into_inner()
+                            });
                     pending.entry(key).or_default().extend(pending_records);
 
                     tracing::trace!(
@@ -1180,10 +1210,15 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
                         .collect();
 
                     let key = (producer_id, producer_epoch);
-                    let mut pending = self
-                        .pending_txn_messages
-                        .write()
-                        .expect("pending_txn_messages lock poisoned");
+                    let mut pending =
+                        self.pending_txn_messages
+                            .write()
+                            .unwrap_or_else(|poisoned| {
+                                tracing::warn!(
+                                    "pending_txn_messages write lock was poisoned, recovering"
+                                );
+                                poisoned.into_inner()
+                            });
                     pending.entry(key).or_default().extend(pending_records);
 
                     tracing::trace!(
@@ -1242,7 +1277,10 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
             let mut pending = self
                 .pending_txn_messages
                 .write()
-                .expect("pending_txn_messages lock poisoned");
+                .unwrap_or_else(|poisoned| {
+                    tracing::warn!("pending_txn_messages write lock was poisoned, recovering");
+                    poisoned.into_inner()
+                });
             pending.remove(&key)
         };
 
@@ -1307,7 +1345,10 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
             let mut pending = self
                 .pending_txn_messages
                 .write()
-                .expect("pending_txn_messages lock poisoned");
+                .unwrap_or_else(|poisoned| {
+                    tracing::warn!("pending_txn_messages write lock was poisoned, recovering");
+                    poisoned.into_inner()
+                });
             pending.remove(&key)
         };
 
@@ -1378,6 +1419,7 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kafka::messages::RecordHeader;
     use crate::kafka::shadow::config::{ShadowMode, WriteMode};
 
     #[test]
@@ -1419,5 +1461,422 @@ mod tests {
         // Here we just verify cache integration works
         let retrieved = cache.get(1).unwrap();
         assert!(retrieved.should_forward());
+    }
+
+    #[test]
+    fn test_pending_forward_record_creation() {
+        let header = RecordHeader {
+            key: "header-key".to_string(),
+            value: b"header-value".to_vec(),
+        };
+
+        let record = PendingForwardRecord {
+            topic_id: 1,
+            topic_name: "test-topic".to_string(),
+            partition_id: 0,
+            offset: 100,
+            key: Some(b"key".to_vec()),
+            value: Some(b"value".to_vec()),
+            headers: vec![header],
+            timestamp: Some(1234567890),
+            write_mode: WriteMode::DualWrite,
+            written_locally: true,
+        };
+
+        assert_eq!(record.topic_id, 1);
+        assert_eq!(record.topic_name, "test-topic");
+        assert_eq!(record.partition_id, 0);
+        assert_eq!(record.offset, 100);
+        assert_eq!(record.key, Some(b"key".to_vec()));
+        assert_eq!(record.value, Some(b"value".to_vec()));
+        assert_eq!(record.headers.len(), 1);
+        assert_eq!(record.headers[0].key, "header-key");
+        assert_eq!(record.headers[0].value, b"header-value".to_vec());
+        assert_eq!(record.timestamp, Some(1234567890));
+        assert!(matches!(record.write_mode, WriteMode::DualWrite));
+        assert!(record.written_locally);
+    }
+
+    #[test]
+    fn test_pending_forward_record_with_null_fields() {
+        let record = PendingForwardRecord {
+            topic_id: 1,
+            topic_name: "test".to_string(),
+            partition_id: 0,
+            offset: -1, // Not written locally (ExternalOnly)
+            key: None,
+            value: None,
+            headers: vec![],
+            timestamp: None,
+            write_mode: WriteMode::ExternalOnly,
+            written_locally: false,
+        };
+
+        assert!(record.key.is_none());
+        assert!(record.value.is_none());
+        assert!(record.timestamp.is_none());
+        assert_eq!(record.offset, -1);
+        assert!(!record.written_locally);
+        assert!(matches!(record.write_mode, WriteMode::ExternalOnly));
+    }
+
+    #[test]
+    fn test_pending_forward_record_clone() {
+        let record = PendingForwardRecord {
+            topic_id: 1,
+            topic_name: "test".to_string(),
+            partition_id: 0,
+            offset: 50,
+            key: Some(b"key".to_vec()),
+            value: Some(b"value".to_vec()),
+            headers: vec![],
+            timestamp: Some(1000),
+            write_mode: WriteMode::DualWrite,
+            written_locally: true,
+        };
+
+        let cloned = record.clone();
+        assert_eq!(cloned.topic_id, record.topic_id);
+        assert_eq!(cloned.topic_name, record.topic_name);
+        assert_eq!(cloned.key, record.key);
+        assert_eq!(cloned.value, record.value);
+    }
+
+    #[test]
+    fn test_txn_key_type() {
+        // TxnKey is (producer_id, producer_epoch)
+        let key1: TxnKey = (1000, 0);
+        let key2: TxnKey = (1000, 1);
+        let key3: TxnKey = (1001, 0);
+
+        // Keys with same producer_id but different epoch should differ
+        assert_ne!(key1, key2);
+        // Keys with different producer_id should differ
+        assert_ne!(key1, key3);
+
+        // Test HashMap key behavior
+        let mut map: HashMap<TxnKey, Vec<PendingForwardRecord>> = HashMap::new();
+        map.insert(key1, vec![]);
+        map.insert(key2, vec![]);
+
+        assert_eq!(map.len(), 2);
+        assert!(map.contains_key(&(1000, 0)));
+        assert!(map.contains_key(&(1000, 1)));
+        assert!(!map.contains_key(&(1000, 2)));
+    }
+
+    #[test]
+    fn test_pending_txn_messages_type() {
+        // Test the PendingTxnMessages type alias works correctly
+        let pending: PendingTxnMessages = Arc::new(RwLock::new(HashMap::new()));
+
+        // Write some pending records
+        {
+            let mut guard = pending.write().unwrap();
+            let key: TxnKey = (1000, 0);
+            let record = PendingForwardRecord {
+                topic_id: 1,
+                topic_name: "test".to_string(),
+                partition_id: 0,
+                offset: 0,
+                key: None,
+                value: Some(b"test".to_vec()),
+                headers: vec![],
+                timestamp: None,
+                write_mode: WriteMode::DualWrite,
+                written_locally: true,
+            };
+            guard.entry(key).or_default().push(record);
+        }
+
+        // Read back
+        {
+            let guard = pending.read().unwrap();
+            assert_eq!(guard.len(), 1);
+            let records = guard.get(&(1000, 0)).unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].value, Some(b"test".to_vec()));
+        }
+    }
+
+    #[test]
+    fn test_pending_txn_accumulation() {
+        let pending: PendingTxnMessages = Arc::new(RwLock::new(HashMap::new()));
+        let key: TxnKey = (1000, 0);
+
+        // Add multiple records to same transaction
+        {
+            let mut guard = pending.write().unwrap();
+            for i in 0..5 {
+                let record = PendingForwardRecord {
+                    topic_id: 1,
+                    topic_name: "test".to_string(),
+                    partition_id: i,
+                    offset: i as i64,
+                    key: None,
+                    value: Some(format!("msg-{}", i).into_bytes()),
+                    headers: vec![],
+                    timestamp: None,
+                    write_mode: WriteMode::DualWrite,
+                    written_locally: true,
+                };
+                guard.entry(key).or_default().push(record);
+            }
+        }
+
+        // Verify all records accumulated
+        let guard = pending.read().unwrap();
+        let records = guard.get(&key).unwrap();
+        assert_eq!(records.len(), 5);
+
+        // Verify ordering preserved
+        for (i, record) in records.iter().enumerate() {
+            assert_eq!(record.partition_id, i as i32);
+            assert_eq!(record.value, Some(format!("msg-{}", i).into_bytes()));
+        }
+    }
+
+    #[test]
+    fn test_pending_txn_clear_on_commit() {
+        let pending: PendingTxnMessages = Arc::new(RwLock::new(HashMap::new()));
+        let key: TxnKey = (1000, 0);
+
+        // Add records
+        {
+            let mut guard = pending.write().unwrap();
+            guard.insert(
+                key,
+                vec![PendingForwardRecord {
+                    topic_id: 1,
+                    topic_name: "test".to_string(),
+                    partition_id: 0,
+                    offset: 0,
+                    key: None,
+                    value: Some(b"test".to_vec()),
+                    headers: vec![],
+                    timestamp: None,
+                    write_mode: WriteMode::DualWrite,
+                    written_locally: true,
+                }],
+            );
+        }
+
+        // Simulate commit by removing
+        {
+            let mut guard = pending.write().unwrap();
+            let removed = guard.remove(&key);
+            assert!(removed.is_some());
+            assert_eq!(removed.unwrap().len(), 1);
+        }
+
+        // Verify empty
+        let guard = pending.read().unwrap();
+        assert!(guard.get(&key).is_none());
+    }
+
+    #[test]
+    fn test_pending_txn_abort_clears_records() {
+        let pending: PendingTxnMessages = Arc::new(RwLock::new(HashMap::new()));
+        let key: TxnKey = (1000, 0);
+
+        // Add records
+        {
+            let mut guard = pending.write().unwrap();
+            guard.insert(
+                key,
+                vec![PendingForwardRecord {
+                    topic_id: 1,
+                    topic_name: "test".to_string(),
+                    partition_id: 0,
+                    offset: 0,
+                    key: None,
+                    value: Some(b"test".to_vec()),
+                    headers: vec![],
+                    timestamp: None,
+                    write_mode: WriteMode::DualWrite,
+                    written_locally: true,
+                }],
+            );
+        }
+
+        // Simulate abort by removing without forwarding
+        {
+            let mut guard = pending.write().unwrap();
+            guard.remove(&key); // Discard records on abort
+        }
+
+        // Verify empty
+        assert!(pending.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_shadow_metrics_initialization() {
+        let metrics = ShadowMetrics::default();
+
+        assert_eq!(
+            metrics.forwarded.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            metrics.skipped.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(metrics.failed.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(
+            metrics
+                .fallback_local
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[test]
+    fn test_shadow_metrics_atomic_increment() {
+        let metrics = ShadowMetrics::default();
+
+        // Increment counters
+        metrics
+            .forwarded
+            .fetch_add(10, std::sync::atomic::Ordering::Relaxed);
+        metrics
+            .skipped
+            .fetch_add(5, std::sync::atomic::Ordering::Relaxed);
+        metrics
+            .failed
+            .fetch_add(2, std::sync::atomic::Ordering::Relaxed);
+        metrics
+            .fallback_local
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        assert_eq!(
+            metrics.forwarded.load(std::sync::atomic::Ordering::Relaxed),
+            10
+        );
+        assert_eq!(
+            metrics.skipped.load(std::sync::atomic::Ordering::Relaxed),
+            5
+        );
+        assert_eq!(metrics.failed.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert_eq!(
+            metrics
+                .fallback_local
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
+    fn test_shadow_metrics_thread_safe() {
+        use std::sync::atomic::Ordering;
+        use std::thread;
+
+        let metrics = Arc::new(ShadowMetrics::default());
+
+        // Spawn multiple threads incrementing counters
+        let handles: Vec<_> = (0..10)
+            .map(|_| {
+                let m = Arc::clone(&metrics);
+                thread::spawn(move || {
+                    for _ in 0..100 {
+                        m.forwarded.fetch_add(1, Ordering::Relaxed);
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert_eq!(metrics.forwarded.load(Ordering::Relaxed), 1000);
+    }
+
+    #[test]
+    fn test_multiple_transactions_isolation() {
+        let pending: PendingTxnMessages = Arc::new(RwLock::new(HashMap::new()));
+
+        // Two different transactions
+        let txn1: TxnKey = (1000, 0);
+        let txn2: TxnKey = (1001, 0);
+
+        {
+            let mut guard = pending.write().unwrap();
+            guard.insert(
+                txn1,
+                vec![PendingForwardRecord {
+                    topic_id: 1,
+                    topic_name: "topic1".to_string(),
+                    partition_id: 0,
+                    offset: 0,
+                    key: None,
+                    value: Some(b"txn1-msg".to_vec()),
+                    headers: vec![],
+                    timestamp: None,
+                    write_mode: WriteMode::DualWrite,
+                    written_locally: true,
+                }],
+            );
+            guard.insert(
+                txn2,
+                vec![PendingForwardRecord {
+                    topic_id: 2,
+                    topic_name: "topic2".to_string(),
+                    partition_id: 0,
+                    offset: 0,
+                    key: None,
+                    value: Some(b"txn2-msg".to_vec()),
+                    headers: vec![],
+                    timestamp: None,
+                    write_mode: WriteMode::DualWrite,
+                    written_locally: true,
+                }],
+            );
+        }
+
+        // Commit txn1, verify txn2 unaffected
+        {
+            let mut guard = pending.write().unwrap();
+            guard.remove(&txn1);
+        }
+
+        let guard = pending.read().unwrap();
+        assert!(guard.get(&txn1).is_none());
+        assert!(guard.get(&txn2).is_some());
+        assert_eq!(guard.get(&txn2).unwrap()[0].topic_name, "topic2");
+    }
+
+    #[test]
+    fn test_write_mode_affects_written_locally() {
+        // DualWrite should mark as written locally
+        let dual_write = PendingForwardRecord {
+            topic_id: 1,
+            topic_name: "test".to_string(),
+            partition_id: 0,
+            offset: 100,
+            key: None,
+            value: Some(b"test".to_vec()),
+            headers: vec![],
+            timestamp: None,
+            write_mode: WriteMode::DualWrite,
+            written_locally: true,
+        };
+        assert!(dual_write.written_locally);
+        assert!(dual_write.offset >= 0);
+
+        // ExternalOnly should not write locally
+        let external_only = PendingForwardRecord {
+            topic_id: 1,
+            topic_name: "test".to_string(),
+            partition_id: 0,
+            offset: -1, // No local offset
+            key: None,
+            value: Some(b"test".to_vec()),
+            headers: vec![],
+            timestamp: None,
+            write_mode: WriteMode::ExternalOnly,
+            written_locally: false,
+        };
+        assert!(!external_only.written_locally);
+        assert_eq!(external_only.offset, -1);
     }
 }
