@@ -212,4 +212,210 @@ mod tests {
             1001
         );
     }
+
+    #[test]
+    fn test_all_error_display_variants() {
+        // NotEnabled
+        let err = ShadowError::NotEnabled;
+        assert!(err.to_string().contains("not enabled"));
+
+        // NotConfigured
+        let err = ShadowError::NotConfigured("test reason".to_string());
+        assert!(err.to_string().contains("not configured"));
+        assert!(err.to_string().contains("test reason"));
+
+        // ConnectionFailed
+        let err = ShadowError::ConnectionFailed("connection refused".to_string());
+        assert!(err.to_string().contains("Failed to connect"));
+        assert!(err.to_string().contains("connection refused"));
+
+        // ForwardFailed
+        let err = ShadowError::ForwardFailed {
+            topic: "my-topic".to_string(),
+            partition: 5,
+            error: "broker down".to_string(),
+        };
+        assert!(err.to_string().contains("my-topic"));
+        assert!(err.to_string().contains("[5]"));
+        assert!(err.to_string().contains("broker down"));
+
+        // ProducerError
+        let err = ShadowError::ProducerError("queue full".to_string());
+        assert!(err.to_string().contains("producer error"));
+        assert!(err.to_string().contains("queue full"));
+
+        // ConfigError
+        let err = ShadowError::ConfigError("invalid protocol".to_string());
+        assert!(err.to_string().contains("Configuration error"));
+        assert!(err.to_string().contains("invalid protocol"));
+
+        // DatabaseError
+        let err = ShadowError::DatabaseError("connection lost".to_string());
+        assert!(err.to_string().contains("Database error"));
+        assert!(err.to_string().contains("connection lost"));
+
+        // Timeout
+        let err = ShadowError::Timeout {
+            topic: "timeout-topic".to_string(),
+            partition: 3,
+            timeout_ms: 30000,
+        };
+        assert!(err.to_string().contains("Timeout"));
+        assert!(err.to_string().contains("timeout-topic"));
+        assert!(err.to_string().contains("[3]"));
+        assert!(err.to_string().contains("30000ms"));
+
+        // KafkaUnavailable
+        let err = ShadowError::KafkaUnavailable("all brokers down".to_string());
+        assert!(err.to_string().contains("unavailable"));
+        assert!(err.to_string().contains("all brokers down"));
+
+        // InvalidTopicConfig
+        let err = ShadowError::InvalidTopicConfig {
+            topic_id: 42,
+            reason: "missing external topic".to_string(),
+        };
+        assert!(err.to_string().contains("Invalid shadow config"));
+        assert!(err.to_string().contains("42"));
+        assert!(err.to_string().contains("missing external topic"));
+
+        // ReplayFailed
+        let err = ShadowError::ReplayFailed {
+            topic: "replay-topic".to_string(),
+            from_offset: 100,
+            to_offset: 200,
+            error: "network error".to_string(),
+        };
+        assert!(err.to_string().contains("Replay failed"));
+        assert!(err.to_string().contains("replay-topic"));
+        assert!(err.to_string().contains("100"));
+        assert!(err.to_string().contains("200"));
+        assert!(err.to_string().contains("network error"));
+    }
+
+    #[test]
+    fn test_all_error_codes_mapping() {
+        use crate::kafka::constants::*;
+
+        // NotEnabled -> ERROR_SHADOW_NOT_CONFIGURED
+        assert_eq!(
+            ShadowError::NotEnabled.to_error_code(),
+            ERROR_SHADOW_NOT_CONFIGURED
+        );
+
+        // NotConfigured -> ERROR_SHADOW_NOT_CONFIGURED
+        assert_eq!(
+            ShadowError::NotConfigured("x".to_string()).to_error_code(),
+            ERROR_SHADOW_NOT_CONFIGURED
+        );
+
+        // ConnectionFailed -> ERROR_SHADOW_KAFKA_UNAVAILABLE
+        assert_eq!(
+            ShadowError::ConnectionFailed("x".to_string()).to_error_code(),
+            ERROR_SHADOW_KAFKA_UNAVAILABLE
+        );
+
+        // KafkaUnavailable -> ERROR_SHADOW_KAFKA_UNAVAILABLE
+        assert_eq!(
+            ShadowError::KafkaUnavailable("x".to_string()).to_error_code(),
+            ERROR_SHADOW_KAFKA_UNAVAILABLE
+        );
+
+        // ForwardFailed -> ERROR_SHADOW_FORWARD_FAILED
+        assert_eq!(
+            ShadowError::ForwardFailed {
+                topic: "t".to_string(),
+                partition: 0,
+                error: "e".to_string()
+            }
+            .to_error_code(),
+            ERROR_SHADOW_FORWARD_FAILED
+        );
+
+        // ProducerError -> ERROR_SHADOW_FORWARD_FAILED
+        assert_eq!(
+            ShadowError::ProducerError("x".to_string()).to_error_code(),
+            ERROR_SHADOW_FORWARD_FAILED
+        );
+
+        // Timeout -> ERROR_SHADOW_FORWARD_FAILED
+        assert_eq!(
+            ShadowError::Timeout {
+                topic: "t".to_string(),
+                partition: 0,
+                timeout_ms: 1000
+            }
+            .to_error_code(),
+            ERROR_SHADOW_FORWARD_FAILED
+        );
+
+        // ConfigError -> ERROR_SHADOW_NOT_CONFIGURED
+        assert_eq!(
+            ShadowError::ConfigError("x".to_string()).to_error_code(),
+            ERROR_SHADOW_NOT_CONFIGURED
+        );
+
+        // InvalidTopicConfig -> ERROR_SHADOW_NOT_CONFIGURED
+        assert_eq!(
+            ShadowError::InvalidTopicConfig {
+                topic_id: 1,
+                reason: "x".to_string()
+            }
+            .to_error_code(),
+            ERROR_SHADOW_NOT_CONFIGURED
+        );
+
+        // DatabaseError -> ERROR_SHADOW_FORWARD_FAILED
+        assert_eq!(
+            ShadowError::DatabaseError("x".to_string()).to_error_code(),
+            ERROR_SHADOW_FORWARD_FAILED
+        );
+
+        // ReplayFailed -> ERROR_SHADOW_REPLAY_FAILED
+        assert_eq!(
+            ShadowError::ReplayFailed {
+                topic: "t".to_string(),
+                from_offset: 0,
+                to_offset: 10,
+                error: "e".to_string()
+            }
+            .to_error_code(),
+            ERROR_SHADOW_REPLAY_FAILED
+        );
+    }
+
+    #[test]
+    fn test_shadow_error_is_std_error() {
+        // Verify ShadowError implements std::error::Error
+        fn assert_error<E: std::error::Error>(_: &E) {}
+
+        let err = ShadowError::NotEnabled;
+        assert_error(&err);
+    }
+
+    #[test]
+    fn test_shadow_error_debug_format() {
+        let err = ShadowError::ForwardFailed {
+            topic: "test".to_string(),
+            partition: 0,
+            error: "err".to_string(),
+        };
+        let debug_str = format!("{:?}", err);
+        assert!(debug_str.contains("ForwardFailed"));
+        assert!(debug_str.contains("test"));
+    }
+
+    #[test]
+    fn test_shadow_result_type() {
+        fn returns_ok() -> ShadowResult<i32> {
+            Ok(42)
+        }
+
+        fn returns_err() -> ShadowResult<i32> {
+            Err(ShadowError::NotEnabled)
+        }
+
+        assert_eq!(returns_ok().unwrap(), 42);
+        assert!(returns_err().is_err());
+    }
 }

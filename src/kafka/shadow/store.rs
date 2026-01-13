@@ -1879,4 +1879,328 @@ mod tests {
         assert!(!external_only.written_locally);
         assert_eq!(external_only.offset, -1);
     }
+
+    #[test]
+    fn test_shadow_metrics_new() {
+        let metrics = ShadowMetrics::new();
+        assert_eq!(
+            metrics.forwarded.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            metrics.skipped.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(metrics.failed.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(
+            metrics
+                .fallback_local
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[test]
+    fn test_shadow_metrics_snapshot() {
+        let metrics = ShadowMetrics::default();
+
+        // Set some values
+        metrics
+            .forwarded
+            .store(100, std::sync::atomic::Ordering::Relaxed);
+        metrics
+            .skipped
+            .store(50, std::sync::atomic::Ordering::Relaxed);
+        metrics
+            .failed
+            .store(5, std::sync::atomic::Ordering::Relaxed);
+        metrics
+            .fallback_local
+            .store(3, std::sync::atomic::Ordering::Relaxed);
+
+        // Get snapshot
+        let (forwarded, skipped, failed, fallback) = metrics.snapshot();
+
+        assert_eq!(forwarded, 100);
+        assert_eq!(skipped, 50);
+        assert_eq!(failed, 5);
+        assert_eq!(fallback, 3);
+    }
+
+    #[test]
+    fn test_shadow_metrics_concurrent_updates() {
+        use std::sync::atomic::Ordering;
+        use std::thread;
+
+        let metrics = Arc::new(ShadowMetrics::default());
+
+        // Spawn threads for each counter
+        let handles: Vec<_> = vec![
+            {
+                let m = Arc::clone(&metrics);
+                thread::spawn(move || {
+                    for _ in 0..50 {
+                        m.forwarded.fetch_add(1, Ordering::Relaxed);
+                    }
+                })
+            },
+            {
+                let m = Arc::clone(&metrics);
+                thread::spawn(move || {
+                    for _ in 0..30 {
+                        m.skipped.fetch_add(1, Ordering::Relaxed);
+                    }
+                })
+            },
+            {
+                let m = Arc::clone(&metrics);
+                thread::spawn(move || {
+                    for _ in 0..10 {
+                        m.failed.fetch_add(1, Ordering::Relaxed);
+                    }
+                })
+            },
+            {
+                let m = Arc::clone(&metrics);
+                thread::spawn(move || {
+                    for _ in 0..5 {
+                        m.fallback_local.fetch_add(1, Ordering::Relaxed);
+                    }
+                })
+            },
+        ];
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let (forwarded, skipped, failed, fallback) = metrics.snapshot();
+        assert_eq!(forwarded, 50);
+        assert_eq!(skipped, 30);
+        assert_eq!(failed, 10);
+        assert_eq!(fallback, 5);
+    }
+
+    #[test]
+    fn test_topic_config_cache_get_by_name() {
+        let cache = TopicConfigCache::new();
+
+        // Insert config
+        let config = super::super::config::TopicShadowConfig {
+            topic_id: 42,
+            topic_name: "my-special-topic".to_string(),
+            mode: ShadowMode::Shadow,
+            forward_percentage: 100,
+            external_topic_name: Some("external-topic".to_string()),
+            sync_mode: super::super::config::SyncMode::Sync,
+            write_mode: WriteMode::DualWrite,
+        };
+        cache.update(config);
+
+        // Get by name
+        let retrieved = cache.get_by_name("my-special-topic");
+        assert!(retrieved.is_some());
+        let cfg = retrieved.unwrap();
+        assert_eq!(cfg.topic_id, 42);
+        assert_eq!(cfg.external_topic_name, Some("external-topic".to_string()));
+
+        // Non-existent name
+        assert!(cache.get_by_name("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_topic_config_cache_all() {
+        let cache = TopicConfigCache::new();
+
+        // Insert multiple configs
+        for i in 1..=5 {
+            let config = super::super::config::TopicShadowConfig {
+                topic_id: i,
+                topic_name: format!("topic-{}", i),
+                mode: ShadowMode::Shadow,
+                forward_percentage: 100,
+                external_topic_name: None,
+                sync_mode: super::super::config::SyncMode::Async,
+                write_mode: WriteMode::DualWrite,
+            };
+            cache.update(config);
+        }
+
+        let all = cache.all();
+        assert_eq!(all.len(), 5);
+
+        // Verify all topics present
+        let names: Vec<String> = all.iter().map(|c| c.topic_name.clone()).collect();
+        for i in 1..=5 {
+            assert!(names.contains(&format!("topic-{}", i)));
+        }
+    }
+
+    #[test]
+    fn test_topic_config_cache_clear() {
+        let cache = TopicConfigCache::new();
+
+        // Add some configs
+        for i in 1..=3 {
+            let config = super::super::config::TopicShadowConfig {
+                topic_id: i,
+                topic_name: format!("topic-{}", i),
+                mode: ShadowMode::Shadow,
+                forward_percentage: 100,
+                external_topic_name: None,
+                sync_mode: super::super::config::SyncMode::Async,
+                write_mode: WriteMode::DualWrite,
+            };
+            cache.update(config);
+        }
+
+        assert_eq!(cache.all().len(), 3);
+
+        // Clear cache
+        cache.clear();
+
+        assert_eq!(cache.all().len(), 0);
+        assert!(cache.get(1).is_none());
+    }
+
+    #[test]
+    fn test_topic_config_cache_update_existing() {
+        let cache = TopicConfigCache::new();
+
+        // Initial config
+        let config1 = super::super::config::TopicShadowConfig {
+            topic_id: 1,
+            topic_name: "topic".to_string(),
+            mode: ShadowMode::Shadow,
+            forward_percentage: 50,
+            external_topic_name: None,
+            sync_mode: super::super::config::SyncMode::Async,
+            write_mode: WriteMode::DualWrite,
+        };
+        cache.update(config1);
+
+        // Verify initial
+        assert_eq!(cache.get(1).unwrap().forward_percentage, 50);
+
+        // Update same topic
+        let config2 = super::super::config::TopicShadowConfig {
+            topic_id: 1,
+            topic_name: "topic".to_string(),
+            mode: ShadowMode::Shadow,
+            forward_percentage: 100,
+            external_topic_name: Some("external".to_string()),
+            sync_mode: super::super::config::SyncMode::Sync,
+            write_mode: WriteMode::ExternalOnly,
+        };
+        cache.update(config2);
+
+        // Verify updated
+        let updated = cache.get(1).unwrap();
+        assert_eq!(updated.forward_percentage, 100);
+        assert_eq!(updated.external_topic_name, Some("external".to_string()));
+        assert!(matches!(
+            updated.sync_mode,
+            super::super::config::SyncMode::Sync
+        ));
+        assert!(matches!(updated.write_mode, WriteMode::ExternalOnly));
+    }
+
+    #[test]
+    fn test_pending_record_with_headers() {
+        let headers = vec![
+            RecordHeader {
+                key: "key1".to_string(),
+                value: b"value1".to_vec(),
+            },
+            RecordHeader {
+                key: "key2".to_string(),
+                value: b"value2".to_vec(),
+            },
+            RecordHeader {
+                key: "content-type".to_string(),
+                value: b"application/json".to_vec(),
+            },
+        ];
+
+        let record = PendingForwardRecord {
+            topic_id: 1,
+            topic_name: "test".to_string(),
+            partition_id: 0,
+            offset: 0,
+            key: None,
+            value: Some(b"test".to_vec()),
+            headers: headers.clone(),
+            timestamp: None,
+            write_mode: WriteMode::DualWrite,
+            written_locally: true,
+        };
+
+        assert_eq!(record.headers.len(), 3);
+        assert_eq!(record.headers[0].key, "key1");
+        assert_eq!(record.headers[1].key, "key2");
+        assert_eq!(record.headers[2].key, "content-type");
+        assert_eq!(record.headers[2].value, b"application/json".to_vec());
+    }
+
+    #[test]
+    fn test_pending_record_large_payload() {
+        // Test with a large payload (1MB)
+        let large_value: Vec<u8> = (0..1_000_000).map(|i| (i % 256) as u8).collect();
+
+        let record = PendingForwardRecord {
+            topic_id: 1,
+            topic_name: "test".to_string(),
+            partition_id: 0,
+            offset: 0,
+            key: Some(b"large-key".to_vec()),
+            value: Some(large_value.clone()),
+            headers: vec![],
+            timestamp: Some(1234567890),
+            write_mode: WriteMode::DualWrite,
+            written_locally: true,
+        };
+
+        assert_eq!(record.value.as_ref().unwrap().len(), 1_000_000);
+        assert_eq!(record.value, Some(large_value));
+    }
+
+    #[test]
+    fn test_txn_key_epoch_rollover() {
+        // Test epoch handling at boundaries
+        let key_max_epoch: TxnKey = (1000, i16::MAX);
+        let key_min_epoch: TxnKey = (1000, i16::MIN);
+        let key_zero_epoch: TxnKey = (1000, 0);
+
+        assert_ne!(key_max_epoch, key_min_epoch);
+        assert_ne!(key_max_epoch, key_zero_epoch);
+        assert_ne!(key_min_epoch, key_zero_epoch);
+
+        // Verify HashMap handles edge cases
+        let mut map: HashMap<TxnKey, String> = HashMap::new();
+        map.insert(key_max_epoch, "max".to_string());
+        map.insert(key_min_epoch, "min".to_string());
+        map.insert(key_zero_epoch, "zero".to_string());
+
+        assert_eq!(map.len(), 3);
+        assert_eq!(map.get(&key_max_epoch), Some(&"max".to_string()));
+        assert_eq!(map.get(&key_min_epoch), Some(&"min".to_string()));
+        assert_eq!(map.get(&key_zero_epoch), Some(&"zero".to_string()));
+    }
+
+    #[test]
+    fn test_txn_key_producer_id_boundaries() {
+        // Test producer_id at boundaries
+        let key_max_pid: TxnKey = (i64::MAX, 0);
+        let key_min_pid: TxnKey = (i64::MIN, 0);
+        let key_zero_pid: TxnKey = (0, 0);
+
+        assert_ne!(key_max_pid, key_min_pid);
+        assert_ne!(key_max_pid, key_zero_pid);
+
+        let mut map: HashMap<TxnKey, String> = HashMap::new();
+        map.insert(key_max_pid, "max".to_string());
+        map.insert(key_min_pid, "min".to_string());
+
+        assert_eq!(map.len(), 2);
+    }
 }
