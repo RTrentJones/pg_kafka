@@ -41,13 +41,48 @@ use super::producer::ShadowProducer;
 use super::routing::make_forward_decision;
 use super::ForwardRequest;
 use crate::kafka::error::Result;
-use crate::kafka::messages::Record;
+use crate::kafka::messages::{Record, RecordHeader};
 use crate::kafka::storage::{
     CommittedOffset, FetchedMessage, IsolationLevel, KafkaStore, TopicMetadata, TransactionState,
 };
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
+
+/// Record pending shadow forwarding after transaction commit
+///
+/// These are cached during `insert_transactional_records()` and forwarded
+/// when `commit_transaction()` is called.
+#[derive(Clone, Debug)]
+struct PendingForwardRecord {
+    /// Topic ID for this record
+    topic_id: i32,
+    /// Topic name (cached to avoid lookup on commit)
+    topic_name: String,
+    /// Partition ID
+    partition_id: i32,
+    /// Local offset (-1 if not written locally yet, e.g., ExternalOnly mode)
+    offset: i64,
+    /// Record key
+    key: Option<Vec<u8>>,
+    /// Record value
+    value: Option<Vec<u8>>,
+    /// Record headers (matches Record struct type)
+    headers: Vec<RecordHeader>,
+    /// Timestamp (milliseconds since epoch, optional - matches Record struct)
+    timestamp: Option<i64>,
+    /// Write mode for this record (DualWrite or ExternalOnly)
+    write_mode: WriteMode,
+    /// Whether this record was written to local PostgreSQL
+    written_locally: bool,
+}
+
+/// Key for pending transaction messages: (producer_id, producer_epoch)
+type TxnKey = (i64, i16);
+
+/// Cache of pending transactional records awaiting commit
+type PendingTxnMessages = Arc<RwLock<HashMap<TxnKey, Vec<PendingForwardRecord>>>>;
 
 /// Metrics for shadow forwarding operations
 #[derive(Debug, Default)]
@@ -94,6 +129,8 @@ pub struct ShadowStore<S: KafkaStore> {
     inner: S,
     /// Producer for sending to external Kafka (lazily initialized)
     producer: RwLock<Option<Arc<ShadowProducer>>>,
+    /// Bootstrap servers used to create the cached producer (for change detection)
+    producer_bootstrap_servers: RwLock<Option<String>>,
     /// Topic configuration cache
     topic_cache: Arc<TopicConfigCache>,
     /// Primary status checker
@@ -102,8 +139,8 @@ pub struct ShadowStore<S: KafkaStore> {
     metrics: ShadowMetrics,
     /// Channel for async forwarding to network thread (Phase 11)
     forward_tx: RwLock<Option<crossbeam_channel::Sender<ForwardRequest>>>,
-    /// Runtime context for accessing configuration (optional to support tests)
-    runtime_context: Option<Arc<crate::kafka::RuntimeContext>>,
+    /// Pending transactional records awaiting commit for shadow forwarding
+    pending_txn_messages: PendingTxnMessages,
 }
 
 impl<S: KafkaStore> ShadowStore<S> {
@@ -119,32 +156,26 @@ impl<S: KafkaStore> ShadowStore<S> {
         Self {
             inner,
             producer: RwLock::new(None),
+            producer_bootstrap_servers: RwLock::new(None),
             topic_cache: Arc::new(TopicConfigCache::new()),
             primary_status: Mutex::new(PrimaryStatus::new()),
             metrics: ShadowMetrics::new(),
             forward_tx: RwLock::new(None),
-            runtime_context: None,
+            pending_txn_messages: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
     /// Create a new ShadowStore with RuntimeContext for config access
     ///
-    /// This constructor is preferred in production as it enables centralized
-    /// config management via RuntimeContext, avoiding redundant Config::load() calls.
+    /// Note: RuntimeContext is no longer used for shadow producer config.
+    /// The producer now loads config directly from GUCs to detect changes.
+    /// This constructor is kept for API compatibility but simply calls new().
     ///
     /// # Arguments
     /// * `inner` - The store to wrap (typically PostgresStore)
-    /// * `runtime_context` - Runtime context for accessing configuration
-    pub fn with_context(inner: S, runtime_context: Arc<crate::kafka::RuntimeContext>) -> Self {
-        Self {
-            inner,
-            producer: RwLock::new(None),
-            topic_cache: Arc::new(TopicConfigCache::new()),
-            primary_status: Mutex::new(PrimaryStatus::new()),
-            metrics: ShadowMetrics::new(),
-            forward_tx: RwLock::new(None),
-            runtime_context: Some(runtime_context),
-        }
+    /// * `_runtime_context` - Unused (kept for API compatibility)
+    pub fn with_context(inner: S, _runtime_context: Arc<crate::kafka::RuntimeContext>) -> Self {
+        Self::new(inner)
     }
 
     /// Set the forward channel for async forwarding
@@ -197,39 +228,67 @@ impl<S: KafkaStore> ShadowStore<S> {
     ///
     /// Returns Some(producer) if shadow mode is properly configured,
     /// None if configuration is missing or invalid.
+    ///
+    /// This function also handles config changes: if the bootstrap_servers
+    /// GUC has changed since the producer was created, the old producer
+    /// is discarded and a new one is created with the updated config.
     fn ensure_producer(&self) -> Option<Arc<ShadowProducer>> {
-        // Fast path: check if already initialized
-        {
-            let guard = self.producer.read().expect("producer lock poisoned");
-            if let Some(ref producer) = *guard {
-                return Some(producer.clone());
-            }
-        }
-
-        // Slow path: need to initialize
-        let mut guard = self.producer.write().expect("producer lock poisoned");
-
-        // Double-check after acquiring write lock
-        if let Some(ref producer) = *guard {
-            return Some(producer.clone());
-        }
-
-        // Read current config from RuntimeContext if available, otherwise fallback to direct load
+        // Always load fresh config directly from GUCs for shadow producer
+        // We need fresh values to detect config changes (e.g., bootstrap_servers changed via pg_reload_conf)
+        // RuntimeContext caches config and doesn't refresh on SIGHUP, so we bypass it here
         #[cfg(not(test))]
         let config = {
             use crate::config::Config;
-            let cfg = if let Some(ref ctx) = self.runtime_context {
-                // Use RuntimeContext for centralized config access (preferred)
-                ctx.config()
-            } else {
-                // Fallback for tests or if RuntimeContext not provided
-                Arc::new(Config::load())
-            };
-            ShadowConfig::from_config(&cfg)
+            let cfg = Config::load();
+            ShadowConfig::from_config(&Arc::new(cfg))
         };
 
         #[cfg(test)]
         let config = ShadowConfig::default();
+
+        // Fast path: check if already initialized with same config
+        {
+            let guard = self.producer.read().expect("producer lock poisoned");
+            let bs_guard = self
+                .producer_bootstrap_servers
+                .read()
+                .expect("producer_bootstrap_servers lock poisoned");
+
+            if let Some(ref producer) = *guard {
+                // Check if config has changed
+                if let Some(ref cached_bs) = *bs_guard {
+                    if cached_bs == &config.bootstrap_servers {
+                        return Some(producer.clone());
+                    }
+                    // Config changed - need to recreate producer
+                    pgrx::log!(
+                        "Shadow: bootstrap_servers changed from '{}' to '{}', recreating producer",
+                        cached_bs,
+                        config.bootstrap_servers
+                    );
+                }
+            }
+        }
+
+        // Slow path: need to initialize or reinitialize
+        let mut guard = self.producer.write().expect("producer lock poisoned");
+        let mut bs_guard = self
+            .producer_bootstrap_servers
+            .write()
+            .expect("producer_bootstrap_servers lock poisoned");
+
+        // Double-check after acquiring write lock
+        if let Some(ref producer) = *guard {
+            if let Some(ref cached_bs) = *bs_guard {
+                if cached_bs == &config.bootstrap_servers {
+                    return Some(producer.clone());
+                }
+            }
+        }
+
+        // Clear old producer if exists (config changed)
+        *guard = None;
+        *bs_guard = None;
 
         if !config.is_configured() {
             pgrx::warning!(
@@ -253,6 +312,7 @@ impl<S: KafkaStore> ShadowStore<S> {
             Ok(producer) => {
                 let producer = Arc::new(producer);
                 *guard = Some(producer.clone());
+                *bs_guard = Some(config.bootstrap_servers.clone());
                 tracing::info!(
                     "✅ Shadow producer successfully initialized and connected to {}",
                     config.bootstrap_servers
@@ -470,6 +530,124 @@ impl<S: KafkaStore> ShadowStore<S> {
         Ok(())
     }
 
+    /// Forward a single record to external Kafka
+    ///
+    /// Returns true on success, false on failure.
+    /// Used for transactional message forwarding on commit.
+    fn forward_single_record(&self, record: &PendingForwardRecord) -> bool {
+        // Get topic config for percentage routing and external topic name
+        let topic_config = match self.topic_cache.get(record.topic_id) {
+            Some(config) => config,
+            None => {
+                tracing::warn!(
+                    "No shadow config for topic {} during txn forward",
+                    record.topic_id
+                );
+                return false;
+            }
+        };
+
+        // Check percentage routing (use offset if available, otherwise always forward)
+        let should_forward = if record.offset >= 0 {
+            match self.decide_forward(
+                record.key.as_deref(),
+                record.offset,
+                topic_config.forward_percentage,
+            ) {
+                ForwardDecision::Forward => true,
+                ForwardDecision::Skip => {
+                    self.metrics.skipped.fetch_add(1, Ordering::Relaxed);
+                    return true; // Skipped by design, not a failure
+                }
+            }
+        } else {
+            // ExternalOnly mode: no offset yet, check percentage with partition_id as fallback
+            topic_config.forward_percentage == 100
+                || (record.partition_id as u8 % 100) < topic_config.forward_percentage
+        };
+
+        if !should_forward {
+            self.metrics.skipped.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+
+        // Get producer
+        let producer = match self.ensure_producer() {
+            Some(p) => p,
+            None => {
+                tracing::warn!("No producer available for txn forward");
+                return false;
+            }
+        };
+
+        let external_topic = topic_config.effective_external_topic();
+
+        // Forward synchronously
+        match producer.send_sync(
+            external_topic,
+            Some(record.partition_id),
+            record.key.as_deref(),
+            record.value.as_deref(),
+            DEFAULT_FORWARD_TIMEOUT_MS,
+        ) {
+            Ok(_) => {
+                tracing::trace!(
+                    "Shadow txn forward SUCCESS for {}[{}]",
+                    external_topic,
+                    record.partition_id
+                );
+                self.metrics.forwarded.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Shadow txn forward FAILED for {}[{}]: {:?}",
+                    external_topic,
+                    record.partition_id,
+                    e
+                );
+                self.metrics.failed.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+        }
+    }
+
+    /// Write a record to PostgreSQL as fallback when external forward fails (ExternalOnly mode)
+    ///
+    /// This is called during commit when an ExternalOnly record fails to forward.
+    /// The record is inserted as a committed (visible) record since the transaction
+    /// is being committed.
+    fn write_fallback_record(
+        &self,
+        record: &PendingForwardRecord,
+        _producer_id: i64,
+        _producer_epoch: i16,
+    ) -> Result<i64> {
+        // Convert PendingForwardRecord back to Record for insertion
+        let kafka_record = Record {
+            key: record.key.clone(),
+            value: record.value.clone(),
+            headers: record.headers.clone(),
+            timestamp: record.timestamp,
+        };
+
+        // Insert as a committed (visible) record
+        // Note: This uses insert_records, not insert_transactional_records,
+        // because we're in fallback mode and want the message visible immediately
+        let offset =
+            self.inner
+                .insert_records(record.topic_id, record.partition_id, &[kafka_record])?;
+
+        self.metrics.fallback_local.fetch_add(1, Ordering::Relaxed);
+        tracing::info!(
+            "ExternalOnly fallback: wrote txn record to local storage for topic {} partition {}",
+            record.topic_name,
+            record.partition_id
+        );
+
+        Ok(offset)
+    }
+
     /// Load topic shadow configurations from database
     ///
     /// Queries kafka.shadow_config and populates the topic_cache.
@@ -604,12 +782,38 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
         let is_enabled = self.is_enabled();
         let is_primary = self.is_primary();
 
+        // Debug logging to trace shadow forwarding decisions
+        pgrx::log!(
+            "Shadow insert_records: topic_id={}, records={}, is_enabled={}, is_primary={}",
+            topic_id,
+            records.len(),
+            is_enabled,
+            is_primary
+        );
+
         if !is_enabled || !is_primary {
+            pgrx::log!(
+                "Shadow: skipping forwarding (enabled={}, primary={})",
+                is_enabled,
+                is_primary
+            );
             return self.inner.insert_records(topic_id, partition_id, records);
         }
 
         // Get topic configuration (if any)
         let topic_config = self.topic_cache.get(topic_id);
+        let has_config = topic_config.is_some();
+        let should_forward = topic_config
+            .as_ref()
+            .map(|c| c.should_forward())
+            .unwrap_or(false);
+
+        pgrx::log!(
+            "Shadow: topic_id={} has_config={} should_forward={}",
+            topic_id,
+            has_config,
+            should_forward
+        );
 
         // Determine write mode
         let write_mode = topic_config
@@ -617,6 +821,8 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
             .filter(|c| c.should_forward())
             .map(|c| c.write_mode)
             .unwrap_or(WriteMode::DualWrite); // No config = local only (DualWrite but no forward)
+
+        pgrx::log!("Shadow: write_mode={:?}", write_mode);
 
         match write_mode {
             WriteMode::DualWrite => {
@@ -626,13 +832,22 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
                 // Then forward to external (best-effort, doesn't affect return)
                 if let Some(config) = topic_config {
                     if config.should_forward() {
+                        pgrx::log!(
+                            "Shadow: forwarding {} records to external for topic_id={}",
+                            records.len(),
+                            topic_id
+                        );
                         self.forward_records_best_effort(
                             &config,
                             partition_id,
                             records,
                             base_offset,
                         );
+                    } else {
+                        pgrx::log!("Shadow: config exists but should_forward=false");
                     }
+                } else {
+                    pgrx::log!("Shadow: no topic config, skipping forward");
                 }
 
                 Ok(base_offset)
@@ -828,26 +1043,130 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
         producer_id: i64,
         producer_epoch: i16,
     ) -> Result<i64> {
-        // For transactional records, we always write locally first and forward on commit
-        // This is because transaction semantics require atomicity - we can't partially
-        // forward records from an uncommitted transaction
-        //
-        // Shadow forwarding for transactions happens in commit_transaction() instead
-        // (not yet implemented - would need to track pending records)
-        let base_offset = self.inner.insert_transactional_records(
-            topic_id,
-            partition_id,
-            records,
-            producer_id,
-            producer_epoch,
-        )?;
+        // Check if shadow forwarding should happen
+        let is_enabled = self.is_enabled();
+        let is_primary = self.is_primary();
 
-        tracing::trace!(
-            "ShadowStore: inserted {} transactional records to topic {} partition {} (forward on commit)",
-            records.len(),
-            topic_id,
-            partition_id
-        );
+        if !is_enabled || !is_primary {
+            // Shadow mode not enabled - just delegate to inner
+            return self.inner.insert_transactional_records(
+                topic_id,
+                partition_id,
+                records,
+                producer_id,
+                producer_epoch,
+            );
+        }
+
+        // Get topic configuration
+        let topic_config = self.topic_cache.get(topic_id);
+
+        // Determine write mode (default to DualWrite if no config)
+        let (write_mode, should_forward, topic_name) = match &topic_config {
+            Some(config) if config.should_forward() => {
+                (config.write_mode, true, config.topic_name.clone())
+            }
+            Some(config) => (WriteMode::DualWrite, false, config.topic_name.clone()),
+            None => (WriteMode::DualWrite, false, format!("topic-{}", topic_id)),
+        };
+
+        // Handle based on write mode
+        let base_offset = match write_mode {
+            WriteMode::DualWrite => {
+                // DualWrite: Write locally first, buffer for forwarding on commit
+                let offset = self.inner.insert_transactional_records(
+                    topic_id,
+                    partition_id,
+                    records,
+                    producer_id,
+                    producer_epoch,
+                )?;
+
+                // Buffer records for forwarding on commit (if should_forward)
+                if should_forward {
+                    let pending_records: Vec<PendingForwardRecord> = records
+                        .iter()
+                        .enumerate()
+                        .map(|(i, r)| PendingForwardRecord {
+                            topic_id,
+                            topic_name: topic_name.clone(),
+                            partition_id,
+                            offset: offset + i as i64,
+                            key: r.key.clone(),
+                            value: r.value.clone(),
+                            headers: r.headers.clone(),
+                            timestamp: r.timestamp,
+                            write_mode: WriteMode::DualWrite,
+                            written_locally: true,
+                        })
+                        .collect();
+
+                    let key = (producer_id, producer_epoch);
+                    let mut pending = self
+                        .pending_txn_messages
+                        .write()
+                        .expect("pending_txn_messages lock poisoned");
+                    pending.entry(key).or_default().extend(pending_records);
+
+                    tracing::trace!(
+                        "ShadowStore: buffered {} DualWrite txn records for topic {} partition {} (forward on commit)",
+                        records.len(),
+                        topic_id,
+                        partition_id
+                    );
+                }
+
+                offset
+            }
+
+            WriteMode::ExternalOnly => {
+                // ExternalOnly: Buffer in memory ONLY, don't write to PostgreSQL
+                // Records will be forwarded on commit, with fallback to local on failure
+                if should_forward {
+                    let pending_records: Vec<PendingForwardRecord> = records
+                        .iter()
+                        .map(|r| PendingForwardRecord {
+                            topic_id,
+                            topic_name: topic_name.clone(),
+                            partition_id,
+                            offset: -1, // Not written locally yet
+                            key: r.key.clone(),
+                            value: r.value.clone(),
+                            headers: r.headers.clone(),
+                            timestamp: r.timestamp,
+                            write_mode: WriteMode::ExternalOnly,
+                            written_locally: false,
+                        })
+                        .collect();
+
+                    let key = (producer_id, producer_epoch);
+                    let mut pending = self
+                        .pending_txn_messages
+                        .write()
+                        .expect("pending_txn_messages lock poisoned");
+                    pending.entry(key).or_default().extend(pending_records);
+
+                    tracing::trace!(
+                        "ShadowStore: buffered {} ExternalOnly txn records for topic {} partition {} (forward on commit)",
+                        records.len(),
+                        topic_id,
+                        partition_id
+                    );
+
+                    // Return synthetic offset (not stored locally)
+                    0
+                } else {
+                    // ExternalOnly but forwarding disabled - write locally
+                    self.inner.insert_transactional_records(
+                        topic_id,
+                        partition_id,
+                        records,
+                        producer_id,
+                        producer_epoch,
+                    )?
+                }
+            }
+        };
 
         Ok(base_offset)
     }
@@ -877,8 +1196,63 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
         producer_id: i64,
         producer_epoch: i16,
     ) -> Result<()> {
-        self.inner
-            .commit_transaction(transactional_id, producer_id, producer_epoch)
+        // 1. Get pending records BEFORE commit
+        let key = (producer_id, producer_epoch);
+        let pending_records = {
+            let mut pending = self
+                .pending_txn_messages
+                .write()
+                .expect("pending_txn_messages lock poisoned");
+            pending.remove(&key)
+        };
+
+        // 2. Separate records by write mode
+        let (dual_write_records, external_only_records): (Vec<_>, Vec<_>) = pending_records
+            .unwrap_or_default()
+            .into_iter()
+            .partition(|r| r.write_mode == WriteMode::DualWrite);
+
+        // 3. For DualWrite records: commit to PostgreSQL first (makes messages visible)
+        // Also commit if there are no external_only records (normal case)
+        let has_local_writes = !dual_write_records.is_empty() || external_only_records.is_empty();
+        if has_local_writes {
+            self.inner
+                .commit_transaction(transactional_id, producer_id, producer_epoch)?;
+        }
+
+        // 4. Forward DualWrite records (best effort, already committed locally)
+        for record in &dual_write_records {
+            self.forward_single_record(record);
+        }
+
+        if !dual_write_records.is_empty() {
+            tracing::debug!(
+                "Shadow txn commit: forwarded {} DualWrite records",
+                dual_write_records.len()
+            );
+        }
+
+        // 5. For ExternalOnly: forward first, fallback to local on failure
+        for record in external_only_records {
+            let forward_success = self.forward_single_record(&record);
+
+            if !forward_success {
+                // Fallback: write to PostgreSQL since external forward failed
+                tracing::warn!(
+                    "ExternalOnly forward failed for topic {}, falling back to local write",
+                    record.topic_name
+                );
+                if let Err(e) = self.write_fallback_record(&record, producer_id, producer_epoch) {
+                    tracing::error!(
+                        "ExternalOnly fallback write also failed for topic {}: {:?}",
+                        record.topic_name,
+                        e
+                    );
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn abort_transaction(
@@ -887,8 +1261,44 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
         producer_id: i64,
         producer_epoch: i16,
     ) -> Result<()> {
-        self.inner
-            .abort_transaction(transactional_id, producer_id, producer_epoch)
+        // 1. Get pending records to check if any were written locally
+        let key = (producer_id, producer_epoch);
+        let pending_records = {
+            let mut pending = self
+                .pending_txn_messages
+                .write()
+                .expect("pending_txn_messages lock poisoned");
+            pending.remove(&key)
+        };
+
+        // 2. Only call inner abort if we wrote to PostgreSQL (DualWrite records)
+        let has_local_writes = pending_records
+            .as_ref()
+            .map(|r| r.iter().any(|rec| rec.written_locally))
+            .unwrap_or(true); // Default to true if no pending records (normal abort path)
+
+        if has_local_writes {
+            self.inner
+                .abort_transaction(transactional_id, producer_id, producer_epoch)?;
+        }
+
+        // ExternalOnly records were never written locally, so just discard the buffer
+        // (already removed from pending_txn_messages above)
+
+        if let Some(records) = &pending_records {
+            let external_only_count = records
+                .iter()
+                .filter(|r| r.write_mode == WriteMode::ExternalOnly)
+                .count();
+            if external_only_count > 0 {
+                tracing::debug!(
+                    "Shadow txn abort: discarded {} ExternalOnly records (never written locally)",
+                    external_only_count
+                );
+            }
+        }
+
+        Ok(())
     }
 
     fn get_transaction_state(&self, transactional_id: &str) -> Result<Option<TransactionState>> {

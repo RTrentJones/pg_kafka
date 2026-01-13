@@ -105,10 +105,9 @@ impl ShadowProducer {
         // in all configurations (e.g., single-node KRaft clusters)
         client_config.set("enable.idempotence", "false");
 
-        // API version request - disable for compatibility with some brokers
-        client_config.set("api.version.request", "true");
-        client_config.set("api.version.fallback.ms", "0");
-        client_config.set("broker.version.fallback", "2.1.0");
+        // NOTE: Removed deprecated api.version.* settings that caused
+        // "Required feature not supported by broker" errors with modern Kafka.
+        // Modern librdkafka handles API negotiation automatically.
 
         // Request timeout and message timeout
         client_config.set("request.timeout.ms", "30000");
