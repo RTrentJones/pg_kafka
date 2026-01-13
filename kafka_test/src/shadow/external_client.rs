@@ -50,8 +50,10 @@ pub fn get_internal_bootstrap_servers() -> String {
 
     // Check if we're running in Docker (test process itself)
     // If tests run inside container, pg_kafka is also in container
+    // Use port 9093 (EXTERNAL listener) which works from all locations
+    // The INTERNAL listener (9094) is misconfigured in the Apache Kafka image
     if std::path::Path::new("/.dockerenv").exists() {
-        return "external-kafka:9094".to_string();
+        return "external-kafka:9093".to_string();
     }
 
     // Default: Assume host environment (local dev without docker-compose)

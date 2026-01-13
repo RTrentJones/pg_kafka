@@ -494,29 +494,34 @@ impl<S: KafkaStore> ShadowStore<S> {
 
             if let Ok(table) = result {
                 for row in table {
-                    let topic_id: i32 = row.get(1).unwrap_or(Some(0)).unwrap_or(0);
+                    // Use named columns for clarity and safety
+                    let topic_id: i32 = row.get_by_name("topic_id").unwrap_or(Some(0)).unwrap_or(0);
                     let topic_name: String = row
-                        .get(2)
+                        .get_by_name("name")
                         .unwrap_or(Some(String::new()))
                         .unwrap_or_default();
                     let mode_str: String = row
-                        .get(3)
+                        .get_by_name("mode")
                         .unwrap_or(Some("local_only".to_string()))
                         .unwrap_or_default();
-                    let forward_percentage: i32 = row.get(4).unwrap_or(Some(0)).unwrap_or(0);
-                    let external_topic_name: Option<String> = row.get(5).unwrap_or(None);
+                    let forward_percentage: i32 = row
+                        .get_by_name("forward_percentage")
+                        .unwrap_or(Some(0))
+                        .unwrap_or(0);
+                    let external_topic_name: Option<String> =
+                        row.get_by_name("external_topic_name").unwrap_or(None);
                     let sync_mode_str: String = row
-                        .get(6)
+                        .get_by_name("sync_mode")
                         .unwrap_or(Some("sync".to_string()))
                         .unwrap_or_default();
                     let write_mode_str: String = row
-                        .get(7)
+                        .get_by_name("write_mode")
                         .unwrap_or(Some("dual_write".to_string()))
                         .unwrap_or_default();
 
                     let config = TopicShadowConfig {
                         topic_id,
-                        topic_name,
+                        topic_name: topic_name.clone(),
                         mode: ShadowMode::parse(&mode_str),
                         forward_percentage: forward_percentage.clamp(0, 100) as u8,
                         external_topic_name,

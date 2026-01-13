@@ -98,18 +98,24 @@ impl ShadowProducer {
         client_config.set("retry.backoff.ms", config.retry_backoff_ms.to_string());
         client_config.set("retries", config.max_retries.to_string());
 
-        // Compression (match pg_kafka's compression setting)
-        client_config.set("compression.type", "zstd");
+        // Compression (use none for maximum compatibility)
+        client_config.set("compression.type", "none");
 
-        // Idempotent producer for exactly-once semantics
-        client_config.set("enable.idempotence", "true");
+        // Disable idempotent producer - external Kafka may not support it
+        // in all configurations (e.g., single-node KRaft clusters)
+        client_config.set("enable.idempotence", "false");
+
+        // API version request - disable for compatibility with some brokers
+        client_config.set("api.version.request", "true");
+        client_config.set("api.version.fallback.ms", "0");
+        client_config.set("broker.version.fallback", "2.1.0");
 
         // Request timeout and message timeout
         client_config.set("request.timeout.ms", "30000");
         client_config.set("message.timeout.ms", "120000");
 
-        // Acknowledgments (wait for all replicas)
-        client_config.set("acks", "all");
+        // Acknowledgments (use 1 for single-node compatibility)
+        client_config.set("acks", "1");
 
         // Create the producer
         client_config
