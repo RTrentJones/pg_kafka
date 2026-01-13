@@ -6,20 +6,37 @@ This document describes how to set up and run the shadow mode E2E tests in the d
 
 - Docker and docker-compose
 - The devcontainer running (`pg_kafka_dev`)
-- External Kafka container running (`external_kafka`)
 
 ## Quick Start
 
 From inside the devcontainer, run:
 
 ```bash
-# Full setup and test run
+# Full setup and test run (starts Docker, builds, configures, runs tests)
 ./scripts/run-shadow-tests.sh
 
 # Or run individual steps:
-./scripts/run-shadow-tests.sh --setup-only    # Just setup, don't run tests
+./scripts/run-shadow-tests.sh --setup-only    # Setup only (Docker + PostgreSQL + build)
 ./scripts/run-shadow-tests.sh --test-only     # Just run tests (assumes setup done)
+./scripts/run-shadow-tests.sh --docker-only   # Just start Docker containers
+./scripts/run-shadow-tests.sh --skip-docker   # Skip Docker, just setup PostgreSQL
+
+# Run a specific test
+./scripts/run-shadow-tests.sh --test test_dual_write_sync
 ```
+
+## What the Script Does
+
+1. **Start Docker containers** - Starts `external_kafka` if not running
+2. **Build pg_kafka extension** - Compiles with `cargo build --features pg14`
+3. **Restart PostgreSQL** - Uses `./restart.sh` to load the extension
+4. **Configure GUCs** - Sets all shadow mode PostgreSQL parameters:
+   - `pg_kafka.shadow_mode_enabled = 'true'`
+   - `pg_kafka.shadow_bootstrap_servers = '<kafka_ip>:9095'`
+   - `pg_kafka.shadow_security_protocol = 'PLAINTEXT'`
+   - `pg_kafka.shadow_config_reload_interval_ms = '2000'`
+5. **Build test client** - Compiles `kafka_test` in release mode
+6. **Run tests** - Executes shadow mode test category
 
 ## Network Architecture
 
