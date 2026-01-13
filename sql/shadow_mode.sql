@@ -1,3 +1,12 @@
+-- Copyright (c) 2026 Robert Trent Jones.
+-- This file is part of the "Shadow Mode" feature of pg_kafka.
+--
+-- Use of this source code for production purposes is governed by the
+-- Commercial License found in src/kafka/shadow/LICENSE.
+-- Development and evaluation use is permitted.
+--
+-- GitHub Sponsors: https://github.com/sponsors/RTrentJones
+
 -- =============================================================================
 -- Phase 11: Shadow Mode
 -- Enables forwarding messages to an external Kafka cluster for gradual migration

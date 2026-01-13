@@ -1,3 +1,10 @@
+NOTE: This license (MIT) applies to the pg_kafka project EXCEPT for the
+Shadow Mode feature located in src/kafka/shadow/ and sql/shadow_mode.sql,
+which are governed by a separate commercial license.
+See src/kafka/shadow/LICENSE for details.
+
+---
+
 MIT License
 
 Copyright (c) 2025 Robert Trent Jones

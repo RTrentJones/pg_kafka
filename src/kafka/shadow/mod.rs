@@ -1,3 +1,12 @@
+// Copyright (c) 2026 Robert Trent Jones.
+// This file is part of the "Shadow Mode" feature of pg_kafka.
+//
+// Use of this source code for production purposes is governed by the
+// Commercial License found in the LICENSE file in this directory.
+// Development and evaluation use is permitted.
+//
+// GitHub Sponsors: https://github.com/sponsors/RTrentJones
+
 //! Shadow Mode Module (Phase 11)
 //!
 //! This module provides shadow mode functionality for forwarding messages to an
@@ -42,6 +51,7 @@
 pub mod config;
 pub mod error;
 pub mod forwarder;
+pub mod license;
 pub mod primary;
 pub mod producer;
 pub mod replay;
@@ -62,6 +72,9 @@ pub use producer::{ShadowProducer, ShadowProducerBuilder};
 pub use replay::{ReplayEngine, ReplayProgress, ReplayRequest, ReplayResult};
 pub use routing::{compute_routing_hash, make_forward_decision};
 pub use store::{ShadowMetrics, ShadowStore};
+
+// License validation (Commercial License)
+pub use license::{LicenseStatus, LicenseValidator};
 
 /// Message sent from DB thread to network thread for async forwarding
 ///

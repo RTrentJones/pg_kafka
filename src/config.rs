@@ -94,6 +94,9 @@ pub struct Config {
     pub shadow_metrics_enabled: bool,
     /// OpenTelemetry OTLP endpoint for shadow tracing
     pub shadow_otel_endpoint: String,
+    /// License key for Shadow Mode production use (Commercial License)
+    /// Format: "sponsor_id:signature" or "eval" for evaluation
+    pub shadow_license_key: String,
 }
 
 impl Config {
@@ -170,6 +173,12 @@ impl Config {
                 .as_deref()
                 .map(|c| c.to_string_lossy().into_owned())
                 .unwrap_or_else(|| DEFAULT_SHADOW_OTEL_ENDPOINT.to_string()),
+            // License key (Commercial License)
+            shadow_license_key: SHADOW_LICENSE_KEY
+                .get()
+                .as_deref()
+                .map(|c| c.to_string_lossy().into_owned())
+                .unwrap_or_default(),
         }
     }
 
@@ -202,6 +211,8 @@ impl Config {
             shadow_default_sync_mode: DEFAULT_SHADOW_SYNC_MODE.to_string(),
             shadow_metrics_enabled: DEFAULT_SHADOW_METRICS_ENABLED,
             shadow_otel_endpoint: DEFAULT_SHADOW_OTEL_ENDPOINT.to_string(),
+            // Tests run in eval mode by default (Commercial License)
+            shadow_license_key: "eval".to_string(),
         }
     }
 }
@@ -245,6 +256,8 @@ static SHADOW_DEFAULT_SYNC_MODE: GucSetting<Option<CString>> =
 static SHADOW_METRICS_ENABLED: GucSetting<bool> =
     GucSetting::<bool>::new(DEFAULT_SHADOW_METRICS_ENABLED);
 static SHADOW_OTEL_ENDPOINT: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
+// License key for Shadow Mode (Commercial License)
+static SHADOW_LICENSE_KEY: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 pub static CONFIG_RELOAD_INTERVAL_MS: GucSetting<i32> =
     GucSetting::<i32>::new(DEFAULT_CONFIG_RELOAD_MS);
 
@@ -482,6 +495,16 @@ pub fn init() {
         &SHADOW_OTEL_ENDPOINT,
         GucContext::Suset,
         GucFlags::default(),
+    );
+
+    // Shadow Mode License Key (Commercial License)
+    GucRegistry::define_string_guc(
+        c"pg_kafka.shadow_license_key",
+        c"License key for Shadow Mode production use",
+        c"Format: 'sponsor_id:signature' or 'eval' for evaluation. Obtain from https://github.com/sponsors/RTrentJones",
+        &SHADOW_LICENSE_KEY,
+        GucContext::Postmaster, // Requires restart
+        GucFlags::NO_SHOW_ALL | GucFlags::SUPERUSER_ONLY,
     );
 
     GucRegistry::define_int_guc(

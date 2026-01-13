@@ -180,6 +180,8 @@ pub fn mock_config() -> crate::config::Config {
         shadow_default_sync_mode: DEFAULT_SHADOW_SYNC_MODE.to_string(),
         shadow_metrics_enabled: DEFAULT_SHADOW_METRICS_ENABLED,
         shadow_otel_endpoint: DEFAULT_SHADOW_OTEL_ENDPOINT.to_string(),
+        // Tests run in eval mode by default (Commercial License)
+        shadow_license_key: "eval".to_string(),
     }
 }
 

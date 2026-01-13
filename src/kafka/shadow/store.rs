@@ -1,3 +1,12 @@
+// Copyright (c) 2026 Robert Trent Jones.
+// This file is part of the "Shadow Mode" feature of pg_kafka.
+//
+// Use of this source code for production purposes is governed by the
+// Commercial License found in the LICENSE file in this directory.
+// Development and evaluation use is permitted.
+//
+// GitHub Sponsors: https://github.com/sponsors/RTrentJones
+
 //! ShadowStore - KafkaStore wrapper with shadow forwarding
 //!
 //! This module provides a KafkaStore implementation that wraps another store
@@ -36,6 +45,7 @@
 
 use super::config::{ShadowConfig, SyncMode, TopicConfigCache, TopicShadowConfig, WriteMode};
 use super::forwarder::ForwardDecision;
+use super::license::LicenseValidator;
 use super::primary::PrimaryStatus;
 use super::producer::ShadowProducer;
 use super::routing::make_forward_decision;
@@ -142,6 +152,8 @@ pub struct ShadowStore<S: KafkaStore> {
     forward_tx: RwLock<Option<crossbeam_channel::Sender<ForwardRequest>>>,
     /// Pending transactional records awaiting commit for shadow forwarding
     pending_txn_messages: PendingTxnMessages,
+    /// License validator for shadow mode (Commercial License)
+    license: RwLock<Option<LicenseValidator>>,
 }
 
 impl<S: KafkaStore> ShadowStore<S> {
@@ -163,6 +175,7 @@ impl<S: KafkaStore> ShadowStore<S> {
             metrics: ShadowMetrics::new(),
             forward_tx: RwLock::new(None),
             pending_txn_messages: Arc::new(RwLock::new(HashMap::new())),
+            license: RwLock::new(None),
         }
     }
 
@@ -187,6 +200,20 @@ impl<S: KafkaStore> ShadowStore<S> {
     pub fn set_forward_channel(&self, tx: crossbeam_channel::Sender<ForwardRequest>) {
         let mut guard = self.forward_tx.write().expect("forward_tx lock poisoned");
         *guard = Some(tx);
+    }
+
+    /// Set license key and initialize validator (Commercial License)
+    pub fn set_license_key(&self, license_key: &str) {
+        let validator = LicenseValidator::new(license_key);
+        let mut guard = self.license.write().expect("license lock poisoned");
+        *guard = Some(validator);
+    }
+
+    /// Check license and emit rate-limited warnings if shadow mode is active
+    fn check_license(&self) {
+        if let Some(ref validator) = *self.license.read().expect("license lock poisoned") {
+            validator.check_and_warn();
+        }
     }
 
     /// Get the topic configuration cache
@@ -370,6 +397,9 @@ impl<S: KafkaStore> ShadowStore<S> {
         records: &[Record],
         base_offset: i64,
     ) {
+        // Check license (Commercial License) - emits rate-limited warnings
+        self.check_license();
+
         let external_topic = topic_config.effective_external_topic();
 
         match topic_config.sync_mode {
@@ -495,6 +525,9 @@ impl<S: KafkaStore> ShadowStore<S> {
         partition_id: i32,
         records: &[Record],
     ) -> bool {
+        // Check license (Commercial License) - emits rate-limited warnings
+        self.check_license();
+
         let producer = match self.ensure_producer() {
             Some(p) => p,
             None => {

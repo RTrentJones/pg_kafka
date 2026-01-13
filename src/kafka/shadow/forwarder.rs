@@ -1,3 +1,12 @@
+// Copyright (c) 2026 Robert Trent Jones.
+// This file is part of the "Shadow Mode" feature of pg_kafka.
+//
+// Use of this source code for production purposes is governed by the
+// Commercial License found in the LICENSE file in this directory.
+// Development and evaluation use is permitted.
+//
+// GitHub Sponsors: https://github.com/sponsors/RTrentJones
+
 //! Shadow mode message forwarder
 //!
 //! This module handles the decision and execution of forwarding messages to

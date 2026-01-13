@@ -203,6 +203,9 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
         ShadowStore::with_context(PostgresStore::new(), runtime_context.clone()),
     );
 
+    // Set license key for shadow mode (Commercial License)
+    shadow_store.set_license_key(&config.shadow_license_key);
+
     if config.shadow_mode_enabled {
         log!(
             "Shadow mode enabled, configured to forward to: {}",
