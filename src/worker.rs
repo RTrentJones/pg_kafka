@@ -403,6 +403,9 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
         });
     }
 
+    // Flag to track if SIGHUP was received (triggers immediate config reload)
+    let mut sighup_pending = false;
+
     loop {
         // ┌─────────────────────────────────────────────────────────────┐
         // │ Check for Postgres Shutdown Signal                          │
@@ -428,6 +431,18 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
             }
 
             break;
+        }
+
+        // ┌─────────────────────────────────────────────────────────────┐
+        // │ Check for SIGHUP (Config Reload Signal)                     │
+        // └─────────────────────────────────────────────────────────────┘
+        // When pg_reload_conf() is called, we receive SIGHUP. This triggers
+        // an immediate config reload on the next loop iteration, bypassing
+        // the normal reload_interval check. This is critical for tests that
+        // change GUCs and need the changes to take effect immediately.
+        if BackgroundWorker::sighup_received() {
+            sighup_pending = true;
+            pg_log!("SIGHUP received, config reload pending");
         }
 
         // ┌─────────────────────────────────────────────────────────────┐
@@ -575,10 +590,29 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
         // This allows configuration changes to take effect without restarting Postgres.
         // PostMasterContext GUCs (port, host) still require restart.
 
+        // Reload config either on schedule OR immediately after SIGHUP
         let reload_interval_ms = crate::config::CONFIG_RELOAD_INTERVAL_MS.get();
         let reload_interval = Duration::from_millis(reload_interval_ms as u64);
-        if last_config_reload.elapsed() >= reload_interval {
-            // 1. Reload GUCs
+        let should_reload = sighup_pending || last_config_reload.elapsed() >= reload_interval;
+
+        if should_reload {
+            if sighup_pending {
+                pg_log!(
+                    "Immediate config reload triggered by SIGHUP (interval={}ms)",
+                    reload_interval_ms
+                );
+                sighup_pending = false;
+
+                // CRITICAL: Call ProcessConfigFile to actually reload GUC values
+                // Without this, GUC changes made via ALTER SYSTEM won't take effect
+                // in this background worker. This is the standard PostgreSQL pattern.
+                unsafe {
+                    pgrx::pg_sys::ProcessConfigFile(pgrx::pg_sys::GucContext::PGC_SIGHUP);
+                }
+                pg_log!("ProcessConfigFile called, GUCs reloaded from postgresql.auto.conf");
+            }
+
+            // 1. Reload GUCs (update RuntimeContext cache)
             runtime_context.reload();
             pg_log!("Reloaded GUC configuration");
 
@@ -588,9 +622,7 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
                 // Reload topic shadow configurations
                 match shadow_reload.load_topic_config_from_db() {
                     Ok(count) => {
-                        if count > 0 {
-                            pg_log!("Reloaded {} shadow topic configurations", count);
-                        }
+                        pg_log!("Reloaded {} shadow topic configurations", count);
                     }
                     Err(e) => {
                         pg_warning!("Failed to reload shadow config: {:?}", e);

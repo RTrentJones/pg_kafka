@@ -136,11 +136,13 @@ start_docker() {
         $COMPOSE_CMD up -d external-kafka
     fi
 
-    # Wait for Kafka to be healthy
+    # Wait for Kafka to be healthy (two-phase check)
     echo "Waiting for Kafka to be healthy..."
+
+    # Phase 1: Wait for broker API to be available
     for i in {1..60}; do
         if docker exec external_kafka /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9093 >/dev/null 2>&1; then
-            echo -e "${GREEN}✓ Kafka is healthy${NC}"
+            echo -e "${GREEN}✓ Kafka broker API available${NC}"
             break
         fi
         if [ $i -eq 60 ]; then
@@ -149,6 +151,43 @@ start_docker() {
             exit 1
         fi
         echo -n "."
+        sleep 1
+    done
+
+    # Phase 2: Verify Kafka can handle topic metadata requests
+    # This ensures Kafka is fully initialized and can accept producer connections
+    echo "Verifying Kafka can handle metadata requests..."
+    for i in {1..30}; do
+        if docker exec external_kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9093 --list >/dev/null 2>&1; then
+            echo -e "${GREEN}✓ Kafka metadata requests working${NC}"
+            break
+        fi
+        if [ $i -eq 30 ]; then
+            echo -e "${YELLOW}WARNING: Kafka metadata check timed out, continuing anyway...${NC}"
+            break
+        fi
+        echo -n "."
+        sleep 1
+    done
+
+    # Phase 3: Verify topic creation capability (critical for fresh Kafka starts)
+    # This ensures auto-creation works before tests run
+    echo "Verifying topic creation capability..."
+    TEST_TOPIC="__pg_kafka_health_check"
+    docker exec external_kafka /opt/kafka/bin/kafka-topics.sh \
+        --bootstrap-server localhost:9093 \
+        --create --topic "$TEST_TOPIC" --partitions 1 --replication-factor 1 \
+        --if-not-exists >/dev/null 2>&1 || true
+
+    for i in {1..10}; do
+        if docker exec external_kafka /opt/kafka/bin/kafka-topics.sh \
+            --bootstrap-server localhost:9093 --list 2>/dev/null | grep -q "$TEST_TOPIC"; then
+            echo -e "${GREEN}✓ Kafka fully operational (topic creation verified)${NC}"
+            break
+        fi
+        if [ $i -eq 10 ]; then
+            echo -e "${YELLOW}WARNING: Topic creation verification timed out${NC}"
+        fi
         sleep 1
     done
     echo ""
@@ -181,7 +220,7 @@ setup_postgresql() {
     echo -e "${YELLOW}=== Step 3: Restart PostgreSQL ===${NC}"
 
     # Use restart.sh which handles stopping, starting, and schema creation
-    ./restart.sh
+    ./scripts/restart.sh
     echo -e "${GREEN}✓ PostgreSQL restarted${NC}"
     echo ""
 
@@ -211,13 +250,22 @@ setup_postgresql() {
     $PSQL_CMD -c "ALTER SYSTEM SET pg_kafka.shadow_mode_enabled = 'true';"
     $PSQL_CMD -c "ALTER SYSTEM SET pg_kafka.shadow_bootstrap_servers = '${KAFKA_IP}:9095';"
     $PSQL_CMD -c "ALTER SYSTEM SET pg_kafka.shadow_security_protocol = 'PLAINTEXT';"
+    $PSQL_CMD -c "ALTER SYSTEM SET pg_kafka.shadow_max_retries = '20';"
+    $PSQL_CMD -c "ALTER SYSTEM SET pg_kafka.shadow_retry_backoff_ms = '500';"
 
     # Config reload settings (fast reload for tests)
-    $PSQL_CMD -c "ALTER SYSTEM SET pg_kafka.shadow_config_reload_interval_ms = '2000';"
+    # Note: Only config_reload_interval_ms exists; shadow_config_reload_interval_ms was removed
     $PSQL_CMD -c "ALTER SYSTEM SET pg_kafka.config_reload_interval_ms = '2000';"
 
-    # Reload configuration
+    # Reload configuration - this sends SIGHUP to the worker which triggers
+    # immediate config reload, picking up the new GUC values
     $PSQL_CMD -c "SELECT pg_reload_conf();"
+
+    # Wait for SIGHUP to be processed by the background worker
+    # The worker checks every 100ms, so 1 second is plenty
+    echo "⏳ Waiting for SIGHUP processing (1s)..."
+    sleep 1
+    echo "✅ Config reload interval now set to 2s"
 
     echo ""
     echo "Current shadow mode configuration:"

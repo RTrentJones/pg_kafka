@@ -71,35 +71,14 @@ impl TestContext {
 
     /// Manually trigger cleanup (also called automatically on drop)
     pub async fn cleanup(&self) -> TestResult {
-        // Reset shadow mode GUCs (test isolation)
-        // Use best-effort (ignore errors) since cleanup should be robust
-        let _ = self
-            .db_client
-            .execute("ALTER SYSTEM RESET pg_kafka.shadow_mode_enabled", &[])
-            .await;
-
-        let _ = self
-            .db_client
-            .execute("ALTER SYSTEM RESET pg_kafka.shadow_bootstrap_servers", &[])
-            .await;
-
-        let _ = self
-            .db_client
-            .execute("ALTER SYSTEM RESET pg_kafka.shadow_security_protocol", &[])
-            .await;
-
-        let _ = self
-            .db_client
-            .execute(
-                "ALTER SYSTEM RESET pg_kafka.config_reload_interval_ms",
-                &[],
-            )
-            .await;
-
-        // Reload config (best-effort)
-        let _ = self.db_client.execute("SELECT pg_reload_conf()", &[]).await;
-
-        // No need to wait here - next test will wait during setup
+        // NOTE: We intentionally do NOT reset shadow mode GUCs here.
+        // Resetting GUCs between tests causes race conditions where the SIGHUP
+        // from the reset arrives while the next test is setting up, causing
+        // shadow_mode_enabled to be false when the test expects it to be true.
+        //
+        // Instead, each test sets the GUCs it needs via enable_shadow_mode(),
+        // and the per-topic shadow_config table controls forwarding behavior.
+        // Tests that don't need shadow mode simply don't insert shadow_config rows.
 
         let topics = self.topics_created.lock().await;
         let groups = self.groups_created.lock().await;

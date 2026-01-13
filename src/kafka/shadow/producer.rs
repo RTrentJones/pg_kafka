@@ -236,6 +236,26 @@ impl ShadowProducer {
 
         Ok(())
     }
+
+    /// Check if the producer can communicate with Kafka (sync version)
+    ///
+    /// Returns true if metadata fetch succeeds, false otherwise.
+    /// Uses a short timeout (5s) to avoid blocking too long on unhealthy connections.
+    /// This is called from ensure_producer() to detect stale connections after
+    /// network failures or broker restarts.
+    pub fn is_healthy(&self) -> bool {
+        // Use a short timeout to avoid blocking too long
+        let timeout = Duration::from_secs(5);
+
+        // Try to fetch metadata - this verifies broker connectivity
+        match self.producer.client().fetch_metadata(None, timeout) {
+            Ok(metadata) => {
+                // Check that we have at least one broker
+                !metadata.brokers().is_empty()
+            }
+            Err(_) => false,
+        }
+    }
 }
 
 impl std::fmt::Debug for ShadowProducer {

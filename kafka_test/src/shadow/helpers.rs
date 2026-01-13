@@ -13,8 +13,9 @@ static SHADOW_SETUP_DONE: AtomicBool = AtomicBool::new(false);
 
 /// Shadow mode test suite setup - call once before running shadow tests
 ///
-/// This sets the config reload interval to 2 seconds and waits for the initial
-/// 30-second reload cycle. After this, all tests can use the fast 2-second interval.
+/// This sets the config reload interval to 2 seconds. With SIGHUP handling in the
+/// background worker, the config change takes effect immediately when pg_reload_conf()
+/// is called, so we only need a short wait for the SIGHUP to be processed.
 pub async fn shadow_test_setup(db: &Client) -> TestResult {
     if SHADOW_SETUP_DONE.load(Ordering::Acquire) {
         // Setup already done
@@ -22,7 +23,7 @@ pub async fn shadow_test_setup(db: &Client) -> TestResult {
     }
 
     println!("=== Shadow Test Suite Setup ===");
-    println!("Setting fast config reload interval (2s) and waiting for initial reload...");
+    println!("Setting fast config reload interval (2s)...");
 
     // Set fast reload interval
     db.execute(
@@ -31,14 +32,14 @@ pub async fn shadow_test_setup(db: &Client) -> TestResult {
     )
     .await?;
 
-    // Reload configuration
+    // Reload configuration - this sends SIGHUP to the worker which triggers
+    // immediate config reload, picking up the new 2s interval
     db.execute("SELECT pg_reload_conf()", &[]).await?;
 
-    // Wait for initial 30s reload cycle (worker picks up new 2s interval)
-    println!("⏳ Waiting for initial config reload (30s)...");
-    tokio::time::sleep(std::time::Duration::from_millis(31000)).await;
-    println!("✅ Config reload interval now set to 2s");
-    println!("✅ Subsequent tests will reload in ~2s\n");
+    // Wait for SIGHUP to be processed (worker checks every 100ms)
+    println!("⏳ Waiting for SIGHUP processing (500ms)...");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    println!("✅ Config reload interval now set to 2s\n");
 
     SHADOW_SETUP_DONE.store(true, Ordering::Release);
     Ok(())
@@ -123,13 +124,8 @@ pub async fn enable_shadow_mode(
     )
     .await?;
 
-    // Reload configuration so background worker sees new GUCs
-    println!("  Reloading PostgreSQL configuration...");
-    db.execute("SELECT pg_reload_conf()", &[]).await?;
-
-    // Wait for GUC reload to propagate (pg_reload_conf is async)
-    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-
+    // IMPORTANT: Insert shadow config INTO DATABASE FIRST, BEFORE calling pg_reload_conf()
+    // This ensures the config is visible when the worker reloads on SIGHUP
     let mode_str = match config.mode {
         ShadowMode::LocalOnly => "local_only",
         ShadowMode::Shadow => "shadow",
@@ -143,6 +139,7 @@ pub async fn enable_shadow_mode(
         WriteMode::ExternalOnly => "external_only",
     };
 
+    println!("  Inserting shadow config for topic_id={}...", topic_id);
     db.execute(
         r#"
         INSERT INTO kafka.shadow_config
@@ -167,11 +164,19 @@ pub async fn enable_shadow_mode(
     )
     .await?;
 
-    // Wait for config reload (shadow_test_setup already did the initial 30s wait)
-    // Worker is now using the fast 2s reload interval
-    println!("⏳ Waiting for config reload cycle (2s + 1s buffer = 3s)...");
-    tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
-    println!("✅ Config should be reloaded");
+    // NOW reload configuration - this sends SIGHUP to the worker which triggers
+    // immediate config reload (including the shadow config we just inserted)
+    println!("  Reloading PostgreSQL configuration (triggers SIGHUP)...");
+    db.execute("SELECT pg_reload_conf()", &[]).await?;
+
+    // Wait for SIGHUP to be processed (worker checks every 100ms)
+    // 500ms is plenty of time for the worker to:
+    // 1. Receive SIGHUP
+    // 2. Process the pending flag
+    // 3. Reload GUCs and shadow config from database
+    println!("⏳ Waiting for SIGHUP processing (500ms)...");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    println!("✅ Shadow config should be loaded");
 
     Ok(())
 }

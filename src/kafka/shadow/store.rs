@@ -115,7 +115,8 @@ impl ShadowMetrics {
 }
 
 /// Default timeout for sync forwards (milliseconds)
-const DEFAULT_FORWARD_TIMEOUT_MS: u64 = 30_000;
+/// 60 seconds to handle fresh Kafka broker topic auto-creation
+const DEFAULT_FORWARD_TIMEOUT_MS: u64 = 60_000;
 
 /// A KafkaStore wrapper that adds shadow mode forwarding
 ///
@@ -258,14 +259,20 @@ impl<S: KafkaStore> ShadowStore<S> {
                 // Check if config has changed
                 if let Some(ref cached_bs) = *bs_guard {
                     if cached_bs == &config.bootstrap_servers {
-                        return Some(producer.clone());
+                        // Verify cached producer is healthy before returning
+                        if producer.is_healthy() {
+                            return Some(producer.clone());
+                        }
+                        // Producer unhealthy, fall through to recreate
+                        pgrx::log!("Shadow: cached producer unhealthy, recreating");
+                    } else {
+                        // Config changed - need to recreate producer
+                        pgrx::log!(
+                            "Shadow: bootstrap_servers changed from '{}' to '{}', recreating producer",
+                            cached_bs,
+                            config.bootstrap_servers
+                        );
                     }
-                    // Config changed - need to recreate producer
-                    pgrx::log!(
-                        "Shadow: bootstrap_servers changed from '{}' to '{}', recreating producer",
-                        cached_bs,
-                        config.bootstrap_servers
-                    );
                 }
             }
         }
@@ -280,7 +287,7 @@ impl<S: KafkaStore> ShadowStore<S> {
         // Double-check after acquiring write lock
         if let Some(ref producer) = *guard {
             if let Some(ref cached_bs) = *bs_guard {
-                if cached_bs == &config.bootstrap_servers {
+                if cached_bs == &config.bootstrap_servers && producer.is_healthy() {
                     return Some(producer.clone());
                 }
             }
@@ -455,7 +462,7 @@ impl<S: KafkaStore> ShadowStore<S> {
                                 record.value.as_deref(),
                                 DEFAULT_FORWARD_TIMEOUT_MS,
                             ) {
-                                tracing::warn!(
+                                pgrx::warning!(
                                     "Shadow forward FAILED for {}[{}] offset {}: {:?}",
                                     external_topic,
                                     partition_id,
@@ -506,8 +513,8 @@ impl<S: KafkaStore> ShadowStore<S> {
                 record.value.as_deref(),
                 DEFAULT_FORWARD_TIMEOUT_MS,
             ) {
-                tracing::warn!(
-                    "External write failed for {}[{}]: {:?}",
+                pgrx::warning!(
+                    "Shadow external write failed for {}[{}]: {:?}",
                     external_topic,
                     partition_id,
                     e

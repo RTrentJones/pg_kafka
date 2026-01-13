@@ -34,9 +34,10 @@ From inside the devcontainer, run:
    - `pg_kafka.shadow_mode_enabled = 'true'`
    - `pg_kafka.shadow_bootstrap_servers = '<kafka_ip>:9095'`
    - `pg_kafka.shadow_security_protocol = 'PLAINTEXT'`
-   - `pg_kafka.shadow_config_reload_interval_ms = '2000'`
-5. **Build test client** - Compiles `kafka_test` in release mode
-6. **Run tests** - Executes shadow mode test category
+   - `pg_kafka.config_reload_interval_ms = '2000'`
+5. **Wait for config propagation** - Waits 31 seconds for the background worker to pick up the fast reload interval
+6. **Build test client** - Compiles `kafka_test` in release mode
+7. **Run tests** - Executes shadow mode test category
 
 ## Network Architecture
 
