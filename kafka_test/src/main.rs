@@ -44,6 +44,9 @@ use std::time::Instant;
 use kafka_test::{
     // Shadow mode tests (Phase 11)
     test_aborted_transaction_not_forwarded,
+    // Transaction atomicity tests
+    test_abort_transaction_discards_pending_offsets,
+    test_add_partitions_to_txn_idempotent,
     // Edge case tests
     test_batch_1000_messages,
     // Producer tests
@@ -64,6 +67,8 @@ use kafka_test::{
     // Concurrent tests
     test_concurrent_producers_different_partitions,
     test_concurrent_producers_same_topic,
+    test_concurrent_transactions_same_producer,
+    test_coordinator_state_race,
     // Negative tests
     test_connection_refused,
     test_consume_empty_partition,
@@ -109,32 +114,59 @@ use kafka_test::{
     test_fetch_uncommitted_offset,
     test_fetch_unknown_topic,
     test_fifty_percent_forwarding,
+    // Coordinator state tests
+    test_find_coordinator_bootstrap,
+    test_group_rejoin_race,
+    test_group_state_transitions,
+    // Rebalancing edge case tests
     test_heartbeat_after_leave,
+    test_heartbeat_during_rebalance_window,
+    test_heartbeat_keeps_membership,
     test_high_offset_values,
     test_hundred_percent_forwarding,
     // Idempotent producer tests
+    test_idempotent_concurrent_producers,
+    test_idempotent_high_sequence,
+    test_idempotent_multi_partition,
     test_idempotent_producer_basic,
+    test_idempotent_producer_epoch_bump,
+    test_idempotent_producer_restart,
     test_invalid_group_id,
     // Partition tests
     test_key_distribution,
     test_key_routing_deterministic,
     test_large_message_key,
+    test_leave_during_rebalance,
     test_large_message_value,
     test_list_offsets_empty_topic,
     test_local_only_mode,
     // Long polling tests
+    test_long_poll_auto_commit_interval,
+    test_long_poll_consumer_disconnect,
     test_long_poll_immediate_return,
+    test_long_poll_min_bytes_threshold,
+    test_long_poll_multiple_consumers_same_partition,
     test_long_poll_multiple_waiters,
     test_long_poll_producer_wakeup,
     test_long_poll_timeout,
+    test_long_poll_timeout_precision,
     test_multi_partition_produce,
+    test_multiple_concurrent_timeouts,
     test_multiple_consumer_groups,
     test_multiple_consumers_same_group,
     test_null_key_distribution,
     // Offset management tests
+    test_fetch_offset_new_group,
     test_offset_boundaries,
     test_offset_commit_fetch,
+    test_offset_commit_multi_partition,
+    test_offset_commit_race,
+    test_offset_commit_with_metadata,
+    test_offset_reset_policy,
+    test_offset_seek,
     test_offset_zero_boundary,
+    test_partition_assignment_race,
+    test_partition_assignment_strategies,
     test_partition_zero,
     test_produce_any_partition,
     test_produce_empty_batch,
@@ -142,14 +174,19 @@ use kafka_test::{
     test_produce_large_key,
     test_produce_throughput_baseline,
     test_produce_timeout,
+    test_produce_consume_race,
     test_produce_while_consuming,
     test_producer,
     // Transaction tests
     test_producer_fencing,
+    test_producer_fencing_mid_transaction,
+    test_rapid_rebalance_cycles,
     test_read_committed_after_commit,
     test_read_committed_filters_pending,
     test_read_uncommitted_sees_pending,
     test_rebalance_after_leave,
+    test_rebalance_mixed_timeout_values,
+    test_rebalance_with_minimal_session_timeout,
     test_rejoin_after_leave,
     test_replay_historical_messages,
     // Pipelining tests
@@ -157,11 +194,15 @@ use kafka_test::{
     test_session_timeout_rebalance,
     test_single_partition_topic,
     test_topic_name_mapping,
+    test_transaction_boundary_isolation,
+    test_transaction_partial_failure_atomicity,
+    test_transaction_timeout_auto_abort,
     test_transactional_batch,
     test_transactional_producer_abort,
     test_transactional_producer_commit,
     test_true_deduplication_manual_replay,
     test_txn_offset_commit,
+    test_txn_offset_commit_visibility_timing,
     test_zero_percent_forwarding,
 };
 
@@ -353,6 +394,37 @@ fn get_all_tests() -> Vec<TestDef> {
             test_fn: wrap_test!(test_offset_boundaries),
             parallel_safe: true,
         },
+        // Offset management edge case tests
+        TestDef {
+            category: "offset_management",
+            name: "test_offset_commit_with_metadata",
+            test_fn: wrap_test!(test_offset_commit_with_metadata),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "offset_management",
+            name: "test_fetch_offset_new_group",
+            test_fn: wrap_test!(test_fetch_offset_new_group),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "offset_management",
+            name: "test_offset_reset_policy",
+            test_fn: wrap_test!(test_offset_reset_policy),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "offset_management",
+            name: "test_offset_commit_multi_partition",
+            test_fn: wrap_test!(test_offset_commit_multi_partition),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "offset_management",
+            name: "test_offset_seek",
+            test_fn: wrap_test!(test_offset_seek),
+            parallel_safe: true,
+        },
         // Consumer group tests
         TestDef {
             category: "consumer_group",
@@ -371,6 +443,68 @@ fn get_all_tests() -> Vec<TestDef> {
             name: "test_session_timeout_rebalance",
             test_fn: wrap_test!(test_session_timeout_rebalance),
             parallel_safe: false, // Has sleep delays
+        },
+        // Rebalancing edge case tests
+        TestDef {
+            category: "consumer_group",
+            name: "test_rapid_rebalance_cycles",
+            test_fn: wrap_test!(test_rapid_rebalance_cycles),
+            parallel_safe: false, // Uses shared group state
+        },
+        TestDef {
+            category: "consumer_group",
+            name: "test_heartbeat_during_rebalance_window",
+            test_fn: wrap_test!(test_heartbeat_during_rebalance_window),
+            parallel_safe: false, // Uses shared group state
+        },
+        TestDef {
+            category: "consumer_group",
+            name: "test_multiple_concurrent_timeouts",
+            test_fn: wrap_test!(test_multiple_concurrent_timeouts),
+            parallel_safe: false, // Has sleep delays
+        },
+        TestDef {
+            category: "consumer_group",
+            name: "test_rebalance_with_minimal_session_timeout",
+            test_fn: wrap_test!(test_rebalance_with_minimal_session_timeout),
+            parallel_safe: false, // Has sleep delays
+        },
+        TestDef {
+            category: "consumer_group",
+            name: "test_rebalance_mixed_timeout_values",
+            test_fn: wrap_test!(test_rebalance_mixed_timeout_values),
+            parallel_safe: false, // Has sleep delays
+        },
+        // Coordinator state machine tests
+        TestDef {
+            category: "consumer_group",
+            name: "test_find_coordinator_bootstrap",
+            test_fn: wrap_test!(test_find_coordinator_bootstrap),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "consumer_group",
+            name: "test_partition_assignment_strategies",
+            test_fn: wrap_test!(test_partition_assignment_strategies),
+            parallel_safe: false, // Multiple consumers
+        },
+        TestDef {
+            category: "consumer_group",
+            name: "test_leave_during_rebalance",
+            test_fn: wrap_test!(test_leave_during_rebalance),
+            parallel_safe: false, // Tests rebalance timing
+        },
+        TestDef {
+            category: "consumer_group",
+            name: "test_heartbeat_keeps_membership",
+            test_fn: wrap_test!(test_heartbeat_keeps_membership),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "consumer_group",
+            name: "test_group_state_transitions",
+            test_fn: wrap_test!(test_group_state_transitions),
+            parallel_safe: true,
         },
         // Partition tests
         TestDef {
@@ -610,6 +744,37 @@ fn get_all_tests() -> Vec<TestDef> {
             test_fn: wrap_test!(test_request_pipelining),
             parallel_safe: true, // Uses its own connection
         },
+        // Race condition tests
+        TestDef {
+            category: "concurrent",
+            name: "test_produce_consume_race",
+            test_fn: wrap_test!(test_produce_consume_race),
+            parallel_safe: false, // Tests concurrent access
+        },
+        TestDef {
+            category: "concurrent",
+            name: "test_offset_commit_race",
+            test_fn: wrap_test!(test_offset_commit_race),
+            parallel_safe: false, // Tests concurrent offset commits
+        },
+        TestDef {
+            category: "concurrent",
+            name: "test_coordinator_state_race",
+            test_fn: wrap_test!(test_coordinator_state_race),
+            parallel_safe: false, // Tests coordinator state
+        },
+        TestDef {
+            category: "concurrent",
+            name: "test_partition_assignment_race",
+            test_fn: wrap_test!(test_partition_assignment_race),
+            parallel_safe: false, // Tests partition assignment
+        },
+        TestDef {
+            category: "concurrent",
+            name: "test_group_rejoin_race",
+            test_fn: wrap_test!(test_group_rejoin_race),
+            parallel_safe: false, // Tests group membership
+        },
         // Negative tests
         TestDef {
             category: "negative",
@@ -679,6 +844,37 @@ fn get_all_tests() -> Vec<TestDef> {
             test_fn: wrap_test!(test_long_poll_multiple_waiters),
             parallel_safe: false, // Tests timing-sensitive behavior
         },
+        // Long polling edge case tests
+        TestDef {
+            category: "long_poll",
+            name: "test_long_poll_min_bytes_threshold",
+            test_fn: wrap_test!(test_long_poll_min_bytes_threshold),
+            parallel_safe: false, // Timing-sensitive
+        },
+        TestDef {
+            category: "long_poll",
+            name: "test_long_poll_timeout_precision",
+            test_fn: wrap_test!(test_long_poll_timeout_precision),
+            parallel_safe: false, // Timing-sensitive
+        },
+        TestDef {
+            category: "long_poll",
+            name: "test_long_poll_consumer_disconnect",
+            test_fn: wrap_test!(test_long_poll_consumer_disconnect),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "long_poll",
+            name: "test_long_poll_multiple_consumers_same_partition",
+            test_fn: wrap_test!(test_long_poll_multiple_consumers_same_partition),
+            parallel_safe: false, // Multiple consumers
+        },
+        TestDef {
+            category: "long_poll",
+            name: "test_long_poll_auto_commit_interval",
+            test_fn: wrap_test!(test_long_poll_auto_commit_interval),
+            parallel_safe: false, // Timing-sensitive
+        },
         // Compression tests (Phase 8)
         TestDef {
             category: "compression",
@@ -721,6 +917,37 @@ fn get_all_tests() -> Vec<TestDef> {
             category: "idempotent",
             name: "test_true_deduplication_manual_replay",
             test_fn: wrap_test!(test_true_deduplication_manual_replay),
+            parallel_safe: true,
+        },
+        // Idempotent producer edge case tests
+        TestDef {
+            category: "idempotent",
+            name: "test_idempotent_producer_epoch_bump",
+            test_fn: wrap_test!(test_idempotent_producer_epoch_bump),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "idempotent",
+            name: "test_idempotent_multi_partition",
+            test_fn: wrap_test!(test_idempotent_multi_partition),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "idempotent",
+            name: "test_idempotent_producer_restart",
+            test_fn: wrap_test!(test_idempotent_producer_restart),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "idempotent",
+            name: "test_idempotent_concurrent_producers",
+            test_fn: wrap_test!(test_idempotent_concurrent_producers),
+            parallel_safe: false, // Concurrent producers
+        },
+        TestDef {
+            category: "idempotent",
+            name: "test_idempotent_high_sequence",
+            test_fn: wrap_test!(test_idempotent_high_sequence),
             parallel_safe: true,
         },
         // Transaction tests (Phase 10)
@@ -770,6 +997,55 @@ fn get_all_tests() -> Vec<TestDef> {
             category: "transaction",
             name: "test_txn_offset_commit",
             test_fn: wrap_test!(test_txn_offset_commit),
+            parallel_safe: true,
+        },
+        // Transaction atomicity edge case tests
+        TestDef {
+            category: "transaction",
+            name: "test_transaction_timeout_auto_abort",
+            test_fn: wrap_test!(test_transaction_timeout_auto_abort),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "transaction",
+            name: "test_concurrent_transactions_same_producer",
+            test_fn: wrap_test!(test_concurrent_transactions_same_producer),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "transaction",
+            name: "test_producer_fencing_mid_transaction",
+            test_fn: wrap_test!(test_producer_fencing_mid_transaction),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "transaction",
+            name: "test_add_partitions_to_txn_idempotent",
+            test_fn: wrap_test!(test_add_partitions_to_txn_idempotent),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "transaction",
+            name: "test_txn_offset_commit_visibility_timing",
+            test_fn: wrap_test!(test_txn_offset_commit_visibility_timing),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "transaction",
+            name: "test_abort_transaction_discards_pending_offsets",
+            test_fn: wrap_test!(test_abort_transaction_discards_pending_offsets),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "transaction",
+            name: "test_transaction_partial_failure_atomicity",
+            test_fn: wrap_test!(test_transaction_partial_failure_atomicity),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "transaction",
+            name: "test_transaction_boundary_isolation",
+            test_fn: wrap_test!(test_transaction_boundary_isolation),
             parallel_safe: true,
         },
         // Shadow mode tests (Phase 11) - NOT parallel safe (uses external Kafka)

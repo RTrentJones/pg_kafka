@@ -72,9 +72,19 @@ pub use consumer::{
     test_consumer_basic, test_consumer_from_offset, test_consumer_multiple_messages,
 };
 pub use consumer_group::{
-    test_consumer_group_lifecycle, test_rebalance_after_leave, test_session_timeout_rebalance,
+    test_consumer_group_lifecycle, test_find_coordinator_bootstrap,
+    test_group_state_transitions, test_heartbeat_during_rebalance_window,
+    test_heartbeat_keeps_membership, test_leave_during_rebalance,
+    test_multiple_concurrent_timeouts, test_partition_assignment_strategies,
+    test_rapid_rebalance_cycles, test_rebalance_after_leave,
+    test_rebalance_mixed_timeout_values, test_rebalance_with_minimal_session_timeout,
+    test_session_timeout_rebalance,
 };
-pub use offset_management::{test_offset_boundaries, test_offset_commit_fetch};
+pub use offset_management::{
+    test_fetch_offset_new_group, test_offset_boundaries, test_offset_commit_fetch,
+    test_offset_commit_multi_partition, test_offset_commit_with_metadata, test_offset_reset_policy,
+    test_offset_seek,
+};
 pub use partition::{
     test_key_distribution, test_key_routing_deterministic, test_multi_partition_produce,
     test_null_key_distribution,
@@ -85,7 +95,9 @@ pub use producer::{test_batch_produce, test_producer};
 pub use concurrent::{
     test_concurrent_producers_different_partitions, test_concurrent_producers_same_topic,
     test_consumer_catches_up, test_consumer_group_two_members, test_consumer_rejoin_after_leave,
-    test_multiple_consumer_groups, test_produce_while_consuming, test_request_pipelining,
+    test_coordinator_state_race, test_group_rejoin_race, test_multiple_consumer_groups,
+    test_offset_commit_race, test_partition_assignment_race, test_produce_consume_race,
+    test_produce_while_consuming, test_request_pipelining,
 };
 pub use edge_cases::{
     test_batch_1000_messages, test_consume_empty_partition, test_consumer_group_empty,
@@ -119,8 +131,10 @@ pub use admin::{
 
 // Long polling tests
 pub use long_poll::{
-    test_long_poll_immediate_return, test_long_poll_multiple_waiters,
-    test_long_poll_producer_wakeup, test_long_poll_timeout,
+    test_long_poll_auto_commit_interval, test_long_poll_consumer_disconnect,
+    test_long_poll_immediate_return, test_long_poll_min_bytes_threshold,
+    test_long_poll_multiple_consumers_same_partition, test_long_poll_multiple_waiters,
+    test_long_poll_producer_wakeup, test_long_poll_timeout, test_long_poll_timeout_precision,
 };
 
 // Compression tests (Phase 8)
@@ -130,13 +144,23 @@ pub use compression::{
 };
 
 // Idempotent producer tests (Phase 9)
-pub use idempotent::{test_idempotent_producer_basic, test_true_deduplication_manual_replay};
+pub use idempotent::{
+    test_idempotent_concurrent_producers, test_idempotent_high_sequence,
+    test_idempotent_multi_partition, test_idempotent_producer_basic,
+    test_idempotent_producer_epoch_bump, test_idempotent_producer_restart,
+    test_true_deduplication_manual_replay,
+};
 
 // Transaction tests (Phase 10)
 pub use transaction::{
-    test_producer_fencing, test_read_committed_after_commit, test_read_committed_filters_pending,
-    test_read_uncommitted_sees_pending, test_transactional_batch,
+    test_abort_transaction_discards_pending_offsets, test_add_partitions_to_txn_idempotent,
+    test_concurrent_transactions_same_producer, test_producer_fencing,
+    test_producer_fencing_mid_transaction, test_read_committed_after_commit,
+    test_read_committed_filters_pending, test_read_uncommitted_sees_pending,
+    test_transaction_boundary_isolation, test_transaction_partial_failure_atomicity,
+    test_transaction_timeout_auto_abort, test_transactional_batch,
     test_transactional_producer_abort, test_transactional_producer_commit, test_txn_offset_commit,
+    test_txn_offset_commit_visibility_timing,
 };
 
 // Shadow mode tests (Phase 11)
