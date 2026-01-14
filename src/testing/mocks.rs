@@ -147,7 +147,13 @@ mock! {
 ///
 /// Avoids calling pgrx GUC functions which require Postgres runtime
 pub fn mock_config() -> crate::config::Config {
-    use crate::kafka::constants::DEFAULT_FETCH_POLL_INTERVAL_MS;
+    use crate::kafka::constants::{
+        DEFAULT_FETCH_POLL_INTERVAL_MS, DEFAULT_SHADOW_BATCH_SIZE,
+        DEFAULT_SHADOW_BOOTSTRAP_SERVERS, DEFAULT_SHADOW_LINGER_MS, DEFAULT_SHADOW_MAX_RETRIES,
+        DEFAULT_SHADOW_METRICS_ENABLED, DEFAULT_SHADOW_MODE_ENABLED, DEFAULT_SHADOW_OTEL_ENDPOINT,
+        DEFAULT_SHADOW_RETRY_BACKOFF_MS, DEFAULT_SHADOW_SASL_MECHANISM,
+        DEFAULT_SHADOW_SECURITY_PROTOCOL, DEFAULT_SHADOW_SYNC_MODE,
+    };
     crate::config::Config {
         port: DEFAULT_KAFKA_PORT,
         host: TEST_HOST.to_string(),
@@ -159,6 +165,23 @@ pub fn mock_config() -> crate::config::Config {
         enable_long_polling: true,
         compression_type: DEFAULT_COMPRESSION_TYPE.to_string(),
         log_timing: false,
+        // Shadow mode configuration (Phase 11)
+        shadow_mode_enabled: DEFAULT_SHADOW_MODE_ENABLED,
+        shadow_bootstrap_servers: DEFAULT_SHADOW_BOOTSTRAP_SERVERS.to_string(),
+        shadow_security_protocol: DEFAULT_SHADOW_SECURITY_PROTOCOL.to_string(),
+        shadow_sasl_mechanism: DEFAULT_SHADOW_SASL_MECHANISM.to_string(),
+        shadow_sasl_username: String::new(),
+        shadow_sasl_password: String::new(),
+        shadow_ssl_ca_location: String::new(),
+        shadow_batch_size: DEFAULT_SHADOW_BATCH_SIZE,
+        shadow_linger_ms: DEFAULT_SHADOW_LINGER_MS,
+        shadow_retry_backoff_ms: DEFAULT_SHADOW_RETRY_BACKOFF_MS,
+        shadow_max_retries: DEFAULT_SHADOW_MAX_RETRIES,
+        shadow_default_sync_mode: DEFAULT_SHADOW_SYNC_MODE.to_string(),
+        shadow_metrics_enabled: DEFAULT_SHADOW_METRICS_ENABLED,
+        shadow_otel_endpoint: DEFAULT_SHADOW_OTEL_ENDPOINT.to_string(),
+        // Tests run in eval mode by default (Commercial License)
+        shadow_license_key: "eval".to_string(),
     }
 }
 

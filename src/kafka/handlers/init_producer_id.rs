@@ -6,7 +6,7 @@
 
 use crate::kafka::constants::ERROR_NONE;
 use crate::kafka::error::Result;
-use crate::kafka::storage::KafkaStore;
+use crate::kafka::handler_context::HandlerContext;
 use kafka_protocol::messages::init_producer_id_response::InitProducerIdResponse;
 use kafka_protocol::messages::ProducerId;
 
@@ -25,7 +25,7 @@ use kafka_protocol::messages::ProducerId;
 /// - Otherwise, validates and bumps epoch for reconnecting producer
 ///
 /// # Arguments
-/// * `store` - Storage backend
+/// * `ctx` - Handler context (store, coordinator, broker metadata, etc.)
 /// * `transactional_id` - Optional transactional ID (for transactional producers)
 /// * `transaction_timeout_ms` - Transaction timeout in ms (for transactional producers)
 /// * `existing_producer_id` - Existing producer ID for reconnection (-1 for new)
@@ -35,13 +35,14 @@ use kafka_protocol::messages::ProducerId;
 /// # Returns
 /// InitProducerIdResponse with allocated (producer_id, epoch) or error
 pub fn handle_init_producer_id(
-    store: &impl KafkaStore,
+    ctx: &HandlerContext,
     transactional_id: Option<String>,
     transaction_timeout_ms: i32,
     existing_producer_id: i64,
     existing_epoch: i16,
     client_id: Option<&str>,
 ) -> Result<InitProducerIdResponse> {
+    let store = ctx.store;
     let mut response = InitProducerIdResponse::default();
 
     // Phase 10: Handle transactional producers

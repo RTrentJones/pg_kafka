@@ -567,4 +567,353 @@ mod tests {
         assert!(msg.contains("my-txn-id"));
         assert!(msg.contains("60000"));
     }
+
+    // ========== Additional Coverage Tests ==========
+
+    #[test]
+    fn test_all_error_variants_display() {
+        // Ensure all variants have proper Display impl
+        let errors: Vec<KafkaError> = vec![
+            KafkaError::InvalidRequestSize { size: 100 },
+            KafkaError::UnsupportedApiKey { api_key: 99 },
+            KafkaError::UnsupportedApiVersion {
+                api_key: 1,
+                version: 999,
+            },
+            KafkaError::RequestTooShort {
+                expected: 100,
+                actual: 50,
+            },
+            KafkaError::CorruptMessage {
+                message: "test".to_string(),
+            },
+            KafkaError::UnknownTopic {
+                topic: "test".to_string(),
+            },
+            KafkaError::UnknownPartition {
+                topic: "test".to_string(),
+                partition: 5,
+            },
+            KafkaError::InvalidPartitions { count: -1 },
+            KafkaError::CoordinatorNotAvailable {
+                group_id: "g1".to_string(),
+            },
+            KafkaError::NotCoordinator {
+                group_id: "g1".to_string(),
+            },
+            KafkaError::UnknownMemberId {
+                group_id: "g1".to_string(),
+                member_id: "m1".to_string(),
+            },
+            KafkaError::IllegalGeneration {
+                group_id: "g1".to_string(),
+                generation: 1,
+                expected: 2,
+            },
+            KafkaError::RebalanceInProgress {
+                group_id: "g1".to_string(),
+            },
+            KafkaError::DuplicateSequence {
+                producer_id: 1,
+                partition_id: 0,
+                sequence: 5,
+                expected: 5,
+            },
+            KafkaError::OutOfOrderSequence {
+                producer_id: 1,
+                partition_id: 0,
+                sequence: 10,
+                expected: 5,
+            },
+            KafkaError::ProducerFenced {
+                producer_id: 1,
+                epoch: 1,
+                expected_epoch: 2,
+            },
+            KafkaError::UnknownProducerId { producer_id: 123 },
+            KafkaError::TransactionalIdNotFound {
+                transactional_id: "txn".to_string(),
+            },
+            KafkaError::InvalidTxnState {
+                transactional_id: "txn".to_string(),
+                current_state: "Empty".to_string(),
+                operation: "EndTxn".to_string(),
+            },
+            KafkaError::ConcurrentTransactions { producer_id: 1 },
+            KafkaError::TransactionTimedOut {
+                transactional_id: "txn".to_string(),
+                timeout_ms: 60000,
+            },
+            KafkaError::Database {
+                message: "test".to_string(),
+            },
+            KafkaError::SchemaNotReady {
+                message: "test".to_string(),
+            },
+            KafkaError::Encoding {
+                message: "test".to_string(),
+            },
+            KafkaError::InvalidConfig {
+                key: "key".to_string(),
+                message: "msg".to_string(),
+            },
+            KafkaError::Protocol {
+                code: 1,
+                message: "test".to_string(),
+            },
+            KafkaError::Internal("test".to_string()),
+        ];
+
+        for err in errors {
+            let display = format!("{}", err);
+            assert!(!display.is_empty(), "Error should have display text");
+        }
+    }
+
+    #[test]
+    fn test_all_error_codes_mapping() {
+        // Test error code mapping for each variant type
+        assert_eq!(
+            KafkaError::InvalidRequestSize { size: 1 }.to_kafka_error_code(),
+            ERROR_CORRUPT_MESSAGE
+        );
+        assert_eq!(
+            KafkaError::UnsupportedApiVersion {
+                api_key: 1,
+                version: 99
+            }
+            .to_kafka_error_code(),
+            ERROR_UNSUPPORTED_VERSION
+        );
+        assert_eq!(
+            KafkaError::UnknownPartition {
+                topic: "t".to_string(),
+                partition: 0
+            }
+            .to_kafka_error_code(),
+            ERROR_UNKNOWN_TOPIC_OR_PARTITION
+        );
+        assert_eq!(
+            KafkaError::InvalidPartitions { count: -1 }.to_kafka_error_code(),
+            ERROR_INVALID_PARTITIONS
+        );
+        assert_eq!(
+            KafkaError::CoordinatorNotAvailable {
+                group_id: "g".to_string()
+            }
+            .to_kafka_error_code(),
+            ERROR_COORDINATOR_NOT_AVAILABLE
+        );
+        assert_eq!(
+            KafkaError::NotCoordinator {
+                group_id: "g".to_string()
+            }
+            .to_kafka_error_code(),
+            ERROR_NOT_COORDINATOR
+        );
+        assert_eq!(
+            KafkaError::SchemaNotReady {
+                message: "m".to_string()
+            }
+            .to_kafka_error_code(),
+            ERROR_UNKNOWN_SERVER_ERROR
+        );
+        assert_eq!(
+            KafkaError::InvalidConfig {
+                key: "k".to_string(),
+                message: "m".to_string()
+            }
+            .to_kafka_error_code(),
+            ERROR_UNKNOWN_SERVER_ERROR
+        );
+        assert_eq!(
+            KafkaError::Protocol {
+                code: 42,
+                message: "m".to_string()
+            }
+            .to_kafka_error_code(),
+            42
+        );
+        assert_eq!(
+            KafkaError::Internal("m".to_string()).to_kafka_error_code(),
+            ERROR_UNKNOWN_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn test_is_server_error_returns_false_for_client_errors() {
+        // These are client-induced errors, not server errors
+        let client_errors: Vec<KafkaError> = vec![
+            KafkaError::InvalidRequestSize { size: 1 },
+            KafkaError::UnsupportedApiKey { api_key: 99 },
+            KafkaError::UnsupportedApiVersion {
+                api_key: 1,
+                version: 99,
+            },
+            KafkaError::RequestTooShort {
+                expected: 100,
+                actual: 50,
+            },
+            KafkaError::CorruptMessage {
+                message: "test".to_string(),
+            },
+            KafkaError::UnknownTopic {
+                topic: "test".to_string(),
+            },
+            KafkaError::UnknownPartition {
+                topic: "test".to_string(),
+                partition: 0,
+            },
+            KafkaError::UnknownMemberId {
+                group_id: "g".to_string(),
+                member_id: "m".to_string(),
+            },
+            KafkaError::Protocol {
+                code: 1,
+                message: "test".to_string(),
+            },
+        ];
+
+        for err in client_errors {
+            assert!(
+                !err.is_server_error(),
+                "Error {:?} should not be a server error",
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_server_error_returns_true_for_server_errors() {
+        // These are server-side errors
+        let server_errors: Vec<KafkaError> = vec![
+            KafkaError::Database {
+                message: "connection failed".to_string(),
+            },
+            KafkaError::SchemaNotReady {
+                message: "schema not found".to_string(),
+            },
+            KafkaError::Internal("internal failure".to_string()),
+        ];
+
+        for err in server_errors {
+            assert!(
+                err.is_server_error(),
+                "Error {:?} should be a server error",
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn test_idempotent_producer_errors() {
+        // DuplicateSequence
+        let err = KafkaError::duplicate_sequence(100, 0, 5, 5);
+        assert_eq!(err.to_kafka_error_code(), ERROR_DUPLICATE_SEQUENCE_NUMBER);
+        let msg = format!("{}", err);
+        assert!(msg.contains("100")); // producer_id
+        assert!(msg.contains("Duplicate"));
+
+        // OutOfOrderSequence
+        let err = KafkaError::out_of_order_sequence(100, 0, 10, 5);
+        assert_eq!(
+            err.to_kafka_error_code(),
+            ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER
+        );
+        let msg = format!("{}", err);
+        assert!(msg.contains("Out of order"));
+        assert!(msg.contains("expected 5"));
+
+        // ProducerFenced
+        let err = KafkaError::producer_fenced(100, 1, 2);
+        assert_eq!(err.to_kafka_error_code(), ERROR_PRODUCER_FENCED);
+        let msg = format!("{}", err);
+        assert!(msg.contains("fenced"));
+        assert!(msg.contains("epoch"));
+
+        // UnknownProducerId
+        let err = KafkaError::unknown_producer_id(999);
+        assert_eq!(err.to_kafka_error_code(), ERROR_UNKNOWN_PRODUCER_ID);
+        let msg = format!("{}", err);
+        assert!(msg.contains("999"));
+    }
+
+    #[test]
+    fn test_helper_constructors() {
+        // corrupt_message
+        let err = KafkaError::corrupt_message("invalid data");
+        assert!(matches!(err, KafkaError::CorruptMessage { .. }));
+        assert!(format!("{}", err).contains("invalid data"));
+
+        // unknown_partition
+        let err = KafkaError::unknown_partition("my-topic", 5);
+        assert!(matches!(err, KafkaError::UnknownPartition { .. }));
+        assert!(format!("{}", err).contains("my-topic"));
+        assert!(format!("{}", err).contains("5"));
+
+        // database
+        let err = KafkaError::database("query failed");
+        assert!(matches!(err, KafkaError::Database { .. }));
+        assert!(err.is_server_error());
+    }
+
+    #[test]
+    fn test_backwards_compat_encoding() {
+        let err = KafkaError::Encoding("test error".to_string());
+        assert!(matches!(
+            err,
+            KafkaError::Encoding {
+                message: ref m
+            } if m == "test error"
+        ));
+    }
+
+    #[test]
+    fn test_backwards_compat_invalid_config() {
+        let err = KafkaError::InvalidConfig("bad value".to_string());
+        assert!(matches!(
+            err,
+            KafkaError::InvalidConfig {
+                key: ref k,
+                message: ref m
+            } if k == "unknown" && m == "bad value"
+        ));
+    }
+
+    #[test]
+    fn test_backwards_compat_schema_not_found() {
+        let err = KafkaError::SchemaNotFound("kafka schema missing".to_string());
+        assert!(matches!(err, KafkaError::SchemaNotReady { .. }));
+    }
+
+    #[test]
+    fn test_backwards_compat_topic_not_found() {
+        let err = KafkaError::TopicNotFound("missing-topic".to_string());
+        assert!(matches!(
+            err,
+            KafkaError::UnknownTopic { topic: ref t } if t == "missing-topic"
+        ));
+    }
+
+    #[test]
+    fn test_backwards_compat_coordinator_error() {
+        let err = KafkaError::CoordinatorError(15, "group coordinator failed".to_string());
+        assert!(matches!(
+            err,
+            KafkaError::Protocol {
+                code: 15,
+                message: ref m
+            } if m == "group coordinator failed"
+        ));
+    }
+
+    #[test]
+    fn test_error_debug_format() {
+        let err = KafkaError::UnknownTopic {
+            topic: "test".to_string(),
+        };
+        let debug = format!("{:?}", err);
+        assert!(debug.contains("UnknownTopic"));
+        assert!(debug.contains("test"));
+    }
 }

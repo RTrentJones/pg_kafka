@@ -22,20 +22,20 @@ use kafka_protocol::messages::{GroupId, TopicName};
 use kafka_protocol::protocol::StrBytes;
 
 use crate::kafka::constants::*;
-use crate::kafka::coordinator::GroupCoordinator;
 use crate::kafka::error::Result;
+use crate::kafka::handler_context::HandlerContext;
 use crate::kafka::messages::{CreatePartitionsTopicRequest, CreateTopicRequest};
-use crate::kafka::storage::KafkaStore;
 
 /// Handle CreateTopics request
 ///
 /// Creates topics with the specified configuration. Topics that already exist
 /// will return TOPIC_ALREADY_EXISTS error.
 pub fn handle_create_topics(
-    store: &impl KafkaStore,
+    ctx: &HandlerContext,
     topics: Vec<CreateTopicRequest>,
     validate_only: bool,
 ) -> Result<CreateTopicsResponse> {
+    let store = ctx.store;
     let mut results = Vec::new();
 
     for topic in topics {
@@ -128,9 +128,10 @@ pub fn handle_create_topics(
 /// Deletes topics and all their messages. Consumer offsets for deleted topics
 /// are also removed.
 pub fn handle_delete_topics(
-    store: &impl KafkaStore,
+    ctx: &HandlerContext,
     topic_names: Vec<String>,
 ) -> Result<DeleteTopicsResponse> {
+    let store = ctx.store;
     let mut results = Vec::new();
 
     for topic_name in topic_names {
@@ -181,10 +182,11 @@ pub fn handle_delete_topics(
 /// Increases the partition count for existing topics.
 /// Cannot decrease partition count.
 pub fn handle_create_partitions(
-    store: &impl KafkaStore,
+    ctx: &HandlerContext,
     topics: Vec<CreatePartitionsTopicRequest>,
     validate_only: bool,
 ) -> Result<CreatePartitionsResponse> {
+    let store = ctx.store;
     let mut results = Vec::new();
 
     for topic in topics {
@@ -249,10 +251,11 @@ pub fn handle_create_partitions(
 /// Deletes consumer groups. Groups with active members cannot be deleted
 /// (returns NON_EMPTY_GROUP error).
 pub fn handle_delete_groups(
-    store: &impl KafkaStore,
-    coordinator: &GroupCoordinator,
+    ctx: &HandlerContext,
     group_names: Vec<String>,
 ) -> Result<DeleteGroupsResponse> {
+    let store = ctx.store;
+    let coordinator = ctx.coordinator;
     let mut results = Vec::new();
 
     for group_name in group_names {
@@ -311,6 +314,20 @@ mod tests {
     use super::*;
     use crate::testing::mocks::MockKafkaStore;
 
+    fn make_test_context<'a>(
+        store: &'a MockKafkaStore,
+        coordinator: &'a crate::kafka::GroupCoordinator,
+        broker: &'a crate::kafka::BrokerMetadata,
+    ) -> HandlerContext<'a> {
+        HandlerContext::new(
+            store,
+            coordinator,
+            broker,
+            1,
+            kafka_protocol::records::Compression::None,
+        )
+    }
+
     #[test]
     fn test_create_topics_success() {
         let mut store = MockKafkaStore::new();
@@ -323,7 +340,10 @@ mod tests {
             replication_factor: 1,
         }];
 
-        let result = handle_create_topics(&store, topics, false);
+        let coordinator = crate::kafka::GroupCoordinator::new();
+        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = make_test_context(&store, &coordinator, &broker);
+        let result = handle_create_topics(&ctx, topics, false);
         assert!(result.is_ok());
 
         let response = result.unwrap();
@@ -340,7 +360,10 @@ mod tests {
             replication_factor: 1,
         }];
 
-        let result = handle_create_topics(&store, topics, false);
+        let coordinator = crate::kafka::GroupCoordinator::new();
+        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = make_test_context(&store, &coordinator, &broker);
+        let result = handle_create_topics(&ctx, topics, false);
         assert!(result.is_ok());
 
         let response = result.unwrap();
@@ -359,7 +382,10 @@ mod tests {
             replication_factor: 1,
         }];
 
-        let result = handle_create_topics(&store, topics, true);
+        let coordinator = crate::kafka::GroupCoordinator::new();
+        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = make_test_context(&store, &coordinator, &broker);
+        let result = handle_create_topics(&ctx, topics, true);
         assert!(result.is_ok());
 
         let response = result.unwrap();
@@ -377,7 +403,10 @@ mod tests {
             replication_factor: 1,
         }];
 
-        let result = handle_create_topics(&store, topics, false);
+        let coordinator = crate::kafka::GroupCoordinator::new();
+        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = make_test_context(&store, &coordinator, &broker);
+        let result = handle_create_topics(&ctx, topics, false);
         assert!(result.is_ok());
 
         let response = result.unwrap();
@@ -390,7 +419,10 @@ mod tests {
         store.expect_get_topic_id().returning(|_| Ok(Some(1)));
         store.expect_delete_topic().returning(|_| Ok(()));
 
-        let result = handle_delete_topics(&store, vec!["test-topic".to_string()]);
+        let coordinator = crate::kafka::GroupCoordinator::new();
+        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = make_test_context(&store, &coordinator, &broker);
+        let result = handle_delete_topics(&ctx, vec!["test-topic".to_string()]);
         assert!(result.is_ok());
 
         let response = result.unwrap();
@@ -403,7 +435,10 @@ mod tests {
         let mut store = MockKafkaStore::new();
         store.expect_get_topic_id().returning(|_| Ok(None));
 
-        let result = handle_delete_topics(&store, vec!["nonexistent".to_string()]);
+        let coordinator = crate::kafka::GroupCoordinator::new();
+        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = make_test_context(&store, &coordinator, &broker);
+        let result = handle_delete_topics(&ctx, vec!["nonexistent".to_string()]);
         assert!(result.is_ok());
 
         let response = result.unwrap();
@@ -428,7 +463,10 @@ mod tests {
             count: 3,
         }];
 
-        let result = handle_create_partitions(&store, topics, false);
+        let coordinator = crate::kafka::GroupCoordinator::new();
+        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = make_test_context(&store, &coordinator, &broker);
+        let result = handle_create_partitions(&ctx, topics, false);
         assert!(result.is_ok());
 
         let response = result.unwrap();
@@ -448,7 +486,10 @@ mod tests {
             count: 3, // Less than current 5
         }];
 
-        let result = handle_create_partitions(&store, topics, false);
+        let coordinator = crate::kafka::GroupCoordinator::new();
+        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = make_test_context(&store, &coordinator, &broker);
+        let result = handle_create_partitions(&ctx, topics, false);
         assert!(result.is_ok());
 
         let response = result.unwrap();

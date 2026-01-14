@@ -10,6 +10,11 @@ pub mod worker; // Background worker implementation
 #[cfg(test)]
 pub mod testing;
 
+// Note: Previously had RELOAD_SHADOW_CONFIG_REQUESTED atomic flag here.
+// Removed because PostgreSQL uses separate processes (not threads), so static
+// variables aren't shared between the SQL function process and worker process.
+// Use shadow_config_reload_interval_ms GUC instead for testing.
+
 // ===== Conditional Logging Macros =====
 // These provide test-safe alternatives to pgrx logging functions
 
@@ -120,6 +125,11 @@ pub unsafe extern "C-unwind" fn _PG_init() {
 fn hello_pg_kafka() -> &'static str {
     "Hello, pg_kafka"
 }
+
+// Note: Removed reload_shadow_config() SQL function.
+// It didn't work because PostgreSQL uses separate processes, not threads.
+// Static variables aren't shared between backend and worker processes.
+// Use shadow_config_reload_interval_ms GUC for fast reloads during testing.
 
 // Include bootstrap SQL to create kafka schema and tables
 pgrx::extension_sql_file!("../sql/bootstrap.sql");

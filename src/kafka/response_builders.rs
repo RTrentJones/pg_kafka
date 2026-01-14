@@ -189,10 +189,10 @@ pub fn build_api_versions_response() -> ApiVersionsResponse {
 }
 
 /// Build a MetadataResponseBroker for our single-node broker
-pub fn build_broker_metadata(node_id: i32, host: String, port: i32) -> MetadataResponseBroker {
+pub fn build_broker_metadata(node_id: i32, host: &str, port: i32) -> MetadataResponseBroker {
     let mut broker = MetadataResponseBroker::default();
     broker.node_id = BrokerId(node_id);
-    broker.host = host.into();
+    broker.host = host.to_string().into();
     broker.port = port;
     broker.rack = None;
     broker
@@ -510,7 +510,7 @@ mod tests {
 
     #[test]
     fn test_build_broker_metadata() {
-        let broker = build_broker_metadata(0, "localhost".to_string(), 9092);
+        let broker = build_broker_metadata(0, "localhost", 9092);
 
         assert_eq!(broker.node_id.0, 0);
         assert_eq!(broker.host.as_str(), "localhost");
@@ -520,7 +520,7 @@ mod tests {
 
     #[test]
     fn test_build_broker_metadata_with_custom_values() {
-        let broker = build_broker_metadata(42, "kafka.example.com".to_string(), 19092);
+        let broker = build_broker_metadata(42, "kafka.example.com", 19092);
 
         assert_eq!(broker.node_id.0, 42);
         assert_eq!(broker.host.as_str(), "kafka.example.com");

@@ -59,6 +59,7 @@ pub mod offset_management;
 pub mod partition;
 pub mod performance;
 pub mod producer;
+pub mod shadow;
 pub mod transaction;
 
 // Re-export infrastructure
@@ -134,6 +135,37 @@ pub use idempotent::{test_idempotent_producer_basic, test_true_deduplication_man
 // Transaction tests (Phase 10)
 pub use transaction::{
     test_producer_fencing, test_read_committed_after_commit, test_read_committed_filters_pending,
-    test_read_uncommitted_sees_pending, test_transactional_batch, test_transactional_producer_abort,
-    test_transactional_producer_commit, test_txn_offset_commit,
+    test_read_uncommitted_sees_pending, test_transactional_batch,
+    test_transactional_producer_abort, test_transactional_producer_commit, test_txn_offset_commit,
+};
+
+// Shadow mode tests (Phase 11)
+pub use shadow::{
+    // Transaction integration
+    test_aborted_transaction_not_forwarded,
+    test_committed_transaction_forwarded,
+    // Percentage routing
+    test_deterministic_routing,
+    // Dial-up tests
+    test_dialup_0_percent,
+    test_dialup_100_percent,
+    test_dialup_10_percent,
+    test_dialup_25_percent,
+    test_dialup_50_percent,
+    test_dialup_75_percent,
+    // Basic forwarding
+    test_dual_write_async,
+    // Error handling
+    test_dual_write_external_down,
+    test_dual_write_sync,
+    test_external_only_fallback,
+    test_external_only_mode,
+    test_fifty_percent_forwarding,
+    test_hundred_percent_forwarding,
+    test_local_only_mode,
+    // Replay
+    test_replay_historical_messages,
+    // Topic mapping
+    test_topic_name_mapping,
+    test_zero_percent_forwarding,
 };

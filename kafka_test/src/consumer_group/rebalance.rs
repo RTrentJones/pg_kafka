@@ -112,10 +112,7 @@ pub async fn test_rebalance_after_leave() -> TestResult {
         match tokio::time::timeout(Duration::from_secs(2), consumer2.recv()).await {
             Ok(Ok(msg)) => {
                 received2 += 1;
-                println!(
-                    "   Consumer 2 received message at offset {}",
-                    msg.offset()
-                );
+                println!("   Consumer 2 received message at offset {}", msg.offset());
             }
             Ok(Err(e)) => {
                 println!("   ⚠️  Consumer 2 error: {}", e);
@@ -220,10 +217,7 @@ pub async fn test_session_timeout_rebalance() -> TestResult {
         match tokio::time::timeout(Duration::from_secs(2), consumer2.recv()).await {
             Ok(Ok(msg)) => {
                 received += 1;
-                println!(
-                    "   Consumer 2 received message at offset {}",
-                    msg.offset()
-                );
+                println!("   Consumer 2 received message at offset {}", msg.offset());
             }
             Ok(Err(e)) => {
                 println!("   ⚠️  Consumer 2 error: {}", e);

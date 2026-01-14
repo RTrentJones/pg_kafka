@@ -8,7 +8,7 @@
 
 use crate::kafka::constants::ERROR_NONE;
 use crate::kafka::error::{KafkaError, Result};
-use crate::kafka::storage::KafkaStore;
+use crate::kafka::handler_context::HandlerContext;
 use kafka_protocol::messages::add_offsets_to_txn_response::AddOffsetsToTxnResponse;
 use kafka_protocol::messages::add_partitions_to_txn_response::{
     AddPartitionsToTxnPartitionResult, AddPartitionsToTxnResponse, AddPartitionsToTxnTopicResult,
@@ -29,7 +29,7 @@ use crate::kafka::messages::TxnOffsetCommitTopics;
 /// which partitions are involved so it can properly commit/abort them later.
 ///
 /// # Arguments
-/// * `store` - Storage backend
+/// * `ctx` - Handler context (store, coordinator, broker metadata, etc.)
 /// * `transactional_id` - The transactional ID of the producer
 /// * `producer_id` - The producer ID allocated by InitProducerId
 /// * `producer_epoch` - The producer epoch for fencing
@@ -38,12 +38,14 @@ use crate::kafka::messages::TxnOffsetCommitTopics;
 /// # Returns
 /// AddPartitionsToTxnResponse with per-partition error codes
 pub fn handle_add_partitions_to_txn(
-    store: &impl KafkaStore,
+    ctx: &HandlerContext,
     transactional_id: &str,
     producer_id: i64,
     producer_epoch: i16,
     topics: Vec<(String, Vec<i32>)>, // (topic_name, partition_ids)
 ) -> Result<AddPartitionsToTxnResponse> {
+    let store = ctx.store;
+    let default_partitions = ctx.default_partitions;
     // Validate the transaction state
     store.validate_transaction(transactional_id, producer_id, producer_epoch)?;
 
@@ -72,9 +74,6 @@ pub fn handle_add_partitions_to_txn(
     // Build response with results for each partition
     let mut response = AddPartitionsToTxnResponse::default();
     let mut topic_results = Vec::new();
-
-    // Default partitions for auto-created topics (TODO: make configurable)
-    let default_partitions = 1;
 
     for (topic_name, partition_ids) in topics {
         let mut partition_results = Vec::new();
@@ -151,7 +150,7 @@ pub fn handle_add_partitions_to_txn(
 /// exactly-once semantics for consume-process-produce patterns.
 ///
 /// # Arguments
-/// * `store` - Storage backend
+/// * `ctx` - Handler context (store, coordinator, broker metadata, etc.)
 /// * `transactional_id` - The transactional ID of the producer
 /// * `producer_id` - The producer ID allocated by InitProducerId
 /// * `producer_epoch` - The producer epoch for fencing
@@ -160,12 +159,13 @@ pub fn handle_add_partitions_to_txn(
 /// # Returns
 /// AddOffsetsToTxnResponse with error code
 pub fn handle_add_offsets_to_txn(
-    store: &impl KafkaStore,
+    ctx: &HandlerContext,
     transactional_id: &str,
     producer_id: i64,
     producer_epoch: i16,
     _group_id: &str,
 ) -> Result<AddOffsetsToTxnResponse> {
+    let store = ctx.store;
     // Validate the transaction state
     store.validate_transaction(transactional_id, producer_id, producer_epoch)?;
 
@@ -206,7 +206,7 @@ pub fn handle_add_offsets_to_txn(
 /// - Abort: Marks all transactional records as aborted and discards offset commits
 ///
 /// # Arguments
-/// * `store` - Storage backend
+/// * `ctx` - Handler context (store, coordinator, broker metadata, etc.)
 /// * `transactional_id` - The transactional ID of the producer
 /// * `producer_id` - The producer ID allocated by InitProducerId
 /// * `producer_epoch` - The producer epoch for fencing
@@ -215,12 +215,13 @@ pub fn handle_add_offsets_to_txn(
 /// # Returns
 /// EndTxnResponse with error code
 pub fn handle_end_txn(
-    store: &impl KafkaStore,
+    ctx: &HandlerContext,
     transactional_id: &str,
     producer_id: i64,
     producer_epoch: i16,
     committed: bool,
 ) -> Result<EndTxnResponse> {
+    let store = ctx.store;
     // Validate the transaction state
     store.validate_transaction(transactional_id, producer_id, producer_epoch)?;
 
@@ -266,7 +267,7 @@ pub fn handle_end_txn(
 /// these are stored pending and only become visible when the transaction commits.
 ///
 /// # Arguments
-/// * `store` - Storage backend
+/// * `ctx` - Handler context (store, coordinator, broker metadata, etc.)
 /// * `transactional_id` - The transactional ID of the producer
 /// * `producer_id` - The producer ID allocated by InitProducerId
 /// * `producer_epoch` - The producer epoch for fencing
@@ -276,13 +277,14 @@ pub fn handle_end_txn(
 /// # Returns
 /// TxnOffsetCommitResponse with per-partition error codes
 pub fn handle_txn_offset_commit(
-    store: &impl KafkaStore,
+    ctx: &HandlerContext,
     transactional_id: &str,
     producer_id: i64,
     producer_epoch: i16,
     group_id: &str,
     topics: TxnOffsetCommitTopics,
 ) -> Result<TxnOffsetCommitResponse> {
+    let store = ctx.store;
     // Validate the transaction state
     store.validate_transaction(transactional_id, producer_id, producer_epoch)?;
 

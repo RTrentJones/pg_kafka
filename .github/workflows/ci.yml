@@ -40,7 +40,7 @@ jobs:
       - name: Install System Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libpq-dev libreadline-dev zlib1g-dev flex bison libxml2-dev libxslt-dev libssl-dev
+          sudo apt-get install -y libpq-dev libreadline-dev zlib1g-dev flex bison libxml2-dev libxslt-dev libssl-dev libsasl2-dev libzstd-dev
 
       - name: Cache cargo-pgrx binary
         id: cache-cargo-pgrx
@@ -286,15 +286,41 @@ jobs:
         sleep 3 # Wait for protocol readiness (Fixes CI race condition)
 
     - name: Run Functional E2E Tests
-      # Runs functional tests (excludes performance tests which run separately)
+      # Runs functional tests (excludes performance and shadow tests which run separately)
       timeout-minutes: 10
       run: |
         cd kafka_test
-        cargo run --release -- --exclude performance
+        cargo run --release -- --exclude performance --exclude shadow
       env:
         # Pass the dynamically discovered port to the test runner
         # IMPORTANT: Use 'postgres' database since that's where the worker connects via SPI
         DATABASE_URL: postgresql://${{ env.DB_USER }}@localhost:${{ env.PG_PORT }}/postgres
+
+    # Start external Kafka for shadow mode tests
+    - name: Start External Kafka
+      run: |
+        docker compose up -d external-kafka
+        echo "Waiting for Kafka to be healthy..."
+        timeout 60 bash -c 'until docker compose ps external-kafka | grep -q "(healthy)"; do
+          echo "Waiting for Kafka healthcheck..."
+          sleep 2
+        done'
+        echo "External Kafka is ready"
+
+    # Run shadow mode E2E tests (now required to pass)
+    - name: Run Shadow Mode E2E Tests
+      timeout-minutes: 15
+      run: |
+        cd kafka_test
+        cargo run --release -- --category shadow
+      env:
+        DATABASE_URL: postgresql://${{ env.DB_USER }}@localhost:${{ env.PG_PORT }}/postgres
+
+    # Cleanup external Kafka
+    - name: Stop External Kafka
+      if: always()
+      run: |
+        docker compose down -v
 
     - name: Run Performance E2E Tests
       # Performance tests run separately with their own timeout
@@ -355,7 +381,7 @@ jobs:
       - name: Install System Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libpq-dev libreadline-dev zlib1g-dev flex bison libxml2-dev libxslt-dev libssl-dev
+          sudo apt-get install -y libpq-dev libreadline-dev zlib1g-dev flex bison libxml2-dev libxslt-dev libssl-dev libsasl2-dev libzstd-dev
 
       - name: Cache cargo-pgrx binary
         id: cache-cargo-pgrx

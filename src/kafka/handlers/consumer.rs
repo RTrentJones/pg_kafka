@@ -6,7 +6,8 @@
 use super::helpers::{resolve_topic_id, topic_resolution_error_code, TopicResolution};
 use crate::kafka::constants::ERROR_NONE;
 use crate::kafka::error::Result;
-use crate::kafka::storage::{CommittedOffset, KafkaStore};
+use crate::kafka::handler_context::HandlerContext;
+use crate::kafka::storage::CommittedOffset;
 use kafka_protocol::messages::TopicName;
 use kafka_protocol::protocol::StrBytes;
 
@@ -14,10 +15,11 @@ use kafka_protocol::protocol::StrBytes;
 ///
 /// Commits consumer offsets for a consumer group
 pub fn handle_offset_commit(
-    store: &impl KafkaStore,
+    ctx: &HandlerContext,
     group_id: String,
     topics: Vec<crate::kafka::messages::OffsetCommitTopicData>,
 ) -> Result<kafka_protocol::messages::offset_commit_response::OffsetCommitResponse> {
+    let store = ctx.store;
     use kafka_protocol::messages::offset_commit_response::{
         OffsetCommitResponse, OffsetCommitResponsePartition, OffsetCommitResponseTopic,
     };
@@ -107,10 +109,11 @@ pub fn handle_offset_commit(
 ///
 /// Fetches committed offsets for a consumer group
 pub fn handle_offset_fetch(
-    store: &impl KafkaStore,
+    ctx: &HandlerContext,
     group_id: String,
     topics: Option<Vec<crate::kafka::messages::OffsetFetchTopicData>>,
 ) -> Result<kafka_protocol::messages::offset_fetch_response::OffsetFetchResponse> {
+    let store = ctx.store;
     use kafka_protocol::messages::offset_fetch_response::{
         OffsetFetchResponse, OffsetFetchResponsePartition, OffsetFetchResponseTopic,
     };

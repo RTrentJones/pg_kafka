@@ -33,10 +33,13 @@
 // - Bounded channel provides backpressure when DB can't keep up
 
 pub mod assignment;
+pub mod broker_metadata;
 pub mod constants;
+pub mod context;
 pub mod coordinator;
 pub mod dispatch;
 pub mod error;
+pub mod handler_context;
 pub mod handlers;
 pub mod listener;
 pub mod messages;
@@ -45,15 +48,20 @@ pub mod partitioner;
 pub mod pending_fetches;
 pub mod protocol;
 pub mod response_builders;
+pub mod shadow;
 pub mod storage;
 
 // Re-export commonly used types for convenience
+pub use broker_metadata::BrokerMetadata;
 pub use constants::*;
+pub use context::RuntimeContext;
 pub use coordinator::{GroupCoordinator, GroupState};
 pub use error::{KafkaError, Result};
+pub use handler_context::HandlerContext;
 pub use listener::run as run_listener;
 pub use messages::{KafkaRequest, KafkaResponse};
 pub use notifications::InternalNotification;
 pub use pending_fetches::PendingFetchRegistry;
 pub use response_builders::*;
+pub use shadow::{ShadowConfig, ShadowError, ShadowMode, SyncMode, TopicShadowConfig};
 pub use storage::{KafkaStore, PostgresStore};

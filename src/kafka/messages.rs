@@ -898,3 +898,563 @@ impl From<kafka_protocol::messages::list_offsets_request::ListOffsetsPartition>
 // - Bounded channels for backpressure (10,000 capacity)
 // - Cleaner ownership model (no global static)
 // - Easier testing with injected channels
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========== RecordHeader Tests ==========
+
+    #[test]
+    fn test_record_header_new() {
+        let header = RecordHeader {
+            key: "content-type".to_string(),
+            value: b"application/json".to_vec(),
+        };
+        assert_eq!(header.key, "content-type");
+        assert_eq!(header.value, b"application/json".to_vec());
+    }
+
+    #[test]
+    fn test_record_header_with_empty_key() {
+        let header = RecordHeader {
+            key: "".to_string(),
+            value: b"value".to_vec(),
+        };
+        assert!(header.key.is_empty());
+        assert_eq!(header.value, b"value".to_vec());
+    }
+
+    #[test]
+    fn test_record_header_with_empty_value() {
+        let header = RecordHeader {
+            key: "key".to_string(),
+            value: vec![],
+        };
+        assert_eq!(header.key, "key");
+        assert!(header.value.is_empty());
+    }
+
+    #[test]
+    fn test_record_header_clone() {
+        let header = RecordHeader {
+            key: "test-key".to_string(),
+            value: vec![1, 2, 3, 4, 5],
+        };
+        let cloned = header.clone();
+        assert_eq!(cloned.key, header.key);
+        assert_eq!(cloned.value, header.value);
+    }
+
+    #[test]
+    fn test_record_header_debug_format() {
+        let header = RecordHeader {
+            key: "debug-key".to_string(),
+            value: vec![0xDE, 0xAD],
+        };
+        let debug_str = format!("{:?}", header);
+        assert!(debug_str.contains("debug-key"));
+        assert!(debug_str.contains("RecordHeader"));
+    }
+
+    // ========== Record Tests ==========
+
+    #[test]
+    fn test_record_new_minimal() {
+        let record = Record {
+            key: None,
+            value: None,
+            headers: vec![],
+            timestamp: None,
+        };
+        assert!(record.key.is_none());
+        assert!(record.value.is_none());
+        assert!(record.headers.is_empty());
+        assert!(record.timestamp.is_none());
+    }
+
+    #[test]
+    fn test_record_with_all_fields() {
+        let record = Record {
+            key: Some(b"my-key".to_vec()),
+            value: Some(b"my-value".to_vec()),
+            headers: vec![RecordHeader {
+                key: "h1".to_string(),
+                value: b"v1".to_vec(),
+            }],
+            timestamp: Some(1234567890123),
+        };
+        assert_eq!(record.key, Some(b"my-key".to_vec()));
+        assert_eq!(record.value, Some(b"my-value".to_vec()));
+        assert_eq!(record.headers.len(), 1);
+        assert_eq!(record.timestamp, Some(1234567890123));
+    }
+
+    #[test]
+    fn test_record_with_headers() {
+        let record = Record {
+            key: Some(b"k".to_vec()),
+            value: Some(b"v".to_vec()),
+            headers: vec![
+                RecordHeader {
+                    key: "h1".to_string(),
+                    value: b"v1".to_vec(),
+                },
+                RecordHeader {
+                    key: "h2".to_string(),
+                    value: b"v2".to_vec(),
+                },
+                RecordHeader {
+                    key: "h3".to_string(),
+                    value: b"v3".to_vec(),
+                },
+            ],
+            timestamp: None,
+        };
+        assert_eq!(record.headers.len(), 3);
+        assert_eq!(record.headers[0].key, "h1");
+        assert_eq!(record.headers[1].key, "h2");
+        assert_eq!(record.headers[2].key, "h3");
+    }
+
+    #[test]
+    fn test_record_clone() {
+        let record = Record {
+            key: Some(b"clone-key".to_vec()),
+            value: Some(b"clone-value".to_vec()),
+            headers: vec![RecordHeader {
+                key: "hdr".to_string(),
+                value: b"val".to_vec(),
+            }],
+            timestamp: Some(999),
+        };
+        let cloned = record.clone();
+        assert_eq!(cloned.key, record.key);
+        assert_eq!(cloned.value, record.value);
+        assert_eq!(cloned.headers.len(), record.headers.len());
+        assert_eq!(cloned.timestamp, record.timestamp);
+    }
+
+    #[test]
+    fn test_record_with_timestamp() {
+        let record = Record {
+            key: None,
+            value: None,
+            headers: vec![],
+            timestamp: Some(0), // Epoch
+        };
+        assert_eq!(record.timestamp, Some(0));
+
+        let record2 = Record {
+            key: None,
+            value: None,
+            headers: vec![],
+            timestamp: Some(i64::MAX),
+        };
+        assert_eq!(record2.timestamp, Some(i64::MAX));
+    }
+
+    // ========== ProducerMetadata Tests ==========
+
+    #[test]
+    fn test_producer_metadata_default() {
+        let meta = ProducerMetadata::default();
+        assert_eq!(meta.producer_id, 0);
+        assert_eq!(meta.producer_epoch, 0);
+        assert_eq!(meta.base_sequence, 0);
+    }
+
+    #[test]
+    fn test_producer_metadata_with_values() {
+        let meta = ProducerMetadata {
+            producer_id: 12345,
+            producer_epoch: 5,
+            base_sequence: 100,
+        };
+        assert_eq!(meta.producer_id, 12345);
+        assert_eq!(meta.producer_epoch, 5);
+        assert_eq!(meta.base_sequence, 100);
+    }
+
+    #[test]
+    fn test_producer_metadata_non_idempotent() {
+        // Non-idempotent producers use -1 for producer_id and epoch
+        let meta = ProducerMetadata {
+            producer_id: -1,
+            producer_epoch: -1,
+            base_sequence: -1,
+        };
+        assert_eq!(meta.producer_id, -1);
+        assert_eq!(meta.producer_epoch, -1);
+        assert_eq!(meta.base_sequence, -1);
+    }
+
+    #[test]
+    fn test_producer_metadata_clone() {
+        let meta = ProducerMetadata {
+            producer_id: 999,
+            producer_epoch: 7,
+            base_sequence: 42,
+        };
+        let cloned = meta.clone();
+        assert_eq!(cloned.producer_id, meta.producer_id);
+        assert_eq!(cloned.producer_epoch, meta.producer_epoch);
+        assert_eq!(cloned.base_sequence, meta.base_sequence);
+    }
+
+    // ========== TopicProduceData Tests ==========
+
+    #[test]
+    fn test_topic_produce_data_construction() {
+        let data = TopicProduceData {
+            name: "test-topic".to_string(),
+            partitions: vec![],
+        };
+        assert_eq!(data.name, "test-topic");
+        assert!(data.partitions.is_empty());
+    }
+
+    #[test]
+    fn test_topic_produce_data_with_partitions() {
+        let data = TopicProduceData {
+            name: "multi-partition".to_string(),
+            partitions: vec![
+                PartitionProduceData {
+                    partition_index: 0,
+                    records: vec![],
+                    producer_metadata: None,
+                },
+                PartitionProduceData {
+                    partition_index: 1,
+                    records: vec![],
+                    producer_metadata: None,
+                },
+            ],
+        };
+        assert_eq!(data.partitions.len(), 2);
+        assert_eq!(data.partitions[0].partition_index, 0);
+        assert_eq!(data.partitions[1].partition_index, 1);
+    }
+
+    // ========== PartitionProduceData Tests ==========
+
+    #[test]
+    fn test_partition_produce_data_empty() {
+        let data = PartitionProduceData {
+            partition_index: 0,
+            records: vec![],
+            producer_metadata: None,
+        };
+        assert_eq!(data.partition_index, 0);
+        assert!(data.records.is_empty());
+        assert!(data.producer_metadata.is_none());
+    }
+
+    #[test]
+    fn test_partition_produce_data_with_records() {
+        let data = PartitionProduceData {
+            partition_index: 5,
+            records: vec![
+                Record {
+                    key: Some(b"k1".to_vec()),
+                    value: Some(b"v1".to_vec()),
+                    headers: vec![],
+                    timestamp: None,
+                },
+                Record {
+                    key: Some(b"k2".to_vec()),
+                    value: Some(b"v2".to_vec()),
+                    headers: vec![],
+                    timestamp: None,
+                },
+            ],
+            producer_metadata: Some(ProducerMetadata {
+                producer_id: 100,
+                producer_epoch: 1,
+                base_sequence: 0,
+            }),
+        };
+        assert_eq!(data.partition_index, 5);
+        assert_eq!(data.records.len(), 2);
+        assert!(data.producer_metadata.is_some());
+    }
+
+    // ========== TopicFetchData Tests ==========
+
+    #[test]
+    fn test_topic_fetch_data_construction() {
+        let data = TopicFetchData {
+            name: "fetch-topic".to_string(),
+            partitions: vec![],
+        };
+        assert_eq!(data.name, "fetch-topic");
+        assert!(data.partitions.is_empty());
+    }
+
+    #[test]
+    fn test_topic_fetch_data_with_partitions() {
+        let data = TopicFetchData {
+            name: "multi-fetch".to_string(),
+            partitions: vec![
+                PartitionFetchData {
+                    partition_index: 0,
+                    fetch_offset: 100,
+                    partition_max_bytes: 1024,
+                },
+                PartitionFetchData {
+                    partition_index: 1,
+                    fetch_offset: 200,
+                    partition_max_bytes: 2048,
+                },
+            ],
+        };
+        assert_eq!(data.partitions.len(), 2);
+    }
+
+    // ========== PartitionFetchData Tests ==========
+
+    #[test]
+    fn test_partition_fetch_data() {
+        let data = PartitionFetchData {
+            partition_index: 3,
+            fetch_offset: 12345,
+            partition_max_bytes: 1048576,
+        };
+        assert_eq!(data.partition_index, 3);
+        assert_eq!(data.fetch_offset, 12345);
+        assert_eq!(data.partition_max_bytes, 1048576);
+    }
+
+    // ========== OffsetCommitTopicData Tests ==========
+
+    #[test]
+    fn test_offset_commit_topic_data() {
+        let data = OffsetCommitTopicData {
+            name: "commit-topic".to_string(),
+            partitions: vec![OffsetCommitPartitionData {
+                partition_index: 0,
+                committed_offset: 500,
+                metadata: Some("test-metadata".to_string()),
+            }],
+        };
+        assert_eq!(data.name, "commit-topic");
+        assert_eq!(data.partitions.len(), 1);
+        assert_eq!(data.partitions[0].committed_offset, 500);
+    }
+
+    // ========== OffsetCommitPartitionData Tests ==========
+
+    #[test]
+    fn test_offset_commit_partition_data_with_metadata() {
+        let data = OffsetCommitPartitionData {
+            partition_index: 2,
+            committed_offset: 999,
+            metadata: Some("my-consumer-metadata".to_string()),
+        };
+        assert_eq!(data.partition_index, 2);
+        assert_eq!(data.committed_offset, 999);
+        assert_eq!(data.metadata, Some("my-consumer-metadata".to_string()));
+    }
+
+    #[test]
+    fn test_offset_commit_partition_data_without_metadata() {
+        let data = OffsetCommitPartitionData {
+            partition_index: 0,
+            committed_offset: 0,
+            metadata: None,
+        };
+        assert!(data.metadata.is_none());
+    }
+
+    // ========== OffsetFetchTopicData Tests ==========
+
+    #[test]
+    fn test_offset_fetch_topic_data() {
+        let data = OffsetFetchTopicData {
+            name: "fetch-offsets-topic".to_string(),
+            partition_indexes: vec![0, 1, 2, 3],
+        };
+        assert_eq!(data.name, "fetch-offsets-topic");
+        assert_eq!(data.partition_indexes, vec![0, 1, 2, 3]);
+    }
+
+    // ========== JoinGroupProtocol Tests ==========
+
+    #[test]
+    fn test_join_group_protocol() {
+        let proto = JoinGroupProtocol {
+            name: "range".to_string(),
+            metadata: vec![0, 1, 2, 3],
+        };
+        assert_eq!(proto.name, "range");
+        assert_eq!(proto.metadata.len(), 4);
+    }
+
+    // ========== SyncGroupAssignment Tests ==========
+
+    #[test]
+    fn test_sync_group_assignment() {
+        let assign = SyncGroupAssignment {
+            member_id: "member-123".to_string(),
+            assignment: vec![10, 20, 30],
+        };
+        assert_eq!(assign.member_id, "member-123");
+        assert_eq!(assign.assignment, vec![10, 20, 30]);
+    }
+
+    // ========== MemberIdentity Tests ==========
+
+    #[test]
+    fn test_member_identity_with_instance_id() {
+        let id = MemberIdentity {
+            member_id: "m1".to_string(),
+            group_instance_id: Some("instance-1".to_string()),
+        };
+        assert_eq!(id.member_id, "m1");
+        assert_eq!(id.group_instance_id, Some("instance-1".to_string()));
+    }
+
+    #[test]
+    fn test_member_identity_without_instance_id() {
+        let id = MemberIdentity {
+            member_id: "m2".to_string(),
+            group_instance_id: None,
+        };
+        assert_eq!(id.member_id, "m2");
+        assert!(id.group_instance_id.is_none());
+    }
+
+    // ========== ListOffsetsTopicData Tests ==========
+
+    #[test]
+    fn test_list_offsets_topic_data() {
+        let data = ListOffsetsTopicData {
+            name: "offsets-topic".to_string(),
+            partitions: vec![ListOffsetsPartitionData {
+                partition_index: 0,
+                current_leader_epoch: -1,
+                timestamp: -2, // Earliest
+            }],
+        };
+        assert_eq!(data.name, "offsets-topic");
+        assert_eq!(data.partitions.len(), 1);
+    }
+
+    // ========== ListOffsetsPartitionData Tests ==========
+
+    #[test]
+    fn test_list_offsets_partition_data_earliest() {
+        let data = ListOffsetsPartitionData {
+            partition_index: 0,
+            current_leader_epoch: -1,
+            timestamp: -2, // Earliest offset
+        };
+        assert_eq!(data.timestamp, -2);
+    }
+
+    #[test]
+    fn test_list_offsets_partition_data_latest() {
+        let data = ListOffsetsPartitionData {
+            partition_index: 0,
+            current_leader_epoch: -1,
+            timestamp: -1, // Latest offset
+        };
+        assert_eq!(data.timestamp, -1);
+    }
+
+    #[test]
+    fn test_list_offsets_partition_data_at_timestamp() {
+        let data = ListOffsetsPartitionData {
+            partition_index: 1,
+            current_leader_epoch: 5,
+            timestamp: 1704067200000, // 2024-01-01 00:00:00 UTC
+        };
+        assert_eq!(data.timestamp, 1704067200000);
+        assert_eq!(data.current_leader_epoch, 5);
+    }
+
+    // ========== CreateTopicRequest Tests ==========
+
+    #[test]
+    fn test_create_topic_request() {
+        let req = CreateTopicRequest {
+            name: "new-topic".to_string(),
+            num_partitions: 3,
+            replication_factor: 1,
+        };
+        assert_eq!(req.name, "new-topic");
+        assert_eq!(req.num_partitions, 3);
+        assert_eq!(req.replication_factor, 1);
+    }
+
+    #[test]
+    fn test_create_topic_request_broker_defaults() {
+        let req = CreateTopicRequest {
+            name: "default-topic".to_string(),
+            num_partitions: -1,     // Broker default
+            replication_factor: -1, // Broker default
+        };
+        assert_eq!(req.num_partitions, -1);
+        assert_eq!(req.replication_factor, -1);
+    }
+
+    // ========== CreatePartitionsTopicRequest Tests ==========
+
+    #[test]
+    fn test_create_partitions_topic_request() {
+        let req = CreatePartitionsTopicRequest {
+            name: "expand-topic".to_string(),
+            count: 10,
+        };
+        assert_eq!(req.name, "expand-topic");
+        assert_eq!(req.count, 10);
+    }
+
+    // ========== TopicProduceResponse Tests ==========
+
+    #[test]
+    fn test_topic_produce_response() {
+        let resp = TopicProduceResponse {
+            name: "resp-topic".to_string(),
+            partitions: vec![PartitionProduceResponse {
+                partition_index: 0,
+                error_code: 0,
+                base_offset: 100,
+                log_append_time: -1,
+                log_start_offset: 0,
+            }],
+        };
+        assert_eq!(resp.name, "resp-topic");
+        assert_eq!(resp.partitions.len(), 1);
+        assert_eq!(resp.partitions[0].base_offset, 100);
+    }
+
+    // ========== PartitionProduceResponse Tests ==========
+
+    #[test]
+    fn test_partition_produce_response_success() {
+        let resp = PartitionProduceResponse {
+            partition_index: 0,
+            error_code: 0,
+            base_offset: 50,
+            log_append_time: 1234567890123,
+            log_start_offset: 0,
+        };
+        assert_eq!(resp.error_code, 0);
+        assert_eq!(resp.base_offset, 50);
+        assert_eq!(resp.log_append_time, 1234567890123);
+    }
+
+    #[test]
+    fn test_partition_produce_response_error() {
+        let resp = PartitionProduceResponse {
+            partition_index: 1,
+            error_code: 3, // UNKNOWN_TOPIC_OR_PARTITION
+            base_offset: -1,
+            log_append_time: -1,
+            log_start_offset: -1,
+        };
+        assert_eq!(resp.error_code, 3);
+        assert_eq!(resp.base_offset, -1);
+    }
+}

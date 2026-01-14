@@ -29,6 +29,8 @@ use std::time::{Duration, Instant};
 
 // Import conditional logging macros from lib.rs
 use crate::kafka::constants::*;
+use crate::kafka::shadow::ShadowStore;
+use crate::kafka::{KafkaStore, PostgresStore};
 use crate::{pg_log, pg_warning};
 
 /// How often to check for member timeouts
@@ -36,6 +38,9 @@ const TIMEOUT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// How often to check for timed-out transactions (less frequent than member timeouts)
 const TXN_TIMEOUT_CHECK_INTERVAL: Duration = Duration::from_secs(10);
+
+// Configuration reload interval is now controlled by pg_kafka.config_reload_interval_ms GUC
+// (default 30s, tests can set to 1-2s for fast iteration)
 
 /// Timeout for blocking recv - allows periodic signal checks
 const RECV_TIMEOUT: Duration = Duration::from_millis(100);
@@ -121,7 +126,11 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
 
     // Step 2: Load configuration (GUCs are available after _PG_init)
-    let config = crate::config::Config::load();
+    // Create RuntimeContext for centralized config access across all modules
+    let runtime_context = std::sync::Arc::new(crate::kafka::RuntimeContext::new(
+        crate::config::Config::load(),
+    ));
+    let config = runtime_context.config();
 
     // Step 3: Connect to the configured database (required for SPI access)
     // IMPORTANT: Must connect to the database where CREATE EXTENSION was run
@@ -185,23 +194,43 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
         config.database
     );
 
+    // Step 3c: Initialize shadow mode store (Phase 11)
+    // Always create ShadowStore wrapping PostgresStore. Shadow mode can be
+    // enabled/disabled at runtime via pg_kafka.shadow_mode_enabled GUC.
+    // The producer is lazily initialized on first use when enabled.
+    // Pass RuntimeContext to enable centralized config access.
+    let shadow_store: std::sync::Arc<ShadowStore<PostgresStore>> = std::sync::Arc::new(
+        ShadowStore::with_context(PostgresStore::new(), runtime_context.clone()),
+    );
+
+    // Set license key for shadow mode (Commercial License)
+    shadow_store.set_license_key(&config.shadow_license_key);
+
+    if config.shadow_mode_enabled {
+        log!(
+            "Shadow mode enabled, configured to forward to: {}",
+            config.shadow_bootstrap_servers
+        );
+    }
+
     // Step 4: Clone config values for use in threads
     let port = config.port;
     let host = config.host.clone();
-    let log_connections = config.log_connections;
     let shutdown_timeout = Duration::from_millis(config.shutdown_timeout_ms as u64);
     let default_partitions = config.default_partitions;
-    let fetch_poll_interval_ms = config.fetch_poll_interval_ms;
-    let enable_long_polling = config.enable_long_polling;
     let compression = parse_compression_type(&config.compression_type);
     let log_timing = config.log_timing;
+
     // Convert 0.0.0.0 to localhost for advertised host (used in Metadata and FindCoordinator)
     // 0.0.0.0 is not routable from clients - they need a resolvable hostname
-    let broker_host = if host == "0.0.0.0" || host.is_empty() {
+    let advertised_host = if host == "0.0.0.0" || host.is_empty() {
         "localhost".to_string()
     } else {
         host.clone()
     };
+
+    // Create BrokerMetadata once (eliminates string allocations on every Metadata/FindCoordinator request)
+    let broker_metadata = crate::kafka::BrokerMetadata::new(advertised_host, port);
 
     // Step 5: Create bounded request channel (backpressure at 10,000 pending requests)
     // This is the bridge between the network thread and the database thread.
@@ -215,6 +244,20 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     // are acceptable - fetch handlers fall back to polling.
     let (notify_tx, notify_rx) =
         crossbeam_channel::bounded::<crate::kafka::InternalNotification>(10_000);
+
+    // Step 5c: Create forward channel for async shadow forwarding (Phase 11)
+    // This channel sends ForwardRequest messages from the DB thread to the network
+    // thread for non-blocking forwarding to external Kafka when sync_mode=async.
+    // Bounded to prevent OOM - on channel full, requests are dropped (fire-and-forget).
+    let (forward_tx, forward_rx) =
+        crossbeam_channel::bounded::<crate::kafka::shadow::ForwardRequest>(10_000);
+
+    // Set forward_tx on ShadowStore for async forwarding
+    shadow_store.set_forward_channel(forward_tx);
+
+    // Step 5d: Pass RuntimeContext to network thread for config access
+    // The network thread will use this to access shadow config and other settings dynamically
+    let runtime_context_for_network = runtime_context.clone();
 
     // Step 6: Create shutdown signal channel
     // Simple mpsc channel - network thread checks for message to shutdown
@@ -297,10 +340,9 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
                     tcp_listener,
                     request_tx,
                     notify_rx,
+                    forward_rx,
+                    runtime_context_for_network,
                     shutdown_rx,
-                    log_connections,
-                    enable_long_polling,
-                    fetch_poll_interval_ms,
                 )
                 .await
                 {
@@ -347,10 +389,29 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
 
     let mut last_timeout_check = Instant::now();
     let mut last_txn_timeout_check = Instant::now();
+    let mut last_config_reload = Instant::now();
+
+    // Phase 11: Initial shadow config load
+    {
+        let shadow_init = AssertUnwindSafe(&shadow_store);
+        BackgroundWorker::transaction(move || match shadow_init.load_topic_config_from_db() {
+            Ok(count) => {
+                if count > 0 {
+                    log!("Loaded {} shadow topic configurations", count);
+                }
+            }
+            Err(e) => {
+                pg_warning!("Failed to load shadow config: {:?}", e);
+            }
+        });
+    }
+
+    // Flag to track if SIGHUP was received (triggers immediate config reload)
+    let mut sighup_pending = false;
 
     loop {
         // ┌─────────────────────────────────────────────────────────────┐
-        // │ Check for Postgres Shutdown Signal                         │
+        // │ Check for Postgres Shutdown Signal                          │
         // └─────────────────────────────────────────────────────────────┘
         if BackgroundWorker::sigterm_received() {
             log!("pg_kafka background worker shutting down");
@@ -376,6 +437,18 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
         }
 
         // ┌─────────────────────────────────────────────────────────────┐
+        // │ Check for SIGHUP (Config Reload Signal)                     │
+        // └─────────────────────────────────────────────────────────────┘
+        // When pg_reload_conf() is called, we receive SIGHUP. This triggers
+        // an immediate config reload on the next loop iteration, bypassing
+        // the normal reload_interval check. This is critical for tests that
+        // change GUCs and need the changes to take effect immediately.
+        if BackgroundWorker::sighup_received() {
+            sighup_pending = true;
+            pg_log!("SIGHUP received, config reload pending");
+        }
+
+        // ┌─────────────────────────────────────────────────────────────┐
         // │ Wait for Next Request (Blocking with Timeout)              │
         // └─────────────────────────────────────────────────────────────┘
         // This is the key performance improvement: we block until work arrives.
@@ -386,11 +459,11 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
                 // │ Process Database Request (SPI in Transaction)      │
                 // └─────────────────────────────────────────────────────┘
                 let coord = coordinator.clone();
-                let broker_h = broker_host.clone();
-                let broker_p = port;
+                let broker = broker_metadata.clone(); // Cheap Arc pointer copy
                 let default_parts = default_partitions;
                 let notifier = notify_tx.clone();
                 let comp = compression;
+                let shadow = shadow_store.clone();
 
                 // Timing instrumentation (enabled via pg_kafka.log_timing GUC)
                 // Measures transaction overhead vs handler execution time
@@ -404,6 +477,8 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
                 let handler_duration = std::cell::Cell::new(Duration::ZERO);
                 // Wrap in AssertUnwindSafe to satisfy UnwindSafe requirement
                 let handler_duration_ref = AssertUnwindSafe(&handler_duration);
+                // ShadowStore contains FutureProducer which isn't RefUnwindSafe
+                let shadow_ref = AssertUnwindSafe(&shadow);
 
                 BackgroundWorker::transaction(move || {
                     let handler_start = std::time::Instant::now();
@@ -413,11 +488,11 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
                         process_request(
                             request,
                             &coord,
-                            &broker_h,
-                            broker_p,
+                            &broker,
                             default_parts,
                             &notifier,
                             comp,
+                            *shadow_ref,
                         );
                     }));
 
@@ -506,6 +581,65 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
             });
             last_txn_timeout_check = Instant::now();
         }
+
+        // ┌─────────────────────────────────────────────────────────────┐
+        // │ Configuration Reload (GUCs + Shadow Config)                 │
+        // │ Triggers: Periodic (configurable via config_reload_interval_ms GUC, default 30s) │
+        // └─────────────────────────────────────────────────────────────┘
+        // Unified reload cycle:
+        // 1. Reload GUCs (runtime-changeable settings like compression, log settings, etc.)
+        // 2. Reload shadow topic configurations from database
+        // 3. Flush shadow metrics
+        // This allows configuration changes to take effect without restarting Postgres.
+        // PostMasterContext GUCs (port, host) still require restart.
+
+        // Reload config either on schedule OR immediately after SIGHUP
+        let reload_interval_ms = crate::config::CONFIG_RELOAD_INTERVAL_MS.get();
+        let reload_interval = Duration::from_millis(reload_interval_ms as u64);
+        let should_reload = sighup_pending || last_config_reload.elapsed() >= reload_interval;
+
+        if should_reload {
+            if sighup_pending {
+                pg_log!(
+                    "Immediate config reload triggered by SIGHUP (interval={}ms)",
+                    reload_interval_ms
+                );
+                sighup_pending = false;
+
+                // CRITICAL: Call ProcessConfigFile to actually reload GUC values
+                // Without this, GUC changes made via ALTER SYSTEM won't take effect
+                // in this background worker. This is the standard PostgreSQL pattern.
+                unsafe {
+                    pgrx::pg_sys::ProcessConfigFile(pgrx::pg_sys::GucContext::PGC_SIGHUP);
+                }
+                pg_log!("ProcessConfigFile called, GUCs reloaded from postgresql.auto.conf");
+            }
+
+            // 1. Reload GUCs (update RuntimeContext cache)
+            runtime_context.reload();
+            pg_log!("Reloaded GUC configuration");
+
+            // 2. Reload shadow config and flush metrics
+            let shadow_reload = AssertUnwindSafe(&shadow_store);
+            BackgroundWorker::transaction(move || {
+                // Reload topic shadow configurations
+                match shadow_reload.load_topic_config_from_db() {
+                    Ok(count) => {
+                        pg_log!("Reloaded {} shadow topic configurations", count);
+                    }
+                    Err(e) => {
+                        pg_warning!("Failed to reload shadow config: {:?}", e);
+                    }
+                }
+
+                // Flush accumulated metrics to database/logs
+                if let Err(e) = shadow_reload.flush_metrics_to_db() {
+                    pg_warning!("Failed to flush shadow metrics: {:?}", e);
+                }
+            });
+
+            last_config_reload = Instant::now();
+        }
     }
 }
 
@@ -522,22 +656,23 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
 /// This function is public to allow unit testing, but is not part of the
 /// public API and should not be called directly by external code.
 #[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
 pub fn process_request(
     request: crate::kafka::KafkaRequest,
     coordinator: &std::sync::Arc<crate::kafka::GroupCoordinator>,
-    broker_host: &str,
-    broker_port: i32,
+    broker_metadata: &crate::kafka::BrokerMetadata,
     default_partitions: i32,
     notify_tx: &crossbeam_channel::Sender<crate::kafka::InternalNotification>,
     compression: kafka_protocol::records::Compression,
+    shadow_store: &std::sync::Arc<ShadowStore<PostgresStore>>,
 ) {
     use crate::kafka::dispatch::{dispatch_infallible, dispatch_response};
+    use crate::kafka::handlers;
     use crate::kafka::messages::KafkaResponse;
-    use crate::kafka::storage::KafkaStore;
-    use crate::kafka::{handlers, PostgresStore};
 
-    // Create store once - it's a stateless unit struct (zero-cost)
-    let store = PostgresStore::new();
+    // ShadowStore wraps PostgresStore and handles shadow mode internally.
+    // It checks the GUC at runtime to decide whether to forward.
+    let store: &dyn KafkaStore = shadow_store.as_ref();
 
     match request {
         // ===== ApiVersions (infallible - no storage) =====
@@ -567,21 +702,18 @@ pub fn process_request(
             response_tx,
             ..
         } => {
-            let advertised_host = broker_host.to_string();
-            let advertised_port = broker_port;
+            let ctx = crate::kafka::HandlerContext::new(
+                store,
+                coordinator,
+                broker_metadata,
+                default_partitions,
+                compression,
+            );
 
             dispatch_response(
                 "Metadata",
                 response_tx,
-                || {
-                    handlers::handle_metadata(
-                        &store,
-                        requested_topics,
-                        advertised_host,
-                        advertised_port,
-                        default_partitions,
-                    )
-                },
+                || handlers::handle_metadata(&ctx, requested_topics),
                 |r| KafkaResponse::Metadata {
                     correlation_id,
                     api_version,
@@ -622,13 +754,15 @@ pub fn process_request(
                 // enforcing sequence validation would be misleading and waste resources.
                 // Phase 10 Note: We also skip transactional support for acks=0 since there's no
                 // guarantee of delivery - transactions require acks >= 1 for meaningful guarantees.
-                match handlers::handle_produce(
-                    &store,
-                    topic_data.clone(),
+                let ctx = crate::kafka::HandlerContext::with_notifier(
+                    store,
+                    coordinator,
+                    broker_metadata,
                     default_partitions,
-                    None,
-                    None,
-                ) {
+                    compression,
+                    notify_tx,
+                );
+                match handlers::handle_produce(&ctx, topic_data.clone(), None, None) {
                     Ok(response) => {
                         // Send notifications for long-polling consumers
                         for topic_response in &response.responses {
@@ -667,11 +801,20 @@ pub fn process_request(
             // Phase 9: Extract producer metadata for idempotent producer validation
             // This enables sequence checking, deduplication, and producer fencing
             let producer_metadata = extract_producer_metadata(&topic_data);
+
             // Phase 10: Pass transactional_id for transactional producers
-            match handlers::handle_produce(
-                &store,
-                topic_data,
+            // Phase 11: Shadow forwarding is now handled internally by ShadowStore.insert_records()
+            let ctx = crate::kafka::HandlerContext::with_notifier(
+                store,
+                coordinator,
+                broker_metadata,
                 default_partitions,
+                compression,
+                notify_tx,
+            );
+            match handlers::handle_produce(
+                &ctx,
+                topic_data,
                 producer_metadata.as_ref(),
                 transactional_id.as_deref(),
             ) {
@@ -741,10 +884,18 @@ pub fn process_request(
                 crate::kafka::storage::IsolationLevel::ReadUncommitted
             };
 
+            let ctx = crate::kafka::HandlerContext::new(
+                store,
+                coordinator,
+                broker_metadata,
+                default_partitions,
+                compression,
+            );
+
             dispatch_response(
                 "Fetch",
                 response_tx,
-                || handlers::handle_fetch(&store, topic_data, compression, isolation),
+                || handlers::handle_fetch(&ctx, topic_data, isolation),
                 |r| KafkaResponse::Fetch {
                     correlation_id,
                     api_version,
@@ -769,10 +920,18 @@ pub fn process_request(
             response_tx,
             ..
         } => {
+            let ctx = crate::kafka::HandlerContext::new(
+                store,
+                coordinator,
+                broker_metadata,
+                default_partitions,
+                compression,
+            );
+
             dispatch_response(
                 "OffsetCommit",
                 response_tx,
-                || handlers::handle_offset_commit(&store, group_id, topics),
+                || handlers::handle_offset_commit(&ctx, group_id, topics),
                 |r| KafkaResponse::OffsetCommit {
                     correlation_id,
                     api_version,
@@ -797,10 +956,18 @@ pub fn process_request(
             response_tx,
             ..
         } => {
+            let ctx = crate::kafka::HandlerContext::new(
+                store,
+                coordinator,
+                broker_metadata,
+                default_partitions,
+                compression,
+            );
+
             dispatch_response(
                 "OffsetFetch",
                 response_tx,
-                || handlers::handle_offset_fetch(&store, group_id, topics),
+                || handlers::handle_offset_fetch(&ctx, group_id, topics),
                 |r| KafkaResponse::OffsetFetch {
                     correlation_id,
                     api_version,
@@ -825,12 +992,18 @@ pub fn process_request(
             response_tx,
             ..
         } => {
-            let host = broker_host.to_string();
-            let port = broker_port;
+            let ctx = crate::kafka::HandlerContext::new(
+                store,
+                coordinator,
+                broker_metadata,
+                default_partitions,
+                compression,
+            );
+
             dispatch_response(
                 "FindCoordinator",
                 response_tx,
-                || handlers::handle_find_coordinator(host, port, key, key_type),
+                || handlers::handle_find_coordinator(&ctx, key, key_type),
                 |r| KafkaResponse::FindCoordinator {
                     correlation_id,
                     api_version,
@@ -861,14 +1034,21 @@ pub fn process_request(
             response_tx,
             ..
         } => {
-            let coord = coordinator.clone();
+            let ctx = crate::kafka::HandlerContext::new(
+                store,
+                coordinator,
+                broker_metadata,
+                default_partitions,
+                compression,
+            );
             let cid = client_id.unwrap_or_else(|| "unknown".to_string());
+
             dispatch_response(
                 "JoinGroup",
                 response_tx,
                 || {
                     handlers::handle_join_group(
-                        &coord,
+                        &ctx,
                         group_id,
                         member_id,
                         cid,
@@ -904,14 +1084,20 @@ pub fn process_request(
             response_tx,
             ..
         } => {
-            let coord = coordinator.clone();
+            let ctx = crate::kafka::HandlerContext::new(
+                store,
+                coordinator,
+                broker_metadata,
+                default_partitions,
+                compression,
+            );
+
             dispatch_response(
                 "SyncGroup",
                 response_tx,
                 || {
                     handlers::handle_sync_group(
-                        &coord,
-                        &store,
+                        &ctx,
                         group_id,
                         member_id,
                         generation_id,
@@ -943,11 +1129,18 @@ pub fn process_request(
             response_tx,
             ..
         } => {
-            let coord = coordinator.clone();
+            let ctx = crate::kafka::HandlerContext::new(
+                store,
+                coordinator,
+                broker_metadata,
+                default_partitions,
+                compression,
+            );
+
             dispatch_response(
                 "Heartbeat",
                 response_tx,
-                || handlers::handle_heartbeat(&coord, group_id, member_id, generation_id),
+                || handlers::handle_heartbeat(&ctx, group_id, member_id, generation_id),
                 |r| KafkaResponse::Heartbeat {
                     correlation_id,
                     api_version,
@@ -972,11 +1165,18 @@ pub fn process_request(
             response_tx,
             ..
         } => {
-            let coord = coordinator.clone();
+            let ctx = crate::kafka::HandlerContext::new(
+                store,
+                coordinator,
+                broker_metadata,
+                default_partitions,
+                compression,
+            );
+
             dispatch_response(
                 "LeaveGroup",
                 response_tx,
-                || handlers::handle_leave_group(&coord, group_id, member_id),
+                || handlers::handle_leave_group(&ctx, group_id, member_id),
                 |r| KafkaResponse::LeaveGroup {
                     correlation_id,
                     api_version,
@@ -1000,10 +1200,18 @@ pub fn process_request(
             response_tx,
             ..
         } => {
+            let ctx = crate::kafka::HandlerContext::new(
+                store,
+                coordinator,
+                broker_metadata,
+                default_partitions,
+                compression,
+            );
+
             dispatch_response(
                 "ListOffsets",
                 response_tx,
-                || handlers::handle_list_offsets(&store, topics),
+                || handlers::handle_list_offsets(&ctx, topics),
                 |r| KafkaResponse::ListOffsets {
                     correlation_id,
                     api_version,
@@ -1027,11 +1235,18 @@ pub fn process_request(
             response_tx,
             ..
         } => {
-            let coord = coordinator.clone();
+            let ctx = crate::kafka::HandlerContext::new(
+                store,
+                coordinator,
+                broker_metadata,
+                default_partitions,
+                compression,
+            );
+
             dispatch_response(
                 "DescribeGroups",
                 response_tx,
-                || handlers::handle_describe_groups(&coord, groups),
+                || handlers::handle_describe_groups(&ctx, groups),
                 |r| KafkaResponse::DescribeGroups {
                     correlation_id,
                     api_version,
@@ -1055,11 +1270,18 @@ pub fn process_request(
             response_tx,
             ..
         } => {
-            let coord = coordinator.clone();
+            let ctx = crate::kafka::HandlerContext::new(
+                store,
+                coordinator,
+                broker_metadata,
+                default_partitions,
+                compression,
+            );
+
             dispatch_response(
                 "ListGroups",
                 response_tx,
-                || handlers::handle_list_groups(&coord, states_filter),
+                || handlers::handle_list_groups(&ctx, states_filter),
                 |r| KafkaResponse::ListGroups {
                     correlation_id,
                     api_version,
@@ -1084,10 +1306,18 @@ pub fn process_request(
             response_tx,
             ..
         } => {
+            let ctx = crate::kafka::HandlerContext::new(
+                store,
+                coordinator,
+                broker_metadata,
+                default_partitions,
+                compression,
+            );
+
             dispatch_response(
                 "CreateTopics",
                 response_tx,
-                || handlers::handle_create_topics(&store, topics, validate_only),
+                || handlers::handle_create_topics(&ctx, topics, validate_only),
                 |r| KafkaResponse::CreateTopics {
                     correlation_id,
                     api_version,
@@ -1111,10 +1341,18 @@ pub fn process_request(
             response_tx,
             ..
         } => {
+            let ctx = crate::kafka::HandlerContext::new(
+                store,
+                coordinator,
+                broker_metadata,
+                default_partitions,
+                compression,
+            );
+
             dispatch_response(
                 "DeleteTopics",
                 response_tx,
-                || handlers::handle_delete_topics(&store, topic_names),
+                || handlers::handle_delete_topics(&ctx, topic_names),
                 |r| KafkaResponse::DeleteTopics {
                     correlation_id,
                     api_version,
@@ -1139,10 +1377,18 @@ pub fn process_request(
             response_tx,
             ..
         } => {
+            let ctx = crate::kafka::HandlerContext::new(
+                store,
+                coordinator,
+                broker_metadata,
+                default_partitions,
+                compression,
+            );
+
             dispatch_response(
                 "CreatePartitions",
                 response_tx,
-                || handlers::handle_create_partitions(&store, topics, validate_only),
+                || handlers::handle_create_partitions(&ctx, topics, validate_only),
                 |r| KafkaResponse::CreatePartitions {
                     correlation_id,
                     api_version,
@@ -1167,11 +1413,18 @@ pub fn process_request(
             response_tx,
             ..
         } => {
-            let coord = coordinator.clone();
+            let ctx = crate::kafka::HandlerContext::new(
+                store,
+                coordinator,
+                broker_metadata,
+                default_partitions,
+                compression,
+            );
+
             dispatch_response(
                 "DeleteGroups",
                 response_tx,
-                || handlers::handle_delete_groups(&store, &coord, groups_names),
+                || handlers::handle_delete_groups(&ctx, groups_names),
                 |r| KafkaResponse::DeleteGroups {
                     correlation_id,
                     api_version,
@@ -1198,12 +1451,20 @@ pub fn process_request(
             client_id,
             response_tx,
         } => {
+            let ctx = crate::kafka::HandlerContext::new(
+                store,
+                coordinator,
+                broker_metadata,
+                default_partitions,
+                compression,
+            );
+
             dispatch_response(
                 "InitProducerId",
                 response_tx,
                 || {
                     handlers::handle_init_producer_id(
-                        &store,
+                        &ctx,
                         transactional_id,
                         transaction_timeout_ms,
                         existing_producer_id,
@@ -1238,12 +1499,20 @@ pub fn process_request(
             response_tx,
             ..
         } => {
+            let ctx = crate::kafka::HandlerContext::new(
+                store,
+                coordinator,
+                broker_metadata,
+                default_partitions,
+                compression,
+            );
+
             dispatch_response(
                 "AddPartitionsToTxn",
                 response_tx,
                 || {
                     handlers::handle_add_partitions_to_txn(
-                        &store,
+                        &ctx,
                         &transactional_id,
                         producer_id,
                         producer_epoch,
@@ -1278,12 +1547,20 @@ pub fn process_request(
             response_tx,
             ..
         } => {
+            let ctx = crate::kafka::HandlerContext::new(
+                store,
+                coordinator,
+                broker_metadata,
+                default_partitions,
+                compression,
+            );
+
             dispatch_response(
                 "AddOffsetsToTxn",
                 response_tx,
                 || {
                     handlers::handle_add_offsets_to_txn(
-                        &store,
+                        &ctx,
                         &transactional_id,
                         producer_id,
                         producer_epoch,
@@ -1318,12 +1595,20 @@ pub fn process_request(
             response_tx,
             ..
         } => {
+            let ctx = crate::kafka::HandlerContext::new(
+                store,
+                coordinator,
+                broker_metadata,
+                default_partitions,
+                compression,
+            );
+
             dispatch_response(
                 "EndTxn",
                 response_tx,
                 || {
                     handlers::handle_end_txn(
-                        &store,
+                        &ctx,
                         &transactional_id,
                         producer_id,
                         producer_epoch,
@@ -1360,12 +1645,20 @@ pub fn process_request(
             response_tx,
             ..
         } => {
+            let ctx = crate::kafka::HandlerContext::new(
+                store,
+                coordinator,
+                broker_metadata,
+                default_partitions,
+                compression,
+            );
+
             dispatch_response(
                 "TxnOffsetCommit",
                 response_tx,
                 || {
                     handlers::handle_txn_offset_commit(
-                        &store,
+                        &ctx,
                         &transactional_id,
                         producer_id,
                         producer_epoch,

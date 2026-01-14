@@ -1,7 +1,7 @@
 # Test Strategy
 
-**Status:** Phase 10 Complete
-**Last Updated:** 2026-01-10
+**Status:** Phase 11 Complete (Shadow Mode)
+**Last Updated:** 2026-01-14
 
 ---
 
@@ -9,24 +9,29 @@
 
 | Category | Count | Coverage |
 |----------|-------|----------|
-| Unit Tests | 287 | Core logic, handlers, storage, protocol |
-| E2E Tests | 74 | Full protocol integration |
-| **Total** | **361** | **Comprehensive** |
+| Unit Tests | 630 | Core logic, handlers, storage, protocol, shadow |
+| E2E Tests | 104 | Full protocol integration |
+| **Total** | **734** | **Comprehensive** |
 
 ---
 
-## Unit Test Distribution (184 tests)
+## Unit Test Distribution (630 tests)
 
 | Module | Tests | Focus |
 |--------|-------|-------|
-| Assignment Strategies | 61 | Range, RoundRobin, Sticky algorithms |
-| Protocol Handlers | 22 | All 18 API handlers with MockKafkaStore |
-| Storage Layer | 22 | KafkaStore trait, types, mock verification |
-| Coordinator | 8 | Group state management, generation tracking |
-| Error Handling | 10 | Error code mapping, typed errors |
-| Partitioner | 7 | Murmur2 hash, key-based routing |
-| Protocol Encoding | 34 | Wire format, properties, framing |
-| Infrastructure | 20 | Config, mocks, helpers, constants |
+| Shadow Mode | 141 | External forwarding, SASL/SSL, replay, config |
+| Protocol Encoding | 85 | Wire format, properties, framing |
+| Handler Logic | 78 | All 23 API handlers with MockKafkaStore |
+| Assignment Strategies | 67 | Range, RoundRobin, Sticky algorithms |
+| Storage Layer | 43 | KafkaStore trait, types, mock verification |
+| Messages | 39 | Message encoding/decoding |
+| Response Builders | 30 | Response construction |
+| Error Handling | 22 | Error code mapping, typed errors |
+| Config | 32 | GUC configuration |
+| Testing Infrastructure | 23 | Mocks, helpers |
+| Coordinator | 11 | Group state management |
+| Partitioner | 8 | Murmur2 hash, key-based routing |
+| Other | 51 | Constants, property tests, etc. |
 
 ### Running Unit Tests
 
@@ -36,7 +41,7 @@ cargo test --features pg14
 
 ---
 
-## E2E Test Categories (74 tests)
+## E2E Test Categories (104 tests)
 
 | Category | Tests | Purpose |
 |----------|-------|---------|
@@ -46,13 +51,16 @@ cargo test --features pg14
 | Consumer Groups | 3 | Lifecycle, two-member, rebalance after leave |
 | Offset Management | 2 | Commit/fetch, boundaries |
 | Partitioning | 4 | Multi-partition produce, key routing, distribution |
+| Compression | 5 | gzip, snappy, lz4, zstd, roundtrip |
+| Idempotent | 2 | InitProducerId, deduplication |
+| Transaction | 8 | EOS, isolation levels, fencing |
+| Shadow | 20 | External forwarding, SASL/SSL, topic mapping, replay |
+| Long Polling | 4 | Timeout, immediate return, producer wakeup |
 | Error Paths | 16 | Invalid partitions, unknown topics, coordinator errors |
 | Edge Cases | 11 | Empty topics, large messages, boundary values |
 | Concurrent | 8 | Multi-producer, multi-consumer, pipelining |
 | Negative | 4 | Connection refused, timeouts, invalid operations |
 | Performance | 3 | Throughput baselines (produce, consume, batch) |
-| Long Polling | 4 | Timeout, immediate return, producer wakeup |
-| Compression | 5 | gzip, snappy, lz4, zstd, roundtrip |
 
 ### Running E2E Tests
 
@@ -181,6 +189,6 @@ See `docs/PGRX_TESTING_GUIDE.md` for the full testing strategy.
 
 ---
 
-**Test Count:** 361 (287 unit + 74 E2E)
+**Test Count:** 734 (630 unit + 104 E2E)
 **Coverage Target:** 80%+ (testable code)
 **All Tests Passing:** ✅

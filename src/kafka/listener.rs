@@ -34,6 +34,129 @@ use super::messages::{KafkaRequest, KafkaResponse, TopicFetchData};
 use super::notifications::InternalNotification;
 use super::pending_fetches::PendingFetchRegistry;
 use super::protocol;
+use super::shadow::{ForwardRequest, ShadowConfig, ShadowProducer};
+
+/// Shadow forwarder task for async forwarding
+///
+/// Receives ForwardRequest messages from the DB thread via crossbeam channel
+/// and forwards them to external Kafka asynchronously (fire-and-forget).
+///
+/// This task uses RuntimeContext to check configuration dynamically, allowing
+/// shadow mode to be enabled/disabled at runtime via ALTER SYSTEM + pg_reload_conf().
+/// The producer is lazily created when shadow mode is first enabled and recreated
+/// if the bootstrap servers change.
+async fn run_shadow_forwarder(
+    forward_rx: Receiver<ForwardRequest>,
+    runtime_context: Arc<crate::kafka::RuntimeContext>,
+) {
+    info!("Shadow forwarder task started (dynamic config mode)");
+
+    // Track current producer and config for change detection
+    let mut producer: Option<Arc<ShadowProducer>> = None;
+    let mut current_bootstrap_servers: String = String::new();
+
+    loop {
+        // Use spawn_blocking to receive from crossbeam channel in async context
+        let rx = forward_rx.clone();
+        let result =
+            tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_millis(100))).await;
+
+        match result {
+            Ok(Ok(req)) => {
+                // Check current config from RuntimeContext (dynamic reload support)
+                let config = runtime_context.config();
+
+                // Skip if shadow mode is not enabled or not configured
+                if !config.shadow_mode_enabled || config.shadow_bootstrap_servers.is_empty() {
+                    debug!(
+                        "Shadow mode disabled or not configured, dropping forward request for {}[{}]",
+                        req.topic_name, req.partition_id
+                    );
+                    continue;
+                }
+
+                // Check if config changed - recreate producer if bootstrap servers changed
+                if config.shadow_bootstrap_servers != current_bootstrap_servers {
+                    info!(
+                        "Shadow config changed: bootstrap_servers '{}' -> '{}'",
+                        current_bootstrap_servers, config.shadow_bootstrap_servers
+                    );
+
+                    let shadow_config = Arc::new(ShadowConfig::from_config(&config));
+                    match ShadowProducer::new(shadow_config) {
+                        Ok(p) => {
+                            current_bootstrap_servers = config.shadow_bootstrap_servers.clone();
+                            producer = Some(Arc::new(p));
+                            info!(
+                                "Shadow producer created/recreated for bootstrap_servers='{}'",
+                                current_bootstrap_servers
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to create shadow producer for '{}': {:?}",
+                                config.shadow_bootstrap_servers, e
+                            );
+                            // Clear producer so we retry on next config check
+                            producer = None;
+                            current_bootstrap_servers.clear();
+                            continue;
+                        }
+                    }
+                }
+
+                // Get producer (should exist if we passed the config check)
+                let p = match &producer {
+                    Some(p) => p.clone(),
+                    None => {
+                        warn!("No producer available, dropping forward request");
+                        continue;
+                    }
+                };
+
+                // Fire-and-forget: log failure but continue
+                let topic = req.topic_name.clone();
+                let partition = req.partition_id;
+                let offset = req.local_offset;
+
+                if let Err(e) = p
+                    .send_async(
+                        &req.topic_name,
+                        Some(req.partition_id),
+                        req.key.as_deref(),
+                        req.value.as_deref(),
+                    )
+                    .await
+                {
+                    warn!(
+                        "Async forward failed for {}[{}] offset {}: {:?}",
+                        topic, partition, offset, e
+                    );
+                    // Note: No retry queue - this is intentional fire-and-forget
+                } else {
+                    debug!(
+                        "Async forward succeeded for {}[{}] offset {}",
+                        topic, partition, offset
+                    );
+                }
+            }
+            Ok(Err(crossbeam_channel::RecvTimeoutError::Timeout)) => {
+                // Normal timeout, continue
+            }
+            Ok(Err(crossbeam_channel::RecvTimeoutError::Disconnected)) => {
+                info!("Forward channel disconnected, stopping shadow forwarder");
+                break;
+            }
+            Err(_) => {
+                // spawn_blocking panicked
+                error!("Shadow forwarder recv task panicked");
+                break;
+            }
+        }
+    }
+
+    info!("Shadow forwarder task stopped");
+}
 
 /// Run the TCP listener
 ///
@@ -45,10 +168,9 @@ use super::protocol;
 /// * `listener` - Pre-bound TcpListener (bound in worker.rs)
 /// * `request_tx` - Channel sender for forwarding parsed requests to main thread
 /// * `notify_rx` - Channel receiver for notifications from DB thread (long polling)
+/// * `forward_rx` - Channel receiver for async shadow forwarding requests
+/// * `runtime_context` - Runtime context for accessing configuration
 /// * `shutdown_rx` - Channel receiver for shutdown signal from main thread
-/// * `_log_connections` - Whether to log each new connection
-/// * `enable_long_polling` - Whether to enable long polling for FetchRequest
-/// * `fetch_poll_interval_ms` - Polling interval for long polling fallback
 ///
 /// # Thread Safety
 /// This function runs in a spawned thread and MUST NOT call pgrx functions.
@@ -56,14 +178,22 @@ pub async fn run(
     listener: TcpListener,
     request_tx: Sender<KafkaRequest>,
     notify_rx: Receiver<InternalNotification>,
+    forward_rx: Receiver<ForwardRequest>,
+    runtime_context: Arc<crate::kafka::RuntimeContext>,
     shutdown_rx: std::sync::mpsc::Receiver<()>,
-    _log_connections: bool,
-    enable_long_polling: bool,
-    fetch_poll_interval_ms: i32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Extract config values from RuntimeContext
+    let config = runtime_context.config();
+    let enable_long_polling = config.enable_long_polling;
+    let log_connections = config.log_connections;
+    let fetch_poll_interval_ms = config.fetch_poll_interval_ms;
+
+    // Note: Shadow config is now checked dynamically in run_shadow_forwarder
+    // to support runtime enable/disable via ALTER SYSTEM + pg_reload_conf()
+
     info!(
-        "pg_kafka TCP listener started (long_polling={})",
-        enable_long_polling
+        "pg_kafka TCP listener started (long_polling={}, log_connections={})",
+        enable_long_polling, log_connections
     );
 
     // Create the pending fetch registry for long polling
@@ -112,6 +242,14 @@ pub async fn run(
         }
     });
 
+    // Spawn the shadow forwarder task (async forwarding from DB thread)
+    // This task receives ForwardRequest messages and sends them to external Kafka.
+    // Always spawned - config is checked dynamically to support runtime enable/disable.
+    let runtime_context_for_forwarder = runtime_context.clone();
+    let _forward_handle = tokio::spawn(async move {
+        run_shadow_forwarder(forward_rx, runtime_context_for_forwarder).await;
+    });
+
     // Accept loop: wait for new connections OR shutdown signal
     loop {
         // Check for shutdown signal (non-blocking)
@@ -135,14 +273,17 @@ pub async fn run(
 
         match accept_result {
             Ok(Ok((socket, addr))) => {
-                // Always log connections for debugging
-                info!("Accepted connection from {}", addr);
+                // Log connections if enabled
+                if log_connections {
+                    info!("Kafka client connected from {}", addr);
+                }
 
                 // Clone resources for this connection
                 let conn_request_tx = request_tx.clone();
                 let conn_registry = registry.clone();
                 let poll_interval = fetch_poll_interval_ms;
                 let long_poll_enabled = enable_long_polling;
+                let should_log = log_connections;
 
                 // Spawn a new async task to handle this connection
                 // Use tokio::spawn (not spawn_local) since we're in multi-thread runtime
@@ -153,10 +294,15 @@ pub async fn run(
                         conn_registry,
                         long_poll_enabled,
                         poll_interval,
+                        should_log,
                     )
                     .await
                     {
-                        warn!("Error handling connection from {}: {}", addr, e);
+                        if should_log {
+                            warn!("Error handling connection from {}: {}", addr, e);
+                        }
+                    } else if should_log {
+                        info!("Kafka client disconnected from {}", addr);
                     }
                 });
             }
@@ -204,6 +350,7 @@ async fn handle_connection(
     registry: Arc<PendingFetchRegistry>,
     enable_long_polling: bool,
     poll_interval_ms: i32,
+    _log_connections: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     debug!("New connection established, starting pipelined handle loop");
 

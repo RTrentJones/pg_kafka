@@ -57,7 +57,10 @@ pub async fn test_key_routing_deterministic() -> TestResult {
 
         match producer.send(record, Duration::from_secs(5)).await {
             Ok((partition, offset)) => {
-                println!("   Message {}: partition={}, offset={}", i, partition, offset);
+                println!(
+                    "   Message {}: partition={}, offset={}",
+                    i, partition, offset
+                );
                 delivered_partitions.push(partition);
             }
             Err((err, _)) => {
@@ -141,7 +144,10 @@ pub async fn test_key_distribution() -> TestResult {
     println!("   Topic '{}' created", topic);
 
     // 2. Produce messages with different keys
-    println!("\nStep 2: Producing {} messages with unique keys...", num_messages);
+    println!(
+        "\nStep 2: Producing {} messages with unique keys...",
+        num_messages
+    );
     let producer = create_producer()?;
 
     let mut partition_counts: HashMap<i32, i32> = HashMap::new();
@@ -177,7 +183,10 @@ pub async fn test_key_distribution() -> TestResult {
     println!("   Distribution across {} partitions:", partitions_used);
     for (partition, count) in &partition_counts {
         let percentage = (*count as f64 / num_messages as f64) * 100.0;
-        println!("     Partition {}: {} messages ({:.1}%)", partition, count, percentage);
+        println!(
+            "     Partition {}: {} messages ({:.1}%)",
+            partition, count, percentage
+        );
     }
 
     // 4. Verify in database
@@ -202,7 +211,10 @@ pub async fn test_key_distribution() -> TestResult {
         "Database should show messages in multiple partitions"
     );
 
-    println!("   Database confirms {} partitions have messages", db_partitions_used);
+    println!(
+        "   Database confirms {} partitions have messages",
+        db_partitions_used
+    );
 
     println!("\n Test: Key Distribution PASSED\n");
     Ok(())
@@ -237,7 +249,10 @@ pub async fn test_null_key_distribution() -> TestResult {
     println!("   Topic '{}' created", topic);
 
     // 2. Produce messages without keys
-    println!("\nStep 2: Producing {} messages without keys...", num_messages);
+    println!(
+        "\nStep 2: Producing {} messages without keys...",
+        num_messages
+    );
     let producer = create_producer()?;
 
     let mut partition_counts: HashMap<i32, i32> = HashMap::new();
@@ -266,7 +281,10 @@ pub async fn test_null_key_distribution() -> TestResult {
     println!("   Distribution:");
     for (partition, count) in &partition_counts {
         let percentage = (*count as f64 / num_messages as f64) * 100.0;
-        println!("     Partition {}: {} messages ({:.1}%)", partition, count, percentage);
+        println!(
+            "     Partition {}: {} messages ({:.1}%)",
+            partition, count, percentage
+        );
     }
 
     // Note: rdkafka uses sticky partitioner for null keys, so they may batch to one partition

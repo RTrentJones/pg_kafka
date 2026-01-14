@@ -1,21 +1,22 @@
 # Full Kafka API Compliance Plan for pg_kafka
 
-**Last Updated:** 2026-01-08
+**Last Updated:** 2026-01-14
 
-## Current State (Phase 8 Complete)
+## Current State (Phase 11 Complete)
 
-**APIs Implemented:** 18 of ~50 (36%)
-**Tests:** 184 unit + 74 E2E (all passing)
-**Architecture:** Repository Pattern, typed errors, clean handler structure, key-based partition routing, compression support
+**APIs Implemented:** 23 of ~50 (46%)
+**Tests:** 630 unit + 104 E2E (all passing)
+**Architecture:** Repository Pattern, typed errors, clean handler structure, key-based partition routing, compression, transactions, shadow mode
 
 ### Implemented APIs
 | Category | APIs |
 |----------|------|
 | Metadata | ApiVersions (18), Metadata (3) |
-| Producer | Produce (0) with key-based partition routing |
+| Producer | Produce (0), InitProducerId (22) |
 | Consumer | Fetch (1), ListOffsets (2), OffsetCommit (8), OffsetFetch (9) |
 | Coordinator | FindCoordinator (10), JoinGroup (11), SyncGroup (14), Heartbeat (12), LeaveGroup (13), DescribeGroups (15), ListGroups (16) |
 | Admin | CreateTopics (19), DeleteTopics (20), CreatePartitions (37), DeleteGroups (42) |
+| Transaction | AddPartitionsToTxn (24), AddOffsetsToTxn (25), EndTxn (26), TxnOffsetCommit (28) |
 
 ---
 
@@ -111,7 +112,7 @@ SET pg_kafka.compression_type = 'lz4';  -- Recommended for balanced performance
 
 ---
 
-### Phase 9: Idempotent Producer (Priority: MEDIUM)
+### Phase 9: Idempotent Producer ✅ COMPLETE
 **Goal:** Exactly-once delivery semantics
 
 #### 9.1 Schema Changes
@@ -148,7 +149,7 @@ CREATE TABLE kafka.producer_sequences (
 
 ---
 
-### Phase 10: Transaction Support (Priority: LOW - Full Parity)
+### Phase 10: Transaction Support ✅ COMPLETE
 **Goal:** Multi-partition atomic writes
 
 #### 10.1 Transaction Coordinator
@@ -177,18 +178,25 @@ CREATE TABLE kafka.transactions (
 
 ---
 
-### Phase 11: Security APIs (Priority: LOW - Optional)
-**Goal:** SASL authentication (alternative: use PostgreSQL auth)
+### Phase 11: Shadow Mode ✅ COMPLETE
+**Goal:** Forward messages to external Kafka cluster
 
-#### 11.1 SaslHandshake (API 17) + SaslAuthenticate (API 36)
-- Support PLAIN mechanism minimum
-- Map to PostgreSQL roles
+**Implemented Features:**
+- ✅ External Kafka connection with SASL/SSL authentication
+- ✅ Dual-write (local PostgreSQL + external Kafka)
+- ✅ Per-topic shadow configuration via `kafka.topic_shadow_config`
+- ✅ Sync and async forwarding modes
+- ✅ Percentage-based dial-up routing
+- ✅ Historical message replay to external Kafka
+- ✅ Graceful degradation when external Kafka unavailable
+- ✅ 141 unit tests + 20 E2E tests for shadow mode
 
-#### 11.2 ACL APIs (29, 30, 31)
-- Map to PostgreSQL row-level security policies
-- Store ACLs in `kafka.acls` table
-
-**Note:** May defer entirely - PostgreSQL's native auth is more robust
+**Configuration:**
+```sql
+SET pg_kafka.shadow_mode_enabled = true;
+SET pg_kafka.shadow_bootstrap_servers = 'kafka1:9092,kafka2:9092';
+SET pg_kafka.shadow_security_protocol = 'SASL_SSL';
+```
 
 ---
 
@@ -206,20 +214,20 @@ CREATE TABLE kafka.transactions (
 
 ---
 
-## Implementation Order & Estimates
+## Implementation Order & Status
 
 | Phase | Scope | Status | Dependencies |
 |-------|-------|--------|--------------|
 | **6** | Admin APIs | ✅ Complete | None |
 | **7** | Multi-Partition | ✅ Complete | Phase 6 (CreatePartitions) |
 | **8** | Compression | ✅ Complete | None |
-| **9** | Idempotent Producer | Planned | None |
-| **10** | Transactions | Planned | Phase 9 |
-| **11** | Security | Optional | None |
+| **9** | Idempotent Producer | ✅ Complete | None |
+| **10** | Transactions | ✅ Complete | Phase 9 |
+| **11** | Shadow Mode | ✅ Complete | None |
 | **12** | Advanced Coordinator | Planned | None |
 
-**Completed:** Phases 1-8
-**Remaining for Full Parity:** Phases 9-12
+**Completed:** Phases 1-11
+**Future:** Phase 12 (Advanced Coordinator), Cooperative Rebalancing (KIP-429), Static Group Membership (KIP-345)
 
 ---
 
@@ -247,8 +255,8 @@ Each phase includes:
 3. **E2E tests** - rdkafka client in `kafka_test/`
 
 **Coverage targets:**
-- Maintain 184+ unit tests
-- Current: 74 E2E tests across all categories
+- Maintain 630+ unit tests
+- Current: 104 E2E tests across all categories
 
 ---
 
@@ -268,6 +276,7 @@ Each phase includes:
 - [x] Phase 6: kcat/rdkafka can create/delete topics programmatically ✅
 - [x] Phase 7: Multi-consumer groups work on multi-partition topics ✅
 - [x] Phase 8: Compressed messages accepted and stored ✅
-- [ ] Phase 9: `enable.idempotence=true` works without duplicates
-- [ ] Phase 10: Transactional producer commits atomically
+- [x] Phase 9: `enable.idempotence=true` works without duplicates ✅
+- [x] Phase 10: Transactional producer commits atomically ✅
+- [x] Phase 11: Shadow mode forwards to external Kafka ✅
 - [x] All tests passing, zero compilation warnings ✅

@@ -1,7 +1,7 @@
 # Kafka Protocol Coverage Analysis
 
-**Date**: 2026-01-09
-**pg_kafka Version**: Phase 9 Complete (Idempotent Producer)
+**Date**: 2026-01-14
+**pg_kafka Version**: Phase 11 Complete (Shadow Mode)
 **Analysis**: Comprehensive review of implemented vs standard Kafka protocol
 
 ---
@@ -10,15 +10,15 @@
 
 | Metric | Value |
 |--------|-------|
-| **API Coverage** | 19 of ~50 standard Kafka APIs (38%) |
+| **API Coverage** | 23 of ~50 standard Kafka APIs (46%) |
 | **Build Status** | ✅ Compiles with zero warnings |
-| **Test Suite** | 192 unit tests + 74 E2E tests |
+| **Test Suite** | 630 unit tests + 104 E2E tests |
 | **Architecture** | Repository Pattern with typed errors |
 | **Client Compatibility** | ✅ kcat, rdkafka verified |
 
 ---
 
-## Implemented APIs (19 total)
+## Implemented APIs (23 total)
 
 ### 1. Core Metadata (2 APIs) ✅ 100% Coverage
 | API | Key | Versions | Status | Notes |
@@ -36,7 +36,7 @@
 - ✅ Idempotent producer support with sequence validation
 - ✅ Deduplication (DUPLICATE_SEQUENCE_NUMBER, OUT_OF_ORDER_SEQUENCE_NUMBER)
 - ✅ Producer epoch fencing (PRODUCER_FENCED)
-- ❌ No full transaction support (transactional_id allocation only)
+- ✅ Full transaction support via Phase 10 APIs (see Transaction APIs section)
 
 ### 3. Consumer - Data Access (4 APIs) ✅ 100% Coverage
 | API | Key | Versions | Status | Notes |
@@ -85,14 +85,29 @@
 - ✅ CreatePartitions adds partitions to existing topics
 - ✅ DeleteGroups validates group is empty before deletion
 
+### 6. Transaction APIs (4 APIs) ✅ 100% Coverage
+| API | Key | Versions | Status | Notes |
+|-----|-----|----------|--------|-------|
+| AddPartitionsToTxn | 24 | v0-v3 | ✅ Complete | Register partitions in transaction |
+| AddOffsetsToTxn | 25 | v0-v3 | ✅ Complete | Include consumer offsets in transaction |
+| EndTxn | 26 | v0-v3 | ✅ Complete | Commit or abort transaction |
+| TxnOffsetCommit | 28 | v0-v3 | ✅ Complete | Commit offsets atomically within transaction |
+
+**Implementation Notes (Phase 10):**
+- ✅ Full exactly-once semantics (EOS)
+- ✅ Read-committed isolation level for consumers
+- ✅ Proper transaction state machine (Empty → Ongoing → PrepareCommit/Abort → Complete)
+- ✅ Transactional producer fencing via epoch
+- ✅ Pending/aborted messages filtered for read_committed consumers
+
 ---
 
 ## Unimplemented APIs Analysis
 
 **Source**: [Apache Kafka Protocol Guide](https://kafka.apache.org/protocol.html)
 **Total Standard Kafka APIs**: ~50
-**Implemented**: 19 (38%)
-**Unimplemented**: ~31 (62%)
+**Implemented**: 23 (46%)
+**Unimplemented**: ~27 (54%)
 
 This section analyzes all unimplemented APIs, their use cases, and priority for drop-in Kafka replacement.
 
@@ -116,23 +131,19 @@ This section analyzes all unimplemented APIs, their use cases, and priority for 
 
 ---
 
-### Transactions (7 APIs) - Priority: Low (Complex)
+### Transactions (3 remaining APIs) - Priority: Low
+
+**Note:** 4 of 7 transaction APIs are now implemented (Phase 10). See "Implemented APIs" section above.
 
 | API | Key | Use Case | Drop-In Priority |
 |-----|-----|----------|------------------|
-| **AddPartitionsToTxn** | 24 | Registers partitions as part of an active transaction | Low - Only for exactly-once semantics |
-| **AddOffsetsToTxn** | 25 | Includes consumer offset commits in a transaction (exactly-once consume-transform-produce) | Low - Streaming pipelines only |
-| **EndTxn** | 26 | Commits or aborts a transaction | Low - Complex feature |
-| **WriteTxnMarkers** | 27 | Internal: coordinator writes commit/abort markers to partitions | Low - Broker-to-broker |
-| **TxnOffsetCommit** | 28 | Commits offsets as part of a transaction | Low - Requires full transaction support |
+| **WriteTxnMarkers** | 27 | Internal: coordinator writes commit/abort markers to partitions | Low - Broker-to-broker internal |
 | **DescribeTransactions** | 65 | Lists active transactions for monitoring/debugging | Low - Admin utility |
 | **ListTransactions** | 66 | Finds transactions by producer ID or state | Low - Admin utility |
 
-**Use Case**: Exactly-once semantics (EOS) for streaming pipelines like Kafka Streams and Flink. Enables atomic writes to multiple partitions + offset commits.
+**pg_kafka Approach**: Core transaction APIs (AddPartitionsToTxn, AddOffsetsToTxn, EndTxn, TxnOffsetCommit) are fully implemented. The remaining 3 APIs are internal broker communication or admin utilities.
 
-**pg_kafka Approach**: Use PostgreSQL's native transactions instead. Clients only require this if explicitly configured for transactions (`transactional.id` set).
-
-**Client Impact**: Minimal. Most producers don't use transactions. Idempotent producer (InitProducerId - already implemented) covers 99% of use cases.
+**Client Impact**: None. Transactional producers work fully with the implemented APIs.
 
 ---
 
@@ -420,6 +431,8 @@ Consumer Flow (Current):
 - **Phase 7** ✅ Multi-Partition Topics with key-based routing
 - **Phase 8** ✅ Compression Support (gzip, snappy, lz4, zstd)
 - **Phase 9** ✅ Idempotent Producer (InitProducerId, sequence validation, deduplication)
+- **Phase 10** ✅ Transaction Support (AddPartitionsToTxn, AddOffsetsToTxn, EndTxn, TxnOffsetCommit)
+- **Phase 11** ✅ Shadow Mode (external Kafka forwarding, SASL/SSL, per-topic config)
 
 ### Enhancements
 
@@ -427,10 +440,9 @@ Consumer Flow (Current):
 
 ### Future Phases
 
-- **Phase 10** - Shadow Mode (Logical Decoding → external Kafka)
-- **Phase 11** - Transaction Support (full ACID semantics)
 - **Cooperative Rebalancing** (KIP-429)
 - **Static Group Membership** (KIP-345)
+- Table partitioning and retention policies
 
 ---
 
@@ -442,7 +454,7 @@ Consumer Flow (Current):
 | Wire Protocol | v0-v17+ | v0-v13 | Supports flexible format (v9+) |
 | RecordBatch | v0, v1, v2 | v2 only | MessageSet v0/v1 deprecated |
 | Compression | All codecs | All codecs | gzip, snappy, lz4, zstd fully supported |
-| Transactions | Yes | No | Not planned |
+| Transactions | Yes | Yes | ✅ Phase 10 - full EOS support |
 | SASL/ACLs | Yes | No | Use PostgreSQL auth |
 
 ### Consumer Groups
@@ -469,48 +481,53 @@ Consumer Flow (Current):
 - **Testing**: E2E tests with rdkafka
 - **Documentation**: Comprehensive design docs
 
-### Test Coverage (192 unit tests + 74 E2E tests)
+### Test Coverage (630 unit tests + 104 E2E tests)
 
 | Category | Count | Location |
 |----------|-------|----------|
-| Assignment strategies | 61 | `src/kafka/assignment/` |
-| Protocol encoding | 34 | `tests/` |
-| Handler logic | 22 | `src/kafka/handlers/tests.rs` (includes Phase 9) |
-| Storage layer | 22 | `src/kafka/storage/tests.rs` |
-| Infrastructure | 20 | Config, mocks, helpers |
-| Error handling | 10 | `src/kafka/error.rs` |
-| Coordinator | 8 | `src/kafka/coordinator.rs` |
-| Partitioner | 7 | `src/kafka/partitioner.rs` |
-| Property-based | 8 | Proptest fuzzing |
-| **Unit Total** | **192** | |
-| **E2E Test Suite** | **74** | `kafka_test/` |
+| Shadow mode | 141 | `src/kafka/shadow/` |
+| Protocol encoding | 85 | `src/kafka/protocol/` |
+| Handler logic | 78 | `src/kafka/handlers/tests.rs` |
+| Assignment strategies | 67 | `src/kafka/assignment/` |
+| Storage layer | 43 | `src/kafka/storage/tests.rs` |
+| Messages | 39 | `src/kafka/messages.rs` |
+| Response builders | 30 | `src/kafka/response_builders.rs` |
+| Error handling | 22 | `src/kafka/error.rs` |
+| Config | 32 | `src/config.rs` |
+| Testing infrastructure | 23 | `src/testing/` |
+| Other | 70 | Coordinator, partitioner, constants, property tests |
+| **Unit Total** | **630** | |
+| **E2E Test Suite** | **104** | `kafka_test/` |
 
-**E2E Test Categories (74 tests):**
+**E2E Test Categories (104 tests):**
 - Admin APIs (9 tests)
 - Producer (2 tests)
 - Consumer (3 tests)
 - Consumer Groups (3 tests)
 - Offset Management (2 tests)
 - Partitioning (4 tests)
+- Compression (5 tests)
+- Idempotent (2 tests)
+- Transaction (8 tests)
+- Shadow (20 tests)
+- Long Polling (4 tests)
 - Error Paths (16 tests)
 - Edge Cases (11 tests)
 - Concurrent Operations (8 tests)
 - Negative (4 tests)
 - Performance Baselines (3 tests)
-- Long Polling (4 tests)
-- Compression (5 tests)
 
 ---
 
 ## Conclusion
 
-**Current State**: Comprehensive Kafka-compatible broker with 19 APIs implemented
-**Coverage**: 38% of standard Kafka protocol (full producer/consumer/coordinator/admin support)
+**Current State**: Comprehensive Kafka-compatible broker with 23 APIs implemented
+**Coverage**: 46% of standard Kafka protocol (full producer/consumer/coordinator/admin/transaction support)
 **Architecture**: Clean, maintainable, well-documented with Repository Pattern
-**Test Status**: All 192 unit tests and 74 E2E tests passing ✅
+**Test Status**: All 630 unit tests and 104 E2E tests passing ✅
 
 **Readiness**:
-- ✅ **Producer**: Production-ready with idempotency and compression support
+- ✅ **Producer**: Production-ready with idempotency, transactions, and compression
 - ✅ **Consumer**: Fully functional with long polling and automatic partition assignment
 - ✅ **Coordinator**: Complete with automatic rebalancing
 - ✅ **Admin APIs**: CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups
@@ -518,26 +535,28 @@ Consumer Flow (Current):
 - ✅ **Long Polling**: max_wait_ms/min_bytes support
 - ✅ **Compression**: gzip, snappy, lz4, zstd (inbound/outbound)
 - ✅ **Idempotency**: InitProducerId with sequence validation and deduplication
+- ✅ **Transactions**: Full EOS with read-committed isolation
+- ✅ **Shadow Mode**: External Kafka forwarding with SASL/SSL
 
-**Recent Achievements (Phase 9)**:
-1. ✅ InitProducerId API (API key 22, versions 0-4)
-2. ✅ Producer ID allocation with epoch tracking
-3. ✅ Sequence validation per partition (DUPLICATE_SEQUENCE_NUMBER, OUT_OF_ORDER_SEQUENCE_NUMBER)
-4. ✅ Producer epoch fencing (PRODUCER_FENCED error)
-5. ✅ Database schema for producer_ids and producer_sequences
-6. ✅ PostgreSQL advisory locks for sequence serialization
-7. ✅ 8 new unit tests for idempotent producer behavior
+**Recent Achievements (Phase 10-11)**:
+1. ✅ Transaction APIs (AddPartitionsToTxn, AddOffsetsToTxn, EndTxn, TxnOffsetCommit)
+2. ✅ Exactly-once semantics with read-committed isolation
+3. ✅ Transactional producer fencing via epoch
+4. ✅ Shadow mode for external Kafka forwarding
+5. ✅ SASL/SSL authentication to external Kafka
+6. ✅ Per-topic shadow configuration
+7. ✅ Historical message replay to external Kafka
+8. ✅ 141 shadow mode unit tests, 28 transaction/shadow E2E tests
 
 **Future Phases**:
-1. Phase 10: Shadow mode (logical decoding to external Kafka)
-2. Phase 11: Transaction support (full ACID semantics)
-3. Cooperative rebalancing (KIP-429)
-4. Static group membership (KIP-345)
+1. Cooperative rebalancing (KIP-429)
+2. Static group membership (KIP-345)
+3. Table partitioning and retention policies
 
 ---
 
-**Overall Assessment**: Phase 9 Complete - pg_kafka provides full producer/consumer support with idempotency, compression, long polling, multi-partition topics, and admin APIs. The implementation features clean architecture (Repository Pattern), comprehensive test coverage (192 unit tests, 74 E2E tests), and typed error handling with full Kafka error code mapping.
+**Overall Assessment**: Phase 11 Complete - pg_kafka provides full producer/consumer support with idempotency, transactions, compression, long polling, multi-partition topics, admin APIs, and shadow mode. The implementation features clean architecture (Repository Pattern), comprehensive test coverage (630 unit tests, 104 E2E tests), and typed error handling with full Kafka error code mapping.
 
-**Last Updated:** 2026-01-09
-**Phase:** 9 Complete (Idempotent Producer)
-**Tests:** 192 unit tests + 74 E2E tests
+**Last Updated:** 2026-01-14
+**Phase:** 11 Complete (Shadow Mode)
+**Tests:** 630 unit tests + 104 E2E tests

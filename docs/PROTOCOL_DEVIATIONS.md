@@ -4,17 +4,18 @@ This document lists intentional deviations from the official Kafka protocol spec
 
 ## Summary
 
-`pg_kafka` implements a **subset** of the Kafka wire protocol (36% API coverage). The following deviations are intentional design decisions that optimize for PostgreSQL's strengths while maintaining compatibility with standard Kafka clients.
+`pg_kafka` implements a **subset** of the Kafka wire protocol (46% API coverage). The following deviations are intentional design decisions that optimize for PostgreSQL's strengths while maintaining compatibility with standard Kafka clients.
 
 | Category | Status |
 |----------|--------|
-| **Producer APIs** | ✅ Full support (with documented limitations) |
+| **Producer APIs** | ✅ Full support (idempotent + transactional) |
 | **Consumer APIs** | ✅ Full support (with automatic rebalancing) |
 | **Coordinator APIs** | ✅ Full support (Range, RoundRobin, Sticky strategies) |
 | **Admin APIs** | ✅ Full support (CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups) |
-| **Transaction APIs** | ❌ Not planned |
+| **Transaction APIs** | ✅ Full support (EOS with read-committed isolation) |
+| **Shadow Mode** | ✅ Full support (external Kafka forwarding) |
 
-**Current Implementation:** Phase 8 Complete (Compression Support)
+**Current Implementation:** Phase 11 Complete (Shadow Mode)
 
 ## Producer API Deviations
 
@@ -61,35 +62,43 @@ SET pg_kafka.compression_type = 'gzip';
 - Server decompresses messages before storage
 - Server compresses responses based on GUC setting
 
-### 3. Idempotent Producer Not Supported
+### 3. Idempotent Producer ✅ Fully Supported (Phase 9)
 
-**Status:** Not Implemented
+**Status:** Fully Implemented
 **Kafka Behavior:** `enable.idempotence=true` prevents duplicate messages
-**pg_kafka Behavior:** No deduplication mechanism
+**pg_kafka Behavior:** Full idempotency support with sequence validation
 
-**Rationale:**
-- Requires tracking producer IDs and sequence numbers
-- PostgreSQL transactions already provide atomicity
-- Duplicates can occur on network retry (same as Kafka without idempotence)
+**Implementation:**
+- ✅ InitProducerId API allocates producer IDs with epoch
+- ✅ Sequence number tracking per topic-partition
+- ✅ Duplicate detection (DUPLICATE_SEQUENCE_NUMBER error)
+- ✅ Out-of-order detection (OUT_OF_ORDER_SEQUENCE_NUMBER error)
+- ✅ Producer fencing via epoch (PRODUCER_FENCED error)
+- ✅ PostgreSQL advisory locks for sequence serialization
 
 **Client Impact:**
-- Clients should handle potential duplicates at application level
-- Or rely on database constraints (e.g., UNIQUE on message key)
+- Clients can use `enable.idempotence=true` (default in librdkafka 2.0+)
+- Full exactly-once delivery semantics within a producer session
+- Standard duplicate handling works as expected
 
-### 4. Transactions Not Supported
+### 4. Transactions ✅ Fully Supported (Phase 10)
 
-**Status:** Not Implemented
+**Status:** Fully Implemented
 **Kafka Behavior:** Multi-partition atomic writes via `transactional.id`
-**pg_kafka Behavior:** No transaction coordinator
+**pg_kafka Behavior:** Full transaction coordinator with EOS
 
-**Rationale:**
-- Kafka transactions require two-phase commit across partitions
-- Current focus is on single-partition producer/consumer support
-- Could potentially leverage PostgreSQL's native transaction support in future phases
+**Implementation:**
+- ✅ AddPartitionsToTxn registers partitions in transaction
+- ✅ AddOffsetsToTxn includes consumer offsets in transaction
+- ✅ EndTxn commits or aborts atomically
+- ✅ TxnOffsetCommit commits offsets within transaction context
+- ✅ Read-committed isolation level filters pending/aborted messages
+- ✅ Transactional producer fencing via epoch
 
 **Client Impact:**
-- Clients using Kafka transactions will fail
-- Workaround: Use PostgreSQL transactions at application level (each produce is already atomic)
+- Transactional producers work without modification
+- Exactly-once consume-transform-produce patterns supported
+- Read-committed consumers see only committed messages
 
 ## Consumer API Deviations
 
@@ -338,7 +347,7 @@ auto.offset.reset=earliest
 
 ---
 
-**Last Updated:** 2026-01-08
-**Applies To:** pg_kafka Phase 8 Complete (Compression Support)
-**API Coverage:** 18 of ~50 Kafka APIs (36%)
-**Test Status:** 184 unit tests + 74 E2E tests passing
+**Last Updated:** 2026-01-14
+**Applies To:** pg_kafka Phase 11 Complete (Shadow Mode)
+**API Coverage:** 23 of ~50 Kafka APIs (46%)
+**Test Status:** 630 unit tests + 104 E2E tests passing

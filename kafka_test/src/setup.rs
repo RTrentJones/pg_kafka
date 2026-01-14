@@ -53,12 +53,8 @@ impl TestContext {
     ///
     /// The name is tracked for automatic cleanup.
     pub async fn unique_topic(&self, base: &str) -> String {
-        let name = format!(
-            "{}-{}-{}",
-            base,
-            self.test_id,
-            Uuid::new_v4().to_string()[..8].to_string()
-        );
+        let uuid_str = Uuid::new_v4().to_string();
+        let name = format!("{}-{}-{}", base, self.test_id, &uuid_str[..8]);
         self.topics_created.lock().await.push(name.clone());
         name
     }
@@ -67,18 +63,23 @@ impl TestContext {
     ///
     /// The group is tracked for automatic cleanup.
     pub async fn unique_group(&self, base: &str) -> String {
-        let name = format!(
-            "{}-{}-{}",
-            base,
-            self.test_id,
-            Uuid::new_v4().to_string()[..8].to_string()
-        );
+        let uuid_str = Uuid::new_v4().to_string();
+        let name = format!("{}-{}-{}", base, self.test_id, &uuid_str[..8]);
         self.groups_created.lock().await.push(name.clone());
         name
     }
 
     /// Manually trigger cleanup (also called automatically on drop)
     pub async fn cleanup(&self) -> TestResult {
+        // NOTE: We intentionally do NOT reset shadow mode GUCs here.
+        // Resetting GUCs between tests causes race conditions where the SIGHUP
+        // from the reset arrives while the next test is setting up, causing
+        // shadow_mode_enabled to be false when the test expects it to be true.
+        //
+        // Instead, each test sets the GUCs it needs via enable_shadow_mode(),
+        // and the per-topic shadow_config table controls forwarding behavior.
+        // Tests that don't need shadow mode simply don't insert shadow_config rows.
+
         let topics = self.topics_created.lock().await;
         let groups = self.groups_created.lock().await;
 
