@@ -430,6 +430,26 @@ pub trait KafkaStore {
         producer_epoch: i16,
     ) -> Result<()>;
 
+    /// Atomically begin or continue a transaction
+    ///
+    /// This method handles the race condition between checking transaction state
+    /// and updating it. It uses an atomic compare-and-swap operation to:
+    /// 1. Check if transaction exists and is in a valid starting state (Empty, CompleteCommit, CompleteAbort)
+    /// 2. If valid, atomically transition to 'Ongoing' state
+    /// 3. If already 'Ongoing' with matching producer, continue (idempotent)
+    /// 4. If producer mismatch or invalid state, return appropriate error
+    ///
+    /// # Arguments
+    /// * `transactional_id` - The transactional ID
+    /// * `producer_id` - The producer ID
+    /// * `producer_epoch` - The producer epoch (for fencing check)
+    fn begin_or_continue_transaction(
+        &self,
+        transactional_id: &str,
+        producer_id: i64,
+        producer_epoch: i16,
+    ) -> Result<()>;
+
     /// Validate that producer owns an active transaction
     ///
     /// Checks that the transaction exists, is in 'Ongoing' state, and the

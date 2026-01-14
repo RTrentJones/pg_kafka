@@ -89,6 +89,12 @@ mock! {
             producer_id: i64,
             producer_epoch: i16,
         ) -> Result<()>;
+        fn begin_or_continue_transaction<'a>(
+            &self,
+            transactional_id: &'a str,
+            producer_id: i64,
+            producer_epoch: i16,
+        ) -> Result<()>;
         fn validate_transaction<'a>(
             &self,
             transactional_id: &'a str,

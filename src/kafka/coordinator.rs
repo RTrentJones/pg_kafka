@@ -26,9 +26,18 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime};
+use std::time::Instant;
 
 use super::error::{KafkaError, Result};
+
+/// TTL for empty consumer groups before cleanup (24 hours)
+const EMPTY_GROUP_TTL_SECS: u64 = 86400;
+
+/// Maximum number of consumer groups to prevent DoS
+const MAX_CONSUMER_GROUPS: usize = 100_000;
+
+/// Default rebalance timeout (5 minutes)
+const DEFAULT_REBALANCE_TIMEOUT_MS: u64 = 300_000;
 
 // Import conditional logging macros for test isolation
 use crate::pg_log;
@@ -63,8 +72,8 @@ pub struct GroupMember {
     /// Current partition assignment (from leader's SyncGroup request)
     pub assignment: Option<Vec<u8>>,
 
-    /// Last heartbeat timestamp
-    pub last_heartbeat: SystemTime,
+    /// Last heartbeat timestamp (monotonic for reliable timeout detection)
+    pub last_heartbeat: Instant,
 
     /// Static group instance ID (KIP-345) for static membership
     pub group_instance_id: Option<String>,
@@ -73,11 +82,7 @@ pub struct GroupMember {
 impl GroupMember {
     /// Check if member's session has timed out
     pub fn is_timed_out(&self) -> bool {
-        let now = SystemTime::now();
-        let elapsed = now
-            .duration_since(self.last_heartbeat)
-            .unwrap_or(Duration::from_secs(0));
-
+        let elapsed = self.last_heartbeat.elapsed();
         elapsed.as_millis() > self.session_timeout_ms as u128
     }
 }
@@ -129,6 +134,12 @@ pub struct ConsumerGroup {
     /// Stored after successful SyncGroup completion
     /// Maps member_id -> encoded MemberAssignment bytes
     pub previous_assignments: HashMap<String, Vec<u8>>,
+
+    /// Last activity timestamp for TTL cleanup of empty groups
+    pub last_activity: Instant,
+
+    /// Timestamp when rebalance started (for timeout detection)
+    pub rebalance_started_at: Option<Instant>,
 }
 
 impl ConsumerGroup {
@@ -142,6 +153,8 @@ impl ConsumerGroup {
             members: HashMap::new(),
             state: GroupState::Empty,
             previous_assignments: HashMap::new(),
+            last_activity: Instant::now(),
+            rebalance_started_at: None,
         }
     }
 
@@ -168,7 +181,7 @@ impl ConsumerGroup {
             protocol_type,
             protocols,
             assignment: None,
-            last_heartbeat: SystemTime::now(),
+            last_heartbeat: Instant::now(),
             group_instance_id,
         };
 
@@ -186,6 +199,9 @@ impl ConsumerGroup {
     /// Remove a member from the group
     fn remove_member(&mut self, member_id: &str) -> bool {
         if self.members.remove(member_id).is_some() {
+            // Clean up previous assignments for this member (memory leak fix)
+            self.previous_assignments.remove(member_id);
+
             // If leader left, reassign leadership
             if self.leader.as_deref() == Some(member_id) {
                 self.leader = self.members.keys().next().cloned();
@@ -197,6 +213,8 @@ impl ConsumerGroup {
                 self.generation_id = 0;
                 self.protocol_name = None;
                 self.leader = None;
+                // Update last_activity for TTL tracking
+                self.last_activity = Instant::now();
             }
 
             true
@@ -209,6 +227,7 @@ impl ConsumerGroup {
     fn start_rebalance(&mut self) {
         self.generation_id += 1;
         self.state = GroupState::PreparingRebalance;
+        self.rebalance_started_at = Some(Instant::now());
         pg_log!(
             "Group {} starting rebalance (generation {})",
             self.group_id,
@@ -241,6 +260,8 @@ impl ConsumerGroup {
         }
 
         self.state = GroupState::Stable;
+        self.rebalance_started_at = None; // Clear rebalance timeout tracking
+        self.last_activity = Instant::now();
         pg_log!(
             "Group {} completed sync phase (generation {})",
             self.group_id,
@@ -286,6 +307,41 @@ impl GroupCoordinator {
         let mut groups = self.groups.write().map_err(|e| {
             KafkaError::Internal(format!("Failed to acquire groups write lock: {}", e))
         })?;
+
+        // Clean up stale empty groups (TTL-based)
+        groups.retain(|_, g| {
+            if g.state == GroupState::Empty {
+                g.last_activity.elapsed().as_secs() < EMPTY_GROUP_TTL_SECS
+            } else {
+                true
+            }
+        });
+
+        // Check for rebalance timeouts and abort stuck rebalances
+        for group in groups.values_mut() {
+            if let Some(started) = group.rebalance_started_at {
+                if started.elapsed().as_millis() > DEFAULT_REBALANCE_TIMEOUT_MS as u128 {
+                    pg_log!(
+                        "Group {} rebalance timed out after {}ms, resetting to Empty",
+                        group.group_id,
+                        started.elapsed().as_millis()
+                    );
+                    group.state = GroupState::Empty;
+                    group.rebalance_started_at = None;
+                    group.members.clear();
+                    group.leader = None;
+                    group.generation_id += 1;
+                }
+            }
+        }
+
+        // Check MAX_CONSUMER_GROUPS limit (DoS protection)
+        if !groups.contains_key(&group_id) && groups.len() >= MAX_CONSUMER_GROUPS {
+            return Err(KafkaError::Internal(format!(
+                "Maximum consumer groups limit ({}) reached",
+                MAX_CONSUMER_GROUPS
+            )));
+        }
 
         // Get or create consumer group
         let group = groups
@@ -471,7 +527,7 @@ impl GroupCoordinator {
             .get_mut(&member_id)
             .ok_or_else(|| KafkaError::unknown_member(&group_id, &member_id))?;
 
-        member.last_heartbeat = SystemTime::now();
+        member.last_heartbeat = Instant::now();
 
         // Check if group is rebalancing - force client to rejoin
         if group.state == GroupState::PreparingRebalance

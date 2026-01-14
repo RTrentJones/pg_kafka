@@ -975,6 +975,88 @@ impl KafkaStore for PostgresStore {
         })
     }
 
+    fn begin_or_continue_transaction(
+        &self,
+        transactional_id: &str,
+        producer_id: i64,
+        producer_epoch: i16,
+    ) -> Result<()> {
+        crate::pg_debug!(
+            "PostgresStore::begin_or_continue_transaction: transactional_id={}, producer_id={}, epoch={}",
+            transactional_id,
+            producer_id,
+            producer_epoch
+        );
+
+        Spi::connect_mut(|client| {
+            // Atomic compare-and-swap: transition to 'Ongoing' if in valid starting state
+            // OR continue if already 'Ongoing' with matching producer
+            let updated = client.update(
+                "UPDATE kafka.transactions
+                 SET state = 'Ongoing',
+                     started_at = COALESCE(started_at, NOW()),
+                     last_updated_at = NOW()
+                 WHERE transactional_id = $1
+                   AND producer_id = $2
+                   AND producer_epoch = $3
+                   AND state IN ('Empty', 'CompleteCommit', 'CompleteAbort', 'Ongoing')
+                 RETURNING state",
+                None,
+                &[transactional_id.into(), producer_id.into(), producer_epoch.into()],
+            )?;
+
+            if !updated.is_empty() {
+                crate::pg_debug!("Transaction {} is now Ongoing", transactional_id);
+                return Ok(());
+            }
+
+            // Update failed - check why
+            let exists = client.select(
+                "SELECT state, producer_id, producer_epoch FROM kafka.transactions WHERE transactional_id = $1",
+                Some(1),
+                &[transactional_id.into()],
+            )?;
+
+            if exists.is_empty() {
+                return Err(KafkaError::transactional_id_not_found(transactional_id));
+            }
+
+            let row = exists.first();
+            let current_producer_id: i64 =
+                row.get_by_name("producer_id")?.ok_or_else(|| KafkaError::Database {
+                    message: "Unexpected NULL in transactions.producer_id column".to_string(),
+                })?;
+            let current_epoch: i16 =
+                row.get_by_name("producer_epoch")?.ok_or_else(|| KafkaError::Database {
+                    message: "Unexpected NULL in transactions.producer_epoch column".to_string(),
+                })?;
+            let state: String = row.get_by_name("state")?.ok_or_else(|| KafkaError::Database {
+                message: "Unexpected NULL in transactions.state column".to_string(),
+            })?;
+
+            if current_producer_id != producer_id || current_epoch != producer_epoch {
+                return Err(KafkaError::producer_fenced(
+                    producer_id,
+                    producer_epoch,
+                    current_epoch,
+                ));
+            }
+
+            // State is not valid for beginning a transaction
+            Err(KafkaError::invalid_txn_state(
+                transactional_id,
+                "Empty, CompleteCommit, or CompleteAbort",
+                &state,
+            ))
+        })
+        .map_err(|e| match e {
+            KafkaError::TransactionalIdNotFound { .. }
+            | KafkaError::ProducerFenced { .. }
+            | KafkaError::InvalidTxnState { .. } => e,
+            _ => KafkaError::Internal(format!("begin_or_continue_transaction failed: {}", e)),
+        })
+    }
+
     fn validate_transaction(
         &self,
         transactional_id: &str,

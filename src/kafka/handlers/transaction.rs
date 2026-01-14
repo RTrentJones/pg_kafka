@@ -46,30 +46,9 @@ pub fn handle_add_partitions_to_txn(
 ) -> Result<AddPartitionsToTxnResponse> {
     let store = ctx.store;
     let default_partitions = ctx.default_partitions;
-    // Validate the transaction state
-    store.validate_transaction(transactional_id, producer_id, producer_epoch)?;
-
-    // Ensure transaction is in the right state (should be Ongoing or Empty->Ongoing)
-    let state = store.get_transaction_state(transactional_id)?;
-    match state {
-        Some(crate::kafka::storage::TransactionState::Empty) => {
-            // Transition to Ongoing
-            store.begin_transaction(transactional_id, producer_id, producer_epoch)?;
-        }
-        Some(crate::kafka::storage::TransactionState::Ongoing) => {
-            // Already ongoing, good
-        }
-        Some(other) => {
-            return Err(KafkaError::invalid_txn_state(
-                transactional_id,
-                format!("{:?}", other),
-                "AddPartitionsToTxn",
-            ));
-        }
-        None => {
-            return Err(KafkaError::transactional_id_not_found(transactional_id));
-        }
-    }
+    // Atomically begin or continue the transaction
+    // This handles the race condition between checking state and transitioning
+    store.begin_or_continue_transaction(transactional_id, producer_id, producer_epoch)?;
 
     // Build response with results for each partition
     let mut response = AddPartitionsToTxnResponse::default();
@@ -166,30 +145,8 @@ pub fn handle_add_offsets_to_txn(
     _group_id: &str,
 ) -> Result<AddOffsetsToTxnResponse> {
     let store = ctx.store;
-    // Validate the transaction state
-    store.validate_transaction(transactional_id, producer_id, producer_epoch)?;
-
-    // Ensure transaction is ongoing
-    let state = store.get_transaction_state(transactional_id)?;
-    match state {
-        Some(crate::kafka::storage::TransactionState::Ongoing) => {
-            // Good, transaction is active
-        }
-        Some(crate::kafka::storage::TransactionState::Empty) => {
-            // Start the transaction
-            store.begin_transaction(transactional_id, producer_id, producer_epoch)?;
-        }
-        Some(other) => {
-            return Err(KafkaError::invalid_txn_state(
-                transactional_id,
-                format!("{:?}", other),
-                "AddOffsetsToTxn",
-            ));
-        }
-        None => {
-            return Err(KafkaError::transactional_id_not_found(transactional_id));
-        }
-    }
+    // Atomically begin or continue the transaction
+    store.begin_or_continue_transaction(transactional_id, producer_id, producer_epoch)?;
 
     // Note: In Kafka, this returns the coordinator for the consumer group.
     // In our single-node implementation, we are always the coordinator.

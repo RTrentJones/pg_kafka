@@ -449,6 +449,67 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
         }
 
         // ┌─────────────────────────────────────────────────────────────┐
+        // │ Configuration Reload (GUCs + Shadow Config)                 │
+        // │ CRITICAL: Must happen BEFORE recv_timeout to ensure new     │
+        // │ config is available when processing requests that arrive    │
+        // │ immediately after pg_reload_conf().                         │
+        // └─────────────────────────────────────────────────────────────┘
+        // Triggers: Periodic (configurable via config_reload_interval_ms GUC, default 30s)
+        // or immediately after SIGHUP.
+        // Unified reload cycle:
+        // 1. Reload GUCs (runtime-changeable settings like compression, log settings, etc.)
+        // 2. Reload shadow topic configurations from database
+        // 3. Flush shadow metrics
+        // This allows configuration changes to take effect without restarting Postgres.
+        // PostMasterContext GUCs (port, host) still require restart.
+        let reload_interval_ms = crate::config::CONFIG_RELOAD_INTERVAL_MS.get();
+        let reload_interval = Duration::from_millis(reload_interval_ms as u64);
+        let should_reload = sighup_pending || last_config_reload.elapsed() >= reload_interval;
+
+        if should_reload {
+            if sighup_pending {
+                pg_log!(
+                    "Immediate config reload triggered by SIGHUP (interval={}ms)",
+                    reload_interval_ms
+                );
+                sighup_pending = false;
+
+                // CRITICAL: Call ProcessConfigFile to actually reload GUC values
+                // Without this, GUC changes made via ALTER SYSTEM won't take effect
+                // in this background worker. This is the standard PostgreSQL pattern.
+                unsafe {
+                    pgrx::pg_sys::ProcessConfigFile(pgrx::pg_sys::GucContext::PGC_SIGHUP);
+                }
+                pg_log!("ProcessConfigFile called, GUCs reloaded from postgresql.auto.conf");
+            }
+
+            // 1. Reload GUCs (update RuntimeContext cache)
+            runtime_context.reload();
+            pg_log!("Reloaded GUC configuration");
+
+            // 2. Reload shadow config and flush metrics
+            let shadow_reload = AssertUnwindSafe(&shadow_store);
+            BackgroundWorker::transaction(move || {
+                // Reload topic shadow configurations
+                match shadow_reload.load_topic_config_from_db() {
+                    Ok(count) => {
+                        pg_log!("Reloaded {} shadow topic configurations", count);
+                    }
+                    Err(e) => {
+                        pg_warning!("Failed to reload shadow config: {:?}", e);
+                    }
+                }
+
+                // Flush accumulated metrics to database/logs
+                if let Err(e) = shadow_reload.flush_metrics_to_db() {
+                    pg_warning!("Failed to flush shadow metrics: {:?}", e);
+                }
+            });
+
+            last_config_reload = Instant::now();
+        }
+
+        // ┌─────────────────────────────────────────────────────────────┐
         // │ Wait for Next Request (Blocking with Timeout)              │
         // └─────────────────────────────────────────────────────────────┘
         // This is the key performance improvement: we block until work arrives.
@@ -580,65 +641,6 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
                 }
             });
             last_txn_timeout_check = Instant::now();
-        }
-
-        // ┌─────────────────────────────────────────────────────────────┐
-        // │ Configuration Reload (GUCs + Shadow Config)                 │
-        // │ Triggers: Periodic (configurable via config_reload_interval_ms GUC, default 30s) │
-        // └─────────────────────────────────────────────────────────────┘
-        // Unified reload cycle:
-        // 1. Reload GUCs (runtime-changeable settings like compression, log settings, etc.)
-        // 2. Reload shadow topic configurations from database
-        // 3. Flush shadow metrics
-        // This allows configuration changes to take effect without restarting Postgres.
-        // PostMasterContext GUCs (port, host) still require restart.
-
-        // Reload config either on schedule OR immediately after SIGHUP
-        let reload_interval_ms = crate::config::CONFIG_RELOAD_INTERVAL_MS.get();
-        let reload_interval = Duration::from_millis(reload_interval_ms as u64);
-        let should_reload = sighup_pending || last_config_reload.elapsed() >= reload_interval;
-
-        if should_reload {
-            if sighup_pending {
-                pg_log!(
-                    "Immediate config reload triggered by SIGHUP (interval={}ms)",
-                    reload_interval_ms
-                );
-                sighup_pending = false;
-
-                // CRITICAL: Call ProcessConfigFile to actually reload GUC values
-                // Without this, GUC changes made via ALTER SYSTEM won't take effect
-                // in this background worker. This is the standard PostgreSQL pattern.
-                unsafe {
-                    pgrx::pg_sys::ProcessConfigFile(pgrx::pg_sys::GucContext::PGC_SIGHUP);
-                }
-                pg_log!("ProcessConfigFile called, GUCs reloaded from postgresql.auto.conf");
-            }
-
-            // 1. Reload GUCs (update RuntimeContext cache)
-            runtime_context.reload();
-            pg_log!("Reloaded GUC configuration");
-
-            // 2. Reload shadow config and flush metrics
-            let shadow_reload = AssertUnwindSafe(&shadow_store);
-            BackgroundWorker::transaction(move || {
-                // Reload topic shadow configurations
-                match shadow_reload.load_topic_config_from_db() {
-                    Ok(count) => {
-                        pg_log!("Reloaded {} shadow topic configurations", count);
-                    }
-                    Err(e) => {
-                        pg_warning!("Failed to reload shadow config: {:?}", e);
-                    }
-                }
-
-                // Flush accumulated metrics to database/logs
-                if let Err(e) = shadow_reload.flush_metrics_to_db() {
-                    pg_warning!("Failed to flush shadow metrics: {:?}", e);
-                }
-            });
-
-            last_config_reload = Instant::now();
         }
     }
 }

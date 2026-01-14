@@ -99,6 +99,40 @@ pub struct Config {
     pub shadow_license_key: String,
 }
 
+/// Custom Debug implementation that redacts sensitive credentials
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("port", &self.port)
+            .field("host", &self.host)
+            .field("database", &self.database)
+            .field("log_connections", &self.log_connections)
+            .field("shutdown_timeout_ms", &self.shutdown_timeout_ms)
+            .field("default_partitions", &self.default_partitions)
+            .field("fetch_poll_interval_ms", &self.fetch_poll_interval_ms)
+            .field("enable_long_polling", &self.enable_long_polling)
+            .field("compression_type", &self.compression_type)
+            .field("log_timing", &self.log_timing)
+            .field("shadow_mode_enabled", &self.shadow_mode_enabled)
+            .field("shadow_bootstrap_servers", &self.shadow_bootstrap_servers)
+            .field("shadow_security_protocol", &self.shadow_security_protocol)
+            .field("shadow_sasl_mechanism", &self.shadow_sasl_mechanism)
+            // REDACT sensitive credentials to prevent log exposure
+            .field("shadow_sasl_username", &"[REDACTED]")
+            .field("shadow_sasl_password", &"[REDACTED]")
+            .field("shadow_ssl_ca_location", &self.shadow_ssl_ca_location)
+            .field("shadow_batch_size", &self.shadow_batch_size)
+            .field("shadow_linger_ms", &self.shadow_linger_ms)
+            .field("shadow_retry_backoff_ms", &self.shadow_retry_backoff_ms)
+            .field("shadow_max_retries", &self.shadow_max_retries)
+            .field("shadow_default_sync_mode", &self.shadow_default_sync_mode)
+            .field("shadow_metrics_enabled", &self.shadow_metrics_enabled)
+            .field("shadow_otel_endpoint", &self.shadow_otel_endpoint)
+            .field("shadow_license_key", &"[REDACTED]")
+            .finish()
+    }
+}
+
 impl Config {
     /// Load configuration from GUC parameters
     #[cfg(not(test))]

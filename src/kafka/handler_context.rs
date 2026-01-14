@@ -352,6 +352,15 @@ mod tests {
             Ok(())
         }
 
+        fn begin_or_continue_transaction(
+            &self,
+            _transactional_id: &str,
+            _producer_id: i64,
+            _producer_epoch: i16,
+        ) -> crate::kafka::error::Result<()> {
+            Ok(())
+        }
+
         fn validate_transaction(
             &self,
             _transactional_id: &str,

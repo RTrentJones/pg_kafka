@@ -128,7 +128,7 @@ pub fn handle_fetch(
                         producer_epoch: -1,
                         timestamp_type: TimestampType::Creation,
                         offset: msg.partition_offset,
-                        sequence: msg.partition_offset as i32,
+                        sequence: 0, // Sequence in fetch response is not used; avoid i64→i32 overflow
                         timestamp: msg.timestamp,
                         key: msg.key.map(bytes::Bytes::from),
                         value: msg.value.map(bytes::Bytes::from),

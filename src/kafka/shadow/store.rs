@@ -1090,6 +1090,16 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
             .begin_transaction(transactional_id, producer_id, producer_epoch)
     }
 
+    fn begin_or_continue_transaction(
+        &self,
+        transactional_id: &str,
+        producer_id: i64,
+        producer_epoch: i16,
+    ) -> Result<()> {
+        self.inner
+            .begin_or_continue_transaction(transactional_id, producer_id, producer_epoch)
+    }
+
     fn validate_transaction(
         &self,
         transactional_id: &str,

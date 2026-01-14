@@ -1380,21 +1380,11 @@ mod tests {
     // ========== AddPartitionsToTxn Tests ==========
 
     #[test]
-    fn test_add_partitions_success_empty_to_ongoing() {
+    fn test_add_partitions_success() {
         let mut mock = MockKafkaStore::new();
 
-        // Validate transaction succeeds
-        mock.expect_validate_transaction()
-            .times(1)
-            .returning(|_, _, _| Ok(()));
-
-        // State is Empty, should transition to Ongoing
-        mock.expect_get_transaction_state()
-            .times(1)
-            .returning(|_| Ok(Some(TransactionState::Empty)));
-
-        // Should begin transaction
-        mock.expect_begin_transaction()
+        // Atomic begin_or_continue_transaction handles state transition
+        mock.expect_begin_or_continue_transaction()
             .times(1)
             .returning(|_, _, _| Ok(()));
 
@@ -1425,49 +1415,11 @@ mod tests {
     }
 
     #[test]
-    fn test_add_partitions_success_already_ongoing() {
-        let mut mock = MockKafkaStore::new();
-
-        mock.expect_validate_transaction()
-            .times(1)
-            .returning(|_, _, _| Ok(()));
-
-        // State is Ongoing - should NOT call begin_transaction
-        mock.expect_get_transaction_state()
-            .times(1)
-            .returning(|_| Ok(Some(TransactionState::Ongoing)));
-
-        // begin_transaction should NOT be called (no expect set)
-
-        mock.expect_get_topic_partition_count()
-            .times(1)
-            .returning(|_| Ok(Some(4)));
-
-        // Create HandlerContext AFTER setting expectations
-        let coordinator = GroupCoordinator::new();
-        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
-
-        let topics = vec![("test-topic".to_string(), vec![0])];
-
-        let response =
-            transaction::handle_add_partitions_to_txn(&ctx, "txn-1", 1000, 0, topics).unwrap();
-
-        assert_eq!(response.results_by_topic_v3_and_below.len(), 1);
-        assert_eq!(
-            response.results_by_topic_v3_and_below[0].results_by_partition[0].partition_error_code,
-            ERROR_NONE
-        );
-    }
-
-    #[test]
     fn test_add_partitions_invalid_partition() {
         let mut mock = MockKafkaStore::new();
 
-        mock.expect_validate_transaction()
+        mock.expect_begin_or_continue_transaction()
             .returning(|_, _, _| Ok(()));
-        mock.expect_get_transaction_state()
-            .returning(|_| Ok(Some(TransactionState::Ongoing)));
         // Topic has only 2 partitions
         mock.expect_get_topic_partition_count()
             .returning(|_| Ok(Some(2)));
@@ -1503,10 +1455,8 @@ mod tests {
         // because rdkafka calls this before the topic exists
         let mut mock = MockKafkaStore::new();
 
-        mock.expect_validate_transaction()
+        mock.expect_begin_or_continue_transaction()
             .returning(|_, _, _| Ok(()));
-        mock.expect_get_transaction_state()
-            .returning(|_| Ok(Some(TransactionState::Ongoing)));
         // Topic doesn't exist initially
         mock.expect_get_topic_partition_count()
             .returning(|_| Ok(None));
@@ -1534,11 +1484,15 @@ mod tests {
     fn test_add_partitions_invalid_state() {
         let mut mock = MockKafkaStore::new();
 
-        mock.expect_validate_transaction()
-            .returning(|_, _, _| Ok(()));
-        // State is CompleteCommit - invalid for AddPartitionsToTxn
-        mock.expect_get_transaction_state()
-            .returning(|_| Ok(Some(TransactionState::CompleteCommit)));
+        // Atomic method returns error for invalid state
+        mock.expect_begin_or_continue_transaction()
+            .returning(|_, _, _| {
+                Err(KafkaError::invalid_txn_state(
+                    "txn-1",
+                    "CompleteCommit",
+                    "AddPartitionsToTxn",
+                ))
+            });
 
         // Create HandlerContext AFTER setting expectations
         let coordinator = GroupCoordinator::new();
@@ -1560,10 +1514,9 @@ mod tests {
     fn test_add_partitions_txn_not_found() {
         let mut mock = MockKafkaStore::new();
 
-        mock.expect_validate_transaction()
-            .returning(|_, _, _| Ok(()));
-        // Transaction doesn't exist
-        mock.expect_get_transaction_state().returning(|_| Ok(None));
+        // Atomic method returns error for non-existent transaction
+        mock.expect_begin_or_continue_transaction()
+            .returning(|_, _, _| Err(KafkaError::transactional_id_not_found("unknown-txn")));
 
         // Create HandlerContext AFTER setting expectations
         let coordinator = GroupCoordinator::new();
@@ -1586,8 +1539,8 @@ mod tests {
     fn test_add_partitions_producer_fenced() {
         let mut mock = MockKafkaStore::new();
 
-        // Validation fails with ProducerFenced
-        mock.expect_validate_transaction()
+        // Atomic method returns ProducerFenced error
+        mock.expect_begin_or_continue_transaction()
             .returning(|_, _, _| Err(KafkaError::producer_fenced(1000, 0, 1)));
 
         // Create HandlerContext AFTER setting expectations
@@ -1609,38 +1562,11 @@ mod tests {
     // ========== AddOffsetsToTxn Tests ==========
 
     #[test]
-    fn test_add_offsets_success_ongoing() {
+    fn test_add_offsets_success() {
         let mut mock = MockKafkaStore::new();
 
-        mock.expect_validate_transaction()
-            .returning(|_, _, _| Ok(()));
-        mock.expect_get_transaction_state()
-            .returning(|_| Ok(Some(TransactionState::Ongoing)));
-
-        // Create HandlerContext AFTER setting expectations
-        let coordinator = GroupCoordinator::new();
-        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
-
-        let response =
-            transaction::handle_add_offsets_to_txn(&ctx, "txn-1", 1000, 0, "consumer-group")
-                .unwrap();
-
-        assert_eq!(response.error_code, ERROR_NONE);
-    }
-
-    #[test]
-    fn test_add_offsets_starts_transaction() {
-        let mut mock = MockKafkaStore::new();
-
-        mock.expect_validate_transaction()
-            .returning(|_, _, _| Ok(()));
-        // State is Empty
-        mock.expect_get_transaction_state()
-            .returning(|_| Ok(Some(TransactionState::Empty)));
-        // Should begin transaction
-        mock.expect_begin_transaction()
-            .times(1)
+        // Atomic begin_or_continue_transaction handles state transition
+        mock.expect_begin_or_continue_transaction()
             .returning(|_, _, _| Ok(()));
 
         // Create HandlerContext AFTER setting expectations
@@ -1659,10 +1585,15 @@ mod tests {
     fn test_add_offsets_invalid_state() {
         let mut mock = MockKafkaStore::new();
 
-        mock.expect_validate_transaction()
-            .returning(|_, _, _| Ok(()));
-        mock.expect_get_transaction_state()
-            .returning(|_| Ok(Some(TransactionState::PrepareCommit)));
+        // Atomic method returns error for invalid state
+        mock.expect_begin_or_continue_transaction()
+            .returning(|_, _, _| {
+                Err(KafkaError::invalid_txn_state(
+                    "txn-1",
+                    "PrepareCommit",
+                    "AddOffsetsToTxn",
+                ))
+            });
 
         // Create HandlerContext AFTER setting expectations
         let coordinator = GroupCoordinator::new();
@@ -1683,9 +1614,9 @@ mod tests {
     fn test_add_offsets_txn_not_found() {
         let mut mock = MockKafkaStore::new();
 
-        mock.expect_validate_transaction()
-            .returning(|_, _, _| Ok(()));
-        mock.expect_get_transaction_state().returning(|_| Ok(None));
+        // Atomic method returns error for non-existent transaction
+        mock.expect_begin_or_continue_transaction()
+            .returning(|_, _, _| Err(KafkaError::transactional_id_not_found("unknown-txn")));
 
         // Create HandlerContext AFTER setting expectations
         let coordinator = GroupCoordinator::new();
@@ -1706,7 +1637,8 @@ mod tests {
     fn test_add_offsets_producer_fenced() {
         let mut mock = MockKafkaStore::new();
 
-        mock.expect_validate_transaction()
+        // Atomic method returns ProducerFenced error
+        mock.expect_begin_or_continue_transaction()
             .returning(|_, _, _| Err(KafkaError::producer_fenced(1000, 0, 1)));
 
         // Create HandlerContext AFTER setting expectations

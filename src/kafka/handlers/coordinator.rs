@@ -159,15 +159,11 @@ pub fn handle_sync_group(
         // Get subscribed topics from group members
         if let Ok(topics) = coordinator.get_subscribed_topics(&group_id) {
             if !topics.is_empty() {
-                // Get partition counts for each topic
+                // Get partition counts for all topics in a single query (avoid N+1)
                 let mut topic_partitions: HashMap<String, i32> = HashMap::new();
-                for topic in &topics {
-                    if let Ok(metadata) =
-                        store.get_topic_metadata(Some(std::slice::from_ref(topic)))
-                    {
-                        if let Some(tm) = metadata.first() {
-                            topic_partitions.insert(topic.clone(), tm.partition_count);
-                        }
+                if let Ok(metadata) = store.get_topic_metadata(Some(&topics)) {
+                    for tm in metadata {
+                        topic_partitions.insert(tm.name.clone(), tm.partition_count);
                     }
                 }
 
