@@ -46,7 +46,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Automated E2E tests with real Kafka client (rdkafka)
 
 **API Coverage:** 23 of ~50 standard Kafka APIs (46%)
-**Test Status:** 192 unit tests + 104 E2E tests = 296 total ✅
+**Test Status:** 630 unit tests + 104 E2E tests = 734 total ✅
 **Coverage Target:** 80%+ (testable code)
 
 ## Development Setup
@@ -185,16 +185,16 @@ src/
 │   │   ├── init_producer_id.rs  # InitProducerId handler (Phase 9)
 │   │   ├── metadata.rs # ApiVersions/Metadata handlers
 │   │   ├── produce.rs  # ProduceRequest handler (with sequence validation)
-│   │   └── tests.rs    # Handler unit tests (22 tests with MockKafkaStore)
+│   │   └── tests.rs    # Handler unit tests (78 tests with MockKafkaStore)
 │   └── storage/        # Storage abstraction layer (Repository Pattern)
 │       ├── mod.rs      # KafkaStore trait definition
 │       ├── postgres.rs # PostgreSQL implementation (PostgresStore)
-│       └── tests.rs    # Storage layer tests (22 tests)
+│       └── tests.rs    # Storage layer tests (43 tests)
 └── bin/
     └── pgrx_embed.rs   # pgrx embedding binary (generated)
 
 tests/                  # pgrx integration tests (limited due to PGC_POSTMASTER)
-kafka_test/             # E2E test suite (74 tests)
+kafka_test/             # E2E test suite (104 tests)
     └── src/
         ├── main.rs               # Test orchestrator with CLI
         ├── lib.rs                # Test re-exports
@@ -278,7 +278,7 @@ This separation enables testing handlers without a running database.
 Protocol handlers live in `src/kafka/handlers/`:
 - Each Kafka API has a handler function taking `&dyn KafkaStore` for testability
 - `helpers.rs`: `TopicResolution` enum for topic lookup logic shared across handlers
-- `tests.rs`: 14 handler tests using `MockKafkaStore`
+- `tests.rs`: 78 handler tests using `MockKafkaStore`
 
 ### Error Handling
 
@@ -300,7 +300,8 @@ impl KafkaError {
 
 In-memory state management (`src/kafka/coordinator.rs`):
 - `Arc<RwLock<HashMap<String, GroupState>>>` for thread-safe group state
-- Currently supports manual partition assignment only (no automatic rebalancing)
+- Automatic partition assignment with Range, RoundRobin, and Sticky strategies
+- Automatic rebalancing on member leave or session timeout
 - Tracks: generation IDs, member registry, partition assignments
 
 ### Storage Schema

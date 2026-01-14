@@ -15,14 +15,16 @@ kcat -C -b localhost:9092 -t my-topic -p 0 -o beginning
 
 | Component | Status | Details |
 |-----------|--------|---------|
-| **Protocol Layer** | Production-ready | 19 Kafka APIs implemented (38% coverage) |
-| **Producer** | Production-ready | Full ProduceRequest with idempotency support |
+| **Protocol Layer** | Production-ready | 23 Kafka APIs implemented (46% coverage) |
+| **Producer** | Production-ready | Idempotent + transactional support |
 | **Consumer** | Production-ready | Fetch, ListOffsets, automatic partition assignment |
 | **Consumer Groups** | Complete | Full coordinator with auto-rebalancing |
-| **Test Suite** | 266 tests | 192 unit tests + 74 E2E scenarios |
+| **Transactions** | Complete | Full EOS with read-committed isolation |
+| **Shadow Mode** | Complete | External Kafka forwarding with SASL/SSL |
+| **Test Suite** | 734 tests | 630 unit tests + 104 E2E scenarios |
 | **CI/CD** | Complete | GitHub Actions with lint, test, security audit |
 
-**Current Phase:** Phase 9 Complete - Idempotent Producer
+**Current Phase:** Phase 11 Complete - Shadow Mode
 
 ---
 
@@ -42,8 +44,11 @@ kcat -C -b localhost:9092 -t my-topic -p 0 -o beginning
 - **Multi-Partition Topics** - Key-based routing with murmur2 hash
 - **Topic Auto-Creation** - Topics created on first produce
 - **Dual-Offset Design** - Both `partition_offset` (Kafka-compatible) and `global_offset` (temporal ordering)
+- **Transaction Support** - Full ACID with AddPartitionsToTxn, AddOffsetsToTxn, EndTxn, TxnOffsetCommit
+- **Read-Committed Isolation** - Consumers filter pending/aborted transactions
+- **Shadow Mode** - Dual-write to external Kafka with SASL/SSL authentication
 
-### Implemented APIs (19 total)
+### Implemented APIs (23 total)
 
 | API | Key | Description |
 |-----|-----|-------------|
@@ -64,6 +69,10 @@ kcat -C -b localhost:9092 -t my-topic -p 0 -o beginning
 | CreateTopics | 19 | Create topics with partition count |
 | DeleteTopics | 20 | Delete topics and messages |
 | InitProducerId | 22 | Allocate producer ID for idempotency |
+| AddPartitionsToTxn | 24 | Register partitions in transaction |
+| AddOffsetsToTxn | 25 | Include offsets in transaction |
+| EndTxn | 26 | Commit or abort transaction |
+| TxnOffsetCommit | 28 | Commit offsets within transaction |
 | CreatePartitions | 37 | Add partitions to existing topics |
 | DeleteGroups | 42 | Delete consumer groups |
 
@@ -243,17 +252,19 @@ docs/                       # Architecture decisions, protocol coverage
 
 | Category | Tests | Description |
 |----------|-------|-------------|
-| Assignment | 61 | Partition assignment strategies |
-| Protocol | 34 | Request/response parsing and encoding |
-| Handlers | 22 | Handler logic with MockKafkaStore |
-| Storage | 22 | Storage types and trait verification |
-| Infrastructure | 20 | Config, mocks, helpers |
-| Error Handling | 10 | KafkaError variants |
-| Coordinator | 8 | Consumer group coordinator |
-| Partitioner | 7 | Key-based partition routing |
-| Property | 8 | Property-based fuzzing with proptest |
-| E2E | 74 | Full integration with rdkafka client |
-| **Total** | **192 + 74** | |
+| Shadow Mode | 141 | External Kafka forwarding, SASL/SSL, replay |
+| Protocol | 85 | Request/response parsing and encoding |
+| Handlers | 78 | Handler logic with MockKafkaStore |
+| Assignment | 67 | Partition assignment strategies |
+| Storage | 43 | Storage types and trait verification |
+| Messages | 39 | Message encoding/decoding |
+| Response Builders | 30 | Response construction |
+| Error Handling | 22 | KafkaError variants |
+| Config | 32 | GUC configuration |
+| Testing Utils | 23 | Test infrastructure |
+| Other | 70 | Coordinator, partitioner, constants, property tests |
+| E2E | 104 | Full integration with rdkafka client |
+| **Total** | **734** | 630 unit + 104 E2E |
 
 ### Running Tests
 
@@ -308,13 +319,14 @@ pg_kafka.shutdown_timeout_ms = 5000
 - [x] **Phase 7:** Multi-Partition Topics (key-based routing)
 - [x] **Phase 8:** Compression Support (gzip, snappy, lz4, zstd)
 - [x] **Phase 9:** Idempotent Producer (InitProducerId, sequence validation)
+- [x] **Phase 10:** Transaction Support (AddPartitionsToTxn, AddOffsetsToTxn, EndTxn, TxnOffsetCommit)
+- [x] **Phase 11:** Shadow Mode (external Kafka forwarding, SASL/SSL, per-topic config)
 
 ### Planned
 
-- [ ] **Phase 10:** Shadow Mode (Logical Decoding → external Kafka)
-- [ ] **Phase 11:** Transaction Support (full ACID semantics)
 - [ ] **Cooperative Rebalancing** (KIP-429)
 - [ ] **Static Group Membership** (KIP-345)
+- [ ] Table partitioning and retention policies
 
 ---
 
@@ -332,7 +344,7 @@ pg_kafka.shutdown_timeout_ms = 5000
 - Long-term event sourcing (months/years of retention)
 - Massive scale (>100K msg/sec sustained)
 - Multi-datacenter replication
-- Exactly-once semantics, log compaction, transactions
+- Log compaction (KIP-58)
 
 See [PROTOCOL_DEVIATIONS.md](docs/PROTOCOL_DEVIATIONS.md) for detailed compatibility notes.
 
@@ -355,11 +367,12 @@ See [PROTOCOL_DEVIATIONS.md](docs/PROTOCOL_DEVIATIONS.md) for detailed compatibi
 ## Documentation
 
 - [CLAUDE.md](CLAUDE.md) - Development workflow and architecture
-- [PROJECT.md](PROJECT.md) - Complete design document
 - [docs/KAFKA_PROTOCOL_COVERAGE.md](docs/KAFKA_PROTOCOL_COVERAGE.md) - API coverage analysis
 - [docs/PROTOCOL_DEVIATIONS.md](docs/PROTOCOL_DEVIATIONS.md) - Intentional protocol deviations
 - [docs/TEST_STRATEGY.md](docs/TEST_STRATEGY.md) - Test strategy and coverage
 - [docs/REPOSITORY_PATTERN.md](docs/REPOSITORY_PATTERN.md) - Storage abstraction design
+- [docs/SHADOW_MODE_TESTING.md](docs/SHADOW_MODE_TESTING.md) - Shadow mode setup and testing
+- [docs/LICENSING.md](docs/LICENSING.md) - Dual-licensing information
 - [docs/architecture/ADR-001-partitioning-and-retention.md](docs/architecture/ADR-001-partitioning-and-retention.md) - Partitioning decisions
 
 ---

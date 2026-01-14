@@ -512,6 +512,6 @@ Producer (gzip) → TCP → pg_kafka (auto-decompress) → PostgreSQL (uncompres
 
 ---
 
-**Status:** Phase 8 Complete. Compression support is fully implemented. Partitioning and retention policies are planned for future phases and are critical for production deployments.
+**Status:** Phase 11 Complete. Shadow mode, transactions, idempotent producer, and compression support are fully implemented. Partitioning and retention policies are planned for future phases and are critical for production deployments.
 
-**Last Updated:** 2026-01-08
+**Last Updated:** 2026-01-14
