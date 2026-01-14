@@ -38,16 +38,24 @@ coverage:
 # These are either:
 # - pgrx-generated code
 # - SPI-dependent (tested via E2E suite in kafka_test/)
-# - Runtime code (async/tokio - tested via E2E)
+# - Async runtime code (E2E tested)
 ignore:
+  # pgrx generated/macro code
   - "src/bin/**"                      # pgrx embedding binary
   - "**/*_embed.rs"                   # pgrx generated files
   - "src/lib.rs"                      # _PG_init hook (pgrx macros)
-  - "src/config.rs"                   # GUC loading (requires postgres)
+
+  # SPI-dependent code (requires PostgreSQL, E2E tested)
   - "src/worker.rs"                   # Main BGWorker loop (SPI-dependent)
-  - "src/kafka/listener.rs"           # Async TCP listener (E2E tested)
-  - "src/kafka/messages.rs"           # Message queue types (async runtime)
   - "src/kafka/storage/postgres.rs"   # PostgresStore (SPI-dependent)
+  - "src/kafka/shadow/store.rs"       # ShadowStore (SPI-dependent, wraps PostgresStore)
+
+  # Async runtime code (E2E tested)
+  - "src/kafka/listener.rs"           # Async TCP listener (tokio runtime)
+
+  # Test infrastructure (MockStore impl is ~260 lines of stub methods)
+  # The actual HandlerContext code is tested, but MockStore drags down metrics
+  - "src/kafka/handler_context.rs"    # Contains MockStore impl for handler tests
 
 # Comment configuration for PR reviews
 comment:

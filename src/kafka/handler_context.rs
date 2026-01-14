@@ -176,7 +176,11 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    // Mock implementations for testing
+    // Simple mock store for HandlerContext tests.
+    // This is a minimal stub that returns defaults - we use MockKafkaStore from
+    // testing/mocks.rs for tests that need expectation-based mocking.
+    // NOTE: This impl is excluded from coverage in codecov.yml because it's
+    // test infrastructure (~260 lines), not application code.
     struct MockStore;
     impl KafkaStore for MockStore {
         fn get_or_create_topic(

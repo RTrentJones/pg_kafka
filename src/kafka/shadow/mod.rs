@@ -113,3 +113,56 @@ impl ForwardRequest {
         }
     }
 }
+
+// Unit tests for ForwardRequest (exported from mod.rs)
+#[cfg(test)]
+mod forward_request_tests {
+    use super::ForwardRequest;
+
+    #[test]
+    fn test_forward_request_new() {
+        let req = ForwardRequest::new(
+            "test-topic".to_string(),
+            0,
+            Some(b"key".to_vec()),
+            Some(b"value".to_vec()),
+            100,
+        );
+        assert_eq!(req.topic_name, "test-topic");
+        assert_eq!(req.partition_id, 0);
+        assert_eq!(req.key, Some(b"key".to_vec()));
+        assert_eq!(req.value, Some(b"value".to_vec()));
+        assert_eq!(req.local_offset, 100);
+    }
+
+    #[test]
+    fn test_forward_request_with_null_key() {
+        let req = ForwardRequest::new("topic".to_string(), 1, None, Some(b"v".to_vec()), 50);
+        assert!(req.key.is_none());
+        assert!(req.value.is_some());
+    }
+
+    #[test]
+    fn test_forward_request_with_null_value() {
+        let req = ForwardRequest::new("topic".to_string(), 2, Some(b"k".to_vec()), None, 75);
+        assert!(req.key.is_some());
+        assert!(req.value.is_none());
+    }
+
+    #[test]
+    fn test_forward_request_clone() {
+        let req = ForwardRequest::new("clone-topic".to_string(), 3, None, None, 999);
+        let cloned = req.clone();
+        assert_eq!(cloned.topic_name, req.topic_name);
+        assert_eq!(cloned.partition_id, req.partition_id);
+        assert_eq!(cloned.local_offset, req.local_offset);
+    }
+
+    #[test]
+    fn test_forward_request_debug_format() {
+        let req = ForwardRequest::new("debug".to_string(), 0, None, None, 0);
+        let debug = format!("{:?}", req);
+        assert!(debug.contains("ForwardRequest"));
+        assert!(debug.contains("debug"));
+    }
+}
