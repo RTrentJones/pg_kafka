@@ -56,7 +56,11 @@ pub async fn test_large_value_compression() -> TestResult {
     println!("Step 1: Creating 1MB value...");
     let pattern = "ABCDEFGHIJ".repeat(100); // 1KB pattern
     let large_value = pattern.repeat(1024); // 1MB total
-    println!("   Value size: {} bytes ({} MB)", large_value.len(), large_value.len() / (1024 * 1024));
+    println!(
+        "   Value size: {} bytes ({} MB)",
+        large_value.len(),
+        large_value.len() / (1024 * 1024)
+    );
     println!("✅ Large value created\n");
 
     // 2. Produce with zstd compression
@@ -101,7 +105,10 @@ pub async fn test_large_value_compression() -> TestResult {
         large_value.len(),
         "Decompressed value should match original size"
     );
-    assert_eq!(received, large_value, "Decompressed value should match original");
+    assert_eq!(
+        received, large_value,
+        "Decompressed value should match original"
+    );
     println!("✅ Large message received and verified\n");
 
     // 4. Verify storage in database
@@ -148,7 +155,9 @@ pub async fn test_compression_mixed_formats() -> TestResult {
 
     gzip_producer
         .send(
-            FutureRecord::to(&topic).payload("gzip-compressed-msg").key("gzip"),
+            FutureRecord::to(&topic)
+                .payload("gzip-compressed-msg")
+                .key("gzip"),
             Duration::from_secs(5),
         )
         .await
@@ -157,7 +166,9 @@ pub async fn test_compression_mixed_formats() -> TestResult {
 
     snappy_producer
         .send(
-            FutureRecord::to(&topic).payload("snappy-compressed-msg").key("snappy"),
+            FutureRecord::to(&topic)
+                .payload("snappy-compressed-msg")
+                .key("snappy"),
             Duration::from_secs(5),
         )
         .await
@@ -166,7 +177,9 @@ pub async fn test_compression_mixed_formats() -> TestResult {
 
     lz4_producer
         .send(
-            FutureRecord::to(&topic).payload("lz4-compressed-msg").key("lz4"),
+            FutureRecord::to(&topic)
+                .payload("lz4-compressed-msg")
+                .key("lz4"),
             Duration::from_secs(5),
         )
         .await
@@ -175,7 +188,9 @@ pub async fn test_compression_mixed_formats() -> TestResult {
 
     none_producer
         .send(
-            FutureRecord::to(&topic).payload("uncompressed-msg").key("none"),
+            FutureRecord::to(&topic)
+                .payload("uncompressed-msg")
+                .key("none"),
             Duration::from_secs(5),
         )
         .await
@@ -211,7 +226,10 @@ pub async fn test_compression_mixed_formats() -> TestResult {
         "Should receive at least 3 of 4 messages, got {}",
         received_messages.len()
     );
-    println!("✅ Received {} messages from mixed compression\n", received_messages.len());
+    println!(
+        "✅ Received {} messages from mixed compression\n",
+        received_messages.len()
+    );
 
     // 5. Verify in database
     println!("=== Database Verification ===\n");
@@ -331,9 +349,7 @@ pub async fn test_compression_incompressible_data() -> TestResult {
 
     producer
         .send(
-            FutureRecord::to(&topic)
-                .payload(&data)
-                .key("random-data"),
+            FutureRecord::to(&topic).payload(&data).key("random-data"),
             Duration::from_secs(10),
         )
         .await
@@ -383,7 +399,11 @@ pub async fn test_compression_small_message_overhead() -> TestResult {
     // 1. Create a very small message
     println!("Step 1: Creating small message (10 bytes)...");
     let small_message = "tiny data!"; // 10 bytes
-    println!("   Message: '{}' ({} bytes)", small_message, small_message.len());
+    println!(
+        "   Message: '{}' ({} bytes)",
+        small_message,
+        small_message.len()
+    );
     println!("✅ Small message created\n");
 
     // 2. Produce with compression (adds overhead to small messages)
@@ -392,9 +412,7 @@ pub async fn test_compression_small_message_overhead() -> TestResult {
 
     producer
         .send(
-            FutureRecord::to(&topic)
-                .payload(small_message)
-                .key("small"),
+            FutureRecord::to(&topic).payload(small_message).key("small"),
             Duration::from_secs(5),
         )
         .await
@@ -438,7 +456,11 @@ pub async fn test_compression_small_message_overhead() -> TestResult {
         )
         .await?;
     let stored_len: i32 = row.get(0);
-    assert_eq!(stored_len, small_message.len() as i32, "Stored size should match");
+    assert_eq!(
+        stored_len,
+        small_message.len() as i32,
+        "Stored size should match"
+    );
     println!("✅ Database stores original size: {} bytes\n", stored_len);
 
     ctx.cleanup().await?;

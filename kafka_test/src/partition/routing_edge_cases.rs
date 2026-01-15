@@ -24,7 +24,10 @@ pub async fn test_large_key_routing() -> TestResult {
     let num_partitions = 4i32;
 
     // 1. Create topic with multiple partitions
-    println!("Step 1: Creating topic with {} partitions...", num_partitions);
+    println!(
+        "Step 1: Creating topic with {} partitions...",
+        num_partitions
+    );
     ctx.db()
         .execute(
             "INSERT INTO kafka.topics (name, partitions) VALUES ($1, $2)
@@ -52,7 +55,10 @@ pub async fn test_large_key_routing() -> TestResult {
 
         match producer.send(record, Duration::from_secs(10)).await {
             Ok((partition, offset)) => {
-                println!("   Message {}: partition={}, offset={}", i, partition, offset);
+                println!(
+                    "   Message {}: partition={}, offset={}",
+                    i, partition, offset
+                );
                 delivered_partitions.push(partition);
             }
             Err((err, _)) => {
@@ -197,7 +203,10 @@ pub async fn test_empty_vs_null_key_routing() -> TestResult {
     let num_partitions = 4i32;
 
     // 1. Create topic
-    println!("Step 1: Creating topic with {} partitions...", num_partitions);
+    println!(
+        "Step 1: Creating topic with {} partitions...",
+        num_partitions
+    );
     ctx.db()
         .execute(
             "INSERT INTO kafka.topics (name, partitions) VALUES ($1, $2)
@@ -246,10 +255,7 @@ pub async fn test_empty_vs_null_key_routing() -> TestResult {
             }
         }
     }
-    println!(
-        "   Null key partitions: {:?}",
-        null_key_partitions
-    );
+    println!("   Null key partitions: {:?}", null_key_partitions);
     println!("✅ Null key messages delivered\n");
 
     // 4. Verify in database that both types are stored
@@ -366,7 +372,10 @@ pub async fn test_key_routing_after_partition_expansion() -> TestResult {
         )
         .await?;
     let count: i64 = row.get(0);
-    assert_eq!(count, 8, "Expected 8 messages (4 before + 4 after expansion)");
+    assert_eq!(
+        count, 8,
+        "Expected 8 messages (4 before + 4 after expansion)"
+    );
     println!("✅ Database confirms {} messages\n", count);
 
     // Note: Same key may route to different partition after expansion
@@ -390,7 +399,10 @@ pub async fn test_key_routing_across_producers() -> TestResult {
     let num_partitions = 4i32;
 
     // 1. Create topic
-    println!("Step 1: Creating topic with {} partitions...", num_partitions);
+    println!(
+        "Step 1: Creating topic with {} partitions...",
+        num_partitions
+    );
     ctx.db()
         .execute(
             "INSERT INTO kafka.topics (name, partitions) VALUES ($1, $2)

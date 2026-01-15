@@ -116,7 +116,8 @@ pub async fn test_transaction_timeout_auto_abort() -> TestResult {
             // After abort, message should be marked as aborted (not pending or NULL)
             println!("  Final message state: {:?}", final_state);
             assert!(
-                final_state == Some("aborted".to_string()) || final_state == Some("pending".to_string()),
+                final_state == Some("aborted".to_string())
+                    || final_state == Some("pending".to_string()),
                 "Message should be aborted or still pending (async abort)"
             );
         }
@@ -160,9 +161,7 @@ pub async fn test_concurrent_transactions_same_producer() -> TestResult {
     // Produce to first topic
     let (_p1, _o1) = producer
         .send(
-            FutureRecord::to(&topic1)
-                .payload("message 1")
-                .key("key1"),
+            FutureRecord::to(&topic1).payload("message 1").key("key1"),
             Duration::from_secs(5),
         )
         .await
@@ -185,9 +184,7 @@ pub async fn test_concurrent_transactions_same_producer() -> TestResult {
             // Produce to second topic
             let (_p2, _o2) = producer
                 .send(
-                    FutureRecord::to(&topic2)
-                        .payload("message 2")
-                        .key("key2"),
+                    FutureRecord::to(&topic2).payload("message 2").key("key2"),
                     Duration::from_secs(5),
                 )
                 .await
@@ -322,7 +319,10 @@ pub async fn test_producer_fencing_mid_transaction() -> TestResult {
     };
     println!("  Second producer epoch: {}", epoch2);
     assert!(epoch2 > epoch1, "Epoch should be bumped");
-    println!("  Epoch bumped: {} -> {} (fencing confirmed)\n", epoch1, epoch2);
+    println!(
+        "  Epoch bumped: {} -> {} (fencing confirmed)\n",
+        epoch1, epoch2
+    );
 
     // Try to commit the fenced producer's transaction (should fail)
     println!("Attempting to commit with fenced producer...");
@@ -347,7 +347,10 @@ pub async fn test_producer_fencing_mid_transaction() -> TestResult {
                     )
                     .await?
                     .get(0);
-                println!("  Visible messages: {} (fenced messages may not be visible)", visible);
+                println!(
+                    "  Visible messages: {} (fenced messages may not be visible)",
+                    visible
+                );
             }
         }
         Err(e) => {
@@ -423,7 +426,10 @@ pub async fn test_add_partitions_to_txn_idempotent() -> TestResult {
             Duration::from_secs(5),
         )
         .await;
-    assert!(result2.is_ok(), "Second produce to same partition should succeed");
+    assert!(
+        result2.is_ok(),
+        "Second produce to same partition should succeed"
+    );
     let (_p2, offset2) = result2.unwrap();
     println!("  Second message at offset {}\n", offset2);
 
@@ -532,7 +538,10 @@ pub async fn test_txn_offset_commit_visibility_timing() -> TestResult {
         )
         .await?
         .get(0);
-    println!("  Committed offsets before transaction commit: {}", committed_before);
+    println!(
+        "  Committed offsets before transaction commit: {}",
+        committed_before
+    );
     assert_eq!(committed_before, 0, "Offset should not be committed yet");
 
     // Produce something to keep transaction alive
@@ -583,7 +592,9 @@ pub async fn test_txn_offset_commit_visibility_timing() -> TestResult {
 
             // Pending offsets should be moved to committed on transaction commit
             if pending_count == 0 {
-                println!("  Note: Pending offsets were processed (may need EndTxn handler enhancement)");
+                println!(
+                    "  Note: Pending offsets were processed (may need EndTxn handler enhancement)"
+                );
             }
         }
     }
@@ -614,9 +625,7 @@ pub async fn test_abort_transaction_discards_pending_offsets() -> TestResult {
     let seed_producer = create_producer()?;
     seed_producer
         .send(
-            FutureRecord::to(&source_topic)
-                .payload("seed")
-                .key("key"),
+            FutureRecord::to(&source_topic).payload("seed").key("key"),
             Duration::from_secs(5),
         )
         .await
@@ -862,7 +871,10 @@ pub async fn test_transaction_boundary_isolation() -> TestResult {
         .map_err(|(e, _)| e)?;
 
     producer1.commit_transaction(Duration::from_secs(10))?;
-    println!("  First transaction committed, message at offset {}\n", offset1);
+    println!(
+        "  First transaction committed, message at offset {}\n",
+        offset1
+    );
 
     // Create second transaction but don't commit (keep pending)
     println!("Creating second producer with pending transaction...");
@@ -879,7 +891,10 @@ pub async fn test_transaction_boundary_isolation() -> TestResult {
         )
         .await
         .map_err(|(e, _)| e)?;
-    println!("  Second transaction pending, message at offset {}\n", offset2);
+    println!(
+        "  Second transaction pending, message at offset {}\n",
+        offset2
+    );
 
     // Verify database state
     println!("=== Database Verification ===\n");
@@ -909,7 +924,10 @@ pub async fn test_transaction_boundary_isolation() -> TestResult {
     println!("  Message 1 (committed): txn_state = {:?}", msg1_state);
     println!("  Message 2 (pending): txn_state = {:?}", msg2_state);
 
-    assert!(msg1_state.is_none(), "Committed message should have NULL txn_state");
+    assert!(
+        msg1_state.is_none(),
+        "Committed message should have NULL txn_state"
+    );
     assert_eq!(
         msg2_state,
         Some("pending".to_string()),
@@ -936,7 +954,10 @@ pub async fn test_transaction_boundary_isolation() -> TestResult {
     println!("\n  read_committed sees: {} message(s)", visible_count);
     println!("  read_uncommitted sees: {} message(s)", total_count);
 
-    assert_eq!(visible_count, 1, "read_committed should see only committed message");
+    assert_eq!(
+        visible_count, 1,
+        "read_committed should see only committed message"
+    );
     assert_eq!(total_count, 2, "read_uncommitted should see both messages");
 
     // Verify with actual consumer

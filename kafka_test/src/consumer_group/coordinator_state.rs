@@ -46,7 +46,10 @@ pub async fn test_find_coordinator_bootstrap() -> TestResult {
 
     // Create consumer with a new (non-existent) group
     let new_group = format!("new-coord-group-{}", uuid::Uuid::new_v4());
-    println!("\nStep 2: Creating consumer with new group '{}'...", new_group);
+    println!(
+        "\nStep 2: Creating consumer with new group '{}'...",
+        new_group
+    );
 
     let consumer: StreamConsumer = ClientConfig::new()
         .set("bootstrap.servers", get_bootstrap_servers())
@@ -69,7 +72,9 @@ pub async fn test_find_coordinator_bootstrap() -> TestResult {
 
     match result {
         Ok(Ok(msg)) => {
-            let value = msg.payload().map(|v| String::from_utf8_lossy(v).to_string());
+            let value = msg
+                .payload()
+                .map(|v| String::from_utf8_lossy(v).to_string());
             println!("  ✅ Received message: {:?}", value);
         }
         Ok(Err(e)) => {
@@ -174,8 +179,15 @@ pub async fn test_partition_assignment_strategies() -> TestResult {
         match tokio::time::timeout(Duration::from_millis(500), consumer.recv()).await {
             Ok(Ok(msg)) => {
                 let partition = msg.partition();
-                let value = msg.payload().map(|v| String::from_utf8_lossy(v).to_string());
-                println!("  Consumer {} received from partition {}: {:?}", i + 1, partition, value);
+                let value = msg
+                    .payload()
+                    .map(|v| String::from_utf8_lossy(v).to_string());
+                println!(
+                    "  Consumer {} received from partition {}: {:?}",
+                    i + 1,
+                    partition,
+                    value
+                );
                 total_received += 1;
             }
             Ok(Err(e)) => {
@@ -192,7 +204,10 @@ pub async fn test_partition_assignment_strategies() -> TestResult {
     println!("  Total messages received: {}", total_received);
 
     // With 3 partitions and 3 consumers, at least 1 should receive
-    assert!(total_received >= 1, "At least one consumer should receive messages");
+    assert!(
+        total_received >= 1,
+        "At least one consumer should receive messages"
+    );
 
     ctx.cleanup().await?;
     println!("\n✅ Partition assignment strategies test PASSED\n");
@@ -277,7 +292,9 @@ pub async fn test_leave_during_rebalance() -> TestResult {
 
     match result {
         Ok(Ok(msg)) => {
-            let value = msg.payload().map(|v| String::from_utf8_lossy(v).to_string());
+            let value = msg
+                .payload()
+                .map(|v| String::from_utf8_lossy(v).to_string());
             println!("  ✅ Consumer 2 received: {:?}", value);
         }
         _ => {
@@ -349,7 +366,9 @@ pub async fn test_heartbeat_keeps_membership() -> TestResult {
         // Poll with long timeout
         match tokio::time::timeout(Duration::from_secs(3), consumer.recv()).await {
             Ok(Ok(msg)) => {
-                let value = msg.payload().map(|v| String::from_utf8_lossy(v).to_string());
+                let value = msg
+                    .payload()
+                    .map(|v| String::from_utf8_lossy(v).to_string());
                 println!("  Received: {:?}", value);
                 received += 1;
             }
@@ -440,7 +459,9 @@ pub async fn test_group_state_transitions() -> TestResult {
     for _ in 0..3 {
         match tokio::time::timeout(Duration::from_secs(2), consumer1.recv()).await {
             Ok(Ok(msg)) => {
-                let value = msg.payload().map(|v| String::from_utf8_lossy(v).to_string());
+                let value = msg
+                    .payload()
+                    .map(|v| String::from_utf8_lossy(v).to_string());
                 println!("  Consumer 1 received: {:?}", value);
                 received1 += 1;
             }
@@ -478,7 +499,9 @@ pub async fn test_group_state_transitions() -> TestResult {
     for _ in 0..3 {
         match tokio::time::timeout(Duration::from_secs(2), consumer2.recv()).await {
             Ok(Ok(msg)) => {
-                let value = msg.payload().map(|v| String::from_utf8_lossy(v).to_string());
+                let value = msg
+                    .payload()
+                    .map(|v| String::from_utf8_lossy(v).to_string());
                 println!("  Consumer 2 received: {:?}", value);
                 received2 += 1;
             }

@@ -156,7 +156,8 @@ pub async fn test_produce_latency_percentiles() -> TestResult {
 
     let p50 = latencies.get(p50_idx).copied().unwrap_or_default();
     let p95 = latencies.get(p95_idx).copied().unwrap_or_default();
-    let p99 = latencies.get(p99_idx.min(latencies.len().saturating_sub(1)))
+    let p99 = latencies
+        .get(p99_idx.min(latencies.len().saturating_sub(1)))
         .copied()
         .unwrap_or_default();
     let min = latencies.first().copied().unwrap_or_default();
@@ -346,7 +347,10 @@ pub async fn test_long_poll_cpu_efficiency() -> TestResult {
 
     let actual_duration = poll_start.elapsed();
     println!("   Poll cycles: {}", poll_count);
-    println!("   Actual duration: {:.2}s\n", actual_duration.as_secs_f64());
+    println!(
+        "   Actual duration: {:.2}s\n",
+        actual_duration.as_secs_f64()
+    );
 
     // 3. Verify efficient polling (not spinning)
     println!("=== CPU Efficiency Assessment ===\n");

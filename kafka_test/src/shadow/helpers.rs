@@ -204,11 +204,8 @@ pub async fn disable_shadow_mode(db: &Client, topic_name: &str) -> TestResult {
         .await?;
     db.execute("ALTER SYSTEM RESET pg_kafka.shadow_security_protocol", &[])
         .await?;
-    db.execute(
-        "ALTER SYSTEM RESET pg_kafka.config_reload_interval_ms",
-        &[],
-    )
-    .await?;
+    db.execute("ALTER SYSTEM RESET pg_kafka.config_reload_interval_ms", &[])
+        .await?;
 
     // Reload config
     db.execute("SELECT pg_reload_conf()", &[]).await?;

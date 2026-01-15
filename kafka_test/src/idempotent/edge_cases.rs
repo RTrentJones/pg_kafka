@@ -123,9 +123,12 @@ pub async fn test_idempotent_producer_epoch_bump() -> TestResult {
         );
 
         // If both have values, verify epoch behavior
-        if let (Some(_), Some(e1), Some(_), Some(e2)) =
-            (initial_producer_id, initial_epoch, new_producer_id, new_epoch)
-        {
+        if let (Some(_), Some(e1), Some(_), Some(e2)) = (
+            initial_producer_id,
+            initial_epoch,
+            new_producer_id,
+            new_epoch,
+        ) {
             // New producer may have same or different ID, but epoch should be tracked
             println!("  Epoch tracking verified: {} -> {}", e1, e2);
         }
@@ -428,7 +431,10 @@ pub async fn test_idempotent_concurrent_producers() -> TestResult {
         .get(0);
 
     println!("  Database count: {}", db_count);
-    assert_eq!(db_count, total_sent as i64, "Database should match sent count");
+    assert_eq!(
+        db_count, total_sent as i64,
+        "Database should match sent count"
+    );
 
     // Verify no duplicate offsets
     let unique_offsets: i64 = ctx
@@ -520,7 +526,11 @@ pub async fn test_idempotent_high_sequence() -> TestResult {
         .await?
         .get(0);
 
-    assert_eq!(max_offset, num_messages - 1, "Max offset should be num_messages - 1");
+    assert_eq!(
+        max_offset,
+        num_messages - 1,
+        "Max offset should be num_messages - 1"
+    );
     println!("  Max offset: {} (correct)", max_offset);
 
     // Verify no gaps

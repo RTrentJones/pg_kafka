@@ -220,7 +220,10 @@ pub async fn test_heartbeat_during_rebalance_window() -> TestResult {
     drop(consumer2);
     ctx.cleanup().await?;
 
-    assert!(either_received, "At least one consumer should receive after rebalance");
+    assert!(
+        either_received,
+        "At least one consumer should receive after rebalance"
+    );
 
     println!("\n  Heartbeat during rebalance window test PASSED\n");
     Ok(())

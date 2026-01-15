@@ -185,7 +185,10 @@ pub async fn test_offset_commit_race() -> TestResult {
     // Get topic ID for direct DB operations
     let topic_row = ctx
         .db()
-        .query_one("SELECT id FROM kafka.topics WHERE name = $1", &[&topic_name])
+        .query_one(
+            "SELECT id FROM kafka.topics WHERE name = $1",
+            &[&topic_name],
+        )
         .await?;
     let topic_id: i32 = topic_row.get(0);
 
@@ -312,11 +315,7 @@ pub async fn test_coordinator_state_race() -> TestResult {
 
                 // Do a few poll cycles (triggers heartbeats)
                 for _ in 0..3 {
-                    let _ = tokio::time::timeout(
-                        Duration::from_millis(200),
-                        consumer.recv(),
-                    )
-                    .await;
+                    let _ = tokio::time::timeout(Duration::from_millis(200), consumer.recv()).await;
                 }
 
                 // Unsubscribe (triggers leave)
@@ -468,9 +467,7 @@ pub async fn test_group_rejoin_race() -> TestResult {
     println!("=== Test: Group Rejoin Race ===\n");
 
     let ctx = TestContext::new().await?;
-    let topic = TestTopicBuilder::new(&ctx, "race-rejoin")
-        .build()
-        .await?;
+    let topic = TestTopicBuilder::new(&ctx, "race-rejoin").build().await?;
 
     let group_id = format!("race-rejoin-group-{}", Uuid::new_v4());
     let rejoin_cycles = 5;
@@ -516,7 +513,10 @@ pub async fn test_group_rejoin_race() -> TestResult {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    println!("\n  Successful joins: {}/{}", successful_joins, rejoin_cycles);
+    println!(
+        "\n  Successful joins: {}/{}",
+        successful_joins, rejoin_cycles
+    );
 
     // At least some joins should succeed
     assert!(

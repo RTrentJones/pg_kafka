@@ -53,7 +53,10 @@ pub async fn test_long_poll_min_bytes_threshold() -> TestResult {
     let consumer: StreamConsumer = ClientConfig::new()
         .set("bootstrap.servers", get_bootstrap_servers())
         .set("broker.address.family", "v4")
-        .set("group.id", &format!("minbytes-group-{}", uuid::Uuid::new_v4()))
+        .set(
+            "group.id",
+            &format!("minbytes-group-{}", uuid::Uuid::new_v4()),
+        )
         .set("auto.offset.reset", "latest")
         .set("fetch.wait.max.ms", "10000") // Long wait
         .set("fetch.min.bytes", "500") // Accumulation threshold
@@ -81,8 +84,14 @@ pub async fn test_long_poll_min_bytes_threshold() -> TestResult {
 
             match tokio::time::timeout(Duration::from_millis(100), consumer.recv()).await {
                 Ok(Ok(msg)) => {
-                    let value = msg.payload().map(|v| String::from_utf8_lossy(v).to_string());
-                    if value.as_deref().map(|v| v.starts_with("batch-")).unwrap_or(false) {
+                    let value = msg
+                        .payload()
+                        .map(|v| String::from_utf8_lossy(v).to_string());
+                    if value
+                        .as_deref()
+                        .map(|v| v.starts_with("batch-"))
+                        .unwrap_or(false)
+                    {
                         received_clone.fetch_add(1, Ordering::SeqCst);
                         let elapsed = start.elapsed();
                         println!("  Consumer received message in {:?}", elapsed);
@@ -130,7 +139,11 @@ pub async fn test_long_poll_min_bytes_threshold() -> TestResult {
     println!("  Time to receive: {:?}", duration);
 
     // Consumer should have received messages after batch accumulated
-    assert!(count >= 3, "Should receive at least 3 messages, got {}", count);
+    assert!(
+        count >= 3,
+        "Should receive at least 3 messages, got {}",
+        count
+    );
 
     ctx.cleanup().await?;
     println!("\n✅ Long poll min_bytes threshold test PASSED\n");
@@ -171,7 +184,10 @@ pub async fn test_long_poll_timeout_precision() -> TestResult {
     let consumer: StreamConsumer = ClientConfig::new()
         .set("bootstrap.servers", get_bootstrap_servers())
         .set("broker.address.family", "v4")
-        .set("group.id", &format!("precision-group-{}", uuid::Uuid::new_v4()))
+        .set(
+            "group.id",
+            &format!("precision-group-{}", uuid::Uuid::new_v4()),
+        )
         .set("auto.offset.reset", "latest")
         .set("fetch.wait.max.ms", "2000")
         .set("fetch.min.bytes", "1")
@@ -194,14 +210,30 @@ pub async fn test_long_poll_timeout_precision() -> TestResult {
         let poll_start = Instant::now();
         match tokio::time::timeout(Duration::from_millis(500), consumer.recv()).await {
             Ok(Ok(msg)) => {
-                let value = msg.payload().map(|v| String::from_utf8_lossy(v).to_string());
-                println!("  Poll {}: received {:?} in {:?}", poll_count + 1, value, poll_start.elapsed());
+                let value = msg
+                    .payload()
+                    .map(|v| String::from_utf8_lossy(v).to_string());
+                println!(
+                    "  Poll {}: received {:?} in {:?}",
+                    poll_count + 1,
+                    value,
+                    poll_start.elapsed()
+                );
             }
             Ok(Err(e)) => {
-                println!("  Poll {}: error {} in {:?}", poll_count + 1, e, poll_start.elapsed());
+                println!(
+                    "  Poll {}: error {} in {:?}",
+                    poll_count + 1,
+                    e,
+                    poll_start.elapsed()
+                );
             }
             Err(_) => {
-                println!("  Poll {}: client timeout in {:?}", poll_count + 1, poll_start.elapsed());
+                println!(
+                    "  Poll {}: client timeout in {:?}",
+                    poll_count + 1,
+                    poll_start.elapsed()
+                );
             }
         }
         poll_count += 1;
@@ -209,7 +241,10 @@ pub async fn test_long_poll_timeout_precision() -> TestResult {
 
     let total_duration = start.elapsed();
     println!("\nStep 4: Verifying behavior...");
-    println!("  Total time for {} polls: {:?}", poll_count, total_duration);
+    println!(
+        "  Total time for {} polls: {:?}",
+        poll_count, total_duration
+    );
 
     // Should complete all polls reasonably quickly
     assert!(
@@ -245,7 +280,9 @@ pub async fn test_long_poll_consumer_disconnect() -> TestResult {
     let producer = create_producer()?;
     producer
         .send(
-            FutureRecord::to(&topic.name).payload("test-message").key("key"),
+            FutureRecord::to(&topic.name)
+                .payload("test-message")
+                .key("key"),
             Duration::from_secs(5),
         )
         .await
@@ -258,7 +295,10 @@ pub async fn test_long_poll_consumer_disconnect() -> TestResult {
         let consumer: StreamConsumer = ClientConfig::new()
             .set("bootstrap.servers", get_bootstrap_servers())
             .set("broker.address.family", "v4")
-            .set("group.id", &format!("disconnect-group-{}", uuid::Uuid::new_v4()))
+            .set(
+                "group.id",
+                &format!("disconnect-group-{}", uuid::Uuid::new_v4()),
+            )
             .set("auto.offset.reset", "earliest")
             .set("fetch.wait.max.ms", "30000") // Very long wait
             .set("fetch.min.bytes", "1")
@@ -286,7 +326,10 @@ pub async fn test_long_poll_consumer_disconnect() -> TestResult {
     let consumer2: StreamConsumer = ClientConfig::new()
         .set("bootstrap.servers", get_bootstrap_servers())
         .set("broker.address.family", "v4")
-        .set("group.id", &format!("disconnect-group2-{}", uuid::Uuid::new_v4()))
+        .set(
+            "group.id",
+            &format!("disconnect-group2-{}", uuid::Uuid::new_v4()),
+        )
         .set("auto.offset.reset", "earliest")
         .set("fetch.wait.max.ms", "5000")
         .set("fetch.min.bytes", "1")
@@ -304,7 +347,9 @@ pub async fn test_long_poll_consumer_disconnect() -> TestResult {
     while start.elapsed() < Duration::from_secs(5) {
         match tokio::time::timeout(Duration::from_millis(500), consumer2.recv()).await {
             Ok(Ok(msg)) => {
-                let value = msg.payload().map(|v| String::from_utf8_lossy(v).to_string());
+                let value = msg
+                    .payload()
+                    .map(|v| String::from_utf8_lossy(v).to_string());
                 if value.as_deref() == Some("test-message") {
                     received = true;
                     println!("  ✅ New consumer received message");
@@ -358,7 +403,10 @@ pub async fn test_long_poll_multiple_consumers_same_partition() -> TestResult {
         let consumer: StreamConsumer = ClientConfig::new()
             .set("bootstrap.servers", get_bootstrap_servers())
             .set("broker.address.family", "v4")
-            .set("group.id", &format!("multi-group-{}-{}", i, uuid::Uuid::new_v4()))
+            .set(
+                "group.id",
+                &format!("multi-group-{}-{}", i, uuid::Uuid::new_v4()),
+            )
             .set("auto.offset.reset", "latest")
             .set("fetch.wait.max.ms", "10000")
             .set("fetch.min.bytes", "1")
@@ -376,9 +424,8 @@ pub async fn test_long_poll_multiple_consumers_same_partition() -> TestResult {
 
     // Start all consumers polling
     println!("\nStep 3: Starting all consumers polling...");
-    let received_counts: Vec<Arc<AtomicU32>> = (0..3)
-        .map(|_| Arc::new(AtomicU32::new(0)))
-        .collect();
+    let received_counts: Vec<Arc<AtomicU32>> =
+        (0..3).map(|_| Arc::new(AtomicU32::new(0))).collect();
 
     let mut handles = Vec::new();
     for (i, consumer) in consumers.into_iter().enumerate() {
@@ -388,10 +435,16 @@ pub async fn test_long_poll_multiple_consumers_same_partition() -> TestResult {
             while start.elapsed() < Duration::from_secs(5) {
                 match tokio::time::timeout(Duration::from_millis(100), consumer.recv()).await {
                     Ok(Ok(msg)) => {
-                        let value = msg.payload().map(|v| String::from_utf8_lossy(v).to_string());
+                        let value = msg
+                            .payload()
+                            .map(|v| String::from_utf8_lossy(v).to_string());
                         if value.as_deref() == Some("broadcast-message") {
                             count.fetch_add(1, Ordering::SeqCst);
-                            println!("  Consumer {} received broadcast in {:?}", i + 1, start.elapsed());
+                            println!(
+                                "  Consumer {} received broadcast in {:?}",
+                                i + 1,
+                                start.elapsed()
+                            );
                             return true;
                         }
                     }
@@ -501,7 +554,9 @@ pub async fn test_long_poll_auto_commit_interval() -> TestResult {
     while consumed < 3 && start.elapsed() < Duration::from_secs(5) {
         match tokio::time::timeout(Duration::from_millis(500), consumer.recv()).await {
             Ok(Ok(msg)) => {
-                let value = msg.payload().map(|v| String::from_utf8_lossy(v).to_string());
+                let value = msg
+                    .payload()
+                    .map(|v| String::from_utf8_lossy(v).to_string());
                 if let Some(v) = value {
                     if v.starts_with("message-") {
                         consumed += 1;

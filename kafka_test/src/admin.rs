@@ -418,7 +418,11 @@ pub async fn test_create_topic_invalid_name() -> TestResult {
         println!(
             "   '{}' -> {}",
             name,
-            if result.is_ok() { "accepted" } else { "rejected" }
+            if result.is_ok() {
+                "accepted"
+            } else {
+                "rejected"
+            }
         );
     }
     println!("✅ Invalid name handling verified\n");
@@ -430,7 +434,11 @@ pub async fn test_create_topic_invalid_name() -> TestResult {
     let result = &results[0];
     println!(
         "   Empty name -> {}",
-        if result.is_ok() { "accepted" } else { "rejected" }
+        if result.is_ok() {
+            "accepted"
+        } else {
+            "rejected"
+        }
     );
     println!("✅ Empty name handling verified\n");
 
@@ -538,7 +546,11 @@ pub async fn test_create_topic_with_config() -> TestResult {
     // Note: pg_kafka may not support all config options
     println!(
         "   Topic creation: {}",
-        if result.is_ok() { "success" } else { "rejected" }
+        if result.is_ok() {
+            "success"
+        } else {
+            "rejected"
+        }
     );
     println!("✅ Topic configuration handling verified\n");
 
@@ -584,7 +596,11 @@ pub async fn test_create_topic_invalid_partitions() -> TestResult {
     let result = &results[0];
     println!(
         "   Zero partitions -> {}",
-        if result.is_ok() { "accepted" } else { "rejected" }
+        if result.is_ok() {
+            "accepted"
+        } else {
+            "rejected"
+        }
     );
     // Zero partitions should ideally be rejected
     if result.is_err() {
@@ -599,11 +615,17 @@ pub async fn test_create_topic_invalid_partitions() -> TestResult {
     let result = &results[0];
     println!(
         "   10000 partitions -> {}",
-        if result.is_ok() { "accepted" } else { "rejected" }
+        if result.is_ok() {
+            "accepted"
+        } else {
+            "rejected"
+        }
     );
 
     // Cleanup any created topics
-    let _ = admin.delete_topics(&[&topic_zero, &topic_large], &opts).await;
+    let _ = admin
+        .delete_topics(&[&topic_zero, &topic_large], &opts)
+        .await;
 
     println!("\n✅ Test: Create Topic with Invalid Partitions PASSED\n");
     Ok(())

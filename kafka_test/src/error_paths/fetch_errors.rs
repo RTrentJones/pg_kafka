@@ -6,7 +6,9 @@
 //! - Offset reset behavior
 //! - Partition deletion scenarios
 
-use crate::common::{create_stream_consumer, create_transactional_producer, get_bootstrap_servers, TestResult};
+use crate::common::{
+    create_stream_consumer, create_transactional_producer, get_bootstrap_servers, TestResult,
+};
 use crate::fixtures::{generate_messages, TestTopicBuilder};
 use crate::setup::TestContext;
 use rdkafka::config::ClientConfig;
@@ -96,7 +98,9 @@ pub async fn test_fetch_isolation_level_enforcement() -> TestResult {
     println!("=== Test: Fetch Isolation Level Enforcement ===\n");
 
     let ctx = TestContext::new().await?;
-    let topic = TestTopicBuilder::new(&ctx, "isolation-test").build().await?;
+    let topic = TestTopicBuilder::new(&ctx, "isolation-test")
+        .build()
+        .await?;
     let group_committed = ctx.unique_group("read-committed").await;
     let group_uncommitted = ctx.unique_group("read-uncommitted").await;
 
@@ -168,7 +172,10 @@ pub async fn test_fetch_isolation_level_enforcement() -> TestResult {
             Err(_) => continue,
         }
     }
-    println!("   read_committed received {} messages\n", committed_msgs.len());
+    println!(
+        "   read_committed received {} messages\n",
+        committed_msgs.len()
+    );
 
     // 4. Create read_uncommitted consumer
     println!("Step 4: Testing read_uncommitted consumer...");
@@ -201,7 +208,10 @@ pub async fn test_fetch_isolation_level_enforcement() -> TestResult {
             Err(_) => continue,
         }
     }
-    println!("   read_uncommitted received {} messages\n", uncommitted_msgs.len());
+    println!(
+        "   read_uncommitted received {} messages\n",
+        uncommitted_msgs.len()
+    );
 
     // 5. Abort the transaction
     println!("Step 5: Aborting transaction...");
@@ -329,7 +339,10 @@ pub async fn test_fetch_with_deleted_topic() -> TestResult {
     while !received_before_delete && start.elapsed() < Duration::from_secs(5) {
         match tokio::time::timeout(Duration::from_secs(1), consumer.recv()).await {
             Ok(Ok(msg)) => {
-                println!("   Received message at offset {} (before delete)", msg.offset());
+                println!(
+                    "   Received message at offset {} (before delete)",
+                    msg.offset()
+                );
                 received_before_delete = true;
             }
             Ok(Err(e)) => println!("   Error: {}", e),
@@ -347,10 +360,7 @@ pub async fn test_fetch_with_deleted_topic() -> TestResult {
         )
         .await?;
     ctx.db()
-        .execute(
-            "DELETE FROM kafka.topics WHERE name = $1",
-            &[&topic_name],
-        )
+        .execute("DELETE FROM kafka.topics WHERE name = $1", &[&topic_name])
         .await?;
     println!("✅ Topic deleted from database\n");
 
@@ -451,7 +461,10 @@ pub async fn test_fetch_from_new_partition() -> TestResult {
     while start.elapsed() < Duration::from_secs(2) {
         match tokio::time::timeout(Duration::from_millis(500), consumer.recv()).await {
             Ok(Ok(msg)) => {
-                println!("   Received message from partition 1 at offset {}", msg.offset());
+                println!(
+                    "   Received message from partition 1 at offset {}",
+                    msg.offset()
+                );
                 received_from_new += 1;
             }
             Ok(Err(e)) => println!("   Error: {}", e),
@@ -459,7 +472,10 @@ pub async fn test_fetch_from_new_partition() -> TestResult {
         }
     }
 
-    println!("   Messages received from new partition: {}", received_from_new);
+    println!(
+        "   Messages received from new partition: {}",
+        received_from_new
+    );
     println!("✅ New partition correctly starts empty\n");
 
     // 5. Produce to new partition and verify
@@ -486,7 +502,10 @@ pub async fn test_fetch_from_new_partition() -> TestResult {
         )
         .await?;
     let offset: i64 = row.get(0);
-    assert_eq!(offset, 0, "First message in new partition should be at offset 0");
+    assert_eq!(
+        offset, 0,
+        "First message in new partition should be at offset 0"
+    );
     println!("✅ New partition first message at offset 0\n");
 
     ctx.cleanup().await?;

@@ -217,9 +217,7 @@ pub async fn test_offset_reset_policy() -> TestResult {
     println!("=== Test: Offset Reset Policy ===\n");
 
     let ctx = TestContext::new().await?;
-    let topic = TestTopicBuilder::new(&ctx, "offset-reset")
-        .build()
-        .await?;
+    let topic = TestTopicBuilder::new(&ctx, "offset-reset").build().await?;
 
     // Create topic with messages
     println!("Step 1: Creating topic with messages...");
@@ -242,7 +240,10 @@ pub async fn test_offset_reset_policy() -> TestResult {
     let consumer_earliest: StreamConsumer = ClientConfig::new()
         .set("bootstrap.servers", get_bootstrap_servers())
         .set("broker.address.family", "v4")
-        .set("group.id", &format!("earliest-group-{}", uuid::Uuid::new_v4()))
+        .set(
+            "group.id",
+            &format!("earliest-group-{}", uuid::Uuid::new_v4()),
+        )
         .set("auto.offset.reset", "earliest")
         .set("session.timeout.ms", "10000")
         .set("enable.auto.commit", "false")
@@ -254,7 +255,9 @@ pub async fn test_offset_reset_policy() -> TestResult {
     let earliest_msg = tokio::time::timeout(Duration::from_secs(3), consumer_earliest.recv()).await;
     match earliest_msg {
         Ok(Ok(msg)) => {
-            let value = msg.payload().map(|v| String::from_utf8_lossy(v).to_string());
+            let value = msg
+                .payload()
+                .map(|v| String::from_utf8_lossy(v).to_string());
             println!("  ✅ Earliest consumer received: {:?}", value);
         }
         _ => println!("  Note: No message received"),
@@ -265,7 +268,10 @@ pub async fn test_offset_reset_policy() -> TestResult {
     let consumer_latest: StreamConsumer = ClientConfig::new()
         .set("bootstrap.servers", get_bootstrap_servers())
         .set("broker.address.family", "v4")
-        .set("group.id", &format!("latest-group-{}", uuid::Uuid::new_v4()))
+        .set(
+            "group.id",
+            &format!("latest-group-{}", uuid::Uuid::new_v4()),
+        )
         .set("auto.offset.reset", "latest")
         .set("session.timeout.ms", "10000")
         .set("enable.auto.commit", "false")
@@ -280,7 +286,9 @@ pub async fn test_offset_reset_policy() -> TestResult {
     let latest_msg = tokio::time::timeout(Duration::from_millis(500), consumer_latest.recv()).await;
     match latest_msg {
         Ok(Ok(msg)) => {
-            let value = msg.payload().map(|v| String::from_utf8_lossy(v).to_string());
+            let value = msg
+                .payload()
+                .map(|v| String::from_utf8_lossy(v).to_string());
             println!("  Latest consumer received: {:?} (may be expected)", value);
         }
         Err(_) => println!("  ✅ Latest consumer didn't receive old messages (expected)"),
@@ -304,7 +312,9 @@ pub async fn test_offset_reset_policy() -> TestResult {
     let new_msg = tokio::time::timeout(Duration::from_secs(3), consumer_latest.recv()).await;
     match new_msg {
         Ok(Ok(msg)) => {
-            let value = msg.payload().map(|v| String::from_utf8_lossy(v).to_string());
+            let value = msg
+                .payload()
+                .map(|v| String::from_utf8_lossy(v).to_string());
             println!("  ✅ Latest consumer received new message: {:?}", value);
         }
         _ => println!("  Note: Latest consumer didn't receive new message"),
@@ -443,9 +453,7 @@ pub async fn test_offset_seek() -> TestResult {
     println!("=== Test: Offset Seek ===\n");
 
     let ctx = TestContext::new().await?;
-    let topic = TestTopicBuilder::new(&ctx, "offset-seek")
-        .build()
-        .await?;
+    let topic = TestTopicBuilder::new(&ctx, "offset-seek").build().await?;
 
     // Create messages
     println!("Step 1: Creating topic with 10 messages...");
@@ -484,7 +492,9 @@ pub async fn test_offset_seek() -> TestResult {
     println!("\nStep 3: Verifying first message...");
     match tokio::time::timeout(Duration::from_secs(3), consumer.recv()).await {
         Ok(Ok(msg)) => {
-            let value = msg.payload().map(|v| String::from_utf8_lossy(v).to_string());
+            let value = msg
+                .payload()
+                .map(|v| String::from_utf8_lossy(v).to_string());
             let offset = msg.offset();
             println!("  First message at offset {}: {:?}", offset, value);
         }
@@ -497,7 +507,12 @@ pub async fn test_offset_seek() -> TestResult {
     tpl.add_partition_offset(&topic.name, 0, rdkafka::Offset::Offset(5))
         .map_err(|e| format!("Failed to add partition: {}", e))?;
 
-    match consumer.seek(&topic.name, 0, rdkafka::Offset::Offset(5), Duration::from_secs(2)) {
+    match consumer.seek(
+        &topic.name,
+        0,
+        rdkafka::Offset::Offset(5),
+        Duration::from_secs(2),
+    ) {
         Ok(_) => println!("  Seek successful"),
         Err(e) => {
             println!("  Seek not supported or failed: {}", e);
@@ -509,7 +524,9 @@ pub async fn test_offset_seek() -> TestResult {
     println!("\nStep 5: Verifying position after seek...");
     match tokio::time::timeout(Duration::from_secs(3), consumer.recv()).await {
         Ok(Ok(msg)) => {
-            let value = msg.payload().map(|v| String::from_utf8_lossy(v).to_string());
+            let value = msg
+                .payload()
+                .map(|v| String::from_utf8_lossy(v).to_string());
             let offset = msg.offset();
             println!("  Message at offset {}: {:?}", offset, value);
             // Offset should be >= 1 (we consumed one already)

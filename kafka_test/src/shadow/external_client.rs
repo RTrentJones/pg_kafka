@@ -37,8 +37,7 @@ pub fn get_external_bootstrap_servers() -> String {
 ///
 /// TODO: Fix devcontainer networking to properly resolve external-kafka hostname
 pub fn get_internal_bootstrap_servers() -> String {
-    env::var("INTERNAL_KAFKA_BOOTSTRAP_SERVERS")
-        .unwrap_or_else(|_| "172.18.0.2:9095".to_string())
+    env::var("INTERNAL_KAFKA_BOOTSTRAP_SERVERS").unwrap_or_else(|_| "172.18.0.2:9095".to_string())
 }
 
 /// Get SASL username for external Kafka
@@ -132,10 +131,7 @@ pub async fn verify_external_kafka_ready() -> TestResult {
     let timeout = Duration::from_secs(10);
     match producer.client().fetch_metadata(None, timeout) {
         Ok(metadata) => {
-            eprintln!(
-                "DEBUG: Connected to {} brokers",
-                metadata.brokers().len()
-            );
+            eprintln!("DEBUG: Connected to {} brokers", metadata.brokers().len());
             Ok(())
         }
         Err(e) => {

@@ -5,7 +5,7 @@
 //! ## Usage
 //!
 //! ```bash
-//! # Run all tests
+//! # Run all tests (parallel by default, 16 concurrent)
 //! cargo run --release
 //!
 //! # Run specific category
@@ -15,8 +15,11 @@
 //! # Run single test by name
 //! cargo run --release -- --test test_producer
 //!
-//! # Run tests in parallel (where safe)
-//! cargo run --release -- --parallel
+//! # Run tests sequentially (disable parallelism)
+//! cargo run --release -- --sequential
+//!
+//! # Adjust concurrency level
+//! cargo run --release -- --concurrency 32
 //!
 //! # JSON output for CI
 //! cargo run --release -- --json
@@ -45,10 +48,10 @@ use tokio::sync::Semaphore;
 
 // Import all test functions
 use kafka_test::{
-    // Shadow mode tests (Phase 11)
-    test_aborted_transaction_not_forwarded,
     // Transaction atomicity tests
     test_abort_transaction_discards_pending_offsets,
+    // Shadow mode tests (Phase 11)
+    test_aborted_transaction_not_forwarded,
     test_add_partitions_to_txn_idempotent,
     // Edge case tests
     test_batch_1000_messages,
@@ -76,7 +79,6 @@ use kafka_test::{
     test_concurrent_producers_different_partitions,
     test_concurrent_producers_same_topic,
     test_concurrent_transactions_same_producer,
-    test_coordinator_state_race,
     // Negative tests
     test_connection_refused,
     test_consume_empty_partition,
@@ -92,6 +94,7 @@ use kafka_test::{
     test_consumer_group_two_members,
     test_consumer_multiple_messages,
     test_consumer_rejoin_after_leave,
+    test_coordinator_state_race,
     // Admin tests
     test_create_multiple_topics,
     test_create_partitions,
@@ -118,8 +121,8 @@ use kafka_test::{
     test_dual_write_external_down,
     test_dual_write_sync,
     test_duplicate_consumer_join,
-    test_empty_vs_null_key_routing,
     test_empty_group_id,
+    test_empty_vs_null_key_routing,
     test_external_only_fallback,
     test_external_only_mode,
     test_fetch_after_offset_reset,
@@ -127,6 +130,8 @@ use kafka_test::{
     test_fetch_from_new_partition,
     test_fetch_invalid_partition,
     test_fetch_isolation_level_enforcement,
+    // Offset management tests
+    test_fetch_offset_new_group,
     test_fetch_offset_out_of_range,
     test_fetch_respects_min_one_message,
     test_fetch_uncommitted_offset,
@@ -156,32 +161,30 @@ use kafka_test::{
     test_key_routing_across_producers,
     test_key_routing_after_partition_expansion,
     test_key_routing_deterministic,
+    test_large_batch_throughput,
     test_large_key_routing,
     test_large_message_key,
+    test_large_message_value,
     test_large_value_compression,
     test_leave_during_rebalance,
-    test_large_message_value,
     test_list_offsets_empty_topic,
     test_local_only_mode,
     // Long polling tests
     test_long_poll_auto_commit_interval,
     test_long_poll_consumer_disconnect,
+    test_long_poll_cpu_efficiency,
     test_long_poll_immediate_return,
     test_long_poll_min_bytes_threshold,
     test_long_poll_multiple_consumers_same_partition,
     test_long_poll_multiple_waiters,
     test_long_poll_producer_wakeup,
-    test_long_poll_cpu_efficiency,
     test_long_poll_timeout,
     test_long_poll_timeout_precision,
-    test_large_batch_throughput,
     test_multi_partition_produce,
     test_multiple_concurrent_timeouts,
     test_multiple_consumer_groups,
     test_multiple_consumers_same_group,
     test_null_key_distribution,
-    // Offset management tests
-    test_fetch_offset_new_group,
     test_offset_boundaries,
     test_offset_commit_fetch,
     test_offset_commit_multi_partition,
@@ -194,13 +197,13 @@ use kafka_test::{
     test_partition_assignment_strategies,
     test_partition_zero,
     test_produce_any_partition,
+    test_produce_consume_race,
     test_produce_empty_batch,
     test_produce_invalid_partition,
     test_produce_large_key,
     test_produce_latency_percentiles,
     test_produce_throughput_baseline,
     test_produce_timeout,
-    test_produce_consume_race,
     test_produce_while_consuming,
     test_producer,
     // Transaction tests
@@ -253,12 +256,12 @@ struct Args {
     #[arg(short, long)]
     test: Option<String>,
 
-    /// Run tests in parallel (where safe)
+    /// Run tests sequentially (disables parallel execution)
     #[arg(short, long)]
-    parallel: bool,
+    sequential: bool,
 
-    /// Maximum concurrent tests when running in parallel (default: 8)
-    #[arg(long, default_value = "8")]
+    /// Maximum concurrent tests when running in parallel (default: 16)
+    #[arg(long, default_value = "16")]
     concurrency: usize,
 
     /// Output results as JSON
@@ -1509,8 +1512,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!(
             "Running {} tests{}...\n",
             tests_to_run.len(),
-            if args.parallel {
-                " (parallel where safe)"
+            if args.sequential {
+                " (sequential mode)"
             } else {
                 ""
             }
@@ -1552,11 +1555,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let suite_start = Instant::now();
     let all_results: Vec<TestResult>;
 
-    if args.parallel {
+    if !args.sequential {
         // Parallel execution mode
-        let (parallel_tests, sequential_tests): (Vec<_>, Vec<_>) = tests_to_run
-            .iter()
-            .partition(|t| t.parallel_safe);
+        let (parallel_tests, sequential_tests): (Vec<_>, Vec<_>) =
+            tests_to_run.iter().partition(|t| t.parallel_safe);
 
         if !args.json {
             println!(
