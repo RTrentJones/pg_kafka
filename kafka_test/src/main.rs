@@ -35,10 +35,13 @@
 
 use chrono::{DateTime, Utc};
 use clap::Parser;
+use futures::stream::{self, StreamExt};
 use serde::Serialize;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::Semaphore;
 
 // Import all test functions
 use kafka_test::{
@@ -253,6 +256,10 @@ struct Args {
     /// Run tests in parallel (where safe)
     #[arg(short, long)]
     parallel: bool,
+
+    /// Maximum concurrent tests when running in parallel (default: 8)
+    #[arg(long, default_value = "8")]
+    concurrency: usize,
 
     /// Output results as JSON
     #[arg(long)]
@@ -1543,58 +1550,152 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let suite_start = Instant::now();
-    let mut category_results: Vec<CategoryResult> = Vec::new();
-    let mut current_category = "";
-    let mut current_cat_tests: Vec<TestResult> = Vec::new();
-    let mut current_cat_start = Instant::now();
+    let all_results: Vec<TestResult>;
 
-    // Group tests by category for execution
-    for test in &tests_to_run {
-        if test.category != current_category {
-            // Save previous category if any
-            if !current_category.is_empty() {
-                let passed = current_cat_tests.iter().filter(|t| t.passed).count();
-                let failed = current_cat_tests.iter().filter(|t| !t.passed).count();
-                category_results.push(CategoryResult {
-                    name: current_category.to_string(),
-                    passed,
-                    failed,
-                    duration_ms: current_cat_start.elapsed().as_millis() as u64,
-                    tests: std::mem::take(&mut current_cat_tests),
-                });
-            }
-
-            current_category = test.category;
-            current_cat_start = Instant::now();
-
-            if !args.json {
-                print_category_header(current_category);
-            }
-        }
-
-        // Run the test
-        let result = run_single_test(test, args.verbose).await;
+    if args.parallel {
+        // Parallel execution mode
+        let (parallel_tests, sequential_tests): (Vec<_>, Vec<_>) = tests_to_run
+            .iter()
+            .partition(|t| t.parallel_safe);
 
         if !args.json {
-            let status = if result.passed { "PASSED" } else { "FAILED" };
-            let duration = format!("({:.2}s)", result.duration_ms as f64 / 1000.0);
-            println!("  {} - {} {}", test.name, status, duration);
+            println!(
+                "Running {} tests in parallel (max {}), {} sequentially\n",
+                parallel_tests.len(),
+                args.concurrency,
+                sequential_tests.len()
+            );
         }
 
-        current_cat_tests.push(result);
+        // Run parallel-safe tests concurrently with semaphore limiting
+        let semaphore = Arc::new(Semaphore::new(args.concurrency));
+        let verbose = args.verbose;
+        let json_mode = args.json;
+
+        let parallel_results: Vec<TestResult> = stream::iter(parallel_tests)
+            .map(|test: &&TestDef| {
+                let sem = semaphore.clone();
+                let test_name = test.name.to_string();
+                let test_category = test.category.to_string();
+                let test_fn = test.test_fn;
+                async move {
+                    let _permit = sem.acquire().await.unwrap();
+                    let start = Instant::now();
+                    let future = (test_fn)();
+                    let result: Result<(), Box<dyn std::error::Error>> = future.await;
+                    let duration = start.elapsed();
+
+                    let (passed, error) = match result {
+                        Ok(()) => (true, None),
+                        Err(e) => {
+                            if verbose {
+                                eprintln!("   Error in {}: {}", test_name, e);
+                            }
+                            (false, Some(e.to_string()))
+                        }
+                    };
+
+                    if !json_mode {
+                        let status = if passed { "PASSED" } else { "FAILED" };
+                        let duration_str = format!("({:.2}s)", duration.as_secs_f64());
+                        println!("  {} - {} {}", test_name, status, duration_str);
+                    }
+
+                    TestResult {
+                        category: test_category,
+                        name: test_name,
+                        passed,
+                        duration_ms: duration.as_millis() as u64,
+                        error,
+                    }
+                }
+            })
+            .buffer_unordered(args.concurrency)
+            .collect()
+            .await;
+
+        // Run sequential tests one by one
+        if !sequential_tests.is_empty() && !args.json {
+            println!("\n--- Running sequential tests ---\n");
+        }
+
+        let mut sequential_results: Vec<TestResult> = Vec::new();
+        for test in sequential_tests {
+            let result = run_single_test(test, args.verbose).await;
+            if !args.json {
+                let status = if result.passed { "PASSED" } else { "FAILED" };
+                let duration = format!("({:.2}s)", result.duration_ms as f64 / 1000.0);
+                println!("  {} - {} {}", test.name, status, duration);
+            }
+            sequential_results.push(result);
+        }
+
+        // Combine results
+        all_results = parallel_results
+            .into_iter()
+            .chain(sequential_results)
+            .collect();
+    } else {
+        // Sequential execution mode (original behavior)
+        let mut results = Vec::new();
+        let mut current_category = "";
+
+        for test in &tests_to_run {
+            if test.category != current_category {
+                current_category = test.category;
+                if !args.json {
+                    print_category_header(current_category);
+                }
+            }
+
+            let result = run_single_test(test, args.verbose).await;
+            if !args.json {
+                let status = if result.passed { "PASSED" } else { "FAILED" };
+                let duration = format!("({:.2}s)", result.duration_ms as f64 / 1000.0);
+                println!("  {} - {} {}", test.name, status, duration);
+            }
+            results.push(result);
+        }
+        all_results = results;
     }
 
-    // Save last category
-    if !current_category.is_empty() {
-        let passed = current_cat_tests.iter().filter(|t| t.passed).count();
-        let failed = current_cat_tests.iter().filter(|t| !t.passed).count();
-        category_results.push(CategoryResult {
-            name: current_category.to_string(),
-            passed,
-            failed,
-            duration_ms: current_cat_start.elapsed().as_millis() as u64,
-            tests: current_cat_tests,
+    // Group results by category
+    let mut category_map: std::collections::HashMap<String, Vec<TestResult>> =
+        std::collections::HashMap::new();
+    for result in all_results {
+        category_map
+            .entry(result.category.clone())
+            .or_default()
+            .push(result);
+    }
+
+    // Build category results in consistent order
+    let categories: Vec<&str> = tests_to_run
+        .iter()
+        .map(|t| t.category)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .fold(Vec::new(), |mut acc, cat| {
+            if !acc.contains(&cat) {
+                acc.push(cat);
+            }
+            acc
         });
+
+    let mut category_results: Vec<CategoryResult> = Vec::new();
+    for cat in categories {
+        if let Some(tests) = category_map.remove(cat) {
+            let passed = tests.iter().filter(|t| t.passed).count();
+            let failed = tests.iter().filter(|t| !t.passed).count();
+            let duration_ms: u64 = tests.iter().map(|t| t.duration_ms).sum();
+            category_results.push(CategoryResult {
+                name: cat.to_string(),
+                passed,
+                failed,
+                duration_ms,
+                tests,
+            });
+        }
     }
 
     // Build final result

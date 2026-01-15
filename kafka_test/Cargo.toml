@@ -7,6 +7,9 @@ edition = "2021"
 # Kafka client for E2E testing
 rdkafka = { version = "0.36", features = ["cmake-build", "zstd"] }
 
+# Async utilities for parallel execution
+futures = "0.3"
+
 # Async runtime
 tokio = { version = "1.48", features = [
     "rt-multi-thread",
