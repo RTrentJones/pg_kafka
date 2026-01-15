@@ -33,6 +33,8 @@ fn create_consumer_with_fetch_settings(
         .set("enable.auto.commit", "false")
         .set("fetch.max.bytes", max_bytes.to_string())
         .set("fetch.min.bytes", min_bytes.to_string())
+        // message.max.bytes must be <= fetch.max.bytes
+        .set("message.max.bytes", max_bytes.to_string())
         .create()?;
 
     Ok(consumer)
@@ -54,9 +56,10 @@ pub async fn test_fetch_respects_min_one_message() -> TestResult {
     topic.produce(&messages).await?;
     println!("✅ Message produced\n");
 
-    // 2. Create consumer with very small max_bytes
-    println!("Step 2: Creating consumer with small max_bytes (10)...");
-    let consumer = create_consumer_with_fetch_settings(&group, 10, 1)?;
+    // 2. Create consumer with small max_bytes
+    // Note: Using 1000 bytes because rdkafka requires message.max.bytes <= fetch.max.bytes
+    println!("Step 2: Creating consumer with small max_bytes (1000)...");
+    let consumer = create_consumer_with_fetch_settings(&group, 1000, 1)?;
 
     let mut assignment = TopicPartitionList::new();
     assignment.add_partition_offset(&topic.name, 0, rdkafka::Offset::Beginning)?;

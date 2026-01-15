@@ -52,14 +52,15 @@ pub async fn test_large_value_compression() -> TestResult {
     let topic = ctx.unique_topic("large-compress").await;
     let group = ctx.unique_group("large-compress").await;
 
-    // 1. Create a large value (1MB of repeated pattern - compresses well)
-    println!("Step 1: Creating 1MB value...");
+    // 1. Create a large value (100KB of repeated pattern - compresses well)
+    // Note: 1MB exceeds default max.message.bytes, so we use 100KB
+    println!("Step 1: Creating 100KB value...");
     let pattern = "ABCDEFGHIJ".repeat(100); // 1KB pattern
-    let large_value = pattern.repeat(1024); // 1MB total
+    let large_value = pattern.repeat(100); // 100KB total
     println!(
-        "   Value size: {} bytes ({} MB)",
+        "   Value size: {} bytes ({} KB)",
         large_value.len(),
-        large_value.len() / (1024 * 1024)
+        large_value.len() / 1024
     );
     println!("✅ Large value created\n");
 
