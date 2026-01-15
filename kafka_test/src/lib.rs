@@ -86,8 +86,10 @@ pub use offset_management::{
     test_offset_seek,
 };
 pub use partition::{
-    test_key_distribution, test_key_routing_deterministic, test_multi_partition_produce,
-    test_null_key_distribution,
+    test_empty_vs_null_key_routing, test_key_distribution, test_key_routing_across_producers,
+    test_key_routing_after_partition_expansion, test_key_routing_deterministic,
+    test_large_key_routing, test_multi_partition_produce, test_null_key_distribution,
+    test_special_character_key_routing,
 };
 pub use producer::{test_batch_produce, test_producer};
 
@@ -107,26 +109,30 @@ pub use edge_cases::{
 };
 pub use error_paths::{
     test_commit_new_group, test_commit_offset_zero, test_commit_then_fetch_offset,
-    test_consume_empty_topic, test_empty_group_id, test_fetch_invalid_partition,
-    test_fetch_offset_out_of_range, test_fetch_uncommitted_offset, test_fetch_unknown_topic,
-    test_heartbeat_after_leave, test_multiple_consumers_same_group, test_produce_any_partition,
-    test_produce_empty_batch, test_produce_invalid_partition, test_produce_large_key,
-    test_rejoin_after_leave,
+    test_consume_empty_topic, test_empty_group_id, test_fetch_after_offset_reset,
+    test_fetch_from_new_partition, test_fetch_invalid_partition, test_fetch_isolation_level_enforcement,
+    test_fetch_offset_out_of_range, test_fetch_respects_min_one_message, test_fetch_uncommitted_offset,
+    test_fetch_unknown_topic, test_fetch_with_deleted_topic, test_heartbeat_after_leave,
+    test_multiple_consumers_same_group, test_produce_any_partition, test_produce_empty_batch,
+    test_produce_invalid_partition, test_produce_large_key, test_rejoin_after_leave,
 };
 pub use negative::{
     test_connection_refused, test_duplicate_consumer_join, test_invalid_group_id,
     test_produce_timeout,
 };
 pub use performance::{
-    test_batch_vs_single_performance, test_consume_throughput_baseline,
-    test_produce_throughput_baseline,
+    test_batch_vs_single_performance, test_concurrent_connection_scaling,
+    test_consume_throughput_baseline, test_large_batch_throughput, test_long_poll_cpu_efficiency,
+    test_produce_latency_percentiles, test_produce_throughput_baseline,
 };
 
 // Admin API tests
 pub use admin::{
     test_create_multiple_topics, test_create_partitions, test_create_partitions_cannot_decrease,
-    test_create_topic, test_create_topic_already_exists, test_delete_group_empty,
-    test_delete_group_non_empty, test_delete_topic, test_delete_topic_not_found,
+    test_create_partitions_not_found, test_create_topic, test_create_topic_already_exists,
+    test_create_topic_invalid_name, test_create_topic_invalid_partitions, test_create_topic_with_config,
+    test_delete_group_empty, test_delete_group_idempotent, test_delete_group_non_empty,
+    test_delete_topic, test_delete_topic_not_found,
 };
 
 // Long polling tests
@@ -140,7 +146,9 @@ pub use long_poll::{
 // Compression tests (Phase 8)
 pub use compression::{
     test_compressed_producer_gzip, test_compressed_producer_lz4, test_compressed_producer_snappy,
-    test_compressed_producer_zstd, test_compression_roundtrip,
+    test_compressed_producer_zstd, test_compression_incompressible_data,
+    test_compression_mixed_formats, test_compression_ratio_verification, test_compression_roundtrip,
+    test_compression_small_message_overhead, test_large_value_compression,
 };
 
 // Idempotent producer tests (Phase 9)
