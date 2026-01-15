@@ -54,11 +54,13 @@ pub mod edge_cases;
 pub mod error_paths;
 pub mod idempotent;
 pub mod long_poll;
+pub mod metadata;
 pub mod negative;
 pub mod offset_management;
 pub mod partition;
 pub mod performance;
 pub mod producer;
+pub mod protocol;
 pub mod shadow;
 pub mod transaction;
 
@@ -201,4 +203,15 @@ pub use shadow::{
     // Topic mapping
     test_topic_name_mapping,
     test_zero_percent_forwarding,
+};
+
+// Metadata API tests (Phase 4)
+pub use metadata::{
+    test_metadata_all_topics, test_metadata_nonexistent_topic, test_metadata_refresh_after_create,
+};
+
+// Protocol compliance tests (Phase 4)
+pub use protocol::{
+    test_api_versions_negotiation, test_correlation_id_preserved, test_protocol_request_pipelining,
+    test_unknown_api_key_handling,
 };

@@ -53,6 +53,8 @@ use kafka_test::{
     // Shadow mode tests (Phase 11)
     test_aborted_transaction_not_forwarded,
     test_add_partitions_to_txn_idempotent,
+    // Protocol compliance tests (Phase 4)
+    test_api_versions_negotiation,
     // Edge case tests
     test_batch_1000_messages,
     // Producer tests
@@ -95,6 +97,7 @@ use kafka_test::{
     test_consumer_multiple_messages,
     test_consumer_rejoin_after_leave,
     test_coordinator_state_race,
+    test_correlation_id_preserved,
     // Admin tests
     test_create_multiple_topics,
     test_create_partitions,
@@ -180,6 +183,10 @@ use kafka_test::{
     test_long_poll_producer_wakeup,
     test_long_poll_timeout,
     test_long_poll_timeout_precision,
+    // Metadata API tests (Phase 4)
+    test_metadata_all_topics,
+    test_metadata_nonexistent_topic,
+    test_metadata_refresh_after_create,
     test_multi_partition_produce,
     test_multiple_concurrent_timeouts,
     test_multiple_consumer_groups,
@@ -209,6 +216,7 @@ use kafka_test::{
     // Transaction tests
     test_producer_fencing,
     test_producer_fencing_mid_transaction,
+    test_protocol_request_pipelining,
     test_rapid_rebalance_cycles,
     test_read_committed_after_commit,
     test_read_committed_filters_pending,
@@ -233,6 +241,7 @@ use kafka_test::{
     test_true_deduplication_manual_replay,
     test_txn_offset_commit,
     test_txn_offset_commit_visibility_timing,
+    test_unknown_api_key_handling,
     test_zero_percent_forwarding,
 };
 
@@ -1358,6 +1367,50 @@ fn get_all_tests() -> Vec<TestDef> {
             name: "test_replay_historical_messages",
             test_fn: wrap_test!(test_replay_historical_messages),
             parallel_safe: false,
+        },
+        // ==================== METADATA API TESTS (Phase 4) ====================
+        TestDef {
+            category: "metadata",
+            name: "test_metadata_all_topics",
+            test_fn: wrap_test!(test_metadata_all_topics),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "metadata",
+            name: "test_metadata_nonexistent_topic",
+            test_fn: wrap_test!(test_metadata_nonexistent_topic),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "metadata",
+            name: "test_metadata_refresh_after_create",
+            test_fn: wrap_test!(test_metadata_refresh_after_create),
+            parallel_safe: true,
+        },
+        // ==================== PROTOCOL COMPLIANCE TESTS (Phase 4) ====================
+        TestDef {
+            category: "protocol",
+            name: "test_api_versions_negotiation",
+            test_fn: wrap_test!(test_api_versions_negotiation),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "protocol",
+            name: "test_correlation_id_preserved",
+            test_fn: wrap_test!(test_correlation_id_preserved),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "protocol",
+            name: "test_unknown_api_key_handling",
+            test_fn: wrap_test!(test_unknown_api_key_handling),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "protocol",
+            name: "test_protocol_request_pipelining",
+            test_fn: wrap_test!(test_protocol_request_pipelining),
+            parallel_safe: true,
         },
     ]
 }
