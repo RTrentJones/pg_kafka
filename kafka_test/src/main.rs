@@ -44,7 +44,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, Semaphore};
 
 // Import all test functions
 use kafka_test::{
@@ -1623,37 +1623,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Run parallel-safe tests concurrently with semaphore limiting
+        // Use a mutex to coordinate output printing (avoid interleaving)
         let semaphore = Arc::new(Semaphore::new(args.concurrency));
-        let verbose = args.verbose;
+        let print_mutex = Arc::new(Mutex::new(()));
         let json_mode = args.json;
 
         let parallel_results: Vec<TestResult> = stream::iter(parallel_tests)
             .map(|test: &&TestDef| {
                 let sem = semaphore.clone();
+                let print_lock = print_mutex.clone();
                 let test_name = test.name.to_string();
                 let test_category = test.category.to_string();
                 let test_fn = test.test_fn;
                 async move {
                     let _permit = sem.acquire().await.unwrap();
                     let start = Instant::now();
-                    let future = (test_fn)();
-                    let result: Result<(), Box<dyn std::error::Error>> = future.await;
+                    let result: Result<(), Box<dyn std::error::Error>> = (test_fn)().await;
                     let duration = start.elapsed();
-
                     let (passed, error) = match result {
                         Ok(()) => (true, None),
-                        Err(e) => {
-                            if verbose {
-                                eprintln!("   Error in {}: {}", test_name, e);
-                            }
-                            (false, Some(e.to_string()))
-                        }
+                        Err(e) => (false, Some(e.to_string())),
                     };
 
+                    // Print result atomically (one test at a time)
                     if !json_mode {
-                        let status = if passed { "PASSED" } else { "FAILED" };
-                        let duration_str = format!("({:.2}s)", duration.as_secs_f64());
-                        println!("  {} - {} {}", test_name, status, duration_str);
+                        let _lock = print_lock.lock().await;
+                        let icon = if passed { "✓" } else { "✗" };
+                        let duration_str = format!("{:.2}s", duration.as_secs_f64());
+                        println!("  {} {} ({})", icon, test_name, duration_str);
+                        if !passed {
+                            if let Some(ref e) = error {
+                                eprintln!("    Error: {}", e);
+                            }
+                        }
                     }
 
                     TestResult {
