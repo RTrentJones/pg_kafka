@@ -46,7 +46,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Automated E2E tests with real Kafka client (rdkafka)
 
 **API Coverage:** 23 of ~50 standard Kafka APIs (46%)
-**Test Status:** 630 unit tests + 104 E2E tests = 734 total ✅
+**Test Status:** 609 unit tests + 173 E2E tests = 782 total ✅
 **Coverage Target:** 80%+ (testable code)
 
 ## Development Setup
@@ -185,7 +185,7 @@ src/
 │   │   ├── init_producer_id.rs  # InitProducerId handler (Phase 9)
 │   │   ├── metadata.rs # ApiVersions/Metadata handlers
 │   │   ├── produce.rs  # ProduceRequest handler (with sequence validation)
-│   │   └── tests.rs    # Handler unit tests (78 tests with MockKafkaStore)
+│   │   └── tests.rs    # Handler unit tests (56 tests with MockKafkaStore)
 │   └── storage/        # Storage abstraction layer (Repository Pattern)
 │       ├── mod.rs      # KafkaStore trait definition
 │       ├── postgres.rs # PostgreSQL implementation (PostgresStore)
@@ -194,7 +194,7 @@ src/
     └── pgrx_embed.rs   # pgrx embedding binary (generated)
 
 tests/                  # pgrx integration tests (limited due to PGC_POSTMASTER)
-kafka_test/             # E2E test suite (104 tests)
+kafka_test/             # E2E test suite (173 tests)
     └── src/
         ├── main.rs               # Test orchestrator with CLI
         ├── lib.rs                # Test re-exports
@@ -278,7 +278,7 @@ This separation enables testing handlers without a running database.
 Protocol handlers live in `src/kafka/handlers/`:
 - Each Kafka API has a handler function taking `&dyn KafkaStore` for testability
 - `helpers.rs`: `TopicResolution` enum for topic lookup logic shared across handlers
-- `tests.rs`: 78 handler tests using `MockKafkaStore`
+- `tests.rs`: 56 handler tests using `MockKafkaStore`
 
 ### Error Handling
 
@@ -516,26 +516,28 @@ Tests use shared infrastructure from `kafka_test/src/`:
 - **fixtures.rs**: Builders (`TestTopicBuilder`, `TestConsumerBuilder`, `TestProducerBuilder`)
 - **assertions.rs**: Domain-specific assertions (`assert_topic_exists()`, `assert_message_count()`, etc.)
 
-### Test Categories (104 tests)
+### Test Categories (173 tests)
 
 | Category | Tests | Purpose |
 |----------|-------|---------|
-| **admin** | 9 | CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups |
-| **producer/** | 2 | Basic produce, batch produce |
-| **consumer/** | 3 | Basic consume, from offset, multiple messages |
-| **consumer_group/** | 3 | Lifecycle, two-member groups, rebalancing |
-| **offset_management/** | 2 | Commit/fetch, boundary conditions |
-| **partition/** | 4 | Multi-partition topics, key routing, distribution |
-| **compression/** | 5 | gzip, snappy, lz4, zstd, roundtrip verification |
-| **idempotent/** | 2 | InitProducerId, deduplication (Phase 9) |
-| **transaction/** | 8 | Transactions, isolation levels, EOS, fencing (Phase 10) |
-| **shadow/** | 20 | External forwarding, SASL/SSL, topic mapping, replay, dial-up tests (Phase 11) |
-| **long_poll/** | 4 | Timeout behavior, immediate return, producer wakeup |
-| **error_paths/** | 16 | Invalid partitions, unknown topics, coordinator errors |
-| **edge_cases/** | 11 | Empty topics, large messages, boundary values |
-| **concurrent/** | 8 | Multi-producer, multi-consumer, request pipelining |
-| **negative/** | 4 | Connection refused, timeouts, expected failures |
-| **performance/** | 3 | Throughput baselines (produce, consume, batch) |
+| **admin** | 14 | CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups |
+| **producer** | 2 | Basic produce, batch produce |
+| **consumer** | 3 | Basic consume, from offset, multiple messages |
+| **consumer_group** | 13 | Lifecycle, two-member groups, rebalancing, strategies |
+| **offset_management** | 7 | Commit/fetch, boundary conditions, multi-partition |
+| **partition** | 9 | Multi-partition topics, key routing, distribution |
+| **compression** | 10 | gzip, snappy, lz4, zstd, roundtrip, edge cases |
+| **idempotent** | 7 | InitProducerId, deduplication, epoch, multi-partition |
+| **transaction** | 16 | Transactions, isolation levels, EOS, fencing, atomicity |
+| **shadow** | 20 | External forwarding, SASL/SSL, topic mapping, replay, dial-up |
+| **long_poll** | 9 | Timeout behavior, immediate return, producer wakeup, precision |
+| **error_paths** | 21 | Invalid partitions, unknown topics, coordinator errors |
+| **edge_cases** | 11 | Empty topics, large messages, boundary values |
+| **concurrent** | 13 | Multi-producer, multi-consumer, request pipelining, races |
+| **negative** | 4 | Connection refused, timeouts, expected failures |
+| **performance** | 7 | Throughput baselines, latency percentiles, scaling |
+| **metadata** | 3 | Metadata refresh, all topics, nonexistent topic |
+| **protocol** | 4 | ApiVersions negotiation, correlation ID, unknown API |
 
 ### Running E2E Tests with CLI Options
 

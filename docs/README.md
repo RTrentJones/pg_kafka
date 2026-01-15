@@ -1,7 +1,7 @@
 # pg_kafka Documentation
 
 **Status:** Phase 11 Complete (Shadow Mode)
-**Last Updated:** 2026-01-14
+**Last Updated:** 2026-01-15
 
 ## Quick Reference
 
@@ -9,7 +9,7 @@
 |----------|---------|
 | [KAFKA_PROTOCOL_COVERAGE.md](KAFKA_PROTOCOL_COVERAGE.md) | API coverage analysis (23 of ~50 APIs) |
 | [PROTOCOL_DEVIATIONS.md](PROTOCOL_DEVIATIONS.md) | Intentional spec differences from Apache Kafka |
-| [TEST_STRATEGY.md](TEST_STRATEGY.md) | Test architecture (630 unit + 104 E2E tests) |
+| [TEST_STRATEGY.md](TEST_STRATEGY.md) | Test architecture (609 unit + 173 E2E tests) |
 | [REPOSITORY_PATTERN.md](REPOSITORY_PATTERN.md) | Storage abstraction design (KafkaStore trait) |
 | [PERFORMANCE.md](PERFORMANCE.md) | Tuning, benchmarks, compression guide |
 | [SHADOW_MODE_TESTING.md](SHADOW_MODE_TESTING.md) | Shadow mode setup and testing |

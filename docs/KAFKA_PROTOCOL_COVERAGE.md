@@ -1,6 +1,6 @@
 # Kafka Protocol Coverage Analysis
 
-**Date**: 2026-01-14
+**Date**: 2026-01-15
 **pg_kafka Version**: Phase 11 Complete (Shadow Mode)
 **Analysis**: Comprehensive review of implemented vs standard Kafka protocol
 
@@ -12,7 +12,7 @@
 |--------|-------|
 | **API Coverage** | 23 of ~50 standard Kafka APIs (46%) |
 | **Build Status** | ✅ Compiles with zero warnings |
-| **Test Suite** | 630 unit tests + 104 E2E tests |
+| **Test Suite** | 609 unit tests + 173 E2E tests |
 | **Architecture** | Repository Pattern with typed errors |
 | **Client Compatibility** | ✅ kcat, rdkafka verified |
 
@@ -481,13 +481,13 @@ Consumer Flow (Current):
 - **Testing**: E2E tests with rdkafka
 - **Documentation**: Comprehensive design docs
 
-### Test Coverage (630 unit tests + 104 E2E tests)
+### Test Coverage (609 unit tests + 173 E2E tests)
 
 | Category | Count | Location |
 |----------|-------|----------|
-| Shadow mode | 141 | `src/kafka/shadow/` |
+| Shadow mode | 146 | `src/kafka/shadow/` |
 | Protocol encoding | 85 | `src/kafka/protocol/` |
-| Handler logic | 78 | `src/kafka/handlers/tests.rs` |
+| Handler logic | 76 | `src/kafka/handlers/` |
 | Assignment strategies | 67 | `src/kafka/assignment/` |
 | Storage layer | 43 | `src/kafka/storage/tests.rs` |
 | Messages | 39 | `src/kafka/messages.rs` |
@@ -495,27 +495,29 @@ Consumer Flow (Current):
 | Error handling | 22 | `src/kafka/error.rs` |
 | Config | 32 | `src/config.rs` |
 | Testing infrastructure | 23 | `src/testing/` |
-| Other | 70 | Coordinator, partitioner, constants, property tests |
-| **Unit Total** | **630** | |
-| **E2E Test Suite** | **104** | `kafka_test/` |
+| Other | 46 | Coordinator, partitioner, constants |
+| **Unit Total** | **609** | |
+| **E2E Test Suite** | **173** | `kafka_test/` |
 
-**E2E Test Categories (104 tests):**
-- Admin APIs (9 tests)
+**E2E Test Categories (173 tests):**
+- Admin APIs (14 tests)
 - Producer (2 tests)
 - Consumer (3 tests)
-- Consumer Groups (3 tests)
-- Offset Management (2 tests)
-- Partitioning (4 tests)
-- Compression (5 tests)
-- Idempotent (2 tests)
-- Transaction (8 tests)
+- Consumer Groups (13 tests)
+- Offset Management (7 tests)
+- Partitioning (9 tests)
+- Compression (10 tests)
+- Idempotent (7 tests)
+- Transaction (16 tests)
 - Shadow (20 tests)
-- Long Polling (4 tests)
-- Error Paths (16 tests)
+- Long Polling (9 tests)
+- Error Paths (21 tests)
 - Edge Cases (11 tests)
-- Concurrent Operations (8 tests)
+- Concurrent Operations (13 tests)
 - Negative (4 tests)
-- Performance Baselines (3 tests)
+- Performance (7 tests)
+- Metadata (3 tests)
+- Protocol (4 tests)
 
 ---
 
@@ -524,7 +526,7 @@ Consumer Flow (Current):
 **Current State**: Comprehensive Kafka-compatible broker with 23 APIs implemented
 **Coverage**: 46% of standard Kafka protocol (full producer/consumer/coordinator/admin/transaction support)
 **Architecture**: Clean, maintainable, well-documented with Repository Pattern
-**Test Status**: All 630 unit tests and 104 E2E tests passing ✅
+**Test Status**: All 609 unit tests and 173 E2E tests passing ✅
 
 **Readiness**:
 - ✅ **Producer**: Production-ready with idempotency, transactions, and compression
@@ -546,7 +548,7 @@ Consumer Flow (Current):
 5. ✅ SASL/SSL authentication to external Kafka
 6. ✅ Per-topic shadow configuration
 7. ✅ Historical message replay to external Kafka
-8. ✅ 141 shadow mode unit tests, 28 transaction/shadow E2E tests
+8. ✅ 146 shadow mode unit tests, 36 transaction/shadow E2E tests
 
 **Future Phases**:
 1. Cooperative rebalancing (KIP-429)
@@ -555,8 +557,8 @@ Consumer Flow (Current):
 
 ---
 
-**Overall Assessment**: Phase 11 Complete - pg_kafka provides full producer/consumer support with idempotency, transactions, compression, long polling, multi-partition topics, admin APIs, and shadow mode. The implementation features clean architecture (Repository Pattern), comprehensive test coverage (630 unit tests, 104 E2E tests), and typed error handling with full Kafka error code mapping.
+**Overall Assessment**: Phase 11 Complete - pg_kafka provides full producer/consumer support with idempotency, transactions, compression, long polling, multi-partition topics, admin APIs, and shadow mode. The implementation features clean architecture (Repository Pattern), comprehensive test coverage (609 unit tests, 173 E2E tests), and typed error handling with full Kafka error code mapping.
 
-**Last Updated:** 2026-01-14
+**Last Updated:** 2026-01-15
 **Phase:** 11 Complete (Shadow Mode)
-**Tests:** 630 unit tests + 104 E2E tests
+**Tests:** 609 unit tests + 173 E2E tests

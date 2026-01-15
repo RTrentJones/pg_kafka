@@ -1,11 +1,11 @@
 # Full Kafka API Compliance Plan for pg_kafka
 
-**Last Updated:** 2026-01-14
+**Last Updated:** 2026-01-15
 
 ## Current State (Phase 11 Complete)
 
 **APIs Implemented:** 23 of ~50 (46%)
-**Tests:** 630 unit + 104 E2E (all passing)
+**Tests:** 609 unit + 173 E2E (all passing)
 **Architecture:** Repository Pattern, typed errors, clean handler structure, key-based partition routing, compression, transactions, shadow mode
 
 ### Implemented APIs
@@ -255,8 +255,8 @@ Each phase includes:
 3. **E2E tests** - rdkafka client in `kafka_test/`
 
 **Coverage targets:**
-- Maintain 630+ unit tests
-- Current: 104 E2E tests across all categories
+- Maintain 609+ unit tests
+- Current: 173 E2E tests across all categories
 
 ---
 

@@ -300,7 +300,7 @@ impl KafkaError {
 | Client | Version | Status | Notes |
 |--------|---------|--------|-------|
 | kcat | 1.7.0+ | ✅ Works | Producer and consumer tested |
-| rdkafka (Rust) | 0.36+ | ✅ Works | Full E2E test suite (5 scenarios) |
+| rdkafka (Rust) | 0.36+ | ✅ Works | Full E2E test suite (173 tests) |
 
 ### Client Configuration
 
@@ -347,7 +347,7 @@ auto.offset.reset=earliest
 
 ---
 
-**Last Updated:** 2026-01-14
+**Last Updated:** 2026-01-15
 **Applies To:** pg_kafka Phase 11 Complete (Shadow Mode)
 **API Coverage:** 23 of ~50 Kafka APIs (46%)
-**Test Status:** 630 unit tests + 104 E2E tests passing
+**Test Status:** 609 unit tests + 173 E2E tests passing

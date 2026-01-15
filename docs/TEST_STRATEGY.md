@@ -1,7 +1,7 @@
 # Test Strategy
 
 **Status:** Phase 11 Complete (Shadow Mode)
-**Last Updated:** 2026-01-14
+**Last Updated:** 2026-01-15
 
 ---
 
@@ -9,19 +9,19 @@
 
 | Category | Count | Coverage |
 |----------|-------|----------|
-| Unit Tests | 630 | Core logic, handlers, storage, protocol, shadow |
-| E2E Tests | 104 | Full protocol integration |
-| **Total** | **734** | **Comprehensive** |
+| Unit Tests | 609 | Core logic, handlers, storage, protocol, shadow |
+| E2E Tests | 173 | Full protocol integration |
+| **Total** | **782** | **Comprehensive** |
 
 ---
 
-## Unit Test Distribution (630 tests)
+## Unit Test Distribution (609 tests)
 
 | Module | Tests | Focus |
 |--------|-------|-------|
-| Shadow Mode | 141 | External forwarding, SASL/SSL, replay, config |
+| Shadow Mode | 146 | External forwarding, SASL/SSL, replay, config |
 | Protocol Encoding | 85 | Wire format, properties, framing |
-| Handler Logic | 78 | All 23 API handlers with MockKafkaStore |
+| Handler Logic | 76 | All 23 API handlers with MockKafkaStore |
 | Assignment Strategies | 67 | Range, RoundRobin, Sticky algorithms |
 | Storage Layer | 43 | KafkaStore trait, types, mock verification |
 | Messages | 39 | Message encoding/decoding |
@@ -31,7 +31,7 @@
 | Testing Infrastructure | 23 | Mocks, helpers |
 | Coordinator | 11 | Group state management |
 | Partitioner | 8 | Murmur2 hash, key-based routing |
-| Other | 51 | Constants, property tests, etc. |
+| Other | 27 | Constants, context, etc. |
 
 ### Running Unit Tests
 
@@ -41,26 +41,28 @@ cargo test --features pg14
 
 ---
 
-## E2E Test Categories (104 tests)
+## E2E Test Categories (173 tests)
 
 | Category | Tests | Purpose |
 |----------|-------|---------|
-| Admin APIs | 9 | CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups |
+| Admin APIs | 14 | CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups |
 | Producer | 2 | Basic produce, batch produce |
 | Consumer | 3 | Basic consume, from offset, multiple messages |
-| Consumer Groups | 3 | Lifecycle, two-member, rebalance after leave |
-| Offset Management | 2 | Commit/fetch, boundaries |
-| Partitioning | 4 | Multi-partition produce, key routing, distribution |
-| Compression | 5 | gzip, snappy, lz4, zstd, roundtrip |
-| Idempotent | 2 | InitProducerId, deduplication |
-| Transaction | 8 | EOS, isolation levels, fencing |
+| Consumer Groups | 13 | Lifecycle, two-member, rebalance, strategies |
+| Offset Management | 7 | Commit/fetch, boundaries, multi-partition |
+| Partitioning | 9 | Multi-partition produce, key routing, distribution |
+| Compression | 10 | gzip, snappy, lz4, zstd, roundtrip, edge cases |
+| Idempotent | 7 | InitProducerId, deduplication, epoch, multi-partition |
+| Transaction | 16 | EOS, isolation levels, fencing, atomicity |
 | Shadow | 20 | External forwarding, SASL/SSL, topic mapping, replay |
-| Long Polling | 4 | Timeout, immediate return, producer wakeup |
-| Error Paths | 16 | Invalid partitions, unknown topics, coordinator errors |
+| Long Polling | 9 | Timeout, immediate return, producer wakeup, precision |
+| Error Paths | 21 | Invalid partitions, unknown topics, coordinator errors |
 | Edge Cases | 11 | Empty topics, large messages, boundary values |
-| Concurrent | 8 | Multi-producer, multi-consumer, pipelining |
+| Concurrent | 13 | Multi-producer, multi-consumer, pipelining, races |
 | Negative | 4 | Connection refused, timeouts, invalid operations |
-| Performance | 3 | Throughput baselines (produce, consume, batch) |
+| Performance | 7 | Throughput baselines, latency percentiles, scaling |
+| Metadata | 3 | Metadata refresh, all topics, nonexistent topic |
+| Protocol | 4 | ApiVersions negotiation, correlation ID, unknown API |
 
 ### Running E2E Tests
 
@@ -189,6 +191,6 @@ See `docs/PGRX_TESTING_GUIDE.md` for the full testing strategy.
 
 ---
 
-**Test Count:** 734 (630 unit + 104 E2E)
+**Test Count:** 782 (609 unit + 173 E2E)
 **Coverage Target:** 80%+ (testable code)
 **All Tests Passing:** ✅
