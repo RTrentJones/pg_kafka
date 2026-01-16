@@ -21,7 +21,7 @@ kcat -C -b localhost:9092 -t my-topic -p 0 -o beginning
 | **Consumer Groups** | Complete | Full coordinator with auto-rebalancing |
 | **Transactions** | Complete | Full EOS with read-committed isolation |
 | **Shadow Mode** | Complete | External Kafka forwarding with SASL/SSL |
-| **Test Suite** | 734 tests | 630 unit tests + 104 E2E scenarios |
+| **Test Suite** | 782 tests | 609 unit tests + 173 E2E scenarios |
 | **CI/CD** | Complete | GitHub Actions with lint, test, security audit |
 
 **Current Phase:** Phase 11 Complete - Shadow Mode
@@ -232,15 +232,15 @@ src/
 │   │   ├── helpers.rs      # Topic resolution utilities
 │   │   ├── metadata.rs     # ApiVersions, Metadata
 │   │   ├── produce.rs      # ProduceRequest
-│   │   └── tests.rs        # Handler unit tests (14 tests)
+│   │   └── tests.rs        # Handler unit tests (56 tests)
 │   └── storage/            # Storage abstraction layer
 │       ├── mod.rs          # KafkaStore trait definition
 │       ├── postgres.rs     # PostgreSQL implementation
-│       └── tests.rs        # Storage tests (22 tests)
+│       └── tests.rs        # Storage tests (43 tests)
 └── bin/
     └── pgrx_embed.rs       # pgrx embedding binary
 
-kafka_test/                 # E2E test suite using rdkafka client (5 scenarios)
+kafka_test/                 # E2E test suite using rdkafka client (173 tests)
 docs/                       # Architecture decisions, protocol coverage
 ```
 
@@ -252,9 +252,9 @@ docs/                       # Architecture decisions, protocol coverage
 
 | Category | Tests | Description |
 |----------|-------|-------------|
-| Shadow Mode | 141 | External Kafka forwarding, SASL/SSL, replay |
+| Shadow Mode | 146 | External Kafka forwarding, SASL/SSL, replay |
 | Protocol | 85 | Request/response parsing and encoding |
-| Handlers | 78 | Handler logic with MockKafkaStore |
+| Handlers | 76 | Handler logic with MockKafkaStore |
 | Assignment | 67 | Partition assignment strategies |
 | Storage | 43 | Storage types and trait verification |
 | Messages | 39 | Message encoding/decoding |
@@ -262,9 +262,9 @@ docs/                       # Architecture decisions, protocol coverage
 | Error Handling | 22 | KafkaError variants |
 | Config | 32 | GUC configuration |
 | Testing Utils | 23 | Test infrastructure |
-| Other | 70 | Coordinator, partitioner, constants, property tests |
-| E2E | 104 | Full integration with rdkafka client |
-| **Total** | **734** | 630 unit + 104 E2E |
+| Other | 46 | Coordinator, partitioner, constants |
+| E2E | 173 | Full integration with rdkafka client |
+| **Total** | **782** | 609 unit + 173 E2E |
 
 ### Running Tests
 
