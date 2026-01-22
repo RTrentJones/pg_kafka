@@ -53,7 +53,9 @@ pub mod shadow;
 pub mod storage;
 
 // Re-export commonly used types for convenience
-pub use backpressure::{new_shared_tracker, ByteTracker, SharedByteTracker, DEFAULT_MAX_PENDING_BYTES};
+pub use backpressure::{
+    new_shared_tracker, ByteTracker, SharedByteTracker, DEFAULT_MAX_PENDING_BYTES,
+};
 pub use broker_metadata::BrokerMetadata;
 pub use constants::*;
 pub use context::RuntimeContext;
