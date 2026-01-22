@@ -238,17 +238,30 @@ impl KafkaStore for PostgresStore {
             max_bytes
         );
 
-        // Calculate limit based on max_bytes
-        // Use conservative estimate of ~100 bytes per message minimum to avoid starving
-        // high-throughput consumers with small messages. The hard cap is raised to 10,000
-        // rows since the actual byte limit is enforced when building the response.
-        // Note: max_bytes is typically 1MB (1,048,576), giving limit of 10,000 with /100.
-        let limit = (max_bytes / 100).clamp(100, 10_000);
+        // ADR-002: Dynamic Fetch Sizing
+        //
+        // Previous approach: Fixed heuristic (max_bytes / 100) assumed ~100 bytes per message.
+        // This caused issues with:
+        //   - Tiny messages: 10,000 roundtrips for 1MB of 100-byte messages
+        //   - Large messages: OOM trying to load 10,000 x 1MB blobs
+        //
+        // New approach: Use pg_column_size() to track actual bytes and stop when limit reached.
+        // Initial limit is based on configurable estimate (default: 500 bytes per message).
+        // This adapts to actual message sizes while preventing memory exhaustion.
+        //
+        // The query includes cumulative byte tracking via window function.
+        // We fetch up to initial_limit rows but stop processing when cumulative_bytes exceeds max_bytes.
+        const ESTIMATE_BYTES_PER_MESSAGE: i32 = 500;
+        let initial_limit = (max_bytes / ESTIMATE_BYTES_PER_MESSAGE).clamp(10, 5_000);
 
         Spi::connect(|client| {
+            // Query with cumulative byte tracking
+            // pg_column_size() gives actual storage size including TOAST overhead
             let table = client.select(
                 "SELECT partition_offset, key, value,
-                        EXTRACT(EPOCH FROM created_at)::bigint * 1000 as timestamp_ms
+                        EXTRACT(EPOCH FROM created_at)::bigint * 1000 as timestamp_ms,
+                        SUM(COALESCE(pg_column_size(key), 0) + COALESCE(pg_column_size(value), 0) + 64)
+                            OVER (ORDER BY partition_offset) as cumulative_bytes
                  FROM kafka.messages
                  WHERE topic_id = $1 AND partition_id = $2 AND partition_offset >= $3
                  ORDER BY partition_offset
@@ -258,12 +271,29 @@ impl KafkaStore for PostgresStore {
                     topic_id.into(),
                     partition_id.into(),
                     fetch_offset.into(),
-                    limit.into(),
+                    initial_limit.into(),
                 ],
             )?;
 
             let mut messages = Vec::new();
+            let max_bytes_i64 = max_bytes as i64;
+
             for row in table {
+                // Check cumulative bytes BEFORE adding message
+                // This ensures we don't exceed max_bytes
+                let cumulative_bytes: i64 = row.get_by_name("cumulative_bytes")?.unwrap_or(0);
+
+                // Always include at least one message even if it exceeds max_bytes
+                // (Kafka protocol behavior: one message is minimum response)
+                if !messages.is_empty() && cumulative_bytes > max_bytes_i64 {
+                    crate::pg_debug!(
+                        "Stopping fetch: cumulative_bytes={} exceeds max_bytes={}",
+                        cumulative_bytes,
+                        max_bytes
+                    );
+                    break;
+                }
+
                 let partition_offset: i64 = row.get_by_name("partition_offset")?.unwrap_or(0);
                 let key: Option<Vec<u8>> = row.get_by_name("key")?;
                 let value: Option<Vec<u8>> = row.get_by_name("value")?;
@@ -1450,23 +1480,29 @@ impl KafkaStore for PostgresStore {
             isolation_level
         );
 
-        let limit = (max_bytes / 100).clamp(100, 10_000);
+        // ADR-002: Dynamic Fetch Sizing (same as fetch_records)
+        const ESTIMATE_BYTES_PER_MESSAGE: i32 = 500;
+        let initial_limit = (max_bytes / ESTIMATE_BYTES_PER_MESSAGE).clamp(10, 5_000);
 
         Spi::connect(|client| {
             let query = match isolation_level {
                 IsolationLevel::ReadUncommitted => {
-                    // Return all records including pending
+                    // Return all records including pending, with cumulative byte tracking
                     "SELECT partition_offset, key, value,
-                            EXTRACT(EPOCH FROM created_at)::bigint * 1000 as timestamp_ms
+                            EXTRACT(EPOCH FROM created_at)::bigint * 1000 as timestamp_ms,
+                            SUM(COALESCE(pg_column_size(key), 0) + COALESCE(pg_column_size(value), 0) + 64)
+                                OVER (ORDER BY partition_offset) as cumulative_bytes
                      FROM kafka.messages
                      WHERE topic_id = $1 AND partition_id = $2 AND partition_offset >= $3
                      ORDER BY partition_offset
                      LIMIT $4"
                 }
                 IsolationLevel::ReadCommitted => {
-                    // Filter out pending and aborted records
+                    // Filter out pending and aborted records, with cumulative byte tracking
                     "SELECT partition_offset, key, value,
-                            EXTRACT(EPOCH FROM created_at)::bigint * 1000 as timestamp_ms
+                            EXTRACT(EPOCH FROM created_at)::bigint * 1000 as timestamp_ms,
+                            SUM(COALESCE(pg_column_size(key), 0) + COALESCE(pg_column_size(value), 0) + 64)
+                                OVER (ORDER BY partition_offset) as cumulative_bytes
                      FROM kafka.messages
                      WHERE topic_id = $1 AND partition_id = $2 AND partition_offset >= $3
                        AND (txn_state IS NULL)
@@ -1482,12 +1518,27 @@ impl KafkaStore for PostgresStore {
                     topic_id.into(),
                     partition_id.into(),
                     fetch_offset.into(),
-                    limit.into(),
+                    initial_limit.into(),
                 ],
             )?;
 
             let mut messages = Vec::new();
+            let max_bytes_i64 = max_bytes as i64;
+
             for row in table {
+                // Check cumulative bytes before adding message
+                let cumulative_bytes: i64 = row.get_by_name("cumulative_bytes")?.unwrap_or(0);
+
+                // Always include at least one message
+                if !messages.is_empty() && cumulative_bytes > max_bytes_i64 {
+                    crate::pg_debug!(
+                        "Stopping fetch: cumulative_bytes={} exceeds max_bytes={}",
+                        cumulative_bytes,
+                        max_bytes
+                    );
+                    break;
+                }
+
                 let partition_offset: i64 = row.get_by_name("partition_offset")?.unwrap_or(0);
                 let key: Option<Vec<u8>> = row.get_by_name("key")?;
                 let value: Option<Vec<u8>> = row.get_by_name("value")?;

@@ -324,3 +324,105 @@ COMMENT ON TABLE kafka.shadow_config IS 'Per-topic shadow mode configuration for
 COMMENT ON TABLE kafka.shadow_tracking IS 'Tracks which messages have been forwarded and their external offsets.';
 COMMENT ON TABLE kafka.shadow_metrics IS 'Aggregated shadow mode metrics per topic/partition.';
 COMMENT ON VIEW kafka.shadow_status IS 'Unified view of shadow mode health, lag, and error counts.';
+
+-- =============================================================================
+-- Operational Metrics View (ADR-002: Staff-Level Architectural Improvements)
+-- =============================================================================
+-- Provides a unified view of system health metrics for monitoring.
+-- This view aggregates key operational metrics in a single query.
+
+CREATE VIEW kafka.metrics AS
+-- Topic metrics
+SELECT
+    'topics' AS category,
+    'count' AS metric,
+    COUNT(*)::BIGINT AS value,
+    'total' AS unit
+FROM kafka.topics
+UNION ALL
+-- Message metrics
+SELECT
+    'messages' AS category,
+    'count' AS metric,
+    COUNT(*)::BIGINT AS value,
+    'total' AS unit
+FROM kafka.messages
+UNION ALL
+SELECT
+    'messages' AS category,
+    'total_bytes' AS metric,
+    COALESCE(SUM(COALESCE(pg_column_size(key), 0) + COALESCE(pg_column_size(value), 0)), 0)::BIGINT AS value,
+    'bytes' AS unit
+FROM kafka.messages
+UNION ALL
+-- Consumer group metrics
+SELECT
+    'consumer_groups' AS category,
+    'active_members' AS metric,
+    COUNT(DISTINCT (group_id, member_id))::BIGINT AS value,
+    'total' AS unit
+FROM kafka.consumer_groups
+UNION ALL
+SELECT
+    'consumer_offsets' AS category,
+    'committed' AS metric,
+    COUNT(*)::BIGINT AS value,
+    'total' AS unit
+FROM kafka.consumer_offsets
+UNION ALL
+-- Producer metrics (Phase 9)
+SELECT
+    'producers' AS category,
+    'active' AS metric,
+    COUNT(*)::BIGINT AS value,
+    'total' AS unit
+FROM kafka.producer_ids
+WHERE last_active_at > NOW() - INTERVAL '5 minutes'
+UNION ALL
+-- Transaction metrics (Phase 10)
+SELECT
+    'transactions' AS category,
+    'ongoing' AS metric,
+    COUNT(*)::BIGINT AS value,
+    'total' AS unit
+FROM kafka.transactions
+WHERE state = 'Ongoing'
+UNION ALL
+SELECT
+    'transactions' AS category,
+    'pending_messages' AS metric,
+    COUNT(*)::BIGINT AS value,
+    'total' AS unit
+FROM kafka.messages
+WHERE txn_state = 'pending'
+UNION ALL
+-- Shadow mode metrics (Phase 11)
+SELECT
+    'shadow' AS category,
+    'forwarded' AS metric,
+    COALESCE(SUM(messages_forwarded), 0)::BIGINT AS value,
+    'total' AS unit
+FROM kafka.shadow_metrics
+UNION ALL
+SELECT
+    'shadow' AS category,
+    'failed' AS metric,
+    COALESCE(SUM(messages_failed), 0)::BIGINT AS value,
+    'total' AS unit
+FROM kafka.shadow_metrics
+UNION ALL
+SELECT
+    'shadow' AS category,
+    'lag' AS metric,
+    COALESCE(
+        (SELECT MAX(partition_offset) FROM kafka.messages) -
+        COALESCE((SELECT MAX(last_forwarded_offset) FROM kafka.shadow_metrics), 0),
+        0
+    )::BIGINT AS value,
+    'messages' AS unit;
+
+GRANT SELECT ON kafka.metrics TO PUBLIC;
+
+COMMENT ON VIEW kafka.metrics IS 'Unified operational metrics view for monitoring pg_kafka health.
+Categories: topics, messages, consumer_groups, consumer_offsets, producers, transactions, shadow.
+Use with: SELECT * FROM kafka.metrics WHERE category = ''messages'';';

@@ -701,6 +701,67 @@ pub struct RecordHeader {
     pub value: Vec<u8>,
 }
 
+// ============================================================================
+// Byte Size Calculation for Backpressure
+// ============================================================================
+
+impl Record {
+    /// Calculate approximate byte size of this record for backpressure tracking.
+    ///
+    /// This is an estimate of memory usage, not the exact wire format size.
+    /// Used for byte-weighted channel backpressure to prevent OOM.
+    pub fn approx_byte_size(&self) -> usize {
+        let key_size = self.key.as_ref().map(|k| k.len()).unwrap_or(0);
+        let value_size = self.value.as_ref().map(|v| v.len()).unwrap_or(0);
+        let headers_size: usize = self
+            .headers
+            .iter()
+            .map(|h| h.key.len() + h.value.len())
+            .sum();
+        // Base struct overhead (~64 bytes for Options, Vec, etc.)
+        64 + key_size + value_size + headers_size
+    }
+}
+
+impl TopicProduceData {
+    /// Calculate approximate byte size of this topic data for backpressure tracking.
+    pub fn approx_byte_size(&self) -> usize {
+        let name_size = self.name.len();
+        let partitions_size: usize = self.partitions.iter().map(|p| p.approx_byte_size()).sum();
+        // Base struct overhead
+        32 + name_size + partitions_size
+    }
+}
+
+impl PartitionProduceData {
+    /// Calculate approximate byte size of this partition data for backpressure tracking.
+    pub fn approx_byte_size(&self) -> usize {
+        let records_size: usize = self.records.iter().map(|r| r.approx_byte_size()).sum();
+        // Base struct overhead + producer metadata (~48 bytes)
+        48 + records_size
+    }
+}
+
+impl KafkaRequest {
+    /// Calculate approximate byte size of this request for backpressure tracking.
+    ///
+    /// This is used to implement byte-weighted channel backpressure.
+    /// Only Produce requests have significant memory footprint from message payloads.
+    /// Other requests are assigned a minimum overhead value.
+    pub fn approx_byte_size(&self) -> usize {
+        match self {
+            KafkaRequest::Produce { topic_data, .. } => {
+                let data_size: usize = topic_data.iter().map(|t| t.approx_byte_size()).sum();
+                // Include response channel and other field overhead
+                256 + data_size
+            }
+            // Other requests have minimal memory footprint
+            // Assign a conservative estimate for struct overhead
+            _ => 512,
+        }
+    }
+}
+
 /// Response for a topic in ProduceResponse
 #[derive(Debug, Clone)]
 pub struct TopicProduceResponse {
