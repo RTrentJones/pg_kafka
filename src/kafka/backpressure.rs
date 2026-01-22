@@ -183,4 +183,44 @@ mod tests {
         // 10 threads × 1000 iterations × 100 bytes = 1,000,000
         assert_eq!(tracker.current(), 1_000_000);
     }
+
+    #[test]
+    fn test_with_default_max() {
+        let tracker = ByteTracker::with_default_max();
+        assert_eq!(tracker.max(), DEFAULT_MAX_PENDING_BYTES);
+        assert_eq!(tracker.current(), 0);
+    }
+
+    #[test]
+    fn test_max_getter() {
+        let tracker = ByteTracker::new(12345);
+        assert_eq!(tracker.max(), 12345);
+    }
+
+    #[test]
+    fn test_new_shared_tracker() {
+        let tracker = new_shared_tracker(5000);
+        assert_eq!(tracker.max(), 5000);
+        assert_eq!(tracker.current(), 0);
+
+        // Test that it's actually shared (Arc)
+        let tracker2 = Arc::clone(&tracker);
+        tracker.add(100);
+        assert_eq!(tracker2.current(), 100);
+    }
+
+    #[test]
+    fn test_utilization_percent_zero_max() {
+        let tracker = ByteTracker::new(0);
+        // With max_bytes = 0, utilization should be 100%
+        assert_eq!(tracker.utilization_percent(), 100);
+    }
+
+    #[test]
+    fn test_debug_format() {
+        let tracker = ByteTracker::new(1000);
+        tracker.add(500);
+        let debug_str = format!("{:?}", tracker);
+        assert!(debug_str.contains("ByteTracker"));
+    }
 }
