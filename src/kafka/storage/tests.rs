@@ -880,4 +880,86 @@ mod tests {
         let result = mock.get_last_stable_offset(1, 0).unwrap();
         assert_eq!(result, 50);
     }
+
+    // ========== Sequence Validation Tests (Idempotent Producer) ==========
+
+    use crate::kafka::storage::{validate_sequence, SequenceValidation};
+
+    #[test]
+    fn test_validate_sequence_first_batch() {
+        // No prior state (last_sequence = -1): batch starting at 0 proceeds
+        assert_eq!(
+            validate_sequence(-1, 0, 5),
+            SequenceValidation::Proceed {
+                new_last_sequence: 4
+            }
+        );
+    }
+
+    #[test]
+    fn test_validate_sequence_next_batch_proceeds() {
+        assert_eq!(
+            validate_sequence(4, 5, 3),
+            SequenceValidation::Proceed {
+                new_last_sequence: 7
+            }
+        );
+    }
+
+    #[test]
+    fn test_validate_sequence_exact_replay_is_duplicate() {
+        // Batch 5..=7 already persisted (last_sequence = 7): exact replay
+        assert_eq!(validate_sequence(7, 5, 3), SequenceValidation::Duplicate);
+        // Older fully-persisted batch is also a duplicate
+        assert_eq!(validate_sequence(7, 0, 5), SequenceValidation::Duplicate);
+        // Single-record replay at the boundary
+        assert_eq!(validate_sequence(7, 7, 1), SequenceValidation::Duplicate);
+    }
+
+    #[test]
+    fn test_validate_sequence_gap_is_out_of_order() {
+        assert_eq!(
+            validate_sequence(7, 10, 3),
+            SequenceValidation::OutOfOrder {
+                expected_sequence: 8
+            }
+        );
+    }
+
+    #[test]
+    fn test_validate_sequence_partial_overlap_is_out_of_order() {
+        // last_sequence = 7, batch covers 5..=12: records 8..=12 were never
+        // persisted, so treating this as a duplicate would silently lose them
+        assert_eq!(
+            validate_sequence(7, 5, 8),
+            SequenceValidation::OutOfOrder {
+                expected_sequence: 8
+            }
+        );
+        // Overlap by one (batch 7..=8 against last_sequence = 7)
+        assert_eq!(
+            validate_sequence(7, 7, 2),
+            SequenceValidation::OutOfOrder {
+                expected_sequence: 8
+            }
+        );
+    }
+
+    #[test]
+    fn test_validate_sequence_no_overflow_near_i32_max() {
+        // Batch base behind expected near i32::MAX must not overflow when
+        // computing the batch's last sequence (i64 arithmetic internally)
+        assert_eq!(
+            validate_sequence(i32::MAX, i32::MAX, 1),
+            SequenceValidation::Duplicate
+        );
+        // Advancing past i32::MAX is refused (wraparound unsupported), not
+        // silently wrapped
+        assert_eq!(
+            validate_sequence(i32::MAX - 1, i32::MAX, 2),
+            SequenceValidation::OutOfOrder {
+                expected_sequence: i32::MAX
+            }
+        );
+    }
 }

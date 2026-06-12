@@ -618,6 +618,62 @@ pub trait KafkaStore {
     fn cleanup_aborted_messages(&self, older_than: Duration) -> Result<u64>;
 }
 
+/// Outcome of validating a producer batch's sequence range against the last
+/// persisted sequence for a (producer, topic, partition).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SequenceValidation {
+    /// The entire batch is at or behind the last persisted sequence: a replay
+    /// of already-persisted records. Skip the insert, report success.
+    Duplicate,
+    /// The batch starts exactly at the expected sequence. Persist it and
+    /// advance the stored sequence to `new_last_sequence`.
+    Proceed { new_last_sequence: i32 },
+    /// The batch leaves a gap ahead of the expected sequence, or partially
+    /// overlaps already-persisted records (base behind expected but extending
+    /// past the last persisted sequence). Persisting it would drop or
+    /// duplicate records, so the producer must be told to back off.
+    OutOfOrder { expected_sequence: i32 },
+}
+
+/// Validate a producer batch's sequence range.
+///
+/// A batch is only a duplicate when *every* record in it is at or behind
+/// `last_sequence`. A batch whose base is behind the expected sequence but
+/// which extends past `last_sequence` is NOT a duplicate: silently skipping
+/// it would lose the unseen tail records, so it is rejected as out of order
+/// (matching Kafka, which only honors exact replays of cached batches).
+///
+/// All arithmetic is done in i64 so sequence ranges near `i32::MAX` cannot
+/// overflow. Sequence wraparound (mod 2^31) is not yet supported; a batch
+/// that would advance past `i32::MAX` is rejected as out of order rather
+/// than wrapping silently.
+pub fn validate_sequence(
+    last_sequence: i32,
+    base_sequence: i32,
+    record_count: i32,
+) -> SequenceValidation {
+    let expected = last_sequence as i64 + 1;
+    let base = base_sequence as i64;
+    let batch_last = base + (record_count.max(1) as i64) - 1;
+
+    if base == expected {
+        match i32::try_from(batch_last) {
+            Ok(new_last_sequence) => SequenceValidation::Proceed { new_last_sequence },
+            // Would overflow i32 (client wrapped mod 2^31, which we don't
+            // support yet): refuse rather than wrap silently.
+            Err(_) => SequenceValidation::OutOfOrder {
+                expected_sequence: last_sequence.wrapping_add(1),
+            },
+        }
+    } else if batch_last <= last_sequence as i64 {
+        SequenceValidation::Duplicate
+    } else {
+        SequenceValidation::OutOfOrder {
+            expected_sequence: last_sequence.wrapping_add(1),
+        }
+    }
+}
+
 // Submodules
 pub mod postgres;
 
