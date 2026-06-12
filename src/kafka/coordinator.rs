@@ -207,10 +207,14 @@ impl ConsumerGroup {
                 self.leader = self.members.keys().next().cloned();
             }
 
-            // If no members left, return to Empty state
+            // If no members left, return to Empty state.
+            // NOTE: generation_id is intentionally NOT reset. The generation is
+            // the zombie-fencing token: if it restarted at 0, a stale client
+            // from a previous incarnation of the group could pass the
+            // generation checks. Kafka keeps it monotonic for the lifetime of
+            // the group; so do we.
             if self.members.is_empty() {
                 self.state = GroupState::Empty;
-                self.generation_id = 0;
                 self.protocol_name = None;
                 self.leader = None;
                 // Update last_activity for TTL tracking
@@ -474,6 +478,15 @@ impl GroupCoordinator {
             assignments.len()
         );
 
+        // SyncGroup is only valid once the join phase has completed. During
+        // PreparingRebalance the membership is still settling, so the member
+        // must rejoin (clients react to REBALANCE_IN_PROGRESS by rejoining).
+        if group.state == GroupState::PreparingRebalance {
+            return Err(KafkaError::RebalanceInProgress {
+                group_id: group_id.clone(),
+            });
+        }
+
         // If this is the leader, store assignments for all members
         if group.leader.as_deref() == Some(&member_id) {
             for (target_member_id, assignment_bytes) in assignments.iter() {
@@ -487,13 +500,35 @@ impl GroupCoordinator {
         }
 
         // Return assignment for this member
-        let assignment = group
+        match group
             .members
             .get(&member_id)
             .and_then(|m| m.assignment.clone())
-            .unwrap_or_default();
-
-        Ok(assignment)
+        {
+            Some(assignment) => Ok(assignment),
+            None => {
+                if group.state == GroupState::Stable {
+                    // The leader has already synced this generation but had no
+                    // assignment for us: we joined after the leader received
+                    // its member list, so we are invisible to the current
+                    // assignment. Returning an empty assignment here would
+                    // leave this member silently consuming nothing forever.
+                    // Force a full rebalance so the leader recomputes with
+                    // complete membership.
+                    pg_log!(
+                        "SyncGroup: member {} has no assignment in stable group {}, forcing rebalance",
+                        member_id,
+                        group_id
+                    );
+                    group.start_rebalance();
+                }
+                // CompletingRebalance: the leader simply hasn't provided
+                // assignments yet; the member rejoins and retries.
+                Err(KafkaError::RebalanceInProgress {
+                    group_id: group_id.clone(),
+                })
+            }
+        }
     }
 
     /// Handle Heartbeat request
@@ -1204,5 +1239,138 @@ mod tests {
             assert_eq!(group.members.len(), 1);
             assert!(group.members.contains_key(&member2));
         }
+    }
+
+    /// Join a group with default test parameters, returning (member_id, generation_id)
+    fn join(coordinator: &GroupCoordinator, group: &str, client: &str) -> (String, i32) {
+        let (member_id, generation_id, ..) = coordinator
+            .join_group(
+                group.to_string(),
+                None,
+                client.to_string(),
+                "localhost".to_string(),
+                30000,
+                60000,
+                "consumer".to_string(),
+                vec![("range".to_string(), vec![])],
+                None,
+            )
+            .unwrap();
+        (member_id, generation_id)
+    }
+
+    #[test]
+    fn test_generation_id_survives_group_becoming_empty() {
+        let coordinator = GroupCoordinator::new();
+
+        let (member1, gen1) = join(&coordinator, "test-group", "client-1");
+        assert_eq!(gen1, 1);
+
+        // Last member leaves: group becomes Empty
+        coordinator
+            .leave_group("test-group".to_string(), member1)
+            .unwrap();
+
+        // A new incarnation of the group must NOT reuse old generation ids:
+        // the generation is the zombie-fencing token, so a stale client from
+        // the previous incarnation must fail generation validation.
+        let (_member2, gen2) = join(&coordinator, "test-group", "client-2");
+        assert!(
+            gen2 > gen1,
+            "generation must stay monotonic across empty: {} -> {}",
+            gen1,
+            gen2
+        );
+    }
+
+    #[test]
+    fn test_sync_group_follower_before_leader_gets_rebalance_in_progress() {
+        let coordinator = GroupCoordinator::new();
+
+        let (_leader, gen) = join(&coordinator, "test-group", "client-1");
+        let (follower, _) = join(&coordinator, "test-group", "client-2");
+
+        // Follower syncs before the leader has provided assignments.
+        // It must be told to retry (REBALANCE_IN_PROGRESS), not handed an
+        // empty assignment with a success code.
+        let result = coordinator.sync_group("test-group".to_string(), follower, gen, vec![]);
+        assert!(matches!(
+            result,
+            Err(KafkaError::RebalanceInProgress { .. })
+        ));
+    }
+
+    #[test]
+    fn test_sync_group_unassigned_member_in_stable_group_forces_rebalance() {
+        let coordinator = GroupCoordinator::new();
+
+        let (leader, gen) = join(&coordinator, "test-group", "client-1");
+
+        // A second member joins, but the leader computed assignments from the
+        // member list it saw at its own join (just itself)
+        let (late_member, _) = join(&coordinator, "test-group", "client-2");
+
+        // Leader syncs with an assignment only for itself -> group goes Stable
+        coordinator
+            .sync_group(
+                "test-group".to_string(),
+                leader.clone(),
+                gen,
+                vec![(leader.clone(), b"leader-assignment".to_vec())],
+            )
+            .unwrap();
+
+        // The late member syncs: it has no assignment in the stable group.
+        // It must get REBALANCE_IN_PROGRESS and the group must start a new
+        // rebalance so the leader recomputes with full membership — otherwise
+        // this member would silently consume nothing forever.
+        let result = coordinator.sync_group("test-group".to_string(), late_member, gen, vec![]);
+        assert!(matches!(
+            result,
+            Err(KafkaError::RebalanceInProgress { .. })
+        ));
+
+        let groups = coordinator.groups.read().unwrap();
+        let group = groups.get("test-group").unwrap();
+        assert_eq!(group.state, GroupState::PreparingRebalance);
+        assert!(group.generation_id > gen);
+    }
+
+    #[test]
+    fn test_sync_group_during_preparing_rebalance_gets_rebalance_in_progress() {
+        let coordinator = GroupCoordinator::new();
+
+        let (member1, gen) = join(&coordinator, "test-group", "client-1");
+        let (member2, _) = join(&coordinator, "test-group", "client-2");
+
+        // Complete a full sync so the group is Stable
+        coordinator
+            .sync_group(
+                "test-group".to_string(),
+                member1.clone(),
+                gen,
+                vec![
+                    (member1.clone(), b"a1".to_vec()),
+                    (member2.clone(), b"a2".to_vec()),
+                ],
+            )
+            .unwrap();
+
+        // member2 leaves -> PreparingRebalance
+        coordinator
+            .leave_group("test-group".to_string(), member2)
+            .unwrap();
+
+        // Syncing during PreparingRebalance must be rejected: the join phase
+        // for the new generation hasn't completed
+        let new_gen = {
+            let groups = coordinator.groups.read().unwrap();
+            groups.get("test-group").unwrap().generation_id
+        };
+        let result = coordinator.sync_group("test-group".to_string(), member1, new_gen, vec![]);
+        assert!(matches!(
+            result,
+            Err(KafkaError::RebalanceInProgress { .. })
+        ));
     }
 }
