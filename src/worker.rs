@@ -48,6 +48,63 @@ const RECV_TIMEOUT: Duration = Duration::from_millis(100);
 /// Capacity of the bounded request channel (backpressure threshold)
 const REQUEST_CHANNEL_CAPACITY: usize = 10_000;
 
+/// Extract a human-readable message from a caught panic payload.
+///
+/// Postgres ERRORs crossing the pgrx FFI boundary arrive as a panic whose
+/// payload is a `CaughtError`, so try that in addition to the usual
+/// `&str`/`String` panic payloads.
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else if let Some(e) = payload.downcast_ref::<pgrx::pg_sys::panic::CaughtError>() {
+        format!("{:?}", e)
+    } else {
+        "Unknown panic".to_string()
+    }
+}
+
+/// Run `f` inside an internal subtransaction, rolling back its database
+/// writes if it panics. Postgres ERRORs (constraint violations, OOM, ...)
+/// surface through pgrx as Rust panics, so they take the rollback path too.
+///
+/// This exists because the worker catches handler panics to stay alive, but a
+/// caught panic must not let the surrounding `BackgroundWorker::transaction`
+/// COMMIT the request's partial writes — and after a caught Postgres ERROR
+/// the backend is still inside the error subsystem until `FlushErrorState`.
+/// Both are handled here with the PL/pgSQL exception-block sequence:
+/// `BeginInternalSubTransaction`, then on failure `FlushErrorState` +
+/// `RollbackAndReleaseCurrentSubTransaction`, restoring the caller's memory
+/// context and resource owner on every path.
+///
+/// Returns `Err(panic message)` if `f` panicked (after rolling back).
+fn run_request_in_subtransaction<F: FnOnce()>(f: F) -> Result<(), String> {
+    unsafe {
+        let old_context = pgrx::pg_sys::CurrentMemoryContext;
+        let old_owner = pgrx::pg_sys::CurrentResourceOwner;
+        pgrx::pg_sys::BeginInternalSubTransaction(std::ptr::null());
+        pgrx::pg_sys::MemoryContextSwitchTo(old_context);
+
+        match catch_unwind(AssertUnwindSafe(f)) {
+            Ok(()) => {
+                pgrx::pg_sys::ReleaseCurrentSubTransaction();
+                pgrx::pg_sys::MemoryContextSwitchTo(old_context);
+                pgrx::pg_sys::CurrentResourceOwner = old_owner;
+                Ok(())
+            }
+            Err(payload) => {
+                let message = panic_payload_message(payload.as_ref());
+                pgrx::pg_sys::FlushErrorState();
+                pgrx::pg_sys::RollbackAndReleaseCurrentSubTransaction();
+                pgrx::pg_sys::MemoryContextSwitchTo(old_context);
+                pgrx::pg_sys::CurrentResourceOwner = old_owner;
+                Err(message)
+            }
+        }
+    }
+}
+
 /// Verify that the kafka schema and required tables exist.
 /// Returns Ok(()) if all tables exist, Err with description if any are missing.
 fn verify_schema(database: &str) -> Result<(), String> {
@@ -544,8 +601,12 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
                 BackgroundWorker::transaction(move || {
                     let handler_start = std::time::Instant::now();
 
-                    // Wrap in catch_unwind to prevent handler panics from crashing the worker
-                    let result = catch_unwind(AssertUnwindSafe(|| {
+                    // Run the handler inside a subtransaction so a panic (or a
+                    // Postgres ERROR, which pgrx surfaces as a panic) rolls
+                    // back the request's partial writes instead of letting
+                    // them commit with the surrounding transaction. The worker
+                    // itself survives either way.
+                    let result = run_request_in_subtransaction(|| {
                         process_request(
                             request,
                             &coord,
@@ -555,20 +616,16 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
                             comp,
                             *shadow_ref,
                         );
-                    }));
+                    });
 
                     // Capture handler duration before transaction commit
                     handler_duration_ref.set(handler_start.elapsed());
 
-                    if let Err(panic_info) = result {
-                        let panic_msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
-                            s.to_string()
-                        } else if let Some(s) = panic_info.downcast_ref::<String>() {
-                            s.clone()
-                        } else {
-                            "Unknown panic".to_string()
-                        };
-                        pg_warning!("Handler panic caught (worker survived): {}", panic_msg);
+                    if let Err(panic_msg) = result {
+                        pg_warning!(
+                            "Handler panic caught, request rolled back (worker survived): {}",
+                            panic_msg
+                        );
                     }
                 });
 
@@ -740,17 +797,13 @@ pub fn process_request(
             ..
         } => {
             // Handle acks=0 (fire-and-forget)
-            // Per Kafka protocol: respond immediately without waiting for DB commit.
-            // Data is still written best-effort; errors are logged but not sent to client.
+            // Per Kafka protocol: the broker sends NO response frame at all for
+            // acks=0. Sending one desyncs real clients (the Java client enforces
+            // strict per-connection request/response pairing and kills the
+            // connection on an unexpected response). Data is written best-effort;
+            // errors are logged but never sent to the client.
             if acks == 0 {
-                // Send immediate empty success response (true fire-and-forget semantics)
-                let _ = response_tx.send(KafkaResponse::Produce {
-                    correlation_id,
-                    api_version,
-                    response: crate::kafka::response_builders::build_produce_response(),
-                });
-
-                // Process the produce request best-effort (client already got response)
+                // Process the produce request best-effort (no response either way)
                 // Phase 9 Note: For acks=0 (fire-and-forget), we intentionally skip idempotency validation
                 // by passing None for producer_metadata. There's no delivery guarantee anyway, so
                 // enforcing sequence validation would be misleading and waste resources.
@@ -764,7 +817,7 @@ pub fn process_request(
                     compression,
                     notify_tx,
                 );
-                match handlers::handle_produce(&ctx, topic_data.clone(), None, None) {
+                match handlers::handle_produce(&ctx, topic_data, None, None) {
                     Ok(response) => {
                         // Send notifications for long-polling consumers
                         for topic_response in &response.responses {
