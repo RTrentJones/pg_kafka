@@ -213,5 +213,5 @@ pub use metadata::{
 // Protocol compliance tests (Phase 4)
 pub use protocol::{
     test_api_versions_negotiation, test_correlation_id_preserved, test_protocol_request_pipelining,
-    test_unknown_api_key_handling,
+    test_response_ordering_with_long_poll, test_unknown_api_key_handling,
 };

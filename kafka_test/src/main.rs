@@ -229,6 +229,7 @@ use kafka_test::{
     test_replay_historical_messages,
     // Pipelining tests
     test_request_pipelining,
+    test_response_ordering_with_long_poll,
     test_session_timeout_rebalance,
     test_single_partition_topic,
     test_special_character_key_routing,
@@ -1418,6 +1419,12 @@ fn get_all_tests() -> Vec<TestDef> {
             name: "test_protocol_request_pipelining",
             test_fn: wrap_test!(test_protocol_request_pipelining),
             parallel_safe: true,
+        },
+        TestDef {
+            category: "protocol",
+            name: "test_response_ordering_with_long_poll",
+            test_fn: wrap_test!(test_response_ordering_with_long_poll),
+            parallel_safe: false, // timing-sensitive: asserts long-poll wait duration
         },
     ]
 }

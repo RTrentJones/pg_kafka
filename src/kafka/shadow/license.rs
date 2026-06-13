@@ -72,7 +72,7 @@ impl LicenseValidator {
     }
 
     /// Check license and emit rate-limited warnings
-    /// Uses pgrx::warning! macro for PostgreSQL log integration
+    /// Uses crate::pg_warning! macro for PostgreSQL log integration
     pub fn check_and_warn(&self) {
         // Get current epoch seconds
         let now = std::time::SystemTime::now()
@@ -99,13 +99,13 @@ impl LicenseValidator {
         match &self.status {
             LicenseStatus::Valid => {} // Silent
             LicenseStatus::Evaluation => {
-                pgrx::warning!(
+                crate::pg_warning!(
                     "Shadow Mode running in EVALUATION mode. \
                      Production use requires a license: https://github.com/sponsors/RTrentJones"
                 );
             }
             LicenseStatus::Unlicensed => {
-                pgrx::warning!(
+                crate::pg_warning!(
                     "SHADOW MODE ACTIVE WITHOUT LICENSE - \
                      This is a paid feature for production use. \
                      Set pg_kafka.shadow_license_key = 'eval' for evaluation, \
@@ -113,7 +113,7 @@ impl LicenseValidator {
                 );
             }
             LicenseStatus::Invalid(reason) => {
-                pgrx::warning!(
+                crate::pg_warning!(
                     "Invalid Shadow Mode license key: {}. \
                      Visit https://github.com/sponsors/RTrentJones for licensing.",
                     reason
