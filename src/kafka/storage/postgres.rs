@@ -782,32 +782,38 @@ impl KafkaStore for PostgresStore {
                     .unwrap_or(-1)
             };
 
-            let expected_sequence = last_sequence + 1;
-
-            // Step 4: Validate sequence
-            if base_sequence < expected_sequence {
-                // Duplicate - sequence is behind expected
-                // Kafka spec: Return success (don't error), skip insert, don't update sequence
-                crate::pg_debug!(
-                    "Duplicate detected: producer_id={}, partition_id={}, base_sequence={}, expected={}",
-                    producer_id,
-                    partition_id,
-                    base_sequence,
-                    expected_sequence
-                );
-                return Ok(false); // Duplicate - skip insert
-            } else if base_sequence > expected_sequence {
-                // Gap - sequence is ahead of expected
-                return Err(KafkaError::out_of_order_sequence(
-                    producer_id,
-                    partition_id,
-                    base_sequence,
-                    expected_sequence,
-                ));
-            }
+            // Step 4: Validate sequence range (pure logic in storage::validate_sequence).
+            // A batch is only a duplicate if it is ENTIRELY at or behind last_sequence;
+            // a partially overlapping batch must be rejected, not silently skipped.
+            let new_last_sequence = match super::validate_sequence(
+                last_sequence,
+                base_sequence,
+                record_count,
+            ) {
+                super::SequenceValidation::Duplicate => {
+                    // Kafka spec: exact replay returns success, skip insert,
+                    // don't update sequence
+                    crate::pg_debug!(
+                        "Duplicate detected: producer_id={}, partition_id={}, base_sequence={}, last_sequence={}",
+                        producer_id,
+                        partition_id,
+                        base_sequence,
+                        last_sequence
+                    );
+                    return Ok(false); // Duplicate - skip insert
+                }
+                super::SequenceValidation::OutOfOrder { expected_sequence } => {
+                    return Err(KafkaError::out_of_order_sequence(
+                        producer_id,
+                        partition_id,
+                        base_sequence,
+                        expected_sequence,
+                    ));
+                }
+                super::SequenceValidation::Proceed { new_last_sequence } => new_last_sequence,
+            };
 
             // Step 5: Sequence is valid - update last_sequence
-            let new_last_sequence = base_sequence + record_count - 1;
 
             client.update(
                 "INSERT INTO kafka.producer_sequences (producer_id, topic_id, partition_id, last_sequence)

@@ -246,3 +246,112 @@ pub async fn test_protocol_request_pipelining() -> TestResult {
     println!("✅ Test PASSED\n");
     Ok(())
 }
+
+/// Encode a FetchRequest v4 body (non-flexible encoding)
+///
+/// Used to issue a long-poll fetch over raw TCP so the test controls exactly
+/// what is pipelined behind it on the same connection.
+fn encode_fetch_v4_body(
+    topic: &str,
+    partition: i32,
+    fetch_offset: i64,
+    max_wait_ms: i32,
+    min_bytes: i32,
+) -> BytesMut {
+    let mut body = BytesMut::new();
+    body.put_i32(-1); // replica_id
+    body.put_i32(max_wait_ms);
+    body.put_i32(min_bytes);
+    body.put_i32(1024 * 1024); // max_bytes (v3+)
+    body.put_i8(0); // isolation_level: read_uncommitted (v4+)
+    body.put_i32(1); // topics array count
+    body.put_i16(topic.len() as i16);
+    body.extend_from_slice(topic.as_bytes());
+    body.put_i32(1); // partitions array count
+    body.put_i32(partition);
+    body.put_i64(fetch_offset);
+    body.put_i32(1024 * 1024); // partition_max_bytes
+    body
+}
+
+/// Test: Responses are written in strict request order, even across long polls
+///
+/// Kafka requires per-connection FIFO responses; the official Java client
+/// kills the connection on a correlation-id mismatch. A long-poll fetch is
+/// handled in a detached task by the broker, so this test pins the regression
+/// where a request pipelined behind it could have its response written first:
+/// 1. Fetch at the high watermark (no data) with max_wait_ms=1500 -> long poll
+/// 2. Pipeline an ApiVersions request behind it on the same connection
+/// 3. The fetch response must arrive FIRST (after ~max_wait_ms), then ApiVersions
+pub async fn test_response_ordering_with_long_poll() -> TestResult {
+    println!("=== Test: Response Ordering Across Long Poll ===\n");
+
+    // Create the topic with one message so the fetch targets a real partition
+    let ctx = crate::setup::TestContext::new().await?;
+    let topic = ctx.unique_topic("resp-order").await;
+    let producer = crate::common::create_producer()?;
+    producer
+        .send(
+            rdkafka::producer::FutureRecord::to(&topic)
+                .key("k")
+                .payload("v"),
+            Duration::from_secs(5),
+        )
+        .await
+        .map_err(|(err, _)| err)?;
+    println!("Step 1: Topic created with one message\n");
+
+    let mut stream = TcpStream::connect("localhost:9092").await?;
+    stream.set_nodelay(true)?;
+
+    // Fetch from offset 1 (the high watermark): no data available, so the
+    // broker long-polls for max_wait_ms
+    const FETCH_CORR: i32 = 111;
+    const API_VERSIONS_CORR: i32 = 222;
+    const MAX_WAIT_MS: i32 = 1500;
+
+    let fetch_body = encode_fetch_v4_body(&topic, 0, 1, MAX_WAIT_MS, 1);
+    let fetch_request = encode_request(1, 4, FETCH_CORR, &fetch_body);
+    let api_versions_request = encode_request(18, 0, API_VERSIONS_CORR, &[]);
+
+    let start = std::time::Instant::now();
+    stream.write_all(&fetch_request).await?;
+    stream.write_all(&api_versions_request).await?;
+    println!("Step 2: Sent long-poll Fetch + pipelined ApiVersions\n");
+
+    // First response on the wire must be the fetch, even though ApiVersions
+    // completed long before the long poll expired
+    let (first_corr, _) =
+        tokio::time::timeout(Duration::from_secs(10), read_response(&mut stream)).await??;
+    let first_elapsed = start.elapsed();
+    let (second_corr, _) =
+        tokio::time::timeout(Duration::from_secs(10), read_response(&mut stream)).await??;
+
+    println!(
+        "Step 3: Responses: first corr={} after {:?}, second corr={}\n",
+        first_corr, first_elapsed, second_corr
+    );
+
+    assert_eq!(
+        first_corr, FETCH_CORR,
+        "Fetch response must be written first (request order), got corr {}",
+        first_corr
+    );
+    assert_eq!(
+        second_corr, API_VERSIONS_CORR,
+        "ApiVersions response must follow the fetch"
+    );
+    // The fetch response should have actually long-polled (close to
+    // max_wait_ms), proving the ApiVersions response was held behind it
+    assert!(
+        first_elapsed >= Duration::from_millis(1000),
+        "Fetch should have long-polled ~{}ms, returned after {:?}",
+        MAX_WAIT_MS,
+        first_elapsed
+    );
+
+    ctx.cleanup().await?;
+    println!("✅ Responses arrived in strict request order\n");
+    println!("✅ Test PASSED\n");
+    Ok(())
+}

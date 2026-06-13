@@ -92,7 +92,7 @@ pub use partition::{
     test_large_key_routing, test_multi_partition_produce, test_null_key_distribution,
     test_special_character_key_routing,
 };
-pub use producer::{test_batch_produce, test_producer};
+pub use producer::{test_batch_produce, test_producer, test_producer_acks_zero};
 
 // Re-export new test functions
 pub use concurrent::{
@@ -213,5 +213,5 @@ pub use metadata::{
 // Protocol compliance tests (Phase 4)
 pub use protocol::{
     test_api_versions_negotiation, test_correlation_id_preserved, test_protocol_request_pipelining,
-    test_unknown_api_key_handling,
+    test_response_ordering_with_long_poll, test_unknown_api_key_handling,
 };

@@ -765,8 +765,22 @@ mod tests {
         .unwrap();
 
         let follower_id = follower_join.member_id.to_string();
-        // Generation may have incremented
-        let gen = follower_join.generation_id;
+
+        // The follower's join starts a new generation; the join phase only
+        // completes once every member has rejoined it. Rejoin as the leader
+        // (existing member id) to complete the join phase.
+        let leader_rejoin = coordinator::handle_join_group(
+            &ctx,
+            "test-group".to_string(),
+            leader_id.clone(),
+            "leader-client".to_string(),
+            30000,
+            60000,
+            "consumer".to_string(),
+            create_test_protocol(),
+        )
+        .unwrap();
+        let gen = leader_rejoin.generation_id;
 
         // Leader sends sync with assignments for both members
         let leader_assignment = vec![1, 2, 3];

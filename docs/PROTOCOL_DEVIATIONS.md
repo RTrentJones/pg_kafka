@@ -22,23 +22,24 @@ This document lists intentional deviations from the official Kafka protocol spec
 ### 1. acks=0 (Fire-and-Forget) ✅ Supported
 
 **Status:** Implemented
-**Kafka Behavior:** Client sends message, does not wait for acknowledgment
-**pg_kafka Behavior:** Immediate empty success response, best-effort database write
+**Kafka Behavior:** Client sends message and does not wait for acknowledgment; the broker sends NO response frame at all
+**pg_kafka Behavior:** Matches Kafka — no response frame is sent; best-effort database write
 
 **Implementation:**
-- Response sent immediately without waiting for database commit
+- No response is sent for acks=0 (sending one would desync clients that
+  enforce strict per-connection request/response pairing, e.g. the Java client)
 - Data is still written to PostgreSQL (best-effort)
 - Errors are logged but not returned to client (per acks=0 contract)
 - Long-polling consumers are notified if write succeeds
+- Idempotency/transactional validation is intentionally skipped for acks=0
 
 **Trade-offs:**
 - True fire-and-forget semantics (client doesn't wait)
-- Data loss possible if PostgreSQL fails after response sent
+- Data loss possible if PostgreSQL fails after the write was accepted
 - Suitable for high-throughput analytics pipelines where some loss is acceptable
 
 **Client Impact:**
 - Works with standard Kafka clients using `acks=0`
-- Same behavior as real Kafka for fire-and-forget use cases
 
 ### 2. Compression ✅ Fully Supported (Phase 8)
 

@@ -84,8 +84,6 @@ struct PendingForwardRecord {
     timestamp: Option<i64>,
     /// Write mode for this record (DualWrite or ExternalOnly)
     write_mode: WriteMode,
-    /// Whether this record was written to local PostgreSQL
-    written_locally: bool,
 }
 
 /// Key for pending transaction messages: (producer_id, producer_epoch)
@@ -154,6 +152,25 @@ pub struct ShadowStore<S: KafkaStore> {
     pending_txn_messages: PendingTxnMessages,
     /// License validator for shadow mode (Commercial License)
     license: RwLock<Option<LicenseValidator>>,
+    /// Monotonic counter used to sample keyless ExternalOnly transactional
+    /// records, which have no local offset to route on (offset = -1)
+    txn_forward_seq: AtomicU64,
+}
+
+/// Outcome of attempting to forward a single transactional record to
+/// external Kafka.
+///
+/// `Skipped` (sampled out by forward_percentage) is deliberately distinct
+/// from `Forwarded`: for an ExternalOnly record, a skip means the record was
+/// written nowhere yet and the caller MUST persist it locally or it is lost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForwardOutcome {
+    /// Delivered to external Kafka
+    Forwarded,
+    /// Sampled out by forward_percentage (by design, not an error)
+    Skipped,
+    /// Delivery failed (missing config/producer, or send error)
+    Failed,
 }
 
 impl<S: KafkaStore> ShadowStore<S> {
@@ -176,6 +193,7 @@ impl<S: KafkaStore> ShadowStore<S> {
             forward_tx: RwLock::new(None),
             pending_txn_messages: Arc::new(RwLock::new(HashMap::new())),
             license: RwLock::new(None),
+            txn_forward_seq: AtomicU64::new(0),
         }
     }
 
@@ -307,10 +325,10 @@ impl<S: KafkaStore> ShadowStore<S> {
                             return Some(producer.clone());
                         }
                         // Producer unhealthy, fall through to recreate
-                        pgrx::log!("Shadow: cached producer unhealthy, recreating");
+                        crate::pg_log!("Shadow: cached producer unhealthy, recreating");
                     } else {
                         // Config changed - need to recreate producer
-                        pgrx::log!(
+                        crate::pg_log!(
                             "Shadow: bootstrap_servers changed from '{}' to '{}', recreating producer",
                             cached_bs,
                             config.bootstrap_servers
@@ -347,7 +365,7 @@ impl<S: KafkaStore> ShadowStore<S> {
         *bs_guard = None;
 
         if !config.is_configured() {
-            pgrx::warning!(
+            crate::pg_warning!(
                 "⚠️  SHADOW MODE WARNING: \
                  pg_kafka.shadow_mode_enabled={} \
                  pg_kafka.shadow_bootstrap_servers='{}' \
@@ -376,7 +394,7 @@ impl<S: KafkaStore> ShadowStore<S> {
                 Some(producer)
             }
             Err(e) => {
-                pgrx::warning!(
+                crate::pg_warning!(
                     "⚠️  SHADOW MODE CONNECTION FAILED: Cannot connect to external Kafka at '{}'. Error: {:?}\n\
                      Messages will be stored locally but NOT forwarded. Check:\n\
                      1. Is the Kafka broker accessible from PostgreSQL?\n\
@@ -480,7 +498,7 @@ impl<S: KafkaStore> ShadowStore<S> {
                 let producer = match self.ensure_producer() {
                     Some(p) => p,
                     None => {
-                        pgrx::warning!("Shadow mode: producer not available for forwarding");
+                        crate::pg_warning!("Shadow mode: producer not available for forwarding");
                         return;
                     }
                 };
@@ -517,7 +535,7 @@ impl<S: KafkaStore> ShadowStore<S> {
                                 record.value.as_deref(),
                                 DEFAULT_FORWARD_TIMEOUT_MS,
                             ) {
-                                pgrx::warning!(
+                                crate::pg_warning!(
                                     "Shadow forward FAILED for {}[{}] offset {}: {:?}",
                                     external_topic,
                                     partition_id,
@@ -571,7 +589,7 @@ impl<S: KafkaStore> ShadowStore<S> {
                 record.value.as_deref(),
                 DEFAULT_FORWARD_TIMEOUT_MS,
             ) {
-                pgrx::warning!(
+                crate::pg_warning!(
                     "Shadow external write failed for {}[{}]: {:?}",
                     external_topic,
                     partition_id,
@@ -599,7 +617,7 @@ impl<S: KafkaStore> ShadowStore<S> {
     ///
     /// Returns true on success, false on failure.
     /// Used for transactional message forwarding on commit.
-    fn forward_single_record(&self, record: &PendingForwardRecord) -> bool {
+    fn forward_single_record(&self, record: &PendingForwardRecord) -> ForwardOutcome {
         // Get topic config for percentage routing and external topic name
         let topic_config = match self.topic_cache.get(record.topic_id) {
             Some(config) => config,
@@ -608,32 +626,28 @@ impl<S: KafkaStore> ShadowStore<S> {
                     "No shadow config for topic {} during txn forward",
                     record.topic_id
                 );
-                return false;
+                return ForwardOutcome::Failed;
             }
         };
 
-        // Check percentage routing (use offset if available, otherwise always forward)
-        let should_forward = if record.offset >= 0 {
-            match self.decide_forward(
-                record.key.as_deref(),
-                record.offset,
-                topic_config.forward_percentage,
-            ) {
-                ForwardDecision::Forward => true,
-                ForwardDecision::Skip => {
-                    self.metrics.skipped.fetch_add(1, Ordering::Relaxed);
-                    return true; // Skipped by design, not a failure
-                }
-            }
+        // Percentage sampling. Keyed records route deterministically on the
+        // key (same as everywhere else). Keyless records route on the local
+        // offset when one exists (DualWrite); ExternalOnly records have no
+        // local offset (-1), so a monotonic counter provides an accurate
+        // per-message sample instead of the constant -1.
+        let routing_offset = if record.offset >= 0 {
+            record.offset
         } else {
-            // ExternalOnly mode: no offset yet, check percentage with partition_id as fallback
-            topic_config.forward_percentage == 100
-                || (record.partition_id as u8 % 100) < topic_config.forward_percentage
+            self.txn_forward_seq.fetch_add(1, Ordering::Relaxed) as i64
         };
-
-        if !should_forward {
+        let decision = self.decide_forward(
+            record.key.as_deref(),
+            routing_offset,
+            topic_config.forward_percentage,
+        );
+        if decision == ForwardDecision::Skip {
             self.metrics.skipped.fetch_add(1, Ordering::Relaxed);
-            return true;
+            return ForwardOutcome::Skipped;
         }
 
         // Get producer
@@ -641,7 +655,7 @@ impl<S: KafkaStore> ShadowStore<S> {
             Some(p) => p,
             None => {
                 tracing::warn!("No producer available for txn forward");
-                return false;
+                return ForwardOutcome::Failed;
             }
         };
 
@@ -662,7 +676,7 @@ impl<S: KafkaStore> ShadowStore<S> {
                     record.partition_id
                 );
                 self.metrics.forwarded.fetch_add(1, Ordering::Relaxed);
-                true
+                ForwardOutcome::Forwarded
             }
             Err(e) => {
                 tracing::warn!(
@@ -672,7 +686,7 @@ impl<S: KafkaStore> ShadowStore<S> {
                     e
                 );
                 self.metrics.failed.fetch_add(1, Ordering::Relaxed);
-                false
+                ForwardOutcome::Failed
             }
         }
     }
@@ -848,7 +862,7 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
         let is_primary = self.is_primary();
 
         // Debug logging to trace shadow forwarding decisions
-        pgrx::log!(
+        crate::pg_log!(
             "Shadow insert_records: topic_id={}, records={}, is_enabled={}, is_primary={}",
             topic_id,
             records.len(),
@@ -857,7 +871,7 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
         );
 
         if !is_enabled || !is_primary {
-            pgrx::log!(
+            crate::pg_log!(
                 "Shadow: skipping forwarding (enabled={}, primary={})",
                 is_enabled,
                 is_primary
@@ -873,7 +887,7 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
             .map(|c| c.should_forward())
             .unwrap_or(false);
 
-        pgrx::log!(
+        crate::pg_log!(
             "Shadow: topic_id={} has_config={} should_forward={}",
             topic_id,
             has_config,
@@ -887,7 +901,7 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
             .map(|c| c.write_mode)
             .unwrap_or(WriteMode::DualWrite); // No config = local only (DualWrite but no forward)
 
-        pgrx::log!("Shadow: write_mode={:?}", write_mode);
+        crate::pg_log!("Shadow: write_mode={:?}", write_mode);
 
         match write_mode {
             WriteMode::DualWrite => {
@@ -897,7 +911,7 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
                 // Then forward to external (best-effort, doesn't affect return)
                 if let Some(config) = topic_config {
                     if config.should_forward() {
-                        pgrx::log!(
+                        crate::pg_log!(
                             "Shadow: forwarding {} records to external for topic_id={}",
                             records.len(),
                             topic_id
@@ -909,10 +923,10 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
                             base_offset,
                         );
                     } else {
-                        pgrx::log!("Shadow: config exists but should_forward=false");
+                        crate::pg_log!("Shadow: config exists but should_forward=false");
                     }
                 } else {
-                    pgrx::log!("Shadow: no topic config, skipping forward");
+                    crate::pg_log!("Shadow: no topic config, skipping forward");
                 }
 
                 Ok(base_offset)
@@ -1172,7 +1186,6 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
                             headers: r.headers.clone(),
                             timestamp: r.timestamp,
                             write_mode: WriteMode::DualWrite,
-                            written_locally: true,
                         })
                         .collect();
 
@@ -1215,7 +1228,6 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
                             headers: r.headers.clone(),
                             timestamp: r.timestamp,
                             write_mode: WriteMode::ExternalOnly,
-                            written_locally: false,
                         })
                         .collect();
 
@@ -1300,13 +1312,14 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
             .into_iter()
             .partition(|r| r.write_mode == WriteMode::DualWrite);
 
-        // 3. For DualWrite records: commit to PostgreSQL first (makes messages visible)
-        // Also commit if there are no external_only records (normal case)
-        let has_local_writes = !dual_write_records.is_empty() || external_only_records.is_empty();
-        if has_local_writes {
-            self.inner
-                .commit_transaction(transactional_id, producer_id, producer_epoch)?;
-        }
+        // 3. Commit the inner transaction unconditionally. Even when every
+        // record is ExternalOnly (no local message rows), the transaction's
+        // state row in kafka.transactions must transition to committed and
+        // any pending consumer offsets (TxnOffsetCommit) must be applied —
+        // otherwise the transaction lingers as Ongoing until the timeout
+        // sweeper force-aborts it.
+        self.inner
+            .commit_transaction(transactional_id, producer_id, producer_epoch)?;
 
         // 4. Forward DualWrite records (best effort, already committed locally)
         for record in &dual_write_records {
@@ -1320,22 +1333,41 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
             );
         }
 
-        // 5. For ExternalOnly: forward first, fallback to local on failure
+        // 5. ExternalOnly records exist nowhere until forwarded, so any record
+        // that was NOT delivered externally — whether the send failed or the
+        // record was sampled out by forward_percentage — must be persisted
+        // locally or it is silently lost.
         for record in external_only_records {
-            let forward_success = self.forward_single_record(&record);
-
-            if !forward_success {
-                // Fallback: write to PostgreSQL since external forward failed
-                tracing::warn!(
-                    "ExternalOnly forward failed for topic {}, falling back to local write",
-                    record.topic_name
-                );
-                if let Err(e) = self.write_fallback_record(&record, producer_id, producer_epoch) {
-                    tracing::error!(
-                        "ExternalOnly fallback write also failed for topic {}: {:?}",
-                        record.topic_name,
-                        e
+            match self.forward_single_record(&record) {
+                ForwardOutcome::Forwarded => {}
+                ForwardOutcome::Skipped => {
+                    tracing::debug!(
+                        "ExternalOnly record for topic {} sampled out by forward_percentage, writing locally",
+                        record.topic_name
                     );
+                    if let Err(e) = self.write_fallback_record(&record, producer_id, producer_epoch)
+                    {
+                        tracing::error!(
+                            "ExternalOnly local write after sampling skip failed for topic {}: {:?}",
+                            record.topic_name,
+                            e
+                        );
+                    }
+                }
+                ForwardOutcome::Failed => {
+                    // Fallback: write to PostgreSQL since external forward failed
+                    tracing::warn!(
+                        "ExternalOnly forward failed for topic {}, falling back to local write",
+                        record.topic_name
+                    );
+                    if let Err(e) = self.write_fallback_record(&record, producer_id, producer_epoch)
+                    {
+                        tracing::error!(
+                            "ExternalOnly fallback write also failed for topic {}: {:?}",
+                            record.topic_name,
+                            e
+                        );
+                    }
                 }
             }
         }
@@ -1362,16 +1394,13 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
             pending.remove(&key)
         };
 
-        // 2. Only call inner abort if we wrote to PostgreSQL (DualWrite records)
-        let has_local_writes = pending_records
-            .as_ref()
-            .map(|r| r.iter().any(|rec| rec.written_locally))
-            .unwrap_or(true); // Default to true if no pending records (normal abort path)
-
-        if has_local_writes {
-            self.inner
-                .abort_transaction(transactional_id, producer_id, producer_epoch)?;
-        }
+        // 2. Abort the inner transaction unconditionally. Even when no record
+        // was written locally (ExternalOnly), the transaction's state row in
+        // kafka.transactions must transition to aborted and pending offsets
+        // must be discarded — otherwise the transaction lingers as Ongoing
+        // until the timeout sweeper force-aborts it.
+        self.inner
+            .abort_transaction(transactional_id, producer_id, producer_epoch)?;
 
         // ExternalOnly records were never written locally, so just discard the buffer
         // (already removed from pending_txn_messages above)
@@ -1490,7 +1519,6 @@ mod tests {
             headers: vec![header],
             timestamp: Some(1234567890),
             write_mode: WriteMode::DualWrite,
-            written_locally: true,
         };
 
         assert_eq!(record.topic_id, 1);
@@ -1504,7 +1532,6 @@ mod tests {
         assert_eq!(record.headers[0].value, b"header-value".to_vec());
         assert_eq!(record.timestamp, Some(1234567890));
         assert!(matches!(record.write_mode, WriteMode::DualWrite));
-        assert!(record.written_locally);
     }
 
     #[test]
@@ -1519,14 +1546,12 @@ mod tests {
             headers: vec![],
             timestamp: None,
             write_mode: WriteMode::ExternalOnly,
-            written_locally: false,
         };
 
         assert!(record.key.is_none());
         assert!(record.value.is_none());
         assert!(record.timestamp.is_none());
         assert_eq!(record.offset, -1);
-        assert!(!record.written_locally);
         assert!(matches!(record.write_mode, WriteMode::ExternalOnly));
     }
 
@@ -1542,7 +1567,6 @@ mod tests {
             headers: vec![],
             timestamp: Some(1000),
             write_mode: WriteMode::DualWrite,
-            written_locally: true,
         };
 
         let cloned = record.clone();
@@ -1594,7 +1618,6 @@ mod tests {
                 headers: vec![],
                 timestamp: None,
                 write_mode: WriteMode::DualWrite,
-                written_locally: true,
             };
             guard.entry(key).or_default().push(record);
         }
@@ -1628,7 +1651,6 @@ mod tests {
                     headers: vec![],
                     timestamp: None,
                     write_mode: WriteMode::DualWrite,
-                    written_locally: true,
                 };
                 guard.entry(key).or_default().push(record);
             }
@@ -1666,7 +1688,6 @@ mod tests {
                     headers: vec![],
                     timestamp: None,
                     write_mode: WriteMode::DualWrite,
-                    written_locally: true,
                 }],
             );
         }
@@ -1704,7 +1725,6 @@ mod tests {
                     headers: vec![],
                     timestamp: None,
                     write_mode: WriteMode::DualWrite,
-                    written_locally: true,
                 }],
             );
         }
@@ -1823,7 +1843,6 @@ mod tests {
                     headers: vec![],
                     timestamp: None,
                     write_mode: WriteMode::DualWrite,
-                    written_locally: true,
                 }],
             );
             guard.insert(
@@ -1838,7 +1857,6 @@ mod tests {
                     headers: vec![],
                     timestamp: None,
                     write_mode: WriteMode::DualWrite,
-                    written_locally: true,
                 }],
             );
         }
@@ -1856,8 +1874,8 @@ mod tests {
     }
 
     #[test]
-    fn test_write_mode_affects_written_locally() {
-        // DualWrite should mark as written locally
+    fn test_write_mode_affects_local_offset() {
+        // DualWrite records carry the local offset they were written at
         let dual_write = PendingForwardRecord {
             topic_id: 1,
             topic_name: "test".to_string(),
@@ -1868,12 +1886,10 @@ mod tests {
             headers: vec![],
             timestamp: None,
             write_mode: WriteMode::DualWrite,
-            written_locally: true,
         };
-        assert!(dual_write.written_locally);
         assert!(dual_write.offset >= 0);
 
-        // ExternalOnly should not write locally
+        // ExternalOnly records have no local offset
         let external_only = PendingForwardRecord {
             topic_id: 1,
             topic_name: "test".to_string(),
@@ -1884,10 +1900,138 @@ mod tests {
             headers: vec![],
             timestamp: None,
             write_mode: WriteMode::ExternalOnly,
-            written_locally: false,
         };
-        assert!(!external_only.written_locally);
         assert_eq!(external_only.offset, -1);
+    }
+
+    // ===== Transaction finalization and ExternalOnly fallback tests =====
+
+    use crate::testing::mocks::MockKafkaStore;
+
+    fn external_only_record(topic_id: i32) -> PendingForwardRecord {
+        PendingForwardRecord {
+            topic_id,
+            topic_name: "ext-topic".to_string(),
+            partition_id: 0,
+            offset: -1,
+            key: None,
+            value: Some(b"payload".to_vec()),
+            headers: vec![],
+            timestamp: None,
+            write_mode: WriteMode::ExternalOnly,
+        }
+    }
+
+    fn external_only_config(topic_id: i32, forward_percentage: u8) -> TopicShadowConfig {
+        TopicShadowConfig {
+            topic_id,
+            topic_name: "ext-topic".to_string(),
+            mode: ShadowMode::Shadow,
+            forward_percentage,
+            external_topic_name: None,
+            sync_mode: SyncMode::Sync,
+            write_mode: WriteMode::ExternalOnly,
+        }
+    }
+
+    #[test]
+    fn test_commit_finalizes_inner_txn_with_only_external_only_records() {
+        // Regression: a transaction containing ONLY ExternalOnly records used
+        // to skip the inner commit, leaving the kafka.transactions row
+        // Ongoing and pending offsets unapplied
+        let mut mock = MockKafkaStore::new();
+        mock.expect_commit_transaction()
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+        // No topic config is registered, so forwarding fails and the record
+        // must be persisted locally instead
+        mock.expect_insert_records()
+            .times(1)
+            .returning(|_, _, _| Ok(0));
+
+        let store = ShadowStore::new(mock);
+        {
+            let mut pending = store.pending_txn_messages.write().unwrap();
+            pending
+                .entry((100, 0))
+                .or_default()
+                .push(external_only_record(1));
+        }
+
+        store.commit_transaction("txn-1", 100, 0).unwrap();
+    }
+
+    #[test]
+    fn test_abort_finalizes_inner_txn_with_only_external_only_records() {
+        // Regression: aborting a transaction with no locally-written records
+        // used to skip the inner abort, leaving the transaction Ongoing
+        let mut mock = MockKafkaStore::new();
+        mock.expect_abort_transaction()
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+
+        let store = ShadowStore::new(mock);
+        {
+            let mut pending = store.pending_txn_messages.write().unwrap();
+            pending
+                .entry((100, 0))
+                .or_default()
+                .push(external_only_record(1));
+        }
+
+        store.abort_transaction("txn-1", 100, 0).unwrap();
+    }
+
+    #[test]
+    fn test_forward_single_record_sampled_out_returns_skipped() {
+        // forward_percentage = 0 always samples out, before any producer is
+        // needed. Skipped must be distinguishable from Forwarded so the
+        // commit path can persist the record locally.
+        let store = ShadowStore::new(MockKafkaStore::new());
+        store.topic_cache.update(external_only_config(1, 0));
+
+        let outcome = store.forward_single_record(&external_only_record(1));
+        assert_eq!(outcome, ForwardOutcome::Skipped);
+        assert_eq!(store.metrics.skipped.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_forward_single_record_missing_config_returns_failed() {
+        let store = ShadowStore::new(MockKafkaStore::new());
+        // No topic config registered for topic 42
+        let outcome = store.forward_single_record(&external_only_record(42));
+        assert_eq!(outcome, ForwardOutcome::Failed);
+    }
+
+    #[test]
+    fn test_commit_writes_sampled_out_external_only_record_locally() {
+        // Regression: an ExternalOnly record sampled out by
+        // forward_percentage was treated as handled and written NOWHERE.
+        // It must fall back to a local write on commit.
+        let mut mock = MockKafkaStore::new();
+        mock.expect_commit_transaction()
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+        mock.expect_insert_records()
+            .times(1)
+            .withf(|topic_id, partition_id, records| {
+                *topic_id == 1 && *partition_id == 0 && records.len() == 1
+            })
+            .returning(|_, _, _| Ok(7));
+
+        let store = ShadowStore::new(mock);
+        store.topic_cache.update(external_only_config(1, 0));
+        {
+            let mut pending = store.pending_txn_messages.write().unwrap();
+            pending
+                .entry((100, 0))
+                .or_default()
+                .push(external_only_record(1));
+        }
+
+        store.commit_transaction("txn-1", 100, 0).unwrap();
+        assert_eq!(store.metrics.skipped.load(Ordering::Relaxed), 1);
+        assert_eq!(store.metrics.fallback_local.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -2142,7 +2286,6 @@ mod tests {
             headers: headers.clone(),
             timestamp: None,
             write_mode: WriteMode::DualWrite,
-            written_locally: true,
         };
 
         assert_eq!(record.headers.len(), 3);
@@ -2167,7 +2310,6 @@ mod tests {
             headers: vec![],
             timestamp: Some(1234567890),
             write_mode: WriteMode::DualWrite,
-            written_locally: true,
         };
 
         assert_eq!(record.value.as_ref().unwrap().len(), 1_000_000);
