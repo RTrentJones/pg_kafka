@@ -92,7 +92,7 @@ pub use partition::{
     test_large_key_routing, test_multi_partition_produce, test_null_key_distribution,
     test_special_character_key_routing,
 };
-pub use producer::{test_batch_produce, test_producer};
+pub use producer::{test_batch_produce, test_producer, test_producer_acks_zero};
 
 // Re-export new test functions
 pub use concurrent::{

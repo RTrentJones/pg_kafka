@@ -213,6 +213,7 @@ use kafka_test::{
     test_produce_timeout,
     test_produce_while_consuming,
     test_producer,
+    test_producer_acks_zero,
     // Transaction tests
     test_producer_fencing,
     test_producer_fencing_mid_transaction,
@@ -434,6 +435,12 @@ fn get_all_tests() -> Vec<TestDef> {
             category: "producer",
             name: "test_batch_produce",
             test_fn: wrap_test!(test_batch_produce),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "producer",
+            name: "test_producer_acks_zero",
+            test_fn: wrap_test!(test_producer_acks_zero),
             parallel_safe: true,
         },
         // Consumer tests
