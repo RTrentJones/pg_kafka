@@ -334,13 +334,17 @@ pub async fn run(
 ///
 /// ## Ordering Guarantee
 /// Kafka requires: if Request A comes before Request B, Response A must come before Response B.
-/// Our architecture guarantees this for non-long-poll requests:
-/// 1. reader.next() reads from TCP in order → pushes to request_tx (FIFO) in order
-/// 2. Worker pops from request_rx in order → processes synchronously → pushes to response_tx in order
-/// 3. response_rx receives in order → writer.send() writes to TCP in order
+/// Clients that pipeline requests (the official Java client enforces strict per-connection
+/// FIFO and kills the connection on a correlation-id mismatch) depend on this.
 ///
-/// Note: Long poll requests may return out of order relative to each other, but this is
-/// acceptable for FetchRequest as clients handle this via correlation_id matching.
+/// The reader creates a fresh response channel per request and queues the receiving ends,
+/// in request order, to the writer task. The writer drains one request's responses before
+/// moving to the next, so responses hit the socket in request order even when a long-poll
+/// fetch resolves in a detached task long after later requests completed. A request that
+/// produces no response (acks=0 produce) closes its channel without sending and the writer
+/// skips it. A long-poll fetch therefore blocks later responses on the same connection
+/// until it resolves — the same behavior as a real Kafka broker, which mutes a connection
+/// while a request waits in purgatory.
 ///
 /// # Thread Safety
 /// This function runs in the network thread and MUST NOT call pgrx functions.
@@ -369,33 +373,42 @@ async fn handle_connection(
     // This enables concurrent reading and writing for pipelining support
     let (mut writer, mut reader) = framed.split();
 
-    // Create a channel for this connection's responses
-    // The main thread will send responses back via this channel
-    let (response_tx, mut response_rx) = tokio::sync::mpsc::unbounded_channel();
+    // Per-request response ordering: each request gets its own response
+    // channel, and the receiving ends are queued to the writer in request
+    // order. The writer fully drains one request's channel (closed when the
+    // request's sender is dropped) before moving to the next, guaranteeing
+    // responses are written in request order.
+    type ResponseSlot = tokio::sync::mpsc::UnboundedReceiver<KafkaResponse>;
+    let (order_tx, mut order_rx) = tokio::sync::mpsc::unbounded_channel::<ResponseSlot>();
 
     // Spawn the Writer Task
     // This task sits and waits for responses from the DB.
     // It runs completely independently of the reader.
     let writer_handle: tokio::task::JoinHandle<Result<(), String>> = tokio::spawn(async move {
-        while let Some(response) = response_rx.recv().await {
-            debug!("Writer received response, encoding...");
-            let response_bytes = match protocol::encode_response(response) {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    error!("Failed to encode response: {}", e);
-                    return Err(format!("Encoding error: {}", e));
-                }
-            };
+        while let Some(mut slot) = order_rx.recv().await {
+            // A request yields at most one response; one that yields none
+            // (acks=0 produce) closes the channel without sending and is
+            // skipped here.
+            while let Some(response) = slot.recv().await {
+                debug!("Writer received response, encoding...");
+                let response_bytes = match protocol::encode_response(response) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        error!("Failed to encode response: {}", e);
+                        return Err(format!("Encoding error: {}", e));
+                    }
+                };
 
-            debug!(
-                "Sending {} byte response to client...",
-                response_bytes.len()
-            );
-            if let Err(e) = writer.send(response_bytes.freeze()).await {
-                warn!("Failed to send response to client: {}", e);
-                return Err(format!("Write error: {}", e));
+                debug!(
+                    "Sending {} byte response to client...",
+                    response_bytes.len()
+                );
+                if let Err(e) = writer.send(response_bytes.freeze()).await {
+                    warn!("Failed to send response to client: {}", e);
+                    return Err(format!("Write error: {}", e));
+                }
+                debug!("Response sent to client successfully");
             }
-            debug!("Response sent to client successfully");
         }
         Ok(())
     });
@@ -413,9 +426,16 @@ async fn handle_connection(
 
         debug!("Received frame of {} bytes", frame.len());
 
-        // Parse and attach the SAME response_tx clone for every request
-        // This ensures all responses route back to our writer task
-        match protocol::parse_request(frame, response_tx.clone()) {
+        // Create this request's response channel and queue its receiver to
+        // the writer BEFORE dispatching, so the writer's output order is
+        // fixed by request arrival order.
+        let (response_tx, response_rx) = tokio::sync::mpsc::unbounded_channel();
+        if order_tx.send(response_rx).is_err() {
+            warn!("Writer task gone, closing connection");
+            break;
+        }
+
+        match protocol::parse_request(frame, response_tx) {
             Ok(Some(request)) => {
                 debug!("Request parsed successfully, dispatching to worker...");
 
@@ -493,12 +513,21 @@ async fn handle_connection(
         }
     }
 
-    // Cleanup: Drop response_tx to signal writer task to exit
-    drop(response_tx);
+    // Cleanup: Drop order_tx so the writer exits once it has drained the
+    // response slots of requests that were already dispatched
+    drop(order_tx);
 
-    // Wait briefly for writer to finish sending any pending responses
-    // Use a timeout to avoid blocking forever if writer is stuck
-    let _ = tokio::time::timeout(std::time::Duration::from_millis(100), writer_handle).await;
+    // Wait briefly for writer to finish sending any pending responses, then
+    // abort it: an in-flight long poll could otherwise hold the task (and
+    // the half-open socket) alive for up to max_wait_ms after disconnect
+    let mut writer_handle = writer_handle;
+    if tokio::time::timeout(std::time::Duration::from_millis(100), &mut writer_handle)
+        .await
+        .is_err()
+    {
+        writer_handle.abort();
+        let _ = writer_handle.await;
+    }
 
     debug!("Connection handler exiting");
     Ok(())
