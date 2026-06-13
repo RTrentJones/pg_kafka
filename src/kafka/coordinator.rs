@@ -75,6 +75,10 @@ pub struct GroupMember {
     /// Last heartbeat timestamp (monotonic for reliable timeout detection)
     pub last_heartbeat: Instant,
 
+    /// Generation this member last (re)joined. The join phase of a rebalance
+    /// completes once every member has joined the current generation.
+    pub last_join_generation: i32,
+
     /// Static group instance ID (KIP-345) for static membership
     pub group_instance_id: Option<String>,
 }
@@ -182,6 +186,7 @@ impl ConsumerGroup {
             protocols,
             assignment: None,
             last_heartbeat: Instant::now(),
+            last_join_generation: self.generation_id,
             group_instance_id,
         };
 
@@ -194,6 +199,37 @@ impl ConsumerGroup {
         self.members.insert(member_id.clone(), member);
 
         (member_id, is_leader)
+    }
+
+    /// Complete the join phase if every member has (re)joined the current
+    /// generation. Called after joins and after member removals: a rebalance
+    /// can also become completable when the last straggler leaves or times out.
+    ///
+    /// The chosen protocol is the leader's first advertised strategy
+    /// (simplified selection; see select_common_strategy for the general case).
+    fn maybe_complete_join(&mut self) {
+        if self.state != GroupState::PreparingRebalance || self.members.is_empty() {
+            return;
+        }
+
+        let all_joined = self
+            .members
+            .values()
+            .all(|m| m.last_join_generation == self.generation_id);
+        if !all_joined {
+            return;
+        }
+
+        let protocol = self
+            .leader
+            .as_ref()
+            .and_then(|l| self.members.get(l))
+            .or_else(|| self.members.values().next())
+            .and_then(|m| m.protocols.first().map(|(name, _)| name.clone()));
+
+        if let Some(protocol) = protocol {
+            self.complete_join(protocol);
+        }
     }
 
     /// Remove a member from the group
@@ -334,6 +370,7 @@ impl GroupCoordinator {
                     group.rebalance_started_at = None;
                     group.members.clear();
                     group.leader = None;
+                    group.protocol_name = None;
                     group.generation_id += 1;
                 }
             }
@@ -376,11 +413,13 @@ impl GroupCoordinator {
         // Determine if we need to rebalance
         let needs_rebalance = match group.state {
             GroupState::Empty => true, // First member joining
-            GroupState::Stable => {
-                // New member joining stable group
-                !group.members.contains_key(&member_id)
-            }
-            _ => false, // Already rebalancing
+            // New member joining a stable group
+            GroupState::Stable => !group.members.contains_key(&member_id),
+            // New member joining while the leader may already be computing
+            // assignments: restart the join phase so the new generation's
+            // member list (and thus the leader's assignments) includes it
+            GroupState::CompletingRebalance => !group.members.contains_key(&member_id),
+            _ => false, // Already in the join phase
         };
 
         if needs_rebalance {
@@ -399,11 +438,12 @@ impl GroupCoordinator {
             group_instance_id,
         );
 
-        // Choose assignment strategy (for now, just pick first one from first member)
-        if group.protocol_name.is_none() && !protocols.is_empty() {
-            let strategy = protocols[0].0.clone();
-            group.complete_join(strategy);
-        }
+        // Complete the join phase once every member has rejoined the current
+        // generation. Gating on full membership (rather than completing on the
+        // first join) means the leader's member list — and therefore its
+        // assignments — covers everyone; stragglers are evicted by the
+        // session/rebalance timeout sweeps.
+        group.maybe_complete_join();
 
         // If this is the leader, return member list
         let members_for_leader = if is_leader {
@@ -596,8 +636,13 @@ impl GroupCoordinator {
 
         if group.remove_member(&member_id) {
             // Member removed successfully
-            // Trigger rebalance for remaining members if group is still active
-            if !group.members.is_empty() && group.state == GroupState::Stable {
+            // Trigger rebalance for remaining members if group is still active.
+            // CompletingRebalance counts too: the in-flight assignments may
+            // reference the departed member, stranding its partitions.
+            if !group.members.is_empty()
+                && (group.state == GroupState::Stable
+                    || group.state == GroupState::CompletingRebalance)
+            {
                 group.start_rebalance();
                 pg_log!(
                     "LeaveGroup triggered rebalance for {} remaining members in group {}",
@@ -605,6 +650,9 @@ impl GroupCoordinator {
                     group_id
                 );
             }
+            // If the leaver was the last straggler of an in-flight rebalance,
+            // the join phase may now be complete for the remaining members
+            group.maybe_complete_join();
             Ok(())
         } else {
             Err(KafkaError::unknown_member(&group_id, &member_id))
@@ -657,12 +705,20 @@ impl GroupCoordinator {
 
             // Trigger rebalance if members were removed and group still has members
             if !timed_out.is_empty() && !group.members.is_empty() {
-                group.start_rebalance();
+                // During PreparingRebalance the generation already advanced
+                // when the rebalance started; bumping it again would force
+                // members that already rejoined to rejoin once more
+                if group.state != GroupState::PreparingRebalance {
+                    group.start_rebalance();
+                }
                 pg_log!(
                     "Timeout triggered rebalance for {} remaining members in group {}",
                     group.members.len(),
                     group_id
                 );
+                // If the evicted member was the last straggler of an
+                // in-flight rebalance, the join phase is now complete
+                group.maybe_complete_join();
             }
         }
 
@@ -1013,17 +1069,24 @@ mod tests {
             )
             .unwrap();
 
+        // member1 rejoins the generation started by member2's join,
+        // completing the join phase
+        let (_, gen) = rejoin(&coordinator, "test-group", &member1, "client-1");
+
         // Complete the sync to get to Stable state
         coordinator
             .sync_group(
                 "test-group".to_string(),
                 member1.clone(),
-                1,
-                vec![(member1.clone(), vec![]), (member2.clone(), vec![])],
+                gen,
+                vec![
+                    (member1.clone(), b"a1".to_vec()),
+                    (member2.clone(), b"a2".to_vec()),
+                ],
             )
             .unwrap();
         coordinator
-            .sync_group("test-group".to_string(), member2.clone(), 1, vec![])
+            .sync_group("test-group".to_string(), member2.clone(), gen, vec![])
             .unwrap();
 
         // Verify group is now Stable
@@ -1195,17 +1258,36 @@ mod tests {
             )
             .unwrap();
 
+        // member1 rejoins the generation started by member2's join (keeping
+        // its short session timeout), completing the join phase
+        let (_, gen, ..) = coordinator
+            .join_group(
+                "test-group".to_string(),
+                Some(member1.clone()),
+                "client-1".to_string(),
+                "localhost".to_string(),
+                1, // 1ms session timeout - will expire
+                1000,
+                "consumer".to_string(),
+                vec![("range".to_string(), vec![])],
+                None,
+            )
+            .unwrap();
+
         // Complete sync to get to Stable state
         coordinator
             .sync_group(
                 "test-group".to_string(),
                 member1.clone(),
-                1,
-                vec![(member1.clone(), vec![]), (member2.clone(), vec![])],
+                gen,
+                vec![
+                    (member1.clone(), b"a1".to_vec()),
+                    (member2.clone(), b"a2".to_vec()),
+                ],
             )
             .unwrap();
         coordinator
-            .sync_group("test-group".to_string(), member2.clone(), 1, vec![])
+            .sync_group("test-group".to_string(), member2.clone(), gen, vec![])
             .unwrap();
 
         // Verify stable state with 2 members
@@ -1218,7 +1300,7 @@ mod tests {
 
         // Keep member2 alive by sending heartbeat
         coordinator
-            .heartbeat("test-group".to_string(), member2.clone(), 1)
+            .heartbeat("test-group".to_string(), member2.clone(), gen)
             .unwrap();
 
         // Wait for member1's timeout to expire
@@ -1243,10 +1325,29 @@ mod tests {
 
     /// Join a group with default test parameters, returning (member_id, generation_id)
     fn join(coordinator: &GroupCoordinator, group: &str, client: &str) -> (String, i32) {
+        join_inner(coordinator, group, None, client)
+    }
+
+    /// Rejoin a group with an existing member id, returning (member_id, generation_id)
+    fn rejoin(
+        coordinator: &GroupCoordinator,
+        group: &str,
+        member_id: &str,
+        client: &str,
+    ) -> (String, i32) {
+        join_inner(coordinator, group, Some(member_id.to_string()), client)
+    }
+
+    fn join_inner(
+        coordinator: &GroupCoordinator,
+        group: &str,
+        existing_member_id: Option<String>,
+        client: &str,
+    ) -> (String, i32) {
         let (member_id, generation_id, ..) = coordinator
             .join_group(
                 group.to_string(),
-                None,
+                existing_member_id,
                 client.to_string(),
                 "localhost".to_string(),
                 30000,
@@ -1287,8 +1388,10 @@ mod tests {
     fn test_sync_group_follower_before_leader_gets_rebalance_in_progress() {
         let coordinator = GroupCoordinator::new();
 
-        let (_leader, gen) = join(&coordinator, "test-group", "client-1");
+        let (leader, _) = join(&coordinator, "test-group", "client-1");
         let (follower, _) = join(&coordinator, "test-group", "client-2");
+        // Leader rejoins the new generation -> join phase completes
+        let (_, gen) = rejoin(&coordinator, "test-group", &leader, "client-1");
 
         // Follower syncs before the leader has provided assignments.
         // It must be told to retry (REBALANCE_IN_PROGRESS), not handed an
@@ -1304,13 +1407,8 @@ mod tests {
     fn test_sync_group_unassigned_member_in_stable_group_forces_rebalance() {
         let coordinator = GroupCoordinator::new();
 
+        // Single member joins and syncs -> Stable
         let (leader, gen) = join(&coordinator, "test-group", "client-1");
-
-        // A second member joins, but the leader computed assignments from the
-        // member list it saw at its own join (just itself)
-        let (late_member, _) = join(&coordinator, "test-group", "client-2");
-
-        // Leader syncs with an assignment only for itself -> group goes Stable
         coordinator
             .sync_group(
                 "test-group".to_string(),
@@ -1320,11 +1418,13 @@ mod tests {
             )
             .unwrap();
 
-        // The late member syncs: it has no assignment in the stable group.
-        // It must get REBALANCE_IN_PROGRESS and the group must start a new
-        // rebalance so the leader recomputes with full membership — otherwise
-        // this member would silently consume nothing forever.
-        let result = coordinator.sync_group("test-group".to_string(), late_member, gen, vec![]);
+        // The member rejoins (e.g., changed subscription): add_member resets
+        // its assignment, the group stays Stable
+        let (_, gen) = rejoin(&coordinator, "test-group", &leader, "client-1");
+
+        // Syncing with no stored assignment in a Stable group must force a
+        // rebalance instead of handing back an empty assignment forever
+        let result = coordinator.sync_group("test-group".to_string(), leader.clone(), gen, vec![]);
         assert!(matches!(
             result,
             Err(KafkaError::RebalanceInProgress { .. })
@@ -1340,8 +1440,10 @@ mod tests {
     fn test_sync_group_during_preparing_rebalance_gets_rebalance_in_progress() {
         let coordinator = GroupCoordinator::new();
 
-        let (member1, gen) = join(&coordinator, "test-group", "client-1");
+        let (member1, _) = join(&coordinator, "test-group", "client-1");
         let (member2, _) = join(&coordinator, "test-group", "client-2");
+        // member1 rejoins the new generation -> join phase completes
+        let (_, gen) = rejoin(&coordinator, "test-group", &member1, "client-1");
 
         // Complete a full sync so the group is Stable
         coordinator
@@ -1355,8 +1457,11 @@ mod tests {
                 ],
             )
             .unwrap();
+        coordinator
+            .sync_group("test-group".to_string(), member2.clone(), gen, vec![])
+            .unwrap();
 
-        // member2 leaves -> PreparingRebalance
+        // member2 leaves -> PreparingRebalance (member1 must rejoin)
         coordinator
             .leave_group("test-group".to_string(), member2)
             .unwrap();
@@ -1372,5 +1477,76 @@ mod tests {
             result,
             Err(KafkaError::RebalanceInProgress { .. })
         ));
+    }
+
+    #[test]
+    fn test_join_phase_completes_when_all_members_rejoin() {
+        let coordinator = GroupCoordinator::new();
+
+        // Single member: join phase completes immediately
+        let (member1, _) = join(&coordinator, "test-group", "client-1");
+        {
+            let groups = coordinator.groups.read().unwrap();
+            assert_eq!(
+                groups.get("test-group").unwrap().state,
+                GroupState::CompletingRebalance
+            );
+        }
+
+        // A second member joining starts a new generation; the join phase is
+        // incomplete until member1 rejoins it
+        let (_member2, _) = join(&coordinator, "test-group", "client-2");
+        {
+            let groups = coordinator.groups.read().unwrap();
+            assert_eq!(
+                groups.get("test-group").unwrap().state,
+                GroupState::PreparingRebalance
+            );
+        }
+
+        // member1 rejoins -> all members present in the current generation
+        rejoin(&coordinator, "test-group", &member1, "client-1");
+        {
+            let groups = coordinator.groups.read().unwrap();
+            assert_eq!(
+                groups.get("test-group").unwrap().state,
+                GroupState::CompletingRebalance
+            );
+        }
+    }
+
+    #[test]
+    fn test_straggler_eviction_completes_join_phase() {
+        let coordinator = GroupCoordinator::new();
+
+        // Two-member stable group
+        let (member1, _) = join(&coordinator, "test-group", "client-1");
+        let (member2, _) = join(&coordinator, "test-group", "client-2");
+        let (_, gen) = rejoin(&coordinator, "test-group", &member1, "client-1");
+        coordinator
+            .sync_group(
+                "test-group".to_string(),
+                member1.clone(),
+                gen,
+                vec![
+                    (member1.clone(), b"a1".to_vec()),
+                    (member2.clone(), b"a2".to_vec()),
+                ],
+            )
+            .unwrap();
+
+        // member2 leaves during Stable -> rebalance; member1 rejoins, but the
+        // join phase completes immediately because member1 is the only member
+        coordinator
+            .leave_group("test-group".to_string(), member2)
+            .unwrap();
+        rejoin(&coordinator, "test-group", &member1, "client-1");
+        {
+            let groups = coordinator.groups.read().unwrap();
+            assert_eq!(
+                groups.get("test-group").unwrap().state,
+                GroupState::CompletingRebalance
+            );
+        }
     }
 }
