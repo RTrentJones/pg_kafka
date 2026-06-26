@@ -1,0 +1,10 @@
+{
+  "name": "pg-kafka-conformance-kafkajs",
+  "private": true,
+  "type": "module",
+  "description": "Conformance harness: drive pg_kafka with the unmodified kafkajs client.",
+  "scripts": { "conformance": "node conformance.mjs" },
+  "dependencies": {
+    "kafkajs": "^2.2.4"
+  }
+}

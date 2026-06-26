@@ -1,0 +1,186 @@
+name: evidence
+
+# Continuously-verified evidence for the pg_kafka showcase (rtrentjones.dev/pg_kafka). Brings the
+# extension up exactly the way ci.yml's E2E job does (pgrx on the runner + the real-broker compose),
+# then runs the client conformance matrix, the benchmark (with raw-INSERT floor + real-broker
+# ceiling) and the recorded session, and:
+#   1. force-pushes conformance.json / bench.json / session.svg to the orphan `evidence` branch
+#      (a snapshot, kept out of main history) — the site reads them from raw.githubusercontent,
+#   2. POSTs the normalized benchmark into Tracer (tracer.rtrentjones.dev → /runs?tool=pg_kafka).
+#
+# Secrets (optional, both fail open): TRACER_INGEST_TOKEN enables the Tracer post.
+on:
+  schedule:
+    - cron: '0 6 * * 1' # weekly (the run does a full pgrx build)
+  push:
+    tags: ['v*'] # refresh on each tagged release
+  workflow_dispatch:
+
+permissions:
+  contents: write # push the orphan evidence branch
+
+concurrency:
+  group: evidence
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  PGRX_VERSION: '0.16.1'
+  PG_VERSION: '14.20'
+
+jobs:
+  evidence:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/android
+          sudo apt-get clean
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: nightly
+          components: rustfmt, clippy
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpq-dev libreadline-dev zlib1g-dev flex bison \
+            libxml2-dev libxslt-dev libssl-dev libsasl2-dev libzstd-dev \
+            netcat-openbsd postgresql-client kafkacat asciinema
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v2
+
+      - name: Cache cargo-pgrx binary
+        id: cache-cargo-pgrx
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-pgrx
+          key: ${{ runner.os }}-cargo-pgrx-bin-${{ env.PGRX_VERSION }}
+
+      - name: Install pgrx
+        if: steps.cache-cargo-pgrx.outputs.cache-hit != 'true'
+        run: cargo install --locked cargo-pgrx --version ${{ env.PGRX_VERSION }}
+
+      - name: Cache pgrx PostgreSQL binaries
+        id: cache-pgrx
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pgrx/14.*
+            ~/.pgrx/14.*_unpack
+            ~/.pgrx/config.toml
+          key: ${{ runner.os }}-pgrx-pg14-${{ env.PGRX_VERSION }}-pg${{ env.PG_VERSION }}-v2
+          restore-keys: |
+            ${{ runner.os }}-pgrx-pg14-${{ env.PGRX_VERSION }}-
+
+      - name: Initialize pgrx
+        if: steps.cache-pgrx.outputs.cache-hit != 'true'
+        run: cargo pgrx init --pg14 download
+
+      - name: Install extension
+        run: |
+          PG_CONFIG=$(find ~/.pgrx -name pg_config -type f -executable 2>/dev/null | grep "14\." | head -n 1)
+          [ -n "$PG_CONFIG" ] || { echo "no pg_config for pg14"; exit 1; }
+          export PATH="$(dirname "$PG_CONFIG"):$PATH"
+          cargo pgrx install --release --pg-config="$PG_CONFIG"
+
+      - name: Initialize Postgres data dir
+        run: |
+          cargo pgrx start pg14 || true
+          sleep 2
+          cargo pgrx stop pg14 || true
+          sleep 1
+
+      - name: Configure background worker (shared_preload_libraries)
+        run: |
+          PG14_DATA_DIR=$(find ~/.pgrx -maxdepth 1 -type d -name "data-14*" | head -n 1)
+          [ -n "$PG14_DATA_DIR" ] || { echo "no pgrx data dir"; exit 1; }
+          if ! grep -q "shared_preload_libraries.*pg_kafka" "$PG14_DATA_DIR/postgresql.conf"; then
+            printf "\nshared_preload_libraries = 'pg_kafka'\npg_kafka.host = '0.0.0.0'\n" >> "$PG14_DATA_DIR/postgresql.conf"
+          fi
+
+      - name: Start Postgres + create extension
+        run: |
+          cargo pgrx start pg14
+          PG14_DATA_DIR=$(find ~/.pgrx -maxdepth 1 -type d -name "data-14*" | head -n 1)
+          PG_PORT=$(grep "port =" "$PG14_DATA_DIR/postgresql.conf" | awk '{print $3}')
+          DB_USER=$(whoami)
+          psql -h localhost -p "$PG_PORT" -U "$DB_USER" -d postgres -c "CREATE EXTENSION IF NOT EXISTS pg_kafka;"
+          {
+            echo "PGHOST=localhost"
+            echo "PGPORT=$PG_PORT"
+            echo "PGUSER=$DB_USER"
+            echo "PGDATABASE=postgres"
+          } >> "$GITHUB_ENV"
+
+      - name: Wait for Kafka port 9092
+        timeout-minutes: 1
+        run: |
+          timeout 30s bash -c 'until nc -z 127.0.0.1 9092; do sleep 1; done'
+          sleep 3 # protocol readiness
+
+      - name: Start real broker (ceiling baseline)
+        run: |
+          docker compose up -d external-kafka
+          timeout 90 bash -c 'until docker compose ps external-kafka | grep -q "(healthy)"; do sleep 2; done'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Recording tooling (kcat alias + svg-term)
+        run: |
+          command -v kcat >/dev/null 2>&1 || sudo ln -sf "$(command -v kafkacat)" /usr/local/bin/kcat
+          npm install -g svg-term-cli
+
+      - name: Generate evidence
+        env:
+          PG_KAFKA_BROKER: localhost:9092
+          REAL_BROKER: localhost:9093
+        run: |
+          mkdir -p evidence-out
+          bash scripts/generate-evidence.sh "$PWD/evidence-out"
+
+      - name: Publish to the orphan evidence branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd evidence-out
+          shopt -s nullglob
+          files=()
+          for f in conformance.json bench.json session.svg; do [ -f "$f" ] && files+=("$f"); done
+          if [ ${#files[@]} -eq 0 ]; then echo "::warning::no artifacts produced — nothing to publish"; exit 0; fi
+          git init -q
+          git checkout -q -b evidence
+          git add "${files[@]}"
+          git -c user.name='pg-kafka-evidence[bot]' \
+              -c user.email='actions@github.com' \
+              commit -qm "evidence: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git push -f "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" evidence
+
+      - name: Ingest benchmark into Tracer
+        if: hashFiles('evidence-out/bench.json') != ''
+        env:
+          TRACER_INGEST_TOKEN: ${{ secrets.TRACER_INGEST_TOKEN }}
+        run: node .github/scripts/ingest-tracer.mjs evidence-out/bench.json
+
+      - name: Teardown
+        if: always()
+        run: |
+          docker compose down -v || true
+          cargo pgrx stop pg14 || true
