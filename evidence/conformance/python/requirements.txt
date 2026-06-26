@@ -1,0 +1,4 @@
+# kafka-python = pure-Python client; confluent-kafka = the librdkafka (C) binding.
+# Two distinct client implementations → two rows in the conformance matrix.
+kafka-python==2.0.2
+confluent-kafka==2.5.3

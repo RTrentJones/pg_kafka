@@ -1,0 +1,10 @@
+{
+  "name": "pg-kafka-bench",
+  "private": true,
+  "type": "module",
+  "description": "Benchmark pg_kafka over the Kafka wire protocol, with a raw-INSERT floor and a real-broker ceiling.",
+  "dependencies": {
+    "kafkajs": "^2.2.4",
+    "pg": "^8.12.0"
+  }
+}

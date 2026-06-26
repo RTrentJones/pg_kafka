@@ -1,0 +1,28 @@
+{
+  "_comment": "The 23 Kafka APIs implemented by pg_kafka (single source of truth for the conformance harnesses + merge). Mirrors the 'Implemented APIs' table in README.md.",
+  "apis": [
+    { "key": 0, "name": "Produce" },
+    { "key": 1, "name": "Fetch" },
+    { "key": 2, "name": "ListOffsets" },
+    { "key": 3, "name": "Metadata" },
+    { "key": 8, "name": "OffsetCommit" },
+    { "key": 9, "name": "OffsetFetch" },
+    { "key": 10, "name": "FindCoordinator" },
+    { "key": 11, "name": "JoinGroup" },
+    { "key": 12, "name": "Heartbeat" },
+    { "key": 13, "name": "LeaveGroup" },
+    { "key": 14, "name": "SyncGroup" },
+    { "key": 15, "name": "DescribeGroups" },
+    { "key": 16, "name": "ListGroups" },
+    { "key": 18, "name": "ApiVersions" },
+    { "key": 19, "name": "CreateTopics" },
+    { "key": 20, "name": "DeleteTopics" },
+    { "key": 22, "name": "InitProducerId" },
+    { "key": 24, "name": "AddPartitionsToTxn" },
+    { "key": 25, "name": "AddOffsetsToTxn" },
+    { "key": 26, "name": "EndTxn" },
+    { "key": 28, "name": "TxnOffsetCommit" },
+    { "key": 37, "name": "CreatePartitions" },
+    { "key": 42, "name": "DeleteGroups" }
+  ]
+}
