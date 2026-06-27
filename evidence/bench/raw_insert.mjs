@@ -49,7 +49,9 @@ async function main() {
   console.log(`[bench:rawInsert] ${out.msgsPerSec} msgs/s, p50 ${out.p50Ms}ms, p99 ${out.p99Ms}ms`);
 }
 
-main().catch((err) => {
-  console.error(`[bench:rawInsert] ${err.stack || err}`);
-  process.exit(1);
-});
+main()
+  .then(() => process.exit(0))
+  .catch((err) => {
+    console.error(`[bench:rawInsert] ${err.stack || err}`);
+    process.exit(1);
+  });

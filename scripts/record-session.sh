@@ -26,7 +26,8 @@ if ! command -v asciinema >/dev/null 2>&1; then
   echo "::warning::asciinema not installed — skipping session recording"
   exit 0
 fi
-asciinema rec --overwrite -c "bash $INNER" "$CAST" || { echo "::warning::asciinema rec failed"; exit 0; }
+timeout -k 10 120 asciinema rec --overwrite -c "bash $INNER" "$CAST" \
+  || { echo "::warning::asciinema rec failed/timed out"; exit 0; }
 
 if command -v svg-term >/dev/null 2>&1 && [ -s "$CAST" ]; then
   svg-term --in "$CAST" --out "$OUT_DIR/session.svg" --window --width 92 --height 22 \

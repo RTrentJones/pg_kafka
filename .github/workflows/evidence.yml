@@ -31,6 +31,7 @@ env:
 jobs:
   evidence:
     runs-on: ubuntu-latest
+    timeout-minutes: 45 # hard ceiling — harnesses are individually timeout-wrapped; this is the backstop
     steps:
       - uses: actions/checkout@v4
         with:

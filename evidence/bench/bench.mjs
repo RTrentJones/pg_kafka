@@ -136,6 +136,7 @@ async function main() {
     }
     await collected;
     scenarios.push(scenario(`end-to-end · ${SIZE}B`, lat, performance.now() - t0, count));
+    await consumer.disconnect().catch(() => {});
   }
 
   await Promise.allSettled([admin.disconnect(), producer.disconnect()]);
@@ -144,7 +145,11 @@ async function main() {
   for (const s of scenarios) console.log(`  ${s.name}: ${s.msgsPerSec} msgs/s, p50 ${s.p50Ms}ms, p99 ${s.p99Ms}ms`);
 }
 
-main().catch((err) => {
-  console.error(`[bench:${LABEL}] ${err.stack || err}`);
-  process.exit(1);
-});
+// kafkajs keeps timers/sockets open, so the event loop won't drain on its own — exit explicitly
+// (a lingering client here is what hung the first CI run for 6h).
+main()
+  .then(() => process.exit(0))
+  .catch((err) => {
+    console.error(`[bench:${LABEL}] ${err.stack || err}`);
+    process.exit(1);
+  });
