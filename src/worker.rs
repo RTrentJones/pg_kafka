@@ -1217,6 +1217,7 @@ pub fn process_request(
             api_version,
             group_id,
             member_id,
+            members,
             response_tx,
             ..
         } => {
@@ -1231,7 +1232,7 @@ pub fn process_request(
             dispatch_response(
                 "LeaveGroup",
                 response_tx,
-                || handlers::handle_leave_group(&ctx, group_id, member_id),
+                || handlers::handle_leave_group(&ctx, group_id, member_id, members),
                 |r| KafkaResponse::LeaveGroup {
                     correlation_id,
                     api_version,

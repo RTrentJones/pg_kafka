@@ -37,7 +37,11 @@ from confluent_kafka.admin import AdminClient, NewPartitions, NewTopic
 stamp = int(time.time())
 topic = f"conf-rd-{stamp}"
 group = f"conf-rd-grp-{stamp}"
-admin = AdminClient({"bootstrap.servers": BROKER})
+# Force IPv4 on every librdkafka client — the same setting pg_kafka's own E2E suite uses
+# (kafka_test create_stream_consumer). Without it librdkafka follows the broker's advertised host to
+# IPv6 (::1) and the group consume never lands (the rest of the matrix is fine on either stack).
+BASE = {"bootstrap.servers": BROKER, "broker.address.family": "v4"}
+admin = AdminClient(BASE)
 
 
 def _resolve(futures, timeout=20):
@@ -54,7 +58,7 @@ mark("CreatePartitions", lambda: _resolve(admin.create_partitions([NewPartitions
 
 
 def _produce():
-    producer = Producer({"bootstrap.servers": BROKER})
+    producer = Producer(BASE)
     producer.produce(topic, key=b"k1", value=b"v1")
     producer.produce(topic, key=b"k2", value=b"v2")
     if producer.flush(10) != 0:
@@ -66,7 +70,7 @@ mark("Produce", _produce)
 
 def _list_offsets():
     consumer = Consumer(
-        {"bootstrap.servers": BROKER, "group.id": f"lo-{uuid.uuid4()}", "enable.auto.commit": False}
+        {**BASE, "group.id": f"lo-{uuid.uuid4()}", "enable.auto.commit": False}
     )
     consumer.get_watermark_offsets(TopicPartition(topic, 0), timeout=10)
     consumer.close()
@@ -77,20 +81,18 @@ mark("ListOffsets", _list_offsets)
 
 def _consume():
     # Produce a few fresh messages first so there's guaranteed data at the tail, then drain.
-    feeder = Producer({"bootstrap.servers": BROKER})
+    feeder = Producer(BASE)
     for i in range(5):
         feeder.produce(topic, key=b"c", value=f"consume-{i}".encode())
     feeder.flush(10)
 
     consumer = Consumer(
         {
-            "bootstrap.servers": BROKER,
+            **BASE,
             "group.id": group,
             "auto.offset.reset": "earliest",
             "enable.auto.commit": False,
             "session.timeout.ms": 10000,
-            "partition.assignment.strategy": "range",
-            "enable.partition.eof": False,
         }
     )
     consumer.subscribe([topic])
@@ -129,7 +131,7 @@ mark("DeleteGroups", lambda: _resolve(admin.delete_consumer_groups([group])))
 
 # Transactions (librdkafka EOS): init → begin → produce → send-offsets → commit.
 def _txn():
-    producer = Producer({"bootstrap.servers": BROKER, "transactional.id": f"rd-tx-{uuid.uuid4()}"})
+    producer = Producer({**BASE, "transactional.id": f"rd-tx-{uuid.uuid4()}"})
     producer.init_transactions(15)  # InitProducerId
     results["InitProducerId"] = "pass"
 
@@ -141,7 +143,7 @@ def _txn():
     # AddOffsetsToTxn + TxnOffsetCommit ride send_offsets_to_transaction.
     try:
         helper = Consumer(
-            {"bootstrap.servers": BROKER, "group.id": group, "enable.auto.commit": False}
+            {**BASE, "group.id": group, "enable.auto.commit": False}
         )
         producer.send_offsets_to_transaction(
             [TopicPartition(topic, 0, 2)], helper.consumer_group_metadata(), 15

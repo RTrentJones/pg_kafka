@@ -343,6 +343,52 @@ pub async fn test_delete_group_non_empty() -> TestResult {
     Ok(())
 }
 
+/// Test that a group can be deleted after its members cleanly leave.
+///
+/// Regression: modern clients (kafkajs / Sarama / librdkafka) send LeaveGroup v3+ with the leaving
+/// members batched in a `members` array and an empty top-level member_id. pg_kafka must remove each
+/// so the group becomes Empty and DeleteGroups succeeds — otherwise it keeps returning
+/// NON_EMPTY_GROUP long after a clean leave.
+pub async fn test_delete_group_after_leave() -> TestResult {
+    use crate::common::create_stream_consumer;
+    use rdkafka::consumer::Consumer;
+
+    let admin = create_admin_client()?;
+    let topic_name = format!("test-delete-group-afterleave-{}", Uuid::new_v4());
+    let group_id = format!("test-group-afterleave-{}", Uuid::new_v4());
+
+    let new_topic = NewTopic::new(&topic_name, 1, TopicReplication::Fixed(1));
+    let opts = AdminOptions::new().operation_timeout(Some(Duration::from_secs(5)));
+    let _ = admin.create_topics(&[new_topic], &opts).await?;
+
+    // Join the group, then cleanly leave (dropping the consumer sends LeaveGroup).
+    {
+        let consumer = create_stream_consumer(&group_id)?;
+        consumer.subscribe(&[&topic_name])?;
+        tokio::time::sleep(Duration::from_secs(3)).await; // complete JoinGroup/SyncGroup
+    } // consumer dropped here → LeaveGroup (v3+ members array)
+
+    // Give the broker a moment to process the LeaveGroup and empty the group.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // DeleteGroups should now succeed (the group is Empty).
+    let results = admin.delete_groups(&[&group_id], &opts).await?;
+    assert_eq!(results.len(), 1);
+    assert!(
+        results[0].is_ok(),
+        "DeleteGroups should succeed after a clean leave, got: {:?}",
+        results[0].as_ref().err()
+    );
+
+    // Cleanup
+    if let Err(e) = admin.delete_topics(&[&topic_name], &opts).await {
+        eprintln!("    Cleanup warning: {:?}", e);
+    }
+
+    println!("    Deleted empty group '{}' after a clean leave", group_id);
+    Ok(())
+}
+
 /// Test creating multiple topics in a single request
 pub async fn test_create_multiple_topics() -> TestResult {
     let admin = create_admin_client()?;
