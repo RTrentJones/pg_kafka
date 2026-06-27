@@ -41,11 +41,14 @@ pub fn build_api_versions_response() -> ApiVersionsResponse {
     av3.max_version = 9;
     response.api_keys.push(av3);
 
-    // Fetch (API_KEY_FETCH): versions 0-13
+    // Fetch (API_KEY_FETCH): versions 0-11. Capped below v13: KIP-516 added topic IDs to Fetch in
+    // v13 (the topic *name* is dropped), but pg_kafka resolves topics by name only — so a v13 client
+    // (e.g. librdkafka >= 2.4) would get UNKNOWN_TOPIC_OR_PARTITION. v11 is the highest version that
+    // still carries the topic name and the (non-flexible) path all supported clients exercise.
     let mut av4 = ApiVersion::default();
     av4.api_key = API_KEY_FETCH;
     av4.min_version = 0;
-    av4.max_version = 13;
+    av4.max_version = 11;
     response.api_keys.push(av4);
 
     // ListOffsets (API_KEY_LIST_OFFSETS): versions 0-7
@@ -476,6 +479,17 @@ mod tests {
             .expect("AddPartitionsToTxn should be present");
         assert_eq!(add_partitions.min_version, 0);
         assert_eq!(add_partitions.max_version, 3);
+
+        // Verify Fetch entry — capped at v11. KIP-516 (Fetch v13) replaces the topic *name* with a
+        // topic ID, which pg_kafka can't resolve (it keys topics by name); advertising v13 made
+        // librdkafka >= 2.4 fetch by ID and get UNKNOWN_TOPIC_OR_PARTITION. v11 keeps the name.
+        let fetch = response
+            .api_keys
+            .iter()
+            .find(|a| a.api_key == API_KEY_FETCH)
+            .expect("Fetch should be present");
+        assert_eq!(fetch.min_version, 0);
+        assert_eq!(fetch.max_version, 11);
     }
 
     #[test]
