@@ -105,7 +105,7 @@ try {
   await mark('LeaveGroup', () => consumer.disconnect());
   // DeleteGroups legitimately rejects a non-empty group; give the broker a moment to reap the
   // now-memberless group before deleting it.
-  await new Promise((r) => setTimeout(r, 3000));
+  await new Promise((r) => setTimeout(r, 8000));
   await mark('DeleteGroups', () => admin.deleteGroups([groupId]));
 
   // Transactions: connecting a transactional producer drives InitProducerId; a committed

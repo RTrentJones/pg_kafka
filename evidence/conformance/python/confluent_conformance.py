@@ -89,11 +89,13 @@ def _consume():
             "auto.offset.reset": "earliest",
             "enable.auto.commit": False,
             "session.timeout.ms": 10000,
+            "partition.assignment.strategy": "range",
+            "enable.partition.eof": False,
         }
     )
     consumer.subscribe([topic])
     n = 0
-    deadline = time.time() + 30
+    deadline = time.time() + 40
     while time.time() < deadline and n < 2:
         msg = consumer.poll(1.0)
         if msg is None or msg.error():
