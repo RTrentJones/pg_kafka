@@ -105,8 +105,11 @@ jobs:
         run: |
           PG14_DATA_DIR=$(find ~/.pgrx -maxdepth 1 -type d -name "data-14*" | head -n 1)
           [ -n "$PG14_DATA_DIR" ] || { echo "no pgrx data dir"; exit 1; }
+          # Advertise 127.0.0.1 (not 'localhost'): pg_kafka returns pg_kafka.host as the broker's
+          # advertised address, and librdkafka/kcat follow 'localhost' to IPv6 ::1 (which nothing
+          # binds) → connection refused. 127.0.0.1 keeps every client on IPv4.
           if ! grep -q "shared_preload_libraries.*pg_kafka" "$PG14_DATA_DIR/postgresql.conf"; then
-            printf "\nshared_preload_libraries = 'pg_kafka'\npg_kafka.host = '0.0.0.0'\n" >> "$PG14_DATA_DIR/postgresql.conf"
+            printf "\nshared_preload_libraries = 'pg_kafka'\npg_kafka.host = '127.0.0.1'\n" >> "$PG14_DATA_DIR/postgresql.conf"
           fi
 
       - name: Start Postgres + create extension
@@ -151,7 +154,7 @@ jobs:
 
       - name: Generate evidence
         env:
-          PG_KAFKA_BROKER: localhost:9092
+          PG_KAFKA_BROKER: 127.0.0.1:9092
           REAL_BROKER: localhost:9093
         run: |
           mkdir -p evidence-out
