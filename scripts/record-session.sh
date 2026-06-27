@@ -1,24 +1,30 @@
 #!/usr/bin/env bash
 # Record the canonical pg_kafka session — kcat -P produces, kcat -C consumes, then a SELECT over
 # kafka.messages shows the same row in Postgres — and render it to an animated SVG (svg-term) so the
-# site can embed it with zero client JS. Best-effort: if asciinema/svg-term/kcat aren't available it
-# warns and leaves no session.svg (the site falls back to its committed placeholder).
+# site can embed it with zero client JS. Best-effort: warns and leaves no session.svg if the tools
+# aren't available (the site falls back to its committed placeholder).
 # Usage: scripts/record-session.sh <out-dir>
 set -uo pipefail
 OUT_DIR="${1:-$PWD}"
 mkdir -p "$OUT_DIR"
-BROKER="${PG_KAFKA_BROKER:-localhost:9092}"
+# Force IPv4: pg_kafka binds 0.0.0.0:9092, but kcat/librdkafka resolve "localhost" to ::1 first and
+# get connection-refused — which aborted the recording after the first command.
+BROKER="${PG_KAFKA_BROKER:-127.0.0.1:9092}"
+BROKER="${BROKER/localhost/127.0.0.1}"
+export BROKER
 CAST="$(mktemp --suffix=.cast)"
 INNER="$(mktemp --suffix=.sh)"
 
+# Escaped heredoc: \$* / \$BROKER stay literal for runtime. No `set -e` — one hiccup shouldn't abort
+# the narrative, and the SELECT proves the produced message is sitting in Postgres regardless.
 cat > "$INNER" <<INNER_EOF
-set -e
-run() { printf '\$ %s\n' "\$*"; eval "\$*"; echo; sleep 1; }
-echo "# pg_kafka — produce over the Kafka wire protocol, read it back as SQL"; echo; sleep 1
-run 'echo "key1:value1" | kcat -P -b $BROKER -t demo -K:'
-run 'kcat -C -b $BROKER -t demo -o beginning -e'
-run "psql -c 'SELECT key, value FROM kafka.messages ORDER BY partition_offset;'"
-echo "# the broker and the table are the same data."; sleep 2
+run() { printf '\$ %s\n' "\$*"; eval "\$* 2>&1"; echo; sleep 1.6; }
+echo "# pg_kafka — produce over the Kafka wire protocol, read it back as SQL"; echo; sleep 1.6
+run "echo 'key1:value1' | kcat -P -b $BROKER -t demo -K:"
+sleep 0.8
+run "kcat -C -b $BROKER -t demo -o beginning -c1 -e"
+run "psql -c 'SELECT key, value FROM kafka.messages ORDER BY partition_offset LIMIT 5;'"
+echo "# the broker and the table are the same data."; sleep 2.5
 INNER_EOF
 chmod +x "$INNER"
 
@@ -26,8 +32,7 @@ if ! command -v asciinema >/dev/null 2>&1; then
   echo "::warning::asciinema not installed — skipping session recording"
   exit 0
 fi
-# Bound the recorded command (not asciinema itself — wrapping asciinema in `timeout` strips its
-# controlling pty and crashes it). The inner script is already short, so this is just a backstop.
+# Bound the recorded command (not asciinema itself — wrapping asciinema in `timeout` strips its pty).
 asciinema rec --overwrite -c "timeout -k 5 90 bash $INNER" "$CAST" \
   || { echo "::warning::asciinema rec failed"; exit 0; }
 
