@@ -1027,6 +1027,44 @@ mod tests {
     }
 
     #[test]
+    fn test_handle_leave_group_v3_unknown_member() {
+        // v3+ members array naming a member that isn't in the group → per-member error (the
+        // top-level error_code stays NONE; the per-member result carries the error).
+        let mock = MockKafkaStore::new();
+        let coord = create_test_coordinator();
+        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(&mock, &coord, &broker, 1, Compression::None);
+
+        // Group exists (one real member) so leave_group reaches the member lookup.
+        coordinator::handle_join_group(
+            &ctx,
+            "test-group".to_string(),
+            "".to_string(),
+            "test-client".to_string(),
+            30000,
+            60000,
+            "consumer".to_string(),
+            create_test_protocol(),
+        )
+        .unwrap();
+
+        let leave_response = coordinator::handle_leave_group(
+            &ctx,
+            "test-group".to_string(),
+            String::new(),
+            vec![crate::kafka::messages::MemberIdentity {
+                member_id: "unknown-member".to_string(),
+                group_instance_id: None,
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(leave_response.error_code, ERROR_NONE);
+        assert_eq!(leave_response.members.len(), 1);
+        assert_ne!(leave_response.members[0].error_code, ERROR_NONE);
+    }
+
+    #[test]
     fn test_handle_describe_groups_existing_group() {
         let mock = MockKafkaStore::new();
         let coord = create_test_coordinator();
