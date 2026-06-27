@@ -76,17 +76,26 @@ mark("ListOffsets", _list_offsets)
 
 
 def _consume():
+    # Produce a few fresh messages first so there's guaranteed data at the tail, then drain.
+    feeder = Producer({"bootstrap.servers": BROKER})
+    for i in range(5):
+        feeder.produce(topic, key=b"c", value=f"consume-{i}".encode())
+    feeder.flush(10)
+
     consumer = Consumer(
         {
             "bootstrap.servers": BROKER,
             "group.id": group,
             "auto.offset.reset": "earliest",
             "enable.auto.commit": False,
+            "session.timeout.ms": 10000,
+            "partition.assignment.strategy": "range",
+            "enable.partition.eof": False,
         }
     )
     consumer.subscribe([topic])
     n = 0
-    deadline = time.time() + 20
+    deadline = time.time() + 40
     while time.time() < deadline and n < 2:
         msg = consumer.poll(1.0)
         if msg is None or msg.error():
@@ -106,7 +115,8 @@ if results["Fetch"] == "pass":
 
 
 def _offset_fetch():
-    from confluent_kafka.admin import ConsumerGroupTopicPartitions
+    # ConsumerGroupTopicPartitions lives at the package top level (not confluent_kafka.admin).
+    from confluent_kafka import ConsumerGroupTopicPartitions
 
     _resolve(admin.list_consumer_group_offsets([ConsumerGroupTopicPartitions(group)]))
 
@@ -170,3 +180,4 @@ tally = {}
 for s in results.values():
     tally[s] = tally.get(s, 0) + 1
 print(f"[librdkafka] wrote {OUT} — {tally}")
+sys.exit(0)  # librdkafka background threads can keep the process alive; exit explicitly

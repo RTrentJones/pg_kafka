@@ -103,6 +103,9 @@ try {
   await mark('DescribeGroups', () => admin.describeGroups([groupId]));
   await mark('ListGroups', () => admin.listGroups());
   await mark('LeaveGroup', () => consumer.disconnect());
+  // DeleteGroups legitimately rejects a non-empty group; give the broker a moment to reap the
+  // now-memberless group before deleting it.
+  await new Promise((r) => setTimeout(r, 8000));
   await mark('DeleteGroups', () => admin.deleteGroups([groupId]));
 
   // Transactions: connecting a transactional producer drives InitProducerId; a committed
@@ -155,3 +158,4 @@ const client = {
 writeFileSync(OUT, `${JSON.stringify(client, null, 2)}\n`);
 const tally = Object.values(results).reduce((a, s) => ((a[s] = (a[s] || 0) + 1), a), {});
 console.log(`[kafkajs] wrote ${OUT} —`, tally);
+process.exit(0); // kafkajs keeps the event loop alive; exit explicitly

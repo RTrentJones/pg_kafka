@@ -127,3 +127,4 @@ tally = {}
 for s in results.values():
     tally[s] = tally.get(s, 0) + 1
 print(f"[kafka-python] wrote {OUT} — {tally}")
+sys.exit(0)

@@ -182,6 +182,8 @@ func main() {
 	})
 	mark("ListGroups", func() error { _, err := admin.ListConsumerGroups(); return err })
 	mark("DescribeGroups", func() error { _, err := admin.DescribeConsumerGroups([]string{group}); return err })
+	// DeleteConsumerGroup legitimately rejects a non-empty group; wait for the member to be reaped.
+	time.Sleep(8 * time.Second)
 	mark("DeleteGroups", func() error { return admin.DeleteConsumerGroup(group) })
 
 	// Transactions (EOS): a transactional producer performs InitProducerId on creation; a committed
