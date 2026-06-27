@@ -12,6 +12,10 @@ mkdir -p "$OUT_DIR"
 BROKER="${PG_KAFKA_BROKER:-127.0.0.1:9092}"
 BROKER="${BROKER/localhost/127.0.0.1}"
 export BROKER
+# psql opens its pager (less) when stdout is a tty — inside asciinema's pty that hangs forever, which
+# truncated the recording right at the SELECT. Disable it; force psql onto IPv4 too.
+export PAGER=cat PSQL_PAGER=cat
+[ -n "${PGHOST:-}" ] && export PGHOST="${PGHOST/localhost/127.0.0.1}"
 CAST="$(mktemp --suffix=.cast)"
 INNER="$(mktemp --suffix=.sh)"
 
@@ -23,7 +27,7 @@ echo "# pg_kafka — produce over the Kafka wire protocol, read it back as SQL";
 run "echo 'key1:value1' | kcat -P -b $BROKER -t demo -K:"
 sleep 0.8
 run "kcat -C -b $BROKER -t demo -o beginning -c1 -e"
-run "psql -c 'SELECT key, value FROM kafka.messages ORDER BY partition_offset LIMIT 5;'"
+run "psql -P pager=off -c 'SELECT key, value FROM kafka.messages ORDER BY partition_offset LIMIT 5;'"
 echo "# the broker and the table are the same data."; sleep 2.5
 INNER_EOF
 chmod +x "$INNER"
