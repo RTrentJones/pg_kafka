@@ -18,6 +18,14 @@ export PAGER=cat PSQL_PAGER=cat
 [ -n "${PGHOST:-}" ] && export PGHOST="${PGHOST/localhost/127.0.0.1}"
 CAST="$(mktemp --suffix=.cast)"
 INNER="$(mktemp --suffix=.sh)"
+# The benchmark fills kafka.messages with 1KB payloads first, so filter to the demo key and decode
+# the bytea — that's the "same row, now as SQL" punchline. Kept in a file to dodge nested quoting.
+SQLFILE="$(mktemp --suffix=.sql)"
+cat > "$SQLFILE" <<'SQL'
+SELECT convert_from(key, 'UTF8') AS key, convert_from(value, 'UTF8') AS value
+FROM kafka.messages
+WHERE key = convert_to('key1', 'UTF8');
+SQL
 
 # Escaped heredoc: \$* / \$BROKER stay literal for runtime. No `set -e` — one hiccup shouldn't abort
 # the narrative, and the SELECT proves the produced message is sitting in Postgres regardless.
@@ -27,7 +35,7 @@ echo "# pg_kafka — produce over the Kafka wire protocol, read it back as SQL";
 run "echo 'key1:value1' | kcat -P -b $BROKER -t demo -K:"
 sleep 0.8
 run "kcat -C -b $BROKER -t demo -o beginning -c1 -e"
-run "psql -P pager=off -c 'SELECT key, value FROM kafka.messages ORDER BY partition_offset LIMIT 5;'"
+run "psql -P pager=off -f $SQLFILE"
 echo "# the broker and the table are the same data."; sleep 2.5
 INNER_EOF
 chmod +x "$INNER"
