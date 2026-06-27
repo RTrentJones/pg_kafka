@@ -134,7 +134,8 @@ pub use admin::{
     test_create_partitions_not_found, test_create_topic, test_create_topic_already_exists,
     test_create_topic_invalid_name, test_create_topic_invalid_partitions,
     test_create_topic_with_config, test_delete_group_empty, test_delete_group_idempotent,
-    test_delete_group_non_empty, test_delete_topic, test_delete_topic_not_found,
+    test_delete_group_after_leave, test_delete_group_non_empty, test_delete_topic,
+    test_delete_topic_not_found,
 };
 
 // Long polling tests

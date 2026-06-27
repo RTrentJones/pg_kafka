@@ -928,10 +928,14 @@ mod tests {
 
         let member_id = join_response.member_id.to_string();
 
-        // Leave group
-        let leave_response =
-            coordinator::handle_leave_group(&ctx, "test-group".to_string(), member_id.clone())
-                .unwrap();
+        // Leave group (v0-2: single top-level member_id)
+        let leave_response = coordinator::handle_leave_group(
+            &ctx,
+            "test-group".to_string(),
+            member_id.clone(),
+            vec![],
+        )
+        .unwrap();
 
         assert_eq!(leave_response.error_code, ERROR_NONE);
 
@@ -967,6 +971,7 @@ mod tests {
             &ctx,
             "test-group".to_string(),
             "unknown-member-id".to_string(),
+            vec![],
         );
 
         assert!(result.is_err());
@@ -974,6 +979,89 @@ mod tests {
             KafkaError::UnknownMemberId { .. } => {}
             e => panic!("Expected UnknownMemberId error, got {:?}", e),
         }
+    }
+
+    #[test]
+    fn test_handle_leave_group_v3_members_array() {
+        // LeaveGroup v3+ sends an empty top-level member_id and batches the leaving members in
+        // `members` (the framing kafkajs / Sarama / librdkafka use). The handler must remove each —
+        // regression for DeleteGroups seeing the group as non-empty after a clean leave.
+        let mock = MockKafkaStore::new();
+        let coord = create_test_coordinator();
+        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(&mock, &coord, &broker, 1, Compression::None);
+
+        let join_response = coordinator::handle_join_group(
+            &ctx,
+            "test-group".to_string(),
+            "".to_string(),
+            "test-client".to_string(),
+            30000,
+            60000,
+            "consumer".to_string(),
+            create_test_protocol(),
+        )
+        .unwrap();
+        let member_id = join_response.member_id.to_string();
+
+        // v3+: empty top-level member_id, member supplied in the `members` batch.
+        let leave_response = coordinator::handle_leave_group(
+            &ctx,
+            "test-group".to_string(),
+            String::new(),
+            vec![crate::kafka::messages::MemberIdentity {
+                member_id: member_id.clone(),
+                group_instance_id: None,
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(leave_response.error_code, ERROR_NONE);
+        assert_eq!(leave_response.members.len(), 1);
+        assert_eq!(leave_response.members[0].error_code, ERROR_NONE);
+
+        // Member removed → group is now Empty (so DeleteGroups would succeed).
+        let heartbeat_result =
+            coordinator::handle_heartbeat(&ctx, "test-group".to_string(), member_id, 1);
+        assert!(heartbeat_result.is_err());
+    }
+
+    #[test]
+    fn test_handle_leave_group_v3_unknown_member() {
+        // v3+ members array naming a member that isn't in the group → per-member error (the
+        // top-level error_code stays NONE; the per-member result carries the error).
+        let mock = MockKafkaStore::new();
+        let coord = create_test_coordinator();
+        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(&mock, &coord, &broker, 1, Compression::None);
+
+        // Group exists (one real member) so leave_group reaches the member lookup.
+        coordinator::handle_join_group(
+            &ctx,
+            "test-group".to_string(),
+            "".to_string(),
+            "test-client".to_string(),
+            30000,
+            60000,
+            "consumer".to_string(),
+            create_test_protocol(),
+        )
+        .unwrap();
+
+        let leave_response = coordinator::handle_leave_group(
+            &ctx,
+            "test-group".to_string(),
+            String::new(),
+            vec![crate::kafka::messages::MemberIdentity {
+                member_id: "unknown-member".to_string(),
+                group_instance_id: None,
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(leave_response.error_code, ERROR_NONE);
+        assert_eq!(leave_response.members.len(), 1);
+        assert_ne!(leave_response.members[0].error_code, ERROR_NONE);
     }
 
     #[test]

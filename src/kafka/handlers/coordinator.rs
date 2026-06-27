@@ -236,20 +236,44 @@ pub fn handle_leave_group(
     ctx: &HandlerContext,
     group_id: String,
     member_id: String,
+    members: Vec<crate::kafka::messages::MemberIdentity>,
 ) -> Result<kafka_protocol::messages::leave_group_response::LeaveGroupResponse> {
     let coordinator = ctx.coordinator;
-    use kafka_protocol::messages::leave_group_response::LeaveGroupResponse;
+    use kafka_protocol::messages::leave_group_response::{LeaveGroupResponse, MemberResponse};
+    use kafka_protocol::protocol::StrBytes;
 
-    crate::pg_debug!("LeaveGroup: group_id={}, member_id={}", group_id, member_id);
-
-    // Coordinator returns typed errors (UnknownMemberId, CoordinatorNotAvailable)
-    // which map directly to Kafka protocol error codes via to_kafka_error_code()
-    coordinator.leave_group(group_id, member_id)?;
-
-    // Build response
     let mut response = LeaveGroupResponse::default();
     response.throttle_time_ms = 0;
     response.error_code = ERROR_NONE;
+
+    if members.is_empty() {
+        // LeaveGroup v0-2: a single top-level member_id.
+        crate::pg_debug!("LeaveGroup: group_id={}, member_id={}", group_id, member_id);
+        // Coordinator returns typed errors (UnknownMemberId, CoordinatorNotAvailable) that map to
+        // Kafka error codes via to_kafka_error_code().
+        coordinator.leave_group(group_id, member_id)?;
+    } else {
+        // LeaveGroup v3+ (the framing kafkajs / Sarama / librdkafka send): the top-level member_id
+        // is empty and the leaving members are batched in `members`. Remove each and report a
+        // per-member result. Without this the member is never removed and the group stays
+        // non-empty, so DeleteGroups keeps returning NON_EMPTY_GROUP after a clean leave.
+        for m in members {
+            crate::pg_debug!(
+                "LeaveGroup(v3+): group_id={}, member_id={}",
+                group_id,
+                m.member_id
+            );
+            let error_code = match coordinator.leave_group(group_id.clone(), m.member_id.clone()) {
+                Ok(()) => ERROR_NONE,
+                Err(e) => e.to_kafka_error_code(),
+            };
+            let mut member_response = MemberResponse::default();
+            member_response.member_id = StrBytes::from_string(m.member_id);
+            member_response.group_instance_id = m.group_instance_id.map(StrBytes::from_string);
+            member_response.error_code = error_code;
+            response.members.push(member_response);
+        }
+    }
 
     Ok(response)
 }

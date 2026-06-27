@@ -109,6 +109,7 @@ use kafka_test::{
     test_create_topic_invalid_partitions,
     test_create_topic_with_config,
     test_delete_group_empty,
+    test_delete_group_after_leave,
     test_delete_group_idempotent,
     test_delete_group_non_empty,
     test_delete_topic,
@@ -386,6 +387,12 @@ fn get_all_tests() -> Vec<TestDef> {
             category: "admin",
             name: "test_delete_group_non_empty",
             test_fn: wrap_test!(test_delete_group_non_empty),
+            parallel_safe: false, // Uses shared consumer group state
+        },
+        TestDef {
+            category: "admin",
+            name: "test_delete_group_after_leave",
+            test_fn: wrap_test!(test_delete_group_after_leave),
             parallel_safe: false, // Uses shared consumer group state
         },
         TestDef {
