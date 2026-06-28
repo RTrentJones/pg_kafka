@@ -158,6 +158,18 @@ async fn run_shadow_forwarder(
     info!("Shadow forwarder task stopped");
 }
 
+/// Try to admit a new connection under the concurrent-connection cap (SEC-3).
+///
+/// Returns a permit to hold for the connection's lifetime, or `None` if the cap has been
+/// reached (the caller must then close the new socket). Dropping the returned permit — which the
+/// connection task does on exit — frees the slot for a future connection. `try_acquire` is
+/// non-blocking so the accept loop keeps servicing shutdown checks while at capacity.
+fn try_admit_connection(
+    limiter: &Arc<tokio::sync::Semaphore>,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    Arc::clone(limiter).try_acquire_owned().ok()
+}
+
 /// Run the TCP listener
 ///
 /// This is the main entry point for the Kafka protocol listener.
@@ -283,9 +295,9 @@ pub async fn run(
                 // SEC-3: enforce the concurrent-connection cap. try_acquire is non-blocking so
                 // the accept loop keeps servicing shutdown checks; at the cap we close the new
                 // socket rather than buffer an unbounded number of connections.
-                let permit = match Arc::clone(&conn_limiter).try_acquire_owned() {
-                    Ok(permit) => permit,
-                    Err(_) => {
+                let permit = match try_admit_connection(&conn_limiter) {
+                    Some(permit) => permit,
+                    None => {
                         if log_connections {
                             warn!(
                                 "Connection limit ({}) reached; rejecting {}",
@@ -679,5 +691,29 @@ fn calculate_response_bytes(response: &KafkaResponse) -> usize {
             .map(|r| r.len())
             .sum(),
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_try_admit_connection_enforces_cap_and_frees_on_drop() {
+        // SEC-3: admission must reject once the concurrent-connection cap is reached, and free a
+        // slot when a permit (held for a connection's lifetime) is dropped. This is the policy the
+        // accept loop relies on to bound fd/memory usage.
+        let limiter = Arc::new(tokio::sync::Semaphore::new(2));
+        let p1 = try_admit_connection(&limiter).expect("1st connection admitted under the cap");
+        let _p2 = try_admit_connection(&limiter).expect("2nd connection admitted under the cap");
+        assert!(
+            try_admit_connection(&limiter).is_none(),
+            "a 3rd connection must be rejected at the cap of 2"
+        );
+        drop(p1); // a connection closes, dropping its permit
+        assert!(
+            try_admit_connection(&limiter).is_some(),
+            "closing a connection must free a slot for a new one"
+        );
     }
 }

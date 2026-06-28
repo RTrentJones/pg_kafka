@@ -711,6 +711,17 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
 /// - Dispatch Pattern: Common error handling via dispatch helpers
 /// - Transaction boundaries remain explicit here (in worker.rs)
 ///
+/// Send a best-effort produce notification to the network thread without blocking the single DB
+/// thread (SEC-4). The notify channel is bounded; a *blocking* send from here would stall all
+/// request processing if the channel filled. `try_send` drops the notification instead — fetch
+/// handlers fall back to polling, so a dropped wake-up only adds latency, never blocks.
+fn notify_best_effort(
+    tx: &crossbeam_channel::Sender<crate::kafka::InternalNotification>,
+    notification: crate::kafka::InternalNotification,
+) {
+    let _ = tx.try_send(notification);
+}
+
 /// # Testing
 /// This function is public to allow unit testing, but is not part of the
 /// public API and should not be called directly by external code.
@@ -835,11 +846,9 @@ pub fn process_request(
                                                     partition_id,
                                                     high_watermark: hwm,
                                                 };
-                                            // SEC-4: try_send (non-blocking) so a full notify
-                                            // channel can't stall the single DB thread; dropped
-                                            // notifications are acceptable (fetch falls back to
-                                            // polling).
-                                            let _ = notify_tx.try_send(notification);
+                                            // SEC-4: non-blocking, so a full notify channel can't
+                                            // stall the single DB thread (dropped wake-ups are fine).
+                                            notify_best_effort(notify_tx, notification);
                                         }
                                     }
                                 }
@@ -897,8 +906,8 @@ pub fn process_request(
                                                 partition_id,
                                                 high_watermark: hwm,
                                             };
-                                        // SEC-4: non-blocking try_send (see the other notify site).
-                                        let _ = notify_tx.try_send(notification);
+                                        // SEC-4: non-blocking (see the other notify site).
+                                        notify_best_effort(notify_tx, notification);
                                     }
                                 }
                             }
@@ -1745,5 +1754,27 @@ pub fn process_request(
                 },
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kafka::InternalNotification;
+
+    #[test]
+    fn test_notify_best_effort_does_not_block_when_channel_full() {
+        // SEC-4: the single DB thread must never block sending a produce wake-up. A *blocking*
+        // send on a full bounded channel would stall all request processing; notify_best_effort
+        // uses try_send and drops instead. The channel below has capacity 1 and no receiver
+        // draining it, so a blocking send on the second call would hang this test forever.
+        let (tx, _rx) = crossbeam_channel::bounded::<InternalNotification>(1);
+        let make = |topic_id| InternalNotification::NewMessages {
+            topic_id,
+            partition_id: 0,
+            high_watermark: 0,
+        };
+        notify_best_effort(&tx, make(1)); // fills the channel
+        notify_best_effort(&tx, make(2)); // must return immediately (dropped), not block
     }
 }
