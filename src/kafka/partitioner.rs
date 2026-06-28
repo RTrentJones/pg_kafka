@@ -30,11 +30,16 @@ use rand::Rng;
 /// random selection instead, which provides similar distribution but without
 /// batch affinity. This deviation is documented in PROTOCOL_DEVIATIONS.md.
 pub fn compute_partition(key: Option<&[u8]>, partition_count: i32, explicit_partition: i32) -> i32 {
-    debug_assert!(partition_count > 0, "partition_count must be positive");
-
     if explicit_partition >= 0 {
         // Client explicitly specified partition - pass through
         return explicit_partition;
+    }
+
+    // BUG-8: guard the modulo / random paths against a non-positive partition count. In release
+    // builds there is no debug_assert, so `% 0` and gen_range(0..0) would panic and abort the
+    // produce request. A real topic always has >= 1 partition, so this is purely defensive.
+    if partition_count <= 0 {
+        return 0;
     }
 
     match key {
@@ -56,6 +61,16 @@ pub fn compute_partition(key: Option<&[u8]>, partition_count: i32, explicit_part
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_non_positive_partition_count_no_panic() {
+        // BUG-8: a degenerate partition_count must not panic (% 0 / gen_range(0..0) would).
+        assert_eq!(compute_partition(Some(b"k"), 0, -1), 0);
+        assert_eq!(compute_partition(None, 0, -1), 0);
+        assert_eq!(compute_partition(Some(b"k"), -5, -1), 0);
+        // An explicit partition still passes through regardless of partition_count.
+        assert_eq!(compute_partition(None, 0, 7), 7);
+    }
 
     #[test]
     fn test_explicit_partition_passes_through() {
