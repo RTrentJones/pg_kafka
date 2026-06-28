@@ -100,7 +100,9 @@ pub fn handle_add_partitions_to_txn(
         };
 
         for partition_id in partition_ids {
-            let error_code = if partition_id < partition_count {
+            // CONF-5: a negative partition id is not valid. The previous check only bounded the
+            // upper end (`< partition_count`), so e.g. -1 was accepted as ERROR_NONE.
+            let error_code = if partition_id >= 0 && partition_id < partition_count {
                 ERROR_NONE
             } else {
                 crate::kafka::constants::ERROR_UNKNOWN_TOPIC_OR_PARTITION
@@ -307,4 +309,50 @@ pub fn handle_txn_offset_commit(
 
     response.topics = topic_results;
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::mocks::MockKafkaStore;
+
+    #[test]
+    fn test_add_partitions_to_txn_rejects_negative_partition() {
+        // CONF-5: a negative partition id must be rejected (UNKNOWN_TOPIC_OR_PARTITION), not
+        // accepted as ERROR_NONE. The old check only bounded the upper end (< partition_count).
+        let mut store = MockKafkaStore::new();
+        store
+            .expect_begin_or_continue_transaction()
+            .returning(|_, _, _| Ok(()));
+        store
+            .expect_get_topic_partition_count()
+            .returning(|_| Ok(Some(3)));
+
+        let coordinator = crate::kafka::GroupCoordinator::new();
+        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(
+            &store,
+            &coordinator,
+            &broker,
+            1,
+            kafka_protocol::records::Compression::None,
+        );
+
+        let topics = vec![("t".to_string(), vec![-1, 0])];
+        let resp = handle_add_partitions_to_txn(&ctx, "txn-1", 1, 0, topics).unwrap();
+        let by_partition = &resp.results_by_topic_v3_and_below[0].results_by_partition;
+        let neg = by_partition
+            .iter()
+            .find(|p| p.partition_index == -1)
+            .unwrap();
+        let zero = by_partition
+            .iter()
+            .find(|p| p.partition_index == 0)
+            .unwrap();
+        assert_eq!(
+            neg.partition_error_code,
+            crate::kafka::constants::ERROR_UNKNOWN_TOPIC_OR_PARTITION
+        );
+        assert_eq!(zero.partition_error_code, ERROR_NONE);
+    }
 }
