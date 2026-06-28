@@ -39,9 +39,11 @@ use super::recordbatch::{parse_record_batch_with_metadata, ParsedRecordBatch};
 /// wrapped in `catch_unwind` so a malformed frame degrades to a CorruptMessage error instead of
 /// unwinding the connection. See `test_parse_{empty,truncated}_header_returns_err_no_panic`.
 ///
-/// NOTE: catch_unwind only contains *unwinding* panics. A crafted array-length prefix can make
-/// the kafka-protocol body decoders `with_capacity` gigabytes and *abort* the process (SIGABRT,
-/// not an unwind) — tracked as AUDIT-2026-06 SEC-9 and fixed separately.
+/// NOTE: catch_unwind only contains *unwinding* panics, not allocation aborts. A crafted
+/// array-length prefix used to make the kafka-protocol body decoders `with_capacity` gigabytes and
+/// *abort* the process (SIGABRT) — AUDIT-2026-06 SEC-9. That is fixed by capping the decoder's
+/// pre-allocation in a patched kafka-protocol (see Cargo.toml `[patch.crates-io]`); the
+/// `fuzz_parse_request_*` and `test_fetch_huge_topics_array_*` tests guard against regressions.
 pub fn parse_request(
     frame: BytesMut,
     response_tx: tokio::sync::mpsc::UnboundedSender<super::super::messages::KafkaResponse>,
@@ -1618,14 +1620,59 @@ mod tests {
         tokio::sync::mpsc::unbounded_channel()
     }
 
-    // NOTE: a full-pipeline `parse_request` fuzz harness is deliberately NOT added here yet.
-    // It surfaced AUDIT-2026-06 SEC-9: the kafka-protocol crate's body decoders call
-    // `Vec::with_capacity` on an attacker-controlled array-length prefix, so a crafted request
-    // (e.g. a Fetch with a huge topics_len) triggers a multi-GB allocation that *aborts* the
-    // process (SIGABRT). That is an allocation failure, not an unwind, so the catch_unwind in
-    // parse_request cannot contain it. The fuzz harness is restored once SEC-9 is fixed (a
-    // pre-decode array-length bound / crate upgrade). SEC-2's catch_unwind is still exercised
-    // by the empty/truncated-header tests above, which hit the (unwinding) header-decode panic.
+    #[test]
+    fn test_fetch_huge_topics_array_does_not_oom_abort() {
+        // SEC-9 regression: a Fetch request declaring a ~2.1-billion-entry topics array must NOT
+        // make the decoder pre-allocate gigabytes and abort the process. With the patched
+        // kafka-protocol decoder (capped Array prealloc, see Cargo.toml [patch.crates-io]) this
+        // decodes to a graceful error. WITHOUT the patch this test aborts the test binary — an
+        // allocation failure that catch_unwind cannot contain — so it is a true before/after proof.
+        let (tx, _rx) = create_test_channel();
+        let mut buf = BytesMut::new();
+        // Request header v1 (non-flexible): api_key=Fetch, api_version=0, correlation_id, null client_id.
+        buf.put_i16(API_KEY_FETCH);
+        buf.put_i16(0);
+        buf.put_i32(123);
+        buf.put_i16(-1);
+        // FetchRequest v0 body: replica_id, max_wait_ms, min_bytes, then the topics array count.
+        buf.put_i32(-1);
+        buf.put_i32(0);
+        buf.put_i32(0);
+        buf.put_i32(i32::MAX); // topics array length = 2,147,483,647, with no entries following
+        let _ = parse_request(buf, tx); // must return (Ok/Err) without aborting
+    }
+
+    // SEC-9 regression: full-pipeline fuzzing. This harness is what originally surfaced SEC-9 (a
+    // Fetch with a huge topics_len aborted the process inside the kafka-protocol decoder). With the
+    // capped-prealloc patch it must now complete for every input — Ok or Err, but never an abort or
+    // an unwinding panic. Arbitrary bytes plus header-seeded bodies drive the per-API decoders.
+    proptest::proptest! {
+        #[test]
+        fn fuzz_parse_request_never_panics(
+            data in proptest::collection::vec(proptest::num::u8::ANY, 0..1024)
+        ) {
+            let (tx, _rx) = create_test_channel();
+            let buf = BytesMut::from(&data[..]);
+            let _ = parse_request(buf, tx);
+        }
+
+        #[test]
+        fn fuzz_parse_request_with_header_never_panics(
+            api_key in 0i16..75,
+            api_version in 0i16..16,
+            correlation_id in proptest::num::i32::ANY,
+            body in proptest::collection::vec(proptest::num::u8::ANY, 0..512),
+        ) {
+            let (tx, _rx) = create_test_channel();
+            let mut buf = BytesMut::new();
+            buf.put_i16(api_key);
+            buf.put_i16(api_version);
+            buf.put_i32(correlation_id);
+            buf.put_i16(-1); // null client_id
+            buf.extend_from_slice(&body);
+            let _ = parse_request(buf, tx);
+        }
+    }
 
     // ========== ApiVersions Request Tests ==========
 
