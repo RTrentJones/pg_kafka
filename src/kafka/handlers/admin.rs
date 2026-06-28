@@ -26,6 +26,25 @@ use crate::kafka::error::Result;
 use crate::kafka::handler_context::HandlerContext;
 use crate::kafka::messages::{CreatePartitionsTopicRequest, CreateTopicRequest};
 
+/// Validate a topic name against Kafka's rules (mirrors `Topic.validate` in Apache Kafka):
+/// non-empty, not "." or "..", at most 249 characters, and only `[a-zA-Z0-9._-]`. (CONF-4)
+fn validate_topic_name(name: &str) -> std::result::Result<(), &'static str> {
+    if name.is_empty() {
+        return Err("Topic name cannot be empty");
+    }
+    if name == "." || name == ".." {
+        return Err("Topic name cannot be \".\" or \"..\"");
+    }
+    if name.len() > 249 {
+        return Err("Topic name cannot be longer than 249 characters");
+    }
+    let allowed = |c: char| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-';
+    if !name.chars().all(allowed) {
+        return Err("Topic name may only contain ASCII alphanumerics, '.', '_', and '-'");
+    }
+    Ok(())
+}
+
 /// Handle CreateTopics request
 ///
 /// Creates topics with the specified configuration. Topics that already exist
@@ -42,10 +61,10 @@ pub fn handle_create_topics(
         let mut result = CreatableTopicResult::default();
         result.name = TopicName(StrBytes::from_string(topic.name.clone()));
 
-        // Validate topic name
-        if topic.name.is_empty() {
+        // Validate topic name (CONF-4: length, charset, and "."/".." in addition to empty).
+        if let Err(msg) = validate_topic_name(&topic.name) {
             result.error_code = ERROR_INVALID_TOPIC_EXCEPTION;
-            result.error_message = Some(StrBytes::from_static_str("Topic name cannot be empty"));
+            result.error_message = Some(StrBytes::from_static_str(msg));
             results.push(result);
             continue;
         }
@@ -203,8 +222,13 @@ pub fn handle_create_partitions(
                         current_count, topic.count
                     )));
                 } else if topic.count == current_count {
-                    // No change needed
-                    result.error_code = ERROR_NONE;
+                    // CONF-4: Kafka rejects a no-op partition count as INVALID_PARTITIONS
+                    // ("Topic already has N partitions") rather than silently succeeding.
+                    result.error_code = ERROR_INVALID_PARTITIONS;
+                    result.error_message = Some(StrBytes::from_string(format!(
+                        "Topic already has {} partitions",
+                        current_count
+                    )));
                 } else if validate_only {
                     // Validation passed
                     result.error_code = ERROR_NONE;
@@ -494,5 +518,43 @@ mod tests {
 
         let response = result.unwrap();
         assert_eq!(response.results[0].error_code, ERROR_INVALID_PARTITIONS);
+    }
+
+    #[test]
+    fn test_create_partitions_no_op_rejected() {
+        // CONF-4: increasing to the current count is a no-op and must be rejected with
+        // INVALID_PARTITIONS, not silently succeed.
+        let mut store = MockKafkaStore::new();
+        store
+            .expect_get_topic_partition_count()
+            .returning(|_| Ok(Some(3)));
+
+        let topics = vec![CreatePartitionsTopicRequest {
+            name: "test-topic".to_string(),
+            count: 3, // Same as current
+        }];
+
+        let coordinator = crate::kafka::GroupCoordinator::new();
+        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = make_test_context(&store, &coordinator, &broker);
+        let result = handle_create_partitions(&ctx, topics, false);
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap().results[0].error_code,
+            ERROR_INVALID_PARTITIONS
+        );
+    }
+
+    #[test]
+    fn test_validate_topic_name() {
+        // CONF-4: name validation mirrors Apache Kafka's Topic.validate.
+        assert!(validate_topic_name("valid.topic_name-1").is_ok());
+        assert!(validate_topic_name(&"x".repeat(249)).is_ok());
+        assert!(validate_topic_name("").is_err());
+        assert!(validate_topic_name(".").is_err());
+        assert!(validate_topic_name("..").is_err());
+        assert!(validate_topic_name("has space").is_err());
+        assert!(validate_topic_name("bad/slash").is_err());
+        assert!(validate_topic_name(&"x".repeat(250)).is_err());
     }
 }
