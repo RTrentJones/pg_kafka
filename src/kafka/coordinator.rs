@@ -190,11 +190,17 @@ impl ConsumerGroup {
             group_instance_id,
         };
 
-        // First member becomes leader
-        let is_leader = self.members.is_empty();
-        if is_leader {
+        // The first member to join an empty group becomes the leader; an existing leader
+        // rejoining (e.g. during a rebalance) is still the leader. BUG-9: the old check
+        // `self.members.is_empty()` reported a rejoining leader as a non-leader with an empty
+        // member list — it only "worked" because SyncGroup recomputes assignments server-side,
+        // so a client doing real client-side assignment would mis-assign / rebalance-loop.
+        let is_leader = if self.leader.is_none() {
             self.leader = Some(member_id.clone());
-        }
+            true
+        } else {
+            self.leader.as_deref() == Some(member_id.as_str())
+        };
 
         self.members.insert(member_id.clone(), member);
 
@@ -1035,6 +1041,61 @@ mod tests {
     }
 
     // ===== Phase 5: Automatic Rebalancing Tests =====
+
+    #[test]
+    fn test_rejoining_leader_remains_leader() {
+        // BUG-9: a leader rejoining the group (e.g. during a rebalance) must still report
+        // is_leader=true, not be demoted to a non-leader with an empty member list.
+        let coordinator = GroupCoordinator::new();
+        let (leader, _, leader_is_leader, ..) = coordinator
+            .join_group(
+                "bug9-group".to_string(),
+                None,
+                "client-1".to_string(),
+                "localhost".to_string(),
+                30000,
+                60000,
+                "consumer".to_string(),
+                vec![("range".to_string(), vec![])],
+                None,
+            )
+            .unwrap();
+        assert!(leader_is_leader, "first member should be the leader");
+
+        let (_m2, _, m2_is_leader, ..) = coordinator
+            .join_group(
+                "bug9-group".to_string(),
+                None,
+                "client-2".to_string(),
+                "localhost".to_string(),
+                30000,
+                60000,
+                "consumer".to_string(),
+                vec![("range".to_string(), vec![])],
+                None,
+            )
+            .unwrap();
+        assert!(!m2_is_leader, "second member should not be the leader");
+
+        // The leader rejoins the generation started by member 2's join.
+        let (_, _, rejoined_is_leader, ..) = coordinator
+            .join_group(
+                "bug9-group".to_string(),
+                Some(leader.clone()),
+                "client-1".to_string(),
+                "localhost".to_string(),
+                30000,
+                60000,
+                "consumer".to_string(),
+                vec![("range".to_string(), vec![])],
+                None,
+            )
+            .unwrap();
+        assert!(
+            rejoined_is_leader,
+            "a rejoining leader must remain the leader (BUG-9)"
+        );
+    }
 
     #[test]
     fn test_leave_group_triggers_rebalance_with_remaining_members() {
