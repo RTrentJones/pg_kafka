@@ -250,6 +250,13 @@ pub async fn run(
         run_shadow_forwarder(forward_rx, runtime_context_for_forwarder).await;
     });
 
+    // SEC-3: bound concurrent client connections to prevent fd/memory exhaustion. Each
+    // connection task can buffer up to one MAX_REQUEST_SIZE frame, so unbounded connections
+    // are a DoS vector. A permit is held for the connection's lifetime and freed on close.
+    let conn_limiter = Arc::new(tokio::sync::Semaphore::new(
+        crate::kafka::constants::MAX_CONNECTIONS,
+    ));
+
     // Accept loop: wait for new connections OR shutdown signal
     loop {
         // Check for shutdown signal (non-blocking)
@@ -273,6 +280,24 @@ pub async fn run(
 
         match accept_result {
             Ok(Ok((socket, addr))) => {
+                // SEC-3: enforce the concurrent-connection cap. try_acquire is non-blocking so
+                // the accept loop keeps servicing shutdown checks; at the cap we close the new
+                // socket rather than buffer an unbounded number of connections.
+                let permit = match Arc::clone(&conn_limiter).try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        if log_connections {
+                            warn!(
+                                "Connection limit ({}) reached; rejecting {}",
+                                crate::kafka::constants::MAX_CONNECTIONS,
+                                addr
+                            );
+                        }
+                        drop(socket);
+                        continue;
+                    }
+                };
+
                 // Log connections if enabled
                 if log_connections {
                     info!("Kafka client connected from {}", addr);
@@ -288,6 +313,9 @@ pub async fn run(
                 // Spawn a new async task to handle this connection
                 // Use tokio::spawn (not spawn_local) since we're in multi-thread runtime
                 tokio::spawn(async move {
+                    // Hold the connection permit for the task's lifetime; dropping it on exit
+                    // frees a slot for a new connection (SEC-3).
+                    let _permit = permit;
                     if let Err(e) = handle_connection(
                         socket,
                         conn_request_tx,

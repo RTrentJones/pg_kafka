@@ -835,7 +835,11 @@ pub fn process_request(
                                                     partition_id,
                                                     high_watermark: hwm,
                                                 };
-                                            let _ = notify_tx.send(notification);
+                                            // SEC-4: try_send (non-blocking) so a full notify
+                                            // channel can't stall the single DB thread; dropped
+                                            // notifications are acceptable (fetch falls back to
+                                            // polling).
+                                            let _ = notify_tx.try_send(notification);
                                         }
                                     }
                                 }
@@ -893,7 +897,8 @@ pub fn process_request(
                                                 partition_id,
                                                 high_watermark: hwm,
                                             };
-                                        let _ = notify_tx.send(notification);
+                                        // SEC-4: non-blocking try_send (see the other notify site).
+                                        let _ = notify_tx.try_send(notification);
                                     }
                                 }
                             }
