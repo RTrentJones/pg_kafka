@@ -21,6 +21,7 @@
 
 use bytes::{Buf, BufMut};
 
+use crate::kafka::constants::MAX_PREALLOC_ELEMENTS;
 use crate::kafka::error::{KafkaError, Result};
 
 /// Consumer subscription metadata from JoinGroup request
@@ -84,7 +85,10 @@ impl MemberSubscription {
             });
         }
 
-        let mut topics = Vec::with_capacity(topics_len as usize);
+        // Cap the pre-allocation hint: `topics_len` is attacker-controlled, so never
+        // pre-allocate the claimed count directly (memory-exhaustion DoS). The loop below
+        // bounds-checks every element, so an honestly-large array still parses correctly.
+        let mut topics = Vec::with_capacity((topics_len as usize).min(MAX_PREALLOC_ELEMENTS));
         for _ in 0..topics_len {
             // Check we have enough for string length
             if buf.remaining() < 2 {

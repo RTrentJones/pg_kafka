@@ -195,26 +195,35 @@ fn parse_message_set_legacy(
         let _offset = buf.get_i64(); // Ignore offset (we assign our own)
         let message_size = buf.get_i32();
 
-        if message_size < 0 || buf.remaining() < message_size as usize {
+        // A Message is at minimum CRC(4) + magic(1) + attributes(1) = 6 bytes, and must not
+        // exceed what remains in the buffer. Without the `>= 6` floor a crafted size in
+        // 0..=5 passes this guard, then the unconditional 6-byte header read below underflows
+        // the buffer and panics — a remotely-triggerable DoS on the untrusted network path.
+        if message_size < 6 || buf.remaining() < message_size as usize {
             warn!("Invalid message size in MessageSet: {}", message_size);
             break;
         }
 
-        // Parse the Message struct
-        let _crc = buf.get_u32(); // Skip CRC validation for now
-        let _magic = buf.get_i8();
-        let _attributes = buf.get_i8(); // Compression, timestamp type
+        // Carve out exactly this message so every read below is bounded by `message_size`.
+        // copy_to_bytes won't panic here because `buf.remaining() >= message_size` was checked.
+        let mut msg = buf.copy_to_bytes(message_size as usize);
 
-        // Parse key (nullable bytes)
-        let key = if buf.remaining() < 4 {
+        // Message header: CRC(4) + magic(1) + attributes(1). The `message_size >= 6` guard
+        // guarantees these reads stay within `msg`.
+        let _crc = msg.get_u32(); // CRC validation deferred — see BUG-2 in docs/AUDIT-2026-06.md
+        let _magic = msg.get_i8();
+        let _attributes = msg.get_i8(); // Compression, timestamp type
+
+        // Parse key (nullable bytes), bounded by the message frame.
+        let key = if msg.remaining() < 4 {
             None
         } else {
-            let key_len = buf.get_i32();
+            let key_len = msg.get_i32();
             if key_len < 0 {
                 None
-            } else if buf.remaining() >= key_len as usize {
+            } else if msg.remaining() >= key_len as usize {
                 let mut key_bytes = vec![0u8; key_len as usize];
-                buf.copy_to_slice(&mut key_bytes);
+                msg.copy_to_slice(&mut key_bytes);
                 Some(key_bytes)
             } else {
                 warn!("Insufficient bytes for key");
@@ -222,16 +231,16 @@ fn parse_message_set_legacy(
             }
         };
 
-        // Parse value (nullable bytes)
-        let value = if buf.remaining() < 4 {
+        // Parse value (nullable bytes), bounded by the message frame.
+        let value = if msg.remaining() < 4 {
             None
         } else {
-            let value_len = buf.get_i32();
+            let value_len = msg.get_i32();
             if value_len < 0 {
                 None
-            } else if buf.remaining() >= value_len as usize {
+            } else if msg.remaining() >= value_len as usize {
                 let mut value_bytes = vec![0u8; value_len as usize];
-                buf.copy_to_slice(&mut value_bytes);
+                msg.copy_to_slice(&mut value_bytes);
                 Some(value_bytes)
             } else {
                 warn!("Insufficient bytes for value");
@@ -470,6 +479,53 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].key, Some(b"key".to_vec()));
         assert_eq!(records[0].value, Some(b"value".to_vec()));
+    }
+
+    #[test]
+    fn test_parse_message_set_tiny_message_size_no_panic() {
+        // SEC-1: a message_size in 0..=5 is below the 6-byte message-header floor and must be
+        // rejected, not read as a header. Before the fix this panicked on a get_u32 underflow.
+        for size in 0i32..=5 {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&0i64.to_be_bytes()); // offset
+            buf.extend_from_slice(&size.to_be_bytes()); // tiny message_size
+            let bytes = Bytes::from(buf);
+            let result = parse_message_set_legacy(&bytes, "test error");
+            assert!(result.is_err(), "size {} should yield Err, not panic", size);
+        }
+    }
+
+    #[test]
+    fn test_parse_message_set_size_exceeds_remaining_no_panic() {
+        // SEC-1: a message_size larger than the remaining buffer is rejected cleanly.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0i64.to_be_bytes());
+        buf.extend_from_slice(&1000i32.to_be_bytes()); // claims 1000 bytes
+        buf.extend_from_slice(&[0u8; 4]); // but only 4 follow
+        let bytes = Bytes::from(buf);
+        assert!(parse_message_set_legacy(&bytes, "test error").is_err());
+    }
+
+    proptest::proptest! {
+        // QA-2: fuzz the legacy MessageSet parser (our hand-rolled code) directly with
+        // [offset][size][maybe-body] framing — it must never panic (returns Ok or Err).
+        //
+        // NOTE: we do NOT fuzz the full `parse_record_batch` here, because its v2 path routes
+        // into kafka-protocol's `RecordBatchDecoder::decode`, which (like the request-body
+        // decoders, AUDIT-2026-06 SEC-9) can `with_capacity` an attacker-controlled count and
+        // *abort* the process on OOM — uncatchable by the test harness. Restore once SEC-9 lands.
+        #[test]
+        fn fuzz_parse_message_set_legacy_never_panics(
+            size in proptest::num::i32::ANY,
+            body in proptest::collection::vec(proptest::num::u8::ANY, 0..256),
+        ) {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&0i64.to_be_bytes());
+            buf.extend_from_slice(&size.to_be_bytes());
+            buf.extend_from_slice(&body);
+            let bytes = Bytes::from(buf);
+            let _ = parse_message_set_legacy(&bytes, "fuzz");
+        }
     }
 
     // ========== ParsedRecordBatch Tests ==========

@@ -32,7 +32,34 @@ use super::recordbatch::{parse_record_batch_with_metadata, ParsedRecordBatch};
 /// - client_id: nullable string (client identifier)
 ///
 /// Returns None if there's a parse error with error response already sent
+///
+/// SEC-2: this is the untrusted-input boundary. The `kafka-protocol` crate's header and body
+/// decoders index without bounds checks and PANIC on truncated/garbage frames rather than
+/// returning Err. Since this runs on the network thread (panic = "unwind"), the whole parse is
+/// wrapped in `catch_unwind` so a malformed frame degrades to a CorruptMessage error instead of
+/// unwinding the connection. See `test_parse_{empty,truncated}_header_returns_err_no_panic`.
+///
+/// NOTE: catch_unwind only contains *unwinding* panics. A crafted array-length prefix can make
+/// the kafka-protocol body decoders `with_capacity` gigabytes and *abort* the process (SIGABRT,
+/// not an unwind) — tracked as AUDIT-2026-06 SEC-9 and fixed separately.
 pub fn parse_request(
+    frame: BytesMut,
+    response_tx: tokio::sync::mpsc::UnboundedSender<super::super::messages::KafkaResponse>,
+) -> Result<Option<KafkaRequest>> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        parse_request_inner(frame, response_tx)
+    })) {
+        Ok(result) => result,
+        Err(_panic) => {
+            warn!("Panic while parsing request (malformed or truncated frame)");
+            Err(KafkaError::CorruptMessage {
+                message: "malformed request".into(),
+            })
+        }
+    }
+}
+
+fn parse_request_inner(
     frame: BytesMut,
     response_tx: tokio::sync::mpsc::UnboundedSender<super::super::messages::KafkaResponse>,
 ) -> Result<Option<KafkaRequest>> {
@@ -1591,6 +1618,15 @@ mod tests {
         tokio::sync::mpsc::unbounded_channel()
     }
 
+    // NOTE: a full-pipeline `parse_request` fuzz harness is deliberately NOT added here yet.
+    // It surfaced AUDIT-2026-06 SEC-9: the kafka-protocol crate's body decoders call
+    // `Vec::with_capacity` on an attacker-controlled array-length prefix, so a crafted request
+    // (e.g. a Fetch with a huge topics_len) triggers a multi-GB allocation that *aborts* the
+    // process (SIGABRT). That is an allocation failure, not an unwind, so the catch_unwind in
+    // parse_request cannot contain it. The fuzz harness is restored once SEC-9 is fixed (a
+    // pre-decode array-length bound / crate upgrade). SEC-2's catch_unwind is still exercised
+    // by the empty/truncated-header tests above, which hit the (unwinding) header-decode panic.
+
     // ========== ApiVersions Request Tests ==========
 
     #[test]
@@ -2563,35 +2599,34 @@ mod tests {
     // ========== Error Handling Tests ==========
 
     #[test]
-    fn test_parse_invalid_header_panics() {
-        // The kafka-protocol crate panics on invalid input (empty buffer)
-        // This test verifies that behavior using catch_unwind
-        use std::panic;
-
-        let result = panic::catch_unwind(|| {
-            let (tx, _rx) = create_test_channel();
-            let buf = BytesMut::new();
-            let _ = parse_request(buf, tx);
-        });
-
-        // Should panic on empty buffer
-        assert!(result.is_err(), "Expected panic on empty buffer");
+    fn test_parse_empty_header_returns_err_no_panic() {
+        // SEC-2: an empty frame must NOT panic the network thread. The header decode is
+        // wrapped in catch_unwind and degraded to a graceful CorruptMessage error. Calling
+        // parse_request directly (not inside catch_unwind) means a regression that lets the
+        // panic escape would fail this test by unwinding.
+        let (tx, _rx) = create_test_channel();
+        let buf = BytesMut::new();
+        let result = parse_request(buf, tx);
+        assert!(
+            result.is_err(),
+            "empty frame should be a graceful Err, got Ok({:?})",
+            result.as_ref().map(|o| o.is_some())
+        );
     }
 
     #[test]
-    fn test_parse_truncated_header_panics() {
-        // The kafka-protocol crate panics on truncated input
-        use std::panic;
-
-        let result = panic::catch_unwind(|| {
-            let (tx, _rx) = create_test_channel();
-            let mut buf = BytesMut::new();
-            buf.put_i16(0); // Just API key, no version/correlation_id
-            let _ = parse_request(buf, tx);
-        });
-
-        // Should panic on truncated header
-        assert!(result.is_err(), "Expected panic on truncated header");
+    fn test_parse_truncated_header_returns_err_no_panic() {
+        // SEC-2: a truncated header (api_key only, no version/correlation_id/client_id) must
+        // degrade to an Err rather than panic.
+        let (tx, _rx) = create_test_channel();
+        let mut buf = BytesMut::new();
+        buf.put_i16(0); // Just API key
+        let result = parse_request(buf, tx);
+        assert!(
+            result.is_err(),
+            "truncated header should be a graceful Err, got Ok({:?})",
+            result.as_ref().map(|o| o.is_some())
+        );
     }
 
     // ========== Correlation ID Preservation Tests ==========
