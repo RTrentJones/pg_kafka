@@ -82,3 +82,12 @@ panic = "unwind"
 opt-level = 3
 lto = "thin"  # "thin" provides most benefits of "fat" with smaller intermediate files
 codegen-units = 1
+
+# SEC-9 (AUDIT-2026-06): bound array pre-allocation in the Kafka wire decoders. The upstream
+# kafka-protocol 0.17.0 Array/CompactArray decoders call Vec::with_capacity on a length read
+# straight from the wire, so a single crafted request can declare a huge array length and trigger
+# a multi-GB allocation that *aborts the worker process* (an allocation failure, not an unwinding
+# panic, so parse_request's catch_unwind cannot contain it). This fork caps the capacity hint; the
+# Vec still grows for honest inputs. Fork: https://github.com/RTrentJones/kafka-protocol-rs
+[patch.crates-io]
+kafka-protocol = { git = "https://github.com/RTrentJones/kafka-protocol-rs", rev = "3e0e6a0c00afa69013a5b19976c4f7f7344e2d0e" }
