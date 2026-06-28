@@ -119,6 +119,10 @@ pub fn handle_offset_fetch(
     };
 
     let mut response_topics = Vec::new();
+    // BUG-6: track a top-level error so a fetch-all storage failure surfaces to the client as an
+    // error instead of a success response with no offsets (which a consumer reads as "no committed
+    // offsets" and may reset from).
+    let mut top_level_error = ERROR_NONE;
 
     if let Some(topic_list) = topics {
         // Fetch specific topics and partitions
@@ -226,7 +230,8 @@ pub fn handle_offset_fetch(
                 }
             }
             Err(e) => {
-                // Error - return empty response
+                // BUG-6: surface the storage failure to the client instead of swallowing it.
+                top_level_error = e.to_kafka_error_code();
                 crate::pg_warning!(
                     "Failed to fetch all offsets for group='{}': {}",
                     group_id,
@@ -239,8 +244,40 @@ pub fn handle_offset_fetch(
     // Build response
     let mut kafka_response = OffsetFetchResponse::default();
     kafka_response.throttle_time_ms = 0;
-    kafka_response.error_code = ERROR_NONE;
+    kafka_response.error_code = top_level_error;
     kafka_response.topics = response_topics;
 
     Ok(kafka_response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kafka::error::KafkaError;
+    use crate::testing::mocks::MockKafkaStore;
+
+    #[test]
+    fn test_offset_fetch_all_propagates_storage_error() {
+        // BUG-6: when fetch_all_offsets fails, the fetch-all OffsetFetch path used to log and
+        // return error_code = NONE with no topics — a consumer reads that as "no committed
+        // offsets" and may reset. It must surface the error instead.
+        let mut store = MockKafkaStore::new();
+        store
+            .expect_fetch_all_offsets()
+            .returning(|_| Err(KafkaError::database("boom")));
+
+        let coordinator = crate::kafka::GroupCoordinator::new();
+        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(
+            &store,
+            &coordinator,
+            &broker,
+            1,
+            kafka_protocol::records::Compression::None,
+        );
+
+        // topics = None selects the fetch-all path.
+        let resp = handle_offset_fetch(&ctx, "g".to_string(), None).unwrap();
+        assert_ne!(resp.error_code, ERROR_NONE);
+    }
 }
