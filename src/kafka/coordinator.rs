@@ -86,6 +86,12 @@ pub struct GroupMember {
 impl GroupMember {
     /// Check if member's session has timed out
     pub fn is_timed_out(&self) -> bool {
+        // CG-4: a non-positive session timeout is invalid. `self.session_timeout_ms as u128`
+        // would wrap a negative value to ~1.8e19 ms, making the member effectively immortal and
+        // never reaped. Treat an invalid timeout as already expired so the sweep removes it.
+        if self.session_timeout_ms <= 0 {
+            return true;
+        }
         let elapsed = self.last_heartbeat.elapsed();
         elapsed.as_millis() > self.session_timeout_ms as u128
     }
@@ -1095,6 +1101,38 @@ mod tests {
             rejoined_is_leader,
             "a rejoining leader must remain the leader (BUG-9)"
         );
+    }
+
+    #[test]
+    fn test_invalid_session_timeout_member_is_timed_out() {
+        // CG-4: a non-positive session_timeout_ms must not make a member immortal. The old
+        // `as u128` cast wrapped a negative value to ~1.8e19 ms; a freshly-heartbeated member
+        // with such a timeout is now reported timed-out immediately (deterministic, no waiting).
+        let member = GroupMember {
+            member_id: "m".to_string(),
+            client_id: "c".to_string(),
+            client_host: "localhost".to_string(),
+            session_timeout_ms: -1,
+            rebalance_timeout_ms: 60000,
+            protocol_type: "consumer".to_string(),
+            protocols: vec![],
+            assignment: None,
+            last_heartbeat: Instant::now(),
+            last_join_generation: 0,
+            group_instance_id: None,
+        };
+        assert!(
+            member.is_timed_out(),
+            "a negative session timeout must not make a member immortal"
+        );
+
+        // A valid, freshly-heartbeated member is not timed out.
+        let valid = GroupMember {
+            session_timeout_ms: 30_000,
+            last_heartbeat: Instant::now(),
+            ..member
+        };
+        assert!(!valid.is_timed_out());
     }
 
     #[test]

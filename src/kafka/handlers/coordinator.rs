@@ -298,7 +298,9 @@ pub fn handle_describe_groups(
     response.throttle_time_ms = 0;
 
     // Get coordinator state
-    let coordinator_groups = coordinator.groups.read().unwrap();
+    // CG-7: recover from a poisoned lock instead of panicking (which would crash the worker). A
+    // poisoned lock only means some writer panicked; the group map itself is still readable.
+    let coordinator_groups = coordinator.groups.read().unwrap_or_else(|e| e.into_inner());
 
     for group_id in groups {
         let mut described_group = DescribedGroup::default();
@@ -388,7 +390,9 @@ pub fn handle_list_groups(
     response.throttle_time_ms = 0;
 
     // Get coordinator state
-    let coordinator_groups = coordinator.groups.read().unwrap();
+    // CG-7: recover from a poisoned lock instead of panicking (which would crash the worker). A
+    // poisoned lock only means some writer panicked; the group map itself is still readable.
+    let coordinator_groups = coordinator.groups.read().unwrap_or_else(|e| e.into_inner());
 
     // Filter groups by state if requested (v4+)
     let filter_enabled = !states_filter.is_empty();
@@ -433,4 +437,37 @@ pub fn handle_list_groups(
     }
 
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::mocks::MockKafkaStore;
+
+    #[test]
+    fn test_describe_and_list_groups_recover_from_poisoned_lock() {
+        // CG-7: a poisoned groups lock (a writer panicked while holding it) must NOT crash
+        // DescribeGroups / ListGroups. They previously did `groups.read().unwrap()`, which panics
+        // on a poisoned lock; now they recover via into_inner(). This test poisons the lock and
+        // asserts both handlers still return Ok (it also covers the recovery closures).
+        let coordinator = crate::kafka::GroupCoordinator::new();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = coordinator.groups.write().unwrap();
+            panic!("intentionally poison the lock");
+        }));
+        assert!(coordinator.groups.is_poisoned(), "lock should be poisoned");
+
+        let store = MockKafkaStore::new();
+        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(
+            &store,
+            &coordinator,
+            &broker,
+            1,
+            kafka_protocol::records::Compression::None,
+        );
+
+        assert!(handle_describe_groups(&ctx, vec!["g".to_string()]).is_ok());
+        assert!(handle_list_groups(&ctx, vec![]).is_ok());
+    }
 }
