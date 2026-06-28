@@ -194,6 +194,19 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_huge_topics_len_does_not_oom() {
+        // SEC-6 regression: a tiny request can declare a huge topics array length. Before the
+        // `with_capacity(.. .min(MAX_PREALLOC_ELEMENTS))` cap, this pre-allocated
+        // ~2.1B * sizeof(String) up front and aborted the process (OOM). With the cap it must
+        // instead error gracefully after the per-element bounds check. If this test ever OOMs,
+        // the cap has regressed.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0i16.to_be_bytes()); // version
+        buf.extend_from_slice(&i32::MAX.to_be_bytes()); // topics_len = 2.1B, no data follows
+        assert!(MemberSubscription::parse(&buf).is_err());
+    }
+
+    #[test]
     fn test_parse_single_topic() {
         // version=0, topics=["test-topic"], user_data=null
         let mut bytes = Vec::new();

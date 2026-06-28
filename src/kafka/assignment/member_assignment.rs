@@ -265,6 +265,18 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_huge_topics_len_does_not_oom() {
+        // SEC-6 regression: before the `with_capacity(.. .min(MAX_PREALLOC_ELEMENTS))` cap, a
+        // huge topic_partitions array length pre-allocated a multi-GB HashMap up front and
+        // aborted the process. With the cap it must error gracefully instead. An OOM here means
+        // the cap regressed.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0i16.to_be_bytes()); // version
+        buf.extend_from_slice(&i32::MAX.to_be_bytes()); // topic_partitions len = 2.1B, no data follows
+        assert!(MemberAssignment::parse(&buf).is_err());
+    }
+
+    #[test]
     fn test_parse_single_topic() {
         // version=0, topics=[("test-topic", [0, 1, 2])], user_data=null
         let mut bytes = Vec::new();
