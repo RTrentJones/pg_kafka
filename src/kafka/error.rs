@@ -19,9 +19,10 @@ use thiserror::Error;
 use crate::kafka::constants::{
     ERROR_CONCURRENT_TRANSACTIONS, ERROR_COORDINATOR_NOT_AVAILABLE, ERROR_CORRUPT_MESSAGE,
     ERROR_DUPLICATE_SEQUENCE_NUMBER, ERROR_ILLEGAL_GENERATION, ERROR_INVALID_PARTITIONS,
-    ERROR_INVALID_TXN_STATE, ERROR_NOT_COORDINATOR, ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER,
+    ERROR_INVALID_TXN_STATE, ERROR_MESSAGE_TOO_LARGE, ERROR_NOT_COORDINATOR,
+    ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER,
     ERROR_PRODUCER_FENCED, ERROR_REBALANCE_IN_PROGRESS, ERROR_TRANSACTIONAL_ID_NOT_FOUND,
-    ERROR_TRANSACTION_TIMED_OUT, ERROR_UNKNOWN_MEMBER_ID, ERROR_UNKNOWN_PRODUCER_ID,
+    ERROR_UNKNOWN_MEMBER_ID, ERROR_UNKNOWN_PRODUCER_ID,
     ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION, ERROR_UNSUPPORTED_VERSION,
     MAX_REQUEST_SIZE,
 };
@@ -191,8 +192,11 @@ impl KafkaError {
     /// Every error variant maps to a specific Kafka error code.
     pub fn to_kafka_error_code(&self) -> i16 {
         match self {
-            // Request validation → CORRUPT_MESSAGE or UNSUPPORTED_VERSION
-            KafkaError::InvalidRequestSize { .. } => ERROR_CORRUPT_MESSAGE,
+            // Request validation → MESSAGE_TOO_LARGE / CORRUPT_MESSAGE / UNSUPPORTED_VERSION.
+            // CONF-8: an oversize request is MESSAGE_TOO_LARGE (10), not CORRUPT_MESSAGE — the
+            // bytes aren't corrupt, the frame just exceeds the configured maximum. A truncated
+            // frame (RequestTooShort) is genuinely corrupt and stays CORRUPT_MESSAGE.
+            KafkaError::InvalidRequestSize { .. } => ERROR_MESSAGE_TOO_LARGE,
             KafkaError::UnsupportedApiKey { .. } => ERROR_UNSUPPORTED_VERSION,
             KafkaError::UnsupportedApiVersion { .. } => ERROR_UNSUPPORTED_VERSION,
             KafkaError::RequestTooShort { .. } => ERROR_CORRUPT_MESSAGE,
@@ -220,7 +224,9 @@ impl KafkaError {
             KafkaError::TransactionalIdNotFound { .. } => ERROR_TRANSACTIONAL_ID_NOT_FOUND,
             KafkaError::InvalidTxnState { .. } => ERROR_INVALID_TXN_STATE,
             KafkaError::ConcurrentTransactions { .. } => ERROR_CONCURRENT_TRANSACTIONS,
-            KafkaError::TransactionTimedOut { .. } => ERROR_TRANSACTION_TIMED_OUT,
+            // Kafka has no TRANSACTION_TIMED_OUT code; a timed-out transaction is fenced by the
+            // coordinator, so the producer learns about it via PRODUCER_FENCED. (BUG-1)
+            KafkaError::TransactionTimedOut { .. } => ERROR_PRODUCER_FENCED,
 
             // Storage/Schema errors → UNKNOWN_SERVER_ERROR
             KafkaError::Database { .. } => ERROR_UNKNOWN_SERVER_ERROR,
@@ -542,6 +548,20 @@ mod tests {
     }
 
     #[test]
+    fn test_oversize_request_is_message_too_large() {
+        // CONF-8: an oversize frame maps to MESSAGE_TOO_LARGE (10), a truncated one to
+        // CORRUPT_MESSAGE (2).
+        let too_big = KafkaError::InvalidRequestSize { size: 200_000_000 };
+        assert_eq!(too_big.to_kafka_error_code(), ERROR_MESSAGE_TOO_LARGE);
+
+        let truncated = KafkaError::RequestTooShort {
+            expected: 100,
+            actual: 4,
+        };
+        assert_eq!(truncated.to_kafka_error_code(), ERROR_CORRUPT_MESSAGE);
+    }
+
+    #[test]
     fn test_transaction_errors() {
         // TransactionalIdNotFound
         let err = KafkaError::transactional_id_not_found("my-txn-id");
@@ -560,9 +580,9 @@ mod tests {
         let err = KafkaError::concurrent_transactions(12345);
         assert_eq!(err.to_kafka_error_code(), ERROR_CONCURRENT_TRANSACTIONS);
 
-        // TransactionTimedOut
+        // TransactionTimedOut → PRODUCER_FENCED (Kafka has no TRANSACTION_TIMED_OUT code; BUG-1)
         let err = KafkaError::transaction_timed_out("my-txn-id", 60000);
-        assert_eq!(err.to_kafka_error_code(), ERROR_TRANSACTION_TIMED_OUT);
+        assert_eq!(err.to_kafka_error_code(), ERROR_PRODUCER_FENCED);
         let msg = format!("{}", err);
         assert!(msg.contains("my-txn-id"));
         assert!(msg.contains("60000"));
@@ -675,7 +695,7 @@ mod tests {
         // Test error code mapping for each variant type
         assert_eq!(
             KafkaError::InvalidRequestSize { size: 1 }.to_kafka_error_code(),
-            ERROR_CORRUPT_MESSAGE
+            ERROR_MESSAGE_TOO_LARGE
         );
         assert_eq!(
             KafkaError::UnsupportedApiVersion {
