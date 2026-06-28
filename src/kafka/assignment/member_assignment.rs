@@ -272,8 +272,7 @@ mod tests {
         // the cap regressed.
         let mut buf = Vec::new();
         buf.extend_from_slice(&0i16.to_be_bytes()); // version
-        buf.extend_from_slice(&i32::MAX.to_be_bytes()); // topic_partitions len = 2,147,483,647
-        // No topic entries actually follow.
+        buf.extend_from_slice(&i32::MAX.to_be_bytes()); // topic_partitions len = 2.1B, no data follows
         assert!(MemberAssignment::parse(&buf).is_err());
     }
 
