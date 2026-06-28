@@ -146,6 +146,14 @@ pub const MAX_PORT: i32 = 65535;
 /// This limit prevents DoS attacks via extremely large requests
 pub const MAX_REQUEST_SIZE: i32 = 100_000_000;
 
+/// Maximum number of concurrent client connections.
+///
+/// Each accepted connection spawns a task that can buffer up to one `MAX_REQUEST_SIZE`
+/// frame, so unbounded connections are an fd/memory-exhaustion DoS vector (SEC-3). The
+/// accept loop holds a semaphore permit per live connection and rejects new connections
+/// once this cap is reached.
+pub const MAX_CONNECTIONS: usize = 1024;
+
 /// Maximum number of elements to pre-allocate from a wire-supplied array length.
 ///
 /// Array length prefixes in the wire protocol are attacker-controlled. Passing one
