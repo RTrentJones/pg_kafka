@@ -25,6 +25,7 @@ use std::collections::HashMap;
 
 use bytes::{Buf, BufMut};
 
+use crate::kafka::constants::MAX_PREALLOC_ELEMENTS;
 use crate::kafka::error::{KafkaError, Result};
 
 /// Partition assignment for a consumer member
@@ -111,7 +112,11 @@ impl MemberAssignment {
             });
         }
 
-        let mut topic_partitions = HashMap::with_capacity(topics_len as usize);
+        // Cap the pre-allocation hint: `topics_len` is attacker-controlled (see
+        // MAX_PREALLOC_ELEMENTS). The per-element bounds checks below still allow an
+        // honestly-large array to parse; only the up-front allocation is bounded.
+        let mut topic_partitions =
+            HashMap::with_capacity((topics_len as usize).min(MAX_PREALLOC_ELEMENTS));
 
         for _ in 0..topics_len {
             // Read topic name
@@ -169,7 +174,7 @@ impl MemberAssignment {
                 });
             }
 
-            let mut partitions = Vec::with_capacity(partitions_len);
+            let mut partitions = Vec::with_capacity(partitions_len.min(MAX_PREALLOC_ELEMENTS));
             for _ in 0..partitions_len {
                 partitions.push(buf.get_i32());
             }

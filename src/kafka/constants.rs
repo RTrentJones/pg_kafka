@@ -146,6 +146,16 @@ pub const MAX_PORT: i32 = 65535;
 /// This limit prevents DoS attacks via extremely large requests
 pub const MAX_REQUEST_SIZE: i32 = 100_000_000;
 
+/// Maximum number of elements to pre-allocate from a wire-supplied array length.
+///
+/// Array length prefixes in the wire protocol are attacker-controlled. Passing one
+/// straight to `Vec::with_capacity`/`HashMap::with_capacity` lets a tiny request claim a
+/// huge element count and force a multi-GB up-front allocation (memory-exhaustion DoS).
+/// We cap the *capacity hint* at this value; the collection still grows past it if the
+/// data genuinely contains more elements (each of which is bounds-checked as it is read),
+/// so correctness is preserved while the pre-allocation stays bounded.
+pub const MAX_PREALLOC_ELEMENTS: usize = 4096;
+
 /// Default graceful shutdown timeout (milliseconds)
 pub const DEFAULT_SHUTDOWN_TIMEOUT_MS: i32 = 5000;
 
