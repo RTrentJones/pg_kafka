@@ -293,6 +293,9 @@ pub const ERROR_UNKNOWN_SERVER_ERROR: i16 = -1;
 /// Corrupt message (invalid RecordBatch format)
 pub const ERROR_CORRUPT_MESSAGE: i16 = 2;
 
+/// Message too large (request exceeds the configured maximum size)
+pub const ERROR_MESSAGE_TOO_LARGE: i16 = 10;
+
 /// Unknown topic or partition
 pub const ERROR_UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
 
@@ -339,10 +342,10 @@ pub const ERROR_NON_EMPTY_GROUP: i16 = 68;
 pub const ERROR_DUPLICATE_SEQUENCE_NUMBER: i16 = 46;
 
 /// Out of order sequence number (gap in sequence)
-pub const ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER: i16 = 47;
+pub const ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER: i16 = 45;
 
 /// Producer fenced (epoch mismatch - newer producer took over)
-pub const ERROR_PRODUCER_FENCED: i16 = 91;
+pub const ERROR_PRODUCER_FENCED: i16 = 90;
 
 /// Unknown producer ID (producer ID not found)
 pub const ERROR_UNKNOWN_PRODUCER_ID: i16 = 59;
@@ -350,16 +353,17 @@ pub const ERROR_UNKNOWN_PRODUCER_ID: i16 = 59;
 // ===== Transaction Error Codes (Phase 10) =====
 
 /// Concurrent transactions (producer has another active transaction)
-pub const ERROR_CONCURRENT_TRANSACTIONS: i16 = 53;
+pub const ERROR_CONCURRENT_TRANSACTIONS: i16 = 51;
 
 /// Transactional ID not found
-pub const ERROR_TRANSACTIONAL_ID_NOT_FOUND: i16 = 79;
+pub const ERROR_TRANSACTIONAL_ID_NOT_FOUND: i16 = 105;
 
 /// Invalid transaction state (invalid state transition)
-pub const ERROR_INVALID_TXN_STATE: i16 = 90;
+pub const ERROR_INVALID_TXN_STATE: i16 = 48;
 
-/// Transaction timed out
-pub const ERROR_TRANSACTION_TIMED_OUT: i16 = 94;
+// NOTE: there is no "transaction timed out" code in the Kafka protocol — 94 is
+// INCONSISTENT_VOTER_SET. A server-side transaction timeout fences the producer, so the
+// internal TransactionTimedOut error maps to ERROR_PRODUCER_FENCED (see error.rs). (BUG-1)
 
 // ===== Compression =====
 
@@ -513,8 +517,19 @@ mod tests {
         assert_eq!(ERROR_UNKNOWN_SERVER_ERROR, -1);
         assert_eq!(ERROR_CORRUPT_MESSAGE, 2);
         assert_eq!(ERROR_UNKNOWN_TOPIC_OR_PARTITION, 3);
+        assert_eq!(ERROR_MESSAGE_TOO_LARGE, 10);
         assert_eq!(ERROR_UNSUPPORTED_VERSION, 35);
         assert_eq!(ERROR_INVALID_PARTITIONS, 37);
+
+        // Idempotent-producer and transaction codes — pinned to the canonical values in
+        // Apache Kafka's org.apache.kafka.common.protocol.Errors (BUG-1 in AUDIT-2026-06).
+        assert_eq!(ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER, 45);
+        assert_eq!(ERROR_DUPLICATE_SEQUENCE_NUMBER, 46);
+        assert_eq!(ERROR_INVALID_TXN_STATE, 48);
+        assert_eq!(ERROR_CONCURRENT_TRANSACTIONS, 51);
+        assert_eq!(ERROR_UNKNOWN_PRODUCER_ID, 59);
+        assert_eq!(ERROR_PRODUCER_FENCED, 90);
+        assert_eq!(ERROR_TRANSACTIONAL_ID_NOT_FOUND, 105);
     }
 
     #[test]
