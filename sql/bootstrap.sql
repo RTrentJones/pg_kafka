@@ -55,6 +55,20 @@ CREATE INDEX idx_messages_txn_pending
 ON kafka.messages(topic_id, partition_id, partition_offset)
 WHERE txn_state = 'pending';
 
+-- Per-partition monotonic offset counter (BUG-3, AUDIT-2026-06): the next partition_offset to
+-- assign for each (topic, partition). Producers advance it under the per-partition advisory lock
+-- and it is NEVER decremented, so deleting the highest (aborted) rows in cleanup_aborted_messages
+-- cannot lower the next offset and reuse offsets — they stay strictly increasing for the life of
+-- the partition. A missing row is seeded from MAX(partition_offset)+1 on first use, so existing
+-- data is respected.
+CREATE TABLE IF NOT EXISTS kafka.partition_offsets (
+    topic_id INT NOT NULL,
+    partition_id INT NOT NULL,
+    next_offset BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY (topic_id, partition_id),
+    FOREIGN KEY (topic_id) REFERENCES kafka.topics(id) ON DELETE CASCADE
+);
+
 -- Consumer offsets table: Track committed offsets per consumer group
 -- Phase 3: Consumer support
 CREATE TABLE kafka.consumer_offsets (

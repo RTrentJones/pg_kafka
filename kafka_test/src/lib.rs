@@ -83,8 +83,8 @@ pub use consumer_group::{
 };
 pub use offset_management::{
     test_fetch_offset_new_group, test_offset_boundaries, test_offset_commit_fetch,
-    test_offset_commit_multi_partition, test_offset_commit_with_metadata, test_offset_reset_policy,
-    test_offset_seek,
+    test_offset_commit_multi_partition, test_offset_commit_with_metadata,
+    test_offset_no_reuse_after_cleanup, test_offset_reset_policy, test_offset_seek,
 };
 pub use partition::{
     test_empty_vs_null_key_routing, test_key_distribution, test_key_routing_across_producers,

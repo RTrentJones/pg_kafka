@@ -198,6 +198,7 @@ use kafka_test::{
     test_offset_commit_multi_partition,
     test_offset_commit_race,
     test_offset_commit_with_metadata,
+    test_offset_no_reuse_after_cleanup,
     test_offset_reset_policy,
     test_offset_seek,
     test_offset_zero_boundary,
@@ -481,6 +482,12 @@ fn get_all_tests() -> Vec<TestDef> {
             category: "offset_management",
             name: "test_offset_boundaries",
             test_fn: wrap_test!(test_offset_boundaries),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "offset_management",
+            name: "test_offset_no_reuse_after_cleanup",
+            test_fn: wrap_test!(test_offset_no_reuse_after_cleanup),
             parallel_safe: true,
         },
         // Offset management edge case tests
