@@ -321,7 +321,7 @@ mod tests {
         let broker = BrokerMetadata::new("localhost".to_string(), 9092);
         let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
 
-        let response = metadata::handle_metadata(&ctx, None).unwrap();
+        let response = metadata::handle_metadata(&ctx, None, true).unwrap();
 
         assert_eq!(response.topics.len(), 2);
         assert_eq!(response.brokers.len(), 1);
@@ -344,9 +344,30 @@ mod tests {
         let broker = BrokerMetadata::new("localhost".to_string(), 9092);
         let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
 
-        let response = metadata::handle_metadata(&ctx, Some(vec!["my-topic".to_string()])).unwrap();
+        let response =
+            metadata::handle_metadata(&ctx, Some(vec!["my-topic".to_string()]), true).unwrap();
 
         assert_eq!(response.topics.len(), 1);
+    }
+
+    #[test]
+    fn test_handle_metadata_no_auto_create_missing_topic() {
+        // CONF-2: with allow_auto_topic_creation = false, a missing requested topic must be reported
+        // as UNKNOWN_TOPIC_OR_PARTITION and NOT created. Not setting expect_get_or_create_topic means
+        // the mock panics if the handler tries to create — proving the no-create contract.
+        let mut mock = MockKafkaStore::new();
+        mock.expect_get_topic_metadata().returning(|_| Ok(vec![])); // topic doesn't exist
+
+        let coordinator = GroupCoordinator::new();
+        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+
+        let response =
+            metadata::handle_metadata(&ctx, Some(vec!["missing".to_string()]), false).unwrap();
+
+        assert_eq!(response.topics.len(), 1);
+        assert_eq!(response.topics[0].error_code, ERROR_UNKNOWN_TOPIC_OR_PARTITION);
+        assert!(response.topics[0].partitions.is_empty());
     }
 
     // ========== OffsetCommit Handler Tests ==========
