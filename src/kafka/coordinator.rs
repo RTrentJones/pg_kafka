@@ -217,8 +217,8 @@ impl ConsumerGroup {
     /// generation. Called after joins and after member removals: a rebalance
     /// can also become completable when the last straggler leaves or times out.
     ///
-    /// The chosen protocol is the leader's first advertised strategy
-    /// (simplified selection; see select_common_strategy for the general case).
+    /// The chosen protocol is the most-preferred strategy supported by every member
+    /// (see `select_group_protocol`).
     fn maybe_complete_join(&mut self) {
         if self.state != GroupState::PreparingRebalance || self.members.is_empty() {
             return;
@@ -232,16 +232,34 @@ impl ConsumerGroup {
             return;
         }
 
-        let protocol = self
+        if let Some(protocol) = self.select_group_protocol() {
+            self.complete_join(protocol);
+        }
+    }
+
+    /// CG-1: choose the group protocol as the most-preferred strategy supported by EVERY member
+    /// (Kafka's common-protocol rule), walking the leader's preference order. The previous code took
+    /// the leader's first advertised strategy outright, so a follower that didn't support it would be
+    /// handed a server-computed assignment for a strategy it never asked for. Falls back to the
+    /// leader's first advertised strategy only when the members share none (non-conformant clients).
+    fn select_group_protocol(&self) -> Option<String> {
+        let leader = self
             .leader
             .as_ref()
             .and_then(|l| self.members.get(l))
-            .or_else(|| self.members.values().next())
-            .and_then(|m| m.protocols.first().map(|(name, _)| name.clone()));
+            .or_else(|| self.members.values().next())?;
 
-        if let Some(protocol) = protocol {
-            self.complete_join(protocol);
+        for (name, _) in &leader.protocols {
+            let supported_by_all = self
+                .members
+                .values()
+                .all(|m| m.protocols.iter().any(|(n, _)| n == name));
+            if supported_by_all {
+                return Some(name.clone());
+            }
         }
+
+        leader.protocols.first().map(|(name, _)| name.clone())
     }
 
     /// Remove a member from the group
@@ -1385,6 +1403,66 @@ mod tests {
             .expect("group-1 should exist");
         assert_eq!(g1.state, GroupState::Empty);
         assert!(g1.members.is_empty());
+    }
+
+    #[test]
+    fn test_join_selects_strategy_common_to_all_members() {
+        // CG-1: the group protocol must be a strategy supported by EVERY member, not just the
+        // leader's first advertised preference.
+        let coordinator = GroupCoordinator::new();
+
+        // Leader c1 prefers "sticky" then "range"; c2 supports only "range".
+        let (leader, ..) = coordinator
+            .join_group(
+                "g".to_string(),
+                None,
+                "c1".to_string(),
+                "h".to_string(),
+                300_000,
+                300_000,
+                "consumer".to_string(),
+                vec![
+                    ("sticky".to_string(), vec![]),
+                    ("range".to_string(), vec![]),
+                ],
+                None,
+            )
+            .unwrap();
+        coordinator
+            .join_group(
+                "g".to_string(),
+                None,
+                "c2".to_string(),
+                "h".to_string(),
+                300_000,
+                300_000,
+                "consumer".to_string(),
+                vec![("range".to_string(), vec![])],
+                None,
+            )
+            .unwrap();
+        // Leader rejoins the new generation so the join phase completes and the protocol is chosen.
+        coordinator
+            .join_group(
+                "g".to_string(),
+                Some(leader),
+                "c1".to_string(),
+                "h".to_string(),
+                300_000,
+                300_000,
+                "consumer".to_string(),
+                vec![
+                    ("sticky".to_string(), vec![]),
+                    ("range".to_string(), vec![]),
+                ],
+                None,
+            )
+            .unwrap();
+
+        // "sticky" is the leader's first preference, but c2 doesn't support it; the only strategy
+        // common to both is "range", so that must be selected.
+        let g = coordinator.get_group_state("g").expect("group exists");
+        assert_eq!(g.protocol_name.as_deref(), Some("range"));
     }
 
     #[test]
