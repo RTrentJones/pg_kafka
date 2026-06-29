@@ -24,6 +24,10 @@ pub enum InternalNotification {
     /// Sent after a successful ProduceRequest to wake any consumers
     /// waiting on FetchRequest for this topic-partition.
     NewMessages {
+        /// The topic name (as the client sees it). QA-5: the long-poll registry is keyed by topic
+        /// name because the FetchRequest handler on the network thread only has the topic name, not
+        /// the internal topic ID.
+        topic_name: String,
         /// The topic ID (from kafka.topics table)
         topic_id: i32,
         /// The partition ID

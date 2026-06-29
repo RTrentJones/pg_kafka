@@ -872,6 +872,7 @@ pub fn process_request(
                                         {
                                             let notification =
                                                 crate::kafka::InternalNotification::NewMessages {
+                                                    topic_name: topic_name.to_string(),
                                                     topic_id,
                                                     partition_id,
                                                     high_watermark: hwm,
@@ -932,6 +933,7 @@ pub fn process_request(
                                     {
                                         let notification =
                                             crate::kafka::InternalNotification::NewMessages {
+                                                topic_name: topic_name.to_string(),
                                                 topic_id,
                                                 partition_id,
                                                 high_watermark: hwm,
@@ -1802,6 +1804,7 @@ mod tests {
         // draining it, so a blocking send on the second call would hang this test forever.
         let (tx, _rx) = crossbeam_channel::bounded::<InternalNotification>(1);
         let make = |topic_id| InternalNotification::NewMessages {
+            topic_name: String::new(),
             topic_id,
             partition_id: 0,
             high_watermark: 0,

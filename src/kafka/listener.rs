@@ -225,16 +225,17 @@ pub async fn run(
             match result {
                 Ok(Ok(notification)) => match notification {
                     InternalNotification::NewMessages {
+                        topic_name,
                         topic_id,
                         partition_id,
                         high_watermark,
                     } => {
                         debug!(
-                            "Notification: new messages for topic_id={}, partition_id={}, hwm={}",
-                            topic_id, partition_id, high_watermark
+                            "Notification: new messages for topic={} (id={}), partition_id={}, hwm={}",
+                            topic_name, topic_id, partition_id, high_watermark
                         );
                         registry_for_notifier
-                            .notify_new_data(topic_id, partition_id, high_watermark)
+                            .notify_new_data(&topic_name, partition_id, high_watermark)
                             .await;
                     }
                 },
@@ -595,7 +596,7 @@ async fn handle_fetch_long_poll(
     topic_data: Vec<TopicFetchData>,
     request_tx: Sender<KafkaRequest>,
     final_response_tx: UnboundedSender<KafkaResponse>,
-    _registry: Arc<PendingFetchRegistry>,
+    registry: Arc<PendingFetchRegistry>,
     poll_interval_ms: i32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let deadline = Instant::now() + Duration::from_millis(max_wait_ms as u64);
@@ -656,27 +657,48 @@ async fn handle_fetch_long_poll(
             return Ok(());
         }
 
-        // Not enough data and not timed out - register and wait
-        // Note: We use a simplified approach where we just wait for the poll interval
-        // rather than registering for every topic-partition. This is because we don't
-        // have topic_id (only topic_name) in the request - we'd need to resolve it.
-        // The fallback poll interval still provides the correctness guarantee.
+        // Not enough data and not timed out. QA-5: register every requested topic-partition on one
+        // shared Notify, then wait for either a produce notification (low latency) or the poll
+        // interval. The poll interval is retained as a correctness fallback — if a wake-up is ever
+        // missed (e.g. a produce lands in the brief window between this fetch and registration), the
+        // behaviour degrades to exactly the previous fixed-interval polling rather than stalling.
         let wait_time = remaining.min(poll_interval);
+        let notify = Arc::new(tokio::sync::Notify::new());
+        for topic in &topic_data {
+            for partition in &topic.partitions {
+                registry
+                    .register(
+                        &topic.name,
+                        partition.partition_index,
+                        partition.fetch_offset,
+                        notify.clone(),
+                    )
+                    .await;
+            }
+        }
 
         debug!(
-            "Long poll: waiting {:?} for more data (remaining: {:?})",
+            "Long poll: waiting up to {:?} for new-data notification (remaining: {:?})",
             wait_time, remaining
         );
 
-        // For now, just sleep. In a more sophisticated implementation, we would:
-        // 1. Resolve topic names to topic IDs
-        // 2. Register with the registry for each topic-partition
-        // 3. Use tokio::select! to wait on either notification or timeout
-        // 4. Unregister after waking up
-        //
-        // The current implementation relies on the poll interval for wakeup,
-        // which is correct but slightly less efficient than notification-based wakeup.
-        tokio::time::sleep(wait_time).await;
+        tokio::select! {
+            _ = notify.notified() => {
+                debug!("Long poll: woken by new-data notification");
+            }
+            _ = tokio::time::sleep(wait_time) => {
+                debug!("Long poll: poll interval elapsed, re-fetching");
+            }
+        }
+
+        // Clean up our registrations before the next iteration (or return).
+        for topic in &topic_data {
+            for partition in &topic.partitions {
+                registry
+                    .unregister(&topic.name, partition.partition_index, &notify)
+                    .await;
+            }
+        }
     }
 }
 

@@ -21,17 +21,22 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Notify, RwLock};
 
-/// Key for identifying a topic-partition
+/// Key for identifying a topic-partition.
+///
+/// QA-5: keyed by topic **name** (not the internal topic ID) because the FetchRequest handler on
+/// the network thread only has the client-supplied topic name; resolving it to an ID would require
+/// an SPI round-trip on the DB thread. The produce path already has the name, so it travels with the
+/// notification (`InternalNotification::NewMessages.topic_name`).
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct TopicPartitionKey {
-    pub topic_id: i32,
+    pub topic_name: String,
     pub partition_id: i32,
 }
 
 impl TopicPartitionKey {
-    pub fn new(topic_id: i32, partition_id: i32) -> Self {
+    pub fn new(topic_name: &str, partition_id: i32) -> Self {
         Self {
-            topic_id,
+            topic_name: topic_name.to_string(),
             partition_id,
         }
     }
@@ -75,36 +80,34 @@ impl PendingFetchRegistry {
         }
     }
 
-    /// Register a pending fetch for a topic-partition
+    /// Register a pending fetch for a topic-partition.
     ///
-    /// Returns a Notify handle that will be notified when new data arrives.
-    /// The caller should await on the Notify (with timeout) and then re-fetch.
+    /// The caller supplies the `Notify` so that a single FetchRequest spanning several
+    /// topic-partitions can register one shared handle under each key and `await` it once. The
+    /// caller should register every requested partition, then await the handle (with a poll-interval
+    /// timeout) and re-fetch, then `unregister`.
     ///
     /// # Arguments
-    /// * `topic_id` - The topic ID
+    /// * `topic_name` - The topic name (as the client sees it)
     /// * `partition_id` - The partition ID
     /// * `fetch_offset` - The offset being fetched from (for relevance filtering)
-    ///
-    /// # Returns
-    /// An Arc<Notify> that will be notified when data arrives for this partition
+    /// * `notify` - The shared handle to wake when data arrives for this partition
     pub async fn register(
         &self,
-        topic_id: i32,
+        topic_name: &str,
         partition_id: i32,
         fetch_offset: i64,
-    ) -> Arc<Notify> {
-        let key = TopicPartitionKey::new(topic_id, partition_id);
-        let notify = Arc::new(Notify::new());
+        notify: Arc<Notify>,
+    ) {
+        let key = TopicPartitionKey::new(topic_name, partition_id);
 
         let pending = PendingFetch {
-            notify: notify.clone(),
+            notify,
             fetch_offset,
         };
 
         let mut guard = self.inner.write().await;
         guard.entry(key).or_default().push(pending);
-
-        notify
     }
 
     /// Notify all pending fetches for a topic-partition that new data is available
@@ -113,11 +116,11 @@ impl PendingFetchRegistry {
     /// this topic-partition with fetch_offset < high_watermark will be woken.
     ///
     /// # Arguments
-    /// * `topic_id` - The topic ID
+    /// * `topic_name` - The topic name
     /// * `partition_id` - The partition ID
     /// * `high_watermark` - The new high watermark after the produce
-    pub async fn notify_new_data(&self, topic_id: i32, partition_id: i32, high_watermark: i64) {
-        let key = TopicPartitionKey::new(topic_id, partition_id);
+    pub async fn notify_new_data(&self, topic_name: &str, partition_id: i32, high_watermark: i64) {
+        let key = TopicPartitionKey::new(topic_name, partition_id);
 
         let guard = self.inner.read().await;
         if let Some(pending_list) = guard.get(&key) {
@@ -137,11 +140,11 @@ impl PendingFetchRegistry {
     /// the registry entry.
     ///
     /// # Arguments
-    /// * `topic_id` - The topic ID
+    /// * `topic_name` - The topic name
     /// * `partition_id` - The partition ID
-    /// * `notify` - The Notify handle returned from register()
-    pub async fn unregister(&self, topic_id: i32, partition_id: i32, notify: &Arc<Notify>) {
-        let key = TopicPartitionKey::new(topic_id, partition_id);
+    /// * `notify` - The shared Notify handle that was registered
+    pub async fn unregister(&self, topic_name: &str, partition_id: i32, notify: &Arc<Notify>) {
+        let key = TopicPartitionKey::new(topic_name, partition_id);
 
         let mut guard = self.inner.write().await;
         if let Some(pending_list) = guard.get_mut(&key) {
@@ -181,12 +184,13 @@ mod tests {
         let registry = PendingFetchRegistry::new();
 
         // Register a pending fetch
-        let notify = registry.register(1, 0, 0).await;
+        let notify = Arc::new(Notify::new());
+        registry.register("topic-a", 0, 0, notify.clone()).await;
 
         assert_eq!(registry.len().await, 1);
 
         // Notify with high watermark > fetch_offset should wake
-        registry.notify_new_data(1, 0, 10).await;
+        registry.notify_new_data("topic-a", 0, 10).await;
 
         // The notify should be triggered
         let result = timeout(Duration::from_millis(100), notify.notified()).await;
@@ -198,10 +202,11 @@ mod tests {
         let registry = PendingFetchRegistry::new();
 
         // Register for partition 0
-        let notify = registry.register(1, 0, 0).await;
+        let notify = Arc::new(Notify::new());
+        registry.register("topic-a", 0, 0, notify.clone()).await;
 
         // Notify partition 1 - should NOT wake partition 0
-        registry.notify_new_data(1, 1, 10).await;
+        registry.notify_new_data("topic-a", 1, 10).await;
 
         // The notify should NOT be triggered
         let result = timeout(Duration::from_millis(50), notify.notified()).await;
@@ -209,14 +214,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_notify_wrong_topic() {
+        let registry = PendingFetchRegistry::new();
+
+        // QA-5: the registry is keyed by topic name, so a produce to a different topic must not
+        // wake a waiter on this one.
+        let notify = Arc::new(Notify::new());
+        registry.register("topic-a", 0, 0, notify.clone()).await;
+
+        registry.notify_new_data("topic-b", 0, 10).await;
+
+        let result = timeout(Duration::from_millis(50), notify.notified()).await;
+        assert!(
+            result.is_err(),
+            "Should NOT have been notified for another topic"
+        );
+    }
+
+    #[tokio::test]
     async fn test_notify_only_relevant_offsets() {
         let registry = PendingFetchRegistry::new();
 
         // Register waiting from offset 100
-        let notify = registry.register(1, 0, 100).await;
+        let notify = Arc::new(Notify::new());
+        registry.register("topic-a", 0, 100, notify.clone()).await;
 
         // Notify with high watermark 50 - should NOT wake (already past that)
-        registry.notify_new_data(1, 0, 50).await;
+        registry.notify_new_data("topic-a", 0, 50).await;
 
         let result = timeout(Duration::from_millis(50), notify.notified()).await;
         assert!(
@@ -225,7 +249,7 @@ mod tests {
         );
 
         // Notify with high watermark 150 - SHOULD wake
-        registry.notify_new_data(1, 0, 150).await;
+        registry.notify_new_data("topic-a", 0, 150).await;
 
         let result = timeout(Duration::from_millis(100), notify.notified()).await;
         assert!(result.is_ok(), "Should have been notified for new offset");
@@ -235,10 +259,11 @@ mod tests {
     async fn test_unregister() {
         let registry = PendingFetchRegistry::new();
 
-        let notify = registry.register(1, 0, 0).await;
+        let notify = Arc::new(Notify::new());
+        registry.register("topic-a", 0, 0, notify.clone()).await;
         assert_eq!(registry.len().await, 1);
 
-        registry.unregister(1, 0, &notify).await;
+        registry.unregister("topic-a", 0, &notify).await;
         assert!(registry.is_empty().await);
     }
 
@@ -246,15 +271,18 @@ mod tests {
     async fn test_multiple_waiters_same_partition() {
         let registry = PendingFetchRegistry::new();
 
-        // Register multiple waiters for same partition
-        let notify1 = registry.register(1, 0, 0).await;
-        let notify2 = registry.register(1, 0, 5).await;
-        let notify3 = registry.register(1, 0, 10).await;
+        // Register multiple waiters for same partition (each caller has its own Notify)
+        let notify1 = Arc::new(Notify::new());
+        let notify2 = Arc::new(Notify::new());
+        let notify3 = Arc::new(Notify::new());
+        registry.register("topic-a", 0, 0, notify1.clone()).await;
+        registry.register("topic-a", 0, 5, notify2.clone()).await;
+        registry.register("topic-a", 0, 10, notify3.clone()).await;
 
         assert_eq!(registry.len().await, 3);
 
         // Notify with high watermark 8 - should wake notify1 and notify2, not notify3
-        registry.notify_new_data(1, 0, 8).await;
+        registry.notify_new_data("topic-a", 0, 8).await;
 
         let result1 = timeout(Duration::from_millis(100), notify1.notified()).await;
         let result2 = timeout(Duration::from_millis(100), notify2.notified()).await;
@@ -274,7 +302,8 @@ mod tests {
         for i in 0..10 {
             let reg = registry.clone();
             handles.push(tokio::spawn(async move {
-                let notify = reg.register(1, 0, i as i64).await;
+                let notify = Arc::new(Notify::new());
+                reg.register("topic-a", 0, i as i64, notify.clone()).await;
                 timeout(Duration::from_millis(500), notify.notified()).await
             }));
         }
@@ -283,7 +312,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Notify all
-        registry.notify_new_data(1, 0, 100).await;
+        registry.notify_new_data("topic-a", 0, 100).await;
 
         // All should complete
         for handle in handles {
