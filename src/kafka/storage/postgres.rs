@@ -145,27 +145,28 @@ impl KafkaStore for PostgresStore {
                 &[topic_id.into(), partition_id.into()],
             )?;
 
-            // Step 2: Get current max offset
+            // Step 2: Compute base_offset = GREATEST(persisted next_offset, MAX(partition_offset)+1).
+            // BUG-3: the persisted per-partition counter (kafka.partition_offsets) is never
+            // decremented, so deleting the highest (aborted) rows in cleanup_aborted_messages can't
+            // lower the next offset and cause offset reuse. The MAX+1 term seeds the counter from
+            // existing data the first time a partition is produced to after this counter existed.
             let table = client.select(
-                "SELECT COALESCE(MAX(partition_offset), -1) as max_offset
-                 FROM kafka.messages
-                 WHERE topic_id = $1 AND partition_id = $2",
+                "SELECT GREATEST(
+                          COALESCE((SELECT next_offset FROM kafka.partition_offsets
+                                    WHERE topic_id = $1 AND partition_id = $2), 0),
+                          COALESCE((SELECT MAX(partition_offset) + 1 FROM kafka.messages
+                                    WHERE topic_id = $1 AND partition_id = $2), 0)
+                        ) AS base_offset",
                 None,
                 &[topic_id.into(), partition_id.into()],
             )?;
 
-            let max_offset: i64 = table
+            let base_offset: i64 = table
                 .first()
-                .get_by_name::<i64, _>("max_offset")?
-                .unwrap_or(-1);
+                .get_by_name::<i64, _>("base_offset")?
+                .unwrap_or(0);
 
-            let base_offset = max_offset + 1;
-
-            crate::pg_debug!(
-                "Current max_offset={}, new base_offset={}",
-                max_offset,
-                base_offset
-            );
+            crate::pg_debug!("Assigning base_offset={}", base_offset);
 
             // Step 3: Build parallel arrays for UNNEST-based bulk insert
             // This is type-safe (no SQL injection) and PostgreSQL-optimized
@@ -207,6 +208,25 @@ impl KafkaStore for PostgresStore {
                     ],
                 )
                 .map_err(|e| KafkaError::Internal(format!("Failed to insert records: {}", e)))?;
+
+            // BUG-3: advance the monotonic per-partition counter so the next produce — even after
+            // cleanup_aborted_messages deletes the highest rows — cannot reuse these offsets.
+            client
+                .update(
+                    "INSERT INTO kafka.partition_offsets (topic_id, partition_id, next_offset)
+                     VALUES ($1, $2, $3)
+                     ON CONFLICT (topic_id, partition_id)
+                     DO UPDATE SET next_offset = GREATEST(kafka.partition_offsets.next_offset, EXCLUDED.next_offset)",
+                    None,
+                    &[
+                        topic_id.into(),
+                        partition_id.into(),
+                        (base_offset + count as i64).into(),
+                    ],
+                )
+                .map_err(|e| {
+                    KafkaError::Internal(format!("Failed to advance partition offset: {}", e))
+                })?;
 
             crate::pg_debug!(
                 "Successfully inserted {} records (offsets {} to {}) in single query",
@@ -1169,21 +1189,25 @@ impl KafkaStore for PostgresStore {
                 &[topic_id.into(), partition_id.into()],
             )?;
 
-            // Step 2: Get current max offset
+            // Step 2: Compute base_offset = GREATEST(persisted next_offset, MAX(partition_offset)+1).
+            // BUG-3: transactional inserts must advance the monotonic counter too — these are the
+            // very rows cleanup_aborted_messages later deletes, and without advancing the counter a
+            // post-cleanup produce would reuse their offsets.
             let table = client.select(
-                "SELECT COALESCE(MAX(partition_offset), -1) as max_offset
-                 FROM kafka.messages
-                 WHERE topic_id = $1 AND partition_id = $2",
+                "SELECT GREATEST(
+                          COALESCE((SELECT next_offset FROM kafka.partition_offsets
+                                    WHERE topic_id = $1 AND partition_id = $2), 0),
+                          COALESCE((SELECT MAX(partition_offset) + 1 FROM kafka.messages
+                                    WHERE topic_id = $1 AND partition_id = $2), 0)
+                        ) AS base_offset",
                 None,
                 &[topic_id.into(), partition_id.into()],
             )?;
 
-            let max_offset: i64 = table
+            let base_offset: i64 = table
                 .first()
-                .get_by_name::<i64, _>("max_offset")?
-                .unwrap_or(-1);
-
-            let base_offset = max_offset + 1;
+                .get_by_name::<i64, _>("base_offset")?
+                .unwrap_or(0);
 
             // Step 3: Build parallel arrays for UNNEST-based bulk insert
             let count = records.len();
@@ -1230,6 +1254,25 @@ impl KafkaStore for PostgresStore {
                     ],
                 )
                 .map_err(|e| KafkaError::Internal(format!("Failed to insert transactional records: {}", e)))?;
+
+            // BUG-3: advance the monotonic per-partition counter (never decremented), so that once
+            // these pending rows are aborted and cleaned up, a later produce cannot reuse offsets.
+            client
+                .update(
+                    "INSERT INTO kafka.partition_offsets (topic_id, partition_id, next_offset)
+                     VALUES ($1, $2, $3)
+                     ON CONFLICT (topic_id, partition_id)
+                     DO UPDATE SET next_offset = GREATEST(kafka.partition_offsets.next_offset, EXCLUDED.next_offset)",
+                    None,
+                    &[
+                        topic_id.into(),
+                        partition_id.into(),
+                        (base_offset + count as i64).into(),
+                    ],
+                )
+                .map_err(|e| {
+                    KafkaError::Internal(format!("Failed to advance partition offset: {}", e))
+                })?;
 
             crate::pg_debug!(
                 "Successfully inserted {} transactional records (offsets {} to {})",
