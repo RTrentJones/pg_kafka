@@ -3106,12 +3106,12 @@ mod tests {
     fn test_request_version_out_of_range_rejected() {
         // CONF-6: a request whose version exceeds the advertised max for its api_key must be
         // rejected with UNSUPPORTED_VERSION *before* the version-specific body decode runs.
-        // Metadata max is 9; declare v10 in the header (its header is flexible just like v9, so the
+        // Metadata max is 10; declare v11 in the header (its header is flexible just like v10, so the
         // header still decodes cleanly) and let the dispatcher reject on version.
         let (tx, mut rx) = create_test_channel();
 
         let request = metadata_request::MetadataRequest::default();
-        let frame = build_request_frame(API_KEY_METADATA, 10, 7777, 2, &request, 9);
+        let frame = build_request_frame(API_KEY_METADATA, 11, 7777, 2, &request, 9);
 
         let parsed = parse_request(frame, tx).unwrap();
         assert!(
@@ -3137,16 +3137,18 @@ mod tests {
 
     #[test]
     fn test_request_version_in_range_accepted() {
-        // CONF-6 must not over-reject: a valid in-range version still parses normally.
+        // CONF-6 must not over-reject: a valid in-range version still parses normally. v10 is the
+        // version Sarama V2_8_0_0 sends for its bootstrap Metadata; it must parse (raising the cap
+        // 9 -> 10 is the fix for the Sarama NewClient regression).
         let (tx, _rx) = create_test_channel();
 
         let request = metadata_request::MetadataRequest::default();
-        let frame = build_request_frame(API_KEY_METADATA, 9, 7778, 2, &request, 9);
+        let frame = build_request_frame(API_KEY_METADATA, 10, 7778, 2, &request, 10);
 
         let parsed = parse_request(frame, tx).unwrap();
         assert!(
             matches!(parsed, Some(KafkaRequest::Metadata { .. })),
-            "in-range Metadata v9 should parse, got {:?}",
+            "in-range Metadata v10 should parse, got {:?}",
             parsed
         );
     }

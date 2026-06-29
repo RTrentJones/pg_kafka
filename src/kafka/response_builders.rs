@@ -26,9 +26,14 @@ use super::constants::*;
 ///   highest version that still carries the topic name.
 /// - OffsetFetch max 7: v8+ changed the response shape to support multiple groups, which we don't
 ///   implement yet.
+/// - Metadata max 10: v10 (KIP-516) added a per-topic `topic_id` to the *response*; pg_kafka resolves
+///   by name and leaves it as the zero UUID, which by-name clients ignore. We advertise (and serve)
+///   v10 because clients with an explicit broker version that don't down-negotiate — notably Sarama
+///   `V2_8_0_0` — send Metadata v10 unconditionally; rejecting it broke their bootstrap (the rejection
+///   is an error frame strict decoders can't parse). v11+ adds fields/semantics we don't serve.
 pub const API_VERSION_RANGES: &[(i16, i16, i16)] = &[
     (API_KEY_API_VERSIONS, 0, 3),
-    (API_KEY_METADATA, 0, 9),
+    (API_KEY_METADATA, 0, 10),
     (API_KEY_PRODUCE, 3, 9),
     (API_KEY_FETCH, 0, 11),
     (API_KEY_LIST_OFFSETS, 0, 7),
@@ -347,7 +352,7 @@ mod tests {
             .find(|a| a.api_key == API_KEY_METADATA)
             .expect("Metadata should be present");
         assert_eq!(metadata.min_version, 0);
-        assert_eq!(metadata.max_version, 9);
+        assert_eq!(metadata.max_version, 10);
 
         // Verify InitProducerId entry (Phase 9)
         let init_producer = response
@@ -412,7 +417,7 @@ mod tests {
         // The enforcement table (CONF-6) must agree with what ApiVersions advertises.
         assert_eq!(supported_version_range(API_KEY_PRODUCE), Some((3, 9)));
         assert_eq!(supported_version_range(API_KEY_FETCH), Some((0, 11)));
-        assert_eq!(supported_version_range(API_KEY_METADATA), Some((0, 9)));
+        assert_eq!(supported_version_range(API_KEY_METADATA), Some((0, 10)));
         assert_eq!(supported_version_range(API_KEY_OFFSET_FETCH), Some((0, 7)));
 
         // Every advertised API has a matching enforcement range, and vice versa.
