@@ -170,14 +170,14 @@ SET pg_kafka.compression_type = 'gzip';
 
 ### 8. ListOffsets ✅ Implemented
 
-**Status:** Fully implemented for special timestamps
+**Status:** Fully implemented
 **Kafka Behavior:** Returns offsets by timestamp or special values
-**pg_kafka Behavior:** Supports earliest (-2) and latest (-1) only
+**pg_kafka Behavior:** Supports earliest (-2), latest (-1), and timestamp lookup
 
 **Implementation:**
 - ✅ Returns earliest offset (first message in partition)
 - ✅ Returns latest offset (high watermark)
-- ❌ Timestamp-based lookup not implemented (returns UNSUPPORTED_VERSION)
+- ✅ Timestamp-based lookup — returns the earliest offset whose record timestamp is ≥ the requested time (record timestamps are persisted; AUDIT-2026-06 BUG-7 + CONF-7)
 
 ## Metadata API Deviations
 
@@ -290,9 +290,11 @@ impl KafkaError {
 
 ### Notable Missing APIs
 
-- Transaction APIs (22-26) - Not planned
-- Admin/Security APIs - Not planned
+- Security APIs (SaslHandshake/SaslAuthenticate, ACLs) - Not planned; use PostgreSQL auth + network controls
+- Broker-internal / admin-utility APIs (DescribeTransactions, ListTransactions, DescribeProducers) - Not planned (monitoring-only)
 - Log compaction - Not planned (PostgreSQL UPDATE provides similar semantics)
+
+> Transaction APIs (InitProducerId 22, AddPartitionsToTxn 24, AddOffsetsToTxn 25, EndTxn 26, TxnOffsetCommit 28) and the core Admin APIs (CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups) **are** implemented — see the Summary above and `KAFKA_PROTOCOL_COVERAGE.md`.
 
 ## Compatibility Testing
 
@@ -301,7 +303,7 @@ impl KafkaError {
 | Client | Version | Status | Notes |
 |--------|---------|--------|-------|
 | kcat | 1.7.0+ | ✅ Works | Producer and consumer tested |
-| rdkafka (Rust) | 0.36+ | ✅ Works | Full E2E test suite (173 tests) |
+| rdkafka (Rust) | 0.36+ | ✅ Works | Full E2E test suite (181 tests) |
 
 ### Client Configuration
 
@@ -310,7 +312,7 @@ impl KafkaError {
 bootstrap.servers=localhost:9092
 acks=1  # Default (acks=0 also supported for fire-and-forget)
 compression.type=gzip  # Optional: none, gzip, snappy, lz4, zstd
-enable.idempotence=false  # REQUIRED
+enable.idempotence=true  # Supported (idempotent producer — Phase 9 / InitProducerId)
 
 # Consumer settings
 bootstrap.servers=localhost:9092
@@ -321,13 +323,7 @@ auto.offset.reset=earliest
 
 ## Future Work
 
-### Shadow Mode (Future Phase)
-
-| Feature | Description | Complexity |
-|---------|-------------|------------|
-| Logical Decoding | Tail PostgreSQL WAL | High |
-| External Kafka Production | Forward to real Kafka cluster | Medium |
-| At-Least-Once Delivery | Acknowledge only after external ACK | Medium |
+> **Shadow Mode is implemented** (Phase 11 — external Kafka forwarding, per-topic config, SASL/SSL) and is no longer future work. See `KAFKA_PROTOCOL_COVERAGE.md` and the `SHADOW_MODE_*` docs. Known correctness limitations (durable forwarding, replay idempotency, the license gate) are tracked as SH-1..16 in `AUDIT-2026-06.md`.
 
 ### Advanced Consumer Features (Future)
 
@@ -341,14 +337,15 @@ auto.offset.reset=earliest
 | Feature | Rationale |
 |---------|-----------|
 | Log compaction | PostgreSQL UPDATE provides similar semantics |
-| Exactly-once semantics | Requires full transaction coordinator |
 | Replication protocol | Rely on PostgreSQL HA (Patroni, RDS) |
 | Quotas | Not needed for target use cases |
 | SASL authentication | Use PostgreSQL authentication instead |
 
+> Exactly-once semantics (EOS) **is** implemented via the Phase 10 transaction APIs and read-committed isolation — see the Summary above and `KAFKA_PROTOCOL_COVERAGE.md`.
+
 ---
 
-**Last Updated:** 2026-01-15
+**Last Updated:** 2026-06-29
 **Applies To:** pg_kafka Phase 11 Complete (Shadow Mode)
 **API Coverage:** 23 of ~50 Kafka APIs (46%)
-**Test Status:** 609 unit tests + 173 E2E tests passing
+**Test Status:** 672 unit tests + 181 E2E tests (CI-gated)
