@@ -1421,7 +1421,10 @@ mod tests {
                 300_000,
                 300_000,
                 "consumer".to_string(),
-                vec![("sticky".to_string(), vec![]), ("range".to_string(), vec![])],
+                vec![
+                    ("sticky".to_string(), vec![]),
+                    ("range".to_string(), vec![]),
+                ],
                 None,
             )
             .unwrap();
@@ -1448,7 +1451,10 @@ mod tests {
                 300_000,
                 300_000,
                 "consumer".to_string(),
-                vec![("sticky".to_string(), vec![]), ("range".to_string(), vec![])],
+                vec![
+                    ("sticky".to_string(), vec![]),
+                    ("range".to_string(), vec![]),
+                ],
                 None,
             )
             .unwrap();
