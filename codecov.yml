@@ -39,6 +39,19 @@ coverage:
 # - pgrx-generated code
 # - SPI-dependent (tested via E2E suite in kafka_test/)
 # - Async runtime code (E2E tested)
+#
+# QA-1 (AUDIT-2026-06) — coverage policy and its limitation, stated explicitly so the gate isn't a
+# silent dodge:
+#   * The unit patch/project gates below apply only to code that CAN run without a live PostgreSQL.
+#     The files ignored here genuinely cannot (they call SPI / run inside the pgrx background worker /
+#     drive the tokio listener), so unit coverage would always read 0% for them and is not meaningful.
+#   * The mitigation is mandatory, not implied: every behavioural change to an ignored file MUST ship a
+#     kafka_test E2E regression test that fails before / passes after (the test-per-bug rule this
+#     remediation applied to e.g. BUG-3 offset reuse, BUG-4 high-watermark, BUG-5 panic→hang, BUG-7
+#     timestamps, CONF-7 ListOffsets, SEC-3/4 admission/backpressure). A reviewer should reject an
+#     ignored-file change that lands without one.
+#   * Do NOT add a file here to route untested logic around the patch gate. The list below is for
+#     genuinely SPI/async/generated code only; new entries need a one-line justification.
 ignore:
   # pgrx generated/macro code
   - "src/bin/**"                      # pgrx embedding binary
