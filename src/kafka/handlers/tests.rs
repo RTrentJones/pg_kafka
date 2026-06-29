@@ -366,7 +366,10 @@ mod tests {
             metadata::handle_metadata(&ctx, Some(vec!["missing".to_string()]), false).unwrap();
 
         assert_eq!(response.topics.len(), 1);
-        assert_eq!(response.topics[0].error_code, ERROR_UNKNOWN_TOPIC_OR_PARTITION);
+        assert_eq!(
+            response.topics[0].error_code,
+            ERROR_UNKNOWN_TOPIC_OR_PARTITION
+        );
         assert!(response.topics[0].partitions.is_empty());
     }
 
