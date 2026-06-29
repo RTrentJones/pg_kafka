@@ -39,6 +39,11 @@ pub enum KafkaRequest {
         api_version: i16,
         /// List of topics to get metadata for (None = all topics)
         topics: Option<Vec<String>>,
+        /// Whether the broker may auto-create requested topics that don't exist. This is the v4+
+        /// wire flag (`allow_auto_topic_creation`); it defaults to true for older versions. CONF-2:
+        /// when false, a missing requested topic is reported as UNKNOWN_TOPIC_OR_PARTITION rather
+        /// than being created.
+        allow_auto_topic_creation: bool,
         /// Channel to send the response back to the specific connection
         response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
     },

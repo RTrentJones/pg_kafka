@@ -379,6 +379,8 @@ fn parse_metadata(
         client_id,
         api_version,
         topics,
+        // v4+ wire flag; defaults to true for older versions (the crate fills the schema default).
+        allow_auto_topic_creation: metadata_req.allow_auto_topic_creation,
         response_tx,
     }))
 }
@@ -1843,6 +1845,28 @@ mod tests {
                 "empty array at v0 should mean ALL topics (None), got {:?}",
                 topics
             );
+        } else {
+            panic!("Expected Metadata request");
+        }
+    }
+
+    #[test]
+    fn test_parse_metadata_allow_auto_topic_creation_flag() {
+        // CONF-2: the v4+ allow_auto_topic_creation wire flag must be carried into the request.
+        let (tx, _rx) = create_test_channel();
+
+        let mut request = metadata_request::MetadataRequest::default();
+        request.allow_auto_topic_creation = false;
+        // Metadata v4 uses a non-flexible header (v1).
+        let frame = build_request_frame(API_KEY_METADATA, 4, 120, 1, &request, 4);
+
+        let parsed = parse_request(frame, tx).unwrap();
+        if let Some(KafkaRequest::Metadata {
+            allow_auto_topic_creation,
+            ..
+        }) = parsed
+        {
+            assert!(!allow_auto_topic_creation);
         } else {
             panic!("Expected Metadata request");
         }

@@ -77,6 +77,7 @@ pub fn mock_metadata_request(
         client_id: None,
         api_version: 4, // Default to v4 for tests
         topics,
+        allow_auto_topic_creation: true,
         response_tx,
     };
 
@@ -99,6 +100,7 @@ pub fn mock_metadata_request_with_client(
         client_id: Some(client_id),
         api_version: 4, // Default to v4 for tests
         topics,
+        allow_auto_topic_creation: true,
         response_tx,
     };
 

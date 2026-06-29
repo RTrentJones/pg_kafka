@@ -769,6 +769,7 @@ pub fn process_request(
             correlation_id,
             api_version,
             topics: requested_topics,
+            allow_auto_topic_creation,
             response_tx,
             ..
         } => {
@@ -783,7 +784,7 @@ pub fn process_request(
             dispatch_response(
                 "Metadata",
                 response_tx,
-                || handlers::handle_metadata(&ctx, requested_topics),
+                || handlers::handle_metadata(&ctx, requested_topics, allow_auto_topic_creation),
                 |r| KafkaResponse::Metadata {
                     correlation_id,
                     api_version,
