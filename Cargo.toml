@@ -88,6 +88,12 @@ codegen-units = 1
 # straight from the wire, so a single crafted request can declare a huge array length and trigger
 # a multi-GB allocation that *aborts the worker process* (an allocation failure, not an unwinding
 # panic, so parse_request's catch_unwind cannot contain it). This fork caps the capacity hint; the
-# Vec still grows for honest inputs. Fork: https://github.com/RTrentJones/kafka-protocol-rs
+# Vec still grows for honest inputs.
+#
+# SEC-5 (AUDIT-2026-06): the same fork also caps decompressed record-batch size (MAX_DECOMPRESSED_SIZE
+# = 256 MiB) across gzip/lz4/zstd/snappy, so a "decompression bomb" — a tiny compressed batch that
+# inflates to many GB — is rejected instead of allocated.
+#
+# Fork: https://github.com/RTrentJones/kafka-protocol-rs (branch bounded-decompress)
 [patch.crates-io]
-kafka-protocol = { git = "https://github.com/RTrentJones/kafka-protocol-rs", rev = "3e0e6a0c00afa69013a5b19976c4f7f7344e2d0e" }
+kafka-protocol = { git = "https://github.com/RTrentJones/kafka-protocol-rs", rev = "703af1879bffbcce7e2e4f60b69975d4022d5cd9" }
