@@ -61,7 +61,11 @@ impl StickyStrategy {
 
 impl AssignmentStrategy for StickyStrategy {
     fn name(&self) -> &'static str {
-        "cooperative-sticky"
+        // CG-2: this is the *eager* sticky assignor — it computes a full assignment server-side and
+        // does not implement the cooperative (incremental, KIP-429) rebalance protocol. Advertising
+        // "cooperative-sticky" would tell clients to skip revoking moved partitions, briefly
+        // double-owning them. Report the honest eager name.
+        "sticky"
     }
 
     fn assign(&self, input: &AssignmentInput) -> AssignmentOutput {
@@ -169,9 +173,11 @@ impl AssignmentStrategy for StickyStrategy {
                 .push(partition);
         }
 
-        // Step 4: Balance if needed (move from overloaded to underloaded)
-        // This is optional and can be expensive; skip for MVP
-        // The orphan distribution already tends toward balance
+        // Step 4: Balance — move partitions from overloaded members to underloaded ones. CG-2:
+        // sticky preservation (Step 1) can leave a member holding far more partitions than a peer
+        // (e.g. when a new member joins an assignment one member already fully owns), and this was
+        // previously never corrected ("skip for MVP").
+        balance_assignments(&mut result, input, total_partitions);
 
         // Sort partition lists for consistent output
         for assignment in result.values_mut() {
@@ -181,6 +187,70 @@ impl AssignmentStrategy for StickyStrategy {
         }
 
         result
+    }
+}
+
+/// Move partitions from overloaded members to subscribed, less-loaded members until the load spread
+/// is at most one (CG-2). Each move takes a partition from a member and hands it to a member that
+/// subscribes to its topic and is at least two partitions lighter, which strictly reduces the
+/// most-loaded member's count — so the loop terminates within `total_partitions` iterations.
+fn balance_assignments(
+    result: &mut AssignmentOutput,
+    input: &AssignmentInput,
+    total_partitions: usize,
+) {
+    for _ in 0..total_partitions {
+        // Snapshot member ids in deterministic order.
+        let mut members: Vec<String> = result.keys().cloned().collect();
+        members.sort();
+
+        // Find a beneficial move: a partition of some `from` member that a subscribed, strictly
+        // lighter `to` member (at least two below `from`) can take.
+        let mut chosen: Option<(String, String, String, i32)> = None;
+        'search: for from in &members {
+            let from_count = result[from].partition_count();
+            for (topic, partitions) in &result[from].topic_partitions {
+                for &partition in partitions {
+                    let mut best: Option<String> = None;
+                    let mut best_count = usize::MAX;
+                    for to in &members {
+                        if to == from || !input.subscriptions[to].topics.contains(topic) {
+                            continue;
+                        }
+                        let to_count = result[to].partition_count();
+                        if to_count + 1 < from_count && to_count < best_count {
+                            best_count = to_count;
+                            best = Some(to.clone());
+                        }
+                    }
+                    if let Some(to) = best {
+                        chosen = Some((from.clone(), to, topic.clone(), partition));
+                        break 'search;
+                    }
+                }
+            }
+        }
+
+        let (from, to, topic, partition) = match chosen {
+            Some(mv) => mv,
+            None => break,
+        };
+
+        if let Some(parts) = result
+            .get_mut(&from)
+            .unwrap()
+            .topic_partitions
+            .get_mut(&topic)
+        {
+            parts.retain(|&p| p != partition);
+        }
+        result
+            .get_mut(&to)
+            .unwrap()
+            .topic_partitions
+            .entry(topic)
+            .or_default()
+            .push(partition);
     }
 }
 
@@ -313,11 +383,17 @@ mod tests {
         let strategy = StickyStrategy::with_previous(previous);
         let result = strategy.assign(&input);
 
-        // member-1 keeps previous [0,1,2,3], member-2 gets nothing (no orphans)
-        // Actually, all partitions are already assigned to member-1
-        // No automatic rebalancing in this implementation
-        assert_eq!(result["member-1"].partition_count(), 4);
-        assert_eq!(result["member-2"].partition_count(), 0);
+        // CG-2: a new member joining an assignment member-1 fully owns must trigger rebalancing —
+        // the load is split evenly (2/2), with every partition still assigned exactly once.
+        assert_eq!(result["member-1"].partition_count(), 2);
+        assert_eq!(result["member-2"].partition_count(), 2);
+        let all: Vec<i32> = result
+            .values()
+            .flat_map(|a| a.partitions("topic-a"))
+            .collect();
+        let unique: HashSet<i32> = all.iter().copied().collect();
+        assert_eq!(unique, [0, 1, 2, 3].iter().copied().collect());
+        assert_eq!(all.len(), 4, "no partition assigned to two members");
     }
 
     #[test]
