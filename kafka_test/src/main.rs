@@ -214,6 +214,7 @@ use kafka_test::{
     test_produce_throughput_baseline,
     test_produce_timeout,
     test_produce_while_consuming,
+    test_sasl_password_guc_is_superuser_only,
     test_producer,
     test_producer_acks_zero,
     // Transaction tests
@@ -934,6 +935,12 @@ fn get_all_tests() -> Vec<TestDef> {
             parallel_safe: false, // Tests group membership
         },
         // Negative tests
+        TestDef {
+            category: "negative",
+            name: "test_sasl_password_guc_is_superuser_only",
+            test_fn: wrap_test!(test_sasl_password_guc_is_superuser_only),
+            parallel_safe: false,
+        },
         TestDef {
             category: "negative",
             name: "test_connection_refused",

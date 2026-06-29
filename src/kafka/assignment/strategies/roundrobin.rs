@@ -78,42 +78,38 @@ impl AssignmentStrategy for RoundRobinStrategy {
             return result;
         }
 
-        // Track position for each topic's round-robin cycle
-        // This ensures we continue from where we left off for each topic
-        let mut topic_positions: HashMap<String, usize> = HashMap::new();
+        // CG-6: use a SINGLE global round-robin pointer across all (topic, partition) pairs — as
+        // Kafka does and as this module's doc example describes — not a per-topic counter that
+        // restarts at 0 for each topic (which imbalances heterogeneous multi-topic subscriptions).
+        // The pointer walks the sorted members and skips any not subscribed to the current topic.
+        let mut position = 0usize;
+        let member_count = member_ids.len();
 
-        // Round-robin assignment
         for (topic, partition) in all_partitions {
-            // Get members subscribed to this topic
-            let eligible_members: Vec<&&String> = member_ids
-                .iter()
-                .filter(|id| {
-                    input
-                        .subscriptions
-                        .get(**id)
-                        .map(|sub| sub.topics.contains(&topic))
-                        .unwrap_or(false)
-                })
-                .collect();
-
-            if eligible_members.is_empty() {
-                continue;
+            // Advance the global pointer to the next member subscribed to this topic.
+            let mut assigned: Option<&String> = None;
+            for _ in 0..member_count {
+                let candidate = member_ids[position % member_count];
+                position += 1;
+                let subscribed = input
+                    .subscriptions
+                    .get(candidate)
+                    .map(|sub| sub.topics.contains(&topic))
+                    .unwrap_or(false);
+                if subscribed {
+                    assigned = Some(candidate);
+                    break;
+                }
             }
 
-            // Get current position for this topic's cycle
-            let position = topic_positions.entry(topic.clone()).or_insert(0);
-            let member_idx = *position % eligible_members.len();
-            *position += 1;
-
-            let member_id = *eligible_members[member_idx];
-
-            // Add partition to member's assignment
-            if let Some(assignment) = result.get_mut(member_id) {
-                assignment
-                    .topic_partitions
-                    .entry(topic)
-                    .or_default()
-                    .push(partition);
+            if let Some(member_id) = assigned {
+                if let Some(assignment) = result.get_mut(member_id) {
+                    assignment
+                        .topic_partitions
+                        .entry(topic)
+                        .or_default()
+                        .push(partition);
+                }
             }
         }
 
@@ -232,9 +228,10 @@ mod tests {
         assert_eq!(result["member-1"].partitions("topic-a"), vec![0, 2]);
         assert_eq!(result["member-2"].partitions("topic-a"), vec![1]);
 
-        // topic-b: 0->m1, 1->m2
-        assert_eq!(result["member-1"].partitions("topic-b"), vec![0]);
-        assert_eq!(result["member-2"].partitions("topic-b"), vec![1]);
+        // CG-6: topic-b continues the GLOBAL pointer from topic-a (B0->m2, B1->m1), rather than
+        // restarting per topic (which previously, wrongly, gave m1 B0 and m2 B1).
+        assert_eq!(result["member-1"].partitions("topic-b"), vec![1]);
+        assert_eq!(result["member-2"].partitions("topic-b"), vec![0]);
     }
 
     #[test]
