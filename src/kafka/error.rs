@@ -429,14 +429,9 @@ impl KafkaError {
         KafkaError::Encoding { message }
     }
 
-    /// Create from legacy InvalidConfig(String) pattern
-    #[allow(non_snake_case)]
-    pub fn InvalidConfig(message: String) -> Self {
-        KafkaError::InvalidConfig {
-            key: "unknown".to_string(),
-            message,
-        }
-    }
+    // QA-9: the legacy `InvalidConfig(message)` constructor was removed — it fabricated
+    // `key: "unknown"`, discarding the real config key. Callers use the struct form
+    // `KafkaError::InvalidConfig { key, message }` with the actual key instead.
 
     /// Create from legacy SchemaNotFound(String) pattern
     #[allow(non_snake_case)]
@@ -884,18 +879,6 @@ mod tests {
             KafkaError::Encoding {
                 message: ref m
             } if m == "test error"
-        ));
-    }
-
-    #[test]
-    fn test_backwards_compat_invalid_config() {
-        let err = KafkaError::InvalidConfig("bad value".to_string());
-        assert!(matches!(
-            err,
-            KafkaError::InvalidConfig {
-                key: ref k,
-                message: ref m
-            } if k == "unknown" && m == "bad value"
         ));
     }
 
