@@ -189,11 +189,13 @@ mod tests {
 
     #[test]
     fn test_create_strategy_sticky() {
+        // CG-2: both aliases resolve to the eager sticky assignor, which reports the honest "sticky"
+        // name (not "cooperative-sticky" — it does not implement the cooperative rebalance protocol).
         let strategy = create_strategy("sticky").unwrap();
-        assert_eq!(strategy.name(), "cooperative-sticky");
+        assert_eq!(strategy.name(), "sticky");
 
         let strategy = create_strategy("cooperative-sticky").unwrap();
-        assert_eq!(strategy.name(), "cooperative-sticky");
+        assert_eq!(strategy.name(), "sticky");
     }
 
     #[test]
