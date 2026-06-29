@@ -120,7 +120,7 @@ pub use error_paths::{
 };
 pub use negative::{
     test_connection_refused, test_duplicate_consumer_join, test_invalid_group_id,
-    test_produce_timeout,
+    test_produce_timeout, test_sasl_password_guc_is_superuser_only,
 };
 pub use performance::{
     test_batch_vs_single_performance, test_concurrent_connection_scaling,

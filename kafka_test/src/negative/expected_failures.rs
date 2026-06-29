@@ -10,6 +10,41 @@ use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::producer::FutureProducer;
 use std::time::Duration;
 
+/// SEC-8: the external-Kafka SASL password GUC must be readable only by superusers, so an
+/// ordinary DB role cannot read the cleartext credential via `SHOW`. The fix locks it down with
+/// `SUPERUSER_ONLY | NO_SHOW_ALL` (mirroring the license-key GUC).
+pub async fn test_sasl_password_guc_is_superuser_only() -> TestResult {
+    println!("=== Test: shadow_sasl_password GUC is superuser-only (SEC-8) ===\n");
+    let ctx = TestContext::new().await?;
+    let db = ctx.db();
+
+    // Create a throwaway non-superuser role (idempotent across re-runs).
+    db.batch_execute(
+        "DO $$ BEGIN
+           IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pg_kafka_sec8_probe') THEN
+             CREATE ROLE pg_kafka_sec8_probe NOSUPERUSER;
+           END IF;
+         END $$;",
+    )
+    .await?;
+
+    // Sanity: as the (superuser) test role, reading the GUC succeeds.
+    db.query_one("SHOW pg_kafka.shadow_sasl_password", &[]).await?;
+
+    // As the non-superuser role, reading it must be rejected (SUPERUSER_ONLY).
+    db.execute("SET ROLE pg_kafka_sec8_probe", &[]).await?;
+    let unpriv_read = db.query_one("SHOW pg_kafka.shadow_sasl_password", &[]).await;
+    db.execute("RESET ROLE", &[]).await?;
+
+    if unpriv_read.is_ok() {
+        return Err(
+            "SEC-8 regression: a non-superuser read pg_kafka.shadow_sasl_password".to_string().into(),
+        );
+    }
+    println!("✅ a non-superuser cannot read the SASL password GUC");
+    Ok(())
+}
+
 /// Test connection to wrong port fails gracefully
 pub async fn test_connection_refused() -> TestResult {
     println!("=== Test: Connection Refused ===\n");

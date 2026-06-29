@@ -448,7 +448,10 @@ pub fn init() {
         c"Password for SASL authentication to external Kafka. Requires restart.",
         &SHADOW_SASL_PASSWORD,
         GucContext::Postmaster,
-        GucFlags::default(),
+        // SEC-8: lock down like the license key — only superusers may read/set it, and it is
+        // excluded from SHOW ALL / pg_settings. Without these flags any DB role could read the
+        // cleartext external-Kafka credential via `SHOW pg_kafka.shadow_sasl_password`.
+        GucFlags::NO_SHOW_ALL | GucFlags::SUPERUSER_ONLY,
     );
 
     GucRegistry::define_string_guc(
