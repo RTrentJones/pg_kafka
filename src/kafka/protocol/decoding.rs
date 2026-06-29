@@ -89,6 +89,34 @@ fn parse_request_inner(
         api_key, api_version, correlation_id, client_id
     );
 
+    // CONF-6: enforce the request version is within the range we advertise in ApiVersions, before
+    // handing the body to a version-specific `decode(buf, version)`. ApiVersions itself is exempt —
+    // the protocol requires the broker to still answer an out-of-range ApiVersions request so the
+    // client can negotiate down. An api_key we don't handle has no range here and falls through to
+    // the `_` arm below, which already returns UNSUPPORTED_VERSION.
+    if api_key != API_KEY_API_VERSIONS {
+        if let Some((min_version, max_version)) =
+            super::super::response_builders::supported_version_range(api_key)
+        {
+            if api_version < min_version || api_version > max_version {
+                warn!(
+                    "Rejecting api_key={} version {} outside supported range {}..={}",
+                    api_key, api_version, min_version, max_version
+                );
+                let error_response = super::super::messages::KafkaResponse::Error {
+                    correlation_id,
+                    error_code: ERROR_UNSUPPORTED_VERSION,
+                    error_message: Some(format!(
+                        "Unsupported version {} for api_key {} (supported {}..={})",
+                        api_version, api_key, min_version, max_version
+                    )),
+                };
+                let _ = response_tx.send(error_response);
+                return Ok(None);
+            }
+        }
+    }
+
     // Match on api_key to determine request type
     match api_key {
         API_KEY_API_VERSIONS => {
@@ -314,22 +342,34 @@ fn parse_metadata(
         }
     };
 
-    // Extract requested topics (None means "all topics")
+    // CONF-3: Kafka's empty-vs-null Metadata semantics are version-dependent:
+    //   - v0 has no nullable array; an empty topics array means "all topics".
+    //   - v1+ null  => "all topics"; an empty array => "no topics" (broker/cluster metadata only).
+    // Conflating empty with null (the old behaviour) made an empty v1+ request return every topic.
+    // Downstream, `Some(vec![])` yields an empty topic list and `None` yields all topics.
     let topics = match metadata_req.topics {
+        // Explicit, non-empty topic list → just those topics.
         Some(ref t) if !t.is_empty() => {
             let topic_names: Vec<String> = t
                 .iter()
                 .filter_map(|t| t.name.as_ref().map(|n| n.to_string()))
                 .collect();
             debug!("Metadata request for specific topics: {:?}", topic_names);
-            if topic_names.is_empty() {
+            Some(topic_names)
+        }
+        // Empty array: v0 means "all topics"; v1+ means "no topics".
+        Some(_) => {
+            if api_version == 0 {
+                debug!("Metadata v0 empty array → ALL topics");
                 None
             } else {
-                Some(topic_names)
+                debug!("Metadata v{} empty array → NO topics", api_version);
+                Some(Vec::new())
             }
         }
-        _ => {
-            debug!("Metadata request for ALL topics");
+        // Null (v1+) → all topics.
+        None => {
+            debug!("Metadata request for ALL topics (null topics)");
             None
         }
     };
@@ -1715,7 +1755,10 @@ mod tests {
     fn test_parse_metadata_request_all_topics() {
         let (tx, _rx) = create_test_channel();
 
-        let request = metadata_request::MetadataRequest::default();
+        // Null topics (v1+) means "all topics". Set it explicitly so the test doesn't depend on the
+        // crate's Default for the field (CONF-3 distinguishes null from an empty array).
+        let mut request = metadata_request::MetadataRequest::default();
+        request.topics = None;
         let frame = build_request_frame(API_KEY_METADATA, 9, 100, 2, &request, 9);
 
         let result = parse_request(frame, tx);
@@ -1757,6 +1800,49 @@ mod tests {
             let topic_list = topics.unwrap();
             assert_eq!(topic_list.len(), 1);
             assert_eq!(topic_list[0], "test-topic");
+        } else {
+            panic!("Expected Metadata request");
+        }
+    }
+
+    #[test]
+    fn test_parse_metadata_empty_array_v9_means_no_topics() {
+        // CONF-3: a v1+ request with an *empty* topics array means "no topics" (not "all topics").
+        let (tx, _rx) = create_test_channel();
+
+        let mut request = metadata_request::MetadataRequest::default();
+        request.topics = Some(vec![]); // explicitly empty
+        let frame = build_request_frame(API_KEY_METADATA, 9, 110, 2, &request, 9);
+
+        let parsed = parse_request(frame, tx).unwrap();
+        if let Some(KafkaRequest::Metadata { topics, .. }) = parsed {
+            let topics = topics.expect("v9 empty array should be Some(empty)");
+            assert!(
+                topics.is_empty(),
+                "empty array at v9 should request zero topics, got {:?}",
+                topics
+            );
+        } else {
+            panic!("Expected Metadata request");
+        }
+    }
+
+    #[test]
+    fn test_parse_metadata_empty_array_v0_means_all_topics() {
+        // CONF-3: v0 has no nullable array, so an empty array means "all topics" (None downstream).
+        let (tx, _rx) = create_test_channel();
+
+        let mut request = metadata_request::MetadataRequest::default();
+        request.topics = Some(vec![]);
+        let frame = build_request_frame(API_KEY_METADATA, 0, 111, 1, &request, 0);
+
+        let parsed = parse_request(frame, tx).unwrap();
+        if let Some(KafkaRequest::Metadata { topics, .. }) = parsed {
+            assert!(
+                topics.is_none(),
+                "empty array at v0 should mean ALL topics (None), got {:?}",
+                topics
+            );
         } else {
             panic!("Expected Metadata request");
         }
@@ -2979,5 +3065,48 @@ mod tests {
         } else {
             panic!("Expected Error response");
         }
+    }
+
+    #[test]
+    fn test_request_version_out_of_range_rejected() {
+        // CONF-6: a request whose version exceeds the advertised max for its api_key must be
+        // rejected with UNSUPPORTED_VERSION *before* the version-specific body decode runs.
+        // Metadata max is 9; declare v10 in the header (its header is flexible just like v9, so the
+        // header still decodes cleanly) and let the dispatcher reject on version.
+        let (tx, mut rx) = create_test_channel();
+
+        let request = metadata_request::MetadataRequest::default();
+        let frame = build_request_frame(API_KEY_METADATA, 10, 7777, 2, &request, 9);
+
+        let parsed = parse_request(frame, tx).unwrap();
+        assert!(parsed.is_none(), "out-of-range version should not yield a request");
+
+        match rx.try_recv() {
+            Ok(super::super::super::messages::KafkaResponse::Error {
+                correlation_id,
+                error_code,
+                ..
+            }) => {
+                assert_eq!(correlation_id, 7777);
+                assert_eq!(error_code, ERROR_UNSUPPORTED_VERSION);
+            }
+            other => panic!("Expected UNSUPPORTED_VERSION Error response, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_request_version_in_range_accepted() {
+        // CONF-6 must not over-reject: a valid in-range version still parses normally.
+        let (tx, _rx) = create_test_channel();
+
+        let request = metadata_request::MetadataRequest::default();
+        let frame = build_request_frame(API_KEY_METADATA, 9, 7778, 2, &request, 9);
+
+        let parsed = parse_request(frame, tx).unwrap();
+        assert!(
+            matches!(parsed, Some(KafkaRequest::Metadata { .. })),
+            "in-range Metadata v9 should parse, got {:?}",
+            parsed
+        );
     }
 }

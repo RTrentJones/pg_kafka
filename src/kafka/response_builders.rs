@@ -12,181 +12,68 @@ use kafka_protocol::messages::{BrokerId, TopicName};
 
 use super::constants::*;
 
-/// Build an ApiVersionsResponse with the API versions we support
+/// The single source of truth for the request versions pg_kafka supports, as
+/// `(api_key, min_version, max_version)`. This table is used both to *advertise* supported versions
+/// in the ApiVersions response and to *enforce* them on inbound requests (CONF-6, see
+/// `decoding::parse_request_inner`) — keeping the two in lockstep so we never accept a version we
+/// don't advertise.
+///
+/// Notable caps:
+/// - Produce min 3: we only support the RecordBatch format (v3+); v0-2 use the legacy MessageSet
+///   format the kafka-protocol crate doesn't decode.
+/// - Fetch max 11: KIP-516 (v13) drops the topic *name* in favour of topic IDs, but pg_kafka
+///   resolves topics by name only, so a v13 client would get UNKNOWN_TOPIC_OR_PARTITION. v11 is the
+///   highest version that still carries the topic name.
+/// - OffsetFetch max 7: v8+ changed the response shape to support multiple groups, which we don't
+///   implement yet.
+pub const API_VERSION_RANGES: &[(i16, i16, i16)] = &[
+    (API_KEY_API_VERSIONS, 0, 3),
+    (API_KEY_METADATA, 0, 9),
+    (API_KEY_PRODUCE, 3, 9),
+    (API_KEY_FETCH, 0, 11),
+    (API_KEY_LIST_OFFSETS, 0, 7),
+    (API_KEY_OFFSET_COMMIT, 0, 8),
+    (API_KEY_OFFSET_FETCH, 0, 7),
+    (API_KEY_FIND_COORDINATOR, 0, 3),
+    (API_KEY_JOIN_GROUP, 0, 7),
+    (API_KEY_HEARTBEAT, 0, 4),
+    (API_KEY_LEAVE_GROUP, 0, 4),
+    (API_KEY_SYNC_GROUP, 0, 4),
+    (API_KEY_DESCRIBE_GROUPS, 0, 5),
+    (API_KEY_LIST_GROUPS, 0, 4),
+    (API_KEY_CREATE_TOPICS, 0, 5),
+    (API_KEY_DELETE_TOPICS, 0, 4),
+    (API_KEY_CREATE_PARTITIONS, 0, 2),
+    (API_KEY_DELETE_GROUPS, 0, 2),
+    (API_KEY_INIT_PRODUCER_ID, 0, 4),
+    (API_KEY_ADD_PARTITIONS_TO_TXN, 0, 3),
+    (API_KEY_ADD_OFFSETS_TO_TXN, 0, 3),
+    (API_KEY_END_TXN, 0, 3),
+    (API_KEY_TXN_OFFSET_COMMIT, 0, 3),
+];
+
+/// Return the supported `(min_version, max_version)` for an API key, or `None` if the key is not
+/// one pg_kafka handles. Backs CONF-6 request-version enforcement.
+pub fn supported_version_range(api_key: i16) -> Option<(i16, i16)> {
+    API_VERSION_RANGES
+        .iter()
+        .find(|(key, _, _)| *key == api_key)
+        .map(|(_, min, max)| (*min, *max))
+}
+
+/// Build an ApiVersionsResponse advertising the versions in [`API_VERSION_RANGES`].
 pub fn build_api_versions_response() -> ApiVersionsResponse {
     let mut response = ApiVersionsResponse::default();
     response.error_code = ERROR_NONE;
     response.throttle_time_ms = 0;
 
-    // ApiVersions (API_KEY_API_VERSIONS): versions 0-3
-    let mut av1 = ApiVersion::default();
-    av1.api_key = API_KEY_API_VERSIONS;
-    av1.min_version = 0;
-    av1.max_version = 3;
-    response.api_keys.push(av1);
-
-    // Metadata (API_KEY_METADATA): versions 0-9
-    let mut av2 = ApiVersion::default();
-    av2.api_key = API_KEY_METADATA;
-    av2.min_version = 0;
-    av2.max_version = 9;
-    response.api_keys.push(av2);
-
-    // Produce (API_KEY_PRODUCE): versions 3-9
-    // Note: We only support v3+ because it uses RecordBatch format.
-    // v0-v2 use legacy MessageSet format which kafka-protocol crate doesn't support.
-    let mut av3 = ApiVersion::default();
-    av3.api_key = API_KEY_PRODUCE;
-    av3.min_version = 3; // RecordBatch format only (v3+)
-    av3.max_version = 9;
-    response.api_keys.push(av3);
-
-    // Fetch (API_KEY_FETCH): versions 0-11. Capped below v13: KIP-516 added topic IDs to Fetch in
-    // v13 (the topic *name* is dropped), but pg_kafka resolves topics by name only — so a v13 client
-    // (e.g. librdkafka >= 2.4) would get UNKNOWN_TOPIC_OR_PARTITION. v11 is the highest version that
-    // still carries the topic name and the (non-flexible) path all supported clients exercise.
-    let mut av4 = ApiVersion::default();
-    av4.api_key = API_KEY_FETCH;
-    av4.min_version = 0;
-    av4.max_version = 11;
-    response.api_keys.push(av4);
-
-    // ListOffsets (API_KEY_LIST_OFFSETS): versions 0-7
-    let mut av5 = ApiVersion::default();
-    av5.api_key = API_KEY_LIST_OFFSETS;
-    av5.min_version = 0;
-    av5.max_version = 7;
-    response.api_keys.push(av5);
-
-    // OffsetCommit (API_KEY_OFFSET_COMMIT): versions 0-8
-    let mut av6 = ApiVersion::default();
-    av6.api_key = API_KEY_OFFSET_COMMIT;
-    av6.min_version = 0;
-    av6.max_version = 8;
-    response.api_keys.push(av6);
-
-    // OffsetFetch (API_KEY_OFFSET_FETCH): versions 0-7
-    // Note: v8+ changed response format to support multiple groups
-    // We currently only support the single-group format (v0-7)
-    let mut av7 = ApiVersion::default();
-    av7.api_key = API_KEY_OFFSET_FETCH;
-    av7.min_version = 0;
-    av7.max_version = 7;
-    response.api_keys.push(av7);
-
-    // FindCoordinator (API_KEY_FIND_COORDINATOR): versions 0-3
-    let mut av8 = ApiVersion::default();
-    av8.api_key = API_KEY_FIND_COORDINATOR;
-    av8.min_version = 0;
-    av8.max_version = 3;
-    response.api_keys.push(av8);
-
-    // JoinGroup (API_KEY_JOIN_GROUP): versions 0-7
-    let mut av9 = ApiVersion::default();
-    av9.api_key = API_KEY_JOIN_GROUP;
-    av9.min_version = 0;
-    av9.max_version = 7;
-    response.api_keys.push(av9);
-
-    // Heartbeat (API_KEY_HEARTBEAT): versions 0-4
-    let mut av10 = ApiVersion::default();
-    av10.api_key = API_KEY_HEARTBEAT;
-    av10.min_version = 0;
-    av10.max_version = 4;
-    response.api_keys.push(av10);
-
-    // LeaveGroup (API_KEY_LEAVE_GROUP): versions 0-4
-    let mut av11 = ApiVersion::default();
-    av11.api_key = API_KEY_LEAVE_GROUP;
-    av11.min_version = 0;
-    av11.max_version = 4;
-    response.api_keys.push(av11);
-
-    // SyncGroup (API_KEY_SYNC_GROUP): versions 0-4
-    let mut av12 = ApiVersion::default();
-    av12.api_key = API_KEY_SYNC_GROUP;
-    av12.min_version = 0;
-    av12.max_version = 4;
-    response.api_keys.push(av12);
-
-    // DescribeGroups (API_KEY_DESCRIBE_GROUPS): versions 0-5
-    let mut av13 = ApiVersion::default();
-    av13.api_key = API_KEY_DESCRIBE_GROUPS;
-    av13.min_version = 0;
-    av13.max_version = 5;
-    response.api_keys.push(av13);
-
-    // ListGroups (API_KEY_LIST_GROUPS): versions 0-4
-    let mut av14 = ApiVersion::default();
-    av14.api_key = API_KEY_LIST_GROUPS;
-    av14.min_version = 0;
-    av14.max_version = 4;
-    response.api_keys.push(av14);
-
-    // CreateTopics (API_KEY_CREATE_TOPICS): versions 0-5
-    let mut av15 = ApiVersion::default();
-    av15.api_key = API_KEY_CREATE_TOPICS;
-    av15.min_version = 0;
-    av15.max_version = 5;
-    response.api_keys.push(av15);
-
-    // DeleteTopics (API_KEY_DELETE_TOPICS): versions 0-4
-    let mut av16 = ApiVersion::default();
-    av16.api_key = API_KEY_DELETE_TOPICS;
-    av16.min_version = 0;
-    av16.max_version = 4;
-    response.api_keys.push(av16);
-
-    // CreatePartitions (API_KEY_CREATE_PARTITIONS): versions 0-2
-    let mut av17 = ApiVersion::default();
-    av17.api_key = API_KEY_CREATE_PARTITIONS;
-    av17.min_version = 0;
-    av17.max_version = 2;
-    response.api_keys.push(av17);
-
-    // DeleteGroups (API_KEY_DELETE_GROUPS): versions 0-2
-    let mut av18 = ApiVersion::default();
-    av18.api_key = API_KEY_DELETE_GROUPS;
-    av18.min_version = 0;
-    av18.max_version = 2;
-    response.api_keys.push(av18);
-
-    // InitProducerId (API_KEY_INIT_PRODUCER_ID): versions 0-4 (Phase 9)
-    let mut av19 = ApiVersion::default();
-    av19.api_key = API_KEY_INIT_PRODUCER_ID;
-    av19.min_version = 0;
-    av19.max_version = 4;
-    response.api_keys.push(av19);
-
-    // ===== Phase 10: Transaction APIs =====
-
-    // AddPartitionsToTxn (API_KEY_ADD_PARTITIONS_TO_TXN): versions 0-3
-    let mut av20 = ApiVersion::default();
-    av20.api_key = API_KEY_ADD_PARTITIONS_TO_TXN;
-    av20.min_version = 0;
-    av20.max_version = 3;
-    response.api_keys.push(av20);
-
-    // AddOffsetsToTxn (API_KEY_ADD_OFFSETS_TO_TXN): versions 0-3
-    let mut av21 = ApiVersion::default();
-    av21.api_key = API_KEY_ADD_OFFSETS_TO_TXN;
-    av21.min_version = 0;
-    av21.max_version = 3;
-    response.api_keys.push(av21);
-
-    // EndTxn (API_KEY_END_TXN): versions 0-3
-    let mut av22 = ApiVersion::default();
-    av22.api_key = API_KEY_END_TXN;
-    av22.min_version = 0;
-    av22.max_version = 3;
-    response.api_keys.push(av22);
-
-    // TxnOffsetCommit (API_KEY_TXN_OFFSET_COMMIT): versions 0-3
-    let mut av23 = ApiVersion::default();
-    av23.api_key = API_KEY_TXN_OFFSET_COMMIT;
-    av23.min_version = 0;
-    av23.max_version = 3;
-    response.api_keys.push(av23);
+    for &(api_key, min_version, max_version) in API_VERSION_RANGES {
+        let mut av = ApiVersion::default();
+        av.api_key = api_key;
+        av.min_version = min_version;
+        av.max_version = max_version;
+        response.api_keys.push(av);
+    }
 
     response
 }
@@ -518,6 +405,31 @@ mod tests {
         assert!(api_keys.contains(&API_KEY_DELETE_TOPICS));
         assert!(api_keys.contains(&API_KEY_CREATE_PARTITIONS));
         assert!(api_keys.contains(&API_KEY_DELETE_GROUPS));
+    }
+
+    #[test]
+    fn test_supported_version_range_matches_advertised() {
+        // The enforcement table (CONF-6) must agree with what ApiVersions advertises.
+        assert_eq!(supported_version_range(API_KEY_PRODUCE), Some((3, 9)));
+        assert_eq!(supported_version_range(API_KEY_FETCH), Some((0, 11)));
+        assert_eq!(supported_version_range(API_KEY_METADATA), Some((0, 9)));
+        assert_eq!(supported_version_range(API_KEY_OFFSET_FETCH), Some((0, 7)));
+
+        // Every advertised API has a matching enforcement range, and vice versa.
+        let advertised = build_api_versions_response();
+        for entry in &advertised.api_keys {
+            assert_eq!(
+                supported_version_range(entry.api_key),
+                Some((entry.min_version, entry.max_version)),
+                "api_key {} advertised but enforcement range differs",
+                entry.api_key
+            );
+        }
+
+        // An API key pg_kafka doesn't handle has no range (so enforcement skips it and the
+        // dispatcher's unsupported-api-key path handles it instead).
+        assert_eq!(supported_version_range(17), None); // SaslHandshake — not implemented
+        assert_eq!(supported_version_range(9999), None);
     }
 
     // ========== Metadata Builder Tests ==========
