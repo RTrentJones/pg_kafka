@@ -1380,7 +1380,9 @@ mod tests {
 
         // group-1's stuck rebalance must have been aborted (reset to Empty). With the old hardcoded
         // 5-minute timeout, 50ms is nowhere near expiry and the group would still be rebalancing.
-        let g1 = coordinator.get_group_state("group-1").expect("group-1 should exist");
+        let g1 = coordinator
+            .get_group_state("group-1")
+            .expect("group-1 should exist");
         assert_eq!(g1.state, GroupState::Empty);
         assert!(g1.members.is_empty());
     }
