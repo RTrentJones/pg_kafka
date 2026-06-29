@@ -45,22 +45,25 @@ pub async fn test_produce_invalid_partition() -> TestResult {
         )
         .await;
 
-    match result {
+    // QA-3: producing to partition 5 of a 1-partition topic must be rejected, not silently routed
+    // somewhere. librdkafka knows from cached metadata that the partition is out of range and fails
+    // the send locally (UNKNOWN_PARTITION); a success here means a record was accepted for a
+    // partition that doesn't exist — the regression we guard against.
+    let delivered = match result {
         Ok((partition, offset)) => {
-            // Some implementations may auto-create partitions or route differently
-            println!(
-                "   Message delivered to partition {} offset {} (unexpected but acceptable)",
-                partition, offset
-            );
+            println!("   Unexpected delivery to partition {} offset {}", partition, offset);
+            true
         }
         Err((err, _)) => {
             println!("   Expected error received: {}", err);
-            // This is the expected behavior
+            false
         }
-    }
+    };
 
     ctx.cleanup().await?;
-    println!("\n✅ Produce to invalid partition test PASSED\n");
+    if delivered {
+        return Err("produce to a non-existent partition unexpectedly succeeded".into());
+    }
     Ok(())
 }
 
@@ -85,10 +88,26 @@ pub async fn test_produce_any_partition() -> TestResult {
     let offsets = topic.produce(&[msg]).await?;
 
     println!("   Message delivered at offset {}", offsets[0]);
-    println!("✅ Partitioner correctly assigned partition");
+
+    // QA-3: partition -1 means "let the partitioner choose", which must resolve to a *valid*
+    // partition for a 3-partition topic — not be stored as -1 or out of range. Verify the persisted
+    // partition_id is in 0..3.
+    let row = ctx
+        .db()
+        .query_one(
+            "SELECT m.partition_id FROM kafka.messages m
+             JOIN kafka.topics t ON m.topic_id = t.id
+             WHERE t.name = $1",
+            &[&topic.name],
+        )
+        .await?;
+    let partition_id: i32 = row.get(0);
+    println!("   Partitioner assigned partition {}", partition_id);
 
     ctx.cleanup().await?;
-    println!("\n✅ Produce to any partition test PASSED\n");
+    if !(0..3).contains(&partition_id) {
+        return Err("partitioner chose an out-of-range partition".into());
+    }
     Ok(())
 }
 

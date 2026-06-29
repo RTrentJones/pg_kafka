@@ -75,21 +75,21 @@ pub async fn test_connection_refused() -> TestResult {
             match result {
                 Err((kafka_error, _)) => {
                     println!("   Expected failure occurred: {}", kafka_error);
-                    println!("   Error is recoverable/expected");
                 }
                 Ok(_) => {
-                    println!("   Unexpected: message succeeded to non-existent server");
-                    // This might happen if port 19999 is somehow in use
+                    // QA-3: producing to a broker that isn't listening (localhost:19999) must NOT
+                    // succeed.
+                    return Err("produce to a non-existent broker unexpectedly succeeded".into());
                 }
             }
         }
         Err(e) => {
+            // Failing to even build the client is also an acceptable "refused" outcome.
             println!("   Producer creation failed (expected): {}", e);
         }
     }
 
     println!("   Connection refused handled gracefully");
-    println!("\n   Test PASSED (graceful failure handling)\n");
     Ok(())
 }
 
@@ -136,12 +136,13 @@ pub async fn test_produce_timeout() -> TestResult {
         "   Timeouts: {}, Successes: {}",
         timeout_count, success_count
     );
-    // With such a short timeout, we expect at least some failures
-    // But on fast systems, some might succeed
-    println!("   Short timeout behavior verified");
-
+    // QA-3: a 1ms message.timeout.ms is far below the time a real produce (network + SPI insert)
+    // takes, so at least one of five sends must trip the local delivery timeout. (Returning Err
+    // rather than asserting keeps a failure isolated to this test instead of unwinding the suite.)
     ctx.cleanup().await?;
-    println!("\n   Produce timeout test PASSED\n");
+    if timeout_count == 0 {
+        return Err("a 1ms produce timeout should have fired at least once".into());
+    }
     Ok(())
 }
 
@@ -152,6 +153,23 @@ pub async fn test_invalid_group_id() -> TestResult {
     let ctx = TestContext::new().await?;
     let topic = TestTopicBuilder::new(&ctx, "invalid-group").build().await?;
 
+    // Seed one record so the recv() branch below is meaningful: a *working* consumer would deliver
+    // it, so "no delivery" genuinely reflects the empty group.id being rejected rather than an
+    // empty topic.
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", crate::common::get_bootstrap_servers())
+        .set("message.timeout.ms", "5000")
+        .create()?;
+    producer
+        .send(
+            rdkafka::producer::FutureRecord::to(&topic.name)
+                .payload("seed")
+                .key("seed"),
+            Duration::from_secs(5),
+        )
+        .await
+        .map_err(|(e, _)| e)?;
+
     // Try to create consumer with empty group ID
     let consumer_result: Result<StreamConsumer, _> = ClientConfig::new()
         .set("bootstrap.servers", crate::common::get_bootstrap_servers())
@@ -159,35 +177,37 @@ pub async fn test_invalid_group_id() -> TestResult {
         .set("auto.offset.reset", "earliest")
         .create();
 
-    match consumer_result {
+    // QA-3: an empty group.id is invalid — it must never end up consuming a message. We don't pin
+    // *where* it's rejected (librdkafka may reject at create, at subscribe, or just never deliver),
+    // only that the invalid configuration cannot silently behave like a valid consumer.
+    let consumed_with_empty_group = match consumer_result {
         Err(e) => {
-            println!(
-                "   Consumer creation failed with empty group.id (expected): {}",
-                e
-            );
+            println!("   Consumer creation rejected empty group.id (expected): {}", e);
+            false
         }
-        Ok(consumer) => {
-            // Some implementations might allow creation but fail on subscribe
-            match consumer.subscribe(&[&topic.name]) {
-                Err(e) => {
-                    println!("   Subscribe failed with empty group.id (expected): {}", e);
-                }
-                Ok(_) => {
-                    // Try to receive - should fail or return error
-                    match tokio::time::timeout(Duration::from_secs(2), consumer.recv()).await {
-                        Ok(Ok(_)) => println!("   Unexpected: received message with empty group"),
-                        Ok(Err(e)) => println!("   Recv error (expected): {}", e),
-                        Err(_) => println!("   Timeout (acceptable for empty group)"),
-                    }
-                }
+        Ok(consumer) => match consumer.subscribe(&[&topic.name]) {
+            Err(e) => {
+                println!("   Subscribe rejected empty group.id (expected): {}", e);
+                false
             }
-        }
-    }
-
-    println!("   Invalid group ID handled appropriately");
+            Ok(_) => match tokio::time::timeout(Duration::from_secs(2), consumer.recv()).await {
+                Ok(Ok(_)) => true, // a real delivery — that's the regression we guard against
+                Ok(Err(e)) => {
+                    println!("   Recv error (expected): {}", e);
+                    false
+                }
+                Err(_) => {
+                    println!("   Timeout, no delivery (acceptable for empty group)");
+                    false
+                }
+            },
+        },
+    };
 
     ctx.cleanup().await?;
-    println!("\n   Invalid group ID test PASSED\n");
+    if consumed_with_empty_group {
+        return Err("a consumer with an empty group.id must not consume".into());
+    }
     Ok(())
 }
 
@@ -231,10 +251,21 @@ pub async fn test_duplicate_consumer_join() -> TestResult {
     // With a single-partition topic, only one will actually receive messages
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    println!("   Both consumers in group (rebalance handled)");
-    println!("   Duplicate join behavior verified");
+    // QA-3: a second join into a live group must be handled as a rebalance, not an error — both
+    // members stay subscribed to the topic. (subscribe() above already `?`-propagates failure; this
+    // asserts the subscription actually took on both members rather than silently being dropped.)
+    let sub1 = consumer1.subscription()?;
+    let sub2 = consumer2.subscription()?;
+    let topic_name = topic.name.as_str();
+    let has_topic = |sub: &rdkafka::TopicPartitionList| {
+        sub.elements().iter().any(|e| e.topic() == topic_name)
+    };
+    let (ok1, ok2) = (has_topic(&sub1), has_topic(&sub2));
+    println!("   subscriptions after rejoin: consumer1={ok1}, consumer2={ok2}");
 
     ctx.cleanup().await?;
-    println!("\n   Duplicate consumer join test PASSED\n");
+    if !ok1 || !ok2 {
+        return Err("both members must stay subscribed after the rejoin".into());
+    }
     Ok(())
 }

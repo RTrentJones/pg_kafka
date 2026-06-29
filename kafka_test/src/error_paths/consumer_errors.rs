@@ -36,11 +36,13 @@ pub async fn test_fetch_unknown_topic() -> TestResult {
     let timeout = Duration::from_secs(3);
     let start = std::time::Instant::now();
     let mut got_error = false;
+    let mut got_message = false;
 
     while start.elapsed() < timeout {
         match consumer.poll(POLL_TIMEOUT) {
             Some(Ok(msg)) => {
                 println!("   Unexpected message received: {:?}", msg.offset());
+                got_message = true;
             }
             Some(Err(e)) => {
                 println!("   Expected error: {}", e);
@@ -58,7 +60,12 @@ pub async fn test_fetch_unknown_topic() -> TestResult {
     }
 
     ctx.cleanup().await?;
-    println!("\n✅ Fetch from unknown topic test PASSED\n");
+    // QA-3: whether pg_kafka errors or auto-creates the (empty) topic is implementation-defined, but
+    // either way there is no data — a real message must never be delivered from a topic that never
+    // received one.
+    if got_message {
+        return Err("fetch from a non-existent topic delivered a message".into());
+    }
     Ok(())
 }
 
@@ -98,11 +105,13 @@ pub async fn test_fetch_invalid_partition() -> TestResult {
 
     let timeout = Duration::from_secs(3);
     let start = std::time::Instant::now();
+    let mut got_message = false;
 
     while start.elapsed() < timeout {
         match consumer.poll(POLL_TIMEOUT) {
             Some(Ok(_)) => {
                 println!("   Unexpected: received message from invalid partition");
+                got_message = true;
             }
             Some(Err(e)) => {
                 println!("   Expected error: {}", e);
@@ -115,7 +124,11 @@ pub async fn test_fetch_invalid_partition() -> TestResult {
     }
 
     ctx.cleanup().await?;
-    println!("\n✅ Fetch from invalid partition test PASSED\n");
+    // QA-3: partition 10 of a 1-partition topic does not exist, so no record can come from it —
+    // an error or an empty fetch are both acceptable, a delivered message is not.
+    if got_message {
+        return Err("fetch from a non-existent partition delivered a message".into());
+    }
     Ok(())
 }
 
@@ -181,7 +194,12 @@ pub async fn test_fetch_offset_out_of_range() -> TestResult {
     }
 
     ctx.cleanup().await?;
-    println!("\n✅ Fetch from out-of-range offset test PASSED\n");
+    // QA-3: starting at offset 100 with a high-watermark of 5, the only valid outcomes are an
+    // OFFSET_OUT_OF_RANGE error or a reset to the (default `latest`) end with no new data — never a
+    // phantom record at offset 100.
+    if received_any {
+        return Err("fetch from an out-of-range offset delivered a message".into());
+    }
     Ok(())
 }
 

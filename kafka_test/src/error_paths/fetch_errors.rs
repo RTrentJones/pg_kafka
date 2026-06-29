@@ -84,13 +84,15 @@ pub async fn test_fetch_respects_min_one_message() -> TestResult {
         }
     }
 
-    // At least one message should be returned regardless of max_bytes
-    // This is Kafka protocol behavior - max_bytes is advisory
+    // QA-3: max_bytes is advisory — Kafka must still return at least one complete message even when
+    // the message is larger than the fetch budget, otherwise a consumer with a small max_bytes would
+    // stall forever. That guarantee is the whole point of this test, so assert it.
     println!("   Received message: {}", received);
-    println!("✅ Fetch behavior verified (max_bytes is advisory)\n");
 
     ctx.cleanup().await?;
-    println!("✅ Test: Fetch Respects Min One Message PASSED\n");
+    if !received {
+        return Err("fetch with a small max_bytes returned no message".into());
+    }
     Ok(())
 }
 
@@ -354,6 +356,14 @@ pub async fn test_fetch_with_deleted_topic() -> TestResult {
     }
     println!("✅ Consumer received initial message\n");
 
+    // QA-3: the pre-delete record must actually be delivered — otherwise the "fetch after delete"
+    // half below is exercising nothing. (The post-delete outcome is intentionally lenient: an error
+    // or a quiet timeout are both acceptable ways to handle a topic that vanished mid-session.)
+    if !received_before_delete {
+        ctx.cleanup().await?;
+        return Err("consumer never received the pre-delete message".into());
+    }
+
     // 3. Delete topic while consumer is active
     println!("Step 3: Deleting topic...");
     ctx.db()
@@ -388,11 +398,11 @@ pub async fn test_fetch_with_deleted_topic() -> TestResult {
         }
     }
 
+    // Both a clean error and a quiet timeout are acceptable post-delete outcomes.
     println!(
-        "   Fetch after deletion handled (error or no data): {}",
-        got_error_or_timeout || true // Timeout is acceptable
+        "   Fetch after deletion handled gracefully (saw error: {})",
+        got_error_or_timeout
     );
-    println!("✅ Consumer handled topic deletion gracefully\n");
 
     ctx.cleanup().await?;
     println!("✅ Test: Fetch with Deleted Topic PASSED\n");

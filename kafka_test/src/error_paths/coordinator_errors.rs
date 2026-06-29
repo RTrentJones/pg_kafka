@@ -3,6 +3,7 @@
 //! Tests for consumer group coordinator error conditions including
 //! unknown member IDs, stale generations, and protocol violations.
 
+use crate::assertions::{assert_no_committed_offset, assert_offset_committed};
 use crate::common::{create_stream_consumer, TestResult};
 use crate::fixtures::{generate_messages, TestTopicBuilder};
 use crate::setup::TestContext;
@@ -30,21 +31,27 @@ pub async fn test_heartbeat_after_leave() -> TestResult {
     println!("Subscribing consumer to topic...");
     consumer.subscribe(&[&topic.name])?;
 
-    // Poll a few times to join group
+    // Poll to join the group and consume. With auto.offset.reset=earliest and 3 pre-produced
+    // messages, a member that actually joined and got an assignment will receive at least one.
+    let mut received = 0;
     for _ in 0..5 {
-        let _ = tokio::time::timeout(Duration::from_secs(1), consumer.recv()).await;
+        if let Ok(Ok(_)) = tokio::time::timeout(Duration::from_secs(1), consumer.recv()).await {
+            received += 1;
+        }
     }
 
-    println!("Consumer joined group, now dropping (LeaveGroup)...");
+    println!("Consumer joined group (received {received}), now dropping (LeaveGroup)...");
     drop(consumer);
 
     // Small delay for LeaveGroup to process
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    println!("✅ Consumer left group successfully");
-
     ctx.cleanup().await?;
-    println!("\n✅ Heartbeat after leave test PASSED\n");
+    // QA-3: this test is only meaningful if the consumer was a live member before leaving — assert
+    // it actually joined and consumed, otherwise "leave" is exercising an empty group.
+    if received == 0 {
+        return Err("consumer never joined or consumed before leaving".into());
+    }
     Ok(())
 }
 
@@ -105,10 +112,14 @@ pub async fn test_rejoin_after_leave() -> TestResult {
         }
     }
 
-    println!("✅ Second consumer successfully rejoined group");
+    println!("Second consumer received {received} messages after rejoining");
 
     ctx.cleanup().await?;
-    println!("\n✅ Rejoin after leave test PASSED\n");
+    // QA-3: the first consumer left without committing (auto-commit off), so a second consumer in the
+    // same group must rejoin and, starting from earliest, consume the still-available messages.
+    if received == 0 {
+        return Err("second consumer rejoined but consumed nothing".into());
+    }
     Ok(())
 }
 
@@ -143,17 +154,24 @@ pub async fn test_commit_new_group() -> TestResult {
     tpl.add_partition_offset(&topic.name, 0, rdkafka::Offset::Offset(1))?;
 
     println!("Attempting to commit offset for new group...");
-    match consumer.commit(&tpl, rdkafka::consumer::CommitMode::Sync) {
+    let commit_result = consumer.commit(&tpl, rdkafka::consumer::CommitMode::Sync);
+
+    // QA-3: a standalone (assign-based, generation < 0) commit to a brand-new group may either be
+    // accepted (group auto-created) or rejected — both are valid Kafka behaviours. What must hold
+    // either way is consistency between the reported outcome and storage: a reported success means
+    // offset 1 is actually persisted, a reported failure means nothing was written.
+    match &commit_result {
         Ok(_) => {
-            println!("   Commit succeeded (group may have been auto-created)");
+            println!("   Commit succeeded; verifying offset 1 is persisted");
+            assert_offset_committed(ctx.db(), &group_id, &topic.name, 0, 1).await?;
         }
         Err(e) => {
-            println!("   Commit error (may be expected): {}", e);
+            println!("   Commit rejected ({e}); verifying no offset was persisted");
+            assert_no_committed_offset(ctx.db(), &group_id, &topic.name, 0).await?;
         }
     }
 
     ctx.cleanup().await?;
-    println!("\n✅ Commit for new group test PASSED\n");
     Ok(())
 }
 
@@ -177,26 +195,33 @@ pub async fn test_empty_group_id() -> TestResult {
         .set("session.timeout.ms", "6000")
         .create();
 
-    match result {
+    // QA-3: group membership requires a group.id, so an empty one must be rejected — either at
+    // create or at subscribe. It must never yield a consumer that successfully subscribes to a
+    // consumer group.
+    let subscribe_succeeded = match result {
         Ok(consumer) => {
-            // Try to subscribe
             println!("Consumer created with empty group ID, trying to subscribe...");
             match consumer.subscribe(&[&topic.name]) {
                 Ok(_) => {
-                    println!("   Subscribe succeeded (unexpected but acceptable)");
+                    println!("   Subscribe unexpectedly succeeded with empty group.id");
+                    true
                 }
                 Err(e) => {
                     println!("   Subscribe failed (expected): {}", e);
+                    false
                 }
             }
         }
         Err(e) => {
             println!("   Consumer creation failed (expected): {}", e);
+            false
         }
-    }
+    };
 
     ctx.cleanup().await?;
-    println!("\n✅ Empty group ID test PASSED\n");
+    if subscribe_succeeded {
+        return Err("an empty group.id must not subscribe to a group".into());
+    }
     Ok(())
 }
 
@@ -259,9 +284,13 @@ pub async fn test_multiple_consumers_same_group() -> TestResult {
         "   Consumer 1 received: {}, Consumer 2 received: {}",
         c1_received, c2_received
     );
-    println!("✅ Multiple consumers in same group working");
 
     ctx.cleanup().await?;
-    println!("\n✅ Multiple consumers same group test PASSED\n");
+    // QA-3: two consumers in one group over a 2-partition topic with 10 earliest messages must,
+    // between them, actually consume something — a rebalance that delivered nothing to either member
+    // is the failure this guards against.
+    if c1_received + c2_received == 0 {
+        return Err("two consumers in one group received nothing".into());
+    }
     Ok(())
 }
