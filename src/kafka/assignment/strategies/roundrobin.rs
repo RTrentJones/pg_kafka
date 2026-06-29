@@ -158,28 +158,6 @@ mod tests {
     }
 
     #[test]
-    fn test_global_pointer_across_topics() {
-        // CG-6: with topics A(3) and B(2) and two members subscribed to both, the round-robin
-        // pointer must carry ACROSS topics: A0->m1, A1->m2, A2->m1, B0->m2, B1->m1. A per-topic
-        // counter (the bug) restarts at B, giving m1 B0 and m2 B1 instead.
-        let input = make_input(
-            vec![
-                ("member-1", vec!["topic-a", "topic-b"]),
-                ("member-2", vec!["topic-a", "topic-b"]),
-            ],
-            vec![("topic-a", 3), ("topic-b", 2)],
-        );
-
-        let result = RoundRobinStrategy::new().assign(&input);
-
-        assert_eq!(result["member-1"].partitions("topic-a"), vec![0, 2]);
-        assert_eq!(result["member-2"].partitions("topic-a"), vec![1]);
-        // The pointer continues from topic-a into topic-b (the regression check):
-        assert_eq!(result["member-1"].partitions("topic-b"), vec![1]);
-        assert_eq!(result["member-2"].partitions("topic-b"), vec![0]);
-    }
-
-    #[test]
     fn test_odd_distribution() {
         // 5 partitions, 2 consumers -> 3 and 2
         let input = make_input(
@@ -250,9 +228,10 @@ mod tests {
         assert_eq!(result["member-1"].partitions("topic-a"), vec![0, 2]);
         assert_eq!(result["member-2"].partitions("topic-a"), vec![1]);
 
-        // topic-b: 0->m1, 1->m2
-        assert_eq!(result["member-1"].partitions("topic-b"), vec![0]);
-        assert_eq!(result["member-2"].partitions("topic-b"), vec![1]);
+        // CG-6: topic-b continues the GLOBAL pointer from topic-a (B0->m2, B1->m1), rather than
+        // restarting per topic (which previously, wrongly, gave m1 B0 and m2 B1).
+        assert_eq!(result["member-1"].partitions("topic-b"), vec![1]);
+        assert_eq!(result["member-2"].partitions("topic-b"), vec![0]);
     }
 
     #[test]
