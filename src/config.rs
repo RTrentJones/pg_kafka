@@ -311,7 +311,7 @@ pub fn init() {
     GucRegistry::define_string_guc(
         c"pg_kafka.host",
         c"Host/interface to bind to",
-        c"The network interface to listen on. Use 0.0.0.0 for all interfaces. Requires restart.",
+        c"The network interface to listen on. 0.0.0.0 = all interfaces; pg_kafka has no Kafka-wire authentication, so a non-loopback bind must be protected by network controls (firewall/security groups). Use 127.0.0.1 to restrict to local clients. Requires restart.",
         &HOST,
         GucContext::Postmaster,
         GucFlags::default(),
@@ -560,6 +560,27 @@ pub fn init() {
     );
 
     pgrx::log!("pg_kafka GUC parameters initialized (including shadow mode)");
+}
+
+/// SEC-7: returns true when `host` binds the Kafka listener to a non-loopback interface, i.e. the
+/// listener is reachable from other machines. pg_kafka speaks the Kafka wire protocol with **no
+/// authentication or authorization** (no SASL, no ACLs), so a non-loopback bind exposes
+/// unauthenticated read/write to anyone who can reach the port. The caller emits a startup warning
+/// in that case (see `worker.rs`); the no-auth posture itself is accepted-by-design and is mitigated
+/// by network controls + PostgreSQL auth (documented in `docs/PROTOCOL_DEVIATIONS.md`).
+///
+/// Loopback (`127.0.0.0/8`, `::1`, `localhost`) is treated as not-exposed; `0.0.0.0`/`::`/empty mean
+/// "all interfaces" and are exposed; any other specific address is a concrete LAN/public interface
+/// and is therefore also exposed.
+pub fn bind_is_publicly_exposed(host: &str) -> bool {
+    match host {
+        // "all interfaces" (empty defaults to 0.0.0.0 in the bind address)
+        "" | "0.0.0.0" | "::" | "[::]" => true,
+        // explicit loopback
+        "localhost" | "::1" | "[::1]" => false,
+        // 127.0.0.0/8 is loopback; every other concrete address is network-reachable
+        h => !h.starts_with("127."),
+    }
 }
 
 #[cfg(test)]
@@ -854,5 +875,35 @@ mod tests {
         assert_eq!(config1.host, config2.host);
         assert_eq!(config1.shadow_mode_enabled, config2.shadow_mode_enabled);
         assert_eq!(config1.shadow_batch_size, config2.shadow_batch_size);
+    }
+
+    // ========== SEC-7: exposed-bind detection ==========
+
+    #[test]
+    fn test_bind_all_interfaces_is_exposed() {
+        // "all interfaces" forms — reachable from other hosts.
+        assert!(bind_is_publicly_exposed("0.0.0.0"));
+        assert!(bind_is_publicly_exposed("::"));
+        assert!(bind_is_publicly_exposed("[::]"));
+        // empty string defaults to 0.0.0.0 in the bind address
+        assert!(bind_is_publicly_exposed(""));
+    }
+
+    #[test]
+    fn test_bind_loopback_is_not_exposed() {
+        assert!(!bind_is_publicly_exposed("127.0.0.1"));
+        assert!(!bind_is_publicly_exposed("localhost"));
+        assert!(!bind_is_publicly_exposed("::1"));
+        assert!(!bind_is_publicly_exposed("[::1]"));
+        // the whole 127.0.0.0/8 block is loopback
+        assert!(!bind_is_publicly_exposed("127.0.0.53"));
+    }
+
+    #[test]
+    fn test_bind_specific_address_is_exposed() {
+        // A concrete LAN/public interface is network-reachable.
+        assert!(bind_is_publicly_exposed("10.0.0.5"));
+        assert!(bind_is_publicly_exposed("192.168.1.10"));
+        assert!(bind_is_publicly_exposed("0.0.0.1"));
     }
 }

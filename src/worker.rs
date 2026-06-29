@@ -353,6 +353,18 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
                 pgrx::error!("Failed to set non-blocking mode: {}", e);
             }
             pg_log!("TCP listener bound to {}", bind_addr);
+            // SEC-7: pg_kafka performs no Kafka-wire authentication, so warn loudly when the
+            // listener is reachable from other hosts — an operator must not silently expose
+            // unauthenticated read/write access to every topic.
+            if crate::config::bind_is_publicly_exposed(&host) {
+                pg_warning!(
+                    "pg_kafka is bound to {} (a non-loopback interface) and performs NO \
+                     Kafka-wire authentication or authorization — anyone who can reach this port \
+                     can read and write any topic. Protect it with a firewall/security group, or \
+                     set pg_kafka.host = '127.0.0.1' to allow only local clients.",
+                    bind_addr
+                );
+            }
             listener
         }
         Err(e) => {

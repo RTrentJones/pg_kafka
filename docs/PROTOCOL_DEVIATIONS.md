@@ -296,6 +296,18 @@ impl KafkaError {
 
 > Transaction APIs (InitProducerId 22, AddPartitionsToTxn 24, AddOffsetsToTxn 25, EndTxn 26, TxnOffsetCommit 28) and the core Admin APIs (CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups) **are** implemented — see the Summary above and `KAFKA_PROTOCOL_COVERAGE.md`.
 
+## Network Security Posture (SEC-7)
+
+**Status:** Accepted by design, with a startup warning.
+
+pg_kafka speaks the Kafka wire protocol with **no authentication or authorization** — there is no SaslHandshake/SaslAuthenticate negotiation and no ACL enforcement. Any client that can open a TCP connection to the listener can read and write any topic.
+
+- **Default bind is `0.0.0.0`** (`pg_kafka.host`), i.e. all interfaces — chosen because a broker is typically reached from other hosts, and a loopback-only default would make the out-of-the-box configuration unusable for that case.
+- **Mitigation (required for non-loopback binds):** restrict access at the network layer — firewall / cloud security group / private subnet — and rely on PostgreSQL's own authentication for the control plane. Set `pg_kafka.host = '127.0.0.1'` to accept only local clients.
+- **Loud by default:** when the listener binds to a non-loopback interface, pg_kafka emits a startup `WARNING` (see `bind_is_publicly_exposed` in `config.rs` / the bind path in `worker.rs`) so the no-auth exposure is never silent.
+
+Wire-level SASL/ACLs are **not planned**; the accepted posture is network-control + PostgreSQL auth.
+
 ## Compatibility Testing
 
 ### Tested Clients
