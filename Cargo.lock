@@ -939,7 +939,7 @@ dependencies = [
 [[package]]
 name = "kafka-protocol"
 version = "0.17.0"
-source = "git+https://github.com/RTrentJones/kafka-protocol-rs?rev=3e0e6a0c00afa69013a5b19976c4f7f7344e2d0e#3e0e6a0c00afa69013a5b19976c4f7f7344e2d0e"
+source = "git+https://github.com/RTrentJones/kafka-protocol-rs?rev=703af1879bffbcce7e2e4f60b69975d4022d5cd9#703af1879bffbcce7e2e4f60b69975d4022d5cd9"
 dependencies = [
  "anyhow",
  "bytes",
