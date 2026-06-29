@@ -326,12 +326,16 @@ pub fn init() {
         GucFlags::default(),
     );
 
+    // QA-8: these are read once when the background worker (and its listener) start, so changing
+    // them via SET/ALTER SYSTEM has no effect until a restart. Register them as `Postmaster` context
+    // so the labelling is honest — an attempted runtime SET fails loudly instead of silently no-op'ing
+    // — rather than `Suset`, which advertises a runtime reload the worker never performs.
     GucRegistry::define_bool_guc(
         c"pg_kafka.log_connections",
         c"Whether to log each connection",
-        c"When enabled, logs every incoming connection. Can be changed at runtime.",
+        c"When enabled, logs every incoming connection. Read at worker start; requires a restart.",
         &LOG_CONNECTIONS,
-        GucContext::Suset,
+        GucContext::Postmaster,
         GucFlags::default(),
     );
 
@@ -342,7 +346,7 @@ pub fn init() {
         &SHUTDOWN_TIMEOUT_MS,
         MIN_SHUTDOWN_TIMEOUT_MS,
         60000,
-        GucContext::Suset,
+        GucContext::Postmaster,
         GucFlags::default(),
     );
 
@@ -353,7 +357,7 @@ pub fn init() {
         &DEFAULT_PARTITIONS,
         1,
         10000,
-        GucContext::Suset,
+        GucContext::Postmaster,
         GucFlags::default(),
     );
 
@@ -364,7 +368,7 @@ pub fn init() {
         &FETCH_POLL_INTERVAL_MS,
         MIN_FETCH_POLL_INTERVAL_MS,
         MAX_FETCH_POLL_INTERVAL_MS,
-        GucContext::Suset,
+        GucContext::Postmaster,
         GucFlags::default(),
     );
 
@@ -373,7 +377,7 @@ pub fn init() {
         c"Enable long polling for FetchRequest",
         c"When enabled, FetchRequest will wait up to max_wait_ms for data. Default: true.",
         &ENABLE_LONG_POLLING,
-        GucContext::Suset,
+        GucContext::Postmaster,
         GucFlags::default(),
     );
 
@@ -382,7 +386,7 @@ pub fn init() {
         c"Compression type for FetchResponse encoding",
         c"Compression codec for outbound messages: none, gzip, snappy, lz4, zstd. Default: none.",
         &COMPRESSION_TYPE,
-        GucContext::Suset,
+        GucContext::Postmaster,
         GucFlags::default(),
     );
 
@@ -391,7 +395,7 @@ pub fn init() {
         c"Enable timing instrumentation for performance research",
         c"When enabled, logs transaction and handler timing for each request. Use for benchmarking.",
         &LOG_TIMING,
-        GucContext::Suset,
+        GucContext::Postmaster,
         GucFlags::default(),
     );
 
