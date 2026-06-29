@@ -712,14 +712,16 @@ pub struct RecordHeader {
 }
 
 // ============================================================================
-// Byte Size Calculation for Backpressure
+// Approximate byte-size estimators
 // ============================================================================
+// QA-4: these once fed a byte-weighted backpressure tracker that was never wired in (the request
+// channel is count-bounded); that dead module was removed. They are kept as request memory-size
+// utilities.
 
 impl Record {
-    /// Calculate approximate byte size of this record for backpressure tracking.
+    /// Calculate the approximate in-memory byte size of this record.
     ///
     /// This is an estimate of memory usage, not the exact wire format size.
-    /// Used for byte-weighted channel backpressure to prevent OOM.
     pub fn approx_byte_size(&self) -> usize {
         let key_size = self.key.as_ref().map(|k| k.len()).unwrap_or(0);
         let value_size = self.value.as_ref().map(|v| v.len()).unwrap_or(0);
