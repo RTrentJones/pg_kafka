@@ -35,6 +35,12 @@ mock! {
         ) -> Result<Vec<FetchedMessage>>;
         fn get_high_watermark(&self, topic_id: i32, partition_id: i32) -> Result<i64>;
         fn get_earliest_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64>;
+        fn get_offset_for_timestamp(
+            &self,
+            topic_id: i32,
+            partition_id: i32,
+            timestamp_ms: i64,
+        ) -> Result<Option<(i64, i64)>>;
         fn commit_offset<'a>(
             &self,
             group_id: &'a str,

@@ -172,6 +172,7 @@ use kafka_test::{
     test_large_message_value,
     test_large_value_compression,
     test_leave_during_rebalance,
+    test_list_offsets_by_timestamp,
     test_list_offsets_empty_topic,
     test_local_only_mode,
     // Long polling tests
@@ -503,6 +504,12 @@ fn get_all_tests() -> Vec<TestDef> {
             category: "offset_management",
             name: "test_high_watermark_no_regress_after_cleanup",
             test_fn: wrap_test!(test_high_watermark_no_regress_after_cleanup),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "offset_management",
+            name: "test_list_offsets_by_timestamp",
+            test_fn: wrap_test!(test_list_offsets_by_timestamp),
             parallel_safe: true,
         },
         // Offset management edge case tests

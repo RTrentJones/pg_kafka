@@ -5,7 +5,7 @@
 // Phase 10: Added isolation_level support for transactional reads.
 
 use super::helpers::{resolve_topic_id, topic_resolution_error_code, TopicResolution};
-use crate::kafka::constants::{ERROR_NONE, ERROR_UNSUPPORTED_VERSION};
+use crate::kafka::constants::ERROR_NONE;
 use crate::kafka::error::Result;
 use crate::kafka::handler_context::HandlerContext;
 use crate::kafka::storage::IsolationLevel;
@@ -287,9 +287,33 @@ pub fn handle_list_offsets(
                     }
                 }
                 _ => {
-                    // Timestamp-based lookup not yet implemented
-                    // For now, return UNSUPPORTED_VERSION error
-                    partition_response.error_code = ERROR_UNSUPPORTED_VERSION;
+                    // CONF-7: a real timestamp lookup — the earliest offset whose stored record
+                    // timestamp (BUG-7) is at or after the requested one. Per the protocol, return
+                    // offset -1 (and timestamp -1) when no record qualifies, rather than erroring.
+                    match store.get_offset_for_timestamp(topic_id, partition_id, timestamp) {
+                        Ok(Some((offset, record_ts))) => {
+                            partition_response.error_code = ERROR_NONE;
+                            partition_response.offset = offset;
+                            partition_response.timestamp = record_ts;
+                        }
+                        Ok(None) => {
+                            partition_response.error_code = ERROR_NONE;
+                            partition_response.offset = -1;
+                            partition_response.timestamp = -1;
+                        }
+                        Err(e) => {
+                            let error_code = e.to_kafka_error_code();
+                            if e.is_server_error() {
+                                crate::pg_warning!(
+                                    "Failed timestamp lookup for topic_id={}, partition={}: {}",
+                                    topic_id,
+                                    partition_id,
+                                    e
+                                );
+                            }
+                            partition_response.error_code = error_code;
+                        }
+                    }
                     partition_responses.push(partition_response);
                     continue;
                 }

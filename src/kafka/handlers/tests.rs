@@ -295,6 +295,42 @@ mod tests {
         assert_eq!(partition_response.offset, 100);
     }
 
+    #[test]
+    fn test_handle_list_offsets_by_timestamp() {
+        // CONF-7: a positive timestamp resolves to the earliest qualifying offset (and its record
+        // timestamp), instead of returning UNSUPPORTED_VERSION.
+        let mut mock = MockKafkaStore::new();
+        mock.expect_get_topic_metadata().returning(|_| {
+            Ok(vec![TopicMetadata {
+                name: "test-topic".to_string(),
+                id: 1,
+                partition_count: 1,
+            }])
+        });
+        mock.expect_get_offset_for_timestamp()
+            .returning(|_, _, _| Ok(Some((7, 1_600_000_002_000))));
+
+        let topics = vec![ListOffsetsTopicData {
+            name: "test-topic".to_string(),
+            partitions: vec![ListOffsetsPartitionData {
+                partition_index: 0,
+                current_leader_epoch: -1,
+                timestamp: 1_600_000_001_500, // a real (positive) timestamp
+            }],
+        }];
+
+        let coordinator = GroupCoordinator::new();
+        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+
+        let response = fetch::handle_list_offsets(&ctx, topics).unwrap();
+
+        let partition_response = &response.topics[0].partitions[0];
+        assert_eq!(partition_response.error_code, ERROR_NONE);
+        assert_eq!(partition_response.offset, 7);
+        assert_eq!(partition_response.timestamp, 1_600_000_002_000);
+    }
+
     // ========== Metadata Handler Tests ==========
 
     #[test]

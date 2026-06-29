@@ -983,6 +983,16 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
         self.inner.get_earliest_offset(topic_id, partition_id)
     }
 
+    fn get_offset_for_timestamp(
+        &self,
+        topic_id: i32,
+        partition_id: i32,
+        timestamp_ms: i64,
+    ) -> Result<Option<(i64, i64)>> {
+        self.inner
+            .get_offset_for_timestamp(topic_id, partition_id, timestamp_ms)
+    }
+
     // ===== Consumer Offset Operations =====
 
     fn commit_offset(
