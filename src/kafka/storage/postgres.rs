@@ -191,12 +191,15 @@ impl KafkaStore for PostgresStore {
                     }
                 })
                 .collect();
+            // BUG-7: persist the producer's record timestamp (epoch ms) instead of dropping it; -1
+            // marks "no timestamp" so the fetch path falls back to the broker insert time.
+            let timestamps: Vec<i64> = records.iter().map(|r| r.timestamp.unwrap_or(-1)).collect();
 
             // Execute single INSERT with UNNEST - type-safe parameterized query
             client
                 .update(
-                    "INSERT INTO kafka.messages (topic_id, partition_id, partition_offset, key, value, headers)
-                     SELECT * FROM unnest($1::int[], $2::int[], $3::bigint[], $4::bytea[], $5::bytea[], $6::jsonb[])",
+                    "INSERT INTO kafka.messages (topic_id, partition_id, partition_offset, key, value, headers, timestamp_ms)
+                     SELECT * FROM unnest($1::int[], $2::int[], $3::bigint[], $4::bytea[], $5::bytea[], $6::jsonb[], $7::bigint[])",
                     None,
                     &[
                         topic_ids.into(),
@@ -205,6 +208,7 @@ impl KafkaStore for PostgresStore {
                         keys.into(),
                         values.into(),
                         headers.into(),
+                        timestamps.into(),
                     ],
                 )
                 .map_err(|e| KafkaError::Internal(format!("Failed to insert records: {}", e)))?;
@@ -279,7 +283,7 @@ impl KafkaStore for PostgresStore {
             // pg_column_size() gives actual storage size including TOAST overhead
             let table = client.select(
                 "SELECT partition_offset, key, value,
-                        EXTRACT(EPOCH FROM created_at)::bigint * 1000 as timestamp_ms,
+                        CASE WHEN timestamp_ms >= 0 THEN timestamp_ms ELSE (EXTRACT(EPOCH FROM created_at) * 1000)::bigint END as timestamp_ms,
                         SUM(COALESCE(pg_column_size(key), 0) + COALESCE(pg_column_size(value), 0) + 64)
                             OVER (ORDER BY partition_offset) as cumulative_bytes
                  FROM kafka.messages
@@ -1245,12 +1249,14 @@ impl KafkaStore for PostgresStore {
             let producer_ids: Vec<i64> = vec![producer_id; count];
             let producer_epochs: Vec<i16> = vec![producer_epoch; count];
             let txn_states: Vec<&str> = vec!["pending"; count];
+            // BUG-7: persist the producer's record timestamp (epoch ms); -1 means "no timestamp".
+            let timestamps: Vec<i64> = records.iter().map(|r| r.timestamp.unwrap_or(-1)).collect();
 
             // Execute single INSERT with UNNEST including transaction columns
             client
                 .update(
-                    "INSERT INTO kafka.messages (topic_id, partition_id, partition_offset, key, value, headers, producer_id, producer_epoch, txn_state)
-                     SELECT * FROM unnest($1::int[], $2::int[], $3::bigint[], $4::bytea[], $5::bytea[], $6::jsonb[], $7::bigint[], $8::smallint[], $9::text[])",
+                    "INSERT INTO kafka.messages (topic_id, partition_id, partition_offset, key, value, headers, producer_id, producer_epoch, txn_state, timestamp_ms)
+                     SELECT * FROM unnest($1::int[], $2::int[], $3::bigint[], $4::bytea[], $5::bytea[], $6::jsonb[], $7::bigint[], $8::smallint[], $9::text[], $10::bigint[])",
                     None,
                     &[
                         topic_ids.into(),
@@ -1262,6 +1268,7 @@ impl KafkaStore for PostgresStore {
                         producer_ids.into(),
                         producer_epochs.into(),
                         txn_states.into(),
+                        timestamps.into(),
                     ],
                 )
                 .map_err(|e| KafkaError::Internal(format!("Failed to insert transactional records: {}", e)))?;
@@ -1549,7 +1556,7 @@ impl KafkaStore for PostgresStore {
                 IsolationLevel::ReadUncommitted => {
                     // Return all records including pending, with cumulative byte tracking
                     "SELECT partition_offset, key, value,
-                            EXTRACT(EPOCH FROM created_at)::bigint * 1000 as timestamp_ms,
+                            CASE WHEN timestamp_ms >= 0 THEN timestamp_ms ELSE (EXTRACT(EPOCH FROM created_at) * 1000)::bigint END as timestamp_ms,
                             SUM(COALESCE(pg_column_size(key), 0) + COALESCE(pg_column_size(value), 0) + 64)
                                 OVER (ORDER BY partition_offset) as cumulative_bytes
                      FROM kafka.messages
@@ -1560,7 +1567,7 @@ impl KafkaStore for PostgresStore {
                 IsolationLevel::ReadCommitted => {
                     // Filter out pending and aborted records, with cumulative byte tracking
                     "SELECT partition_offset, key, value,
-                            EXTRACT(EPOCH FROM created_at)::bigint * 1000 as timestamp_ms,
+                            CASE WHEN timestamp_ms >= 0 THEN timestamp_ms ELSE (EXTRACT(EPOCH FROM created_at) * 1000)::bigint END as timestamp_ms,
                             SUM(COALESCE(pg_column_size(key), 0) + COALESCE(pg_column_size(value), 0) + 64)
                                 OVER (ORDER BY partition_offset) as cumulative_bytes
                      FROM kafka.messages

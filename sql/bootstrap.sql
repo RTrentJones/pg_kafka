@@ -29,7 +29,13 @@ CREATE TABLE kafka.messages (
     key BYTEA,
     value BYTEA,
     headers JSONB,
-    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    -- BUG-7 (AUDIT-2026-06): the producer's record timestamp (epoch ms), stored verbatim so consumers
+    -- read the producer's time, not the broker's insert time. -1 means the record carried no
+    -- timestamp; the fetch path then falls back to created_at.
+    timestamp_ms BIGINT NOT NULL DEFAULT -1,
+    -- created_at is the broker insert time, kept for retention/cleanup. TIMESTAMPTZ (not naive
+    -- TIMESTAMP) so EXTRACT(EPOCH ...) is unambiguous and doesn't skew by the session time zone.
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     -- Phase 10: Transaction tracking columns
     producer_id BIGINT,                -- Producer ID for transactional messages (NULL for non-transactional)
     producer_epoch SMALLINT,           -- Producer epoch for fencing
