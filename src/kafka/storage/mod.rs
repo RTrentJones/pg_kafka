@@ -207,6 +207,16 @@ pub trait KafkaStore {
     /// Earliest offset (0 if partition is empty)
     fn get_earliest_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64>;
 
+    /// Find the earliest offset whose record timestamp is at or after `timestamp_ms` (CONF-7,
+    /// Kafka's ListOffsets-by-timestamp). Returns `(offset, record_timestamp_ms)`, or `None` when no
+    /// visible record qualifies. Records that carried no timestamp (stored as -1) are excluded.
+    fn get_offset_for_timestamp(
+        &self,
+        topic_id: i32,
+        partition_id: i32,
+        timestamp_ms: i64,
+    ) -> Result<Option<(i64, i64)>>;
+
     // ===== Consumer Offset Operations =====
 
     /// Commit consumer offsets for a group

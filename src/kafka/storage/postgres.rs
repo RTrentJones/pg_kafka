@@ -382,6 +382,42 @@ impl KafkaStore for PostgresStore {
         .map_err(|e: KafkaError| KafkaError::Internal(format!("get_earliest_offset failed: {}", e)))
     }
 
+    fn get_offset_for_timestamp(
+        &self,
+        topic_id: i32,
+        partition_id: i32,
+        timestamp_ms: i64,
+    ) -> Result<Option<(i64, i64)>> {
+        Spi::connect(|client| {
+            // CONF-7: the lowest committed offset whose stored producer timestamp (BUG-7) is at or
+            // after the target. Records with no timestamp (-1) are excluded; pending/aborted txn
+            // rows are excluded so the lookup matches read-committed visibility.
+            let table = client.select(
+                "SELECT partition_offset, timestamp_ms
+                 FROM kafka.messages
+                 WHERE topic_id = $1 AND partition_id = $2
+                   AND timestamp_ms >= 0 AND timestamp_ms >= $3
+                   AND txn_state IS NULL
+                 ORDER BY partition_offset ASC
+                 LIMIT 1",
+                None,
+                &[topic_id.into(), partition_id.into(), timestamp_ms.into()],
+            )?;
+
+            let row = table.first();
+            match row.get_by_name::<i64, _>("partition_offset")? {
+                Some(offset) => {
+                    let ts: i64 = row.get_by_name("timestamp_ms")?.unwrap_or(-1);
+                    Ok(Some((offset, ts)))
+                }
+                None => Ok(None),
+            }
+        })
+        .map_err(|e: KafkaError| {
+            KafkaError::Internal(format!("get_offset_for_timestamp failed: {}", e))
+        })
+    }
+
     fn commit_offset(
         &self,
         group_id: &str,

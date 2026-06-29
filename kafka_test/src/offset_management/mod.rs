@@ -6,11 +6,13 @@
 //! - Edge cases: metadata, reset policy, multi-partition, seek
 
 mod boundaries;
+mod by_timestamp;
 mod commit_fetch;
 mod edge_cases;
 mod no_reuse;
 
 pub use boundaries::test_offset_boundaries;
+pub use by_timestamp::test_list_offsets_by_timestamp;
 pub use commit_fetch::test_offset_commit_fetch;
 pub use no_reuse::{
     test_high_watermark_no_regress_after_cleanup, test_offset_no_reuse_after_cleanup,
