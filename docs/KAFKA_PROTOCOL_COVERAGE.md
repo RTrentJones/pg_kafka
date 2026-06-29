@@ -12,7 +12,7 @@
 |--------|-------|
 | **API Coverage** | 23 of ~50 standard Kafka APIs (46%) |
 | **Build Status** | ✅ Compiles with zero warnings |
-| **Test Suite** | 609 unit tests + 173 E2E tests |
+| **Test Suite** | 672 unit tests + 181 E2E tests |
 | **Architecture** | Repository Pattern with typed errors |
 | **Client Compatibility** | ✅ kcat, rdkafka verified |
 
@@ -44,10 +44,10 @@
 | Fetch | 1 | v0-v13 | ✅ Complete | Read messages with long polling support |
 | OffsetCommit | 8 | v0-v8 | ✅ Complete | Commit consumed offsets |
 | OffsetFetch | 9 | v0-v7 | ✅ Complete | Retrieve committed offsets (v8+ not supported) |
-| ListOffsets | 2 | v0-v7 | ✅ Complete | Get earliest/latest offsets |
+| ListOffsets | 2 | v0-v7 | ✅ Complete | Get earliest/latest/by-timestamp offsets |
 
 **Implementation Notes:**
-- ✅ ListOffsets supports special timestamps (-2 = earliest, -1 = latest)
+- ✅ ListOffsets supports special timestamps (-2 = earliest, -1 = latest) and arbitrary timestamp lookup (earliest offset whose record timestamp ≥ target; AUDIT-2026-06 BUG-7 + CONF-7)
 - ✅ OffsetFetch limited to v0-v7 (v8+ requires different response format)
 - ✅ All consumer data access APIs fully functional
 - ✅ Long polling with max_wait_ms/min_bytes support
@@ -481,30 +481,30 @@ Consumer Flow (Current):
 - **Testing**: E2E tests with rdkafka
 - **Documentation**: Comprehensive design docs
 
-### Test Coverage (609 unit tests + 173 E2E tests)
+### Test Coverage (672 unit tests + 181 E2E tests)
 
 | Category | Count | Location |
 |----------|-------|----------|
-| Shadow mode | 146 | `src/kafka/shadow/` |
-| Protocol encoding | 85 | `src/kafka/protocol/` |
-| Handler logic | 76 | `src/kafka/handlers/` |
-| Assignment strategies | 67 | `src/kafka/assignment/` |
-| Storage layer | 43 | `src/kafka/storage/tests.rs` |
-| Messages | 39 | `src/kafka/messages.rs` |
-| Response builders | 30 | `src/kafka/response_builders.rs` |
+| Shadow mode | 151 | `src/kafka/shadow/` |
+| Protocol encoding | 97 | `src/kafka/protocol/` |
+| Handler logic | 86 | `src/kafka/handlers/` |
+| Assignment strategies | 69 | `src/kafka/assignment/` |
+| Storage layer | 49 | `src/kafka/storage/` |
+| Messages | 49 | `src/kafka/messages.rs` |
+| Response builders | 31 | `src/kafka/response_builders.rs` |
 | Error handling | 22 | `src/kafka/error.rs` |
 | Config | 32 | `src/config.rs` |
 | Testing infrastructure | 23 | `src/testing/` |
-| Other | 46 | Coordinator, partitioner, constants |
-| **Unit Total** | **609** | |
-| **E2E Test Suite** | **173** | `kafka_test/` |
+| Other | 63 | Coordinator, partitioner, constants |
+| **Unit Total** | **672** | |
+| **E2E Test Suite** | **181** | `kafka_test/` |
 
-**E2E Test Categories (173 tests):**
-- Admin APIs (14 tests)
-- Producer (2 tests)
+**E2E Test Categories (181 tests):**
+- Admin APIs (15 tests)
+- Producer (4 tests)
 - Consumer (3 tests)
 - Consumer Groups (13 tests)
-- Offset Management (7 tests)
+- Offset Management (10 tests)
 - Partitioning (9 tests)
 - Compression (10 tests)
 - Idempotent (7 tests)
@@ -514,10 +514,10 @@ Consumer Flow (Current):
 - Error Paths (21 tests)
 - Edge Cases (11 tests)
 - Concurrent Operations (13 tests)
-- Negative (4 tests)
+- Negative (5 tests)
 - Performance (7 tests)
 - Metadata (3 tests)
-- Protocol (4 tests)
+- Protocol (5 tests)
 
 ---
 

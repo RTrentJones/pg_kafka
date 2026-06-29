@@ -431,7 +431,7 @@ pg_kafka.shadow_mode_enabled = true                    -- Default: false
 
 -- External Kafka connection
 pg_kafka.shadow_bootstrap_servers = 'kafka1:9092,kafka2:9092'  -- Required
-pg_kafka.shadow_security_protocol = 'SASL_SSL'         -- Default: PLAINTEXT
+pg_kafka.shadow_security_protocol = 'SASL_SSL'         -- Default: SASL_SSL (use PLAINTEXT for local/no-auth)
 pg_kafka.shadow_sasl_mechanism = 'SCRAM-SHA-256'       -- Default: PLAIN
 pg_kafka.shadow_sasl_username = 'your_username'        -- Default: empty
 pg_kafka.shadow_sasl_password = 'your_password'        -- Default: empty
