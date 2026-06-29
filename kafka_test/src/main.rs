@@ -218,6 +218,7 @@ use kafka_test::{
     test_sasl_password_guc_is_superuser_only,
     test_producer,
     test_producer_acks_zero,
+    test_producer_timestamp_roundtrip,
     // Transaction tests
     test_producer_fencing,
     test_producer_fencing_mid_transaction,
@@ -452,6 +453,12 @@ fn get_all_tests() -> Vec<TestDef> {
             category: "producer",
             name: "test_producer_acks_zero",
             test_fn: wrap_test!(test_producer_acks_zero),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "producer",
+            name: "test_producer_timestamp_roundtrip",
+            test_fn: wrap_test!(test_producer_timestamp_roundtrip),
             parallel_safe: true,
         },
         // Consumer tests
