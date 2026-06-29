@@ -8,9 +8,11 @@
 //
 // The dispatch_response() function encapsulates this pattern.
 
+use crate::kafka::constants::ERROR_UNKNOWN_SERVER_ERROR;
 use crate::kafka::error::KafkaError;
 use crate::kafka::messages::KafkaResponse;
 use crate::{pg_log, pg_warning};
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use tokio::sync::mpsc::UnboundedSender;
 
 /// Dispatch a handler result to the response channel.
@@ -43,8 +45,14 @@ pub fn dispatch_response<R, F, W, E>(
     W: FnOnce(R) -> KafkaResponse,
     E: FnOnce(i16) -> KafkaResponse,
 {
-    match handler() {
-        Ok(result) => {
+    // BUG-5: a handler panic (including a Postgres ERROR, which pgrx surfaces as a Rust panic) must
+    // not leave the client hanging until its request timeout. Catch the panic, reply
+    // UNKNOWN_SERVER_ERROR, then re-raise the original payload so the surrounding subtransaction
+    // still rolls back the request's partial writes (see worker::run_request_in_subtransaction).
+    // The panic branch does only Rust work (channel send + response construction, Rust allocator) —
+    // no Postgres calls — so it is safe to run before FlushErrorState at the subtransaction boundary.
+    match catch_unwind(AssertUnwindSafe(handler)) {
+        Ok(Ok(result)) => {
             let response = wrap_response(result);
             if let Err(e) = response_tx.send(response) {
                 pg_warning!("Failed to send {} response: {}", handler_name, e);
@@ -52,12 +60,21 @@ pub fn dispatch_response<R, F, W, E>(
                 pg_log!("{} response sent successfully", handler_name);
             }
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             pg_warning!("Failed to handle {} request: {}", handler_name, e);
             let error_response = wrap_error(e.to_kafka_error_code());
             if let Err(send_err) = response_tx.send(error_response) {
                 pg_warning!("Failed to send error response: {}", send_err);
             }
+        }
+        Err(panic) => {
+            pg_warning!(
+                "{} handler panicked; replying UNKNOWN_SERVER_ERROR and rolling back",
+                handler_name
+            );
+            let error_response = wrap_error(ERROR_UNKNOWN_SERVER_ERROR);
+            let _ = response_tx.send(error_response);
+            resume_unwind(panic);
         }
     }
 }
@@ -156,6 +173,47 @@ mod tests {
                 assert_eq!(error_message.unwrap(), "API-specific error");
             }
             _ => panic!("Expected error response"),
+        }
+    }
+
+    #[test]
+    fn test_dispatch_response_handler_panic_replies_and_resumes() {
+        // BUG-5: a panicking handler must still produce a response (so the client is not left
+        // hanging) AND re-raise the panic (so the surrounding subtransaction rolls back).
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            dispatch_response(
+                "Test",
+                tx,
+                || -> Result<i32, KafkaError> { panic!("handler boom") },
+                |result| KafkaResponse::Error {
+                    correlation_id: result,
+                    error_code: 0,
+                    error_message: None,
+                },
+                |error_code| KafkaResponse::Error {
+                    correlation_id: 42,
+                    error_code,
+                    error_message: None,
+                },
+            );
+        }));
+
+        // The panic is re-raised for the caller (subtransaction) to roll back.
+        assert!(outcome.is_err());
+
+        // ...but an error response was sent first, so the client is not left hanging.
+        match rx.try_recv().expect("error response should have been sent") {
+            KafkaResponse::Error {
+                correlation_id,
+                error_code,
+                ..
+            } => {
+                assert_eq!(correlation_id, 42);
+                assert_eq!(error_code, ERROR_UNKNOWN_SERVER_ERROR);
+            }
+            _ => panic!("Expected Error response"),
         }
     }
 
