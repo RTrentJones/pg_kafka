@@ -108,7 +108,24 @@ fn run_request_in_subtransaction<F: FnOnce()>(f: F) -> Result<(), String> {
 /// Verify that the kafka schema and required tables exist.
 /// Returns Ok(()) if all tables exist, Err with description if any are missing.
 fn verify_schema(database: &str) -> Result<(), String> {
-    let required_tables = ["topics", "messages", "consumer_offsets"];
+    // QA-7: verify every table the runtime depends on, not just the core three, so a partial or
+    // stale schema (e.g. missing the phase-9/10 idempotent/transaction tables, the BUG-3 offset
+    // counter, or the shadow tables) is caught at worker start rather than as a late SPI failure on
+    // the first produce/txn/shadow operation. `CREATE EXTENSION pg_kafka` creates all of these.
+    let required_tables = [
+        "topics",
+        "messages",
+        "consumer_offsets",
+        "consumer_groups",
+        "partition_offsets",
+        "producer_ids",
+        "producer_sequences",
+        "transactions",
+        "txn_pending_offsets",
+        "shadow_config",
+        "shadow_metrics",
+        "shadow_tracking",
+    ];
 
     let result: Result<Option<String>, pgrx::spi::SpiError> = Spi::connect(|client| {
         for table in required_tables {
