@@ -3079,7 +3079,10 @@ mod tests {
         let frame = build_request_frame(API_KEY_METADATA, 10, 7777, 2, &request, 9);
 
         let parsed = parse_request(frame, tx).unwrap();
-        assert!(parsed.is_none(), "out-of-range version should not yield a request");
+        assert!(
+            parsed.is_none(),
+            "out-of-range version should not yield a request"
+        );
 
         match rx.try_recv() {
             Ok(super::super::super::messages::KafkaResponse::Error {
@@ -3090,7 +3093,10 @@ mod tests {
                 assert_eq!(correlation_id, 7777);
                 assert_eq!(error_code, ERROR_UNSUPPORTED_VERSION);
             }
-            other => panic!("Expected UNSUPPORTED_VERSION Error response, got {:?}", other),
+            other => panic!(
+                "Expected UNSUPPORTED_VERSION Error response, got {:?}",
+                other
+            ),
         }
     }
 
