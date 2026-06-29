@@ -28,17 +28,20 @@ pub async fn test_sasl_password_guc_is_superuser_only() -> TestResult {
     )
     .await?;
 
-    // Sanity: as the (superuser) test role, reading the GUC succeeds.
-    db.query_one("SHOW pg_kafka.shadow_sasl_password", &[]).await?;
+    // Sanity: as the (superuser) test role, reading the GUC succeeds. Use simple_query — SHOW/SET
+    // are utility statements that the extended (prepared) protocol can reject.
+    db.simple_query("SHOW pg_kafka.shadow_sasl_password").await?;
 
     // As the non-superuser role, reading it must be rejected (SUPERUSER_ONLY).
-    db.execute("SET ROLE pg_kafka_sec8_probe", &[]).await?;
-    let unpriv_read = db.query_one("SHOW pg_kafka.shadow_sasl_password", &[]).await;
-    db.execute("RESET ROLE", &[]).await?;
+    db.simple_query("SET ROLE pg_kafka_sec8_probe").await?;
+    let unpriv_read = db.simple_query("SHOW pg_kafka.shadow_sasl_password").await;
+    db.simple_query("RESET ROLE").await?;
 
     if unpriv_read.is_ok() {
         return Err(
-            "SEC-8 regression: a non-superuser read pg_kafka.shadow_sasl_password".to_string().into(),
+            "SEC-8 regression: a non-superuser read pg_kafka.shadow_sasl_password"
+                .to_string()
+                .into(),
         );
     }
     println!("✅ a non-superuser cannot read the SASL password GUC");
