@@ -335,10 +335,21 @@ impl KafkaStore for PostgresStore {
 
     fn get_high_watermark(&self, topic_id: i32, partition_id: i32) -> Result<i64> {
         Spi::connect(|client| {
+            // BUG-4: the high watermark must be the log-end offset and must never regress. A plain
+            // MAX(partition_offset)+1 drops when cleanup_aborted_messages deletes the highest
+            // (aborted) rows, reporting a HWM below offsets already handed out. Use the never-
+            // decreasing per-partition counter (kafka.partition_offsets, the same source produce
+            // assigns from — see BUG-3), taking GREATEST with MAX+1 as a backstop for partitions
+            // that predate the counter. Read isolation (read_committed vs read_uncommitted) is
+            // unaffected: that is decided by the fetch row filter and the last-stable-offset, not by
+            // the HWM bound reported here.
             let table = client.select(
-                "SELECT COALESCE(MAX(partition_offset) + 1, 0) as high_watermark
-                 FROM kafka.messages
-                 WHERE topic_id = $1 AND partition_id = $2",
+                "SELECT GREATEST(
+                     COALESCE((SELECT next_offset FROM kafka.partition_offsets
+                               WHERE topic_id = $1 AND partition_id = $2), 0),
+                     COALESCE((SELECT MAX(partition_offset) + 1 FROM kafka.messages
+                               WHERE topic_id = $1 AND partition_id = $2), 0)
+                 ) AS high_watermark",
                 None,
                 &[topic_id.into(), partition_id.into()],
             )?;

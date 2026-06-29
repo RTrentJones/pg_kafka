@@ -151,6 +151,7 @@ use kafka_test::{
     test_heartbeat_during_rebalance_window,
     test_heartbeat_keeps_membership,
     test_high_offset_values,
+    test_high_watermark_no_regress_after_cleanup,
     test_hundred_percent_forwarding,
     // Idempotent producer tests
     test_idempotent_concurrent_producers,
@@ -489,6 +490,12 @@ fn get_all_tests() -> Vec<TestDef> {
             category: "offset_management",
             name: "test_offset_no_reuse_after_cleanup",
             test_fn: wrap_test!(test_offset_no_reuse_after_cleanup),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "offset_management",
+            name: "test_high_watermark_no_regress_after_cleanup",
+            test_fn: wrap_test!(test_high_watermark_no_regress_after_cleanup),
             parallel_safe: true,
         },
         // Offset management edge case tests
