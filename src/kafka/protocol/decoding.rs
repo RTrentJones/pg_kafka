@@ -1921,7 +1921,8 @@ mod tests {
         request.generation_id = 1;
         request.member_id = StrBytes::from_static_str("member-123");
 
-        let frame = build_request_frame(API_KEY_SYNC_GROUP, 5, 400, 2, &request, 5);
+        // v4 is the highest SyncGroup version pg_kafka advertises (and now enforces, CONF-6).
+        let frame = build_request_frame(API_KEY_SYNC_GROUP, 4, 400, 2, &request, 4);
 
         let result = parse_request(frame, tx);
         assert!(result.is_ok());
@@ -2201,7 +2202,8 @@ mod tests {
         request.topic_names = vec![TopicName::from(StrBytes::from_static_str("delete-me"))];
         request.timeout_ms = 5000;
 
-        let frame = build_request_frame(API_KEY_DELETE_TOPICS, 5, 1300, 2, &request, 5);
+        // v4 is the highest DeleteTopics version pg_kafka advertises (and now enforces, CONF-6).
+        let frame = build_request_frame(API_KEY_DELETE_TOPICS, 4, 1300, 2, &request, 4);
 
         let result = parse_request(frame, tx);
         assert!(result.is_ok());
@@ -2234,7 +2236,8 @@ mod tests {
         request.timeout_ms = 5000;
         request.validate_only = true;
 
-        let frame = build_request_frame(API_KEY_CREATE_PARTITIONS, 3, 1400, 2, &request, 3);
+        // v2 is the highest CreatePartitions version pg_kafka advertises (and now enforces, CONF-6).
+        let frame = build_request_frame(API_KEY_CREATE_PARTITIONS, 2, 1400, 2, &request, 2);
 
         let result = parse_request(frame, tx);
         assert!(result.is_ok());
@@ -2853,8 +2856,10 @@ mod tests {
 
     #[test]
     fn test_parse_add_partitions_to_txn_request_v4() {
-        // Tests the v4+ batch transaction format (different from v3)
-        let (tx, _rx) = create_test_channel();
+        // v4 introduces the batched-transactions format, which is *above* pg_kafka's advertised
+        // AddPartitionsToTxn max (v3). CONF-6 must reject it with UNSUPPORTED_VERSION — a broker does
+        // not serve a version it doesn't advertise — rather than half-decoding the batch format.
+        let (tx, mut rx) = create_test_channel();
 
         let mut request = add_partitions_to_txn_request::AddPartitionsToTxnRequest::default();
 
@@ -2873,27 +2878,16 @@ mod tests {
 
         let frame = build_request_frame(API_KEY_ADD_PARTITIONS_TO_TXN, 4, 4001, 2, &request, 4);
 
-        let result = parse_request(frame, tx);
-        assert!(result.is_ok());
-        let parsed = result.unwrap();
-        assert!(parsed.is_some());
-
-        if let Some(KafkaRequest::AddPartitionsToTxn {
-            transactional_id,
-            producer_id,
-            producer_epoch,
-            topics,
-            ..
-        }) = parsed
-        {
-            assert_eq!(transactional_id, "batch-txn");
-            assert_eq!(producer_id, 44444);
-            assert_eq!(producer_epoch, 1);
-            assert_eq!(topics.len(), 1);
-            assert_eq!(topics[0].0, "batch-topic");
-            assert_eq!(topics[0].1, vec![0, 1]);
-        } else {
-            panic!("Expected AddPartitionsToTxn request");
+        let parsed = parse_request(frame, tx).unwrap();
+        assert!(
+            parsed.is_none(),
+            "AddPartitionsToTxn v4 is above the advertised max (v3) and must be rejected"
+        );
+        match rx.try_recv() {
+            Ok(super::super::super::messages::KafkaResponse::Error { error_code, .. }) => {
+                assert_eq!(error_code, ERROR_UNSUPPORTED_VERSION);
+            }
+            other => panic!("expected UNSUPPORTED_VERSION, got {:?}", other),
         }
     }
 
