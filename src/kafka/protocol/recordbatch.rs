@@ -183,6 +183,24 @@ pub fn parse_record_batch(batch_bytes: &bytes::Bytes) -> Result<Vec<Record>> {
 /// Repeated: [Offset: 8 bytes][MessageSize: 4 bytes][Message]
 /// Message: [CRC: 4 bytes][Magic: 1 byte][Attributes: 1 byte][Key][Value]
 /// Key/Value: [Length: 4 bytes (i32, -1=null)][Data]
+/// CRC-32 (IEEE / `java.util.zip.CRC32`, reflected poly 0xEDB88320) — the checksum a legacy Kafka
+/// MessageSet v0/v1 message carries over its body. Computed bit-by-bit (these batches are off the
+/// hot path), so no extra dependency is needed.
+fn crc32_ieee(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &byte in data {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
 fn parse_message_set_legacy(
     batch_bytes: &bytes::Bytes,
     original_error: impl std::fmt::Display,
@@ -206,11 +224,25 @@ fn parse_message_set_legacy(
 
         // Carve out exactly this message so every read below is bounded by `message_size`.
         // copy_to_bytes won't panic here because `buf.remaining() >= message_size` was checked.
-        let mut msg = buf.copy_to_bytes(message_size as usize);
+        let msg = buf.copy_to_bytes(message_size as usize);
 
-        // Message header: CRC(4) + magic(1) + attributes(1). The `message_size >= 6` guard
-        // guarantees these reads stay within `msg`.
-        let _crc = msg.get_u32(); // CRC validation deferred — see BUG-2 in docs/AUDIT-2026-06.md
+        // BUG-2: validate the message CRC32, which covers everything after the CRC field (magic,
+        // attributes, key, value). A mismatch means a corrupt message — stop parsing rather than
+        // persist garbage. (The live RecordBatch v2 path already has its CRC32C checked by the
+        // kafka-protocol decoder; this hardens the legacy MessageSet fallback the same way.) The
+        // `message_size >= 6` guard above guarantees the first four bytes exist.
+        let stored_crc = u32::from_be_bytes([msg[0], msg[1], msg[2], msg[3]]);
+        let computed_crc = crc32_ieee(&msg[4..]);
+        if stored_crc != computed_crc {
+            warn!(
+                "MessageSet CRC mismatch (corrupt message): stored={:#010x} computed={:#010x}",
+                stored_crc, computed_crc
+            );
+            break;
+        }
+
+        // Skip the validated CRC; the `message_size >= 6` guard keeps these reads within `msg`.
+        let mut msg = msg.slice(4..);
         let _magic = msg.get_i8();
         let _attributes = msg.get_i8(); // Compression, timestamp type
 
@@ -406,34 +438,19 @@ mod tests {
 
     #[test]
     fn test_parse_message_set_legacy_simple_message() {
-        // Create a simple legacy MessageSet v0 message
+        // Build the message body — everything the CRC covers: magic, attributes, key, value.
+        let mut body = Vec::new();
+        body.push(0); // magic v0
+        body.push(0); // attributes
+        body.extend_from_slice(&(-1i32).to_be_bytes()); // null key
+        body.extend_from_slice(&5i32.to_be_bytes()); // value length
+        body.extend_from_slice(b"hello");
+
         let mut buf = Vec::new();
-
-        // Offset (8 bytes) - we ignore this
-        buf.extend_from_slice(&0i64.to_be_bytes());
-
-        // Message size (4 bytes) - CRC(4) + Magic(1) + Attr(1) + Key(-1) + Value(5 bytes)
-        // = 4 + 1 + 1 + 4 + 4 + 5 = 19 bytes
-        let msg_size: i32 = 19;
-        buf.extend_from_slice(&msg_size.to_be_bytes());
-
-        // CRC (4 bytes) - we don't validate
-        buf.extend_from_slice(&0u32.to_be_bytes());
-
-        // Magic (1 byte)
-        buf.push(0);
-
-        // Attributes (1 byte)
-        buf.push(0);
-
-        // Key length = -1 (null key)
-        buf.extend_from_slice(&(-1i32).to_be_bytes());
-
-        // Value length = 5
-        buf.extend_from_slice(&5i32.to_be_bytes());
-
-        // Value = "hello"
-        buf.extend_from_slice(b"hello");
+        buf.extend_from_slice(&0i64.to_be_bytes()); // offset (ignored)
+        buf.extend_from_slice(&((4 + body.len()) as i32).to_be_bytes()); // message size = CRC + body
+        buf.extend_from_slice(&crc32_ieee(&body).to_be_bytes()); // BUG-2: valid CRC over the body
+        buf.extend_from_slice(&body);
 
         let bytes = Bytes::from(buf);
         let result = parse_message_set_legacy(&bytes, "test error");
@@ -448,28 +465,20 @@ mod tests {
 
     #[test]
     fn test_parse_message_set_legacy_with_key() {
+        // body = magic + attributes + keylen + "key" + vallen + "value"
+        let mut body = Vec::new();
+        body.push(0); // magic
+        body.push(0); // attributes
+        body.extend_from_slice(&3i32.to_be_bytes());
+        body.extend_from_slice(b"key");
+        body.extend_from_slice(&5i32.to_be_bytes());
+        body.extend_from_slice(b"value");
+
         let mut buf = Vec::new();
-
-        // Offset
-        buf.extend_from_slice(&0i64.to_be_bytes());
-
-        // Message size = CRC(4) + Magic(1) + Attr(1) + KeyLen(4) + Key(3) + ValLen(4) + Val(5) = 22
-        buf.extend_from_slice(&22i32.to_be_bytes());
-
-        // CRC
-        buf.extend_from_slice(&0u32.to_be_bytes());
-
-        // Magic + Attributes
-        buf.push(0);
-        buf.push(0);
-
-        // Key length = 3
-        buf.extend_from_slice(&3i32.to_be_bytes());
-        buf.extend_from_slice(b"key");
-
-        // Value length = 5
-        buf.extend_from_slice(&5i32.to_be_bytes());
-        buf.extend_from_slice(b"value");
+        buf.extend_from_slice(&0i64.to_be_bytes()); // offset
+        buf.extend_from_slice(&((4 + body.len()) as i32).to_be_bytes()); // message size = CRC + body
+        buf.extend_from_slice(&crc32_ieee(&body).to_be_bytes()); // BUG-2: valid CRC
+        buf.extend_from_slice(&body);
 
         let bytes = Bytes::from(buf);
         let result = parse_message_set_legacy(&bytes, "test error");
@@ -479,6 +488,30 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].key, Some(b"key".to_vec()));
         assert_eq!(records[0].value, Some(b"value".to_vec()));
+    }
+
+    #[test]
+    fn test_parse_message_set_legacy_rejects_bad_crc() {
+        // BUG-2: a message whose CRC doesn't match its body is corrupt and must not be parsed into a
+        // record. Build a valid body, then store a deliberately wrong CRC.
+        let mut body = Vec::new();
+        body.push(0); // magic
+        body.push(0); // attributes
+        body.extend_from_slice(&(-1i32).to_be_bytes()); // null key
+        body.extend_from_slice(&5i32.to_be_bytes());
+        body.extend_from_slice(b"hello");
+
+        let wrong_crc = crc32_ieee(&body).wrapping_add(1); // off by one → mismatch
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0i64.to_be_bytes());
+        buf.extend_from_slice(&((4 + body.len()) as i32).to_be_bytes());
+        buf.extend_from_slice(&wrong_crc.to_be_bytes());
+        buf.extend_from_slice(&body);
+
+        let bytes = Bytes::from(buf);
+        // No valid record parses → the function reports an error (and never persists the message).
+        assert!(parse_message_set_legacy(&bytes, "test error").is_err());
     }
 
     #[test]
