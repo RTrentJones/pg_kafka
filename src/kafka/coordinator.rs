@@ -372,7 +372,19 @@ impl GroupCoordinator {
         // Check for rebalance timeouts and abort stuck rebalances
         for group in groups.values_mut() {
             if let Some(started) = group.rebalance_started_at {
-                if started.elapsed().as_millis() > DEFAULT_REBALANCE_TIMEOUT_MS as u128 {
+                // CG-3: honour the members' advertised rebalance_timeout_ms (the max across the
+                // group, matching Kafka — the coordinator waits for the most lenient member) rather
+                // than a hardcoded 5 minutes. Fall back to the default when no member advertises a
+                // positive value (e.g. a v0 JoinGroup that predates the field).
+                let effective_timeout_ms = group
+                    .members
+                    .values()
+                    .map(|m| m.rebalance_timeout_ms)
+                    .filter(|&t| t > 0)
+                    .max()
+                    .map(|t| t as u128)
+                    .unwrap_or(DEFAULT_REBALANCE_TIMEOUT_MS as u128);
+                if started.elapsed().as_millis() > effective_timeout_ms {
                     pg_log!(
                         "Group {} rebalance timed out after {}ms, resetting to Empty",
                         group.group_id,
@@ -1322,6 +1334,55 @@ mod tests {
             let group = groups.get("test-group").unwrap();
             assert_eq!(group.members.len(), 0);
         }
+    }
+
+    #[test]
+    fn test_rebalance_timeout_honors_member_rebalance_timeout_ms() {
+        // CG-3: a stuck rebalance must be aborted after the members' advertised rebalance_timeout_ms,
+        // not a hardcoded 5 minutes.
+        let coordinator = GroupCoordinator::new();
+
+        // group-1: one member with a very short rebalance budget (20ms) that never syncs, so the
+        // group stays mid-rebalance with rebalance_started_at set. The session timeout is long so the
+        // member itself is not reaped — we want the *rebalance* to time out.
+        coordinator
+            .join_group(
+                "group-1".to_string(),
+                None,
+                "c1".to_string(),
+                "localhost".to_string(),
+                300_000, // session timeout (won't expire)
+                20,      // rebalance_timeout_ms (short)
+                "consumer".to_string(),
+                vec![("range".to_string(), vec![])],
+                None,
+            )
+            .unwrap();
+
+        // Elapse past the 20ms rebalance budget — but far below the old hardcoded 5-minute default.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // join_group runs the rebalance-timeout sweep over all groups up-front; a dummy second group
+        // drives it without otherwise touching group-1.
+        coordinator
+            .join_group(
+                "group-2".to_string(),
+                None,
+                "c2".to_string(),
+                "localhost".to_string(),
+                300_000,
+                300_000,
+                "consumer".to_string(),
+                vec![("range".to_string(), vec![])],
+                None,
+            )
+            .unwrap();
+
+        // group-1's stuck rebalance must have been aborted (reset to Empty). With the old hardcoded
+        // 5-minute timeout, 50ms is nowhere near expiry and the group would still be rebalancing.
+        let g1 = coordinator.get_group_state("group-1").expect("group-1 should exist");
+        assert_eq!(g1.state, GroupState::Empty);
+        assert!(g1.members.is_empty());
     }
 
     #[test]
