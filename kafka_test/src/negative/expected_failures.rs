@@ -18,11 +18,12 @@ pub async fn test_sasl_password_guc_is_superuser_only() -> TestResult {
     let ctx = TestContext::new().await?;
     let db = ctx.db();
 
-    // Create a throwaway non-superuser role (idempotent across re-runs).
+    // Create a throwaway non-superuser role (idempotent across re-runs). The name must NOT start
+    // with `pg_` — PostgreSQL reserves that prefix and rejects CREATE ROLE for it.
     db.batch_execute(
         "DO $$ BEGIN
-           IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pg_kafka_sec8_probe') THEN
-             CREATE ROLE pg_kafka_sec8_probe NOSUPERUSER;
+           IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'sec8_unpriv_probe') THEN
+             CREATE ROLE sec8_unpriv_probe NOSUPERUSER;
            END IF;
          END $$;",
     )
@@ -33,7 +34,7 @@ pub async fn test_sasl_password_guc_is_superuser_only() -> TestResult {
     db.simple_query("SHOW pg_kafka.shadow_sasl_password").await?;
 
     // As the non-superuser role, reading it must be rejected (SUPERUSER_ONLY).
-    db.simple_query("SET ROLE pg_kafka_sec8_probe").await?;
+    db.simple_query("SET ROLE sec8_unpriv_probe").await?;
     let unpriv_read = db.simple_query("SHOW pg_kafka.shadow_sasl_password").await;
     db.simple_query("RESET ROLE").await?;
 
