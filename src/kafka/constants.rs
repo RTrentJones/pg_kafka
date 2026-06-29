@@ -344,6 +344,9 @@ pub const ERROR_GROUP_ID_NOT_FOUND: i16 = 69;
 /// Non-empty group (cannot delete group with members)
 pub const ERROR_NON_EMPTY_GROUP: i16 = 68;
 
+/// Consumer group has reached its configured maximum size (CG-4)
+pub const ERROR_GROUP_MAX_SIZE_REACHED: i16 = 81;
+
 // ===== Idempotent Producer Error Codes (Phase 9) =====
 
 /// Duplicate sequence number (idempotent producer deduplication)

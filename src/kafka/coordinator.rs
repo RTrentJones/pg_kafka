@@ -36,6 +36,10 @@ const EMPTY_GROUP_TTL_SECS: u64 = 86400;
 /// Maximum number of consumer groups to prevent DoS
 const MAX_CONSUMER_GROUPS: usize = 100_000;
 
+/// CG-4: maximum members in a single consumer group (DoS protection). A genuinely new member is
+/// rejected with GROUP_MAX_SIZE_REACHED once a group is full; rejoining members are always allowed.
+const MAX_MEMBERS_PER_GROUP: usize = 1000;
+
 /// Default rebalance timeout (5 minutes)
 const DEFAULT_REBALANCE_TIMEOUT_MS: u64 = 300_000;
 
@@ -431,6 +435,21 @@ impl GroupCoordinator {
             .entry(group_id.clone())
             .or_insert_with(|| ConsumerGroup::new(group_id.clone()));
 
+        // CG-4: cap members per group (DoS protection). A rejoining member (already present) is
+        // always allowed; only a genuinely new member is rejected when the group is at capacity.
+        let is_rejoin = existing_member_id
+            .as_ref()
+            .is_some_and(|id| group.members.contains_key(id));
+        if !is_rejoin && group.members.len() >= MAX_MEMBERS_PER_GROUP {
+            return Err(KafkaError::Protocol {
+                code: crate::kafka::constants::ERROR_GROUP_MAX_SIZE_REACHED,
+                message: format!(
+                    "group '{}' has reached the maximum of {} members",
+                    group_id, MAX_MEMBERS_PER_GROUP
+                ),
+            });
+        }
+
         // Generate member ID if this is a new member
         let member_id = if let Some(id) = existing_member_id {
             // Rejoining with existing ID
@@ -804,6 +823,12 @@ impl GroupCoordinator {
                 group.maybe_complete_join();
             }
         }
+
+        // CG-5: reclaim empty groups here (every sweep), not just on the next join_group's TTL
+        // pass. An empty group holds no durable state — committed offsets live in storage, and a
+        // rejoin recreates the group — so dropping it bounds coordinator memory. DeleteGroups on a
+        // since-removed group is idempotent (returns NONE), so this is safe for clients.
+        groups.retain(|_, g| g.state != GroupState::Empty);
 
         removed
     }
@@ -1387,12 +1412,9 @@ mod tests {
         assert_eq!(removed.len(), 1);
         assert_eq!(removed[0].0, "test-group");
 
-        // Verify member is gone
-        {
-            let groups = coordinator.groups.read().unwrap();
-            let group = groups.get("test-group").unwrap();
-            assert_eq!(group.members.len(), 0);
-        }
+        // CG-5: with its only member gone the group is now empty and reclaimed by the same sweep,
+        // rather than lingering until the next join_group.
+        assert!(coordinator.get_group_state("test-group").is_none());
     }
 
     #[test]
@@ -1543,6 +1565,77 @@ mod tests {
         // A group this coordinator doesn't know → lenient, allowed.
         let unknown = coordinator.validate_commit("other", &member, generation);
         assert!(unknown.is_ok());
+    }
+
+    #[test]
+    fn test_join_group_enforces_member_cap() {
+        // CG-4: a group is capped at MAX_MEMBERS_PER_GROUP; one more new member is rejected with
+        // GROUP_MAX_SIZE_REACHED.
+        let coordinator = GroupCoordinator::new();
+        for i in 0..MAX_MEMBERS_PER_GROUP {
+            coordinator
+                .join_group(
+                    "g".to_string(),
+                    None,
+                    format!("c{}", i),
+                    "h".to_string(),
+                    300_000,
+                    300_000,
+                    "consumer".to_string(),
+                    vec![("range".to_string(), vec![])],
+                    None,
+                )
+                .unwrap();
+        }
+
+        let overflow = coordinator.join_group(
+            "g".to_string(),
+            None,
+            "overflow".to_string(),
+            "h".to_string(),
+            300_000,
+            300_000,
+            "consumer".to_string(),
+            vec![("range".to_string(), vec![])],
+            None,
+        );
+
+        match overflow {
+            Err(KafkaError::Protocol { code, .. }) => {
+                assert_eq!(code, crate::kafka::constants::ERROR_GROUP_MAX_SIZE_REACHED);
+            }
+            other => panic!("expected GROUP_MAX_SIZE_REACHED, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_empty_group_reclaimed_by_sweep() {
+        // CG-5: a group whose only member times out is removed by the periodic sweep, not left to
+        // linger until the next join_group.
+        let coordinator = GroupCoordinator::new();
+        coordinator
+            .join_group(
+                "g".to_string(),
+                None,
+                "c1".to_string(),
+                "h".to_string(),
+                1, // 1ms session timeout — will expire
+                300_000,
+                "consumer".to_string(),
+                vec![("range".to_string(), vec![])],
+                None,
+            )
+            .unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // The sweep removes the timed-out member and reclaims the now-empty group.
+        coordinator.check_and_remove_timed_out_members();
+
+        assert!(
+            coordinator.get_group_state("g").is_none(),
+            "empty group should be reclaimed by the sweep"
+        );
     }
 
     #[test]
