@@ -78,42 +78,38 @@ impl AssignmentStrategy for RoundRobinStrategy {
             return result;
         }
 
-        // Track position for each topic's round-robin cycle
-        // This ensures we continue from where we left off for each topic
-        let mut topic_positions: HashMap<String, usize> = HashMap::new();
+        // CG-6: use a SINGLE global round-robin pointer across all (topic, partition) pairs — as
+        // Kafka does and as this module's doc example describes — not a per-topic counter that
+        // restarts at 0 for each topic (which imbalances heterogeneous multi-topic subscriptions).
+        // The pointer walks the sorted members and skips any not subscribed to the current topic.
+        let mut position = 0usize;
+        let member_count = member_ids.len();
 
-        // Round-robin assignment
         for (topic, partition) in all_partitions {
-            // Get members subscribed to this topic
-            let eligible_members: Vec<&&String> = member_ids
-                .iter()
-                .filter(|id| {
-                    input
-                        .subscriptions
-                        .get(**id)
-                        .map(|sub| sub.topics.contains(&topic))
-                        .unwrap_or(false)
-                })
-                .collect();
-
-            if eligible_members.is_empty() {
-                continue;
+            // Advance the global pointer to the next member subscribed to this topic.
+            let mut assigned: Option<&String> = None;
+            for _ in 0..member_count {
+                let candidate = member_ids[position % member_count];
+                position += 1;
+                let subscribed = input
+                    .subscriptions
+                    .get(candidate)
+                    .map(|sub| sub.topics.contains(&topic))
+                    .unwrap_or(false);
+                if subscribed {
+                    assigned = Some(candidate);
+                    break;
+                }
             }
 
-            // Get current position for this topic's cycle
-            let position = topic_positions.entry(topic.clone()).or_insert(0);
-            let member_idx = *position % eligible_members.len();
-            *position += 1;
-
-            let member_id = *eligible_members[member_idx];
-
-            // Add partition to member's assignment
-            if let Some(assignment) = result.get_mut(member_id) {
-                assignment
-                    .topic_partitions
-                    .entry(topic)
-                    .or_default()
-                    .push(partition);
+            if let Some(member_id) = assigned {
+                if let Some(assignment) = result.get_mut(member_id) {
+                    assignment
+                        .topic_partitions
+                        .entry(topic)
+                        .or_default()
+                        .push(partition);
+                }
             }
         }
 
@@ -159,6 +155,28 @@ mod tests {
         // Round-robin: 0->m1, 1->m2, 2->m1, 3->m2, 4->m1, 5->m2
         assert_eq!(result["member-1"].partitions("topic-a"), vec![0, 2, 4]);
         assert_eq!(result["member-2"].partitions("topic-a"), vec![1, 3, 5]);
+    }
+
+    #[test]
+    fn test_global_pointer_across_topics() {
+        // CG-6: with topics A(3) and B(2) and two members subscribed to both, the round-robin
+        // pointer must carry ACROSS topics: A0->m1, A1->m2, A2->m1, B0->m2, B1->m1. A per-topic
+        // counter (the bug) restarts at B, giving m1 B0 and m2 B1 instead.
+        let input = make_input(
+            vec![
+                ("member-1", vec!["topic-a", "topic-b"]),
+                ("member-2", vec!["topic-a", "topic-b"]),
+            ],
+            vec![("topic-a", 3), ("topic-b", 2)],
+        );
+
+        let result = RoundRobinStrategy::new().assign(&input);
+
+        assert_eq!(result["member-1"].partitions("topic-a"), vec![0, 2]);
+        assert_eq!(result["member-2"].partitions("topic-a"), vec![1]);
+        // The pointer continues from topic-a into topic-b (the regression check):
+        assert_eq!(result["member-1"].partitions("topic-b"), vec![1]);
+        assert_eq!(result["member-2"].partitions("topic-b"), vec![0]);
     }
 
     #[test]
