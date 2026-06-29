@@ -233,6 +233,15 @@ mod tests {
             Ok(0)
         }
 
+        fn get_offset_for_timestamp(
+            &self,
+            _topic_id: i32,
+            _partition_id: i32,
+            _timestamp_ms: i64,
+        ) -> crate::kafka::error::Result<Option<(i64, i64)>> {
+            Ok(None)
+        }
+
         fn commit_offset(
             &self,
             _group_id: &str,
