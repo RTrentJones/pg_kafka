@@ -613,6 +613,47 @@ impl GroupCoordinator {
         }
     }
 
+    /// CONF-1: validate an OffsetCommit against the live group state to reject zombie commits.
+    ///
+    /// A simple consumer with no active group membership commits with `generation_id < 0` and is not
+    /// validated. Otherwise, if this coordinator knows the group, the commit's generation and member
+    /// id must match the current ones — a stale generation yields `IllegalGeneration` and an unknown
+    /// member yields `UnknownMemberId`. A group this coordinator has no record of is allowed (there
+    /// is nothing to validate against), so offset commits never hard-fail on coordinator restart.
+    pub fn validate_commit(
+        &self,
+        group_id: &str,
+        member_id: &str,
+        generation_id: i32,
+    ) -> Result<()> {
+        if generation_id < 0 {
+            return Ok(());
+        }
+
+        let groups = self.groups.read().map_err(|e| {
+            KafkaError::Internal(format!("Failed to acquire groups read lock: {}", e))
+        })?;
+
+        let group = match groups.get(group_id) {
+            Some(g) => g,
+            None => return Ok(()),
+        };
+
+        if group.generation_id != generation_id {
+            return Err(KafkaError::illegal_generation(
+                group_id,
+                generation_id,
+                group.generation_id,
+            ));
+        }
+
+        if !group.members.contains_key(member_id) {
+            return Err(KafkaError::unknown_member(group_id, member_id));
+        }
+
+        Ok(())
+    }
+
     /// Handle Heartbeat request
     ///
     /// Updates member's last_heartbeat timestamp.
@@ -1463,6 +1504,45 @@ mod tests {
         // common to both is "range", so that must be selected.
         let g = coordinator.get_group_state("g").expect("group exists");
         assert_eq!(g.protocol_name.as_deref(), Some("range"));
+    }
+
+    #[test]
+    fn test_validate_commit_rejects_zombie_commits() {
+        // CONF-1: a stale generation or unknown member must be rejected; a simple consumer
+        // (generation -1) and an unknown group are allowed through.
+        let coordinator = GroupCoordinator::new();
+        let (member, generation, ..) = coordinator
+            .join_group(
+                "g".to_string(),
+                None,
+                "c1".to_string(),
+                "h".to_string(),
+                300_000,
+                300_000,
+                "consumer".to_string(),
+                vec![("range".to_string(), vec![])],
+                None,
+            )
+            .unwrap();
+
+        // Current generation + known member → accepted.
+        let current = coordinator.validate_commit("g", &member, generation);
+        assert!(current.is_ok());
+
+        // Stale generation → IllegalGeneration.
+        let stale = coordinator.validate_commit("g", &member, generation - 1);
+        assert!(matches!(stale, Err(KafkaError::IllegalGeneration { .. })));
+
+        // Unknown member at the current generation → UnknownMemberId.
+        let ghost = coordinator.validate_commit("g", "ghost", generation);
+        assert!(matches!(ghost, Err(KafkaError::UnknownMemberId { .. })));
+
+        // Simple consumer (generation -1) → not validated.
+        assert!(coordinator.validate_commit("g", "", -1).is_ok());
+
+        // A group this coordinator doesn't know → lenient, allowed.
+        let unknown = coordinator.validate_commit("other", &member, generation);
+        assert!(unknown.is_ok());
     }
 
     #[test]

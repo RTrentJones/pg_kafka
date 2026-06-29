@@ -597,10 +597,16 @@ fn parse_offset_commit(
     };
 
     let group_id = commit_req.group_id.to_string();
+    // CONF-1: carry the member's generation + id so the handler can reject zombie commits. For a
+    // simple consumer (and v0, which lacks the fields) these default to -1 / "".
+    let generation_id = commit_req.generation_id_or_member_epoch;
+    let member_id = commit_req.member_id.to_string();
 
     debug!(
-        "OffsetCommit for group_id={}, {} topics",
+        "OffsetCommit for group_id={}, generation={}, member={}, {} topics",
         group_id,
+        generation_id,
+        member_id,
         commit_req.topics.len()
     );
 
@@ -631,6 +637,8 @@ fn parse_offset_commit(
         client_id,
         api_version,
         group_id,
+        generation_id,
+        member_id,
         topics,
         response_tx,
     }))
@@ -2044,6 +2052,9 @@ mod tests {
         let mut request = offset_commit_request::OffsetCommitRequest::default();
         request.group_id =
             kafka_protocol::messages::GroupId::from(StrBytes::from_static_str("commit-group"));
+        // CONF-1: generation + member id must be carried through to the request.
+        request.generation_id_or_member_epoch = 7;
+        request.member_id = StrBytes::from_static_str("member-7");
 
         let mut topic = offset_commit_request::OffsetCommitRequestTopic::default();
         topic.name = TopicName::from(StrBytes::from_static_str("commit-topic"));
@@ -2061,10 +2072,16 @@ mod tests {
         assert!(parsed.is_some());
 
         if let Some(KafkaRequest::OffsetCommit {
-            group_id, topics, ..
+            group_id,
+            generation_id,
+            member_id,
+            topics,
+            ..
         }) = parsed
         {
             assert_eq!(group_id, "commit-group");
+            assert_eq!(generation_id, 7);
+            assert_eq!(member_id, "member-7");
             assert_eq!(topics.len(), 1);
             assert_eq!(topics[0].name, "commit-topic");
             assert_eq!(topics[0].partitions[0].committed_offset, 100);
