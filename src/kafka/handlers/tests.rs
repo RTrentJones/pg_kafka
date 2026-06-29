@@ -404,11 +404,65 @@ mod tests {
         let broker = BrokerMetadata::new("localhost".to_string(), 9092);
         let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
 
-        let response =
-            consumer::handle_offset_commit(&ctx, "test-group".to_string(), topics).unwrap();
+        let response = consumer::handle_offset_commit(
+            &ctx,
+            "test-group".to_string(),
+            -1,
+            String::new(),
+            topics,
+        )
+        .unwrap();
 
         let partition_response = &response.topics[0].partitions[0];
         assert_eq!(partition_response.error_code, ERROR_NONE);
+    }
+
+    #[test]
+    fn test_handle_offset_commit_rejects_stale_generation() {
+        // CONF-1: a commit with a stale generation for a live group is rejected per-partition with
+        // ILLEGAL_GENERATION before any store write (the mock has no commit_offset expectation, so a
+        // write attempt would panic the test).
+        let mock = MockKafkaStore::new();
+        let coordinator = GroupCoordinator::new();
+        let (member, generation, ..) = coordinator
+            .join_group(
+                "zombie-group".to_string(),
+                None,
+                "c1".to_string(),
+                "h".to_string(),
+                300_000,
+                300_000,
+                "consumer".to_string(),
+                vec![("range".to_string(), vec![])],
+                None,
+            )
+            .unwrap();
+
+        let topics = vec![OffsetCommitTopicData {
+            name: "t".to_string(),
+            partitions: vec![OffsetCommitPartitionData {
+                partition_index: 0,
+                committed_offset: 10,
+                metadata: None,
+            }],
+        }];
+
+        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+
+        let response = consumer::handle_offset_commit(
+            &ctx,
+            "zombie-group".to_string(),
+            generation - 1,
+            member,
+            topics,
+        )
+        .unwrap();
+
+        assert_eq!(
+            response.topics[0].partitions[0].error_code,
+            ERROR_ILLEGAL_GENERATION
+        );
     }
 
     #[test]
@@ -432,8 +486,14 @@ mod tests {
         let broker = BrokerMetadata::new("localhost".to_string(), 9092);
         let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
 
-        let response =
-            consumer::handle_offset_commit(&ctx, "test-group".to_string(), topics).unwrap();
+        let response = consumer::handle_offset_commit(
+            &ctx,
+            "test-group".to_string(),
+            -1,
+            String::new(),
+            topics,
+        )
+        .unwrap();
 
         let partition_response = &response.topics[0].partitions[0];
         assert_eq!(

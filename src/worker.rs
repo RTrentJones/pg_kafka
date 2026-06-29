@@ -986,6 +986,8 @@ pub fn process_request(
             correlation_id,
             api_version,
             group_id,
+            generation_id,
+            member_id,
             topics,
             response_tx,
             ..
@@ -1001,7 +1003,7 @@ pub fn process_request(
             dispatch_response(
                 "OffsetCommit",
                 response_tx,
-                || handlers::handle_offset_commit(&ctx, group_id, topics),
+                || handlers::handle_offset_commit(&ctx, group_id, generation_id, member_id, topics),
                 |r| KafkaResponse::OffsetCommit {
                     correlation_id,
                     api_version,

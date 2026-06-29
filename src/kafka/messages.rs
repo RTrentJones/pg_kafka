@@ -97,6 +97,11 @@ pub enum KafkaRequest {
         api_version: i16,
         /// Consumer group ID
         group_id: String,
+        /// Generation the committing member believes it holds (-1 for a simple consumer with no
+        /// active membership). CONF-1: validated against the coordinator to reject zombie commits.
+        generation_id: i32,
+        /// Member id of the committing consumer ("" for a simple consumer).
+        member_id: String,
         /// Topic-partition offset data to commit
         topics: Vec<OffsetCommitTopicData>,
         /// Channel to send the response back to the specific connection

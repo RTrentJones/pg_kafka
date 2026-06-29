@@ -17,12 +17,46 @@ use kafka_protocol::protocol::StrBytes;
 pub fn handle_offset_commit(
     ctx: &HandlerContext,
     group_id: String,
+    generation_id: i32,
+    member_id: String,
     topics: Vec<crate::kafka::messages::OffsetCommitTopicData>,
 ) -> Result<kafka_protocol::messages::offset_commit_response::OffsetCommitResponse> {
     let store = ctx.store;
     use kafka_protocol::messages::offset_commit_response::{
         OffsetCommitResponse, OffsetCommitResponsePartition, OffsetCommitResponseTopic,
     };
+
+    // CONF-1: reject zombie commits. A member committing with a stale generation (or an unknown
+    // member id) for a live group must be rejected with ILLEGAL_GENERATION / UNKNOWN_MEMBER_ID
+    // rather than silently persisting an offset. Simple consumers (generation -1) are not validated.
+    if let Err(e) = ctx
+        .coordinator
+        .validate_commit(&group_id, &member_id, generation_id)
+    {
+        let error_code = e.to_kafka_error_code();
+        let response_topics: Vec<_> = topics
+            .into_iter()
+            .map(|topic| {
+                let partitions: Vec<_> = topic
+                    .partitions
+                    .into_iter()
+                    .map(|partition| {
+                        let mut partition_response = OffsetCommitResponsePartition::default();
+                        partition_response.partition_index = partition.partition_index;
+                        partition_response.error_code = error_code;
+                        partition_response
+                    })
+                    .collect();
+                let mut topic_response = OffsetCommitResponseTopic::default();
+                topic_response.name = TopicName(StrBytes::from_string(topic.name));
+                topic_response.partitions = partitions;
+                topic_response
+            })
+            .collect();
+        let mut response = OffsetCommitResponse::default();
+        response.topics = response_topics;
+        return Ok(response);
+    }
 
     let mut response_topics = Vec::new();
 
