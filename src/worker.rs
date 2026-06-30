@@ -851,7 +851,7 @@ pub fn process_request(
     compression: kafka_protocol::records::Compression,
     shadow_store: &std::sync::Arc<ShadowStore<PostgresStore>>,
 ) {
-    use crate::kafka::dispatch::{dispatch_infallible, dispatch_response};
+    use crate::kafka::dispatch::{dispatch_infallible, dispatch_produce, dispatch_response};
     use crate::kafka::handlers;
     use crate::kafka::messages::KafkaResponse;
 
@@ -959,13 +959,11 @@ pub fn process_request(
                 return;
             }
 
-            // Handle produce and send notifications on success (acks >= 1)
-            // Phase 9: Extract producer metadata for idempotent producer validation
-            // This enables sequence checking, deduplication, and producer fencing
+            // Handle produce (acks >= 1).
+            // Phase 9: producer metadata enables sequence checking / dedup / fencing.
+            // Phase 10: transactional_id for transactional producers.
+            // Phase 11: shadow forwarding is internal to ShadowStore.insert_records().
             let producer_metadata = extract_producer_metadata(&topic_data);
-
-            // Phase 10: Pass transactional_id for transactional producers
-            // Phase 11: Shadow forwarding is now handled internally by ShadowStore.insert_records()
             let ctx = crate::kafka::HandlerContext::with_notifier(
                 store,
                 coordinator,
@@ -974,37 +972,27 @@ pub fn process_request(
                 compression,
                 notify_tx,
             );
-            match handlers::handle_produce(
-                &ctx,
-                topic_data,
-                producer_metadata.as_ref(),
-                transactional_id.as_deref(),
-            ) {
-                Ok(response) => {
-                    // Wake long-poll consumers for the partitions just written.
-                    emit_produce_notifications(&response, store, notify_tx);
 
-                    // Send the response
-                    let _ = response_tx.send(KafkaResponse::Produce {
-                        correlation_id,
-                        api_version,
-                        response,
-                    });
-                }
-                Err(e) => {
-                    let error_code = e.to_kafka_error_code();
-                    if e.is_server_error() {
-                        pg_warning!("Produce handler error: {}", e);
-                    }
-                    let _ = response_tx.send(KafkaResponse::Produce {
-                        correlation_id,
-                        api_version,
-                        response: crate::kafka::response_builders::build_produce_error_response(
-                            error_code,
-                        ),
-                    });
-                }
-            }
+            // RA-3: route through dispatch_produce so a handler PANIC (a Postgres
+            // ERROR surfaces through pgrx as a Rust panic) still replies
+            // UNKNOWN_SERVER_ERROR and rolls back, instead of leaving the client to
+            // hang. The previous hand-rolled match (kept for the acks=0 no-response
+            // special case above) skipped that panic safety.
+            dispatch_produce(
+                response_tx,
+                correlation_id,
+                api_version,
+                move || {
+                    handlers::handle_produce(
+                        &ctx,
+                        topic_data,
+                        producer_metadata.as_ref(),
+                        transactional_id.as_deref(),
+                    )
+                },
+                // Wake long-poll consumers for the partitions just written.
+                |response| emit_produce_notifications(response, store, notify_tx),
+            );
         }
 
         // ===== Fetch =====
