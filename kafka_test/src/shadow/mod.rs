@@ -47,4 +47,5 @@ pub use replay::test_replay_historical_messages;
 pub use topic_mapping::test_topic_name_mapping;
 pub use transaction_integration::{
     test_aborted_transaction_not_forwarded, test_committed_transaction_forwarded,
+    test_committed_transaction_uses_durable_outbox,
 };

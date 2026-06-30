@@ -62,7 +62,7 @@ use super::producer::ShadowProducer;
 use super::routing::make_forward_decision;
 use super::{ForwardAck, ForwardRequest};
 use crate::kafka::error::{KafkaError, Result};
-use crate::kafka::messages::{Record, RecordHeader};
+use crate::kafka::messages::Record;
 use crate::kafka::storage::{
     CommittedOffset, FetchedMessage, IsolationLevel, KafkaStore, TopicMetadata, TransactionState,
 };
@@ -71,30 +71,23 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-/// Record pending shadow forwarding after transaction commit
+/// A committed transactional record's outbox pointer.
 ///
-/// These are cached during `insert_transactional_records()` and forwarded
-/// when `commit_transaction()` is called.
+/// Buffered during `insert_transactional_records()` and enqueued into the
+/// durable `kafka.shadow_tracking` outbox when `commit_transaction()` is called
+/// (RA-1/RA-2). Only the row key + record key are needed — the payload is
+/// re-read from `kafka.messages` by the forwarder, exactly like a non-txn
+/// produce, so the buffer no longer carries the value/headers/timestamp.
 #[derive(Clone, Debug)]
 struct PendingForwardRecord {
-    /// Topic ID for this record
+    /// Topic ID (outbox row key + per-topic config lookup)
     topic_id: i32,
-    /// Topic name (cached to avoid lookup on commit)
-    topic_name: String,
-    /// Partition ID
+    /// Partition ID (outbox row key)
     partition_id: i32,
-    /// Local offset (-1 if not written locally yet, e.g., ExternalOnly mode)
+    /// Local offset the record was committed at (outbox row key)
     offset: i64,
-    /// Record key
+    /// Record key — used only for percentage routing at enqueue time
     key: Option<Vec<u8>>,
-    /// Record value
-    value: Option<Vec<u8>>,
-    /// Record headers (matches Record struct type)
-    headers: Vec<RecordHeader>,
-    /// Timestamp (milliseconds since epoch, optional - matches Record struct)
-    timestamp: Option<i64>,
-    /// Write mode for this record (DualWrite or ExternalOnly)
-    write_mode: WriteMode,
 }
 
 /// Key for pending transaction messages: (producer_id, producer_epoch)
@@ -230,22 +223,6 @@ pub struct ShadowStore<S: KafkaStore> {
     /// Monotonic counter used to sample keyless ExternalOnly transactional
     /// records, which have no local offset to route on (offset = -1)
     txn_forward_seq: AtomicU64,
-}
-
-/// Outcome of attempting to forward a single transactional record to
-/// external Kafka.
-///
-/// `Skipped` (sampled out by forward_percentage) is deliberately distinct
-/// from `Forwarded`: for an ExternalOnly record, a skip means the record was
-/// written nowhere yet and the caller MUST persist it locally or it is lost.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ForwardOutcome {
-    /// Delivered to external Kafka
-    Forwarded,
-    /// Sampled out by forward_percentage (by design, not an error)
-    Skipped,
-    /// Delivery failed (missing config/producer, or send error)
-    Failed,
 }
 
 impl<S: KafkaStore> ShadowStore<S> {
@@ -623,120 +600,6 @@ impl<S: KafkaStore> ShadowStore<S> {
         Ok(())
     }
 
-    /// Forward a single record to external Kafka
-    ///
-    /// Returns true on success, false on failure.
-    /// Used for transactional message forwarding on commit.
-    fn forward_single_record(&self, record: &PendingForwardRecord) -> ForwardOutcome {
-        // Get topic config for percentage routing and external topic name
-        let topic_config = match self.topic_cache.get(record.topic_id) {
-            Some(config) => config,
-            None => {
-                tracing::warn!(
-                    "No shadow config for topic {} during txn forward",
-                    record.topic_id
-                );
-                return ForwardOutcome::Failed;
-            }
-        };
-
-        // Percentage sampling. Keyed records route deterministically on the
-        // key (same as everywhere else). Keyless records route on the local
-        // offset when one exists (DualWrite); ExternalOnly records have no
-        // local offset (-1), so a monotonic counter provides an accurate
-        // per-message sample instead of the constant -1.
-        let routing_offset = if record.offset >= 0 {
-            record.offset
-        } else {
-            self.txn_forward_seq.fetch_add(1, Ordering::Relaxed) as i64
-        };
-        let decision = self.decide_forward(
-            record.key.as_deref(),
-            routing_offset,
-            topic_config.forward_percentage,
-        );
-        if decision == ForwardDecision::Skip {
-            self.metrics.skipped.fetch_add(1, Ordering::Relaxed);
-            return ForwardOutcome::Skipped;
-        }
-
-        // Get producer
-        let producer = match self.ensure_producer() {
-            Some(p) => p,
-            None => {
-                tracing::warn!("No producer available for txn forward");
-                return ForwardOutcome::Failed;
-            }
-        };
-
-        let external_topic = topic_config.effective_external_topic();
-
-        // Forward synchronously
-        match producer.send_sync(
-            external_topic,
-            Some(record.partition_id),
-            record.key.as_deref(),
-            record.value.as_deref(),
-            DEFAULT_FORWARD_TIMEOUT_MS,
-        ) {
-            Ok(_) => {
-                tracing::trace!(
-                    "Shadow txn forward SUCCESS for {}[{}]",
-                    external_topic,
-                    record.partition_id
-                );
-                self.metrics.forwarded.fetch_add(1, Ordering::Relaxed);
-                ForwardOutcome::Forwarded
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Shadow txn forward FAILED for {}[{}]: {:?}",
-                    external_topic,
-                    record.partition_id,
-                    e
-                );
-                self.metrics.failed.fetch_add(1, Ordering::Relaxed);
-                ForwardOutcome::Failed
-            }
-        }
-    }
-
-    /// Write a record to PostgreSQL as fallback when external forward fails (ExternalOnly mode)
-    ///
-    /// This is called during commit when an ExternalOnly record fails to forward.
-    /// The record is inserted as a committed (visible) record since the transaction
-    /// is being committed.
-    fn write_fallback_record(
-        &self,
-        record: &PendingForwardRecord,
-        _producer_id: i64,
-        _producer_epoch: i16,
-    ) -> Result<i64> {
-        // Convert PendingForwardRecord back to Record for insertion
-        let kafka_record = Record {
-            key: record.key.clone(),
-            value: record.value.clone(),
-            headers: record.headers.clone(),
-            timestamp: record.timestamp,
-        };
-
-        // Insert as a committed (visible) record
-        // Note: This uses insert_records, not insert_transactional_records,
-        // because we're in fallback mode and want the message visible immediately
-        let offset =
-            self.inner
-                .insert_records(record.topic_id, record.partition_id, &[kafka_record])?;
-
-        self.metrics.fallback_local.fetch_add(1, Ordering::Relaxed);
-        tracing::info!(
-            "ExternalOnly fallback: wrote txn record to local storage for topic {} partition {}",
-            record.topic_name,
-            record.partition_id
-        );
-
-        Ok(offset)
-    }
-
     // ===== Durable forwarding outbox (SH-9, SH-7, SH-8, SH-14, SH-15) =====
 
     /// Try to hand a forward request to the network thread. Returns false if no
@@ -765,6 +628,77 @@ impl<S: KafkaStore> ShadowStore<S> {
         }
     }
 
+    /// Insert a batch of pending `(topic_id, partition_id, local_offset)` rows
+    /// into the `kafka.shadow_tracking` outbox in the current transaction. The
+    /// shared write path for both the live produce and the txn-commit enqueue.
+    #[cfg(not(test))]
+    fn insert_outbox_rows(&self, rows: &[(i32, i32, i64)]) -> Result<()> {
+        use pgrx::prelude::*;
+        Spi::connect_mut(|client| {
+            for &(topic_id, partition_id, local_offset) in rows {
+                client.update(
+                    "INSERT INTO kafka.shadow_tracking (topic_id, partition_id, local_offset) \
+                     VALUES ($1, $2, $3) \
+                     ON CONFLICT (topic_id, partition_id, local_offset) DO NOTHING",
+                    None,
+                    &[topic_id.into(), partition_id.into(), local_offset.into()],
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Enqueue the records of a just-committed transaction into the durable
+    /// outbox (RA-1/RA-2).
+    ///
+    /// This replaces the old in-RAM per-record `send_sync` →
+    /// `block_on` loop that ran on the single DB thread and could freeze every
+    /// client for up to 60 s × N when the external broker was down. Each
+    /// percentage-selected record (looked up against the current per-topic
+    /// config) gets a pending `shadow_tracking` row written inside the commit
+    /// transaction; the periodic poll then forwards it via the idempotent
+    /// producer — non-blocking, at-least-once, re-partitioned by key, and
+    /// (crucially for external-primary topics, whose local reads are suppressed)
+    /// durably retried instead of best-effort-and-dropped.
+    #[cfg(not(test))]
+    fn enqueue_committed_txn_outbox(&self, records: &[PendingForwardRecord]) {
+        if records.is_empty() {
+            return;
+        }
+        self.check_license();
+
+        let mut rows: Vec<(i32, i32, i64)> = Vec::with_capacity(records.len());
+        for r in records {
+            // The topic may have stopped forwarding since the records were
+            // buffered (config reload); re-check at commit time.
+            let percentage = match self.topic_cache.get(r.topic_id) {
+                Some(c) if c.should_forward() => c.forward_percentage,
+                _ => continue,
+            };
+            match self.decide_forward(r.key.as_deref(), r.offset, percentage) {
+                ForwardDecision::Skip => {
+                    self.metrics.skipped.fetch_add(1, Ordering::Relaxed);
+                }
+                ForwardDecision::Forward => rows.push((r.topic_id, r.partition_id, r.offset)),
+            }
+        }
+
+        if rows.is_empty() {
+            return;
+        }
+        if let Err(e) = self.insert_outbox_rows(&rows) {
+            tracing::warn!(
+                "Shadow: failed to enqueue {} committed txn outbox row(s): {:?}",
+                rows.len(),
+                e
+            );
+        }
+    }
+
+    /// Test stub — see `enqueue_committed_txn_outbox`.
+    #[cfg(test)]
+    fn enqueue_committed_txn_outbox(&self, _records: &[PendingForwardRecord]) {}
+
     /// Write durable outbox rows for a freshly-produced batch (SH-9).
     ///
     /// For each record the percentage router selects (SH-8), insert a *pending*
@@ -782,8 +716,6 @@ impl<S: KafkaStore> ShadowStore<S> {
         base_offset: i64,
         config: &TopicShadowConfig,
     ) {
-        use pgrx::prelude::*;
-
         let external_topic = config.effective_external_topic();
         let forward_percentage = config.forward_percentage;
 
@@ -807,20 +739,11 @@ impl<S: KafkaStore> ShadowStore<S> {
         }
 
         // SH-9: persist a pending pointer row per selected record, same txn.
-        let write_result: Result<()> = Spi::connect_mut(|client| {
-            for &local_offset in &selected {
-                client.update(
-                    "INSERT INTO kafka.shadow_tracking (topic_id, partition_id, local_offset) \
-                     VALUES ($1, $2, $3) \
-                     ON CONFLICT (topic_id, partition_id, local_offset) DO NOTHING",
-                    None,
-                    &[topic_id.into(), partition_id.into(), local_offset.into()],
-                )?;
-            }
-            Ok(())
-        });
-
-        if let Err(e) = write_result {
+        let rows: Vec<(i32, i32, i64)> = selected
+            .iter()
+            .map(|&local_offset| (topic_id, partition_id, local_offset))
+            .collect();
+        if let Err(e) = self.insert_outbox_rows(&rows) {
             tracing::warn!(
                 "Shadow: failed to write {} outbox row(s) for topic_id={} partition={}: {:?}",
                 selected.len(),
@@ -1575,10 +1498,9 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
         // identically — always persist locally with a real offset and buffer for
         // forward-on-commit. write_mode now affects only reads (external-primary
         // suppresses local fetches). So we no longer branch on it here.
-        let (should_forward, topic_name) = match &topic_config {
-            Some(config) if config.should_forward() => (true, config.topic_name.clone()),
-            Some(config) => (false, config.topic_name.clone()),
-            None => (false, format!("topic-{}", topic_id)),
+        let should_forward = match &topic_config {
+            Some(config) => config.should_forward(),
+            None => false,
         };
 
         // Always write locally first (real offset).
@@ -1597,14 +1519,9 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
                 .enumerate()
                 .map(|(i, r)| PendingForwardRecord {
                     topic_id,
-                    topic_name: topic_name.clone(),
                     partition_id,
                     offset: base_offset + i as i64,
                     key: r.key.clone(),
-                    value: r.value.clone(),
-                    headers: r.headers.clone(),
-                    timestamp: r.timestamp,
-                    write_mode: WriteMode::DualWrite,
                 })
                 .collect();
 
@@ -1668,72 +1585,23 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
             pending.remove(&key)
         };
 
-        // 2. Separate records by write mode
-        let (dual_write_records, external_only_records): (Vec<_>, Vec<_>) = pending_records
-            .map(|buf| buf.records)
-            .unwrap_or_default()
-            .into_iter()
-            .partition(|r| r.write_mode == WriteMode::DualWrite);
+        // 2. Collect the buffered records (all are about to be committed).
+        let records = pending_records.map(|buf| buf.records).unwrap_or_default();
 
-        // 3. Commit the inner transaction unconditionally. Even when every
-        // record is ExternalOnly (no local message rows), the transaction's
-        // state row in kafka.transactions must transition to committed and
-        // any pending consumer offsets (TxnOffsetCommit) must be applied —
-        // otherwise the transaction lingers as Ongoing until the timeout
-        // sweeper force-aborts it.
+        // 3. Commit the inner transaction unconditionally. Even with zero
+        // forwarded records, the kafka.transactions state row must transition to
+        // committed and any pending consumer offsets (TxnOffsetCommit) must be
+        // applied — otherwise the transaction lingers as Ongoing until the
+        // timeout sweeper force-aborts it.
         self.inner
             .commit_transaction(transactional_id, producer_id, producer_epoch)?;
 
-        // 4. Forward DualWrite records (best effort, already committed locally)
-        for record in &dual_write_records {
-            self.forward_single_record(record);
-        }
-
-        if !dual_write_records.is_empty() {
-            tracing::debug!(
-                "Shadow txn commit: forwarded {} DualWrite records",
-                dual_write_records.len()
-            );
-        }
-
-        // 5. ExternalOnly records exist nowhere until forwarded, so any record
-        // that was NOT delivered externally — whether the send failed or the
-        // record was sampled out by forward_percentage — must be persisted
-        // locally or it is silently lost.
-        for record in external_only_records {
-            match self.forward_single_record(&record) {
-                ForwardOutcome::Forwarded => {}
-                ForwardOutcome::Skipped => {
-                    tracing::debug!(
-                        "ExternalOnly record for topic {} sampled out by forward_percentage, writing locally",
-                        record.topic_name
-                    );
-                    if let Err(e) = self.write_fallback_record(&record, producer_id, producer_epoch)
-                    {
-                        tracing::error!(
-                            "ExternalOnly local write after sampling skip failed for topic {}: {:?}",
-                            record.topic_name,
-                            e
-                        );
-                    }
-                }
-                ForwardOutcome::Failed => {
-                    // Fallback: write to PostgreSQL since external forward failed
-                    tracing::warn!(
-                        "ExternalOnly forward failed for topic {}, falling back to local write",
-                        record.topic_name
-                    );
-                    if let Err(e) = self.write_fallback_record(&record, producer_id, producer_epoch)
-                    {
-                        tracing::error!(
-                            "ExternalOnly fallback write also failed for topic {}: {:?}",
-                            record.topic_name,
-                            e
-                        );
-                    }
-                }
-            }
-        }
+        // 4. RA-1/RA-2: enqueue the committed records into the durable outbox in
+        // this same commit transaction. The poll forwards them — no DB-thread
+        // block_on (RA-1), at-least-once with re-partition-by-key (RA-2), and
+        // durably retried for external-primary topics (whose local reads are
+        // suppressed) instead of best-effort-and-dropped.
+        self.enqueue_committed_txn_outbox(&records);
 
         Ok(())
     }
@@ -1765,19 +1633,13 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
         self.inner
             .abort_transaction(transactional_id, producer_id, producer_epoch)?;
 
-        // ExternalOnly records were never written locally, so just discard the buffer
-        // (already removed from pending_txn_messages above)
-
+        // Buffered forward records are never forwarded on abort, so just
+        // discard the buffer (already removed from pending_txn_messages above).
         if let Some(buf) = &pending_records {
-            let external_only_count = buf
-                .records
-                .iter()
-                .filter(|r| r.write_mode == WriteMode::ExternalOnly)
-                .count();
-            if external_only_count > 0 {
+            if !buf.records.is_empty() {
                 tracing::debug!(
-                    "Shadow txn abort: discarded {} ExternalOnly records (never written locally)",
-                    external_only_count
+                    "Shadow txn abort: discarded {} buffered forward record(s)",
+                    buf.records.len()
                 );
             }
         }
@@ -1854,7 +1716,6 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kafka::messages::RecordHeader;
     use crate::kafka::shadow::config::{ShadowMode, WriteMode};
 
     #[test]
@@ -1899,80 +1760,6 @@ mod tests {
     }
 
     #[test]
-    fn test_pending_forward_record_creation() {
-        let header = RecordHeader {
-            key: "header-key".to_string(),
-            value: b"header-value".to_vec(),
-        };
-
-        let record = PendingForwardRecord {
-            topic_id: 1,
-            topic_name: "test-topic".to_string(),
-            partition_id: 0,
-            offset: 100,
-            key: Some(b"key".to_vec()),
-            value: Some(b"value".to_vec()),
-            headers: vec![header],
-            timestamp: Some(1234567890),
-            write_mode: WriteMode::DualWrite,
-        };
-
-        assert_eq!(record.topic_id, 1);
-        assert_eq!(record.topic_name, "test-topic");
-        assert_eq!(record.partition_id, 0);
-        assert_eq!(record.offset, 100);
-        assert_eq!(record.key, Some(b"key".to_vec()));
-        assert_eq!(record.value, Some(b"value".to_vec()));
-        assert_eq!(record.headers.len(), 1);
-        assert_eq!(record.headers[0].key, "header-key");
-        assert_eq!(record.headers[0].value, b"header-value".to_vec());
-        assert_eq!(record.timestamp, Some(1234567890));
-        assert!(matches!(record.write_mode, WriteMode::DualWrite));
-    }
-
-    #[test]
-    fn test_pending_forward_record_with_null_fields() {
-        let record = PendingForwardRecord {
-            topic_id: 1,
-            topic_name: "test".to_string(),
-            partition_id: 0,
-            offset: -1, // Not written locally (ExternalOnly)
-            key: None,
-            value: None,
-            headers: vec![],
-            timestamp: None,
-            write_mode: WriteMode::ExternalOnly,
-        };
-
-        assert!(record.key.is_none());
-        assert!(record.value.is_none());
-        assert!(record.timestamp.is_none());
-        assert_eq!(record.offset, -1);
-        assert!(matches!(record.write_mode, WriteMode::ExternalOnly));
-    }
-
-    #[test]
-    fn test_pending_forward_record_clone() {
-        let record = PendingForwardRecord {
-            topic_id: 1,
-            topic_name: "test".to_string(),
-            partition_id: 0,
-            offset: 50,
-            key: Some(b"key".to_vec()),
-            value: Some(b"value".to_vec()),
-            headers: vec![],
-            timestamp: Some(1000),
-            write_mode: WriteMode::DualWrite,
-        };
-
-        let cloned = record.clone();
-        assert_eq!(cloned.topic_id, record.topic_id);
-        assert_eq!(cloned.topic_name, record.topic_name);
-        assert_eq!(cloned.key, record.key);
-        assert_eq!(cloned.value, record.value);
-    }
-
-    #[test]
     fn test_txn_key_type() {
         // TxnKey is (producer_id, producer_epoch)
         let key1: TxnKey = (1000, 0);
@@ -1996,75 +1783,6 @@ mod tests {
     }
 
     #[test]
-    fn test_pending_txn_messages_type() {
-        // Test the PendingTxnMessages type alias works correctly
-        let pending: PendingTxnMessages = Arc::new(RwLock::new(HashMap::new()));
-
-        // Write some pending records
-        {
-            let mut guard = pending.write().unwrap();
-            let key: TxnKey = (1000, 0);
-            let record = PendingForwardRecord {
-                topic_id: 1,
-                topic_name: "test".to_string(),
-                partition_id: 0,
-                offset: 0,
-                key: None,
-                value: Some(b"test".to_vec()),
-                headers: vec![],
-                timestamp: None,
-                write_mode: WriteMode::DualWrite,
-            };
-            guard.entry(key).or_default().records.push(record);
-        }
-
-        // Read back
-        {
-            let guard = pending.read().unwrap();
-            assert_eq!(guard.len(), 1);
-            let records = &guard.get(&(1000, 0)).unwrap().records;
-            assert_eq!(records.len(), 1);
-            assert_eq!(records[0].value, Some(b"test".to_vec()));
-        }
-    }
-
-    #[test]
-    fn test_pending_txn_accumulation() {
-        let pending: PendingTxnMessages = Arc::new(RwLock::new(HashMap::new()));
-        let key: TxnKey = (1000, 0);
-
-        // Add multiple records to same transaction
-        {
-            let mut guard = pending.write().unwrap();
-            for i in 0..5 {
-                let record = PendingForwardRecord {
-                    topic_id: 1,
-                    topic_name: "test".to_string(),
-                    partition_id: i,
-                    offset: i as i64,
-                    key: None,
-                    value: Some(format!("msg-{}", i).into_bytes()),
-                    headers: vec![],
-                    timestamp: None,
-                    write_mode: WriteMode::DualWrite,
-                };
-                guard.entry(key).or_default().records.push(record);
-            }
-        }
-
-        // Verify all records accumulated
-        let guard = pending.read().unwrap();
-        let records = &guard.get(&key).unwrap().records;
-        assert_eq!(records.len(), 5);
-
-        // Verify ordering preserved
-        for (i, record) in records.iter().enumerate() {
-            assert_eq!(record.partition_id, i as i32);
-            assert_eq!(record.value, Some(format!("msg-{}", i).into_bytes()));
-        }
-    }
-
-    #[test]
     fn test_pending_txn_clear_on_commit() {
         let pending: PendingTxnMessages = Arc::new(RwLock::new(HashMap::new()));
         let key: TxnKey = (1000, 0);
@@ -2076,14 +1794,9 @@ mod tests {
                 key,
                 vec![PendingForwardRecord {
                     topic_id: 1,
-                    topic_name: "test".to_string(),
                     partition_id: 0,
                     offset: 0,
                     key: None,
-                    value: Some(b"test".to_vec()),
-                    headers: vec![],
-                    timestamp: None,
-                    write_mode: WriteMode::DualWrite,
                 }]
                 .into(),
             );
@@ -2114,14 +1827,9 @@ mod tests {
                 key,
                 vec![PendingForwardRecord {
                     topic_id: 1,
-                    topic_name: "test".to_string(),
                     partition_id: 0,
                     offset: 0,
                     key: None,
-                    value: Some(b"test".to_vec()),
-                    headers: vec![],
-                    timestamp: None,
-                    write_mode: WriteMode::DualWrite,
                 }]
                 .into(),
             );
@@ -2219,91 +1927,6 @@ mod tests {
         assert_eq!(metrics.forwarded.load(Ordering::Relaxed), 1000);
     }
 
-    #[test]
-    fn test_multiple_transactions_isolation() {
-        let pending: PendingTxnMessages = Arc::new(RwLock::new(HashMap::new()));
-
-        // Two different transactions
-        let txn1: TxnKey = (1000, 0);
-        let txn2: TxnKey = (1001, 0);
-
-        {
-            let mut guard = pending.write().unwrap();
-            guard.insert(
-                txn1,
-                vec![PendingForwardRecord {
-                    topic_id: 1,
-                    topic_name: "topic1".to_string(),
-                    partition_id: 0,
-                    offset: 0,
-                    key: None,
-                    value: Some(b"txn1-msg".to_vec()),
-                    headers: vec![],
-                    timestamp: None,
-                    write_mode: WriteMode::DualWrite,
-                }]
-                .into(),
-            );
-            guard.insert(
-                txn2,
-                vec![PendingForwardRecord {
-                    topic_id: 2,
-                    topic_name: "topic2".to_string(),
-                    partition_id: 0,
-                    offset: 0,
-                    key: None,
-                    value: Some(b"txn2-msg".to_vec()),
-                    headers: vec![],
-                    timestamp: None,
-                    write_mode: WriteMode::DualWrite,
-                }]
-                .into(),
-            );
-        }
-
-        // Commit txn1, verify txn2 unaffected
-        {
-            let mut guard = pending.write().unwrap();
-            guard.remove(&txn1);
-        }
-
-        let guard = pending.read().unwrap();
-        assert!(guard.get(&txn1).is_none());
-        assert!(guard.get(&txn2).is_some());
-        assert_eq!(guard.get(&txn2).unwrap().records[0].topic_name, "topic2");
-    }
-
-    #[test]
-    fn test_write_mode_affects_local_offset() {
-        // DualWrite records carry the local offset they were written at
-        let dual_write = PendingForwardRecord {
-            topic_id: 1,
-            topic_name: "test".to_string(),
-            partition_id: 0,
-            offset: 100,
-            key: None,
-            value: Some(b"test".to_vec()),
-            headers: vec![],
-            timestamp: None,
-            write_mode: WriteMode::DualWrite,
-        };
-        assert!(dual_write.offset >= 0);
-
-        // ExternalOnly records have no local offset
-        let external_only = PendingForwardRecord {
-            topic_id: 1,
-            topic_name: "test".to_string(),
-            partition_id: 0,
-            offset: -1, // No local offset
-            key: None,
-            value: Some(b"test".to_vec()),
-            headers: vec![],
-            timestamp: None,
-            write_mode: WriteMode::ExternalOnly,
-        };
-        assert_eq!(external_only.offset, -1);
-    }
-
     // ===== Transaction finalization and ExternalOnly fallback tests =====
 
     use crate::testing::mocks::MockKafkaStore;
@@ -2311,55 +1934,10 @@ mod tests {
     fn external_only_record(topic_id: i32) -> PendingForwardRecord {
         PendingForwardRecord {
             topic_id,
-            topic_name: "ext-topic".to_string(),
             partition_id: 0,
             offset: -1,
             key: None,
-            value: Some(b"payload".to_vec()),
-            headers: vec![],
-            timestamp: None,
-            write_mode: WriteMode::ExternalOnly,
         }
-    }
-
-    fn external_only_config(topic_id: i32, forward_percentage: u8) -> TopicShadowConfig {
-        TopicShadowConfig {
-            topic_id,
-            topic_name: "ext-topic".to_string(),
-            mode: ShadowMode::Shadow,
-            forward_percentage,
-            external_topic_name: None,
-            sync_mode: SyncMode::Sync,
-            write_mode: WriteMode::ExternalOnly,
-        }
-    }
-
-    #[test]
-    fn test_commit_finalizes_inner_txn_with_only_external_only_records() {
-        // Regression: a transaction containing ONLY ExternalOnly records used
-        // to skip the inner commit, leaving the kafka.transactions row
-        // Ongoing and pending offsets unapplied
-        let mut mock = MockKafkaStore::new();
-        mock.expect_commit_transaction()
-            .times(1)
-            .returning(|_, _, _| Ok(()));
-        // No topic config is registered, so forwarding fails and the record
-        // must be persisted locally instead
-        mock.expect_insert_records()
-            .times(1)
-            .returning(|_, _, _| Ok(0));
-
-        let store = ShadowStore::new(mock);
-        {
-            let mut pending = store.pending_txn_messages.write().unwrap();
-            pending
-                .entry((100, 0))
-                .or_default()
-                .records
-                .push(external_only_record(1));
-        }
-
-        store.commit_transaction("txn-1", 100, 0).unwrap();
     }
 
     #[test]
@@ -2385,44 +1963,17 @@ mod tests {
     }
 
     #[test]
-    fn test_forward_single_record_sampled_out_returns_skipped() {
-        // forward_percentage = 0 always samples out, before any producer is
-        // needed. Skipped must be distinguishable from Forwarded so the
-        // commit path can persist the record locally.
-        let store = ShadowStore::new(MockKafkaStore::new());
-        store.topic_cache.update(external_only_config(1, 0));
-
-        let outcome = store.forward_single_record(&external_only_record(1));
-        assert_eq!(outcome, ForwardOutcome::Skipped);
-        assert_eq!(store.metrics.skipped.load(Ordering::Relaxed), 1);
-    }
-
-    #[test]
-    fn test_forward_single_record_missing_config_returns_failed() {
-        let store = ShadowStore::new(MockKafkaStore::new());
-        // No topic config registered for topic 42
-        let outcome = store.forward_single_record(&external_only_record(42));
-        assert_eq!(outcome, ForwardOutcome::Failed);
-    }
-
-    #[test]
-    fn test_commit_writes_sampled_out_external_only_record_locally() {
-        // Regression: an ExternalOnly record sampled out by
-        // forward_percentage was treated as handled and written NOWHERE.
-        // It must fall back to a local write on commit.
+    fn test_commit_finalizes_inner_txn() {
+        // The inner commit must run unconditionally (state row → committed,
+        // pending offsets applied) even though forwarding is now deferred to the
+        // durable outbox (RA-1/RA-2) rather than done inline. In test builds the
+        // outbox enqueue is a no-op stub, so this asserts the inner commit fires.
         let mut mock = MockKafkaStore::new();
         mock.expect_commit_transaction()
             .times(1)
             .returning(|_, _, _| Ok(()));
-        mock.expect_insert_records()
-            .times(1)
-            .withf(|topic_id, partition_id, records| {
-                *topic_id == 1 && *partition_id == 0 && records.len() == 1
-            })
-            .returning(|_, _, _| Ok(7));
 
         let store = ShadowStore::new(mock);
-        store.topic_cache.update(external_only_config(1, 0));
         {
             let mut pending = store.pending_txn_messages.write().unwrap();
             pending
@@ -2433,8 +1984,6 @@ mod tests {
         }
 
         store.commit_transaction("txn-1", 100, 0).unwrap();
-        assert_eq!(store.metrics.skipped.load(Ordering::Relaxed), 1);
-        assert_eq!(store.metrics.fallback_local.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -2701,63 +2250,6 @@ mod tests {
             super::super::config::SyncMode::Sync
         ));
         assert!(matches!(updated.write_mode, WriteMode::ExternalOnly));
-    }
-
-    #[test]
-    fn test_pending_record_with_headers() {
-        let headers = vec![
-            RecordHeader {
-                key: "key1".to_string(),
-                value: b"value1".to_vec(),
-            },
-            RecordHeader {
-                key: "key2".to_string(),
-                value: b"value2".to_vec(),
-            },
-            RecordHeader {
-                key: "content-type".to_string(),
-                value: b"application/json".to_vec(),
-            },
-        ];
-
-        let record = PendingForwardRecord {
-            topic_id: 1,
-            topic_name: "test".to_string(),
-            partition_id: 0,
-            offset: 0,
-            key: None,
-            value: Some(b"test".to_vec()),
-            headers: headers.clone(),
-            timestamp: None,
-            write_mode: WriteMode::DualWrite,
-        };
-
-        assert_eq!(record.headers.len(), 3);
-        assert_eq!(record.headers[0].key, "key1");
-        assert_eq!(record.headers[1].key, "key2");
-        assert_eq!(record.headers[2].key, "content-type");
-        assert_eq!(record.headers[2].value, b"application/json".to_vec());
-    }
-
-    #[test]
-    fn test_pending_record_large_payload() {
-        // Test with a large payload (1MB)
-        let large_value: Vec<u8> = (0..1_000_000).map(|i| (i % 256) as u8).collect();
-
-        let record = PendingForwardRecord {
-            topic_id: 1,
-            topic_name: "test".to_string(),
-            partition_id: 0,
-            offset: 0,
-            key: Some(b"large-key".to_vec()),
-            value: Some(large_value.clone()),
-            headers: vec![],
-            timestamp: Some(1234567890),
-            write_mode: WriteMode::DualWrite,
-        };
-
-        assert_eq!(record.value.as_ref().unwrap().len(), 1_000_000);
-        assert_eq!(record.value, Some(large_value));
     }
 
     #[test]
