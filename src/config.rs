@@ -95,7 +95,7 @@ pub struct Config {
     /// OpenTelemetry OTLP endpoint for shadow tracing
     pub shadow_otel_endpoint: String,
     /// License key for Shadow Mode production use (Commercial License)
-    /// Format: "sponsor_id:signature" or "eval" for evaluation
+    /// Format: "sponsor_id:token" or "eval" for evaluation
     pub shadow_license_key: String,
 }
 
@@ -542,7 +542,7 @@ pub fn init() {
     GucRegistry::define_string_guc(
         c"pg_kafka.shadow_license_key",
         c"License key for Shadow Mode production use",
-        c"Format: 'sponsor_id:signature' or 'eval' for evaluation. Obtain from https://github.com/sponsors/RTrentJones",
+        c"Format: 'sponsor_id:token' or 'eval' for evaluation. Obtain from https://github.com/sponsors/RTrentJones",
         &SHADOW_LICENSE_KEY,
         GucContext::Postmaster, // Requires restart
         GucFlags::NO_SHOW_ALL | GucFlags::SUPERUSER_ONLY,

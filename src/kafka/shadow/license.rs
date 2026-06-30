@@ -284,7 +284,7 @@ mod tests {
     fn test_invalid_license_reason_message() {
         let v = LicenseValidator::new("invalid");
         if let LicenseStatus::Invalid(reason) = v.status() {
-            assert!(reason.contains("sponsor_id:signature"));
+            assert!(reason.contains("sponsor_id:token"));
         } else {
             panic!("Expected Invalid status");
         }
