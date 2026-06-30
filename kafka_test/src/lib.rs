@@ -202,6 +202,7 @@ pub use shadow::{
     test_fifty_percent_forwarding,
     test_hundred_percent_forwarding,
     test_local_only_mode,
+    test_outbox_row_written_and_finalized,
     test_reload_clears_deleted_topic_config,
     // Replay
     test_replay_historical_messages,

@@ -110,9 +110,19 @@ impl ShadowProducer {
         // Compression (use none for maximum compatibility)
         client_config.set("compression.type", "none");
 
-        // Disable idempotent producer - external Kafka may not support it
-        // in all configurations (e.g., single-node KRaft clusters)
-        client_config.set("enable.idempotence", "false");
+        // SH-12: idempotent producer. The durable outbox replays a row on any
+        // crash before its ack is recorded (at-least-once), so the forwarding
+        // producer MUST de-duplicate retries to avoid double-delivery to the
+        // external broker. Idempotence requires acks=all, a bounded in-flight
+        // window, and retries > 0 — set them explicitly so the config is valid
+        // regardless of librdkafka defaults.
+        client_config.set("enable.idempotence", "true");
+        client_config.set("max.in.flight.requests.per.connection", "5");
+        client_config.set("acks", "all");
+        if config.max_retries < 1 {
+            // Idempotence needs at least one retry to be meaningful.
+            client_config.set("retries", "3");
+        }
 
         // NOTE: Removed deprecated api.version.* settings that caused
         // "Required feature not supported by broker" errors with modern Kafka.
@@ -121,9 +131,6 @@ impl ShadowProducer {
         // Request timeout and message timeout
         client_config.set("request.timeout.ms", "30000");
         client_config.set("message.timeout.ms", "120000");
-
-        // Acknowledgments (use 1 for single-node compatibility)
-        client_config.set("acks", "1");
 
         // Create the producer
         client_config
@@ -142,6 +149,25 @@ impl ShadowProducer {
         key: Option<&[u8]>,
         payload: Option<&[u8]>,
     ) -> ShadowResult<()> {
+        self.send_async_offset(topic, partition, key, payload)
+            .await
+            .map(|_| ())
+    }
+
+    /// Send a message asynchronously, returning the external partition offset
+    /// it was written at on success.
+    ///
+    /// The durable-outbox forwarder records this offset in
+    /// `kafka.shadow_tracking.external_offset` so an operator can correlate a
+    /// local message with its external position (and so a non-NULL value marks
+    /// the row delivered). Behaves exactly like [`send_async`] otherwise.
+    pub async fn send_async_offset(
+        &self,
+        topic: &str,
+        partition: Option<i32>,
+        key: Option<&[u8]>,
+        payload: Option<&[u8]>,
+    ) -> ShadowResult<i64> {
         let mut record = FutureRecord::to(topic);
 
         if let Some(k) = key {
@@ -158,16 +184,17 @@ impl ShadowProducer {
 
         let timeout = Timeout::After(Duration::from_millis(DEFAULT_DELIVERY_TIMEOUT_MS));
 
-        self.producer
-            .send(record, timeout)
-            .await
-            .map_err(|(err, _)| ShadowError::ForwardFailed {
-                topic: topic.to_string(),
-                partition: partition.unwrap_or(-1),
-                error: err.to_string(),
-            })?;
+        let (_partition, offset) =
+            self.producer
+                .send(record, timeout)
+                .await
+                .map_err(|(err, _)| ShadowError::ForwardFailed {
+                    topic: topic.to_string(),
+                    partition: partition.unwrap_or(-1),
+                    error: err.to_string(),
+                })?;
 
-        Ok(())
+        Ok(offset)
     }
 
     /// Send a message synchronously (blocking)
