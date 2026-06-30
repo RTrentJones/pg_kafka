@@ -24,16 +24,13 @@
 //! ## Architecture
 //!
 //! ```text
-//! ShadowStore (wrapper)
-//!     │
-//!     ├──> PostgresStore (local write)
-//!     │
-//!     └──> ShadowForwarder (external forward)
-//!              │
-//!              ├──> is_primary() check (pg_is_in_recovery)
-//!              │
-//!              └──> ShadowProducer (rdkafka)
+//! produce ──> ShadowStore ──> PostgresStore                 (local write)
+//!                  └────────> kafka.shadow_tracking         (durable outbox row, same txn)
+//!
+//! DB-thread poll: claim due rows ──ForwardRequest──> network thread ──> ShadowProducer
+//!                 finalize rows  <──ForwardAck─────── network thread      (rdkafka, idempotent)
 //! ```
+//! Only the primary forwards (is_primary / pg_is_in_recovery).
 //!
 //! ## Configuration
 //!
@@ -54,7 +51,6 @@ pub mod forwarder;
 pub mod license;
 pub mod primary;
 pub mod producer;
-pub mod replay;
 pub mod routing;
 pub mod store;
 
@@ -66,10 +62,9 @@ pub use config::{
     ShadowConfig, ShadowMode, SyncMode, TopicConfigCache, TopicShadowConfig, WriteMode,
 };
 pub use error::{ShadowError, ShadowResult};
-pub use forwarder::{ForwardDecision, ForwardMessage, ForwardResult, ShadowForwarder};
+pub use forwarder::ForwardDecision;
 pub use primary::{is_primary, PrimaryStatus};
 pub use producer::{ShadowProducer, ShadowProducerBuilder};
-pub use replay::{ReplayEngine, ReplayProgress, ReplayRequest, ReplayResult};
 pub use routing::{compute_routing_hash, make_forward_decision};
 pub use store::{ShadowMetrics, ShadowStore};
 
