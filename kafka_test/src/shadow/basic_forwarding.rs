@@ -2,9 +2,11 @@
 //!
 //! Tests for DualWrite/ExternalOnly modes with sync/async forwarding.
 
-use crate::common::{create_producer, TestResult};
+use crate::common::{create_base_consumer, create_producer, TestResult};
 use crate::setup::TestContext;
+use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::producer::FutureRecord;
+use rdkafka::TopicPartitionList;
 use std::time::Duration;
 
 use super::assertions::{
@@ -150,9 +152,14 @@ pub async fn test_dual_write_async() -> TestResult {
 /// Test ExternalOnly mode
 ///
 /// Produces a message and verifies it only appears in external Kafka,
-/// NOT in the local database (when external succeeds).
+/// Test ExternalOnly (external-primary) mode (SH-6)
+///
+/// external-primary writes the record locally for durability AND forwards it,
+/// but SUPPRESSES local reads so a consumer pointed at pg_kafka sees nothing and
+/// must read from the external broker. So: external has it, the local table has
+/// it (count = 1), but a pg_kafka consumer reads zero.
 pub async fn test_external_only_mode() -> TestResult {
-    println!("=== Test: ExternalOnly Mode ===\n");
+    println!("=== Test: ExternalOnly / external-primary Mode ===\n");
 
     // 1. SETUP
     let ctx = TestContext::new().await?;
@@ -204,14 +211,38 @@ pub async fn test_external_only_mode() -> TestResult {
         .await?;
     println!("✅ Message found in external Kafka\n");
 
-    // 3b. Local DB verification - should NOT have the message (ExternalOnly skips local on success)
-    println!("Checking local database (should be empty)...");
-    assert_local_message_count(ctx.db(), &topic, 0).await?;
-    println!("✅ No message in local database (as expected for ExternalOnly)\n");
+    // 3b. Local DB: the record IS stored locally (durability / replay), unlike
+    // the old ExternalOnly which skipped the local write.
+    println!("Checking local database (stored for durability)...");
+    assert_local_message_count(ctx.db(), &topic, 1).await?;
+    println!("✅ Message stored locally\n");
+
+    // 3c. Read cutover: a consumer pointed at pg_kafka must see NOTHING, because
+    // external-primary suppresses local reads. This is the cutover guarantee.
+    println!("Checking pg_kafka consumer sees nothing (read suppressed)...");
+    let consumer: BaseConsumer = create_base_consumer("external-primary-read-check")?;
+    let mut tpl = TopicPartitionList::new();
+    tpl.add_partition_offset(&topic, 0, rdkafka::Offset::Beginning)?;
+    consumer.assign(&tpl)?;
+    let mut received = 0;
+    for _ in 0..5 {
+        match consumer.poll(Duration::from_secs(1)) {
+            Some(Ok(_)) => received += 1,
+            Some(Err(_)) | None => {}
+        }
+    }
+    if received != 0 {
+        return Err(format!(
+            "external-primary read suppression failed: pg_kafka returned {} message(s)",
+            received
+        )
+        .into());
+    }
+    println!("✅ pg_kafka consumer saw 0 messages (cutover to external)\n");
 
     // 4. CLEANUP
     ctx.cleanup().await?;
-    println!("✅ Test PASSED: ExternalOnly Mode\n");
+    println!("✅ Test PASSED: external-primary mode\n");
     Ok(())
 }
 
