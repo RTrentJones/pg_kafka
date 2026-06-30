@@ -573,13 +573,17 @@ pub fn init() {
 /// "all interfaces" and are exposed; any other specific address is a concrete LAN/public interface
 /// and is therefore also exposed.
 pub fn bind_is_publicly_exposed(host: &str) -> bool {
-    match host {
-        // "all interfaces" (empty defaults to 0.0.0.0 in the bind address)
-        "" | "0.0.0.0" | "::" | "[::]" => true,
-        // explicit loopback
-        "localhost" | "::1" | "[::1]" => false,
-        // 127.0.0.0/8 is loopback; every other concrete address is network-reachable
-        h => !h.starts_with("127."),
+    // Accept the bracketed IPv6 form (`[::1]`) a host:port-style config might carry.
+    let h = host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host);
+    match h.parse::<std::net::IpAddr>() {
+        // Loopback (the whole `127.0.0.0/8` block, `::1`) is the only not-exposed family. A specific
+        // LAN/public address, or `0.0.0.0` / `::` ("all interfaces", `is_unspecified`), is reachable.
+        Ok(addr) => !addr.is_loopback(),
+        // Not an IP literal: empty defaults to `0.0.0.0` (exposed); only `localhost` is loopback.
+        Err(_) => host != "localhost",
     }
 }
 
@@ -905,5 +909,13 @@ mod tests {
         assert!(bind_is_publicly_exposed("10.0.0.5"));
         assert!(bind_is_publicly_exposed("192.168.1.10"));
         assert!(bind_is_publicly_exposed("0.0.0.1"));
+    }
+
+    #[test]
+    fn test_bind_non_ip_hostname_defaults_to_exposed() {
+        // A non-IP host that isn't "localhost" can't be proven loopback, so the security warning
+        // errs toward exposed.
+        assert!(bind_is_publicly_exposed("broker.internal"));
+        assert!(bind_is_publicly_exposed("myhost"));
     }
 }

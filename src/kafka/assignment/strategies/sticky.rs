@@ -122,7 +122,7 @@ impl AssignmentStrategy for StickyStrategy {
                     if all_partitions.contains(&key) && !assigned.contains(&key) {
                         result
                             .get_mut(member_id)
-                            .unwrap()
+                            .expect("every member is initialised in `result` before this loop")
                             .topic_partitions
                             .entry(topic.clone())
                             .or_default()
@@ -166,7 +166,7 @@ impl AssignmentStrategy for StickyStrategy {
             let best_member = eligible[0];
             result
                 .get_mut(best_member)
-                .unwrap()
+                .expect("`best_member` came from `result`'s own keys")
                 .topic_partitions
                 .entry(topic)
                 .or_default()
@@ -238,7 +238,7 @@ fn balance_assignments(
 
         if let Some(parts) = result
             .get_mut(&from)
-            .unwrap()
+            .expect("`from` is a member of `result` (chosen from its keys)")
             .topic_partitions
             .get_mut(&topic)
         {
@@ -246,7 +246,7 @@ fn balance_assignments(
         }
         result
             .get_mut(&to)
-            .unwrap()
+            .expect("`to` is a member of `result` (chosen from its keys)")
             .topic_partitions
             .entry(topic)
             .or_default()
