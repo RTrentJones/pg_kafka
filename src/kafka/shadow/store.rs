@@ -1609,10 +1609,13 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
                 .collect();
 
             let key = (producer_id, producer_epoch);
-            let mut pending = self.pending_txn_messages.write().unwrap_or_else(|poisoned| {
-                tracing::warn!("pending_txn_messages write lock was poisoned, recovering");
-                poisoned.into_inner()
-            });
+            let mut pending = self
+                .pending_txn_messages
+                .write()
+                .unwrap_or_else(|poisoned| {
+                    tracing::warn!("pending_txn_messages write lock was poisoned, recovering");
+                    poisoned.into_inner()
+                });
             let buf = pending.entry(key).or_default();
             buf.records.extend(pending_records);
 
