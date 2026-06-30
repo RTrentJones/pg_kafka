@@ -158,9 +158,6 @@ impl ShadowMetrics {
     }
 }
 
-/// Default timeout for sync forwards (milliseconds)
-/// 60 seconds to handle fresh Kafka broker topic auto-creation
-const DEFAULT_FORWARD_TIMEOUT_MS: u64 = 60_000;
 
 /// Max `shadow_tracking` outbox rows claimed and forwarded per poll cycle.
 const OUTBOX_BATCH_LIMIT: i64 = 256;
@@ -220,9 +217,6 @@ pub struct ShadowStore<S: KafkaStore> {
     pending_txn_messages: PendingTxnMessages,
     /// License validator for shadow mode (Commercial License)
     license: RwLock<Option<LicenseValidator>>,
-    /// Monotonic counter used to sample keyless ExternalOnly transactional
-    /// records, which have no local offset to route on (offset = -1)
-    txn_forward_seq: AtomicU64,
 }
 
 impl<S: KafkaStore> ShadowStore<S> {
@@ -247,7 +241,6 @@ impl<S: KafkaStore> ShadowStore<S> {
             forward_ack_rx: RwLock::new(None),
             pending_txn_messages: Arc::new(RwLock::new(HashMap::new())),
             license: RwLock::new(None),
-            txn_forward_seq: AtomicU64::new(0),
         }
     }
 
