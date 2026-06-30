@@ -655,7 +655,14 @@ impl GroupCoordinator {
 
         let group = match groups.get(group_id) {
             Some(g) => g,
-            None => return Ok(()),
+            // RA-5: a consumer presenting a generation (>= 0, checked above) for a
+            // group this coordinator has no record of is stale — the group was
+            // almost certainly reaped by the empty-group sweep (CG-5) while the
+            // consumer was partitioned or lagging. Fence it with UNKNOWN_MEMBER_ID
+            // so it rejoins and gets a fresh generation, instead of accepting a
+            // zombie offset commit. (A simple consumer, generation < 0, already
+            // returned Ok above and is unaffected.)
+            None => return Err(KafkaError::unknown_member(group_id, member_id)),
         };
 
         if group.generation_id != generation_id {
@@ -671,6 +678,19 @@ impl GroupCoordinator {
         }
 
         Ok(())
+    }
+
+    /// The group's selected common protocol, set once a rebalance completes
+    /// (`None` if the group is unknown or hasn't completed a join).
+    ///
+    /// RA-6: the JoinGroup response should advertise the protocol the GROUP
+    /// agreed on (the leader's preference that every member supports), not just
+    /// the requesting member's first advertised preference — heterogeneous
+    /// clients advertising protocols in different orders would otherwise each get
+    /// a different `protocol_name` back.
+    pub fn group_protocol_name(&self, group_id: &str) -> Option<String> {
+        let groups = self.groups.read().ok()?;
+        groups.get(group_id).and_then(|g| g.protocol_name.clone())
     }
 
     /// Handle Heartbeat request
@@ -1530,8 +1550,9 @@ mod tests {
 
     #[test]
     fn test_validate_commit_rejects_zombie_commits() {
-        // CONF-1: a stale generation or unknown member must be rejected; a simple consumer
-        // (generation -1) and an unknown group are allowed through.
+        // CONF-1: a stale generation or unknown member must be rejected. A simple consumer
+        // (generation -1) is allowed through. RA-5: a generation-bearing commit to a group the
+        // coordinator doesn't know (e.g. reaped by the empty-group sweep) is fenced as a zombie.
         let coordinator = GroupCoordinator::new();
         let (member, generation, ..) = coordinator
             .join_group(
@@ -1562,9 +1583,37 @@ mod tests {
         // Simple consumer (generation -1) → not validated.
         assert!(coordinator.validate_commit("g", "", -1).is_ok());
 
-        // A group this coordinator doesn't know → lenient, allowed.
+        // RA-5: a generation-bearing commit to a group this coordinator doesn't
+        // know (e.g. reaped by the empty-group sweep) is a zombie → UnknownMemberId.
         let unknown = coordinator.validate_commit("other", &member, generation);
-        assert!(unknown.is_ok());
+        assert!(matches!(unknown, Err(KafkaError::UnknownMemberId { .. })));
+
+        // ...but a simple consumer (generation -1) on an unknown group is still fine.
+        assert!(coordinator.validate_commit("other", "", -1).is_ok());
+    }
+
+    #[test]
+    fn test_group_protocol_name_reports_selected_protocol() {
+        // RA-6: the accessor the JoinGroup handler uses returns the group's
+        // selected common protocol once a join completes, and None for a group
+        // the coordinator doesn't know.
+        let coordinator = GroupCoordinator::new();
+        coordinator
+            .join_group(
+                "g".to_string(),
+                None,
+                "c1".to_string(),
+                "h".to_string(),
+                300_000,
+                300_000,
+                "consumer".to_string(),
+                vec![("range".to_string(), vec![])],
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(coordinator.group_protocol_name("g").as_deref(), Some("range"));
+        assert!(coordinator.group_protocol_name("nonexistent").is_none());
     }
 
     #[test]
