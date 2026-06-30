@@ -101,7 +101,13 @@ pub fn handle_join_group(
     response.error_code = ERROR_NONE;
     response.generation_id = generation_id;
     response.protocol_type = Some(protocol_type.into());
-    response.protocol_name = coord_protocols.first().map(|(name, _)| name.clone().into());
+    // RA-6: advertise the protocol the GROUP selected (common to all members),
+    // falling back to this member's first preference only if the group hasn't
+    // completed a join yet (so the response is never empty).
+    response.protocol_name = coordinator
+        .group_protocol_name(&group_id)
+        .or_else(|| coord_protocols.first().map(|(name, _)| name.clone()))
+        .map(Into::into);
     response.leader = leader_id.into();
     response.member_id = assigned_member_id.into();
 
