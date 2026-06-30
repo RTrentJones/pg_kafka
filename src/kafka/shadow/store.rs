@@ -2268,7 +2268,10 @@ mod tests {
             !pending.contains_key(&(1, 0)),
             "stale buffer should be evicted by the timeout sweep"
         );
-        assert!(pending.contains_key(&(2, 0)), "fresh buffer must be retained");
+        assert!(
+            pending.contains_key(&(2, 0)),
+            "fresh buffer must be retained"
+        );
     }
 
     #[test]
