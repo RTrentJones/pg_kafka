@@ -158,7 +158,6 @@ impl ShadowMetrics {
     }
 }
 
-
 /// Max `shadow_tracking` outbox rows claimed and forwarded per poll cycle.
 const OUTBOX_BATCH_LIMIT: i64 = 256;
 
