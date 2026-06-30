@@ -8,7 +8,8 @@ use rdkafka::producer::FutureRecord;
 use std::time::Duration;
 
 use super::assertions::{
-    assert_external_kafka_empty, assert_local_message_count, assert_message_in_external_kafka,
+    assert_external_kafka_empty, assert_external_message_count, assert_local_message_count,
+    assert_message_in_external_kafka,
 };
 use super::external_client::verify_external_kafka_ready;
 use super::helpers::{enable_shadow_mode, ShadowMode, ShadowTopicConfig, SyncMode, WriteMode};
@@ -275,5 +276,101 @@ pub async fn test_local_only_mode() -> TestResult {
     // 4. CLEANUP
     ctx.cleanup().await?;
     println!("✅ Test PASSED: LocalOnly Mode\n");
+    Ok(())
+}
+
+/// Test that a reload drops a DELETED topic config from the cache (SH-3)
+///
+/// Regression: the in-memory topic config cache was only ever *updated* on
+/// reload, never cleared, so a `kafka.shadow_config` row that was DELETED kept
+/// forwarding forever. After the fix the cache is replaced on each successful
+/// reload, so a deleted topic stops forwarding (but is still stored locally).
+pub async fn test_reload_clears_deleted_topic_config() -> TestResult {
+    println!("=== Test: Reload Clears Deleted Topic Config (SH-3) ===\n");
+
+    // 1. SETUP
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("reload-clears-cache").await;
+
+    println!("Step 1: Verifying external Kafka is ready...");
+    verify_external_kafka_ready().await?;
+    println!("✅ External Kafka ready\n");
+
+    println!("Step 2: Enabling shadow mode (DualWrite + Sync, 100%)...");
+    enable_shadow_mode(
+        ctx.db(),
+        &topic,
+        &ShadowTopicConfig {
+            mode: ShadowMode::Shadow,
+            forward_percentage: 100,
+            external_topic_name: None,
+            sync_mode: SyncMode::Sync,
+            write_mode: WriteMode::DualWrite,
+        },
+    )
+    .await?;
+    println!("✅ Shadow mode enabled\n");
+
+    let producer = create_producer()?;
+
+    // 2a. Produce before delete — must be forwarded.
+    println!("Step 3: Producing a message (expect forwarded)...");
+    let key1 = b"before-delete-key";
+    let value1 = b"before-delete-value";
+    producer
+        .send(
+            FutureRecord::to(&topic).key(&key1[..]).payload(&value1[..]),
+            Duration::from_secs(5),
+        )
+        .await
+        .map_err(|(e, _)| e)?;
+    assert_message_in_external_kafka(&topic, Some(key1), Some(value1), Duration::from_secs(15))
+        .await?;
+    println!("✅ First message forwarded\n");
+
+    // 2b. DELETE the shadow_config row (not just set local_only) and reload.
+    println!("Step 4: Deleting shadow_config row and reloading...");
+    ctx.db()
+        .execute(
+            r#"
+            DELETE FROM kafka.shadow_config sc
+            USING kafka.topics t
+            WHERE sc.topic_id = t.id AND t.name = $1
+            "#,
+            &[&topic],
+        )
+        .await?;
+    ctx.db().execute("SELECT pg_reload_conf()", &[]).await?;
+    // Wait out the SIGHUP + the 2s reload interval so the worker reloads.
+    tokio::time::sleep(Duration::from_millis(3000)).await;
+    println!("✅ Config deleted and reload window elapsed\n");
+
+    // 2c. Produce after delete — must NOT be forwarded, but stored locally.
+    println!("Step 5: Producing a message after delete (expect NOT forwarded)...");
+    let key2 = b"after-delete-key";
+    let value2 = b"after-delete-value";
+    producer
+        .send(
+            FutureRecord::to(&topic).key(&key2[..]).payload(&value2[..]),
+            Duration::from_secs(5),
+        )
+        .await
+        .map_err(|(e, _)| e)?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    println!("✅ Second message produced\n");
+
+    // 3. VERIFY
+    println!("=== Verification ===\n");
+    // Local: both messages persisted (deleted config still stores locally).
+    assert_local_message_count(ctx.db(), &topic, 2).await?;
+    println!("✅ Both messages stored locally\n");
+    // External: only the first message — the second was NOT forwarded because
+    // the deleted row was evicted from the cache on reload.
+    assert_external_message_count(&topic, 1, Duration::from_secs(5)).await?;
+    println!("✅ Only the pre-delete message was forwarded (cache cleared)\n");
+
+    // 4. CLEANUP
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED: Reload Clears Deleted Topic Config\n");
     Ok(())
 }

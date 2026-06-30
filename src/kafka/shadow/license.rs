@@ -9,9 +9,17 @@
 
 //! Shadow mode license validation
 //!
-//! This module provides license key validation for Shadow Mode commercial licensing.
-//! Shadow Mode is a paid feature for production use, with evaluation mode available
-//! for development and testing.
+//! Shadow Mode is a paid feature for production use, with evaluation mode
+//! available for development and testing.
+//!
+//! ## This is an honor-system "freemium" nag, not an enforcement gate
+//!
+//! By design, Shadow Mode is **never blocked** — it logs and warns, but always
+//! forwards. The license key is a registered-sponsor marker, not a cryptographic
+//! credential: the code performs a **format check only** and does not (and is not
+//! intended to) verify a signature. The deterrent is the recurring log warning and
+//! the compliance/audit exposure it creates for an organization large enough to
+//! care, not a technical lockout. Do not add a signing/enforcement gate here.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -19,13 +27,16 @@ use std::time::Duration;
 /// License validation result
 #[derive(Debug, Clone, PartialEq)]
 pub enum LicenseStatus {
-    /// Valid commercial license
-    Valid,
+    /// A registered sponsor key (`sponsor_id:token`) was supplied. This is a
+    /// well-formed marker on the honor system — its format is checked but no
+    /// signature is verified, so it silences the nag without unlocking anything
+    /// gated (nothing is gated). See the module docs.
+    Registered,
     /// Evaluation mode
     Evaluation,
     /// No license key provided
     Unlicensed,
-    /// Invalid license key format
+    /// Malformed license key (wrong shape for a `sponsor_id:token` marker)
     Invalid(String),
 }
 
@@ -49,7 +60,11 @@ impl LicenseValidator {
         }
     }
 
-    /// Validate license key format
+    /// Classify a license key by shape.
+    ///
+    /// This is a deliberate **format check only** — no signature is verified
+    /// (see the module docs on the freemium honor system). Any non-empty
+    /// `sponsor_id:token` pair is accepted as a registered-sponsor marker.
     fn validate_key(key: &str) -> LicenseStatus {
         if key.is_empty() {
             return LicenseStatus::Unlicensed;
@@ -60,15 +75,15 @@ impl LicenseValidator {
             return LicenseStatus::Evaluation;
         }
 
-        // Format: "sponsor_id:signature"
-        // MVP: Just check format. Future: ed25519 signature verification
-        if let Some((sponsor_id, signature)) = key.split_once(':') {
-            if !sponsor_id.is_empty() && !signature.is_empty() {
-                return LicenseStatus::Valid;
+        // Shape: "sponsor_id:token" — both halves non-empty. Intentionally not
+        // cryptographically verified; this only silences the recurring nag.
+        if let Some((sponsor_id, token)) = key.split_once(':') {
+            if !sponsor_id.is_empty() && !token.is_empty() {
+                return LicenseStatus::Registered;
             }
         }
 
-        LicenseStatus::Invalid("Invalid format. Expected 'sponsor_id:signature'".to_string())
+        LicenseStatus::Invalid("Invalid format. Expected 'sponsor_id:token'".to_string())
     }
 
     /// Check license and emit rate-limited warnings
@@ -97,7 +112,7 @@ impl LicenseValidator {
         }
 
         match &self.status {
-            LicenseStatus::Valid => {} // Silent
+            LicenseStatus::Registered => {} // Silent — registered sponsor marker
             LicenseStatus::Evaluation => {
                 crate::pg_warning!(
                     "Shadow Mode running in EVALUATION mode. \
@@ -132,7 +147,7 @@ impl LicenseValidator {
     pub fn is_licensed(&self) -> bool {
         matches!(
             self.status,
-            LicenseStatus::Valid | LicenseStatus::Evaluation
+            LicenseStatus::Registered | LicenseStatus::Evaluation
         )
     }
 }
@@ -164,7 +179,7 @@ mod tests {
     #[test]
     fn test_valid_format() {
         let v = LicenseValidator::new("sponsor_12345:abc123def456");
-        assert_eq!(v.status(), &LicenseStatus::Valid);
+        assert_eq!(v.status(), &LicenseStatus::Registered);
         assert!(v.is_licensed());
     }
 
@@ -188,9 +203,9 @@ mod tests {
 
     #[test]
     fn test_license_status_clone() {
-        let status = LicenseStatus::Valid;
+        let status = LicenseStatus::Registered;
         let cloned = status.clone();
-        assert_eq!(cloned, LicenseStatus::Valid);
+        assert_eq!(cloned, LicenseStatus::Registered);
 
         let eval = LicenseStatus::Evaluation;
         assert_eq!(eval.clone(), LicenseStatus::Evaluation);
@@ -205,8 +220,8 @@ mod tests {
 
     #[test]
     fn test_license_status_debug_format() {
-        let valid = LicenseStatus::Valid;
-        assert!(format!("{:?}", valid).contains("Valid"));
+        let registered = LicenseStatus::Registered;
+        assert!(format!("{:?}", registered).contains("Registered"));
 
         let eval = LicenseStatus::Evaluation;
         assert!(format!("{:?}", eval).contains("Evaluation"));
@@ -221,7 +236,7 @@ mod tests {
 
     #[test]
     fn test_license_status_equality() {
-        assert_eq!(LicenseStatus::Valid, LicenseStatus::Valid);
+        assert_eq!(LicenseStatus::Registered, LicenseStatus::Registered);
         assert_eq!(LicenseStatus::Evaluation, LicenseStatus::Evaluation);
         assert_eq!(LicenseStatus::Unlicensed, LicenseStatus::Unlicensed);
         assert_eq!(
@@ -232,7 +247,7 @@ mod tests {
             LicenseStatus::Invalid("a".to_string()),
             LicenseStatus::Invalid("b".to_string())
         );
-        assert_ne!(LicenseStatus::Valid, LicenseStatus::Evaluation);
+        assert_ne!(LicenseStatus::Registered, LicenseStatus::Evaluation);
     }
 
     #[test]
@@ -256,20 +271,20 @@ mod tests {
     fn test_valid_license_various_formats() {
         // Any format with non-empty sponsor_id and signature should be valid
         let v1 = LicenseValidator::new("a:b");
-        assert_eq!(v1.status(), &LicenseStatus::Valid);
+        assert_eq!(v1.status(), &LicenseStatus::Registered);
 
         let v2 = LicenseValidator::new("sponsor-123:sig-abc-def-456");
-        assert_eq!(v2.status(), &LicenseStatus::Valid);
+        assert_eq!(v2.status(), &LicenseStatus::Registered);
 
         let v3 = LicenseValidator::new("user@company.com:signature123");
-        assert_eq!(v3.status(), &LicenseStatus::Valid);
+        assert_eq!(v3.status(), &LicenseStatus::Registered);
     }
 
     #[test]
     fn test_invalid_license_reason_message() {
         let v = LicenseValidator::new("invalid");
         if let LicenseStatus::Invalid(reason) = v.status() {
-            assert!(reason.contains("sponsor_id:signature"));
+            assert!(reason.contains("sponsor_id:token"));
         } else {
             panic!("Expected Invalid status");
         }
@@ -300,5 +315,18 @@ mod tests {
     fn test_is_licensed_returns_false_for_invalid() {
         let v = LicenseValidator::new("bad-format");
         assert!(!v.is_licensed());
+    }
+
+    #[test]
+    fn test_registered_key_check_is_silent() {
+        // A registered-sponsor marker takes the silent arm of check_and_warn:
+        // it must not emit a warning (and must not panic). This is the whole
+        // point of the freemium honor system — a well-formed key quiets the nag.
+        let v = LicenseValidator::new("sponsor:token");
+        assert_eq!(v.status(), &LicenseStatus::Registered);
+        // Exercises the `Registered => {}` arm; the other arms call pg_warning!,
+        // which requires the Postgres runtime, so only the silent path is safe
+        // to drive from a plain unit test.
+        v.check_and_warn();
     }
 }

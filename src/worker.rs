@@ -586,6 +586,16 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
                     }
                 }
 
+                // SH-2: re-check primary/standby status. is_primary() caches its
+                // result for the life of the worker, so without this a standby
+                // promoted to primary would never start forwarding. Refreshing
+                // on the reload cycle picks up a failover within one interval.
+                let is_primary = shadow_reload.refresh_primary_status();
+                tracing::debug!(
+                    "Shadow: refreshed primary status (is_primary={})",
+                    is_primary
+                );
+
                 // Flush accumulated metrics to database/logs
                 if let Err(e) = shadow_reload.flush_metrics_to_db() {
                     pg_warning!("Failed to flush shadow metrics: {:?}", e);
