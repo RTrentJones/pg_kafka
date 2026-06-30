@@ -184,17 +184,15 @@ impl ShadowProducer {
 
         let timeout = Timeout::After(Duration::from_millis(DEFAULT_DELIVERY_TIMEOUT_MS));
 
-        let (_partition, offset) =
-            self.producer
-                .send(record, timeout)
-                .await
-                .map_err(|(err, _)| ShadowError::ForwardFailed {
-                    topic: topic.to_string(),
-                    partition: partition.unwrap_or(-1),
-                    error: err.to_string(),
-                })?;
-
-        Ok(offset)
+        let result = self.producer.send(record, timeout).await;
+        match result {
+            Ok((_partition, offset)) => Ok(offset),
+            Err((err, _)) => Err(ShadowError::ForwardFailed {
+                topic: topic.to_string(),
+                partition: partition.unwrap_or(-1),
+                error: err.to_string(),
+            }),
+        }
     }
 
     /// Send a message synchronously (blocking)

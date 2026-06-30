@@ -777,10 +777,7 @@ impl<S: KafkaStore> ShadowStore<S> {
             tracing::warn!("forward_tx read lock was poisoned, recovering");
             poisoned.into_inner()
         });
-        match guard.as_ref() {
-            Some(tx) => tx.try_send(req).is_ok(),
-            None => false,
-        }
+        guard.as_ref().is_some_and(|tx| tx.try_send(req).is_ok())
     }
 
     /// Receive a single forward ack, waiting up to `timeout`. Returns None on
@@ -1013,8 +1010,7 @@ impl<S: KafkaStore> ShadowStore<S> {
                 let local_offset: i64 = row.get_by_name("local_offset")?.unwrap_or(0);
                 let key: Option<Vec<u8>> = row.get_by_name("msg_key")?;
                 let value: Option<Vec<u8>> = row.get_by_name("msg_value")?;
-                let external_topic: String =
-                    row.get_by_name("external_topic")?.unwrap_or_default();
+                let external_topic: String = row.get_by_name("external_topic")?.unwrap_or_default();
                 reqs.push(ForwardRequest::new(
                     topic_id,
                     external_topic,
