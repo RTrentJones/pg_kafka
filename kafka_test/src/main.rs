@@ -236,6 +236,7 @@ use kafka_test::{
     test_outbox_row_written_and_finalized,
     test_reload_clears_deleted_topic_config,
     test_replay_historical_messages,
+    test_replay_skips_aborted_records,
     // Pipelining tests
     test_request_pipelining,
     test_response_ordering_with_long_poll,
@@ -1437,6 +1438,12 @@ fn get_all_tests() -> Vec<TestDef> {
             category: "shadow",
             name: "test_replay_historical_messages",
             test_fn: wrap_test!(test_replay_historical_messages),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "shadow",
+            name: "test_replay_skips_aborted_records",
+            test_fn: wrap_test!(test_replay_skips_aborted_records),
             parallel_safe: false,
         },
         // ==================== METADATA API TESTS (Phase 4) ====================

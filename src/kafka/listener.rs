@@ -157,10 +157,14 @@ async fn run_shadow_forwarder(
                     local_offset: req.local_offset,
                     result: ack_result,
                 };
-                // If the DB thread/receiver is gone (shutdown), the row simply
-                // stays pending — no panic.
-                if ack_tx.send(ack).is_err() {
-                    debug!("Forward ack channel closed, dropping ack");
+                // RA-6: non-blocking send. A blocking `send` here could park this
+                // tokio worker if the ack channel were full (the SEC-4
+                // anti-pattern). On full/closed, drop the ack — the row stays
+                // pending in the outbox and the poll re-forwards it (at-least-once
+                // is preserved), so the only cost is a duplicate the idempotent
+                // producer absorbs.
+                if ack_tx.try_send(ack).is_err() {
+                    debug!("Forward ack channel full or closed, dropping ack (row stays pending)");
                 }
             }
             Ok(Err(crossbeam_channel::RecvTimeoutError::Timeout)) => {
