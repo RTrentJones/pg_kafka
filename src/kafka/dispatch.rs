@@ -12,6 +12,7 @@ use crate::kafka::constants::ERROR_UNKNOWN_SERVER_ERROR;
 use crate::kafka::error::KafkaError;
 use crate::kafka::messages::KafkaResponse;
 use crate::{pg_log, pg_warning};
+use kafka_protocol::messages::produce_response::ProduceResponse;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -98,6 +99,47 @@ pub fn dispatch_infallible<R, F, W>(
     } else {
         pg_log!("{} response sent successfully", handler_name);
     }
+}
+
+/// Produce-specific wrapper around [`dispatch_response`] (RA-3).
+///
+/// The Produce `acks >= 1` path can't go through the generic enum dispatch
+/// because it needs a success side-effect (waking long-poll consumers) and the
+/// `acks = 0` no-response special case lives next to it. It used to hand-roll the
+/// `Ok`/`Err` match and send, which skipped panic safety: a handler panic (a
+/// Postgres ERROR surfaces through pgrx as a Rust panic) sent no response and the
+/// client hung to its timeout. This helper restores the same `catch_unwind`
+/// behaviour as `dispatch_response` — panic → reply UNKNOWN_SERVER_ERROR → resume
+/// so the surrounding subtransaction still rolls back — while wiring the Produce
+/// response shape and an `on_success` hook.
+pub fn dispatch_produce<H, N>(
+    response_tx: UnboundedSender<KafkaResponse>,
+    correlation_id: i32,
+    api_version: i16,
+    handler: H,
+    on_success: N,
+) where
+    H: FnOnce() -> Result<ProduceResponse, KafkaError>,
+    N: FnOnce(&ProduceResponse),
+{
+    dispatch_response(
+        "Produce",
+        response_tx,
+        handler,
+        move |response| {
+            on_success(&response);
+            KafkaResponse::Produce {
+                correlation_id,
+                api_version,
+                response,
+            }
+        },
+        move |error_code| KafkaResponse::Produce {
+            correlation_id,
+            api_version,
+            response: crate::kafka::response_builders::build_produce_error_response(error_code),
+        },
+    );
 }
 
 #[cfg(test)]
@@ -238,6 +280,65 @@ mod tests {
                 assert_eq!(correlation_id, 42);
             }
             _ => panic!("Unexpected response type"),
+        }
+    }
+
+    #[test]
+    fn test_dispatch_produce_success_runs_on_success_and_sends() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let ran = std::cell::Cell::new(false);
+        dispatch_produce(
+            tx,
+            3,
+            2,
+            || Ok(crate::kafka::response_builders::build_produce_error_response(0)),
+            |_resp| ran.set(true),
+        );
+        assert!(ran.get(), "on_success should run on Ok");
+        match rx.try_recv().expect("a Produce response should be sent") {
+            KafkaResponse::Produce {
+                correlation_id,
+                api_version,
+                ..
+            } => {
+                assert_eq!(correlation_id, 3);
+                assert_eq!(api_version, 2);
+            }
+            _ => panic!("expected a Produce response"),
+        }
+    }
+
+    #[test]
+    fn test_dispatch_produce_panic_replies_produce_error_and_resumes() {
+        // RA-3: a panicking Produce handler must still send a Produce response
+        // (client not left hanging) AND re-raise so the subtransaction rolls back.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            dispatch_produce(
+                tx,
+                7,
+                9,
+                || -> Result<ProduceResponse, KafkaError> { panic!("produce boom") },
+                |_resp| {},
+            );
+        }));
+        assert!(
+            outcome.is_err(),
+            "panic must be re-raised so the subtransaction rolls back"
+        );
+        match rx
+            .try_recv()
+            .expect("a Produce response must have been sent before resume")
+        {
+            KafkaResponse::Produce {
+                correlation_id,
+                api_version,
+                ..
+            } => {
+                assert_eq!(correlation_id, 7);
+                assert_eq!(api_version, 9);
+            }
+            _ => panic!("expected a Produce response"),
         }
     }
 }
