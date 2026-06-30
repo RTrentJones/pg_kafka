@@ -311,6 +311,120 @@ pub fn build_init_producer_id_error_response(error_code: i16) -> InitProducerIdR
     response
 }
 
+/// Build a *decodable*, API-specific error response for a request whose `api_key` is known.
+///
+/// Wraps the matching `build_*_error_response` builder in the corresponding [`KafkaResponse`] variant,
+/// tagged with the request's `api_version` so the existing encoder writes it at the version the client
+/// sent. The protocol layer prefers this over the hand-rolled `KafkaResponse::Error` frame, which uses
+/// a fixed v0 header that strict clients (e.g. Sarama) mis-decode and panic on. Used by the
+/// request-version-range rejection (CONF-6) and the per-API decode-failure arms in `decoding.rs`.
+///
+/// Returns `None` for an `api_key` with no typed error builder — ApiVersions (which never reaches the
+/// error path) and the transaction APIs — so the caller falls back to the generic frame, which is then
+/// only reachable on a truly-unknown `api_key` or a builder-less API's malformed-input path.
+pub fn error_response_for(
+    api_key: i16,
+    api_version: i16,
+    correlation_id: i32,
+    error_code: i16,
+) -> Option<crate::kafka::messages::KafkaResponse> {
+    use crate::kafka::messages::KafkaResponse;
+    let response = match api_key {
+        API_KEY_METADATA => KafkaResponse::Metadata {
+            correlation_id,
+            api_version,
+            response: build_metadata_error_response(),
+        },
+        API_KEY_PRODUCE => KafkaResponse::Produce {
+            correlation_id,
+            api_version,
+            response: build_produce_error_response(error_code),
+        },
+        API_KEY_FETCH => KafkaResponse::Fetch {
+            correlation_id,
+            api_version,
+            response: build_fetch_error_response(error_code),
+        },
+        API_KEY_LIST_OFFSETS => KafkaResponse::ListOffsets {
+            correlation_id,
+            api_version,
+            response: build_list_offsets_error_response(error_code),
+        },
+        API_KEY_OFFSET_COMMIT => KafkaResponse::OffsetCommit {
+            correlation_id,
+            api_version,
+            response: build_offset_commit_error_response(error_code),
+        },
+        API_KEY_OFFSET_FETCH => KafkaResponse::OffsetFetch {
+            correlation_id,
+            api_version,
+            response: build_offset_fetch_error_response(error_code),
+        },
+        API_KEY_FIND_COORDINATOR => KafkaResponse::FindCoordinator {
+            correlation_id,
+            api_version,
+            response: build_find_coordinator_error_response(error_code),
+        },
+        API_KEY_JOIN_GROUP => KafkaResponse::JoinGroup {
+            correlation_id,
+            api_version,
+            response: build_join_group_error_response(error_code),
+        },
+        API_KEY_SYNC_GROUP => KafkaResponse::SyncGroup {
+            correlation_id,
+            api_version,
+            response: build_sync_group_error_response(error_code),
+        },
+        API_KEY_HEARTBEAT => KafkaResponse::Heartbeat {
+            correlation_id,
+            api_version,
+            response: build_heartbeat_error_response(error_code),
+        },
+        API_KEY_LEAVE_GROUP => KafkaResponse::LeaveGroup {
+            correlation_id,
+            api_version,
+            response: build_leave_group_error_response(error_code),
+        },
+        API_KEY_DESCRIBE_GROUPS => KafkaResponse::DescribeGroups {
+            correlation_id,
+            api_version,
+            response: build_describe_groups_error_response(error_code),
+        },
+        API_KEY_LIST_GROUPS => KafkaResponse::ListGroups {
+            correlation_id,
+            api_version,
+            response: build_list_groups_error_response(error_code),
+        },
+        API_KEY_CREATE_TOPICS => KafkaResponse::CreateTopics {
+            correlation_id,
+            api_version,
+            response: build_create_topics_error_response(error_code),
+        },
+        API_KEY_DELETE_TOPICS => KafkaResponse::DeleteTopics {
+            correlation_id,
+            api_version,
+            response: build_delete_topics_error_response(error_code),
+        },
+        API_KEY_CREATE_PARTITIONS => KafkaResponse::CreatePartitions {
+            correlation_id,
+            api_version,
+            response: build_create_partitions_error_response(error_code),
+        },
+        API_KEY_DELETE_GROUPS => KafkaResponse::DeleteGroups {
+            correlation_id,
+            api_version,
+            response: build_delete_groups_error_response(error_code),
+        },
+        API_KEY_INIT_PRODUCER_ID => KafkaResponse::InitProducerId {
+            correlation_id,
+            api_version,
+            response: build_init_producer_id_error_response(error_code),
+        },
+        _ => return None,
+    };
+    Some(response)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -688,5 +802,41 @@ mod tests {
         assert_eq!(response.controller_id.0, -1);
         assert!(response.brokers.is_empty());
         assert!(response.topics.is_empty());
+    }
+
+    // ========== error_response_for dispatcher (decodable protocol errors) ==========
+
+    #[test]
+    fn test_error_response_for_known_api_is_typed_and_versioned() {
+        use crate::kafka::messages::KafkaResponse;
+        // Fetch has a top-level error_code → it is carried through, tagged with the request version.
+        match error_response_for(API_KEY_FETCH, 11, 42, ERROR_UNSUPPORTED_VERSION) {
+            Some(KafkaResponse::Fetch {
+                correlation_id,
+                api_version,
+                response,
+            }) => {
+                assert_eq!(correlation_id, 42);
+                assert_eq!(api_version, 11);
+                assert_eq!(response.error_code, ERROR_UNSUPPORTED_VERSION);
+            }
+            _ => panic!("expected a typed Fetch error response"),
+        }
+        // Metadata carries no top-level error_code, but still maps to a decodable Metadata variant.
+        assert!(matches!(
+            error_response_for(API_KEY_METADATA, 10, 1, ERROR_UNSUPPORTED_VERSION),
+            Some(KafkaResponse::Metadata {
+                api_version: 10,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_error_response_for_builderless_or_unknown_api_is_none() {
+        // Transaction APIs and unknown keys have no typed error builder → None, so the protocol
+        // layer falls back to the generic frame (its only remaining use).
+        assert!(error_response_for(API_KEY_END_TXN, 3, 1, ERROR_UNSUPPORTED_VERSION).is_none());
+        assert!(error_response_for(9999, 0, 1, ERROR_UNSUPPORTED_VERSION).is_none());
     }
 }
