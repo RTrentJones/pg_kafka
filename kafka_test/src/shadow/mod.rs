@@ -43,7 +43,7 @@ pub use percentage_routing::{
     test_deterministic_routing, test_fifty_percent_forwarding, test_hundred_percent_forwarding,
     test_zero_percent_forwarding,
 };
-pub use replay::test_replay_historical_messages;
+pub use replay::{test_replay_historical_messages, test_replay_skips_aborted_records};
 pub use topic_mapping::test_topic_name_mapping;
 pub use transaction_integration::{
     test_aborted_transaction_not_forwarded, test_committed_transaction_forwarded,

@@ -207,6 +207,7 @@ pub use shadow::{
     test_reload_clears_deleted_topic_config,
     // Replay
     test_replay_historical_messages,
+    test_replay_skips_aborted_records,
     // Topic mapping
     test_topic_name_mapping,
     test_zero_percent_forwarding,

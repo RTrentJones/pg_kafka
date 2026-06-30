@@ -166,6 +166,14 @@ const OUTBOX_BATCH_LIMIT: i64 = 256;
 /// last-attempt stamp until `external_offset` is set (which marks the row done).
 const OUTBOX_RETRY_INTERVAL_MS: i64 = 5_000;
 
+/// After this many failed forward attempts a row is left as a durable
+/// dead-letter (RA-4): the poll stops re-dispatching it (no infinite retry of a
+/// poison message — e.g. a payload over the external broker's max.message.bytes),
+/// but the row stays in `kafka.shadow_tracking` (pending, with `retry_count` and
+/// `error_message` set) so it is visible and can be re-queued with
+/// `kafka.replay_shadow_messages` once the cause is fixed.
+const MAX_FORWARD_RETRIES: i64 = 10;
+
 /// Upper bound a bounded-sync produce waits for external confirmation before
 /// returning anyway. The outbox row stays durable and the poll retries it, so
 /// this is a latency cap, never a correctness boundary (SH-14). Kept short
@@ -333,7 +341,13 @@ impl<S: KafkaStore> ShadowStore<S> {
     /// consumers must read from the external broker. The config loader forces
     /// `forward_percentage = 100` for these topics, so every record is
     /// guaranteed to be forwarded (a sampled-out record would be readable
-    /// nowhere). Returns false on a standby (no shadow behaviour applies there).
+    /// nowhere).
+    ///
+    /// Read suppression depends only on the global shadow GUC + the per-topic
+    /// config, not on primary/standby (RA-6): a standby must suppress these reads
+    /// too, since the external broker — not the local copy — is the source of
+    /// truth for an external-primary topic. (Forwarding itself is still
+    /// primary-only; that gate lives on the write path.)
     fn is_external_primary(&self, topic_id: i32) -> bool {
         if !self.is_enabled() {
             return false;
@@ -855,12 +869,19 @@ impl<S: KafkaStore> ShadowStore<S> {
             let table = client.update(
                 r#"
                 WITH due AS (
-                    SELECT topic_id, partition_id, local_offset
-                    FROM kafka.shadow_tracking
-                    WHERE external_offset IS NULL
-                      AND (forwarded_at IS NULL
-                           OR forwarded_at < NOW() - ($1 || ' milliseconds')::interval)
-                    ORDER BY topic_id, partition_id, local_offset
+                    SELECT st.topic_id, st.partition_id, st.local_offset
+                    FROM kafka.shadow_tracking st
+                    WHERE st.external_offset IS NULL
+                      AND st.retry_count < $3
+                      AND (st.forwarded_at IS NULL
+                           OR st.forwarded_at < NOW() - ($1 || ' milliseconds')::interval)
+                      AND EXISTS (
+                          SELECT 1 FROM kafka.messages m
+                          WHERE m.topic_id = st.topic_id
+                            AND m.partition_id = st.partition_id
+                            AND m.partition_offset = st.local_offset
+                      )
+                    ORDER BY st.topic_id, st.partition_id, st.local_offset
                     LIMIT $2
                 ),
                 claimed AS (
@@ -887,7 +908,11 @@ impl<S: KafkaStore> ShadowStore<S> {
                  AND m.partition_offset = c.local_offset
                 "#,
                 None,
-                &[OUTBOX_RETRY_INTERVAL_MS.into(), OUTBOX_BATCH_LIMIT.into()],
+                &[
+                    OUTBOX_RETRY_INTERVAL_MS.into(),
+                    OUTBOX_BATCH_LIMIT.into(),
+                    MAX_FORWARD_RETRIES.into(),
+                ],
             )?;
 
             let mut reqs: Vec<ForwardRequest> = Vec::new();
@@ -963,24 +988,31 @@ impl<S: KafkaStore> ShadowStore<S> {
         // guarded by `external_offset IS NULL`, so a duplicate ack (e.g. a sync
         // send and a poll resend both confirming) updates nothing and counts
         // nothing — exactly-once per row.
-        let result: Result<()> = Spi::connect_mut(|client| {
-            match &ack.result {
+        // Each statement appends `RETURNING 1` so we learn whether the row
+        // actually transitioned (`external_offset IS NULL` matched). A duplicate
+        // ack updates nothing and returns no rows, so the in-RAM mirror below is
+        // bumped exactly once too (RA-6), matching the persistent table.
+        let result: Result<bool> = Spi::connect_mut(|client| {
+            let transitioned = match &ack.result {
                 Ok(external_offset) => {
-                    client.update(
+                    let table = client.update(
                         "WITH done AS ( \
                              UPDATE kafka.shadow_tracking \
                              SET external_offset = $4, forwarded_at = NOW(), error_message = NULL \
                              WHERE topic_id = $1 AND partition_id = $2 AND local_offset = $3 \
                                AND external_offset IS NULL \
                              RETURNING topic_id, partition_id, local_offset \
+                         ), \
+                         bumped AS ( \
+                             INSERT INTO kafka.shadow_metrics \
+                                 (topic_id, partition_id, messages_forwarded, last_forwarded_offset, last_forwarded_at) \
+                             SELECT topic_id, partition_id, 1, local_offset, NOW() FROM done \
+                             ON CONFLICT (topic_id, partition_id) DO UPDATE SET \
+                                messages_forwarded = kafka.shadow_metrics.messages_forwarded + 1, \
+                                last_forwarded_offset = GREATEST(kafka.shadow_metrics.last_forwarded_offset, EXCLUDED.last_forwarded_offset), \
+                                last_forwarded_at = NOW() \
                          ) \
-                         INSERT INTO kafka.shadow_metrics \
-                             (topic_id, partition_id, messages_forwarded, last_forwarded_offset, last_forwarded_at) \
-                         SELECT topic_id, partition_id, 1, local_offset, NOW() FROM done \
-                         ON CONFLICT (topic_id, partition_id) DO UPDATE SET \
-                            messages_forwarded = kafka.shadow_metrics.messages_forwarded + 1, \
-                            last_forwarded_offset = GREATEST(kafka.shadow_metrics.last_forwarded_offset, EXCLUDED.last_forwarded_offset), \
-                            last_forwarded_at = NOW()",
+                         SELECT 1 FROM done",
                         None,
                         &[
                             ack.topic_id.into(),
@@ -989,20 +1021,24 @@ impl<S: KafkaStore> ShadowStore<S> {
                             (*external_offset).into(),
                         ],
                     )?;
+                    table.into_iter().count() > 0
                 }
                 Err(msg) => {
-                    client.update(
+                    let table = client.update(
                         "WITH failed AS ( \
                              UPDATE kafka.shadow_tracking \
                              SET retry_count = retry_count + 1, error_message = $4 \
                              WHERE topic_id = $1 AND partition_id = $2 AND local_offset = $3 \
                                AND external_offset IS NULL \
                              RETURNING topic_id, partition_id \
+                         ), \
+                         bumped AS ( \
+                             INSERT INTO kafka.shadow_metrics (topic_id, partition_id, messages_failed) \
+                             SELECT topic_id, partition_id, 1 FROM failed \
+                             ON CONFLICT (topic_id, partition_id) DO UPDATE SET \
+                                messages_failed = kafka.shadow_metrics.messages_failed + 1 \
                          ) \
-                         INSERT INTO kafka.shadow_metrics (topic_id, partition_id, messages_failed) \
-                         SELECT topic_id, partition_id, 1 FROM failed \
-                         ON CONFLICT (topic_id, partition_id) DO UPDATE SET \
-                            messages_failed = kafka.shadow_metrics.messages_failed + 1",
+                         SELECT 1 FROM failed",
                         None,
                         &[
                             ack.topic_id.into(),
@@ -1011,27 +1047,32 @@ impl<S: KafkaStore> ShadowStore<S> {
                             msg.clone().into(),
                         ],
                     )?;
+                    table.into_iter().count() > 0
                 }
-            }
-            Ok(())
+            };
+            Ok(transitioned)
         });
 
-        if let Err(e) = result {
-            tracing::warn!(
-                "Shadow: failed to apply forward ack for {}[{}] offset {}: {:?}",
-                ack.topic_id,
-                ack.partition_id,
-                ack.local_offset,
-                e
-            );
-        }
-
-        // Mirror into the in-RAM counters used by flush_metrics_to_db logging.
-        match &ack.result {
-            Ok(_) => {
-                self.metrics.forwarded.fetch_add(1, Ordering::Relaxed);
+        let transitioned = match result {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(
+                    "Shadow: failed to apply forward ack for {}[{}] offset {}: {:?}",
+                    ack.topic_id,
+                    ack.partition_id,
+                    ack.local_offset,
+                    e
+                );
+                false
             }
-            Err(_) => {
+        };
+
+        // Mirror into the in-RAM counters used by flush_metrics_to_db logging,
+        // only when the row actually transitioned (exactly-once, RA-6).
+        if transitioned {
+            if ack.result.is_ok() {
+                self.metrics.forwarded.fetch_add(1, Ordering::Relaxed);
+            } else {
                 self.metrics.failed.fetch_add(1, Ordering::Relaxed);
             }
         }

@@ -2,12 +2,12 @@
 //!
 //! Tests for replaying historical messages to external Kafka.
 
-use crate::common::{create_producer, TestResult};
+use crate::common::{create_producer, create_transactional_producer, TestResult};
 use crate::setup::TestContext;
-use rdkafka::producer::FutureRecord;
+use rdkafka::producer::{FutureRecord, Producer};
 use std::time::Duration;
 
-use super::assertions::assert_external_message_count;
+use super::assertions::{assert_external_message_count, assert_message_in_external_kafka};
 use super::external_client::verify_external_kafka_ready;
 use super::helpers::{enable_shadow_mode, ShadowMode, ShadowTopicConfig, SyncMode, WriteMode};
 
@@ -131,5 +131,106 @@ pub async fn test_replay_historical_messages() -> TestResult {
     // 5. CLEANUP
     ctx.cleanup().await?;
     println!("✅ Test PASSED: Replay Historical Messages\n");
+    Ok(())
+}
+
+/// Test that replay skips aborted (and uncommitted) records (RA-6)
+///
+/// `kafka.replay_shadow_messages` filters on `txn_state IS NULL` so a replay over
+/// a range that includes an aborted transactional record does NOT forward that
+/// record to the external broker — only the committed/non-transactional ones.
+pub async fn test_replay_skips_aborted_records() -> TestResult {
+    println!("=== Test: Replay Skips Aborted Records (RA-6) ===\n");
+
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("replay-aborted").await;
+    let txn_id = format!("replay-abort-{}", ctx.test_id);
+
+    verify_external_kafka_ready().await?;
+
+    // Produce with shadow OFF (LocalOnly) so nothing forwards until we replay.
+    enable_shadow_mode(
+        ctx.db(),
+        &topic,
+        &ShadowTopicConfig {
+            mode: ShadowMode::LocalOnly,
+            forward_percentage: 100,
+            external_topic_name: None,
+            sync_mode: SyncMode::Sync,
+            write_mode: WriteMode::DualWrite,
+        },
+    )
+    .await?;
+
+    // 1. A committed, non-transactional record (txn_state NULL).
+    let producer = create_producer()?;
+    let committed_key = b"committed-key";
+    let committed_value = b"committed-value";
+    producer
+        .send(
+            FutureRecord::to(&topic)
+                .key(&committed_key[..])
+                .payload(&committed_value[..]),
+            Duration::from_secs(5),
+        )
+        .await
+        .map_err(|(e, _)| e)?;
+
+    // 2. An ABORTED transactional record (persists with txn_state='aborted').
+    let txn_producer = create_transactional_producer(&txn_id)?;
+    txn_producer.init_transactions(Duration::from_secs(10))?;
+    txn_producer.begin_transaction()?;
+    txn_producer
+        .send(
+            FutureRecord::to(&topic)
+                .key(&b"aborted-key"[..])
+                .payload(&b"aborted-value"[..]),
+            Duration::from_secs(5),
+        )
+        .await
+        .map_err(|(e, _)| e)?;
+    txn_producer.abort_transaction(Duration::from_secs(10))?;
+    println!("✅ Produced 1 committed + 1 aborted record\n");
+
+    // 3. Enable shadow + replay the whole range.
+    enable_shadow_mode(
+        ctx.db(),
+        &topic,
+        &ShadowTopicConfig {
+            mode: ShadowMode::Shadow,
+            forward_percentage: 100,
+            external_topic_name: None,
+            sync_mode: SyncMode::Sync,
+            write_mode: WriteMode::DualWrite,
+        },
+    )
+    .await?;
+
+    let row = ctx
+        .db()
+        .query_one("SELECT id FROM kafka.topics WHERE name = $1", &[&topic])
+        .await?;
+    let topic_id: i32 = row.get(0);
+    ctx.db()
+        .execute(
+            "SELECT kafka.replay_shadow_messages($1, 0, NULL)",
+            &[&topic_id],
+        )
+        .await?;
+    println!("✅ Replay invoked\n");
+
+    // 4. VERIFY: only the committed record reaches external Kafka.
+    assert_message_in_external_kafka(
+        &topic,
+        Some(committed_key),
+        Some(committed_value),
+        Duration::from_secs(15),
+    )
+    .await?;
+    assert_external_message_count(&topic, 1, Duration::from_secs(5)).await?;
+    println!("✅ Only the committed record was replayed (aborted record skipped)\n");
+
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED: Replay Skips Aborted Records\n");
     Ok(())
 }

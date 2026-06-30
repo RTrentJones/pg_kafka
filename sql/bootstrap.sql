@@ -259,7 +259,7 @@ COMMENT ON TABLE kafka.txn_pending_offsets IS 'Pending offset commits within an 
 COMMENT ON COLUMN kafka.txn_pending_offsets.pending_offset IS 'Offset to be committed when transaction completes successfully';
 
 -- =============================================================================
--- Phase 11: Shadow Mode (included from shadow_mode.sql)
+-- Phase 11: Shadow Mode
 -- =============================================================================
 -- NOTE: Shadow mode tables are defined inline below rather than via \i
 -- to avoid SQL file include issues with pgrx extension packaging.
@@ -369,6 +369,10 @@ BEGIN
     WHERE m.topic_id = p_topic_id
       AND m.partition_offset >= p_from_offset
       AND (p_to_offset IS NULL OR m.partition_offset < p_to_offset)
+      -- RA-6: only replay committed/non-transactional records. txn_state NULL =
+      -- committed or non-txn; 'pending' (uncommitted) and 'aborted' must never be
+      -- forwarded to the external broker.
+      AND m.txn_state IS NULL
     ON CONFLICT (topic_id, partition_id, local_offset) DO UPDATE
         SET external_offset = NULL,
             forwarded_at    = NULL,
