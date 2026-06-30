@@ -315,20 +315,18 @@ pub fn encode_response(response: KafkaResponse) -> Result<BytesMut> {
             error_code,
             error_message,
         } => {
-            // Protocol/Decoding Error Response
-            // =================================
-            // This variant is used ONLY for protocol-level errors that occur during request
-            // decoding, BEFORE we know which API is being requested. Examples:
-            // - Invalid request header
-            // - Unsupported API key
-            // - Decode failures before API type is determined
+            // Generic protocol-error fallback frame (hand-rolled, fixed v0 header).
+            // =======================================================================
+            // Reserved for the cases where we genuinely cannot build a typed, API-specific reply:
+            // a request whose `api_key` we don't recognise, or a builder-less API (the transaction
+            // APIs) on a malformed-input path. The protocol layer (`decoding::send_api_error`) routes
+            // every *known* api_key — including the CONF-6 version-range rejection that once panicked
+            // Sarama — through `response_builders::error_response_for`, which returns the API's own
+            // response struct encoded at the request's version so even strict clients can decode it.
             //
-            // For handler-level errors (after we know the API type), use the appropriate
-            // API-specific error response via the dispatch mechanism in worker.rs.
-            //
-            // Note: This hand-rolled format works with lenient clients like kcat, but strict
-            // clients may fail to parse it. This is acceptable since these are protocol errors
-            // that shouldn't happen in normal operation.
+            // This frame's fixed v0 header is mis-parsed by strict clients, but that is acceptable
+            // here: a client that reaches this path is already sending a request we cannot shape a
+            // typed response for.
             let header = ResponseHeader::default().with_correlation_id(correlation_id);
             header.encode(&mut response_buf, 0)?;
 

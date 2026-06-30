@@ -103,15 +103,17 @@ fn parse_request_inner(
                     "Rejecting api_key={} version {} outside supported range {}..={}",
                     api_key, api_version, min_version, max_version
                 );
-                let error_response = super::super::messages::KafkaResponse::Error {
+                // CONF-6: respond with the API's own (decodable) error response at the requested
+                // version rather than the hand-rolled generic frame, so a client that sent an
+                // over-range version can parse the reply instead of mis-decoding it (Sarama).
+                send_api_error(
+                    &response_tx,
+                    api_key,
+                    api_version,
                     correlation_id,
-                    error_code: ERROR_UNSUPPORTED_VERSION,
-                    error_message: Some(format!(
-                        "Unsupported version {} for api_key {} (supported {}..={})",
-                        api_version, api_key, min_version, max_version
-                    )),
-                };
-                let _ = response_tx.send(error_response);
+                    ERROR_UNSUPPORTED_VERSION,
+                    "unsupported request version",
+                );
                 return Ok(None);
             }
         }
@@ -277,20 +279,51 @@ fn parse_request_inner(
             response_tx,
         ),
         _ => {
-            // Unsupported API
+            // Unsupported API — we don't know this api_key, so `error_response_for` returns None and
+            // this falls back to the generic protocol-error frame (the case it's still meant for).
             warn!("Unsupported API key: {}", api_key);
-
-            // Send error response immediately
-            let error_response = super::super::messages::KafkaResponse::Error {
+            send_api_error(
+                &response_tx,
+                api_key,
+                api_version,
                 correlation_id,
-                error_code: ERROR_UNSUPPORTED_VERSION,
-                error_message: Some(format!("Unsupported API key: {}", api_key)),
-            };
-            let _ = response_tx.send(error_response);
-
+                ERROR_UNSUPPORTED_VERSION,
+                "unsupported API key",
+            );
             Ok(None)
         }
     }
+}
+
+/// Send a *decodable*, API-specific error response for a known `api_key`.
+///
+/// Delegates to [`response_builders::error_response_for`], which wraps the API's
+/// `build_*_error_response` in the matching typed [`KafkaResponse`] variant (encoded at the request's
+/// `api_version`). Falls back to the hand-rolled generic `KafkaResponse::Error` frame only when the
+/// api_key has no typed builder (a truly-unknown API, or a builder-less API's malformed-input path) —
+/// a strict client hitting that fallback is already sending a request we can't shape a response for.
+/// This is what lets an over-version or malformed request return something the client can decode
+/// instead of panicking its decoder (the Sarama CONF-6 regression).
+fn send_api_error(
+    response_tx: &tokio::sync::mpsc::UnboundedSender<super::super::messages::KafkaResponse>,
+    api_key: i16,
+    api_version: i16,
+    correlation_id: i32,
+    error_code: i16,
+    fallback_message: &str,
+) {
+    let response = super::super::response_builders::error_response_for(
+        api_key,
+        api_version,
+        correlation_id,
+        error_code,
+    )
+    .unwrap_or_else(|| super::super::messages::KafkaResponse::Error {
+        correlation_id,
+        error_code,
+        error_message: Some(fallback_message.to_string()),
+    });
+    let _ = response_tx.send(response);
 }
 
 fn parse_api_versions(
@@ -332,12 +365,14 @@ fn parse_metadata(
         Ok(req) => req,
         Err(e) => {
             warn!("Failed to decode MetadataRequest: {}", e);
-            let error_response = super::super::messages::KafkaResponse::Error {
+            send_api_error(
+                &response_tx,
+                API_KEY_METADATA,
+                api_version,
                 correlation_id,
-                error_code: ERROR_CORRUPT_MESSAGE,
-                error_message: Some(format!("Malformed MetadataRequest: {}", e)),
-            };
-            let _ = response_tx.send(error_response);
+                ERROR_CORRUPT_MESSAGE,
+                "malformed request",
+            );
             return Ok(None);
         }
     };
@@ -402,12 +437,14 @@ fn parse_produce(
         Ok(req) => req,
         Err(e) => {
             warn!("Failed to decode ProduceRequest: {}", e);
-            let error_response = super::super::messages::KafkaResponse::Error {
+            send_api_error(
+                &response_tx,
+                API_KEY_PRODUCE,
+                api_version,
                 correlation_id,
-                error_code: ERROR_CORRUPT_MESSAGE,
-                error_message: Some(format!("Malformed ProduceRequest: {}", e)),
-            };
-            let _ = response_tx.send(error_response);
+                ERROR_CORRUPT_MESSAGE,
+                "malformed request",
+            );
             return Ok(None);
         }
     };
@@ -446,12 +483,14 @@ fn parse_produce(
                             "Failed to parse RecordBatch for topic={}, partition={}: {}",
                             topic_name, partition_index, e
                         );
-                        let error_response = super::super::messages::KafkaResponse::Error {
+                        send_api_error(
+                            &response_tx,
+                            API_KEY_PRODUCE,
+                            api_version,
                             correlation_id,
-                            error_code: ERROR_CORRUPT_MESSAGE,
-                            error_message: Some(format!("Invalid RecordBatch: {}", e)),
-                        };
-                        let _ = response_tx.send(error_response);
+                            ERROR_CORRUPT_MESSAGE,
+                            "invalid record batch",
+                        );
                         return Ok(None);
                     }
                 },
@@ -507,12 +546,14 @@ fn parse_fetch(
         Ok(req) => req,
         Err(e) => {
             warn!("Failed to decode FetchRequest: {}", e);
-            let error_response = super::super::messages::KafkaResponse::Error {
+            send_api_error(
+                &response_tx,
+                API_KEY_FETCH,
+                api_version,
                 correlation_id,
-                error_code: ERROR_CORRUPT_MESSAGE,
-                error_message: Some(format!("Malformed FetchRequest: {}", e)),
-            };
-            let _ = response_tx.send(error_response);
+                ERROR_CORRUPT_MESSAGE,
+                "malformed request",
+            );
             return Ok(None);
         }
     };
@@ -586,12 +627,14 @@ fn parse_offset_commit(
         Ok(req) => req,
         Err(e) => {
             warn!("Failed to decode OffsetCommitRequest: {}", e);
-            let error_response = super::super::messages::KafkaResponse::Error {
+            send_api_error(
+                &response_tx,
+                API_KEY_OFFSET_COMMIT,
+                api_version,
                 correlation_id,
-                error_code: ERROR_CORRUPT_MESSAGE,
-                error_message: Some(format!("Malformed OffsetCommitRequest: {}", e)),
-            };
-            let _ = response_tx.send(error_response);
+                ERROR_CORRUPT_MESSAGE,
+                "malformed request",
+            );
             return Ok(None);
         }
     };
@@ -660,12 +703,14 @@ fn parse_offset_fetch(
         Ok(req) => req,
         Err(e) => {
             warn!("Failed to decode OffsetFetchRequest: {}", e);
-            let error_response = super::super::messages::KafkaResponse::Error {
+            send_api_error(
+                &response_tx,
+                API_KEY_OFFSET_FETCH,
+                api_version,
                 correlation_id,
-                error_code: ERROR_CORRUPT_MESSAGE,
-                error_message: Some(format!("Malformed OffsetFetchRequest: {}", e)),
-            };
-            let _ = response_tx.send(error_response);
+                ERROR_CORRUPT_MESSAGE,
+                "malformed request",
+            );
             return Ok(None);
         }
     };
@@ -723,12 +768,14 @@ fn parse_find_coordinator(
             Ok(req) => req,
             Err(e) => {
                 warn!("Failed to decode FindCoordinatorRequest: {}", e);
-                let error_response = super::super::messages::KafkaResponse::Error {
+                send_api_error(
+                    &response_tx,
+                    API_KEY_FIND_COORDINATOR,
+                    api_version,
                     correlation_id,
-                    error_code: ERROR_CORRUPT_MESSAGE,
-                    error_message: Some(format!("Malformed FindCoordinatorRequest: {}", e)),
-                };
-                let _ = response_tx.send(error_response);
+                    ERROR_CORRUPT_MESSAGE,
+                    "malformed request",
+                );
                 return Ok(None);
             }
         };
@@ -765,12 +812,14 @@ fn parse_join_group(
         Ok(req) => req,
         Err(e) => {
             warn!("Failed to decode JoinGroupRequest: {}", e);
-            let error_response = super::super::messages::KafkaResponse::Error {
+            send_api_error(
+                &response_tx,
+                API_KEY_JOIN_GROUP,
+                api_version,
                 correlation_id,
-                error_code: ERROR_CORRUPT_MESSAGE,
-                error_message: Some(format!("Malformed JoinGroupRequest: {}", e)),
-            };
-            let _ = response_tx.send(error_response);
+                ERROR_CORRUPT_MESSAGE,
+                "malformed request",
+            );
             return Ok(None);
         }
     };
@@ -822,12 +871,14 @@ fn parse_sync_group(
         Ok(req) => req,
         Err(e) => {
             warn!("Failed to decode SyncGroupRequest: {}", e);
-            let error_response = super::super::messages::KafkaResponse::Error {
+            send_api_error(
+                &response_tx,
+                API_KEY_SYNC_GROUP,
+                api_version,
                 correlation_id,
-                error_code: ERROR_CORRUPT_MESSAGE,
-                error_message: Some(format!("Malformed SyncGroupRequest: {}", e)),
-            };
-            let _ = response_tx.send(error_response);
+                ERROR_CORRUPT_MESSAGE,
+                "malformed request",
+            );
             return Ok(None);
         }
     };
@@ -879,12 +930,14 @@ fn parse_heartbeat(
         Ok(req) => req,
         Err(e) => {
             warn!("Failed to decode HeartbeatRequest: {}", e);
-            let error_response = super::super::messages::KafkaResponse::Error {
+            send_api_error(
+                &response_tx,
+                API_KEY_HEARTBEAT,
+                api_version,
                 correlation_id,
-                error_code: ERROR_CORRUPT_MESSAGE,
-                error_message: Some(format!("Malformed HeartbeatRequest: {}", e)),
-            };
-            let _ = response_tx.send(error_response);
+                ERROR_CORRUPT_MESSAGE,
+                "malformed request",
+            );
             return Ok(None);
         }
     };
@@ -925,12 +978,14 @@ fn parse_leave_group(
         Ok(req) => req,
         Err(e) => {
             warn!("Failed to decode LeaveGroupRequest: {}", e);
-            let error_response = super::super::messages::KafkaResponse::Error {
+            send_api_error(
+                &response_tx,
+                API_KEY_LEAVE_GROUP,
+                api_version,
                 correlation_id,
-                error_code: ERROR_CORRUPT_MESSAGE,
-                error_message: Some(format!("Malformed LeaveGroupRequest: {}", e)),
-            };
-            let _ = response_tx.send(error_response);
+                ERROR_CORRUPT_MESSAGE,
+                "malformed request",
+            );
             return Ok(None);
         }
     };
@@ -974,12 +1029,14 @@ fn parse_list_offsets(
         Ok(req) => req,
         Err(e) => {
             warn!("Failed to decode ListOffsetsRequest: {}", e);
-            let error_response = super::super::messages::KafkaResponse::Error {
+            send_api_error(
+                &response_tx,
+                API_KEY_LIST_OFFSETS,
+                api_version,
                 correlation_id,
-                error_code: ERROR_CORRUPT_MESSAGE,
-                error_message: Some(format!("Malformed ListOffsetsRequest: {}", e)),
-            };
-            let _ = response_tx.send(error_response);
+                ERROR_CORRUPT_MESSAGE,
+                "malformed request",
+            );
             return Ok(None);
         }
     };
@@ -1035,12 +1092,14 @@ fn parse_describe_groups(
             Ok(req) => req,
             Err(e) => {
                 warn!("Failed to decode DescribeGroupsRequest: {}", e);
-                let error_response = super::super::messages::KafkaResponse::Error {
+                send_api_error(
+                    &response_tx,
+                    API_KEY_DESCRIBE_GROUPS,
+                    api_version,
                     correlation_id,
-                    error_code: ERROR_CORRUPT_MESSAGE,
-                    error_message: Some(format!("Malformed DescribeGroupsRequest: {}", e)),
-                };
-                let _ = response_tx.send(error_response);
+                    ERROR_CORRUPT_MESSAGE,
+                    "malformed request",
+                );
                 return Ok(None);
             }
         };
@@ -1082,12 +1141,14 @@ fn parse_list_groups(
         Ok(req) => req,
         Err(e) => {
             warn!("Failed to decode ListGroupsRequest: {}", e);
-            let error_response = super::super::messages::KafkaResponse::Error {
+            send_api_error(
+                &response_tx,
+                API_KEY_LIST_GROUPS,
+                api_version,
                 correlation_id,
-                error_code: ERROR_CORRUPT_MESSAGE,
-                error_message: Some(format!("Malformed ListGroupsRequest: {}", e)),
-            };
-            let _ = response_tx.send(error_response);
+                ERROR_CORRUPT_MESSAGE,
+                "malformed request",
+            );
             return Ok(None);
         }
     };
@@ -1129,12 +1190,14 @@ fn parse_create_topics(
             Ok(req) => req,
             Err(e) => {
                 warn!("Failed to decode CreateTopicsRequest: {}", e);
-                let error_response = super::super::messages::KafkaResponse::Error {
+                send_api_error(
+                    &response_tx,
+                    API_KEY_CREATE_TOPICS,
+                    api_version,
                     correlation_id,
-                    error_code: ERROR_CORRUPT_MESSAGE,
-                    error_message: Some(format!("Malformed CreateTopicsRequest: {}", e)),
-                };
-                let _ = response_tx.send(error_response);
+                    ERROR_CORRUPT_MESSAGE,
+                    "malformed request",
+                );
                 return Ok(None);
             }
         };
@@ -1183,12 +1246,14 @@ fn parse_delete_topics(
             Ok(req) => req,
             Err(e) => {
                 warn!("Failed to decode DeleteTopicsRequest: {}", e);
-                let error_response = super::super::messages::KafkaResponse::Error {
+                send_api_error(
+                    &response_tx,
+                    API_KEY_DELETE_TOPICS,
+                    api_version,
                     correlation_id,
-                    error_code: ERROR_CORRUPT_MESSAGE,
-                    error_message: Some(format!("Malformed DeleteTopicsRequest: {}", e)),
-                };
-                let _ = response_tx.send(error_response);
+                    ERROR_CORRUPT_MESSAGE,
+                    "malformed request",
+                );
                 return Ok(None);
             }
         };
@@ -1233,12 +1298,14 @@ fn parse_create_partitions(
             Ok(req) => req,
             Err(e) => {
                 warn!("Failed to decode CreatePartitionsRequest: {}", e);
-                let error_response = super::super::messages::KafkaResponse::Error {
+                send_api_error(
+                    &response_tx,
+                    API_KEY_CREATE_PARTITIONS,
+                    api_version,
                     correlation_id,
-                    error_code: ERROR_CORRUPT_MESSAGE,
-                    error_message: Some(format!("Malformed CreatePartitionsRequest: {}", e)),
-                };
-                let _ = response_tx.send(error_response);
+                    ERROR_CORRUPT_MESSAGE,
+                    "malformed request",
+                );
                 return Ok(None);
             }
         };
@@ -1281,12 +1348,14 @@ fn parse_delete_groups(
             Ok(req) => req,
             Err(e) => {
                 warn!("Failed to decode DeleteGroupsRequest: {}", e);
-                let error_response = super::super::messages::KafkaResponse::Error {
+                send_api_error(
+                    &response_tx,
+                    API_KEY_DELETE_GROUPS,
+                    api_version,
                     correlation_id,
-                    error_code: ERROR_CORRUPT_MESSAGE,
-                    error_message: Some(format!("Malformed DeleteGroupsRequest: {}", e)),
-                };
-                let _ = response_tx.send(error_response);
+                    ERROR_CORRUPT_MESSAGE,
+                    "malformed request",
+                );
                 return Ok(None);
             }
         };
@@ -1328,12 +1397,14 @@ fn parse_init_producer_id(
             Ok(req) => req,
             Err(e) => {
                 warn!("Failed to decode InitProducerIdRequest: {}", e);
-                let error_response = super::super::messages::KafkaResponse::Error {
+                send_api_error(
+                    &response_tx,
+                    API_KEY_INIT_PRODUCER_ID,
+                    api_version,
                     correlation_id,
-                    error_code: ERROR_CORRUPT_MESSAGE,
-                    error_message: Some(format!("Malformed InitProducerIdRequest: {}", e)),
-                };
-                let _ = response_tx.send(error_response);
+                    ERROR_CORRUPT_MESSAGE,
+                    "malformed request",
+                );
                 return Ok(None);
             }
         };
@@ -1382,12 +1453,14 @@ fn parse_add_partitions_to_txn(
         Ok(req) => req,
         Err(e) => {
             warn!("Failed to decode AddPartitionsToTxnRequest: {}", e);
-            let error_response = super::super::messages::KafkaResponse::Error {
+            send_api_error(
+                &response_tx,
+                API_KEY_ADD_PARTITIONS_TO_TXN,
+                api_version,
                 correlation_id,
-                error_code: ERROR_CORRUPT_MESSAGE,
-                error_message: Some(format!("Malformed AddPartitionsToTxnRequest: {}", e)),
-            };
-            let _ = response_tx.send(error_response);
+                ERROR_CORRUPT_MESSAGE,
+                "malformed request",
+            );
             return Ok(None);
         }
     };
@@ -1413,12 +1486,14 @@ fn parse_add_partitions_to_txn(
             (txn_id, pid, epoch, topics_data)
         } else {
             warn!("AddPartitionsToTxn v4+ with empty transactions array");
-            let error_response = super::super::messages::KafkaResponse::Error {
+            send_api_error(
+                &response_tx,
+                API_KEY_ADD_PARTITIONS_TO_TXN,
+                api_version,
                 correlation_id,
-                error_code: ERROR_CORRUPT_MESSAGE,
-                error_message: Some("Empty transactions array".to_string()),
-            };
-            let _ = response_tx.send(error_response);
+                ERROR_CORRUPT_MESSAGE,
+                "empty transactions array",
+            );
             return Ok(None);
         }
     } else {
@@ -1475,12 +1550,14 @@ fn parse_add_offsets_to_txn(
             Ok(req) => req,
             Err(e) => {
                 warn!("Failed to decode AddOffsetsToTxnRequest: {}", e);
-                let error_response = super::super::messages::KafkaResponse::Error {
+                send_api_error(
+                    &response_tx,
+                    API_KEY_ADD_OFFSETS_TO_TXN,
+                    api_version,
                     correlation_id,
-                    error_code: ERROR_CORRUPT_MESSAGE,
-                    error_message: Some(format!("Malformed AddOffsetsToTxnRequest: {}", e)),
-                };
-                let _ = response_tx.send(error_response);
+                    ERROR_CORRUPT_MESSAGE,
+                    "malformed request",
+                );
                 return Ok(None);
             }
         };
@@ -1526,12 +1603,14 @@ fn parse_end_txn(
         Ok(req) => req,
         Err(e) => {
             warn!("Failed to decode EndTxnRequest: {}", e);
-            let error_response = super::super::messages::KafkaResponse::Error {
+            send_api_error(
+                &response_tx,
+                API_KEY_END_TXN,
+                api_version,
                 correlation_id,
-                error_code: ERROR_CORRUPT_MESSAGE,
-                error_message: Some(format!("Malformed EndTxnRequest: {}", e)),
-            };
-            let _ = response_tx.send(error_response);
+                ERROR_CORRUPT_MESSAGE,
+                "malformed request",
+            );
             return Ok(None);
         }
     };
@@ -1578,12 +1657,14 @@ fn parse_txn_offset_commit(
             Ok(req) => req,
             Err(e) => {
                 warn!("Failed to decode TxnOffsetCommitRequest: {}", e);
-                let error_response = super::super::messages::KafkaResponse::Error {
+                send_api_error(
+                    &response_tx,
+                    API_KEY_TXN_OFFSET_COMMIT,
+                    api_version,
                     correlation_id,
-                    error_code: ERROR_CORRUPT_MESSAGE,
-                    error_message: Some(format!("Malformed TxnOffsetCommitRequest: {}", e)),
-                };
-                let _ = response_tx.send(error_response);
+                    ERROR_CORRUPT_MESSAGE,
+                    "malformed request",
+                );
                 return Ok(None);
             }
         };
@@ -3105,9 +3186,8 @@ mod tests {
     #[test]
     fn test_request_version_out_of_range_rejected() {
         // CONF-6: a request whose version exceeds the advertised max for its api_key must be
-        // rejected with UNSUPPORTED_VERSION *before* the version-specific body decode runs.
-        // Metadata max is 10; declare v11 in the header (its header is flexible just like v10, so the
-        // header still decodes cleanly) and let the dispatcher reject on version.
+        // rejected *before* the version-specific body decode runs. Metadata max is 10; declare v11
+        // in the header (its header is flexible just like v10, so the header still decodes cleanly).
         let (tx, mut rx) = create_test_channel();
 
         let request = metadata_request::MetadataRequest::default();
@@ -3119,19 +3199,19 @@ mod tests {
             "out-of-range version should not yield a request"
         );
 
+        // The rejection now returns the API's own (decodable) error response at the requested
+        // version — a typed Metadata v11 — not the hand-rolled generic frame, so a strict client
+        // can parse it (Metadata carries no top-level error_code; errors are per-topic).
         match rx.try_recv() {
-            Ok(super::super::super::messages::KafkaResponse::Error {
+            Ok(super::super::super::messages::KafkaResponse::Metadata {
                 correlation_id,
-                error_code,
+                api_version,
                 ..
             }) => {
                 assert_eq!(correlation_id, 7777);
-                assert_eq!(error_code, ERROR_UNSUPPORTED_VERSION);
+                assert_eq!(api_version, 11);
             }
-            other => panic!(
-                "Expected UNSUPPORTED_VERSION Error response, got {:?}",
-                other
-            ),
+            other => panic!("Expected a typed Metadata error response, got {:?}", other),
         }
     }
 
