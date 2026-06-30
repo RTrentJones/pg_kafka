@@ -32,7 +32,7 @@ pub mod transaction_integration;
 // Re-export test functions for registration in main.rs
 pub use basic_forwarding::{
     test_dual_write_async, test_dual_write_sync, test_external_only_mode, test_local_only_mode,
-    test_reload_clears_deleted_topic_config,
+    test_outbox_row_written_and_finalized, test_reload_clears_deleted_topic_config,
 };
 pub use dialup::{
     test_dialup_0_percent, test_dialup_100_percent, test_dialup_10_percent, test_dialup_25_percent,

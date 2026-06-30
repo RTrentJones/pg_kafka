@@ -319,15 +319,21 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     let (notify_tx, notify_rx) =
         crossbeam_channel::bounded::<crate::kafka::InternalNotification>(10_000);
 
-    // Step 5c: Create forward channel for async shadow forwarding (Phase 11)
-    // This channel sends ForwardRequest messages from the DB thread to the network
-    // thread for non-blocking forwarding to external Kafka when sync_mode=async.
-    // Bounded to prevent OOM - on channel full, requests are dropped (fire-and-forget).
+    // Step 5c: Create forward channel for the durable shadow outbox (SH-9).
+    // The DB thread sends ForwardRequest messages to the network thread, which
+    // forwards them to external Kafka via the idempotent producer. On channel
+    // full the outbox row simply stays pending and is retried by the next poll.
     let (forward_tx, forward_rx) =
         crossbeam_channel::bounded::<crate::kafka::shadow::ForwardRequest>(10_000);
 
-    // Set forward_tx on ShadowStore for async forwarding
+    // The reverse channel: the network thread returns a ForwardAck per attempt
+    // so the DB thread can finalize the kafka.shadow_tracking outbox row.
+    let (forward_ack_tx, forward_ack_rx) =
+        crossbeam_channel::bounded::<crate::kafka::shadow::ForwardAck>(10_000);
+
+    // Wire both ends onto the ShadowStore (DB thread drains acks; sends forwards).
     shadow_store.set_forward_channel(forward_tx);
+    shadow_store.set_ack_channel(forward_ack_rx);
 
     // Step 5d: Pass RuntimeContext to network thread for config access
     // The network thread will use this to access shadow config and other settings dynamically
@@ -427,6 +433,7 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
                     request_tx,
                     notify_rx,
                     forward_rx,
+                    forward_ack_tx,
                     runtime_context_for_network,
                     shutdown_rx,
                 )
@@ -476,6 +483,11 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     let mut last_timeout_check = Instant::now();
     let mut last_txn_timeout_check = Instant::now();
     let mut last_config_reload = Instant::now();
+    // SH-9: how often the DB thread drains forward acks and forwards due outbox
+    // rows. Short so async forwarding has sub-second latency, but throttled so
+    // an idle instance isn't opening an SPI transaction on every 100ms wakeup.
+    let outbox_poll_interval = Duration::from_millis(250);
+    let mut last_outbox_poll = Instant::now();
 
     // Phase 11: Initial shadow config load
     {
@@ -603,6 +615,37 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
             });
 
             last_config_reload = Instant::now();
+        }
+
+        // ┌─────────────────────────────────────────────────────────────┐
+        // │ Durable shadow outbox: forward due rows + finalize acks (SH-9)│
+        // └─────────────────────────────────────────────────────────────┘
+        // Runs on the DB thread (SPI). Gated on shadow mode being enabled and
+        // the poll interval, so an idle or non-shadow instance does no work.
+        if crate::config::SHADOW_MODE_ENABLED.get()
+            && last_outbox_poll.elapsed() >= outbox_poll_interval
+        {
+            let shadow_outbox = AssertUnwindSafe(&shadow_store);
+            BackgroundWorker::transaction(move || {
+                // Apply results first (marks delivered rows done so the poll
+                // won't re-dispatch them), then dispatch the next due batch.
+                let applied = shadow_outbox.drain_forward_acks();
+                match shadow_outbox.poll_and_forward_outbox() {
+                    Ok(dispatched) => {
+                        if applied > 0 || dispatched > 0 {
+                            tracing::debug!(
+                                "Shadow outbox: {} ack(s) applied, {} row(s) dispatched",
+                                applied,
+                                dispatched
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        pg_warning!("Shadow outbox poll failed: {:?}", e);
+                    }
+                }
+            });
+            last_outbox_poll = Instant::now();
         }
 
         // ┌─────────────────────────────────────────────────────────────┐

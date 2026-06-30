@@ -34,7 +34,7 @@ use super::messages::{KafkaRequest, KafkaResponse, TopicFetchData};
 use super::notifications::InternalNotification;
 use super::pending_fetches::PendingFetchRegistry;
 use super::protocol;
-use super::shadow::{ForwardRequest, ShadowConfig, ShadowProducer};
+use super::shadow::{ForwardAck, ForwardRequest, ShadowConfig, ShadowProducer};
 
 /// Shadow forwarder task for async forwarding
 ///
@@ -47,6 +47,7 @@ use super::shadow::{ForwardRequest, ShadowConfig, ShadowProducer};
 /// if the bootstrap servers change.
 async fn run_shadow_forwarder(
     forward_rx: Receiver<ForwardRequest>,
+    ack_tx: Sender<ForwardAck>,
     runtime_context: Arc<crate::kafka::RuntimeContext>,
 ) {
     info!("Shadow forwarder task started (dynamic config mode)");
@@ -114,30 +115,52 @@ async fn run_shadow_forwarder(
                     }
                 };
 
-                // Fire-and-forget: log failure but continue
-                let topic = req.topic_name.clone();
-                let partition = req.partition_id;
-                let offset = req.local_offset;
-
-                if let Err(e) = p
-                    .send_async(
+                // SH-15: forward with partition=None so the external cluster
+                // re-partitions by key. The local partition count may differ
+                // from the external topic's, so forcing the local partition id
+                // would misroute.
+                //
+                // SH-9: this is the durable-outbox forward. Every attempt sends
+                // a ForwardAck back to the DB thread, which finalizes the
+                // kafka.shadow_tracking row (success → external_offset set;
+                // failure → row stays pending and is retried). The send is no
+                // longer fire-and-forget.
+                let result = p
+                    .send_async_offset(
                         &req.topic_name,
-                        Some(req.partition_id),
+                        None,
                         req.key.as_deref(),
                         req.value.as_deref(),
                     )
-                    .await
-                {
-                    warn!(
-                        "Async forward failed for {}[{}] offset {}: {:?}",
-                        topic, partition, offset, e
-                    );
-                    // Note: No retry queue - this is intentional fire-and-forget
-                } else {
-                    debug!(
-                        "Async forward succeeded for {}[{}] offset {}",
-                        topic, partition, offset
-                    );
+                    .await;
+
+                let ack_result = match result {
+                    Ok(external_offset) => {
+                        debug!(
+                            "Forward OK {}[{}] local_offset {} -> external_offset {}",
+                            req.topic_name, req.partition_id, req.local_offset, external_offset
+                        );
+                        Ok(external_offset)
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Forward FAILED {}[{}] local_offset {}: {:?} (row stays pending)",
+                            req.topic_name, req.partition_id, req.local_offset, e
+                        );
+                        Err(e.to_string())
+                    }
+                };
+
+                let ack = ForwardAck {
+                    topic_id: req.topic_id,
+                    partition_id: req.partition_id,
+                    local_offset: req.local_offset,
+                    result: ack_result,
+                };
+                // If the DB thread/receiver is gone (shutdown), the row simply
+                // stays pending — no panic.
+                if ack_tx.send(ack).is_err() {
+                    debug!("Forward ack channel closed, dropping ack");
                 }
             }
             Ok(Err(crossbeam_channel::RecvTimeoutError::Timeout)) => {
@@ -191,6 +214,7 @@ pub async fn run(
     request_tx: Sender<KafkaRequest>,
     notify_rx: Receiver<InternalNotification>,
     forward_rx: Receiver<ForwardRequest>,
+    forward_ack_tx: Sender<ForwardAck>,
     runtime_context: Arc<crate::kafka::RuntimeContext>,
     shutdown_rx: std::sync::mpsc::Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -260,7 +284,7 @@ pub async fn run(
     // Always spawned - config is checked dynamically to support runtime enable/disable.
     let runtime_context_for_forwarder = runtime_context.clone();
     let _forward_handle = tokio::spawn(async move {
-        run_shadow_forwarder(forward_rx, runtime_context_for_forwarder).await;
+        run_shadow_forwarder(forward_rx, forward_ack_tx, runtime_context_for_forwarder).await;
     });
 
     // SEC-3: bound concurrent client connections to prevent fd/memory exhaustion. Each

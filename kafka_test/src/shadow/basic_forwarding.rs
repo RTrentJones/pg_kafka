@@ -374,3 +374,89 @@ pub async fn test_reload_clears_deleted_topic_config() -> TestResult {
     println!("✅ Test PASSED: Reload Clears Deleted Topic Config\n");
     Ok(())
 }
+
+/// Test the durable-outbox lifecycle end to end (SH-9)
+///
+/// Produces in async mode and asserts both that the message reaches external
+/// Kafka (forwarded by the periodic poll, not inline) AND that the
+/// `kafka.shadow_tracking` outbox row is written and then *finalized* — its
+/// `external_offset` becomes non-NULL once the forward ack is applied. This is
+/// what proves the durable path: a row is the source of truth, forwarded
+/// at-least-once and marked done exactly once.
+pub async fn test_outbox_row_written_and_finalized() -> TestResult {
+    println!("=== Test: Durable Outbox Row Written + Finalized (SH-9) ===\n");
+
+    // 1. SETUP
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("outbox-finalized").await;
+
+    verify_external_kafka_ready().await?;
+    enable_shadow_mode(
+        ctx.db(),
+        &topic,
+        &ShadowTopicConfig {
+            mode: ShadowMode::Shadow,
+            forward_percentage: 100,
+            external_topic_name: None,
+            sync_mode: SyncMode::Async, // async → the poll does the forwarding
+            write_mode: WriteMode::DualWrite,
+        },
+    )
+    .await?;
+
+    // 2. ACTION
+    let producer = create_producer()?;
+    let key = b"outbox-key";
+    let value = b"outbox-value";
+    producer
+        .send(
+            FutureRecord::to(&topic).key(&key[..]).payload(&value[..]),
+            Duration::from_secs(5),
+        )
+        .await
+        .map_err(|(e, _)| e)?;
+    println!("✅ Message produced (async)\n");
+
+    // 3. VERIFY
+    // 3a. Reaches external Kafka via the poll.
+    assert_message_in_external_kafka(&topic, Some(key), Some(value), Duration::from_secs(15))
+        .await?;
+    println!("✅ Forwarded to external Kafka\n");
+
+    // 3b. The outbox row exists and is finalized (external_offset NOT NULL).
+    let mut finalized = false;
+    for _ in 0..20 {
+        let row = ctx
+            .db()
+            .query_one(
+                r#"
+                SELECT COUNT(*) FILTER (WHERE st.external_offset IS NOT NULL) AS done,
+                       COUNT(*) AS total
+                FROM kafka.shadow_tracking st
+                JOIN kafka.topics t ON t.id = st.topic_id
+                WHERE t.name = $1
+                "#,
+                &[&topic],
+            )
+            .await?;
+        let done: i64 = row.get("done");
+        let total: i64 = row.get("total");
+        if total >= 1 && done >= 1 {
+            finalized = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    if !finalized {
+        return Err(
+            "shadow_tracking outbox row was not written and finalized (external_offset NULL)"
+                .into(),
+        );
+    }
+    println!("✅ Outbox row finalized (external_offset set)\n");
+
+    // 4. CLEANUP
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED: Durable Outbox Row Written + Finalized\n");
+    Ok(())
+}
