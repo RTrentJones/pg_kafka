@@ -10,7 +10,7 @@
 //! Shared routing utilities for shadow mode
 //!
 //! Provides deterministic routing hash computation and forward decision logic
-//! used by both ShadowStore and ShadowForwarder.
+//! used by ShadowStore (both the live produce path and the outbox poll).
 
 use super::forwarder::ForwardDecision;
 use murmur2::murmur2;

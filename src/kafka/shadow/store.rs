@@ -602,10 +602,10 @@ impl<S: KafkaStore> ShadowStore<S> {
         }
     }
 
-    /// Decide whether to forward a message based on percentage routing
+    /// Decide whether to forward a message based on percentage routing.
     ///
-    /// Delegates to the shared routing module for consistent behavior
-    /// with ShadowForwarder.
+    /// Delegates to the shared `routing` module so the live produce path and the
+    /// outbox poll make identical decisions.
     fn decide_forward(
         &self,
         key: Option<&[u8]>,

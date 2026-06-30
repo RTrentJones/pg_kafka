@@ -16,9 +16,7 @@ use super::config::{
     ShadowConfig, ShadowMode, SyncMode, TopicConfigCache, TopicShadowConfig, WriteMode,
 };
 use super::error::ShadowError;
-use super::forwarder::{ForwardMessage, ForwardResult};
 use super::primary::PrimaryStatus;
-use super::replay::{ReplayProgress, ReplayQueryBuilder, ReplayRequest};
 
 /// Test that shadow configuration properly validates
 mod config_tests {
@@ -344,127 +342,6 @@ mod error_tests {
         let msg = err.to_string();
         assert!(msg.contains("42"));
         assert!(msg.contains("invalid percentage"));
-    }
-}
-
-/// Test replay functionality
-mod replay_tests {
-    use super::*;
-
-    #[test]
-    fn test_replay_progress_edge_cases() {
-        // Empty range
-        let progress = ReplayProgress::new("test", 0, 100, 100);
-        assert!(progress.is_complete());
-        assert_eq!(progress.percent_complete(), 100.0);
-        assert_eq!(progress.remaining(), 0);
-
-        // Negative range (invalid but handled gracefully)
-        let progress = ReplayProgress::new("test", 0, 200, 100);
-        assert!(progress.is_complete()); // current >= to
-        assert_eq!(progress.remaining(), 0);
-    }
-
-    #[test]
-    fn test_replay_request_defaults() {
-        let request = ReplayRequest::new("my-topic");
-        assert_eq!(request.topic_name, "my-topic");
-        assert!(request.partition_id.is_none());
-        assert!(request.from_offset.is_none());
-        assert!(request.to_offset.is_none());
-        assert_eq!(request.batch_size, 1000);
-        assert!(request.skip_forwarded);
-    }
-
-    #[test]
-    fn test_replay_query_includes_topic_filter() {
-        let query = ReplayQueryBuilder::new("events").build();
-        assert!(query.contains("t.name = $1"));
-    }
-
-    #[test]
-    fn test_replay_query_full_options() {
-        let query = ReplayQueryBuilder::new("events")
-            .partition(2)
-            .range(100, 500)
-            .limit(250)
-            .skip_forwarded(true)
-            .build();
-
-        assert!(query.contains("t.name = $1"));
-        assert!(query.contains("m.partition_id"));
-        assert!(query.contains("m.partition_offset >="));
-        assert!(query.contains("m.partition_offset <"));
-        assert!(query.contains("NOT EXISTS"));
-        assert!(query.contains("LIMIT 250"));
-    }
-}
-
-/// Test forward message construction
-mod forward_message_tests {
-    use super::*;
-
-    #[test]
-    fn test_forward_message_construction() {
-        let msg = ForwardMessage {
-            topic: "events".to_string(),
-            partition: 3,
-            key: Some(b"user-123".to_vec()),
-            value: Some(b"event data".to_vec()),
-            global_offset: 12345,
-            partition_offset: 42,
-        };
-
-        assert_eq!(msg.topic, "events");
-        assert_eq!(msg.partition, 3);
-        assert_eq!(msg.key.as_deref(), Some(b"user-123".as_slice()));
-        assert_eq!(msg.value.as_deref(), Some(b"event data".as_slice()));
-        assert_eq!(msg.global_offset, 12345);
-        assert_eq!(msg.partition_offset, 42);
-    }
-
-    #[test]
-    fn test_forward_message_null_key_value() {
-        let msg = ForwardMessage {
-            topic: "tombstones".to_string(),
-            partition: 0,
-            key: Some(b"delete-me".to_vec()),
-            value: None, // Tombstone
-            global_offset: 999,
-            partition_offset: 10,
-        };
-
-        assert!(msg.key.is_some());
-        assert!(msg.value.is_none());
-    }
-}
-
-/// Test forward result aggregation
-mod forward_result_tests {
-    use super::*;
-
-    #[test]
-    fn test_forward_result_accumulation() {
-        let mut result = ForwardResult::default();
-
-        result.forwarded = 90;
-        result.skipped = 5;
-        result.failed = 5;
-
-        assert_eq!(result.forwarded + result.skipped + result.failed, 100);
-    }
-
-    #[test]
-    fn test_forward_result_with_error() {
-        let mut result = ForwardResult::default();
-        result.failed = 1;
-        result.first_error = Some(ShadowError::ForwardFailed {
-            topic: "test".to_string(),
-            partition: 0,
-            error: "broker unavailable".to_string(),
-        });
-
-        assert!(result.first_error.is_some());
     }
 }
 

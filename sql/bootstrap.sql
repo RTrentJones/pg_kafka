@@ -345,6 +345,44 @@ COMMENT ON TABLE kafka.shadow_tracking IS 'Tracks which messages have been forwa
 COMMENT ON TABLE kafka.shadow_metrics IS 'Aggregated shadow mode metrics per topic/partition.';
 COMMENT ON VIEW kafka.shadow_status IS 'Unified view of shadow mode health, lag, and error counts.';
 
+-- Replay (SH-10/SH-11): re-mark a range of locally-stored messages as pending in
+-- the durable outbox so the background poller re-forwards them to external Kafka.
+-- This is how an operator runs an initial migration or recovers after an external
+-- outage: replay reuses the same at-least-once outbox path as a live produce (no
+-- separate, drift-prone forwarding engine). For each kafka.messages row in
+-- [from_offset, to_offset) it inserts a pending kafka.shadow_tracking row, or
+-- resets an existing one back to pending (external_offset = NULL). The poller then
+-- forwards via the idempotent producer. Returns the number of rows (re)queued.
+-- to_offset NULL means "to the current end".
+CREATE OR REPLACE FUNCTION kafka.replay_shadow_messages(
+    p_topic_id INT,
+    p_from_offset BIGINT DEFAULT 0,
+    p_to_offset BIGINT DEFAULT NULL
+) RETURNS BIGINT
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_count BIGINT;
+BEGIN
+    INSERT INTO kafka.shadow_tracking (topic_id, partition_id, local_offset)
+    SELECT m.topic_id, m.partition_id, m.partition_offset
+    FROM kafka.messages m
+    WHERE m.topic_id = p_topic_id
+      AND m.partition_offset >= p_from_offset
+      AND (p_to_offset IS NULL OR m.partition_offset < p_to_offset)
+    ON CONFLICT (topic_id, partition_id, local_offset) DO UPDATE
+        SET external_offset = NULL,
+            forwarded_at    = NULL,
+            error_message   = NULL,
+            retry_count     = 0;
+    GET DIAGNOSTICS v_count = ROW_COUNT;
+    RETURN v_count;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION kafka.replay_shadow_messages(INT, BIGINT, BIGINT) TO PUBLIC;
+COMMENT ON FUNCTION kafka.replay_shadow_messages(INT, BIGINT, BIGINT) IS
+    'Re-queue a range of stored messages into the shadow outbox for re-forwarding (replay/migration/recovery).';
+
 -- =============================================================================
 -- Operational Metrics View (ADR-002: Staff-Level Architectural Improvements)
 -- =============================================================================
