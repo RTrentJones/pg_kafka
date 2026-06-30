@@ -806,14 +806,15 @@ impl<S: KafkaStore> ShadowStore<S> {
     fn enqueue_outbox(
         &self,
         topic_id: i32,
-        external_topic: &str,
         partition_id: i32,
         records: &[Record],
         base_offset: i64,
-        forward_percentage: u8,
-        sync_mode: SyncMode,
+        config: &TopicShadowConfig,
     ) {
         use pgrx::prelude::*;
+
+        let external_topic = config.effective_external_topic();
+        let forward_percentage = config.forward_percentage;
 
         // License nag (rate-limited).
         self.check_license();
@@ -861,7 +862,7 @@ impl<S: KafkaStore> ShadowStore<S> {
 
         // Async topics are forwarded by the periodic poll after commit. Sync
         // topics wait (bounded) for external confirmation now (SH-14).
-        if sync_mode == SyncMode::Sync {
+        if config.sync_mode == SyncMode::Sync {
             self.forward_sync_bounded(
                 topic_id,
                 external_topic,
@@ -1155,12 +1156,10 @@ impl<S: KafkaStore> ShadowStore<S> {
     fn enqueue_outbox(
         &self,
         _topic_id: i32,
-        _external_topic: &str,
         _partition_id: i32,
         _records: &[Record],
         _base_offset: i64,
-        _forward_percentage: u8,
-        _sync_mode: SyncMode,
+        _config: &TopicShadowConfig,
     ) {
     }
 
@@ -1384,15 +1383,7 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
                 // enqueue_outbox. The forward never runs on this thread.
                 if let Some(config) = topic_config {
                     if config.should_forward() {
-                        self.enqueue_outbox(
-                            topic_id,
-                            config.effective_external_topic(),
-                            partition_id,
-                            records,
-                            base_offset,
-                            config.forward_percentage,
-                            config.sync_mode,
-                        );
+                        self.enqueue_outbox(topic_id, partition_id, records, base_offset, &config);
                     } else {
                         crate::pg_log!("Shadow: config exists but should_forward=false");
                     }
