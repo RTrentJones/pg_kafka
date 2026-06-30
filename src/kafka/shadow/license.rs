@@ -316,4 +316,17 @@ mod tests {
         let v = LicenseValidator::new("bad-format");
         assert!(!v.is_licensed());
     }
+
+    #[test]
+    fn test_registered_key_check_is_silent() {
+        // A registered-sponsor marker takes the silent arm of check_and_warn:
+        // it must not emit a warning (and must not panic). This is the whole
+        // point of the freemium honor system — a well-formed key quiets the nag.
+        let v = LicenseValidator::new("sponsor:token");
+        assert_eq!(v.status(), &LicenseStatus::Registered);
+        // Exercises the `Registered => {}` arm; the other arms call pg_warning!,
+        // which requires the Postgres runtime, so only the silent path is safe
+        // to drive from a plain unit test.
+        v.check_and_warn();
+    }
 }
