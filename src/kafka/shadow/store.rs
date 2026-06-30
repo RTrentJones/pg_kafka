@@ -58,7 +58,7 @@ use crate::kafka::storage::{
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Record pending shadow forwarding after transaction commit
 ///
@@ -89,8 +89,40 @@ struct PendingForwardRecord {
 /// Key for pending transaction messages: (producer_id, producer_epoch)
 type TxnKey = (i64, i16);
 
+/// Buffered transactional forward records plus when the buffer was first
+/// created, so the timeout sweeper can evict an abandoned buffer.
+///
+/// `abort_timed_out_transactions` (the storage-layer sweeper) force-aborts a
+/// timed-out transaction directly in `kafka.transactions` and never routes
+/// through `abort_transaction()`, so without an age-based eviction the in-RAM
+/// buffer for a producer that opened a transaction and vanished would leak
+/// forever. `first_buffered` lets the override drop buffers older than the
+/// transaction timeout, matching the sweeper's own threshold.
+struct PendingTxnBuffer {
+    records: Vec<PendingForwardRecord>,
+    first_buffered: Instant,
+}
+
+impl Default for PendingTxnBuffer {
+    fn default() -> Self {
+        Self {
+            records: Vec::new(),
+            first_buffered: Instant::now(),
+        }
+    }
+}
+
+impl From<Vec<PendingForwardRecord>> for PendingTxnBuffer {
+    fn from(records: Vec<PendingForwardRecord>) -> Self {
+        Self {
+            records,
+            first_buffered: Instant::now(),
+        }
+    }
+}
+
 /// Cache of pending transactional records awaiting commit
-type PendingTxnMessages = Arc<RwLock<HashMap<TxnKey, Vec<PendingForwardRecord>>>>;
+type PendingTxnMessages = Arc<RwLock<HashMap<TxnKey, PendingTxnBuffer>>>;
 
 /// Metrics for shadow forwarding operations
 #[derive(Debug, Default)]
@@ -126,6 +158,16 @@ impl ShadowMetrics {
 /// 60 seconds to handle fresh Kafka broker topic auto-creation
 const DEFAULT_FORWARD_TIMEOUT_MS: u64 = 60_000;
 
+/// How long a successful producer health check is trusted before it is
+/// re-verified.
+///
+/// `is_healthy()` does a blocking metadata fetch (up to 5s). Running it on the
+/// `ensure_producer` fast path meant every single produce paid that round-trip
+/// — and in sync mode, on the DB thread, that stalls all clients. rdkafka
+/// already reconnects transparently, so a periodic re-check is enough: within
+/// this window we trust the cached producer and skip the fetch entirely.
+const PRODUCER_HEALTH_TTL: Duration = Duration::from_secs(30);
+
 /// A KafkaStore wrapper that adds shadow mode forwarding
 ///
 /// Wraps an inner store (typically PostgresStore) and forwards produce
@@ -140,6 +182,9 @@ pub struct ShadowStore<S: KafkaStore> {
     producer: RwLock<Option<Arc<ShadowProducer>>>,
     /// Bootstrap servers used to create the cached producer (for change detection)
     producer_bootstrap_servers: RwLock<Option<String>>,
+    /// When the cached producer was last verified healthy (see
+    /// `PRODUCER_HEALTH_TTL`). `None` until the first check.
+    producer_health_checked_at: Mutex<Option<Instant>>,
     /// Topic configuration cache
     topic_cache: Arc<TopicConfigCache>,
     /// Primary status checker
@@ -187,6 +232,7 @@ impl<S: KafkaStore> ShadowStore<S> {
             inner,
             producer: RwLock::new(None),
             producer_bootstrap_servers: RwLock::new(None),
+            producer_health_checked_at: Mutex::new(None),
             topic_cache: Arc::new(TopicConfigCache::new()),
             primary_status: Mutex::new(PrimaryStatus::new()),
             metrics: ShadowMetrics::new(),
@@ -268,6 +314,61 @@ impl<S: KafkaStore> ShadowStore<S> {
         status.check()
     }
 
+    /// Force a re-check of primary status (SH-2).
+    ///
+    /// `is_primary()` caches its result for the life of the process, which is
+    /// correct only while the recovery state never changes. After a failover a
+    /// promoted standby would otherwise stay cached as a non-primary and never
+    /// start forwarding. The worker calls this on its periodic config-reload
+    /// cycle so a promotion is picked up within one reload interval.
+    pub fn refresh_primary_status(&self) -> bool {
+        let mut status = self.primary_status.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("primary_status lock was poisoned, recovering");
+            poisoned.into_inner()
+        });
+        status.refresh()
+    }
+
+    /// Whether the cached producer's last health check is still within
+    /// `PRODUCER_HEALTH_TTL` (SH-5). When fresh, the fast path trusts the
+    /// producer and skips the blocking metadata fetch.
+    fn producer_health_fresh(&self) -> bool {
+        let guard = self
+            .producer_health_checked_at
+            .lock()
+            .unwrap_or_else(|poisoned| {
+                tracing::warn!("producer_health_checked_at lock was poisoned, recovering");
+                poisoned.into_inner()
+            });
+        matches!(*guard, Some(at) if at.elapsed() < PRODUCER_HEALTH_TTL)
+    }
+
+    /// Record that the producer was just verified (or created) healthy, so the
+    /// next `PRODUCER_HEALTH_TTL` window can skip the metadata fetch.
+    fn mark_producer_healthy(&self) {
+        let mut guard = self
+            .producer_health_checked_at
+            .lock()
+            .unwrap_or_else(|poisoned| {
+                tracing::warn!("producer_health_checked_at lock was poisoned, recovering");
+                poisoned.into_inner()
+            });
+        *guard = Some(Instant::now());
+    }
+
+    /// Clear the cached health timestamp so the next call re-verifies (used
+    /// when a cached producer is found unhealthy or discarded).
+    fn invalidate_producer_health(&self) {
+        let mut guard = self
+            .producer_health_checked_at
+            .lock()
+            .unwrap_or_else(|poisoned| {
+                tracing::warn!("producer_health_checked_at lock was poisoned, recovering");
+                poisoned.into_inner()
+            });
+        *guard = None;
+    }
+
     /// Check if shadow mode is enabled globally by reading the GUC directly
     #[cfg(not(test))]
     fn is_enabled(&self) -> bool {
@@ -293,14 +394,14 @@ impl<S: KafkaStore> ShadowStore<S> {
         // We need fresh values to detect config changes (e.g., bootstrap_servers changed via pg_reload_conf)
         // RuntimeContext caches config and doesn't refresh on SIGHUP, so we bypass it here
         #[cfg(not(test))]
-        let config = {
+        let mut config = {
             use crate::config::Config;
             let cfg = Config::load();
             ShadowConfig::from_config(&Arc::new(cfg))
         };
 
         #[cfg(test)]
-        let config = ShadowConfig::default();
+        let mut config = ShadowConfig::default();
 
         // Fast path: check if already initialized with same config
         {
@@ -320,11 +421,18 @@ impl<S: KafkaStore> ShadowStore<S> {
                 // Check if config has changed
                 if let Some(ref cached_bs) = *bs_guard {
                     if cached_bs == &config.bootstrap_servers {
-                        // Verify cached producer is healthy before returning
+                        // SH-5: within the health TTL, trust the cached producer
+                        // and skip the blocking metadata fetch entirely.
+                        if self.producer_health_fresh() {
+                            return Some(producer.clone());
+                        }
+                        // TTL elapsed: re-verify once, then trust again.
                         if producer.is_healthy() {
+                            self.mark_producer_healthy();
                             return Some(producer.clone());
                         }
                         // Producer unhealthy, fall through to recreate
+                        self.invalidate_producer_health();
                         crate::pg_log!("Shadow: cached producer unhealthy, recreating");
                     } else {
                         // Config changed - need to recreate producer
@@ -351,18 +459,24 @@ impl<S: KafkaStore> ShadowStore<S> {
                 poisoned.into_inner()
             });
 
-        // Double-check after acquiring write lock
+        // Double-check after acquiring write lock (another thread may have
+        // created/verified the producer while we waited). Same TTL gate as the
+        // fast path so we don't pay a second metadata fetch.
         if let Some(ref producer) = *guard {
             if let Some(ref cached_bs) = *bs_guard {
-                if cached_bs == &config.bootstrap_servers && producer.is_healthy() {
+                if cached_bs == &config.bootstrap_servers
+                    && (self.producer_health_fresh() || producer.is_healthy())
+                {
+                    self.mark_producer_healthy();
                     return Some(producer.clone());
                 }
             }
         }
 
-        // Clear old producer if exists (config changed)
+        // Clear old producer if exists (config changed or unhealthy)
         *guard = None;
         *bs_guard = None;
+        self.invalidate_producer_health();
 
         if !config.is_configured() {
             crate::pg_warning!(
@@ -372,6 +486,21 @@ impl<S: KafkaStore> ShadowStore<S> {
                  Shadow mode is NOT properly configured - messages will NOT be forwarded!",
                 config.enabled,
                 config.bootstrap_servers
+            );
+            return None;
+        }
+
+        // SH-1: validate (and normalize/clamp) the config before building a
+        // producer from it. Previously `validate()` ran only in tests, so an
+        // invalid security_protocol / sasl_mechanism / bootstrap_servers would
+        // be handed straight to rdkafka. Run it here on the slow path only, so
+        // the security warnings it emits fire once per (re)create rather than
+        // on every produce.
+        if let Err(e) = config.validate() {
+            crate::pg_warning!(
+                "⚠️  SHADOW MODE CONFIG INVALID: {} — messages will NOT be forwarded. \
+                 Fix pg_kafka.shadow_* settings and reload.",
+                e
             );
             return None;
         }
@@ -387,6 +516,9 @@ impl<S: KafkaStore> ShadowStore<S> {
                 let producer = Arc::new(producer);
                 *guard = Some(producer.clone());
                 *bs_guard = Some(config.bootstrap_servers.clone());
+                // A freshly created producer is healthy; start its TTL window
+                // so the next produce doesn't immediately re-probe (SH-5).
+                self.mark_producer_healthy();
                 tracing::info!(
                     "✅ Shadow producer successfully initialized and connected to {}",
                     config.bootstrap_servers
@@ -744,12 +876,20 @@ impl<S: KafkaStore> ShadowStore<S> {
             JOIN kafka.topics t ON sc.topic_id = t.id
         "#;
 
-        let mut count = 0;
+        // Collect into a local vec first and only swap the cache once the query
+        // has succeeded (SH-3). The cache must be *replaced*, not merely
+        // updated: a topic whose row was deleted from kafka.shadow_config would
+        // otherwise linger in the cache (and keep forwarding) forever. But a
+        // transient query failure must NOT wipe a working cache, so we clear
+        // only on the success path.
+        let mut new_configs: Vec<TopicShadowConfig> = Vec::new();
+        let mut query_ok = false;
 
         Spi::connect(|client| {
             let result = client.select(query, None, &[]);
 
             if let Ok(table) = result {
+                query_ok = true;
                 for row in table {
                     // Use named columns for clarity and safety
                     let topic_id: i32 = row.get_by_name("topic_id").unwrap_or(Some(0)).unwrap_or(0);
@@ -786,11 +926,24 @@ impl<S: KafkaStore> ShadowStore<S> {
                         write_mode: WriteMode::parse(&write_mode_str),
                     };
 
-                    self.topic_cache.update(config);
-                    count += 1;
+                    new_configs.push(config);
                 }
             }
         });
+
+        // Only replace the cache when the query actually ran. On failure, keep
+        // whatever was loaded previously rather than serving an empty config.
+        if !query_ok {
+            return Err(super::error::ShadowError::DatabaseError(
+                "failed to query kafka.shadow_config".to_string(),
+            ));
+        }
+
+        let count = new_configs.len();
+        self.topic_cache.clear();
+        for config in new_configs {
+            self.topic_cache.update(config);
+        }
 
         Ok(count)
     }
@@ -1209,7 +1362,8 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
                                 );
                                 poisoned.into_inner()
                             });
-                    pending.entry(key).or_default().extend(pending_records);
+                    let buf = pending.entry(key).or_default();
+                    buf.records.extend(pending_records);
 
                     tracing::trace!(
                         "ShadowStore: buffered {} DualWrite txn records for topic {} partition {} (forward on commit)",
@@ -1251,7 +1405,8 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
                                 );
                                 poisoned.into_inner()
                             });
-                    pending.entry(key).or_default().extend(pending_records);
+                    let buf = pending.entry(key).or_default();
+                    buf.records.extend(pending_records);
 
                     tracing::trace!(
                         "ShadowStore: buffered {} ExternalOnly txn records for topic {} partition {} (forward on commit)",
@@ -1318,6 +1473,7 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
 
         // 2. Separate records by write mode
         let (dual_write_records, external_only_records): (Vec<_>, Vec<_>) = pending_records
+            .map(|buf| buf.records)
             .unwrap_or_default()
             .into_iter()
             .partition(|r| r.write_mode == WriteMode::DualWrite);
@@ -1415,8 +1571,9 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
         // ExternalOnly records were never written locally, so just discard the buffer
         // (already removed from pending_txn_messages above)
 
-        if let Some(records) = &pending_records {
-            let external_only_count = records
+        if let Some(buf) = &pending_records {
+            let external_only_count = buf
+                .records
                 .iter()
                 .filter(|r| r.write_mode == WriteMode::ExternalOnly)
                 .count();
@@ -1457,7 +1614,32 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
     }
 
     fn abort_timed_out_transactions(&self, timeout: Duration) -> Result<Vec<String>> {
-        self.inner.abort_timed_out_transactions(timeout)
+        let aborted = self.inner.abort_timed_out_transactions(timeout)?;
+
+        // SH-4: the storage-layer sweeper force-aborts timed-out transactions
+        // directly and never routes through abort_transaction(), so the in-RAM
+        // forward buffer for an abandoned producer would leak forever. Evict any
+        // buffer older than the same timeout the sweeper just applied.
+        {
+            let mut pending = self
+                .pending_txn_messages
+                .write()
+                .unwrap_or_else(|poisoned| {
+                    tracing::warn!("pending_txn_messages write lock was poisoned, recovering");
+                    poisoned.into_inner()
+                });
+            let before = pending.len();
+            pending.retain(|_, buf| buf.first_buffered.elapsed() < timeout);
+            let evicted = before - pending.len();
+            if evicted > 0 {
+                tracing::debug!(
+                    "Shadow: evicted {} stale pending-txn forward buffer(s) on timeout sweep",
+                    evicted
+                );
+            }
+        }
+
+        Ok(aborted)
     }
 
     fn cleanup_aborted_messages(&self, older_than: Duration) -> Result<u64> {
@@ -1629,14 +1811,14 @@ mod tests {
                 timestamp: None,
                 write_mode: WriteMode::DualWrite,
             };
-            guard.entry(key).or_default().push(record);
+            guard.entry(key).or_default().records.push(record);
         }
 
         // Read back
         {
             let guard = pending.read().unwrap();
             assert_eq!(guard.len(), 1);
-            let records = guard.get(&(1000, 0)).unwrap();
+            let records = &guard.get(&(1000, 0)).unwrap().records;
             assert_eq!(records.len(), 1);
             assert_eq!(records[0].value, Some(b"test".to_vec()));
         }
@@ -1662,13 +1844,13 @@ mod tests {
                     timestamp: None,
                     write_mode: WriteMode::DualWrite,
                 };
-                guard.entry(key).or_default().push(record);
+                guard.entry(key).or_default().records.push(record);
             }
         }
 
         // Verify all records accumulated
         let guard = pending.read().unwrap();
-        let records = guard.get(&key).unwrap();
+        let records = &guard.get(&key).unwrap().records;
         assert_eq!(records.len(), 5);
 
         // Verify ordering preserved
@@ -1698,7 +1880,8 @@ mod tests {
                     headers: vec![],
                     timestamp: None,
                     write_mode: WriteMode::DualWrite,
-                }],
+                }]
+                .into(),
             );
         }
 
@@ -1707,7 +1890,7 @@ mod tests {
             let mut guard = pending.write().unwrap();
             let removed = guard.remove(&key);
             assert!(removed.is_some());
-            assert_eq!(removed.unwrap().len(), 1);
+            assert_eq!(removed.unwrap().records.len(), 1);
         }
 
         // Verify empty
@@ -1735,7 +1918,8 @@ mod tests {
                     headers: vec![],
                     timestamp: None,
                     write_mode: WriteMode::DualWrite,
-                }],
+                }]
+                .into(),
             );
         }
 
@@ -1853,7 +2037,8 @@ mod tests {
                     headers: vec![],
                     timestamp: None,
                     write_mode: WriteMode::DualWrite,
-                }],
+                }]
+                .into(),
             );
             guard.insert(
                 txn2,
@@ -1867,7 +2052,8 @@ mod tests {
                     headers: vec![],
                     timestamp: None,
                     write_mode: WriteMode::DualWrite,
-                }],
+                }]
+                .into(),
             );
         }
 
@@ -1880,7 +2066,7 @@ mod tests {
         let guard = pending.read().unwrap();
         assert!(guard.get(&txn1).is_none());
         assert!(guard.get(&txn2).is_some());
-        assert_eq!(guard.get(&txn2).unwrap()[0].topic_name, "topic2");
+        assert_eq!(guard.get(&txn2).unwrap().records[0].topic_name, "topic2");
     }
 
     #[test]
@@ -1965,6 +2151,7 @@ mod tests {
             pending
                 .entry((100, 0))
                 .or_default()
+                .records
                 .push(external_only_record(1));
         }
 
@@ -1986,6 +2173,7 @@ mod tests {
             pending
                 .entry((100, 0))
                 .or_default()
+                .records
                 .push(external_only_record(1));
         }
 
@@ -2036,12 +2224,51 @@ mod tests {
             pending
                 .entry((100, 0))
                 .or_default()
+                .records
                 .push(external_only_record(1));
         }
 
         store.commit_transaction("txn-1", 100, 0).unwrap();
         assert_eq!(store.metrics.skipped.load(Ordering::Relaxed), 1);
         assert_eq!(store.metrics.fallback_local.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_abort_timed_out_evicts_stale_pending_buffers() {
+        // SH-4: the storage sweeper force-aborts timed-out transactions without
+        // routing through abort_transaction(), so a buffer for an abandoned
+        // producer must be evicted on the same timeout or it leaks forever.
+        let mut mock = MockKafkaStore::new();
+        mock.expect_abort_timed_out_transactions()
+            .times(1)
+            .returning(|_| Ok(vec![]));
+
+        let store = ShadowStore::new(mock);
+        {
+            let mut pending = store.pending_txn_messages.write().unwrap();
+            // Stale: first_buffered older than the timeout we will sweep with.
+            let mut stale = PendingTxnBuffer::from(vec![external_only_record(1)]);
+            stale.first_buffered = Instant::now()
+                .checked_sub(Duration::from_secs(120))
+                .unwrap_or_else(Instant::now);
+            pending.insert((1, 0), stale);
+            // Fresh: just buffered, well within the timeout.
+            pending.insert(
+                (2, 0),
+                PendingTxnBuffer::from(vec![external_only_record(1)]),
+            );
+        }
+
+        store
+            .abort_timed_out_transactions(Duration::from_secs(60))
+            .unwrap();
+
+        let pending = store.pending_txn_messages.read().unwrap();
+        assert!(
+            !pending.contains_key(&(1, 0)),
+            "stale buffer should be evicted by the timeout sweep"
+        );
+        assert!(pending.contains_key(&(2, 0)), "fresh buffer must be retained");
     }
 
     #[test]

@@ -232,6 +232,7 @@ use kafka_test::{
     test_rebalance_mixed_timeout_values,
     test_rebalance_with_minimal_session_timeout,
     test_rejoin_after_leave,
+    test_reload_clears_deleted_topic_config,
     test_replay_historical_messages,
     // Pipelining tests
     test_request_pipelining,
@@ -1314,6 +1315,12 @@ fn get_all_tests() -> Vec<TestDef> {
             category: "shadow",
             name: "test_local_only_mode",
             test_fn: wrap_test!(test_local_only_mode),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "shadow",
+            name: "test_reload_clears_deleted_topic_config",
+            test_fn: wrap_test!(test_reload_clears_deleted_topic_config),
             parallel_safe: false,
         },
         // Percentage routing tests
