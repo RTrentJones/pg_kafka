@@ -1612,7 +1612,10 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(coordinator.group_protocol_name("g").as_deref(), Some("range"));
+        assert_eq!(
+            coordinator.group_protocol_name("g").as_deref(),
+            Some("range")
+        );
         assert!(coordinator.group_protocol_name("nonexistent").is_none());
     }
 
