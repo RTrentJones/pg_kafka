@@ -751,6 +751,39 @@ fn notify_best_effort(
     let _ = tx.try_send(notification);
 }
 
+/// Wake any long-poll consumers for the partitions a produce just appended to, one best-effort
+/// notification per successfully-written partition. Shared by the `acks=0` and `acks>=1` produce
+/// paths, which previously carried identical copies of this loop. A missing topic id, a failed
+/// high-watermark read, or a full notify channel simply skips that wake-up (consumers fall back to
+/// the poll interval — see [`notify_best_effort`]).
+fn emit_produce_notifications(
+    response: &kafka_protocol::messages::produce_response::ProduceResponse,
+    store: &dyn KafkaStore,
+    notify_tx: &crossbeam_channel::Sender<crate::kafka::InternalNotification>,
+) {
+    for topic_response in &response.responses {
+        let topic_name = topic_response.name.0.as_str();
+        if let Ok(Some(topic_id)) = store.get_topic_id(topic_name) {
+            for partition_response in &topic_response.partition_responses {
+                if partition_response.error_code == ERROR_NONE {
+                    let partition_id = partition_response.index;
+                    if let Ok(hwm) = store.get_high_watermark(topic_id, partition_id) {
+                        notify_best_effort(
+                            notify_tx,
+                            crate::kafka::InternalNotification::NewMessages {
+                                topic_name: topic_name.to_string(),
+                                topic_id,
+                                partition_id,
+                                high_watermark: hwm,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// # Testing
 /// This function is public to allow unit testing, but is not part of the
 /// public API and should not be called directly by external code.
@@ -860,31 +893,8 @@ pub fn process_request(
                 );
                 match handlers::handle_produce(&ctx, topic_data, None, None) {
                     Ok(response) => {
-                        // Send notifications for long-polling consumers
-                        for topic_response in &response.responses {
-                            let topic_name = topic_response.name.0.as_str();
-                            if let Ok(Some(topic_id)) = store.get_topic_id(topic_name) {
-                                for partition_response in &topic_response.partition_responses {
-                                    if partition_response.error_code == ERROR_NONE {
-                                        let partition_id = partition_response.index;
-                                        if let Ok(hwm) =
-                                            store.get_high_watermark(topic_id, partition_id)
-                                        {
-                                            let notification =
-                                                crate::kafka::InternalNotification::NewMessages {
-                                                    topic_name: topic_name.to_string(),
-                                                    topic_id,
-                                                    partition_id,
-                                                    high_watermark: hwm,
-                                                };
-                                            // SEC-4: non-blocking, so a full notify channel can't
-                                            // stall the single DB thread (dropped wake-ups are fine).
-                                            notify_best_effort(notify_tx, notification);
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        // Wake long-poll consumers for the partitions just written.
+                        emit_produce_notifications(&response, store, notify_tx);
                     }
                     Err(e) => {
                         // Log error but don't notify client (per acks=0 contract)
@@ -918,33 +928,8 @@ pub fn process_request(
                 transactional_id.as_deref(),
             ) {
                 Ok(response) => {
-                    // Send notifications for each successfully produced partition
-                    // This wakes up any consumers waiting in long poll
-                    for topic_response in &response.responses {
-                        let topic_name = topic_response.name.0.as_str();
-                        if let Ok(Some(topic_id)) = store.get_topic_id(topic_name) {
-                            for partition_response in &topic_response.partition_responses {
-                                // Only notify if produce succeeded (error_code == 0)
-                                if partition_response.error_code == ERROR_NONE {
-                                    let partition_id = partition_response.index;
-                                    // Get the new high watermark
-                                    if let Ok(hwm) =
-                                        store.get_high_watermark(topic_id, partition_id)
-                                    {
-                                        let notification =
-                                            crate::kafka::InternalNotification::NewMessages {
-                                                topic_name: topic_name.to_string(),
-                                                topic_id,
-                                                partition_id,
-                                                high_watermark: hwm,
-                                            };
-                                        // SEC-4: non-blocking (see the other notify site).
-                                        notify_best_effort(notify_tx, notification);
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    // Wake long-poll consumers for the partitions just written.
+                    emit_produce_notifications(&response, store, notify_tx);
 
                     // Send the response
                     let _ = response_tx.send(KafkaResponse::Produce {
