@@ -1,0 +1,49 @@
+{
+  "generatedAt": "2026-06-30T18:57:38Z",
+  "version": "f3e97bc",
+  "gitSha": "f3e97bc",
+  "config": {
+    "warmupExcluded": true,
+    "messageSizes": [
+      1024
+    ]
+  },
+  "scenarios": [
+    {
+      "name": "produce · unbatched · 1024B",
+      "p50Ms": 2.49,
+      "p99Ms": 4.42,
+      "msgsPerSec": 394
+    },
+    {
+      "name": "produce · batched(100) · 1024B",
+      "p50Ms": 12.23,
+      "p99Ms": 17.77,
+      "msgsPerSec": 7815
+    },
+    {
+      "name": "consume · 1024B",
+      "p50Ms": 0,
+      "p99Ms": 0.03,
+      "msgsPerSec": 13927
+    },
+    {
+      "name": "end-to-end · 1024B",
+      "p50Ms": 11.28,
+      "p99Ms": 23.95,
+      "msgsPerSec": 122
+    }
+  ],
+  "baselines": {
+    "rawInsert": {
+      "msgsPerSec": 3628,
+      "p50Ms": 0.26,
+      "p99Ms": 0.41
+    },
+    "realBroker": {
+      "msgsPerSec": 1248,
+      "p50Ms": 0.67,
+      "p99Ms": 2.95
+    }
+  }
+}
