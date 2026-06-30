@@ -358,6 +358,23 @@ impl<S: KafkaStore> ShadowStore<S> {
         status.check()
     }
 
+    /// Whether `topic_id` is an *external-primary* topic — `ExternalOnly`
+    /// write_mode with forwarding active (SH-6). Such a topic is written and
+    /// forwarded exactly like DualWrite, but its local reads are suppressed so
+    /// consumers must read from the external broker. The config loader forces
+    /// `forward_percentage = 100` for these topics, so every record is
+    /// guaranteed to be forwarded (a sampled-out record would be readable
+    /// nowhere). Returns false on a standby (no shadow behaviour applies there).
+    fn is_external_primary(&self, topic_id: i32) -> bool {
+        if !self.is_enabled() {
+            return false;
+        }
+        self.topic_cache
+            .get(topic_id)
+            .map(|c| c.should_forward() && c.write_mode == WriteMode::ExternalOnly)
+            .unwrap_or(false)
+    }
+
     /// Force a re-check of primary status (SH-2).
     ///
     /// `is_primary()` caches its result for the life of the process, which is
@@ -596,52 +613,6 @@ impl<S: KafkaStore> ShadowStore<S> {
         forward_percentage: u8,
     ) -> ForwardDecision {
         make_forward_decision(key, offset, forward_percentage)
-    }
-
-    /// Forward records to external Kafka, returning success status
-    ///
-    /// Used for ExternalOnly mode where we need to know if forward succeeded.
-    fn forward_records_required(
-        &self,
-        topic_config: &TopicShadowConfig,
-        partition_id: i32,
-        records: &[Record],
-    ) -> bool {
-        // Check license (Commercial License) - emits rate-limited warnings
-        self.check_license();
-
-        let producer = match self.ensure_producer() {
-            Some(p) => p,
-            None => {
-                tracing::debug!("No producer available for shadow forwarding");
-                return false;
-            }
-        };
-
-        let external_topic = topic_config.effective_external_topic();
-
-        for record in records {
-            if let Err(e) = producer.send_sync(
-                external_topic,
-                Some(partition_id),
-                record.key.as_deref(),
-                record.value.as_deref(),
-                DEFAULT_FORWARD_TIMEOUT_MS,
-            ) {
-                crate::pg_warning!(
-                    "Shadow external write failed for {}[{}]: {:?}",
-                    external_topic,
-                    partition_id,
-                    e
-                );
-                self.metrics.failed.fetch_add(1, Ordering::Relaxed);
-                return false; // Trigger fallback to local
-            } else {
-                self.metrics.forwarded.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-
-        true // All records forwarded successfully
     }
 
     /// Flush the producer if initialized
@@ -1232,7 +1203,7 @@ impl<S: KafkaStore> ShadowStore<S> {
                         .unwrap_or(Some("dual_write".to_string()))
                         .unwrap_or_default();
 
-                    let config = TopicShadowConfig {
+                    let mut config = TopicShadowConfig {
                         topic_id,
                         topic_name: topic_name.clone(),
                         mode: ShadowMode::parse(&mode_str),
@@ -1241,6 +1212,23 @@ impl<S: KafkaStore> ShadowStore<S> {
                         sync_mode: SyncMode::parse(&sync_mode_str),
                         write_mode: WriteMode::parse(&write_mode_str),
                     };
+
+                    // SH-6 guard: an external-primary topic suppresses local
+                    // reads, so a record sampled out by forward_percentage would
+                    // be readable nowhere — neither locally (suppressed) nor
+                    // externally (not forwarded). Force 100% so every record is
+                    // forwarded; the percentage dial is meaningless here.
+                    if config.write_mode == WriteMode::ExternalOnly
+                        && config.forward_percentage != 100
+                    {
+                        tracing::warn!(
+                            "Shadow: topic '{}' is external-primary (ExternalOnly) but \
+                             forward_percentage={}; forcing 100% to avoid unreadable records",
+                            config.topic_name,
+                            config.forward_percentage
+                        );
+                        config.forward_percentage = 100;
+                    }
 
                     new_configs.push(config);
                 }
@@ -1348,82 +1336,25 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
             return self.inner.insert_records(topic_id, partition_id, records);
         }
 
-        // Get topic configuration (if any)
+        // SH-6/SH-13: external-primary (ExternalOnly) and DualWrite WRITE
+        // identically — the record is always persisted locally (real offset)
+        // and, when configured, forwarded via the durable outbox. write_mode now
+        // governs only READS: an external-primary topic suppresses local fetches
+        // (see fetch_records / get_high_watermark), so consumers cut over to the
+        // external broker and delivery comes from exactly one source. That makes
+        // forward_percentage a real cutover dial instead of a split between local
+        // reads and the external broker. The old synthetic-offset / skip-local /
+        // partial-failure double-write paths are gone.
         let topic_config = self.topic_cache.get(topic_id);
-        let has_config = topic_config.is_some();
-        let should_forward = topic_config
-            .as_ref()
-            .map(|c| c.should_forward())
-            .unwrap_or(false);
+        let base_offset = self.inner.insert_records(topic_id, partition_id, records)?;
 
-        crate::pg_log!(
-            "Shadow: topic_id={} has_config={} should_forward={}",
-            topic_id,
-            has_config,
-            should_forward
-        );
-
-        // Determine write mode
-        let write_mode = topic_config
-            .as_ref()
-            .filter(|c| c.should_forward())
-            .map(|c| c.write_mode)
-            .unwrap_or(WriteMode::DualWrite); // No config = local only (DualWrite but no forward)
-
-        crate::pg_log!("Shadow: write_mode={:?}", write_mode);
-
-        match write_mode {
-            WriteMode::DualWrite => {
-                // Always write locally first.
-                let base_offset = self.inner.insert_records(topic_id, partition_id, records)?;
-
-                // SH-9: enqueue durable outbox rows in the SAME transaction as
-                // the local write (no lossy in-RAM channel). The periodic poll
-                // forwards async topics; sync topics wait, bounded, inside
-                // enqueue_outbox. The forward never runs on this thread.
-                if let Some(config) = topic_config {
-                    if config.should_forward() {
-                        self.enqueue_outbox(topic_id, partition_id, records, base_offset, &config);
-                    } else {
-                        crate::pg_log!("Shadow: config exists but should_forward=false");
-                    }
-                } else {
-                    crate::pg_log!("Shadow: no topic config, skipping forward");
-                }
-
-                Ok(base_offset)
-            }
-
-            WriteMode::ExternalOnly => {
-                // Try external first
-                let config = topic_config.expect("ExternalOnly requires shadow config");
-
-                if self.forward_records_required(&config, partition_id, records) {
-                    // External succeeded - skip local write entirely
-                    // Consumers should be configured to read from external Kafka
-                    tracing::debug!(
-                        "ExternalOnly: {} records forwarded to external Kafka, skipping local",
-                        records.len()
-                    );
-                    self.metrics
-                        .forwarded
-                        .fetch_add(records.len() as u64, Ordering::Relaxed);
-                    // Return a synthetic offset (not stored locally)
-                    // Clients should switch to consuming from external Kafka
-                    Ok(0)
-                } else {
-                    // External failed - fallback to local storage
-                    tracing::info!(
-                        "ExternalOnly fallback: {} records written locally due to external failure",
-                        records.len()
-                    );
-                    self.metrics
-                        .fallback_local
-                        .fetch_add(records.len() as u64, Ordering::Relaxed);
-                    self.inner.insert_records(topic_id, partition_id, records)
-                }
+        if let Some(config) = &topic_config {
+            if config.should_forward() {
+                self.enqueue_outbox(topic_id, partition_id, records, base_offset, config);
             }
         }
+
+        Ok(base_offset)
     }
 
     fn fetch_records(
@@ -1433,15 +1364,30 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
         fetch_offset: i64,
         max_bytes: i32,
     ) -> Result<Vec<FetchedMessage>> {
+        // SH-6: external-primary topics suppress local reads so consumers cut
+        // over to the external broker. The data is still stored locally (for
+        // durability / replay) — it is just not served from here.
+        if self.is_external_primary(topic_id) {
+            return Ok(Vec::new());
+        }
         self.inner
             .fetch_records(topic_id, partition_id, fetch_offset, max_bytes)
     }
 
     fn get_high_watermark(&self, topic_id: i32, partition_id: i32) -> Result<i64> {
+        // SH-6: report an empty partition for external-primary topics so a
+        // consumer pointed at pg_kafka sees nothing to read and uses the
+        // external broker instead.
+        if self.is_external_primary(topic_id) {
+            return Ok(0);
+        }
         self.inner.get_high_watermark(topic_id, partition_id)
     }
 
     fn get_earliest_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64> {
+        if self.is_external_primary(topic_id) {
+            return Ok(0);
+        }
         self.inner.get_earliest_offset(topic_id, partition_id)
     }
 
@@ -1451,6 +1397,9 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
         partition_id: i32,
         timestamp_ms: i64,
     ) -> Result<Option<(i64, i64)>> {
+        if self.is_external_primary(topic_id) {
+            return Ok(None);
+        }
         self.inner
             .get_offset_for_timestamp(topic_id, partition_id, timestamp_ms)
     }
@@ -1622,122 +1571,58 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
         // Get topic configuration
         let topic_config = self.topic_cache.get(topic_id);
 
-        // Determine write mode (default to DualWrite if no config)
-        let (write_mode, should_forward, topic_name) = match &topic_config {
-            Some(config) if config.should_forward() => {
-                (config.write_mode, true, config.topic_name.clone())
-            }
-            Some(config) => (WriteMode::DualWrite, false, config.topic_name.clone()),
-            None => (WriteMode::DualWrite, false, format!("topic-{}", topic_id)),
+        // SH-6/SH-13: external-primary (ExternalOnly) and DualWrite WRITE
+        // identically — always persist locally with a real offset and buffer for
+        // forward-on-commit. write_mode now affects only reads (external-primary
+        // suppresses local fetches). So we no longer branch on it here.
+        let (should_forward, topic_name) = match &topic_config {
+            Some(config) if config.should_forward() => (true, config.topic_name.clone()),
+            Some(config) => (false, config.topic_name.clone()),
+            None => (false, format!("topic-{}", topic_id)),
         };
 
-        // Handle based on write mode
-        let base_offset = match write_mode {
-            WriteMode::DualWrite => {
-                // DualWrite: Write locally first, buffer for forwarding on commit
-                let offset = self.inner.insert_transactional_records(
+        // Always write locally first (real offset).
+        let base_offset = self.inner.insert_transactional_records(
+            topic_id,
+            partition_id,
+            records,
+            producer_id,
+            producer_epoch,
+        )?;
+
+        // Buffer the committed offsets so commit_transaction forwards them.
+        if should_forward {
+            let pending_records: Vec<PendingForwardRecord> = records
+                .iter()
+                .enumerate()
+                .map(|(i, r)| PendingForwardRecord {
                     topic_id,
+                    topic_name: topic_name.clone(),
                     partition_id,
-                    records,
-                    producer_id,
-                    producer_epoch,
-                )?;
+                    offset: base_offset + i as i64,
+                    key: r.key.clone(),
+                    value: r.value.clone(),
+                    headers: r.headers.clone(),
+                    timestamp: r.timestamp,
+                    write_mode: WriteMode::DualWrite,
+                })
+                .collect();
 
-                // Buffer records for forwarding on commit (if should_forward)
-                if should_forward {
-                    let pending_records: Vec<PendingForwardRecord> = records
-                        .iter()
-                        .enumerate()
-                        .map(|(i, r)| PendingForwardRecord {
-                            topic_id,
-                            topic_name: topic_name.clone(),
-                            partition_id,
-                            offset: offset + i as i64,
-                            key: r.key.clone(),
-                            value: r.value.clone(),
-                            headers: r.headers.clone(),
-                            timestamp: r.timestamp,
-                            write_mode: WriteMode::DualWrite,
-                        })
-                        .collect();
+            let key = (producer_id, producer_epoch);
+            let mut pending = self.pending_txn_messages.write().unwrap_or_else(|poisoned| {
+                tracing::warn!("pending_txn_messages write lock was poisoned, recovering");
+                poisoned.into_inner()
+            });
+            let buf = pending.entry(key).or_default();
+            buf.records.extend(pending_records);
 
-                    let key = (producer_id, producer_epoch);
-                    let mut pending =
-                        self.pending_txn_messages
-                            .write()
-                            .unwrap_or_else(|poisoned| {
-                                tracing::warn!(
-                                    "pending_txn_messages write lock was poisoned, recovering"
-                                );
-                                poisoned.into_inner()
-                            });
-                    let buf = pending.entry(key).or_default();
-                    buf.records.extend(pending_records);
-
-                    tracing::trace!(
-                        "ShadowStore: buffered {} DualWrite txn records for topic {} partition {} (forward on commit)",
-                        records.len(),
-                        topic_id,
-                        partition_id
-                    );
-                }
-
-                offset
-            }
-
-            WriteMode::ExternalOnly => {
-                // ExternalOnly: Buffer in memory ONLY, don't write to PostgreSQL
-                // Records will be forwarded on commit, with fallback to local on failure
-                if should_forward {
-                    let pending_records: Vec<PendingForwardRecord> = records
-                        .iter()
-                        .map(|r| PendingForwardRecord {
-                            topic_id,
-                            topic_name: topic_name.clone(),
-                            partition_id,
-                            offset: -1, // Not written locally yet
-                            key: r.key.clone(),
-                            value: r.value.clone(),
-                            headers: r.headers.clone(),
-                            timestamp: r.timestamp,
-                            write_mode: WriteMode::ExternalOnly,
-                        })
-                        .collect();
-
-                    let key = (producer_id, producer_epoch);
-                    let mut pending =
-                        self.pending_txn_messages
-                            .write()
-                            .unwrap_or_else(|poisoned| {
-                                tracing::warn!(
-                                    "pending_txn_messages write lock was poisoned, recovering"
-                                );
-                                poisoned.into_inner()
-                            });
-                    let buf = pending.entry(key).or_default();
-                    buf.records.extend(pending_records);
-
-                    tracing::trace!(
-                        "ShadowStore: buffered {} ExternalOnly txn records for topic {} partition {} (forward on commit)",
-                        records.len(),
-                        topic_id,
-                        partition_id
-                    );
-
-                    // Return synthetic offset (not stored locally)
-                    0
-                } else {
-                    // ExternalOnly but forwarding disabled - write locally
-                    self.inner.insert_transactional_records(
-                        topic_id,
-                        partition_id,
-                        records,
-                        producer_id,
-                        producer_epoch,
-                    )?
-                }
-            }
-        };
+            tracing::trace!(
+                "ShadowStore: buffered {} txn records for topic {} partition {} (forward on commit)",
+                records.len(),
+                topic_id,
+                partition_id
+            );
+        }
 
         Ok(base_offset)
     }
@@ -1909,6 +1794,10 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
         max_bytes: i32,
         isolation_level: IsolationLevel,
     ) -> Result<Vec<FetchedMessage>> {
+        // SH-6: external-primary read suppression (see fetch_records).
+        if self.is_external_primary(topic_id) {
+            return Ok(Vec::new());
+        }
         self.inner.fetch_records_with_isolation(
             topic_id,
             partition_id,
@@ -1919,6 +1808,9 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
     }
 
     fn get_last_stable_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64> {
+        if self.is_external_primary(topic_id) {
+            return Ok(0);
+        }
         self.inner.get_last_stable_offset(topic_id, partition_id)
     }
 
