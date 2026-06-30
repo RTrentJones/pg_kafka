@@ -155,3 +155,91 @@ pub async fn test_aborted_transaction_not_forwarded() -> TestResult {
     println!("✅ Test PASSED: Aborted Transaction Not Forwarded\n");
     Ok(())
 }
+
+/// Test that a committed transaction forwards via the DURABLE OUTBOX (RA-1/RA-2)
+///
+/// Uses async mode so forwarding can only happen via the background poll (never
+/// an inline `block_on` on the commit path — the RA-1 fix). Asserts both that
+/// the message reaches external Kafka AND that the `kafka.shadow_tracking` outbox
+/// row is written and finalized (`external_offset` non-NULL) — proving the txn
+/// commit now routes through the same at-least-once outbox as a non-txn produce.
+pub async fn test_committed_transaction_uses_durable_outbox() -> TestResult {
+    println!("=== Test: Committed Transaction Uses Durable Outbox (RA-1/RA-2) ===\n");
+
+    // 1. SETUP
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("txn-outbox").await;
+    let txn_id = format!("shadow-txn-outbox-{}", ctx.test_id);
+
+    verify_external_kafka_ready().await?;
+    enable_shadow_mode(
+        ctx.db(),
+        &topic,
+        &ShadowTopicConfig {
+            mode: ShadowMode::Shadow,
+            forward_percentage: 100,
+            external_topic_name: None,
+            sync_mode: SyncMode::Async, // async → only the poll can forward
+            write_mode: WriteMode::DualWrite,
+        },
+    )
+    .await?;
+
+    // 2. ACTION — produce within a transaction and commit.
+    let producer = create_transactional_producer(&txn_id)?;
+    producer.init_transactions(Duration::from_secs(10))?;
+    producer.begin_transaction()?;
+    let key = b"txn-outbox-key";
+    let value = b"txn-outbox-value";
+    producer
+        .send(
+            FutureRecord::to(&topic).key(&key[..]).payload(&value[..]),
+            Duration::from_secs(5),
+        )
+        .await
+        .map_err(|(e, _)| e)?;
+    producer.commit_transaction(Duration::from_secs(10))?;
+    println!("✅ Transaction committed\n");
+
+    // 3. VERIFY
+    // 3a. Reaches external Kafka — via the poll, not an inline commit-path send.
+    assert_message_in_external_kafka(&topic, Some(key), Some(value), Duration::from_secs(15))
+        .await?;
+    println!("✅ Forwarded to external Kafka (via the outbox poll)\n");
+
+    // 3b. The outbox row exists and is finalized — proving the durable path.
+    let mut finalized = false;
+    for _ in 0..20 {
+        let row = ctx
+            .db()
+            .query_one(
+                r#"
+                SELECT COUNT(*) FILTER (WHERE st.external_offset IS NOT NULL) AS done,
+                       COUNT(*) AS total
+                FROM kafka.shadow_tracking st
+                JOIN kafka.topics t ON t.id = st.topic_id
+                WHERE t.name = $1
+                "#,
+                &[&topic],
+            )
+            .await?;
+        let done: i64 = row.get("done");
+        let total: i64 = row.get("total");
+        if total >= 1 && done >= 1 {
+            finalized = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    if !finalized {
+        return Err(
+            "committed txn did not produce a finalized shadow_tracking outbox row".into(),
+        );
+    }
+    println!("✅ Outbox row written and finalized for the committed txn\n");
+
+    // 4. CLEANUP
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED: Committed Transaction Uses Durable Outbox\n");
+    Ok(())
+}
