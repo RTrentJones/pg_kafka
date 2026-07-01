@@ -168,16 +168,20 @@ pub async fn test_partition_assignment_strategies() -> TestResult {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
-    // Wait for rebalance to complete
-    println!("\nStep 3: Waiting for rebalance...");
-    tokio::time::sleep(Duration::from_secs(3)).await;
-
-    // Verify each consumer can poll
-    println!("\nStep 4: Verifying partition assignments...");
+    // Poll the consumers in a retry loop until at least one delivers a record,
+    // bounded by an overall deadline. This replaces the flaky "blind 3s sleep
+    // then a single 500ms poll": actively polling each consumer both drives the
+    // group rebalance (rdkafka only progresses the join/sync while the stream is
+    // polled) and collects the record, so a slow-to-stabilize group under CI
+    // load no longer yields zero receives.
+    println!("\nStep 3-4: Polling until a consumer receives...");
+    let overall = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut total_received = 0;
-    for (i, consumer) in consumers.iter().enumerate() {
-        match tokio::time::timeout(Duration::from_millis(500), consumer.recv()).await {
-            Ok(Ok(msg)) => {
+    while total_received == 0 && tokio::time::Instant::now() < overall {
+        for (i, consumer) in consumers.iter().enumerate() {
+            if let Ok(Ok(msg)) =
+                tokio::time::timeout(Duration::from_millis(500), consumer.recv()).await
+            {
                 let partition = msg.partition();
                 let value = msg
                     .payload()
@@ -190,20 +194,12 @@ pub async fn test_partition_assignment_strategies() -> TestResult {
                 );
                 total_received += 1;
             }
-            Ok(Err(e)) => {
-                println!("  Consumer {} error: {}", i + 1, e);
-            }
-            Err(_) => {
-                println!("  Consumer {} no message (may not have assignment)", i + 1);
-            }
         }
     }
 
-    // At least some consumers should have received messages
+    // At least one consumer should have received a record.
     println!("\nStep 5: Verifying results...");
     println!("  Total messages received: {}", total_received);
-
-    // With 3 partitions and 3 consumers, at least 1 should receive
     assert!(
         total_received >= 1,
         "At least one consumer should receive messages"
