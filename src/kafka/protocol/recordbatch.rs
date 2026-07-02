@@ -542,11 +542,6 @@ mod tests {
     proptest::proptest! {
         // QA-2: fuzz the legacy MessageSet parser (our hand-rolled code) directly with
         // [offset][size][maybe-body] framing — it must never panic (returns Ok or Err).
-        //
-        // NOTE: we do NOT fuzz the full `parse_record_batch` here, because its v2 path routes
-        // into kafka-protocol's `RecordBatchDecoder::decode`, which (like the request-body
-        // decoders, AUDIT-2026-06 SEC-9) can `with_capacity` an attacker-controlled count and
-        // *abort* the process on OOM — uncatchable by the test harness. Restore once SEC-9 lands.
         #[test]
         fn fuzz_parse_message_set_legacy_never_panics(
             size in proptest::num::i32::ANY,
@@ -558,6 +553,20 @@ mod tests {
             buf.extend_from_slice(&body);
             let bytes = Bytes::from(buf);
             let _ = parse_message_set_legacy(&bytes, "fuzz");
+        }
+
+        // RV-1 (AUDIT-2026-06 post-remediation review): the full `parse_record_batch`
+        // pipeline — including the v2 `RecordBatchDecoder::decode` path — must never panic
+        // OR abort on arbitrary bytes. Restored now that the fork bounds the record-count
+        // `reserve` and the string/bytes `vec![0; wire_len]` allocations (this was disabled
+        // because the pre-cap decoder could `abort()` on an attacker-controlled count, which
+        // no `catch_unwind` can contain). The precise huge-`record_count` fail-before/pass-after
+        // regression lives in the fork (`records.rs::huge_record_count_errors_instead_of_aborting`).
+        #[test]
+        fn fuzz_parse_record_batch_never_aborts(
+            bytes in proptest::collection::vec(proptest::num::u8::ANY, 0..1024),
+        ) {
+            let _ = parse_record_batch(&Bytes::from(bytes));
         }
     }
 

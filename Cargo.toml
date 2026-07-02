@@ -94,6 +94,11 @@ codegen-units = 1
 # = 256 MiB) across gzip/lz4/zstd/snappy, so a "decompression bomb" — a tiny compressed batch that
 # inflates to many GB — is rejected instead of allocated.
 #
+# RV-1/RV-15 (AUDIT-2026-06 post-remediation review): the SEC-9 caps missed two residual sites the fork
+# now also bounds — the RecordBatch record-count `reserve` (a ~60-byte Produce claiming record_count =
+# i32::MAX aborted the worker) and the four Vec<u8>/String vec![0; wire_len] decoders (guarded against
+# remaining bytes). See records.rs / protocol/types.rs in the fork.
+#
 # Fork: https://github.com/RTrentJones/kafka-protocol-rs (branch bounded-decompress)
 [patch.crates-io]
-kafka-protocol = { git = "https://github.com/RTrentJones/kafka-protocol-rs", rev = "703af1879bffbcce7e2e4f60b69975d4022d5cd9" }
+kafka-protocol = { git = "https://github.com/RTrentJones/kafka-protocol-rs", rev = "3094a3e9167baca547620fefeb9d1ad949e46535" }
