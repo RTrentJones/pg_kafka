@@ -247,6 +247,7 @@ use kafka_test::{
     test_special_character_key_routing,
     test_topic_name_mapping,
     test_transaction_boundary_isolation,
+    test_transaction_honors_per_txn_timeout_ms,
     test_transaction_partial_failure_atomicity,
     test_transaction_timeout_auto_abort,
     test_transactional_batch,
@@ -1306,6 +1307,12 @@ fn get_all_tests() -> Vec<TestDef> {
             category: "transaction",
             name: "test_transaction_boundary_isolation",
             test_fn: wrap_test!(test_transaction_boundary_isolation),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "transaction",
+            name: "test_transaction_honors_per_txn_timeout_ms",
+            test_fn: wrap_test!(test_transaction_honors_per_txn_timeout_ms),
             parallel_safe: true,
         },
         // Shadow mode tests (Phase 11) - NOT parallel safe (uses external Kafka)

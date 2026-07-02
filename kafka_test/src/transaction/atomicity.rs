@@ -988,3 +988,59 @@ pub async fn test_transaction_boundary_isolation() -> TestResult {
     println!("Transaction boundary isolation test PASSED\n");
     Ok(())
 }
+
+/// RV-7 regression: the periodic timeout sweep must honor each transaction's own
+/// `timeout_ms` (from the client's `transaction.timeout.ms`), not a hardcoded 60 s.
+/// A transaction started 90 s ago with `timeout_ms = 120000` must NOT be aborted —
+/// before the fix the fixed 60 s would wrongly abort it.
+pub async fn test_transaction_honors_per_txn_timeout_ms() -> TestResult {
+    println!("=== Test: Transaction Honors Per-Txn timeout_ms (RV-7) ===\n");
+
+    let txn_id = format!("txn-timeout-honor-{}", Uuid::new_v4());
+    let topic = format!("txn-timeout-honor-{}", Uuid::new_v4());
+    let client = create_db_client().await?;
+
+    let producer = create_transactional_producer(&txn_id)?;
+    producer.init_transactions(Duration::from_secs(10))?;
+    producer.begin_transaction()?;
+    producer
+        .send(
+            FutureRecord::to(&topic).payload("p").key("k"),
+            Duration::from_secs(5),
+        )
+        .await
+        .map_err(|(e, _)| e)?;
+
+    // Backdate the transaction to 90 s ago with a 120 s timeout, and ensure it is
+    // Ongoing so the sweep considers it.
+    client
+        .execute(
+            "UPDATE kafka.transactions
+             SET started_at = NOW() - INTERVAL '90 seconds', timeout_ms = 120000, state = 'Ongoing'
+             WHERE transactional_id = $1",
+            &[&txn_id],
+        )
+        .await?;
+
+    // Wait for at least one sweep cycle (the worker sweeps every 10 s).
+    println!("  Waiting for a timeout-sweep cycle...");
+    tokio::time::sleep(Duration::from_secs(13)).await;
+
+    let state: Option<String> = client
+        .query_one(
+            "SELECT state FROM kafka.transactions WHERE transactional_id = $1",
+            &[&txn_id],
+        )
+        .await?
+        .get(0);
+    println!("  Transaction state after sweep: {:?}", state);
+    assert_eq!(
+        state,
+        Some("Ongoing".to_string()),
+        "a 90s-old transaction with timeout_ms=120000 must not be swept (RV-7)"
+    );
+
+    producer.abort_transaction(Duration::from_secs(10))?;
+    println!("\nTransaction honors per-txn timeout_ms test PASSED\n");
+    Ok(())
+}

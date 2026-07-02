@@ -1422,6 +1422,11 @@ mod tests {
             .times(1)
             .returning(|_, _, _| Ok(0));
 
+        // RV-8: the producer sequence is recorded after the successful insert
+        mock.expect_record_producer_sequence()
+            .times(1)
+            .returning(|_, _, _, _| Ok(()));
+
         let topic_data = vec![TopicProduceData {
             name: "test-topic".to_string(),
             partitions: vec![PartitionProduceData {
@@ -1454,6 +1459,52 @@ mod tests {
         let partition_response = &response.responses[0].partition_responses[0];
         assert_eq!(partition_response.error_code, ERROR_NONE);
         assert_eq!(partition_response.base_offset, 0);
+    }
+
+    #[test]
+    fn test_handle_produce_insert_failure_does_not_advance_sequence() {
+        // RV-8: when the insert fails, the producer sequence must NOT advance, so a
+        // retry re-inserts instead of being dropped as a false duplicate. No
+        // record_producer_sequence expectation is set, so mockall fails on Drop if
+        // the handler advances the sequence after a failed insert.
+        let mut mock = MockKafkaStore::new();
+        mock.expect_get_or_create_topic()
+            .returning(|_, _| Ok((1, 1)));
+        mock.expect_check_and_update_sequence()
+            .times(1)
+            .returning(|_, _, _, _, _, _| Ok(true));
+        mock.expect_insert_records()
+            .times(1)
+            .returning(|_, _, _| Err(KafkaError::database("insert boom")));
+        // Intentionally NO expect_record_producer_sequence — it must not be called.
+
+        let topic_data = vec![TopicProduceData {
+            name: "test-topic".to_string(),
+            partitions: vec![PartitionProduceData {
+                partition_index: 0,
+                records: vec![Record {
+                    key: None,
+                    value: Some(b"v".to_vec()),
+                    headers: vec![],
+                    timestamp: None,
+                }],
+                producer_metadata: None,
+            }],
+        }];
+        let producer_metadata = ProducerMetadata {
+            producer_id: 1000,
+            producer_epoch: 0,
+            base_sequence: 0,
+        };
+        let coordinator = GroupCoordinator::new();
+        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+
+        let response =
+            produce::handle_produce(&ctx, topic_data, Some(&producer_metadata), None).unwrap();
+        let partition_response = &response.responses[0].partition_responses[0];
+        // The insert error is surfaced and the sequence was not advanced.
+        assert_ne!(partition_response.error_code, ERROR_NONE);
     }
 
     #[test]

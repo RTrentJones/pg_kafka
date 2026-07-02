@@ -402,6 +402,20 @@ pub trait KafkaStore {
         record_count: i32,
     ) -> Result<bool>;
 
+    /// Persist a producer's advanced `last_sequence` AFTER a successful insert (RV-8).
+    ///
+    /// The sequence advance is split out from `check_and_update_sequence` (which now
+    /// only validates) so it happens only once the records are durably inserted.
+    /// Otherwise a failed insert would leave the sequence advanced and a retry of
+    /// the same batch would be misclassified as a duplicate and silently dropped.
+    fn record_producer_sequence(
+        &self,
+        producer_id: i64,
+        topic_id: i32,
+        partition_id: i32,
+        last_sequence: i32,
+    ) -> Result<()>;
+
     // ===== Transaction Operations (Phase 10) =====
 
     /// Look up or create producer by transactional_id

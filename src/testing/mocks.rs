@@ -82,6 +82,13 @@ mock! {
             base_sequence: i32,
             record_count: i32,
         ) -> Result<bool>;
+        fn record_producer_sequence(
+            &self,
+            producer_id: i64,
+            topic_id: i32,
+            partition_id: i32,
+            last_sequence: i32,
+        ) -> Result<()>;
         // Transaction Operations (Phase 10)
         fn get_or_create_transactional_producer<'a>(
             &self,
