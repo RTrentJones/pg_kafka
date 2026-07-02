@@ -853,17 +853,17 @@ impl KafkaStore for PostgresStore {
                     .unwrap_or(-1)
             };
 
-            // Step 4: Validate sequence range (pure logic in storage::validate_sequence).
+            // Step 4: Validate the sequence range (pure logic in storage::validate_sequence).
             // A batch is only a duplicate if it is ENTIRELY at or behind last_sequence;
             // a partially overlapping batch must be rejected, not silently skipped.
-            let new_last_sequence = match super::validate_sequence(
-                last_sequence,
-                base_sequence,
-                record_count,
-            ) {
+            //
+            // RV-8: the stored last_sequence is NOT advanced here. record_producer_sequence
+            // persists it AFTER a successful insert, so a failed insert leaves the sequence
+            // un-advanced and a retry of the same batch re-inserts instead of being dropped
+            // as a false duplicate.
+            match super::validate_sequence(last_sequence, base_sequence, record_count) {
                 super::SequenceValidation::Duplicate => {
-                    // Kafka spec: exact replay returns success, skip insert,
-                    // don't update sequence
+                    // Kafka spec: exact replay returns success, skip insert.
                     crate::pg_debug!(
                         "Duplicate detected: producer_id={}, partition_id={}, base_sequence={}, last_sequence={}",
                         producer_id,
@@ -871,21 +871,38 @@ impl KafkaStore for PostgresStore {
                         base_sequence,
                         last_sequence
                     );
-                    return Ok(false); // Duplicate - skip insert
+                    Ok(false) // Duplicate - skip insert
                 }
                 super::SequenceValidation::OutOfOrder { expected_sequence } => {
-                    return Err(KafkaError::out_of_order_sequence(
+                    Err(KafkaError::out_of_order_sequence(
                         producer_id,
                         partition_id,
                         base_sequence,
                         expected_sequence,
-                    ));
+                    ))
                 }
-                super::SequenceValidation::Proceed { new_last_sequence } => new_last_sequence,
-            };
+                super::SequenceValidation::Proceed { .. } => Ok(true), // valid - proceed with insert
+            }
+        })
+        .map_err(|e| match e {
+            KafkaError::UnknownProducerId { .. }
+            | KafkaError::ProducerFenced { .. }
+            | KafkaError::DuplicateSequence { .. }
+            | KafkaError::OutOfOrderSequence { .. } => e,
+            _ => KafkaError::Internal(format!("check_and_update_sequence failed: {}", e)),
+        })
+    }
 
-            // Step 5: Sequence is valid - update last_sequence
-
+    fn record_producer_sequence(
+        &self,
+        producer_id: i64,
+        topic_id: i32,
+        partition_id: i32,
+        last_sequence: i32,
+    ) -> Result<()> {
+        // RV-8: persist the advanced last_sequence, called only AFTER the records
+        // are durably inserted (runs in the same request subtransaction).
+        Spi::connect_mut(|client| {
             client.update(
                 "INSERT INTO kafka.producer_sequences (producer_id, topic_id, partition_id, last_sequence)
                  VALUES ($1, $2, $3, $4)
@@ -896,26 +913,13 @@ impl KafkaStore for PostgresStore {
                     producer_id.into(),
                     topic_id.into(),
                     partition_id.into(),
-                    new_last_sequence.into(),
+                    last_sequence.into(),
                 ],
             )?;
-
-            crate::pg_debug!(
-                "Updated sequence for producer_id={}, partition_id={}: {} -> {}",
-                producer_id,
-                partition_id,
-                last_sequence,
-                new_last_sequence
-            );
-
-            Ok(true) // Valid sequence - proceed with insert
+            Ok(())
         })
-        .map_err(|e| match e {
-            KafkaError::UnknownProducerId { .. }
-            | KafkaError::ProducerFenced { .. }
-            | KafkaError::DuplicateSequence { .. }
-            | KafkaError::OutOfOrderSequence { .. } => e,
-            _ => KafkaError::Internal(format!("check_and_update_sequence failed: {}", e)),
+        .map_err(|e: KafkaError| {
+            KafkaError::Internal(format!("record_producer_sequence failed: {}", e))
         })
     }
 
@@ -1729,10 +1733,13 @@ impl KafkaStore for PostgresStore {
     }
 
     fn abort_timed_out_transactions(&self, timeout: Duration) -> Result<Vec<String>> {
-        let timeout_secs = timeout.as_secs() as i64;
+        // RV-7: enforce each transaction's own timeout_ms (set from the client's
+        // transaction.timeout.ms at InitProducerId), not a single hardcoded value.
+        // The passed `timeout` is only the fallback when a row's timeout_ms is NULL.
+        let default_timeout_ms = timeout.as_millis() as i64;
         crate::pg_debug!(
-            "PostgresStore::abort_timed_out_transactions: timeout={}s",
-            timeout_secs
+            "PostgresStore::abort_timed_out_transactions: default_timeout={}ms",
+            default_timeout_ms
         );
 
         Spi::connect_mut(|client| {
@@ -1741,9 +1748,9 @@ impl KafkaStore for PostgresStore {
                 "SELECT transactional_id, producer_id, producer_epoch
                  FROM kafka.transactions
                  WHERE state = 'Ongoing'
-                   AND started_at < NOW() - ($1 || ' seconds')::interval",
+                   AND started_at < NOW() - (COALESCE(timeout_ms, $1) || ' milliseconds')::interval",
                 None,
-                &[timeout_secs.into()],
+                &[default_timeout_ms.into()],
             )?;
 
             let mut aborted = Vec::new();

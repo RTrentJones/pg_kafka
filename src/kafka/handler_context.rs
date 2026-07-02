@@ -343,6 +343,16 @@ mod tests {
             Ok(true)
         }
 
+        fn record_producer_sequence(
+            &self,
+            _producer_id: i64,
+            _topic_id: i32,
+            _partition_id: i32,
+            _last_sequence: i32,
+        ) -> crate::kafka::error::Result<()> {
+            Ok(())
+        }
+
         fn get_or_create_transactional_producer(
             &self,
             _transactional_id: &str,

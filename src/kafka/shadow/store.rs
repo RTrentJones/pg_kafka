@@ -1456,6 +1456,17 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
         )
     }
 
+    fn record_producer_sequence(
+        &self,
+        producer_id: i64,
+        topic_id: i32,
+        partition_id: i32,
+        last_sequence: i32,
+    ) -> Result<()> {
+        self.inner
+            .record_producer_sequence(producer_id, topic_id, partition_id, last_sequence)
+    }
+
     // ===== Transaction Operations =====
 
     fn get_or_create_transactional_producer(

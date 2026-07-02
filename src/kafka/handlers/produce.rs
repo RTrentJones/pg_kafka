@@ -179,6 +179,31 @@ pub fn handle_produce(
                         partition_response.base_offset = base_offset;
                         partition_response.log_append_time_ms = -1;
                         partition_response.log_start_offset = -1;
+
+                        // RV-8: advance the idempotent producer's sequence only AFTER the
+                        // insert has succeeded. If the insert had failed, the sequence
+                        // would stay un-advanced and a retry re-inserts, instead of being
+                        // dropped as a false duplicate. new_last_sequence matches the value
+                        // validate_sequence would have stored (base + count - 1).
+                        if let Some(meta) = producer_metadata {
+                            if meta.producer_id >= 0 {
+                                let new_last_sequence =
+                                    meta.base_sequence + records.len() as i32 - 1;
+                                if let Err(e) = store.record_producer_sequence(
+                                    meta.producer_id,
+                                    topic_id,
+                                    partition_index,
+                                    new_last_sequence,
+                                ) {
+                                    crate::pg_warning!(
+                                        "Failed to record producer sequence (topic_id={}, partition={}): {}",
+                                        topic_id,
+                                        partition_index,
+                                        e
+                                    );
+                                }
+                            }
+                        }
                     }
                     Err(e) => {
                         // Use typed error's Kafka error code for proper protocol response
