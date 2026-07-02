@@ -64,6 +64,27 @@ pub fn handle_join_group(
         client_id
     );
 
+    // RV-10: reject a session_timeout_ms outside the broker's accepted range with
+    // INVALID_SESSION_TIMEOUT before touching group state, matching Kafka. This
+    // prevents a hostile client from pinning a member alive far beyond any real
+    // heartbeat cadence (blocking rebalances for the whole group) or requesting a
+    // sub-second timeout that thrashes the group. Enforced here at the request
+    // boundary so the coordinator core stays free to drive expiry with tiny
+    // timeouts in unit tests.
+    let session_timeout_range = crate::kafka::coordinator::MIN_SESSION_TIMEOUT_MS
+        ..=crate::kafka::coordinator::MAX_SESSION_TIMEOUT_MS;
+    if !session_timeout_range.contains(&session_timeout_ms) {
+        return Err(crate::kafka::error::KafkaError::Protocol {
+            code: crate::kafka::constants::ERROR_INVALID_SESSION_TIMEOUT,
+            message: format!(
+                "session_timeout_ms {} outside accepted range [{}, {}]",
+                session_timeout_ms,
+                crate::kafka::coordinator::MIN_SESSION_TIMEOUT_MS,
+                crate::kafka::coordinator::MAX_SESSION_TIMEOUT_MS
+            ),
+        });
+    }
+
     // Convert protocols to coordinator format
     let coord_protocols: Vec<(String, Vec<u8>)> = protocols
         .into_iter()

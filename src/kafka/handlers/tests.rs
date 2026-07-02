@@ -717,6 +717,58 @@ mod tests {
     }
 
     #[test]
+    fn test_handle_join_group_rejects_out_of_bounds_session_timeout() {
+        // RV-10: a session_timeout_ms outside the accepted range is rejected with
+        // INVALID_SESSION_TIMEOUT before any group state is created; the Kafka
+        // minimum (6s) is accepted.
+        let mock = MockKafkaStore::new();
+        let coord = create_test_coordinator();
+        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(&mock, &coord, &broker, 1, Compression::None);
+
+        // Sub-second timeout → rejected (fail-before: this used to be admitted).
+        let too_small = coordinator::handle_join_group(
+            &ctx,
+            "g".to_string(),
+            "".to_string(),
+            "c".to_string(),
+            100,
+            60000,
+            "consumer".to_string(),
+            create_test_protocol(),
+        );
+        let small_code = too_small.unwrap_err().to_kafka_error_code();
+        assert_eq!(small_code, ERROR_INVALID_SESSION_TIMEOUT);
+
+        // Multi-week timeout → rejected.
+        let too_large = coordinator::handle_join_group(
+            &ctx,
+            "g".to_string(),
+            "".to_string(),
+            "c".to_string(),
+            i32::MAX,
+            60000,
+            "consumer".to_string(),
+            create_test_protocol(),
+        );
+        let large_code = too_large.unwrap_err().to_kafka_error_code();
+        assert_eq!(large_code, ERROR_INVALID_SESSION_TIMEOUT);
+
+        // The Kafka minimum (6s) is within range and admitted.
+        let ok = coordinator::handle_join_group(
+            &ctx,
+            "g2".to_string(),
+            "".to_string(),
+            "c".to_string(),
+            6000,
+            60000,
+            "consumer".to_string(),
+            create_test_protocol(),
+        );
+        assert!(ok.is_ok());
+    }
+
+    #[test]
     fn test_handle_join_group_second_member_not_leader() {
         let mock = MockKafkaStore::new();
         let coord = create_test_coordinator();
