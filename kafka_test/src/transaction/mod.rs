@@ -25,6 +25,7 @@ pub use basic::{
 };
 pub use eos::test_txn_offset_commit;
 pub use isolation::{
-    test_read_committed_after_commit, test_read_committed_filters_pending,
+    test_read_committed_after_commit, test_read_committed_clamped_to_lso,
+    test_read_committed_filters_pending, test_reinit_aborts_in_flight_transaction,
     test_read_uncommitted_sees_pending,
 };

@@ -402,3 +402,161 @@ pub async fn test_read_committed_after_commit() -> TestResult {
 
     Ok(())
 }
+
+/// RV-2 regression: InitProducerId (producer re-init) must abort any transaction
+/// still in flight for the same `transactional_id` — the canonical producer
+/// crash-restart path. Before the fix the previous epoch's `pending` records were
+/// stranded forever (nothing reclaimed them; `get_last_stable_offset` pinned the
+/// LSO = a hanging transaction). After the fix they are marked `aborted`.
+pub async fn test_reinit_aborts_in_flight_transaction() -> TestResult {
+    println!("=== Test: Re-init Aborts In-Flight Transaction (RV-2) ===\n");
+
+    let txn_id = format!("txn-reinit-{}", Uuid::new_v4());
+    let topic = format!("txn-reinit-test-{}", Uuid::new_v4());
+    let client = create_db_client().await?;
+
+    // Producer 1: begin a transaction and produce a record, but do NOT commit.
+    let producer1 = create_transactional_producer(&txn_id)?;
+    producer1.init_transactions(Duration::from_secs(10))?;
+    producer1.begin_transaction()?;
+    let (_partition, offset) = producer1
+        .send(
+            FutureRecord::to(&topic).payload("in-flight").key("k"),
+            Duration::from_secs(5),
+        )
+        .await
+        .map_err(|(e, _)| e)?;
+    println!("  Producer 1 produced pending record at offset {}", offset);
+
+    let topic_id: i32 = client
+        .query_one("SELECT id FROM kafka.topics WHERE name = $1", &[&topic])
+        .await?
+        .get(0);
+    let pending: Option<String> = client
+        .query_one(
+            "SELECT txn_state FROM kafka.messages WHERE topic_id = $1 AND partition_offset = $2",
+            &[&topic_id, &offset],
+        )
+        .await?
+        .get(0);
+    assert_eq!(
+        pending,
+        Some("pending".to_string()),
+        "record should start pending"
+    );
+
+    // Producer 2: re-init the SAME transactional_id (crash-restart). This bumps the
+    // epoch and must abort producer 1's in-flight records.
+    println!("\n  Producer 2 re-initializes the same transactional_id...");
+    let producer2 = create_transactional_producer(&txn_id)?;
+    producer2.init_transactions(Duration::from_secs(10))?;
+
+    // Fresh connection to observe the committed abort.
+    let client2 = create_db_client().await?;
+    let after: Option<String> = client2
+        .query_one(
+            "SELECT txn_state FROM kafka.messages WHERE topic_id = $1 AND partition_offset = $2",
+            &[&topic_id, &offset],
+        )
+        .await?
+        .get(0);
+    println!("  After re-init: txn_state = {:?}", after);
+    assert_eq!(
+        after,
+        Some("aborted".to_string()),
+        "re-init must abort the stranded in-flight record (RV-2), not leave it pending"
+    );
+
+    // The LSO is no longer pinned: no pending rows remain for this topic.
+    let pending_count: i64 = client2
+        .query_one(
+            "SELECT COUNT(*) FROM kafka.messages WHERE topic_id = $1 AND txn_state = 'pending'",
+            &[&topic_id],
+        )
+        .await?
+        .get(0);
+    assert_eq!(
+        pending_count, 0,
+        "no pending records should remain after re-init"
+    );
+
+    println!("\nRe-init aborts in-flight transaction test PASSED\n");
+    Ok(())
+}
+
+/// RV-4 regression: a read_committed consumer must not receive a committed record
+/// at or above the LSO (the lowest pending offset). Before the fix an interleaved
+/// higher-offset committed txn was returned while a lower-offset txn was still
+/// pending, so the consumer advanced past the pending offset and lost it on commit.
+pub async fn test_read_committed_clamped_to_lso() -> TestResult {
+    println!("=== Test: Read Committed Clamped To LSO (RV-4) ===\n");
+
+    let topic = format!("txn-lso-clamp-test-{}", Uuid::new_v4());
+    let txn_a = format!("txn-lso-a-{}", Uuid::new_v4());
+    let txn_b = format!("txn-lso-b-{}", Uuid::new_v4());
+    let group_id = format!("group-lso-{}", Uuid::new_v4());
+
+    // Producer A: produce a low-offset record on partition 0, leave it PENDING.
+    let producer_a = create_transactional_producer(&txn_a)?;
+    producer_a.init_transactions(Duration::from_secs(10))?;
+    producer_a.begin_transaction()?;
+    let (partition, offset_a) = producer_a
+        .send(
+            FutureRecord::to(&topic)
+                .payload("A-pending")
+                .key("a")
+                .partition(0),
+            Duration::from_secs(5),
+        )
+        .await
+        .map_err(|(e, _)| e)?;
+    println!("  Producer A pending at offset {}", offset_a);
+
+    // Producer B: produce a higher-offset record on the same partition and COMMIT.
+    let producer_b = create_transactional_producer(&txn_b)?;
+    producer_b.init_transactions(Duration::from_secs(10))?;
+    producer_b.begin_transaction()?;
+    let (_p, offset_b) = producer_b
+        .send(
+            FutureRecord::to(&topic)
+                .payload("B-committed")
+                .key("b")
+                .partition(0),
+            Duration::from_secs(5),
+        )
+        .await
+        .map_err(|(e, _)| e)?;
+    producer_b.commit_transaction(Duration::from_secs(10))?;
+    println!("  Producer B committed at offset {}", offset_b);
+    assert!(
+        offset_b > offset_a,
+        "B must be at a higher offset than the pending A"
+    );
+
+    // A read_committed consumer must see NOTHING: B is committed but sits at an
+    // offset >= LSO (= A's pending offset), so it must be withheld until A resolves.
+    let consumer: BaseConsumer = create_read_committed_consumer(&group_id)?;
+    let mut tpl = TopicPartitionList::new();
+    tpl.add_partition_offset(&topic, partition, rdkafka::Offset::Beginning)?;
+    consumer.assign(&tpl)?;
+
+    let mut received = Vec::new();
+    for _ in 0..10 {
+        if let Some(Ok(msg)) = consumer.poll(Duration::from_millis(200)) {
+            received.push(msg.offset());
+        }
+    }
+    println!("  read_committed received offsets: {:?}", received);
+    assert!(
+        received.is_empty(),
+        "read_committed must not deliver a committed record >= LSO while a lower \
+         offset is pending (RV-4); got {:?}",
+        received
+    );
+
+    // Clean up: abort A.
+    producer_a.abort_transaction(Duration::from_secs(10))?;
+
+    println!("\nRead committed clamped to LSO test PASSED\n");
+    Ok(())
+}

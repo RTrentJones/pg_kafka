@@ -227,7 +227,9 @@ use kafka_test::{
     test_protocol_request_pipelining,
     test_rapid_rebalance_cycles,
     test_read_committed_after_commit,
+    test_read_committed_clamped_to_lso,
     test_read_committed_filters_pending,
+    test_reinit_aborts_in_flight_transaction,
     test_read_uncommitted_sees_pending,
     test_rebalance_after_leave,
     test_rebalance_mixed_timeout_values,
@@ -1237,6 +1239,18 @@ fn get_all_tests() -> Vec<TestDef> {
             category: "transaction",
             name: "test_read_committed_after_commit",
             test_fn: wrap_test!(test_read_committed_after_commit),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "transaction",
+            name: "test_reinit_aborts_in_flight_transaction",
+            test_fn: wrap_test!(test_reinit_aborts_in_flight_transaction),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "transaction",
+            name: "test_read_committed_clamped_to_lso",
+            test_fn: wrap_test!(test_read_committed_clamped_to_lso),
             parallel_safe: true,
         },
         TestDef {

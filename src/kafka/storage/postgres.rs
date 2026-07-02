@@ -967,6 +967,27 @@ impl KafkaStore for PostgresStore {
                 // Existing transactional producer - bump epoch (fences old producer)
                 let row = existing.first();
                 let producer_id: i64 = row.get_by_name("producer_id")?.unwrap_or(0);
+                let old_epoch: i16 = row.get_by_name("epoch")?.unwrap_or(0);
+
+                // RV-2: InitProducerId must abort any transaction still in flight for this
+                // transactional_id (the canonical producer crash-restart path). Otherwise the
+                // previous epoch's `pending` records are stranded forever — commit/abort filter
+                // on the new epoch and require state='Ongoing', the timeout sweep scans
+                // state='Ongoing', and cleanup only touches 'aborted' — so nothing reclaims
+                // them and get_last_stable_offset (MIN pending offset) pins the LSO permanently
+                // (a hanging transaction). Abort the old-epoch pending records here, before the
+                // bump. Harmless (matches nothing) when no transaction was in flight.
+                client.update(
+                    "UPDATE kafka.messages SET txn_state = 'aborted'
+                     WHERE producer_id = $1 AND producer_epoch = $2 AND txn_state = 'pending'",
+                    None,
+                    &[producer_id.into(), old_epoch.into()],
+                )?;
+                client.update(
+                    "DELETE FROM kafka.txn_pending_offsets WHERE transactional_id = $1",
+                    None,
+                    &[transactional_id.into()],
+                )?;
 
                 let table = client.update(
                     "UPDATE kafka.producer_ids
@@ -1601,7 +1622,14 @@ impl KafkaStore for PostgresStore {
                      LIMIT $4"
                 }
                 IsolationLevel::ReadCommitted => {
-                    // Filter out pending and aborted records, with cumulative byte tracking
+                    // Filter out pending and aborted records, with cumulative byte tracking.
+                    // RV-4: also clamp to below the Last Stable Offset (the lowest pending
+                    // offset). A committed record at an offset >= a still-open lower-offset
+                    // transaction must NOT be returned to a read_committed consumer — otherwise
+                    // it advances past the pending offset and never re-reads it once that txn
+                    // commits (lost / reordered delivery). When nothing is pending the subquery
+                    // is NULL, so the COALESCE default (partition_offset + 1) makes the bound a
+                    // no-op and every committed record is returned.
                     "SELECT partition_offset, key, value,
                             CASE WHEN timestamp_ms >= 0 THEN timestamp_ms ELSE (EXTRACT(EPOCH FROM created_at) * 1000)::bigint END as timestamp_ms,
                             SUM(COALESCE(pg_column_size(key), 0) + COALESCE(pg_column_size(value), 0) + 64)
@@ -1609,6 +1637,11 @@ impl KafkaStore for PostgresStore {
                      FROM kafka.messages
                      WHERE topic_id = $1 AND partition_id = $2 AND partition_offset >= $3
                        AND (txn_state IS NULL)
+                       AND partition_offset < COALESCE(
+                           (SELECT MIN(m2.partition_offset) FROM kafka.messages m2
+                            WHERE m2.topic_id = $1 AND m2.partition_id = $2
+                              AND m2.txn_state = 'pending'),
+                           partition_offset + 1)
                      ORDER BY partition_offset
                      LIMIT $4"
                 }
