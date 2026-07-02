@@ -201,6 +201,7 @@ pub use shadow::{
     test_dual_write_external_down,
     test_dual_write_sync,
     test_external_only_fallback,
+    test_external_primary_dead_letter_serves_local,
     test_external_only_mode,
     test_fifty_percent_forwarding,
     test_hundred_percent_forwarding,

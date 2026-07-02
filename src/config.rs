@@ -289,6 +289,11 @@ static SHADOW_DEFAULT_SYNC_MODE: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(None);
 static SHADOW_METRICS_ENABLED: GucSetting<bool> =
     GucSetting::<bool>::new(DEFAULT_SHADOW_METRICS_ENABLED);
+// RV-6: when true, external-primary topics keep local reads fully suppressed even
+// after a forward is dead-lettered (external-only-strict, accept the loss). When
+// false (default), a dead-lettered external-primary topic falls back to local reads
+// so a record is never readable nowhere.
+pub static SHADOW_EXTERNAL_PRIMARY_STRICT: GucSetting<bool> = GucSetting::<bool>::new(false);
 static SHADOW_OTEL_ENDPOINT: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 // License key for Shadow Mode (Commercial License)
 static SHADOW_LICENSE_KEY: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
@@ -525,6 +530,15 @@ pub fn init() {
         c"Enable shadow mode metrics",
         c"When enabled, tracks forwarding statistics in kafka.shadow_metrics table. Default: true.",
         &SHADOW_METRICS_ENABLED,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_bool_guc(
+        c"pg_kafka.shadow_external_primary_strict",
+        c"Keep external-primary topics fully read-suppressed even when a forward is dead-lettered",
+        c"When true, external-primary topics never fall back to local reads (external-only-strict; a dead-lettered record is accepted as lost). When false (default), a dead-lettered external-primary topic serves the record locally so it is never readable nowhere (RV-6).",
+        &SHADOW_EXTERNAL_PRIMARY_STRICT,
         GucContext::Suset,
         GucFlags::default(),
     );

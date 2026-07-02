@@ -38,7 +38,10 @@ pub use dialup::{
     test_dialup_0_percent, test_dialup_100_percent, test_dialup_10_percent, test_dialup_25_percent,
     test_dialup_50_percent, test_dialup_75_percent,
 };
-pub use error_handling::{test_dual_write_external_down, test_external_only_fallback};
+pub use error_handling::{
+    test_dual_write_external_down, test_external_only_fallback,
+    test_external_primary_dead_letter_serves_local,
+};
 pub use percentage_routing::{
     test_deterministic_routing, test_fifty_percent_forwarding, test_hundred_percent_forwarding,
     test_zero_percent_forwarding,

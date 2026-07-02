@@ -2,9 +2,11 @@
 //!
 //! Tests for external Kafka down/recovery scenarios and fallback behavior.
 
-use crate::common::{create_producer, TestResult};
+use crate::common::{create_producer, create_read_committed_consumer, TestResult};
 use crate::setup::TestContext;
+use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::producer::FutureRecord;
+use rdkafka::TopicPartitionList;
 use std::time::Duration;
 
 use super::assertions::assert_local_message_count;
@@ -158,5 +160,93 @@ pub async fn test_external_only_fallback() -> TestResult {
     // 4. CLEANUP
     ctx.cleanup().await?;
     println!("✅ Test PASSED: ExternalOnly Fallback\n");
+    Ok(())
+}
+
+/// RV-6 regression: a dead-lettered external-primary forward must fall back to local
+/// reads (default), so a record produced to an external-primary topic is never
+/// "readable nowhere". A healthy external-primary topic suppresses local reads; once
+/// a forward exhausts the retry cap (never delivered externally) the record is served
+/// locally instead.
+pub async fn test_external_primary_dead_letter_serves_local() -> TestResult {
+    println!("=== Test: External-Primary Dead-Letter Serves Local (RV-6) ===\n");
+
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("ext-primary-deadletter").await;
+
+    enable_shadow_mode(
+        ctx.db(),
+        &topic,
+        &ShadowTopicConfig {
+            mode: ShadowMode::Shadow,
+            forward_percentage: 100,
+            external_topic_name: None,
+            sync_mode: SyncMode::Async,
+            write_mode: WriteMode::ExternalOnly,
+        },
+    )
+    .await?;
+
+    // Produce a record. External-primary always writes locally (only reads suppress).
+    let producer = create_producer()?;
+    producer
+        .send(
+            FutureRecord::to(&topic).key("k").payload("deadletter"),
+            Duration::from_secs(5),
+        )
+        .await
+        .map_err(|(e, _)| e)?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_local_message_count(ctx.db(), &topic, 1).await?;
+
+    let topic_id: i32 = ctx
+        .db()
+        .query_one("SELECT id FROM kafka.topics WHERE name = $1", &[&topic])
+        .await?
+        .get(0);
+
+    // Control: while the forward is not dead-lettered, an external-primary topic
+    // suppresses local reads (the consumer sees nothing).
+    let consumer: BaseConsumer =
+        create_read_committed_consumer(&format!("g-deadletter-{}", topic))?;
+    let mut tpl = TopicPartitionList::new();
+    tpl.add_partition_offset(&topic, 0, rdkafka::Offset::Beginning)?;
+    consumer.assign(&tpl)?;
+    let mut suppressed = true;
+    for _ in 0..4 {
+        if let Some(Ok(_)) = consumer.poll(Duration::from_millis(250)) {
+            suppressed = false;
+            break;
+        }
+    }
+    assert!(
+        suppressed,
+        "a healthy external-primary topic must suppress local reads"
+    );
+
+    // Force the forward into the dead-letter state (retry cap exhausted, external
+    // delivery abandoned): retry_count >= MAX_FORWARD_RETRIES (10), still un-forwarded.
+    ctx.db()
+        .execute(
+            "UPDATE kafka.shadow_tracking SET external_offset = NULL, retry_count = 10 WHERE topic_id = $1",
+            &[&topic_id],
+        )
+        .await?;
+
+    // Now the record must be served locally (reads un-suppressed).
+    let mut received = false;
+    for _ in 0..20 {
+        if let Some(Ok(_)) = consumer.poll(Duration::from_millis(300)) {
+            received = true;
+            break;
+        }
+    }
+    assert!(
+        received,
+        "a dead-lettered external-primary record must be served locally (RV-6)"
+    );
+
+    ctx.cleanup().await?;
+    println!("✅ External-primary dead-letter serves local test PASSED\n");
     Ok(())
 }
