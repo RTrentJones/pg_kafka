@@ -358,6 +358,41 @@ impl<S: KafkaStore> ShadowStore<S> {
             .unwrap_or(false)
     }
 
+    /// RV-6: whether to suppress local reads for a topic.
+    ///
+    /// A healthy external-primary topic suppresses local reads so consumers cut over
+    /// to the external broker. But a forward that exhausts the retry cap is
+    /// dead-lettered — present locally, never external. To avoid silent non-delivery
+    /// ("readable nowhere"), once a topic has any dead-lettered forward we STOP
+    /// suppressing and serve the record locally. `pg_kafka.shadow_external_primary_strict`
+    /// keeps full suppression (external-only-strict, the record is accepted as lost).
+    fn suppress_external_primary_reads(&self, topic_id: i32) -> bool {
+        if !self.is_external_primary(topic_id) {
+            return false;
+        }
+        if crate::config::SHADOW_EXTERNAL_PRIMARY_STRICT.get() {
+            return true;
+        }
+        !self.topic_has_dead_letters(topic_id)
+    }
+
+    /// True if the topic has a forward that exhausted the retry cap and will never be
+    /// delivered externally (`external_offset` still NULL, `retry_count >= cap`).
+    fn topic_has_dead_letters(&self, topic_id: i32) -> bool {
+        use pgrx::prelude::*;
+        let result: Result<bool> = Spi::connect(|client| {
+            let table = client.select(
+                "SELECT 1 FROM kafka.shadow_tracking \
+                 WHERE topic_id = $1 AND external_offset IS NULL AND retry_count >= $2 \
+                 LIMIT 1",
+                Some(1),
+                &[topic_id.into(), MAX_FORWARD_RETRIES.into()],
+            )?;
+            Ok(!table.is_empty())
+        });
+        result.unwrap_or(false)
+    }
+
     /// Force a re-check of primary status (SH-2).
     ///
     /// `is_primary()` caches its result for the life of the process, which is
@@ -1030,7 +1065,7 @@ impl<S: KafkaStore> ShadowStore<S> {
                              SET retry_count = retry_count + 1, error_message = $4 \
                              WHERE topic_id = $1 AND partition_id = $2 AND local_offset = $3 \
                                AND external_offset IS NULL \
-                             RETURNING topic_id, partition_id \
+                             RETURNING topic_id, partition_id, retry_count \
                          ), \
                          bumped AS ( \
                              INSERT INTO kafka.shadow_metrics (topic_id, partition_id, messages_failed) \
@@ -1038,7 +1073,7 @@ impl<S: KafkaStore> ShadowStore<S> {
                              ON CONFLICT (topic_id, partition_id) DO UPDATE SET \
                                 messages_failed = kafka.shadow_metrics.messages_failed + 1 \
                          ) \
-                         SELECT 1 FROM failed",
+                         SELECT retry_count FROM failed",
                         None,
                         &[
                             ack.topic_id.into(),
@@ -1047,7 +1082,25 @@ impl<S: KafkaStore> ShadowStore<S> {
                             msg.clone().into(),
                         ],
                     )?;
-                    table.into_iter().count() > 0
+                    let mut transitioned = false;
+                    for row in table {
+                        transitioned = true;
+                        let retry_count: i32 = row.get_by_name("retry_count")?.unwrap_or(0);
+                        // RV-6: at the retry cap the poll stops retrying this row (it is
+                        // dead-lettered). For an external-primary topic the record then
+                        // falls back to local reads unless strict — log loudly.
+                        if retry_count as i64 >= MAX_FORWARD_RETRIES {
+                            tracing::warn!(
+                                "shadow forward dead-lettered after {} attempts (topic_id={}, partition_id={}, local_offset={}): {} — external-primary reads for this topic fall back to local unless pg_kafka.shadow_external_primary_strict is set",
+                                retry_count,
+                                ack.topic_id,
+                                ack.partition_id,
+                                ack.local_offset,
+                                msg
+                            );
+                        }
+                    }
+                    transitioned
                 }
             };
             Ok(transitioned)
@@ -1323,7 +1376,7 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
         // SH-6: external-primary topics suppress local reads so consumers cut
         // over to the external broker. The data is still stored locally (for
         // durability / replay) — it is just not served from here.
-        if self.is_external_primary(topic_id) {
+        if self.suppress_external_primary_reads(topic_id) {
             return Ok(Vec::new());
         }
         self.inner
@@ -1334,14 +1387,14 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
         // SH-6: report an empty partition for external-primary topics so a
         // consumer pointed at pg_kafka sees nothing to read and uses the
         // external broker instead.
-        if self.is_external_primary(topic_id) {
+        if self.suppress_external_primary_reads(topic_id) {
             return Ok(0);
         }
         self.inner.get_high_watermark(topic_id, partition_id)
     }
 
     fn get_earliest_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64> {
-        if self.is_external_primary(topic_id) {
+        if self.suppress_external_primary_reads(topic_id) {
             return Ok(0);
         }
         self.inner.get_earliest_offset(topic_id, partition_id)
@@ -1353,7 +1406,7 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
         partition_id: i32,
         timestamp_ms: i64,
     ) -> Result<Option<(i64, i64)>> {
-        if self.is_external_primary(topic_id) {
+        if self.suppress_external_primary_reads(topic_id) {
             return Ok(None);
         }
         self.inner
@@ -1704,7 +1757,7 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
         isolation_level: IsolationLevel,
     ) -> Result<Vec<FetchedMessage>> {
         // SH-6: external-primary read suppression (see fetch_records).
-        if self.is_external_primary(topic_id) {
+        if self.suppress_external_primary_reads(topic_id) {
             return Ok(Vec::new());
         }
         self.inner.fetch_records_with_isolation(
@@ -1717,7 +1770,7 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
     }
 
     fn get_last_stable_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64> {
-        if self.is_external_primary(topic_id) {
+        if self.suppress_external_primary_reads(topic_id) {
             return Ok(0);
         }
         self.inner.get_last_stable_offset(topic_id, partition_id)
