@@ -422,6 +422,11 @@ pub enum KafkaRequest {
         producer_id: i64,
         /// Producer epoch
         producer_epoch: i16,
+        /// Consumer-group generation (KIP-447 `generation_id_or_member_epoch`);
+        /// -1 for a simple consumer / pre-v3 client (exempt from group fencing).
+        generation_id: i32,
+        /// Consumer-group member id (empty for a simple consumer / pre-v3 client).
+        member_id: String,
         /// Topics with partition offsets
         topics: TxnOffsetCommitTopics,
         /// Channel to send the response back

@@ -122,17 +122,26 @@ pub fn dispatch_produce<H, N>(
     H: FnOnce() -> Result<ProduceResponse, KafkaError>,
     N: FnOnce(&ProduceResponse),
 {
+    // RV-3: run the `on_success` side-effect (waking long-poll consumers, which
+    // issues its own SPI reads) INSIDE the guarded handler, not in `wrap_response`
+    // — `dispatch_response` runs `wrap_response` *outside* its `catch_unwind`.
+    // Otherwise a Postgres ERROR in the notification path surfaces as an unguarded
+    // pgrx panic: no response is sent (the RA-3 client hang, reopened) and the
+    // already-successful produce is rolled back. Inside the guard, such a panic
+    // instead replies UNKNOWN_SERVER_ERROR and resumes (rollback; the produce is
+    // retryable), and `wrap_response` stays pure enum construction.
     dispatch_response(
         "Produce",
         response_tx,
-        handler,
-        move |response| {
+        move || {
+            let response = handler()?;
             on_success(&response);
-            KafkaResponse::Produce {
-                correlation_id,
-                api_version,
-                response,
-            }
+            Ok(response)
+        },
+        move |response| KafkaResponse::Produce {
+            correlation_id,
+            api_version,
+            response,
         },
         move |error_code| KafkaResponse::Produce {
             correlation_id,
@@ -337,6 +346,44 @@ mod tests {
             } => {
                 assert_eq!(correlation_id, 7);
                 assert_eq!(api_version, 9);
+            }
+            _ => panic!("expected a Produce response"),
+        }
+    }
+
+    #[test]
+    fn test_dispatch_produce_panic_in_on_success_replies_and_resumes() {
+        // RV-3: a panic in the on_success side-effect (e.g. a Postgres ERROR in the
+        // long-poll notification's SPI reads) must be caught like a handler panic —
+        // reply a Produce error (no client hang) AND re-raise (subtransaction
+        // rollback). Before the fix on_success ran outside the catch_unwind, so its
+        // panic escaped unguarded: no response was sent and the acked produce rolled
+        // back silently.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            dispatch_produce(
+                tx,
+                11,
+                4,
+                || Ok(crate::kafka::response_builders::build_produce_error_response(0)),
+                |_resp| panic!("notify boom"),
+            );
+        }));
+        assert!(
+            outcome.is_err(),
+            "an on_success panic must re-raise so the subtransaction rolls back"
+        );
+        match rx
+            .try_recv()
+            .expect("a Produce error response must be sent before resume")
+        {
+            KafkaResponse::Produce {
+                correlation_id,
+                api_version,
+                ..
+            } => {
+                assert_eq!(correlation_id, 11);
+                assert_eq!(api_version, 4);
             }
             _ => panic!("expected a Produce response"),
         }

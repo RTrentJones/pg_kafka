@@ -1771,6 +1771,8 @@ pub fn process_request(
             group_id,
             producer_id,
             producer_epoch,
+            generation_id,
+            member_id,
             topics,
             response_tx,
             ..
@@ -1793,6 +1795,8 @@ pub fn process_request(
                         producer_id,
                         producer_epoch,
                         &group_id,
+                        generation_id,
+                        &member_id,
                         topics,
                     )
                 },

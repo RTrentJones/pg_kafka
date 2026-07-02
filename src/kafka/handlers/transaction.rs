@@ -235,15 +235,53 @@ pub fn handle_end_txn(
 ///
 /// # Returns
 /// TxnOffsetCommitResponse with per-partition error codes
+#[allow(clippy::too_many_arguments)]
 pub fn handle_txn_offset_commit(
     ctx: &HandlerContext,
     transactional_id: &str,
     producer_id: i64,
     producer_epoch: i16,
     group_id: &str,
+    generation_id: i32,
+    member_id: &str,
     topics: TxnOffsetCommitTopics,
 ) -> Result<TxnOffsetCommitResponse> {
     let store = ctx.store;
+
+    // RV-5: fence a zombie EOS consumer. A member committing offsets inside a
+    // transaction with a stale group generation (or an unknown member id) must be
+    // rejected with ILLEGAL_GENERATION / UNKNOWN_MEMBER_ID — the same fence RA-5
+    // added to the non-transactional OffsetCommit path. The producer-epoch fence
+    // alone does not cover KIP-447 (the new owner uses a *different*
+    // transactional_id, so the zombie keeps a valid epoch). Simple consumers /
+    // pre-v3 clients (generation -1) are exempt inside validate_commit.
+    if let Err(e) = ctx
+        .coordinator
+        .validate_commit(group_id, member_id, generation_id)
+    {
+        let error_code = e.to_kafka_error_code();
+        let mut response = TxnOffsetCommitResponse::default();
+        response.topics = topics
+            .into_iter()
+            .map(|(topic_name, partitions)| {
+                let partition_results = partitions
+                    .into_iter()
+                    .map(|(partition_id, _offset, _metadata)| {
+                        let mut p = TxnOffsetCommitResponsePartition::default();
+                        p.partition_index = partition_id;
+                        p.error_code = error_code;
+                        p
+                    })
+                    .collect();
+                let mut t = TxnOffsetCommitResponseTopic::default();
+                t.name = TopicName(StrBytes::from_string(topic_name));
+                t.partitions = partition_results;
+                t
+            })
+            .collect();
+        return Ok(response);
+    }
+
     // Validate the transaction state
     store.validate_transaction(transactional_id, producer_id, producer_epoch)?;
 
@@ -354,5 +392,35 @@ mod tests {
             crate::kafka::constants::ERROR_UNKNOWN_TOPIC_OR_PARTITION
         );
         assert_eq!(zero.partition_error_code, ERROR_NONE);
+    }
+
+    #[test]
+    fn test_txn_offset_commit_fences_stale_generation() {
+        // RV-5: a TxnOffsetCommit carrying a real group generation (>= 0) for an
+        // unknown / stale group membership must be fenced with UNKNOWN_MEMBER_ID,
+        // not silently accepted. The producer-epoch fence alone does not cover this
+        // (KIP-447: the new owner uses a different transactional_id). The fence
+        // returns before any store access, so the mock needs no expectations.
+        let store = MockKafkaStore::new();
+        let coordinator = crate::kafka::GroupCoordinator::new();
+        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(
+            &store,
+            &coordinator,
+            &broker,
+            1,
+            kafka_protocol::records::Compression::None,
+        );
+
+        let topics = vec![("t".to_string(), vec![(0i32, 100i64, None)])];
+        let resp =
+            handle_txn_offset_commit(&ctx, "txn-1", 1, 0, "g", 5, "zombie-member", topics).unwrap();
+
+        let partition = &resp.topics[0].partitions[0];
+        assert_eq!(
+            partition.error_code,
+            crate::kafka::constants::ERROR_UNKNOWN_MEMBER_ID,
+            "a stale/unknown-group txn offset commit must be fenced"
+        );
     }
 }
