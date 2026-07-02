@@ -164,10 +164,11 @@ pub async fn test_metadata_refresh_after_create() -> TestResult {
         has_new_topic,
         "New topic should appear in refreshed metadata"
     );
-    assert!(
-        refreshed_count >= initial_count,
-        "Topic count should not decrease"
-    );
+    // NOTE: we intentionally do NOT assert refreshed_count >= initial_count. The
+    // metadata query returns the whole broker's topic list, so a concurrently-run
+    // test deleting its topics can make the global count decrease between the two
+    // snapshots — that is not a bug in metadata refresh. `has_new_topic` above is
+    // the meaningful assertion.
 
     println!("✅ New topic found in refreshed metadata\n");
     println!("✅ Test PASSED\n");
