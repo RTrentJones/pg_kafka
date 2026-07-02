@@ -43,6 +43,16 @@ const MAX_MEMBERS_PER_GROUP: usize = 1000;
 /// Default rebalance timeout (5 minutes)
 const DEFAULT_REBALANCE_TIMEOUT_MS: u64 = 300_000;
 
+/// RV-10: accepted range for a JoinGroup `session_timeout_ms`, matching Kafka's
+/// broker defaults (`group.min.session.timeout.ms` = 6s, `group.max.session.timeout.ms`
+/// = 30 min). A request outside this range is rejected with `INVALID_SESSION_TIMEOUT`
+/// so a hostile or misconfigured client cannot pin a member alive for weeks (blocking
+/// rebalances) or set a sub-second timeout that thrashes the group. Enforced at the
+/// request boundary (the JoinGroup handler), not in the group-state core, so unit tests
+/// can still drive expiry with tiny timeouts.
+pub const MIN_SESSION_TIMEOUT_MS: i32 = 6_000;
+pub const MAX_SESSION_TIMEOUT_MS: i32 = 1_800_000;
+
 // Import conditional logging macros for test isolation
 use crate::pg_log;
 
@@ -675,6 +685,21 @@ impl GroupCoordinator {
 
         if !group.members.contains_key(member_id) {
             return Err(KafkaError::unknown_member(group_id, member_id));
+        }
+
+        // RV-10: fence an OffsetCommit that arrives while the group is rebalancing
+        // with REBALANCE_IN_PROGRESS, matching Heartbeat and Kafka's coordinator.
+        // A commit accepted mid-rebalance could persist an offset for a partition
+        // the member is about to lose, so the client must rejoin and re-fetch its
+        // assignment before committing. Checked after the generation/member fences
+        // so a stale member still gets the more specific ILLEGAL_GENERATION /
+        // UNKNOWN_MEMBER_ID.
+        if group.state == GroupState::PreparingRebalance
+            || group.state == GroupState::CompletingRebalance
+        {
+            return Err(KafkaError::RebalanceInProgress {
+                group_id: group_id.to_string(),
+            });
         }
 
         Ok(())
@@ -1568,6 +1593,18 @@ mod tests {
             )
             .unwrap();
 
+        // Drive the group to Stable (the single leader member assigns itself) so
+        // the current-generation commit below isn't fenced by the RV-10
+        // mid-rebalance guard — this test is about generation/member fencing.
+        coordinator
+            .sync_group(
+                "g".to_string(),
+                member.clone(),
+                generation,
+                vec![(member.clone(), b"a".to_vec())],
+            )
+            .unwrap();
+
         // Current generation + known member → accepted.
         let current = coordinator.validate_commit("g", &member, generation);
         assert!(current.is_ok());
@@ -1590,6 +1627,51 @@ mod tests {
 
         // ...but a simple consumer (generation -1) on an unknown group is still fine.
         assert!(coordinator.validate_commit("other", "", -1).is_ok());
+    }
+
+    #[test]
+    fn test_validate_commit_fenced_during_rebalance() {
+        // RV-10: between JoinGroup and SyncGroup the group is mid-rebalance
+        // (CompletingRebalance). An OffsetCommit at the current generation from a
+        // known member must be fenced with REBALANCE_IN_PROGRESS so the client
+        // rejoins and re-fetches its assignment before committing, rather than
+        // persisting an offset for a partition it may be about to lose.
+        let coordinator = GroupCoordinator::new();
+        let (member, generation, ..) = coordinator
+            .join_group(
+                "g".to_string(),
+                None,
+                "c1".to_string(),
+                "h".to_string(),
+                300_000,
+                300_000,
+                "consumer".to_string(),
+                vec![("range".to_string(), vec![])],
+                None,
+            )
+            .unwrap();
+
+        // Awaiting SyncGroup → fenced (this is the fail-before assertion: without
+        // the guard the commit was accepted mid-rebalance).
+        let during = coordinator.validate_commit("g", &member, generation);
+        assert!(matches!(
+            during,
+            Err(KafkaError::RebalanceInProgress { .. })
+        ));
+
+        // Once SyncGroup completes and the group is Stable, the same commit is
+        // accepted.
+        coordinator
+            .sync_group(
+                "g".to_string(),
+                member.clone(),
+                generation,
+                vec![(member.clone(), b"a".to_vec())],
+            )
+            .unwrap();
+        assert!(coordinator
+            .validate_commit("g", &member, generation)
+            .is_ok());
     }
 
     #[test]

@@ -327,6 +327,10 @@ pub const ERROR_ILLEGAL_GENERATION: i16 = 22;
 /// Unknown member ID
 pub const ERROR_UNKNOWN_MEMBER_ID: i16 = 25;
 
+/// Session timeout not within the broker's accepted range
+/// (`[group.min.session.timeout.ms, group.max.session.timeout.ms]`)
+pub const ERROR_INVALID_SESSION_TIMEOUT: i16 = 26;
+
 /// Rebalance in progress
 pub const ERROR_REBALANCE_IN_PROGRESS: i16 = 27;
 
