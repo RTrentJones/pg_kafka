@@ -112,29 +112,35 @@ pub async fn assert_local_message_count(
     topic_name: &str,
     expected_count: i64,
 ) -> TestResult {
-    let row = db
-        .query_one(
-            r#"
+    // Poll until the local count reaches the expected value rather than asserting
+    // once after a fixed sleep: async forwarding and the produce commit can lag
+    // under CI load, which made the fixed-sleep callers flaky.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+    loop {
+        let row = db
+            .query_one(
+                r#"
         SELECT COUNT(*) as count
         FROM kafka.messages m
         JOIN kafka.topics t ON m.topic_id = t.id
         WHERE t.name = $1
         "#,
-            &[&topic_name],
-        )
-        .await?;
-
-    let count: i64 = row.get(0);
-
-    if count != expected_count {
-        return Err(format!(
-            "Expected {} messages in local DB for topic '{}', found {}",
-            expected_count, topic_name, count
-        )
-        .into());
+                &[&topic_name],
+            )
+            .await?;
+        let count: i64 = row.get(0);
+        if count == expected_count {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "Expected {} messages in local DB for topic '{}', found {} after polling",
+                expected_count, topic_name, count
+            )
+            .into());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
-
-    Ok(())
 }
 
 /// Assert shadow config exists for a topic
