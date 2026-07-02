@@ -111,9 +111,13 @@ impl ShadowProducer {
         client_config.set("compression.type", "none");
 
         // SH-12: idempotent producer. The durable outbox replays a row on any
-        // crash before its ack is recorded (at-least-once), so the forwarding
-        // producer MUST de-duplicate retries to avoid double-delivery to the
-        // external broker. Idempotence requires acks=all, a bounded in-flight
+        // crash before its ack is recorded, so the forwarding producer de-dups
+        // retries to avoid double-delivery to the external broker. Note the
+        // guarantee is bounded: librdkafka idempotence only suppresses duplicates
+        // *within a single producer session* (a stable PID + per-partition
+        // sequence). A replay that crosses a producer restart (new PID) is NOT
+        // recognized as a duplicate, so external delivery is at-least-once, not
+        // exactly-once. Idempotence still requires acks=all, a bounded in-flight
         // window, and retries > 0 — set them explicitly so the config is valid
         // regardless of librdkafka defaults.
         client_config.set("enable.idempotence", "true");

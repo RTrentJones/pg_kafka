@@ -143,7 +143,7 @@ pub const VALID_SECURITY_PROTOCOLS: &[&str] = &["PLAINTEXT", "SASL_PLAINTEXT", "
 pub const VALID_SASL_MECHANISMS: &[&str] = &["PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512"];
 
 /// Global shadow mode configuration from GUCs
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ShadowConfig {
     /// Whether shadow mode is enabled globally
     pub enabled: bool,
@@ -173,6 +173,31 @@ pub struct ShadowConfig {
     pub metrics_enabled: bool,
     /// OpenTelemetry endpoint
     pub otel_endpoint: String,
+}
+
+/// Custom Debug implementation that redacts SASL credentials so a `{:?}` of a
+/// `ShadowConfig` never leaks the external-broker username/password into logs
+/// (RV-10; mirrors the redaction on the global `Config`).
+impl std::fmt::Debug for ShadowConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShadowConfig")
+            .field("enabled", &self.enabled)
+            .field("bootstrap_servers", &self.bootstrap_servers)
+            .field("security_protocol", &self.security_protocol)
+            .field("sasl_mechanism", &self.sasl_mechanism)
+            // REDACT sensitive credentials to prevent log exposure
+            .field("sasl_username", &"[REDACTED]")
+            .field("sasl_password", &"[REDACTED]")
+            .field("ssl_ca_location", &self.ssl_ca_location)
+            .field("batch_size", &self.batch_size)
+            .field("linger_ms", &self.linger_ms)
+            .field("retry_backoff_ms", &self.retry_backoff_ms)
+            .field("max_retries", &self.max_retries)
+            .field("default_sync_mode", &self.default_sync_mode)
+            .field("metrics_enabled", &self.metrics_enabled)
+            .field("otel_endpoint", &self.otel_endpoint)
+            .finish()
+    }
 }
 
 impl ShadowConfig {
@@ -762,5 +787,34 @@ mod tests {
             ..Default::default()
         };
         assert!(config.validate().is_ok());
+    }
+
+    // RV-10: a `{:?}` of a ShadowConfig must never expose the SASL credentials.
+    #[test]
+    fn test_debug_redacts_sasl_credentials() {
+        let config = ShadowConfig {
+            enabled: true,
+            bootstrap_servers: "broker:9092".to_string(),
+            security_protocol: "SASL_SSL".to_string(),
+            sasl_mechanism: "PLAIN".to_string(),
+            sasl_username: "super-secret-user".to_string(),
+            sasl_password: "super-secret-password".to_string(),
+            ..Default::default()
+        };
+
+        let rendered = format!("{:?}", config);
+
+        // The credentials must not appear in any form.
+        assert!(
+            !rendered.contains("super-secret-password"),
+            "sasl_password leaked into Debug output: {rendered}"
+        );
+        assert!(
+            !rendered.contains("super-secret-user"),
+            "sasl_username leaked into Debug output: {rendered}"
+        );
+        // They must be shown as redacted, and non-sensitive fields still render.
+        assert!(rendered.contains("[REDACTED]"));
+        assert!(rendered.contains("broker:9092"));
     }
 }

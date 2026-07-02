@@ -273,9 +273,11 @@ async fn run_shadow_forwarder(
                 // RA-6: non-blocking send. A blocking `send` here could park this
                 // tokio worker if the ack channel were full (the SEC-4
                 // anti-pattern). On full/closed, drop the ack — the row stays
-                // pending in the outbox and the poll re-forwards it (at-least-once
-                // is preserved), so the only cost is a duplicate the idempotent
-                // producer absorbs.
+                // pending in the outbox and the poll re-forwards it, so the
+                // external topic is at-least-once. The re-forward is a duplicate;
+                // the idempotent producer suppresses it only if it happens within
+                // the same producer session (stable PID) — a duplicate that spans
+                // a producer restart still lands on the external topic.
                 if ack_tx.try_send(ack).is_err() {
                     debug!("Forward ack channel full or closed, dropping ack (row stays pending)");
                 }

@@ -337,7 +337,12 @@ GROUP BY t.id, t.name, sc.mode, sc.forward_percentage, sc.sync_mode, sc.external
 
 -- Grant permissions
 GRANT SELECT ON kafka.shadow_config TO PUBLIC;
-GRANT SELECT ON kafka.shadow_tracking TO PUBLIC;
+-- RV-10 (SEC-8 class): error_message can hold raw external-broker error strings
+-- (authz failures, host/topic names, payload-size limits), so it is withheld from
+-- PUBLIC. Grant only the non-sensitive columns column-by-column instead of the
+-- whole row; the bgworker (table owner) keeps full access to error_message.
+GRANT SELECT (topic_id, partition_id, local_offset, external_offset, forwarded_at, retry_count)
+    ON kafka.shadow_tracking TO PUBLIC;
 GRANT SELECT ON kafka.shadow_metrics TO PUBLIC;
 GRANT SELECT ON kafka.shadow_status TO PUBLIC;
 
