@@ -662,6 +662,17 @@ pub fn validate_sequence(
     base_sequence: i32,
     record_count: i32,
 ) -> SequenceValidation {
+    // RV-12: a negative base_sequence (or record_count) is malformed wire input. It
+    // must not fall through to the Duplicate branch below — for e.g. a fresh
+    // partition (last_sequence = -1) with base_sequence = -1, `batch_last` (-1) is
+    // <= last_sequence, so it would be classified Duplicate, skipped, and acked
+    // success = silent data loss. Reject it as out of order so the client resyncs.
+    if base_sequence < 0 || record_count < 0 {
+        return SequenceValidation::OutOfOrder {
+            expected_sequence: last_sequence.wrapping_add(1),
+        };
+    }
+
     let expected = last_sequence as i64 + 1;
     let base = base_sequence as i64;
     let batch_last = base + (record_count.max(1) as i64) - 1;

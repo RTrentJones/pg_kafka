@@ -2045,9 +2045,17 @@ mod tests {
             vec![(0, 100i64, Some("metadata".to_string()))],
         )];
 
-        let response =
-            transaction::handle_txn_offset_commit(&ctx, "txn-1", 1000, 0, "consumer-group", topics)
-                .unwrap();
+        let response = transaction::handle_txn_offset_commit(
+            &ctx,
+            "txn-1",
+            1000,
+            0,
+            "consumer-group",
+            -1,
+            "",
+            topics,
+        )
+        .unwrap();
 
         assert_eq!(response.topics.len(), 1);
         assert_eq!(response.topics[0].partitions.len(), 1);
@@ -2078,9 +2086,17 @@ mod tests {
             vec![(0, 10i64, None), (1, 20i64, None), (2, 30i64, None)],
         )];
 
-        let response =
-            transaction::handle_txn_offset_commit(&ctx, "txn-1", 1000, 0, "consumer-group", topics)
-                .unwrap();
+        let response = transaction::handle_txn_offset_commit(
+            &ctx,
+            "txn-1",
+            1000,
+            0,
+            "consumer-group",
+            -1,
+            "",
+            topics,
+        )
+        .unwrap();
 
         assert_eq!(response.topics[0].partitions.len(), 3);
         for partition in &response.topics[0].partitions {
@@ -2106,9 +2122,17 @@ mod tests {
 
         let topics = vec![("unknown-topic".to_string(), vec![(0, 100i64, None)])];
 
-        let response =
-            transaction::handle_txn_offset_commit(&ctx, "txn-1", 1000, 0, "consumer-group", topics)
-                .unwrap();
+        let response = transaction::handle_txn_offset_commit(
+            &ctx,
+            "txn-1",
+            1000,
+            0,
+            "consumer-group",
+            -1,
+            "",
+            topics,
+        )
+        .unwrap();
 
         assert_eq!(
             response.topics[0].partitions[0].error_code,
@@ -2133,8 +2157,16 @@ mod tests {
 
         let topics = vec![("test-topic".to_string(), vec![(0, 100i64, None)])];
 
-        let result =
-            transaction::handle_txn_offset_commit(&ctx, "txn-1", 1000, 0, "consumer-group", topics);
+        let result = transaction::handle_txn_offset_commit(
+            &ctx,
+            "txn-1",
+            1000,
+            0,
+            "consumer-group",
+            -1,
+            "",
+            topics,
+        );
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -2157,8 +2189,16 @@ mod tests {
 
         let topics = vec![("test-topic".to_string(), vec![(0, 100i64, None)])];
 
-        let result =
-            transaction::handle_txn_offset_commit(&ctx, "txn-1", 1000, 0, "consumer-group", topics);
+        let result = transaction::handle_txn_offset_commit(
+            &ctx,
+            "txn-1",
+            1000,
+            0,
+            "consumer-group",
+            -1,
+            "",
+            topics,
+        );
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -2187,9 +2227,17 @@ mod tests {
 
         let topics = vec![("test-topic".to_string(), vec![(0, 100i64, None)])];
 
-        let response =
-            transaction::handle_txn_offset_commit(&ctx, "txn-1", 1000, 0, "consumer-group", topics)
-                .unwrap();
+        let response = transaction::handle_txn_offset_commit(
+            &ctx,
+            "txn-1",
+            1000,
+            0,
+            "consumer-group",
+            -1,
+            "",
+            topics,
+        )
+        .unwrap();
 
         assert_eq!(
             response.topics[0].partitions[0].error_code,

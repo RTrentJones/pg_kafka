@@ -946,6 +946,33 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_sequence_negative_base_is_rejected() {
+        // RV-12: a negative base_sequence must be rejected (out of order), not
+        // misclassified as a Duplicate and silently dropped. On a fresh partition
+        // (last_sequence = -1), base_sequence = -1 would otherwise hit the Duplicate
+        // branch (batch_last -1 <= last_sequence -1) and lose the records + ack ok.
+        assert_eq!(
+            validate_sequence(-1, -1, 1),
+            SequenceValidation::OutOfOrder {
+                expected_sequence: 0
+            }
+        );
+        assert_eq!(
+            validate_sequence(7, -5, 3),
+            SequenceValidation::OutOfOrder {
+                expected_sequence: 8
+            }
+        );
+        // A negative record_count is likewise rejected.
+        assert_eq!(
+            validate_sequence(7, 8, -1),
+            SequenceValidation::OutOfOrder {
+                expected_sequence: 8
+            }
+        );
+    }
+
+    #[test]
     fn test_validate_sequence_no_overflow_near_i32_max() {
         // Batch base behind expected near i32::MAX must not overflow when
         // computing the batch's last sequence (i64 arithmetic internally)

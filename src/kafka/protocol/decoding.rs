@@ -1673,6 +1673,11 @@ fn parse_txn_offset_commit(
     let group_id = req.group_id.to_string();
     let producer_id = req.producer_id.0;
     let producer_epoch = req.producer_epoch;
+    // RV-5: lift the consumer-group generation/member (KIP-447, v3+) so the handler
+    // can fence a zombie EOS consumer. Older clients (v0-2) default these to
+    // -1/"" which validate_commit treats as a simple consumer (exempt).
+    let generation_id = req.generation_id;
+    let member_id = req.member_id.to_string();
 
     // Convert topics to (topic_name, partitions) format
     // where partitions is Vec<(partition_id, offset, metadata)>
@@ -1706,6 +1711,8 @@ fn parse_txn_offset_commit(
         group_id,
         producer_id,
         producer_epoch,
+        generation_id,
+        member_id,
         topics,
         response_tx,
     }))
