@@ -993,26 +993,48 @@ impl KafkaStore for PostgresStore {
                     &[transactional_id.into()],
                 )?;
 
-                let table = client.update(
-                    "UPDATE kafka.producer_ids
-                     SET epoch = epoch + 1, last_active_at = NOW()
-                     WHERE producer_id = $1
-                     RETURNING epoch",
-                    None,
-                    &[producer_id.into()],
-                )?;
+                let table = if old_epoch == i16::MAX {
+                    // RV-13: SMALLINT epoch exhausted. `epoch + 1` would overflow the
+                    // column and fail InitProducerId forever for this transactional_id.
+                    // Kafka handles exhaustion by allocating a fresh producer_id. Reassign
+                    // this row's producer_id from the BIGSERIAL sequence and reset the epoch
+                    // to 0. transactional_id is UNIQUE (one row), and the transactions FK is
+                    // ON UPDATE CASCADE, so the transaction row's producer_id follows the new
+                    // id automatically.
+                    client.update(
+                        "UPDATE kafka.producer_ids
+                         SET producer_id = nextval(pg_get_serial_sequence('kafka.producer_ids', 'producer_id')),
+                             epoch = 0, last_active_at = NOW()
+                         WHERE producer_id = $1
+                         RETURNING producer_id, epoch",
+                        None,
+                        &[producer_id.into()],
+                    )?
+                } else {
+                    client.update(
+                        "UPDATE kafka.producer_ids
+                         SET epoch = epoch + 1, last_active_at = NOW()
+                         WHERE producer_id = $1
+                         RETURNING producer_id, epoch",
+                        None,
+                        &[producer_id.into()],
+                    )?
+                };
 
-                let new_epoch: i16 = table
-                    .first()
+                let updated = table.first();
+                let new_producer_id: i64 =
+                    updated.get_by_name("producer_id")?.unwrap_or(producer_id);
+                let new_epoch: i16 = updated
                     .get_by_name("epoch")?
                     .ok_or_else(|| KafkaError::Internal("Failed to get new epoch".into()))?;
 
                 crate::pg_debug!(
-                    "Bumped epoch for existing transactional producer_id={}, new_epoch={}",
+                    "Existing transactional producer_id={} -> producer_id={}, new_epoch={}",
                     producer_id,
+                    new_producer_id,
                     new_epoch
                 );
-                (producer_id, new_epoch)
+                (new_producer_id, new_epoch)
             };
 
             // Create or update transaction record with state='Empty'

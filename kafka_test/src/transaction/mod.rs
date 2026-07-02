@@ -16,7 +16,8 @@ mod isolation;
 pub use atomicity::{
     test_abort_transaction_discards_pending_offsets, test_add_partitions_to_txn_idempotent,
     test_concurrent_transactions_same_producer, test_producer_fencing_mid_transaction,
-    test_transaction_boundary_isolation, test_transaction_honors_per_txn_timeout_ms,
+    test_producer_id_reallocated_on_epoch_exhaustion, test_transaction_boundary_isolation,
+    test_transaction_honors_per_txn_timeout_ms,
     test_transaction_partial_failure_atomicity, test_transaction_timeout_auto_abort,
     test_txn_offset_commit_visibility_timing,
 };

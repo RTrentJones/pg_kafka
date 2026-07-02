@@ -207,7 +207,9 @@ COMMENT ON COLUMN kafka.producer_sequences.last_sequence IS 'Last successfully w
 -- Each transactional producer has one row tracking its current transaction state
 CREATE TABLE kafka.transactions (
     transactional_id TEXT PRIMARY KEY,
-    producer_id BIGINT NOT NULL REFERENCES kafka.producer_ids(producer_id),
+    -- ON UPDATE CASCADE: RV-13 reallocates producer_ids.producer_id on epoch
+    -- exhaustion; the transaction row's producer_id must follow the new id.
+    producer_id BIGINT NOT NULL REFERENCES kafka.producer_ids(producer_id) ON UPDATE CASCADE,
     producer_epoch SMALLINT NOT NULL,
     state TEXT NOT NULL DEFAULT 'Empty',
     -- States: 'Empty', 'Ongoing', 'PrepareCommit', 'PrepareAbort', 'CompleteCommit', 'CompleteAbort'

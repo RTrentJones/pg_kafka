@@ -1044,3 +1044,69 @@ pub async fn test_transaction_honors_per_txn_timeout_ms() -> TestResult {
     println!("\nTransaction honors per-txn timeout_ms test PASSED\n");
     Ok(())
 }
+
+/// RV-13 regression: when the SMALLINT producer epoch is exhausted (i16::MAX),
+/// InitProducerId must allocate a fresh producer_id (epoch reset to 0) rather than
+/// overflowing `epoch + 1` and failing the transactional_id permanently.
+pub async fn test_producer_id_reallocated_on_epoch_exhaustion() -> TestResult {
+    println!("=== Test: Producer ID Reallocated On Epoch Exhaustion (RV-13) ===\n");
+
+    let txn_id = format!("txn-epoch-exhaust-{}", Uuid::new_v4());
+    let client = create_db_client().await?;
+
+    // First init creates the producer_ids row.
+    let producer1 = create_transactional_producer(&txn_id)?;
+    producer1.init_transactions(Duration::from_secs(10))?;
+
+    let orig_pid: i64 = client
+        .query_one(
+            "SELECT producer_id FROM kafka.producer_ids WHERE transactional_id = $1 ORDER BY producer_id DESC LIMIT 1",
+            &[&txn_id],
+        )
+        .await?
+        .get(0);
+
+    // Drive the epoch to i16::MAX to force the exhaustion path on the next re-init.
+    client
+        .execute(
+            "UPDATE kafka.producer_ids SET epoch = 32767 WHERE transactional_id = $1",
+            &[&txn_id],
+        )
+        .await?;
+
+    // Re-init the same transactional_id → epoch exhausted → reallocate a fresh id.
+    let producer2 = create_transactional_producer(&txn_id)?;
+    producer2.init_transactions(Duration::from_secs(10))?;
+
+    let client2 = create_db_client().await?;
+    let row = client2
+        .query_one(
+            "SELECT producer_id, epoch FROM kafka.producer_ids WHERE transactional_id = $1 ORDER BY producer_id DESC LIMIT 1",
+            &[&txn_id],
+        )
+        .await?;
+    let new_pid: i64 = row.get(0);
+    let new_epoch: i16 = row.get(1);
+    println!("  orig producer_id={}, new producer_id={}, epoch={}", orig_pid, new_pid, new_epoch);
+    assert_ne!(
+        new_pid, orig_pid,
+        "epoch exhaustion must allocate a fresh producer_id (RV-13)"
+    );
+    assert_eq!(new_epoch, 0, "the reallocated producer must reset epoch to 0");
+
+    // The transactions row must be repointed to the new producer_id.
+    let txn_pid: i64 = client2
+        .query_one(
+            "SELECT producer_id FROM kafka.transactions WHERE transactional_id = $1",
+            &[&txn_id],
+        )
+        .await?
+        .get(0);
+    assert_eq!(
+        txn_pid, new_pid,
+        "the transactions row must reference the reallocated producer_id"
+    );
+
+    println!("\nProducer id reallocated on epoch exhaustion test PASSED\n");
+    Ok(())
+}
