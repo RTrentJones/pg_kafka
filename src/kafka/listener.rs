@@ -20,14 +20,16 @@
 // - InternalNotification: signals from DB thread when new data arrives
 // - Per-connection long poll handlers that manage the wait/retry logic
 
+use bytes::{Bytes, BytesMut};
 use crossbeam_channel::{Receiver, Sender};
 use futures::sink::SinkExt;
 use futures::stream::StreamExt;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::UnboundedSender;
-use tokio_util::codec::{Framed, LengthDelimitedCodec};
+use tokio_util::codec::{Decoder, Encoder, Framed, LengthDelimitedCodec};
 use tracing::{debug, error, info, warn};
 
 use super::messages::{KafkaRequest, KafkaResponse, TopicFetchData};
@@ -35,6 +37,117 @@ use super::notifications::InternalNotification;
 use super::pending_fetches::PendingFetchRegistry;
 use super::protocol;
 use super::shadow::{ForwardAck, ForwardRequest, ShadowConfig, ShadowProducer};
+
+// ============================================================================
+// RV-9: aggregate in-flight frame-reservation budget.
+//
+// LengthDelimitedCodec reserves the full declared frame length as soon as the
+// 4-byte length prefix arrives, so MAX_CONNECTIONS (1024) connections each
+// declaring a MAX_REQUEST_SIZE (100 MB) frame could reserve ~100 GB from a few KB
+// of attacker input. This budget bounds the *aggregate* reservation across all
+// connections while still admitting individual large frames until it is hit;
+// small requests are effectively unrestricted.
+// ============================================================================
+
+/// Total bytes that may be reserved across all connections for in-flight frame
+/// reads at once. 512 MiB comfortably admits several concurrent max-size frames
+/// while keeping the worst case far below the ~100 GB the connection cap alone
+/// allowed.
+const FRAME_RESERVE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
+
+static FRAME_RESERVE_REMAINING: AtomicUsize = AtomicUsize::new(FRAME_RESERVE_BUDGET_BYTES);
+
+/// Try to charge `n` bytes to `budget`. Returns false if it lacks `n` bytes, in
+/// which case the caller rejects the frame.
+fn charge_frame_budget(budget: &AtomicUsize, n: usize) -> bool {
+    let mut remaining = budget.load(Ordering::Relaxed);
+    loop {
+        if n > remaining {
+            return false;
+        }
+        match budget.compare_exchange_weak(
+            remaining,
+            remaining - n,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(actual) => remaining = actual,
+        }
+    }
+}
+
+fn release_frame_budget(budget: &AtomicUsize, n: usize) {
+    if n > 0 {
+        budget.fetch_add(n, Ordering::Release);
+    }
+}
+
+/// A `LengthDelimitedCodec` wrapper that charges the global reservation budget for
+/// a frame's declared length before the inner codec reserves it, and releases it
+/// once the frame is fully decoded (RV-9). Encoding is delegated unchanged.
+struct BudgetedFrameCodec {
+    inner: LengthDelimitedCodec,
+    /// Bytes charged to the budget for the in-progress frame (0 = none charged).
+    charged: usize,
+}
+
+impl BudgetedFrameCodec {
+    fn new() -> Self {
+        Self {
+            inner: LengthDelimitedCodec::builder()
+                .big_endian()
+                .length_field_length(4)
+                .max_frame_length(super::constants::MAX_REQUEST_SIZE as usize)
+                .new_codec(),
+            charged: 0,
+        }
+    }
+}
+
+impl Decoder for BudgetedFrameCodec {
+    type Item = BytesMut;
+    type Error = std::io::Error;
+
+    fn decode(&mut self, src: &mut BytesMut) -> std::io::Result<Option<BytesMut>> {
+        // Charge the budget for this frame's declared payload length as soon as the
+        // 4-byte big-endian prefix is available, before the inner codec reserves it.
+        if self.charged == 0 && src.len() >= 4 {
+            let len = u32::from_be_bytes([src[0], src[1], src[2], src[3]]) as usize;
+            if len <= super::constants::MAX_REQUEST_SIZE as usize {
+                if !charge_frame_budget(&FRAME_RESERVE_REMAINING, len) {
+                    return Err(std::io::Error::other(
+                        "aggregate request reservation budget exhausted",
+                    ));
+                }
+                self.charged = len;
+            }
+            // len > MAX_REQUEST_SIZE is left uncharged; the inner codec rejects it.
+        }
+
+        match self.inner.decode(src) {
+            Ok(Some(frame)) => {
+                release_frame_budget(&FRAME_RESERVE_REMAINING, self.charged);
+                self.charged = 0;
+                Ok(Some(frame))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => {
+                release_frame_budget(&FRAME_RESERVE_REMAINING, self.charged);
+                self.charged = 0;
+                Err(e)
+            }
+        }
+    }
+}
+
+impl Encoder<Bytes> for BudgetedFrameCodec {
+    type Error = std::io::Error;
+
+    fn encode(&mut self, item: Bytes, dst: &mut BytesMut) -> std::io::Result<()> {
+        self.inner.encode(item, dst)
+    }
+}
 
 /// Shadow forwarder task for async forwarding
 ///
@@ -427,16 +540,11 @@ async fn handle_connection(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     debug!("New connection established, starting pipelined handle loop");
 
-    // Wrap socket in LengthDelimitedCodec for automatic size-prefix framing
-    // Kafka uses big-endian 4-byte size prefix
-    let framed = Framed::new(
-        socket,
-        LengthDelimitedCodec::builder()
-            .big_endian()
-            .length_field_length(4)
-            .max_frame_length(super::constants::MAX_REQUEST_SIZE as usize)
-            .new_codec(),
-    );
+    // Wrap socket in a budgeted length-delimited codec (big-endian 4-byte size
+    // prefix). RV-9: the codec charges a global reservation budget for each frame's
+    // declared length so aggregate in-flight reservations across connections are
+    // bounded, not just the connection count.
+    let framed = Framed::new(socket, BudgetedFrameCodec::new());
 
     // Split the framed socket into independent reader and writer halves
     // This enables concurrent reading and writing for pipelining support
@@ -827,5 +935,36 @@ mod tests {
             !send_with_backpressure(&tx, 1).await,
             "a disconnected channel must report failure"
         );
+    }
+
+    // RV-9: the aggregate frame-reservation budget admits reservations up to its
+    // ceiling, rejects a frame that would overshoot without mutating the budget,
+    // and restores capacity on release so completed frames free their reservation.
+    #[test]
+    fn test_frame_reserve_budget_admits_then_rejects_then_releases() {
+        let budget = AtomicUsize::new(100);
+
+        // A reservation that fits is admitted and deducted.
+        assert!(charge_frame_budget(&budget, 60));
+        assert_eq!(budget.load(Ordering::Relaxed), 40);
+
+        // A reservation larger than what remains is rejected and leaves the
+        // budget untouched (no partial charge).
+        assert!(!charge_frame_budget(&budget, 50));
+        assert_eq!(budget.load(Ordering::Relaxed), 40);
+
+        // A reservation that exactly fits the remainder is admitted, exhausting it.
+        assert!(charge_frame_budget(&budget, 40));
+        assert_eq!(budget.load(Ordering::Relaxed), 0);
+
+        // With the budget exhausted, even a single byte is refused.
+        assert!(!charge_frame_budget(&budget, 1));
+
+        // Releasing a completed frame's reservation restores capacity, which the
+        // next reservation can then draw on.
+        release_frame_budget(&budget, 60);
+        assert_eq!(budget.load(Ordering::Relaxed), 60);
+        assert!(charge_frame_budget(&budget, 60));
+        assert_eq!(budget.load(Ordering::Relaxed), 0);
     }
 }
