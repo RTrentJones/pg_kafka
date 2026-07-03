@@ -182,10 +182,10 @@ pub const DEFAULT_BROKER_ID: i32 = 1;
 
 // ===== Topic Configuration =====
 
-/// Default number of partitions for new topics
-///
-/// Phase 1 only supports single-partition topics.
-/// In future phases, this will become configurable per-topic.
+/// Default number of partitions for a topic auto-created without an explicit
+/// count. Multi-partition topics are fully supported (partitioned produce/fetch,
+/// routing, consumer-group assignment); this is only the fallback default and is
+/// overridden by the `pg_kafka.default_partitions` GUC.
 pub const DEFAULT_TOPIC_PARTITIONS: i32 = 1;
 
 // ===== Long Polling Configuration =====

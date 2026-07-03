@@ -238,7 +238,7 @@ SET pg_kafka.compression_type = 'gzip';
 | API Key | Name | Versions | Status |
 |---------|------|----------|--------|
 | 0 | Produce | 3-9 | ✅ Full support (with key-based routing) |
-| 1 | Fetch | 0-13 | ✅ Full support |
+| 1 | Fetch | 0-11 | ✅ Full support |
 | 2 | ListOffsets | 0-7 | ✅ Implemented (incl. timestamp lookup) |
 | 3 | Metadata | 0-9 | ✅ Full support |
 | 8 | OffsetCommit | 0-8 | ✅ Full support |
