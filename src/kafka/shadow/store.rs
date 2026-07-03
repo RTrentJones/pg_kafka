@@ -920,8 +920,15 @@ impl<S: KafkaStore> ShadowStore<S> {
                     LIMIT $2
                 ),
                 claimed AS (
+                    -- RV-10: count each claim as a delivery attempt. Previously
+                    -- retry_count was bumped only when a *failure* ack came back, so a
+                    -- forward whose ack was dropped (RA-6 backpressure drop) left
+                    -- retry_count unchanged and the row was re-claimed forever,
+                    -- bypassing the `retry_count < $3` cap (re-forward livelock).
+                    -- Bumping on claim bounds every re-forward loop — dropped or
+                    -- failed — to $3 attempts before the row is dead-lettered.
                     UPDATE kafka.shadow_tracking st
-                    SET forwarded_at = NOW()
+                    SET forwarded_at = NOW(), retry_count = st.retry_count + 1
                     FROM due
                     WHERE st.topic_id = due.topic_id
                       AND st.partition_id = due.partition_id
@@ -1012,9 +1019,10 @@ impl<S: KafkaStore> ShadowStore<S> {
     ///
     /// Success → record the external offset and clear any error; the row is now
     /// delivered and will never be polled again (`external_offset IS NOT NULL`).
-    /// Failure → leave it pending, bump `retry_count` and store the error so the
-    /// poll re-attempts it. The forward metric is counted exactly once, here, on
-    /// a confirmed delivery (SH-7).
+    /// Failure → leave it pending and store the error so the poll re-attempts it
+    /// (RV-10: `retry_count` is bumped on claim in `poll_and_forward_outbox`, not
+    /// here, so a dropped ack still counts against the cap). The forward metric is
+    /// counted exactly once, here, on a confirmed delivery (SH-7).
     #[cfg(not(test))]
     fn apply_ack(&self, ack: &ForwardAck) {
         use pgrx::prelude::*;
@@ -1060,9 +1068,14 @@ impl<S: KafkaStore> ShadowStore<S> {
                 }
                 Err(msg) => {
                     let table = client.update(
+                        // RV-10: retry_count is now bumped on claim (see
+                        // poll_and_forward_outbox), so the failure ack only records the
+                        // error — incrementing here too would double-count and halve the
+                        // effective retry budget. RETURNING retry_count still reports the
+                        // claim-bumped value for the dead-letter check below.
                         "WITH failed AS ( \
                              UPDATE kafka.shadow_tracking \
-                             SET retry_count = retry_count + 1, error_message = $4 \
+                             SET error_message = $4 \
                              WHERE topic_id = $1 AND partition_id = $2 AND local_offset = $3 \
                                AND external_offset IS NULL \
                              RETURNING topic_id, partition_id, retry_count \

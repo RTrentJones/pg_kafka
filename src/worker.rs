@@ -588,29 +588,41 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
             // 2. Reload shadow config and flush metrics
             let shadow_reload = AssertUnwindSafe(&shadow_store);
             BackgroundWorker::transaction(move || {
-                // Reload topic shadow configurations
-                match shadow_reload.load_topic_config_from_db() {
-                    Ok(count) => {
-                        pg_log!("Reloaded {} shadow topic configurations", count);
+                // RV-10: run this periodic maintenance inside the same subtransaction
+                // guard the request path uses, so a Postgres ERROR here (surfaced by
+                // pgrx as a panic) rolls back and is logged instead of unwinding out
+                // of BackgroundWorker::transaction and aborting the whole bgworker.
+                let result = run_request_in_subtransaction(|| {
+                    // Reload topic shadow configurations
+                    match shadow_reload.load_topic_config_from_db() {
+                        Ok(count) => {
+                            pg_log!("Reloaded {} shadow topic configurations", count);
+                        }
+                        Err(e) => {
+                            pg_warning!("Failed to reload shadow config: {:?}", e);
+                        }
                     }
-                    Err(e) => {
-                        pg_warning!("Failed to reload shadow config: {:?}", e);
+
+                    // SH-2: re-check primary/standby status. is_primary() caches its
+                    // result for the life of the worker, so without this a standby
+                    // promoted to primary would never start forwarding. Refreshing
+                    // on the reload cycle picks up a failover within one interval.
+                    let is_primary = shadow_reload.refresh_primary_status();
+                    tracing::debug!(
+                        "Shadow: refreshed primary status (is_primary={})",
+                        is_primary
+                    );
+
+                    // Flush accumulated metrics to database/logs
+                    if let Err(e) = shadow_reload.flush_metrics_to_db() {
+                        pg_warning!("Failed to flush shadow metrics: {:?}", e);
                     }
-                }
-
-                // SH-2: re-check primary/standby status. is_primary() caches its
-                // result for the life of the worker, so without this a standby
-                // promoted to primary would never start forwarding. Refreshing
-                // on the reload cycle picks up a failover within one interval.
-                let is_primary = shadow_reload.refresh_primary_status();
-                tracing::debug!(
-                    "Shadow: refreshed primary status (is_primary={})",
-                    is_primary
-                );
-
-                // Flush accumulated metrics to database/logs
-                if let Err(e) = shadow_reload.flush_metrics_to_db() {
-                    pg_warning!("Failed to flush shadow metrics: {:?}", e);
+                });
+                if let Err(panic_msg) = result {
+                    pg_warning!(
+                        "Shadow config-reload/metrics maintenance panicked, rolled back (worker survived): {}",
+                        panic_msg
+                    );
                 }
             });
 
@@ -627,22 +639,33 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
         {
             let shadow_outbox = AssertUnwindSafe(&shadow_store);
             BackgroundWorker::transaction(move || {
-                // Apply results first (marks delivered rows done so the poll
-                // won't re-dispatch them), then dispatch the next due batch.
-                let applied = shadow_outbox.drain_forward_acks();
-                match shadow_outbox.poll_and_forward_outbox() {
-                    Ok(dispatched) => {
-                        if applied > 0 || dispatched > 0 {
-                            tracing::debug!(
-                                "Shadow outbox: {} ack(s) applied, {} row(s) dispatched",
-                                applied,
-                                dispatched
-                            );
+                // RV-10: guard the outbox maintenance with the subtransaction wrapper
+                // (see the config-reload block above) so a Postgres ERROR rolls back
+                // and is logged rather than aborting the bgworker.
+                let result = run_request_in_subtransaction(|| {
+                    // Apply results first (marks delivered rows done so the poll
+                    // won't re-dispatch them), then dispatch the next due batch.
+                    let applied = shadow_outbox.drain_forward_acks();
+                    match shadow_outbox.poll_and_forward_outbox() {
+                        Ok(dispatched) => {
+                            if applied > 0 || dispatched > 0 {
+                                tracing::debug!(
+                                    "Shadow outbox: {} ack(s) applied, {} row(s) dispatched",
+                                    applied,
+                                    dispatched
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            pg_warning!("Shadow outbox poll failed: {:?}", e);
                         }
                     }
-                    Err(e) => {
-                        pg_warning!("Shadow outbox poll failed: {:?}", e);
-                    }
+                });
+                if let Err(panic_msg) = result {
+                    pg_warning!(
+                        "Shadow outbox maintenance panicked, rolled back (worker survived): {}",
+                        panic_msg
+                    );
                 }
             });
             last_outbox_poll = Instant::now();
@@ -762,21 +785,32 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
         if last_txn_timeout_check.elapsed() >= TXN_TIMEOUT_CHECK_INTERVAL {
             // Must run within a BackgroundWorker transaction for SPI access
             BackgroundWorker::transaction(|| {
-                use crate::kafka::{KafkaStore, PostgresStore};
-                let store = PostgresStore::new();
-                let default_timeout = Duration::from_secs(60);
-                match store.abort_timed_out_transactions(default_timeout) {
-                    Ok(aborted) => {
-                        for txn_id in aborted {
-                            pg_log!(
-                                "Transaction timeout: Aborted timed-out transaction '{}'",
-                                txn_id
-                            );
+                // RV-10: guard the timeout sweep with the subtransaction wrapper (see
+                // the config-reload block above) so a Postgres ERROR rolls back and is
+                // logged rather than aborting the bgworker.
+                let result = run_request_in_subtransaction(|| {
+                    use crate::kafka::{KafkaStore, PostgresStore};
+                    let store = PostgresStore::new();
+                    let default_timeout = Duration::from_secs(60);
+                    match store.abort_timed_out_transactions(default_timeout) {
+                        Ok(aborted) => {
+                            for txn_id in aborted {
+                                pg_log!(
+                                    "Transaction timeout: Aborted timed-out transaction '{}'",
+                                    txn_id
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            pg_warning!("Failed to check transaction timeouts: {}", e);
                         }
                     }
-                    Err(e) => {
-                        pg_warning!("Failed to check transaction timeouts: {}", e);
-                    }
+                });
+                if let Err(panic_msg) = result {
+                    pg_warning!(
+                        "Transaction-timeout maintenance panicked, rolled back (worker survived): {}",
+                        panic_msg
+                    );
                 }
             });
             last_txn_timeout_check = Instant::now();
