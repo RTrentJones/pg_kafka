@@ -22,7 +22,9 @@
 //! - **PreparingRebalance**: Waiting for all members to rejoin (triggered by member join/leave)
 //! - **CompletingRebalance**: Waiting for leader to provide assignments via SyncGroup
 //! - **Stable**: All members have assignments and are consuming
-//! - **Dead**: Group is being deleted (future feature)
+//! - **Dead**: defined for protocol completeness but never entered — an emptied
+//!   group transitions to `Empty` and is reaped by the empty-group TTL sweep
+//!   rather than being marked `Dead`. It is treated like `Empty` where matched.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -645,10 +647,20 @@ impl GroupCoordinator {
     /// CONF-1: validate an OffsetCommit against the live group state to reject zombie commits.
     ///
     /// A simple consumer with no active group membership commits with `generation_id < 0` and is not
-    /// validated. Otherwise, if this coordinator knows the group, the commit's generation and member
-    /// id must match the current ones — a stale generation yields `IllegalGeneration` and an unknown
-    /// member yields `UnknownMemberId`. A group this coordinator has no record of is allowed (there
-    /// is nothing to validate against), so offset commits never hard-fail on coordinator restart.
+    /// validated. Otherwise the commit's generation and member id must match the current ones — a
+    /// stale generation yields `IllegalGeneration` and an unknown member yields `UnknownMemberId`.
+    ///
+    /// RA-5: a generation-bearing commit for a group this coordinator has *no record of* is fenced
+    /// with `UnknownMemberId` (a zombie whose group was reaped by the empty-group sweep, or whose
+    /// coordinator restarted), forcing it to rejoin and get a fresh generation. Because coordinator
+    /// state is in-memory, this means that after a bgworker restart every consumer holding a
+    /// generation must rejoin — a brief rejoin/rebalance storm on restart. That is deliberate and
+    /// correct (the old generations are gone), not a regression; the earlier "unknown group is
+    /// allowed" behavior would have let a zombie commit through.
+    ///
+    /// RV-10: even for a known group at the current generation, a commit that arrives while the group
+    /// is `PreparingRebalance`/`CompletingRebalance` is fenced with `RebalanceInProgress` so the
+    /// member rejoins before committing.
     pub fn validate_commit(
         &self,
         group_id: &str,
