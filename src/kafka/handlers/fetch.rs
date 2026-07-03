@@ -116,6 +116,13 @@ pub fn handle_fetch(
                 IsolationLevel::ReadUncommitted => high_watermark,
             };
 
+            // RV-10: report the real log-start offset — the earliest retained offset
+            // after cleanup/retention — rather than a hardcoded 0, so a consumer
+            // that seeks to the beginning or computes lag lands on a valid offset.
+            let log_start_offset = store
+                .get_earliest_offset(topic_id, partition_id)
+                .unwrap_or(0);
+
             // Convert database records to Kafka RecordBatch format
             let records_bytes = if !db_records.is_empty() {
                 let kafka_records: Vec<Record> = db_records
@@ -168,7 +175,7 @@ pub fn handle_fetch(
             partition_data.error_code = ERROR_NONE;
             partition_data.high_watermark = high_watermark;
             partition_data.last_stable_offset = last_stable_offset;
-            partition_data.log_start_offset = 0;
+            partition_data.log_start_offset = log_start_offset;
             partition_data.records = records_bytes;
             partition_responses.push(partition_data);
         }

@@ -214,7 +214,10 @@ CREATE TABLE kafka.transactions (
     state TEXT NOT NULL DEFAULT 'Empty',
     -- States: 'Empty', 'Ongoing', 'PrepareCommit', 'PrepareAbort', 'CompleteCommit', 'CompleteAbort'
     timeout_ms INT NOT NULL DEFAULT 60000,
-    started_at TIMESTAMP,
+    -- RV-10/BUG-7: TIMESTAMPTZ (not naive TIMESTAMP). started_at is compared to
+    -- NOW() in the timeout sweep (`started_at < NOW() - (timeout_ms||'ms')::interval`),
+    -- so a naive column skews the abort deadline by the session/DST offset.
+    started_at TIMESTAMPTZ,
     last_updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
@@ -288,7 +291,10 @@ CREATE TABLE kafka.shadow_tracking (
     partition_id INT NOT NULL,
     local_offset BIGINT NOT NULL,
     external_offset BIGINT,
-    forwarded_at TIMESTAMP,
+    -- RV-10/BUG-7: TIMESTAMPTZ (not naive TIMESTAMP). forwarded_at is compared to
+    -- NOW() in the outbox retry-backoff filter (`forwarded_at < NOW() - (backoff||'ms')::interval`),
+    -- so a naive column skews the re-forward cadence by the session/DST offset.
+    forwarded_at TIMESTAMPTZ,
     error_message TEXT,
     retry_count INT NOT NULL DEFAULT 0,
     PRIMARY KEY (topic_id, partition_id, local_offset),

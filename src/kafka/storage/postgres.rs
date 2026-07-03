@@ -1734,13 +1734,23 @@ impl KafkaStore for PostgresStore {
         );
 
         Spi::connect(|client| {
-            // Get the minimum offset of pending messages, or high watermark if none
+            // Get the minimum offset of pending messages, or the high watermark if
+            // none. RV-10/BUG-4: when there are no pending rows the LSO equals the
+            // HWM, which must never regress. A plain MAX(partition_offset)+1 drops
+            // when cleanup_aborted_messages deletes the highest (aborted) rows,
+            // reporting an LSO below offsets already handed out. Use the same
+            // GREATEST(monotonic next_offset counter, MAX+1) the HWM uses so the two
+            // agree and neither regresses after cleanup.
             let table = client.select(
                 "SELECT COALESCE(
                     (SELECT MIN(partition_offset) FROM kafka.messages
                      WHERE topic_id = $1 AND partition_id = $2 AND txn_state = 'pending'),
-                    (SELECT COALESCE(MAX(partition_offset) + 1, 0) FROM kafka.messages
-                     WHERE topic_id = $1 AND partition_id = $2)
+                    GREATEST(
+                        COALESCE((SELECT next_offset FROM kafka.partition_offsets
+                                  WHERE topic_id = $1 AND partition_id = $2), 0),
+                        COALESCE((SELECT MAX(partition_offset) + 1 FROM kafka.messages
+                                  WHERE topic_id = $1 AND partition_id = $2), 0)
+                    )
                  ) as lso",
                 None,
                 &[topic_id.into(), partition_id.into()],

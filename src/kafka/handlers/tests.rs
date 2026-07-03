@@ -163,6 +163,9 @@ mod tests {
 
         mock.expect_get_high_watermark().returning(|_, _| Ok(1));
         mock.expect_get_last_stable_offset().returning(|_, _| Ok(1));
+        // RV-10: the fetch response's log_start_offset must reflect the store's
+        // earliest retained offset, not a hardcoded 0.
+        mock.expect_get_earliest_offset().returning(|_, _| Ok(5));
 
         let topic_data = vec![TopicFetchData {
             name: "test-topic".to_string(),
@@ -189,6 +192,7 @@ mod tests {
         let partition_data = &response.responses[0].partitions[0];
         assert_eq!(partition_data.error_code, ERROR_NONE);
         assert_eq!(partition_data.high_watermark, 1);
+        assert_eq!(partition_data.log_start_offset, 5);
     }
 
     #[test]
