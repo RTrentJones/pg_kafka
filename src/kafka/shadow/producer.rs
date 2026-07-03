@@ -35,6 +35,20 @@ use std::time::Duration;
 /// Default delivery timeout for async sends (30 seconds)
 const DEFAULT_DELIVERY_TIMEOUT_MS: u64 = 30_000;
 
+/// librdkafka tuning for the shadow forwarding producer. Named here rather than
+/// inlined as string literals at the `client_config.set` call sites so the intent
+/// (and the idempotence invariants) are explicit.
+///
+/// Max in-flight requests per connection. librdkafka requires this to be ≤ 5 for
+/// `enable.idempotence=true` (ordering guarantee), so 5 is the idempotent maximum.
+const PRODUCER_MAX_IN_FLIGHT: &str = "5";
+/// Fallback retry count when the configured `max_retries` is < 1 — idempotence
+/// needs at least one retry to be meaningful.
+const PRODUCER_IDEMPOTENCE_MIN_RETRIES: &str = "3";
+/// Per-request timeout (30 s) and total message delivery timeout (120 s).
+const PRODUCER_REQUEST_TIMEOUT_MS: &str = "30000";
+const PRODUCER_MESSAGE_TIMEOUT_MS: &str = "120000";
+
 /// Shadow producer for forwarding messages to external Kafka
 pub struct ShadowProducer {
     /// The underlying rdkafka producer
@@ -121,11 +135,14 @@ impl ShadowProducer {
         // window, and retries > 0 — set them explicitly so the config is valid
         // regardless of librdkafka defaults.
         client_config.set("enable.idempotence", "true");
-        client_config.set("max.in.flight.requests.per.connection", "5");
+        client_config.set(
+            "max.in.flight.requests.per.connection",
+            PRODUCER_MAX_IN_FLIGHT,
+        );
         client_config.set("acks", "all");
         if config.max_retries < 1 {
             // Idempotence needs at least one retry to be meaningful.
-            client_config.set("retries", "3");
+            client_config.set("retries", PRODUCER_IDEMPOTENCE_MIN_RETRIES);
         }
 
         // NOTE: Removed deprecated api.version.* settings that caused
@@ -133,8 +150,8 @@ impl ShadowProducer {
         // Modern librdkafka handles API negotiation automatically.
 
         // Request timeout and message timeout
-        client_config.set("request.timeout.ms", "30000");
-        client_config.set("message.timeout.ms", "120000");
+        client_config.set("request.timeout.ms", PRODUCER_REQUEST_TIMEOUT_MS);
+        client_config.set("message.timeout.ms", PRODUCER_MESSAGE_TIMEOUT_MS);
 
         // Create the producer
         client_config

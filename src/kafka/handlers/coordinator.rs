@@ -7,6 +7,14 @@ use crate::kafka::constants::{DEFAULT_BROKER_ID, ERROR_NONE, ERROR_UNKNOWN_SERVE
 use crate::kafka::error::Result;
 use crate::kafka::handler_context::HandlerContext;
 
+/// Placeholder for a JoinGroup member's `client_host`. This field is informational
+/// only — echoed back in DescribeGroups member listings, never used for routing or
+/// authorization. The real peer address is known at the TCP accept site
+/// (`listener.rs`) but is not plumbed through `KafkaRequest` to this DB-thread
+/// handler, so a stable placeholder is reported. Threading the real peer host
+/// through the request enum is a non-functional enhancement left as follow-up.
+const PLACEHOLDER_CLIENT_HOST: &str = "localhost";
+
 /// Handle FindCoordinator request
 ///
 /// Returns the coordinator broker for a consumer group.
@@ -91,8 +99,9 @@ pub fn handle_join_group(
         .map(|p| (p.name, p.metadata))
         .collect();
 
-    // Get client host (use localhost for now)
-    let client_host = "localhost".to_string();
+    // client_host is informational only (see PLACEHOLDER_CLIENT_HOST); the real
+    // peer address is not plumbed to this DB-thread handler.
+    let client_host = PLACEHOLDER_CLIENT_HOST.to_string();
 
     // Join group via coordinator
     let existing_member_id = if member_id.is_empty() {

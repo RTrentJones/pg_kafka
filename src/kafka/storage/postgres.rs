@@ -1456,6 +1456,14 @@ impl KafkaStore for PostgresStore {
                 return Err(KafkaError::transactional_id_not_found(transactional_id));
             }
 
+            // `unwrap_or`/`unwrap_or_default` on these column reads is safe by
+            // schema, not by luck: kafka.transactions.{producer_id, producer_epoch,
+            // state} are all declared NOT NULL (sql/bootstrap.sql), so get_by_name
+            // never returns None for a row that exists (and non-existence was already
+            // handled by the is_empty() check above). The fallback value is therefore
+            // unreachable and never masks a real NULL. The same reasoning applies to
+            // the other `get_by_name(...).unwrap_or*` reads of NOT NULL columns
+            // throughout this module.
             let row = txn_table.first();
             let current_producer_id: i64 = row.get_by_name("producer_id")?.unwrap_or(0);
             let current_epoch: i16 = row.get_by_name("producer_epoch")?.unwrap_or(0);
