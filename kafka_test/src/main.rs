@@ -67,6 +67,7 @@ use kafka_test::{
     test_commit_then_fetch_offset,
     test_committed_transaction_forwarded,
     test_committed_transaction_uses_durable_outbox,
+    test_committed_txn_leaves_no_orphan_outbox_rows,
     // Compression tests
     test_compressed_producer_gzip,
     test_compressed_producer_lz4,
@@ -1447,6 +1448,12 @@ fn get_all_tests() -> Vec<TestDef> {
             category: "shadow",
             name: "test_committed_transaction_uses_durable_outbox",
             test_fn: wrap_test!(test_committed_transaction_uses_durable_outbox),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "shadow",
+            name: "test_committed_txn_leaves_no_orphan_outbox_rows",
+            test_fn: wrap_test!(test_committed_txn_leaves_no_orphan_outbox_rows),
             parallel_safe: false,
         },
         // Error handling tests

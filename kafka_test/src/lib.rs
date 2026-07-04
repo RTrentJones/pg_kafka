@@ -187,6 +187,7 @@ pub use shadow::{
     test_aborted_transaction_not_forwarded,
     test_committed_transaction_forwarded,
     test_committed_transaction_uses_durable_outbox,
+    test_committed_txn_leaves_no_orphan_outbox_rows,
     // Percentage routing
     test_deterministic_routing,
     // Dial-up tests

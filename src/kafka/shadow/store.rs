@@ -677,9 +677,23 @@ impl<S: KafkaStore> ShadowStore<S> {
         use pgrx::prelude::*;
         Spi::connect_mut(|client| {
             for &(topic_id, partition_id, local_offset) in rows {
+                // B1: only enqueue an outbox pointer when the backing
+                // kafka.messages row actually exists. The live-produce enqueue
+                // runs in the same subtransaction as the message insert, so the
+                // row is always visible and this is a no-op there. On the txn
+                // commit path it drops orphan pointers left by a transactional
+                // produce that buffered offsets in RAM but whose message rows were
+                // rolled back (a panic mid-txn) — which would otherwise be
+                // never-claimed, never-cleaned rows. Symmetric with the poll's own
+                // EXISTS guard in poll_and_forward_outbox.
                 client.update(
                     "INSERT INTO kafka.shadow_tracking (topic_id, partition_id, local_offset) \
-                     VALUES ($1, $2, $3) \
+                     SELECT $1, $2, $3 \
+                     WHERE EXISTS ( \
+                     SELECT 1 FROM kafka.messages m \
+                     WHERE m.topic_id = $1 AND m.partition_id = $2 \
+                     AND m.partition_offset = $3 \
+                     ) \
                      ON CONFLICT (topic_id, partition_id, local_offset) DO NOTHING",
                     None,
                     &[topic_id.into(), partition_id.into(), local_offset.into()],
@@ -1541,11 +1555,27 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
         transaction_timeout_ms: i32,
         client_id: Option<&str>,
     ) -> Result<(i64, i16)> {
-        self.inner.get_or_create_transactional_producer(
+        let (producer_id, new_epoch) = self.inner.get_or_create_transactional_producer(
             transactional_id,
             transaction_timeout_ms,
             client_id,
-        )
+        )?;
+        // RV-2 residual: a re-init bumps the producer epoch and fences the
+        // old-epoch DB rows, but the in-RAM forward buffer keyed
+        // (producer_id, old_epoch) would otherwise linger until the age sweep
+        // because commit/abort look it up by the NEW epoch. Drop any stale-epoch
+        // buffer for this producer now (no-op when the epoch didn't change).
+        {
+            let mut pending = self
+                .pending_txn_messages
+                .write()
+                .unwrap_or_else(|poisoned| {
+                    tracing::warn!("pending_txn_messages write lock was poisoned, recovering");
+                    poisoned.into_inner()
+                });
+            pending.retain(|&(pid, ep), _| pid != producer_id || ep == new_epoch);
+        }
+        Ok((producer_id, new_epoch))
     }
 
     fn begin_transaction(
@@ -2134,6 +2164,48 @@ mod tests {
         assert!(
             pending.contains_key(&(2, 0)),
             "fresh buffer must be retained"
+        );
+    }
+
+    #[test]
+    fn test_reinit_drops_stale_epoch_pending_buffer() {
+        // RV-2 residual: a producer re-init bumps the epoch; the old-epoch in-RAM
+        // forward buffer must be dropped on re-init (commit/abort look it up by the
+        // NEW epoch and would otherwise never free it). A different producer's
+        // buffer must be left untouched.
+        let mut mock = MockKafkaStore::new();
+        mock.expect_get_or_create_transactional_producer()
+            .times(1)
+            .returning(|_, _, _| Ok((100, 1)));
+
+        let store = ShadowStore::new(mock);
+        {
+            let mut pending = store.pending_txn_messages.write().unwrap();
+            // Stale: producer 100 at the OLD epoch 0.
+            pending.insert(
+                (100, 0),
+                PendingTxnBuffer::from(vec![external_only_record(1)]),
+            );
+            // Unrelated producer 200 — must be kept.
+            pending.insert(
+                (200, 0),
+                PendingTxnBuffer::from(vec![external_only_record(1)]),
+            );
+        }
+
+        let (pid, epoch) = store
+            .get_or_create_transactional_producer("txn-1", 60_000, None)
+            .unwrap();
+        assert_eq!((pid, epoch), (100, 1));
+
+        let pending = store.pending_txn_messages.read().unwrap();
+        assert!(
+            !pending.contains_key(&(100, 0)),
+            "stale old-epoch buffer should be dropped on re-init"
+        );
+        assert!(
+            pending.contains_key(&(200, 0)),
+            "a different producer's buffer must be retained"
         );
     }
 
