@@ -169,23 +169,30 @@ cargo llvm-cov --lib --features pg14 --fail-under-lines 80
 
 ### Coverage Enforcement
 
-Coverage is enforced in CI via:
-1. **Codecov Integration** - Uploads coverage and blocks PRs below threshold
-2. **CI Threshold Check** - `--fail-under-lines 80` in workflow
+Coverage is enforced in CI via **Codecov's commit status checks** (configured in `codecov.yml`): the
+`test` job uploads `lcov.info` (produced by `cargo llvm-cov --lib`), and Codecov computes the two statuses
+that gate the PR — `codecov/project` (target 80%) and `codecov/patch` (target 90% on changed lines). The
+workflow itself does **not** run a local `--fail-under-lines` gate; the Codecov statuses are the
+enforcement.
 
 See `codecov.yml` for configuration details.
 
 ### Intentionally Uncovered Code
 
-Some code cannot be unit tested due to pgrx/SPI dependencies. These are excluded from coverage requirements:
+Some code cannot be unit tested due to pgrx/SPI dependencies. These are excluded (via the `ignore:` list in
+`codecov.yml`, mirrored here):
 
 | File | Reason | Tested By |
 |------|--------|-----------|
 | `src/kafka/storage/postgres.rs` | SPI calls | E2E tests |
 | `src/worker.rs` | Main loop, SPI | E2E tests |
 | `src/kafka/listener.rs` | Async runtime | E2E tests |
-| `src/config.rs` | GUC loading | E2E tests |
+| `src/kafka/shadow/store.rs` | SPI (wraps `PostgresStore`) | E2E (shadow) tests |
+| `src/kafka/handler_context.rs` | Holds the `MockStore` test double | Handler unit tests |
 | `src/lib.rs` | `_PG_init` hook | E2E tests |
+
+**Note:** `src/config.rs` is **not** excluded — its parse/validation/default logic is unit-tested and
+subject to the coverage targets (it was previously listed here in error).
 
 See `docs/PGRX_TESTING_GUIDE.md` for the full testing strategy.
 
