@@ -5,6 +5,10 @@
 // kafka.shadow_status / kafka.shadow_tracking. Writes a raw result ({config, checks, counts}) that
 // assemble.mjs stamps into shadow.json — degrading to a "pending" shape rather than a fabricated green.
 //
+// Every scenario logs its full number set (broker delivered, local stored, forwarded metrics, outbox
+// finalized/pending, failed, retries, lag) and embeds it as `detail` — so a red cell is debuggable from
+// the artifact alone (never-enqueued vs still-pending vs dead-lettered vs under-delivered).
+//
 // Each scenario is independently try/caught (house style, cf. bench.mjs): one flake colours its own cell
 // `fail`, never aborts the run. kafkajs keeps the event loop alive, so the process exits explicitly.
 //
@@ -19,13 +23,15 @@ const REAL_BROKER = process.env.REAL_BROKER || 'localhost:9093';
 const OUT = process.env.OUT || 'shadow-raw.json';
 const N = Number(process.env.RECORDS || 500);
 const RELOAD_WAIT_MS = Number(process.env.RELOAD_WAIT_MS || 3000); // > config_reload_interval_ms (2s)
-const FORWARD_DEADLINE_MS = Number(process.env.FORWARD_DEADLINE_MS || 20000);
+const FORWARD_DEADLINE_MS = Number(process.env.FORWARD_DEADLINE_MS || 30000); // outbox polls at 250ms
+const SETTLE_MS = Number(process.env.SETTLE_MS || 10000); // dwell for the partial / must-not-forward cases
 const stamp = Date.now();
 const body = Buffer.alloc(256, 0x78).toString('latin1');
 
 const kafkaPg = new Kafka({ clientId: 'shadow-evi-pg', brokers: [PG_KAFKA_BROKER], logLevel: logLevel.NOTHING, retry: { retries: 5 } });
 const kafkaReal = new Kafka({ clientId: 'shadow-evi-real', brokers: [REAL_BROKER], logLevel: logLevel.NOTHING, retry: { retries: 5 } });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const between = (x, lo, hi) => x >= lo && x <= hi;
 
 // ── DB helpers (single client; libpq env) ────────────────────────────────────────────────────────
 async function topicId(db, name) {
@@ -61,14 +67,17 @@ async function readStatus(db, name) {
   return r.rows[0] ?? { total_forwarded: 0, total_skipped: 0, total_failed: 0, last_forwarded_offset: -1, lag: 0 };
 }
 
-// external_offset IS NOT NULL = a forward finalized in the durable outbox. error_message is withheld
-// from PUBLIC (SEC-8), so never SELECT * here — only the granted columns.
-async function readOutboxFinalized(db, id) {
+// Outbox rows: external_offset IS NOT NULL = a forward finalized; IS NULL = still pending. error_message
+// is withheld from PUBLIC (SEC-8), so never SELECT * here — only the granted columns (retry_count is one).
+async function readTracking(db, id) {
   const r = await db.query(
-    'SELECT count(*)::int AS n FROM kafka.shadow_tracking WHERE topic_id = $1 AND external_offset IS NOT NULL',
+    `SELECT count(*) FILTER (WHERE external_offset IS NOT NULL)::int AS finalized,
+            count(*) FILTER (WHERE external_offset IS NULL)::int     AS pending,
+            COALESCE(SUM(retry_count), 0)::int                        AS retries
+       FROM kafka.shadow_tracking WHERE topic_id = $1`,
     [id],
   );
-  return r.rows[0].n;
+  return r.rows[0];
 }
 
 async function readLocalStored(db, id) {
@@ -76,15 +85,35 @@ async function readLocalStored(db, id) {
   return r.rows[0].n;
 }
 
-// Poll until pg_kafka reports it forwarded `expect` (async path) or the deadline elapses.
-async function waitForwarded(db, name, expect, deadlineMs) {
+// pg_kafka's full self-reported accounting for a topic.
+async function gather(db, name, id) {
+  const [s, t, local] = await Promise.all([readStatus(db, name), readTracking(db, id), readLocalStored(db, id)]);
+  return {
+    forwardedMetrics: Number(s.total_forwarded),
+    skipped: Number(s.total_skipped),
+    failed: Number(s.total_failed),
+    lag: Number(s.lag),
+    finalized: t.finalized,
+    pending: t.pending,
+    retries: t.retries,
+    localStored: local,
+  };
+}
+
+// Poll until pg_kafka reaches a terminal forwarding state for `expect`: all finalized, or the outbox
+// has drained to a terminal mix of finalized+failed with nothing pending, or the deadline elapses.
+async function waitForForwarding(db, name, id, expect, deadlineMs) {
   const t0 = performance.now();
-  let status = await readStatus(db, name);
-  while (Number(status.total_forwarded) < expect && performance.now() - t0 < deadlineMs) {
+  let g = await gather(db, name, id);
+  while (
+    g.finalized < expect &&
+    !(g.pending === 0 && g.finalized + g.failed >= expect) &&
+    performance.now() - t0 < deadlineMs
+  ) {
     await sleep(1000);
-    status = await readStatus(db, name);
+    g = await gather(db, name, id);
   }
-  return status;
+  return g;
 }
 
 // ── independent confirmation: consume the real broker ─────────────────────────────────────────────
@@ -170,8 +199,6 @@ async function prepTopic(db, key) {
   return { topic, id };
 }
 
-const between = (x, lo, hi) => x >= lo && x <= hi;
-
 async function main() {
   const db = new pg.Client(); // libpq env
   await db.connect();
@@ -187,72 +214,87 @@ async function main() {
 
   const checks = [];
   let counts = null;
-  const record = (name, status) => { checks.push({ name, status }); console.log(`  ${name}: ${status}`); };
+  const record = (name, status, detail) => {
+    checks.push({ name, status, detail });
+    const d = detail || {};
+    console.log(
+      `  ${name}: ${status}  [broker=${d.forwardedToBroker} local=${d.localStored} metrics=${d.forwardedMetrics} ` +
+        `finalized=${d.finalized} pending=${d.pending} failed=${d.failed} retries=${d.retries} lag=${d.lag}]`,
+    );
+  };
 
-  // dual_write_sync — the headline 100% parity scenario; its counts become the artifact's `counts`.
+  // dual_write_sync — the headline 100% parity scenario; its numbers become the artifact's `counts`.
   try {
     const { topic, id } = await prepTopic(db, 'dual-write-sync');
     await applyShadowConfig(db, id, { sync: 'sync', write: 'dual_write', pct: 100 });
     await produceN(topic, N);
-    const status = await waitForwarded(db, topic, N, FORWARD_DEADLINE_MS);
+    const g = await waitForForwarding(db, topic, id, N, FORWARD_DEADLINE_MS);
     const forwardedToBroker = await countExternal(topic, { min: N });
-    const localStored = await readLocalStored(db, id);
-    const outboxFinalized = await readOutboxFinalized(db, id);
+    const detail = { produced: N, forwardedToBroker, ...g };
     counts = {
       produced: N,
       forwardedToBroker,
-      localStored,
-      shadowMetricsForwarded: Number(status.total_forwarded),
-      skipped: Number(status.total_skipped),
-      failed: Number(status.total_failed),
-      outboxFinalized,
-      lag: Number(status.lag),
+      localStored: g.localStored,
+      shadowMetricsForwarded: g.forwardedMetrics,
+      skipped: g.skipped,
+      failed: g.failed,
+      outboxFinalized: g.finalized,
+      lag: g.lag,
     };
-    record('dual_write_sync', forwardedToBroker === N && localStored === N ? 'pass' : 'fail');
+    record('dual_write_sync', forwardedToBroker >= N && g.localStored === N && g.finalized >= N ? 'pass' : 'fail', detail);
   } catch (err) {
     console.error(`  [dual_write_sync] ${err.message}`);
-    record('dual_write_sync', 'fail');
+    record('dual_write_sync', 'fail', null);
   }
 
-  // dual_write_async — forwarding off the ack path; still full parity once it drains.
+  // dual_write_async — forwarding off the ack path; still full parity once the outbox drains.
   try {
     const { topic, id } = await prepTopic(db, 'dual-write-async');
     await applyShadowConfig(db, id, { sync: 'async', write: 'dual_write', pct: 100 });
     await produceN(topic, N);
-    await waitForwarded(db, topic, N, FORWARD_DEADLINE_MS);
+    const g = await waitForForwarding(db, topic, id, N, FORWARD_DEADLINE_MS);
     const forwardedToBroker = await countExternal(topic, { min: N });
-    const localStored = await readLocalStored(db, id);
-    record('dual_write_async', forwardedToBroker === N && localStored === N ? 'pass' : 'fail');
+    record('dual_write_async', forwardedToBroker >= N && g.localStored === N && g.finalized >= N ? 'pass' : 'fail', {
+      produced: N,
+      forwardedToBroker,
+      ...g,
+    });
   } catch (err) {
     console.error(`  [dual_write_async] ${err.message}`);
-    record('dual_write_async', 'fail');
+    record('dual_write_async', 'fail', null);
   }
 
-  // external_only — forwards without dual-writing. The definite property is that forwarding still hits
-  // 100%; localStored is recorded for context, not asserted (its semantics vary with dead-letter reads).
+  // external_only — forwards without dual-writing. Definite property: forwarding still reaches 100%
+  // (localStored is recorded for context, not asserted — its semantics vary with dead-letter reads).
   try {
     const { topic, id } = await prepTopic(db, 'external-only');
     await applyShadowConfig(db, id, { sync: 'sync', write: 'external_only', pct: 100 });
     await produceN(topic, N);
-    await waitForwarded(db, topic, N, FORWARD_DEADLINE_MS);
+    const g = await waitForForwarding(db, topic, id, N, FORWARD_DEADLINE_MS);
     const forwardedToBroker = await countExternal(topic, { min: N });
-    record('external_only', forwardedToBroker === N ? 'pass' : 'fail');
+    record('external_only', forwardedToBroker >= N && g.finalized >= N ? 'pass' : 'fail', { produced: N, forwardedToBroker, ...g });
   } catch (err) {
     console.error(`  [external_only] ${err.message}`);
-    record('external_only', 'fail');
+    record('external_only', 'fail', null);
   }
 
-  // percentage_50 — sampled forwarding. Wide band around N/2 (binomial 3σ for N=500 is ±33).
+  // percentage_50 — sampled forwarding. Wide band around N/2 (binomial 3σ for N=500 is ±33). Banded on
+  // pg_kafka's own forwarded metric (stabler than a partial external consume).
   try {
     const { topic, id } = await prepTopic(db, 'percentage-50');
     await applyShadowConfig(db, id, { sync: 'sync', write: 'dual_write', pct: 50 });
     await produceN(topic, N);
-    await sleep(FORWARD_DEADLINE_MS / 2);
+    await sleep(SETTLE_MS);
+    const g = await gather(db, topic, id);
     const forwardedToBroker = await countExternal(topic, { min: null, quietMs: 6000 });
-    record('percentage_50', between(forwardedToBroker, Math.floor(N * 0.3), Math.ceil(N * 0.7)) ? 'pass' : 'fail');
+    record('percentage_50', between(g.forwardedMetrics, Math.floor(N * 0.3), Math.ceil(N * 0.7)) ? 'pass' : 'fail', {
+      produced: N,
+      forwardedToBroker,
+      ...g,
+    });
   } catch (err) {
     console.error(`  [percentage_50] ${err.message}`);
-    record('percentage_50', 'fail');
+    record('percentage_50', 'fail', null);
   }
 
   // committed_txn_forwarded — records in a committed txn are forwarded on commit.
@@ -260,12 +302,12 @@ async function main() {
     const { topic, id } = await prepTopic(db, 'committed-txn');
     await applyShadowConfig(db, id, { sync: 'sync', write: 'dual_write', pct: 100 });
     await produceTxn(topic, N, true);
-    await waitForwarded(db, topic, N, FORWARD_DEADLINE_MS);
+    const g = await waitForForwarding(db, topic, id, N, FORWARD_DEADLINE_MS);
     const forwardedToBroker = await countExternal(topic, { min: N });
-    record('committed_txn_forwarded', forwardedToBroker === N ? 'pass' : 'fail');
+    record('committed_txn_forwarded', forwardedToBroker >= N && g.finalized >= N ? 'pass' : 'fail', { produced: N, forwardedToBroker, ...g });
   } catch (err) {
     console.error(`  [committed_txn_forwarded] ${err.message}`);
-    record('committed_txn_forwarded', 'fail');
+    record('committed_txn_forwarded', 'fail', null);
   }
 
   // aborted_txn_not_forwarded — records in an aborted txn are NEVER forwarded (read-committed).
@@ -273,12 +315,17 @@ async function main() {
     const { topic, id } = await prepTopic(db, 'aborted-txn');
     await applyShadowConfig(db, id, { sync: 'sync', write: 'dual_write', pct: 100 });
     await produceTxn(topic, N, false);
-    await sleep(FORWARD_DEADLINE_MS / 2);
+    await sleep(SETTLE_MS);
+    const g = await gather(db, topic, id);
     const forwardedToBroker = await countExternal(topic, { min: 0, quietMs: 6000 });
-    record('aborted_txn_not_forwarded', forwardedToBroker === 0 ? 'pass' : 'fail');
+    record('aborted_txn_not_forwarded', forwardedToBroker === 0 && g.forwardedMetrics === 0 && g.finalized === 0 ? 'pass' : 'fail', {
+      produced: N,
+      forwardedToBroker,
+      ...g,
+    });
   } catch (err) {
     console.error(`  [aborted_txn_not_forwarded] ${err.message}`);
-    record('aborted_txn_not_forwarded', 'fail');
+    record('aborted_txn_not_forwarded', 'fail', null);
   }
 
   await db.end().catch(() => {});
