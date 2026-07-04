@@ -49,6 +49,89 @@ const PRODUCER_IDEMPOTENCE_MIN_RETRIES: &str = "3";
 const PRODUCER_REQUEST_TIMEOUT_MS: &str = "30000";
 const PRODUCER_MESSAGE_TIMEOUT_MS: &str = "120000";
 
+/// Assemble the ordered librdkafka settings for the shadow forwarding producer.
+///
+/// Pure — no client creation, no IO — so the security/idempotence invariants can
+/// be unit-tested without a live broker (mirrors the `validate_sequence`
+/// extraction in `storage/mod.rs`). [`ShadowProducer::create_producer`] applies
+/// these to a `ClientConfig` and calls `.create()`. Behaviour is identical to the
+/// previous inline `client_config.set(...)` calls; the only structural change is
+/// that `retries` is now resolved once (the idempotence fallback folded in)
+/// instead of being set then conditionally overwritten.
+fn build_producer_settings(config: &ShadowConfig) -> Vec<(&'static str, String)> {
+    // Basic configuration + security protocol are always set.
+    // (SASL_SSL, SASL_PLAINTEXT, SSL, or PLAINTEXT for security.protocol.)
+    let mut settings: Vec<(&'static str, String)> = vec![
+        ("bootstrap.servers", config.bootstrap_servers.clone()),
+        ("security.protocol", config.security_protocol.clone()),
+    ];
+
+    // SASL configuration (if using a SASL_* protocol)
+    if config.security_protocol.starts_with("SASL") {
+        settings.push(("sasl.mechanism", config.sasl_mechanism.clone()));
+
+        // Empty credentials are omitted — librdkafka rejects empty SASL fields.
+        if !config.sasl_username.is_empty() {
+            settings.push(("sasl.username", config.sasl_username.clone()));
+        }
+        if !config.sasl_password.is_empty() {
+            settings.push(("sasl.password", config.sasl_password.clone()));
+        }
+    }
+
+    // SSL configuration (if using an *_SSL protocol)
+    if config.security_protocol.ends_with("SSL") {
+        if !config.ssl_ca_location.is_empty() {
+            settings.push(("ssl.ca.location", config.ssl_ca_location.clone()));
+        }
+        // Enable hostname verification for security.
+        let https = "https".to_string();
+        settings.push(("ssl.endpoint.identification.algorithm", https));
+    }
+
+    // Producer performance settings
+    settings.push(("batch.size", config.batch_size.to_string()));
+    settings.push(("linger.ms", config.linger_ms.to_string()));
+    settings.push(("retry.backoff.ms", config.retry_backoff_ms.to_string()));
+
+    // Compression (use none for maximum compatibility)
+    settings.push(("compression.type", "none".to_string()));
+
+    // SH-12: idempotent producer. The durable outbox replays a row on any crash
+    // before its ack is recorded, so the forwarding producer de-dups retries to
+    // avoid double-delivery to the external broker. Note the guarantee is bounded:
+    // librdkafka idempotence only suppresses duplicates *within a single producer
+    // session* (a stable PID + per-partition sequence). A replay that crosses a
+    // producer restart (new PID) is NOT recognized as a duplicate, so external
+    // delivery is at-least-once, not exactly-once. Idempotence still requires
+    // acks=all, a bounded in-flight window, and retries > 0 — set them explicitly
+    // so the config is valid regardless of librdkafka defaults.
+    //
+    // Long const values are bound to short locals first so each `push` stays well
+    // inside rustfmt's width heuristics (and to avoid a re-alloc per call site).
+    let max_in_flight = PRODUCER_MAX_IN_FLIGHT.to_string();
+    let retries = if config.max_retries < 1 {
+        // Idempotence needs at least one retry to be meaningful.
+        PRODUCER_IDEMPOTENCE_MIN_RETRIES.to_string()
+    } else {
+        config.max_retries.to_string()
+    };
+    settings.push(("enable.idempotence", "true".to_string()));
+    settings.push(("max.in.flight.requests.per.connection", max_in_flight));
+    settings.push(("acks", "all".to_string()));
+    settings.push(("retries", retries));
+
+    // NOTE: deprecated api.version.* settings are intentionally NOT set — they
+    // caused "Required feature not supported by broker" errors with modern Kafka,
+    // which negotiates the API version automatically.
+    let request_timeout = PRODUCER_REQUEST_TIMEOUT_MS.to_string();
+    let message_timeout = PRODUCER_MESSAGE_TIMEOUT_MS.to_string();
+    settings.push(("request.timeout.ms", request_timeout));
+    settings.push(("message.timeout.ms", message_timeout));
+
+    settings
+}
+
 /// Shadow producer for forwarding messages to external Kafka
 pub struct ShadowProducer {
     /// The underlying rdkafka producer
@@ -82,78 +165,18 @@ impl ShadowProducer {
         Ok(Self { producer, config })
     }
 
-    /// Create the rdkafka producer with SASL/SSL configuration
+    /// Create the rdkafka producer with SASL/SSL configuration.
+    ///
+    /// The librdkafka key/value assembly lives in the pure
+    /// [`build_producer_settings`] free function so the security and idempotence
+    /// invariants can be unit-tested without a live broker (mirrors the
+    /// `validate_sequence` extraction pattern). This shell only applies the
+    /// settings and calls `.create()`, which connects and is therefore E2E-only.
     fn create_producer(config: &ShadowConfig) -> ShadowResult<FutureProducer> {
         let mut client_config = ClientConfig::new();
-
-        // Basic configuration
-        client_config.set("bootstrap.servers", &config.bootstrap_servers);
-
-        // Security protocol (SASL_SSL, SASL_PLAINTEXT, SSL, PLAINTEXT)
-        client_config.set("security.protocol", &config.security_protocol);
-
-        // SASL configuration (if using SASL_* protocol)
-        if config.security_protocol.starts_with("SASL") {
-            client_config.set("sasl.mechanism", &config.sasl_mechanism);
-
-            if !config.sasl_username.is_empty() {
-                client_config.set("sasl.username", &config.sasl_username);
-            }
-
-            if !config.sasl_password.is_empty() {
-                client_config.set("sasl.password", &config.sasl_password);
-            }
+        for (key, value) in build_producer_settings(config) {
+            client_config.set(key, value);
         }
-
-        // SSL configuration (if using *_SSL protocol)
-        if config.security_protocol.ends_with("SSL") {
-            if !config.ssl_ca_location.is_empty() {
-                client_config.set("ssl.ca.location", &config.ssl_ca_location);
-            }
-
-            // Enable hostname verification for security
-            client_config.set("ssl.endpoint.identification.algorithm", "https");
-        }
-
-        // Producer performance settings
-        client_config.set("batch.size", config.batch_size.to_string());
-        client_config.set("linger.ms", config.linger_ms.to_string());
-        client_config.set("retry.backoff.ms", config.retry_backoff_ms.to_string());
-        client_config.set("retries", config.max_retries.to_string());
-
-        // Compression (use none for maximum compatibility)
-        client_config.set("compression.type", "none");
-
-        // SH-12: idempotent producer. The durable outbox replays a row on any
-        // crash before its ack is recorded, so the forwarding producer de-dups
-        // retries to avoid double-delivery to the external broker. Note the
-        // guarantee is bounded: librdkafka idempotence only suppresses duplicates
-        // *within a single producer session* (a stable PID + per-partition
-        // sequence). A replay that crosses a producer restart (new PID) is NOT
-        // recognized as a duplicate, so external delivery is at-least-once, not
-        // exactly-once. Idempotence still requires acks=all, a bounded in-flight
-        // window, and retries > 0 — set them explicitly so the config is valid
-        // regardless of librdkafka defaults.
-        client_config.set("enable.idempotence", "true");
-        client_config.set(
-            "max.in.flight.requests.per.connection",
-            PRODUCER_MAX_IN_FLIGHT,
-        );
-        client_config.set("acks", "all");
-        if config.max_retries < 1 {
-            // Idempotence needs at least one retry to be meaningful.
-            client_config.set("retries", PRODUCER_IDEMPOTENCE_MIN_RETRIES);
-        }
-
-        // NOTE: Removed deprecated api.version.* settings that caused
-        // "Required feature not supported by broker" errors with modern Kafka.
-        // Modern librdkafka handles API negotiation automatically.
-
-        // Request timeout and message timeout
-        client_config.set("request.timeout.ms", PRODUCER_REQUEST_TIMEOUT_MS);
-        client_config.set("message.timeout.ms", PRODUCER_MESSAGE_TIMEOUT_MS);
-
-        // Create the producer
         client_config
             .create()
             .map_err(|e| ShadowError::ProducerError(format!("Failed to create producer: {}", e)))
@@ -573,5 +596,169 @@ mod tests {
             ..Default::default()
         };
         assert!(config3.is_configured());
+    }
+
+    /// True if the assembled settings contain `key` mapped exactly to `value`.
+    fn has(settings: &[(&'static str, String)], key: &str, value: &str) -> bool {
+        for (k, v) in settings {
+            if *k == key && v.as_str() == value {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// True if the assembled settings contain `key` with any value.
+    fn has_key(settings: &[(&'static str, String)], key: &str) -> bool {
+        settings.iter().any(|(k, _)| *k == key)
+    }
+
+    #[test]
+    fn test_build_producer_settings_idempotence_invariants() {
+        // A valid idempotent producer requires acks=all, a bounded in-flight
+        // window (librdkafka caps this at 5 for enable.idempotence=true), and
+        // idempotence enabled. These invariants must hold for any config.
+        let config = ShadowConfig {
+            enabled: true,
+            bootstrap_servers: "kafka:9092".to_string(),
+            security_protocol: "SASL_SSL".to_string(),
+            max_retries: 5,
+            ..Default::default()
+        };
+        let s = build_producer_settings(&config);
+        assert!(has(&s, "enable.idempotence", "true"));
+        assert!(has(&s, "max.in.flight.requests.per.connection", "5"));
+        assert!(has(&s, "acks", "all"));
+        assert!(has(&s, "compression.type", "none"));
+    }
+
+    #[test]
+    fn test_build_producer_settings_retries_fallback() {
+        // Idempotence needs >= 1 retry: when max_retries < 1 the assembly must
+        // fall back to the idempotence minimum, otherwise the configured value.
+        let mut config = ShadowConfig {
+            enabled: true,
+            bootstrap_servers: "kafka:9092".to_string(),
+            max_retries: 0,
+            ..Default::default()
+        };
+        assert!(has(&build_producer_settings(&config), "retries", "3"));
+
+        config.max_retries = 7;
+        assert!(has(&build_producer_settings(&config), "retries", "7"));
+    }
+
+    #[test]
+    fn test_build_producer_settings_sasl_only_for_sasl_protocol() {
+        // SASL keys are present for SASL* protocols and absent otherwise.
+        let sasl = ShadowConfig {
+            enabled: true,
+            bootstrap_servers: "kafka:9092".to_string(),
+            security_protocol: "SASL_SSL".to_string(),
+            sasl_mechanism: "SCRAM-SHA-256".to_string(),
+            sasl_username: "user".to_string(),
+            sasl_password: "pass".to_string(),
+            ..Default::default()
+        };
+        let s = build_producer_settings(&sasl);
+        assert!(has(&s, "sasl.mechanism", "SCRAM-SHA-256"));
+        assert!(has(&s, "sasl.username", "user"));
+        assert!(has(&s, "sasl.password", "pass"));
+
+        let plaintext = ShadowConfig {
+            enabled: true,
+            bootstrap_servers: "kafka:9092".to_string(),
+            security_protocol: "PLAINTEXT".to_string(),
+            ..Default::default()
+        };
+        let s = build_producer_settings(&plaintext);
+        assert!(!has_key(&s, "sasl.mechanism"));
+        assert!(!has_key(&s, "sasl.username"));
+        assert!(!has_key(&s, "sasl.password"));
+    }
+
+    #[test]
+    fn test_build_producer_settings_empty_sasl_credentials_omitted() {
+        // Empty username/password must not be emitted (librdkafka rejects empty
+        // SASL fields); the mechanism is still set for a SASL protocol.
+        let config = ShadowConfig {
+            enabled: true,
+            bootstrap_servers: "kafka:9092".to_string(),
+            security_protocol: "SASL_PLAINTEXT".to_string(),
+            sasl_username: String::new(),
+            sasl_password: String::new(),
+            ..Default::default()
+        };
+        let s = build_producer_settings(&config);
+        assert!(has_key(&s, "sasl.mechanism"));
+        assert!(!has_key(&s, "sasl.username"));
+        assert!(!has_key(&s, "sasl.password"));
+    }
+
+    #[test]
+    fn test_build_producer_settings_ssl_endpoint_only_for_ssl() {
+        // Hostname verification is set only for *SSL protocols.
+        let ssl = ShadowConfig {
+            enabled: true,
+            bootstrap_servers: "kafka:9092".to_string(),
+            security_protocol: "SSL".to_string(),
+            ..Default::default()
+        };
+        let key = "ssl.endpoint.identification.algorithm";
+        assert!(has(&build_producer_settings(&ssl), key, "https"));
+
+        let plaintext = ShadowConfig {
+            enabled: true,
+            bootstrap_servers: "kafka:9092".to_string(),
+            security_protocol: "PLAINTEXT".to_string(),
+            ..Default::default()
+        };
+        assert!(!has_key(&build_producer_settings(&plaintext), key));
+    }
+
+    #[test]
+    fn test_build_producer_settings_ca_location_conditional() {
+        // ssl.ca.location is emitted only when configured.
+        let with_ca = ShadowConfig {
+            enabled: true,
+            bootstrap_servers: "kafka:9092".to_string(),
+            security_protocol: "SSL".to_string(),
+            ssl_ca_location: "/etc/ssl/ca.pem".to_string(),
+            ..Default::default()
+        };
+        let s = build_producer_settings(&with_ca);
+        assert!(has(&s, "ssl.ca.location", "/etc/ssl/ca.pem"));
+
+        let without_ca = ShadowConfig {
+            enabled: true,
+            bootstrap_servers: "kafka:9092".to_string(),
+            security_protocol: "SSL".to_string(),
+            ssl_ca_location: String::new(),
+            ..Default::default()
+        };
+        let s = build_producer_settings(&without_ca);
+        assert!(!has_key(&s, "ssl.ca.location"));
+    }
+
+    #[test]
+    fn test_build_producer_settings_maps_config_values() {
+        // Bootstrap servers, timeouts, and performance knobs carry through.
+        let config = ShadowConfig {
+            enabled: true,
+            bootstrap_servers: "a:9092,b:9092".to_string(),
+            security_protocol: "PLAINTEXT".to_string(),
+            batch_size: 4096,
+            linger_ms: 25,
+            retry_backoff_ms: 200,
+            ..Default::default()
+        };
+        let s = build_producer_settings(&config);
+        assert!(has(&s, "bootstrap.servers", "a:9092,b:9092"));
+        assert!(has(&s, "security.protocol", "PLAINTEXT"));
+        assert!(has(&s, "batch.size", "4096"));
+        assert!(has(&s, "linger.ms", "25"));
+        assert!(has(&s, "retry.backoff.ms", "200"));
+        assert!(has(&s, "request.timeout.ms", "30000"));
+        assert!(has(&s, "message.timeout.ms", "120000"));
     }
 }

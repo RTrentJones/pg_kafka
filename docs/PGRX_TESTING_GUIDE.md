@@ -202,15 +202,23 @@ When adding new functionality to pg_kafka:
 
 ## Code That Cannot Be Unit Tested
 
-Some code paths cannot be covered by unit tests due to pgrx/SPI dependencies. These are excluded from coverage requirements and tested via E2E:
+Some code paths cannot be covered by unit tests due to pgrx/SPI dependencies. These are excluded from
+coverage requirements (via the `ignore:` list in `codecov.yml`) and tested via E2E. This table mirrors
+that list exactly:
 
 | File | Reason | Covered By |
 |------|--------|------------|
 | `src/kafka/storage/postgres.rs` | SPI calls | E2E tests |
 | `src/worker.rs` | Main loop, SPI | E2E tests |
 | `src/kafka/listener.rs` | Async runtime, tokio | E2E tests |
-| `src/config.rs` | GUC loading | E2E tests |
+| `src/kafka/shadow/store.rs` | SPI (wraps `PostgresStore`) | E2E (shadow) tests |
+| `src/kafka/handler_context.rs` | Holds the `MockStore` test double (drags coverage) | Handler unit tests |
 | `src/lib.rs` | `_PG_init` hook | E2E tests |
+| `src/bin/**`, `**/*_embed.rs` | pgrx-generated | N/A |
+
+> **Note:** `src/config.rs` is **not** excluded. Its GUC loading needs the running server, but the parse/
+> validation/default logic is unit-testable and gated — it has its own unit tests and is subject to the
+> coverage targets like any other non-ignored file. (It was previously listed here in error.)
 
 ## Test-Safe Logging
 
