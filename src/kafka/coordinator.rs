@@ -1611,8 +1611,14 @@ mod tests {
     fn test_group_state_as_str_wire_strings() {
         // These are echoed on the wire (DescribeGroups/ListGroups); pin them.
         assert_eq!(GroupState::Empty.as_str(), "Empty");
-        assert_eq!(GroupState::PreparingRebalance.as_str(), "PreparingRebalance");
-        assert_eq!(GroupState::CompletingRebalance.as_str(), "CompletingRebalance");
+        assert_eq!(
+            GroupState::PreparingRebalance.as_str(),
+            "PreparingRebalance"
+        );
+        assert_eq!(
+            GroupState::CompletingRebalance.as_str(),
+            "CompletingRebalance"
+        );
         assert_eq!(GroupState::Stable.as_str(), "Stable");
         assert_eq!(GroupState::Dead.as_str(), "Dead");
     }
