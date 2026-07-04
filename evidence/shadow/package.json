@@ -1,0 +1,10 @@
+{
+  "name": "pg-kafka-shadow",
+  "private": true,
+  "type": "module",
+  "description": "Shadow-mode forwarding compliance evidence: drive pg_kafka's live forwarding path and confirm delivery on the real broker.",
+  "dependencies": {
+    "kafkajs": "^2.2.4",
+    "pg": "^8.12.0"
+  }
+}

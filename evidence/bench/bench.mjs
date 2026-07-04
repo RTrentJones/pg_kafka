@@ -17,6 +17,14 @@ const N = Number(process.env.MESSAGES || 2000);
 const WARMUP = Number(process.env.WARMUP || 200);
 const BATCH = Number(process.env.BATCH || 100);
 const SIZE = Number(process.env.MSG_SIZE || 1024);
+// Shadow-bench knobs (behaviour identical to a plain run when all three are unset):
+//   TOPIC — produce to this fixed, pre-configured topic instead of a random one (so the run targets a
+//           topic whose kafka.shadow_config was applied beforehand by run.sh).
+//   TAG   — inject into scenario names, e.g. `produce · batched(100) · shadow-sync · 1024B`.
+//   ONLY  — comma-list of scenario keys to run (shadow only needs `produce-batched`).
+const TAG = process.env.TAG || '';
+const tag = TAG ? ` · ${TAG}` : '';
+const ONLY = (process.env.ONLY || '').split(',').map((s) => s.trim()).filter(Boolean);
 
 const body = Buffer.alloc(SIZE, 0x78).toString('latin1'); // ~SIZE-byte payload
 const pct = (xs, p) => {
@@ -41,6 +49,7 @@ const kafka = new Kafka({
 
 const scenarios = [];
 async function scenario(name, fn) {
+  if (ONLY.length && !ONLY.includes(name)) return; // ONLY filters by scenario key (not the display name)
   try {
     scenarios.push(await fn());
     const s = scenarios[scenarios.length - 1];
@@ -55,8 +64,10 @@ async function main() {
   const producer = kafka.producer({ allowAutoTopicCreation: true });
   await admin.connect();
   await producer.connect();
-  const topic = `bench-${LABEL}-${Date.now()}`;
-  await admin.createTopics({ topics: [{ topic, numPartitions: 1 }], waitForLeaders: true });
+  const topic = process.env.TOPIC || `bench-${LABEL}-${Date.now()}`;
+  // Idempotent: with TOPIC set the topic is pre-created + shadow-configured by run.sh, so tolerate
+  // an existing topic rather than failing the run.
+  await admin.createTopics({ topics: [{ topic, numPartitions: 1 }], waitForLeaders: true }).catch(() => {});
 
   await scenario('produce-unbatched', async () => {
     for (let i = 0; i < WARMUP; i++) await producer.send({ topic, messages: [{ value: body }] });
@@ -67,7 +78,7 @@ async function main() {
       await producer.send({ topic, messages: [{ value: body }] });
       lat.push(performance.now() - s);
     }
-    return summarize(`produce · unbatched · ${SIZE}B`, lat, performance.now() - t0, N);
+    return summarize(`produce · unbatched${tag} · ${SIZE}B`, lat, performance.now() - t0, N);
   });
 
   await scenario('produce-batched', async () => {
@@ -81,7 +92,7 @@ async function main() {
       await producer.send({ topic, messages: batch });
       lat.push(performance.now() - s);
     }
-    return summarize(`produce · batched(${BATCH}) · ${SIZE}B`, lat, performance.now() - t0, batches * BATCH);
+    return summarize(`produce · batched(${BATCH})${tag} · ${SIZE}B`, lat, performance.now() - t0, batches * BATCH);
   });
 
   await scenario('consume', async () => {
@@ -110,7 +121,7 @@ async function main() {
           })
           .catch(reject);
       });
-      return summarize(`consume · ${SIZE}B`, lat, performance.now() - t0, count);
+      return summarize(`consume${tag} · ${SIZE}B`, lat, performance.now() - t0, count);
     } finally {
       await consumer.disconnect().catch(() => {});
     }
@@ -147,7 +158,7 @@ async function main() {
         await producer.send({ topic, messages: [{ value: stamp + body.slice(16) }] });
       }
       await collected;
-      return summarize(`end-to-end · ${SIZE}B`, lat, performance.now() - t0, count);
+      return summarize(`end-to-end${tag} · ${SIZE}B`, lat, performance.now() - t0, count);
     } finally {
       await consumer.disconnect().catch(() => {});
     }

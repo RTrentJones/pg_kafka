@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Orchestrate the three evidence artifacts into <out-dir>: conformance.json, bench.json, session.svg.
+# Orchestrate the evidence artifacts into <out-dir>: conformance.json, bench.json, session.svg, shadow.json.
 # This is the single entrypoint the CI evidence workflow calls once the environment is up. Assumes
 # (the workflow sets these up):
 #   - pg_kafka's Kafka listener on $PG_KAFKA_BROKER (default localhost:9092)
@@ -28,6 +28,9 @@ bash "$ROOT/evidence/bench/run.sh" "$OUT_DIR" || echo "::warning::benchmark step
 
 echo "### recording"
 bash "$ROOT/scripts/record-session.sh" "$OUT_DIR" || echo "::warning::recording step failed"
+
+echo "### shadow"
+bash "$ROOT/evidence/shadow/run.sh" "$OUT_DIR" || echo "::warning::shadow step failed"
 
 echo "### artifacts in $OUT_DIR"
 ls -la "$OUT_DIR"
