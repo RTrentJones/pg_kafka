@@ -52,9 +52,15 @@ pub fn dispatch_response<R, F, W, E>(
     // still rolls back the request's partial writes (see worker::run_request_in_subtransaction).
     // The panic branch does only Rust work (channel send + response construction, Rust allocator) —
     // no Postgres calls — so it is safe to run before FlushErrorState at the subtransaction boundary.
-    match catch_unwind(AssertUnwindSafe(handler)) {
-        Ok(Ok(result)) => {
-            let response = wrap_response(result);
+    // RV-3: the guard must also cover the success response *builder*
+    // (`wrap_response`), not just `handler`. Building the response inside the
+    // catch_unwind means a panic there (e.g. a Postgres ERROR in a builder that
+    // reads SPI) still replies UNKNOWN_SERVER_ERROR instead of dropping
+    // `response_tx` unsent and hanging the client to its timeout. The error/panic
+    // responses are pure enum construction, built after the guard and always sent.
+    let guarded = catch_unwind(AssertUnwindSafe(|| handler().map(wrap_response)));
+    match guarded {
+        Ok(Ok(response)) => {
             if let Err(e) = response_tx.send(response) {
                 pg_warning!("Failed to send {} response: {}", handler_name, e);
             } else {
@@ -252,6 +258,45 @@ mod tests {
         }));
 
         // The panic is re-raised for the caller (subtransaction) to roll back.
+        assert!(outcome.is_err());
+
+        // ...but an error response was sent first, so the client is not left hanging.
+        match rx.try_recv().expect("error response should have been sent") {
+            KafkaResponse::Error {
+                correlation_id,
+                error_code,
+                ..
+            } => {
+                assert_eq!(correlation_id, 42);
+                assert_eq!(error_code, ERROR_UNKNOWN_SERVER_ERROR);
+            }
+            _ => panic!("Expected Error response"),
+        }
+    }
+
+    #[test]
+    fn test_dispatch_response_builder_panic_replies_and_resumes() {
+        // RV-3: a panic in the SUCCESS response builder (`wrap_response`) — not
+        // just the handler — must still reply UNKNOWN_SERVER_ERROR and re-raise,
+        // so the client isn't left hanging. This fails before `wrap_response` was
+        // moved inside the guard.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            dispatch_response(
+                "Test",
+                tx,
+                || Ok::<i32, KafkaError>(7),
+                |_result| -> KafkaResponse { panic!("builder boom") },
+                |error_code| KafkaResponse::Error {
+                    correlation_id: 42,
+                    error_code,
+                    error_message: None,
+                },
+            );
+        }));
+
+        // The panic is re-raised for the subtransaction to roll back.
         assert!(outcome.is_err());
 
         // ...but an error response was sent first, so the client is not left hanging.
