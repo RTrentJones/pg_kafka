@@ -145,9 +145,29 @@ cargo pgrx schema pg14               # Generate SQL schema files
 - Patch Coverage: 90%+ (new/modified code)
 
 **Enforcement:**
-- CI enforces coverage via Codecov (see `codecov.yml`)
+- CI enforces coverage via Codecov's `project`/`patch` commit statuses (see `codecov.yml`)
 - PRs with coverage below threshold will be blocked
 - Files in `codecov.yml` ignore list are excluded (SPI-dependent code tested via E2E)
+
+**QA-1 rule — SPI/async change ⇒ E2E test (machine-enforced):**
+The files in the `codecov.yml` `ignore:` list (`worker.rs`, `storage/postgres.rs`,
+`shadow/store.rs`, `listener.rs`) can't be seen by unit coverage, so the coverage gate
+can't protect them. The mitigation is mandatory: **every behavioural change to one of
+those files must ship a fail-before / pass-after `kafka_test/` regression test.** This is
+enforced by the `spi-e2e-guard` CI job (`.github/scripts/require-e2e-for-spi.sh`), which
+fails a PR that touches one of those files without also changing anything under
+`kafka_test/`. For a genuinely test-neutral edit (comments/docs/renames), add the
+`no-e2e-needed` label to waive it. Do **not** add a file to the ignore list to route
+untested logic around the patch gate — prefer extracting the pure logic into a testable
+free function (see `validate_sequence` in `storage/mod.rs` and `build_producer_settings`
+in `shadow/producer.rs` for the pattern).
+
+**Single-DB-thread invariant (why the above is safe):** all handlers, the `Arc<RwLock>`
+coordinator, and the `ShadowStore` run on the *one* background-worker DB thread; only the
+crossbeam channel ends cross to the tokio network thread. Several structures
+(coordinator lock, shadow config-cache reload, metrics RMW) are correct *only* under this
+invariant. If you ever make one of them reachable from another thread, you must add
+synchronization — do not assume the current check-then-act code is race-free off-thread.
 
 **Quick Check:**
 ```bash

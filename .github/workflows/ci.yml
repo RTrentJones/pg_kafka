@@ -414,3 +414,22 @@ jobs:
         # Use cargo check --locked to verify lockfile matches Cargo.toml
         # This will fail if Cargo.lock needs updating
         run: cargo check --locked --features pg14
+
+  # QA-1 enforcement (see codecov.yml + CLAUDE.md): the SPI/async files excluded
+  # from unit coverage can't be caught by the codecov gate, so a behavioural change
+  # to one of them must ship a kafka_test E2E regression test. This makes that
+  # mitigation a machine check instead of a prose policy a reviewer might miss.
+  spi-e2e-guard:
+    name: SPI change needs E2E test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require a kafka_test change when an SPI/async file changes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          gh pr view "$PR_NUMBER" --json files --jq '.files[].path' \
+            | bash .github/scripts/require-e2e-for-spi.sh
