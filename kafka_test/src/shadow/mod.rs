@@ -51,4 +51,5 @@ pub use topic_mapping::test_topic_name_mapping;
 pub use transaction_integration::{
     test_aborted_transaction_not_forwarded, test_committed_transaction_forwarded,
     test_committed_transaction_uses_durable_outbox,
+    test_committed_txn_leaves_no_orphan_outbox_rows,
 };
