@@ -132,6 +132,21 @@ pub enum GroupState {
     Dead,
 }
 
+impl GroupState {
+    /// The Kafka wire-protocol group-state string, echoed in DescribeGroups /
+    /// ListGroups. Mirrors `TransactionState::as_str`; centralizes the mapping
+    /// that was previously duplicated across the two handlers.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Empty => "Empty",
+            Self::PreparingRebalance => "PreparingRebalance",
+            Self::CompletingRebalance => "CompletingRebalance",
+            Self::Stable => "Stable",
+            Self::Dead => "Dead",
+        }
+    }
+}
+
 /// Consumer group metadata and state
 #[derive(Debug, Clone)]
 pub struct ConsumerGroup {
@@ -524,8 +539,15 @@ impl GroupCoordinator {
                 .members
                 .values()
                 .flat_map(|m| {
+                    // Hand the leader the metadata for the group-SELECTED protocol
+                    // (what it computes assignments from), not just the member's
+                    // first-listed one — mirrors compute_assignments' selection.
+                    // Fall back to the first protocol only when the member didn't
+                    // advertise the selected one (transient pre-join window).
                     m.protocols
-                        .first()
+                        .iter()
+                        .find(|(name, _)| Some(name) == group.protocol_name.as_ref())
+                        .or_else(|| m.protocols.first())
                         .map(|(_, metadata)| (m.member_id.clone(), metadata.clone()))
                 })
                 .collect()
@@ -1583,6 +1605,94 @@ mod tests {
         // common to both is "range", so that must be selected.
         let g = coordinator.get_group_state("g").expect("group exists");
         assert_eq!(g.protocol_name.as_deref(), Some("range"));
+    }
+
+    #[test]
+    fn test_group_state_as_str_wire_strings() {
+        // These are echoed on the wire (DescribeGroups/ListGroups); pin them.
+        assert_eq!(GroupState::Empty.as_str(), "Empty");
+        assert_eq!(
+            GroupState::PreparingRebalance.as_str(),
+            "PreparingRebalance"
+        );
+        assert_eq!(
+            GroupState::CompletingRebalance.as_str(),
+            "CompletingRebalance"
+        );
+        assert_eq!(GroupState::Stable.as_str(), "Stable");
+        assert_eq!(GroupState::Dead.as_str(), "Dead");
+    }
+
+    #[test]
+    fn test_join_leader_gets_selected_protocol_metadata() {
+        // The leader's returned member metadata must be for the group-SELECTED
+        // protocol, not each member's first-listed one. The leader prefers
+        // "roundrobin" (supported by all → selected); the follower lists "range"
+        // first but also supports "roundrobin", so the leader must receive the
+        // follower's "roundrobin" metadata, not its first ("range") metadata.
+        let coordinator = GroupCoordinator::new();
+
+        let (leader, ..) = coordinator
+            .join_group(
+                "g".to_string(),
+                None,
+                "c1".to_string(),
+                "h".to_string(),
+                300_000,
+                300_000,
+                "consumer".to_string(),
+                vec![
+                    ("roundrobin".to_string(), b"rr-leader".to_vec()),
+                    ("range".to_string(), b"rg-leader".to_vec()),
+                ],
+                None,
+            )
+            .unwrap();
+        // member_id is assigned by the coordinator (we pass None), so capture c2's.
+        let (c2_member, ..) = coordinator
+            .join_group(
+                "g".to_string(),
+                None,
+                "c2".to_string(),
+                "h".to_string(),
+                300_000,
+                300_000,
+                "consumer".to_string(),
+                vec![
+                    ("range".to_string(), b"rg-follower".to_vec()),
+                    ("roundrobin".to_string(), b"rr-follower".to_vec()),
+                ],
+                None,
+            )
+            .unwrap();
+        // Leader rejoins to complete the join phase and receive the member list.
+        let (_, _, is_leader, _, members) = coordinator
+            .join_group(
+                "g".to_string(),
+                Some(leader),
+                "c1".to_string(),
+                "h".to_string(),
+                300_000,
+                300_000,
+                "consumer".to_string(),
+                vec![
+                    ("roundrobin".to_string(), b"rr-leader".to_vec()),
+                    ("range".to_string(), b"rg-leader".to_vec()),
+                ],
+                None,
+            )
+            .unwrap();
+
+        assert!(is_leader);
+        let g = coordinator.get_group_state("g").expect("group exists");
+        assert_eq!(g.protocol_name.as_deref(), Some("roundrobin"));
+
+        let c2_meta = members
+            .iter()
+            .find(|(id, _)| *id == c2_member)
+            .map(|(_, meta)| meta.clone())
+            .expect("c2 in leader member list");
+        assert_eq!(c2_meta, b"rr-follower".to_vec());
     }
 
     #[test]

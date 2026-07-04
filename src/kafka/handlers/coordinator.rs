@@ -323,7 +323,6 @@ pub fn handle_describe_groups(
     groups: Vec<String>,
 ) -> Result<kafka_protocol::messages::describe_groups_response::DescribeGroupsResponse> {
     let coordinator = ctx.coordinator;
-    use crate::kafka::GroupState;
     use kafka_protocol::messages::describe_groups_response::{
         DescribeGroupsResponse, DescribedGroup, DescribedGroupMember,
     };
@@ -346,13 +345,7 @@ pub fn handle_describe_groups(
             Some(group) => {
                 // Group exists - return detailed information
                 described_group.error_code = ERROR_NONE;
-                described_group.group_state = StrBytes::from_string(match group.state {
-                    GroupState::Empty => "Empty".to_string(),
-                    GroupState::PreparingRebalance => "PreparingRebalance".to_string(),
-                    GroupState::CompletingRebalance => "CompletingRebalance".to_string(),
-                    GroupState::Stable => "Stable".to_string(),
-                    GroupState::Dead => "Dead".to_string(),
-                });
+                described_group.group_state = StrBytes::from_static_str(group.state.as_str());
                 described_group.protocol_type = StrBytes::from_string(
                     group
                         .members
@@ -416,7 +409,6 @@ pub fn handle_list_groups(
     states_filter: Vec<String>,
 ) -> Result<kafka_protocol::messages::list_groups_response::ListGroupsResponse> {
     let coordinator = ctx.coordinator;
-    use crate::kafka::GroupState;
     use kafka_protocol::messages::list_groups_response::{ListGroupsResponse, ListedGroup};
     use kafka_protocol::messages::GroupId;
     use kafka_protocol::protocol::StrBytes;
@@ -436,13 +428,7 @@ pub fn handle_list_groups(
     for (group_id, group) in coordinator_groups.iter() {
         // Apply state filter if provided
         if filter_enabled {
-            let state_str = match group.state {
-                GroupState::Empty => "Empty",
-                GroupState::PreparingRebalance => "PreparingRebalance",
-                GroupState::CompletingRebalance => "CompletingRebalance",
-                GroupState::Stable => "Stable",
-                GroupState::Dead => "Dead",
-            };
+            let state_str = group.state.as_str();
 
             if !states_filter.contains(&state_str.to_string()) {
                 continue;
@@ -461,13 +447,7 @@ pub fn handle_list_groups(
         );
 
         // Add group state (v4+)
-        listed_group.group_state = StrBytes::from_string(match group.state {
-            GroupState::Empty => "Empty".to_string(),
-            GroupState::PreparingRebalance => "PreparingRebalance".to_string(),
-            GroupState::CompletingRebalance => "CompletingRebalance".to_string(),
-            GroupState::Stable => "Stable".to_string(),
-            GroupState::Dead => "Dead".to_string(),
-        });
+        listed_group.group_state = StrBytes::from_static_str(group.state.as_str());
 
         response.groups.push(listed_group);
     }
