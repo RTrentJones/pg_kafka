@@ -144,9 +144,8 @@ mod tests {
         let mut mock = MockKafkaStore::new();
         mock.expect_validate_transaction()
             .returning(|_, _, _| Ok(()));
-        mock.expect_get_transaction_state().returning(|_| {
-            Ok(Some(crate::kafka::storage::TransactionState::PrepareCommit))
-        });
+        mock.expect_get_transaction_state()
+            .returning(|_| Ok(Some(crate::kafka::storage::TransactionState::PrepareCommit)));
 
         let topic_data = vec![TopicProduceData {
             name: "t".to_string(),
