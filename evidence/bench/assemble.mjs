@@ -27,8 +27,16 @@ const read = (file) => {
 const pgk = read('bench-pg_kafka.json');
 const realBroker = read('bench-realbroker.json');
 const rawInsert = read('bench-rawinsert.json');
+// Shadow-forwarding throughput rows (async/sync), appended so they render inline in the existing
+// BenchTable next to the plain produce/consume/e2e scenarios. Missing inputs simply contribute nothing.
+const shadowAsync = read('bench-shadow-async.json');
+const shadowSync = read('bench-shadow-sync.json');
 
-const scenarios = pgk?.scenarios ?? [];
+const scenarios = [
+  ...(pgk?.scenarios ?? []),
+  ...(shadowAsync?.scenarios ?? []),
+  ...(shadowSync?.scenarios ?? []),
+];
 
 // Representative throughput for a scenario-style run = its batched-produce scenario (best signal of
 // sustained throughput), else the first scenario.

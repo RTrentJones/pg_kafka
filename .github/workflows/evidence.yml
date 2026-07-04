@@ -167,7 +167,7 @@ jobs:
           cd evidence-out
           shopt -s nullglob
           files=()
-          for f in conformance.json bench.json session.svg; do [ -f "$f" ] && files+=("$f"); done
+          for f in conformance.json bench.json session.svg shadow.json; do [ -f "$f" ] && files+=("$f"); done
           if [ ${#files[@]} -eq 0 ]; then echo "::warning::no artifacts produced — nothing to publish"; exit 0; fi
           git init -q
           git checkout -q -b evidence

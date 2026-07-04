@@ -6,7 +6,7 @@ This directory holds the harnesses that produce that evidence; [`.github/workflo
 runs them (it brings the extension up the same way `ci.yml`'s E2E job does — pgrx on the runner plus
 the real-broker compose).
 
-The three artifacts are force-pushed to the orphan **`evidence`** branch and consumed by the site
+The artifacts are force-pushed to the orphan **`evidence`** branch and consumed by the site
 ([rtrentjones.dev/pg_kafka](https://rtrentjones.dev/pg_kafka)) at build time:
 
 | Artifact | Produced by | Rendered as |
@@ -14,6 +14,11 @@ The three artifacts are force-pushed to the orphan **`evidence`** branch and con
 | `conformance.json` | `evidence/conformance/` | the client × API green/red/na grid |
 | `bench.json` | `evidence/bench/` | the throughput/latency table (+ a Tracer trend) |
 | `session.svg` | `scripts/record-session.sh` | the animated `kcat`/`SELECT` session |
+| `shadow.json` | `evidence/shadow/` | the shadow-mode forwarding compliance table |
+
+Shadow-mode **throughput** is not a separate artifact — `evidence/bench/` adds two shadow-forwarding
+rows (`shadow-async`, `shadow-sync`) directly into `bench.json.scenarios[]`, so they render inline in
+the same benchmark table.
 
 ## Layout
 
@@ -30,10 +35,14 @@ evidence/
     merge.mjs                  # results-*.json → conformance.json
     run.sh                     # run all client harnesses + merge
   bench/
-    bench.mjs                  # Kafka-wire throughput/latency (pg_kafka + real broker)
+    bench.mjs                  # Kafka-wire throughput/latency (pg_kafka + real broker; TOPIC/TAG/ONLY knobs)
     raw_insert.mjs             # raw-INSERT floor (libpq)
-    assemble.mjs               # → bench.json
-    run.sh                     # run all three + assemble
+    assemble.mjs               # → bench.json (incl. the two shadow-forwarding rows)
+    run.sh                     # run all three + the two shadow runs + assemble
+  shadow/
+    shadow.mjs                 # shadow-forwarding compliance (produce → pg_kafka, confirm on real broker)
+    assemble.mjs               # → shadow.json
+    run.sh                     # run the harness + assemble
 .github/scripts/ingest-tracer.mjs   # normalize bench.json → Tracer /api/ingest
 ```
 
@@ -67,6 +76,22 @@ Each harness drives the client through real operations and records, per API, `pa
   "scenarios": [{ "name": "produce · batched(100) · 1024B", "p50Ms": 0, "p99Ms": 0, "msgsPerSec": 0 }],
   "baselines": { "rawInsert": { "msgsPerSec": 0, "p50Ms": 0, "p99Ms": 0 },
                  "realBroker": { "msgsPerSec": 0, "p50Ms": 0, "p99Ms": 0 } }
+}
+```
+
+`shadow.json` — one `checks[]` row per forwarding scenario (`pass|fail|na`), a `counts` parity block for
+the headline 100% dual-write topic, and `passed` (all checks pass **and** `forwardedToBroker == produced`).
+Each scenario produces to pg_kafka, drives the live forwarding path, then independently consumes the real
+broker to confirm delivery.
+```jsonc
+{
+  "generatedAt": "<ISO>", "version": "…", "gitSha": "…",
+  "config": { "records": 500, "forwardPercentage": 100, "writeMode": "dual_write", "syncMode": "sync",
+              "realBroker": "localhost:9093" },
+  "checks": [{ "name": "dual_write_sync", "status": "pass" }, { "name": "aborted_txn_not_forwarded", "status": "pass" } /* …6… */],
+  "counts": { "produced": 500, "forwardedToBroker": 500, "localStored": 500, "shadowMetricsForwarded": 500,
+              "skipped": 0, "failed": 0, "outboxFinalized": 500, "lag": 0 },
+  "passed": true
 }
 ```
 
