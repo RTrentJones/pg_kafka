@@ -1648,7 +1648,8 @@ mod tests {
                 None,
             )
             .unwrap();
-        coordinator
+        // member_id is assigned by the coordinator (we pass None), so capture c2's.
+        let (c2_member, ..) = coordinator
             .join_group(
                 "g".to_string(),
                 None,
@@ -1688,7 +1689,7 @@ mod tests {
 
         let c2_meta = members
             .iter()
-            .find(|(id, _)| id.as_str() == "c2")
+            .find(|(id, _)| *id == c2_member)
             .map(|(_, meta)| meta.clone())
             .expect("c2 in leader member list");
         assert_eq!(c2_meta, b"rr-follower".to_vec());
