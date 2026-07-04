@@ -137,6 +137,116 @@ mod tests {
         assert_eq!(partition_response.error_code, ERROR_UNKNOWN_SERVER_ERROR);
     }
 
+    #[test]
+    fn test_handle_produce_txn_wrong_state_rejected() {
+        // A transactional produce whose transaction is not Ongoing is rejected
+        // with INVALID_TXN_STATE before any record is inserted (produce.rs gate).
+        let mut mock = MockKafkaStore::new();
+        mock.expect_validate_transaction()
+            .returning(|_, _, _| Ok(()));
+        mock.expect_get_transaction_state().returning(|_| {
+            Ok(Some(crate::kafka::storage::TransactionState::PrepareCommit))
+        });
+
+        let topic_data = vec![TopicProduceData {
+            name: "t".to_string(),
+            partitions: vec![PartitionProduceData {
+                partition_index: 0,
+                records: vec![],
+                producer_metadata: None,
+            }],
+        }];
+        let meta = crate::kafka::messages::ProducerMetadata {
+            producer_id: 100,
+            producer_epoch: 0,
+            base_sequence: 0,
+        };
+
+        let coordinator = GroupCoordinator::new();
+        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+
+        let result = produce::handle_produce(&ctx, topic_data, Some(&meta), Some("tx1"));
+        let err = result.unwrap_err();
+        assert_eq!(err.to_kafka_error_code(), ERROR_INVALID_TXN_STATE);
+    }
+
+    #[test]
+    fn test_handle_produce_txn_id_not_found_rejected() {
+        // A transactional produce for an unknown transactional id is rejected
+        // with TRANSACTIONAL_ID_NOT_FOUND (produce.rs gate, None arm).
+        let mut mock = MockKafkaStore::new();
+        mock.expect_validate_transaction()
+            .returning(|_, _, _| Ok(()));
+        mock.expect_get_transaction_state().returning(|_| Ok(None));
+
+        let topic_data = vec![TopicProduceData {
+            name: "t".to_string(),
+            partitions: vec![PartitionProduceData {
+                partition_index: 0,
+                records: vec![],
+                producer_metadata: None,
+            }],
+        }];
+        let meta = crate::kafka::messages::ProducerMetadata {
+            producer_id: 100,
+            producer_epoch: 0,
+            base_sequence: 0,
+        };
+
+        let coordinator = GroupCoordinator::new();
+        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+
+        let result = produce::handle_produce(&ctx, topic_data, Some(&meta), Some("tx1"));
+        let err = result.unwrap_err();
+        assert_eq!(err.to_kafka_error_code(), ERROR_TRANSACTIONAL_ID_NOT_FOUND);
+    }
+
+    #[test]
+    fn test_handle_produce_key_based_routing() {
+        // partition_index == -1 routes each record by key via compute_partition
+        // and produces to the resolved partitions (produce.rs routing branch).
+        let mut mock = MockKafkaStore::new();
+        mock.expect_get_or_create_topic()
+            .returning(|_, _| Ok((1, 3)));
+        mock.expect_insert_records().returning(|_, _, _| Ok(0));
+
+        let topic_data = vec![TopicProduceData {
+            name: "t".to_string(),
+            partitions: vec![PartitionProduceData {
+                partition_index: -1,
+                records: vec![
+                    Record {
+                        key: Some(b"a".to_vec()),
+                        value: Some(b"1".to_vec()),
+                        headers: vec![],
+                        timestamp: None,
+                    },
+                    Record {
+                        key: Some(b"b".to_vec()),
+                        value: Some(b"2".to_vec()),
+                        headers: vec![],
+                        timestamp: None,
+                    },
+                ],
+                producer_metadata: None,
+            }],
+        }];
+
+        let coordinator = GroupCoordinator::new();
+        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+
+        let response = produce::handle_produce(&ctx, topic_data, None, None).unwrap();
+        let topic_response = &response.responses[0];
+        assert!(!topic_response.partition_responses.is_empty());
+        for pr in &topic_response.partition_responses {
+            assert_eq!(pr.error_code, ERROR_NONE);
+            assert!((0..3).contains(&pr.index));
+        }
+    }
+
     // ========== Fetch Handler Tests ==========
 
     #[test]
@@ -225,6 +335,101 @@ mod tests {
 
         let partition_data = &response.responses[0].partitions[0];
         assert_eq!(partition_data.error_code, ERROR_UNKNOWN_TOPIC_OR_PARTITION);
+    }
+
+    #[test]
+    fn test_handle_fetch_storage_error() {
+        // A storage failure while fetching surfaces the mapped Kafka error code
+        // and a sentinel high_watermark of -1 for that partition (fetch.rs error
+        // arm), rather than failing the whole request.
+        let mut mock = MockKafkaStore::new();
+
+        mock.expect_get_topic_metadata().returning(|_| {
+            Ok(vec![TopicMetadata {
+                name: "test-topic".to_string(),
+                id: 1,
+                partition_count: 1,
+            }])
+        });
+
+        mock.expect_fetch_records_with_isolation()
+            .returning(|_, _, _, _, _| {
+                Err(KafkaError::Database {
+                    message: "boom".to_string(),
+                })
+            });
+
+        let topic_data = vec![TopicFetchData {
+            name: "test-topic".to_string(),
+            partitions: vec![PartitionFetchData {
+                partition_index: 0,
+                fetch_offset: 0,
+                partition_max_bytes: 1024,
+            }],
+        }];
+
+        let coordinator = GroupCoordinator::new();
+        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+
+        let response = fetch::handle_fetch(
+            &ctx,
+            topic_data,
+            crate::kafka::storage::IsolationLevel::ReadUncommitted,
+        )
+        .unwrap();
+
+        let partition_data = &response.responses[0].partitions[0];
+        assert_eq!(partition_data.error_code, ERROR_UNKNOWN_SERVER_ERROR);
+        assert_eq!(partition_data.high_watermark, -1);
+    }
+
+    #[test]
+    fn test_handle_fetch_read_committed_uses_lso() {
+        // Under ReadCommitted the response's last_stable_offset comes from the
+        // store's LSO (fetch.rs ReadCommitted arm), not the high watermark; an
+        // empty result set still returns ERROR_NONE with empty record bytes.
+        let mut mock = MockKafkaStore::new();
+
+        mock.expect_get_topic_metadata().returning(|_| {
+            Ok(vec![TopicMetadata {
+                name: "test-topic".to_string(),
+                id: 1,
+                partition_count: 1,
+            }])
+        });
+
+        mock.expect_fetch_records_with_isolation()
+            .returning(|_, _, _, _, _| Ok(vec![]));
+        mock.expect_get_high_watermark().returning(|_, _| Ok(10));
+        mock.expect_get_last_stable_offset().returning(|_, _| Ok(7));
+        mock.expect_get_earliest_offset().returning(|_, _| Ok(0));
+
+        let topic_data = vec![TopicFetchData {
+            name: "test-topic".to_string(),
+            partitions: vec![PartitionFetchData {
+                partition_index: 0,
+                fetch_offset: 0,
+                partition_max_bytes: 1024,
+            }],
+        }];
+
+        let coordinator = GroupCoordinator::new();
+        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+
+        let response = fetch::handle_fetch(
+            &ctx,
+            topic_data,
+            crate::kafka::storage::IsolationLevel::ReadCommitted,
+        )
+        .unwrap();
+
+        let partition_data = &response.responses[0].partitions[0];
+        assert_eq!(partition_data.error_code, ERROR_NONE);
+        assert_eq!(partition_data.high_watermark, 10);
+        assert_eq!(partition_data.last_stable_offset, 7);
+        assert!(partition_data.records.is_some());
     }
 
     // ========== ListOffsets Handler Tests ==========
@@ -411,6 +616,33 @@ mod tests {
             ERROR_UNKNOWN_TOPIC_OR_PARTITION
         );
         assert!(response.topics[0].partitions.is_empty());
+    }
+
+    #[test]
+    fn test_handle_api_versions_ok() {
+        // handle_api_versions delegates to the response builder; it must report a
+        // NONE error code so clients accept the advertised API range.
+        let response = metadata::handle_api_versions();
+        assert_eq!(response.error_code, ERROR_NONE);
+    }
+
+    #[test]
+    fn test_handle_metadata_storage_error_propagates() {
+        // A storage failure listing all topics propagates as a handler error
+        // rather than a partial/empty success (metadata.rs error path).
+        let mut mock = MockKafkaStore::new();
+        mock.expect_get_topic_metadata().returning(|_| {
+            Err(KafkaError::Database {
+                message: "boom".to_string(),
+            })
+        });
+
+        let coordinator = GroupCoordinator::new();
+        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+
+        let result = metadata::handle_metadata(&ctx, None, true);
+        assert!(result.is_err());
     }
 
     // ========== OffsetCommit Handler Tests ==========

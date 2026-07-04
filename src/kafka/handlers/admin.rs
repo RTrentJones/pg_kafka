@@ -557,4 +557,23 @@ mod tests {
         assert!(validate_topic_name("bad/slash").is_err());
         assert!(validate_topic_name(&"x".repeat(250)).is_err());
     }
+
+    #[test]
+    fn test_delete_groups_unknown_group_deletes_offsets() {
+        // A group absent from the coordinator still attempts to delete any
+        // orphaned committed offsets and reports NONE (delete_groups None arm).
+        let mut store = MockKafkaStore::new();
+        store
+            .expect_delete_consumer_group_offsets()
+            .returning(|_| Ok(()));
+
+        let coordinator = crate::kafka::GroupCoordinator::new();
+        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = make_test_context(&store, &coordinator, &broker);
+        let result = handle_delete_groups(&ctx, vec!["ghost".to_string()]);
+        assert!(result.is_ok());
+
+        let response = result.unwrap();
+        assert_eq!(response.results[0].error_code, ERROR_NONE);
+    }
 }
