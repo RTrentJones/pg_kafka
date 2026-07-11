@@ -9,13 +9,17 @@ use rdkafka::consumer::Consumer;
 use rdkafka::producer::FutureRecord;
 use std::time::{Duration, Instant};
 
-/// Minimum expected produce throughput (messages per second)
-/// Note: Set low to avoid flaky tests; actual throughput varies by environment
-const MIN_PRODUCE_THROUGHPUT: f64 = 5.0;
+/// Minimum expected produce throughput (messages per second).
+/// DR-18 (DEEP-REVIEW-2026-07): thresholds are now real regression floors instead
+/// of 5 msg/s warn-only decoration. Calibrated against a dev-class machine at
+/// ~150 msg/s for the awaited-per-send produce loop and ~2,300 msg/s consume;
+/// the floors sit ~5-10x below measured so environment variance passes but an
+/// order-of-magnitude regression (the kind an accidental O(n) or extra
+/// round-trip introduces) fails the suite.
+const MIN_PRODUCE_THROUGHPUT: f64 = 25.0;
 
-/// Minimum expected consume throughput (messages per second)
-/// Note: Set low to avoid flaky tests; actual throughput varies by environment
-const MIN_CONSUME_THROUGHPUT: f64 = 5.0;
+/// Minimum expected consume throughput (messages per second). See above.
+const MIN_CONSUME_THROUGHPUT: f64 = 200.0;
 
 /// Test produce throughput baseline
 pub async fn test_produce_throughput_baseline() -> TestResult {
@@ -61,17 +65,18 @@ pub async fn test_produce_throughput_baseline() -> TestResult {
         "All messages should be produced successfully"
     );
 
-    if throughput >= MIN_PRODUCE_THROUGHPUT {
-        println!(
-            "   Throughput meets baseline ({:.0} msgs/sec)",
-            MIN_PRODUCE_THROUGHPUT
-        );
-    } else {
-        println!(
-            "   WARNING: Throughput below baseline ({:.0} < {:.0})",
+    // DR-18: a miss FAILS (it used to print a warning and pass).
+    if throughput < MIN_PRODUCE_THROUGHPUT {
+        return Err(format!(
+            "Produce throughput regression: {:.2} msg/s is below the {:.0} msg/s floor",
             throughput, MIN_PRODUCE_THROUGHPUT
-        );
+        )
+        .into());
     }
+    println!(
+        "   Throughput meets baseline ({:.0} msgs/sec)",
+        MIN_PRODUCE_THROUGHPUT
+    );
 
     ctx.cleanup().await?;
     println!("\n   Produce throughput baseline test PASSED\n");
@@ -122,17 +127,18 @@ pub async fn test_consume_throughput_baseline() -> TestResult {
         "Should consume at least 80% of messages"
     );
 
-    if throughput >= MIN_CONSUME_THROUGHPUT {
-        println!(
-            "   Throughput meets baseline ({:.0} msgs/sec)",
-            MIN_CONSUME_THROUGHPUT
-        );
-    } else {
-        println!(
-            "   WARNING: Throughput below baseline ({:.0} < {:.0})",
+    // DR-18: a miss FAILS (it used to print a warning and pass).
+    if throughput < MIN_CONSUME_THROUGHPUT {
+        return Err(format!(
+            "Consume throughput regression: {:.2} msg/s is below the {:.0} msg/s floor",
             throughput, MIN_CONSUME_THROUGHPUT
-        );
+        )
+        .into());
     }
+    println!(
+        "   Throughput meets baseline ({:.0} msgs/sec)",
+        MIN_CONSUME_THROUGHPUT
+    );
 
     ctx.cleanup().await?;
     println!("\n   Consume throughput baseline test PASSED\n");
@@ -221,12 +227,18 @@ pub async fn test_batch_vs_single_performance() -> TestResult {
     let speedup = batch_throughput / single_throughput;
     println!("   Batch speedup: {:.2}x", speedup);
 
-    // Batch should generally be faster due to parallelism
-    if speedup >= 0.9 {
-        println!("   Batch performance is acceptable");
-    } else {
-        println!("   WARNING: Batch unexpectedly slower than single");
+    // DR-18: batch must not be grossly slower than sequential sends — a real
+    // inversion here means pipelining/parallel dispatch broke. The 0.5x floor
+    // (vs the informational 0.9x) leaves room for scheduler noise while still
+    // failing on a genuine serialization regression.
+    if speedup < 0.5 {
+        return Err(format!(
+            "Batch produce regression: {:.2}x vs single (floor 0.5x) — parallel dispatch appears serialized",
+            speedup
+        )
+        .into());
     }
+    println!("   Batch performance is acceptable ({:.2}x)", speedup);
 
     ctx.cleanup().await?;
     println!("\n   Batch vs single performance test PASSED\n");

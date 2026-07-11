@@ -299,7 +299,11 @@ jobs:
         echo "Waiting for port 9092..."
         timeout 30s bash -c 'until nc -z 127.0.0.1 9092; do sleep 1; done'
         echo "Port 9092 is open!"
-        sleep 3 # Wait for protocol readiness (Fixes CI race condition)
+        # DR-17: no extra sleep — the worker binds the port only after full init
+        # (GUCs read, channels built), and requests received before the loop's
+        # first iteration simply queue on the request channel. The historical
+        # 'sleep 3' papered over the worker's 10s wait-for-schema retry, which
+        # the port probe above already covers.
 
     - name: Run Functional E2E Tests
       # Runs functional tests (excludes performance and shadow tests which run separately)
@@ -339,10 +343,10 @@ jobs:
         docker compose down -v
 
     - name: Run Performance E2E Tests
-      # Performance tests run separately with their own timeout
-      # These are advisory - don't block CI on performance regressions
+      # DR-18: BLOCKING (was continue-on-error). The thresholds inside the tests
+      # are conservative floors (~5-10x below dev-machine measurements), so this
+      # only fails on order-of-magnitude regressions, not runner variance.
       timeout-minutes: 5
-      continue-on-error: true
       run: |
         cd kafka_test
         cargo run --release -- --category performance
