@@ -102,9 +102,9 @@ pub use producer::{
 pub use concurrent::{
     test_concurrent_producers_different_partitions, test_concurrent_producers_same_topic,
     test_consumer_catches_up, test_consumer_group_two_members, test_consumer_rejoin_after_leave,
-    test_coordinator_state_race, test_group_rejoin_race, test_multiple_consumer_groups,
-    test_offset_commit_race, test_partition_assignment_race, test_produce_consume_race,
-    test_produce_while_consuming, test_request_pipelining,
+    test_coordinator_state_race, test_group_rejoin_race, test_heartbeat_bypasses_produce_backlog,
+    test_multiple_consumer_groups, test_offset_commit_race, test_partition_assignment_race,
+    test_produce_consume_race, test_produce_while_consuming, test_request_pipelining,
 };
 pub use edge_cases::{
     test_batch_1000_messages, test_consume_empty_partition, test_consumer_group_empty,

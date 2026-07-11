@@ -54,6 +54,10 @@ const RECV_TIMEOUT: Duration = Duration::from_millis(100);
 /// Capacity of the bounded request channel (backpressure threshold)
 const REQUEST_CHANNEL_CAPACITY: usize = 10_000;
 
+/// DR-12: capacity of the liveness (Heartbeat) lane. Heartbeats are small and
+/// per-member periodic; 1,000 pending already implies severe DB-thread stall.
+const LIVENESS_CHANNEL_CAPACITY: usize = 1_000;
+
 /// Extract a human-readable message from a caught panic payload.
 ///
 /// Postgres ERRORs crossing the pgrx FFI boundary arrive as a panic whose
@@ -318,6 +322,19 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     let (request_tx, request_rx) =
         crossbeam_channel::bounded::<crate::kafka::KafkaRequest>(REQUEST_CHANNEL_CAPACITY);
 
+    // DR-12 (DEEP-REVIEW-2026-07): dedicated liveness lane for Heartbeat. The DB
+    // thread drains this lane before taking the next main-lane request, so group
+    // liveness never waits behind a queue of heavy Produce/Fetch work (which
+    // previously let DB pressure cascade into spurious rebalances). Small bound:
+    // heartbeats are tiny and frequent, and try_send drops excess into the
+    // client's retry path rather than blocking the network thread.
+    let (liveness_tx, liveness_rx) =
+        crossbeam_channel::bounded::<crate::kafka::KafkaRequest>(LIVENESS_CHANNEL_CAPACITY);
+    let request_lanes = crate::kafka::RequestLanes {
+        main: request_tx,
+        liveness: liveness_tx,
+    };
+
     // Step 5b: Create notification channel for long polling support
     // This channel sends notifications from the database thread to the network thread
     // when new messages are produced. Used to wake up waiting FetchRequest handlers.
@@ -437,7 +454,7 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
 
                 if let Err(e) = crate::kafka::listener::run(
                     tcp_listener,
-                    request_tx,
+                    request_lanes,
                     notify_rx,
                     forward_rx,
                     forward_ack_tx,
@@ -684,81 +701,39 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
         // └─────────────────────────────────────────────────────────────┘
         // This is the key performance improvement: we block until work arrives.
         // No CPU usage when idle, instant wake-up when requests come in.
+        // DR-12 (DEEP-REVIEW-2026-07): drain the liveness lane BEFORE taking the
+        // next main-lane request. Heartbeats are served from the in-memory
+        // coordinator, so each drains in microseconds; doing this every loop
+        // iteration bounds heartbeat queueing delay to at most one in-flight
+        // request (plus RECV_TIMEOUT when idle) instead of the whole main queue.
+        while let Ok(request) = liveness_rx.try_recv() {
+            execute_request_in_transaction(
+                request,
+                &coordinator,
+                &broker_metadata,
+                default_partitions,
+                &notify_tx,
+                compression,
+                &shadow_store,
+                log_timing,
+            );
+        }
+
         match request_rx.recv_timeout(RECV_TIMEOUT) {
             Ok(request) => {
                 // ┌─────────────────────────────────────────────────────┐
                 // │ Process Database Request (SPI in Transaction)      │
                 // └─────────────────────────────────────────────────────┘
-                let coord = coordinator.clone();
-                let broker = broker_metadata.clone(); // Cheap Arc pointer copy
-                let default_parts = default_partitions;
-                let notifier = notify_tx.clone();
-                let comp = compression;
-                let shadow = shadow_store.clone();
-
-                // Timing instrumentation (enabled via pg_kafka.log_timing GUC)
-                // Measures transaction overhead vs handler execution time
-                let tx_start = if log_timing {
-                    Some(std::time::Instant::now())
-                } else {
-                    None
-                };
-
-                // Use a Cell to capture handler duration from inside the closure
-                let handler_duration = std::cell::Cell::new(Duration::ZERO);
-                // Wrap in AssertUnwindSafe to satisfy UnwindSafe requirement
-                let handler_duration_ref = AssertUnwindSafe(&handler_duration);
-                // ShadowStore contains FutureProducer which isn't RefUnwindSafe
-                let shadow_ref = AssertUnwindSafe(&shadow);
-
-                BackgroundWorker::transaction(move || {
-                    let handler_start = std::time::Instant::now();
-
-                    // Run the handler inside a subtransaction so a panic (or a
-                    // Postgres ERROR, which pgrx surfaces as a panic) rolls
-                    // back the request's partial writes instead of letting
-                    // them commit with the surrounding transaction. The worker
-                    // itself survives either way.
-                    let result = run_request_in_subtransaction(|| {
-                        process_request(
-                            request,
-                            &coord,
-                            &broker,
-                            default_parts,
-                            &notifier,
-                            comp,
-                            *shadow_ref,
-                        );
-                    });
-
-                    // Capture handler duration before transaction commit
-                    handler_duration_ref.set(handler_start.elapsed());
-
-                    if let Err(panic_msg) = result {
-                        pg_warning!(
-                            "Handler panic caught, request rolled back (worker survived): {}",
-                            panic_msg
-                        );
-                    }
-                });
-
-                // Log timing results (only when log_timing is enabled)
-                if let Some(start) = tx_start {
-                    let total_duration = start.elapsed();
-                    let handler_dur = handler_duration.get();
-                    let tx_overhead = total_duration.saturating_sub(handler_dur);
-                    log!(
-                        "TIMING: total={}us handler={}us tx_overhead={}us ({}%)",
-                        total_duration.as_micros(),
-                        handler_dur.as_micros(),
-                        tx_overhead.as_micros(),
-                        if total_duration.as_micros() > 0 {
-                            (tx_overhead.as_micros() * 100) / total_duration.as_micros()
-                        } else {
-                            0
-                        }
-                    );
-                }
+                execute_request_in_transaction(
+                    request,
+                    &coordinator,
+                    &broker_metadata,
+                    default_partitions,
+                    &notify_tx,
+                    compression,
+                    &shadow_store,
+                    log_timing,
+                );
             }
 
             Err(RecvTimeoutError::Timeout) => {
@@ -870,6 +845,92 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
             });
             last_retention_sweep = Instant::now();
         }
+    }
+}
+
+/// Execute one Kafka request under the standard transaction + subtransaction
+/// guard, with optional timing instrumentation. Shared by the main lane and the
+/// DR-12 liveness lane so both take the identical safety path (a Heartbeat does
+/// no SPI, but routing it through the same guard keeps one code path and costs
+/// only an empty transaction).
+#[allow(clippy::too_many_arguments)]
+fn execute_request_in_transaction(
+    request: crate::kafka::KafkaRequest,
+    coordinator: &std::sync::Arc<crate::kafka::GroupCoordinator>,
+    broker_metadata: &crate::kafka::BrokerMetadata,
+    default_partitions: i32,
+    notify_tx: &crossbeam_channel::Sender<crate::kafka::InternalNotification>,
+    compression: kafka_protocol::records::Compression,
+    shadow_store: &std::sync::Arc<ShadowStore<PostgresStore>>,
+    log_timing: bool,
+) {
+    let coord = coordinator.clone();
+    let broker = broker_metadata.clone(); // Cheap Arc pointer copy
+    let notifier = notify_tx.clone();
+    let shadow = shadow_store.clone();
+
+    // Timing instrumentation (enabled via pg_kafka.log_timing GUC)
+    // Measures transaction overhead vs handler execution time
+    let tx_start = if log_timing {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+
+    // Use a Cell to capture handler duration from inside the closure
+    let handler_duration = std::cell::Cell::new(Duration::ZERO);
+    // Wrap in AssertUnwindSafe to satisfy UnwindSafe requirement
+    let handler_duration_ref = AssertUnwindSafe(&handler_duration);
+    // ShadowStore contains FutureProducer which isn't RefUnwindSafe
+    let shadow_ref = AssertUnwindSafe(&shadow);
+
+    BackgroundWorker::transaction(move || {
+        let handler_start = std::time::Instant::now();
+
+        // Run the handler inside a subtransaction so a panic (or a
+        // Postgres ERROR, which pgrx surfaces as a panic) rolls
+        // back the request's partial writes instead of letting
+        // them commit with the surrounding transaction. The worker
+        // itself survives either way.
+        let result = run_request_in_subtransaction(|| {
+            process_request(
+                request,
+                &coord,
+                &broker,
+                default_partitions,
+                &notifier,
+                compression,
+                *shadow_ref,
+            );
+        });
+
+        // Capture handler duration before transaction commit
+        handler_duration_ref.set(handler_start.elapsed());
+
+        if let Err(panic_msg) = result {
+            pg_warning!(
+                "Handler panic caught, request rolled back (worker survived): {}",
+                panic_msg
+            );
+        }
+    });
+
+    // Log timing results (only when log_timing is enabled)
+    if let Some(start) = tx_start {
+        let total_duration = start.elapsed();
+        let handler_dur = handler_duration.get();
+        let tx_overhead = total_duration.saturating_sub(handler_dur);
+        log!(
+            "TIMING: total={}us handler={}us tx_overhead={}us ({}%)",
+            total_duration.as_micros(),
+            handler_dur.as_micros(),
+            tx_overhead.as_micros(),
+            if total_duration.as_micros() > 0 {
+                (tx_overhead.as_micros() * 100) / total_duration.as_micros()
+            } else {
+                0
+            }
+        );
     }
 }
 

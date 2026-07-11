@@ -14,6 +14,34 @@
 /// Type alias for TxnOffsetCommit topic data: (topic_name, [(partition, offset, metadata)])
 pub type TxnOffsetCommitTopics = Vec<(String, Vec<(i32, i64, Option<String>)>)>;
 
+/// DR-12 (DEEP-REVIEW-2026-07): the two request lanes from the network thread to
+/// the single DB thread.
+///
+/// All requests used to share one FIFO channel, so a heavy Produce (large UNNEST,
+/// advisory-lock wait) delayed every queued Heartbeat behind it — and under DB
+/// pressure, delayed heartbeats cascade into spurious consumer-group rebalances,
+/// a self-amplifying failure mode. Heartbeat is served purely from the in-memory
+/// coordinator, so it now travels on a dedicated `liveness` lane that the worker
+/// drains *before* taking the next main-lane request. A heartbeat can still wait
+/// behind the one request currently executing, but never behind the queue.
+#[derive(Clone)]
+pub struct RequestLanes {
+    /// Everything except liveness traffic (Produce, Fetch, Metadata, ...).
+    pub main: crossbeam_channel::Sender<KafkaRequest>,
+    /// Liveness traffic (Heartbeat), drained with priority by the DB thread.
+    pub liveness: crossbeam_channel::Sender<KafkaRequest>,
+}
+
+impl RequestLanes {
+    /// Pick the lane for a parsed request.
+    pub fn route(&self, request: &KafkaRequest) -> &crossbeam_channel::Sender<KafkaRequest> {
+        match request {
+            KafkaRequest::Heartbeat { .. } => &self.liveness,
+            _ => &self.main,
+        }
+    }
+}
+
 /// Kafka request types that can be sent from async tasks to the main worker thread
 #[derive(Debug)]
 pub enum KafkaRequest {

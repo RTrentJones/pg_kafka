@@ -428,7 +428,15 @@ impl KafkaStore for PostgresStore {
         );
 
         Spi::connect_mut(|client| {
-            // Step 1: Lock the partition using advisory lock
+            // Step 1: Lock the partition using advisory lock.
+            // DR-13 (DEEP-REVIEW-2026-07): in the shipped topology this lock is
+            // uncontended overhead — all extension writes serialize on the single
+            // DB thread, so no in-extension writer can race it. It is kept as
+            // defense-in-depth against OUT-OF-BAND writers (direct SQL inserts, a
+            // future second worker): the offset-assignment read below is a
+            // check-then-act that would race such a writer without it. Cost is one
+            // fast-path lock acquisition per produce; revisit only with a benchmark
+            // showing it matters.
             client.select(
                 "SELECT pg_advisory_xact_lock($1, $2)",
                 None,
@@ -1501,7 +1509,15 @@ impl KafkaStore for PostgresStore {
         );
 
         Spi::connect_mut(|client| {
-            // Step 1: Lock the partition using advisory lock
+            // Step 1: Lock the partition using advisory lock.
+            // DR-13 (DEEP-REVIEW-2026-07): in the shipped topology this lock is
+            // uncontended overhead — all extension writes serialize on the single
+            // DB thread, so no in-extension writer can race it. It is kept as
+            // defense-in-depth against OUT-OF-BAND writers (direct SQL inserts, a
+            // future second worker): the offset-assignment read below is a
+            // check-then-act that would race such a writer without it. Cost is one
+            // fast-path lock acquisition per produce; revisit only with a benchmark
+            // showing it matters.
             client.select(
                 "SELECT pg_advisory_xact_lock($1, $2)",
                 None,

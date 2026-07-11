@@ -320,7 +320,7 @@ fn try_admit_connection(
 ///
 /// # Arguments
 /// * `listener` - Pre-bound TcpListener (bound in worker.rs)
-/// * `request_tx` - Channel sender for forwarding parsed requests to main thread
+/// * `request_lanes` - Channel senders (main + DR-12 liveness lanes) to the DB thread
 /// * `notify_rx` - Channel receiver for notifications from DB thread (long polling)
 /// * `forward_rx` - Channel receiver for async shadow forwarding requests
 /// * `runtime_context` - Runtime context for accessing configuration
@@ -330,7 +330,7 @@ fn try_admit_connection(
 /// This function runs in a spawned thread and MUST NOT call pgrx functions.
 pub async fn run(
     listener: TcpListener,
-    request_tx: Sender<KafkaRequest>,
+    request_lanes: crate::kafka::RequestLanes,
     notify_rx: Receiver<InternalNotification>,
     forward_rx: Receiver<ForwardRequest>,
     forward_ack_tx: Sender<ForwardAck>,
@@ -460,7 +460,7 @@ pub async fn run(
                 }
 
                 // Clone resources for this connection
-                let conn_request_tx = request_tx.clone();
+                let conn_request_lanes = request_lanes.clone();
                 let conn_registry = registry.clone();
                 let poll_interval = fetch_poll_interval_ms;
                 let long_poll_enabled = enable_long_polling;
@@ -474,7 +474,7 @@ pub async fn run(
                     let _permit = permit;
                     if let Err(e) = handle_connection(
                         socket,
-                        conn_request_tx,
+                        conn_request_lanes,
                         conn_registry,
                         long_poll_enabled,
                         poll_interval,
@@ -534,7 +534,7 @@ pub async fn run(
 /// This function runs in the network thread and MUST NOT call pgrx functions.
 async fn handle_connection(
     socket: TcpStream,
-    request_tx: Sender<KafkaRequest>,
+    request_lanes: crate::kafka::RequestLanes,
     registry: Arc<PendingFetchRegistry>,
     enable_long_polling: bool,
     poll_interval_ms: i32,
@@ -645,7 +645,7 @@ async fn handle_connection(
                         );
 
                         let long_poll_registry = registry.clone();
-                        let long_poll_request_tx = request_tx.clone();
+                        let long_poll_request_tx = request_lanes.main.clone();
                         let poll_interval = poll_interval_ms;
 
                         tokio::spawn(async move {
@@ -674,8 +674,11 @@ async fn handle_connection(
                     }
                 }
 
-                // Normal path - send to worker directly (SEC-4: non-blocking handoff)
-                if !send_with_backpressure(&request_tx, request).await {
+                // Normal path - send to worker directly (SEC-4: non-blocking handoff).
+                // DR-12: Heartbeat routes to the liveness lane, everything else to
+                // the main lane, so group liveness never queues behind heavy work.
+                let lane = request_lanes.route(&request).clone();
+                if !send_with_backpressure(&lane, request).await {
                     error!("Worker channel closed");
                     break;
                 }

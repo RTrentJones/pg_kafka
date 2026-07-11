@@ -152,6 +152,7 @@ use kafka_test::{
     test_group_state_transitions,
     // Rebalancing edge case tests
     test_heartbeat_after_leave,
+    test_heartbeat_bypasses_produce_backlog,
     test_heartbeat_during_rebalance_window,
     test_heartbeat_keeps_membership,
     test_high_offset_values,
@@ -910,6 +911,12 @@ fn get_all_tests() -> Vec<TestDef> {
             parallel_safe: false,
         },
         // Concurrent tests - NOT parallel safe (they test concurrency themselves)
+        TestDef {
+            category: "concurrent",
+            name: "test_heartbeat_bypasses_produce_backlog",
+            test_fn: wrap_test!(test_heartbeat_bypasses_produce_backlog),
+            parallel_safe: false,
+        },
         TestDef {
             category: "concurrent",
             name: "test_concurrent_producers_same_topic",
