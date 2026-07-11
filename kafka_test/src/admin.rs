@@ -610,8 +610,8 @@ pub async fn test_create_topic_with_config() -> TestResult {
         )
         .await?;
 
-    if row.is_some() {
-        let partitions: i32 = row.unwrap().get(0);
+    if let Some(row) = row {
+        let partitions: i32 = row.get(0);
         println!("   Topic exists with {} partitions", partitions);
 
         // Cleanup

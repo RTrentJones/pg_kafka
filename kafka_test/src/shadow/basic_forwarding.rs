@@ -226,9 +226,8 @@ pub async fn test_external_only_mode() -> TestResult {
     consumer.assign(&tpl)?;
     let mut received = 0;
     for _ in 0..5 {
-        match consumer.poll(Duration::from_secs(1)) {
-            Some(Ok(_)) => received += 1,
-            Some(Err(_)) | None => {}
+        if let Some(Ok(_)) = consumer.poll(Duration::from_secs(1)) {
+            received += 1
         }
     }
     if received != 0 {

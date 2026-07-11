@@ -1,0 +1,44 @@
+# cargo-deny configuration for the kafka_test E2E crate (DR-16).
+# Mirrors the root deny.toml minus the pg16 feature graph (this crate has no
+# pg features) and the kafka-protocol git-source allowance (kafka_test uses
+# the crates.io release, not the patched fork).
+
+[advisories]
+version = 2
+yanked = "deny"
+# paste: unmaintained proc-macro via rdkafka (RUSTSEC-2024-0436).
+ignore = [
+    "RUSTSEC-2024-0436",
+]
+
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
+    "PostgreSQL",
+    "OpenSSL",
+    "CC0-1.0",
+]
+confidence-threshold = 0.8
+
+[[licenses.clarify]]
+crate = "ring"
+expression = "MIT AND ISC AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

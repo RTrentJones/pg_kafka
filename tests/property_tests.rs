@@ -64,7 +64,7 @@ mod property_tests {
             response.encode(&mut buf, 9).unwrap();
 
             // Should encode successfully
-            prop_assert!(buf.len() > 0);
+            prop_assert!(!buf.is_empty());
         }
 
         #[test]
@@ -90,7 +90,7 @@ mod property_tests {
             header.encode(&mut buf, 1).unwrap();
             response.encode(&mut buf, 9).unwrap();
 
-            prop_assert!(buf.len() > 0);
+            prop_assert!(!buf.is_empty());
         }
 
         #[test]
@@ -127,7 +127,7 @@ mod property_tests {
             header.encode(&mut buf, 1).unwrap();
             response.encode(&mut buf, 9).unwrap();
 
-            prop_assert!(buf.len() > 0);
+            prop_assert!(!buf.is_empty());
         }
 
         #[test]
@@ -155,7 +155,7 @@ mod property_tests {
             header.encode(&mut buf, 1).unwrap();
             response.encode(&mut buf, 3).unwrap();
 
-            prop_assert!(buf.len() > 0);
+            prop_assert!(!buf.is_empty());
         }
 
         #[test]
@@ -180,7 +180,7 @@ mod property_tests {
             header.encode(&mut buf, 1).unwrap();
             response.encode(&mut buf, 9).unwrap();
 
-            prop_assert!(buf.len() > 0);
+            prop_assert!(!buf.is_empty());
         }
     }
 

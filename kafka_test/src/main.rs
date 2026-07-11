@@ -1763,9 +1763,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let suite_start = Instant::now();
-    let all_results: Vec<TestResult>;
 
-    if !args.sequential {
+    let all_results: Vec<TestResult> = if !args.sequential {
         // Parallel execution mode
         let (parallel_tests, sequential_tests): (Vec<_>, Vec<_>) =
             tests_to_run.iter().partition(|t| t.parallel_safe);
@@ -1845,10 +1844,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Combine results
-        all_results = parallel_results
+        parallel_results
             .into_iter()
             .chain(sequential_results)
-            .collect();
+            .collect()
     } else {
         // Sequential execution mode (original behavior)
         let mut results = Vec::new();
@@ -1870,8 +1869,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             results.push(result);
         }
-        all_results = results;
-    }
+        results
+    };
 
     // Group results by category
     let mut category_map: std::collections::HashMap<String, Vec<TestResult>> =

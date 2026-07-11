@@ -179,7 +179,7 @@ mod tests {
         }
         // Allow variance (20% to 40% range)
         assert!(
-            forward_count >= 200 && forward_count <= 400,
+            (200..=400).contains(&forward_count),
             "Forward count {} should be roughly 30%",
             forward_count
         );

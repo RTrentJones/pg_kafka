@@ -55,7 +55,7 @@ pub async fn test_long_poll_min_bytes_threshold() -> TestResult {
         .set("broker.address.family", "v4")
         .set(
             "group.id",
-            &format!("minbytes-group-{}", uuid::Uuid::new_v4()),
+            format!("minbytes-group-{}", uuid::Uuid::new_v4()),
         )
         .set("auto.offset.reset", "latest")
         .set("fetch.wait.max.ms", "10000") // Long wait
@@ -186,7 +186,7 @@ pub async fn test_long_poll_timeout_precision() -> TestResult {
         .set("broker.address.family", "v4")
         .set(
             "group.id",
-            &format!("precision-group-{}", uuid::Uuid::new_v4()),
+            format!("precision-group-{}", uuid::Uuid::new_v4()),
         )
         .set("auto.offset.reset", "latest")
         .set("fetch.wait.max.ms", "2000")
@@ -297,7 +297,7 @@ pub async fn test_long_poll_consumer_disconnect() -> TestResult {
             .set("broker.address.family", "v4")
             .set(
                 "group.id",
-                &format!("disconnect-group-{}", uuid::Uuid::new_v4()),
+                format!("disconnect-group-{}", uuid::Uuid::new_v4()),
             )
             .set("auto.offset.reset", "earliest")
             .set("fetch.wait.max.ms", "30000") // Very long wait
@@ -328,7 +328,7 @@ pub async fn test_long_poll_consumer_disconnect() -> TestResult {
         .set("broker.address.family", "v4")
         .set(
             "group.id",
-            &format!("disconnect-group2-{}", uuid::Uuid::new_v4()),
+            format!("disconnect-group2-{}", uuid::Uuid::new_v4()),
         )
         .set("auto.offset.reset", "earliest")
         .set("fetch.wait.max.ms", "5000")
@@ -405,7 +405,7 @@ pub async fn test_long_poll_multiple_consumers_same_partition() -> TestResult {
             .set("broker.address.family", "v4")
             .set(
                 "group.id",
-                &format!("multi-group-{}-{}", i, uuid::Uuid::new_v4()),
+                format!("multi-group-{}-{}", i, uuid::Uuid::new_v4()),
             )
             .set("auto.offset.reset", "latest")
             .set("fetch.wait.max.ms", "10000")

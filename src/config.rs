@@ -621,6 +621,10 @@ pub fn bind_is_publicly_exposed(host: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    // The constants-validation tests below assert compile-time-constant range
+    // invariants on purpose (documentation-as-test); silence the lint that
+    // flags constant assertions.
+    #![allow(clippy::assertions_on_constants)]
     use super::*;
     use crate::kafka::constants::{
         DEFAULT_COMPRESSION_TYPE, DEFAULT_DATABASE, DEFAULT_FETCH_POLL_INTERVAL_MS,

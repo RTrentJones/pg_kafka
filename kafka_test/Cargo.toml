@@ -2,6 +2,9 @@
 name = "kafka_test"
 version = "0.1.0"
 edition = "2021"
+# Test harness only, no Shadow Mode code — plain MIT like the project root
+# (required so `cargo deny check licenses` can evaluate this crate; DR-16).
+license = "MIT"
 
 [dependencies]
 # Kafka client for E2E testing

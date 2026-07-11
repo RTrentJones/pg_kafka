@@ -486,6 +486,8 @@ pub const ERROR_SHADOW_REPLAY_FAILED: i16 = 1004;
 
 #[cfg(test)]
 mod tests {
+    // Constant-range invariants asserted on purpose (documentation-as-test).
+    #![allow(clippy::assertions_on_constants)]
     use super::*;
 
     #[test]
