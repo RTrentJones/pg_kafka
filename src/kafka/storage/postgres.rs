@@ -19,10 +19,167 @@ use std::time::Duration;
 /// started by BackgroundWorker::transaction() in worker.rs.
 pub struct PostgresStore;
 
+// DR-1/DR-2 (DEEP-REVIEW-2026-07): retention constants for the periodic sweep.
+// These are deliberately constants rather than GUCs — only the messages-table
+// retention (the policy an operator genuinely tunes) is exposed as
+// `pg_kafka.message_retention_hours`; the auxiliary windows match Kafka's own
+// defaults where one exists.
+
+/// Grace period before physically deleting `txn_state='aborted'` rows. Aborted rows
+/// are already invisible to consumers; the grace only avoids churning rows a
+/// concurrent diagnostic query might be looking at.
+pub const ABORTED_MESSAGE_GRACE: Duration = Duration::from_secs(60);
+/// Idle window after which a producer id (and its sequences) is reclaimed.
+/// Kafka: `transactional.id.expiration.ms` defaults to 7 days.
+pub const PRODUCER_ID_RETENTION: Duration = Duration::from_secs(7 * 24 * 3600);
+/// Age after which terminal (`CompleteCommit`/`CompleteAbort`) transaction rows are
+/// deleted. Matches PRODUCER_ID_RETENTION so a txn row never outlives its producer.
+pub const TERMINAL_TXN_RETENTION: Duration = Duration::from_secs(7 * 24 * 3600);
+/// Age after which successfully forwarded shadow-outbox rows are deleted.
+pub const SHADOW_DELIVERED_RETENTION: Duration = Duration::from_secs(24 * 3600);
+/// Per-sweep cap on expired-message deletes, so one sweep can't hold the DB thread
+/// (and its transaction) for an unbounded scan after retention is first enabled on
+/// a large backlog. The sweep runs every RETENTION_SWEEP_INTERVAL, so the backlog
+/// drains incrementally.
+pub const RETENTION_DELETE_BATCH: i64 = 10_000;
+
+/// Row counts deleted by one retention sweep (see `run_retention_sweep`).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionSweepStats {
+    pub aborted_messages: u64,
+    pub expired_messages: u64,
+    pub stale_producers: u64,
+    pub terminal_transactions: u64,
+    pub shadow_delivered_rows: u64,
+}
+
+impl RetentionSweepStats {
+    pub fn total(&self) -> u64 {
+        self.aborted_messages
+            + self.expired_messages
+            + self.stale_producers
+            + self.terminal_transactions
+            + self.shadow_delivered_rows
+    }
+}
+
 impl PostgresStore {
     /// Create a new PostgresStore instance
     pub fn new() -> Self {
         PostgresStore
+    }
+
+    /// DR-1/DR-2 (DEEP-REVIEW-2026-07): one pass of the storage-lifecycle sweep.
+    ///
+    /// Before this existed the system only ever grew: `cleanup_aborted_messages` was
+    /// implemented but had no production caller, and nothing pruned expired messages,
+    /// stale producer ids/sequences, terminal transaction rows, or delivered
+    /// shadow-outbox rows. The worker calls this every RETENTION_SWEEP_INTERVAL; the
+    /// SQL function `pg_kafka_run_retention_sweep()` exposes the same pass on demand.
+    ///
+    /// `message_retention_hours` ≤ 0 disables the expired-message delete (messages
+    /// kept forever); pending transactional rows are never deleted regardless of age.
+    /// `aborted_grace` is the ABORTED_MESSAGE_GRACE window (parameterized so the
+    /// on-demand SQL function can shrink it for testing).
+    ///
+    /// Offset-monotonicity safety: deletes never touch `kafka.partition_offsets`, and
+    /// every offset producer/read path takes `GREATEST(next_offset, MAX+1)` (BUG-3),
+    /// so removing rows — oldest or newest — cannot cause offset reuse or HWM/LSO
+    /// regression. Consumers positioned before a retention cutoff get a standard
+    /// Kafka out-of-range reset, exactly as with a real broker's retention.
+    pub fn run_retention_sweep(
+        &self,
+        message_retention_hours: i32,
+        aborted_grace: Duration,
+    ) -> Result<RetentionSweepStats> {
+        let mut stats = RetentionSweepStats {
+            aborted_messages: self.cleanup_aborted_messages(aborted_grace)?,
+            ..Default::default()
+        };
+
+        Spi::connect_mut(|client| {
+            // Expired messages (only when retention is enabled). Batched via ctid so
+            // one sweep is bounded; never deletes pending transactional rows.
+            if message_retention_hours > 0 {
+                let table = client.update(
+                    "DELETE FROM kafka.messages
+                     WHERE ctid IN (
+                         SELECT ctid FROM kafka.messages
+                         WHERE created_at < NOW() - ($1 || ' hours')::interval
+                           AND (txn_state IS NULL OR txn_state <> 'pending')
+                         LIMIT $2
+                     )
+                     RETURNING 1",
+                    None,
+                    &[
+                        (message_retention_hours as i64).into(),
+                        RETENTION_DELETE_BATCH.into(),
+                    ],
+                )?;
+                stats.expired_messages = table.len() as u64;
+            }
+
+            // Terminal transactions first (their FK on producer_ids would otherwise
+            // block the producer prune below). Only rows idle past the window: a
+            // producer that resumes a terminal transactional_id within the window
+            // keeps its row; one that resumes after the prune re-creates it via
+            // InitProducerId, matching Kafka's transactional.id expiration.
+            let terminal_txn_secs = TERMINAL_TXN_RETENTION.as_secs() as i64;
+            let table = client.update(
+                "DELETE FROM kafka.transactions
+                 WHERE state IN ('CompleteCommit', 'CompleteAbort', 'Empty')
+                   AND last_updated_at < NOW() - ($1 || ' seconds')::interval
+                 RETURNING 1",
+                None,
+                &[terminal_txn_secs.into()],
+            )?;
+            stats.terminal_transactions = table.len() as u64;
+
+            // Stale producers: idle past the window and not referenced by any
+            // remaining transaction row. Sequences go with their producer (no FK
+            // between the two tables, so the CTE keeps it atomic).
+            let producer_secs = PRODUCER_ID_RETENTION.as_secs() as i64;
+            let table = client.update(
+                "WITH doomed AS (
+                     DELETE FROM kafka.producer_ids p
+                     WHERE p.last_active_at < NOW() - ($1 || ' seconds')::interval
+                       AND NOT EXISTS (
+                           SELECT 1 FROM kafka.transactions t
+                           WHERE t.producer_id = p.producer_id
+                       )
+                     RETURNING p.producer_id
+                 ),
+                 seqs AS (
+                     DELETE FROM kafka.producer_sequences s
+                     USING doomed d
+                     WHERE s.producer_id = d.producer_id
+                 )
+                 SELECT COUNT(*)::BIGINT AS n FROM doomed",
+                None,
+                &[producer_secs.into()],
+            )?;
+            stats.stale_producers = table
+                .first()
+                .get_by_name::<i64, _>("n")?
+                .unwrap_or(0)
+                .max(0) as u64;
+
+            // Delivered shadow-outbox rows: forwarding is complete (external_offset
+            // set); keep a day of history for diagnostics, then reap.
+            let shadow_secs = SHADOW_DELIVERED_RETENTION.as_secs() as i64;
+            let table = client.update(
+                "DELETE FROM kafka.shadow_tracking
+                 WHERE external_offset IS NOT NULL
+                   AND forwarded_at < NOW() - ($1 || ' seconds')::interval
+                 RETURNING 1",
+                None,
+                &[shadow_secs.into()],
+            )?;
+            stats.shadow_delivered_rows = table.len() as u64;
+
+            Ok(stats)
+        })
+        .map_err(|e: KafkaError| KafkaError::Internal(format!("run_retention_sweep failed: {}", e)))
     }
 }
 
@@ -1842,8 +1999,12 @@ impl KafkaStore for PostgresStore {
         );
 
         Spi::connect_mut(|client| {
-            // Use DELETE ... RETURNING to count deleted rows
-            let table = client.select(
+            // Use DELETE ... RETURNING to count deleted rows.
+            // DR-1 (DEEP-REVIEW-2026-07): must be client.update — client.select runs
+            // SPI read-only, and Postgres rejects DML there ("DELETE is not allowed in
+            // a non-volatile function"). This was latent for as long as this method had
+            // no production caller; the retention-sweep E2E test now pins it.
+            let table = client.update(
                 "DELETE FROM kafka.messages
                  WHERE txn_state = 'aborted'
                    AND created_at < NOW() - ($1 || ' seconds')::interval

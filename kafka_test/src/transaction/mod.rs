@@ -17,9 +17,8 @@ pub use atomicity::{
     test_abort_transaction_discards_pending_offsets, test_add_partitions_to_txn_idempotent,
     test_concurrent_transactions_same_producer, test_producer_fencing_mid_transaction,
     test_producer_id_reallocated_on_epoch_exhaustion, test_transaction_boundary_isolation,
-    test_transaction_honors_per_txn_timeout_ms,
-    test_transaction_partial_failure_atomicity, test_transaction_timeout_auto_abort,
-    test_txn_offset_commit_visibility_timing,
+    test_transaction_honors_per_txn_timeout_ms, test_transaction_partial_failure_atomicity,
+    test_transaction_timeout_auto_abort, test_txn_offset_commit_visibility_timing,
 };
 pub use basic::{
     test_producer_fencing, test_transactional_batch, test_transactional_producer_abort,
@@ -28,6 +27,6 @@ pub use basic::{
 pub use eos::test_txn_offset_commit;
 pub use isolation::{
     test_read_committed_after_commit, test_read_committed_clamped_to_lso,
-    test_read_committed_filters_pending, test_reinit_aborts_in_flight_transaction,
-    test_read_uncommitted_sees_pending,
+    test_read_committed_filters_pending, test_read_uncommitted_sees_pending,
+    test_reinit_aborts_in_flight_transaction,
 };

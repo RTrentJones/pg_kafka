@@ -109,7 +109,8 @@ pub use edge_cases::{
     test_batch_1000_messages, test_consume_empty_partition, test_consumer_group_empty,
     test_fetch_committed_no_history, test_high_offset_values, test_large_message_key,
     test_large_message_value, test_list_offsets_empty_topic, test_offset_zero_boundary,
-    test_partition_zero, test_single_partition_topic,
+    test_partition_zero, test_retention_sweep_expires_old_messages,
+    test_retention_sweep_reclaims_aborted_messages, test_single_partition_topic,
 };
 pub use error_paths::{
     test_commit_new_group, test_commit_offset_zero, test_commit_then_fetch_offset,
@@ -136,8 +137,8 @@ pub use admin::{
     test_create_multiple_topics, test_create_partitions, test_create_partitions_cannot_decrease,
     test_create_partitions_not_found, test_create_topic, test_create_topic_already_exists,
     test_create_topic_invalid_name, test_create_topic_invalid_partitions,
-    test_create_topic_with_config, test_delete_group_empty, test_delete_group_idempotent,
-    test_delete_group_after_leave, test_delete_group_non_empty, test_delete_topic,
+    test_create_topic_with_config, test_delete_group_after_leave, test_delete_group_empty,
+    test_delete_group_idempotent, test_delete_group_non_empty, test_delete_topic,
     test_delete_topic_not_found,
 };
 
@@ -170,12 +171,11 @@ pub use idempotent::{
 pub use transaction::{
     test_abort_transaction_discards_pending_offsets, test_add_partitions_to_txn_idempotent,
     test_concurrent_transactions_same_producer, test_producer_fencing,
-    test_producer_fencing_mid_transaction, test_read_committed_after_commit,
-    test_read_committed_clamped_to_lso, test_read_committed_filters_pending,
-    test_reinit_aborts_in_flight_transaction, test_read_uncommitted_sees_pending,
-    test_producer_id_reallocated_on_epoch_exhaustion, test_transaction_boundary_isolation,
-    test_transaction_honors_per_txn_timeout_ms,
-    test_transaction_partial_failure_atomicity,
+    test_producer_fencing_mid_transaction, test_producer_id_reallocated_on_epoch_exhaustion,
+    test_read_committed_after_commit, test_read_committed_clamped_to_lso,
+    test_read_committed_filters_pending, test_read_uncommitted_sees_pending,
+    test_reinit_aborts_in_flight_transaction, test_transaction_boundary_isolation,
+    test_transaction_honors_per_txn_timeout_ms, test_transaction_partial_failure_atomicity,
     test_transaction_timeout_auto_abort, test_transactional_batch,
     test_transactional_producer_abort, test_transactional_producer_commit, test_txn_offset_commit,
     test_txn_offset_commit_visibility_timing,
@@ -203,8 +203,8 @@ pub use shadow::{
     test_dual_write_external_down,
     test_dual_write_sync,
     test_external_only_fallback,
-    test_external_primary_dead_letter_serves_local,
     test_external_only_mode,
+    test_external_primary_dead_letter_serves_local,
     test_fifty_percent_forwarding,
     test_hundred_percent_forwarding,
     test_local_only_mode,

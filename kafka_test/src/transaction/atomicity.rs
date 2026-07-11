@@ -1087,12 +1087,18 @@ pub async fn test_producer_id_reallocated_on_epoch_exhaustion() -> TestResult {
         .await?;
     let new_pid: i64 = row.get(0);
     let new_epoch: i16 = row.get(1);
-    println!("  orig producer_id={}, new producer_id={}, epoch={}", orig_pid, new_pid, new_epoch);
+    println!(
+        "  orig producer_id={}, new producer_id={}, epoch={}",
+        orig_pid, new_pid, new_epoch
+    );
     assert_ne!(
         new_pid, orig_pid,
         "epoch exhaustion must allocate a fresh producer_id (RV-13)"
     );
-    assert_eq!(new_epoch, 0, "the reallocated producer must reset epoch to 0");
+    assert_eq!(
+        new_epoch, 0,
+        "the reallocated producer must reset epoch to 0"
+    );
 
     // The transactions row must be repointed to the new producer_id.
     let txn_pid: i64 = client2

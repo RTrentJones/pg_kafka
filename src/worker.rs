@@ -39,6 +39,12 @@ const TIMEOUT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 /// How often to check for timed-out transactions (less frequent than member timeouts)
 const TXN_TIMEOUT_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 
+/// DR-1/DR-2 (DEEP-REVIEW-2026-07): how often the storage-lifecycle retention sweep
+/// runs (reclaim aborted rows, enforce message retention, prune stale
+/// producers/terminal transactions/delivered shadow-outbox rows). Each pass is
+/// bounded (RETENTION_DELETE_BATCH), so a large backlog drains across sweeps.
+const RETENTION_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
 // Configuration reload interval is now controlled by pg_kafka.config_reload_interval_ms GUC
 // (default 30s, tests can set to 1-2s for fast iteration)
 
@@ -483,6 +489,7 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
 
     let mut last_timeout_check = Instant::now();
     let mut last_txn_timeout_check = Instant::now();
+    let mut last_retention_sweep = Instant::now();
     let mut last_config_reload = Instant::now();
     // SH-9: how often the DB thread drains forward acks and forwards due outbox
     // rows. Short so async forwarding has sub-second latency, but throttled so
@@ -815,6 +822,53 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
                 }
             });
             last_txn_timeout_check = Instant::now();
+        }
+
+        // ┌─────────────────────────────────────────────────────────────┐
+        // │ Storage-Lifecycle Retention Sweep (Periodic, ~60 seconds)  │
+        // └─────────────────────────────────────────────────────────────┘
+        // DR-1/DR-2 (DEEP-REVIEW-2026-07): before this block, nothing ever deleted
+        // anything — cleanup_aborted_messages had no production caller and expired
+        // messages / stale producers / terminal txns / delivered outbox rows all
+        // accumulated forever. The sweep is bounded per pass and honors the
+        // pg_kafka.message_retention_hours GUC (0 = messages kept forever).
+        if last_retention_sweep.elapsed() >= RETENTION_SWEEP_INTERVAL {
+            BackgroundWorker::transaction(|| {
+                // RV-10: guard with the subtransaction wrapper (see the config-reload
+                // block above) so a Postgres ERROR rolls back and is logged rather
+                // than aborting the bgworker.
+                let result = run_request_in_subtransaction(|| {
+                    use crate::kafka::storage::postgres::{PostgresStore, ABORTED_MESSAGE_GRACE};
+                    let store = PostgresStore::new();
+                    let retention_hours = crate::config::MESSAGE_RETENTION_HOURS.get();
+                    match store.run_retention_sweep(retention_hours, ABORTED_MESSAGE_GRACE) {
+                        Ok(stats) => {
+                            if stats.total() > 0 {
+                                pg_log!(
+                                    "Retention sweep: {} aborted msg(s), {} expired msg(s), \
+                                     {} stale producer(s), {} terminal txn(s), \
+                                     {} delivered shadow row(s) reclaimed",
+                                    stats.aborted_messages,
+                                    stats.expired_messages,
+                                    stats.stale_producers,
+                                    stats.terminal_transactions,
+                                    stats.shadow_delivered_rows
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            pg_warning!("Retention sweep failed: {}", e);
+                        }
+                    }
+                });
+                if let Err(panic_msg) = result {
+                    pg_warning!(
+                        "Retention-sweep maintenance panicked, rolled back (worker survived): {}",
+                        panic_msg
+                    );
+                }
+            });
+            last_retention_sweep = Instant::now();
         }
     }
 }
