@@ -1,5 +1,5 @@
-version: '3.8'
-
+# (DR-25: the obsolete top-level `version:` key was removed — Compose v2
+# ignores it and warns.)
 services:
   pg_kafka_dev:
     build:
@@ -58,6 +58,12 @@ services:
       KAFKA_LISTENERS: INTERNAL://0.0.0.0:9094,CONTAINER://0.0.0.0:9095,EXTERNAL://0.0.0.0:9093,CONTROLLER://0.0.0.0:29094
       # IMPORTANT: CONTAINER listener uses IP (172.18.0.2) not hostname because DNS resolution
       # can be stale in devcontainer environments where containers are recreated.
+      # DR-25 note: the IP is deterministic because pg_kafka_network below pins
+      # ipam subnet 172.18.0.0/16 and this service gets a static ipv4_address.
+      # Caveat: 172.18.0.0/16 is a common Docker default-bridge range — if
+      # another network on your host already claims it, `docker compose up`
+      # fails with a pool-overlap error; change the subnet AND this advertised
+      # IP together.
       KAFKA_ADVERTISED_LISTENERS: INTERNAL://external-kafka:9094,CONTAINER://172.18.0.2:9095,EXTERNAL://localhost:9093
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,CONTAINER:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL

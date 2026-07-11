@@ -47,6 +47,21 @@ pub async fn test_sasl_password_guc_is_superuser_only() -> TestResult {
         );
     }
     println!("✅ a non-superuser cannot read the SASL password GUC");
+
+    // DR-21 (DEEP-REVIEW-2026-07): the USERNAME must have the same lockdown — it
+    // identifies the external-broker principal, and before DR-21 it was visible
+    // in pg_settings to every role while the password was superuser-only.
+    db.simple_query("SET ROLE sec8_unpriv_probe").await?;
+    let unpriv_user_read = db.simple_query("SHOW pg_kafka.shadow_sasl_username").await;
+    db.simple_query("RESET ROLE").await?;
+    if unpriv_user_read.is_ok() {
+        return Err(
+            "DR-21 regression: a non-superuser read pg_kafka.shadow_sasl_username"
+                .to_string()
+                .into(),
+        );
+    }
+    println!("✅ a non-superuser cannot read the SASL username GUC");
     Ok(())
 }
 

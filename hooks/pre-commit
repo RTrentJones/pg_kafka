@@ -1,37 +1,34 @@
 #!/bin/bash
 # Pre-commit hook for pg_kafka
-# Ensures code quality by running fmt and clippy before accepting commits
 #
-# To install: cp hooks/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
-# Or run: hooks/install.sh
+# DR-25 (DEEP-REVIEW-2026-07): pre-commit now runs ONLY the fast checks
+# (formatting for both crates, ~seconds). The minutes-long clippy pass moved to
+# the pre-push hook — a heavy pre-commit trains contributors to reach for
+# `--no-verify`, which silently skips everything.
+#
+# To install: ./hooks/install.sh
 
 set -e
 
 echo "Running pre-commit checks..."
 
-# Check if we're in the workspace directory
 if [ ! -f "Cargo.toml" ]; then
     echo "Error: Cargo.toml not found. Run git commit from repository root."
     exit 1
 fi
 
-# Run cargo fmt check
 echo "🔍 Checking code formatting with cargo fmt..."
 if ! cargo fmt --check 2>&1; then
     echo "❌ Code formatting check failed!"
     echo "Run 'cargo fmt' to fix formatting issues."
     exit 1
 fi
-echo "✅ Formatting check passed"
-
-# Run clippy with strict warnings
-echo "🔍 Running clippy with strict warnings..."
-if ! cargo clippy --features pg14 -- -D warnings 2>&1; then
-    echo "❌ Clippy check failed!"
-    echo "Fix all clippy warnings before committing."
+if ! (cd kafka_test && cargo fmt --check) 2>&1; then
+    echo "❌ kafka_test formatting check failed!"
+    echo "Run 'cd kafka_test && cargo fmt' to fix formatting issues."
     exit 1
 fi
-echo "✅ Clippy check passed"
+echo "✅ Formatting checks passed"
 
-echo "✅ All pre-commit checks passed!"
+echo "✅ All pre-commit checks passed! (clippy runs on pre-push)"
 exit 0

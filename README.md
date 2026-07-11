@@ -21,7 +21,7 @@ kcat -C -b localhost:9092 -t my-topic -p 0 -o beginning
 | **Consumer Groups** | Complete | Full coordinator with auto-rebalancing |
 | **Transactions** | Complete | Full EOS with read-committed isolation |
 | **Shadow Mode** | Complete | External Kafka forwarding with SASL/SSL |
-| **Test Suite** | 782 tests | 609 unit tests + 173 E2E scenarios |
+| **Test Suite** | 890+ tests | 686 unit + 10 property + 195 E2E (CI is the source of truth) |
 | **CI/CD** | Complete | GitHub Actions with lint, test, security audit |
 
 **Current Phase:** Phase 11 Complete - Shadow Mode
@@ -240,7 +240,7 @@ src/
 └── bin/
     └── pgrx_embed.rs       # pgrx embedding binary
 
-kafka_test/                 # E2E test suite using rdkafka client (173 tests)
+kafka_test/                 # E2E test suite using rdkafka client (195 tests)
 docs/                       # Architecture decisions, protocol coverage
 ```
 
@@ -263,8 +263,11 @@ docs/                       # Architecture decisions, protocol coverage
 | Config | 32 | GUC configuration |
 | Testing Utils | 23 | Test infrastructure |
 | Other | 46 | Coordinator, partitioner, constants |
-| E2E | 173 | Full integration with rdkafka client |
-| **Total** | **782** | 609 unit + 173 E2E |
+| E2E | 195 | Full integration with rdkafka client |
+| **Total** | **890+** | 686 unit + 10 property + 195 E2E |
+
+*Counts drift as tests are added — the CI run is the source of truth; per-category
+numbers above are indicative.*
 
 ### Running Tests
 
@@ -290,17 +293,27 @@ The GitHub Actions pipeline runs:
 
 ## Configuration
 
+> ⚠️ **Security: the Kafka listener has no authentication or TLS.** Anyone who
+> can reach `pg_kafka.port` can produce, consume, and administer topics — the
+> wire protocol implements no SASL and no encryption (inbound; Shadow Mode's
+> *outbound* SASL/SSL is unrelated). The default bind is `0.0.0.0`. Deploy only
+> on trusted networks: bind to `127.0.0.1` where possible, or firewall the port
+> to known clients. The extension logs a startup WARNING when bound to a
+> non-loopback address (SEC-7, accepted-by-design — see
+> `docs/PROTOCOL_DEVIATIONS.md` "Network Security Posture").
+
 ```sql
 -- In postgresql.conf:
 shared_preload_libraries = 'pg_kafka'
 
 -- Network configuration (requires restart)
 pg_kafka.port = 9092              -- TCP port (default: 9092)
-pg_kafka.host = '0.0.0.0'         -- Bind address (default: 0.0.0.0)
+pg_kafka.host = '0.0.0.0'         -- Bind address (default: 0.0.0.0 — see warning above)
 
 -- Runtime configuration
 pg_kafka.log_connections = false  -- Log each connection
 pg_kafka.shutdown_timeout_ms = 5000
+pg_kafka.message_retention_hours = 0  -- Time-based retention sweep (0 = keep forever)
 ```
 
 ---

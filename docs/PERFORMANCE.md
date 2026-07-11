@@ -2,20 +2,48 @@
 
 This document outlines performance benchmarks, tuning recommendations, and architectural decisions based on real-world PostgreSQL queue/pub-sub benchmarking.
 
-## Benchmark Validation
+## Measured pg_kafka Performance (the numbers that matter)
 
-### PostgreSQL as High-Throughput Message Store
+> DR-23 (DEEP-REVIEW-2026-07): this section supersedes the external benchmark
+> below as the headline. pg_kafka's own measured numbers live in the evidence
+> pipeline — `evidence/bench/` regenerates `bench.json` in CI and the results
+> render at [rtrentjones.dev/pg_kafka](https://rtrentjones.dev/pg_kafka).
+> **Do not quote the external PostgreSQL benchmark figures as pg_kafka
+> throughput**: pg_kafka serializes ALL SPI work through a single background
+> worker thread (a deliberate correctness trade — see "Architecture ceiling"
+> below), so raw multi-core PostgreSQL numbers are not reachable through the
+> Kafka wire path.
+
+For current figures, see `bench.json` on the `evidence` branch (produce/consume
+throughput, latency percentiles, raw-INSERT floor, shadow-forwarding rates).
+The E2E performance suite (`kafka_test --category performance`) enforces
+regression floors in CI (DR-18).
+
+### Architecture ceiling
+
+Every Produce/Fetch/Offset/Txn request executes on **one** DB thread, one at a
+time. This makes the in-memory coordinator and check-then-act SQL race-free
+without locks, at the cost of a hard single-core ceiling for SPI work.
+Throughput levers, in order: batching (one Produce carrying N records costs
+~one insert), fetch byte budgets (DR-9 fills max_bytes in bounded query
+loops), connection pipelining (safe — responses stay ordered per connection),
+and vertical DB tuning. Heartbeats bypass the queue entirely (DR-12), so group
+liveness does not degrade with produce load.
+
+## Background: PostgreSQL as a message store (external benchmark)
 
 **Source:** [stanislavkozlovski/pg-queue-pubsub-benchmark](https://github.com/stanislavkozlovski/pg-queue-pubsub-benchmark)
 
-**Key Findings:**
-- ✅ **1,000,000+ reads/sec** on single node (96 vCPU)
-- ✅ **200,000+ writes/sec** sustained throughput
-- ✅ **Monotonic offset pattern** (identical to Kafka) performs well
-- ⚠️ **Infinite table growth** causes performance cliff
-- ⚠️ **Default autovacuum settings** too slow for high-churn workloads
+These figures characterize the *storage engine*, not pg_kafka (measured with
+many parallel backends on a 96-vCPU node — a topology pg_kafka's single-writer
+design deliberately does not use):
+- 1,000,000+ reads/sec / 200,000+ writes/sec on that hardware
+- Monotonic offset pattern (identical to Kafka) performs well
+- ⚠️ Infinite table growth causes a performance cliff
+- ⚠️ Default autovacuum settings too slow for high-churn workloads
 
-**Conclusion:** PostgreSQL can absolutely serve as a Kafka-compatible message broker for small-to-medium scale workloads. The bottleneck is NOT the database engine itself, but rather schema design and configuration.
+**Takeaway:** the storage engine is not the limiting factor at pg_kafka's
+scale; schema design, retention, and the single-writer wire path are.
 
 ## Critical Performance Pitfalls
 
@@ -190,7 +218,11 @@ reserve_pool_size = 10         # Emergency reserve
 **pg_kafka Impact:**
 - The TCP listener on port 9092 multiplexes thousands of client connections
 - But only uses ONE background worker process for SPI calls
-- This is already optimal! No additional pooling needed.
+- So PgBouncer-style pooling is NOT APPLICABLE to the Kafka wire path — there
+  is exactly one SPI connection by design. (That is a correctness trade with a
+  hard throughput ceiling, not an optimization — see "Architecture ceiling"
+  at the top of this document. Pooling advice here applies only to regular
+  SQL clients sharing the same database.)
 
 ## Performance Monitoring
 
@@ -360,25 +392,25 @@ CREATE TABLE kafka.consumer_offsets (
 - Lock is per-partition, not global (concurrent writes to different partitions don't block)
 - Adds ~1ms per INSERT batch (acceptable for Phase 2 throughput targets)
 
-## Recommended GUC Parameters for pg_kafka
+## Retention & lifecycle GUCs (shipped)
 
-### Phase 2 (Current)
-
-Add these to our extension's GUC configuration:
-
-```rust
-// src/config.rs additions for Phase 3
-static PG_KAFKA_RETENTION_DAYS: GucSetting<i32> = GucSetting::new(7);  // Default: 7 days
-static PG_KAFKA_PARTITION_INTERVAL: GucSetting<&str> = GucSetting::new("daily");  // "daily" or "hourly"
-static PG_KAFKA_AUTOVACUUM_AGGRESSIVE: GucSetting<bool> = GucSetting::new(true);  // Enable aggressive autovacuum
-```
+> DR-23: earlier revisions of this document described `pg_kafka.retention_days`,
+> `pg_kafka.partition_interval`, and `pg_kafka.autovacuum_aggressive` — none of
+> which were ever implemented. What actually ships (DR-1/DR-2):
 
 ```sql
--- postgresql.conf recommendations
-pg_kafka.retention_days = 7                    -- Drop partitions older than 7 days
-pg_kafka.partition_interval = 'daily'          -- 'daily' or 'hourly'
-pg_kafka.autovacuum_aggressive = true          -- Apply aggressive autovacuum settings
+-- Time-based retention for kafka.messages, enforced by the worker's periodic
+-- retention sweep (60s cadence, bounded deletes). 0 (default) keeps forever.
+pg_kafka.message_retention_hours = 168   -- e.g. 7 days
+
+-- On-demand sweep + report (also prunes stale producers, terminal
+-- transactions, and delivered shadow-outbox rows):
+SELECT * FROM pg_kafka_run_retention_sweep();
 ```
+
+Aggressive autovacuum for the high-churn counter tables is applied by
+`sql/tune_autovacuum.sql` (DR-5). Native table partitioning remains future work
+(ADR-001).
 
 ### Suggested System Configuration
 

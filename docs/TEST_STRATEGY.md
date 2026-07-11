@@ -9,13 +9,18 @@
 
 | Category | Count | Coverage |
 |----------|-------|----------|
-| Unit Tests | 609 | Core logic, handlers, storage, protocol, shadow |
-| E2E Tests | 173 | Full protocol integration |
-| **Total** | **782** | **Comprehensive** |
+| Unit Tests | 686 | Core logic, handlers, storage, protocol, shadow |
+| Property Tests | 10 | Proptest wire-format invariants (CI-run) |
+| E2E Tests | 195 | Full protocol integration |
+| **Total** | **~890** | **Comprehensive** |
+
+> DR-22 (DEEP-REVIEW-2026-07): counts here are refreshed manually and drift as
+> tests land — **the CI run is the source of truth.** Regenerate with
+> `cargo test --lib` (unit), `grep -c wrap_test! kafka_test/src/main.rs` (E2E).
 
 ---
 
-## Unit Test Distribution (609 tests)
+## Unit Test Distribution (indicative)
 
 | Module | Tests | Focus |
 |--------|-------|-------|
@@ -41,7 +46,7 @@ cargo test --features pg14
 
 ---
 
-## E2E Test Categories (173 tests)
+## E2E Test Categories (195 tests)
 
 | Category | Tests | Purpose |
 |----------|-------|---------|
@@ -198,6 +203,6 @@ See `docs/PGRX_TESTING_GUIDE.md` for the full testing strategy.
 
 ---
 
-**Test Count:** 782 (609 unit + 173 E2E)
+**Test Count:** ~890 (686 unit + 10 property + 195 E2E; CI is the source of truth)
 **Coverage Target:** 80%+ (testable code)
 **All Tests Passing:** ✅

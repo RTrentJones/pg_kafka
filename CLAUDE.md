@@ -46,7 +46,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Automated E2E tests with real Kafka client (rdkafka)
 
 **API Coverage:** 23 of ~50 standard Kafka APIs (46%)
-**Test Status:** 609 unit tests + 173 E2E tests = 782 total ✅
+**Test Status:** 686 unit + 10 property + 195 E2E ≈ 890 total ✅ (CI is the source of truth; counts drift)
 **Coverage Target:** 80%+ (testable code)
 
 ## Development Setup
@@ -120,7 +120,7 @@ cargo pgrx start pg14
 cd kafka_test && cargo run --release
 
 # Quick development iteration (kills postgres, rebuilds, restarts, recreates extension)
-./restart.sh
+./scripts/restart.sh
 
 # Test coverage
 cargo llvm-cov --lib --features pg14 --lcov --output-path lcov.info
@@ -205,16 +205,16 @@ src/
 │   │   ├── init_producer_id.rs  # InitProducerId handler (Phase 9)
 │   │   ├── metadata.rs # ApiVersions/Metadata handlers
 │   │   ├── produce.rs  # ProduceRequest handler (with sequence validation)
-│   │   └── tests.rs    # Handler unit tests (56 tests with MockKafkaStore)
+│   │   └── tests.rs    # Handler unit tests with MockKafkaStore
 │   └── storage/        # Storage abstraction layer (Repository Pattern)
 │       ├── mod.rs      # KafkaStore trait definition
 │       ├── postgres.rs # PostgreSQL implementation (PostgresStore)
-│       └── tests.rs    # Storage layer tests (43 tests)
+│       └── tests.rs    # Storage layer tests
 └── bin/
     └── pgrx_embed.rs   # pgrx embedding binary (generated)
 
 tests/                  # pgrx integration tests (limited due to PGC_POSTMASTER)
-kafka_test/             # E2E test suite (173 tests)
+kafka_test/             # E2E test suite (195 tests)
     └── src/
         ├── main.rs               # Test orchestrator with CLI
         ├── lib.rs                # Test re-exports
@@ -239,7 +239,7 @@ kafka_test/             # E2E test suite (173 tests)
         └── performance/          # Performance benchmarks
 
 sql/
-├── pg_kafka--0.0.0.sql # Schema definition (kafka.messages, kafka.topics, kafka.consumer_offsets)
+├── bootstrap.sql       # Schema definition (kafka.messages, kafka.topics, kafka.consumer_offsets, ...)
 └── tune_autovacuum.sql # Optional performance tuning script
 
 docs/
@@ -252,7 +252,7 @@ docs/
 └── architecture/
     └── ADR-001-partitioning-and-retention.md  # Design decisions
 
-restart.sh              # Quick rebuild and restart script for development
+scripts/restart.sh      # Quick rebuild and restart script for development
 Cargo.lock              # Locked dependencies for reproducible builds
 ```
 
@@ -358,6 +358,10 @@ CREATE TABLE kafka.consumer_offsets (
     PRIMARY KEY (group_id, topic_id, partition_id)
 );
 
+-- NOTE: group MEMBERSHIP is in-memory in the GroupCoordinator; only committed
+-- offsets persist. (The former kafka.consumer_groups table was dead schema and
+-- was removed — DR-6, DEEP-REVIEW-2026-07.)
+
 -- Phase 9: Idempotent Producer support
 CREATE TABLE kafka.producer_ids (
     producer_id BIGSERIAL PRIMARY KEY,
@@ -437,6 +441,7 @@ pg_kafka.compression_type = 'none' -- Outbound compression (none, gzip, snappy, 
 pg_kafka.log_timing = false       -- Enable timing instrumentation for benchmarking
 pg_kafka.enable_long_polling = true  -- Enable long polling for FetchRequest
 pg_kafka.fetch_poll_interval_ms = 100  -- Fallback polling interval (100-60000ms)
+pg_kafka.message_retention_hours = 0 -- Retention sweep for kafka.messages (0 = keep forever; DR-2)
 
 -- See "Shadow Mode Configuration" section below for shadow mode settings
 ```
@@ -536,7 +541,7 @@ Tests use shared infrastructure from `kafka_test/src/`:
 - **fixtures.rs**: Builders (`TestTopicBuilder`, `TestConsumerBuilder`, `TestProducerBuilder`)
 - **assertions.rs**: Domain-specific assertions (`assert_topic_exists()`, `assert_message_count()`, etc.)
 
-### Test Categories (173 tests)
+### Test Categories (195 tests)
 
 | Category | Tests | Purpose |
 |----------|-------|---------|

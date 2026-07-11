@@ -344,7 +344,7 @@ Wire-level SASL/ACLs are **not planned**; the accepted posture is network-contro
 | Client | Version | Status | Notes |
 |--------|---------|--------|-------|
 | kcat | 1.7.0+ | ✅ Works | Producer and consumer tested |
-| rdkafka (Rust) | 0.36+ | ✅ Works | Full E2E test suite (181 tests) |
+| rdkafka (Rust) | 0.36+ | ✅ Works | Full E2E test suite (195 tests) |
 
 ### Client Configuration
 
@@ -389,4 +389,4 @@ auto.offset.reset=earliest
 **Last Updated:** 2026-06-29
 **Applies To:** pg_kafka Phase 11 Complete (Shadow Mode)
 **API Coverage:** 23 of ~50 Kafka APIs (46%)
-**Test Status:** 672 unit tests + 181 E2E tests (CI-gated)
+**Test Status:** 686 unit + 10 property + 195 E2E tests (CI-gated; counts drift — CI is the source of truth)

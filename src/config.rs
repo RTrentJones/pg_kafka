@@ -466,7 +466,11 @@ pub fn init() {
         c"Username for SASL authentication to external Kafka. Requires restart.",
         &SHADOW_SASL_USERNAME,
         GucContext::Postmaster,
-        GucFlags::default(),
+        // DR-21 (DEEP-REVIEW-2026-07): same lockdown as the password (SEC-8). The
+        // username identifies the external-broker principal; with default flags it
+        // was visible in pg_settings/SHOW ALL to every role while the password was
+        // superuser-only — an inconsistent disclosure.
+        GucFlags::NO_SHOW_ALL | GucFlags::SUPERUSER_ONLY,
     );
 
     GucRegistry::define_string_guc(
