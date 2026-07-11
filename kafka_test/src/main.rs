@@ -97,6 +97,7 @@ use kafka_test::{
     test_consumer_group_lifecycle,
     test_consumer_group_two_members,
     test_consumer_multiple_messages,
+    test_consumer_receives_headers,
     test_consumer_rejoin_after_leave,
     test_coordinator_state_race,
     test_correlation_id_preserved,
@@ -480,6 +481,12 @@ fn get_all_tests() -> Vec<TestDef> {
             category: "consumer",
             name: "test_consumer_basic",
             test_fn: wrap_test!(test_consumer_basic),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "consumer",
+            name: "test_consumer_receives_headers",
+            test_fn: wrap_test!(test_consumer_receives_headers),
             parallel_safe: true,
         },
         TestDef {

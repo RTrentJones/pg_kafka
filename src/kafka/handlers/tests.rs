@@ -267,6 +267,7 @@ mod tests {
                     key: Some(b"key1".to_vec()),
                     value: Some(b"value1".to_vec()),
                     timestamp: 1234567890,
+                    headers: vec![],
                 }])
             });
 
@@ -302,6 +303,123 @@ mod tests {
         assert_eq!(partition_data.error_code, ERROR_NONE);
         assert_eq!(partition_data.high_watermark, 1);
         assert_eq!(partition_data.log_start_offset, 5);
+    }
+
+    /// DR-8 (DEEP-REVIEW-2026-07): stored headers must be re-encoded into the fetch
+    /// response's RecordBatch. Before the fix, the handler set `headers:
+    /// Default::default()` unconditionally, so consumers always saw empty headers.
+    #[test]
+    fn test_handle_fetch_returns_headers() {
+        let mut mock = MockKafkaStore::new();
+
+        mock.expect_get_topic_metadata().returning(|_| {
+            Ok(vec![TopicMetadata {
+                name: "test-topic".to_string(),
+                id: 1,
+                partition_count: 1,
+            }])
+        });
+
+        mock.expect_fetch_records_with_isolation()
+            .returning(|_, _, _, _, _| {
+                Ok(vec![FetchedMessage {
+                    partition_offset: 0,
+                    key: Some(b"key1".to_vec()),
+                    value: Some(b"value1".to_vec()),
+                    timestamp: 1234567890,
+                    headers: vec![("trace-id".to_string(), b"abc123".to_vec())],
+                }])
+            });
+
+        mock.expect_get_high_watermark().returning(|_, _| Ok(1));
+        mock.expect_get_last_stable_offset().returning(|_, _| Ok(1));
+        mock.expect_get_earliest_offset().returning(|_, _| Ok(0));
+
+        let topic_data = vec![TopicFetchData {
+            name: "test-topic".to_string(),
+            partitions: vec![PartitionFetchData {
+                partition_index: 0,
+                fetch_offset: 0,
+                partition_max_bytes: 1024,
+            }],
+        }];
+
+        let coordinator = GroupCoordinator::new();
+        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+
+        let response = fetch::handle_fetch(
+            &ctx,
+            topic_data,
+            crate::kafka::storage::IsolationLevel::ReadUncommitted,
+        )
+        .unwrap();
+
+        // Decode the encoded RecordBatch and assert the header survived.
+        let partition_data = &response.responses[0].partitions[0];
+        assert_eq!(partition_data.error_code, ERROR_NONE);
+        let mut records_buf = partition_data.records.clone().expect("records present");
+        let decoded =
+            kafka_protocol::records::RecordBatchDecoder::decode(&mut records_buf).unwrap();
+        assert_eq!(decoded.records.len(), 1);
+        let record = &decoded.records[0];
+        let header_value = record
+            .headers
+            .get(&kafka_protocol::protocol::StrBytes::from_static_str(
+                "trace-id",
+            ))
+            .cloned()
+            .flatten()
+            .expect("trace-id header present in fetched record");
+        assert_eq!(header_value.as_ref(), b"abc123");
+    }
+
+    /// DR-10 (DEEP-REVIEW-2026-07): a storage error computing the HWM must surface
+    /// as a per-partition error code — not be swallowed into HWM=0, which a consumer
+    /// reads as "partition is empty".
+    #[test]
+    fn test_handle_fetch_hwm_error_returns_partition_error() {
+        let mut mock = MockKafkaStore::new();
+
+        mock.expect_get_topic_metadata().returning(|_| {
+            Ok(vec![TopicMetadata {
+                name: "test-topic".to_string(),
+                id: 1,
+                partition_count: 1,
+            }])
+        });
+
+        mock.expect_fetch_records_with_isolation()
+            .returning(|_, _, _, _, _| Ok(vec![]));
+        mock.expect_get_high_watermark()
+            .returning(|_, _| Err(crate::kafka::error::KafkaError::Internal("db down".into())));
+
+        let topic_data = vec![TopicFetchData {
+            name: "test-topic".to_string(),
+            partitions: vec![PartitionFetchData {
+                partition_index: 0,
+                fetch_offset: 0,
+                partition_max_bytes: 1024,
+            }],
+        }];
+
+        let coordinator = GroupCoordinator::new();
+        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+
+        let response = fetch::handle_fetch(
+            &ctx,
+            topic_data,
+            crate::kafka::storage::IsolationLevel::ReadUncommitted,
+        )
+        .unwrap();
+
+        let partition_data = &response.responses[0].partitions[0];
+        assert_ne!(
+            partition_data.error_code, ERROR_NONE,
+            "storage error must not be reported as an empty partition"
+        );
+        assert_eq!(partition_data.high_watermark, -1);
     }
 
     #[test]

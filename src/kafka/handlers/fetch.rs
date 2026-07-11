@@ -102,44 +102,74 @@ pub fn handle_fetch(
                 }
             };
 
-            // Get high watermark
-            let high_watermark = store
+            // DR-10 (DEEP-REVIEW-2026-07): a storage error computing the offset
+            // bounds must surface as a per-partition error code, not be swallowed
+            // as offset 0 — `unwrap_or(0)` made a transient Postgres error look
+            // like an empty partition, which can reset a consumer's position.
+            let bounds = store
                 .get_high_watermark(topic_id, partition_id)
-                .unwrap_or(0);
-
-            // Phase 10: Get last stable offset for ReadCommitted consumers
-            // LSO is the lowest offset of any pending transaction, or HWM if none pending
-            let last_stable_offset = match isolation_level {
-                IsolationLevel::ReadCommitted => store
-                    .get_last_stable_offset(topic_id, partition_id)
-                    .unwrap_or(high_watermark),
-                IsolationLevel::ReadUncommitted => high_watermark,
+                .and_then(|hwm| {
+                    let lso = match isolation_level {
+                        // Phase 10: LSO is the lowest offset of any pending
+                        // transaction, or HWM if none pending.
+                        IsolationLevel::ReadCommitted => {
+                            store.get_last_stable_offset(topic_id, partition_id)?
+                        }
+                        IsolationLevel::ReadUncommitted => hwm,
+                    };
+                    // RV-10: report the real log-start offset — the earliest
+                    // retained offset after cleanup/retention — rather than a
+                    // hardcoded 0.
+                    let log_start = store.get_earliest_offset(topic_id, partition_id)?;
+                    Ok((hwm, lso, log_start))
+                });
+            let (high_watermark, last_stable_offset, log_start_offset) = match bounds {
+                Ok(b) => b,
+                Err(e) => {
+                    if e.is_server_error() {
+                        crate::pg_warning!(
+                            "Failed to compute offset bounds for topic_id={}, partition={}: {}",
+                            topic_id,
+                            partition_id,
+                            e
+                        );
+                    }
+                    let mut partition_data = PartitionData::default();
+                    partition_data.partition_index = partition_id;
+                    partition_data.error_code = e.to_kafka_error_code();
+                    partition_data.high_watermark = -1;
+                    partition_responses.push(partition_data);
+                    continue;
+                }
             };
-
-            // RV-10: report the real log-start offset — the earliest retained offset
-            // after cleanup/retention — rather than a hardcoded 0, so a consumer
-            // that seeks to the beginning or computes lag lands on a valid offset.
-            let log_start_offset = store
-                .get_earliest_offset(topic_id, partition_id)
-                .unwrap_or(0);
 
             // Convert database records to Kafka RecordBatch format
             let records_bytes = if !db_records.is_empty() {
                 let kafka_records: Vec<Record> = db_records
                     .into_iter()
-                    .map(|msg| Record {
-                        transactional: false,
-                        control: false,
-                        partition_leader_epoch: 0,
-                        producer_id: -1,
-                        producer_epoch: -1,
-                        timestamp_type: TimestampType::Creation,
-                        offset: msg.partition_offset,
-                        sequence: 0, // Sequence in fetch response is not used; avoid i64→i32 overflow
-                        timestamp: msg.timestamp,
-                        key: msg.key.map(bytes::Bytes::from),
-                        value: msg.value.map(bytes::Bytes::from),
-                        headers: Default::default(),
+                    .map(|msg| {
+                        let mut record = Record {
+                            transactional: false,
+                            control: false,
+                            partition_leader_epoch: 0,
+                            producer_id: -1,
+                            producer_epoch: -1,
+                            timestamp_type: TimestampType::Creation,
+                            offset: msg.partition_offset,
+                            sequence: 0, // Sequence in fetch response is not used; avoid i64→i32 overflow
+                            timestamp: msg.timestamp,
+                            key: msg.key.map(bytes::Bytes::from),
+                            value: msg.value.map(bytes::Bytes::from),
+                            headers: Default::default(),
+                        };
+                        // DR-8: return stored headers to the consumer (they were
+                        // written on produce but never fetched before this).
+                        for (k, v) in msg.headers {
+                            record
+                                .headers
+                                .insert(StrBytes::from_string(k), Some(bytes::Bytes::from(v)));
+                        }
+                        record
                     })
                     .collect();
 

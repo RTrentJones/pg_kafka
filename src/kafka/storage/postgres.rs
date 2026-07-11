@@ -181,6 +181,139 @@ impl PostgresStore {
         })
         .map_err(|e: KafkaError| KafkaError::Internal(format!("run_retention_sweep failed: {}", e)))
     }
+
+    /// Shared fetch implementation for both isolation levels (DR-8/DR-9/DR-24,
+    /// DEEP-REVIEW-2026-07). Previously `fetch_records` and the ReadUncommitted
+    /// branch of `fetch_records_with_isolation` were byte-identical copies, and
+    /// both capped every fetch at 5,000 rows regardless of the client's
+    /// `max_bytes` budget — a 1 MB fetch of small messages returned tens of KB
+    /// and forced extra round trips through the single DB thread.
+    ///
+    /// This version iterates: each query is bounded (MAX_ROWS_PER_QUERY) so one
+    /// pass can't hold a huge result set, but the loop continues until the byte
+    /// budget is spent or the partition has no more rows. Headers are selected
+    /// and decoded (DR-8) so consumers actually receive them.
+    fn fetch_records_filtered(
+        &self,
+        topic_id: i32,
+        partition_id: i32,
+        fetch_offset: i64,
+        max_bytes: i32,
+        read_committed: bool,
+    ) -> Result<Vec<FetchedMessage>> {
+        // ADR-002: Dynamic Fetch Sizing — pg_column_size() tracks actual bytes via a
+        // window function; the row LIMIT is only a per-query bound, not the fetch cap.
+        const ESTIMATE_BYTES_PER_MESSAGE: i64 = 500;
+        const MAX_ROWS_PER_QUERY: i64 = 5_000;
+
+        // RV-4 (ReadCommitted): filter uncommitted rows AND clamp below the Last
+        // Stable Offset — a committed record above a still-open lower-offset
+        // transaction must not be returned, or the consumer advances past the
+        // pending offset and never re-reads it (lost/reordered delivery). With
+        // nothing pending the COALESCE default makes the bound a no-op.
+        let query = if read_committed {
+            "SELECT partition_offset, key, value, headers::text AS headers_json,
+                    CASE WHEN timestamp_ms >= 0 THEN timestamp_ms ELSE (EXTRACT(EPOCH FROM created_at) * 1000)::bigint END as timestamp_ms,
+                    SUM(COALESCE(pg_column_size(key), 0) + COALESCE(pg_column_size(value), 0) + 64)
+                        OVER (ORDER BY partition_offset) as cumulative_bytes
+             FROM kafka.messages
+             WHERE topic_id = $1 AND partition_id = $2 AND partition_offset >= $3
+               AND (txn_state IS NULL)
+               AND partition_offset < COALESCE(
+                   (SELECT MIN(m2.partition_offset) FROM kafka.messages m2
+                    WHERE m2.topic_id = $1 AND m2.partition_id = $2
+                      AND m2.txn_state = 'pending'),
+                   partition_offset + 1)
+             ORDER BY partition_offset
+             LIMIT $4"
+        } else {
+            "SELECT partition_offset, key, value, headers::text AS headers_json,
+                    CASE WHEN timestamp_ms >= 0 THEN timestamp_ms ELSE (EXTRACT(EPOCH FROM created_at) * 1000)::bigint END as timestamp_ms,
+                    SUM(COALESCE(pg_column_size(key), 0) + COALESCE(pg_column_size(value), 0) + 64)
+                        OVER (ORDER BY partition_offset) as cumulative_bytes
+             FROM kafka.messages
+             WHERE topic_id = $1 AND partition_id = $2 AND partition_offset >= $3
+             ORDER BY partition_offset
+             LIMIT $4"
+        };
+
+        Spi::connect(|client| {
+            let mut messages: Vec<FetchedMessage> = Vec::new();
+            let max_bytes_i64 = max_bytes.max(0) as i64;
+            let mut consumed: i64 = 0;
+            let mut next_offset = fetch_offset;
+
+            loop {
+                let remaining = max_bytes_i64 - consumed;
+                if remaining <= 0 && !messages.is_empty() {
+                    break;
+                }
+                let limit =
+                    (remaining / ESTIMATE_BYTES_PER_MESSAGE + 1).clamp(10, MAX_ROWS_PER_QUERY);
+
+                let table = client.select(
+                    query,
+                    None,
+                    &[
+                        topic_id.into(),
+                        partition_id.into(),
+                        next_offset.into(),
+                        limit.into(),
+                    ],
+                )?;
+
+                let row_count = table.len() as i64;
+                let batch_base = consumed;
+                let mut budget_hit = false;
+
+                for row in table {
+                    // cumulative_bytes restarts per query; add the running total.
+                    let batch_cumulative: i64 = row.get_by_name("cumulative_bytes")?.unwrap_or(0);
+                    let total = batch_base + batch_cumulative;
+
+                    // Always include at least one message even if it exceeds max_bytes
+                    // (Kafka protocol behavior: one message is the minimum response).
+                    if !messages.is_empty() && total > max_bytes_i64 {
+                        budget_hit = true;
+                        break;
+                    }
+
+                    let partition_offset: i64 = row.get_by_name("partition_offset")?.unwrap_or(0);
+                    let key: Option<Vec<u8>> = row.get_by_name("key")?;
+                    let value: Option<Vec<u8>> = row.get_by_name("value")?;
+                    let timestamp: i64 = row.get_by_name("timestamp_ms")?.unwrap_or(0);
+                    let headers_json: Option<String> = row.get_by_name("headers_json")?;
+                    let headers = super::decode_headers_json(headers_json.as_deref());
+
+                    messages.push(FetchedMessage {
+                        partition_offset,
+                        key,
+                        value,
+                        timestamp,
+                        headers,
+                    });
+                    next_offset = partition_offset + 1;
+                    consumed = total;
+                }
+
+                // Stop when the budget is spent or the partition is drained
+                // (a short batch means no more matching rows past next_offset).
+                if budget_hit || row_count < limit {
+                    break;
+                }
+            }
+
+            crate::pg_debug!(
+                "Fetched {} messages ({} bytes of {} budget, read_committed={})",
+                messages.len(),
+                consumed,
+                max_bytes_i64,
+                read_committed
+            );
+            Ok(messages)
+        })
+        .map_err(|e: KafkaError| KafkaError::Internal(format!("fetch_records failed: {}", e)))
+    }
 }
 
 impl Default for PostgresStore {
@@ -419,79 +552,10 @@ impl KafkaStore for PostgresStore {
             max_bytes
         );
 
-        // ADR-002: Dynamic Fetch Sizing
-        //
-        // Previous approach: Fixed heuristic (max_bytes / 100) assumed ~100 bytes per message.
-        // This caused issues with:
-        //   - Tiny messages: 10,000 roundtrips for 1MB of 100-byte messages
-        //   - Large messages: OOM trying to load 10,000 x 1MB blobs
-        //
-        // New approach: Use pg_column_size() to track actual bytes and stop when limit reached.
-        // Initial limit is based on configurable estimate (default: 500 bytes per message).
-        // This adapts to actual message sizes while preventing memory exhaustion.
-        //
-        // The query includes cumulative byte tracking via window function.
-        // We fetch up to initial_limit rows but stop processing when cumulative_bytes exceeds max_bytes.
-        const ESTIMATE_BYTES_PER_MESSAGE: i32 = 500;
-        let initial_limit = (max_bytes / ESTIMATE_BYTES_PER_MESSAGE).clamp(10, 5_000);
-
-        Spi::connect(|client| {
-            // Query with cumulative byte tracking
-            // pg_column_size() gives actual storage size including TOAST overhead
-            let table = client.select(
-                "SELECT partition_offset, key, value,
-                        CASE WHEN timestamp_ms >= 0 THEN timestamp_ms ELSE (EXTRACT(EPOCH FROM created_at) * 1000)::bigint END as timestamp_ms,
-                        SUM(COALESCE(pg_column_size(key), 0) + COALESCE(pg_column_size(value), 0) + 64)
-                            OVER (ORDER BY partition_offset) as cumulative_bytes
-                 FROM kafka.messages
-                 WHERE topic_id = $1 AND partition_id = $2 AND partition_offset >= $3
-                 ORDER BY partition_offset
-                 LIMIT $4",
-                None,
-                &[
-                    topic_id.into(),
-                    partition_id.into(),
-                    fetch_offset.into(),
-                    initial_limit.into(),
-                ],
-            )?;
-
-            let mut messages = Vec::new();
-            let max_bytes_i64 = max_bytes as i64;
-
-            for row in table {
-                // Check cumulative bytes BEFORE adding message
-                // This ensures we don't exceed max_bytes
-                let cumulative_bytes: i64 = row.get_by_name("cumulative_bytes")?.unwrap_or(0);
-
-                // Always include at least one message even if it exceeds max_bytes
-                // (Kafka protocol behavior: one message is minimum response)
-                if !messages.is_empty() && cumulative_bytes > max_bytes_i64 {
-                    crate::pg_debug!(
-                        "Stopping fetch: cumulative_bytes={} exceeds max_bytes={}",
-                        cumulative_bytes,
-                        max_bytes
-                    );
-                    break;
-                }
-
-                let partition_offset: i64 = row.get_by_name("partition_offset")?.unwrap_or(0);
-                let key: Option<Vec<u8>> = row.get_by_name("key")?;
-                let value: Option<Vec<u8>> = row.get_by_name("value")?;
-                let timestamp: i64 = row.get_by_name("timestamp_ms")?.unwrap_or(0);
-
-                messages.push(FetchedMessage {
-                    partition_offset,
-                    key,
-                    value,
-                    timestamp,
-                });
-            }
-
-            crate::pg_debug!("Fetched {} messages", messages.len());
-            Ok(messages)
-        })
-        .map_err(|e: KafkaError| KafkaError::Internal(format!("fetch_records failed: {}", e)))
+        // Kept on the trait for the ShadowStore SH-6 suppression path; the consumer
+        // path goes through fetch_records_with_isolation. Both share one
+        // implementation (DR-24): this is the ReadUncommitted filter.
+        self.fetch_records_filtered(topic_id, partition_id, fetch_offset, max_bytes, false)
     }
 
     fn get_high_watermark(&self, topic_id: i32, partition_id: i32) -> Result<i64> {
@@ -1795,100 +1859,16 @@ impl KafkaStore for PostgresStore {
             isolation_level
         );
 
-        // ADR-002: Dynamic Fetch Sizing (same as fetch_records)
-        const ESTIMATE_BYTES_PER_MESSAGE: i32 = 500;
-        let initial_limit = (max_bytes / ESTIMATE_BYTES_PER_MESSAGE).clamp(10, 5_000);
-
-        Spi::connect(|client| {
-            let query = match isolation_level {
-                IsolationLevel::ReadUncommitted => {
-                    // Return all records including pending, with cumulative byte tracking
-                    "SELECT partition_offset, key, value,
-                            CASE WHEN timestamp_ms >= 0 THEN timestamp_ms ELSE (EXTRACT(EPOCH FROM created_at) * 1000)::bigint END as timestamp_ms,
-                            SUM(COALESCE(pg_column_size(key), 0) + COALESCE(pg_column_size(value), 0) + 64)
-                                OVER (ORDER BY partition_offset) as cumulative_bytes
-                     FROM kafka.messages
-                     WHERE topic_id = $1 AND partition_id = $2 AND partition_offset >= $3
-                     ORDER BY partition_offset
-                     LIMIT $4"
-                }
-                IsolationLevel::ReadCommitted => {
-                    // Filter out pending and aborted records, with cumulative byte tracking.
-                    // RV-4: also clamp to below the Last Stable Offset (the lowest pending
-                    // offset). A committed record at an offset >= a still-open lower-offset
-                    // transaction must NOT be returned to a read_committed consumer — otherwise
-                    // it advances past the pending offset and never re-reads it once that txn
-                    // commits (lost / reordered delivery). When nothing is pending the subquery
-                    // is NULL, so the COALESCE default (partition_offset + 1) makes the bound a
-                    // no-op and every committed record is returned.
-                    "SELECT partition_offset, key, value,
-                            CASE WHEN timestamp_ms >= 0 THEN timestamp_ms ELSE (EXTRACT(EPOCH FROM created_at) * 1000)::bigint END as timestamp_ms,
-                            SUM(COALESCE(pg_column_size(key), 0) + COALESCE(pg_column_size(value), 0) + 64)
-                                OVER (ORDER BY partition_offset) as cumulative_bytes
-                     FROM kafka.messages
-                     WHERE topic_id = $1 AND partition_id = $2 AND partition_offset >= $3
-                       AND (txn_state IS NULL)
-                       AND partition_offset < COALESCE(
-                           (SELECT MIN(m2.partition_offset) FROM kafka.messages m2
-                            WHERE m2.topic_id = $1 AND m2.partition_id = $2
-                              AND m2.txn_state = 'pending'),
-                           partition_offset + 1)
-                     ORDER BY partition_offset
-                     LIMIT $4"
-                }
-            };
-
-            let table = client.select(
-                query,
-                None,
-                &[
-                    topic_id.into(),
-                    partition_id.into(),
-                    fetch_offset.into(),
-                    initial_limit.into(),
-                ],
-            )?;
-
-            let mut messages = Vec::new();
-            let max_bytes_i64 = max_bytes as i64;
-
-            for row in table {
-                // Check cumulative bytes before adding message
-                let cumulative_bytes: i64 = row.get_by_name("cumulative_bytes")?.unwrap_or(0);
-
-                // Always include at least one message
-                if !messages.is_empty() && cumulative_bytes > max_bytes_i64 {
-                    crate::pg_debug!(
-                        "Stopping fetch: cumulative_bytes={} exceeds max_bytes={}",
-                        cumulative_bytes,
-                        max_bytes
-                    );
-                    break;
-                }
-
-                let partition_offset: i64 = row.get_by_name("partition_offset")?.unwrap_or(0);
-                let key: Option<Vec<u8>> = row.get_by_name("key")?;
-                let value: Option<Vec<u8>> = row.get_by_name("value")?;
-                let timestamp: i64 = row.get_by_name("timestamp_ms")?.unwrap_or(0);
-
-                messages.push(FetchedMessage {
-                    partition_offset,
-                    key,
-                    value,
-                    timestamp,
-                });
-            }
-
-            crate::pg_debug!(
-                "Fetched {} messages with isolation {:?}",
-                messages.len(),
-                isolation_level
-            );
-            Ok(messages)
-        })
-        .map_err(|e: KafkaError| {
-            KafkaError::Internal(format!("fetch_records_with_isolation failed: {}", e))
-        })
+        // DR-24: both isolation levels share fetch_records_filtered; ReadCommitted
+        // adds the txn_state filter + RV-4 LSO clamp inside the shared query.
+        let read_committed = matches!(isolation_level, IsolationLevel::ReadCommitted);
+        self.fetch_records_filtered(
+            topic_id,
+            partition_id,
+            fetch_offset,
+            max_bytes,
+            read_committed,
+        )
     }
 
     fn get_last_stable_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64> {

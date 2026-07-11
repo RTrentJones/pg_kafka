@@ -72,6 +72,7 @@ pub use setup::TestContext;
 // Re-export test functions for convenience
 pub use consumer::{
     test_consumer_basic, test_consumer_from_offset, test_consumer_multiple_messages,
+    test_consumer_receives_headers,
 };
 pub use consumer_group::{
     test_consumer_group_lifecycle, test_find_coordinator_bootstrap, test_group_state_transitions,
