@@ -182,6 +182,150 @@ impl PostgresStore {
         .map_err(|e: KafkaError| KafkaError::Internal(format!("run_retention_sweep failed: {}", e)))
     }
 
+    /// Shared produce-path insert for plain and transactional batches (DR-24,
+    /// DEEP-REVIEW-2026-07): the two paths were ~90% identical copies (advisory
+    /// lock -> BUG-3 base-offset -> UNNEST insert -> counter advance) that had
+    /// already diverged once (RV-5-style "fix landed on one twin only" bugs).
+    /// `txn = Some((producer_id, producer_epoch))` stamps the transaction columns
+    /// and txn_state='pending'; None inserts NULLs (plain produce).
+    fn insert_records_inner(
+        &self,
+        topic_id: i32,
+        partition_id: i32,
+        records: &[Record],
+        txn: Option<(i64, i16)>,
+    ) -> Result<i64> {
+        if records.is_empty() {
+            return Ok(0);
+        }
+
+        Spi::connect_mut(|client| {
+            // Step 1: Lock the partition using advisory lock.
+            // DR-13 (DEEP-REVIEW-2026-07): in the shipped topology this lock is
+            // uncontended overhead — all extension writes serialize on the single
+            // DB thread, so no in-extension writer can race it. It is kept as
+            // defense-in-depth against OUT-OF-BAND writers (direct SQL inserts, a
+            // future second worker): the offset-assignment read below is a
+            // check-then-act that would race such a writer without it. Cost is one
+            // fast-path lock acquisition per produce; revisit only with a benchmark
+            // showing it matters.
+            client.select(
+                "SELECT pg_advisory_xact_lock($1, $2)",
+                None,
+                &[topic_id.into(), partition_id.into()],
+            )?;
+
+            // Step 2: Compute base_offset = GREATEST(persisted next_offset, MAX(partition_offset)+1).
+            // BUG-3: the persisted per-partition counter (kafka.partition_offsets) is never
+            // decremented, so deleting the highest (aborted) rows in cleanup_aborted_messages can't
+            // lower the next offset and cause offset reuse. The MAX+1 term seeds the counter from
+            // existing data the first time a partition is produced to after this counter existed.
+            // (Transactional rows are exactly the ones cleanup later deletes, so both paths MUST
+            // advance the same counter — the historical duplication risked them drifting.)
+            let table = client.select(
+                "SELECT GREATEST(
+                          COALESCE((SELECT next_offset FROM kafka.partition_offsets
+                                    WHERE topic_id = $1 AND partition_id = $2), 0),
+                          COALESCE((SELECT MAX(partition_offset) + 1 FROM kafka.messages
+                                    WHERE topic_id = $1 AND partition_id = $2), 0)
+                        ) AS base_offset",
+                None,
+                &[topic_id.into(), partition_id.into()],
+            )?;
+
+            let base_offset: i64 = table
+                .first()
+                .get_by_name::<i64, _>("base_offset")?
+                .unwrap_or(0);
+
+            crate::pg_debug!("Assigning base_offset={}", base_offset);
+
+            // Step 3: Build parallel arrays for UNNEST-based bulk insert
+            // (type-safe, no SQL built from data, PostgreSQL-optimized).
+            let count = records.len();
+            let topic_ids: Vec<i32> = vec![topic_id; count];
+            let partition_ids: Vec<i32> = vec![partition_id; count];
+            let offsets: Vec<i64> = (0..count).map(|i| base_offset + i as i64).collect();
+            let keys: Vec<Option<Vec<u8>>> = records.iter().map(|r| r.key.clone()).collect();
+            let values: Vec<Option<Vec<u8>>> = records.iter().map(|r| r.value.clone()).collect();
+            let headers: Vec<String> = records
+                .iter()
+                .map(|r| {
+                    if r.headers.is_empty() {
+                        "{}".to_string()
+                    } else {
+                        let headers_map: HashMap<String, String> = r
+                            .headers
+                            .iter()
+                            .map(|h| (h.key.clone(), hex_encode(&h.value)))
+                            .collect();
+                        serde_json::to_string(&headers_map).unwrap_or_else(|_| "{}".to_string())
+                    }
+                })
+                .collect();
+            // BUG-7: persist the producer's record timestamp (epoch ms) instead of dropping it; -1
+            // marks "no timestamp" so the fetch path falls back to the broker insert time.
+            let timestamps: Vec<i64> = records.iter().map(|r| r.timestamp.unwrap_or(-1)).collect();
+            // Transaction columns: stamped for transactional batches, NULL otherwise.
+            let producer_ids: Vec<Option<i64>> = vec![txn.map(|(pid, _)| pid); count];
+            let producer_epochs: Vec<Option<i16>> = vec![txn.map(|(_, epoch)| epoch); count];
+            let txn_states: Vec<Option<&str>> = vec![txn.map(|_| "pending"); count];
+
+            client
+                .update(
+                    "INSERT INTO kafka.messages (topic_id, partition_id, partition_offset, key, value, headers, producer_id, producer_epoch, txn_state, timestamp_ms)
+                     SELECT * FROM unnest($1::int[], $2::int[], $3::bigint[], $4::bytea[], $5::bytea[], $6::jsonb[], $7::bigint[], $8::smallint[], $9::text[], $10::bigint[])",
+                    None,
+                    &[
+                        topic_ids.into(),
+                        partition_ids.into(),
+                        offsets.into(),
+                        keys.into(),
+                        values.into(),
+                        headers.into(),
+                        producer_ids.into(),
+                        producer_epochs.into(),
+                        txn_states.into(),
+                        timestamps.into(),
+                    ],
+                )
+                .map_err(|e| KafkaError::Internal(format!("Failed to insert records: {}", e)))?;
+
+            // BUG-3: advance the monotonic per-partition counter so the next produce — even after
+            // cleanup_aborted_messages deletes the highest rows — cannot reuse these offsets.
+            client
+                .update(
+                    "INSERT INTO kafka.partition_offsets (topic_id, partition_id, next_offset)
+                     VALUES ($1, $2, $3)
+                     ON CONFLICT (topic_id, partition_id)
+                     DO UPDATE SET next_offset = GREATEST(kafka.partition_offsets.next_offset, EXCLUDED.next_offset)",
+                    None,
+                    &[
+                        topic_id.into(),
+                        partition_id.into(),
+                        (base_offset + count as i64).into(),
+                    ],
+                )
+                .map_err(|e| {
+                    KafkaError::Internal(format!("Failed to advance partition offset: {}", e))
+                })?;
+
+            crate::pg_debug!(
+                "Successfully inserted {} records (offsets {} to {}, txn={})",
+                count,
+                base_offset,
+                base_offset + count as i64 - 1,
+                txn.is_some()
+            );
+
+            Ok(base_offset)
+        })
+        .map_err(|e| match e {
+            KafkaError::Internal(_) => e,
+            _ => KafkaError::Internal(format!("insert_records failed: {}", e)),
+        })
+    }
+
     /// Shared fetch implementation for both isolation levels (DR-8/DR-9/DR-24,
     /// DEEP-REVIEW-2026-07). Previously `fetch_records` and the ReadUncommitted
     /// branch of `fetch_records_with_isolation` were byte-identical copies, and
@@ -416,133 +560,14 @@ impl KafkaStore for PostgresStore {
     }
 
     fn insert_records(&self, topic_id: i32, partition_id: i32, records: &[Record]) -> Result<i64> {
-        if records.is_empty() {
-            return Ok(0);
-        }
-
         crate::pg_debug!(
             "PostgresStore::insert_records: {} records for topic_id={}, partition_id={}",
             records.len(),
             topic_id,
             partition_id
         );
-
-        Spi::connect_mut(|client| {
-            // Step 1: Lock the partition using advisory lock.
-            // DR-13 (DEEP-REVIEW-2026-07): in the shipped topology this lock is
-            // uncontended overhead — all extension writes serialize on the single
-            // DB thread, so no in-extension writer can race it. It is kept as
-            // defense-in-depth against OUT-OF-BAND writers (direct SQL inserts, a
-            // future second worker): the offset-assignment read below is a
-            // check-then-act that would race such a writer without it. Cost is one
-            // fast-path lock acquisition per produce; revisit only with a benchmark
-            // showing it matters.
-            client.select(
-                "SELECT pg_advisory_xact_lock($1, $2)",
-                None,
-                &[topic_id.into(), partition_id.into()],
-            )?;
-
-            // Step 2: Compute base_offset = GREATEST(persisted next_offset, MAX(partition_offset)+1).
-            // BUG-3: the persisted per-partition counter (kafka.partition_offsets) is never
-            // decremented, so deleting the highest (aborted) rows in cleanup_aborted_messages can't
-            // lower the next offset and cause offset reuse. The MAX+1 term seeds the counter from
-            // existing data the first time a partition is produced to after this counter existed.
-            let table = client.select(
-                "SELECT GREATEST(
-                          COALESCE((SELECT next_offset FROM kafka.partition_offsets
-                                    WHERE topic_id = $1 AND partition_id = $2), 0),
-                          COALESCE((SELECT MAX(partition_offset) + 1 FROM kafka.messages
-                                    WHERE topic_id = $1 AND partition_id = $2), 0)
-                        ) AS base_offset",
-                None,
-                &[topic_id.into(), partition_id.into()],
-            )?;
-
-            let base_offset: i64 = table
-                .first()
-                .get_by_name::<i64, _>("base_offset")?
-                .unwrap_or(0);
-
-            crate::pg_debug!("Assigning base_offset={}", base_offset);
-
-            // Step 3: Build parallel arrays for UNNEST-based bulk insert
-            // This is type-safe (no SQL injection) and PostgreSQL-optimized
-            let count = records.len();
-            let topic_ids: Vec<i32> = vec![topic_id; count];
-            let partition_ids: Vec<i32> = vec![partition_id; count];
-            let offsets: Vec<i64> = (0..count).map(|i| base_offset + i as i64).collect();
-            let keys: Vec<Option<Vec<u8>>> = records.iter().map(|r| r.key.clone()).collect();
-            let values: Vec<Option<Vec<u8>>> = records.iter().map(|r| r.value.clone()).collect();
-            let headers: Vec<String> = records
-                .iter()
-                .map(|r| {
-                    if r.headers.is_empty() {
-                        "{}".to_string()
-                    } else {
-                        let headers_map: HashMap<String, String> = r
-                            .headers
-                            .iter()
-                            .map(|h| (h.key.clone(), hex_encode(&h.value)))
-                            .collect();
-                        serde_json::to_string(&headers_map).unwrap_or_else(|_| "{}".to_string())
-                    }
-                })
-                .collect();
-            // BUG-7: persist the producer's record timestamp (epoch ms) instead of dropping it; -1
-            // marks "no timestamp" so the fetch path falls back to the broker insert time.
-            let timestamps: Vec<i64> = records.iter().map(|r| r.timestamp.unwrap_or(-1)).collect();
-
-            // Execute single INSERT with UNNEST - type-safe parameterized query
-            client
-                .update(
-                    "INSERT INTO kafka.messages (topic_id, partition_id, partition_offset, key, value, headers, timestamp_ms)
-                     SELECT * FROM unnest($1::int[], $2::int[], $3::bigint[], $4::bytea[], $5::bytea[], $6::jsonb[], $7::bigint[])",
-                    None,
-                    &[
-                        topic_ids.into(),
-                        partition_ids.into(),
-                        offsets.into(),
-                        keys.into(),
-                        values.into(),
-                        headers.into(),
-                        timestamps.into(),
-                    ],
-                )
-                .map_err(|e| KafkaError::Internal(format!("Failed to insert records: {}", e)))?;
-
-            // BUG-3: advance the monotonic per-partition counter so the next produce — even after
-            // cleanup_aborted_messages deletes the highest rows — cannot reuse these offsets.
-            client
-                .update(
-                    "INSERT INTO kafka.partition_offsets (topic_id, partition_id, next_offset)
-                     VALUES ($1, $2, $3)
-                     ON CONFLICT (topic_id, partition_id)
-                     DO UPDATE SET next_offset = GREATEST(kafka.partition_offsets.next_offset, EXCLUDED.next_offset)",
-                    None,
-                    &[
-                        topic_id.into(),
-                        partition_id.into(),
-                        (base_offset + count as i64).into(),
-                    ],
-                )
-                .map_err(|e| {
-                    KafkaError::Internal(format!("Failed to advance partition offset: {}", e))
-                })?;
-
-            crate::pg_debug!(
-                "Successfully inserted {} records (offsets {} to {}) in single query",
-                records.len(),
-                base_offset,
-                base_offset + records.len() as i64 - 1
-            );
-
-            Ok(base_offset)
-        })
-        .map_err(|e| match e {
-            KafkaError::Internal(_) => e,
-            _ => KafkaError::Internal(format!("insert_records failed: {}", e)),
-        })
+        // DR-24: shared implementation with the transactional path (txn = None).
+        self.insert_records_inner(topic_id, partition_id, records, None)
     }
 
     fn fetch_records(
@@ -1496,10 +1521,6 @@ impl KafkaStore for PostgresStore {
         producer_id: i64,
         producer_epoch: i16,
     ) -> Result<i64> {
-        if records.is_empty() {
-            return Ok(0);
-        }
-
         crate::pg_debug!(
             "PostgresStore::insert_transactional_records: {} records for topic_id={}, partition_id={}, producer_id={}",
             records.len(),
@@ -1507,124 +1528,14 @@ impl KafkaStore for PostgresStore {
             partition_id,
             producer_id
         );
-
-        Spi::connect_mut(|client| {
-            // Step 1: Lock the partition using advisory lock.
-            // DR-13 (DEEP-REVIEW-2026-07): in the shipped topology this lock is
-            // uncontended overhead — all extension writes serialize on the single
-            // DB thread, so no in-extension writer can race it. It is kept as
-            // defense-in-depth against OUT-OF-BAND writers (direct SQL inserts, a
-            // future second worker): the offset-assignment read below is a
-            // check-then-act that would race such a writer without it. Cost is one
-            // fast-path lock acquisition per produce; revisit only with a benchmark
-            // showing it matters.
-            client.select(
-                "SELECT pg_advisory_xact_lock($1, $2)",
-                None,
-                &[topic_id.into(), partition_id.into()],
-            )?;
-
-            // Step 2: Compute base_offset = GREATEST(persisted next_offset, MAX(partition_offset)+1).
-            // BUG-3: transactional inserts must advance the monotonic counter too — these are the
-            // very rows cleanup_aborted_messages later deletes, and without advancing the counter a
-            // post-cleanup produce would reuse their offsets.
-            let table = client.select(
-                "SELECT GREATEST(
-                          COALESCE((SELECT next_offset FROM kafka.partition_offsets
-                                    WHERE topic_id = $1 AND partition_id = $2), 0),
-                          COALESCE((SELECT MAX(partition_offset) + 1 FROM kafka.messages
-                                    WHERE topic_id = $1 AND partition_id = $2), 0)
-                        ) AS base_offset",
-                None,
-                &[topic_id.into(), partition_id.into()],
-            )?;
-
-            let base_offset: i64 = table
-                .first()
-                .get_by_name::<i64, _>("base_offset")?
-                .unwrap_or(0);
-
-            // Step 3: Build parallel arrays for UNNEST-based bulk insert
-            let count = records.len();
-            let topic_ids: Vec<i32> = vec![topic_id; count];
-            let partition_ids: Vec<i32> = vec![partition_id; count];
-            let offsets: Vec<i64> = (0..count).map(|i| base_offset + i as i64).collect();
-            let keys: Vec<Option<Vec<u8>>> = records.iter().map(|r| r.key.clone()).collect();
-            let values: Vec<Option<Vec<u8>>> = records.iter().map(|r| r.value.clone()).collect();
-            let headers: Vec<String> = records
-                .iter()
-                .map(|r| {
-                    if r.headers.is_empty() {
-                        "{}".to_string()
-                    } else {
-                        let headers_map: HashMap<String, String> = r
-                            .headers
-                            .iter()
-                            .map(|h| (h.key.clone(), hex_encode(&h.value)))
-                            .collect();
-                        serde_json::to_string(&headers_map).unwrap_or_else(|_| "{}".to_string())
-                    }
-                })
-                .collect();
-            let producer_ids: Vec<i64> = vec![producer_id; count];
-            let producer_epochs: Vec<i16> = vec![producer_epoch; count];
-            let txn_states: Vec<&str> = vec!["pending"; count];
-            // BUG-7: persist the producer's record timestamp (epoch ms); -1 means "no timestamp".
-            let timestamps: Vec<i64> = records.iter().map(|r| r.timestamp.unwrap_or(-1)).collect();
-
-            // Execute single INSERT with UNNEST including transaction columns
-            client
-                .update(
-                    "INSERT INTO kafka.messages (topic_id, partition_id, partition_offset, key, value, headers, producer_id, producer_epoch, txn_state, timestamp_ms)
-                     SELECT * FROM unnest($1::int[], $2::int[], $3::bigint[], $4::bytea[], $5::bytea[], $6::jsonb[], $7::bigint[], $8::smallint[], $9::text[], $10::bigint[])",
-                    None,
-                    &[
-                        topic_ids.into(),
-                        partition_ids.into(),
-                        offsets.into(),
-                        keys.into(),
-                        values.into(),
-                        headers.into(),
-                        producer_ids.into(),
-                        producer_epochs.into(),
-                        txn_states.into(),
-                        timestamps.into(),
-                    ],
-                )
-                .map_err(|e| KafkaError::Internal(format!("Failed to insert transactional records: {}", e)))?;
-
-            // BUG-3: advance the monotonic per-partition counter (never decremented), so that once
-            // these pending rows are aborted and cleaned up, a later produce cannot reuse offsets.
-            client
-                .update(
-                    "INSERT INTO kafka.partition_offsets (topic_id, partition_id, next_offset)
-                     VALUES ($1, $2, $3)
-                     ON CONFLICT (topic_id, partition_id)
-                     DO UPDATE SET next_offset = GREATEST(kafka.partition_offsets.next_offset, EXCLUDED.next_offset)",
-                    None,
-                    &[
-                        topic_id.into(),
-                        partition_id.into(),
-                        (base_offset + count as i64).into(),
-                    ],
-                )
-                .map_err(|e| {
-                    KafkaError::Internal(format!("Failed to advance partition offset: {}", e))
-                })?;
-
-            crate::pg_debug!(
-                "Successfully inserted {} transactional records (offsets {} to {})",
-                records.len(),
-                base_offset,
-                base_offset + records.len() as i64 - 1
-            );
-
-            Ok(base_offset)
-        })
-        .map_err(|e| match e {
-            KafkaError::Internal(_) => e,
-            _ => KafkaError::Internal(format!("insert_transactional_records failed: {}", e)),
-        })
+        // DR-24: shared implementation with the plain path; Some(..) stamps the
+        // transaction columns and txn_state='pending'.
+        self.insert_records_inner(
+            topic_id,
+            partition_id,
+            records,
+            Some((producer_id, producer_epoch)),
+        )
     }
 
     fn store_txn_pending_offset(
