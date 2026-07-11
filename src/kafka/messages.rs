@@ -1009,6 +1009,58 @@ impl From<kafka_protocol::messages::list_offsets_request::ListOffsetsPartition>
 mod tests {
     use super::*;
 
+    // ========== RequestLanes Tests (DR-12) ==========
+
+    /// DR-12: Heartbeat must route to the liveness lane; everything else to the
+    /// main lane. Misrouting either way silently loses the liveness guarantee
+    /// (heartbeats queue behind produce) or starves the main lane's ordering.
+    #[test]
+    fn test_request_lanes_route_heartbeat_to_liveness() {
+        let (main_tx, main_rx) = crossbeam_channel::bounded::<KafkaRequest>(4);
+        let (liveness_tx, liveness_rx) = crossbeam_channel::bounded::<KafkaRequest>(4);
+        let lanes = RequestLanes {
+            main: main_tx,
+            liveness: liveness_tx,
+        };
+        let (response_tx, _response_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let heartbeat = KafkaRequest::Heartbeat {
+            correlation_id: 1,
+            client_id: None,
+            api_version: 0,
+            group_id: "g".to_string(),
+            generation_id: 1,
+            member_id: "m".to_string(),
+            group_instance_id: None,
+            response_tx: response_tx.clone(),
+        };
+        lanes.route(&heartbeat).send(heartbeat).unwrap();
+        assert!(
+            liveness_rx.try_recv().is_ok(),
+            "Heartbeat must land on the liveness lane"
+        );
+        assert!(
+            main_rx.try_recv().is_err(),
+            "Heartbeat must not land on the main lane"
+        );
+
+        let api_versions = KafkaRequest::ApiVersions {
+            correlation_id: 2,
+            client_id: None,
+            api_version: 0,
+            response_tx,
+        };
+        lanes.route(&api_versions).send(api_versions).unwrap();
+        assert!(
+            main_rx.try_recv().is_ok(),
+            "Non-heartbeat requests must land on the main lane"
+        );
+        assert!(
+            liveness_rx.try_recv().is_err(),
+            "Non-heartbeat requests must not land on the liveness lane"
+        );
+    }
+
     // ========== RecordHeader Tests ==========
 
     #[test]
