@@ -299,6 +299,11 @@ static SHADOW_OTEL_ENDPOINT: GucSetting<Option<CString>> = GucSetting::<Option<C
 static SHADOW_LICENSE_KEY: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 pub static CONFIG_RELOAD_INTERVAL_MS: GucSetting<i32> =
     GucSetting::<i32>::new(DEFAULT_CONFIG_RELOAD_MS);
+// DR-2 (DEEP-REVIEW-2026-07): time-based retention for kafka.messages. 0 (default)
+// disables the expired-message sweep — messages are kept forever (the historical
+// behaviour). Auxiliary-table pruning (stale producers, terminal transactions,
+// delivered shadow-outbox rows) always runs; see storage::postgres retention consts.
+pub static MESSAGE_RETENTION_HOURS: GucSetting<i32> = GucSetting::<i32>::new(0);
 
 /// Initialize GUC parameters
 pub fn init() {
@@ -374,6 +379,19 @@ pub fn init() {
         MIN_FETCH_POLL_INTERVAL_MS,
         MAX_FETCH_POLL_INTERVAL_MS,
         GucContext::Postmaster,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"pg_kafka.message_retention_hours",
+        c"Delete messages older than this many hours (0 = keep forever)",
+        c"Time-based retention for kafka.messages, enforced by the worker's periodic \
+          retention sweep. 0 (default) disables the sweep. Pending transactional \
+          messages are never deleted regardless of age. Reloadable via SIGHUP.",
+        &MESSAGE_RETENTION_HOURS,
+        0,
+        87_600, // 10 years
+        GucContext::Sighup,
         GucFlags::default(),
     );
 

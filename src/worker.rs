@@ -112,11 +112,12 @@ fn verify_schema(database: &str) -> Result<(), String> {
     // stale schema (e.g. missing the phase-9/10 idempotent/transaction tables, the BUG-3 offset
     // counter, or the shadow tables) is caught at worker start rather than as a late SPI failure on
     // the first produce/txn/shadow operation. `CREATE EXTENSION pg_kafka` creates all of these.
+    // DR-6 (DEEP-REVIEW-2026-07): "consumer_groups" is intentionally absent — the table was
+    // dead schema (membership lives in the in-memory GroupCoordinator) and was dropped.
     let required_tables = [
         "topics",
         "messages",
         "consumer_offsets",
-        "consumer_groups",
         "partition_offsets",
         "producer_ids",
         "producer_sequences",
