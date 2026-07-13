@@ -22,6 +22,31 @@ fn create_admin_client() -> Result<AdminClient<DefaultClientContext>, Box<dyn st
     Ok(admin)
 }
 
+/// Poll a COUNT(*) query until it returns `expected` or the deadline passes,
+/// returning the last observed value for the caller to assert on.
+///
+/// The broker sends its Kafka response from inside the worker's transaction,
+/// so a separate Postgres connection can still observe pre-commit state for a
+/// few milliseconds after the client sees a successful admin response. A
+/// single instant read here is a race (seen as a rare CI flake in
+/// test_create_multiple_topics); polling briefly makes verification
+/// deterministic without hiding real failures.
+async fn wait_for_count(
+    db: &tokio_postgres::Client,
+    query: &str,
+    params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+    expected: i64,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let count: i64 = db.query_one(query, params).await?.get(0);
+        if count == expected || std::time::Instant::now() >= deadline {
+            return Ok(count);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// Test creating a new topic via CreateTopics API
 pub async fn test_create_topic() -> TestResult {
     let admin = create_admin_client()?;
@@ -44,15 +69,14 @@ pub async fn test_create_topic() -> TestResult {
 
     // Verify in database
     let db = create_db_client().await?;
-    let row = db
-        .query_one(
-            "SELECT partitions FROM kafka.topics WHERE name = $1",
-            &[&topic_name],
-        )
-        .await?;
-
-    let partitions: i32 = row.get(0);
-    assert_eq!(partitions, 3, "Topic should have 3 partitions");
+    let count = wait_for_count(
+        &db,
+        "SELECT COUNT(*) FROM kafka.topics WHERE name = $1 AND partitions = 3",
+        &[&topic_name],
+        1,
+    )
+    .await?;
+    assert_eq!(count, 1, "Topic should exist with 3 partitions");
 
     // Cleanup - wait for completion to prevent race conditions with next test
     if let Err(e) = admin.delete_topics(&[&topic_name], &opts).await {
@@ -129,14 +153,13 @@ pub async fn test_delete_topic() -> TestResult {
 
     // Verify in database that topic is gone
     let db = create_db_client().await?;
-    let count: i64 = db
-        .query_one(
-            "SELECT COUNT(*) FROM kafka.topics WHERE name = $1",
-            &[&topic_name],
-        )
-        .await?
-        .get(0);
-
+    let count = wait_for_count(
+        &db,
+        "SELECT COUNT(*) FROM kafka.topics WHERE name = $1",
+        &[&topic_name],
+        0,
+    )
+    .await?;
     assert_eq!(count, 0, "Topic should be deleted from database");
 
     println!("    Deleted topic '{}'", topic_name);
@@ -199,15 +222,14 @@ pub async fn test_create_partitions() -> TestResult {
 
     // Verify in database
     let db = create_db_client().await?;
-    let row = db
-        .query_one(
-            "SELECT partitions FROM kafka.topics WHERE name = $1",
-            &[&topic_name],
-        )
-        .await?;
-
-    let partitions: i32 = row.get(0);
-    assert_eq!(partitions, 5, "Topic should have 5 partitions now");
+    let count = wait_for_count(
+        &db,
+        "SELECT COUNT(*) FROM kafka.topics WHERE name = $1 AND partitions = 5",
+        &[&topic_name],
+        1,
+    )
+    .await?;
+    assert_eq!(count, 1, "Topic should have 5 partitions now");
 
     // Cleanup - wait for completion to prevent race conditions with next test
     if let Err(e) = admin.delete_topics(&[&topic_name], &opts).await {
@@ -413,14 +435,13 @@ pub async fn test_create_multiple_topics() -> TestResult {
 
     // Verify in database
     let db = create_db_client().await?;
-    let count: i64 = db
-        .query_one(
-            "SELECT COUNT(*) FROM kafka.topics WHERE name IN ($1, $2, $3)",
-            &[&topic1, &topic2, &topic3],
-        )
-        .await?
-        .get(0);
-
+    let count = wait_for_count(
+        &db,
+        "SELECT COUNT(*) FROM kafka.topics WHERE name IN ($1, $2, $3)",
+        &[&topic1, &topic2, &topic3],
+        3,
+    )
+    .await?;
     assert_eq!(count, 3, "All 3 topics should exist in database");
 
     // Cleanup - wait for completion to prevent race conditions with next test
