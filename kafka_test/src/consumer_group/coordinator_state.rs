@@ -86,19 +86,19 @@ pub async fn test_find_coordinator_bootstrap() -> TestResult {
         }
     }
 
-    // Verify group exists in database
+    // DR-6 (DEEP-REVIEW-2026-07): group membership is in-memory in the GroupCoordinator
+    // (the former kafka.consumer_groups table was dead schema and was dropped), so the
+    // durable trace of a live group is its committed offsets, if any. The key assertion
+    // of this test is above: the consumer didn't error with "coordinator not found".
     println!("\nStep 4: Verifying group state...");
-    let group_exists = ctx
+    let group_offsets = ctx
         .db()
         .query_opt(
-            "SELECT 1 FROM kafka.consumer_groups WHERE group_id = $1",
+            "SELECT 1 FROM kafka.consumer_offsets WHERE group_id = $1",
             &[&new_group],
         )
         .await?;
-
-    // Group may or may not be in database depending on implementation
-    // The key is that consumer didn't error with "coordinator not found"
-    println!("  Group in database: {}", group_exists.is_some());
+    println!("  Group has committed offsets: {}", group_offsets.is_some());
 
     ctx.cleanup().await?;
     println!("\n✅ FindCoordinator bootstrap test PASSED\n");

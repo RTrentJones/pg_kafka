@@ -4,11 +4,18 @@ This directory contains git hooks that enforce code quality standards for the pg
 
 ## Available Hooks
 
-### pre-commit
+### pre-commit (fast)
 
 Runs before every commit to ensure:
-- Code is properly formatted (`cargo fmt --check`)
-- No clippy warnings exist (`cargo clippy --features pg14 -- -D warnings`)
+- Code is properly formatted in both crates (`cargo fmt --check`, root + kafka_test)
+
+### pre-push (slower)
+
+Runs once per push (DR-25: keeping the minutes-long lint off the per-commit
+path so nobody is tempted into `--no-verify`):
+- No clippy warnings in either crate
+  (`cargo clippy --all-targets --features pg14 -- -D warnings` and the
+  kafka_test equivalent — the same gates CI enforces)
 
 ## Installation
 
@@ -26,7 +33,8 @@ Copy hooks to your `.git/hooks/` directory:
 
 ```bash
 cp hooks/pre-commit .git/hooks/pre-commit
-chmod +x .git/hooks/pre-commit
+cp hooks/pre-push .git/hooks/pre-push
+chmod +x .git/hooks/pre-commit .git/hooks/pre-push
 ```
 
 ## For New Contributors

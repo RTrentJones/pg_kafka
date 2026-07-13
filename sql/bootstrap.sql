@@ -7,7 +7,8 @@
 --
 -- Phase 3 additions:
 -- - Consumer offset tracking (consumer_offsets table)
--- - Consumer group coordination (consumer_groups table)
+-- (Consumer-group membership is coordinated in-memory by the GroupCoordinator;
+--  only committed offsets are persisted. See DR-6, DEEP-REVIEW-2026-07.)
 
 -- Create kafka schema for all extension objects
 CREATE SCHEMA IF NOT EXISTS kafka;
@@ -40,20 +41,22 @@ CREATE TABLE kafka.messages (
     producer_id BIGINT,                -- Producer ID for transactional messages (NULL for non-transactional)
     producer_epoch SMALLINT,           -- Producer epoch for fencing
     txn_state TEXT,                    -- NULL (committed/non-txn), 'pending' (uncommitted), 'aborted'
+    -- DR-7 (DEEP-REVIEW-2026-07): reject negative partition ids at the storage layer too
+    -- (handlers validate range against topics.partitions; this is the schema backstop).
+    CHECK (partition_id >= 0),
     PRIMARY KEY (topic_id, partition_id, partition_offset),
     FOREIGN KEY (topic_id) REFERENCES kafka.topics(id) ON DELETE CASCADE,
-    UNIQUE (global_offset)  -- Ensures global ordering is strictly monotonic
+    -- Ensures global ordering is strictly monotonic. The unique constraint's backing
+    -- btree also serves temporal-range queries (global_offset > ? ORDER BY global_offset),
+    -- so no separate index on global_offset is needed (DR-3, DEEP-REVIEW-2026-07: a
+    -- second identical index doubled write amplification on the hottest column).
+    UNIQUE (global_offset)
 );
 
 -- Index for Kafka fetch queries (by topic/partition/offset range)
 -- Supports: SELECT * FROM kafka.messages WHERE topic_id = ? AND partition_id = ? AND partition_offset >= ? LIMIT ?
 CREATE INDEX idx_messages_topic_partition_offset
 ON kafka.messages(topic_id, partition_id, partition_offset);
-
--- Index for temporal queries (Phase 3: Hippocampus feature)
--- Supports: SELECT * FROM kafka.messages WHERE global_offset > ? ORDER BY global_offset
-CREATE INDEX idx_messages_global_offset
-ON kafka.messages(global_offset);
 
 -- Index for read_committed filtering (Phase 10: exclude pending transactional messages)
 -- Supports: SELECT * FROM kafka.messages WHERE ... AND (txn_state IS NULL)
@@ -71,6 +74,7 @@ CREATE TABLE IF NOT EXISTS kafka.partition_offsets (
     topic_id INT NOT NULL,
     partition_id INT NOT NULL,
     next_offset BIGINT NOT NULL DEFAULT 0,
+    CHECK (partition_id >= 0),
     PRIMARY KEY (topic_id, partition_id),
     FOREIGN KEY (topic_id) REFERENCES kafka.topics(id) ON DELETE CASCADE
 );
@@ -84,6 +88,7 @@ CREATE TABLE kafka.consumer_offsets (
     committed_offset BIGINT NOT NULL,
     metadata TEXT,  -- Optional client metadata
     commit_timestamp TIMESTAMP NOT NULL DEFAULT NOW(),
+    CHECK (partition_id >= 0),
     PRIMARY KEY (group_id, topic_id, partition_id),
     FOREIGN KEY (topic_id) REFERENCES kafka.topics(id) ON DELETE CASCADE
 );
@@ -92,20 +97,11 @@ CREATE TABLE kafka.consumer_offsets (
 CREATE INDEX idx_consumer_offsets_group ON kafka.consumer_offsets(group_id);
 CREATE INDEX idx_consumer_offsets_timestamp ON kafka.consumer_offsets(commit_timestamp);
 
--- Consumer groups table: Track active consumer group members
--- Phase 3: Simplified consumer group coordination (static assignment only)
-CREATE TABLE kafka.consumer_groups (
-    group_id TEXT NOT NULL,
-    member_id TEXT NOT NULL,
-    topic_id INT NOT NULL,
-    partition_ids INT[] NOT NULL,  -- Static partition assignment
-    heartbeat_timestamp TIMESTAMP NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (group_id, member_id),
-    FOREIGN KEY (topic_id) REFERENCES kafka.topics(id) ON DELETE CASCADE
-);
-
--- Index for heartbeat checks
-CREATE INDEX idx_consumer_groups_heartbeat ON kafka.consumer_groups(heartbeat_timestamp);
+-- NOTE (DR-6, DEEP-REVIEW-2026-07): the former kafka.consumer_groups table was removed.
+-- It was dead schema — group membership, generations, and assignments live in the
+-- in-memory GroupCoordinator (src/kafka/coordinator.rs) with full Range/RoundRobin/Sticky
+-- rebalancing; nothing ever read or wrote the table, and its comment claimed
+-- "static assignment (no rebalancing)", contradicting the implementation.
 
 -- Grant permissions
 -- Background worker and extension functions run as superuser by default,
@@ -114,7 +110,6 @@ GRANT USAGE ON SCHEMA kafka TO PUBLIC;
 GRANT SELECT ON kafka.topics TO PUBLIC;
 GRANT SELECT ON kafka.messages TO PUBLIC;
 GRANT SELECT ON kafka.consumer_offsets TO PUBLIC;
-GRANT SELECT ON kafka.consumer_groups TO PUBLIC;
 
 -- Comments for documentation
 COMMENT ON SCHEMA kafka IS 'pg_kafka extension schema for Kafka-compatible message storage';
@@ -147,12 +142,6 @@ COMMENT ON COLUMN kafka.consumer_offsets.group_id IS 'Consumer group identifier 
 
 COMMENT ON COLUMN kafka.consumer_offsets.committed_offset IS 'Last committed partition offset for this consumer group. Consumer will fetch from committed_offset + 1.';
 
-COMMENT ON TABLE kafka.consumer_groups IS 'Consumer group membership tracking. pg_kafka uses simplified static assignment (no rebalancing).';
-
-COMMENT ON COLUMN kafka.consumer_groups.partition_ids IS 'Array of partition IDs statically assigned to this member. No automatic rebalancing.';
-
-COMMENT ON COLUMN kafka.consumer_groups.heartbeat_timestamp IS 'Last heartbeat from this consumer. Stale members (no heartbeat > 5min) may be cleaned up.';
-
 -- =============================================================================
 -- Phase 9: Idempotent Producer Support
 -- =============================================================================
@@ -178,6 +167,7 @@ CREATE TABLE kafka.producer_sequences (
     partition_id INT NOT NULL,
     last_sequence INT NOT NULL DEFAULT -1,  -- Last successfully written sequence (-1 = none)
     updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    CHECK (partition_id >= 0),
     PRIMARY KEY (producer_id, topic_id, partition_id),
     FOREIGN KEY (topic_id) REFERENCES kafka.topics(id) ON DELETE CASCADE
 );
@@ -236,6 +226,7 @@ CREATE TABLE kafka.txn_pending_offsets (
     pending_offset BIGINT NOT NULL,
     metadata TEXT,
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    CHECK (partition_id >= 0),
     PRIMARY KEY (transactional_id, group_id, topic_id, partition_id)
 );
 
@@ -297,6 +288,7 @@ CREATE TABLE kafka.shadow_tracking (
     forwarded_at TIMESTAMPTZ,
     error_message TEXT,
     retry_count INT NOT NULL DEFAULT 0,
+    CHECK (partition_id >= 0),
     PRIMARY KEY (topic_id, partition_id, local_offset),
     FOREIGN KEY (topic_id) REFERENCES kafka.topics(id) ON DELETE CASCADE
 );
@@ -406,6 +398,14 @@ COMMENT ON FUNCTION kafka.replay_shadow_messages(INT, BIGINT, BIGINT) IS
 -- Provides a unified view of system health metrics for monitoring.
 -- This view aggregates key operational metrics in a single query.
 
+-- DR-4 (DEEP-REVIEW-2026-07): the messages-table metrics use O(1) catalog estimates
+-- (pg_class.reltuples / pg_table_size) instead of COUNT(*)/SUM(pg_column_size(...))
+-- full scans — kafka.messages is the one unbounded table, so a scan-per-scrape view
+-- degrades monitoring exactly when it matters. reltuples is refreshed by
+-- (auto)VACUUM/ANALYZE; -1 (never analyzed) is clamped to 0. The shadow 'lag' metric
+-- is now the pending-outbox depth (rows not yet forwarded, served by the partial
+-- index idx_shadow_tracking_pending) instead of a cross-topic MAX(partition_offset)
+-- diff, which both full-scanned and mixed all topics into one number.
 CREATE VIEW kafka.metrics AS
 -- Topic metrics
 SELECT
@@ -415,28 +415,29 @@ SELECT
     'total' AS unit
 FROM kafka.topics
 UNION ALL
--- Message metrics
+-- Message metrics (estimates; see view comment)
 SELECT
     'messages' AS category,
-    'count' AS metric,
-    COUNT(*)::BIGINT AS value,
+    'count_estimate' AS metric,
+    GREATEST(reltuples, 0)::BIGINT AS value,
     'total' AS unit
-FROM kafka.messages
+FROM pg_class
+WHERE oid = 'kafka.messages'::regclass
 UNION ALL
 SELECT
     'messages' AS category,
-    'total_bytes' AS metric,
-    COALESCE(SUM(COALESCE(pg_column_size(key), 0) + COALESCE(pg_column_size(value), 0)), 0)::BIGINT AS value,
+    'stored_bytes' AS metric,
+    pg_table_size('kafka.messages'::regclass)::BIGINT AS value,
     'bytes' AS unit
-FROM kafka.messages
 UNION ALL
--- Consumer group metrics
+-- Consumer group metrics (groups with at least one committed offset; live
+-- membership is in-memory in the GroupCoordinator and not visible to SQL)
 SELECT
     'consumer_groups' AS category,
-    'active_members' AS metric,
-    COUNT(DISTINCT (group_id, member_id))::BIGINT AS value,
+    'groups_with_commits' AS metric,
+    COUNT(DISTINCT group_id)::BIGINT AS value,
     'total' AS unit
-FROM kafka.consumer_groups
+FROM kafka.consumer_offsets
 UNION ALL
 SELECT
     'consumer_offsets' AS category,
@@ -489,15 +490,15 @@ UNION ALL
 SELECT
     'shadow' AS category,
     'lag' AS metric,
-    COALESCE(
-        (SELECT MAX(partition_offset) FROM kafka.messages) -
-        COALESCE((SELECT MAX(last_forwarded_offset) FROM kafka.shadow_metrics), 0),
-        0
-    )::BIGINT AS value,
-    'messages' AS unit;
+    COUNT(*)::BIGINT AS value,
+    'messages' AS unit
+FROM kafka.shadow_tracking
+WHERE external_offset IS NULL;
 
 GRANT SELECT ON kafka.metrics TO PUBLIC;
 
 COMMENT ON VIEW kafka.metrics IS 'Unified operational metrics view for monitoring pg_kafka health.
 Categories: topics, messages, consumer_groups, consumer_offsets, producers, transactions, shadow.
+messages.count_estimate and messages.stored_bytes are O(1) catalog estimates (refreshed by
+(auto)VACUUM/ANALYZE), not exact scans; shadow.lag is the pending-outbox depth.
 Use with: SELECT * FROM kafka.metrics WHERE category = ''messages'';';

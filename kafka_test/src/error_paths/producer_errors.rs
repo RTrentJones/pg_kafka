@@ -51,7 +51,10 @@ pub async fn test_produce_invalid_partition() -> TestResult {
     // partition that doesn't exist — the regression we guard against.
     let delivered = match result {
         Ok((partition, offset)) => {
-            println!("   Unexpected delivery to partition {} offset {}", partition, offset);
+            println!(
+                "   Unexpected delivery to partition {} offset {}",
+                partition, offset
+            );
             true
         }
         Err((err, _)) => {

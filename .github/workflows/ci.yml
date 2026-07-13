@@ -28,13 +28,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # DR-14: no explicit toolchain — the action reads rust-toolchain.toml,
+      # which pins a dated nightly (single source of truth for local + CI).
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          toolchain: nightly
           components: rustfmt, clippy
 
       - name: Check formatting
         run: cargo fmt -- --check
+
+      - name: Check formatting (kafka_test)
+        run: cd kafka_test && cargo fmt -- --check
 
       # pgrx setup required for clippy (pgrx-pg-sys needs PostgreSQL headers)
       - name: Install System Dependencies
@@ -70,7 +74,11 @@ jobs:
         run: cargo pgrx init --pg14 download
 
       - name: Run clippy
-        run: cargo clippy --features pg14 -- -D warnings
+        # DR-16: --all-targets so test code is linted too
+        run: cargo clippy --all-targets --features pg14 -- -D warnings
+
+      - name: Run clippy (kafka_test)
+        run: cd kafka_test && cargo clippy --all-targets -- -D warnings
 
   test:
     name: Test Suite
@@ -100,9 +108,9 @@ jobs:
         df -h /
 
     - name: Install Rust toolchain
+      # DR-14: toolchain comes from rust-toolchain.toml (dated nightly pin)
       uses: actions-rust-lang/setup-rust-toolchain@v1
       with:
-        toolchain: nightly
         # 'rustfmt' for style checks, 'clippy' for linting
         components: rustfmt, clippy, llvm-tools-preview
 
@@ -178,6 +186,14 @@ jobs:
       run: cargo llvm-cov --lib --features pg14 --lcov --output-path lcov.info
       env:
         # Override RUSTFLAGS to avoid -D warnings (pgrx macros cause false positives)
+        RUSTFLAGS: ""
+
+    - name: Run property tests
+      # DR-18: tests/property_tests.rs is an integration target, which
+      # `cargo llvm-cov --lib` never compiles — before this step the proptest
+      # suite existed but never ran anywhere.
+      run: cargo test --features pg14 --test property_tests
+      env:
         RUSTFLAGS: ""
 
     - name: Upload to Codecov
@@ -283,7 +299,11 @@ jobs:
         echo "Waiting for port 9092..."
         timeout 30s bash -c 'until nc -z 127.0.0.1 9092; do sleep 1; done'
         echo "Port 9092 is open!"
-        sleep 3 # Wait for protocol readiness (Fixes CI race condition)
+        # DR-17: no extra sleep — the worker binds the port only after full init
+        # (GUCs read, channels built), and requests received before the loop's
+        # first iteration simply queue on the request channel. The historical
+        # 'sleep 3' papered over the worker's 10s wait-for-schema retry, which
+        # the port probe above already covers.
 
     - name: Run Functional E2E Tests
       # Runs functional tests (excludes performance and shadow tests which run separately)
@@ -323,10 +343,10 @@ jobs:
         docker compose down -v
 
     - name: Run Performance E2E Tests
-      # Performance tests run separately with their own timeout
-      # These are advisory - don't block CI on performance regressions
+      # DR-18: BLOCKING (was continue-on-error). The thresholds inside the tests
+      # are conservative floors (~5-10x below dev-machine measurements), so this
+      # only fails on order-of-magnitude regressions, not runner variance.
       timeout-minutes: 5
-      continue-on-error: true
       run: |
         cd kafka_test
         cargo run --release -- --category performance
@@ -352,7 +372,11 @@ jobs:
       # Ensures the background Postgres process is killed, freeing resources.
       run: cargo pgrx stop pg14
 
-  # Security audit for known vulnerabilities
+  # Security audit for known vulnerabilities.
+  # DR-16: BLOCKING (was continue-on-error). Both lockfiles are scanned — the
+  # kafka_test crate has its own Cargo.lock that previously escaped every gate.
+  # cargo-deny additionally enforces license policy and pins the allowed git
+  # sources to the patched kafka-protocol fork (see deny.toml).
   security:
     name: Security Audit
     runs-on: ubuntu-latest
@@ -362,10 +386,17 @@ jobs:
         with:
           toolchain: stable
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+        uses: taiki-e/install-action@cargo-audit
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@cargo-deny
       - name: Run security audit
         run: cargo audit
-        continue-on-error: true  # Advisory - don't fail CI for now
+      - name: Run security audit (kafka_test)
+        run: cd kafka_test && cargo audit
+      - name: Run cargo-deny
+        run: cargo deny check
+      - name: Run cargo-deny (kafka_test)
+        run: cd kafka_test && cargo deny check
 
   # Verify Cargo.lock is up-to-date
   lockfile:
@@ -373,9 +404,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # DR-14: toolchain from rust-toolchain.toml
       - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          toolchain: nightly
 
       # pgrx setup required for cargo check (pgrx-pg-sys needs PostgreSQL headers)
       - name: Install System Dependencies
@@ -414,6 +444,66 @@ jobs:
         # Use cargo check --locked to verify lockfile matches Cargo.toml
         # This will fail if Cargo.lock needs updating
         run: cargo check --locked --features pg14
+
+      - name: Check kafka_test Cargo.lock is up-to-date
+        run: cd kafka_test && cargo check --locked
+
+  # DR-15 (DEEP-REVIEW-2026-07): the crate advertises pg13–pg18 features but CI
+  # historically built pg14 only, so breakage on other majors shipped undetected.
+  # This matrix compiles and unit-tests against system PostgreSQL from apt.pgdg
+  # (no pgrx source download — headers are all bindgen needs), catching per-major
+  # API breaks cheaply. The full E2E suite still runs on pg14 in `test`.
+  pg-matrix:
+    name: Check pg${{ matrix.pg }}
+    runs-on: ubuntu-latest
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [15, 16, 17]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Install PostgreSQL ${{ matrix.pg }} (pgdg)
+        # Both packages are required: -server-dev-N has the headers + pg_config
+        # that bindgen needs, but `cargo pgrx init` also runs initdb, which lives
+        # in the full postgresql-N server package.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y postgresql-${{ matrix.pg }} \
+            postgresql-server-dev-${{ matrix.pg }} \
+            libsasl2-dev libzstd-dev libssl-dev
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v2-pg${{ matrix.pg }}
+
+      - name: Cache cargo-pgrx binary
+        id: cache-cargo-pgrx
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-pgrx
+          key: ${{ runner.os }}-cargo-pgrx-bin-${{ env.PGRX_VERSION }}
+
+      - name: Install pgrx
+        if: steps.cache-cargo-pgrx.outputs.cache-hit != 'true'
+        run: cargo install --locked cargo-pgrx --version ${{ env.PGRX_VERSION }}
+
+      - name: Initialize pgrx against system PostgreSQL
+        run: cargo pgrx init --pg${{ matrix.pg }} /usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
+
+      - name: Check
+        run: cargo check --no-default-features --features pg${{ matrix.pg }}
+
+      - name: Unit tests
+        run: cargo test --no-default-features --features pg${{ matrix.pg }} --lib
+        env:
+          RUSTFLAGS: ""
 
   # QA-1 enforcement (see codecov.yml + CLAUDE.md): the SPI/async files excluded
   # from unit coverage can't be caught by the codecov gate, so a behavioural change

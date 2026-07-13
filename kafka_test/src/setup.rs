@@ -83,33 +83,49 @@ impl TestContext {
         let topics = self.topics_created.lock().await;
         let groups = self.groups_created.lock().await;
 
-        // Delete messages for test topics
+        // DR-19 (DEEP-REVIEW-2026-07): cleanup failures are LOGGED instead of
+        // silently swallowed (`let _ =`), so leaked rows between runs are visible
+        // in the test output. Still best-effort: a cleanup failure prints a
+        // warning rather than failing the test that already passed.
         for topic in topics.iter() {
-            let _ = self
+            if let Err(e) = self
                 .db_client
                 .execute(
                     "DELETE FROM kafka.messages WHERE topic_id IN
                      (SELECT id FROM kafka.topics WHERE name = $1)",
                     &[topic],
                 )
-                .await;
+                .await
+            {
+                eprintln!(
+                    "⚠️  cleanup: failed to delete messages for '{}': {}",
+                    topic, e
+                );
+            }
 
-            // Delete topic itself
-            let _ = self
+            if let Err(e) = self
                 .db_client
                 .execute("DELETE FROM kafka.topics WHERE name = $1", &[topic])
-                .await;
+                .await
+            {
+                eprintln!("⚠️  cleanup: failed to delete topic '{}': {}", topic, e);
+            }
         }
 
-        // Delete consumer offsets for test groups
         for group in groups.iter() {
-            let _ = self
+            if let Err(e) = self
                 .db_client
                 .execute(
                     "DELETE FROM kafka.consumer_offsets WHERE group_id = $1",
                     &[group],
                 )
-                .await;
+                .await
+            {
+                eprintln!(
+                    "⚠️  cleanup: failed to delete offsets for group '{}': {}",
+                    group, e
+                );
+            }
         }
 
         Ok(())
@@ -129,8 +145,19 @@ impl Drop for TestContext {
         let groups = self.groups_created.clone();
         let db = self.db_client.clone();
 
-        // Try to get the current runtime handle for cleanup
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        // DR-19: if there is no runtime (shutdown path), say so — a silent no-op
+        // here leaks rows into the next run with no trace in the output.
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => Some(h),
+            Err(_) => {
+                eprintln!(
+                    "⚠️  TestContext dropped outside a tokio runtime — drop-based cleanup \
+                     skipped (prefer calling ctx.cleanup().await explicitly)"
+                );
+                None
+            }
+        };
+        if let Some(handle) = handle {
             handle.spawn(async move {
                 let topics = topics.lock().await;
                 let groups = groups.lock().await;

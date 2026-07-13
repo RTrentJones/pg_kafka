@@ -157,8 +157,11 @@ SET pg_kafka.compression_type = 'gzip';
 **What Works:**
 - ✅ FetchRequest/Response handling
 - ✅ RecordBatch v2 encoding
+- ✅ Record headers returned to consumers (DR-8, DEEP-REVIEW-2026-07)
 - ✅ Empty fetch responses (returns empty bytes)
 - ✅ Partition watermarks (high watermark, log start offset)
+- ✅ Byte-budget fetch sizing — small-message fetches fill `max_bytes` via bounded
+  iterative queries instead of capping at a fixed row count (DR-9)
 - ✅ Long polling (max_wait_ms/min_bytes support) - Phase 8
 
 **What's Missing:**
@@ -167,6 +170,32 @@ SET pg_kafka.compression_type = 'gzip';
 **Client Impact:**
 - Works with standard Kafka clients
 - Low latency with long polling enabled (default: on)
+
+**Deviation: server-side read_committed filtering (DR-11, DEEP-REVIEW-2026-07)**
+
+Real Kafka returns *all* records (including aborted ones) to a `read_committed`
+consumer along with control batches and an `aborted_transactions` list, and the
+client filters aborted ranges itself (the wire contract for Fetch ≥ v4).
+pg_kafka instead filters **server-side**: pending/aborted rows are excluded by
+the fetch query, results are clamped to the Last Stable Offset (RV-4), and the
+response carries an **empty** `aborted_transactions` list with **no control
+batches**. Fetched batches are also re-encoded rather than replayed verbatim,
+so they carry `producer_id = -1`, `producer_epoch = -1`, batch boundaries that
+may differ from the original produce, and `partition_leader_epoch = 0`.
+
+- Works with rdkafka/librdkafka, kafka-python, KafkaJS, and Sarama (all tolerate
+  an empty aborted list because the aborted data simply never appears).
+- A client that *relies* on doing its own abort filtering (rather than trusting
+  the served rows) sees no aborted ranges and no control markers — the data it
+  receives is already clean, so correctness holds, but byte-level batch
+  equivalence with a real broker does not.
+- Header **order** is not preserved and duplicate header keys collapse (headers
+  are stored as a JSONB object); Kafka's wire format permits ordered, duplicate
+  headers.
+
+Related minor deviations: `throttle_time_ms` is always 0 (no quota system) and
+`log_append_time_ms` is always -1 (LogAppendTime timestamp type is not
+honored; producer CreateTime timestamps are preserved — BUG-7).
 
 ### 8. ListOffsets ✅ Implemented
 
@@ -315,7 +344,7 @@ Wire-level SASL/ACLs are **not planned**; the accepted posture is network-contro
 | Client | Version | Status | Notes |
 |--------|---------|--------|-------|
 | kcat | 1.7.0+ | ✅ Works | Producer and consumer tested |
-| rdkafka (Rust) | 0.36+ | ✅ Works | Full E2E test suite (181 tests) |
+| rdkafka (Rust) | 0.36+ | ✅ Works | Full E2E test suite (195 tests) |
 
 ### Client Configuration
 
@@ -360,4 +389,4 @@ auto.offset.reset=earliest
 **Last Updated:** 2026-06-29
 **Applies To:** pg_kafka Phase 11 Complete (Shadow Mode)
 **API Coverage:** 23 of ~50 Kafka APIs (46%)
-**Test Status:** 672 unit tests + 181 E2E tests (CI-gated)
+**Test Status:** 686 unit + 10 property + 195 E2E tests (CI-gated; counts drift — CI is the source of truth)

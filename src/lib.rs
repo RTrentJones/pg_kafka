@@ -126,6 +126,53 @@ fn hello_pg_kafka() -> &'static str {
     "Hello, pg_kafka"
 }
 
+/// DR-1/DR-2 (DEEP-REVIEW-2026-07): run one storage-lifecycle retention sweep on
+/// demand and report what it deleted. The background worker runs the identical
+/// sweep periodically; this function exists for operators (reclaim space now,
+/// observe what a sweep would reap) and for the E2E suite, which can't wait out
+/// the worker's sweep interval.
+///
+/// * `message_retention_hours` — NULL (default) uses `pg_kafka.message_retention_hours`;
+///   0 disables the expired-message delete for this pass.
+/// * `aborted_grace_seconds` — minimum age of `txn_state='aborted'` rows to reclaim
+///   (default matches the worker's ABORTED_MESSAGE_GRACE).
+#[pg_extern(volatile)]
+fn pg_kafka_run_retention_sweep(
+    message_retention_hours: default!(Option<i32>, "NULL"),
+    aborted_grace_seconds: default!(i64, 60),
+) -> TableIterator<'static, (name!(category, String), name!(deleted, i64))> {
+    use crate::kafka::storage::postgres::PostgresStore;
+
+    let retention_hours =
+        message_retention_hours.unwrap_or_else(|| config::MESSAGE_RETENTION_HOURS.get());
+    let grace = std::time::Duration::from_secs(aborted_grace_seconds.max(0) as u64);
+
+    let store = PostgresStore::new();
+    let stats = store
+        .run_retention_sweep(retention_hours, grace)
+        .unwrap_or_else(|e| pgrx::error!("pg_kafka_run_retention_sweep failed: {}", e));
+
+    TableIterator::new(vec![
+        (
+            "aborted_messages".to_string(),
+            stats.aborted_messages as i64,
+        ),
+        (
+            "expired_messages".to_string(),
+            stats.expired_messages as i64,
+        ),
+        ("stale_producers".to_string(), stats.stale_producers as i64),
+        (
+            "terminal_transactions".to_string(),
+            stats.terminal_transactions as i64,
+        ),
+        (
+            "shadow_delivered_rows".to_string(),
+            stats.shadow_delivered_rows as i64,
+        ),
+    ])
+}
+
 // Note: Removed reload_shadow_config() SQL function.
 // It didn't work because PostgreSQL uses separate processes, not threads.
 // Static variables aren't shared between backend and worker processes.

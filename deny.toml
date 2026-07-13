@@ -1,0 +1,63 @@
+# cargo-deny configuration (DR-16, DEEP-REVIEW-2026-07)
+#
+# Complements the cargo-audit gate: audit checks the advisory DB; deny also
+# enforces license policy and — most importantly for this project — pins the
+# allowed *sources* of dependencies, so the patched kafka-protocol fork (which
+# carries the SEC-9/RV-1 allocation caps) can't silently be joined by other
+# unvetted git dependencies.
+#
+# Run locally:  cargo deny check           (root crate)
+#               cd kafka_test && cargo deny check
+# CI runs both (see .github/workflows/ci.yml `security` job).
+
+[graph]
+all-features = false
+no-default-features = true
+features = ["pg16"]
+
+[advisories]
+version = 2
+yanked = "deny"
+# Unmaintained transitive deps we can't influence (both enter via pgrx/rdkafka):
+# paste (proc-macro, RUSTSEC-2024-0436), serde_cbor (criterion, RUSTSEC-2021-0127).
+ignore = [
+    "RUSTSEC-2024-0436",
+    "RUSTSEC-2021-0127",
+]
+
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
+    "PostgreSQL",
+    "OpenSSL",
+    "CC0-1.0",
+]
+confidence-threshold = 0.8
+
+[[licenses.clarify]]
+crate = "ring"
+expression = "MIT AND ISC AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# The ONLY permitted git dependency: the patched kafka-protocol fork carrying
+# the SEC-9/RV-1 decode-allocation caps (see Cargo.toml [patch.crates-io]).
+allow-git = [
+    "https://github.com/RTrentJones/kafka-protocol-rs",
+]

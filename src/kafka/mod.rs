@@ -59,7 +59,7 @@ pub use coordinator::{GroupCoordinator, GroupState};
 pub use error::{KafkaError, Result};
 pub use handler_context::HandlerContext;
 pub use listener::run as run_listener;
-pub use messages::{KafkaRequest, KafkaResponse};
+pub use messages::{KafkaRequest, KafkaResponse, RequestLanes};
 pub use notifications::InternalNotification;
 pub use pending_fetches::PendingFetchRegistry;
 pub use response_builders::*;

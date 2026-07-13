@@ -186,7 +186,7 @@ mod tests {
         // Check each partition got a reasonable share
         for (i, &count) in counts.iter().enumerate() {
             assert!(
-                count >= 500 && count <= 1500,
+                (500..=1500).contains(&count),
                 "Partition {} got {} messages, expected ~1000",
                 i,
                 count

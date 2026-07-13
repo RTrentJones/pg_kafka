@@ -14,6 +14,34 @@
 /// Type alias for TxnOffsetCommit topic data: (topic_name, [(partition, offset, metadata)])
 pub type TxnOffsetCommitTopics = Vec<(String, Vec<(i32, i64, Option<String>)>)>;
 
+/// DR-12 (DEEP-REVIEW-2026-07): the two request lanes from the network thread to
+/// the single DB thread.
+///
+/// All requests used to share one FIFO channel, so a heavy Produce (large UNNEST,
+/// advisory-lock wait) delayed every queued Heartbeat behind it — and under DB
+/// pressure, delayed heartbeats cascade into spurious consumer-group rebalances,
+/// a self-amplifying failure mode. Heartbeat is served purely from the in-memory
+/// coordinator, so it now travels on a dedicated `liveness` lane that the worker
+/// drains *before* taking the next main-lane request. A heartbeat can still wait
+/// behind the one request currently executing, but never behind the queue.
+#[derive(Clone)]
+pub struct RequestLanes {
+    /// Everything except liveness traffic (Produce, Fetch, Metadata, ...).
+    pub main: crossbeam_channel::Sender<KafkaRequest>,
+    /// Liveness traffic (Heartbeat), drained with priority by the DB thread.
+    pub liveness: crossbeam_channel::Sender<KafkaRequest>,
+}
+
+impl RequestLanes {
+    /// Pick the lane for a parsed request.
+    pub fn route(&self, request: &KafkaRequest) -> &crossbeam_channel::Sender<KafkaRequest> {
+        match request {
+            KafkaRequest::Heartbeat { .. } => &self.liveness,
+            _ => &self.main,
+        }
+    }
+}
+
 /// Kafka request types that can be sent from async tasks to the main worker thread
 #[derive(Debug)]
 pub enum KafkaRequest {
@@ -980,6 +1008,58 @@ impl From<kafka_protocol::messages::list_offsets_request::ListOffsetsPartition>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ========== RequestLanes Tests (DR-12) ==========
+
+    /// DR-12: Heartbeat must route to the liveness lane; everything else to the
+    /// main lane. Misrouting either way silently loses the liveness guarantee
+    /// (heartbeats queue behind produce) or starves the main lane's ordering.
+    #[test]
+    fn test_request_lanes_route_heartbeat_to_liveness() {
+        let (main_tx, main_rx) = crossbeam_channel::bounded::<KafkaRequest>(4);
+        let (liveness_tx, liveness_rx) = crossbeam_channel::bounded::<KafkaRequest>(4);
+        let lanes = RequestLanes {
+            main: main_tx,
+            liveness: liveness_tx,
+        };
+        let (response_tx, _response_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let heartbeat = KafkaRequest::Heartbeat {
+            correlation_id: 1,
+            client_id: None,
+            api_version: 0,
+            group_id: "g".to_string(),
+            generation_id: 1,
+            member_id: "m".to_string(),
+            group_instance_id: None,
+            response_tx: response_tx.clone(),
+        };
+        lanes.route(&heartbeat).send(heartbeat).unwrap();
+        assert!(
+            liveness_rx.try_recv().is_ok(),
+            "Heartbeat must land on the liveness lane"
+        );
+        assert!(
+            main_rx.try_recv().is_err(),
+            "Heartbeat must not land on the main lane"
+        );
+
+        let api_versions = KafkaRequest::ApiVersions {
+            correlation_id: 2,
+            client_id: None,
+            api_version: 0,
+            response_tx,
+        };
+        lanes.route(&api_versions).send(api_versions).unwrap();
+        assert!(
+            main_rx.try_recv().is_ok(),
+            "Non-heartbeat requests must land on the main lane"
+        );
+        assert!(
+            liveness_rx.try_recv().is_err(),
+            "Non-heartbeat requests must not land on the liveness lane"
+        );
+    }
 
     // ========== RecordHeader Tests ==========
 

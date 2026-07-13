@@ -36,7 +36,10 @@ pub async fn test_producer_acks_zero() -> TestResult {
     let topic = ctx.unique_topic("acks-zero").await;
 
     // 2. ACTION: produce with acks=0
-    println!("Step 1: Producing {} messages with acks=0...", MESSAGE_COUNT);
+    println!(
+        "Step 1: Producing {} messages with acks=0...",
+        MESSAGE_COUNT
+    );
     let producer = create_acks_zero_producer()?;
     for i in 0..MESSAGE_COUNT {
         let key = format!("key-{}", i);

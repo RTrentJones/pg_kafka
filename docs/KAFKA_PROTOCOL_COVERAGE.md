@@ -526,7 +526,7 @@ Consumer Flow (Current):
 **Current State**: Comprehensive Kafka-compatible broker with 23 APIs implemented
 **Coverage**: 46% of standard Kafka protocol (full producer/consumer/coordinator/admin/transaction support)
 **Architecture**: Clean, maintainable, well-documented with Repository Pattern
-**Test Status**: All 609 unit tests and 173 E2E tests passing ✅
+**Test Status**: ~890 tests passing (686 unit + 10 property + 195 E2E; CI is the source of truth) ✅
 
 **Readiness**:
 - ✅ **Producer**: Production-ready with idempotency, transactions, and compression
@@ -557,8 +557,8 @@ Consumer Flow (Current):
 
 ---
 
-**Overall Assessment**: Phase 11 Complete - pg_kafka provides full producer/consumer support with idempotency, transactions, compression, long polling, multi-partition topics, admin APIs, and shadow mode. The implementation features clean architecture (Repository Pattern), comprehensive test coverage (609 unit tests, 173 E2E tests), and typed error handling with full Kafka error code mapping.
+**Overall Assessment**: Phase 11 Complete - pg_kafka provides full producer/consumer support with idempotency, transactions, compression, long polling, multi-partition topics, admin APIs, and shadow mode. The implementation features clean architecture (Repository Pattern), comprehensive test coverage (~890 tests), and typed error handling with full Kafka error code mapping.
 
 **Last Updated:** 2026-01-15
 **Phase:** 11 Complete (Shadow Mode)
-**Tests:** 609 unit tests + 173 E2E tests
+**Tests:** ~890 tests (686 unit + 10 property + 195 E2E; CI is the source of truth)

@@ -7,6 +7,12 @@
 //
 // GitHub Sponsors: https://github.com/sponsors/RTrentJones
 
+// Much of this file is SPI code compiled out of the cfg(test) build; under
+// `clippy --all-targets` that leaves its imports, structs, and constants
+// "unused" in the test target only. Allow those two lints for test builds
+// rather than annotating every SPI-adjacent item.
+#![cfg_attr(test, allow(dead_code, unused_imports))]
+
 //! ShadowStore - KafkaStore wrapper with shadow forwarding
 //!
 //! This module provides a KafkaStore implementation that wraps another store

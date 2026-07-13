@@ -242,7 +242,7 @@ pub async fn test_offset_reset_policy() -> TestResult {
         .set("broker.address.family", "v4")
         .set(
             "group.id",
-            &format!("earliest-group-{}", uuid::Uuid::new_v4()),
+            format!("earliest-group-{}", uuid::Uuid::new_v4()),
         )
         .set("auto.offset.reset", "earliest")
         .set("session.timeout.ms", "10000")
@@ -268,10 +268,7 @@ pub async fn test_offset_reset_policy() -> TestResult {
     let consumer_latest: StreamConsumer = ClientConfig::new()
         .set("bootstrap.servers", get_bootstrap_servers())
         .set("broker.address.family", "v4")
-        .set(
-            "group.id",
-            &format!("latest-group-{}", uuid::Uuid::new_v4()),
-        )
+        .set("group.id", format!("latest-group-{}", uuid::Uuid::new_v4()))
         .set("auto.offset.reset", "latest")
         .set("session.timeout.ms", "10000")
         .set("enable.auto.commit", "false")
@@ -476,7 +473,7 @@ pub async fn test_offset_seek() -> TestResult {
     let consumer: StreamConsumer = ClientConfig::new()
         .set("bootstrap.servers", get_bootstrap_servers())
         .set("broker.address.family", "v4")
-        .set("group.id", &format!("seek-group-{}", uuid::Uuid::new_v4()))
+        .set("group.id", format!("seek-group-{}", uuid::Uuid::new_v4()))
         .set("auto.offset.reset", "earliest")
         .set("session.timeout.ms", "10000")
         .set("enable.auto.commit", "false")

@@ -62,8 +62,12 @@
   // Post-create commands removed - base image already has nightly toolchain
   // rust-toolchain.toml ensures correct version is used automatically
   // Run 'rustup update' manually if needed (may fail with cross-device link error)
-  // Environment variables
-  "RUST_LOG": "info",
-  "RUSTUP_PERMIT_COPY_RENAME": "true"
-}
+  // Environment variables (DR-25, DEEP-REVIEW-2026-07: these were top-level keys,
+  // which is not a valid devcontainer property — they were silently ignored.
+  // containerEnv is the supported mechanism. Also removed a stray extra closing
+  // brace that made the file invalid JSON.)
+  "containerEnv": {
+    "RUST_LOG": "info",
+    "RUSTUP_PERMIT_COPY_RENAME": "true"
+  }
 }

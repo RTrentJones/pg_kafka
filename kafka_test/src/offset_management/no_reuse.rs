@@ -58,7 +58,11 @@ pub async fn test_offset_no_reuse_after_cleanup() -> TestResult {
         )
         .await
         .map_err(|(e, _msg)| e)?;
-    println!("Next offset after cleanup = {} (expected {})", new_off, last + 1);
+    println!(
+        "Next offset after cleanup = {} (expected {})",
+        new_off,
+        last + 1
+    );
 
     if new_off != last + 1 {
         return Err(format!(
@@ -99,7 +103,10 @@ pub async fn test_high_watermark_no_regress_after_cleanup() -> TestResult {
         last = off;
     }
     let expected_hwm = last + 1;
-    println!("Produced 5 messages, last offset = {}, HWM = {}", last, expected_hwm);
+    println!(
+        "Produced 5 messages, last offset = {}, HWM = {}",
+        last, expected_hwm
+    );
 
     let consumer = create_base_consumer("hwm-probe")?;
     let timeout = Duration::from_secs(5);
@@ -124,7 +131,10 @@ pub async fn test_high_watermark_no_regress_after_cleanup() -> TestResult {
     // The high watermark must NOT regress: MAX(partition_offset)+1 would now be last - 1, but the
     // monotonic counter keeps it at expected_hwm.
     let (_low, high_after) = consumer.fetch_watermarks(&topic, partition, timeout)?;
-    println!("HWM after cleanup = {} (expected {})", high_after, expected_hwm);
+    println!(
+        "HWM after cleanup = {} (expected {})",
+        high_after, expected_hwm
+    );
 
     if high_after != expected_hwm {
         return Err(format!(

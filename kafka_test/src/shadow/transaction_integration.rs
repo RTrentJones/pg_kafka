@@ -232,9 +232,7 @@ pub async fn test_committed_transaction_uses_durable_outbox() -> TestResult {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     if !finalized {
-        return Err(
-            "committed txn did not produce a finalized shadow_tracking outbox row".into(),
-        );
+        return Err("committed txn did not produce a finalized shadow_tracking outbox row".into());
     }
     println!("✅ Outbox row written and finalized for the committed txn\n");
 

@@ -299,6 +299,11 @@ static SHADOW_OTEL_ENDPOINT: GucSetting<Option<CString>> = GucSetting::<Option<C
 static SHADOW_LICENSE_KEY: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 pub static CONFIG_RELOAD_INTERVAL_MS: GucSetting<i32> =
     GucSetting::<i32>::new(DEFAULT_CONFIG_RELOAD_MS);
+// DR-2 (DEEP-REVIEW-2026-07): time-based retention for kafka.messages. 0 (default)
+// disables the expired-message sweep — messages are kept forever (the historical
+// behaviour). Auxiliary-table pruning (stale producers, terminal transactions,
+// delivered shadow-outbox rows) always runs; see storage::postgres retention consts.
+pub static MESSAGE_RETENTION_HOURS: GucSetting<i32> = GucSetting::<i32>::new(0);
 
 /// Initialize GUC parameters
 pub fn init() {
@@ -377,6 +382,19 @@ pub fn init() {
         GucFlags::default(),
     );
 
+    GucRegistry::define_int_guc(
+        c"pg_kafka.message_retention_hours",
+        c"Delete messages older than this many hours (0 = keep forever)",
+        c"Time-based retention for kafka.messages, enforced by the worker's periodic \
+          retention sweep. 0 (default) disables the sweep. Pending transactional \
+          messages are never deleted regardless of age. Reloadable via SIGHUP.",
+        &MESSAGE_RETENTION_HOURS,
+        0,
+        87_600, // 10 years
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+
     GucRegistry::define_bool_guc(
         c"pg_kafka.enable_long_polling",
         c"Enable long polling for FetchRequest",
@@ -448,7 +466,11 @@ pub fn init() {
         c"Username for SASL authentication to external Kafka. Requires restart.",
         &SHADOW_SASL_USERNAME,
         GucContext::Postmaster,
-        GucFlags::default(),
+        // DR-21 (DEEP-REVIEW-2026-07): same lockdown as the password (SEC-8). The
+        // username identifies the external-broker principal; with default flags it
+        // was visible in pg_settings/SHOW ALL to every role while the password was
+        // superuser-only — an inconsistent disclosure.
+        GucFlags::NO_SHOW_ALL | GucFlags::SUPERUSER_ONLY,
     );
 
     GucRegistry::define_string_guc(
@@ -603,6 +625,10 @@ pub fn bind_is_publicly_exposed(host: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    // The constants-validation tests below assert compile-time-constant range
+    // invariants on purpose (documentation-as-test); silence the lint that
+    // flags constant assertions.
+    #![allow(clippy::assertions_on_constants)]
     use super::*;
     use crate::kafka::constants::{
         DEFAULT_COMPRESSION_TYPE, DEFAULT_DATABASE, DEFAULT_FETCH_POLL_INTERVAL_MS,

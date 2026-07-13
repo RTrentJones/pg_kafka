@@ -39,6 +39,44 @@ pub struct FetchedMessage {
     pub value: Option<Vec<u8>>,
     /// Timestamp (milliseconds since epoch)
     pub timestamp: i64,
+    /// Record headers, decoded from JSONB storage (DR-8, DEEP-REVIEW-2026-07).
+    /// Before DR-8, headers were written on every produce but never selected on
+    /// fetch, so consumers silently received empty headers. Order is not
+    /// preserved across the JSONB roundtrip (Kafka permits duplicate/ordered
+    /// headers; the storage schema does not — documented in
+    /// PROTOCOL_DEVIATIONS.md).
+    pub headers: Vec<(String, Vec<u8>)>,
+}
+
+/// Decode the JSONB headers column (a `{key: hex(value)}` object, see
+/// `hex_encode` in the postgres store) back into header pairs (DR-8).
+///
+/// Pure function so the decoding logic is unit-testable even though its only
+/// caller lives in the coverage-ignored SPI layer (QA-1 pattern, like
+/// `validate_sequence`). Malformed JSON or hex yields an empty/partial result
+/// rather than an error: headers are metadata, and failing a whole fetch over
+/// an undecodable header would be worse than dropping it.
+pub fn decode_headers_json(json: Option<&str>) -> Vec<(String, Vec<u8>)> {
+    let Some(json) = json else {
+        return Vec::new();
+    };
+    let Ok(map) = serde_json::from_str::<std::collections::BTreeMap<String, String>>(json) else {
+        return Vec::new();
+    };
+    map.into_iter()
+        .filter_map(|(k, hex)| hex_decode(&hex).map(|v| (k, v)))
+        .collect()
+}
+
+/// Decode a lowercase/uppercase hex string into bytes; `None` on malformed input.
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
 }
 
 /// Committed offset information (internal representation)

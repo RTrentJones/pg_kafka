@@ -97,6 +97,7 @@ use kafka_test::{
     test_consumer_group_lifecycle,
     test_consumer_group_two_members,
     test_consumer_multiple_messages,
+    test_consumer_receives_headers,
     test_consumer_rejoin_after_leave,
     test_coordinator_state_race,
     test_correlation_id_preserved,
@@ -110,8 +111,8 @@ use kafka_test::{
     test_create_topic_invalid_name,
     test_create_topic_invalid_partitions,
     test_create_topic_with_config,
-    test_delete_group_empty,
     test_delete_group_after_leave,
+    test_delete_group_empty,
     test_delete_group_idempotent,
     test_delete_group_non_empty,
     test_delete_topic,
@@ -130,8 +131,8 @@ use kafka_test::{
     test_empty_group_id,
     test_empty_vs_null_key_routing,
     test_external_only_fallback,
-    test_external_primary_dead_letter_serves_local,
     test_external_only_mode,
+    test_external_primary_dead_letter_serves_local,
     test_fetch_after_offset_reset,
     test_fetch_committed_no_history,
     test_fetch_from_new_partition,
@@ -151,6 +152,7 @@ use kafka_test::{
     test_group_state_transitions,
     // Rebalancing edge case tests
     test_heartbeat_after_leave,
+    test_heartbeat_bypasses_produce_backlog,
     test_heartbeat_during_rebalance_window,
     test_heartbeat_keeps_membership,
     test_high_offset_values,
@@ -207,6 +209,7 @@ use kafka_test::{
     test_offset_reset_policy,
     test_offset_seek,
     test_offset_zero_boundary,
+    test_outbox_row_written_and_finalized,
     test_partition_assignment_race,
     test_partition_assignment_strategies,
     test_partition_zero,
@@ -219,36 +222,38 @@ use kafka_test::{
     test_produce_throughput_baseline,
     test_produce_timeout,
     test_produce_while_consuming,
-    test_sasl_password_guc_is_superuser_only,
     test_producer,
     test_producer_acks_zero,
-    test_producer_timestamp_roundtrip,
     // Transaction tests
     test_producer_fencing,
     test_producer_fencing_mid_transaction,
+    test_producer_id_reallocated_on_epoch_exhaustion,
+    test_producer_timestamp_roundtrip,
     test_protocol_request_pipelining,
     test_rapid_rebalance_cycles,
     test_read_committed_after_commit,
     test_read_committed_clamped_to_lso,
     test_read_committed_filters_pending,
-    test_reinit_aborts_in_flight_transaction,
     test_read_uncommitted_sees_pending,
     test_rebalance_after_leave,
     test_rebalance_mixed_timeout_values,
     test_rebalance_with_minimal_session_timeout,
+    test_reinit_aborts_in_flight_transaction,
     test_rejoin_after_leave,
-    test_outbox_row_written_and_finalized,
     test_reload_clears_deleted_topic_config,
     test_replay_historical_messages,
     test_replay_skips_aborted_records,
     // Pipelining tests
     test_request_pipelining,
     test_response_ordering_with_long_poll,
+    // Retention sweep tests (DR-1/DR-2)
+    test_retention_sweep_expires_old_messages,
+    test_retention_sweep_reclaims_aborted_messages,
+    test_sasl_password_guc_is_superuser_only,
     test_session_timeout_rebalance,
     test_single_partition_topic,
     test_special_character_key_routing,
     test_topic_name_mapping,
-    test_producer_id_reallocated_on_epoch_exhaustion,
     test_transaction_boundary_isolation,
     test_transaction_honors_per_txn_timeout_ms,
     test_transaction_partial_failure_atomicity,
@@ -477,6 +482,12 @@ fn get_all_tests() -> Vec<TestDef> {
             category: "consumer",
             name: "test_consumer_basic",
             test_fn: wrap_test!(test_consumer_basic),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "consumer",
+            name: "test_consumer_receives_headers",
+            test_fn: wrap_test!(test_consumer_receives_headers),
             parallel_safe: true,
         },
         TestDef {
@@ -885,7 +896,27 @@ fn get_all_tests() -> Vec<TestDef> {
             test_fn: wrap_test!(test_batch_1000_messages),
             parallel_safe: true,
         },
+        // DR-1/DR-2: retention sweep — NOT parallel safe (the grace-0 aborted pass
+        // reclaims any aborted row, racing concurrent transaction tests)
+        TestDef {
+            category: "edge_cases",
+            name: "test_retention_sweep_reclaims_aborted_messages",
+            test_fn: wrap_test!(test_retention_sweep_reclaims_aborted_messages),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "edge_cases",
+            name: "test_retention_sweep_expires_old_messages",
+            test_fn: wrap_test!(test_retention_sweep_expires_old_messages),
+            parallel_safe: false,
+        },
         // Concurrent tests - NOT parallel safe (they test concurrency themselves)
+        TestDef {
+            category: "concurrent",
+            name: "test_heartbeat_bypasses_produce_backlog",
+            test_fn: wrap_test!(test_heartbeat_bypasses_produce_backlog),
+            parallel_safe: false,
+        },
         TestDef {
             category: "concurrent",
             name: "test_concurrent_producers_same_topic",
@@ -1732,9 +1763,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let suite_start = Instant::now();
-    let all_results: Vec<TestResult>;
 
-    if !args.sequential {
+    let all_results: Vec<TestResult> = if !args.sequential {
         // Parallel execution mode
         let (parallel_tests, sequential_tests): (Vec<_>, Vec<_>) =
             tests_to_run.iter().partition(|t| t.parallel_safe);
@@ -1814,10 +1844,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Combine results
-        all_results = parallel_results
+        parallel_results
             .into_iter()
             .chain(sequential_results)
-            .collect();
+            .collect()
     } else {
         // Sequential execution mode (original behavior)
         let mut results = Vec::new();
@@ -1839,8 +1869,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             results.push(result);
         }
-        all_results = results;
-    }
+        results
+    };
 
     // Group results by category
     let mut category_map: std::collections::HashMap<String, Vec<TestResult>> =

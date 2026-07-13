@@ -3,7 +3,9 @@
 //! The producer's record timestamp must be stored and returned to consumers, not silently replaced
 //! by the broker's insert time.
 
-use crate::common::{create_base_consumer, create_producer, TestResult, POLL_TIMEOUT, TEST_TIMEOUT};
+use crate::common::{
+    create_base_consumer, create_producer, TestResult, POLL_TIMEOUT, TEST_TIMEOUT,
+};
 use rdkafka::consumer::Consumer;
 use rdkafka::message::{Message, Timestamp};
 use rdkafka::producer::FutureRecord;

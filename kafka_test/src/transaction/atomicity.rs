@@ -1022,9 +1022,51 @@ pub async fn test_transaction_honors_per_txn_timeout_ms() -> TestResult {
         )
         .await?;
 
-    // Wait for at least one sweep cycle (the worker sweeps every 10 s).
-    println!("  Waiting for a timeout-sweep cycle...");
-    tokio::time::sleep(Duration::from_secs(13)).await;
+    // DR-17 (DEEP-REVIEW-2026-07): prove a sweep ran with a SENTINEL instead of a
+    // blind 13 s sleep. The sentinel transaction is already expired (started 90 s
+    // ago, timeout 1 s), so the next sweep must abort it; once it flips to
+    // CompleteAbort we know a full sweep cycle has run and can assert the
+    // 120 s-timeout transaction was left alone. Bounded poll instead of a fixed
+    // sleep: faster on average and immune to a slow sweep under CI load.
+    let sentinel_txn = format!("txn-timeout-sentinel-{}", Uuid::new_v4());
+    let sentinel_producer = create_transactional_producer(&sentinel_txn)?;
+    sentinel_producer.init_transactions(Duration::from_secs(10))?;
+    sentinel_producer.begin_transaction()?;
+    sentinel_producer
+        .send(
+            FutureRecord::to(&topic).payload("sentinel").key("s"),
+            Duration::from_secs(5),
+        )
+        .await
+        .map_err(|(e, _)| e)?;
+    client
+        .execute(
+            "UPDATE kafka.transactions
+             SET started_at = NOW() - INTERVAL '90 seconds', timeout_ms = 1000, state = 'Ongoing'
+             WHERE transactional_id = $1",
+            &[&sentinel_txn],
+        )
+        .await?;
+
+    println!("  Waiting for the sweep to abort the expired sentinel...");
+    let deadline = std::time::Instant::now() + Duration::from_secs(25);
+    loop {
+        let sentinel_state: Option<String> = client
+            .query_one(
+                "SELECT state FROM kafka.transactions WHERE transactional_id = $1",
+                &[&sentinel_txn],
+            )
+            .await?
+            .get(0);
+        if sentinel_state.as_deref() == Some("CompleteAbort") {
+            println!("  Sentinel swept (CompleteAbort) — a sweep cycle has run");
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            return Err("timeout sweep never aborted the expired sentinel".into());
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 
     let state: Option<String> = client
         .query_one(
@@ -1041,6 +1083,12 @@ pub async fn test_transaction_honors_per_txn_timeout_ms() -> TestResult {
     );
 
     producer.abort_transaction(Duration::from_secs(10))?;
+    client
+        .execute(
+            "DELETE FROM kafka.transactions WHERE transactional_id = $1",
+            &[&sentinel_txn],
+        )
+        .await?;
     println!("\nTransaction honors per-txn timeout_ms test PASSED\n");
     Ok(())
 }
@@ -1087,12 +1135,18 @@ pub async fn test_producer_id_reallocated_on_epoch_exhaustion() -> TestResult {
         .await?;
     let new_pid: i64 = row.get(0);
     let new_epoch: i16 = row.get(1);
-    println!("  orig producer_id={}, new producer_id={}, epoch={}", orig_pid, new_pid, new_epoch);
+    println!(
+        "  orig producer_id={}, new producer_id={}, epoch={}",
+        orig_pid, new_pid, new_epoch
+    );
     assert_ne!(
         new_pid, orig_pid,
         "epoch exhaustion must allocate a fresh producer_id (RV-13)"
     );
-    assert_eq!(new_epoch, 0, "the reallocated producer must reset epoch to 0");
+    assert_eq!(
+        new_epoch, 0,
+        "the reallocated producer must reset epoch to 0"
+    );
 
     // The transactions row must be repointed to the new producer_id.
     let txn_pid: i64 = client2

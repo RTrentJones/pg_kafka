@@ -9,7 +9,7 @@
 |----------|---------|
 | [KAFKA_PROTOCOL_COVERAGE.md](KAFKA_PROTOCOL_COVERAGE.md) | API coverage analysis (23 of ~50 APIs) |
 | [PROTOCOL_DEVIATIONS.md](PROTOCOL_DEVIATIONS.md) | Intentional spec differences from Apache Kafka |
-| [TEST_STRATEGY.md](TEST_STRATEGY.md) | Test architecture (609 unit + 173 E2E tests) |
+| [TEST_STRATEGY.md](TEST_STRATEGY.md) | Test architecture (~890 tests: unit + property + E2E) |
 | [REPOSITORY_PATTERN.md](REPOSITORY_PATTERN.md) | Storage abstraction design (KafkaStore trait) |
 | [PERFORMANCE.md](PERFORMANCE.md) | Tuning, benchmarks, compression guide |
 | [SHADOW_MODE_TESTING.md](SHADOW_MODE_TESTING.md) | Shadow mode setup and testing |

@@ -13,7 +13,9 @@
 mod tests {
     use crate::kafka::error::KafkaError;
     use crate::kafka::messages::Record;
-    use crate::kafka::storage::{CommittedOffset, FetchedMessage, KafkaStore, TopicMetadata};
+    use crate::kafka::storage::{
+        decode_headers_json, CommittedOffset, FetchedMessage, KafkaStore, TopicMetadata,
+    };
     use crate::testing::mocks::MockKafkaStore;
 
     // ========== Storage Types Tests ==========
@@ -117,6 +119,7 @@ mod tests {
             key: Some(b"key".to_vec()),
             value: Some(b"value".to_vec()),
             timestamp: 1234567890,
+            headers: vec![],
         };
 
         assert_eq!(msg.partition_offset, 100);
@@ -132,6 +135,7 @@ mod tests {
             key: None,
             value: None,
             timestamp: 0,
+            headers: vec![],
         };
 
         assert!(msg.key.is_none());
@@ -273,12 +277,14 @@ mod tests {
                         key: Some(b"key".to_vec()),
                         value: Some(b"value".to_vec()),
                         timestamp: 12345,
+                        headers: vec![],
                     },
                     FetchedMessage {
                         partition_offset: 1,
                         key: None,
                         value: Some(b"value2".to_vec()),
                         timestamp: 12346,
+                        headers: vec![],
                     },
                 ])
             });
@@ -857,6 +863,7 @@ mod tests {
                     key: Some(b"committed-key".to_vec()),
                     value: Some(b"committed-value".to_vec()),
                     timestamp: 12345,
+                    headers: vec![],
                 }])
             });
 
@@ -988,5 +995,42 @@ mod tests {
                 expected_sequence: i32::MAX
             }
         );
+    }
+    // ========== DR-8: header JSONB decode (DEEP-REVIEW-2026-07) ==========
+
+    #[test]
+    fn test_decode_headers_json_roundtrip() {
+        // The produce path stores headers as {key: hex(value)}
+        let json = r#"{"trace-id":"616263","empty":""}"#;
+        let mut headers = decode_headers_json(Some(json));
+        headers.sort();
+        assert_eq!(
+            headers,
+            vec![
+                ("empty".to_string(), b"".to_vec()),
+                ("trace-id".to_string(), b"abc".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_decode_headers_json_absent_or_empty() {
+        assert!(decode_headers_json(None).is_empty());
+        assert!(decode_headers_json(Some("{}")).is_empty());
+        assert!(decode_headers_json(Some("")).is_empty());
+    }
+
+    #[test]
+    fn test_decode_headers_json_malformed_is_lenient() {
+        // Malformed JSON: drop all headers rather than failing the fetch
+        assert!(decode_headers_json(Some("not-json")).is_empty());
+        // Malformed hex value: that header is dropped, valid ones survive
+        let json = r#"{"bad":"zz","good":"6869"}"#;
+        assert_eq!(
+            decode_headers_json(Some(json)),
+            vec![("good".to_string(), b"hi".to_vec())]
+        );
+        // Odd-length hex is malformed
+        assert!(decode_headers_json(Some(r#"{"odd":"abc"}"#)).is_empty());
     }
 }

@@ -31,7 +31,8 @@ pub async fn test_sasl_password_guc_is_superuser_only() -> TestResult {
 
     // Sanity: as the (superuser) test role, reading the GUC succeeds. Use simple_query — SHOW/SET
     // are utility statements that the extended (prepared) protocol can reject.
-    db.simple_query("SHOW pg_kafka.shadow_sasl_password").await?;
+    db.simple_query("SHOW pg_kafka.shadow_sasl_password")
+        .await?;
 
     // As the non-superuser role, reading it must be rejected (SUPERUSER_ONLY).
     db.simple_query("SET ROLE sec8_unpriv_probe").await?;
@@ -46,6 +47,21 @@ pub async fn test_sasl_password_guc_is_superuser_only() -> TestResult {
         );
     }
     println!("✅ a non-superuser cannot read the SASL password GUC");
+
+    // DR-21 (DEEP-REVIEW-2026-07): the USERNAME must have the same lockdown — it
+    // identifies the external-broker principal, and before DR-21 it was visible
+    // in pg_settings to every role while the password was superuser-only.
+    db.simple_query("SET ROLE sec8_unpriv_probe").await?;
+    let unpriv_user_read = db.simple_query("SHOW pg_kafka.shadow_sasl_username").await;
+    db.simple_query("RESET ROLE").await?;
+    if unpriv_user_read.is_ok() {
+        return Err(
+            "DR-21 regression: a non-superuser read pg_kafka.shadow_sasl_username"
+                .to_string()
+                .into(),
+        );
+    }
+    println!("✅ a non-superuser cannot read the SASL username GUC");
     Ok(())
 }
 
@@ -182,7 +198,10 @@ pub async fn test_invalid_group_id() -> TestResult {
     // only that the invalid configuration cannot silently behave like a valid consumer.
     let consumed_with_empty_group = match consumer_result {
         Err(e) => {
-            println!("   Consumer creation rejected empty group.id (expected): {}", e);
+            println!(
+                "   Consumer creation rejected empty group.id (expected): {}",
+                e
+            );
             false
         }
         Ok(consumer) => match consumer.subscribe(&[&topic.name]) {
@@ -257,9 +276,8 @@ pub async fn test_duplicate_consumer_join() -> TestResult {
     let sub1 = consumer1.subscription()?;
     let sub2 = consumer2.subscription()?;
     let topic_name = topic.name.as_str();
-    let has_topic = |sub: &rdkafka::TopicPartitionList| {
-        sub.elements().iter().any(|e| e.topic() == topic_name)
-    };
+    let has_topic =
+        |sub: &rdkafka::TopicPartitionList| sub.elements().iter().any(|e| e.topic() == topic_name);
     let (ok1, ok2) = (has_topic(&sub1), has_topic(&sub2));
     println!("   subscriptions after rejoin: consumer1={ok1}, consumer2={ok2}");
 

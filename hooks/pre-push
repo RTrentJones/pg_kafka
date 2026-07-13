@@ -1,0 +1,33 @@
+#!/bin/bash
+# Pre-push hook for pg_kafka (DR-25, DEEP-REVIEW-2026-07)
+#
+# Runs the slower lint pass once per push instead of on every commit:
+#   - cargo clippy --all-targets (root crate, pg14)
+#   - cargo clippy --all-targets (kafka_test)
+#
+# CI enforces the same gates, so bypassing this hook only defers the failure.
+# To install: ./hooks/install.sh
+
+set -e
+
+echo "Running pre-push checks..."
+
+if [ ! -f "Cargo.toml" ]; then
+    echo "Error: Cargo.toml not found. Run git push from repository root."
+    exit 1
+fi
+
+echo "🔍 Running clippy (root, --all-targets)..."
+if ! cargo clippy --all-targets --features pg14 -- -D warnings 2>&1; then
+    echo "❌ Clippy check failed!"
+    exit 1
+fi
+
+echo "🔍 Running clippy (kafka_test, --all-targets)..."
+if ! (cd kafka_test && cargo clippy --all-targets -- -D warnings) 2>&1; then
+    echo "❌ kafka_test clippy check failed!"
+    exit 1
+fi
+
+echo "✅ All pre-push checks passed!"
+exit 0

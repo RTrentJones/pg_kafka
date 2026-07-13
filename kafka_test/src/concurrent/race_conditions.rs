@@ -94,7 +94,7 @@ pub async fn test_produce_consume_race() -> TestResult {
     });
 
     // Wait for both
-    let _ = producer_handle.await?;
+    producer_handle.await?;
     let consumed = consumer_handle.await?;
 
     let produced = produced_count.load(Ordering::SeqCst);
@@ -397,7 +397,7 @@ pub async fn test_partition_assignment_race() -> TestResult {
                 let _ = tokio::time::timeout(Duration::from_millis(500), consumer.recv()).await;
 
                 // Check assignment
-                if let Some(assignment) = consumer.assignment().ok() {
+                if let Ok(assignment) = consumer.assignment() {
                     let partitions: Vec<i32> = assignment
                         .elements()
                         .iter()

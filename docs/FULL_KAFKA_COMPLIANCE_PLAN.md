@@ -5,7 +5,7 @@
 ## Current State (Phase 11 Complete)
 
 **APIs Implemented:** 23 of ~50 (46%)
-**Tests:** 609 unit + 173 E2E (all passing)
+**Tests:** ~890 (686 unit + 10 property + 195 E2E; CI is the source of truth)
 **Architecture:** Repository Pattern, typed errors, clean handler structure, key-based partition routing, compression, transactions, shadow mode
 
 ### Implemented APIs
@@ -255,8 +255,8 @@ Each phase includes:
 3. **E2E tests** - rdkafka client in `kafka_test/`
 
 **Coverage targets:**
-- Maintain 609+ unit tests
-- Current: 173 E2E tests across all categories
+- Maintain the unit-test suite (686+ tests)
+- Current: 195 E2E tests across all categories
 
 ---
 

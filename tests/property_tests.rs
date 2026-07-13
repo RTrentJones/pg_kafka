@@ -25,11 +25,22 @@ mod property_tests {
         }
 
         #[test]
-        fn test_api_key_range(api_key in 0i16..100i16) {
-            // Property: API keys in valid range should be encodable
-            // This tests that we can handle various API key values
-            prop_assert!(api_key >= 0);
-            prop_assert!(api_key < 100);
+        fn test_api_key_header_roundtrip(api_key in 0i16..100i16) {
+            // DR-18 (DEEP-REVIEW-2026-07): the old form asserted the sampled value
+            // was inside its own sampling range — a tautology. Assert something
+            // real instead: any api_key encodes into a request header and decodes
+            // back unchanged.
+            use bytes::BytesMut;
+            use kafka_protocol::messages::RequestHeader;
+            use kafka_protocol::protocol::Encodable;
+            let header = RequestHeader::default()
+                .with_request_api_key(api_key)
+                .with_request_api_version(0)
+                .with_correlation_id(7);
+            let mut buf = BytesMut::new();
+            header.encode(&mut buf, 1).unwrap();
+            let decoded_key = i16::from_be_bytes([buf[0], buf[1]]);
+            prop_assert_eq!(decoded_key, api_key);
         }
 
         #[test]
@@ -64,7 +75,7 @@ mod property_tests {
             response.encode(&mut buf, 9).unwrap();
 
             // Should encode successfully
-            prop_assert!(buf.len() > 0);
+            prop_assert!(!buf.is_empty());
         }
 
         #[test]
@@ -90,7 +101,7 @@ mod property_tests {
             header.encode(&mut buf, 1).unwrap();
             response.encode(&mut buf, 9).unwrap();
 
-            prop_assert!(buf.len() > 0);
+            prop_assert!(!buf.is_empty());
         }
 
         #[test]
@@ -127,7 +138,7 @@ mod property_tests {
             header.encode(&mut buf, 1).unwrap();
             response.encode(&mut buf, 9).unwrap();
 
-            prop_assert!(buf.len() > 0);
+            prop_assert!(!buf.is_empty());
         }
 
         #[test]
@@ -155,7 +166,7 @@ mod property_tests {
             header.encode(&mut buf, 1).unwrap();
             response.encode(&mut buf, 3).unwrap();
 
-            prop_assert!(buf.len() > 0);
+            prop_assert!(!buf.is_empty());
         }
 
         #[test]
@@ -180,7 +191,7 @@ mod property_tests {
             header.encode(&mut buf, 1).unwrap();
             response.encode(&mut buf, 9).unwrap();
 
-            prop_assert!(buf.len() > 0);
+            prop_assert!(!buf.is_empty());
         }
     }
 

@@ -2,12 +2,14 @@
 //!
 //! Tests for concurrent producer/consumer scenarios and race conditions.
 
+mod liveness_lane;
 mod multi_consumer;
 mod multi_producer;
 mod pipelining;
 mod producer_consumer;
 mod race_conditions;
 
+pub use liveness_lane::*;
 pub use multi_consumer::*;
 pub use multi_producer::*;
 pub use pipelining::*;

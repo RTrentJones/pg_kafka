@@ -43,9 +43,9 @@ jobs:
           sudo apt-get clean
 
       - name: Install Rust toolchain
+        # DR-14: toolchain from rust-toolchain.toml (dated nightly pin)
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          toolchain: nightly
           components: rustfmt, clippy
 
       - name: Install system dependencies
