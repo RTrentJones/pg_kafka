@@ -180,6 +180,14 @@ const OUTBOX_RETRY_INTERVAL_MS: i64 = 5_000;
 /// `kafka.replay_shadow_messages` once the cause is fixed.
 const MAX_FORWARD_RETRIES: i64 = 10;
 
+/// How long an in-flight forward blocks re-dispatch of its outbox row before
+/// the entry is presumed lost and evicted (issue #93). Sized above rdkafka's
+/// `message.timeout.ms` (120s — see shadow::producer), after which every send
+/// is guaranteed to have produced a success or failure ack; an entry older
+/// than this means the ack itself was lost (dropped on a full channel,
+/// forwarder crash) and lease-based retry must resume to stay at-least-once.
+const INFLIGHT_EVICT_AFTER: Duration = Duration::from_secs(150);
+
 /// Upper bound a bounded-sync produce waits for external confirmation before
 /// returning anyway. The outbox row stays durable and the poll retries it, so
 /// this is a latency cap, never a correctness boundary (SH-14). Kept short
@@ -230,6 +238,11 @@ pub struct ShadowStore<S: KafkaStore> {
     pending_txn_messages: PendingTxnMessages,
     /// License validator for shadow mode (Commercial License)
     license: RwLock<Option<LicenseValidator>>,
+    /// Outbox rows dispatched to the network thread whose ack has not yet
+    /// been applied — a lease-expiry re-claim of such a row is skipped instead
+    /// of re-sent, so a slow ack no longer produces a duplicate delivery
+    /// (issue #93).
+    inflight: super::inflight::InflightTracker,
 }
 
 impl<S: KafkaStore> ShadowStore<S> {
@@ -254,6 +267,7 @@ impl<S: KafkaStore> ShadowStore<S> {
             forward_ack_rx: RwLock::new(None),
             pending_txn_messages: Arc::new(RwLock::new(HashMap::new())),
             license: RwLock::new(None),
+            inflight: super::inflight::InflightTracker::new(INFLIGHT_EVICT_AFTER),
         }
     }
 
@@ -865,8 +879,18 @@ impl<S: KafkaStore> ShadowStore<S> {
                 record.value.clone(),
                 local_offset,
             );
+            // Issue #93: register the sync dispatch too, so an outbox poll
+            // that re-claims this row while the ack is still pending (ack
+            // slower than the retry lease) skips it instead of duplicating it.
+            let key = (topic_id, partition_id, local_offset);
+            if !self.inflight.try_begin(key) {
+                // Already in flight from an earlier dispatch — don't re-send.
+                pending.remove(&local_offset);
+                continue;
+            }
             if !self.try_send_forward(req) {
                 // Could not enqueue — leave it for the poll, stop waiting on it.
+                self.inflight.complete(&key);
                 pending.remove(&local_offset);
             }
         }
@@ -920,6 +944,13 @@ impl<S: KafkaStore> ShadowStore<S> {
             }
         }
 
+        // Issue #93: rows whose forward is still in flight (dispatched, ack
+        // pending) are excluded from the claim itself — claiming them would
+        // bump retry_count (eroding the dead-letter budget of a slow-but-alive
+        // forward) and, before the in-flight gate existed, re-send them and
+        // deliver duplicates to the external broker.
+        let (inflight_topics, inflight_partitions, inflight_offsets) = self.inflight.live_keys();
+
         let reqs: Vec<ForwardRequest> = Spi::connect_mut(|client| {
             let table = client.update(
                 r#"
@@ -930,6 +961,13 @@ impl<S: KafkaStore> ShadowStore<S> {
                       AND st.retry_count < $3
                       AND (st.forwarded_at IS NULL
                            OR st.forwarded_at < NOW() - ($1 || ' milliseconds')::interval)
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM unnest($4::int4[], $5::int4[], $6::int8[]) AS inf(t, p, o)
+                          WHERE inf.t = st.topic_id
+                            AND inf.p = st.partition_id
+                            AND inf.o = st.local_offset
+                      )
                       AND EXISTS (
                           SELECT 1 FROM kafka.messages m
                           WHERE m.topic_id = st.topic_id
@@ -974,6 +1012,9 @@ impl<S: KafkaStore> ShadowStore<S> {
                     OUTBOX_RETRY_INTERVAL_MS.into(),
                     OUTBOX_BATCH_LIMIT.into(),
                     MAX_FORWARD_RETRIES.into(),
+                    inflight_topics.into(),
+                    inflight_partitions.into(),
+                    inflight_offsets.into(),
                 ],
             )?;
 
@@ -1000,12 +1041,30 @@ impl<S: KafkaStore> ShadowStore<S> {
             super::error::ShadowError::DatabaseError(format!("outbox poll failed: {}", e))
         })?;
 
-        let dispatched = reqs.len();
+        let mut dispatched = 0usize;
         for req in reqs {
+            // Issue #93: skip a re-claimed row whose first forward is still in
+            // flight (ack pending). Without this gate a forward slower than the
+            // retry lease was re-sent and delivered twice to the external
+            // broker. The claim already re-stamped forwarded_at, so the row
+            // simply waits another lease period for its ack.
+            let key = (req.topic_id, req.partition_id, req.local_offset);
+            if !self.inflight.try_begin(key) {
+                tracing::debug!(
+                    "Shadow: outbox row {:?} still in flight, skipping re-dispatch",
+                    key
+                );
+                continue;
+            }
             // If the channel is momentarily full the row stays pending (its
             // forwarded_at was just set) and is retried after the interval.
-            if !self.try_send_forward(req) {
+            if self.try_send_forward(req) {
+                dispatched += 1;
+            } else {
                 tracing::debug!("Shadow: forward channel full, deferring outbox row");
+                // Not actually handed to the network thread: unregister so the
+                // lease-expiry retry is not blocked by a phantom in-flight entry.
+                self.inflight.complete(&key);
             }
         }
         Ok(dispatched)
@@ -1046,6 +1105,13 @@ impl<S: KafkaStore> ShadowStore<S> {
     #[cfg(not(test))]
     fn apply_ack(&self, ack: &ForwardAck) {
         use pgrx::prelude::*;
+
+        // Issue #93: the forward has resolved (success or failure), so the row
+        // may be dispatched again by a future lease-expiry re-claim. Cleared
+        // unconditionally — sync-path acks for rows never registered are a
+        // harmless no-op.
+        self.inflight
+            .complete(&(ack.topic_id, ack.partition_id, ack.local_offset));
 
         // SH-7: the metric is bumped in the SAME statement that flips the row,
         // guarded by `external_offset IS NULL`, so a duplicate ack (e.g. a sync

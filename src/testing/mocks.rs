@@ -201,6 +201,7 @@ pub fn mock_config() -> crate::config::Config {
         shadow_otel_endpoint: DEFAULT_SHADOW_OTEL_ENDPOINT.to_string(),
         // Tests run in eval mode by default (Commercial License)
         shadow_license_key: "eval".to_string(),
+        test_forward_ack_delay_ms: 0,
     }
 }
 

@@ -270,6 +270,14 @@ async fn run_shadow_forwarder(
                     local_offset: req.local_offset,
                     result: ack_result,
                 };
+                // Issue #93 test hook: hold the ack so it arrives later than
+                // the outbox retry lease, letting the E2E suite prove the
+                // in-flight gate prevents duplicate re-dispatch. 0 in
+                // production (async sleep; only this forwarder task waits).
+                let ack_delay_ms = config.test_forward_ack_delay_ms;
+                if ack_delay_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(ack_delay_ms as u64)).await;
+                }
                 // RA-6: non-blocking send. A blocking `send` here could park this
                 // tokio worker if the ack channel were full (the SEC-4
                 // anti-pattern). On full/closed, drop the ack — the row stays

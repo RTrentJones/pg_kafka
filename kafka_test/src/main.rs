@@ -55,6 +55,8 @@ use kafka_test::{
     test_add_partitions_to_txn_idempotent,
     // Protocol compliance tests (Phase 4)
     test_api_versions_negotiation,
+    // Shadow outbox duplicate-delivery guard (issue #93)
+    test_async_forwarding_no_duplicates_on_slow_ack,
     // Edge case tests
     test_batch_1000_messages,
     // Producer tests
@@ -1375,6 +1377,12 @@ fn get_all_tests() -> Vec<TestDef> {
             name: "test_dual_write_async",
             test_fn: wrap_test!(test_dual_write_async),
             parallel_safe: false,
+        },
+        TestDef {
+            category: "shadow",
+            name: "test_async_forwarding_no_duplicates_on_slow_ack",
+            test_fn: wrap_test!(test_async_forwarding_no_duplicates_on_slow_ack),
+            parallel_safe: false, // Mutates global GUC (test_forward_ack_delay_ms)
         },
         TestDef {
             category: "shadow",

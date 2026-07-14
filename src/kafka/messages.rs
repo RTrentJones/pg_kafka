@@ -1258,7 +1258,10 @@ mod tests {
                 error_message: None,
             })
             .unwrap();
-        assert!(orig_rx.try_recv().is_ok(), "returned sender must be the original");
+        assert!(
+            orig_rx.try_recv().is_ok(),
+            "returned sender must be the original"
+        );
 
         // The request now holds the buffer sender: a handler-side send lands in buf_rx.
         if let KafkaRequest::Produce { response_tx, .. } = &request {
@@ -1270,7 +1273,10 @@ mod tests {
                 })
                 .unwrap();
         }
-        assert!(buf_rx.try_recv().is_ok(), "request must now hold the new sender");
+        assert!(
+            buf_rx.try_recv().is_ok(),
+            "request must now hold the new sender"
+        );
     }
 
     /// RB-1: `wire_ids` must report the correct API key/version/correlation for
