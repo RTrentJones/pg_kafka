@@ -853,9 +853,26 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
 /// DR-12 liveness lane so both take the identical safety path (a Heartbeat does
 /// no SPI, but routing it through the same guard keeps one code path and costs
 /// only an empty transaction).
+///
+/// ## RB-1: response-after-commit barrier
+///
+/// Invariant: **no response may reach the client before
+/// `BackgroundWorker::transaction` has returned** (i.e. before the commit is
+/// durable and visible to other Postgres connections). Handlers still "send"
+/// their response as always, but the request's `response_tx` is swapped for a
+/// same-typed buffer channel before dispatch; the buffered response is
+/// forwarded to the real client sender only after the transaction commits.
+/// Without this barrier an acked produce/offset-commit could be lost on a
+/// crash between response send and commit (acks>=1 durability violation), and
+/// a client that received an OK could race a separate Postgres connection into
+/// pre-commit state.
+///
+/// This relies on the writer task queueing response slots at parse time
+/// (listener.rs), so deferring the send cannot reorder responses. If that
+/// ordering scheme ever changes, re-review this barrier.
 #[allow(clippy::too_many_arguments)]
 fn execute_request_in_transaction(
-    request: crate::kafka::KafkaRequest,
+    mut request: crate::kafka::KafkaRequest,
     coordinator: &std::sync::Arc<crate::kafka::GroupCoordinator>,
     broker_metadata: &crate::kafka::BrokerMetadata,
     default_partitions: i32,
@@ -868,6 +885,16 @@ fn execute_request_in_transaction(
     let broker = broker_metadata.clone(); // Cheap Arc pointer copy
     let notifier = notify_tx.clone();
     let shadow = shadow_store.clone();
+
+    // RB-1: swap the client's sender for a buffer the handler writes into; we
+    // flush the buffer to `client_tx` only after the commit below. Both ends of
+    // the buffer live on this one DB thread — tokio's unbounded send/try_recv
+    // are plain synchronous calls, so no runtime or extra synchronization is
+    // involved.
+    let is_produce = matches!(request, crate::kafka::KafkaRequest::Produce { .. });
+    let (api_key, api_version, correlation_id) = request.wire_ids();
+    let (buffer_tx, mut buffer_rx) = tokio::sync::mpsc::unbounded_channel();
+    let client_tx = request.swap_response_tx(buffer_tx);
 
     // Timing instrumentation (enabled via pg_kafka.log_timing GUC)
     // Measures transaction overhead vs handler execution time
@@ -884,36 +911,89 @@ fn execute_request_in_transaction(
     // ShadowStore contains FutureProducer which isn't RefUnwindSafe
     let shadow_ref = AssertUnwindSafe(&shadow);
 
-    BackgroundWorker::transaction(move || {
-        let handler_start = std::time::Instant::now();
+    let txn_result = catch_unwind(AssertUnwindSafe(|| {
+        BackgroundWorker::transaction(move || {
+            let handler_start = std::time::Instant::now();
 
-        // Run the handler inside a subtransaction so a panic (or a
-        // Postgres ERROR, which pgrx surfaces as a panic) rolls
-        // back the request's partial writes instead of letting
-        // them commit with the surrounding transaction. The worker
-        // itself survives either way.
-        let result = run_request_in_subtransaction(|| {
-            process_request(
-                request,
-                &coord,
-                &broker,
-                default_partitions,
-                &notifier,
-                compression,
-                *shadow_ref,
-            );
+            // Run the handler inside a subtransaction so a panic (or a
+            // Postgres ERROR, which pgrx surfaces as a panic) rolls
+            // back the request's partial writes instead of letting
+            // them commit with the surrounding transaction. The worker
+            // itself survives either way.
+            let result = run_request_in_subtransaction(|| {
+                process_request(
+                    request,
+                    &coord,
+                    &broker,
+                    default_partitions,
+                    &notifier,
+                    compression,
+                    *shadow_ref,
+                );
+            });
+
+            // Capture handler duration before transaction commit
+            handler_duration_ref.set(handler_start.elapsed());
+
+            if let Err(panic_msg) = result {
+                pg_warning!(
+                    "Handler panic caught, request rolled back (worker survived): {}",
+                    panic_msg
+                );
+            }
+
+            // RB-1 test hook: widen the response-send→commit window so the E2E
+            // barrier test can prove the ack now implies a visible commit.
+            // Produce-gated so heartbeats (DR-12 lane) and unrelated traffic are
+            // unaffected while a test has the GUC set.
+            if is_produce {
+                let delay_ms = crate::config::TEST_PRE_COMMIT_DELAY_MS.get();
+                if delay_ms > 0 {
+                    std::thread::sleep(Duration::from_millis(delay_ms as u64));
+                }
+            }
         });
+    }));
 
-        // Capture handler duration before transaction commit
-        handler_duration_ref.set(handler_start.elapsed());
-
-        if let Err(panic_msg) = result {
-            pg_warning!(
-                "Handler panic caught, request rolled back (worker survived): {}",
-                panic_msg
-            );
+    match txn_result {
+        Ok(()) => {
+            // Commit is durable and visible: flush the buffered response(s) to
+            // the client, in order. Today a request yields at most one
+            // response, but the loop keeps a future multi-response request
+            // from silently dropping frames.
+            while let Ok(response) = buffer_rx.try_recv() {
+                if client_tx.send(response).is_err() {
+                    pg_warning!(
+                        "Client disconnected before response flush (correlation_id={})",
+                        correlation_id
+                    );
+                }
+            }
         }
-    });
+        Err(panic_payload) => {
+            // The transaction itself failed (commit-time panic). Any buffered
+            // response asserts success for work that did NOT commit — sending
+            // it would recreate the lost-ack bug at commit-failure
+            // granularity. Discard it and send an API-typed error frame
+            // instead (pure Rust construction + channel send; safe before
+            // Postgres error-state cleanup), then re-raise the panic to
+            // preserve today's worker-restart semantics.
+            while buffer_rx.try_recv().is_ok() {}
+            let error_response = crate::kafka::response_builders::error_response_for(
+                api_key,
+                api_version,
+                correlation_id,
+                ERROR_UNKNOWN_SERVER_ERROR,
+            )
+            .unwrap_or(crate::kafka::KafkaResponse::Error {
+                correlation_id,
+                error_code: ERROR_UNKNOWN_SERVER_ERROR,
+                error_message: Some("transaction commit failed".to_string()),
+            });
+            let _ = client_tx.send(error_response);
+            std::panic::resume_unwind(panic_payload);
+        }
+    }
 
     // Log timing results (only when log_timing is enabled)
     if let Some(start) = tx_start {

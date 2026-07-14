@@ -6,11 +6,13 @@
 //! - acks=0 (fire-and-forget) protocol compliance
 //! - Database verification of stored messages
 
+mod ack_visibility;
 mod acks_zero;
 mod basic;
 mod batch;
 mod timestamp;
 
+pub use ack_visibility::test_produce_ack_implies_committed_visibility;
 pub use acks_zero::test_producer_acks_zero;
 pub use basic::test_producer;
 pub use batch::test_batch_produce;

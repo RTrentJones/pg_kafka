@@ -95,7 +95,8 @@ pub use partition::{
     test_special_character_key_routing,
 };
 pub use producer::{
-    test_batch_produce, test_producer, test_producer_acks_zero, test_producer_timestamp_roundtrip,
+    test_batch_produce, test_produce_ack_implies_committed_visibility, test_producer,
+    test_producer_acks_zero, test_producer_timestamp_roundtrip,
 };
 
 // Re-export new test functions

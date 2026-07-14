@@ -304,6 +304,12 @@ pub static CONFIG_RELOAD_INTERVAL_MS: GucSetting<i32> =
 // behaviour). Auxiliary-table pruning (stale producers, terminal transactions,
 // delivered shadow-outbox rows) always runs; see storage::postgres retention consts.
 pub static MESSAGE_RETENTION_HOURS: GucSetting<i32> = GucSetting::<i32>::new(0);
+// RB-1: test-only fault injection for the response-after-commit barrier. When > 0,
+// the worker sleeps this many ms inside the transaction after a Produce handler
+// runs and before commit, widening the response-send→commit window so the E2E
+// suite can prove deterministically that an acked produce is already committed.
+// Never set this in production — it stalls the single DB thread per produce.
+pub static TEST_PRE_COMMIT_DELAY_MS: GucSetting<i32> = GucSetting::<i32>::new(0);
 
 /// Initialize GUC parameters
 pub fn init() {
@@ -391,6 +397,20 @@ pub fn init() {
         &MESSAGE_RETENTION_HOURS,
         0,
         87_600, // 10 years
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"pg_kafka.test_pre_commit_delay_ms",
+        c"TEST ONLY: delay (ms) between a Produce handler and its commit",
+        c"Fault-injection knob for the response-after-commit barrier E2E test: \
+          sleeps on the DB thread inside the transaction after a Produce handler \
+          runs, before commit. 0 (default) disables it. Do not set in production. \
+          Reloadable via SIGHUP.",
+        &TEST_PRE_COMMIT_DELAY_MS,
+        0,
+        10_000,
         GucContext::Sighup,
         GucFlags::default(),
     );

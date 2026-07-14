@@ -213,6 +213,7 @@ use kafka_test::{
     test_partition_assignment_race,
     test_partition_assignment_strategies,
     test_partition_zero,
+    test_produce_ack_implies_committed_visibility,
     test_produce_any_partition,
     test_produce_consume_race,
     test_produce_empty_batch,
@@ -470,6 +471,12 @@ fn get_all_tests() -> Vec<TestDef> {
             name: "test_producer_acks_zero",
             test_fn: wrap_test!(test_producer_acks_zero),
             parallel_safe: true,
+        },
+        TestDef {
+            category: "producer",
+            name: "test_produce_ack_implies_committed_visibility",
+            test_fn: wrap_test!(test_produce_ack_implies_committed_visibility),
+            parallel_safe: false, // Mutates global GUC (test_pre_commit_delay_ms)
         },
         TestDef {
             category: "producer",
