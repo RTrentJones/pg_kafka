@@ -149,7 +149,8 @@ pub use long_poll::{
     test_long_poll_auto_commit_interval, test_long_poll_consumer_disconnect,
     test_long_poll_immediate_return, test_long_poll_min_bytes_threshold,
     test_long_poll_multiple_consumers_same_partition, test_long_poll_multiple_waiters,
-    test_long_poll_producer_wakeup, test_long_poll_timeout, test_long_poll_timeout_precision,
+    test_long_poll_per_connection_task_cap, test_long_poll_producer_wakeup, test_long_poll_timeout,
+    test_long_poll_timeout_precision,
 };
 
 // Compression tests (Phase 8)

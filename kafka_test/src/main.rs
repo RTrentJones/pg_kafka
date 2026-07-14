@@ -190,6 +190,7 @@ use kafka_test::{
     test_long_poll_min_bytes_threshold,
     test_long_poll_multiple_consumers_same_partition,
     test_long_poll_multiple_waiters,
+    test_long_poll_per_connection_task_cap,
     test_long_poll_producer_wakeup,
     test_long_poll_timeout,
     test_long_poll_timeout_precision,
@@ -1086,6 +1087,12 @@ fn get_all_tests() -> Vec<TestDef> {
             name: "test_long_poll_immediate_return",
             test_fn: wrap_test!(test_long_poll_immediate_return),
             parallel_safe: true,
+        },
+        TestDef {
+            category: "long_poll",
+            name: "test_long_poll_per_connection_task_cap",
+            test_fn: wrap_test!(test_long_poll_per_connection_task_cap),
+            parallel_safe: false, // Floods one connection; sensitive to concurrent produce wakeups
         },
         TestDef {
             category: "long_poll",

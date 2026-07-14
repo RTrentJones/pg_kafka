@@ -29,13 +29,23 @@ pub fn get_external_bootstrap_servers() -> String {
 /// Get internal Kafka bootstrap servers for pg_kafka extension to use
 ///
 /// This determines the address that pg_kafka will use to connect to external Kafka.
-/// Uses direct IP (172.18.0.2:9095) because:
-/// - DNS for "external-kafka" may be stale in devcontainer
-/// - Port 9094 (INTERNAL) causes "Required feature not supported by broker" errors
-/// - Port 9095 (CONTAINER) is specifically for container-to-container communication
-/// - Port 9093 (EXTERNAL) advertises as localhost:9093 which doesn't work from containers
 ///
-/// TODO: Fix devcontainer networking to properly resolve external-kafka hostname
+/// The default is a static IP on the compose network's pinned subnet, not the
+/// `external-kafka` hostname — a deliberate, documented design (see the
+/// `KAFKA_ADVERTISED_LISTENERS` comments in `docker-compose.yml`), not a
+/// leftover hack:
+/// - pg_kafka runs on the HOST in CI (pgrx-managed postgres), where Docker's
+///   embedded DNS for compose service names does not resolve; the broker must
+///   therefore advertise an address valid from both host and containers, which
+///   a routable static IP provides and a service hostname cannot.
+/// - Port 9095 (CONTAINER listener) advertises that IP; 9094 (INTERNAL)
+///   advertises the hostname and 9093 (EXTERNAL) advertises localhost:9093 —
+///   each usable only from its own vantage point.
+/// - `docker-compose.yml` pins the subnet (172.18.0.0/16) and this service's
+///   `ipv4_address`, so the default below cannot drift.
+///
+/// For an environment where that subnet collides (see the compose caveat),
+/// override with `INTERNAL_KAFKA_BOOTSTRAP_SERVERS`.
 pub fn get_internal_bootstrap_servers() -> String {
     env::var("INTERNAL_KAFKA_BOOTSTRAP_SERVERS").unwrap_or_else(|_| "172.18.0.2:9095".to_string())
 }

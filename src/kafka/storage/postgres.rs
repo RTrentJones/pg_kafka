@@ -69,6 +69,133 @@ impl PostgresStore {
         PostgresStore
     }
 
+    /// Shared completion path for `commit_transaction` / `abort_transaction`
+    /// (PR #84 documented follow-up). The two flows were ~90% duplicated SQL:
+    /// identical validation (existence, fencing, Ongoing-state check), a
+    /// terminal-visibility UPDATE on `kafka.messages` (NULL = visible vs
+    /// 'aborted'), the pending-offset DELETE, and the terminal
+    /// `kafka.transactions` state UPDATE — commit additionally promotes
+    /// pending offsets into `kafka.consumer_offsets` before the delete.
+    fn end_transaction(
+        &self,
+        transactional_id: &str,
+        producer_id: i64,
+        producer_epoch: i16,
+        commit: bool,
+    ) -> Result<()> {
+        let op = if commit { "commit" } else { "abort" };
+        crate::pg_debug!(
+            "PostgresStore::end_transaction ({}): transactional_id={}, producer_id={}, epoch={}",
+            op,
+            transactional_id,
+            producer_id,
+            producer_epoch
+        );
+
+        Spi::connect_mut(|client| {
+            // Step 1: Validate transaction state
+            let txn_table = client.select(
+                "SELECT state, producer_id, producer_epoch FROM kafka.transactions WHERE transactional_id = $1",
+                Some(1),
+                &[transactional_id.into()],
+            )?;
+
+            if txn_table.is_empty() {
+                return Err(KafkaError::transactional_id_not_found(transactional_id));
+            }
+
+            // `unwrap_or`/`unwrap_or_default` on these column reads is safe by
+            // schema, not by luck: kafka.transactions.{producer_id, producer_epoch,
+            // state} are all declared NOT NULL (sql/bootstrap.sql), so get_by_name
+            // never returns None for a row that exists (and non-existence was already
+            // handled by the is_empty() check above). The fallback value is therefore
+            // unreachable and never masks a real NULL. The same reasoning applies to
+            // the other `get_by_name(...).unwrap_or*` reads of NOT NULL columns
+            // throughout this module.
+            let row = txn_table.first();
+            let current_producer_id: i64 = row.get_by_name("producer_id")?.unwrap_or(0);
+            let current_epoch: i16 = row.get_by_name("producer_epoch")?.unwrap_or(0);
+            let state: String = row.get_by_name("state")?.unwrap_or_default();
+
+            if current_producer_id != producer_id || current_epoch != producer_epoch {
+                return Err(KafkaError::producer_fenced(
+                    producer_id,
+                    producer_epoch,
+                    current_epoch,
+                ));
+            }
+
+            if state != "Ongoing" {
+                return Err(KafkaError::invalid_txn_state(
+                    transactional_id,
+                    "Ongoing",
+                    &state,
+                ));
+            }
+
+            // Step 2: Terminal message visibility — commit makes pending rows
+            // visible (txn_state = NULL); abort marks them 'aborted'.
+            if commit {
+                client.update(
+                    "UPDATE kafka.messages SET txn_state = NULL
+                     WHERE producer_id = $1 AND producer_epoch = $2 AND txn_state = 'pending'",
+                    None,
+                    &[producer_id.into(), producer_epoch.into()],
+                )?;
+
+                // Step 3 (commit only): Move pending offsets to consumer_offsets
+                client.update(
+                    "INSERT INTO kafka.consumer_offsets (group_id, topic_id, partition_id, committed_offset, metadata)
+                     SELECT group_id, topic_id, partition_id, pending_offset, metadata
+                     FROM kafka.txn_pending_offsets
+                     WHERE transactional_id = $1
+                     ON CONFLICT (group_id, topic_id, partition_id) DO UPDATE SET
+                         committed_offset = EXCLUDED.committed_offset,
+                         metadata = EXCLUDED.metadata,
+                         commit_timestamp = NOW()",
+                    None,
+                    &[transactional_id.into()],
+                )?;
+            } else {
+                client.update(
+                    "UPDATE kafka.messages SET txn_state = 'aborted'
+                     WHERE producer_id = $1 AND producer_epoch = $2 AND txn_state = 'pending'",
+                    None,
+                    &[producer_id.into(), producer_epoch.into()],
+                )?;
+            }
+
+            // Step 4: Delete pending offsets (aborted ones are simply dropped)
+            client.update(
+                "DELETE FROM kafka.txn_pending_offsets WHERE transactional_id = $1",
+                None,
+                &[transactional_id.into()],
+            )?;
+
+            // Step 5: Terminal transaction state
+            client.update(
+                if commit {
+                    "UPDATE kafka.transactions SET state = 'CompleteCommit', last_updated_at = NOW()
+                     WHERE transactional_id = $1"
+                } else {
+                    "UPDATE kafka.transactions SET state = 'CompleteAbort', last_updated_at = NOW()
+                     WHERE transactional_id = $1"
+                },
+                None,
+                &[transactional_id.into()],
+            )?;
+
+            crate::pg_debug!("Transaction {} completed ({})", transactional_id, op);
+            Ok(())
+        })
+        .map_err(|e| match e {
+            KafkaError::TransactionalIdNotFound { .. }
+            | KafkaError::ProducerFenced { .. }
+            | KafkaError::InvalidTxnState { .. } => e,
+            _ => KafkaError::Internal(format!("{}_transaction failed: {}", op, e)),
+        })
+    }
+
     /// DR-1/DR-2 (DEEP-REVIEW-2026-07): one pass of the storage-lifecycle sweep.
     ///
     /// Before this existed the system only ever grew: `cleanup_aborted_messages` was
@@ -1585,92 +1712,7 @@ impl KafkaStore for PostgresStore {
         producer_id: i64,
         producer_epoch: i16,
     ) -> Result<()> {
-        crate::pg_debug!(
-            "PostgresStore::commit_transaction: transactional_id={}, producer_id={}, epoch={}",
-            transactional_id,
-            producer_id,
-            producer_epoch
-        );
-
-        Spi::connect_mut(|client| {
-            // Step 1: Validate transaction state
-            let txn_table = client.select(
-                "SELECT state, producer_id, producer_epoch FROM kafka.transactions WHERE transactional_id = $1",
-                Some(1),
-                &[transactional_id.into()],
-            )?;
-
-            if txn_table.is_empty() {
-                return Err(KafkaError::transactional_id_not_found(transactional_id));
-            }
-
-            // `unwrap_or`/`unwrap_or_default` on these column reads is safe by
-            // schema, not by luck: kafka.transactions.{producer_id, producer_epoch,
-            // state} are all declared NOT NULL (sql/bootstrap.sql), so get_by_name
-            // never returns None for a row that exists (and non-existence was already
-            // handled by the is_empty() check above). The fallback value is therefore
-            // unreachable and never masks a real NULL. The same reasoning applies to
-            // the other `get_by_name(...).unwrap_or*` reads of NOT NULL columns
-            // throughout this module.
-            let row = txn_table.first();
-            let current_producer_id: i64 = row.get_by_name("producer_id")?.unwrap_or(0);
-            let current_epoch: i16 = row.get_by_name("producer_epoch")?.unwrap_or(0);
-            let state: String = row.get_by_name("state")?.unwrap_or_default();
-
-            if current_producer_id != producer_id || current_epoch != producer_epoch {
-                return Err(KafkaError::producer_fenced(producer_id, producer_epoch, current_epoch));
-            }
-
-            if state != "Ongoing" {
-                return Err(KafkaError::invalid_txn_state(transactional_id, "Ongoing", &state));
-            }
-
-            // Step 2: Make messages visible (set txn_state = NULL)
-            client.update(
-                "UPDATE kafka.messages SET txn_state = NULL
-                 WHERE producer_id = $1 AND producer_epoch = $2 AND txn_state = 'pending'",
-                None,
-                &[producer_id.into(), producer_epoch.into()],
-            )?;
-
-            // Step 3: Move pending offsets to consumer_offsets
-            client.update(
-                "INSERT INTO kafka.consumer_offsets (group_id, topic_id, partition_id, committed_offset, metadata)
-                 SELECT group_id, topic_id, partition_id, pending_offset, metadata
-                 FROM kafka.txn_pending_offsets
-                 WHERE transactional_id = $1
-                 ON CONFLICT (group_id, topic_id, partition_id) DO UPDATE SET
-                     committed_offset = EXCLUDED.committed_offset,
-                     metadata = EXCLUDED.metadata,
-                     commit_timestamp = NOW()",
-                None,
-                &[transactional_id.into()],
-            )?;
-
-            // Step 4: Delete pending offsets
-            client.update(
-                "DELETE FROM kafka.txn_pending_offsets WHERE transactional_id = $1",
-                None,
-                &[transactional_id.into()],
-            )?;
-
-            // Step 5: Update transaction state to CompleteCommit
-            client.update(
-                "UPDATE kafka.transactions SET state = 'CompleteCommit', last_updated_at = NOW()
-                 WHERE transactional_id = $1",
-                None,
-                &[transactional_id.into()],
-            )?;
-
-            crate::pg_debug!("Transaction {} committed", transactional_id);
-            Ok(())
-        })
-        .map_err(|e| match e {
-            KafkaError::TransactionalIdNotFound { .. }
-            | KafkaError::ProducerFenced { .. }
-            | KafkaError::InvalidTxnState { .. } => e,
-            _ => KafkaError::Internal(format!("commit_transaction failed: {}", e)),
-        })
+        self.end_transaction(transactional_id, producer_id, producer_epoch, true)
     }
 
     fn abort_transaction(
@@ -1679,70 +1721,7 @@ impl KafkaStore for PostgresStore {
         producer_id: i64,
         producer_epoch: i16,
     ) -> Result<()> {
-        crate::pg_debug!(
-            "PostgresStore::abort_transaction: transactional_id={}, producer_id={}, epoch={}",
-            transactional_id,
-            producer_id,
-            producer_epoch
-        );
-
-        Spi::connect_mut(|client| {
-            // Step 1: Validate transaction state
-            let txn_table = client.select(
-                "SELECT state, producer_id, producer_epoch FROM kafka.transactions WHERE transactional_id = $1",
-                Some(1),
-                &[transactional_id.into()],
-            )?;
-
-            if txn_table.is_empty() {
-                return Err(KafkaError::transactional_id_not_found(transactional_id));
-            }
-
-            let row = txn_table.first();
-            let current_producer_id: i64 = row.get_by_name("producer_id")?.unwrap_or(0);
-            let current_epoch: i16 = row.get_by_name("producer_epoch")?.unwrap_or(0);
-            let state: String = row.get_by_name("state")?.unwrap_or_default();
-
-            if current_producer_id != producer_id || current_epoch != producer_epoch {
-                return Err(KafkaError::producer_fenced(producer_id, producer_epoch, current_epoch));
-            }
-
-            if state != "Ongoing" {
-                return Err(KafkaError::invalid_txn_state(transactional_id, "Ongoing", &state));
-            }
-
-            // Step 2: Mark messages as aborted
-            client.update(
-                "UPDATE kafka.messages SET txn_state = 'aborted'
-                 WHERE producer_id = $1 AND producer_epoch = $2 AND txn_state = 'pending'",
-                None,
-                &[producer_id.into(), producer_epoch.into()],
-            )?;
-
-            // Step 3: Delete pending offsets
-            client.update(
-                "DELETE FROM kafka.txn_pending_offsets WHERE transactional_id = $1",
-                None,
-                &[transactional_id.into()],
-            )?;
-
-            // Step 4: Update transaction state to CompleteAbort
-            client.update(
-                "UPDATE kafka.transactions SET state = 'CompleteAbort', last_updated_at = NOW()
-                 WHERE transactional_id = $1",
-                None,
-                &[transactional_id.into()],
-            )?;
-
-            crate::pg_debug!("Transaction {} aborted", transactional_id);
-            Ok(())
-        })
-        .map_err(|e| match e {
-            KafkaError::TransactionalIdNotFound { .. }
-            | KafkaError::ProducerFenced { .. }
-            | KafkaError::InvalidTxnState { .. } => e,
-            _ => KafkaError::Internal(format!("abort_transaction failed: {}", e)),
-        })
+        self.end_transaction(transactional_id, producer_id, producer_epoch, false)
     }
 
     fn get_transaction_state(&self, transactional_id: &str) -> Result<Option<TransactionState>> {
