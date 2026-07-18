@@ -2691,6 +2691,51 @@ mod tests {
         }
     }
 
+    /// Header for `api_key`/`api_version` followed by a deliberately truncated
+    /// body, to drive the decode-error branch of a parser.
+    fn header_plus_garbage(
+        api_key: i16,
+        api_version: i16,
+        header_version: i16,
+        correlation_id: i32,
+    ) -> BytesMut {
+        let header = RequestHeader::default()
+            .with_request_api_key(api_key)
+            .with_request_api_version(api_version)
+            .with_correlation_id(correlation_id)
+            .with_client_id(Some(StrBytes::from_static_str("test-client")));
+        let mut buf = BytesMut::new();
+        header.encode(&mut buf, header_version).unwrap();
+        // One stray byte: not a valid body for any of these requests, so decode
+        // fails and the parser must take its send_api_error branch.
+        buf.extend_from_slice(&[0xFF]);
+        buf
+    }
+
+    /// The three config/log-management parsers must handle a malformed body by
+    /// returning Ok(None) and queueing a decodable API-typed error frame (never
+    /// panicking or hanging the client).
+    #[test]
+    fn test_parse_config_log_apis_malformed_body() {
+        for (api_key, api_version, header_version) in [
+            (API_KEY_DELETE_RECORDS, 1i16, 1i16),
+            (API_KEY_DESCRIBE_CONFIGS, 1, 1),
+            (API_KEY_INCREMENTAL_ALTER_CONFIGS, 0, 1),
+        ] {
+            let (tx, mut rx) = create_test_channel();
+            let frame = header_plus_garbage(api_key, api_version, header_version, 555);
+            let parsed = parse_request(frame, tx).unwrap();
+            assert!(
+                parsed.is_none(),
+                "malformed api_key={api_key} must parse to None"
+            );
+            assert!(
+                rx.try_recv().is_ok(),
+                "malformed api_key={api_key} must queue an error response"
+            );
+        }
+    }
+
     // ========== Idempotent Producer Tests (Phase 9) ==========
 
     #[test]

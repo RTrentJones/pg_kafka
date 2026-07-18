@@ -7,7 +7,7 @@
 //! (established pattern: idempotent/protocol_encoding.rs) with database
 //! verification through ctx.db().
 
-use crate::common::{create_producer, get_bootstrap_servers, TestResult};
+use crate::common::{create_base_consumer, create_producer, get_bootstrap_servers, TestResult};
 use crate::setup::TestContext;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use kafka_protocol::messages::delete_records_request::{
@@ -23,8 +23,9 @@ use kafka_protocol::protocol::{Decodable, Encodable, StrBytes};
 use rdkafka::admin::{AdminClient, AdminOptions, ResourceSpecifier};
 use rdkafka::client::DefaultClientContext;
 use rdkafka::config::ClientConfig;
+use rdkafka::consumer::Consumer;
 use rdkafka::producer::FutureRecord;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -346,6 +347,51 @@ pub async fn test_delete_records_truncates_partition() -> TestResult {
         .get(0);
     assert_eq!(count, 0, "partition fully truncated");
     println!("✅ Full truncation\n");
+
+    // The persisted log start must NOT regress to 0 on the now-empty partition.
+    // Primary proof: the durable column. Guards the Codex-flagged
+    // log-start-regression on the DeleteRecords path.
+    println!("Step 5: log start must persist at 5 (not regress to 0)...");
+    let stored_log_start: i64 = ctx
+        .db()
+        .query_one(
+            "SELECT po.log_start_offset FROM kafka.partition_offsets po
+             JOIN kafka.topics t ON po.topic_id = t.id
+             WHERE t.name = $1 AND po.partition_id = 0",
+            &[&topic],
+        )
+        .await?
+        .get(0);
+    assert_eq!(stored_log_start, 5, "durable log_start_offset must be 5");
+
+    // Client-visible proof: ListOffsets(EARLIEST) — via fetch_watermarks' low
+    // watermark — must report 5, not 0. rdkafka's BaseConsumer is !Send, so run
+    // it on a blocking thread to keep the test future Send.
+    let topic_for_wm = topic.clone();
+    let low_wm: i64 = tokio::task::spawn_blocking(move || -> Result<i64, String> {
+        let consumer =
+            create_base_consumer("delete-records-lso").map_err(|e| format!("consumer: {e}"))?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok((low, _high)) =
+                consumer.fetch_watermarks(&topic_for_wm, 0, Duration::from_secs(5))
+            {
+                if low == 5 || Instant::now() > deadline {
+                    return Ok(low);
+                }
+            } else if Instant::now() > deadline {
+                return Err("fetch_watermarks never succeeded".to_string());
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    })
+    .await
+    .map_err(|e| format!("join error: {e}"))??;
+    assert_eq!(
+        low_wm, 5,
+        "EARLIEST offset regressed after full truncation (expected 5, got {low_wm})"
+    );
+    println!("✅ Log start persisted at 5; EARLIEST reports 5, no regression\n");
 
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");

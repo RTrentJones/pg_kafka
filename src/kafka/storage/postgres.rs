@@ -756,10 +756,20 @@ impl KafkaStore for PostgresStore {
 
     fn get_earliest_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64> {
         Spi::connect(|client| {
+            // Earliest = GREATEST(smallest remaining offset, durable log start).
+            // The durable log start (kafka.partition_offsets.log_start_offset,
+            // advanced by DeleteRecords) dominates only when the partition has
+            // been emptied by truncation — otherwise MIN(partition_offset) is at
+            // or above it. For a never-truncated partition log_start is 0, so
+            // this is unchanged. The LEFT JOIN covers a partition with rows but
+            // no counter row (log_start defaults to 0).
             let table = client.select(
-                "SELECT COALESCE(MIN(partition_offset), 0) as earliest_offset
-                 FROM kafka.messages
-                 WHERE topic_id = $1 AND partition_id = $2",
+                "SELECT GREATEST(
+                            COALESCE((SELECT MIN(partition_offset) FROM kafka.messages
+                                      WHERE topic_id = $1 AND partition_id = $2), 0),
+                            COALESCE((SELECT log_start_offset FROM kafka.partition_offsets
+                                      WHERE topic_id = $1 AND partition_id = $2), 0)
+                        ) AS earliest_offset",
                 None,
                 &[topic_id.into(), partition_id.into()],
             )?;
@@ -1975,17 +1985,40 @@ impl KafkaStore for PostgresStore {
                 &[topic_id.into(), partition_id.into(), before_offset.into()],
             )?;
 
-            // New log start offset: earliest remaining row, or the requested
-            // truncation point when the partition is now empty (matching Kafka,
-            // where log_start_offset advances to the delete offset). Offset
-            // monotonicity is safe: producers take GREATEST(next_offset, MAX+1)
-            // from kafka.partition_offsets (BUG-3), which this never touches.
-            let table = client.select(
-                "SELECT COALESCE(MIN(partition_offset), $3) AS low_watermark
-                 FROM kafka.messages
-                 WHERE topic_id = $1 AND partition_id = $2",
+            // Persist the advanced log start so it survives an emptied partition.
+            // Without this, get_earliest_offset would fall back to
+            // COALESCE(MIN(partition_offset), 0) = 0 once every row is deleted,
+            // regressing the reported log start (ListOffsets EARLIEST / Fetch
+            // log_start_offset) to offsets that were explicitly truncated. The
+            // per-partition counter row already exists (created on produce);
+            // GREATEST keeps log_start monotonic. next_offset is untouched here,
+            // so producer monotonicity (GREATEST(next_offset, MAX+1), BUG-3)
+            // is preserved.
+            client.update(
+                "INSERT INTO kafka.partition_offsets (topic_id, partition_id, next_offset, log_start_offset)
+                 VALUES ($1, $2, $3, $3)
+                 ON CONFLICT (topic_id, partition_id) DO UPDATE SET
+                     log_start_offset = GREATEST(kafka.partition_offsets.log_start_offset, EXCLUDED.log_start_offset)",
                 None,
                 &[topic_id.into(), partition_id.into(), before_offset.into()],
+            )?;
+
+            // New log start offset = the persisted log start, or the earliest
+            // remaining row if it sits above it (a contiguous log reports MIN,
+            // which equals the truncation point). Matches Kafka's DeleteRecords
+            // semantics.
+            let table = client.select(
+                "SELECT GREATEST(
+                            po.log_start_offset,
+                            COALESCE((SELECT MIN(m.partition_offset)
+                                      FROM kafka.messages m
+                                      WHERE m.topic_id = po.topic_id AND m.partition_id = po.partition_id),
+                                     po.log_start_offset)
+                        ) AS low_watermark
+                 FROM kafka.partition_offsets po
+                 WHERE po.topic_id = $1 AND po.partition_id = $2",
+                None,
+                &[topic_id.into(), partition_id.into()],
             )?;
             let low_watermark: i64 = table
                 .first()

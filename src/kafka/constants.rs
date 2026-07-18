@@ -612,6 +612,24 @@ mod tests {
     }
 
     #[test]
+    fn test_get_response_header_version_config_log_apis() {
+        // DeleteRecords v2+, DescribeConfigs v4+, IncrementalAlterConfigs v1+
+        // use flexible format (covers the new get_flexible_format_threshold arms).
+        assert_eq!(get_response_header_version(API_KEY_DELETE_RECORDS, 1), 0);
+        assert_eq!(get_response_header_version(API_KEY_DELETE_RECORDS, 2), 1);
+        assert_eq!(get_response_header_version(API_KEY_DESCRIBE_CONFIGS, 3), 0);
+        assert_eq!(get_response_header_version(API_KEY_DESCRIBE_CONFIGS, 4), 1);
+        assert_eq!(
+            get_response_header_version(API_KEY_INCREMENTAL_ALTER_CONFIGS, 0),
+            0
+        );
+        assert_eq!(
+            get_response_header_version(API_KEY_INCREMENTAL_ALTER_CONFIGS, 1),
+            1
+        );
+    }
+
+    #[test]
     fn test_get_response_header_version_coordinator_apis() {
         // FindCoordinator v3+ uses flexible format
         assert_eq!(get_response_header_version(API_KEY_FIND_COORDINATOR, 2), 0);

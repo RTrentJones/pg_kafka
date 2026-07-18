@@ -79,6 +79,12 @@ CREATE TABLE IF NOT EXISTS kafka.partition_offsets (
     topic_id INT NOT NULL,
     partition_id INT NOT NULL,
     next_offset BIGINT NOT NULL DEFAULT 0,
+    -- Durable log start offset. DeleteRecords (API 21) advances this to the
+    -- truncation point so a fully-emptied partition still reports the correct
+    -- earliest offset (ListOffsets EARLIEST / Fetch log_start_offset) instead of
+    -- regressing to 0 — matching Kafka, which never lets the log start move
+    -- backwards. 0 for partitions that have never been truncated.
+    log_start_offset BIGINT NOT NULL DEFAULT 0,
     CHECK (partition_id >= 0),
     PRIMARY KEY (topic_id, partition_id),
     FOREIGN KEY (topic_id) REFERENCES kafka.topics(id) ON DELETE CASCADE

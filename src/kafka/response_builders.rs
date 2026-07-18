@@ -884,4 +884,61 @@ mod tests {
         assert!(error_response_for(API_KEY_END_TXN, 3, 1, ERROR_UNSUPPORTED_VERSION).is_none());
         assert!(error_response_for(9999, 0, 1, ERROR_UNSUPPORTED_VERSION).is_none());
     }
+
+    #[test]
+    fn test_error_response_for_config_and_log_apis() {
+        use crate::kafka::messages::KafkaResponse;
+        // The three APIs added alongside RB-1 each map to their typed error
+        // response, tagged with the request version.
+        assert!(matches!(
+            error_response_for(API_KEY_DELETE_RECORDS, 1, 7, ERROR_UNSUPPORTED_VERSION),
+            Some(KafkaResponse::DeleteRecords {
+                correlation_id: 7,
+                api_version: 1,
+                ..
+            })
+        ));
+        assert!(matches!(
+            error_response_for(API_KEY_DESCRIBE_CONFIGS, 4, 8, ERROR_UNSUPPORTED_VERSION),
+            Some(KafkaResponse::DescribeConfigs {
+                correlation_id: 8,
+                api_version: 4,
+                ..
+            })
+        ));
+        assert!(matches!(
+            error_response_for(
+                API_KEY_INCREMENTAL_ALTER_CONFIGS,
+                1,
+                9,
+                ERROR_UNSUPPORTED_VERSION
+            ),
+            Some(KafkaResponse::IncrementalAlterConfigs {
+                correlation_id: 9,
+                api_version: 1,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_new_error_builders_are_defaultish() {
+        // The three new builders return empty (per-partition/per-resource error)
+        // responses; exercised for coverage and to assert they don't panic.
+        assert!(
+            build_delete_records_error_response(ERROR_UNKNOWN_SERVER_ERROR)
+                .topics
+                .is_empty()
+        );
+        assert!(
+            build_describe_configs_error_response(ERROR_UNKNOWN_SERVER_ERROR)
+                .results
+                .is_empty()
+        );
+        assert!(
+            build_incremental_alter_configs_error_response(ERROR_UNKNOWN_SERVER_ERROR)
+                .responses
+                .is_empty()
+        );
+    }
 }
