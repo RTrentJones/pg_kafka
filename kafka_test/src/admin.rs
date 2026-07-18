@@ -22,30 +22,9 @@ fn create_admin_client() -> Result<AdminClient<DefaultClientContext>, Box<dyn st
     Ok(admin)
 }
 
-/// Poll a COUNT(*) query until it returns `expected` or the deadline passes,
-/// returning the last observed value for the caller to assert on.
-///
-/// The broker sends its Kafka response from inside the worker's transaction,
-/// so a separate Postgres connection can still observe pre-commit state for a
-/// few milliseconds after the client sees a successful admin response. A
-/// single instant read here is a race (seen as a rare CI flake in
-/// test_create_multiple_topics); polling briefly makes verification
-/// deterministic without hiding real failures.
-async fn wait_for_count(
-    db: &tokio_postgres::Client,
-    query: &str,
-    params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
-    expected: i64,
-) -> Result<i64, Box<dyn std::error::Error>> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let count: i64 = db.query_one(query, params).await?.get(0);
-        if count == expected || std::time::Instant::now() >= deadline {
-            return Ok(count);
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
+// wait_for_count lives in fixtures.rs (shared across all E2E categories); see
+// its doc comment for the RB-1 rationale.
+use crate::fixtures::wait_for_count;
 
 /// Test creating a new topic via CreateTopics API
 pub async fn test_create_topic() -> TestResult {

@@ -48,6 +48,7 @@
 pub mod config;
 pub mod error;
 pub mod forwarder;
+pub mod inflight;
 pub mod license;
 pub mod primary;
 pub mod producer;

@@ -7,8 +7,11 @@
 //! - Edge cases: Timeout precision, disconnect handling, multiple waiters
 
 mod edge_cases;
+mod task_cap;
 mod timeout;
 mod wakeup;
+
+pub use task_cap::test_long_poll_per_connection_task_cap;
 
 pub use edge_cases::{
     test_long_poll_auto_commit_interval, test_long_poll_consumer_disconnect,

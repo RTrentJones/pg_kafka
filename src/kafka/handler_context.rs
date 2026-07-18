@@ -463,6 +463,30 @@ mod tests {
             Ok(vec![])
         }
 
+        fn get_topic_retention_ms(
+            &self,
+            _topic_id: i32,
+        ) -> crate::kafka::error::Result<Option<i64>> {
+            Ok(None)
+        }
+
+        fn set_topic_retention_ms(
+            &self,
+            _topic_id: i32,
+            _retention_ms: Option<i64>,
+        ) -> crate::kafka::error::Result<()> {
+            Ok(())
+        }
+
+        fn delete_records_before(
+            &self,
+            _topic_id: i32,
+            _partition_id: i32,
+            before_offset: i64,
+        ) -> crate::kafka::error::Result<i64> {
+            Ok(before_offset)
+        }
+
         fn cleanup_aborted_messages(
             &self,
             _older_than: std::time::Duration,

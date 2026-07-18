@@ -88,16 +88,16 @@ pub async fn test_idempotent_producer_basic() -> TestResult {
     assert_eq!(topic_name, topic, "Topic name mismatch");
     println!("✅ Topic '{}' created with id={}\n", topic_name, topic_id);
 
-    // Verify all messages were inserted
+    // Verify all messages were inserted (RB-1 makes a single read correct;
+    // poll as defense-in-depth against non-barrier timing).
     println!("Step 2: Checking message insertion...");
-    let count_row = ctx
-        .db()
-        .query_one(
-            "SELECT COUNT(*) FROM kafka.messages WHERE topic_id = $1",
-            &[&topic_id],
-        )
-        .await?;
-    let message_count: i64 = count_row.get(0);
+    let message_count = crate::fixtures::wait_for_count(
+        ctx.db(),
+        "SELECT COUNT(*) FROM kafka.messages WHERE topic_id = $1",
+        &[&topic_id],
+        num_messages,
+    )
+    .await?;
 
     assert_eq!(
         message_count, num_messages,

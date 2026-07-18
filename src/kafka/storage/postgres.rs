@@ -69,6 +69,133 @@ impl PostgresStore {
         PostgresStore
     }
 
+    /// Shared completion path for `commit_transaction` / `abort_transaction`
+    /// (PR #84 documented follow-up). The two flows were ~90% duplicated SQL:
+    /// identical validation (existence, fencing, Ongoing-state check), a
+    /// terminal-visibility UPDATE on `kafka.messages` (NULL = visible vs
+    /// 'aborted'), the pending-offset DELETE, and the terminal
+    /// `kafka.transactions` state UPDATE — commit additionally promotes
+    /// pending offsets into `kafka.consumer_offsets` before the delete.
+    fn end_transaction(
+        &self,
+        transactional_id: &str,
+        producer_id: i64,
+        producer_epoch: i16,
+        commit: bool,
+    ) -> Result<()> {
+        let op = if commit { "commit" } else { "abort" };
+        crate::pg_debug!(
+            "PostgresStore::end_transaction ({}): transactional_id={}, producer_id={}, epoch={}",
+            op,
+            transactional_id,
+            producer_id,
+            producer_epoch
+        );
+
+        Spi::connect_mut(|client| {
+            // Step 1: Validate transaction state
+            let txn_table = client.select(
+                "SELECT state, producer_id, producer_epoch FROM kafka.transactions WHERE transactional_id = $1",
+                Some(1),
+                &[transactional_id.into()],
+            )?;
+
+            if txn_table.is_empty() {
+                return Err(KafkaError::transactional_id_not_found(transactional_id));
+            }
+
+            // `unwrap_or`/`unwrap_or_default` on these column reads is safe by
+            // schema, not by luck: kafka.transactions.{producer_id, producer_epoch,
+            // state} are all declared NOT NULL (sql/bootstrap.sql), so get_by_name
+            // never returns None for a row that exists (and non-existence was already
+            // handled by the is_empty() check above). The fallback value is therefore
+            // unreachable and never masks a real NULL. The same reasoning applies to
+            // the other `get_by_name(...).unwrap_or*` reads of NOT NULL columns
+            // throughout this module.
+            let row = txn_table.first();
+            let current_producer_id: i64 = row.get_by_name("producer_id")?.unwrap_or(0);
+            let current_epoch: i16 = row.get_by_name("producer_epoch")?.unwrap_or(0);
+            let state: String = row.get_by_name("state")?.unwrap_or_default();
+
+            if current_producer_id != producer_id || current_epoch != producer_epoch {
+                return Err(KafkaError::producer_fenced(
+                    producer_id,
+                    producer_epoch,
+                    current_epoch,
+                ));
+            }
+
+            if state != "Ongoing" {
+                return Err(KafkaError::invalid_txn_state(
+                    transactional_id,
+                    "Ongoing",
+                    &state,
+                ));
+            }
+
+            // Step 2: Terminal message visibility — commit makes pending rows
+            // visible (txn_state = NULL); abort marks them 'aborted'.
+            if commit {
+                client.update(
+                    "UPDATE kafka.messages SET txn_state = NULL
+                     WHERE producer_id = $1 AND producer_epoch = $2 AND txn_state = 'pending'",
+                    None,
+                    &[producer_id.into(), producer_epoch.into()],
+                )?;
+
+                // Step 3 (commit only): Move pending offsets to consumer_offsets
+                client.update(
+                    "INSERT INTO kafka.consumer_offsets (group_id, topic_id, partition_id, committed_offset, metadata)
+                     SELECT group_id, topic_id, partition_id, pending_offset, metadata
+                     FROM kafka.txn_pending_offsets
+                     WHERE transactional_id = $1
+                     ON CONFLICT (group_id, topic_id, partition_id) DO UPDATE SET
+                         committed_offset = EXCLUDED.committed_offset,
+                         metadata = EXCLUDED.metadata,
+                         commit_timestamp = NOW()",
+                    None,
+                    &[transactional_id.into()],
+                )?;
+            } else {
+                client.update(
+                    "UPDATE kafka.messages SET txn_state = 'aborted'
+                     WHERE producer_id = $1 AND producer_epoch = $2 AND txn_state = 'pending'",
+                    None,
+                    &[producer_id.into(), producer_epoch.into()],
+                )?;
+            }
+
+            // Step 4: Delete pending offsets (aborted ones are simply dropped)
+            client.update(
+                "DELETE FROM kafka.txn_pending_offsets WHERE transactional_id = $1",
+                None,
+                &[transactional_id.into()],
+            )?;
+
+            // Step 5: Terminal transaction state
+            client.update(
+                if commit {
+                    "UPDATE kafka.transactions SET state = 'CompleteCommit', last_updated_at = NOW()
+                     WHERE transactional_id = $1"
+                } else {
+                    "UPDATE kafka.transactions SET state = 'CompleteAbort', last_updated_at = NOW()
+                     WHERE transactional_id = $1"
+                },
+                None,
+                &[transactional_id.into()],
+            )?;
+
+            crate::pg_debug!("Transaction {} completed ({})", transactional_id, op);
+            Ok(())
+        })
+        .map_err(|e| match e {
+            KafkaError::TransactionalIdNotFound { .. }
+            | KafkaError::ProducerFenced { .. }
+            | KafkaError::InvalidTxnState { .. } => e,
+            _ => KafkaError::Internal(format!("{}_transaction failed: {}", op, e)),
+        })
+    }
+
     /// DR-1/DR-2 (DEEP-REVIEW-2026-07): one pass of the storage-lifecycle sweep.
     ///
     /// Before this existed the system only ever grew: `cleanup_aborted_messages` was
@@ -82,11 +209,14 @@ impl PostgresStore {
     /// `aborted_grace` is the ABORTED_MESSAGE_GRACE window (parameterized so the
     /// on-demand SQL function can shrink it for testing).
     ///
-    /// Offset-monotonicity safety: deletes never touch `kafka.partition_offsets`, and
-    /// every offset producer/read path takes `GREATEST(next_offset, MAX+1)` (BUG-3),
-    /// so removing rows — oldest or newest — cannot cause offset reuse or HWM/LSO
-    /// regression. Consumers positioned before a retention cutoff get a standard
-    /// Kafka out-of-range reset, exactly as with a real broker's retention.
+    /// Offset-monotonicity safety: the message delete never touches
+    /// `kafka.partition_offsets.next_offset`, and every offset producer/read path
+    /// takes `GREATEST(next_offset, MAX+1)` (BUG-3), so removing rows — oldest or
+    /// newest — cannot cause offset reuse or HWM regression. It *does* advance
+    /// `log_start_offset` for emptied partitions (only ever forward, GREATEST) so
+    /// the reported earliest offset tracks retention instead of regressing to 0.
+    /// Consumers positioned before a retention cutoff get a standard Kafka
+    /// out-of-range reset, exactly as with a real broker's retention.
     pub fn run_retention_sweep(
         &self,
         message_retention_hours: i32,
@@ -98,25 +228,68 @@ impl PostgresStore {
         };
 
         Spi::connect_mut(|client| {
-            // Expired messages (only when retention is enabled). Batched via ctid so
-            // one sweep is bounded; never deletes pending transactional rows.
-            if message_retention_hours > 0 {
-                let table = client.update(
-                    "DELETE FROM kafka.messages
-                     WHERE ctid IN (
-                         SELECT ctid FROM kafka.messages
-                         WHERE created_at < NOW() - ($1 || ' hours')::interval
-                           AND (txn_state IS NULL OR txn_state <> 'pending')
-                         LIMIT $2
-                     )
-                     RETURNING 1",
+            // Expired messages. Batched via ctid so one sweep is bounded; never
+            // deletes pending transactional rows. Per-topic `retention.ms`
+            // (kafka.topics.retention_ms, settable via IncrementalAlterConfigs)
+            // overrides the global GUC: >= 0 enforces that window even when the
+            // global sweep is off; < 0 pins the topic to infinite retention even
+            // when a global window is set; NULL falls back to the GUC.
+            let table = client.update(
+                "DELETE FROM kafka.messages
+                 WHERE ctid IN (
+                     SELECT m.ctid FROM kafka.messages m
+                     JOIN kafka.topics t ON t.id = m.topic_id
+                     WHERE (m.txn_state IS NULL OR m.txn_state <> 'pending')
+                       AND (
+                            (t.retention_ms IS NOT NULL AND t.retention_ms >= 0
+                             AND m.created_at < NOW() - (t.retention_ms || ' milliseconds')::interval)
+                         OR (t.retention_ms IS NULL AND $1 > 0
+                             AND m.created_at < NOW() - ($1 || ' hours')::interval)
+                       )
+                     LIMIT $2
+                 )
+                 RETURNING topic_id, partition_id",
+                None,
+                &[
+                    (message_retention_hours as i64).into(),
+                    RETENTION_DELETE_BATCH.into(),
+                ],
+            )?;
+            // Collect the distinct partitions this batch touched so we can
+            // advance their durable log start (Codex review, PR #95): like
+            // DeleteRecords, retention deletion must advance
+            // partition_offsets.log_start_offset — otherwise a partition emptied
+            // by retention reports EARLIEST=0 via get_earliest_offset and a
+            // consumer resets to offsets retention already removed. Offsets are
+            // assigned monotonically with created_at, so retention deletes an
+            // offset-contiguous prefix; the new log start is the oldest
+            // surviving offset, or next_offset (the HWM) when the partition is
+            // now empty.
+            let mut affected: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
+            let mut expired = 0u64;
+            for row in table {
+                expired += 1;
+                let tid: i32 = row.get_by_name("topic_id")?.unwrap_or(0);
+                let pid: i32 = row.get_by_name("partition_id")?.unwrap_or(0);
+                affected.insert((tid, pid));
+            }
+            stats.expired_messages = expired;
+
+            if !affected.is_empty() {
+                let (topic_ids, partition_ids): (Vec<i32>, Vec<i32>) =
+                    affected.into_iter().unzip();
+                client.update(
+                    "UPDATE kafka.partition_offsets po
+                     SET log_start_offset = GREATEST(
+                             po.log_start_offset,
+                             COALESCE((SELECT MIN(m.partition_offset) FROM kafka.messages m
+                                       WHERE m.topic_id = po.topic_id AND m.partition_id = po.partition_id),
+                                      po.next_offset))
+                     FROM unnest($1::int4[], $2::int4[]) AS a(topic_id, partition_id)
+                     WHERE po.topic_id = a.topic_id AND po.partition_id = a.partition_id",
                     None,
-                    &[
-                        (message_retention_hours as i64).into(),
-                        RETENTION_DELETE_BATCH.into(),
-                    ],
+                    &[topic_ids.into(), partition_ids.into()],
                 )?;
-                stats.expired_messages = table.len() as u64;
             }
 
             // Terminal transactions first (their FK on producer_ids would otherwise
@@ -621,10 +794,20 @@ impl KafkaStore for PostgresStore {
 
     fn get_earliest_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64> {
         Spi::connect(|client| {
+            // Earliest = GREATEST(smallest remaining offset, durable log start).
+            // The durable log start (kafka.partition_offsets.log_start_offset,
+            // advanced by DeleteRecords) dominates only when the partition has
+            // been emptied by truncation — otherwise MIN(partition_offset) is at
+            // or above it. For a never-truncated partition log_start is 0, so
+            // this is unchanged. The LEFT JOIN covers a partition with rows but
+            // no counter row (log_start defaults to 0).
             let table = client.select(
-                "SELECT COALESCE(MIN(partition_offset), 0) as earliest_offset
-                 FROM kafka.messages
-                 WHERE topic_id = $1 AND partition_id = $2",
+                "SELECT GREATEST(
+                            COALESCE((SELECT MIN(partition_offset) FROM kafka.messages
+                                      WHERE topic_id = $1 AND partition_id = $2), 0),
+                            COALESCE((SELECT log_start_offset FROM kafka.partition_offsets
+                                      WHERE topic_id = $1 AND partition_id = $2), 0)
+                        ) AS earliest_offset",
                 None,
                 &[topic_id.into(), partition_id.into()],
             )?;
@@ -1585,92 +1768,7 @@ impl KafkaStore for PostgresStore {
         producer_id: i64,
         producer_epoch: i16,
     ) -> Result<()> {
-        crate::pg_debug!(
-            "PostgresStore::commit_transaction: transactional_id={}, producer_id={}, epoch={}",
-            transactional_id,
-            producer_id,
-            producer_epoch
-        );
-
-        Spi::connect_mut(|client| {
-            // Step 1: Validate transaction state
-            let txn_table = client.select(
-                "SELECT state, producer_id, producer_epoch FROM kafka.transactions WHERE transactional_id = $1",
-                Some(1),
-                &[transactional_id.into()],
-            )?;
-
-            if txn_table.is_empty() {
-                return Err(KafkaError::transactional_id_not_found(transactional_id));
-            }
-
-            // `unwrap_or`/`unwrap_or_default` on these column reads is safe by
-            // schema, not by luck: kafka.transactions.{producer_id, producer_epoch,
-            // state} are all declared NOT NULL (sql/bootstrap.sql), so get_by_name
-            // never returns None for a row that exists (and non-existence was already
-            // handled by the is_empty() check above). The fallback value is therefore
-            // unreachable and never masks a real NULL. The same reasoning applies to
-            // the other `get_by_name(...).unwrap_or*` reads of NOT NULL columns
-            // throughout this module.
-            let row = txn_table.first();
-            let current_producer_id: i64 = row.get_by_name("producer_id")?.unwrap_or(0);
-            let current_epoch: i16 = row.get_by_name("producer_epoch")?.unwrap_or(0);
-            let state: String = row.get_by_name("state")?.unwrap_or_default();
-
-            if current_producer_id != producer_id || current_epoch != producer_epoch {
-                return Err(KafkaError::producer_fenced(producer_id, producer_epoch, current_epoch));
-            }
-
-            if state != "Ongoing" {
-                return Err(KafkaError::invalid_txn_state(transactional_id, "Ongoing", &state));
-            }
-
-            // Step 2: Make messages visible (set txn_state = NULL)
-            client.update(
-                "UPDATE kafka.messages SET txn_state = NULL
-                 WHERE producer_id = $1 AND producer_epoch = $2 AND txn_state = 'pending'",
-                None,
-                &[producer_id.into(), producer_epoch.into()],
-            )?;
-
-            // Step 3: Move pending offsets to consumer_offsets
-            client.update(
-                "INSERT INTO kafka.consumer_offsets (group_id, topic_id, partition_id, committed_offset, metadata)
-                 SELECT group_id, topic_id, partition_id, pending_offset, metadata
-                 FROM kafka.txn_pending_offsets
-                 WHERE transactional_id = $1
-                 ON CONFLICT (group_id, topic_id, partition_id) DO UPDATE SET
-                     committed_offset = EXCLUDED.committed_offset,
-                     metadata = EXCLUDED.metadata,
-                     commit_timestamp = NOW()",
-                None,
-                &[transactional_id.into()],
-            )?;
-
-            // Step 4: Delete pending offsets
-            client.update(
-                "DELETE FROM kafka.txn_pending_offsets WHERE transactional_id = $1",
-                None,
-                &[transactional_id.into()],
-            )?;
-
-            // Step 5: Update transaction state to CompleteCommit
-            client.update(
-                "UPDATE kafka.transactions SET state = 'CompleteCommit', last_updated_at = NOW()
-                 WHERE transactional_id = $1",
-                None,
-                &[transactional_id.into()],
-            )?;
-
-            crate::pg_debug!("Transaction {} committed", transactional_id);
-            Ok(())
-        })
-        .map_err(|e| match e {
-            KafkaError::TransactionalIdNotFound { .. }
-            | KafkaError::ProducerFenced { .. }
-            | KafkaError::InvalidTxnState { .. } => e,
-            _ => KafkaError::Internal(format!("commit_transaction failed: {}", e)),
-        })
+        self.end_transaction(transactional_id, producer_id, producer_epoch, true)
     }
 
     fn abort_transaction(
@@ -1679,70 +1777,7 @@ impl KafkaStore for PostgresStore {
         producer_id: i64,
         producer_epoch: i16,
     ) -> Result<()> {
-        crate::pg_debug!(
-            "PostgresStore::abort_transaction: transactional_id={}, producer_id={}, epoch={}",
-            transactional_id,
-            producer_id,
-            producer_epoch
-        );
-
-        Spi::connect_mut(|client| {
-            // Step 1: Validate transaction state
-            let txn_table = client.select(
-                "SELECT state, producer_id, producer_epoch FROM kafka.transactions WHERE transactional_id = $1",
-                Some(1),
-                &[transactional_id.into()],
-            )?;
-
-            if txn_table.is_empty() {
-                return Err(KafkaError::transactional_id_not_found(transactional_id));
-            }
-
-            let row = txn_table.first();
-            let current_producer_id: i64 = row.get_by_name("producer_id")?.unwrap_or(0);
-            let current_epoch: i16 = row.get_by_name("producer_epoch")?.unwrap_or(0);
-            let state: String = row.get_by_name("state")?.unwrap_or_default();
-
-            if current_producer_id != producer_id || current_epoch != producer_epoch {
-                return Err(KafkaError::producer_fenced(producer_id, producer_epoch, current_epoch));
-            }
-
-            if state != "Ongoing" {
-                return Err(KafkaError::invalid_txn_state(transactional_id, "Ongoing", &state));
-            }
-
-            // Step 2: Mark messages as aborted
-            client.update(
-                "UPDATE kafka.messages SET txn_state = 'aborted'
-                 WHERE producer_id = $1 AND producer_epoch = $2 AND txn_state = 'pending'",
-                None,
-                &[producer_id.into(), producer_epoch.into()],
-            )?;
-
-            // Step 3: Delete pending offsets
-            client.update(
-                "DELETE FROM kafka.txn_pending_offsets WHERE transactional_id = $1",
-                None,
-                &[transactional_id.into()],
-            )?;
-
-            // Step 4: Update transaction state to CompleteAbort
-            client.update(
-                "UPDATE kafka.transactions SET state = 'CompleteAbort', last_updated_at = NOW()
-                 WHERE transactional_id = $1",
-                None,
-                &[transactional_id.into()],
-            )?;
-
-            crate::pg_debug!("Transaction {} aborted", transactional_id);
-            Ok(())
-        })
-        .map_err(|e| match e {
-            KafkaError::TransactionalIdNotFound { .. }
-            | KafkaError::ProducerFenced { .. }
-            | KafkaError::InvalidTxnState { .. } => e,
-            _ => KafkaError::Internal(format!("abort_transaction failed: {}", e)),
-        })
+        self.end_transaction(transactional_id, producer_id, producer_epoch, false)
     }
 
     fn get_transaction_state(&self, transactional_id: &str) -> Result<Option<TransactionState>> {
@@ -1926,6 +1961,111 @@ impl KafkaStore for PostgresStore {
         })
         .map_err(|e: KafkaError| {
             KafkaError::Internal(format!("cleanup_aborted_messages failed: {}", e))
+        })
+    }
+
+    fn get_topic_retention_ms(&self, topic_id: i32) -> Result<Option<i64>> {
+        Spi::connect(|client| {
+            let table = client.select(
+                "SELECT retention_ms FROM kafka.topics WHERE id = $1",
+                Some(1),
+                &[topic_id.into()],
+            )?;
+            if table.is_empty() {
+                return Err(KafkaError::Internal(format!(
+                    "topic id {} not found",
+                    topic_id
+                )));
+            }
+            Ok(table.first().get_by_name::<i64, _>("retention_ms")?)
+        })
+        .map_err(|e: KafkaError| {
+            KafkaError::Internal(format!("get_topic_retention_ms failed: {}", e))
+        })
+    }
+
+    fn set_topic_retention_ms(&self, topic_id: i32, retention_ms: Option<i64>) -> Result<()> {
+        crate::pg_debug!(
+            "PostgresStore::set_topic_retention_ms: topic_id={}, retention_ms={:?}",
+            topic_id,
+            retention_ms
+        );
+        Spi::connect_mut(|client| {
+            client.update(
+                "UPDATE kafka.topics SET retention_ms = $2 WHERE id = $1",
+                None,
+                &[topic_id.into(), retention_ms.into()],
+            )?;
+            Ok(())
+        })
+        .map_err(|e: KafkaError| {
+            KafkaError::Internal(format!("set_topic_retention_ms failed: {}", e))
+        })
+    }
+
+    fn delete_records_before(
+        &self,
+        topic_id: i32,
+        partition_id: i32,
+        before_offset: i64,
+    ) -> Result<i64> {
+        crate::pg_debug!(
+            "PostgresStore::delete_records_before: topic_id={}, partition_id={}, before_offset={}",
+            topic_id,
+            partition_id,
+            before_offset
+        );
+        Spi::connect_mut(|client| {
+            client.update(
+                "DELETE FROM kafka.messages
+                 WHERE topic_id = $1 AND partition_id = $2 AND partition_offset < $3",
+                None,
+                &[topic_id.into(), partition_id.into(), before_offset.into()],
+            )?;
+
+            // Persist the advanced log start so it survives an emptied partition.
+            // Without this, get_earliest_offset would fall back to
+            // COALESCE(MIN(partition_offset), 0) = 0 once every row is deleted,
+            // regressing the reported log start (ListOffsets EARLIEST / Fetch
+            // log_start_offset) to offsets that were explicitly truncated. The
+            // per-partition counter row already exists (created on produce);
+            // GREATEST keeps log_start monotonic. next_offset is untouched here,
+            // so producer monotonicity (GREATEST(next_offset, MAX+1), BUG-3)
+            // is preserved.
+            client.update(
+                "INSERT INTO kafka.partition_offsets (topic_id, partition_id, next_offset, log_start_offset)
+                 VALUES ($1, $2, $3, $3)
+                 ON CONFLICT (topic_id, partition_id) DO UPDATE SET
+                     log_start_offset = GREATEST(kafka.partition_offsets.log_start_offset, EXCLUDED.log_start_offset)",
+                None,
+                &[topic_id.into(), partition_id.into(), before_offset.into()],
+            )?;
+
+            // New log start offset = the persisted log start, or the earliest
+            // remaining row if it sits above it (a contiguous log reports MIN,
+            // which equals the truncation point). Matches Kafka's DeleteRecords
+            // semantics.
+            let table = client.select(
+                "SELECT GREATEST(
+                            po.log_start_offset,
+                            COALESCE((SELECT MIN(m.partition_offset)
+                                      FROM kafka.messages m
+                                      WHERE m.topic_id = po.topic_id AND m.partition_id = po.partition_id),
+                                     po.log_start_offset)
+                        ) AS low_watermark
+                 FROM kafka.partition_offsets po
+                 WHERE po.topic_id = $1 AND po.partition_id = $2",
+                None,
+                &[topic_id.into(), partition_id.into()],
+            )?;
+            let low_watermark: i64 = table
+                .first()
+                .get_by_name("low_watermark")?
+                .unwrap_or(before_offset);
+            Ok(low_watermark)
+        })
+        .map_err(|e: KafkaError| {
+            KafkaError::Internal(format!("delete_records_before failed: {}", e))
         })
     }
 }

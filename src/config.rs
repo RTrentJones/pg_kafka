@@ -97,6 +97,11 @@ pub struct Config {
     /// License key for Shadow Mode production use (Commercial License)
     /// Format: "sponsor_id:token" or "eval" for evaluation
     pub shadow_license_key: String,
+    /// TEST ONLY (issue #93): delay (ms) the shadow forwarder holds a
+    /// ForwardAck after delivery before returning it to the DB thread. Lets
+    /// the E2E suite make a forward's ack deterministically slower than the
+    /// outbox retry lease. 0 (default) disables it.
+    pub test_forward_ack_delay_ms: i32,
 }
 
 /// Custom Debug implementation that redacts sensitive credentials
@@ -129,6 +134,7 @@ impl std::fmt::Debug for Config {
             .field("shadow_metrics_enabled", &self.shadow_metrics_enabled)
             .field("shadow_otel_endpoint", &self.shadow_otel_endpoint)
             .field("shadow_license_key", &"[REDACTED]")
+            .field("test_forward_ack_delay_ms", &self.test_forward_ack_delay_ms)
             .finish()
     }
 }
@@ -213,6 +219,7 @@ impl Config {
                 .as_deref()
                 .map(|c| c.to_string_lossy().into_owned())
                 .unwrap_or_default(),
+            test_forward_ack_delay_ms: TEST_FORWARD_ACK_DELAY_MS.get(),
         }
     }
 
@@ -247,6 +254,7 @@ impl Config {
             shadow_otel_endpoint: DEFAULT_SHADOW_OTEL_ENDPOINT.to_string(),
             // Tests run in eval mode by default (Commercial License)
             shadow_license_key: "eval".to_string(),
+            test_forward_ack_delay_ms: 0,
         }
     }
 }
@@ -304,6 +312,19 @@ pub static CONFIG_RELOAD_INTERVAL_MS: GucSetting<i32> =
 // behaviour). Auxiliary-table pruning (stale producers, terminal transactions,
 // delivered shadow-outbox rows) always runs; see storage::postgres retention consts.
 pub static MESSAGE_RETENTION_HOURS: GucSetting<i32> = GucSetting::<i32>::new(0);
+// Issue #93: test-only fault injection for the shadow outbox in-flight gate.
+// When > 0, the shadow forwarder (network thread) holds each ForwardAck this
+// many ms after delivery before returning it to the DB thread, making the ack
+// deterministically slower than the outbox retry lease so the E2E suite can
+// prove a late ack no longer causes a duplicate delivery. Read via the
+// RuntimeContext config snapshot (reloaded on SIGHUP). Never set in production.
+static TEST_FORWARD_ACK_DELAY_MS: GucSetting<i32> = GucSetting::<i32>::new(0);
+// RB-1: test-only fault injection for the response-after-commit barrier. When > 0,
+// the worker sleeps this many ms inside the transaction after a Produce handler
+// runs and before commit, widening the response-send→commit window so the E2E
+// suite can prove deterministically that an acked produce is already committed.
+// Never set this in production — it stalls the single DB thread per produce.
+pub static TEST_PRE_COMMIT_DELAY_MS: GucSetting<i32> = GucSetting::<i32>::new(0);
 
 /// Initialize GUC parameters
 pub fn init() {
@@ -391,6 +412,34 @@ pub fn init() {
         &MESSAGE_RETENTION_HOURS,
         0,
         87_600, // 10 years
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"pg_kafka.test_forward_ack_delay_ms",
+        c"TEST ONLY: delay (ms) before the shadow forwarder returns each ForwardAck",
+        c"Fault-injection knob for the shadow outbox in-flight gate E2E test \
+          (issue #93): the network-thread forwarder sleeps this long after a \
+          delivery before acking it to the DB thread. 0 (default) disables it. \
+          Do not set in production. Reloadable via SIGHUP.",
+        &TEST_FORWARD_ACK_DELAY_MS,
+        0,
+        30_000,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"pg_kafka.test_pre_commit_delay_ms",
+        c"TEST ONLY: delay (ms) between a Produce handler and its commit",
+        c"Fault-injection knob for the response-after-commit barrier E2E test: \
+          sleeps on the DB thread inside the transaction after a Produce handler \
+          runs, before commit. 0 (default) disables it. Do not set in production. \
+          Reloadable via SIGHUP.",
+        &TEST_PRE_COMMIT_DELAY_MS,
+        0,
+        10_000,
         GucContext::Sighup,
         GucFlags::default(),
     );

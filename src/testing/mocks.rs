@@ -155,6 +155,10 @@ mock! {
         fn get_last_stable_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64>;
         fn abort_timed_out_transactions(&self, timeout: Duration) -> Result<Vec<String>>;
         fn cleanup_aborted_messages(&self, older_than: Duration) -> Result<u64>;
+        // Topic config + log management (DescribeConfigs 32 / IncrementalAlterConfigs 44 / DeleteRecords 21)
+        fn get_topic_retention_ms(&self, topic_id: i32) -> Result<Option<i64>>;
+        fn set_topic_retention_ms(&self, topic_id: i32, retention_ms: Option<i64>) -> Result<()>;
+        fn delete_records_before(&self, topic_id: i32, partition_id: i32, before_offset: i64) -> Result<i64>;
     }
 }
 
@@ -201,6 +205,7 @@ pub fn mock_config() -> crate::config::Config {
         shadow_otel_endpoint: DEFAULT_SHADOW_OTEL_ENDPOINT.to_string(),
         // Tests run in eval mode by default (Commercial License)
         shadow_license_key: "eval".to_string(),
+        test_forward_ack_delay_ms: 0,
     }
 }
 

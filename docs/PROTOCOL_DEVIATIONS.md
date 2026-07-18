@@ -4,7 +4,7 @@ This document lists intentional deviations from the official Kafka protocol spec
 
 ## Summary
 
-`pg_kafka` implements a **subset** of the Kafka wire protocol (46% API coverage). The following deviations are intentional design decisions that optimize for PostgreSQL's strengths while maintaining compatibility with standard Kafka clients.
+`pg_kafka` implements a **subset** of the Kafka wire protocol (52% API coverage). The following deviations are intentional design decisions that optimize for PostgreSQL's strengths while maintaining compatibility with standard Kafka clients.
 
 | Category | Status |
 |----------|--------|
@@ -325,6 +325,43 @@ impl KafkaError {
 
 > Transaction APIs (InitProducerId 22, AddPartitionsToTxn 24, AddOffsetsToTxn 25, EndTxn 26, TxnOffsetCommit 28) and the core Admin APIs (CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups) **are** implemented — see the Summary above and `KAFKA_PROTOCOL_COVERAGE.md`.
 
+## Acknowledgment Durability (RB-1)
+
+**Status:** Kafka-conformant as of the response-after-commit barrier.
+
+For `acks >= 1`, a produce (or offset-commit/admin) response is delivered to
+the client **only after the backing PostgreSQL transaction has committed** —
+the ack implies the write is durable (WAL-flushed) and visible to any other
+PostgreSQL connection. Historically the response was sent from inside the
+open transaction, leaving a microsecond-scale window where an acked write
+could be lost on a crash; that window no longer exists. (`acks=0` remains
+fire-and-forget with no response frame and no durability claim — see §1.)
+
+## Shadow Forwarding Delivery Semantics (Issue #93)
+
+**Status:** At-least-once on decoupled paths, by design.
+
+Shadow forwarding to an external Kafka cluster uses a durable outbox
+(`kafka.shadow_tracking`) drained by a poll loop:
+
+- **Sync mode** (`forward_sync_bounded`): effectively exactly-once at the
+  external broker in normal operation — the produce waits (bounded) for the
+  external ack.
+- **Async / forward-on-commit modes:** **at-least-once**. A row whose forward
+  ack is lost (worker crash between delivery and finalization, dropped ack on
+  a full channel) is re-forwarded after its retry lease expires, so the
+  external topic can receive duplicates in failure windows. This is the
+  standard Kafka mirroring guarantee; consumers of the external topic that
+  need exactly-once semantics must deduplicate (e.g. by key + producer
+  metadata).
+- **In-flight gating:** a row whose forward is merely *slow* (ack pending) is
+  no longer re-claimed at lease expiry — the DB thread tracks dispatched
+  forwards and the outbox claim skips them until the ack resolves or the
+  entry ages out (`INFLIGHT_EVICT_AFTER`, sized above rdkafka's
+  `message.timeout.ms`). Duplicates therefore occur only on genuine ack
+  *loss*, not ack *latency*. Local storage and `kafka.shadow_tracking`
+  finalization remain exactly-once in all modes.
+
 ## Network Security Posture (SEC-7)
 
 **Status:** Accepted by design, with a startup warning.
@@ -388,5 +425,5 @@ auto.offset.reset=earliest
 
 **Last Updated:** 2026-06-29
 **Applies To:** pg_kafka Phase 11 Complete (Shadow Mode)
-**API Coverage:** 23 of ~50 Kafka APIs (46%)
+**API Coverage:** 26 of ~50 Kafka APIs (52%)
 **Test Status:** 686 unit + 10 property + 195 E2E tests (CI-gated; counts drift — CI is the source of truth)

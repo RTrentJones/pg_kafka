@@ -24,6 +24,7 @@ pub mod dialup;
 pub mod error_handling;
 pub mod external_client;
 pub mod helpers;
+pub mod no_duplicates;
 pub mod percentage_routing;
 pub mod replay;
 pub mod topic_mapping;
@@ -34,6 +35,8 @@ pub use basic_forwarding::{
     test_dual_write_async, test_dual_write_sync, test_external_only_mode, test_local_only_mode,
     test_outbox_row_written_and_finalized, test_reload_clears_deleted_topic_config,
 };
+pub use no_duplicates::test_async_forwarding_no_duplicates_on_slow_ack;
+
 pub use dialup::{
     test_dialup_0_percent, test_dialup_100_percent, test_dialup_10_percent, test_dialup_25_percent,
     test_dialup_50_percent, test_dialup_75_percent,

@@ -20,6 +20,7 @@
 // - transaction: Transaction handlers (Phase 10)
 
 mod admin;
+mod configs;
 mod consumer;
 mod coordinator;
 mod fetch;
@@ -35,6 +36,9 @@ mod tests;
 // Re-export all handlers
 pub use admin::{
     handle_create_partitions, handle_create_topics, handle_delete_groups, handle_delete_topics,
+};
+pub use configs::{
+    handle_delete_records, handle_describe_configs, handle_incremental_alter_configs,
 };
 pub use consumer::{handle_offset_commit, handle_offset_fetch};
 pub use coordinator::{

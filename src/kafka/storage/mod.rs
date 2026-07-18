@@ -678,6 +678,42 @@ pub trait KafkaStore {
     /// # Returns
     /// Number of messages deleted
     fn cleanup_aborted_messages(&self, older_than: Duration) -> Result<u64>;
+
+    /// Get a topic's per-topic `retention.ms` override (API 32/44 support).
+    ///
+    /// # Returns
+    /// `None` when the topic inherits the global
+    /// `pg_kafka.message_retention_hours`; `Some(ms)` when an override is set
+    /// (`ms < 0` = infinite retention for this topic).
+    fn get_topic_retention_ms(&self, topic_id: i32) -> Result<Option<i64>>;
+
+    /// Set or clear a topic's `retention.ms` override (IncrementalAlterConfigs).
+    ///
+    /// # Arguments
+    /// * `retention_ms` - `Some(ms)` to set (negative = infinite), `None` to
+    ///   clear the override and fall back to the global GUC
+    fn set_topic_retention_ms(&self, topic_id: i32, retention_ms: Option<i64>) -> Result<()>;
+
+    /// Delete records below `before_offset` in a partition (DeleteRecords, API 21).
+    ///
+    /// Rows with `partition_offset < before_offset` are removed (pending
+    /// transactional rows included — the caller has explicitly asked for
+    /// truncation, matching Kafka semantics where DeleteRecords advances the
+    /// log start offset unconditionally).
+    ///
+    /// # Arguments
+    /// * `before_offset` - Exclusive upper bound; caller must already have
+    ///   clamped/validated it against the high watermark
+    ///
+    /// # Returns
+    /// The partition's new log start offset (earliest remaining offset, or the
+    /// high watermark when the partition is now empty)
+    fn delete_records_before(
+        &self,
+        topic_id: i32,
+        partition_id: i32,
+        before_offset: i64,
+    ) -> Result<i64>;
 }
 
 /// Outcome of validating a producer batch's sequence range against the last

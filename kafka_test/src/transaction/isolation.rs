@@ -337,11 +337,26 @@ pub async fn test_read_committed_after_commit() -> TestResult {
     producer.commit_transaction(Duration::from_secs(10))?;
     println!("  Transaction committed\n");
 
-    // Brief delay to ensure commit is visible to new queries
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
     // Create a fresh database connection to ensure we see committed data
     let client2 = create_db_client().await?;
+
+    // Poll until the row's txn_state clears to NULL (RB-1: visible on the
+    // commit ack; bounded wait replaces a fixed sleep).
+    let _ = crate::fixtures::wait_for(
+        Duration::from_secs(5),
+        Duration::from_millis(50),
+        || async {
+            client2
+                .query_one(
+                    "SELECT txn_state IS NULL FROM kafka.messages WHERE topic_id = $1 AND partition_offset = $2",
+                    &[&topic_id, &offset],
+                )
+                .await
+                .map(|row| row.get::<_, bool>(0))
+                .unwrap_or(false)
+        },
+    )
+    .await;
 
     // Verify message is now visible
     let msg_row_after = client2

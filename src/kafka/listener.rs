@@ -55,6 +55,15 @@ use super::shadow::{ForwardAck, ForwardRequest, ShadowConfig, ShadowProducer};
 /// allowed.
 const FRAME_RESERVE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 
+/// Max concurrent long-poll fetch tasks per connection (RV-10 follow-up).
+/// Each long-poll fetch spawns a detached task; without a cap, a client
+/// pipelining fetches could hold MAX_CONNECTIONS × unbounded tasks. Fetches
+/// over the cap are served by the immediate (non-waiting) path — a valid,
+/// possibly-empty response — so the degradation is latency, never an error.
+/// 64 comfortably covers real consumers (rdkafka holds ~1 in-flight fetch per
+/// partition batch) while bounding a hostile pipeliner.
+const MAX_LONG_POLLS_PER_CONNECTION: usize = 64;
+
 static FRAME_RESERVE_REMAINING: AtomicUsize = AtomicUsize::new(FRAME_RESERVE_BUDGET_BYTES);
 
 /// Try to charge `n` bytes to `budget`. Returns false if it lacks `n` bytes, in
@@ -270,6 +279,14 @@ async fn run_shadow_forwarder(
                     local_offset: req.local_offset,
                     result: ack_result,
                 };
+                // Issue #93 test hook: hold the ack so it arrives later than
+                // the outbox retry lease, letting the E2E suite prove the
+                // in-flight gate prevents duplicate re-dispatch. 0 in
+                // production (async sleep; only this forwarder task waits).
+                let ack_delay_ms = config.test_forward_ack_delay_ms;
+                if ack_delay_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(ack_delay_ms as u64)).await;
+                }
                 // RA-6: non-blocking send. A blocking `send` here could park this
                 // tokio worker if the ack channel were full (the SEC-4
                 // anti-pattern). On full/closed, drop the ack — the row stays
@@ -560,6 +577,13 @@ async fn handle_connection(
     type ResponseSlot = tokio::sync::mpsc::UnboundedReceiver<KafkaResponse>;
     let (order_tx, mut order_rx) = tokio::sync::mpsc::unbounded_channel::<ResponseSlot>();
 
+    // RV-10 follow-up: each long-poll fetch spawns a detached task, previously
+    // bounded only by MAX_CONNECTIONS × the client's pipelining rate. Cap the
+    // concurrent long-poll tasks per connection; a fetch over the cap degrades
+    // gracefully to the immediate (non-waiting) fetch path — a valid Kafka
+    // response (possibly empty), never an error or a dropped request.
+    let long_poll_permits = Arc::new(tokio::sync::Semaphore::new(MAX_LONG_POLLS_PER_CONNECTION));
+
     // Spawn the Writer Task
     // This task sits and waits for responses from the DB.
     // It runs completely independently of the reader.
@@ -625,7 +649,24 @@ async fn handle_connection(
                         KafkaRequest::Fetch { max_wait_ms, .. } if *max_wait_ms > 0
                     );
 
-                if should_long_poll {
+                // Acquire a long-poll slot; at the cap the fetch falls through
+                // to the immediate path below instead of spawning a task.
+                let long_poll_permit = if should_long_poll {
+                    match long_poll_permits.clone().try_acquire_owned() {
+                        Ok(permit) => Some(permit),
+                        Err(_) => {
+                            debug!(
+                                "Per-connection long-poll cap ({}) reached; serving fetch immediately",
+                                MAX_LONG_POLLS_PER_CONNECTION
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(permit) = long_poll_permit {
                     // Destructure for long polling - we know it's a Fetch with max_wait_ms > 0
                     if let KafkaRequest::Fetch {
                         correlation_id,
@@ -649,6 +690,8 @@ async fn handle_connection(
                         let poll_interval = poll_interval_ms;
 
                         tokio::spawn(async move {
+                            // Hold the per-connection slot for the task's lifetime.
+                            let _long_poll_slot = permit;
                             if let Err(e) = handle_fetch_long_poll(
                                 correlation_id,
                                 client_id,

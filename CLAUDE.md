@@ -45,7 +45,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Shadow mode for forwarding to external Kafka with SASL/SSL, per-topic config, replay support
 - Automated E2E tests with real Kafka client (rdkafka)
 
-**API Coverage:** 23 of ~50 standard Kafka APIs (46%)
+**API Coverage:** 26 of ~50 standard Kafka APIs (52%)
 **Test Status:** 686 unit + 10 property + 195 E2E ≈ 890 total ✅ (CI is the source of truth; counts drift)
 **Coverage Target:** 80%+ (testable code)
 

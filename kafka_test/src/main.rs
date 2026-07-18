@@ -55,6 +55,8 @@ use kafka_test::{
     test_add_partitions_to_txn_idempotent,
     // Protocol compliance tests (Phase 4)
     test_api_versions_negotiation,
+    // Shadow outbox duplicate-delivery guard (issue #93)
+    test_async_forwarding_no_duplicates_on_slow_ack,
     // Edge case tests
     test_batch_1000_messages,
     // Producer tests
@@ -115,8 +117,10 @@ use kafka_test::{
     test_delete_group_empty,
     test_delete_group_idempotent,
     test_delete_group_non_empty,
+    test_delete_records_truncates_partition,
     test_delete_topic,
     test_delete_topic_not_found,
+    test_describe_configs_reports_topic_configs,
     test_deterministic_routing,
     test_dialup_0_percent,
     test_dialup_100_percent,
@@ -165,6 +169,7 @@ use kafka_test::{
     test_idempotent_producer_basic,
     test_idempotent_producer_epoch_bump,
     test_idempotent_producer_restart,
+    test_incremental_alter_configs_retention_roundtrip,
     test_invalid_group_id,
     // Partition tests
     test_key_distribution,
@@ -188,6 +193,7 @@ use kafka_test::{
     test_long_poll_min_bytes_threshold,
     test_long_poll_multiple_consumers_same_partition,
     test_long_poll_multiple_waiters,
+    test_long_poll_per_connection_task_cap,
     test_long_poll_producer_wakeup,
     test_long_poll_timeout,
     test_long_poll_timeout_precision,
@@ -213,6 +219,8 @@ use kafka_test::{
     test_partition_assignment_race,
     test_partition_assignment_strategies,
     test_partition_zero,
+    test_per_topic_retention_override_enforced_by_sweep,
+    test_produce_ack_implies_committed_visibility,
     test_produce_any_partition,
     test_produce_consume_race,
     test_produce_empty_batch,
@@ -417,6 +425,30 @@ fn get_all_tests() -> Vec<TestDef> {
         },
         TestDef {
             category: "admin",
+            name: "test_describe_configs_reports_topic_configs",
+            test_fn: wrap_test!(test_describe_configs_reports_topic_configs),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "admin",
+            name: "test_incremental_alter_configs_retention_roundtrip",
+            test_fn: wrap_test!(test_incremental_alter_configs_retention_roundtrip),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "admin",
+            name: "test_delete_records_truncates_partition",
+            test_fn: wrap_test!(test_delete_records_truncates_partition),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "admin",
+            name: "test_per_topic_retention_override_enforced_by_sweep",
+            test_fn: wrap_test!(test_per_topic_retention_override_enforced_by_sweep),
+            parallel_safe: false, // Runs the global retention sweep
+        },
+        TestDef {
+            category: "admin",
             name: "test_create_multiple_topics",
             test_fn: wrap_test!(test_create_multiple_topics),
             parallel_safe: true,
@@ -470,6 +502,12 @@ fn get_all_tests() -> Vec<TestDef> {
             name: "test_producer_acks_zero",
             test_fn: wrap_test!(test_producer_acks_zero),
             parallel_safe: true,
+        },
+        TestDef {
+            category: "producer",
+            name: "test_produce_ack_implies_committed_visibility",
+            test_fn: wrap_test!(test_produce_ack_implies_committed_visibility),
+            parallel_safe: false, // Mutates global GUC (test_pre_commit_delay_ms)
         },
         TestDef {
             category: "producer",
@@ -1080,6 +1118,12 @@ fn get_all_tests() -> Vec<TestDef> {
         },
         TestDef {
             category: "long_poll",
+            name: "test_long_poll_per_connection_task_cap",
+            test_fn: wrap_test!(test_long_poll_per_connection_task_cap),
+            parallel_safe: false, // Floods one connection; sensitive to concurrent produce wakeups
+        },
+        TestDef {
+            category: "long_poll",
             name: "test_long_poll_timeout",
             test_fn: wrap_test!(test_long_poll_timeout),
             parallel_safe: true,
@@ -1368,6 +1412,12 @@ fn get_all_tests() -> Vec<TestDef> {
             name: "test_dual_write_async",
             test_fn: wrap_test!(test_dual_write_async),
             parallel_safe: false,
+        },
+        TestDef {
+            category: "shadow",
+            name: "test_async_forwarding_no_duplicates_on_slow_ack",
+            test_fn: wrap_test!(test_async_forwarding_no_duplicates_on_slow_ack),
+            parallel_safe: false, // Mutates global GUC (test_forward_ack_delay_ms)
         },
         TestDef {
             category: "shadow",

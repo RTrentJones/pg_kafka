@@ -310,6 +310,42 @@ pub fn encode_response(response: KafkaResponse) -> Result<BytesMut> {
             body
         ),
 
+        KafkaResponse::DeleteRecords {
+            correlation_id,
+            api_version,
+            response: body,
+        } => encode_standard_response!(
+            &mut response_buf,
+            correlation_id,
+            api_version,
+            crate::kafka::constants::API_KEY_DELETE_RECORDS,
+            body
+        ),
+
+        KafkaResponse::DescribeConfigs {
+            correlation_id,
+            api_version,
+            response: body,
+        } => encode_standard_response!(
+            &mut response_buf,
+            correlation_id,
+            api_version,
+            crate::kafka::constants::API_KEY_DESCRIBE_CONFIGS,
+            body
+        ),
+
+        KafkaResponse::IncrementalAlterConfigs {
+            correlation_id,
+            api_version,
+            response: body,
+        } => encode_standard_response!(
+            &mut response_buf,
+            correlation_id,
+            api_version,
+            crate::kafka::constants::API_KEY_INCREMENTAL_ALTER_CONFIGS,
+            body
+        ),
+
         KafkaResponse::Error {
             correlation_id,
             error_code,
@@ -823,5 +859,40 @@ mod tests {
             let encoded = encode_response(response).unwrap();
             assert!(!encoded.is_empty(), "Failed to encode Fetch v{}", version);
         }
+    }
+
+    // ========== Config/Log-management Response Tests (API 21/32/44) ==========
+
+    #[test]
+    fn test_encode_delete_records_response() {
+        let response = KafkaResponse::DeleteRecords {
+            correlation_id: 21,
+            api_version: 1,
+            response: delete_records_response::DeleteRecordsResponse::default(),
+        };
+        assert!(!encode_response(response).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_encode_describe_configs_response() {
+        // v4 is flexible (header v1); exercise both the encode arm and the
+        // flexible-header path.
+        let response = KafkaResponse::DescribeConfigs {
+            correlation_id: 32,
+            api_version: 4,
+            response: describe_configs_response::DescribeConfigsResponse::default(),
+        };
+        assert!(!encode_response(response).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_encode_incremental_alter_configs_response() {
+        let response = KafkaResponse::IncrementalAlterConfigs {
+            correlation_id: 44,
+            api_version: 1,
+            response: incremental_alter_configs_response::IncrementalAlterConfigsResponse::default(
+            ),
+        };
+        assert!(!encode_response(response).unwrap().is_empty());
     }
 }

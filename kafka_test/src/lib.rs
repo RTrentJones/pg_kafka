@@ -48,6 +48,7 @@ pub mod setup;
 pub mod admin;
 pub mod compression;
 pub mod concurrent;
+pub mod configs;
 pub mod consumer;
 pub mod consumer_group;
 pub mod edge_cases;
@@ -95,7 +96,8 @@ pub use partition::{
     test_special_character_key_routing,
 };
 pub use producer::{
-    test_batch_produce, test_producer, test_producer_acks_zero, test_producer_timestamp_roundtrip,
+    test_batch_produce, test_produce_ack_implies_committed_visibility, test_producer,
+    test_producer_acks_zero, test_producer_timestamp_roundtrip,
 };
 
 // Re-export new test functions
@@ -133,6 +135,13 @@ pub use performance::{
     test_produce_latency_percentiles, test_produce_throughput_baseline,
 };
 
+// Config/log-management API tests (DescribeConfigs 32, IncrementalAlterConfigs 44, DeleteRecords 21)
+pub use configs::{
+    test_delete_records_truncates_partition, test_describe_configs_reports_topic_configs,
+    test_incremental_alter_configs_retention_roundtrip,
+    test_per_topic_retention_override_enforced_by_sweep,
+};
+
 // Admin API tests
 pub use admin::{
     test_create_multiple_topics, test_create_partitions, test_create_partitions_cannot_decrease,
@@ -148,7 +157,8 @@ pub use long_poll::{
     test_long_poll_auto_commit_interval, test_long_poll_consumer_disconnect,
     test_long_poll_immediate_return, test_long_poll_min_bytes_threshold,
     test_long_poll_multiple_consumers_same_partition, test_long_poll_multiple_waiters,
-    test_long_poll_producer_wakeup, test_long_poll_timeout, test_long_poll_timeout_precision,
+    test_long_poll_per_connection_task_cap, test_long_poll_producer_wakeup, test_long_poll_timeout,
+    test_long_poll_timeout_precision,
 };
 
 // Compression tests (Phase 8)
@@ -186,6 +196,8 @@ pub use transaction::{
 pub use shadow::{
     // Transaction integration
     test_aborted_transaction_not_forwarded,
+    // Outbox duplicate-delivery guard (issue #93)
+    test_async_forwarding_no_duplicates_on_slow_ack,
     test_committed_transaction_forwarded,
     test_committed_transaction_uses_durable_outbox,
     test_committed_txn_leaves_no_orphan_outbox_rows,
