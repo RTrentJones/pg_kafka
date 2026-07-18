@@ -452,6 +452,40 @@ pub async fn test_per_topic_retention_override_enforced_by_sweep() -> TestResult
     );
     println!("✅ Override enforced; inheriting topic untouched\n");
 
+    // The sweep must advance the durable log start of the emptied partition to
+    // the HWM (next_offset = 1 after one produce), so EARLIEST does not regress
+    // to 0 (Codex review, PR #95). The untouched sibling keeps log_start = 0.
+    println!("Step 4: Emptied partition's log start must advance to the HWM (1)...");
+    let swept_log_start: i64 = ctx
+        .db()
+        .query_one(
+            "SELECT po.log_start_offset FROM kafka.partition_offsets po
+             JOIN kafka.topics t ON po.topic_id = t.id
+             WHERE t.name = $1 AND po.partition_id = 0",
+            &[&topic_with],
+        )
+        .await?
+        .get(0);
+    assert_eq!(
+        swept_log_start, 1,
+        "retention-emptied partition must advance log_start to the HWM, not leave it at 0"
+    );
+    let untouched_log_start: i64 = ctx
+        .db()
+        .query_one(
+            "SELECT po.log_start_offset FROM kafka.partition_offsets po
+             JOIN kafka.topics t ON po.topic_id = t.id
+             WHERE t.name = $1 AND po.partition_id = 0",
+            &[&topic_without],
+        )
+        .await?
+        .get(0);
+    assert_eq!(
+        untouched_log_start, 0,
+        "partition the sweep did not touch must keep log_start = 0"
+    );
+    println!("✅ Log start advanced on the swept partition; sibling unchanged\n");
+
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");
     Ok(())

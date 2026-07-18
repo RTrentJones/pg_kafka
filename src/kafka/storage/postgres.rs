@@ -209,11 +209,14 @@ impl PostgresStore {
     /// `aborted_grace` is the ABORTED_MESSAGE_GRACE window (parameterized so the
     /// on-demand SQL function can shrink it for testing).
     ///
-    /// Offset-monotonicity safety: deletes never touch `kafka.partition_offsets`, and
-    /// every offset producer/read path takes `GREATEST(next_offset, MAX+1)` (BUG-3),
-    /// so removing rows — oldest or newest — cannot cause offset reuse or HWM/LSO
-    /// regression. Consumers positioned before a retention cutoff get a standard
-    /// Kafka out-of-range reset, exactly as with a real broker's retention.
+    /// Offset-monotonicity safety: the message delete never touches
+    /// `kafka.partition_offsets.next_offset`, and every offset producer/read path
+    /// takes `GREATEST(next_offset, MAX+1)` (BUG-3), so removing rows — oldest or
+    /// newest — cannot cause offset reuse or HWM regression. It *does* advance
+    /// `log_start_offset` for emptied partitions (only ever forward, GREATEST) so
+    /// the reported earliest offset tracks retention instead of regressing to 0.
+    /// Consumers positioned before a retention cutoff get a standard Kafka
+    /// out-of-range reset, exactly as with a real broker's retention.
     pub fn run_retention_sweep(
         &self,
         message_retention_hours: i32,
@@ -245,14 +248,49 @@ impl PostgresStore {
                        )
                      LIMIT $2
                  )
-                 RETURNING 1",
+                 RETURNING topic_id, partition_id",
                 None,
                 &[
                     (message_retention_hours as i64).into(),
                     RETENTION_DELETE_BATCH.into(),
                 ],
             )?;
-            stats.expired_messages = table.len() as u64;
+            // Collect the distinct partitions this batch touched so we can
+            // advance their durable log start (Codex review, PR #95): like
+            // DeleteRecords, retention deletion must advance
+            // partition_offsets.log_start_offset — otherwise a partition emptied
+            // by retention reports EARLIEST=0 via get_earliest_offset and a
+            // consumer resets to offsets retention already removed. Offsets are
+            // assigned monotonically with created_at, so retention deletes an
+            // offset-contiguous prefix; the new log start is the oldest
+            // surviving offset, or next_offset (the HWM) when the partition is
+            // now empty.
+            let mut affected: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
+            let mut expired = 0u64;
+            for row in table {
+                expired += 1;
+                let tid: i32 = row.get_by_name("topic_id")?.unwrap_or(0);
+                let pid: i32 = row.get_by_name("partition_id")?.unwrap_or(0);
+                affected.insert((tid, pid));
+            }
+            stats.expired_messages = expired;
+
+            if !affected.is_empty() {
+                let (topic_ids, partition_ids): (Vec<i32>, Vec<i32>) =
+                    affected.into_iter().unzip();
+                client.update(
+                    "UPDATE kafka.partition_offsets po
+                     SET log_start_offset = GREATEST(
+                             po.log_start_offset,
+                             COALESCE((SELECT MIN(m.partition_offset) FROM kafka.messages m
+                                       WHERE m.topic_id = po.topic_id AND m.partition_id = po.partition_id),
+                                      po.next_offset))
+                     FROM unnest($1::int4[], $2::int4[]) AS a(topic_id, partition_id)
+                     WHERE po.topic_id = a.topic_id AND po.partition_id = a.partition_id",
+                    None,
+                    &[topic_ids.into(), partition_ids.into()],
+                )?;
+            }
 
             // Terminal transactions first (their FK on producer_ids would otherwise
             // block the producer prune below). Only rows idle past the window: a

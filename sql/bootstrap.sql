@@ -25,6 +25,12 @@ CREATE TABLE kafka.topics (
     retention_ms BIGINT,
     created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
+-- Idempotent guard for the additive column above. pg_kafka follows a
+-- fresh-install (CREATE EXTENSION) schema convention with no upgrade scripts,
+-- so this is not auto-run on an in-place upgrade; it makes re-applying this
+-- file a no-op and gives operators an explicit, copy-pasteable manual upgrade
+-- path (run this one statement) instead of a runtime "column does not exist".
+ALTER TABLE kafka.topics ADD COLUMN IF NOT EXISTS retention_ms BIGINT;
 
 -- Messages table: The actual message log with dual-offset design
 CREATE TABLE kafka.messages (
@@ -89,6 +95,10 @@ CREATE TABLE IF NOT EXISTS kafka.partition_offsets (
     PRIMARY KEY (topic_id, partition_id),
     FOREIGN KEY (topic_id) REFERENCES kafka.topics(id) ON DELETE CASCADE
 );
+-- Idempotent guard for the additive log_start_offset column (see the note on
+-- kafka.topics above). Manual in-place upgrade path for existing installs.
+ALTER TABLE kafka.partition_offsets
+    ADD COLUMN IF NOT EXISTS log_start_offset BIGINT NOT NULL DEFAULT 0;
 
 -- Consumer offsets table: Track committed offsets per consumer group
 -- Phase 3: Consumer support
