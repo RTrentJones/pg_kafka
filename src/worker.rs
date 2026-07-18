@@ -1893,6 +1893,92 @@ pub fn process_request(
                 },
             );
         }
+
+        // ===== DeleteRecords (API 21) =====
+        crate::kafka::KafkaRequest::DeleteRecords {
+            correlation_id,
+            api_version,
+            topics,
+            response_tx,
+            ..
+        } => {
+            dispatch_response(
+                "DeleteRecords",
+                response_tx,
+                || handlers::handle_delete_records(&ctx, topics),
+                |r| KafkaResponse::DeleteRecords {
+                    correlation_id,
+                    api_version,
+                    response: r,
+                },
+                |error_code| KafkaResponse::DeleteRecords {
+                    correlation_id,
+                    api_version,
+                    response: crate::kafka::response_builders::build_delete_records_error_response(
+                        error_code,
+                    ),
+                },
+            );
+        }
+
+        // ===== DescribeConfigs (API 32) =====
+        crate::kafka::KafkaRequest::DescribeConfigs {
+            correlation_id,
+            api_version,
+            resources,
+            response_tx,
+            ..
+        } => {
+            let global_retention_hours = crate::config::MESSAGE_RETENTION_HOURS.get();
+            dispatch_response(
+                "DescribeConfigs",
+                response_tx,
+                || handlers::handle_describe_configs(&ctx, resources, global_retention_hours),
+                |r| KafkaResponse::DescribeConfigs {
+                    correlation_id,
+                    api_version,
+                    response: r,
+                },
+                |error_code| KafkaResponse::DescribeConfigs {
+                    correlation_id,
+                    api_version,
+                    response:
+                        crate::kafka::response_builders::build_describe_configs_error_response(
+                            error_code,
+                        ),
+                },
+            );
+        }
+
+        // ===== IncrementalAlterConfigs (API 44) =====
+        crate::kafka::KafkaRequest::IncrementalAlterConfigs {
+            correlation_id,
+            api_version,
+            resources,
+            validate_only,
+            response_tx,
+            ..
+        } => {
+            dispatch_response(
+                "IncrementalAlterConfigs",
+                response_tx,
+                || handlers::handle_incremental_alter_configs(&ctx, resources, validate_only),
+                |r| KafkaResponse::IncrementalAlterConfigs {
+                    correlation_id,
+                    api_version,
+                    response: r,
+                },
+                |error_code| {
+                    KafkaResponse::IncrementalAlterConfigs {
+                    correlation_id,
+                    api_version,
+                    response: crate::kafka::response_builders::build_incremental_alter_configs_error_response(
+                        error_code,
+                    ),
+                }
+                },
+            );
+        }
     }
 }
 

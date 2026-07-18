@@ -1923,6 +1923,24 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
     fn cleanup_aborted_messages(&self, older_than: Duration) -> Result<u64> {
         self.inner.cleanup_aborted_messages(older_than)
     }
+
+    fn get_topic_retention_ms(&self, topic_id: i32) -> Result<Option<i64>> {
+        self.inner.get_topic_retention_ms(topic_id)
+    }
+
+    fn set_topic_retention_ms(&self, topic_id: i32, retention_ms: Option<i64>) -> Result<()> {
+        self.inner.set_topic_retention_ms(topic_id, retention_ms)
+    }
+
+    fn delete_records_before(
+        &self,
+        topic_id: i32,
+        partition_id: i32,
+        before_offset: i64,
+    ) -> Result<i64> {
+        self.inner
+            .delete_records_before(topic_id, partition_id, before_offset)
+    }
 }
 
 #[cfg(test)]

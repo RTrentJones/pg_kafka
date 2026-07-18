@@ -310,6 +310,42 @@ pub fn encode_response(response: KafkaResponse) -> Result<BytesMut> {
             body
         ),
 
+        KafkaResponse::DeleteRecords {
+            correlation_id,
+            api_version,
+            response: body,
+        } => encode_standard_response!(
+            &mut response_buf,
+            correlation_id,
+            api_version,
+            crate::kafka::constants::API_KEY_DELETE_RECORDS,
+            body
+        ),
+
+        KafkaResponse::DescribeConfigs {
+            correlation_id,
+            api_version,
+            response: body,
+        } => encode_standard_response!(
+            &mut response_buf,
+            correlation_id,
+            api_version,
+            crate::kafka::constants::API_KEY_DESCRIBE_CONFIGS,
+            body
+        ),
+
+        KafkaResponse::IncrementalAlterConfigs {
+            correlation_id,
+            api_version,
+            response: body,
+        } => encode_standard_response!(
+            &mut response_buf,
+            correlation_id,
+            api_version,
+            crate::kafka::constants::API_KEY_INCREMENTAL_ALTER_CONFIGS,
+            body
+        ),
+
         KafkaResponse::Error {
             correlation_id,
             error_code,

@@ -15,7 +15,7 @@ kcat -C -b localhost:9092 -t my-topic -p 0 -o beginning
 
 | Component | Status | Details |
 |-----------|--------|---------|
-| **Protocol Layer** | Production-ready | 23 Kafka APIs implemented (46% coverage) |
+| **Protocol Layer** | Production-ready | 26 Kafka APIs implemented (52% coverage) |
 | **Producer** | Production-ready | Idempotent + transactional support |
 | **Consumer** | Production-ready | Fetch, ListOffsets, automatic partition assignment |
 | **Consumer Groups** | Complete | Full coordinator with auto-rebalancing |

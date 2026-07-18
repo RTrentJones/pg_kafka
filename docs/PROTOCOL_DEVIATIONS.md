@@ -4,7 +4,7 @@ This document lists intentional deviations from the official Kafka protocol spec
 
 ## Summary
 
-`pg_kafka` implements a **subset** of the Kafka wire protocol (46% API coverage). The following deviations are intentional design decisions that optimize for PostgreSQL's strengths while maintaining compatibility with standard Kafka clients.
+`pg_kafka` implements a **subset** of the Kafka wire protocol (52% API coverage). The following deviations are intentional design decisions that optimize for PostgreSQL's strengths while maintaining compatibility with standard Kafka clients.
 
 | Category | Status |
 |----------|--------|
@@ -425,5 +425,5 @@ auto.offset.reset=earliest
 
 **Last Updated:** 2026-06-29
 **Applies To:** pg_kafka Phase 11 Complete (Shadow Mode)
-**API Coverage:** 23 of ~50 Kafka APIs (46%)
+**API Coverage:** 26 of ~50 Kafka APIs (52%)
 **Test Status:** 686 unit + 10 property + 195 E2E tests (CI-gated; counts drift — CI is the source of truth)

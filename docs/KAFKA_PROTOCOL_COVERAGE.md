@@ -10,7 +10,7 @@
 
 | Metric | Value |
 |--------|-------|
-| **API Coverage** | 23 of ~50 standard Kafka APIs (46%) |
+| **API Coverage** | 26 of ~50 standard Kafka APIs (52%) |
 | **Build Status** | ✅ Compiles with zero warnings |
 | **Test Suite** | 672 unit tests + 181 E2E tests |
 | **Architecture** | Repository Pattern with typed errors |
@@ -106,8 +106,8 @@
 
 **Source**: [Apache Kafka Protocol Guide](https://kafka.apache.org/protocol.html)
 **Total Standard Kafka APIs**: ~50
-**Implemented**: 23 (46%)
-**Unimplemented**: ~27 (54%)
+**Implemented**: 26 (52%)
+**Unimplemented**: ~24 (48%)
 
 This section analyzes all unimplemented APIs, their use cases, and priority for drop-in Kafka replacement.
 
@@ -164,20 +164,20 @@ This section analyzes all unimplemented APIs, their use cases, and priority for 
 
 ---
 
-### Configuration Management (4 APIs) - Priority: Medium
+### Configuration Management (2 remaining APIs) - Priority: Low
 
 | API | Key | Use Case | Drop-In Priority |
 |-----|-----|----------|------------------|
-| **DescribeConfigs** | 32 | Reads broker/topic/client configs (e.g., retention.ms, max.message.bytes) | Medium - Admin tools expect this |
+| ✅ **DescribeConfigs** | 32 | **IMPLEMENTED** — reports the configs pg_kafka honors (retention.ms with real source/value, cleanup.policy) for TOPIC resources | Done |
+| ✅ **IncrementalAlterConfigs** | 44 | **IMPLEMENTED** — SET/DELETE of `retention.ms` per topic (persisted to `kafka.topics.retention_ms`, enforced by the retention sweep); unsupported keys rejected with INVALID_CONFIG | Done |
 | **AlterConfigs** | 33 | Modifies configs (deprecated, replaced by IncrementalAlterConfigs) | Low - Deprecated API |
-| **IncrementalAlterConfigs** | 44 | Modifies specific config keys without replacing entire config | Medium - Admin tools use this |
 | **ListConfigResources** | 74 | Lists configurable resources | Low - Admin utility |
 
 **Use Case**: Dynamic configuration changes without broker restart. Admin tools like `kafka-configs.sh` use these.
 
-**pg_kafka Approach**: Could expose PostgreSQL GUCs via these APIs, or require SQL `ALTER SYSTEM` instead.
+**pg_kafka Approach**: Honest-minimal — describe/alter only the configs the engine actually enforces, reject the rest rather than silently accepting.
 
-**Client Impact**: Admin CLI tools (`kafka-configs.sh --describe-topic`) fail without DescribeConfigs. Producers/consumers don't care.
+**Client Impact**: `kafka-configs.sh --describe/--alter` for topic `retention.ms` works; other keys are explicitly rejected.
 
 ---
 
@@ -202,11 +202,11 @@ This section analyzes all unimplemented APIs, their use cases, and priority for 
 
 ---
 
-### Log Management (2 APIs) - Priority: Medium
+### Log Management (1 remaining API) - Priority: None
 
 | API | Key | Use Case | Drop-In Priority |
 |-----|-----|----------|------------------|
-| **DeleteRecords** | 21 | Deletes records before a given offset (manual log truncation) | Medium - GDPR compliance |
+| ✅ **DeleteRecords** | 21 | **IMPLEMENTED** — deletes records below a per-partition offset (`-1` = truncate to high watermark), reports the new low watermark; GDPR/compliance truncation | Done |
 | **OffsetForLeaderEpoch** | 23 | Resolves offset divergence after leader failover (truncation detection) | None - No replica failover |
 
 **Use Case**:
@@ -214,10 +214,10 @@ This section analyzes all unimplemented APIs, their use cases, and priority for 
 - OffsetForLeaderEpoch: Prevents consumers from reading divergent data after unclean leader election
 
 **pg_kafka Approach**:
-- DeleteRecords: Could implement using `DELETE FROM kafka.messages WHERE partition_offset < $1`
+- DeleteRecords: `DELETE FROM kafka.messages WHERE partition_offset < $1` behind the wire API, with OFFSET_OUT_OF_RANGE validation
 - OffsetForLeaderEpoch: Skip (only needed for replica divergence detection)
 
-**Client Impact**: Minimal. DeleteRecords is admin-only. OffsetForLeaderEpoch is automatic (clients don't manually call).
+**Client Impact**: DeleteRecords works via the wire protocol. OffsetForLeaderEpoch is automatic (clients don't manually call).
 
 ---
 
@@ -345,8 +345,8 @@ This section analyzes all unimplemented APIs, their use cases, and priority for 
 |----------|------|-----------|-------------------------------------|
 | **Critical** | ✅ InitProducerId (22) | **ALREADY IMPLEMENTED** - librdkafka defaults to idempotence | Clients fail or require `enable.idempotence=false` |
 | **High** | SaslHandshake (17), SaslAuthenticate (36) | Required for authenticated deployments | Clients configured with SASL fail to connect |
-| **Medium** | DescribeConfigs (32), IncrementalAlterConfigs (44) | Admin tools (`kafka-configs.sh`) expect these | Admin CLI tools fail, but producers/consumers work |
-| **Medium** | DeleteRecords (21) | GDPR compliance, log cleanup | Workaround: `DELETE FROM kafka.messages` in SQL |
+| **Medium** | ✅ DescribeConfigs (32), ✅ IncrementalAlterConfigs (44) | **ALREADY IMPLEMENTED** (retention.ms honest-minimal) | — |
+| **Medium** | ✅ DeleteRecords (21) | **ALREADY IMPLEMENTED** | — |
 | **Low** | OffsetDelete (47), DescribeCluster (60) | Admin utilities | Minor admin CLI failures |
 | **None** | All others (~25 APIs) | Cluster ops, KRaft, quotas, share groups, telemetry | No client impact - admin/internal only |
 
@@ -524,7 +524,7 @@ Consumer Flow (Current):
 ## Conclusion
 
 **Current State**: Comprehensive Kafka-compatible broker with 23 APIs implemented
-**Coverage**: 46% of standard Kafka protocol (full producer/consumer/coordinator/admin/transaction support)
+**Coverage**: 52% of standard Kafka protocol (full producer/consumer/coordinator/admin/transaction/config support)
 **Architecture**: Clean, maintainable, well-documented with Repository Pattern
 **Test Status**: ~890 tests passing (686 unit + 10 property + 195 E2E; CI is the source of truth) ✅
 

@@ -126,6 +126,21 @@ pub const API_KEY_END_TXN: i16 = 26;
 /// Used to commit offsets as part of a transaction
 pub const API_KEY_TXN_OFFSET_COMMIT: i16 = 28;
 
+/// API key for DeleteRecords requests
+///
+/// Used to delete records below an offset (GDPR/compliance truncation)
+pub const API_KEY_DELETE_RECORDS: i16 = 21;
+
+/// API key for DescribeConfigs requests
+///
+/// Used by admin tooling (kafka-configs.sh --describe) to read configs
+pub const API_KEY_DESCRIBE_CONFIGS: i16 = 32;
+
+/// API key for IncrementalAlterConfigs requests
+///
+/// Used by admin tooling to SET/DELETE individual configs (e.g. retention.ms)
+pub const API_KEY_INCREMENTAL_ALTER_CONFIGS: i16 = 44;
+
 // ===== Configuration Defaults =====
 
 /// Default Kafka protocol port
@@ -254,6 +269,9 @@ pub fn get_flexible_format_threshold(api_key: i16) -> Option<i16> {
         API_KEY_ADD_OFFSETS_TO_TXN => Some(3), // AddOffsetsToTxn v3+ uses flexible format
         API_KEY_END_TXN => Some(3),          // EndTxn v3+ uses flexible format
         API_KEY_TXN_OFFSET_COMMIT => Some(3), // TxnOffsetCommit v3+ uses flexible format
+        API_KEY_DELETE_RECORDS => Some(2),   // DeleteRecords v2+ uses flexible format
+        API_KEY_DESCRIBE_CONFIGS => Some(4), // DescribeConfigs v4+ uses flexible format
+        API_KEY_INCREMENTAL_ALTER_CONFIGS => Some(1), // IncrementalAlterConfigs v1+ flexible
         _ => None,                           // Unknown API keys default to v0
     }
 }
@@ -375,6 +393,15 @@ pub const ERROR_TRANSACTIONAL_ID_NOT_FOUND: i16 = 105;
 
 /// Invalid transaction state (invalid state transition)
 pub const ERROR_INVALID_TXN_STATE: i16 = 48;
+
+/// OFFSET_OUT_OF_RANGE: requested offset is outside the partition's log range
+pub const ERROR_OFFSET_OUT_OF_RANGE: i16 = 1;
+
+/// INVALID_REQUEST: the request is malformed or targets an unsupported entity
+pub const ERROR_INVALID_REQUEST: i16 = 42;
+
+/// INVALID_CONFIG: the given configuration key/value is invalid or unsupported
+pub const ERROR_INVALID_CONFIG: i16 = 40;
 
 // NOTE: there is no "transaction timed out" code in the Kafka protocol — 94 is
 // INCONSISTENT_VOTER_SET. A server-side transaction timeout fences the producer, so the

@@ -117,8 +117,10 @@ use kafka_test::{
     test_delete_group_empty,
     test_delete_group_idempotent,
     test_delete_group_non_empty,
+    test_delete_records_truncates_partition,
     test_delete_topic,
     test_delete_topic_not_found,
+    test_describe_configs_reports_topic_configs,
     test_deterministic_routing,
     test_dialup_0_percent,
     test_dialup_100_percent,
@@ -167,6 +169,7 @@ use kafka_test::{
     test_idempotent_producer_basic,
     test_idempotent_producer_epoch_bump,
     test_idempotent_producer_restart,
+    test_incremental_alter_configs_retention_roundtrip,
     test_invalid_group_id,
     // Partition tests
     test_key_distribution,
@@ -216,6 +219,7 @@ use kafka_test::{
     test_partition_assignment_race,
     test_partition_assignment_strategies,
     test_partition_zero,
+    test_per_topic_retention_override_enforced_by_sweep,
     test_produce_ack_implies_committed_visibility,
     test_produce_any_partition,
     test_produce_consume_race,
@@ -418,6 +422,30 @@ fn get_all_tests() -> Vec<TestDef> {
             name: "test_delete_group_after_leave",
             test_fn: wrap_test!(test_delete_group_after_leave),
             parallel_safe: false, // Uses shared consumer group state
+        },
+        TestDef {
+            category: "admin",
+            name: "test_describe_configs_reports_topic_configs",
+            test_fn: wrap_test!(test_describe_configs_reports_topic_configs),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "admin",
+            name: "test_incremental_alter_configs_retention_roundtrip",
+            test_fn: wrap_test!(test_incremental_alter_configs_retention_roundtrip),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "admin",
+            name: "test_delete_records_truncates_partition",
+            test_fn: wrap_test!(test_delete_records_truncates_partition),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "admin",
+            name: "test_per_topic_retention_override_enforced_by_sweep",
+            test_fn: wrap_test!(test_per_topic_retention_override_enforced_by_sweep),
+            parallel_safe: false, // Runs the global retention sweep
         },
         TestDef {
             category: "admin",

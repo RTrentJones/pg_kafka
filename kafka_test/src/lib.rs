@@ -48,6 +48,7 @@ pub mod setup;
 pub mod admin;
 pub mod compression;
 pub mod concurrent;
+pub mod configs;
 pub mod consumer;
 pub mod consumer_group;
 pub mod edge_cases;
@@ -132,6 +133,13 @@ pub use performance::{
     test_batch_vs_single_performance, test_concurrent_connection_scaling,
     test_consume_throughput_baseline, test_large_batch_throughput, test_long_poll_cpu_efficiency,
     test_produce_latency_percentiles, test_produce_throughput_baseline,
+};
+
+// Config/log-management API tests (DescribeConfigs 32, IncrementalAlterConfigs 44, DeleteRecords 21)
+pub use configs::{
+    test_delete_records_truncates_partition, test_describe_configs_reports_topic_configs,
+    test_incremental_alter_configs_retention_roundtrip,
+    test_per_topic_retention_override_enforced_by_sweep,
 };
 
 // Admin API tests

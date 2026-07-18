@@ -55,6 +55,12 @@ pub const API_VERSION_RANGES: &[(i16, i16, i16)] = &[
     (API_KEY_ADD_OFFSETS_TO_TXN, 0, 3),
     (API_KEY_END_TXN, 0, 3),
     (API_KEY_TXN_OFFSET_COMMIT, 0, 3),
+    (API_KEY_DELETE_RECORDS, 0, 2),
+    // DescribeConfigs min 1: the kafka-protocol crate implements v1-4 only
+    // (v0 lacks per-config source/synonym metadata); every mainstream admin
+    // client negotiates >= 1.
+    (API_KEY_DESCRIBE_CONFIGS, 1, 4),
+    (API_KEY_INCREMENTAL_ALTER_CONFIGS, 0, 1),
 ];
 
 /// Return the supported `(min_version, max_version)` for an API key, or `None` if the key is not
@@ -300,6 +306,30 @@ pub fn build_delete_groups_error_response(_error_code: i16) -> DeleteGroupsRespo
     response
 }
 
+/// Build a DeleteRecordsResponse with an error code (empty results)
+pub fn build_delete_records_error_response(
+    _error_code: i16,
+) -> kafka_protocol::messages::delete_records_response::DeleteRecordsResponse {
+    // DeleteRecordsResponse errors are per-partition. Return empty response.
+    kafka_protocol::messages::delete_records_response::DeleteRecordsResponse::default()
+}
+
+/// Build a DescribeConfigsResponse with an error code (empty results)
+pub fn build_describe_configs_error_response(
+    _error_code: i16,
+) -> kafka_protocol::messages::describe_configs_response::DescribeConfigsResponse {
+    // DescribeConfigsResponse errors are per-resource. Return empty response.
+    kafka_protocol::messages::describe_configs_response::DescribeConfigsResponse::default()
+}
+
+/// Build an IncrementalAlterConfigsResponse with an error code (empty results)
+pub fn build_incremental_alter_configs_error_response(
+    _error_code: i16,
+) -> kafka_protocol::messages::incremental_alter_configs_response::IncrementalAlterConfigsResponse {
+    // Errors are per-resource. Return empty response.
+    kafka_protocol::messages::incremental_alter_configs_response::IncrementalAlterConfigsResponse::default()
+}
+
 /// Build an InitProducerIdResponse with an error code (Phase 9)
 pub fn build_init_producer_id_error_response(error_code: i16) -> InitProducerIdResponse {
     use kafka_protocol::messages::ProducerId;
@@ -420,6 +450,21 @@ pub fn error_response_for(
             api_version,
             response: build_init_producer_id_error_response(error_code),
         },
+        API_KEY_DELETE_RECORDS => KafkaResponse::DeleteRecords {
+            correlation_id,
+            api_version,
+            response: build_delete_records_error_response(error_code),
+        },
+        API_KEY_DESCRIBE_CONFIGS => KafkaResponse::DescribeConfigs {
+            correlation_id,
+            api_version,
+            response: build_describe_configs_error_response(error_code),
+        },
+        API_KEY_INCREMENTAL_ALTER_CONFIGS => KafkaResponse::IncrementalAlterConfigs {
+            correlation_id,
+            api_version,
+            response: build_incremental_alter_configs_error_response(error_code),
+        },
         _ => return None,
     };
     Some(response)
@@ -438,8 +483,8 @@ mod tests {
         assert_eq!(response.error_code, ERROR_NONE);
         assert_eq!(response.throttle_time_ms, 0);
 
-        // Should have 23 API versions (all supported APIs)
-        assert_eq!(response.api_keys.len(), 23);
+        // Should have 26 API versions (all supported APIs)
+        assert_eq!(response.api_keys.len(), 26);
 
         // Verify ApiVersions entry
         let api_versions = response

@@ -18,6 +18,11 @@ CREATE TABLE kafka.topics (
     id SERIAL PRIMARY KEY,
     name TEXT UNIQUE NOT NULL,
     partitions INT NOT NULL DEFAULT 1,
+    -- Per-topic retention.ms override (IncrementalAlterConfigs, API 44).
+    -- NULL = inherit pg_kafka.message_retention_hours; >= 0 = enforce this
+    -- window (even when the global sweep is off); < 0 = infinite retention
+    -- for this topic (even when a global window is set).
+    retention_ms BIGINT,
     created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 

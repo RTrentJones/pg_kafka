@@ -278,6 +278,27 @@ fn parse_request_inner(
             api_version,
             response_tx,
         ),
+        API_KEY_DELETE_RECORDS => parse_delete_records(
+            &mut payload_buf,
+            correlation_id,
+            client_id,
+            api_version,
+            response_tx,
+        ),
+        API_KEY_DESCRIBE_CONFIGS => parse_describe_configs(
+            &mut payload_buf,
+            correlation_id,
+            client_id,
+            api_version,
+            response_tx,
+        ),
+        API_KEY_INCREMENTAL_ALTER_CONFIGS => parse_incremental_alter_configs(
+            &mut payload_buf,
+            correlation_id,
+            client_id,
+            api_version,
+            response_tx,
+        ),
         _ => {
             // Unsupported API — we don't know this api_key, so `error_response_for` returns None and
             // this falls back to the generic protocol-error frame (the case it's still meant for).
@@ -1375,6 +1396,157 @@ fn parse_delete_groups(
     }))
 }
 
+fn parse_delete_records(
+    payload_buf: &mut BytesMut,
+    correlation_id: i32,
+    client_id: Option<String>,
+    api_version: i16,
+    response_tx: tokio::sync::mpsc::UnboundedSender<super::super::messages::KafkaResponse>,
+) -> Result<Option<KafkaRequest>> {
+    let req = match kafka_protocol::messages::delete_records_request::DeleteRecordsRequest::decode(
+        payload_buf,
+        api_version,
+    ) {
+        Ok(req) => req,
+        Err(e) => {
+            warn!("Failed to decode DeleteRecordsRequest: {}", e);
+            send_api_error(
+                &response_tx,
+                API_KEY_DELETE_RECORDS,
+                api_version,
+                correlation_id,
+                ERROR_CORRUPT_MESSAGE,
+                "malformed request",
+            );
+            return Ok(None);
+        }
+    };
+
+    let topics: Vec<(String, Vec<(i32, i64)>)> = req
+        .topics
+        .into_iter()
+        .map(|t| {
+            let partitions = t
+                .partitions
+                .into_iter()
+                .map(|p| (p.partition_index, p.offset))
+                .collect();
+            (t.name.to_string(), partitions)
+        })
+        .collect();
+
+    Ok(Some(KafkaRequest::DeleteRecords {
+        correlation_id,
+        client_id,
+        api_version,
+        topics,
+        timeout_ms: req.timeout_ms,
+        response_tx,
+    }))
+}
+
+fn parse_describe_configs(
+    payload_buf: &mut BytesMut,
+    correlation_id: i32,
+    client_id: Option<String>,
+    api_version: i16,
+    response_tx: tokio::sync::mpsc::UnboundedSender<super::super::messages::KafkaResponse>,
+) -> Result<Option<KafkaRequest>> {
+    let req =
+        match kafka_protocol::messages::describe_configs_request::DescribeConfigsRequest::decode(
+            payload_buf,
+            api_version,
+        ) {
+            Ok(req) => req,
+            Err(e) => {
+                warn!("Failed to decode DescribeConfigsRequest: {}", e);
+                send_api_error(
+                    &response_tx,
+                    API_KEY_DESCRIBE_CONFIGS,
+                    api_version,
+                    correlation_id,
+                    ERROR_CORRUPT_MESSAGE,
+                    "malformed request",
+                );
+                return Ok(None);
+            }
+        };
+
+    let resources: Vec<(i8, String, Option<Vec<String>>)> = req
+        .resources
+        .into_iter()
+        .map(|r| {
+            let keys = r
+                .configuration_keys
+                .map(|keys| keys.into_iter().map(|k| k.to_string()).collect());
+            (r.resource_type, r.resource_name.to_string(), keys)
+        })
+        .collect();
+
+    Ok(Some(KafkaRequest::DescribeConfigs {
+        correlation_id,
+        client_id,
+        api_version,
+        resources,
+        response_tx,
+    }))
+}
+
+fn parse_incremental_alter_configs(
+    payload_buf: &mut BytesMut,
+    correlation_id: i32,
+    client_id: Option<String>,
+    api_version: i16,
+    response_tx: tokio::sync::mpsc::UnboundedSender<super::super::messages::KafkaResponse>,
+) -> Result<Option<KafkaRequest>> {
+    let req = match kafka_protocol::messages::incremental_alter_configs_request::IncrementalAlterConfigsRequest::decode(
+        payload_buf,
+        api_version,
+    ) {
+        Ok(req) => req,
+        Err(e) => {
+            warn!("Failed to decode IncrementalAlterConfigsRequest: {}", e);
+            send_api_error(
+                &response_tx,
+                API_KEY_INCREMENTAL_ALTER_CONFIGS,
+                api_version,
+                correlation_id,
+                ERROR_CORRUPT_MESSAGE,
+                "malformed request",
+            );
+            return Ok(None);
+        }
+    };
+
+    let resources: super::super::messages::AlterConfigsResources = req
+        .resources
+        .into_iter()
+        .map(|r| {
+            let configs = r
+                .configs
+                .into_iter()
+                .map(|c| {
+                    (
+                        c.name.to_string(),
+                        c.config_operation,
+                        c.value.map(|v| v.to_string()),
+                    )
+                })
+                .collect();
+            (r.resource_type, r.resource_name.to_string(), configs)
+        })
+        .collect();
+
+    Ok(Some(KafkaRequest::IncrementalAlterConfigs {
+        correlation_id,
+        client_id,
+        api_version,
+        resources,
+        validate_only: req.validate_only,
+        response_tx,
+    }))
+}
+
 // ========== Idempotent Producer API Parsers (Phase 9) ==========
 
 fn parse_init_producer_id(
@@ -2409,6 +2581,113 @@ mod tests {
             assert_eq!(groups_names[0], "old-group");
         } else {
             panic!("Expected DeleteGroups request");
+        }
+    }
+
+    #[test]
+    fn test_parse_delete_records_request() {
+        let (tx, _rx) = create_test_channel();
+
+        let mut request =
+            kafka_protocol::messages::delete_records_request::DeleteRecordsRequest::default();
+        request.timeout_ms = 30000;
+        request.topics = vec![
+            kafka_protocol::messages::delete_records_request::DeleteRecordsTopic::default()
+                .with_name(kafka_protocol::messages::TopicName(
+                    StrBytes::from_static_str("truncate-me"),
+                ))
+                .with_partitions(vec![
+                    kafka_protocol::messages::delete_records_request::DeleteRecordsPartition::default()
+                        .with_partition_index(0)
+                        .with_offset(42),
+                ]),
+        ];
+
+        // v1 is non-flexible (header v1); flexible starts at v2.
+        let frame = build_request_frame(API_KEY_DELETE_RECORDS, 1, 1700, 1, &request, 1);
+
+        let parsed = parse_request(frame, tx).unwrap();
+        if let Some(KafkaRequest::DeleteRecords {
+            topics, timeout_ms, ..
+        }) = parsed
+        {
+            assert_eq!(timeout_ms, 30000);
+            assert_eq!(topics, vec![("truncate-me".to_string(), vec![(0, 42i64)])]);
+        } else {
+            panic!("Expected DeleteRecords request");
+        }
+    }
+
+    #[test]
+    fn test_parse_describe_configs_request() {
+        let (tx, _rx) = create_test_channel();
+
+        let mut request =
+            kafka_protocol::messages::describe_configs_request::DescribeConfigsRequest::default();
+        request.resources = vec![
+            kafka_protocol::messages::describe_configs_request::DescribeConfigsResource::default()
+                .with_resource_type(2)
+                .with_resource_name(StrBytes::from_static_str("my-topic"))
+                .with_configuration_keys(Some(vec![StrBytes::from_static_str("retention.ms")])),
+        ];
+
+        // v1 is non-flexible (header v1); flexible starts at v4.
+        let frame = build_request_frame(API_KEY_DESCRIBE_CONFIGS, 1, 1701, 1, &request, 1);
+
+        let parsed = parse_request(frame, tx).unwrap();
+        if let Some(KafkaRequest::DescribeConfigs { resources, .. }) = parsed {
+            assert_eq!(
+                resources,
+                vec![(
+                    2i8,
+                    "my-topic".to_string(),
+                    Some(vec!["retention.ms".to_string()])
+                )]
+            );
+        } else {
+            panic!("Expected DescribeConfigs request");
+        }
+    }
+
+    #[test]
+    fn test_parse_incremental_alter_configs_request() {
+        let (tx, _rx) = create_test_channel();
+
+        let mut request = kafka_protocol::messages::incremental_alter_configs_request::IncrementalAlterConfigsRequest::default();
+        request.validate_only = true;
+        request.resources = vec![
+            kafka_protocol::messages::incremental_alter_configs_request::AlterConfigsResource::default()
+                .with_resource_type(2)
+                .with_resource_name(StrBytes::from_static_str("my-topic"))
+                .with_configs(vec![
+                    kafka_protocol::messages::incremental_alter_configs_request::AlterableConfig::default()
+                        .with_name(StrBytes::from_static_str("retention.ms"))
+                        .with_config_operation(0)
+                        .with_value(Some(StrBytes::from_static_str("60000"))),
+                ]),
+        ];
+
+        // v0 is non-flexible (header v1); flexible starts at v1.
+        let frame = build_request_frame(API_KEY_INCREMENTAL_ALTER_CONFIGS, 0, 1702, 1, &request, 0);
+
+        let parsed = parse_request(frame, tx).unwrap();
+        if let Some(KafkaRequest::IncrementalAlterConfigs {
+            resources,
+            validate_only,
+            ..
+        }) = parsed
+        {
+            assert!(validate_only);
+            assert_eq!(
+                resources,
+                vec![(
+                    2i8,
+                    "my-topic".to_string(),
+                    vec![("retention.ms".to_string(), 0i8, Some("60000".to_string()))]
+                )]
+            );
+        } else {
+            panic!("Expected IncrementalAlterConfigs request");
         }
     }
 

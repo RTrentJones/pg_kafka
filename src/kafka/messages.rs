@@ -14,6 +14,10 @@
 /// Type alias for TxnOffsetCommit topic data: (topic_name, [(partition, offset, metadata)])
 pub type TxnOffsetCommitTopics = Vec<(String, Vec<(i32, i64, Option<String>)>)>;
 
+/// Type alias for IncrementalAlterConfigs resources:
+/// (resource_type, resource_name, [(config_name, operation, value)])
+pub type AlterConfigsResources = Vec<(i8, String, Vec<(String, i8, Option<String>)>)>;
+
 /// DR-12 (DEEP-REVIEW-2026-07): the two request lanes from the network thread to
 /// the single DB thread.
 ///
@@ -460,6 +464,54 @@ pub enum KafkaRequest {
         /// Channel to send the response back
         response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
     },
+    /// DeleteRecords request - truncate partitions below an offset (API 21)
+    DeleteRecords {
+        /// Correlation ID from client - MUST be echoed back in response
+        correlation_id: i32,
+        /// Optional client identifier string
+        client_id: Option<String>,
+        /// API version from the request (needed for response encoding)
+        api_version: i16,
+        /// Topics with per-partition truncation offsets:
+        /// (topic_name, [(partition_id, before_offset)]); before_offset == -1
+        /// means "truncate to the high watermark".
+        topics: Vec<(String, Vec<(i32, i64)>)>,
+        /// Timeout for the request in milliseconds
+        timeout_ms: i32,
+        /// Channel to send the response back
+        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
+    },
+    /// DescribeConfigs request - read entity configs (API 32)
+    DescribeConfigs {
+        /// Correlation ID from client - MUST be echoed back in response
+        correlation_id: i32,
+        /// Optional client identifier string
+        client_id: Option<String>,
+        /// API version from the request (needed for response encoding)
+        api_version: i16,
+        /// Requested resources: (resource_type, resource_name, requested keys —
+        /// None/empty = all known configs)
+        resources: Vec<(i8, String, Option<Vec<String>>)>,
+        /// Channel to send the response back
+        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
+    },
+    /// IncrementalAlterConfigs request - SET/DELETE individual configs (API 44)
+    IncrementalAlterConfigs {
+        /// Correlation ID from client - MUST be echoed back in response
+        correlation_id: i32,
+        /// Optional client identifier string
+        client_id: Option<String>,
+        /// API version from the request (needed for response encoding)
+        api_version: i16,
+        /// Requested alterations: (resource_type, resource_name,
+        /// [(config_name, operation, value)]) where operation is the wire enum
+        /// (0=SET, 1=DELETE, 2=APPEND, 3=SUBTRACT)
+        resources: AlterConfigsResources,
+        /// If true, validate without applying
+        validate_only: bool,
+        /// Channel to send the response back
+        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
+    },
 }
 
 /// Kafka response types sent back from main thread to async tasks
@@ -677,6 +729,34 @@ pub enum KafkaResponse {
         response: kafka_protocol::messages::txn_offset_commit_response::TxnOffsetCommitResponse,
     },
     /// Error response for unsupported or malformed requests
+    /// DeleteRecords response - wraps kafka-protocol's DeleteRecordsResponse
+    DeleteRecords {
+        /// Correlation ID from request
+        correlation_id: i32,
+        /// API version to use for encoding the response
+        api_version: i16,
+        /// The kafka-protocol response struct (ready to encode)
+        response: kafka_protocol::messages::delete_records_response::DeleteRecordsResponse,
+    },
+    /// DescribeConfigs response - wraps kafka-protocol's DescribeConfigsResponse
+    DescribeConfigs {
+        /// Correlation ID from request
+        correlation_id: i32,
+        /// API version to use for encoding the response
+        api_version: i16,
+        /// The kafka-protocol response struct (ready to encode)
+        response: kafka_protocol::messages::describe_configs_response::DescribeConfigsResponse,
+    },
+    /// IncrementalAlterConfigs response - wraps kafka-protocol's response
+    IncrementalAlterConfigs {
+        /// Correlation ID from request
+        correlation_id: i32,
+        /// API version to use for encoding the response
+        api_version: i16,
+        /// The kafka-protocol response struct (ready to encode)
+        response:
+            kafka_protocol::messages::incremental_alter_configs_response::IncrementalAlterConfigsResponse,
+    },
     Error {
         /// Correlation ID from request
         correlation_id: i32,
@@ -929,6 +1009,25 @@ impl KafkaRequest {
                 api_version,
                 ..
             } => (API_KEY_TXN_OFFSET_COMMIT, *api_version, *correlation_id),
+            KafkaRequest::DeleteRecords {
+                correlation_id,
+                api_version,
+                ..
+            } => (API_KEY_DELETE_RECORDS, *api_version, *correlation_id),
+            KafkaRequest::DescribeConfigs {
+                correlation_id,
+                api_version,
+                ..
+            } => (API_KEY_DESCRIBE_CONFIGS, *api_version, *correlation_id),
+            KafkaRequest::IncrementalAlterConfigs {
+                correlation_id,
+                api_version,
+                ..
+            } => (
+                API_KEY_INCREMENTAL_ALTER_CONFIGS,
+                *api_version,
+                *correlation_id,
+            ),
         }
     }
 
@@ -965,7 +1064,10 @@ impl KafkaRequest {
             | KafkaRequest::AddPartitionsToTxn { response_tx, .. }
             | KafkaRequest::AddOffsetsToTxn { response_tx, .. }
             | KafkaRequest::EndTxn { response_tx, .. }
-            | KafkaRequest::TxnOffsetCommit { response_tx, .. } => {
+            | KafkaRequest::TxnOffsetCommit { response_tx, .. }
+            | KafkaRequest::DeleteRecords { response_tx, .. }
+            | KafkaRequest::DescribeConfigs { response_tx, .. }
+            | KafkaRequest::IncrementalAlterConfigs { response_tx, .. } => {
                 std::mem::replace(response_tx, new_tx)
             }
         }

@@ -13,6 +13,7 @@
 //!     arrives, wake, and return it.
 //!   - Over-cap fetches (the last 16) were served immediately at send time —
 //!     before the record existed — and come back empty.
+//!
 //! Pre-cap builds long-poll all 80, so all 80 would contain the record; the
 //! capped build yields exactly 64 with records / 16 empty.
 

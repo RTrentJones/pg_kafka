@@ -225,26 +225,34 @@ impl PostgresStore {
         };
 
         Spi::connect_mut(|client| {
-            // Expired messages (only when retention is enabled). Batched via ctid so
-            // one sweep is bounded; never deletes pending transactional rows.
-            if message_retention_hours > 0 {
-                let table = client.update(
-                    "DELETE FROM kafka.messages
-                     WHERE ctid IN (
-                         SELECT ctid FROM kafka.messages
-                         WHERE created_at < NOW() - ($1 || ' hours')::interval
-                           AND (txn_state IS NULL OR txn_state <> 'pending')
-                         LIMIT $2
-                     )
-                     RETURNING 1",
-                    None,
-                    &[
-                        (message_retention_hours as i64).into(),
-                        RETENTION_DELETE_BATCH.into(),
-                    ],
-                )?;
-                stats.expired_messages = table.len() as u64;
-            }
+            // Expired messages. Batched via ctid so one sweep is bounded; never
+            // deletes pending transactional rows. Per-topic `retention.ms`
+            // (kafka.topics.retention_ms, settable via IncrementalAlterConfigs)
+            // overrides the global GUC: >= 0 enforces that window even when the
+            // global sweep is off; < 0 pins the topic to infinite retention even
+            // when a global window is set; NULL falls back to the GUC.
+            let table = client.update(
+                "DELETE FROM kafka.messages
+                 WHERE ctid IN (
+                     SELECT m.ctid FROM kafka.messages m
+                     JOIN kafka.topics t ON t.id = m.topic_id
+                     WHERE (m.txn_state IS NULL OR m.txn_state <> 'pending')
+                       AND (
+                            (t.retention_ms IS NOT NULL AND t.retention_ms >= 0
+                             AND m.created_at < NOW() - (t.retention_ms || ' milliseconds')::interval)
+                         OR (t.retention_ms IS NULL AND $1 > 0
+                             AND m.created_at < NOW() - ($1 || ' hours')::interval)
+                       )
+                     LIMIT $2
+                 )
+                 RETURNING 1",
+                None,
+                &[
+                    (message_retention_hours as i64).into(),
+                    RETENTION_DELETE_BATCH.into(),
+                ],
+            )?;
+            stats.expired_messages = table.len() as u64;
 
             // Terminal transactions first (their FK on producer_ids would otherwise
             // block the producer prune below). Only rows idle past the window: a
@@ -1905,6 +1913,88 @@ impl KafkaStore for PostgresStore {
         })
         .map_err(|e: KafkaError| {
             KafkaError::Internal(format!("cleanup_aborted_messages failed: {}", e))
+        })
+    }
+
+    fn get_topic_retention_ms(&self, topic_id: i32) -> Result<Option<i64>> {
+        Spi::connect(|client| {
+            let table = client.select(
+                "SELECT retention_ms FROM kafka.topics WHERE id = $1",
+                Some(1),
+                &[topic_id.into()],
+            )?;
+            if table.is_empty() {
+                return Err(KafkaError::Internal(format!(
+                    "topic id {} not found",
+                    topic_id
+                )));
+            }
+            Ok(table.first().get_by_name::<i64, _>("retention_ms")?)
+        })
+        .map_err(|e: KafkaError| {
+            KafkaError::Internal(format!("get_topic_retention_ms failed: {}", e))
+        })
+    }
+
+    fn set_topic_retention_ms(&self, topic_id: i32, retention_ms: Option<i64>) -> Result<()> {
+        crate::pg_debug!(
+            "PostgresStore::set_topic_retention_ms: topic_id={}, retention_ms={:?}",
+            topic_id,
+            retention_ms
+        );
+        Spi::connect_mut(|client| {
+            client.update(
+                "UPDATE kafka.topics SET retention_ms = $2 WHERE id = $1",
+                None,
+                &[topic_id.into(), retention_ms.into()],
+            )?;
+            Ok(())
+        })
+        .map_err(|e: KafkaError| {
+            KafkaError::Internal(format!("set_topic_retention_ms failed: {}", e))
+        })
+    }
+
+    fn delete_records_before(
+        &self,
+        topic_id: i32,
+        partition_id: i32,
+        before_offset: i64,
+    ) -> Result<i64> {
+        crate::pg_debug!(
+            "PostgresStore::delete_records_before: topic_id={}, partition_id={}, before_offset={}",
+            topic_id,
+            partition_id,
+            before_offset
+        );
+        Spi::connect_mut(|client| {
+            client.update(
+                "DELETE FROM kafka.messages
+                 WHERE topic_id = $1 AND partition_id = $2 AND partition_offset < $3",
+                None,
+                &[topic_id.into(), partition_id.into(), before_offset.into()],
+            )?;
+
+            // New log start offset: earliest remaining row, or the requested
+            // truncation point when the partition is now empty (matching Kafka,
+            // where log_start_offset advances to the delete offset). Offset
+            // monotonicity is safe: producers take GREATEST(next_offset, MAX+1)
+            // from kafka.partition_offsets (BUG-3), which this never touches.
+            let table = client.select(
+                "SELECT COALESCE(MIN(partition_offset), $3) AS low_watermark
+                 FROM kafka.messages
+                 WHERE topic_id = $1 AND partition_id = $2",
+                None,
+                &[topic_id.into(), partition_id.into(), before_offset.into()],
+            )?;
+            let low_watermark: i64 = table
+                .first()
+                .get_by_name("low_watermark")?
+                .unwrap_or(before_offset);
+            Ok(low_watermark)
+        })
+        .map_err(|e: KafkaError| {
+            KafkaError::Internal(format!("delete_records_before failed: {}", e))
         })
     }
 }
