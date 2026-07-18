@@ -153,6 +153,41 @@ materially faster and is rare in any codebase.
 
 ## Resolution changelog
 
+- 2026-07-14 — **follow-up round (post-merge of PR #94)**: the strategic
+  recommendations and the remaining tractable items from the sweep were
+  addressed on a fresh branch off `main`. This closes the root cause behind the
+  DR-era database-verification flakiness rather than only the test-side symptom.
+  - **RB-1 — response-after-commit barrier** (`src/worker.rs`): Kafka responses
+    were sent from *inside* `BackgroundWorker::transaction`, so an acked
+    produce/offset-commit could be lost on a crash before commit (acks≥1
+    durability violation) and a client could race a separate connection into
+    pre-commit state (the S-tier version of the admin CI flake). The worker now
+    buffers each response and flushes it only after the transaction commits;
+    a commit-time panic sends an API-typed error instead of a false success.
+    Deterministic fail-before/pass-after E2E via a test-only
+    `pg_kafka.test_pre_commit_delay_ms` GUC. Documented in
+    PROTOCOL_DEVIATIONS.md (§ Acknowledgment Durability).
+  - **Issue #93 — shadow outbox duplicate delivery**: an in-flight tracker
+    (`src/kafka/shadow/inflight.rs`, unit-tested) + a claim-query anti-join stop
+    the outbox re-dispatching a row whose forward is merely slow; duplicates now
+    occur only on genuine ack loss, keeping the async path at-least-once instead
+    of ~8%-duplicating. E2E via `pg_kafka.test_forward_ack_delay_ms`.
+  - **S-2 partial — per-connection long-poll task cap** (`listener.rs`, the
+    RV-10 deferred item): bounded at 64; over-cap fetches degrade to the
+    immediate path. Raw-wire E2E (80 pipelined → exactly 64 long-poll / 16
+    immediate).
+  - **API completeness (23 → 26)**: DescribeConfigs (32), IncrementalAlterConfigs
+    (44), DeleteRecords (21) — honest-minimal (`retention.ms` per topic,
+    persisted and enforced by the DR-2 sweep, which lands ADR-001's per-topic
+    retention question; unsupported keys rejected). 11 new unit + 4 new E2E.
+  - **Code/test hygiene**: txn commit/abort SQL unified into `end_transaction`
+    (PR #84 follow-up); `wait_for_count` promoted into `fixtures.rs` and the
+    fragile fixed-sleep verification sites converted to bounded condition polls;
+    the stale devcontainer-networking TODO replaced with accurate docs.
+  - Validation: 705 unit + property tests green; clippy `--all-targets` clean on
+    both crates; every new QA-1 E2E demonstrated fail-before/pass-after on a live
+    pg16 instance.
+
 - 2026-07-11 — review created on `013aa9b`; all findings 🔴 Open.
 - 2026-07-11 — **full remediation pass** (same branch, seven themed commits, each
   validated against a live pg16 instance — which itself exercises DR-15):

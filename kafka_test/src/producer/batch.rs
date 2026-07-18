@@ -83,15 +83,17 @@ pub async fn test_batch_produce() -> TestResult {
     println!("\nStep 3: Verifying messages in database...");
     let db_client2 = create_db_client().await?;
 
-    let final_count: i64 = db_client2
-        .query_one(
-            "SELECT COUNT(*) FROM kafka.messages m
-             JOIN kafka.topics t ON m.topic_id = t.id
-             WHERE t.name = $1",
-            &[&topic],
-        )
-        .await?
-        .get(0);
+    // Defense-in-depth poll (RB-1 makes a single read correct; this guards
+    // against non-barrier timing and any future regression).
+    let final_count = crate::fixtures::wait_for_count(
+        &db_client2,
+        "SELECT COUNT(*) FROM kafka.messages m
+         JOIN kafka.topics t ON m.topic_id = t.id
+         WHERE t.name = $1",
+        &[&topic],
+        initial_count + batch_size as i64,
+    )
+    .await?;
 
     let new_messages = final_count - initial_count;
     println!("   Final count: {}", final_count);

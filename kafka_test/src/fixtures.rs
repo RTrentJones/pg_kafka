@@ -5,7 +5,7 @@
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, StreamConsumer};
 use rdkafka::producer::{FutureProducer, FutureRecord};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::common::TestResult;
 use crate::setup::TestContext;
@@ -327,4 +327,33 @@ where
     }
 
     Err("Timeout waiting for condition".into())
+}
+
+/// Poll a scalar `COUNT(*)`-style query until it returns `expected` or the
+/// deadline passes, returning the last observed value for the caller to assert
+/// on.
+///
+/// Rationale (RB-1): the worker's response-after-commit barrier means an acked
+/// produce/admin op IS committed and visible by the time the client sees the
+/// response, so a single read is now correct. This helper is defense-in-depth:
+/// it keeps the many database-verification sites robust against non-barrier
+/// timing (async delivery, replication lag if ever added) and against any
+/// future regression of the barrier — without masking real failures, since it
+/// returns the last value and the caller still asserts on it. Promoted from
+/// the admin-only `wait_for_count` (was the flake-fix for
+/// test_create_multiple_topics).
+pub async fn wait_for_count(
+    db: &tokio_postgres::Client,
+    query: &str,
+    params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+    expected: i64,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let count: i64 = db.query_one(query, params).await?.get(0);
+        if count == expected || Instant::now() >= deadline {
+            return Ok(count);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }

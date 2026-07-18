@@ -561,8 +561,25 @@ pub async fn test_txn_offset_commit_visibility_timing() -> TestResult {
     producer.commit_transaction(Duration::from_secs(10))?;
     println!("  Transaction committed\n");
 
-    // Brief delay for commit to propagate
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Poll until the committed offset lands (RB-1 makes the commit visible on
+    // ack; this bounded wait replaces a fixed sleep and tolerates any residual
+    // propagation without hiding a real failure).
+    let _ = crate::fixtures::wait_for(
+        Duration::from_secs(5),
+        Duration::from_millis(50),
+        || async {
+            client
+                .query_opt(
+                    "SELECT 1 FROM kafka.consumer_offsets WHERE group_id = $1 AND topic_id = $2 AND partition_id = 0 AND committed_offset = 3",
+                    &[&group_id, &source_topic_id],
+                )
+                .await
+                .ok()
+                .flatten()
+                .is_some()
+        },
+    )
+    .await;
 
     // Verify offset is now committed
     let committed_after = client
@@ -694,17 +711,15 @@ pub async fn test_abort_transaction_discards_pending_offsets() -> TestResult {
     producer.abort_transaction(Duration::from_secs(10))?;
     println!("  Transaction aborted\n");
 
-    // Brief delay for abort to propagate
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Verify pending offsets are discarded
-    let pending_after: i64 = client
-        .query_one(
-            "SELECT COUNT(*) FROM kafka.txn_pending_offsets WHERE transactional_id = $1",
-            &[&txn_id],
-        )
-        .await?
-        .get(0);
+    // Poll until the abort has cleared the pending offsets (RB-1: visible on
+    // the abort ack; bounded wait replaces a fixed sleep).
+    let pending_after = crate::fixtures::wait_for_count(
+        &client,
+        "SELECT COUNT(*) FROM kafka.txn_pending_offsets WHERE transactional_id = $1",
+        &[&txn_id],
+        0,
+    )
+    .await?;
     println!("  Pending offsets after abort: {}", pending_after);
 
     // Verify offset is NOT in consumer_offsets
