@@ -1,0 +1,121 @@
+{
+  "generatedAt": "2026-09-07T11:17:29Z",
+  "version": "ae666ab",
+  "gitSha": "ae666ab",
+  "config": {
+    "records": 500,
+    "forwardPercentage": 100,
+    "writeMode": "dual_write",
+    "syncMode": "sync",
+    "realBroker": "localhost:9093"
+  },
+  "checks": [
+    {
+      "name": "dual_write_sync",
+      "status": "pass",
+      "detail": {
+        "produced": 500,
+        "forwardedToBroker": 500,
+        "forwardedMetrics": 500,
+        "skipped": 0,
+        "failed": 0,
+        "lag": 0,
+        "finalized": 500,
+        "pending": 0,
+        "retries": 0,
+        "localStored": 500
+      }
+    },
+    {
+      "name": "dual_write_async",
+      "status": "pass",
+      "detail": {
+        "produced": 500,
+        "forwardedToBroker": 500,
+        "forwardedMetrics": 500,
+        "skipped": 0,
+        "failed": 0,
+        "lag": 0,
+        "finalized": 500,
+        "pending": 0,
+        "retries": 500,
+        "localStored": 500
+      }
+    },
+    {
+      "name": "external_only",
+      "status": "pass",
+      "detail": {
+        "produced": 500,
+        "forwardedToBroker": 500,
+        "forwardedMetrics": 500,
+        "skipped": 0,
+        "failed": 0,
+        "lag": 0,
+        "finalized": 500,
+        "pending": 0,
+        "retries": 0,
+        "localStored": 500
+      }
+    },
+    {
+      "name": "percentage_50",
+      "status": "pass",
+      "detail": {
+        "produced": 500,
+        "forwardedToBroker": 250,
+        "forwardedMetrics": 250,
+        "skipped": 0,
+        "failed": 0,
+        "lag": 50,
+        "finalized": 250,
+        "pending": 0,
+        "retries": 0,
+        "localStored": 500
+      }
+    },
+    {
+      "name": "committed_txn_forwarded",
+      "status": "pass",
+      "detail": {
+        "produced": 500,
+        "forwardedToBroker": 500,
+        "forwardedMetrics": 500,
+        "skipped": 0,
+        "failed": 0,
+        "lag": 0,
+        "finalized": 500,
+        "pending": 0,
+        "retries": 500,
+        "localStored": 500
+      }
+    },
+    {
+      "name": "aborted_txn_not_forwarded",
+      "status": "pass",
+      "detail": {
+        "produced": 500,
+        "forwardedToBroker": 0,
+        "forwardedMetrics": 0,
+        "skipped": 0,
+        "failed": 0,
+        "lag": 499,
+        "finalized": 0,
+        "pending": 0,
+        "retries": 0,
+        "localStored": 500
+      }
+    }
+  ],
+  "counts": {
+    "produced": 500,
+    "forwardedToBroker": 500,
+    "localStored": 500,
+    "shadowMetricsForwarded": 500,
+    "skipped": 0,
+    "failed": 0,
+    "outboxFinalized": 500,
+    "lag": 0
+  },
+  "passed": true
+}
