@@ -6,7 +6,8 @@ This document outlines performance benchmarks, tuning recommendations, and archi
 
 > DR-23 (DEEP-REVIEW-2026-07): this section supersedes the external benchmark
 > below as the headline. pg_kafka's own measured numbers live in the evidence
-> pipeline — `evidence/bench/` regenerates `bench.json` in CI and the results
+> pipeline — `evidence/bench/` regenerates `bench.json` in the `evidence` workflow
+> (`.github/workflows/evidence.yml`: weekly, on `v*` tags, or on demand) and the results
 > render at [rtrentjones.dev/pg_kafka](https://rtrentjones.dev/pg_kafka).
 > **Do not quote the external PostgreSQL benchmark figures as pg_kafka
 > throughput**: pg_kafka serializes ALL SPI work through a single background
@@ -27,8 +28,9 @@ without locks, at the cost of a hard single-core ceiling for SPI work.
 Throughput levers, in order: batching (one Produce carrying N records costs
 ~one insert), fetch byte budgets (DR-9 fills max_bytes in bounded query
 loops), connection pipelining (safe — responses stay ordered per connection),
-and vertical DB tuning. Heartbeats bypass the queue entirely (DR-12), so group
-liveness does not degrade with produce load.
+and vertical DB tuning. Heartbeats travel on a dedicated liveness lane that the
+worker drains before the main request queue (DR-12), so group liveness does not
+degrade with produce load.
 
 ## Background: PostgreSQL as a message store (external benchmark)
 
@@ -72,10 +74,11 @@ UPDATE messages SET is_read = TRUE WHERE id = $1;
 **pg_kafka Status:**
 - ✅ We do NOT use `is_read` columns
 - ✅ We use offset-based reads (Kafka pattern)
-- ⚠️ **We currently have no retention policy**
+- ✅ Time-based retention ships as a bounded `DELETE` sweep (see "Retention & lifecycle GUCs" below)
+- ⚠️ `kafka.messages` is not partitioned, so retention reclaims space through `DELETE` + `VACUUM`, not `DROP`
 
-**Required Fix (Phase 3+):**
-Implement table partitioning with automatic partition dropping:
+**Proposed (ADR-001, not implemented):**
+Table partitioning with automatic partition dropping:
 
 ```sql
 -- Partition by time range (e.g., daily)
@@ -186,7 +189,9 @@ synchronous_commit = on         -- For acks=-1 (wait for WAL flush)
 
 **pg_kafka Recommendation:**
 - Use `synchronous_commit = on` by default (data safety)
-- Allow users to set `synchronous_commit = off` via GUC for higher throughput (Phase 2.1)
+- pg_kafka has no GUC of its own for this. The worker's transactions follow the server's
+  `synchronous_commit` setting, so `off` trades durability of the latest commits for throughput
+  for every acks level.
 
 #### 4. Huge Pages (Large Instances)
 
@@ -283,6 +288,14 @@ SELECT
                    EXTRACT(EPOCH FROM NOW() - pg_postmaster_start_time())) AS wal_per_sec;
 ```
 
+#### 5. Built-in Metrics View
+```sql
+-- O(1) catalog estimates for message counts/bytes, plus groups, producers,
+-- transactions, and shadow-mode counters (category, metric, value, unit)
+SELECT * FROM kafka.metrics;
+SELECT * FROM kafka.metrics WHERE category = 'messages';
+```
+
 ## Architectural Decisions for pg_kafka
 
 ### 1. ✅ Offset-Based Reads (Not Mark-as-Read)
@@ -304,9 +317,10 @@ LIMIT $4;
 - Naturally supports replayability (restart from any offset)
 - Multiple consumers can read same data
 
-### 2. ⚠️ Partitioning Strategy (TODO: Phase 3+)
+### 2. ⚠️ Partitioning Strategy (Proposed, not implemented)
 
-**Decision:** Implement time-based partitioning with automatic retention.
+**Decision (ADR-001, still proposed):** Implement time-based partitioning with automatic retention.
+Retention itself has since shipped without partitioning, as a bounded `DELETE` sweep (see below).
 
 **Why:**
 - Prevents infinite table growth
@@ -371,8 +385,11 @@ CREATE TABLE kafka.consumer_offsets (
     topic_id INT NOT NULL,
     partition_id INT NOT NULL,
     committed_offset BIGINT NOT NULL,
-    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (group_id, topic_id, partition_id)
+    metadata TEXT,  -- Optional client metadata
+    commit_timestamp TIMESTAMP NOT NULL DEFAULT NOW(),
+    CHECK (partition_id >= 0),
+    PRIMARY KEY (group_id, topic_id, partition_id),
+    FOREIGN KEY (topic_id) REFERENCES kafka.topics(id) ON DELETE CASCADE
 );
 
 -- This table stays small (one row per consumer-group-partition combo)
@@ -385,10 +402,12 @@ CREATE TABLE kafka.consumer_offsets (
 
 **Current Implementation:**
 - `global_offset BIGSERIAL` - Monotonic across ALL partitions
-- `partition_offset BIGINT` - Computed per partition
+- `partition_offset BIGINT` - Assigned per partition from the `kafka.partition_offsets.next_offset` counter,
+  which is never decremented, so offsets are not reused after aborted rows are cleaned up
 
 **Performance Impact:**
-- Computing `partition_offset` requires `FOR UPDATE` lock on partition
+- Assigning `partition_offset` takes a per-partition transaction-scoped advisory lock (`pg_advisory_xact_lock`)
+  and updates the `kafka.partition_offsets` row
 - Lock is per-partition, not global (concurrent writes to different partitions don't block)
 - Adds ~1ms per INSERT batch (acceptable for Phase 2 throughput targets)
 
@@ -400,13 +419,23 @@ CREATE TABLE kafka.consumer_offsets (
 
 ```sql
 -- Time-based retention for kafka.messages, enforced by the worker's periodic
--- retention sweep (60s cadence, bounded deletes). 0 (default) keeps forever.
+-- retention sweep (60s cadence, at most 10,000 rows per DELETE). 0 (default)
+-- keeps forever. Range 0-87600; reloadable with SIGHUP (pg_reload_conf()).
 pg_kafka.message_retention_hours = 168   -- e.g. 7 days
 
--- On-demand sweep + report (also prunes stale producers, terminal
--- transactions, and delivered shadow-outbox rows):
+-- On-demand sweep + report (also reclaims aborted transactional rows and prunes
+-- stale producers, terminal transactions, and delivered shadow-outbox rows).
+-- Arguments: message_retention_hours (NULL = use the GUC), aborted_grace_seconds
+-- (default 60). Returns one (category, deleted) row per category.
 SELECT * FROM pg_kafka_run_retention_sweep();
 ```
+
+Per-topic overrides use Kafka's own config key. `retention.ms` set through
+IncrementalAlterConfigs (API 44) is stored in `kafka.topics.retention_ms` and
+enforced by the same sweep: a value `>= 0` applies even when the global GUC is
+0, and a negative value pins that topic to infinite retention. DescribeConfigs
+(API 32) reports the effective value. DeleteRecords (API 21) truncates a
+partition up to an offset on demand.
 
 Aggressive autovacuum for the high-churn counter tables is applied by
 `sql/tune_autovacuum.sql` (DR-5). Native table partitioning remains future work
@@ -459,6 +488,12 @@ pgbench -c 10 -j 4 -T 60 -f produce_benchmark.sql
 
 ### Phase 4 (Shadow Mode Replication)
 
+These targets predate the shadow-mode implementation. Shadow mode shipped (Phase 11)
+as a durable outbox (`kafka.shadow_tracking`, written in the producing transaction)
+drained by an rdkafka producer, with at-least-once delivery to the external broker.
+It does not use logical replication or LSNs. Measured shadow-forwarding rates are
+the `shadow-async` / `shadow-sync` rows in `bench.json`.
+
 **Target Metrics:**
 - **Replication Lag:** <100ms (p99)
 - **Replication Throughput:** Match producer throughput (50k msg/sec)
@@ -483,8 +518,9 @@ pg_kafka supports all standard Kafka compression codecs: gzip, snappy, lz4, and 
 ### Configuration
 
 ```sql
--- Outbound compression (runtime changeable)
-SET pg_kafka.compression_type = 'lz4';  -- Recommended for balanced performance
+-- Outbound compression. This is a PGC_POSTMASTER GUC: set it in postgresql.conf
+-- and restart PostgreSQL (SET at runtime is rejected).
+pg_kafka.compression_type = 'lz4'  -- none (default), gzip, snappy, lz4, zstd
 
 -- Check current setting
 SHOW pg_kafka.compression_type;
@@ -531,6 +567,8 @@ Producer (gzip) → TCP → pg_kafka (auto-decompress) → PostgreSQL (uncompres
 
 ### Phase 4+ (Shadow Mode)
 
+These ideas predate the outbox-based implementation described above.
+
 1. **Logical Replication Slots:** Fine-tune `wal_sender_timeout` and `max_slot_wal_keep_size`
 2. **External Kafka Batching:** Batch multiple Postgres rows into single Kafka ProduceRequest
 3. **Parallel Replication:** Multiple replication workers for different topics/partitions
@@ -544,6 +582,6 @@ Producer (gzip) → TCP → pg_kafka (auto-decompress) → PostgreSQL (uncompres
 
 ---
 
-**Status:** Phase 11 Complete. Shadow mode, transactions, idempotent producer, and compression support are fully implemented. Partitioning and retention policies are planned for future phases and are critical for production deployments.
+**Status:** Phase 11 Complete. Shadow mode, transactions, idempotent producer, and compression support are fully implemented. Time-based retention (global GUC plus per-topic `retention.ms`) ships as a bounded `DELETE` sweep. Native table partitioning is still planned (ADR-001).
 
-**Last Updated:** 2026-01-14
+**Last Updated:** 2026-10-29

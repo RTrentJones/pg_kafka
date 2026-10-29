@@ -45,17 +45,18 @@ Add this step to your onboarding:
 
 1. Clone the repository
 2. Run `./hooks/install.sh` to install hooks
-3. Hooks will now run automatically before commits
+3. Hooks will now run automatically before commits (pre-commit) and pushes (pre-push)
 
 ## Bypassing Hooks (Not Recommended)
 
 In rare cases where you need to bypass hooks (e.g., work-in-progress commits):
 
 ```bash
-git commit --no-verify
+git commit --no-verify   # skips pre-commit
+git push --no-verify     # skips pre-push
 ```
 
-**Warning:** Do not push commits that haven't passed the hooks checks. The CI pipeline will reject them.
+**Warning:** Do not push commits that haven't passed the hooks checks. CI's `Lint & Format` job runs the same `cargo fmt --check` and `cargo clippy --all-targets ... -D warnings` gates for both crates and will reject them.
 
 ## Updating Hooks
 
