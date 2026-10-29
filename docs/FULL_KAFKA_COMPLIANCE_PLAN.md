@@ -1,11 +1,11 @@
 # Full Kafka API Compliance Plan for pg_kafka
 
-**Last Updated:** 2026-01-15
+**Last Updated:** 2026-10-29
 
 ## Current State (Phase 11 Complete)
 
-**APIs Implemented:** 23 of ~50 (46%)
-**Tests:** ~890 (686 unit + 10 property + 195 E2E; CI is the source of truth)
+**APIs Implemented:** 26 of ~50 (52%)
+**Tests:** ~925 (713 unit + 10 property + 202 E2E; CI is the source of truth)
 **Architecture:** Repository Pattern, typed errors, clean handler structure, key-based partition routing, compression, transactions, shadow mode
 
 ### Implemented APIs
@@ -17,6 +17,8 @@
 | Coordinator | FindCoordinator (10), JoinGroup (11), SyncGroup (14), Heartbeat (12), LeaveGroup (13), DescribeGroups (15), ListGroups (16) |
 | Admin | CreateTopics (19), DeleteTopics (20), CreatePartitions (37), DeleteGroups (42) |
 | Transaction | AddPartitionsToTxn (24), AddOffsetsToTxn (25), EndTxn (26), TxnOffsetCommit (28) |
+| Config | DescribeConfigs (32), IncrementalAlterConfigs (44) |
+| Log Management | DeleteRecords (21) |
 
 ---
 
@@ -49,17 +51,17 @@ fn handle_create_topics(store: &impl KafkaStore, topics: Vec<CreateTopicRequest>
 
 #### 6.3 CreatePartitions (API 37)
 **Files to modify:**
-- `src/kafka/storage/postgres.rs` - `add_partitions(topic_id, new_count)`
-- Trigger rebalance for affected consumer groups
+- `src/kafka/storage/postgres.rs` - `set_topic_partition_count(name, new_count)` (as built)
+- Trigger rebalance for affected consumer groups (not implemented; consumers pick up new partitions on metadata refresh)
 
 #### 6.4 DeleteGroups (API 42)
 **Files to modify:**
-- `src/kafka/coordinator.rs` - Add `delete_group()` method
+- `src/kafka/coordinator.rs` - Add `remove_group()` method (as built)
 - `src/kafka/storage/postgres.rs` - Delete from `kafka.consumer_offsets`
 
 **Testing:**
 - Unit tests in `src/kafka/handlers/tests.rs`
-- E2E tests in `kafka_test/src/admin/`
+- E2E tests in `kafka_test/src/admin.rs`
 
 ---
 
@@ -73,7 +75,7 @@ fn handle_create_topics(store: &impl KafkaStore, topics: Vec<CreateTopicRequest>
 
 #### 7.2 Key-Based Partition Routing
 **Files to modify:**
-- `src/kafka/handlers/produce.rs` - Add partition selection logic
+- `src/kafka/partitioner.rs` - Partition selection logic (`compute_partition()`, called from `handlers/produce.rs`)
 
 ```rust
 fn compute_partition(key: Option<&[u8]>, partition_count: i32, explicit: i32) -> i32 {
@@ -103,11 +105,12 @@ fn compute_partition(key: Option<&[u8]>, partition_count: i32, explicit: i32) ->
 
 **Configuration:**
 ```sql
-SET pg_kafka.compression_type = 'lz4';  -- Recommended for balanced performance
+-- postgresql.conf (postmaster-level GUC, requires a server restart)
+pg_kafka.compression_type = 'lz4'  -- Recommended for balanced performance
 ```
 
 **Testing:**
-- 5 E2E compression tests (gzip, snappy, lz4, zstd, roundtrip)
+- 10 E2E compression tests (gzip, snappy, lz4, zstd, roundtrip, edge cases)
 - Unit tests for compression parameter handling
 
 ---
@@ -116,7 +119,7 @@ SET pg_kafka.compression_type = 'lz4';  -- Recommended for balanced performance
 **Goal:** Exactly-once delivery semantics
 
 #### 9.1 Schema Changes
-**Files to create:**
+**Files to create:** (as built, these tables live in `sql/bootstrap.sql`, and `producer_sequences` stores `last_sequence`)
 - `sql/idempotent.sql`:
 ```sql
 CREATE TABLE kafka.producer_ids (
@@ -136,12 +139,12 @@ CREATE TABLE kafka.producer_sequences (
 
 #### 9.2 InitProducerId Handler (API 22)
 **Files to modify:**
-- `src/kafka/handlers/idempotent.rs` - Create `handle_init_producer_id()`
-- `src/kafka/storage/mod.rs` - Add `allocate_producer_id()`, `get_sequence()`
+- `src/kafka/handlers/init_producer_id.rs` - `handle_init_producer_id()` (as built)
+- `src/kafka/storage/mod.rs` - `allocate_producer_id()`, `check_and_update_sequence()`, `record_producer_sequence()` (as built)
 
 #### 9.3 Produce Deduplication
 **Files to modify:**
-- `src/kafka/handlers/produce.rs` - Check sequence numbers, reject duplicates
+- `src/kafka/handlers/produce.rs` - Check sequence numbers; duplicates are acked without re-inserting, gaps return OUT_OF_ORDER_SEQUENCE_NUMBER
 
 **Testing:**
 - E2E: Producer with `enable.idempotence=true`
@@ -172,9 +175,10 @@ CREATE TABLE kafka.transactions (
 );
 ```
 
-**Architecture:**
-- Map Kafka transaction states to PostgreSQL savepoints
-- Use PostgreSQL's MVCC for isolation
+**Architecture (as built):**
+- The `kafka.transactions` table has no `partitions` column; transactional records carry `producer_id`/`producer_epoch`/`txn_state` on `kafka.messages`, and pending offsets live in `kafka.txn_pending_offsets`
+- No savepoints: EndTxn moves `Ongoing` directly to `CompleteCommit`/`CompleteAbort` in one PostgreSQL transaction
+- `txn_state` (`pending`/`aborted`/NULL) drives read_committed visibility
 
 ---
 
@@ -184,18 +188,20 @@ CREATE TABLE kafka.transactions (
 **Implemented Features:**
 - ✅ External Kafka connection with SASL/SSL authentication
 - ✅ Dual-write (local PostgreSQL + external Kafka)
-- ✅ Per-topic shadow configuration via `kafka.topic_shadow_config`
+- ✅ Per-topic shadow configuration via `kafka.shadow_config` (keyed by `topic_id`)
 - ✅ Sync and async forwarding modes
 - ✅ Percentage-based dial-up routing
 - ✅ Historical message replay to external Kafka
 - ✅ Graceful degradation when external Kafka unavailable
-- ✅ 141 unit tests + 20 E2E tests for shadow mode
+- ✅ 128 unit tests + 27 E2E tests for shadow mode
 
 **Configuration:**
 ```sql
-SET pg_kafka.shadow_mode_enabled = true;
-SET pg_kafka.shadow_bootstrap_servers = 'kafka1:9092,kafka2:9092';
-SET pg_kafka.shadow_security_protocol = 'SASL_SSL';
+-- SIGHUP-level GUCs: set in postgresql.conf or via ALTER SYSTEM, then reload
+ALTER SYSTEM SET pg_kafka.shadow_mode_enabled = true;
+ALTER SYSTEM SET pg_kafka.shadow_bootstrap_servers = 'kafka1:9092,kafka2:9092';
+ALTER SYSTEM SET pg_kafka.shadow_security_protocol = 'SASL_SSL';
+SELECT pg_reload_conf();
 ```
 
 ---
@@ -224,9 +230,10 @@ SET pg_kafka.shadow_security_protocol = 'SASL_SSL';
 | **9** | Idempotent Producer | ✅ Complete | None |
 | **10** | Transactions | ✅ Complete | Phase 9 |
 | **11** | Shadow Mode | ✅ Complete | None |
+| — | Config & Log Management (DescribeConfigs, IncrementalAlterConfigs, DeleteRecords) | ✅ Complete | None |
 | **12** | Advanced Coordinator | Planned | None |
 
-**Completed:** Phases 1-11
+**Completed:** Phases 1-11, plus Config & Log Management (DescribeConfigs, IncrementalAlterConfigs, DeleteRecords)
 **Future:** Phase 12 (Advanced Coordinator), Cooperative Rebalancing (KIP-429), Static Group Membership (KIP-345)
 
 ---
@@ -241,7 +248,9 @@ SET pg_kafka.shadow_security_protocol = 'SASL_SSL';
 | `src/kafka/coordinator.rs` | Group state machine |
 | `src/kafka/protocol/decoding.rs` | Request parsing |
 | `src/kafka/messages.rs` | Request/Response enums |
-| `src/worker.rs` | Request dispatch |
+| `src/worker.rs` | Background worker loop, transaction + response-after-commit barrier |
+| `src/kafka/dispatch.rs` | Request → handler dispatch |
+| `src/kafka/response_builders.rs` | Advertised/enforced API version ranges |
 | `src/kafka/constants.rs` | API keys, error codes |
 | `src/kafka/error.rs` | KafkaError → error codes |
 
@@ -255,8 +264,8 @@ Each phase includes:
 3. **E2E tests** - rdkafka client in `kafka_test/`
 
 **Coverage targets:**
-- Maintain the unit-test suite (686+ tests)
-- Current: 195 E2E tests across all categories
+- Maintain the unit-test suite (713+ tests)
+- Current: 202 E2E tests across all categories
 
 ---
 
