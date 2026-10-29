@@ -21,7 +21,7 @@ kcat -C -b localhost:9092 -t my-topic -p 0 -o beginning
 | **Consumer Groups** | Complete | Full coordinator with auto-rebalancing |
 | **Transactions** | Complete | Full EOS with read-committed isolation |
 | **Shadow Mode** | Complete | External Kafka forwarding with SASL/SSL |
-| **Test Suite** | 890+ tests | 686 unit + 10 property + 195 E2E (CI is the source of truth) |
+| **Test Suite** | ~925 tests | 713 unit + 10 property + 202 E2E (CI is the source of truth) |
 | **CI/CD** | Complete | GitHub Actions with lint, test, security audit |
 
 **Current Phase:** Phase 11 Complete - Shadow Mode
@@ -40,6 +40,8 @@ kcat -C -b localhost:9092 -t my-topic -p 0 -o beginning
 - **Partition Assignment** - Range, RoundRobin, and Sticky strategies
 - **Offset Management** - OffsetCommit/OffsetFetch for consumer progress tracking
 - **Admin APIs** - CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups
+- **Config & Log Management** - DescribeConfigs, IncrementalAlterConfigs (`retention.ms` only), DeleteRecords
+- **Retention** - Periodic time-based sweep (`pg_kafka.message_retention_hours`, per-topic `retention.ms`), also runnable via `SELECT * FROM pg_kafka_run_retention_sweep()`
 - **Compression** - gzip, snappy, lz4, zstd (inbound/outbound)
 - **Multi-Partition Topics** - Key-based routing with murmur2 hash
 - **Topic Auto-Creation** - Topics created on first produce
@@ -48,33 +50,38 @@ kcat -C -b localhost:9092 -t my-topic -p 0 -o beginning
 - **Read-Committed Isolation** - Consumers filter pending/aborted transactions
 - **Shadow Mode** - Dual-write to external Kafka with SASL/SSL authentication
 
-### Implemented APIs (23 total)
+### Implemented APIs (26 total)
 
-| API | Key | Description |
-|-----|-----|-------------|
-| Produce | 0 | Write messages to database |
-| Fetch | 1 | Read messages with RecordBatch v2 encoding |
-| ListOffsets | 2 | Query earliest/latest offsets |
-| Metadata | 3 | Broker and topic metadata |
-| OffsetCommit | 8 | Commit consumer offsets |
-| OffsetFetch | 9 | Retrieve committed offsets |
-| FindCoordinator | 10 | Locate group coordinator |
-| JoinGroup | 11 | Register consumer group member |
-| Heartbeat | 12 | Maintain group membership |
-| LeaveGroup | 13 | Graceful group departure |
-| SyncGroup | 14 | Distribute partition assignments |
-| DescribeGroups | 15 | Get consumer group state and members |
-| ListGroups | 16 | List all consumer groups |
-| ApiVersions | 18 | Protocol version negotiation |
-| CreateTopics | 19 | Create topics with partition count |
-| DeleteTopics | 20 | Delete topics and messages |
-| InitProducerId | 22 | Allocate producer ID for idempotency |
-| AddPartitionsToTxn | 24 | Register partitions in transaction |
-| AddOffsetsToTxn | 25 | Include offsets in transaction |
-| EndTxn | 26 | Commit or abort transaction |
-| TxnOffsetCommit | 28 | Commit offsets within transaction |
-| CreatePartitions | 37 | Add partitions to existing topics |
-| DeleteGroups | 42 | Delete consumer groups |
+Versions are the ranges advertised in ApiVersions and enforced on inbound requests (`API_VERSION_RANGES` in `src/kafka/response_builders.rs`).
+
+| API | Key | Versions | Description |
+|-----|-----|----------|-------------|
+| Produce | 0 | 3-9 | Write messages to database |
+| Fetch | 1 | 0-11 | Read messages with RecordBatch v2 encoding |
+| ListOffsets | 2 | 0-7 | Query earliest/latest/by-timestamp offsets |
+| Metadata | 3 | 0-10 | Broker and topic metadata |
+| OffsetCommit | 8 | 0-8 | Commit consumer offsets |
+| OffsetFetch | 9 | 0-7 | Retrieve committed offsets |
+| FindCoordinator | 10 | 0-3 | Locate group coordinator |
+| JoinGroup | 11 | 0-7 | Register consumer group member |
+| Heartbeat | 12 | 0-4 | Maintain group membership |
+| LeaveGroup | 13 | 0-4 | Graceful group departure |
+| SyncGroup | 14 | 0-4 | Distribute partition assignments |
+| DescribeGroups | 15 | 0-5 | Get consumer group state and members |
+| ListGroups | 16 | 0-4 | List all consumer groups |
+| ApiVersions | 18 | 0-3 | Protocol version negotiation |
+| CreateTopics | 19 | 0-5 | Create topics with partition count |
+| DeleteTopics | 20 | 0-4 | Delete topics and messages |
+| DeleteRecords | 21 | 0-2 | Truncate partitions below an offset |
+| InitProducerId | 22 | 0-4 | Allocate producer ID for idempotency |
+| AddPartitionsToTxn | 24 | 0-3 | Register partitions in transaction |
+| AddOffsetsToTxn | 25 | 0-3 | Include offsets in transaction |
+| EndTxn | 26 | 0-3 | Commit or abort transaction |
+| TxnOffsetCommit | 28 | 0-3 | Commit offsets within transaction |
+| DescribeConfigs | 32 | 1-4 | Report the topic configs pg_kafka honors |
+| CreatePartitions | 37 | 0-2 | Add partitions to existing topics |
+| DeleteGroups | 42 | 0-2 | Delete consumer groups |
+| IncrementalAlterConfigs | 44 | 0-1 | Set per-topic `retention.ms` (other keys rejected) |
 
 ---
 
@@ -154,6 +161,17 @@ FROM kafka.consumer_offsets;
 ### Storage Schema
 
 ```sql
+-- Excerpt of sql/bootstrap.sql (indexes, GRANTs and COMMENTs omitted)
+
+-- Topic metadata
+CREATE TABLE kafka.topics (
+    id SERIAL PRIMARY KEY,
+    name TEXT UNIQUE NOT NULL,
+    partitions INT NOT NULL DEFAULT 1,
+    retention_ms BIGINT,              -- Per-topic retention.ms override (NULL = inherit global)
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
 -- Messages with dual-offset design
 CREATE TABLE kafka.messages (
     topic_id INT NOT NULL,
@@ -163,15 +181,15 @@ CREATE TABLE kafka.messages (
     key BYTEA,
     value BYTEA,
     headers JSONB,
-    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (topic_id, partition_id, partition_offset)
-);
-
--- Topic metadata
-CREATE TABLE kafka.topics (
-    id SERIAL PRIMARY KEY,
-    name TEXT UNIQUE NOT NULL,
-    partitions INT DEFAULT 1
+    timestamp_ms BIGINT NOT NULL DEFAULT -1,  -- Producer record timestamp (-1 = none)
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    producer_id BIGINT,             -- Transactional messages only
+    producer_epoch SMALLINT,
+    txn_state TEXT,                 -- NULL (committed), 'pending', 'aborted'
+    CHECK (partition_id >= 0),
+    PRIMARY KEY (topic_id, partition_id, partition_offset),
+    FOREIGN KEY (topic_id) REFERENCES kafka.topics(id) ON DELETE CASCADE,
+    UNIQUE (global_offset)
 );
 
 -- Consumer group offset tracking
@@ -182,7 +200,9 @@ CREATE TABLE kafka.consumer_offsets (
     committed_offset BIGINT NOT NULL,
     metadata TEXT,
     commit_timestamp TIMESTAMP NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (group_id, topic_id, partition_id)
+    CHECK (partition_id >= 0),
+    PRIMARY KEY (group_id, topic_id, partition_id),
+    FOREIGN KEY (topic_id) REFERENCES kafka.topics(id) ON DELETE CASCADE
 );
 
 -- Idempotent producer support (Phase 9)
@@ -201,9 +221,14 @@ CREATE TABLE kafka.producer_sequences (
     partition_id INT NOT NULL,
     last_sequence INT NOT NULL DEFAULT -1,
     updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    CHECK (partition_id >= 0),
     PRIMARY KEY (producer_id, topic_id, partition_id),
     FOREIGN KEY (topic_id) REFERENCES kafka.topics(id) ON DELETE CASCADE
 );
+
+-- Also: kafka.partition_offsets (per-partition offset counter + log start offset),
+-- kafka.transactions and kafka.txn_pending_offsets (Phase 10), and the shadow-mode
+-- tables kafka.shadow_config / shadow_tracking / shadow_metrics (Phase 11).
 ```
 
 ---
@@ -212,35 +237,49 @@ CREATE TABLE kafka.producer_sequences (
 
 ```
 src/
-├── lib.rs                  # Extension entry point, _PG_init hook
+├── lib.rs                  # Extension entry point, _PG_init hook, SQL functions
 ├── config.rs               # GUC configuration (pg_kafka.port, etc.)
 ├── worker.rs               # Background worker main loop, SPI integration
 ├── testing/
+│   ├── helpers.rs          # Test fixtures and assertions
 │   └── mocks.rs            # MockKafkaStore for unit testing
 ├── kafka/
 │   ├── mod.rs              # Module organization
 │   ├── listener.rs         # TCP listener, tokio runtime
-│   ├── protocol.rs         # Binary protocol parsing (kafka-protocol crate)
+│   ├── protocol/           # Binary protocol decoding/encoding, RecordBatch parsing (kafka-protocol crate)
 │   ├── messages.rs         # Request/response types, message queues
+│   ├── dispatch.rs         # Request dispatch helpers
+│   ├── handler_context.rs  # HandlerContext passed to every handler
 │   ├── coordinator.rs      # Consumer group coordinator (Arc<RwLock>)
+│   ├── assignment/         # Range, RoundRobin, Sticky assignment strategies
+│   ├── partitioner.rs      # Key-based partition routing (murmur2)
+│   ├── notifications.rs, pending_fetches.rs  # Long polling support
+│   ├── response_builders.rs  # Response construction, supported API version table
 │   ├── constants.rs        # Protocol constants, Kafka error codes
 │   ├── error.rs            # Typed errors with to_kafka_error_code()
 │   ├── handlers/           # Protocol request handlers
+│   │   ├── admin.rs        # CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups
+│   │   ├── configs.rs      # DescribeConfigs, IncrementalAlterConfigs, DeleteRecords
 │   │   ├── consumer.rs     # OffsetCommit/OffsetFetch
-│   │   ├── coordinator.rs  # JoinGroup, Heartbeat, LeaveGroup, SyncGroup
+│   │   ├── coordinator.rs  # FindCoordinator, JoinGroup, SyncGroup, Heartbeat, LeaveGroup, DescribeGroups, ListGroups
 │   │   ├── fetch.rs        # Fetch, ListOffsets
 │   │   ├── helpers.rs      # Topic resolution utilities
+│   │   ├── init_producer_id.rs  # InitProducerId
 │   │   ├── metadata.rs     # ApiVersions, Metadata
 │   │   ├── produce.rs      # ProduceRequest
-│   │   └── tests.rs        # Handler unit tests (56 tests)
+│   │   ├── transaction.rs  # AddPartitionsToTxn, AddOffsetsToTxn, EndTxn, TxnOffsetCommit
+│   │   └── tests.rs        # Handler unit tests (80 tests)
+│   ├── shadow/             # Shadow mode: ShadowStore, outbox forwarder, rdkafka producer, licensing
 │   └── storage/            # Storage abstraction layer
 │       ├── mod.rs          # KafkaStore trait definition
 │       ├── postgres.rs     # PostgreSQL implementation
-│       └── tests.rs        # Storage tests (43 tests)
+│       └── tests.rs        # Storage tests (53 tests)
 └── bin/
     └── pgrx_embed.rs       # pgrx embedding binary
 
-kafka_test/                 # E2E test suite using rdkafka client (195 tests)
+tests/property_tests.rs     # proptest suite (10 tests)
+kafka_test/                 # E2E test suite using rdkafka client (202 tests)
+sql/bootstrap.sql           # Schema definition
 docs/                       # Architecture decisions, protocol coverage
 ```
 
@@ -252,19 +291,20 @@ docs/                       # Architecture decisions, protocol coverage
 
 | Category | Tests | Description |
 |----------|-------|-------------|
-| Shadow Mode | 146 | External Kafka forwarding, SASL/SSL, replay |
-| Protocol | 85 | Request/response parsing and encoding |
-| Handlers | 76 | Handler logic with MockKafkaStore |
-| Assignment | 67 | Partition assignment strategies |
-| Storage | 43 | Storage types and trait verification |
-| Messages | 39 | Message encoding/decoding |
-| Response Builders | 30 | Response construction |
+| Shadow Mode | 128 | External Kafka forwarding, SASL/SSL, replay |
+| Protocol | 105 | Request/response parsing and encoding (incl. 4 proptests) |
+| Handlers | 107 | Handler logic with MockKafkaStore |
+| Assignment | 69 | Partition assignment strategies |
+| Storage | 53 | Storage types and trait verification |
+| Messages | 53 | Message encoding/decoding |
+| Response Builders | 35 | Response construction |
 | Error Handling | 22 | KafkaError variants |
-| Config | 32 | GUC configuration |
+| Config | 36 | GUC configuration |
 | Testing Utils | 23 | Test infrastructure |
-| Other | 46 | Coordinator, partitioner, constants |
-| E2E | 195 | Full integration with rdkafka client |
-| **Total** | **890+** | 686 unit + 10 property + 195 E2E |
+| Other | 82 | Coordinator, partitioner, constants, dispatch, long-poll registry, contexts |
+| Property | 10 | `tests/property_tests.rs` (proptest) |
+| E2E | 202 | Full integration with rdkafka client |
+| **Total** | **~925** | 713 unit + 10 property + 202 E2E |
 
 *Counts drift as tests are added — the CI run is the source of truth; per-category
 numbers above are indicative.*
@@ -275,6 +315,9 @@ numbers above are indicative.*
 # Unit tests (fast, no PostgreSQL required)
 cargo test --features pg14
 
+# Property tests only
+cargo test --features pg14 --test property_tests
+
 # E2E tests (requires running PostgreSQL)
 cargo pgrx start pg14
 cd kafka_test && cargo run --release
@@ -283,11 +326,13 @@ cd kafka_test && cargo run --release
 ### CI Pipeline
 
 The GitHub Actions pipeline runs:
-1. **Lint** - `cargo fmt` and `cargo clippy`
-2. **Unit Tests** - With code coverage via `cargo-llvm-cov`
-3. **E2E Tests** - Full integration with rdkafka client
-4. **Security Audit** - `cargo-audit` for vulnerability scanning
-5. **Lockfile Verification** - Ensures `Cargo.lock` is synchronized
+1. **Lint** - `cargo fmt` and `cargo clippy` (root crate and `kafka_test/`)
+2. **Unit Tests** - With code coverage via `cargo-llvm-cov`, plus the property tests
+3. **E2E Tests** - Functional, shadow mode (against an external Kafka container), and performance suites with the rdkafka client
+4. **Security Audit** - `cargo-audit` and `cargo-deny`
+5. **Lockfile Verification** - Ensures `Cargo.lock` is synchronized (root and `kafka_test/`)
+6. **PostgreSQL Matrix** - `cargo check` and unit tests against PostgreSQL 15, 16 and 17
+7. **SPI E2E Guard** - On PRs, a change to an SPI/async file must come with a `kafka_test/src/` test change
 
 ---
 
@@ -306,15 +351,18 @@ The GitHub Actions pipeline runs:
 -- In postgresql.conf:
 shared_preload_libraries = 'pg_kafka'
 
--- Network configuration (requires restart)
+-- Read at worker start (requires restart)
 pg_kafka.port = 9092              -- TCP port (default: 9092)
 pg_kafka.host = '0.0.0.0'         -- Bind address (default: 0.0.0.0 — see warning above)
-
--- Runtime configuration
+pg_kafka.database = 'postgres'    -- Database where CREATE EXTENSION pg_kafka was run
 pg_kafka.log_connections = false  -- Log each connection
 pg_kafka.shutdown_timeout_ms = 5000
+
+-- Reloadable with pg_reload_conf()
 pg_kafka.message_retention_hours = 0  -- Time-based retention sweep (0 = keep forever)
 ```
+
+See [CLAUDE.md](CLAUDE.md#configuration) for the full GUC list, including long polling, compression and Shadow Mode settings.
 
 ---
 
@@ -339,7 +387,7 @@ pg_kafka.message_retention_hours = 0  -- Time-based retention sweep (0 = keep fo
 
 - [ ] **Cooperative Rebalancing** (KIP-429)
 - [ ] **Static Group Membership** (KIP-345)
-- [ ] Table partitioning and retention policies
+- [ ] Table partitioning (time-based retention is already available)
 
 ---
 
