@@ -1,8 +1,12 @@
 # Shadow-mode forwarding — evidence & reporting plan
 
-> Status: **planned, not yet implemented.** This doc is the execution spec (every file, schema, and wiring
-> point is named). Written to a temp branch (`docs/shadow-evidence-plan`) as a hand-off; it can be executed
-> as its own focused PRs. All paths are relative to the repo root shown, absolute where cross-repo.
+> Status: **partially executed.** Part A (evidence generation) landed in c013b78 (#91), with the harness
+> instrumentation fix in 013aa9b (#92). Part B (site reporting) is live in the site repo. The first
+> `evidence.yml` run published the BASELINE (`shadow.json` at `ae666ab`, 2026-10-26: all six checks `pass`,
+> `passed: true`). Still open: PR4 (the dead `ShadowStore` producer removal), the post-PR4 re-dispatch, and
+> the optional items marked below. This doc is the execution spec (every file, schema, and wiring point is
+> named). Paths are relative to the repo root shown, absolute where cross-repo (the cross-repo paths are the
+> author's local checkout).
 
 ## Why
 
@@ -11,7 +15,7 @@ Two goals, coupled:
 1. **Continuously-verified proof that shadow forwarding is compliant** — pg_kafka is an implementation, not a
    hosted service, so "it works" is shown as *evidence regenerated in CI and published as data* (the existing
    `conformance.json` / `bench.json` / `session.svg`). Shadow-mode forwarding is currently **absent** from
-   that pipeline and from the site.
+   that pipeline and from the site. *(Done: `shadow.json` is now part of the pipeline and the site.)*
 2. **Before/after verification for the dead-`ShadowStore`-producer removal (PR4).** PR4 deletes the *dead*
    pre-outbox forwarding path; the evidence exercises the *live* path (`forward_sync_bounded` + durable outbox
    + network-thread producer). So the shadow evidence must be **identical before and after PR4** = published,
@@ -56,6 +60,7 @@ ALTER SYSTEM SET pg_kafka.shadow_mode_enabled = true;
 ALTER SYSTEM SET pg_kafka.shadow_bootstrap_servers = '<REAL_BROKER e.g. localhost:9093>';
 ALTER SYSTEM SET pg_kafka.shadow_security_protocol = 'PLAINTEXT';
 ALTER SYSTEM SET pg_kafka.config_reload_interval_ms = 2000;
+SELECT pg_reload_conf();
 -- per topic (topic must exist; resolve id via kafka.topics.name):
 INSERT INTO kafka.shadow_config
   (topic_id, mode, forward_percentage, external_topic_name, sync_mode, write_mode, updated_at)
@@ -67,9 +72,15 @@ SELECT pg_reload_conf();   -- SIGHUP; the bgworker reloads (config_reload_interv
 ```
 Config lives in `kafka.shadow_config`; results are readable from the `kafka.shadow_status` view
 (`total_forwarded/total_skipped/total_failed/last_forwarded_offset/lag` per topic) and `kafka.shadow_tracking`
-(`external_offset IS NOT NULL` = forwarded/finalized). Both granted `SELECT` to PUBLIC.
+(`external_offset IS NOT NULL` = forwarded/finalized). Both are readable by PUBLIC; on `kafka.shadow_tracking`
+the grant is column-level and excludes `error_message`. Note that `total_skipped` is always 0, because the
+code never increments `kafka.shadow_metrics.messages_skipped` (skips are counted only in RAM).
 
-### A1 — Compliance artifact `shadow.json` (new dir `evidence/shadow/`)
+### A1 — Compliance artifact `shadow.json` (new dir `evidence/shadow/`) — ✅ done
+
+Implemented as `evidence/shadow/{shadow.mjs,assemble.mjs,run.sh,package.json}` with the kafkajs option
+below. Each `checks[]` entry also carries a `detail` object with that scenario's numbers (produced,
+forwardedToBroker, forwardedMetrics, skipped, failed, lag, finalized, pending, retries, localStored).
 
 Mirror `evidence/conformance/` + `evidence/bench/` (a `run.sh` that runs a harness into `$WORK/` then a small
 `assemble.mjs` stamper; stamp from env `GENERATED_AT`/`VERSION`/`GIT_SHA`; degrade to a "pending" shape on
@@ -96,7 +107,10 @@ build `kafka_test` and capture `kafka_test --category shadow --json` — its `Su
   "passed": true }                                                    // all checks pass AND forwarded==produced (100% topic)
 ```
 
-### A2 — Throughput scenarios in the EXISTING `bench.json`
+### A2 — Throughput scenarios in the EXISTING `bench.json` — ✅ done
+
+Published scenario names: `produce · batched(100) · shadow-async · 1024B` and
+`produce · batched(100) · shadow-sync · 1024B`.
 
 Extend `evidence/bench/` so shadow-forwarding TPS lands in `bench.json.scenarios[]` and renders in the
 existing table (no new component):
@@ -122,19 +136,19 @@ existing table (no new component):
 - **`evidence/bench/assemble.mjs`** — read `bench-shadow-async.json` / `bench-shadow-sync.json` and append
   their scenario(s) to `bench.json.scenarios[]` (baselines `rawInsert`/`realBroker` unchanged).
 
-### A3 — Wire-in + docs
+### A3 — Wire-in + docs — ✅ done except the optional Tracer variant
 
-- **`scripts/generate-evidence.sh`** — add a 4th best-effort step (A1): after the recording step,
+- ✅ **`scripts/generate-evidence.sh`** — add a 4th best-effort step (A1): after the recording step,
   `echo "### shadow"; bash "$ROOT/evidence/shadow/run.sh" "$OUT_DIR" || echo "::warning::shadow step failed"`.
   A2 rides the existing `evidence/bench/run.sh` step (no orchestrator change).
-- **`.github/workflows/evidence.yml`** — the publish loop (~line 170) hard-codes the file list; add
+- ✅ **`.github/workflows/evidence.yml`** — the publish loop (~line 170) hard-codes the file list; add
   `shadow.json`: `for f in conformance.json bench.json session.svg shadow.json; do …`. (`bench.json` is
   already published, so A2 needs no publish change.)
-- **`evidence/README.md`** — add a `shadow.json` row to the artifact table + a Contract block, and note the
+- ✅ **`evidence/README.md`** — add a `shadow.json` row to the artifact table + a Contract block, and note the
   two shadow bench scenarios.
-- **`/home/rtj/workspace/RTrentJones.dev/docs/ci-throughline.md`** — add `shadow.json` to the mermaid
+- ✅ **`/home/rtj/workspace/RTrentJones.dev/docs/ci-throughline.md`** — add `shadow.json` to the mermaid
   `evidence branch` node and the per-repo table.
-- **Optional (defer):** a `mode:'shadow'` Tracer POST — Tracer's `evalRunInput` schema already accepts a
+- ⏳ **Optional (deferred, not done):** a `mode:'shadow'` Tracer POST — Tracer's `evalRunInput` schema already accepts a
   free-form `mode`, so **no Tracer code change**; add a shadow variant to `.github/scripts/ingest-tracer.mjs`
   (map each shadow check → a `cases[]` entry, `score` = fraction forwarded), inert without
   `TRACER_INGEST_TOKEN`.
@@ -145,17 +159,17 @@ and no `no-e2e-needed` label is needed.
 
 ---
 
-## Part B — Shadow reporting (site repo, `/home/rtj/workspace/RTrentJones.dev/apps/blog`)
+## Part B — Shadow reporting (site repo, `/home/rtj/workspace/RTrentJones.dev/apps/blog`) — ✅ done except the optional post paragraph
 
 The build-time loader hub is `apps/blog/src/lib/evidence.ts` (`EVIDENCE_BASE =
 raw.githubusercontent…/pg_kafka/evidence`, a generic `load<T>(file)` → `{data, source}` with a 5s timeout and
 no fabricated fallback, plus `loadConformance`/`loadBench`/`loadSessionSvg`, typed interfaces, and
 `fmtVerified(iso)`).
 
-- **Throughput → existing table, no new component.** The A2 shadow scenarios flow through the existing
+- ✅ **Throughput → existing table, no new component.** The A2 shadow scenarios flow through the existing
   `loadBench()` → `apps/blog/src/components/BenchTable.astro` (it already maps `scenarios[]`), so they appear
   as rows automatically. Only tweak: a one-line caption noting the `shadow-async`/`shadow-sync` rows.
-- **Compliance → new table.**
+- ✅ **Compliance → new table.**
   - `apps/blog/src/lib/evidence.ts` — add a `ShadowData` interface + `loadShadow()` → `shadow.json` (one
     loader, mirroring `loadBench`).
   - `apps/blog/src/components/ShadowTable.astro` — new component copying `BenchTable.astro`'s structure:
@@ -165,13 +179,13 @@ no fabricated fallback, plus `loadConformance`/`loadBench`/`loadSessionSvg`, typ
     verified" section (compliance table + a note that its throughput is the shadow rows in the benchmark table
     above), framed as *compliance verified before/after*. Shadow is currently unmentioned on the page — also
     add a one-line mention to the intro feature list.
-- Ships via the **blog's Greenlight deploy-verify-promote loop** (branch → preview → `greenlight verify` →
+- ✅ Ships via the **blog's Greenlight deploy-verify-promote loop** (branch → preview → `greenlight verify` →
   beta → prod). `apps/blog/verify.config.ts` already asserts `/pg_kafka/` returns 200.
-- *Optional:* a paragraph in `apps/blog/src/content/blog/pg-kafka-proof.mdx` (the "building the proof" post)
+- ⏳ *Optional (not done):* a paragraph in `apps/blog/src/content/blog/pg-kafka-proof.mdx` (the "building the proof" post)
   on the before/after forwarding story.
 
 **Note:** pg_kafka is deliberately **not** a Greenlight tool (`greenlight.config.ts` lists only
-heistmind/bamcp/tracer/muse + blog); its *page* rides the blog's lifecycle. No `greenlight.config.ts` change.
+heistmind/bamcp/tracer/muse/polyphony + blog); its *page* rides the blog's lifecycle. No `greenlight.config.ts` change.
 
 ---
 
@@ -179,13 +193,15 @@ heistmind/bamcp/tracer/muse + blog); its *page* rides the blog's lifecycle. No `
 
 Sequential merges under the strict `main` gate; rebase each on latest `main`.
 
-1. **PR-A (evidence: A1 `shadow.json` + A2 bench scenarios + wiring/docs)** → merge → **manually dispatch
+1. ✅ **PR-A (evidence: A1 `shadow.json` + A2 bench scenarios + wiring/docs)** → merge → **manually dispatch
    `evidence.yml`** (`gh workflow run evidence.yml`). Publishes the first `shadow.json` + shadow-throughput
    rows = **BASELINE** (dead producer code still present, but off the live path).
-2. **PR-B (site reporting)** → blog loop; renders the compliance table + shadow throughput rows (shows the
+2. ✅ **PR-B (site reporting)** → blog loop; renders the compliance table + shadow throughput rows (shows the
    baseline once published).
-3. **PR4 (dead-`ShadowStore`-producer removal)** → merge (rebased on post-A `main`).
-4. **Re-dispatch `evidence.yml`** → new evidence: every compliance check still `pass`, `counts` identical, and
+3. ⏳ **PR4 (dead-`ShadowStore`-producer removal)** → merge (rebased on post-A `main`). *Not done:*
+   `ShadowStore.producer`, `ensure_producer()` and the uncalled `ShadowStore::flush()` are still in
+   `src/kafka/shadow/store.rs`. (`ShadowProducer::send_sync` in `producer.rs` is also no longer called.)
+4. ⏳ **Re-dispatch `evidence.yml`** → new evidence: every compliance check still `pass`, `counts` identical, and
    the shadow-async/-sync TPS rows unchanged = **AFTER**, published proof PR4 was behaviour-neutral for
    forwarding.
 
@@ -201,15 +217,15 @@ Sequential merges under the strict `main` gate; rebase each on latest `main`.
 ## File / reference index
 
 Generation (this repo):
-- `scripts/generate-evidence.sh` — orchestrator (add A1 step).
-- `.github/workflows/evidence.yml` — publish loop ~L170 (add `shadow.json`); real broker already up.
+- `scripts/generate-evidence.sh` — orchestrator (A1 step added).
+- `.github/workflows/evidence.yml` — publish loop ~L170 (`shadow.json` added); real broker already up.
 - `.github/scripts/ingest-tracer.mjs` — Tracer POST (optional shadow variant).
 - `evidence/README.md` — artifact table + contracts.
 - `evidence/conformance/{run.sh,merge.mjs,apis.json}`, `evidence/bench/{run.sh,bench.mjs,assemble.mjs}` —
-  patterns to mirror.
+  patterns to mirror; `evidence/shadow/{run.sh,shadow.mjs,assemble.mjs}` — the A1 implementation.
 - `kafka_test/src/shadow/helpers.rs` (`enable_shadow_mode` SQL), `kafka_test/src/main.rs` (`--json`
-  `SuiteResult`, structs ~L316-343, emit ~L1890), `sql/bootstrap.sql` L273-359 (`shadow_config`/
-  `shadow_tracking`/`shadow_metrics`/`shadow_status`), `docker-compose.yml` (`external-kafka`, host 9093).
+  `SuiteResult`, structs ~L330-358, emit ~L1978), `sql/bootstrap.sql` L277-414 (`shadow_config`/
+  `shadow_tracking`/`shadow_metrics`/`shadow_status`/`replay_shadow_messages`), `docker-compose.yml` (`external-kafka`, host 9093).
 
 Reporting (site repo `/home/rtj/workspace/RTrentJones.dev`):
 - `apps/blog/src/lib/evidence.ts`, `apps/blog/src/components/{BenchTable,ConformanceMatrix,SessionCast}.astro`,

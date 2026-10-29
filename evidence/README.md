@@ -23,11 +23,11 @@ the same benchmark table.
 ## Layout
 
 ```
-scripts/generate-evidence.sh   # orchestrator → writes the 3 artifacts into <out-dir>
+scripts/generate-evidence.sh   # orchestrator → writes the 4 artifacts into <out-dir>
 scripts/record-session.sh      # asciinema rec of kcat -P / -C + SELECT → svg-term → session.svg
 evidence/
   conformance/
-    apis.json                  # the 23 implemented APIs (single source of truth)
+    apis.json                  # the 23 APIs the matrix probes (single source of truth for the harnesses)
     kafkajs/   conformance.mjs  # Node client
     python/    kafka_python_conformance.py   # pure-Python client
                confluent_conformance.py      # librdkafka (via confluent-kafka)
@@ -43,10 +43,14 @@ evidence/
     shadow.mjs                 # shadow-forwarding compliance (produce → pg_kafka, confirm on real broker)
     assemble.mjs               # → shadow.json
     run.sh                     # run the harness + assemble
+    package.json               # kafkajs + pg
 .github/scripts/ingest-tracer.mjs   # normalize bench.json → Tracer /api/ingest
 ```
 
 ## How a client maps to APIs
+
+`apis.json` lists 23 APIs. pg_kafka implements 26 (`src/kafka/constants.rs`); DeleteRecords (21),
+DescribeConfigs (32) and IncrementalAlterConfigs (44) are not yet in the conformance matrix.
 
 Each harness drives the client through real operations and records, per API, `pass | fail | na`:
 - every probe is independently error-trapped, so one failing API never aborts the run — it just
@@ -62,7 +66,7 @@ Each harness drives the client through real operations and records, per API, `pa
 ```jsonc
 {
   "generatedAt": "<ISO>", "version": "<git describe>", "gitSha": "<short sha>",
-  "apis": [{ "key": 0, "name": "Produce" } /* …23… */],
+  "apis": [{ "key": 0, "name": "Produce" } /* …23, from apis.json… */],
   "clients": [{ "name": "kafkajs", "lang": "Node", "version": "2.2.4",
                "results": { "Produce": "pass", "AddPartitionsToTxn": "na" /* … */ } }]
 }
@@ -79,16 +83,20 @@ Each harness drives the client through real operations and records, per API, `pa
 }
 ```
 
-`shadow.json` — one `checks[]` row per forwarding scenario (`pass|fail|na`), a `counts` parity block for
-the headline 100% dual-write topic, and `passed` (all checks pass **and** `forwardedToBroker == produced`).
-Each scenario produces to pg_kafka, drives the live forwarding path, then independently consumes the real
-broker to confirm delivery.
+`shadow.json` — one `checks[]` row per forwarding scenario (`pass|fail|na`, plus a `detail` object with
+that scenario's numbers), a `counts` parity block for the headline 100% `dual_write_sync` topic, and
+`passed` (all checks pass **and** `forwardedToBroker == produced`). Each scenario produces to pg_kafka,
+drives the live forwarding path (the durable `kafka.shadow_tracking` outbox), then independently consumes
+the real broker to confirm delivery. The six scenarios are `dual_write_sync`, `dual_write_async`,
+`external_only`, `percentage_50`, `committed_txn_forwarded` and `aborted_txn_not_forwarded`. If the
+harness produces no raw result, `assemble.mjs` emits every check as `na` with `passed: false`.
 ```jsonc
 {
   "generatedAt": "<ISO>", "version": "…", "gitSha": "…",
   "config": { "records": 500, "forwardPercentage": 100, "writeMode": "dual_write", "syncMode": "sync",
               "realBroker": "localhost:9093" },
-  "checks": [{ "name": "dual_write_sync", "status": "pass" }, { "name": "aborted_txn_not_forwarded", "status": "pass" } /* …6… */],
+  "checks": [{ "name": "dual_write_sync", "status": "pass", "detail": { "produced": 500, "forwardedToBroker": 500 /* … */ } },
+             { "name": "aborted_txn_not_forwarded", "status": "pass", "detail": { /* … */ } } /* …6… */],
   "counts": { "produced": 500, "forwardedToBroker": 500, "localStored": 500, "shadowMetricsForwarded": 500,
               "skipped": 0, "failed": 0, "outboxFinalized": 500, "lag": 0 },
   "passed": true
@@ -104,7 +112,9 @@ With the extension up on `:9092` (`cargo pgrx run pg14`), a real broker on `:909
 scripts/generate-evidence.sh ./evidence-out
 ```
 
-> **Status:** these harnesses were authored to the contract above and need a first CI run to shake
-> out client/version specifics — the matrix reports `fail`/`na` truthfully wherever a probe doesn't
-> succeed, which is the point. The pipeline is resilient: any harness that fails to build or run
-> degrades to an all-`na` row (conformance) or zeros (bench) rather than breaking the artifact.
+> **Status:** all four harnesses run in CI and publish to the `evidence` branch (the run of
+> 2026-10-26 at `ae666ab` published all four artifacts, with every `shadow.json` check `pass`). The
+> matrix reports `fail`/`na` truthfully wherever a probe doesn't succeed, which is the point. The
+> pipeline is resilient: any harness that fails to build or run degrades to an all-`na` row
+> (conformance), zeros (bench), or an all-`na` `passed: false` body (shadow) rather than breaking the
+> artifact.
