@@ -396,8 +396,11 @@ Delivery guarantees and their limits:
   never reached the forward channel (channel full) is re-claimed after the 5 s lease. A row the
   network thread dropped (shadow disabled or no producer on that side) or whose ack was dropped (ack
   channel full) stays in the in-flight set, so it is re-claimed only after that entry is evicted
-  (150 s, see below). After a worker restart the in-flight set is empty and the lease alone applies. The idempotent producer suppresses a re-send only within one producer session, so a re-send
-  that spans a producer restart lands on the external topic as a duplicate.
+  (150 s, see below). After a worker restart the in-flight set is empty and the lease alone applies. The idempotent producer only deduplicates librdkafka's own internal retries of a send. An
+  outbox re-dispatch builds a new `FutureRecord` and is a new send, so if the first send was in
+  fact delivered (only its ack was lost or late), the re-dispatch lands on the external topic as a
+  duplicate, within the same producer session as well as across a restart. Downstream consumers of
+  the external topic should deduplicate on an application-level id if they need exactly-once.
 - **In-flight gate (issue #93).** `InflightTracker` (`inflight.rs`) records every dispatched row until
   its ack is applied, and the poll excludes those rows from the claim, so a forward that is merely
   slower than the 5 s lease is no longer re-sent. Entries are evicted after 150 s
