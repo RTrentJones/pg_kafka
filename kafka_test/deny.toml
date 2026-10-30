@@ -42,3 +42,8 @@ wildcards = "deny"
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+# The ONLY permitted git dependency: the same patched kafka-protocol fork the root crate uses
+# (see ../Cargo.toml [patch.crates-io] and ../deny.toml).
+allow-git = [
+    "https://github.com/RTrentJones/kafka-protocol-rs",
+]
