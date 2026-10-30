@@ -1,13 +1,30 @@
 # ADR-001: Partitioning and Retention Strategy
 
-**Status:** Proposed (Future Phase)
+**Status:** Proposed (Future Phase). Partitioning is not implemented; retention shipped by a different mechanism (see the status note below).
 **Date:** 2026-01-02
-**Last Reviewed:** 2026-01-08
+**Last Reviewed:** 2026-10-29
 **Context:** Based on PostgreSQL queue/pubsub benchmark findings
 
-> **Note:** This is a future architectural proposal. As of Phase 8, pg_kafka does not implement
-> table partitioning or automatic retention. The current `kafka.messages` table grows unbounded.
-> This feature is planned for a future phase to address production scaling needs.
+> **Implementation status (2026-10-29):** The decision below is unchanged and still a proposal.
+> What the code does today:
+>
+> - **No table partitioning.** `kafka.messages` is a single, unpartitioned table (`sql/bootstrap.sql`).
+>   None of `kafka.ensure_next_partition()`, `kafka.drop_old_partitions()`, `sql/migrate_to_partitioned.sql`,
+>   or the `pg_kafka.retention_days` GUC exist.
+> - **Retention exists, implemented as a bounded `DELETE` sweep** (DR-1/DR-2, DEEP-REVIEW-2026-07), which is
+>   closer to the `DELETE`-based approach this ADR rejected in Alternative 2 than to partition dropping. The
+>   background worker runs the sweep every 60 seconds, deleting at most 10,000 expired rows per statement.
+>   It is controlled by `pg_kafka.message_retention_hours` (default 0 = keep forever, SIGHUP-reloadable) and
+>   can be run on demand with `SELECT * FROM pg_kafka_run_retention_sweep();`. Pending transactional messages
+>   are never deleted. The same sweep reclaims aborted transactional rows, stale producer ids, terminal
+>   transactions, and delivered shadow-outbox rows.
+> - **Per-topic retention exists** (Open Question 2 / Alternative 4, answered without per-topic partition
+>   sets). `retention.ms` set through IncrementalAlterConfigs is stored in `kafka.topics.retention_ms`
+>   (NULL = inherit the GUC, `>= 0` = enforce this window, negative = infinite) and enforced by the same sweep.
+>   DeleteRecords truncates a partition on demand, and `kafka.partition_offsets.log_start_offset` keeps the
+>   earliest offset from moving backwards.
+> - Space reclaimed by the sweep is returned through `VACUUM`. `sql/tune_autovacuum.sql` tunes autovacuum
+>   for the high-churn counter tables.
 
 ## Summary
 
@@ -362,5 +379,6 @@ Based on this retention limitation:
 **Next Steps:**
 - [ ] Implement partition management functions (Phase 3.1)
 - [ ] Test migration script with 10M+ rows
-- [ ] Document data loss behavior in user-facing docs
+- [ ] Document data loss behavior in user-facing docs (the `DELETE`-sweep retention is documented in
+      [PERFORMANCE.md](../PERFORMANCE.md#retention--lifecycle-gucs-shipped); partition dropping is not implemented)
 - [ ] Add monitoring for partition operations

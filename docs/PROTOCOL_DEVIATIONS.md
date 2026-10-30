@@ -11,7 +11,8 @@ This document lists intentional deviations from the official Kafka protocol spec
 | **Producer APIs** | ✅ Full support (idempotent + transactional) |
 | **Consumer APIs** | ✅ Full support (with automatic rebalancing) |
 | **Coordinator APIs** | ✅ Full support (Range, RoundRobin, Sticky strategies) |
-| **Admin APIs** | ✅ Full support (CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups) |
+| **Admin APIs** | ✅ Supported (CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups; see §13) |
+| **Config & Log APIs** | ✅ Minimal support (DescribeConfigs, IncrementalAlterConfigs for `retention.ms` only, DeleteRecords) |
 | **Transaction APIs** | ✅ Full support (EOS with read-committed isolation) |
 | **Shadow Mode** | ✅ Full support (external Kafka forwarding) |
 
@@ -54,8 +55,8 @@ This document lists intentional deviations from the official Kafka protocol spec
 
 **Configuration:**
 ```sql
--- Set outbound compression (default: none)
-SET pg_kafka.compression_type = 'gzip';
+-- In postgresql.conf (postmaster-level GUC, requires a server restart; default: none)
+pg_kafka.compression_type = 'gzip'
 ```
 
 **Client Impact:**
@@ -72,10 +73,11 @@ SET pg_kafka.compression_type = 'gzip';
 **Implementation:**
 - ✅ InitProducerId API allocates producer IDs with epoch
 - ✅ Sequence number tracking per topic-partition
-- ✅ Duplicate detection (DUPLICATE_SEQUENCE_NUMBER error)
+- ✅ Duplicate detection: a retried batch whose sequence range was already written is acknowledged with error code 0 and not re-inserted (this matches Kafka; the DUPLICATE_SEQUENCE_NUMBER code is defined but not returned). Unlike Kafka, the ack carries `base_offset = 0` rather than the original batch's offset
 - ✅ Out-of-order detection (OUT_OF_ORDER_SEQUENCE_NUMBER error)
 - ✅ Producer fencing via epoch (PRODUCER_FENCED error)
 - ✅ PostgreSQL advisory locks for sequence serialization
+- Produce responses report `log_start_offset = -1` and `log_append_time_ms = -1`
 
 **Client Impact:**
 - Clients can use `enable.idempotence=true` (default in librdkafka 2.0+)
@@ -95,6 +97,8 @@ SET pg_kafka.compression_type = 'gzip';
 - ✅ TxnOffsetCommit commits offsets within transaction context
 - ✅ Read-committed isolation level filters pending/aborted messages
 - ✅ Transactional producer fencing via epoch
+
+**Difference:** EndTxn moves a transaction directly from `Ongoing` to `CompleteCommit`/`CompleteAbort` inside one PostgreSQL transaction; no transaction markers are written to the log, and the `PrepareCommit`/`PrepareAbort` states are never persisted. Read-committed visibility comes from the `txn_state` column instead (see §7).
 
 **Client Impact:**
 - Transactional producers work without modification
@@ -125,7 +129,7 @@ SET pg_kafka.compression_type = 'gzip';
 - ✅ REBALANCE_IN_PROGRESS error handling
 
 **What's Not Implemented:**
-- ❌ Static group membership (KIP-345)
+- ❌ Static group membership (KIP-345): `group_instance_id` is not honored
 - ❌ Cooperative rebalancing (KIP-429)
 
 **Client Impact:**
@@ -162,10 +166,11 @@ SET pg_kafka.compression_type = 'gzip';
 - ✅ Partition watermarks (high watermark, log start offset)
 - ✅ Byte-budget fetch sizing — small-message fetches fill `max_bytes` via bounded
   iterative queries instead of capping at a fixed row count (DR-9)
-- ✅ Long polling (max_wait_ms/min_bytes support) - Phase 8
+- ✅ Long polling (max_wait_ms/min_bytes support)
 
 **What's Missing:**
 - ❌ Fetch sessions (always uses fetch session ID 0)
+- At most 64 long-poll fetches may wait concurrently per connection; a fetch over that cap is answered immediately (possibly empty) instead of waiting for `max_wait_ms`
 
 **Client Impact:**
 - Works with standard Kafka clients
@@ -222,9 +227,9 @@ honored; producer CreateTime timestamps are preserved — BUG-7).
 
 ### 10. Dynamic Topic Creation
 
-**Status:** Always enabled
-**Kafka Behavior:** `auto.create.topics.enable` defaults to `false`
-**pg_kafka Behavior:** Topics auto-created on first produce
+**Status:** Always enabled for Produce
+**Kafka Behavior:** Governed by the broker setting `auto.create.topics.enable` (default `true`, commonly disabled in production)
+**pg_kafka Behavior:** There is no broker-level switch. Topics are always auto-created on first produce. A Metadata request also auto-creates requested topics unless the client sends `allow_auto_topic_creation=false` (Metadata v4+), in which case a missing topic is reported as UNKNOWN_TOPIC_OR_PARTITION
 
 **Client Impact:**
 - Typos in topic names create unwanted topics
@@ -260,16 +265,32 @@ honored; producer CreateTime timestamps are preserved — BUG-7).
 - Messages without keys may not batch to the same partition
 - No impact on ordering guarantees (null keys have no ordering guarantee in Kafka either)
 
+## Admin API Deviations
+
+### 13. CreateTopics / DeleteGroups / Config APIs
+
+**Status:** Minor deviations by design
+
+- **CreateTopics ignores topic configs.** Per-topic `configs` (e.g. `retention.ms`), manual replica assignments, and `replication_factor` in the request are accepted but not applied; the response always reports replication factor 1. Set `retention.ms` afterwards with IncrementalAlterConfigs.
+- **CreateTopics default partition count.** `num_partitions <= 0` (including `-1`, "broker default") creates a 1-partition topic. It does not use the `pg_kafka.default_partitions` GUC, which applies only to auto-created topics. As a result CreateTopics never returns INVALID_PARTITIONS.
+- **DeleteGroups on an unknown group** succeeds (error code 0, any orphaned committed offsets are deleted) instead of returning GROUP_ID_NOT_FOUND.
+- **CreatePartitions** does not itself trigger a rebalance; consumers pick up the new partitions on their next metadata refresh.
+- **DescribeConfigs** supports only TOPIC resources and reports only `retention.ms` and `cleanup.policy` (always `delete`; there is no log compaction). BROKER and other resource types return INVALID_REQUEST. Versions v1-v4 only (the kafka-protocol crate does not implement v0).
+- **IncrementalAlterConfigs** accepts only SET/DELETE of `retention.ms` on TOPIC resources. Any other key or operation (APPEND/SUBTRACT) fails the whole resource with INVALID_CONFIG rather than being silently accepted.
+- **AlterConfigs (33)** is not implemented.
+
 ## API Version Support
 
-### Supported APIs (18 total)
+### Supported APIs (26 total)
+
+These ranges are both advertised in ApiVersions and enforced on inbound requests (`API_VERSION_RANGES` in `src/kafka/response_builders.rs`); an out-of-range request gets UNSUPPORTED_VERSION.
 
 | API Key | Name | Versions | Status |
 |---------|------|----------|--------|
 | 0 | Produce | 3-9 | ✅ Full support (with key-based routing) |
-| 1 | Fetch | 0-11 | ✅ Full support |
+| 1 | Fetch | 0-11 | ✅ Full support (v12+ not advertised; v13+ uses topic IDs) |
 | 2 | ListOffsets | 0-7 | ✅ Implemented (incl. timestamp lookup) |
-| 3 | Metadata | 0-9 | ✅ Full support |
+| 3 | Metadata | 0-10 | ✅ Full support (v10 `topic_id` is the zero UUID) |
 | 8 | OffsetCommit | 0-8 | ✅ Full support |
 | 9 | OffsetFetch | 0-7 | ✅ Full support |
 | 10 | FindCoordinator | 0-3 | ✅ Full support |
@@ -277,15 +298,23 @@ honored; producer CreateTime timestamps are preserved — BUG-7).
 | 12 | Heartbeat | 0-4 | ✅ Full support |
 | 13 | LeaveGroup | 0-4 | ✅ Full support |
 | 14 | SyncGroup | 0-4 | ✅ Full support |
-| 15 | DescribeGroups | 0-4 | ✅ Full support |
+| 15 | DescribeGroups | 0-5 | ✅ Full support |
 | 16 | ListGroups | 0-4 | ✅ Full support |
 | 18 | ApiVersions | 0-3 | ✅ Full support |
-| 19 | CreateTopics | 0-7 | ✅ Full support |
-| 20 | DeleteTopics | 0-6 | ✅ Full support |
-| 37 | CreatePartitions | 0-3 | ✅ Full support |
+| 19 | CreateTopics | 0-5 | ✅ Supported (topic configs ignored, see §13) |
+| 20 | DeleteTopics | 0-4 | ✅ Full support |
+| 21 | DeleteRecords | 0-2 | ✅ Full support |
+| 22 | InitProducerId | 0-4 | ✅ Full support |
+| 24 | AddPartitionsToTxn | 0-3 | ✅ Full support |
+| 25 | AddOffsetsToTxn | 0-3 | ✅ Full support |
+| 26 | EndTxn | 0-3 | ✅ Full support |
+| 28 | TxnOffsetCommit | 0-3 | ✅ Full support |
+| 32 | DescribeConfigs | 1-4 | ✅ Minimal (TOPIC resources, see §13) |
+| 37 | CreatePartitions | 0-2 | ✅ Full support |
 | 42 | DeleteGroups | 0-2 | ✅ Full support |
+| 44 | IncrementalAlterConfigs | 0-1 | ✅ Minimal (`retention.ms` only, see §13) |
 
-**Note:** OffsetFetch v8+ uses different response format. We support v0-7.
+**Note:** OffsetFetch v8+ uses a different (multi-group) response format. We support v0-7.
 
 ## Error Handling
 
@@ -323,7 +352,7 @@ impl KafkaError {
 - Broker-internal / admin-utility APIs (DescribeTransactions, ListTransactions, DescribeProducers) - Not planned (monitoring-only)
 - Log compaction - Not planned (PostgreSQL UPDATE provides similar semantics)
 
-> Transaction APIs (InitProducerId 22, AddPartitionsToTxn 24, AddOffsetsToTxn 25, EndTxn 26, TxnOffsetCommit 28) and the core Admin APIs (CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups) **are** implemented — see the Summary above and `KAFKA_PROTOCOL_COVERAGE.md`.
+> Transaction APIs (InitProducerId 22, AddPartitionsToTxn 24, AddOffsetsToTxn 25, EndTxn 26, TxnOffsetCommit 28), the core Admin APIs (CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups), and the config/log APIs (DescribeConfigs 32, IncrementalAlterConfigs 44, DeleteRecords 21) **are** implemented — see the Summary above and `KAFKA_PROTOCOL_COVERAGE.md`.
 
 ## Acknowledgment Durability (RB-1)
 
@@ -381,7 +410,7 @@ Wire-level SASL/ACLs are **not planned**; the accepted posture is network-contro
 | Client | Version | Status | Notes |
 |--------|---------|--------|-------|
 | kcat | 1.7.0+ | ✅ Works | Producer and consumer tested |
-| rdkafka (Rust) | 0.36+ | ✅ Works | Full E2E test suite (195 tests) |
+| rdkafka (Rust) | 0.36+ | ✅ Works | Full E2E test suite (202 tests) |
 
 ### Client Configuration
 
@@ -423,7 +452,7 @@ auto.offset.reset=earliest
 
 ---
 
-**Last Updated:** 2026-06-29
+**Last Updated:** 2026-10-29
 **Applies To:** pg_kafka Phase 11 Complete (Shadow Mode)
 **API Coverage:** 26 of ~50 Kafka APIs (52%)
-**Test Status:** 686 unit + 10 property + 195 E2E tests (CI-gated; counts drift — CI is the source of truth)
+**Test Status:** 713 unit + 10 property + 202 E2E tests (CI-gated; counts drift — CI is the source of truth)

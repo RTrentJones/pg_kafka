@@ -36,8 +36,10 @@ Shadow Mode enables forwarding messages to an external Apache Kafka cluster whil
 ### Location
 
 All code in:
-- `src/kafka/shadow/` directory (10 files, ~4,000 lines)
-- `sql/shadow_mode.sql` (schema definitions)
+- `src/kafka/shadow/` directory (11 Rust files, ~6,200 lines, plus its `LICENSE`)
+- the "Phase 11: Shadow Mode" section of `sql/bootstrap.sql` (the `kafka.shadow_config`,
+  `kafka.shadow_tracking` and `kafka.shadow_metrics` tables, the `kafka.shadow_status` view, and the
+  `kafka.replay_shadow_messages()` function). There is no separate shadow SQL file.
 
 ### Source Available
 
@@ -63,13 +65,16 @@ You can evaluate Shadow Mode with:
 pg_kafka.shadow_license_key = 'eval'
 ```
 
-This enables full functionality with periodic warning logs.
+`'evaluation'` is accepted as a synonym. This enables full functionality with periodic warning logs.
 
 ### Enforcement
 
 Shadow Mode uses a "soft lock" approach:
-- **No DRM or crippling** - full functionality available
-- **Warning logs** every hour if unlicensed
+- **No DRM or crippling** - full functionality available; forwarding is never blocked
+- **Warning logs** at most once per hour while records are being forwarded, if the key is empty
+  (unlicensed), `eval`/`evaluation`, or malformed. A registered key logs nothing.
+- **Format check only** - a registered key is any `sponsor_id:token` pair with both halves non-empty.
+  No signature is verified (see `src/kafka/shadow/license.rs`).
 - **Trust-based model** - we trust users to comply with licensing
 
 Large companies have compliance departments that enforce license terms. We don't need technical enforcement; legal teams do it for us.
@@ -79,8 +84,8 @@ Large companies have compliance departments that enforce license terms. We don't
 ### Production License
 
 ```sql
--- In postgresql.conf:
-pg_kafka.shadow_license_key = 'your_sponsor_id:signature'
+-- In postgresql.conf (shadow_license_key requires a restart; it is superuser-only and hidden from SHOW ALL):
+pg_kafka.shadow_license_key = 'your_sponsor_id:token'
 pg_kafka.shadow_mode_enabled = true
 pg_kafka.shadow_bootstrap_servers = 'kafka1:9092,kafka2:9092'
 ```
@@ -88,7 +93,7 @@ pg_kafka.shadow_bootstrap_servers = 'kafka1:9092,kafka2:9092'
 ### Evaluation Mode
 
 ```sql
--- In postgresql.conf:
+-- In postgresql.conf (requires restart):
 pg_kafka.shadow_license_key = 'eval'
 pg_kafka.shadow_mode_enabled = true
 pg_kafka.shadow_bootstrap_servers = 'localhost:9093'
@@ -103,7 +108,7 @@ A: Yes! The core extension is fully open source with no restrictions.
 A: Yes! It's source-available. Read, audit, and understand it before purchasing.
 
 **Q: What if I use Shadow Mode without a license?**
-A: It will run but emit warning logs. You're trusting our work; we're trusting you to pay if it provides value.
+A: It will run but emit a warning log at most once per hour while forwarding. You're trusting our work; we're trusting you to pay if it provides value.
 
 **Q: Do I need a license per database/server?**
 A: Licensing is per **organization**, not per instance. One sponsorship covers your company's use.
