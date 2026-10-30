@@ -43,3 +43,9 @@ serde_json = "1"
 
 # Timing utilities
 chrono = { version = "0.4", features = ["serde"] }
+
+# Same kafka-protocol fork as the root crate (see ../Cargo.toml): the fork also moves zstd to 0.14,
+# which clears the zstd-safe 7.x / zstd-sys 2.0 advisories that crates.io kafka-protocol 0.17
+# (zstd ^0.13) cannot. Keep this rev in lockstep with the root [patch.crates-io].
+[patch.crates-io]
+kafka-protocol = { git = "https://github.com/RTrentJones/kafka-protocol-rs", rev = "642043e3a6681e51e2b6d37e5c8b69c2db633ea6" }

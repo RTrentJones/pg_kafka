@@ -99,7 +99,8 @@ codegen-units = 1
 # i32::MAX aborted the worker) and the four Vec<u8>/String vec![0; wire_len] decoders (guarded against
 # remaining bytes). See records.rs / protocol/types.rs in the fork.
 #
-# Fork: https://github.com/RTrentJones/kafka-protocol-rs (branch bounded-decompress)
+# Fork: https://github.com/RTrentJones/kafka-protocol-rs (branch claude/upbeat-cori-utc1j7: the
+# bounded-decompress caps plus zstd 0.14, which clears the zstd-safe 7.x / zstd-sys 2.0 advisories)
 #
 # DR-14 (DEEP-REVIEW-2026-07) — supply-chain contingency for this fork:
 # the rev pin means builds are reproducible, but if the fork repo ever becomes
@@ -113,4 +114,4 @@ codegen-units = 1
 #      removes the fork entirely (preferred long-term exit).
 # cargo-deny (deny.toml [sources]) pins this as the ONLY allowed git dependency.
 [patch.crates-io]
-kafka-protocol = { git = "https://github.com/RTrentJones/kafka-protocol-rs", rev = "3094a3e9167baca547620fefeb9d1ad949e46535" }
+kafka-protocol = { git = "https://github.com/RTrentJones/kafka-protocol-rs", rev = "642043e3a6681e51e2b6d37e5c8b69c2db633ea6" }
