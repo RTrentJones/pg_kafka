@@ -1,0 +1,61 @@
+{
+  "generatedAt": "2026-11-02T14:28:00Z",
+  "version": "6c982be",
+  "gitSha": "6c982be",
+  "config": {
+    "warmupExcluded": true,
+    "messageSizes": [
+      1024
+    ]
+  },
+  "scenarios": [
+    {
+      "name": "produce · unbatched · 1024B",
+      "p50Ms": 1.64,
+      "p99Ms": 2.53,
+      "msgsPerSec": 596
+    },
+    {
+      "name": "produce · batched(100) · 1024B",
+      "p50Ms": 7,
+      "p99Ms": 10.39,
+      "msgsPerSec": 13523
+    },
+    {
+      "name": "consume · 1024B",
+      "p50Ms": 0,
+      "p99Ms": 0.02,
+      "msgsPerSec": 22385
+    },
+    {
+      "name": "end-to-end · 1024B",
+      "p50Ms": 9.2,
+      "p99Ms": 12.1,
+      "msgsPerSec": 170
+    },
+    {
+      "name": "produce · batched(100) · shadow-async · 1024B",
+      "p50Ms": 6.81,
+      "p99Ms": 16.3,
+      "msgsPerSec": 13422
+    },
+    {
+      "name": "produce · batched(100) · shadow-sync · 1024B",
+      "p50Ms": 6.88,
+      "p99Ms": 9.37,
+      "msgsPerSec": 14191
+    }
+  ],
+  "baselines": {
+    "rawInsert": {
+      "msgsPerSec": 8368,
+      "p50Ms": 0.1,
+      "p99Ms": 0.3
+    },
+    "realBroker": {
+      "msgsPerSec": 1586,
+      "p50Ms": 0.54,
+      "p99Ms": 2.58
+    }
+  }
+}
