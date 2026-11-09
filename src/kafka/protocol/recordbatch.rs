@@ -137,6 +137,15 @@ pub fn parse_record_batch(batch_bytes: &bytes::Bytes) -> Result<Vec<Record>> {
     // Try RecordBatch v2 format first (Kafka 0.11+)
     // If that fails, fall back to MessageSet v0/v1 (legacy format)
     match RecordBatchDecoder::decode(&mut batch_buf) {
+        // Produce v3+ (the only Produce versions pg_kafka accepts) must carry exactly one
+        // record batch per partition. Decoding one and ignoring the rest silently dropped
+        // the trailing batches while the request was acked; reject it as Kafka does.
+        Ok(_) if batch_buf.has_remaining() => Err(KafkaError::InvalidRecord {
+            message: format!(
+                "partition data carries more than one record batch ({} trailing bytes)",
+                batch_buf.remaining()
+            ),
+        }),
         Ok(record_set) => {
             // RecordSet contains a Vec<Record> in the .records field
             let mut records = Vec::new();
@@ -320,6 +329,58 @@ fn parse_message_set_legacy(
 mod tests {
     use super::*;
     use bytes::Bytes;
+
+    fn encode_batch(values: &[&str]) -> bytes::BytesMut {
+        use kafka_protocol::records::{
+            Compression, Record as PRecord, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
+        };
+        let records: Vec<PRecord> = values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| PRecord {
+                transactional: false,
+                control: false,
+                partition_leader_epoch: 0,
+                producer_id: -1,
+                producer_epoch: -1,
+                timestamp_type: TimestampType::Creation,
+                offset: i as i64,
+                sequence: -1,
+                timestamp: 0,
+                key: None,
+                value: Some(Bytes::from(v.to_string())),
+                headers: Default::default(),
+            })
+            .collect();
+        let mut buf = bytes::BytesMut::new();
+        RecordBatchEncoder::encode(
+            &mut buf,
+            records.iter(),
+            &RecordEncodeOptions {
+                version: 2,
+                compression: Compression::None,
+            },
+        )
+        .unwrap();
+        buf
+    }
+
+    #[test]
+    fn test_second_record_batch_is_rejected_not_dropped() {
+        // Produce v3+ allows exactly one batch per partition. A second batch used to be
+        // ignored while the request was acked (silent data loss); it is now rejected.
+        let one = encode_batch(&["a"]);
+        assert_eq!(parse_record_batch(&one.clone().freeze()).unwrap().len(), 1);
+
+        let mut two = one;
+        two.extend_from_slice(&encode_batch(&["b"]));
+        let err = parse_record_batch(&two.freeze()).unwrap_err();
+        assert!(matches!(err, KafkaError::InvalidRecord { .. }), "{:?}", err);
+        assert_eq!(
+            err.to_kafka_error_code(),
+            crate::kafka::constants::ERROR_INVALID_RECORD
+        );
+    }
 
     // ========== Empty/Edge Case Tests ==========
 

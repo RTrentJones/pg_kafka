@@ -54,6 +54,7 @@ use kafka_test::{
     test_aborted_transaction_not_forwarded,
     test_active_idempotent_producer_survives_retention_sweep,
     test_add_partitions_to_txn_idempotent,
+    test_api_versions_above_range_negotiates_down,
     // Protocol compliance tests (Phase 4)
     test_api_versions_negotiation,
     // Shadow outbox duplicate-delivery guard (issue #93)
@@ -104,6 +105,7 @@ use kafka_test::{
     test_consumer_rejoin_after_leave,
     test_coordinator_state_race,
     test_correlation_id_preserved,
+    test_corrupt_acks0_produce_sends_no_reply,
     // Admin tests
     test_create_multiple_topics,
     test_create_partitions,
@@ -140,6 +142,7 @@ use kafka_test::{
     test_external_only_mode,
     test_external_primary_dead_letter_serves_local,
     test_fenced_producer_cannot_write,
+    test_fetch_advertised_minimum_is_usable,
     test_fetch_after_offset_reset,
     test_fetch_bad_partition_or_offset_returns_error,
     test_fetch_committed_no_history,
@@ -235,6 +238,7 @@ use kafka_test::{
     test_produce_latency_percentiles,
     test_produce_throughput_baseline,
     test_produce_timeout,
+    test_produce_two_batches_in_one_partition_is_rejected,
     test_produce_while_consuming,
     test_producer,
     test_producer_acks_zero,
@@ -748,6 +752,30 @@ fn get_all_tests() -> Vec<TestDef> {
             parallel_safe: true,
         },
         // Error path tests
+        TestDef {
+            category: "error_paths",
+            name: "test_corrupt_acks0_produce_sends_no_reply",
+            test_fn: wrap_test!(test_corrupt_acks0_produce_sends_no_reply),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_produce_two_batches_in_one_partition_is_rejected",
+            test_fn: wrap_test!(test_produce_two_batches_in_one_partition_is_rejected),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_fetch_advertised_minimum_is_usable",
+            test_fn: wrap_test!(test_fetch_advertised_minimum_is_usable),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_api_versions_above_range_negotiates_down",
+            test_fn: wrap_test!(test_api_versions_above_range_negotiates_down),
+            parallel_safe: true,
+        },
         TestDef {
             category: "error_paths",
             name: "test_fenced_producer_cannot_write",

@@ -220,3 +220,255 @@ pub async fn test_fenced_producer_cannot_write() -> TestResult {
     println!("✅ Test PASSED\n");
     Ok(())
 }
+
+// ----- wire-level protocol regressions -----
+
+use bytes::{Buf, BufMut, BytesMut};
+use kafka_protocol::messages::produce_request::{
+    PartitionProduceData, ProduceRequest, TopicProduceData,
+};
+use kafka_protocol::messages::TopicName;
+use kafka_protocol::protocol::StrBytes;
+use kafka_protocol::records::{
+    Compression, Record as PRecord, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
+};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+
+const BROKER: &str = "localhost:9092";
+
+/// Write a raw request frame with a v1 (non-flexible) header and an empty client id.
+async fn send_raw(
+    stream: &mut TcpStream,
+    api_key: i16,
+    version: i16,
+    correlation_id: i32,
+    body: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut frame = BytesMut::new();
+    frame.put_i32((2 + 2 + 4 + 2 + body.len()) as i32);
+    frame.put_i16(api_key);
+    frame.put_i16(version);
+    frame.put_i32(correlation_id);
+    frame.put_i16(-1);
+    frame.extend_from_slice(body);
+    stream.write_all(&frame).await?;
+    Ok(())
+}
+
+/// Read one response frame, or None if the broker closed the connection.
+async fn read_raw(stream: &mut TcpStream) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
+    let mut size = [0u8; 4];
+    match tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut size)).await? {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => return Ok(None),
+        Err(e) => return Err(e.into()),
+    }
+    let mut body = vec![0u8; i32::from_be_bytes(size) as usize];
+    stream.read_exact(&mut body).await?;
+    Ok(Some(body))
+}
+
+/// ApiVersions above the supported range is answered in the v0 format with
+/// UNSUPPORTED_VERSION and the key list (KIP-511), instead of an encode failure
+/// that drops the connection.
+pub async fn test_api_versions_above_range_negotiates_down() -> TestResult {
+    println!("=== Test: ApiVersions Above Range Negotiates Down ===\n");
+    let mut stream = TcpStream::connect(BROKER).await?;
+    // ApiVersions v3+ uses the flexible request header (v2), which ends with an empty
+    // tagged-field section after the client id; the body is likewise just tagged fields.
+    let mut frame = BytesMut::new();
+    frame.put_i16(18);
+    frame.put_i16(5);
+    frame.put_i32(501);
+    frame.put_i16(-1); // null client id
+    frame.put_u8(0); // header tagged fields
+    frame.put_u8(0); // body tagged fields
+    let mut sized = BytesMut::new();
+    sized.put_i32(frame.len() as i32);
+    sized.extend_from_slice(&frame);
+    stream.write_all(&sized).await?;
+    let body = read_raw(&mut stream)
+        .await?
+        .ok_or("the broker closed the connection instead of answering ApiVersions v5")?;
+    let mut b = &body[..];
+    assert_eq!(b.get_i32(), 501, "correlation id");
+    let error_code = b.get_i16();
+    let key_count = b.get_i32();
+    println!("   error_code={} api_keys={}", error_code, key_count);
+    assert_eq!(error_code, 35, "UNSUPPORTED_VERSION");
+    assert!(key_count > 0, "the key list lets the client pick a version");
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// Fetch v0-3 used to be advertised although the protocol crate cannot encode
+/// them. The advertised range now starts at v4, and a v4 fetch works.
+pub async fn test_fetch_advertised_minimum_is_usable() -> TestResult {
+    println!("=== Test: Fetch Advertised Minimum Is Usable ===\n");
+    let mut stream = TcpStream::connect(BROKER).await?;
+    let response = crate::error_paths::bug_hunt::roundtrip(
+        &mut stream,
+        0,
+        502,
+        &kafka_protocol::messages::api_versions_request::ApiVersionsRequest::default(),
+    )
+    .await?;
+    let fetch = response
+        .api_keys
+        .iter()
+        .find(|k| k.api_key == 1)
+        .ok_or("Fetch not advertised")?;
+    println!(
+        "   Fetch advertised v{}..=v{}",
+        fetch.min_version, fetch.max_version
+    );
+    assert_eq!(fetch.min_version, 4);
+
+    let ctx = TestContext::new().await?;
+    let topic = crate::fixtures::TestTopicBuilder::new(&ctx, "review-fetch-min")
+        .with_partitions(1)
+        .build()
+        .await?;
+    let fetched = crate::error_paths::bug_hunt::roundtrip(
+        &mut stream,
+        fetch.min_version,
+        503,
+        &crate::error_paths::bug_hunt::fetch_request(&topic.name, 0, 0, 0),
+    )
+    .await?;
+    assert_eq!(fetched.responses[0].partitions[0].error_code, 0);
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+fn record_batch(value: &str) -> BytesMut {
+    let record = PRecord {
+        transactional: false,
+        control: false,
+        partition_leader_epoch: 0,
+        producer_id: -1,
+        producer_epoch: -1,
+        timestamp_type: TimestampType::Creation,
+        offset: 0,
+        sequence: -1,
+        timestamp: 0,
+        key: None,
+        value: Some(bytes::Bytes::from(value.to_string())),
+        headers: Default::default(),
+    };
+    let mut buf = BytesMut::new();
+    RecordBatchEncoder::encode(
+        &mut buf,
+        [record].iter(),
+        &RecordEncodeOptions {
+            version: 2,
+            compression: Compression::None,
+        },
+    )
+    .expect("encode record batch");
+    buf
+}
+
+fn produce_request(topic: &str, records: bytes::Bytes, acks: i16) -> ProduceRequest {
+    let mut p = PartitionProduceData::default();
+    p.index = 0;
+    p.records = Some(records);
+    let mut t = TopicProduceData::default();
+    t.name = TopicName(StrBytes::from_string(topic.to_string()));
+    t.partition_data = vec![p];
+    let mut req = ProduceRequest::default();
+    req.acks = acks;
+    req.timeout_ms = 5000;
+    req.topic_data = vec![t];
+    req
+}
+
+/// Produce v3+ allows one record batch per partition. A second batch used to be
+/// dropped while the request was acked; it must now be rejected (INVALID_RECORD)
+/// with nothing stored.
+pub async fn test_produce_two_batches_in_one_partition_is_rejected() -> TestResult {
+    println!("=== Test: Two Record Batches In One Partition Are Rejected ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = crate::fixtures::TestTopicBuilder::new(&ctx, "review-two-batches")
+        .with_partitions(1)
+        .build()
+        .await?;
+    let mut two = record_batch("first");
+    two.extend_from_slice(&record_batch("second"));
+
+    let mut stream = TcpStream::connect(BROKER).await?;
+    let response = crate::error_paths::bug_hunt::roundtrip(
+        &mut stream,
+        7,
+        504,
+        &produce_request(&topic.name, two.freeze(), 1),
+    )
+    .await?;
+    let p = &response.responses[0].partition_responses[0];
+    let stored = count_messages(&ctx, &topic.name).await?;
+    println!("   error_code={} stored={}", p.error_code, stored);
+    assert_eq!(p.error_code, 87, "INVALID_RECORD");
+    assert_eq!(stored, 0, "neither batch may be stored");
+
+    // A single batch is still accepted.
+    let ok = crate::error_paths::bug_hunt::roundtrip(
+        &mut stream,
+        7,
+        505,
+        &produce_request(&topic.name, record_batch("only").freeze(), 1),
+    )
+    .await?;
+    assert_eq!(ok.responses[0].partition_responses[0].error_code, 0);
+    assert_eq!(count_messages(&ctx, &topic.name).await?, 1);
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// An acks=0 produce never gets a reply, even when its batch is corrupt. An
+/// unsolicited error reply would be read as the answer to the next request.
+pub async fn test_corrupt_acks0_produce_sends_no_reply() -> TestResult {
+    println!("=== Test: Corrupt acks=0 Produce Sends No Reply ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = crate::fixtures::TestTopicBuilder::new(&ctx, "review-acks0-corrupt")
+        .with_partitions(1)
+        .build()
+        .await?;
+    let mut stream = TcpStream::connect(BROKER).await?;
+
+    // Fire-and-forget produce with garbage in place of a record batch...
+    let req = produce_request(
+        &topic.name,
+        bytes::Bytes::from_static(b"not a record batch at all"),
+        0,
+    );
+    let mut header = kafka_protocol::messages::RequestHeader::default();
+    header.request_api_key = 0;
+    header.request_api_version = 7;
+    header.correlation_id = 506;
+    let mut body = BytesMut::new();
+    use kafka_protocol::protocol::Encodable;
+    header.encode(&mut body, 1)?;
+    req.encode(&mut body, 7)?;
+    let mut frame = BytesMut::new();
+    frame.put_i32(body.len() as i32);
+    frame.extend_from_slice(&body);
+    stream.write_all(&frame).await?;
+
+    // ...then an ordinary request: its reply must be the first frame we read.
+    send_raw(&mut stream, 18, 0, 507, &[]).await?;
+    let first = read_raw(&mut stream).await?.ok_or("connection closed")?;
+    let correlation = (&first[..]).get_i32();
+    println!("   first reply correlation id: {}", correlation);
+    assert_eq!(
+        correlation, 507,
+        "the acks=0 produce must not have been answered"
+    );
+
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}

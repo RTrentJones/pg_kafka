@@ -31,14 +31,18 @@ use super::constants::*;
 ///   v10 because clients with an explicit broker version that don't down-negotiate — notably Sarama
 ///   `V2_8_0_0` — send Metadata v10 unconditionally; rejecting it broke their bootstrap (the rejection
 ///   is an error frame strict decoders can't parse). v11+ adds fields/semantics we don't serve.
+/// - Minimums follow the kafka-protocol crate: it cannot decode or encode Fetch v0-3,
+///   ListOffsets v0, OffsetCommit v0-1, OffsetFetch v0, CreateTopics v0-1 or DeleteTopics v0,
+///   so advertising them made a negotiating client's first request drop the connection. The
+///   `every_advertised_version_encodes` test keeps the table and the crate in step.
 pub const API_VERSION_RANGES: &[(i16, i16, i16)] = &[
     (API_KEY_API_VERSIONS, 0, 3),
     (API_KEY_METADATA, 0, 10),
     (API_KEY_PRODUCE, 3, 9),
-    (API_KEY_FETCH, 0, 11),
-    (API_KEY_LIST_OFFSETS, 0, 7),
-    (API_KEY_OFFSET_COMMIT, 0, 8),
-    (API_KEY_OFFSET_FETCH, 0, 7),
+    (API_KEY_FETCH, 4, 11),
+    (API_KEY_LIST_OFFSETS, 1, 7),
+    (API_KEY_OFFSET_COMMIT, 2, 8),
+    (API_KEY_OFFSET_FETCH, 1, 7),
     (API_KEY_FIND_COORDINATOR, 0, 3),
     (API_KEY_JOIN_GROUP, 0, 7),
     (API_KEY_HEARTBEAT, 0, 4),
@@ -46,8 +50,8 @@ pub const API_VERSION_RANGES: &[(i16, i16, i16)] = &[
     (API_KEY_SYNC_GROUP, 0, 4),
     (API_KEY_DESCRIBE_GROUPS, 0, 5),
     (API_KEY_LIST_GROUPS, 0, 4),
-    (API_KEY_CREATE_TOPICS, 0, 5),
-    (API_KEY_DELETE_TOPICS, 0, 4),
+    (API_KEY_CREATE_TOPICS, 2, 5),
+    (API_KEY_DELETE_TOPICS, 1, 4),
     (API_KEY_CREATE_PARTITIONS, 0, 2),
     (API_KEY_DELETE_GROUPS, 0, 2),
     (API_KEY_INIT_PRODUCER_ID, 0, 4),
@@ -173,6 +177,32 @@ pub fn build_produce_error_response(_error_code: i16) -> ProduceResponse {
     // Errors are per-topic/partition. Return empty response for protocol-level errors.
     let mut response = ProduceResponse::default();
     response.throttle_time_ms = 0;
+    response
+}
+
+/// A ProduceResponse reporting `error_code` on every requested partition.
+pub fn build_produce_partition_error_response(
+    topic_data: &[crate::kafka::messages::TopicProduceData],
+    error_code: i16,
+) -> kafka_protocol::messages::produce_response::ProduceResponse {
+    use kafka_protocol::messages::produce_response::{
+        PartitionProduceResponse, TopicProduceResponse,
+    };
+    let mut response = build_produce_response();
+    for topic in topic_data {
+        let mut t = TopicProduceResponse::default();
+        t.name = kafka_protocol::messages::TopicName(topic.name.clone().into());
+        for p in &topic.partitions {
+            let mut pr = PartitionProduceResponse::default();
+            pr.index = p.partition_index;
+            pr.error_code = error_code;
+            pr.base_offset = -1;
+            pr.log_append_time_ms = -1;
+            pr.log_start_offset = -1;
+            t.partition_responses.push(pr);
+        }
+        response.responses.push(t);
+    }
     response
 }
 
@@ -465,6 +495,41 @@ pub fn error_response_for(
             api_version,
             response: build_incremental_alter_configs_error_response(error_code),
         },
+        // Transaction APIs. AddPartitionsToTxn and TxnOffsetCommit carry their errors per
+        // partition, so without the request this is an empty (decodable) response; AddOffsetsToTxn
+        // and EndTxn have a top-level error code.
+        API_KEY_ADD_PARTITIONS_TO_TXN => KafkaResponse::AddPartitionsToTxn {
+            correlation_id,
+            api_version,
+            response: {
+                let mut r = kafka_protocol::messages::add_partitions_to_txn_response::AddPartitionsToTxnResponse::default();
+                r.error_code = error_code; // v4+ only
+                r
+            },
+        },
+        API_KEY_ADD_OFFSETS_TO_TXN => KafkaResponse::AddOffsetsToTxn {
+            correlation_id,
+            api_version,
+            response: {
+                let mut r = kafka_protocol::messages::add_offsets_to_txn_response::AddOffsetsToTxnResponse::default();
+                r.error_code = error_code;
+                r
+            },
+        },
+        API_KEY_END_TXN => KafkaResponse::EndTxn {
+            correlation_id,
+            api_version,
+            response: {
+                let mut r = kafka_protocol::messages::end_txn_response::EndTxnResponse::default();
+                r.error_code = error_code;
+                r
+            },
+        },
+        API_KEY_TXN_OFFSET_COMMIT => KafkaResponse::TxnOffsetCommit {
+            correlation_id,
+            api_version,
+            response: kafka_protocol::messages::txn_offset_commit_response::TxnOffsetCommitResponse::default(),
+        },
         _ => return None,
     };
     Some(response)
@@ -473,6 +538,31 @@ pub fn error_response_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_advertised_version_encodes() {
+        // Each advertised (api_key, version) must have a response the encoder accepts;
+        // otherwise a client that negotiates that version loses its connection on the
+        // first reply.
+        for &(api_key, min_version, max_version) in API_VERSION_RANGES {
+            for version in min_version..=max_version {
+                let response = if api_key == API_KEY_API_VERSIONS {
+                    Some(crate::kafka::messages::KafkaResponse::ApiVersions {
+                        correlation_id: 1,
+                        api_version: version,
+                        response: build_api_versions_response(),
+                    })
+                } else {
+                    error_response_for(api_key, version, 1, ERROR_NONE)
+                };
+                let response = response
+                    .unwrap_or_else(|| panic!("no response builder for api_key {}", api_key));
+                crate::kafka::protocol::encode_response(response).unwrap_or_else(|e| {
+                    panic!("api_key {} v{} does not encode: {}", api_key, version, e)
+                });
+            }
+        }
+    }
 
     // ========== API Versions Response Tests ==========
 
@@ -539,7 +629,7 @@ mod tests {
             .iter()
             .find(|a| a.api_key == API_KEY_FETCH)
             .expect("Fetch should be present");
-        assert_eq!(fetch.min_version, 0);
+        assert_eq!(fetch.min_version, 4); // crate minimum
         assert_eq!(fetch.max_version, 11);
     }
 
@@ -575,9 +665,9 @@ mod tests {
     fn test_supported_version_range_matches_advertised() {
         // The enforcement table (CONF-6) must agree with what ApiVersions advertises.
         assert_eq!(supported_version_range(API_KEY_PRODUCE), Some((3, 9)));
-        assert_eq!(supported_version_range(API_KEY_FETCH), Some((0, 11)));
+        assert_eq!(supported_version_range(API_KEY_FETCH), Some((4, 11)));
         assert_eq!(supported_version_range(API_KEY_METADATA), Some((0, 10)));
-        assert_eq!(supported_version_range(API_KEY_OFFSET_FETCH), Some((0, 7)));
+        assert_eq!(supported_version_range(API_KEY_OFFSET_FETCH), Some((1, 7)));
 
         // Every advertised API has a matching enforcement range, and vice versa.
         let advertised = build_api_versions_response();
@@ -879,9 +969,9 @@ mod tests {
 
     #[test]
     fn test_error_response_for_builderless_or_unknown_api_is_none() {
-        // Transaction APIs and unknown keys have no typed error builder → None, so the protocol
-        // layer falls back to the generic frame (its only remaining use).
-        assert!(error_response_for(API_KEY_END_TXN, 3, 1, ERROR_UNSUPPORTED_VERSION).is_none());
+        // Every handled API has a typed error builder (the transaction APIs included); only an
+        // unknown key falls back to the generic frame.
+        assert!(error_response_for(API_KEY_END_TXN, 3, 1, ERROR_UNSUPPORTED_VERSION).is_some());
         assert!(error_response_for(9999, 0, 1, ERROR_UNSUPPORTED_VERSION).is_none());
     }
 

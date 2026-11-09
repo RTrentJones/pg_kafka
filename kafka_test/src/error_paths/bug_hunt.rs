@@ -25,7 +25,7 @@ use tokio::net::TcpStream;
 const BROKER: &str = "localhost:9092";
 
 /// Send one request at `version` and decode its response.
-async fn roundtrip<R: Request>(
+pub(crate) async fn roundtrip<R: Request>(
     stream: &mut TcpStream,
     version: i16,
     correlation_id: i32,
@@ -67,7 +67,12 @@ async fn roundtrip<R: Request>(
     Ok(R::Response::decode(&mut buf, version)?)
 }
 
-fn fetch_request(topic: &str, partition: i32, offset: i64, max_wait_ms: i32) -> FetchRequest {
+pub(crate) fn fetch_request(
+    topic: &str,
+    partition: i32,
+    offset: i64,
+    max_wait_ms: i32,
+) -> FetchRequest {
     let mut p = FetchPartition::default();
     p.partition = partition;
     p.fetch_offset = offset;

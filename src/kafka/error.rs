@@ -19,7 +19,7 @@ use thiserror::Error;
 use crate::kafka::constants::{
     ERROR_CONCURRENT_TRANSACTIONS, ERROR_COORDINATOR_NOT_AVAILABLE, ERROR_CORRUPT_MESSAGE,
     ERROR_DUPLICATE_SEQUENCE_NUMBER, ERROR_ILLEGAL_GENERATION, ERROR_INVALID_PARTITIONS,
-    ERROR_INVALID_TXN_STATE, ERROR_MESSAGE_TOO_LARGE, ERROR_NOT_COORDINATOR,
+    ERROR_INVALID_RECORD, ERROR_INVALID_TXN_STATE, ERROR_MESSAGE_TOO_LARGE, ERROR_NOT_COORDINATOR,
     ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER, ERROR_PRODUCER_FENCED, ERROR_REBALANCE_IN_PROGRESS,
     ERROR_TRANSACTIONAL_ID_NOT_FOUND, ERROR_UNKNOWN_MEMBER_ID, ERROR_UNKNOWN_PRODUCER_ID,
     ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION, ERROR_UNSUPPORTED_VERSION,
@@ -52,6 +52,10 @@ pub enum KafkaError {
     /// Malformed request body (failed to decode)
     #[error("Corrupt message: {message}")]
     CorruptMessage { message: String },
+
+    /// Well-formed records that fail broker-side validation (INVALID_RECORD)
+    #[error("Invalid record: {message}")]
+    InvalidRecord { message: String },
 
     // ===== Topic/Partition Errors =====
     /// Topic does not exist
@@ -200,6 +204,7 @@ impl KafkaError {
             KafkaError::UnsupportedApiVersion { .. } => ERROR_UNSUPPORTED_VERSION,
             KafkaError::RequestTooShort { .. } => ERROR_CORRUPT_MESSAGE,
             KafkaError::CorruptMessage { .. } => ERROR_CORRUPT_MESSAGE,
+            KafkaError::InvalidRecord { .. } => ERROR_INVALID_RECORD,
 
             // Topic/Partition → UNKNOWN_TOPIC_OR_PARTITION or INVALID_PARTITIONS
             KafkaError::UnknownTopic { .. } => ERROR_UNKNOWN_TOPIC_OR_PARTITION,

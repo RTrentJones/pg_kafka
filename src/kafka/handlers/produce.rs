@@ -43,7 +43,12 @@ pub fn handle_produce(
         if let Some(meta) = producer_metadata {
             if meta.producer_id >= 0 {
                 if let Err(e) = validate_ongoing_transaction(store, txn_id, meta) {
-                    return Ok(produce_error_response(&topic_data, e.to_kafka_error_code()));
+                    return Ok(
+                        crate::kafka::response_builders::build_produce_partition_error_response(
+                            &topic_data,
+                            e.to_kafka_error_code(),
+                        ),
+                    );
                 }
             }
         }
@@ -69,9 +74,12 @@ pub fn handle_produce(
                     }
                     let code = e.to_kafka_error_code();
                     kafka_response.responses.push(
-                        produce_error_response(std::slice::from_ref(&topic), code)
-                            .responses
-                            .remove(0),
+                        crate::kafka::response_builders::build_produce_partition_error_response(
+                            std::slice::from_ref(&topic),
+                            code,
+                        )
+                        .responses
+                        .remove(0),
                     );
                     continue;
                 }
@@ -298,30 +306,4 @@ fn validate_ongoing_transaction(
             txn_id,
         )),
     }
-}
-
-/// A ProduceResponse reporting `error_code` on every requested partition.
-pub fn produce_error_response(
-    topic_data: &[crate::kafka::messages::TopicProduceData],
-    error_code: i16,
-) -> kafka_protocol::messages::produce_response::ProduceResponse {
-    use kafka_protocol::messages::produce_response::{
-        PartitionProduceResponse, TopicProduceResponse,
-    };
-    let mut response = crate::kafka::build_produce_response();
-    for topic in topic_data {
-        let mut t = TopicProduceResponse::default();
-        t.name = kafka_protocol::messages::TopicName(topic.name.clone().into());
-        for p in &topic.partitions {
-            let mut pr = PartitionProduceResponse::default();
-            pr.index = p.partition_index;
-            pr.error_code = error_code;
-            pr.base_offset = -1;
-            pr.log_append_time_ms = -1;
-            pr.log_start_offset = -1;
-            t.partition_responses.push(pr);
-        }
-        response.responses.push(t);
-    }
-    response
 }

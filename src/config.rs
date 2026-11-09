@@ -42,7 +42,6 @@ use crate::kafka::constants::{
     MIN_SHUTDOWN_TIMEOUT_MS,
 };
 
-#[cfg(not(test))]
 use crate::kafka::constants::DEFAULT_HOST;
 
 #[cfg(test)]
@@ -145,11 +144,11 @@ impl Config {
     pub fn load() -> Self {
         Config {
             port: PORT.get(),
-            host: HOST
-                .get()
-                .as_deref()
-                .map(|c| c.to_string_lossy().into_owned())
-                .unwrap_or_else(|| DEFAULT_HOST.to_string()),
+            host: normalize_host(
+                HOST.get()
+                    .as_deref()
+                    .map(|c| c.to_string_lossy().into_owned()),
+            ),
             database: DATABASE
                 .get()
                 .as_deref()
@@ -647,6 +646,16 @@ pub fn init() {
     pgrx::log!("pg_kafka GUC parameters initialized (including shadow mode)");
 }
 
+/// The bind host from the `pg_kafka.host` GUC. Unset, empty or all-whitespace means the default
+/// (`0.0.0.0`); an empty string used to reach the bind as `":9092"`, which fails to resolve and
+/// stops the worker.
+pub fn normalize_host(raw: Option<String>) -> String {
+    match raw {
+        Some(h) if !h.trim().is_empty() => h.trim().to_string(),
+        _ => DEFAULT_HOST.to_string(),
+    }
+}
+
 /// SEC-7: returns true when `host` binds the Kafka listener to a non-loopback interface, i.e. the
 /// listener is reachable from other machines. pg_kafka speaks the Kafka wire protocol with **no
 /// authentication or authorization** (no SASL, no ACLs), so a non-loopback bind exposes
@@ -668,7 +677,8 @@ pub fn bind_is_publicly_exposed(host: &str) -> bool {
         // LAN/public address, or `0.0.0.0` / `::` ("all interfaces", `is_unspecified`), is reachable.
         Ok(addr) => !addr.is_loopback(),
         // Not an IP literal: empty defaults to `0.0.0.0` (exposed); only `localhost` is loopback.
-        Err(_) => host != "localhost",
+        // Host names are case-insensitive, so `LOCALHOST` is loopback too.
+        Err(_) => !h.eq_ignore_ascii_case("localhost"),
     }
 }
 
@@ -998,6 +1008,20 @@ mod tests {
         assert!(bind_is_publicly_exposed("10.0.0.5"));
         assert!(bind_is_publicly_exposed("192.168.1.10"));
         assert!(bind_is_publicly_exposed("0.0.0.1"));
+    }
+
+    #[test]
+    fn test_normalize_host_empty_means_default() {
+        assert_eq!(normalize_host(None), DEFAULT_HOST);
+        assert_eq!(normalize_host(Some(String::new())), DEFAULT_HOST);
+        assert_eq!(normalize_host(Some("  ".to_string())), DEFAULT_HOST);
+        assert_eq!(normalize_host(Some(" 127.0.0.1 ".to_string())), "127.0.0.1");
+    }
+
+    #[test]
+    fn test_bind_localhost_is_case_insensitive() {
+        assert!(!bind_is_publicly_exposed("LOCALHOST"));
+        assert!(!bind_is_publicly_exposed("LocalHost"));
     }
 
     #[test]

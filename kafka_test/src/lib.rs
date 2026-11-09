@@ -116,10 +116,12 @@ pub use edge_cases::{
     test_retention_sweep_reclaims_aborted_messages, test_single_partition_topic,
 };
 pub use error_paths::{
-    test_active_idempotent_producer_survives_retention_sweep, test_commit_new_group,
-    test_commit_offset_zero, test_commit_then_fetch_offset, test_consume_empty_topic,
-    test_create_topics_default_and_zero_partitions, test_empty_group_id,
-    test_fenced_producer_cannot_write, test_fetch_after_offset_reset,
+    test_active_idempotent_producer_survives_retention_sweep,
+    test_api_versions_above_range_negotiates_down, test_commit_new_group, test_commit_offset_zero,
+    test_commit_then_fetch_offset, test_consume_empty_topic,
+    test_corrupt_acks0_produce_sends_no_reply, test_create_topics_default_and_zero_partitions,
+    test_empty_group_id, test_fenced_producer_cannot_write,
+    test_fetch_advertised_minimum_is_usable, test_fetch_after_offset_reset,
     test_fetch_bad_partition_or_offset_returns_error, test_fetch_from_new_partition,
     test_fetch_into_cleaned_up_aborted_rows_is_in_range, test_fetch_invalid_partition,
     test_fetch_isolation_level_enforcement, test_fetch_offset_out_of_range,
@@ -127,6 +129,7 @@ pub use error_paths::{
     test_fetch_with_deleted_topic, test_frame_budget_released_on_mid_frame_disconnect,
     test_heartbeat_after_leave, test_multiple_consumers_same_group, test_produce_any_partition,
     test_produce_empty_batch, test_produce_invalid_partition, test_produce_large_key,
+    test_produce_two_batches_in_one_partition_is_rejected,
     test_producer_restart_new_epoch_records_are_stored, test_rejoin_after_leave,
     test_txn_offset_commit_failure_reports_partition_errors,
 };
