@@ -113,6 +113,7 @@ use kafka_test::{
     test_create_topic_invalid_name,
     test_create_topic_invalid_partitions,
     test_create_topic_with_config,
+    test_create_topics_default_and_zero_partitions,
     test_delete_group_after_leave,
     test_delete_group_empty,
     test_delete_group_idempotent,
@@ -138,8 +139,10 @@ use kafka_test::{
     test_external_only_mode,
     test_external_primary_dead_letter_serves_local,
     test_fetch_after_offset_reset,
+    test_fetch_bad_partition_or_offset_returns_error,
     test_fetch_committed_no_history,
     test_fetch_from_new_partition,
+    test_fetch_into_cleaned_up_aborted_rows_is_in_range,
     test_fetch_invalid_partition,
     test_fetch_isolation_level_enforcement,
     // Offset management tests
@@ -152,6 +155,7 @@ use kafka_test::{
     test_fifty_percent_forwarding,
     // Coordinator state tests
     test_find_coordinator_bootstrap,
+    test_frame_budget_released_on_mid_frame_disconnect,
     test_group_rejoin_race,
     test_group_state_transitions,
     // Rebalancing edge case tests
@@ -271,6 +275,7 @@ use kafka_test::{
     test_transactional_producer_commit,
     test_true_deduplication_manual_replay,
     test_txn_offset_commit,
+    test_txn_offset_commit_failure_reports_partition_errors,
     test_txn_offset_commit_visibility_timing,
     test_unknown_api_key_handling,
     test_zero_percent_forwarding,
@@ -740,6 +745,36 @@ fn get_all_tests() -> Vec<TestDef> {
             parallel_safe: true,
         },
         // Error path tests
+        TestDef {
+            category: "error_paths",
+            name: "test_fetch_into_cleaned_up_aborted_rows_is_in_range",
+            test_fn: wrap_test!(test_fetch_into_cleaned_up_aborted_rows_is_in_range),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_fetch_bad_partition_or_offset_returns_error",
+            test_fn: wrap_test!(test_fetch_bad_partition_or_offset_returns_error),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_txn_offset_commit_failure_reports_partition_errors",
+            test_fn: wrap_test!(test_txn_offset_commit_failure_reports_partition_errors),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_create_topics_default_and_zero_partitions",
+            test_fn: wrap_test!(test_create_topics_default_and_zero_partitions),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_frame_budget_released_on_mid_frame_disconnect",
+            test_fn: wrap_test!(test_frame_budget_released_on_mid_frame_disconnect),
+            parallel_safe: false,
+        },
         TestDef {
             category: "error_paths",
             name: "test_fetch_unknown_topic",

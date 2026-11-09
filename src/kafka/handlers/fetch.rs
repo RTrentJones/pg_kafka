@@ -4,7 +4,9 @@
 // These are read-focused APIs for consuming messages from topics.
 // Phase 10: Added isolation_level support for transactional reads.
 
-use super::helpers::{resolve_topic_id, topic_resolution_error_code, TopicResolution};
+use super::helpers::{
+    resolve_topic, resolve_topic_id, topic_resolution_error_code, TopicResolution,
+};
 use crate::kafka::constants::ERROR_NONE;
 use crate::kafka::error::Result;
 use crate::kafka::handler_context::HandlerContext;
@@ -41,12 +43,15 @@ pub fn handle_fetch(
     for topic_fetch in topic_data {
         let topic_name = topic_fetch.name.clone();
 
-        // Look up topic by name using helper
-        let topic_id = match resolve_topic_id(store, &topic_name) {
-            TopicResolution::Found(id) => id,
-            resolution => {
+        // Look up topic by name (id + partition count in one lookup)
+        let (topic_id, partition_count) = match resolve_topic(store, &topic_name) {
+            Ok(Some(found)) => found,
+            unresolved => {
                 // Topic not found or error - return error for all partitions
-                let error_code = topic_resolution_error_code(&resolution);
+                let error_code = match unresolved {
+                    Err(code) => code,
+                    _ => crate::kafka::constants::ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+                };
                 let mut error_partitions = Vec::new();
                 for p in topic_fetch.partitions {
                     let mut partition_data = PartitionData::default();
@@ -71,36 +76,18 @@ pub fn handle_fetch(
             let fetch_offset = partition_fetch.fetch_offset;
             let max_bytes = partition_fetch.partition_max_bytes;
 
-            // Fetch messages from storage
-            // Phase 10: Use isolation-aware fetch for transactional reads
-            let db_records = match store.fetch_records_with_isolation(
-                topic_id,
-                partition_id,
-                fetch_offset,
-                max_bytes,
-                isolation_level,
-            ) {
-                Ok(records) => records,
-                Err(e) => {
-                    // Use typed error's Kafka error code for proper protocol response
-                    let error_code = e.to_kafka_error_code();
-                    if e.is_server_error() {
-                        crate::pg_warning!(
-                            "Failed to fetch records for topic_id={}, partition={}, offset={}: {}",
-                            topic_id,
-                            partition_id,
-                            fetch_offset,
-                            e
-                        );
-                    }
-                    let mut partition_data = PartitionData::default();
-                    partition_data.partition_index = partition_id;
-                    partition_data.error_code = error_code;
-                    partition_data.high_watermark = -1;
-                    partition_responses.push(partition_data);
-                    continue;
-                }
-            };
+            // A partition outside [0, partition_count) does not exist: report
+            // UNKNOWN_TOPIC_OR_PARTITION instead of an empty success, which would
+            // leave the consumer polling it forever.
+            if partition_id < 0 || partition_id >= partition_count {
+                let mut partition_data = PartitionData::default();
+                partition_data.partition_index = partition_id;
+                partition_data.error_code =
+                    crate::kafka::constants::ERROR_UNKNOWN_TOPIC_OR_PARTITION;
+                partition_data.high_watermark = -1;
+                partition_responses.push(partition_data);
+                continue;
+            }
 
             // DR-10 (DEEP-REVIEW-2026-07): a storage error computing the offset
             // bounds must surface as a per-partition error code, not be swallowed
@@ -137,6 +124,66 @@ pub fn handle_fetch(
                     let mut partition_data = PartitionData::default();
                     partition_data.partition_index = partition_id;
                     partition_data.error_code = e.to_kafka_error_code();
+                    partition_data.high_watermark = -1;
+                    partition_responses.push(partition_data);
+                    continue;
+                }
+            };
+
+            // An offset before the durable log start (retired by DeleteRecords or
+            // retention) or past the high watermark is OFFSET_OUT_OF_RANGE, so the
+            // consumer applies its auto.offset.reset policy. The lower bound is the
+            // durable log start, not the first surviving row: aborted-message cleanup
+            // can delete leading rows without retiring their offsets, and a fetch
+            // from such a hole must skip ahead to the next committed record.
+            // fetch_offset == high_watermark is valid (caught up, waiting for data).
+            let durable_log_start = match store.get_log_start_offset(topic_id, partition_id) {
+                Ok(v) => v,
+                Err(e) => {
+                    let mut partition_data = PartitionData::default();
+                    partition_data.partition_index = partition_id;
+                    partition_data.error_code = e.to_kafka_error_code();
+                    partition_data.high_watermark = -1;
+                    partition_responses.push(partition_data);
+                    continue;
+                }
+            };
+            if fetch_offset < durable_log_start || fetch_offset > high_watermark {
+                let mut partition_data = PartitionData::default();
+                partition_data.partition_index = partition_id;
+                partition_data.error_code = crate::kafka::constants::ERROR_OFFSET_OUT_OF_RANGE;
+                partition_data.high_watermark = high_watermark;
+                partition_data.last_stable_offset = last_stable_offset;
+                partition_data.log_start_offset = log_start_offset;
+                partition_responses.push(partition_data);
+                continue;
+            }
+
+            // Fetch messages from storage
+            // Phase 10: Use isolation-aware fetch for transactional reads
+            let db_records = match store.fetch_records_with_isolation(
+                topic_id,
+                partition_id,
+                fetch_offset,
+                max_bytes,
+                isolation_level,
+            ) {
+                Ok(records) => records,
+                Err(e) => {
+                    // Use typed error's Kafka error code for proper protocol response
+                    let error_code = e.to_kafka_error_code();
+                    if e.is_server_error() {
+                        crate::pg_warning!(
+                            "Failed to fetch records for topic_id={}, partition={}, offset={}: {}",
+                            topic_id,
+                            partition_id,
+                            fetch_offset,
+                            e
+                        );
+                    }
+                    let mut partition_data = PartitionData::default();
+                    partition_data.partition_index = partition_id;
+                    partition_data.error_code = error_code;
                     partition_data.high_watermark = -1;
                     partition_responses.push(partition_data);
                     continue;

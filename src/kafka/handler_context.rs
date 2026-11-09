@@ -233,6 +233,14 @@ mod tests {
             Ok(0)
         }
 
+        fn get_log_start_offset(
+            &self,
+            _topic_id: i32,
+            _partition_id: i32,
+        ) -> crate::kafka::error::Result<i64> {
+            Ok(0)
+        }
+
         fn get_offset_for_timestamp(
             &self,
             _topic_id: i32,

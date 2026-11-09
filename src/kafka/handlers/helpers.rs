@@ -24,20 +24,29 @@ pub enum TopicResolution {
 /// - `TopicResolution::NotFound` if the topic doesn't exist
 /// - `TopicResolution::Error(code)` if a storage error occurred
 pub fn resolve_topic_id<S: KafkaStore + ?Sized>(store: &S, topic_name: &str) -> TopicResolution {
+    match resolve_topic(store, topic_name) {
+        Ok(Some((id, _))) => TopicResolution::Found(id),
+        Ok(None) => TopicResolution::NotFound,
+        Err(code) => TopicResolution::Error(code),
+    }
+}
+
+/// Resolves a topic name to `(topic_id, partition_count)` with a single metadata lookup.
+///
+/// Returns `Ok(None)` if the topic doesn't exist, and `Err(code)` (the Kafka error code
+/// of the typed storage error) if the lookup failed.
+pub fn resolve_topic<S: KafkaStore + ?Sized>(
+    store: &S,
+    topic_name: &str,
+) -> std::result::Result<Option<(i32, i32)>, i16> {
     match store.get_topic_metadata(Some(std::slice::from_ref(&topic_name.to_string()))) {
-        Ok(topics) => {
-            if let Some(tm) = topics.first() {
-                TopicResolution::Found(tm.id)
-            } else {
-                TopicResolution::NotFound
-            }
-        }
+        Ok(topics) => Ok(topics.first().map(|tm| (tm.id, tm.partition_count))),
         Err(e) => {
             // Use typed error for logging and error code
             if e.is_server_error() {
                 crate::pg_warning!("Failed to resolve topic '{}': {}", topic_name, e);
             }
-            TopicResolution::Error(e.to_kafka_error_code())
+            Err(e.to_kafka_error_code())
         }
     }
 }

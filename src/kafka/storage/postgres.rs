@@ -819,6 +819,22 @@ impl KafkaStore for PostgresStore {
         .map_err(|e: KafkaError| KafkaError::Internal(format!("get_earliest_offset failed: {}", e)))
     }
 
+    fn get_log_start_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64> {
+        Spi::connect(|client| {
+            let table = client.select(
+                "SELECT COALESCE((SELECT log_start_offset FROM kafka.partition_offsets
+                                  WHERE topic_id = $1 AND partition_id = $2), 0)
+                        AS log_start_offset",
+                None,
+                &[topic_id.into(), partition_id.into()],
+            )?;
+            Ok(table.first().get_by_name("log_start_offset")?.unwrap_or(0))
+        })
+        .map_err(|e: KafkaError| {
+            KafkaError::Internal(format!("get_log_start_offset failed: {}", e))
+        })
+    }
+
     fn get_offset_for_timestamp(
         &self,
         topic_id: i32,

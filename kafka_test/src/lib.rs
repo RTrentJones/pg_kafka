@@ -117,13 +117,16 @@ pub use edge_cases::{
 };
 pub use error_paths::{
     test_commit_new_group, test_commit_offset_zero, test_commit_then_fetch_offset,
-    test_consume_empty_topic, test_empty_group_id, test_fetch_after_offset_reset,
-    test_fetch_from_new_partition, test_fetch_invalid_partition,
-    test_fetch_isolation_level_enforcement, test_fetch_offset_out_of_range,
-    test_fetch_respects_min_one_message, test_fetch_uncommitted_offset, test_fetch_unknown_topic,
-    test_fetch_with_deleted_topic, test_heartbeat_after_leave, test_multiple_consumers_same_group,
-    test_produce_any_partition, test_produce_empty_batch, test_produce_invalid_partition,
-    test_produce_large_key, test_rejoin_after_leave,
+    test_consume_empty_topic, test_create_topics_default_and_zero_partitions, test_empty_group_id,
+    test_fetch_after_offset_reset, test_fetch_bad_partition_or_offset_returns_error,
+    test_fetch_from_new_partition, test_fetch_into_cleaned_up_aborted_rows_is_in_range,
+    test_fetch_invalid_partition, test_fetch_isolation_level_enforcement,
+    test_fetch_offset_out_of_range, test_fetch_respects_min_one_message,
+    test_fetch_uncommitted_offset, test_fetch_unknown_topic, test_fetch_with_deleted_topic,
+    test_frame_budget_released_on_mid_frame_disconnect, test_heartbeat_after_leave,
+    test_multiple_consumers_same_group, test_produce_any_partition, test_produce_empty_batch,
+    test_produce_invalid_partition, test_produce_large_key, test_rejoin_after_leave,
+    test_txn_offset_commit_failure_reports_partition_errors,
 };
 pub use negative::{
     test_connection_refused, test_duplicate_consumer_join, test_invalid_group_id,

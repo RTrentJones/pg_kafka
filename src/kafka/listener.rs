@@ -150,6 +150,16 @@ impl Decoder for BudgetedFrameCodec {
     }
 }
 
+/// Release any charge still held for a partially received frame when the codec goes
+/// away (e.g. the client disconnects mid-frame). Without this, each abandoned frame
+/// would permanently shrink the global reservation budget.
+impl Drop for BudgetedFrameCodec {
+    fn drop(&mut self) {
+        release_frame_budget(&FRAME_RESERVE_REMAINING, self.charged);
+        self.charged = 0;
+    }
+}
+
 impl Encoder<Bytes> for BudgetedFrameCodec {
     type Error = std::io::Error;
 
@@ -850,7 +860,13 @@ async fn handle_fetch_long_poll(
             total_bytes, min_bytes
         );
 
-        if total_bytes >= min_bytes as usize || min_bytes <= 0 {
+        // A partition error (unknown partition, offset out of range, ...) is returned
+        // straight away, as Kafka does, so the consumer can react instead of waiting
+        // out max_wait_ms for data that will not arrive.
+        if total_bytes >= min_bytes as usize
+            || min_bytes <= 0
+            || response_has_partition_error(&response)
+        {
             // Enough data - forward to client
             debug!("Long poll: min_bytes threshold met, returning response");
             let _ = final_response_tx.send(response);
@@ -925,6 +941,18 @@ fn calculate_response_bytes(response: &KafkaResponse) -> usize {
     }
 }
 
+/// Whether any partition in a Fetch response carries a non-zero error code.
+fn response_has_partition_error(response: &KafkaResponse) -> bool {
+    match response {
+        KafkaResponse::Fetch { response, .. } => response
+            .responses
+            .iter()
+            .flat_map(|t| t.partitions.iter())
+            .any(|p| p.error_code != 0),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -988,6 +1016,25 @@ mod tests {
     // RV-9: the aggregate frame-reservation budget admits reservations up to its
     // ceiling, rejects a frame that would overshoot without mutating the budget,
     // and restores capacity on release so completed frames free their reservation.
+    #[test]
+    fn test_budgeted_codec_releases_charge_when_dropped_mid_frame() {
+        // A client that sends a length prefix and disconnects leaves the codec holding a
+        // charge for a frame that never completes. Dropping the codec (the connection
+        // closing) must return that charge to the global budget. This is the only test
+        // that touches FRAME_RESERVE_REMAINING, so the before/after reads are stable.
+        let before = FRAME_RESERVE_REMAINING.load(Ordering::Acquire);
+        let mut codec = BudgetedFrameCodec::new();
+        let mut src = BytesMut::from(&1_000_000u32.to_be_bytes()[..]);
+        assert!(codec.decode(&mut src).unwrap().is_none());
+        assert_eq!(
+            FRAME_RESERVE_REMAINING.load(Ordering::Acquire),
+            before - 1_000_000,
+            "the declared frame length is charged as soon as the prefix arrives"
+        );
+        drop(codec);
+        assert_eq!(FRAME_RESERVE_REMAINING.load(Ordering::Acquire), before);
+    }
+
     #[test]
     fn test_frame_reserve_budget_admits_then_rejects_then_releases() {
         let budget = AtomicUsize::new(100);

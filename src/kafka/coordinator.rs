@@ -324,6 +324,13 @@ impl ConsumerGroup {
         }
     }
 
+    /// Whether this group is Empty and has been idle past `EMPTY_GROUP_TTL_SECS`,
+    /// so the coordinator may drop it.
+    fn is_expired_empty(&self) -> bool {
+        self.state == GroupState::Empty
+            && self.last_activity.elapsed().as_secs() >= EMPTY_GROUP_TTL_SECS
+    }
+
     /// Start a rebalance (increment generation, move to PreparingRebalance)
     fn start_rebalance(&mut self) {
         self.generation_id += 1;
@@ -410,13 +417,7 @@ impl GroupCoordinator {
         })?;
 
         // Clean up stale empty groups (TTL-based)
-        groups.retain(|_, g| {
-            if g.state == GroupState::Empty {
-                g.last_activity.elapsed().as_secs() < EMPTY_GROUP_TTL_SECS
-            } else {
-                true
-            }
-        });
+        groups.retain(|_, g| !g.is_expired_empty());
 
         // Check for rebalance timeouts and abort stuck rebalances
         for group in groups.values_mut() {
@@ -903,11 +904,12 @@ impl GroupCoordinator {
             }
         }
 
-        // CG-5: reclaim empty groups here (every sweep), not just on the next join_group's TTL
-        // pass. An empty group holds no durable state — committed offsets live in storage, and a
-        // rejoin recreates the group — so dropping it bounds coordinator memory. DeleteGroups on a
-        // since-removed group is idempotent (returns NONE), so this is safe for clients.
-        groups.retain(|_, g| g.state != GroupState::Empty);
+        // CG-5: reclaim expired empty groups here (every sweep), not just on the next
+        // join_group's pass, so coordinator memory stays bounded. An Empty group is kept until
+        // EMPTY_GROUP_TTL_SECS has passed (the same rule join_group applies): dropping it
+        // immediately would restart a rejoining group at generation 1, defeating the
+        // monotonic generation that fences zombie consumers (see remove_member).
+        groups.retain(|_, g| !g.is_expired_empty());
 
         removed
     }
@@ -1491,9 +1493,10 @@ mod tests {
         assert_eq!(removed.len(), 1);
         assert_eq!(removed[0].0, "test-group");
 
-        // CG-5: with its only member gone the group is now empty and reclaimed by the same sweep,
-        // rather than lingering until the next join_group.
-        assert!(coordinator.get_group_state("test-group").is_none());
+        // With its only member gone the group is Empty. It is kept (not reclaimed) until the
+        // empty-group TTL passes, so its generation stays monotonic for a rejoin.
+        let group = coordinator.get_group_state("test-group").unwrap();
+        assert_eq!(group.state, GroupState::Empty);
     }
 
     #[test]
@@ -1885,13 +1888,39 @@ mod tests {
 
         std::thread::sleep(std::time::Duration::from_millis(10));
 
-        // The sweep removes the timed-out member and reclaims the now-empty group.
+        // The sweep removes the timed-out member; the now-empty group survives until its TTL.
         coordinator.check_and_remove_timed_out_members();
+        assert_eq!(
+            coordinator.get_group_state("g").unwrap().state,
+            GroupState::Empty,
+            "a fresh empty group must be kept until the TTL"
+        );
 
+        // Age the group past the TTL: the next sweep reclaims it.
+        {
+            let mut groups = coordinator.groups.write().unwrap();
+            let g = groups.get_mut("g").unwrap();
+            g.last_activity = Instant::now()
+                .checked_sub(std::time::Duration::from_secs(EMPTY_GROUP_TTL_SECS + 1))
+                .expect("monotonic clock far enough from boot");
+        }
+        coordinator.check_and_remove_timed_out_members();
         assert!(
             coordinator.get_group_state("g").is_none(),
-            "empty group should be reclaimed by the sweep"
+            "expired empty group should be reclaimed by the sweep"
         );
+    }
+
+    #[test]
+    fn test_generation_monotonic_across_leave_sweep_rejoin() {
+        // A group that empties, is swept, and is rejoined must not restart at
+        // generation 1: the generation is the zombie-fencing token.
+        let coordinator = GroupCoordinator::new();
+        let (member1, gen1) = join(&coordinator, "g", "client-1");
+        coordinator.leave_group("g".to_string(), member1).unwrap();
+        coordinator.check_and_remove_timed_out_members();
+        let (_member2, gen2) = join(&coordinator, "g", "client-2");
+        assert!(gen2 > gen1, "generation went {} -> {}", gen1, gen2);
     }
 
     #[test]

@@ -35,6 +35,7 @@ mock! {
         ) -> Result<Vec<FetchedMessage>>;
         fn get_high_watermark(&self, topic_id: i32, partition_id: i32) -> Result<i64>;
         fn get_earliest_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64>;
+        fn get_log_start_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64>;
         fn get_offset_for_timestamp(
             &self,
             topic_id: i32,

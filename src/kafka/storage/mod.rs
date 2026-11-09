@@ -75,7 +75,9 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
     }
     (0..s.len())
         .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        // `get` instead of slicing: a non-ASCII char would put `i` off a char
+        // boundary and slicing would panic. Invalid input yields None instead.
+        .map(|i| s.get(i..i + 2).and_then(|h| u8::from_str_radix(h, 16).ok()))
         .collect()
 }
 
@@ -244,6 +246,16 @@ pub trait KafkaStore {
     /// # Returns
     /// Earliest offset (0 if partition is empty)
     fn get_earliest_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64>;
+
+    /// Get the durable log start offset for a topic partition
+    /// (`kafka.partition_offsets.log_start_offset`).
+    ///
+    /// Unlike [`get_earliest_offset`](Self::get_earliest_offset), this ignores which
+    /// rows happen to survive: aborted-message cleanup can delete a partition's leading
+    /// rows without retiring those offsets, so only DeleteRecords and the retention
+    /// sweep (which advance this column) make an offset out of range. Returns 0 when the
+    /// partition has no counter row.
+    fn get_log_start_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64>;
 
     /// Find the earliest offset whose record timestamp is at or after `timestamp_ms` (CONF-7,
     /// Kafka's ListOffsets-by-timestamp). Returns `(offset, record_timestamp_ms)`, or `None` when no

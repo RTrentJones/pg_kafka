@@ -70,8 +70,10 @@ pub fn handle_create_topics(
         }
 
         // Validate partition count
-        let num_partitions = if topic.num_partitions <= 0 {
-            DEFAULT_TOPIC_PARTITIONS // Use broker default
+        // -1 means "use the broker default" (pg_kafka.default_partitions); any
+        // other value < 1 (e.g. 0) is rejected by the check below.
+        let num_partitions = if topic.num_partitions == -1 {
+            ctx.default_partitions
         } else {
             topic.num_partitions
         };
@@ -392,6 +394,46 @@ mod tests {
 
         let response = result.unwrap();
         assert_eq!(response.topics[0].error_code, ERROR_INVALID_TOPIC_EXCEPTION);
+    }
+
+    #[test]
+    fn test_create_topics_minus_one_uses_default_partitions_and_zero_is_rejected() {
+        // num_partitions = -1 means "broker default" (pg_kafka.default_partitions);
+        // 0 is not a valid partition count.
+        let mut store = MockKafkaStore::new();
+        store.expect_topic_exists().returning(|_| Ok(false));
+        store
+            .expect_create_topic()
+            .withf(|name, n| name == "defaulted" && *n == 6)
+            .times(1)
+            .returning(|_, _| Ok(1));
+
+        let topics = vec![
+            CreateTopicRequest {
+                name: "defaulted".to_string(),
+                num_partitions: -1,
+                replication_factor: 1,
+            },
+            CreateTopicRequest {
+                name: "zero".to_string(),
+                num_partitions: 0,
+                replication_factor: 1,
+            },
+        ];
+
+        let coordinator = crate::kafka::GroupCoordinator::new();
+        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(
+            &store,
+            &coordinator,
+            &broker,
+            6,
+            kafka_protocol::records::Compression::None,
+        );
+        let response = handle_create_topics(&ctx, topics, false).unwrap();
+        assert_eq!(response.topics[0].error_code, ERROR_NONE);
+        assert_eq!(response.topics[0].num_partitions, 6);
+        assert_eq!(response.topics[1].error_code, ERROR_INVALID_PARTITIONS);
     }
 
     #[test]

@@ -739,25 +739,17 @@ fn parse_offset_fetch(
     let group_id = fetch_req.group_id.to_string();
     debug!("OffsetFetch for group_id={}", group_id);
 
-    let topics = if let Some(topic_vec) = fetch_req.topics {
-        if topic_vec.is_empty() {
-            None
-        } else {
-            let mut topic_list = Vec::new();
-            for topic in topic_vec {
-                let topic_name = topic.name.to_string();
-                let partition_indexes = topic.partition_indexes;
-
-                topic_list.push(super::super::messages::OffsetFetchTopicData {
-                    name: topic_name,
-                    partition_indexes,
-                });
-            }
-            Some(topic_list)
-        }
-    } else {
-        None
-    };
+    // Only a null topics array (v2+) means "all partitions of the group". An
+    // empty array asks for nothing and must get an empty reply, not every offset.
+    let topics = fetch_req.topics.map(|topic_vec| {
+        topic_vec
+            .into_iter()
+            .map(|topic| super::super::messages::OffsetFetchTopicData {
+                name: topic.name.to_string(),
+                partition_indexes: topic.partition_indexes,
+            })
+            .collect::<Vec<_>>()
+    });
 
     Ok(Some(KafkaRequest::OffsetFetch {
         correlation_id,
@@ -3182,6 +3174,30 @@ mod tests {
             assert_eq!(topic_list[0].partition_indexes, vec![0, 1, 2]);
         } else {
             panic!("Expected OffsetFetch request");
+        }
+    }
+
+    #[test]
+    fn test_parse_offset_fetch_empty_vs_null_topics() {
+        // An empty topics array asks for nothing (Some(vec![])); only a null array
+        // (v2+) means "every partition of the group" (None).
+        for (wire_topics, expect_all) in [(Some(vec![]), false), (None, true)] {
+            let (tx, _rx) = create_test_channel();
+            let mut request = offset_fetch_request::OffsetFetchRequest::default();
+            request.group_id =
+                kafka_protocol::messages::GroupId::from(StrBytes::from_static_str("g"));
+            request.topics = wire_topics;
+            let frame = build_request_frame(API_KEY_OFFSET_FETCH, 7, 6001, 2, &request, 7);
+            match parse_request(frame, tx).unwrap() {
+                Some(KafkaRequest::OffsetFetch { topics, .. }) => {
+                    if expect_all {
+                        assert!(topics.is_none(), "null topics means all partitions");
+                    } else {
+                        assert_eq!(topics.map(|t| t.len()), Some(0));
+                    }
+                }
+                _ => panic!("Expected OffsetFetch request"),
+            }
         }
     }
 

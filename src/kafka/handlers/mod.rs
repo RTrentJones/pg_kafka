@@ -52,5 +52,5 @@ pub use metadata::{handle_api_versions, handle_metadata};
 pub use produce::handle_produce;
 pub use transaction::{
     handle_add_offsets_to_txn, handle_add_partitions_to_txn, handle_end_txn,
-    handle_txn_offset_commit,
+    handle_txn_offset_commit, txn_offset_commit_error_response,
 };
