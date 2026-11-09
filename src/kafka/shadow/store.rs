@@ -1592,7 +1592,7 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
         self.inner.get_producer_epoch(producer_id)
     }
 
-    fn increment_producer_epoch(&self, producer_id: i64) -> Result<i16> {
+    fn increment_producer_epoch(&self, producer_id: i64) -> Result<(i64, i16)> {
         self.inner.increment_producer_epoch(producer_id)
     }
 

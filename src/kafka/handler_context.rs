@@ -335,8 +335,11 @@ mod tests {
             Ok(Some(0))
         }
 
-        fn increment_producer_epoch(&self, _producer_id: i64) -> crate::kafka::error::Result<i16> {
-            Ok(1)
+        fn increment_producer_epoch(
+            &self,
+            producer_id: i64,
+        ) -> crate::kafka::error::Result<(i64, i16)> {
+            Ok((producer_id, 1))
         }
 
         fn check_and_update_sequence(

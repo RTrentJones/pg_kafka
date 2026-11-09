@@ -260,7 +260,9 @@ pub fn handle_produce(
                 // Duplicate detected - return success (error_code=0) but skip insert
                 // This is the correct Kafka idempotency behavior
                 partition_response.error_code = ERROR_NONE;
-                partition_response.base_offset = 0; // Duplicate - offset doesn't matter
+                // The original batch's offset is not stored, so report it as unknown
+                // (-1) rather than claim offset 0, which the client would record.
+                partition_response.base_offset = -1;
                 partition_response.log_append_time_ms = -1;
                 partition_response.log_start_offset = -1;
             }

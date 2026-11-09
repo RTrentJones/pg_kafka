@@ -52,6 +52,7 @@ use kafka_test::{
     test_abort_transaction_discards_pending_offsets,
     // Shadow mode tests (Phase 11)
     test_aborted_transaction_not_forwarded,
+    test_active_idempotent_producer_survives_retention_sweep,
     test_add_partitions_to_txn_idempotent,
     // Protocol compliance tests (Phase 4)
     test_api_versions_negotiation,
@@ -240,6 +241,7 @@ use kafka_test::{
     test_producer_fencing,
     test_producer_fencing_mid_transaction,
     test_producer_id_reallocated_on_epoch_exhaustion,
+    test_producer_restart_new_epoch_records_are_stored,
     test_producer_timestamp_roundtrip,
     test_protocol_request_pipelining,
     test_rapid_rebalance_cycles,
@@ -745,6 +747,18 @@ fn get_all_tests() -> Vec<TestDef> {
             parallel_safe: true,
         },
         // Error path tests
+        TestDef {
+            category: "error_paths",
+            name: "test_active_idempotent_producer_survives_retention_sweep",
+            test_fn: wrap_test!(test_active_idempotent_producer_survives_retention_sweep),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_producer_restart_new_epoch_records_are_stored",
+            test_fn: wrap_test!(test_producer_restart_new_epoch_records_are_stored),
+            parallel_safe: true,
+        },
         TestDef {
             category: "error_paths",
             name: "test_fetch_into_cleaned_up_aborted_rows_is_in_range",

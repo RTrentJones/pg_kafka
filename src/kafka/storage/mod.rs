@@ -420,8 +420,11 @@ pub trait KafkaStore {
     /// * `producer_id` - The producer ID to update
     ///
     /// # Returns
-    /// The new epoch value, or error if producer not found
-    fn increment_producer_epoch(&self, producer_id: i64) -> Result<i16>;
+    /// `(producer_id, epoch)`: normally the same id with the bumped epoch; a fresh id at
+    /// epoch 0 once the epoch is exhausted. Clears the producer's sequence state, since
+    /// a new epoch restarts sequence numbers. Errors if the producer is unknown or is
+    /// transactional.
+    fn increment_producer_epoch(&self, producer_id: i64) -> Result<(i64, i16)>;
 
     /// Check and update sequence number for idempotent producer
     ///

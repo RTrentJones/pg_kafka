@@ -1721,7 +1721,7 @@ mod tests {
         // Then increment the epoch
         mock.expect_increment_producer_epoch()
             .times(1)
-            .returning(|_| Ok(1)); // New epoch is 1
+            .returning(|id| Ok((id, 1))); // New epoch is 1
 
         // Create HandlerContext AFTER setting expectations
         let coordinator = GroupCoordinator::new();
@@ -1962,7 +1962,7 @@ mod tests {
         let partition_response = &response.responses[0].partition_responses[0];
         // Kafka spec: Duplicates return SUCCESS (error_code=0), not error
         assert_eq!(partition_response.error_code, ERROR_NONE);
-        assert_eq!(partition_response.base_offset, 0); // Duplicate - offset 0
+        assert_eq!(partition_response.base_offset, -1); // Duplicate - original offset unknown
     }
 
     #[test]

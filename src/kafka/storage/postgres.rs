@@ -320,6 +320,13 @@ impl PostgresStore {
                            SELECT 1 FROM kafka.transactions t
                            WHERE t.producer_id = p.producer_id
                        )
+                       -- last_active_at only moves on InitProducerId; a long-running
+                       -- producer shows its activity through its sequence rows.
+                       AND NOT EXISTS (
+                           SELECT 1 FROM kafka.producer_sequences s
+                           WHERE s.producer_id = p.producer_id
+                             AND s.updated_at >= NOW() - ($1 || ' seconds')::interval
+                       )
                      RETURNING p.producer_id
                  ),
                  seqs AS (
@@ -1195,37 +1202,75 @@ impl KafkaStore for PostgresStore {
         .map_err(|e: KafkaError| KafkaError::Internal(format!("get_producer_epoch failed: {}", e)))
     }
 
-    fn increment_producer_epoch(&self, producer_id: i64) -> Result<i16> {
+    fn increment_producer_epoch(&self, producer_id: i64) -> Result<(i64, i16)> {
         crate::pg_debug!(
             "PostgresStore::increment_producer_epoch: producer_id={}",
             producer_id
         );
 
         Spi::connect_mut(|client| {
-            let table = client.update(
-                "UPDATE kafka.producer_ids
-                 SET epoch = epoch + 1, last_active_at = NOW()
-                 WHERE producer_id = $1
-                 RETURNING epoch",
+            // Only idempotent (non-transactional) producers are re-initialised by id;
+            // a transactional producer's epoch is owned by its transactional_id
+            // (get_or_create_transactional_producer), and bumping it here would leave
+            // kafka.transactions on the old epoch.
+            let current = client.select(
+                "SELECT epoch FROM kafka.producer_ids
+                 WHERE producer_id = $1 AND transactional_id IS NULL",
+                Some(1),
+                &[producer_id.into()],
+            )?;
+            if current.is_empty() {
+                return Err(KafkaError::unknown_producer_id(producer_id));
+            }
+            let old_epoch: i16 = current.first().get_by_name("epoch")?.unwrap_or(0);
+
+            // A new epoch starts the producer's sequence numbers again at 0 on every
+            // partition, so the previous epoch's sequence state must go. Otherwise the
+            // first batches of the new epoch are judged against the old last_sequence
+            // and silently dropped as duplicates.
+            client.update(
+                "DELETE FROM kafka.producer_sequences WHERE producer_id = $1",
                 None,
                 &[producer_id.into()],
             )?;
 
-            if table.is_empty() {
-                return Err(KafkaError::unknown_producer_id(producer_id));
-            }
+            let table = if old_epoch == i16::MAX {
+                // Epoch exhausted (RV-13 for idempotent producers): `epoch + 1` would
+                // overflow the SMALLINT and fail every re-init from now on. Like Kafka,
+                // hand out a fresh producer_id at epoch 0.
+                client.update(
+                    "UPDATE kafka.producer_ids
+                     SET producer_id = nextval(pg_get_serial_sequence('kafka.producer_ids', 'producer_id')),
+                         epoch = 0, last_active_at = NOW()
+                     WHERE producer_id = $1
+                     RETURNING producer_id, epoch",
+                    None,
+                    &[producer_id.into()],
+                )?
+            } else {
+                client.update(
+                    "UPDATE kafka.producer_ids
+                     SET epoch = epoch + 1, last_active_at = NOW()
+                     WHERE producer_id = $1
+                     RETURNING producer_id, epoch",
+                    None,
+                    &[producer_id.into()],
+                )?
+            };
 
-            let new_epoch: i16 = table
-                .first()
+            let row = table.first();
+            let new_producer_id: i64 = row.get_by_name("producer_id")?.unwrap_or(producer_id);
+            let new_epoch: i16 = row
                 .get_by_name("epoch")?
                 .ok_or_else(|| KafkaError::Internal("Failed to get new epoch".into()))?;
 
             crate::pg_debug!(
-                "Incremented producer_id={} to epoch={}",
+                "Re-initialised producer_id={} -> producer_id={}, epoch={}",
                 producer_id,
+                new_producer_id,
                 new_epoch
             );
-            Ok(new_epoch)
+            Ok((new_producer_id, new_epoch))
         })
         .map_err(|e| match e {
             KafkaError::UnknownProducerId { .. } => e,
@@ -1269,7 +1314,11 @@ impl KafkaStore for PostgresStore {
                 .get_by_name("epoch")?
                 .unwrap_or(0);
 
-            if producer_epoch < current_epoch {
+            // The epoch must be exactly the current one. A lower epoch is a zombie
+            // (fenced). A higher epoch was never issued by this broker, so its sequence
+            // numbers cannot be validated against anything; reject it too rather than
+            // check it against another epoch's sequence state.
+            if producer_epoch != current_epoch {
                 return Err(KafkaError::producer_fenced(
                     producer_id,
                     producer_epoch,
@@ -1444,6 +1493,13 @@ impl KafkaStore for PostgresStore {
                     "DELETE FROM kafka.txn_pending_offsets WHERE transactional_id = $1",
                     None,
                     &[transactional_id.into()],
+                )?;
+                // The new epoch restarts sequence numbers at 0; drop the old epoch's
+                // sequence state so its first batches are not dropped as duplicates.
+                client.update(
+                    "DELETE FROM kafka.producer_sequences WHERE producer_id = $1",
+                    None,
+                    &[producer_id.into()],
                 )?;
 
                 let table = if old_epoch == i16::MAX {

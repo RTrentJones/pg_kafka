@@ -77,9 +77,10 @@ pub fn handle_init_producer_id(
         // First, check if the producer exists and get current epoch
         match store.get_producer_epoch(existing_producer_id)? {
             Some(current_epoch) => {
-                // Validate that the client's epoch is not stale
-                if existing_epoch < current_epoch {
-                    // Producer is fenced - a newer producer has taken over
+                // KIP-360: the client must present the epoch it currently holds. A
+                // lower epoch means a newer instance took over (fenced); a higher one
+                // was never issued by this broker.
+                if existing_epoch != current_epoch {
                     return Err(crate::kafka::error::KafkaError::producer_fenced(
                         existing_producer_id,
                         existing_epoch,
@@ -87,11 +88,12 @@ pub fn handle_init_producer_id(
                     ));
                 }
 
-                // Bump the epoch for this producer
-                let new_epoch = store.increment_producer_epoch(existing_producer_id)?;
+                // Bump the epoch (or, once it is exhausted, get a fresh producer id).
+                let (producer_id, new_epoch) =
+                    store.increment_producer_epoch(existing_producer_id)?;
 
                 response.error_code = ERROR_NONE;
-                response.producer_id = ProducerId(existing_producer_id);
+                response.producer_id = ProducerId(producer_id);
                 response.producer_epoch = new_epoch;
             }
             None => {
@@ -104,4 +106,56 @@ pub fn handle_init_producer_id(
     }
 
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::mocks::MockKafkaStore;
+
+    fn run(store: &MockKafkaStore, existing_epoch: i16) -> Result<InitProducerIdResponse> {
+        let coordinator = crate::kafka::GroupCoordinator::new();
+        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(
+            store,
+            &coordinator,
+            &broker,
+            1,
+            kafka_protocol::records::Compression::None,
+        );
+        handle_init_producer_id(&ctx, None, 60000, 1000, existing_epoch, None)
+    }
+
+    #[test]
+    fn reinit_requires_the_current_epoch() {
+        // KIP-360: both a stale and a never-issued (higher) epoch are fenced; the
+        // epoch must not be bumped for either.
+        for epoch in [2i16, 4] {
+            let mut store = MockKafkaStore::new();
+            store.expect_get_producer_epoch().returning(|_| Ok(Some(3)));
+            let err = run(&store, epoch).unwrap_err();
+            assert!(
+                matches!(err, crate::kafka::error::KafkaError::ProducerFenced { .. }),
+                "epoch {} should be fenced, got {:?}",
+                epoch,
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn reinit_returns_the_id_the_store_hands_out() {
+        // Once the epoch is exhausted the store allocates a fresh producer id; the
+        // response must carry that id, not the old one.
+        let mut store = MockKafkaStore::new();
+        store
+            .expect_get_producer_epoch()
+            .returning(|_| Ok(Some(i16::MAX)));
+        store
+            .expect_increment_producer_epoch()
+            .returning(|_| Ok((2000, 0)));
+        let response = run(&store, i16::MAX).unwrap();
+        assert_eq!(response.producer_id.0, 2000);
+        assert_eq!(response.producer_epoch, 0);
+    }
 }
