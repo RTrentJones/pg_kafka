@@ -5,7 +5,7 @@
 ## Current State (Phase 11 Complete)
 
 **APIs Implemented:** 26 of ~50 (52%)
-**Tests:** ~925 (713 unit + 10 property + 202 E2E; CI is the source of truth)
+**Tests:** ~977 (746 unit + 10 property + 221 E2E; CI is the source of truth)
 **Architecture:** Repository Pattern, typed errors, clean handler structure, key-based partition routing, compression, transactions, shadow mode
 
 ### Implemented APIs
@@ -265,7 +265,7 @@ Each phase includes:
 
 **Coverage targets:**
 - Maintain the unit-test suite (713+ tests)
-- Current: 202 E2E tests across all categories
+- Current: 221 E2E tests across all categories
 
 ---
 

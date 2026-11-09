@@ -127,6 +127,15 @@ pg_kafka.compression_type = 'gzip'
 - ✅ Automatic rebalancing on member join/leave
 - ✅ Member timeout detection (session timeout)
 - ✅ REBALANCE_IN_PROGRESS error handling
+- JoinGroup is answered immediately rather than held until the join phase completes,
+  so the group's generation moves when a rebalance *starts*. To keep what clients see
+  the same as Kafka, the coordinator remembers the last stable generation: a member
+  still on it that has not rejoined gets REBALANCE_IN_PROGRESS from Heartbeat (not
+  ILLEGAL_GENERATION), and its OffsetCommit is accepted while the group is
+  PreparingRebalance (the commit made when partitions are revoked). A stable group
+  rebalances when a member joins, a member's subscription changes, or the leader
+  rejoins; a follower rejoining with unchanged metadata keeps its assignment. A
+  rebalance that times out evicts only the members that did not rejoin.
 
 **What's Not Implemented:**
 - ❌ Static group membership (KIP-345): `group_instance_id` is not honored
@@ -194,9 +203,10 @@ may differ from the original produce, and `partition_leader_epoch = 0`.
   the served rows) sees no aborted ranges and no control markers — the data it
   receives is already clean, so correctness holds, but byte-level batch
   equivalence with a real broker does not.
-- Header **order** is not preserved and duplicate header keys collapse (headers
-  are stored as a JSONB object); Kafka's wire format permits ordered, duplicate
-  headers.
+- Header order is preserved (headers are stored as an ordered array of pairs), but
+  duplicate header keys collapse to the last value: the kafka-protocol record type
+  holds headers in a map on both decode and encode. Kafka's wire format permits
+  duplicate keys.
 
 Related minor deviations: `throttle_time_ms` is always 0 (no quota system) and
 `log_append_time_ms` is always -1 (LogAppendTime timestamp type is not
@@ -289,11 +299,11 @@ These ranges are both advertised in ApiVersions and enforced on inbound requests
 | API Key | Name | Versions | Status |
 |---------|------|----------|--------|
 | 0 | Produce | 3-9 | ✅ Full support (with key-based routing) |
-| 1 | Fetch | 0-11 | ✅ Full support (v12+ not advertised; v13+ uses topic IDs) |
-| 2 | ListOffsets | 0-7 | ✅ Implemented (incl. timestamp lookup) |
+| 1 | Fetch | 4-11 | ✅ Full support (v12+ not advertised; v13+ uses topic IDs) |
+| 2 | ListOffsets | 1-7 | ✅ Implemented (incl. timestamp lookup) |
 | 3 | Metadata | 0-10 | ✅ Full support (v10 `topic_id` is the zero UUID) |
-| 8 | OffsetCommit | 0-8 | ✅ Full support |
-| 9 | OffsetFetch | 0-7 | ✅ Full support |
+| 8 | OffsetCommit | 2-8 | ✅ Full support |
+| 9 | OffsetFetch | 1-7 | ✅ Full support |
 | 10 | FindCoordinator | 0-3 | ✅ Full support |
 | 11 | JoinGroup | 0-7 | ✅ Full support |
 | 12 | Heartbeat | 0-4 | ✅ Full support |
@@ -302,8 +312,8 @@ These ranges are both advertised in ApiVersions and enforced on inbound requests
 | 15 | DescribeGroups | 0-5 | ✅ Full support |
 | 16 | ListGroups | 0-4 | ✅ Full support |
 | 18 | ApiVersions | 0-3 | ✅ Full support |
-| 19 | CreateTopics | 0-5 | ✅ Supported (topic configs ignored, see §13) |
-| 20 | DeleteTopics | 0-4 | ✅ Full support |
+| 19 | CreateTopics | 2-5 | ✅ Supported (topic configs ignored, see §13) |
+| 20 | DeleteTopics | 1-4 | ✅ Full support |
 | 21 | DeleteRecords | 0-2 | ✅ Full support |
 | 22 | InitProducerId | 0-4 | ✅ Full support |
 | 24 | AddPartitionsToTxn | 0-3 | ✅ Full support |
@@ -411,7 +421,7 @@ Wire-level SASL/ACLs are **not planned**; the accepted posture is network-contro
 | Client | Version | Status | Notes |
 |--------|---------|--------|-------|
 | kcat | 1.7.0+ | ✅ Works | Producer and consumer tested |
-| rdkafka (Rust) | 0.36+ | ✅ Works | Full E2E test suite (202 tests) |
+| rdkafka (Rust) | 0.36+ | ✅ Works | Full E2E test suite (221 tests) |
 
 ### Client Configuration
 
@@ -456,4 +466,4 @@ auto.offset.reset=earliest
 **Last Updated:** 2026-10-29
 **Applies To:** pg_kafka Phase 11 Complete (Shadow Mode)
 **API Coverage:** 26 of ~50 Kafka APIs (52%)
-**Test Status:** 713 unit + 10 property + 202 E2E tests (CI-gated; counts drift — CI is the source of truth)
+**Test Status:** 746 unit + 10 property + 221 E2E tests (CI-gated; counts drift — CI is the source of truth)
