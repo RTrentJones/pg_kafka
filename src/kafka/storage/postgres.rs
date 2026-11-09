@@ -243,8 +243,10 @@ impl PostgresStore {
                             (t.retention_ms IS NOT NULL AND t.retention_ms >= 0
                              -- Clamp to 1e13 ms (~317 years): larger values, such as the
                              -- common i64::MAX for forever, overflow the interval or the
-                             -- timestamp and abort the whole sweep for every topic.
-                             AND m.created_at < NOW() - (LEAST(t.retention_ms, 10000000000000) || ' milliseconds')::interval)
+                             -- timestamp and abort the whole sweep for every topic. Build
+                             -- the interval by multiplication: PG14 rejects a text
+                             -- 'N milliseconds' literal above the int32 range.
+                             AND m.created_at < NOW() - LEAST(t.retention_ms, 10000000000000) * INTERVAL '1 millisecond')
                          OR (t.retention_ms IS NULL AND $1 > 0
                              AND m.created_at < NOW() - ($1 || ' hours')::interval)
                        )
