@@ -165,9 +165,20 @@ mod tests {
         let broker = BrokerMetadata::new("localhost".to_string(), 9092);
         let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
 
-        let result = produce::handle_produce(&ctx, topic_data, Some(&meta), Some("tx1"));
-        let err = result.unwrap_err();
-        assert_eq!(err.to_kafka_error_code(), ERROR_INVALID_TXN_STATE);
+        // Reported on every requested partition, not returned as Err.
+        let response = produce::handle_produce(&ctx, topic_data, Some(&meta), Some("tx1")).unwrap();
+        let codes: Vec<i16> = response
+            .responses
+            .iter()
+            .flat_map(|t| t.partition_responses.iter())
+            .map(|p| p.error_code)
+            .collect();
+        assert!(!codes.is_empty());
+        assert!(
+            codes.iter().all(|c| *c == ERROR_INVALID_TXN_STATE),
+            "{:?}",
+            codes
+        );
     }
 
     #[test]
@@ -197,9 +208,20 @@ mod tests {
         let broker = BrokerMetadata::new("localhost".to_string(), 9092);
         let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
 
-        let result = produce::handle_produce(&ctx, topic_data, Some(&meta), Some("tx1"));
-        let err = result.unwrap_err();
-        assert_eq!(err.to_kafka_error_code(), ERROR_TRANSACTIONAL_ID_NOT_FOUND);
+        // Reported on every requested partition, not returned as Err.
+        let response = produce::handle_produce(&ctx, topic_data, Some(&meta), Some("tx1")).unwrap();
+        let codes: Vec<i16> = response
+            .responses
+            .iter()
+            .flat_map(|t| t.partition_responses.iter())
+            .map(|p| p.error_code)
+            .collect();
+        assert!(!codes.is_empty());
+        assert!(
+            codes.iter().all(|c| *c == ERROR_TRANSACTIONAL_ID_NOT_FOUND),
+            "{:?}",
+            codes
+        );
     }
 
     #[test]
@@ -2187,11 +2209,21 @@ mod tests {
 
         let result = transaction::handle_add_partitions_to_txn(&ctx, "txn-1", 1000, 0, topics);
 
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            KafkaError::InvalidTxnState { .. } => {}
-            e => panic!("Expected InvalidTransactionState error, got {:?}", e),
-        }
+        // The error is reported on every requested partition (v0-3 has no
+        // top-level error code), not returned as Err.
+        let response = result.unwrap();
+        let codes: Vec<i16> = response
+            .results_by_topic_v3_and_below
+            .iter()
+            .flat_map(|t| t.results_by_partition.iter())
+            .map(|p| p.partition_error_code)
+            .collect();
+        assert!(!codes.is_empty());
+        assert!(
+            codes.iter().all(|c| *c == ERROR_INVALID_TXN_STATE),
+            "{:?}",
+            codes
+        );
     }
 
     #[test]
@@ -2212,11 +2244,21 @@ mod tests {
         let result =
             transaction::handle_add_partitions_to_txn(&ctx, "unknown-txn", 1000, 0, topics);
 
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            KafkaError::TransactionalIdNotFound { .. } => {}
-            e => panic!("Expected TransactionalIdNotFound error, got {:?}", e),
-        }
+        // The error is reported on every requested partition (v0-3 has no
+        // top-level error code), not returned as Err.
+        let response = result.unwrap();
+        let codes: Vec<i16> = response
+            .results_by_topic_v3_and_below
+            .iter()
+            .flat_map(|t| t.results_by_partition.iter())
+            .map(|p| p.partition_error_code)
+            .collect();
+        assert!(!codes.is_empty());
+        assert!(
+            codes.iter().all(|c| *c == ERROR_TRANSACTIONAL_ID_NOT_FOUND),
+            "{:?}",
+            codes
+        );
     }
 
     #[test]
@@ -2236,11 +2278,21 @@ mod tests {
 
         let result = transaction::handle_add_partitions_to_txn(&ctx, "txn-1", 1000, 0, topics);
 
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            KafkaError::ProducerFenced { .. } => {}
-            e => panic!("Expected ProducerFenced error, got {:?}", e),
-        }
+        // The error is reported on every requested partition (v0-3 has no
+        // top-level error code), not returned as Err.
+        let response = result.unwrap();
+        let codes: Vec<i16> = response
+            .results_by_topic_v3_and_below
+            .iter()
+            .flat_map(|t| t.results_by_partition.iter())
+            .map(|p| p.partition_error_code)
+            .collect();
+        assert!(!codes.is_empty());
+        assert!(
+            codes.iter().all(|c| *c == ERROR_PRODUCER_FENCED),
+            "{:?}",
+            codes
+        );
     }
 
     // ========== AddOffsetsToTxn Tests ==========

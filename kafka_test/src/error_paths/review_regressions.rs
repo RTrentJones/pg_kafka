@@ -148,3 +148,75 @@ pub async fn test_active_idempotent_producer_survives_retention_sweep() -> TestR
     println!("✅ Test PASSED\n");
     Ok(())
 }
+
+/// A producer fenced by a newer instance (same transactional.id) must get an error
+/// when it tries to write again, and nothing it sends may become visible. The fenced
+/// AddPartitionsToTxn used to come back as an empty response (its top-level error
+/// field only exists from v4, and the broker advertises v0-3), which reads as success.
+pub async fn test_fenced_producer_cannot_write() -> TestResult {
+    println!("=== Test: Fenced Producer Cannot Write ===\n");
+
+    let ctx = TestContext::new().await?;
+    let topic = crate::fixtures::TestTopicBuilder::new(&ctx, "review-fenced-write")
+        .with_partitions(2)
+        .build()
+        .await?;
+    let txn_id = format!("review-fenced-{}", uuid::Uuid::new_v4());
+
+    let zombie = create_transactional_producer(&txn_id)?;
+    zombie.init_transactions(Duration::from_secs(10))?;
+    let newer = create_transactional_producer(&txn_id)?;
+    newer.init_transactions(Duration::from_secs(10))?;
+    println!("Step 1: second instance initialised; the first is now fenced");
+
+    // The zombie writes to a partition it never added, so the broker sees
+    // AddPartitionsToTxn (then Produce) carrying the stale epoch.
+    let outcome: Result<(), String> = async {
+        zombie.begin_transaction().map_err(|e| e.to_string())?;
+        zombie
+            .send(
+                FutureRecord::<(), _>::to(&topic.name)
+                    .payload("zombie")
+                    .partition(1),
+                Duration::from_secs(5),
+            )
+            .await
+            .map_err(|(e, _)| e.to_string())?;
+        zombie
+            .commit_transaction(Duration::from_secs(10))
+            .map_err(|e| e.to_string())
+    }
+    .await;
+    println!("   zombie outcome: {:?}", outcome);
+
+    let visible = count_messages(&ctx, &topic.name).await?;
+    let fatal = zombie.client().fatal_error();
+    println!(
+        "   committed records: {}, fatal error: {:?}",
+        visible, fatal
+    );
+    if outcome.is_ok() {
+        return Err("the fenced producer's transaction was reported as committed".into());
+    }
+    // The broker must tell the client it was fenced (a fatal ProducerFenced error),
+    // not leave it to time out.
+    match fatal {
+        Some((rdkafka::types::RDKafkaErrorCode::Fenced, _))
+        | Some((rdkafka::types::RDKafkaErrorCode::ProducerFenced, _)) => {}
+        other => {
+            return Err(format!(
+                "expected rdkafka to record a fatal ProducerFenced error, got {:?}",
+                other
+            )
+            .into())
+        }
+    }
+    assert_eq!(
+        visible, 0,
+        "a fenced producer's record must not be committed"
+    );
+
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}

@@ -139,6 +139,7 @@ use kafka_test::{
     test_external_only_fallback,
     test_external_only_mode,
     test_external_primary_dead_letter_serves_local,
+    test_fenced_producer_cannot_write,
     test_fetch_after_offset_reset,
     test_fetch_bad_partition_or_offset_returns_error,
     test_fetch_committed_no_history,
@@ -747,6 +748,12 @@ fn get_all_tests() -> Vec<TestDef> {
             parallel_safe: true,
         },
         // Error path tests
+        TestDef {
+            category: "error_paths",
+            name: "test_fenced_producer_cannot_write",
+            test_fn: wrap_test!(test_fenced_producer_cannot_write),
+            parallel_safe: true,
+        },
         TestDef {
             category: "error_paths",
             name: "test_active_idempotent_producer_survives_retention_sweep",

@@ -47,8 +47,18 @@ pub fn handle_add_partitions_to_txn(
     let store = ctx.store;
     let default_partitions = ctx.default_partitions;
     // Atomically begin or continue the transaction
-    // This handles the race condition between checking state and transitioning
-    store.begin_or_continue_transaction(transactional_id, producer_id, producer_epoch)?;
+    // This handles the race condition between checking state and transitioning.
+    // On failure (fenced epoch, invalid state, ...) report the error on every
+    // requested partition: the response's top-level error_code only exists from v4,
+    // and an empty v0-3 response reads as success.
+    if let Err(e) =
+        store.begin_or_continue_transaction(transactional_id, producer_id, producer_epoch)
+    {
+        return Ok(add_partitions_to_txn_error_response(
+            &topics,
+            e.to_kafka_error_code(),
+        ));
+    }
 
     // Build response with results for each partition
     let mut response = AddPartitionsToTxnResponse::default();
@@ -342,6 +352,34 @@ pub fn handle_txn_offset_commit(
 
     response.topics = topic_results;
     Ok(response)
+}
+
+/// An AddPartitionsToTxn (v0-3) response reporting `error_code` on every requested
+/// partition.
+pub fn add_partitions_to_txn_error_response(
+    topics: &[(String, Vec<i32>)],
+    error_code: i16,
+) -> AddPartitionsToTxnResponse {
+    let mut response = AddPartitionsToTxnResponse::default();
+    response.error_code = error_code; // v4+ only; ignored by the v0-3 encoder
+    response.results_by_topic_v3_and_below = topics
+        .iter()
+        .map(|(topic_name, partitions)| {
+            let mut t = AddPartitionsToTxnTopicResult::default();
+            t.name = TopicName(StrBytes::from_string(topic_name.clone()));
+            t.results_by_partition = partitions
+                .iter()
+                .map(|partition_id| {
+                    let mut p = AddPartitionsToTxnPartitionResult::default();
+                    p.partition_index = *partition_id;
+                    p.partition_error_code = error_code;
+                    p
+                })
+                .collect();
+            t
+        })
+        .collect();
+    response
 }
 
 /// Build a TxnOffsetCommit response that reports `error_code` for every requested
