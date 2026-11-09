@@ -211,6 +211,7 @@ pub use shadow::{
     // Outbox duplicate-delivery guard (issue #93)
     test_async_forwarding_no_duplicates_on_slow_ack,
     test_committed_transaction_forwarded,
+    test_committed_transaction_forwards_without_ram_buffer,
     test_committed_transaction_uses_durable_outbox,
     test_committed_txn_leaves_no_orphan_outbox_rows,
     // Percentage routing

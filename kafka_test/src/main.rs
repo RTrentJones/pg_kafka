@@ -71,6 +71,7 @@ use kafka_test::{
     test_commit_offset_zero,
     test_commit_then_fetch_offset,
     test_committed_transaction_forwarded,
+    test_committed_transaction_forwards_without_ram_buffer,
     test_committed_transaction_uses_durable_outbox,
     test_committed_txn_leaves_no_orphan_outbox_rows,
     // Compression tests
@@ -1639,6 +1640,12 @@ fn get_all_tests() -> Vec<TestDef> {
             parallel_safe: false,
         },
         // Transaction integration tests
+        TestDef {
+            category: "shadow",
+            name: "test_committed_transaction_forwards_without_ram_buffer",
+            test_fn: wrap_test!(test_committed_transaction_forwards_without_ram_buffer),
+            parallel_safe: false,
+        },
         TestDef {
             category: "shadow",
             name: "test_committed_transaction_forwarded",
