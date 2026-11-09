@@ -21,7 +21,7 @@ kcat -C -b localhost:9092 -t my-topic -p 0 -o beginning
 | **Consumer Groups** | Complete | Full coordinator with auto-rebalancing |
 | **Transactions** | Complete | Full EOS with read-committed isolation |
 | **Shadow Mode** | Complete | External Kafka forwarding with SASL/SSL |
-| **Test Suite** | ~925 tests | 713 unit + 10 property + 202 E2E (CI is the source of truth) |
+| **Test Suite** | ~977 tests | 746 unit + 10 property + 221 E2E (CI is the source of truth) |
 | **CI/CD** | Complete | GitHub Actions with lint, test, security audit |
 
 **Current Phase:** Phase 11 Complete - Shadow Mode
@@ -278,7 +278,7 @@ src/
     └── pgrx_embed.rs       # pgrx embedding binary
 
 tests/property_tests.rs     # proptest suite (10 tests)
-kafka_test/                 # E2E test suite using rdkafka client (202 tests)
+kafka_test/                 # E2E test suite using rdkafka client (221 tests)
 sql/bootstrap.sql           # Schema definition
 docs/                       # Architecture decisions, protocol coverage
 ```
@@ -304,7 +304,7 @@ docs/                       # Architecture decisions, protocol coverage
 | Other | 82 | Coordinator, partitioner, constants, dispatch, long-poll registry, contexts |
 | Property | 10 | `tests/property_tests.rs` (proptest) |
 | E2E | 202 | Full integration with rdkafka client |
-| **Total** | **~925** | 713 unit + 10 property + 202 E2E |
+| **Total** | **~977** | 746 unit + 10 property + 221 E2E |
 
 *Counts drift as tests are added — the CI run is the source of truth; per-category
 numbers above are indicative.*

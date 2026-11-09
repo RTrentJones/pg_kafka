@@ -64,7 +64,9 @@ const LIVENESS_CHANNEL_CAPACITY: usize = 1_000;
 /// payload is a `CaughtError`, so try that in addition to the usual
 /// `&str`/`String` panic payloads.
 fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
-    if let Some(s) = payload.downcast_ref::<&str>() {
+    if payload.is::<crate::kafka::dispatch::RollbackRequest>() {
+        HANDLER_ERROR_ROLLBACK.to_string()
+    } else if let Some(s) = payload.downcast_ref::<&str>() {
         s.to_string()
     } else if let Some(s) = payload.downcast_ref::<String>() {
         s.clone()
@@ -74,6 +76,10 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
         "Unknown panic".to_string()
     }
 }
+
+/// Message `run_request_in_subtransaction` returns when a handler returned an error
+/// and asked for its partial writes to be rolled back (not a panic).
+const HANDLER_ERROR_ROLLBACK: &str = "handler returned an error; request rolled back";
 
 /// Run `f` inside an internal subtransaction, rolling back its database
 /// writes if it panics. Postgres ERRORs (constraint violations, OOM, ...)
@@ -670,10 +676,23 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
                 // RV-10: guard the outbox maintenance with the subtransaction wrapper
                 // (see the config-reload block above) so a Postgres ERROR rolls back
                 // and is logged rather than aborting the bgworker.
+                // Apply results first (marks delivered rows done so the poll won't
+                // re-dispatch them), in a subtransaction of their own: the acks are
+                // consumed from the channel as they are read, so if they shared the
+                // poll's subtransaction a Postgres ERROR in the poll would roll back
+                // the applied acks and lose them (delivered rows left pending,
+                // re-sent, and eventually dead-lettered).
+                let mut applied = 0;
+                if let Err(panic_msg) = run_request_in_subtransaction(|| {
+                    applied = shadow_outbox.drain_forward_acks();
+                }) {
+                    pg_warning!(
+                        "Shadow ack application panicked, rolled back (worker survived): {}",
+                        panic_msg
+                    );
+                }
                 let result = run_request_in_subtransaction(|| {
-                    // Apply results first (marks delivered rows done so the poll
-                    // won't re-dispatch them), then dispatch the next due batch.
-                    let applied = shadow_outbox.drain_forward_acks();
+                    // Then dispatch the next due batch.
                     match shadow_outbox.poll_and_forward_outbox() {
                         Ok(dispatched) => {
                             if applied > 0 || dispatched > 0 {
@@ -923,6 +942,9 @@ fn execute_request_in_transaction(
             // back the request's partial writes instead of letting
             // them commit with the surrounding transaction. The worker
             // itself survives either way.
+            // New request, new sync-forward budget (see ShadowStore::begin_request).
+            shadow_ref.begin_request();
+
             let result = run_request_in_subtransaction(|| {
                 process_request(
                     request,
@@ -939,10 +961,14 @@ fn execute_request_in_transaction(
             handler_duration_ref.set(handler_start.elapsed());
 
             if let Err(panic_msg) = result {
-                pg_warning!(
-                    "Handler panic caught, request rolled back (worker survived): {}",
-                    panic_msg
-                );
+                // A handler error already logged itself and sent its response; only
+                // a real panic is worth a warning here.
+                if panic_msg != HANDLER_ERROR_ROLLBACK {
+                    pg_warning!(
+                        "Handler panic caught, request rolled back (worker survived): {}",
+                        panic_msg
+                    );
+                }
             }
 
             // RB-1 test hook: widen the response-send→commit window so the E2E

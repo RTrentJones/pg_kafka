@@ -243,9 +243,28 @@ pub struct ShadowStore<S: KafkaStore> {
     /// of re-sent, so a slow ack no longer produces a duplicate delivery
     /// (issue #93).
     inflight: super::inflight::InflightTracker,
+    /// Acks for *other* rows that a sync-mode produce drained while waiting for its
+    /// own. Applying them inside that produce's subtransaction lost them whenever the
+    /// request rolled back (the ack was already consumed from the channel), leaving
+    /// delivered rows pending: duplicate deliveries and, eventually, false dead
+    /// letters. They are applied by `drain_forward_acks` in its own subtransaction.
+    deferred_acks: Mutex<Vec<ForwardAck>>,
+    /// Deadline shared by every sync-mode forward of the current request, so a
+    /// produce to many partitions waits at most `SYNC_FORWARD_WAIT_MS` in total
+    /// rather than per partition (the wait blocks the single DB thread). Reset by
+    /// `begin_request`.
+    sync_budget_deadline: Mutex<Option<Instant>>,
 }
 
 impl<S: KafkaStore> ShadowStore<S> {
+    /// Called by the worker before each request: starts a new sync-forward budget.
+    pub fn begin_request(&self) {
+        *self
+            .sync_budget_deadline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
     /// Create a new ShadowStore wrapping the given inner store
     ///
     /// The producer is NOT created here - it's lazily initialized on first use
@@ -268,6 +287,8 @@ impl<S: KafkaStore> ShadowStore<S> {
             pending_txn_messages: Arc::new(RwLock::new(HashMap::new())),
             license: RwLock::new(None),
             inflight: super::inflight::InflightTracker::new(INFLIGHT_EVICT_AFTER),
+            deferred_acks: Mutex::new(Vec::new()),
+            sync_budget_deadline: Mutex::new(None),
         }
     }
 
@@ -770,6 +791,56 @@ impl<S: KafkaStore> ShadowStore<S> {
         }
     }
 
+    /// The pending (uncommitted) records of `(producer_id, producer_epoch)`'s
+    /// transaction, read from `kafka.messages`. `None` if the lookup failed (the
+    /// caller then falls back to the in-RAM buffer).
+    #[cfg(not(test))]
+    fn pending_txn_records(
+        &self,
+        producer_id: i64,
+        producer_epoch: i16,
+    ) -> Option<Vec<PendingForwardRecord>> {
+        use pgrx::prelude::*;
+        let result: std::result::Result<Vec<PendingForwardRecord>, pgrx::spi::SpiError> =
+            Spi::connect(|client| {
+                let table = client.select(
+                    "SELECT topic_id, partition_id, partition_offset, key
+                     FROM kafka.messages
+                     WHERE producer_id = $1 AND producer_epoch = $2 AND txn_state = 'pending'
+                     ORDER BY topic_id, partition_id, partition_offset",
+                    None,
+                    &[producer_id.into(), producer_epoch.into()],
+                )?;
+                let mut records = Vec::new();
+                for row in table {
+                    records.push(PendingForwardRecord {
+                        topic_id: row.get_by_name("topic_id")?.unwrap_or(0),
+                        partition_id: row.get_by_name("partition_id")?.unwrap_or(0),
+                        offset: row.get_by_name("partition_offset")?.unwrap_or(0),
+                        key: row.get_by_name::<Vec<u8>, _>("key")?,
+                    });
+                }
+                Ok(records)
+            });
+        match result {
+            Ok(records) => Some(records),
+            Err(e) => {
+                tracing::warn!("Shadow: failed to read pending txn records: {:?}", e);
+                None
+            }
+        }
+    }
+
+    /// Test stub — see `pending_txn_records`.
+    #[cfg(test)]
+    fn pending_txn_records(
+        &self,
+        _producer_id: i64,
+        _producer_epoch: i16,
+    ) -> Option<Vec<PendingForwardRecord>> {
+        None
+    }
+
     /// Test stub — see `enqueue_committed_txn_outbox`.
     #[cfg(test)]
     fn enqueue_committed_txn_outbox(&self, _records: &[PendingForwardRecord]) {}
@@ -899,8 +970,15 @@ impl<S: KafkaStore> ShadowStore<S> {
             return;
         }
 
-        // Wait (bounded) for acks, applying every one we drain so none are lost.
-        let deadline = Instant::now() + Duration::from_millis(SYNC_FORWARD_WAIT_MS);
+        // Wait (bounded) for acks. The bound is shared by the whole request (see
+        // sync_budget_deadline). Our own acks are applied now (their rows belong to
+        // this request); others are deferred to drain_forward_acks so a rollback of
+        // this request cannot lose them.
+        let deadline = *self
+            .sync_budget_deadline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_or_insert_with(|| Instant::now() + Duration::from_millis(SYNC_FORWARD_WAIT_MS));
         loop {
             let remaining = match deadline.checked_duration_since(Instant::now()) {
                 Some(r) if !r.is_zero() => r,
@@ -911,12 +989,17 @@ impl<S: KafkaStore> ShadowStore<S> {
                     let is_ours = ack.topic_id == topic_id
                         && ack.partition_id == partition_id
                         && pending.contains(&ack.local_offset);
+                    if !is_ours {
+                        self.deferred_acks
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .push(ack);
+                        continue;
+                    }
                     self.apply_ack(&ack);
-                    if is_ours {
-                        pending.remove(&ack.local_offset);
-                        if pending.is_empty() {
-                            break;
-                        }
+                    pending.remove(&ack.local_offset);
+                    if pending.is_empty() {
+                        break;
                     }
                 }
                 None => break, // timed out
@@ -1075,7 +1158,9 @@ impl<S: KafkaStore> ShadowStore<S> {
     /// the number of acks applied.
     #[cfg(not(test))]
     pub fn drain_forward_acks(&self) -> usize {
-        let mut acks: Vec<ForwardAck> = Vec::new();
+        // Acks a sync-mode produce deferred, then whatever is on the channel.
+        let mut acks: Vec<ForwardAck> =
+            std::mem::take(&mut *self.deferred_acks.lock().unwrap_or_else(|p| p.into_inner()));
         {
             let guard = self.forward_ack_rx.read().unwrap_or_else(|poisoned| {
                 tracing::warn!("forward_ack_rx read lock was poisoned, recovering");
@@ -1592,7 +1677,7 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
         self.inner.get_producer_epoch(producer_id)
     }
 
-    fn increment_producer_epoch(&self, producer_id: i64) -> Result<i16> {
+    fn increment_producer_epoch(&self, producer_id: i64) -> Result<(i64, i16)> {
         self.inner.increment_producer_epoch(producer_id)
     }
 
@@ -1804,8 +1889,22 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
             pending.remove(&key)
         };
 
-        // 2. Collect the buffered records (all are about to be committed).
-        let records = pending_records.map(|buf| buf.records).unwrap_or_default();
+        // 2. The records about to be committed. Read them from kafka.messages, in
+        // this transaction, rather than trusting the in-RAM buffer: the buffer is
+        // empty after a worker restart, and it is removed above even if the commit
+        // below then fails and the client retries, either of which committed the
+        // transaction without ever forwarding it.
+        //
+        // Only while shadow mode is on and this node is primary, the same gate
+        // insert_transactional_records applies when buffering: records produced
+        // while forwarding was off must not be queued (and later forwarded) here.
+        let forwarding = self.is_enabled() && self.is_primary();
+        let records = if forwarding {
+            self.pending_txn_records(producer_id, producer_epoch)
+                .unwrap_or_else(|| pending_records.map(|buf| buf.records).unwrap_or_default())
+        } else {
+            Vec::new()
+        };
 
         // 3. Commit the inner transaction unconditionally. Even with zero
         // forwarded records, the kafka.transactions state row must transition to

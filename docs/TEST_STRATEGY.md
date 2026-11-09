@@ -9,7 +9,7 @@
 
 | Category | Count | Coverage |
 |----------|-------|----------|
-| Unit Tests | 713 | Core logic, handlers, storage, protocol, shadow (`src/`, includes 4 in-module proptest fuzz harnesses) |
+| Unit Tests | 746 | Core logic, handlers, storage, protocol, shadow (`src/`, includes 4 in-module proptest fuzz harnesses) |
 | Property Tests | 10 | `tests/property_tests.rs`: 8 proptest wire-format invariants + 2 boundary tests (CI-run) |
 | E2E Tests | 202 | Full protocol integration (`kafka_test/`) |
 | **Total** | **~925** | **Comprehensive** |
@@ -49,7 +49,7 @@ cargo test --features pg14                           # both
 
 ---
 
-## E2E Test Categories (202 tests)
+## E2E Test Categories (221 tests)
 
 | Category | Tests | Purpose |
 |----------|-------|---------|
@@ -236,6 +236,6 @@ See `docs/PGRX_TESTING_GUIDE.md` for the full testing strategy.
 
 ---
 
-**Test Count:** ~925 (713 unit + 10 property + 202 E2E; CI is the source of truth)
+**Test Count:** ~977 (746 unit + 10 property + 221 E2E; CI is the source of truth)
 **Coverage Target:** 80%+ (testable code)
 **All Tests Passing:** ✅

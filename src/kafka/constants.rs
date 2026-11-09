@@ -400,6 +400,10 @@ pub const ERROR_OFFSET_OUT_OF_RANGE: i16 = 1;
 /// INVALID_REQUEST: the request is malformed or targets an unsupported entity
 pub const ERROR_INVALID_REQUEST: i16 = 42;
 
+/// INVALID_RECORD: a record (or record batch) failed broker-side validation, e.g. a
+/// Produce v3+ partition carrying more than one record batch
+pub const ERROR_INVALID_RECORD: i16 = 87;
+
 /// INVALID_CONFIG: the given configuration key/value is invalid or unsupported
 pub const ERROR_INVALID_CONFIG: i16 = 40;
 

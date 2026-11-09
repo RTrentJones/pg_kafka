@@ -47,8 +47,18 @@ pub fn handle_add_partitions_to_txn(
     let store = ctx.store;
     let default_partitions = ctx.default_partitions;
     // Atomically begin or continue the transaction
-    // This handles the race condition between checking state and transitioning
-    store.begin_or_continue_transaction(transactional_id, producer_id, producer_epoch)?;
+    // This handles the race condition between checking state and transitioning.
+    // On failure (fenced epoch, invalid state, ...) report the error on every
+    // requested partition: the response's top-level error_code only exists from v4,
+    // and an empty v0-3 response reads as success.
+    if let Err(e) =
+        store.begin_or_continue_transaction(transactional_id, producer_id, producer_epoch)
+    {
+        return Ok(add_partitions_to_txn_error_response(
+            &topics,
+            e.to_kafka_error_code(),
+        ));
+    }
 
     // Build response with results for each partition
     let mut response = AddPartitionsToTxnResponse::default();
@@ -63,7 +73,11 @@ pub fn handle_add_partitions_to_txn(
             Ok(Some(count)) => count,
             Ok(None) => {
                 // Topic doesn't exist, auto-create it
-                match store.get_or_create_topic(&topic_name, default_partitions) {
+                match super::helpers::get_or_create_valid_topic(
+                    store,
+                    &topic_name,
+                    default_partitions,
+                ) {
                     Ok((_, count)) => count,
                     Err(_) => {
                         // Failed to create, return error for all partitions
@@ -195,6 +209,16 @@ pub fn handle_end_txn(
             let mut response = EndTxnResponse::default();
             response.error_code = ERROR_NONE;
             return Ok(response);
+        }
+        // A retried EndTxn (its first response was lost) finds the transaction already
+        // finished. When the outcome matches what the client asks for, Kafka answers
+        // NONE; INVALID_TXN_STATE would be fatal to the client for a commit that did
+        // succeed. The opposite outcome is still an invalid transition.
+        Some(crate::kafka::storage::TransactionState::CompleteCommit) if committed => {
+            return Ok(EndTxnResponse::default());
+        }
+        Some(crate::kafka::storage::TransactionState::CompleteAbort) if !committed => {
+            return Ok(EndTxnResponse::default());
         }
         Some(other) => {
             return Err(KafkaError::invalid_txn_state(
@@ -344,6 +368,34 @@ pub fn handle_txn_offset_commit(
     Ok(response)
 }
 
+/// An AddPartitionsToTxn (v0-3) response reporting `error_code` on every requested
+/// partition.
+pub fn add_partitions_to_txn_error_response(
+    topics: &[(String, Vec<i32>)],
+    error_code: i16,
+) -> AddPartitionsToTxnResponse {
+    let mut response = AddPartitionsToTxnResponse::default();
+    response.error_code = error_code; // v4+ only; ignored by the v0-3 encoder
+    response.results_by_topic_v3_and_below = topics
+        .iter()
+        .map(|(topic_name, partitions)| {
+            let mut t = AddPartitionsToTxnTopicResult::default();
+            t.name = TopicName(StrBytes::from_string(topic_name.clone()));
+            t.results_by_partition = partitions
+                .iter()
+                .map(|partition_id| {
+                    let mut p = AddPartitionsToTxnPartitionResult::default();
+                    p.partition_index = *partition_id;
+                    p.partition_error_code = error_code;
+                    p
+                })
+                .collect();
+            t
+        })
+        .collect();
+    response
+}
+
 /// Build a TxnOffsetCommit response that reports `error_code` for every requested
 /// partition. TxnOffsetCommitResponse has no top-level error code, so a request-level
 /// failure (fenced epoch, invalid transaction state, stale generation, ...) has to be
@@ -377,6 +429,41 @@ pub fn txn_offset_commit_error_response(
 mod tests {
     use super::*;
     use crate::testing::mocks::MockKafkaStore;
+
+    #[test]
+    fn test_end_txn_retry_with_same_outcome_succeeds() {
+        use crate::kafka::storage::TransactionState;
+        let cases = [
+            (TransactionState::CompleteCommit, true, true),
+            (TransactionState::CompleteAbort, false, true),
+            (TransactionState::CompleteCommit, false, false),
+            (TransactionState::CompleteAbort, true, false),
+        ];
+        for (state, committed, ok) in cases {
+            let mut store = MockKafkaStore::new();
+            store
+                .expect_validate_transaction()
+                .returning(|_, _, _| Ok(()));
+            let st = state.clone();
+            store
+                .expect_get_transaction_state()
+                .returning(move |_| Ok(Some(st.clone())));
+            let coordinator = crate::kafka::GroupCoordinator::new();
+            let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
+            let ctx = HandlerContext::new(
+                &store,
+                &coordinator,
+                &broker,
+                1,
+                kafka_protocol::records::Compression::None,
+            );
+            let result = handle_end_txn(&ctx, "txn", 1, 0, committed);
+            assert_eq!(result.is_ok(), ok, "{:?} commit={}", state, committed);
+            if let Ok(r) = result {
+                assert_eq!(r.error_code, ERROR_NONE);
+            }
+        }
+    }
 
     #[test]
     fn test_add_partitions_to_txn_rejects_negative_partition() {

@@ -98,7 +98,17 @@ fn parse_request_inner(
         if let Some((min_version, max_version)) =
             super::super::response_builders::supported_version_range(api_key)
         {
-            if api_version < min_version || api_version > max_version {
+            if api_version < min_version {
+                // Below the advertised minimum there is no response format we can encode
+                // (the minimums are the protocol crate's own), so do what Kafka does with
+                // an unsupported version and close the connection. A client that
+                // negotiated through ApiVersions never sends one.
+                return Err(KafkaError::Encoding(format!(
+                    "api_key={} version {} is below the supported minimum {}",
+                    api_key, api_version, min_version
+                )));
+            }
+            if api_version > max_version {
                 warn!(
                     "Rejecting api_key={} version {} outside supported range {}..={}",
                     api_key, api_version, min_version, max_version
@@ -358,6 +368,28 @@ fn parse_api_versions(
         "Parsed ApiVersions request (api_key={}, api_version={})",
         API_KEY_API_VERSIONS, api_version
     );
+    // KIP-511: a version we don't support must still be answered, in the v0 format,
+    // with UNSUPPORTED_VERSION and the full key list, so the client can retry with a
+    // version from that list. Encoding at the requested version would fail and drop
+    // the connection.
+    let (_, max_version) =
+        super::super::response_builders::supported_version_range(API_KEY_API_VERSIONS)
+            .unwrap_or((0, 3));
+    if !(0..=max_version).contains(&api_version) {
+        warn!(
+            "ApiVersions v{} is outside 0..={}; answering in v0 with UNSUPPORTED_VERSION",
+            api_version, max_version
+        );
+        let mut response = super::super::response_builders::build_api_versions_response();
+        response.error_code = ERROR_UNSUPPORTED_VERSION;
+        let _ = response_tx.send(super::super::messages::KafkaResponse::ApiVersions {
+            correlation_id,
+            api_version: 0,
+            response,
+        });
+        return Ok(None);
+    }
+
     Ok(Some(KafkaRequest::ApiVersions {
         correlation_id,
         client_id,
@@ -483,6 +515,25 @@ fn parse_produce(
         produce_req.topic_data.len()
     );
 
+    // The requested topics/partitions, so a bad record batch can be reported on
+    // every partition (ProduceResponse has no top-level error code).
+    let requested: Vec<super::super::messages::TopicProduceData> = produce_req
+        .topic_data
+        .iter()
+        .map(|t| super::super::messages::TopicProduceData {
+            name: t.name.to_string(),
+            partitions: t
+                .partition_data
+                .iter()
+                .map(|p| super::super::messages::PartitionProduceData {
+                    partition_index: p.index,
+                    records: Vec::new(),
+                    producer_metadata: None,
+                })
+                .collect(),
+        })
+        .collect();
+
     // Extract topic data from kafka-protocol types to our types
     let mut topic_data = Vec::new();
     for topic in produce_req.topic_data {
@@ -504,14 +555,23 @@ fn parse_produce(
                             "Failed to parse RecordBatch for topic={}, partition={}: {}",
                             topic_name, partition_index, e
                         );
-                        send_api_error(
-                            &response_tx,
-                            API_KEY_PRODUCE,
-                            api_version,
-                            correlation_id,
-                            ERROR_CORRUPT_MESSAGE,
-                            "invalid record batch",
-                        );
+                        // acks=0 never gets a response: an unsolicited one would be read
+                        // as the reply to the client's next request.
+                        if acks != 0 {
+                            let code = match e {
+                                KafkaError::InvalidRecord { .. } => e.to_kafka_error_code(),
+                                _ => ERROR_CORRUPT_MESSAGE,
+                            };
+                            let _ = response_tx.send(
+                                super::super::messages::KafkaResponse::Produce {
+                                    correlation_id,
+                                    api_version,
+                                    response: super::super::response_builders::build_produce_partition_error_response(
+                                        &requested, code,
+                                    ),
+                                },
+                            );
+                        }
                         return Ok(None);
                     }
                 },
@@ -1920,6 +1980,50 @@ mod tests {
         tokio::sync::mpsc::UnboundedReceiver<super::super::super::messages::KafkaResponse>,
     ) {
         tokio::sync::mpsc::unbounded_channel()
+    }
+
+    fn corrupt_produce_frame(acks: i16) -> BytesMut {
+        use kafka_protocol::messages::produce_request::{
+            PartitionProduceData, ProduceRequest, TopicProduceData,
+        };
+        let mut p = PartitionProduceData::default();
+        p.index = 0;
+        p.records = Some(bytes::Bytes::from_static(b"definitely not a record batch"));
+        let mut t = TopicProduceData::default();
+        t.name = TopicName::from(StrBytes::from_static_str("t"));
+        t.partition_data = vec![p];
+        let mut req = ProduceRequest::default();
+        req.acks = acks;
+        req.timeout_ms = 1000;
+        req.topic_data = vec![t];
+        build_request_frame(API_KEY_PRODUCE, 7, 77, 1, &req, 7)
+    }
+
+    #[test]
+    fn test_corrupt_produce_acks0_gets_no_response() {
+        // acks=0 never gets a reply; an unsolicited error frame would be read as the
+        // reply to the client's next request.
+        let (tx, mut rx) = create_test_channel();
+        assert!(parse_request(corrupt_produce_frame(0), tx)
+            .unwrap()
+            .is_none());
+        assert!(rx.try_recv().is_err(), "acks=0 must not get a response");
+    }
+
+    #[test]
+    fn test_corrupt_produce_reports_error_per_partition() {
+        let (tx, mut rx) = create_test_channel();
+        assert!(parse_request(corrupt_produce_frame(1), tx)
+            .unwrap()
+            .is_none());
+        match rx.try_recv() {
+            Ok(super::super::super::messages::KafkaResponse::Produce { response, .. }) => {
+                let p = &response.responses[0].partition_responses[0];
+                assert_eq!(p.index, 0);
+                assert_eq!(p.error_code, ERROR_CORRUPT_MESSAGE);
+            }
+            other => panic!("expected a per-partition Produce error, got {:?}", other),
+        }
     }
 
     #[test]
@@ -3352,9 +3456,15 @@ mod tests {
             parsed.is_none(),
             "AddPartitionsToTxn v4 is above the advertised max (v3) and must be rejected"
         );
+        // The typed AddPartitionsToTxn response (v4 has a top-level error_code), not the
+        // generic frame a strict client cannot decode.
         match rx.try_recv() {
-            Ok(super::super::super::messages::KafkaResponse::Error { error_code, .. }) => {
-                assert_eq!(error_code, ERROR_UNSUPPORTED_VERSION);
+            Ok(super::super::super::messages::KafkaResponse::AddPartitionsToTxn {
+                api_version: 4,
+                response,
+                ..
+            }) => {
+                assert_eq!(response.error_code, ERROR_UNSUPPORTED_VERSION);
             }
             other => panic!("expected UNSUPPORTED_VERSION, got {:?}", other),
         }

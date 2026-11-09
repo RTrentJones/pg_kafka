@@ -41,15 +41,16 @@ pub struct FetchedMessage {
     pub timestamp: i64,
     /// Record headers, decoded from JSONB storage (DR-8, DEEP-REVIEW-2026-07).
     /// Before DR-8, headers were written on every produce but never selected on
-    /// fetch, so consumers silently received empty headers. Order is not
-    /// preserved across the JSONB roundtrip (Kafka permits duplicate/ordered
-    /// headers; the storage schema does not — documented in
-    /// PROTOCOL_DEVIATIONS.md).
+    /// fetch, so consumers silently received empty headers. Headers are stored as
+    /// an ordered array of pairs, so their order survives; duplicate keys do not,
+    /// because the kafka-protocol record type holds headers in a map (documented
+    /// in PROTOCOL_DEVIATIONS.md).
     pub headers: Vec<(String, Vec<u8>)>,
 }
 
-/// Decode the JSONB headers column (a `{key: hex(value)}` object, see
-/// `hex_encode` in the postgres store) back into header pairs (DR-8).
+/// Decode the JSONB headers column back into header pairs (DR-8). The column holds an
+/// ordered array of `[key, hex(value)]` pairs; rows written before that hold a
+/// `{key: hex(value)}` object, which is still accepted.
 ///
 /// Pure function so the decoding logic is unit-testable even though its only
 /// caller lives in the coverage-ignored SPI layer (QA-1 pattern, like
@@ -60,10 +61,18 @@ pub fn decode_headers_json(json: Option<&str>) -> Vec<(String, Vec<u8>)> {
     let Some(json) = json else {
         return Vec::new();
     };
-    let Ok(map) = serde_json::from_str::<std::collections::BTreeMap<String, String>>(json) else {
+    let pairs: Vec<(String, String)> = if let Ok(pairs) =
+        serde_json::from_str::<Vec<(String, String)>>(json)
+    {
+        pairs
+    } else if let Ok(map) = serde_json::from_str::<std::collections::BTreeMap<String, String>>(json)
+    {
+        map.into_iter().collect()
+    } else {
         return Vec::new();
     };
-    map.into_iter()
+    pairs
+        .into_iter()
         .filter_map(|(k, hex)| hex_decode(&hex).map(|v| (k, v)))
         .collect()
 }
@@ -420,8 +429,11 @@ pub trait KafkaStore {
     /// * `producer_id` - The producer ID to update
     ///
     /// # Returns
-    /// The new epoch value, or error if producer not found
-    fn increment_producer_epoch(&self, producer_id: i64) -> Result<i16>;
+    /// `(producer_id, epoch)`: normally the same id with the bumped epoch; a fresh id at
+    /// epoch 0 once the epoch is exhausted. Clears the producer's sequence state, since
+    /// a new epoch restarts sequence numbers. Errors if the producer is unknown or is
+    /// transactional.
+    fn increment_producer_epoch(&self, producer_id: i64) -> Result<(i64, i16)>;
 
     /// Check and update sequence number for idempotent producer
     ///

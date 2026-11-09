@@ -52,11 +52,14 @@ use kafka_test::{
     test_abort_transaction_discards_pending_offsets,
     // Shadow mode tests (Phase 11)
     test_aborted_transaction_not_forwarded,
+    test_active_idempotent_producer_survives_retention_sweep,
     test_add_partitions_to_txn_idempotent,
+    test_api_versions_above_range_negotiates_down,
     // Protocol compliance tests (Phase 4)
     test_api_versions_negotiation,
     // Shadow outbox duplicate-delivery guard (issue #93)
     test_async_forwarding_no_duplicates_on_slow_ack,
+    test_auto_create_rejects_invalid_topic_name,
     // Edge case tests
     test_batch_1000_messages,
     // Producer tests
@@ -68,6 +71,7 @@ use kafka_test::{
     test_commit_offset_zero,
     test_commit_then_fetch_offset,
     test_committed_transaction_forwarded,
+    test_committed_transaction_forwards_without_ram_buffer,
     test_committed_transaction_uses_durable_outbox,
     test_committed_txn_leaves_no_orphan_outbox_rows,
     // Compression tests
@@ -103,6 +107,7 @@ use kafka_test::{
     test_consumer_rejoin_after_leave,
     test_coordinator_state_race,
     test_correlation_id_preserved,
+    test_corrupt_acks0_produce_sends_no_reply,
     // Admin tests
     test_create_multiple_topics,
     test_create_partitions,
@@ -135,9 +140,12 @@ use kafka_test::{
     test_duplicate_consumer_join,
     test_empty_group_id,
     test_empty_vs_null_key_routing,
+    test_end_txn_retry_is_idempotent,
     test_external_only_fallback,
     test_external_only_mode,
     test_external_primary_dead_letter_serves_local,
+    test_fenced_producer_cannot_write,
+    test_fetch_advertised_minimum_is_usable,
     test_fetch_after_offset_reset,
     test_fetch_bad_partition_or_offset_returns_error,
     test_fetch_committed_no_history,
@@ -156,8 +164,10 @@ use kafka_test::{
     // Coordinator state tests
     test_find_coordinator_bootstrap,
     test_frame_budget_released_on_mid_frame_disconnect,
+    test_group_rebalance_keeps_old_generation_usable,
     test_group_rejoin_race,
     test_group_state_transitions,
+    test_headers_keep_their_order,
     // Rebalancing edge case tests
     test_heartbeat_after_leave,
     test_heartbeat_bypasses_produce_backlog,
@@ -165,6 +175,7 @@ use kafka_test::{
     test_heartbeat_keeps_membership,
     test_high_offset_values,
     test_high_watermark_no_regress_after_cleanup,
+    test_huge_retention_ms_does_not_break_sweep,
     test_hundred_percent_forwarding,
     // Idempotent producer tests
     test_idempotent_concurrent_producers,
@@ -233,6 +244,7 @@ use kafka_test::{
     test_produce_latency_percentiles,
     test_produce_throughput_baseline,
     test_produce_timeout,
+    test_produce_two_batches_in_one_partition_is_rejected,
     test_produce_while_consuming,
     test_producer,
     test_producer_acks_zero,
@@ -240,6 +252,7 @@ use kafka_test::{
     test_producer_fencing,
     test_producer_fencing_mid_transaction,
     test_producer_id_reallocated_on_epoch_exhaustion,
+    test_producer_restart_new_epoch_records_are_stored,
     test_producer_timestamp_roundtrip,
     test_protocol_request_pipelining,
     test_rapid_rebalance_cycles,
@@ -265,6 +278,7 @@ use kafka_test::{
     test_session_timeout_rebalance,
     test_single_partition_topic,
     test_special_character_key_routing,
+    test_timed_out_transaction_cannot_be_resumed,
     test_topic_name_mapping,
     test_transaction_boundary_isolation,
     test_transaction_honors_per_txn_timeout_ms,
@@ -745,6 +759,84 @@ fn get_all_tests() -> Vec<TestDef> {
             parallel_safe: true,
         },
         // Error path tests
+        TestDef {
+            category: "error_paths",
+            name: "test_group_rebalance_keeps_old_generation_usable",
+            test_fn: wrap_test!(test_group_rebalance_keeps_old_generation_usable),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_headers_keep_their_order",
+            test_fn: wrap_test!(test_headers_keep_their_order),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_auto_create_rejects_invalid_topic_name",
+            test_fn: wrap_test!(test_auto_create_rejects_invalid_topic_name),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_end_txn_retry_is_idempotent",
+            test_fn: wrap_test!(test_end_txn_retry_is_idempotent),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_timed_out_transaction_cannot_be_resumed",
+            test_fn: wrap_test!(test_timed_out_transaction_cannot_be_resumed),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_huge_retention_ms_does_not_break_sweep",
+            test_fn: wrap_test!(test_huge_retention_ms_does_not_break_sweep),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_corrupt_acks0_produce_sends_no_reply",
+            test_fn: wrap_test!(test_corrupt_acks0_produce_sends_no_reply),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_produce_two_batches_in_one_partition_is_rejected",
+            test_fn: wrap_test!(test_produce_two_batches_in_one_partition_is_rejected),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_fetch_advertised_minimum_is_usable",
+            test_fn: wrap_test!(test_fetch_advertised_minimum_is_usable),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_api_versions_above_range_negotiates_down",
+            test_fn: wrap_test!(test_api_versions_above_range_negotiates_down),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_fenced_producer_cannot_write",
+            test_fn: wrap_test!(test_fenced_producer_cannot_write),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_active_idempotent_producer_survives_retention_sweep",
+            test_fn: wrap_test!(test_active_idempotent_producer_survives_retention_sweep),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_producer_restart_new_epoch_records_are_stored",
+            test_fn: wrap_test!(test_producer_restart_new_epoch_records_are_stored),
+            parallel_safe: true,
+        },
         TestDef {
             category: "error_paths",
             name: "test_fetch_into_cleaned_up_aborted_rows_is_in_range",
@@ -1548,6 +1640,12 @@ fn get_all_tests() -> Vec<TestDef> {
             parallel_safe: false,
         },
         // Transaction integration tests
+        TestDef {
+            category: "shadow",
+            name: "test_committed_transaction_forwards_without_ram_buffer",
+            test_fn: wrap_test!(test_committed_transaction_forwards_without_ram_buffer),
+            parallel_safe: false,
+        },
         TestDef {
             category: "shadow",
             name: "test_committed_transaction_forwarded",

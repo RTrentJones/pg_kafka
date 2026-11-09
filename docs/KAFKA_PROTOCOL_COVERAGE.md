@@ -12,15 +12,15 @@
 |--------|-------|
 | **API Coverage** | 26 of ~50 standard Kafka APIs (52%) |
 | **Build Status** | ✅ Compiles with zero warnings |
-| **Test Suite** | 713 unit tests + 10 property tests + 202 E2E tests |
+| **Test Suite** | 746 unit tests + 10 property tests + 221 E2E tests |
 | **Architecture** | Repository Pattern with typed errors |
-| **Client Compatibility** | ✅ kcat, rdkafka verified |
+| **Client Compatibility** | ✅ kcat, rdkafka, and the Apache Kafka 3.7 Java clients (console/verifiable producer and consumer, consumer groups, transactions) verified |
 
 ---
 
 ## Implemented APIs (26 total)
 
-Version ranges below are the ones advertised in the ApiVersions response and enforced on inbound requests (`API_VERSION_RANGES` in `src/kafka/response_builders.rs`). A request outside its range is rejected with UNSUPPORTED_VERSION.
+Version ranges below are the ones advertised in the ApiVersions response and enforced on inbound requests (`API_VERSION_RANGES` in `src/kafka/response_builders.rs`). A request above its range is rejected with UNSUPPORTED_VERSION; a request below it closes the connection, as Kafka does (the minimums are the lowest versions the kafka-protocol crate can decode and encode). ApiVersions outside v0-v3 is answered in the v0 format with UNSUPPORTED_VERSION and the full key list (KIP-511).
 
 ### 1. Core Metadata (2 APIs) ✅ 100% Coverage
 | API | Key | Versions | Status | Notes |
@@ -43,10 +43,10 @@ Version ranges below are the ones advertised in the ApiVersions response and enf
 ### 3. Consumer - Data Access (4 APIs) ✅ 100% Coverage
 | API | Key | Versions | Status | Notes |
 |-----|-----|----------|--------|-------|
-| Fetch | 1 | v0-v11 | ✅ Complete | Read messages with long polling support (capped at v11: v13+ drops topic names for topic IDs) |
-| OffsetCommit | 8 | v0-v8 | ✅ Complete | Commit consumed offsets |
-| OffsetFetch | 9 | v0-v7 | ✅ Complete | Retrieve committed offsets (v8+ not supported) |
-| ListOffsets | 2 | v0-v7 | ✅ Complete | Get earliest/latest/by-timestamp offsets |
+| Fetch | 1 | v4-v11 | ✅ Complete | Read messages with long polling support (capped at v11: v13+ drops topic names for topic IDs) |
+| OffsetCommit | 8 | v2-v8 | ✅ Complete | Commit consumed offsets |
+| OffsetFetch | 9 | v1-v7 | ✅ Complete | Retrieve committed offsets (v8+ not supported) |
+| ListOffsets | 2 | v1-v7 | ✅ Complete | Get earliest/latest/by-timestamp offsets |
 
 **Implementation Notes:**
 - ✅ ListOffsets supports special timestamps (-2 = earliest, -1 = latest) and arbitrary timestamp lookup (earliest offset whose record timestamp ≥ target; AUDIT-2026-06 BUG-7 + CONF-7)
@@ -76,8 +76,8 @@ Version ranges below are the ones advertised in the ApiVersions response and enf
 ### 5. Admin APIs (4 APIs) ✅ 100% Coverage (Phase 6)
 | API | Key | Versions | Status | Notes |
 |-----|-----|----------|--------|-------|
-| CreateTopics | 19 | v0-v5 | ✅ Complete | Create topics with partition count |
-| DeleteTopics | 20 | v0-v4 | ✅ Complete | Delete topics and messages |
+| CreateTopics | 19 | v2-v5 | ✅ Complete | Create topics with partition count |
+| DeleteTopics | 20 | v1-v4 | ✅ Complete | Delete topics and messages |
 | CreatePartitions | 37 | v0-v2 | ✅ Complete | Add partitions to existing topics |
 | DeleteGroups | 42 | v0-v2 | ✅ Complete | Delete consumer groups |
 
@@ -499,7 +499,7 @@ Consumer Flow (Current):
 - **Testing**: E2E tests with rdkafka
 - **Documentation**: Comprehensive design docs
 
-### Test Coverage (713 unit tests + 10 property tests + 202 E2E tests)
+### Test Coverage (746 unit tests + 10 property tests + 221 E2E tests)
 
 | Category | Count | Location |
 |----------|-------|----------|
@@ -518,7 +518,7 @@ Consumer Flow (Current):
 | **Property Tests** | **10** | `tests/property_tests.rs` |
 | **E2E Test Suite** | **202** | `kafka_test/` |
 
-**E2E Test Categories (202 tests):**
+**E2E Test Categories (221 tests):**
 - Admin APIs (19 tests, incl. 4 DescribeConfigs/IncrementalAlterConfigs/DeleteRecords/retention tests)
 - Producer (5 tests)
 - Consumer (4 tests)
@@ -545,7 +545,7 @@ Consumer Flow (Current):
 **Current State**: Comprehensive Kafka-compatible broker with 26 APIs implemented
 **Coverage**: 52% of standard Kafka protocol (full producer/consumer/coordinator/admin/transaction/config support)
 **Architecture**: Clean, maintainable, well-documented with Repository Pattern
-**Test Status**: ~925 tests passing (713 unit + 10 property + 202 E2E; CI is the source of truth) ✅
+**Test Status**: ~977 tests passing (746 unit + 10 property + 221 E2E; CI is the source of truth) ✅
 
 **Readiness**:
 - ✅ **Producer**: Production-ready with idempotency, transactions, and compression
@@ -581,4 +581,4 @@ Consumer Flow (Current):
 
 **Last Updated:** 2026-10-29
 **Phase:** 11 Complete (Shadow Mode)
-**Tests:** ~925 tests (713 unit + 10 property + 202 E2E; CI is the source of truth)
+**Tests:** ~977 tests (746 unit + 10 property + 221 E2E; CI is the source of truth)

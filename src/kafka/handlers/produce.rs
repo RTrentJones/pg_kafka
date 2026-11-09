@@ -35,30 +35,20 @@ pub fn handle_produce(
 ) -> Result<kafka_protocol::messages::produce_response::ProduceResponse> {
     let store = ctx.store;
     let default_partitions = ctx.default_partitions;
-    // Phase 10: Validate transaction state if transactional
+    // Phase 10: Validate transaction state if transactional. ProduceResponse has no
+    // top-level error code, so a request-level failure (fenced epoch, unknown
+    // transactional id, transaction not Ongoing) is reported on every requested
+    // partition; an empty response would leave the client without the error.
     if let Some(txn_id) = transactional_id {
         if let Some(meta) = producer_metadata {
             if meta.producer_id >= 0 {
-                store.validate_transaction(txn_id, meta.producer_id, meta.producer_epoch)?;
-
-                // Ensure transaction is in Ongoing state
-                let state = store.get_transaction_state(txn_id)?;
-                match state {
-                    Some(crate::kafka::storage::TransactionState::Ongoing) => {
-                        // Good, transaction is active
-                    }
-                    Some(other) => {
-                        return Err(crate::kafka::error::KafkaError::invalid_txn_state(
-                            txn_id,
-                            format!("{:?}", other),
-                            "Produce",
-                        ));
-                    }
-                    None => {
-                        return Err(crate::kafka::error::KafkaError::transactional_id_not_found(
-                            txn_id,
-                        ));
-                    }
+                if let Err(e) = validate_ongoing_transaction(store, txn_id, meta) {
+                    return Ok(
+                        crate::kafka::response_builders::build_produce_partition_error_response(
+                            &topic_data,
+                            e.to_kafka_error_code(),
+                        ),
+                    );
                 }
             }
         }
@@ -69,9 +59,32 @@ pub fn handle_produce(
     for topic in topic_data {
         let topic_name: String = topic.name.clone();
 
-        // Get or create topic (returns both topic_id and partition_count in single query)
+        // Get or create topic (returns both topic_id and partition_count in single query).
+        // A failure here is reported on this topic's partitions only.
         let (topic_id, partition_count) =
-            store.get_or_create_topic(&topic_name, default_partitions)?;
+            match super::helpers::get_or_create_valid_topic(store, &topic_name, default_partitions)
+            {
+                Ok(found) => found,
+                Err(e) => {
+                    if e.is_server_error() {
+                        crate::pg_warning!(
+                            "Failed to resolve topic '{}' for produce: {}",
+                            topic_name,
+                            e
+                        );
+                    }
+                    let code = e.to_kafka_error_code();
+                    kafka_response.responses.push(
+                        crate::kafka::response_builders::build_produce_partition_error_response(
+                            std::slice::from_ref(&topic),
+                            code,
+                        )
+                        .responses
+                        .remove(0),
+                    );
+                    continue;
+                }
+            };
 
         // Build topic response
         let mut topic_response =
@@ -260,7 +273,9 @@ pub fn handle_produce(
                 // Duplicate detected - return success (error_code=0) but skip insert
                 // This is the correct Kafka idempotency behavior
                 partition_response.error_code = ERROR_NONE;
-                partition_response.base_offset = 0; // Duplicate - offset doesn't matter
+                // The original batch's offset is not stored, so report it as unknown
+                // (-1) rather than claim offset 0, which the client would record.
+                partition_response.base_offset = -1;
                 partition_response.log_append_time_ms = -1;
                 partition_response.log_start_offset = -1;
             }
@@ -272,4 +287,24 @@ pub fn handle_produce(
     }
 
     Ok(kafka_response)
+}
+
+/// Check that `txn_id` belongs to this producer/epoch and is in the Ongoing state.
+fn validate_ongoing_transaction(
+    store: &dyn crate::kafka::storage::KafkaStore,
+    txn_id: &str,
+    meta: &ProducerMetadata,
+) -> Result<()> {
+    store.validate_transaction(txn_id, meta.producer_id, meta.producer_epoch)?;
+    match store.get_transaction_state(txn_id)? {
+        Some(crate::kafka::storage::TransactionState::Ongoing) => Ok(()),
+        Some(other) => Err(crate::kafka::error::KafkaError::invalid_txn_state(
+            txn_id,
+            format!("{:?}", other),
+            "Produce",
+        )),
+        None => Err(crate::kafka::error::KafkaError::transactional_id_not_found(
+            txn_id,
+        )),
+    }
 }

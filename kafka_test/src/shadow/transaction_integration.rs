@@ -334,3 +334,61 @@ pub async fn test_committed_txn_leaves_no_orphan_outbox_rows() -> TestResult {
     println!("✅ Test PASSED: Committed Txn Leaves No Orphan Outbox Rows\n");
     Ok(())
 }
+
+/// The records a committed transaction forwards are read from kafka.messages at
+/// commit time, not from the in-RAM buffer filled at produce time. That buffer is
+/// lost on a worker restart, and it is removed before the commit runs (so a failed
+/// commit that the client retries also lost it); either way the transaction
+/// committed locally and nothing reached the external cluster.
+///
+/// The test empties the buffer deterministically: the records are produced while
+/// the topic is not yet shadowed (nothing is buffered), then shadowing is enabled
+/// and the transaction committed. Forwarding is decided at commit time (the
+/// commit path already re-checks the topic's config), so the records must arrive.
+pub async fn test_committed_transaction_forwards_without_ram_buffer() -> TestResult {
+    println!("=== Test: Committed Transaction Forwards Without The RAM Buffer ===\n");
+
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("txn-no-buffer").await;
+    let txn_id = format!("shadow-nobuf-{}", ctx.test_id);
+    verify_external_kafka_ready().await?;
+
+    let producer = create_transactional_producer(&txn_id)?;
+    producer.init_transactions(Duration::from_secs(10))?;
+    producer.begin_transaction()?;
+    let key = b"txn-nobuf-key";
+    let value = b"txn-nobuf-value";
+    producer
+        .send(
+            FutureRecord::to(&topic).key(&key[..]).payload(&value[..]),
+            Duration::from_secs(5),
+        )
+        .await
+        .map_err(|(e, _)| e)?;
+    println!("Step 1: record produced in an open transaction (topic not shadowed yet)");
+
+    enable_shadow_mode(
+        ctx.db(),
+        &topic,
+        &ShadowTopicConfig {
+            mode: ShadowMode::Shadow,
+            forward_percentage: 100,
+            external_topic_name: None,
+            sync_mode: SyncMode::Async,
+            write_mode: WriteMode::DualWrite,
+        },
+    )
+    .await?;
+    println!("Step 2: shadowing enabled for the topic");
+
+    producer.commit_transaction(Duration::from_secs(10))?;
+    println!("Step 3: transaction committed");
+
+    assert_message_in_external_kafka(&topic, Some(key), Some(value), Duration::from_secs(20))
+        .await?;
+    println!("✅ Committed record reached external Kafka\n");
+
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}

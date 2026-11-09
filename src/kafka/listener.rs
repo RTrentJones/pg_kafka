@@ -822,6 +822,15 @@ async fn handle_fetch_long_poll(
     let poll_interval = Duration::from_millis(poll_interval_ms as u64);
 
     loop {
+        // The client is gone (its connection's writer, which owns the response slot,
+        // has been torn down): stop instead of re-fetching on the DB thread until
+        // max_wait_ms runs out. Otherwise each disconnect could leave up to
+        // MAX_LONG_POLLS_PER_CONNECTION orphaned tasks polling for up to ~24 days.
+        if final_response_tx.is_closed() {
+            debug!("Long poll: client disconnected, abandoning fetch");
+            return Ok(());
+        }
+
         // Create a response channel for this fetch attempt
         let (inner_tx, mut inner_rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -913,6 +922,9 @@ async fn handle_fetch_long_poll(
             }
             _ = tokio::time::sleep(wait_time) => {
                 debug!("Long poll: poll interval elapsed, re-fetching");
+            }
+            _ = final_response_tx.closed() => {
+                debug!("Long poll: client disconnected while waiting");
             }
         }
 
@@ -1016,6 +1028,48 @@ mod tests {
     // RV-9: the aggregate frame-reservation budget admits reservations up to its
     // ceiling, rejects a frame that would overshoot without mutating the budget,
     // and restores capacity on release so completed frames free their reservation.
+    #[test]
+    fn test_long_poll_stops_when_client_is_gone() {
+        // A long poll whose client has disconnected (response slot closed) must return
+        // straight away instead of re-fetching on the DB thread until max_wait_ms.
+        let (request_tx, request_rx) = crossbeam_channel::bounded::<KafkaRequest>(16);
+        let (final_tx, final_rx) = tokio::sync::mpsc::unbounded_channel::<KafkaResponse>();
+        drop(final_rx);
+        let topic = TopicFetchData {
+            name: "t".to_string(),
+            partitions: vec![super::super::messages::PartitionFetchData {
+                partition_index: 0,
+                fetch_offset: 0,
+                partition_max_bytes: 1024,
+            }],
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let started = Instant::now();
+        rt.block_on(handle_fetch_long_poll(
+            1,
+            None,
+            4,
+            i32::MAX,
+            i32::MAX,
+            1024,
+            0,
+            vec![topic],
+            request_tx,
+            final_tx,
+            Arc::new(PendingFetchRegistry::new()),
+            100,
+        ))
+        .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(
+            request_rx.try_recv().is_err(),
+            "no fetch may reach the worker for a disconnected client"
+        );
+    }
+
     #[test]
     fn test_budgeted_codec_releases_charge_when_dropped_mid_frame() {
         // A client that sends a length prefix and disconnects leaves the codec holding a

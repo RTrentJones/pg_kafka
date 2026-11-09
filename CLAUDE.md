@@ -49,7 +49,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Automated E2E tests with real Kafka client (rdkafka)
 
 **API Coverage:** 26 of ~50 standard Kafka APIs (52%)
-**Test Status:** 713 unit (incl. 4 in-module proptests) + 10 property + 202 E2E ≈ 925 total ✅ (CI is the source of truth; counts drift)
+**Test Status:** 746 unit (incl. 4 in-module proptests) + 10 property + 221 E2E ≈ 977 total ✅ (CI is the source of truth; counts drift)
 **Coverage Target:** 80%+ (testable code)
 
 ## Development Setup
@@ -251,7 +251,7 @@ src/
 
 tests/
 └── property_tests.rs   # proptest suite (run in CI via `cargo test --features pg14 --test property_tests`)
-kafka_test/             # E2E test suite (202 tests)
+kafka_test/             # E2E test suite (221 tests)
     └── src/
         ├── main.rs               # Test orchestrator with CLI + test registry
         ├── lib.rs                # Test re-exports
@@ -645,7 +645,7 @@ Tests use shared infrastructure from `kafka_test/src/`:
 - **fixtures.rs**: Builders (`TestTopicBuilder`, `TestConsumerBuilder`, `TestProducerBuilder`)
 - **assertions.rs**: Domain-specific assertions (`assert_topic_exists()`, `assert_message_count()`, etc.)
 
-### Test Categories (202 tests)
+### Test Categories (221 tests)
 
 Counts are from the registry in `kafka_test/src/main.rs` (`--list` prints it); CI is the source of truth.
 
@@ -660,9 +660,9 @@ Counts are from the registry in `kafka_test/src/main.rs` (`--list` prints it); C
 | **compression** | 10 | gzip, snappy, lz4, zstd, roundtrip, edge cases |
 | **idempotent** | 7 | InitProducerId, deduplication, epoch, multi-partition |
 | **transaction** | 20 | Transactions, isolation levels, EOS, fencing, atomicity, timeouts |
-| **shadow** | 27 | External forwarding, SASL/SSL, topic mapping, replay, dial-up |
+| **shadow** | 28 | External forwarding, SASL/SSL, topic mapping, replay, dial-up |
 | **long_poll** | 10 | Timeout behavior, immediate return, producer wakeup, precision, per-connection task cap |
-| **error_paths** | 21 | Invalid partitions, unknown topics, coordinator errors |
+| **error_paths** | 39 | Invalid partitions, unknown topics, coordinator errors, protocol/transaction/group regressions |
 | **edge_cases** | 13 | Empty topics, large messages, boundary values, retention sweep |
 | **concurrent** | 14 | Multi-producer, multi-consumer, request pipelining, races, heartbeat liveness lane |
 | **negative** | 5 | Connection refused, timeouts, expected failures, superuser-only SASL password GUC |
