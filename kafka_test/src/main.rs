@@ -142,6 +142,7 @@ use kafka_test::{
     test_fetch_bad_partition_or_offset_returns_error,
     test_fetch_committed_no_history,
     test_fetch_from_new_partition,
+    test_fetch_into_cleaned_up_aborted_rows_is_in_range,
     test_fetch_invalid_partition,
     test_fetch_isolation_level_enforcement,
     // Offset management tests
@@ -744,6 +745,12 @@ fn get_all_tests() -> Vec<TestDef> {
             parallel_safe: true,
         },
         // Error path tests
+        TestDef {
+            category: "error_paths",
+            name: "test_fetch_into_cleaned_up_aborted_rows_is_in_range",
+            test_fn: wrap_test!(test_fetch_into_cleaned_up_aborted_rows_is_in_range),
+            parallel_safe: true,
+        },
         TestDef {
             category: "error_paths",
             name: "test_fetch_bad_partition_or_offset_returns_error",

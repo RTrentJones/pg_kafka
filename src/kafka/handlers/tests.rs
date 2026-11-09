@@ -276,6 +276,7 @@ mod tests {
         // RV-10: the fetch response's log_start_offset must reflect the store's
         // earliest retained offset, not a hardcoded 0.
         mock.expect_get_earliest_offset().returning(|_, _| Ok(5));
+        mock.expect_get_log_start_offset().returning(|_, _| Ok(5));
 
         let topic_data = vec![TopicFetchData {
             name: "test-topic".to_string(),
@@ -334,6 +335,7 @@ mod tests {
         mock.expect_get_high_watermark().returning(|_, _| Ok(1));
         mock.expect_get_last_stable_offset().returning(|_, _| Ok(1));
         mock.expect_get_earliest_offset().returning(|_, _| Ok(0));
+        mock.expect_get_log_start_offset().returning(|_, _| Ok(0));
 
         let topic_data = vec![TopicFetchData {
             name: "test-topic".to_string(),
@@ -471,6 +473,7 @@ mod tests {
 
         mock.expect_get_high_watermark().returning(|_, _| Ok(1));
         mock.expect_get_earliest_offset().returning(|_, _| Ok(0));
+        mock.expect_get_log_start_offset().returning(|_, _| Ok(0));
         mock.expect_fetch_records_with_isolation()
             .returning(|_, _, _, _, _| {
                 Err(KafkaError::Database {
@@ -523,6 +526,7 @@ mod tests {
         mock.expect_get_high_watermark().returning(|_, _| Ok(10));
         mock.expect_get_last_stable_offset().returning(|_, _| Ok(7));
         mock.expect_get_earliest_offset().returning(|_, _| Ok(0));
+        mock.expect_get_log_start_offset().returning(|_, _| Ok(0));
 
         let topic_data = vec![TopicFetchData {
             name: "test-topic".to_string(),
@@ -3178,6 +3182,8 @@ mod bug_hunt_regressions {
             .returning(move |_, _| Ok(hwm));
         mock.expect_get_earliest_offset()
             .returning(move |_, _| Ok(log_start));
+        mock.expect_get_log_start_offset()
+            .returning(move |_, _| Ok(log_start));
         mock.expect_fetch_records_with_isolation()
             .returning(|_, _, _, _, _| Ok(vec![]));
         mock
@@ -3221,6 +3227,29 @@ mod bug_hunt_regressions {
         assert_eq!(fetch_one(&mock, 0, 2), (ERROR_OFFSET_OUT_OF_RANGE, 10));
         assert_eq!(fetch_one(&mock, 0, 10).0, ERROR_NONE);
         assert_eq!(fetch_one(&mock, 0, 3).0, ERROR_NONE);
+    }
+
+    /// The fetch lower bound is the durable log start, not the first surviving row:
+    /// after aborted-message cleanup deletes offset 0, a fetch from 0 must still
+    /// succeed (and skip to the next committed record), not report OFFSET_OUT_OF_RANGE.
+    #[test]
+    fn fetch_into_cleaned_up_aborted_hole_is_not_out_of_range() {
+        let mut mock = MockKafkaStore::new();
+        mock.expect_get_topic_metadata().returning(|_| {
+            Ok(vec![TopicMetadata {
+                name: "t".to_string(),
+                id: 1,
+                partition_count: 1,
+            }])
+        });
+        mock.expect_get_high_watermark().returning(|_, _| Ok(2));
+        // First surviving row is offset 1 (aborted offset 0 was cleaned up) ...
+        mock.expect_get_earliest_offset().returning(|_, _| Ok(1));
+        // ... but nothing retired offset 0, so the durable log start is still 0.
+        mock.expect_get_log_start_offset().returning(|_, _| Ok(0));
+        mock.expect_fetch_records_with_isolation()
+            .returning(|_, _, _, _, _| Ok(vec![]));
+        assert_eq!(fetch_one(&mock, 0, 0).0, ERROR_NONE);
     }
 
     /// Bug 4: a request-level TxnOffsetCommit failure is echoed on every partition.

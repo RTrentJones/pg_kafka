@@ -247,6 +247,16 @@ pub trait KafkaStore {
     /// Earliest offset (0 if partition is empty)
     fn get_earliest_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64>;
 
+    /// Get the durable log start offset for a topic partition
+    /// (`kafka.partition_offsets.log_start_offset`).
+    ///
+    /// Unlike [`get_earliest_offset`](Self::get_earliest_offset), this ignores which
+    /// rows happen to survive: aborted-message cleanup can delete a partition's leading
+    /// rows without retiring those offsets, so only DeleteRecords and the retention
+    /// sweep (which advance this column) make an offset out of range. Returns 0 when the
+    /// partition has no counter row.
+    fn get_log_start_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64>;
+
     /// Find the earliest offset whose record timestamp is at or after `timestamp_ms` (CONF-7,
     /// Kafka's ListOffsets-by-timestamp). Returns `(offset, record_timestamp_ms)`, or `None` when no
     /// visible record qualifies. Records that carried no timestamp (stored as -1) are excluded.

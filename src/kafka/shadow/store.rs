@@ -1499,6 +1499,13 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
         self.inner.get_earliest_offset(topic_id, partition_id)
     }
 
+    fn get_log_start_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64> {
+        if self.suppress_external_primary_reads(topic_id) {
+            return Ok(0);
+        }
+        self.inner.get_log_start_offset(topic_id, partition_id)
+    }
+
     fn get_offset_for_timestamp(
         &self,
         topic_id: i32,

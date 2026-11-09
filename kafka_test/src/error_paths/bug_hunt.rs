@@ -139,6 +139,71 @@ pub async fn test_fetch_bad_partition_or_offset_returns_error() -> TestResult {
     Ok(())
 }
 
+/// Fetch lower bound (PR #98 review): aborted-message cleanup deletes rows without
+/// retiring their offsets, so after it removes a partition's leading rows a fetch from
+/// offset 0 must still succeed and return the next committed record. Validating against
+/// the first surviving row instead reported OFFSET_OUT_OF_RANGE, and a consumer with
+/// auto.offset.reset=latest would skip the committed record.
+pub async fn test_fetch_into_cleaned_up_aborted_rows_is_in_range() -> TestResult {
+    println!("=== Test: Fetch Into Cleaned-Up Aborted Rows Is In Range ===\n");
+
+    let ctx = TestContext::new().await?;
+    let topic = TestTopicBuilder::new(&ctx, "bughunt-aborted-hole")
+        .with_partitions(1)
+        .build()
+        .await?;
+    topic.produce(&generate_messages(2, "m")).await?;
+
+    // Turn offset 0 into a cleaned-up aborted row: mark it aborted, then run the
+    // sweep with no grace period so cleanup_aborted_messages deletes it.
+    ctx.db()
+        .execute(
+            "UPDATE kafka.messages m SET txn_state = 'aborted'
+             FROM kafka.topics t
+             WHERE m.topic_id = t.id AND t.name = $1 AND m.partition_offset = 0",
+            &[&topic.name],
+        )
+        .await?;
+    ctx.db()
+        .query("SELECT * FROM pg_kafka_run_retention_sweep(0, 0)", &[])
+        .await?;
+    let surviving: i64 = ctx
+        .db()
+        .query_one(
+            "SELECT MIN(m.partition_offset) FROM kafka.messages m
+             JOIN kafka.topics t ON m.topic_id = t.id WHERE t.name = $1",
+            &[&topic.name],
+        )
+        .await?
+        .get(0);
+    assert_eq!(surviving, 1, "offset 0 should have been cleaned up");
+
+    let mut stream = TcpStream::connect(BROKER).await?;
+    stream.set_nodelay(true)?;
+    let response = roundtrip(&mut stream, 4, 150, &fetch_request(&topic.name, 0, 0, 0)).await?;
+    let p = &response.responses[0].partitions[0];
+    let bytes = p.records.as_ref().map(|r| r.len()).unwrap_or(0);
+    println!(
+        "   fetch from 0 -> error_code={} hwm={} record bytes={}",
+        p.error_code, p.high_watermark, bytes
+    );
+    if p.error_code != 0 {
+        return Err(format!(
+            "fetch from a cleaned-up aborted offset returned error {}",
+            p.error_code
+        )
+        .into());
+    }
+    assert!(
+        bytes > 0,
+        "the committed record at offset 1 should be returned"
+    );
+
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
 /// Bug 4 (worker.rs): a TxnOffsetCommit whose handler fails (here: a transactional id
 /// that was never initialised) must report the error on every requested partition. It
 /// used to come back as an empty response, which the client reads as success.

@@ -130,11 +130,25 @@ pub fn handle_fetch(
                 }
             };
 
-            // An offset before the log start (deleted/expired) or past the high
-            // watermark is OFFSET_OUT_OF_RANGE, so the consumer applies its
-            // auto.offset.reset policy. fetch_offset == high_watermark is valid
-            // (the consumer is caught up and waits for new data).
-            if fetch_offset < log_start_offset || fetch_offset > high_watermark {
+            // An offset before the durable log start (retired by DeleteRecords or
+            // retention) or past the high watermark is OFFSET_OUT_OF_RANGE, so the
+            // consumer applies its auto.offset.reset policy. The lower bound is the
+            // durable log start, not the first surviving row: aborted-message cleanup
+            // can delete leading rows without retiring their offsets, and a fetch
+            // from such a hole must skip ahead to the next committed record.
+            // fetch_offset == high_watermark is valid (caught up, waiting for data).
+            let durable_log_start = match store.get_log_start_offset(topic_id, partition_id) {
+                Ok(v) => v,
+                Err(e) => {
+                    let mut partition_data = PartitionData::default();
+                    partition_data.partition_index = partition_id;
+                    partition_data.error_code = e.to_kafka_error_code();
+                    partition_data.high_watermark = -1;
+                    partition_responses.push(partition_data);
+                    continue;
+                }
+            };
+            if fetch_offset < durable_log_start || fetch_offset > high_watermark {
                 let mut partition_data = PartitionData::default();
                 partition_data.partition_index = partition_id;
                 partition_data.error_code = crate::kafka::constants::ERROR_OFFSET_OUT_OF_RANGE;
