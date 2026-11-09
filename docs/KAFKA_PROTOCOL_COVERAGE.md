@@ -82,7 +82,7 @@ Version ranges below are the ones advertised in the ApiVersions response and enf
 | DeleteGroups | 42 | v0-v2 | ✅ Complete | Delete consumer groups |
 
 **Implementation Notes (Phase 6):**
-- ✅ CreateTopics respects the partition count parameter (`num_partitions <= 0` falls back to 1); per-topic `configs`, replica assignments, and `replication_factor` are ignored (the response always reports replication factor 1)
+- ✅ CreateTopics respects the partition count parameter (`num_partitions = -1` uses `pg_kafka.default_partitions`; `0` or other values below 1 return INVALID_PARTITIONS); per-topic `configs`, replica assignments, and `replication_factor` are ignored (the response always reports replication factor 1)
 - ✅ CreateTopics validates topic names (Kafka rules: length ≤ 249, `[a-zA-Z0-9._-]`, not `.`/`..`) and honors `validate_only`
 - ✅ DeleteTopics cascades to messages and consumer offsets
 - ✅ CreatePartitions adds partitions to existing topics (decreases rejected with INVALID_PARTITIONS)

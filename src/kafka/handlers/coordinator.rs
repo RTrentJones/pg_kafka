@@ -3,7 +3,7 @@
 // Handlers for consumer group management APIs:
 // FindCoordinator, JoinGroup, SyncGroup, Heartbeat, LeaveGroup, DescribeGroups, ListGroups
 
-use crate::kafka::constants::{DEFAULT_BROKER_ID, ERROR_NONE, ERROR_UNKNOWN_SERVER_ERROR};
+use crate::kafka::constants::{DEFAULT_BROKER_ID, ERROR_NONE};
 use crate::kafka::error::Result;
 use crate::kafka::handler_context::HandlerContext;
 
@@ -386,8 +386,9 @@ pub fn handle_describe_groups(
                 }
             }
             None => {
-                // Group doesn't exist - return error
-                described_group.error_code = ERROR_UNKNOWN_SERVER_ERROR;
+                // Group doesn't exist. For the versions we advertise (v0-5) Kafka reports
+                // this as success with state Dead; GROUP_ID_NOT_FOUND only applies from v6.
+                described_group.error_code = ERROR_NONE;
                 described_group.group_state = StrBytes::from_string("Dead".to_string());
                 described_group.protocol_type = StrBytes::from_string("".to_string());
                 described_group.protocol_data = StrBytes::from_string("".to_string());

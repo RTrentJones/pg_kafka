@@ -259,27 +259,10 @@ pub fn handle_txn_offset_commit(
         .coordinator
         .validate_commit(group_id, member_id, generation_id)
     {
-        let error_code = e.to_kafka_error_code();
-        let mut response = TxnOffsetCommitResponse::default();
-        response.topics = topics
-            .into_iter()
-            .map(|(topic_name, partitions)| {
-                let partition_results = partitions
-                    .into_iter()
-                    .map(|(partition_id, _offset, _metadata)| {
-                        let mut p = TxnOffsetCommitResponsePartition::default();
-                        p.partition_index = partition_id;
-                        p.error_code = error_code;
-                        p
-                    })
-                    .collect();
-                let mut t = TxnOffsetCommitResponseTopic::default();
-                t.name = TopicName(StrBytes::from_string(topic_name));
-                t.partitions = partition_results;
-                t
-            })
-            .collect();
-        return Ok(response);
+        return Ok(txn_offset_commit_error_response(
+            &topics,
+            e.to_kafka_error_code(),
+        ));
     }
 
     // Validate the transaction state
@@ -310,12 +293,24 @@ pub fn handle_txn_offset_commit(
     for (topic_name, partitions) in topics {
         let mut partition_results = Vec::new();
 
-        // Resolve topic ID
-        let topic_id_result = store.get_topic_id(&topic_name);
+        // Resolve topic ID and partition count. The partition range check mirrors
+        // AddPartitionsToTxn: a partition outside [0, partition_count) is rejected with
+        // UNKNOWN_TOPIC_OR_PARTITION instead of being stored as a pending offset.
+        let topic_result = store.get_topic_id(&topic_name).and_then(|id| match id {
+            Some(id) => Ok(store
+                .get_topic_partition_count(&topic_name)?
+                .map(|count| (id, count))),
+            None => Ok(None),
+        });
 
         for (partition_id, offset, metadata) in partitions {
-            let error_code = match &topic_id_result {
-                Ok(Some(topic_id)) => {
+            let error_code = match &topic_result {
+                Ok(Some((_, partition_count)))
+                    if partition_id < 0 || partition_id >= *partition_count =>
+                {
+                    crate::kafka::constants::ERROR_UNKNOWN_TOPIC_OR_PARTITION
+                }
+                Ok(Some((topic_id, _))) => {
                     // Store the pending offset commit
                     match store.store_txn_pending_offset(
                         transactional_id,
@@ -347,6 +342,35 @@ pub fn handle_txn_offset_commit(
 
     response.topics = topic_results;
     Ok(response)
+}
+
+/// Build a TxnOffsetCommit response that reports `error_code` for every requested
+/// partition. TxnOffsetCommitResponse has no top-level error code, so a request-level
+/// failure (fenced epoch, invalid transaction state, stale generation, ...) has to be
+/// echoed per partition; an empty response would read as success to the client.
+pub fn txn_offset_commit_error_response(
+    topics: &TxnOffsetCommitTopics,
+    error_code: i16,
+) -> TxnOffsetCommitResponse {
+    let mut response = TxnOffsetCommitResponse::default();
+    response.topics = topics
+        .iter()
+        .map(|(topic_name, partitions)| {
+            let mut t = TxnOffsetCommitResponseTopic::default();
+            t.name = TopicName(StrBytes::from_string(topic_name.clone()));
+            t.partitions = partitions
+                .iter()
+                .map(|(partition_id, _offset, _metadata)| {
+                    let mut p = TxnOffsetCommitResponsePartition::default();
+                    p.partition_index = *partition_id;
+                    p.error_code = error_code;
+                    p
+                })
+                .collect();
+            t
+        })
+        .collect();
+    response
 }
 
 #[cfg(test)]

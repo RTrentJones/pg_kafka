@@ -165,15 +165,36 @@ pub fn select_common_strategy(
         return None;
     }
 
-    // Select highest priority strategy
+    // Select highest priority strategy. Equal priorities (e.g. sticky and
+    // cooperative-sticky) are broken by name so the choice does not depend on
+    // HashSet iteration order.
     common
         .into_iter()
-        .max_by_key(|name| strategy_priority(name))
+        .max_by_key(|name| (strategy_priority(name), name.clone()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_select_common_strategy_tie_is_deterministic() {
+        let protocols = vec![
+            ("sticky".to_string(), vec![]),
+            ("cooperative-sticky".to_string(), vec![]),
+        ];
+        let mut members = HashMap::new();
+        members.insert("m1".to_string(), protocols.clone());
+        members.insert("m2".to_string(), protocols);
+        // HashSet order is randomised per instance; repeat to catch nondeterminism.
+        for _ in 0..200 {
+            assert_eq!(
+                select_common_strategy(&members).as_deref(),
+                Some("sticky"),
+                "tie between equal-priority strategies must be broken by name"
+            );
+        }
+    }
 
     #[test]
     fn test_create_strategy_range() {

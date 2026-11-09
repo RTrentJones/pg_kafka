@@ -243,8 +243,22 @@ fn parse_message_set_legacy(
 
         // Skip the validated CRC; the `message_size >= 6` guard keeps these reads within `msg`.
         let mut msg = msg.slice(4..);
-        let _magic = msg.get_i8();
+        let magic = msg.get_i8();
         let _attributes = msg.get_i8(); // Compression, timestamp type
+
+        // Message v1 (magic=1) carries an 8-byte timestamp between attributes and the key;
+        // v0 (magic=0) does not. Reading the key length without skipping it would treat
+        // the timestamp's bytes as the key length.
+        let timestamp = if magic >= 1 {
+            if msg.remaining() < 8 {
+                warn!("Insufficient bytes for v1 message timestamp");
+                break;
+            }
+            let ts = msg.get_i64();
+            (ts >= 0).then_some(ts)
+        } else {
+            None
+        };
 
         // Parse key (nullable bytes), bounded by the message frame.
         let key = if msg.remaining() < 4 {
@@ -284,7 +298,7 @@ fn parse_message_set_legacy(
             key,
             value,
             headers: Vec::new(), // MessageSet v0/v1 doesn't support headers
-            timestamp: None,     // v0 doesn't have timestamps, v1 does but we skip for simplicity
+            timestamp,           // None for v0; the producer timestamp for v1 (-1 = none)
         });
     }
 
@@ -461,6 +475,31 @@ mod tests {
         assert!(records[0].key.is_none());
         assert_eq!(records[0].value, Some(b"hello".to_vec()));
         assert!(records[0].headers.is_empty()); // Legacy format has no headers
+    }
+
+    #[test]
+    fn test_parse_message_set_legacy_v1_skips_timestamp() {
+        // Message v1 (magic=1) has an 8-byte timestamp between attributes and key. It
+        // must be read as the timestamp, not mistaken for the key length.
+        let mut body = Vec::new();
+        body.push(1); // magic v1
+        body.push(0); // attributes
+        body.extend_from_slice(&1_700_000_000_000i64.to_be_bytes()); // timestamp
+        body.extend_from_slice(&(-1i32).to_be_bytes()); // null key
+        body.extend_from_slice(&2i32.to_be_bytes()); // value length
+        body.extend_from_slice(b"hi");
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0i64.to_be_bytes()); // offset (ignored)
+        buf.extend_from_slice(&((4 + body.len()) as i32).to_be_bytes());
+        buf.extend_from_slice(&crc32_ieee(&body).to_be_bytes());
+        buf.extend_from_slice(&body);
+
+        let records = parse_message_set_legacy(&Bytes::from(buf), "test error").unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(records[0].key.is_none());
+        assert_eq!(records[0].value, Some(b"hi".to_vec()));
+        assert_eq!(records[0].timestamp, Some(1_700_000_000_000));
     }
 
     #[test]

@@ -249,6 +249,7 @@ honored; producer CreateTime timestamps are preserved — BUG-7).
 **Technical Details:**
 - Uses `murmur2` crate with `KAFKA_SEED` for hash compatibility with Kafka
 - When partition_index == -1, server computes: `murmur2(key) % partition_count`
+- Idempotent/transactional producers (`producer_id >= 0`) cannot use partition -1: a batch's sequence numbers are tracked per partition, so splitting it by key would corrupt sequence tracking. Such a batch is rejected with UNKNOWN_TOPIC_OR_PARTITION (real Kafka does not route -1 at all; clients always pick the partition).
 
 ### 12. Null Key Partition Routing (Minor Deviation)
 
@@ -272,7 +273,7 @@ honored; producer CreateTime timestamps are preserved — BUG-7).
 **Status:** Minor deviations by design
 
 - **CreateTopics ignores topic configs.** Per-topic `configs` (e.g. `retention.ms`), manual replica assignments, and `replication_factor` in the request are accepted but not applied; the response always reports replication factor 1. Set `retention.ms` afterwards with IncrementalAlterConfigs.
-- **CreateTopics default partition count.** `num_partitions <= 0` (including `-1`, "broker default") creates a 1-partition topic. It does not use the `pg_kafka.default_partitions` GUC, which applies only to auto-created topics. As a result CreateTopics never returns INVALID_PARTITIONS.
+- **CreateTopics default partition count.** `num_partitions = -1` ("broker default", what most admin clients send) creates a topic with `pg_kafka.default_partitions` partitions, the same default auto-created topics get. Any other value below 1, such as `0`, is rejected with INVALID_PARTITIONS.
 - **DeleteGroups on an unknown group** succeeds (error code 0, any orphaned committed offsets are deleted) instead of returning GROUP_ID_NOT_FOUND.
 - **CreatePartitions** does not itself trigger a rebalance; consumers pick up the new partitions on their next metadata refresh.
 - **DescribeConfigs** supports only TOPIC resources and reports only `retention.ms` and `cleanup.policy` (always `delete`; there is no log compaction). BROKER and other resource types return INVALID_REQUEST. Versions v1-v4 only (the kafka-protocol crate does not implement v0).

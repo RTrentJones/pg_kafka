@@ -75,7 +75,9 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
     }
     (0..s.len())
         .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        // `get` instead of slicing: a non-ASCII char would put `i` off a char
+        // boundary and slicing would panic. Invalid input yields None instead.
+        .map(|i| s.get(i..i + 2).and_then(|h| u8::from_str_radix(h, 16).ok()))
         .collect()
 }
 

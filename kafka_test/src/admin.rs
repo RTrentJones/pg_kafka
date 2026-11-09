@@ -648,9 +648,10 @@ pub async fn test_create_topic_invalid_partitions() -> TestResult {
             "rejected"
         }
     );
-    // Zero partitions should ideally be rejected
-    if result.is_err() {
-        println!("   Expected error: {:?}", result.as_ref().unwrap_err());
+    // Zero partitions must be rejected (INVALID_PARTITIONS), not silently created with 1.
+    match result {
+        Err(e) => println!("   Expected error: {:?}", e),
+        Ok(_) => return Err("CreateTopics with 0 partitions was accepted".into()),
     }
 
     // Test negative partitions (rdkafka uses i32, so we test with the API)

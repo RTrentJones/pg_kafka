@@ -78,35 +78,73 @@ pub fn handle_produce(
             kafka_protocol::messages::produce_response::TopicProduceResponse::default();
         topic_response.name = kafka_protocol::messages::TopicName(topic_name.clone().into());
 
-        // Group records by computed partition
-        // When partition_index == -1, use key-based routing
-        let mut records_by_partition: HashMap<i32, Vec<crate::kafka::messages::Record>> =
-            HashMap::new();
+        // Group records by computed partition, keeping each partition's own producer
+        // metadata: every RecordBatch carries its own base_sequence, so partitions must
+        // not share one request-level sequence number.
+        // When partition_index == -1, use key-based routing.
+        let mut records_by_partition: HashMap<
+            i32,
+            (
+                Vec<crate::kafka::messages::Record>,
+                Option<ProducerMetadata>,
+            ),
+        > = HashMap::new();
+        // Error responses for partitions that cannot be grouped (see below).
+        let mut rejected_partitions: Vec<i32> = Vec::new();
 
         for partition_data in topic.partitions {
             let explicit_partition = partition_data.partition_index;
+            // Per-partition metadata; fall back to the request-level metadata only when
+            // the batch carried none (e.g. a legacy MessageSet).
+            let partition_meta = partition_data
+                .producer_metadata
+                .or_else(|| producer_metadata.cloned());
+            let is_idempotent = partition_meta.as_ref().is_some_and(|m| m.producer_id >= 0);
 
             if explicit_partition == -1 {
+                // An idempotent batch's sequence numbers are tracked per partition.
+                // Splitting one batch across several partitions by key would record
+                // the whole batch's sequence range on each of them and break the
+                // producer's next batch, so server-side routing is refused here.
+                if is_idempotent {
+                    rejected_partitions.push(explicit_partition);
+                    continue;
+                }
                 // Server-side partition routing based on key
                 for record in partition_data.records {
                     let target_partition =
                         compute_partition(record.key.as_deref(), partition_count, -1);
                     records_by_partition
                         .entry(target_partition)
-                        .or_default()
+                        .or_insert_with(|| (Vec::new(), None))
+                        .0
                         .push(record);
                 }
             } else {
                 // Explicit partition - use as-is
-                records_by_partition
+                let entry = records_by_partition
                     .entry(explicit_partition)
-                    .or_default()
-                    .extend(partition_data.records);
+                    .or_insert_with(|| (Vec::new(), None));
+                entry.0.extend(partition_data.records);
+                if entry.1.is_none() {
+                    entry.1 = partition_meta;
+                }
             }
         }
 
+        for partition_index in rejected_partitions {
+            let mut partition_response =
+                kafka_protocol::messages::produce_response::PartitionProduceResponse::default();
+            partition_response.index = partition_index;
+            partition_response.error_code = ERROR_UNKNOWN_TOPIC_OR_PARTITION;
+            partition_response.base_offset = -1;
+            partition_response.log_append_time_ms = -1;
+            partition_response.log_start_offset = -1;
+            topic_response.partition_responses.push(partition_response);
+        }
+
         // Process each partition group
-        for (partition_index, records) in records_by_partition {
+        for (partition_index, (records, partition_meta)) in records_by_partition {
             let mut partition_response =
                 kafka_protocol::messages::produce_response::PartitionProduceResponse::default();
             partition_response.index = partition_index;
@@ -121,34 +159,33 @@ pub fn handle_produce(
                 continue;
             }
 
+            // Sequence metadata for this partition (idempotent producers only).
+            let seq_meta = partition_meta.as_ref().filter(|m| m.producer_id >= 0);
+
             // Phase 9: Validate sequence for idempotent producers BEFORE inserting
-            let should_insert = if let Some(meta) = producer_metadata {
-                if meta.producer_id >= 0 {
-                    // Idempotent producer - check and update sequence
-                    match store.check_and_update_sequence(
-                        meta.producer_id,
-                        meta.producer_epoch,
-                        topic_id,
-                        partition_index,
-                        meta.base_sequence,
-                        records.len() as i32,
-                    ) {
-                        Ok(should_insert) => should_insert, // true=insert, false=duplicate (skip insert)
-                        Err(e) => {
-                            // Sequence validation failed - return error for this partition
-                            partition_response.error_code = e.to_kafka_error_code();
-                            partition_response.base_offset = -1;
-                            partition_response.log_append_time_ms = -1;
-                            partition_response.log_start_offset = -1;
-                            topic_response.partition_responses.push(partition_response);
-                            continue;
-                        }
+            let should_insert = if let Some(meta) = seq_meta {
+                // Idempotent producer - check and update sequence
+                match store.check_and_update_sequence(
+                    meta.producer_id,
+                    meta.producer_epoch,
+                    topic_id,
+                    partition_index,
+                    meta.base_sequence,
+                    records.len() as i32,
+                ) {
+                    Ok(should_insert) => should_insert, // true=insert, false=duplicate (skip insert)
+                    Err(e) => {
+                        // Sequence validation failed - return error for this partition
+                        partition_response.error_code = e.to_kafka_error_code();
+                        partition_response.base_offset = -1;
+                        partition_response.log_append_time_ms = -1;
+                        partition_response.log_start_offset = -1;
+                        topic_response.partition_responses.push(partition_response);
+                        continue;
                     }
-                } else {
-                    true // Non-idempotent producer - always insert
                 }
             } else {
-                true // No metadata - always insert
+                true // Non-idempotent producer - always insert
             };
 
             // Insert records (skip for duplicates)
@@ -185,23 +222,20 @@ pub fn handle_produce(
                         // would stay un-advanced and a retry re-inserts, instead of being
                         // dropped as a false duplicate. new_last_sequence matches the value
                         // validate_sequence would have stored (base + count - 1).
-                        if let Some(meta) = producer_metadata {
-                            if meta.producer_id >= 0 {
-                                let new_last_sequence =
-                                    meta.base_sequence + records.len() as i32 - 1;
-                                if let Err(e) = store.record_producer_sequence(
-                                    meta.producer_id,
+                        if let Some(meta) = seq_meta {
+                            let new_last_sequence = meta.base_sequence + records.len() as i32 - 1;
+                            if let Err(e) = store.record_producer_sequence(
+                                meta.producer_id,
+                                topic_id,
+                                partition_index,
+                                new_last_sequence,
+                            ) {
+                                crate::pg_warning!(
+                                    "Failed to record producer sequence (topic_id={}, partition={}): {}",
                                     topic_id,
                                     partition_index,
-                                    new_last_sequence,
-                                ) {
-                                    crate::pg_warning!(
-                                        "Failed to record producer sequence (topic_id={}, partition={}): {}",
-                                        topic_id,
-                                        partition_index,
-                                        e
-                                    );
-                                }
+                                    e
+                                );
                             }
                         }
                     }

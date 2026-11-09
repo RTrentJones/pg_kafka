@@ -1033,4 +1033,13 @@ mod tests {
         // Odd-length hex is malformed
         assert!(decode_headers_json(Some(r#"{"odd":"abc"}"#)).is_empty());
     }
+
+    #[test]
+    fn test_decode_headers_json_non_ascii_hex_does_not_panic() {
+        // A multi-byte char puts the 2-byte hex window off a char boundary; that must
+        // drop the header (None), not panic with "not a char boundary".
+        assert!(decode_headers_json(Some(r#"{"k":"aé0"}"#)).is_empty());
+        let ok = decode_headers_json(Some(r#"{"bad":"aé0","good":"6869"}"#));
+        assert_eq!(ok, vec![("good".to_string(), b"hi".to_vec())]);
+    }
 }

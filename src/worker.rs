@@ -177,7 +177,10 @@ fn verify_schema(database: &str) -> Result<(), String> {
 ///
 /// Idempotent producers embed producer_id, producer_epoch, and base_sequence in the
 /// RecordBatch header. This function scans all topic partitions to find the first
-/// batch with valid producer metadata (producer_id >= 0).
+/// batch with valid producer metadata (producer_id >= 0). The result identifies the
+/// producer (id/epoch) for the request as a whole; its `base_sequence` belongs to that
+/// first batch only, so `handle_produce` checks each partition against the metadata
+/// of its own batch.
 ///
 /// Returns Some(ProducerMetadata) if found, None for non-idempotent producers.
 fn extract_producer_metadata(
@@ -1860,6 +1863,9 @@ pub fn process_request(
             response_tx,
             ..
         } => {
+            // Keep the requested topics/partitions so a request-level failure can be
+            // echoed per partition (TxnOffsetCommitResponse has no top-level error code).
+            let requested_topics = topics.clone();
             dispatch_response(
                 "TxnOffsetCommit",
                 response_tx,
@@ -1880,11 +1886,12 @@ pub fn process_request(
                     api_version,
                     response: r,
                 },
-                |_error_code| {
-                    // Note: TxnOffsetCommit doesn't have a top-level error_code field,
-                    // errors are per-partition. For simplicity, return an empty response.
-                    let mut response = kafka_protocol::messages::txn_offset_commit_response::TxnOffsetCommitResponse::default();
-                    response.throttle_time_ms = 0;
+                |error_code| {
+                    // TxnOffsetCommit has no top-level error_code field, so report the
+                    // error on every requested partition. An empty response would be
+                    // read by the client as success.
+                    let response =
+                        handlers::txn_offset_commit_error_response(&requested_topics, error_code);
                     KafkaResponse::TxnOffsetCommit {
                         correlation_id,
                         api_version,
