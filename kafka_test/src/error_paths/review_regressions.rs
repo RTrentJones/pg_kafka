@@ -769,3 +769,206 @@ pub async fn test_headers_keep_their_order() -> TestResult {
     println!("✅ Test PASSED\n");
     Ok(())
 }
+
+// ----- consumer-group coordinator regressions -----
+
+mod group_wire {
+    use super::*;
+    use crate::error_paths::bug_hunt::roundtrip;
+    use kafka_protocol::messages::heartbeat_request::HeartbeatRequest;
+    use kafka_protocol::messages::join_group_request::{
+        JoinGroupRequest, JoinGroupRequestProtocol,
+    };
+    use kafka_protocol::messages::offset_commit_request::{
+        OffsetCommitRequest, OffsetCommitRequestPartition, OffsetCommitRequestTopic,
+    };
+    use kafka_protocol::messages::sync_group_request::{
+        SyncGroupRequest, SyncGroupRequestAssignment,
+    };
+    use kafka_protocol::messages::GroupId;
+
+    pub struct Joined {
+        pub member_id: String,
+        pub generation: i32,
+        pub leader: String,
+    }
+
+    pub async fn join(
+        s: &mut TcpStream,
+        group: &str,
+        member_id: &str,
+        metadata: &[u8],
+        corr: i32,
+    ) -> Result<Joined, Box<dyn std::error::Error>> {
+        let mut p = JoinGroupRequestProtocol::default();
+        p.name = StrBytes::from_static_str("range");
+        p.metadata = bytes::Bytes::copy_from_slice(metadata);
+        let mut req = JoinGroupRequest::default();
+        req.group_id = GroupId(StrBytes::from_string(group.to_string()));
+        req.session_timeout_ms = 30000;
+        req.rebalance_timeout_ms = 60000;
+        req.member_id = StrBytes::from_string(member_id.to_string());
+        req.protocol_type = StrBytes::from_static_str("consumer");
+        req.protocols = vec![p];
+        let r = roundtrip(s, 5, corr, &req).await?;
+        if r.error_code != 0 {
+            return Err(format!("JoinGroup error {}", r.error_code).into());
+        }
+        Ok(Joined {
+            member_id: r.member_id.to_string(),
+            generation: r.generation_id,
+            leader: r.leader.to_string(),
+        })
+    }
+
+    pub async fn sync(
+        s: &mut TcpStream,
+        group: &str,
+        member_id: &str,
+        generation: i32,
+        assignments: &[(&str, &[u8])],
+        corr: i32,
+    ) -> Result<(i16, Vec<u8>), Box<dyn std::error::Error>> {
+        let mut req = SyncGroupRequest::default();
+        req.group_id = GroupId(StrBytes::from_string(group.to_string()));
+        req.generation_id = generation;
+        req.member_id = StrBytes::from_string(member_id.to_string());
+        req.assignments = assignments
+            .iter()
+            .map(|(m, a)| {
+                let mut x = SyncGroupRequestAssignment::default();
+                x.member_id = StrBytes::from_string(m.to_string());
+                x.assignment = bytes::Bytes::copy_from_slice(a);
+                x
+            })
+            .collect();
+        let r = roundtrip(s, 3, corr, &req).await?;
+        Ok((r.error_code, r.assignment.to_vec()))
+    }
+
+    pub async fn heartbeat(
+        s: &mut TcpStream,
+        group: &str,
+        member_id: &str,
+        generation: i32,
+        corr: i32,
+    ) -> Result<i16, Box<dyn std::error::Error>> {
+        let mut req = HeartbeatRequest::default();
+        req.group_id = GroupId(StrBytes::from_string(group.to_string()));
+        req.generation_id = generation;
+        req.member_id = StrBytes::from_string(member_id.to_string());
+        Ok(roundtrip(s, 3, corr, &req).await?.error_code)
+    }
+
+    pub async fn commit(
+        s: &mut TcpStream,
+        group: &str,
+        member_id: &str,
+        generation: i32,
+        topic: &str,
+        offset: i64,
+        corr: i32,
+    ) -> Result<i16, Box<dyn std::error::Error>> {
+        let mut p = OffsetCommitRequestPartition::default();
+        p.partition_index = 0;
+        p.committed_offset = offset;
+        let mut t = OffsetCommitRequestTopic::default();
+        t.name = TopicName(StrBytes::from_string(topic.to_string()));
+        t.partitions = vec![p];
+        let mut req = OffsetCommitRequest::default();
+        req.group_id = GroupId(StrBytes::from_string(group.to_string()));
+        req.generation_id_or_member_epoch = generation;
+        req.member_id = StrBytes::from_string(member_id.to_string());
+        req.topics = vec![t];
+        let r = roundtrip(s, 7, corr, &req).await?;
+        Ok(r.topics[0].partitions[0].error_code)
+    }
+}
+
+/// The coordinator's rebalance behaviour as seen by a client:
+/// - when a new member starts a rebalance, members still on the old generation get
+///   REBALANCE_IN_PROGRESS from Heartbeat (not ILLEGAL_GENERATION, which clients
+///   treat as "partitions lost") and can still commit offsets for their revoked
+///   partitions;
+/// - a follower that rejoins a stable group with unchanged metadata keeps its
+///   assignment and generation (it used to lose the assignment and force another
+///   rebalance);
+/// - Heartbeat for a group the coordinator does not know returns UNKNOWN_MEMBER_ID
+///   so the client rejoins (it used to get COORDINATOR_NOT_AVAILABLE).
+pub async fn test_group_rebalance_keeps_old_generation_usable() -> TestResult {
+    use group_wire::*;
+    println!("=== Test: Rebalance Keeps The Old Generation Usable ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = crate::fixtures::TestTopicBuilder::new(&ctx, "review-group")
+        .with_partitions(1)
+        .build()
+        .await?;
+    let group = ctx.unique_group("review-group").await;
+    let mut s = TcpStream::connect(BROKER).await?;
+
+    // Stable group {a (leader), b}.
+    let a = join(&mut s, &group, "", b"sub", 800).await?;
+    let b = join(&mut s, &group, "", b"sub", 801).await?;
+    let a = join(&mut s, &group, &a.member_id, b"sub", 802).await?;
+    assert_eq!(a.leader, a.member_id);
+    let gen = a.generation;
+    let (code, _) = sync(
+        &mut s,
+        &group,
+        &a.member_id,
+        gen,
+        &[(&a.member_id, b"assign-a"), (&b.member_id, b"assign-b")],
+        803,
+    )
+    .await?;
+    assert_eq!(code, 0, "leader sync");
+    let (code, got) = sync(&mut s, &group, &b.member_id, gen, &[], 804).await?;
+    assert_eq!((code, got.as_slice()), (0, b"assign-b".as_slice()));
+    println!("Step 1: stable at generation {}", gen);
+
+    // A follower rejoining with the same metadata keeps generation and assignment.
+    let b2 = join(&mut s, &group, &b.member_id, b"sub", 805).await?;
+    let (code, got) = sync(&mut s, &group, &b.member_id, b2.generation, &[], 806).await?;
+    println!(
+        "   follower rejoin: generation {} -> {}, sync code {} assignment {:?}",
+        gen,
+        b2.generation,
+        code,
+        String::from_utf8_lossy(&got)
+    );
+    assert_eq!(
+        b2.generation, gen,
+        "a plain follower rejoin must not rebalance"
+    );
+    assert_eq!((code, got.as_slice()), (0, b"assign-b".as_slice()));
+
+    // A new member starts a rebalance; a and b still hold `gen`.
+    let c = join(&mut s, &group, "", b"sub", 807).await?;
+    assert!(c.generation > gen);
+    let hb = heartbeat(&mut s, &group, &a.member_id, gen, 808).await?;
+    let commit_code = commit(&mut s, &group, &b.member_id, gen, &topic.name, 5, 809).await?;
+    println!(
+        "   during rebalance: old-generation heartbeat={} commit={}",
+        hb, commit_code
+    );
+    assert_eq!(hb, 27, "REBALANCE_IN_PROGRESS, so the member rejoins");
+    assert_eq!(commit_code, 0, "the revoke-time commit must be accepted");
+    let stored: i64 = ctx
+        .db()
+        .query_one(
+            "SELECT committed_offset FROM kafka.consumer_offsets WHERE group_id = $1",
+            &[&group],
+        )
+        .await?
+        .get(0);
+    assert_eq!(stored, 5);
+
+    // Unknown group.
+    let unknown = heartbeat(&mut s, "review-no-such-group", "m", 1, 810).await?;
+    println!("   heartbeat for an unknown group: {}", unknown);
+    assert_eq!(unknown, 25, "UNKNOWN_MEMBER_ID");
+
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}

@@ -181,6 +181,16 @@ pub struct ConsumerGroup {
 
     /// Timestamp when rebalance started (for timeout detection)
     pub rebalance_started_at: Option<Instant>,
+
+    /// The generation of the last completed SyncGroup: the generation members were
+    /// actually assigned partitions under. pg_kafka answers JoinGroup immediately, so
+    /// `generation_id` moves forward as soon as a rebalance starts; members that have
+    /// not rejoined yet still hold this one. Kafka keeps the old generation until the
+    /// join completes, so such a member gets REBALANCE_IN_PROGRESS from Heartbeat (not
+    /// ILLEGAL_GENERATION) and may still commit offsets while the group is
+    /// PreparingRebalance (the commit it makes when its partitions are revoked).
+    /// 0 until the first sync completes.
+    pub stable_generation: i32,
 }
 
 impl ConsumerGroup {
@@ -196,6 +206,7 @@ impl ConsumerGroup {
             previous_assignments: HashMap::new(),
             last_activity: Instant::now(),
             rebalance_started_at: None,
+            stable_generation: 0,
         }
     }
 
@@ -213,6 +224,13 @@ impl ConsumerGroup {
         protocols: Vec<(String, Vec<u8>)>,
         group_instance_id: Option<String>,
     ) -> (String, bool) {
+        // A member rejoining without starting a rebalance (e.g. a follower that synced
+        // before its leader and retried) keeps its assignment; start_rebalance clears
+        // assignments when membership is about to change.
+        let assignment = self
+            .members
+            .get(&member_id)
+            .and_then(|m| m.assignment.clone());
         let member = GroupMember {
             member_id: member_id.clone(),
             client_id,
@@ -221,7 +239,7 @@ impl ConsumerGroup {
             rebalance_timeout_ms,
             protocol_type,
             protocols,
-            assignment: None,
+            assignment,
             last_heartbeat: Instant::now(),
             last_join_generation: self.generation_id,
             group_instance_id,
@@ -324,6 +342,89 @@ impl ConsumerGroup {
         }
     }
 
+    /// Whether `member_id`, presenting `generation_id`, is a member still on the last
+    /// stable generation that has not rejoined the rebalance now in progress.
+    fn is_awaiting_rejoin(&self, member_id: &str, generation_id: i32) -> bool {
+        matches!(
+            self.state,
+            GroupState::PreparingRebalance | GroupState::CompletingRebalance
+        ) && self.stable_generation > 0
+            && generation_id == self.stable_generation
+            && generation_id != self.generation_id
+            && self
+                .members
+                .get(member_id)
+                .is_some_and(|m| m.last_join_generation < self.generation_id)
+    }
+
+    /// Handle a rebalance that exceeded its rebalance timeout (the largest
+    /// rebalance_timeout_ms the members advertised, as in Kafka):
+    /// - join phase (PreparingRebalance): evict only the members that did not rejoin,
+    ///   then complete the join with the ones that did;
+    /// - sync phase (CompletingRebalance): the leader never delivered assignments, so
+    ///   evict it and start a new rebalance with the remaining members.
+    ///
+    /// Returns the evicted member ids.
+    fn expire_stuck_rebalance(&mut self) -> Vec<String> {
+        if !matches!(
+            self.state,
+            GroupState::PreparingRebalance | GroupState::CompletingRebalance
+        ) {
+            return Vec::new();
+        }
+        let Some(started) = self.rebalance_started_at else {
+            return Vec::new();
+        };
+        // CG-3: honour the members' advertised rebalance_timeout_ms (the max across the
+        // group, matching Kafka) rather than a hardcoded value; fall back to the default
+        // when no member advertises a positive one (e.g. a v0 JoinGroup).
+        let effective_timeout_ms = self
+            .members
+            .values()
+            .map(|m| m.rebalance_timeout_ms)
+            .filter(|&t| t > 0)
+            .max()
+            .map(|t| t as u128)
+            .unwrap_or(DEFAULT_REBALANCE_TIMEOUT_MS as u128);
+        if started.elapsed().as_millis() <= effective_timeout_ms {
+            return Vec::new();
+        }
+        if self.state == GroupState::CompletingRebalance {
+            let Some(leader) = self.leader.clone() else {
+                return Vec::new();
+            };
+            pg_log!(
+                "Group {} leader {} did not sync within the rebalance timeout; evicting it",
+                self.group_id,
+                leader
+            );
+            self.remove_member(&leader);
+            if !self.members.is_empty() {
+                self.start_rebalance();
+            } else {
+                self.rebalance_started_at = None;
+            }
+            return vec![leader];
+        }
+        let stragglers: Vec<String> = self
+            .members
+            .values()
+            .filter(|m| m.last_join_generation != self.generation_id)
+            .map(|m| m.member_id.clone())
+            .collect();
+        pg_log!(
+            "Group {} rebalance timed out after {}ms; evicting {} member(s) that did not rejoin",
+            self.group_id,
+            started.elapsed().as_millis(),
+            stragglers.len()
+        );
+        for member_id in &stragglers {
+            self.remove_member(member_id);
+        }
+        self.maybe_complete_join();
+        stragglers
+    }
+
     /// Whether this group is Empty and has been idle past `EMPTY_GROUP_TTL_SECS`,
     /// so the coordinator may drop it.
     fn is_expired_empty(&self) -> bool {
@@ -333,6 +434,11 @@ impl ConsumerGroup {
 
     /// Start a rebalance (increment generation, move to PreparingRebalance)
     fn start_rebalance(&mut self) {
+        // Assignments belong to the generation being replaced; the leader's next
+        // SyncGroup hands out new ones.
+        for member in self.members.values_mut() {
+            member.assignment = None;
+        }
         self.generation_id += 1;
         self.state = GroupState::PreparingRebalance;
         self.rebalance_started_at = Some(Instant::now());
@@ -368,6 +474,7 @@ impl ConsumerGroup {
         }
 
         self.state = GroupState::Stable;
+        self.stable_generation = self.generation_id;
         self.rebalance_started_at = None; // Clear rebalance timeout tracking
         self.last_activity = Instant::now();
         pg_log!(
@@ -419,35 +526,10 @@ impl GroupCoordinator {
         // Clean up stale empty groups (TTL-based)
         groups.retain(|_, g| !g.is_expired_empty());
 
-        // Check for rebalance timeouts and abort stuck rebalances
+        // Check for rebalance timeouts: evict the members that never rejoined and
+        // complete the join with the rest (also run by the periodic sweep).
         for group in groups.values_mut() {
-            if let Some(started) = group.rebalance_started_at {
-                // CG-3: honour the members' advertised rebalance_timeout_ms (the max across the
-                // group, matching Kafka — the coordinator waits for the most lenient member) rather
-                // than a hardcoded 5 minutes. Fall back to the default when no member advertises a
-                // positive value (e.g. a v0 JoinGroup that predates the field).
-                let effective_timeout_ms = group
-                    .members
-                    .values()
-                    .map(|m| m.rebalance_timeout_ms)
-                    .filter(|&t| t > 0)
-                    .max()
-                    .map(|t| t as u128)
-                    .unwrap_or(DEFAULT_REBALANCE_TIMEOUT_MS as u128);
-                if started.elapsed().as_millis() > effective_timeout_ms {
-                    pg_log!(
-                        "Group {} rebalance timed out after {}ms, resetting to Empty",
-                        group.group_id,
-                        started.elapsed().as_millis()
-                    );
-                    group.state = GroupState::Empty;
-                    group.rebalance_started_at = None;
-                    group.members.clear();
-                    group.leader = None;
-                    group.protocol_name = None;
-                    group.generation_id += 1;
-                }
-            }
+            group.expire_stuck_rebalance();
         }
 
         // Check MAX_CONSUMER_GROUPS limit (DoS protection)
@@ -502,8 +584,18 @@ impl GroupCoordinator {
         // Determine if we need to rebalance
         let needs_rebalance = match group.state {
             GroupState::Empty => true, // First member joining
-            // New member joining a stable group
-            GroupState::Stable => !group.members.contains_key(&member_id),
+            // A stable group rebalances for a new member, a member whose subscription
+            // (protocol metadata) changed, or a rejoining leader (Kafka's rule: the
+            // leader rejoins to make the group pick up new topics or partitions). A
+            // follower rejoining with unchanged metadata keeps the current generation
+            // and its assignment.
+            GroupState::Stable => match group.members.get(&member_id) {
+                None => true,
+                Some(existing) => {
+                    existing.protocols != protocols
+                        || group.leader.as_deref() == Some(member_id.as_str())
+                }
+            },
             // New member joining while the leader may already be computing
             // assignments: restart the join phase so the new generation's
             // member list (and thus the leader's assignments) includes it
@@ -585,12 +677,12 @@ impl GroupCoordinator {
             KafkaError::Internal(format!("Failed to acquire groups write lock: {}", e))
         })?;
 
-        let group =
-            groups
-                .get_mut(&group_id)
-                .ok_or_else(|| KafkaError::CoordinatorNotAvailable {
-                    group_id: group_id.clone(),
-                })?;
+        // A group this coordinator has no record of (e.g. lost in a worker restart):
+        // UNKNOWN_MEMBER_ID, as Kafka answers, makes the client rejoin.
+        // COORDINATOR_NOT_AVAILABLE made it look up the same coordinator and retry.
+        let group = groups
+            .get_mut(&group_id)
+            .ok_or_else(|| KafkaError::unknown_member(&group_id, &member_id))?;
 
         // Validate generation ID
         if group.generation_id != generation_id {
@@ -625,6 +717,26 @@ impl GroupCoordinator {
 
         // If this is the leader, store assignments for all members
         if group.leader.as_deref() == Some(&member_id) {
+            // The leader computed these from the member list in its JoinGroup response.
+            // If a member it assigned to has left since (LeaveGroup or session timeout
+            // during the join phase, which does not move the generation), that member's
+            // partitions would go unconsumed. Restart the rebalance instead.
+            if let Some(departed) = assignments
+                .iter()
+                .map(|(id, _)| id)
+                .find(|id| !group.members.contains_key(*id))
+            {
+                pg_log!(
+                    "SyncGroup: leader {} assigned to departed member {} in group {}; restarting rebalance",
+                    member_id,
+                    departed,
+                    group_id
+                );
+                group.start_rebalance();
+                return Err(KafkaError::RebalanceInProgress {
+                    group_id: group_id.clone(),
+                });
+            }
             for (target_member_id, assignment_bytes) in assignments.iter() {
                 if let Some(member) = group.members.get_mut(target_member_id) {
                     member.assignment = Some(assignment_bytes.clone());
@@ -711,6 +823,14 @@ impl GroupCoordinator {
         };
 
         if group.generation_id != generation_id {
+            // A member that has not rejoined yet, committing under the generation it
+            // was assigned in, while the join phase runs: Kafka accepts this (it is
+            // the commit a consumer makes when its partitions are revoked).
+            if group.state == GroupState::PreparingRebalance
+                && group.is_awaiting_rejoin(member_id, generation_id)
+            {
+                return Ok(());
+            }
             return Err(KafkaError::illegal_generation(
                 group_id,
                 generation_id,
@@ -762,12 +882,22 @@ impl GroupCoordinator {
             KafkaError::Internal(format!("Failed to acquire groups write lock: {}", e))
         })?;
 
-        let group =
-            groups
-                .get_mut(&group_id)
-                .ok_or_else(|| KafkaError::CoordinatorNotAvailable {
-                    group_id: group_id.clone(),
-                })?;
+        // Unknown group (e.g. lost in a worker restart): UNKNOWN_MEMBER_ID so the
+        // client rejoins, as Kafka answers.
+        let group = groups
+            .get_mut(&group_id)
+            .ok_or_else(|| KafkaError::unknown_member(&group_id, &member_id))?;
+
+        // A member still on the last stable generation while a rebalance it has not
+        // rejoined is running: tell it to rejoin, and keep its session alive meanwhile.
+        if group.is_awaiting_rejoin(&member_id, generation_id) {
+            if let Some(member) = group.members.get_mut(&member_id) {
+                member.last_heartbeat = Instant::now();
+            }
+            return Err(KafkaError::RebalanceInProgress {
+                group_id: group_id.clone(),
+            });
+        }
 
         // Validate generation ID
         if group.generation_id != generation_id {
@@ -807,12 +937,9 @@ impl GroupCoordinator {
             KafkaError::Internal(format!("Failed to acquire groups write lock: {}", e))
         })?;
 
-        let group =
-            groups
-                .get_mut(&group_id)
-                .ok_or_else(|| KafkaError::CoordinatorNotAvailable {
-                    group_id: group_id.clone(),
-                })?;
+        let group = groups
+            .get_mut(&group_id)
+            .ok_or_else(|| KafkaError::unknown_member(&group_id, &member_id))?;
 
         pg_log!("LeaveGroup: group_id={}, member_id={}", group_id, member_id);
 
@@ -863,6 +990,15 @@ impl GroupCoordinator {
         for (group_id, group) in groups.iter_mut() {
             // Skip empty or dead groups
             if group.state == GroupState::Empty || group.state == GroupState::Dead {
+                continue;
+            }
+
+            // A join phase that exceeded its rebalance timeout evicts the members that
+            // never rejoined (previously only checked when some JoinGroup arrived).
+            for member_id in group.expire_stuck_rebalance() {
+                removed.push((group_id.clone(), member_id));
+            }
+            if group.state == GroupState::Empty {
                 continue;
             }
 
@@ -2022,6 +2158,156 @@ mod tests {
     }
 
     /// Join a group with default test parameters, returning (member_id, generation_id)
+    /// Form a stable two-member group {leader, follower} and return
+    /// (leader, follower, generation).
+    fn stable_pair(c: &GroupCoordinator, group: &str) -> (String, String, i32) {
+        let (leader, _) = join(c, group, "client-a");
+        let (follower, _) = join(c, group, "client-b");
+        let (_, generation) = rejoin(c, group, &leader, "client-a");
+        let assignments = vec![
+            (leader.clone(), b"A".to_vec()),
+            (follower.clone(), b"B".to_vec()),
+        ];
+        c.sync_group(group.to_string(), leader.clone(), generation, assignments)
+            .unwrap();
+        assert_eq!(c.get_group_state(group).unwrap().state, GroupState::Stable);
+        (leader, follower, generation)
+    }
+
+    #[test]
+    fn follower_rejoin_in_stable_keeps_assignment_and_generation() {
+        // A follower that rejoins with unchanged metadata must not lose its
+        // assignment or force a new rebalance.
+        let c = GroupCoordinator::new();
+        let (_leader, follower, generation) = stable_pair(&c, "g");
+        let (_, rejoined_gen) = rejoin(&c, "g", &follower, "client-b");
+        assert_eq!(rejoined_gen, generation);
+        let assignment = c
+            .sync_group("g".to_string(), follower, generation, vec![])
+            .unwrap();
+        assert_eq!(assignment, b"B".to_vec());
+        assert_eq!(c.get_group_state("g").unwrap().generation_id, generation);
+    }
+
+    #[test]
+    fn old_generation_member_is_told_to_rejoin_and_may_commit() {
+        // When a new member starts a rebalance, existing members still hold the old
+        // generation. Heartbeat must say REBALANCE_IN_PROGRESS (not ILLEGAL_GENERATION)
+        // and their revoke-time OffsetCommit must be accepted.
+        let c = GroupCoordinator::new();
+        let (leader, follower, generation) = stable_pair(&c, "g");
+        join(&c, "g", "client-c");
+        for member in [&leader, &follower] {
+            let hb = c.heartbeat("g".to_string(), member.clone(), generation);
+            assert!(
+                matches!(hb, Err(KafkaError::RebalanceInProgress { .. })),
+                "{:?}",
+                hb
+            );
+            c.validate_commit("g", member, generation)
+                .expect("revoke-time commit under the old generation");
+        }
+        // A generation older than the last stable one is still fenced.
+        assert!(matches!(
+            c.heartbeat("g".to_string(), leader.clone(), generation - 1),
+            Err(KafkaError::IllegalGeneration { .. })
+        ));
+        // Once a member has rejoined, the old generation no longer works for it.
+        rejoin(&c, "g", &follower, "client-b");
+        assert!(matches!(
+            c.validate_commit("g", &follower, generation),
+            Err(KafkaError::IllegalGeneration { .. })
+        ));
+    }
+
+    #[test]
+    fn leader_sync_with_departed_member_restarts_rebalance() {
+        // The leader's member list went stale: a member left after the leader's
+        // JoinGroup response. Its assignment must not be accepted (the departed
+        // member's partitions would go unconsumed).
+        let c = GroupCoordinator::new();
+        let (leader, follower, _) = stable_pair(&c, "g");
+        let (third, _) = join(&c, "g", "client-c");
+        let (_, generation) = rejoin(&c, "g", &leader, "client-a");
+        rejoin(&c, "g", &follower, "client-b");
+        c.leave_group("g".to_string(), follower.clone()).unwrap();
+        let generation = c
+            .get_group_state("g")
+            .unwrap()
+            .generation_id
+            .max(generation);
+        let stale = vec![
+            (leader.clone(), b"A".to_vec()),
+            (follower, b"B".to_vec()),
+            (third, b"C".to_vec()),
+        ];
+        let result = c.sync_group("g".to_string(), leader, generation, stale);
+        assert!(
+            matches!(result, Err(KafkaError::RebalanceInProgress { .. })),
+            "{:?}",
+            result
+        );
+        assert_ne!(c.get_group_state("g").unwrap().state, GroupState::Stable);
+    }
+
+    #[test]
+    fn rebalance_timeout_evicts_only_stragglers() {
+        let c = GroupCoordinator::new();
+        let (leader, follower, _) = stable_pair(&c, "g");
+        let (third, _) = join(&c, "g", "client-c");
+        rejoin(&c, "g", &leader, "client-a");
+        // `follower` never rejoins. Age the rebalance past every member's timeout.
+        {
+            let mut groups = c.groups.write().unwrap();
+            let g = groups.get_mut("g").unwrap();
+            g.rebalance_started_at =
+                Instant::now().checked_sub(std::time::Duration::from_secs(3600));
+        }
+        let removed = c.check_and_remove_timed_out_members();
+        assert_eq!(removed, vec![("g".to_string(), follower.clone())]);
+        let g = c.get_group_state("g").unwrap();
+        assert!(g.members.contains_key(&leader) && g.members.contains_key(&third));
+        assert!(!g.members.contains_key(&follower));
+        assert_eq!(g.state, GroupState::CompletingRebalance);
+    }
+
+    #[test]
+    fn changed_subscription_in_stable_triggers_rebalance() {
+        let c = GroupCoordinator::new();
+        let (leader, _follower, generation) = stable_pair(&c, "g");
+        let (_, new_gen, ..) = c
+            .join_group(
+                "g".to_string(),
+                Some(leader),
+                "client-a".to_string(),
+                "localhost".to_string(),
+                30000,
+                60000,
+                "consumer".to_string(),
+                vec![("range".to_string(), b"new-subscription".to_vec())],
+                None,
+            )
+            .unwrap();
+        assert!(new_gen > generation, "{} -> {}", generation, new_gen);
+    }
+
+    #[test]
+    fn unknown_group_is_unknown_member() {
+        let c = GroupCoordinator::new();
+        assert!(matches!(
+            c.heartbeat("nope".to_string(), "m".to_string(), 1),
+            Err(KafkaError::UnknownMemberId { .. })
+        ));
+        assert!(matches!(
+            c.sync_group("nope".to_string(), "m".to_string(), 1, vec![]),
+            Err(KafkaError::UnknownMemberId { .. })
+        ));
+        assert!(matches!(
+            c.leave_group("nope".to_string(), "m".to_string()),
+            Err(KafkaError::UnknownMemberId { .. })
+        ));
+    }
+
     fn join(coordinator: &GroupCoordinator, group: &str, client: &str) -> (String, i32) {
         join_inner(coordinator, group, None, client)
     }

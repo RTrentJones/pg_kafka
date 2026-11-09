@@ -163,6 +163,7 @@ use kafka_test::{
     // Coordinator state tests
     test_find_coordinator_bootstrap,
     test_frame_budget_released_on_mid_frame_disconnect,
+    test_group_rebalance_keeps_old_generation_usable,
     test_group_rejoin_race,
     test_group_state_transitions,
     test_headers_keep_their_order,
@@ -757,6 +758,12 @@ fn get_all_tests() -> Vec<TestDef> {
             parallel_safe: true,
         },
         // Error path tests
+        TestDef {
+            category: "error_paths",
+            name: "test_group_rebalance_keeps_old_generation_usable",
+            test_fn: wrap_test!(test_group_rebalance_keeps_old_generation_usable),
+            parallel_safe: true,
+        },
         TestDef {
             category: "error_paths",
             name: "test_headers_keep_their_order",
