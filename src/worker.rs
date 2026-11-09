@@ -64,7 +64,9 @@ const LIVENESS_CHANNEL_CAPACITY: usize = 1_000;
 /// payload is a `CaughtError`, so try that in addition to the usual
 /// `&str`/`String` panic payloads.
 fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
-    if let Some(s) = payload.downcast_ref::<&str>() {
+    if payload.is::<crate::kafka::dispatch::RollbackRequest>() {
+        HANDLER_ERROR_ROLLBACK.to_string()
+    } else if let Some(s) = payload.downcast_ref::<&str>() {
         s.to_string()
     } else if let Some(s) = payload.downcast_ref::<String>() {
         s.clone()
@@ -74,6 +76,10 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
         "Unknown panic".to_string()
     }
 }
+
+/// Message `run_request_in_subtransaction` returns when a handler returned an error
+/// and asked for its partial writes to be rolled back (not a panic).
+const HANDLER_ERROR_ROLLBACK: &str = "handler returned an error; request rolled back";
 
 /// Run `f` inside an internal subtransaction, rolling back its database
 /// writes if it panics. Postgres ERRORs (constraint violations, OOM, ...)
@@ -939,10 +945,14 @@ fn execute_request_in_transaction(
             handler_duration_ref.set(handler_start.elapsed());
 
             if let Err(panic_msg) = result {
-                pg_warning!(
-                    "Handler panic caught, request rolled back (worker survived): {}",
-                    panic_msg
-                );
+                // A handler error already logged itself and sent its response; only
+                // a real panic is worth a warning here.
+                if panic_msg != HANDLER_ERROR_ROLLBACK {
+                    pg_warning!(
+                        "Handler panic caught, request rolled back (worker survived): {}",
+                        panic_msg
+                    );
+                }
             }
 
             // RB-1 test hook: widen the response-send→commit window so the E2E

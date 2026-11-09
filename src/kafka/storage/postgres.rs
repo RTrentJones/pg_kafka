@@ -9,7 +9,6 @@ use super::{
 use crate::kafka::error::{KafkaError, Result};
 use crate::kafka::messages::Record;
 use pgrx::prelude::*;
-use std::collections::HashMap;
 use std::time::Duration;
 
 /// PostgreSQL-backed implementation of KafkaStore
@@ -242,7 +241,10 @@ impl PostgresStore {
                      WHERE (m.txn_state IS NULL OR m.txn_state <> 'pending')
                        AND (
                             (t.retention_ms IS NOT NULL AND t.retention_ms >= 0
-                             AND m.created_at < NOW() - (t.retention_ms || ' milliseconds')::interval)
+                             -- Clamp to 1e13 ms (~317 years): larger values, such as the
+                             -- common i64::MAX for forever, overflow the interval or the
+                             -- timestamp and abort the whole sweep for every topic.
+                             AND m.created_at < NOW() - (LEAST(t.retention_ms, 10000000000000) || ' milliseconds')::interval)
                          OR (t.retention_ms IS NULL AND $1 > 0
                              AND m.created_at < NOW() - ($1 || ' hours')::interval)
                        )
@@ -434,12 +436,14 @@ impl PostgresStore {
                     if r.headers.is_empty() {
                         "{}".to_string()
                     } else {
-                        let headers_map: HashMap<String, String> = r
+                        // An array of [key, hex(value)] pairs keeps the producer's header
+                        // order (a JSONB object would reorder its keys).
+                        let pairs: Vec<(&str, String)> = r
                             .headers
                             .iter()
-                            .map(|h| (h.key.clone(), hex_encode(&h.value)))
+                            .map(|h| (h.key.as_str(), hex_encode(&h.value)))
                             .collect();
-                        serde_json::to_string(&headers_map).unwrap_or_else(|_| "{}".to_string())
+                        serde_json::to_string(&pairs).unwrap_or_else(|_| "{}".to_string())
                     }
                 })
                 .collect();
@@ -1986,12 +1990,38 @@ impl KafkaStore for PostgresStore {
                     &[txn_id.clone().into()],
                 )?;
 
+                // Fence the timed-out producer, as Kafka does, by bumping its epoch.
+                // Without this the stalled producer could resume with the same epoch
+                // (AddPartitionsToTxn accepts CompleteAbort -> Ongoing), add more
+                // partitions and commit only the part written after the abort. The
+                // guard leaves the epoch alone if it already moved or is exhausted
+                // (the next InitProducerId then allocates a fresh producer id).
+                let bumped = client.update(
+                    "UPDATE kafka.producer_ids SET epoch = epoch + 1
+                     WHERE producer_id = $1 AND epoch = $2 AND epoch < 32767
+                     RETURNING epoch",
+                    None,
+                    &[producer_id.into(), producer_epoch.into()],
+                )?;
+                let new_epoch: i16 = if bumped.is_empty() {
+                    producer_epoch
+                } else {
+                    bumped.first().get_by_name("epoch")?.unwrap_or(producer_epoch)
+                };
+                // The new epoch restarts sequence numbers.
+                client.update(
+                    "DELETE FROM kafka.producer_sequences WHERE producer_id = $1",
+                    None,
+                    &[producer_id.into()],
+                )?;
+
                 // Update transaction state
                 client.update(
-                    "UPDATE kafka.transactions SET state = 'CompleteAbort', last_updated_at = NOW()
+                    "UPDATE kafka.transactions
+                     SET state = 'CompleteAbort', producer_epoch = $2, last_updated_at = NOW()
                      WHERE transactional_id = $1",
                     None,
-                    &[txn_id.clone().into()],
+                    &[txn_id.clone().into(), new_epoch.into()],
                 )?;
 
                 crate::pg_debug!("Aborted timed-out transaction: {}", txn_id);

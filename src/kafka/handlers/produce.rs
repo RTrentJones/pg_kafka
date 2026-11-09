@@ -62,7 +62,8 @@ pub fn handle_produce(
         // Get or create topic (returns both topic_id and partition_count in single query).
         // A failure here is reported on this topic's partitions only.
         let (topic_id, partition_count) =
-            match store.get_or_create_topic(&topic_name, default_partitions) {
+            match super::helpers::get_or_create_valid_topic(store, &topic_name, default_partitions)
+            {
                 Ok(found) => found,
                 Err(e) => {
                     if e.is_server_error() {

@@ -51,6 +51,48 @@ pub fn resolve_topic<S: KafkaStore + ?Sized>(
     }
 }
 
+/// Validate a topic name against Kafka's rules (mirrors `Topic.validate` in Apache Kafka):
+/// non-empty, not "." or "..", at most 249 characters, and only `[a-zA-Z0-9._-]`. (CONF-4)
+pub fn validate_topic_name(name: &str) -> std::result::Result<(), &'static str> {
+    if name.is_empty() {
+        return Err("Topic name cannot be empty");
+    }
+    if name == "." || name == ".." {
+        return Err("Topic name cannot be \".\" or \"..\"");
+    }
+    if name.len() > 249 {
+        return Err("Topic name cannot be longer than 249 characters");
+    }
+    let allowed = |c: char| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-';
+    if !name.chars().all(allowed) {
+        return Err("Topic name may only contain ASCII alphanumerics, '.', '_', and '-'");
+    }
+    Ok(())
+}
+
+/// `get_or_create_topic` for the auto-create paths (Metadata, Produce,
+/// AddPartitionsToTxn), with the same name rules CreateTopics enforces. Only a name
+/// that fails validation costs an extra lookup, so a topic created before the rules
+/// were enforced on auto-create keeps working.
+pub fn get_or_create_valid_topic<S: KafkaStore + ?Sized>(
+    store: &S,
+    topic_name: &str,
+    default_partitions: i32,
+) -> crate::kafka::error::Result<(i32, i32)> {
+    if let Err(reason) = validate_topic_name(topic_name) {
+        let existing =
+            store.get_topic_metadata(Some(std::slice::from_ref(&topic_name.to_string())))?;
+        return match existing.first() {
+            Some(tm) => Ok((tm.id, tm.partition_count)),
+            None => Err(KafkaError::InvalidTopic {
+                topic: topic_name.to_string(),
+                reason: reason.to_string(),
+            }),
+        };
+    }
+    store.get_or_create_topic(topic_name, default_partitions)
+}
+
 /// Returns the appropriate Kafka error code for a topic resolution failure.
 pub fn topic_resolution_error_code(resolution: &TopicResolution) -> i16 {
     match resolution {

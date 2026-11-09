@@ -59,6 +59,7 @@ use kafka_test::{
     test_api_versions_negotiation,
     // Shadow outbox duplicate-delivery guard (issue #93)
     test_async_forwarding_no_duplicates_on_slow_ack,
+    test_auto_create_rejects_invalid_topic_name,
     // Edge case tests
     test_batch_1000_messages,
     // Producer tests
@@ -138,6 +139,7 @@ use kafka_test::{
     test_duplicate_consumer_join,
     test_empty_group_id,
     test_empty_vs_null_key_routing,
+    test_end_txn_retry_is_idempotent,
     test_external_only_fallback,
     test_external_only_mode,
     test_external_primary_dead_letter_serves_local,
@@ -163,6 +165,7 @@ use kafka_test::{
     test_frame_budget_released_on_mid_frame_disconnect,
     test_group_rejoin_race,
     test_group_state_transitions,
+    test_headers_keep_their_order,
     // Rebalancing edge case tests
     test_heartbeat_after_leave,
     test_heartbeat_bypasses_produce_backlog,
@@ -170,6 +173,7 @@ use kafka_test::{
     test_heartbeat_keeps_membership,
     test_high_offset_values,
     test_high_watermark_no_regress_after_cleanup,
+    test_huge_retention_ms_does_not_break_sweep,
     test_hundred_percent_forwarding,
     // Idempotent producer tests
     test_idempotent_concurrent_producers,
@@ -272,6 +276,7 @@ use kafka_test::{
     test_session_timeout_rebalance,
     test_single_partition_topic,
     test_special_character_key_routing,
+    test_timed_out_transaction_cannot_be_resumed,
     test_topic_name_mapping,
     test_transaction_boundary_isolation,
     test_transaction_honors_per_txn_timeout_ms,
@@ -752,6 +757,36 @@ fn get_all_tests() -> Vec<TestDef> {
             parallel_safe: true,
         },
         // Error path tests
+        TestDef {
+            category: "error_paths",
+            name: "test_headers_keep_their_order",
+            test_fn: wrap_test!(test_headers_keep_their_order),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_auto_create_rejects_invalid_topic_name",
+            test_fn: wrap_test!(test_auto_create_rejects_invalid_topic_name),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_end_txn_retry_is_idempotent",
+            test_fn: wrap_test!(test_end_txn_retry_is_idempotent),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_timed_out_transaction_cannot_be_resumed",
+            test_fn: wrap_test!(test_timed_out_transaction_cannot_be_resumed),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_huge_retention_ms_does_not_break_sweep",
+            test_fn: wrap_test!(test_huge_retention_ms_does_not_break_sweep),
+            parallel_safe: true,
+        },
         TestDef {
             category: "error_paths",
             name: "test_corrupt_acks0_produce_sends_no_reply",

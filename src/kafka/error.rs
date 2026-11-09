@@ -19,11 +19,11 @@ use thiserror::Error;
 use crate::kafka::constants::{
     ERROR_CONCURRENT_TRANSACTIONS, ERROR_COORDINATOR_NOT_AVAILABLE, ERROR_CORRUPT_MESSAGE,
     ERROR_DUPLICATE_SEQUENCE_NUMBER, ERROR_ILLEGAL_GENERATION, ERROR_INVALID_PARTITIONS,
-    ERROR_INVALID_RECORD, ERROR_INVALID_TXN_STATE, ERROR_MESSAGE_TOO_LARGE, ERROR_NOT_COORDINATOR,
-    ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER, ERROR_PRODUCER_FENCED, ERROR_REBALANCE_IN_PROGRESS,
-    ERROR_TRANSACTIONAL_ID_NOT_FOUND, ERROR_UNKNOWN_MEMBER_ID, ERROR_UNKNOWN_PRODUCER_ID,
-    ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION, ERROR_UNSUPPORTED_VERSION,
-    MAX_REQUEST_SIZE,
+    ERROR_INVALID_RECORD, ERROR_INVALID_TOPIC_EXCEPTION, ERROR_INVALID_TXN_STATE,
+    ERROR_MESSAGE_TOO_LARGE, ERROR_NOT_COORDINATOR, ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER,
+    ERROR_PRODUCER_FENCED, ERROR_REBALANCE_IN_PROGRESS, ERROR_TRANSACTIONAL_ID_NOT_FOUND,
+    ERROR_UNKNOWN_MEMBER_ID, ERROR_UNKNOWN_PRODUCER_ID, ERROR_UNKNOWN_SERVER_ERROR,
+    ERROR_UNKNOWN_TOPIC_OR_PARTITION, ERROR_UNSUPPORTED_VERSION, MAX_REQUEST_SIZE,
 };
 
 /// Errors that can occur during Kafka protocol operations
@@ -52,6 +52,10 @@ pub enum KafkaError {
     /// Malformed request body (failed to decode)
     #[error("Corrupt message: {message}")]
     CorruptMessage { message: String },
+
+    /// Topic name that violates Kafka's naming rules (INVALID_TOPIC_EXCEPTION)
+    #[error("Invalid topic name '{topic}': {reason}")]
+    InvalidTopic { topic: String, reason: String },
 
     /// Well-formed records that fail broker-side validation (INVALID_RECORD)
     #[error("Invalid record: {message}")]
@@ -205,6 +209,7 @@ impl KafkaError {
             KafkaError::RequestTooShort { .. } => ERROR_CORRUPT_MESSAGE,
             KafkaError::CorruptMessage { .. } => ERROR_CORRUPT_MESSAGE,
             KafkaError::InvalidRecord { .. } => ERROR_INVALID_RECORD,
+            KafkaError::InvalidTopic { .. } => ERROR_INVALID_TOPIC_EXCEPTION,
 
             // Topic/Partition → UNKNOWN_TOPIC_OR_PARTITION or INVALID_PARTITIONS
             KafkaError::UnknownTopic { .. } => ERROR_UNKNOWN_TOPIC_OR_PARTITION,

@@ -472,3 +472,300 @@ pub async fn test_corrupt_acks0_produce_sends_no_reply() -> TestResult {
     println!("✅ Test PASSED\n");
     Ok(())
 }
+
+// ----- storage / transaction regressions -----
+
+/// A topic with a huge retention.ms (i64::MAX is a common "forever") used to
+/// overflow the sweep's interval arithmetic, rolling back the whole sweep and
+/// stopping retention for every topic.
+pub async fn test_huge_retention_ms_does_not_break_sweep() -> TestResult {
+    println!("=== Test: Huge retention.ms Does Not Break The Sweep ===\n");
+    let ctx = TestContext::new().await?;
+    let forever = crate::fixtures::TestTopicBuilder::new(&ctx, "review-retention-forever")
+        .with_partitions(1)
+        .build()
+        .await?;
+    let expiring = crate::fixtures::TestTopicBuilder::new(&ctx, "review-retention-zero")
+        .with_partitions(1)
+        .build()
+        .await?;
+    forever
+        .produce(&crate::fixtures::generate_messages(1, "keep"))
+        .await?;
+    expiring
+        .produce(&crate::fixtures::generate_messages(1, "drop"))
+        .await?;
+    ctx.db()
+        .execute(
+            "UPDATE kafka.topics SET retention_ms = 9223372036854775807 WHERE name = $1",
+            &[&forever.name],
+        )
+        .await?;
+    ctx.db()
+        .execute(
+            "UPDATE kafka.topics SET retention_ms = 0 WHERE name = $1",
+            &[&expiring.name],
+        )
+        .await?;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let swept = ctx
+        .db()
+        .query("SELECT * FROM pg_kafka_run_retention_sweep(0, 60)", &[])
+        .await;
+    println!("   sweep result: {:?}", swept.as_ref().map(|r| r.len()));
+    swept.map_err(|e| format!("the retention sweep failed: {}", e))?;
+
+    let kept = count_messages(&ctx, &forever.name).await?;
+    let dropped = count_messages(&ctx, &expiring.name).await?;
+    println!(
+        "   forever topic: {} row(s), retention 0 topic: {} row(s)",
+        kept, dropped
+    );
+    assert_eq!(kept, 1, "retention.ms = i64::MAX keeps the record");
+    assert_eq!(
+        dropped, 0,
+        "the other topic's expired record is still swept"
+    );
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// When the broker aborts a transaction for exceeding its timeout, the stalled
+/// producer must be fenced. Before, it kept its epoch: adding a new partition moved
+/// the aborted transaction back to Ongoing and the producer committed only the
+/// records written after the abort.
+pub async fn test_timed_out_transaction_cannot_be_resumed() -> TestResult {
+    println!("=== Test: Timed-Out Transaction Cannot Be Resumed ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = crate::fixtures::TestTopicBuilder::new(&ctx, "review-txn-timeout")
+        .with_partitions(2)
+        .build()
+        .await?;
+    let txn_id = format!("review-txn-timeout-{}", uuid::Uuid::new_v4());
+    let producer = create_transactional_producer(&txn_id)?;
+    producer.init_transactions(Duration::from_secs(10))?;
+    producer.begin_transaction()?;
+    producer
+        .send(
+            FutureRecord::<(), _>::to(&topic.name)
+                .payload("before-timeout")
+                .partition(0),
+            Duration::from_secs(5),
+        )
+        .await
+        .map_err(|(e, _)| e)?;
+
+    // Make the transaction look expired and wait for the worker's timeout sweep
+    // (every 10 s) to abort it.
+    ctx.db()
+        .execute(
+            "UPDATE kafka.transactions SET started_at = NOW() - INTERVAL '1 hour', timeout_ms = 1000
+             WHERE transactional_id = $1",
+            &[&txn_id],
+        )
+        .await?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let state: String = ctx
+            .db()
+            .query_one(
+                "SELECT state FROM kafka.transactions WHERE transactional_id = $1",
+                &[&txn_id],
+            )
+            .await?
+            .get(0);
+        if state == "CompleteAbort" {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            return Err(format!(
+                "the timeout sweep never aborted the transaction (state {})",
+                state
+            )
+            .into());
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    println!("Step 1: the broker aborted the expired transaction");
+
+    // The stalled producer carries on: a new partition, then commit.
+    let outcome: Result<(), String> = async {
+        producer
+            .send(
+                FutureRecord::<(), _>::to(&topic.name)
+                    .payload("after-timeout")
+                    .partition(1),
+                Duration::from_secs(5),
+            )
+            .await
+            .map_err(|(e, _)| e.to_string())?;
+        producer
+            .commit_transaction(Duration::from_secs(10))
+            .map_err(|e| e.to_string())
+    }
+    .await;
+    let committed = count_messages(&ctx, &topic.name).await?;
+    println!(
+        "   resumed commit: {:?}; committed rows: {}",
+        outcome, committed
+    );
+    assert!(outcome.is_err(), "a timed-out transaction must not commit");
+    assert_eq!(
+        committed, 0,
+        "no part of the timed-out transaction may commit"
+    );
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// EndTxn retried after a lost response finds the transaction already finished
+/// with the requested outcome; Kafka answers NONE, not INVALID_TXN_STATE.
+pub async fn test_end_txn_retry_is_idempotent() -> TestResult {
+    use crate::error_paths::bug_hunt::roundtrip;
+    use kafka_protocol::messages::add_partitions_to_txn_request::{
+        AddPartitionsToTxnRequest, AddPartitionsToTxnTopic,
+    };
+    use kafka_protocol::messages::end_txn_request::EndTxnRequest;
+    use kafka_protocol::messages::init_producer_id_request::InitProducerIdRequest;
+    use kafka_protocol::messages::{ProducerId, TransactionalId};
+    println!("=== Test: EndTxn Retry Is Idempotent ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = crate::fixtures::TestTopicBuilder::new(&ctx, "review-endtxn-retry")
+        .with_partitions(1)
+        .build()
+        .await?;
+    let txn_id = format!("review-endtxn-{}", uuid::Uuid::new_v4());
+    let mut stream = TcpStream::connect(BROKER).await?;
+
+    let mut init = InitProducerIdRequest::default();
+    init.transactional_id = Some(TransactionalId(StrBytes::from_string(txn_id.clone())));
+    init.transaction_timeout_ms = 60000;
+    let ids = roundtrip(&mut stream, 2, 601, &init).await?;
+    assert_eq!(ids.error_code, 0);
+
+    let mut add = AddPartitionsToTxnRequest::default();
+    add.v3_and_below_transactional_id = TransactionalId(StrBytes::from_string(txn_id.clone()));
+    add.v3_and_below_producer_id = ids.producer_id;
+    add.v3_and_below_producer_epoch = ids.producer_epoch;
+    let mut t = AddPartitionsToTxnTopic::default();
+    t.name = TopicName(StrBytes::from_string(topic.name.clone()));
+    t.partitions = vec![0];
+    add.v3_and_below_topics = vec![t];
+    let added = roundtrip(&mut stream, 1, 602, &add).await?;
+    assert_eq!(
+        added.results_by_topic_v3_and_below[0].results_by_partition[0].partition_error_code,
+        0
+    );
+
+    let mut end = EndTxnRequest::default();
+    end.transactional_id = TransactionalId(StrBytes::from_string(txn_id.clone()));
+    end.producer_id = ProducerId(ids.producer_id.0);
+    end.producer_epoch = ids.producer_epoch;
+    end.committed = true;
+    let first = roundtrip(&mut stream, 1, 603, &end).await?;
+    let retry = roundtrip(&mut stream, 1, 604, &end).await?;
+    println!(
+        "   EndTxn(commit): first={} retry={}",
+        first.error_code, retry.error_code
+    );
+    assert_eq!(first.error_code, 0);
+    assert_eq!(retry.error_code, 0, "a matching retry must succeed");
+
+    // The opposite outcome is still refused.
+    end.committed = false;
+    let opposite = roundtrip(&mut stream, 1, 605, &end).await?;
+    assert_eq!(opposite.error_code, 48, "INVALID_TXN_STATE");
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// Metadata (and Produce) auto-creation used to skip the topic-name rules
+/// CreateTopics enforces, creating topics such as "bad name/x".
+pub async fn test_auto_create_rejects_invalid_topic_name() -> TestResult {
+    use kafka_protocol::messages::metadata_request::{MetadataRequest, MetadataRequestTopic};
+    println!("=== Test: Auto-Create Rejects Invalid Topic Name ===\n");
+    let ctx = TestContext::new().await?;
+    let bad = format!("bad name/{}", uuid::Uuid::new_v4());
+    let mut t = MetadataRequestTopic::default();
+    t.name = Some(TopicName(StrBytes::from_string(bad.clone())));
+    let mut req = MetadataRequest::default();
+    req.topics = Some(vec![t]);
+    req.allow_auto_topic_creation = true;
+    let mut stream = TcpStream::connect(BROKER).await?;
+    let response = crate::error_paths::bug_hunt::roundtrip(&mut stream, 4, 701, &req).await?;
+    let code = response.topics[0].error_code;
+    let rows = ctx
+        .db()
+        .query("SELECT 1 FROM kafka.topics WHERE name = $1", &[&bad])
+        .await?;
+    println!("   metadata error_code={} topic rows={}", code, rows.len());
+    assert_eq!(code, 17, "INVALID_TOPIC_EXCEPTION");
+    assert!(rows.is_empty(), "the invalid topic must not be created");
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// Headers come back in the order the producer sent them (they used to come back
+/// sorted by key).
+pub async fn test_headers_keep_their_order() -> TestResult {
+    use rdkafka::consumer::{BaseConsumer, Consumer};
+    use rdkafka::message::{Header, Headers, Message, OwnedHeaders};
+    println!("=== Test: Headers Keep Their Order ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = crate::fixtures::TestTopicBuilder::new(&ctx, "review-header-order")
+        .with_partitions(1)
+        .build()
+        .await?;
+    let producer = crate::common::create_producer()?;
+    let headers = OwnedHeaders::new()
+        .insert(Header {
+            key: "zeta",
+            value: Some("1"),
+        })
+        .insert(Header {
+            key: "alpha",
+            value: Some("2"),
+        })
+        .insert(Header {
+            key: "mu",
+            value: Some("3"),
+        });
+    producer
+        .send(
+            FutureRecord::<(), _>::to(&topic.name)
+                .payload("v")
+                .partition(0)
+                .headers(headers),
+            Duration::from_secs(5),
+        )
+        .await
+        .map_err(|(e, _)| e)?;
+
+    let group = ctx.unique_group("review-header-order").await;
+    let consumer: BaseConsumer = crate::common::create_base_consumer(&group)?;
+    let mut tpl = rdkafka::TopicPartitionList::new();
+    tpl.add_partition_offset(&topic.name, 0, rdkafka::Offset::Beginning)?;
+    consumer.assign(&tpl)?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let keys: Vec<String> = loop {
+        if let Some(Ok(msg)) = consumer.poll(Duration::from_millis(500)) {
+            break msg
+                .headers()
+                .map(|hs| hs.iter().map(|h| h.key.to_string()).collect())
+                .unwrap_or_default();
+        }
+        if std::time::Instant::now() > deadline {
+            return Err("no record consumed".into());
+        }
+    };
+    println!("   header keys: {:?}", keys);
+    assert_eq!(keys, vec!["zeta", "alpha", "mu"]);
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}

@@ -1042,4 +1042,18 @@ mod tests {
         let ok = decode_headers_json(Some(r#"{"bad":"aé0","good":"6869"}"#));
         assert_eq!(ok, vec![("good".to_string(), b"hi".to_vec())]);
     }
+
+    #[test]
+    fn test_decode_headers_json_array_keeps_order() {
+        let decoded = decode_headers_json(Some(r#"[["z","01"],["a","02"]]"#));
+        assert_eq!(
+            decoded,
+            vec![("z".to_string(), vec![1u8]), ("a".to_string(), vec![2u8])]
+        );
+        // Rows written in the old object format still decode.
+        assert_eq!(
+            decode_headers_json(Some(r#"{"k":"6869"}"#)),
+            vec![("k".to_string(), b"hi".to_vec())]
+        );
+    }
 }

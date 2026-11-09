@@ -2473,7 +2473,9 @@ mod tests {
 
         mock.expect_validate_transaction()
             .returning(|_, _, _| Ok(()));
-        // State is already CompleteCommit - can't end again
+        // State is already CompleteCommit - aborting it now is an invalid transition.
+        // (Committing it again is a retry and succeeds; see
+        // test_end_txn_retry_with_same_outcome_succeeds.)
         mock.expect_get_transaction_state()
             .returning(|_| Ok(Some(TransactionState::CompleteCommit)));
 
@@ -2482,7 +2484,7 @@ mod tests {
         let broker = BrokerMetadata::new("localhost".to_string(), 9092);
         let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
 
-        let result = transaction::handle_end_txn(&ctx, "txn-1", 1000, 0, true);
+        let result = transaction::handle_end_txn(&ctx, "txn-1", 1000, 0, false);
 
         assert!(result.is_err());
         match result.unwrap_err() {

@@ -16,6 +16,17 @@ use kafka_protocol::messages::produce_response::ProduceResponse;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use tokio::sync::mpsc::UnboundedSender;
 
+/// Unwind payload a handler `Err` uses to roll back the request's subtransaction.
+///
+/// A handler that fails part-way through may already have written to the database
+/// (e.g. IncrementalAlterConfigs applied resource 1, then failed on resource 2). The
+/// client is told the request failed, so those writes must not commit. The request
+/// runs inside `worker::run_request_in_subtransaction`, which rolls back on any
+/// unwind; `dispatch_response` sends the error response and then unwinds with this
+/// marker, which the worker recognises and does not report as a panic. `resume_unwind`
+/// does not run the panic hook, so nothing is printed.
+pub struct RollbackRequest;
+
 /// Dispatch a handler result to the response channel.
 ///
 /// This eliminates repetitive error handling boilerplate across all request handlers.
@@ -73,6 +84,8 @@ pub fn dispatch_response<R, F, W, E>(
             if let Err(send_err) = response_tx.send(error_response) {
                 pg_warning!("Failed to send error response: {}", send_err);
             }
+            // Discard any writes the handler made before failing (see RollbackRequest).
+            resume_unwind(Box::new(RollbackRequest));
         }
         Err(panic) => {
             pg_warning!(
@@ -201,21 +214,27 @@ mod tests {
     fn test_dispatch_response_error() {
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        dispatch_response(
-            "Test",
-            tx,
-            || Err::<i32, KafkaError>(KafkaError::Internal("test error".into())),
-            |_result| KafkaResponse::Error {
-                correlation_id: 0,
-                error_code: 0,
-                error_message: None,
-            },
-            |error_code| KafkaResponse::Error {
-                correlation_id: 42,
-                error_code,
-                error_message: Some("API-specific error".to_string()),
-            },
-        );
+        // A handler error sends the error response, then unwinds with RollbackRequest
+        // so the request's subtransaction discards any partial writes.
+        let unwound = catch_unwind(AssertUnwindSafe(|| {
+            dispatch_response(
+                "Test",
+                tx,
+                || Err::<i32, KafkaError>(KafkaError::Internal("test error".into())),
+                |_result| KafkaResponse::Error {
+                    correlation_id: 0,
+                    error_code: 0,
+                    error_message: None,
+                },
+                |error_code| KafkaResponse::Error {
+                    correlation_id: 42,
+                    error_code,
+                    error_message: Some("API-specific error".to_string()),
+                },
+            )
+        }));
+        let payload = unwound.expect_err("a handler error must unwind to roll back");
+        assert!(payload.is::<RollbackRequest>());
 
         let response = rx.try_recv().expect("Should receive error response");
         match response {

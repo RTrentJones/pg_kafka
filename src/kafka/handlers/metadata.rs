@@ -77,9 +77,12 @@ pub fn handle_metadata(
                 // a missing topic resolves to None and is reported as UNKNOWN_TOPIC_OR_PARTITION
                 // rather than being created.
                 let resolved: Result<Option<i32>> = if allow_auto_topic_creation {
-                    store
-                        .get_or_create_topic(&topic_name, default_partitions)
-                        .map(|(_topic_id, partition_count)| Some(partition_count))
+                    super::helpers::get_or_create_valid_topic(
+                        store,
+                        &topic_name,
+                        default_partitions,
+                    )
+                    .map(|(_topic_id, partition_count)| Some(partition_count))
                 } else {
                     store
                         .get_topic_metadata(Some(std::slice::from_ref(&topic_name)))

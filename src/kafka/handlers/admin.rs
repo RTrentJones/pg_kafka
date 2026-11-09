@@ -21,29 +21,11 @@ use kafka_protocol::messages::delete_topics_response::{
 use kafka_protocol::messages::{GroupId, TopicName};
 use kafka_protocol::protocol::StrBytes;
 
+use super::helpers::validate_topic_name;
 use crate::kafka::constants::*;
 use crate::kafka::error::Result;
 use crate::kafka::handler_context::HandlerContext;
 use crate::kafka::messages::{CreatePartitionsTopicRequest, CreateTopicRequest};
-
-/// Validate a topic name against Kafka's rules (mirrors `Topic.validate` in Apache Kafka):
-/// non-empty, not "." or "..", at most 249 characters, and only `[a-zA-Z0-9._-]`. (CONF-4)
-fn validate_topic_name(name: &str) -> std::result::Result<(), &'static str> {
-    if name.is_empty() {
-        return Err("Topic name cannot be empty");
-    }
-    if name == "." || name == ".." {
-        return Err("Topic name cannot be \".\" or \"..\"");
-    }
-    if name.len() > 249 {
-        return Err("Topic name cannot be longer than 249 characters");
-    }
-    let allowed = |c: char| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-';
-    if !name.chars().all(allowed) {
-        return Err("Topic name may only contain ASCII alphanumerics, '.', '_', and '-'");
-    }
-    Ok(())
-}
 
 /// Handle CreateTopics request
 ///
