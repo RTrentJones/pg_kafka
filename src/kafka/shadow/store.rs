@@ -1894,9 +1894,17 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
         // empty after a worker restart, and it is removed above even if the commit
         // below then fails and the client retries, either of which committed the
         // transaction without ever forwarding it.
-        let records = self
-            .pending_txn_records(producer_id, producer_epoch)
-            .unwrap_or_else(|| pending_records.map(|buf| buf.records).unwrap_or_default());
+        //
+        // Only while shadow mode is on and this node is primary, the same gate
+        // insert_transactional_records applies when buffering: records produced
+        // while forwarding was off must not be queued (and later forwarded) here.
+        let forwarding = self.is_enabled() && self.is_primary();
+        let records = if forwarding {
+            self.pending_txn_records(producer_id, producer_epoch)
+                .unwrap_or_else(|| pending_records.map(|buf| buf.records).unwrap_or_default())
+        } else {
+            Vec::new()
+        };
 
         // 3. Commit the inner transaction unconditionally. Even with zero
         // forwarded records, the kafka.transactions state row must transition to

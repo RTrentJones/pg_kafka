@@ -454,6 +454,10 @@ impl ConsumerGroup {
     fn complete_join(&mut self, protocol_name: String) {
         self.protocol_name = Some(protocol_name);
         self.state = GroupState::CompletingRebalance;
+        // The sync phase gets its own rebalance-timeout window. Keeping the join
+        // phase's start time meant a join completed by evicting stragglers (whose
+        // window had already run out) would evict the leader on the very next check.
+        self.rebalance_started_at = Some(Instant::now());
         pg_log!(
             "Group {} completed join phase (generation {})",
             self.group_id,
@@ -2269,6 +2273,15 @@ mod tests {
         assert!(g.members.contains_key(&leader) && g.members.contains_key(&third));
         assert!(!g.members.contains_key(&follower));
         assert_eq!(g.state, GroupState::CompletingRebalance);
+
+        // The sync phase starts a fresh timeout window: the leader that just
+        // completed the join is not evicted by the next sweep.
+        assert!(c.check_and_remove_timed_out_members().is_empty());
+        assert!(c
+            .get_group_state("g")
+            .unwrap()
+            .members
+            .contains_key(&leader));
     }
 
     #[test]
