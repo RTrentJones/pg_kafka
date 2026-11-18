@@ -169,6 +169,26 @@ pub const MAX_REQUEST_SIZE: i32 = 100_000_000;
 /// once this cap is reached.
 pub const MAX_CONNECTIONS: usize = 1024;
 
+/// Maximum number of requests one connection may have in flight (read from the
+/// socket but whose response has not yet been written back).
+///
+/// Responses are written strictly in request order, so a client that pipelines
+/// requests without reading the responses would otherwise make the connection
+/// buffer an unbounded number of encoded-but-unsent responses. When a connection
+/// reaches this many, its reader stops reading further frames until the writer
+/// has sent a response (TCP backpressure on the client). The value is well above
+/// what real clients pipeline (librdkafka's default
+/// `max.in.flight.requests.per.connection` is 1,000,000 but in practice it holds a
+/// handful; the Java client defaults to 5) and above the per-connection long-poll
+/// cap (64), so a full set of long polls never starves the connection.
+pub const MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION: usize = 128;
+
+/// Maximum concurrent long-poll fetch tasks per connection (RV-10 follow-up).
+///
+/// A fetch over the cap is served by the immediate (non-waiting) path. Must stay
+/// below [`MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION`].
+pub const MAX_LONG_POLLS_PER_CONNECTION: usize = 64;
+
 /// Maximum number of elements to pre-allocate from a wire-supplied array length.
 ///
 /// Array length prefixes in the wire protocol are attacker-controlled. Passing one
@@ -205,17 +225,21 @@ pub const DEFAULT_TOPIC_PARTITIONS: i32 = 1;
 
 // ===== Long Polling Configuration =====
 
-/// Default poll interval for long polling fallback (milliseconds)
+/// Default safety-net poll interval for long polling (milliseconds)
 ///
-/// When waiting for new data in a FetchRequest, this is how often we poll
-/// the database if no in-memory notification arrives.
-pub const DEFAULT_FETCH_POLL_INTERVAL_MS: i32 = 100;
+/// A waiting FetchRequest is re-run when a new-data notification arrives
+/// (Produce, or EndTxn for `read_committed` waiters) or when `max_wait_ms`
+/// expires. This interval is only the fallback for a notification that was
+/// dropped (the notify channel is best-effort) or for data that became visible
+/// without one, so it is deliberately slow: an idle long poll costs one
+/// fetch per second instead of one per 100 ms.
+pub const DEFAULT_FETCH_POLL_INTERVAL_MS: i32 = 1000;
 
 /// Minimum poll interval (milliseconds)
 pub const MIN_FETCH_POLL_INTERVAL_MS: i32 = 10;
 
 /// Maximum poll interval (milliseconds)
-pub const MAX_FETCH_POLL_INTERVAL_MS: i32 = 5000;
+pub const MAX_FETCH_POLL_INTERVAL_MS: i32 = 60_000;
 
 // ===== Protocol Version Constants =====
 
@@ -293,8 +317,12 @@ pub fn get_response_header_version(api_key: i16, api_version: i16) -> i16 {
 
 // ===== Network Hosts =====
 
-/// Default host for production (bind to all interfaces)
-pub const DEFAULT_HOST: &str = "0.0.0.0";
+/// Default bind host: loopback only.
+///
+/// The Kafka listener performs no authentication, so the default must not
+/// expose it to other machines. Operators who need remote clients set
+/// `pg_kafka.host` explicitly (and protect the port with network controls).
+pub const DEFAULT_HOST: &str = "127.0.0.1";
 
 /// Default host for testing (localhost only)
 pub const TEST_HOST: &str = "localhost";
@@ -578,6 +606,30 @@ mod tests {
         assert_eq!(ERROR_UNKNOWN_PRODUCER_ID, 59);
         assert_eq!(ERROR_PRODUCER_FENCED, 90);
         assert_eq!(ERROR_TRANSACTIONAL_ID_NOT_FOUND, 105);
+    }
+
+    #[test]
+    fn test_in_flight_cap_exceeds_long_poll_cap() {
+        // A connection holding its full set of long polls must still be able to read
+        // (and answer) other requests, so the in-flight cap must leave headroom.
+        assert!(MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION > MAX_LONG_POLLS_PER_CONNECTION);
+        assert!(MAX_LONG_POLLS_PER_CONNECTION > 0);
+    }
+
+    #[test]
+    fn test_default_host_is_loopback() {
+        // The listener has no authentication: the out-of-the-box bind must not be
+        // reachable from other hosts.
+        let addr: std::net::IpAddr = DEFAULT_HOST.parse().unwrap();
+        assert!(addr.is_loopback());
+    }
+
+    #[test]
+    fn test_default_fetch_poll_interval_is_a_slow_fallback() {
+        // Idle long polls wake on notifications; the poll interval is only a safety net.
+        assert!(DEFAULT_FETCH_POLL_INTERVAL_MS >= 1000);
+        assert!(MIN_FETCH_POLL_INTERVAL_MS <= DEFAULT_FETCH_POLL_INTERVAL_MS);
+        assert!(DEFAULT_FETCH_POLL_INTERVAL_MS <= MAX_FETCH_POLL_INTERVAL_MS);
     }
 
     #[test]

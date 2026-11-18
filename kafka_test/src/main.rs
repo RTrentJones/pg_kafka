@@ -201,6 +201,10 @@ use kafka_test::{
     test_leave_during_rebalance,
     test_list_offsets_by_timestamp,
     test_list_offsets_empty_topic,
+    test_listener_idle_long_poll_does_not_refetch,
+    test_listener_pipelined_requests_beyond_in_flight_cap,
+    test_listener_produce_wakes_long_poll_promptly,
+    test_listener_read_committed_long_poll_wakes_on_commit,
     test_local_only_mode,
     // Long polling tests
     test_long_poll_auto_commit_interval,
@@ -869,6 +873,31 @@ fn get_all_tests() -> Vec<TestDef> {
             name: "test_producer_restart_new_epoch_records_are_stored",
             test_fn: wrap_test!(test_producer_restart_new_epoch_records_are_stored),
             parallel_safe: true,
+        },
+        // listener stream: timing-sensitive long-poll / pipelining checks run alone.
+        TestDef {
+            category: "error_paths",
+            name: "test_listener_idle_long_poll_does_not_refetch",
+            test_fn: wrap_test!(test_listener_idle_long_poll_does_not_refetch),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_listener_produce_wakes_long_poll_promptly",
+            test_fn: wrap_test!(test_listener_produce_wakes_long_poll_promptly),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_listener_read_committed_long_poll_wakes_on_commit",
+            test_fn: wrap_test!(test_listener_read_committed_long_poll_wakes_on_commit),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_listener_pipelined_requests_beyond_in_flight_cap",
+            test_fn: wrap_test!(test_listener_pipelined_requests_beyond_in_flight_cap),
+            parallel_safe: false,
         },
         TestDef {
             category: "error_paths",

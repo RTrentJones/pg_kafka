@@ -529,7 +529,7 @@ shared_preload_libraries = 'pg_kafka'
 
 -- Read at worker start (GucContext::Postmaster, requires restart)
 pg_kafka.port = 9092              -- TCP port (default: 9092; range 1024-65535)
-pg_kafka.host = '0.0.0.0'         -- Bind address (default: 0.0.0.0)
+pg_kafka.host = '127.0.0.1'       -- Bind address (default: 127.0.0.1 = local clients only; set '0.0.0.0' for all interfaces)
 pg_kafka.database = 'postgres'    -- Database where CREATE EXTENSION pg_kafka was run (default: postgres)
 pg_kafka.log_connections = false  -- Log each connection
 pg_kafka.shutdown_timeout_ms = 5000  -- Listener shutdown timeout (100-60000ms)
@@ -537,7 +537,7 @@ pg_kafka.default_partitions = 1   -- Default partitions for auto-created topics 
 pg_kafka.compression_type = 'none' -- Outbound compression (none, gzip, snappy, lz4, zstd)
 pg_kafka.log_timing = false       -- Enable timing instrumentation for benchmarking
 pg_kafka.enable_long_polling = true  -- Enable long polling for FetchRequest
-pg_kafka.fetch_poll_interval_ms = 100  -- Fallback polling interval (10-5000ms)
+pg_kafka.fetch_poll_interval_ms = 1000 -- Long-poll safety-net re-check (10-60000ms); waiting fetches otherwise wake only on Produce/EndTxn notifications or max_wait_ms
 pg_kafka.run_as_role = 'pgkafka_worker' -- Role the worker switches to once the schema exists ('' = stay bootstrap superuser;
                                           -- a missing role or privilege logs a WARNING and keeps the superuser)
 
@@ -786,6 +786,7 @@ To debug:
 1. Set breakpoints in VS Code
 2. Use the debugger on the Postgres process spawned by `cargo pgrx run`
 3. Check logs with `RUST_LOG=debug cargo pgrx run pg14`
+   (the network thread's `tracing` output goes to the server's stderr; with `RUST_LOG` unset it logs `pg_kafka=warn` and above, and a set `RUST_LOG` replaces that filter)
 
 ### Important pgrx Patterns
 

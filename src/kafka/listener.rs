@@ -55,14 +55,65 @@ use super::shadow::{ForwardAck, ForwardRequest, ShadowConfig, ShadowProducer};
 /// allowed.
 const FRAME_RESERVE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 
-/// Max concurrent long-poll fetch tasks per connection (RV-10 follow-up).
-/// Each long-poll fetch spawns a detached task; without a cap, a client
-/// pipelining fetches could hold MAX_CONNECTIONS × unbounded tasks. Fetches
-/// over the cap are served by the immediate (non-waiting) path — a valid,
-/// possibly-empty response — so the degradation is latency, never an error.
-/// 64 comfortably covers real consumers (rdkafka holds ~1 in-flight fetch per
-/// partition batch) while bounding a hostile pipeliner.
-const MAX_LONG_POLLS_PER_CONNECTION: usize = 64;
+// Max concurrent long-poll fetch tasks per connection (RV-10 follow-up).
+// Each long-poll fetch spawns a detached task; without a cap, a client
+// pipelining fetches could hold MAX_CONNECTIONS × unbounded tasks. Fetches
+// over the cap are served by the immediate (non-waiting) path — a valid,
+// possibly-empty response — so the degradation is latency, never an error.
+// 64 comfortably covers real consumers (rdkafka holds ~1 in-flight fetch per
+// partition batch) while bounding a hostile pipeliner.
+//
+// Max requests per connection read but not yet answered on the socket: see
+// MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION in constants.rs.
+use super::constants::{MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, MAX_LONG_POLLS_PER_CONNECTION};
+
+/// Default `tracing` filter for the network thread when `RUST_LOG` is unset.
+///
+/// The network thread cannot use pgrx logging, so its events go to the
+/// postmaster's stderr (the server log). Warnings — rejected frames, exhausted
+/// budgets, failed shadow forwards, a worker channel that closed — are
+/// operationally relevant and must be visible by default; routine per-request
+/// detail stays at debug.
+const DEFAULT_NETWORK_LOG_FILTER: &str = "pg_kafka=warn";
+
+/// The `tracing` filter directive string for the network thread: `RUST_LOG` when
+/// it is set to something non-empty, otherwise [`DEFAULT_NETWORK_LOG_FILTER`].
+///
+/// (Previously the code appended a hard `pg_kafka=error` directive on top of
+/// `RUST_LOG`, which both hid warnings and overrode `RUST_LOG=pg_kafka=debug`.)
+fn network_log_filter(rust_log: Option<&str>) -> String {
+    match rust_log.map(str::trim) {
+        Some(v) if !v.is_empty() => v.to_string(),
+        _ => DEFAULT_NETWORK_LOG_FILTER.to_string(),
+    }
+}
+
+/// Install the global `tracing` subscriber for the network thread (stderr).
+///
+/// Called once by the worker before the tokio runtime starts. A second call (e.g.
+/// after an in-process restart) is a no-op because `try_init` refuses to replace
+/// an installed subscriber.
+pub fn init_network_tracing() {
+    let directives = network_log_filter(std::env::var("RUST_LOG").ok().as_deref());
+    let filter = tracing_subscriber::EnvFilter::try_new(&directives)
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(DEFAULT_NETWORK_LOG_FILTER));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .with_writer(std::io::stderr)
+        .try_init();
+}
+
+/// Whether an I/O error is just the peer going away (reset / broken pipe /
+/// aborted / EOF mid-frame). Those are routine for a broker and logged at
+/// debug; anything else (oversized frame, exhausted budget, ...) is a warning.
+fn is_peer_disconnect(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::*;
+    matches!(
+        e.kind(),
+        ConnectionReset | ConnectionAborted | BrokenPipe | UnexpectedEof | NotConnected
+    )
+}
 
 static FRAME_RESERVE_REMAINING: AtomicUsize = AtomicUsize::new(FRAME_RESERVE_BUDGET_BYTES);
 
@@ -394,6 +445,10 @@ pub async fn run(
 
             match result {
                 Ok(Ok(notification)) => match notification {
+                    InternalNotification::TransactionEnded => {
+                        debug!("Notification: transaction ended, waking read_committed waiters");
+                        registry_for_notifier.notify_transaction_ended().await;
+                    }
                     InternalNotification::NewMessages {
                         topic_name,
                         topic_id,
@@ -584,8 +639,23 @@ async fn handle_connection(
     // order. The writer fully drains one request's channel (closed when the
     // request's sender is dropped) before moving to the next, guaranteeing
     // responses are written in request order.
-    type ResponseSlot = tokio::sync::mpsc::UnboundedReceiver<KafkaResponse>;
+    //
+    // Each queued slot carries an in-flight permit that the writer drops only
+    // after the slot's response has been written to the socket. The reader
+    // acquires a permit before reading the next frame, so at most
+    // MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION requests per connection are read but
+    // unanswered. A client that pipelines without reading responses fills its
+    // TCP receive window, the writer blocks, permits stop coming back, and the
+    // reader stops reading: the connection's memory is bounded and the
+    // backpressure reaches the client through TCP.
+    type ResponseSlot = (
+        tokio::sync::mpsc::UnboundedReceiver<KafkaResponse>,
+        tokio::sync::OwnedSemaphorePermit,
+    );
     let (order_tx, mut order_rx) = tokio::sync::mpsc::unbounded_channel::<ResponseSlot>();
+    let in_flight = Arc::new(tokio::sync::Semaphore::new(
+        MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION,
+    ));
 
     // RV-10 follow-up: each long-poll fetch spawns a detached task, previously
     // bounded only by MAX_CONNECTIONS × the client's pipelining rate. Cap the
@@ -598,7 +668,7 @@ async fn handle_connection(
     // This task sits and waits for responses from the DB.
     // It runs completely independently of the reader.
     let writer_handle: tokio::task::JoinHandle<Result<(), String>> = tokio::spawn(async move {
-        while let Some(mut slot) = order_rx.recv().await {
+        while let Some((mut slot, _in_flight_permit)) = order_rx.recv().await {
             // A request yields at most one response; one that yields none
             // (acks=0 produce) closes the channel without sending and is
             // skipped here.
@@ -617,22 +687,39 @@ async fn handle_connection(
                     response_bytes.len()
                 );
                 if let Err(e) = writer.send(response_bytes.freeze()).await {
-                    warn!("Failed to send response to client: {}", e);
+                    if is_peer_disconnect(&e) {
+                        debug!("Client went away while sending response: {}", e);
+                    } else {
+                        warn!("Failed to send response to client: {}", e);
+                    }
                     return Err(format!("Write error: {}", e));
                 }
                 debug!("Response sent to client successfully");
             }
+            // `_in_flight_permit` drops here: this request's response (if any) is
+            // on the socket, so the reader may read one more frame.
         }
         Ok(())
     });
 
     // Run the Reader Loop (Main Task)
     // This loop ONLY reads and dispatches. It never waits for the DB response.
-    while let Some(frame_result) = reader.next().await {
-        let frame = match frame_result {
-            Ok(f) => f,
-            Err(e) => {
-                warn!("Error reading frame: {}", e);
+    loop {
+        // Backpressure: wait for an in-flight slot before reading the next frame.
+        // The semaphore is never closed, so acquire only fails if that changes.
+        let in_flight_permit = match in_flight.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => break,
+        };
+        let frame = match reader.next().await {
+            None => break,
+            Some(Ok(f)) => f,
+            Some(Err(e)) => {
+                if is_peer_disconnect(&e) {
+                    debug!("Client disconnected mid-frame: {}", e);
+                } else {
+                    warn!("Error reading frame: {}", e);
+                }
                 break;
             }
         };
@@ -643,7 +730,7 @@ async fn handle_connection(
         // the writer BEFORE dispatching, so the writer's output order is
         // fixed by request arrival order.
         let (response_tx, response_rx) = tokio::sync::mpsc::unbounded_channel();
-        if order_tx.send(response_rx).is_err() {
+        if order_tx.send((response_rx, in_flight_permit)).is_err() {
             warn!("Writer task gone, closing connection");
             break;
         }
@@ -795,14 +882,21 @@ async fn send_with_backpressure<T>(tx: &Sender<T>, mut item: T) -> bool {
 
 /// Handle a FetchRequest with long polling support
 ///
-/// This function implements the long polling logic:
-/// 1. Send fetch to worker
-/// 2. Check if response has enough data (>= min_bytes)
-/// 3. If not enough data and timeout not reached:
-///    - Register with registry for notifications
-///    - Wait for notification or poll interval
-///    - Re-send fetch
-/// 4. Forward final response to writer
+/// The fetch is re-run only when there is reason to expect new data:
+/// 1. Register every requested topic-partition in the registry (one shared
+///    `Notify`) BEFORE the first fetch attempt, and keep the registration for
+///    the whole long poll. A notification that lands while an attempt is in
+///    flight leaves a stored permit on the `Notify`, so there is no missed
+///    wake-up window between "fetch returned too little" and "start waiting".
+/// 2. Send the fetch to the worker; return it if it meets `min_bytes`, carries a
+///    partition error, or the deadline has passed.
+/// 3. Otherwise wait for a new-data notification (Produce for this partition,
+///    or EndTxn for a `read_committed` fetch), the deadline, or the slow
+///    safety-net interval `poll_interval_ms` (for a dropped notification or data
+///    that became visible without one), then go to 2.
+///
+/// An idle long poll therefore costs one fetch at the start, one per safety-net
+/// interval (default 1 s), and one at the deadline, instead of one per 100 ms.
 #[allow(clippy::too_many_arguments)]
 async fn handle_fetch_long_poll(
     correlation_id: i32,
@@ -818,14 +912,79 @@ async fn handle_fetch_long_poll(
     registry: Arc<PendingFetchRegistry>,
     poll_interval_ms: i32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let deadline = Instant::now() + Duration::from_millis(max_wait_ms as u64);
-    let poll_interval = Duration::from_millis(poll_interval_ms as u64);
+    let deadline = Instant::now() + Duration::from_millis(max_wait_ms.max(0) as u64);
+    let poll_interval = Duration::from_millis(poll_interval_ms.max(1) as u64);
+    let read_committed = isolation_level == 1;
 
+    // The client is gone (its connection's writer, which owns the response slot,
+    // has been torn down): do nothing rather than queue work for the DB thread.
+    if final_response_tx.is_closed() {
+        debug!("Long poll: client disconnected, abandoning fetch");
+        return Ok(());
+    }
+
+    let notify = Arc::new(tokio::sync::Notify::new());
+    for topic in &topic_data {
+        for partition in &topic.partitions {
+            registry
+                .register(
+                    &topic.name,
+                    partition.partition_index,
+                    partition.fetch_offset,
+                    notify.clone(),
+                    read_committed,
+                )
+                .await;
+        }
+    }
+
+    let result = long_poll_loop(
+        correlation_id,
+        client_id,
+        api_version,
+        max_bytes,
+        min_bytes,
+        isolation_level,
+        &topic_data,
+        &request_tx,
+        &final_response_tx,
+        &notify,
+        deadline,
+        poll_interval,
+    )
+    .await;
+
+    // Always drop our registrations, whatever the outcome.
+    for topic in &topic_data {
+        for partition in &topic.partitions {
+            registry
+                .unregister(&topic.name, partition.partition_index, &notify)
+                .await;
+        }
+    }
+
+    result
+}
+
+/// The fetch / wait loop of [`handle_fetch_long_poll`]; the caller owns the
+/// registry registration around it.
+#[allow(clippy::too_many_arguments)]
+async fn long_poll_loop(
+    correlation_id: i32,
+    client_id: Option<String>,
+    api_version: i16,
+    max_bytes: i32,
+    min_bytes: i32,
+    isolation_level: i8,
+    topic_data: &[TopicFetchData],
+    request_tx: &Sender<KafkaRequest>,
+    final_response_tx: &UnboundedSender<KafkaResponse>,
+    notify: &tokio::sync::Notify,
+    deadline: Instant,
+    poll_interval: Duration,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     loop {
-        // The client is gone (its connection's writer, which owns the response slot,
-        // has been torn down): stop instead of re-fetching on the DB thread until
-        // max_wait_ms runs out. Otherwise each disconnect could leave up to
-        // MAX_LONG_POLLS_PER_CONNECTION orphaned tasks polling for up to ~24 days.
+        // Stop instead of re-fetching for a client that has disconnected.
         if final_response_tx.is_closed() {
             debug!("Long poll: client disconnected, abandoning fetch");
             return Ok(());
@@ -843,13 +1002,13 @@ async fn handle_fetch_long_poll(
             min_bytes: 0,   // Accept any amount of data
             max_bytes,
             isolation_level,
-            topic_data: topic_data.clone(),
+            topic_data: topic_data.to_vec(),
             response_tx: inner_tx,
         };
 
         // Send to worker (SEC-4: non-blocking handoff)
-        if !send_with_backpressure(&request_tx, fetch_request).await {
-            error!("Worker channel closed during long poll");
+        if !send_with_backpressure(request_tx, fetch_request).await {
+            warn!("Worker channel closed during long poll");
             return Err("Worker channel closed".into());
         }
 
@@ -857,7 +1016,7 @@ async fn handle_fetch_long_poll(
         let response = match inner_rx.recv().await {
             Some(resp) => resp,
             None => {
-                error!("Response channel closed during long poll");
+                warn!("Response channel closed during long poll");
                 return Err("Response channel closed".into());
             }
         };
@@ -876,41 +1035,23 @@ async fn handle_fetch_long_poll(
             || min_bytes <= 0
             || response_has_partition_error(&response)
         {
-            // Enough data - forward to client
             debug!("Long poll: min_bytes threshold met, returning response");
             let _ = final_response_tx.send(response);
             return Ok(());
         }
 
-        // Check timeout
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            // Timeout reached - return whatever we have
             debug!("Long poll: timeout reached, returning response");
             let _ = final_response_tx.send(response);
             return Ok(());
         }
 
-        // Not enough data and not timed out. QA-5: register every requested topic-partition on one
-        // shared Notify, then wait for either a produce notification (low latency) or the poll
-        // interval. The poll interval is retained as a correctness fallback — if a wake-up is ever
-        // missed (e.g. a produce lands in the brief window between this fetch and registration), the
-        // behaviour degrades to exactly the previous fixed-interval polling rather than stalling.
+        // Not enough data and not timed out: wait for a wake-up. The deadline
+        // wait is exact (the final re-fetch happens at max_wait_ms); the
+        // safety-net interval only bounds how long a missed notification can
+        // delay delivery.
         let wait_time = remaining.min(poll_interval);
-        let notify = Arc::new(tokio::sync::Notify::new());
-        for topic in &topic_data {
-            for partition in &topic.partitions {
-                registry
-                    .register(
-                        &topic.name,
-                        partition.partition_index,
-                        partition.fetch_offset,
-                        notify.clone(),
-                    )
-                    .await;
-            }
-        }
-
         debug!(
             "Long poll: waiting up to {:?} for new-data notification (remaining: {:?})",
             wait_time, remaining
@@ -921,19 +1062,10 @@ async fn handle_fetch_long_poll(
                 debug!("Long poll: woken by new-data notification");
             }
             _ = tokio::time::sleep(wait_time) => {
-                debug!("Long poll: poll interval elapsed, re-fetching");
+                debug!("Long poll: deadline or safety-net interval elapsed, re-fetching");
             }
             _ = final_response_tx.closed() => {
                 debug!("Long poll: client disconnected while waiting");
-            }
-        }
-
-        // Clean up our registrations before the next iteration (or return).
-        for topic in &topic_data {
-            for partition in &topic.partitions {
-                registry
-                    .unregister(&topic.name, partition.partition_index, &notify)
-                    .await;
             }
         }
     }
@@ -1067,6 +1199,348 @@ mod tests {
         assert!(
             request_rx.try_recv().is_err(),
             "no fetch may reach the worker for a disconnected client"
+        );
+    }
+
+    // ===== Network-thread logging =====
+
+    #[test]
+    fn test_network_log_filter_defaults_to_warn() {
+        assert_eq!(network_log_filter(None), "pg_kafka=warn");
+        assert_eq!(network_log_filter(Some("")), "pg_kafka=warn");
+        assert_eq!(network_log_filter(Some("   ")), "pg_kafka=warn");
+        // The default must parse as a filter.
+        assert!(tracing_subscriber::EnvFilter::try_new(DEFAULT_NETWORK_LOG_FILTER).is_ok());
+    }
+
+    #[test]
+    fn test_network_log_filter_honours_rust_log() {
+        // RUST_LOG used to be overridden by a hard `pg_kafka=error` directive.
+        assert_eq!(network_log_filter(Some("pg_kafka=debug")), "pg_kafka=debug");
+    }
+
+    #[test]
+    fn test_peer_disconnect_classification() {
+        use std::io::{Error, ErrorKind};
+        assert!(is_peer_disconnect(&Error::from(ErrorKind::ConnectionReset)));
+        assert!(is_peer_disconnect(&Error::from(ErrorKind::BrokenPipe)));
+        assert!(is_peer_disconnect(&Error::from(ErrorKind::UnexpectedEof)));
+        assert!(!is_peer_disconnect(&Error::other(
+            "aggregate request reservation budget exhausted"
+        )));
+        assert!(!is_peer_disconnect(&Error::from(ErrorKind::InvalidData)));
+    }
+
+    // ===== Long poll: wake only on notification / deadline / safety net =====
+
+    fn one_partition_topic(name: &str) -> TopicFetchData {
+        TopicFetchData {
+            name: name.to_string(),
+            partitions: vec![super::super::messages::PartitionFetchData {
+                partition_index: 0,
+                fetch_offset: 0,
+                partition_max_bytes: 1024,
+            }],
+        }
+    }
+
+    fn fetch_response(with_records: bool) -> KafkaResponse {
+        use kafka_protocol::messages::fetch_response::{
+            FetchResponse, FetchableTopicResponse, PartitionData,
+        };
+        let mut response = FetchResponse::default();
+        if with_records {
+            let mut partition = PartitionData::default();
+            partition.records = Some(Bytes::from_static(b"some-record-bytes"));
+            let mut topic = FetchableTopicResponse::default();
+            topic.partitions = vec![partition];
+            response.responses = vec![topic];
+        }
+        KafkaResponse::Fetch {
+            correlation_id: 1,
+            api_version: 4,
+            response,
+        }
+    }
+
+    /// Fake DB thread: answers every Fetch it receives. `before_answer(n)` runs before
+    /// answering the n-th fetch (1-based) and returns whether that answer carries records.
+    /// Returns a counter of fetches served.
+    fn spawn_fake_fetch_worker<F, Fut>(
+        rx: crossbeam_channel::Receiver<KafkaRequest>,
+        before_answer: F,
+    ) -> Arc<AtomicUsize>
+    where
+        F: Fn(usize) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = bool> + Send,
+    {
+        let served = Arc::new(AtomicUsize::new(0));
+        let served_out = served.clone();
+        tokio::spawn(async move {
+            loop {
+                match rx.try_recv() {
+                    Ok(KafkaRequest::Fetch { response_tx, .. }) => {
+                        let n = served.fetch_add(1, Ordering::SeqCst) + 1;
+                        let with_records = before_answer(n).await;
+                        let _ = response_tx.send(fetch_response(with_records));
+                    }
+                    Ok(_) => {}
+                    Err(crossbeam_channel::TryRecvError::Empty) => {
+                        tokio::time::sleep(Duration::from_millis(1)).await
+                    }
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => return,
+                }
+            }
+        });
+        served_out
+    }
+
+    #[tokio::test]
+    async fn test_idle_long_poll_does_not_refetch_until_deadline() {
+        // With no notification and a safety-net interval longer than max_wait, an idle long
+        // poll runs exactly two fetches: the initial attempt and the one at the deadline. The
+        // old loop re-fetched every fetch_poll_interval_ms (100 ms → ~7 fetches here).
+        let (request_tx, request_rx) = crossbeam_channel::bounded::<KafkaRequest>(16);
+        let served = spawn_fake_fetch_worker(request_rx, |_| async { false });
+        let (final_tx, mut final_rx) = tokio::sync::mpsc::unbounded_channel();
+        let registry = Arc::new(PendingFetchRegistry::new());
+
+        let started = Instant::now();
+        handle_fetch_long_poll(
+            1,
+            None,
+            4,
+            600,
+            1,
+            1024,
+            0,
+            vec![one_partition_topic("t")],
+            request_tx,
+            final_tx,
+            registry.clone(),
+            10_000,
+        )
+        .await
+        .unwrap();
+
+        assert!(started.elapsed() >= Duration::from_millis(600));
+        assert!(final_rx.try_recv().is_ok(), "the deadline response is sent");
+        assert_eq!(served.load(Ordering::SeqCst), 2);
+        assert!(registry.is_empty().await, "registrations are removed");
+    }
+
+    #[tokio::test]
+    async fn test_long_poll_safety_net_interval_still_refetches() {
+        // Data that becomes visible without a notification is picked up at the safety-net
+        // interval, well before max_wait_ms.
+        let (request_tx, request_rx) = crossbeam_channel::bounded::<KafkaRequest>(16);
+        let served = spawn_fake_fetch_worker(request_rx, |n| async move { n >= 2 });
+        let (final_tx, mut final_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let started = Instant::now();
+        handle_fetch_long_poll(
+            1,
+            None,
+            4,
+            10_000,
+            1,
+            1024,
+            0,
+            vec![one_partition_topic("t")],
+            request_tx,
+            final_tx,
+            Arc::new(PendingFetchRegistry::new()),
+            200,
+        )
+        .await
+        .unwrap();
+
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_millis(200), "waited {elapsed:?}");
+        assert!(elapsed < Duration::from_secs(3), "waited {elapsed:?}");
+        assert_eq!(served.load(Ordering::SeqCst), 2);
+        assert!(calculate_response_bytes(&final_rx.try_recv().unwrap()) > 0);
+    }
+
+    #[tokio::test]
+    async fn test_notification_during_fetch_attempt_is_not_missed() {
+        // Missed-wakeup window: the produce notification lands while the first fetch attempt is
+        // still on the DB thread (it returned "no data"). The long poll registered before that
+        // attempt, so the wake-up is kept and the record is returned at once — not after the
+        // safety-net interval (10 s here) or max_wait_ms (10 s).
+        let (request_tx, request_rx) = crossbeam_channel::bounded::<KafkaRequest>(16);
+        let registry = Arc::new(PendingFetchRegistry::new());
+        let reg = registry.clone();
+        let served = spawn_fake_fetch_worker(request_rx, move |n| {
+            let reg = reg.clone();
+            async move {
+                if n == 1 {
+                    reg.notify_new_data("t", 0, 1).await;
+                    false
+                } else {
+                    true
+                }
+            }
+        });
+        let (final_tx, mut final_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let started = Instant::now();
+        handle_fetch_long_poll(
+            1,
+            None,
+            4,
+            10_000,
+            1,
+            1024,
+            0,
+            vec![one_partition_topic("t")],
+            request_tx,
+            final_tx,
+            registry.clone(),
+            10_000,
+        )
+        .await
+        .unwrap();
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(served.load(Ordering::SeqCst), 2);
+        assert!(calculate_response_bytes(&final_rx.try_recv().unwrap()) > 0);
+        assert!(registry.is_empty().await);
+    }
+
+    #[tokio::test]
+    async fn test_read_committed_long_poll_wakes_on_transaction_end() {
+        // EndTxn → TransactionEnded wakes a read_committed long poll promptly.
+        let (request_tx, request_rx) = crossbeam_channel::bounded::<KafkaRequest>(16);
+        let registry = Arc::new(PendingFetchRegistry::new());
+        let reg = registry.clone();
+        let served = spawn_fake_fetch_worker(request_rx, move |n| {
+            let reg = reg.clone();
+            async move {
+                if n == 1 {
+                    // Simulate the commit landing (after the first attempt saw nothing).
+                    let reg = reg.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+                        reg.notify_transaction_ended().await;
+                    });
+                    false
+                } else {
+                    true
+                }
+            }
+        });
+        let (final_tx, mut final_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let started = Instant::now();
+        handle_fetch_long_poll(
+            1,
+            None,
+            4,
+            10_000,
+            1,
+            1024,
+            1, // read_committed
+            vec![one_partition_topic("t")],
+            request_tx,
+            final_tx,
+            registry,
+            10_000,
+        )
+        .await
+        .unwrap();
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(served.load(Ordering::SeqCst), 2);
+        assert!(calculate_response_bytes(&final_rx.try_recv().unwrap()) > 0);
+    }
+
+    // ===== Per-connection in-flight bound =====
+
+    /// An ApiVersions v0 request frame ([size][api_key][api_version][corr][client_id=null]).
+    fn api_versions_v0_frame(correlation_id: i32) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&18i16.to_be_bytes());
+        body.extend_from_slice(&0i16.to_be_bytes());
+        body.extend_from_slice(&correlation_id.to_be_bytes());
+        body.extend_from_slice(&(-1i16).to_be_bytes());
+        let mut frame = (body.len() as i32).to_be_bytes().to_vec();
+        frame.extend_from_slice(&body);
+        frame
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_connection_bounds_in_flight_requests() {
+        use tokio::io::AsyncWriteExt;
+
+        // A client pipelines CAP + 20 requests. The fake DB thread holds every request
+        // (unanswered), so no response slot completes: the reader must stop after exactly CAP
+        // requests instead of reading (and buffering) all of them. Releasing the held requests
+        // frees the slots and the rest flow through.
+        const EXTRA: usize = 20;
+        let total = MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION + EXTRA;
+
+        let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        let (main_tx, main_rx) = crossbeam_channel::bounded::<KafkaRequest>(10_000);
+        let (liveness_tx, _liveness_rx) = crossbeam_channel::bounded::<KafkaRequest>(16);
+        let lanes = crate::kafka::RequestLanes {
+            main: main_tx,
+            liveness: liveness_tx,
+        };
+        tokio::spawn(async move {
+            let (socket, _) = server.accept().await.unwrap();
+            let _ = handle_connection(
+                socket,
+                lanes,
+                Arc::new(PendingFetchRegistry::new()),
+                false,
+                1000,
+                false,
+            )
+            .await;
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut bytes = Vec::new();
+        for i in 0..total {
+            bytes.extend_from_slice(&api_versions_v0_frame(i as i32));
+        }
+        client.write_all(&bytes).await.unwrap();
+        client.flush().await.unwrap();
+
+        // Collect what reaches the "DB thread" while holding every request.
+        let mut held = Vec::new();
+        let collect_until = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < collect_until {
+            while let Ok(req) = main_rx.try_recv() {
+                held.push(req);
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            held.len(),
+            MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION,
+            "the reader must stop at the in-flight cap"
+        );
+
+        // Dropping the requests closes their response slots (no response, like acks=0), which
+        // returns the permits; the remaining requests are then read.
+        let first_batch = held.len();
+        held.clear();
+        let mut released = 0usize;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while first_batch + released < total && Instant::now() < deadline {
+            while let Ok(req) = main_rx.try_recv() {
+                drop(req);
+                released += 1;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            first_batch + released,
+            total,
+            "all requests flow once slots free"
         );
     }
 

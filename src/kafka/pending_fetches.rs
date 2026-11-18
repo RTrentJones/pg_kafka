@@ -54,6 +54,9 @@ pub struct PendingFetch {
     /// The offset this fetch is waiting from
     /// Used to determine if new data is relevant (high_watermark > fetch_offset)
     pub fetch_offset: i64,
+    /// Whether the fetch uses `read_committed` isolation; such fetches are also
+    /// woken when a transaction ends (see [`PendingFetchRegistry::notify_transaction_ended`]).
+    pub read_committed: bool,
 }
 
 /// Registry of pending fetch requests waiting for data
@@ -83,27 +86,33 @@ impl PendingFetchRegistry {
     /// Register a pending fetch for a topic-partition.
     ///
     /// The caller supplies the `Notify` so that a single FetchRequest spanning several
-    /// topic-partitions can register one shared handle under each key and `await` it once. The
-    /// caller should register every requested partition, then await the handle (with a poll-interval
-    /// timeout) and re-fetch, then `unregister`.
+    /// topic-partitions can register one shared handle under each key and `await` it once.
+    ///
+    /// The caller should register every requested partition BEFORE its first fetch attempt and
+    /// keep the registration until the long poll ends, then `unregister`. `Notify::notify_one`
+    /// stores a permit when nobody is awaiting, so a notification that arrives while a fetch
+    /// attempt is in flight is not lost: the next `notified().await` returns at once.
     ///
     /// # Arguments
     /// * `topic_name` - The topic name (as the client sees it)
     /// * `partition_id` - The partition ID
     /// * `fetch_offset` - The offset being fetched from (for relevance filtering)
     /// * `notify` - The shared handle to wake when data arrives for this partition
+    /// * `read_committed` - Whether the fetch uses `read_committed` isolation
     pub async fn register(
         &self,
         topic_name: &str,
         partition_id: i32,
         fetch_offset: i64,
         notify: Arc<Notify>,
+        read_committed: bool,
     ) {
         let key = TopicPartitionKey::new(topic_name, partition_id);
 
         let pending = PendingFetch {
             notify,
             fetch_offset,
+            read_committed,
         };
 
         let mut guard = self.inner.write().await;
@@ -130,6 +139,20 @@ impl PendingFetchRegistry {
                 if high_watermark > pending.fetch_offset {
                     pending.notify.notify_one();
                 }
+            }
+        }
+    }
+
+    /// Wake every waiting `read_committed` fetch because a transaction ended.
+    ///
+    /// EndTxn (commit or abort) can advance the last stable offset of any partition the
+    /// transaction wrote to; the notification does not say which, so every `read_committed`
+    /// waiter is woken once and re-fetches. `read_uncommitted` waiters are left alone.
+    pub async fn notify_transaction_ended(&self) {
+        let guard = self.inner.read().await;
+        for pending in guard.values().flatten() {
+            if pending.read_committed {
+                pending.notify.notify_one();
             }
         }
     }
@@ -185,7 +208,9 @@ mod tests {
 
         // Register a pending fetch
         let notify = Arc::new(Notify::new());
-        registry.register("topic-a", 0, 0, notify.clone()).await;
+        registry
+            .register("topic-a", 0, 0, notify.clone(), false)
+            .await;
 
         assert_eq!(registry.len().await, 1);
 
@@ -203,7 +228,9 @@ mod tests {
 
         // Register for partition 0
         let notify = Arc::new(Notify::new());
-        registry.register("topic-a", 0, 0, notify.clone()).await;
+        registry
+            .register("topic-a", 0, 0, notify.clone(), false)
+            .await;
 
         // Notify partition 1 - should NOT wake partition 0
         registry.notify_new_data("topic-a", 1, 10).await;
@@ -220,7 +247,9 @@ mod tests {
         // QA-5: the registry is keyed by topic name, so a produce to a different topic must not
         // wake a waiter on this one.
         let notify = Arc::new(Notify::new());
-        registry.register("topic-a", 0, 0, notify.clone()).await;
+        registry
+            .register("topic-a", 0, 0, notify.clone(), false)
+            .await;
 
         registry.notify_new_data("topic-b", 0, 10).await;
 
@@ -237,7 +266,9 @@ mod tests {
 
         // Register waiting from offset 100
         let notify = Arc::new(Notify::new());
-        registry.register("topic-a", 0, 100, notify.clone()).await;
+        registry
+            .register("topic-a", 0, 100, notify.clone(), false)
+            .await;
 
         // Notify with high watermark 50 - should NOT wake (already past that)
         registry.notify_new_data("topic-a", 0, 50).await;
@@ -260,7 +291,9 @@ mod tests {
         let registry = PendingFetchRegistry::new();
 
         let notify = Arc::new(Notify::new());
-        registry.register("topic-a", 0, 0, notify.clone()).await;
+        registry
+            .register("topic-a", 0, 0, notify.clone(), false)
+            .await;
         assert_eq!(registry.len().await, 1);
 
         registry.unregister("topic-a", 0, &notify).await;
@@ -275,9 +308,15 @@ mod tests {
         let notify1 = Arc::new(Notify::new());
         let notify2 = Arc::new(Notify::new());
         let notify3 = Arc::new(Notify::new());
-        registry.register("topic-a", 0, 0, notify1.clone()).await;
-        registry.register("topic-a", 0, 5, notify2.clone()).await;
-        registry.register("topic-a", 0, 10, notify3.clone()).await;
+        registry
+            .register("topic-a", 0, 0, notify1.clone(), false)
+            .await;
+        registry
+            .register("topic-a", 0, 5, notify2.clone(), false)
+            .await;
+        registry
+            .register("topic-a", 0, 10, notify3.clone(), false)
+            .await;
 
         assert_eq!(registry.len().await, 3);
 
@@ -294,6 +333,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_transaction_ended_wakes_only_read_committed_waiters() {
+        let registry = PendingFetchRegistry::new();
+
+        let committed = Arc::new(Notify::new());
+        let uncommitted = Arc::new(Notify::new());
+        registry
+            .register("topic-a", 0, 0, committed.clone(), true)
+            .await;
+        registry
+            .register("topic-b", 3, 7, uncommitted.clone(), false)
+            .await;
+
+        registry.notify_transaction_ended().await;
+
+        let woke = timeout(Duration::from_millis(100), committed.notified()).await;
+        assert!(woke.is_ok(), "read_committed waiter must wake on EndTxn");
+        let woke = timeout(Duration::from_millis(50), uncommitted.notified()).await;
+        assert!(
+            woke.is_err(),
+            "read_uncommitted waiter must not wake on EndTxn"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_notification_before_await_is_not_lost() {
+        // The long poll registers before its fetch attempt; a notification that lands while
+        // the attempt is in flight (nobody awaiting yet) must still wake the next await.
+        let registry = PendingFetchRegistry::new();
+        let notify = Arc::new(Notify::new());
+        registry
+            .register("topic-a", 0, 0, notify.clone(), false)
+            .await;
+
+        registry.notify_new_data("topic-a", 0, 1).await; // no one awaiting yet
+
+        let woke = timeout(Duration::from_millis(100), notify.notified()).await;
+        assert!(woke.is_ok(), "a stored wake-up permit must not be lost");
+    }
+
+    #[tokio::test]
     async fn test_concurrent_register_notify() {
         let registry = Arc::new(PendingFetchRegistry::new());
 
@@ -303,7 +382,8 @@ mod tests {
             let reg = registry.clone();
             handles.push(tokio::spawn(async move {
                 let notify = Arc::new(Notify::new());
-                reg.register("topic-a", 0, i as i64, notify.clone()).await;
+                reg.register("topic-a", 0, i as i64, notify.clone(), false)
+                    .await;
                 timeout(Duration::from_millis(500), notify.notified()).await
             }));
         }

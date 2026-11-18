@@ -479,16 +479,8 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     let network_handle = std::thread::Builder::new()
         .name("pg_kafka-net".to_string())
         .spawn(move || {
-            // Initialize tracing subscriber for this thread
-            // Use error level to reduce log output in production
-            // Enable with RUST_LOG=pg_kafka=debug for debugging
-            let _ = tracing_subscriber::fmt()
-                .with_env_filter(
-                    tracing_subscriber::EnvFilter::from_default_env()
-                        .add_directive("pg_kafka=error".parse().unwrap()),
-                )
-                .with_target(false)
-                .try_init();
+            // Network-thread logging to stderr: warnings by default, RUST_LOG overrides.
+            crate::kafka::listener::init_network_tracing();
 
             // Create multi-threaded tokio runtime
             let rt = match tokio::runtime::Builder::new_multi_thread()
@@ -1244,6 +1236,18 @@ fn emit_produce_notifications(
     }
 }
 
+/// Wake `read_committed` long-poll consumers after a successful EndTxn (commit or abort), which
+/// can advance the last stable offset of every partition the transaction wrote. Best-effort like
+/// [`emit_produce_notifications`]: a dropped wake-up only delays delivery to the fallback poll.
+fn emit_txn_end_notification(
+    notify_tx: &crossbeam_channel::Sender<crate::kafka::InternalNotification>,
+) {
+    notify_best_effort(
+        notify_tx,
+        crate::kafka::InternalNotification::TransactionEnded,
+    );
+}
+
 /// # Testing
 /// This function is public to allow unit testing, but is not part of the
 /// public API and should not be called directly by external code.
@@ -1960,6 +1964,8 @@ pub fn process_request(
                     producer_epoch,
                     committed,
                 )
+                // Wake read_committed long polls: commit/abort moves the LSO.
+                .inspect(|_| emit_txn_end_notification(notify_tx))
             },
             |r| KafkaResponse::EndTxn {
                 correlation_id,
@@ -2313,5 +2319,18 @@ mod tests {
             Duration::from_secs(150),
             Some(Duration::from_secs(120))
         ));
+    }
+
+    #[test]
+    fn test_emit_txn_end_notification_sends_transaction_ended() {
+        let (tx, rx) = crossbeam_channel::bounded::<InternalNotification>(1);
+        emit_txn_end_notification(&tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(InternalNotification::TransactionEnded)
+        ));
+        // Full channel: dropped, never blocks the DB thread.
+        emit_txn_end_notification(&tx);
+        emit_txn_end_notification(&tx);
     }
 }
