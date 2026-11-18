@@ -318,6 +318,12 @@ use kafka_test::{
     test_failed_request_rolls_back_alone, test_group_commit_concurrent_acks_visible,
     test_group_commit_pipelined_produces_in_order, test_worker_restarts_after_terminate,
 };
+// Stream `part` (wave 2): time-partitioned kafka.messages
+use kafka_test::{
+    test_time_partition_maintenance_and_least_privilege,
+    test_time_partition_retention_drops_whole_partitions,
+    test_time_partition_retention_waits_for_pending_transaction,
+};
 
 type TestFn = fn() -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error>>> + Send>>;
 
@@ -1896,6 +1902,26 @@ fn get_all_tests() -> Vec<TestDef> {
             name: "test_response_ordering_with_long_poll",
             test_fn: wrap_test!(test_response_ordering_with_long_poll),
             parallel_safe: false, // timing-sensitive: asserts long-poll wait duration
+        },
+        // Stream `part` (wave 2): time partitions. NOT parallel safe: they create and
+        // drop leaves of kafka.messages and run the retention sweep.
+        TestDef {
+            category: "part",
+            name: "test_time_partition_retention_drops_whole_partitions",
+            test_fn: wrap_test!(test_time_partition_retention_drops_whole_partitions),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "part",
+            name: "test_time_partition_retention_waits_for_pending_transaction",
+            test_fn: wrap_test!(test_time_partition_retention_waits_for_pending_transaction),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "part",
+            name: "test_time_partition_maintenance_and_least_privilege",
+            test_fn: wrap_test!(test_time_partition_maintenance_and_least_privilege),
+            parallel_safe: false,
         },
     ]
 }
