@@ -161,7 +161,7 @@ fn plain_token(user: &str, password: &str) -> Vec<u8> {
     format!("\0{}\0{}", user, password).into_bytes()
 }
 
-/// SASL_PLAINTEXT + PLAIN: produce/consume round trip; Metadata advertises 9093.
+/// SASL_PLAINTEXT + PLAIN: produce/consume round trip; Metadata advertises 19093.
 pub async fn test_auth_sasl_plain_roundtrip() -> TestResult {
     println!("=== Test: SASL_PLAINTEXT PLAIN round trip ===\n");
     auth_env().await?;

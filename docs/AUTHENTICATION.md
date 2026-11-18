@@ -236,8 +236,8 @@ ssl.key.location=/etc/pg_kafka/client.key
   (`cargo test --lib kafka::auth`).
 * E2E: the `auth` category in `kafka_test` (`cargo run --release -- --category auth`).
   It generates a throwaway CA and certificates with the `openssl` CLI, adds
-  `SASL_PLAINTEXT://127.0.0.1:9093`, `SSL://127.0.0.1:9094` and
-  `SASL_SSL://127.0.0.1:9095` through `ALTER SYSTEM`, restarts the listener worker,
+  `SASL_PLAINTEXT://127.0.0.1:19093`, `SSL://127.0.0.1:19094` and
+  `SASL_SSL://127.0.0.1:19095` through `ALTER SYSTEM`, restarts the listener worker,
   runs real rdkafka clients (PLAIN, SCRAM-SHA-256/512, TLS, an untrusted CA, mutual TLS,
   SASL_SSL, wrong passwords, unauthenticated requests) and resets everything at the end.
   It must run on the database host as a superuser with `openssl` on PATH. The

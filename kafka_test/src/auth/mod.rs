@@ -5,9 +5,9 @@
 //! unauthenticated. These tests add three listeners next to it, through the
 //! `pg_kafka.additional_listeners` GUC:
 //!
-//! * `SASL_PLAINTEXT://127.0.0.1:9093`
-//! * `SSL://127.0.0.1:9094`
-//! * `SASL_SSL://127.0.0.1:9095`
+//! * `SASL_PLAINTEXT://127.0.0.1:19093`
+//! * `SSL://127.0.0.1:19094`
+//! * `SASL_SSL://127.0.0.1:19095`
 //!
 //! The first auth test ([`auth_env`]) generates a throwaway CA, server and client
 //! certificates with the `openssl` CLI into `$TMPDIR/pg_kafka_auth_e2e`, points the
@@ -34,16 +34,16 @@ use tokio::net::TcpStream;
 use tokio_postgres::Client;
 
 pub const PLAINTEXT_PORT: u16 = 9092;
-pub const SASL_PLAINTEXT_PORT: u16 = 9093;
-pub const SSL_PORT: u16 = 9094;
-pub const SASL_SSL_PORT: u16 = 9095;
+pub const SASL_PLAINTEXT_PORT: u16 = 19093;
+pub const SSL_PORT: u16 = 19094;
+pub const SASL_SSL_PORT: u16 = 19095;
 
 /// The Kafka user the tests create. The `=` and `,` exercise SCRAM saslname escaping.
 pub const USER: &str = "e2e-auth=user,1";
 pub const PASSWORD: &str = "e2e auth pässword";
 
 const LISTENERS: &str =
-    "SASL_PLAINTEXT://127.0.0.1:9093,SSL://127.0.0.1:9094,SASL_SSL://127.0.0.1:9095";
+    "SASL_PLAINTEXT://127.0.0.1:19093,SSL://127.0.0.1:19094,SASL_SSL://127.0.0.1:19095";
 
 pub type DynResult<T> = Result<T, Box<dyn std::error::Error>>;
 

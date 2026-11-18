@@ -12,14 +12,14 @@
 there is one table to refresh when tests land. Counts drift between refreshes;
 the CI run is the source of truth.
 
-Counted on 2026-11-18, with the 0.1.0 change set (group commit, held JoinGroup/SyncGroup, metrics, roles):
+Counted on 2026-11-18, with the full 0.1.0 change set (group commit, held JoinGroup/SyncGroup, metrics, roles, API registry, time partitions, TLS/SASL):
 
 | Category | Count | Coverage |
 |----------|-------|----------|
-| Unit Tests | 853 | Core logic, handlers, storage, protocol, shadow (`src/`, includes in-module proptest fuzz harnesses) |
+| Unit Tests | 855 | Core logic, handlers, storage, protocol, shadow (`src/`, includes in-module proptest fuzz harnesses) |
 | Property Tests | 10 | `tests/property_tests.rs`: 8 proptest wire-format invariants + 2 boundary tests (CI-run) |
-| E2E Tests | 240 | Full protocol integration (`kafka_test/`, 18 categories) |
-| **Total** | **1103** | |
+| E2E Tests | 259 | Full protocol integration (`kafka_test/`, 20 categories) |
+| **Total** | **1124** | |
 
 Regenerate (none of these needs a running broker):
 
@@ -38,11 +38,13 @@ are not counted above.
 
 | Module | Tests | Focus |
 |--------|-------|-------|
-| Shadow Mode (`kafka/shadow/`) | 148 | External forwarding, SASL/SSL settings, licensing, routing, outbox, config |
+| Shadow Mode (`kafka/shadow/`) | 149 | External forwarding, SASL/SSL settings, licensing, routing, outbox, config |
 | Handler Logic (`kafka/handlers/`) | 144 | All 26 API handlers, mostly with MockKafkaStore (`handlers/tests.rs` holds 80) |
 | Protocol (`kafka/protocol/`) | 110 | Decoding, encoding, RecordBatch framing, 4 proptest fuzz harnesses |
-| Assignment (`kafka/assignment/`) | 69 | Range, RoundRobin, Sticky algorithms, subscription/assignment codecs |
-| Storage Layer (`kafka/storage/`) | 80 | KafkaStore trait, types, mock verification |
+| Assignment (`kafka/assignment/`) | 63 | Range, RoundRobin, Sticky algorithms, subscription/assignment codecs |
+| Storage Layer (`kafka/storage/`) | 90 | Store role traits, types, mock verification, retention and partition-drop planning, privileges |
+| API Registry (`kafka/api/`) | 17 | Every advertised version encodes, error-response echoes, network-thread APIs |
+| Authentication (`kafka/auth/`) | 30 | SCRAM (RFC 5802/7677 vectors), PLAIN, session rules, listener and TLS config |
 | Messages | 53 | Request/response types, size estimators |
 | Config | 36 | GUC configuration |
 | Response Builders | 35 | Response construction |
@@ -79,13 +81,15 @@ Per-category counts from `kafka_test --list` at the commit named in [Test Summar
 | Transaction (`transaction`) | 20 | EOS, isolation levels, LSO, fencing, timeouts, atomicity |
 | Shadow (`shadow`) | 29 | Dual-write, external-only/local-only, percentage dial-up, topic mapping, outbox, transactions, replay |
 | Long Polling (`long_poll`) | 10 | Timeout, immediate return, producer wakeup, precision, per-connection cap |
-| Error Paths (`error_paths`) | 57 | Invalid partitions, unknown topics, coordinator errors, protocol/transaction/group regressions |
+| Error Paths (`error_paths`) | 61 | Invalid partitions, unknown topics, coordinator errors, protocol/transaction/group regressions |
 | Edge Cases (`edge_cases`) | 13 | Empty topics, large messages, boundary values, retention sweep |
 | Concurrent (`concurrent`) | 14 | Multi-producer, multi-consumer, pipelining, races, heartbeat bypass |
 | Negative (`negative`) | 5 | Connection refused, timeouts, invalid operations, superuser-only GUC |
 | Performance (`performance`) | 7 | Throughput baselines, latency percentiles, scaling |
 | Metadata (`metadata`) | 3 | Metadata refresh, all topics, nonexistent topic |
 | Protocol (`protocol`) | 5 | ApiVersions negotiation, correlation ID, unknown API, pipelining, ordering with long poll |
+| Time Partitions (`part`) | 3 | Whole-partition retention drops, pending-transaction blocking, maintenance, least privilege |
+| Authentication (`auth`) | 12 | SASL PLAIN/SCRAM, TLS, mutual TLS, SASL_SSL, pre-auth gating, user management SQL |
 
 ### Running E2E Tests
 
