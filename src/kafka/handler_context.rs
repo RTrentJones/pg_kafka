@@ -467,6 +467,15 @@ mod tests {
             Ok(0)
         }
 
+        fn get_partition_bounds(
+            &self,
+            _topic_id: i32,
+            _partition_id: i32,
+            _isolation_level: crate::kafka::storage::IsolationLevel,
+        ) -> crate::kafka::error::Result<crate::kafka::storage::PartitionBounds> {
+            Ok(crate::kafka::storage::PartitionBounds::default())
+        }
+
         fn abort_timed_out_transactions(
             &self,
             _timeout: std::time::Duration,

@@ -1262,6 +1262,7 @@ pub fn process_request(
         crate::kafka::KafkaRequest::Fetch {
             correlation_id,
             api_version,
+            max_bytes,
             topic_data,
             isolation_level,
             response_tx,
@@ -1277,7 +1278,7 @@ pub fn process_request(
             dispatch_response(
                 "Fetch",
                 response_tx,
-                || handlers::handle_fetch(&ctx, topic_data, isolation),
+                || handlers::handle_fetch_with_max_bytes(&ctx, topic_data, isolation, max_bytes),
                 |r| KafkaResponse::Fetch {
                     correlation_id,
                     api_version,

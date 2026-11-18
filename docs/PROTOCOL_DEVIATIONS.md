@@ -175,6 +175,10 @@ pg_kafka.compression_type = 'gzip'
 - ✅ Partition watermarks (high watermark, log start offset)
 - ✅ Byte-budget fetch sizing — small-message fetches fill `max_bytes` via bounded
   iterative queries instead of capping at a fixed row count (DR-9)
+- ✅ Request-level `max_bytes` (KIP-74): partitions are filled in request order until
+  the response budget is spent; the first partition with data always returns at least
+  one message, later partitions return only what still fits (sizes are estimated as
+  key + value + 64 bytes per record, the same accounting `partition_max_bytes` uses)
 - ✅ Long polling (max_wait_ms/min_bytes support)
 
 **What's Missing:**

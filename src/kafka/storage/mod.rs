@@ -167,6 +167,73 @@ impl IsolationLevel {
     }
 }
 
+/// Offset bounds of one partition, as reported in a Fetch response
+/// (see [`KafkaStore::get_partition_bounds`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PartitionBounds {
+    /// Log-end offset; never regresses (BUG-4).
+    pub high_watermark: i64,
+    /// Lowest pending transactional offset (ReadCommitted), or the high watermark.
+    pub last_stable_offset: i64,
+    /// Earliest retained offset: GREATEST(first surviving row, durable log start).
+    pub earliest_offset: i64,
+    /// Durable log start (`kafka.partition_offsets.log_start_offset`).
+    pub log_start_offset: i64,
+}
+
+impl PartitionBounds {
+    /// Build the bounds from the raw per-partition values one SQL statement reads:
+    /// the offset counter row (`next_offset`, `log_start_offset`; `None` when the
+    /// partition has no counter row), MIN/MAX `partition_offset` over the stored rows,
+    /// and the lowest pending transactional offset. Mirrors the single-value queries
+    /// in `PostgresStore` so the combined statement cannot drift from them.
+    pub fn from_raw(
+        next_offset: Option<i64>,
+        log_start_offset: Option<i64>,
+        min_offset: Option<i64>,
+        max_offset: Option<i64>,
+        min_pending_offset: Option<i64>,
+        isolation_level: IsolationLevel,
+    ) -> Self {
+        let log_start = log_start_offset.unwrap_or(0);
+        let high_watermark = next_offset
+            .unwrap_or(0)
+            .max(max_offset.map(|m| m.saturating_add(1)).unwrap_or(0));
+        let last_stable_offset = match isolation_level {
+            IsolationLevel::ReadCommitted => min_pending_offset.unwrap_or(high_watermark),
+            IsolationLevel::ReadUncommitted => high_watermark,
+        };
+        PartitionBounds {
+            high_watermark,
+            last_stable_offset,
+            earliest_offset: min_offset.unwrap_or(0).max(log_start),
+            log_start_offset: log_start,
+        }
+    }
+}
+
+/// Order `rows` (`(name, id, partition_count)` from one batched lookup) as the
+/// requested `names`, dropping names with no row. A name requested twice appears
+/// twice, matching the former one-query-per-name loop.
+pub fn order_topic_metadata(names: &[String], rows: Vec<(String, i32, i32)>) -> Vec<TopicMetadata> {
+    let by_name: std::collections::HashMap<String, (i32, i32)> = rows
+        .into_iter()
+        .map(|(name, id, partitions)| (name, (id, partitions)))
+        .collect();
+    names
+        .iter()
+        .filter_map(|name| {
+            by_name
+                .get(name)
+                .map(|&(id, partition_count)| TopicMetadata {
+                    name: name.clone(),
+                    id,
+                    partition_count,
+                })
+        })
+        .collect()
+}
+
 /// Abstract storage interface for Kafka data operations
 ///
 /// This trait defines the contract between the Kafka protocol handlers
@@ -678,6 +745,38 @@ pub trait KafkaStore {
     /// # Returns
     /// Last stable offset
     fn get_last_stable_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64>;
+
+    /// All offset bounds a Fetch response reports for one partition, in one storage
+    /// round trip: high watermark, last stable offset (for `isolation_level`; equal
+    /// to the high watermark for ReadUncommitted), earliest offset and durable log
+    /// start. Each field matches the corresponding single-value method
+    /// (`get_high_watermark`, `get_last_stable_offset`, `get_earliest_offset`,
+    /// `get_log_start_offset`).
+    ///
+    /// The default composes those methods (four statements). `PostgresStore`
+    /// overrides it with a single statement, and `ShadowStore` forwards it; the
+    /// mockall `MockKafkaStore` deliberately keeps this default so expectations set
+    /// on the single-value methods keep driving handler tests.
+    fn get_partition_bounds(
+        &self,
+        topic_id: i32,
+        partition_id: i32,
+        isolation_level: IsolationLevel,
+    ) -> Result<PartitionBounds> {
+        let high_watermark = self.get_high_watermark(topic_id, partition_id)?;
+        let last_stable_offset = match isolation_level {
+            IsolationLevel::ReadCommitted => self.get_last_stable_offset(topic_id, partition_id)?,
+            IsolationLevel::ReadUncommitted => high_watermark,
+        };
+        let earliest_offset = self.get_earliest_offset(topic_id, partition_id)?;
+        let log_start_offset = self.get_log_start_offset(topic_id, partition_id)?;
+        Ok(PartitionBounds {
+            high_watermark,
+            last_stable_offset,
+            earliest_offset,
+            log_start_offset,
+        })
+    }
 
     /// Abort timed-out transactions
     ///

@@ -7,7 +7,12 @@
 //! and checks the stored state.
 
 use crate::common::TestResult;
+use crate::error_paths::bug_hunt::{fetch_request, roundtrip};
+use crate::fixtures::{generate_messages, TestMessage, TestTopicBuilder};
 use crate::setup::TestContext;
+use tokio::net::TcpStream;
+
+const BROKER: &str = "localhost:9092";
 
 /// Number of expired rows seeded by the retention test: well above the old fixed
 /// 10,000-row cap per sweep pass.
@@ -112,6 +117,172 @@ pub async fn test_retention_sweep_catches_up_on_backlog() -> TestResult {
     assert_eq!(
         log_start, RETENTION_BACKLOG,
         "log_start_offset must advance to the oldest surviving offset"
+    );
+
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// Fetch reports all offset bounds from one storage statement
+/// (`PostgresStore::get_partition_bounds`). The bounds must match the single-value
+/// queries they replaced: high watermark from the offset counter, last stable offset
+/// at the first pending transactional row (read_committed only), log start offset
+/// from the durable truncation point, and OFFSET_OUT_OF_RANGE below it.
+pub async fn test_fetch_bounds_from_single_statement() -> TestResult {
+    println!("=== Test: Fetch Bounds From A Single Statement ===\n");
+
+    let ctx = TestContext::new().await?;
+    let topic = TestTopicBuilder::new(&ctx, "storage-fetch-bounds")
+        .with_partitions(1)
+        .build()
+        .await?;
+    topic.produce(&generate_messages(5, "m")).await?;
+    let topic_id: i32 = ctx
+        .db()
+        .query_one(
+            "SELECT id FROM kafka.topics WHERE name = $1",
+            &[&topic.name],
+        )
+        .await?
+        .get(0);
+
+    println!("Step 1: truncate below offset 2 and add a pending row at offset 5...");
+    ctx.db()
+        .execute(
+            "DELETE FROM kafka.messages WHERE topic_id = $1 AND partition_offset < 2",
+            &[&topic_id],
+        )
+        .await?;
+    ctx.db()
+        .execute(
+            "INSERT INTO kafka.messages
+                 (topic_id, partition_id, partition_offset, value, producer_id, producer_epoch, txn_state)
+             VALUES ($1, 0, 5, 'pending'::bytea, -42, 0, 'pending')",
+            &[&topic_id],
+        )
+        .await?;
+    ctx.db()
+        .execute(
+            "UPDATE kafka.partition_offsets SET log_start_offset = 2, next_offset = 6
+             WHERE topic_id = $1 AND partition_id = 0",
+            &[&topic_id],
+        )
+        .await?;
+
+    let mut stream = TcpStream::connect(BROKER).await?;
+    stream.set_nodelay(true)?;
+
+    println!("Step 2: read_committed fetch from offset 2...");
+    let mut req = fetch_request(&topic.name, 0, 2, 0);
+    req.isolation_level = 1;
+    let response = roundtrip(&mut stream, 4, 9101, &req).await?;
+    let p = &response.responses[0].partitions[0];
+    println!(
+        "   error={} hwm={} lso={} log_start={}",
+        p.error_code, p.high_watermark, p.last_stable_offset, p.log_start_offset
+    );
+    assert_eq!(p.error_code, 0, "fetch from the log start must succeed");
+    assert_eq!(p.high_watermark, 6, "HWM comes from the offset counter");
+    assert_eq!(p.last_stable_offset, 5, "LSO is the first pending offset");
+    assert_eq!(p.log_start_offset, 2, "log start is the truncation point");
+    assert!(
+        p.records.as_ref().map(|r| !r.is_empty()).unwrap_or(false),
+        "committed records 2..4 must be returned"
+    );
+
+    println!("Step 3: read_uncommitted fetch reports LSO = HWM...");
+    let response = roundtrip(&mut stream, 4, 9102, &fetch_request(&topic.name, 0, 2, 0)).await?;
+    let p = &response.responses[0].partitions[0];
+    assert_eq!(p.error_code, 0);
+    assert_eq!(p.high_watermark, 6);
+    assert_eq!(p.last_stable_offset, 6);
+
+    println!("Step 4: fetch below the log start is out of range...");
+    let response = roundtrip(&mut stream, 4, 9103, &fetch_request(&topic.name, 0, 1, 0)).await?;
+    let p = &response.responses[0].partitions[0];
+    assert_eq!(p.error_code, 1, "expected OFFSET_OUT_OF_RANGE (1)");
+    assert_eq!(p.log_start_offset, 2);
+
+    ctx.db()
+        .execute(
+            "DELETE FROM kafka.messages WHERE topic_id = $1 AND txn_state = 'pending'",
+            &[&topic_id],
+        )
+        .await?;
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// The request-level Fetch `max_bytes` (v3+) is honoured: once the first partition
+/// has returned data the budget is spent, so the second partition reports its bounds
+/// but no records. With a large `max_bytes` both partitions return records.
+///
+/// Fails before the fix: only `partition_max_bytes` was used, so both partitions
+/// returned records even with `max_bytes = 1`.
+pub async fn test_fetch_honours_request_max_bytes() -> TestResult {
+    println!("=== Test: Fetch Honours Request-Level max_bytes ===\n");
+
+    let ctx = TestContext::new().await?;
+    let topic = TestTopicBuilder::new(&ctx, "storage-fetch-max-bytes")
+        .with_partitions(2)
+        .build()
+        .await?;
+    let payload = "x".repeat(1000);
+    let mut messages = Vec::new();
+    for partition in 0..2 {
+        for _ in 0..3 {
+            let mut m = TestMessage::new(payload.clone());
+            m.partition = Some(partition);
+            messages.push(m);
+        }
+    }
+    topic.produce(&messages).await?;
+
+    let two_partitions = |max_bytes: i32| {
+        let mut req = fetch_request(&topic.name, 0, 0, 0);
+        let mut second = req.topics[0].partitions[0].clone();
+        second.partition = 1;
+        req.topics[0].partitions.push(second);
+        req.max_bytes = max_bytes;
+        req
+    };
+
+    let mut stream = TcpStream::connect(BROKER).await?;
+    stream.set_nodelay(true)?;
+
+    println!("Step 1: max_bytes = 1...");
+    let response = roundtrip(&mut stream, 4, 9201, &two_partitions(1)).await?;
+    let parts = &response.responses[0].partitions;
+    let sizes: Vec<usize> = parts
+        .iter()
+        .map(|p| p.records.as_ref().map(|r| r.len()).unwrap_or(0))
+        .collect();
+    println!("   record bytes per partition: {:?}", sizes);
+    assert_eq!(parts.len(), 2);
+    assert!(parts.iter().all(|p| p.error_code == 0));
+    assert!(
+        sizes[0] > 0,
+        "the first partition must still return a message"
+    );
+    if sizes[1] != 0 {
+        return Err(format!(
+            "partition 1 returned {} record bytes although max_bytes = 1 was already spent",
+            sizes[1]
+        )
+        .into());
+    }
+    assert_eq!(parts[1].high_watermark, 3, "bounds are still reported");
+
+    println!("Step 2: max_bytes = 1 MiB...");
+    let response = roundtrip(&mut stream, 4, 9202, &two_partitions(1024 * 1024)).await?;
+    let parts = &response.responses[0].partitions;
+    assert!(
+        parts
+            .iter()
+            .all(|p| p.records.as_ref().map(|r| !r.is_empty()).unwrap_or(false)),
+        "with room in the budget both partitions return records"
     );
 
     ctx.cleanup().await?;

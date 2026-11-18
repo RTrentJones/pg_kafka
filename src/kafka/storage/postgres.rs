@@ -5,7 +5,8 @@
 
 use super::retention;
 use super::{
-    CommittedOffset, FetchedMessage, IsolationLevel, KafkaStore, TopicMetadata, TransactionState,
+    CommittedOffset, FetchedMessage, IsolationLevel, KafkaStore, PartitionBounds, TopicMetadata,
+    TransactionState,
 };
 use crate::kafka::error::{KafkaError, Result};
 use crate::kafka::messages::Record;
@@ -730,25 +731,25 @@ impl KafkaStore for PostgresStore {
             let mut topics = Vec::new();
 
             if let Some(topic_names) = names {
-                // Fetch specific topics
-                for name in topic_names {
-                    let mut table = client.select(
-                        "SELECT id, partitions FROM kafka.topics WHERE name = $1",
-                        None,
-                        &[name.clone().into()],
-                    )?;
-
-                    if let Some(row) = table.next() {
-                        let id: i32 = row.get_by_name("id")?.unwrap_or(0);
-                        let partitions: i32 = row.get_by_name("partitions")?.unwrap_or(1);
-
-                        topics.push(TopicMetadata {
-                            name: name.clone(),
-                            id,
-                            partition_count: partitions,
-                        });
-                    }
+                // Fetch the requested topics in ONE statement (was one query per
+                // name, an N+1 on every Metadata request), then restore the
+                // requested order in Rust.
+                if topic_names.is_empty() {
+                    return Ok(topics);
                 }
+                let table = client.select(
+                    "SELECT id, name, partitions FROM kafka.topics WHERE name = ANY($1::text[])",
+                    None,
+                    &[topic_names.to_vec().into()],
+                )?;
+                let mut rows = Vec::with_capacity(topic_names.len());
+                for row in table {
+                    let id: i32 = row.get_by_name("id")?.unwrap_or(0);
+                    let name: String = row.get_by_name("name")?.unwrap_or_default();
+                    let partitions: i32 = row.get_by_name("partitions")?.unwrap_or(1);
+                    rows.push((name, id, partitions));
+                }
+                topics = super::order_topic_metadata(topic_names, rows);
             } else {
                 // Fetch all topics
                 let table =
@@ -872,6 +873,48 @@ impl KafkaStore for PostgresStore {
         })
         .map_err(|e: KafkaError| {
             KafkaError::Internal(format!("get_log_start_offset failed: {}", e))
+        })
+    }
+
+    fn get_partition_bounds(
+        &self,
+        topic_id: i32,
+        partition_id: i32,
+        isolation_level: IsolationLevel,
+    ) -> Result<PartitionBounds> {
+        // One statement for every bound a Fetch reports (it used to run 4-5: high
+        // watermark, LSO, earliest, log start). Each scalar subquery is a
+        // primary-key (or idx_messages_txn_pending) probe; PartitionBounds::from_raw
+        // combines them exactly as the single-value methods above do.
+        Spi::connect(|client| {
+            let table = client.select(
+                "SELECT
+                     (SELECT next_offset FROM kafka.partition_offsets
+                      WHERE topic_id = $1 AND partition_id = $2) AS next_offset,
+                     (SELECT log_start_offset FROM kafka.partition_offsets
+                      WHERE topic_id = $1 AND partition_id = $2) AS log_start_offset,
+                     (SELECT MIN(partition_offset) FROM kafka.messages
+                      WHERE topic_id = $1 AND partition_id = $2) AS min_offset,
+                     (SELECT MAX(partition_offset) FROM kafka.messages
+                      WHERE topic_id = $1 AND partition_id = $2) AS max_offset,
+                     (SELECT MIN(partition_offset) FROM kafka.messages
+                      WHERE topic_id = $1 AND partition_id = $2
+                        AND txn_state = 'pending') AS min_pending_offset",
+                None,
+                &[topic_id.into(), partition_id.into()],
+            )?;
+            let row = table.first();
+            Ok(PartitionBounds::from_raw(
+                row.get_by_name("next_offset")?,
+                row.get_by_name("log_start_offset")?,
+                row.get_by_name("min_offset")?,
+                row.get_by_name("max_offset")?,
+                row.get_by_name("min_pending_offset")?,
+                isolation_level,
+            ))
+        })
+        .map_err(|e: KafkaError| {
+            KafkaError::Internal(format!("get_partition_bounds failed: {}", e))
         })
     }
 

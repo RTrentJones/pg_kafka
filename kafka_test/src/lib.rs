@@ -138,7 +138,10 @@ pub use error_paths::{
     test_txn_offset_commit_failure_reports_partition_errors,
 };
 // Storage workstream regressions (retention, fetch bounds, privileges)
-pub use error_paths::test_retention_sweep_catches_up_on_backlog;
+pub use error_paths::{
+    test_fetch_bounds_from_single_statement, test_fetch_honours_request_max_bytes,
+    test_retention_sweep_catches_up_on_backlog,
+};
 pub use negative::{
     test_connection_refused, test_duplicate_consumer_join, test_invalid_group_id,
     test_produce_timeout, test_sasl_password_guc_is_superuser_only,
