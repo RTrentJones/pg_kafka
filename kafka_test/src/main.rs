@@ -295,6 +295,7 @@ use kafka_test::{
     test_txn_offset_commit_failure_reports_partition_errors,
     test_txn_offset_commit_visibility_timing,
     test_unknown_api_key_handling,
+    test_worker_runs_as_least_privilege_role,
     test_zero_percent_forwarding,
 };
 
@@ -845,6 +846,12 @@ fn get_all_tests() -> Vec<TestDef> {
             name: "test_fetch_honours_request_max_bytes",
             test_fn: wrap_test!(test_fetch_honours_request_max_bytes),
             parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_worker_runs_as_least_privilege_role",
+            test_fn: wrap_test!(test_worker_runs_as_least_privilege_role),
+            parallel_safe: false,
         },
         TestDef {
             category: "error_paths",

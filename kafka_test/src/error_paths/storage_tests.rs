@@ -6,10 +6,13 @@
 //! which unit coverage cannot see, so each test drives the broker or the SQL entry point
 //! and checks the stored state.
 
-use crate::common::TestResult;
+use crate::common::{create_db_client, get_bootstrap_servers, TestResult};
 use crate::error_paths::bug_hunt::{fetch_request, roundtrip};
 use crate::fixtures::{generate_messages, TestMessage, TestTopicBuilder};
 use crate::setup::TestContext;
+use rdkafka::config::ClientConfig;
+use rdkafka::producer::{FutureProducer, FutureRecord};
+use std::time::Duration;
 use tokio::net::TcpStream;
 
 const BROKER: &str = "localhost:9092";
@@ -284,6 +287,121 @@ pub async fn test_fetch_honours_request_max_bytes() -> TestResult {
             .all(|p| p.records.as_ref().map(|r| !r.is_empty()).unwrap_or(false)),
         "with room in the budget both partitions return records"
     );
+
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// The least-privilege worker role (`pgkafka_worker`) to which the background worker
+/// switches via `pg_kafka.run_as_role`.
+const WORKER_ROLE: &str = "pgkafka_worker";
+
+/// Produce one record to `topic` with a short delivery timeout.
+async fn produce_once(topic: &str, timeout_ms: u32) -> Result<(), String> {
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", get_bootstrap_servers())
+        .set("message.timeout.ms", timeout_ms.to_string())
+        .create()
+        .map_err(|e| e.to_string())?;
+    producer
+        .send(
+            FutureRecord::<(), _>::to(topic).payload("probe"),
+            Duration::from_millis(timeout_ms as u64),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|(e, _)| e.to_string())
+}
+
+/// 0.1.0 privileges: the kafka schema is no longer readable by PUBLIC (a fresh role
+/// is denied, and can read once granted `pgkafka_reader`), and the background worker
+/// really runs as `pgkafka_worker`: with that role's INSERT on kafka.topics revoked,
+/// auto-creating a topic fails; once re-granted, it succeeds.
+///
+/// Fails before the change: the schema was readable by PUBLIC, the roles did not
+/// exist, and the worker ran as the bootstrap superuser (revoking a role's privilege
+/// had no effect on it).
+///
+/// Not parallel-safe: it briefly revokes a worker privilege, which would fail any
+/// concurrent test that auto-creates a topic.
+pub async fn test_worker_runs_as_least_privilege_role() -> TestResult {
+    println!("=== Test: Worker Runs As The Least-Privilege Role ===\n");
+
+    let ctx = TestContext::new().await?;
+    // A separate connection, so SET ROLE never leaks into the context's client.
+    let db = create_db_client().await?;
+
+    println!("Step 1: both roles exist...");
+    let roles: i64 = db
+        .query_one(
+            "SELECT COUNT(*) FROM pg_roles WHERE rolname IN ('pgkafka_reader', 'pgkafka_worker')",
+            &[],
+        )
+        .await?
+        .get(0);
+    assert_eq!(roles, 2, "pgkafka_reader and pgkafka_worker must exist");
+
+    println!("Step 2: a role without grants cannot read kafka.messages...");
+    let probe = format!("storage_e2e_probe_{}", uuid::Uuid::new_v4().simple());
+    db.batch_execute(&format!("CREATE ROLE {} NOLOGIN", probe))
+        .await?;
+    db.batch_execute(&format!("SET ROLE {}", probe)).await?;
+    let denied = db.query("SELECT 1 FROM kafka.messages LIMIT 1", &[]).await;
+    db.batch_execute("RESET ROLE").await?;
+    db.batch_execute(&format!("GRANT pgkafka_reader TO {}", probe))
+        .await?;
+    db.batch_execute(&format!("SET ROLE {}", probe)).await?;
+    let allowed = db.query("SELECT 1 FROM kafka.messages LIMIT 1", &[]).await;
+    db.batch_execute("RESET ROLE").await?;
+    db.batch_execute(&format!("DROP ROLE {}", probe)).await?;
+    if denied.is_ok() {
+        return Err(
+            "a role with no grants could read kafka.messages (PUBLIC grant still present)".into(),
+        );
+    }
+    if let Err(e) = allowed {
+        return Err(format!("pgkafka_reader member could not read kafka.messages: {}", e).into());
+    }
+
+    println!("Step 3: revoke the worker role's INSERT on kafka.topics and auto-create a topic...");
+    let topic = ctx.unique_topic("storage-worker-role").await;
+    db.batch_execute(&format!(
+        "REVOKE INSERT ON kafka.topics FROM {}",
+        WORKER_ROLE
+    ))
+    .await?;
+    let while_revoked = produce_once(&topic, 3000).await;
+    // Restore before evaluating anything, so a failure cannot leave it revoked.
+    db.batch_execute(&format!(
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON kafka.topics TO {}",
+        WORKER_ROLE
+    ))
+    .await?;
+    let created_while_revoked: i64 = db
+        .query_one(
+            "SELECT COUNT(*) FROM kafka.topics WHERE name = $1",
+            &[&topic],
+        )
+        .await?
+        .get(0);
+    println!(
+        "   produce while revoked: {:?}, topic rows: {}",
+        while_revoked.as_ref().map(|_| "ok"),
+        created_while_revoked
+    );
+    if while_revoked.is_ok() || created_while_revoked != 0 {
+        return Err(
+            "the worker auto-created a topic without INSERT on kafka.topics: \
+                    it is not running as pgkafka_worker"
+                .into(),
+        );
+    }
+
+    println!("Step 4: with the grant restored the same produce succeeds...");
+    produce_once(&topic, 10_000)
+        .await
+        .map_err(|e| format!("produce after restoring the grant failed: {}", e))?;
 
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");

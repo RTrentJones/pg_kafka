@@ -281,6 +281,9 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
         }
     }
 
+    // 0.1.0: drop from the bootstrap superuser to pg_kafka.run_as_role.
+    crate::kafka::storage::postgres::apply_worker_role();
+
     log!(
         "pg_kafka background worker started (port: {}, host: {}, database: {})",
         config.port,
