@@ -1037,11 +1037,22 @@ impl KafkaRequest {
     /// the request and forwards buffered responses to the returned (real) sender
     /// only after `BackgroundWorker::transaction` has committed, so a client can
     /// never observe an ack for state that is not yet durable/visible.
+    ///
+    /// JoinGroup is the exception: its response may be held by the group coordinator
+    /// until the group's join phase completes, long after this request's transaction
+    /// (it does no SPI, so there is nothing to commit first). Its own sender is left in
+    /// place, `new_tx` is dropped, and a closed sender is returned, so the worker's
+    /// flush and commit-failure paths deliver nothing for it.
     pub fn swap_response_tx(
         &mut self,
         new_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
     ) -> tokio::sync::mpsc::UnboundedSender<KafkaResponse> {
         match self {
+            KafkaRequest::JoinGroup { .. } => {
+                drop(new_tx);
+                let (closed_tx, _) = tokio::sync::mpsc::unbounded_channel();
+                closed_tx
+            }
             KafkaRequest::ApiVersions { response_tx, .. }
             | KafkaRequest::Metadata { response_tx, .. }
             | KafkaRequest::Produce { response_tx, .. }
@@ -1049,7 +1060,6 @@ impl KafkaRequest {
             | KafkaRequest::OffsetCommit { response_tx, .. }
             | KafkaRequest::OffsetFetch { response_tx, .. }
             | KafkaRequest::FindCoordinator { response_tx, .. }
-            | KafkaRequest::JoinGroup { response_tx, .. }
             | KafkaRequest::SyncGroup { response_tx, .. }
             | KafkaRequest::Heartbeat { response_tx, .. }
             | KafkaRequest::LeaveGroup { response_tx, .. }
@@ -1733,7 +1743,11 @@ mod tests {
     #[test]
     fn test_swap_response_tx_all_variants() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        for (_api_key, mut request) in all_request_variants(tx) {
+        for (api_key, mut request) in all_request_variants(tx) {
+            if api_key == crate::kafka::constants::API_KEY_JOIN_GROUP {
+                // Exempt from the barrier; see test_swap_response_tx_leaves_join_group_sender.
+                continue;
+            }
             let (buf_tx, mut buf_rx) = tokio::sync::mpsc::unbounded_channel();
             let _returned = request.swap_response_tx(buf_tx);
             // The request now holds the buffer sender: a handler-side send lands
@@ -1755,6 +1769,44 @@ mod tests {
                 "swap must install the new sender"
             );
         }
+    }
+
+    /// JoinGroup answers through the coordinator, possibly after its transaction, so
+    /// `swap_response_tx` must leave the client's own sender on the request and hand
+    /// back a closed one (the worker's flush and commit-failure paths then send
+    /// nothing for it, so the client gets exactly one response).
+    #[test]
+    fn test_swap_response_tx_leaves_join_group_sender() {
+        let (orig_tx, mut orig_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (buf_tx, mut buf_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut request = KafkaRequest::JoinGroup {
+            correlation_id: 3,
+            client_id: None,
+            api_version: 5,
+            group_id: "g".to_string(),
+            session_timeout_ms: 10_000,
+            rebalance_timeout_ms: 30_000,
+            member_id: String::new(),
+            group_instance_id: None,
+            protocol_type: "consumer".to_string(),
+            protocols: vec![],
+            response_tx: orig_tx,
+        };
+        let returned = request.swap_response_tx(buf_tx);
+        let error = || KafkaResponse::Error {
+            correlation_id: 3,
+            error_code: 0,
+            error_message: None,
+        };
+        assert!(returned.send(error()).is_err(), "returned sender is closed");
+        assert!(buf_rx.try_recv().is_err(), "the buffer is not installed");
+        if let KafkaRequest::JoinGroup { response_tx, .. } = &request {
+            response_tx.send(error()).unwrap();
+        }
+        assert!(
+            orig_rx.try_recv().is_ok(),
+            "the request keeps the client sender"
+        );
     }
 
     // ========== RecordHeader Tests ==========

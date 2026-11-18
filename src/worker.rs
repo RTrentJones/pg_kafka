@@ -1390,39 +1390,32 @@ pub fn process_request(
             session_timeout_ms,
             rebalance_timeout_ms,
             protocol_type,
+            group_instance_id,
             protocols,
             response_tx,
-            ..
         } => {
-            let cid = client_id.unwrap_or_else(|| "unknown".to_string());
-
-            dispatch_response(
-                "JoinGroup",
+            // The coordinator may hold this response until the group's join phase
+            // completes (a later JoinGroup, LeaveGroup or the timeout sweep answers it),
+            // so it answers on the client's own sender: swap_response_tx leaves that in
+            // place for JoinGroup, which does no SPI and needs no commit barrier.
+            let reply = crate::kafka::handlers::JoinGroupReply::new(
+                correlation_id,
+                api_version,
                 response_tx,
-                || {
-                    handlers::handle_join_group(
-                        &ctx,
-                        group_id,
-                        member_id,
-                        cid,
-                        session_timeout_ms,
-                        rebalance_timeout_ms,
-                        protocol_type,
-                        protocols,
-                    )
+            );
+            handlers::handle_join_group(
+                &ctx,
+                handlers::JoinGroupRequestData {
+                    group_id,
+                    member_id,
+                    client_id: client_id.unwrap_or_else(|| "unknown".to_string()),
+                    group_instance_id,
+                    session_timeout_ms,
+                    rebalance_timeout_ms,
+                    protocol_type,
+                    protocols,
                 },
-                |r| KafkaResponse::JoinGroup {
-                    correlation_id,
-                    api_version,
-                    response: r,
-                },
-                |error_code| KafkaResponse::JoinGroup {
-                    correlation_id,
-                    api_version,
-                    response: crate::kafka::response_builders::build_join_group_error_response(
-                        error_code,
-                    ),
-                },
+                move |response| reply.send(response),
             );
         }
 
