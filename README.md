@@ -41,7 +41,7 @@ kcat -C -b localhost:9092 -t my-topic -p 0 -o beginning
 - **Offset Management** - OffsetCommit/OffsetFetch for consumer progress tracking
 - **Admin APIs** - CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups
 - **Config & Log Management** - DescribeConfigs, IncrementalAlterConfigs (`retention.ms` only), DeleteRecords
-- **Retention** - Periodic time-based sweep (`pg_kafka.message_retention_hours`, per-topic `retention.ms`), also runnable via `SELECT * FROM pg_kafka_run_retention_sweep()`
+- **Retention** - Periodic time-based sweep (`pg_kafka.message_retention_hours`, per-topic `retention.ms`), also runnable via `SELECT * FROM pg_kafka_run_retention_sweep()`; `kafka.messages` is time-partitioned (`pg_kafka.message_partition_minutes`, default one day), so expired data goes by dropping whole partitions instead of row deletes (ADR-001)
 - **Compression** - gzip, snappy, lz4, zstd (inbound/outbound)
 - **Multi-Partition Topics** - Key-based routing with murmur2 hash
 - **Topic Auto-Creation** - Topics created on first produce
@@ -187,10 +187,11 @@ CREATE TABLE kafka.messages (
     producer_epoch SMALLINT,
     txn_state TEXT,                 -- NULL (committed), 'pending', 'aborted'
     CHECK (partition_id >= 0),
-    PRIMARY KEY (topic_id, partition_id, partition_offset),
-    FOREIGN KEY (topic_id) REFERENCES kafka.topics(id) ON DELETE CASCADE,
-    UNIQUE (global_offset)
-);
+    FOREIGN KEY (topic_id) REFERENCES kafka.topics(id) ON DELETE CASCADE
+) PARTITION BY RANGE (created_at);
+-- Leaves: kafka.messages_pYYYYMMDD_HHMMSS (one per pg_kafka.message_partition_minutes,
+-- created ahead by the worker) + kafka.messages_default; each leaf has UNIQUE
+-- (topic_id, partition_id, partition_offset) and UNIQUE (global_offset).
 
 -- Consumer group offset tracking
 CREATE TABLE kafka.consumer_offsets (
@@ -345,6 +346,7 @@ pg_kafka.shutdown_timeout_ms = 5000
 
 -- Reloadable with pg_reload_conf()
 pg_kafka.message_retention_hours = 0  -- Time-based retention sweep (0 = keep forever)
+pg_kafka.message_partition_minutes = 1440  -- Width of one time partition of kafka.messages
 ```
 
 See [CLAUDE.md](CLAUDE.md#configuration) for the full GUC list, including long polling, compression and Shadow Mode settings.
@@ -372,7 +374,7 @@ See [CLAUDE.md](CLAUDE.md#configuration) for the full GUC list, including long p
 
 - [ ] **Cooperative Rebalancing** (KIP-429)
 - [ ] **Static Group Membership** (KIP-345)
-- [ ] Table partitioning (time-based retention is already available)
+- [x] Time partitioning of kafka.messages with retention by partition drop (0.1.0, ADR-001)
 
 ---
 

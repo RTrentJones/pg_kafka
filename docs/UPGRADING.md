@@ -36,10 +36,20 @@ large `kafka.messages`.
 
 `sql/pg_kafka--0.0.0--0.1.0.sql`:
 
+- converts `kafka.messages` to a table partitioned by `created_at` (ADR-001): the
+  populated 0.0.0 table becomes the leaf `kafka.messages_legacy` covering
+  `[MINVALUE, upgrade time)` without copying rows (it keeps its primary key and unique
+  index as the per-leaf unique indexes and its `global_offset` sequence, now owned by
+  the new parent), a DEFAULT leaf `kafka.messages_default` is added, the views
+  `kafka.shadow_status` and `kafka.metrics` are recreated on the new parent, and the
+  SECURITY DEFINER partition functions are created. The legacy leaf is dropped by the
+  retention sweep once all its rows are expired. This reads the old table three times
+  under ACCESS EXCLUSIVE (bound, attach check, BRIN build);
 - drops `idx_messages_topic_partition_offset`, which duplicated the `kafka.messages`
   primary key;
 - adds `idx_messages_created_at_brin` (BRIN on `created_at`, `autosummarize = on`) for
-  the retention sweep (building it reads the table once);
+  the retention sweep;
+- adds `pg_kafka_run_partition_maintenance()`;
 - creates the NOLOGIN roles `pgkafka_reader` and `pgkafka_worker` if they do not exist,
   revokes every privilege 0.0.0 granted to PUBLIC on the kafka schema (including
   EXECUTE on `kafka.replay_shadow_messages`), grants read-only access to
@@ -64,7 +74,9 @@ After the upgrade:
 `scripts/check-upgrade.sh` (run in CI after the E2E tests) installs the frozen 0.0.0
 install script from `sql/upgrade-test/`, creates one database at 0.0.0 with data and
 upgrades it, creates another with a fresh install, and fails unless the two kafka
-schemas (columns, indexes, ACLs, roles) are identical and the data survived:
+schemas (columns, indexes, ACLs, views, roles, partitioning; leaves are compared by
+shape since their names are data-dependent) are identical, the data survived, partition
+maintenance works on both, the legacy leaf drops whole and `pg_dump` emits no kafka table:
 
 ```bash
 PG_CONFIG=$(which pg_config) PGHOST=localhost PGPORT=28814 PGUSER=postgres \
