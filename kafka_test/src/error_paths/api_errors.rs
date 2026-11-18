@@ -359,3 +359,94 @@ async fn list_offsets_while_revoked(topic_name: &str) -> Result<ListOffsetsRespo
     connection_still_usable(&mut stream).await?;
     Ok(response)
 }
+
+/// A request must see every row committed before it was sent, even when the worker runs
+/// it in a group-commit batch that started earlier. pgrx runs read-only SPI statements on
+/// the snapshot pushed when the batch's transaction began, so before each request got its
+/// own snapshot, a read-only request that joined a batch late missed rows committed by
+/// other sessions in the meantime (`test_fetch_advertised_minimum_is_usable` saw a topic
+/// inserted by SQL as UNKNOWN_TOPIC_OR_PARTITION under parallel load).
+///
+/// Deterministic version: a ListOffsets starts a batch and blocks on a lock the test holds
+/// on kafka.partition_offsets; meanwhile the test commits a new topic by SQL and sends a
+/// Fetch for it, then releases the lock within the batch's 50 ms budget, so the Fetch runs
+/// in the same (read-only) batch.
+pub async fn test_request_sees_rows_committed_during_its_batch() -> TestResult {
+    println!("=== Test: Request Sees Rows Committed During Its Batch ===\n");
+    let ctx = TestContext::new().await?;
+    let existing = ctx.unique_topic("api-snap-existing").await;
+    ctx.db()
+        .execute(
+            "INSERT INTO kafka.topics (name, partitions) VALUES ($1, 2)",
+            &[&existing],
+        )
+        .await?;
+    let (mut locker, locker_conn) =
+        tokio_postgres::connect(&crate::common::get_database_url(), tokio_postgres::NoTls).await?;
+    tokio::spawn(locker_conn);
+
+    let mut stale = 0;
+    for attempt in 0..5 {
+        let fresh = ctx.unique_topic("api-snap-new").await;
+        let mut blocked = TcpStream::connect(BROKER).await?;
+        let mut fetcher = TcpStream::connect(BROKER).await?;
+
+        let txn = locker.transaction().await?;
+        txn.execute(
+            "LOCK TABLE kafka.partition_offsets IN ACCESS EXCLUSIVE MODE",
+            &[],
+        )
+        .await?;
+        // R1: starts a batch, then waits for the lock.
+        blocked
+            .write_all(&frame(
+                ApiKey::ListOffsets,
+                5,
+                400 + attempt,
+                &list_offsets(&existing),
+            ))
+            .await?;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        // Committed before R2 is sent.
+        ctx.db()
+            .execute(
+                "INSERT INTO kafka.topics (name, partitions) VALUES ($1, 1)",
+                &[&fresh],
+            )
+            .await?;
+        let mut fetch = FetchRequest::default();
+        fetch.max_wait_ms = 0;
+        fetch.max_bytes = 1 << 20;
+        let mut t = fetch_request::FetchTopic::default();
+        t.topic = topic(&fresh);
+        let mut p = fetch_request::FetchPartition::default();
+        p.partition = 0;
+        p.partition_max_bytes = 1 << 20;
+        t.partitions = vec![p];
+        fetch.topics = vec![t];
+        let fetch_frame = frame(ApiKey::Fetch, 4, 500 + attempt, &fetch);
+        fetcher.write_all(&fetch_frame).await?;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        txn.commit().await?; // R1 proceeds; R2 is already queued behind it
+
+        let mut reply = read_frame(&mut fetcher)
+            .await?
+            .ok_or("the broker closed the fetch connection")?;
+        let header = ResponseHeader::decode(&mut reply, FetchResponse::header_version(4))?;
+        assert_eq!(header.correlation_id, 500 + attempt);
+        let response = FetchResponse::decode(&mut reply, 4)?;
+        let code = response.responses[0].partitions[0].error_code;
+        println!("   attempt {}: fetch error_code={}", attempt, code);
+        if code != 0 {
+            stale += 1;
+        }
+        let _ = read_frame(&mut blocked).await?;
+    }
+    ctx.cleanup().await?;
+    assert_eq!(
+        stale, 0,
+        "a request missed a topic committed before it was sent"
+    );
+    println!("✅ Test PASSED\n");
+    Ok(())
+}

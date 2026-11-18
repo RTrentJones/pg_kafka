@@ -320,7 +320,8 @@ use kafka_test::{
 };
 // Stream `api`: typed error responses (error_paths/api_errors.rs)
 use kafka_test::{
-    test_handler_failure_gets_typed_error_response, test_truncated_body_gets_invalid_request,
+    test_handler_failure_gets_typed_error_response,
+    test_request_sees_rows_committed_during_its_batch, test_truncated_body_gets_invalid_request,
     test_unsupported_versions_get_typed_error_responses,
 };
 
@@ -1920,6 +1921,12 @@ fn get_all_tests() -> Vec<TestDef> {
             name: "test_handler_failure_gets_typed_error_response",
             test_fn: wrap_test!(test_handler_failure_gets_typed_error_response),
             parallel_safe: false, // revokes a worker privilege for a moment
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_request_sees_rows_committed_during_its_batch",
+            test_fn: wrap_test!(test_request_sees_rows_committed_during_its_batch),
+            parallel_safe: false, // holds a lock on kafka.partition_offsets
         },
         // auth stream: TLS + SASL listeners (kafka_test/src/auth). Sequential: they
         // restart the listener worker; the teardown test must stay last.

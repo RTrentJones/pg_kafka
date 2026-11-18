@@ -1191,7 +1191,15 @@ fn run_one_request(
     // New request, new sync-forward budget (see ShadowStore::begin_request).
     env.shadow_store.begin_request();
     let result = run_request_in_subtransaction(|| {
-        process_request(
+        // Each request reads from its own snapshot. pgrx runs read-only SPI statements
+        // (the transaction has not written yet) on the active snapshot, which
+        // `BackgroundWorker::transaction` pushes once when the batch starts; without this,
+        // a request that joins a batch late would not see rows other sessions committed
+        // since (e.g. a topic created by SQL just before the client asked for it). In READ
+        // COMMITTED, GetTransactionSnapshot takes a fresh snapshot. A panic unwinds to the
+        // subtransaction abort, which pops snapshots pushed inside it.
+        unsafe { pg_sys::PushActiveSnapshot(pg_sys::GetTransactionSnapshot()) };
+        let outcome = process_request(
             request,
             env.coordinator,
             env.broker_metadata,
@@ -1199,7 +1207,9 @@ fn run_one_request(
             env.notify_tx,
             env.compression,
             env.shadow_store,
-        )
+        );
+        unsafe { pg_sys::PopActiveSnapshot() };
+        outcome
     });
     // A reported rollback (handler error) already logged itself and sent its
     // response; only a real panic is worth a warning here.
