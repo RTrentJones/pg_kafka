@@ -110,6 +110,16 @@ pub trait ShadowDb {
 
     /// Every row of `kafka.shadow_config`, parsed. `None` if the query failed.
     fn load_topic_configs(&self) -> Option<Vec<TopicShadowConfig>>;
+
+    /// The xid of the current (sub)transaction, or 0 if it has none. Taken right
+    /// after a sync-mode produce writes its outbox rows, so it identifies the
+    /// innermost subtransaction those writes belong to.
+    fn current_transaction_id(&self) -> u32;
+
+    /// Whether `xid` committed — for a subtransaction xid, whether it and every
+    /// enclosing transaction committed. False for 0, an aborted xid, or one
+    /// still in progress. Called after the worker's commit.
+    fn transaction_committed(&self, xid: u32) -> bool;
 }
 
 /// Production [`ShadowDb`]: SPI and the real GUCs.
@@ -445,6 +455,22 @@ impl ShadowDb for SpiShadowDb {
 
         query_ok.then_some(configs)
     }
+
+    fn current_transaction_id(&self) -> u32 {
+        // SAFETY: reads the backend's own transaction state; no allocation.
+        unsafe { pgrx::pg_sys::GetCurrentTransactionIdIfAny() }.into_inner()
+    }
+
+    fn transaction_committed(&self, xid: u32) -> bool {
+        if xid == 0 {
+            return false;
+        }
+        // SAFETY: a clog lookup; valid outside a transaction. The worker calls
+        // this after its own commit, so the xid is never still in progress here.
+        unsafe {
+            pgrx::pg_sys::TransactionIdDidCommit(pgrx::pg_sys::TransactionId::from_inner(xid))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -507,6 +533,10 @@ pub(crate) mod fake {
         pub fail_pending_txn_lookup: bool,
         /// Make `claim_due_outbox_rows` fail.
         pub fail_claim: bool,
+        /// What `current_transaction_id` returns.
+        pub current_xid: u32,
+        /// Xids `transaction_committed` reports as committed.
+        pub committed_xids: std::collections::HashSet<u32>,
     }
 
     /// In-memory [`ShadowDb`].
@@ -712,6 +742,14 @@ pub(crate) mod fake {
 
         fn load_topic_configs(&self) -> Option<Vec<TopicShadowConfig>> {
             self.state().configs.clone()
+        }
+
+        fn current_transaction_id(&self) -> u32 {
+            self.state().current_xid
+        }
+
+        fn transaction_committed(&self, xid: u32) -> bool {
+            xid != 0 && self.state().committed_xids.contains(&xid)
         }
     }
 }

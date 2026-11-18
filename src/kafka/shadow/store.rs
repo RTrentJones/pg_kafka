@@ -44,10 +44,12 @@
 //! it is durable:
 //!
 //! - **Async**: the poll forwards the row after commit (non-blocking produce).
-//! - **Sync (bounded)**: the produce additionally waits up to a short cap for
-//!   the ack before returning. On timeout it returns anyway — the row stays
-//!   durable and the poll retries it. This replaces the old unbounded
-//!   `block_on`, which could stall every client for minutes (SH-14).
+//! - **Sync (bounded)**: after the request's transaction commits, and before
+//!   its response is released, the worker calls `forward_sync_after_commit`,
+//!   which forwards the request's rows and waits up to a short cap for their
+//!   acks. On timeout the response goes out anyway — the row stays durable and
+//!   the poll retries it (SH-14). Forwarding only after commit means a request
+//!   that rolls back never leaves a copy on the external broker.
 //!
 //! ## Database access
 //!
@@ -176,8 +178,8 @@ const MAX_FORWARD_RETRIES: i64 = 10;
 /// forwarder crash) and lease-based retry must resume to stay at-least-once.
 const INFLIGHT_EVICT_AFTER: Duration = Duration::from_secs(150);
 
-/// Upper bound a bounded-sync produce waits for external confirmation before
-/// returning anyway. The outbox row stays durable and the poll retries it, so
+/// Upper bound one `forward_sync_after_commit` call waits for external
+/// confirmation before returning anyway. The outbox row stays durable and the poll retries it, so
 /// this is a latency cap, never a correctness boundary (SH-14). Kept short
 /// because the wait holds the single DB thread; a healthy broker acks in
 /// milliseconds, and a slow one just degrades sync toward the async poll.
@@ -233,18 +235,31 @@ pub struct ShadowStore<S: KafkaStore, D: ShadowDb = SpiShadowDb> {
     /// of re-sent, so a slow ack no longer produces a duplicate delivery
     /// (issue #93).
     inflight: super::inflight::InflightTracker,
-    /// Acks for *other* rows that a sync-mode produce drained while waiting for its
-    /// own. Applying them inside that produce's subtransaction lost them whenever the
-    /// request rolled back (the ack was already consumed from the channel), leaving
-    /// delivered rows pending: duplicate deliveries and, eventually, false dead
-    /// letters. They are applied by `drain_forward_acks` in its own subtransaction.
+    /// Acks that the post-commit sync wait (`forward_sync_after_commit`) read off
+    /// the channel. No transaction is open there, and applying an ack inside a
+    /// request's subtransaction would lose it if the request rolled back (it was
+    /// already consumed from the channel): delivered rows left pending, re-sent,
+    /// and eventually falsely dead-lettered. They are applied by
+    /// `drain_forward_acks` in its own subtransaction.
     deferred_acks: Mutex<Vec<ForwardAck>>,
-    /// Deadline shared by every sync-mode forward of the current request, so a
-    /// produce to many partitions waits at most `SYNC_FORWARD_WAIT_MS` in total
-    /// rather than per partition (the wait blocks the single DB thread). Reset by
-    /// `begin_request`.
-    sync_budget_deadline: Mutex<Option<Instant>>,
+    /// Sync-mode forwards written by requests whose commit has not been seen
+    /// yet, each tagged with the xid of the subtransaction that wrote its
+    /// outbox row. Sent by `forward_sync_after_commit` only if that xid
+    /// committed.
+    sync_pending: Mutex<Vec<SyncForward>>,
 }
+
+/// One sync-mode forward waiting for its request's commit.
+struct SyncForward {
+    /// Xid of the (sub)transaction that wrote the outbox row.
+    xid: u32,
+    request: ForwardRequest,
+}
+
+/// Cap on `sync_pending`. Entries beyond it are dropped (their outbox rows are
+/// durable and the poll forwards them), so a worker that never calls
+/// `forward_sync_after_commit` degrades sync to async instead of leaking.
+const SYNC_PENDING_CAP: usize = 10_000;
 
 impl<S: KafkaStore> ShadowStore<S> {
     /// Create a new ShadowStore wrapping the given inner store
@@ -274,13 +289,11 @@ impl<S: KafkaStore> ShadowStore<S> {
 }
 
 impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
-    /// Called by the worker before each request: starts a new sync-forward budget.
-    pub fn begin_request(&self) {
-        *self
-            .sync_budget_deadline
-            .lock()
-            .unwrap_or_else(|p| p.into_inner()) = None;
-    }
+    /// Called by the worker before each request. Nothing to reset any more: the
+    /// sync wait moved to `forward_sync_after_commit`, which has one budget per
+    /// call. Kept so the worker call site need not change; it can be removed
+    /// together with that call.
+    pub fn begin_request(&self) {}
 
     /// Create a ShadowStore over `inner` whose own SQL goes through `db`.
     pub fn with_db(inner: S, db: D) -> Self {
@@ -299,7 +312,7 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
             license: RwLock::new(None),
             inflight: super::inflight::InflightTracker::new(INFLIGHT_EVICT_AFTER),
             deferred_acks: Mutex::new(Vec::new()),
-            sync_budget_deadline: Mutex::new(None),
+            sync_pending: Mutex::new(Vec::new()),
         }
     }
 
@@ -756,7 +769,7 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
     /// the produce request's subtransaction), so the outbox is exactly
     /// consistent with what was persisted locally. No payload is copied — it
     /// already lives in `kafka.messages`. The periodic poll forwards async
-    /// topics; sync topics additionally wait (bounded) for confirmation here.
+    /// topics; sync topics are also queued for `forward_sync_after_commit`.
     fn enqueue_outbox(
         &self,
         topic_id: i32,
@@ -804,105 +817,93 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
         }
 
         // Async topics are forwarded by the periodic poll after commit. Sync
-        // topics wait (bounded) for external confirmation now (SH-14).
+        // topics are forwarded right after the commit, before the response is
+        // released (SH-14); nothing leaves for the external broker while the
+        // request can still roll back.
         if config.sync_mode == SyncMode::Sync {
-            self.forward_sync_bounded(
-                topic_id,
-                external_topic,
-                partition_id,
-                records,
-                base_offset,
-                &selected,
-            );
+            let xid = self.db.current_transaction_id();
+            let mut queue = self.sync_pending.lock().unwrap_or_else(|p| p.into_inner());
+            for &local_offset in &selected {
+                if queue.len() >= SYNC_PENDING_CAP {
+                    tracing::warn!(
+                        "Shadow: {} sync forwards awaiting commit; leaving the rest to the poll",
+                        queue.len()
+                    );
+                    break;
+                }
+                let Some(record) = records.get((local_offset - base_offset) as usize) else {
+                    continue;
+                };
+                queue.push(SyncForward {
+                    xid,
+                    request: ForwardRequest::new(
+                        topic_id,
+                        external_topic.to_string(),
+                        partition_id,
+                        record.key.clone(),
+                        record.value.clone(),
+                        local_offset,
+                    ),
+                });
+            }
         }
     }
 
-    /// Bounded-sync forward (SH-14): for a sync-mode produce, eagerly hand the
-    /// just-written outbox rows to the network thread and wait up to
-    /// `SYNC_FORWARD_WAIT_MS` for their acks, applying every ack we observe. On
-    /// timeout we return anyway — the rows are durable and the poll retries
-    /// them. This replaces the old `block_on`, so a down broker delays a single
-    /// produce by at most the cap instead of stalling every client forever.
-    fn forward_sync_bounded(
-        &self,
-        topic_id: i32,
-        external_topic: &str,
-        partition_id: i32,
-        records: &[Record],
-        base_offset: i64,
-        selected: &[i64],
-    ) {
-        let mut pending: std::collections::HashSet<i64> = selected.iter().copied().collect();
-
-        // Send a forward request for each selected record.
-        for &local_offset in selected {
-            let idx = (local_offset - base_offset) as usize;
-            let record = match records.get(idx) {
-                Some(r) => r,
-                None => {
-                    pending.remove(&local_offset);
-                    continue;
-                }
-            };
-            let req = ForwardRequest::new(
-                topic_id,
-                external_topic.to_string(),
-                partition_id,
-                record.key.clone(),
-                record.value.clone(),
-                local_offset,
-            );
-            // Issue #93: register the sync dispatch too, so an outbox poll
-            // that re-claims this row while the ack is still pending (ack
-            // slower than the retry lease) skips it instead of duplicating it.
-            let key = (topic_id, partition_id, local_offset);
-            if !self.inflight.try_begin(key) {
-                // Already in flight from an earlier dispatch — don't re-send.
-                pending.remove(&local_offset);
-                continue;
-            }
-            if !self.try_send_forward(req) {
-                // Could not enqueue — leave it for the poll, stop waiting on it.
-                self.inflight.complete(&key);
-                pending.remove(&local_offset);
-            }
-        }
-
-        if pending.is_empty() {
+    /// Bounded-sync forward (SH-14). The worker calls this after a request's
+    /// transaction has committed and before it releases the response.
+    ///
+    /// Forwards every queued sync-mode row whose writing subtransaction
+    /// committed (a row from a rolled-back request is dropped: its outbox row is
+    /// gone too, so nothing reaches the external broker), then waits up to
+    /// `SYNC_FORWARD_WAIT_MS` in total for their acks. On timeout it returns
+    /// anyway — the rows are durable and the poll retries them.
+    ///
+    /// No transaction is open here, so acks are not applied: every ack read is
+    /// queued for `drain_forward_acks`, which applies it in its own
+    /// subtransaction on the next outbox tick. The rows stay in flight until
+    /// then, so the poll does not re-send them.
+    pub fn forward_sync_after_commit(&self) {
+        let queued =
+            std::mem::take(&mut *self.sync_pending.lock().unwrap_or_else(|p| p.into_inner()));
+        if queued.is_empty() {
             return;
         }
 
-        // Wait (bounded) for acks. The bound is shared by the whole request (see
-        // sync_budget_deadline). Our own acks are applied now (their rows belong to
-        // this request); others are deferred to drain_forward_acks so a rollback of
-        // this request cannot lose them.
-        let deadline = *self
-            .sync_budget_deadline
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get_or_insert_with(|| Instant::now() + Duration::from_millis(SYNC_FORWARD_WAIT_MS));
-        loop {
+        let mut pending: std::collections::HashSet<(i32, i32, i64)> =
+            std::collections::HashSet::new();
+        for SyncForward { xid, request } in queued {
+            if !self.db.transaction_committed(xid) {
+                continue;
+            }
+            // Issue #93: register the sync dispatch too, so an outbox poll
+            // that re-claims this row while the ack is still pending (ack
+            // slower than the retry lease) skips it instead of duplicating it.
+            let key = (request.topic_id, request.partition_id, request.local_offset);
+            if !self.inflight.try_begin(key) {
+                // Already in flight from an earlier dispatch — don't re-send.
+                continue;
+            }
+            if !self.try_send_forward(request) {
+                // Could not enqueue — leave it for the poll, stop waiting on it.
+                self.inflight.complete(&key);
+                continue;
+            }
+            pending.insert(key);
+        }
+
+        let deadline = Instant::now() + Duration::from_millis(SYNC_FORWARD_WAIT_MS);
+        while !pending.is_empty() {
             let remaining = match deadline.checked_duration_since(Instant::now()) {
                 Some(r) if !r.is_zero() => r,
                 _ => break,
             };
             match self.recv_ack_timeout(remaining) {
                 Some(ack) => {
-                    let is_ours = ack.topic_id == topic_id
-                        && ack.partition_id == partition_id
-                        && pending.contains(&ack.local_offset);
-                    if !is_ours {
-                        self.deferred_acks
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .push(ack);
-                        continue;
-                    }
-                    self.apply_ack(&ack);
-                    pending.remove(&ack.local_offset);
-                    if pending.is_empty() {
-                        break;
-                    }
+                    pending.remove(&(ack.topic_id, ack.partition_id, ack.local_offset));
+                    self.deferred_acks
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .push(ack);
                 }
                 None => break, // timed out
             }
@@ -2796,8 +2797,7 @@ mod outbox_tests {
         assert!(h.store.topic_cache().get(T).is_some());
     }
 
-    #[test]
-    fn sync_produce_applies_its_own_ack_and_defers_others() {
+    fn sync_harness() -> Harness {
         let mut mock = MockKafkaStore::new();
         mock.expect_insert_records().returning(|_, _, _| Ok(10));
         let h = harness(
@@ -2806,22 +2806,98 @@ mod outbox_tests {
             16,
         );
         h.store.db().add_message((T, 0, 10), b"a", b"1");
-        // An unrelated ack arrives first, then ours.
-        h.acks.send(ok_ack((T, 1, 99), 1)).unwrap();
-        h.acks.send(ok_ack((T, 0, 10), 42)).unwrap();
+        h.store.db().state().current_xid = 77;
+        h
+    }
+
+    #[test]
+    fn sync_produce_forwards_nothing_before_commit() {
+        let h = sync_harness();
 
         h.store.begin_request();
         h.store.insert_records(T, 0, &[record(b"a", b"1")]).unwrap();
 
+        // The outbox row is written in the request's transaction, but nothing is
+        // sent while that transaction can still roll back.
+        assert!(h.store.db().row((T, 0, 10)).is_some());
+        assert!(h.forwards.try_recv().is_err());
+        assert_eq!(h.store.sync_pending.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn sync_forward_after_commit_sends_and_defers_every_ack() {
+        let h = sync_harness();
+        h.store.insert_records(T, 0, &[record(b"a", b"1")]).unwrap();
+        h.store.db().state().committed_xids.insert(77);
+        // An unrelated ack arrives first, then ours.
+        h.acks.send(ok_ack((T, 1, 99), 1)).unwrap();
+        h.acks.send(ok_ack((T, 0, 10), 42)).unwrap();
+
+        h.store.forward_sync_after_commit();
+
         let sent: Vec<ForwardRequest> = h.forwards.try_iter().collect();
         assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].topic_name, "ext");
         assert_eq!(sent[0].value.as_deref(), Some(&b"1"[..]));
+        assert!(h.store.sync_pending.lock().unwrap().is_empty());
+        // No transaction is open after commit: both acks wait for the drain, and
+        // the row stays in flight so the poll cannot re-send it meanwhile.
+        assert_eq!(h.store.deferred_acks.lock().unwrap().len(), 2);
+        assert_eq!(h.store.db().row((T, 0, 10)).unwrap().external_offset, None);
+        h.store.db().advance_ms(OUTBOX_RETRY_INTERVAL_MS + 1);
+        assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 0);
+
+        assert_eq!(h.store.drain_forward_acks(), 2);
         assert_eq!(
             h.store.db().row((T, 0, 10)).unwrap().external_offset,
             Some(42)
         );
-        let deferred = h.store.deferred_acks.lock().unwrap();
-        assert_eq!(deferred.len(), 1);
-        assert_eq!(deferred[0].partition_id, 1);
+        assert!(h.store.inflight.live_keys().0.is_empty());
+    }
+
+    #[test]
+    fn sync_forward_of_a_rolled_back_request_sends_nothing() {
+        let h = sync_harness();
+        h.store.insert_records(T, 0, &[record(b"a", b"1")]).unwrap();
+        // xid 77 never committed (the request's subtransaction rolled back).
+
+        h.store.forward_sync_after_commit();
+
+        assert!(h.forwards.try_recv().is_err());
+        assert!(h.store.sync_pending.lock().unwrap().is_empty());
+        assert!(h.store.inflight.live_keys().0.is_empty());
+    }
+
+    #[test]
+    fn sync_forward_with_full_channel_leaves_the_row_to_the_poll() {
+        let mut mock = MockKafkaStore::new();
+        mock.expect_insert_records().returning(|_, _, _| Ok(10));
+        let h = harness(
+            mock,
+            vec![topic_config(SyncMode::Sync, WriteMode::DualWrite)],
+            1,
+        );
+        h.store.db().add_message((T, 0, 10), b"a", b"1");
+        h.store.db().add_message((T, 0, 11), b"b", b"2");
+        h.store.db().state().current_xid = 5;
+        h.store.db().state().committed_xids.insert(5);
+        h.acks.send(ok_ack((T, 0, 10), 1)).unwrap();
+
+        h.store
+            .insert_records(T, 0, &[record(b"a", b"1"), record(b"b", b"2")])
+            .unwrap();
+        h.store.forward_sync_after_commit();
+
+        assert_eq!(h.forwards.try_iter().count(), 1);
+        let (_, _, offsets) = h.store.inflight.live_keys();
+        assert_eq!(offsets, vec![10], "the unsent row must not stay in flight");
+    }
+
+    #[test]
+    fn sync_forward_without_queued_rows_returns_immediately() {
+        let h = sync_harness();
+        let start = Instant::now();
+        h.store.forward_sync_after_commit();
+        assert!(start.elapsed() < Duration::from_secs(1));
     }
 }

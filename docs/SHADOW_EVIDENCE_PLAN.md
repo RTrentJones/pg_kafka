@@ -17,7 +17,7 @@ Two goals, coupled:
    `conformance.json` / `bench.json` / `session.svg`). Shadow-mode forwarding is currently **absent** from
    that pipeline and from the site. *(Done: `shadow.json` is now part of the pipeline and the site.)*
 2. **Before/after verification for the dead-`ShadowStore`-producer removal (PR4).** PR4 deletes the *dead*
-   pre-outbox forwarding path; the evidence exercises the *live* path (`forward_sync_bounded` + durable outbox
+   pre-outbox forwarding path; the evidence exercises the *live* path (`forward_sync_after_commit` + durable outbox
    + network-thread producer). So the shadow evidence must be **identical before and after PR4** = published,
    objective proof the removal changed nothing.
 

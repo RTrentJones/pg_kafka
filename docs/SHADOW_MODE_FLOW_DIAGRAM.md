@@ -34,8 +34,9 @@ worker loop in `src/worker.rs`.
 │  │  │  1. inner.insert_records()          → kafka.messages (local write) │ │    │
 │  │  │  2. enqueue_outbox(): percentage routing, then INSERT pending      │ │    │
 │  │  │     rows into kafka.shadow_tracking (same transaction)             │ │    │
-│  │  │  3. sync_mode = sync only: forward_sync_bounded() sends the rows   │ │    │
-│  │  │     now and waits ≤ 5s (SYNC_FORWARD_WAIT_MS) for their acks       │ │    │
+│  │  │  3. sync_mode = sync only: the rows are queued; after commit the   │ │    │
+│  │  │     worker calls forward_sync_after_commit(), which sends them     │ │    │
+│  │  │     and waits ≤ 5s (SYNC_FORWARD_WAIT_MS) before the response      │ │    │
 │  │  │                                                                    │ │    │
 │  │  │  write_mode (dual_write | external_only) does NOT change this      │ │    │
 │  │  │  path; it only controls READS (external_only suppresses local      │ │    │
@@ -76,8 +77,8 @@ worker loop in `src/worker.rs`.
 ```
 
 Only the network thread talks to the external broker. The DB thread never blocks on rdkafka; the
-only wait on the DB thread is the bounded sync wait (at most 5 s per produce), which receives acks
-from the network thread over the ack channel.
+only wait on the DB thread is the bounded sync wait after commit (at most 5 s per request), which
+reads acks from the network thread over the ack channel and queues them for `drain_forward_acks()`.
 
 ## Configuration Lifecycle
 
@@ -287,11 +288,12 @@ validation and a 30 s health-check TTL). In the current code it is reachable onl
 │   │   │    Forward → selected                                             │  │   │
 │   │   │  INSERT INTO kafka.shadow_tracking (topic_id, partition_id,       │  │   │
 │   │   │         local_offset) ... ON CONFLICT DO NOTHING   (same txn)     │  │   │
-│   │   │  if sync_mode = sync → forward_sync_bounded()                     │  │   │
+│   │   │  if sync_mode = sync → queue for forward_sync_after_commit()      │  │   │
 │   │   └──────────────────────────────────────────────────────────────────┘  │   │
 │   │                                                                          │   │
-│   │   Step 4: Commit, then the buffered produce response is sent             │   │
-│   │           (response-after-commit barrier)                                │   │
+│   │   Step 4: Commit; then forward_sync_after_commit() (sync rows            │   │
+│   │           whose subtransaction committed); then the buffered             │   │
+│   │           produce response is sent (response-after-commit barrier)       │   │
 │   └─────────────────────────────────────────────────────────────────────────┘   │
 │                                                                                  │
 └─────────────────────────────────────────────────────────────────────────────────┘
@@ -342,17 +344,23 @@ write the same outbox row and both are finalized by the same `apply_ack()`.
 │          ▼                                                  ▼                   │
 │   ┌──────────────────────────────┐      ┌──────────────────────────────────┐    │
 │   │       SYNC MODE              │      │         ASYNC MODE               │    │
-│   │  forward_sync_bounded()      │      │                                  │    │
-│   │                              │      │  return immediately; the outbox  │    │
-│   │  for each selected record:   │      │  poll (≤ 250 ms later, after     │    │
-│   │   inflight.try_begin(row)    │      │  commit) claims and dispatches   │    │
-│   │   forward_tx.try_send(req)   │      │  the row                         │    │
-│   │   (full → leave for poll)    │      │                                  │    │
-│   │                              │      └──────────────────────────────────┘    │
+│   │  forward_sync_after_commit() │      │                                  │    │
+│   │  (worker, after the commit,  │      │  return immediately; the outbox  │    │
+│   │  before the response)        │      │  poll (≤ 250 ms later, after     │    │
+│   │                              │      │  commit) claims and dispatches   │    │
+│   │  for each queued row whose   │      │  the row                         │    │
+│   │  subtransaction committed:   │      │                                  │    │
+│   │   inflight.try_begin(row)    │      └──────────────────────────────────┘    │
+│   │   forward_tx.try_send(req)   │                                              │
+│   │   (full → leave for poll)    │                                              │
+│   │  rolled back → dropped, never│                                              │
+│   │  sent                        │                                              │
+│   │                              │                                              │
 │   │  wait ≤ SYNC_FORWARD_WAIT_MS │                                              │
-│   │  (5s) on the ack channel,    │                                              │
-│   │  apply_ack() for EVERY ack   │                                              │
-│   │  received (ours or not)      │                                              │
+│   │  (5s) on the ack channel;    │                                              │
+│   │  every ack read is queued for│                                              │
+│   │  drain_forward_acks() (no    │                                              │
+│   │  transaction is open here)   │                                              │
 │   │                              │                                              │
 │   │  timeout → return anyway;    │                                              │
 │   │  the row stays pending and   │                                              │

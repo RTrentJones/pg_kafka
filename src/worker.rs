@@ -986,6 +986,7 @@ fn execute_request_in_transaction(
 
     match txn_result {
         Ok(()) => {
+            shadow.forward_sync_after_commit();
             // Commit is durable and visible: flush the buffered response(s) to
             // the client, in order. Today a request yields at most one
             // response, but the loop keeps a future multi-response request

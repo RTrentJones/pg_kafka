@@ -27,6 +27,7 @@ pub mod helpers;
 pub mod no_duplicates;
 pub mod percentage_routing;
 pub mod replay;
+pub mod rollback;
 pub mod topic_mapping;
 pub mod transaction_integration;
 
@@ -50,6 +51,7 @@ pub use percentage_routing::{
     test_zero_percent_forwarding,
 };
 pub use replay::{test_replay_historical_messages, test_replay_skips_aborted_records};
+pub use rollback::test_sync_forward_skips_rolled_back_request;
 pub use topic_mapping::test_topic_name_mapping;
 pub use transaction_integration::{
     test_aborted_transaction_not_forwarded, test_committed_transaction_forwarded,

@@ -239,6 +239,8 @@ pub use shadow::{
     // Replay
     test_replay_historical_messages,
     test_replay_skips_aborted_records,
+    // Sync forwarding after commit
+    test_sync_forward_skips_rolled_back_request,
     // Topic mapping
     test_topic_name_mapping,
     test_zero_percent_forwarding,
