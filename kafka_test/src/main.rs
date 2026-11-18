@@ -173,6 +173,8 @@ use kafka_test::{
     test_heartbeat_bypasses_produce_backlog,
     test_heartbeat_during_rebalance_window,
     test_heartbeat_keeps_membership,
+    test_held_join_completed_by_leave_group,
+    test_held_join_completed_by_session_timeout_sweep,
     test_high_offset_values,
     test_high_watermark_no_regress_after_cleanup,
     test_huge_retention_ms_does_not_break_sweep,
@@ -186,6 +188,7 @@ use kafka_test::{
     test_idempotent_producer_restart,
     test_incremental_alter_configs_retention_roundtrip,
     test_invalid_group_id,
+    test_join_group_held_until_all_members_rejoin,
     // Partition tests
     test_key_distribution,
     test_key_routing_across_producers,
@@ -764,6 +767,24 @@ fn get_all_tests() -> Vec<TestDef> {
             name: "test_group_rebalance_keeps_old_generation_usable",
             test_fn: wrap_test!(test_group_rebalance_keeps_old_generation_usable),
             parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_join_group_held_until_all_members_rejoin",
+            test_fn: wrap_test!(test_join_group_held_until_all_members_rejoin),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_held_join_completed_by_leave_group",
+            test_fn: wrap_test!(test_held_join_completed_by_leave_group),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_held_join_completed_by_session_timeout_sweep",
+            test_fn: wrap_test!(test_held_join_completed_by_session_timeout_sweep),
+            parallel_safe: false,
         },
         TestDef {
             category: "error_paths",

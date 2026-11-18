@@ -860,6 +860,28 @@ mod group_wire {
         Ok(roundtrip(s, 3, corr, &req).await?.error_code)
     }
 
+    /// Heartbeat until the group reports REBALANCE_IN_PROGRESS (27), or give up after
+    /// 5 s and return the last code. Heartbeat travels on the worker's liveness lane,
+    /// so it can overtake a JoinGroup still queued on the main lane.
+    pub async fn heartbeat_until_rebalance(
+        s: &mut TcpStream,
+        group: &str,
+        member_id: &str,
+        generation: i32,
+        corr: i32,
+    ) -> Result<i16, Box<dyn std::error::Error>> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut corr = corr;
+        loop {
+            let code = heartbeat(s, group, member_id, generation, corr).await?;
+            if code == 27 || std::time::Instant::now() > deadline {
+                return Ok(code);
+            }
+            corr += 1000;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
     pub async fn commit(
         s: &mut TcpStream,
         group: &str,
@@ -885,11 +907,13 @@ mod group_wire {
     }
 }
 
-/// The coordinator's rebalance behaviour as seen by a client:
-/// - when a new member starts a rebalance, members still on the old generation get
-///   REBALANCE_IN_PROGRESS from Heartbeat (not ILLEGAL_GENERATION, which clients
-///   treat as "partitions lost") and can still commit offsets for their revoked
-///   partitions;
+/// The coordinator's rebalance behaviour as seen by a client (JoinGroup responses are
+/// held until the join phase completes, so each member uses its own connection):
+/// - when a new member starts a rebalance, its JoinGroup waits while the existing
+///   members still hold the current generation: Heartbeat gives them
+///   REBALANCE_IN_PROGRESS (not ILLEGAL_GENERATION, which clients treat as
+///   "partitions lost") and their revoke-time OffsetCommit is accepted and stored;
+///   once they rejoin, all three members get the same, next generation;
 /// - a follower that rejoins a stable group with unchanged metadata keeps its
 ///   assignment and generation (it used to lose the assignment and force another
 ///   rebalance);
@@ -904,31 +928,53 @@ pub async fn test_group_rebalance_keeps_old_generation_usable() -> TestResult {
         .build()
         .await?;
     let group = ctx.unique_group("review-group").await;
-    let mut s = TcpStream::connect(BROKER).await?;
+    let mut sa = TcpStream::connect(BROKER).await?;
+    let mut sb = TcpStream::connect(BROKER).await?;
+    let mut sc = TcpStream::connect(BROKER).await?;
 
-    // Stable group {a (leader), b}.
-    let a = join(&mut s, &group, "", b"sub", 800).await?;
-    let b = join(&mut s, &group, "", b"sub", 801).await?;
-    let a = join(&mut s, &group, &a.member_id, b"sub", 802).await?;
+    // Stable group {a (leader), b}: a joins alone, b's join waits for a to rejoin.
+    let a = join(&mut sa, &group, "", b"sub", 800).await?;
+    let a_id = a.member_id.clone();
+    // (Errors are stringified inside `tokio::join!`: a pending branch's output is held
+    // across awaits, and the test future must be Send.)
+    let (b, a) = tokio::join!(
+        async {
+            join(&mut sb, &group, "", b"sub", 801)
+                .await
+                .map_err(|e| e.to_string())
+        },
+        async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let hb = heartbeat_until_rebalance(&mut sa, &group, &a_id, a.generation, 802)
+                .await
+                .map_err(|e| e.to_string())?;
+            assert_eq!(hb, 27, "REBALANCE_IN_PROGRESS tells a to rejoin");
+            join(&mut sa, &group, &a_id, b"sub", 803)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    );
+    let (a, b) = (a?, b?);
     assert_eq!(a.leader, a.member_id);
+    assert_eq!(a.generation, b.generation, "both get the same generation");
     let gen = a.generation;
     let (code, _) = sync(
-        &mut s,
+        &mut sa,
         &group,
         &a.member_id,
         gen,
         &[(&a.member_id, b"assign-a"), (&b.member_id, b"assign-b")],
-        803,
+        804,
     )
     .await?;
     assert_eq!(code, 0, "leader sync");
-    let (code, got) = sync(&mut s, &group, &b.member_id, gen, &[], 804).await?;
+    let (code, got) = sync(&mut sb, &group, &b.member_id, gen, &[], 805).await?;
     assert_eq!((code, got.as_slice()), (0, b"assign-b".as_slice()));
     println!("Step 1: stable at generation {}", gen);
 
     // A follower rejoining with the same metadata keeps generation and assignment.
-    let b2 = join(&mut s, &group, &b.member_id, b"sub", 805).await?;
-    let (code, got) = sync(&mut s, &group, &b.member_id, b2.generation, &[], 806).await?;
+    let b2 = join(&mut sb, &group, &b.member_id, b"sub", 806).await?;
+    let (code, got) = sync(&mut sb, &group, &b.member_id, b2.generation, &[], 807).await?;
     println!(
         "   follower rejoin: generation {} -> {}, sync code {} assignment {:?}",
         gen,
@@ -942,17 +988,51 @@ pub async fn test_group_rebalance_keeps_old_generation_usable() -> TestResult {
     );
     assert_eq!((code, got.as_slice()), (0, b"assign-b".as_slice()));
 
-    // A new member starts a rebalance; a and b still hold `gen`.
-    let c = join(&mut s, &group, "", b"sub", 807).await?;
-    assert!(c.generation > gen);
-    let hb = heartbeat(&mut s, &group, &a.member_id, gen, 808).await?;
-    let commit_code = commit(&mut s, &group, &b.member_id, gen, &topic.name, 5, 809).await?;
-    println!(
-        "   during rebalance: old-generation heartbeat={} commit={}",
-        hb, commit_code
+    // A new member starts a rebalance; its join waits while a and b still hold `gen`.
+    let (c, rest) = tokio::join!(
+        async {
+            join(&mut sc, &group, "", b"sub", 808)
+                .await
+                .map_err(|e| e.to_string())
+        },
+        async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let hb = heartbeat_until_rebalance(&mut sa, &group, &a.member_id, gen, 809)
+                .await
+                .map_err(|e| e.to_string())?;
+            let commit_code = commit(&mut sb, &group, &b.member_id, gen, &topic.name, 5, 810)
+                .await
+                .map_err(|e| e.to_string())?;
+            println!(
+                "   during rebalance: current-generation heartbeat={} commit={}",
+                hb, commit_code
+            );
+            assert_eq!(hb, 27, "REBALANCE_IN_PROGRESS, so the member rejoins");
+            assert_eq!(commit_code, 0, "the revoke-time commit must be accepted");
+            let (a3, b3) = tokio::join!(
+                async {
+                    join(&mut sa, &group, &a.member_id, b"sub", 811)
+                        .await
+                        .map_err(|e| e.to_string())
+                },
+                async {
+                    join(&mut sb, &group, &b.member_id, b"sub", 812)
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+            );
+            Ok::<_, String>((a3?, b3?))
+        }
     );
-    assert_eq!(hb, 27, "REBALANCE_IN_PROGRESS, so the member rejoins");
-    assert_eq!(commit_code, 0, "the revoke-time commit must be accepted");
+    let (c, (a3, b3)) = (c?, rest?);
+    println!(
+        "   after rejoin: generations a={} b={} c={}",
+        a3.generation, b3.generation, c.generation
+    );
+    assert_eq!(a3.generation, gen + 1);
+    assert_eq!(b3.generation, gen + 1);
+    assert_eq!(c.generation, gen + 1);
+    assert_eq!(c.leader, a.member_id, "the leader keeps leading");
     let stored: i64 = ctx
         .db()
         .query_one(
@@ -964,7 +1044,7 @@ pub async fn test_group_rebalance_keeps_old_generation_usable() -> TestResult {
     assert_eq!(stored, 5);
 
     // Unknown group.
-    let unknown = heartbeat(&mut s, "review-no-such-group", "m", 1, 810).await?;
+    let unknown = heartbeat(&mut sa, "review-no-such-group", "m", 1, 813).await?;
     println!("   heartbeat for an unknown group: {}", unknown);
     assert_eq!(unknown, 25, "UNKNOWN_MEMBER_ID");
 
