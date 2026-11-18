@@ -1897,6 +1897,78 @@ fn get_all_tests() -> Vec<TestDef> {
             test_fn: wrap_test!(test_response_ordering_with_long_poll),
             parallel_safe: false, // timing-sensitive: asserts long-poll wait duration
         },
+        // auth stream: TLS + SASL listeners (kafka_test/src/auth). Sequential: they
+        // restart the listener worker; the teardown test must stay last.
+        TestDef {
+            category: "auth",
+            name: "test_auth_sasl_plain_roundtrip",
+            test_fn: wrap_test!(kafka_test::auth::tests::test_auth_sasl_plain_roundtrip),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "auth",
+            name: "test_auth_sasl_scram_sha256_roundtrip",
+            test_fn: wrap_test!(kafka_test::auth::tests::test_auth_sasl_scram_sha256_roundtrip),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "auth",
+            name: "test_auth_sasl_scram_sha512_roundtrip",
+            test_fn: wrap_test!(kafka_test::auth::tests::test_auth_sasl_scram_sha512_roundtrip),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "auth",
+            name: "test_auth_wrong_password_rejected",
+            test_fn: wrap_test!(kafka_test::auth::tests::test_auth_wrong_password_rejected),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "auth",
+            name: "test_auth_unauthenticated_request_rejected",
+            test_fn: wrap_test!(
+                kafka_test::auth::tests::test_auth_unauthenticated_request_rejected
+            ),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "auth",
+            name: "test_auth_plaintext_listener_unaffected",
+            test_fn: wrap_test!(kafka_test::auth::tests::test_auth_plaintext_listener_unaffected),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "auth",
+            name: "test_auth_tls_roundtrip_and_untrusted_ca",
+            test_fn: wrap_test!(kafka_test::auth::tests::test_auth_tls_roundtrip_and_untrusted_ca),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "auth",
+            name: "test_auth_sasl_ssl_roundtrip",
+            test_fn: wrap_test!(kafka_test::auth::tests::test_auth_sasl_ssl_roundtrip),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "auth",
+            name: "test_auth_user_management_sql",
+            test_fn: wrap_test!(kafka_test::auth::tests::test_auth_user_management_sql),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "auth",
+            name: "test_auth_mutual_tls",
+            test_fn: wrap_test!(kafka_test::auth::tests::test_auth_mutual_tls),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "auth",
+            name: "test_auth_teardown_restores_default_listeners",
+            test_fn: wrap_test!(
+                kafka_test::auth::tests::test_auth_teardown_restores_default_listeners
+            ),
+            parallel_safe: false,
+        },
     ]
 }
 

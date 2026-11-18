@@ -64,6 +64,8 @@ pub mod producer;
 pub mod protocol;
 pub mod shadow;
 pub mod transaction;
+// auth stream: TLS + SASL listener tests
+pub mod auth;
 
 // Re-export infrastructure
 pub use assertions::*;
