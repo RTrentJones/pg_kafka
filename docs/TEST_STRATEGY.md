@@ -16,10 +16,10 @@ Counted at `babcd17` (2026-11):
 
 | Category | Count | Coverage |
 |----------|-------|----------|
-| Unit Tests | 761 | Core logic, handlers, storage, protocol, shadow (`src/`, includes in-module proptest fuzz harnesses) |
+| Unit Tests | 746 | Core logic, handlers, storage, protocol, shadow (`src/`, includes in-module proptest fuzz harnesses) |
 | Property Tests | 10 | `tests/property_tests.rs`: 8 proptest wire-format invariants + 2 boundary tests (CI-run) |
 | E2E Tests | 221 | Full protocol integration (`kafka_test/`, 18 categories) |
-| **Total** | **992** | |
+| **Total** | **977** | |
 
 Regenerate (none of these needs a running broker):
 
