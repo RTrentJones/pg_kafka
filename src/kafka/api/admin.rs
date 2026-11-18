@@ -14,7 +14,7 @@ use kafka_protocol::messages::delete_topics_response::{
 };
 use kafka_protocol::messages::TopicName;
 
-use super::{ApiEnv, Call, KafkaApi, Rejection, RequestHeader};
+use super::{ApiEnv, ApiSchema, Call, KafkaApi, Rejection, RequestHeader};
 use crate::kafka::dispatch::RequestOutcome;
 use crate::kafka::handlers;
 use crate::kafka::messages::{CreatePartitionsTopicRequest, CreateTopicRequest};
@@ -37,38 +37,16 @@ pub struct CreateTopicsRequestData {
     pub validate_only: bool,
 }
 
-impl KafkaApi for CreateTopicsApi {
+impl ApiSchema for CreateTopicsApi {
     type Wire = CreateTopicsRequest;
-    type Request = CreateTopicsRequestData;
+
     /// The requested topic names.
     type Echo = Vec<String>;
     const NAME: &'static str = "CreateTopics";
+
     // The crate cannot decode CreateTopics v0-1.
     const MIN_VERSION: i16 = 2;
     const MAX_VERSION: i16 = 5;
-
-    fn decode(
-        wire: CreateTopicsRequest,
-        _header: &RequestHeader,
-    ) -> Result<Self::Request, Rejection<Self::Echo>> {
-        Ok(CreateTopicsRequestData {
-            topics: wire
-                .topics
-                .into_iter()
-                .map(|t| CreateTopicRequest {
-                    name: t.name.to_string(),
-                    num_partitions: t.num_partitions,
-                    replication_factor: t.replication_factor,
-                })
-                .collect(),
-            timeout_ms: wire.timeout_ms,
-            validate_only: wire.validate_only,
-        })
-    }
-
-    fn echo(request: &Self::Request) -> Vec<String> {
-        request.topics.iter().map(|t| t.name.clone()).collect()
-    }
 
     /// Errors are per topic: report the code on every requested topic.
     fn error_response(
@@ -96,6 +74,33 @@ impl KafkaApi for CreateTopicsApi {
     fn response_has_error(response: &CreateTopicsResponse) -> bool {
         response.topics.iter().any(|t| t.error_code != 0)
     }
+}
+
+impl KafkaApi for CreateTopicsApi {
+    type Request = CreateTopicsRequestData;
+
+    fn decode(
+        wire: CreateTopicsRequest,
+        _header: &RequestHeader,
+    ) -> Result<Self::Request, Rejection<Self::Echo>> {
+        Ok(CreateTopicsRequestData {
+            topics: wire
+                .topics
+                .into_iter()
+                .map(|t| CreateTopicRequest {
+                    name: t.name.to_string(),
+                    num_partitions: t.num_partitions,
+                    replication_factor: t.replication_factor,
+                })
+                .collect(),
+            timeout_ms: wire.timeout_ms,
+            validate_only: wire.validate_only,
+        })
+    }
+
+    fn echo(request: &Self::Request) -> Vec<String> {
+        request.topics.iter().map(|t| t.name.clone()).collect()
+    }
 
     fn handle(request: Self::Request, call: Call<Self>, env: &ApiEnv<'_>) -> RequestOutcome {
         call.run(request, |r, _| {
@@ -116,33 +121,16 @@ pub struct DeleteTopicsRequestData {
     pub timeout_ms: i32,
 }
 
-impl KafkaApi for DeleteTopicsApi {
+impl ApiSchema for DeleteTopicsApi {
     type Wire = DeleteTopicsRequest;
-    type Request = DeleteTopicsRequestData;
+
     /// The requested topic names.
     type Echo = Vec<String>;
     const NAME: &'static str = "DeleteTopics";
+
     // The crate cannot decode DeleteTopics v0.
     const MIN_VERSION: i16 = 1;
     const MAX_VERSION: i16 = 4;
-
-    fn decode(
-        wire: DeleteTopicsRequest,
-        _header: &RequestHeader,
-    ) -> Result<Self::Request, Rejection<Self::Echo>> {
-        Ok(DeleteTopicsRequestData {
-            topic_names: wire
-                .topic_names
-                .into_iter()
-                .map(|t| t.to_string())
-                .collect(),
-            timeout_ms: wire.timeout_ms,
-        })
-    }
-
-    fn echo(request: &Self::Request) -> Vec<String> {
-        request.topic_names.clone()
-    }
 
     /// Errors are per topic: report the code on every requested topic.
     fn error_response(
@@ -168,6 +156,28 @@ impl KafkaApi for DeleteTopicsApi {
     fn response_has_error(response: &DeleteTopicsResponse) -> bool {
         response.responses.iter().any(|t| t.error_code != 0)
     }
+}
+
+impl KafkaApi for DeleteTopicsApi {
+    type Request = DeleteTopicsRequestData;
+
+    fn decode(
+        wire: DeleteTopicsRequest,
+        _header: &RequestHeader,
+    ) -> Result<Self::Request, Rejection<Self::Echo>> {
+        Ok(DeleteTopicsRequestData {
+            topic_names: wire
+                .topic_names
+                .into_iter()
+                .map(|t| t.to_string())
+                .collect(),
+            timeout_ms: wire.timeout_ms,
+        })
+    }
+
+    fn echo(request: &Self::Request) -> Vec<String> {
+        request.topic_names.clone()
+    }
 
     fn handle(request: Self::Request, call: Call<Self>, env: &ApiEnv<'_>) -> RequestOutcome {
         call.run(request, |r, _| {
@@ -190,36 +200,14 @@ pub struct CreatePartitionsRequestData {
     pub validate_only: bool,
 }
 
-impl KafkaApi for CreatePartitionsApi {
+impl ApiSchema for CreatePartitionsApi {
     type Wire = CreatePartitionsRequest;
-    type Request = CreatePartitionsRequestData;
+
     /// The requested topic names.
     type Echo = Vec<String>;
     const NAME: &'static str = "CreatePartitions";
     const MIN_VERSION: i16 = 0;
     const MAX_VERSION: i16 = 2;
-
-    fn decode(
-        wire: CreatePartitionsRequest,
-        _header: &RequestHeader,
-    ) -> Result<Self::Request, Rejection<Self::Echo>> {
-        Ok(CreatePartitionsRequestData {
-            topics: wire
-                .topics
-                .into_iter()
-                .map(|t| CreatePartitionsTopicRequest {
-                    name: t.name.to_string(),
-                    count: t.count,
-                })
-                .collect(),
-            timeout_ms: wire.timeout_ms,
-            validate_only: wire.validate_only,
-        })
-    }
-
-    fn echo(request: &Self::Request) -> Vec<String> {
-        request.topics.iter().map(|t| t.name.clone()).collect()
-    }
 
     /// Errors are per topic: report the code on every requested topic.
     fn error_response(
@@ -244,6 +232,32 @@ impl KafkaApi for CreatePartitionsApi {
 
     fn response_has_error(response: &CreatePartitionsResponse) -> bool {
         response.results.iter().any(|r| r.error_code != 0)
+    }
+}
+
+impl KafkaApi for CreatePartitionsApi {
+    type Request = CreatePartitionsRequestData;
+
+    fn decode(
+        wire: CreatePartitionsRequest,
+        _header: &RequestHeader,
+    ) -> Result<Self::Request, Rejection<Self::Echo>> {
+        Ok(CreatePartitionsRequestData {
+            topics: wire
+                .topics
+                .into_iter()
+                .map(|t| CreatePartitionsTopicRequest {
+                    name: t.name.to_string(),
+                    count: t.count,
+                })
+                .collect(),
+            timeout_ms: wire.timeout_ms,
+            validate_only: wire.validate_only,
+        })
+    }
+
+    fn echo(request: &Self::Request) -> Vec<String> {
+        request.topics.iter().map(|t| t.name.clone()).collect()
     }
 
     fn handle(request: Self::Request, call: Call<Self>, env: &ApiEnv<'_>) -> RequestOutcome {

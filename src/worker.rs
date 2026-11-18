@@ -301,6 +301,81 @@ fn exit_for_restart() -> ! {
 /// (registered in `_PG_init`).
 pub const WORKER_RESTART_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Build the per-listener security (TLS acceptor, SASL mechanisms, advertised address)
+/// for every configured listener, primary first. Loads the TLS files once.
+fn build_listener_securities(
+    settings: &crate::kafka::auth::SecuritySettings,
+) -> Result<Vec<std::sync::Arc<crate::kafka::listener::ListenerSecurity>>, String> {
+    let tls_config = if settings.needs_tls() {
+        Some(crate::kafka::auth::tls::build_server_config(
+            &settings.ssl_cert_file,
+            &settings.ssl_key_file,
+            settings
+                .mutual_tls()
+                .then_some(settings.ssl_ca_file.as_str()),
+        )?)
+    } else {
+        None
+    };
+    let mechanisms = std::sync::Arc::new(settings.sasl_mechanisms.clone());
+    Ok(settings
+        .listeners
+        .iter()
+        .map(|spec| {
+            std::sync::Arc::new(crate::kafka::listener::ListenerSecurity {
+                protocol: spec.protocol,
+                bind_addr: spec.bind_addr(),
+                tls: spec
+                    .protocol
+                    .uses_tls()
+                    .then(|| tls_config.clone())
+                    .flatten()
+                    .map(tokio_rustls::TlsAcceptor::from),
+                sasl_mechanisms: mechanisms.clone(),
+                advertised: spec.advertised.clone(),
+            })
+        })
+        .collect())
+}
+
+/// Answer SASL credential lookups: `first` plus whatever else is queued, in one
+/// transaction (each lookup in its own subtransaction, so one failure cannot affect the
+/// others). The network thread waits on each reply.
+fn serve_credential_requests(
+    first: crate::kafka::auth::CredentialRequest,
+    rx: &crossbeam_channel::Receiver<crate::kafka::auth::CredentialRequest>,
+) {
+    let mut batch = vec![first];
+    while batch.len() < 64 {
+        match rx.try_recv() {
+            Ok(r) => batch.push(r),
+            Err(_) => break,
+        }
+    }
+    let batch = AssertUnwindSafe(batch);
+    BackgroundWorker::transaction(move || {
+        let batch = batch; // capture the whole AssertUnwindSafe, not its field
+        let batch = batch.0;
+        for request in batch {
+            let mut result = Err("credential lookup failed".to_string());
+            let outcome = run_request_in_subtransaction(|| {
+                result = crate::kafka::auth::credentials::lookup_credential(
+                    &request.username,
+                    request.mechanism,
+                );
+            });
+            if let Err(panic_msg) = outcome {
+                pg_warning!("SASL credential lookup rolled back: {}", panic_msg);
+                result = Err("credential lookup failed".to_string());
+            } else if let Err(e) = &result {
+                pg_warning!("SASL credential lookup failed: {}", e);
+            }
+            // The receiver may have given up (timeout / disconnect); nothing to do then.
+            let _ = request.reply.send(result);
+        }
+    });
+}
+
 /// Main entry point for the pg_kafka background worker.
 ///
 /// IMPORTANT: This function MUST follow pgrx background worker conventions:
@@ -448,25 +523,29 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     // retries after WORKER_RESTART_INTERVAL.
     let bind_addr = format!("{}:{}", host, port);
 
+    // auth stream: listener security (pg_kafka.security_protocol for the primary
+    // listener, pg_kafka.additional_listeners, TLS files, SASL mechanisms). Read once
+    // here; a bad setting or unreadable file stops the worker with a clear error.
+    let security_settings = crate::kafka::auth::SecuritySettings::resolve(
+        &crate::kafka::auth::settings::raw_from_gucs(),
+        &host,
+        port,
+    )
+    .unwrap_or_else(|e| pgrx::error!("pg_kafka listener security: {}", e));
+    let listener_securities = build_listener_securities(&security_settings)
+        .unwrap_or_else(|e| pgrx::error!("pg_kafka listener security: {}", e));
+
     let std_listener = match std::net::TcpListener::bind(&bind_addr) {
         Ok(listener) => {
             // Set non-blocking mode for tokio compatibility
             if let Err(e) = listener.set_nonblocking(true) {
                 pgrx::error!("Failed to set non-blocking mode: {}", e);
             }
-            pg_log!("TCP listener bound to {}", bind_addr);
-            // SEC-7: pg_kafka performs no Kafka-wire authentication, so warn loudly when the
-            // listener is reachable from other hosts — an operator must not silently expose
-            // unauthenticated read/write access to every topic.
-            if crate::config::bind_is_publicly_exposed(&host) {
-                pg_warning!(
-                    "pg_kafka is bound to {} (a non-loopback interface) and performs NO \
-                     Kafka-wire authentication or authorization — anyone who can reach this port \
-                     can read and write any topic. Protect it with a firewall/security group, or \
-                     set pg_kafka.host = '127.0.0.1' to allow only local clients.",
-                    bind_addr
-                );
-            }
+            pg_log!(
+                "TCP listener bound to {} ({})",
+                bind_addr,
+                security_settings.listeners[0].protocol.name()
+            );
             listener
         }
         Err(e) => {
@@ -478,6 +557,37 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
             );
         }
     };
+    // Additional listeners (bind failures are fatal like the primary's).
+    let mut std_listeners = vec![std_listener];
+    for spec in &security_settings.listeners[1..] {
+        let addr = spec.bind_addr();
+        match std::net::TcpListener::bind(&addr) {
+            Ok(l) => {
+                if let Err(e) = l.set_nonblocking(true) {
+                    pgrx::error!("Failed to set non-blocking mode: {}", e);
+                }
+                pg_log!("TCP listener bound to {} ({})", addr, spec.protocol.name());
+                std_listeners.push(l);
+            }
+            Err(e) => pgrx::error!(
+                "FATAL: Cannot bind pg_kafka listener {}://{}: {}",
+                spec.protocol.name(),
+                addr,
+                e
+            ),
+        }
+    }
+    // SEC-7: warn loudly about listeners reachable from other hosts that do not
+    // authenticate clients (and SASL/PLAIN in clear text), so an operator does not
+    // silently expose unauthenticated read/write access to every topic.
+    for w in security_settings.warnings() {
+        pg_warning!("{}", w);
+    }
+
+    // auth stream: SASL credential lookups from the network thread (the DB thread
+    // answers them between request batches).
+    let (credential_tx, credential_rx) =
+        crossbeam_channel::bounded::<crate::kafka::auth::CredentialRequest>(1024);
 
     // Step 8: Spawn the network thread
     // This thread runs a multi-threaded tokio runtime for handling all network I/O.
@@ -508,17 +618,21 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
             rt.block_on(async move {
                 // Convert std listener to tokio listener inside the async context
                 // This ensures the listener is registered with THIS runtime's reactor
-                let tcp_listener = match tokio::net::TcpListener::from_std(std_listener) {
-                    Ok(listener) => listener,
-                    Err(e) => {
-                        tracing::error!("Failed to convert std listener to tokio: {}", e);
-                        return;
+                let mut tcp_listeners = Vec::new();
+                for (std_listener, security) in std_listeners.into_iter().zip(listener_securities) {
+                    match tokio::net::TcpListener::from_std(std_listener) {
+                        Ok(listener) => tcp_listeners.push((listener, security)),
+                        Err(e) => {
+                            tracing::error!("Failed to convert std listener to tokio: {}", e);
+                            return;
+                        }
                     }
-                };
+                }
 
                 if let Err(e) = crate::kafka::listener::run(
-                    tcp_listener,
+                    tcp_listeners,
                     request_lanes,
+                    credential_tx,
                     notify_rx,
                     forward_rx,
                     forward_ack_tx,
@@ -688,6 +802,21 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
                 pg_log!("ProcessConfigFile called, GUCs reloaded from postgresql.auto.conf");
             }
 
+            // auth stream: listener security settings apply at worker start only.
+            if let Ok(now) = crate::kafka::auth::SecuritySettings::resolve(
+                &crate::kafka::auth::settings::raw_from_gucs(),
+                &host,
+                port,
+            ) {
+                if now != security_settings {
+                    pg_warning!(
+                        "pg_kafka listener security settings changed; they take effect when \
+                         the pg_kafka_listener worker restarts (pg_terminate_backend() on it, \
+                         or a server restart)"
+                    );
+                }
+            }
+
             // 1. Reload GUCs (update RuntimeContext cache)
             runtime_context.reload();
             pg_log!("Reloaded GUC configuration");
@@ -806,7 +935,19 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
             execute_batch(request, &liveness_rx, None, &env);
         }
 
-        match request_rx.recv_timeout(RECV_TIMEOUT) {
+        // auth stream: also wake for SASL credential lookups, answered in their own
+        // short transaction.
+        let received = crossbeam_channel::select! {
+            recv(request_rx) -> r => r.map_err(|_| RecvTimeoutError::Disconnected),
+            recv(credential_rx) -> c => {
+                if let Ok(first) = c {
+                    serve_credential_requests(first, &credential_rx);
+                }
+                Err(RecvTimeoutError::Timeout)
+            },
+            default(RECV_TIMEOUT) => Err(RecvTimeoutError::Timeout),
+        };
+        match received {
             Ok(request) => {
                 // ┌─────────────────────────────────────────────────────┐
                 // │ Process Database Requests (group commit)           │
@@ -1096,7 +1237,15 @@ fn run_one_request(
     // New request, new sync-forward budget (see ShadowStore::begin_request).
     env.shadow_store.begin_request();
     let result = run_request_in_subtransaction(|| {
-        process_request(
+        // Each request reads from its own snapshot. pgrx runs read-only SPI statements
+        // (the transaction has not written yet) on the active snapshot, which
+        // `BackgroundWorker::transaction` pushes once when the batch starts; without this,
+        // a request that joins a batch late would not see rows other sessions committed
+        // since (e.g. a topic created by SQL just before the client asked for it). In READ
+        // COMMITTED, GetTransactionSnapshot takes a fresh snapshot. A panic unwinds to the
+        // subtransaction abort, which pops snapshots pushed inside it.
+        unsafe { pg_sys::PushActiveSnapshot(pg_sys::GetTransactionSnapshot()) };
+        let outcome = process_request(
             request,
             env.coordinator,
             env.broker_metadata,
@@ -1104,7 +1253,9 @@ fn run_one_request(
             env.notify_tx,
             env.compression,
             env.shadow_store,
-        )
+        );
+        unsafe { pg_sys::PopActiveSnapshot() };
+        outcome
     });
     // A reported rollback (handler error) already logged itself and sent its
     // response; only a real panic is worth a warning here.

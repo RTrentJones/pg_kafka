@@ -211,8 +211,8 @@ mod tests {
         assert_eq!(response.error_code, ERROR_NONE);
         assert_eq!(response.throttle_time_ms, 0);
 
-        // Should have 26 API versions (all supported APIs)
-        assert_eq!(response.api_keys.len(), 26);
+        // Should have 28 API versions (all supported APIs)
+        assert_eq!(response.api_keys.len(), 28);
 
         // Verify ApiVersions entry
         let api_versions = response

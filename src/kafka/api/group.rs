@@ -21,7 +21,7 @@ use kafka_protocol::messages::sync_group_request::SyncGroupRequest;
 use kafka_protocol::messages::sync_group_response::SyncGroupResponse;
 use kafka_protocol::messages::GroupId;
 
-use super::{ApiEnv, Call, KafkaApi, Lane, Rejection, RequestHeader};
+use super::{ApiEnv, ApiSchema, Call, KafkaApi, Lane, Rejection, RequestHeader};
 use crate::kafka::dispatch::RequestOutcome;
 pub use crate::kafka::handlers::JoinGroupRequestData;
 
@@ -41,13 +41,28 @@ pub struct FindCoordinatorRequestData {
     pub key_type: i8,
 }
 
-impl KafkaApi for FindCoordinatorApi {
+impl ApiSchema for FindCoordinatorApi {
     type Wire = FindCoordinatorRequest;
-    type Request = FindCoordinatorRequestData;
     type Echo = ();
     const NAME: &'static str = "FindCoordinator";
     const MIN_VERSION: i16 = 0;
     const MAX_VERSION: i16 = 3;
+
+    fn error_response(
+        _echo: Option<&()>,
+        _version: i16,
+        error_code: i16,
+    ) -> FindCoordinatorResponse {
+        rb::build_find_coordinator_error_response(error_code)
+    }
+
+    fn response_has_error(response: &FindCoordinatorResponse) -> bool {
+        response.error_code != 0 || response.coordinators.iter().any(|c| c.error_code != 0)
+    }
+}
+
+impl KafkaApi for FindCoordinatorApi {
+    type Request = FindCoordinatorRequestData;
 
     fn decode(
         wire: FindCoordinatorRequest,
@@ -61,18 +76,6 @@ impl KafkaApi for FindCoordinatorApi {
 
     fn echo(_request: &Self::Request) {}
 
-    fn error_response(
-        _echo: Option<&()>,
-        _version: i16,
-        error_code: i16,
-    ) -> FindCoordinatorResponse {
-        rb::build_find_coordinator_error_response(error_code)
-    }
-
-    fn response_has_error(response: &FindCoordinatorResponse) -> bool {
-        response.error_code != 0 || response.coordinators.iter().any(|c| c.error_code != 0)
-    }
-
     fn handle(request: Self::Request, call: Call<Self>, env: &ApiEnv<'_>) -> RequestOutcome {
         call.run(request, |r, _| {
             handlers::handle_find_coordinator(&env.ctx, r.key, r.key_type)
@@ -83,13 +86,25 @@ impl KafkaApi for FindCoordinatorApi {
 /// JoinGroup: join (or rejoin) a consumer group.
 pub struct JoinGroupApi;
 
-impl KafkaApi for JoinGroupApi {
+impl ApiSchema for JoinGroupApi {
     type Wire = JoinGroupRequest;
-    type Request = JoinGroupRequestData;
     type Echo = ();
     const NAME: &'static str = "JoinGroup";
     const MIN_VERSION: i16 = 0;
     const MAX_VERSION: i16 = 7;
+
+    fn error_response(_echo: Option<&()>, _version: i16, error_code: i16) -> JoinGroupResponse {
+        rb::build_join_group_error_response(error_code)
+    }
+
+    fn response_has_error(response: &JoinGroupResponse) -> bool {
+        response.error_code != 0
+    }
+}
+
+impl KafkaApi for JoinGroupApi {
+    type Request = JoinGroupRequestData;
+
     // The coordinator holds the response until the group's join phase completes.
     const DEFERRED_REPLY: bool = true;
 
@@ -117,14 +132,6 @@ impl KafkaApi for JoinGroupApi {
     }
 
     fn echo(_request: &Self::Request) {}
-
-    fn error_response(_echo: Option<&()>, _version: i16, error_code: i16) -> JoinGroupResponse {
-        rb::build_join_group_error_response(error_code)
-    }
-
-    fn response_has_error(response: &JoinGroupResponse) -> bool {
-        response.error_code != 0
-    }
 
     /// The response may come from a later JoinGroup, a LeaveGroup or the timeout sweep, so
     /// it answers on the client's own sender through a `JoinGroupReply` (which answers
@@ -154,13 +161,25 @@ pub struct HeartbeatRequestData {
     pub group_instance_id: Option<String>,
 }
 
-impl KafkaApi for HeartbeatApi {
+impl ApiSchema for HeartbeatApi {
     type Wire = HeartbeatRequest;
-    type Request = HeartbeatRequestData;
     type Echo = ();
     const NAME: &'static str = "Heartbeat";
     const MIN_VERSION: i16 = 0;
     const MAX_VERSION: i16 = 4;
+
+    fn error_response(_echo: Option<&()>, _version: i16, error_code: i16) -> HeartbeatResponse {
+        rb::build_heartbeat_error_response(error_code)
+    }
+
+    fn response_has_error(response: &HeartbeatResponse) -> bool {
+        response.error_code != 0
+    }
+}
+
+impl KafkaApi for HeartbeatApi {
+    type Request = HeartbeatRequestData;
+
     // DR-12: served from the in-memory coordinator, never queued behind heavy work.
     const LANE: Lane = Lane::Liveness;
 
@@ -177,14 +196,6 @@ impl KafkaApi for HeartbeatApi {
     }
 
     fn echo(_request: &Self::Request) {}
-
-    fn error_response(_echo: Option<&()>, _version: i16, error_code: i16) -> HeartbeatResponse {
-        rb::build_heartbeat_error_response(error_code)
-    }
-
-    fn response_has_error(response: &HeartbeatResponse) -> bool {
-        response.error_code != 0
-    }
 
     fn handle(request: Self::Request, call: Call<Self>, env: &ApiEnv<'_>) -> RequestOutcome {
         call.run(request, |r, _| {
@@ -207,13 +218,24 @@ pub struct LeaveGroupRequestData {
     pub members: Vec<MemberIdentity>,
 }
 
-impl KafkaApi for LeaveGroupApi {
+impl ApiSchema for LeaveGroupApi {
     type Wire = LeaveGroupRequest;
-    type Request = LeaveGroupRequestData;
     type Echo = ();
     const NAME: &'static str = "LeaveGroup";
     const MIN_VERSION: i16 = 0;
     const MAX_VERSION: i16 = 4;
+
+    fn error_response(_echo: Option<&()>, _version: i16, error_code: i16) -> LeaveGroupResponse {
+        rb::build_leave_group_error_response(error_code)
+    }
+
+    fn response_has_error(response: &LeaveGroupResponse) -> bool {
+        response.error_code != 0 || response.members.iter().any(|m| m.error_code != 0)
+    }
+}
+
+impl KafkaApi for LeaveGroupApi {
+    type Request = LeaveGroupRequestData;
 
     fn decode(
         wire: LeaveGroupRequest,
@@ -227,14 +249,6 @@ impl KafkaApi for LeaveGroupApi {
     }
 
     fn echo(_request: &Self::Request) {}
-
-    fn error_response(_echo: Option<&()>, _version: i16, error_code: i16) -> LeaveGroupResponse {
-        rb::build_leave_group_error_response(error_code)
-    }
-
-    fn response_has_error(response: &LeaveGroupResponse) -> bool {
-        response.error_code != 0 || response.members.iter().any(|m| m.error_code != 0)
-    }
 
     fn handle(request: Self::Request, call: Call<Self>, env: &ApiEnv<'_>) -> RequestOutcome {
         call.run(request, |r, _| {
@@ -265,13 +279,25 @@ pub struct SyncGroupRequestData {
     pub assignments: Vec<SyncGroupAssignment>,
 }
 
-impl KafkaApi for SyncGroupApi {
+impl ApiSchema for SyncGroupApi {
     type Wire = SyncGroupRequest;
-    type Request = SyncGroupRequestData;
     type Echo = ();
     const NAME: &'static str = "SyncGroup";
     const MIN_VERSION: i16 = 0;
     const MAX_VERSION: i16 = 4;
+
+    fn error_response(_echo: Option<&()>, _version: i16, error_code: i16) -> SyncGroupResponse {
+        rb::build_sync_group_error_response(error_code)
+    }
+
+    fn response_has_error(response: &SyncGroupResponse) -> bool {
+        response.error_code != 0
+    }
+}
+
+impl KafkaApi for SyncGroupApi {
+    type Request = SyncGroupRequestData;
+
     // A follower's SyncGroup is held until the leader's delivers the assignment.
     const DEFERRED_REPLY: bool = true;
 
@@ -295,14 +321,6 @@ impl KafkaApi for SyncGroupApi {
     }
 
     fn echo(_request: &Self::Request) {}
-
-    fn error_response(_echo: Option<&()>, _version: i16, error_code: i16) -> SyncGroupResponse {
-        rb::build_sync_group_error_response(error_code)
-    }
-
-    fn response_has_error(response: &SyncGroupResponse) -> bool {
-        response.error_code != 0
-    }
 
     /// Like JoinGroup, answers on the client's own sender (`SyncGroupReply`); SyncGroup
     /// only reads and writes nothing.
@@ -334,28 +352,14 @@ pub struct DescribeGroupsRequestData {
     pub include_authorized_operations: bool,
 }
 
-impl KafkaApi for DescribeGroupsApi {
+impl ApiSchema for DescribeGroupsApi {
     type Wire = DescribeGroupsRequest;
-    type Request = DescribeGroupsRequestData;
+
     /// The requested group ids.
     type Echo = Vec<String>;
     const NAME: &'static str = "DescribeGroups";
     const MIN_VERSION: i16 = 0;
     const MAX_VERSION: i16 = 5;
-
-    fn decode(
-        wire: DescribeGroupsRequest,
-        _header: &RequestHeader,
-    ) -> Result<Self::Request, Rejection<Self::Echo>> {
-        Ok(DescribeGroupsRequestData {
-            groups: wire.groups.into_iter().map(|g| g.to_string()).collect(),
-            include_authorized_operations: wire.include_authorized_operations,
-        })
-    }
-
-    fn echo(request: &Self::Request) -> Vec<String> {
-        request.groups.clone()
-    }
 
     /// Errors are per group: report the code on every requested group.
     fn error_response(
@@ -381,6 +385,24 @@ impl KafkaApi for DescribeGroupsApi {
     fn response_has_error(response: &DescribeGroupsResponse) -> bool {
         response.groups.iter().any(|g| g.error_code != 0)
     }
+}
+
+impl KafkaApi for DescribeGroupsApi {
+    type Request = DescribeGroupsRequestData;
+
+    fn decode(
+        wire: DescribeGroupsRequest,
+        _header: &RequestHeader,
+    ) -> Result<Self::Request, Rejection<Self::Echo>> {
+        Ok(DescribeGroupsRequestData {
+            groups: wire.groups.into_iter().map(|g| g.to_string()).collect(),
+            include_authorized_operations: wire.include_authorized_operations,
+        })
+    }
+
+    fn echo(request: &Self::Request) -> Vec<String> {
+        request.groups.clone()
+    }
 
     fn handle(request: Self::Request, call: Call<Self>, env: &ApiEnv<'_>) -> RequestOutcome {
         call.run(request, |r, _| {
@@ -399,13 +421,24 @@ pub struct ListGroupsRequestData {
     pub states_filter: Vec<String>,
 }
 
-impl KafkaApi for ListGroupsApi {
+impl ApiSchema for ListGroupsApi {
     type Wire = ListGroupsRequest;
-    type Request = ListGroupsRequestData;
     type Echo = ();
     const NAME: &'static str = "ListGroups";
     const MIN_VERSION: i16 = 0;
     const MAX_VERSION: i16 = 4;
+
+    fn error_response(_echo: Option<&()>, _version: i16, error_code: i16) -> ListGroupsResponse {
+        rb::build_list_groups_error_response(error_code)
+    }
+
+    fn response_has_error(response: &ListGroupsResponse) -> bool {
+        response.error_code != 0
+    }
+}
+
+impl KafkaApi for ListGroupsApi {
+    type Request = ListGroupsRequestData;
 
     fn decode(
         wire: ListGroupsRequest,
@@ -421,14 +454,6 @@ impl KafkaApi for ListGroupsApi {
     }
 
     fn echo(_request: &Self::Request) {}
-
-    fn error_response(_echo: Option<&()>, _version: i16, error_code: i16) -> ListGroupsResponse {
-        rb::build_list_groups_error_response(error_code)
-    }
-
-    fn response_has_error(response: &ListGroupsResponse) -> bool {
-        response.error_code != 0
-    }
 
     fn handle(request: Self::Request, call: Call<Self>, env: &ApiEnv<'_>) -> RequestOutcome {
         call.run(request, |r, _| {
@@ -447,31 +472,14 @@ pub struct DeleteGroupsRequestData {
     pub groups_names: Vec<String>,
 }
 
-impl KafkaApi for DeleteGroupsApi {
+impl ApiSchema for DeleteGroupsApi {
     type Wire = DeleteGroupsRequest;
-    type Request = DeleteGroupsRequestData;
+
     /// The requested group ids.
     type Echo = Vec<String>;
     const NAME: &'static str = "DeleteGroups";
     const MIN_VERSION: i16 = 0;
     const MAX_VERSION: i16 = 2;
-
-    fn decode(
-        wire: DeleteGroupsRequest,
-        _header: &RequestHeader,
-    ) -> Result<Self::Request, Rejection<Self::Echo>> {
-        Ok(DeleteGroupsRequestData {
-            groups_names: wire
-                .groups_names
-                .into_iter()
-                .map(|g| g.to_string())
-                .collect(),
-        })
-    }
-
-    fn echo(request: &Self::Request) -> Vec<String> {
-        request.groups_names.clone()
-    }
 
     /// Errors are per group: report the code on every requested group.
     fn error_response(
@@ -496,6 +504,27 @@ impl KafkaApi for DeleteGroupsApi {
 
     fn response_has_error(response: &DeleteGroupsResponse) -> bool {
         response.results.iter().any(|r| r.error_code != 0)
+    }
+}
+
+impl KafkaApi for DeleteGroupsApi {
+    type Request = DeleteGroupsRequestData;
+
+    fn decode(
+        wire: DeleteGroupsRequest,
+        _header: &RequestHeader,
+    ) -> Result<Self::Request, Rejection<Self::Echo>> {
+        Ok(DeleteGroupsRequestData {
+            groups_names: wire
+                .groups_names
+                .into_iter()
+                .map(|g| g.to_string())
+                .collect(),
+        })
+    }
+
+    fn echo(request: &Self::Request) -> Vec<String> {
+        request.groups_names.clone()
     }
 
     fn handle(request: Self::Request, call: Call<Self>, env: &ApiEnv<'_>) -> RequestOutcome {

@@ -7,8 +7,9 @@
 
 | Document | Purpose |
 |----------|---------|
-| [KAFKA_PROTOCOL_COVERAGE.md](KAFKA_PROTOCOL_COVERAGE.md) | API coverage analysis (26 of ~50 APIs) |
+| [KAFKA_PROTOCOL_COVERAGE.md](KAFKA_PROTOCOL_COVERAGE.md) | API coverage analysis (28 of ~50 APIs) |
 | [PROTOCOL_DEVIATIONS.md](PROTOCOL_DEVIATIONS.md) | Intentional spec differences from Apache Kafka |
+| [AUTHENTICATION.md](AUTHENTICATION.md) | TLS and SASL listeners, Kafka users, what is and is not protected |
 | [TEST_STRATEGY.md](TEST_STRATEGY.md) | Test architecture; the one place test counts are kept |
 | [PGRX_TESTING_GUIDE.md](PGRX_TESTING_GUIDE.md) | Testing a pgrx extension that uses `PGC_POSTMASTER` GUCs and a background worker |
 | [REPOSITORY_PATTERN.md](REPOSITORY_PATTERN.md) | Storage abstraction design (KafkaStore trait) |

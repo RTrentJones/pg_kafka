@@ -15,7 +15,7 @@ use kafka_protocol::messages::incremental_alter_configs_response::{
 };
 use kafka_protocol::messages::TopicName;
 
-use super::{ApiEnv, Call, KafkaApi, Rejection, RequestHeader, TopicPartitions};
+use super::{ApiEnv, ApiSchema, Call, KafkaApi, Rejection, RequestHeader, TopicPartitions};
 use crate::kafka::dispatch::RequestOutcome;
 use crate::kafka::handlers;
 use crate::kafka::messages::AlterConfigsResources;
@@ -35,43 +35,12 @@ pub struct DeleteRecordsRequestData {
     pub timeout_ms: i32,
 }
 
-impl KafkaApi for DeleteRecordsApi {
+impl ApiSchema for DeleteRecordsApi {
     type Wire = DeleteRecordsRequest;
-    type Request = DeleteRecordsRequestData;
     type Echo = TopicPartitions;
     const NAME: &'static str = "DeleteRecords";
     const MIN_VERSION: i16 = 0;
     const MAX_VERSION: i16 = 2;
-
-    fn decode(
-        wire: DeleteRecordsRequest,
-        _header: &RequestHeader,
-    ) -> Result<Self::Request, Rejection<Self::Echo>> {
-        Ok(DeleteRecordsRequestData {
-            topics: wire
-                .topics
-                .into_iter()
-                .map(|t| {
-                    (
-                        t.name.to_string(),
-                        t.partitions
-                            .into_iter()
-                            .map(|p| (p.partition_index, p.offset))
-                            .collect(),
-                    )
-                })
-                .collect(),
-            timeout_ms: wire.timeout_ms,
-        })
-    }
-
-    fn echo(request: &Self::Request) -> TopicPartitions {
-        request
-            .topics
-            .iter()
-            .map(|(name, partitions)| (name.clone(), partitions.iter().map(|(p, _)| *p).collect()))
-            .collect()
-    }
 
     /// Errors are per partition: report the code on every requested partition.
     fn error_response(
@@ -109,6 +78,40 @@ impl KafkaApi for DeleteRecordsApi {
             .flat_map(|t| t.partitions.iter())
             .any(|p| p.error_code != 0)
     }
+}
+
+impl KafkaApi for DeleteRecordsApi {
+    type Request = DeleteRecordsRequestData;
+
+    fn decode(
+        wire: DeleteRecordsRequest,
+        _header: &RequestHeader,
+    ) -> Result<Self::Request, Rejection<Self::Echo>> {
+        Ok(DeleteRecordsRequestData {
+            topics: wire
+                .topics
+                .into_iter()
+                .map(|t| {
+                    (
+                        t.name.to_string(),
+                        t.partitions
+                            .into_iter()
+                            .map(|p| (p.partition_index, p.offset))
+                            .collect(),
+                    )
+                })
+                .collect(),
+            timeout_ms: wire.timeout_ms,
+        })
+    }
+
+    fn echo(request: &Self::Request) -> TopicPartitions {
+        request
+            .topics
+            .iter()
+            .map(|(name, partitions)| (name.clone(), partitions.iter().map(|(p, _)| *p).collect()))
+            .collect()
+    }
 
     fn handle(request: Self::Request, call: Call<Self>, env: &ApiEnv<'_>) -> RequestOutcome {
         call.run(request, |r, _| {
@@ -127,15 +130,44 @@ pub struct DescribeConfigsRequestData {
     pub resources: Vec<(i8, String, Option<Vec<String>>)>,
 }
 
-impl KafkaApi for DescribeConfigsApi {
+impl ApiSchema for DescribeConfigsApi {
     type Wire = DescribeConfigsRequest;
-    type Request = DescribeConfigsRequestData;
     type Echo = ConfigResources;
     const NAME: &'static str = "DescribeConfigs";
+
     // The crate implements v1-4 only (v0 lacks per-config source/synonym metadata); every
     // mainstream admin client negotiates >= 1.
     const MIN_VERSION: i16 = 1;
     const MAX_VERSION: i16 = 4;
+
+    /// Errors are per resource: report the code on every requested resource.
+    fn error_response(
+        echo: Option<&ConfigResources>,
+        _version: i16,
+        error_code: i16,
+    ) -> DescribeConfigsResponse {
+        let mut response = DescribeConfigsResponse::default();
+        response.results = echo
+            .into_iter()
+            .flatten()
+            .map(|(resource_type, name)| {
+                let mut r = DescribeConfigsResult::default();
+                r.resource_type = *resource_type;
+                r.resource_name = name.clone().into();
+                r.error_code = error_code;
+                r
+            })
+            .collect();
+        response
+    }
+
+    fn response_has_error(response: &DescribeConfigsResponse) -> bool {
+        response.results.iter().any(|r| r.error_code != 0)
+    }
+}
+
+impl KafkaApi for DescribeConfigsApi {
+    type Request = DescribeConfigsRequestData;
 
     fn decode(
         wire: DescribeConfigsRequest,
@@ -163,31 +195,6 @@ impl KafkaApi for DescribeConfigsApi {
             .collect()
     }
 
-    /// Errors are per resource: report the code on every requested resource.
-    fn error_response(
-        echo: Option<&ConfigResources>,
-        _version: i16,
-        error_code: i16,
-    ) -> DescribeConfigsResponse {
-        let mut response = DescribeConfigsResponse::default();
-        response.results = echo
-            .into_iter()
-            .flatten()
-            .map(|(resource_type, name)| {
-                let mut r = DescribeConfigsResult::default();
-                r.resource_type = *resource_type;
-                r.resource_name = name.clone().into();
-                r.error_code = error_code;
-                r
-            })
-            .collect();
-        response
-    }
-
-    fn response_has_error(response: &DescribeConfigsResponse) -> bool {
-        response.results.iter().any(|r| r.error_code != 0)
-    }
-
     fn handle(request: Self::Request, call: Call<Self>, env: &ApiEnv<'_>) -> RequestOutcome {
         let global_retention_hours = crate::config::MESSAGE_RETENTION_HOURS.get();
         call.run(request, |r, _| {
@@ -209,13 +216,41 @@ pub struct IncrementalAlterConfigsRequestData {
     pub validate_only: bool,
 }
 
-impl KafkaApi for IncrementalAlterConfigsApi {
+impl ApiSchema for IncrementalAlterConfigsApi {
     type Wire = IncrementalAlterConfigsRequest;
-    type Request = IncrementalAlterConfigsRequestData;
     type Echo = ConfigResources;
     const NAME: &'static str = "IncrementalAlterConfigs";
     const MIN_VERSION: i16 = 0;
     const MAX_VERSION: i16 = 1;
+
+    /// Errors are per resource: report the code on every requested resource.
+    fn error_response(
+        echo: Option<&ConfigResources>,
+        _version: i16,
+        error_code: i16,
+    ) -> IncrementalAlterConfigsResponse {
+        let mut response = IncrementalAlterConfigsResponse::default();
+        response.responses = echo
+            .into_iter()
+            .flatten()
+            .map(|(resource_type, name)| {
+                let mut r = AlterConfigsResourceResponse::default();
+                r.resource_type = *resource_type;
+                r.resource_name = name.clone().into();
+                r.error_code = error_code;
+                r
+            })
+            .collect();
+        response
+    }
+
+    fn response_has_error(response: &IncrementalAlterConfigsResponse) -> bool {
+        response.responses.iter().any(|r| r.error_code != 0)
+    }
+}
+
+impl KafkaApi for IncrementalAlterConfigsApi {
+    type Request = IncrementalAlterConfigsRequestData;
 
     fn decode(
         wire: IncrementalAlterConfigsRequest,
@@ -250,31 +285,6 @@ impl KafkaApi for IncrementalAlterConfigsApi {
             .iter()
             .map(|(t, name, _)| (*t, name.clone()))
             .collect()
-    }
-
-    /// Errors are per resource: report the code on every requested resource.
-    fn error_response(
-        echo: Option<&ConfigResources>,
-        _version: i16,
-        error_code: i16,
-    ) -> IncrementalAlterConfigsResponse {
-        let mut response = IncrementalAlterConfigsResponse::default();
-        response.responses = echo
-            .into_iter()
-            .flatten()
-            .map(|(resource_type, name)| {
-                let mut r = AlterConfigsResourceResponse::default();
-                r.resource_type = *resource_type;
-                r.resource_name = name.clone().into();
-                r.error_code = error_code;
-                r
-            })
-            .collect();
-        response
-    }
-
-    fn response_has_error(response: &IncrementalAlterConfigsResponse) -> bool {
-        response.responses.iter().any(|r| r.error_code != 0)
     }
 
     fn handle(request: Self::Request, call: Call<Self>, env: &ApiEnv<'_>) -> RequestOutcome {

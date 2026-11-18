@@ -6,7 +6,7 @@ use kafka_protocol::messages::produce_response::{
 };
 use tracing::warn;
 
-use super::{ApiEnv, Call, KafkaApi, Rejection, RequestHeader, TopicPartitions};
+use super::{ApiEnv, ApiSchema, Call, KafkaApi, Rejection, RequestHeader, TopicPartitions};
 use crate::kafka::constants::{ERROR_CORRUPT_MESSAGE, ERROR_NONE};
 use crate::kafka::dispatch::RequestOutcome;
 use crate::kafka::error::KafkaError;
@@ -32,14 +32,50 @@ pub struct ProduceRequestData {
     pub transactional_id: Option<String>,
 }
 
-impl KafkaApi for ProduceApi {
+impl ApiSchema for ProduceApi {
     type Wire = ProduceRequest;
-    type Request = ProduceRequestData;
     type Echo = TopicPartitions;
     const NAME: &'static str = "Produce";
+
     // RecordBatch format only (v3+); v0-2 use the legacy MessageSet the crate cannot decode.
     const MIN_VERSION: i16 = 3;
     const MAX_VERSION: i16 = 9;
+
+    /// ProduceResponse has no top-level error code: report it on every requested partition.
+    fn error_response(
+        echo: Option<&TopicPartitions>,
+        _version: i16,
+        error_code: i16,
+    ) -> ProduceResponse {
+        let mut response = crate::kafka::response_builders::build_produce_response();
+        for (name, partitions) in echo.into_iter().flatten() {
+            let mut topic = TopicProduceResponse::default();
+            topic.name = kafka_protocol::messages::TopicName(name.clone().into());
+            for &index in partitions {
+                let mut p = PartitionProduceResponse::default();
+                p.index = index;
+                p.error_code = error_code;
+                p.base_offset = -1;
+                p.log_append_time_ms = -1;
+                p.log_start_offset = -1;
+                topic.partition_responses.push(p);
+            }
+            response.responses.push(topic);
+        }
+        response
+    }
+
+    fn response_has_error(response: &ProduceResponse) -> bool {
+        response
+            .responses
+            .iter()
+            .flat_map(|t| t.partition_responses.iter())
+            .any(|p| p.error_code != 0)
+    }
+}
+
+impl KafkaApi for ProduceApi {
+    type Request = ProduceRequestData;
 
     fn decode(
         wire: ProduceRequest,
@@ -118,38 +154,6 @@ impl KafkaApi for ProduceApi {
                 )
             })
             .collect()
-    }
-
-    /// ProduceResponse has no top-level error code: report it on every requested partition.
-    fn error_response(
-        echo: Option<&TopicPartitions>,
-        _version: i16,
-        error_code: i16,
-    ) -> ProduceResponse {
-        let mut response = crate::kafka::response_builders::build_produce_response();
-        for (name, partitions) in echo.into_iter().flatten() {
-            let mut topic = TopicProduceResponse::default();
-            topic.name = kafka_protocol::messages::TopicName(name.clone().into());
-            for &index in partitions {
-                let mut p = PartitionProduceResponse::default();
-                p.index = index;
-                p.error_code = error_code;
-                p.base_offset = -1;
-                p.log_append_time_ms = -1;
-                p.log_start_offset = -1;
-                topic.partition_responses.push(p);
-            }
-            response.responses.push(topic);
-        }
-        response
-    }
-
-    fn response_has_error(response: &ProduceResponse) -> bool {
-        response
-            .responses
-            .iter()
-            .flat_map(|t| t.partition_responses.iter())
-            .any(|p| p.error_code != 0)
     }
 
     /// The broker sends NO response frame at all for acks=0 (a reply desyncs clients

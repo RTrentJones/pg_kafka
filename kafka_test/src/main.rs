@@ -320,7 +320,8 @@ use kafka_test::{
 };
 // Stream `api`: typed error responses (error_paths/api_errors.rs)
 use kafka_test::{
-    test_handler_failure_gets_typed_error_response, test_truncated_body_gets_invalid_request,
+    test_handler_failure_gets_typed_error_response,
+    test_request_sees_rows_committed_during_its_batch, test_truncated_body_gets_invalid_request,
     test_unsupported_versions_get_typed_error_responses,
 };
 // Stream `part` (wave 2): time-partitioned kafka.messages
@@ -1945,6 +1946,94 @@ fn get_all_tests() -> Vec<TestDef> {
             category: "part",
             name: "test_time_partition_maintenance_and_least_privilege",
             test_fn: wrap_test!(test_time_partition_maintenance_and_least_privilege),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_request_sees_rows_committed_during_its_batch",
+            test_fn: wrap_test!(test_request_sees_rows_committed_during_its_batch),
+            parallel_safe: false, // holds a lock on kafka.partition_offsets
+        },
+        // auth stream: TLS + SASL listeners (kafka_test/src/auth). Sequential: they
+        // restart the listener worker; the teardown test must stay last.
+        TestDef {
+            category: "auth",
+            name: "test_auth_sasl_plain_roundtrip",
+            test_fn: wrap_test!(kafka_test::auth::tests::test_auth_sasl_plain_roundtrip),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "auth",
+            name: "test_auth_sasl_scram_sha256_roundtrip",
+            test_fn: wrap_test!(kafka_test::auth::tests::test_auth_sasl_scram_sha256_roundtrip),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "auth",
+            name: "test_auth_sasl_scram_sha512_roundtrip",
+            test_fn: wrap_test!(kafka_test::auth::tests::test_auth_sasl_scram_sha512_roundtrip),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "auth",
+            name: "test_auth_wrong_password_rejected",
+            test_fn: wrap_test!(kafka_test::auth::tests::test_auth_wrong_password_rejected),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "auth",
+            name: "test_auth_unauthenticated_request_rejected",
+            test_fn: wrap_test!(
+                kafka_test::auth::tests::test_auth_unauthenticated_request_rejected
+            ),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "auth",
+            name: "test_auth_plaintext_listener_unaffected",
+            test_fn: wrap_test!(kafka_test::auth::tests::test_auth_plaintext_listener_unaffected),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "auth",
+            name: "test_auth_tls_roundtrip_and_untrusted_ca",
+            test_fn: wrap_test!(kafka_test::auth::tests::test_auth_tls_roundtrip_and_untrusted_ca),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "auth",
+            name: "test_auth_sasl_ssl_roundtrip",
+            test_fn: wrap_test!(kafka_test::auth::tests::test_auth_sasl_ssl_roundtrip),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "auth",
+            name: "test_auth_user_management_sql",
+            test_fn: wrap_test!(kafka_test::auth::tests::test_auth_user_management_sql),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "auth",
+            name: "test_auth_mutual_tls",
+            test_fn: wrap_test!(kafka_test::auth::tests::test_auth_mutual_tls),
+            parallel_safe: false,
+        },
+        // Stream `api`: SASL requests counted in kafka.api_metrics (before the teardown,
+        // which restarts the worker and resets the counters).
+        TestDef {
+            category: "auth",
+            name: "test_auth_sasl_requests_counted_in_api_metrics",
+            test_fn: wrap_test!(
+                kafka_test::auth::api_metrics::test_auth_sasl_requests_counted_in_api_metrics
+            ),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "auth",
+            name: "test_auth_teardown_restores_default_listeners",
+            test_fn: wrap_test!(
+                kafka_test::auth::tests::test_auth_teardown_restores_default_listeners
+            ),
             parallel_safe: false,
         },
     ]

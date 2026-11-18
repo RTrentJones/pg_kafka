@@ -323,7 +323,7 @@ pub fn init() {
     GucRegistry::define_string_guc(
         c"pg_kafka.host",
         c"Host/interface to bind to",
-        c"The network interface to listen on. Default 127.0.0.1 (local clients only). pg_kafka has no Kafka-wire authentication, so a non-loopback bind (e.g. 0.0.0.0 = all interfaces) must be protected by network controls (firewall/security groups). Requires restart.",
+        c"The network interface to listen on. Default 127.0.0.1 (local clients only). This listener speaks pg_kafka.security_protocol (default PLAINTEXT, unauthenticated), so a non-loopback PLAINTEXT bind (e.g. 0.0.0.0 = all interfaces) must be protected by network controls (firewall/security groups); see docs/AUTHENTICATION.md. Requires restart.",
         &HOST,
         GucContext::Postmaster,
         GucFlags::default(),
@@ -625,6 +625,9 @@ pub fn init() {
 
     // 0.1.0 least privilege: pg_kafka.run_as_role (storage::privileges).
     crate::kafka::storage::privileges::register_gucs();
+
+    // auth stream: listener security protocols, TLS files, SASL mechanisms.
+    crate::kafka::auth::settings::register_gucs();
 
     pgrx::log!("pg_kafka GUC parameters initialized (including shadow mode)");
 }

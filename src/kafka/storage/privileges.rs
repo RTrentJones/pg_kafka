@@ -70,6 +70,8 @@ pub const WORKER_TABLE_GRANTS: &[(&str, &[&str])] = &[
         &["SELECT", "INSERT", "UPDATE", "DELETE"],
     ),
     ("kafka.shadow_metrics", &["SELECT", "INSERT", "UPDATE"]),
+    // auth stream: SASL credential lookups (kafka/auth/credentials.rs), read only.
+    ("kafka.sasl_credentials", &["SELECT"]),
 ];
 
 /// Sequences behind the SERIAL/BIGSERIAL columns the worker inserts into, plus the
@@ -181,6 +183,10 @@ mod tests {
         ("shadow/outbox.rs", include_str!("../shadow/outbox.rs")),
         ("metrics.rs", include_str!("../metrics.rs")),
         ("worker.rs", include_str!("../../worker.rs")),
+        (
+            "auth/credentials.rs",
+            include_str!("../auth/credentials.rs"),
+        ),
     ];
 
     fn granted(table: &str, privilege: &str) -> bool {

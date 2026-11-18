@@ -38,6 +38,11 @@ use super::notifications::InternalNotification;
 use super::pending_fetches::PendingFetchRegistry;
 use super::protocol;
 use super::shadow::{ForwardAck, ForwardRequest, ShadowConfig, ShadowProducer};
+use crate::kafka::auth::session::{SaslOutcome, AUTH_FAILURE_DELAY};
+use crate::kafka::auth::{
+    ChannelLookup, ConnectionPrincipal, CredentialRequest, SaslMechanism, SaslSession,
+    SecurityProtocol,
+};
 
 // ============================================================================
 // RV-9: aggregate in-flight frame-reservation budget.
@@ -151,11 +156,28 @@ struct BudgetedFrameCodec {
     inner: LengthDelimitedCodec,
     /// Bytes charged to the budget for the in-progress frame (0 = none charged).
     charged: usize,
+    /// auth stream: largest frame accepted right now. A SASL listener starts at
+    /// [`PRE_AUTH_MAX_FRAME`] and the connection raises it to `MAX_REQUEST_SIZE` once
+    /// authentication succeeds (Kafka's `sasl.server.max.receive.size`), so an
+    /// unauthenticated client cannot make the broker reserve 100 MB frames.
+    limit: Arc<AtomicUsize>,
 }
 
+/// auth stream: largest frame an unauthenticated client may send on a SASL listener
+/// (Kafka's `sasl.server.max.receive.size` default).
+const PRE_AUTH_MAX_FRAME: usize = 512 * 1024;
+
 impl BudgetedFrameCodec {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_limit(Arc::new(AtomicUsize::new(
+            super::constants::MAX_REQUEST_SIZE as usize,
+        )))
+    }
+
+    fn with_limit(limit: Arc<AtomicUsize>) -> Self {
         Self {
+            limit,
             inner: LengthDelimitedCodec::builder()
                 .big_endian()
                 .length_field_length(4)
@@ -175,6 +197,12 @@ impl Decoder for BudgetedFrameCodec {
         // 4-byte big-endian prefix is available, before the inner codec reserves it.
         if self.charged == 0 && src.len() >= 4 {
             let len = u32::from_be_bytes([src[0], src[1], src[2], src[3]]) as usize;
+            let limit = self.limit.load(Ordering::Relaxed);
+            if len > limit && limit < super::constants::MAX_REQUEST_SIZE as usize {
+                return Err(std::io::Error::other(
+                    "frame larger than allowed before SASL authentication",
+                ));
+            }
             if len <= super::constants::MAX_REQUEST_SIZE as usize {
                 if !charge_frame_budget(&FRAME_RESERVE_REMAINING, len) {
                     return Err(std::io::Error::other(
@@ -391,15 +419,101 @@ fn try_admit_connection(
     Arc::clone(limiter).try_acquire_owned().ok()
 }
 
+/// How long a client on a SASL listener may take, from connecting, to complete SASL
+/// authentication before the connection is closed.
+const SASL_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a client may take to complete the TLS handshake before the connection is
+/// dropped (bounds what a client that connects and stalls can hold).
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Security of one listener, shared by its connections.
+pub struct ListenerSecurity {
+    pub protocol: SecurityProtocol,
+    /// `host:port` this listener is bound to (for logs).
+    pub bind_addr: String,
+    /// TLS acceptor for SSL / SASL_SSL listeners.
+    pub tls: Option<tokio_rustls::TlsAcceptor>,
+    /// Mechanisms offered on a SASL listener.
+    pub sasl_mechanisms: Arc<Vec<SaslMechanism>>,
+    /// The `(host, port)` advertised in Metadata/FindCoordinator responses served on
+    /// this listener; `None` keeps what the worker built (the primary listener).
+    pub advertised: Option<(String, i32)>,
+}
+
+impl ListenerSecurity {
+    /// A PLAINTEXT listener with no overrides (the default primary listener).
+    pub fn plaintext(bind_addr: &str) -> Self {
+        ListenerSecurity {
+            protocol: SecurityProtocol::Plaintext,
+            bind_addr: bind_addr.to_string(),
+            tls: None,
+            sasl_mechanisms: Arc::new(Vec::new()),
+            advertised: None,
+        }
+    }
+}
+
+/// Per-connection security state: the listener, the principal, and the SASL session.
+/// Lives on the network thread for the connection's lifetime.
+pub struct ConnectionAuth {
+    /// Peer address (for logs).
+    pub peer: String,
+    pub security: Arc<ListenerSecurity>,
+    /// Who the connection is: `User:ANONYMOUS` until SASL succeeds (or the client
+    /// certificate subject under mutual TLS). There are no ACLs yet; this is recorded
+    /// so authorization can be added later.
+    pub principal: ConnectionPrincipal,
+    pub sasl: SaslSession,
+    pub lookup: ChannelLookup,
+    pub log_connections: bool,
+}
+
+impl ConnectionAuth {
+    pub fn new(
+        peer: String,
+        security: Arc<ListenerSecurity>,
+        principal: ConnectionPrincipal,
+        lookup: ChannelLookup,
+        log_connections: bool,
+    ) -> Self {
+        let sasl = SaslSession::new(
+            security.protocol.uses_sasl(),
+            security.sasl_mechanisms.clone(),
+        );
+        ConnectionAuth {
+            peer,
+            security,
+            principal,
+            sasl,
+            lookup,
+            log_connections,
+        }
+    }
+}
+
+/// Shared state every accepted connection needs.
+#[derive(Clone)]
+struct AcceptContext {
+    request_lanes: crate::kafka::RequestLanes,
+    registry: Arc<PendingFetchRegistry>,
+    conn_limiter: Arc<tokio::sync::Semaphore>,
+    lookup: ChannelLookup,
+    enable_long_polling: bool,
+    fetch_poll_interval_ms: i32,
+    log_connections: bool,
+}
+
 /// Run the TCP listener
 ///
 /// This is the main entry point for the Kafka protocol listener.
-/// It accepts a pre-bound TcpListener and spawns a new async task
-/// for each incoming connection.
+/// It accepts the pre-bound TcpListeners (the primary one first) and spawns a new
+/// async task for each incoming connection.
 ///
 /// # Arguments
-/// * `listener` - Pre-bound TcpListener (bound in worker.rs)
+/// * `listeners` - Pre-bound TcpListeners (bound in worker.rs) and their security
 /// * `request_lanes` - Channel senders (main + DR-12 liveness lanes) to the DB thread
+/// * `credential_tx` - Channel to the DB thread for SASL credential lookups
 /// * `notify_rx` - Channel receiver for notifications from DB thread (long polling)
 /// * `forward_rx` - Channel receiver for async shadow forwarding requests
 /// * `runtime_context` - Runtime context for accessing configuration
@@ -407,9 +521,11 @@ fn try_admit_connection(
 ///
 /// # Thread Safety
 /// This function runs in a spawned thread and MUST NOT call pgrx functions.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
-    listener: TcpListener,
+    listeners: Vec<(TcpListener, Arc<ListenerSecurity>)>,
     request_lanes: crate::kafka::RequestLanes,
+    credential_tx: Sender<CredentialRequest>,
     notify_rx: Receiver<InternalNotification>,
     forward_rx: Receiver<ForwardRequest>,
     forward_ack_tx: Sender<ForwardAck>,
@@ -492,40 +608,72 @@ pub async fn run(
     // SEC-3: bound concurrent client connections to prevent fd/memory exhaustion. Each
     // connection task can buffer up to one MAX_REQUEST_SIZE frame, so unbounded connections
     // are a DoS vector. A permit is held for the connection's lifetime and freed on close.
-    let conn_limiter = Arc::new(tokio::sync::Semaphore::new(
-        crate::kafka::constants::MAX_CONNECTIONS,
-    ));
+    // The cap is shared by all listeners.
+    let accept_context = AcceptContext {
+        request_lanes,
+        registry,
+        conn_limiter: Arc::new(tokio::sync::Semaphore::new(
+            crate::kafka::constants::MAX_CONNECTIONS,
+        )),
+        lookup: ChannelLookup(credential_tx),
+        enable_long_polling,
+        fetch_poll_interval_ms,
+        log_connections,
+    };
 
-    // Accept loop: wait for new connections OR shutdown signal
+    // One accept loop per listener (the primary listener plus
+    // pg_kafka.additional_listeners).
+    let accept_tasks: Vec<_> = listeners
+        .into_iter()
+        .map(|(listener, security)| {
+            info!(
+                "pg_kafka listener {}://{} accepting connections",
+                security.protocol.name(),
+                security.bind_addr
+            );
+            tokio::spawn(accept_loop(listener, security, accept_context.clone()))
+        })
+        .collect();
+
+    // Wait for the shutdown signal.
     loop {
-        // Check for shutdown signal (non-blocking)
         match shutdown_rx.try_recv() {
             Ok(()) => {
                 info!("TCP listener received shutdown signal");
                 break;
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
-                // No shutdown signal, continue
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 info!("Shutdown channel disconnected, exiting");
                 break;
             }
         }
+    }
 
-        // Accept with timeout to allow periodic shutdown checks
-        let accept_result =
-            tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept()).await;
+    // Cleanup: stop accepting and abort the notifier task
+    for task in &accept_tasks {
+        task.abort();
+    }
+    notify_handle.abort();
+    let _ = notify_handle.await;
 
-        match accept_result {
-            Ok(Ok((socket, addr))) => {
-                // SEC-3: enforce the concurrent-connection cap. try_acquire is non-blocking so
-                // the accept loop keeps servicing shutdown checks; at the cap we close the new
-                // socket rather than buffer an unbounded number of connections.
-                let permit = match try_admit_connection(&conn_limiter) {
+    Ok(())
+}
+
+/// Accept connections on one listener until aborted.
+async fn accept_loop(listener: TcpListener, security: Arc<ListenerSecurity>, ctx: AcceptContext) {
+    loop {
+        match listener.accept().await {
+            Ok((socket, addr)) => {
+                // SEC-3: enforce the concurrent-connection cap. try_acquire is non-blocking;
+                // at the cap we close the new socket rather than buffer an unbounded number
+                // of connections.
+                let permit = match try_admit_connection(&ctx.conn_limiter) {
                     Some(permit) => permit,
                     None => {
-                        if log_connections {
+                        if ctx.log_connections {
                             warn!(
                                 "Connection limit ({}) reached; rejecting {}",
                                 crate::kafka::constants::MAX_CONNECTIONS,
@@ -539,17 +687,17 @@ pub async fn run(
                 };
 
                 // Log connections if enabled
-                if log_connections {
-                    info!("Kafka client connected from {}", addr);
+                if ctx.log_connections {
+                    info!(
+                        "Kafka client connected from {} on {}://{}",
+                        addr,
+                        security.protocol.name(),
+                        security.bind_addr
+                    );
                 }
 
-                // Clone resources for this connection
-                let conn_request_lanes = request_lanes.clone();
-                let conn_registry = registry.clone();
-                let poll_interval = fetch_poll_interval_ms;
-                let long_poll_enabled = enable_long_polling;
-                let should_log = log_connections;
-
+                let ctx = ctx.clone();
+                let security = security.clone();
                 // Spawn a new async task to handle this connection
                 // Use tokio::spawn (not spawn_local) since we're in multi-thread runtime
                 tokio::spawn(async move {
@@ -557,38 +705,104 @@ pub async fn run(
                     // frees a slot for a new connection (SEC-3).
                     let _permit = permit;
                     let _conn_metrics = crate::kafka::metrics::ConnectionGuard::open();
-                    if let Err(e) = handle_connection(
-                        socket,
-                        conn_request_lanes,
-                        conn_registry,
-                        long_poll_enabled,
-                        poll_interval,
-                        should_log,
-                    )
-                    .await
-                    {
-                        if should_log {
-                            warn!("Error handling connection from {}: {}", addr, e);
+                    let should_log = ctx.log_connections;
+                    let result = serve_connection(socket, addr, security, ctx).await;
+                    match result {
+                        Err(e) if should_log => {
+                            warn!("Error handling connection from {}: {}", addr, e)
                         }
-                    } else if should_log {
-                        info!("Kafka client disconnected from {}", addr);
+                        Ok(()) if should_log => info!("Kafka client disconnected from {}", addr),
+                        _ => {}
                     }
                 });
             }
-            Ok(Err(e)) => {
+            Err(e) => {
                 warn!("Error accepting connection: {}", e);
-            }
-            Err(_) => {
-                // Timeout - normal, continue to check shutdown signal
+                // Back off briefly (e.g. EMFILE) instead of spinning.
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }
     }
+}
 
-    // Cleanup: abort the notifier task
-    notify_handle.abort();
-    let _ = notify_handle.await;
-
-    Ok(())
+/// TLS handshake (SSL / SASL_SSL listeners), then the Kafka protocol loop.
+async fn serve_connection(
+    socket: TcpStream,
+    addr: std::net::SocketAddr,
+    security: Arc<ListenerSecurity>,
+    ctx: AcceptContext,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let peer = addr.to_string();
+    let Some(acceptor) = security.tls.clone() else {
+        let auth = ConnectionAuth::new(
+            peer,
+            security,
+            ConnectionPrincipal::anonymous(),
+            ctx.lookup,
+            ctx.log_connections,
+        );
+        return handle_connection(
+            socket,
+            ctx.request_lanes,
+            ctx.registry,
+            ctx.enable_long_polling,
+            ctx.fetch_poll_interval_ms,
+            auth,
+        )
+        .await;
+    };
+    let tls = match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(socket)).await {
+        Ok(Ok(tls)) => tls,
+        Ok(Err(e)) => {
+            // A peer that connects and leaves without a ClientHello (port probe, load
+            // balancer health check) is routine; a real handshake failure is not.
+            if is_peer_disconnect(&e) {
+                debug!("TLS peer {} left before the handshake: {}", peer, e);
+            } else {
+                warn!(
+                    "TLS handshake with {} on {}://{} failed: {}",
+                    peer,
+                    security.protocol.name(),
+                    security.bind_addr,
+                    e
+                );
+            }
+            return Ok(());
+        }
+        Err(_) => {
+            warn!("TLS handshake with {} timed out", peer);
+            return Ok(());
+        }
+    };
+    // Mutual TLS: the verified client certificate's subject is the principal (Kafka's
+    // default SSL principal, `User:<RFC 2253 subject>`), until SASL replaces it.
+    let principal = tls
+        .get_ref()
+        .1
+        .peer_certificates()
+        .and_then(|certs| certs.first())
+        .and_then(|cert| crate::kafka::auth::tls::certificate_subject(cert.as_ref()))
+        .map(|subject| ConnectionPrincipal {
+            principal: format!("User:{}", subject),
+            method: "SSL",
+        })
+        .unwrap_or_else(ConnectionPrincipal::anonymous);
+    if ctx.log_connections && principal.method == "SSL" {
+        info!(
+            "Kafka client {} authenticated by TLS client certificate as {}",
+            peer, principal.principal
+        );
+    }
+    let auth = ConnectionAuth::new(peer, security, principal, ctx.lookup, ctx.log_connections);
+    handle_connection(
+        tls,
+        ctx.request_lanes,
+        ctx.registry,
+        ctx.enable_long_polling,
+        ctx.fetch_poll_interval_ms,
+        auth,
+    )
+    .await
 }
 
 /// Handle a single client connection with request pipelining support
@@ -617,21 +831,32 @@ pub async fn run(
 ///
 /// # Thread Safety
 /// This function runs in the network thread and MUST NOT call pgrx functions.
-async fn handle_connection(
-    socket: TcpStream,
+async fn handle_connection<S>(
+    socket: S,
     request_lanes: crate::kafka::RequestLanes,
     registry: Arc<PendingFetchRegistry>,
     enable_long_polling: bool,
     poll_interval_ms: i32,
-    _log_connections: bool,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    mut auth: ConnectionAuth,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     debug!("New connection established, starting pipelined handle loop");
 
     // Wrap socket in a budgeted length-delimited codec (big-endian 4-byte size
     // prefix). RV-9: the codec charges a global reservation budget for each frame's
     // declared length so aggregate in-flight reservations across connections are
     // bounded, not just the connection count.
-    let framed = Framed::new(socket, BudgetedFrameCodec::new());
+    let frame_limit = Arc::new(AtomicUsize::new(
+        if auth.sasl.is_authenticated() || !auth.security.protocol.uses_sasl() {
+            super::constants::MAX_REQUEST_SIZE as usize
+        } else {
+            PRE_AUTH_MAX_FRAME
+        },
+    ));
+    let framed = Framed::new(socket, BudgetedFrameCodec::with_limit(frame_limit.clone()));
+    let auth_deadline = tokio::time::Instant::now() + SASL_AUTH_TIMEOUT;
 
     // Split the framed socket into independent reader and writer halves
     // This enables concurrent reading and writing for pipelining support
@@ -667,6 +892,11 @@ async fn handle_connection(
     // response (possibly empty), never an error or a dropped request.
     let long_poll_permits = Arc::new(tokio::sync::Semaphore::new(MAX_LONG_POLLS_PER_CONNECTION));
 
+    // An additional listener advertises its own host:port in Metadata/FindCoordinator,
+    // so a client that bootstrapped on it stays on it (Kafka's per-listener
+    // advertised.listeners).
+    let advertised = auth.security.advertised.clone();
+
     // Spawn the Writer Task
     // This task sits and waits for responses from the DB.
     // It runs completely independently of the reader.
@@ -675,8 +905,11 @@ async fn handle_connection(
             // A request yields at most one response; one that yields none
             // (acks=0 produce) closes the channel without sending and is
             // skipped here.
-            while let Some(response) = slot.recv().await {
+            while let Some(mut response) = slot.recv().await {
                 debug!("Writer received response, encoding...");
+                if let Some((host, port)) = &advertised {
+                    rewrite_advertised(&mut response, host, *port);
+                }
                 let response_bytes = match protocol::encode_response(response) {
                     Ok(bytes) => bytes,
                     Err(e) => {
@@ -714,7 +947,24 @@ async fn handle_connection(
             Ok(permit) => permit,
             Err(_) => break,
         };
-        let frame = match reader.next().await {
+        // auth stream: an unauthenticated connection on a SASL listener must finish
+        // authenticating within SASL_AUTH_TIMEOUT, so idle unauthenticated clients
+        // cannot hold connection slots forever.
+        let next = if auth.sasl.admits(-1) {
+            reader.next().await
+        } else {
+            match tokio::time::timeout_at(auth_deadline, reader.next()).await {
+                Ok(next) => next,
+                Err(_) => {
+                    warn!(
+                        "Closing connection from {}: SASL authentication not completed within {:?}",
+                        auth.peer, SASL_AUTH_TIMEOUT
+                    );
+                    break;
+                }
+            }
+        };
+        let frame = match next {
             None => break,
             Some(Ok(f)) => f,
             Some(Err(e)) => {
@@ -735,6 +985,35 @@ async fn handle_connection(
         let (response_tx, response_rx) = tokio::sync::mpsc::unbounded_channel();
         if order_tx.send((response_rx, in_flight_permit)).is_err() {
             warn!("Writer task gone, closing connection");
+            break;
+        }
+
+        // Listener security: SaslHandshake / SaslAuthenticate are answered here, on
+        // the network thread, from the connection's SASL state. On a SASL listener
+        // nothing but ApiVersions and those two is processed before authentication
+        // succeeds; anything else closes the connection, as Kafka does.
+        let api_key = crate::kafka::auth::session::peek_api_key(&frame);
+        if let Some(key) = api_key.filter(|k| crate::kafka::auth::session::is_sasl_api(*k)) {
+            debug!("SASL request api_key={} from {}", key, auth.peer);
+            if handle_sasl_frame(&mut auth, frame, response_tx).await {
+                if auth.sasl.is_authenticated() {
+                    frame_limit.store(
+                        super::constants::MAX_REQUEST_SIZE as usize,
+                        Ordering::Relaxed,
+                    );
+                }
+                continue;
+            }
+            break;
+        }
+        if !auth.sasl.admits(api_key.unwrap_or(-1)) {
+            warn!(
+                "Closing connection from {} on {}://{}: request api_key={:?} before SASL authentication",
+                auth.peer,
+                auth.security.protocol.name(),
+                auth.security.bind_addr,
+                api_key
+            );
             break;
         }
 
@@ -861,8 +1140,113 @@ async fn handle_connection(
         let _ = writer_handle.await;
     }
 
+    if auth.log_connections {
+        info!(
+            "Kafka connection from {} ({}) closed",
+            auth.peer, auth.principal
+        );
+    }
     debug!("Connection handler exiting");
     Ok(())
+}
+
+/// Answer one SaslHandshake / SaslAuthenticate request. Returns false when the
+/// connection must close (after its response, if any, is written).
+async fn handle_sasl_frame(
+    auth: &mut ConnectionAuth,
+    frame: BytesMut,
+    response_tx: UnboundedSender<KafkaResponse>,
+) -> bool {
+    // Counted in kafka.api_metrics like a worker request (the counters are atomics, safe
+    // on this thread): latency covers the decode, the credential lookup and the
+    // response; a request that closes the connection without one counts as an error.
+    let api_key = crate::kafka::auth::session::peek_api_key(&frame).unwrap_or(-1);
+    let mut timer = crate::kafka::metrics::RequestTimer::start(api_key);
+    let request = match crate::kafka::auth::session::decode_sasl_request(frame) {
+        Ok(r) => r,
+        Err(e) => {
+            timer.mark_error();
+            warn!("Closing connection from {}: {}", auth.peer, e);
+            return false;
+        }
+    };
+    let lookup = auth.lookup.clone();
+    match auth.sasl.handle(request, &lookup).await {
+        SaslOutcome::Reply(response) => {
+            timer.observe(&response);
+            response_tx.send(response).is_ok()
+        }
+        SaslOutcome::Authenticated {
+            response,
+            principal,
+            mechanism,
+        } => {
+            auth.principal = ConnectionPrincipal {
+                principal,
+                method: mechanism,
+            };
+            if auth.log_connections {
+                info!(
+                    "Kafka client {} authenticated as {} on {}://{}",
+                    auth.peer,
+                    auth.principal,
+                    auth.security.protocol.name(),
+                    auth.security.bind_addr
+                );
+            }
+            timer.observe(&response);
+            response_tx.send(response).is_ok()
+        }
+        SaslOutcome::ReplyAndClose(response) => {
+            timer.observe(&response);
+            let _ = response_tx.send(response);
+            false
+        }
+        SaslOutcome::Failed { response, reason } => {
+            // Never includes the password; no username either (it may be a mistyped
+            // password).
+            warn!(
+                "SASL authentication failed for {} on {}://{}: {}",
+                auth.peer,
+                auth.security.protocol.name(),
+                auth.security.bind_addr,
+                reason
+            );
+            timer.observe(&response);
+            // Record before the deliberate failure delay, which is not service time.
+            drop(timer);
+            tokio::time::sleep(AUTH_FAILURE_DELAY).await;
+            let _ = response_tx.send(response);
+            false
+        }
+    }
+}
+
+/// Point Metadata brokers and FindCoordinator coordinators at this listener's
+/// advertised address (single-node broker: every broker entry is this node).
+fn rewrite_advertised(response: &mut KafkaResponse, host: &str, port: i32) {
+    use kafka_protocol::protocol::StrBytes;
+    match &mut response.body {
+        ResponseBody::Metadata(response) => {
+            for broker in response.brokers.iter_mut() {
+                broker.host = StrBytes::from_string(host.to_string());
+                broker.port = port;
+            }
+        }
+        ResponseBody::FindCoordinator(response) => {
+            if response.error_code == 0 && !response.host.is_empty() {
+                response.host = StrBytes::from_string(host.to_string());
+                response.port = port;
+            }
+            for c in response.coordinators.iter_mut() {
+                if c.error_code == 0 && !c.host.is_empty() {
+                    c.host = StrBytes::from_string(host.to_string());
+                    c.port = port;
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// SEC-4: hand a request to the DB thread without blocking the async runtime.
@@ -1505,13 +1889,21 @@ mod tests {
         };
         tokio::spawn(async move {
             let (socket, _) = server.accept().await.unwrap();
+            let (cred_tx, _cred_rx) = crossbeam_channel::bounded(1);
+            let auth = ConnectionAuth::new(
+                "test".into(),
+                Arc::new(ListenerSecurity::plaintext("127.0.0.1:0")),
+                ConnectionPrincipal::anonymous(),
+                ChannelLookup(cred_tx),
+                false,
+            );
             let _ = handle_connection(
                 socket,
                 lanes,
                 Arc::new(PendingFetchRegistry::new()),
                 false,
                 1000,
-                false,
+                auth,
             )
             .await;
         });
@@ -1576,6 +1968,20 @@ mod tests {
         );
         drop(codec);
         assert_eq!(FRAME_RESERVE_REMAINING.load(Ordering::Acquire), before);
+    }
+
+    #[test]
+    fn test_codec_enforces_the_pre_auth_frame_limit() {
+        // A SASL listener's codec refuses a frame declared larger than the pre-auth
+        // limit before reserving anything. (Raising the limit after authentication is
+        // covered by the auth E2E tests; decoding here would touch the global budget.)
+        let limit = Arc::new(AtomicUsize::new(PRE_AUTH_MAX_FRAME));
+        let mut codec = BudgetedFrameCodec::with_limit(limit);
+        let big = (PRE_AUTH_MAX_FRAME as u32 + 1).to_be_bytes();
+        let mut src = BytesMut::from(&big[..]);
+        assert!(codec.decode(&mut src).is_err());
+        // Nothing was charged to the global budget for the refused frame.
+        assert_eq!(codec.charged, 0);
     }
 
     #[test]

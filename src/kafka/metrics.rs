@@ -13,7 +13,9 @@
 //!   whether the response carried any non-zero error code (or the request failed outright),
 //!   and the service time on the DB thread (handler + commit; queue wait is not included). A
 //!   long-poll Fetch that is re-submitted counts each execution.
-//! - The **network thread** tracks connections ([`ConnectionGuard`], [`connection_rejected`]).
+//! - The **network thread** tracks connections ([`ConnectionGuard`], [`connection_rejected`])
+//!   and records the APIs it answers itself (SaslHandshake/SaslAuthenticate, `listener.rs`)
+//!   with the same [`RequestTimer`].
 //! - The flush samples the request-lane depths at flush time.
 //!
 //! Everything here except [`write_batch`] is pure Rust (atomics, no pgrx), so it is safe on

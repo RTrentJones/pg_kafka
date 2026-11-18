@@ -16,7 +16,7 @@ use kafka_protocol::messages::txn_offset_commit_response::TxnOffsetCommitRespons
 use kafka_protocol::messages::TopicName;
 
 use super::produce::notify_best_effort;
-use super::{ApiEnv, Call, KafkaApi, Rejection, RequestHeader, TopicPartitions};
+use super::{ApiEnv, ApiSchema, Call, KafkaApi, Rejection, RequestHeader, TopicPartitions};
 use crate::kafka::constants::ERROR_INVALID_REQUEST;
 use crate::kafka::dispatch::RequestOutcome;
 use crate::kafka::handlers;
@@ -39,13 +39,28 @@ pub struct InitProducerIdRequestData {
     pub producer_epoch: i16,
 }
 
-impl KafkaApi for InitProducerIdApi {
+impl ApiSchema for InitProducerIdApi {
     type Wire = InitProducerIdRequest;
-    type Request = InitProducerIdRequestData;
     type Echo = ();
     const NAME: &'static str = "InitProducerId";
     const MIN_VERSION: i16 = 0;
     const MAX_VERSION: i16 = 4;
+
+    fn error_response(
+        _echo: Option<&()>,
+        _version: i16,
+        error_code: i16,
+    ) -> InitProducerIdResponse {
+        crate::kafka::response_builders::build_init_producer_id_error_response(error_code)
+    }
+
+    fn response_has_error(response: &InitProducerIdResponse) -> bool {
+        response.error_code != 0
+    }
+}
+
+impl KafkaApi for InitProducerIdApi {
+    type Request = InitProducerIdRequestData;
 
     fn decode(
         wire: InitProducerIdRequest,
@@ -60,18 +75,6 @@ impl KafkaApi for InitProducerIdApi {
     }
 
     fn echo(_request: &Self::Request) {}
-
-    fn error_response(
-        _echo: Option<&()>,
-        _version: i16,
-        error_code: i16,
-    ) -> InitProducerIdResponse {
-        crate::kafka::response_builders::build_init_producer_id_error_response(error_code)
-    }
-
-    fn response_has_error(response: &InitProducerIdResponse) -> bool {
-        response.error_code != 0
-    }
 
     fn handle(request: Self::Request, call: Call<Self>, env: &ApiEnv<'_>) -> RequestOutcome {
         call.run(request, |r, header| {
@@ -103,51 +106,12 @@ pub struct AddPartitionsToTxnRequestData {
     pub topics: TopicPartitions,
 }
 
-impl KafkaApi for AddPartitionsToTxnApi {
+impl ApiSchema for AddPartitionsToTxnApi {
     type Wire = AddPartitionsToTxnRequest;
-    type Request = AddPartitionsToTxnRequestData;
     type Echo = TopicPartitions;
     const NAME: &'static str = "AddPartitionsToTxn";
     const MIN_VERSION: i16 = 0;
     const MAX_VERSION: i16 = 3;
-
-    fn decode(
-        wire: AddPartitionsToTxnRequest,
-        header: &RequestHeader,
-    ) -> Result<Self::Request, Rejection<Self::Echo>> {
-        let topics = |topics: &[kafka_protocol::messages::add_partitions_to_txn_request::AddPartitionsToTxnTopic]| {
-            topics
-                .iter()
-                .map(|t| (t.name.to_string(), t.partitions.to_vec()))
-                .collect::<TopicPartitions>()
-        };
-        if header.api_version >= 4 {
-            // v4+ batches transactions; only a single one is supported.
-            let Some(first) = wire.transactions.first() else {
-                return Err(Rejection::Reply {
-                    error_code: ERROR_INVALID_REQUEST,
-                    echo: None,
-                });
-            };
-            Ok(AddPartitionsToTxnRequestData {
-                transactional_id: first.transactional_id.to_string(),
-                producer_id: first.producer_id.0,
-                producer_epoch: first.producer_epoch,
-                topics: topics(&first.topics),
-            })
-        } else {
-            Ok(AddPartitionsToTxnRequestData {
-                transactional_id: wire.v3_and_below_transactional_id.to_string(),
-                producer_id: wire.v3_and_below_producer_id.0,
-                producer_epoch: wire.v3_and_below_producer_epoch,
-                topics: topics(&wire.v3_and_below_topics),
-            })
-        }
-    }
-
-    fn echo(request: &Self::Request) -> TopicPartitions {
-        request.topics.clone()
-    }
 
     /// Top-level error code (v4+) plus the code on every requested partition (v0-3).
     fn error_response(
@@ -196,6 +160,48 @@ impl KafkaApi for AddPartitionsToTxnApi {
                 .flat_map(|r| r.topic_results.iter())
                 .any(topic_error)
     }
+}
+
+impl KafkaApi for AddPartitionsToTxnApi {
+    type Request = AddPartitionsToTxnRequestData;
+
+    fn decode(
+        wire: AddPartitionsToTxnRequest,
+        header: &RequestHeader,
+    ) -> Result<Self::Request, Rejection<Self::Echo>> {
+        let topics = |topics: &[kafka_protocol::messages::add_partitions_to_txn_request::AddPartitionsToTxnTopic]| {
+            topics
+                .iter()
+                .map(|t| (t.name.to_string(), t.partitions.to_vec()))
+                .collect::<TopicPartitions>()
+        };
+        if header.api_version >= 4 {
+            // v4+ batches transactions; only a single one is supported.
+            let Some(first) = wire.transactions.first() else {
+                return Err(Rejection::Reply {
+                    error_code: ERROR_INVALID_REQUEST,
+                    echo: None,
+                });
+            };
+            Ok(AddPartitionsToTxnRequestData {
+                transactional_id: first.transactional_id.to_string(),
+                producer_id: first.producer_id.0,
+                producer_epoch: first.producer_epoch,
+                topics: topics(&first.topics),
+            })
+        } else {
+            Ok(AddPartitionsToTxnRequestData {
+                transactional_id: wire.v3_and_below_transactional_id.to_string(),
+                producer_id: wire.v3_and_below_producer_id.0,
+                producer_epoch: wire.v3_and_below_producer_epoch,
+                topics: topics(&wire.v3_and_below_topics),
+            })
+        }
+    }
+
+    fn echo(request: &Self::Request) -> TopicPartitions {
+        request.topics.clone()
+    }
 
     fn handle(request: Self::Request, call: Call<Self>, env: &ApiEnv<'_>) -> RequestOutcome {
         call.run(request, |r, _| {
@@ -226,27 +232,12 @@ pub struct AddOffsetsToTxnRequestData {
     pub group_id: String,
 }
 
-impl KafkaApi for AddOffsetsToTxnApi {
+impl ApiSchema for AddOffsetsToTxnApi {
     type Wire = AddOffsetsToTxnRequest;
-    type Request = AddOffsetsToTxnRequestData;
     type Echo = ();
     const NAME: &'static str = "AddOffsetsToTxn";
     const MIN_VERSION: i16 = 0;
     const MAX_VERSION: i16 = 3;
-
-    fn decode(
-        wire: AddOffsetsToTxnRequest,
-        _header: &RequestHeader,
-    ) -> Result<Self::Request, Rejection<()>> {
-        Ok(AddOffsetsToTxnRequestData {
-            transactional_id: wire.transactional_id.to_string(),
-            producer_id: wire.producer_id.0,
-            producer_epoch: wire.producer_epoch,
-            group_id: wire.group_id.to_string(),
-        })
-    }
-
-    fn echo(_request: &Self::Request) {}
 
     fn error_response(
         _echo: Option<&()>,
@@ -262,6 +253,24 @@ impl KafkaApi for AddOffsetsToTxnApi {
     fn response_has_error(response: &AddOffsetsToTxnResponse) -> bool {
         response.error_code != 0
     }
+}
+
+impl KafkaApi for AddOffsetsToTxnApi {
+    type Request = AddOffsetsToTxnRequestData;
+
+    fn decode(
+        wire: AddOffsetsToTxnRequest,
+        _header: &RequestHeader,
+    ) -> Result<Self::Request, Rejection<()>> {
+        Ok(AddOffsetsToTxnRequestData {
+            transactional_id: wire.transactional_id.to_string(),
+            producer_id: wire.producer_id.0,
+            producer_epoch: wire.producer_epoch,
+            group_id: wire.group_id.to_string(),
+        })
+    }
+
+    fn echo(_request: &Self::Request) {}
 
     fn handle(request: Self::Request, call: Call<Self>, env: &ApiEnv<'_>) -> RequestOutcome {
         call.run(request, |r, _| {
@@ -292,13 +301,27 @@ pub struct EndTxnRequestData {
     pub committed: bool,
 }
 
-impl KafkaApi for EndTxnApi {
+impl ApiSchema for EndTxnApi {
     type Wire = EndTxnRequest;
-    type Request = EndTxnRequestData;
     type Echo = ();
     const NAME: &'static str = "EndTxn";
     const MIN_VERSION: i16 = 0;
     const MAX_VERSION: i16 = 3;
+
+    fn error_response(_echo: Option<&()>, _version: i16, error_code: i16) -> EndTxnResponse {
+        let mut response = EndTxnResponse::default();
+        response.throttle_time_ms = 0;
+        response.error_code = error_code;
+        response
+    }
+
+    fn response_has_error(response: &EndTxnResponse) -> bool {
+        response.error_code != 0
+    }
+}
+
+impl KafkaApi for EndTxnApi {
+    type Request = EndTxnRequestData;
 
     fn decode(
         wire: EndTxnRequest,
@@ -313,17 +336,6 @@ impl KafkaApi for EndTxnApi {
     }
 
     fn echo(_request: &Self::Request) {}
-
-    fn error_response(_echo: Option<&()>, _version: i16, error_code: i16) -> EndTxnResponse {
-        let mut response = EndTxnResponse::default();
-        response.throttle_time_ms = 0;
-        response.error_code = error_code;
-        response
-    }
-
-    fn response_has_error(response: &EndTxnResponse) -> bool {
-        response.error_code != 0
-    }
 
     fn handle(request: Self::Request, call: Call<Self>, env: &ApiEnv<'_>) -> RequestOutcome {
         call.run(request, |r, _| {
@@ -371,14 +383,39 @@ pub struct TxnOffsetCommitRequestData {
     pub topics: TxnOffsetCommitTopics,
 }
 
-impl KafkaApi for TxnOffsetCommitApi {
+impl ApiSchema for TxnOffsetCommitApi {
     type Wire = TxnOffsetCommitRequest;
-    type Request = TxnOffsetCommitRequestData;
+
     /// The requested topics and partitions (offsets are not needed for the error).
     type Echo = TxnOffsetCommitTopics;
     const NAME: &'static str = "TxnOffsetCommit";
     const MIN_VERSION: i16 = 0;
     const MAX_VERSION: i16 = 3;
+
+    /// No top-level error code: report it on every requested partition (an empty response
+    /// would read as success).
+    fn error_response(
+        echo: Option<&TxnOffsetCommitTopics>,
+        _version: i16,
+        error_code: i16,
+    ) -> TxnOffsetCommitResponse {
+        match echo {
+            Some(topics) => handlers::txn_offset_commit_error_response(topics, error_code),
+            None => TxnOffsetCommitResponse::default(),
+        }
+    }
+
+    fn response_has_error(response: &TxnOffsetCommitResponse) -> bool {
+        response
+            .topics
+            .iter()
+            .flat_map(|t| t.partitions.iter())
+            .any(|p| p.error_code != 0)
+    }
+}
+
+impl KafkaApi for TxnOffsetCommitApi {
+    type Request = TxnOffsetCommitRequestData;
 
     fn decode(
         wire: TxnOffsetCommitRequest,
@@ -424,27 +461,6 @@ impl KafkaApi for TxnOffsetCommitApi {
                 )
             })
             .collect()
-    }
-
-    /// No top-level error code: report it on every requested partition (an empty response
-    /// would read as success).
-    fn error_response(
-        echo: Option<&TxnOffsetCommitTopics>,
-        _version: i16,
-        error_code: i16,
-    ) -> TxnOffsetCommitResponse {
-        match echo {
-            Some(topics) => handlers::txn_offset_commit_error_response(topics, error_code),
-            None => TxnOffsetCommitResponse::default(),
-        }
-    }
-
-    fn response_has_error(response: &TxnOffsetCommitResponse) -> bool {
-        response
-            .topics
-            .iter()
-            .flat_map(|t| t.partitions.iter())
-            .any(|p| p.error_code != 0)
     }
 
     fn handle(request: Self::Request, call: Call<Self>, env: &ApiEnv<'_>) -> RequestOutcome {

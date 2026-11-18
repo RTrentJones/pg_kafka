@@ -66,6 +66,8 @@ pub mod shadow;
 pub mod transaction;
 // Stream `part` (wave 2): time-partitioned kafka.messages
 pub mod part;
+// auth stream: TLS + SASL listener tests
+pub mod auth;
 
 // Re-export infrastructure
 pub use assertions::*;

@@ -11,7 +11,7 @@ use kafka_protocol::messages::offset_fetch_response::{
 };
 use kafka_protocol::messages::{GroupId, TopicName};
 
-use super::{ApiEnv, Call, KafkaApi, Rejection, RequestHeader, TopicPartitions};
+use super::{ApiEnv, ApiSchema, Call, KafkaApi, Rejection, RequestHeader, TopicPartitions};
 use crate::kafka::dispatch::RequestOutcome;
 use crate::kafka::handlers;
 use crate::kafka::messages::{
@@ -35,14 +35,51 @@ pub struct OffsetCommitRequestData {
     pub topics: Vec<OffsetCommitTopicData>,
 }
 
-impl KafkaApi for OffsetCommitApi {
+impl ApiSchema for OffsetCommitApi {
     type Wire = OffsetCommitRequest;
-    type Request = OffsetCommitRequestData;
     type Echo = TopicPartitions;
     const NAME: &'static str = "OffsetCommit";
+
     // The crate cannot decode OffsetCommit v0-1.
     const MIN_VERSION: i16 = 2;
     const MAX_VERSION: i16 = 8;
+
+    /// No top-level error code: report it on every requested partition.
+    fn error_response(
+        echo: Option<&TopicPartitions>,
+        _version: i16,
+        error_code: i16,
+    ) -> OffsetCommitResponse {
+        let mut response = OffsetCommitResponse::default();
+        response.throttle_time_ms = 0;
+        for (name, partitions) in echo.into_iter().flatten() {
+            let mut topic = OffsetCommitResponseTopic::default();
+            topic.name = TopicName(name.clone().into());
+            topic.partitions = partitions
+                .iter()
+                .map(|&index| {
+                    let mut p = OffsetCommitResponsePartition::default();
+                    p.partition_index = index;
+                    p.error_code = error_code;
+                    p
+                })
+                .collect();
+            response.topics.push(topic);
+        }
+        response
+    }
+
+    fn response_has_error(response: &OffsetCommitResponse) -> bool {
+        response
+            .topics
+            .iter()
+            .flat_map(|t| t.partitions.iter())
+            .any(|p| p.error_code != 0)
+    }
+}
+
+impl KafkaApi for OffsetCommitApi {
+    type Request = OffsetCommitRequestData;
 
     fn decode(
         wire: OffsetCommitRequest,
@@ -87,39 +124,6 @@ impl KafkaApi for OffsetCommitApi {
             .collect()
     }
 
-    /// No top-level error code: report it on every requested partition.
-    fn error_response(
-        echo: Option<&TopicPartitions>,
-        _version: i16,
-        error_code: i16,
-    ) -> OffsetCommitResponse {
-        let mut response = OffsetCommitResponse::default();
-        response.throttle_time_ms = 0;
-        for (name, partitions) in echo.into_iter().flatten() {
-            let mut topic = OffsetCommitResponseTopic::default();
-            topic.name = TopicName(name.clone().into());
-            topic.partitions = partitions
-                .iter()
-                .map(|&index| {
-                    let mut p = OffsetCommitResponsePartition::default();
-                    p.partition_index = index;
-                    p.error_code = error_code;
-                    p
-                })
-                .collect();
-            response.topics.push(topic);
-        }
-        response
-    }
-
-    fn response_has_error(response: &OffsetCommitResponse) -> bool {
-        response
-            .topics
-            .iter()
-            .flat_map(|t| t.partitions.iter())
-            .any(|p| p.error_code != 0)
-    }
-
     fn handle(request: Self::Request, call: Call<Self>, env: &ApiEnv<'_>) -> RequestOutcome {
         call.run(request, |r, _| {
             handlers::handle_offset_commit(
@@ -146,62 +150,18 @@ pub struct OffsetFetchRequestData {
     pub topics: Option<Vec<OffsetFetchTopicData>>,
 }
 
-impl KafkaApi for OffsetFetchApi {
+impl ApiSchema for OffsetFetchApi {
     type Wire = OffsetFetchRequest;
-    type Request = OffsetFetchRequestData;
+
     /// The group id and the requested topics/partitions.
     type Echo = (String, TopicPartitions);
     const NAME: &'static str = "OffsetFetch";
+
     // The crate cannot decode OffsetFetch v0.
     const MIN_VERSION: i16 = 1;
+
     // v8+ answers several groups per request, which is not implemented.
     const MAX_VERSION: i16 = 7;
-
-    fn decode(
-        wire: OffsetFetchRequest,
-        _header: &RequestHeader,
-    ) -> Result<Self::Request, Rejection<Self::Echo>> {
-        // v8+ (not served, but echoed in its UNSUPPORTED_VERSION reply) moves the group
-        // and its topics into `groups`.
-        if let Some(group) = wire.groups.into_iter().next() {
-            return Ok(OffsetFetchRequestData {
-                group_id: group.group_id.to_string(),
-                topics: group.topics.map(|topics| {
-                    topics
-                        .into_iter()
-                        .map(|t| OffsetFetchTopicData {
-                            name: t.name.to_string(),
-                            partition_indexes: t.partition_indexes,
-                        })
-                        .collect()
-                }),
-            });
-        }
-        Ok(OffsetFetchRequestData {
-            group_id: wire.group_id.to_string(),
-            topics: wire.topics.map(|topics| {
-                topics
-                    .into_iter()
-                    .map(|t| OffsetFetchTopicData {
-                        name: t.name.to_string(),
-                        partition_indexes: t.partition_indexes,
-                    })
-                    .collect()
-            }),
-        })
-    }
-
-    fn echo(request: &Self::Request) -> Self::Echo {
-        (
-            request.group_id.clone(),
-            request
-                .topics
-                .iter()
-                .flatten()
-                .map(|t| (t.name.clone(), t.partition_indexes.clone()))
-                .collect(),
-        )
-    }
 
     /// v2-7: top-level error code plus the code on every requested partition (the only
     /// place v1 can carry it). v8+: one group entry carrying the code.
@@ -274,6 +234,56 @@ impl KafkaApi for OffsetFetchApi {
                         .flat_map(|t| t.partitions.iter())
                         .any(|p| p.error_code != 0)
             })
+    }
+}
+
+impl KafkaApi for OffsetFetchApi {
+    type Request = OffsetFetchRequestData;
+
+    fn decode(
+        wire: OffsetFetchRequest,
+        _header: &RequestHeader,
+    ) -> Result<Self::Request, Rejection<Self::Echo>> {
+        // v8+ (not served, but echoed in its UNSUPPORTED_VERSION reply) moves the group
+        // and its topics into `groups`.
+        if let Some(group) = wire.groups.into_iter().next() {
+            return Ok(OffsetFetchRequestData {
+                group_id: group.group_id.to_string(),
+                topics: group.topics.map(|topics| {
+                    topics
+                        .into_iter()
+                        .map(|t| OffsetFetchTopicData {
+                            name: t.name.to_string(),
+                            partition_indexes: t.partition_indexes,
+                        })
+                        .collect()
+                }),
+            });
+        }
+        Ok(OffsetFetchRequestData {
+            group_id: wire.group_id.to_string(),
+            topics: wire.topics.map(|topics| {
+                topics
+                    .into_iter()
+                    .map(|t| OffsetFetchTopicData {
+                        name: t.name.to_string(),
+                        partition_indexes: t.partition_indexes,
+                    })
+                    .collect()
+            }),
+        })
+    }
+
+    fn echo(request: &Self::Request) -> Self::Echo {
+        (
+            request.group_id.clone(),
+            request
+                .topics
+                .iter()
+                .flatten()
+                .map(|t| (t.name.clone(), t.partition_indexes.clone()))
+                .collect(),
+        )
     }
 
     fn handle(request: Self::Request, call: Call<Self>, env: &ApiEnv<'_>) -> RequestOutcome {

@@ -421,7 +421,7 @@ mod tests {
     #[test]
     fn test_lane_and_deferred_reply_per_api() {
         use crate::kafka::constants::*;
-        for info in crate::kafka::api::APIS {
+        for info in crate::kafka::api::tests::worker_apis() {
             let liveness = info.key == API_KEY_HEARTBEAT;
             let deferred = info.key == API_KEY_JOIN_GROUP || info.key == API_KEY_SYNC_GROUP;
             let body = crate::kafka::api::tests::sample_request(info.key);
@@ -473,7 +473,7 @@ mod tests {
     /// RB-1: every non-deferred API gets the buffer installed by `swap_response_tx`.
     #[test]
     fn test_swap_response_tx_all_apis() {
-        for info in crate::kafka::api::APIS {
+        for info in crate::kafka::api::tests::worker_apis() {
             let (orig_tx, mut orig_rx) = tokio::sync::mpsc::unbounded_channel();
             let (buf_tx, mut buf_rx) = tokio::sync::mpsc::unbounded_channel();
             let mut request = KafkaRequest {
