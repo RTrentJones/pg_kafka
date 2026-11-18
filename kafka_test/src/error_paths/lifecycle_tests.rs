@@ -8,8 +8,21 @@
 use crate::common::{create_producer, TestResult};
 use crate::error_paths::bug_hunt::roundtrip;
 use crate::setup::TestContext;
-use kafka_protocol::messages::ApiVersionsRequest;
+use bytes::{BufMut, BytesMut};
+use kafka_protocol::messages::produce_request::{
+    PartitionProduceData, ProduceRequest, TopicProduceData,
+};
+use kafka_protocol::messages::produce_response::ProduceResponse;
+use kafka_protocol::messages::{
+    ApiVersionsRequest, EndTxnRequest, ProducerId, RequestHeader, ResponseHeader, TopicName,
+    TransactionalId,
+};
+use kafka_protocol::protocol::{Decodable, Encodable, HeaderVersion, Request, StrBytes};
+use kafka_protocol::records::{
+    Compression, Record as PRecord, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
+};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 const BROKER: &str = "localhost:9092";
@@ -133,6 +146,206 @@ pub async fn test_worker_restarts_after_terminate() -> TestResult {
         .get(0);
     assert_eq!(count, 1, "the produce after restart must be stored");
     println!("Step 4: produce after restart acked and stored");
+
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+async fn count_messages(ctx: &TestContext, topic: &str) -> Result<i64, Box<dyn std::error::Error>> {
+    Ok(ctx
+        .db()
+        .query_one(
+            "SELECT COUNT(*) FROM kafka.messages m JOIN kafka.topics t ON m.topic_id = t.id
+             WHERE t.name = $1",
+            &[&topic],
+        )
+        .await?
+        .get(0))
+}
+
+/// Encode one request frame (size prefix + header + body).
+fn encode_frame<R: Request>(
+    version: i16,
+    correlation_id: i32,
+    request: &R,
+) -> Result<BytesMut, Box<dyn std::error::Error>> {
+    let mut header = RequestHeader::default();
+    header.request_api_key = R::KEY;
+    header.request_api_version = version;
+    header.correlation_id = correlation_id;
+    header.client_id = Some(StrBytes::from_static_str("lifecycle-e2e"));
+    let mut body = BytesMut::new();
+    header.encode(&mut body, R::header_version(version))?;
+    request.encode(&mut body, version)?;
+    let mut frame = BytesMut::with_capacity(4 + body.len());
+    frame.put_i32(body.len() as i32);
+    frame.extend_from_slice(&body);
+    Ok(frame)
+}
+
+/// Read one response frame and decode it as `R::Response`, returning its
+/// correlation id too.
+async fn read_response<R: Request>(
+    stream: &mut TcpStream,
+    version: i16,
+) -> Result<(i32, R::Response), Box<dyn std::error::Error>> {
+    let mut size = [0u8; 4];
+    stream.read_exact(&mut size).await?;
+    let mut buf = vec![0u8; i32::from_be_bytes(size) as usize];
+    stream.read_exact(&mut buf).await?;
+    let mut buf = BytesMut::from(&buf[..]);
+    let header = ResponseHeader::decode(
+        &mut buf,
+        <R::Response as HeaderVersion>::header_version(version),
+    )?;
+    Ok((
+        header.correlation_id,
+        R::Response::decode(&mut buf, version)?,
+    ))
+}
+
+fn record_batch(value: &str) -> bytes::Bytes {
+    let record = PRecord {
+        transactional: false,
+        control: false,
+        partition_leader_epoch: 0,
+        producer_id: -1,
+        producer_epoch: -1,
+        timestamp_type: TimestampType::Creation,
+        offset: 0,
+        sequence: -1,
+        timestamp: 0,
+        key: None,
+        value: Some(bytes::Bytes::from(value.to_string())),
+        headers: Default::default(),
+    };
+    let mut buf = BytesMut::new();
+    RecordBatchEncoder::encode(
+        &mut buf,
+        [record].iter(),
+        &RecordEncodeOptions {
+            version: 2,
+            compression: Compression::None,
+        },
+    )
+    .expect("encode record batch");
+    buf.freeze()
+}
+
+fn produce_request(topic: &str, value: &str) -> ProduceRequest {
+    let mut p = PartitionProduceData::default();
+    p.index = 0;
+    p.records = Some(record_batch(value));
+    let mut t = TopicProduceData::default();
+    t.name = TopicName(StrBytes::from_string(topic.to_string()));
+    t.partition_data = vec![p];
+    let mut req = ProduceRequest::default();
+    req.acks = 1;
+    req.timeout_ms = 5000;
+    req.topic_data = vec![t];
+    req
+}
+
+const PRODUCE_VERSION: i16 = 7;
+
+/// Check one decoded Produce response: expected correlation id, no error, and
+/// return its base offset.
+fn produce_ok(
+    (correlation_id, response): &(i32, ProduceResponse),
+    expected_correlation_id: i32,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    if *correlation_id != expected_correlation_id {
+        return Err(format!(
+            "response order: expected correlation id {}, got {}",
+            expected_correlation_id, correlation_id
+        )
+        .into());
+    }
+    let p = &response.responses[0].partition_responses[0];
+    if p.error_code != 0 {
+        return Err(format!(
+            "produce (correlation id {}) failed with error {}",
+            correlation_id, p.error_code
+        )
+        .into());
+    }
+    Ok(p.base_offset)
+}
+
+/// Item 3 (explicit rollback outcome) + item 4 (rollback isolation inside a
+/// group-commit batch).
+///
+/// Three requests are written to one connection in a single write, so the
+/// worker sees them queued together (and, with group commit, runs them in one
+/// top-level transaction): Produce "a", an EndTxn for a transactional id that
+/// does not exist (the handler returns `Err`, which the worker now receives as a
+/// reported Rollback instead of an unwind marker), then Produce "b".
+///
+/// Asserts: the three responses arrive in request order; both produces succeed
+/// with consecutive base offsets 0 and 1; the EndTxn response carries a non-zero
+/// error code; exactly 2 records are stored; and the worker still serves a new
+/// connection afterwards (the handler error did not take down the batch or the
+/// worker).
+pub async fn test_failed_request_rolls_back_alone() -> TestResult {
+    println!("=== Test: A Failed Request Rolls Back Alone ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = crate::fixtures::TestTopicBuilder::new(&ctx, "lifecycle-rollback-alone")
+        .with_partitions(1)
+        .build()
+        .await?;
+
+    let mut end_txn = EndTxnRequest::default();
+    end_txn.transactional_id = TransactionalId(StrBytes::from_string(format!(
+        "lifecycle-missing-{}",
+        uuid::Uuid::new_v4()
+    )));
+    end_txn.producer_id = ProducerId(987_654_321);
+    end_txn.producer_epoch = 0;
+    end_txn.committed = true;
+
+    let mut frames = encode_frame(PRODUCE_VERSION, 1, &produce_request(&topic.name, "a"))?;
+    frames.extend_from_slice(&encode_frame(0, 2, &end_txn)?);
+    frames.extend_from_slice(&encode_frame(
+        PRODUCE_VERSION,
+        3,
+        &produce_request(&topic.name, "b"),
+    )?);
+
+    let mut stream = TcpStream::connect(BROKER).await?;
+    stream.write_all(&frames).await?;
+    stream.flush().await?;
+    println!("Step 1: pipelined Produce, failing EndTxn, Produce");
+
+    let first = read_response::<ProduceRequest>(&mut stream, PRODUCE_VERSION).await?;
+    let (end_corr, end_resp) = read_response::<EndTxnRequest>(&mut stream, 0).await?;
+    let third = read_response::<ProduceRequest>(&mut stream, PRODUCE_VERSION).await?;
+
+    let off_a = produce_ok(&first, 1)?;
+    assert_eq!(end_corr, 2, "EndTxn response out of order");
+    assert_ne!(
+        end_resp.error_code, 0,
+        "EndTxn for an unknown transactional id must fail"
+    );
+    let off_b = produce_ok(&third, 3)?;
+    println!(
+        "   produce a@{}, EndTxn error {}, produce b@{}",
+        off_a, end_resp.error_code, off_b
+    );
+    assert_eq!(
+        (off_a, off_b),
+        (0, 1),
+        "the two produces get offsets 0 and 1"
+    );
+    assert_eq!(count_messages(&ctx, &topic.name).await?, 2);
+
+    let mut fresh = TcpStream::connect(BROKER).await?;
+    let versions = roundtrip(&mut fresh, 0, 4, &ApiVersionsRequest::default()).await?;
+    assert_eq!(
+        versions.error_code, 0,
+        "worker must still serve after the error"
+    );
+    println!("✅ Verification passed\n");
 
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");

@@ -295,7 +295,7 @@ use kafka_test::{
     test_zero_percent_forwarding,
 };
 // lifecycle workstream (error_paths/lifecycle_tests.rs)
-use kafka_test::test_worker_restarts_after_terminate;
+use kafka_test::{test_failed_request_rolls_back_alone, test_worker_restarts_after_terminate};
 
 type TestFn = fn() -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error>>> + Send>>;
 
@@ -844,6 +844,12 @@ fn get_all_tests() -> Vec<TestDef> {
             name: "test_worker_restarts_after_terminate",
             test_fn: wrap_test!(test_worker_restarts_after_terminate),
             parallel_safe: false, // takes the broker down for ~5 s
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_failed_request_rolls_back_alone",
+            test_fn: wrap_test!(test_failed_request_rolls_back_alone),
+            parallel_safe: true,
         },
         TestDef {
             category: "error_paths",

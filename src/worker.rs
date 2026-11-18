@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 
 // Import conditional logging macros from lib.rs
 use crate::kafka::constants::*;
+use crate::kafka::dispatch::RequestOutcome;
 use crate::kafka::shadow::ShadowStore;
 use crate::kafka::{KafkaStore, PostgresStore};
 use crate::{pg_log, pg_warning};
@@ -64,9 +65,7 @@ const LIVENESS_CHANNEL_CAPACITY: usize = 1_000;
 /// payload is a `CaughtError`, so try that in addition to the usual
 /// `&str`/`String` panic payloads.
 fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
-    if payload.is::<crate::kafka::dispatch::RollbackRequest>() {
-        HANDLER_ERROR_ROLLBACK.to_string()
-    } else if let Some(s) = payload.downcast_ref::<&str>() {
+    if let Some(s) = payload.downcast_ref::<&str>() {
         s.to_string()
     } else if let Some(s) = payload.downcast_ref::<String>() {
         s.clone()
@@ -77,47 +76,60 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
-/// Message `run_request_in_subtransaction` returns when a handler returned an error
-/// and asked for its partial writes to be rolled back (not a panic).
-const HANDLER_ERROR_ROLLBACK: &str = "handler returned an error; request rolled back";
-
-/// Run `f` inside an internal subtransaction, rolling back its database
-/// writes if it panics. Postgres ERRORs (constraint violations, OOM, ...)
-/// surface through pgrx as Rust panics, so they take the rollback path too.
+/// Run `f` inside an internal subtransaction and commit or roll back its
+/// database writes according to what it reports.
 ///
-/// This exists because the worker catches handler panics to stay alive, but a
-/// caught panic must not let the surrounding `BackgroundWorker::transaction`
-/// COMMIT the request's partial writes — and after a caught Postgres ERROR
-/// the backend is still inside the error subsystem until `FlushErrorState`.
-/// Both are handled here with the PL/pgSQL exception-block sequence:
-/// `BeginInternalSubTransaction`, then on failure `FlushErrorState` +
-/// `RollbackAndReleaseCurrentSubTransaction`, restoring the caller's memory
+/// `f` returns a [`RequestOutcome`] (or `()`, which means commit — the
+/// maintenance tasks use that form):
+/// - `Commit`: the subtransaction is released into the surrounding transaction.
+/// - `Rollback`: the handler failed after possibly writing part of its work
+///   (e.g. IncrementalAlterConfigs applied resource 1, then failed on resource
+///   2); the client has been told the request failed, so the subtransaction is
+///   rolled back. This is an ordinary return, not an unwind.
+/// - a panic: Postgres ERRORs (constraint violations, OOM, ...) surface through
+///   pgrx as Rust panics. The worker catches them to stay alive, but a caught
+///   panic must not let the surrounding `BackgroundWorker::transaction` COMMIT
+///   the request's partial writes — and after a caught Postgres ERROR the
+///   backend is still inside the error subsystem until `FlushErrorState`.
+///   `catch_unwind` is here only for this case.
+///
+/// Both rollback paths use the PL/pgSQL exception-block sequence:
+/// `BeginInternalSubTransaction`, then `RollbackAndReleaseCurrentSubTransaction`
+/// (preceded by `FlushErrorState` after a panic), restoring the caller's memory
 /// context and resource owner on every path.
 ///
-/// Returns `Err(panic message)` if `f` panicked (after rolling back).
-fn run_request_in_subtransaction<F: FnOnce()>(f: F) -> Result<(), String> {
+/// Returns `Ok(outcome)` when `f` returned, `Err(panic message)` if it panicked
+/// (after rolling back).
+fn run_request_in_subtransaction<R, F>(f: F) -> Result<RequestOutcome, String>
+where
+    R: Into<RequestOutcome>,
+    F: FnOnce() -> R,
+{
     unsafe {
         let old_context = pgrx::pg_sys::CurrentMemoryContext;
         let old_owner = pgrx::pg_sys::CurrentResourceOwner;
         pgrx::pg_sys::BeginInternalSubTransaction(std::ptr::null());
         pgrx::pg_sys::MemoryContextSwitchTo(old_context);
 
-        match catch_unwind(AssertUnwindSafe(f)) {
-            Ok(()) => {
+        let result = match catch_unwind(AssertUnwindSafe(|| f().into())) {
+            Ok(RequestOutcome::Commit) => {
                 pgrx::pg_sys::ReleaseCurrentSubTransaction();
-                pgrx::pg_sys::MemoryContextSwitchTo(old_context);
-                pgrx::pg_sys::CurrentResourceOwner = old_owner;
-                Ok(())
+                Ok(RequestOutcome::Commit)
+            }
+            Ok(RequestOutcome::Rollback) => {
+                pgrx::pg_sys::RollbackAndReleaseCurrentSubTransaction();
+                Ok(RequestOutcome::Rollback)
             }
             Err(payload) => {
                 let message = panic_payload_message(payload.as_ref());
                 pgrx::pg_sys::FlushErrorState();
                 pgrx::pg_sys::RollbackAndReleaseCurrentSubTransaction();
-                pgrx::pg_sys::MemoryContextSwitchTo(old_context);
-                pgrx::pg_sys::CurrentResourceOwner = old_owner;
                 Err(message)
             }
-        }
+        };
+        pgrx::pg_sys::MemoryContextSwitchTo(old_context);
+        pgrx::pg_sys::CurrentResourceOwner = old_owner;
+        result
     }
 }
 
@@ -1000,21 +1012,19 @@ fn execute_request_in_transaction(
                     &notifier,
                     compression,
                     *shadow_ref,
-                );
+                )
             });
 
             // Capture handler duration before transaction commit
             handler_duration_ref.set(handler_start.elapsed());
 
+            // A reported rollback (handler error) already logged itself and sent
+            // its response; only a real panic is worth a warning here.
             if let Err(panic_msg) = result {
-                // A handler error already logged itself and sent its response; only
-                // a real panic is worth a warning here.
-                if panic_msg != HANDLER_ERROR_ROLLBACK {
-                    pg_warning!(
-                        "Handler panic caught, request rolled back (worker survived): {}",
-                        panic_msg
-                    );
-                }
+                pg_warning!(
+                    "Handler panic caught, request rolled back (worker survived): {}",
+                    panic_msg
+                );
             }
 
             // RB-1 test hook: widen the response-send→commit window so the E2E
@@ -1155,7 +1165,7 @@ pub fn process_request(
     notify_tx: &crossbeam_channel::Sender<crate::kafka::InternalNotification>,
     compression: kafka_protocol::records::Compression,
     shadow_store: &std::sync::Arc<ShadowStore<PostgresStore>>,
-) {
+) -> RequestOutcome {
     use crate::kafka::dispatch::{dispatch_infallible, dispatch_produce, dispatch_response};
     use crate::kafka::handlers;
     use crate::kafka::messages::KafkaResponse;
@@ -1183,18 +1193,16 @@ pub fn process_request(
             api_version,
             response_tx,
             ..
-        } => {
-            dispatch_infallible(
-                "ApiVersions",
-                response_tx,
-                handlers::handle_api_versions,
-                |r| KafkaResponse::ApiVersions {
-                    correlation_id,
-                    api_version,
-                    response: r,
-                },
-            );
-        }
+        } => dispatch_infallible(
+            "ApiVersions",
+            response_tx,
+            handlers::handle_api_versions,
+            |r| KafkaResponse::ApiVersions {
+                correlation_id,
+                api_version,
+                response: r,
+            },
+        ),
 
         // ===== Metadata =====
         crate::kafka::KafkaRequest::Metadata {
@@ -1204,23 +1212,21 @@ pub fn process_request(
             allow_auto_topic_creation,
             response_tx,
             ..
-        } => {
-            dispatch_response(
-                "Metadata",
-                response_tx,
-                || handlers::handle_metadata(&ctx, requested_topics, allow_auto_topic_creation),
-                |r| KafkaResponse::Metadata {
-                    correlation_id,
-                    api_version,
-                    response: r,
-                },
-                |_error_code| KafkaResponse::Metadata {
-                    correlation_id,
-                    api_version,
-                    response: crate::kafka::response_builders::build_metadata_error_response(),
-                },
-            );
-        }
+        } => dispatch_response(
+            "Metadata",
+            response_tx,
+            || handlers::handle_metadata(&ctx, requested_topics, allow_auto_topic_creation),
+            |r| KafkaResponse::Metadata {
+                correlation_id,
+                api_version,
+                response: r,
+            },
+            |_error_code| KafkaResponse::Metadata {
+                correlation_id,
+                api_version,
+                response: crate::kafka::response_builders::build_metadata_error_response(),
+            },
+        ),
 
         // ===== Produce =====
         crate::kafka::KafkaRequest::Produce {
@@ -1253,19 +1259,22 @@ pub fn process_request(
                     compression,
                     notify_tx,
                 );
-                match handlers::handle_produce(&ctx, topic_data, None, None) {
+                return match handlers::handle_produce(&ctx, topic_data, None, None) {
                     Ok(response) => {
                         // Wake long-poll consumers for the partitions just written.
                         emit_produce_notifications(&response, store, notify_tx);
+                        RequestOutcome::Commit
                     }
                     Err(e) => {
-                        // Log error but don't notify client (per acks=0 contract)
+                        // Log error but don't notify client (per acks=0 contract).
+                        // Roll back like the acks>=1 path does: a request-level
+                        // failure must not leave a partial write behind.
                         if e.is_server_error() {
                             pg_warning!("acks=0 produce error (data may be lost): {}", e);
                         }
+                        RequestOutcome::Rollback
                     }
-                }
-                return;
+                };
             }
 
             // Handle produce (acks >= 1).
@@ -1301,7 +1310,7 @@ pub fn process_request(
                 },
                 // Wake long-poll consumers for the partitions just written.
                 |response| emit_produce_notifications(response, store, notify_tx),
-            );
+            )
         }
 
         // ===== Fetch =====
@@ -1336,7 +1345,7 @@ pub fn process_request(
                         error_code,
                     ),
                 },
-            );
+            )
         }
 
         // ===== OffsetCommit =====
@@ -1349,25 +1358,23 @@ pub fn process_request(
             topics,
             response_tx,
             ..
-        } => {
-            dispatch_response(
-                "OffsetCommit",
-                response_tx,
-                || handlers::handle_offset_commit(&ctx, group_id, generation_id, member_id, topics),
-                |r| KafkaResponse::OffsetCommit {
-                    correlation_id,
-                    api_version,
-                    response: r,
-                },
-                |error_code| KafkaResponse::OffsetCommit {
-                    correlation_id,
-                    api_version,
-                    response: crate::kafka::response_builders::build_offset_commit_error_response(
-                        error_code,
-                    ),
-                },
-            );
-        }
+        } => dispatch_response(
+            "OffsetCommit",
+            response_tx,
+            || handlers::handle_offset_commit(&ctx, group_id, generation_id, member_id, topics),
+            |r| KafkaResponse::OffsetCommit {
+                correlation_id,
+                api_version,
+                response: r,
+            },
+            |error_code| KafkaResponse::OffsetCommit {
+                correlation_id,
+                api_version,
+                response: crate::kafka::response_builders::build_offset_commit_error_response(
+                    error_code,
+                ),
+            },
+        ),
 
         // ===== OffsetFetch =====
         crate::kafka::KafkaRequest::OffsetFetch {
@@ -1377,25 +1384,23 @@ pub fn process_request(
             topics,
             response_tx,
             ..
-        } => {
-            dispatch_response(
-                "OffsetFetch",
-                response_tx,
-                || handlers::handle_offset_fetch(&ctx, group_id, topics),
-                |r| KafkaResponse::OffsetFetch {
-                    correlation_id,
-                    api_version,
-                    response: r,
-                },
-                |error_code| KafkaResponse::OffsetFetch {
-                    correlation_id,
-                    api_version,
-                    response: crate::kafka::response_builders::build_offset_fetch_error_response(
-                        error_code,
-                    ),
-                },
-            );
-        }
+        } => dispatch_response(
+            "OffsetFetch",
+            response_tx,
+            || handlers::handle_offset_fetch(&ctx, group_id, topics),
+            |r| KafkaResponse::OffsetFetch {
+                correlation_id,
+                api_version,
+                response: r,
+            },
+            |error_code| KafkaResponse::OffsetFetch {
+                correlation_id,
+                api_version,
+                response: crate::kafka::response_builders::build_offset_fetch_error_response(
+                    error_code,
+                ),
+            },
+        ),
 
         // ===== FindCoordinator =====
         crate::kafka::KafkaRequest::FindCoordinator {
@@ -1405,26 +1410,23 @@ pub fn process_request(
             key_type,
             response_tx,
             ..
-        } => {
-            dispatch_response(
-                "FindCoordinator",
-                response_tx,
-                || handlers::handle_find_coordinator(&ctx, key, key_type),
-                |r| KafkaResponse::FindCoordinator {
-                    correlation_id,
-                    api_version,
-                    response: r,
-                },
-                |error_code| KafkaResponse::FindCoordinator {
-                    correlation_id,
-                    api_version,
-                    response:
-                        crate::kafka::response_builders::build_find_coordinator_error_response(
-                            error_code,
-                        ),
-                },
-            );
-        }
+        } => dispatch_response(
+            "FindCoordinator",
+            response_tx,
+            || handlers::handle_find_coordinator(&ctx, key, key_type),
+            |r| KafkaResponse::FindCoordinator {
+                correlation_id,
+                api_version,
+                response: r,
+            },
+            |error_code| KafkaResponse::FindCoordinator {
+                correlation_id,
+                api_version,
+                response: crate::kafka::response_builders::build_find_coordinator_error_response(
+                    error_code,
+                ),
+            },
+        ),
 
         // ===== JoinGroup =====
         crate::kafka::KafkaRequest::JoinGroup {
@@ -1469,7 +1471,7 @@ pub fn process_request(
                         error_code,
                     ),
                 },
-            );
+            )
         }
 
         // ===== SyncGroup =====
@@ -1482,33 +1484,23 @@ pub fn process_request(
             assignments,
             response_tx,
             ..
-        } => {
-            dispatch_response(
-                "SyncGroup",
-                response_tx,
-                || {
-                    handlers::handle_sync_group(
-                        &ctx,
-                        group_id,
-                        member_id,
-                        generation_id,
-                        assignments,
-                    )
-                },
-                |r| KafkaResponse::SyncGroup {
-                    correlation_id,
-                    api_version,
-                    response: r,
-                },
-                |error_code| KafkaResponse::SyncGroup {
-                    correlation_id,
-                    api_version,
-                    response: crate::kafka::response_builders::build_sync_group_error_response(
-                        error_code,
-                    ),
-                },
-            );
-        }
+        } => dispatch_response(
+            "SyncGroup",
+            response_tx,
+            || handlers::handle_sync_group(&ctx, group_id, member_id, generation_id, assignments),
+            |r| KafkaResponse::SyncGroup {
+                correlation_id,
+                api_version,
+                response: r,
+            },
+            |error_code| KafkaResponse::SyncGroup {
+                correlation_id,
+                api_version,
+                response: crate::kafka::response_builders::build_sync_group_error_response(
+                    error_code,
+                ),
+            },
+        ),
 
         // ===== Heartbeat =====
         crate::kafka::KafkaRequest::Heartbeat {
@@ -1519,25 +1511,23 @@ pub fn process_request(
             generation_id,
             response_tx,
             ..
-        } => {
-            dispatch_response(
-                "Heartbeat",
-                response_tx,
-                || handlers::handle_heartbeat(&ctx, group_id, member_id, generation_id),
-                |r| KafkaResponse::Heartbeat {
-                    correlation_id,
-                    api_version,
-                    response: r,
-                },
-                |error_code| KafkaResponse::Heartbeat {
-                    correlation_id,
-                    api_version,
-                    response: crate::kafka::response_builders::build_heartbeat_error_response(
-                        error_code,
-                    ),
-                },
-            );
-        }
+        } => dispatch_response(
+            "Heartbeat",
+            response_tx,
+            || handlers::handle_heartbeat(&ctx, group_id, member_id, generation_id),
+            |r| KafkaResponse::Heartbeat {
+                correlation_id,
+                api_version,
+                response: r,
+            },
+            |error_code| KafkaResponse::Heartbeat {
+                correlation_id,
+                api_version,
+                response: crate::kafka::response_builders::build_heartbeat_error_response(
+                    error_code,
+                ),
+            },
+        ),
 
         // ===== LeaveGroup =====
         crate::kafka::KafkaRequest::LeaveGroup {
@@ -1548,25 +1538,23 @@ pub fn process_request(
             members,
             response_tx,
             ..
-        } => {
-            dispatch_response(
-                "LeaveGroup",
-                response_tx,
-                || handlers::handle_leave_group(&ctx, group_id, member_id, members),
-                |r| KafkaResponse::LeaveGroup {
-                    correlation_id,
-                    api_version,
-                    response: r,
-                },
-                |error_code| KafkaResponse::LeaveGroup {
-                    correlation_id,
-                    api_version,
-                    response: crate::kafka::response_builders::build_leave_group_error_response(
-                        error_code,
-                    ),
-                },
-            );
-        }
+        } => dispatch_response(
+            "LeaveGroup",
+            response_tx,
+            || handlers::handle_leave_group(&ctx, group_id, member_id, members),
+            |r| KafkaResponse::LeaveGroup {
+                correlation_id,
+                api_version,
+                response: r,
+            },
+            |error_code| KafkaResponse::LeaveGroup {
+                correlation_id,
+                api_version,
+                response: crate::kafka::response_builders::build_leave_group_error_response(
+                    error_code,
+                ),
+            },
+        ),
 
         // ===== ListOffsets =====
         crate::kafka::KafkaRequest::ListOffsets {
@@ -1575,25 +1563,23 @@ pub fn process_request(
             topics,
             response_tx,
             ..
-        } => {
-            dispatch_response(
-                "ListOffsets",
-                response_tx,
-                || handlers::handle_list_offsets(&ctx, topics),
-                |r| KafkaResponse::ListOffsets {
-                    correlation_id,
-                    api_version,
-                    response: r,
-                },
-                |error_code| KafkaResponse::ListOffsets {
-                    correlation_id,
-                    api_version,
-                    response: crate::kafka::response_builders::build_list_offsets_error_response(
-                        error_code,
-                    ),
-                },
-            );
-        }
+        } => dispatch_response(
+            "ListOffsets",
+            response_tx,
+            || handlers::handle_list_offsets(&ctx, topics),
+            |r| KafkaResponse::ListOffsets {
+                correlation_id,
+                api_version,
+                response: r,
+            },
+            |error_code| KafkaResponse::ListOffsets {
+                correlation_id,
+                api_version,
+                response: crate::kafka::response_builders::build_list_offsets_error_response(
+                    error_code,
+                ),
+            },
+        ),
 
         // ===== DescribeGroups =====
         crate::kafka::KafkaRequest::DescribeGroups {
@@ -1602,25 +1588,23 @@ pub fn process_request(
             groups,
             response_tx,
             ..
-        } => {
-            dispatch_response(
-                "DescribeGroups",
-                response_tx,
-                || handlers::handle_describe_groups(&ctx, groups),
-                |r| KafkaResponse::DescribeGroups {
-                    correlation_id,
-                    api_version,
-                    response: r,
-                },
-                |error_code| KafkaResponse::DescribeGroups {
-                    correlation_id,
-                    api_version,
-                    response: crate::kafka::response_builders::build_describe_groups_error_response(
-                        error_code,
-                    ),
-                },
-            );
-        }
+        } => dispatch_response(
+            "DescribeGroups",
+            response_tx,
+            || handlers::handle_describe_groups(&ctx, groups),
+            |r| KafkaResponse::DescribeGroups {
+                correlation_id,
+                api_version,
+                response: r,
+            },
+            |error_code| KafkaResponse::DescribeGroups {
+                correlation_id,
+                api_version,
+                response: crate::kafka::response_builders::build_describe_groups_error_response(
+                    error_code,
+                ),
+            },
+        ),
 
         // ===== ListGroups =====
         crate::kafka::KafkaRequest::ListGroups {
@@ -1629,25 +1613,23 @@ pub fn process_request(
             states_filter,
             response_tx,
             ..
-        } => {
-            dispatch_response(
-                "ListGroups",
-                response_tx,
-                || handlers::handle_list_groups(&ctx, states_filter),
-                |r| KafkaResponse::ListGroups {
-                    correlation_id,
-                    api_version,
-                    response: r,
-                },
-                |error_code| KafkaResponse::ListGroups {
-                    correlation_id,
-                    api_version,
-                    response: crate::kafka::response_builders::build_list_groups_error_response(
-                        error_code,
-                    ),
-                },
-            );
-        }
+        } => dispatch_response(
+            "ListGroups",
+            response_tx,
+            || handlers::handle_list_groups(&ctx, states_filter),
+            |r| KafkaResponse::ListGroups {
+                correlation_id,
+                api_version,
+                response: r,
+            },
+            |error_code| KafkaResponse::ListGroups {
+                correlation_id,
+                api_version,
+                response: crate::kafka::response_builders::build_list_groups_error_response(
+                    error_code,
+                ),
+            },
+        ),
 
         // ===== CreateTopics (Phase 6) =====
         crate::kafka::KafkaRequest::CreateTopics {
@@ -1657,25 +1639,23 @@ pub fn process_request(
             validate_only,
             response_tx,
             ..
-        } => {
-            dispatch_response(
-                "CreateTopics",
-                response_tx,
-                || handlers::handle_create_topics(&ctx, topics, validate_only),
-                |r| KafkaResponse::CreateTopics {
-                    correlation_id,
-                    api_version,
-                    response: r,
-                },
-                |error_code| KafkaResponse::CreateTopics {
-                    correlation_id,
-                    api_version,
-                    response: crate::kafka::response_builders::build_create_topics_error_response(
-                        error_code,
-                    ),
-                },
-            );
-        }
+        } => dispatch_response(
+            "CreateTopics",
+            response_tx,
+            || handlers::handle_create_topics(&ctx, topics, validate_only),
+            |r| KafkaResponse::CreateTopics {
+                correlation_id,
+                api_version,
+                response: r,
+            },
+            |error_code| KafkaResponse::CreateTopics {
+                correlation_id,
+                api_version,
+                response: crate::kafka::response_builders::build_create_topics_error_response(
+                    error_code,
+                ),
+            },
+        ),
 
         // ===== DeleteTopics (Phase 6) =====
         crate::kafka::KafkaRequest::DeleteTopics {
@@ -1684,25 +1664,23 @@ pub fn process_request(
             topic_names,
             response_tx,
             ..
-        } => {
-            dispatch_response(
-                "DeleteTopics",
-                response_tx,
-                || handlers::handle_delete_topics(&ctx, topic_names),
-                |r| KafkaResponse::DeleteTopics {
-                    correlation_id,
-                    api_version,
-                    response: r,
-                },
-                |error_code| KafkaResponse::DeleteTopics {
-                    correlation_id,
-                    api_version,
-                    response: crate::kafka::response_builders::build_delete_topics_error_response(
-                        error_code,
-                    ),
-                },
-            );
-        }
+        } => dispatch_response(
+            "DeleteTopics",
+            response_tx,
+            || handlers::handle_delete_topics(&ctx, topic_names),
+            |r| KafkaResponse::DeleteTopics {
+                correlation_id,
+                api_version,
+                response: r,
+            },
+            |error_code| KafkaResponse::DeleteTopics {
+                correlation_id,
+                api_version,
+                response: crate::kafka::response_builders::build_delete_topics_error_response(
+                    error_code,
+                ),
+            },
+        ),
 
         // ===== CreatePartitions (Phase 6) =====
         crate::kafka::KafkaRequest::CreatePartitions {
@@ -1712,26 +1690,23 @@ pub fn process_request(
             validate_only,
             response_tx,
             ..
-        } => {
-            dispatch_response(
-                "CreatePartitions",
-                response_tx,
-                || handlers::handle_create_partitions(&ctx, topics, validate_only),
-                |r| KafkaResponse::CreatePartitions {
-                    correlation_id,
-                    api_version,
-                    response: r,
-                },
-                |error_code| KafkaResponse::CreatePartitions {
-                    correlation_id,
-                    api_version,
-                    response:
-                        crate::kafka::response_builders::build_create_partitions_error_response(
-                            error_code,
-                        ),
-                },
-            );
-        }
+        } => dispatch_response(
+            "CreatePartitions",
+            response_tx,
+            || handlers::handle_create_partitions(&ctx, topics, validate_only),
+            |r| KafkaResponse::CreatePartitions {
+                correlation_id,
+                api_version,
+                response: r,
+            },
+            |error_code| KafkaResponse::CreatePartitions {
+                correlation_id,
+                api_version,
+                response: crate::kafka::response_builders::build_create_partitions_error_response(
+                    error_code,
+                ),
+            },
+        ),
 
         // ===== DeleteGroups (Phase 6) =====
         crate::kafka::KafkaRequest::DeleteGroups {
@@ -1740,25 +1715,23 @@ pub fn process_request(
             groups_names,
             response_tx,
             ..
-        } => {
-            dispatch_response(
-                "DeleteGroups",
-                response_tx,
-                || handlers::handle_delete_groups(&ctx, groups_names),
-                |r| KafkaResponse::DeleteGroups {
-                    correlation_id,
-                    api_version,
-                    response: r,
-                },
-                |error_code| KafkaResponse::DeleteGroups {
-                    correlation_id,
-                    api_version,
-                    response: crate::kafka::response_builders::build_delete_groups_error_response(
-                        error_code,
-                    ),
-                },
-            );
-        }
+        } => dispatch_response(
+            "DeleteGroups",
+            response_tx,
+            || handlers::handle_delete_groups(&ctx, groups_names),
+            |r| KafkaResponse::DeleteGroups {
+                correlation_id,
+                api_version,
+                response: r,
+            },
+            |error_code| KafkaResponse::DeleteGroups {
+                correlation_id,
+                api_version,
+                response: crate::kafka::response_builders::build_delete_groups_error_response(
+                    error_code,
+                ),
+            },
+        ),
 
         // ===== InitProducerId (Phase 9, extended in Phase 10) =====
         crate::kafka::KafkaRequest::InitProducerId {
@@ -1770,35 +1743,32 @@ pub fn process_request(
             producer_epoch: existing_epoch,
             client_id,
             response_tx,
-        } => {
-            dispatch_response(
-                "InitProducerId",
-                response_tx,
-                || {
-                    handlers::handle_init_producer_id(
-                        &ctx,
-                        transactional_id,
-                        transaction_timeout_ms,
-                        existing_producer_id,
-                        existing_epoch,
-                        client_id.as_deref(),
-                    )
-                },
-                |r| KafkaResponse::InitProducerId {
-                    correlation_id,
-                    api_version,
-                    response: r,
-                },
-                |error_code| KafkaResponse::InitProducerId {
-                    correlation_id,
-                    api_version,
-                    response:
-                        crate::kafka::response_builders::build_init_producer_id_error_response(
-                            error_code,
-                        ),
-                },
-            );
-        }
+        } => dispatch_response(
+            "InitProducerId",
+            response_tx,
+            || {
+                handlers::handle_init_producer_id(
+                    &ctx,
+                    transactional_id,
+                    transaction_timeout_ms,
+                    existing_producer_id,
+                    existing_epoch,
+                    client_id.as_deref(),
+                )
+            },
+            |r| KafkaResponse::InitProducerId {
+                correlation_id,
+                api_version,
+                response: r,
+            },
+            |error_code| KafkaResponse::InitProducerId {
+                correlation_id,
+                api_version,
+                response: crate::kafka::response_builders::build_init_producer_id_error_response(
+                    error_code,
+                ),
+            },
+        ),
 
         // ===== Phase 10: Transaction APIs =====
         crate::kafka::KafkaRequest::AddPartitionsToTxn {
@@ -1810,36 +1780,34 @@ pub fn process_request(
             topics,
             response_tx,
             ..
-        } => {
-            dispatch_response(
-                "AddPartitionsToTxn",
-                response_tx,
-                || {
-                    handlers::handle_add_partitions_to_txn(
-                        &ctx,
-                        &transactional_id,
-                        producer_id,
-                        producer_epoch,
-                        topics,
-                    )
-                },
-                |r| KafkaResponse::AddPartitionsToTxn {
+        } => dispatch_response(
+            "AddPartitionsToTxn",
+            response_tx,
+            || {
+                handlers::handle_add_partitions_to_txn(
+                    &ctx,
+                    &transactional_id,
+                    producer_id,
+                    producer_epoch,
+                    topics,
+                )
+            },
+            |r| KafkaResponse::AddPartitionsToTxn {
+                correlation_id,
+                api_version,
+                response: r,
+            },
+            |error_code| {
+                let mut response = kafka_protocol::messages::add_partitions_to_txn_response::AddPartitionsToTxnResponse::default();
+                response.throttle_time_ms = 0;
+                response.error_code = error_code;
+                KafkaResponse::AddPartitionsToTxn {
                     correlation_id,
                     api_version,
-                    response: r,
-                },
-                |error_code| {
-                    let mut response = kafka_protocol::messages::add_partitions_to_txn_response::AddPartitionsToTxnResponse::default();
-                    response.throttle_time_ms = 0;
-                    response.error_code = error_code;
-                    KafkaResponse::AddPartitionsToTxn {
-                        correlation_id,
-                        api_version,
-                        response,
-                    }
-                },
-            );
-        }
+                    response,
+                }
+            },
+        ),
 
         crate::kafka::KafkaRequest::AddOffsetsToTxn {
             correlation_id,
@@ -1850,36 +1818,34 @@ pub fn process_request(
             group_id,
             response_tx,
             ..
-        } => {
-            dispatch_response(
-                "AddOffsetsToTxn",
-                response_tx,
-                || {
-                    handlers::handle_add_offsets_to_txn(
-                        &ctx,
-                        &transactional_id,
-                        producer_id,
-                        producer_epoch,
-                        &group_id,
-                    )
-                },
-                |r| KafkaResponse::AddOffsetsToTxn {
+        } => dispatch_response(
+            "AddOffsetsToTxn",
+            response_tx,
+            || {
+                handlers::handle_add_offsets_to_txn(
+                    &ctx,
+                    &transactional_id,
+                    producer_id,
+                    producer_epoch,
+                    &group_id,
+                )
+            },
+            |r| KafkaResponse::AddOffsetsToTxn {
+                correlation_id,
+                api_version,
+                response: r,
+            },
+            |error_code| {
+                let mut response = kafka_protocol::messages::add_offsets_to_txn_response::AddOffsetsToTxnResponse::default();
+                response.throttle_time_ms = 0;
+                response.error_code = error_code;
+                KafkaResponse::AddOffsetsToTxn {
                     correlation_id,
                     api_version,
-                    response: r,
-                },
-                |error_code| {
-                    let mut response = kafka_protocol::messages::add_offsets_to_txn_response::AddOffsetsToTxnResponse::default();
-                    response.throttle_time_ms = 0;
-                    response.error_code = error_code;
-                    KafkaResponse::AddOffsetsToTxn {
-                        correlation_id,
-                        api_version,
-                        response,
-                    }
-                },
-            );
-        }
+                    response,
+                }
+            },
+        ),
 
         crate::kafka::KafkaRequest::EndTxn {
             correlation_id,
@@ -1890,37 +1856,35 @@ pub fn process_request(
             committed,
             response_tx,
             ..
-        } => {
-            dispatch_response(
-                "EndTxn",
-                response_tx,
-                || {
-                    handlers::handle_end_txn(
-                        &ctx,
-                        &transactional_id,
-                        producer_id,
-                        producer_epoch,
-                        committed,
-                    )
-                },
-                |r| KafkaResponse::EndTxn {
+        } => dispatch_response(
+            "EndTxn",
+            response_tx,
+            || {
+                handlers::handle_end_txn(
+                    &ctx,
+                    &transactional_id,
+                    producer_id,
+                    producer_epoch,
+                    committed,
+                )
+            },
+            |r| KafkaResponse::EndTxn {
+                correlation_id,
+                api_version,
+                response: r,
+            },
+            |error_code| {
+                let mut response =
+                    kafka_protocol::messages::end_txn_response::EndTxnResponse::default();
+                response.throttle_time_ms = 0;
+                response.error_code = error_code;
+                KafkaResponse::EndTxn {
                     correlation_id,
                     api_version,
-                    response: r,
-                },
-                |error_code| {
-                    let mut response =
-                        kafka_protocol::messages::end_txn_response::EndTxnResponse::default();
-                    response.throttle_time_ms = 0;
-                    response.error_code = error_code;
-                    KafkaResponse::EndTxn {
-                        correlation_id,
-                        api_version,
-                        response,
-                    }
-                },
-            );
-        }
+                    response,
+                }
+            },
+        ),
 
         crate::kafka::KafkaRequest::TxnOffsetCommit {
             correlation_id,
@@ -1970,7 +1934,7 @@ pub fn process_request(
                         response,
                     }
                 },
-            );
+            )
         }
 
         // ===== DeleteRecords (API 21) =====
@@ -1980,25 +1944,23 @@ pub fn process_request(
             topics,
             response_tx,
             ..
-        } => {
-            dispatch_response(
-                "DeleteRecords",
-                response_tx,
-                || handlers::handle_delete_records(&ctx, topics),
-                |r| KafkaResponse::DeleteRecords {
-                    correlation_id,
-                    api_version,
-                    response: r,
-                },
-                |error_code| KafkaResponse::DeleteRecords {
-                    correlation_id,
-                    api_version,
-                    response: crate::kafka::response_builders::build_delete_records_error_response(
-                        error_code,
-                    ),
-                },
-            );
-        }
+        } => dispatch_response(
+            "DeleteRecords",
+            response_tx,
+            || handlers::handle_delete_records(&ctx, topics),
+            |r| KafkaResponse::DeleteRecords {
+                correlation_id,
+                api_version,
+                response: r,
+            },
+            |error_code| KafkaResponse::DeleteRecords {
+                correlation_id,
+                api_version,
+                response: crate::kafka::response_builders::build_delete_records_error_response(
+                    error_code,
+                ),
+            },
+        ),
 
         // ===== DescribeConfigs (API 32) =====
         crate::kafka::KafkaRequest::DescribeConfigs {
@@ -2026,7 +1988,7 @@ pub fn process_request(
                             error_code,
                         ),
                 },
-            );
+            )
         }
 
         // ===== IncrementalAlterConfigs (API 44) =====
@@ -2037,27 +1999,24 @@ pub fn process_request(
             validate_only,
             response_tx,
             ..
-        } => {
-            dispatch_response(
-                "IncrementalAlterConfigs",
-                response_tx,
-                || handlers::handle_incremental_alter_configs(&ctx, resources, validate_only),
-                |r| KafkaResponse::IncrementalAlterConfigs {
-                    correlation_id,
-                    api_version,
-                    response: r,
-                },
-                |error_code| {
-                    KafkaResponse::IncrementalAlterConfigs {
-                    correlation_id,
-                    api_version,
-                    response: crate::kafka::response_builders::build_incremental_alter_configs_error_response(
+        } => dispatch_response(
+            "IncrementalAlterConfigs",
+            response_tx,
+            || handlers::handle_incremental_alter_configs(&ctx, resources, validate_only),
+            |r| KafkaResponse::IncrementalAlterConfigs {
+                correlation_id,
+                api_version,
+                response: r,
+            },
+            |error_code| KafkaResponse::IncrementalAlterConfigs {
+                correlation_id,
+                api_version,
+                response:
+                    crate::kafka::response_builders::build_incremental_alter_configs_error_response(
                         error_code,
                     ),
-                }
-                },
-            );
-        }
+            },
+        ),
     }
 }
 
