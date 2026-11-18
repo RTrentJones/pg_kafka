@@ -52,7 +52,7 @@ kcat -C -b localhost:9092 -t my-topic -p 0 -o beginning
 
 ### Implemented APIs (26 total)
 
-Versions are the ranges advertised in ApiVersions and enforced on inbound requests (`API_VERSION_RANGES` in `src/kafka/response_builders.rs`).
+Versions are the ranges advertised in ApiVersions and enforced on inbound requests (each API's `MIN_VERSION`/`MAX_VERSION` in `src/kafka/api/`).
 
 | API | Key | Versions | Description |
 |-----|-----|----------|-------------|

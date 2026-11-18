@@ -15,12 +15,10 @@
 //! - **Extensibility:** Add new context fields without touching handler signatures
 //! - **Clarity:** Separates "shared context" from "request-specific data"
 
-use crossbeam_channel::Sender;
 use kafka_protocol::records::Compression;
 
 use crate::kafka::broker_metadata::BrokerMetadata;
 use crate::kafka::coordinator::GroupCoordinator;
-use crate::kafka::notifications::InternalNotification;
 use crate::kafka::storage::KafkaStore;
 
 /// Shared context passed to all Kafka protocol handlers
@@ -78,12 +76,6 @@ pub struct HandlerContext<'a> {
     /// Applied to RecordBatch data in FetchResponse. Clients specify this
     /// via configuration (e.g., pg_kafka.compression_type GUC).
     pub compression: Compression,
-
-    /// Optional notification channel for long polling support
-    ///
-    /// When set, ProduceRequest handlers send notifications to wake up waiting
-    /// FetchRequest handlers. None if long polling is disabled.
-    pub notifier: Option<&'a Sender<InternalNotification>>,
 }
 
 impl<'a> HandlerContext<'a> {
@@ -121,52 +113,6 @@ impl<'a> HandlerContext<'a> {
             broker,
             default_partitions,
             compression,
-            notifier: None,
-        }
-    }
-
-    /// Create a handler context with notification support
-    ///
-    /// Used when long polling is enabled. The notifier channel allows
-    /// ProduceRequest handlers to wake up waiting FetchRequest handlers
-    /// when new messages arrive.
-    ///
-    /// # Arguments
-    ///
-    /// * `store` - Storage backend
-    /// * `coordinator` - Consumer group coordinator
-    /// * `broker` - Broker metadata
-    /// * `default_partitions` - Partition count for auto-created topics
-    /// * `compression` - Compression for outbound messages
-    /// * `notifier` - Channel for sending notifications to network thread
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let ctx = HandlerContext::with_notifier(
-    ///     &shadow_store,
-    ///     &coordinator,
-    ///     &broker_metadata,
-    ///     1,
-    ///     Compression::None,
-    ///     &notify_tx,
-    /// );
-    /// ```
-    pub fn with_notifier(
-        store: &'a dyn KafkaStore,
-        coordinator: &'a GroupCoordinator,
-        broker: &'a BrokerMetadata,
-        default_partitions: i32,
-        compression: Compression,
-        notifier: &'a Sender<InternalNotification>,
-    ) -> Self {
-        Self {
-            store,
-            coordinator,
-            broker,
-            default_partitions,
-            compression,
-            notifier: Some(notifier),
         }
     }
 }
@@ -526,27 +472,6 @@ mod tests {
         assert_eq!(ctx.default_partitions, 1);
         assert_eq!(ctx.broker.host(), "localhost");
         assert_eq!(ctx.broker.port(), 9092);
-        assert!(ctx.notifier.is_none());
-    }
-
-    #[test]
-    fn test_handler_context_with_notifier() {
-        let mock_store = MockStore;
-        let coordinator = GroupCoordinator::new();
-        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-        let (notify_tx, _notify_rx) = crossbeam_channel::bounded::<InternalNotification>(100);
-
-        let ctx = HandlerContext::with_notifier(
-            &mock_store,
-            &coordinator,
-            &broker,
-            1,
-            Compression::None,
-            &notify_tx,
-        );
-
-        assert_eq!(ctx.default_partitions, 1);
-        assert!(ctx.notifier.is_some());
     }
 
     #[test]

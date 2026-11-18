@@ -20,7 +20,7 @@
 
 ## Implemented APIs (26 total)
 
-Version ranges below are the ones advertised in the ApiVersions response and enforced on inbound requests (`API_VERSION_RANGES` in `src/kafka/response_builders.rs`). A request above its range is rejected with UNSUPPORTED_VERSION; a request below it closes the connection, as Kafka does (the minimums are the lowest versions the kafka-protocol crate can decode and encode). ApiVersions outside v0-v3 is answered in the v0 format with UNSUPPORTED_VERSION and the full key list (KIP-511).
+Version ranges below are the ones advertised in the ApiVersions response and enforced on inbound requests (each API's `MIN_VERSION`/`MAX_VERSION` in `src/kafka/api/`). A request above its range is rejected with UNSUPPORTED_VERSION; a request below it closes the connection, as Kafka does (the minimums are the lowest versions the kafka-protocol crate can decode and encode). ApiVersions outside v0-v3 is answered in the v0 format with UNSUPPORTED_VERSION and the full key list (KIP-511).
 
 ### 1. Core Metadata (2 APIs) ✅ 100% Coverage
 | API | Key | Versions | Status | Notes |
@@ -469,7 +469,7 @@ Consumer Flow (Current):
 ### Protocol Version Support
 | Feature | Standard Kafka | pg_kafka | Notes |
 |---------|---------------|----------|-------|
-| Wire Protocol | v0-v17+ | Per-API ranges, highest advertised is v11 (Fetch) | Flexible (tagged-field) versions supported; the threshold is per API (see `get_flexible_format_threshold` in `constants.rs`) |
+| Wire Protocol | v0-v17+ | Per-API ranges, highest advertised is v11 (Fetch) | Flexible (tagged-field) versions supported; the response header version comes from each API's kafka-protocol response type |
 | RecordBatch | v0, v1, v2 | v2 (Produce v3+) | Produce v0-v2 (MessageSet) is not advertised; a legacy MessageSet v0/v1 decode fallback exists for inbound batches |
 | Compression | All codecs | All codecs | gzip, snappy, lz4, zstd fully supported |
 | Transactions | Yes | Yes | ✅ Phase 10 - EOS with server-side read_committed filtering |

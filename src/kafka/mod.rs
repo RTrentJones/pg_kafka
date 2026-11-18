@@ -32,6 +32,7 @@
 // - Blocking recv eliminates the 100ms latency floor of the old time-slicing design
 // - Bounded channel provides backpressure when DB can't keep up
 
+pub mod api;
 pub mod assignment;
 pub mod broker_metadata;
 pub mod constants;

@@ -32,6 +32,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::codec::{Decoder, Encoder, Framed, LengthDelimitedCodec};
 use tracing::{debug, error, info, warn};
 
+use super::api::{FetchRequestData, RequestBody, RequestHeader, ResponseBody};
 use super::messages::{KafkaRequest, KafkaResponse, TopicFetchData};
 use super::notifications::InternalNotification;
 use super::pending_fetches::PendingFetchRegistry;
@@ -744,8 +745,8 @@ async fn handle_connection(
                 // Check if this is a Fetch request that should use long polling
                 let should_long_poll = enable_long_polling
                     && matches!(
-                        &request,
-                        KafkaRequest::Fetch { max_wait_ms, .. } if *max_wait_ms > 0
+                        &request.body,
+                        RequestBody::Fetch(fetch) if fetch.max_wait_ms > 0
                     );
 
                 // Acquire a long-poll slot; at the cap the fetch falls through
@@ -767,15 +768,22 @@ async fn handle_connection(
 
                 if let Some(permit) = long_poll_permit {
                     // Destructure for long polling - we know it's a Fetch with max_wait_ms > 0
-                    if let KafkaRequest::Fetch {
-                        correlation_id,
-                        client_id,
-                        api_version,
-                        max_wait_ms,
-                        min_bytes,
-                        max_bytes,
-                        isolation_level,
-                        topic_data,
+                    if let KafkaRequest {
+                        header:
+                            RequestHeader {
+                                correlation_id,
+                                client_id,
+                                api_version,
+                                ..
+                            },
+                        body:
+                            RequestBody::Fetch(FetchRequestData {
+                                max_wait_ms,
+                                min_bytes,
+                                max_bytes,
+                                isolation_level,
+                                topic_data,
+                            }),
                         response_tx: original_response_tx,
                     } = request
                     {
@@ -996,15 +1004,20 @@ async fn long_poll_loop(
         let (inner_tx, mut inner_rx) = tokio::sync::mpsc::unbounded_channel();
 
         // Reconstruct the Fetch request with our response channel
-        let fetch_request = KafkaRequest::Fetch {
-            correlation_id,
-            client_id: client_id.clone(),
-            api_version,
-            max_wait_ms: 0, // Don't long poll again in worker
-            min_bytes: 0,   // Accept any amount of data
-            max_bytes,
-            isolation_level,
-            topic_data: topic_data.to_vec(),
+        let fetch_request = KafkaRequest {
+            header: RequestHeader {
+                api_key: crate::kafka::constants::API_KEY_FETCH,
+                api_version,
+                correlation_id,
+                client_id: client_id.clone(),
+            },
+            body: RequestBody::Fetch(FetchRequestData {
+                max_wait_ms: 0, // Don't long poll again in worker
+                min_bytes: 0,   // Accept any amount of data
+                max_bytes,
+                isolation_level,
+                topic_data: topic_data.to_vec(),
+            }),
             response_tx: inner_tx,
         };
 
@@ -1075,8 +1088,8 @@ async fn long_poll_loop(
 
 /// Calculate the total bytes in a FetchResponse
 fn calculate_response_bytes(response: &KafkaResponse) -> usize {
-    match response {
-        KafkaResponse::Fetch { response, .. } => response
+    match &response.body {
+        ResponseBody::Fetch(response) => response
             .responses
             .iter()
             .flat_map(|t| t.partitions.iter())
@@ -1089,8 +1102,8 @@ fn calculate_response_bytes(response: &KafkaResponse) -> usize {
 
 /// Whether any partition in a Fetch response carries a non-zero error code.
 fn response_has_partition_error(response: &KafkaResponse) -> bool {
-    match response {
-        KafkaResponse::Fetch { response, .. } => response
+    match &response.body {
+        ResponseBody::Fetch(response) => response
             .responses
             .iter()
             .flat_map(|t| t.partitions.iter())
@@ -1258,11 +1271,7 @@ mod tests {
             topic.partitions = vec![partition];
             response.responses = vec![topic];
         }
-        KafkaResponse::Fetch {
-            correlation_id: 1,
-            api_version: 4,
-            response,
-        }
+        KafkaResponse::new(1, 4, ResponseBody::Fetch(response))
     }
 
     /// Fake DB thread: answers every Fetch it receives. `before_answer(n)` runs before
@@ -1281,7 +1290,11 @@ mod tests {
         tokio::spawn(async move {
             loop {
                 match rx.try_recv() {
-                    Ok(KafkaRequest::Fetch { response_tx, .. }) => {
+                    Ok(KafkaRequest {
+                        body: RequestBody::Fetch(_),
+                        response_tx,
+                        ..
+                    }) => {
                         let n = served.fetch_add(1, Ordering::SeqCst) + 1;
                         let with_records = before_answer(n).await;
                         let _ = response_tx.send(fetch_response(with_records));

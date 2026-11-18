@@ -324,7 +324,7 @@ honored; producer CreateTime timestamps are preserved — BUG-7).
 
 ### Supported APIs (26 total)
 
-These ranges are both advertised in ApiVersions and enforced on inbound requests (`API_VERSION_RANGES` in `src/kafka/response_builders.rs`); an out-of-range request gets UNSUPPORTED_VERSION.
+These ranges are both advertised in ApiVersions and enforced on inbound requests (each API's `MIN_VERSION`/`MAX_VERSION` in `src/kafka/api/`); an out-of-range request gets UNSUPPORTED_VERSION.
 
 | API Key | Name | Versions | Status |
 |---------|------|----------|--------|

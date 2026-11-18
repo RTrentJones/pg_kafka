@@ -270,33 +270,6 @@ fn exit_for_restart() -> ! {
 /// (registered in `_PG_init`).
 pub const WORKER_RESTART_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Extract producer metadata from the first partition with valid metadata (Phase 9)
-///
-/// Idempotent producers embed producer_id, producer_epoch, and base_sequence in the
-/// RecordBatch header. This function scans all topic partitions to find the first
-/// batch with valid producer metadata (producer_id >= 0). The result identifies the
-/// producer (id/epoch) for the request as a whole; its `base_sequence` belongs to that
-/// first batch only, so `handle_produce` checks each partition against the metadata
-/// of its own batch.
-///
-/// Returns Some(ProducerMetadata) if found, None for non-idempotent producers.
-fn extract_producer_metadata(
-    topic_data: &[crate::kafka::messages::TopicProduceData],
-) -> Option<crate::kafka::messages::ProducerMetadata> {
-    for topic in topic_data {
-        for partition_data in &topic.partitions {
-            if let Some(ref metadata) = partition_data.producer_metadata {
-                // Only return metadata for actual idempotent producers (producer_id >= 0)
-                // Non-idempotent producers have producer_id = -1
-                if metadata.producer_id >= 0 {
-                    return Some(metadata.clone());
-                }
-            }
-        }
-    }
-    None
-}
-
 /// Main entry point for the pg_kafka background worker.
 ///
 /// IMPORTANT: This function MUST follow pgrx background worker conventions:
@@ -995,9 +968,11 @@ fn batch_has_room(taken: usize, elapsed: Duration, liveness_waiting: bool) -> bo
 struct BufferedResponse {
     client_tx: tokio::sync::mpsc::UnboundedSender<crate::kafka::KafkaResponse>,
     buffer_rx: tokio::sync::mpsc::UnboundedReceiver<crate::kafka::KafkaResponse>,
-    api_key: i16,
     api_version: i16,
     correlation_id: i32,
+    /// What the request's error response echoes (its topics/partitions/groups), for
+    /// a commit failure.
+    echo: crate::kafka::api::Echo,
     /// False for an acks=0 produce: the client expects no response frame at all,
     /// not even an error.
     expects_response: bool,
@@ -1013,18 +988,16 @@ impl BufferedResponse {
     /// send/try_recv are plain synchronous calls, so no runtime or extra
     /// synchronization is involved.
     fn intercept(request: &mut crate::kafka::KafkaRequest) -> Self {
-        let (api_key, api_version, correlation_id) = request.wire_ids();
-        let expects_response =
-            !matches!(request, crate::kafka::KafkaRequest::Produce { acks: 0, .. });
+        let api_key = request.header.api_key;
         let (buffer_tx, buffer_rx) = tokio::sync::mpsc::unbounded_channel();
         let client_tx = request.swap_response_tx(buffer_tx);
         BufferedResponse {
             client_tx,
             buffer_rx,
-            api_key,
-            api_version,
-            correlation_id,
-            expects_response,
+            api_version: request.header.api_version,
+            correlation_id: request.header.correlation_id,
+            echo: request.body.echo(),
+            expects_response: request.body.expects_response(),
             metrics: crate::kafka::metrics::RequestTimer::start(api_key),
         }
     }
@@ -1055,17 +1028,14 @@ impl BufferedResponse {
         if !self.expects_response {
             return;
         }
-        let error_response = crate::kafka::response_builders::error_response_for(
-            self.api_key,
-            self.api_version,
+        // The API's own error response, echoing the request's topics/partitions/groups
+        // so an API without a top-level error code still reports the failure.
+        let error_response = crate::kafka::KafkaResponse::new(
             self.correlation_id,
-            ERROR_UNKNOWN_SERVER_ERROR,
-        )
-        .unwrap_or(crate::kafka::KafkaResponse::Error {
-            correlation_id: self.correlation_id,
-            error_code: ERROR_UNKNOWN_SERVER_ERROR,
-            error_message: Some("transaction commit failed".to_string()),
-        });
+            self.api_version,
+            self.echo
+                .error_response(self.api_version, ERROR_UNKNOWN_SERVER_ERROR),
+        );
         let _ = self.client_tx.send(error_response);
     }
 }
@@ -1162,7 +1132,7 @@ fn execute_batch(
         BackgroundWorker::transaction(AssertUnwindSafe(|| {
             let mut next = Some(first);
             while let Some(mut request) = next.take() {
-                has_produce |= matches!(request, crate::kafka::KafkaRequest::Produce { .. });
+                has_produce |= request.header.api_key == API_KEY_PRODUCE;
                 pending.push(BufferedResponse::intercept(&mut request));
 
                 let handler_start = Instant::now();
@@ -1213,71 +1183,9 @@ fn execute_batch(
     }
 }
 
-// Helper functions removed - now using storage trait and handlers
-
-/// Process a Kafka request and send the response
+/// Run one request on the DB thread: build its handler context and hand it to the
+/// API's [`crate::kafka::api::KafkaApi::handle`] through the registry.
 ///
-/// This function has been refactored to use:
-/// - Repository Pattern: Storage via PostgresStore (implements KafkaStore trait)
-/// - Dispatch Pattern: Common error handling via dispatch helpers
-/// - Transaction boundaries remain explicit here (in worker.rs)
-///
-/// Send a best-effort produce notification to the network thread without blocking the single DB
-/// thread (SEC-4). The notify channel is bounded; a *blocking* send from here would stall all
-/// request processing if the channel filled. `try_send` drops the notification instead — fetch
-/// handlers fall back to polling, so a dropped wake-up only adds latency, never blocks.
-fn notify_best_effort(
-    tx: &crossbeam_channel::Sender<crate::kafka::InternalNotification>,
-    notification: crate::kafka::InternalNotification,
-) {
-    let _ = tx.try_send(notification);
-}
-
-/// Wake any long-poll consumers for the partitions a produce just appended to, one best-effort
-/// notification per successfully-written partition. Shared by the `acks=0` and `acks>=1` produce
-/// paths, which previously carried identical copies of this loop. A missing topic id, a failed
-/// high-watermark read, or a full notify channel simply skips that wake-up (consumers fall back to
-/// the poll interval — see [`notify_best_effort`]).
-fn emit_produce_notifications(
-    response: &kafka_protocol::messages::produce_response::ProduceResponse,
-    store: &dyn KafkaStore,
-    notify_tx: &crossbeam_channel::Sender<crate::kafka::InternalNotification>,
-) {
-    for topic_response in &response.responses {
-        let topic_name = topic_response.name.0.as_str();
-        if let Ok(Some(topic_id)) = store.get_topic_id(topic_name) {
-            for partition_response in &topic_response.partition_responses {
-                if partition_response.error_code == ERROR_NONE {
-                    let partition_id = partition_response.index;
-                    if let Ok(hwm) = store.get_high_watermark(topic_id, partition_id) {
-                        notify_best_effort(
-                            notify_tx,
-                            crate::kafka::InternalNotification::NewMessages {
-                                topic_name: topic_name.to_string(),
-                                topic_id,
-                                partition_id,
-                                high_watermark: hwm,
-                            },
-                        );
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Wake `read_committed` long-poll consumers after a successful EndTxn (commit or abort), which
-/// can advance the last stable offset of every partition the transaction wrote. Best-effort like
-/// [`emit_produce_notifications`]: a dropped wake-up only delays delivery to the fallback poll.
-fn emit_txn_end_notification(
-    notify_tx: &crossbeam_channel::Sender<crate::kafka::InternalNotification>,
-) {
-    notify_best_effort(
-        notify_tx,
-        crate::kafka::InternalNotification::TransactionEnded,
-    );
-}
-
 /// # Testing
 /// This function is public to allow unit testing, but is not part of the
 /// public API and should not be called directly by external code.
@@ -1292,881 +1200,28 @@ pub fn process_request(
     compression: kafka_protocol::records::Compression,
     shadow_store: &std::sync::Arc<ShadowStore<PostgresStore>>,
 ) -> RequestOutcome {
-    use crate::kafka::dispatch::{dispatch_infallible, dispatch_produce, dispatch_response};
-    use crate::kafka::handlers;
-    use crate::kafka::messages::KafkaResponse;
-
     // ShadowStore wraps PostgresStore and handles shadow mode internally.
     // It checks the GUC at runtime to decide whether to forward.
     let store: &dyn KafkaStore = shadow_store.as_ref();
-
-    // DR-24 (DEEP-REVIEW-2026-07): one HandlerContext for the whole dispatch —
-    // previously every match arm rebuilt an identical context (21 copies). The
-    // two produce arms still build their own via with_notifier (they carry the
-    // long-poll wake-up channel).
-    let ctx = crate::kafka::HandlerContext::new(
-        store,
-        coordinator,
-        broker_metadata,
-        default_partitions,
-        compression,
-    );
-
-    match request {
-        // ===== ApiVersions (infallible - no storage) =====
-        crate::kafka::KafkaRequest::ApiVersions {
-            correlation_id,
-            api_version,
-            response_tx,
-            ..
-        } => dispatch_infallible(
-            "ApiVersions",
-            response_tx,
-            handlers::handle_api_versions,
-            |r| KafkaResponse::ApiVersions {
-                correlation_id,
-                api_version,
-                response: r,
-            },
+    let env = crate::kafka::api::ApiEnv {
+        ctx: crate::kafka::HandlerContext::new(
+            store,
+            coordinator,
+            broker_metadata,
+            default_partitions,
+            compression,
         ),
-
-        // ===== Metadata =====
-        crate::kafka::KafkaRequest::Metadata {
-            correlation_id,
-            api_version,
-            topics: requested_topics,
-            allow_auto_topic_creation,
-            response_tx,
-            ..
-        } => dispatch_response(
-            "Metadata",
-            response_tx,
-            || handlers::handle_metadata(&ctx, requested_topics, allow_auto_topic_creation),
-            |r| KafkaResponse::Metadata {
-                correlation_id,
-                api_version,
-                response: r,
-            },
-            |_error_code| KafkaResponse::Metadata {
-                correlation_id,
-                api_version,
-                response: crate::kafka::response_builders::build_metadata_error_response(),
-            },
-        ),
-
-        // ===== Produce =====
-        crate::kafka::KafkaRequest::Produce {
-            correlation_id,
-            api_version,
-            acks,
-            topic_data,
-            transactional_id,
-            response_tx,
-            ..
-        } => {
-            // Handle acks=0 (fire-and-forget)
-            // Per Kafka protocol: the broker sends NO response frame at all for
-            // acks=0. Sending one desyncs real clients (the Java client enforces
-            // strict per-connection request/response pairing and kills the
-            // connection on an unexpected response). Data is written best-effort;
-            // errors are logged but never sent to the client.
-            if acks == 0 {
-                // Process the produce request best-effort (no response either way)
-                // Phase 9 Note: For acks=0 (fire-and-forget), we intentionally skip idempotency validation
-                // by passing None for producer_metadata. There's no delivery guarantee anyway, so
-                // enforcing sequence validation would be misleading and waste resources.
-                // Phase 10 Note: We also skip transactional support for acks=0 since there's no
-                // guarantee of delivery - transactions require acks >= 1 for meaningful guarantees.
-                let ctx = crate::kafka::HandlerContext::with_notifier(
-                    store,
-                    coordinator,
-                    broker_metadata,
-                    default_partitions,
-                    compression,
-                    notify_tx,
-                );
-                return match handlers::handle_produce(&ctx, topic_data, None, None) {
-                    Ok(response) => {
-                        // Wake long-poll consumers for the partitions just written.
-                        emit_produce_notifications(&response, store, notify_tx);
-                        RequestOutcome::Commit
-                    }
-                    Err(e) => {
-                        // Log error but don't notify client (per acks=0 contract).
-                        // Roll back like the acks>=1 path does: a request-level
-                        // failure must not leave a partial write behind.
-                        if e.is_server_error() {
-                            pg_warning!("acks=0 produce error (data may be lost): {}", e);
-                        }
-                        RequestOutcome::Rollback
-                    }
-                };
-            }
-
-            // Handle produce (acks >= 1).
-            // Phase 9: producer metadata enables sequence checking / dedup / fencing.
-            // Phase 10: transactional_id for transactional producers.
-            // Phase 11: shadow forwarding is internal to ShadowStore.insert_records().
-            let producer_metadata = extract_producer_metadata(&topic_data);
-            let ctx = crate::kafka::HandlerContext::with_notifier(
-                store,
-                coordinator,
-                broker_metadata,
-                default_partitions,
-                compression,
-                notify_tx,
-            );
-
-            // RA-3: route through dispatch_produce so a handler PANIC (a Postgres
-            // ERROR surfaces through pgrx as a Rust panic) still replies
-            // UNKNOWN_SERVER_ERROR and rolls back, instead of leaving the client to
-            // hang. The previous hand-rolled match (kept for the acks=0 no-response
-            // special case above) skipped that panic safety.
-            dispatch_produce(
-                response_tx,
-                correlation_id,
-                api_version,
-                move || {
-                    handlers::handle_produce(
-                        &ctx,
-                        topic_data,
-                        producer_metadata.as_ref(),
-                        transactional_id.as_deref(),
-                    )
-                },
-                // Wake long-poll consumers for the partitions just written.
-                |response| emit_produce_notifications(response, store, notify_tx),
-            )
-        }
-
-        // ===== Fetch =====
-        crate::kafka::KafkaRequest::Fetch {
-            correlation_id,
-            api_version,
-            max_bytes,
-            topic_data,
-            isolation_level,
-            response_tx,
-            ..
-        } => {
-            // Phase 10: Convert i8 isolation_level to IsolationLevel enum
-            let isolation = if isolation_level == 1 {
-                crate::kafka::storage::IsolationLevel::ReadCommitted
-            } else {
-                crate::kafka::storage::IsolationLevel::ReadUncommitted
-            };
-
-            dispatch_response(
-                "Fetch",
-                response_tx,
-                || handlers::handle_fetch_with_max_bytes(&ctx, topic_data, isolation, max_bytes),
-                |r| KafkaResponse::Fetch {
-                    correlation_id,
-                    api_version,
-                    response: r,
-                },
-                |error_code| KafkaResponse::Fetch {
-                    correlation_id,
-                    api_version,
-                    response: crate::kafka::response_builders::build_fetch_error_response(
-                        error_code,
-                    ),
-                },
-            )
-        }
-
-        // ===== OffsetCommit =====
-        crate::kafka::KafkaRequest::OffsetCommit {
-            correlation_id,
-            api_version,
-            group_id,
-            generation_id,
-            member_id,
-            topics,
-            response_tx,
-            ..
-        } => dispatch_response(
-            "OffsetCommit",
-            response_tx,
-            || handlers::handle_offset_commit(&ctx, group_id, generation_id, member_id, topics),
-            |r| KafkaResponse::OffsetCommit {
-                correlation_id,
-                api_version,
-                response: r,
-            },
-            |error_code| KafkaResponse::OffsetCommit {
-                correlation_id,
-                api_version,
-                response: crate::kafka::response_builders::build_offset_commit_error_response(
-                    error_code,
-                ),
-            },
-        ),
-
-        // ===== OffsetFetch =====
-        crate::kafka::KafkaRequest::OffsetFetch {
-            correlation_id,
-            api_version,
-            group_id,
-            topics,
-            response_tx,
-            ..
-        } => dispatch_response(
-            "OffsetFetch",
-            response_tx,
-            || handlers::handle_offset_fetch(&ctx, group_id, topics),
-            |r| KafkaResponse::OffsetFetch {
-                correlation_id,
-                api_version,
-                response: r,
-            },
-            |error_code| KafkaResponse::OffsetFetch {
-                correlation_id,
-                api_version,
-                response: crate::kafka::response_builders::build_offset_fetch_error_response(
-                    error_code,
-                ),
-            },
-        ),
-
-        // ===== FindCoordinator =====
-        crate::kafka::KafkaRequest::FindCoordinator {
-            correlation_id,
-            api_version,
-            key,
-            key_type,
-            response_tx,
-            ..
-        } => dispatch_response(
-            "FindCoordinator",
-            response_tx,
-            || handlers::handle_find_coordinator(&ctx, key, key_type),
-            |r| KafkaResponse::FindCoordinator {
-                correlation_id,
-                api_version,
-                response: r,
-            },
-            |error_code| KafkaResponse::FindCoordinator {
-                correlation_id,
-                api_version,
-                response: crate::kafka::response_builders::build_find_coordinator_error_response(
-                    error_code,
-                ),
-            },
-        ),
-
-        // ===== JoinGroup =====
-        crate::kafka::KafkaRequest::JoinGroup {
-            correlation_id,
-            api_version,
-            group_id,
-            member_id,
-            client_id,
-            session_timeout_ms,
-            rebalance_timeout_ms,
-            protocol_type,
-            group_instance_id,
-            protocols,
-            response_tx,
-        } => {
-            // The coordinator may hold this response until the group's join phase
-            // completes (a later JoinGroup, LeaveGroup or the timeout sweep answers it),
-            // so it answers on the client's own sender: swap_response_tx leaves that in
-            // place for JoinGroup, which does no SPI and needs no commit barrier.
-            let reply = crate::kafka::handlers::JoinGroupReply::new(
-                correlation_id,
-                api_version,
-                response_tx,
-            );
-            handlers::handle_join_group(
-                &ctx,
-                handlers::JoinGroupRequestData {
-                    group_id,
-                    member_id,
-                    client_id: client_id.unwrap_or_else(|| "unknown".to_string()),
-                    group_instance_id,
-                    session_timeout_ms,
-                    rebalance_timeout_ms,
-                    protocol_type,
-                    protocols,
-                },
-                move |response| reply.send(response),
-            );
-            // JoinGroup writes nothing to the database, so there is nothing to roll back.
-            RequestOutcome::Commit
-        }
-
-        // ===== SyncGroup =====
-        crate::kafka::KafkaRequest::SyncGroup {
-            correlation_id,
-            api_version,
-            group_id,
-            member_id,
-            generation_id,
-            assignments,
-            response_tx,
-            ..
-        } => {
-            // A follower's SyncGroup may be parked until the leader's arrives, so, as
-            // for JoinGroup, it answers on the client's own sender (swap_response_tx
-            // leaves it in place for SyncGroup, which only reads and writes nothing).
-            let reply = crate::kafka::handlers::SyncGroupReply::new(
-                correlation_id,
-                api_version,
-                response_tx,
-            );
-            handlers::handle_sync_group(
-                &ctx,
-                group_id,
-                member_id,
-                generation_id,
-                assignments,
-                move |response| reply.send(response),
-            );
-            RequestOutcome::Commit
-        }
-
-        // ===== Heartbeat =====
-        crate::kafka::KafkaRequest::Heartbeat {
-            correlation_id,
-            api_version,
-            group_id,
-            member_id,
-            generation_id,
-            response_tx,
-            ..
-        } => dispatch_response(
-            "Heartbeat",
-            response_tx,
-            || handlers::handle_heartbeat(&ctx, group_id, member_id, generation_id),
-            |r| KafkaResponse::Heartbeat {
-                correlation_id,
-                api_version,
-                response: r,
-            },
-            |error_code| KafkaResponse::Heartbeat {
-                correlation_id,
-                api_version,
-                response: crate::kafka::response_builders::build_heartbeat_error_response(
-                    error_code,
-                ),
-            },
-        ),
-
-        // ===== LeaveGroup =====
-        crate::kafka::KafkaRequest::LeaveGroup {
-            correlation_id,
-            api_version,
-            group_id,
-            member_id,
-            members,
-            response_tx,
-            ..
-        } => dispatch_response(
-            "LeaveGroup",
-            response_tx,
-            || handlers::handle_leave_group(&ctx, group_id, member_id, members),
-            |r| KafkaResponse::LeaveGroup {
-                correlation_id,
-                api_version,
-                response: r,
-            },
-            |error_code| KafkaResponse::LeaveGroup {
-                correlation_id,
-                api_version,
-                response: crate::kafka::response_builders::build_leave_group_error_response(
-                    error_code,
-                ),
-            },
-        ),
-
-        // ===== ListOffsets =====
-        crate::kafka::KafkaRequest::ListOffsets {
-            correlation_id,
-            api_version,
-            topics,
-            response_tx,
-            ..
-        } => dispatch_response(
-            "ListOffsets",
-            response_tx,
-            || handlers::handle_list_offsets(&ctx, topics),
-            |r| KafkaResponse::ListOffsets {
-                correlation_id,
-                api_version,
-                response: r,
-            },
-            |error_code| KafkaResponse::ListOffsets {
-                correlation_id,
-                api_version,
-                response: crate::kafka::response_builders::build_list_offsets_error_response(
-                    error_code,
-                ),
-            },
-        ),
-
-        // ===== DescribeGroups =====
-        crate::kafka::KafkaRequest::DescribeGroups {
-            correlation_id,
-            api_version,
-            groups,
-            response_tx,
-            ..
-        } => dispatch_response(
-            "DescribeGroups",
-            response_tx,
-            || handlers::handle_describe_groups(&ctx, groups),
-            |r| KafkaResponse::DescribeGroups {
-                correlation_id,
-                api_version,
-                response: r,
-            },
-            |error_code| KafkaResponse::DescribeGroups {
-                correlation_id,
-                api_version,
-                response: crate::kafka::response_builders::build_describe_groups_error_response(
-                    error_code,
-                ),
-            },
-        ),
-
-        // ===== ListGroups =====
-        crate::kafka::KafkaRequest::ListGroups {
-            correlation_id,
-            api_version,
-            states_filter,
-            response_tx,
-            ..
-        } => dispatch_response(
-            "ListGroups",
-            response_tx,
-            || handlers::handle_list_groups(&ctx, states_filter),
-            |r| KafkaResponse::ListGroups {
-                correlation_id,
-                api_version,
-                response: r,
-            },
-            |error_code| KafkaResponse::ListGroups {
-                correlation_id,
-                api_version,
-                response: crate::kafka::response_builders::build_list_groups_error_response(
-                    error_code,
-                ),
-            },
-        ),
-
-        // ===== CreateTopics (Phase 6) =====
-        crate::kafka::KafkaRequest::CreateTopics {
-            correlation_id,
-            api_version,
-            topics,
-            validate_only,
-            response_tx,
-            ..
-        } => dispatch_response(
-            "CreateTopics",
-            response_tx,
-            || handlers::handle_create_topics(&ctx, topics, validate_only),
-            |r| KafkaResponse::CreateTopics {
-                correlation_id,
-                api_version,
-                response: r,
-            },
-            |error_code| KafkaResponse::CreateTopics {
-                correlation_id,
-                api_version,
-                response: crate::kafka::response_builders::build_create_topics_error_response(
-                    error_code,
-                ),
-            },
-        ),
-
-        // ===== DeleteTopics (Phase 6) =====
-        crate::kafka::KafkaRequest::DeleteTopics {
-            correlation_id,
-            api_version,
-            topic_names,
-            response_tx,
-            ..
-        } => dispatch_response(
-            "DeleteTopics",
-            response_tx,
-            || handlers::handle_delete_topics(&ctx, topic_names),
-            |r| KafkaResponse::DeleteTopics {
-                correlation_id,
-                api_version,
-                response: r,
-            },
-            |error_code| KafkaResponse::DeleteTopics {
-                correlation_id,
-                api_version,
-                response: crate::kafka::response_builders::build_delete_topics_error_response(
-                    error_code,
-                ),
-            },
-        ),
-
-        // ===== CreatePartitions (Phase 6) =====
-        crate::kafka::KafkaRequest::CreatePartitions {
-            correlation_id,
-            api_version,
-            topics,
-            validate_only,
-            response_tx,
-            ..
-        } => dispatch_response(
-            "CreatePartitions",
-            response_tx,
-            || handlers::handle_create_partitions(&ctx, topics, validate_only),
-            |r| KafkaResponse::CreatePartitions {
-                correlation_id,
-                api_version,
-                response: r,
-            },
-            |error_code| KafkaResponse::CreatePartitions {
-                correlation_id,
-                api_version,
-                response: crate::kafka::response_builders::build_create_partitions_error_response(
-                    error_code,
-                ),
-            },
-        ),
-
-        // ===== DeleteGroups (Phase 6) =====
-        crate::kafka::KafkaRequest::DeleteGroups {
-            correlation_id,
-            api_version,
-            groups_names,
-            response_tx,
-            ..
-        } => dispatch_response(
-            "DeleteGroups",
-            response_tx,
-            || handlers::handle_delete_groups(&ctx, groups_names),
-            |r| KafkaResponse::DeleteGroups {
-                correlation_id,
-                api_version,
-                response: r,
-            },
-            |error_code| KafkaResponse::DeleteGroups {
-                correlation_id,
-                api_version,
-                response: crate::kafka::response_builders::build_delete_groups_error_response(
-                    error_code,
-                ),
-            },
-        ),
-
-        // ===== InitProducerId (Phase 9, extended in Phase 10) =====
-        crate::kafka::KafkaRequest::InitProducerId {
-            correlation_id,
-            api_version,
-            transactional_id,
-            transaction_timeout_ms,
-            producer_id: existing_producer_id,
-            producer_epoch: existing_epoch,
-            client_id,
-            response_tx,
-        } => dispatch_response(
-            "InitProducerId",
-            response_tx,
-            || {
-                handlers::handle_init_producer_id(
-                    &ctx,
-                    transactional_id,
-                    transaction_timeout_ms,
-                    existing_producer_id,
-                    existing_epoch,
-                    client_id.as_deref(),
-                )
-            },
-            |r| KafkaResponse::InitProducerId {
-                correlation_id,
-                api_version,
-                response: r,
-            },
-            |error_code| KafkaResponse::InitProducerId {
-                correlation_id,
-                api_version,
-                response: crate::kafka::response_builders::build_init_producer_id_error_response(
-                    error_code,
-                ),
-            },
-        ),
-
-        // ===== Phase 10: Transaction APIs =====
-        crate::kafka::KafkaRequest::AddPartitionsToTxn {
-            correlation_id,
-            api_version,
-            transactional_id,
-            producer_id,
-            producer_epoch,
-            topics,
-            response_tx,
-            ..
-        } => dispatch_response(
-            "AddPartitionsToTxn",
-            response_tx,
-            || {
-                handlers::handle_add_partitions_to_txn(
-                    &ctx,
-                    &transactional_id,
-                    producer_id,
-                    producer_epoch,
-                    topics,
-                )
-            },
-            |r| KafkaResponse::AddPartitionsToTxn {
-                correlation_id,
-                api_version,
-                response: r,
-            },
-            |error_code| {
-                let mut response = kafka_protocol::messages::add_partitions_to_txn_response::AddPartitionsToTxnResponse::default();
-                response.throttle_time_ms = 0;
-                response.error_code = error_code;
-                KafkaResponse::AddPartitionsToTxn {
-                    correlation_id,
-                    api_version,
-                    response,
-                }
-            },
-        ),
-
-        crate::kafka::KafkaRequest::AddOffsetsToTxn {
-            correlation_id,
-            api_version,
-            transactional_id,
-            producer_id,
-            producer_epoch,
-            group_id,
-            response_tx,
-            ..
-        } => dispatch_response(
-            "AddOffsetsToTxn",
-            response_tx,
-            || {
-                handlers::handle_add_offsets_to_txn(
-                    &ctx,
-                    &transactional_id,
-                    producer_id,
-                    producer_epoch,
-                    &group_id,
-                )
-            },
-            |r| KafkaResponse::AddOffsetsToTxn {
-                correlation_id,
-                api_version,
-                response: r,
-            },
-            |error_code| {
-                let mut response = kafka_protocol::messages::add_offsets_to_txn_response::AddOffsetsToTxnResponse::default();
-                response.throttle_time_ms = 0;
-                response.error_code = error_code;
-                KafkaResponse::AddOffsetsToTxn {
-                    correlation_id,
-                    api_version,
-                    response,
-                }
-            },
-        ),
-
-        crate::kafka::KafkaRequest::EndTxn {
-            correlation_id,
-            api_version,
-            transactional_id,
-            producer_id,
-            producer_epoch,
-            committed,
-            response_tx,
-            ..
-        } => dispatch_response(
-            "EndTxn",
-            response_tx,
-            || {
-                handlers::handle_end_txn(
-                    &ctx,
-                    &transactional_id,
-                    producer_id,
-                    producer_epoch,
-                    committed,
-                )
-                // Wake read_committed long polls: commit/abort moves the LSO.
-                .inspect(|_| emit_txn_end_notification(notify_tx))
-            },
-            |r| KafkaResponse::EndTxn {
-                correlation_id,
-                api_version,
-                response: r,
-            },
-            |error_code| {
-                let mut response =
-                    kafka_protocol::messages::end_txn_response::EndTxnResponse::default();
-                response.throttle_time_ms = 0;
-                response.error_code = error_code;
-                KafkaResponse::EndTxn {
-                    correlation_id,
-                    api_version,
-                    response,
-                }
-            },
-        ),
-
-        crate::kafka::KafkaRequest::TxnOffsetCommit {
-            correlation_id,
-            api_version,
-            transactional_id,
-            group_id,
-            producer_id,
-            producer_epoch,
-            generation_id,
-            member_id,
-            topics,
-            response_tx,
-            ..
-        } => {
-            // Keep the requested topics/partitions so a request-level failure can be
-            // echoed per partition (TxnOffsetCommitResponse has no top-level error code).
-            let requested_topics = topics.clone();
-            dispatch_response(
-                "TxnOffsetCommit",
-                response_tx,
-                || {
-                    handlers::handle_txn_offset_commit(
-                        &ctx,
-                        &transactional_id,
-                        producer_id,
-                        producer_epoch,
-                        &group_id,
-                        generation_id,
-                        &member_id,
-                        topics,
-                    )
-                },
-                |r| KafkaResponse::TxnOffsetCommit {
-                    correlation_id,
-                    api_version,
-                    response: r,
-                },
-                |error_code| {
-                    // TxnOffsetCommit has no top-level error_code field, so report the
-                    // error on every requested partition. An empty response would be
-                    // read by the client as success.
-                    let response =
-                        handlers::txn_offset_commit_error_response(&requested_topics, error_code);
-                    KafkaResponse::TxnOffsetCommit {
-                        correlation_id,
-                        api_version,
-                        response,
-                    }
-                },
-            )
-        }
-
-        // ===== DeleteRecords (API 21) =====
-        crate::kafka::KafkaRequest::DeleteRecords {
-            correlation_id,
-            api_version,
-            topics,
-            response_tx,
-            ..
-        } => dispatch_response(
-            "DeleteRecords",
-            response_tx,
-            || handlers::handle_delete_records(&ctx, topics),
-            |r| KafkaResponse::DeleteRecords {
-                correlation_id,
-                api_version,
-                response: r,
-            },
-            |error_code| KafkaResponse::DeleteRecords {
-                correlation_id,
-                api_version,
-                response: crate::kafka::response_builders::build_delete_records_error_response(
-                    error_code,
-                ),
-            },
-        ),
-
-        // ===== DescribeConfigs (API 32) =====
-        crate::kafka::KafkaRequest::DescribeConfigs {
-            correlation_id,
-            api_version,
-            resources,
-            response_tx,
-            ..
-        } => {
-            let global_retention_hours = crate::config::MESSAGE_RETENTION_HOURS.get();
-            dispatch_response(
-                "DescribeConfigs",
-                response_tx,
-                || handlers::handle_describe_configs(&ctx, resources, global_retention_hours),
-                |r| KafkaResponse::DescribeConfigs {
-                    correlation_id,
-                    api_version,
-                    response: r,
-                },
-                |error_code| KafkaResponse::DescribeConfigs {
-                    correlation_id,
-                    api_version,
-                    response:
-                        crate::kafka::response_builders::build_describe_configs_error_response(
-                            error_code,
-                        ),
-                },
-            )
-        }
-
-        // ===== IncrementalAlterConfigs (API 44) =====
-        crate::kafka::KafkaRequest::IncrementalAlterConfigs {
-            correlation_id,
-            api_version,
-            resources,
-            validate_only,
-            response_tx,
-            ..
-        } => dispatch_response(
-            "IncrementalAlterConfigs",
-            response_tx,
-            || handlers::handle_incremental_alter_configs(&ctx, resources, validate_only),
-            |r| KafkaResponse::IncrementalAlterConfigs {
-                correlation_id,
-                api_version,
-                response: r,
-            },
-            |error_code| KafkaResponse::IncrementalAlterConfigs {
-                correlation_id,
-                api_version,
-                response:
-                    crate::kafka::response_builders::build_incremental_alter_configs_error_response(
-                        error_code,
-                    ),
-            },
-        ),
-    }
+        notify_tx,
+    };
+    crate::kafka::api::dispatch(request, &env)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kafka::InternalNotification;
-
-    #[test]
-    fn test_notify_best_effort_does_not_block_when_channel_full() {
-        // SEC-4: the single DB thread must never block sending a produce wake-up. A *blocking*
-        // send on a full bounded channel would stall all request processing; notify_best_effort
-        // uses try_send and drops instead. The channel below has capacity 1 and no receiver
-        // draining it, so a blocking send on the second call would hang this test forever.
-        let (tx, _rx) = crossbeam_channel::bounded::<InternalNotification>(1);
-        let make = |topic_id| InternalNotification::NewMessages {
-            topic_name: String::new(),
-            topic_id,
-            partition_id: 0,
-            high_watermark: 0,
-        };
-        notify_best_effort(&tx, make(1)); // fills the channel
-        notify_best_effort(&tx, make(2)); // must return immediately (dropped), not block
-    }
+    use crate::kafka::api::{
+        ApiVersionsRequestData, ProduceRequestData, RequestBody, RequestHeader, ResponseBody,
+    };
 
     #[test]
     fn test_batch_has_room_stops_at_cap_budget_and_liveness() {
@@ -2190,22 +1245,43 @@ mod tests {
         const { assert!(MAX_GROUP_COMMIT_REQUESTS <= 64) };
     }
 
-    fn api_versions_request(
+    fn request(
+        api_key: i16,
         correlation_id: i32,
+        body: RequestBody,
     ) -> (
         crate::kafka::KafkaRequest,
         tokio::sync::mpsc::UnboundedReceiver<crate::kafka::KafkaResponse>,
     ) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         (
-            crate::kafka::KafkaRequest::ApiVersions {
-                correlation_id,
-                client_id: None,
-                api_version: 3,
+            crate::kafka::KafkaRequest {
+                header: RequestHeader {
+                    api_key,
+                    api_version: 7,
+                    correlation_id,
+                    client_id: None,
+                },
+                body,
                 response_tx: tx,
             },
             rx,
         )
+    }
+
+    fn api_versions_request(
+        correlation_id: i32,
+    ) -> (
+        crate::kafka::KafkaRequest,
+        tokio::sync::mpsc::UnboundedReceiver<crate::kafka::KafkaResponse>,
+    ) {
+        let (mut r, rx) = request(
+            API_KEY_API_VERSIONS,
+            correlation_id,
+            RequestBody::ApiVersions(ApiVersionsRequestData),
+        );
+        r.header.api_version = 3;
+        (r, rx)
     }
 
     fn produce_request(
@@ -2215,35 +1291,29 @@ mod tests {
         crate::kafka::KafkaRequest,
         tokio::sync::mpsc::UnboundedReceiver<crate::kafka::KafkaResponse>,
     ) {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        (
-            crate::kafka::KafkaRequest::Produce {
-                correlation_id,
-                client_id: None,
-                api_version: 7,
+        request(
+            API_KEY_PRODUCE,
+            correlation_id,
+            RequestBody::Produce(ProduceRequestData {
                 acks,
                 timeout_ms: 1000,
                 topic_data: vec![],
                 transactional_id: None,
-                response_tx: tx,
-            },
-            rx,
+            }),
         )
     }
 
-    /// What a handler does: send on the request's (swapped) response channel.
+    /// What a handler does: send its (success) response on the request's (swapped)
+    /// response channel.
     fn handler_sends(request: crate::kafka::KafkaRequest, correlation_id: i32) {
-        let tx = match request {
-            crate::kafka::KafkaRequest::ApiVersions { response_tx, .. }
-            | crate::kafka::KafkaRequest::Produce { response_tx, .. } => response_tx,
-            _ => unreachable!(),
-        };
-        tx.send(crate::kafka::KafkaResponse::Error {
-            correlation_id,
-            error_code: 0,
-            error_message: None,
-        })
-        .unwrap();
+        request
+            .response_tx
+            .send(crate::kafka::KafkaResponse::new(
+                correlation_id,
+                0,
+                ResponseBody::UnknownApi { error_code: 0 },
+            ))
+            .unwrap();
     }
 
     #[test]
@@ -2263,17 +1333,12 @@ mod tests {
 
         after_batch_commit(pending);
         for (rx, expected) in [(&mut a_rx, 1), (&mut b_rx, 2)] {
-            match rx.try_recv().expect("released after commit") {
-                crate::kafka::KafkaResponse::Error {
-                    correlation_id,
-                    error_code,
-                    ..
-                } => {
-                    assert_eq!(correlation_id, expected);
-                    assert_eq!(error_code, 0, "the handler's own (success) response");
-                }
-                _ => panic!("unexpected response"),
-            }
+            let response = rx.try_recv().expect("released after commit");
+            assert_eq!(response.correlation_id, expected);
+            assert!(
+                matches!(response.body, ResponseBody::UnknownApi { error_code: 0 }),
+                "the handler's own (success) response"
+            );
         }
     }
 
@@ -2289,27 +1354,18 @@ mod tests {
         handler_sends(p, 12);
 
         after_batch_commit_failure(pending);
-        // ApiVersions has no typed error builder, so it gets the generic error
-        // frame — never the buffered success.
-        match a_rx.try_recv().expect("an error frame") {
-            crate::kafka::KafkaResponse::Error {
-                correlation_id,
-                error_code,
-                ..
-            } => {
-                assert_eq!(correlation_id, 11);
-                assert_eq!(error_code, ERROR_UNKNOWN_SERVER_ERROR);
-            }
-            other => panic!("expected an error frame, got {:?}", other),
+        // Each request gets its own API's error response — never the buffered success.
+        let response = a_rx.try_recv().expect("an error response");
+        assert_eq!(response.correlation_id, 11);
+        match response.body {
+            ResponseBody::ApiVersions(r) => assert_eq!(r.error_code, ERROR_UNKNOWN_SERVER_ERROR),
+            other => panic!("expected an ApiVersions error, got {:?}", other),
         }
         assert!(a_rx.try_recv().is_err(), "the buffered success is dropped");
         // Produce (acks=1): a Produce-typed error.
-        match p_rx.try_recv().expect("an error frame") {
-            crate::kafka::KafkaResponse::Produce { correlation_id, .. } => {
-                assert_eq!(correlation_id, 12)
-            }
-            other => panic!("expected a Produce error, got {:?}", other),
-        }
+        let response = p_rx.try_recv().expect("an error response");
+        assert_eq!(response.correlation_id, 12);
+        assert!(matches!(response.body, ResponseBody::Produce(_)));
         assert!(p_rx.try_recv().is_err());
     }
 
@@ -2346,18 +1402,5 @@ mod tests {
             Duration::from_secs(150),
             Some(Duration::from_secs(120))
         ));
-    }
-
-    #[test]
-    fn test_emit_txn_end_notification_sends_transaction_ended() {
-        let (tx, rx) = crossbeam_channel::bounded::<InternalNotification>(1);
-        emit_txn_end_notification(&tx);
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(InternalNotification::TransactionEnded)
-        ));
-        // Full channel: dropped, never blocks the DB thread.
-        emit_txn_end_notification(&tx);
-        emit_txn_end_notification(&tx);
     }
 }

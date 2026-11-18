@@ -153,9 +153,9 @@ pub fn process_request(
     shadow_store: &Arc<ShadowStore<PostgresStore>>,
 ) {
     // 1. Build one HandlerContext over the ShadowStore (which wraps PostgresStore)
-    // 2. Match the request variant and call the handler through the
-    //    dispatch_response / dispatch_infallible / dispatch_produce helpers (src/kafka/dispatch.rs)
-    // 3. Map handler errors to Kafka error codes and send the response
+    // 2. Hand the request to its API's KafkaApi::handle through the registry
+    //    (crate::kafka::api::dispatch), which calls the handler via Call::run
+    // 3. Call::run maps handler errors (and panics) to the API's error response
 }
 ```
 
@@ -272,18 +272,18 @@ pub fn process_request(request: KafkaRequest) {
 // worker.rs - clean coordination (abridged)
 pub fn process_request(request: KafkaRequest, /* coordinator, broker, ..., shadow_store */) {
     let store: &dyn KafkaStore = shadow_store.as_ref();
-    let ctx = HandlerContext::new(store, coordinator, broker_metadata, default_partitions, compression);
-    match request {
-        KafkaRequest::Fetch { topic_data, isolation_level, response_tx, .. } => {
-            dispatch_response(
-                "Fetch",
-                response_tx,
-                || handlers::handle_fetch(&ctx, topic_data, isolation),
-                /* wrap success */, /* build error response */,
-            );
-        }
-        // ...
+    let env = ApiEnv { ctx: HandlerContext::new(store, coordinator, broker_metadata, default_partitions, compression), notify_tx };
+    crate::kafka::api::dispatch(request, &env)
+}
+
+// api/fetch.rs - one description of the Fetch API (abridged)
+impl KafkaApi for FetchApi {
+    fn handle(request: FetchRequestData, call: Call<Self>, env: &ApiEnv<'_>) -> RequestOutcome {
+        call.run(request, |r, _| {
+            handlers::handle_fetch_with_max_bytes(&env.ctx, r.topic_data, IsolationLevel::from_i8(r.isolation_level), r.max_bytes)
+        })
     }
+    // ... decode, error_response, version range
 }
 
 // handlers/fetch.rs - pure protocol logic

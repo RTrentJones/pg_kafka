@@ -194,15 +194,19 @@ src/
 │   └── mocks.rs        # MockKafkaStore for unit testing handlers/storage
 ├── kafka/
 │   ├── mod.rs          # Module organization, re-exports
+│   ├── api/            # One `KafkaApi` impl per Kafka API + the registry (decode, error responses, dispatch)
+│   │   ├── mod.rs      # KafkaApi trait, Call, decode_api, kafka_apis! registry (RequestBody/ResponseBody/APIS)
+│   │   ├── metadata.rs, produce.rs, fetch.rs, consumer.rs, group.rs, admin.rs, configs.rs, transaction.rs
+│   │   └── tests.rs    # Registry-wide tests (every advertised version encodes, echoes, header versions)
 │   ├── listener.rs     # TCP listener, tokio runtime, connection handling
 │   ├── protocol/       # Binary protocol parsing/encoding (uses kafka-protocol crate)
 │   │   ├── mod.rs      # Framing and module exports
-│   │   ├── decoding.rs # Request decoding + version enforcement
-│   │   ├── encoding.rs # Response encoding
+│   │   ├── decoding.rs # Header parsing; the body goes to the API registry
+│   │   ├── encoding.rs # Response encoding (header version from the API's response type)
 │   │   └── recordbatch.rs  # RecordBatch v2 / legacy MessageSet parsing
-│   ├── messages.rs     # Request/response types, message queues
+│   ├── messages.rs     # KafkaRequest/KafkaResponse envelopes, request lanes, handler data types
 │   ├── metrics.rs      # Broker request metrics (atomics) + periodic flush to kafka.broker_* tables
-│   ├── dispatch.rs     # Request dispatch helpers used by worker.rs
+│   ├── dispatch.rs     # dispatch_response (handler Err/panic → error response) + RequestOutcome
 │   ├── context.rs      # Runtime context (shared configuration access)
 │   ├── handler_context.rs  # HandlerContext (store, coordinator, broker metadata) passed to handlers
 │   ├── broker_metadata.rs  # Advertised host/port for Metadata/FindCoordinator
@@ -216,7 +220,7 @@ src/
 │   │   ├── strategies/           # range.rs, roundrobin.rs, sticky.rs
 │   │   └── tests.rs              # Cross-module assignment tests
 │   ├── partitioner.rs  # Key-based partition routing (murmur2 hash, Phase 7)
-│   ├── response_builders.rs  # Response construction helpers, API_VERSION_RANGES table
+│   ├── response_builders.rs  # Response construction helpers (ApiVersions list from the API registry)
 │   ├── constants.rs    # Protocol constants and Kafka error codes
 │   ├── error.rs        # Typed errors with Kafka error code mapping (to_kafka_error_code())
 │   ├── handlers/       # Protocol request handlers (modular organization)
@@ -358,6 +362,7 @@ This separation enables testing handlers without a running database.
 
 Protocol handlers live in `src/kafka/handlers/`:
 - Each Kafka API has a `handle_*` function; all except `handle_api_versions` take a `&HandlerContext` (`src/kafka/handler_context.rs`), whose `store: &dyn KafkaStore` field keeps them testable
+- The pipeline around them (decode, version range, lane, error responses, dispatch) is the API's `KafkaApi` impl in `src/kafka/api/` (see "Adding a New Kafka API Handler")
 - `helpers.rs`: `TopicResolution` enum for topic lookup logic shared across handlers
 - `tests.rs`: handler tests using `MockKafkaStore` (more live in per-file `#[cfg(test)]` modules)
 
@@ -384,7 +389,7 @@ In-memory state management (`src/kafka/coordinator.rs`):
 - Automatic partition assignment with Range, RoundRobin, and Sticky strategies
 - Automatic rebalancing on member leave or session timeout
 - Tracks: generation IDs, member registry, partition assignments
-- JoinGroup responses are held until the join phase completes (every known member rejoined, or the rest left / timed out), as in Kafka; the generation moves when the join completes. `GroupCoordinator::join_group` takes a `JoinResponder` it calls exactly once (immediately or later, from another member's JoinGroup, a LeaveGroup or the ~1 s `check_and_remove_timed_out_members` sweep). The worker's JoinGroup arm answers on the client's own sender (`swap_response_tx` leaves it in place for JoinGroup and SyncGroup), wrapped in `handlers::JoinGroupReply`, which answers UNKNOWN_SERVER_ERROR if dropped unsent. A follower's SyncGroup is held the same way (`handlers::SyncGroupReply`, `pending_syncs`) until the leader's SyncGroup delivers the assignment, so a follower that syncs first waits instead of being told REBALANCE_IN_PROGRESS
+- JoinGroup responses are held until the join phase completes (every known member rejoined, or the rest left / timed out), as in Kafka; the generation moves when the join completes. `GroupCoordinator::join_group` takes a `JoinResponder` it calls exactly once (immediately or later, from another member's JoinGroup, a LeaveGroup or the ~1 s `check_and_remove_timed_out_members` sweep). `JoinGroupApi::handle` answers on the client's own sender (`KafkaApi::DEFERRED_REPLY`, so `swap_response_tx` leaves it in place for JoinGroup and SyncGroup), wrapped in `handlers::JoinGroupReply`, which answers UNKNOWN_SERVER_ERROR if dropped unsent. A follower's SyncGroup is held the same way (`handlers::SyncGroupReply`, `pending_syncs`) until the leader's SyncGroup delivers the assignment, so a follower that syncs first waits instead of being told REBALANCE_IN_PROGRESS
 
 ### Storage Schema
 
@@ -643,13 +648,29 @@ psql -h localhost -p 28814 -U postgres -d postgres -c \
 
 ### Adding a New Kafka API Handler
 
-1. Add the API key to `src/kafka/constants.rs` and its supported version range to `API_VERSION_RANGES` in `src/kafka/response_builders.rs` (advertised in ApiVersions and enforced on decode)
-2. Add `KafkaRequest`/`KafkaResponse` variants in `src/kafka/messages.rs`, decoding in `src/kafka/protocol/decoding.rs`, and encoding in `src/kafka/protocol/encoding.rs`
-3. Create the handler function in the appropriate file under `src/kafka/handlers/`, taking `&HandlerContext` (its `store: &dyn KafkaStore` keeps it testable)
-4. Use `KafkaError` variants for error handling (they map to Kafka error codes)
-5. Add unit tests in `src/kafka/handlers/tests.rs` using `MockKafkaStore`
-6. Wire up the handler in the `src/worker.rs` request processing loop
-7. Add an E2E test under `kafka_test/src/` and register it in `kafka_test/src/main.rs`
+Every API is described once, by a type implementing `KafkaApi` (`src/kafka/api/`), and listed
+once in the `kafka_apis!` registry at the bottom of `src/kafka/api/mod.rs`. The registry
+generates the `RequestBody`/`ResponseBody` enums, the decode/encode/dispatch matches, the
+ApiVersions list, the metrics names and the error path; nothing else lists the APIs.
+
+1. Write the handler in `src/kafka/handlers/` taking `&HandlerContext` (its
+   `store: &dyn KafkaStore` keeps it testable) and returning the kafka-protocol response or a
+   `KafkaError`. Add unit tests with `MockKafkaStore` (`src/kafka/handlers/tests.rs`).
+2. In the fitting `src/kafka/api/*.rs` file, add a request data struct and `impl KafkaApi`:
+   - `type Wire` = the kafka-protocol request type (its `KEY` is the api key, its `Response`
+     the response body); `NAME`, `MIN_VERSION`, `MAX_VERSION` (advertised and enforced),
+     and `LANE` / `DEFERRED_REPLY` if not the defaults (main lane, reply after commit);
+   - `decode`: wire request → your data struct (return `Rejection::Reply` to answer an
+     invalid request with an error, `Rejection::Silent` to send nothing);
+   - `type Echo` + `echo` + `error_response`: what an error response needs from the request
+     (`()` when the response has a top-level error code; the requested topics/partitions/
+     groups otherwise, so every entry carries the code);
+   - `response_has_error` (metrics) and `handle`, usually
+     `call.run(request, |r, header| handlers::handle_x(&env.ctx, ...))`.
+3. Add `Variant => YourApi,` to `kafka_apis!` (and an `API_KEY_*` constant in `constants.rs`
+   if other code needs the key). The registry tests (`src/kafka/api/tests.rs`) then check that
+   every advertised version encodes and that the error responses encode.
+4. Add an E2E test under `kafka_test/src/` and register it in `kafka_test/src/main.rs`.
 
 ## E2E Testing Best Practices (kafka_test/)
 

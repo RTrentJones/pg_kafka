@@ -39,44 +39,12 @@ pub const API_SLOTS: usize = 64;
 /// How often the worker publishes metrics (when they changed).
 pub const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 
-/// The APIs pg_kafka implements, by wire API key. The first flush after a worker start writes a
-/// row for each, so stale values from a previous worker are reset.
-pub const KNOWN_APIS: &[(i16, &str)] = &[
-    (0, "Produce"),
-    (1, "Fetch"),
-    (2, "ListOffsets"),
-    (3, "Metadata"),
-    (8, "OffsetCommit"),
-    (9, "OffsetFetch"),
-    (10, "FindCoordinator"),
-    (11, "JoinGroup"),
-    (12, "Heartbeat"),
-    (13, "LeaveGroup"),
-    (14, "SyncGroup"),
-    (15, "DescribeGroups"),
-    (16, "ListGroups"),
-    (18, "ApiVersions"),
-    (19, "CreateTopics"),
-    (20, "DeleteTopics"),
-    (21, "DeleteRecords"),
-    (22, "InitProducerId"),
-    (24, "AddPartitionsToTxn"),
-    (25, "AddOffsetsToTxn"),
-    (26, "EndTxn"),
-    (28, "TxnOffsetCommit"),
-    (32, "DescribeConfigs"),
-    (37, "CreatePartitions"),
-    (42, "DeleteGroups"),
-    (44, "IncrementalAlterConfigs"),
-];
-
-/// Display name for an API key (`"Unknown"` for a key pg_kafka does not implement).
+/// Display name for an API key (`"Unknown"` for a key pg_kafka does not implement). The
+/// APIs and their names come from the API registry (`crate::kafka::api::APIS`); the first
+/// flush after a worker start writes a row for each, so stale values from a previous worker
+/// are reset.
 pub fn api_name(api_key: i16) -> &'static str {
-    KNOWN_APIS
-        .iter()
-        .find(|(k, _)| *k == api_key)
-        .map(|(_, n)| *n)
-        .unwrap_or("Unknown")
+    crate::kafka::api::api_name(api_key)
 }
 
 fn slot(api_key: i16) -> Option<usize> {
@@ -258,118 +226,9 @@ impl Drop for RequestTimer<'_> {
 }
 
 /// Whether a response carries a non-zero error code anywhere (top level, or on any topic,
-/// partition, group, member or resource entry).
+/// partition, group, member or resource entry); see `KafkaApi::response_has_error`.
 pub fn response_has_error(response: &KafkaResponse) -> bool {
-    match response {
-        KafkaResponse::ApiVersions { response, .. } => response.error_code != 0,
-        KafkaResponse::Metadata { response, .. } => {
-            response.error_code != 0
-                || response
-                    .topics
-                    .iter()
-                    .any(|t| t.error_code != 0 || t.partitions.iter().any(|p| p.error_code != 0))
-        }
-        KafkaResponse::Produce { response, .. } => response
-            .responses
-            .iter()
-            .flat_map(|t| t.partition_responses.iter())
-            .any(|p| p.error_code != 0),
-        KafkaResponse::Fetch { response, .. } => {
-            response.error_code != 0
-                || response
-                    .responses
-                    .iter()
-                    .flat_map(|t| t.partitions.iter())
-                    .any(|p| p.error_code != 0)
-        }
-        KafkaResponse::OffsetCommit { response, .. } => response
-            .topics
-            .iter()
-            .flat_map(|t| t.partitions.iter())
-            .any(|p| p.error_code != 0),
-        KafkaResponse::OffsetFetch { response, .. } => {
-            response.error_code != 0
-                || response
-                    .topics
-                    .iter()
-                    .flat_map(|t| t.partitions.iter())
-                    .any(|p| p.error_code != 0)
-                || response.groups.iter().any(|g| {
-                    g.error_code != 0
-                        || g.topics
-                            .iter()
-                            .flat_map(|t| t.partitions.iter())
-                            .any(|p| p.error_code != 0)
-                })
-        }
-        KafkaResponse::FindCoordinator { response, .. } => {
-            response.error_code != 0 || response.coordinators.iter().any(|c| c.error_code != 0)
-        }
-        KafkaResponse::JoinGroup { response, .. } => response.error_code != 0,
-        KafkaResponse::SyncGroup { response, .. } => response.error_code != 0,
-        KafkaResponse::Heartbeat { response, .. } => response.error_code != 0,
-        KafkaResponse::LeaveGroup { response, .. } => {
-            response.error_code != 0 || response.members.iter().any(|m| m.error_code != 0)
-        }
-        KafkaResponse::ListOffsets { response, .. } => response
-            .topics
-            .iter()
-            .flat_map(|t| t.partitions.iter())
-            .any(|p| p.error_code != 0),
-        KafkaResponse::DescribeGroups { response, .. } => {
-            response.groups.iter().any(|g| g.error_code != 0)
-        }
-        KafkaResponse::ListGroups { response, .. } => response.error_code != 0,
-        KafkaResponse::CreateTopics { response, .. } => {
-            response.topics.iter().any(|t| t.error_code != 0)
-        }
-        KafkaResponse::DeleteTopics { response, .. } => {
-            response.responses.iter().any(|t| t.error_code != 0)
-        }
-        KafkaResponse::CreatePartitions { response, .. } => {
-            response.results.iter().any(|r| r.error_code != 0)
-        }
-        KafkaResponse::DeleteGroups { response, .. } => {
-            response.results.iter().any(|r| r.error_code != 0)
-        }
-        KafkaResponse::InitProducerId { response, .. } => response.error_code != 0,
-        KafkaResponse::AddPartitionsToTxn { response, .. } => {
-            let topic_error = |t: &kafka_protocol::messages::add_partitions_to_txn_response::AddPartitionsToTxnTopicResult| {
-                t.results_by_partition
-                    .iter()
-                    .any(|p| p.partition_error_code != 0)
-            };
-            response.error_code != 0
-                || response
-                    .results_by_topic_v3_and_below
-                    .iter()
-                    .any(topic_error)
-                || response
-                    .results_by_transaction
-                    .iter()
-                    .flat_map(|r| r.topic_results.iter())
-                    .any(topic_error)
-        }
-        KafkaResponse::AddOffsetsToTxn { response, .. } => response.error_code != 0,
-        KafkaResponse::EndTxn { response, .. } => response.error_code != 0,
-        KafkaResponse::TxnOffsetCommit { response, .. } => response
-            .topics
-            .iter()
-            .flat_map(|t| t.partitions.iter())
-            .any(|p| p.error_code != 0),
-        KafkaResponse::DeleteRecords { response, .. } => response
-            .topics
-            .iter()
-            .flat_map(|t| t.partitions.iter())
-            .any(|p| p.error_code != 0),
-        KafkaResponse::DescribeConfigs { response, .. } => {
-            response.results.iter().any(|r| r.error_code != 0)
-        }
-        KafkaResponse::IncrementalAlterConfigs { response, .. } => {
-            response.responses.iter().any(|r| r.error_code != 0)
-        }
-        KafkaResponse::Error { error_code, .. } => *error_code != 0,
-    }
+    response.body.has_error()
 }
 
 /// Counters for one API at one instant.
@@ -589,7 +448,7 @@ fn build_batch(published: Option<&Snapshot>, snapshot: Snapshot) -> Option<Flush
             match published {
                 None => {
                     snapshot.apis[i] != ApiStats::default()
-                        || KNOWN_APIS.iter().any(|(k, _)| *k == key)
+                        || crate::kafka::api::api_info(key).is_some()
                 }
                 Some(prev) => prev.apis[i] != snapshot.apis[i],
             }
@@ -646,16 +505,18 @@ mod tests {
     };
 
     fn produce_response(code: i16) -> KafkaResponse {
-        KafkaResponse::Produce {
-            correlation_id: 1,
-            api_version: 9,
-            response: ProduceResponse::default().with_responses(vec![
-                TopicProduceResponse::default().with_partition_responses(vec![
-                    PartitionProduceResponse::default(),
-                    PartitionProduceResponse::default().with_error_code(code),
-                ]),
-            ]),
-        }
+        KafkaResponse::new(
+            1,
+            9,
+            crate::kafka::api::ResponseBody::Produce(ProduceResponse::default().with_responses(
+                vec![
+                    TopicProduceResponse::default().with_partition_responses(vec![
+                        PartitionProduceResponse::default(),
+                        PartitionProduceResponse::default().with_error_code(code),
+                    ]),
+                ],
+            )),
+        )
     }
 
     #[test]
@@ -772,34 +633,41 @@ mod tests {
         assert!(!response_has_error(&produce_response(0)));
         assert!(response_has_error(&produce_response(3)));
 
-        let fetch = |top: i16, part: i16| KafkaResponse::Fetch {
-            correlation_id: 1,
-            api_version: 12,
-            response: FetchResponse::default()
-                .with_error_code(top)
-                .with_responses(vec![FetchableTopicResponse::default()
-                    .with_partitions(vec![PartitionData::default().with_error_code(part)])]),
+        let fetch = |top: i16, part: i16| {
+            KafkaResponse::new(
+                1,
+                12,
+                crate::kafka::api::ResponseBody::Fetch(
+                    FetchResponse::default()
+                        .with_error_code(top)
+                        .with_responses(vec![FetchableTopicResponse::default().with_partitions(
+                            vec![PartitionData::default().with_error_code(part)],
+                        )]),
+                ),
+            )
         };
         assert!(!response_has_error(&fetch(0, 0)));
         assert!(response_has_error(&fetch(0, 1)));
         assert!(response_has_error(&fetch(15, 0)));
 
-        assert!(response_has_error(&KafkaResponse::Error {
-            correlation_id: 1,
-            error_code: 35,
-            error_message: None,
-        }));
-        assert!(!response_has_error(&KafkaResponse::Heartbeat {
-            correlation_id: 1,
-            api_version: 4,
-            response: Default::default(),
-        }));
-        assert!(response_has_error(&KafkaResponse::Heartbeat {
-            correlation_id: 1,
-            api_version: 4,
-            response: kafka_protocol::messages::heartbeat_response::HeartbeatResponse::default()
-                .with_error_code(27),
-        }));
+        assert!(response_has_error(&KafkaResponse::new(
+            1,
+            0,
+            crate::kafka::api::ResponseBody::UnknownApi { error_code: 35 }
+        )));
+        assert!(!response_has_error(&KafkaResponse::new(
+            1,
+            4,
+            crate::kafka::api::ResponseBody::Heartbeat(Default::default())
+        )));
+        assert!(response_has_error(&KafkaResponse::new(
+            1,
+            4,
+            crate::kafka::api::ResponseBody::Heartbeat(
+                kafka_protocol::messages::heartbeat_response::HeartbeatResponse::default()
+                    .with_error_code(27)
+            )
+        )));
     }
 
     #[test]
@@ -810,18 +678,26 @@ mod tests {
                 AddPartitionsToTxnPartitionResult::default().with_partition_error_code(code),
             ])
         };
-        let v3 = |code| KafkaResponse::AddPartitionsToTxn {
-            correlation_id: 1,
-            api_version: 3,
-            response: AddPartitionsToTxnResponse::default()
-                .with_results_by_topic_v3_and_below(vec![topic(code)]),
+        let v3 = |code| {
+            KafkaResponse::new(
+                1,
+                3,
+                crate::kafka::api::ResponseBody::AddPartitionsToTxn(
+                    AddPartitionsToTxnResponse::default()
+                        .with_results_by_topic_v3_and_below(vec![topic(code)]),
+                ),
+            )
         };
-        let v4 = |code| KafkaResponse::AddPartitionsToTxn {
-            correlation_id: 1,
-            api_version: 4,
-            response: AddPartitionsToTxnResponse::default().with_results_by_transaction(vec![
-                AddPartitionsToTxnResult::default().with_topic_results(vec![topic(code)]),
-            ]),
+        let v4 = |code| {
+            KafkaResponse::new(
+                1,
+                4,
+                crate::kafka::api::ResponseBody::AddPartitionsToTxn(
+                    AddPartitionsToTxnResponse::default()
+                        .with_results_by_transaction(vec![AddPartitionsToTxnResult::default()
+                            .with_topic_results(vec![topic(code)])]),
+                ),
+            )
         };
         assert!(!response_has_error(&v3(0)));
         assert!(response_has_error(&v3(48)));
@@ -835,16 +711,10 @@ mod tests {
         assert_eq!(api_name(1), "Fetch");
         assert_eq!(api_name(44), "IncrementalAlterConfigs");
         assert_eq!(api_name(7), "Unknown");
-        assert!(KNOWN_APIS.iter().all(|(k, _)| (*k as usize) < API_SLOTS));
-        // Every API the protocol layer advertises has a name here.
-        for (key, _, _) in crate::kafka::response_builders::API_VERSION_RANGES.iter() {
-            assert_ne!(
-                api_name(*key),
-                "Unknown",
-                "API key {} has no metrics name",
-                key
-            );
-        }
+        // Every registered API has a counter slot.
+        assert!(crate::kafka::api::APIS
+            .iter()
+            .all(|info| (info.key as usize) < API_SLOTS));
     }
 
     #[test]
@@ -854,7 +724,7 @@ mod tests {
         let batch = f
             .poll_at(Instant::now(), 0, 0)
             .expect("first flush resets the tables");
-        assert_eq!(batch.api_rows.len(), KNOWN_APIS.len());
+        assert_eq!(batch.api_rows.len(), crate::kafka::api::APIS.len());
         assert!(batch
             .api_rows
             .iter()

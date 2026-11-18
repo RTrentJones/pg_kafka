@@ -99,11 +99,11 @@ impl JoinGroupReply {
     fn send_inner(&mut self, response: JoinGroupResponse) {
         if let Some(tx) = self.response_tx.take() {
             if tx
-                .send(crate::kafka::KafkaResponse::JoinGroup {
-                    correlation_id: self.correlation_id,
-                    api_version: self.api_version,
-                    response,
-                })
+                .send(crate::kafka::KafkaResponse::new(
+                    self.correlation_id,
+                    self.api_version,
+                    crate::kafka::api::ResponseBody::JoinGroup(response),
+                ))
                 .is_err()
             {
                 crate::pg_debug!(
@@ -280,11 +280,11 @@ impl SyncGroupReply {
     fn send_inner(&mut self, response: SyncGroupResponse) {
         if let Some(tx) = self.response_tx.take() {
             if tx
-                .send(crate::kafka::KafkaResponse::SyncGroup {
-                    correlation_id: self.correlation_id,
-                    api_version: self.api_version,
-                    response,
-                })
+                .send(crate::kafka::KafkaResponse::new(
+                    self.correlation_id,
+                    self.api_version,
+                    crate::kafka::api::ResponseBody::SyncGroup(response),
+                ))
                 .is_err()
             {
                 crate::pg_debug!(
@@ -837,10 +837,10 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         JoinGroupReply::new(7, 5, tx.clone()).send(JoinGroupResponse::default());
         match rx.try_recv().unwrap() {
-            crate::kafka::KafkaResponse::JoinGroup {
+            crate::kafka::KafkaResponse {
                 correlation_id,
                 api_version,
-                response,
+                body: crate::kafka::api::ResponseBody::JoinGroup(response),
             } => {
                 assert_eq!((correlation_id, api_version), (7, 5));
                 assert_eq!(response.error_code, ERROR_NONE);
@@ -851,9 +851,9 @@ mod tests {
 
         drop(JoinGroupReply::new(8, 5, tx.clone()));
         match rx.try_recv().unwrap() {
-            crate::kafka::KafkaResponse::JoinGroup {
+            crate::kafka::KafkaResponse {
                 correlation_id,
-                response,
+                body: crate::kafka::api::ResponseBody::JoinGroup(response),
                 ..
             } => {
                 assert_eq!(correlation_id, 8);
@@ -924,10 +924,10 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         SyncGroupReply::new(7, 3, tx.clone()).send(SyncGroupResponse::default());
         match rx.try_recv().unwrap() {
-            crate::kafka::KafkaResponse::SyncGroup {
+            crate::kafka::KafkaResponse {
                 correlation_id,
                 api_version,
-                response,
+                body: crate::kafka::api::ResponseBody::SyncGroup(response),
             } => {
                 assert_eq!((correlation_id, api_version), (7, 3));
                 assert_eq!(response.error_code, ERROR_NONE);
@@ -938,9 +938,9 @@ mod tests {
 
         drop(SyncGroupReply::new(8, 3, tx.clone()));
         match rx.try_recv().unwrap() {
-            crate::kafka::KafkaResponse::SyncGroup {
+            crate::kafka::KafkaResponse {
                 correlation_id,
-                response,
+                body: crate::kafka::api::ResponseBody::SyncGroup(response),
                 ..
             } => {
                 assert_eq!(correlation_id, 8);
