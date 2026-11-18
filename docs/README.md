@@ -17,6 +17,7 @@
 | [SHADOW_MODE_FLOW_DIAGRAM.md](SHADOW_MODE_FLOW_DIAGRAM.md) | Shadow mode architecture |
 | [SHADOW_EVIDENCE_PLAN.md](SHADOW_EVIDENCE_PLAN.md) | Plan for publishing shadow-forwarding evidence (`evidence/shadow/`) |
 | [LICENSING.md](LICENSING.md) | Dual-licensing information |
+| [UPGRADING.md](UPGRADING.md) | Extension versions, upgrade scripts, roles after 0.1.0 |
 | [FULL_KAFKA_COMPLIANCE_PLAN.md](FULL_KAFKA_COMPLIANCE_PLAN.md) | Roadmap (future phases) |
 
 ## Architecture Decisions

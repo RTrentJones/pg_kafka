@@ -1591,6 +1591,20 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
         self.inner.get_log_start_offset(topic_id, partition_id)
     }
 
+    fn get_partition_bounds(
+        &self,
+        topic_id: i32,
+        partition_id: i32,
+        isolation_level: crate::kafka::storage::IsolationLevel,
+    ) -> Result<crate::kafka::storage::PartitionBounds> {
+        // SH-6: same suppression as the single-value bound methods above.
+        if self.suppress_external_primary_reads(topic_id) {
+            return Ok(crate::kafka::storage::PartitionBounds::default());
+        }
+        self.inner
+            .get_partition_bounds(topic_id, partition_id, isolation_level)
+    }
+
     fn get_offset_for_timestamp(
         &self,
         topic_id: i32,

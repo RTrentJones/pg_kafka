@@ -281,6 +281,8 @@ kafka_test/             # E2E test suite (221 tests)
 
 sql/
 ├── bootstrap.sql       # Schema definition (kafka.messages, kafka.topics, kafka.consumer_offsets, ...)
+├── pg_kafka--0.0.0--0.1.0.sql  # Upgrade script (ALTER EXTENSION pg_kafka UPDATE; see docs/UPGRADING.md)
+├── upgrade-test/       # Frozen 0.0.0 install script used by scripts/check-upgrade.sh
 └── tune_autovacuum.sql # Optional performance tuning script
 
 docs/
@@ -296,6 +298,7 @@ docs/
 ├── SHADOW_MODE_FLOW_DIAGRAM.md # Shadow mode flow diagram
 ├── SHADOW_EVIDENCE_PLAN.md     # Shadow forwarding evidence/reporting plan
 ├── LICENSING.md                # Dual-licensing model
+├── UPGRADING.md                # Extension versioning and the ALTER EXTENSION UPDATE procedure
 ├── AUDIT-2026-06.md            # June 2026 code audit
 ├── DEEP-REVIEW-2026-07.md      # July 2026 deep review
 └── architecture/
@@ -304,6 +307,7 @@ docs/
 
 scripts/
 ├── restart.sh          # Quick rebuild and restart script for development
+├── check-upgrade.sh    # CI: 0.0.0 -> current upgrade must match a fresh install
 ├── run-shadow-tests.sh # Sets up Docker + PostgreSQL and runs the shadow E2E tests
 ├── generate-evidence.sh  # Builds the evidence artifacts (conformance, bench, session, shadow)
 └── record-session.sh   # Records the kcat produce/consume session as an animated SVG
@@ -506,6 +510,13 @@ CREATE TABLE kafka.txn_pending_offsets (
 - `txn_pending_offsets`: Pending offset commits until transaction completes
 - `messages.txn_state`: Controls visibility (NULL=visible, 'pending'=invisible to read_committed)
 
+**Roles (0.1.0):** the extension creates two NOLOGIN roles. `pgkafka_reader` has read-only
+access to the kafka schema (nothing is granted to PUBLIC any more; grant this role to readers).
+`pgkafka_worker` holds exactly the privileges the worker's SQL needs (listed in
+`src/kafka/storage/privileges.rs`, whose unit tests check the GRANTs in `sql/bootstrap.sql` and
+scan the worker's SQL for uncovered tables/verbs). A new worker statement on a new table, or a new
+worker-written table (e.g. a metrics table), needs a matching GRANT plus an entry there.
+
 **SQL Functions** (from `src/lib.rs`, in the `public` schema):
 - `pg_kafka_run_retention_sweep(message_retention_hours INT DEFAULT NULL, aborted_grace_seconds BIGINT DEFAULT 60)`: Runs one retention sweep on demand (the worker runs the same sweep periodically) and returns `(category, deleted)` rows for `aborted_messages`, `expired_messages`, `stale_producers`, `terminal_transactions`, `shadow_delivered_rows`. A NULL first argument uses `pg_kafka.message_retention_hours`.
 - `hello_pg_kafka()`: Smoke-test function returning `'Hello, pg_kafka'`.
@@ -527,6 +538,8 @@ pg_kafka.compression_type = 'none' -- Outbound compression (none, gzip, snappy, 
 pg_kafka.log_timing = false       -- Enable timing instrumentation for benchmarking
 pg_kafka.enable_long_polling = true  -- Enable long polling for FetchRequest
 pg_kafka.fetch_poll_interval_ms = 100  -- Fallback polling interval (10-5000ms)
+pg_kafka.run_as_role = 'pgkafka_worker' -- Role the worker switches to once the schema exists ('' = stay bootstrap superuser;
+                                          -- a missing role or privilege logs a WARNING and keeps the superuser)
 
 -- Reloadable (GucContext::Sighup, pg_reload_conf())
 pg_kafka.message_retention_hours = 0 -- Retention sweep for kafka.messages (0 = keep forever; 0-87600; DR-2)

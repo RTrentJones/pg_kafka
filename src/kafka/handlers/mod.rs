@@ -45,7 +45,7 @@ pub use coordinator::{
     handle_describe_groups, handle_find_coordinator, handle_heartbeat, handle_join_group,
     handle_leave_group, handle_list_groups, handle_sync_group,
 };
-pub use fetch::{handle_fetch, handle_list_offsets};
+pub use fetch::{handle_fetch, handle_fetch_with_max_bytes, handle_list_offsets};
 pub use helpers::{resolve_topic_id, topic_resolution_error_code, TopicResolution};
 pub use init_producer_id::handle_init_producer_id;
 pub use metadata::{handle_api_versions, handle_metadata};

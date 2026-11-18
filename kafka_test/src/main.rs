@@ -148,8 +148,10 @@ use kafka_test::{
     test_fetch_advertised_minimum_is_usable,
     test_fetch_after_offset_reset,
     test_fetch_bad_partition_or_offset_returns_error,
+    test_fetch_bounds_from_single_statement,
     test_fetch_committed_no_history,
     test_fetch_from_new_partition,
+    test_fetch_honours_request_max_bytes,
     test_fetch_into_cleaned_up_aborted_rows_is_in_range,
     test_fetch_invalid_partition,
     test_fetch_isolation_level_enforcement,
@@ -271,6 +273,7 @@ use kafka_test::{
     // Pipelining tests
     test_request_pipelining,
     test_response_ordering_with_long_poll,
+    test_retention_sweep_catches_up_on_backlog,
     // Retention sweep tests (DR-1/DR-2)
     test_retention_sweep_expires_old_messages,
     test_retention_sweep_reclaims_aborted_messages,
@@ -292,6 +295,7 @@ use kafka_test::{
     test_txn_offset_commit_failure_reports_partition_errors,
     test_txn_offset_commit_visibility_timing,
     test_unknown_api_key_handling,
+    test_worker_runs_as_least_privilege_role,
     test_zero_percent_forwarding,
 };
 // lifecycle workstream (error_paths/lifecycle_tests.rs)
@@ -834,6 +838,30 @@ fn get_all_tests() -> Vec<TestDef> {
             category: "error_paths",
             name: "test_active_idempotent_producer_survives_retention_sweep",
             test_fn: wrap_test!(test_active_idempotent_producer_survives_retention_sweep),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_fetch_bounds_from_single_statement",
+            test_fn: wrap_test!(test_fetch_bounds_from_single_statement),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_fetch_honours_request_max_bytes",
+            test_fn: wrap_test!(test_fetch_honours_request_max_bytes),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_worker_runs_as_least_privilege_role",
+            test_fn: wrap_test!(test_worker_runs_as_least_privilege_role),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_retention_sweep_catches_up_on_backlog",
+            test_fn: wrap_test!(test_retention_sweep_catches_up_on_backlog),
             parallel_safe: true,
         },
         TestDef {

@@ -353,6 +353,17 @@ jobs:
       env:
         DATABASE_URL: postgresql://${{ env.DB_USER }}@localhost:${{ env.PG_PORT }}/postgres
 
+    - name: Check Extension Upgrade Path
+      # The 0.0.0 -> current ALTER EXTENSION UPDATE path must produce exactly the schema
+      # of a fresh install (columns, indexes, ACLs, roles) and keep data. Uses two
+      # scratch databases on the running cluster; the worker only serves 'postgres'.
+      # See docs/UPGRADING.md.
+      timeout-minutes: 2
+      run: |
+        PG_CONFIG=$(find ~/.pgrx -name pg_config -type f -executable 2>/dev/null | grep "14\." | head -n 1)
+        PG_CONFIG="$PG_CONFIG" PGHOST=localhost PGPORT=${{ env.PG_PORT }} PGUSER=${{ env.DB_USER }} \
+          scripts/check-upgrade.sh
+
     - name: Dump Postgres Logs (On Failure)
       if: failure()
       run: |

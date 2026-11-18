@@ -643,6 +643,9 @@ pub fn init() {
         GucFlags::default(),
     );
 
+    // 0.1.0 least privilege: pg_kafka.run_as_role (storage::privileges).
+    crate::kafka::storage::privileges::register_gucs();
+
     pgrx::log!("pg_kafka GUC parameters initialized (including shadow mode)");
 }
 

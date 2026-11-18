@@ -327,6 +327,9 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
         exit_for_restart();
     }
 
+    // 0.1.0: drop from the bootstrap superuser to pg_kafka.run_as_role.
+    crate::kafka::storage::postgres::apply_worker_role();
+
     log!(
         "pg_kafka background worker started (port: {}, host: {}, database: {})",
         config.port,
@@ -1406,6 +1409,7 @@ pub fn process_request(
         crate::kafka::KafkaRequest::Fetch {
             correlation_id,
             api_version,
+            max_bytes,
             topic_data,
             isolation_level,
             response_tx,
@@ -1421,7 +1425,7 @@ pub fn process_request(
             dispatch_response(
                 "Fetch",
                 response_tx,
-                || handlers::handle_fetch(&ctx, topic_data, isolation),
+                || handlers::handle_fetch_with_max_bytes(&ctx, topic_data, isolation, max_bytes),
                 |r| KafkaResponse::Fetch {
                     correlation_id,
                     api_version,

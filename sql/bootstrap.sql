@@ -13,6 +13,31 @@
 -- Create kafka schema for all extension objects
 CREATE SCHEMA IF NOT EXISTS kafka;
 
+-- Least-privilege roles (0.1.0). Roles are cluster-wide and are not extension
+-- members, so they are created only if missing (a second database's CREATE EXTENSION,
+-- or a reinstall, reuses them) and DROP EXTENSION leaves them behind. Names cannot
+-- start with the reserved "pg_" prefix.
+--   pgkafka_reader: read-only access; replaces the former GRANT SELECT ... TO PUBLIC,
+--                   which exposed every stored message to every role. Grant it to
+--                   the roles that should read pg_kafka data.
+--   pgkafka_worker: exactly what the background worker's SQL needs (derived from the
+--                   statements in storage/postgres.rs, shadow/store.rs and the
+--                   retention sweep; see storage/privileges.rs, whose unit tests
+--                   check these GRANTs). The worker switches to it via
+--                   pg_kafka.run_as_role once this schema exists.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'pgkafka_reader') THEN
+        CREATE ROLE pgkafka_reader NOLOGIN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'pgkafka_worker') THEN
+        CREATE ROLE pgkafka_worker NOLOGIN;
+    END IF;
+END
+$$;
+GRANT USAGE ON SCHEMA kafka TO pgkafka_reader;
+GRANT USAGE ON SCHEMA kafka TO pgkafka_worker;
+
 -- Topics table: Metadata about topics
 CREATE TABLE kafka.topics (
     id SERIAL PRIMARY KEY,
@@ -25,11 +50,10 @@ CREATE TABLE kafka.topics (
     retention_ms BIGINT,
     created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
--- Idempotent guard for the additive column above. pg_kafka follows a
--- fresh-install (CREATE EXTENSION) schema convention with no upgrade scripts,
--- so this is not auto-run on an in-place upgrade; it makes re-applying this
--- file a no-op and gives operators an explicit, copy-pasteable manual upgrade
--- path (run this one statement) instead of a runtime "column does not exist".
+-- Idempotent guard for the additive column above: re-applying this file is a
+-- no-op. Existing installs get schema changes from the versioned upgrade scripts
+-- (sql/pg_kafka--<from>--<to>.sql, run by ALTER EXTENSION pg_kafka UPDATE; see
+-- docs/UPGRADING.md), which repeat this statement for 0.0.0 installs that predate it.
 ALTER TABLE kafka.topics ADD COLUMN IF NOT EXISTS retention_ms BIGINT;
 
 -- Messages table: The actual message log with dual-offset design
@@ -64,10 +88,20 @@ CREATE TABLE kafka.messages (
     UNIQUE (global_offset)
 );
 
--- Index for Kafka fetch queries (by topic/partition/offset range)
--- Supports: SELECT * FROM kafka.messages WHERE topic_id = ? AND partition_id = ? AND partition_offset >= ? LIMIT ?
-CREATE INDEX idx_messages_topic_partition_offset
-ON kafka.messages(topic_id, partition_id, partition_offset);
+-- Kafka fetch queries (WHERE topic_id = ? AND partition_id = ? AND partition_offset >= ?)
+-- are served by the primary key's btree on (topic_id, partition_id, partition_offset).
+-- There is deliberately no separate index on those columns: the former
+-- idx_messages_topic_partition_offset duplicated the primary key exactly and only
+-- doubled write amplification on the hottest table (dropped in 0.1.0).
+
+-- Retention expiry scans (run_retention_sweep: WHERE topic_id = ? AND created_at < cutoff).
+-- BRIN, not btree: created_at grows with insertion order, so a BRIN summary per block
+-- range lets the sweep skip every block of still-retained messages at a tiny fraction of
+-- a btree's size and insert cost. autosummarize asks autovacuum to summarize each
+-- block range as it fills; an unsummarized range always matches, so without it the
+-- newest ranges would be rechecked until the next VACUUM. Added in 0.1.0.
+CREATE INDEX idx_messages_created_at_brin
+ON kafka.messages USING brin (created_at) WITH (autosummarize = on);
 
 -- Index for read_committed filtering (Phase 10: exclude pending transactional messages)
 -- Supports: SELECT * FROM kafka.messages WHERE ... AND (txn_state IS NULL)
@@ -124,13 +158,18 @@ CREATE INDEX idx_consumer_offsets_timestamp ON kafka.consumer_offsets(commit_tim
 -- rebalancing; nothing ever read or wrote the table, and its comment claimed
 -- "static assignment (no rebalancing)", contradicting the implementation.
 
--- Grant permissions
--- Background worker and extension functions run as superuser by default,
--- but we set up permissions for future user-facing functions
-GRANT USAGE ON SCHEMA kafka TO PUBLIC;
-GRANT SELECT ON kafka.topics TO PUBLIC;
-GRANT SELECT ON kafka.messages TO PUBLIC;
-GRANT SELECT ON kafka.consumer_offsets TO PUBLIC;
+-- Grant permissions (roles: see the top of this file)
+GRANT SELECT ON kafka.topics TO pgkafka_reader;
+GRANT SELECT ON kafka.messages TO pgkafka_reader;
+GRANT SELECT ON kafka.consumer_offsets TO pgkafka_reader;
+GRANT SELECT ON kafka.partition_offsets TO pgkafka_reader;
+GRANT SELECT, INSERT, UPDATE, DELETE ON kafka.topics TO pgkafka_worker;
+GRANT USAGE ON SEQUENCE kafka.topics_id_seq TO pgkafka_worker;
+GRANT SELECT, INSERT, UPDATE, DELETE ON kafka.messages TO pgkafka_worker;
+GRANT USAGE ON SEQUENCE kafka.messages_global_offset_seq TO pgkafka_worker;
+-- partition_offsets is only upserted; rows go with their topic (ON DELETE CASCADE).
+GRANT SELECT, INSERT, UPDATE ON kafka.partition_offsets TO pgkafka_worker;
+GRANT SELECT, INSERT, UPDATE, DELETE ON kafka.consumer_offsets TO pgkafka_worker;
 
 -- Comments for documentation
 COMMENT ON SCHEMA kafka IS 'pg_kafka extension schema for Kafka-compatible message storage';
@@ -194,8 +233,12 @@ CREATE TABLE kafka.producer_sequences (
 );
 
 -- Grant permissions for Phase 9 tables
-GRANT SELECT ON kafka.producer_ids TO PUBLIC;
-GRANT SELECT ON kafka.producer_sequences TO PUBLIC;
+GRANT SELECT ON kafka.producer_ids TO pgkafka_reader;
+GRANT SELECT ON kafka.producer_sequences TO pgkafka_reader;
+GRANT SELECT, INSERT, UPDATE, DELETE ON kafka.producer_ids TO pgkafka_worker;
+-- nextval() for new ids and the RV-13 epoch-exhaustion reallocation.
+GRANT USAGE ON SEQUENCE kafka.producer_ids_producer_id_seq TO pgkafka_worker;
+GRANT SELECT, INSERT, UPDATE, DELETE ON kafka.producer_sequences TO pgkafka_worker;
 
 -- Comments for Phase 9
 COMMENT ON TABLE kafka.producer_ids IS 'Producer ID allocation for idempotent producers. Each idempotent producer gets a unique ID and epoch.';
@@ -257,8 +300,10 @@ ON kafka.producer_ids(transactional_id)
 WHERE transactional_id IS NOT NULL;
 
 -- Grant permissions for Phase 10 tables
-GRANT SELECT ON kafka.transactions TO PUBLIC;
-GRANT SELECT ON kafka.txn_pending_offsets TO PUBLIC;
+GRANT SELECT ON kafka.transactions TO pgkafka_reader;
+GRANT SELECT ON kafka.txn_pending_offsets TO pgkafka_reader;
+GRANT SELECT, INSERT, UPDATE, DELETE ON kafka.transactions TO pgkafka_worker;
+GRANT SELECT, INSERT, UPDATE, DELETE ON kafka.txn_pending_offsets TO pgkafka_worker;
 
 -- Comments for Phase 10
 COMMENT ON TABLE kafka.transactions IS 'Transaction state tracking for transactional producers. One row per transactional_id.';
@@ -355,15 +400,18 @@ LEFT JOIN kafka.shadow_metrics sm ON t.id = sm.topic_id
 GROUP BY t.id, t.name, sc.mode, sc.forward_percentage, sc.sync_mode, sc.external_topic_name;
 
 -- Grant permissions
-GRANT SELECT ON kafka.shadow_config TO PUBLIC;
+GRANT SELECT ON kafka.shadow_config TO pgkafka_reader;
 -- RV-10 (SEC-8 class): error_message can hold raw external-broker error strings
 -- (authz failures, host/topic names, payload-size limits), so it is withheld from
--- PUBLIC. Grant only the non-sensitive columns column-by-column instead of the
--- whole row; the bgworker (table owner) keeps full access to error_message.
-GRANT SELECT (topic_id, partition_id, local_offset, external_offset, forwarded_at, retry_count)
-    ON kafka.shadow_tracking TO PUBLIC;
-GRANT SELECT ON kafka.shadow_metrics TO PUBLIC;
-GRANT SELECT ON kafka.shadow_status TO PUBLIC;
+-- the reader role. Grant only the non-sensitive columns column-by-column instead of
+-- the whole row; the worker role keeps full access to error_message.
+GRANT SELECT (topic_id, partition_id, local_offset, external_offset, forwarded_at, retry_count) ON kafka.shadow_tracking TO pgkafka_reader;
+GRANT SELECT ON kafka.shadow_metrics TO pgkafka_reader;
+GRANT SELECT ON kafka.shadow_status TO pgkafka_reader;
+-- The worker only reads shadow_config (operators manage it).
+GRANT SELECT ON kafka.shadow_config TO pgkafka_worker;
+GRANT SELECT, INSERT, UPDATE, DELETE ON kafka.shadow_tracking TO pgkafka_worker;
+GRANT SELECT, INSERT, UPDATE ON kafka.shadow_metrics TO pgkafka_worker;
 
 -- Comments
 COMMENT ON TABLE kafka.shadow_config IS 'Per-topic shadow mode configuration for forwarding to external Kafka.';
@@ -409,7 +457,10 @@ BEGIN
 END;
 $$;
 
-GRANT EXECUTE ON FUNCTION kafka.replay_shadow_messages(INT, BIGINT, BIGINT) TO PUBLIC;
+-- It writes the outbox and runs with the caller's rights: no longer executable by
+-- PUBLIC (functions are by default). Superusers run it, or GRANT EXECUTE explicitly
+-- to a role that also has INSERT/UPDATE on kafka.shadow_tracking.
+REVOKE EXECUTE ON FUNCTION kafka.replay_shadow_messages(INT, BIGINT, BIGINT) FROM PUBLIC;
 COMMENT ON FUNCTION kafka.replay_shadow_messages(INT, BIGINT, BIGINT) IS
     'Re-queue a range of stored messages into the shadow outbox for re-forwarding (replay/migration/recovery).';
 
@@ -516,7 +567,7 @@ SELECT
 FROM kafka.shadow_tracking
 WHERE external_offset IS NULL;
 
-GRANT SELECT ON kafka.metrics TO PUBLIC;
+GRANT SELECT ON kafka.metrics TO pgkafka_reader;
 
 COMMENT ON VIEW kafka.metrics IS 'Unified operational metrics view for monitoring pg_kafka health.
 Categories: topics, messages, consumer_groups, consumer_offsets, producers, transactions, shadow.

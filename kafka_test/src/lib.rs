@@ -141,6 +141,10 @@ pub use error_paths::{
 pub use error_paths::{
     test_failed_request_rolls_back_alone, test_group_commit_concurrent_acks_visible,
     test_group_commit_pipelined_produces_in_order, test_worker_restarts_after_terminate,
+// Storage workstream regressions (retention, fetch bounds, privileges)
+pub use error_paths::{
+    test_fetch_bounds_from_single_statement, test_fetch_honours_request_max_bytes,
+    test_retention_sweep_catches_up_on_backlog, test_worker_runs_as_least_privilege_role,
 };
 pub use negative::{
     test_connection_refused, test_duplicate_consumer_join, test_invalid_group_id,
