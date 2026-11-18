@@ -209,20 +209,6 @@ impl<A: KafkaApi> Call<A> {
         }
     }
 
-    /// The request's header.
-    pub fn header(&self) -> &RequestHeader {
-        &self.header
-    }
-
-    /// The response envelope for `response`.
-    pub fn response(&self, response: ResponseOf<A>) -> KafkaResponse {
-        KafkaResponse::new(
-            self.header.correlation_id,
-            self.header.api_version,
-            (self.wrap)(response),
-        )
-    }
-
     /// The request's header and the client's response sender, for an API that answers
     /// later ([`KafkaApi::DEFERRED_REPLY`]).
     pub fn into_parts(self) -> (RequestHeader, UnboundedSender<KafkaResponse>) {
@@ -419,12 +405,6 @@ impl ApiInfo {
 /// The registered API with `api_key`.
 pub fn api_info(api_key: i16) -> Option<&'static ApiInfo> {
     APIS.iter().find(|info| info.key == api_key)
-}
-
-/// Supported `(min_version, max_version)` of `api_key`, or `None` for an API pg_kafka does
-/// not serve.
-pub fn supported_version_range(api_key: i16) -> Option<(i16, i16)> {
-    api_info(api_key).map(|info| (info.min_version, info.max_version))
 }
 
 /// Display name of `api_key` (`"Unknown"` for an API pg_kafka does not serve).

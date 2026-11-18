@@ -142,8 +142,9 @@ impl LicenseValidator {
         &self.status
     }
 
-    /// Check if licensed (Valid or Evaluation)
-    #[allow(dead_code)]
+    /// Check if licensed (Valid or Evaluation). Only the tests ask; the worker logs
+    /// `status()` instead.
+    #[cfg(test)]
     pub fn is_licensed(&self) -> bool {
         matches!(
             self.status,

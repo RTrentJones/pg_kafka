@@ -79,13 +79,14 @@ fn registry_keys_are_unique_and_named() {
     for info in APIS {
         assert!(info.min_version <= info.max_version, "{}", info.name);
         assert_eq!(api_name(info.key), info.name);
+        let found = api_info(info.key).unwrap();
         assert_eq!(
-            supported_version_range(info.key),
-            Some((info.min_version, info.max_version))
+            (found.min_version, found.max_version),
+            (info.min_version, info.max_version)
         );
     }
     assert_eq!(api_name(7), "Unknown");
-    assert_eq!(supported_version_range(9999), None);
+    assert!(api_info(9999).is_none());
 }
 
 #[test]
