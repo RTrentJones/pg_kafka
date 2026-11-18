@@ -12,14 +12,14 @@
 there is one table to refresh when tests land. Counts drift between refreshes;
 the CI run is the source of truth.
 
-Counted at `babcd17` (2026-11):
+Counted on 2026-11-18, with the 0.1.0 change set (group commit, held JoinGroup/SyncGroup, metrics, roles):
 
 | Category | Count | Coverage |
 |----------|-------|----------|
-| Unit Tests | 746 | Core logic, handlers, storage, protocol, shadow (`src/`, includes in-module proptest fuzz harnesses) |
+| Unit Tests | 853 | Core logic, handlers, storage, protocol, shadow (`src/`, includes in-module proptest fuzz harnesses) |
 | Property Tests | 10 | `tests/property_tests.rs`: 8 proptest wire-format invariants + 2 boundary tests (CI-run) |
-| E2E Tests | 221 | Full protocol integration (`kafka_test/`, 18 categories) |
-| **Total** | **977** | |
+| E2E Tests | 240 | Full protocol integration (`kafka_test/`, 18 categories) |
+| **Total** | **1103** | |
 
 Regenerate (none of these needs a running broker):
 
@@ -38,15 +38,15 @@ are not counted above.
 
 | Module | Tests | Focus |
 |--------|-------|-------|
-| Shadow Mode (`kafka/shadow/`) | 128 | External forwarding, SASL/SSL settings, licensing, routing, outbox, config |
-| Handler Logic (`kafka/handlers/`) | 107 | All 26 API handlers, mostly with MockKafkaStore (`handlers/tests.rs` holds 80) |
-| Protocol (`kafka/protocol/`) | 105 | Decoding, encoding, RecordBatch framing, 4 proptest fuzz harnesses |
+| Shadow Mode (`kafka/shadow/`) | 148 | External forwarding, SASL/SSL settings, licensing, routing, outbox, config |
+| Handler Logic (`kafka/handlers/`) | 144 | All 26 API handlers, mostly with MockKafkaStore (`handlers/tests.rs` holds 80) |
+| Protocol (`kafka/protocol/`) | 110 | Decoding, encoding, RecordBatch framing, 4 proptest fuzz harnesses |
 | Assignment (`kafka/assignment/`) | 69 | Range, RoundRobin, Sticky algorithms, subscription/assignment codecs |
-| Storage Layer (`kafka/storage/tests.rs`) | 53 | KafkaStore trait, types, mock verification |
+| Storage Layer (`kafka/storage/`) | 80 | KafkaStore trait, types, mock verification |
 | Messages | 53 | Request/response types, size estimators |
 | Config | 36 | GUC configuration |
 | Response Builders | 35 | Response construction |
-| Coordinator | 28 | Group state management |
+| Coordinator | 60 | Group state management |
 | Testing Infrastructure (`testing/`) | 23 | Mocks, helpers |
 | Error Handling | 22 | Error code mapping, typed errors |
 | Partitioner | 9 | Murmur2 hash, key-based routing |
@@ -77,9 +77,9 @@ Per-category counts from `kafka_test --list` at the commit named in [Test Summar
 | Compression (`compression`) | 10 | gzip, snappy, lz4, zstd, roundtrip, edge cases |
 | Idempotent (`idempotent`) | 7 | InitProducerId, deduplication, epoch, multi-partition |
 | Transaction (`transaction`) | 20 | EOS, isolation levels, LSO, fencing, timeouts, atomicity |
-| Shadow (`shadow`) | 28 | Dual-write, external-only/local-only, percentage dial-up, topic mapping, outbox, transactions, replay |
+| Shadow (`shadow`) | 29 | Dual-write, external-only/local-only, percentage dial-up, topic mapping, outbox, transactions, replay |
 | Long Polling (`long_poll`) | 10 | Timeout, immediate return, producer wakeup, precision, per-connection cap |
-| Error Paths (`error_paths`) | 39 | Invalid partitions, unknown topics, coordinator errors, protocol/transaction/group regressions |
+| Error Paths (`error_paths`) | 57 | Invalid partitions, unknown topics, coordinator errors, protocol/transaction/group regressions |
 | Edge Cases (`edge_cases`) | 13 | Empty topics, large messages, boundary values, retention sweep |
 | Concurrent (`concurrent`) | 14 | Multi-producer, multi-consumer, pipelining, races, heartbeat bypass |
 | Negative (`negative`) | 5 | Connection refused, timeouts, invalid operations, superuser-only GUC |
