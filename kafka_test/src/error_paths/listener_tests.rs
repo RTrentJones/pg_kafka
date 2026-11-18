@@ -166,6 +166,21 @@ pub async fn test_listener_produce_wakes_long_poll_promptly() -> TestResult {
     produce_seed(&topic).await?;
     let hwm = high_watermark(&ctx, &topic).await?;
     let producer = create_producer()?;
+    // Warm the producer up (connection + metadata) on another topic, so the timing
+    // below measures the broker's wake-up and not a fresh client's first send.
+    let warmup_topic = ctx.unique_topic("listener-wake-warmup").await;
+    producer
+        .send(
+            FutureRecord::to(&warmup_topic).key("w").payload("w"),
+            Duration::from_secs(5),
+        )
+        .await
+        .map_err(|(e, _)| e)?;
+    // Metadata for the test topic too.
+    use rdkafka::producer::Producer;
+    producer
+        .client()
+        .fetch_metadata(Some(&topic), Duration::from_secs(5))?;
 
     println!("Step 1: long poll at offset {hwm} (max_wait_ms=10000)...");
     let started = Instant::now();

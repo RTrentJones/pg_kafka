@@ -56,7 +56,7 @@ pub async fn test_retention_sweep_catches_up_on_backlog() -> TestResult {
     ctx.db()
         .execute(
             "INSERT INTO kafka.messages (topic_id, partition_id, partition_offset, value, created_at)
-             SELECT $1, 0, g, 'v'::bytea, NOW() - INTERVAL '1 day' + g * INTERVAL '1 millisecond'
+             SELECT $1::int, 0, g, 'v'::bytea, NOW() - INTERVAL '1 day' + g * INTERVAL '1 millisecond'
              FROM generate_series(0::bigint, $2::bigint - 1) AS g",
             &[&topic_id, &RETENTION_BACKLOG],
         )
@@ -72,13 +72,13 @@ pub async fn test_retention_sweep_catches_up_on_backlog() -> TestResult {
     ctx.db()
         .execute(
             "INSERT INTO kafka.messages (topic_id, partition_id, partition_offset, value)
-             VALUES ($1, 0, $2, 'fresh'::bytea), ($1, 0, $2 + 1, 'fresh'::bytea)",
+             VALUES ($1, 0, $2::bigint, 'fresh'::bytea), ($1, 0, $2::bigint + 1, 'fresh'::bytea)",
             &[&topic_id, &RETENTION_BACKLOG],
         )
         .await?;
     ctx.db()
         .execute(
-            "UPDATE kafka.partition_offsets SET next_offset = $2 + 2 WHERE topic_id = $1",
+            "UPDATE kafka.partition_offsets SET next_offset = $2::bigint + 2 WHERE topic_id = $1",
             &[&topic_id, &RETENTION_BACKLOG],
         )
         .await?;
@@ -179,7 +179,7 @@ pub async fn test_fetch_bounds_from_single_statement() -> TestResult {
     println!("Step 2: read_committed fetch from offset 2...");
     let mut req = fetch_request(&topic.name, 0, 2, 0);
     req.isolation_level = 1;
-    let response = roundtrip(&mut stream, 4, 9101, &req).await?;
+    let response = roundtrip(&mut stream, 5, 9101, &req).await?;
     let p = &response.responses[0].partitions[0];
     println!(
         "   error={} hwm={} lso={} log_start={}",
@@ -195,14 +195,14 @@ pub async fn test_fetch_bounds_from_single_statement() -> TestResult {
     );
 
     println!("Step 3: read_uncommitted fetch reports LSO = HWM...");
-    let response = roundtrip(&mut stream, 4, 9102, &fetch_request(&topic.name, 0, 2, 0)).await?;
+    let response = roundtrip(&mut stream, 5, 9102, &fetch_request(&topic.name, 0, 2, 0)).await?;
     let p = &response.responses[0].partitions[0];
     assert_eq!(p.error_code, 0);
     assert_eq!(p.high_watermark, 6);
     assert_eq!(p.last_stable_offset, 6);
 
     println!("Step 4: fetch below the log start is out of range...");
-    let response = roundtrip(&mut stream, 4, 9103, &fetch_request(&topic.name, 0, 1, 0)).await?;
+    let response = roundtrip(&mut stream, 5, 9103, &fetch_request(&topic.name, 0, 1, 0)).await?;
     let p = &response.responses[0].partitions[0];
     assert_eq!(p.error_code, 1, "expected OFFSET_OUT_OF_RANGE (1)");
     assert_eq!(p.log_start_offset, 2);
