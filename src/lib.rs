@@ -105,15 +105,27 @@ pub unsafe extern "C-unwind" fn _PG_init() {
     // - name: Identifier shown in pg_stat_activity
     // - function: The Rust function to run (entry point)
     // - library: Must match the shared library name (pg_kafka.so)
-    // - start_time: When to start (PostmasterStart = at server startup)
+    // - start_time: RecoveryFinished. The worker needs a database connection
+    //   (SPI), and Postgres only allows that once recovery has finished; pgrx's
+    //   enable_spi_access() forces this start time anyway. Consequence: the
+    //   listener does NOT run on a hot standby — it starts on a primary, or on a
+    //   standby only once it has been promoted.
+    // - restart_time: if the worker exits for any reason other than a clean
+    //   unregister (exit code 0) — a FATAL error, a failed bind, a caught commit
+    //   failure, or `pg_terminate_backend()` on its pid — the postmaster starts a
+    //   fresh one after WORKER_RESTART_INTERVAL. Without it any worker exit left
+    //   the Kafka port dead until Postgres itself was restarted. The worker exits
+    //   with code 1 on SIGTERM for this reason (see worker::exit_for_restart);
+    //   during a server shutdown the postmaster does not restart workers.
     //
     // enable_spi_access() allows the worker to connect to the database and
-    // execute SQL queries (we'll use this in Phase 2).
+    // execute SQL queries.
     pgrx::log!("pg_kafka: Registering background worker 'pg_kafka_listener'");
     BackgroundWorkerBuilder::new("pg_kafka_listener")
         .set_function("pg_kafka_listener_main")
         .set_library("pg_kafka")
-        .set_start_time(BgWorkerStartTime::PostmasterStart)
+        .set_start_time(BgWorkerStartTime::RecoveryFinished)
+        .set_restart_time(Some(worker::WORKER_RESTART_INTERVAL))
         .enable_spi_access()
         .load();
 

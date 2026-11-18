@@ -179,6 +179,84 @@ fn verify_schema(database: &str) -> Result<(), String> {
     }
 }
 
+/// How often `wait_for_schema` re-checks for the kafka schema.
+const SCHEMA_CHECK_INTERVAL: Duration = Duration::from_millis(500);
+
+/// How often `wait_for_schema` repeats its "waiting for schema" LOG line.
+const SCHEMA_WAIT_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Whether the schema wait should log on this check: on the first failed check,
+/// then once per `SCHEMA_WAIT_LOG_INTERVAL`, so an instance that never runs
+/// `CREATE EXTENSION` does not fill the log.
+fn schema_wait_should_log(waited: Duration, last_logged: Option<Duration>) -> bool {
+    match last_logged {
+        None => true,
+        Some(last) => waited.saturating_sub(last) >= SCHEMA_WAIT_LOG_INTERVAL,
+    }
+}
+
+/// Block until the kafka schema exists in `database`. Returns `false` if SIGTERM
+/// arrived first.
+///
+/// The worker starts when Postgres finishes recovery, but `CREATE EXTENSION` may
+/// not have run yet (or may run much later). The wait is unbounded: it used to
+/// give up after 60 s and exit, and since nothing restarted the worker the Kafka
+/// port then stayed dead until Postgres was restarted even after the extension
+/// was created. Postgres has no cross-process event for "schema created", so this
+/// polls; `wait_latch` sleeps on the process latch, which SIGTERM sets, so
+/// shutdown is not delayed by the poll interval.
+fn wait_for_schema(database: &str) -> bool {
+    let mut waited = Duration::ZERO;
+    let mut last_logged: Option<Duration> = None;
+    loop {
+        // SPI calls require a transaction context
+        match BackgroundWorker::transaction(|| verify_schema(database)) {
+            Ok(()) => {
+                if last_logged.is_some() {
+                    log!(
+                        "pg_kafka schema found after waiting {} ms",
+                        waited.as_millis()
+                    );
+                }
+                return true;
+            }
+            Err(e) => {
+                if schema_wait_should_log(waited, last_logged) {
+                    log!(
+                        "Waiting for pg_kafka schema (run 'CREATE EXTENSION pg_kafka' in database '{}'): {}",
+                        database,
+                        e
+                    );
+                    last_logged = Some(waited);
+                }
+            }
+        }
+        // wait_latch returns false once SIGTERM has been received (it consumes the
+        // flag) or the postmaster has died.
+        if !BackgroundWorker::wait_latch(Some(SCHEMA_CHECK_INTERVAL)) {
+            return false;
+        }
+        waited = waited.saturating_add(SCHEMA_CHECK_INTERVAL);
+    }
+}
+
+/// Exit the worker process with status 1 so the postmaster restarts it after
+/// `WORKER_RESTART_INTERVAL`.
+///
+/// A bgworker that returns from its main function exits with status 0, which
+/// tells the postmaster to unregister it for good. That is wrong for every exit
+/// this worker makes: a SIGTERM from `pg_terminate_backend()` or the network
+/// thread dying should both lead to a fresh worker. During a server shutdown the
+/// postmaster does not restart workers, so status 1 is also correct there (it is
+/// what Postgres's own default SIGTERM handler for bgworkers does).
+fn exit_for_restart() -> ! {
+    unsafe { pg_sys::proc_exit(1) }
+}
+
+/// How long the postmaster waits before restarting a worker that exited
+/// (registered in `_PG_init`).
+pub const WORKER_RESTART_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Extract producer metadata from the first partition with valid metadata (Phase 9)
 ///
 /// Idempotent producers embed producer_id, producer_epoch, and base_sequence in the
@@ -231,54 +309,9 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     BackgroundWorker::connect_worker_to_spi(Some(&config.database), None);
 
     // Step 3b: Wait for schema to exist before starting listener
-    // The background worker starts when Postgres boots, but CREATE EXTENSION
-    // may not have run yet. We retry with a delay to handle this timing issue.
-    //
-    // Design note: We use polling (500ms interval) rather than event-based notification
-    // because PostgreSQL doesn't provide a cross-process notification mechanism for
-    // schema creation that works reliably during startup. The polling overhead is
-    // minimal since this only runs once at startup, and 500ms strikes a balance
-    // between responsiveness and CPU usage. The loop also checks SIGTERM to ensure
-    // clean shutdown if Postgres stops before the schema is ready.
-    const MAX_SCHEMA_WAIT_MS: u64 = 60_000; // 60 seconds max wait
-    const SCHEMA_CHECK_INTERVAL_MS: u64 = 500;
-    let mut waited_ms = 0u64;
-    let database_name = config.database.clone();
-    loop {
-        // SPI calls require a transaction context
-        let result = BackgroundWorker::transaction(|| verify_schema(&database_name));
-        match result {
-            Ok(()) => {
-                if waited_ms > 0 {
-                    log!("pg_kafka schema found after waiting {} ms", waited_ms);
-                }
-                break;
-            }
-            Err(e) => {
-                if waited_ms >= MAX_SCHEMA_WAIT_MS {
-                    pgrx::error!(
-                        "pg_kafka schema not initialized after {} seconds: {}. \
-                         Run 'CREATE EXTENSION pg_kafka' in database '{}'",
-                        MAX_SCHEMA_WAIT_MS / 1000,
-                        e,
-                        config.database
-                    );
-                }
-                if waited_ms == 0 {
-                    log!(
-                        "Waiting for pg_kafka schema (run 'CREATE EXTENSION pg_kafka' in database '{}')",
-                        config.database
-                    );
-                }
-                std::thread::sleep(std::time::Duration::from_millis(SCHEMA_CHECK_INTERVAL_MS));
-                waited_ms = waited_ms.saturating_add(SCHEMA_CHECK_INTERVAL_MS);
-            }
-        }
-        // Check for shutdown signal while waiting
-        if BackgroundWorker::sigterm_received() {
-            log!("Shutdown signal received while waiting for schema");
-            return;
-        }
+    if !wait_for_schema(&config.database) {
+        log!("Shutdown signal received while waiting for schema");
+        exit_for_restart();
     }
 
     log!(
@@ -383,6 +416,13 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     // Tokio resources are tied to the runtime that created them. If we created a
     // tokio listener here and dropped the runtime, the listener would be broken.
     // Instead, we bind with std, then convert to tokio in the network thread.
+    //
+    // Restart path: a restarted worker binds again here. The previous worker's
+    // listening socket closed with its process, and std's bind sets SO_REUSEADDR
+    // on Unix, so lingering TIME_WAIT connections from the old process do not
+    // block the new bind. If the bind still fails (port taken by something
+    // else), pgrx::error! exits the worker with status 1 and the postmaster
+    // retries after WORKER_RESTART_INTERVAL.
     let bind_addr = format!("{}:{}", host, port);
 
     let std_listener = match std::net::TcpListener::bind(&bind_addr) {
@@ -565,7 +605,9 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
                 std::thread::sleep(Duration::from_millis(10));
             }
 
-            break;
+            // Status 1, not a plain return: a SIGTERM from pg_terminate_backend()
+            // must lead to a restarted worker (see exit_for_restart).
+            exit_for_restart();
         }
 
         // ┌─────────────────────────────────────────────────────────────┐
@@ -763,9 +805,13 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
             }
 
             Err(RecvTimeoutError::Disconnected) => {
-                // Channel closed - network thread has exited
-                log!("Request channel disconnected, shutting down");
-                break;
+                // Channel closed - the network thread has exited, so nothing is
+                // serving the Kafka port. Exit for a restart rather than
+                // unregistering the worker for good.
+                pg_warning!(
+                    "Request channel disconnected (network thread exited); restarting worker"
+                );
+                exit_for_restart();
             }
         }
 
@@ -2035,5 +2081,29 @@ mod tests {
         };
         notify_best_effort(&tx, make(1)); // fills the channel
         notify_best_effort(&tx, make(2)); // must return immediately (dropped), not block
+    }
+
+    #[test]
+    fn test_schema_wait_logs_first_check_then_throttles() {
+        // First failed check always logs.
+        assert!(schema_wait_should_log(Duration::ZERO, None));
+        // Within the interval after the last log line: stay quiet.
+        assert!(!schema_wait_should_log(
+            Duration::from_secs(30),
+            Some(Duration::ZERO)
+        ));
+        // Once the interval has passed: log again.
+        assert!(schema_wait_should_log(
+            SCHEMA_WAIT_LOG_INTERVAL,
+            Some(Duration::ZERO)
+        ));
+        assert!(schema_wait_should_log(
+            Duration::from_secs(185),
+            Some(Duration::from_secs(120))
+        ));
+        assert!(!schema_wait_should_log(
+            Duration::from_secs(150),
+            Some(Duration::from_secs(120))
+        ));
     }
 }

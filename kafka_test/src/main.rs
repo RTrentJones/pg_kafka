@@ -294,6 +294,8 @@ use kafka_test::{
     test_unknown_api_key_handling,
     test_zero_percent_forwarding,
 };
+// lifecycle workstream (error_paths/lifecycle_tests.rs)
+use kafka_test::test_worker_restarts_after_terminate;
 
 type TestFn = fn() -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error>>> + Send>>;
 
@@ -836,6 +838,12 @@ fn get_all_tests() -> Vec<TestDef> {
             name: "test_producer_restart_new_epoch_records_are_stored",
             test_fn: wrap_test!(test_producer_restart_new_epoch_records_are_stored),
             parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_worker_restarts_after_terminate",
+            test_fn: wrap_test!(test_worker_restarts_after_terminate),
+            parallel_safe: false, // takes the broker down for ~5 s
         },
         TestDef {
             category: "error_paths",
