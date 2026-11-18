@@ -108,7 +108,7 @@ pub trait KafkaStore {
 ### 2. Handler Layer ([src/kafka/handlers/](../src/kafka/handlers/))
 
 The handler layer contains pure Kafka protocol logic. It is a module directory with one `pub fn handle_*` per
-supported API (26 in total); `handlers/tests.rs` holds 80 of the module's 107 unit tests.
+supported API (26 in total); most of its unit tests are in `handlers/tests.rs` (counts: [TEST_STRATEGY.md](TEST_STRATEGY.md#test-summary)).
 
 **Key Handlers:**
 ```rust
@@ -383,6 +383,7 @@ The Repository Pattern refactoring successfully:
 The architecture is now more maintainable, testable, and secure while maintaining full backward compatibility.
 
 **Test Coverage:**
-- Handler tests: 80 unit tests in `src/kafka/handlers/tests.rs` (107 across the `handlers/` module)
-- Storage tests: 53 unit tests in `src/kafka/storage/tests.rs`
+- Handler tests: `src/kafka/handlers/tests.rs` plus per-file `#[cfg(test)]` modules
+- Storage tests: `src/kafka/storage/tests.rs`
+- Counts: [TEST_STRATEGY.md](TEST_STRATEGY.md#test-summary)
 - Mock infrastructure: `MockKafkaStore` in `src/testing/mocks.rs`

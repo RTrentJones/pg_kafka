@@ -49,7 +49,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Automated E2E tests with real Kafka client (rdkafka)
 
 **API Coverage:** 26 of ~50 standard Kafka APIs (52%)
-**Test Status:** 746 unit (incl. 4 in-module proptests) + 10 property + 221 E2E ≈ 977 total ✅ (CI is the source of truth; counts drift)
+**Test Status:** unit + property + E2E, all CI-gated. Counts live only in `docs/TEST_STRATEGY.md` ("Test Summary"); do not repeat them elsewhere.
 **Coverage Target:** 80%+ (testable code)
 
 ## Development Setup
@@ -251,7 +251,7 @@ src/
 
 tests/
 └── property_tests.rs   # proptest suite (run in CI via `cargo test --features pg14 --test property_tests`)
-kafka_test/             # E2E test suite (221 tests)
+kafka_test/             # E2E test suite (counts: docs/TEST_STRATEGY.md)
     └── src/
         ├── main.rs               # Test orchestrator with CLI + test registry
         ├── lib.rs                # Test re-exports
@@ -288,7 +288,7 @@ docs/
 ├── KAFKA_PROTOCOL_COVERAGE.md  # Comprehensive API coverage analysis
 ├── FULL_KAFKA_COMPLIANCE_PLAN.md  # Plan for remaining Kafka APIs
 ├── PROTOCOL_DEVIATIONS.md      # Intentional deviations from Kafka spec
-├── TEST_STRATEGY.md            # Test approach and coverage
+├── TEST_STRATEGY.md            # Test approach and coverage; the one home of test counts
 ├── PGRX_TESTING_GUIDE.md       # pgrx testing constraints and strategy
 ├── REPOSITORY_PATTERN.md       # Storage abstraction design
 ├── PERFORMANCE.md              # Performance guide and benchmarks
@@ -296,8 +296,9 @@ docs/
 ├── SHADOW_MODE_FLOW_DIAGRAM.md # Shadow mode flow diagram
 ├── SHADOW_EVIDENCE_PLAN.md     # Shadow forwarding evidence/reporting plan
 ├── LICENSING.md                # Dual-licensing model
-├── AUDIT-2026-06.md            # June 2026 code audit
-├── DEEP-REVIEW-2026-07.md      # July 2026 deep review
+├── archive/                    # Dated point-in-time records
+│   ├── AUDIT-2026-06.md        # June 2026 code audit
+│   └── DEEP-REVIEW-2026-07.md  # July 2026 deep review (source of DR-* references)
 └── architecture/
     ├── ADR-001-partitioning-and-retention.md  # Design decisions
     └── ADR-002-staff-level-architectural-improvements.md
@@ -353,7 +354,7 @@ This separation enables testing handlers without a running database.
 Protocol handlers live in `src/kafka/handlers/`:
 - Each Kafka API has a `handle_*` function; all except `handle_api_versions` take a `&HandlerContext` (`src/kafka/handler_context.rs`), whose `store: &dyn KafkaStore` field keeps them testable
 - `helpers.rs`: `TopicResolution` enum for topic lookup logic shared across handlers
-- `tests.rs`: 80 handler tests using `MockKafkaStore` (more live in per-file `#[cfg(test)]` modules)
+- `tests.rs`: handler tests using `MockKafkaStore` (more live in per-file `#[cfg(test)]` modules)
 
 ### Error Handling
 
@@ -645,30 +646,30 @@ Tests use shared infrastructure from `kafka_test/src/`:
 - **fixtures.rs**: Builders (`TestTopicBuilder`, `TestConsumerBuilder`, `TestProducerBuilder`)
 - **assertions.rs**: Domain-specific assertions (`assert_topic_exists()`, `assert_message_count()`, etc.)
 
-### Test Categories (221 tests)
+### Test Categories
 
-Counts are from the registry in `kafka_test/src/main.rs` (`--list` prints it); CI is the source of truth.
+Per-category counts are in `docs/TEST_STRATEGY.md`; `cargo run --release -- --list` prints the live registry and total.
 
-| Category | Tests | Purpose |
-|----------|-------|---------|
-| **admin** | 19 | CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups, DescribeConfigs, IncrementalAlterConfigs, DeleteRecords, per-topic retention |
-| **producer** | 5 | Basic produce, batch produce, acks=0, ack-implies-committed, timestamp roundtrip |
-| **consumer** | 4 | Basic consume, from offset, multiple messages, headers |
-| **consumer_group** | 13 | Lifecycle, two-member groups, rebalancing, strategies |
-| **offset_management** | 10 | Commit/fetch, boundary conditions, multi-partition, by-timestamp, no offset reuse |
-| **partition** | 9 | Multi-partition topics, key routing, distribution |
-| **compression** | 10 | gzip, snappy, lz4, zstd, roundtrip, edge cases |
-| **idempotent** | 7 | InitProducerId, deduplication, epoch, multi-partition |
-| **transaction** | 20 | Transactions, isolation levels, EOS, fencing, atomicity, timeouts |
-| **shadow** | 28 | External forwarding, SASL/SSL, topic mapping, replay, dial-up |
-| **long_poll** | 10 | Timeout behavior, immediate return, producer wakeup, precision, per-connection task cap |
-| **error_paths** | 39 | Invalid partitions, unknown topics, coordinator errors, protocol/transaction/group regressions |
-| **edge_cases** | 13 | Empty topics, large messages, boundary values, retention sweep |
-| **concurrent** | 14 | Multi-producer, multi-consumer, request pipelining, races, heartbeat liveness lane |
-| **negative** | 5 | Connection refused, timeouts, expected failures, superuser-only SASL password GUC |
-| **performance** | 7 | Throughput baselines, latency percentiles, scaling |
-| **metadata** | 3 | Metadata refresh, all topics, nonexistent topic |
-| **protocol** | 5 | ApiVersions negotiation, correlation ID, unknown API, pipelining, response ordering |
+| Category | Purpose |
+|----------|---------|
+| **admin** | CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups, DescribeConfigs, IncrementalAlterConfigs, DeleteRecords, per-topic retention |
+| **producer** | Basic produce, batch produce, acks=0, ack-implies-committed, timestamp roundtrip |
+| **consumer** | Basic consume, from offset, multiple messages, headers |
+| **consumer_group** | Lifecycle, two-member groups, rebalancing, strategies |
+| **offset_management** | Commit/fetch, boundary conditions, multi-partition, by-timestamp, no offset reuse |
+| **partition** | Multi-partition topics, key routing, distribution |
+| **compression** | gzip, snappy, lz4, zstd, roundtrip, edge cases |
+| **idempotent** | InitProducerId, deduplication, epoch, multi-partition |
+| **transaction** | Transactions, isolation levels, EOS, fencing, atomicity, timeouts |
+| **shadow** | External forwarding, SASL/SSL, topic mapping, replay, dial-up |
+| **long_poll** | Timeout behavior, immediate return, producer wakeup, precision, per-connection task cap |
+| **error_paths** | Invalid partitions, unknown topics, coordinator errors, protocol/transaction/group regressions |
+| **edge_cases** | Empty topics, large messages, boundary values, retention sweep |
+| **concurrent** | Multi-producer, multi-consumer, request pipelining, races, heartbeat liveness lane |
+| **negative** | Connection refused, timeouts, expected failures, superuser-only SASL password GUC |
+| **performance** | Throughput baselines, latency percentiles, scaling |
+| **metadata** | Metadata refresh, all topics, nonexistent topic |
+| **protocol** | ApiVersions negotiation, correlation ID, unknown API, pipelining, response ordering |
 
 ### Running E2E Tests with CLI Options
 
@@ -695,6 +696,10 @@ cargo run --release -- --json
 
 # List all available tests
 cargo run --release -- --list
+
+# Per-test timeout (default 300 s). Each test runs in its own task: a panic or a
+# timeout is reported as FAILED and the run continues
+cargo run --release -- --timeout-secs 120
 
 # Combine flags
 cargo run --release -- --category transaction --json

@@ -5,7 +5,7 @@
 ## Current State (Phase 11 Complete)
 
 **APIs Implemented:** 26 of ~50 (52%)
-**Tests:** ~977 (746 unit + 10 property + 221 E2E; CI is the source of truth)
+**Tests:** unit + property + E2E; counts in [TEST_STRATEGY.md](TEST_STRATEGY.md#test-summary)
 **Architecture:** Repository Pattern, typed errors, clean handler structure, key-based partition routing, compression, transactions, shadow mode
 
 ### Implemented APIs
@@ -193,7 +193,7 @@ CREATE TABLE kafka.transactions (
 - ✅ Percentage-based dial-up routing
 - ✅ Historical message replay to external Kafka
 - ✅ Graceful degradation when external Kafka unavailable
-- ✅ 128 unit tests + 27 E2E tests for shadow mode
+- ✅ Unit and E2E (`shadow` category) coverage for shadow mode
 
 **Configuration:**
 ```sql
@@ -264,8 +264,7 @@ Each phase includes:
 3. **E2E tests** - rdkafka client in `kafka_test/`
 
 **Coverage targets:**
-- Maintain the unit-test suite (713+ tests)
-- Current: 221 E2E tests across all categories
+- Keep the unit and E2E suites growing with each API (current counts: [TEST_STRATEGY.md](TEST_STRATEGY.md#test-summary))
 
 ---
 

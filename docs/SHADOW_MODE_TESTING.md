@@ -153,7 +153,7 @@ Should show `172.18.0.2` (or current actual IP). If it shows a different IP, Doc
 
 ## Test Categories
 
-The `shadow` category registers 27 tests in `kafka_test/src/main.rs`, all `parallel_safe: false`:
+The `shadow` category's tests are registered in `kafka_test/src/main.rs`, all `parallel_safe: false` (`cargo run --release -- --list` prints the live set under `shadow:`):
 
 | Test | Description |
 |------|-------------|
