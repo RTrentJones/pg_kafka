@@ -11,7 +11,7 @@
 use crate::kafka::constants::ERROR_UNKNOWN_SERVER_ERROR;
 use crate::kafka::error::KafkaError;
 use crate::kafka::messages::KafkaResponse;
-use crate::{pg_log, pg_warning};
+use crate::{pg_debug, pg_warning};
 use kafka_protocol::messages::produce_response::ProduceResponse;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use tokio::sync::mpsc::UnboundedSender;
@@ -75,7 +75,7 @@ pub fn dispatch_response<R, F, W, E>(
             if let Err(e) = response_tx.send(response) {
                 pg_warning!("Failed to send {} response: {}", handler_name, e);
             } else {
-                pg_log!("{} response sent successfully", handler_name);
+                pg_debug!("{} response sent successfully", handler_name);
             }
         }
         Ok(Err(e)) => {
@@ -116,7 +116,7 @@ pub fn dispatch_infallible<R, F, W>(
     if let Err(e) = response_tx.send(response) {
         pg_warning!("Failed to send {} response: {}", handler_name, e);
     } else {
-        pg_log!("{} response sent successfully", handler_name);
+        pg_debug!("{} response sent successfully", handler_name);
     }
 }
 
