@@ -16,7 +16,10 @@ mod offset_errors;
 mod producer_errors;
 mod review_regressions;
 mod storage_tests;
+// Stream `api`: typed error responses for every request failure after a valid header.
+mod api_errors;
 
+pub use api_errors::*;
 pub use bug_hunt::*;
 pub use consumer_errors::*;
 pub use coordinator_errors::*;

@@ -318,6 +318,11 @@ use kafka_test::{
     test_failed_request_rolls_back_alone, test_group_commit_concurrent_acks_visible,
     test_group_commit_pipelined_produces_in_order, test_worker_restarts_after_terminate,
 };
+// Stream `api`: typed error responses (error_paths/api_errors.rs)
+use kafka_test::{
+    test_handler_failure_gets_typed_error_response, test_truncated_body_gets_invalid_request,
+    test_unsupported_versions_get_typed_error_responses,
+};
 
 type TestFn = fn() -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error>>> + Send>>;
 
@@ -1896,6 +1901,25 @@ fn get_all_tests() -> Vec<TestDef> {
             name: "test_response_ordering_with_long_poll",
             test_fn: wrap_test!(test_response_ordering_with_long_poll),
             parallel_safe: false, // timing-sensitive: asserts long-poll wait duration
+        },
+        // Stream `api`: typed error responses (error_paths/api_errors.rs)
+        TestDef {
+            category: "error_paths",
+            name: "test_unsupported_versions_get_typed_error_responses",
+            test_fn: wrap_test!(test_unsupported_versions_get_typed_error_responses),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_truncated_body_gets_invalid_request",
+            test_fn: wrap_test!(test_truncated_body_gets_invalid_request),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_handler_failure_gets_typed_error_response",
+            test_fn: wrap_test!(test_handler_failure_gets_typed_error_response),
+            parallel_safe: false, // revokes a worker privilege for a moment
         },
     ]
 }

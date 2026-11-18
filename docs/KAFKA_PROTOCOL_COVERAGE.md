@@ -20,7 +20,7 @@
 
 ## Implemented APIs (26 total)
 
-Version ranges below are the ones advertised in the ApiVersions response and enforced on inbound requests (each API's `MIN_VERSION`/`MAX_VERSION` in `src/kafka/api/`). A request above its range is rejected with UNSUPPORTED_VERSION; a request below it closes the connection, as Kafka does (the minimums are the lowest versions the kafka-protocol crate can decode and encode). ApiVersions outside v0-v3 is answered in the v0 format with UNSUPPORTED_VERSION and the full key list (KIP-511).
+Version ranges below are the ones advertised in the ApiVersions response and enforced on inbound requests (each API's `MIN_VERSION`/`MAX_VERSION` in `src/kafka/api/`). A request above its range is answered with UNSUPPORTED_VERSION in the requested version (echoing the requested topics/partitions/groups where the response has no top-level error code); a request below it closes the connection, as Kafka does (the minimums are the lowest versions the kafka-protocol crate can decode and encode). A body that does not decode gets INVALID_REQUEST; see PROTOCOL_DEVIATIONS.md, "Error responses". ApiVersions outside v0-v3 is answered in the v0 format with UNSUPPORTED_VERSION and the full key list (KIP-511).
 
 ### 1. Core Metadata (2 APIs) ✅ 100% Coverage
 | API | Key | Versions | Status | Notes |

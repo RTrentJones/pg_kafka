@@ -324,7 +324,7 @@ honored; producer CreateTime timestamps are preserved — BUG-7).
 
 ### Supported APIs (26 total)
 
-These ranges are both advertised in ApiVersions and enforced on inbound requests (each API's `MIN_VERSION`/`MAX_VERSION` in `src/kafka/api/`); an out-of-range request gets UNSUPPORTED_VERSION.
+These ranges are both advertised in ApiVersions and enforced on inbound requests (each API's `MIN_VERSION`/`MAX_VERSION` in `src/kafka/api/`); a request above its range gets UNSUPPORTED_VERSION in the requested version (see "Error responses" above).
 
 | API Key | Name | Versions | Status |
 |---------|------|----------|--------|
@@ -391,10 +391,29 @@ impl KafkaError {
 DeleteTopics, CreatePartitions, DeleteGroups, DeleteRecords, DescribeConfigs and
 IncrementalAlterConfigs have no top-level error code, so their handlers report every
 failure, storage failures included, on the topic/partition/resource/group it affects and
-keep processing the other items (as Kafka does). One gap remains: when no item is known or
-the handler did not return (a request that fails to decode, an unsupported version, or a
-Postgres ERROR that aborts the handler and rolls the request back), these APIs answer with
-an empty response that carries no error code.
+keep processing the other items (as Kafka does).
+
+**Error responses for requests that never reach a handler result.** Every request that
+fails after a valid header is answered with a well-formed response of its own API and
+version carrying an error code, built by the API's `KafkaApi::error_response`
+(`src/kafka/api/`), which puts the code in the top-level error field where the response has
+one and on every requested topic/partition/group/resource it echoes:
+
+| Failure | Error code | Echoed entries |
+|---------|------------|----------------|
+| Version above the advertised range (kafka-protocol can encode it) | UNSUPPORTED_VERSION (35), in the requested version | whatever the body decodes to at that version |
+| Body that does not decode (garbage, or truncated after the header) | INVALID_REQUEST (42) | none (nothing was decoded) |
+| Handler returns `Err`, or panics (a Postgres ERROR) | the error's code / UNKNOWN_SERVER_ERROR (-1) | every requested entry |
+| The batch's commit fails | UNKNOWN_SERVER_ERROR (-1) | every requested entry |
+
+Remaining deviations: a body that does not decode has no entries to echo, so APIs without
+a top-level error code (Produce, ListOffsets, DescribeGroups, CreateTopics, ...) answer with
+an empty but well-formed response. A version kafka-protocol cannot encode a response in
+(below the advertised minimum, which is the crate's own minimum, or above the crate's
+maximum) closes the connection, as Kafka does for an unsupported version. A frame whose
+header cannot be parsed closes the connection. An API key pg_kafka does not serve gets the
+generic error frame (correlation id, UNSUPPORTED_VERSION, null message), since there is no
+response schema to answer in. An acks=0 Produce never gets a response.
 
 ### Notable Missing APIs
 

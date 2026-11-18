@@ -6,9 +6,10 @@ use kafka_protocol::messages::offset_commit_response::{
 };
 use kafka_protocol::messages::offset_fetch_request::OffsetFetchRequest;
 use kafka_protocol::messages::offset_fetch_response::{
-    OffsetFetchResponse, OffsetFetchResponsePartition, OffsetFetchResponseTopic,
+    OffsetFetchResponse, OffsetFetchResponseGroup, OffsetFetchResponsePartition,
+    OffsetFetchResponsePartitions, OffsetFetchResponseTopic, OffsetFetchResponseTopics,
 };
-use kafka_protocol::messages::TopicName;
+use kafka_protocol::messages::{GroupId, TopicName};
 
 use super::{ApiEnv, Call, KafkaApi, Rejection, RequestHeader, TopicPartitions};
 use crate::kafka::dispatch::RequestOutcome;
@@ -148,7 +149,8 @@ pub struct OffsetFetchRequestData {
 impl KafkaApi for OffsetFetchApi {
     type Wire = OffsetFetchRequest;
     type Request = OffsetFetchRequestData;
-    type Echo = TopicPartitions;
+    /// The group id and the requested topics/partitions.
+    type Echo = (String, TopicPartitions);
     const NAME: &'static str = "OffsetFetch";
     // The crate cannot decode OffsetFetch v0.
     const MIN_VERSION: i16 = 1;
@@ -159,6 +161,22 @@ impl KafkaApi for OffsetFetchApi {
         wire: OffsetFetchRequest,
         _header: &RequestHeader,
     ) -> Result<Self::Request, Rejection<Self::Echo>> {
+        // v8+ (not served, but echoed in its UNSUPPORTED_VERSION reply) moves the group
+        // and its topics into `groups`.
+        if let Some(group) = wire.groups.into_iter().next() {
+            return Ok(OffsetFetchRequestData {
+                group_id: group.group_id.to_string(),
+                topics: group.topics.map(|topics| {
+                    topics
+                        .into_iter()
+                        .map(|t| OffsetFetchTopicData {
+                            name: t.name.to_string(),
+                            partition_indexes: t.partition_indexes,
+                        })
+                        .collect()
+                }),
+            });
+        }
         Ok(OffsetFetchRequestData {
             group_id: wire.group_id.to_string(),
             topics: wire.topics.map(|topics| {
@@ -173,26 +191,57 @@ impl KafkaApi for OffsetFetchApi {
         })
     }
 
-    fn echo(request: &Self::Request) -> TopicPartitions {
-        request
-            .topics
-            .iter()
-            .flatten()
-            .map(|t| (t.name.clone(), t.partition_indexes.clone()))
-            .collect()
+    fn echo(request: &Self::Request) -> Self::Echo {
+        (
+            request.group_id.clone(),
+            request
+                .topics
+                .iter()
+                .flatten()
+                .map(|t| (t.name.clone(), t.partition_indexes.clone()))
+                .collect(),
+        )
     }
 
-    /// Top-level error code (v2+) plus the code on every requested partition (the only
-    /// place v1 can carry it).
+    /// v2-7: top-level error code plus the code on every requested partition (the only
+    /// place v1 can carry it). v8+: one group entry carrying the code.
     fn error_response(
-        echo: Option<&TopicPartitions>,
-        _version: i16,
+        echo: Option<&Self::Echo>,
+        version: i16,
         error_code: i16,
     ) -> OffsetFetchResponse {
         let mut response = OffsetFetchResponse::default();
         response.throttle_time_ms = 0;
+        if version >= 8 {
+            let mut group = OffsetFetchResponseGroup::default();
+            group.error_code = error_code;
+            if let Some((group_id, topics)) = echo {
+                group.group_id = GroupId(group_id.clone().into());
+                group.topics = topics
+                    .iter()
+                    .map(|(name, partitions)| {
+                        let mut topic = OffsetFetchResponseTopics::default();
+                        topic.name = TopicName(name.clone().into());
+                        topic.partitions = partitions
+                            .iter()
+                            .map(|&index| {
+                                let mut p = OffsetFetchResponsePartitions::default();
+                                p.partition_index = index;
+                                p.committed_offset = -1;
+                                p.committed_leader_epoch = -1;
+                                p.error_code = error_code;
+                                p
+                            })
+                            .collect();
+                        topic
+                    })
+                    .collect();
+            }
+            response.groups = vec![group];
+            return response;
+        }
         response.error_code = error_code;
-        for (name, partitions) in echo.into_iter().flatten() {
+        for (name, partitions) in echo.iter().flat_map(|(_, topics)| topics.iter()) {
             let mut topic = OffsetFetchResponseTopic::default();
             topic.name = TopicName(name.clone().into());
             topic.partitions = partitions

@@ -34,7 +34,7 @@ use kafka_protocol::protocol::{
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::warn;
 
-use crate::kafka::constants::ERROR_UNSUPPORTED_VERSION;
+use crate::kafka::constants::{ERROR_INVALID_REQUEST, ERROR_UNSUPPORTED_VERSION};
 use crate::kafka::dispatch::{dispatch_response, RequestOutcome};
 use crate::kafka::error::KafkaError;
 use crate::kafka::handler_context::HandlerContext;
@@ -271,6 +271,17 @@ pub enum Decoded {
 }
 
 /// Decode the body of a request for API `A` whose header has been parsed.
+///
+/// Every failure after a valid header is answered with a well-formed response of `A`
+/// carrying an error code, with the request's correlation id:
+///
+/// - a version outside `MIN_VERSION..=MAX_VERSION` gets UNSUPPORTED_VERSION in the
+///   requested version (ApiVersions: in v0 with the key list), echoing whatever the body
+///   told us when kafka-protocol can decode it at that version; a version kafka-protocol
+///   cannot encode a response in closes the connection (there is no format to answer in);
+/// - a body that does not decode (an error, or a decoder panic on a truncated body) gets
+///   INVALID_REQUEST;
+/// - [`KafkaApi::decode`] may reject a decoded body with its own code and echo.
 fn decode_api<A: KafkaApi>(
     buf: &mut BytesMut,
     header: RequestHeader,
@@ -287,7 +298,32 @@ fn decode_api<A: KafkaApi>(
         ));
     };
 
-    // CONF-6: enforce the advertised version range before the version-specific decode.
+    // SEC-2: the kafka-protocol body decoders index without bounds checks and panic on a
+    // truncated body, so the decode runs under catch_unwind: a malformed body after a
+    // valid header is answered with an error response instead of tearing the connection
+    // down.
+    let wire_range = <A::Wire as Message>::VERSIONS;
+    let parsed: Option<Result<A::Request, Rejection<A::Echo>>> =
+        if (wire_range.min..=wire_range.max).contains(&version) {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                A::Wire::decode(buf, version)
+            })) {
+                Ok(Ok(wire)) => Some(A::decode(wire, &header)),
+                Ok(Err(e)) => {
+                    warn!("Failed to decode {} v{} body: {}", A::NAME, version, e);
+                    None
+                }
+                Err(_) => {
+                    warn!("Malformed {} v{} body (decoder panicked)", A::NAME, version);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+    // CONF-6: a version outside the advertised range is answered with the API's own error
+    // response (when it can be encoded), echoing what the body told us.
     if !(A::MIN_VERSION..=A::MAX_VERSION).contains(&version) {
         warn!(
             "Rejecting {} version {} outside supported range {}..={}",
@@ -296,17 +332,14 @@ fn decode_api<A: KafkaApi>(
             A::MIN_VERSION,
             A::MAX_VERSION
         );
-        if version < A::MIN_VERSION
-            && api_key_of::<A>() != crate::kafka::constants::API_KEY_API_VERSIONS
-        {
-            return Decoded::Close(format!(
-                "{} version {} is below the supported minimum {}",
-                A::NAME,
-                version,
-                A::MIN_VERSION
-            ));
-        }
-        return match A::unsupported_version_reply(None, version) {
+        let echo = match &parsed {
+            Some(Ok(request)) if !A::expects_response(request) => return Decoded::Answered,
+            Some(Ok(request)) => Some(A::echo(request)),
+            Some(Err(Rejection::Silent)) => return Decoded::Answered,
+            Some(Err(Rejection::Reply { echo, .. })) => echo.clone(),
+            None => None,
+        };
+        return match A::unsupported_version_reply(echo.as_ref(), version) {
             Some((encode_version, response)) => {
                 reply(encode_version, response);
                 Decoded::Answered
@@ -319,31 +352,24 @@ fn decode_api<A: KafkaApi>(
         };
     }
 
-    match A::Wire::decode(buf, version) {
-        Ok(wire) => match A::decode(wire, &header) {
-            Ok(request) => Decoded::Request(KafkaRequest {
-                body: wrap_request(request),
-                header,
-                response_tx,
-            }),
-            Err(Rejection::Reply { error_code, echo }) => {
-                reply(
-                    version,
-                    A::error_response(echo.as_ref(), version, error_code),
-                );
-                Decoded::Answered
-            }
-            Err(Rejection::Silent) => Decoded::Answered,
-        },
-        Err(e) => {
-            warn!("Failed to decode {} v{} body: {}", A::NAME, version, e);
+    match parsed {
+        Some(Ok(request)) => Decoded::Request(KafkaRequest {
+            body: wrap_request(request),
+            header,
+            response_tx,
+        }),
+        Some(Err(Rejection::Reply { error_code, echo })) => {
             reply(
                 version,
-                A::error_response(
-                    None,
-                    version,
-                    crate::kafka::constants::ERROR_CORRUPT_MESSAGE,
-                ),
+                A::error_response(echo.as_ref(), version, error_code),
+            );
+            Decoded::Answered
+        }
+        Some(Err(Rejection::Silent)) => Decoded::Answered,
+        None => {
+            reply(
+                version,
+                A::error_response(None, version, ERROR_INVALID_REQUEST),
             );
             Decoded::Answered
         }
