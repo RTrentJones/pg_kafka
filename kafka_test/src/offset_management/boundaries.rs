@@ -3,9 +3,8 @@
 //! Validates offset boundary conditions including earliest,
 //! latest, and specific offset consumption.
 
-use crate::common::{
-    create_base_consumer, create_db_client, create_producer, TestResult, POLL_TIMEOUT,
-};
+use crate::common::{create_base_consumer, create_producer, TestResult, POLL_TIMEOUT};
+use crate::setup::TestContext;
 use rdkafka::consumer::Consumer;
 use rdkafka::message::Message;
 use rdkafka::producer::FutureRecord;
@@ -23,7 +22,8 @@ use std::time::Duration;
 pub async fn test_offset_boundaries() -> TestResult {
     println!("=== Test: Offset Boundaries ===\n");
 
-    let topic = "offset-boundary-topic";
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("offset-boundary-topic").await;
 
     // 1. Produce some messages to establish offset range
     println!("Step 1: Producing messages to establish offset range...");
@@ -36,7 +36,7 @@ pub async fn test_offset_boundaries() -> TestResult {
         let value = format!("Boundary test message {}", i);
         let (partition, offset) = producer
             .send(
-                FutureRecord::to(topic)
+                FutureRecord::to(&topic)
                     .payload(&value)
                     .key(&format!("boundary-{}", i)),
                 Duration::from_secs(5),
@@ -56,10 +56,11 @@ pub async fn test_offset_boundaries() -> TestResult {
 
     // 2. Test consuming from Beginning (earliest)
     println!("\nStep 2: Testing consume from Beginning (earliest)...");
-    let consumer_earliest = create_base_consumer("boundary-earliest-group")?;
+    let consumer_earliest =
+        create_base_consumer(&ctx.unique_group("boundary-earliest-group").await)?;
 
     let mut assignment = TopicPartitionList::new();
-    assignment.add_partition_offset(topic, partition, rdkafka::Offset::Beginning)?;
+    assignment.add_partition_offset(&topic, partition, rdkafka::Offset::Beginning)?;
     consumer_earliest.assign(&assignment)?;
 
     let mut earliest_received = false;
@@ -78,10 +79,10 @@ pub async fn test_offset_boundaries() -> TestResult {
 
     // 3. Test consuming from End (latest)
     println!("\nStep 3: Testing consume from End (latest)...");
-    let consumer_latest = create_base_consumer("boundary-latest-group")?;
+    let consumer_latest = create_base_consumer(&ctx.unique_group("boundary-latest-group").await)?;
 
     let mut assignment = TopicPartitionList::new();
-    assignment.add_partition_offset(topic, partition, rdkafka::Offset::End)?;
+    assignment.add_partition_offset(&topic, partition, rdkafka::Offset::End)?;
     consumer_latest.assign(&assignment)?;
 
     let msg = consumer_latest.poll(Duration::from_millis(500));
@@ -105,10 +106,11 @@ pub async fn test_offset_boundaries() -> TestResult {
     println!("\nStep 4: Testing consume from specific offset...");
     let target_offset = last_off;
 
-    let consumer_specific = create_base_consumer("boundary-specific-group")?;
+    let consumer_specific =
+        create_base_consumer(&ctx.unique_group("boundary-specific-group").await)?;
 
     let mut assignment = TopicPartitionList::new();
-    assignment.add_partition_offset(topic, partition, rdkafka::Offset::Offset(target_offset))?;
+    assignment.add_partition_offset(&topic, partition, rdkafka::Offset::Offset(target_offset))?;
     consumer_specific.assign(&assignment)?;
 
     let mut specific_received = false;
@@ -139,7 +141,7 @@ pub async fn test_offset_boundaries() -> TestResult {
 
     // 5. Verify offset boundaries via database
     println!("\nStep 5: Verifying offset boundaries in database...");
-    let db_client = create_db_client().await?;
+    let db_client = ctx.db();
 
     let boundary_row = db_client
         .query_one(
@@ -163,6 +165,7 @@ pub async fn test_offset_boundaries() -> TestResult {
     );
     println!("✅ Offset boundaries verified");
 
+    ctx.cleanup().await?;
     println!("\n✅ Offset boundaries test PASSED\n");
     Ok(())
 }

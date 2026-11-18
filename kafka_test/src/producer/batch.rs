@@ -4,6 +4,7 @@
 //! and verifies the N+1 query fix by producing 20 records.
 
 use crate::common::{create_batch_producer, create_db_client, TestResult};
+use crate::setup::TestContext;
 use rdkafka::producer::FutureRecord;
 use std::time::Duration;
 
@@ -17,7 +18,8 @@ use std::time::Duration;
 pub async fn test_batch_produce() -> TestResult {
     println!("=== Test: Batch Produce (20 records) ===\n");
 
-    let topic = "batch-produce-topic";
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("batch-produce-topic").await;
     let batch_size = 20; // Reduced from 100 for faster CI
 
     // 1. Get initial message count in database
@@ -53,7 +55,7 @@ pub async fn test_batch_produce() -> TestResult {
 
         match producer
             .send(
-                FutureRecord::to(topic).payload(&value).key(&key),
+                FutureRecord::to(&topic).payload(&value).key(&key),
                 Duration::from_secs(30),
             )
             .await
@@ -106,6 +108,7 @@ pub async fn test_batch_produce() -> TestResult {
     );
     println!("✅ All {} messages verified in database", batch_size);
 
+    ctx.cleanup().await?;
     println!("\n✅ Batch produce test PASSED\n");
     Ok(())
 }

@@ -1,23 +1,36 @@
 # Test Strategy
 
 **Status:** Phase 11 Complete (Shadow Mode)
-**Last Updated:** 2026-10-29
+**Last Updated:** 2026-11-18
 
 ---
 
 ## Test Summary
 
+**This section is the one place the repository states test counts.** Other docs
+(`README.md`, `CLAUDE.md`, `docs/*`) link here instead of repeating numbers, so
+there is one table to refresh when tests land. Counts drift between refreshes;
+the CI run is the source of truth.
+
+Counted at `babcd17` (2026-11):
+
 | Category | Count | Coverage |
 |----------|-------|----------|
-| Unit Tests | 746 | Core logic, handlers, storage, protocol, shadow (`src/`, includes 4 in-module proptest fuzz harnesses) |
+| Unit Tests | 746 | Core logic, handlers, storage, protocol, shadow (`src/`, includes in-module proptest fuzz harnesses) |
 | Property Tests | 10 | `tests/property_tests.rs`: 8 proptest wire-format invariants + 2 boundary tests (CI-run) |
-| E2E Tests | 202 | Full protocol integration (`kafka_test/`) |
-| **Total** | **~925** | **Comprehensive** |
+| E2E Tests | 221 | Full protocol integration (`kafka_test/`, 18 categories) |
+| **Total** | **977** | |
 
-> DR-22 (DEEP-REVIEW-2026-07): counts here are refreshed manually and drift as
-> tests land — **the CI run is the source of truth.** Regenerate with
-> `cargo test --features pg14 --lib` (unit), `cargo test --features pg14 --test property_tests`
-> (property), `grep -c wrap_test! kafka_test/src/main.rs` (E2E).
+Regenerate (none of these needs a running broker):
+
+```bash
+cargo test --features pg14 --lib -- --list | grep -c ': test$'                # unit
+cargo test --features pg14 --test property_tests -- --list | grep -c ': test$'  # property
+cd kafka_test && cargo run --release -- --list | tail -1                      # E2E total + categories
+```
+
+`kafka_test`'s own runner unit tests (`cargo test --bin kafka_test` in `kafka_test/`)
+are not counted above.
 
 ---
 
@@ -49,7 +62,9 @@ cargo test --features pg14                           # both
 
 ---
 
-## E2E Test Categories (221 tests)
+## E2E Test Categories
+
+Per-category counts from `kafka_test --list` at the commit named in [Test Summary](#test-summary).
 
 | Category | Tests | Purpose |
 |----------|-------|---------|
@@ -62,9 +77,9 @@ cargo test --features pg14                           # both
 | Compression (`compression`) | 10 | gzip, snappy, lz4, zstd, roundtrip, edge cases |
 | Idempotent (`idempotent`) | 7 | InitProducerId, deduplication, epoch, multi-partition |
 | Transaction (`transaction`) | 20 | EOS, isolation levels, LSO, fencing, timeouts, atomicity |
-| Shadow (`shadow`) | 27 | Dual-write, external-only/local-only, percentage dial-up, topic mapping, outbox, transactions, replay |
+| Shadow (`shadow`) | 28 | Dual-write, external-only/local-only, percentage dial-up, topic mapping, outbox, transactions, replay |
 | Long Polling (`long_poll`) | 10 | Timeout, immediate return, producer wakeup, precision, per-connection cap |
-| Error Paths (`error_paths`) | 21 | Invalid partitions, unknown topics, coordinator errors |
+| Error Paths (`error_paths`) | 39 | Invalid partitions, unknown topics, coordinator errors, protocol/transaction/group regressions |
 | Edge Cases (`edge_cases`) | 13 | Empty topics, large messages, boundary values, retention sweep |
 | Concurrent (`concurrent`) | 14 | Multi-producer, multi-consumer, pipelining, races, heartbeat bypass |
 | Negative (`negative`) | 5 | Connection refused, timeouts, invalid operations, superuser-only GUC |
@@ -92,7 +107,8 @@ cd kafka_test && cargo run --release -- --exclude performance --exclude shadow
 ```
 
 Other flags: `--sequential` (disable parallelism; runs are parallel by default),
-`--concurrency <N>` (default 16), `--json`, `--list`, `--verbose`. The runner reads
+`--concurrency <N>` (default 16), `--timeout-secs <N>` (per-test timeout, default 300),
+`--json`, `--list`, `--verbose`. The runner reads
 `DATABASE_URL` and falls back to `host=localhost port=28814 user=postgres dbname=postgres`.
 
 ---
@@ -111,6 +127,11 @@ Other flags: `--sequential` (disable parallelism; runs are parallel by default),
 - Test isolation via unique topic/group names (test id plus a UUID prefix)
 - Database verification via tokio-postgres
 - Run in parallel by default; tests marked `parallel_safe: false` are run separately
+- Each test runs in its own tokio task: a panic (failed `assert!`) is reported as
+  FAILED with the panic message, and a test still running after `--timeout-secs` is
+  aborted and reported FAILED, so one bad test never ends the run without a summary
+- Every test creates its own topics and groups (`TestContext::unique_topic` /
+  `unique_group` or a UUID suffix), so the suite can be re-run against the same database
 
 ---
 
@@ -236,6 +257,6 @@ See `docs/PGRX_TESTING_GUIDE.md` for the full testing strategy.
 
 ---
 
-**Test Count:** ~977 (746 unit + 10 property + 221 E2E; CI is the source of truth)
+**Test Count:** see [Test Summary](#test-summary)
 **Coverage Target:** 80%+ (testable code)
 **All Tests Passing:** ✅

@@ -18,7 +18,7 @@ use std::time::Duration;
 pub async fn test_multi_partition_produce() -> TestResult {
     println!("=== Test: Multi-Partition Produce ===\n");
 
-    let topic = "multi-partition-topic";
+    let topic = format!("multi-partition-topic-{}", uuid::Uuid::new_v4());
     let num_partitions = 3;
 
     // 1. Create topic with multiple partitions in database
@@ -49,7 +49,7 @@ pub async fn test_multi_partition_produce() -> TestResult {
         let key = format!("partition-{}-key", partition);
         let value = format!("Message for partition {}", partition);
 
-        let record = FutureRecord::to(topic)
+        let record = FutureRecord::to(&topic)
             .payload(&value)
             .key(&key)
             .partition(partition);
@@ -99,7 +99,7 @@ pub async fn test_multi_partition_produce() -> TestResult {
 
     let result = producer
         .send(
-            FutureRecord::to(topic)
+            FutureRecord::to(&topic)
                 .payload("invalid")
                 .key("invalid-key")
                 .partition(invalid_partition),
@@ -126,7 +126,7 @@ pub async fn test_multi_partition_produce() -> TestResult {
         let value = format!("Second message for partition {}", partition);
         producer
             .send(
-                FutureRecord::to(topic)
+                FutureRecord::to(&topic)
                     .payload(&value)
                     .key(&format!("second-key-{}", partition))
                     .partition(partition),

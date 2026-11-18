@@ -6,6 +6,7 @@
 use crate::common::{
     create_base_consumer, create_producer, TestResult, POLL_TIMEOUT, TEST_TIMEOUT,
 };
+use crate::setup::TestContext;
 use rdkafka::consumer::Consumer;
 use rdkafka::message::Message;
 use rdkafka::producer::FutureRecord;
@@ -22,7 +23,8 @@ use std::time::Duration;
 pub async fn test_consumer_basic() -> TestResult {
     println!("=== Test: Basic Consumer Functionality ===\n");
 
-    let topic = "consumer-test-topic";
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("consumer-test-topic").await;
 
     // 1. Produce a message first
     println!("Step 1: Producing test message...");
@@ -33,7 +35,7 @@ pub async fn test_consumer_basic() -> TestResult {
 
     let (partition, offset) = producer
         .send(
-            FutureRecord::to(topic).payload(test_value).key(test_key),
+            FutureRecord::to(&topic).payload(test_value).key(test_key),
             Duration::from_secs(5),
         )
         .await
@@ -46,13 +48,13 @@ pub async fn test_consumer_basic() -> TestResult {
 
     // 2. Create consumer with manual partition assignment
     println!("\nStep 2: Creating consumer with manual partition assignment...");
-    let consumer = create_base_consumer("manual-consumer")?;
+    let consumer = create_base_consumer(&ctx.unique_group("manual-consumer").await)?;
     println!("✅ Consumer created");
 
     // 3. Manually assign partition
     println!("\nStep 3: Manually assigning partition...");
     let mut assignment = TopicPartitionList::new();
-    assignment.add_partition_offset(topic, partition, rdkafka::Offset::Offset(offset))?;
+    assignment.add_partition_offset(&topic, partition, rdkafka::Offset::Offset(offset))?;
     consumer.assign(&assignment)?;
     println!("✅ Partition assigned");
 
@@ -97,6 +99,7 @@ pub async fn test_consumer_basic() -> TestResult {
 
     assert!(received, "Failed to receive message within timeout");
 
+    ctx.cleanup().await?;
     println!("\n✅ Basic consumer test PASSED\n");
     Ok(())
 }

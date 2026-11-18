@@ -3,7 +3,8 @@
 //! Validates that consumers can start reading from
 //! specific offsets and verifies offset boundaries.
 
-use crate::common::{create_db_client, create_producer, TestResult};
+use crate::common::{create_producer, TestResult};
+use crate::setup::TestContext;
 use rdkafka::producer::FutureRecord;
 use std::time::Duration;
 
@@ -17,7 +18,8 @@ use std::time::Duration;
 pub async fn test_consumer_from_offset() -> TestResult {
     println!("=== Test: Consumer From Specific Offset ===\n");
 
-    let topic = "offset-test-topic";
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("offset-test-topic").await;
 
     // 1. Produce multiple messages to have different offsets
     println!("Step 1: Producing messages with known offsets...");
@@ -28,7 +30,7 @@ pub async fn test_consumer_from_offset() -> TestResult {
         let key = format!("offset-key-{}", i);
         producer
             .send(
-                FutureRecord::to(topic).payload(&value).key(&key),
+                FutureRecord::to(&topic).payload(&value).key(&key),
                 Duration::from_secs(5),
             )
             .await
@@ -39,7 +41,7 @@ pub async fn test_consumer_from_offset() -> TestResult {
 
     // 2. Verify messages are in the database
     println!("\nStep 2: Verifying messages in database...");
-    let db_client = create_db_client().await?;
+    let db_client = ctx.db();
 
     let count_row = db_client
         .query_one(
@@ -51,7 +53,8 @@ pub async fn test_consumer_from_offset() -> TestResult {
         .await?;
     let db_count: i64 = count_row.get(0);
 
-    assert!(db_count >= 10, "Not enough messages in database");
+    // The topic is unique to this run, so exactly the 10 records above exist.
+    assert_eq!(db_count, 10, "Expected exactly the 10 produced messages");
     println!(
         "✅ Database has {} messages for topic '{}'",
         db_count, topic
@@ -70,6 +73,7 @@ pub async fn test_consumer_from_offset() -> TestResult {
     let high_watermark: i64 = hw_row.get(0);
     println!("✅ High watermark: {}", high_watermark);
 
+    ctx.cleanup().await?;
     println!("\n✅ Offset test PASSED\n");
     Ok(())
 }

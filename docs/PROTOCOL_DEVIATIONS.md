@@ -458,7 +458,7 @@ Wire-level SASL/ACLs are **not planned**; the accepted posture is network-contro
 | Client | Version | Status | Notes |
 |--------|---------|--------|-------|
 | kcat | 1.7.0+ | ✅ Works | Producer and consumer tested |
-| rdkafka (Rust) | 0.36+ | ✅ Works | Full E2E test suite (221 tests) |
+| rdkafka (Rust) | 0.36+ | ✅ Works | Full E2E test suite (`kafka_test/`) |
 
 ### Client Configuration
 
@@ -478,7 +478,7 @@ auto.offset.reset=earliest
 
 ## Future Work
 
-> **Shadow Mode is implemented** (Phase 11 — external Kafka forwarding, per-topic config, SASL/SSL) and is no longer future work. See `KAFKA_PROTOCOL_COVERAGE.md` and the `SHADOW_MODE_*` docs. Known correctness limitations (durable forwarding, replay idempotency, the license gate) are tracked as SH-1..16 in `AUDIT-2026-06.md`.
+> **Shadow Mode is implemented** (Phase 11 — external Kafka forwarding, per-topic config, SASL/SSL) and is no longer future work. See `KAFKA_PROTOCOL_COVERAGE.md` and the `SHADOW_MODE_*` docs. Known correctness limitations (durable forwarding, replay idempotency, the license gate) are tracked as SH-1..16 in `archive/AUDIT-2026-06.md`.
 
 ### Advanced Consumer Features (Future)
 
@@ -503,4 +503,4 @@ auto.offset.reset=earliest
 **Last Updated:** 2026-10-29
 **Applies To:** pg_kafka Phase 11 Complete (Shadow Mode)
 **API Coverage:** 26 of ~50 Kafka APIs (52%)
-**Test Status:** 746 unit + 10 property + 221 E2E tests (CI-gated; counts drift — CI is the source of truth)
+**Test Status:** unit + property + E2E, CI-gated; counts in [TEST_STRATEGY.md](TEST_STRATEGY.md#test-summary)
