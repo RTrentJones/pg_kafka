@@ -273,19 +273,6 @@ impl<S: KafkaStore> ShadowStore<S> {
     pub fn new(inner: S) -> Self {
         Self::with_db(inner, SpiShadowDb)
     }
-
-    /// Create a new ShadowStore with RuntimeContext for config access
-    ///
-    /// Note: RuntimeContext is no longer used for shadow producer config.
-    /// The producer now loads config directly from GUCs to detect changes.
-    /// This constructor is kept for API compatibility but simply calls new().
-    ///
-    /// # Arguments
-    /// * `inner` - The store to wrap (typically PostgresStore)
-    /// * `_runtime_context` - Unused (kept for API compatibility)
-    pub fn with_context(inner: S, _runtime_context: Arc<crate::kafka::RuntimeContext>) -> Self {
-        Self::new(inner)
-    }
 }
 
 impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {

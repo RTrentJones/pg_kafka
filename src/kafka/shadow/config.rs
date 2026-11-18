@@ -167,12 +167,8 @@ pub struct ShadowConfig {
     pub retry_backoff_ms: i32,
     /// Maximum retries per message
     pub max_retries: i32,
-    /// Default sync mode
-    pub default_sync_mode: SyncMode,
     /// Whether metrics are enabled
     pub metrics_enabled: bool,
-    /// OpenTelemetry endpoint
-    pub otel_endpoint: String,
 }
 
 /// Custom Debug implementation that redacts SASL credentials so a `{:?}` of a
@@ -193,9 +189,7 @@ impl std::fmt::Debug for ShadowConfig {
             .field("linger_ms", &self.linger_ms)
             .field("retry_backoff_ms", &self.retry_backoff_ms)
             .field("max_retries", &self.max_retries)
-            .field("default_sync_mode", &self.default_sync_mode)
             .field("metrics_enabled", &self.metrics_enabled)
-            .field("otel_endpoint", &self.otel_endpoint)
             .finish()
     }
 }
@@ -215,9 +209,7 @@ impl ShadowConfig {
             linger_ms: config.shadow_linger_ms,
             retry_backoff_ms: config.shadow_retry_backoff_ms,
             max_retries: config.shadow_max_retries,
-            default_sync_mode: SyncMode::parse(&config.shadow_default_sync_mode),
             metrics_enabled: config.shadow_metrics_enabled,
-            otel_endpoint: config.shadow_otel_endpoint.clone(),
         }
     }
 
@@ -385,9 +377,7 @@ impl Default for ShadowConfig {
             linger_ms: DEFAULT_SHADOW_LINGER_MS,
             retry_backoff_ms: DEFAULT_SHADOW_RETRY_BACKOFF_MS,
             max_retries: DEFAULT_SHADOW_MAX_RETRIES,
-            default_sync_mode: SyncMode::parse(DEFAULT_SHADOW_SYNC_MODE),
             metrics_enabled: DEFAULT_SHADOW_METRICS_ENABLED,
-            otel_endpoint: DEFAULT_SHADOW_OTEL_ENDPOINT.to_string(),
         }
     }
 }

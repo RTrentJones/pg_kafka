@@ -108,10 +108,8 @@ reads acks from the network thread over the ack channel and queues them for `dra
 │   │  pg_kafka.shadow_linger_ms = 10                                        │    │
 │   │  pg_kafka.shadow_retry_backoff_ms = 100                                │    │
 │   │  pg_kafka.shadow_max_retries = 3                                       │    │
-│   │  pg_kafka.shadow_default_sync_mode = 'async'                           │    │
 │   │  pg_kafka.shadow_metrics_enabled = true                                │    │
 │   │  pg_kafka.shadow_external_primary_strict = false                       │    │
-│   │  pg_kafka.shadow_otel_endpoint = ''                                    │    │
 │   └────────────────────────────────────────────────────────────────────────┘    │
 │                                        │                                         │
 │                                        ▼                                         │

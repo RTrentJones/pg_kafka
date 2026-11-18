@@ -174,9 +174,9 @@ pub fn mock_config() -> crate::config::Config {
     use crate::kafka::constants::{
         DEFAULT_FETCH_POLL_INTERVAL_MS, DEFAULT_SHADOW_BATCH_SIZE,
         DEFAULT_SHADOW_BOOTSTRAP_SERVERS, DEFAULT_SHADOW_LINGER_MS, DEFAULT_SHADOW_MAX_RETRIES,
-        DEFAULT_SHADOW_METRICS_ENABLED, DEFAULT_SHADOW_MODE_ENABLED, DEFAULT_SHADOW_OTEL_ENDPOINT,
+        DEFAULT_SHADOW_METRICS_ENABLED, DEFAULT_SHADOW_MODE_ENABLED,
         DEFAULT_SHADOW_RETRY_BACKOFF_MS, DEFAULT_SHADOW_SASL_MECHANISM,
-        DEFAULT_SHADOW_SECURITY_PROTOCOL, DEFAULT_SHADOW_SYNC_MODE,
+        DEFAULT_SHADOW_SECURITY_PROTOCOL,
     };
     crate::config::Config {
         port: DEFAULT_KAFKA_PORT,
@@ -201,9 +201,7 @@ pub fn mock_config() -> crate::config::Config {
         shadow_linger_ms: DEFAULT_SHADOW_LINGER_MS,
         shadow_retry_backoff_ms: DEFAULT_SHADOW_RETRY_BACKOFF_MS,
         shadow_max_retries: DEFAULT_SHADOW_MAX_RETRIES,
-        shadow_default_sync_mode: DEFAULT_SHADOW_SYNC_MODE.to_string(),
         shadow_metrics_enabled: DEFAULT_SHADOW_METRICS_ENABLED,
-        shadow_otel_endpoint: DEFAULT_SHADOW_OTEL_ENDPOINT.to_string(),
         // Tests run in eval mode by default (Commercial License)
         shadow_license_key: "eval".to_string(),
         test_forward_ack_delay_ms: 0,

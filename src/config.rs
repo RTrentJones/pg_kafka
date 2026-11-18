@@ -20,11 +20,9 @@ use crate::kafka::constants::{
     DEFAULT_SHADOW_MAX_RETRIES,
     DEFAULT_SHADOW_METRICS_ENABLED,
     DEFAULT_SHADOW_MODE_ENABLED,
-    DEFAULT_SHADOW_OTEL_ENDPOINT,
     DEFAULT_SHADOW_RETRY_BACKOFF_MS,
     DEFAULT_SHADOW_SASL_MECHANISM,
     DEFAULT_SHADOW_SECURITY_PROTOCOL,
-    DEFAULT_SHADOW_SYNC_MODE,
     DEFAULT_SHUTDOWN_TIMEOUT_MS,
     DEFAULT_TOPIC_PARTITIONS,
     MAX_CONFIG_RELOAD_MS,
@@ -87,12 +85,8 @@ pub struct Config {
     pub shadow_retry_backoff_ms: i32,
     /// Maximum retries per message
     pub shadow_max_retries: i32,
-    /// Default sync mode for shadow forwarding (async, sync)
-    pub shadow_default_sync_mode: String,
     /// Whether shadow metrics are enabled
     pub shadow_metrics_enabled: bool,
-    /// OpenTelemetry OTLP endpoint for shadow tracing
-    pub shadow_otel_endpoint: String,
     /// License key for Shadow Mode production use (Commercial License)
     /// Format: "sponsor_id:token" or "eval" for evaluation
     pub shadow_license_key: String,
@@ -129,9 +123,7 @@ impl std::fmt::Debug for Config {
             .field("shadow_linger_ms", &self.shadow_linger_ms)
             .field("shadow_retry_backoff_ms", &self.shadow_retry_backoff_ms)
             .field("shadow_max_retries", &self.shadow_max_retries)
-            .field("shadow_default_sync_mode", &self.shadow_default_sync_mode)
             .field("shadow_metrics_enabled", &self.shadow_metrics_enabled)
-            .field("shadow_otel_endpoint", &self.shadow_otel_endpoint)
             .field("shadow_license_key", &"[REDACTED]")
             .field("test_forward_ack_delay_ms", &self.test_forward_ack_delay_ms)
             .finish()
@@ -201,17 +193,7 @@ impl Config {
             shadow_linger_ms: SHADOW_LINGER_MS.get(),
             shadow_retry_backoff_ms: SHADOW_RETRY_BACKOFF_MS.get(),
             shadow_max_retries: SHADOW_MAX_RETRIES.get(),
-            shadow_default_sync_mode: SHADOW_DEFAULT_SYNC_MODE
-                .get()
-                .as_deref()
-                .map(|c| c.to_string_lossy().into_owned())
-                .unwrap_or_else(|| DEFAULT_SHADOW_SYNC_MODE.to_string()),
             shadow_metrics_enabled: SHADOW_METRICS_ENABLED.get(),
-            shadow_otel_endpoint: SHADOW_OTEL_ENDPOINT
-                .get()
-                .as_deref()
-                .map(|c| c.to_string_lossy().into_owned())
-                .unwrap_or_else(|| DEFAULT_SHADOW_OTEL_ENDPOINT.to_string()),
             // License key (Commercial License)
             shadow_license_key: SHADOW_LICENSE_KEY
                 .get()
@@ -248,9 +230,7 @@ impl Config {
             shadow_linger_ms: DEFAULT_SHADOW_LINGER_MS,
             shadow_retry_backoff_ms: DEFAULT_SHADOW_RETRY_BACKOFF_MS,
             shadow_max_retries: DEFAULT_SHADOW_MAX_RETRIES,
-            shadow_default_sync_mode: DEFAULT_SHADOW_SYNC_MODE.to_string(),
             shadow_metrics_enabled: DEFAULT_SHADOW_METRICS_ENABLED,
-            shadow_otel_endpoint: DEFAULT_SHADOW_OTEL_ENDPOINT.to_string(),
             // Tests run in eval mode by default (Commercial License)
             shadow_license_key: "eval".to_string(),
             test_forward_ack_delay_ms: 0,
@@ -292,8 +272,6 @@ static SHADOW_LINGER_MS: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_SHADOW
 static SHADOW_RETRY_BACKOFF_MS: GucSetting<i32> =
     GucSetting::<i32>::new(DEFAULT_SHADOW_RETRY_BACKOFF_MS);
 static SHADOW_MAX_RETRIES: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_SHADOW_MAX_RETRIES);
-static SHADOW_DEFAULT_SYNC_MODE: GucSetting<Option<CString>> =
-    GucSetting::<Option<CString>>::new(None);
 static SHADOW_METRICS_ENABLED: GucSetting<bool> =
     GucSetting::<bool>::new(DEFAULT_SHADOW_METRICS_ENABLED);
 // RV-6: when true, external-primary topics keep local reads fully suppressed even
@@ -301,7 +279,6 @@ static SHADOW_METRICS_ENABLED: GucSetting<bool> =
 // false (default), a dead-lettered external-primary topic falls back to local reads
 // so a record is never readable nowhere.
 pub static SHADOW_EXTERNAL_PRIMARY_STRICT: GucSetting<bool> = GucSetting::<bool>::new(false);
-static SHADOW_OTEL_ENDPOINT: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 // License key for Shadow Mode (Commercial License)
 static SHADOW_LICENSE_KEY: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 pub static CONFIG_RELOAD_INTERVAL_MS: GucSetting<i32> =
@@ -586,15 +563,6 @@ pub fn init() {
         GucFlags::default(),
     );
 
-    GucRegistry::define_string_guc(
-        c"pg_kafka.shadow_default_sync_mode",
-        c"Default sync mode for shadow forwarding",
-        c"Default forwarding mode: 'async' (non-blocking) or 'sync' (wait for ack). Default: async.",
-        &SHADOW_DEFAULT_SYNC_MODE,
-        GucContext::Suset,
-        GucFlags::default(),
-    );
-
     GucRegistry::define_bool_guc(
         c"pg_kafka.shadow_metrics_enabled",
         c"Enable shadow mode metrics",
@@ -609,15 +577,6 @@ pub fn init() {
         c"Keep external-primary topics fully read-suppressed even when a forward is dead-lettered",
         c"When true, external-primary topics never fall back to local reads (external-only-strict; a dead-lettered record is accepted as lost). When false (default), a dead-lettered external-primary topic serves the record locally so it is never readable nowhere (RV-6).",
         &SHADOW_EXTERNAL_PRIMARY_STRICT,
-        GucContext::Suset,
-        GucFlags::default(),
-    );
-
-    GucRegistry::define_string_guc(
-        c"pg_kafka.shadow_otel_endpoint",
-        c"OpenTelemetry OTLP endpoint for shadow tracing",
-        c"OTLP endpoint for sending shadow mode traces (e.g., 'http://localhost:4317'). Empty to disable.",
-        &SHADOW_OTEL_ENDPOINT,
         GucContext::Suset,
         GucFlags::default(),
     );
@@ -693,8 +652,8 @@ mod tests {
         DEFAULT_COMPRESSION_TYPE, DEFAULT_DATABASE, DEFAULT_FETCH_POLL_INTERVAL_MS,
         DEFAULT_KAFKA_PORT, DEFAULT_SHADOW_BATCH_SIZE, DEFAULT_SHADOW_BOOTSTRAP_SERVERS,
         DEFAULT_SHADOW_LINGER_MS, DEFAULT_SHADOW_MAX_RETRIES, DEFAULT_SHADOW_METRICS_ENABLED,
-        DEFAULT_SHADOW_MODE_ENABLED, DEFAULT_SHADOW_OTEL_ENDPOINT, DEFAULT_SHADOW_RETRY_BACKOFF_MS,
-        DEFAULT_SHADOW_SASL_MECHANISM, DEFAULT_SHADOW_SECURITY_PROTOCOL, DEFAULT_SHADOW_SYNC_MODE,
+        DEFAULT_SHADOW_MODE_ENABLED, DEFAULT_SHADOW_RETRY_BACKOFF_MS,
+        DEFAULT_SHADOW_SASL_MECHANISM, DEFAULT_SHADOW_SECURITY_PROTOCOL,
         DEFAULT_SHUTDOWN_TIMEOUT_MS, DEFAULT_TOPIC_PARTITIONS, MAX_CONFIG_RELOAD_MS,
         MAX_FETCH_POLL_INTERVAL_MS, MAX_SHADOW_BATCH_SIZE, MAX_SHADOW_LINGER_MS,
         MAX_SHADOW_MAX_RETRIES, MAX_SHADOW_RETRY_BACKOFF_MS, MIN_CONFIG_RELOAD_MS,
@@ -833,13 +792,6 @@ mod tests {
     }
 
     #[test]
-    fn test_config_default_shadow_sync_mode() {
-        let config = Config::load();
-        assert_eq!(config.shadow_default_sync_mode, DEFAULT_SHADOW_SYNC_MODE);
-        assert_eq!(config.shadow_default_sync_mode, "async");
-    }
-
-    #[test]
     fn test_config_default_shadow_metrics_enabled() {
         let config = Config::load();
         assert_eq!(
@@ -865,13 +817,6 @@ mod tests {
             DEFAULT_SHADOW_BOOTSTRAP_SERVERS
         );
         assert!(config.shadow_bootstrap_servers.is_empty());
-    }
-
-    #[test]
-    fn test_config_default_shadow_otel_endpoint_empty() {
-        let config = Config::load();
-        assert_eq!(config.shadow_otel_endpoint, DEFAULT_SHADOW_OTEL_ENDPOINT);
-        assert!(config.shadow_otel_endpoint.is_empty());
     }
 
     #[test]
@@ -964,9 +909,7 @@ mod tests {
         let _shadow_linger_ms: i32 = config.shadow_linger_ms;
         let _shadow_retry_backoff_ms: i32 = config.shadow_retry_backoff_ms;
         let _shadow_max_retries: i32 = config.shadow_max_retries;
-        let _shadow_default_sync_mode: String = config.shadow_default_sync_mode;
         let _shadow_metrics_enabled: bool = config.shadow_metrics_enabled;
-        let _shadow_otel_endpoint: String = config.shadow_otel_endpoint;
         let _shadow_license_key: String = config.shadow_license_key;
     }
 

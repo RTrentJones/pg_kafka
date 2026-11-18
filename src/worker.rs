@@ -292,10 +292,8 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     // Always create ShadowStore wrapping PostgresStore. Shadow mode can be
     // enabled/disabled at runtime via pg_kafka.shadow_mode_enabled GUC.
     // The producer is lazily initialized on first use when enabled.
-    // Pass RuntimeContext to enable centralized config access.
-    let shadow_store: std::sync::Arc<ShadowStore<PostgresStore>> = std::sync::Arc::new(
-        ShadowStore::with_context(PostgresStore::new(), runtime_context.clone()),
-    );
+    let shadow_store: std::sync::Arc<ShadowStore<PostgresStore>> =
+        std::sync::Arc::new(ShadowStore::new(PostgresStore::new()));
 
     // Set license key for shadow mode (Commercial License)
     shadow_store.set_license_key(&config.shadow_license_key);
