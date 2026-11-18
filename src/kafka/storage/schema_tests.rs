@@ -3,6 +3,8 @@
 //! guard their shape from plain `cargo test`.
 
 const BOOTSTRAP_SQL: &str = include_str!("../../../sql/bootstrap.sql");
+const UPGRADE_0_1_0_SQL: &str = include_str!("../../../sql/pg_kafka--0.0.0--0.1.0.sql");
+const CARGO_TOML: &str = include_str!("../../../Cargo.toml");
 
 /// Lower-cased script with `--` comments stripped, so assertions match statements only.
 fn statements(sql: &str) -> String {
@@ -136,4 +138,24 @@ mod partition_bounds {
         assert_eq!(got, vec![("b", 2, 1), ("a", 1, 3), ("b", 2, 1)]);
         assert!(order_topic_metadata(&[], vec![]).is_empty());
     }
+}
+
+#[test]
+fn crate_version_has_an_upgrade_script_from_0_0_0() {
+    // The extension version is the crate version (pg_kafka.control: @CARGO_VERSION@).
+    assert!(CARGO_TOML.contains("\nversion = \"0.1.0\""));
+    assert_eq!(env!("CARGO_PKG_VERSION"), "0.1.0");
+    assert!(
+        UPGRADE_0_1_0_SQL.contains("\\quit"),
+        "the script must refuse to run under psql"
+    );
+}
+
+#[test]
+fn upgrade_script_applies_the_bootstrap_index_changes() {
+    let sql = statements(UPGRADE_0_1_0_SQL);
+    assert!(sql.contains("drop index if exists kafka.idx_messages_topic_partition_offset"));
+    assert!(sql.contains(
+        "create index if not exists idx_messages_created_at_brin\non kafka.messages using brin (created_at) with (autosummarize = on)"
+    ));
 }

@@ -281,6 +281,8 @@ kafka_test/             # E2E test suite (221 tests)
 
 sql/
 ├── bootstrap.sql       # Schema definition (kafka.messages, kafka.topics, kafka.consumer_offsets, ...)
+├── pg_kafka--0.0.0--0.1.0.sql  # Upgrade script (ALTER EXTENSION pg_kafka UPDATE; see docs/UPGRADING.md)
+├── upgrade-test/       # Frozen 0.0.0 install script used by scripts/check-upgrade.sh
 └── tune_autovacuum.sql # Optional performance tuning script
 
 docs/
@@ -296,6 +298,7 @@ docs/
 ├── SHADOW_MODE_FLOW_DIAGRAM.md # Shadow mode flow diagram
 ├── SHADOW_EVIDENCE_PLAN.md     # Shadow forwarding evidence/reporting plan
 ├── LICENSING.md                # Dual-licensing model
+├── UPGRADING.md                # Extension versioning and the ALTER EXTENSION UPDATE procedure
 ├── AUDIT-2026-06.md            # June 2026 code audit
 ├── DEEP-REVIEW-2026-07.md      # July 2026 deep review
 └── architecture/
@@ -304,6 +307,7 @@ docs/
 
 scripts/
 ├── restart.sh          # Quick rebuild and restart script for development
+├── check-upgrade.sh    # CI: 0.0.0 -> current upgrade must match a fresh install
 ├── run-shadow-tests.sh # Sets up Docker + PostgreSQL and runs the shadow E2E tests
 ├── generate-evidence.sh  # Builds the evidence artifacts (conformance, bench, session, shadow)
 └── record-session.sh   # Records the kcat produce/consume session as an animated SVG

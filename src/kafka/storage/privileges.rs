@@ -153,6 +153,7 @@ mod tests {
     use super::*;
 
     const BOOTSTRAP_SQL: &str = include_str!("../../../sql/bootstrap.sql");
+    const UPGRADE_0_1_0_SQL: &str = include_str!("../../../sql/pg_kafka--0.0.0--0.1.0.sql");
     /// The SQL-issuing files on the worker's path. Add a file here when it starts
     /// issuing SQL from the background worker.
     const WORKER_SQL_SOURCES: &[(&str, &str)] = &[
@@ -212,6 +213,21 @@ mod tests {
             .collect();
         expected.sort();
         assert_eq!(flat, expected);
+    }
+
+    /// A 0.0.0 install upgraded to 0.1.0 grants exactly what a fresh 0.1.0 install does.
+    #[test]
+    fn upgrade_script_grants_match_bootstrap() {
+        for role in [READER_ROLE, WORKER_ROLE] {
+            let mut fresh = grants_to(BOOTSTRAP_SQL, role);
+            let mut upgraded = grants_to(UPGRADE_0_1_0_SQL, role);
+            fresh.sort();
+            upgraded.sort();
+            assert_eq!(fresh, upgraded, "grants to {} differ", role);
+        }
+        assert!(
+            UPGRADE_0_1_0_SQL.contains("REVOKE EXECUTE ON FUNCTION kafka.replay_shadow_messages")
+        );
     }
 
     #[test]

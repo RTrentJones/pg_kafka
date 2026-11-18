@@ -50,11 +50,10 @@ CREATE TABLE kafka.topics (
     retention_ms BIGINT,
     created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
--- Idempotent guard for the additive column above. pg_kafka follows a
--- fresh-install (CREATE EXTENSION) schema convention with no upgrade scripts,
--- so this is not auto-run on an in-place upgrade; it makes re-applying this
--- file a no-op and gives operators an explicit, copy-pasteable manual upgrade
--- path (run this one statement) instead of a runtime "column does not exist".
+-- Idempotent guard for the additive column above: re-applying this file is a
+-- no-op. Existing installs get schema changes from the versioned upgrade scripts
+-- (sql/pg_kafka--<from>--<to>.sql, run by ALTER EXTENSION pg_kafka UPDATE; see
+-- docs/UPGRADING.md), which repeat this statement for 0.0.0 installs that predate it.
 ALTER TABLE kafka.topics ADD COLUMN IF NOT EXISTS retention_ms BIGINT;
 
 -- Messages table: The actual message log with dual-offset design
