@@ -201,6 +201,7 @@ src/
 │   │   ├── encoding.rs # Response encoding
 │   │   └── recordbatch.rs  # RecordBatch v2 / legacy MessageSet parsing
 │   ├── messages.rs     # Request/response types, message queues
+│   ├── metrics.rs      # Broker request metrics (atomics) + periodic flush to kafka.broker_* tables
 │   ├── dispatch.rs     # Request dispatch helpers used by worker.rs
 │   ├── context.rs      # Runtime context (shared configuration access)
 │   ├── handler_context.rs  # HandlerContext (store, coordinator, broker metadata) passed to handlers
@@ -487,7 +488,10 @@ CREATE TABLE kafka.txn_pending_offsets (
 
 -- Phase 11 (Shadow Mode): kafka.shadow_config, kafka.shadow_tracking (durable outbox),
 -- kafka.shadow_metrics, view kafka.shadow_status, function kafka.replay_shadow_messages().
--- Monitoring: view kafka.metrics.
+-- Monitoring: view kafka.metrics (row-count snapshot); views kafka.api_metrics (per-API
+-- requests/errors/latency), kafka.broker_metrics (connections, request-queue depth) and
+-- kafka.consumer_lag. The first two read UNLOGGED tables the worker upserts at most once per
+-- second when its in-memory counters (src/kafka/metrics.rs) changed.
 ```
 
 **Why Dual Offsets?**

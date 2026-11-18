@@ -137,6 +137,7 @@ pub use error_paths::{
     test_timed_out_transaction_cannot_be_resumed,
     test_txn_offset_commit_failure_reports_partition_errors,
 };
+pub use error_paths::{test_consumer_lag_view, test_metrics_count_produce_and_fetch};
 pub use negative::{
     test_connection_refused, test_duplicate_consumer_join, test_invalid_group_id,
     test_produce_timeout, test_sasl_password_guc_is_superuser_only,

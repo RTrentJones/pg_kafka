@@ -541,6 +541,9 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     // Flag to track if SIGHUP was received (triggers immediate config reload)
     let mut sighup_pending = false;
 
+    // Broker request metrics: published to kafka.broker_api_stats / kafka.broker_gauges.
+    let mut metrics_flusher = crate::kafka::metrics::MetricsFlusher::new();
+
     loop {
         // ┌─────────────────────────────────────────────────────────────┐
         // │ Check for Postgres Shutdown Signal                          │
@@ -867,6 +870,23 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
             });
             last_retention_sweep = Instant::now();
         }
+
+        // ┌─────────────────────────────────────────────────────────────┐
+        // │ Publish Broker Metrics (≤ once per second, only if changed) │
+        // └─────────────────────────────────────────────────────────────┘
+        // One upsert statement per flush; no SQL at all while nothing changed.
+        if let Some(batch) = metrics_flusher.poll(request_rx.len(), liveness_rx.len()) {
+            let written = BackgroundWorker::transaction(|| {
+                let mut written = Ok(());
+                let guard = run_request_in_subtransaction(|| {
+                    written = crate::kafka::metrics::write_batch(&batch);
+                });
+                guard.and(written)
+            });
+            if let Some(msg) = metrics_flusher.finish(batch, written) {
+                pg_warning!("{}", msg);
+            }
+        }
     }
 }
 
@@ -915,6 +935,7 @@ fn execute_request_in_transaction(
     // involved.
     let is_produce = matches!(request, crate::kafka::KafkaRequest::Produce { .. });
     let (api_key, api_version, correlation_id) = request.wire_ids();
+    let mut request_metrics = crate::kafka::metrics::RequestTimer::start(api_key);
     let (buffer_tx, mut buffer_rx) = tokio::sync::mpsc::unbounded_channel();
     let client_tx = request.swap_response_tx(buffer_tx);
 
@@ -991,6 +1012,7 @@ fn execute_request_in_transaction(
             // response, but the loop keeps a future multi-response request
             // from silently dropping frames.
             while let Ok(response) = buffer_rx.try_recv() {
+                request_metrics.observe(&response);
                 if client_tx.send(response).is_err() {
                     pg_warning!(
                         "Client disconnected before response flush (correlation_id={})",
@@ -1008,6 +1030,7 @@ fn execute_request_in_transaction(
             // Postgres error-state cleanup), then re-raise the panic to
             // preserve today's worker-restart semantics.
             while buffer_rx.try_recv().is_ok() {}
+            request_metrics.mark_error();
             let error_response = crate::kafka::response_builders::error_response_for(
                 api_key,
                 api_version,

@@ -43,6 +43,7 @@ pub mod handler_context;
 pub mod handlers;
 pub mod listener;
 pub mod messages;
+pub mod metrics;
 pub mod notifications;
 pub mod partitioner;
 pub mod pending_fetches;
