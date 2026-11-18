@@ -3,6 +3,7 @@
 // This module implements the storage layer using PostgreSQL and pgrx SPI.
 // It assumes it runs within a transaction context managed by the caller.
 
+use super::retention;
 use super::{
     CommittedOffset, FetchedMessage, IsolationLevel, KafkaStore, TopicMetadata, TransactionState,
 };
@@ -36,11 +37,9 @@ pub const PRODUCER_ID_RETENTION: Duration = Duration::from_secs(7 * 24 * 3600);
 pub const TERMINAL_TXN_RETENTION: Duration = Duration::from_secs(7 * 24 * 3600);
 /// Age after which successfully forwarded shadow-outbox rows are deleted.
 pub const SHADOW_DELIVERED_RETENTION: Duration = Duration::from_secs(24 * 3600);
-/// Per-sweep cap on expired-message deletes, so one sweep can't hold the DB thread
-/// (and its transaction) for an unbounded scan after retention is first enabled on
-/// a large backlog. The sweep runs every RETENTION_SWEEP_INTERVAL, so the backlog
-/// drains incrementally.
-pub const RETENTION_DELETE_BATCH: i64 = 10_000;
+// Expired-message batching: see super::retention (RETENTION_DELETE_BATCH,
+// RETENTION_PASS_BUDGET), re-exported here for existing callers.
+pub use super::retention::{RETENTION_DELETE_BATCH, RETENTION_PASS_BUDGET};
 
 /// Row counts deleted by one retention sweep (see `run_retention_sweep`).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -227,58 +226,86 @@ impl PostgresStore {
         };
 
         Spi::connect_mut(|client| {
-            // Expired messages. Batched via ctid so one sweep is bounded; never
-            // deletes pending transactional rows. Per-topic `retention.ms`
+            // Expired messages. Each topic's effective window comes from
+            // `effective_retention_window_ms`: per-topic `retention.ms`
             // (kafka.topics.retention_ms, settable via IncrementalAlterConfigs)
-            // overrides the global GUC: >= 0 enforces that window even when the
+            // overrides the global GUC — >= 0 enforces that window even when the
             // global sweep is off; < 0 pins the topic to infinite retention even
             // when a global window is set; NULL falls back to the GUC.
-            let table = client.update(
-                "DELETE FROM kafka.messages
-                 WHERE ctid IN (
-                     SELECT m.ctid FROM kafka.messages m
-                     JOIN kafka.topics t ON t.id = m.topic_id
-                     WHERE (m.txn_state IS NULL OR m.txn_state <> 'pending')
-                       AND (
-                            (t.retention_ms IS NOT NULL AND t.retention_ms >= 0
-                             -- Clamp to 1e13 ms (~317 years): larger values, such as the
-                             -- common i64::MAX for forever, overflow the interval or the
-                             -- timestamp and abort the whole sweep for every topic. Build
-                             -- the interval by multiplication: PG14 rejects a text
-                             -- 'N milliseconds' literal above the int32 range.
-                             AND m.created_at < NOW() - LEAST(t.retention_ms, 10000000000000) * INTERVAL '1 millisecond')
-                         OR (t.retention_ms IS NULL AND $1 > 0
-                             AND m.created_at < NOW() - ($1 || ' hours')::interval)
-                       )
-                     LIMIT $2
-                 )
-                 RETURNING topic_id, partition_id",
-                None,
-                &[
-                    (message_retention_hours as i64).into(),
-                    RETENTION_DELETE_BATCH.into(),
-                ],
-            )?;
-            // Collect the distinct partitions this batch touched so we can
-            // advance their durable log start (Codex review, PR #95): like
-            // DeleteRecords, retention deletion must advance
-            // partition_offsets.log_start_offset — otherwise a partition emptied
-            // by retention reports EARLIEST=0 via get_earliest_offset and a
-            // consumer resets to offsets retention already removed. Offsets are
-            // assigned monotonically with created_at, so retention deletes an
-            // offset-contiguous prefix; the new log start is the oldest
-            // surviving offset, or next_offset (the HWM) when the partition is
-            // now empty.
+            //
+            // Deletes run per topic, in RETENTION_DELETE_BATCH batches, until the
+            // topic is caught up (a short batch) or the pass has spent
+            // RETENTION_PASS_BUDGET. The previous single 10,000-row batch per 60 s
+            // pass let the table grow without bound above ~167 records/s. The
+            // per-topic cutoff is one constant per statement, so the planner can
+            // use idx_messages_created_at_brin (or the primary key's topic_id
+            // prefix) instead of scanning the whole table. Pending transactional
+            // rows are never deleted.
+            let topics = client.select("SELECT id, retention_ms FROM kafka.topics ORDER BY id", None, &[])?;
+            let mut windows: Vec<(i32, i64)> = Vec::new();
+            for row in topics {
+                let id: i32 = row.get_by_name("id")?.unwrap_or(0);
+                let retention_ms: Option<i64> = row.get_by_name("retention_ms")?;
+                if let Some(window_ms) = retention::effective_retention_window_ms(
+                    retention_ms,
+                    message_retention_hours,
+                ) {
+                    windows.push((id, window_ms));
+                }
+            }
+            let windows = retention::rotated(&windows, retention::next_start_index(windows.len()));
+
+            let pass_start = std::time::Instant::now();
             let mut affected: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
             let mut expired = 0u64;
-            for row in table {
-                expired += 1;
-                let tid: i32 = row.get_by_name("topic_id")?.unwrap_or(0);
-                let pid: i32 = row.get_by_name("partition_id")?.unwrap_or(0);
-                affected.insert((tid, pid));
+            'topics: for (topic_id, window_ms) in windows {
+                loop {
+                    if pass_start.elapsed() >= RETENTION_PASS_BUDGET {
+                        break 'topics;
+                    }
+                    // Window built by multiplication: PG14 rejects a text
+                    // 'N milliseconds' literal above the int32 range.
+                    let table = client.update(
+                        "DELETE FROM kafka.messages
+                         WHERE ctid IN (
+                             SELECT m.ctid FROM kafka.messages m
+                             WHERE m.topic_id = $1
+                               AND m.created_at < NOW() - $2::bigint * INTERVAL '1 millisecond'
+                               AND (m.txn_state IS NULL OR m.txn_state <> 'pending')
+                             LIMIT $3
+                         )
+                         RETURNING topic_id, partition_id",
+                        None,
+                        &[topic_id.into(), window_ms.into(), RETENTION_DELETE_BATCH.into()],
+                    )?;
+                    let mut deleted = 0u64;
+                    for row in table {
+                        deleted += 1;
+                        let tid: i32 = row.get_by_name("topic_id")?.unwrap_or(0);
+                        let pid: i32 = row.get_by_name("partition_id")?.unwrap_or(0);
+                        affected.insert((tid, pid));
+                    }
+                    expired += deleted;
+                    if !retention::should_run_another_batch(
+                        deleted,
+                        RETENTION_DELETE_BATCH,
+                        pass_start.elapsed(),
+                        RETENTION_PASS_BUDGET,
+                    ) {
+                        break;
+                    }
+                }
             }
             stats.expired_messages = expired;
 
+            // Advance the durable log start of every partition the deletes touched
+            // (Codex review, PR #95): like DeleteRecords, retention deletion must
+            // advance partition_offsets.log_start_offset — otherwise a partition
+            // emptied by retention reports EARLIEST=0 via get_earliest_offset and a
+            // consumer resets to offsets retention already removed. Offsets are
+            // assigned monotonically with created_at, so retention deletes an
+            // offset-contiguous prefix; the new log start is the oldest surviving
+            // offset, or next_offset (the HWM) when the partition is now empty.
             if !affected.is_empty() {
                 let (topic_ids, partition_ids): (Vec<i32>, Vec<i32>) =
                     affected.into_iter().unzip();

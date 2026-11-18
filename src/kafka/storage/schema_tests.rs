@@ -27,3 +27,12 @@ fn bootstrap_has_no_index_duplicating_the_messages_primary_key() {
     );
     assert!(sql.contains("primary key (topic_id, partition_id, partition_offset)"));
 }
+
+#[test]
+fn bootstrap_indexes_created_at_for_the_retention_sweep() {
+    let sql = statements(BOOTSTRAP_SQL);
+    assert!(
+        sql.contains("create index idx_messages_created_at_brin\non kafka.messages using brin (created_at) with (autosummarize = on)"),
+        "the retention sweep's created_at cutoff needs an index"
+    );
+}

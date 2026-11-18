@@ -11,6 +11,7 @@ mod fetch_errors;
 mod offset_errors;
 mod producer_errors;
 mod review_regressions;
+mod storage_tests;
 
 pub use bug_hunt::*;
 pub use consumer_errors::*;
@@ -19,3 +20,4 @@ pub use fetch_errors::*;
 pub use offset_errors::*;
 pub use producer_errors::*;
 pub use review_regressions::*;
+pub use storage_tests::*;

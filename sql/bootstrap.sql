@@ -70,6 +70,15 @@ CREATE TABLE kafka.messages (
 -- idx_messages_topic_partition_offset duplicated the primary key exactly and only
 -- doubled write amplification on the hottest table (dropped in 0.1.0).
 
+-- Retention expiry scans (run_retention_sweep: WHERE topic_id = ? AND created_at < cutoff).
+-- BRIN, not btree: created_at grows with insertion order, so a BRIN summary per block
+-- range lets the sweep skip every block of still-retained messages at a tiny fraction of
+-- a btree's size and insert cost. autosummarize asks autovacuum to summarize each
+-- block range as it fills; an unsummarized range always matches, so without it the
+-- newest ranges would be rechecked until the next VACUUM. Added in 0.1.0.
+CREATE INDEX idx_messages_created_at_brin
+ON kafka.messages USING brin (created_at) WITH (autosummarize = on);
+
 -- Index for read_committed filtering (Phase 10: exclude pending transactional messages)
 -- Supports: SELECT * FROM kafka.messages WHERE ... AND (txn_state IS NULL)
 CREATE INDEX idx_messages_txn_pending

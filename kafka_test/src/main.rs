@@ -271,6 +271,7 @@ use kafka_test::{
     // Pipelining tests
     test_request_pipelining,
     test_response_ordering_with_long_poll,
+    test_retention_sweep_catches_up_on_backlog,
     // Retention sweep tests (DR-1/DR-2)
     test_retention_sweep_expires_old_messages,
     test_retention_sweep_reclaims_aborted_messages,
@@ -829,6 +830,12 @@ fn get_all_tests() -> Vec<TestDef> {
             category: "error_paths",
             name: "test_active_idempotent_producer_survives_retention_sweep",
             test_fn: wrap_test!(test_active_idempotent_producer_survives_retention_sweep),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_retention_sweep_catches_up_on_backlog",
+            test_fn: wrap_test!(test_retention_sweep_catches_up_on_backlog),
             parallel_safe: true,
         },
         TestDef {

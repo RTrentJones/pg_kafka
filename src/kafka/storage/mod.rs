@@ -809,6 +809,7 @@ pub fn validate_sequence(
 
 // Submodules
 pub mod postgres;
+pub mod retention;
 
 #[cfg(test)]
 mod tests;
