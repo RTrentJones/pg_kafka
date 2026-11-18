@@ -102,12 +102,6 @@ pub fn topic_resolution_error_code(resolution: &TopicResolution) -> i16 {
     }
 }
 
-/// Creates an UnknownTopic error with proper Kafka error code
-#[allow(dead_code)]
-pub fn unknown_topic_error(topic: &str) -> KafkaError {
-    KafkaError::unknown_topic(topic)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,23 +158,6 @@ mod tests {
         let resolution = TopicResolution::Error(42);
         let code = topic_resolution_error_code(&resolution);
         assert_eq!(code, 42);
-    }
-
-    // ========== unknown_topic_error Tests ==========
-
-    #[test]
-    fn test_unknown_topic_error_creates_error() {
-        let err = unknown_topic_error("my-missing-topic");
-        assert!(matches!(err, KafkaError::UnknownTopic { .. }));
-        let msg = err.to_string();
-        assert!(msg.contains("my-missing-topic"));
-    }
-
-    #[test]
-    fn test_unknown_topic_error_has_correct_code() {
-        let err = unknown_topic_error("test-topic");
-        let code = err.to_kafka_error_code();
-        assert_eq!(code, ERROR_UNKNOWN_TOPIC_OR_PARTITION);
     }
 
     // ========== resolve_topic_id Tests with MockKafkaStore ==========

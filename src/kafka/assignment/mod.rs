@@ -41,7 +41,5 @@ mod tests;
 
 // Re-export main types
 pub use member_assignment::MemberAssignment;
-pub use strategies::{
-    create_strategy, select_common_strategy, AssignmentInput, AssignmentOutput, AssignmentStrategy,
-};
+pub use strategies::{create_strategy, AssignmentInput, AssignmentOutput, AssignmentStrategy};
 pub use subscription::MemberSubscription;
