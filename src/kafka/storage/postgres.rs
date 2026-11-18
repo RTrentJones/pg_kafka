@@ -13,6 +13,46 @@ use crate::kafka::messages::Record;
 use pgrx::prelude::*;
 use std::time::Duration;
 
+// ADR-001: kafka.messages is time-partitioned, and the hot read statements (produce's
+// base-offset probe, Fetch, the partition-bounds/HWM/earliest probes) do not name the
+// partition key, so planning them expands every leaf: with ~11 leaves planning cost
+// several times the execution. These statements therefore run through prepared plans
+// kept for the life of the backend (SPI_keepplan). The plan cache re-plans them
+// automatically when a leaf is created or dropped. One cache per backend: the worker's
+// single DB thread, or a backend running a pg_extern. Keyed by the SQL text.
+thread_local! {
+    static PLAN_CACHE: std::cell::RefCell<
+        std::collections::HashMap<&'static str, pgrx::spi::OwnedPreparedStatement>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Run a read-only `sql` with `args` (of `types`) through a kept prepared plan.
+fn select_cached<'conn>(
+    client: &pgrx::spi::SpiClient<'conn>,
+    sql: &'static str,
+    types: &[pg_sys::PgBuiltInOids],
+    args: &[pgrx::datum::DatumWithOid],
+) -> std::result::Result<pgrx::spi::SpiTupleTable<'conn>, pgrx::spi::SpiError> {
+    PLAN_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if !cache.contains_key(sql) {
+            let oids: Vec<PgOid> = types.iter().map(|t| PgOid::BuiltIn(*t)).collect();
+            // prepare_mut: executed with read_only = false, so every execution takes a
+            // fresh READ COMMITTED snapshot exactly like the one-shot statements did.
+            // A read-only execution reuses the active snapshot, which inside a
+            // group-commit transaction can predate commits the client already saw
+            // (e.g. a Fetch would report a stale high watermark).
+            let plan = client.prepare_mut(sql, &oids)?.keep();
+            cache.insert(sql, plan);
+        }
+        let plan = cache.get(sql).expect("plan cached above");
+        client.select(plan, None, args)
+    })
+}
+
+const INT4OID: pg_sys::PgBuiltInOids = pg_sys::PgBuiltInOids::INT4OID;
+const INT8OID: pg_sys::PgBuiltInOids = pg_sys::PgBuiltInOids::INT8OID;
+
 /// PostgreSQL-backed implementation of KafkaStore
 ///
 /// This implementation uses pgrx's SPI (Server Programming Interface) to execute
@@ -47,6 +87,8 @@ pub use super::retention::{RETENTION_DELETE_BATCH, RETENTION_PASS_BUDGET};
 pub struct RetentionSweepStats {
     pub aborted_messages: u64,
     pub expired_messages: u64,
+    /// Whole time partitions (leaves of kafka.messages) dropped by retention.
+    pub dropped_partitions: u64,
     pub stale_producers: u64,
     pub terminal_transactions: u64,
     pub shadow_delivered_rows: u64,
@@ -56,6 +98,7 @@ impl RetentionSweepStats {
     pub fn total(&self) -> u64 {
         self.aborted_messages
             + self.expired_messages
+            + self.dropped_partitions
             + self.stale_producers
             + self.terminal_transactions
             + self.shadow_delivered_rows
@@ -203,82 +246,213 @@ impl PostgresStore {
     /// shadow-outbox rows. The worker calls this every RETENTION_SWEEP_INTERVAL; the
     /// SQL function `pg_kafka_run_retention_sweep()` exposes the same pass on demand.
     ///
-    /// `message_retention_hours` ≤ 0 disables the expired-message delete (messages
-    /// kept forever); pending transactional rows are never deleted regardless of age.
-    /// `aborted_grace` is the ABORTED_MESSAGE_GRACE window (parameterized so the
-    /// on-demand SQL function can shrink it for testing).
+    /// Expired messages (ADR-001, 0.1.0: kafka.messages is time-partitioned):
+    /// * a past time leaf whose every topic is wholly expired (the leaf's upper bound
+    ///   is older than the topic's window) and that holds no pending transactional row
+    ///   is DROPPED whole (`kafka.drop_message_partition`, which re-checks under its
+    ///   lock);
+    /// * a past leaf that must stay (a topic with a longer or infinite window, or a
+    ///   pending row) gets the bounded row delete for its wholly expired topics;
+    /// * a topic whose window is shorter than one leaf (`partition_width_ms`) is still
+    ///   expired row by row everywhere, as before partitioning; longer windows are
+    ///   enforced a leaf at a time (Kafka segment semantics, see
+    ///   `retention::row_level_expiry`), and rows still in the DEFAULT leaf are always
+    ///   expired row by row.
     ///
-    /// Offset-monotonicity safety: the message delete never touches
+    /// `message_retention_hours` ≤ 0 disables the global window (per-topic
+    /// `retention.ms` still applies); pending transactional rows are never deleted
+    /// regardless of age. `aborted_grace` is the ABORTED_MESSAGE_GRACE window
+    /// (parameterized so the on-demand SQL function can shrink it for testing).
+    ///
+    /// Offset-monotonicity safety: neither deletes nor drops touch
     /// `kafka.partition_offsets.next_offset`, and every offset producer/read path
     /// takes `GREATEST(next_offset, MAX+1)` (BUG-3), so removing rows — oldest or
-    /// newest — cannot cause offset reuse or HWM regression. It *does* advance
-    /// `log_start_offset` for emptied partitions (only ever forward, GREATEST) so
-    /// the reported earliest offset tracks retention instead of regressing to 0.
-    /// Consumers positioned before a retention cutoff get a standard Kafka
-    /// out-of-range reset, exactly as with a real broker's retention.
+    /// newest — cannot cause offset reuse or HWM regression. Both *do* advance
+    /// `log_start_offset` for every partition they touched (only ever forward,
+    /// GREATEST) so the reported earliest offset tracks retention instead of
+    /// regressing to 0. Consumers positioned before a retention cutoff get a
+    /// standard Kafka out-of-range reset, exactly as with a real broker's retention.
     pub fn run_retention_sweep(
         &self,
         message_retention_hours: i32,
         aborted_grace: Duration,
+        partition_minutes: i32,
     ) -> Result<RetentionSweepStats> {
         let mut stats = RetentionSweepStats {
             aborted_messages: self.cleanup_aborted_messages(aborted_grace)?,
             ..Default::default()
         };
+        let width_ms = retention::partition_width_ms(partition_minutes);
 
         Spi::connect_mut(|client| {
-            // Expired messages. Each topic's effective window comes from
-            // `effective_retention_window_ms`: per-topic `retention.ms`
-            // (kafka.topics.retention_ms, settable via IncrementalAlterConfigs)
-            // overrides the global GUC — >= 0 enforces that window even when the
-            // global sweep is off; < 0 pins the topic to infinite retention even
-            // when a global window is set; NULL falls back to the GUC.
-            //
-            // Deletes run per topic, in RETENTION_DELETE_BATCH batches, until the
-            // topic is caught up (a short batch) or the pass has spent
-            // RETENTION_PASS_BUDGET. The previous single 10,000-row batch per 60 s
-            // pass let the table grow without bound above ~167 records/s. The
-            // per-topic cutoff is one constant per statement, so the planner can
-            // use idx_messages_created_at_brin (or the primary key's topic_id
-            // prefix) instead of scanning the whole table. Pending transactional
-            // rows are never deleted.
+            // Each topic's effective window comes from `effective_retention_window_ms`:
+            // per-topic `retention.ms` (kafka.topics.retention_ms, settable via
+            // IncrementalAlterConfigs) overrides the global GUC — >= 0 enforces that
+            // window even when the global sweep is off; < 0 pins the topic to infinite
+            // retention even when a global window is set; NULL falls back to the GUC.
             let topics = client.select("SELECT id, retention_ms FROM kafka.topics ORDER BY id", None, &[])?;
+            let mut all_windows: std::collections::HashMap<i32, Option<i64>> =
+                std::collections::HashMap::new();
             let mut windows: Vec<(i32, i64)> = Vec::new();
             for row in topics {
                 let id: i32 = row.get_by_name("id")?.unwrap_or(0);
                 let retention_ms: Option<i64> = row.get_by_name("retention_ms")?;
-                if let Some(window_ms) = retention::effective_retention_window_ms(
+                let window = retention::effective_retention_window_ms(
                     retention_ms,
                     message_retention_hours,
-                ) {
+                );
+                all_windows.insert(id, window);
+                if let Some(window_ms) = window {
                     windows.push((id, window_ms));
                 }
             }
             let windows = retention::rotated(&windows, retention::next_start_index(windows.len()));
 
+            let now_ms: i64 = client
+                .select("SELECT (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint AS now_ms", None, &[])?
+                .first()
+                .get_by_name("now_ms")?
+                .unwrap_or(0);
+
+            // The leaves, oldest first (DEFAULT and the upgrade's MINVALUE leaf first).
+            // Bounds travel back into SQL as text: same session, same DateStyle, so the
+            // timestamptz round-trips exactly (to the microsecond).
+            let table = client.select(
+                "SELECT partition_oid::bigint AS oid, partition_name, is_default,
+                        lower_bound::text AS lower_txt, upper_bound::text AS upper_txt,
+                        (EXTRACT(EPOCH FROM lower_bound) * 1000)::bigint AS lower_ms,
+                        (EXTRACT(EPOCH FROM upper_bound) * 1000)::bigint AS upper_ms
+                 FROM kafka.message_partitions()
+                 ORDER BY lower_bound NULLS FIRST, upper_bound",
+                None,
+                &[],
+            )?;
+            let mut leaves: Vec<retention::TimePartition> = Vec::new();
+            let mut bounds: std::collections::HashMap<u32, (Option<String>, Option<String>)> =
+                std::collections::HashMap::new();
+            for row in table {
+                let oid: i64 = row.get_by_name("oid")?.unwrap_or(0);
+                let oid = oid as u32;
+                bounds.insert(oid, (row.get_by_name("lower_txt")?, row.get_by_name("upper_txt")?));
+                leaves.push(retention::TimePartition {
+                    oid,
+                    name: row.get_by_name("partition_name")?.unwrap_or_default(),
+                    lower_ms: row.get_by_name("lower_ms")?,
+                    upper_ms: row.get_by_name("upper_ms")?,
+                    is_default: row.get_by_name("is_default")?.unwrap_or(false),
+                });
+            }
+
+            // 1. Inspect every past time leaf: drop it whole, trim it, or keep it.
+            let mut to_drop: Vec<(u32, Vec<i32>)> = Vec::new();
+            // (topic, window_ms, leaf oid) row-delete work, in order.
+            let mut work: Vec<(i32, i64, u32)> = Vec::new();
+            for leaf in retention::past_time_partitions(&leaves, now_ms) {
+                let row = client.select(
+                    "SELECT topic_ids, has_pending
+                     FROM kafka.message_partition_contents($1::bigint::oid::regclass)",
+                    None,
+                    &[(leaf.oid as i64).into()],
+                )?;
+                let row = row.first();
+                let present: Vec<Option<i32>> = row.get_by_name("topic_ids")?.unwrap_or_default();
+                let present: Vec<i32> = present.into_iter().flatten().collect();
+                let has_pending: bool = row.get_by_name("has_pending")?.unwrap_or(true);
+                let upper_ms = leaf.upper_ms.unwrap_or(i64::MAX);
+                match retention::classify_leaf(upper_ms, now_ms, &present, has_pending, |t| {
+                    all_windows.get(&t).copied().flatten()
+                }) {
+                    retention::LeafAction::Drop { expired_topics } => {
+                        if to_drop.len() < retention::MAX_PARTITION_DROPS_PER_PASS {
+                            to_drop.push((leaf.oid, expired_topics));
+                        }
+                    }
+                    retention::LeafAction::Trim { topics } => {
+                        for t in topics {
+                            if let Some(Some(w)) = all_windows.get(&t) {
+                                work.push((t, *w, leaf.oid));
+                            }
+                        }
+                    }
+                    retention::LeafAction::Keep => {}
+                }
+            }
+            // 2. Row-level expiry: short windows everywhere they may have expired rows;
+            //    longer windows only in the DEFAULT leaf (the rest is leaf-granular).
+            for (topic_id, window_ms) in &windows {
+                for leaf in &leaves {
+                    if to_drop.iter().any(|(oid, _)| *oid == leaf.oid) {
+                        continue;
+                    }
+                    let in_scope = leaf.is_default
+                        || retention::row_level_expiry(*window_ms, width_ms);
+                    if in_scope && retention::may_hold_expired(leaf, now_ms, *window_ms) {
+                        work.push((*topic_id, *window_ms, leaf.oid));
+                    }
+                }
+            }
+
+            // Deletes run in RETENTION_DELETE_BATCH batches, per (topic, leaf), until
+            // caught up (a short batch) or the pass has spent RETENTION_PASS_BUDGET.
+            // Each statement is confined to one leaf: through the parent with the
+            // leaf's bounds (so the planner prunes to it) and its tableoid (ctid is
+            // only unique within one table), or directly on kafka.messages_default.
+            // The per-topic cutoff is one constant per statement, so the planner can
+            // use the leaf's idx_messages_created_at_brin or its topic_id-prefixed
+            // unique index. Pending transactional rows are never deleted.
+            let default_oid = leaves.iter().find(|l| l.is_default).map(|l| l.oid);
             let pass_start = std::time::Instant::now();
             let mut affected: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
             let mut expired = 0u64;
-            'topics: for (topic_id, window_ms) in windows {
+            'work: for (topic_id, window_ms, leaf_oid) in work {
                 loop {
                     if pass_start.elapsed() >= RETENTION_PASS_BUDGET {
-                        break 'topics;
+                        break 'work;
                     }
                     // Window built by multiplication: PG14 rejects a text
                     // 'N milliseconds' literal above the int32 range.
-                    let table = client.update(
-                        "DELETE FROM kafka.messages
-                         WHERE ctid IN (
-                             SELECT m.ctid FROM kafka.messages m
-                             WHERE m.topic_id = $1
-                               AND m.created_at < NOW() - $2::bigint * INTERVAL '1 millisecond'
-                               AND (m.txn_state IS NULL OR m.txn_state <> 'pending')
-                             LIMIT $3
-                         )
-                         RETURNING topic_id, partition_id",
-                        None,
-                        &[topic_id.into(), window_ms.into(), RETENTION_DELETE_BATCH.into()],
-                    )?;
+                    let table = if Some(leaf_oid) == default_oid {
+                        client.update(
+                            "DELETE FROM kafka.messages_default
+                             WHERE ctid IN (
+                                 SELECT d.ctid FROM kafka.messages_default d
+                                 WHERE d.topic_id = $1
+                                   AND d.created_at < NOW() - $2::bigint * INTERVAL '1 millisecond'
+                                   AND (d.txn_state IS NULL OR d.txn_state <> 'pending')
+                                 LIMIT $3
+                             )
+                             RETURNING topic_id, partition_id",
+                            None,
+                            &[topic_id.into(), window_ms.into(), RETENTION_DELETE_BATCH.into()],
+                        )?
+                    } else {
+                        let (lower, upper) = bounds.get(&leaf_oid).cloned().unwrap_or((None, None));
+                        client.update(
+                            "DELETE FROM kafka.messages
+                             WHERE created_at >= COALESCE($4::text::timestamptz, '-infinity')
+                               AND created_at < COALESCE($5::text::timestamptz, 'infinity')
+                               AND tableoid = $6::bigint::oid
+                               AND ctid = ANY (ARRAY(
+                                   SELECT m.ctid FROM kafka.messages m
+                                   WHERE m.created_at >= COALESCE($4::text::timestamptz, '-infinity')
+                                     AND m.created_at < COALESCE($5::text::timestamptz, 'infinity')
+                                     AND m.tableoid = $6::bigint::oid
+                                     AND m.topic_id = $1
+                                     AND m.created_at < NOW() - $2::bigint * INTERVAL '1 millisecond'
+                                     AND (m.txn_state IS NULL OR m.txn_state <> 'pending')
+                                   LIMIT $3))
+                             RETURNING topic_id, partition_id",
+                            None,
+                            &[
+                                topic_id.into(),
+                                window_ms.into(),
+                                RETENTION_DELETE_BATCH.into(),
+                                lower.into(),
+                                upper.into(),
+                                (leaf_oid as i64).into(),
+                            ],
+                        )?
+                    };
                     let mut deleted = 0u64;
                     for row in table {
                         deleted += 1;
@@ -299,12 +473,35 @@ impl PostgresStore {
             }
             stats.expired_messages = expired;
 
-            // Advance the durable log start of every partition the deletes touched
-            // (Codex review, PR #95): like DeleteRecords, retention deletion must
+            // 3. Whole-leaf drops, last, so the ACCESS EXCLUSIVE lock a drop takes on
+            //    kafka.messages is held only until this transaction commits.
+            for (leaf_oid, expired_topics) in to_drop {
+                let row = client.update(
+                    "SELECT dropped, topic_ids, partition_ids
+                     FROM kafka.drop_message_partition($1::bigint::oid::regclass, $2::int4[])",
+                    None,
+                    &[(leaf_oid as i64).into(), expired_topics.into()],
+                )?;
+                let row = row.first();
+                if row.get_by_name::<bool, _>("dropped")?.unwrap_or(false) {
+                    stats.dropped_partitions += 1;
+                    let tids: Vec<Option<i32>> = row.get_by_name("topic_ids")?.unwrap_or_default();
+                    let pids: Vec<Option<i32>> =
+                        row.get_by_name("partition_ids")?.unwrap_or_default();
+                    for (t, p) in tids.into_iter().zip(pids) {
+                        if let (Some(t), Some(p)) = (t, p) {
+                            affected.insert((t, p));
+                        }
+                    }
+                }
+            }
+
+            // Advance the durable log start of every partition the deletes or drops
+            // touched (Codex review, PR #95): like DeleteRecords, retention must
             // advance partition_offsets.log_start_offset — otherwise a partition
             // emptied by retention reports EARLIEST=0 via get_earliest_offset and a
             // consumer resets to offsets retention already removed. Offsets are
-            // assigned monotonically with created_at, so retention deletes an
+            // assigned monotonically with created_at, so retention removes an
             // offset-contiguous prefix; the new log start is the oldest surviving
             // offset, or next_offset (the HWM) when the partition is now empty.
             if !affected.is_empty() {
@@ -394,6 +591,31 @@ impl PostgresStore {
         .map_err(|e: KafkaError| KafkaError::Internal(format!("run_retention_sweep failed: {}", e)))
     }
 
+    /// ADR-001 partition maintenance: make sure time partitions of `partition_minutes`
+    /// exist for now and the next [`retention::PARTITIONS_AHEAD`] widths, and move any
+    /// row the DEFAULT leaf caught into its proper leaf. The DDL runs inside the
+    /// SECURITY DEFINER function `kafka.ensure_message_partitions`, so the worker role
+    /// needs only EXECUTE on it. Returns the number of leaves created. The worker
+    /// calls this at start and every retention interval; the SQL function
+    /// `pg_kafka_run_partition_maintenance()` runs it on demand.
+    pub fn ensure_time_partitions(&self, partition_minutes: i32) -> Result<i64> {
+        let minutes = partition_minutes.clamp(
+            retention::MIN_PARTITION_MINUTES,
+            retention::MAX_PARTITION_MINUTES,
+        );
+        Spi::connect_mut(|client| {
+            let table = client.update(
+                "SELECT kafka.ensure_message_partitions($1, $2)::bigint AS created",
+                None,
+                &[minutes.into(), retention::PARTITIONS_AHEAD.into()],
+            )?;
+            Ok(table.first().get_by_name::<i64, _>("created")?.unwrap_or(0))
+        })
+        .map_err(|e: KafkaError| {
+            KafkaError::Internal(format!("ensure_time_partitions failed: {}", e))
+        })
+    }
+
     /// Shared produce-path insert for plain and transactional batches (DR-24,
     /// DEEP-REVIEW-2026-07): the two paths were ~90% identical copies (advisory
     /// lock -> BUG-3 base-offset -> UNNEST insert -> counter advance) that had
@@ -434,14 +656,15 @@ impl PostgresStore {
             // existing data the first time a partition is produced to after this counter existed.
             // (Transactional rows are exactly the ones cleanup later deletes, so both paths MUST
             // advance the same counter — the historical duplication risked them drifting.)
-            let table = client.select(
+            let table = select_cached(
+                client,
                 "SELECT GREATEST(
                           COALESCE((SELECT next_offset FROM kafka.partition_offsets
                                     WHERE topic_id = $1 AND partition_id = $2), 0),
                           COALESCE((SELECT MAX(partition_offset) + 1 FROM kafka.messages
                                     WHERE topic_id = $1 AND partition_id = $2), 0)
                         ) AS base_offset",
-                None,
+                &[INT4OID, INT4OID],
                 &[topic_id.into(), partition_id.into()],
             )?;
 
@@ -609,9 +832,10 @@ impl PostgresStore {
                 let limit =
                     (remaining / ESTIMATE_BYTES_PER_MESSAGE + 1).clamp(10, MAX_ROWS_PER_QUERY);
 
-                let table = client.select(
+                let table = select_cached(
+                    client,
                     query,
-                    None,
+                    &[INT4OID, INT4OID, INT8OID, INT8OID],
                     &[
                         topic_id.into(),
                         partition_id.into(),
@@ -815,14 +1039,15 @@ impl KafkaStore for PostgresStore {
             // that predate the counter. Read isolation (read_committed vs read_uncommitted) is
             // unaffected: that is decided by the fetch row filter and the last-stable-offset, not by
             // the HWM bound reported here.
-            let table = client.select(
+            let table = select_cached(
+                client,
                 "SELECT GREATEST(
                      COALESCE((SELECT next_offset FROM kafka.partition_offsets
                                WHERE topic_id = $1 AND partition_id = $2), 0),
                      COALESCE((SELECT MAX(partition_offset) + 1 FROM kafka.messages
                                WHERE topic_id = $1 AND partition_id = $2), 0)
                  ) AS high_watermark",
-                None,
+                &[INT4OID, INT4OID],
                 &[topic_id.into(), partition_id.into()],
             )?;
 
@@ -842,14 +1067,15 @@ impl KafkaStore for PostgresStore {
             // or above it. For a never-truncated partition log_start is 0, so
             // this is unchanged. The LEFT JOIN covers a partition with rows but
             // no counter row (log_start defaults to 0).
-            let table = client.select(
+            let table = select_cached(
+                client,
                 "SELECT GREATEST(
                             COALESCE((SELECT MIN(partition_offset) FROM kafka.messages
                                       WHERE topic_id = $1 AND partition_id = $2), 0),
                             COALESCE((SELECT log_start_offset FROM kafka.partition_offsets
                                       WHERE topic_id = $1 AND partition_id = $2), 0)
                         ) AS earliest_offset",
-                None,
+                &[INT4OID, INT4OID],
                 &[topic_id.into(), partition_id.into()],
             )?;
 
@@ -887,7 +1113,8 @@ impl KafkaStore for PostgresStore {
         // primary-key (or idx_messages_txn_pending) probe; PartitionBounds::from_raw
         // combines them exactly as the single-value methods above do.
         Spi::connect(|client| {
-            let table = client.select(
+            let table = select_cached(
+                client,
                 "SELECT
                      (SELECT next_offset FROM kafka.partition_offsets
                       WHERE topic_id = $1 AND partition_id = $2) AS next_offset,
@@ -900,7 +1127,7 @@ impl KafkaStore for PostgresStore {
                      (SELECT MIN(partition_offset) FROM kafka.messages
                       WHERE topic_id = $1 AND partition_id = $2
                         AND txn_state = 'pending') AS min_pending_offset",
-                None,
+                &[INT4OID, INT4OID],
                 &[topic_id.into(), partition_id.into()],
             )?;
             let row = table.first();
@@ -2293,6 +2520,8 @@ pub fn apply_worker_role() {
                          WHEN 'schema' THEN pg_catalog.has_schema_privilege($1::name, r.obj, r.priv)
                          WHEN 'sequence' THEN CASE WHEN pg_catalog.to_regclass(r.obj) IS NULL THEN false
                               ELSE pg_catalog.has_sequence_privilege($1::name, r.obj, r.priv) END
+                         WHEN 'function' THEN CASE WHEN pg_catalog.to_regprocedure(r.obj) IS NULL THEN false
+                              ELSE pg_catalog.has_function_privilege($1::name, r.obj, r.priv) END
                          ELSE CASE WHEN pg_catalog.to_regclass(r.obj) IS NULL THEN false
                               ELSE pg_catalog.has_table_privilege($1::name, r.obj, r.priv) END
                      END",

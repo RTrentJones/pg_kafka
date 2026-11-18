@@ -40,6 +40,9 @@ pub const WORKER_TABLE_GRANTS: &[(&str, &[&str])] = &[
     ("kafka.broker_gauges", &["SELECT", "INSERT", "UPDATE"]),
     ("kafka.topics", &["SELECT", "INSERT", "UPDATE", "DELETE"]),
     ("kafka.messages", &["SELECT", "INSERT", "UPDATE", "DELETE"]),
+    // ADR-001: the retention sweep's row delete in the DEFAULT time partition (every
+    // other leaf is reached through kafka.messages).
+    ("kafka.messages_default", &["SELECT", "DELETE"]),
     ("kafka.partition_offsets", &["SELECT", "INSERT", "UPDATE"]),
     (
         "kafka.consumer_offsets",
@@ -77,6 +80,16 @@ pub const WORKER_SEQUENCE_GRANTS: &[&str] = &[
     "kafka.producer_ids_producer_id_seq",
 ];
 
+/// SECURITY DEFINER functions the worker calls (ADR-001 time partitions): all
+/// partition DDL runs inside them, as the extension owner, so the worker role itself
+/// needs no DDL rights. Each validates that it only touches leaves of kafka.messages.
+/// Signatures as written in the GRANT statements (lower case).
+pub const WORKER_FUNCTION_GRANTS: &[&str] = &[
+    "kafka.message_partition_contents(regclass)",
+    "kafka.ensure_message_partitions(int, int)",
+    "kafka.drop_message_partition(regclass, int[])",
+];
+
 /// [`WORKER_ROLE`] as the GUC's compiled-in default.
 const WORKER_ROLE_C: &std::ffi::CStr = c"pgkafka_worker";
 
@@ -106,7 +119,7 @@ pub fn normalize_role(raw: Option<String>) -> Option<String> {
 }
 
 /// Every privilege the worker role must hold, as `(kind, object, privilege)` rows for
-/// the startup check. `kind` is `schema`, `table` or `sequence`. One row per privilege:
+/// the startup check. `kind` is `schema`, `table`, `sequence` or `function`. One row per privilege:
 /// `has_table_privilege` with a comma list is true if ANY of them is held.
 pub fn required_worker_privileges() -> Vec<(&'static str, &'static str, &'static str)> {
     let mut out = vec![("schema", "kafka", "USAGE")];
@@ -117,6 +130,9 @@ pub fn required_worker_privileges() -> Vec<(&'static str, &'static str, &'static
     }
     for seq in WORKER_SEQUENCE_GRANTS {
         out.push(("sequence", seq, "USAGE"));
+    }
+    for func in WORKER_FUNCTION_GRANTS {
+        out.push(("function", func, "EXECUTE"));
     }
     out
 }
@@ -185,6 +201,7 @@ mod tests {
                 let object = object
                     .trim_start_matches("sequence ")
                     .trim_start_matches("schema ")
+                    .trim_start_matches("function ")
                     .trim()
                     .to_string();
                 // Drop column lists: "select (a, b)" is one SELECT privilege.
@@ -303,6 +320,10 @@ mod tests {
                     "kafka.shadow_status",
                     "kafka.metrics",
                     "kafka.replay_shadow_messages",
+                    "kafka.message_partitions",
+                    "kafka.message_partition_contents",
+                    "kafka.ensure_message_partitions",
+                    "kafka.drop_message_partition",
                 ]
                 .contains(&table.as_str())
                 {
@@ -363,7 +384,64 @@ mod tests {
         assert_eq!(rows[0], ("schema", "kafka", "USAGE"));
         assert!(rows.contains(&("table", "kafka.messages", "DELETE")));
         assert!(rows.contains(&("sequence", "kafka.producer_ids_producer_id_seq", "USAGE")));
+        assert!(rows.contains(&(
+            "function",
+            "kafka.drop_message_partition(regclass, int[])",
+            "EXECUTE"
+        )));
         assert!(rows.iter().all(|(_, _, p)| !p.contains(',')));
+    }
+
+    /// Every `kafka.<function>(` the worker's SQL calls is either granted to the worker
+    /// role (SECURITY DEFINER partition functions) or executable by PUBLIC
+    /// (`kafka.message_partitions()`, a catalog read). The partition DDL functions must
+    /// never be left executable by PUBLIC.
+    #[test]
+    fn worker_partition_functions_are_granted_and_not_public() {
+        let granted: Vec<String> = WORKER_FUNCTION_GRANTS
+            .iter()
+            .map(|f| f.split('(').next().unwrap().to_string())
+            .collect();
+        for (_, src) in WORKER_SQL_SOURCES {
+            let lower = src.to_lowercase();
+            for f in [
+                "kafka.message_partition_contents(",
+                "kafka.ensure_message_partitions(",
+                "kafka.drop_message_partition(",
+            ] {
+                if lower.contains(f) {
+                    assert!(
+                        granted.contains(&f.trim_end_matches('(').to_string()),
+                        "{} not granted",
+                        f
+                    );
+                }
+            }
+        }
+        let bootstrap = BOOTSTRAP_SQL.to_lowercase();
+        for f in [
+            "kafka.message_partition_contents(regclass)",
+            "kafka.create_message_partition(timestamptz, timestamptz)",
+            "kafka.ensure_message_partitions(int, int)",
+            "kafka.drop_message_partition(regclass, int[])",
+        ] {
+            assert!(
+                bootstrap.contains(&format!("revoke execute on function {} from public;", f)),
+                "{} must be revoked from PUBLIC in bootstrap.sql",
+                f
+            );
+        }
+        // Every partition DDL function pins its search_path.
+        for def in bootstrap.split("create function kafka.").skip(1) {
+            let header = def.split("$$").next().unwrap_or("");
+            if header.contains("security definer") {
+                assert!(
+                    header.contains("set search_path = pg_catalog, pg_temp"),
+                    "SECURITY DEFINER function without a fixed search_path: {}",
+                    def.lines().next().unwrap_or("")
+                );
+            }
+        }
     }
 
     #[test]

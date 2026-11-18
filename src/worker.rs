@@ -134,6 +134,37 @@ where
     }
 }
 
+/// ADR-001 (0.1.0): one time-partition maintenance pass in its own transaction
+/// (`PostgresStore::ensure_time_partitions`): leaves for now and the next widths, and
+/// rows caught by kafka.messages_default moved into their leaf. Guarded like the other
+/// maintenance blocks, so an ERROR (for example a schema that predates 0.1.0, before
+/// `ALTER EXTENSION pg_kafka UPDATE`) is logged and the worker carries on.
+fn run_partition_maintenance() {
+    BackgroundWorker::transaction(|| {
+        let result = run_request_in_subtransaction(|| {
+            let store = PostgresStore::new();
+            match store.ensure_time_partitions(crate::config::MESSAGE_PARTITION_MINUTES.get()) {
+                Ok(created) if created > 0 => {
+                    pg_log!(
+                        "Partition maintenance: created {} time partition(s)",
+                        created
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    pg_warning!("Partition maintenance failed: {}", e);
+                }
+            }
+        });
+        if let Err(panic_msg) = result {
+            pg_warning!(
+                "Partition maintenance panicked, rolled back (worker survived): {}",
+                panic_msg
+            );
+        }
+    });
+}
+
 /// Verify that the kafka schema and required tables exist.
 /// Returns Ok(()) if all tables exist, Err with description if any are missing.
 fn verify_schema(database: &str) -> Result<(), String> {
@@ -329,6 +360,11 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
 
     // 0.1.0: drop from the bootstrap superuser to pg_kafka.run_as_role.
     crate::kafka::storage::postgres::apply_worker_role();
+
+    // ADR-001: create the time partitions of kafka.messages before serving (rows that
+    // arrive before a leaf exists land in kafka.messages_default, so this is about
+    // keeping that leaf empty, not about Produce succeeding).
+    run_partition_maintenance();
 
     log!(
         "pg_kafka background worker started (port: {}, host: {}, database: {})",
@@ -883,6 +919,9 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
         // accumulated forever. The sweep is bounded per pass and honors the
         // pg_kafka.message_retention_hours GUC (0 = messages kept forever).
         if last_retention_sweep.elapsed() >= RETENTION_SWEEP_INTERVAL {
+            // ADR-001: keep the next time partitions ready (and drain the DEFAULT
+            // leaf) before the sweep decides which leaves to drop.
+            run_partition_maintenance();
             BackgroundWorker::transaction(|| {
                 // RV-10: guard with the subtransaction wrapper (see the config-reload
                 // block above) so a Postgres ERROR rolls back and is logged rather
@@ -891,15 +930,22 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
                     use crate::kafka::storage::postgres::{PostgresStore, ABORTED_MESSAGE_GRACE};
                     let store = PostgresStore::new();
                     let retention_hours = crate::config::MESSAGE_RETENTION_HOURS.get();
-                    match store.run_retention_sweep(retention_hours, ABORTED_MESSAGE_GRACE) {
+                    let partition_minutes = crate::config::MESSAGE_PARTITION_MINUTES.get();
+                    match store.run_retention_sweep(
+                        retention_hours,
+                        ABORTED_MESSAGE_GRACE,
+                        partition_minutes,
+                    ) {
                         Ok(stats) => {
                             if stats.total() > 0 {
                                 pg_log!(
                                     "Retention sweep: {} aborted msg(s), {} expired msg(s), \
+                                     {} time partition(s) dropped, \
                                      {} stale producer(s), {} terminal txn(s), \
                                      {} delivered shadow row(s) reclaimed",
                                     stats.aborted_messages,
                                     stats.expired_messages,
+                                    stats.dropped_partitions,
                                     stats.stale_producers,
                                     stats.terminal_transactions,
                                     stats.shadow_delivered_rows
