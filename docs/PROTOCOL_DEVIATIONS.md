@@ -175,11 +175,16 @@ pg_kafka.compression_type = 'gzip'
 - ✅ Partition watermarks (high watermark, log start offset)
 - ✅ Byte-budget fetch sizing — small-message fetches fill `max_bytes` via bounded
   iterative queries instead of capping at a fixed row count (DR-9)
-- ✅ Long polling (max_wait_ms/min_bytes support)
+- ✅ Long polling (max_wait_ms/min_bytes support). A waiting fetch is re-run only
+  when a Produce to one of its partitions (or, for `read_committed`, any EndTxn)
+  signals new data, at `max_wait_ms`, or at the slow safety-net interval
+  `pg_kafka.fetch_poll_interval_ms` (default 1000 ms) — idle consumers do not
+  generate repeated fetch work on the DB thread
 
 **What's Missing:**
 - ❌ Fetch sessions (always uses fetch session ID 0)
 - At most 64 long-poll fetches may wait concurrently per connection; a fetch over that cap is answered immediately (possibly empty) instead of waiting for `max_wait_ms`
+- At most 128 requests per connection may be in flight (read but not yet answered on the socket); beyond that the broker stops reading from the connection until responses are consumed (TCP backpressure), much as Kafka mutes a connection while it has an outstanding request
 
 **Client Impact:**
 - Works with standard Kafka clients
@@ -408,8 +413,8 @@ Shadow forwarding to an external Kafka cluster uses a durable outbox
 
 pg_kafka speaks the Kafka wire protocol with **no authentication or authorization** — there is no SaslHandshake/SaslAuthenticate negotiation and no ACL enforcement. Any client that can open a TCP connection to the listener can read and write any topic.
 
-- **Default bind is `0.0.0.0`** (`pg_kafka.host`), i.e. all interfaces — chosen because a broker is typically reached from other hosts, and a loopback-only default would make the out-of-the-box configuration unusable for that case.
-- **Mitigation (required for non-loopback binds):** restrict access at the network layer — firewall / cloud security group / private subnet — and rely on PostgreSQL's own authentication for the control plane. Set `pg_kafka.host = '127.0.0.1'` to accept only local clients.
+- **Default bind is `127.0.0.1`** (`pg_kafka.host`), i.e. loopback only, so an out-of-the-box install is not reachable from other machines. To serve remote clients set `pg_kafka.host` explicitly (e.g. `'0.0.0.0'` for all interfaces, or a specific address); the advertised broker address in Metadata/FindCoordinator is that host (`0.0.0.0` is advertised as `localhost`).
+- **Mitigation (required for non-loopback binds):** restrict access at the network layer — firewall / cloud security group / private subnet — and rely on PostgreSQL's own authentication for the control plane.
 - **Loud by default:** when the listener binds to a non-loopback interface, pg_kafka emits a startup `WARNING` (see `bind_is_publicly_exposed` in `config.rs` / the bind path in `worker.rs`) so the no-auth exposure is never silent.
 
 Wire-level SASL/ACLs are **not planned**; the accepted posture is network-control + PostgreSQL auth.

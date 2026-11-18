@@ -341,7 +341,7 @@ pub fn init() {
     GucRegistry::define_string_guc(
         c"pg_kafka.host",
         c"Host/interface to bind to",
-        c"The network interface to listen on. 0.0.0.0 = all interfaces; pg_kafka has no Kafka-wire authentication, so a non-loopback bind must be protected by network controls (firewall/security groups). Use 127.0.0.1 to restrict to local clients. Requires restart.",
+        c"The network interface to listen on. Default 127.0.0.1 (local clients only). pg_kafka has no Kafka-wire authentication, so a non-loopback bind (e.g. 0.0.0.0 = all interfaces) must be protected by network controls (firewall/security groups). Requires restart.",
         &HOST,
         GucContext::Postmaster,
         GucFlags::default(),
@@ -394,7 +394,7 @@ pub fn init() {
     GucRegistry::define_int_guc(
         c"pg_kafka.fetch_poll_interval_ms",
         c"Polling interval for long polling fallback (milliseconds)",
-        c"How often to poll the database when waiting for data in FetchRequest. Default: 100ms.",
+        c"A waiting FetchRequest re-runs when new data is signalled (Produce, EndTxn) or max_wait_ms expires; this interval is only the safety-net re-check for a missed signal. Default: 1000ms.",
         &FETCH_POLL_INTERVAL_MS,
         MIN_FETCH_POLL_INTERVAL_MS,
         MAX_FETCH_POLL_INTERVAL_MS,
@@ -647,7 +647,7 @@ pub fn init() {
 }
 
 /// The bind host from the `pg_kafka.host` GUC. Unset, empty or all-whitespace means the default
-/// (`0.0.0.0`); an empty string used to reach the bind as `":9092"`, which fails to resolve and
+/// (`127.0.0.1`, loopback only); an empty string used to reach the bind as `":9092"`, which fails to resolve and
 /// stops the worker.
 pub fn normalize_host(raw: Option<String>) -> String {
     match raw {
@@ -664,7 +664,8 @@ pub fn normalize_host(raw: Option<String>) -> String {
 /// by network controls + PostgreSQL auth (documented in `docs/PROTOCOL_DEVIATIONS.md`).
 ///
 /// Loopback (`127.0.0.0/8`, `::1`, `localhost`) is treated as not-exposed; `0.0.0.0`/`::`/empty mean
-/// "all interfaces" and are exposed; any other specific address is a concrete LAN/public interface
+/// "all interfaces" and are exposed (empty never reaches here in practice: [`normalize_host`] maps it
+/// to the loopback default, but it is still treated as exposed to err on the safe side); any other specific address is a concrete LAN/public interface
 /// and is therefore also exposed.
 pub fn bind_is_publicly_exposed(host: &str) -> bool {
     // Accept the bracketed IPv6 form (`[::1]`) a host:port-style config might carry.
@@ -676,7 +677,7 @@ pub fn bind_is_publicly_exposed(host: &str) -> bool {
         // Loopback (the whole `127.0.0.0/8` block, `::1`) is the only not-exposed family. A specific
         // LAN/public address, or `0.0.0.0` / `::` ("all interfaces", `is_unspecified`), is reachable.
         Ok(addr) => !addr.is_loopback(),
-        // Not an IP literal: empty defaults to `0.0.0.0` (exposed); only `localhost` is loopback.
+        // Not an IP literal (empty included, conservatively): exposed; only `localhost` is loopback.
         // Host names are case-insensitive, so `LOCALHOST` is loopback too.
         Err(_) => !h.eq_ignore_ascii_case("localhost"),
     }
@@ -758,7 +759,7 @@ mod tests {
             config.fetch_poll_interval_ms,
             DEFAULT_FETCH_POLL_INTERVAL_MS
         );
-        assert_eq!(config.fetch_poll_interval_ms, 100);
+        assert_eq!(config.fetch_poll_interval_ms, 1000);
     }
 
     #[test]
@@ -920,7 +921,7 @@ mod tests {
         assert!(MIN_FETCH_POLL_INTERVAL_MS <= DEFAULT_FETCH_POLL_INTERVAL_MS);
         assert!(DEFAULT_FETCH_POLL_INTERVAL_MS <= MAX_FETCH_POLL_INTERVAL_MS);
         assert_eq!(MIN_FETCH_POLL_INTERVAL_MS, 10);
-        assert_eq!(MAX_FETCH_POLL_INTERVAL_MS, 5000);
+        assert_eq!(MAX_FETCH_POLL_INTERVAL_MS, 60_000);
     }
 
     #[test]
@@ -988,8 +989,16 @@ mod tests {
         assert!(bind_is_publicly_exposed("0.0.0.0"));
         assert!(bind_is_publicly_exposed("::"));
         assert!(bind_is_publicly_exposed("[::]"));
-        // empty string defaults to 0.0.0.0 in the bind address
+        // An empty host is treated as exposed (conservative); normalize_host never passes one.
         assert!(bind_is_publicly_exposed(""));
+    }
+
+    #[test]
+    fn test_default_bind_is_not_exposed() {
+        // An unset pg_kafka.host binds loopback only, so the no-auth listener is not reachable
+        // from other machines out of the box (and the SEC-7 startup warning stays quiet).
+        assert!(!bind_is_publicly_exposed(&normalize_host(None)));
+        assert_eq!(normalize_host(None), "127.0.0.1");
     }
 
     #[test]

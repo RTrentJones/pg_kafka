@@ -11,7 +11,15 @@
 // 2. Database thread sends InternalNotification::NewMessages via crossbeam channel
 // 3. Network thread receives notification and wakes any waiting FetchRequest handlers
 //
-// This enables sub-10ms latency for the produce→consume path.
+// This enables sub-10ms latency for the produce→consume path. A waiting fetch is
+// re-run ONLY on such a notification, on its max_wait_ms deadline, or on the slow
+// safety-net poll (`pg_kafka.fetch_poll_interval_ms`), so idle consumers cost
+// almost no DB work.
+//
+// Notifications are sent from inside the request's transaction, i.e. before its
+// commit. That is safe because the woken fetch is re-submitted to the same
+// single DB thread, which processes requests in order: the re-fetch always runs
+// after the notifying request (and sees its writes).
 
 /// Internal notification from database thread to network thread
 ///
@@ -36,4 +44,13 @@ pub enum InternalNotification {
         /// Used to determine which waiting fetches should be woken
         high_watermark: i64,
     },
+
+    /// A transaction was committed or aborted (EndTxn).
+    ///
+    /// Either outcome can advance a partition's last stable offset, making records
+    /// visible to `read_committed` consumers without any new produce. The DB thread
+    /// does not resolve which partitions the transaction touched, so this wakes every
+    /// waiting `read_committed` fetch (each re-fetches once); `read_uncommitted`
+    /// waiters already saw the records when they were produced and are not woken.
+    TransactionEnded,
 }

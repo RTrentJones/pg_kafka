@@ -7,7 +7,7 @@
 set -uo pipefail
 OUT_DIR="${1:-$PWD}"
 mkdir -p "$OUT_DIR"
-# Force IPv4: pg_kafka binds 0.0.0.0:9092, but kcat/librdkafka resolve "localhost" to ::1 first and
+# Force IPv4: pg_kafka binds an IPv4 address (127.0.0.1 by default), but kcat/librdkafka resolve "localhost" to ::1 first and
 # get connection-refused — which aborted the recording after the first command.
 BROKER="${PG_KAFKA_BROKER:-127.0.0.1:9092}"
 BROKER="${BROKER/localhost/127.0.0.1}"

@@ -341,9 +341,9 @@ The GitHub Actions pipeline runs:
 > ⚠️ **Security: the Kafka listener has no authentication or TLS.** Anyone who
 > can reach `pg_kafka.port` can produce, consume, and administer topics — the
 > wire protocol implements no SASL and no encryption (inbound; Shadow Mode's
-> *outbound* SASL/SSL is unrelated). The default bind is `0.0.0.0`. Deploy only
-> on trusted networks: bind to `127.0.0.1` where possible, or firewall the port
-> to known clients. The extension logs a startup WARNING when bound to a
+> *outbound* SASL/SSL is unrelated). The default bind is `127.0.0.1` (local
+> clients only); setting `pg_kafka.host` to a non-loopback address exposes it.
+> Deploy only on trusted networks, and firewall the port to known clients. The extension logs a startup WARNING when bound to a
 > non-loopback address (SEC-7, accepted-by-design — see
 > `docs/PROTOCOL_DEVIATIONS.md` "Network Security Posture").
 
@@ -353,7 +353,7 @@ shared_preload_libraries = 'pg_kafka'
 
 -- Read at worker start (requires restart)
 pg_kafka.port = 9092              -- TCP port (default: 9092)
-pg_kafka.host = '0.0.0.0'         -- Bind address (default: 0.0.0.0 — see warning above)
+pg_kafka.host = '127.0.0.1'       -- Bind address (default: 127.0.0.1; '0.0.0.0' = all interfaces, see warning above)
 pg_kafka.database = 'postgres'    -- Database where CREATE EXTENSION pg_kafka was run
 pg_kafka.log_connections = false  -- Log each connection
 pg_kafka.shutdown_timeout_ms = 5000
