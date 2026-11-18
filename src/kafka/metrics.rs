@@ -68,6 +68,9 @@ pub const KNOWN_APIS: &[(i16, &str)] = &[
     (37, "CreatePartitions"),
     (42, "DeleteGroups"),
     (44, "IncrementalAlterConfigs"),
+    // auth stream (answered on the network thread, so never counted by the worker)
+    (17, "SaslHandshake"),
+    (36, "SaslAuthenticate"),
 ];
 
 /// Display name for an API key (`"Unknown"` for a key pg_kafka does not implement).
@@ -368,6 +371,9 @@ pub fn response_has_error(response: &KafkaResponse) -> bool {
         KafkaResponse::IncrementalAlterConfigs { response, .. } => {
             response.responses.iter().any(|r| r.error_code != 0)
         }
+        // auth stream
+        KafkaResponse::SaslHandshake { response, .. } => response.error_code != 0,
+        KafkaResponse::SaslAuthenticate { response, .. } => response.error_code != 0,
         KafkaResponse::Error { error_code, .. } => *error_code != 0,
     }
 }

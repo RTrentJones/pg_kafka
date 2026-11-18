@@ -33,6 +33,7 @@
 // - Bounded channel provides backpressure when DB can't keep up
 
 pub mod assignment;
+pub mod auth;
 pub mod broker_metadata;
 pub mod constants;
 pub mod context;

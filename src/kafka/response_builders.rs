@@ -65,6 +65,11 @@ pub const API_VERSION_RANGES: &[(i16, i16, i16)] = &[
     // client negotiates >= 1.
     (API_KEY_DESCRIBE_CONFIGS, 1, 4),
     (API_KEY_INCREMENTAL_ALTER_CONFIGS, 0, 1),
+    // auth stream: answered on the network thread (src/kafka/auth/session.rs), never
+    // decoded into a KafkaRequest. SaslHandshake v0 is advertised because librdkafka
+    // requires it before it enables SASL, but a v0 handshake gets UNSUPPORTED_VERSION.
+    (API_KEY_SASL_HANDSHAKE, 0, 1),
+    (API_KEY_SASL_AUTHENTICATE, 0, 2),
 ];
 
 /// Return the supported `(min_version, max_version)` for an API key, or `None` if the key is not
@@ -506,6 +511,19 @@ pub fn error_response_for(
             api_version,
             response: build_incremental_alter_configs_error_response(error_code),
         },
+        // auth stream: the SASL APIs (normally answered by auth::session).
+        API_KEY_SASL_HANDSHAKE => KafkaResponse::SaslHandshake {
+            correlation_id,
+            api_version,
+            response: kafka_protocol::messages::sasl_handshake_response::SaslHandshakeResponse::default()
+                .with_error_code(error_code),
+        },
+        API_KEY_SASL_AUTHENTICATE => KafkaResponse::SaslAuthenticate {
+            correlation_id,
+            api_version,
+            response: kafka_protocol::messages::sasl_authenticate_response::SaslAuthenticateResponse::default()
+                .with_error_code(error_code),
+        },
         // Transaction APIs. AddPartitionsToTxn and TxnOffsetCommit carry their errors per
         // partition, so without the request this is an empty (decodable) response; AddOffsetsToTxn
         // and EndTxn have a top-level error code.
@@ -584,8 +602,8 @@ mod tests {
         assert_eq!(response.error_code, ERROR_NONE);
         assert_eq!(response.throttle_time_ms, 0);
 
-        // Should have 26 API versions (all supported APIs)
-        assert_eq!(response.api_keys.len(), 26);
+        // Should have 28 API versions (all supported APIs)
+        assert_eq!(response.api_keys.len(), 28);
 
         // Verify ApiVersions entry
         let api_versions = response
@@ -693,7 +711,7 @@ mod tests {
 
         // An API key pg_kafka doesn't handle has no range (so enforcement skips it and the
         // dispatcher's unsupported-api-key path handles it instead).
-        assert_eq!(supported_version_range(17), None); // SaslHandshake — not implemented
+        assert_eq!(supported_version_range(29), None); // DescribeAcls — not implemented
         assert_eq!(supported_version_range(9999), None);
     }
 

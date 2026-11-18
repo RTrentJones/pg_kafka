@@ -141,6 +141,14 @@ pub const API_KEY_DESCRIBE_CONFIGS: i16 = 32;
 /// Used by admin tooling to SET/DELETE individual configs (e.g. retention.ms)
 pub const API_KEY_INCREMENTAL_ALTER_CONFIGS: i16 = 44;
 
+// ----- auth stream: SASL (handled on the network thread, src/kafka/auth/session.rs) -----
+
+/// API key for SaslHandshake requests (mechanism negotiation)
+pub const API_KEY_SASL_HANDSHAKE: i16 = 17;
+
+/// API key for SaslAuthenticate requests (SASL tokens, KIP-152)
+pub const API_KEY_SASL_AUTHENTICATE: i16 = 36;
+
 // ===== Configuration Defaults =====
 
 /// Default Kafka protocol port
@@ -296,6 +304,7 @@ pub fn get_flexible_format_threshold(api_key: i16) -> Option<i16> {
         API_KEY_DELETE_RECORDS => Some(2),   // DeleteRecords v2+ uses flexible format
         API_KEY_DESCRIBE_CONFIGS => Some(4), // DescribeConfigs v4+ uses flexible format
         API_KEY_INCREMENTAL_ALTER_CONFIGS => Some(1), // IncrementalAlterConfigs v1+ flexible
+        API_KEY_SASL_AUTHENTICATE => Some(2), // auth stream: SaslAuthenticate v2+ flexible
         _ => None,                           // Unknown API keys default to v0
     }
 }
@@ -434,6 +443,17 @@ pub const ERROR_INVALID_RECORD: i16 = 87;
 
 /// INVALID_CONFIG: the given configuration key/value is invalid or unsupported
 pub const ERROR_INVALID_CONFIG: i16 = 40;
+
+// ----- auth stream: SASL error codes -----
+
+/// UNSUPPORTED_SASL_MECHANISM: the requested SASL mechanism is not enabled
+pub const ERROR_UNSUPPORTED_SASL_MECHANISM: i16 = 33;
+
+/// ILLEGAL_SASL_STATE: a SASL request arrived in the wrong state
+pub const ERROR_ILLEGAL_SASL_STATE: i16 = 34;
+
+/// SASL_AUTHENTICATION_FAILED: SASL authentication failed
+pub const ERROR_SASL_AUTHENTICATION_FAILED: i16 = 58;
 
 // NOTE: there is no "transaction timed out" code in the Kafka protocol — 94 is
 // INCONSISTENT_VOTER_SET. A server-side transaction timeout fences the producer, so the

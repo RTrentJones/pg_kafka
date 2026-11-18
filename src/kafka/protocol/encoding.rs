@@ -346,6 +346,30 @@ pub fn encode_response(response: KafkaResponse) -> Result<BytesMut> {
             body
         ),
 
+        // auth stream: the two SASL responses
+        KafkaResponse::SaslHandshake {
+            correlation_id,
+            api_version,
+            response: body,
+        } => encode_standard_response!(
+            &mut response_buf,
+            correlation_id,
+            api_version,
+            crate::kafka::constants::API_KEY_SASL_HANDSHAKE,
+            body
+        ),
+        KafkaResponse::SaslAuthenticate {
+            correlation_id,
+            api_version,
+            response: body,
+        } => encode_standard_response!(
+            &mut response_buf,
+            correlation_id,
+            api_version,
+            crate::kafka::constants::API_KEY_SASL_AUTHENTICATE,
+            body
+        ),
+
         KafkaResponse::Error {
             correlation_id,
             error_code,

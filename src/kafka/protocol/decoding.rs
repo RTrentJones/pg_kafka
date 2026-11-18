@@ -3613,16 +3613,16 @@ mod tests {
     #[test]
     fn test_parse_unsupported_api_key() {
         // Tests error handling for valid-but-unsupported API keys
-        // API key 17 = SaslHandshake (valid Kafka API, but not implemented here)
+        // API key 29 = DescribeAcls (valid Kafka API, but not implemented here). (It used
+        // to be 17 = SaslHandshake, which the auth stream now serves on the network thread.)
         let (tx, mut rx) = create_test_channel();
 
-        use kafka_protocol::messages::sasl_handshake_request::SaslHandshakeRequest;
+        use kafka_protocol::messages::describe_acls_request::DescribeAclsRequest;
 
-        let mut request = SaslHandshakeRequest::default();
-        request.mechanism = StrBytes::from_static_str("PLAIN");
+        let request = DescribeAclsRequest::default();
 
-        // SaslHandshake uses non-flexible header (version 1)
-        let frame = build_request_frame(17, 1, 9999, 1, &request, 1);
+        // DescribeAcls v1 uses the non-flexible header (version 1)
+        let frame = build_request_frame(29, 1, 9999, 1, &request, 1);
 
         let result = parse_request(frame, tx);
         assert!(result.is_ok());

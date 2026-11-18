@@ -757,6 +757,18 @@ pub enum KafkaResponse {
         response:
             kafka_protocol::messages::incremental_alter_configs_response::IncrementalAlterConfigsResponse,
     },
+    /// auth stream: SaslHandshake response (built on the network thread)
+    SaslHandshake {
+        correlation_id: i32,
+        api_version: i16,
+        response: kafka_protocol::messages::sasl_handshake_response::SaslHandshakeResponse,
+    },
+    /// auth stream: SaslAuthenticate response (built on the network thread)
+    SaslAuthenticate {
+        correlation_id: i32,
+        api_version: i16,
+        response: kafka_protocol::messages::sasl_authenticate_response::SaslAuthenticateResponse,
+    },
     Error {
         /// Correlation ID from request
         correlation_id: i32,
