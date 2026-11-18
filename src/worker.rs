@@ -14,7 +14,8 @@
 //    - Uses `tracing` for logging (NOT pgrx - thread safety)
 //
 // 2. **Database Thread** (main BGWorker): Blocks on channel recv
-//    - Processes requests via SPI within transactions
+//    - Processes requests via SPI, batching already-queued requests into one
+//      transaction per batch (group commit: one WAL flush per batch)
 //    - Instant wake-up when requests arrive (no polling delay)
 //    - Uses pgrx logging (safe on main thread)
 //
@@ -535,6 +536,17 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     // Arc<RwLock> makes it safe to access from the coordinator handlers
     let coordinator = std::sync::Arc::new(crate::kafka::GroupCoordinator::new());
 
+    // Everything a request needs, borrowed once for the whole loop.
+    let env = RequestEnv {
+        coordinator: &coordinator,
+        broker_metadata: &broker_metadata,
+        default_partitions,
+        notify_tx: &notify_tx,
+        compression,
+        shadow_store: &shadow_store,
+        log_timing,
+    };
+
     pg_log!("Entering main event loop (two-thread architecture)");
 
     // Step 10: Main event loop
@@ -549,9 +561,11 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     //    - No polling, no CPU usage when idle
     //    - Instant wake-up when network thread sends a request
     //
-    // 2. PROCESS DATABASE REQUEST (SPI in Transaction)
-    //    - Execute the request within BackgroundWorker::transaction()
-    //    - Send response back via the request's response channel
+    // 2. PROCESS DATABASE REQUESTS (group commit, see execute_batch)
+    //    - The request plus everything already queued behind it (up to 64)
+    //      run in ONE BackgroundWorker::transaction(), each in its own
+    //      subtransaction
+    //    - All their responses are released after the single commit (RB-1)
     //
     // 3. CHECK MEMBER TIMEOUTS (Periodic, ~1 second)
     //    - Scan consumer groups for timed-out members
@@ -779,37 +793,22 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
         // No CPU usage when idle, instant wake-up when requests come in.
         // DR-12 (DEEP-REVIEW-2026-07): drain the liveness lane BEFORE taking the
         // next main-lane request. Heartbeats are served from the in-memory
-        // coordinator, so each drains in microseconds; doing this every loop
-        // iteration bounds heartbeat queueing delay to at most one in-flight
-        // request (plus RECV_TIMEOUT when idle) instead of the whole main queue.
+        // coordinator, so each drains in microseconds. A main-lane batch also
+        // ends early as soon as a heartbeat is waiting (see execute_batch), so
+        // heartbeat queueing delay stays bounded by one in-flight request plus
+        // one commit (plus RECV_TIMEOUT when idle), not by the main queue.
         while let Ok(request) = liveness_rx.try_recv() {
-            execute_request_in_transaction(
-                request,
-                &coordinator,
-                &broker_metadata,
-                default_partitions,
-                &notify_tx,
-                compression,
-                &shadow_store,
-                log_timing,
-            );
+            execute_batch(request, &liveness_rx, None, &env);
         }
 
         match request_rx.recv_timeout(RECV_TIMEOUT) {
             Ok(request) => {
                 // ┌─────────────────────────────────────────────────────┐
-                // │ Process Database Request (SPI in Transaction)      │
+                // │ Process Database Requests (group commit)           │
                 // └─────────────────────────────────────────────────────┘
-                execute_request_in_transaction(
-                    request,
-                    &coordinator,
-                    &broker_metadata,
-                    default_partitions,
-                    &notify_tx,
-                    compression,
-                    &shadow_store,
-                    log_timing,
-                );
+                // This request plus whatever is already queued behind it run
+                // in ONE top-level transaction (one WAL flush).
+                execute_batch(request, &request_rx, Some(&liveness_rx), &env);
             }
 
             Err(RecvTimeoutError::Timeout) => {
@@ -928,11 +927,40 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     }
 }
 
-/// Execute one Kafka request under the standard transaction + subtransaction
-/// guard, with optional timing instrumentation. Shared by the main lane and the
-/// DR-12 liveness lane so both take the identical safety path (a Heartbeat does
-/// no SPI, but routing it through the same guard keeps one code path and costs
-/// only an empty transaction).
+/// Most requests one top-level transaction carries (group commit).
+///
+/// Each request runs in its own subtransaction, and every one that writes is
+/// assigned a subtransaction XID. 64 is `PGPROC_MAX_CACHED_SUBXIDS`, so a batch
+/// never overflows the worker's subxid cache (an overflowed cache forces other
+/// backends' snapshot checks into `pg_subtrans` lookups until it commits).
+const MAX_GROUP_COMMIT_REQUESTS: usize = 64;
+
+/// A batch stops taking more requests once it has run this long, so group
+/// commit delays the first request's response by at most about this much (plus
+/// the request still running and the commit).
+const GROUP_COMMIT_TIME_BUDGET: Duration = Duration::from_millis(50);
+
+/// Everything `process_request` needs, borrowed once by the main loop.
+struct RequestEnv<'a> {
+    coordinator: &'a std::sync::Arc<crate::kafka::GroupCoordinator>,
+    broker_metadata: &'a crate::kafka::BrokerMetadata,
+    default_partitions: i32,
+    notify_tx: &'a crossbeam_channel::Sender<crate::kafka::InternalNotification>,
+    compression: kafka_protocol::records::Compression,
+    shadow_store: &'a std::sync::Arc<ShadowStore<PostgresStore>>,
+    log_timing: bool,
+}
+
+/// Whether a group-commit batch should take another already-queued request.
+///
+/// It stops at the request cap, at the time budget, or as soon as a Heartbeat is
+/// waiting on the liveness lane (DR-12), so liveness traffic never waits behind
+/// more than one in-flight request and one commit.
+fn batch_has_room(taken: usize, elapsed: Duration, liveness_waiting: bool) -> bool {
+    taken < MAX_GROUP_COMMIT_REQUESTS && elapsed < GROUP_COMMIT_TIME_BUDGET && !liveness_waiting
+}
+
+/// The RB-1 response buffer for one request in a batch.
 ///
 /// ## RB-1: response-after-commit barrier
 ///
@@ -945,153 +973,214 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
 /// Without this barrier an acked produce/offset-commit could be lost on a
 /// crash between response send and commit (acks>=1 durability violation), and
 /// a client that received an OK could race a separate Postgres connection into
-/// pre-commit state.
+/// pre-commit state. With group commit the barrier covers the whole batch: no
+/// response of any request in it is released before the one commit.
 ///
 /// This relies on the writer task queueing response slots at parse time
 /// (listener.rs), so deferring the send cannot reorder responses. If that
 /// ordering scheme ever changes, re-review this barrier.
-#[allow(clippy::too_many_arguments)]
-fn execute_request_in_transaction(
-    mut request: crate::kafka::KafkaRequest,
-    coordinator: &std::sync::Arc<crate::kafka::GroupCoordinator>,
-    broker_metadata: &crate::kafka::BrokerMetadata,
-    default_partitions: i32,
-    notify_tx: &crossbeam_channel::Sender<crate::kafka::InternalNotification>,
-    compression: kafka_protocol::records::Compression,
-    shadow_store: &std::sync::Arc<ShadowStore<PostgresStore>>,
-    log_timing: bool,
-) {
-    let coord = coordinator.clone();
-    let broker = broker_metadata.clone(); // Cheap Arc pointer copy
-    let notifier = notify_tx.clone();
-    let shadow = shadow_store.clone();
+struct BufferedResponse {
+    client_tx: tokio::sync::mpsc::UnboundedSender<crate::kafka::KafkaResponse>,
+    buffer_rx: tokio::sync::mpsc::UnboundedReceiver<crate::kafka::KafkaResponse>,
+    api_key: i16,
+    api_version: i16,
+    correlation_id: i32,
+    /// False for an acks=0 produce: the client expects no response frame at all,
+    /// not even an error.
+    expects_response: bool,
+}
 
-    // RB-1: swap the client's sender for a buffer the handler writes into; we
-    // flush the buffer to `client_tx` only after the commit below. Both ends of
-    // the buffer live on this one DB thread — tokio's unbounded send/try_recv
-    // are plain synchronous calls, so no runtime or extra synchronization is
-    // involved.
-    let is_produce = matches!(request, crate::kafka::KafkaRequest::Produce { .. });
-    let (api_key, api_version, correlation_id) = request.wire_ids();
-    let (buffer_tx, mut buffer_rx) = tokio::sync::mpsc::unbounded_channel();
-    let client_tx = request.swap_response_tx(buffer_tx);
+impl BufferedResponse {
+    /// Swap the request's client sender for a buffer the handler writes into.
+    /// Both ends of the buffer live on this one DB thread — tokio's unbounded
+    /// send/try_recv are plain synchronous calls, so no runtime or extra
+    /// synchronization is involved.
+    fn intercept(request: &mut crate::kafka::KafkaRequest) -> Self {
+        let (api_key, api_version, correlation_id) = request.wire_ids();
+        let expects_response =
+            !matches!(request, crate::kafka::KafkaRequest::Produce { acks: 0, .. });
+        let (buffer_tx, buffer_rx) = tokio::sync::mpsc::unbounded_channel();
+        let client_tx = request.swap_response_tx(buffer_tx);
+        BufferedResponse {
+            client_tx,
+            buffer_rx,
+            api_key,
+            api_version,
+            correlation_id,
+            expects_response,
+        }
+    }
 
-    // Timing instrumentation (enabled via pg_kafka.log_timing GUC)
-    // Measures transaction overhead vs handler execution time
-    let tx_start = if log_timing {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
-
-    // Use a Cell to capture handler duration from inside the closure
-    let handler_duration = std::cell::Cell::new(Duration::ZERO);
-    // Wrap in AssertUnwindSafe to satisfy UnwindSafe requirement
-    let handler_duration_ref = AssertUnwindSafe(&handler_duration);
-    // ShadowStore contains FutureProducer which isn't RefUnwindSafe
-    let shadow_ref = AssertUnwindSafe(&shadow);
-
-    let txn_result = catch_unwind(AssertUnwindSafe(|| {
-        BackgroundWorker::transaction(move || {
-            let handler_start = std::time::Instant::now();
-
-            // Run the handler inside a subtransaction so a panic (or a
-            // Postgres ERROR, which pgrx surfaces as a panic) rolls
-            // back the request's partial writes instead of letting
-            // them commit with the surrounding transaction. The worker
-            // itself survives either way.
-            // New request, new sync-forward budget (see ShadowStore::begin_request).
-            shadow_ref.begin_request();
-
-            let result = run_request_in_subtransaction(|| {
-                process_request(
-                    request,
-                    &coord,
-                    &broker,
-                    default_partitions,
-                    &notifier,
-                    compression,
-                    *shadow_ref,
-                )
-            });
-
-            // Capture handler duration before transaction commit
-            handler_duration_ref.set(handler_start.elapsed());
-
-            // A reported rollback (handler error) already logged itself and sent
-            // its response; only a real panic is worth a warning here.
-            if let Err(panic_msg) = result {
+    /// The batch committed: forward the buffered response(s) to the client, in
+    /// order. Today a request yields at most one response, but the loop keeps a
+    /// future multi-response request from silently dropping frames.
+    fn release(mut self) {
+        while let Ok(response) = self.buffer_rx.try_recv() {
+            if self.client_tx.send(response).is_err() {
                 pg_warning!(
-                    "Handler panic caught, request rolled back (worker survived): {}",
-                    panic_msg
+                    "Client disconnected before response flush (correlation_id={})",
+                    self.correlation_id
                 );
             }
+        }
+    }
 
-            // RB-1 test hook: widen the response-send→commit window so the E2E
-            // barrier test can prove the ack now implies a visible commit.
-            // Produce-gated so heartbeats (DR-12 lane) and unrelated traffic are
-            // unaffected while a test has the GUC set.
-            if is_produce {
-                let delay_ms = crate::config::TEST_PRE_COMMIT_DELAY_MS.get();
-                if delay_ms > 0 {
-                    std::thread::sleep(Duration::from_millis(delay_ms as u64));
+    /// The batch's commit failed. Any buffered response asserts success for work
+    /// that did NOT commit — sending it would recreate the lost-ack bug at
+    /// commit-failure granularity. Discard it and send an API-typed error frame
+    /// instead (pure Rust construction + channel send; safe before Postgres
+    /// error-state cleanup). An acks=0 produce gets nothing.
+    fn fail(mut self) {
+        while self.buffer_rx.try_recv().is_ok() {}
+        if !self.expects_response {
+            return;
+        }
+        let error_response = crate::kafka::response_builders::error_response_for(
+            self.api_key,
+            self.api_version,
+            self.correlation_id,
+            ERROR_UNKNOWN_SERVER_ERROR,
+        )
+        .unwrap_or(crate::kafka::KafkaResponse::Error {
+            correlation_id: self.correlation_id,
+            error_code: ERROR_UNKNOWN_SERVER_ERROR,
+            error_message: Some("transaction commit failed".to_string()),
+        });
+        let _ = self.client_tx.send(error_response);
+    }
+}
+
+/// Run one request of a batch in its own subtransaction (so a handler error or
+/// panic rolls back only that request) and log a caught panic.
+fn run_one_request(
+    request: crate::kafka::KafkaRequest,
+    env: &RequestEnv,
+) -> Result<RequestOutcome, String> {
+    // New request, new sync-forward budget (see ShadowStore::begin_request).
+    env.shadow_store.begin_request();
+    let result = run_request_in_subtransaction(|| {
+        process_request(
+            request,
+            env.coordinator,
+            env.broker_metadata,
+            env.default_partitions,
+            env.notify_tx,
+            env.compression,
+            env.shadow_store,
+        )
+    });
+    // A reported rollback (handler error) already logged itself and sent its
+    // response; only a real panic is worth a warning here.
+    if let Err(panic_msg) = &result {
+        pg_warning!(
+            "Handler panic caught, request rolled back (worker survived): {}",
+            panic_msg
+        );
+    }
+    result
+}
+
+/// RB-1 test hook: widen the response-send→commit window so the E2E barrier
+/// test can prove the ack implies a visible commit. Produce-gated so heartbeats
+/// (DR-12 lane) and unrelated traffic are unaffected while a test has the GUC
+/// set. Applied once per batch, just before its commit.
+fn apply_test_pre_commit_delay(batch_has_produce: bool) {
+    if batch_has_produce {
+        let delay_ms = crate::config::TEST_PRE_COMMIT_DELAY_MS.get();
+        if delay_ms > 0 {
+            std::thread::sleep(Duration::from_millis(delay_ms as u64));
+        }
+    }
+}
+
+/// The batch's transaction committed: release every buffered response, in
+/// arrival order.
+fn after_batch_commit(pending: Vec<BufferedResponse>) {
+    for response in pending {
+        response.release();
+    }
+}
+
+/// The batch's commit failed: every request in it gets an API-typed error.
+fn after_batch_commit_failure(pending: Vec<BufferedResponse>) {
+    for response in pending {
+        response.fail();
+    }
+}
+
+/// Execute `first` plus every request already queued behind it on `source`
+/// (no waiting for more) in ONE top-level transaction: group commit.
+///
+/// Each request used to be its own top-level transaction and therefore its own
+/// WAL flush, which capped produce throughput at the fsync rate (~220
+/// requests/s). Now a batch pays one flush. Each request still runs in its own
+/// subtransaction, so a handler error or panic rolls back only that request; the
+/// responses of all requests are buffered and released only after the single
+/// commit (RB-1, see [`BufferedResponse`]). A batch takes at most
+/// `MAX_GROUP_COMMIT_REQUESTS` requests and stops early on
+/// `GROUP_COMMIT_TIME_BUDGET` or when `yield_to` (the liveness lane) has work.
+///
+/// Used for both lanes: the DR-12 liveness lane passes `yield_to = None` (a
+/// Heartbeat does no SPI, but taking the same guarded path keeps one code path
+/// and costs only an empty transaction).
+fn execute_batch(
+    first: crate::kafka::KafkaRequest,
+    source: &crossbeam_channel::Receiver<crate::kafka::KafkaRequest>,
+    yield_to: Option<&crossbeam_channel::Receiver<crate::kafka::KafkaRequest>>,
+    env: &RequestEnv,
+) {
+    let batch_start = Instant::now();
+    let mut pending: Vec<BufferedResponse> = Vec::new();
+    let mut has_produce = false;
+    // Time spent inside handlers (timing instrumentation, pg_kafka.log_timing).
+    let mut handler_time = Duration::ZERO;
+
+    // The closure is not UnwindSafe (it borrows the ShadowStore, whose
+    // FutureProducer isn't); any unwind out of it is either re-raised below or
+    // already rolled back by the subtransaction guard.
+    let txn_result = catch_unwind(AssertUnwindSafe(|| {
+        BackgroundWorker::transaction(AssertUnwindSafe(|| {
+            let mut next = Some(first);
+            while let Some(mut request) = next.take() {
+                has_produce |= matches!(request, crate::kafka::KafkaRequest::Produce { .. });
+                pending.push(BufferedResponse::intercept(&mut request));
+
+                let handler_start = Instant::now();
+                let _ = run_one_request(request, env);
+                handler_time += handler_start.elapsed();
+
+                let liveness_waiting = yield_to.is_some_and(|rx| !rx.is_empty());
+                if batch_has_room(pending.len(), batch_start.elapsed(), liveness_waiting) {
+                    next = source.try_recv().ok();
                 }
             }
-        });
+            apply_test_pre_commit_delay(has_produce);
+        }))
     }));
 
+    let batch_size = pending.len();
     match txn_result {
-        Ok(()) => {
-            // Commit is durable and visible: flush the buffered response(s) to
-            // the client, in order. Today a request yields at most one
-            // response, but the loop keeps a future multi-response request
-            // from silently dropping frames.
-            while let Ok(response) = buffer_rx.try_recv() {
-                if client_tx.send(response).is_err() {
-                    pg_warning!(
-                        "Client disconnected before response flush (correlation_id={})",
-                        correlation_id
-                    );
-                }
-            }
-        }
+        Ok(()) => after_batch_commit(pending),
         Err(panic_payload) => {
-            // The transaction itself failed (commit-time panic). Any buffered
-            // response asserts success for work that did NOT commit — sending
-            // it would recreate the lost-ack bug at commit-failure
-            // granularity. Discard it and send an API-typed error frame
-            // instead (pure Rust construction + channel send; safe before
-            // Postgres error-state cleanup), then re-raise the panic to
-            // preserve today's worker-restart semantics.
-            while buffer_rx.try_recv().is_ok() {}
-            let error_response = crate::kafka::response_builders::error_response_for(
-                api_key,
-                api_version,
-                correlation_id,
-                ERROR_UNKNOWN_SERVER_ERROR,
-            )
-            .unwrap_or(crate::kafka::KafkaResponse::Error {
-                correlation_id,
-                error_code: ERROR_UNKNOWN_SERVER_ERROR,
-                error_message: Some("transaction commit failed".to_string()),
-            });
-            let _ = client_tx.send(error_response);
+            // The transaction itself failed (commit-time panic). Answer every
+            // request, then re-raise: the worker exits and the postmaster
+            // restarts it (WORKER_RESTART_INTERVAL).
+            after_batch_commit_failure(pending);
             std::panic::resume_unwind(panic_payload);
         }
     }
 
-    // Log timing results (only when log_timing is enabled)
-    if let Some(start) = tx_start {
-        let total_duration = start.elapsed();
-        let handler_dur = handler_duration.get();
-        let tx_overhead = total_duration.saturating_sub(handler_dur);
+    if env.log_timing {
+        let total = batch_start.elapsed();
+        let tx_overhead = total.saturating_sub(handler_time);
         log!(
-            "TIMING: total={}us handler={}us tx_overhead={}us ({}%)",
-            total_duration.as_micros(),
-            handler_dur.as_micros(),
+            "TIMING: batch={} total={}us handler={}us tx_overhead={}us ({}%)",
+            batch_size,
+            total.as_micros(),
+            handler_time.as_micros(),
             tx_overhead.as_micros(),
-            if total_duration.as_micros() > 0 {
-                (tx_overhead.as_micros() * 100) / total_duration.as_micros()
+            if total.as_micros() > 0 {
+                (tx_overhead.as_micros() * 100) / total.as_micros()
             } else {
                 0
             }
@@ -2040,6 +2129,162 @@ mod tests {
         };
         notify_best_effort(&tx, make(1)); // fills the channel
         notify_best_effort(&tx, make(2)); // must return immediately (dropped), not block
+    }
+
+    #[test]
+    fn test_batch_has_room_stops_at_cap_budget_and_liveness() {
+        assert!(batch_has_room(1, Duration::ZERO, false));
+        assert!(batch_has_room(
+            MAX_GROUP_COMMIT_REQUESTS - 1,
+            Duration::from_millis(1),
+            false
+        ));
+        // Request cap.
+        assert!(!batch_has_room(
+            MAX_GROUP_COMMIT_REQUESTS,
+            Duration::ZERO,
+            false
+        ));
+        // Time budget.
+        assert!(!batch_has_room(1, GROUP_COMMIT_TIME_BUDGET, false));
+        // A waiting heartbeat ends the batch (DR-12).
+        assert!(!batch_has_room(1, Duration::ZERO, true));
+        // The cap keeps a batch within the subxid cache.
+        const { assert!(MAX_GROUP_COMMIT_REQUESTS <= 64) };
+    }
+
+    fn api_versions_request(
+        correlation_id: i32,
+    ) -> (
+        crate::kafka::KafkaRequest,
+        tokio::sync::mpsc::UnboundedReceiver<crate::kafka::KafkaResponse>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (
+            crate::kafka::KafkaRequest::ApiVersions {
+                correlation_id,
+                client_id: None,
+                api_version: 3,
+                response_tx: tx,
+            },
+            rx,
+        )
+    }
+
+    fn produce_request(
+        correlation_id: i32,
+        acks: i16,
+    ) -> (
+        crate::kafka::KafkaRequest,
+        tokio::sync::mpsc::UnboundedReceiver<crate::kafka::KafkaResponse>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (
+            crate::kafka::KafkaRequest::Produce {
+                correlation_id,
+                client_id: None,
+                api_version: 7,
+                acks,
+                timeout_ms: 1000,
+                topic_data: vec![],
+                transactional_id: None,
+                response_tx: tx,
+            },
+            rx,
+        )
+    }
+
+    /// What a handler does: send on the request's (swapped) response channel.
+    fn handler_sends(request: crate::kafka::KafkaRequest, correlation_id: i32) {
+        let tx = match request {
+            crate::kafka::KafkaRequest::ApiVersions { response_tx, .. }
+            | crate::kafka::KafkaRequest::Produce { response_tx, .. } => response_tx,
+            _ => unreachable!(),
+        };
+        tx.send(crate::kafka::KafkaResponse::Error {
+            correlation_id,
+            error_code: 0,
+            error_message: None,
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn test_buffered_responses_are_held_until_commit_then_released_in_order() {
+        // RB-1 with group commit: nothing reaches a client before the batch's
+        // commit; after it, every request's response is released.
+        let (mut a, mut a_rx) = api_versions_request(1);
+        let (mut b, mut b_rx) = api_versions_request(2);
+        let pending = vec![
+            BufferedResponse::intercept(&mut a),
+            BufferedResponse::intercept(&mut b),
+        ];
+        handler_sends(a, 1);
+        handler_sends(b, 2);
+        assert!(a_rx.try_recv().is_err(), "no response before commit");
+        assert!(b_rx.try_recv().is_err(), "no response before commit");
+
+        after_batch_commit(pending);
+        for (rx, expected) in [(&mut a_rx, 1), (&mut b_rx, 2)] {
+            match rx.try_recv().expect("released after commit") {
+                crate::kafka::KafkaResponse::Error {
+                    correlation_id,
+                    error_code,
+                    ..
+                } => {
+                    assert_eq!(correlation_id, expected);
+                    assert_eq!(error_code, 0, "the handler's own (success) response");
+                }
+                _ => panic!("unexpected response"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_commit_failure_replaces_every_response_with_an_error() {
+        let (mut a, mut a_rx) = api_versions_request(11);
+        let (mut p, mut p_rx) = produce_request(12, 1);
+        let pending = vec![
+            BufferedResponse::intercept(&mut a),
+            BufferedResponse::intercept(&mut p),
+        ];
+        handler_sends(a, 11);
+        handler_sends(p, 12);
+
+        after_batch_commit_failure(pending);
+        // ApiVersions has no typed error builder, so it gets the generic error
+        // frame — never the buffered success.
+        match a_rx.try_recv().expect("an error frame") {
+            crate::kafka::KafkaResponse::Error {
+                correlation_id,
+                error_code,
+                ..
+            } => {
+                assert_eq!(correlation_id, 11);
+                assert_eq!(error_code, ERROR_UNKNOWN_SERVER_ERROR);
+            }
+            other => panic!("expected an error frame, got {:?}", other),
+        }
+        assert!(a_rx.try_recv().is_err(), "the buffered success is dropped");
+        // Produce (acks=1): a Produce-typed error.
+        match p_rx.try_recv().expect("an error frame") {
+            crate::kafka::KafkaResponse::Produce { correlation_id, .. } => {
+                assert_eq!(correlation_id, 12)
+            }
+            other => panic!("expected a Produce error, got {:?}", other),
+        }
+        assert!(p_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_commit_failure_sends_nothing_to_acks0_produce() {
+        // An acks=0 client expects no response frame at all; an error frame would
+        // be read as the answer to its next request.
+        let (mut p, mut p_rx) = produce_request(21, 0);
+        let pending = vec![BufferedResponse::intercept(&mut p)];
+        drop(p); // the acks=0 path sends nothing
+        after_batch_commit_failure(pending);
+        assert!(p_rx.try_recv().is_err());
     }
 
     #[test]

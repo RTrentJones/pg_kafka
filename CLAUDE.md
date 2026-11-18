@@ -322,7 +322,7 @@ TCP:9092 → Tokio Runtime (listener.rs) → crossbeam-channel → Background Wo
 
 1. **Async Layer** (`src/kafka/listener.rs`): Tokio runtime accepts TCP connections, parses Kafka wire protocol
 2. **Message Queue** (`src/kafka/messages.rs`): `crossbeam-channel` bridges async→sync with `KafkaRequest` values on two lanes (`RequestLanes`: `main`, plus a `liveness` lane for Heartbeat that the worker drains first); each request carries a tokio `response_tx` that the worker answers with a `KafkaResponse`
-3. **Sync Layer** (`src/worker.rs`): Background worker processes requests via SPI within postgres transactions
+3. **Sync Layer** (`src/worker.rs`): Background worker processes requests via SPI within postgres transactions. **Group commit:** every request already queued (cap 64, ~50 ms budget, ends early when a Heartbeat waits) runs in one top-level transaction, each request in its own subtransaction (a handler returns `RequestOutcome::Rollback` on `Err`; panics are caught and rolled back), and all responses are released only after the single commit (RB-1). The worker is registered with a 5 s restart interval and exits with status 1 on SIGTERM, so `pg_terminate_backend()` or a crash brings up a fresh listener; it waits for the schema indefinitely. It starts once recovery finishes, so it does not run on a hot standby.
 
 **Critical constraint:** The tokio runtime cannot call SPI directly (different thread context). All database operations must go through the background worker.
 

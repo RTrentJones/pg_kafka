@@ -295,7 +295,10 @@ use kafka_test::{
     test_zero_percent_forwarding,
 };
 // lifecycle workstream (error_paths/lifecycle_tests.rs)
-use kafka_test::{test_failed_request_rolls_back_alone, test_worker_restarts_after_terminate};
+use kafka_test::{
+    test_failed_request_rolls_back_alone, test_group_commit_concurrent_acks_visible,
+    test_group_commit_pipelined_produces_in_order, test_worker_restarts_after_terminate,
+};
 
 type TestFn = fn() -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error>>> + Send>>;
 
@@ -849,6 +852,18 @@ fn get_all_tests() -> Vec<TestDef> {
             category: "error_paths",
             name: "test_failed_request_rolls_back_alone",
             test_fn: wrap_test!(test_failed_request_rolls_back_alone),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_group_commit_concurrent_acks_visible",
+            test_fn: wrap_test!(test_group_commit_concurrent_acks_visible),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_group_commit_pipelined_produces_in_order",
+            test_fn: wrap_test!(test_group_commit_pipelined_produces_in_order),
             parallel_safe: true,
         },
         TestDef {

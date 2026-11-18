@@ -5,7 +5,7 @@
 //! The code under test lives in `src/worker.rs` / `src/lib.rs`, which unit
 //! coverage cannot see (QA-1), so these drive the running broker.
 
-use crate::common::{create_producer, TestResult};
+use crate::common::{create_db_client, create_producer, TestResult};
 use crate::error_paths::bug_hunt::roundtrip;
 use crate::setup::TestContext;
 use bytes::{BufMut, BytesMut};
@@ -344,6 +344,157 @@ pub async fn test_failed_request_rolls_back_alone() -> TestResult {
     assert_eq!(
         versions.error_code, 0,
         "worker must still serve after the error"
+    );
+    println!("✅ Verification passed\n");
+
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+const GROUP_COMMIT_PRODUCERS: usize = 16;
+const GROUP_COMMIT_RECORDS_PER_PRODUCER: usize = 20;
+
+/// Item 4 (group commit) — RB-1 across a batch.
+///
+/// 16 producers (separate rdkafka clients, so separate connections) send 20
+/// records each, concurrently, to one partition. Concurrent requests queue up
+/// together and are committed in shared top-level transactions. After each ack,
+/// the producing task immediately reads that exact record (topic, partition,
+/// acked offset, unique key) on its OWN Postgres connection, once, with no
+/// retry.
+///
+/// Asserts: every acked record is visible on that first read (no response is
+/// released before its batch's commit); all 320 records are stored; and the 320
+/// acked offsets are distinct (one per record, none reused across a batch).
+pub async fn test_group_commit_concurrent_acks_visible() -> TestResult {
+    println!("=== Test: Group Commit — Every Acked Record Is Visible ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = crate::fixtures::TestTopicBuilder::new(&ctx, "lifecycle-group-commit")
+        .with_partitions(1)
+        .build()
+        .await?;
+
+    let mut tasks = Vec::new();
+    for producer_index in 0..GROUP_COMMIT_PRODUCERS {
+        let topic = topic.name.clone();
+        tasks.push(tokio::spawn(async move {
+            let run = async {
+                let producer = create_producer()?;
+                let db = create_db_client().await?;
+                let mut offsets = Vec::new();
+                for i in 0..GROUP_COMMIT_RECORDS_PER_PRODUCER {
+                    let key = format!("p{}-r{}", producer_index, i);
+                    let (partition, offset) = producer
+                        .send(
+                            rdkafka::producer::FutureRecord::to(&topic)
+                                .key(&key)
+                                .payload("group-commit")
+                                .partition(0),
+                            Duration::from_secs(10),
+                        )
+                        .await
+                        .map_err(|(e, _)| e)?;
+                    let visible: i64 = db
+                        .query_one(
+                            "SELECT COUNT(*) FROM kafka.messages m
+                             JOIN kafka.topics t ON m.topic_id = t.id
+                             WHERE t.name = $1 AND m.partition_id = $2
+                               AND m.partition_offset = $3 AND m.key = $4",
+                            &[&topic, &partition, &offset, &key.as_bytes()],
+                        )
+                        .await?
+                        .get(0);
+                    if visible != 1 {
+                        return Err(format!(
+                            "BARRIER VIOLATION: record {} acked at offset {} but the first \
+                             read from another connection saw {} rows",
+                            key, offset, visible
+                        )
+                        .into());
+                    }
+                    offsets.push(offset);
+                }
+                Ok::<Vec<i64>, Box<dyn std::error::Error>>(offsets)
+            };
+            run.await.map_err(|e| e.to_string())
+        }));
+    }
+
+    let mut all_offsets = Vec::new();
+    for task in tasks {
+        all_offsets.extend(task.await??);
+    }
+    let expected = GROUP_COMMIT_PRODUCERS * GROUP_COMMIT_RECORDS_PER_PRODUCER;
+    println!(
+        "   {} records acked, each visible on first read",
+        all_offsets.len()
+    );
+
+    all_offsets.sort_unstable();
+    all_offsets.dedup();
+    assert_eq!(
+        all_offsets.len(),
+        expected,
+        "acked offsets must be distinct"
+    );
+    assert_eq!(count_messages(&ctx, &topic.name).await?, expected as i64);
+    println!("✅ Verification passed\n");
+
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+const PIPELINED_PRODUCES: i32 = 40;
+
+/// Item 4 (group commit) — response order and offsets within a batch.
+///
+/// 40 Produce requests are written to one connection in a single write, so the
+/// worker finds them queued together and commits them in one or a few batches.
+///
+/// Asserts: 40 responses come back in request (correlation id) order, each
+/// without error, with base offsets exactly 0..39; and immediately afterwards
+/// all 40 records are visible from a separate connection.
+pub async fn test_group_commit_pipelined_produces_in_order() -> TestResult {
+    println!("=== Test: Group Commit — Pipelined Produces Answer In Order ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = crate::fixtures::TestTopicBuilder::new(&ctx, "lifecycle-pipelined")
+        .with_partitions(1)
+        .build()
+        .await?;
+
+    let mut frames = BytesMut::new();
+    for i in 0..PIPELINED_PRODUCES {
+        frames.extend_from_slice(&encode_frame(
+            PRODUCE_VERSION,
+            100 + i,
+            &produce_request(&topic.name, &format!("pipelined-{}", i)),
+        )?);
+    }
+    let mut stream = TcpStream::connect(BROKER).await?;
+    stream.write_all(&frames).await?;
+    stream.flush().await?;
+
+    for i in 0..PIPELINED_PRODUCES {
+        let response = tokio::time::timeout(
+            Duration::from_secs(30),
+            read_response::<ProduceRequest>(&mut stream, PRODUCE_VERSION),
+        )
+        .await
+        .map_err(|_| format!("timed out waiting for response {}", i))??;
+        let offset = produce_ok(&response, 100 + i)?;
+        assert_eq!(offset, i as i64, "produce {} got base offset {}", i, offset);
+    }
+    println!(
+        "   {} responses in order, offsets 0..{}",
+        PIPELINED_PRODUCES,
+        PIPELINED_PRODUCES - 1
+    );
+    assert_eq!(
+        count_messages(&ctx, &topic.name).await?,
+        PIPELINED_PRODUCES as i64,
+        "every acked record must already be visible"
     );
     println!("✅ Verification passed\n");
 

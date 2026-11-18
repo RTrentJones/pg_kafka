@@ -192,6 +192,12 @@ synchronous_commit = on         -- For acks=-1 (wait for WAL flush)
 - pg_kafka has no GUC of its own for this. The worker's transactions follow the server's
   `synchronous_commit` setting, so `off` trades durability of the latest commits for throughput
   for every acks level.
+- Group commit: the worker runs every request already queued (up to 64, or about 50 ms of work,
+  and never past a waiting Heartbeat) in ONE top-level transaction, each request in its own
+  subtransaction, and releases their responses only after that single commit. Concurrent and
+  pipelined producers therefore share one WAL flush instead of paying one each, which lifts the
+  ~220 requests/s fsync ceiling of the old one-transaction-per-request design. A lone request
+  still commits on its own, with no added wait.
 
 #### 4. Huge Pages (Large Instances)
 
