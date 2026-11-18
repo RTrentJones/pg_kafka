@@ -357,6 +357,15 @@ impl KafkaError {
 - Direct mapping to Kafka protocol error codes
 - Consistent error responses across all handlers
 
+**Per-item errors.** Produce, OffsetCommit, ListOffsets, DescribeGroups, CreateTopics,
+DeleteTopics, CreatePartitions, DeleteGroups, DeleteRecords, DescribeConfigs and
+IncrementalAlterConfigs have no top-level error code, so their handlers report every
+failure, storage failures included, on the topic/partition/resource/group it affects and
+keep processing the other items (as Kafka does). One gap remains: when no item is known or
+the handler did not return (a request that fails to decode, an unsupported version, or a
+Postgres ERROR that aborts the handler and rolls the request back), these APIs answer with
+an empty response that carries no error code.
+
 ### Notable Missing APIs
 
 - Security APIs (SaslHandshake/SaslAuthenticate, ACLs) - Not planned; use PostgreSQL auth + network controls
