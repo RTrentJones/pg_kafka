@@ -378,6 +378,7 @@ In-memory state management (`src/kafka/coordinator.rs`):
 - Automatic partition assignment with Range, RoundRobin, and Sticky strategies
 - Automatic rebalancing on member leave or session timeout
 - Tracks: generation IDs, member registry, partition assignments
+- JoinGroup responses are held until the join phase completes (every known member rejoined, or the rest left / timed out), as in Kafka; the generation moves when the join completes. `GroupCoordinator::join_group` takes a `JoinResponder` it calls exactly once (immediately or later, from another member's JoinGroup, a LeaveGroup or the ~1 s `check_and_remove_timed_out_members` sweep). The worker's JoinGroup arm answers on the client's own sender (`swap_response_tx` leaves it in place for JoinGroup), wrapped in `handlers::JoinGroupReply`, which answers UNKNOWN_SERVER_ERROR if dropped unsent
 
 ### Storage Schema
 

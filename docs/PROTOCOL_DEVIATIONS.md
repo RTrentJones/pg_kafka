@@ -127,19 +127,35 @@ pg_kafka.compression_type = 'gzip'
 - ✅ Automatic rebalancing on member join/leave
 - ✅ Member timeout detection (session timeout)
 - ✅ REBALANCE_IN_PROGRESS error handling
-- JoinGroup is answered immediately rather than held until the join phase completes,
-  so the group's generation moves when a rebalance *starts*. To keep what clients see
-  the same as Kafka, the coordinator remembers the last stable generation: a member
-  still on it that has not rejoined gets REBALANCE_IN_PROGRESS from Heartbeat (not
-  ILLEGAL_GENERATION), and its OffsetCommit is accepted while the group is
-  PreparingRebalance (the commit made when partitions are revoked). A stable group
-  rebalances when a member joins, a member's subscription changes, or the leader
-  rejoins; a follower rejoining with unchanged metadata keeps its assignment. A
-  rebalance that times out evicts only the members that did not rejoin.
+- ✅ JoinGroup responses are held until the join phase completes, as in Kafka: a
+  rebalance waits for every known member to rejoin (members that have not learn of it
+  from Heartbeat, REBALANCE_IN_PROGRESS), and the generation is incremented when the
+  join completes, so every member gets the same generation and the leader's member
+  list covers all of them. The phase also completes when the members that have not
+  rejoined leave, miss their session timeout, or are evicted by the rebalance timeout
+  (the largest `rebalance_timeout_ms` the members advertise); a periodic sweep (about
+  every second) runs those timeouts, so a held JoinGroup is answered even if no other
+  request arrives. A group whose only member is the joiner completes at once. While a
+  member waits on its JoinGroup its session timeout is suspended. OffsetCommit at the
+  current generation is accepted during the join phase (the commit made when
+  partitions are revoked) and fenced with REBALANCE_IN_PROGRESS during the sync phase.
+  A stable group rebalances when a member joins, a member's subscription changes, or
+  the leader rejoins; a follower rejoining with unchanged metadata keeps its
+  generation and assignment. Heartbeat during the sync phase answers NONE.
 
 **What's Not Implemented:**
 - ❌ Static group membership (KIP-345): `group_instance_id` is not honored
 - ❌ Cooperative rebalancing (KIP-429)
+- ❌ `MEMBER_ID_REQUIRED` (KIP-394): a first JoinGroup is admitted with a new member id
+  directly. A client that closes while its first JoinGroup is held never learns its
+  id, so it cannot send LeaveGroup; it is removed by its session timeout once the join
+  phase completes.
+- ❌ No initial rebalance delay (`group.initial.rebalance.delay.ms`): the first member
+  of an empty group completes its join at once, and members joining right after it
+  start a second rebalance.
+- ❌ A follower's SyncGroup that arrives before the leader's is answered
+  REBALANCE_IN_PROGRESS (the client rejoins, is answered at once with the current
+  generation, and retries) instead of being held until the leader syncs.
 
 **Client Impact:**
 - Full consumer group functionality works with standard Kafka clients
