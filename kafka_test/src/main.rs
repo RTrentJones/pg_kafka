@@ -322,6 +322,7 @@ use kafka_test::{
 use kafka_test::{
     test_handler_failure_gets_typed_error_response, test_truncated_body_gets_invalid_request,
     test_unsupported_versions_get_typed_error_responses,
+};
 // Stream `part` (wave 2): time-partitioned kafka.messages
 use kafka_test::{
     test_time_partition_maintenance_and_least_privilege,
@@ -1925,6 +1926,7 @@ fn get_all_tests() -> Vec<TestDef> {
             name: "test_handler_failure_gets_typed_error_response",
             test_fn: wrap_test!(test_handler_failure_gets_typed_error_response),
             parallel_safe: false, // revokes a worker privilege for a moment
+        },
         // Stream `part` (wave 2): time partitions. NOT parallel safe: they create and
         // drop leaves of kafka.messages and run the retention sweep.
         TestDef {
