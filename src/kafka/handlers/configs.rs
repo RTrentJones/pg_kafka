@@ -6,6 +6,12 @@
 // accepts only the keys it can enforce (`retention.ms`) and rejects everything
 // else with INVALID_CONFIG rather than silently accepting; DeleteRecords
 // truncates partitions below an offset and reports the new low watermark.
+//
+// None of the three handlers returns `Err`: their responses have no top-level
+// error code, and the request-level error builders used on `Err`
+// (`build_*_error_response`) can only produce an empty, error-free response. Every
+// failure, storage failures included, is reported on the resource or partition it
+// affects, and the other items in the request are still processed.
 
 use kafka_protocol::messages::delete_records_response::{
     DeleteRecordsPartitionResult, DeleteRecordsResponse, DeleteRecordsTopicResult,
@@ -115,9 +121,19 @@ pub fn handle_describe_configs(
             continue;
         }
 
-        match ctx.store.get_topic_id(&resource_name)? {
-            Some(topic_id) => {
-                let configs = effective_topic_configs(ctx, topic_id, global_retention_hours)?;
+        // A storage failure is reported on this resource only (error_code + message);
+        // a handler `Err` would reach the client as an empty, error-free response.
+        let lookup = ctx
+            .store
+            .get_topic_id(&resource_name)
+            .and_then(|id| match id {
+                Some(topic_id) => {
+                    effective_topic_configs(ctx, topic_id, global_retention_hours).map(Some)
+                }
+                None => Ok(None),
+            });
+        match lookup {
+            Ok(Some(configs)) => {
                 let wanted = |name: &str| match &requested_keys {
                     Some(keys) if !keys.is_empty() => keys.iter().any(|k| k == name),
                     _ => true,
@@ -137,12 +153,17 @@ pub fn handle_describe_configs(
                     .collect();
                 result.error_code = ERROR_NONE;
             }
-            None => {
+            Ok(None) => {
                 result.error_code = ERROR_UNKNOWN_TOPIC_OR_PARTITION;
                 result.error_message = Some(StrBytes::from_string(format!(
                     "Unknown topic '{}'",
                     resource_name
                 )));
+            }
+            Err(e) => {
+                warn_if_server_error("describe configs for", &resource_name, &e);
+                result.error_code = e.to_kafka_error_code();
+                result.error_message = Some(StrBytes::from_string(e.to_string()));
             }
         }
         results.push(result);
@@ -194,9 +215,9 @@ pub fn handle_incremental_alter_configs(
             continue;
         }
 
-        let topic_id = match ctx.store.get_topic_id(&resource_name)? {
-            Some(id) => id,
-            None => {
+        let topic_id = match ctx.store.get_topic_id(&resource_name) {
+            Ok(Some(id)) => id,
+            Ok(None) => {
                 resp.error_code = ERROR_UNKNOWN_TOPIC_OR_PARTITION;
                 resp.error_message = Some(StrBytes::from_string(format!(
                     "Unknown topic '{}'",
@@ -205,10 +226,20 @@ pub fn handle_incremental_alter_configs(
                 responses.push(resp);
                 continue;
             }
+            Err(e) => {
+                warn_if_server_error("alter configs for", &resource_name, &e);
+                resp.error_code = e.to_kafka_error_code();
+                resp.error_message = Some(StrBytes::from_string(e.to_string()));
+                responses.push(resp);
+                continue;
+            }
         };
 
-        // Validate everything first (all-or-nothing per resource).
-        let mut planned: Vec<Option<i64>> = Vec::new();
+        // Validate everything first (all-or-nothing per resource). Every supported
+        // alteration targets the same column, so applying them in order is the same
+        // as applying the last one: `planned` keeps only the final value, and the
+        // resource is applied with ONE write that either fully succeeds or fails.
+        let mut planned: Option<Option<i64>> = None;
         let mut validation_error: Option<String> = None;
         for (name, op, value) in &configs {
             if name != "retention.ms" {
@@ -220,13 +251,13 @@ pub fn handle_incremental_alter_configs(
             }
             match *op {
                 OP_SET => match parse_retention_ms(value.as_deref()) {
-                    Ok(ms) => planned.push(Some(ms)),
+                    Ok(ms) => planned = Some(Some(ms)),
                     Err(msg) => {
                         validation_error = Some(msg.to_string());
                         break;
                     }
                 },
-                OP_DELETE => planned.push(None),
+                OP_DELETE => planned = Some(None),
                 _ => {
                     validation_error =
                         Some("Unsupported operation (only SET and DELETE)".to_string());
@@ -242,9 +273,13 @@ pub fn handle_incremental_alter_configs(
             continue;
         }
 
-        if !validate_only {
-            for retention_ms in planned {
-                ctx.store.set_topic_retention_ms(topic_id, retention_ms)?;
+        if let (false, Some(retention_ms)) = (validate_only, planned) {
+            if let Err(e) = ctx.store.set_topic_retention_ms(topic_id, retention_ms) {
+                warn_if_server_error("alter configs for", &resource_name, &e);
+                resp.error_code = e.to_kafka_error_code();
+                resp.error_message = Some(StrBytes::from_string(e.to_string()));
+                responses.push(resp);
+                continue;
             }
         }
         resp.error_code = ERROR_NONE;
@@ -267,47 +302,43 @@ pub fn handle_delete_records(
     let mut topic_results = Vec::with_capacity(topics.len());
 
     for (topic_name, partitions) in topics {
-        let topic_id = ctx.store.get_topic_id(&topic_name)?;
-        let partition_count = ctx.store.get_topic_partition_count(&topic_name)?;
+        // Resolve the topic once. Unknown topic and a storage failure are both reported
+        // on every requested partition of this topic (`Err` holds the error code).
+        let resolved: std::result::Result<(i32, i32), i16> = match (
+            ctx.store.get_topic_id(&topic_name),
+            ctx.store.get_topic_partition_count(&topic_name),
+        ) {
+            (Ok(Some(id)), Ok(Some(count))) => Ok((id, count)),
+            (Ok(_), Ok(_)) => Err(ERROR_UNKNOWN_TOPIC_OR_PARTITION),
+            (Err(e), _) | (_, Err(e)) => {
+                warn_if_server_error("delete records from", &topic_name, &e);
+                Err(e.to_kafka_error_code())
+            }
+        };
         let mut partition_results = Vec::with_capacity(partitions.len());
 
         for (partition_id, requested_offset) in partitions {
             let mut pr = DeleteRecordsPartitionResult::default()
                 .with_partition_index(partition_id)
                 .with_low_watermark(-1);
-
-            let (topic_id, partition_count) = match (topic_id, partition_count) {
-                (Some(id), Some(count)) => (id, count),
-                _ => {
-                    pr.error_code = ERROR_UNKNOWN_TOPIC_OR_PARTITION;
-                    partition_results.push(pr);
-                    continue;
+            pr.error_code = match resolved {
+                Ok((topic_id, partition_count)) => {
+                    match delete_partition_records(
+                        ctx,
+                        topic_id,
+                        partition_count,
+                        partition_id,
+                        requested_offset,
+                    ) {
+                        Ok(low_watermark) => {
+                            pr.low_watermark = low_watermark;
+                            ERROR_NONE
+                        }
+                        Err(code) => code,
+                    }
                 }
+                Err(code) => code,
             };
-            if partition_id < 0 || partition_id >= partition_count {
-                pr.error_code = ERROR_UNKNOWN_TOPIC_OR_PARTITION;
-                partition_results.push(pr);
-                continue;
-            }
-
-            let high_watermark = ctx.store.get_high_watermark(topic_id, partition_id)?;
-            // -1 = "truncate everything" (to the HWM), per Kafka semantics.
-            let before_offset = if requested_offset == -1 {
-                high_watermark
-            } else {
-                requested_offset
-            };
-            if before_offset < 0 || before_offset > high_watermark {
-                pr.error_code = ERROR_OFFSET_OUT_OF_RANGE;
-                partition_results.push(pr);
-                continue;
-            }
-
-            let low_watermark =
-                ctx.store
-                    .delete_records_before(topic_id, partition_id, before_offset)?;
-            pr.error_code = ERROR_NONE;
-            pr.low_watermark = low_watermark;
             partition_results.push(pr);
         }
 
@@ -319,4 +350,49 @@ pub fn handle_delete_records(
     }
 
     Ok(DeleteRecordsResponse::default().with_topics(topic_results))
+}
+
+/// DeleteRecords for one partition of a resolved topic: the new low watermark, or
+/// the partition's error code. Storage failures are per-partition, like the rest.
+fn delete_partition_records(
+    ctx: &HandlerContext,
+    topic_id: i32,
+    partition_count: i32,
+    partition_id: i32,
+    requested_offset: i64,
+) -> std::result::Result<i64, i16> {
+    if partition_id < 0 || partition_id >= partition_count {
+        return Err(ERROR_UNKNOWN_TOPIC_OR_PARTITION);
+    }
+    let on_err = |e: crate::kafka::error::KafkaError| {
+        warn_if_server_error(
+            "delete records from",
+            &format!("topic_id={} partition={}", topic_id, partition_id),
+            &e,
+        );
+        e.to_kafka_error_code()
+    };
+    let high_watermark = ctx
+        .store
+        .get_high_watermark(topic_id, partition_id)
+        .map_err(on_err)?;
+    // -1 = "truncate everything" (to the HWM), per Kafka semantics.
+    let before_offset = if requested_offset == -1 {
+        high_watermark
+    } else {
+        requested_offset
+    };
+    if before_offset < 0 || before_offset > high_watermark {
+        return Err(ERROR_OFFSET_OUT_OF_RANGE);
+    }
+    ctx.store
+        .delete_records_before(topic_id, partition_id, before_offset)
+        .map_err(on_err)
+}
+
+/// Log a storage failure that is being reported to the client per item.
+fn warn_if_server_error(action: &str, target: &str, e: &crate::kafka::error::KafkaError) {
+    if e.is_server_error() {
+        crate::pg_warning!("Failed to {} '{}': {}", action, target, e);
+    }
 }

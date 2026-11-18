@@ -8,9 +8,10 @@
 //!
 //! # Strategy Selection
 //!
-//! Consumers advertise their supported strategies in JoinGroup. The coordinator
-//! selects a common strategy using `select_common_strategy()` with priority:
-//! sticky > roundrobin > range
+//! Consumers advertise their supported strategies in JoinGroup, in preference
+//! order. The coordinator (`ConsumerGroup::select_group_protocol`) picks the
+//! leader's most-preferred strategy that every member supports;
+//! `create_strategy()` maps the chosen name to an implementation.
 
 pub mod range;
 pub mod roundrobin;
@@ -111,90 +112,9 @@ pub fn create_strategy(name: &str) -> Option<Box<dyn AssignmentStrategy>> {
     }
 }
 
-/// Strategy priority for selection (higher = preferred)
-fn strategy_priority(name: &str) -> i32 {
-    match name.to_lowercase().as_str() {
-        "sticky" | "cooperative-sticky" => 3,
-        "roundrobin" => 2,
-        "range" => 1,
-        _ => 0,
-    }
-}
-
-/// Select a common strategy supported by all members
-///
-/// # Algorithm
-/// 1. Collect all strategies from all members' protocol lists
-/// 2. Find strategies supported by ALL members (intersection)
-/// 3. Return highest priority strategy from intersection
-///
-/// # Arguments
-/// * `member_protocols` - Map of member_id -> Vec<(strategy_name, metadata_bytes)>
-///
-/// # Returns
-/// Selected strategy name, or None if no common strategy exists
-pub fn select_common_strategy(
-    member_protocols: &HashMap<String, Vec<(String, Vec<u8>)>>,
-) -> Option<String> {
-    if member_protocols.is_empty() {
-        return None;
-    }
-
-    // Collect strategy sets for each member
-    let member_strategies: Vec<std::collections::HashSet<String>> = member_protocols
-        .values()
-        .map(|protocols| {
-            protocols
-                .iter()
-                .map(|(name, _)| name.to_lowercase())
-                .collect()
-        })
-        .collect();
-
-    if member_strategies.is_empty() {
-        return None;
-    }
-
-    // Find intersection (strategies supported by ALL members)
-    let mut common = member_strategies[0].clone();
-    for strategies in &member_strategies[1..] {
-        common = common.intersection(strategies).cloned().collect();
-    }
-
-    if common.is_empty() {
-        return None;
-    }
-
-    // Select highest priority strategy. Equal priorities (e.g. sticky and
-    // cooperative-sticky) are broken by name so the choice does not depend on
-    // HashSet iteration order.
-    common
-        .into_iter()
-        .max_by_key(|name| (strategy_priority(name), name.clone()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_select_common_strategy_tie_is_deterministic() {
-        let protocols = vec![
-            ("sticky".to_string(), vec![]),
-            ("cooperative-sticky".to_string(), vec![]),
-        ];
-        let mut members = HashMap::new();
-        members.insert("m1".to_string(), protocols.clone());
-        members.insert("m2".to_string(), protocols);
-        // HashSet order is randomised per instance; repeat to catch nondeterminism.
-        for _ in 0..200 {
-            assert_eq!(
-                select_common_strategy(&members).as_deref(),
-                Some("sticky"),
-                "tie between equal-priority strategies must be broken by name"
-            );
-        }
-    }
 
     #[test]
     fn test_create_strategy_range() {
@@ -229,81 +149,6 @@ mod tests {
         assert!(create_strategy("RANGE").is_some());
         assert!(create_strategy("RoundRobin").is_some());
         assert!(create_strategy("STICKY").is_some());
-    }
-
-    #[test]
-    fn test_select_common_strategy_all_support_range() {
-        let mut protocols = HashMap::new();
-        protocols.insert("member-1".to_string(), vec![("range".to_string(), vec![])]);
-        protocols.insert("member-2".to_string(), vec![("range".to_string(), vec![])]);
-
-        let selected = select_common_strategy(&protocols);
-        assert_eq!(selected, Some("range".to_string()));
-    }
-
-    #[test]
-    fn test_select_common_strategy_prioritizes_sticky() {
-        let mut protocols = HashMap::new();
-        protocols.insert(
-            "member-1".to_string(),
-            vec![
-                ("range".to_string(), vec![]),
-                ("roundrobin".to_string(), vec![]),
-                ("sticky".to_string(), vec![]),
-            ],
-        );
-        protocols.insert(
-            "member-2".to_string(),
-            vec![
-                ("range".to_string(), vec![]),
-                ("sticky".to_string(), vec![]),
-            ],
-        );
-
-        let selected = select_common_strategy(&protocols);
-        assert_eq!(selected, Some("sticky".to_string()));
-    }
-
-    #[test]
-    fn test_select_common_strategy_roundrobin_over_range() {
-        let mut protocols = HashMap::new();
-        protocols.insert(
-            "member-1".to_string(),
-            vec![
-                ("range".to_string(), vec![]),
-                ("roundrobin".to_string(), vec![]),
-            ],
-        );
-        protocols.insert(
-            "member-2".to_string(),
-            vec![
-                ("range".to_string(), vec![]),
-                ("roundrobin".to_string(), vec![]),
-            ],
-        );
-
-        let selected = select_common_strategy(&protocols);
-        assert_eq!(selected, Some("roundrobin".to_string()));
-    }
-
-    #[test]
-    fn test_select_common_strategy_no_common() {
-        let mut protocols = HashMap::new();
-        protocols.insert("member-1".to_string(), vec![("range".to_string(), vec![])]);
-        protocols.insert(
-            "member-2".to_string(),
-            vec![("roundrobin".to_string(), vec![])],
-        );
-
-        let selected = select_common_strategy(&protocols);
-        assert!(selected.is_none());
-    }
-
-    #[test]
-    fn test_select_common_strategy_empty() {
-        let protocols: HashMap<String, Vec<(String, Vec<u8>)>> = HashMap::new();
-        let selected = select_common_strategy(&protocols);
-        assert!(selected.is_none());
     }
 
     #[test]

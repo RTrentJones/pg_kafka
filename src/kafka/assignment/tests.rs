@@ -7,8 +7,7 @@ mod integration_tests {
     use std::collections::HashMap;
 
     use crate::kafka::assignment::{
-        create_strategy, select_common_strategy, AssignmentInput, MemberAssignment,
-        MemberSubscription,
+        create_strategy, AssignmentInput, MemberAssignment, MemberSubscription,
     };
 
     /// Helper to create assignment input
@@ -95,47 +94,6 @@ mod integration_tests {
                 strategy_name
             );
         }
-    }
-
-    #[test]
-    fn test_strategy_selection_integration() {
-        // Simulate JoinGroup protocol negotiation
-        let mut protocols = HashMap::new();
-        protocols.insert(
-            "member-1".to_string(),
-            vec![
-                (
-                    "range".to_string(),
-                    MemberSubscription::new(vec!["topic-a".to_string()]).encode(),
-                ),
-                (
-                    "roundrobin".to_string(),
-                    MemberSubscription::new(vec!["topic-a".to_string()]).encode(),
-                ),
-            ],
-        );
-        protocols.insert(
-            "member-2".to_string(),
-            vec![
-                (
-                    "roundrobin".to_string(),
-                    MemberSubscription::new(vec!["topic-a".to_string()]).encode(),
-                ),
-                (
-                    "range".to_string(),
-                    MemberSubscription::new(vec!["topic-a".to_string()]).encode(),
-                ),
-            ],
-        );
-
-        let selected = select_common_strategy(&protocols).unwrap();
-
-        // Both support roundrobin and range, roundrobin is preferred
-        assert_eq!(selected, "roundrobin");
-
-        // Create strategy and verify it works
-        let strategy = create_strategy(&selected).unwrap();
-        assert_eq!(strategy.name(), "roundrobin");
     }
 
     #[test]

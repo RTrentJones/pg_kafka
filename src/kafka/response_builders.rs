@@ -153,6 +153,17 @@ pub fn build_metadata_error_response(
 // ========== Error Response Builders ==========
 // These functions build API-specific error responses with the error code
 // embedded in the correct location for each Kafka API.
+//
+// Several APIs have no top-level error code (Produce, OffsetCommit, ListOffsets,
+// DescribeGroups, CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups,
+// DeleteRecords, DescribeConfigs, IncrementalAlterConfigs): their errors live on
+// each topic/partition/resource/group, and these builders know none of the
+// requested items, so they return an EMPTY response and cannot carry the code.
+// Their handlers therefore never return `Err`; they report every failure on the
+// items it affects. These builders are reached only where no request data exists
+// or the handler did not return: a request that failed to decode or used an
+// unsupported version (`error_response_for`), and a handler panic (a Postgres
+// ERROR) caught by `dispatch::dispatch_response`.
 
 use kafka_protocol::messages::create_partitions_response::CreatePartitionsResponse;
 use kafka_protocol::messages::create_topics_response::CreateTopicsResponse;

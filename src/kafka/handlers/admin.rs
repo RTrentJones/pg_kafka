@@ -281,16 +281,17 @@ pub fn handle_delete_groups(
                     continue;
                 }
 
-                // Remove from coordinator
-                coordinator.remove_group(&group_name);
-
-                // Delete committed offsets from storage
+                // Delete committed offsets first and drop the in-memory group only once
+                // that succeeded: a failed delete reports an error and leaves the group
+                // as it was, instead of half-deleting it (gone from the coordinator,
+                // offsets still stored).
                 match store.delete_consumer_group_offsets(&group_name) {
                     Ok(()) => {
+                        coordinator.remove_group(&group_name);
                         result.error_code = ERROR_NONE;
                     }
-                    Err(_e) => {
-                        result.error_code = ERROR_UNKNOWN_SERVER_ERROR;
+                    Err(e) => {
+                        result.error_code = e.to_kafka_error_code();
                     }
                 }
             }
@@ -301,8 +302,8 @@ pub fn handle_delete_groups(
                         // Successfully deleted any orphaned offsets, or nothing to delete
                         result.error_code = ERROR_NONE;
                     }
-                    Err(_e) => {
-                        result.error_code = ERROR_UNKNOWN_SERVER_ERROR;
+                    Err(e) => {
+                        result.error_code = e.to_kafka_error_code();
                     }
                 }
             }
