@@ -161,7 +161,11 @@ fn pg_kafka_run_retention_sweep(
 
     let store = PostgresStore::new();
     let stats = store
-        .run_retention_sweep(retention_hours, grace)
+        .run_retention_sweep(
+            retention_hours,
+            grace,
+            config::MESSAGE_PARTITION_MINUTES.get(),
+        )
         .unwrap_or_else(|e| pgrx::error!("pg_kafka_run_retention_sweep failed: {}", e));
 
     TableIterator::new(vec![
@@ -173,6 +177,10 @@ fn pg_kafka_run_retention_sweep(
             "expired_messages".to_string(),
             stats.expired_messages as i64,
         ),
+        (
+            "dropped_partitions".to_string(),
+            stats.dropped_partitions as i64,
+        ),
         ("stale_producers".to_string(), stats.stale_producers as i64),
         (
             "terminal_transactions".to_string(),
@@ -183,6 +191,22 @@ fn pg_kafka_run_retention_sweep(
             stats.shadow_delivered_rows as i64,
         ),
     ])
+}
+
+/// ADR-001 (0.1.0): run one time-partition maintenance pass on demand — create the
+/// leaves of kafka.messages for now and the next two widths, and move any row the
+/// DEFAULT leaf caught into its proper leaf. The worker runs the same pass at start
+/// and every retention interval. Returns the number of leaves created.
+///
+/// * `partition_minutes` — NULL (default) uses `pg_kafka.message_partition_minutes`.
+#[pg_extern(volatile)]
+fn pg_kafka_run_partition_maintenance(partition_minutes: default!(Option<i32>, "NULL")) -> i64 {
+    use crate::kafka::storage::postgres::PostgresStore;
+
+    let minutes = partition_minutes.unwrap_or_else(|| config::MESSAGE_PARTITION_MINUTES.get());
+    PostgresStore::new()
+        .ensure_time_partitions(minutes)
+        .unwrap_or_else(|e| pgrx::error!("pg_kafka_run_partition_maintenance failed: {}", e))
 }
 
 // Note: Removed reload_shadow_config() SQL function.

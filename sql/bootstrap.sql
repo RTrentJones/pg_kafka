@@ -56,7 +56,31 @@ CREATE TABLE kafka.topics (
 -- docs/UPGRADING.md), which repeat this statement for 0.0.0 installs that predate it.
 ALTER TABLE kafka.topics ADD COLUMN IF NOT EXISTS retention_ms BIGINT;
 
--- Messages table: The actual message log with dual-offset design
+-- Messages table: The actual message log with dual-offset design.
+--
+-- Time-partitioned (0.1.0, ADR-001): RANGE on created_at, the broker insert time.
+-- Each leaf ("time partition", like a Kafka log segment) covers
+-- pg_kafka.message_partition_minutes (default one day, aligned to UTC). The worker
+-- creates the current and the next two leaves ahead of time through
+-- kafka.ensure_message_partitions(); kafka.messages_default catches any row whose
+-- leaf does not exist yet, so a Produce never fails because maintenance was late,
+-- and the next maintenance pass moves such rows into their proper leaf. Retention
+-- drops a whole leaf once every row in it is expired under its own topic's rule
+-- (kafka.drop_message_partition) instead of deleting it row by row.
+--
+-- Uniqueness: Postgres only allows a unique constraint on a partitioned table if it
+-- contains the partition key, so the parent has no primary key. What makes offsets
+-- unique is how they are allocated: every partition_offset comes from
+-- kafka.partition_offsets.next_offset, read and advanced under the per-partition
+-- advisory lock and the counter row's lock, and never decremented (BUG-3); every
+-- global_offset comes from one sequence. As a backstop, each leaf carries UNIQUE
+-- (topic_id, partition_id, partition_offset) and UNIQUE (global_offset) indexes
+-- (kafka.create_message_partition adds them to every leaf it creates), which also
+-- serve the fetch/offset lookups: those queries do not name created_at, so they
+-- probe every leaf's btree, one cheap descent per leaf.
+--
+-- No UPDATE the extension issues changes created_at (EndTxn only sets txn_state),
+-- so a row never has to move between leaves.
 CREATE TABLE kafka.messages (
     topic_id INT NOT NULL,
     partition_id INT NOT NULL,
@@ -69,8 +93,9 @@ CREATE TABLE kafka.messages (
     -- read the producer's time, not the broker's insert time. -1 means the record carried no
     -- timestamp; the fetch path then falls back to created_at.
     timestamp_ms BIGINT NOT NULL DEFAULT -1,
-    -- created_at is the broker insert time, kept for retention/cleanup. TIMESTAMPTZ (not naive
-    -- TIMESTAMP) so EXTRACT(EPOCH ...) is unambiguous and doesn't skew by the session time zone.
+    -- created_at is the broker insert time: the partition key, and what retention is measured
+    -- against. TIMESTAMPTZ (not naive TIMESTAMP) so EXTRACT(EPOCH ...) is unambiguous and doesn't
+    -- skew by the session time zone.
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     -- Phase 10: Transaction tracking columns
     producer_id BIGINT,                -- Producer ID for transactional messages (NULL for non-transactional)
@@ -79,27 +104,20 @@ CREATE TABLE kafka.messages (
     -- DR-7 (DEEP-REVIEW-2026-07): reject negative partition ids at the storage layer too
     -- (handlers validate range against topics.partitions; this is the schema backstop).
     CHECK (partition_id >= 0),
-    PRIMARY KEY (topic_id, partition_id, partition_offset),
-    FOREIGN KEY (topic_id) REFERENCES kafka.topics(id) ON DELETE CASCADE,
-    -- Ensures global ordering is strictly monotonic. The unique constraint's backing
-    -- btree also serves temporal-range queries (global_offset > ? ORDER BY global_offset),
-    -- so no separate index on global_offset is needed (DR-3, DEEP-REVIEW-2026-07: a
-    -- second identical index doubled write amplification on the hottest column).
-    UNIQUE (global_offset)
-);
+    FOREIGN KEY (topic_id) REFERENCES kafka.topics(id) ON DELETE CASCADE
+) PARTITION BY RANGE (created_at);
 
 -- Kafka fetch queries (WHERE topic_id = ? AND partition_id = ? AND partition_offset >= ?)
--- are served by the primary key's btree on (topic_id, partition_id, partition_offset).
--- There is deliberately no separate index on those columns: the former
--- idx_messages_topic_partition_offset duplicated the primary key exactly and only
--- doubled write amplification on the hottest table (dropped in 0.1.0).
+-- are served by each leaf's UNIQUE (topic_id, partition_id, partition_offset) btree.
+-- (The former idx_messages_topic_partition_offset duplicated the old primary key
+-- exactly and only doubled write amplification; dropped in 0.1.0.)
 
--- Retention expiry scans (run_retention_sweep: WHERE topic_id = ? AND created_at < cutoff).
--- BRIN, not btree: created_at grows with insertion order, so a BRIN summary per block
--- range lets the sweep skip every block of still-retained messages at a tiny fraction of
--- a btree's size and insert cost. autosummarize asks autovacuum to summarize each
--- block range as it fills; an unsummarized range always matches, so without it the
--- newest ranges would be rechecked until the next VACUUM. Added in 0.1.0.
+-- Retention expiry scans inside a leaf that cannot be dropped whole (WHERE topic_id = ?
+-- AND created_at < cutoff). BRIN, not btree: created_at grows with insertion order, so
+-- a BRIN summary per block range lets the sweep skip every block of still-retained
+-- messages at a tiny fraction of a btree's size and insert cost. autosummarize asks
+-- autovacuum to summarize each block range as it fills. Partitioned index: every leaf
+-- gets one. Added in 0.1.0.
 CREATE INDEX idx_messages_created_at_brin
 ON kafka.messages USING brin (created_at) WITH (autosummarize = on);
 
@@ -108,6 +126,271 @@ ON kafka.messages USING brin (created_at) WITH (autosummarize = on);
 CREATE INDEX idx_messages_txn_pending
 ON kafka.messages(topic_id, partition_id, partition_offset)
 WHERE txn_state = 'pending';
+
+-- The catch-all leaf. Normally empty: it only holds rows that arrived before their
+-- time partition existed (or rows written out of band with a created_at outside every
+-- leaf). kafka.ensure_message_partitions() moves them into a proper leaf.
+CREATE TABLE kafka.messages_default PARTITION OF kafka.messages DEFAULT;
+CREATE UNIQUE INDEX messages_default_offset_key
+ON kafka.messages_default (topic_id, partition_id, partition_offset);
+CREATE UNIQUE INDEX messages_default_global_offset_key
+ON kafka.messages_default (global_offset);
+
+-- Every leaf of kafka.messages with its bounds (NULL = MINVALUE/MAXVALUE) and whether
+-- it is the DEFAULT leaf. Read-only catalog query. The bounds are parsed from
+-- pg_get_expr(relpartbound), which prints timestamptz constants in the session's
+-- DateStyle: the function pins DateStyle so the text round-trips exactly.
+CREATE FUNCTION kafka.message_partitions()
+RETURNS TABLE (partition_oid OID, partition_name TEXT, lower_bound TIMESTAMPTZ,
+               upper_bound TIMESTAMPTZ, is_default BOOLEAN)
+LANGUAGE sql STABLE
+SET search_path = pg_catalog, pg_temp
+SET datestyle = 'ISO, YMD'
+AS $$
+    SELECT c.oid,
+           c.relname::text,
+           CASE WHEN m.b IS NULL OR m.b[1] = 'MINVALUE' THEN NULL
+                ELSE btrim(m.b[1], '''')::timestamptz END,
+           CASE WHEN m.b IS NULL OR m.b[2] = 'MAXVALUE' THEN NULL
+                ELSE btrim(m.b[2], '''')::timestamptz END,
+           m.b IS NULL
+    FROM pg_inherits i
+    JOIN pg_class c ON c.oid = i.inhrelid
+    CROSS JOIN LATERAL (
+        SELECT regexp_match(pg_get_expr(c.relpartbound, c.oid),
+                            '^FOR VALUES FROM \((.*)\) TO \((.*)\)$') AS b
+    ) m
+    WHERE i.inhparent = 'kafka.messages'::regclass
+$$;
+
+-- What a leaf holds, for the retention sweep's drop decision: every distinct
+-- (topic_id, partition_id) pair (parallel arrays, found with a loose index scan over
+-- the leaf's unique offset index, one btree descent per pair) and whether any row is a
+-- pending transactional row. SECURITY DEFINER because the worker has no privileges on
+-- the leaves themselves (it reads and writes through kafka.messages); it refuses any
+-- relation that is not a leaf of kafka.messages, so it cannot read other tables.
+CREATE FUNCTION kafka.message_partition_contents(
+    p_partition REGCLASS,
+    OUT topic_ids INT[],
+    OUT partition_ids INT[],
+    OUT has_pending BOOLEAN
+)
+LANGUAGE plpgsql STABLE SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_inherits
+                   WHERE inhrelid = p_partition AND inhparent = 'kafka.messages'::regclass) THEN
+        RAISE EXCEPTION '% is not a partition of kafka.messages', p_partition;
+    END IF;
+    EXECUTE format(
+        'WITH RECURSIVE k AS (
+             (SELECT topic_id, partition_id FROM %1$s
+              ORDER BY topic_id, partition_id LIMIT 1)
+             UNION ALL
+             SELECT n.topic_id, n.partition_id
+             FROM k CROSS JOIN LATERAL (
+                 SELECT l.topic_id, l.partition_id FROM %1$s l
+                 WHERE (l.topic_id, l.partition_id) > (k.topic_id, k.partition_id)
+                 ORDER BY l.topic_id, l.partition_id LIMIT 1) n
+         )
+         SELECT COALESCE(array_agg(topic_id ORDER BY topic_id, partition_id), ''{}''),
+                COALESCE(array_agg(partition_id ORDER BY topic_id, partition_id), ''{}''),
+                EXISTS (SELECT 1 FROM %1$s WHERE txn_state = ''pending'')
+         FROM k', p_partition)
+    INTO topic_ids, partition_ids, has_pending;
+END;
+$$;
+
+-- Create the leaf [p_lower, p_upper) (internal; called by ensure_message_partitions).
+-- Rows already in the DEFAULT leaf for that range are moved into the new leaf first
+-- (Postgres refuses CREATE ... PARTITION OF while the default holds such rows). The
+-- leaf gets the per-leaf unique indexes and is made a member of the extension, like
+-- the tables CREATE EXTENSION made: pg_dump then leaves it out exactly as it leaves
+-- out kafka.messages itself, DROP EXTENSION drops it, and no dump can restore a leaf
+-- without its parent. Returns 1 if created, 0 if a lock could not be taken within
+-- lock_timeout (the next maintenance pass retries).
+CREATE FUNCTION kafka.create_message_partition(p_lower TIMESTAMPTZ, p_upper TIMESTAMPTZ)
+RETURNS INT
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+SET datestyle = 'ISO, YMD'
+SET lock_timeout = '2s'
+AS $$
+DECLARE
+    -- messages_pYYYYMMDD_HHMMSS (UTC lower bound), plus _microseconds for a bound
+    -- that is not a whole second (only the gap after the upgrade's legacy leaf).
+    v_name TEXT := 'messages_p' || to_char(p_lower AT TIME ZONE 'UTC', 'YYYYMMDD"_"HH24MISS')
+                   || CASE WHEN date_trunc('second', p_lower) = p_lower THEN ''
+                           ELSE to_char(p_lower AT TIME ZONE 'UTC', '"_"US') END;
+    v_moved BIGINT := 0;
+BEGIN
+    IF p_lower IS NULL OR p_upper IS NULL OR p_lower >= p_upper THEN
+        RAISE EXCEPTION 'invalid partition range [%, %)', p_lower, p_upper;
+    END IF;
+    BEGIN
+        IF EXISTS (SELECT 1 FROM kafka.messages_default
+                   WHERE created_at >= p_lower AND created_at < p_upper) THEN
+            EXECUTE format('CREATE TABLE kafka.%I (LIKE kafka.messages INCLUDING DEFAULTS INCLUDING CONSTRAINTS)', v_name);
+            EXECUTE format(
+                'WITH moved AS (DELETE FROM kafka.messages_default
+                                WHERE created_at >= $1 AND created_at < $2 RETURNING *)
+                 INSERT INTO kafka.%I SELECT * FROM moved', v_name)
+            USING p_lower, p_upper;
+            GET DIAGNOSTICS v_moved = ROW_COUNT;
+            EXECUTE format('CREATE UNIQUE INDEX %I ON kafka.%I (topic_id, partition_id, partition_offset)',
+                           v_name || '_offset_key', v_name);
+            EXECUTE format('CREATE UNIQUE INDEX %I ON kafka.%I (global_offset)',
+                           v_name || '_global_offset_key', v_name);
+            EXECUTE format('ALTER TABLE kafka.messages ATTACH PARTITION kafka.%I FOR VALUES FROM (%L) TO (%L)',
+                           v_name, p_lower, p_upper);
+        ELSE
+            EXECUTE format('CREATE TABLE kafka.%I PARTITION OF kafka.messages FOR VALUES FROM (%L) TO (%L)',
+                           v_name, p_lower, p_upper);
+            EXECUTE format('CREATE UNIQUE INDEX %I ON kafka.%I (topic_id, partition_id, partition_offset)',
+                           v_name || '_offset_key', v_name);
+            EXECUTE format('CREATE UNIQUE INDEX %I ON kafka.%I (global_offset)',
+                           v_name || '_global_offset_key', v_name);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_depend
+                       WHERE classid = 'pg_class'::regclass
+                         AND objid = format('kafka.%I', v_name)::regclass
+                         AND deptype = 'e') THEN
+            EXECUTE format('ALTER EXTENSION pg_kafka ADD TABLE kafka.%I', v_name);
+        END IF;
+    EXCEPTION WHEN lock_not_available THEN
+        RAISE WARNING 'pg_kafka: could not create time partition kafka.% (lock timeout); will retry', v_name;
+        RETURN 0;
+    END;
+    IF v_moved > 0 THEN
+        RAISE LOG 'pg_kafka: created time partition kafka.% and moved % row(s) into it from kafka.messages_default',
+            v_name, v_moved;
+    END IF;
+    RETURN 1;
+END;
+$$;
+
+-- Partition maintenance (worker: at start and every sweep interval; operators: any
+-- time). Makes sure leaves of p_width_minutes (aligned to UTC multiples of the width)
+-- exist for now and the next p_ahead widths, and gives every row in the DEFAULT leaf a
+-- proper leaf. Ranges that already have a leaf (e.g. made under an earlier width) are
+-- left alone: only the gaps are filled, so changing the width never overlaps. Runs as
+-- the extension owner (DDL) but only ever creates leaves of kafka.messages. Returns the
+-- number of leaves created.
+CREATE FUNCTION kafka.ensure_message_partitions(p_width_minutes INT, p_ahead INT DEFAULT 2)
+RETURNS INT
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    v_width_s BIGINT;
+    v_width INTERVAL;
+    v_bucket TIMESTAMPTZ;
+    v_cur TIMESTAMPTZ;
+    v_hi TIMESTAMPTZ;
+    v_ov RECORD;
+    v_created INT := 0;
+BEGIN
+    IF p_width_minutes IS NULL OR p_width_minutes < 1 THEN
+        RAISE EXCEPTION 'partition width must be at least 1 minute, got %', p_width_minutes;
+    END IF;
+    v_width_s := p_width_minutes::BIGINT * 60;
+    v_width := make_interval(secs => v_width_s);
+    -- Serializes concurrent maintenance (worker and a manual call). Key: 'pg_kafka'.
+    PERFORM pg_advisory_xact_lock(8099547369649367905);
+    FOR v_bucket IN
+        SELECT DISTINCT b FROM (
+            SELECT to_timestamp((floor(extract(epoch FROM now()) / v_width_s) + g) * v_width_s) AS b
+            FROM generate_series(0, GREATEST(COALESCE(p_ahead, 2), 0)) AS g
+            UNION
+            SELECT to_timestamp(floor(extract(epoch FROM d.created_at) / v_width_s) * v_width_s)
+            FROM kafka.messages_default d
+        ) buckets
+        ORDER BY b
+    LOOP
+        -- Fill the gaps of [v_bucket, v_bucket + width) not covered by an existing leaf.
+        v_cur := v_bucket;
+        v_hi := v_bucket + v_width;
+        WHILE v_cur < v_hi LOOP
+            SELECT p.lower_bound, p.upper_bound INTO v_ov
+            FROM kafka.message_partitions() p
+            WHERE NOT p.is_default
+              AND COALESCE(p.upper_bound, 'infinity') > v_cur
+              AND COALESCE(p.lower_bound, '-infinity') < v_hi
+            ORDER BY p.lower_bound NULLS FIRST
+            LIMIT 1;
+            IF NOT FOUND THEN
+                v_created := v_created + kafka.create_message_partition(v_cur, v_hi);
+                EXIT;
+            END IF;
+            IF COALESCE(v_ov.lower_bound, '-infinity') > v_cur THEN
+                v_created := v_created + kafka.create_message_partition(v_cur, v_ov.lower_bound);
+            END IF;
+            v_cur := COALESCE(v_ov.upper_bound, 'infinity');
+        END LOOP;
+    END LOOP;
+    RETURN v_created;
+END;
+$$;
+
+-- Drop one time leaf for retention, if (re-checked here, under the locks) it holds no
+-- pending transactional row and every topic with rows in it is listed in
+-- p_expired_topics (the topics the caller found wholly expired in this leaf: its upper
+-- bound is older than the topic's retention window). Never drops the DEFAULT leaf.
+-- Returns whether it dropped the leaf and the (topic_id, partition_id) pairs the leaf
+-- held, so the caller advances their log_start_offset. Dropping a leaf is equivalent
+-- to deleting its rows, which the worker may already do; the function grants no more.
+CREATE FUNCTION kafka.drop_message_partition(
+    p_partition REGCLASS,
+    p_expired_topics INT[],
+    OUT dropped BOOLEAN,
+    OUT topic_ids INT[],
+    OUT partition_ids INT[]
+)
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+SET lock_timeout = '2s'
+AS $$
+DECLARE
+    v_contents RECORD;
+BEGIN
+    dropped := false;
+    IF NOT EXISTS (SELECT 1 FROM kafka.message_partitions() p
+                   WHERE p.partition_oid = p_partition AND NOT p.is_default) THEN
+        RAISE EXCEPTION '% is not a time partition of kafka.messages', p_partition;
+    END IF;
+    PERFORM pg_advisory_xact_lock(8099547369649367905);
+    BEGIN
+        -- DROP takes ACCESS EXCLUSIVE on the parent; take it first (parent, then leaf,
+        -- the order inserts use) so the contents check below cannot race a writer.
+        LOCK TABLE kafka.messages IN ACCESS EXCLUSIVE MODE;
+        SELECT * INTO v_contents FROM kafka.message_partition_contents(p_partition);
+        topic_ids := v_contents.topic_ids;
+        partition_ids := v_contents.partition_ids;
+        IF v_contents.has_pending
+           OR NOT (v_contents.topic_ids <@ COALESCE(p_expired_topics, '{}'::INT[])) THEN
+            RETURN;
+        END IF;
+        IF EXISTS (SELECT 1 FROM pg_depend
+                   WHERE classid = 'pg_class'::regclass AND objid = p_partition AND deptype = 'e') THEN
+            EXECUTE format('ALTER EXTENSION pg_kafka DROP TABLE %s', p_partition);
+        END IF;
+        EXECUTE format('DROP TABLE %s', p_partition);
+        dropped := true;
+    EXCEPTION WHEN lock_not_available THEN
+        RAISE WARNING 'pg_kafka: could not drop time partition % (lock timeout); will retry', p_partition;
+        dropped := false;
+        topic_ids := NULL;
+        partition_ids := NULL;
+    END;
+END;
+$$;
+
+-- Functions are executable by PUBLIC by default: these are for the worker role only.
+REVOKE EXECUTE ON FUNCTION kafka.message_partition_contents(REGCLASS) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION kafka.create_message_partition(TIMESTAMPTZ, TIMESTAMPTZ) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION kafka.ensure_message_partitions(INT, INT) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION kafka.drop_message_partition(REGCLASS, INT[]) FROM PUBLIC;
 
 -- Per-partition monotonic offset counter (BUG-3, AUDIT-2026-06): the next partition_offset to
 -- assign for each (topic, partition). Producers advance it under the per-partition advisory lock
@@ -167,6 +450,13 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON kafka.topics TO pgkafka_worker;
 GRANT USAGE ON SEQUENCE kafka.topics_id_seq TO pgkafka_worker;
 GRANT SELECT, INSERT, UPDATE, DELETE ON kafka.messages TO pgkafka_worker;
 GRANT USAGE ON SEQUENCE kafka.messages_global_offset_seq TO pgkafka_worker;
+-- Time partitions (ADR-001): the worker reads and writes the leaves only through
+-- kafka.messages, except the retention sweep's row delete in the DEFAULT leaf; all
+-- partition DDL goes through these SECURITY DEFINER functions.
+GRANT SELECT, DELETE ON kafka.messages_default TO pgkafka_worker;
+GRANT EXECUTE ON FUNCTION kafka.message_partition_contents(regclass) TO pgkafka_worker;
+GRANT EXECUTE ON FUNCTION kafka.ensure_message_partitions(int, int) TO pgkafka_worker;
+GRANT EXECUTE ON FUNCTION kafka.drop_message_partition(regclass, int[]) TO pgkafka_worker;
 -- partition_offsets is only upserted; rows go with their topic (ON DELETE CASCADE).
 GRANT SELECT, INSERT, UPDATE ON kafka.partition_offsets TO pgkafka_worker;
 GRANT SELECT, INSERT, UPDATE, DELETE ON kafka.consumer_offsets TO pgkafka_worker;
@@ -487,20 +777,32 @@ SELECT
     'total' AS unit
 FROM kafka.topics
 UNION ALL
--- Message metrics (estimates; see view comment)
+-- Message metrics (estimates; see view comment), summed over the leaves of the
+-- time-partitioned kafka.messages (the partitioned parent itself stores nothing).
 SELECT
     'messages' AS category,
     'count_estimate' AS metric,
-    GREATEST(reltuples, 0)::BIGINT AS value,
+    COALESCE(SUM(GREATEST(c.reltuples, 0)), 0)::BIGINT AS value,
     'total' AS unit
-FROM pg_class
-WHERE oid = 'kafka.messages'::regclass
+FROM pg_partition_tree('kafka.messages'::regclass) pt
+JOIN pg_class c ON c.oid = pt.relid
+WHERE pt.isleaf
 UNION ALL
 SELECT
     'messages' AS category,
     'stored_bytes' AS metric,
-    pg_table_size('kafka.messages'::regclass)::BIGINT AS value,
+    COALESCE(SUM(pg_table_size(pt.relid)), 0)::BIGINT AS value,
     'bytes' AS unit
+FROM pg_partition_tree('kafka.messages'::regclass) pt
+WHERE pt.isleaf
+UNION ALL
+SELECT
+    'messages' AS category,
+    'time_partitions' AS metric,
+    COUNT(*)::BIGINT AS value,
+    'total' AS unit
+FROM pg_partition_tree('kafka.messages'::regclass) pt
+WHERE pt.isleaf
 UNION ALL
 -- Consumer group metrics (groups with at least one committed offset; live
 -- membership is in-memory in the GroupCoordinator and not visible to SQL)
@@ -571,8 +873,9 @@ GRANT SELECT ON kafka.metrics TO pgkafka_reader;
 
 COMMENT ON VIEW kafka.metrics IS 'Unified operational metrics view for monitoring pg_kafka health.
 Categories: topics, messages, consumer_groups, consumer_offsets, producers, transactions, shadow.
-messages.count_estimate and messages.stored_bytes are O(1) catalog estimates (refreshed by
-(auto)VACUUM/ANALYZE), not exact scans; shadow.lag is the pending-outbox depth.
+messages.count_estimate and messages.stored_bytes are catalog estimates summed over the
+time partitions (refreshed by (auto)VACUUM/ANALYZE), not exact scans; messages.time_partitions
+counts the leaves of kafka.messages (DEFAULT included); shadow.lag is the pending-outbox depth.
 Use with: SELECT * FROM kafka.metrics WHERE category = ''messages'';';
 
 -- =============================================================================

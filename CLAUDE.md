@@ -42,6 +42,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Admin operations: CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups
 - Config/log management: DescribeConfigs, IncrementalAlterConfigs (only `retention.ms`; other keys are rejected with INVALID_CONFIG), DeleteRecords
 - Time-based retention sweep (`pg_kafka.message_retention_hours`, per-topic `retention.ms`), also runnable on demand via `pg_kafka_run_retention_sweep()`
+- Time-partitioned `kafka.messages` (RANGE on `created_at`, `pg_kafka.message_partition_minutes`, default one day, plus a DEFAULT leaf): retention drops whole leaves where every row is expired (ADR-001)
 - Multi-partition topics with key-based partition routing (murmur2 hash)
 - Dual-offset design (partition_offset + global_offset)
 - Repository Pattern storage abstraction (KafkaStore trait + PostgresStore impl)
@@ -251,6 +252,8 @@ src/
 │       ├── mod.rs      # Storage role traits, KafkaStore (their sum), delegate_*_store! macros
 │       ├── postgres/roles.rs  # PostgresStore's role impls (forward to its inherent SQL methods)
 │       ├── postgres.rs # PostgreSQL implementation (PostgresStore)
+│       ├── retention.rs # Pure retention planning (windows, batches, time-partition drop/trim decisions)
+│       ├── privileges.rs # Worker/reader role grants and the startup role check
 │       └── tests.rs    # Storage layer tests
 └── bin/
     └── pgrx_embed.rs   # pgrx embedding binary (generated)
@@ -283,6 +286,7 @@ kafka_test/             # E2E test suite (counts: docs/TEST_STRATEGY.md)
         ├── edge_cases/           # Boundary condition tests
         ├── concurrent/           # Concurrency tests
         ├── negative/             # Expected failure tests
+        ├── part/                 # Time partitions + partition-drop retention (ADR-001)
         └── performance/          # Performance benchmarks
 
 sql/
@@ -424,10 +428,14 @@ CREATE TABLE kafka.messages (
     producer_epoch SMALLINT,
     txn_state TEXT,                    -- NULL (committed/non-txn), 'pending' (uncommitted), 'aborted'
     CHECK (partition_id >= 0),
-    PRIMARY KEY (topic_id, partition_id, partition_offset),
-    FOREIGN KEY (topic_id) REFERENCES kafka.topics(id) ON DELETE CASCADE,
-    UNIQUE (global_offset)
-);
+    FOREIGN KEY (topic_id) REFERENCES kafka.topics(id) ON DELETE CASCADE
+) PARTITION BY RANGE (created_at);
+-- Time partitions (ADR-001): leaves kafka.messages_pYYYYMMDD_HHMMSS of
+-- pg_kafka.message_partition_minutes (UTC-aligned) + kafka.messages_default. No primary key on
+-- the parent (Postgres needs the partition key in it): offsets are unique because they are
+-- allocated from kafka.partition_offsets under lock and never reused; every leaf carries
+-- UNIQUE (topic_id, partition_id, partition_offset) and UNIQUE (global_offset) as a backstop.
+-- Leaves are extension members (pg_dump leaves them out like the parent).
 
 -- Per-partition monotonic offset counter (never decremented, so offsets are never reused)
 CREATE TABLE IF NOT EXISTS kafka.partition_offsets (
@@ -531,8 +539,24 @@ access to the kafka schema (nothing is granted to PUBLIC any more; grant this ro
 scan the worker's SQL for uncovered tables/verbs). A new worker statement on a new table, or a new
 worker-written table (e.g. a metrics table), needs a matching GRANT plus an entry there.
 
+**Time partitions (ADR-001, 0.1.0):** all partition DDL runs in SECURITY DEFINER functions in
+`sql/bootstrap.sql` (fixed `search_path`, `lock_timeout`, each refuses anything but a leaf of
+`kafka.messages`): `kafka.ensure_message_partitions(width_minutes, ahead)` (worker: at start and
+every sweep interval; creates the current + next two leaves and moves rows out of the DEFAULT
+leaf), `kafka.drop_message_partition(leaf, expired_topics)` (re-checks under lock),
+`kafka.message_partition_contents(leaf)`, internal `kafka.create_message_partition`;
+`kafka.message_partitions()` lists the leaves. `pgkafka_worker` gets only EXECUTE on them
+(`WORKER_FUNCTION_GRANTS` in `privileges.rs`). The drop/trim decisions are pure functions in
+`src/kafka/storage/retention.rs`. Retention for a window >= one width is leaf-granular (a row
+lives at most window + width, like Kafka segments); shorter windows and the DEFAULT leaf are
+expired row by row. Never write an UPDATE that changes `created_at` (it would move rows between
+leaves), and confine a ctid-based statement to one leaf (`tableoid`), since ctids repeat across leaves. Statements on
+`kafka.messages` that do not name `created_at` plan over every leaf: hot ones go through
+`select_cached` in `postgres.rs` (kept prepared plans, executed with a fresh snapshot).
+
 **SQL Functions** (from `src/lib.rs`, in the `public` schema):
-- `pg_kafka_run_retention_sweep(message_retention_hours INT DEFAULT NULL, aborted_grace_seconds BIGINT DEFAULT 60)`: Runs one retention sweep on demand (the worker runs the same sweep periodically) and returns `(category, deleted)` rows for `aborted_messages`, `expired_messages`, `stale_producers`, `terminal_transactions`, `shadow_delivered_rows`. A NULL first argument uses `pg_kafka.message_retention_hours`.
+- `pg_kafka_run_retention_sweep(message_retention_hours INT DEFAULT NULL, aborted_grace_seconds BIGINT DEFAULT 60)`: Runs one retention sweep on demand (the worker runs the same sweep periodically) and returns `(category, deleted)` rows for `aborted_messages`, `expired_messages`, `dropped_partitions` (whole time partitions dropped), `stale_producers`, `terminal_transactions`, `shadow_delivered_rows`. A NULL first argument uses `pg_kafka.message_retention_hours`.
+- `pg_kafka_run_partition_maintenance(partition_minutes INT DEFAULT NULL)`: Runs one time-partition maintenance pass on demand (same as the worker's) and returns the number of leaves created. NULL uses `pg_kafka.message_partition_minutes`.
 - `hello_pg_kafka()`: Smoke-test function returning `'Hello, pg_kafka'`.
 
 ## Configuration
@@ -557,6 +581,7 @@ pg_kafka.run_as_role = 'pgkafka_worker' -- Role the worker switches to once the 
 
 -- Reloadable (GucContext::Sighup, pg_reload_conf())
 pg_kafka.message_retention_hours = 0 -- Retention sweep for kafka.messages (0 = keep forever; 0-87600; DR-2)
+pg_kafka.message_partition_minutes = 1440 -- Width of one time partition of kafka.messages (5-43200; new leaves only; ADR-001)
 pg_kafka.config_reload_interval_ms = 30000  -- How often the worker reloads GUCs + shadow config (100-300000ms)
 
 -- Test-only fault injection (Sighup, default 0 = off; never set in production)
@@ -704,6 +729,7 @@ Per-category counts are in `docs/TEST_STRATEGY.md`; `cargo run --release -- --li
 | **long_poll** | Timeout behavior, immediate return, producer wakeup, precision, per-connection task cap |
 | **error_paths** | Invalid partitions, unknown topics, coordinator errors, protocol/transaction/group regressions |
 | **edge_cases** | Empty topics, large messages, boundary values, retention sweep |
+| **part** | Time partitions of kafka.messages: whole-leaf retention drops, row-delete fallback, pending-transaction blocking, maintenance, least privilege |
 | **concurrent** | Multi-producer, multi-consumer, request pipelining, races, heartbeat liveness lane |
 | **negative** | Connection refused, timeouts, expected failures, superuser-only SASL password GUC |
 | **performance** | Throughput baselines, latency percentiles, scaling |
@@ -852,7 +878,6 @@ To debug:
 
 ## Future Enhancements
 
-- Table partitioning (for high-volume use cases; time-based retention already exists via `pg_kafka.message_retention_hours` and per-topic `retention.ms`)
 - Cooperative rebalancing (KIP-429)
 - Static group membership (KIP-345)
 - Log compaction (KIP-58)

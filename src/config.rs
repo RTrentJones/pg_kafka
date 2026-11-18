@@ -288,6 +288,11 @@ pub static CONFIG_RELOAD_INTERVAL_MS: GucSetting<i32> =
 // behaviour). Auxiliary-table pruning (stale producers, terminal transactions,
 // delivered shadow-outbox rows) always runs; see storage::postgres retention consts.
 pub static MESSAGE_RETENTION_HOURS: GucSetting<i32> = GucSetting::<i32>::new(0);
+// ADR-001 (0.1.0): width of one time partition (leaf) of kafka.messages, minutes.
+// The worker keeps the current leaf and the next two created ahead of time; whole
+// leaves are dropped by the retention sweep once every row in them is expired.
+pub static MESSAGE_PARTITION_MINUTES: GucSetting<i32> =
+    GucSetting::<i32>::new(crate::kafka::storage::retention::DEFAULT_PARTITION_MINUTES);
 // Issue #93: test-only fault injection for the shadow outbox in-flight gate.
 // When > 0, the shadow forwarder (network thread) holds each ForwardAck this
 // many ms after delivery before returning it to the DB thread, making the ack
@@ -388,6 +393,22 @@ pub fn init() {
         &MESSAGE_RETENTION_HOURS,
         0,
         87_600, // 10 years
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"pg_kafka.message_partition_minutes",
+        c"Width of one time partition of kafka.messages, in minutes (default 1440 = one day)",
+        c"kafka.messages is partitioned by created_at into leaves of this width, aligned to \
+          UTC. The worker creates the current leaf and the next two ahead of time; the \
+          retention sweep drops a whole leaf once every row in it is expired under its \
+          topic's retention. Topics whose retention window is shorter than one width are \
+          still expired row by row. A change applies to leaves created afterwards (existing \
+          leaves keep their bounds). Reloadable via SIGHUP.",
+        &MESSAGE_PARTITION_MINUTES,
+        crate::kafka::storage::retention::MIN_PARTITION_MINUTES,
+        crate::kafka::storage::retention::MAX_PARTITION_MINUTES,
         GucContext::Sighup,
         GucFlags::default(),
     );

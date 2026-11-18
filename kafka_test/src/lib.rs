@@ -64,6 +64,8 @@ pub mod producer;
 pub mod protocol;
 pub mod shadow;
 pub mod transaction;
+// Stream `part` (wave 2): time-partitioned kafka.messages
+pub mod part;
 
 // Re-export infrastructure
 pub use assertions::*;
@@ -235,4 +237,11 @@ pub use metadata::{
 pub use protocol::{
     test_api_versions_negotiation, test_correlation_id_preserved, test_protocol_request_pipelining,
     test_response_ordering_with_long_poll, test_unknown_api_key_handling,
+};
+
+// Stream `part` (wave 2): time partitions + retention by partition drop
+pub use part::{
+    test_time_partition_maintenance_and_least_privilege,
+    test_time_partition_retention_drops_whole_partitions,
+    test_time_partition_retention_waits_for_pending_transaction,
 };
