@@ -17,7 +17,7 @@ use std::time::Duration;
 pub async fn test_key_routing_deterministic() -> TestResult {
     println!("=== Test: Key Routing Deterministic ===\n");
 
-    let topic = "key-routing-deterministic";
+    let topic = format!("key-routing-deterministic-{}", uuid::Uuid::new_v4());
     let num_partitions = 5i32;
     let test_key = "consistent-key";
 
@@ -53,7 +53,7 @@ pub async fn test_key_routing_deterministic() -> TestResult {
         // NOTE: rdkafka handles partition selection client-side when partition is not set
         // To truly test server-side routing, we would need to send partition=-1 in the wire protocol
         // For now, we verify that messages with the same key end up in the same partition
-        let record = FutureRecord::to(topic).payload(&value).key(test_key);
+        let record = FutureRecord::to(&topic).payload(&value).key(test_key);
 
         match producer.send(record, Duration::from_secs(5)).await {
             Ok((partition, offset)) => {
@@ -122,7 +122,7 @@ pub async fn test_key_routing_deterministic() -> TestResult {
 pub async fn test_key_distribution() -> TestResult {
     println!("=== Test: Key Distribution ===\n");
 
-    let topic = "key-distribution-topic";
+    let topic = format!("key-distribution-topic-{}", uuid::Uuid::new_v4());
     let num_partitions = 4i32;
     let num_messages = 100;
 
@@ -156,7 +156,7 @@ pub async fn test_key_distribution() -> TestResult {
         let key = format!("unique-key-{}", i);
         let value = format!("value-{}", i);
 
-        let record = FutureRecord::to(topic).payload(&value).key(&key);
+        let record = FutureRecord::to(&topic).payload(&value).key(&key);
 
         match producer.send(record, Duration::from_secs(5)).await {
             Ok((partition, _offset)) => {

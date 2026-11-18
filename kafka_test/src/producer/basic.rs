@@ -3,7 +3,8 @@
 //! Validates that messages can be produced via Kafka protocol
 //! and are correctly stored in the PostgreSQL database.
 
-use crate::common::{create_db_client, create_producer, TestResult};
+use crate::common::{create_producer, TestResult};
+use crate::setup::TestContext;
 use rdkafka::producer::FutureRecord;
 use std::time::Duration;
 
@@ -22,15 +23,19 @@ pub async fn test_producer() -> TestResult {
     let producer = create_producer()?;
     println!("✅ Producer created\n");
 
+    // Unique per run, so a re-run against the same database does not see the
+    // previous run's rows.
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("test-topic").await;
+
     // Send a test message
-    println!("Sending message to topic 'test-topic'...");
-    let topic = "test-topic";
+    println!("Sending message to topic '{}'...", topic);
     let key = "test-key";
     let payload = "Hello from rdkafka test client!";
 
     let (partition, offset) = producer
         .send(
-            FutureRecord::to(topic).payload(payload).key(key),
+            FutureRecord::to(&topic).payload(payload).key(key),
             Duration::from_secs(5),
         )
         .await
@@ -48,9 +53,7 @@ pub async fn test_producer() -> TestResult {
     println!("\n=== Automated Database Verification ===");
 
     // Connect to PostgreSQL
-    println!("Connecting to PostgreSQL...");
-    let client = create_db_client().await?;
-    println!("✅ Connected to database\n");
+    let client = ctx.db();
 
     // Verify topic was created
     println!("Checking topic creation...");
@@ -112,6 +115,7 @@ pub async fn test_producer() -> TestResult {
     let message_count: i64 = count_row.get(0);
     println!("\n✅ Total messages in '{}': {}", topic, message_count);
 
+    ctx.cleanup().await?;
     println!("✅ Producer test PASSED\n");
 
     Ok(())

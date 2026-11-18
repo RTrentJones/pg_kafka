@@ -4,6 +4,7 @@
 //! FindCoordinator → JoinGroup → SyncGroup → Heartbeat → LeaveGroup
 
 use crate::common::{create_producer, TestResult};
+use crate::setup::TestContext;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::message::Message;
@@ -22,8 +23,9 @@ use std::time::Duration;
 pub async fn test_consumer_group_lifecycle() -> TestResult {
     println!("=== Test: Consumer Group Lifecycle ===\n");
 
-    let topic = "lifecycle-test-topic";
-    let group_id = "lifecycle-test-group";
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("lifecycle-test-topic").await;
+    let group_id = ctx.unique_group("lifecycle-test-group").await;
 
     // 1. Produce some test messages
     println!("Step 1: Producing test messages...");
@@ -33,7 +35,7 @@ pub async fn test_consumer_group_lifecycle() -> TestResult {
         let value = format!("Lifecycle test message {}", i);
         producer
             .send(
-                FutureRecord::to(topic)
+                FutureRecord::to(&topic)
                     .payload(&value)
                     .key(&format!("key-{}", i)),
                 Duration::from_secs(5),
@@ -47,7 +49,7 @@ pub async fn test_consumer_group_lifecycle() -> TestResult {
     println!("\nStep 2: Creating consumer and joining group...");
     let consumer: StreamConsumer = ClientConfig::new()
         .set("bootstrap.servers", "localhost:9092")
-        .set("group.id", group_id)
+        .set("group.id", &group_id)
         .set("session.timeout.ms", "10000")
         .set("heartbeat.interval.ms", "1000")
         .set("enable.auto.commit", "false")
@@ -55,7 +57,7 @@ pub async fn test_consumer_group_lifecycle() -> TestResult {
         .create()?;
 
     // Subscribe exercises FindCoordinator, JoinGroup, SyncGroup
-    consumer.subscribe(&[topic])?;
+    consumer.subscribe(&[topic.as_str()])?;
     println!("✅ Consumer subscribed (FindCoordinator + JoinGroup + SyncGroup)");
 
     // 3. Poll for messages (exercises Fetch + implicit Heartbeats)
@@ -104,16 +106,17 @@ pub async fn test_consumer_group_lifecycle() -> TestResult {
     // Create new consumer to verify group is joinable
     let consumer2: StreamConsumer = ClientConfig::new()
         .set("bootstrap.servers", "localhost:9092")
-        .set("group.id", group_id)
+        .set("group.id", &group_id)
         .set("session.timeout.ms", "6000")
         .set("enable.auto.commit", "false")
         .create()?;
 
-    consumer2.subscribe(&[topic])?;
+    consumer2.subscribe(&[topic.as_str()])?;
     println!("✅ New consumer successfully joined same group");
 
     drop(consumer2);
 
+    ctx.cleanup().await?;
     println!("\n✅ Consumer group lifecycle test PASSED\n");
     Ok(())
 }
