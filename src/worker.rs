@@ -600,6 +600,9 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     // Flag to track if SIGHUP was received (triggers immediate config reload)
     let mut sighup_pending = false;
 
+    // Broker request metrics: published to kafka.broker_api_stats / kafka.broker_gauges.
+    let mut metrics_flusher = crate::kafka::metrics::MetricsFlusher::new();
+
     loop {
         // ┌─────────────────────────────────────────────────────────────┐
         // │ Check for Postgres Shutdown Signal                          │
@@ -917,6 +920,23 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
             });
             last_retention_sweep = Instant::now();
         }
+
+        // ┌─────────────────────────────────────────────────────────────┐
+        // │ Publish Broker Metrics (≤ once per second, only if changed) │
+        // └─────────────────────────────────────────────────────────────┘
+        // One upsert statement per flush; no SQL at all while nothing changed.
+        if let Some(batch) = metrics_flusher.poll(request_rx.len(), liveness_rx.len()) {
+            let written = BackgroundWorker::transaction(|| {
+                let mut written = Ok(());
+                let guard = run_request_in_subtransaction(|| {
+                    written = crate::kafka::metrics::write_batch(&batch);
+                });
+                guard.and(written)
+            });
+            if let Some(msg) = metrics_flusher.finish(batch, written) {
+                pg_warning!("{}", msg);
+            }
+        }
     }
 }
 
@@ -981,6 +1001,10 @@ struct BufferedResponse {
     /// False for an acks=0 produce: the client expects no response frame at all,
     /// not even an error.
     expects_response: bool,
+    /// Per-request metrics: started when the request is taken into the batch,
+    /// recorded when this value is dropped (after release or fail), so latency
+    /// covers the handler and the batch commit.
+    metrics: crate::kafka::metrics::RequestTimer<'static>,
 }
 
 impl BufferedResponse {
@@ -1001,6 +1025,7 @@ impl BufferedResponse {
             api_version,
             correlation_id,
             expects_response,
+            metrics: crate::kafka::metrics::RequestTimer::start(api_key),
         }
     }
 
@@ -1009,6 +1034,7 @@ impl BufferedResponse {
     /// future multi-response request from silently dropping frames.
     fn release(mut self) {
         while let Ok(response) = self.buffer_rx.try_recv() {
+            self.metrics.observe(&response);
             if self.client_tx.send(response).is_err() {
                 pg_warning!(
                     "Client disconnected before response flush (correlation_id={})",
@@ -1025,6 +1051,7 @@ impl BufferedResponse {
     /// error-state cleanup). An acks=0 produce gets nothing.
     fn fail(mut self) {
         while self.buffer_rx.try_recv().is_ok() {}
+        self.metrics.mark_error();
         if !self.expects_response {
             return;
         }

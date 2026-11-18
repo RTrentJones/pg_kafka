@@ -531,6 +531,7 @@ pub async fn run(
                                 addr
                             );
                         }
+                        crate::kafka::metrics::connection_rejected();
                         drop(socket);
                         continue;
                     }
@@ -554,6 +555,7 @@ pub async fn run(
                     // Hold the connection permit for the task's lifetime; dropping it on exit
                     // frees a slot for a new connection (SEC-3).
                     let _permit = permit;
+                    let _conn_metrics = crate::kafka::metrics::ConnectionGuard::open();
                     if let Err(e) = handle_connection(
                         socket,
                         conn_request_lanes,

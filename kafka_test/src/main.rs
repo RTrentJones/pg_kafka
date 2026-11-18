@@ -102,6 +102,7 @@ use kafka_test::{
     // Consumer group tests
     test_consumer_group_lifecycle,
     test_consumer_group_two_members,
+    test_consumer_lag_view,
     test_consumer_multiple_messages,
     test_consumer_receives_headers,
     test_consumer_rejoin_after_leave,
@@ -222,6 +223,7 @@ use kafka_test::{
     test_metadata_all_topics,
     test_metadata_nonexistent_topic,
     test_metadata_refresh_after_create,
+    test_metrics_count_produce_and_fetch,
     test_multi_partition_produce,
     test_multiple_concurrent_timeouts,
     test_multiple_consumer_groups,
@@ -922,6 +924,18 @@ fn get_all_tests() -> Vec<TestDef> {
             category: "error_paths",
             name: "test_group_commit_pipelined_produces_in_order",
             test_fn: wrap_test!(test_group_commit_pipelined_produces_in_order),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_metrics_count_produce_and_fetch",
+            test_fn: wrap_test!(test_metrics_count_produce_and_fetch),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_consumer_lag_view",
+            test_fn: wrap_test!(test_consumer_lag_view),
             parallel_safe: true,
         },
         TestDef {

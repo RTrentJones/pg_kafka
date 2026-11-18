@@ -149,6 +149,7 @@ pub use error_paths::{
     test_fetch_bounds_from_single_statement, test_fetch_honours_request_max_bytes,
     test_retention_sweep_catches_up_on_backlog, test_worker_runs_as_least_privilege_role,
 };
+pub use error_paths::{test_consumer_lag_view, test_metrics_count_produce_and_fetch};
 pub use negative::{
     test_connection_refused, test_duplicate_consumer_join, test_invalid_group_id,
     test_produce_timeout, test_sasl_password_guc_is_superuser_only,
