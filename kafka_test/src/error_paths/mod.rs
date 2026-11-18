@@ -7,6 +7,7 @@
 pub(crate) mod bug_hunt;
 mod consumer_errors;
 mod coordinator_errors;
+mod coordinator_tests;
 mod fetch_errors;
 mod lifecycle_tests;
 mod listener_tests;
@@ -19,6 +20,7 @@ mod storage_tests;
 pub use bug_hunt::*;
 pub use consumer_errors::*;
 pub use coordinator_errors::*;
+pub use coordinator_tests::*;
 pub use fetch_errors::*;
 pub use lifecycle_tests::*;
 pub use listener_tests::*;
