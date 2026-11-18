@@ -21,6 +21,8 @@
 //! registered `parallel_safe: false` because they restart the listener.
 
 pub mod tests;
+// Stream `api`: SASL requests in kafka.api_metrics.
+pub mod api_metrics;
 
 use crate::common::{create_db_client, TestResult};
 use crate::error_paths::bug_hunt::roundtrip;

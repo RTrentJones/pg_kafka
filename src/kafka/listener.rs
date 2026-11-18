@@ -1157,16 +1157,25 @@ async fn handle_sasl_frame(
     frame: BytesMut,
     response_tx: UnboundedSender<KafkaResponse>,
 ) -> bool {
+    // Counted in kafka.api_metrics like a worker request (the counters are atomics, safe
+    // on this thread): latency covers the decode, the credential lookup and the
+    // response; a request that closes the connection without one counts as an error.
+    let api_key = crate::kafka::auth::session::peek_api_key(&frame).unwrap_or(-1);
+    let mut timer = crate::kafka::metrics::RequestTimer::start(api_key);
     let request = match crate::kafka::auth::session::decode_sasl_request(frame) {
         Ok(r) => r,
         Err(e) => {
+            timer.mark_error();
             warn!("Closing connection from {}: {}", auth.peer, e);
             return false;
         }
     };
     let lookup = auth.lookup.clone();
     match auth.sasl.handle(request, &lookup).await {
-        SaslOutcome::Reply(response) => response_tx.send(response).is_ok(),
+        SaslOutcome::Reply(response) => {
+            timer.observe(&response);
+            response_tx.send(response).is_ok()
+        }
         SaslOutcome::Authenticated {
             response,
             principal,
@@ -1185,9 +1194,11 @@ async fn handle_sasl_frame(
                     auth.security.bind_addr
                 );
             }
+            timer.observe(&response);
             response_tx.send(response).is_ok()
         }
         SaslOutcome::ReplyAndClose(response) => {
+            timer.observe(&response);
             let _ = response_tx.send(response);
             false
         }
@@ -1201,6 +1212,9 @@ async fn handle_sasl_frame(
                 auth.security.bind_addr,
                 reason
             );
+            timer.observe(&response);
+            // Record before the deliberate failure delay, which is not service time.
+            drop(timer);
             tokio::time::sleep(AUTH_FAILURE_DELAY).await;
             let _ = response_tx.send(response);
             false

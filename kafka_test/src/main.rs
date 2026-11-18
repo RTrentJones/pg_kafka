@@ -1985,6 +1985,16 @@ fn get_all_tests() -> Vec<TestDef> {
             test_fn: wrap_test!(kafka_test::auth::tests::test_auth_mutual_tls),
             parallel_safe: false,
         },
+        // Stream `api`: SASL requests counted in kafka.api_metrics (before the teardown,
+        // which restarts the worker and resets the counters).
+        TestDef {
+            category: "auth",
+            name: "test_auth_sasl_requests_counted_in_api_metrics",
+            test_fn: wrap_test!(
+                kafka_test::auth::api_metrics::test_auth_sasl_requests_counted_in_api_metrics
+            ),
+            parallel_safe: false,
+        },
         TestDef {
             category: "auth",
             name: "test_auth_teardown_restores_default_listeners",
