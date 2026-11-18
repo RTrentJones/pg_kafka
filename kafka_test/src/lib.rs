@@ -115,44 +115,8 @@ pub use edge_cases::{
     test_partition_zero, test_retention_sweep_expires_old_messages,
     test_retention_sweep_reclaims_aborted_messages, test_single_partition_topic,
 };
-pub use error_paths::{
-    test_active_idempotent_producer_survives_retention_sweep,
-    test_api_versions_above_range_negotiates_down, test_auto_create_rejects_invalid_topic_name,
-    test_commit_new_group, test_commit_offset_zero, test_commit_then_fetch_offset,
-    test_consume_empty_topic, test_corrupt_acks0_produce_sends_no_reply,
-    test_create_topics_default_and_zero_partitions, test_empty_group_id,
-    test_end_txn_retry_is_idempotent, test_fenced_producer_cannot_write,
-    test_fetch_advertised_minimum_is_usable, test_fetch_after_offset_reset,
-    test_fetch_bad_partition_or_offset_returns_error, test_fetch_from_new_partition,
-    test_fetch_into_cleaned_up_aborted_rows_is_in_range, test_fetch_invalid_partition,
-    test_fetch_isolation_level_enforcement, test_fetch_offset_out_of_range,
-    test_fetch_respects_min_one_message, test_fetch_uncommitted_offset, test_fetch_unknown_topic,
-    test_fetch_with_deleted_topic, test_frame_budget_released_on_mid_frame_disconnect,
-    test_group_rebalance_keeps_old_generation_usable, test_headers_keep_their_order,
-    test_heartbeat_after_leave, test_huge_retention_ms_does_not_break_sweep,
-    test_listener_idle_long_poll_does_not_refetch,
-    test_listener_pipelined_requests_beyond_in_flight_cap,
-    test_listener_produce_wakes_long_poll_promptly,
-    test_listener_read_committed_long_poll_wakes_on_commit, test_multiple_consumers_same_group,
-    test_heartbeat_after_leave, test_held_join_completed_by_leave_group,
-    test_held_join_completed_by_session_timeout_sweep, test_huge_retention_ms_does_not_break_sweep,
-    test_join_group_held_until_all_members_rejoin, test_multiple_consumers_same_group,
-    test_produce_any_partition, test_produce_empty_batch, test_produce_invalid_partition,
-    test_produce_large_key, test_produce_two_batches_in_one_partition_is_rejected,
-    test_producer_restart_new_epoch_records_are_stored, test_rejoin_after_leave,
-    test_timed_out_transaction_cannot_be_resumed,
-    test_txn_offset_commit_failure_reports_partition_errors,
-};
-// lifecycle workstream: worker restart + group commit (error_paths/lifecycle_tests.rs)
-pub use error_paths::{
-    test_failed_request_rolls_back_alone, test_group_commit_concurrent_acks_visible,
-    test_group_commit_pipelined_produces_in_order, test_worker_restarts_after_terminate,
-// Storage workstream regressions (retention, fetch bounds, privileges)
-pub use error_paths::{
-    test_fetch_bounds_from_single_statement, test_fetch_honours_request_max_bytes,
-    test_retention_sweep_catches_up_on_backlog, test_worker_runs_as_least_privilege_role,
-};
-pub use error_paths::{test_consumer_lag_view, test_metrics_count_produce_and_fetch};
+// Every error-path test (the module re-exports each of its files).
+pub use error_paths::*;
 pub use negative::{
     test_connection_refused, test_duplicate_consumer_join, test_invalid_group_id,
     test_produce_timeout, test_sasl_password_guc_is_superuser_only,

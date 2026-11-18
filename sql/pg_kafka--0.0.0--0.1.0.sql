@@ -78,3 +78,81 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON kafka.txn_pending_offsets TO pgkafka_wor
 GRANT SELECT ON kafka.shadow_config TO pgkafka_worker;
 GRANT SELECT, INSERT, UPDATE, DELETE ON kafka.shadow_tracking TO pgkafka_worker;
 GRANT SELECT, INSERT, UPDATE ON kafka.shadow_metrics TO pgkafka_worker;
+
+-- BEGIN broker request metrics (metrics stream)
+-- =============================================================================
+-- The background worker keeps per-API request/error/latency counters and broker
+-- gauges (open connections, request-queue depth) in memory (src/kafka/metrics.rs)
+-- and publishes them here at most once per second, only when they changed, with a
+-- single upsert statement. Values are cumulative since the worker started; the
+-- first flush after a worker (re)start rewrites every API row. UNLOGGED: these are
+-- monitoring data, cheap to write and acceptable to lose on a crash.
+CREATE UNLOGGED TABLE kafka.broker_api_stats (
+    api_key SMALLINT PRIMARY KEY,
+    api_name TEXT NOT NULL,
+    requests BIGINT NOT NULL DEFAULT 0,       -- requests executed by the worker
+    errors BIGINT NOT NULL DEFAULT 0,         -- requests whose response carried any non-zero error code, or that failed to commit
+    latency_us_sum BIGINT NOT NULL DEFAULT 0, -- total DB-thread service time (handler + commit), microseconds
+    latency_us_max BIGINT NOT NULL DEFAULT 0, -- largest single service time since worker start, microseconds
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE UNLOGGED TABLE kafka.broker_gauges (
+    name TEXT PRIMARY KEY,                    -- connections_open, connections_accepted_total, connections_rejected_total, request_queue_depth, liveness_queue_depth
+    value BIGINT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE VIEW kafka.api_metrics AS
+SELECT
+    api_key,
+    api_name,
+    requests,
+    errors,
+    latency_us_sum,
+    latency_us_max,
+    CASE WHEN requests > 0 THEN latency_us_sum::DOUBLE PRECISION / requests END AS latency_us_avg,
+    updated_at
+FROM kafka.broker_api_stats;
+
+CREATE VIEW kafka.broker_metrics AS
+SELECT name, value, updated_at FROM kafka.broker_gauges;
+
+-- Consumer lag per committed (group, topic, partition): the log-end offset
+-- (kafka.partition_offsets.next_offset, the never-decreasing counter Produce
+-- assigns from) minus the committed offset. A negative committed offset (no
+-- position) yields NULL lag. Groups with no commits are not visible to SQL
+-- (membership lives in the in-memory coordinator).
+CREATE VIEW kafka.consumer_lag AS
+SELECT
+    co.group_id,
+    t.name AS topic,
+    co.partition_id,
+    co.committed_offset,
+    COALESCE(po.next_offset, 0) AS high_watermark,
+    CASE WHEN co.committed_offset < 0 THEN NULL
+         ELSE GREATEST(COALESCE(po.next_offset, 0) - co.committed_offset, 0)
+    END AS lag,
+    co.commit_timestamp
+FROM kafka.consumer_offsets co
+JOIN kafka.topics t ON t.id = co.topic_id
+LEFT JOIN kafka.partition_offsets po
+       ON po.topic_id = co.topic_id AND po.partition_id = co.partition_id;
+
+GRANT SELECT ON kafka.broker_api_stats TO pgkafka_reader;
+GRANT SELECT ON kafka.broker_gauges TO pgkafka_reader;
+GRANT SELECT ON kafka.api_metrics TO pgkafka_reader;
+GRANT SELECT ON kafka.broker_metrics TO pgkafka_reader;
+GRANT SELECT ON kafka.consumer_lag TO pgkafka_reader;
+
+COMMENT ON TABLE kafka.broker_api_stats IS 'Per-API request counters published by the pg_kafka worker (cumulative since worker start).';
+COMMENT ON TABLE kafka.broker_gauges IS 'Broker gauges published by the pg_kafka worker (connections, request-queue depth).';
+COMMENT ON VIEW kafka.api_metrics IS 'Per-API requests, errors and DB-thread latency (count/sum/max/avg, microseconds).';
+COMMENT ON VIEW kafka.broker_metrics IS 'Broker gauges: open/accepted/rejected connections and request-lane depths.';
+COMMENT ON VIEW kafka.consumer_lag IS 'Committed offset vs log-end offset per consumer group/topic/partition.';
+-- =============================================================================
+-- The worker flushes these two tables (storage::privileges::WORKER_TABLE_GRANTS).
+GRANT SELECT, INSERT, UPDATE ON kafka.broker_api_stats TO pgkafka_worker;
+GRANT SELECT, INSERT, UPDATE ON kafka.broker_gauges TO pgkafka_worker;
+
+-- END broker request metrics (metrics stream)

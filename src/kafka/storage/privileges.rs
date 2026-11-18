@@ -35,6 +35,9 @@ pub const WORKER_ROLE: &str = "pgkafka_worker";
 ///   with the table owner's rights).
 /// * `shadow_config` is only read (operators manage it).
 pub const WORKER_TABLE_GRANTS: &[(&str, &[&str])] = &[
+    // Runtime metrics, flushed by one upsert per tick (kafka/metrics.rs FLUSH_SQL).
+    ("kafka.broker_api_stats", &["SELECT", "INSERT", "UPDATE"]),
+    ("kafka.broker_gauges", &["SELECT", "INSERT", "UPDATE"]),
     ("kafka.topics", &["SELECT", "INSERT", "UPDATE", "DELETE"]),
     ("kafka.messages", &["SELECT", "INSERT", "UPDATE", "DELETE"]),
     ("kafka.partition_offsets", &["SELECT", "INSERT", "UPDATE"]),
@@ -159,6 +162,8 @@ mod tests {
     const WORKER_SQL_SOURCES: &[(&str, &str)] = &[
         ("storage/postgres.rs", include_str!("postgres.rs")),
         ("shadow/store.rs", include_str!("../shadow/store.rs")),
+        ("shadow/outbox.rs", include_str!("../shadow/outbox.rs")),
+        ("metrics.rs", include_str!("../metrics.rs")),
         ("worker.rs", include_str!("../../worker.rs")),
     ];
 

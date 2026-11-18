@@ -636,11 +636,11 @@ JOIN kafka.topics t ON t.id = co.topic_id
 LEFT JOIN kafka.partition_offsets po
        ON po.topic_id = co.topic_id AND po.partition_id = co.partition_id;
 
-GRANT SELECT ON kafka.broker_api_stats TO PUBLIC;
-GRANT SELECT ON kafka.broker_gauges TO PUBLIC;
-GRANT SELECT ON kafka.api_metrics TO PUBLIC;
-GRANT SELECT ON kafka.broker_metrics TO PUBLIC;
-GRANT SELECT ON kafka.consumer_lag TO PUBLIC;
+GRANT SELECT ON kafka.broker_api_stats TO pgkafka_reader;
+GRANT SELECT ON kafka.broker_gauges TO pgkafka_reader;
+GRANT SELECT ON kafka.api_metrics TO pgkafka_reader;
+GRANT SELECT ON kafka.broker_metrics TO pgkafka_reader;
+GRANT SELECT ON kafka.consumer_lag TO pgkafka_reader;
 
 COMMENT ON TABLE kafka.broker_api_stats IS 'Per-API request counters published by the pg_kafka worker (cumulative since worker start).';
 COMMENT ON TABLE kafka.broker_gauges IS 'Broker gauges published by the pg_kafka worker (connections, request-queue depth).';
@@ -648,5 +648,9 @@ COMMENT ON VIEW kafka.api_metrics IS 'Per-API requests, errors and DB-thread lat
 COMMENT ON VIEW kafka.broker_metrics IS 'Broker gauges: open/accepted/rejected connections and request-lane depths.';
 COMMENT ON VIEW kafka.consumer_lag IS 'Committed offset vs log-end offset per consumer group/topic/partition.';
 -- =============================================================================
+-- The worker flushes these two tables (storage::privileges::WORKER_TABLE_GRANTS).
+GRANT SELECT, INSERT, UPDATE ON kafka.broker_api_stats TO pgkafka_worker;
+GRANT SELECT, INSERT, UPDATE ON kafka.broker_gauges TO pgkafka_worker;
+
 -- END broker request metrics (metrics stream)
 -- =============================================================================

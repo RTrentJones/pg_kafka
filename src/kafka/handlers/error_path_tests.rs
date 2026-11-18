@@ -371,20 +371,31 @@ mod tests {
 
     /// Put an empty group named `group` into the coordinator (join, then leave).
     fn make_empty_group(ctx: &HandlerContext, group: &str) {
-        let join = handle_join_group(
+        // A lone joiner completes at once, so the responder runs before this returns.
+        let joined = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let slot = joined.clone();
+        handle_join_group(
             ctx,
-            group.to_string(),
-            "".to_string(),
-            "client".to_string(),
-            30_000,
-            60_000,
-            "consumer".to_string(),
-            vec![JoinGroupProtocol {
-                name: "range".to_string(),
-                metadata: vec![],
-            }],
-        )
-        .unwrap();
+            crate::kafka::handlers::JoinGroupRequestData {
+                group_id: group.to_string(),
+                member_id: "".to_string(),
+                client_id: "client".to_string(),
+                group_instance_id: None,
+                session_timeout_ms: 30_000,
+                rebalance_timeout_ms: 60_000,
+                protocol_type: "consumer".to_string(),
+                protocols: vec![JoinGroupProtocol {
+                    name: "range".to_string(),
+                    metadata: vec![],
+                }],
+            },
+            move |response| *slot.lock().unwrap() = Some(response),
+        );
+        let join = joined
+            .lock()
+            .unwrap()
+            .take()
+            .expect("lone join answered immediately");
         handle_leave_group(ctx, group.to_string(), join.member_id.to_string(), vec![]).unwrap();
         let state = ctx.coordinator.get_group_state(group).expect("group kept");
         assert!(state.members.is_empty());
