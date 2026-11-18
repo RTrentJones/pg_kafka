@@ -64,10 +64,11 @@ CREATE TABLE kafka.messages (
     UNIQUE (global_offset)
 );
 
--- Index for Kafka fetch queries (by topic/partition/offset range)
--- Supports: SELECT * FROM kafka.messages WHERE topic_id = ? AND partition_id = ? AND partition_offset >= ? LIMIT ?
-CREATE INDEX idx_messages_topic_partition_offset
-ON kafka.messages(topic_id, partition_id, partition_offset);
+-- Kafka fetch queries (WHERE topic_id = ? AND partition_id = ? AND partition_offset >= ?)
+-- are served by the primary key's btree on (topic_id, partition_id, partition_offset).
+-- There is deliberately no separate index on those columns: the former
+-- idx_messages_topic_partition_offset duplicated the primary key exactly and only
+-- doubled write amplification on the hottest table (dropped in 0.1.0).
 
 -- Index for read_committed filtering (Phase 10: exclude pending transactional messages)
 -- Supports: SELECT * FROM kafka.messages WHERE ... AND (txn_state IS NULL)

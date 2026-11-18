@@ -813,5 +813,8 @@ pub mod postgres;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod schema_tests;
+
 // Re-export main types
 pub use postgres::PostgresStore;
