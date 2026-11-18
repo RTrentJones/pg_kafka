@@ -51,6 +51,18 @@
 //! member waiting for its JoinGroup response cannot heartbeat, so its session timeout
 //! is suspended while it waits; the rebalance timeout bounds the wait instead.
 //!
+//! # Parked SyncGroup responses
+//!
+//! Likewise, a follower's SyncGroup that arrives in CompletingRebalance before the
+//! leader's is parked (a [`SyncResponder`]) and answered with the member's assignment
+//! when the leader's SyncGroup lands. It is answered REBALANCE_IN_PROGRESS if a new
+//! join phase starts first (a member joins or leaves, or the sweep evicts a leader
+//! that did not sync within the rebalance timeout), and UNKNOWN_MEMBER_ID if the
+//! member itself is removed. Answering it REBALANCE_IN_PROGRESS at once instead made
+//! clients rejoin, and a client whose subscription metadata differs on each rejoin
+//! (the Java consumer's carries its owned partitions and generation) then started a
+//! new rebalance every time. A parked member's session timeout is suspended too.
+//!
 //! All of this runs on the single background-worker thread (see the single-DB-thread
 //! invariant in CLAUDE.md); responders are called after the coordinator's locks are
 //! released.
@@ -143,12 +155,45 @@ pub type JoinOutcome = Result<JoinResult>;
 /// after `join_group` has returned (see the module docs).
 pub type JoinResponder = Box<dyn FnOnce(JoinOutcome) + Send>;
 
-/// An answer for a held JoinGroup, produced by the group state machine and routed to
-/// the member's responder by the coordinator once its locks are released.
-struct JoinDelivery {
+/// What a SyncGroup is eventually answered with: the member's assignment bytes.
+pub type SyncOutcome = Result<Vec<u8>>;
+
+/// Receives a SyncGroup's outcome. Called exactly once by the coordinator, possibly
+/// after `sync_group` has returned: a follower's SyncGroup that arrives before the
+/// leader's is parked until the leader syncs (see the module docs).
+pub type SyncResponder = Box<dyn FnOnce(SyncOutcome) + Send>;
+
+/// The answer carried by a [`Delivery`].
+enum DeliveryOutcome {
+    Join(JoinOutcome),
+    Sync(SyncOutcome),
+}
+
+/// An answer for a held JoinGroup or parked SyncGroup, produced by the group state
+/// machine and routed to the member's responder by the coordinator once its locks are
+/// released.
+struct Delivery {
     group_id: String,
     member_id: String,
-    outcome: JoinOutcome,
+    outcome: DeliveryOutcome,
+}
+
+impl Delivery {
+    fn join(group_id: &str, member_id: &str, outcome: JoinOutcome) -> Self {
+        Self {
+            group_id: group_id.to_string(),
+            member_id: member_id.to_string(),
+            outcome: DeliveryOutcome::Join(outcome),
+        }
+    }
+
+    fn sync(group_id: &str, member_id: &str, outcome: SyncOutcome) -> Self {
+        Self {
+            group_id: group_id.to_string(),
+            member_id: member_id.to_string(),
+            outcome: DeliveryOutcome::Sync(outcome),
+        }
+    }
 }
 
 /// Consumer group member information
@@ -188,6 +233,10 @@ pub struct GroupMember {
     /// progress, i.e. the member has rejoined it. Only ever true while the group is
     /// PreparingRebalance.
     pub awaiting_join: bool,
+
+    /// True while this member's SyncGroup response is parked waiting for the leader's
+    /// SyncGroup. Only ever true while the group is CompletingRebalance.
+    pub awaiting_sync: bool,
 
     /// Static group instance ID (KIP-345) for static membership
     pub group_instance_id: Option<String>,
@@ -309,6 +358,7 @@ impl ConsumerGroup {
         let existing = self.members.get(member_id);
         let assignment = existing.and_then(|m| m.assignment.clone());
         let awaiting_join = existing.is_some_and(|m| m.awaiting_join);
+        let awaiting_sync = existing.is_some_and(|m| m.awaiting_sync);
         let member = GroupMember {
             member_id: member_id.to_string(),
             client_id: params.client_id.clone(),
@@ -320,6 +370,7 @@ impl ConsumerGroup {
             assignment,
             last_heartbeat: Instant::now(),
             awaiting_join,
+            awaiting_sync,
             group_instance_id: params.group_instance_id.clone(),
         };
         self.members.insert(member_id.to_string(), member);
@@ -369,8 +420,29 @@ impl ConsumerGroup {
     }
 
     /// Start a join phase. The generation does not move until the phase completes;
-    /// members learn of the rebalance from Heartbeat and rejoin.
-    fn prepare_rebalance(&mut self) {
+    /// members learn of the rebalance from Heartbeat and rejoin. SyncGroups parked in
+    /// the sync phase being abandoned are answered REBALANCE_IN_PROGRESS (Kafka's
+    /// answer too), so those members rejoin.
+    fn prepare_rebalance(&mut self, out: &mut Vec<Delivery>) {
+        let mut parked: Vec<String> = self
+            .members
+            .values_mut()
+            .filter(|m| m.awaiting_sync)
+            .map(|m| {
+                m.awaiting_sync = false;
+                m.member_id.clone()
+            })
+            .collect();
+        parked.sort();
+        for member_id in parked {
+            out.push(Delivery::sync(
+                &self.group_id,
+                &member_id,
+                Err(KafkaError::RebalanceInProgress {
+                    group_id: self.group_id.clone(),
+                }),
+            ));
+        }
         self.state = GroupState::PreparingRebalance;
         self.rebalance_started_at = Some(Instant::now());
         pg_log!(
@@ -385,7 +457,7 @@ impl ConsumerGroup {
     /// the JoinGroup answer for every member (the leader's carries the member list).
     /// Called after a join and after member removals, since a phase also becomes
     /// completable when the last member that had not rejoined leaves or is evicted.
-    fn maybe_complete_join(&mut self, out: &mut Vec<JoinDelivery>) {
+    fn maybe_complete_join(&mut self, out: &mut Vec<Delivery>) {
         if self.state != GroupState::PreparingRebalance || self.members.is_empty() {
             return;
         }
@@ -419,11 +491,11 @@ impl ConsumerGroup {
         let mut member_ids: Vec<String> = self.members.keys().cloned().collect();
         member_ids.sort();
         for member_id in member_ids {
-            out.push(JoinDelivery {
-                group_id: self.group_id.clone(),
-                outcome: Ok(self.join_result_for(&member_id)),
-                member_id,
-            });
+            out.push(Delivery::join(
+                &self.group_id,
+                &member_id,
+                Ok(self.join_result_for(&member_id)),
+            ));
         }
         pg_log!(
             "Group {} completed join phase (generation {}, {} member(s))",
@@ -459,9 +531,10 @@ impl ConsumerGroup {
     }
 
     /// Remove a member from the group. A member whose JoinGroup is held gets
-    /// UNKNOWN_MEMBER_ID for it. Does not start a rebalance: callers follow up with
+    /// UNKNOWN_MEMBER_ID for it, as does a member whose SyncGroup is parked. Does not
+    /// start a rebalance: callers follow up with
     /// `on_members_removed`.
-    fn remove_member(&mut self, member_id: &str, out: &mut Vec<JoinDelivery>) -> bool {
+    fn remove_member(&mut self, member_id: &str, out: &mut Vec<Delivery>) -> bool {
         let Some(removed) = self.members.remove(member_id) else {
             return false;
         };
@@ -469,11 +542,18 @@ impl ConsumerGroup {
         self.previous_assignments.remove(member_id);
 
         if removed.awaiting_join {
-            out.push(JoinDelivery {
-                group_id: self.group_id.clone(),
-                member_id: member_id.to_string(),
-                outcome: Err(KafkaError::unknown_member(&self.group_id, member_id)),
-            });
+            out.push(Delivery::join(
+                &self.group_id,
+                member_id,
+                Err(KafkaError::unknown_member(&self.group_id, member_id)),
+            ));
+        }
+        if removed.awaiting_sync {
+            out.push(Delivery::sync(
+                &self.group_id,
+                member_id,
+                Err(KafkaError::unknown_member(&self.group_id, member_id)),
+            ));
         }
 
         // If the leader left, reassign leadership
@@ -499,9 +579,9 @@ impl ConsumerGroup {
     /// React to members having been removed: a Stable or CompletingRebalance group
     /// rebalances (the assignments, settled or in flight, covered the departed
     /// members); a join phase may now be complete.
-    fn on_members_removed(&mut self, out: &mut Vec<JoinDelivery>) {
+    fn on_members_removed(&mut self, out: &mut Vec<Delivery>) {
         match self.state {
-            GroupState::Stable | GroupState::CompletingRebalance => self.prepare_rebalance(),
+            GroupState::Stable | GroupState::CompletingRebalance => self.prepare_rebalance(out),
             GroupState::PreparingRebalance => self.maybe_complete_join(out),
             GroupState::Empty => {}
         }
@@ -515,7 +595,7 @@ impl ConsumerGroup {
     ///   evict it and start a new join phase with the remaining members.
     ///
     /// Returns the evicted member ids.
-    fn expire_stuck_rebalance(&mut self, out: &mut Vec<JoinDelivery>) -> Vec<String> {
+    fn expire_stuck_rebalance(&mut self, out: &mut Vec<Delivery>) -> Vec<String> {
         if !matches!(
             self.state,
             GroupState::PreparingRebalance | GroupState::CompletingRebalance
@@ -579,16 +659,26 @@ impl ConsumerGroup {
     }
 
     /// Complete the sync phase and move to Stable. Members the leader did not assign
-    /// anything get an empty assignment, as in Kafka.
-    fn complete_sync(&mut self) {
+    /// anything get an empty assignment, as in Kafka. Every parked follower SyncGroup
+    /// is answered with the member's assignment.
+    fn complete_sync(&mut self, out: &mut Vec<Delivery>) {
         // Save current assignments for sticky strategy
         self.previous_assignments.clear();
+        let mut parked = Vec::new();
         for (member_id, member) in self.members.iter_mut() {
             let assignment = member.assignment.get_or_insert_with(Vec::new);
             if !assignment.is_empty() {
                 self.previous_assignments
                     .insert(member_id.clone(), assignment.clone());
             }
+            if member.awaiting_sync {
+                member.awaiting_sync = false;
+                parked.push((member_id.clone(), assignment.clone()));
+            }
+        }
+        parked.sort();
+        for (member_id, assignment) in parked {
+            out.push(Delivery::sync(&self.group_id, &member_id, Ok(assignment)));
         }
 
         self.state = GroupState::Stable;
@@ -624,6 +714,11 @@ pub struct GroupCoordinator {
     /// exactly while that member's `awaiting_join` is true. Always locked after
     /// `groups` (never the other way round), and never while a responder runs.
     pending_joins: Mutex<HashMap<(String, String), JoinResponder>>,
+
+    /// Responders of parked follower SyncGroups, by (group_id, member_id). An entry
+    /// exists exactly while that member's `awaiting_sync` is true. Same locking rules
+    /// as `pending_joins` (never both at once).
+    pending_syncs: Mutex<HashMap<(String, String), SyncResponder>>,
 }
 
 impl GroupCoordinator {
@@ -632,6 +727,7 @@ impl GroupCoordinator {
         Self {
             groups: Arc::new(RwLock::new(HashMap::new())),
             pending_joins: Mutex::new(HashMap::new()),
+            pending_syncs: Mutex::new(HashMap::new()),
         }
     }
 
@@ -640,24 +736,39 @@ impl GroupCoordinator {
         self.pending_joins.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    fn lock_pending_syncs(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<(String, String), SyncResponder>> {
+        self.pending_syncs.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Route queued answers to their held responders and call them. Must be called
     /// with the `groups` lock released.
-    fn deliver(&self, deliveries: Vec<JoinDelivery>) {
+    fn deliver(&self, deliveries: Vec<Delivery>) {
         if deliveries.is_empty() {
             return;
         }
-        let ready: Vec<(JoinResponder, JoinOutcome)> = {
-            let mut pending = self.lock_pending();
-            deliveries
-                .into_iter()
-                .filter_map(|d| {
-                    pending
-                        .remove(&(d.group_id, d.member_id))
-                        .map(|responder| (responder, d.outcome))
-                })
-                .collect()
-        };
-        for (responder, outcome) in ready {
+        let mut joins: Vec<(JoinResponder, JoinOutcome)> = Vec::new();
+        let mut syncs: Vec<(SyncResponder, SyncOutcome)> = Vec::new();
+        for d in deliveries {
+            let key = (d.group_id, d.member_id);
+            match d.outcome {
+                DeliveryOutcome::Join(outcome) => {
+                    if let Some(responder) = self.lock_pending().remove(&key) {
+                        joins.push((responder, outcome));
+                    }
+                }
+                DeliveryOutcome::Sync(outcome) => {
+                    if let Some(responder) = self.lock_pending_syncs().remove(&key) {
+                        syncs.push((responder, outcome));
+                    }
+                }
+            }
+        }
+        for (responder, outcome) in joins {
+            responder(outcome);
+        }
+        for (responder, outcome) in syncs {
             responder(outcome);
         }
     }
@@ -665,6 +776,21 @@ impl GroupCoordinator {
     /// Number of JoinGroup responses currently held (for tests and diagnostics).
     pub fn pending_join_count(&self) -> usize {
         self.lock_pending().len()
+    }
+
+    /// Number of SyncGroup responses currently parked (for tests and diagnostics).
+    pub fn pending_sync_count(&self) -> usize {
+        self.lock_pending_syncs().len()
+    }
+
+    /// Whether `member_id` is the leader of `group_id` (false for an unknown group).
+    /// The SyncGroup handler computes server-side assignments only for the leader.
+    pub fn is_group_leader(&self, group_id: &str, member_id: &str) -> bool {
+        self.groups
+            .read()
+            .ok()
+            .and_then(|groups| groups.get(group_id).and_then(|g| g.leader.clone()))
+            .is_some_and(|leader| leader == member_id)
     }
 
     /// Handle a JoinGroup request.
@@ -734,7 +860,7 @@ impl GroupCoordinator {
     fn join_locked(
         groups: &mut HashMap<String, ConsumerGroup>,
         params: JoinGroupParams,
-        out: &mut Vec<JoinDelivery>,
+        out: &mut Vec<Delivery>,
     ) -> Result<JoinDisposition> {
         // Clean up stale empty groups (TTL-based)
         groups.retain(|_, g| !g.is_expired_empty());
@@ -805,7 +931,7 @@ impl GroupCoordinator {
             }
             GroupState::Empty | GroupState::Stable | GroupState::CompletingRebalance => {
                 group.upsert_member(&member_id, &params);
-                group.prepare_rebalance();
+                group.prepare_rebalance(out);
             }
             GroupState::PreparingRebalance => {
                 group.upsert_member(&member_id, &params);
@@ -823,49 +949,110 @@ impl GroupCoordinator {
         })
     }
 
-    /// Handle SyncGroup request
+    /// Handle a SyncGroup request.
     ///
-    /// Leader provides assignments for all members.
-    /// Followers send empty assignments and wait for their assignment.
-    ///
-    /// Returns the assignment for the requesting member.
+    /// `responder` is called exactly once with the member's assignment or an error,
+    /// as in Kafka:
+    /// - unknown group or member: UNKNOWN_MEMBER_ID; generation other than the
+    ///   current one: ILLEGAL_GENERATION; PreparingRebalance: REBALANCE_IN_PROGRESS
+    ///   (the member must rejoin);
+    /// - CompletingRebalance, leader: its assignments are stored, the group becomes
+    ///   Stable, and the leader and every parked follower are answered with their
+    ///   assignments (empty for members the leader left out);
+    /// - CompletingRebalance, follower: parked until the leader's SyncGroup arrives.
+    ///   It is answered REBALANCE_IN_PROGRESS if a new rebalance starts first (a
+    ///   member joins or leaves, or the leader misses the rebalance timeout and is
+    ///   evicted by the sweep), and UNKNOWN_MEMBER_ID if the member is removed;
+    /// - Stable: the stored assignment.
     pub fn sync_group(
         &self,
         group_id: String,
         member_id: String,
         generation_id: i32,
         assignments: Vec<(String, Vec<u8>)>, // (member_id, assignment_bytes)
-    ) -> Result<Vec<u8>> {
-        let mut groups = self.groups.write().map_err(|e| {
-            KafkaError::Internal(format!("Failed to acquire groups write lock: {}", e))
-        })?;
+        responder: SyncResponder,
+    ) {
+        let mut deliveries = Vec::new();
+        let mut replaced = None;
+        let mut responder = Some(responder);
 
+        let immediate: Option<SyncOutcome> = match self.groups.write() {
+            Ok(mut groups) => match Self::sync_locked(
+                &mut groups,
+                &group_id,
+                &member_id,
+                generation_id,
+                assignments,
+                &mut deliveries,
+            ) {
+                Ok(Some(assignment)) => Some(Ok(assignment)),
+                Ok(None) => {
+                    // Parked. A resend from a member whose SyncGroup is already parked
+                    // replaces it; the earlier request is told to rejoin.
+                    if let Some(responder) = responder.take() {
+                        replaced = self
+                            .lock_pending_syncs()
+                            .insert((group_id.clone(), member_id.clone()), responder);
+                    }
+                    None
+                }
+                Err(e) => Some(Err(e)),
+            },
+            Err(e) => Some(Err(KafkaError::Internal(format!(
+                "Failed to acquire groups write lock: {}",
+                e
+            )))),
+        };
+
+        if let Some(old) = replaced {
+            old(Err(KafkaError::RebalanceInProgress {
+                group_id: group_id.clone(),
+            }));
+        }
+        if let (Some(outcome), Some(responder)) = (immediate, responder) {
+            responder(outcome);
+        }
+        self.deliver(deliveries);
+    }
+
+    /// The SyncGroup state transition, under the groups write lock. `Ok(None)` means
+    /// the member's SyncGroup is parked (its `awaiting_sync` is now set).
+    fn sync_locked(
+        groups: &mut HashMap<String, ConsumerGroup>,
+        group_id: &str,
+        member_id: &str,
+        generation_id: i32,
+        assignments: Vec<(String, Vec<u8>)>,
+        out: &mut Vec<Delivery>,
+    ) -> Result<Option<Vec<u8>>> {
         // A group this coordinator has no record of (e.g. lost in a worker restart):
         // UNKNOWN_MEMBER_ID, as Kafka answers, makes the client rejoin.
         // COORDINATOR_NOT_AVAILABLE made it look up the same coordinator and retry.
         let group = groups
-            .get_mut(&group_id)
-            .ok_or_else(|| KafkaError::unknown_member(&group_id, &member_id))?;
+            .get_mut(group_id)
+            .ok_or_else(|| KafkaError::unknown_member(group_id, member_id))?;
 
         // As in Kafka: an unknown member first (it must rejoin as a new member), then
         // a generation other than the current one.
-        if !group.members.contains_key(&member_id) {
-            return Err(KafkaError::unknown_member(&group_id, &member_id));
+        if !group.members.contains_key(member_id) {
+            return Err(KafkaError::unknown_member(group_id, member_id));
         }
         if group.generation_id != generation_id {
             return Err(KafkaError::illegal_generation(
-                &group_id,
+                group_id,
                 generation_id,
                 group.generation_id,
             ));
         }
 
+        let is_leader = group.leader.as_deref() == Some(member_id);
         pg_log!(
-            "SyncGroup: group_id={}, member_id={}, is_leader={}, assignments={}",
+            "SyncGroup: group_id={}, member_id={}, is_leader={}, assignments={}, state={:?}",
             group_id,
             member_id,
-            group.leader.as_deref() == Some(&member_id),
-            assignments.len()
+            is_leader,
+            assignments.len(),
+            group.state
         );
 
         match group.state {
@@ -873,41 +1060,44 @@ impl GroupCoordinator {
             // PreparingRebalance the membership is still settling, so the member must
             // rejoin (clients react to REBALANCE_IN_PROGRESS by rejoining).
             GroupState::PreparingRebalance | GroupState::Empty => {
-                return Err(KafkaError::RebalanceInProgress {
-                    group_id: group_id.clone(),
+                Err(KafkaError::RebalanceInProgress {
+                    group_id: group_id.to_string(),
                 })
             }
-            GroupState::CompletingRebalance => {
-                if group.leader.as_deref() == Some(&member_id) {
-                    // Membership cannot have changed since the leader got its member
-                    // list: any join, leave or eviction after the join phase completed
-                    // moved the group back to PreparingRebalance. Assignments for ids
-                    // that are not members are ignored.
-                    for (target_member_id, assignment_bytes) in assignments {
-                        if let Some(member) = group.members.get_mut(&target_member_id) {
-                            member.assignment = Some(assignment_bytes);
-                        }
+            GroupState::CompletingRebalance if is_leader => {
+                // Membership cannot have changed since the leader got its member
+                // list: any join, leave or eviction after the join phase completed
+                // moved the group back to PreparingRebalance. Assignments for ids
+                // that are not members are ignored.
+                for (target_member_id, assignment_bytes) in assignments {
+                    if let Some(member) = group.members.get_mut(&target_member_id) {
+                        member.assignment = Some(assignment_bytes);
                     }
-                    group.complete_sync();
                 }
+                group.complete_sync(out);
+                Ok(Some(
+                    group
+                        .members
+                        .get(member_id)
+                        .and_then(|m| m.assignment.clone())
+                        .unwrap_or_default(),
+                ))
             }
-            GroupState::Stable => {}
-        }
-
-        match group
-            .members
-            .get(&member_id)
-            .and_then(|m| m.assignment.clone())
-        {
-            Some(assignment) => Ok(assignment),
-            // Stable always carries an assignment (complete_sync fills in empty ones);
-            // answer empty defensively rather than fail.
-            None if group.state == GroupState::Stable => Ok(Vec::new()),
-            // CompletingRebalance: the leader hasn't provided assignments yet; the
-            // member rejoins (answered at once with the current generation) and retries.
-            None => Err(KafkaError::RebalanceInProgress {
-                group_id: group_id.clone(),
-            }),
+            GroupState::CompletingRebalance => {
+                // A follower ahead of the leader waits for the leader's assignments.
+                if let Some(member) = group.members.get_mut(member_id) {
+                    member.awaiting_sync = true;
+                }
+                Ok(None)
+            }
+            // Stable always carries an assignment (complete_sync fills in empty ones).
+            GroupState::Stable => Ok(Some(
+                group
+                    .members
+                    .get(member_id)
+                    .and_then(|m| m.assignment.clone())
+                    .unwrap_or_default(),
+            )),
         }
     }
 
@@ -1058,9 +1248,10 @@ impl GroupCoordinator {
 
     /// Run the periodic group timeouts: rebalance timeouts (evicting members that did
     /// not rejoin a join phase, or a leader that did not sync), then session timeouts
-    /// (members not heartbeating; a member whose JoinGroup is held is exempt, its
-    /// rebalance timeout applies instead). Completes any join phase these removals
-    /// make complete, answering the held JoinGroups.
+    /// (members not heartbeating; a member whose JoinGroup is held or whose SyncGroup
+    /// is parked is exempt, the rebalance timeout applies instead). Completes any join
+    /// phase these removals make complete, answering the held JoinGroups, and fails
+    /// parked SyncGroups whose sync phase is abandoned.
     ///
     /// Called every ~1 second from the background worker main loop, whether or not
     /// requests arrive, so a held JoinGroup is always answered within about a second
@@ -1096,7 +1287,7 @@ impl GroupCoordinator {
                 let mut timed_out: Vec<String> = group
                     .members
                     .values()
-                    .filter(|m| !m.awaiting_join && m.is_timed_out())
+                    .filter(|m| !m.awaiting_join && !m.awaiting_sync && m.is_timed_out())
                     .map(|m| m.member_id.clone())
                     .collect();
                 timed_out.sort();
@@ -1281,23 +1472,39 @@ impl GroupCoordinator {
     /// Should only be called after confirming the group has no active members; any
     /// JoinGroup still held for the group is answered UNKNOWN_MEMBER_ID.
     pub fn remove_group(&self, group_id: &str) {
-        let orphaned: Vec<(String, JoinResponder)> = match self.groups.write() {
-            Ok(mut groups) => {
-                groups.remove(group_id);
-                pg_log!("Removed group '{}' from coordinator", group_id);
-                let mut pending = self.lock_pending();
-                let keys: Vec<(String, String)> = pending
-                    .keys()
-                    .filter(|(g, _)| g == group_id)
-                    .cloned()
-                    .collect();
-                keys.into_iter()
-                    .filter_map(|key| pending.remove(&key).map(|r| (key.1, r)))
-                    .collect()
+        let mut orphaned_joins: Vec<(String, JoinResponder)> = Vec::new();
+        let mut orphaned_syncs: Vec<(String, SyncResponder)> = Vec::new();
+        if let Ok(mut groups) = self.groups.write() {
+            groups.remove(group_id);
+            pg_log!("Removed group '{}' from coordinator", group_id);
+            let mut pending = self.lock_pending();
+            let keys: Vec<(String, String)> = pending
+                .keys()
+                .filter(|(g, _)| g == group_id)
+                .cloned()
+                .collect();
+            for key in keys {
+                if let Some(r) = pending.remove(&key) {
+                    orphaned_joins.push((key.1, r));
+                }
             }
-            Err(_) => Vec::new(),
-        };
-        for (member_id, responder) in orphaned {
+            drop(pending);
+            let mut pending = self.lock_pending_syncs();
+            let keys: Vec<(String, String)> = pending
+                .keys()
+                .filter(|(g, _)| g == group_id)
+                .cloned()
+                .collect();
+            for key in keys {
+                if let Some(r) = pending.remove(&key) {
+                    orphaned_syncs.push((key.1, r));
+                }
+            }
+        }
+        for (member_id, responder) in orphaned_joins {
+            responder(Err(KafkaError::unknown_member(group_id, &member_id)));
+        }
+        for (member_id, responder) in orphaned_syncs {
             responder(Err(KafkaError::unknown_member(group_id, &member_id)));
         }
     }
@@ -1337,6 +1544,77 @@ mod tests {
             *guard = Some(outcome);
         });
         (responder, slot)
+    }
+
+    type SyncSlot = Arc<Mutex<Option<SyncOutcome>>>;
+
+    /// A SyncGroup responder that records the outcome, and its slot.
+    fn sync_recorder() -> (SyncResponder, SyncSlot) {
+        let slot: SyncSlot = Arc::new(Mutex::new(None));
+        let writer = slot.clone();
+        let responder: SyncResponder = Box::new(move |outcome| {
+            let mut guard = writer.lock().unwrap();
+            assert!(guard.is_none(), "a responder must be called exactly once");
+            *guard = Some(outcome);
+        });
+        (responder, slot)
+    }
+
+    /// Test helpers over the responder-based SyncGroup API.
+    trait SyncExt {
+        /// Send a SyncGroup and return the slot its answer lands in (maybe parked).
+        fn sync_park(
+            &self,
+            group: String,
+            member: String,
+            generation: i32,
+            assignments: Vec<(String, Vec<u8>)>,
+        ) -> SyncSlot;
+        /// Send a SyncGroup that must be answered at once, and return the answer.
+        fn sync_now(
+            &self,
+            group: String,
+            member: String,
+            generation: i32,
+            assignments: Vec<(String, Vec<u8>)>,
+        ) -> SyncOutcome;
+    }
+
+    impl SyncExt for GroupCoordinator {
+        fn sync_park(
+            &self,
+            group: String,
+            member: String,
+            generation: i32,
+            assignments: Vec<(String, Vec<u8>)>,
+        ) -> SyncSlot {
+            let (responder, slot) = sync_recorder();
+            self.sync_group(group, member, generation, assignments, responder);
+            slot
+        }
+
+        fn sync_now(
+            &self,
+            group: String,
+            member: String,
+            generation: i32,
+            assignments: Vec<(String, Vec<u8>)>,
+        ) -> SyncOutcome {
+            self.sync_park(group, member, generation, assignments)
+                .lock()
+                .unwrap()
+                .take()
+                .expect("SyncGroup expected to be answered at once was parked")
+        }
+    }
+
+    fn sync_pending(slot: &SyncSlot) -> bool {
+        slot.lock().unwrap().is_none()
+    }
+
+    /// The outcome recorded in a SyncGroup slot (panics if still parked).
+    fn synced(slot: &SyncSlot) -> SyncOutcome {
+        slot.lock().unwrap().take().expect("SyncGroup still parked")
     }
 
     fn params(group: &str, member: Option<&str>, protocols: &[(&str, &[u8])]) -> JoinGroupParams {
@@ -1425,7 +1703,7 @@ mod tests {
     fn stable_single(c: &GroupCoordinator, group: &str) -> String {
         let a = joined(&join(c, group, None));
         assert_eq!(a.generation_id, 1);
-        c.sync_group(
+        c.sync_now(
             group.to_string(),
             a.member_id.clone(),
             1,
@@ -1446,7 +1724,7 @@ mod tests {
         let l = joined(&leader_slot);
         let f = joined(&follower_slot);
         assert_eq!(l.generation_id, f.generation_id);
-        c.sync_group(
+        c.sync_now(
             group.to_string(),
             leader.clone(),
             l.generation_id,
@@ -1509,6 +1787,7 @@ mod tests {
             assignment: None,
             last_heartbeat: Instant::now(),
             awaiting_join: false,
+            awaiting_sync: false,
             group_instance_id: None,
         };
         assert!(member.is_timed_out());
@@ -1533,6 +1812,7 @@ mod tests {
             assignment: None,
             last_heartbeat: Instant::now(),
             awaiting_join: false,
+            awaiting_sync: false,
             group_instance_id: None,
         };
         assert_eq!(member.effective_rebalance_timeout_ms(), 45_000);
@@ -1568,7 +1848,7 @@ mod tests {
         let c = GroupCoordinator::new();
         let a = joined(&join(&c, "g", None));
         let assignment = c
-            .sync_group(
+            .sync_now(
                 "g".to_string(),
                 a.member_id.clone(),
                 1,
@@ -1666,14 +1946,14 @@ mod tests {
             Err(KafkaError::UnknownMemberId { .. })
         ));
         assert!(matches!(
-            c.sync_group("g".to_string(), "ghost".to_string(), 0, vec![]),
+            c.sync_now("g".to_string(), "ghost".to_string(), 0, vec![]),
             Err(KafkaError::UnknownMemberId { .. })
         ));
         assert!(matches!(
             c.heartbeat("nope".to_string(), a.clone(), 1),
             Err(KafkaError::UnknownMemberId { .. })
         ));
-        c.sync_group("g".to_string(), a.clone(), 1, vec![(a.clone(), vec![1])])
+        c.sync_now("g".to_string(), a.clone(), 1, vec![(a.clone(), vec![1])])
             .unwrap();
         assert!(c.heartbeat("g".to_string(), a.clone(), 1).is_ok());
         // PreparingRebalance: REBALANCE_IN_PROGRESS, and the heartbeat counts.
@@ -1697,7 +1977,7 @@ mod tests {
             c.validate_commit("g", &a, 1),
             Err(KafkaError::RebalanceInProgress { .. })
         ));
-        c.sync_group("g".to_string(), a.clone(), 1, vec![(a.clone(), vec![1])])
+        c.sync_now("g".to_string(), a.clone(), 1, vec![(a.clone(), vec![1])])
             .unwrap();
         // Stable: accepted.
         assert!(c.validate_commit("g", &a, 1).is_ok());
@@ -1734,7 +2014,7 @@ mod tests {
         // PreparingRebalance: REBALANCE_IN_PROGRESS.
         let third = join(&c, "g", None);
         assert!(matches!(
-            c.sync_group("g".to_string(), leader.clone(), gen, vec![]),
+            c.sync_now("g".to_string(), leader.clone(), gen, vec![]),
             Err(KafkaError::RebalanceInProgress { .. })
         ));
 
@@ -1744,35 +2024,35 @@ mod tests {
         let _ = joined(&f);
         let third = joined(&third).member_id;
 
-        // CompletingRebalance, follower before the leader: REBALANCE_IN_PROGRESS
-        // (assignments of the replaced generation were cleared).
-        assert!(matches!(
-            c.sync_group("g".to_string(), follower.clone(), gen2, vec![]),
-            Err(KafkaError::RebalanceInProgress { .. })
-        ));
-        // The follower retries by rejoining: answered at once, same generation.
-        let retry = joined(&join(&c, "g", Some(&follower)));
-        assert_eq!(retry.generation_id, gen2);
+        // CompletingRebalance, followers before the leader: parked (Kafka holds them
+        // until the leader syncs), the generation does not move.
+        let follower_sync = c.sync_park("g".to_string(), follower.clone(), gen2, vec![]);
+        let third_sync = c.sync_park("g".to_string(), third.clone(), gen2, vec![]);
+        assert!(sync_pending(&follower_sync) && sync_pending(&third_sync));
+        assert_eq!(c.pending_sync_count(), 2);
         assert_eq!(state(&c, "g"), GroupState::CompletingRebalance);
+        assert_eq!(generation(&c, "g"), gen2);
+        // A parked member keeps its session alive (and may heartbeat meanwhile).
+        assert!(c.heartbeat("g".to_string(), follower.clone(), gen2).is_ok());
 
         // Wrong generation / unknown member / unknown group.
         assert!(matches!(
-            c.sync_group("g".to_string(), leader.clone(), gen, vec![]),
+            c.sync_now("g".to_string(), leader.clone(), gen, vec![]),
             Err(KafkaError::IllegalGeneration { .. })
         ));
         assert!(matches!(
-            c.sync_group("g".to_string(), "ghost".to_string(), gen2, vec![]),
+            c.sync_now("g".to_string(), "ghost".to_string(), gen2, vec![]),
             Err(KafkaError::UnknownMemberId { .. })
         ));
         assert!(matches!(
-            c.sync_group("nope".to_string(), leader.clone(), gen2, vec![]),
+            c.sync_now("nope".to_string(), leader.clone(), gen2, vec![]),
             Err(KafkaError::UnknownMemberId { .. })
         ));
 
         // The leader assigns the follower but omits `third`, and names a stranger
         // (ignored). `third` gets an empty assignment, as in Kafka.
         let own = c
-            .sync_group(
+            .sync_now(
                 "g".to_string(),
                 leader.clone(),
                 gen2,
@@ -1785,13 +2065,19 @@ mod tests {
             .unwrap();
         assert_eq!(own, b"L".to_vec());
         assert_eq!(state(&c, "g"), GroupState::Stable);
+        // The leader's SyncGroup answers every parked follower.
+        assert_eq!(synced(&follower_sync).unwrap(), b"F".to_vec());
+        assert_eq!(synced(&third_sync).unwrap(), Vec::<u8>::new());
+        assert_eq!(c.pending_sync_count(), 0);
+        assert_eq!(generation(&c, "g"), gen2);
+        // Stable: the stored assignment, at once.
         assert_eq!(
-            c.sync_group("g".to_string(), follower.clone(), gen2, vec![])
+            c.sync_now("g".to_string(), follower.clone(), gen2, vec![])
                 .unwrap(),
             b"F".to_vec()
         );
         assert_eq!(
-            c.sync_group("g".to_string(), third, gen2, vec![]).unwrap(),
+            c.sync_now("g".to_string(), third, gen2, vec![]).unwrap(),
             Vec::<u8>::new()
         );
         assert_eq!(state(&c, "g"), GroupState::Stable, "no repair rebalance");
@@ -1806,8 +2092,7 @@ mod tests {
         assert!(!r.is_leader());
         assert_eq!(state(&c, "g"), GroupState::Stable);
         assert_eq!(
-            c.sync_group("g".to_string(), follower, gen, vec![])
-                .unwrap(),
+            c.sync_now("g".to_string(), follower, gen, vec![]).unwrap(),
             b"B".to_vec()
         );
     }
@@ -1848,7 +2133,7 @@ mod tests {
         assert_eq!(state(&c, "g"), GroupState::PreparingRebalance);
         // The leader's SyncGroup for the replaced join is refused.
         assert!(matches!(
-            c.sync_group("g".to_string(), a.clone(), 1, vec![(a.clone(), vec![])]),
+            c.sync_now("g".to_string(), a.clone(), 1, vec![(a.clone(), vec![])]),
             Err(KafkaError::RebalanceInProgress { .. })
         ));
         let a2 = joined(&join(&c, "g", Some(&a)));
@@ -2119,7 +2404,7 @@ mod tests {
         p.rebalance_timeout_ms = 20;
         p.session_timeout_ms = 300_000;
         let a = joined(&join_with(&c, p)).member_id;
-        c.sync_group("g".to_string(), a.clone(), 1, vec![(a.clone(), vec![])])
+        c.sync_now("g".to_string(), a.clone(), 1, vec![(a.clone(), vec![])])
             .unwrap();
         let b = join(&c, "g", None);
         // `b` advertises 60s, so the group's timeout is 60s, not `a`'s 20ms.
@@ -2140,7 +2425,10 @@ mod tests {
         {
             // Start a join phase nobody has rejoined yet (as after a LeaveGroup).
             let mut groups = c.groups.write().unwrap();
-            groups.get_mut("g").unwrap().prepare_rebalance();
+            groups
+                .get_mut("g")
+                .unwrap()
+                .prepare_rebalance(&mut Vec::new());
         }
         age_rebalance(&c, "g", Duration::from_secs(61));
         let removed = c.check_and_remove_timed_out_members();
@@ -2254,5 +2542,184 @@ mod tests {
             crate::kafka::constants::ERROR_UNKNOWN_SERVER_ERROR
         );
         assert!(c.check_and_remove_timed_out_members().is_empty());
+    }
+
+    // ----- parked follower SyncGroup -----
+
+    /// A pair whose join phase just completed (CompletingRebalance). Returns
+    /// (leader, follower, generation).
+    fn completing_pair(c: &GroupCoordinator, group: &str) -> (String, String, i32) {
+        let (leader, follower, _) = stable_pair(c, group);
+        let l = join(c, group, Some(&leader));
+        let f = join(c, group, Some(&follower));
+        let gen = joined(&l).generation_id;
+        assert_eq!(joined(&f).generation_id, gen);
+        assert_eq!(state(c, group), GroupState::CompletingRebalance);
+        (leader, follower, gen)
+    }
+
+    #[test]
+    fn test_parked_sync_answered_when_leader_syncs() {
+        let c = GroupCoordinator::new();
+        let (leader, follower, gen) = completing_pair(&c, "g");
+        let parked = c.sync_park("g".to_string(), follower.clone(), gen, vec![]);
+        assert!(sync_pending(&parked));
+        let own = c
+            .sync_now(
+                "g".to_string(),
+                leader.clone(),
+                gen,
+                vec![(leader, b"L".to_vec()), (follower, b"F".to_vec())],
+            )
+            .unwrap();
+        assert_eq!(own, b"L".to_vec());
+        assert_eq!(synced(&parked).unwrap(), b"F".to_vec());
+        assert_eq!(generation(&c, "g"), gen);
+    }
+
+    #[test]
+    fn test_parked_sync_fails_when_new_member_starts_rebalance() {
+        let c = GroupCoordinator::new();
+        let (leader, follower, gen) = completing_pair(&c, "g");
+        let parked = c.sync_park("g".to_string(), follower, gen, vec![]);
+        let newcomer = join(&c, "g", None);
+        assert!(is_pending(&newcomer));
+        assert_eq!(
+            synced(&parked).unwrap_err().to_kafka_error_code(),
+            crate::kafka::constants::ERROR_REBALANCE_IN_PROGRESS
+        );
+        assert_eq!(c.pending_sync_count(), 0);
+        // The leader's late SyncGroup is refused too: the group is rebalancing.
+        assert!(matches!(
+            c.sync_now("g".to_string(), leader, gen, vec![]),
+            Err(KafkaError::RebalanceInProgress { .. })
+        ));
+    }
+
+    #[test]
+    fn test_parked_sync_fails_when_another_member_leaves() {
+        let c = GroupCoordinator::new();
+        let a = stable_single(&c, "g");
+        let b = join(&c, "g", None);
+        let x = join(&c, "g", None);
+        let _ = joined(&join(&c, "g", Some(&a)));
+        let (b, x) = (joined(&b), joined(&x));
+        let parked = c.sync_park(
+            "g".to_string(),
+            b.member_id.clone(),
+            b.generation_id,
+            vec![],
+        );
+        c.leave_group("g".to_string(), x.member_id).unwrap();
+        assert_eq!(
+            synced(&parked).unwrap_err().to_kafka_error_code(),
+            crate::kafka::constants::ERROR_REBALANCE_IN_PROGRESS
+        );
+        assert_eq!(state(&c, "g"), GroupState::PreparingRebalance);
+    }
+
+    #[test]
+    fn test_parked_sync_of_leaving_member_answered_unknown_member() {
+        let c = GroupCoordinator::new();
+        let (_leader, follower, gen) = completing_pair(&c, "g");
+        let parked = c.sync_park("g".to_string(), follower.clone(), gen, vec![]);
+        c.leave_group("g".to_string(), follower).unwrap();
+        assert_eq!(
+            synced(&parked).unwrap_err().to_kafka_error_code(),
+            crate::kafka::constants::ERROR_UNKNOWN_MEMBER_ID
+        );
+        assert_eq!(c.pending_sync_count(), 0);
+    }
+
+    #[test]
+    fn test_parked_sync_times_out_when_leader_never_syncs() {
+        // The sweep's sync-phase rebalance timeout evicts the leader; the parked
+        // follower is told to rejoin, with no further request arriving.
+        let c = GroupCoordinator::new();
+        let (leader, follower, gen) = completing_pair(&c, "g");
+        let parked = c.sync_park("g".to_string(), follower.clone(), gen, vec![]);
+        // A parked member is exempt from the session timeout (as a waiting joiner).
+        age_member(&c, "g", &follower, Duration::from_secs(31));
+        assert!(c.check_and_remove_timed_out_members().is_empty());
+        assert!(sync_pending(&parked));
+        // (Clients heartbeat while their SyncGroup waits; Heartbeat answers NONE.)
+        assert!(c.heartbeat("g".to_string(), follower.clone(), gen).is_ok());
+
+        age_rebalance(&c, "g", Duration::from_secs(61));
+        let removed = c.check_and_remove_timed_out_members();
+        assert_eq!(removed, vec![("g".to_string(), leader)]);
+        assert_eq!(
+            synced(&parked).unwrap_err().to_kafka_error_code(),
+            crate::kafka::constants::ERROR_REBALANCE_IN_PROGRESS
+        );
+        assert_eq!(state(&c, "g"), GroupState::PreparingRebalance);
+        // The follower rejoins and, now alone, leads the next generation.
+        let f = joined(&join(&c, "g", Some(&follower)));
+        assert!(f.is_leader());
+        assert_eq!(f.generation_id, gen + 1);
+    }
+
+    #[test]
+    fn test_parked_sync_resend_replaces_earlier_one() {
+        let c = GroupCoordinator::new();
+        let (leader, follower, gen) = completing_pair(&c, "g");
+        let first = c.sync_park("g".to_string(), follower.clone(), gen, vec![]);
+        let second = c.sync_park("g".to_string(), follower.clone(), gen, vec![]);
+        assert_eq!(
+            synced(&first).unwrap_err().to_kafka_error_code(),
+            crate::kafka::constants::ERROR_REBALANCE_IN_PROGRESS
+        );
+        assert!(sync_pending(&second));
+        assert_eq!(c.pending_sync_count(), 1);
+        c.sync_now(
+            "g".to_string(),
+            leader,
+            gen,
+            vec![(follower, b"F".to_vec())],
+        )
+        .unwrap();
+        assert_eq!(synced(&second).unwrap(), b"F".to_vec());
+    }
+
+    #[test]
+    fn test_parked_sync_survives_unchanged_rejoin_retry() {
+        // A follower that gives up on its SyncGroup and rejoins with unchanged
+        // metadata gets the current generation (no rebalance); its parked SyncGroup
+        // is still answered by the leader's sync.
+        let c = GroupCoordinator::new();
+        let (leader, follower, gen) = completing_pair(&c, "g");
+        let parked = c.sync_park("g".to_string(), follower.clone(), gen, vec![]);
+        assert_eq!(joined(&join(&c, "g", Some(&follower))).generation_id, gen);
+        assert_eq!(state(&c, "g"), GroupState::CompletingRebalance);
+        c.sync_now(
+            "g".to_string(),
+            leader,
+            gen,
+            vec![(follower, b"F".to_vec())],
+        )
+        .unwrap();
+        assert_eq!(synced(&parked).unwrap(), b"F".to_vec());
+    }
+
+    #[test]
+    fn test_remove_group_answers_parked_syncs() {
+        let c = GroupCoordinator::new();
+        let (_leader, follower, gen) = completing_pair(&c, "g");
+        let parked = c.sync_park("g".to_string(), follower, gen, vec![]);
+        c.remove_group("g");
+        assert_eq!(
+            synced(&parked).unwrap_err().to_kafka_error_code(),
+            crate::kafka::constants::ERROR_UNKNOWN_MEMBER_ID
+        );
+        assert_eq!(c.pending_sync_count(), 0);
+    }
+
+    #[test]
+    fn test_is_group_leader() {
+        let c = GroupCoordinator::new();
+        let (leader, follower, _) = stable_pair(&c, "g");
+        assert!(c.is_group_leader("g", &leader));
+        assert!(!c.is_group_leader("g", &follower));
+        assert!(!c.is_group_leader("nope", &leader));
     }
 }

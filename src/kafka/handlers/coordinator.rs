@@ -7,6 +7,7 @@ use crate::kafka::constants::{DEFAULT_BROKER_ID, ERROR_NONE};
 use crate::kafka::error::Result;
 use crate::kafka::handler_context::HandlerContext;
 use kafka_protocol::messages::join_group_response::JoinGroupResponse;
+use kafka_protocol::messages::sync_group_response::SyncGroupResponse;
 
 /// Placeholder for a JoinGroup member's `client_host`. This field is informational
 /// only — echoed back in DescribeGroups member listings, never used for routing or
@@ -247,20 +248,86 @@ fn build_join_group_response(
     response
 }
 
+/// The client's side of one SyncGroup: sends the (possibly deferred) response to the
+/// connection that asked, exactly once. Like [`JoinGroupReply`], if it is dropped
+/// without having sent anything it answers UNKNOWN_SERVER_ERROR.
+pub struct SyncGroupReply {
+    correlation_id: i32,
+    api_version: i16,
+    response_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::kafka::KafkaResponse>>,
+}
+
+impl SyncGroupReply {
+    /// A reply for the SyncGroup `correlation_id` (at `api_version`) whose response
+    /// goes to `response_tx`, the client connection's own sender.
+    pub fn new(
+        correlation_id: i32,
+        api_version: i16,
+        response_tx: tokio::sync::mpsc::UnboundedSender<crate::kafka::KafkaResponse>,
+    ) -> Self {
+        Self {
+            correlation_id,
+            api_version,
+            response_tx: Some(response_tx),
+        }
+    }
+
+    /// Send the response. A client that has disconnected meanwhile is ignored.
+    pub fn send(mut self, response: SyncGroupResponse) {
+        self.send_inner(response);
+    }
+
+    fn send_inner(&mut self, response: SyncGroupResponse) {
+        if let Some(tx) = self.response_tx.take() {
+            if tx
+                .send(crate::kafka::KafkaResponse::SyncGroup {
+                    correlation_id: self.correlation_id,
+                    api_version: self.api_version,
+                    response,
+                })
+                .is_err()
+            {
+                crate::pg_debug!(
+                    "SyncGroup client disconnected before its response (correlation_id={})",
+                    self.correlation_id
+                );
+            }
+        }
+    }
+}
+
+impl Drop for SyncGroupReply {
+    fn drop(&mut self) {
+        if self.response_tx.is_some() {
+            self.send_inner(
+                crate::kafka::response_builders::build_sync_group_error_response(
+                    crate::kafka::constants::ERROR_UNKNOWN_SERVER_ERROR,
+                ),
+            );
+        }
+    }
+}
+
 /// Handle SyncGroup request
 ///
-/// Leader provides partition assignments, followers receive their assignment.
-/// If leader sends empty assignments, server computes assignments automatically.
-pub fn handle_sync_group(
+/// The leader provides partition assignments (or none, in which case they are
+/// computed server-side); every member receives its own. `respond` receives the
+/// response exactly once: at once for the leader, a Stable group or an error, or,
+/// for a follower whose SyncGroup arrives before the leader's, when the leader syncs
+/// (or a new rebalance / the member's removal fails it), as Kafka holds it (see
+/// `GroupCoordinator::sync_group`).
+pub fn handle_sync_group<F>(
     ctx: &HandlerContext,
     group_id: String,
     member_id: String,
     generation_id: i32,
     assignments: Vec<crate::kafka::messages::SyncGroupAssignment>,
-) -> Result<kafka_protocol::messages::sync_group_response::SyncGroupResponse> {
+    respond: F,
+) where
+    F: FnOnce(SyncGroupResponse) + Send + 'static,
+{
     let coordinator = ctx.coordinator;
     let store = ctx.store;
-    use kafka_protocol::messages::sync_group_response::SyncGroupResponse;
     use std::collections::HashMap;
 
     crate::pg_debug!(
@@ -277,11 +344,12 @@ pub fn handle_sync_group(
         .map(|a| (a.member_id, a.assignment))
         .collect();
 
-    // Check if leader sent empty assignments - if so, compute server-side
+    // A leader that sent empty assignments asks the server to compute them. (Only the
+    // leader's assignments are used, so a follower's SyncGroup computes nothing.)
     let assignments_empty =
         coord_assignments.is_empty() || coord_assignments.iter().all(|(_, bytes)| bytes.is_empty());
 
-    if assignments_empty {
+    if assignments_empty && coordinator.is_group_leader(&group_id, &member_id) {
         // Get subscribed topics from group members
         if let Ok(topics) = coordinator.get_subscribed_topics(&group_id) {
             if !topics.is_empty() {
@@ -310,18 +378,34 @@ pub fn handle_sync_group(
         }
     }
 
-    // Coordinator returns typed errors (UnknownMemberId, IllegalGeneration, CoordinatorNotAvailable)
-    // which map directly to Kafka protocol error codes via to_kafka_error_code()
-    let assignment =
-        coordinator.sync_group(group_id, member_id, generation_id, coord_assignments)?;
+    // Coordinator outcomes are typed errors (UnknownMemberId, IllegalGeneration,
+    // RebalanceInProgress) which map to Kafka error codes via to_kafka_error_code().
+    coordinator.sync_group(
+        group_id,
+        member_id,
+        generation_id,
+        coord_assignments,
+        Box::new(move |outcome| respond(build_sync_group_response(outcome))),
+    );
+}
 
-    // Build response
-    let mut response = SyncGroupResponse::default();
-    response.throttle_time_ms = 0;
-    response.error_code = ERROR_NONE;
-    response.assignment = assignment.into();
-
-    Ok(response)
+/// Build the SyncGroup response for a coordinator outcome.
+fn build_sync_group_response(outcome: crate::kafka::coordinator::SyncOutcome) -> SyncGroupResponse {
+    match outcome {
+        Ok(assignment) => {
+            let mut response = SyncGroupResponse::default();
+            response.throttle_time_ms = 0;
+            response.error_code = ERROR_NONE;
+            response.assignment = assignment.into();
+            response
+        }
+        Err(e) => {
+            crate::pg_warning!("Failed to handle SyncGroup request: {}", e);
+            crate::kafka::response_builders::build_sync_group_error_response(
+                e.to_kafka_error_code(),
+            )
+        }
+    }
 }
 
 /// Handle Heartbeat request
@@ -625,6 +709,39 @@ mod tests {
         slot.lock().unwrap().take()
     }
 
+    type SyncSlot = Arc<Mutex<Option<SyncGroupResponse>>>;
+
+    fn take_sync(slot: &SyncSlot) -> Option<SyncGroupResponse> {
+        slot.lock().unwrap().take()
+    }
+
+    impl Fixture {
+        /// Send a SyncGroup and return the slot its response lands in.
+        fn sync(
+            &self,
+            group: &str,
+            member_id: &str,
+            generation: i32,
+            assignments: Vec<SyncGroupAssignment>,
+        ) -> SyncSlot {
+            let slot: SyncSlot = Arc::new(Mutex::new(None));
+            let writer = slot.clone();
+            handle_sync_group(
+                &self.ctx(),
+                group.to_string(),
+                member_id.to_string(),
+                generation,
+                assignments,
+                move |response| {
+                    let mut guard = writer.lock().unwrap();
+                    assert!(guard.is_none(), "one response per SyncGroup");
+                    *guard = Some(response);
+                },
+            );
+            slot
+        }
+    }
+
     #[test]
     fn test_handle_find_coordinator_success() {
         let f = Fixture::new();
@@ -700,9 +817,8 @@ mod tests {
         let follower = f.join("g", "", 30_000);
         let gen = f.join_now("g", &leader).generation_id;
         let follower = take(&follower).unwrap().member_id.to_string();
-        f.coordinator
-            .sync_group("g".to_string(), leader.clone(), gen, vec![])
-            .unwrap();
+        let leader_sync = f.sync("g", &leader, gen, vec![]);
+        assert_eq!(take_sync(&leader_sync).unwrap().error_code, ERROR_NONE);
 
         // The leader rejoins (held: the follower has not rejoined), then resends.
         let first = f.join("g", &leader, 30_000);
@@ -755,7 +871,7 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_sync_group_leader_and_follower() {
+    fn test_handle_sync_group_follower_parked_until_leader_syncs() {
         let f = Fixture::new();
         let leader = f.join_now("test-group", "");
         let leader_id = leader.member_id.to_string();
@@ -763,14 +879,20 @@ mod tests {
         let gen = f.join_now("test-group", &leader_id).generation_id;
         let follower_id = take(&follower).unwrap().member_id.to_string();
 
-        let leader_sync = handle_sync_group(
-            &f.ctx(),
-            "test-group".to_string(),
-            leader_id.clone(),
+        // The follower syncs first: no response yet.
+        let follower_sync = f.sync("test-group", &follower_id, gen, vec![]);
+        assert!(
+            take_sync(&follower_sync).is_none(),
+            "parked until the leader syncs"
+        );
+
+        let leader_sync = f.sync(
+            "test-group",
+            &leader_id,
             gen,
             vec![
                 SyncGroupAssignment {
-                    member_id: leader_id,
+                    member_id: leader_id.clone(),
                     assignment: vec![1, 2, 3],
                 },
                 SyncGroupAssignment {
@@ -778,15 +900,59 @@ mod tests {
                     assignment: vec![4, 5, 6],
                 },
             ],
-        )
-        .unwrap();
-        assert_eq!(leader_sync.assignment.as_ref(), &[1, 2, 3]);
-
-        let follower_sync =
-            handle_sync_group(&f.ctx(), "test-group".to_string(), follower_id, gen, vec![])
-                .unwrap();
+        );
+        assert_eq!(
+            take_sync(&leader_sync).unwrap().assignment.as_ref(),
+            &[1, 2, 3]
+        );
+        let follower_sync = take_sync(&follower_sync).expect("answered by the leader's sync");
         assert_eq!(follower_sync.error_code, ERROR_NONE);
         assert_eq!(follower_sync.assignment.as_ref(), &[4, 5, 6]);
+
+        // Stable: answered at once; a stale generation maps to ILLEGAL_GENERATION.
+        let again = take_sync(&f.sync("test-group", &follower_id, gen, vec![])).unwrap();
+        assert_eq!(again.assignment.as_ref(), &[4, 5, 6]);
+        let stale = take_sync(&f.sync("test-group", &follower_id, gen - 1, vec![])).unwrap();
+        assert_eq!(
+            stale.error_code,
+            crate::kafka::constants::ERROR_ILLEGAL_GENERATION
+        );
+    }
+
+    #[test]
+    fn test_sync_group_reply_sends_once_and_answers_when_dropped_unsent() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        SyncGroupReply::new(7, 3, tx.clone()).send(SyncGroupResponse::default());
+        match rx.try_recv().unwrap() {
+            crate::kafka::KafkaResponse::SyncGroup {
+                correlation_id,
+                api_version,
+                response,
+            } => {
+                assert_eq!((correlation_id, api_version), (7, 3));
+                assert_eq!(response.error_code, ERROR_NONE);
+            }
+            other => panic!("unexpected response {:?}", other),
+        }
+        assert!(rx.try_recv().is_err(), "exactly one response");
+
+        drop(SyncGroupReply::new(8, 3, tx.clone()));
+        match rx.try_recv().unwrap() {
+            crate::kafka::KafkaResponse::SyncGroup {
+                correlation_id,
+                response,
+                ..
+            } => {
+                assert_eq!(correlation_id, 8);
+                assert_eq!(
+                    response.error_code,
+                    crate::kafka::constants::ERROR_UNKNOWN_SERVER_ERROR
+                );
+            }
+            other => panic!("unexpected response {:?}", other),
+        }
+        drop(rx);
+        SyncGroupReply::new(9, 3, tx).send(SyncGroupResponse::default());
     }
 
     #[test]

@@ -151,14 +151,12 @@ async fn heartbeat(
     Ok(roundtrip(stream, 3, corr, &req).await?.error_code)
 }
 
-async fn sync(
-    stream: &mut TcpStream,
+fn sync_request(
     group: &str,
     member_id: &str,
     generation: i32,
     assignments: &[(&str, &[u8])],
-    corr: i32,
-) -> Result<(i16, Vec<u8>), Box<dyn std::error::Error>> {
+) -> SyncGroupRequest {
     let mut req = SyncGroupRequest::default();
     req.group_id = GroupId(StrBytes::from_string(group.to_string()));
     req.generation_id = generation;
@@ -172,8 +170,42 @@ async fn sync(
             x
         })
         .collect();
+    req
+}
+
+async fn sync(
+    stream: &mut TcpStream,
+    group: &str,
+    member_id: &str,
+    generation: i32,
+    assignments: &[(&str, &[u8])],
+    corr: i32,
+) -> Result<(i16, Vec<u8>), Box<dyn std::error::Error>> {
+    let req = sync_request(group, member_id, generation, assignments);
     let r = roundtrip(stream, 3, corr, &req).await?;
     Ok((r.error_code, r.assignment.to_vec()))
+}
+
+/// Heartbeat until the group reports REBALANCE_IN_PROGRESS, or give up after 5 s and
+/// return the last code. Heartbeat travels on the worker's liveness lane and can
+/// overtake a JoinGroup still queued on the main lane.
+async fn heartbeat_until_rebalance(
+    stream: &mut TcpStream,
+    group: &str,
+    member_id: &str,
+    generation: i32,
+    first_corr: i32,
+) -> Result<i16, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut corr = first_corr;
+    loop {
+        let hb = heartbeat(stream, group, member_id, generation, corr).await?;
+        if hb == ERROR_REBALANCE_IN_PROGRESS || Instant::now() > deadline {
+            return Ok(hb);
+        }
+        corr += 1;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 }
 
 async fn leave(
@@ -362,6 +394,76 @@ pub async fn test_held_join_completed_by_leave_group() -> TestResult {
     assert_eq!(b.generation_id, a.generation_id + 1);
     assert_eq!(b.leader, b.member_id);
     assert_eq!(member_ids(&b), vec![b.member_id.to_string()]);
+
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// A follower's SyncGroup that arrives before the leader's is held, as Kafka does:
+/// after a two-member join completes, the follower syncs first and gets no response
+/// (nothing arrives on its connection for 1.5 s); the leader then syncs, and the
+/// follower's response arrives within 5 s carrying exactly the assignment the leader
+/// gave it. The generation does not move: both members then heartbeat NONE at the
+/// generation of the join. (Answering the early follower REBALANCE_IN_PROGRESS made
+/// it rejoin, which with Java clients restarted the rebalance every round.)
+pub async fn test_follower_sync_held_until_leader_syncs() -> TestResult {
+    println!("=== Test: Follower SyncGroup Held Until The Leader Syncs ===\n");
+    let ctx = TestContext::new().await?;
+    let group = ctx.unique_group("coord-sync-hold").await;
+    let mut conn_a = TcpStream::connect(BROKER).await?;
+    let mut conn_b = TcpStream::connect(BROKER).await?;
+
+    println!("Step 1: form a two-member generation...");
+    let a = join_now(&mut conn_a, &group, "", 1).await?;
+    let a_id = a.member_id.to_string();
+    send_join(&mut conn_b, &group, "", 30_000, 2).await?;
+    let hb = heartbeat_until_rebalance(&mut conn_a, &group, &a_id, a.generation_id, 100).await?;
+    assert_eq!(hb, ERROR_REBALANCE_IN_PROGRESS);
+    let a2 = join_now(&mut conn_a, &group, &a_id, 3).await?;
+    let b = tokio::time::timeout(Duration::from_secs(5), recv_join(&mut conn_b, 2))
+        .await
+        .map_err(|_| "the held JoinGroup was not answered when the phase completed")??;
+    let b_id = b.member_id.to_string();
+    let gen = a2.generation_id;
+    assert_eq!(b.generation_id, gen);
+    assert_eq!(a2.leader.as_str(), a_id.as_str());
+
+    println!("Step 2: the follower syncs first; its response must be held...");
+    send_request(&mut conn_b, 3, 4, &sync_request(&group, &b_id, gen, &[])).await?;
+    assert!(
+        nothing_arrives(&conn_b, Duration::from_millis(1500)).await,
+        "the follower's SyncGroup must wait for the leader's"
+    );
+
+    println!("Step 3: the leader syncs; the follower gets its assignment...");
+    let (code, own) = sync(
+        &mut conn_a,
+        &group,
+        &a_id,
+        gen,
+        &[(&a_id, b"assign-a"), (&b_id, b"assign-b")],
+        5,
+    )
+    .await?;
+    assert_eq!((code, own.as_slice()), (0, b"assign-a".as_slice()));
+    let follower = tokio::time::timeout(
+        Duration::from_secs(5),
+        recv_response::<SyncGroupRequest>(&mut conn_b, 3, 4),
+    )
+    .await
+    .map_err(|_| "the held SyncGroup was not answered when the leader synced")??;
+    println!(
+        "   follower sync: code {} assignment {:?}",
+        follower.error_code,
+        String::from_utf8_lossy(&follower.assignment)
+    );
+    assert_eq!(follower.error_code, 0);
+    assert_eq!(follower.assignment.as_ref(), b"assign-b");
+
+    println!("Step 4: the generation did not move...");
+    assert_eq!(heartbeat(&mut conn_a, &group, &a_id, gen, 6).await?, 0);
+    assert_eq!(heartbeat(&mut conn_b, &group, &b_id, gen, 7).await?, 0);
 
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");

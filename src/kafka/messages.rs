@@ -1038,17 +1038,18 @@ impl KafkaRequest {
     /// only after `BackgroundWorker::transaction` has committed, so a client can
     /// never observe an ack for state that is not yet durable/visible.
     ///
-    /// JoinGroup is the exception: its response may be held by the group coordinator
-    /// until the group's join phase completes, long after this request's transaction
-    /// (it does no SPI, so there is nothing to commit first). Its own sender is left in
-    /// place, `new_tx` is dropped, and a closed sender is returned, so the worker's
-    /// flush and commit-failure paths deliver nothing for it.
+    /// JoinGroup and SyncGroup are the exceptions: the group coordinator may hold
+    /// their responses (a JoinGroup until the join phase completes, a follower's
+    /// SyncGroup until the leader's arrives), long after this request's transaction.
+    /// Neither writes to the database, so there is nothing to commit first. Their own
+    /// sender is left in place, `new_tx` is dropped, and a closed sender is returned,
+    /// so the worker's flush and commit-failure paths deliver nothing for them.
     pub fn swap_response_tx(
         &mut self,
         new_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
     ) -> tokio::sync::mpsc::UnboundedSender<KafkaResponse> {
         match self {
-            KafkaRequest::JoinGroup { .. } => {
+            KafkaRequest::JoinGroup { .. } | KafkaRequest::SyncGroup { .. } => {
                 drop(new_tx);
                 let (closed_tx, _) = tokio::sync::mpsc::unbounded_channel();
                 closed_tx
@@ -1060,7 +1061,6 @@ impl KafkaRequest {
             | KafkaRequest::OffsetCommit { response_tx, .. }
             | KafkaRequest::OffsetFetch { response_tx, .. }
             | KafkaRequest::FindCoordinator { response_tx, .. }
-            | KafkaRequest::SyncGroup { response_tx, .. }
             | KafkaRequest::Heartbeat { response_tx, .. }
             | KafkaRequest::LeaveGroup { response_tx, .. }
             | KafkaRequest::ListOffsets { response_tx, .. }
@@ -1744,8 +1744,10 @@ mod tests {
     fn test_swap_response_tx_all_variants() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         for (api_key, mut request) in all_request_variants(tx) {
-            if api_key == crate::kafka::constants::API_KEY_JOIN_GROUP {
-                // Exempt from the barrier; see test_swap_response_tx_leaves_join_group_sender.
+            if api_key == crate::kafka::constants::API_KEY_JOIN_GROUP
+                || api_key == crate::kafka::constants::API_KEY_SYNC_GROUP
+            {
+                // Exempt from the barrier; see test_swap_response_tx_leaves_{join,sync}_group_sender.
                 continue;
             }
             let (buf_tx, mut buf_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1801,6 +1803,42 @@ mod tests {
         assert!(returned.send(error()).is_err(), "returned sender is closed");
         assert!(buf_rx.try_recv().is_err(), "the buffer is not installed");
         if let KafkaRequest::JoinGroup { response_tx, .. } = &request {
+            response_tx.send(error()).unwrap();
+        }
+        assert!(
+            orig_rx.try_recv().is_ok(),
+            "the request keeps the client sender"
+        );
+    }
+
+    /// SyncGroup, like JoinGroup, keeps the client's own sender: a follower's SyncGroup
+    /// may be answered after its transaction, when the leader syncs.
+    #[test]
+    fn test_swap_response_tx_leaves_sync_group_sender() {
+        let (orig_tx, mut orig_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (buf_tx, mut buf_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut request = KafkaRequest::SyncGroup {
+            correlation_id: 4,
+            client_id: None,
+            api_version: 3,
+            group_id: "g".to_string(),
+            generation_id: 1,
+            member_id: "m".to_string(),
+            group_instance_id: None,
+            protocol_type: None,
+            protocol_name: None,
+            assignments: vec![],
+            response_tx: orig_tx,
+        };
+        let returned = request.swap_response_tx(buf_tx);
+        let error = || KafkaResponse::Error {
+            correlation_id: 4,
+            error_code: 0,
+            error_message: None,
+        };
+        assert!(returned.send(error()).is_err(), "returned sender is closed");
+        assert!(buf_rx.try_recv().is_err(), "the buffer is not installed");
+        if let KafkaRequest::SyncGroup { response_tx, .. } = &request {
             response_tx.send(error()).unwrap();
         }
         assert!(

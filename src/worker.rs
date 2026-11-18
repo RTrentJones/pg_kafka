@@ -1606,23 +1606,25 @@ pub fn process_request(
             assignments,
             response_tx,
             ..
-        } => dispatch_response(
-            "SyncGroup",
-            response_tx,
-            || handlers::handle_sync_group(&ctx, group_id, member_id, generation_id, assignments),
-            |r| KafkaResponse::SyncGroup {
+        } => {
+            // A follower's SyncGroup may be parked until the leader's arrives, so, as
+            // for JoinGroup, it answers on the client's own sender (swap_response_tx
+            // leaves it in place for SyncGroup, which only reads and writes nothing).
+            let reply = crate::kafka::handlers::SyncGroupReply::new(
                 correlation_id,
                 api_version,
-                response: r,
-            },
-            |error_code| KafkaResponse::SyncGroup {
-                correlation_id,
-                api_version,
-                response: crate::kafka::response_builders::build_sync_group_error_response(
-                    error_code,
-                ),
-            },
-        ),
+                response_tx,
+            );
+            handlers::handle_sync_group(
+                &ctx,
+                group_id,
+                member_id,
+                generation_id,
+                assignments,
+                move |response| reply.send(response),
+            );
+            RequestOutcome::Commit
+        }
 
         // ===== Heartbeat =====
         crate::kafka::KafkaRequest::Heartbeat {

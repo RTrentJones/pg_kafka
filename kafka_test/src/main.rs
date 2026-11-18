@@ -170,6 +170,7 @@ use kafka_test::{
     test_fifty_percent_forwarding,
     // Coordinator state tests
     test_find_coordinator_bootstrap,
+    test_follower_sync_held_until_leader_syncs,
     test_frame_budget_released_on_mid_frame_disconnect,
     test_group_rebalance_keeps_old_generation_usable,
     test_group_rejoin_race,
@@ -797,6 +798,12 @@ fn get_all_tests() -> Vec<TestDef> {
             category: "error_paths",
             name: "test_join_group_held_until_all_members_rejoin",
             test_fn: wrap_test!(test_join_group_held_until_all_members_rejoin),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_follower_sync_held_until_leader_syncs",
+            test_fn: wrap_test!(test_follower_sync_held_until_leader_syncs),
             parallel_safe: true,
         },
         TestDef {

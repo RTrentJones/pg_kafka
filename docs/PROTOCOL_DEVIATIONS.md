@@ -142,6 +142,14 @@ pg_kafka.compression_type = 'gzip'
   A stable group rebalances when a member joins, a member's subscription changes, or
   the leader rejoins; a follower rejoining with unchanged metadata keeps its
   generation and assignment. Heartbeat during the sync phase answers NONE.
+- ✅ A follower's SyncGroup that arrives before the leader's is held, as in Kafka,
+  and answered with its assignment (empty if the leader left it out) when the
+  leader's SyncGroup arrives; the generation does not move. A held SyncGroup is
+  answered REBALANCE_IN_PROGRESS if a new rebalance starts first (a member joins or
+  leaves, or the leader misses the rebalance timeout and the sweep evicts it), and
+  UNKNOWN_MEMBER_ID if the member itself is removed. Like a waiting joiner, a member
+  whose SyncGroup is held is exempt from its session timeout. Server-side
+  assignment (a leader sending empty assignments) is computed only for the leader.
 
 **What's Not Implemented:**
 - ❌ Static group membership (KIP-345): `group_instance_id` is not honored
@@ -153,9 +161,6 @@ pg_kafka.compression_type = 'gzip'
 - ❌ No initial rebalance delay (`group.initial.rebalance.delay.ms`): the first member
   of an empty group completes its join at once, and members joining right after it
   start a second rebalance.
-- ❌ A follower's SyncGroup that arrives before the leader's is answered
-  REBALANCE_IN_PROGRESS (the client rejoins, is answered at once with the current
-  generation, and retries) instead of being held until the leader syncs.
 
 **Client Impact:**
 - Full consumer group functionality works with standard Kafka clients
