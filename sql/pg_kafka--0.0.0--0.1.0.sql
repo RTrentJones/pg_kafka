@@ -156,3 +156,79 @@ GRANT SELECT, INSERT, UPDATE ON kafka.broker_api_stats TO pgkafka_worker;
 GRANT SELECT, INSERT, UPDATE ON kafka.broker_gauges TO pgkafka_worker;
 
 -- END broker request metrics (metrics stream)
+
+-- =============================================================================
+-- SASL credentials (auth stream)
+-- =============================================================================
+-- One SCRAM credential per Kafka user and mechanism, stored the way Kafka stores
+-- them: salt, iteration count, StoredKey = H(HMAC(SaltedPassword, 'Client Key')),
+-- ServerKey = HMAC(SaltedPassword, 'Server Key'). No password is ever stored. SASL/PLAIN
+-- is checked against the SCRAM-SHA-256 credential (or SCRAM-SHA-512 if that is the
+-- only one). Manage users with pg_kafka_create_user / pg_kafka_alter_user /
+-- pg_kafka_set_user_verifier / pg_kafka_drop_user (src/kafka/auth/users.rs).
+--
+-- Not readable by pgkafka_reader (it gets the kafka.sasl_users view, without the
+-- salts and keys); pgkafka_worker may only SELECT it.
+CREATE TABLE kafka.sasl_credentials (
+    username TEXT NOT NULL CHECK (octet_length(username) BETWEEN 1 AND 255),
+    mechanism TEXT NOT NULL CHECK (mechanism IN ('SCRAM-SHA-256', 'SCRAM-SHA-512')),
+    salt BYTEA NOT NULL CHECK (octet_length(salt) > 0),
+    iterations INT NOT NULL CHECK (iterations BETWEEN 4096 AND 16384),
+    stored_key BYTEA NOT NULL,
+    server_key BYTEA NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (username, mechanism)
+);
+
+-- Include the credentials in pg_dump output (extension tables are skipped otherwise),
+-- so a dump/restore keeps the Kafka users. A dump therefore contains the verifiers.
+SELECT pg_catalog.pg_extension_config_dump('kafka.sasl_credentials', '');
+
+CREATE VIEW kafka.sasl_users AS
+SELECT username, mechanism, iterations, created_at, updated_at
+FROM kafka.sasl_credentials;
+
+GRANT SELECT ON kafka.sasl_users TO pgkafka_reader;
+GRANT SELECT ON kafka.sasl_credentials TO pgkafka_worker;
+
+COMMENT ON TABLE kafka.sasl_credentials IS 'SCRAM credentials of Kafka SASL users (salt, iterations, StoredKey, ServerKey; never a password).';
+COMMENT ON VIEW kafka.sasl_users IS 'Kafka SASL users and their mechanisms, without secrets.';
+
+-- Kafka user management functions (in a fresh install pgrx generates these from
+-- src/kafka/auth/users.rs; keep the signatures identical).
+CREATE FUNCTION "pg_kafka_create_user"(
+	"username" TEXT,
+	"password" TEXT,
+	"iterations" INT DEFAULT 4096
+) RETURNS void
+STRICT VOLATILE
+LANGUAGE c
+AS 'MODULE_PATHNAME', 'pg_kafka_create_user_wrapper';
+
+CREATE FUNCTION "pg_kafka_alter_user"(
+	"username" TEXT,
+	"password" TEXT,
+	"iterations" INT DEFAULT 4096
+) RETURNS void
+STRICT VOLATILE
+LANGUAGE c
+AS 'MODULE_PATHNAME', 'pg_kafka_alter_user_wrapper';
+
+CREATE FUNCTION "pg_kafka_set_user_verifier"(
+	"username" TEXT,
+	"verifier" TEXT
+) RETURNS void
+STRICT VOLATILE
+LANGUAGE c
+AS 'MODULE_PATHNAME', 'pg_kafka_set_user_verifier_wrapper';
+
+CREATE FUNCTION "pg_kafka_drop_user"(
+	"username" TEXT
+) RETURNS bool
+STRICT VOLATILE
+LANGUAGE c
+AS 'MODULE_PATHNAME', 'pg_kafka_drop_user_wrapper';
+
+-- END SASL credentials (auth stream)
+-- =============================================================================

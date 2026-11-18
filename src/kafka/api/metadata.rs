@@ -6,7 +6,7 @@ use kafka_protocol::messages::metadata_request::MetadataRequest;
 use kafka_protocol::messages::metadata_response::MetadataResponse;
 use kafka_protocol::messages::BrokerId;
 
-use super::{ApiEnv, Call, KafkaApi, Rejection, RequestHeader};
+use super::{ApiEnv, ApiSchema, Call, KafkaApi, Rejection, RequestHeader};
 use crate::kafka::constants::ERROR_UNSUPPORTED_VERSION;
 use crate::kafka::dispatch::RequestOutcome;
 use crate::kafka::handlers;
@@ -19,22 +19,12 @@ pub struct ApiVersionsApi;
 #[derive(Debug, Clone, Default)]
 pub struct ApiVersionsRequestData;
 
-impl KafkaApi for ApiVersionsApi {
+impl ApiSchema for ApiVersionsApi {
     type Wire = ApiVersionsRequest;
-    type Request = ApiVersionsRequestData;
     type Echo = ();
     const NAME: &'static str = "ApiVersions";
     const MIN_VERSION: i16 = 0;
     const MAX_VERSION: i16 = 3;
-
-    fn decode(
-        _wire: ApiVersionsRequest,
-        _header: &RequestHeader,
-    ) -> Result<Self::Request, Rejection<()>> {
-        Ok(ApiVersionsRequestData)
-    }
-
-    fn echo(_request: &Self::Request) {}
 
     fn error_response(_echo: Option<&()>, _version: i16, error_code: i16) -> ApiVersionsResponse {
         let mut response = crate::kafka::response_builders::build_api_versions_response();
@@ -45,6 +35,19 @@ impl KafkaApi for ApiVersionsApi {
     fn response_has_error(response: &ApiVersionsResponse) -> bool {
         response.error_code != 0
     }
+}
+
+impl KafkaApi for ApiVersionsApi {
+    type Request = ApiVersionsRequestData;
+
+    fn decode(
+        _wire: ApiVersionsRequest,
+        _header: &RequestHeader,
+    ) -> Result<Self::Request, Rejection<()>> {
+        Ok(ApiVersionsRequestData)
+    }
+
+    fn echo(_request: &Self::Request) {}
 
     /// KIP-511: a version we do not support must still be answered, in the v0 format, with
     /// UNSUPPORTED_VERSION and the full key list, so the client can retry with a version
@@ -74,43 +77,18 @@ pub struct MetadataRequestData {
     pub allow_auto_topic_creation: bool,
 }
 
-impl KafkaApi for MetadataApi {
+impl ApiSchema for MetadataApi {
     type Wire = MetadataRequest;
-    type Request = MetadataRequestData;
+
     /// The requested topic names (`None` = all topics).
     type Echo = Option<Vec<String>>;
     const NAME: &'static str = "Metadata";
     const MIN_VERSION: i16 = 0;
+
     // v10 (KIP-516) adds a per-topic `topic_id` to the response, left as the zero UUID
     // (by-name clients ignore it). It is served because clients with a pinned broker
     // version that do not down-negotiate (Sarama `V2_8_0_0`) send v10 unconditionally.
     const MAX_VERSION: i16 = 10;
-
-    fn decode(
-        wire: MetadataRequest,
-        header: &RequestHeader,
-    ) -> Result<Self::Request, Rejection<Self::Echo>> {
-        // CONF-3: empty-vs-null is version dependent. v0 has no nullable array and an empty
-        // array means "all topics"; v1+ null means all topics and an empty array none.
-        let topics = match wire.topics {
-            Some(t) if !t.is_empty() => Some(
-                t.into_iter()
-                    .filter_map(|t| t.name.map(|n| n.to_string()))
-                    .collect(),
-            ),
-            Some(_) if header.api_version == 0 => None,
-            Some(_) => Some(Vec::new()),
-            None => None,
-        };
-        Ok(MetadataRequestData {
-            topics,
-            allow_auto_topic_creation: wire.allow_auto_topic_creation,
-        })
-    }
-
-    fn echo(request: &Self::Request) -> Self::Echo {
-        request.topics.clone()
-    }
 
     /// MetadataResponse has no top-level error code: report it on every requested topic.
     fn error_response(
@@ -141,6 +119,36 @@ impl KafkaApi for MetadataApi {
                 .topics
                 .iter()
                 .any(|t| t.error_code != 0 || t.partitions.iter().any(|p| p.error_code != 0))
+    }
+}
+
+impl KafkaApi for MetadataApi {
+    type Request = MetadataRequestData;
+
+    fn decode(
+        wire: MetadataRequest,
+        header: &RequestHeader,
+    ) -> Result<Self::Request, Rejection<Self::Echo>> {
+        // CONF-3: empty-vs-null is version dependent. v0 has no nullable array and an empty
+        // array means "all topics"; v1+ null means all topics and an empty array none.
+        let topics = match wire.topics {
+            Some(t) if !t.is_empty() => Some(
+                t.into_iter()
+                    .filter_map(|t| t.name.map(|n| n.to_string()))
+                    .collect(),
+            ),
+            Some(_) if header.api_version == 0 => None,
+            Some(_) => Some(Vec::new()),
+            None => None,
+        };
+        Ok(MetadataRequestData {
+            topics,
+            allow_auto_topic_creation: wire.allow_auto_topic_creation,
+        })
+    }
+
+    fn echo(request: &Self::Request) -> Self::Echo {
+        request.topics.clone()
     }
 
     fn handle(request: Self::Request, call: Call<Self>, env: &ApiEnv<'_>) -> RequestOutcome {

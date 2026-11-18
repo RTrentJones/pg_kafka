@@ -48,6 +48,7 @@ mod fetch;
 mod group;
 mod metadata;
 mod produce;
+mod sasl;
 mod transaction;
 
 pub use admin::*;
@@ -57,13 +58,14 @@ pub use fetch::*;
 pub use group::*;
 pub use metadata::*;
 pub use produce::*;
+pub use sasl::*;
 pub use transaction::*;
 
 /// Requested `(topic, [partition])` pairs, the echo of the partition-addressed APIs.
 pub type TopicPartitions = Vec<(String, Vec<i32>)>;
 
 /// The response body type of API `A`.
-pub type ResponseOf<A> = <<A as KafkaApi>::Wire as WireRequest>::Response;
+pub type ResponseOf<A> = <<A as ApiSchema>::Wire as WireRequest>::Response;
 
 /// The request header fields every API carries.
 #[derive(Debug, Clone)]
@@ -109,13 +111,14 @@ pub struct ApiEnv<'a> {
     pub notify_tx: &'a Sender<InternalNotification>,
 }
 
-/// One Kafka API. See the module documentation.
-pub trait KafkaApi: Sized + 'static {
+/// What every registered API has, whoever serves it: wire types, name, supported
+/// versions and how to answer it with an error. The registry derives ApiVersions,
+/// version enforcement, encoding (header version from the response type), metrics names
+/// and error detection from this alone.
+pub trait ApiSchema: Sized + 'static {
     /// The kafka-protocol request type; its `KEY` is the API key and its `Response` the
     /// response body.
     type Wire: WireRequest;
-    /// The handler's input, built from `Wire` on the network thread.
-    type Request: std::fmt::Debug + Send + 'static;
     /// What an error response echoes from the request (requested topics, partitions,
     /// groups, ...). `()` for an API whose response has a top-level error code only.
     type Echo: Clone + std::fmt::Debug + Send + 'static;
@@ -126,6 +129,29 @@ pub trait KafkaApi: Sized + 'static {
     const MIN_VERSION: i16;
     /// Highest supported (advertised) request version.
     const MAX_VERSION: i16;
+
+    /// A well-formed response at `version` reporting `error_code`: in the top-level error
+    /// field where the response has one, and on every echoed entry.
+    fn error_response(echo: Option<&Self::Echo>, version: i16, error_code: i16)
+        -> ResponseOf<Self>;
+
+    /// Whether `response` carries any non-zero error code (metrics).
+    fn response_has_error(response: &ResponseOf<Self>) -> bool;
+}
+
+/// An API the DB thread serves: requests are decoded on the network thread into
+/// [`KafkaApi::Request`], travel on a [`Lane`] and run in [`KafkaApi::handle`]. See the
+/// module documentation.
+///
+/// APIs answered entirely on the network thread (SaslHandshake/SaslAuthenticate, from
+/// the connection's SASL state in `listener.rs` / `auth::session`) implement only
+/// [`ApiSchema`] and are listed in the registry's `network_thread` section: they are
+/// advertised, version-checked, encoded and counted like the others, but never decoded
+/// into a [`KafkaRequest`] or dispatched to the worker.
+pub trait KafkaApi: ApiSchema {
+    /// The handler's input, built from `Wire` on the network thread.
+    type Request: std::fmt::Debug + Send + 'static;
+
     /// The lane the request travels on.
     const LANE: Lane = Lane::Main;
     /// The handler may answer after the request's transaction (JoinGroup/SyncGroup are held
@@ -141,14 +167,6 @@ pub trait KafkaApi: Sized + 'static {
 
     /// The part of `request` an error response echoes.
     fn echo(request: &Self::Request) -> Self::Echo;
-
-    /// A well-formed response at `version` reporting `error_code`: in the top-level error
-    /// field where the response has one, and on every echoed entry.
-    fn error_response(echo: Option<&Self::Echo>, version: i16, error_code: i16)
-        -> ResponseOf<Self>;
-
-    /// Whether `response` carries any non-zero error code (metrics).
-    fn response_has_error(response: &ResponseOf<Self>) -> bool;
 
     /// Whether the client expects a response to `request` at all.
     fn expects_response(_request: &Self::Request) -> bool {
@@ -178,12 +196,12 @@ pub trait KafkaApi: Sized + 'static {
 }
 
 /// The API key of `A`.
-pub const fn api_key_of<A: KafkaApi>() -> i16 {
+pub const fn api_key_of<A: ApiSchema>() -> i16 {
     <A::Wire as WireRequest>::KEY
 }
 
 /// Whether kafka-protocol can encode `A`'s response at `version`.
-pub fn response_encodable<A: KafkaApi>(version: i16) -> bool {
+pub fn response_encodable<A: ApiSchema>(version: i16) -> bool {
     let range = <ResponseOf<A> as Message>::VERSIONS;
     (range.min..=range.max).contains(&version)
 }
@@ -363,7 +381,7 @@ fn decode_api<A: KafkaApi>(
 }
 
 /// Encode `response` (header + body) at `version`.
-fn encode_frame<A: KafkaApi>(
+fn encode_frame<A: ApiSchema>(
     response: &ResponseOf<A>,
     correlation_id: i32,
     version: i16,
@@ -389,15 +407,28 @@ pub struct ApiInfo {
     pub min_version: i16,
     /// Highest supported version.
     pub max_version: i16,
+    /// Who answers the API.
+    pub served_by: ServedBy,
+}
+
+/// Where an API's requests are answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServedBy {
+    /// Decoded on the network thread and run by the DB thread ([`KafkaApi`]), on this lane.
+    Worker(Lane),
+    /// Answered on the network thread from per-connection state (SASL), never sent to the
+    /// worker; the API implements only [`ApiSchema`].
+    NetworkThread,
 }
 
 impl ApiInfo {
-    const fn of<A: KafkaApi>() -> Self {
+    const fn of<A: ApiSchema>(served_by: ServedBy) -> Self {
         Self {
             key: api_key_of::<A>(),
             name: A::NAME,
             min_version: A::MIN_VERSION,
             max_version: A::MAX_VERSION,
+            served_by,
         }
     }
 }
@@ -416,9 +447,15 @@ pub fn api_name(api_key: i16) -> &'static str {
 /// [`ResponseBody`], [`Echo`], [`APIS`] and the per-API matches below; nothing else in the
 /// pipeline lists the APIs.
 macro_rules! kafka_apis {
-    ($($variant:ident => $api:ty),* $(,)?) => {
+    (
+        worker { $($variant:ident => $api:ty),* $(,)? }
+        network_thread { $($net_variant:ident => $net_api:ty),* $(,)? }
+    ) => {
         /// Every registered API, in registry order.
-        pub static APIS: &[ApiInfo] = &[$(ApiInfo::of::<$api>()),*];
+        pub static APIS: &[ApiInfo] = &[
+            $(ApiInfo::of::<$api>(ServedBy::Worker(<$api as KafkaApi>::LANE)),)*
+            $(ApiInfo::of::<$net_api>(ServedBy::NetworkThread),)*
+        ];
 
         /// A decoded request body, one variant per registered API.
         #[derive(Debug)]
@@ -436,6 +473,10 @@ macro_rules! kafka_apis {
                 #[allow(missing_docs)]
                 $variant(ResponseOf<$api>),
             )*
+            $(
+                #[allow(missing_docs)]
+                $net_variant(ResponseOf<$net_api>),
+            )*
             /// The generic error frame for an API key pg_kafka does not serve (there is no
             /// response schema to answer in): correlation id, error code, null message.
             UnknownApi {
@@ -449,7 +490,7 @@ macro_rules! kafka_apis {
         pub enum Echo {
             $(
                 #[allow(missing_docs)]
-                $variant(<$api as KafkaApi>::Echo),
+                $variant(<$api as ApiSchema>::Echo),
             )*
         }
 
@@ -460,7 +501,7 @@ macro_rules! kafka_apis {
             }
             /// Display name.
             pub fn api_name(&self) -> &'static str {
-                match self { $(Self::$variant(_) => <$api as KafkaApi>::NAME,)* }
+                match self { $(Self::$variant(_) => <$api as ApiSchema>::NAME,)* }
             }
             /// The lane this request travels on.
             pub fn lane(&self) -> Lane {
@@ -487,7 +528,7 @@ macro_rules! kafka_apis {
             pub fn error_response(&self, version: i16, error_code: i16) -> ResponseBody {
                 match self {
                     $(Self::$variant(e) => ResponseBody::$variant(
-                        <$api as KafkaApi>::error_response(Some(e), version, error_code),
+                        <$api as ApiSchema>::error_response(Some(e), version, error_code),
                     ),)*
                 }
             }
@@ -498,13 +539,15 @@ macro_rules! kafka_apis {
             pub fn api_key(&self) -> Option<i16> {
                 match self {
                     $(Self::$variant(_) => Some(api_key_of::<$api>()),)*
+                    $(Self::$net_variant(_) => Some(api_key_of::<$net_api>()),)*
                     Self::UnknownApi { .. } => None,
                 }
             }
             /// Whether the response carries any non-zero error code.
             pub fn has_error(&self) -> bool {
                 match self {
-                    $(Self::$variant(r) => <$api as KafkaApi>::response_has_error(r),)*
+                    $(Self::$variant(r) => <$api as ApiSchema>::response_has_error(r),)*
+                    $(Self::$net_variant(r) => <$net_api as ApiSchema>::response_has_error(r),)*
                     Self::UnknownApi { error_code } => *error_code != 0,
                 }
             }
@@ -517,6 +560,7 @@ macro_rules! kafka_apis {
             ) -> crate::kafka::error::Result<()> {
                 match self {
                     $(Self::$variant(r) => encode_frame::<$api>(r, correlation_id, version, buf),)*
+                    $(Self::$net_variant(r) => encode_frame::<$net_api>(r, correlation_id, version, buf),)*
                     Self::UnknownApi { error_code } => {
                         encode_unknown_api_frame(correlation_id, *error_code, buf)
                     }
@@ -530,7 +574,14 @@ macro_rules! kafka_apis {
             $(
                 if api_key == api_key_of::<$api>() {
                     return Some(ResponseBody::$variant(
-                        <$api as KafkaApi>::error_response(None, version, error_code),
+                        <$api as ApiSchema>::error_response(None, version, error_code),
+                    ));
+                }
+            )*
+            $(
+                if api_key == api_key_of::<$net_api>() {
+                    return Some(ResponseBody::$net_variant(
+                        <$net_api as ApiSchema>::error_response(None, version, error_code),
                     ));
                 }
             )*
@@ -553,6 +604,16 @@ macro_rules! kafka_apis {
                         RequestBody::$variant,
                         ResponseBody::$variant,
                     ));
+                }
+            )*
+            $(
+                // Answered by the connection (listener.rs) before parse_request; a frame
+                // that reaches the worker decoder anyway has no handler to run.
+                if header.api_key == api_key_of::<$net_api>() {
+                    return Ok(Decoded::Close(format!(
+                        "{} is answered on the network thread",
+                        <$net_api as ApiSchema>::NAME
+                    )));
                 }
             )*
             Err((header, response_tx))
@@ -589,32 +650,38 @@ fn encode_unknown_api_frame(
 }
 
 kafka_apis! {
-    ApiVersions => ApiVersionsApi,
-    Metadata => MetadataApi,
-    Produce => ProduceApi,
-    Fetch => FetchApi,
-    ListOffsets => ListOffsetsApi,
-    OffsetCommit => OffsetCommitApi,
-    OffsetFetch => OffsetFetchApi,
-    FindCoordinator => FindCoordinatorApi,
-    JoinGroup => JoinGroupApi,
-    Heartbeat => HeartbeatApi,
-    LeaveGroup => LeaveGroupApi,
-    SyncGroup => SyncGroupApi,
-    DescribeGroups => DescribeGroupsApi,
-    ListGroups => ListGroupsApi,
-    CreateTopics => CreateTopicsApi,
-    DeleteTopics => DeleteTopicsApi,
-    CreatePartitions => CreatePartitionsApi,
-    DeleteGroups => DeleteGroupsApi,
-    InitProducerId => InitProducerIdApi,
-    AddPartitionsToTxn => AddPartitionsToTxnApi,
-    AddOffsetsToTxn => AddOffsetsToTxnApi,
-    EndTxn => EndTxnApi,
-    TxnOffsetCommit => TxnOffsetCommitApi,
-    DeleteRecords => DeleteRecordsApi,
-    DescribeConfigs => DescribeConfigsApi,
-    IncrementalAlterConfigs => IncrementalAlterConfigsApi,
+    worker {
+        ApiVersions => ApiVersionsApi,
+        Metadata => MetadataApi,
+        Produce => ProduceApi,
+        Fetch => FetchApi,
+        ListOffsets => ListOffsetsApi,
+        OffsetCommit => OffsetCommitApi,
+        OffsetFetch => OffsetFetchApi,
+        FindCoordinator => FindCoordinatorApi,
+        JoinGroup => JoinGroupApi,
+        Heartbeat => HeartbeatApi,
+        LeaveGroup => LeaveGroupApi,
+        SyncGroup => SyncGroupApi,
+        DescribeGroups => DescribeGroupsApi,
+        ListGroups => ListGroupsApi,
+        CreateTopics => CreateTopicsApi,
+        DeleteTopics => DeleteTopicsApi,
+        CreatePartitions => CreatePartitionsApi,
+        DeleteGroups => DeleteGroupsApi,
+        InitProducerId => InitProducerIdApi,
+        AddPartitionsToTxn => AddPartitionsToTxnApi,
+        AddOffsetsToTxn => AddOffsetsToTxnApi,
+        EndTxn => EndTxnApi,
+        TxnOffsetCommit => TxnOffsetCommitApi,
+        DeleteRecords => DeleteRecordsApi,
+        DescribeConfigs => DescribeConfigsApi,
+        IncrementalAlterConfigs => IncrementalAlterConfigsApi,
+    }
+    network_thread {
+        SaslHandshake => SaslHandshakeApi,
+        SaslAuthenticate => SaslAuthenticateApi,
+    }
 }
 
 #[cfg(test)]

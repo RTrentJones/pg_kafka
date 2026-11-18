@@ -34,6 +34,7 @@
 
 pub mod api;
 pub mod assignment;
+pub mod auth;
 pub mod broker_metadata;
 pub mod constants;
 pub mod context;

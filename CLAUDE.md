@@ -23,6 +23,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - ✅ **Phase 11 Complete:** Shadow Mode (external Kafka forwarding, SASL/SSL, per-topic config, replay)
 - ✅ **Enhancement:** Long Polling (max_wait_ms/min_bytes support, in-memory notification)
 - ✅ **Enhancement:** Config & log management (DescribeConfigs, IncrementalAlterConfigs for `retention.ms`, DeleteRecords) and a periodic retention sweep
+- ✅ **Enhancement:** Listener security: TLS (rustls, optional mutual TLS) and SASL PLAIN / SCRAM-SHA-256 / SCRAM-SHA-512 (SaslHandshake, SaslAuthenticate) on Kafka-style listeners; **no ACLs** (see `docs/AUTHENTICATION.md`)
 - ✅ **CI/CD:** GitHub Actions pipeline with automated testing
 
 **What Works Now:**
@@ -46,9 +47,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Dual-offset design (partition_offset + global_offset)
 - Repository Pattern storage abstraction (KafkaStore trait + PostgresStore impl)
 - Shadow mode for forwarding to external Kafka with SASL/SSL, per-topic config, replay support
+- Listener security protocols PLAINTEXT / SSL / SASL_PLAINTEXT / SASL_SSL, several listeners at once (`pg_kafka.additional_listeners`), each advertising its own address; SCRAM credentials in `kafka.sasl_credentials`, managed with `pg_kafka_create_user` & co.; per-connection principal recorded (authorization is not implemented)
 - Automated E2E tests with real Kafka client (rdkafka)
 
-**API Coverage:** 26 of ~50 standard Kafka APIs (52%)
+**API Coverage:** 28 of ~50 standard Kafka APIs (56%)
 **Test Status:** unit + property + E2E, all CI-gated. Counts live only in `docs/TEST_STRATEGY.md` ("Test Summary"); do not repeat them elsewhere.
 **Coverage Target:** 80%+ (testable code)
 
@@ -197,6 +199,7 @@ src/
 │   ├── api/            # One `KafkaApi` impl per Kafka API + the registry (decode, error responses, dispatch)
 │   │   ├── mod.rs      # KafkaApi trait, Call, decode_api, kafka_apis! registry (RequestBody/ResponseBody/APIS)
 │   │   ├── metadata.rs, produce.rs, fetch.rs, consumer.rs, group.rs, admin.rs, configs.rs, transaction.rs
+│   │   ├── sasl.rs     # SaslHandshake/SaslAuthenticate schema (answered on the network thread)
 │   │   └── tests.rs    # Registry-wide tests (every advertised version encodes, echoes, header versions)
 │   ├── listener.rs     # TCP listener, tokio runtime, connection handling
 │   ├── protocol/       # Binary protocol parsing/encoding (uses kafka-protocol crate)
@@ -213,6 +216,15 @@ src/
 │   ├── notifications.rs    # DB-thread/network-thread notifications for long polling
 │   ├── pending_fetches.rs  # Registry of FetchRequests waiting for data (long polling)
 │   ├── coordinator.rs  # Consumer group coordinator (Arc<RwLock> shared state)
+│   ├── auth/           # Listener security (TLS, SASL), see docs/AUTHENTICATION.md
+│   │   ├── mod.rs      # ConnectionPrincipal, re-exports
+│   │   ├── settings.rs # Security protocols, listener specs, the listener-security GUCs
+│   │   ├── tls.rs      # rustls ServerConfig from PEM files; client-cert subject -> principal
+│   │   ├── session.rs  # Per-connection SASL state machine (network thread), credential channel
+│   │   ├── scram.rs    # SCRAM-SHA-256/512 server + stored credential format (RFC 5802/7677)
+│   │   ├── plain.rs    # SASL/PLAIN parsing (RFC 4616)
+│   │   ├── credentials.rs  # DB-thread credential lookup (SELECT on kafka.sasl_credentials)
+│   │   └── users.rs    # pg_kafka_create_user / _alter_user / _set_user_verifier / _drop_user
 │   ├── assignment/     # Partition assignment (Phase 4)
 │   │   ├── mod.rs
 │   │   ├── subscription.rs       # MemberSubscription (JoinGroup metadata) parsing/encoding
@@ -278,6 +290,7 @@ kafka_test/             # E2E test suite (counts: docs/TEST_STRATEGY.md)
         ├── idempotent/           # Idempotent producer tests
         ├── transaction/          # Transaction tests
         ├── shadow/               # Shadow mode tests (Phase 11)
+        ├── auth/                 # TLS + SASL listener tests (reconfigure + restart the worker)
         ├── long_poll/            # Long polling tests
         ├── error_paths/          # Error handling tests
         ├── edge_cases/           # Boundary condition tests
@@ -331,7 +344,7 @@ The core architectural challenge is bridging async Kafka protocol handling with 
 TCP:9092 → Tokio Runtime (listener.rs) → crossbeam-channel → Background Worker (worker.rs) → SPI
 ```
 
-1. **Async Layer** (`src/kafka/listener.rs`): Tokio runtime accepts TCP connections, parses Kafka wire protocol
+1. **Async Layer** (`src/kafka/listener.rs`): Tokio runtime accepts TCP connections on every configured listener (TLS handshake where configured), parses Kafka wire protocol. SaslHandshake/SaslAuthenticate never become `KafkaRequest`s: the per-connection `SaslSession` (`src/kafka/auth/session.rs`) answers them on the network thread and gates every other request until authentication succeeds; its credential lookups go to the worker over a separate `CredentialRequest` channel that the main loop `select!`s next to the main lane
 2. **Message Queue** (`src/kafka/messages.rs`): `crossbeam-channel` bridges async→sync with `KafkaRequest` values on two lanes (`RequestLanes`: `main`, plus a `liveness` lane for Heartbeat that the worker drains first); each request carries a tokio `response_tx` that the worker answers with a `KafkaResponse`
 3. **Sync Layer** (`src/worker.rs`): Background worker processes requests via SPI within postgres transactions. **Group commit:** every request already queued (cap 64, ~50 ms budget, ends early when a Heartbeat waits) runs in one top-level transaction, each request in its own subtransaction (a handler returns `RequestOutcome::Rollback` on `Err`; panics are caught and rolled back), and all responses are released only after the single commit (RB-1). The worker is registered with a 5 s restart interval and exits with status 1 on SIGTERM, so `pg_terminate_backend()` or a crash brings up a fresh listener; it waits for the schema indefinitely. It starts once recovery finishes, so it does not run on a hot standby.
 
@@ -530,10 +543,13 @@ access to the kafka schema (nothing is granted to PUBLIC any more; grant this ro
 `src/kafka/storage/privileges.rs`, whose unit tests check the GRANTs in `sql/bootstrap.sql` and
 scan the worker's SQL for uncovered tables/verbs). A new worker statement on a new table, or a new
 worker-written table (e.g. a metrics table), needs a matching GRANT plus an entry there.
+`kafka.sasl_credentials` (SCRAM verifiers) is readable only by superusers and `pgkafka_worker`
+(SELECT); `pgkafka_reader` gets the secret-free `kafka.sasl_users` view.
 
 **SQL Functions** (from `src/lib.rs`, in the `public` schema):
 - `pg_kafka_run_retention_sweep(message_retention_hours INT DEFAULT NULL, aborted_grace_seconds BIGINT DEFAULT 60)`: Runs one retention sweep on demand (the worker runs the same sweep periodically) and returns `(category, deleted)` rows for `aborted_messages`, `expired_messages`, `stale_producers`, `terminal_transactions`, `shadow_delivered_rows`. A NULL first argument uses `pg_kafka.message_retention_hours`.
 - `hello_pg_kafka()`: Smoke-test function returning `'Hello, pg_kafka'`.
+- `pg_kafka_create_user(username, password, iterations INT DEFAULT 4096)`, `pg_kafka_alter_user(...)`, `pg_kafka_set_user_verifier(username, verifier)`, `pg_kafka_drop_user(username) RETURNS bool`: manage SASL users (`src/kafka/auth/users.rs`; SECURITY INVOKER, so only roles that may write `kafka.sasl_credentials`, i.e. superusers by default)
 
 ## Configuration
 
@@ -562,6 +578,15 @@ pg_kafka.config_reload_interval_ms = 30000  -- How often the worker reloads GUCs
 -- Test-only fault injection (Sighup, default 0 = off; never set in production)
 pg_kafka.test_forward_ack_delay_ms = 0   -- Delay before the shadow forwarder acks (0-30000ms)
 pg_kafka.test_pre_commit_delay_ms = 0    -- Delay between a Produce handler and its commit (0-10000ms)
+
+-- Listener security (Sighup, but read only when the worker starts: reload, then
+-- pg_terminate_backend() the pg_kafka_listener worker; see docs/AUTHENTICATION.md)
+pg_kafka.security_protocol = 'PLAINTEXT'   -- primary listener: PLAINTEXT | SSL | SASL_PLAINTEXT | SASL_SSL
+pg_kafka.additional_listeners = ''         -- 'SASL_SSL://0.0.0.0:9093,SSL://:9094' (empty host = pg_kafka.host)
+pg_kafka.ssl_cert_file = ''                -- PEM chain (required by SSL / SASL_SSL listeners)
+pg_kafka.ssl_key_file = ''                 -- PEM private key
+pg_kafka.ssl_ca_file = ''                  -- client CA bundle; set = mutual TLS on TLS listeners
+pg_kafka.sasl_enabled_mechanisms = 'PLAIN,SCRAM-SHA-256,SCRAM-SHA-512'
 
 -- See "Shadow Mode Configuration" section below for shadow mode settings
 ```
@@ -675,6 +700,15 @@ ApiVersions list, the metrics names and the error path; nothing else lists the A
    every advertised version encodes and that the error responses encode.
 4. Add an E2E test under `kafka_test/src/` and register it in `kafka_test/src/main.rs`.
 
+**An API answered on the network thread** (from per-connection state, never sent to the
+worker; today SaslHandshake/SaslAuthenticate, answered by `auth::session` from
+`listener.rs`) implements only `ApiSchema` (wire types, name, versions, error response,
+`response_has_error`; see `src/kafka/api/sasl.rs`) and goes in the registry's
+`network_thread { .. }` section. It is advertised, encoded and named from the table like
+the others (`ApiInfo::served_by` is `ServedBy::NetworkThread`) but has no `RequestBody`
+variant: the listener must intercept its frames before `parse_request`, build responses as
+`ResponseBody::<Variant>`, and count them with `metrics::RequestTimer` itself.
+
 ## E2E Testing Best Practices (kafka_test/)
 
 ### Test Infrastructure
@@ -709,6 +743,7 @@ Per-category counts are in `docs/TEST_STRATEGY.md`; `cargo run --release -- --li
 | **performance** | Throughput baselines, latency percentiles, scaling |
 | **metadata** | Metadata refresh, all topics, nonexistent topic |
 | **protocol** | ApiVersions negotiation, correlation ID, unknown API, pipelining, response ordering |
+| **auth** | SASL_PLAINTEXT (PLAIN, SCRAM-SHA-256/512), SSL (+ untrusted CA, mutual TLS), SASL_SSL, wrong passwords, pre-auth gating, user SQL. Sequential: generates certs with the `openssl` CLI, adds listeners 9093-9095 via ALTER SYSTEM and restarts the worker; the last test resets them. Needs the DB host's filesystem and superuser |
 
 ### Running E2E Tests with CLI Options
 

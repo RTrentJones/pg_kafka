@@ -15,7 +15,7 @@ kcat -C -b localhost:9092 -t my-topic -p 0 -o beginning
 
 | Component | Status | Details |
 |-----------|--------|---------|
-| **Protocol Layer** | Production-ready | 26 Kafka APIs implemented (52% coverage) |
+| **Protocol Layer** | Production-ready | 28 Kafka APIs implemented (56% coverage) |
 | **Producer** | Production-ready | Idempotent + transactional support |
 | **Consumer** | Production-ready | Fetch, ListOffsets, automatic partition assignment |
 | **Consumer Groups** | Complete | Full coordinator with auto-rebalancing |
@@ -49,8 +49,9 @@ kcat -C -b localhost:9092 -t my-topic -p 0 -o beginning
 - **Transaction Support** - Full ACID with AddPartitionsToTxn, AddOffsetsToTxn, EndTxn, TxnOffsetCommit
 - **Read-Committed Isolation** - Consumers filter pending/aborted transactions
 - **Shadow Mode** - Dual-write to external Kafka with SASL/SSL authentication
+- **Listener Security** - TLS (rustls, optional mutual TLS) and SASL PLAIN / SCRAM-SHA-256 / SCRAM-SHA-512 on Kafka-style `SSL` / `SASL_PLAINTEXT` / `SASL_SSL` listeners; no ACLs ([docs/AUTHENTICATION.md](docs/AUTHENTICATION.md))
 
-### Implemented APIs (26 total)
+### Implemented APIs (28 total)
 
 Versions are the ranges advertised in ApiVersions and enforced on inbound requests (each API's `MIN_VERSION`/`MAX_VERSION` in `src/kafka/api/`).
 
@@ -69,6 +70,7 @@ Versions are the ranges advertised in ApiVersions and enforced on inbound reques
 | SyncGroup | 14 | 0-4 | Distribute partition assignments |
 | DescribeGroups | 15 | 0-5 | Get consumer group state and members |
 | ListGroups | 16 | 0-4 | List all consumer groups |
+| SaslHandshake | 17 | 0-1 | Negotiate the SASL mechanism (SASL listeners; v0 answered UNSUPPORTED_VERSION) |
 | ApiVersions | 18 | 0-3 | Protocol version negotiation |
 | CreateTopics | 19 | 0-5 | Create topics with partition count |
 | DeleteTopics | 20 | 0-4 | Delete topics and messages |
@@ -79,6 +81,7 @@ Versions are the ranges advertised in ApiVersions and enforced on inbound reques
 | EndTxn | 26 | 0-3 | Commit or abort transaction |
 | TxnOffsetCommit | 28 | 0-3 | Commit offsets within transaction |
 | DescribeConfigs | 32 | 1-4 | Report the topic configs pg_kafka honors |
+| SaslAuthenticate | 36 | 0-2 | PLAIN / SCRAM-SHA-256 / SCRAM-SHA-512 exchange |
 | CreatePartitions | 37 | 0-2 | Add partitions to existing topics |
 | DeleteGroups | 42 | 0-2 | Delete consumer groups |
 | IncrementalAlterConfigs | 44 | 0-1 | Set per-topic `retention.ms` (other keys rejected) |
@@ -323,14 +326,15 @@ The GitHub Actions pipeline runs:
 
 ## Configuration
 
-> ⚠️ **Security: the Kafka listener has no authentication or TLS.** Anyone who
-> can reach `pg_kafka.port` can produce, consume, and administer topics — the
-> wire protocol implements no SASL and no encryption (inbound; Shadow Mode's
-> *outbound* SASL/SSL is unrelated). The default bind is `127.0.0.1` (local
-> clients only); setting `pg_kafka.host` to a non-loopback address exposes it.
-> Deploy only on trusted networks, and firewall the port to known clients. The extension logs a startup WARNING when bound to a
-> non-loopback address (SEC-7, accepted-by-design — see
-> `docs/PROTOCOL_DEVIATIONS.md` "Network Security Posture").
+> ⚠️ **Security: authentication is opt-in, and there is no authorization.** By
+> default the only listener is PLAINTEXT on `127.0.0.1:9092`: anyone who can reach
+> it can produce, consume, and administer topics. TLS and SASL (PLAIN,
+> SCRAM-SHA-256, SCRAM-SHA-512) listeners can be added with
+> `pg_kafka.security_protocol` / `pg_kafka.additional_listeners` (see
+> [docs/AUTHENTICATION.md](docs/AUTHENTICATION.md)); an authenticated client may
+> still do everything, because there are no ACLs. The extension logs a startup
+> WARNING for every non-loopback listener that does not authenticate clients
+> (`docs/PROTOCOL_DEVIATIONS.md` "Network Security Posture").
 
 ```sql
 -- In postgresql.conf:
@@ -345,7 +349,18 @@ pg_kafka.shutdown_timeout_ms = 5000
 
 -- Reloadable with pg_reload_conf()
 pg_kafka.message_retention_hours = 0  -- Time-based retention sweep (0 = keep forever)
+
+-- Listener security (read when the worker starts; see docs/AUTHENTICATION.md)
+pg_kafka.security_protocol = 'PLAINTEXT'      -- primary listener: PLAINTEXT, SSL, SASL_PLAINTEXT, SASL_SSL
+pg_kafka.additional_listeners = ''            -- e.g. 'SASL_SSL://0.0.0.0:9093'
+pg_kafka.ssl_cert_file = ''                   -- PEM chain / key for SSL listeners
+pg_kafka.ssl_key_file = ''
+pg_kafka.ssl_ca_file = ''                     -- set = mutual TLS
+pg_kafka.sasl_enabled_mechanisms = 'PLAIN,SCRAM-SHA-256,SCRAM-SHA-512'
 ```
+
+Kafka users: `SELECT pg_kafka_create_user('alice', 'secret');` (also `pg_kafka_alter_user`,
+`pg_kafka_set_user_verifier`, `pg_kafka_drop_user`, view `kafka.sasl_users`).
 
 See [CLAUDE.md](CLAUDE.md#configuration) for the full GUC list, including long polling, compression and Shadow Mode settings.
 

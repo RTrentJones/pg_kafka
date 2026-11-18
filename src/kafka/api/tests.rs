@@ -5,6 +5,12 @@ use super::*;
 use crate::kafka::constants::*;
 use crate::kafka::error::KafkaError;
 
+/// The APIs the DB thread serves (every one but the network-thread SASL APIs).
+pub(crate) fn worker_apis() -> impl Iterator<Item = &'static ApiInfo> {
+    APIS.iter()
+        .filter(|info| matches!(info.served_by, ServedBy::Worker(_)))
+}
+
 /// A minimal request body for `api_key` (tests only).
 pub(crate) fn sample_request(api_key: i16) -> RequestBody {
     let header = RequestHeader {
@@ -118,6 +124,8 @@ fn registry_matches_the_api_key_constants() {
         (API_KEY_CREATE_PARTITIONS, "CreatePartitions"),
         (API_KEY_DELETE_GROUPS, "DeleteGroups"),
         (API_KEY_INCREMENTAL_ALTER_CONFIGS, "IncrementalAlterConfigs"),
+        (API_KEY_SASL_HANDSHAKE, "SaslHandshake"),
+        (API_KEY_SASL_AUTHENTICATE, "SaslAuthenticate"),
     ];
     assert_eq!(APIS.len(), expected.len());
     for (key, name) in expected {
@@ -143,7 +151,7 @@ fn every_advertised_version_encodes() {
 
 #[test]
 fn every_registered_api_decodes_its_minimum_version() {
-    for info in APIS {
+    for info in worker_apis() {
         let body = sample_request(info.key);
         assert_eq!(body.api_key(), info.key, "{}", info.name);
         assert_eq!(body.api_name(), info.name);
@@ -154,7 +162,7 @@ fn every_registered_api_decodes_its_minimum_version() {
 fn echoed_error_responses_encode_and_carry_the_code() {
     // The error response built from a decoded request's echo must encode at every
     // advertised version and report an error.
-    for info in APIS {
+    for info in worker_apis() {
         let echo = sample_request(info.key).echo();
         for version in info.min_version..=info.max_version {
             let body = echo.error_response(version, ERROR_UNKNOWN_SERVER_ERROR);
@@ -253,7 +261,7 @@ fn truncated_body_gets_invalid_request_with_correlation_id() {
 fn truncated_body_of_every_api_is_answered_in_its_own_schema() {
     // For each registered API: a valid header at the minimum version followed by a body
     // that is cut short (one byte of garbage) yields that API's response, never a close.
-    for info in APIS {
+    for info in worker_apis() {
         let mut buf = BytesMut::new();
         let header = kafka_protocol::messages::RequestHeader::default()
             .with_request_api_key(info.key)
@@ -470,4 +478,41 @@ fn error_responses_without_echo_still_carry_top_level_codes() {
         assert_eq!(code_of(&body), ERROR_INVALID_REQUEST, "api key {}", key);
         assert!(body.has_error());
     }
+}
+
+#[test]
+fn network_thread_apis_are_advertised_but_never_reach_the_worker() {
+    // SaslHandshake and SaslAuthenticate are answered by the connection's SASL session
+    // (listener.rs); the registry still advertises and encodes them, but a frame that
+    // reaches the worker decoder is not turned into a request.
+    for (key, versions) in [
+        (API_KEY_SASL_HANDSHAKE, (0, 1)),
+        (API_KEY_SASL_AUTHENTICATE, (0, 2)),
+    ] {
+        let info = api_info(key).expect("registered");
+        assert_eq!(info.served_by, ServedBy::NetworkThread);
+        assert_eq!((info.min_version, info.max_version), versions);
+        let advertised = crate::kafka::response_builders::build_api_versions_response();
+        assert!(advertised
+            .api_keys
+            .iter()
+            .any(|a| a.api_key == key && (a.min_version, a.max_version) == versions));
+        let mut buf = BytesMut::new();
+        kafka_protocol::messages::RequestHeader::default()
+            .with_request_api_key(key)
+            .with_request_api_version(1)
+            .with_correlation_id(3)
+            .encode(&mut buf, 1)
+            .unwrap();
+        let (parsed, response) = parse(buf);
+        assert!(
+            parsed.is_err(),
+            "api key {} must not be decoded for the worker",
+            key
+        );
+        assert!(response.is_none());
+        let body = error_response_for(key, 1, ERROR_ILLEGAL_SASL_STATE).unwrap();
+        assert!(body.has_error());
+    }
+    assert!(worker_apis().all(|info| info.key != API_KEY_SASL_HANDSHAKE));
 }

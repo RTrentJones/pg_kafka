@@ -10,7 +10,7 @@
 
 | Metric | Value |
 |--------|-------|
-| **API Coverage** | 26 of ~50 standard Kafka APIs (52%) |
+| **API Coverage** | 28 of ~50 standard Kafka APIs (56%) |
 | **Build Status** | ✅ Compiles with zero warnings |
 | **Test Suite** | Unit + property + E2E; counts in [TEST_STRATEGY.md](TEST_STRATEGY.md#test-summary) |
 | **Architecture** | Repository Pattern with typed errors |
@@ -18,7 +18,7 @@
 
 ---
 
-## Implemented APIs (26 total)
+## Implemented APIs (28 total)
 
 Version ranges below are the ones advertised in the ApiVersions response and enforced on inbound requests (each API's `MIN_VERSION`/`MAX_VERSION` in `src/kafka/api/`). A request above its range is answered with UNSUPPORTED_VERSION in the requested version (echoing the requested topics/partitions/groups where the response has no top-level error code); a request below it closes the connection, as Kafka does (the minimums are the lowest versions the kafka-protocol crate can decode and encode). A body that does not decode gets INVALID_REQUEST; see PROTOCOL_DEVIATIONS.md, "Error responses". ApiVersions outside v0-v3 is answered in the v0 format with UNSUPPORTED_VERSION and the full key list (KIP-511).
 
@@ -115,34 +115,44 @@ Version ranges below are the ones advertised in the ApiVersions response and enf
 - ✅ IncrementalAlterConfigs persists `retention.ms` to `kafka.topics.retention_ms`, which the retention sweep enforces; any other key or operation (APPEND/SUBTRACT) is rejected with INVALID_CONFIG, all-or-nothing per resource; `validate_only` runs the checks without applying
 - ✅ DeleteRecords treats offset `-1` as "truncate to the high watermark", returns OFFSET_OUT_OF_RANGE for offsets past the high watermark, and persists the new log start offset (`kafka.partition_offsets.log_start_offset`) so ListOffsets(EARLIEST) and Fetch `log_start_offset` do not regress
 
+### 8. Security APIs (2 APIs) ✅
+| API | Key | Versions | Status | Notes |
+|-----|-----|----------|--------|-------|
+| SaslHandshake | 17 | v0-v1 | ✅ Complete | Mechanism negotiation; v0 (unframed tokens) advertised but answered UNSUPPORTED_VERSION |
+| SaslAuthenticate | 36 | v0-v2 | ✅ Complete | PLAIN, SCRAM-SHA-256, SCRAM-SHA-512; no re-authentication (`session_lifetime_ms` 0) |
+
+**Implementation Notes:**
+- ✅ Kafka-style listener security protocols (PLAINTEXT, SSL, SASL_PLAINTEXT, SASL_SSL), several listeners at once, TLS via rustls with optional mutual TLS
+- ✅ Credentials are SCRAM verifiers in `kafka.sasl_credentials` (never passwords), managed with SQL functions
+- ✅ Handled on the network thread per connection; only the credential lookup reaches the DB thread
+- ❌ No ACLs: an authenticated principal may do everything. See [AUTHENTICATION.md](AUTHENTICATION.md)
+
 ---
 
 ## Unimplemented APIs Analysis
 
 **Source**: [Apache Kafka Protocol Guide](https://kafka.apache.org/protocol.html)
 **Total Standard Kafka APIs**: ~50
-**Implemented**: 26 (52%)
-**Unimplemented**: ~24 (48%)
+**Implemented**: 28 (56%)
+**Unimplemented**: ~22 (44%)
 
 This section analyzes all unimplemented APIs, their use cases, and priority for drop-in Kafka replacement.
 
 ---
 
-### Security & Authentication (7 APIs) - Priority: Medium/Low
+### Security & Authentication (5 remaining APIs) - Priority: Low
 
 | API | Key | Use Case | Drop-In Priority |
 |-----|-----|----------|------------------|
-| **SaslHandshake** | 17 | Initiates SASL authentication, negotiates mechanism (PLAIN, SCRAM, GSSAPI, OAUTHBEARER) | Medium - Required if clients use `security.protocol=SASL_*` |
-| **SaslAuthenticate** | 36 | Performs actual SASL authentication exchange after handshake | Medium - Required with SaslHandshake |
 | **CreateAcls** | 30 | Creates access control lists (e.g., "user X can produce to topic Y") | Low - Use PostgreSQL GRANT/REVOKE |
 | **DescribeAcls** | 29 | Lists existing ACL rules for auditing/debugging permissions | Low - Admin utility |
 | **DeleteAcls** | 31 | Removes ACL rules | Low - Admin utility |
 | **DescribeUserScramCredentials** | 50 | Lists SCRAM credentials for users (SCRAM-SHA-256/512 auth) | Low - Only for SCRAM auth |
 | **AlterUserScramCredentials** | 51 | Creates/updates/deletes SCRAM credentials | Low - Only for SCRAM auth |
 
-**pg_kafka Approach**: Rely on PostgreSQL's native authentication (pg_hba.conf, SSL, LDAP) instead of implementing Kafka-level auth.
+**pg_kafka Approach**: SaslHandshake/SaslAuthenticate are implemented (§8 above); SCRAM users are managed with SQL functions instead of the SCRAM credential APIs, and there are no ACLs yet (an authenticated principal may do everything).
 
-**Client Impact**: Clients configured with `security.protocol=SASL_*` will fail to connect without SaslHandshake/SaslAuthenticate. Most internal deployments use `PLAINTEXT` or `SSL` (no SASL).
+**Client Impact**: `kafka-configs --alter --entity-type users` and ACL tooling do not work; SASL clients connect normally.
 
 ---
 
@@ -359,7 +369,7 @@ This section analyzes all unimplemented APIs, their use cases, and priority for 
 | Priority | APIs | Rationale | Client Impact Without Implementation |
 |----------|------|-----------|-------------------------------------|
 | **Critical** | ✅ InitProducerId (22) | **ALREADY IMPLEMENTED** - librdkafka defaults to idempotence | Clients fail or require `enable.idempotence=false` |
-| **High** | SaslHandshake (17), SaslAuthenticate (36) | Required for authenticated deployments | Clients configured with SASL fail to connect |
+| **High** | ✅ SaslHandshake (17), SaslAuthenticate (36) | **IMPLEMENTED** (no ACLs) | — |
 | **Medium** | ✅ DescribeConfigs (32), ✅ IncrementalAlterConfigs (44) | **ALREADY IMPLEMENTED** (retention.ms honest-minimal) | — |
 | **Medium** | ✅ DeleteRecords (21) | **ALREADY IMPLEMENTED** | — |
 | **Low** | OffsetDelete (47), DescribeCluster (60) | Admin utilities | Minor admin CLI failures |
@@ -369,7 +379,7 @@ This section analyzes all unimplemented APIs, their use cases, and priority for 
 
 **Current State**:
 ```
-26 APIs (produce/consume, coordinator, transactions, admin, config/log management)
+28 APIs (produce/consume, coordinator, transactions, admin, config/log management, SASL)
 = 99% of produce/consume workloads covered
 ```
 
@@ -381,11 +391,10 @@ This section analyzes all unimplemented APIs, their use cases, and priority for 
 = 27 APIs total (54% coverage)
 ```
 
-**With Authentication (Add 2 More)**:
+**With Authentication**:
 ```
-+ SaslHandshake (17)
-+ SaslAuthenticate (36)
-= 29 APIs total (58% coverage)
+✅ SaslHandshake (17)      - Already implemented
+✅ SaslAuthenticate (36)   - Already implemented
 ```
 
 **Verdict**: pg_kafka is already a viable drop-in replacement for **most Kafka workloads**. The remaining ~24 APIs are either:
@@ -473,7 +482,8 @@ Consumer Flow (Current):
 | RecordBatch | v0, v1, v2 | v2 (Produce v3+) | Produce v0-v2 (MessageSet) is not advertised; a legacy MessageSet v0/v1 decode fallback exists for inbound batches |
 | Compression | All codecs | All codecs | gzip, snappy, lz4, zstd fully supported |
 | Transactions | Yes | Yes | ✅ Phase 10 - EOS with server-side read_committed filtering |
-| SASL/ACLs | Yes | No | Use PostgreSQL auth |
+| SASL/TLS | Yes | Yes | PLAIN, SCRAM-SHA-256/512, TLS + mTLS (see AUTHENTICATION.md) |
+| ACLs | Yes | No | Not implemented: authenticated principals may do everything |
 
 ### Consumer Groups
 | Feature | Standard Kafka | pg_kafka | Status |
@@ -509,8 +519,8 @@ one place: [TEST_STRATEGY.md](TEST_STRATEGY.md#test-summary).
 
 ## Conclusion
 
-**Current State**: Comprehensive Kafka-compatible broker with 26 APIs implemented
-**Coverage**: 52% of standard Kafka protocol (full producer/consumer/coordinator/admin/transaction/config support)
+**Current State**: Comprehensive Kafka-compatible broker with 28 APIs implemented
+**Coverage**: 56% of standard Kafka protocol (full producer/consumer/coordinator/admin/transaction/config support)
 **Architecture**: Clean, maintainable, well-documented with Repository Pattern
 **Test Status**: CI-gated; counts in [TEST_STRATEGY.md](TEST_STRATEGY.md#test-summary)
 

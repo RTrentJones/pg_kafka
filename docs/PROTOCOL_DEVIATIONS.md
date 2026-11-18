@@ -4,7 +4,7 @@ This document lists intentional deviations from the official Kafka protocol spec
 
 ## Summary
 
-`pg_kafka` implements a **subset** of the Kafka wire protocol (52% API coverage). The following deviations are intentional design decisions that optimize for PostgreSQL's strengths while maintaining compatibility with standard Kafka clients.
+`pg_kafka` implements a **subset** of the Kafka wire protocol (56% API coverage). The following deviations are intentional design decisions that optimize for PostgreSQL's strengths while maintaining compatibility with standard Kafka clients.
 
 | Category | Status |
 |----------|--------|
@@ -15,6 +15,7 @@ This document lists intentional deviations from the official Kafka protocol spec
 | **Config & Log APIs** | ✅ Minimal support (DescribeConfigs, IncrementalAlterConfigs for `retention.ms` only, DeleteRecords) |
 | **Transaction APIs** | ✅ Full support (EOS with read-committed isolation) |
 | **Shadow Mode** | ✅ Full support (external Kafka forwarding) |
+| **Security APIs** | ✅ SASL PLAIN / SCRAM-SHA-256 / SCRAM-SHA-512 and TLS listeners; **no ACLs** (see "Network Security Posture") |
 
 **Current Implementation:** Phase 11 Complete (Shadow Mode)
 
@@ -322,7 +323,7 @@ honored; producer CreateTime timestamps are preserved — BUG-7).
 
 ## API Version Support
 
-### Supported APIs (26 total)
+### Supported APIs (28 total)
 
 These ranges are both advertised in ApiVersions and enforced on inbound requests (each API's `MIN_VERSION`/`MAX_VERSION` in `src/kafka/api/`); a request above its range gets UNSUPPORTED_VERSION in the requested version (see "Error responses" above).
 
@@ -341,6 +342,7 @@ These ranges are both advertised in ApiVersions and enforced on inbound requests
 | 14 | SyncGroup | 0-4 | ✅ Full support |
 | 15 | DescribeGroups | 0-5 | ✅ Full support |
 | 16 | ListGroups | 0-4 | ✅ Full support |
+| 17 | SaslHandshake | 0-1 | ✅ Network thread; v0 is advertised (librdkafka requires it) but answered UNSUPPORTED_VERSION, see "Network Security Posture" |
 | 18 | ApiVersions | 0-3 | ✅ Full support |
 | 19 | CreateTopics | 2-5 | ✅ Supported (topic configs ignored, see §13) |
 | 20 | DeleteTopics | 1-4 | ✅ Full support |
@@ -351,6 +353,7 @@ These ranges are both advertised in ApiVersions and enforced on inbound requests
 | 26 | EndTxn | 0-3 | ✅ Full support |
 | 28 | TxnOffsetCommit | 0-3 | ✅ Full support |
 | 32 | DescribeConfigs | 1-4 | ✅ Minimal (TOPIC resources, see §13) |
+| 36 | SaslAuthenticate | 0-2 | ✅ PLAIN, SCRAM-SHA-256, SCRAM-SHA-512; `session_lifetime_ms` = 0 (no re-authentication) |
 | 37 | CreatePartitions | 0-2 | ✅ Full support |
 | 42 | DeleteGroups | 0-2 | ✅ Full support |
 | 44 | IncrementalAlterConfigs | 0-1 | ✅ Minimal (`retention.ms` only, see §13) |
@@ -417,7 +420,7 @@ response schema to answer in. An acks=0 Produce never gets a response.
 
 ### Notable Missing APIs
 
-- Security APIs (SaslHandshake/SaslAuthenticate, ACLs) - Not planned; use PostgreSQL auth + network controls
+- ACL APIs (DescribeAcls, CreateAcls, DeleteAcls) and SCRAM credential admin APIs (DescribeUserScramCredentials, AlterUserScramCredentials) - not implemented; users are managed with SQL functions (`docs/AUTHENTICATION.md`)
 - Broker-internal / admin-utility APIs (DescribeTransactions, ListTransactions, DescribeProducers) - Not planned (monitoring-only)
 - Log compaction - Not planned (PostgreSQL UPDATE provides similar semantics)
 
@@ -465,15 +468,31 @@ Shadow forwarding to an external Kafka cluster uses a durable outbox
 
 ## Network Security Posture (SEC-7)
 
-**Status:** Accepted by design, with a startup warning.
+**Status:** Authentication available (TLS, SASL); **authorization not implemented**. Full
+reference: [AUTHENTICATION.md](AUTHENTICATION.md).
 
-pg_kafka speaks the Kafka wire protocol with **no authentication or authorization** — there is no SaslHandshake/SaslAuthenticate negotiation and no ACL enforcement. Any client that can open a TCP connection to the listener can read and write any topic.
-
-- **Default bind is `127.0.0.1`** (`pg_kafka.host`), i.e. loopback only, so an out-of-the-box install is not reachable from other machines. To serve remote clients set `pg_kafka.host` explicitly (e.g. `'0.0.0.0'` for all interfaces, or a specific address); the advertised broker address in Metadata/FindCoordinator is that host (`0.0.0.0` is advertised as `localhost`).
-- **Mitigation (required for non-loopback binds):** restrict access at the network layer — firewall / cloud security group / private subnet — and rely on PostgreSQL's own authentication for the control plane.
-- **Loud by default:** when the listener binds to a non-loopback interface, pg_kafka emits a startup `WARNING` (see `bind_is_publicly_exposed` in `config.rs` / the bind path in `worker.rs`) so the no-auth exposure is never silent.
-
-Wire-level SASL/ACLs are **not planned**; the accepted posture is network-control + PostgreSQL auth.
+- **Default:** one PLAINTEXT listener on `127.0.0.1:9092` (`pg_kafka.host`, `pg_kafka.port`,
+  `pg_kafka.security_protocol = 'PLAINTEXT'`) with no authentication, exactly as before. Any
+  client that can open a TCP connection to a PLAINTEXT listener can read and write any topic.
+- **Listener security protocols** as in Kafka: `PLAINTEXT`, `SSL`, `SASL_PLAINTEXT`, `SASL_SSL`,
+  for the primary listener and for any `pg_kafka.additional_listeners`
+  (`'SASL_SSL://0.0.0.0:9093,...'`). Each listener advertises its own address in
+  Metadata/FindCoordinator. TLS is rustls; mutual TLS when `pg_kafka.ssl_ca_file` is set.
+- **SASL:** PLAIN, SCRAM-SHA-256, SCRAM-SHA-512 (`pg_kafka.sasl_enabled_mechanisms`), checked
+  against salted SCRAM verifiers in `kafka.sasl_credentials`. GSSAPI and OAUTHBEARER are not
+  supported.
+- **No ACLs.** An authenticated principal may do everything, like any client of a PLAINTEXT
+  listener. The principal (`User:<name>`, the client-certificate subject, or `User:ANONYMOUS`) is
+  recorded per connection and logged, so ACLs can be added later; nothing checks it yet.
+- **Deviations from Kafka's authenticator:** SaslHandshake v0 (raw tokens after the handshake)
+  is advertised but answered UNSUPPORTED_VERSION; sessions are never re-authenticated (KIP-368, `session_lifetime_ms = 0`), and
+  dropping a user does not close its open connections; SCRAM ignores SASLprep (as Kafka does),
+  rejects channel binding and delegation tokens; users are managed with SQL functions
+  (`pg_kafka_create_user` etc.) rather than AlterUserScramCredentials; listener settings apply
+  when the worker restarts, not on reload.
+- **Loud by default:** the worker logs a startup `WARNING` for every listener bound to a
+  non-loopback address that does not authenticate clients (PLAINTEXT, or SSL without a client
+  CA), and for SASL/PLAIN offered on an exposed SASL_PLAINTEXT listener.
 
 ## Compatibility Testing
 

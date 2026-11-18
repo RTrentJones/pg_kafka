@@ -8,7 +8,10 @@ license = "MIT"
 
 [dependencies]
 # Kafka client for E2E testing
-rdkafka = { version = "0.36", features = ["cmake-build", "zstd"] }
+# "ssl" (system OpenSSL, libssl-dev) gives librdkafka TLS and its built-in SASL
+# PLAIN / SCRAM-SHA-256 / SCRAM-SHA-512 for the auth E2E tests; no libsasl2 is needed
+# (that is only for GSSAPI).
+rdkafka = { version = "0.36", features = ["cmake-build", "ssl", "zstd"] }
 
 # Async utilities for parallel execution
 futures = "0.3"
@@ -30,6 +33,9 @@ crc32c = "0.6"
 
 # Database client for verification
 tokio-postgres = "0.7.15"
+# Client-side SCRAM verifier (libpq format) for the auth E2E tests; already a
+# dependency of tokio-postgres.
+postgres-protocol = "0.6"
 
 # CLI argument parsing
 clap = { version = "4", features = ["derive"] }
