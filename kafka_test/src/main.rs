@@ -285,6 +285,7 @@ use kafka_test::{
     test_session_timeout_rebalance,
     test_single_partition_topic,
     test_special_character_key_routing,
+    test_sync_forward_skips_rolled_back_request,
     test_timed_out_transaction_cannot_be_resumed,
     test_topic_name_mapping,
     test_transaction_boundary_isolation,
@@ -1786,6 +1787,13 @@ fn get_all_tests() -> Vec<TestDef> {
             category: "shadow",
             name: "test_replay_skips_aborted_records",
             test_fn: wrap_test!(test_replay_skips_aborted_records),
+            parallel_safe: false,
+        },
+        // Sync forwarding happens only after the local commit
+        TestDef {
+            category: "shadow",
+            name: "test_sync_forward_skips_rolled_back_request",
+            test_fn: wrap_test!(test_sync_forward_skips_rolled_back_request),
             parallel_safe: false,
         },
         // ==================== METADATA API TESTS (Phase 4) ====================

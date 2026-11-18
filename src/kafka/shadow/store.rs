@@ -7,12 +7,6 @@
 //
 // GitHub Sponsors: https://github.com/sponsors/RTrentJones
 
-// Much of this file is SPI code compiled out of the cfg(test) build; under
-// `clippy --all-targets` that leaves its imports, structs, and constants
-// "unused" in the test target only. Allow those two lints for test builds
-// rather than annotating every SPI-adjacent item.
-#![cfg_attr(test, allow(dead_code, unused_imports))]
-
 //! ShadowStore - KafkaStore wrapper with shadow forwarding
 //!
 //! This module provides a KafkaStore implementation that wraps another store
@@ -50,10 +44,18 @@
 //! it is durable:
 //!
 //! - **Async**: the poll forwards the row after commit (non-blocking produce).
-//! - **Sync (bounded)**: the produce additionally waits up to a short cap for
-//!   the ack before returning. On timeout it returns anyway — the row stays
-//!   durable and the poll retries it. This replaces the old unbounded
-//!   `block_on`, which could stall every client for minutes (SH-14).
+//! - **Sync (bounded)**: after the request's transaction commits, and before
+//!   its response is released, the worker calls `forward_sync_after_commit`,
+//!   which forwards the request's rows and waits up to a short cap for their
+//!   acks. On timeout the response goes out anyway — the row stays durable and
+//!   the poll retries it (SH-14). Forwarding only after commit means a request
+//!   that rolls back never leaves a copy on the external broker.
+//!
+//! ## Database access
+//!
+//! Every SQL statement and GUC read goes through the [`ShadowDb`] trait
+//! (`super::outbox`): `SpiShadowDb` in production, an in-memory fake in unit
+//! tests, so the outbox logic in this file is unit-tested.
 //!
 //! ## Thread Safety
 //!
@@ -63,6 +65,7 @@
 use super::config::{ShadowConfig, SyncMode, TopicConfigCache, TopicShadowConfig, WriteMode};
 use super::forwarder::ForwardDecision;
 use super::license::LicenseValidator;
+use super::outbox::{OutboxClaim, PendingForwardRecord, ShadowDb, SpiShadowDb};
 use super::primary::PrimaryStatus;
 use super::producer::ShadowProducer;
 use super::routing::make_forward_decision;
@@ -77,24 +80,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-/// A committed transactional record's outbox pointer.
-///
-/// Buffered during `insert_transactional_records()` and enqueued into the
-/// durable `kafka.shadow_tracking` outbox when `commit_transaction()` is called
-/// (RA-1/RA-2). Only the row key + record key are needed — the payload is
-/// re-read from `kafka.messages` by the forwarder, exactly like a non-txn
-/// produce, so the buffer no longer carries the value/headers/timestamp.
-#[derive(Clone, Debug)]
-struct PendingForwardRecord {
-    /// Topic ID (outbox row key + per-topic config lookup)
-    topic_id: i32,
-    /// Partition ID (outbox row key)
-    partition_id: i32,
-    /// Local offset the record was committed at (outbox row key)
-    offset: i64,
-    /// Record key — used only for percentage routing at enqueue time
-    key: Option<Vec<u8>>,
-}
+// A committed transactional record's outbox pointer (`PendingForwardRecord`,
+// defined in `super::outbox`) is buffered during `insert_transactional_records()`
+// and enqueued into the durable `kafka.shadow_tracking` outbox when
+// `commit_transaction()` is called (RA-1/RA-2). Only the row key + record key are
+// needed — the payload is re-read from `kafka.messages` by the forwarder.
 
 /// Key for pending transaction messages: (producer_id, producer_epoch)
 type TxnKey = (i64, i16);
@@ -188,8 +178,8 @@ const MAX_FORWARD_RETRIES: i64 = 10;
 /// forwarder crash) and lease-based retry must resume to stay at-least-once.
 const INFLIGHT_EVICT_AFTER: Duration = Duration::from_secs(150);
 
-/// Upper bound a bounded-sync produce waits for external confirmation before
-/// returning anyway. The outbox row stays durable and the poll retries it, so
+/// Upper bound one `forward_sync_after_commit` call waits for external
+/// confirmation before returning anyway. The outbox row stays durable and the poll retries it, so
 /// this is a latency cap, never a correctness boundary (SH-14). Kept short
 /// because the wait holds the single DB thread; a healthy broker acks in
 /// milliseconds, and a slow one just degrades sync toward the async poll.
@@ -212,9 +202,11 @@ const PRODUCER_HEALTH_TTL: Duration = Duration::from_secs(30);
 ///
 /// The producer is lazily initialized on first use when shadow mode is enabled.
 /// This allows enabling/disabling shadow mode at runtime via GUC changes.
-pub struct ShadowStore<S: KafkaStore> {
+pub struct ShadowStore<S: KafkaStore, D: ShadowDb = SpiShadowDb> {
     /// The wrapped inner store
     inner: S,
+    /// Shadow mode's own SQL and GUC reads (outbox, config, dead letters)
+    db: D,
     /// Producer for sending to external Kafka (lazily initialized)
     producer: RwLock<Option<Arc<ShadowProducer>>>,
     /// Bootstrap servers used to create the cached producer (for change detection)
@@ -243,28 +235,33 @@ pub struct ShadowStore<S: KafkaStore> {
     /// of re-sent, so a slow ack no longer produces a duplicate delivery
     /// (issue #93).
     inflight: super::inflight::InflightTracker,
-    /// Acks for *other* rows that a sync-mode produce drained while waiting for its
-    /// own. Applying them inside that produce's subtransaction lost them whenever the
-    /// request rolled back (the ack was already consumed from the channel), leaving
-    /// delivered rows pending: duplicate deliveries and, eventually, false dead
-    /// letters. They are applied by `drain_forward_acks` in its own subtransaction.
+    /// Acks that the post-commit sync wait (`forward_sync_after_commit`) read off
+    /// the channel. No transaction is open there, and applying an ack inside a
+    /// request's subtransaction would lose it if the request rolled back (it was
+    /// already consumed from the channel): delivered rows left pending, re-sent,
+    /// and eventually falsely dead-lettered. They are applied by
+    /// `drain_forward_acks` in its own subtransaction.
     deferred_acks: Mutex<Vec<ForwardAck>>,
-    /// Deadline shared by every sync-mode forward of the current request, so a
-    /// produce to many partitions waits at most `SYNC_FORWARD_WAIT_MS` in total
-    /// rather than per partition (the wait blocks the single DB thread). Reset by
-    /// `begin_request`.
-    sync_budget_deadline: Mutex<Option<Instant>>,
+    /// Sync-mode forwards written by requests whose commit has not been seen
+    /// yet, each tagged with the xid of the subtransaction that wrote its
+    /// outbox row. Sent by `forward_sync_after_commit` only if that xid
+    /// committed.
+    sync_pending: Mutex<Vec<SyncForward>>,
 }
 
-impl<S: KafkaStore> ShadowStore<S> {
-    /// Called by the worker before each request: starts a new sync-forward budget.
-    pub fn begin_request(&self) {
-        *self
-            .sync_budget_deadline
-            .lock()
-            .unwrap_or_else(|p| p.into_inner()) = None;
-    }
+/// One sync-mode forward waiting for its request's commit.
+struct SyncForward {
+    /// Xid of the (sub)transaction that wrote the outbox row.
+    xid: u32,
+    request: ForwardRequest,
+}
 
+/// Cap on `sync_pending`. Entries beyond it are dropped (their outbox rows are
+/// durable and the poll forwards them), so a worker that never calls
+/// `forward_sync_after_commit` degrades sync to async instead of leaking.
+const SYNC_PENDING_CAP: usize = 10_000;
+
+impl<S: KafkaStore> ShadowStore<S> {
     /// Create a new ShadowStore wrapping the given inner store
     ///
     /// The producer is NOT created here - it's lazily initialized on first use
@@ -274,8 +271,22 @@ impl<S: KafkaStore> ShadowStore<S> {
     /// # Arguments
     /// * `inner` - The store to wrap (typically PostgresStore)
     pub fn new(inner: S) -> Self {
+        Self::with_db(inner, SpiShadowDb)
+    }
+}
+
+impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
+    /// Called by the worker before each request. Nothing to reset any more: the
+    /// sync wait moved to `forward_sync_after_commit`, which has one budget per
+    /// call. Kept so the worker call site need not change; it can be removed
+    /// together with that call.
+    pub fn begin_request(&self) {}
+
+    /// Create a ShadowStore over `inner` whose own SQL goes through `db`.
+    pub fn with_db(inner: S, db: D) -> Self {
         Self {
             inner,
+            db,
             producer: RwLock::new(None),
             producer_bootstrap_servers: RwLock::new(None),
             producer_health_checked_at: Mutex::new(None),
@@ -288,21 +299,14 @@ impl<S: KafkaStore> ShadowStore<S> {
             license: RwLock::new(None),
             inflight: super::inflight::InflightTracker::new(INFLIGHT_EVICT_AFTER),
             deferred_acks: Mutex::new(Vec::new()),
-            sync_budget_deadline: Mutex::new(None),
+            sync_pending: Mutex::new(Vec::new()),
         }
     }
 
-    /// Create a new ShadowStore with RuntimeContext for config access
-    ///
-    /// Note: RuntimeContext is no longer used for shadow producer config.
-    /// The producer now loads config directly from GUCs to detect changes.
-    /// This constructor is kept for API compatibility but simply calls new().
-    ///
-    /// # Arguments
-    /// * `inner` - The store to wrap (typically PostgresStore)
-    /// * `_runtime_context` - Unused (kept for API compatibility)
-    pub fn with_context(inner: S, _runtime_context: Arc<crate::kafka::RuntimeContext>) -> Self {
-        Self::new(inner)
+    /// The database backend (tests inspect the fake through this).
+    #[cfg(test)]
+    pub(crate) fn db(&self) -> &D {
+        &self.db
     }
 
     /// Set the forward channel for async forwarding
@@ -411,7 +415,7 @@ impl<S: KafkaStore> ShadowStore<S> {
         if !self.is_external_primary(topic_id) {
             return false;
         }
-        if crate::config::SHADOW_EXTERNAL_PRIMARY_STRICT.get() {
+        if self.db.external_primary_strict() {
             return true;
         }
         !self.topic_has_dead_letters(topic_id)
@@ -420,18 +424,9 @@ impl<S: KafkaStore> ShadowStore<S> {
     /// True if the topic has a forward that exhausted the retry cap and will never be
     /// delivered externally (`external_offset` still NULL, `retry_count >= cap`).
     fn topic_has_dead_letters(&self, topic_id: i32) -> bool {
-        use pgrx::prelude::*;
-        let result: Result<bool> = Spi::connect(|client| {
-            let table = client.select(
-                "SELECT 1 FROM kafka.shadow_tracking \
-                 WHERE topic_id = $1 AND external_offset IS NULL AND retry_count >= $2 \
-                 LIMIT 1",
-                Some(1),
-                &[topic_id.into(), MAX_FORWARD_RETRIES.into()],
-            )?;
-            Ok(!table.is_empty())
-        });
-        result.unwrap_or(false)
+        self.db
+            .topic_has_dead_letters(topic_id, MAX_FORWARD_RETRIES)
+            .unwrap_or(false)
     }
 
     /// Force a re-check of primary status (SH-2).
@@ -490,15 +485,8 @@ impl<S: KafkaStore> ShadowStore<S> {
     }
 
     /// Check if shadow mode is enabled globally by reading the GUC directly
-    #[cfg(not(test))]
     fn is_enabled(&self) -> bool {
-        crate::config::SHADOW_MODE_ENABLED.get()
-    }
-
-    /// Test version - always returns false unless overridden
-    #[cfg(test)]
-    fn is_enabled(&self) -> bool {
-        false
+        self.db.shadow_mode_enabled()
     }
 
     /// Ensure the producer is initialized, creating it if necessary
@@ -687,7 +675,6 @@ impl<S: KafkaStore> ShadowStore<S> {
     /// Try to hand a forward request to the network thread. Returns false if no
     /// channel is wired up or it is momentarily full (the caller leaves the row
     /// pending for the next poll). Never blocks.
-    #[cfg(not(test))]
     fn try_send_forward(&self, req: ForwardRequest) -> bool {
         let guard = self.forward_tx.read().unwrap_or_else(|poisoned| {
             tracing::warn!("forward_tx read lock was poisoned, recovering");
@@ -698,7 +685,6 @@ impl<S: KafkaStore> ShadowStore<S> {
 
     /// Receive a single forward ack, waiting up to `timeout`. Returns None on
     /// timeout or if no ack channel is installed.
-    #[cfg(not(test))]
     fn recv_ack_timeout(&self, timeout: Duration) -> Option<ForwardAck> {
         let guard = self.forward_ack_rx.read().unwrap_or_else(|poisoned| {
             tracing::warn!("forward_ack_rx read lock was poisoned, recovering");
@@ -713,35 +699,8 @@ impl<S: KafkaStore> ShadowStore<S> {
     /// Insert a batch of pending `(topic_id, partition_id, local_offset)` rows
     /// into the `kafka.shadow_tracking` outbox in the current transaction. The
     /// shared write path for both the live produce and the txn-commit enqueue.
-    #[cfg(not(test))]
     fn insert_outbox_rows(&self, rows: &[(i32, i32, i64)]) -> Result<()> {
-        use pgrx::prelude::*;
-        Spi::connect_mut(|client| {
-            for &(topic_id, partition_id, local_offset) in rows {
-                // B1: only enqueue an outbox pointer when the backing
-                // kafka.messages row actually exists. The live-produce enqueue
-                // runs in the same subtransaction as the message insert, so the
-                // row is always visible and this is a no-op there. On the txn
-                // commit path it drops orphan pointers left by a transactional
-                // produce that buffered offsets in RAM but whose message rows were
-                // rolled back (a panic mid-txn) — which would otherwise be
-                // never-claimed, never-cleaned rows. Symmetric with the poll's own
-                // EXISTS guard in poll_and_forward_outbox.
-                client.update(
-                    "INSERT INTO kafka.shadow_tracking (topic_id, partition_id, local_offset) \
-                     SELECT $1, $2, $3 \
-                     WHERE EXISTS ( \
-                     SELECT 1 FROM kafka.messages m \
-                     WHERE m.topic_id = $1 AND m.partition_id = $2 \
-                     AND m.partition_offset = $3 \
-                     ) \
-                     ON CONFLICT (topic_id, partition_id, local_offset) DO NOTHING",
-                    None,
-                    &[topic_id.into(), partition_id.into(), local_offset.into()],
-                )?;
-            }
-            Ok(())
-        })
+        self.db.insert_outbox_rows(rows)
     }
 
     /// Enqueue the records of a just-committed transaction into the durable
@@ -756,7 +715,6 @@ impl<S: KafkaStore> ShadowStore<S> {
     /// producer — non-blocking, at-least-once, re-partitioned by key, and
     /// (crucially for external-primary topics, whose local reads are suppressed)
     /// durably retried instead of best-effort-and-dropped.
-    #[cfg(not(test))]
     fn enqueue_committed_txn_outbox(&self, records: &[PendingForwardRecord]) {
         if records.is_empty() {
             return;
@@ -791,60 +749,6 @@ impl<S: KafkaStore> ShadowStore<S> {
         }
     }
 
-    /// The pending (uncommitted) records of `(producer_id, producer_epoch)`'s
-    /// transaction, read from `kafka.messages`. `None` if the lookup failed (the
-    /// caller then falls back to the in-RAM buffer).
-    #[cfg(not(test))]
-    fn pending_txn_records(
-        &self,
-        producer_id: i64,
-        producer_epoch: i16,
-    ) -> Option<Vec<PendingForwardRecord>> {
-        use pgrx::prelude::*;
-        let result: std::result::Result<Vec<PendingForwardRecord>, pgrx::spi::SpiError> =
-            Spi::connect(|client| {
-                let table = client.select(
-                    "SELECT topic_id, partition_id, partition_offset, key
-                     FROM kafka.messages
-                     WHERE producer_id = $1 AND producer_epoch = $2 AND txn_state = 'pending'
-                     ORDER BY topic_id, partition_id, partition_offset",
-                    None,
-                    &[producer_id.into(), producer_epoch.into()],
-                )?;
-                let mut records = Vec::new();
-                for row in table {
-                    records.push(PendingForwardRecord {
-                        topic_id: row.get_by_name("topic_id")?.unwrap_or(0),
-                        partition_id: row.get_by_name("partition_id")?.unwrap_or(0),
-                        offset: row.get_by_name("partition_offset")?.unwrap_or(0),
-                        key: row.get_by_name::<Vec<u8>, _>("key")?,
-                    });
-                }
-                Ok(records)
-            });
-        match result {
-            Ok(records) => Some(records),
-            Err(e) => {
-                tracing::warn!("Shadow: failed to read pending txn records: {:?}", e);
-                None
-            }
-        }
-    }
-
-    /// Test stub — see `pending_txn_records`.
-    #[cfg(test)]
-    fn pending_txn_records(
-        &self,
-        _producer_id: i64,
-        _producer_epoch: i16,
-    ) -> Option<Vec<PendingForwardRecord>> {
-        None
-    }
-
-    /// Test stub — see `enqueue_committed_txn_outbox`.
-    #[cfg(test)]
-    fn enqueue_committed_txn_outbox(&self, _records: &[PendingForwardRecord]) {}
-
     /// Write durable outbox rows for a freshly-produced batch (SH-9).
     ///
     /// For each record the percentage router selects (SH-8), insert a *pending*
@@ -852,8 +756,7 @@ impl<S: KafkaStore> ShadowStore<S> {
     /// the produce request's subtransaction), so the outbox is exactly
     /// consistent with what was persisted locally. No payload is copied — it
     /// already lives in `kafka.messages`. The periodic poll forwards async
-    /// topics; sync topics additionally wait (bounded) for confirmation here.
-    #[cfg(not(test))]
+    /// topics; sync topics are also queued for `forward_sync_after_commit`.
     fn enqueue_outbox(
         &self,
         topic_id: i32,
@@ -901,106 +804,93 @@ impl<S: KafkaStore> ShadowStore<S> {
         }
 
         // Async topics are forwarded by the periodic poll after commit. Sync
-        // topics wait (bounded) for external confirmation now (SH-14).
+        // topics are forwarded right after the commit, before the response is
+        // released (SH-14); nothing leaves for the external broker while the
+        // request can still roll back.
         if config.sync_mode == SyncMode::Sync {
-            self.forward_sync_bounded(
-                topic_id,
-                external_topic,
-                partition_id,
-                records,
-                base_offset,
-                &selected,
-            );
+            let xid = self.db.current_transaction_id();
+            let mut queue = self.sync_pending.lock().unwrap_or_else(|p| p.into_inner());
+            for &local_offset in &selected {
+                if queue.len() >= SYNC_PENDING_CAP {
+                    tracing::warn!(
+                        "Shadow: {} sync forwards awaiting commit; leaving the rest to the poll",
+                        queue.len()
+                    );
+                    break;
+                }
+                let Some(record) = records.get((local_offset - base_offset) as usize) else {
+                    continue;
+                };
+                queue.push(SyncForward {
+                    xid,
+                    request: ForwardRequest::new(
+                        topic_id,
+                        external_topic.to_string(),
+                        partition_id,
+                        record.key.clone(),
+                        record.value.clone(),
+                        local_offset,
+                    ),
+                });
+            }
         }
     }
 
-    /// Bounded-sync forward (SH-14): for a sync-mode produce, eagerly hand the
-    /// just-written outbox rows to the network thread and wait up to
-    /// `SYNC_FORWARD_WAIT_MS` for their acks, applying every ack we observe. On
-    /// timeout we return anyway — the rows are durable and the poll retries
-    /// them. This replaces the old `block_on`, so a down broker delays a single
-    /// produce by at most the cap instead of stalling every client forever.
-    #[cfg(not(test))]
-    fn forward_sync_bounded(
-        &self,
-        topic_id: i32,
-        external_topic: &str,
-        partition_id: i32,
-        records: &[Record],
-        base_offset: i64,
-        selected: &[i64],
-    ) {
-        let mut pending: std::collections::HashSet<i64> = selected.iter().copied().collect();
-
-        // Send a forward request for each selected record.
-        for &local_offset in selected {
-            let idx = (local_offset - base_offset) as usize;
-            let record = match records.get(idx) {
-                Some(r) => r,
-                None => {
-                    pending.remove(&local_offset);
-                    continue;
-                }
-            };
-            let req = ForwardRequest::new(
-                topic_id,
-                external_topic.to_string(),
-                partition_id,
-                record.key.clone(),
-                record.value.clone(),
-                local_offset,
-            );
-            // Issue #93: register the sync dispatch too, so an outbox poll
-            // that re-claims this row while the ack is still pending (ack
-            // slower than the retry lease) skips it instead of duplicating it.
-            let key = (topic_id, partition_id, local_offset);
-            if !self.inflight.try_begin(key) {
-                // Already in flight from an earlier dispatch — don't re-send.
-                pending.remove(&local_offset);
-                continue;
-            }
-            if !self.try_send_forward(req) {
-                // Could not enqueue — leave it for the poll, stop waiting on it.
-                self.inflight.complete(&key);
-                pending.remove(&local_offset);
-            }
-        }
-
-        if pending.is_empty() {
+    /// Bounded-sync forward (SH-14). The worker calls this after a request's
+    /// transaction has committed and before it releases the response.
+    ///
+    /// Forwards every queued sync-mode row whose writing subtransaction
+    /// committed (a row from a rolled-back request is dropped: its outbox row is
+    /// gone too, so nothing reaches the external broker), then waits up to
+    /// `SYNC_FORWARD_WAIT_MS` in total for their acks. On timeout it returns
+    /// anyway — the rows are durable and the poll retries them.
+    ///
+    /// No transaction is open here, so acks are not applied: every ack read is
+    /// queued for `drain_forward_acks`, which applies it in its own
+    /// subtransaction on the next outbox tick. The rows stay in flight until
+    /// then, so the poll does not re-send them.
+    pub fn forward_sync_after_commit(&self) {
+        let queued =
+            std::mem::take(&mut *self.sync_pending.lock().unwrap_or_else(|p| p.into_inner()));
+        if queued.is_empty() {
             return;
         }
 
-        // Wait (bounded) for acks. The bound is shared by the whole request (see
-        // sync_budget_deadline). Our own acks are applied now (their rows belong to
-        // this request); others are deferred to drain_forward_acks so a rollback of
-        // this request cannot lose them.
-        let deadline = *self
-            .sync_budget_deadline
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get_or_insert_with(|| Instant::now() + Duration::from_millis(SYNC_FORWARD_WAIT_MS));
-        loop {
+        let mut pending: std::collections::HashSet<(i32, i32, i64)> =
+            std::collections::HashSet::new();
+        for SyncForward { xid, request } in queued {
+            if !self.db.transaction_committed(xid) {
+                continue;
+            }
+            // Issue #93: register the sync dispatch too, so an outbox poll
+            // that re-claims this row while the ack is still pending (ack
+            // slower than the retry lease) skips it instead of duplicating it.
+            let key = (request.topic_id, request.partition_id, request.local_offset);
+            if !self.inflight.try_begin(key) {
+                // Already in flight from an earlier dispatch — don't re-send.
+                continue;
+            }
+            if !self.try_send_forward(request) {
+                // Could not enqueue — leave it for the poll, stop waiting on it.
+                self.inflight.complete(&key);
+                continue;
+            }
+            pending.insert(key);
+        }
+
+        let deadline = Instant::now() + Duration::from_millis(SYNC_FORWARD_WAIT_MS);
+        while !pending.is_empty() {
             let remaining = match deadline.checked_duration_since(Instant::now()) {
                 Some(r) if !r.is_zero() => r,
                 _ => break,
             };
             match self.recv_ack_timeout(remaining) {
                 Some(ack) => {
-                    let is_ours = ack.topic_id == topic_id
-                        && ack.partition_id == partition_id
-                        && pending.contains(&ack.local_offset);
-                    if !is_ours {
-                        self.deferred_acks
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .push(ack);
-                        continue;
-                    }
-                    self.apply_ack(&ack);
-                    pending.remove(&ack.local_offset);
-                    if pending.is_empty() {
-                        break;
-                    }
+                    pending.remove(&(ack.topic_id, ack.partition_id, ack.local_offset));
+                    self.deferred_acks
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .push(ack);
                 }
                 None => break, // timed out
             }
@@ -1012,10 +902,7 @@ impl<S: KafkaStore> ShadowStore<S> {
     /// NULL`) and was last attempted longer ago than the retry interval.
     /// Claiming sets `forwarded_at` so a row is not re-sent every tick while it
     /// is in flight. Returns the number of rows dispatched.
-    #[cfg(not(test))]
     pub fn poll_and_forward_outbox(&self) -> super::error::ShadowResult<usize> {
-        use pgrx::prelude::*;
-
         // Nothing to do if no forward channel is wired up yet.
         {
             let guard = self.forward_tx.read().unwrap_or_else(|poisoned| {
@@ -1034,95 +921,19 @@ impl<S: KafkaStore> ShadowStore<S> {
         // deliver duplicates to the external broker.
         let (inflight_topics, inflight_partitions, inflight_offsets) = self.inflight.live_keys();
 
-        let reqs: Vec<ForwardRequest> = Spi::connect_mut(|client| {
-            let table = client.update(
-                r#"
-                WITH due AS (
-                    SELECT st.topic_id, st.partition_id, st.local_offset
-                    FROM kafka.shadow_tracking st
-                    WHERE st.external_offset IS NULL
-                      AND st.retry_count < $3
-                      AND (st.forwarded_at IS NULL
-                           OR st.forwarded_at < NOW() - ($1 || ' milliseconds')::interval)
-                      AND NOT EXISTS (
-                          SELECT 1
-                          FROM unnest($4::int4[], $5::int4[], $6::int8[]) AS inf(t, p, o)
-                          WHERE inf.t = st.topic_id
-                            AND inf.p = st.partition_id
-                            AND inf.o = st.local_offset
-                      )
-                      AND EXISTS (
-                          SELECT 1 FROM kafka.messages m
-                          WHERE m.topic_id = st.topic_id
-                            AND m.partition_id = st.partition_id
-                            AND m.partition_offset = st.local_offset
-                      )
-                    ORDER BY st.topic_id, st.partition_id, st.local_offset
-                    LIMIT $2
-                ),
-                claimed AS (
-                    -- RV-10: count each claim as a delivery attempt. Previously
-                    -- retry_count was bumped only when a *failure* ack came back, so a
-                    -- forward whose ack was dropped (RA-6 backpressure drop) left
-                    -- retry_count unchanged and the row was re-claimed forever,
-                    -- bypassing the `retry_count < $3` cap (re-forward livelock).
-                    -- Bumping on claim bounds every re-forward loop — dropped or
-                    -- failed — to $3 attempts before the row is dead-lettered.
-                    UPDATE kafka.shadow_tracking st
-                    SET forwarded_at = NOW(), retry_count = st.retry_count + 1
-                    FROM due
-                    WHERE st.topic_id = due.topic_id
-                      AND st.partition_id = due.partition_id
-                      AND st.local_offset = due.local_offset
-                    RETURNING st.topic_id, st.partition_id, st.local_offset
-                )
-                SELECT c.topic_id    AS topic_id,
-                       c.partition_id AS partition_id,
-                       c.local_offset AS local_offset,
-                       m.key          AS msg_key,
-                       m.value        AS msg_value,
-                       COALESCE(sc.external_topic_name, t.name) AS external_topic
-                FROM claimed c
-                JOIN kafka.topics t ON t.id = c.topic_id
-                LEFT JOIN kafka.shadow_config sc ON sc.topic_id = c.topic_id
-                JOIN kafka.messages m
-                  ON m.topic_id = c.topic_id
-                 AND m.partition_id = c.partition_id
-                 AND m.partition_offset = c.local_offset
-                "#,
-                None,
-                &[
-                    OUTBOX_RETRY_INTERVAL_MS.into(),
-                    OUTBOX_BATCH_LIMIT.into(),
-                    MAX_FORWARD_RETRIES.into(),
-                    inflight_topics.into(),
-                    inflight_partitions.into(),
-                    inflight_offsets.into(),
-                ],
-            )?;
-
-            let mut reqs: Vec<ForwardRequest> = Vec::new();
-            for row in table {
-                let topic_id: i32 = row.get_by_name("topic_id")?.unwrap_or(0);
-                let partition_id: i32 = row.get_by_name("partition_id")?.unwrap_or(0);
-                let local_offset: i64 = row.get_by_name("local_offset")?.unwrap_or(0);
-                let key: Option<Vec<u8>> = row.get_by_name("msg_key")?;
-                let value: Option<Vec<u8>> = row.get_by_name("msg_value")?;
-                let external_topic: String = row.get_by_name("external_topic")?.unwrap_or_default();
-                reqs.push(ForwardRequest::new(
-                    topic_id,
-                    external_topic,
-                    partition_id,
-                    key,
-                    value,
-                    local_offset,
-                ));
-            }
-            Ok(reqs)
-        })
-        .map_err(|e: KafkaError| {
-            super::error::ShadowError::DatabaseError(format!("outbox poll failed: {}", e))
-        })?;
+        let reqs: Vec<ForwardRequest> = self
+            .db
+            .claim_due_outbox_rows(&OutboxClaim {
+                retry_interval_ms: OUTBOX_RETRY_INTERVAL_MS,
+                batch_limit: OUTBOX_BATCH_LIMIT,
+                max_retries: MAX_FORWARD_RETRIES,
+                inflight_topics,
+                inflight_partitions,
+                inflight_offsets,
+            })
+            .map_err(|e: KafkaError| {
+                super::error::ShadowError::DatabaseError(format!("outbox poll failed: {}", e))
+            })?;
 
         let mut dispatched = 0usize;
         for req in reqs {
@@ -1156,7 +967,6 @@ impl<S: KafkaStore> ShadowStore<S> {
     /// Drain all currently-available forward acks and finalize their outbox
     /// rows (SH-9). Non-blocking: stops as soon as the channel is empty. Returns
     /// the number of acks applied.
-    #[cfg(not(test))]
     pub fn drain_forward_acks(&self) -> usize {
         // Acks a sync-mode produce deferred, then whatever is on the channel.
         let mut acks: Vec<ForwardAck> =
@@ -1187,10 +997,7 @@ impl<S: KafkaStore> ShadowStore<S> {
     /// (RV-10: `retry_count` is bumped on claim in `poll_and_forward_outbox`, not
     /// here, so a dropped ack still counts against the cap). The forward metric is
     /// counted exactly once, here, on a confirmed delivery (SH-7).
-    #[cfg(not(test))]
     fn apply_ack(&self, ack: &ForwardAck) {
-        use pgrx::prelude::*;
-
         // Issue #93: the forward has resolved (success or failure), so the row
         // may be dispatched again by a future lease-expiry re-claim. Cleared
         // unconditionally — sync-path acks for rows never registered are a
@@ -1199,80 +1006,25 @@ impl<S: KafkaStore> ShadowStore<S> {
             .complete(&(ack.topic_id, ack.partition_id, ack.local_offset));
 
         // SH-7: the metric is bumped in the SAME statement that flips the row,
-        // guarded by `external_offset IS NULL`, so a duplicate ack (e.g. a sync
-        // send and a poll resend both confirming) updates nothing and counts
-        // nothing — exactly-once per row.
-        // Each statement appends `RETURNING 1` so we learn whether the row
-        // actually transitioned (`external_offset IS NULL` matched). A duplicate
-        // ack updates nothing and returns no rows, so the in-RAM mirror below is
-        // bumped exactly once too (RA-6), matching the persistent table.
-        let result: Result<bool> = Spi::connect_mut(|client| {
-            let transitioned = match &ack.result {
-                Ok(external_offset) => {
-                    let table = client.update(
-                        "WITH done AS ( \
-                             UPDATE kafka.shadow_tracking \
-                             SET external_offset = $4, forwarded_at = NOW(), error_message = NULL \
-                             WHERE topic_id = $1 AND partition_id = $2 AND local_offset = $3 \
-                               AND external_offset IS NULL \
-                             RETURNING topic_id, partition_id, local_offset \
-                         ), \
-                         bumped AS ( \
-                             INSERT INTO kafka.shadow_metrics \
-                                 (topic_id, partition_id, messages_forwarded, last_forwarded_offset, last_forwarded_at) \
-                             SELECT topic_id, partition_id, 1, local_offset, NOW() FROM done \
-                             ON CONFLICT (topic_id, partition_id) DO UPDATE SET \
-                                messages_forwarded = kafka.shadow_metrics.messages_forwarded + 1, \
-                                last_forwarded_offset = GREATEST(kafka.shadow_metrics.last_forwarded_offset, EXCLUDED.last_forwarded_offset), \
-                                last_forwarded_at = NOW() \
-                         ) \
-                         SELECT 1 FROM done",
-                        None,
-                        &[
-                            ack.topic_id.into(),
-                            ack.partition_id.into(),
-                            ack.local_offset.into(),
-                            (*external_offset).into(),
-                        ],
-                    )?;
-                    table.into_iter().count() > 0
-                }
-                Err(msg) => {
-                    let table = client.update(
-                        // RV-10: retry_count is now bumped on claim (see
-                        // poll_and_forward_outbox), so the failure ack only records the
-                        // error — incrementing here too would double-count and halve the
-                        // effective retry budget. RETURNING retry_count still reports the
-                        // claim-bumped value for the dead-letter check below.
-                        "WITH failed AS ( \
-                             UPDATE kafka.shadow_tracking \
-                             SET error_message = $4 \
-                             WHERE topic_id = $1 AND partition_id = $2 AND local_offset = $3 \
-                               AND external_offset IS NULL \
-                             RETURNING topic_id, partition_id, retry_count \
-                         ), \
-                         bumped AS ( \
-                             INSERT INTO kafka.shadow_metrics (topic_id, partition_id, messages_failed) \
-                             SELECT topic_id, partition_id, 1 FROM failed \
-                             ON CONFLICT (topic_id, partition_id) DO UPDATE SET \
-                                messages_failed = kafka.shadow_metrics.messages_failed + 1 \
-                         ) \
-                         SELECT retry_count FROM failed",
-                        None,
-                        &[
-                            ack.topic_id.into(),
-                            ack.partition_id.into(),
-                            ack.local_offset.into(),
-                            msg.clone().into(),
-                        ],
-                    )?;
-                    let mut transitioned = false;
-                    for row in table {
-                        transitioned = true;
-                        let retry_count: i32 = row.get_by_name("retry_count")?.unwrap_or(0);
-                        // RV-6: at the retry cap the poll stops retrying this row (it is
-                        // dead-lettered). For an external-primary topic the record then
-                        // falls back to local reads unless strict — log loudly.
+        // guarded by `external_offset IS NULL`, so a duplicate ack updates
+        // nothing and counts nothing — exactly-once per row. Each statement
+        // reports whether the row actually transitioned, so the in-RAM mirror
+        // below is bumped exactly once too (RA-6), matching the persistent table.
+        let result: Result<bool> = match &ack.result {
+            Ok(external_offset) => self.db.mark_forward_succeeded(
+                ack.topic_id,
+                ack.partition_id,
+                ack.local_offset,
+                *external_offset,
+            ),
+            Err(msg) => self
+                .db
+                .mark_forward_failed(ack.topic_id, ack.partition_id, ack.local_offset, msg)
+                .map(|retry_count| match retry_count {
+                    Some(retry_count) => {
+                        // RV-6: at the retry cap the poll stops retrying this row (it
+                        // is dead-lettered). For an external-primary topic the record
+                        // then falls back to local reads unless strict — log loudly.
                         if retry_count as i64 >= MAX_FORWARD_RETRIES {
                             tracing::warn!(
                                 "shadow forward dead-lettered after {} attempts (topic_id={}, partition_id={}, local_offset={}): {} — external-primary reads for this topic fall back to local unless pg_kafka.shadow_external_primary_strict is set",
@@ -1283,12 +1035,11 @@ impl<S: KafkaStore> ShadowStore<S> {
                                 msg
                             );
                         }
+                        true
                     }
-                    transitioned
-                }
-            };
-            Ok(transitioned)
-        });
+                    None => false,
+                }),
+        };
 
         let transitioned = match result {
             Ok(t) => t,
@@ -1315,125 +1066,40 @@ impl<S: KafkaStore> ShadowStore<S> {
         }
     }
 
-    /// Test stub — the outbox is SPI-backed and exercised by the shadow E2E.
-    #[cfg(test)]
-    fn enqueue_outbox(
-        &self,
-        _topic_id: i32,
-        _partition_id: i32,
-        _records: &[Record],
-        _base_offset: i64,
-        _config: &TopicShadowConfig,
-    ) {
-    }
-
-    /// Test stub — see `poll_and_forward_outbox`.
-    #[cfg(test)]
-    pub fn poll_and_forward_outbox(&self) -> super::error::ShadowResult<usize> {
-        Ok(0)
-    }
-
-    /// Test stub — see `drain_forward_acks`.
-    #[cfg(test)]
-    pub fn drain_forward_acks(&self) -> usize {
-        0
-    }
-
     /// Load topic shadow configurations from database
     ///
     /// Queries kafka.shadow_config and populates the topic_cache.
     /// Call this on startup and periodically to refresh config.
-    #[cfg(not(test))]
     pub fn load_topic_config_from_db(&self) -> super::error::ShadowResult<usize> {
-        use super::config::{ShadowMode, SyncMode};
-        use pgrx::prelude::*;
-
-        let query = r#"
-            SELECT sc.topic_id, t.name, sc.mode, sc.forward_percentage,
-                   sc.external_topic_name, sc.sync_mode,
-                   COALESCE(sc.write_mode, 'dual_write') as write_mode
-            FROM kafka.shadow_config sc
-            JOIN kafka.topics t ON sc.topic_id = t.id
-        "#;
-
         // Collect into a local vec first and only swap the cache once the query
         // has succeeded (SH-3). The cache must be *replaced*, not merely
         // updated: a topic whose row was deleted from kafka.shadow_config would
         // otherwise linger in the cache (and keep forwarding) forever. But a
         // transient query failure must NOT wipe a working cache, so we clear
         // only on the success path.
-        let mut new_configs: Vec<TopicShadowConfig> = Vec::new();
-        let mut query_ok = false;
-
-        Spi::connect(|client| {
-            let result = client.select(query, None, &[]);
-
-            if let Ok(table) = result {
-                query_ok = true;
-                for row in table {
-                    // Use named columns for clarity and safety
-                    let topic_id: i32 = row.get_by_name("topic_id").unwrap_or(Some(0)).unwrap_or(0);
-                    let topic_name: String = row
-                        .get_by_name("name")
-                        .unwrap_or(Some(String::new()))
-                        .unwrap_or_default();
-                    let mode_str: String = row
-                        .get_by_name("mode")
-                        .unwrap_or(Some("local_only".to_string()))
-                        .unwrap_or_default();
-                    let forward_percentage: i32 = row
-                        .get_by_name("forward_percentage")
-                        .unwrap_or(Some(0))
-                        .unwrap_or(0);
-                    let external_topic_name: Option<String> =
-                        row.get_by_name("external_topic_name").unwrap_or(None);
-                    let sync_mode_str: String = row
-                        .get_by_name("sync_mode")
-                        .unwrap_or(Some("sync".to_string()))
-                        .unwrap_or_default();
-                    let write_mode_str: String = row
-                        .get_by_name("write_mode")
-                        .unwrap_or(Some("dual_write".to_string()))
-                        .unwrap_or_default();
-
-                    let mut config = TopicShadowConfig {
-                        topic_id,
-                        topic_name: topic_name.clone(),
-                        mode: ShadowMode::parse(&mode_str),
-                        forward_percentage: forward_percentage.clamp(0, 100) as u8,
-                        external_topic_name,
-                        sync_mode: SyncMode::parse(&sync_mode_str),
-                        write_mode: WriteMode::parse(&write_mode_str),
-                    };
-
-                    // SH-6 guard: an external-primary topic suppresses local
-                    // reads, so a record sampled out by forward_percentage would
-                    // be readable nowhere — neither locally (suppressed) nor
-                    // externally (not forwarded). Force 100% so every record is
-                    // forwarded; the percentage dial is meaningless here.
-                    if config.write_mode == WriteMode::ExternalOnly
-                        && config.forward_percentage != 100
-                    {
-                        tracing::warn!(
-                            "Shadow: topic '{}' is external-primary (ExternalOnly) but \
-                             forward_percentage={}; forcing 100% to avoid unreadable records",
-                            config.topic_name,
-                            config.forward_percentage
-                        );
-                        config.forward_percentage = 100;
-                    }
-
-                    new_configs.push(config);
-                }
-            }
-        });
-
-        // Only replace the cache when the query actually ran. On failure, keep
-        // whatever was loaded previously rather than serving an empty config.
-        if !query_ok {
+        let Some(mut new_configs) = self.db.load_topic_configs() else {
+            // Only replace the cache when the query actually ran. On failure, keep
+            // whatever was loaded previously rather than serving an empty config.
             return Err(super::error::ShadowError::DatabaseError(
                 "failed to query kafka.shadow_config".to_string(),
             ));
+        };
+
+        for config in &mut new_configs {
+            // SH-6 guard: an external-primary topic suppresses local
+            // reads, so a record sampled out by forward_percentage would
+            // be readable nowhere — neither locally (suppressed) nor
+            // externally (not forwarded). Force 100% so every record is
+            // forwarded; the percentage dial is meaningless here.
+            if config.write_mode == WriteMode::ExternalOnly && config.forward_percentage != 100 {
+                tracing::warn!(
+                    "Shadow: topic '{}' is external-primary (ExternalOnly) but \
+                     forward_percentage={}; forcing 100% to avoid unreadable records",
+                    config.topic_name,
+                    config.forward_percentage
+                );
+                config.forward_percentage = 100;
+            }
         }
 
         let count = new_configs.len();
@@ -1445,16 +1111,9 @@ impl<S: KafkaStore> ShadowStore<S> {
         Ok(count)
     }
 
-    /// Test version - no-op
-    #[cfg(test)]
-    pub fn load_topic_config_from_db(&self) -> super::error::ShadowResult<usize> {
-        Ok(0)
-    }
-
     /// Flush accumulated metrics to logs
     ///
     /// Logs metrics summary and resets counters. Call periodically from the worker loop.
-    #[cfg(not(test))]
     pub fn flush_metrics_to_db(&self) -> super::error::ShadowResult<()> {
         let (forwarded, skipped, failed, fallback_local) = self.metrics.snapshot();
 
@@ -1479,19 +1138,9 @@ impl<S: KafkaStore> ShadowStore<S> {
 
         Ok(())
     }
-
-    /// Test version - just reset counters
-    #[cfg(test)]
-    pub fn flush_metrics_to_db(&self) -> super::error::ShadowResult<()> {
-        self.metrics.forwarded.store(0, Ordering::Relaxed);
-        self.metrics.skipped.store(0, Ordering::Relaxed);
-        self.metrics.failed.store(0, Ordering::Relaxed);
-        self.metrics.fallback_local.store(0, Ordering::Relaxed);
-        Ok(())
-    }
 }
 
-impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
+impl<S: KafkaStore, D: ShadowDb> KafkaStore for ShadowStore<S, D> {
     // ===== Topic Operations =====
 
     fn get_or_create_topic(&self, name: &str, default_partitions: i32) -> Result<(i32, i32)> {
@@ -1914,7 +1563,8 @@ impl<S: KafkaStore> KafkaStore for ShadowStore<S> {
         // while forwarding was off must not be queued (and later forwarded) here.
         let forwarding = self.is_enabled() && self.is_primary();
         let records = if forwarding {
-            self.pending_txn_records(producer_id, producer_epoch)
+            self.db
+                .pending_txn_records(producer_id, producer_epoch)
                 .unwrap_or_else(|| pending_records.map(|buf| buf.records).unwrap_or_default())
         } else {
             Vec::new()
@@ -2279,6 +1929,7 @@ mod tests {
 
     // ===== Transaction finalization and ExternalOnly fallback tests =====
 
+    use crate::kafka::shadow::outbox::fake::InMemoryShadowDb;
     use crate::testing::mocks::MockKafkaStore;
 
     fn external_only_record(topic_id: i32) -> PendingForwardRecord {
@@ -2299,7 +1950,7 @@ mod tests {
             .times(1)
             .returning(|_, _, _| Ok(()));
 
-        let store = ShadowStore::new(mock);
+        let store = ShadowStore::with_db(mock, InMemoryShadowDb::default());
         {
             let mut pending = store.pending_txn_messages.write().unwrap();
             pending
@@ -2323,7 +1974,7 @@ mod tests {
             .times(1)
             .returning(|_, _, _| Ok(()));
 
-        let store = ShadowStore::new(mock);
+        let store = ShadowStore::with_db(mock, InMemoryShadowDb::default());
         {
             let mut pending = store.pending_txn_messages.write().unwrap();
             pending
@@ -2346,7 +1997,7 @@ mod tests {
             .times(1)
             .returning(|_| Ok(vec![]));
 
-        let store = ShadowStore::new(mock);
+        let store = ShadowStore::with_db(mock, InMemoryShadowDb::default());
         {
             let mut pending = store.pending_txn_messages.write().unwrap();
             // Stale: first_buffered older than the timeout we will sweep with.
@@ -2388,7 +2039,7 @@ mod tests {
             .times(1)
             .returning(|_, _, _| Ok((100, 1)));
 
-        let store = ShadowStore::new(mock);
+        let store = ShadowStore::with_db(mock, InMemoryShadowDb::default());
         {
             let mut pending = store.pending_txn_messages.write().unwrap();
             // Stale: producer 100 at the OLD epoch 0.
@@ -2682,5 +2333,572 @@ mod tests {
         map.insert(key_min_pid, "min".to_string());
 
         assert_eq!(map.len(), 2);
+    }
+}
+
+/// Unit tests of the outbox logic against the in-memory `ShadowDb`.
+#[cfg(test)]
+mod outbox_tests {
+    use super::*;
+    use crate::kafka::shadow::config::ShadowMode;
+    use crate::kafka::shadow::outbox::fake::InMemoryShadowDb;
+    use crate::testing::mocks::MockKafkaStore;
+
+    const T: i32 = 7;
+
+    type Store = ShadowStore<MockKafkaStore, InMemoryShadowDb>;
+
+    fn topic_config(sync_mode: SyncMode, write_mode: WriteMode) -> TopicShadowConfig {
+        TopicShadowConfig {
+            topic_id: T,
+            topic_name: "local".to_string(),
+            mode: ShadowMode::Shadow,
+            forward_percentage: 100,
+            external_topic_name: Some("ext".to_string()),
+            sync_mode,
+            write_mode,
+        }
+    }
+
+    struct Harness {
+        store: Store,
+        forwards: crossbeam_channel::Receiver<ForwardRequest>,
+        acks: crossbeam_channel::Sender<ForwardAck>,
+    }
+
+    /// A store with shadow mode enabled, `configs` loaded into its cache, and
+    /// forward/ack channels (forward capacity `cap`).
+    fn harness(mock: MockKafkaStore, configs: Vec<TopicShadowConfig>, cap: usize) -> Harness {
+        let db = InMemoryShadowDb::enabled();
+        db.add_topic(T, "local", Some("ext"));
+        db.state().configs = Some(configs);
+        let store = ShadowStore::with_db(mock, db);
+        store.load_topic_config_from_db().unwrap();
+        let (forward_tx, forwards) = crossbeam_channel::bounded(cap);
+        let (acks, ack_rx) = crossbeam_channel::unbounded();
+        store.set_forward_channel(forward_tx);
+        store.set_ack_channel(ack_rx);
+        Harness {
+            store,
+            forwards,
+            acks,
+        }
+    }
+
+    fn record(key: &[u8], value: &[u8]) -> Record {
+        Record {
+            key: Some(key.to_vec()),
+            value: Some(value.to_vec()),
+            headers: vec![],
+            timestamp: None,
+        }
+    }
+
+    fn ok_ack(key: (i32, i32, i64), external_offset: i64) -> ForwardAck {
+        ForwardAck {
+            topic_id: key.0,
+            partition_id: key.1,
+            local_offset: key.2,
+            result: Ok(external_offset),
+        }
+    }
+
+    fn err_ack(key: (i32, i32, i64)) -> ForwardAck {
+        ForwardAck {
+            topic_id: key.0,
+            partition_id: key.1,
+            local_offset: key.2,
+            result: Err("broker down".to_string()),
+        }
+    }
+
+    /// Seed messages and pending outbox rows for `keys`.
+    fn seed_rows(store: &Store, keys: &[(i32, i32, i64)]) {
+        for &k in keys {
+            store
+                .db()
+                .add_message(k, b"k", format!("v{}", k.2).as_bytes());
+        }
+        store.insert_outbox_rows(keys).unwrap();
+    }
+
+    fn async_harness(cap: usize) -> Harness {
+        harness(
+            MockKafkaStore::new(),
+            vec![topic_config(SyncMode::Async, WriteMode::DualWrite)],
+            cap,
+        )
+    }
+
+    #[test]
+    fn produce_writes_one_pending_outbox_row_per_record() {
+        let mut mock = MockKafkaStore::new();
+        mock.expect_insert_records().returning(|_, _, _| Ok(10));
+        let h = harness(
+            mock,
+            vec![topic_config(SyncMode::Async, WriteMode::DualWrite)],
+            16,
+        );
+        h.store.db().add_message((T, 0, 10), b"a", b"1");
+        h.store.db().add_message((T, 0, 11), b"b", b"2");
+
+        let base = h
+            .store
+            .insert_records(T, 0, &[record(b"a", b"1"), record(b"b", b"2")])
+            .unwrap();
+
+        assert_eq!(base, 10);
+        for off in [10, 11] {
+            let row = h.store.db().row((T, 0, off)).expect("outbox row");
+            assert_eq!(row.retry_count, 0);
+            assert_eq!(row.external_offset, None);
+            assert_eq!(row.forwarded_at, None);
+        }
+        // Async: nothing is sent inline; the poll forwards.
+        assert!(h.forwards.try_recv().is_err());
+    }
+
+    #[test]
+    fn produce_with_shadow_disabled_writes_no_outbox_row() {
+        let mut mock = MockKafkaStore::new();
+        mock.expect_insert_records().returning(|_, _, _| Ok(0));
+        let h = harness(
+            mock,
+            vec![topic_config(SyncMode::Async, WriteMode::DualWrite)],
+            16,
+        );
+        h.store.db().state().enabled = false;
+        h.store.db().add_message((T, 0, 0), b"a", b"1");
+
+        h.store.insert_records(T, 0, &[record(b"a", b"1")]).unwrap();
+
+        assert!(h.store.db().state().tracking.is_empty());
+    }
+
+    #[test]
+    fn outbox_row_is_only_written_for_an_existing_message() {
+        let h = async_harness(16);
+        h.store.db().add_message((T, 0, 1), b"a", b"1");
+
+        h.store.insert_outbox_rows(&[(T, 0, 1), (T, 0, 2)]).unwrap();
+
+        assert!(h.store.db().row((T, 0, 1)).is_some());
+        assert!(h.store.db().row((T, 0, 2)).is_none());
+    }
+
+    #[test]
+    fn poll_claims_due_rows_and_dispatches_payloads() {
+        let h = async_harness(16);
+        seed_rows(&h.store, &[(T, 0, 1), (T, 0, 2)]);
+
+        assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 2);
+
+        let sent: Vec<ForwardRequest> = h.forwards.try_iter().collect();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0].topic_name, "ext");
+        assert_eq!(sent[0].local_offset, 1);
+        assert_eq!(sent[0].value.as_deref(), Some(&b"v1"[..]));
+        assert_eq!(sent[1].local_offset, 2);
+        for off in [1, 2] {
+            let row = h.store.db().row((T, 0, off)).unwrap();
+            assert_eq!(row.retry_count, 1, "a claim counts as an attempt (RV-10)");
+            assert_eq!(row.forwarded_at, Some(0));
+        }
+    }
+
+    #[test]
+    fn poll_does_not_reclaim_within_lease_or_while_in_flight() {
+        let h = async_harness(16);
+        seed_rows(&h.store, &[(T, 0, 1), (T, 0, 2)]);
+        assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 2);
+        h.forwards.try_iter().for_each(drop);
+
+        // Within the lease: not due.
+        assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 0);
+
+        // Lease expired but both forwards still in flight: excluded from the
+        // claim itself, so retry_count is not eroded (issue #93).
+        h.store.db().advance_ms(OUTBOX_RETRY_INTERVAL_MS + 1);
+        assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 0);
+        assert_eq!(h.store.db().row((T, 0, 1)).unwrap().retry_count, 1);
+
+        // Row 1 fails, row 2 is delivered.
+        h.acks.send(err_ack((T, 0, 1))).unwrap();
+        h.acks.send(ok_ack((T, 0, 2), 500)).unwrap();
+        assert_eq!(h.store.drain_forward_acks(), 2);
+        let failed = h.store.db().row((T, 0, 1)).unwrap();
+        assert_eq!(failed.error_message.as_deref(), Some("broker down"));
+        assert_eq!(failed.external_offset, None);
+        assert_eq!(
+            h.store.db().row((T, 0, 2)).unwrap().external_offset,
+            Some(500)
+        );
+
+        // Only the failed row is retried after the next lease.
+        h.store.db().advance_ms(OUTBOX_RETRY_INTERVAL_MS + 1);
+        assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 1);
+        let sent: Vec<ForwardRequest> = h.forwards.try_iter().collect();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].local_offset, 1);
+        assert_eq!(h.store.db().row((T, 0, 1)).unwrap().retry_count, 2);
+    }
+
+    #[test]
+    fn duplicate_success_ack_counts_once() {
+        let h = async_harness(16);
+        seed_rows(&h.store, &[(T, 0, 1)]);
+        h.store.poll_and_forward_outbox().unwrap();
+
+        h.acks.send(ok_ack((T, 0, 1), 9)).unwrap();
+        h.acks.send(ok_ack((T, 0, 1), 10)).unwrap();
+        assert_eq!(h.store.drain_forward_acks(), 2);
+
+        assert_eq!(
+            h.store.db().row((T, 0, 1)).unwrap().external_offset,
+            Some(9)
+        );
+        let m = h.store.db().state().metrics[&(T, 0)].clone();
+        assert_eq!(m.messages_forwarded, 1);
+        assert_eq!(m.last_forwarded_offset, Some(1));
+        assert_eq!(h.store.metrics().forwarded.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn failing_forward_is_dead_lettered_and_external_primary_reads_fall_back() {
+        let mut mock = MockKafkaStore::new();
+        // Called exactly once: only after the dead letter lifts suppression.
+        mock.expect_fetch_records()
+            .times(1)
+            .returning(|_, _, _, _| Ok(vec![]));
+        let h = harness(
+            mock,
+            vec![topic_config(SyncMode::Async, WriteMode::ExternalOnly)],
+            16,
+        );
+        seed_rows(&h.store, &[(T, 0, 1)]);
+
+        // Healthy external-primary topic: local reads suppressed.
+        assert!(h.store.fetch_records(T, 0, 0, 1024).unwrap().is_empty());
+
+        for attempt in 1..=MAX_FORWARD_RETRIES {
+            assert_eq!(
+                h.store.poll_and_forward_outbox().unwrap(),
+                1,
+                "attempt {attempt}"
+            );
+            h.forwards.try_iter().for_each(drop);
+            h.acks.send(err_ack((T, 0, 1))).unwrap();
+            h.store.drain_forward_acks();
+            h.store.db().advance_ms(OUTBOX_RETRY_INTERVAL_MS + 1);
+        }
+
+        // At the cap the row is a dead letter: never claimed again, kept pending.
+        assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 0);
+        let row = h.store.db().row((T, 0, 1)).unwrap();
+        assert_eq!(row.retry_count as i64, MAX_FORWARD_RETRIES);
+        assert_eq!(row.external_offset, None);
+        assert_eq!(
+            h.store.db().state().metrics[&(T, 0)].messages_failed,
+            MAX_FORWARD_RETRIES
+        );
+        assert!(h.store.topic_has_dead_letters(T));
+
+        // RV-6: the dead letter lifts read suppression (inner is now called) ...
+        h.store.fetch_records(T, 0, 0, 1024).unwrap();
+        // ... unless strict mode keeps it.
+        h.store.db().state().strict = true;
+        assert!(h.store.fetch_records(T, 0, 0, 1024).unwrap().is_empty());
+    }
+
+    #[test]
+    fn full_forward_channel_leaves_rows_pending_and_not_in_flight() {
+        let h = async_harness(1);
+        seed_rows(&h.store, &[(T, 0, 1), (T, 0, 2), (T, 0, 3)]);
+
+        assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 1);
+        let (topics, _, offsets) = h.store.inflight.live_keys();
+        assert_eq!(topics.len(), 1, "undelivered rows must not stay in flight");
+        assert_eq!(offsets, vec![1]);
+
+        // Next lease: the two undispatched rows are due again.
+        h.forwards.try_recv().unwrap();
+        h.store.db().advance_ms(OUTBOX_RETRY_INTERVAL_MS + 1);
+        assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 1);
+        assert_eq!(h.store.db().row((T, 0, 2)).unwrap().retry_count, 2);
+        assert_eq!(h.store.db().row((T, 0, 3)).unwrap().retry_count, 2);
+        assert_eq!(h.store.db().row((T, 0, 1)).unwrap().retry_count, 1);
+    }
+
+    #[test]
+    fn poll_without_forward_channel_is_a_no_op() {
+        let db = InMemoryShadowDb::enabled();
+        db.add_topic(T, "local", None);
+        let store = ShadowStore::with_db(MockKafkaStore::new(), db);
+        seed_rows(&store, &[(T, 0, 1)]);
+
+        assert_eq!(store.poll_and_forward_outbox().unwrap(), 0);
+        assert_eq!(store.db().row((T, 0, 1)).unwrap().retry_count, 0);
+    }
+
+    #[test]
+    fn poll_claim_failure_is_a_database_error() {
+        let h = async_harness(16);
+        h.store.db().state().fail_claim = true;
+        assert!(matches!(
+            h.store.poll_and_forward_outbox(),
+            Err(super::super::error::ShadowError::DatabaseError(_))
+        ));
+    }
+
+    #[test]
+    fn drain_applies_deferred_acks_and_channel_acks() {
+        let h = async_harness(16);
+        seed_rows(&h.store, &[(T, 0, 1), (T, 0, 2)]);
+        h.store
+            .deferred_acks
+            .lock()
+            .unwrap()
+            .push(ok_ack((T, 0, 1), 100));
+        h.acks.send(ok_ack((T, 0, 2), 101)).unwrap();
+
+        assert_eq!(h.store.drain_forward_acks(), 2);
+
+        assert!(h.store.deferred_acks.lock().unwrap().is_empty());
+        assert_eq!(
+            h.store.db().row((T, 0, 1)).unwrap().external_offset,
+            Some(100)
+        );
+        assert_eq!(
+            h.store.db().row((T, 0, 2)).unwrap().external_offset,
+            Some(101)
+        );
+    }
+
+    #[test]
+    fn commit_enqueues_the_transactions_records_read_from_messages() {
+        let mut mock = MockKafkaStore::new();
+        mock.expect_commit_transaction()
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+        let h = harness(
+            mock,
+            vec![topic_config(SyncMode::Async, WriteMode::DualWrite)],
+            16,
+        );
+        for off in [5, 6] {
+            let mut s = h.store.db().state();
+            s.messages.insert(
+                (T, 0, off),
+                crate::kafka::shadow::outbox::fake::FakeMessage {
+                    txn: Some((100, 0)),
+                    txn_pending: true,
+                    ..Default::default()
+                },
+            );
+        }
+        // Another producer's pending record is not part of this commit.
+        h.store.db().state().messages.insert(
+            (T, 0, 7),
+            crate::kafka::shadow::outbox::fake::FakeMessage {
+                txn: Some((200, 0)),
+                txn_pending: true,
+                ..Default::default()
+            },
+        );
+
+        // No RAM buffer (e.g. after a worker restart): the DB read still finds them.
+        h.store.commit_transaction("txn", 100, 0).unwrap();
+
+        assert!(h.store.db().row((T, 0, 5)).is_some());
+        assert!(h.store.db().row((T, 0, 6)).is_some());
+        assert!(h.store.db().row((T, 0, 7)).is_none());
+    }
+
+    #[test]
+    fn commit_falls_back_to_the_ram_buffer_when_the_lookup_fails() {
+        let mut mock = MockKafkaStore::new();
+        mock.expect_commit_transaction()
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+        let h = harness(
+            mock,
+            vec![topic_config(SyncMode::Async, WriteMode::DualWrite)],
+            16,
+        );
+        h.store.db().add_message((T, 0, 5), b"k", b"v");
+        h.store.db().state().fail_pending_txn_lookup = true;
+        h.store.pending_txn_messages.write().unwrap().insert(
+            (100, 0),
+            PendingTxnBuffer::from(vec![PendingForwardRecord {
+                topic_id: T,
+                partition_id: 0,
+                offset: 5,
+                key: None,
+            }]),
+        );
+
+        h.store.commit_transaction("txn", 100, 0).unwrap();
+
+        assert!(h.store.db().row((T, 0, 5)).is_some());
+    }
+
+    #[test]
+    fn commit_with_shadow_disabled_enqueues_nothing() {
+        let mut mock = MockKafkaStore::new();
+        mock.expect_commit_transaction()
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+        let h = harness(
+            mock,
+            vec![topic_config(SyncMode::Async, WriteMode::DualWrite)],
+            16,
+        );
+        h.store.db().state().messages.insert(
+            (T, 0, 5),
+            crate::kafka::shadow::outbox::fake::FakeMessage {
+                txn: Some((100, 0)),
+                txn_pending: true,
+                ..Default::default()
+            },
+        );
+        h.store.db().state().enabled = false;
+
+        h.store.commit_transaction("txn", 100, 0).unwrap();
+
+        assert!(h.store.db().state().tracking.is_empty());
+    }
+
+    #[test]
+    fn config_load_replaces_cache_and_forces_full_forwarding_for_external_primary() {
+        let mut external = topic_config(SyncMode::Async, WriteMode::ExternalOnly);
+        external.forward_percentage = 30;
+        let mut other = topic_config(SyncMode::Async, WriteMode::DualWrite);
+        other.topic_id = T + 1;
+        other.forward_percentage = 30;
+        let h = harness(MockKafkaStore::new(), vec![external, other], 16);
+
+        assert_eq!(
+            h.store.topic_cache().get(T).unwrap().forward_percentage,
+            100
+        );
+        assert_eq!(
+            h.store.topic_cache().get(T + 1).unwrap().forward_percentage,
+            30
+        );
+
+        // A deleted row disappears from the cache on the next load.
+        h.store.db().state().configs =
+            Some(vec![topic_config(SyncMode::Async, WriteMode::DualWrite)]);
+        assert_eq!(h.store.load_topic_config_from_db().unwrap(), 1);
+        assert!(h.store.topic_cache().get(T + 1).is_none());
+
+        // A failed query keeps the previous cache.
+        h.store.db().state().configs = None;
+        assert!(h.store.load_topic_config_from_db().is_err());
+        assert!(h.store.topic_cache().get(T).is_some());
+    }
+
+    fn sync_harness() -> Harness {
+        let mut mock = MockKafkaStore::new();
+        mock.expect_insert_records().returning(|_, _, _| Ok(10));
+        let h = harness(
+            mock,
+            vec![topic_config(SyncMode::Sync, WriteMode::DualWrite)],
+            16,
+        );
+        h.store.db().add_message((T, 0, 10), b"a", b"1");
+        h.store.db().state().current_xid = 77;
+        h
+    }
+
+    #[test]
+    fn sync_produce_forwards_nothing_before_commit() {
+        let h = sync_harness();
+
+        h.store.begin_request();
+        h.store.insert_records(T, 0, &[record(b"a", b"1")]).unwrap();
+
+        // The outbox row is written in the request's transaction, but nothing is
+        // sent while that transaction can still roll back.
+        assert!(h.store.db().row((T, 0, 10)).is_some());
+        assert!(h.forwards.try_recv().is_err());
+        assert_eq!(h.store.sync_pending.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn sync_forward_after_commit_sends_and_defers_every_ack() {
+        let h = sync_harness();
+        h.store.insert_records(T, 0, &[record(b"a", b"1")]).unwrap();
+        h.store.db().state().committed_xids.insert(77);
+        // An unrelated ack arrives first, then ours.
+        h.acks.send(ok_ack((T, 1, 99), 1)).unwrap();
+        h.acks.send(ok_ack((T, 0, 10), 42)).unwrap();
+
+        h.store.forward_sync_after_commit();
+
+        let sent: Vec<ForwardRequest> = h.forwards.try_iter().collect();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].topic_name, "ext");
+        assert_eq!(sent[0].value.as_deref(), Some(&b"1"[..]));
+        assert!(h.store.sync_pending.lock().unwrap().is_empty());
+        // No transaction is open after commit: both acks wait for the drain, and
+        // the row stays in flight so the poll cannot re-send it meanwhile.
+        assert_eq!(h.store.deferred_acks.lock().unwrap().len(), 2);
+        assert_eq!(h.store.db().row((T, 0, 10)).unwrap().external_offset, None);
+        h.store.db().advance_ms(OUTBOX_RETRY_INTERVAL_MS + 1);
+        assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 0);
+
+        assert_eq!(h.store.drain_forward_acks(), 2);
+        assert_eq!(
+            h.store.db().row((T, 0, 10)).unwrap().external_offset,
+            Some(42)
+        );
+        assert!(h.store.inflight.live_keys().0.is_empty());
+    }
+
+    #[test]
+    fn sync_forward_of_a_rolled_back_request_sends_nothing() {
+        let h = sync_harness();
+        h.store.insert_records(T, 0, &[record(b"a", b"1")]).unwrap();
+        // xid 77 never committed (the request's subtransaction rolled back).
+
+        h.store.forward_sync_after_commit();
+
+        assert!(h.forwards.try_recv().is_err());
+        assert!(h.store.sync_pending.lock().unwrap().is_empty());
+        assert!(h.store.inflight.live_keys().0.is_empty());
+    }
+
+    #[test]
+    fn sync_forward_with_full_channel_leaves_the_row_to_the_poll() {
+        let mut mock = MockKafkaStore::new();
+        mock.expect_insert_records().returning(|_, _, _| Ok(10));
+        let h = harness(
+            mock,
+            vec![topic_config(SyncMode::Sync, WriteMode::DualWrite)],
+            1,
+        );
+        h.store.db().add_message((T, 0, 10), b"a", b"1");
+        h.store.db().add_message((T, 0, 11), b"b", b"2");
+        h.store.db().state().current_xid = 5;
+        h.store.db().state().committed_xids.insert(5);
+        h.acks.send(ok_ack((T, 0, 10), 1)).unwrap();
+
+        h.store
+            .insert_records(T, 0, &[record(b"a", b"1"), record(b"b", b"2")])
+            .unwrap();
+        h.store.forward_sync_after_commit();
+
+        assert_eq!(h.forwards.try_iter().count(), 1);
+        let (_, _, offsets) = h.store.inflight.live_keys();
+        assert_eq!(offsets, vec![10], "the unsent row must not stay in flight");
+    }
+
+    #[test]
+    fn sync_forward_without_queued_rows_returns_immediately() {
+        let h = sync_harness();
+        let start = Instant::now();
+        h.store.forward_sync_after_commit();
+        assert!(start.elapsed() < Duration::from_secs(1));
     }
 }

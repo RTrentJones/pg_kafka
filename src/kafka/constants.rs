@@ -511,14 +511,8 @@ pub const MIN_SHADOW_MAX_RETRIES: i32 = 0;
 /// Maximum shadow max retries
 pub const MAX_SHADOW_MAX_RETRIES: i32 = 100;
 
-/// Default shadow sync mode (async or sync)
-pub const DEFAULT_SHADOW_SYNC_MODE: &str = "async";
-
 /// Default shadow metrics enabled
 pub const DEFAULT_SHADOW_METRICS_ENABLED: bool = true;
-
-/// Default shadow OpenTelemetry endpoint (empty = disabled)
-pub const DEFAULT_SHADOW_OTEL_ENDPOINT: &str = "";
 
 /// Configuration reload interval (milliseconds) - reloads both GUCs and shadow config
 pub const DEFAULT_CONFIG_RELOAD_MS: i32 = 30_000; // 30 seconds

@@ -573,13 +573,10 @@ pg_kafka.shadow_batch_size = 1000                      -- Messages per batch (de
 pg_kafka.shadow_linger_ms = 10                         -- Batch delay (default 10; 0-60000ms)
 pg_kafka.shadow_retry_backoff_ms = 100                 -- Retry delay (default 100; 10-60000ms)
 pg_kafka.shadow_max_retries = 3                        -- Max retries (default 3; 0-100)
-pg_kafka.shadow_default_sync_mode = 'async'            -- Default: async. Parsed into ShadowConfig but not currently consulted;
-                                                       -- the per-topic kafka.shadow_config.sync_mode column (default 'sync') decides
 pg_kafka.shadow_external_primary_strict = false        -- Keep external_only topics read-suppressed even after a dead-lettered forward (default false)
 
 -- Observability (Suset)
 pg_kafka.shadow_metrics_enabled = true                 -- Enable metrics collection (kafka.shadow_metrics)
-pg_kafka.shadow_otel_endpoint = 'http://otel:4317'     -- OpenTelemetry endpoint (default: empty = disabled)
 
 -- License (restart; superuser-only, hidden from SHOW ALL)
 pg_kafka.shadow_license_key = 'eval'                   -- 'sponsor_id:token' or 'eval'
@@ -587,7 +584,7 @@ pg_kafka.shadow_license_key = 'eval'                   -- 'sponsor_id:token' or 
 
 **Per-Topic Shadow Configuration:**
 
-Shadow mode is configured per-topic via the `kafka.shadow_config` table, keyed by `topic_id`. Columns: `mode` (`'local_only'` | `'shadow'`), `forward_percentage` (0-100), `external_topic_name`, `sync_mode` (`'async'` | `'sync'`), `write_mode` (`'dual_write'` | `'external_only'`). The worker picks up changes on its next config reload (`pg_kafka.config_reload_interval_ms`, or immediately after `pg_reload_conf()`).
+Shadow mode is configured per-topic via the `kafka.shadow_config` table, keyed by `topic_id`. Columns: `mode` (`'local_only'` | `'shadow'`), `forward_percentage` (0-100), `external_topic_name`, `sync_mode` (`'async'` | `'sync'`, default `'sync'`; there is no global default GUC; `sync` forwards right after the local commit and holds the produce response until the external ack or 5 s), `write_mode` (`'dual_write'` | `'external_only'`). The worker picks up changes on its next config reload (`pg_kafka.config_reload_interval_ms`, or immediately after `pg_reload_conf()`).
 
 ```sql
 -- Forward specific topics with different settings

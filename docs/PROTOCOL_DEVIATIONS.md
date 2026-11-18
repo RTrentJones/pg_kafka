@@ -393,9 +393,12 @@ fire-and-forget with no response frame and no durability claim — see §1.)
 Shadow forwarding to an external Kafka cluster uses a durable outbox
 (`kafka.shadow_tracking`) drained by a poll loop:
 
-- **Sync mode** (`forward_sync_bounded`): effectively exactly-once at the
-  external broker in normal operation — the produce waits (bounded) for the
-  external ack.
+- **Sync mode** (`forward_sync_after_commit`): effectively exactly-once at the
+  external broker in normal operation — after the local commit, and before the
+  produce response is sent, the worker forwards the request's rows and waits
+  (bounded, 5 s) for the external acks. Rows of a request that rolled back are
+  never forwarded, so the external broker never holds a record pg_kafka did
+  not store.
 - **Async / forward-on-commit modes:** **at-least-once**. A row whose forward
   ack is lost (worker crash between delivery and finalization, dropped ack on
   a full channel) is re-forwarded after its retry lease expires, so the

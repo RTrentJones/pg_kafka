@@ -341,10 +341,8 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     // Always create ShadowStore wrapping PostgresStore. Shadow mode can be
     // enabled/disabled at runtime via pg_kafka.shadow_mode_enabled GUC.
     // The producer is lazily initialized on first use when enabled.
-    // Pass RuntimeContext to enable centralized config access.
-    let shadow_store: std::sync::Arc<ShadowStore<PostgresStore>> = std::sync::Arc::new(
-        ShadowStore::with_context(PostgresStore::new(), runtime_context.clone()),
-    );
+    let shadow_store: std::sync::Arc<ShadowStore<PostgresStore>> =
+        std::sync::Arc::new(ShadowStore::new(PostgresStore::new()));
 
     // Set license key for shadow mode (Commercial License)
     shadow_store.set_license_key(&config.shadow_license_key);
@@ -1155,7 +1153,12 @@ fn execute_batch(
 
     let batch_size = pending.len();
     match txn_result {
-        Ok(()) => after_batch_commit(pending),
+        Ok(()) => {
+            // Sync-mode shadow forwards go out only now that the local writes are
+            // committed; responses are released after the (bounded) external wait.
+            env.shadow_store.forward_sync_after_commit();
+            after_batch_commit(pending)
+        }
         Err(panic_payload) => {
             // The transaction itself failed (commit-time panic). Answer every
             // request, then re-raise: the worker exits and the postmaster
