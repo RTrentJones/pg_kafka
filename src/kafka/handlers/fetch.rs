@@ -491,7 +491,8 @@ pub fn handle_list_offsets(
 mod storage_stream_tests {
     use super::*;
     use crate::kafka::messages::{PartitionFetchData, TopicFetchData};
-    use crate::kafka::storage::{KafkaStore, PartitionBounds, TopicMetadata};
+    use crate::kafka::storage::roles::*;
+    use crate::kafka::storage::{PartitionBounds, TopicMetadata};
     use crate::kafka::{BrokerMetadata, GroupCoordinator};
     use crate::testing::mocks::MockKafkaStore;
     use kafka_protocol::records::Compression;

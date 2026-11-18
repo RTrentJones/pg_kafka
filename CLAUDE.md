@@ -239,7 +239,7 @@ src/
 │   ├── shadow/         # Shadow mode (Phase 11; commercial license, see shadow/LICENSE)
 │   │   ├── mod.rs      # Module docs, re-exports, forward request/ack types
 │   │   ├── config.rs   # ShadowConfig, per-topic TopicShadowConfig, modes
-│   │   ├── store.rs    # ShadowStore: KafkaStore wrapper writing the durable outbox
+│   │   ├── store.rs    # ShadowStore: store wrapper writing the durable outbox
 │   │   ├── forwarder.rs, routing.rs  # Forward decision + percentage routing hash
 │   │   ├── producer.rs # rdkafka FutureProducer wrapper (SASL/SSL settings)
 │   │   ├── inflight.rs # In-flight forward tracking for the outbox
@@ -248,7 +248,8 @@ src/
 │   │   ├── error.rs    # ShadowError
 │   │   └── tests.rs    # Shadow component tests
 │   └── storage/        # Storage abstraction layer (Repository Pattern)
-│       ├── mod.rs      # KafkaStore trait definition
+│       ├── mod.rs      # Storage role traits, KafkaStore (their sum), delegate_*_store! macros
+│       ├── postgres/roles.rs  # PostgresStore's role impls (forward to its inherent SQL methods)
 │       ├── postgres.rs # PostgreSQL implementation (PostgresStore)
 │       └── tests.rs    # Storage layer tests
 └── bin/
@@ -340,21 +341,23 @@ TCP:9092 → Tokio Runtime (listener.rs) → crossbeam-channel → Background Wo
 
 ### Repository Pattern (KafkaStore Trait)
 
-Storage is abstracted via the `KafkaStore` trait (`src/kafka/storage/mod.rs`):
+Storage is abstracted via role traits in `src/kafka/storage/mod.rs`, with `KafkaStore` as their sum
+(implemented for every type that has all six):
 
 ```rust
-pub trait KafkaStore {
-    fn get_or_create_topic(&self, name: &str, default_partitions: i32) -> Result<(i32, i32)>;
-    fn insert_records(&self, topic_id: i32, partition_id: i32, records: &[Record]) -> Result<i64>;
-    fn fetch_records(&self, topic_id: i32, partition_id: i32, fetch_offset: i64, max_bytes: i32) -> Result<Vec<FetchedMessage>>;
-    fn commit_offset(&self, group_id: &str, topic_id: i32, partition_id: i32, offset: i64, metadata: Option<&str>) -> Result<()>;
-    // ... more methods
-}
+pub trait TopicStore { fn get_or_create_topic(&self, name: &str, default_partitions: i32) -> Result<(i32, i32)>; fn get_topic_id(..); /* catalog, admin, retention.ms */ }
+pub trait LogStore { fn insert_records(..) -> Result<i64>; fn fetch_records_with_isolation(..); /* offsets bounds, DeleteRecords */ }
+pub trait OffsetStore { fn commit_offset(..); fn fetch_offset(..); /* group offsets */ }
+pub trait ProducerStore { /* producer ids, epochs, sequences (Phase 9) */ }
+pub trait TransactionStore { /* transactional producers, writes, commit/abort (Phase 10) */ }
+pub trait MaintenanceStore { fn abort_timed_out_transactions(..); fn cleanup_aborted_messages(..); }
+pub trait KafkaStore: TopicStore + LogStore + OffsetStore + ProducerStore + TransactionStore + MaintenanceStore {}
 ```
 
-- `PostgresStore` (`src/kafka/storage/postgres.rs`): Production implementation using SPI
-- `ShadowStore` (`src/kafka/shadow/store.rs`): Wraps `PostgresStore` and adds shadow-mode forwarding
+- `PostgresStore` (`src/kafka/storage/postgres.rs`): Production implementation using SPI. The SQL is one inherent `impl PostgresStore` block; `storage/postgres/roles.rs` implements the roles by forwarding to it
+- `ShadowStore` (`src/kafka/shadow/store.rs`): Wraps `PostgresStore` and adds shadow-mode forwarding; it forwards the roles it does not change wholesale (`delegate_topic_store!(TopicStore, inner)`, likewise offsets and producer state) and implements `LogStore`, `TransactionStore` and `MaintenanceStore`
 - `MockKafkaStore` (`src/testing/mocks.rs`): Test double for handler unit tests
+- Helpers take the narrowest role (`resolve_topic_id<S: TopicStore + ?Sized>`); calling store methods on a concrete store type needs `use crate::kafka::storage::roles::*`
 
 This separation enables testing handlers without a running database.
 

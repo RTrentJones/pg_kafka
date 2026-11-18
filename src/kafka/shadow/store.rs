@@ -73,7 +73,9 @@ use super::{ForwardAck, ForwardRequest};
 use crate::kafka::error::{KafkaError, Result};
 use crate::kafka::messages::Record;
 use crate::kafka::storage::{
-    CommittedOffset, FetchedMessage, IsolationLevel, KafkaStore, TopicMetadata, TransactionState,
+    delegate_offset_store, delegate_producer_store, delegate_topic_store, FetchedMessage,
+    IsolationLevel, KafkaStore, LogStore, MaintenanceStore, OffsetStore, ProducerStore, TopicStore,
+    TransactionState, TransactionStore,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1140,19 +1142,22 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
     }
 }
 
-impl<S: KafkaStore, D: ShadowDb> KafkaStore for ShadowStore<S, D> {
-    // ===== Topic Operations =====
+// Roles shadow mode does not change are forwarded to the wrapped store wholesale.
+impl<S: KafkaStore, D: ShadowDb> TopicStore for ShadowStore<S, D> {
+    delegate_topic_store!(TopicStore, inner);
+}
 
-    fn get_or_create_topic(&self, name: &str, default_partitions: i32) -> Result<(i32, i32)> {
-        self.inner.get_or_create_topic(name, default_partitions)
-    }
+impl<S: KafkaStore, D: ShadowDb> OffsetStore for ShadowStore<S, D> {
+    delegate_offset_store!(OffsetStore, inner);
+}
 
-    fn get_topic_metadata(&self, names: Option<&[String]>) -> Result<Vec<TopicMetadata>> {
-        self.inner.get_topic_metadata(names)
-    }
+impl<S: KafkaStore, D: ShadowDb> ProducerStore for ShadowStore<S, D> {
+    delegate_producer_store!(ProducerStore, inner);
+}
 
-    // ===== Message Operations =====
-
+// The log: writes feed the outbox (forwarding); reads are suppressed for
+// external-primary topics (SH-6).
+impl<S: KafkaStore, D: ShadowDb> LogStore for ShadowStore<S, D> {
     fn insert_records(&self, topic_id: i32, partition_id: i32, records: &[Record]) -> Result<i64> {
         // Skip shadow forwarding if:
         // 1. Shadow mode is not enabled globally
@@ -1216,6 +1221,27 @@ impl<S: KafkaStore, D: ShadowDb> KafkaStore for ShadowStore<S, D> {
             .fetch_records(topic_id, partition_id, fetch_offset, max_bytes)
     }
 
+    fn fetch_records_with_isolation(
+        &self,
+        topic_id: i32,
+        partition_id: i32,
+        fetch_offset: i64,
+        max_bytes: i32,
+        isolation_level: IsolationLevel,
+    ) -> Result<Vec<FetchedMessage>> {
+        // SH-6: external-primary read suppression (see fetch_records).
+        if self.suppress_external_primary_reads(topic_id) {
+            return Ok(Vec::new());
+        }
+        self.inner.fetch_records_with_isolation(
+            topic_id,
+            partition_id,
+            fetch_offset,
+            max_bytes,
+            isolation_level,
+        )
+    }
+
     fn get_high_watermark(&self, topic_id: i32, partition_id: i32) -> Result<i64> {
         // SH-6: report an empty partition for external-primary topics so a
         // consumer pointed at pg_kafka sees nothing to read and uses the
@@ -1238,6 +1264,13 @@ impl<S: KafkaStore, D: ShadowDb> KafkaStore for ShadowStore<S, D> {
             return Ok(0);
         }
         self.inner.get_log_start_offset(topic_id, partition_id)
+    }
+
+    fn get_last_stable_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64> {
+        if self.suppress_external_primary_reads(topic_id) {
+            return Ok(0);
+        }
+        self.inner.get_last_stable_offset(topic_id, partition_id)
     }
 
     fn get_partition_bounds(
@@ -1267,115 +1300,19 @@ impl<S: KafkaStore, D: ShadowDb> KafkaStore for ShadowStore<S, D> {
             .get_offset_for_timestamp(topic_id, partition_id, timestamp_ms)
     }
 
-    // ===== Consumer Offset Operations =====
-
-    fn commit_offset(
+    fn delete_records_before(
         &self,
-        group_id: &str,
         topic_id: i32,
         partition_id: i32,
-        offset: i64,
-        metadata: Option<&str>,
-    ) -> Result<()> {
+        before_offset: i64,
+    ) -> Result<i64> {
         self.inner
-            .commit_offset(group_id, topic_id, partition_id, offset, metadata)
+            .delete_records_before(topic_id, partition_id, before_offset)
     }
+}
 
-    fn fetch_offset(
-        &self,
-        group_id: &str,
-        topic_id: i32,
-        partition_id: i32,
-    ) -> Result<Option<CommittedOffset>> {
-        self.inner.fetch_offset(group_id, topic_id, partition_id)
-    }
-
-    fn fetch_all_offsets(&self, group_id: &str) -> Result<Vec<(String, i32, CommittedOffset)>> {
-        self.inner.fetch_all_offsets(group_id)
-    }
-
-    // ===== Admin Topic Operations =====
-
-    fn topic_exists(&self, name: &str) -> Result<bool> {
-        self.inner.topic_exists(name)
-    }
-
-    fn create_topic(&self, name: &str, partition_count: i32) -> Result<i32> {
-        self.inner.create_topic(name, partition_count)
-    }
-
-    fn get_topic_id(&self, name: &str) -> Result<Option<i32>> {
-        self.inner.get_topic_id(name)
-    }
-
-    fn delete_topic(&self, topic_id: i32) -> Result<()> {
-        self.inner.delete_topic(topic_id)
-    }
-
-    fn get_topic_partition_count(&self, name: &str) -> Result<Option<i32>> {
-        self.inner.get_topic_partition_count(name)
-    }
-
-    fn set_topic_partition_count(&self, name: &str, partition_count: i32) -> Result<()> {
-        self.inner.set_topic_partition_count(name, partition_count)
-    }
-
-    // ===== Admin Consumer Group Operations =====
-
-    fn delete_consumer_group_offsets(&self, group_id: &str) -> Result<()> {
-        self.inner.delete_consumer_group_offsets(group_id)
-    }
-
-    // ===== Idempotent Producer Operations =====
-
-    fn allocate_producer_id(
-        &self,
-        client_id: Option<&str>,
-        transactional_id: Option<&str>,
-    ) -> Result<(i64, i16)> {
-        self.inner.allocate_producer_id(client_id, transactional_id)
-    }
-
-    fn get_producer_epoch(&self, producer_id: i64) -> Result<Option<i16>> {
-        self.inner.get_producer_epoch(producer_id)
-    }
-
-    fn increment_producer_epoch(&self, producer_id: i64) -> Result<(i64, i16)> {
-        self.inner.increment_producer_epoch(producer_id)
-    }
-
-    fn check_and_update_sequence(
-        &self,
-        producer_id: i64,
-        producer_epoch: i16,
-        topic_id: i32,
-        partition_id: i32,
-        base_sequence: i32,
-        record_count: i32,
-    ) -> Result<bool> {
-        self.inner.check_and_update_sequence(
-            producer_id,
-            producer_epoch,
-            topic_id,
-            partition_id,
-            base_sequence,
-            record_count,
-        )
-    }
-
-    fn record_producer_sequence(
-        &self,
-        producer_id: i64,
-        topic_id: i32,
-        partition_id: i32,
-        last_sequence: i32,
-    ) -> Result<()> {
-        self.inner
-            .record_producer_sequence(producer_id, topic_id, partition_id, last_sequence)
-    }
-
-    // ===== Transaction Operations =====
-
+// Transactions: transactional writes are buffered and forwarded on commit.
+impl<S: KafkaStore, D: ShadowDb> TransactionStore for ShadowStore<S, D> {
     fn get_or_create_transactional_producer(
         &self,
         transactional_id: &str,
@@ -1632,35 +1569,10 @@ impl<S: KafkaStore, D: ShadowDb> KafkaStore for ShadowStore<S, D> {
     fn get_transaction_state(&self, transactional_id: &str) -> Result<Option<TransactionState>> {
         self.inner.get_transaction_state(transactional_id)
     }
+}
 
-    fn fetch_records_with_isolation(
-        &self,
-        topic_id: i32,
-        partition_id: i32,
-        fetch_offset: i64,
-        max_bytes: i32,
-        isolation_level: IsolationLevel,
-    ) -> Result<Vec<FetchedMessage>> {
-        // SH-6: external-primary read suppression (see fetch_records).
-        if self.suppress_external_primary_reads(topic_id) {
-            return Ok(Vec::new());
-        }
-        self.inner.fetch_records_with_isolation(
-            topic_id,
-            partition_id,
-            fetch_offset,
-            max_bytes,
-            isolation_level,
-        )
-    }
-
-    fn get_last_stable_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64> {
-        if self.suppress_external_primary_reads(topic_id) {
-            return Ok(0);
-        }
-        self.inner.get_last_stable_offset(topic_id, partition_id)
-    }
-
+// Maintenance: the timeout sweep also evicts stale forward buffers (SH-4).
+impl<S: KafkaStore, D: ShadowDb> MaintenanceStore for ShadowStore<S, D> {
     fn abort_timed_out_transactions(&self, timeout: Duration) -> Result<Vec<String>> {
         let aborted = self.inner.abort_timed_out_transactions(timeout)?;
 
@@ -1692,24 +1604,6 @@ impl<S: KafkaStore, D: ShadowDb> KafkaStore for ShadowStore<S, D> {
 
     fn cleanup_aborted_messages(&self, older_than: Duration) -> Result<u64> {
         self.inner.cleanup_aborted_messages(older_than)
-    }
-
-    fn get_topic_retention_ms(&self, topic_id: i32) -> Result<Option<i64>> {
-        self.inner.get_topic_retention_ms(topic_id)
-    }
-
-    fn set_topic_retention_ms(&self, topic_id: i32, retention_ms: Option<i64>) -> Result<()> {
-        self.inner.set_topic_retention_ms(topic_id, retention_ms)
-    }
-
-    fn delete_records_before(
-        &self,
-        topic_id: i32,
-        partition_id: i32,
-        before_offset: i64,
-    ) -> Result<i64> {
-        self.inner
-            .delete_records_before(topic_id, partition_id, before_offset)
     }
 }
 
@@ -1985,6 +1879,44 @@ mod tests {
         }
 
         store.commit_transaction("txn-1", 100, 0).unwrap();
+    }
+
+    #[test]
+    fn test_unchanged_roles_are_delegated_to_the_inner_store() {
+        // TopicStore, OffsetStore and ProducerStore are forwarded wholesale
+        // (delegate_*_store!): each call reaches the wrapped store with its arguments
+        // and returns the inner result unchanged.
+        let mut mock = MockKafkaStore::new();
+        mock.expect_get_topic_id()
+            .withf(|name| name == "orders")
+            .times(1)
+            .returning(|_| Ok(Some(7)));
+        mock.expect_set_topic_retention_ms()
+            .withf(|id, ms| *id == 7 && *ms == Some(60_000))
+            .times(1)
+            .returning(|_, _| Ok(()));
+        mock.expect_commit_offset()
+            .withf(|g, t, p, o, m| g == "g" && *t == 7 && *p == 1 && *o == 42 && m.is_none())
+            .times(1)
+            .returning(|_, _, _, _, _| Ok(()));
+        mock.expect_delete_consumer_group_offsets()
+            .times(1)
+            .returning(|_| Ok(()));
+        mock.expect_allocate_producer_id()
+            .times(1)
+            .returning(|_, _| Ok((5, 0)));
+        mock.expect_record_producer_sequence()
+            .withf(|pid, t, p, seq| (*pid, *t, *p, *seq) == (5, 7, 1, 9))
+            .times(1)
+            .returning(|_, _, _, _| Ok(()));
+
+        let store = ShadowStore::with_db(mock, InMemoryShadowDb::default());
+        assert_eq!(store.get_topic_id("orders").unwrap(), Some(7));
+        store.set_topic_retention_ms(7, Some(60_000)).unwrap();
+        store.commit_offset("g", 7, 1, 42, None).unwrap();
+        store.delete_consumer_group_offsets("g").unwrap();
+        assert_eq!(store.allocate_producer_id(None, None).unwrap(), (5, 0));
+        store.record_producer_sequence(5, 7, 1, 9).unwrap();
     }
 
     #[test]

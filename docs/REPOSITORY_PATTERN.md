@@ -21,68 +21,30 @@ The codebase has been refactored to use the Repository Pattern, which provides:
 The storage layer defines and implements data persistence operations.
 
 **Key Files:**
-- [`storage/mod.rs`](../src/kafka/storage/mod.rs) - Defines the `KafkaStore` trait
+- [`storage/mod.rs`](../src/kafka/storage/mod.rs) - Defines the storage role traits and `KafkaStore`
 - [`storage/postgres.rs`](../src/kafka/storage/postgres.rs) - PostgreSQL implementation (`PostgresStore`)
+- [`storage/postgres/roles.rs`](../src/kafka/storage/postgres/roles.rs) - `PostgresStore`'s role impls
 - [`storage/tests.rs`](../src/kafka/storage/tests.rs) - Storage-layer unit tests
 
-**`KafkaStore` Trait (38 methods):**
-```rust
-pub trait KafkaStore {
-    // ===== Topic Operations =====
-    fn get_or_create_topic(&self, name: &str, default_partitions: i32) -> Result<(i32, i32)>; // (topic_id, partition_count)
-    fn get_topic_metadata(&self, names: Option<&[String]>) -> Result<Vec<TopicMetadata>>;
+**Role traits.** The storage interface is split by concern; `KafkaStore` is their sum
+(`pub trait KafkaStore: TopicStore + LogStore + OffsetStore + ProducerStore +
+TransactionStore + MaintenanceStore {}`, implemented for every type that has all six), so
+handlers keep `&dyn KafkaStore` and helpers can take a single role
+(`resolve_topic_id<S: TopicStore + ?Sized>`, `validate_ongoing_transaction(&dyn TransactionStore, ..)`).
 
-    // ===== Message Operations =====
-    fn insert_records(&self, topic_id: i32, partition_id: i32, records: &[Record]) -> Result<i64>;
-    fn fetch_records(&self, topic_id: i32, partition_id: i32, fetch_offset: i64, max_bytes: i32) -> Result<Vec<FetchedMessage>>;
-    fn get_high_watermark(&self, topic_id: i32, partition_id: i32) -> Result<i64>;
-    fn get_earliest_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64>;
-    fn get_offset_for_timestamp(&self, topic_id: i32, partition_id: i32, timestamp_ms: i64) -> Result<Option<(i64, i64)>>;
+| Role | Methods |
+|------|---------|
+| `TopicStore` | `get_or_create_topic`, `get_topic_metadata`, `topic_exists`, `create_topic`, `get_topic_id`, `delete_topic`, `get_topic_partition_count`, `set_topic_partition_count`, `get_topic_retention_ms`, `set_topic_retention_ms` |
+| `LogStore` | `insert_records`, `fetch_records`, `fetch_records_with_isolation`, `get_high_watermark`, `get_earliest_offset`, `get_log_start_offset`, `get_last_stable_offset`, `get_partition_bounds` (default composes the single-value methods), `get_offset_for_timestamp`, `delete_records_before` |
+| `OffsetStore` | `commit_offset`, `fetch_offset`, `fetch_all_offsets`, `delete_consumer_group_offsets` |
+| `ProducerStore` | `allocate_producer_id`, `get_producer_epoch`, `increment_producer_epoch`, `check_and_update_sequence`, `record_producer_sequence` |
+| `TransactionStore` | `get_or_create_transactional_producer`, `begin_transaction`, `begin_or_continue_transaction`, `validate_transaction`, `insert_transactional_records`, `store_txn_pending_offset`, `commit_transaction`, `abort_transaction`, `get_transaction_state` |
+| `MaintenanceStore` | `abort_timed_out_transactions`, `cleanup_aborted_messages` |
 
-    // ===== Consumer Offset Operations =====
-    fn commit_offset(&self, group_id: &str, topic_id: i32, partition_id: i32, offset: i64, metadata: Option<&str>) -> Result<()>;
-    fn fetch_offset(&self, group_id: &str, topic_id: i32, partition_id: i32) -> Result<Option<CommittedOffset>>;
-    fn fetch_all_offsets(&self, group_id: &str) -> Result<Vec<(String, i32, CommittedOffset)>>;
-
-    // ===== Admin Topic Operations (Phase 6) =====
-    fn topic_exists(&self, name: &str) -> Result<bool>;
-    fn create_topic(&self, name: &str, partition_count: i32) -> Result<i32>;
-    fn get_topic_id(&self, name: &str) -> Result<Option<i32>>;
-    fn delete_topic(&self, topic_id: i32) -> Result<()>;
-    fn get_topic_partition_count(&self, name: &str) -> Result<Option<i32>>;
-    fn set_topic_partition_count(&self, name: &str, partition_count: i32) -> Result<()>;
-
-    // ===== Admin Consumer Group Operations (Phase 6) =====
-    fn delete_consumer_group_offsets(&self, group_id: &str) -> Result<()>;
-
-    // ===== Idempotent Producer Operations (Phase 9) =====
-    fn allocate_producer_id(&self, client_id: Option<&str>, transactional_id: Option<&str>) -> Result<(i64, i16)>;
-    fn get_producer_epoch(&self, producer_id: i64) -> Result<Option<i16>>;
-    fn increment_producer_epoch(&self, producer_id: i64) -> Result<i16>;
-    fn check_and_update_sequence(&self, producer_id: i64, producer_epoch: i16, topic_id: i32, partition_id: i32, base_sequence: i32, record_count: i32) -> Result<bool>;
-    fn record_producer_sequence(&self, producer_id: i64, topic_id: i32, partition_id: i32, last_sequence: i32) -> Result<()>;
-
-    // ===== Transaction Operations (Phase 10) =====
-    fn get_or_create_transactional_producer(&self, transactional_id: &str, transaction_timeout_ms: i32, client_id: Option<&str>) -> Result<(i64, i16)>;
-    fn begin_transaction(&self, transactional_id: &str, producer_id: i64, producer_epoch: i16) -> Result<()>;
-    fn begin_or_continue_transaction(&self, transactional_id: &str, producer_id: i64, producer_epoch: i16) -> Result<()>;
-    fn validate_transaction(&self, transactional_id: &str, producer_id: i64, producer_epoch: i16) -> Result<()>;
-    fn insert_transactional_records(&self, topic_id: i32, partition_id: i32, records: &[Record], producer_id: i64, producer_epoch: i16) -> Result<i64>;
-    fn store_txn_pending_offset(&self, transactional_id: &str, group_id: &str, topic_id: i32, partition_id: i32, offset: i64, metadata: Option<&str>) -> Result<()>;
-    fn commit_transaction(&self, transactional_id: &str, producer_id: i64, producer_epoch: i16) -> Result<()>;
-    fn abort_transaction(&self, transactional_id: &str, producer_id: i64, producer_epoch: i16) -> Result<()>;
-    fn get_transaction_state(&self, transactional_id: &str) -> Result<Option<TransactionState>>;
-    fn fetch_records_with_isolation(&self, topic_id: i32, partition_id: i32, fetch_offset: i64, max_bytes: i32, isolation_level: IsolationLevel) -> Result<Vec<FetchedMessage>>;
-    fn get_last_stable_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64>;
-    fn abort_timed_out_transactions(&self, timeout: Duration) -> Result<Vec<String>>;
-    fn cleanup_aborted_messages(&self, older_than: Duration) -> Result<u64>;
-
-    // ===== Config / log management =====
-    fn get_topic_retention_ms(&self, topic_id: i32) -> Result<Option<i64>>;
-    fn set_topic_retention_ms(&self, topic_id: i32, retention_ms: Option<i64>) -> Result<()>;
-    fn delete_records_before(&self, topic_id: i32, partition_id: i32, before_offset: i64) -> Result<i64>;
-}
-```
+A wrapper forwards a role it does not change with one macro line,
+`delegate_topic_store!(TopicStore, inner)` (one `delegate_*_store!` per role, defined next to
+the traits). Code calling store methods on a concrete type imports
+`crate::kafka::storage::roles::*`.
 
 **Storage-Specific Types:**
 - `TopicMetadata` - Internal representation of topic metadata
@@ -92,13 +54,16 @@ pub trait KafkaStore {
 - `IsolationLevel` - `ReadUncommitted` / `ReadCommitted` for fetches
 
 **Implementations:**
-- `PostgresStore` (`storage/postgres.rs`) - production implementation over pgrx SPI. All of its SQL lives here.
-  It also has inherent (non-trait) maintenance methods such as `run_retention_sweep`, called by the worker
-  and by the `pg_kafka_run_retention_sweep()` SQL function.
-- `ShadowStore<S: KafkaStore>` (`shadow/store.rs`) - a decorator that implements `KafkaStore` by delegating
-  to an inner store and writing the shadow-mode outbox. The worker uses `ShadowStore<PostgresStore>`.
-- `MockKafkaStore` (`testing/mocks.rs`) - mockall-generated test double for handler unit tests.
-- `MockStore` (`handler_context.rs`, test-only) - minimal stub used by the `HandlerContext` tests.
+- `PostgresStore` (`storage/postgres.rs`) - production implementation over pgrx SPI. All of its SQL lives here,
+  in one inherent `impl PostgresStore` block whose methods carry the role methods' names; `postgres/roles.rs`
+  implements each role by forwarding to them (`delegate_*_store!(PostgresStore)`), so the split moved no SQL.
+  It also has inherent maintenance methods such as `run_retention_sweep`, called by the worker and by the
+  `pg_kafka_run_retention_sweep()` SQL function.
+- `ShadowStore<S: KafkaStore>` (`shadow/store.rs`) - a decorator over an inner store. It forwards
+  `TopicStore`, `OffsetStore` and `ProducerStore` wholesale and implements `LogStore` (outbox on write,
+  external-primary read suppression), `TransactionStore` (forward-on-commit buffer) and `MaintenanceStore`
+  (stale-buffer eviction). The worker uses `ShadowStore<PostgresStore>`.
+- `MockKafkaStore` (`testing/mocks.rs`) - mockall-generated test double (all six roles) for unit tests.
 
 **Implementation Details:**
 - Uses pgrx SPI (`Spi::connect` / `Spi::connect_mut`) for database operations
@@ -292,8 +257,8 @@ pub fn handle_fetch(ctx: &HandlerContext, topic_data: Vec<TopicFetchData>, isola
     // No SQL knowledge needed
 }
 
-// storage/postgres.rs - centralized SQL
-impl KafkaStore for PostgresStore {
+// storage/postgres.rs - centralized SQL (the role traits forward to these methods)
+impl PostgresStore {
     fn fetch_records(...) -> Result<Vec<FetchedMessage>> {
         // All SQL in one place
         // Parameterized queries
@@ -334,7 +299,7 @@ pub struct FileSystemStore;
 pub struct S3Store;
 pub struct RedisStore;
 
-// All implement KafkaStore trait
+// All implement the six role traits, and so KafkaStore
 ```
 
 ### 3. Handler Unit Tests (done)

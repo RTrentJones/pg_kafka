@@ -9,22 +9,36 @@ use crate::kafka::constants::{
 use crate::kafka::error::Result;
 use crate::kafka::messages::Record;
 use crate::kafka::storage::{
-    CommittedOffset, FetchedMessage, IsolationLevel, KafkaStore, TopicMetadata, TransactionState,
+    CommittedOffset, FetchedMessage, IsolationLevel, LogStore, MaintenanceStore, OffsetStore,
+    ProducerStore, TopicMetadata, TopicStore, TransactionState, TransactionStore,
 };
 use mockall::mock;
 use mockall::predicate::*;
 use std::time::Duration;
 
-// MockKafkaStore: Auto-generated mock for KafkaStore trait.
+// MockKafkaStore: Auto-generated mock implementing every storage role (so KafkaStore).
 // This allows setting expectations on storage operations without requiring
 // a real database connection. Use this in handler tests to isolate protocol
 // logic from database concerns.
 mock! {
     pub KafkaStore {}
 
-    impl KafkaStore for KafkaStore {
+    impl TopicStore for KafkaStore {
         fn get_or_create_topic<'a>(&self, name: &'a str, default_partitions: i32) -> Result<(i32, i32)>;
         fn get_topic_metadata<'a>(&self, names: Option<&'a [String]>) -> Result<Vec<TopicMetadata>>;
+        fn topic_exists<'a>(&self, name: &'a str) -> Result<bool>;
+        fn create_topic<'a>(&self, name: &'a str, partition_count: i32) -> Result<i32>;
+        fn get_topic_id<'a>(&self, name: &'a str) -> Result<Option<i32>>;
+        fn delete_topic(&self, topic_id: i32) -> Result<()>;
+        fn get_topic_partition_count<'a>(&self, name: &'a str) -> Result<Option<i32>>;
+        fn set_topic_partition_count<'a>(&self, name: &'a str, partition_count: i32) -> Result<()>;
+        fn get_topic_retention_ms(&self, topic_id: i32) -> Result<Option<i64>>;
+        fn set_topic_retention_ms(&self, topic_id: i32, retention_ms: Option<i64>) -> Result<()>;
+    }
+
+    impl LogStore for KafkaStore {
+        // get_partition_bounds keeps the trait default, so expectations on the
+        // single-value bound methods drive handler tests.
         fn insert_records<'a>(&self, topic_id: i32, partition_id: i32, records: &'a [Record]) -> Result<i64>;
         fn fetch_records(
             &self,
@@ -33,15 +47,28 @@ mock! {
             fetch_offset: i64,
             max_bytes: i32,
         ) -> Result<Vec<FetchedMessage>>;
+        fn fetch_records_with_isolation(
+            &self,
+            topic_id: i32,
+            partition_id: i32,
+            fetch_offset: i64,
+            max_bytes: i32,
+            isolation_level: IsolationLevel,
+        ) -> Result<Vec<FetchedMessage>>;
         fn get_high_watermark(&self, topic_id: i32, partition_id: i32) -> Result<i64>;
         fn get_earliest_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64>;
         fn get_log_start_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64>;
+        fn get_last_stable_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64>;
         fn get_offset_for_timestamp(
             &self,
             topic_id: i32,
             partition_id: i32,
             timestamp_ms: i64,
         ) -> Result<Option<(i64, i64)>>;
+        fn delete_records_before(&self, topic_id: i32, partition_id: i32, before_offset: i64) -> Result<i64>;
+    }
+
+    impl OffsetStore for KafkaStore {
         fn commit_offset<'a>(
             &self,
             group_id: &'a str,
@@ -57,16 +84,10 @@ mock! {
             partition_id: i32,
         ) -> Result<Option<CommittedOffset>>;
         fn fetch_all_offsets<'a>(&self, group_id: &'a str) -> Result<Vec<(String, i32, CommittedOffset)>>;
-        // Admin Topic Operations (Phase 6)
-        fn topic_exists<'a>(&self, name: &'a str) -> Result<bool>;
-        fn create_topic<'a>(&self, name: &'a str, partition_count: i32) -> Result<i32>;
-        fn get_topic_id<'a>(&self, name: &'a str) -> Result<Option<i32>>;
-        fn delete_topic(&self, topic_id: i32) -> Result<()>;
-        fn get_topic_partition_count<'a>(&self, name: &'a str) -> Result<Option<i32>>;
-        fn set_topic_partition_count<'a>(&self, name: &'a str, partition_count: i32) -> Result<()>;
-        // Admin Consumer Group Operations (Phase 6)
         fn delete_consumer_group_offsets<'a>(&self, group_id: &'a str) -> Result<()>;
-        // Idempotent Producer Operations (Phase 9)
+    }
+
+    impl ProducerStore for KafkaStore {
         fn allocate_producer_id<'a>(
             &self,
             client_id: Option<&'a str>,
@@ -90,7 +111,9 @@ mock! {
             partition_id: i32,
             last_sequence: i32,
         ) -> Result<()>;
-        // Transaction Operations (Phase 10)
+    }
+
+    impl TransactionStore for KafkaStore {
         fn get_or_create_transactional_producer<'a>(
             &self,
             transactional_id: &'a str,
@@ -145,21 +168,11 @@ mock! {
             producer_epoch: i16,
         ) -> Result<()>;
         fn get_transaction_state<'a>(&self, transactional_id: &'a str) -> Result<Option<TransactionState>>;
-        fn fetch_records_with_isolation(
-            &self,
-            topic_id: i32,
-            partition_id: i32,
-            fetch_offset: i64,
-            max_bytes: i32,
-            isolation_level: IsolationLevel,
-        ) -> Result<Vec<FetchedMessage>>;
-        fn get_last_stable_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64>;
+    }
+
+    impl MaintenanceStore for KafkaStore {
         fn abort_timed_out_transactions(&self, timeout: Duration) -> Result<Vec<String>>;
         fn cleanup_aborted_messages(&self, older_than: Duration) -> Result<u64>;
-        // Topic config + log management (DescribeConfigs 32 / IncrementalAlterConfigs 44 / DeleteRecords 21)
-        fn get_topic_retention_ms(&self, topic_id: i32) -> Result<Option<i64>>;
-        fn set_topic_retention_ms(&self, topic_id: i32, retention_ms: Option<i64>) -> Result<()>;
-        fn delete_records_before(&self, topic_id: i32, partition_id: i32, before_offset: i64) -> Result<i64>;
     }
 }
 

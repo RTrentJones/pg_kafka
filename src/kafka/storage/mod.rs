@@ -168,7 +168,7 @@ impl IsolationLevel {
 }
 
 /// Offset bounds of one partition, as reported in a Fetch response
-/// (see [`KafkaStore::get_partition_bounds`]).
+/// (see [`LogStore::get_partition_bounds`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PartitionBounds {
     /// Log-end offset; never regresses (BUG-4).
@@ -234,18 +234,20 @@ pub fn order_topic_metadata(names: &[String], rows: Vec<(String, i32, i32)>) -> 
         .collect()
 }
 
-/// Abstract storage interface for Kafka data operations
+/// Abstract storage interface for Kafka data operations, split into role traits.
 ///
-/// This trait defines the contract between the Kafka protocol handlers
-/// and the underlying storage implementation. Implementors handle the
-/// actual data persistence (SQL, file system, etc.) while handlers
-/// focus on protocol logic.
+/// These traits define the contract between the Kafka protocol handlers and the
+/// underlying storage implementation. Implementors handle the actual data persistence
+/// (SQL, file system, etc.) while handlers focus on protocol logic. Each role groups the
+/// methods one concern needs, so a wrapper (`ShadowStore`) can delegate whole roles it
+/// does not change ([`DelegateTopicStore`], [`DelegateOffsetStore`],
+/// [`DelegateProducerStore`]) and code that needs one concern can take just that role.
+/// [`KafkaStore`] is the sum of all roles.
 ///
-/// All methods are assumed to run within a transaction context managed
-/// by the caller (typically the background worker).
-pub trait KafkaStore {
-    // ===== Topic Operations =====
-
+/// All methods are assumed to run within a transaction context managed by the caller
+/// (typically the background worker).
+/// Topic catalog: lookup, auto-create, admin (create/delete/partition count) and per-topic config.
+pub trait TopicStore {
     /// Get or create a topic by name
     ///
     /// If the topic exists, returns its ID and partition count.
@@ -267,130 +269,6 @@ pub trait KafkaStore {
     /// # Returns
     /// Vector of topic metadata
     fn get_topic_metadata(&self, names: Option<&[String]>) -> Result<Vec<TopicMetadata>>;
-
-    // ===== Message Operations =====
-
-    /// Insert records into a topic partition
-    ///
-    /// # Arguments
-    /// * `topic_id` - Topic ID
-    /// * `partition_id` - Partition ID
-    /// * `records` - Slice of records to insert
-    ///
-    /// # Returns
-    /// Base partition offset assigned to the first record
-    fn insert_records(&self, topic_id: i32, partition_id: i32, records: &[Record]) -> Result<i64>;
-
-    /// Fetch messages from a topic partition
-    ///
-    /// # Arguments
-    /// * `topic_id` - Topic ID
-    /// * `partition_id` - Partition ID
-    /// * `fetch_offset` - Offset to start fetching from
-    /// * `max_bytes` - Maximum bytes to fetch (approximate limit)
-    ///
-    /// # Returns
-    /// Vector of fetched messages
-    fn fetch_records(
-        &self,
-        topic_id: i32,
-        partition_id: i32,
-        fetch_offset: i64,
-        max_bytes: i32,
-    ) -> Result<Vec<FetchedMessage>>;
-
-    /// Get high watermark for a topic partition
-    ///
-    /// The high watermark is the offset of the next message to be written.
-    ///
-    /// # Arguments
-    /// * `topic_id` - Topic ID
-    /// * `partition_id` - Partition ID
-    ///
-    /// # Returns
-    /// High watermark offset (0 if partition is empty)
-    fn get_high_watermark(&self, topic_id: i32, partition_id: i32) -> Result<i64>;
-
-    /// Get earliest offset for a topic partition
-    ///
-    /// The earliest offset is the offset of the first available message.
-    ///
-    /// # Arguments
-    /// * `topic_id` - Topic ID
-    /// * `partition_id` - Partition ID
-    ///
-    /// # Returns
-    /// Earliest offset (0 if partition is empty)
-    fn get_earliest_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64>;
-
-    /// Get the durable log start offset for a topic partition
-    /// (`kafka.partition_offsets.log_start_offset`).
-    ///
-    /// Unlike [`get_earliest_offset`](Self::get_earliest_offset), this ignores which
-    /// rows happen to survive: aborted-message cleanup can delete a partition's leading
-    /// rows without retiring those offsets, so only DeleteRecords and the retention
-    /// sweep (which advance this column) make an offset out of range. Returns 0 when the
-    /// partition has no counter row.
-    fn get_log_start_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64>;
-
-    /// Find the earliest offset whose record timestamp is at or after `timestamp_ms` (CONF-7,
-    /// Kafka's ListOffsets-by-timestamp). Returns `(offset, record_timestamp_ms)`, or `None` when no
-    /// visible record qualifies. Records that carried no timestamp (stored as -1) are excluded.
-    fn get_offset_for_timestamp(
-        &self,
-        topic_id: i32,
-        partition_id: i32,
-        timestamp_ms: i64,
-    ) -> Result<Option<(i64, i64)>>;
-
-    // ===== Consumer Offset Operations =====
-
-    /// Commit consumer offsets for a group
-    ///
-    /// # Arguments
-    /// * `group_id` - Consumer group ID
-    /// * `topic_id` - Topic ID
-    /// * `partition_id` - Partition ID
-    /// * `offset` - Offset to commit
-    /// * `metadata` - Optional metadata
-    ///
-    /// # Returns
-    /// Ok on success
-    fn commit_offset(
-        &self,
-        group_id: &str,
-        topic_id: i32,
-        partition_id: i32,
-        offset: i64,
-        metadata: Option<&str>,
-    ) -> Result<()>;
-
-    /// Fetch committed offset for a consumer group partition
-    ///
-    /// # Arguments
-    /// * `group_id` - Consumer group ID
-    /// * `topic_id` - Topic ID
-    /// * `partition_id` - Partition ID
-    ///
-    /// # Returns
-    /// Committed offset info, or None if not committed
-    fn fetch_offset(
-        &self,
-        group_id: &str,
-        topic_id: i32,
-        partition_id: i32,
-    ) -> Result<Option<CommittedOffset>>;
-
-    /// Fetch all committed offsets for a consumer group
-    ///
-    /// # Arguments
-    /// * `group_id` - Consumer group ID
-    ///
-    /// # Returns
-    /// Map of (topic_name, partition_id) -> CommittedOffset
-    fn fetch_all_offsets(&self, group_id: &str) -> Result<Vec<(String, i32, CommittedOffset)>>;
-
-    // ===== Admin Topic Operations (Phase 6) =====
 
     /// Check if a topic exists
     ///
@@ -448,7 +326,235 @@ pub trait KafkaStore {
     /// Ok on success
     fn set_topic_partition_count(&self, name: &str, partition_count: i32) -> Result<()>;
 
-    // ===== Admin Consumer Group Operations (Phase 6) =====
+    /// Get a topic's per-topic `retention.ms` override (API 32/44 support).
+    ///
+    /// # Returns
+    /// `None` when the topic inherits the global
+    /// `pg_kafka.message_retention_hours`; `Some(ms)` when an override is set
+    /// (`ms < 0` = infinite retention for this topic).
+    fn get_topic_retention_ms(&self, topic_id: i32) -> Result<Option<i64>>;
+
+    /// Set or clear a topic's `retention.ms` override (IncrementalAlterConfigs).
+    ///
+    /// # Arguments
+    /// * `retention_ms` - `Some(ms)` to set (negative = infinite), `None` to
+    ///   clear the override and fall back to the global GUC
+    fn set_topic_retention_ms(&self, topic_id: i32, retention_ms: Option<i64>) -> Result<()>;
+}
+
+/// The message log: append, read (with isolation), offset bounds and truncation.
+pub trait LogStore {
+    /// Insert records into a topic partition
+    ///
+    /// # Arguments
+    /// * `topic_id` - Topic ID
+    /// * `partition_id` - Partition ID
+    /// * `records` - Slice of records to insert
+    ///
+    /// # Returns
+    /// Base partition offset assigned to the first record
+    fn insert_records(&self, topic_id: i32, partition_id: i32, records: &[Record]) -> Result<i64>;
+
+    /// Fetch messages from a topic partition
+    ///
+    /// # Arguments
+    /// * `topic_id` - Topic ID
+    /// * `partition_id` - Partition ID
+    /// * `fetch_offset` - Offset to start fetching from
+    /// * `max_bytes` - Maximum bytes to fetch (approximate limit)
+    ///
+    /// # Returns
+    /// Vector of fetched messages
+    fn fetch_records(
+        &self,
+        topic_id: i32,
+        partition_id: i32,
+        fetch_offset: i64,
+        max_bytes: i32,
+    ) -> Result<Vec<FetchedMessage>>;
+
+    /// Fetch records with isolation level filtering
+    ///
+    /// Like fetch_records but respects isolation level:
+    /// - ReadUncommitted: returns all records (existing behavior)
+    /// - ReadCommitted: filters out records where txn_state='pending' or 'aborted'
+    ///
+    /// # Arguments
+    /// * `topic_id` - Topic ID
+    /// * `partition_id` - Partition ID
+    /// * `fetch_offset` - Offset to start fetching from
+    /// * `max_bytes` - Maximum bytes to fetch (approximate limit)
+    /// * `isolation_level` - Consumer isolation level
+    ///
+    /// # Returns
+    /// Vector of fetched messages respecting isolation level
+    fn fetch_records_with_isolation(
+        &self,
+        topic_id: i32,
+        partition_id: i32,
+        fetch_offset: i64,
+        max_bytes: i32,
+        isolation_level: IsolationLevel,
+    ) -> Result<Vec<FetchedMessage>>;
+
+    /// Get high watermark for a topic partition
+    ///
+    /// The high watermark is the offset of the next message to be written.
+    ///
+    /// # Arguments
+    /// * `topic_id` - Topic ID
+    /// * `partition_id` - Partition ID
+    ///
+    /// # Returns
+    /// High watermark offset (0 if partition is empty)
+    fn get_high_watermark(&self, topic_id: i32, partition_id: i32) -> Result<i64>;
+
+    /// Get earliest offset for a topic partition
+    ///
+    /// The earliest offset is the offset of the first available message.
+    ///
+    /// # Arguments
+    /// * `topic_id` - Topic ID
+    /// * `partition_id` - Partition ID
+    ///
+    /// # Returns
+    /// Earliest offset (0 if partition is empty)
+    fn get_earliest_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64>;
+
+    /// Get the durable log start offset for a topic partition
+    /// (`kafka.partition_offsets.log_start_offset`).
+    ///
+    /// Unlike [`get_earliest_offset`](Self::get_earliest_offset), this ignores which
+    /// rows happen to survive: aborted-message cleanup can delete a partition's leading
+    /// rows without retiring those offsets, so only DeleteRecords and the retention
+    /// sweep (which advance this column) make an offset out of range. Returns 0 when the
+    /// partition has no counter row.
+    fn get_log_start_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64>;
+
+    /// Get last stable offset for a partition
+    ///
+    /// Returns the lowest offset of any pending transaction, or the high
+    /// watermark if no transactions are pending. Used by read_committed
+    /// consumers to know how far they can safely read.
+    ///
+    /// # Arguments
+    /// * `topic_id` - Topic ID
+    /// * `partition_id` - Partition ID
+    ///
+    /// # Returns
+    /// Last stable offset
+    fn get_last_stable_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64>;
+
+    /// All offset bounds a Fetch response reports for one partition, in one storage
+    /// round trip: high watermark, last stable offset (for `isolation_level`; equal
+    /// to the high watermark for ReadUncommitted), earliest offset and durable log
+    /// start. Each field matches the corresponding single-value method
+    /// (`get_high_watermark`, `get_last_stable_offset`, `get_earliest_offset`,
+    /// `get_log_start_offset`).
+    ///
+    /// The default composes those methods (four statements). `PostgresStore`
+    /// overrides it with a single statement, and `ShadowStore` forwards it; the
+    /// mockall `MockKafkaStore` deliberately keeps this default so expectations set
+    /// on the single-value methods keep driving handler tests.
+    fn get_partition_bounds(
+        &self,
+        topic_id: i32,
+        partition_id: i32,
+        isolation_level: IsolationLevel,
+    ) -> Result<PartitionBounds> {
+        let high_watermark = self.get_high_watermark(topic_id, partition_id)?;
+        let last_stable_offset = match isolation_level {
+            IsolationLevel::ReadCommitted => self.get_last_stable_offset(topic_id, partition_id)?,
+            IsolationLevel::ReadUncommitted => high_watermark,
+        };
+        let earliest_offset = self.get_earliest_offset(topic_id, partition_id)?;
+        let log_start_offset = self.get_log_start_offset(topic_id, partition_id)?;
+        Ok(PartitionBounds {
+            high_watermark,
+            last_stable_offset,
+            earliest_offset,
+            log_start_offset,
+        })
+    }
+
+    /// Find the earliest offset whose record timestamp is at or after `timestamp_ms` (CONF-7,
+    /// Kafka's ListOffsets-by-timestamp). Returns `(offset, record_timestamp_ms)`, or `None` when no
+    /// visible record qualifies. Records that carried no timestamp (stored as -1) are excluded.
+    fn get_offset_for_timestamp(
+        &self,
+        topic_id: i32,
+        partition_id: i32,
+        timestamp_ms: i64,
+    ) -> Result<Option<(i64, i64)>>;
+
+    /// Delete records below `before_offset` in a partition (DeleteRecords, API 21).
+    ///
+    /// Rows with `partition_offset < before_offset` are removed (pending
+    /// transactional rows included — the caller has explicitly asked for
+    /// truncation, matching Kafka semantics where DeleteRecords advances the
+    /// log start offset unconditionally).
+    ///
+    /// # Arguments
+    /// * `before_offset` - Exclusive upper bound; caller must already have
+    ///   clamped/validated it against the high watermark
+    ///
+    /// # Returns
+    /// The partition's new log start offset (earliest remaining offset, or the
+    /// high watermark when the partition is now empty)
+    fn delete_records_before(
+        &self,
+        topic_id: i32,
+        partition_id: i32,
+        before_offset: i64,
+    ) -> Result<i64>;
+}
+
+/// Committed consumer-group offsets.
+pub trait OffsetStore {
+    /// Commit consumer offsets for a group
+    ///
+    /// # Arguments
+    /// * `group_id` - Consumer group ID
+    /// * `topic_id` - Topic ID
+    /// * `partition_id` - Partition ID
+    /// * `offset` - Offset to commit
+    /// * `metadata` - Optional metadata
+    ///
+    /// # Returns
+    /// Ok on success
+    fn commit_offset(
+        &self,
+        group_id: &str,
+        topic_id: i32,
+        partition_id: i32,
+        offset: i64,
+        metadata: Option<&str>,
+    ) -> Result<()>;
+
+    /// Fetch committed offset for a consumer group partition
+    ///
+    /// # Arguments
+    /// * `group_id` - Consumer group ID
+    /// * `topic_id` - Topic ID
+    /// * `partition_id` - Partition ID
+    ///
+    /// # Returns
+    /// Committed offset info, or None if not committed
+    fn fetch_offset(
+        &self,
+        group_id: &str,
+        topic_id: i32,
+        partition_id: i32,
+    ) -> Result<Option<CommittedOffset>>;
+
+    /// Fetch all committed offsets for a consumer group
+    ///
+    /// # Arguments
+    /// * `group_id` - Consumer group ID
+    ///
+    /// # Returns
+    /// Map of (topic_name, partition_id) -> CommittedOffset
+    fn fetch_all_offsets(&self, group_id: &str) -> Result<Vec<(String, i32, CommittedOffset)>>;
 
     /// Delete all committed offsets for a consumer group
     ///
@@ -458,9 +564,10 @@ pub trait KafkaStore {
     /// # Returns
     /// Ok on success
     fn delete_consumer_group_offsets(&self, group_id: &str) -> Result<()>;
+}
 
-    // ===== Idempotent Producer Operations (Phase 9) =====
-
+/// Idempotent producer state: producer ids, epochs and sequence numbers (Phase 9).
+pub trait ProducerStore {
     /// Allocate a new producer ID with epoch 0
     ///
     /// Creates a new entry in the producer_ids table and returns the allocated
@@ -544,9 +651,10 @@ pub trait KafkaStore {
         partition_id: i32,
         last_sequence: i32,
     ) -> Result<()>;
+}
 
-    // ===== Transaction Operations (Phase 10) =====
-
+/// Transactions: transactional producers, state, transactional writes and offsets, commit/abort (Phase 10).
+pub trait TransactionStore {
     /// Look up or create producer by transactional_id
     ///
     /// If transactional_id exists: bump epoch (fences old producer), return existing producer_id.
@@ -707,77 +815,10 @@ pub trait KafkaStore {
     /// # Returns
     /// Current transaction state, or None if transactional_id not found
     fn get_transaction_state(&self, transactional_id: &str) -> Result<Option<TransactionState>>;
+}
 
-    /// Fetch records with isolation level filtering
-    ///
-    /// Like fetch_records but respects isolation level:
-    /// - ReadUncommitted: returns all records (existing behavior)
-    /// - ReadCommitted: filters out records where txn_state='pending' or 'aborted'
-    ///
-    /// # Arguments
-    /// * `topic_id` - Topic ID
-    /// * `partition_id` - Partition ID
-    /// * `fetch_offset` - Offset to start fetching from
-    /// * `max_bytes` - Maximum bytes to fetch (approximate limit)
-    /// * `isolation_level` - Consumer isolation level
-    ///
-    /// # Returns
-    /// Vector of fetched messages respecting isolation level
-    fn fetch_records_with_isolation(
-        &self,
-        topic_id: i32,
-        partition_id: i32,
-        fetch_offset: i64,
-        max_bytes: i32,
-        isolation_level: IsolationLevel,
-    ) -> Result<Vec<FetchedMessage>>;
-
-    /// Get last stable offset for a partition
-    ///
-    /// Returns the lowest offset of any pending transaction, or the high
-    /// watermark if no transactions are pending. Used by read_committed
-    /// consumers to know how far they can safely read.
-    ///
-    /// # Arguments
-    /// * `topic_id` - Topic ID
-    /// * `partition_id` - Partition ID
-    ///
-    /// # Returns
-    /// Last stable offset
-    fn get_last_stable_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64>;
-
-    /// All offset bounds a Fetch response reports for one partition, in one storage
-    /// round trip: high watermark, last stable offset (for `isolation_level`; equal
-    /// to the high watermark for ReadUncommitted), earliest offset and durable log
-    /// start. Each field matches the corresponding single-value method
-    /// (`get_high_watermark`, `get_last_stable_offset`, `get_earliest_offset`,
-    /// `get_log_start_offset`).
-    ///
-    /// The default composes those methods (four statements). `PostgresStore`
-    /// overrides it with a single statement, and `ShadowStore` forwards it; the
-    /// mockall `MockKafkaStore` deliberately keeps this default so expectations set
-    /// on the single-value methods keep driving handler tests.
-    fn get_partition_bounds(
-        &self,
-        topic_id: i32,
-        partition_id: i32,
-        isolation_level: IsolationLevel,
-    ) -> Result<PartitionBounds> {
-        let high_watermark = self.get_high_watermark(topic_id, partition_id)?;
-        let last_stable_offset = match isolation_level {
-            IsolationLevel::ReadCommitted => self.get_last_stable_offset(topic_id, partition_id)?,
-            IsolationLevel::ReadUncommitted => high_watermark,
-        };
-        let earliest_offset = self.get_earliest_offset(topic_id, partition_id)?;
-        let log_start_offset = self.get_log_start_offset(topic_id, partition_id)?;
-        Ok(PartitionBounds {
-            high_watermark,
-            last_stable_offset,
-            earliest_offset,
-            log_start_offset,
-        })
-    }
-
+/// Background maintenance the worker runs between requests.
+pub trait MaintenanceStore {
     /// Abort timed-out transactions
     ///
     /// Finds transactions in 'Ongoing' state that have exceeded their timeout
@@ -801,43 +842,212 @@ pub trait KafkaStore {
     /// # Returns
     /// Number of messages deleted
     fn cleanup_aborted_messages(&self, older_than: Duration) -> Result<u64>;
-
-    /// Get a topic's per-topic `retention.ms` override (API 32/44 support).
-    ///
-    /// # Returns
-    /// `None` when the topic inherits the global
-    /// `pg_kafka.message_retention_hours`; `Some(ms)` when an override is set
-    /// (`ms < 0` = infinite retention for this topic).
-    fn get_topic_retention_ms(&self, topic_id: i32) -> Result<Option<i64>>;
-
-    /// Set or clear a topic's `retention.ms` override (IncrementalAlterConfigs).
-    ///
-    /// # Arguments
-    /// * `retention_ms` - `Some(ms)` to set (negative = infinite), `None` to
-    ///   clear the override and fall back to the global GUC
-    fn set_topic_retention_ms(&self, topic_id: i32, retention_ms: Option<i64>) -> Result<()>;
-
-    /// Delete records below `before_offset` in a partition (DeleteRecords, API 21).
-    ///
-    /// Rows with `partition_offset < before_offset` are removed (pending
-    /// transactional rows included — the caller has explicitly asked for
-    /// truncation, matching Kafka semantics where DeleteRecords advances the
-    /// log start offset unconditionally).
-    ///
-    /// # Arguments
-    /// * `before_offset` - Exclusive upper bound; caller must already have
-    ///   clamped/validated it against the high watermark
-    ///
-    /// # Returns
-    /// The partition's new log start offset (earliest remaining offset, or the
-    /// high watermark when the partition is now empty)
-    fn delete_records_before(
-        &self,
-        topic_id: i32,
-        partition_id: i32,
-        before_offset: i64,
-    ) -> Result<i64>;
 }
+
+/// Every storage role: what handlers see through `HandlerContext::store`. Implemented for
+/// every type that implements all roles.
+pub trait KafkaStore:
+    TopicStore + LogStore + OffsetStore + ProducerStore + TransactionStore + MaintenanceStore
+{
+}
+
+impl<T> KafkaStore for T where
+    T: TopicStore
+        + LogStore
+        + OffsetStore
+        + ProducerStore
+        + TransactionStore
+        + MaintenanceStore
+        + ?Sized
+{
+}
+
+/// Every storage role trait, for code that calls store methods on a concrete store type
+/// (`use crate::kafka::storage::roles::*`); through `&dyn KafkaStore` they are in scope
+/// already.
+pub mod roles {
+    pub use super::{
+        LogStore, MaintenanceStore, OffsetStore, ProducerStore, TopicStore, TransactionStore,
+    };
+}
+
+// ===== Role delegation =====
+// A wrapper that changes nothing about a role forwards it wholesale with one of these
+// macros instead of re-listing the role method by method.
+
+/// Implement every [`TopicStore`] method by forwarding to `$via::method(receiver, ...)`:
+/// `delegate_topic_store!(Trait, field)` forwards to `&self.field`, `delegate_topic_store!(Type)` to `self` (for a
+/// type whose inherent methods carry the same names). Used inside an `impl TopicStore for ...`.
+macro_rules! delegate_topic_store {
+    ($via:ident $(, $field:ident)?) => {
+        fn get_or_create_topic(&self, name: &str, default_partitions: i32) -> $crate::kafka::error::Result<(i32, i32)> {
+            $via::get_or_create_topic(&self $(.$field)?, name, default_partitions)
+        }
+        fn get_topic_metadata(&self, names: Option<&[String]>) -> $crate::kafka::error::Result<Vec<$crate::kafka::storage::TopicMetadata>> {
+            $via::get_topic_metadata(&self $(.$field)?, names)
+        }
+        fn topic_exists(&self, name: &str) -> $crate::kafka::error::Result<bool> {
+            $via::topic_exists(&self $(.$field)?, name)
+        }
+        fn create_topic(&self, name: &str, partition_count: i32) -> $crate::kafka::error::Result<i32> {
+            $via::create_topic(&self $(.$field)?, name, partition_count)
+        }
+        fn get_topic_id(&self, name: &str) -> $crate::kafka::error::Result<Option<i32>> {
+            $via::get_topic_id(&self $(.$field)?, name)
+        }
+        fn delete_topic(&self, topic_id: i32) -> $crate::kafka::error::Result<()> {
+            $via::delete_topic(&self $(.$field)?, topic_id)
+        }
+        fn get_topic_partition_count(&self, name: &str) -> $crate::kafka::error::Result<Option<i32>> {
+            $via::get_topic_partition_count(&self $(.$field)?, name)
+        }
+        fn set_topic_partition_count(&self, name: &str, partition_count: i32) -> $crate::kafka::error::Result<()> {
+            $via::set_topic_partition_count(&self $(.$field)?, name, partition_count)
+        }
+        fn get_topic_retention_ms(&self, topic_id: i32) -> $crate::kafka::error::Result<Option<i64>> {
+            $via::get_topic_retention_ms(&self $(.$field)?, topic_id)
+        }
+        fn set_topic_retention_ms(&self, topic_id: i32, retention_ms: Option<i64>) -> $crate::kafka::error::Result<()> {
+            $via::set_topic_retention_ms(&self $(.$field)?, topic_id, retention_ms)
+        }
+    };
+}
+pub(crate) use delegate_topic_store;
+
+/// Implement every [`LogStore`] method by forwarding to `$via::method(receiver, ...)`:
+/// `delegate_log_store!(Trait, field)` forwards to `&self.field`, `delegate_log_store!(Type)` to `self` (for a
+/// type whose inherent methods carry the same names). Used inside an `impl LogStore for ...`.
+macro_rules! delegate_log_store {
+    ($via:ident $(, $field:ident)?) => {
+        fn insert_records(&self, topic_id: i32, partition_id: i32, records: &[$crate::kafka::messages::Record]) -> $crate::kafka::error::Result<i64> {
+            $via::insert_records(&self $(.$field)?, topic_id, partition_id, records)
+        }
+        fn fetch_records(&self, topic_id: i32, partition_id: i32, fetch_offset: i64, max_bytes: i32) -> $crate::kafka::error::Result<Vec<$crate::kafka::storage::FetchedMessage>> {
+            $via::fetch_records(&self $(.$field)?, topic_id, partition_id, fetch_offset, max_bytes)
+        }
+        fn fetch_records_with_isolation(&self, topic_id: i32, partition_id: i32, fetch_offset: i64, max_bytes: i32, isolation_level: $crate::kafka::storage::IsolationLevel) -> $crate::kafka::error::Result<Vec<$crate::kafka::storage::FetchedMessage>> {
+            $via::fetch_records_with_isolation(&self $(.$field)?, topic_id, partition_id, fetch_offset, max_bytes, isolation_level)
+        }
+        fn get_high_watermark(&self, topic_id: i32, partition_id: i32) -> $crate::kafka::error::Result<i64> {
+            $via::get_high_watermark(&self $(.$field)?, topic_id, partition_id)
+        }
+        fn get_earliest_offset(&self, topic_id: i32, partition_id: i32) -> $crate::kafka::error::Result<i64> {
+            $via::get_earliest_offset(&self $(.$field)?, topic_id, partition_id)
+        }
+        fn get_log_start_offset(&self, topic_id: i32, partition_id: i32) -> $crate::kafka::error::Result<i64> {
+            $via::get_log_start_offset(&self $(.$field)?, topic_id, partition_id)
+        }
+        fn get_last_stable_offset(&self, topic_id: i32, partition_id: i32) -> $crate::kafka::error::Result<i64> {
+            $via::get_last_stable_offset(&self $(.$field)?, topic_id, partition_id)
+        }
+        fn get_partition_bounds(&self, topic_id: i32, partition_id: i32, isolation_level: $crate::kafka::storage::IsolationLevel) -> $crate::kafka::error::Result<$crate::kafka::storage::PartitionBounds> {
+            $via::get_partition_bounds(&self $(.$field)?, topic_id, partition_id, isolation_level)
+        }
+        fn get_offset_for_timestamp(&self, topic_id: i32, partition_id: i32, timestamp_ms: i64) -> $crate::kafka::error::Result<Option<(i64, i64)>> {
+            $via::get_offset_for_timestamp(&self $(.$field)?, topic_id, partition_id, timestamp_ms)
+        }
+        fn delete_records_before(&self, topic_id: i32, partition_id: i32, before_offset: i64) -> $crate::kafka::error::Result<i64> {
+            $via::delete_records_before(&self $(.$field)?, topic_id, partition_id, before_offset)
+        }
+    };
+}
+pub(crate) use delegate_log_store;
+
+/// Implement every [`OffsetStore`] method by forwarding to `$via::method(receiver, ...)`:
+/// `delegate_offset_store!(Trait, field)` forwards to `&self.field`, `delegate_offset_store!(Type)` to `self` (for a
+/// type whose inherent methods carry the same names). Used inside an `impl OffsetStore for ...`.
+macro_rules! delegate_offset_store {
+    ($via:ident $(, $field:ident)?) => {
+        fn commit_offset(&self, group_id: &str, topic_id: i32, partition_id: i32, offset: i64, metadata: Option<&str>) -> $crate::kafka::error::Result<()> {
+            $via::commit_offset(&self $(.$field)?, group_id, topic_id, partition_id, offset, metadata)
+        }
+        fn fetch_offset(&self, group_id: &str, topic_id: i32, partition_id: i32) -> $crate::kafka::error::Result<Option<$crate::kafka::storage::CommittedOffset>> {
+            $via::fetch_offset(&self $(.$field)?, group_id, topic_id, partition_id)
+        }
+        fn fetch_all_offsets(&self, group_id: &str) -> $crate::kafka::error::Result<Vec<(String, i32, $crate::kafka::storage::CommittedOffset)>> {
+            $via::fetch_all_offsets(&self $(.$field)?, group_id)
+        }
+        fn delete_consumer_group_offsets(&self, group_id: &str) -> $crate::kafka::error::Result<()> {
+            $via::delete_consumer_group_offsets(&self $(.$field)?, group_id)
+        }
+    };
+}
+pub(crate) use delegate_offset_store;
+
+/// Implement every [`ProducerStore`] method by forwarding to `$via::method(receiver, ...)`:
+/// `delegate_producer_store!(Trait, field)` forwards to `&self.field`, `delegate_producer_store!(Type)` to `self` (for a
+/// type whose inherent methods carry the same names). Used inside an `impl ProducerStore for ...`.
+macro_rules! delegate_producer_store {
+    ($via:ident $(, $field:ident)?) => {
+        fn allocate_producer_id(&self, client_id: Option<&str>, transactional_id: Option<&str>) -> $crate::kafka::error::Result<(i64, i16)> {
+            $via::allocate_producer_id(&self $(.$field)?, client_id, transactional_id)
+        }
+        fn get_producer_epoch(&self, producer_id: i64) -> $crate::kafka::error::Result<Option<i16>> {
+            $via::get_producer_epoch(&self $(.$field)?, producer_id)
+        }
+        fn increment_producer_epoch(&self, producer_id: i64) -> $crate::kafka::error::Result<(i64, i16)> {
+            $via::increment_producer_epoch(&self $(.$field)?, producer_id)
+        }
+        fn check_and_update_sequence(&self, producer_id: i64, producer_epoch: i16, topic_id: i32, partition_id: i32, base_sequence: i32, record_count: i32) -> $crate::kafka::error::Result<bool> {
+            $via::check_and_update_sequence(&self $(.$field)?, producer_id, producer_epoch, topic_id, partition_id, base_sequence, record_count)
+        }
+        fn record_producer_sequence(&self, producer_id: i64, topic_id: i32, partition_id: i32, last_sequence: i32) -> $crate::kafka::error::Result<()> {
+            $via::record_producer_sequence(&self $(.$field)?, producer_id, topic_id, partition_id, last_sequence)
+        }
+    };
+}
+pub(crate) use delegate_producer_store;
+
+/// Implement every [`TransactionStore`] method by forwarding to `$via::method(receiver, ...)`:
+/// `delegate_transaction_store!(Trait, field)` forwards to `&self.field`, `delegate_transaction_store!(Type)` to `self` (for a
+/// type whose inherent methods carry the same names). Used inside an `impl TransactionStore for ...`.
+macro_rules! delegate_transaction_store {
+    ($via:ident $(, $field:ident)?) => {
+        fn get_or_create_transactional_producer(&self, transactional_id: &str, transaction_timeout_ms: i32, client_id: Option<&str>) -> $crate::kafka::error::Result<(i64, i16)> {
+            $via::get_or_create_transactional_producer(&self $(.$field)?, transactional_id, transaction_timeout_ms, client_id)
+        }
+        fn begin_transaction(&self, transactional_id: &str, producer_id: i64, producer_epoch: i16) -> $crate::kafka::error::Result<()> {
+            $via::begin_transaction(&self $(.$field)?, transactional_id, producer_id, producer_epoch)
+        }
+        fn begin_or_continue_transaction(&self, transactional_id: &str, producer_id: i64, producer_epoch: i16) -> $crate::kafka::error::Result<()> {
+            $via::begin_or_continue_transaction(&self $(.$field)?, transactional_id, producer_id, producer_epoch)
+        }
+        fn validate_transaction(&self, transactional_id: &str, producer_id: i64, producer_epoch: i16) -> $crate::kafka::error::Result<()> {
+            $via::validate_transaction(&self $(.$field)?, transactional_id, producer_id, producer_epoch)
+        }
+        fn insert_transactional_records(&self, topic_id: i32, partition_id: i32, records: &[$crate::kafka::messages::Record], producer_id: i64, producer_epoch: i16) -> $crate::kafka::error::Result<i64> {
+            $via::insert_transactional_records(&self $(.$field)?, topic_id, partition_id, records, producer_id, producer_epoch)
+        }
+        fn store_txn_pending_offset(&self, transactional_id: &str, group_id: &str, topic_id: i32, partition_id: i32, offset: i64, metadata: Option<&str>) -> $crate::kafka::error::Result<()> {
+            $via::store_txn_pending_offset(&self $(.$field)?, transactional_id, group_id, topic_id, partition_id, offset, metadata)
+        }
+        fn commit_transaction(&self, transactional_id: &str, producer_id: i64, producer_epoch: i16) -> $crate::kafka::error::Result<()> {
+            $via::commit_transaction(&self $(.$field)?, transactional_id, producer_id, producer_epoch)
+        }
+        fn abort_transaction(&self, transactional_id: &str, producer_id: i64, producer_epoch: i16) -> $crate::kafka::error::Result<()> {
+            $via::abort_transaction(&self $(.$field)?, transactional_id, producer_id, producer_epoch)
+        }
+        fn get_transaction_state(&self, transactional_id: &str) -> $crate::kafka::error::Result<Option<$crate::kafka::storage::TransactionState>> {
+            $via::get_transaction_state(&self $(.$field)?, transactional_id)
+        }
+    };
+}
+pub(crate) use delegate_transaction_store;
+
+/// Implement every [`MaintenanceStore`] method by forwarding to `$via::method(receiver, ...)`:
+/// `delegate_maintenance_store!(Trait, field)` forwards to `&self.field`, `delegate_maintenance_store!(Type)` to `self` (for a
+/// type whose inherent methods carry the same names). Used inside an `impl MaintenanceStore for ...`.
+macro_rules! delegate_maintenance_store {
+    ($via:ident $(, $field:ident)?) => {
+        fn abort_timed_out_transactions(&self, timeout: std::time::Duration) -> $crate::kafka::error::Result<Vec<String>> {
+            $via::abort_timed_out_transactions(&self $(.$field)?, timeout)
+        }
+        fn cleanup_aborted_messages(&self, older_than: std::time::Duration) -> $crate::kafka::error::Result<u64> {
+            $via::cleanup_aborted_messages(&self $(.$field)?, older_than)
+        }
+    };
+}
+pub(crate) use delegate_maintenance_store;
 
 /// Outcome of validating a producer batch's sequence range against the last
 /// persisted sequence for a (producer, topic, partition).

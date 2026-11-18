@@ -820,7 +820,8 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
                 // the config-reload block above) so a Postgres ERROR rolls back and is
                 // logged rather than aborting the bgworker.
                 let result = run_request_in_subtransaction(|| {
-                    use crate::kafka::{KafkaStore, PostgresStore};
+                    use crate::kafka::storage::MaintenanceStore;
+                    use crate::kafka::PostgresStore;
                     let store = PostgresStore::new();
                     let default_timeout = Duration::from_secs(60);
                     match store.abort_timed_out_transactions(default_timeout) {

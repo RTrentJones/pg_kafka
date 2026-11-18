@@ -13,6 +13,7 @@
 mod tests {
     use crate::kafka::error::KafkaError;
     use crate::kafka::messages::Record;
+    use crate::kafka::storage::roles::*;
     use crate::kafka::storage::{
         decode_headers_json, CommittedOffset, FetchedMessage, KafkaStore, TopicMetadata,
     };

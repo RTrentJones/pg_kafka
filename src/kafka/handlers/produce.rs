@@ -291,7 +291,7 @@ pub fn handle_produce(
 
 /// Check that `txn_id` belongs to this producer/epoch and is in the Ongoing state.
 fn validate_ongoing_transaction(
-    store: &dyn crate::kafka::storage::KafkaStore,
+    store: &dyn crate::kafka::storage::TransactionStore,
     txn_id: &str,
     meta: &ProducerMetadata,
 ) -> Result<()> {

@@ -5,13 +5,15 @@
 
 use super::retention;
 use super::{
-    CommittedOffset, FetchedMessage, IsolationLevel, KafkaStore, PartitionBounds, TopicMetadata,
+    CommittedOffset, FetchedMessage, IsolationLevel, PartitionBounds, TopicMetadata,
     TransactionState,
 };
 use crate::kafka::error::{KafkaError, Result};
 use crate::kafka::messages::Record;
 use pgrx::prelude::*;
 use std::time::Duration;
+
+mod roles;
 
 /// PostgreSQL-backed implementation of KafkaStore
 ///
@@ -685,7 +687,8 @@ fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-impl KafkaStore for PostgresStore {
+// The SQL behind every storage role. The role traits forward here (see `roles`).
+impl PostgresStore {
     fn get_or_create_topic(&self, name: &str, default_partitions: i32) -> Result<(i32, i32)> {
         crate::pg_debug!(
             "PostgresStore::get_or_create_topic: '{}' (default_partitions={})",

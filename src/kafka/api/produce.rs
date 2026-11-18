@@ -14,7 +14,7 @@ use crate::kafka::handlers;
 use crate::kafka::messages::{PartitionProduceData, ProducerMetadata, TopicProduceData};
 use crate::kafka::notifications::InternalNotification;
 use crate::kafka::protocol::{parse_record_batch_with_metadata, ParsedRecordBatch};
-use crate::kafka::storage::KafkaStore;
+use crate::kafka::storage::{LogStore, TopicStore};
 
 /// Produce: append record batches.
 pub struct ProduceApi;
@@ -221,9 +221,9 @@ pub(crate) fn notify_best_effort(
 
 /// Wake long-poll consumers for every partition a produce appended to. A missing topic id,
 /// a failed high-watermark read or a full notify channel skips that wake-up.
-fn emit_produce_notifications(
+fn emit_produce_notifications<S: TopicStore + LogStore + ?Sized>(
     response: &ProduceResponse,
-    store: &dyn KafkaStore,
+    store: &S,
     notify_tx: &crossbeam_channel::Sender<InternalNotification>,
 ) {
     for topic_response in &response.responses {

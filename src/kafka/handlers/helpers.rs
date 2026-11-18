@@ -5,7 +5,7 @@
 
 use crate::kafka::constants::{ERROR_NONE, ERROR_UNKNOWN_TOPIC_OR_PARTITION};
 use crate::kafka::error::KafkaError;
-use crate::kafka::storage::KafkaStore;
+use crate::kafka::storage::TopicStore;
 
 /// Result of resolving a topic name to its ID
 pub enum TopicResolution {
@@ -23,7 +23,7 @@ pub enum TopicResolution {
 /// - `TopicResolution::Found(topic_id)` if the topic exists
 /// - `TopicResolution::NotFound` if the topic doesn't exist
 /// - `TopicResolution::Error(code)` if a storage error occurred
-pub fn resolve_topic_id<S: KafkaStore + ?Sized>(store: &S, topic_name: &str) -> TopicResolution {
+pub fn resolve_topic_id<S: TopicStore + ?Sized>(store: &S, topic_name: &str) -> TopicResolution {
     match resolve_topic(store, topic_name) {
         Ok(Some((id, _))) => TopicResolution::Found(id),
         Ok(None) => TopicResolution::NotFound,
@@ -35,7 +35,7 @@ pub fn resolve_topic_id<S: KafkaStore + ?Sized>(store: &S, topic_name: &str) -> 
 ///
 /// Returns `Ok(None)` if the topic doesn't exist, and `Err(code)` (the Kafka error code
 /// of the typed storage error) if the lookup failed.
-pub fn resolve_topic<S: KafkaStore + ?Sized>(
+pub fn resolve_topic<S: TopicStore + ?Sized>(
     store: &S,
     topic_name: &str,
 ) -> std::result::Result<Option<(i32, i32)>, i16> {
@@ -74,7 +74,7 @@ pub fn validate_topic_name(name: &str) -> std::result::Result<(), &'static str> 
 /// AddPartitionsToTxn), with the same name rules CreateTopics enforces. Only a name
 /// that fails validation costs an extra lookup, so a topic created before the rules
 /// were enforced on auto-create keeps working.
-pub fn get_or_create_valid_topic<S: KafkaStore + ?Sized>(
+pub fn get_or_create_valid_topic<S: TopicStore + ?Sized>(
     store: &S,
     topic_name: &str,
     default_partitions: i32,
