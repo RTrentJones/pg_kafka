@@ -176,6 +176,18 @@ synchronous_commit = on         -- For acks=-1 (wait for WAL flush)
   pipelined producers therefore share one WAL flush instead of paying one each, which lifts the
   ~220 requests/s fsync ceiling of the old one-transaction-per-request design. A lone request
   still commits on its own, with no added wait.
+- There is deliberately no "wait for more requests" delay (like Postgres's `commit_delay`). One
+  was built and measured (2026-11, PG14, fsync on, eight Java producers with
+  `max.in.flight.requests.per.connection=1`, `batch.size=0`, server-side rate from
+  `kafka.messages.created_at`). While one batch flushes, the other producers' requests queue, so
+  the next batch already carries about 5 of the 8 possible requests (one record each on a
+  one-partition topic) or about 35 records (eight partitions). A wait cannot add requests that
+  the clients have not sent, so it only lengthened every round: one partition fell from 1,165 to
+  1,014 records/s at 0.5 ms and 630 at 5 ms; eight partitions went from 2,600-2,730 to
+  2,450-2,520 records/s at 1 ms (three runs each). With few in-flight requests, throughput is
+  bounded by the fsync rate times the number of requests the clients keep in flight; raise
+  client concurrency (`max.in.flight.requests.per.connection`, `linger.ms`, more producers) or,
+  if losing the latest commits on a crash is acceptable, `synchronous_commit = off`.
 
 #### 4. Huge Pages (Large Instances)
 
