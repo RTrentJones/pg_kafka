@@ -49,8 +49,7 @@ const CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const PEER_GONE_GRACE: Duration = Duration::from_millis(100);
 
 /// The frame-size limit once a connection may send any request.
-// MAX_REQUEST_SIZE is a positive constant (asserted in the constants.rs tests).
-const AUTHENTICATED_MAX_FRAME: usize = MAX_REQUEST_SIZE as usize;
+const AUTHENTICATED_MAX_FRAME: usize = MAX_REQUEST_SIZE;
 
 /// Why a connection's read loop ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
