@@ -1,6 +1,6 @@
 //! The schema the worker runs against: waiting for it at start and after DROP EXTENSION,
-//! re-deciding the worker's role when it changes, and detecting what an older extension
-//! version lacks.
+//! re-deciding the worker's role when it changes, and detecting a schema older than the
+//! library (not served until `ALTER EXTENSION pg_kafka UPDATE`).
 
 use pgrx::bgworkers::BackgroundWorker;
 use pgrx::prelude::*;
@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use super::batch::reject_request;
 use super::lifecycle::{postmaster_alive, sigterm_received};
 use super::network::Inbox;
-use super::txn::{schema_found_again, worker_transaction};
+use super::txn::{schema_found_again, schema_lost, worker_transaction};
 use super::RECV_TIMEOUT;
 use crate::kafka::ERROR_KAFKA_STORAGE_ERROR;
 use crate::pg_warning;
@@ -38,93 +38,131 @@ const REQUIRED_TABLES: [&str; 11] = [
     "shadow_tracking",
 ];
 
-/// Which optional parts of the schema this database has. A new binary can run against
-/// the schema of an older extension version until `ALTER EXTENSION pg_kafka UPDATE`
-/// (docs/UPGRADING.md step 2): it then skips what that schema lacks instead of failing
-/// every cycle.
+/// The objects of the current schema (0.1.0) that the library's request and maintenance
+/// paths use and an older extension version lacks, each with the SQL test for it. The
+/// 0.0.0 schema has none of them: every idempotent Produce reads kafka.producer_batches,
+/// transactions use kafka.txn_partitions, SASL logins read kafka.sasl_credentials and
+/// kafka.sasl_server_secret, the shadow outbox claims through
+/// kafka.shadow_tracking.attempt_open, and partition maintenance and the metrics flush
+/// need the time partitions and the broker metrics tables.
+const CURRENT_SCHEMA_OBJECTS: [(&str, &str); 8] = [
+    (
+        "kafka.producer_batches",
+        "to_regclass('kafka.producer_batches') IS NOT NULL",
+    ),
+    (
+        "kafka.txn_partitions",
+        "to_regclass('kafka.txn_partitions') IS NOT NULL",
+    ),
+    (
+        "kafka.sasl_credentials",
+        "to_regclass('kafka.sasl_credentials') IS NOT NULL",
+    ),
+    (
+        "kafka.sasl_server_secret",
+        "to_regclass('kafka.sasl_server_secret') IS NOT NULL",
+    ),
+    (
+        "kafka.shadow_tracking.attempt_open",
+        "EXISTS (SELECT 1 FROM pg_catalog.pg_attribute
+                 WHERE attrelid = to_regclass('kafka.shadow_tracking')
+                   AND attname = 'attempt_open' AND NOT attisdropped)",
+    ),
+    (
+        "time partitions of kafka.messages",
+        "to_regprocedure('kafka.message_partitions()') IS NOT NULL",
+    ),
+    (
+        "kafka.broker_api_stats",
+        "to_regclass('kafka.broker_api_stats') IS NOT NULL",
+    ),
+    (
+        "kafka.broker_gauges",
+        "to_regclass('kafka.broker_gauges') IS NOT NULL",
+    ),
+];
+
+/// The installed schema as the worker last saw it. A new binary loaded before `ALTER
+/// EXTENSION pg_kafka UPDATE` (docs/UPGRADING.md step 2) finds an older schema: it then
+/// serves no client and runs no maintenance (see [`wait_for_schema_update`]) until the
+/// schema is current.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(super) struct SchemaFeatures {
-    /// `extversion` of the installed extension.
-    pub(super) version: String,
-    /// kafka.messages is time-partitioned (0.1.0, ADR-001): partition maintenance and
-    /// the partition-aware retention sweep.
-    pub(super) time_partitions: bool,
-    /// kafka.broker_api_stats / kafka.broker_gauges exist (broker metrics flush).
-    pub(super) broker_metrics: bool,
-    /// kafka.sasl_credentials exists (SASL users).
-    pub(super) sasl_credentials: bool,
+pub(super) struct SchemaState {
+    /// `extversion` of the installed extension (empty: not detected yet).
+    version: String,
+    /// The [`CURRENT_SCHEMA_OBJECTS`] this schema lacks.
+    missing: Vec<&'static str>,
 }
 
-impl SchemaFeatures {
-    /// Human-readable list of what this schema lacks (empty: nothing).
-    fn missing(&self) -> Vec<&'static str> {
-        let mut out = Vec::new();
-        if !self.time_partitions {
-            out.push("time partitions of kafka.messages (partition maintenance; retention runs row by row)");
-        }
-        if !self.broker_metrics {
-            out.push("broker metrics (kafka.broker_api_stats / kafka.broker_gauges)");
-        }
-        if !self.sasl_credentials {
-            out.push("SASL users (kafka.sasl_credentials)");
-        }
-        out
+impl SchemaState {
+    /// From the result of each [`CURRENT_SCHEMA_OBJECTS`] test, in order.
+    fn from_checks(version: String, present: &[bool]) -> Self {
+        let missing = CURRENT_SCHEMA_OBJECTS
+            .iter()
+            .zip(present.iter().copied().chain(std::iter::repeat(false)))
+            .filter(|(_, present)| !present)
+            .map(|((name, _), _)| *name)
+            .collect();
+        SchemaState { version, missing }
+    }
+
+    /// Whether the schema has everything the library uses (false until detected).
+    pub(super) fn is_current(&self) -> bool {
+        !self.version.is_empty() && self.missing.is_empty()
     }
 }
 
-/// Read the [`SchemaFeatures`] of the current database (inside a transaction).
-fn detect_schema_features() -> SchemaFeatures {
-    Spi::connect(|client| {
-        let row = client
-            .select(
-                "SELECT (SELECT extversion FROM pg_extension WHERE extname = 'pg_kafka') AS v,
-                        to_regprocedure('kafka.message_partitions()') IS NOT NULL AS tp,
-                        to_regclass('kafka.broker_api_stats') IS NOT NULL
-                          AND to_regclass('kafka.broker_gauges') IS NOT NULL AS bm,
-                        to_regclass('kafka.sasl_credentials') IS NOT NULL AS sc",
-                None,
-                &[],
-            )
-            .ok()?;
-        let row = row.first();
-        Some(SchemaFeatures {
-            version: row.get_by_name::<String, _>("v").ok()??,
-            time_partitions: row.get_by_name("tp").ok()?.unwrap_or(false),
-            broker_metrics: row.get_by_name("bm").ok()?.unwrap_or(false),
-            sasl_credentials: row.get_by_name("sc").ok()?.unwrap_or(false),
-        })
-    })
-    .unwrap_or_default()
+/// The detection query: the extension version, then one boolean per
+/// [`CURRENT_SCHEMA_OBJECTS`] entry.
+fn detect_query() -> String {
+    let checks: Vec<&str> = CURRENT_SCHEMA_OBJECTS.iter().map(|(_, sql)| *sql).collect();
+    format!(
+        "SELECT (SELECT extversion FROM pg_extension WHERE extname = 'pg_kafka'), {}",
+        checks.join(", ")
+    )
 }
 
-/// Re-detect the schema features; log once whenever they change (a WARNING listing
-/// what is unavailable, or a LOG line when everything is there again). Returns true
-/// if they changed.
-pub(super) fn refresh_schema_features(features: &mut SchemaFeatures) -> bool {
-    let Ok(now) = worker_transaction(detect_schema_features) else {
+/// Read the [`SchemaState`] of the current database (inside a transaction); None if
+/// the query fails or the extension is not installed.
+fn detect_schema_state() -> Option<SchemaState> {
+    Spi::connect(|client| {
+        let row = client.select(&detect_query(), Some(1), &[]).ok()?;
+        let row = row.first();
+        let version = row.get::<String>(1).ok()??;
+        let present: Vec<bool> = (0..CURRENT_SCHEMA_OBJECTS.len())
+            .map(|i| row.get::<bool>(i + 2).ok().flatten().unwrap_or(false))
+            .collect();
+        Some(SchemaState::from_checks(version, &present))
+    })
+}
+
+/// Re-detect the schema; log once whenever it changes (a WARNING that an older schema
+/// is not served, or a LOG line when it is current again). Returns true if it changed.
+pub(super) fn refresh_schema_state(state: &mut SchemaState) -> bool {
+    let Ok(Some(now)) = worker_transaction(detect_schema_state) else {
         return false;
     };
-    if now == *features {
+    if now == *state {
         return false;
     }
-    let missing = now.missing();
-    if missing.is_empty() {
-        if !features.version.is_empty() {
+    if now.is_current() {
+        if !state.version.is_empty() {
             log!(
-                "pg_kafka schema is now version {}: all features enabled",
+                "pg_kafka schema is now version {}: serving Kafka clients",
                 now.version
             );
         }
     } else {
         pg_warning!(
-            "pg_kafka: running against an older pg_kafka schema (version {}, library {}); \
-             unavailable until ALTER EXTENSION pg_kafka UPDATE: {}",
+            "pg_kafka: running against an older pg_kafka schema (version {}, library {}): \
+             answering Kafka requests with KAFKA_STORAGE_ERROR and running no maintenance \
+             until ALTER EXTENSION pg_kafka UPDATE (missing: {})",
             now.version,
             env!("CARGO_PKG_VERSION"),
-            missing.join("; ")
+            now.missing.join(", ")
         );
     }
-    *features = now;
+    *state = now;
     true
 }
 
@@ -226,33 +264,18 @@ pub(super) fn wait_for_schema(database: &str) -> bool {
     }
 }
 
-/// The extension was dropped while the worker ran. Keep the listener up and answer
-/// every request with a retriable KAFKA_STORAGE_ERROR (credential lookups fail) until
-/// the schema exists again, re-checking every [`SCHEMA_CHECK_INTERVAL`]. Returns true
-/// once it exists, false on SIGTERM or postmaster death (the caller's loop handles
-/// those).
-pub(super) fn wait_for_schema_while_serving(database: &str, inbox: &Inbox) -> bool {
-    log!(
-        "pg_kafka extension is gone from database '{database}' (DROP EXTENSION?); answering requests \
-         with KAFKA_STORAGE_ERROR until CREATE EXTENSION pg_kafka"
-    );
-    // Back to the bootstrap superuser while waiting: whatever schema appears next is
-    // checked (and its grants re-evaluated by reapply_worker_role) from there. A failure
-    // here only means the next check runs under the current role.
-    let _ = reset_worker_role();
-    let started = Instant::now();
+/// Keep the listener up while the worker cannot serve: answer every request with a
+/// retriable KAFKA_STORAGE_ERROR and every credential lookup with `refusal`, calling
+/// `ready` every [`SCHEMA_CHECK_INTERVAL`] until it returns true. Returns true then,
+/// false on SIGTERM or postmaster death (the caller's loop handles those).
+fn refuse_requests_until(inbox: &Inbox, refusal: &str, mut ready: impl FnMut() -> bool) -> bool {
     let mut next_check = Instant::now();
     loop {
         if sigterm_received() || !postmaster_alive() {
             return false;
         }
         if Instant::now() >= next_check {
-            if BackgroundWorker::transaction(|| verify_schema(database)).is_ok() {
-                schema_found_again();
-                log!(
-                    "pg_kafka schema found again after {} ms; resuming",
-                    started.elapsed().as_millis()
-                );
+            if ready() {
                 return true;
             }
             next_check = Instant::now() + SCHEMA_CHECK_INTERVAL;
@@ -261,7 +284,7 @@ pub(super) fn wait_for_schema_while_serving(database: &str, inbox: &Inbox) -> bo
             reject_request(r, ERROR_KAFKA_STORAGE_ERROR);
         }
         while let Ok(c) = inbox.credentials.try_recv() {
-            let _ = c.reply.send(Err("pg_kafka schema is missing".to_string()));
+            let _ = c.reply.send(Err(refusal.to_string()));
         }
         crossbeam_channel::select! {
             recv(inbox.requests) -> r => {
@@ -275,27 +298,96 @@ pub(super) fn wait_for_schema_while_serving(database: &str, inbox: &Inbox) -> bo
     }
 }
 
+/// The extension was dropped while the worker ran. Keep the listener up and answer
+/// every request with a retriable KAFKA_STORAGE_ERROR (credential lookups fail) until
+/// the schema exists again. Returns true once it exists, false on SIGTERM or
+/// postmaster death (the caller's loop handles those).
+pub(super) fn wait_for_schema_while_serving(database: &str, inbox: &Inbox) -> bool {
+    log!(
+        "pg_kafka extension is gone from database '{database}' (DROP EXTENSION?); answering requests \
+         with KAFKA_STORAGE_ERROR until CREATE EXTENSION pg_kafka"
+    );
+    // Back to the bootstrap superuser while waiting: whatever schema appears next is
+    // checked (and its grants re-evaluated by reapply_worker_role) from there. A failure
+    // here only means the next check runs under the current role.
+    let _ = reset_worker_role();
+    let started = Instant::now();
+    refuse_requests_until(inbox, "pg_kafka schema is missing", || {
+        if BackgroundWorker::transaction(|| verify_schema(database)).is_err() {
+            return false;
+        }
+        schema_found_again();
+        log!(
+            "pg_kafka schema found again after {} ms; resuming",
+            started.elapsed().as_millis()
+        );
+        true
+    })
+}
+
+/// The schema is older than the library (`state` is not current): its tables cannot
+/// serve the library's requests, so answer every request with the retriable
+/// KAFKA_STORAGE_ERROR (credential lookups fail) and re-detect the schema every
+/// [`SCHEMA_CHECK_INTERVAL`] until `ALTER EXTENSION pg_kafka UPDATE` has made it
+/// current, or the extension is dropped (the caller then sees [`schema_lost`]). Returns
+/// false on SIGTERM or postmaster death.
+pub(super) fn wait_for_schema_update(state: &mut SchemaState, inbox: &Inbox) -> bool {
+    refuse_requests_until(
+        inbox,
+        "the pg_kafka schema is older than the library (ALTER EXTENSION pg_kafka UPDATE)",
+        || {
+            refresh_schema_state(state);
+            state.is_current() || schema_lost()
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_schema_features_missing_lists_what_an_old_schema_lacks() {
-        let full = SchemaFeatures {
-            version: "0.1.0".into(),
-            time_partitions: true,
-            broker_metrics: true,
-            sasl_credentials: true,
-        };
-        assert_eq!(full.missing(), Vec::<&str>::new());
-        let old = SchemaFeatures {
-            version: "0.0.0".into(),
-            ..Default::default()
-        };
-        let missing = old.missing().join("; ");
-        assert!(missing.contains("time partitions"));
-        assert!(missing.contains("broker metrics"));
-        assert!(missing.contains("SASL users"));
+    fn test_schema_state_is_current_only_with_every_object() {
+        let all = [true; CURRENT_SCHEMA_OBJECTS.len()];
+        let full = SchemaState::from_checks("0.1.0".into(), &all);
+        assert_eq!(full.missing, Vec::<&str>::new());
+        assert!(full.is_current());
+
+        // The 0.0.0 schema has none of them.
+        let old = SchemaState::from_checks("0.0.0".into(), &[false; CURRENT_SCHEMA_OBJECTS.len()]);
+        assert!(!old.is_current());
+        for name in [
+            "kafka.producer_batches",
+            "kafka.txn_partitions",
+            "kafka.sasl_credentials",
+            "kafka.sasl_server_secret",
+            "kafka.shadow_tracking.attempt_open",
+        ] {
+            assert!(
+                old.missing.contains(&name),
+                "{name} missing from {:?}",
+                old.missing
+            );
+        }
+
+        // One object missing is enough; a short result counts as missing.
+        let mut one = all;
+        one[0] = false;
+        let partial = SchemaState::from_checks("0.1.0".into(), &one);
+        assert_eq!(partial.missing, vec!["kafka.producer_batches"]);
+        assert!(!SchemaState::from_checks("0.1.0".into(), &all[..2]).is_current());
+
+        // Not detected yet: not current.
+        assert!(!SchemaState::default().is_current());
+    }
+
+    #[test]
+    fn test_detect_query_has_one_column_per_object() {
+        let q = detect_query();
+        assert!(q.starts_with("SELECT (SELECT extversion"));
+        for (_, sql) in CURRENT_SCHEMA_OBJECTS {
+            assert!(q.contains(sql));
+        }
     }
 
     #[test]
