@@ -1,8 +1,4 @@
-// InitProducerId handler
-//
-// Handles InitProducerIdRequest - allocates producer IDs for idempotent producers.
-// Phase 9: Idempotent Producer Support
-// Phase 10: Extended for Transactional Producer Support
+//! InitProducerId: producer ids and epochs for idempotent and transactional producers.
 
 use crate::kafka::constants::ERROR_NONE;
 use crate::kafka::error::Result;
@@ -11,7 +7,7 @@ use kafka_protocol::messages::init_producer_id_response::InitProducerIdResponse;
 use kafka_protocol::messages::ProducerId;
 use pgrx::GucSetting;
 
-/// `pg_kafka.transaction_max_timeout_ms` (wave 3), Kafka's `transaction.max.timeout.ms`:
+/// `pg_kafka.transaction_max_timeout_ms`, Kafka's `transaction.max.timeout.ms`:
 /// the largest transaction timeout InitProducerId accepts. Registered in
 /// `config::init`; reloadable.
 pub static TRANSACTION_MAX_TIMEOUT_MS: GucSetting<i32> =
@@ -77,9 +73,9 @@ pub(crate) fn init_producer_id_bounded(
     let store = ctx.store;
     let mut response = InitProducerIdResponse::default();
 
-    // Phase 10: Handle transactional producers
+    // Handle transactional producers
     if let Some(txn_id) = transactional_id {
-        // Wave 3: validate the timeout first, as Kafka does (the producer is not
+        // Validate the timeout first, as Kafka does (the producer is not
         // touched, so an existing transaction is not fenced by a bad request).
         if !transaction_timeout_is_valid(transaction_timeout_ms, max_timeout_ms) {
             response.error_code = crate::kafka::constants::ERROR_INVALID_TRANSACTION_TIMEOUT;
@@ -147,7 +143,7 @@ mod tests {
 
     #[test]
     fn invalid_transaction_timeout_is_refused_without_touching_the_producer() {
-        // Wave 3: InitProducerId accepted any timeout (-5, 0, i32::MAX). Kafka answers
+        // InitProducerId accepted any timeout (-5, 0, i32::MAX). Kafka answers
         // INVALID_TRANSACTION_TIMEOUT (50) and leaves the transactional id alone; the
         // mock has no expectation, so any store call would fail the test.
         let store = MockKafkaStore::new();

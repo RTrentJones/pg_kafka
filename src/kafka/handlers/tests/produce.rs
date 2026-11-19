@@ -14,7 +14,7 @@ fn test_handle_produce_success() {
     let mut mock = MockKafkaStore::new();
     mock.expect_get_log_start_offset().returning(|_, _| Ok(0));
 
-    // Expect topic lookup - now returns (topic_id, partition_count) in single call
+    // The topic lookup returns (topic_id, partition_count) in one call.
     mock.expect_get_or_create_topic()
         .with(
             mockall::predicate::eq("test-topic"),

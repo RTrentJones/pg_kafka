@@ -78,7 +78,7 @@ impl AssignmentStrategy for RoundRobinStrategy {
             return result;
         }
 
-        // CG-6: use a SINGLE global round-robin pointer across all (topic, partition) pairs — as
+        // Use a SINGLE global round-robin pointer across all (topic, partition) pairs — as
         // Kafka does and as this module's doc example describes — not a per-topic counter that
         // restarts at 0 for each topic (which imbalances heterogeneous multi-topic subscriptions).
         // The pointer walks the sorted members and skips any not subscribed to the current topic.
@@ -227,8 +227,8 @@ mod tests {
         assert_eq!(result["member-1"].partitions("topic-a"), vec![0, 2]);
         assert_eq!(result["member-2"].partitions("topic-a"), vec![1]);
 
-        // CG-6: topic-b continues the GLOBAL pointer from topic-a (B0->m2, B1->m1), rather than
-        // restarting per topic (which previously, wrongly, gave m1 B0 and m2 B1).
+        // topic-b continues the global pointer from topic-a (B0->m2, B1->m1), as Kafka's
+        // assignor does, rather than restarting per topic (m1 B0, m2 B1).
         assert_eq!(result["member-1"].partitions("topic-b"), vec![1]);
         assert_eq!(result["member-2"].partitions("topic-b"), vec![0]);
     }

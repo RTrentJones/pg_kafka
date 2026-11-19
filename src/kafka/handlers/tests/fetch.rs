@@ -39,7 +39,7 @@ fn test_handle_fetch_success() {
 
     mock.expect_get_high_watermark().returning(|_, _| Ok(6));
     mock.expect_get_last_stable_offset().returning(|_, _| Ok(6));
-    // RV-10: the fetch response's log_start_offset must reflect the store's
+    // The fetch response's log_start_offset must reflect the store's
     // earliest retained offset, not a hardcoded 0.
     mock.expect_get_earliest_offset().returning(|_, _| Ok(5));
     mock.expect_get_log_start_offset().returning(|_, _| Ok(5));
@@ -66,9 +66,8 @@ fn test_handle_fetch_success() {
     assert_eq!(partition_data.log_start_offset, 5);
 }
 
-/// DR-8 (DEEP-REVIEW-2026-07): stored headers must be re-encoded into the fetch
-/// response's RecordBatch. Before the fix, the handler set `headers:
-/// Default::default()` unconditionally, so consumers always saw empty headers.
+/// Stored headers are re-encoded into the fetch response's RecordBatch; a handler that
+/// dropped them would hand consumers empty headers.
 #[test]
 fn test_handle_fetch_returns_headers() {
     let mut mock = MockKafkaStore::new();
@@ -131,7 +130,7 @@ fn test_handle_fetch_returns_headers() {
     assert_eq!(header_value.as_ref(), b"abc123");
 }
 
-/// DR-10 (DEEP-REVIEW-2026-07): a storage error computing the HWM must surface
+/// A storage error computing the HWM must surface
 /// as a per-partition error code — not be swallowed into HWM=0, which a consumer
 /// reads as "partition is empty".
 #[test]
@@ -360,7 +359,7 @@ fn test_handle_list_offsets_latest() {
 
 #[test]
 fn test_handle_list_offsets_by_timestamp() {
-    // CONF-7: a positive timestamp resolves to the earliest qualifying offset (and its record
+    // A positive timestamp resolves to the earliest qualifying offset (and its record
     // timestamp), instead of returning UNSUPPORTED_VERSION.
     let mut mock = MockKafkaStore::new();
     mock.expect_get_topic_metadata().returning(|_| {
@@ -395,7 +394,7 @@ fn test_handle_list_offsets_by_timestamp() {
     assert_eq!(partition_response.timestamp, 1_600_000_002_000);
 }
 
-/// wave3 txn: one ListOffsets partition query against a 2-partition topic with
+/// One ListOffsets partition query against a 2-partition topic with
 /// HWM 10, LSO 4 (a transaction open at offset 4), a timestamp match at offset 6
 /// and the max-timestamp record at offset 3.
 fn list_one(partition: i32, timestamp: i64, isolation: IsolationLevel) -> (i16, i64, i64) {
@@ -435,8 +434,8 @@ fn list_one(partition: i32, timestamp: i64, isolation: IsolationLevel) -> (i16, 
 
 #[test]
 fn test_list_offsets_latest_honours_isolation_level() {
-    // Before wave 3 read_committed LATEST returned the high watermark, so a
-    // read_committed consumer saw lag it could never consume.
+    // read_committed LATEST is the last stable offset: the high watermark would show a
+    // read_committed consumer lag it can never consume.
     assert_eq!(
         list_one(0, -1, IsolationLevel::ReadUncommitted),
         (0, 10, -1)

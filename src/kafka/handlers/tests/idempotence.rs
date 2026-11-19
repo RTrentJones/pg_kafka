@@ -9,7 +9,7 @@ use crate::kafka::messages::{PartitionProduceData, Record, TopicProduceData};
 use crate::testing::mocks::MockKafkaStore;
 use crate::testing::TestEnv;
 
-// ========== InitProducerId Handler Tests (Phase 9) ==========
+// ========== InitProducerId Handler Tests ==========
 
 #[test]
 fn test_handle_init_producer_id_new_producer() {
@@ -37,7 +37,7 @@ fn test_handle_init_producer_id_new_producer() {
     assert_eq!(response.producer_epoch, 0);
 }
 
-// ========== Produce Handler with Idempotency Tests (Phase 9) ==========
+// ========== Produce Handler with Idempotency Tests ==========
 
 #[test]
 fn test_handle_produce_with_idempotent_producer_success() {
@@ -58,7 +58,7 @@ fn test_handle_produce_with_idempotent_producer_success() {
         .times(1)
         .returning(|_, _, _| Ok(0));
 
-    // RV-8: the producer batch is recorded (with its offset) after the insert
+    // The producer batch is recorded (with its offset) after the insert
     mock.expect_record_producer_batch()
         .withf(|b| b.base_offset == 0 && b.first_sequence == 0 && b.last_sequence == 0)
         .times(1)
@@ -99,7 +99,7 @@ fn test_handle_produce_with_idempotent_producer_success() {
 
 #[test]
 fn test_handle_produce_insert_failure_does_not_advance_sequence() {
-    // RV-8: when the insert fails, the producer sequence must NOT advance, so a
+    // When the insert fails, the producer sequence must NOT advance, so a
     // retry re-inserts instead of being dropped as a false duplicate. No
     // record_producer_sequence expectation is set, so mockall fails on Drop if
     // the handler advances the sequence after a failed insert.
@@ -188,7 +188,7 @@ fn test_handle_produce_duplicate_sequence_rejected() {
     let partition_response = &response.responses[0].partition_responses[0];
     // Kafka spec: Duplicates return SUCCESS (error_code=0), not error
     assert_eq!(partition_response.error_code, ERROR_NONE);
-    assert_eq!(partition_response.base_offset, 42); // wave 3: the original offset
+    assert_eq!(partition_response.base_offset, 42); // The original offset
 }
 
 #[test]

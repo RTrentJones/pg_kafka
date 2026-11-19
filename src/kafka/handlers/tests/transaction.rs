@@ -7,7 +7,7 @@ use crate::kafka::storage::TransactionState;
 use crate::testing::mocks::MockKafkaStore;
 use crate::testing::TestEnv;
 
-// ========== Transaction Handler Tests (Phase 10) ==========
+// ========== Transaction Handler Tests ==========
 
 // ========== AddPartitionsToTxn Tests ==========
 
@@ -48,7 +48,7 @@ fn test_add_partitions_success() {
         .times(1)
         .returning(|_, _, _| Ok(()));
     topics_with_partitions(&mut mock, 4);
-    // Wave 3: the partitions are registered for the transactional produce check.
+    // The partitions are registered for the transactional produce check.
     mock.expect_add_txn_partitions()
         .withf(|txn, parts| txn == "txn-1" && parts == [(1, 0), (1, 1)])
         .times(1)
@@ -71,7 +71,7 @@ fn test_add_partitions_success() {
 
 #[test]
 fn test_add_partitions_invalid_partition() {
-    // Wave 3 (Kafka): one unknown partition fails the request: it gets
+    // One unknown partition fails the request: it gets
     // UNKNOWN_TOPIC_OR_PARTITION, the valid ones OPERATION_NOT_ATTEMPTED, and
     // neither the transaction state nor the registry is touched (no expectations).
     let mut mock = MockKafkaStore::new();
@@ -99,8 +99,8 @@ fn test_add_partitions_invalid_partition() {
 
 #[test]
 fn test_add_partitions_unknown_topic_is_not_created() {
-    // Wave 3: AddPartitionsToTxn used to auto-create a missing topic. Kafka answers
-    // UNKNOWN_TOPIC_OR_PARTITION (clients create topics through Metadata); no
+    // AddPartitionsToTxn does not create a missing topic: Kafka answers
+    // UNKNOWN_TOPIC_OR_PARTITION (clients create topics through Metadata). There is no
     // get_or_create_topic expectation, so creating it would fail the test.
     let mut mock = MockKafkaStore::new();
     topics_with_partitions(&mut mock, 1);

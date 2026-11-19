@@ -135,9 +135,8 @@ pub enum GroupState {
 
 impl GroupState {
     /// The Kafka wire-protocol group-state string, echoed in DescribeGroups /
-    /// ListGroups. Mirrors `TransactionState::as_str`; centralizes the mapping
-    /// that was previously duplicated across the two handlers. (A group the
-    /// coordinator does not know is reported as "Dead" by DescribeGroups.)
+    /// ListGroups. (A group the coordinator does not know is reported as "Dead" by
+    /// DescribeGroups.)
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Empty => "Empty",
@@ -184,7 +183,7 @@ pub struct ConsumerGroup {
     pub rebalance_started_at: Option<Instant>,
 
     /// The group's protocol type ("consumer", "connect", ...), set by the first member to join
-    /// and kept when the group empties, as in Kafka (wave3 groups). Every later member must use
+    /// and kept when the group empties, as in Kafka. Every later member must use
     /// the same one (INCONSISTENT_GROUP_PROTOCOL otherwise) while the group has members.
     pub protocol_type: Option<String>,
 }
@@ -206,7 +205,7 @@ impl ConsumerGroup {
         }
     }
 
-    /// Kafka's `supportsProtocols` rule for a JoinGroup (wave3 groups): joining an Empty group
+    /// Kafka's `supportsProtocols` rule for a JoinGroup: joining an Empty group
     /// needs a non-empty protocol type and at least one protocol; joining a group with members
     /// needs the group's protocol type and at least one protocol every *other* member supports
     /// (a known member's own previous list does not count, it is being replaced; Kafka counts
@@ -269,7 +268,7 @@ impl ConsumerGroup {
         }
 
         // The first member to join a leaderless group becomes the leader; an existing
-        // leader rejoining stays the leader (BUG-9).
+        // leader rejoining stays the leader.
         if self.leader.is_none() {
             self.leader = Some(member_id.to_string());
         }
@@ -398,7 +397,7 @@ impl ConsumerGroup {
         );
     }
 
-    /// Choose the group protocol by Kafka's member vote (wave3 groups): the candidates are the
+    /// Choose the group protocol by Kafka's member vote: the candidates are the
     /// protocols every member supports; each member votes for the first candidate in its own
     /// preference order and the candidate with the most votes wins. Ties go to the candidate
     /// the leader prefers (Kafka leaves ties to hash order; this keeps the choice
@@ -515,7 +514,7 @@ impl ConsumerGroup {
         let Some(started) = self.rebalance_started_at else {
             return Vec::new();
         };
-        // CG-3: honour the members' advertised rebalance_timeout_ms (the max across the
+        // Honour the members' advertised rebalance_timeout_ms (the max across the
         // group, matching Kafka) rather than a hardcoded value.
         let effective_timeout_ms = self
             .members

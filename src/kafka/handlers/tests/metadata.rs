@@ -42,7 +42,7 @@ fn test_handle_metadata_all_topics() {
 fn test_handle_metadata_specific_topic() {
     let mut mock = MockKafkaStore::new();
 
-    // get_or_create_topic now returns (topic_id, partition_count) in single call
+    // get_or_create_topic returns (topic_id, partition_count) in one call.
     mock.expect_get_or_create_topic()
         .with(
             mockall::predicate::eq("my-topic"),
@@ -62,7 +62,7 @@ fn test_handle_metadata_specific_topic() {
 
 #[test]
 fn test_handle_metadata_no_auto_create_missing_topic() {
-    // CONF-2: with allow_auto_topic_creation = false, a missing requested topic must be reported
+    // With allow_auto_topic_creation = false, a missing requested topic must be reported
     // as UNKNOWN_TOPIC_OR_PARTITION and NOT created. Not setting expect_get_or_create_topic means
     // the mock panics if the handler tries to create — proving the no-create contract.
     let mut mock = MockKafkaStore::new();

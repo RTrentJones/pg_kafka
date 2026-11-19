@@ -409,7 +409,7 @@ mod tests {
     }
 
     /// Kafka: a transactional Produce to a partition the transaction never added
-    /// (AddPartitionsToTxn) is INVALID_TXN_STATE; it used to be written.
+    /// (AddPartitionsToTxn) is INVALID_TXN_STATE, and nothing is written.
     #[test]
     fn transactional_produce_to_an_unregistered_partition_is_refused() {
         let mut mock = MockKafkaStore::new();

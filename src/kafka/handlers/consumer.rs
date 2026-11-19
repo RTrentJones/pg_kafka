@@ -1,7 +1,4 @@
-// Consumer offset handlers
-//
-// Handlers for OffsetCommit and OffsetFetch requests.
-// These track consumer group progress through partitions.
+//! OffsetCommit and OffsetFetch: a consumer group's committed offsets.
 
 use super::helpers::{
     resolve_topic, resolve_topic_id, topic_resolution_error_code, TopicResolution,
@@ -31,9 +28,9 @@ pub fn handle_offset_commit(
 ) -> Result<OffsetCommitResponse> {
     let store = ctx.store;
 
-    // CONF-1: reject zombie commits. A member committing with a stale generation (or an unknown
+    // Reject zombie commits. A member committing with a stale generation (or an unknown
     // member id) for a live group must be rejected with ILLEGAL_GENERATION / UNKNOWN_MEMBER_ID
-    // rather than silently persisting an offset. wave3 groups: Kafka 3.7's rules, see
+    // rather than silently persisting an offset. Kafka 3.7's rules, see
     // `GroupCoordinator::validate_offset_commit` (generation -1 only for an unknown/Empty group).
     if let Err(e) = ctx
         .coordinator
@@ -158,7 +155,7 @@ pub fn handle_offset_commit(
 ///
 /// Fetches committed offsets for a consumer group
 ///
-/// `require_stable` (v7+, KIP-447; wave 3): a partition with a transactional offset
+/// `require_stable` (v7+, KIP-447): a partition with a transactional offset
 /// commit whose transaction is still open is answered UNSTABLE_OFFSET_COMMIT with
 /// offset -1 (partition level, as Kafka 3.7), so a read_committed consumer retries
 /// instead of starting from an offset the transaction may still replace.
@@ -169,7 +166,7 @@ pub fn handle_offset_fetch(
     require_stable: bool,
 ) -> Result<OffsetFetchResponse> {
     let store = ctx.store;
-    // wave3 txn: partitions with a pending transactional commit (require_stable only).
+    // Partitions with a pending transactional commit (require_stable only).
     let unstable: std::collections::HashSet<(String, i32)> = if require_stable {
         store
             .pending_txn_offset_partitions(group_id)?
@@ -183,7 +180,7 @@ pub fn handle_offset_fetch(
     };
 
     let mut response_topics = Vec::new();
-    // BUG-6: track a top-level error so a fetch-all storage failure surfaces to the client as an
+    // Track a top-level error so a fetch-all storage failure surfaces to the client as an
     // error instead of a success response with no offsets (which a consumer reads as "no committed
     // offsets" and may reset from).
     let mut top_level_error = ERROR_NONE;
@@ -308,7 +305,7 @@ pub fn handle_offset_fetch(
                 }
             }
             Err(e) => {
-                // BUG-6: surface the storage failure to the client instead of swallowing it.
+                // Surface the storage failure to the client instead of swallowing it.
                 top_level_error = e.to_kafka_error_code();
                 crate::pg_warning!(
                     "Failed to fetch all offsets for group='{}': {}",
@@ -337,9 +334,8 @@ mod tests {
 
     #[test]
     fn test_offset_fetch_all_propagates_storage_error() {
-        // BUG-6: when fetch_all_offsets fails, the fetch-all OffsetFetch path used to log and
-        // return error_code = NONE with no topics — a consumer reads that as "no committed
-        // offsets" and may reset. It must surface the error instead.
+        // When fetch_all_offsets fails, a fetch-all OffsetFetch must surface the error: NONE
+        // with no topics reads to a consumer as "no committed offsets", and it may reset.
         let mut store = MockKafkaStore::new();
         store
             .expect_fetch_all_offsets()
@@ -399,10 +395,10 @@ mod tests {
         );
     }
 
-    /// wave3 txn (KIP-447): with require_stable, a partition with a pending
-    /// transactional offset commit is UNSTABLE_OFFSET_COMMIT (offset -1); the others
-    /// and the same request without require_stable read the committed offset. Before
-    /// wave 3 the flag was ignored and the stale committed offset was returned.
+    /// KIP-447: with require_stable, a partition with a pending transactional offset
+    /// commit is UNSTABLE_OFFSET_COMMIT (offset -1), so a consumer does not start from
+    /// an offset the transaction may still replace; the others and the same request
+    /// without require_stable read the committed offset.
     #[test]
     fn test_offset_fetch_require_stable_reports_pending_txn_commits() {
         use crate::kafka::messages::OffsetFetchTopicData;

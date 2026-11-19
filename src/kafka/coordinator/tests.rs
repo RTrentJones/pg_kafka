@@ -249,7 +249,7 @@ fn test_group_state_as_str_wire_strings() {
 
 #[test]
 fn test_invalid_session_timeout_member_is_timed_out() {
-    // CG-4: a non-positive session_timeout_ms must not make a member immortal.
+    // A non-positive session_timeout_ms must not make a member immortal.
     let member = GroupMember {
         member_id: "m".to_string(),
         client_id: "c".to_string(),
@@ -446,7 +446,7 @@ fn test_validate_commit_by_state() {
     let c = GroupCoordinator::new();
     let a = joined(&join(&c, "g", None)).member_id;
 
-    // CompletingRebalance: fenced (RV-10), the member has not synced yet.
+    // CompletingRebalance: fenced, the member has not synced yet.
     assert!(matches!(
         c.validate_commit("g", &a, 1),
         Err(KafkaError::RebalanceInProgress { .. })
@@ -462,7 +462,7 @@ fn test_validate_commit_by_state() {
     assert_eq!(state(&c, "g"), GroupState::PreparingRebalance);
     assert!(c.validate_commit("g", &a, 1).is_ok());
 
-    // Zombie fencing (CONF-1 / RA-5).
+    // Zombie fencing.
     assert!(matches!(
         c.validate_commit("g", &a, 0),
         Err(KafkaError::IllegalGeneration { .. })
@@ -584,7 +584,7 @@ fn test_follower_rejoin_with_changed_metadata_starts_rebalance() {
 #[test]
 fn test_leader_rejoin_on_stable_group_starts_rebalance_and_stays_leader() {
     // Kafka's rule: a leader rejoining makes the group pick up metadata changes.
-    // BUG-9: it must still be the leader afterwards.
+    // It must still be the leader afterwards.
     let c = GroupCoordinator::new();
     let (leader, follower, gen) = stable_pair(&c, "g");
     let l = join(&c, "g", Some(&leader));
@@ -625,13 +625,13 @@ fn test_known_member_retry_during_sync_phase_is_answered_at_once() {
     assert_eq!(state(&c, "g"), GroupState::CompletingRebalance);
 }
 
-// ----- wave3 groups: Kafka 3.7 join / commit rules and limits -----
+// ----- Kafka 3.7 join / commit rules and limits -----
 
 #[test]
 fn test_unknown_member_id_gets_unknown_member_id() {
     // Kafka: a JoinGroup with a non-empty member id the group does not know is answered
-    // UNKNOWN_MEMBER_ID (the client then rejoins with an empty id); it used to be given a
-    // fresh id silently. No group is created for it either.
+    // UNKNOWN_MEMBER_ID (the client then rejoins with an empty id), not given a fresh id
+    // silently. No group is created for it either.
     let c = GroupCoordinator::new();
     assert_eq!(
         join_error_code(&join(&c, "g", Some("evicted-long-ago"))),
@@ -856,7 +856,7 @@ fn test_duplicate_join_replaces_held_response() {
 
 #[test]
 fn test_join_selects_strategy_common_to_all_members() {
-    // CG-1: the group protocol must be a strategy supported by EVERY member.
+    // The group protocol must be a strategy supported by EVERY member.
     let c = GroupCoordinator::new();
     let leader = joined(&join_with(
         &c,
@@ -1064,7 +1064,7 @@ fn test_sweep_rebalance_timeout_evicts_stragglers_and_completes_join() {
 
 #[test]
 fn test_rebalance_timeout_honors_member_rebalance_timeout_ms() {
-    // CG-3: the timeout is the largest rebalance_timeout_ms the members advertise,
+    // The timeout is the largest rebalance_timeout_ms the members advertise,
     // not a hardcoded 5 minutes. join_group also runs it (over every group).
     let c = GroupCoordinator::new();
     let mut p = params("g", None, &[("range", b"sub")]);
@@ -1138,7 +1138,7 @@ fn test_sweep_session_timeout_in_stable_group_starts_rebalance() {
 
 #[test]
 fn test_empty_group_reclaimed_by_sweep_after_ttl() {
-    // CG-5: an empty group is kept until its TTL, then dropped by the sweep.
+    // An empty group is kept until its TTL, then dropped by the sweep.
     let c = GroupCoordinator::new();
     let a = joined(&join(&c, "g", None)).member_id;
     age_member(&c, "g", &a, Duration::from_secs(31));
@@ -1157,7 +1157,7 @@ fn test_empty_group_reclaimed_by_sweep_after_ttl() {
 
 #[test]
 fn test_join_group_enforces_member_cap() {
-    // CG-4: a group is capped at pg_kafka.group_max_size (default) new members.
+    // A group is capped at pg_kafka.group_max_size (default) new members.
     let c = GroupCoordinator::new();
     {
         let mut groups = c.groups.write().unwrap();

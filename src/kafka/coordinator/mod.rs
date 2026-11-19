@@ -83,9 +83,9 @@ pub use group::{ConsumerGroup, GroupMember, GroupState};
 use group::{Delivery, DeliveryOutcome};
 
 // Group-count and group-size caps: `pg_kafka.max_consumer_groups` / `pg_kafka.group_max_size`
-// (crate::kafka::limits), applied through `GroupCoordinator::set_limits` (wave3 groups).
+// (crate::kafka::limits), applied through `GroupCoordinator::set_limits`.
 
-/// RV-10: accepted range for a JoinGroup `session_timeout_ms`, matching Kafka's
+/// Accepted range for a JoinGroup `session_timeout_ms`, matching Kafka's
 /// broker defaults (`group.min.session.timeout.ms` = 6s, `group.max.session.timeout.ms`
 /// = 30 min). A request outside this range is rejected with `INVALID_SESSION_TIMEOUT`
 /// so a hostile or misconfigured client cannot pin a member alive for weeks (blocking
@@ -186,10 +186,10 @@ pub struct GroupCoordinator {
     /// as `pending_joins` (never both at once).
     pending_syncs: Mutex<HashMap<(String, String), SyncResponder>>,
 
-    /// `pg_kafka.max_consumer_groups`: the most groups held in memory (wave3 groups).
+    /// `pg_kafka.max_consumer_groups`: the most groups held in memory.
     max_groups: AtomicUsize,
 
-    /// `pg_kafka.group_max_size`: the most members one group may have (wave3 groups).
+    /// `pg_kafka.group_max_size`: the most members one group may have.
     max_group_size: AtomicUsize,
 }
 
@@ -371,7 +371,7 @@ impl GroupCoordinator {
         // As in Kafka: a JoinGroup presenting a member id is a rejoin. If the group or the
         // member is unknown (evicted, or lost in a worker restart) it gets UNKNOWN_MEMBER_ID and
         // the client rejoins with an empty id; it is not silently given a new identity, and no
-        // group is created for it (wave3 groups).
+        // group is created for it.
         if let Some(id) = params.member_id.as_deref() {
             if !groups
                 .get(&group_id)
@@ -420,7 +420,7 @@ impl GroupCoordinator {
 
         let known_id = params.member_id.clone();
 
-        // CG-4: cap members per group (DoS protection; Kafka's group.max.size). A rejoining
+        // Cap members per group (DoS protection; Kafka's group.max.size). A rejoining
         // member (already present) is always allowed; only a new member is rejected.
         if known_id.is_none() && group.members.len() >= max_group_size {
             return Err(KafkaError::Protocol {
@@ -432,7 +432,7 @@ impl GroupCoordinator {
         }
 
         // Kafka's protocol check: the member's protocol type must be the group's and it must
-        // share at least one protocol with every other member (wave3 groups).
+        // share at least one protocol with every other member.
         if !group.supports_protocols(
             known_id.as_deref(),
             &params.protocol_type,
@@ -639,14 +639,14 @@ impl GroupCoordinator {
         }
     }
 
-    /// CONF-1: validate an OffsetCommit against the live group state to reject zombie commits.
+    /// Validate an OffsetCommit against the live group state to reject zombie commits.
     ///
     /// A simple consumer with no active group membership commits with `generation_id < 0` and is not
     /// validated. Otherwise the commit's member id and generation must match the current ones — an
     /// unknown member yields `UnknownMemberId` (checked first, as Kafka does) and a stale
     /// generation `IllegalGeneration`.
     ///
-    /// RA-5: a generation-bearing commit for a group this coordinator has *no record of* is fenced
+    /// A generation-bearing commit for a group this coordinator has *no record of* is fenced
     /// with `UnknownMemberId` (a zombie whose group was reaped by the empty-group sweep, or whose
     /// coordinator restarted), forcing it to rejoin and get a fresh generation. Because coordinator
     /// state is in-memory, this means that after a bgworker restart every consumer holding a
@@ -657,7 +657,7 @@ impl GroupCoordinator {
     /// As in Kafka, a current-generation commit is accepted while the group is
     /// PreparingRebalance (the commit a member makes when its partitions are revoked,
     /// before it rejoins; the generation has not moved yet) and fenced with
-    /// `RebalanceInProgress` while it is CompletingRebalance (RV-10: the member's
+    /// `RebalanceInProgress` while it is CompletingRebalance (the member's
     /// assignment is about to change and it has not synced yet).
     pub fn validate_commit(
         &self,
@@ -698,7 +698,7 @@ impl GroupCoordinator {
         Ok(())
     }
 
-    /// Validate a (non-transactional) OffsetCommit as Kafka 3.7 does (wave3 groups):
+    /// Validate a (non-transactional) OffsetCommit as Kafka 3.7 does:
     /// - generation < 0 for an unknown or Empty group: a simple consumer (or an admin tool such
     ///   as `kafka-consumer-groups --reset-offsets`) committing outside group management; accepted
     ///   whatever the member id;
@@ -885,7 +885,7 @@ impl GroupCoordinator {
                 group.on_members_removed(&mut deliveries);
             }
 
-            // CG-5: reclaim expired empty groups here (every sweep), not just on the next
+            // Reclaim expired empty groups here (every sweep), not just on the next
             // join_group's pass, so coordinator memory stays bounded. An Empty group is kept until
             // EMPTY_GROUP_TTL_SECS has passed (the same rule join_group applies): dropping it
             // immediately would restart a rejoining group at generation 1, defeating the
@@ -1095,7 +1095,7 @@ impl Default for GroupCoordinator {
 }
 
 /// INCONSISTENT_GROUP_PROTOCOL for a JoinGroup whose protocol type or protocols do not fit the
-/// group (wave3 groups).
+/// group.
 fn inconsistent_protocol(group_id: &str) -> KafkaError {
     KafkaError::Protocol {
         code: crate::kafka::constants::ERROR_INCONSISTENT_GROUP_PROTOCOL,

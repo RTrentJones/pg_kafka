@@ -1,10 +1,4 @@
-// Transaction handlers
-//
-// Handles transaction-related requests for Kafka transactions (Phase 10).
-// - AddPartitionsToTxn: Register partitions in an active transaction
-// - AddOffsetsToTxn: Include consumer offset commits in a transaction
-// - EndTxn: Commit or abort a transaction
-// - TxnOffsetCommit: Commit offsets as part of a transaction
+//! Transaction handlers: AddPartitionsToTxn, AddOffsetsToTxn, EndTxn and TxnOffsetCommit.
 
 use crate::kafka::constants::ERROR_NONE;
 use crate::kafka::error::{KafkaError, Result};
@@ -49,7 +43,7 @@ pub fn handle_add_partitions_to_txn(
 ) -> Result<AddPartitionsToTxnResponse> {
     let store = ctx.store;
 
-    // Wave 3: resolve every partition first, without creating topics (Kafka answers
+    // Resolve every partition first, without creating topics (Kafka answers
     // UNKNOWN_TOPIC_OR_PARTITION for a missing topic; producers create topics through
     // Metadata). If any partition is unknown, nothing is added, the transaction does
     // not begin, and the valid partitions get OPERATION_NOT_ATTEMPTED, as in Kafka.
@@ -271,10 +265,10 @@ pub fn handle_txn_offset_commit(
 ) -> Result<TxnOffsetCommitResponse> {
     let store = ctx.store;
 
-    // RV-5: fence a zombie EOS consumer. A member committing offsets inside a
+    // Fence a zombie EOS consumer. A member committing offsets inside a
     // transaction with a stale group generation (or an unknown member id) must be
-    // rejected with ILLEGAL_GENERATION / UNKNOWN_MEMBER_ID — the same fence RA-5
-    // added to the non-transactional OffsetCommit path. The producer-epoch fence
+    // rejected with ILLEGAL_GENERATION / UNKNOWN_MEMBER_ID, the same fence as on the
+    // non-transactional OffsetCommit path. The producer-epoch fence
     // alone does not cover KIP-447 (the new owner uses a *different*
     // transactional_id, so the zombie keeps a valid epoch). Simple consumers /
     // pre-v3 clients (generation -1) are exempt inside validate_commit.
@@ -460,8 +454,8 @@ mod tests {
 
     #[test]
     fn test_add_partitions_to_txn_rejects_negative_partition() {
-        // CONF-5: a negative partition id must be rejected (UNKNOWN_TOPIC_OR_PARTITION), not
-        // accepted as ERROR_NONE. Wave 3: the request then fails as a whole (Kafka), the
+        // A negative partition id must be rejected (UNKNOWN_TOPIC_OR_PARTITION), not
+        // accepted as ERROR_NONE. The request then fails as a whole (Kafka), the
         // valid partition 0 gets OPERATION_NOT_ATTEMPTED and nothing begins.
         let mut store = MockKafkaStore::new();
         store.expect_get_topic_metadata().returning(|_| {
@@ -498,7 +492,7 @@ mod tests {
 
     #[test]
     fn test_txn_offset_commit_fences_stale_generation() {
-        // RV-5: a TxnOffsetCommit carrying a real group generation (>= 0) for an
+        // A TxnOffsetCommit carrying a real group generation (>= 0) for an
         // unknown / stale group membership must be fenced with UNKNOWN_MEMBER_ID,
         // not silently accepted. The producer-epoch fence alone does not cover this
         // (KIP-447: the new owner uses a different transactional_id). The fence

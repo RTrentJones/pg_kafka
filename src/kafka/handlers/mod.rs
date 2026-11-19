@@ -1,23 +1,10 @@
-// Kafka protocol handlers
-//
-// This module contains pure protocol logic that is decoupled from the storage implementation.
-// Each handler accepts a storage trait and returns protocol responses without knowing about SQL.
-//
-// Architecture:
-// - Handlers accept &impl KafkaStore (dependency injection)
-// - They focus on protocol logic: parsing requests, coordinating storage calls, building responses
-// - They know nothing about SQL, SPI, or transactions
-// - Transaction boundaries remain explicit in worker.rs
-//
-// Module organization:
-// - helpers: Common utilities for topic resolution and error handling
-// - metadata: ApiVersions and Metadata request handlers
-// - produce: ProduceRequest handler
-// - fetch: FetchRequest and ListOffsetsRequest handlers
-// - consumer: OffsetCommit and OffsetFetch handlers
-// - coordinator: Consumer group coordination (JoinGroup, SyncGroup, Heartbeat, etc.)
-// - init_producer_id: InitProducerId handler for idempotent producers (Phase 9)
-// - transaction: Transaction handlers (Phase 10)
+//! Kafka protocol handlers: one `handle_*` function per API, taking `&HandlerContext`.
+//!
+//! A handler turns a decoded request into the kafka-protocol response (or a typed
+//! `KafkaError`) through the storage role traits on `HandlerContext::store`
+//! (`&dyn KafkaStore`) and the group coordinator; it knows nothing about SQL or SPI, and
+//! the transaction around it belongs to the worker. The decode/encode pipeline around each
+//! handler is its API's `KafkaApi` impl in `kafka::api`.
 
 mod admin;
 mod configs;
@@ -33,7 +20,6 @@ mod transaction;
 #[cfg(test)]
 mod tests;
 
-// Re-export all handlers
 pub use admin::{
     handle_create_partitions, handle_create_topics, handle_delete_groups, handle_delete_topics,
 };

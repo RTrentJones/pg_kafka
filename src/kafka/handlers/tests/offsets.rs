@@ -49,7 +49,7 @@ fn test_handle_offset_commit_success() {
 
 #[test]
 fn test_handle_offset_commit_rejects_stale_generation() {
-    // CONF-1: a commit with a stale generation for a live group is rejected per-partition with
+    // A commit with a stale generation for a live group is rejected per-partition with
     // ILLEGAL_GENERATION before any store write (the mock has no commit_offset expectation, so a
     // write attempt would panic the test).
     let mock = MockKafkaStore::new();

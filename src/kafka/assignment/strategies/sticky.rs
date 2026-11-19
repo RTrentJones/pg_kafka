@@ -20,9 +20,11 @@
 //!
 //! # Example
 //!
+//! ```text
 //! Previous: Consumer A has [0,1,2], Consumer B has [3,4,5]
 //! Consumer B leaves -> partitions [3,4,5] become orphaned
-//! Consumer A gets [3,4,5] added -> Consumer A now has [0,1,2,3,4,5]
+//! Consumer A gets [3,4,5] added -> Consumer A has [0,1,2,3,4,5]
+//! ```
 //!
 //! # Characteristics
 //!
@@ -61,7 +63,7 @@ impl StickyStrategy {
 
 impl AssignmentStrategy for StickyStrategy {
     fn name(&self) -> &'static str {
-        // CG-2: this is the *eager* sticky assignor — it computes a full assignment server-side and
+        // This is the *eager* sticky assignor — it computes a full assignment server-side and
         // does not implement the cooperative (incremental, KIP-429) rebalance protocol. Advertising
         // "cooperative-sticky" would tell clients to skip revoking moved partitions, briefly
         // double-owning them. Report the honest eager name.
@@ -173,10 +175,9 @@ impl AssignmentStrategy for StickyStrategy {
                 .push(partition);
         }
 
-        // Step 4: Balance — move partitions from overloaded members to underloaded ones. CG-2:
-        // sticky preservation (Step 1) can leave a member holding far more partitions than a peer
-        // (e.g. when a new member joins an assignment one member already fully owns), and this was
-        // previously never corrected ("skip for MVP").
+        // Step 4: Balance: move partitions from overloaded members to underloaded ones. Sticky
+        // preservation (Step 1) can leave a member holding far more partitions than a peer
+        // (e.g. when a new member joins an assignment one member already fully owns).
         balance_assignments(&mut result, input, total_partitions);
 
         // Sort partition lists for consistent output
@@ -191,7 +192,7 @@ impl AssignmentStrategy for StickyStrategy {
 }
 
 /// Move partitions from overloaded members to subscribed, less-loaded members until the load spread
-/// is at most one (CG-2). Each move takes a partition from a member and hands it to a member that
+/// is at most one. Each move takes a partition from a member and hands it to a member that
 /// subscribes to its topic and is at least two partitions lighter, which strictly reduces the
 /// most-loaded member's count — so the loop terminates within `total_partitions` iterations.
 fn balance_assignments(
@@ -382,7 +383,7 @@ mod tests {
         let strategy = StickyStrategy::with_previous(previous);
         let result = strategy.assign(&input);
 
-        // CG-2: a new member joining an assignment member-1 fully owns must trigger rebalancing —
+        // A new member joining an assignment member-1 fully owns must trigger rebalancing —
         // the load is split evenly (2/2), with every partition still assigned exactly once.
         assert_eq!(result["member-1"].partition_count(), 2);
         assert_eq!(result["member-2"].partition_count(), 2);

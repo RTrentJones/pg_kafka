@@ -1,8 +1,5 @@
-// Fetch handlers
-//
-// Handlers for FetchRequest and ListOffsetsRequest.
-// These are read-focused APIs for consuming messages from topics.
-// Phase 10: Added isolation_level support for transactional reads.
+//! Fetch and ListOffsets: reading records (isolation-aware, re-encoded as RecordBatch v2) and
+//! resolving offsets by position or timestamp.
 
 use super::helpers::resolve_topic;
 use crate::kafka::constants::ERROR_NONE;
@@ -26,7 +23,7 @@ use kafka_protocol::records::{Record, RecordBatchEncoder, RecordEncodeOptions, T
 /// Fetches messages from storage and encodes them as Kafka RecordBatch.
 /// The compression parameter controls the encoding compression for the response.
 ///
-/// Phase 10: Added isolation_level support:
+/// Added isolation_level support:
 /// - ReadUncommitted (0): Returns all messages including pending transactions
 /// - ReadCommitted (1): Only returns committed messages (skips pending/aborted)
 ///
@@ -90,7 +87,7 @@ pub(crate) fn trim_to_response_budget(
     (kept, used)
 }
 
-/// Encode fetched rows as RecordBatch v2 (wave 3). Consecutive offsets written by the
+/// Encode fetched rows as RecordBatch v2. Consecutive offsets written by the
 /// same producer id and epoch form one batch (rows without a producer id, i.e. not
 /// written by a transactional producer, likewise): the batch header (61 bytes) and the
 /// compression are paid per batch instead of per record. Batches of transactional rows
@@ -149,7 +146,7 @@ pub(crate) fn encode_record_batches(
             value: msg.value.map(bytes::Bytes::from),
             headers: IndexMap::default(),
         };
-        // DR-8: return stored headers to the consumer.
+        // Return stored headers to the consumer.
         for (k, v) in msg.headers {
             record
                 .headers
@@ -209,7 +206,7 @@ fn gap_marker_record(offset_delta: i32) -> bytes::Bytes {
     out.freeze()
 }
 
-/// A batch covering offsets `[from, to)` without data (wave 3), or `None` when the
+/// A batch covering offsets `[from, to)` without data, or `None` when the
 /// range is empty: a control batch holding one COMMIT marker at offset `to - 1`, like
 /// the marker Kafka writes when a transaction ends. Clients skip control records but
 /// move their position past them: the Java client to the batch's last offset + 1,
@@ -343,7 +340,7 @@ pub fn handle_fetch_with_max_bytes(
                 continue;
             }
 
-            // DR-10 (DEEP-REVIEW-2026-07): a storage error computing the offset
+            // A storage error computing the offset
             // bounds must surface as a per-partition error code, not be swallowed
             // as offset 0 — `unwrap_or(0)` made a transient Postgres error look
             // like an empty partition, which can reset a consumer's position.
@@ -369,10 +366,10 @@ pub fn handle_fetch_with_max_bytes(
                 }
             };
             let high_watermark = bounds.high_watermark;
-            // Phase 10: LSO is the lowest offset of any pending transaction, or
+            // LSO is the lowest offset of any pending transaction, or
             // the HWM if none pending (always the HWM for ReadUncommitted).
             let last_stable_offset = bounds.last_stable_offset;
-            // RV-10: report the real log-start offset — the earliest retained
+            // Report the real log-start offset — the earliest retained
             // offset after cleanup/retention — rather than a hardcoded 0.
             let log_start_offset = bounds.earliest_offset;
 
@@ -396,7 +393,7 @@ pub fn handle_fetch_with_max_bytes(
             }
 
             // Fetch messages from storage
-            // Phase 10: Use isolation-aware fetch for transactional reads
+            // Use isolation-aware fetch for transactional reads
             // Request-level max_bytes: once the response budget is spent, later
             // partitions report their bounds but no records.
             let Some(limit) =
@@ -537,14 +534,14 @@ fn fetched_partition_data(
 /// Kafka's special timestamps:
 /// - -2 = earliest offset (log start)
 /// - -1 = latest offset: the high watermark, or the last stable offset for a
-///   read_committed request (wave 3)
+///   read_committed request
 /// - -3 = MAX_TIMESTAMP (KIP-734): offset and timestamp of the record with the largest
-///   timestamp (wave 3)
+///   timestamp
 /// - >= 0 = the earliest offset whose timestamp is at or after it
 ///
 /// Timestamp lookups (-3 and >= 0) are bounded like Kafka's: a match at or beyond the
 /// high watermark (read_committed: the last stable offset) is reported as offset -1.
-/// A partition outside the topic is UNKNOWN_TOPIC_OR_PARTITION (wave 3; was offset 0).
+/// A partition outside the topic is UNKNOWN_TOPIC_OR_PARTITION.
 pub fn handle_list_offsets(
     ctx: &HandlerContext,
     topics: Vec<crate::kafka::messages::ListOffsetsTopicData>,
@@ -885,7 +882,7 @@ mod tests {
         );
     }
 
-    // ===== wave3 txn: batch grouping and gap batches =====
+    // ===== Batch grouping and gap batches =====
 
     fn txn_msg(offset: i64, pid: Option<i64>) -> FetchedMessage {
         FetchedMessage {
@@ -922,8 +919,8 @@ mod tests {
     fn timestamps_too_far_apart_start_a_new_batch() {
         // A batch stores timestamps as i32 deltas from its minimum. A record stamped 0
         // (a client that sent no time) followed by records stamped with the current
-        // time used to be grouped into one batch that could not be encoded, and every
-        // fetch of the partition failed.
+        // time cannot share a batch with it: the batch could not be encoded, and every
+        // fetch of the partition would fail.
         let now = 1_795_078_665_492;
         let mut rows: Vec<FetchedMessage> = (0..4).map(|o| msg(o, 10)).collect();
         rows[1].timestamp = now;
@@ -938,7 +935,7 @@ mod tests {
 
     #[test]
     fn records_are_grouped_into_batches() {
-        // Before wave 3 every record was its own batch (61 bytes of header each).
+        // Consecutive records share a batch instead of paying 61 header bytes each.
         let plain: Vec<FetchedMessage> = (0..100).map(|o| msg(o, 10)).collect();
         let bytes = encode_record_batches(plain, Compression::None).unwrap();
         assert_eq!(decode_batches(bytes.clone()), vec![(0, 100, -1, false)]);
@@ -1035,9 +1032,9 @@ mod tests {
         r.responses[0].partitions[0].records.clone().unwrap()
     }
 
-    /// The read_committed stall: offsets 2..5 are aborted (filtered), nothing visible
-    /// is left. Before wave 3 the response was empty and the consumer re-fetched offset
-    /// 2 forever; now an empty batch moves it to the LSO (= HWM 5).
+    /// Offsets 2..5 are aborted (filtered) and nothing visible is left: a gap batch
+    /// moves the consumer to the LSO (= HWM 5). An empty response would make it
+    /// re-fetch offset 2 forever.
     #[test]
     fn invisible_tail_is_covered_by_a_gap_batch() {
         let mut mock = one_partition_mock(5, 5);

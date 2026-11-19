@@ -1,7 +1,5 @@
-// Consumer group coordinator handlers
-//
-// Handlers for consumer group management APIs:
-// FindCoordinator, JoinGroup, SyncGroup, Heartbeat, LeaveGroup, DescribeGroups, ListGroups
+//! Consumer group handlers: FindCoordinator, JoinGroup, SyncGroup, Heartbeat, LeaveGroup,
+//! DescribeGroups and ListGroups, over the in-memory `GroupCoordinator`.
 
 use crate::kafka::constants::{DEFAULT_BROKER_ID, ERROR_NONE};
 use crate::kafka::error::Result;
@@ -126,7 +124,7 @@ impl JoinGroupReply {
     }
 }
 
-/// Make a JoinGroup response encodable as Kafka encodes it at `api_version` (wave3 groups):
+/// Make a JoinGroup response encodable as Kafka encodes it at `api_version`:
 /// `protocol_name` is nullable only from v7, so an absent name (an error response) is sent as ""
 /// to older versions (Kafka's `GroupCoordinator.NoProtocol`); a null there made the Java client
 /// fail to parse the response.
@@ -172,7 +170,7 @@ where
         request.client_id
     );
 
-    // RV-10: reject a session_timeout_ms outside the broker's accepted range with
+    // Reject a session_timeout_ms outside the broker's accepted range with
     // INVALID_SESSION_TIMEOUT before touching group state, matching Kafka. This
     // prevents a hostile client from pinning a member alive far beyond any real
     // heartbeat cadence (blocking rebalances for the whole group) or requesting a
@@ -202,7 +200,7 @@ where
         .map(|p| (p.name, p.metadata))
         .collect();
 
-    // wave3 groups: bound what one member parks in coordinator memory. Kafka keeps a group's
+    // Bound what one member parks in coordinator memory. Kafka keeps a group's
     // member metadata in one __consumer_offsets record (message.max.bytes, 1 MiB by default).
     let protocol_bytes: usize = protocols.iter().map(|(n, m)| n.len() + m.len()).sum();
     if protocols.len() > crate::kafka::limits::MAX_MEMBER_PROTOCOLS
@@ -279,7 +277,7 @@ fn build_join_group_response(
     response.error_code = ERROR_NONE;
     response.generation_id = result.generation_id;
     response.protocol_type = Some(protocol_type.into());
-    // RA-6: advertise the protocol the GROUP selected (common to all members).
+    // Advertise the protocol the GROUP selected (common to all members).
     response.protocol_name = result.protocol_name.or(fallback_protocol).map(Into::into);
     response.leader = result.leader_id.into();
     response.member_id = result.member_id.into();
@@ -546,7 +544,7 @@ pub fn handle_describe_groups(
     response.throttle_time_ms = 0;
 
     // Get coordinator state
-    // CG-7: recover from a poisoned lock instead of panicking (which would crash the worker). A
+    // Recover from a poisoned lock instead of panicking (which would crash the worker). A
     // poisoned lock only means some writer panicked; the group map itself is still readable.
     let coordinator_groups = coordinator
         .groups
@@ -602,7 +600,7 @@ pub fn handle_describe_groups(
                 described_group.members.push(described_member);
             }
         } else {
-            // wave3 groups: a group the coordinator does not hold (none of its members
+            // A group the coordinator does not hold (none of its members
             // joined since the worker started, or it was reclaimed) still exists while it
             // has committed offsets: Kafka reports it as an Empty "consumer" group, which is
             // what lets `kafka-consumer-groups --describe` show its offsets and lag. Without
@@ -649,7 +647,7 @@ pub fn handle_list_groups(
     response.throttle_time_ms = 0;
 
     // Get coordinator state
-    // CG-7: recover from a poisoned lock instead of panicking (which would crash the worker). A
+    // Recover from a poisoned lock instead of panicking (which would crash the worker). A
     // poisoned lock only means some writer panicked; the group map itself is still readable.
     let coordinator_groups = coordinator
         .groups
@@ -672,7 +670,7 @@ pub fn handle_list_groups(
             )
         })
         .collect();
-    // wave3 groups: groups known only by their committed offsets are Empty "consumer" groups
+    // Groups known only by their committed offsets are Empty "consumer" groups
     // (see handle_describe_groups), so `kafka-consumer-groups --list` keeps showing them after a
     // worker restart.
     for group_id in ctx.store.list_offset_groups()? {
@@ -720,7 +718,7 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
-            // wave3 groups: groups unknown to the coordinator are looked up by their offsets.
+            // Groups unknown to the coordinator are looked up by their offsets.
             let mut store = MockKafkaStore::new();
             store.expect_group_has_offsets().returning(|_| Ok(false));
             store.expect_list_offset_groups().returning(|| Ok(vec![]));
@@ -841,7 +839,7 @@ mod tests {
 
     #[test]
     fn test_handle_join_group_rejects_out_of_bounds_session_timeout() {
-        // RV-10: a session_timeout_ms outside the accepted range is rejected with
+        // A session_timeout_ms outside the accepted range is rejected with
         // INVALID_SESSION_TIMEOUT before any group state is created.
         let f = Fixture::new();
         for bad in [100, i32::MAX] {
@@ -1125,10 +1123,9 @@ mod tests {
 
     #[test]
     fn test_describe_and_list_groups_recover_from_poisoned_lock() {
-        // CG-7: a poisoned groups lock (a writer panicked while holding it) must NOT crash
-        // DescribeGroups / ListGroups. They previously did `groups.read().unwrap()`, which panics
-        // on a poisoned lock; now they recover via into_inner(). This test poisons the lock and
-        // asserts both handlers still return Ok (it also covers the recovery closures).
+        // A poisoned groups lock (a writer panicked while holding it) must not crash
+        // DescribeGroups / ListGroups: they recover the guard with into_inner(). This test
+        // poisons the lock and asserts both handlers still return Ok.
         let coordinator = GroupCoordinator::new();
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = coordinator.groups.write().unwrap();
@@ -1152,7 +1149,7 @@ mod tests {
         assert!(handle_list_groups(&ctx, &[]).is_ok());
     }
 
-    // ----- wave3 groups -----
+    // ----- Groups known only by their committed offsets -----
 
     fn offsets_store(groups: &'static [&'static str]) -> MockKafkaStore {
         let mut store = MockKafkaStore::new();
@@ -1167,7 +1164,7 @@ mod tests {
 
     #[test]
     fn test_offsets_only_group_is_an_empty_consumer_group() {
-        // Item 2: a group the coordinator does not hold (e.g. after a worker restart) but that
+        // A group the coordinator does not hold (e.g. after a worker restart) but that
         // has committed offsets is reported as an Empty "consumer" group, as Kafka does;
         // it was "Dead" in DescribeGroups and missing from ListGroups.
         let store = offsets_store(&["committed-only", "live"]);

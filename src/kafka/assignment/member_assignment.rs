@@ -38,7 +38,7 @@ pub struct MemberAssignment {
     /// Protocol version
     pub version: i16,
 
-    /// Assigned partitions per topic: topic_name -> [partition_ids]
+    /// Assigned partitions per topic: topic name -> partition ids
     pub topic_partitions: HashMap<String, Vec<i32>>,
 
     /// Optional user-defined data (passed through unchanged)
@@ -228,10 +228,9 @@ mod tests {
 
     #[test]
     fn test_parse_huge_topics_len_does_not_oom() {
-        // SEC-6 regression: before the `with_capacity(.. .min(MAX_PREALLOC_ELEMENTS))` cap, a
-        // huge topic_partitions array length pre-allocated a multi-GB HashMap up front and
-        // aborted the process. With the cap it must error gracefully instead. An OOM here means
-        // the cap regressed.
+        // A huge declared topic_partitions length must not be pre-allocated (a multi-GB
+        // HashMap would abort the process); the capacity is capped at MAX_PREALLOC_ELEMENTS
+        // and the missing data is an error. An OOM here means the cap is gone.
         let mut buf = Vec::new();
         buf.extend_from_slice(&0i16.to_be_bytes()); // version
         buf.extend_from_slice(&i32::MAX.to_be_bytes()); // topic_partitions len = 2.1B, no data follows

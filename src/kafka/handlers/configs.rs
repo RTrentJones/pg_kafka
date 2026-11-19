@@ -1,17 +1,17 @@
-// Configuration management handlers (DescribeConfigs 32, IncrementalAlterConfigs 44)
-// and log management (DeleteRecords 21).
-//
-// Honest-minimal implementations: DescribeConfigs reports the configs pg_kafka
-// actually honors (with real values and correct sources); IncrementalAlterConfigs
-// accepts only the keys it can enforce (`retention.ms`) and rejects everything
-// else with INVALID_CONFIG rather than silently accepting; DeleteRecords
-// truncates partitions below an offset and reports the new low watermark.
-//
-// None of the three handlers returns `Err`: their responses have no top-level
-// error code, and the request-level error builders used on `Err`
-// (`build_*_error_response`) can only produce an empty, error-free response. Every
-// failure, storage failures included, is reported on the resource or partition it
-// affects, and the other items in the request are still processed.
+//! Configuration management handlers (DescribeConfigs 32, IncrementalAlterConfigs 44)
+//! and log management (DeleteRecords 21).
+//!
+//! DescribeConfigs reports the configs pg_kafka
+//! actually honors (with real values and correct sources); IncrementalAlterConfigs
+//! accepts only the keys it can enforce (`retention.ms`) and rejects everything
+//! else with INVALID_CONFIG rather than silently accepting; DeleteRecords
+//! truncates partitions below an offset and reports the new low watermark.
+//!
+//! None of the three handlers returns `Err`: their responses have no top-level
+//! error code, and the request-level error builders used on `Err`
+//! (`build_*_error_response`) can only produce an empty, error-free response. Every
+//! failure, storage failures included, is reported on the resource or partition it
+//! affects, and the other items in the request are still processed.
 
 use kafka_protocol::messages::delete_records_response::{
     DeleteRecordsPartitionResult, DeleteRecordsResponse, DeleteRecordsTopicResult,

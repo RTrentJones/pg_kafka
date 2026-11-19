@@ -1,19 +1,6 @@
-//! Handler context for unified parameter passing
-//!
-//! This module provides HandlerContext, a struct that groups common parameters
-//! passed to Kafka protocol handlers. This standardizes handler signatures and
-//! makes it easier to add new context without changing every handler signature.
-//!
-//! ## Motivation
-//!
-//! Previously, handlers had inconsistent parameter ordering and varying numbers
-//! of parameters (3-7 params). Adding new context (like logging or metrics)
-//! required updating every handler signature and call site.
-//!
-//! HandlerContext provides:
-//! - **Consistency:** All handlers accept `&HandlerContext` as first parameter
-//! - **Extensibility:** Add new context fields without touching handler signatures
-//! - **Clarity:** Separates "shared context" from "request-specific data"
+//! `HandlerContext`: the store, coordinator and broker metadata every Kafka handler takes
+//! as its first parameter, so shared context is added in one place rather than to every
+//! handler signature, and request-specific data stays in the handler's own parameters.
 
 use kafka_protocol::records::Compression;
 
@@ -62,7 +49,7 @@ pub struct HandlerContext<'a> {
     /// Broker metadata for Metadata/FindCoordinator responses
     ///
     /// Contains advertised host/port that clients use to connect.
-    /// Uses Arc<String> internally for zero-cost cloning.
+    /// Holds the host as an `Arc<String>`, so cloning it is cheap.
     pub broker: &'a BrokerMetadata,
 
     /// Default number of partitions for auto-created topics
