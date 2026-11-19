@@ -171,7 +171,7 @@ SELECT id, 0, 0, 'v'::bytea FROM kafka.topics WHERE name = 'upgrade-check-new';
 SELECT count(*) = 0 FROM kafka.messages_default;
 SQL
 )"
-  if [ "$(echo $out)" != "t t" ]; then
+  if [ "${out//$'\n'/ }" != "t t" ]; then
     echo "ERROR: partition maintenance check failed on $db: $out" >&2
     status=1
   fi
@@ -185,7 +185,7 @@ SELECT id, 0, 1, 'v'::bytea FROM kafka.topics WHERE name = 'upgrade-check-new';
 SELECT count(*) = 2 AND count(DISTINCT global_offset) = 2 FROM kafka.messages;
 SQL
 )"
-if [ "$(echo $out)" != "t t t" ]; then
+if [ "${out//$'\n'/ }" != "t t t" ]; then
   echo "ERROR: dropping the legacy leaf failed: $out" >&2
   status=1
 fi

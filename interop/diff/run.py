@@ -8,9 +8,9 @@ and compares pg_kafka's against Kafka's.
 
 Every difference must be classified in KNOWN:
   ("deviation", "PROTOCOL_DEVIATIONS.md, <section>")  documented, intentional: reported DEV
-  ("bug", "<who fixes it>")                           a defect: reported XFAIL (XPASS once fixed)
+  ("bug", "<the defect>")                            a defect: reported XFAIL (XPASS once fixed)
 An unclassified difference fails the run. A classified observation that no longer differs is
-reported XPASS / DEV-GONE so the entry can be removed.
+reported XPASS / DEV-GONE (the run still passes) so the entry can be removed.
 
   interop/diff/run.py --pg 127.0.0.1:9092 --kafka 127.0.0.1:9093 [--only scenario] [--show]
 
@@ -45,8 +45,8 @@ ERRORS = {0: "NONE", 1: "OFFSET_OUT_OF_RANGE", 3: "UNKNOWN_TOPIC_OR_PARTITION",
           69: "GROUP_ID_NOT_FOUND", 79: "MEMBER_ID_REQUIRED", 88: "UNSTABLE_OFFSET_COMMIT",
           90: "PRODUCER_FENCED"}
 
-# (scenario, observation) -> (kind, reason). Keep every entry pointing at where it is
-# documented (deviation) or who fixes it (bug, wave 3 stream).
+# (scenario, observation) -> (kind, reason). A deviation points at where it is documented; a
+# bug says what pg_kafka does wrong.
 DEV_MARKERS = ("deviation", "PROTOCOL_DEVIATIONS.md §4: no transaction markers are written, so "
                "offsets after a transaction are one lower per committed/aborted transaction")
 KNOWN = {
@@ -63,54 +63,29 @@ KNOWN = {
     ("transactions", "lo_latest_uncommitted"): DEV_MARKERS,
     ("transactions", "fetch_uncommitted_from_0.offsets"): DEV_MARKERS,
     ("transactions", "fetch_uncommitted_at_aborted_tail.offsets"): DEV_MARKERS,
-    ("transactions", "batch_layout"): ("bug", "stream txn item 4: one RecordBatch per record "
-                                       "(and, PROTOCOL_DEVIATIONS.md §4, no control batches)"),
-    # ---- bugs other wave-3 streams are fixing
-    ("produce_plain", "acks_2"): ("bug", "stream net item 5: invalid acks accepted and written"),
-    ("produce_plain", "fetch"): ("bug", "stream net item 5: the acks=2 record was written"),
-    ("produce_plain", "fetch.offsets"): ("bug", "stream net item 5: the acks=2 record was written"),
-    ("produce_idempotent", "retry_seq0"): ("bug", "stream txn item 5: a duplicate is acked with "
-                                           "base_offset -1, not the original offset"),
-    ("produce_idempotent", "retry_older_seq0"): ("bug", "stream txn item 5: duplicates of the "
-                                                 "last 5 batches keep their original offset"),
-    ("produce_idempotent", "unknown_pid"): ("bug", "stream txn item 5: Kafka 3.7 starts state "
-                                            "for an unknown producer id at sequence 0; pg_kafka "
-                                            "answers UNKNOWN_PRODUCER_ID"),
-    ("produce_idempotent", "log"): ("bug", "stream txn item 5 (follows unknown_pid)"),
-    ("produce_idempotent", "log.offsets"): ("bug", "stream txn item 5 (follows unknown_pid)"),
-    ("transactions", "init_bad_timeout"): ("bug", "stream txn item 6: transaction_timeout_ms "
-                                           "not validated"),
-    ("transactions", "lo_latest_committed"): ("bug", "stream txn item 3a: read_committed "
-                                              "ListOffsets LATEST is not the LSO"),
-    ("transactions", "fetch_committed_from_0.offsets"): ("bug", "stream txn item 1: the "
-                                                         "read_committed position stops before "
-                                                         "the aborted tail (and §4 markers)"),
-    ("transactions", "fetch_committed_at_aborted_tail.offsets"): ("bug", "stream txn item 1: "
-                                                                  "position never passes the "
-                                                                  "aborted tail"),
-    ("transactions", "offset_fetch_require_stable"): ("bug", "stream txn item 2: require_stable "
-                                                      "ignored (no UNSTABLE_OFFSET_COMMIT)"),
-    ("list_offsets", "max_timestamp"): ("bug", "stream txn item 3b: MAX_TIMESTAMP (-3)"),
-    ("list_offsets", "unknown_partition"): ("bug", "stream txn item 3c: out-of-range partition"),
-    ("offsets", "unknown_group_generation_5"): ("bug", "stream groups item 4: OffsetCommit for "
-                                                "an unknown group at generation >= 0"),
-    ("groups", "join_unknown_member_id"): ("bug", "stream groups item 4: JoinGroup with an "
-                                           "unknown non-empty member id is admitted"),
-    ("groups", "join_no_protocols"): ("bug", "stream groups item 3: empty protocol list"),
-    ("groups", "join_other_protocol_type"): ("bug", "stream groups item 3: no "
-                                             "INCONSISTENT_GROUP_PROTOCOL"),
-    ("admin", "replication_3"): ("bug", "stream groups item 5: replication_factor > 1 accepted"),
-    ("admin", "dup_in_request"): ("bug", "stream groups item 5: duplicate topic in one request"),
-    ("admin", "collision"): ("bug", "stream groups item 5: x.N / x_N collision"),
-    # ---- bugs found by this harness that no stream was assigned (reported to the integrator)
-    ("produce_plain", "log_start_offset"): ("bug", "NEW: ProduceResponse log_start_offset is -1 "
+    ("transactions", "lo_latest_committed"): DEV_MARKERS,
+    ("transactions", "fetch_committed_at_aborted_tail.offsets"): DEV_MARKERS,
+    ("transactions", "fetch_committed_from_0.offsets"): (
+        "deviation", "PROTOCOL_DEVIATIONS.md §7: aborted records are filtered server-side, so "
+        "the fetch ends at the last visible record and the control batch covering the aborted "
+        "tail comes with the next fetch (and §4: no markers)"),
+    ("transactions", "batch_layout"): (
+        "deviation", "PROTOCOL_DEVIATIONS.md §7: records are regrouped at read time into one "
+        "batch per run of a producer's consecutive offsets (and §4: no control batches)"),
+    ("produce_idempotent", "unknown_pid"): (
+        "deviation", "PROTOCOL_DEVIATIONS.md §3: a producer id InitProducerId never issued "
+        "(or whose state expired) is UNKNOWN_PRODUCER_ID; Kafka 3.7 accepts it at sequence 0"),
+    ("produce_idempotent", "log"): ("deviation", "PROTOCOL_DEVIATIONS.md §3: follows from "
+                                    "unknown_pid (the record is not written)"),
+    ("produce_idempotent", "log.offsets"): ("deviation", "PROTOCOL_DEVIATIONS.md §3: follows "
+                                            "from unknown_pid"),
+    # ---- known defects
+    ("produce_plain", "log_start_offset"): ("bug", "ProduceResponse log_start_offset is -1 "
                                             "(Kafka returns the partition's log start offset)"),
-    ("list_offsets", "after_last"): ("bug", "NEW: ListOffsets for a timestamp after the last "
-                                     "record answers UNKNOWN_SERVER_ERROR (Kafka: NONE, offset -1)"),
-    ("offsets", "unknown_partition"): ("bug", "NEW: OffsetCommit to a partition the topic does "
-                                       "not have is accepted (Kafka: UNKNOWN_TOPIC_OR_PARTITION)"),
-    ("groups", "delete_unknown_group"): ("bug", "NEW: DeleteGroups of an unknown group answers "
-                                         "NONE (Kafka: GROUP_ID_NOT_FOUND)"),
+    ("list_offsets", "after_last"): ("bug", "ListOffsets for a timestamp after the last record "
+                                     "answers UNKNOWN_SERVER_ERROR (Kafka: NONE, offset -1)"),
+    ("offsets", "unknown_partition"): ("bug", "OffsetCommit to a partition the topic does not "
+                                       "have is accepted (Kafka: UNKNOWN_TOPIC_OR_PARTITION)"),
 }
 
 # Response fields that differ between any two brokers and carry no protocol meaning here.
@@ -171,9 +146,8 @@ class Target:
         self.raw({"conn": conn, "op": "close"})
 
     def sym(self, kind, value):
-        if value in (None, -1, "", 0) and kind != "memberId":
-            return value
-        if value in ("", None):
+        # None, "" and -1 mean "no id"; 0 is a real producer id (Kafka's first).
+        if value in (None, "", -1):
             return value
         key = (kind, value)
         if key not in self.symbols:
@@ -469,7 +443,7 @@ def sc_transactions(t, obs):
         if first_aborted is not None:
             _, p = fetch(t, topic, first_aborted, iso)
             obs_fetch(obs, f"fetch_{name}_at_aborted_tail", p, first_aborted, iso)
-    # Batch layout: one batch per produce (Kafka) vs one per record.
+    # Batch layout: Kafka keeps the produced batches and adds markers; pg_kafka regroups.
     _, p = fetch(t, topic, 0, 0)
     obs("batch_layout", [(b["baseOffset"], b["lastOffset"], b["isControlBatch"])
                          for b in p.get("records", [])])
@@ -491,8 +465,14 @@ def sc_transactions(t, obs):
                                                           "producerId": pid,
                                                           "producerEpoch": ep,
                                                           "committed": True}))))
-    of = body(t.req(9, 7, {"groupId": group, "requireStable": True,
-                           "topics": [{"name": topic, "partitionIndexes": [0]}]}))
+    # Kafka writes the commit markers asynchronously after EndTxn, so a require_stable fetch
+    # can still be UNSTABLE_OFFSET_COMMIT for a moment; clients retry it, and so does this.
+    for _ in range(40):
+        of = body(t.req(9, 7, {"groupId": group, "requireStable": True,
+                               "topics": [{"name": topic, "partitionIndexes": [0]}]}))
+        if not has_code(of, 88):
+            break
+        time.sleep(0.25)
     obs("offset_fetch_after_commit", normalise(t, of))
     # A stale epoch after a re-init (fencing)
     b2, pid2, ep2 = init_pid(t, txn)

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# pg_kafka soak test (wave 3, stream `worker`).
+# pg_kafka soak test.
 #
 # Runs kafka_test's `soak` driver (kafka_test/src/bin/soak.rs) against a live broker for
 # DURATION seconds (default 1800), with:
@@ -37,6 +37,7 @@ PGDATABASE="${PGDATABASE:-postgres}"
 KAFKA_BOOTSTRAP="${KAFKA_BOOTSTRAP:-127.0.0.1:9092}"
 export PGHOST PGPORT PGUSER PGDATABASE
 PSQL=(psql -X -q -At -v ON_ERROR_STOP=1)
+read -r -a soak_args <<< "${SOAK_ARGS:-}"
 
 if [ -z "${SOAK_BIN:-}" ]; then
   (cd "$ROOT/kafka_test" && cargo build --release --bin soak)
@@ -66,7 +67,8 @@ trap reset_gucs EXIT
 echo "soak: ${DURATION}s against $KAFKA_BOOTSTRAP (db $PGHOST:$PGPORT)"
 status=0
 "$SOAK_BIN" --duration-secs "$DURATION" --bootstrap "$KAFKA_BOOTSTRAP" \
-  --db "host=$PGHOST port=$PGPORT user=$PGUSER dbname=$PGDATABASE" ${SOAK_ARGS:-} || status=$?
+  --db "host=$PGHOST port=$PGPORT user=$PGUSER dbname=$PGDATABASE" "${soak_args[@]}" \
+  || status=$?
 
 if [ -n "$SERVER_LOG" ]; then
   segment="$(mktemp)"
@@ -76,7 +78,10 @@ if [ -n "$SERVER_LOG" ]; then
   # batch errors and lock waits caused by DROP EXTENSION, DROP's own NOTICEs.
   expected='terminating background worker "pg_kafka_listener" due to administrator command|Failed to handle [A-Za-z]+ request|Client disconnected before response flush|Request batch failed and was rolled back.*(lock timeout|extension)|canceling statement due to lock timeout|could not (create|drop) time partition .*lock timeout|partition maintenance skipped'
   echo "server log: $(wc -l < "$segment") lines in the run"
-  grep -E 'deadlock detected' "$segment" && { echo "FAIL: deadlock detected"; status=1; } || true
+  if grep -E 'deadlock detected' "$segment"; then
+    echo "FAIL: deadlock detected"
+    status=1
+  fi
   grep -E '(\b(ERROR|FATAL|PANIC|WARNING):|panicked)' "$segment" \
     | sed -E 's/^[0-9-]+ [0-9:.]+ [A-Z]+ \[[0-9]+\] //; s/[0-9]+/N/g' | cut -c1-160 \
     | sort | uniq -c | sort -rn > "$segment.kinds" || true

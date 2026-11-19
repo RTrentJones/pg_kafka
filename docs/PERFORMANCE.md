@@ -4,8 +4,7 @@ This document outlines performance benchmarks, tuning recommendations, and archi
 
 ## Measured pg_kafka Performance (the numbers that matter)
 
-> DR-23 (DEEP-REVIEW-2026-07): this section supersedes the external benchmark
-> below as the headline. pg_kafka's own measured numbers live in the evidence
+> pg_kafka's own measured numbers live in the evidence
 > pipeline — `evidence/bench/` regenerates `bench.json` in the `evidence` workflow
 > (`.github/workflows/evidence.yml`: weekly, on `v*` tags, or on demand) and the results
 > render at [rtrentjones.dev/pg_kafka](https://rtrentjones.dev/pg_kafka).
@@ -18,7 +17,7 @@ This document outlines performance benchmarks, tuning recommendations, and archi
 For current figures, see `bench.json` on the `evidence` branch (produce/consume
 throughput, latency percentiles, raw-INSERT floor, shadow-forwarding rates).
 The E2E performance suite (`kafka_test --category performance`) enforces
-regression floors in CI (DR-18).
+regression floors in CI.
 
 ### Architecture ceiling
 
@@ -26,10 +25,10 @@ Every Produce/Fetch/Offset/Txn request executes on **one** DB thread, one at a
 time. This makes the in-memory coordinator and check-then-act SQL race-free
 without locks, at the cost of a hard single-core ceiling for SPI work.
 Throughput levers, in order: batching (one Produce carrying N records costs
-~one insert), fetch byte budgets (DR-9 fills max_bytes in bounded query
+~one insert), fetch byte budgets (max_bytes is filled in bounded query
 loops), connection pipelining (safe — responses stay ordered per connection),
 and vertical DB tuning. Heartbeats travel on a dedicated liveness lane that the
-worker drains before the main request queue (DR-12), so group liveness does not
+worker drains before the main request queue, so group liveness does not
 degrade with produce load.
 
 ## Background: PostgreSQL as a message store (external benchmark)
@@ -369,10 +368,6 @@ CREATE TABLE kafka.consumer_offsets (
 
 ## Retention & lifecycle GUCs (shipped)
 
-> DR-23: earlier revisions of this document described `pg_kafka.retention_days`,
-> `pg_kafka.partition_interval`, and `pg_kafka.autovacuum_aggressive` — none of
-> which were ever implemented. What actually ships (DR-1/DR-2):
-
 ```sql
 -- Time-based retention for kafka.messages, enforced by the worker's periodic
 -- retention sweep (60s cadence, at most 10,000 rows per DELETE). 0 (default)
@@ -404,7 +399,7 @@ enforced by the same sweep: a value `>= 0` applies even when the global GUC is
 partition up to an offset on demand.
 
 Aggressive autovacuum for the high-churn counter tables is applied by
-`sql/tune_autovacuum.sql` (DR-5). Time partitioning and partition-drop retention:
+`sql/tune_autovacuum.sql`. Time partitioning and partition-drop retention:
 ADR-001 "As built".
 
 ### Suggested System Configuration
@@ -548,6 +543,6 @@ These ideas predate the outbox-based implementation described above.
 
 ---
 
-**Status:** Phase 11 Complete. Shadow mode, transactions, idempotent producer, and compression support are fully implemented. Time-based retention (global GUC plus per-topic `retention.ms`) ships as a bounded `DELETE` sweep. Native table partitioning is still planned (ADR-001).
+**Status:** Phase 11 Complete. Retention (global GUC plus per-topic `retention.ms`) drops whole time partitions of `kafka.messages` where it can and deletes row by row in bounded batches elsewhere (ADR-001).
 
-**Last Updated:** 2026-10-29
+**Last Updated:** 2026-11-19

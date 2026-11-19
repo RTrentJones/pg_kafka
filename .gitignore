@@ -34,3 +34,5 @@ target
 # Test Coverage directory
 .cov/
 lcov.info
+# Python bytecode (scripts/, interop/)
+__pycache__/

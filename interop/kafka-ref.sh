@@ -5,7 +5,7 @@
 #   interop/kafka-ref.sh start <kafka_home> <workdir>
 #   interop/kafka-ref.sh stop  <kafka_home> <workdir>
 #
-# <kafka_home> is an unpacked kafka_2.13-3.7.0 distribution. Settings match what the review used:
+# <kafka_home> is an unpacked kafka_2.13-3.7.0 distribution. The broker is configured with
 # one partition per topic by default, replication factor 1 for the internal topics, no initial
 # rebalance delay (so group timings are comparable with pg_kafka).
 set -euo pipefail

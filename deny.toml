@@ -1,9 +1,9 @@
-# cargo-deny configuration (DR-16, DEEP-REVIEW-2026-07)
+# cargo-deny configuration
 #
 # Complements the cargo-audit gate: audit checks the advisory DB; deny also
 # enforces license policy and — most importantly for this project — pins the
 # allowed *sources* of dependencies, so the patched kafka-protocol fork (which
-# carries the SEC-9/RV-1 allocation caps) can't silently be joined by other
+# carries the decoder allocation caps) cannot silently be joined by other
 # unvetted git dependencies.
 #
 # Run locally:  cargo deny check           (root crate)
@@ -57,7 +57,7 @@ wildcards = "deny"
 unknown-registry = "deny"
 unknown-git = "deny"
 # The ONLY permitted git dependency: the patched kafka-protocol fork carrying
-# the SEC-9/RV-1 decode-allocation caps (see Cargo.toml [patch.crates-io]).
+# the decoder allocation caps (see Cargo.toml [patch.crates-io]).
 allow-git = [
     "https://github.com/RTrentJones/kafka-protocol-rs",
 ]

@@ -1,9 +1,6 @@
-# Codecov Configuration
-# https://docs.codecov.com/docs/codecov-yaml
-#
-# Coverage targets and enforcement for pg_kafka
-# Note: Some code cannot be unit tested due to pgrx/SPI constraints.
-# Those files are excluded and covered by E2E tests in kafka_test/
+# Codecov configuration (https://docs.codecov.com/docs/codecov-yaml): the coverage gates for
+# pg_kafka's unit tests. Code that needs a live PostgreSQL is excluded below and covered by the
+# E2E suite in kafka_test/.
 
 codecov:
   require_ci_to_pass: yes
@@ -34,27 +31,18 @@ coverage:
         threshold: 5%  # Some flexibility for generated code
         informational: false  # Block PRs below threshold
 
-# Files excluded from coverage calculation
-# These are either:
-# - pgrx-generated code
-# - SPI-dependent (tested via E2E suite in kafka_test/)
-# - Async runtime code (E2E tested)
+# Files excluded from coverage: pgrx-generated code, and code that only runs against a live
+# PostgreSQL (SPI, the background worker) or inside the tokio listener, for which unit coverage
+# would always read 0%.
 #
-# QA-1 (AUDIT-2026-06) — coverage policy and its limitation, stated explicitly so the gate isn't a
-# silent dodge:
-#   * The unit patch/project gates below apply only to code that CAN run without a live PostgreSQL.
-#     The files ignored here genuinely cannot (they call SPI / run inside the pgrx background worker /
-#     drive the tokio listener), so unit coverage would always read 0% for them and is not meaningful.
-#   * The mitigation is mandatory, not implied: every behavioural change to an ignored file MUST ship a
-#     kafka_test E2E regression test that fails before / passes after (the test-per-bug rule this
-#     remediation applied to e.g. BUG-3 offset reuse, BUG-4 high-watermark, BUG-5 panic→hang, BUG-7
-#     timestamps, CONF-7 ListOffsets, SEC-3/4 admission/backpressure). A reviewer should reject an
-#     ignored-file change that lands without one.
-#   * Do NOT add a file here to route untested logic around the patch gate. The list below is for
-#     genuinely SPI/async/generated code only; new entries need a one-line justification. A file
-#     that mixes SPI calls with unit-testable logic goes on the `# qa1-guard:` list instead.
-#   * Mechanically checked: every src/ file that calls SPI (Spi::*, BackgroundWorker::*,
-#     #[pg_extern]) must be on one of the two lists (.github/scripts/check-coverage-policy.sh).
+# QA-1 rule: every behavioural change to a file listed here (or on a `# qa1-guard:` line below)
+# must ship a kafka_test/ E2E regression test that fails before and passes after; the
+# spi-e2e-guard CI job (.github/scripts/require-e2e-for-spi.sh) enforces it. Do NOT add a file
+# here to route untested logic around the patch gate: entries are for genuinely
+# SPI/async/generated code, each with a one-line justification. A file that mixes SPI calls with
+# unit-testable logic goes on the `# qa1-guard:` list instead. Every src/ file that calls SPI
+# (Spi::*, BackgroundWorker::*, #[pg_extern]) must be on one of the two lists, and entries must
+# be literal paths (no globs) for the guard to see them (.github/scripts/check-coverage-policy.sh).
 ignore:
   # pgrx generated/macro code
   - "src/bin/**"                      # pgrx embedding binary
