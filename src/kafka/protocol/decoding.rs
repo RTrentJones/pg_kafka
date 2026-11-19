@@ -1,98 +1,71 @@
-// Request decoding module
-//
-// Handles parsing of Kafka requests from binary wire protocol format.
-//
-// ## Thread Safety
-//
-// This module runs in the network thread and MUST NOT use pgrx logging.
-// All logging uses the `tracing` crate.
+//! Request decoding: the header of a frame, then the body through the API registry.
+//!
+//! Runs on the network thread, so it logs through `tracing`, never pgrx.
 
 use bytes::BytesMut;
 use kafka_protocol::protocol::decode_request_header_from_buffer;
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, warn};
 
-use super::super::api::{self, Decoded, ResponseBody};
-use super::super::constants::ERROR_UNSUPPORTED_VERSION;
-use super::super::error::{KafkaError, Result};
-use super::super::messages::{KafkaRequest, KafkaResponse};
+use crate::kafka::api::{self, Decoded, ResponseBody};
+use crate::kafka::constants::ERROR_UNSUPPORTED_VERSION;
+use crate::kafka::error::{KafkaError, Result};
+use crate::kafka::messages::{KafkaRequest, KafkaResponse};
 
-/// Parse a Kafka request from a frame
-///
-/// The frame has already been extracted by LengthDelimitedCodec, so we only need to parse:
-/// [RequestHeader] [RequestBody]
-///
-/// RequestHeader contains:
-/// - api_key: i16 (which API this is, e.g., 18 = ApiVersions)
-/// - api_version: i16 (which version of the API)
-/// - correlation_id: i32 (client-assigned ID for matching responses)
-/// - client_id: nullable string (client identifier)
+/// Parse one request frame (the length prefix already removed by the frame codec):
+/// `[RequestHeader][RequestBody]`.
 ///
 /// Returns `Ok(Some(request))` for a request the DB thread must run, `Ok(None)` when the
 /// request was already answered here (an error response, or deliberately nothing for an
 /// acks=0 Produce), and `Err` when no response can be shaped and the connection must close
 /// (the header cannot be parsed, or the version has no response format).
 ///
-/// The body is decoded by the API's [`api::KafkaApi`] description (see `api::decode_body`).
-///
-/// SEC-2: this is the untrusted-input boundary. The `kafka-protocol` crate's header and body
-/// decoders index without bounds checks and PANIC on truncated/garbage frames rather than
-/// returning Err. Since this runs on the network thread (panic = "unwind"), the whole parse is
-/// wrapped in `catch_unwind` so a malformed frame degrades to a CorruptMessage error instead of
-/// unwinding the connection. See `test_parse_{empty,truncated}_header_returns_err_no_panic`.
-///
-/// NOTE: catch_unwind only contains *unwinding* panics, not allocation aborts. A crafted
-/// array-length prefix used to make the kafka-protocol body decoders `with_capacity` gigabytes and
-/// *abort* the process (SIGABRT) — AUDIT-2026-06 SEC-9. That is fixed by capping the decoder's
-/// pre-allocation in a patched kafka-protocol (see Cargo.toml `[patch.crates-io]`); the
-/// `fuzz_parse_request_*` and `test_fetch_huge_topics_array_*` tests guard against regressions.
+/// This is the untrusted-input boundary. The `kafka-protocol` header and body decoders index
+/// without bounds checks and panic on truncated or garbage frames, so the whole parse runs
+/// under `catch_unwind` (the network thread is built with `panic = "unwind"`) and a
+/// malformed frame becomes a CorruptMessage error. `catch_unwind` cannot contain an
+/// allocation abort; the patched kafka-protocol in Cargo.toml `[patch.crates-io]` caps the
+/// pre-allocation a crafted array length can ask for, which
+/// `test_fetch_huge_topics_array_does_not_oom_abort` and the `fuzz_parse_request_*`
+/// property tests guard.
 pub fn parse_request(
     frame: BytesMut,
-    response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
+    response_tx: UnboundedSender<KafkaResponse>,
 ) -> Result<Option<KafkaRequest>> {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         parse_request_inner(frame, response_tx)
-    })) {
-        Ok(result) => result,
-        Err(_panic) => {
-            warn!("Panic while parsing request (malformed or truncated frame)");
-            Err(KafkaError::CorruptMessage {
-                message: "malformed request".into(),
-            })
-        }
-    }
+    }))
+    .unwrap_or_else(|_panic| {
+        warn!("Panic while parsing request (malformed or truncated frame)");
+        Err(KafkaError::CorruptMessage {
+            message: "malformed request".into(),
+        })
+    })
 }
 
 fn parse_request_inner(
-    frame: BytesMut,
-    response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
+    mut frame: BytesMut,
+    response_tx: UnboundedSender<KafkaResponse>,
 ) -> Result<Option<KafkaRequest>> {
     debug!("Parsing request from {} byte frame", frame.len());
 
-    // Parse RequestHeader using kafka-protocol's decode function
-    // This automatically handles both non-flexible and flexible header formats
-    let mut payload_buf = frame;
-
-    let header = match decode_request_header_from_buffer(&mut payload_buf) {
-        Ok(h) => h,
-        Err(e) => {
-            warn!("Failed to decode RequestHeader: {}", e);
-            return Err(KafkaError::ProtocolCodec(e));
-        }
-    };
-
+    // Handles both the non-flexible and the flexible header formats.
+    let wire_header = decode_request_header_from_buffer(&mut frame).map_err(|e| {
+        warn!("Failed to decode RequestHeader: {e}");
+        KafkaError::ProtocolCodec(e)
+    })?;
     let header = api::RequestHeader {
-        api_key: header.request_api_key,
-        api_version: header.request_api_version,
-        correlation_id: header.correlation_id,
-        client_id: header.client_id.map(|s| s.to_string()),
+        api_key: wire_header.request_api_key,
+        api_version: wire_header.request_api_version,
+        correlation_id: wire_header.correlation_id,
+        client_id: wire_header.client_id.map(|s| s.to_string()),
     };
-
     debug!(
         "Parsed RequestHeader: api_key={}, api_version={}, correlation_id={}, client_id={:?}",
         header.api_key, header.api_version, header.correlation_id, header.client_id
     );
 
-    match api::decode_body(&mut payload_buf, header, response_tx) {
+    match api::decode_body(&mut frame, header, response_tx) {
         Ok(Decoded::Request(request)) => Ok(Some(request)),
         Ok(Decoded::Answered) => Ok(None),
         Ok(Decoded::Close(reason)) => Err(KafkaError::encoding(reason)),
@@ -100,6 +73,7 @@ fn parse_request_inner(
             // An API key the crate knows but pg_kafka does not serve: there is no
             // registered response schema, so answer with the generic error frame.
             warn!("Unsupported API key: {}", header.api_key);
+            // The connection may already be gone; there is nobody left to tell.
             let _ = response_tx.send(KafkaResponse::new(
                 header.correlation_id,
                 header.api_version,
