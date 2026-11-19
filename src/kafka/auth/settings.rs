@@ -474,7 +474,7 @@ mod tests {
         assert_eq!(s.listeners[0].protocol, SecurityProtocol::Plaintext);
         assert_eq!(s.listeners[0].advertised, None);
         assert!(!s.needs_tls() && !s.needs_sasl());
-        assert!(s.warnings().is_empty());
+        assert_eq!(s.warnings(), Vec::<String>::new());
     }
 
     #[test]
@@ -491,7 +491,7 @@ mod tests {
         assert_eq!(l[2].host, "::1");
         assert_eq!(l[2].bind_addr(), "[::1]:9095");
         assert_eq!(l[3].advertised, Some(("localhost".into(), 9096)));
-        assert!(parse_listeners("", "h").unwrap().is_empty());
+        assert_eq!(parse_listeners("", "h").unwrap(), Vec::new());
     }
 
     #[test]
@@ -562,6 +562,6 @@ mod tests {
         assert_eq!(s.warnings().len(), 1, "only the PLAINTEXT listener is left");
         // Loopback binds never warn.
         let s = SecuritySettings::resolve(&raw("PLAINTEXT", ""), "127.0.0.1", 9092).unwrap();
-        assert!(s.warnings().is_empty());
+        assert_eq!(s.warnings(), Vec::<String>::new());
     }
 }

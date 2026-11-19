@@ -81,7 +81,7 @@ fn lookup_stored(
             mechanism: ScramMechanism::from_name(&mechanism)
                 .ok_or_else(|| format!("stored credential has unknown mechanism {mechanism}"))?,
             salt,
-            iterations: iterations.max(0) as u32,
+            iterations: u32::try_from(iterations).unwrap_or(0),
             stored_key,
             server_key,
         };
@@ -153,10 +153,10 @@ fn read_fake_params(mechanism: ScramMechanism) -> Result<FakeCredentialParams, S
             .next()
         {
             if let Some(i) = row.get_by_name::<i32, _>("iterations")? {
-                params.iterations = i.max(0) as u32;
+                params.iterations = u32::try_from(i).unwrap_or(0);
             }
             if let Some(l) = row.get_by_name::<i32, _>("salt_len")? {
-                params.salt_len = l.max(1) as usize;
+                params.salt_len = usize::try_from(l).unwrap_or(0).max(1);
             }
         }
         Ok::<_, spi::SpiError>(params)

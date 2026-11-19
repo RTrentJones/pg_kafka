@@ -62,7 +62,10 @@ struct ApiCounters {
 }
 
 impl ApiCounters {
-    #[expect(clippy::declare_interior_mutable_const)] // only used as an array-repeat initializer
+    #[expect(
+        clippy::declare_interior_mutable_const,
+        reason = "only used as an array-repeat initializer, so each slot gets its own atomics"
+    )]
     const NEW: ApiCounters = ApiCounters {
         requests: AtomicU64::new(0),
         errors: AtomicU64::new(0),
@@ -295,7 +298,10 @@ fn to_i64(v: u64) -> i64 {
 impl FlushBatch {
     /// Column arrays for the `unnest()` in [`FLUSH_SQL`], in parameter order
     /// ($1 api_key, $2 api_name, $3 requests, $4 errors, $5 latency sum, $6 latency max).
-    #[expect(clippy::type_complexity)]
+    #[expect(
+        clippy::type_complexity,
+        reason = "one Vec per SQL parameter, in parameter order"
+    )]
     pub fn api_columns(
         &self,
     ) -> (
@@ -443,21 +449,17 @@ impl<'a> MetricsFlusher<'a> {
 /// Diff `snapshot` against what is published. First flush: every known API plus any other
 /// non-zero slot. Later: only slots whose counters moved; `None` if nothing at all changed.
 fn build_batch(published: Option<&Snapshot>, snapshot: Snapshot) -> Option<FlushBatch> {
-    let api_rows: Vec<ApiRow> = (0..API_SLOTS)
-        .filter(|&i| {
-            let key = i as i16;
-            match published {
-                None => {
-                    snapshot.apis[i] != ApiStats::default()
-                        || crate::kafka::api::api_info(key).is_some()
-                }
-                Some(prev) => prev.apis[i] != snapshot.apis[i],
-            }
+    // Slot `i` holds API key `i` (API_SLOTS is far below i16::MAX).
+    let api_rows: Vec<ApiRow> = (0_i16..)
+        .zip(snapshot.apis.iter().enumerate())
+        .filter(|&(key, (i, stats))| match published {
+            None => *stats != ApiStats::default() || crate::kafka::api::api_info(key).is_some(),
+            Some(prev) => prev.apis[i] != *stats,
         })
-        .map(|i| ApiRow {
-            api_key: i as i16,
-            api_name: api_name(i as i16),
-            stats: snapshot.apis[i],
+        .map(|(key, (_, stats))| ApiRow {
+            api_key: key,
+            api_name: api_name(key),
+            stats: *stats,
         })
         .collect();
 
@@ -544,7 +546,11 @@ mod tests {
     fn out_of_range_api_keys_are_ignored() {
         let m = BrokerMetrics::new();
         m.record_request(-1, Duration::from_micros(1), true);
-        m.record_request(API_SLOTS as i16, Duration::from_micros(1), true);
+        m.record_request(
+            i16::try_from(API_SLOTS).unwrap(),
+            Duration::from_micros(1),
+            true,
+        );
         m.record_request(i16::MAX, Duration::from_micros(1), true);
         let s = m.snapshot(0, 0);
         assert!(s.apis.iter().all(|a| *a == ApiStats::default()));
@@ -659,7 +665,9 @@ mod tests {
         assert!(!response_has_error(&KafkaResponse::new(
             1,
             4,
-            crate::kafka::api::ResponseBody::Heartbeat(Default::default())
+            crate::kafka::api::ResponseBody::Heartbeat(
+                kafka_protocol::messages::heartbeat_response::HeartbeatResponse::default()
+            )
         )));
         assert!(response_has_error(&KafkaResponse::new(
             1,
@@ -715,7 +723,7 @@ mod tests {
         // Every registered API has a counter slot.
         assert!(crate::kafka::api::APIS
             .iter()
-            .all(|info| (info.key as usize) < API_SLOTS));
+            .all(|info| usize::try_from(info.key).unwrap() < API_SLOTS));
     }
 
     #[test]
@@ -763,7 +771,7 @@ mod tests {
 
         // A gauge-only change (queue depth) also flushes, with no API rows.
         let b = f.poll_at(t0 + Duration::from_secs(7), 3, 0).unwrap();
-        assert!(b.api_rows.is_empty());
+        assert_eq!(b.api_rows, Vec::new());
         assert_eq!(b.snapshot.gauges.request_queue_depth, 3);
     }
 
@@ -797,7 +805,7 @@ mod tests {
         assert_eq!(get("request_queue_depth"), 2);
         assert_eq!(get("liveness_queue_depth"), 1);
         for p in 1..=8 {
-            assert!(FLUSH_SQL.contains(&format!("${}", p)));
+            assert!(FLUSH_SQL.contains(&format!("${p}")));
         }
         assert!(!FLUSH_SQL.contains("$9"));
         assert_eq!(to_i64(u64::MAX), i64::MAX);

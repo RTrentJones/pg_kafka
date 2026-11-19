@@ -185,7 +185,7 @@ impl PendingFetchRegistry {
     #[cfg(test)]
     pub async fn len(&self) -> usize {
         let guard = self.inner.read().await;
-        guard.values().map(|v| v.len()).sum()
+        guard.values().map(Vec::len).sum()
     }
 
     /// Check if registry is empty (for testing/debugging)
@@ -382,7 +382,7 @@ mod tests {
             let reg = registry.clone();
             handles.push(tokio::spawn(async move {
                 let notify = Arc::new(Notify::new());
-                reg.register("topic-a", 0, i as i64, notify.clone(), false)
+                reg.register("topic-a", 0, i64::from(i), notify.clone(), false)
                     .await;
                 timeout(Duration::from_millis(500), notify.notified()).await
             }));

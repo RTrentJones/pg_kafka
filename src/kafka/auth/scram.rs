@@ -684,7 +684,7 @@ pub(crate) mod tests {
         let client_key = hmac_bytes(mechanism, &salted, b"Client Key");
         let stored_key = hash_bytes(mechanism, &client_key);
         let without_proof = format!("c={},r={}", B64.encode(gs2_header), nonce);
-        let auth_message = format!("{},{},{}", client_first_bare, server_first, without_proof);
+        let auth_message = format!("{client_first_bare},{server_first},{without_proof}");
         let signature = hmac_bytes(mechanism, &stored_key, auth_message.as_bytes());
         let proof: Vec<u8> = client_key
             .iter()
@@ -936,7 +936,7 @@ pub(crate) mod tests {
     #[test]
     fn debug_output_redacts_keys() {
         let cred = ScramCredential::generate(ScramMechanism::Sha256, b"pw", 4096);
-        let s = format!("{:?}", cred);
+        let s = format!("{cred:?}");
         assert!(s.contains("REDACTED"));
         assert!(!s.contains(&format!("{:?}", cred.stored_key)));
     }

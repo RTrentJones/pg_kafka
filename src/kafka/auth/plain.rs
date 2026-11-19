@@ -54,14 +54,12 @@ impl std::fmt::Display for PlainError {
 /// Parse a PLAIN message.
 pub fn parse_plain(message: &[u8]) -> Result<PlainCredentials, PlainError> {
     let mut parts = message.split(|b| *b == 0);
-    let (authzid, authcid, passwd) = match (parts.next(), parts.next(), parts.next(), parts.next())
-    {
-        (Some(z), Some(c), Some(p), None) => (z, c, p),
-        _ => {
-            return Err(PlainError::Malformed(
-                "expected authzid NUL authcid NUL passwd",
-            ))
-        }
+    let (Some(authzid), Some(authcid), Some(passwd), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(PlainError::Malformed(
+            "expected authzid NUL authcid NUL passwd",
+        ));
     };
     if authcid.is_empty() {
         return Err(PlainError::Malformed("empty username"));
@@ -127,7 +125,7 @@ mod tests {
     #[test]
     fn debug_hides_the_password() {
         let c = parse_plain(b"\0alice\0hunter2").unwrap();
-        let s = format!("{:?}", c);
+        let s = format!("{c:?}");
         assert!(s.contains("alice"));
         assert!(!s.contains("hunter2"));
     }

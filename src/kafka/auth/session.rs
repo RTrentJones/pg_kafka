@@ -177,6 +177,30 @@ pub enum SaslRequest {
     },
 }
 
+impl SaslRequest {
+    /// An ILLEGAL_SASL_STATE answer to this request.
+    fn illegal_state(&self, message: &str) -> KafkaResponse {
+        match self {
+            SaslRequest::Handshake {
+                correlation_id,
+                api_version,
+                ..
+            } => handshake_response(*correlation_id, *api_version, ERROR_ILLEGAL_SASL_STATE, &[]),
+            SaslRequest::Authenticate {
+                correlation_id,
+                api_version,
+                ..
+            } => authenticate_response(
+                *correlation_id,
+                *api_version,
+                ERROR_ILLEGAL_SASL_STATE,
+                Some(message),
+                Bytes::new(),
+            ),
+        }
+    }
+}
+
 /// The api_key of a frame (its first two bytes), if it has one.
 pub fn peek_api_key(frame: &[u8]) -> Option<i16> {
     (frame.len() >= 2).then(|| i16::from_be_bytes([frame[0], frame[1]]))
@@ -333,27 +357,6 @@ impl SaslSession {
         !self.sasl_required || self.is_authenticated() || api_key == API_KEY_API_VERSIONS
     }
 
-    fn illegal_state(&self, request: &SaslRequest, message: &str) -> KafkaResponse {
-        match request {
-            SaslRequest::Handshake {
-                correlation_id,
-                api_version,
-                ..
-            } => handshake_response(*correlation_id, *api_version, ERROR_ILLEGAL_SASL_STATE, &[]),
-            SaslRequest::Authenticate {
-                correlation_id,
-                api_version,
-                ..
-            } => authenticate_response(
-                *correlation_id,
-                *api_version,
-                ERROR_ILLEGAL_SASL_STATE,
-                Some(message),
-                Bytes::new(),
-            ),
-        }
-    }
-
     /// Handle one SASL request.
     pub async fn handle<L: CredentialLookup>(
         &mut self,
@@ -361,13 +364,12 @@ impl SaslSession {
         lookup: &L,
     ) -> SaslOutcome {
         if !self.sasl_required {
-            return SaslOutcome::Reply(self.illegal_state(
-                &request,
-                "SASL authentication is not enabled on this listener",
-            ));
+            return SaslOutcome::Reply(
+                request.illegal_state("SASL authentication is not enabled on this listener"),
+            );
         }
         if self.is_authenticated() {
-            return SaslOutcome::Reply(self.illegal_state(&request, "already authenticated"));
+            return SaslOutcome::Reply(request.illegal_state("already authenticated"));
         }
         match request {
             SaslRequest::Handshake {
@@ -377,7 +379,7 @@ impl SaslSession {
             } => {
                 if !matches!(self.state, State::AwaitingHandshake) {
                     return SaslOutcome::ReplyAndClose(
-                        self.illegal_state(&request, "unexpected SaslHandshake"),
+                        request.illegal_state("unexpected SaslHandshake"),
                     );
                 }
                 if api_version < 1 {
@@ -711,7 +713,7 @@ mod tests {
                 body: ResponseBody::SaslHandshake(response),
                 ..
             }) => {
-                assert_eq!(response.error_code, ERROR_ILLEGAL_SASL_STATE)
+                assert_eq!(response.error_code, ERROR_ILLEGAL_SASL_STATE);
             }
             other => panic!("{other:?}"),
         }
@@ -759,9 +761,9 @@ mod tests {
             handshake_error(&s.handle(handshake(m.name()), lookup).await),
             0
         );
-        let bare = format!("n={},r=clientnonce123", user);
+        let bare = format!("n={user},r=clientnonce123");
         let first = s
-            .handle(authenticate(format!("n,,{}", bare).as_bytes()), lookup)
+            .handle(authenticate(format!("n,,{bare}").as_bytes()), lookup)
             .await;
         let server_first = String::from_utf8(auth_bytes_of(&first).to_vec()).unwrap();
         assert!(server_first.starts_with("r=clientnonce123"));
@@ -868,8 +870,7 @@ mod tests {
         header.request_api_key = api_key;
         header.request_api_version = version;
         header.correlation_id = 77;
-        kafka_protocol::protocol::Encodable::encode(&header, &mut buf, T::header_version(version))
-            .unwrap();
+        Encodable::encode(&header, &mut buf, T::header_version(version)).unwrap();
         body.encode(&mut buf, version).unwrap();
         buf
     }

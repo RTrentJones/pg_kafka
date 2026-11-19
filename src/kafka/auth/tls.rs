@@ -9,6 +9,7 @@
 
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 fn read_file(setting: &str, path: &str) -> Result<Vec<u8>, String> {
@@ -107,7 +108,7 @@ fn oid_to_string(oid: &[u8]) -> Option<String> {
     Some(
         parts
             .iter()
-            .map(std::string::ToString::to_string)
+            .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join("."),
     )
@@ -140,7 +141,7 @@ fn escape_value(v: &str) -> String {
             out.push('\\');
         }
         if c.is_control() {
-            out.push_str(&format!("\\{:02X}", c as u32 & 0xff));
+            let _ = write!(out, "\\{:02X}", u32::from(c) & 0xff);
         } else {
             out.push(c);
         }
@@ -149,7 +150,12 @@ fn escape_value(v: &str) -> String {
 }
 
 fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut out, b| {
+            let _ = write!(out, "{b:02x}");
+            out
+        })
 }
 
 /// Render one AttributeTypeAndValue.
