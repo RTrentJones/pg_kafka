@@ -9,8 +9,9 @@
 #   3. creates database B at 0.0.0, writes some data, runs
 #      `ALTER EXTENSION pg_kafka UPDATE`;
 #   4. fails unless B reports the current version, kept its data, and its kafka
-#      schema (columns, indexes, table/column/schema/function ACLs, views, roles,
-#      the partitioning of kafka.messages) is identical to A's;
+#      schema (columns, indexes, CHECK/foreign-key constraints, table/column/schema/function
+#      ACLs, function bodies, views, roles, the partitioning of kafka.messages) is identical
+#      to A's;
 #   5. checks the time partitions work on both (ADR-001): maintenance creates leaves,
 #      the converted 0.0.0 leaf drops whole, and pg_dump emits no kafka table.
 #
@@ -111,10 +112,27 @@ WHERE n.nspname = 'kafka' AND at.attacl IS NOT NULL ORDER BY 1;
 SELECT 'schema-acl ' || a.acl FROM pg_namespace n
 CROSS JOIN LATERAL (SELECT unnest(coalesce(n.nspacl, '{}'))::text AS acl) a
 WHERE n.nspname = 'kafka' ORDER BY 1;
+-- md5(prosrc): a function the upgrade script redefines must have the body of the fresh
+-- install's, not only its signature and ACL (for a C function it is the symbol name).
 SELECT 'function ' || p.oid::regprocedure::text || ' ' || coalesce(p.proacl::text, 'default')
        || ' secdef=' || p.prosecdef || ' ' || coalesce(array_to_string(p.proconfig, ','), '')
+       || ' returns ' || pg_get_function_result(p.oid) || ' ' || p.provolatile
+       || ' src=' || md5(p.prosrc)
 FROM pg_proc p JOIN pg_depend d ON d.objid = p.oid AND d.deptype = 'e'
 JOIN pg_extension e ON e.oid = d.refobjid AND e.extname = 'pg_kafka'
+ORDER BY 1;
+-- CHECK and foreign-key constraints by definition (primary keys and unique constraints are
+-- covered by their indexes above). On leaves the name is normalized away like the index
+-- names: the converted 0.0.0 leaf keeps its own name for the foreign key it shares with the
+-- parent (ATTACH adopts an equal constraint under the leaf's name).
+SELECT 'constraint ' || c.relname || ' ' || co.conname || ' ' || pg_get_constraintdef(co.oid)
+FROM pg_constraint co JOIN pg_class c ON c.oid = co.conrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'kafka' AND co.contype IN ('c', 'f') AND c.oid NOT IN (SELECT oid FROM leaves)
+ORDER BY 1;
+SELECT DISTINCT 'leaf-constraint ' || pg_get_constraintdef(co.oid)
+FROM pg_constraint co
+WHERE co.conrelid IN (SELECT oid FROM leaves) AND co.contype IN ('c', 'f')
 ORDER BY 1;
 SELECT 'view ' || c.relname || ' ' || md5(pg_get_viewdef(c.oid))
 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
