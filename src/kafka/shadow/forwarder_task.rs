@@ -45,7 +45,7 @@
 //! or when its timeout expires, so a slow or unreachable external cluster delays
 //! only those responses, never the DB thread.
 
-use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError};
 use futures::future::BoxFuture;
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::collections::{HashMap, VecDeque};
@@ -65,6 +65,11 @@ const BRIDGE_BATCH: usize = 2048;
 const HOLD_TICK: Duration = Duration::from_millis(20);
 /// Wait between attempts to enqueue into a full librdkafka queue.
 const QUEUE_FULL_BACKOFF: Duration = Duration::from_millis(5);
+/// How long the bridge thread waits for a request before checking whether
+/// the task is gone.
+const BRIDGE_POLL: Duration = Duration::from_millis(100);
+/// Hold ticks between checks for changed producer settings (~0.5 s).
+const SETTINGS_CHECK_TICKS: u64 = 25;
 
 /// What to do with an incoming record.
 #[derive(Debug, PartialEq)]
@@ -293,29 +298,38 @@ struct LiveProducer {
     fingerprint: String,
 }
 
-/// One resolved delivery.
-type Delivery = (RowKey, u64, Result<i64, String>, Arc<ShadowProducer>);
+/// The producer the forwarder sends through, rebuilt when a setting changes
+/// or it becomes fatal. Each build is a new *generation*, so a failure can be
+/// traced to the producer that reported it.
+#[derive(Default)]
+struct ProducerSlot {
+    live: Option<LiveProducer>,
+    /// The latest generation built.
+    generation: u64,
+    /// The last build error, so a persistent one is logged once.
+    last_error: Option<String>,
+}
 
-/// The producer for the current configuration, (re)built when a setting
-/// changed or the old one became fatal. `Err` carries why there is none.
-fn current_producer(
-    live: &mut Option<LiveProducer>,
-    generation: &mut u64,
-    last_error: &mut Option<String>,
-    core: &mut ForwarderCore,
-    config: &crate::config::Config,
-) -> Result<(Arc<ShadowProducer>, u64), String> {
-    let mut shadow = ShadowConfig::from_config(config);
-    let fingerprint = producer_fingerprint(&shadow);
-    if let Some(l) = live.as_ref() {
-        if l.fingerprint == fingerprint && l.producer.fatal_error().is_none() {
-            return Ok((l.producer.clone(), l.generation));
+impl ProducerSlot {
+    /// The producer for the current configuration and its generation,
+    /// (re)built when a setting changed or the old one became fatal. `Err`
+    /// says why there is none.
+    fn current(
+        &mut self,
+        core: &mut ForwarderCore,
+        config: &crate::config::Config,
+    ) -> Result<(Arc<ShadowProducer>, u64), String> {
+        let mut shadow = ShadowConfig::from_config(config);
+        let fingerprint = producer_fingerprint(&shadow);
+        if let Some(l) = &self.live {
+            if l.fingerprint == fingerprint && l.producer.fatal_error().is_none() {
+                return Ok((l.producer.clone(), l.generation));
+            }
         }
-    }
-    if let Some(old) = live.take() {
-        match old.producer.fatal_error() {
-            Some(e) => warn!("Shadow producer is fatal ({}); rebuilding it", e),
-            None => {
+        if let Some(old) = self.live.take() {
+            if let Some(e) = old.producer.fatal_error() {
+                warn!("Shadow producer is fatal ({e}); rebuilding it");
+            } else {
                 info!("Shadow producer settings changed; rebuilding the producer");
                 // Fail the old producer's outstanding records now (instead of
                 // at message.timeout.ms) and do not count them: they are
@@ -324,47 +338,57 @@ fn current_producer(
                 old.producer.purge_outstanding();
             }
         }
-    }
-    // SH-1: the same validation the config-loading path applies (it also
-    // normalizes the protocol/mechanism names).
-    let built = shadow
-        .validate()
-        .map_err(|e| format!("invalid shadow configuration: {}", e))
-        .and_then(|()| {
-            ShadowProducer::new(Arc::new(shadow.clone())).map_err(|e| format!("{:?}", e))
-        });
-    match built {
-        Ok(p) => {
-            *generation += 1;
-            *last_error = None;
-            info!(
-                "Shadow producer created for bootstrap_servers='{}'",
-                shadow.bootstrap_servers
-            );
-            let p = Arc::new(p);
-            *live = Some(LiveProducer {
-                producer: p.clone(),
-                generation: *generation,
-                fingerprint,
+        // The same validation the config-loading path applies (it also
+        // normalizes the protocol/mechanism names).
+        let built = shadow
+            .validate()
+            .map_err(|e| format!("invalid shadow configuration: {e}"))
+            .and_then(|()| {
+                ShadowProducer::new(Arc::new(shadow.clone())).map_err(|e| format!("{e:?}"))
             });
-            Ok((p, *generation))
-        }
-        Err(e) => {
-            // Logged once per distinct error, not once per record.
-            if last_error.as_deref() != Some(e.as_str()) {
-                warn!("Shadow producer unavailable: {}", e);
-                *last_error = Some(e.clone());
+        match built {
+            Ok(producer) => {
+                self.generation += 1;
+                self.last_error = None;
+                info!(
+                    "Shadow producer created for bootstrap_servers='{}'",
+                    shadow.bootstrap_servers
+                );
+                let producer = Arc::new(producer);
+                self.live = Some(LiveProducer {
+                    producer: producer.clone(),
+                    generation: self.generation,
+                    fingerprint,
+                });
+                Ok((producer, self.generation))
             }
-            Err(e)
+            Err(e) => {
+                // Logged once per distinct error, not once per record.
+                if self.last_error.as_deref() != Some(e.as_str()) {
+                    warn!("Shadow producer unavailable: {e}");
+                    self.last_error = Some(e.clone());
+                }
+                Err(e)
+            }
         }
     }
 }
 
+/// One resolved delivery.
+struct Delivery {
+    key: RowKey,
+    generation: u64,
+    result: Result<i64, String>,
+    producer: Arc<ShadowProducer>,
+}
+
+type Deliveries = FuturesUnordered<BoxFuture<'static, Delivery>>;
+
 /// Shadow forwarder task (see the module docs).
 ///
-/// Uses RuntimeContext to read the configuration on every record, so shadow
-/// mode and every producer setting can change at runtime (ALTER SYSTEM +
-/// pg_reload_conf()).
+/// Reads the configuration through the `RuntimeContext` on every record, so
+/// shadow mode and every producer setting can change at runtime
+/// (ALTER SYSTEM + pg_reload_conf()).
 pub(crate) async fn run_shadow_forwarder(
     forward_rx: Receiver<ForwardRequest>,
     ack_tx: Sender<ForwardAck>,
@@ -376,34 +400,11 @@ pub(crate) async fn run_shadow_forwarder(
     // one blocking-pool thread, so the async loop below can wait for new records,
     // delivery reports and hold timeouts at once.
     let (batch_tx, mut batch_rx) = tokio::sync::mpsc::channel::<Vec<ForwardRequest>>(4);
-    tokio::task::spawn_blocking(move || loop {
-        match forward_rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(first) => {
-                let mut batch = vec![first];
-                while batch.len() < BRIDGE_BATCH {
-                    match forward_rx.try_recv() {
-                        Ok(m) => batch.push(m),
-                        Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
-                    }
-                }
-                if batch_tx.blocking_send(batch).is_err() {
-                    break;
-                }
-            }
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                if batch_tx.is_closed() {
-                    break;
-                }
-            }
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-        }
-    });
+    tokio::task::spawn_blocking(move || bridge_requests(&forward_rx, &batch_tx));
 
     let mut core = ForwarderCore::default();
-    let mut live: Option<LiveProducer> = None;
-    let mut generation: u64 = 0;
-    let mut last_error: Option<String> = None;
-    let mut deliveries: FuturesUnordered<BoxFuture<'static, Delivery>> = FuturesUnordered::new();
+    let mut slot = ProducerSlot::default();
+    let mut deliveries = Deliveries::new();
     let mut ticks: u64 = 0;
     let mut tick = tokio::time::interval(HOLD_TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -423,43 +424,31 @@ pub(crate) async fn run_shadow_forwarder(
                     match message {
                         ForwardRequest::Hold(hold) => core.add_hold(hold, Instant::now()),
                         ForwardRequest::Record(record) => {
-                            forward_one(
-                                record,
-                                &runtime_context,
-                                &mut core,
-                                &mut live,
-                                &mut generation,
-                                &mut last_error,
-                                &mut deliveries,
-                            )
-                            .await;
+                            forward_one(record, &runtime_context, &mut core, &mut slot, &mut deliveries)
+                                .await;
                         }
                     }
                 }
             }
-            Some((key, gen, result, producer)) = deliveries.next(), if !deliveries.is_empty() => {
-                if let Err(e) = &result {
-                    debug!("Forward FAILED {:?}: {}", key, e);
+            Some(delivery) = deliveries.next(), if !deliveries.is_empty() => {
+                if let Err(e) = &delivery.result {
+                    debug!("Forward FAILED {:?}: {e}", delivery.key);
                 }
-                let fatal = result.is_err() && producer.fatal_error().is_some();
-                core.on_result(key, gen, result, fatal);
+                let fatal = delivery.result.is_err() && delivery.producer.fatal_error().is_some();
+                core.on_result(delivery.key, delivery.generation, delivery.result, fatal);
             }
             _ = tick.tick() => {
                 core.expire_holds(Instant::now());
                 // A settings change rebuilds the producer (and purges its
-                // outstanding records) within ~0.5 s, even when no new record
-                // arrives to notice it.
+                // outstanding records) even when no new record arrives to
+                // notice it.
                 ticks = ticks.wrapping_add(1);
-                if ticks % 25 == 0 && live.is_some() {
+                if ticks % SETTINGS_CHECK_TICKS == 0 && slot.live.is_some() {
                     let config = runtime_context.config();
                     if config.shadow_mode_enabled && !config.shadow_bootstrap_servers.is_empty() {
-                        let _ = current_producer(
-                            &mut live,
-                            &mut generation,
-                            &mut last_error,
-                            &mut core,
-                            &config,
-                        );
+                        // A failed rebuild is logged by `current` and retried on the
+                        // next record or check.
+                        let _ = slot.current(&mut core, &config);
                     }
                 }
             }
@@ -469,15 +458,43 @@ pub(crate) async fn run_shadow_forwarder(
     info!("Shadow forwarder task stopped");
 }
 
+/// Move requests from the DB thread's channel to the async task, up to
+/// `BRIDGE_BATCH` per hop, until either side is gone.
+fn bridge_requests(
+    forward_rx: &Receiver<ForwardRequest>,
+    batch_tx: &tokio::sync::mpsc::Sender<Vec<ForwardRequest>>,
+) {
+    loop {
+        match forward_rx.recv_timeout(BRIDGE_POLL) {
+            Ok(first) => {
+                let mut batch = vec![first];
+                while batch.len() < BRIDGE_BATCH {
+                    match forward_rx.try_recv() {
+                        Ok(m) => batch.push(m),
+                        Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+                    }
+                }
+                if batch_tx.blocking_send(batch).is_err() {
+                    break;
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if batch_tx.is_closed() {
+                    break;
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+}
+
 /// Send one record (or answer it without sending).
 async fn forward_one(
     record: ForwardRecord,
     runtime_context: &crate::kafka::RuntimeContext,
     core: &mut ForwarderCore,
-    live: &mut Option<LiveProducer>,
-    generation: &mut u64,
-    last_error: &mut Option<String>,
-    deliveries: &mut FuturesUnordered<BoxFuture<'static, Delivery>>,
+    slot: &mut ProducerSlot,
+    deliveries: &mut Deliveries,
 ) {
     let key = record.row;
     let config = runtime_context.config();
@@ -485,12 +502,12 @@ async fn forward_one(
         core.not_attempted(key, "shadow mode is not enabled or not configured");
         return;
     }
-    let (producer, gen) = match current_producer(live, generation, last_error, core, &config) {
+    let (producer, generation) = match slot.current(core, &config) {
         Ok(p) => p,
         Err(e) => {
             // No producer can be built: a real delivery failure (it is retried
             // and eventually dead-lettered, like any other).
-            core.on_result(key, *generation, Err(e), false);
+            core.on_result(key, slot.generation, Err(e), false);
             return;
         }
     };
@@ -501,21 +518,27 @@ async fn forward_one(
     loop {
         match producer.enqueue(&record) {
             Ok(future) => {
-                // Issue #93 test hook: hold the ack so it arrives later than
-                // the outbox retry lease. 0 in production; only this delivery's
-                // own future waits, the pipeline keeps going.
-                let ack_delay_ms = config.test_forward_ack_delay_ms;
-                let producer = producer.clone();
+                // Test hook (pg_kafka.test_forward_ack_delay_ms, 0 in
+                // production): delay the ack past the outbox retry lease. Only
+                // this delivery's own future waits; the pipeline keeps going.
+                let ack_delay = Duration::from_millis(
+                    u64::try_from(config.test_forward_ack_delay_ms).unwrap_or(0),
+                );
                 deliveries.push(Box::pin(async move {
                     let result = match future.await {
                         Ok(Ok((_partition, offset))) => Ok(offset),
                         Ok(Err((e, _message))) => Err(e.to_string()),
                         Err(_canceled) => Err("delivery canceled".to_string()),
                     };
-                    if ack_delay_ms > 0 {
-                        tokio::time::sleep(Duration::from_millis(ack_delay_ms as u64)).await;
+                    if !ack_delay.is_zero() {
+                        tokio::time::sleep(ack_delay).await;
                     }
-                    (key, gen, result, producer)
+                    Delivery {
+                        key,
+                        generation,
+                        result,
+                        producer,
+                    }
                 }));
                 return;
             }
@@ -526,7 +549,7 @@ async fn forward_one(
             }
             Err(EnqueueError::Refused(e)) => {
                 let fatal = producer.fatal_error().is_some();
-                core.on_result(key, gen, Err(e), fatal);
+                core.on_result(key, generation, Err(e), fatal);
                 return;
             }
         }
