@@ -29,6 +29,7 @@
 //! | `api-table` | the README table (key order) |
 
 use super::*;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 /// The "~50 standard Kafka APIs" the coverage figures are quoted against (the client-facing
@@ -120,10 +121,12 @@ fn render_table() -> String {
             ServedBy::Worker(Lane::Liveness) => "DB thread (liveness lane)",
             ServedBy::NetworkThread => "network thread",
         };
-        out.push_str(&format!(
-            "| {} | {} | {}-{} | {} | {} |\n",
-            a.name, a.key, a.min_version, a.max_version, served, desc
-        ));
+        writeln!(
+            out,
+            "| {} | {} | {}-{} | {served} | {desc} |",
+            a.name, a.key, a.min_version, a.max_version
+        )
+        .expect("writing to a String cannot fail");
     }
     out
 }

@@ -29,7 +29,7 @@ pub struct InitProducerIdApi;
 /// InitProducerId request.
 #[derive(Debug, Clone)]
 pub struct InitProducerIdRequestData {
-    /// Transactional id of a transactional producer (Phase 10).
+    /// Transactional id of a transactional producer.
     pub transactional_id: Option<String>,
     /// Transaction timeout (milliseconds).
     pub transaction_timeout_ms: i32,

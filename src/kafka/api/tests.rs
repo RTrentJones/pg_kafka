@@ -28,7 +28,7 @@ pub(crate) fn sample_request(api_key: i16) -> RequestBody {
         Ok(Decoded::Request(request)) => request.body,
         Ok(Decoded::Answered) => panic!("api_key {api_key} default request was rejected"),
         Ok(Decoded::Close(reason)) => panic!("api_key {api_key}: {reason}"),
-        Err(_) => panic!("api_key {api_key} is not registered"),
+        Err((_header, _tx)) => panic!("api_key {api_key} is not registered"),
     }
 }
 
@@ -353,7 +353,7 @@ fn version_without_a_response_format_closes_the_connection() {
 #[test]
 fn handler_error_echoes_requested_partitions() {
     // A handler Err for an API without a top-level error code reports the code on every
-    // requested partition (previously an empty response the client read as success).
+    // requested partition; an empty response would read as success to the client.
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let header = RequestHeader {
         api_key: API_KEY_LIST_OFFSETS,

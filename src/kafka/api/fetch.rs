@@ -30,7 +30,7 @@ pub struct FetchRequestData {
     pub min_bytes: i32,
     /// Response size budget across all partitions.
     pub max_bytes: i32,
-    /// 0 = READ_UNCOMMITTED, 1 = READ_COMMITTED (Phase 10).
+    /// 0 = READ_UNCOMMITTED, 1 = READ_COMMITTED.
     pub isolation_level: i8,
     /// Topic → partition fetch positions.
     pub topic_data: Vec<TopicFetchData>,

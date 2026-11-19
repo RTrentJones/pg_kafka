@@ -28,7 +28,7 @@ pub struct ProduceRequestData {
     pub timeout_ms: i32,
     /// Topic → partitions → records.
     pub topic_data: Vec<TopicProduceData>,
-    /// Transactional id of a transactional producer (Phase 10).
+    /// Transactional id of a transactional producer.
     pub transactional_id: Option<String>,
 }
 
@@ -93,10 +93,10 @@ impl KafkaApi for ProduceApi {
             })
             .collect();
 
-        // wave3 net (item 5): Kafka accepts only acks -1, 0 and 1; anything else is
+        // Kafka accepts only acks -1, 0 and 1; anything else is
         // answered INVALID_REQUIRED_ACKS on every partition and nothing is written.
         if !valid_acks(acks) {
-            warn!("Rejecting Produce with invalid acks={}", acks);
+            warn!("Rejecting Produce with invalid acks={acks}");
             return Err(Rejection::Reply {
                 error_code: ERROR_INVALID_REQUIRED_ACKS,
                 echo: Some(requested),
@@ -121,7 +121,7 @@ impl KafkaApi for ProduceApi {
                             );
                             // acks=0 never gets a response: an unsolicited one would be read
                             // as the reply to the client's next request. Kafka closes the
-                            // connection instead (wave3 net item 4), so the client notices.
+                            // connection instead, so the client notices.
                             if acks == 0 {
                                 return Err(Rejection::Close(
                                     "acks=0 Produce with a corrupt record batch",
@@ -178,11 +178,11 @@ impl KafkaApi for ProduceApi {
     fn handle(request: Self::Request, call: Call<Self>, env: &ApiEnv<'_>) -> RequestOutcome {
         let store = env.ctx.store;
         if request.acks == 0 {
-            // Best effort, no response. Idempotency (Phase 9) and transactions (Phase 10)
+            // Best effort, no response. Idempotency and transactions
             // need acks >= 1 to mean anything, so neither is applied here. A request-level
             // failure rolls back like the acks >= 1 path.
             //
-            // wave3 net (item 4): as in Kafka, any error (a partition error, or the whole
+            // As in Kafka, any error (a partition error, or the whole
             // request failing) closes the connection, so the client refreshes its metadata
             // instead of producing into the void. The partitions that succeeded still
             // commit: the close instruction travels through the response channel, so the
@@ -214,7 +214,7 @@ impl KafkaApi for ProduceApi {
         }
 
         // The long-poll wake-up runs inside the guarded handler, so a Postgres ERROR in its
-        // SPI reads is answered like a handler panic instead of escaping unguarded (RV-3).
+        // SPI reads is answered like a handler panic instead of escaping unguarded.
         call.run(request, |r, _| {
             let producer_metadata = extract_producer_metadata(&r.topic_data);
             let response = handlers::handle_produce(
@@ -229,12 +229,12 @@ impl KafkaApi for ProduceApi {
     }
 }
 
-/// wave3 net: the `acks` values Kafka accepts (all ISR, none, leader).
+/// The `acks` values Kafka accepts (all ISR, none, leader).
 pub(crate) fn valid_acks(acks: i16) -> bool {
     matches!(acks, -1..=1)
 }
 
-/// wave3 net: whether an acks=0 Produce must close the connection (any partition error).
+/// Whether an acks=0 Produce must close the connection (any partition error).
 pub(crate) fn acks0_must_close(response: &ProduceResponse) -> bool {
     ProduceApi::response_has_error(response)
 }
@@ -255,7 +255,7 @@ pub(crate) fn extract_producer_metadata(
 }
 
 /// Send a best-effort notification to the network thread without blocking the single DB
-/// thread (SEC-4): the notify channel is bounded and `try_send` drops on full. Waiting
+/// thread: the notify channel is bounded and `try_send` drops on full. Waiting
 /// fetches fall back to their poll interval, so a dropped wake-up only adds latency.
 pub(crate) fn notify_best_effort(
     tx: &crossbeam_channel::Sender<InternalNotification>,
