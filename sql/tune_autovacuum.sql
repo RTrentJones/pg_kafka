@@ -1,9 +1,8 @@
 -- Optional autovacuum tuning for pg_kafka tables
 --
--- DR-5 (DEEP-REVIEW-2026-07): this script targets the tables by their actual churn
--- profile. kafka.messages is append-mostly (UPDATE only when a transaction aborts,
--- DELETE only via retention/cleanup sweeps), so its bloat pressure is modest; the
--- genuinely high-churn tables are the small counters that take an UPDATE/UPSERT on
+-- The settings target the tables by their churn profile. kafka.messages is
+-- append-mostly (UPDATE only when a transaction ends, DELETE only via the retention
+-- and cleanup sweeps), so its bloat pressure is modest; the high-churn tables are the small counters that take an UPDATE/UPSERT on
 -- every produce or commit:
 --
 --   - kafka.partition_offsets   UPDATE on every produce (per topic/partition)
@@ -63,12 +62,25 @@ ALTER TABLE kafka.shadow_tracking SET (
 
 -- kafka.messages: mostly append-only. A moderate scale factor keeps the visibility
 -- map fresh for index-only scans and reclaims abort-marked rows after the cleanup
--- sweep deletes them, without paying constant full-table vacuum cost.
-ALTER TABLE kafka.messages SET (
-    autovacuum_vacuum_scale_factor = 0.1,
-    autovacuum_analyze_scale_factor = 0.05,
-    autovacuum_vacuum_cost_delay = 2
-);
+-- sweep deletes them, without paying constant full-table vacuum cost. The table is
+-- time-partitioned and a partitioned table takes no storage parameters, so they go on
+-- each leaf that exists now; leaves that partition maintenance creates later start
+-- with the defaults, so re-run this script after they appear.
+DO $$
+DECLARE
+    v_leaf REGCLASS;
+BEGIN
+    FOR v_leaf IN
+        SELECT relid FROM pg_partition_tree('kafka.messages'::regclass) WHERE isleaf
+    LOOP
+        EXECUTE format('ALTER TABLE %s SET (
+            autovacuum_vacuum_scale_factor = 0.1,
+            autovacuum_analyze_scale_factor = 0.05,
+            autovacuum_vacuum_cost_delay = 2
+        )', v_leaf);
+    END LOOP;
+END
+$$;
 
 -- Optional: Increase autovacuum workers if you have many topics/partitions
 -- (Requires postgresql.conf change and restart)

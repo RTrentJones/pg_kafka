@@ -1,9 +1,9 @@
 //! Pure planning logic for the expired-message part of the retention sweep.
 //!
-//! `PostgresStore::run_retention_sweep` (SPI, not unit-testable) deletes expired
-//! messages in bounded batches. The decisions it makes — which retention window a
-//! topic has, whether to run another batch, and which topic a pass starts from —
-//! live here so they can be unit tested.
+//! `PostgresStore::run_retention_sweep` (SPI, not unit-testable) expires messages by
+//! dropping whole time partitions or deleting rows in bounded batches. The decisions it
+//! makes (which retention window a topic has, what to do with a leaf, whether to run
+//! another batch, which topic a pass starts from) live here so they are unit tested.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -23,6 +23,9 @@ pub const RETENTION_PASS_BUDGET: Duration = Duration::from_millis(1500);
 /// timestamp arithmetic in SQL and would abort the whole sweep.
 pub const MAX_RETENTION_WINDOW_MS: i64 = 10_000_000_000_000;
 
+const MS_PER_MINUTE: i64 = 60_000;
+const MS_PER_HOUR: i64 = 60 * MS_PER_MINUTE;
+
 /// The retention window (milliseconds) that applies to a topic, or `None` when its
 /// messages are kept forever.
 ///
@@ -38,11 +41,11 @@ pub fn effective_retention_window_ms(
 ) -> Option<i64> {
     match topic_retention_ms {
         Some(ms) if ms >= 0 => Some(ms.min(MAX_RETENTION_WINDOW_MS)),
-        Some(_) => None,
         None if global_retention_hours > 0 => {
-            Some((global_retention_hours as i64 * 3_600_000).min(MAX_RETENTION_WINDOW_MS))
+            Some((i64::from(global_retention_hours) * MS_PER_HOUR).min(MAX_RETENTION_WINDOW_MS))
         }
-        None => None,
+        // A negative per-topic value, or no window at all: kept forever.
+        Some(_) | None => None,
     }
 }
 
@@ -55,7 +58,8 @@ pub fn should_run_another_batch(
     elapsed: Duration,
     budget: Duration,
 ) -> bool {
-    batch_size > 0 && last_batch_deleted >= batch_size as u64 && elapsed < budget
+    u64::try_from(batch_size).is_ok_and(|size| size > 0 && last_batch_deleted >= size)
+        && elapsed < budget
 }
 
 /// Rotation cursor for the topic order, so a pass that runs out of budget on one
@@ -84,15 +88,14 @@ pub fn rotated<T: Clone>(items: &[T], start: usize) -> Vec<T> {
         .collect()
 }
 
-// ---------------------------------------------------------------------------
-// Time partitions (ADR-001, 0.1.0): kafka.messages is RANGE-partitioned on
-// created_at. The decisions below drive `PostgresStore::run_retention_sweep`.
-// ---------------------------------------------------------------------------
+// Time partitions (ADR-001): kafka.messages is RANGE-partitioned on created_at. The
+// decisions below drive `PostgresStore::run_retention_sweep`.
 
 /// Default width of one time partition, minutes (`pg_kafka.message_partition_minutes`).
 pub const DEFAULT_PARTITION_MINUTES: i32 = 1440;
-/// Bounds of `pg_kafka.message_partition_minutes`: 5 minutes to 30 days.
+/// Lower bound of `pg_kafka.message_partition_minutes` (5 minutes).
 pub const MIN_PARTITION_MINUTES: i32 = 5;
+/// Upper bound of `pg_kafka.message_partition_minutes` (30 days).
 pub const MAX_PARTITION_MINUTES: i32 = 43_200;
 /// Leaves the worker keeps ready beyond the current one.
 pub const PARTITIONS_AHEAD: i32 = 2;
@@ -197,7 +200,7 @@ pub fn may_hold_expired(leaf: &TimePartition, now_ms: i64, window_ms: i64) -> bo
 
 /// `pg_kafka.message_partition_minutes` as milliseconds, clamped to its GUC range.
 pub fn partition_width_ms(minutes: i32) -> i64 {
-    minutes.clamp(MIN_PARTITION_MINUTES, MAX_PARTITION_MINUTES) as i64 * 60_000
+    i64::from(minutes.clamp(MIN_PARTITION_MINUTES, MAX_PARTITION_MINUTES)) * MS_PER_MINUTE
 }
 
 #[cfg(test)]
@@ -264,7 +267,7 @@ mod tests {
         assert_eq!(rotated(&v, 0), vec![1, 2, 3, 4]);
         assert_eq!(rotated(&v, 1), vec![2, 3, 4, 1]);
         assert_eq!(rotated(&v, 5), vec![2, 3, 4, 1]);
-        assert!(rotated::<i32>(&[], 3).is_empty());
+        assert_eq!(rotated::<i32>(&[], 3), Vec::<i32>::new());
     }
 
     #[test]
@@ -278,7 +281,7 @@ mod tests {
     fn leaf(oid: u32, lower: Option<i64>, upper: Option<i64>, is_default: bool) -> TimePartition {
         TimePartition {
             oid,
-            name: format!("l{}", oid),
+            name: format!("l{oid}"),
             lower_ms: lower,
             upper_ms: upper,
             is_default,
@@ -317,8 +320,7 @@ mod tests {
         let windows = |t: i32| match t {
             1 => Some(100),
             2 => Some(500),
-            3 => None, // infinite
-            _ => None,
+            _ => None, // 3: infinite; anything else: unknown
         };
         // upper=1000, now=1200: topic 1 expired (1100<=1200), topic 2 not (1500).
         assert_eq!(
@@ -371,10 +373,13 @@ mod tests {
 
     #[test]
     fn partition_width_is_clamped_to_the_guc_range() {
-        assert_eq!(partition_width_ms(0), MIN_PARTITION_MINUTES as i64 * 60_000);
+        assert_eq!(
+            partition_width_ms(0),
+            i64::from(MIN_PARTITION_MINUTES) * 60_000
+        );
         assert_eq!(
             partition_width_ms(i32::MAX),
-            MAX_PARTITION_MINUTES as i64 * 60_000
+            i64::from(MAX_PARTITION_MINUTES) * 60_000
         );
         assert_eq!(partition_width_ms(60), 3_600_000);
     }
