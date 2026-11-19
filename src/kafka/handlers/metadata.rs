@@ -137,7 +137,7 @@ pub fn topic_metadata_for(
 }
 
 #[cfg(test)]
-mod wave3_groups_tests {
+mod tests {
     use super::*;
 
     #[test]

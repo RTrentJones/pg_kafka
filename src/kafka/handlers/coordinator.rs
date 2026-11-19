@@ -6,8 +6,19 @@
 use crate::kafka::constants::{DEFAULT_BROKER_ID, ERROR_NONE};
 use crate::kafka::error::Result;
 use crate::kafka::handler_context::HandlerContext;
+use kafka_protocol::messages::describe_groups_response::{
+    DescribeGroupsResponse, DescribedGroup, DescribedGroupMember,
+};
+use kafka_protocol::messages::find_coordinator_response::FindCoordinatorResponse;
+use kafka_protocol::messages::heartbeat_response::HeartbeatResponse;
 use kafka_protocol::messages::join_group_response::JoinGroupResponse;
+use kafka_protocol::messages::join_group_response::JoinGroupResponseMember;
+use kafka_protocol::messages::leave_group_response::{LeaveGroupResponse, MemberResponse};
+use kafka_protocol::messages::list_groups_response::{ListGroupsResponse, ListedGroup};
 use kafka_protocol::messages::sync_group_response::SyncGroupResponse;
+use kafka_protocol::messages::GroupId;
+use kafka_protocol::protocol::StrBytes;
+use std::collections::HashMap;
 
 /// Placeholder for a JoinGroup member's `client_host`. This field is informational
 /// only — echoed back in DescribeGroups member listings, never used for routing or
@@ -25,10 +36,9 @@ pub fn handle_find_coordinator(
     ctx: &HandlerContext,
     key: &str,
     key_type: i8,
-) -> Result<kafka_protocol::messages::find_coordinator_response::FindCoordinatorResponse> {
+) -> Result<FindCoordinatorResponse> {
     let broker_host = ctx.broker.host();
     let broker_port = ctx.broker.port();
-    use kafka_protocol::messages::find_coordinator_response::FindCoordinatorResponse;
 
     crate::pg_debug!("FindCoordinator: key={}, key_type={}", key, key_type);
 
@@ -125,7 +135,7 @@ pub fn normalize_join_group_response(
     api_version: i16,
 ) -> JoinGroupResponse {
     if api_version < 7 && response.protocol_name.is_none() {
-        response.protocol_name = Some(kafka_protocol::protocol::StrBytes::from_static_str(""));
+        response.protocol_name = Some(StrBytes::from_static_str(""));
     }
     response
 }
@@ -254,8 +264,6 @@ fn build_join_group_response(
     protocol_type: String,
     fallback_protocol: Option<String>,
 ) -> JoinGroupResponse {
-    use kafka_protocol::messages::join_group_response::JoinGroupResponseMember;
-
     let result = match outcome {
         Ok(result) => result,
         Err(e) => {
@@ -368,7 +376,6 @@ pub fn handle_sync_group<F>(
 {
     let coordinator = ctx.coordinator;
     let store = ctx.store;
-    use std::collections::HashMap;
 
     crate::pg_debug!(
         "SyncGroup: group_id={}, member_id={}, generation_id={}, assignments={}",
@@ -456,9 +463,8 @@ pub fn handle_heartbeat(
     group_id: &str,
     member_id: &str,
     generation_id: i32,
-) -> Result<kafka_protocol::messages::heartbeat_response::HeartbeatResponse> {
+) -> Result<HeartbeatResponse> {
     let coordinator = ctx.coordinator;
-    use kafka_protocol::messages::heartbeat_response::HeartbeatResponse;
 
     crate::pg_debug!(
         "Heartbeat: group_id={}, member_id={}, generation_id={}",
@@ -487,10 +493,8 @@ pub fn handle_leave_group(
     group_id: &str,
     member_id: &str,
     members: Vec<crate::kafka::messages::MemberIdentity>,
-) -> Result<kafka_protocol::messages::leave_group_response::LeaveGroupResponse> {
+) -> Result<LeaveGroupResponse> {
     let coordinator = ctx.coordinator;
-    use kafka_protocol::messages::leave_group_response::{LeaveGroupResponse, MemberResponse};
-    use kafka_protocol::protocol::StrBytes;
 
     let mut response = LeaveGroupResponse::default();
     response.throttle_time_ms = 0;
@@ -535,13 +539,8 @@ pub fn handle_leave_group(
 pub fn handle_describe_groups(
     ctx: &HandlerContext,
     groups: Vec<String>,
-) -> Result<kafka_protocol::messages::describe_groups_response::DescribeGroupsResponse> {
+) -> Result<DescribeGroupsResponse> {
     let coordinator = ctx.coordinator;
-    use kafka_protocol::messages::describe_groups_response::{
-        DescribeGroupsResponse, DescribedGroup, DescribedGroupMember,
-    };
-    use kafka_protocol::messages::GroupId;
-    use kafka_protocol::protocol::StrBytes;
 
     let mut response = DescribeGroupsResponse::default();
     response.throttle_time_ms = 0;
@@ -642,11 +641,8 @@ pub fn handle_describe_groups(
 pub fn handle_list_groups(
     ctx: &HandlerContext,
     states_filter: &[String],
-) -> Result<kafka_protocol::messages::list_groups_response::ListGroupsResponse> {
+) -> Result<ListGroupsResponse> {
     let coordinator = ctx.coordinator;
-    use kafka_protocol::messages::list_groups_response::{ListGroupsResponse, ListedGroup};
-    use kafka_protocol::messages::GroupId;
-    use kafka_protocol::protocol::StrBytes;
 
     let mut response = ListGroupsResponse::default();
     response.error_code = ERROR_NONE;
@@ -1124,10 +1120,7 @@ mod tests {
             handle_list_groups(&f.ctx(), &["CompletingRebalance".to_string()]).unwrap();
         assert_eq!(completing.groups.len(), 1);
         let empty = handle_list_groups(&f.ctx(), &["Empty".to_string()]).unwrap();
-        assert_eq!(
-            empty.groups,
-            [] as [kafka_protocol::messages::list_groups_response::ListedGroup; 0]
-        );
+        assert_eq!(empty.groups, [] as [ListedGroup; 0]);
     }
 
     #[test]
@@ -1216,10 +1209,7 @@ mod tests {
         assert_eq!(d.groups[0].error_code, ERROR_NONE);
         assert_eq!(d.groups[0].group_state.as_str(), "Empty");
         assert_eq!(d.groups[0].protocol_type.as_str(), "consumer");
-        assert_eq!(
-            d.groups[0].members,
-            [] as [kafka_protocol::messages::describe_groups_response::DescribedGroupMember; 0]
-        );
+        assert_eq!(d.groups[0].members, [] as [DescribedGroupMember; 0]);
         assert_eq!(d.groups[1].group_state.as_str(), "Dead");
 
         let l = handle_list_groups(&ctx, &[]).unwrap();

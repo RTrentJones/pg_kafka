@@ -1,4 +1,4 @@
-//! Bounds on client-controlled state (wave3 groups).
+//! Bounds on client-controlled state.
 //!
 //! Every count a client can choose and the broker then materialises in memory is capped here:
 //! partitions per topic (Metadata and the assignors allocate one entry per partition, so an
@@ -99,13 +99,16 @@ pub fn max_partitions_per_topic() -> i32 {
 
 /// The configured member cap per group (`pg_kafka.group_max_size`).
 pub fn group_max_size() -> usize {
-    read(&GROUP_MAX_SIZE, DEFAULT_GROUP_MAX_SIZE).clamp(1, MAX_GROUP_MAX_SIZE) as usize
+    usize::try_from(read(&GROUP_MAX_SIZE, DEFAULT_GROUP_MAX_SIZE).clamp(1, MAX_GROUP_MAX_SIZE))
+        .expect("clamped to a positive i32")
 }
 
 /// The configured cap on in-memory groups (`pg_kafka.max_consumer_groups`).
 pub fn max_consumer_groups() -> usize {
-    read(&MAX_CONSUMER_GROUPS, DEFAULT_MAX_CONSUMER_GROUPS).clamp(1, MAX_MAX_CONSUMER_GROUPS)
-        as usize
+    usize::try_from(
+        read(&MAX_CONSUMER_GROUPS, DEFAULT_MAX_CONSUMER_GROUPS).clamp(1, MAX_MAX_CONSUMER_GROUPS),
+    )
+    .expect("clamped to a positive i32")
 }
 
 /// Why a requested partition count is refused, or `Ok` if `1 <= count <= max`.

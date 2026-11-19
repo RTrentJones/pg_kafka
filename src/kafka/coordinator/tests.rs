@@ -814,6 +814,26 @@ fn test_validate_offset_commit_matches_kafka() {
     assert_eq!(code("e", "", 1), UM);
 }
 
+/// Join a new member to the Stable group "g" and return its id (read from the
+/// group) and its held slot.
+fn joined_id_pending(c: &GroupCoordinator) -> (String, Slot) {
+    let before: Vec<String> = c
+        .get_group_state("g")
+        .unwrap()
+        .members
+        .into_keys()
+        .collect();
+    let slot = join(c, "g", None);
+    let id = c
+        .get_group_state("g")
+        .unwrap()
+        .members
+        .into_keys()
+        .find(|id| !before.contains(id))
+        .unwrap();
+    (id, slot)
+}
+
 #[test]
 fn test_duplicate_join_replaces_held_response() {
     let c = GroupCoordinator::new();
@@ -830,26 +850,6 @@ fn test_duplicate_join_replaces_held_response() {
     assert_eq!(c.pending_join_count(), 1);
     let _ = joined(&join(&c, "g", Some(&a)));
     assert_eq!(joined(&second).generation_id, 2);
-
-    /// Join a new member to the Stable group "g" and return its id (read from the
-    /// group) and its held slot.
-    fn joined_id_pending(c: &GroupCoordinator) -> (String, Slot) {
-        let before: Vec<String> = c
-            .get_group_state("g")
-            .unwrap()
-            .members
-            .into_keys()
-            .collect();
-        let slot = join(c, "g", None);
-        let id = c
-            .get_group_state("g")
-            .unwrap()
-            .members
-            .into_keys()
-            .find(|id| !before.contains(id))
-            .unwrap();
-        (id, slot)
-    }
 }
 
 // ----- protocol selection -----

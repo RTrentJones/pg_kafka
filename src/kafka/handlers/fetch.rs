@@ -9,9 +9,17 @@ use crate::kafka::constants::ERROR_NONE;
 use crate::kafka::error::Result;
 use crate::kafka::handler_context::HandlerContext;
 use crate::kafka::storage::{FetchedMessage, IsolationLevel};
+use bytes::BufMut;
 use kafka_protocol::indexmap::IndexMap;
+use kafka_protocol::messages::fetch_response::{
+    FetchResponse, FetchableTopicResponse, PartitionData,
+};
+use kafka_protocol::messages::list_offsets_response::{
+    ListOffsetsPartitionResponse, ListOffsetsResponse, ListOffsetsTopicResponse,
+};
 use kafka_protocol::messages::TopicName;
 use kafka_protocol::protocol::StrBytes;
+use kafka_protocol::records::{Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType};
 
 /// Handle Fetch request
 ///
@@ -28,7 +36,7 @@ pub fn handle_fetch(
     ctx: &HandlerContext,
     topic_data: Vec<crate::kafka::messages::TopicFetchData>,
     isolation_level: IsolationLevel,
-) -> Result<kafka_protocol::messages::fetch_response::FetchResponse> {
+) -> Result<FetchResponse> {
     handle_fetch_with_max_bytes(ctx, topic_data, isolation_level, i32::MAX)
 }
 
@@ -92,8 +100,6 @@ pub(crate) fn encode_record_batches(
     messages: Vec<FetchedMessage>,
     compression: kafka_protocol::records::Compression,
 ) -> std::result::Result<bytes::Bytes, String> {
-    use kafka_protocol::records::{Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType};
-
     let mut records: Vec<Record> = Vec::with_capacity(messages.len());
     let mut group_base = 0i64;
     // Smallest and largest timestamp of the current batch: the encoder stores each
@@ -171,7 +177,6 @@ const BATCH_HEADER_LEN: usize = 61;
 /// COMMIT; value: an EndTransactionMarker, version 0, coordinator epoch 0) at offset
 /// delta `offset_delta`, timestamp delta 0.
 fn gap_marker_record(offset_delta: i32) -> bytes::Bytes {
-    use bytes::BufMut;
     #[expect(
         clippy::cast_possible_truncation,
         reason = "each byte takes the low 7 bits of the zigzag value by design"
@@ -213,7 +218,6 @@ fn gap_marker_record(offset_delta: i32) -> bytes::Bytes {
 /// simply empty). A range longer than `i32::MAX + 1` offsets is covered up to that
 /// length; the next fetch covers the rest.
 pub(crate) fn gap_batch(from: i64, to: i64) -> Option<bytes::Bytes> {
-    use bytes::BufMut;
     if to <= from {
         return None;
     }
@@ -282,14 +286,11 @@ pub fn handle_fetch_with_max_bytes(
     topic_data: Vec<crate::kafka::messages::TopicFetchData>,
     isolation_level: IsolationLevel,
     max_bytes: i32,
-) -> Result<kafka_protocol::messages::fetch_response::FetchResponse> {
+) -> Result<FetchResponse> {
     let store = ctx.store;
     let mut response_remaining: i64 = i64::from(max_bytes.max(0));
     let mut returned_any = false;
     let compression = ctx.compression;
-    use kafka_protocol::messages::fetch_response::{
-        FetchResponse, FetchableTopicResponse, PartitionData,
-    };
     let mut responses = Vec::new();
 
     // Process each topic requested
@@ -505,8 +506,8 @@ fn fetched_partition_data(
     partition_id: i32,
     bounds: &crate::kafka::storage::PartitionBounds,
     records: std::result::Result<bytes::Bytes, String>,
-) -> kafka_protocol::messages::fetch_response::PartitionData {
-    let mut partition_data = kafka_protocol::messages::fetch_response::PartitionData::default();
+) -> PartitionData {
+    let mut partition_data = PartitionData::default();
     partition_data.partition_index = partition_id;
     let records = match records {
         Ok(records) => records,
@@ -548,11 +549,8 @@ pub fn handle_list_offsets(
     ctx: &HandlerContext,
     topics: Vec<crate::kafka::messages::ListOffsetsTopicData>,
     isolation_level: IsolationLevel,
-) -> Result<kafka_protocol::messages::list_offsets_response::ListOffsetsResponse> {
+) -> Result<ListOffsetsResponse> {
     let store = ctx.store;
-    use kafka_protocol::messages::list_offsets_response::{
-        ListOffsetsPartitionResponse, ListOffsetsResponse, ListOffsetsTopicResponse,
-    };
 
     let mut response_topics = Vec::new();
 
@@ -632,12 +630,8 @@ pub fn handle_list_offsets(
 }
 
 /// A ListOffsets partition entry carrying `error_code` (offset and timestamp -1).
-fn list_offsets_error(
-    partition_index: i32,
-    error_code: i16,
-) -> kafka_protocol::messages::list_offsets_response::ListOffsetsPartitionResponse {
-    let mut p =
-        kafka_protocol::messages::list_offsets_response::ListOffsetsPartitionResponse::default();
+fn list_offsets_error(partition_index: i32, error_code: i16) -> ListOffsetsPartitionResponse {
+    let mut p = ListOffsetsPartitionResponse::default();
     p.partition_index = partition_index;
     p.error_code = error_code;
     p.offset = -1;
@@ -674,7 +668,7 @@ fn list_partition_offset(
 }
 
 #[cfg(test)]
-mod storage_stream_tests {
+mod tests {
     use super::*;
     use crate::kafka::messages::{PartitionFetchData, TopicFetchData};
     use crate::kafka::storage::roles::*;
@@ -682,6 +676,7 @@ mod storage_stream_tests {
     use crate::testing::mocks::MockKafkaStore;
     use crate::testing::TestEnv;
     use kafka_protocol::records::Compression;
+    use kafka_protocol::records::RecordBatchDecoder;
 
     fn msg(offset: i64, value_len: usize) -> FetchedMessage {
         FetchedMessage {
@@ -994,8 +989,8 @@ mod storage_stream_tests {
         assert_eq!(i16::from_be_bytes(b[21..23].try_into().unwrap()), 0x30);
         assert_eq!(i32::from_be_bytes(b[23..27].try_into().unwrap()), 2); // last delta
         assert_eq!(i32::from_be_bytes(b[57..61].try_into().unwrap()), 1); // records
-                                                                          // What a client decodes: one control record (COMMIT marker) at offset 4.
-        use kafka_protocol::records::RecordBatchDecoder;
+
+        // What a client decodes: one control record (COMMIT marker) at offset 4.
         let mut buf = b.clone();
         let set = RecordBatchDecoder::decode_all(&mut buf).unwrap();
         assert_eq!(set.len(), 1);

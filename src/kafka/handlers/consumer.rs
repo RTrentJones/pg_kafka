@@ -10,6 +10,12 @@ use crate::kafka::constants::{ERROR_NONE, ERROR_UNKNOWN_TOPIC_OR_PARTITION};
 use crate::kafka::error::Result;
 use crate::kafka::handler_context::HandlerContext;
 use crate::kafka::storage::CommittedOffset;
+use kafka_protocol::messages::offset_commit_response::{
+    OffsetCommitResponse, OffsetCommitResponsePartition, OffsetCommitResponseTopic,
+};
+use kafka_protocol::messages::offset_fetch_response::{
+    OffsetFetchResponse, OffsetFetchResponsePartition, OffsetFetchResponseTopic,
+};
 use kafka_protocol::messages::TopicName;
 use kafka_protocol::protocol::StrBytes;
 
@@ -22,11 +28,8 @@ pub fn handle_offset_commit(
     generation_id: i32,
     member_id: &str,
     topics: Vec<crate::kafka::messages::OffsetCommitTopicData>,
-) -> Result<kafka_protocol::messages::offset_commit_response::OffsetCommitResponse> {
+) -> Result<OffsetCommitResponse> {
     let store = ctx.store;
-    use kafka_protocol::messages::offset_commit_response::{
-        OffsetCommitResponse, OffsetCommitResponsePartition, OffsetCommitResponseTopic,
-    };
 
     // CONF-1: reject zombie commits. A member committing with a stale generation (or an unknown
     // member id) for a live group must be rejected with ILLEGAL_GENERATION / UNKNOWN_MEMBER_ID
@@ -164,7 +167,7 @@ pub fn handle_offset_fetch(
     group_id: &str,
     topics: Option<Vec<crate::kafka::messages::OffsetFetchTopicData>>,
     require_stable: bool,
-) -> Result<kafka_protocol::messages::offset_fetch_response::OffsetFetchResponse> {
+) -> Result<OffsetFetchResponse> {
     let store = ctx.store;
     // wave3 txn: partitions with a pending transactional commit (require_stable only).
     let unstable: std::collections::HashSet<(String, i32)> = if require_stable {
@@ -177,9 +180,6 @@ pub fn handle_offset_fetch(
     };
     let is_unstable = |topic: &str, partition: i32| {
         !unstable.is_empty() && unstable.contains(&(topic.to_string(), partition))
-    };
-    use kafka_protocol::messages::offset_fetch_response::{
-        OffsetFetchResponse, OffsetFetchResponsePartition, OffsetFetchResponseTopic,
     };
 
     let mut response_topics = Vec::new();
