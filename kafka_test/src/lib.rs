@@ -68,6 +68,8 @@ pub mod transaction;
 pub mod part;
 // auth stream: TLS + SASL listener tests
 pub mod auth;
+// wave3 worker: lifecycle, locking, maintenance races (kafka_test/src/w3_worker)
+pub mod w3_worker;
 
 // Re-export infrastructure
 pub use assertions::*;

@@ -2036,6 +2036,77 @@ fn get_all_tests() -> Vec<TestDef> {
             ),
             parallel_safe: false,
         },
+        // wave3 worker: sequential (GUCs, held locks, worker restarts, DROP/CREATE EXTENSION).
+        TestDef {
+            category: "w3_worker",
+            name: "test_w3_partition_maintenance_lock_waits_are_bounded",
+            test_fn: wrap_test!(
+                kafka_test::w3_worker::tests::test_w3_partition_maintenance_lock_waits_are_bounded
+            ),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "w3_worker",
+            name: "test_w3_end_txn_during_default_leaf_move",
+            test_fn: wrap_test!(
+                kafka_test::w3_worker::tests::test_w3_end_txn_during_default_leaf_move
+            ),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "w3_worker",
+            name: "test_w3_lock_timeout_bounds_stuck_lock",
+            test_fn: wrap_test!(
+                kafka_test::w3_worker::tests::test_w3_lock_timeout_bounds_stuck_lock
+            ),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "w3_worker",
+            name: "test_w3_sigterm_interrupts_lock_wait",
+            test_fn: wrap_test!(kafka_test::w3_worker::tests::test_w3_sigterm_interrupts_lock_wait),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "w3_worker",
+            name: "test_w3_commit_failure_answered_without_restart",
+            test_fn: wrap_test!(
+                kafka_test::w3_worker::tests::test_w3_commit_failure_answered_without_restart
+            ),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "w3_worker",
+            name: "test_w3_heartbeats_do_not_split_batches",
+            test_fn: wrap_test!(
+                kafka_test::w3_worker::tests::test_w3_heartbeats_do_not_split_batches
+            ),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "w3_worker",
+            name: "test_w3_transaction_end_wakes_read_committed",
+            test_fn: wrap_test!(
+                kafka_test::w3_worker::tests::test_w3_transaction_end_wakes_read_committed
+            ),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "w3_worker",
+            name: "test_w3_old_schema_degrades_gracefully",
+            test_fn: wrap_test!(
+                kafka_test::w3_worker::tests::test_w3_old_schema_degrades_gracefully
+            ),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "w3_worker",
+            name: "test_w3_extension_ddl_loop_under_load",
+            test_fn: wrap_test!(
+                kafka_test::w3_worker::tests::test_w3_extension_ddl_loop_under_load
+            ),
+            parallel_safe: false,
+        },
     ]
 }
 
