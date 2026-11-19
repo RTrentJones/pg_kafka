@@ -117,63 +117,11 @@ impl MemberAssignment {
         let mut topic_partitions = HashMap::with_capacity(topics_len.min(MAX_PREALLOC_ELEMENTS));
 
         for _ in 0..topics_len {
-            // Read topic name
-            if buf.remaining() < 2 {
-                return Err(KafkaError::CorruptMessage {
-                    message: "Unexpected end of data reading topic name length".into(),
-                });
-            }
-
             // A null (negative-length) topic name is skipped.
-            let Ok(str_len) = usize::try_from(buf.get_i16()) else {
+            let Some(topic_name) = read_topic_name(&mut buf)? else {
                 continue;
             };
-            if buf.remaining() < str_len {
-                return Err(KafkaError::CorruptMessage {
-                    message: format!(
-                        "Topic name length {} exceeds remaining data {}",
-                        str_len,
-                        buf.remaining()
-                    ),
-                });
-            }
-
-            let mut str_bytes = vec![0u8; str_len];
-            buf.copy_to_slice(&mut str_bytes);
-
-            let topic_name =
-                String::from_utf8(str_bytes).map_err(|e| KafkaError::CorruptMessage {
-                    message: format!("Invalid UTF-8 in topic name: {e}"),
-                })?;
-
-            // Read partitions array
-            if buf.remaining() < 4 {
-                return Err(KafkaError::CorruptMessage {
-                    message: "Unexpected end of data reading partitions array length".into(),
-                });
-            }
-
-            // A null (negative-length) partitions array is an empty assignment.
-            let Ok(partitions_len) = usize::try_from(buf.get_i32()) else {
-                topic_partitions.insert(topic_name, Vec::new());
-                continue;
-            };
-            if buf.remaining() < partitions_len * 4 {
-                return Err(KafkaError::CorruptMessage {
-                    message: format!(
-                        "Partitions array length {} exceeds remaining data {}",
-                        partitions_len * 4,
-                        buf.remaining()
-                    ),
-                });
-            }
-
-            let mut partitions = Vec::with_capacity(partitions_len.min(MAX_PREALLOC_ELEMENTS));
-            for _ in 0..partitions_len {
-                partitions.push(buf.get_i32());
-            }
-
-            topic_partitions.insert(topic_name, partitions);
+            topic_partitions.insert(topic_name, read_partitions(&mut buf)?);
         }
 
         // Read user_data (optional)
@@ -212,6 +160,61 @@ impl MemberAssignment {
         wire::put_nullable_bytes(&mut buf, self.user_data.as_deref())?;
         Ok(buf)
     }
+}
+
+/// One topic name of the assignment array, or `None` for a null (negative-length) one.
+fn read_topic_name(buf: &mut &[u8]) -> Result<Option<String>> {
+    if buf.remaining() < 2 {
+        return Err(KafkaError::CorruptMessage {
+            message: "Unexpected end of data reading topic name length".into(),
+        });
+    }
+    let Ok(str_len) = usize::try_from(buf.get_i16()) else {
+        return Ok(None);
+    };
+    if buf.remaining() < str_len {
+        return Err(KafkaError::CorruptMessage {
+            message: format!(
+                "Topic name length {} exceeds remaining data {}",
+                str_len,
+                buf.remaining()
+            ),
+        });
+    }
+    let mut str_bytes = vec![0u8; str_len];
+    buf.copy_to_slice(&mut str_bytes);
+    String::from_utf8(str_bytes)
+        .map(Some)
+        .map_err(|e| KafkaError::CorruptMessage {
+            message: format!("Invalid UTF-8 in topic name: {e}"),
+        })
+}
+
+/// One topic's partitions array; a null (negative-length) array is an empty assignment.
+fn read_partitions(buf: &mut &[u8]) -> Result<Vec<i32>> {
+    if buf.remaining() < 4 {
+        return Err(KafkaError::CorruptMessage {
+            message: "Unexpected end of data reading partitions array length".into(),
+        });
+    }
+    let Ok(partitions_len) = usize::try_from(buf.get_i32()) else {
+        return Ok(Vec::new());
+    };
+    if buf.remaining() < partitions_len * 4 {
+        return Err(KafkaError::CorruptMessage {
+            message: format!(
+                "Partitions array length {} exceeds remaining data {}",
+                partitions_len * 4,
+                buf.remaining()
+            ),
+        });
+    }
+    // Capped like the topics array: the declared length is client-controlled.
+    let mut partitions = Vec::with_capacity(partitions_len.min(MAX_PREALLOC_ELEMENTS));
+    for _ in 0..partitions_len {
+        partitions.push(buf.get_i32());
+    }
+    Ok(partitions)
 }
 
 #[cfg(test)]

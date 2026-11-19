@@ -2,6 +2,7 @@
 //! DescribeGroups and ListGroups, over the in-memory `GroupCoordinator`.
 
 use crate::kafka::constants::{DEFAULT_BROKER_ID, ERROR_NONE};
+use crate::kafka::coordinator::{ConsumerGroup, GroupMember};
 use crate::kafka::error::Result;
 use crate::kafka::handler_context::HandlerContext;
 use kafka_protocol::messages::describe_groups_response::{
@@ -170,54 +171,17 @@ where
         request.client_id
     );
 
-    // Reject a session_timeout_ms outside the broker's accepted range with
-    // INVALID_SESSION_TIMEOUT before touching group state, matching Kafka. This
-    // prevents a hostile client from pinning a member alive far beyond any real
-    // heartbeat cadence (blocking rebalances for the whole group) or requesting a
-    // sub-second timeout that thrashes the group. Enforced here at the request
-    // boundary so the coordinator core stays free to drive expiry with tiny
-    // timeouts in unit tests.
-    let session_timeout_range = crate::kafka::coordinator::MIN_SESSION_TIMEOUT_MS
-        ..=crate::kafka::coordinator::MAX_SESSION_TIMEOUT_MS;
-    if !session_timeout_range.contains(&request.session_timeout_ms) {
-        crate::pg_warning!(
-            "JoinGroup rejected: session_timeout_ms {} outside accepted range [{}, {}]",
-            request.session_timeout_ms,
-            crate::kafka::coordinator::MIN_SESSION_TIMEOUT_MS,
-            crate::kafka::coordinator::MAX_SESSION_TIMEOUT_MS
-        );
-        respond(
-            crate::kafka::response_builders::build_join_group_error_response(
-                crate::kafka::constants::ERROR_INVALID_SESSION_TIMEOUT,
-            ),
-        );
+    if let Some(error_code) = session_timeout_refusal(request.session_timeout_ms) {
+        respond(crate::kafka::response_builders::build_join_group_error_response(error_code));
         return;
     }
-
     let protocols: Vec<(String, Vec<u8>)> = request
         .protocols
         .into_iter()
         .map(|p| (p.name, p.metadata))
         .collect();
-
-    // Bound what one member parks in coordinator memory. Kafka keeps a group's
-    // member metadata in one __consumer_offsets record (message.max.bytes, 1 MiB by default).
-    let protocol_bytes: usize = protocols.iter().map(|(n, m)| n.len() + m.len()).sum();
-    if protocols.len() > crate::kafka::limits::MAX_MEMBER_PROTOCOLS
-        || protocol_bytes > crate::kafka::limits::MAX_MEMBER_PROTOCOL_BYTES
-    {
-        crate::pg_warning!(
-            "JoinGroup rejected: {} protocols / {} bytes of protocol metadata exceed the limit ({} / {})",
-            protocols.len(),
-            protocol_bytes,
-            crate::kafka::limits::MAX_MEMBER_PROTOCOLS,
-            crate::kafka::limits::MAX_MEMBER_PROTOCOL_BYTES
-        );
-        respond(
-            crate::kafka::response_builders::build_join_group_error_response(
-                crate::kafka::constants::ERROR_INVALID_REQUEST,
-            ),
-        );
+    if let Some(error_code) = protocols_refusal(&protocols) {
+        respond(crate::kafka::response_builders::build_join_group_error_response(error_code));
         return;
     }
     ctx.coordinator.set_limits(
@@ -253,6 +217,47 @@ where
             ));
         }),
     );
+}
+
+/// INVALID_SESSION_TIMEOUT for a session_timeout_ms outside the broker's accepted range,
+/// checked before touching group state, as in Kafka. This prevents a hostile client from
+/// pinning a member alive far beyond any real heartbeat cadence (blocking rebalances for
+/// the whole group) or requesting a sub-second timeout that thrashes the group. It is
+/// enforced at the request boundary so the coordinator core stays free to drive expiry
+/// with tiny timeouts in unit tests.
+fn session_timeout_refusal(session_timeout_ms: i32) -> Option<i16> {
+    let range = crate::kafka::coordinator::MIN_SESSION_TIMEOUT_MS
+        ..=crate::kafka::coordinator::MAX_SESSION_TIMEOUT_MS;
+    if range.contains(&session_timeout_ms) {
+        return None;
+    }
+    crate::pg_warning!(
+        "JoinGroup rejected: session_timeout_ms {} outside accepted range [{}, {}]",
+        session_timeout_ms,
+        crate::kafka::coordinator::MIN_SESSION_TIMEOUT_MS,
+        crate::kafka::coordinator::MAX_SESSION_TIMEOUT_MS
+    );
+    Some(crate::kafka::constants::ERROR_INVALID_SESSION_TIMEOUT)
+}
+
+/// INVALID_REQUEST for a protocol list beyond what one member may park in coordinator
+/// memory. Kafka keeps a group's member metadata in one __consumer_offsets record
+/// (message.max.bytes, 1 MiB by default).
+fn protocols_refusal(protocols: &[(String, Vec<u8>)]) -> Option<i16> {
+    let protocol_bytes: usize = protocols.iter().map(|(n, m)| n.len() + m.len()).sum();
+    if protocols.len() <= crate::kafka::limits::MAX_MEMBER_PROTOCOLS
+        && protocol_bytes <= crate::kafka::limits::MAX_MEMBER_PROTOCOL_BYTES
+    {
+        return None;
+    }
+    crate::pg_warning!(
+        "JoinGroup rejected: {} protocols / {} bytes of protocol metadata exceed the limit ({} / {})",
+        protocols.len(),
+        protocol_bytes,
+        crate::kafka::limits::MAX_MEMBER_PROTOCOLS,
+        crate::kafka::limits::MAX_MEMBER_PROTOCOL_BYTES
+    );
+    Some(crate::kafka::constants::ERROR_INVALID_REQUEST)
 }
 
 /// Build the JoinGroup response for a coordinator outcome. Errors map to their Kafka
@@ -552,84 +557,84 @@ pub fn handle_describe_groups(
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     for group_id in groups {
-        let mut described_group = DescribedGroup::default();
-        described_group.group_id = GroupId(StrBytes::from_string(group_id.clone()));
-
-        if let Some(group) = coordinator_groups.get(&group_id) {
-            // Group exists - return detailed information
-            described_group.error_code = ERROR_NONE;
-            described_group.group_state = StrBytes::from_static_str(group.state.as_str());
-            described_group.protocol_type = StrBytes::from_string(
-                group
-                    .protocol_type
-                    .clone()
-                    .unwrap_or_else(|| "consumer".to_string()),
-            );
-            described_group.protocol_data =
-                StrBytes::from_string(group.protocol_name.clone().unwrap_or_default());
-
-            // Add member information
-            for member in group.members.values() {
-                let mut described_member = DescribedGroupMember::default();
-                described_member.member_id = StrBytes::from_string(member.member_id.clone());
-                described_member.client_id = StrBytes::from_string(member.client_id.clone());
-                described_member.client_host = StrBytes::from_string(member.client_host.clone());
-
-                // Member metadata for the group's selected protocol, as Kafka reports it
-                // (the first protocol before a protocol has been selected).
-                if let Some((_, metadata)) = member
-                    .protocols
-                    .iter()
-                    .find(|(n, _)| Some(n) == group.protocol_name.as_ref())
-                    .or_else(|| member.protocols.first())
-                {
-                    described_member.member_metadata = metadata.clone().into();
-                }
-
-                // Member assignment
-                if let Some(assignment) = &member.assignment {
-                    described_member.member_assignment = assignment.clone().into();
-                }
-
-                // Static group instance ID (KIP-345)
-                if let Some(instance_id) = &member.group_instance_id {
-                    described_member.group_instance_id =
-                        Some(StrBytes::from_string(instance_id.clone()));
-                }
-
-                described_group.members.push(described_member);
-            }
-        } else {
-            // A group the coordinator does not hold (none of its members
-            // joined since the worker started, or it was reclaimed) still exists while it
-            // has committed offsets: Kafka reports it as an Empty "consumer" group, which is
-            // what lets `kafka-consumer-groups --describe` show its offsets and lag. Without
-            // offsets it does not exist: for the versions we advertise (v0-5) Kafka reports
-            // that as success with state Dead (GROUP_ID_NOT_FOUND only applies from v6).
-            described_group.protocol_data = StrBytes::from_static_str("");
-            match ctx.store.group_has_offsets(&group_id) {
-                Ok(true) => {
-                    described_group.error_code = ERROR_NONE;
-                    described_group.group_state = StrBytes::from_static_str("Empty");
-                    described_group.protocol_type = StrBytes::from_static_str("consumer");
-                }
-                Ok(false) => {
-                    described_group.error_code = ERROR_NONE;
-                    described_group.group_state = StrBytes::from_static_str("Dead");
-                    described_group.protocol_type = StrBytes::from_static_str("");
-                }
-                Err(e) => {
-                    described_group.error_code = e.to_kafka_error_code();
-                    described_group.group_state = StrBytes::from_static_str("");
-                    described_group.protocol_type = StrBytes::from_static_str("");
-                }
-            }
-        }
-
+        let described_group = match coordinator_groups.get(&group_id) {
+            Some(group) => describe_held_group(&group_id, group),
+            None => describe_unheld_group(ctx, &group_id),
+        };
         response.groups.push(described_group);
     }
 
     Ok(response)
+}
+
+/// DescribeGroups for a group the coordinator holds: its state, protocol and members.
+fn describe_held_group(group_id: &str, group: &ConsumerGroup) -> DescribedGroup {
+    let mut described_group = DescribedGroup::default();
+    described_group.group_id = GroupId(StrBytes::from_string(group_id.to_string()));
+    described_group.error_code = ERROR_NONE;
+    described_group.group_state = StrBytes::from_static_str(group.state.as_str());
+    described_group.protocol_type = StrBytes::from_string(
+        group
+            .protocol_type
+            .clone()
+            .unwrap_or_else(|| "consumer".to_string()),
+    );
+    described_group.protocol_data =
+        StrBytes::from_string(group.protocol_name.clone().unwrap_or_default());
+    described_group.members = group
+        .members
+        .values()
+        .map(|member| describe_member(member, group.protocol_name.as_ref()))
+        .collect();
+    described_group
+}
+
+/// One member's DescribeGroups entry.
+fn describe_member(member: &GroupMember, protocol_name: Option<&String>) -> DescribedGroupMember {
+    let mut described_member = DescribedGroupMember::default();
+    described_member.member_id = StrBytes::from_string(member.member_id.clone());
+    described_member.client_id = StrBytes::from_string(member.client_id.clone());
+    described_member.client_host = StrBytes::from_string(member.client_host.clone());
+
+    // Member metadata for the group's selected protocol, as Kafka reports it (the first
+    // protocol before a protocol has been selected).
+    if let Some((_, metadata)) = member
+        .protocols
+        .iter()
+        .find(|(n, _)| Some(n) == protocol_name)
+        .or_else(|| member.protocols.first())
+    {
+        described_member.member_metadata = metadata.clone().into();
+    }
+    if let Some(assignment) = &member.assignment {
+        described_member.member_assignment = assignment.clone().into();
+    }
+    // Static group instance ID (KIP-345)
+    if let Some(instance_id) = &member.group_instance_id {
+        described_member.group_instance_id = Some(StrBytes::from_string(instance_id.clone()));
+    }
+    described_member
+}
+
+/// DescribeGroups for a group the coordinator does not hold (none of its members joined
+/// since the worker started, or it was reclaimed). It still exists while it has committed
+/// offsets: Kafka reports it as an Empty "consumer" group, which is what lets
+/// `kafka-consumer-groups --describe` show its offsets and lag. Without offsets it does not
+/// exist: for the versions we advertise (v0-5) Kafka reports that as success with state
+/// Dead (GROUP_ID_NOT_FOUND only applies from v6).
+fn describe_unheld_group(ctx: &HandlerContext, group_id: &str) -> DescribedGroup {
+    let mut described_group = DescribedGroup::default();
+    described_group.group_id = GroupId(StrBytes::from_string(group_id.to_string()));
+    described_group.protocol_data = StrBytes::from_static_str("");
+    let (error_code, state, protocol_type) = match ctx.store.group_has_offsets(group_id) {
+        Ok(true) => (ERROR_NONE, "Empty", "consumer"),
+        Ok(false) => (ERROR_NONE, "Dead", ""),
+        Err(e) => (e.to_kafka_error_code(), "", ""),
+    };
+    described_group.error_code = error_code;
+    described_group.group_state = StrBytes::from_static_str(state);
+    described_group.protocol_type = StrBytes::from_static_str(protocol_type);
+    described_group
 }
 
 /// Handle ListGroups request

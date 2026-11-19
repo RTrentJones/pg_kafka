@@ -67,6 +67,11 @@
 //! invariant in CLAUDE.md); responders are called after the coordinator's locks are
 //! released.
 
+use crate::kafka::assignment::strategies::StickyStrategy;
+use crate::kafka::assignment::{
+    create_strategy, AssignmentInput, AssignmentOutput, AssignmentStrategy, MemberAssignment,
+    MemberSubscription,
+};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -382,71 +387,20 @@ impl GroupCoordinator {
         }
 
         if !groups.contains_key(&group_id) {
-            // A new group must also be a valid one (checked here so a refused join leaves no
-            // group behind).
-            if params.protocol_type.is_empty() || params.protocols.is_empty() {
-                return Err(inconsistent_protocol(&group_id));
-            }
-            // Bound the coordinator's memory (pg_kafka.max_consumer_groups): make room by
-            // forgetting the least recently active Empty group (its committed offsets stay in
-            // the database, so it remains visible as an Empty group), else refuse with the
-            // retriable COORDINATOR_NOT_AVAILABLE.
-            if groups.len() >= max_groups {
-                let victim = groups
-                    .values()
-                    .filter(|g| g.state == GroupState::Empty)
-                    .min_by_key(|g| g.last_activity)
-                    .map(|g| g.group_id.clone());
-                match victim {
-                    Some(v) if groups.len() == max_groups => {
-                        groups.remove(&v);
-                    }
-                    _ => {
-                        crate::pg_warning!(
-                            "JoinGroup for new group '{}' refused: {} groups in memory (pg_kafka.max_consumer_groups = {})",
-                            group_id,
-                            groups.len(),
-                            max_groups
-                        );
-                        return Err(KafkaError::CoordinatorNotAvailable { group_id });
-                    }
-                }
-            }
+            Self::admit_new_group(groups, params, max_groups)?;
         }
 
         let group = groups
             .entry(group_id.clone())
             .or_insert_with(|| ConsumerGroup::new(group_id.clone()));
+        Self::admit_member(group, params, max_group_size)?;
 
         let known_id = params.member_id.clone();
-
-        // Cap members per group (DoS protection; Kafka's group.max.size). A rejoining
-        // member (already present) is always allowed; only a new member is rejected.
-        if known_id.is_none() && group.members.len() >= max_group_size {
-            return Err(KafkaError::Protocol {
-                code: crate::kafka::constants::ERROR_GROUP_MAX_SIZE_REACHED,
-                message: format!(
-                    "group '{group_id}' has reached the maximum of {max_group_size} members"
-                ),
-            });
-        }
-
-        // Kafka's protocol check: the member's protocol type must be the group's and it must
-        // share at least one protocol with every other member.
-        if !group.supports_protocols(
-            known_id.as_deref(),
-            &params.protocol_type,
-            &params.protocols,
-        ) {
-            return Err(inconsistent_protocol(&group_id));
-        }
-
         let unchanged = known_id
             .as_ref()
             .and_then(|id| group.members.get(id))
             .is_some_and(|m| m.protocols == params.protocols);
         let member_id = known_id.unwrap_or_else(|| generate_member_id(&params.client_id));
-        let is_leader = group.leader.as_deref() == Some(member_id.as_str());
 
         pg_log!(
             "JoinGroup: group_id={}, member_id={}, state={:?}",
@@ -454,19 +408,95 @@ impl GroupCoordinator {
             member_id,
             group.state
         );
+        Ok(Self::apply_join(group, member_id, params, unchanged, out))
+    }
 
+    /// Whether a JoinGroup may create the group it names: a new group must be a valid one
+    /// (checked first, so a refused join leaves no group behind), and the coordinator's
+    /// memory is bounded (pg_kafka.max_consumer_groups). Room is made by forgetting the
+    /// least recently active Empty group (its committed offsets stay in the database, so
+    /// it remains visible as an Empty group), else the join gets the retriable
+    /// COORDINATOR_NOT_AVAILABLE.
+    fn admit_new_group(
+        groups: &mut HashMap<String, ConsumerGroup>,
+        params: &JoinGroupParams,
+        max_groups: usize,
+    ) -> Result<()> {
+        let group_id = &params.group_id;
+        if params.protocol_type.is_empty() || params.protocols.is_empty() {
+            return Err(inconsistent_protocol(group_id));
+        }
+        if groups.len() < max_groups {
+            return Ok(());
+        }
+        let victim = groups
+            .values()
+            .filter(|g| g.state == GroupState::Empty)
+            .min_by_key(|g| g.last_activity)
+            .map(|g| g.group_id.clone());
+        match victim {
+            Some(v) if groups.len() == max_groups => {
+                groups.remove(&v);
+                Ok(())
+            }
+            _ => {
+                crate::pg_warning!(
+                    "JoinGroup for new group '{}' refused: {} groups in memory (pg_kafka.max_consumer_groups = {})",
+                    group_id,
+                    groups.len(),
+                    max_groups
+                );
+                Err(KafkaError::CoordinatorNotAvailable {
+                    group_id: group_id.clone(),
+                })
+            }
+        }
+    }
+
+    /// Whether the group admits this member: a new member is refused once the group has
+    /// pg_kafka.group_max_size members (Kafka's group.max.size; a rejoining member is
+    /// always allowed), and by Kafka's protocol check the member's protocol type must be
+    /// the group's and it must share at least one protocol with every other member.
+    fn admit_member(
+        group: &ConsumerGroup,
+        params: &JoinGroupParams,
+        max_group_size: usize,
+    ) -> Result<()> {
+        let known_id = params.member_id.as_deref();
+        if known_id.is_none() && group.members.len() >= max_group_size {
+            return Err(KafkaError::Protocol {
+                code: crate::kafka::constants::ERROR_GROUP_MAX_SIZE_REACHED,
+                message: format!(
+                    "group '{}' has reached the maximum of {max_group_size} members",
+                    params.group_id
+                ),
+            });
+        }
+        if !group.supports_protocols(known_id, &params.protocol_type, &params.protocols) {
+            return Err(inconsistent_protocol(&params.group_id));
+        }
+        Ok(())
+    }
+
+    /// Add or update an admitted member and decide its JoinGroup: an unchanged rejoin of a
+    /// Stable group's follower, or of a CompletingRebalance group's member, is answered with
+    /// the current generation; anything else joins (or starts) a join phase and is held.
+    fn apply_join(
+        group: &mut ConsumerGroup,
+        member_id: String,
+        params: &JoinGroupParams,
+        unchanged: bool,
+        out: &mut Vec<Delivery>,
+    ) -> JoinDisposition {
+        let is_leader = group.leader.as_deref() == Some(member_id.as_str());
         match group.state {
             GroupState::Stable if unchanged && !is_leader => {
                 group.upsert_member(&member_id, params);
-                return Ok(JoinDisposition::Respond(Ok(
-                    group.join_result_for(&member_id)
-                )));
+                return JoinDisposition::Respond(Ok(group.join_result_for(&member_id)));
             }
             GroupState::CompletingRebalance if unchanged => {
                 group.upsert_member(&member_id, params);
-                return Ok(JoinDisposition::Respond(Ok(
-                    group.join_result_for(&member_id)
-                )));
+                return JoinDisposition::Respond(Ok(group.join_result_for(&member_id)));
             }
             GroupState::Empty | GroupState::Stable | GroupState::CompletingRebalance => {
                 group.upsert_member(&member_id, params);
@@ -482,10 +512,10 @@ impl GroupCoordinator {
         }
         group.maybe_complete_join(out);
 
-        Ok(JoinDisposition::Hold {
-            group_id,
+        JoinDisposition::Hold {
+            group_id: group.group_id.clone(),
             member_id,
-        })
+        }
     }
 
     /// Handle a SyncGroup request.
@@ -563,26 +593,7 @@ impl GroupCoordinator {
         assignments: Vec<(String, Vec<u8>)>,
         out: &mut Vec<Delivery>,
     ) -> Result<Option<Vec<u8>>> {
-        // A group this coordinator has no record of (e.g. lost in a worker restart):
-        // UNKNOWN_MEMBER_ID, as Kafka answers, makes the client rejoin.
-        // COORDINATOR_NOT_AVAILABLE made it look up the same coordinator and retry.
-        let group = groups
-            .get_mut(group_id)
-            .ok_or_else(|| KafkaError::unknown_member(group_id, member_id))?;
-
-        // As in Kafka: an unknown member first (it must rejoin as a new member), then
-        // a generation other than the current one.
-        if !group.members.contains_key(member_id) {
-            return Err(KafkaError::unknown_member(group_id, member_id));
-        }
-        if group.generation_id != generation_id {
-            return Err(KafkaError::illegal_generation(
-                group_id,
-                generation_id,
-                group.generation_id,
-            ));
-        }
-
+        let group = current_member_group(groups, group_id, member_id, generation_id)?;
         let is_leader = group.leader.as_deref() == Some(member_id);
         pg_log!(
             "SyncGroup: group_id={}, member_id={}, is_leader={}, assignments={}, state={:?}",
@@ -613,13 +624,7 @@ impl GroupCoordinator {
                     }
                 }
                 group.complete_sync(out);
-                Ok(Some(
-                    group
-                        .members
-                        .get(member_id)
-                        .and_then(|m| m.assignment.clone())
-                        .unwrap_or_default(),
-                ))
+                Ok(Some(group.assignment_of(member_id)))
             }
             GroupState::CompletingRebalance => {
                 // A follower ahead of the leader waits for the leader's assignments.
@@ -629,13 +634,7 @@ impl GroupCoordinator {
                 Ok(None)
             }
             // Stable always carries an assignment (complete_sync fills in empty ones).
-            GroupState::Stable => Ok(Some(
-                group
-                    .members
-                    .get(member_id)
-                    .and_then(|m| m.assignment.clone())
-                    .unwrap_or_default(),
-            )),
+            GroupState::Stable => Ok(Some(group.assignment_of(member_id))),
         }
     }
 
@@ -767,23 +766,7 @@ impl GroupCoordinator {
             KafkaError::Internal(format!("Failed to acquire groups write lock: {e}"))
         })?;
 
-        // Unknown group (e.g. lost in a worker restart): UNKNOWN_MEMBER_ID so the
-        // client rejoins, as Kafka answers.
-        let group = groups
-            .get_mut(group_id)
-            .ok_or_else(|| KafkaError::unknown_member(group_id, member_id))?;
-
-        if !group.members.contains_key(member_id) {
-            return Err(KafkaError::unknown_member(group_id, member_id));
-        }
-        if group.generation_id != generation_id {
-            return Err(KafkaError::illegal_generation(
-                group_id,
-                generation_id,
-                group.generation_id,
-            ));
-        }
-
+        let group = current_member_group(&mut groups, group_id, member_id, generation_id)?;
         let Some(member) = group.members.get_mut(member_id) else {
             return Err(KafkaError::unknown_member(group_id, member_id));
         };
@@ -921,12 +904,6 @@ impl GroupCoordinator {
         group_id: &str,
         topic_partitions: &HashMap<String, i32>,
     ) -> Result<HashMap<String, Vec<u8>>> {
-        use crate::kafka::assignment::strategies::StickyStrategy;
-        use crate::kafka::assignment::{
-            create_strategy, AssignmentInput, AssignmentStrategy, MemberAssignment,
-            MemberSubscription,
-        };
-
         let groups = self.groups.read().map_err(|e| {
             KafkaError::Internal(format!("Failed to acquire groups read lock: {e}"))
         })?;
@@ -937,59 +914,10 @@ impl GroupCoordinator {
                 group_id: group_id.to_string(),
             })?;
 
-        // Parse subscriptions from member protocol metadata
-        let mut subscriptions = HashMap::new();
-        for (member_id, member) in &group.members {
-            // Find the protocol matching the chosen strategy
-            if let Some((_, metadata)) = member
-                .protocols
-                .iter()
-                .find(|(name, _)| Some(name) == group.protocol_name.as_ref())
-            {
-                match MemberSubscription::parse(metadata) {
-                    Ok(sub) => {
-                        subscriptions.insert(member_id.clone(), sub);
-                    }
-                    Err(e) => {
-                        pg_log!(
-                            "Failed to parse subscription for member {}: {}",
-                            member_id,
-                            e
-                        );
-                        // Use empty subscription as fallback
-                        subscriptions.insert(member_id.clone(), MemberSubscription::default());
-                    }
-                }
-            } else {
-                // No matching protocol, use empty subscription
-                subscriptions.insert(member_id.clone(), MemberSubscription::default());
-            }
-        }
-
-        // Create assignment input
-        let input = AssignmentInput::new(subscriptions, topic_partitions.clone());
-
-        // Get strategy name (default to "range")
+        let input = AssignmentInput::new(member_subscriptions(group), topic_partitions.clone());
+        // The group's selected assignor, "range" if none was selected.
         let strategy_name = group.protocol_name.as_deref().unwrap_or("range");
-
-        // Create strategy - for sticky, include previous assignments
-        let assignments = if strategy_name.contains("sticky") {
-            // Parse previous assignments for sticky strategy
-            let mut previous = HashMap::new();
-            for (member_id, bytes) in &group.previous_assignments {
-                if let Ok(assign) = MemberAssignment::parse(bytes) {
-                    previous.insert(member_id.clone(), assign);
-                }
-            }
-            let strategy = StickyStrategy::with_previous(previous);
-            strategy.assign(&input)
-        } else {
-            // Use standard strategy
-            let strategy = create_strategy(strategy_name).ok_or_else(|| {
-                KafkaError::Internal(format!("Unknown assignment strategy: {strategy_name}"))
-            })?;
-            strategy.assign(&input)
-        };
+        let assignments = run_assignor(group, &input, strategy_name)?;
 
         // Encode assignments to bytes
         let encoded = assignments
@@ -1096,6 +1024,84 @@ impl Default for GroupCoordinator {
 
 /// INCONSISTENT_GROUP_PROTOCOL for a JoinGroup whose protocol type or protocols do not fit the
 /// group.
+/// Every member's subscription, parsed from its metadata for the group's selected
+/// protocol. A member without that protocol, or whose metadata does not parse, is
+/// assigned as if it subscribed to nothing.
+fn member_subscriptions(group: &ConsumerGroup) -> HashMap<String, MemberSubscription> {
+    group
+        .members
+        .iter()
+        .map(|(member_id, member)| {
+            let subscription = member
+                .protocols
+                .iter()
+                .find(|(name, _)| Some(name) == group.protocol_name.as_ref())
+                .map_or_else(MemberSubscription::default, |(_, metadata)| {
+                    MemberSubscription::parse(metadata).unwrap_or_else(|e| {
+                        pg_log!(
+                            "Failed to parse subscription for member {}: {}",
+                            member_id,
+                            e
+                        );
+                        MemberSubscription::default()
+                    })
+                });
+            (member_id.clone(), subscription)
+        })
+        .collect()
+}
+
+/// Run the assignor `strategy_name` over `input`. The sticky assignor starts from the
+/// group's previous assignments.
+fn run_assignor(
+    group: &ConsumerGroup,
+    input: &AssignmentInput,
+    strategy_name: &str,
+) -> Result<AssignmentOutput> {
+    if strategy_name.contains("sticky") {
+        let previous = group
+            .previous_assignments
+            .iter()
+            .filter_map(|(member_id, bytes)| {
+                MemberAssignment::parse(bytes)
+                    .ok()
+                    .map(|assignment| (member_id.clone(), assignment))
+            })
+            .collect();
+        return Ok(StickyStrategy::with_previous(previous).assign(input));
+    }
+    let strategy = create_strategy(strategy_name).ok_or_else(|| {
+        KafkaError::Internal(format!("Unknown assignment strategy: {strategy_name}"))
+    })?;
+    Ok(strategy.assign(input))
+}
+
+/// The group of a member presenting `generation_id`, fenced as Kafka fences SyncGroup and
+/// Heartbeat: a group this coordinator has no record of (e.g. lost in a worker restart)
+/// or an unknown member gets UNKNOWN_MEMBER_ID, which makes the client rejoin as a new
+/// member; then a generation other than the current one gets ILLEGAL_GENERATION.
+fn current_member_group<'a>(
+    groups: &'a mut HashMap<String, ConsumerGroup>,
+    group_id: &str,
+    member_id: &str,
+    generation_id: i32,
+) -> Result<&'a mut ConsumerGroup> {
+    let group = groups
+        .get_mut(group_id)
+        .ok_or_else(|| KafkaError::unknown_member(group_id, member_id))?;
+    if !group.members.contains_key(member_id) {
+        return Err(KafkaError::unknown_member(group_id, member_id));
+    }
+    if group.generation_id != generation_id {
+        return Err(KafkaError::illegal_generation(
+            group_id,
+            generation_id,
+            group.generation_id,
+        ));
+    }
+    Ok(group)
+}
+
 fn inconsistent_protocol(group_id: &str) -> KafkaError {
     KafkaError::Protocol {
         code: crate::kafka::constants::ERROR_INCONSISTENT_GROUP_PROTOCOL,

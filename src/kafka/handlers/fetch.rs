@@ -8,7 +8,9 @@ use crate::kafka::constants::{
 };
 use crate::kafka::error::Result;
 use crate::kafka::handler_context::HandlerContext;
-use crate::kafka::messages::{PartitionFetchData, TopicFetchData};
+use crate::kafka::messages::{
+    ListOffsetsPartitionData, ListOffsetsTopicData, PartitionFetchData, TopicFetchData,
+};
 use crate::kafka::storage::{FetchedMessage, IsolationLevel, KafkaStore, PartitionBounds};
 use bytes::BufMut;
 use kafka_protocol::indexmap::IndexMap;
@@ -295,6 +297,10 @@ pub fn handle_fetch_with_max_bytes(
         remaining: i64::from(max_bytes.max(0)),
         returned_any: false,
     };
+    let settings = FetchSettings {
+        isolation_level,
+        compression: ctx.compression,
+    };
     let mut responses = Vec::new();
 
     for topic_fetch in topic_data {
@@ -310,14 +316,7 @@ pub fn handle_fetch_with_max_bytes(
                     .partitions
                     .iter()
                     .map(|partition| {
-                        fetch_partition(
-                            store,
-                            topic,
-                            partition,
-                            isolation_level,
-                            ctx.compression,
-                            &mut budget,
-                        )
+                        fetch_partition(store, topic, partition, settings, &mut budget)
                     })
                     .collect()
             }
@@ -352,6 +351,14 @@ struct TopicPartitions {
     partition_count: i32,
 }
 
+/// How a fetch request reads: its isolation level and the compression of the batches
+/// it returns.
+#[derive(Clone, Copy)]
+struct FetchSettings {
+    isolation_level: IsolationLevel,
+    compression: Compression,
+}
+
 /// What is left of a fetch request's `max_bytes`, and whether an earlier partition
 /// already returned records (see [`partition_fetch_limit`]).
 struct FetchBudget {
@@ -364,10 +371,10 @@ fn fetch_partition(
     store: &dyn KafkaStore,
     topic: TopicPartitions,
     partition_fetch: &PartitionFetchData,
-    isolation_level: IsolationLevel,
-    compression: Compression,
+    settings: FetchSettings,
     budget: &mut FetchBudget,
 ) -> PartitionData {
+    let isolation_level = settings.isolation_level;
     let topic_id = topic.id;
     let partition_id = partition_fetch.partition_index;
     let fetch_offset = partition_fetch.fetch_offset;
@@ -419,6 +426,34 @@ fn fetch_partition(
     ) else {
         return partition_with_bounds(partition_id, &bounds);
     };
+    read_partition(
+        store,
+        topic_id,
+        partition_fetch,
+        limit,
+        &bounds,
+        settings,
+        budget,
+    )
+}
+
+/// Read up to `limit` bytes of records of an in-range partition from `fetch_offset`, trim
+/// them to the response budget and encode them (or a gap batch over invisible offsets).
+fn read_partition(
+    store: &dyn KafkaStore,
+    topic_id: i32,
+    partition_fetch: &PartitionFetchData,
+    limit: i32,
+    bounds: &PartitionBounds,
+    settings: FetchSettings,
+    budget: &mut FetchBudget,
+) -> PartitionData {
+    let partition_id = partition_fetch.partition_index;
+    let fetch_offset = partition_fetch.fetch_offset;
+    let FetchSettings {
+        isolation_level,
+        compression,
+    } = settings;
     let fetched = match store.fetch_records_with_isolation(
         topic_id,
         partition_id,
@@ -463,7 +498,7 @@ fn fetch_partition(
     } else {
         Ok(bytes::Bytes::new())
     };
-    fetched_partition_data(topic_id, partition_id, &bounds, records)
+    fetched_partition_data(topic_id, partition_id, bounds, records)
 }
 
 /// A partition entry for an error that leaves its bounds unknown.
@@ -537,86 +572,86 @@ fn fetched_partition_data(
 /// A partition outside the topic is UNKNOWN_TOPIC_OR_PARTITION.
 pub fn handle_list_offsets(
     ctx: &HandlerContext,
-    topics: Vec<crate::kafka::messages::ListOffsetsTopicData>,
+    topics: Vec<ListOffsetsTopicData>,
     isolation_level: IsolationLevel,
 ) -> Result<ListOffsetsResponse> {
-    let store = ctx.store;
-
-    let mut response_topics = Vec::new();
-
-    for topic_request in topics {
-        let topic_name = topic_request.name.clone();
-
-        let (topic_id, partition_count) = match resolve_topic(store, &topic_name) {
-            Ok(Some(found)) => found,
-            unresolved => {
-                let error_code = match unresolved {
-                    Err(code) => code,
-                    _ => ERROR_UNKNOWN_TOPIC_OR_PARTITION,
-                };
-                let mut topic_response = ListOffsetsTopicResponse::default();
-                topic_response.name = TopicName(StrBytes::from_string(topic_name));
-                topic_response.partitions = topic_request
-                    .partitions
-                    .iter()
-                    .map(|p| list_offsets_error(p.partition_index, error_code))
-                    .collect();
-                response_topics.push(topic_response);
-                continue;
-            }
-        };
-
-        let mut partition_responses = Vec::new();
-        for partition_request in topic_request.partitions {
-            let partition_id = partition_request.partition_index;
-            if partition_id < 0 || partition_id >= partition_count {
-                partition_responses.push(list_offsets_error(
-                    partition_id,
-                    ERROR_UNKNOWN_TOPIC_OR_PARTITION,
-                ));
-                continue;
-            }
-            let result = list_partition_offset(
-                store,
-                topic_id,
-                partition_id,
-                partition_request.timestamp,
-                isolation_level,
-            );
-            let mut partition_response = ListOffsetsPartitionResponse::default();
-            partition_response.partition_index = partition_id;
-            match result {
-                Ok((offset, timestamp)) => {
-                    partition_response.error_code = ERROR_NONE;
-                    partition_response.offset = offset;
-                    partition_response.timestamp = timestamp;
-                }
-                Err(e) => {
-                    if e.is_server_error() {
-                        crate::pg_warning!(
-                            "ListOffsets failed for topic_id={}, partition={}, timestamp={}: {}",
-                            topic_id,
-                            partition_id,
-                            partition_request.timestamp,
-                            e
-                        );
-                    }
-                    partition_response = list_offsets_error(partition_id, e.to_kafka_error_code());
-                }
-            }
-            partition_responses.push(partition_response);
-        }
-
-        let mut topic_response = ListOffsetsTopicResponse::default();
-        topic_response.name = TopicName(StrBytes::from_string(topic_name));
-        topic_response.partitions = partition_responses;
-        response_topics.push(topic_response);
-    }
-
     let mut kafka_response = ListOffsetsResponse::default();
     kafka_response.throttle_time_ms = 0;
-    kafka_response.topics = response_topics;
+    kafka_response.topics = topics
+        .into_iter()
+        .map(|topic| list_topic_offsets(ctx.store, topic, isolation_level))
+        .collect();
     Ok(kafka_response)
+}
+
+/// Answer one ListOffsets topic: a missing topic (or a failed lookup) is reported on
+/// every requested partition.
+fn list_topic_offsets(
+    store: &dyn KafkaStore,
+    topic: ListOffsetsTopicData,
+    isolation_level: IsolationLevel,
+) -> ListOffsetsTopicResponse {
+    let partitions = match resolve_topic(store, &topic.name) {
+        Ok(Some((topic_id, partition_count))) => topic
+            .partitions
+            .iter()
+            .map(|p| list_offsets_partition(store, topic_id, partition_count, p, isolation_level))
+            .collect(),
+        unresolved => {
+            let error_code = unresolved.err().unwrap_or(ERROR_UNKNOWN_TOPIC_OR_PARTITION);
+            topic
+                .partitions
+                .iter()
+                .map(|p| list_offsets_error(p.partition_index, error_code))
+                .collect()
+        }
+    };
+    let mut topic_response = ListOffsetsTopicResponse::default();
+    topic_response.name = TopicName(StrBytes::from_string(topic.name));
+    topic_response.partitions = partitions;
+    topic_response
+}
+
+/// Answer one ListOffsets partition of a resolved topic.
+fn list_offsets_partition(
+    store: &dyn KafkaStore,
+    topic_id: i32,
+    partition_count: i32,
+    request: &ListOffsetsPartitionData,
+    isolation_level: IsolationLevel,
+) -> ListOffsetsPartitionResponse {
+    let partition_id = request.partition_index;
+    if partition_id < 0 || partition_id >= partition_count {
+        return list_offsets_error(partition_id, ERROR_UNKNOWN_TOPIC_OR_PARTITION);
+    }
+    match list_partition_offset(
+        store,
+        topic_id,
+        partition_id,
+        request.timestamp,
+        isolation_level,
+    ) {
+        Ok((offset, timestamp)) => {
+            let mut partition_response = ListOffsetsPartitionResponse::default();
+            partition_response.partition_index = partition_id;
+            partition_response.error_code = ERROR_NONE;
+            partition_response.offset = offset;
+            partition_response.timestamp = timestamp;
+            partition_response
+        }
+        Err(e) => {
+            if e.is_server_error() {
+                crate::pg_warning!(
+                    "ListOffsets failed for topic_id={}, partition={}, timestamp={}: {}",
+                    topic_id,
+                    partition_id,
+                    request.timestamp,
+                    e
+                );
+            }
+            list_offsets_error(partition_id, e.to_kafka_error_code())
+        }
+    }
 }
 
 /// A ListOffsets partition entry carrying `error_code` (offset and timestamp -1).

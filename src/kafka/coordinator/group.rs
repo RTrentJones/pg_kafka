@@ -397,6 +397,14 @@ impl ConsumerGroup {
         );
     }
 
+    /// The assignment a member's SyncGroup returns (empty if it has none).
+    pub(super) fn assignment_of(&self, member_id: &str) -> Vec<u8> {
+        self.members
+            .get(member_id)
+            .and_then(|m| m.assignment.clone())
+            .unwrap_or_default()
+    }
+
     /// Choose the group protocol by Kafka's member vote: the candidates are the
     /// protocols every member supports; each member votes for the first candidate in its own
     /// preference order and the candidate with the most votes wins. Ties go to the candidate

@@ -96,8 +96,6 @@ mod store {
                 client_id: Option<&'a str>,
                 transactional_id: Option<&'a str>,
             ) -> Result<(i64, i16)>;
-            fn get_producer_epoch(&self, producer_id: i64) -> Result<Option<i16>>;
-            fn increment_producer_epoch(&self, producer_id: i64) -> Result<(i64, i16)>;
             fn check_and_update_sequence(
                 &self,
                 producer_id: i64,

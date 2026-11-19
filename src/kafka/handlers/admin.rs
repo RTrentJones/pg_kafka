@@ -41,9 +41,7 @@ pub fn handle_create_topics(
     topics: Vec<CreateTopicRequest>,
     validate_only: bool,
 ) -> Result<CreateTopicsResponse> {
-    let store = ctx.store;
     let max_partitions = crate::kafka::limits::max_partitions_per_topic();
-    let mut results = Vec::new();
 
     // A name given more than once fails as a whole, reported once (Kafka answers one
     // INVALID_REQUEST entry and creates nothing for it).
@@ -53,141 +51,132 @@ pub fn handle_create_topics(
     }
     let mut reported = std::collections::HashSet::<String>::new();
 
+    let mut results = Vec::new();
     for topic in topics {
         if !reported.insert(topic.name.clone()) {
             continue;
         }
-        let mut result = CreatableTopicResult::default();
-        result.name = TopicName(StrBytes::from_string(topic.name.clone()));
-        result.num_partitions = -1;
-        result.replication_factor = -1;
-        let fail = |mut result: CreatableTopicResult, code: i16, msg: String| {
-            result.error_code = code;
-            result.error_message = Some(StrBytes::from_string(msg));
-            result
-        };
-
-        if seen.get(&topic.name).copied().unwrap_or(0) > 1 {
-            results.push(fail(
-                result,
+        results.push(if seen.get(&topic.name).copied().unwrap_or(0) > 1 {
+            failed_topic(
+                &topic.name,
                 ERROR_INVALID_REQUEST,
                 "Duplicate topic name.".to_string(),
-            ));
-            continue;
-        }
-
-        // Validate topic name (length, charset, and "."/".." in addition to empty).
-        if let Err(msg) = validate_topic_name(&topic.name) {
-            results.push(fail(result, ERROR_INVALID_TOPIC_EXCEPTION, msg.to_string()));
-            continue;
-        }
-
-        // -1 means "use the broker default" (pg_kafka.default_partitions, capped like an
-        // auto-created topic); any other value < 1 (e.g. 0) is rejected.
-        let num_partitions = if topic.num_partitions == -1 {
-            crate::kafka::limits::auto_create_partitions(ctx.default_partitions)
+            )
         } else {
-            topic.num_partitions
-        };
-        if num_partitions < 1 {
-            results.push(fail(
-                result,
-                ERROR_INVALID_PARTITIONS,
-                "Number of partitions was set to an invalid non-positive value.".to_string(),
-            ));
-            continue;
-        }
-        if let Err(msg) =
-            crate::kafka::limits::check_partition_count(num_partitions, max_partitions)
-        {
-            results.push(fail(result, ERROR_INVALID_PARTITIONS, msg));
-            continue;
-        }
-
-        if let Err(msg) = validate_replication_factor(topic.replication_factor) {
-            results.push(fail(result, ERROR_INVALID_REPLICATION_FACTOR, msg));
-            continue;
-        }
-
-        // Check if topic already exists
-        match store.topic_exists(&topic.name) {
-            Ok(true) => {
-                results.push(fail(
-                    result,
-                    ERROR_TOPIC_ALREADY_EXISTS,
-                    format!("Topic '{}' already exists.", topic.name),
-                ));
-                continue;
-            }
-            Ok(false) => {}
-            Err(e) => {
-                results.push(fail(
-                    result,
-                    ERROR_UNKNOWN_SERVER_ERROR,
-                    format!("Error checking topic: {e}"),
-                ));
-                continue;
-            }
-        }
-
-        // Kafka rejects a name that collides with an existing one once '.' and '_' are
-        // treated as equal (their metric names would clash).
-        match store.find_colliding_topic(&topic.name) {
-            Ok(Some(existing)) => {
-                results.push(fail(
-                    result,
-                    ERROR_INVALID_TOPIC_EXCEPTION,
-                    format!(
-                        "Topic '{}' collides with existing topic: {}",
-                        topic.name, existing
-                    ),
-                ));
-                continue;
-            }
-            Ok(None) => {}
-            Err(e) => {
-                results.push(fail(
-                    result,
-                    ERROR_UNKNOWN_SERVER_ERROR,
-                    format!("Error checking topic: {e}"),
-                ));
-                continue;
-            }
-        }
-
-        // If validate_only, don't actually create
-        if validate_only {
-            result.error_code = ERROR_NONE;
-            result.num_partitions = num_partitions;
-            result.replication_factor = 1; // Single-node, always 1
-            results.push(result);
-            continue;
-        }
-
-        // Create the topic
-        match store.create_topic(&topic.name, num_partitions) {
-            Ok(_topic_id) => {
-                result.error_code = ERROR_NONE;
-                // Note: topic_id field is a Uuid in v7+, we leave it as default (nil) for simplicity
-                result.num_partitions = num_partitions;
-                result.replication_factor = 1; // Single-node, always 1
-            }
-            Err(e) => {
-                result = fail(
-                    result,
-                    ERROR_UNKNOWN_SERVER_ERROR,
-                    format!("Failed to create topic: {e}"),
-                );
-            }
-        }
-
-        results.push(result);
+            create_topic_result(ctx, &topic, max_partitions, validate_only)
+        });
     }
 
     let mut response = CreateTopicsResponse::default();
     response.throttle_time_ms = 0;
     response.topics = results;
     Ok(response)
+}
+
+/// Validate one requested topic and, unless `validate_only`, create it.
+fn create_topic_result(
+    ctx: &HandlerContext,
+    topic: &CreateTopicRequest,
+    max_partitions: i32,
+    validate_only: bool,
+) -> CreatableTopicResult {
+    let num_partitions = match validate_new_topic(ctx, topic, max_partitions) {
+        Ok(num_partitions) => num_partitions,
+        Err((code, message)) => return failed_topic(&topic.name, code, message),
+    };
+    if validate_only {
+        return created_topic(&topic.name, num_partitions);
+    }
+    match ctx.store.create_topic(&topic.name, num_partitions) {
+        Ok(_topic_id) => created_topic(&topic.name, num_partitions),
+        Err(e) => failed_topic(
+            &topic.name,
+            ERROR_UNKNOWN_SERVER_ERROR,
+            format!("Failed to create topic: {e}"),
+        ),
+    }
+}
+
+/// The partition count a requested topic gets, or the error code and message that refuse
+/// it: an invalid name, partition count or replication factor, an existing topic, or a name
+/// that collides with one.
+fn validate_new_topic(
+    ctx: &HandlerContext,
+    topic: &CreateTopicRequest,
+    max_partitions: i32,
+) -> std::result::Result<i32, (i16, String)> {
+    let store = ctx.store;
+    // Length, charset, and "."/".." in addition to empty.
+    validate_topic_name(&topic.name)
+        .map_err(|msg| (ERROR_INVALID_TOPIC_EXCEPTION, msg.to_string()))?;
+
+    // -1 means "use the broker default" (pg_kafka.default_partitions, capped like an
+    // auto-created topic); any other value < 1 (e.g. 0) is rejected.
+    let num_partitions = if topic.num_partitions == -1 {
+        crate::kafka::limits::auto_create_partitions(ctx.default_partitions)
+    } else {
+        topic.num_partitions
+    };
+    if num_partitions < 1 {
+        return Err((
+            ERROR_INVALID_PARTITIONS,
+            "Number of partitions was set to an invalid non-positive value.".to_string(),
+        ));
+    }
+    crate::kafka::limits::check_partition_count(num_partitions, max_partitions)
+        .map_err(|msg| (ERROR_INVALID_PARTITIONS, msg))?;
+    validate_replication_factor(topic.replication_factor)
+        .map_err(|msg| (ERROR_INVALID_REPLICATION_FACTOR, msg))?;
+
+    let lookup_failed = |e| {
+        (
+            ERROR_UNKNOWN_SERVER_ERROR,
+            format!("Error checking topic: {e}"),
+        )
+    };
+    if store.topic_exists(&topic.name).map_err(lookup_failed)? {
+        return Err((
+            ERROR_TOPIC_ALREADY_EXISTS,
+            format!("Topic '{}' already exists.", topic.name),
+        ));
+    }
+    // Kafka rejects a name that collides with an existing one once '.' and '_' are
+    // treated as equal (their metric names would clash).
+    if let Some(existing) = store
+        .find_colliding_topic(&topic.name)
+        .map_err(lookup_failed)?
+    {
+        return Err((
+            ERROR_INVALID_TOPIC_EXCEPTION,
+            format!(
+                "Topic '{}' collides with existing topic: {}",
+                topic.name, existing
+            ),
+        ));
+    }
+    Ok(num_partitions)
+}
+
+/// A CreateTopics result for a refused topic.
+fn failed_topic(name: &str, error_code: i16, message: String) -> CreatableTopicResult {
+    let mut result = CreatableTopicResult::default();
+    result.name = TopicName(StrBytes::from_string(name.to_string()));
+    result.num_partitions = -1;
+    result.replication_factor = -1;
+    result.error_code = error_code;
+    result.error_message = Some(StrBytes::from_string(message));
+    result
+}
+
+/// A CreateTopics result for a topic that is (or, with validate_only, would be) created;
+/// the replication factor is always 1 on this single-node broker.
+fn created_topic(name: &str, num_partitions: i32) -> CreatableTopicResult {
+    let mut result = CreatableTopicResult::default();
+    result.name = TopicName(StrBytes::from_string(name.to_string()));
+    result.error_code = ERROR_NONE;
+    result.num_partitions = num_partitions;
+    result.replication_factor = 1;
+    result
 }
 
 /// Replication factor rule for this one-broker cluster (Kafka's messages): -1 (the broker

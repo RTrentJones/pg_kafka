@@ -390,18 +390,6 @@ macro_rules! delegate_producer_store {
         ) -> $crate::kafka::error::Result<(i64, i16)> {
             $via::allocate_producer_id(client_id, transactional_id)
         }
-        fn get_producer_epoch(
-            &self,
-            producer_id: i64,
-        ) -> $crate::kafka::error::Result<Option<i16>> {
-            $via::get_producer_epoch(producer_id)
-        }
-        fn increment_producer_epoch(
-            &self,
-            producer_id: i64,
-        ) -> $crate::kafka::error::Result<(i64, i16)> {
-            $via::increment_producer_epoch(producer_id)
-        }
         fn check_and_update_sequence(
             &self,
             producer_id: i64,
@@ -458,18 +446,6 @@ macro_rules! delegate_producer_store {
             transactional_id: Option<&str>,
         ) -> $crate::kafka::error::Result<(i64, i16)> {
             $via::allocate_producer_id(&self.$field, client_id, transactional_id)
-        }
-        fn get_producer_epoch(
-            &self,
-            producer_id: i64,
-        ) -> $crate::kafka::error::Result<Option<i16>> {
-            $via::get_producer_epoch(&self.$field, producer_id)
-        }
-        fn increment_producer_epoch(
-            &self,
-            producer_id: i64,
-        ) -> $crate::kafka::error::Result<(i64, i16)> {
-            $via::increment_producer_epoch(&self.$field, producer_id)
         }
         fn check_and_update_sequence(
             &self,

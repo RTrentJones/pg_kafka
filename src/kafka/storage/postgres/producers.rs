@@ -139,53 +139,6 @@ impl PostgresStore {
         .map_err(internal("allocate_producer_id"))
     }
 
-    pub(super) fn get_producer_epoch(producer_id: i64) -> Result<Option<i16>> {
-        crate::pg_debug!("PostgresStore::get_producer_epoch: producer_id={producer_id}");
-
-        Spi::connect(|client| {
-            let mut table = client.select(
-                "SELECT epoch FROM kafka.producer_ids WHERE producer_id = $1",
-                Some(1),
-                &[producer_id.into()],
-            )?;
-            match table.next() {
-                Some(row) => Ok(Some(row.get_by_name("epoch")?.unwrap_or(0))),
-                None => Ok(None),
-            }
-        })
-        .map_err(internal("get_producer_epoch"))
-    }
-
-    /// Re-initialise an idempotent producer by id. A transactional producer's epoch is
-    /// owned by its transactional id (`get_or_create_transactional_producer`); bumping
-    /// it here would leave kafka.transactions on the old epoch, so it is unknown here.
-    pub(super) fn increment_producer_epoch(producer_id: i64) -> Result<(i64, i16)> {
-        crate::pg_debug!("PostgresStore::increment_producer_epoch: producer_id={producer_id}");
-
-        Spi::connect_mut(|client| {
-            let current = client.select(
-                "SELECT epoch FROM kafka.producer_ids
-                 WHERE producer_id = $1 AND transactional_id IS NULL",
-                Some(1),
-                &[producer_id.into()],
-            )?;
-            if current.is_empty() {
-                return Err(KafkaError::unknown_producer_id(producer_id));
-            }
-            let old_epoch: i16 = current.first().get_by_name("epoch")?.unwrap_or(0);
-
-            clear_producer_sequences(client, producer_id)?;
-            let (new_producer_id, new_epoch) = bump_producer_epoch(client, producer_id, old_epoch)?;
-            crate::pg_debug!(
-                "Re-initialised producer_id={producer_id} -> producer_id={new_producer_id}, epoch={new_epoch}"
-            );
-            Ok((new_producer_id, new_epoch))
-        })
-        .map_err(internal_unless("increment_producer_epoch", |e| {
-            matches!(e, KafkaError::UnknownProducerId { .. })
-        }))
-    }
-
     pub(super) fn check_and_update_sequence(
         producer_id: i64,
         producer_epoch: i16,

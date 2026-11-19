@@ -918,8 +918,7 @@ fn test_parse_init_producer_id_request() {
     request.producer_epoch = -1;
 
     let data = expect_body!(decode(&request, 4), InitProducerId);
-    assert_eq!(data.producer_id, -1);
-    assert_eq!(data.producer_epoch, -1);
+    assert_eq!(data.transactional_id, None);
     assert_eq!(data.transaction_timeout_ms, 60000);
 }
 

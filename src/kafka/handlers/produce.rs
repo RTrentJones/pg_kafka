@@ -1,6 +1,7 @@
 //! Produce: writes records to their partitions, with key routing for partition -1,
 //! idempotent sequence checks and transactional writes.
 
+use super::helpers::validate_ongoing_transaction;
 use crate::kafka::constants::{
     ERROR_INVALID_PRODUCER_EPOCH, ERROR_INVALID_TXN_STATE, ERROR_NONE,
     ERROR_UNKNOWN_TOPIC_OR_PARTITION,
@@ -11,8 +12,7 @@ use crate::kafka::messages::{ProducerMetadata, Record, TopicProduceData};
 use crate::kafka::partitioner::compute_partition;
 use crate::kafka::response_builders::build_produce_partition_error_response;
 use crate::kafka::storage::{
-    batch_last_sequence, KafkaStore, LogStore, ProducerBatch, SequenceCheck, TransactionState,
-    TransactionStore,
+    batch_last_sequence, KafkaStore, LogStore, ProducerBatch, SequenceCheck,
 };
 use kafka_protocol::messages::produce_response::{
     PartitionProduceResponse, ProduceResponse, TopicProduceResponse,
@@ -47,7 +47,13 @@ pub fn handle_produce(
     // requested partition; an empty response would leave the client without the error.
     if let (Some(txn_id), Some(meta)) = (transactional_id, producer_metadata) {
         if meta.producer_id >= 0 {
-            if let Err(e) = validate_ongoing_transaction(store, txn_id, meta) {
+            if let Err(e) = validate_ongoing_transaction(
+                store,
+                txn_id,
+                meta.producer_id,
+                meta.producer_epoch,
+                "Produce",
+            ) {
                 return Ok(build_produce_partition_error_response(
                     &topic_data,
                     produce_error_code(&e),
@@ -56,15 +62,26 @@ pub fn handle_produce(
         }
     }
     let mut kafka_response = crate::kafka::build_produce_response();
+    kafka_response.responses = topic_data
+        .into_iter()
+        .map(|topic| produce_topic(ctx, topic, producer_metadata, transactional_id))
+        .collect();
+    Ok(kafka_response)
+}
 
-    for topic in topic_data {
-        // Topic id and partition count in one query. A failure here is reported on this
-        // topic's partitions only.
-        let (topic_id, partition_count) = match super::helpers::get_or_create_valid_topic(
-            store,
-            &topic.name,
-            ctx.default_partitions,
-        ) {
+/// Write one topic's records and answer for its partitions. A failure to resolve (or
+/// create) the topic is reported on this topic's partitions only.
+fn produce_topic(
+    ctx: &HandlerContext,
+    topic: TopicProduceData,
+    producer_metadata: Option<&ProducerMetadata>,
+    transactional_id: Option<&str>,
+) -> TopicProduceResponse {
+    let store = ctx.store;
+    // Topic id and partition count in one query.
+    let (topic_id, partition_count) =
+        match super::helpers::get_or_create_valid_topic(store, &topic.name, ctx.default_partitions)
+        {
             Ok(found) => found,
             Err(e) => {
                 if e.is_server_error() {
@@ -74,47 +91,40 @@ pub fn handle_produce(
                         e
                     );
                 }
-                kafka_response.responses.push(
-                    build_produce_partition_error_response(
-                        std::slice::from_ref(&topic),
-                        e.to_kafka_error_code(),
-                    )
-                    .responses
-                    .remove(0),
-                );
-                continue;
+                return build_produce_partition_error_response(
+                    std::slice::from_ref(&topic),
+                    e.to_kafka_error_code(),
+                )
+                .responses
+                .remove(0);
             }
         };
 
-        let mut topic_response = TopicProduceResponse::default();
-        topic_response.name = TopicName(topic.name.clone().into());
-        let target = TargetTopic {
-            id: topic_id,
-            partition_count,
-        };
-        let (by_partition, rejected) =
-            group_by_partition(topic, partition_count, producer_metadata);
-        for partition_index in rejected {
-            topic_response.partition_responses.push(failed_partition(
-                partition_index,
-                ERROR_UNKNOWN_TOPIC_OR_PARTITION,
-            ));
-        }
-        for (partition_index, (records, partition_meta)) in by_partition {
-            topic_response.partition_responses.push(produce_partition(
-                store,
-                target,
-                partition_index,
-                &records,
-                partition_meta.as_ref(),
-                producer_metadata,
-                transactional_id,
-            ));
-        }
-        kafka_response.responses.push(topic_response);
+    let mut topic_response = TopicProduceResponse::default();
+    topic_response.name = TopicName(topic.name.clone().into());
+    let target = TargetTopic {
+        id: topic_id,
+        partition_count,
+    };
+    let (by_partition, rejected) = group_by_partition(topic, partition_count, producer_metadata);
+    for partition_index in rejected {
+        topic_response.partition_responses.push(failed_partition(
+            partition_index,
+            ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+        ));
     }
-
-    Ok(kafka_response)
+    for (partition_index, (records, partition_meta)) in by_partition {
+        topic_response.partition_responses.push(produce_partition(
+            store,
+            target,
+            partition_index,
+            &records,
+            partition_meta.as_ref(),
+            producer_metadata,
+            transactional_id,
+        ));
+    }
+    topic_response
 }
 
 /// The topic a produce writes to.
@@ -189,18 +199,8 @@ fn produce_partition(
     transactional_id: Option<&str>,
 ) -> PartitionProduceResponse {
     let topic_id = topic.id;
-    if partition_index < 0 || partition_index >= topic.partition_count {
-        return failed_partition(partition_index, ERROR_UNKNOWN_TOPIC_OR_PARTITION);
-    }
-
-    // A transactional producer may only write to partitions it added to the transaction
-    // (AddPartitionsToTxn); Kafka answers INVALID_TXN_STATE.
-    if let Some(txn_id) = transactional_id {
-        match store.txn_has_partition(txn_id, topic_id, partition_index) {
-            Ok(true) => {}
-            Ok(false) => return failed_partition(partition_index, ERROR_INVALID_TXN_STATE),
-            Err(e) => return failed_partition(partition_index, e.to_kafka_error_code()),
-        }
+    if let Some(error_code) = partition_refusal(store, topic, partition_index, transactional_id) {
+        return failed_partition(partition_index, error_code);
     }
 
     // Sequence metadata for this partition (idempotent producers only).
@@ -228,7 +228,65 @@ fn produce_partition(
         }
     }
 
-    let insert_result = if transactional_id.is_some() {
+    let base_offset = match insert_partition_records(
+        store,
+        topic_id,
+        partition_index,
+        records,
+        producer_metadata,
+        transactional_id,
+    ) {
+        Ok(base_offset) => base_offset,
+        Err(error_code) => return failed_partition(partition_index, error_code),
+    };
+
+    // The producer's sequence advances only after the insert succeeded, so a failed
+    // insert leaves it in place and the retry is inserted instead of being dropped as a
+    // false duplicate.
+    if let Some(meta) = seq_meta {
+        record_appended_batch(
+            store,
+            meta,
+            topic_id,
+            partition_index,
+            record_count,
+            base_offset,
+        );
+    }
+    appended_partition(store, topic_id, partition_index, base_offset)
+}
+
+/// Why a partition cannot be written, if it cannot: it is outside the topic, or a
+/// transactional producer did not add it to its transaction (AddPartitionsToTxn), which
+/// Kafka answers INVALID_TXN_STATE.
+fn partition_refusal(
+    store: &dyn KafkaStore,
+    topic: TargetTopic,
+    partition_index: i32,
+    transactional_id: Option<&str>,
+) -> Option<i16> {
+    if partition_index < 0 || partition_index >= topic.partition_count {
+        return Some(ERROR_UNKNOWN_TOPIC_OR_PARTITION);
+    }
+    let txn_id = transactional_id?;
+    match store.txn_has_partition(txn_id, topic.id, partition_index) {
+        Ok(true) => None,
+        Ok(false) => Some(ERROR_INVALID_TXN_STATE),
+        Err(e) => Some(e.to_kafka_error_code()),
+    }
+}
+
+/// Insert the records (pending, for a transactional producer): their base offset, or
+/// the partition's error code.
+fn insert_partition_records(
+    store: &dyn KafkaStore,
+    topic_id: i32,
+    partition_index: i32,
+    records: &[Record],
+    producer_metadata: Option<&ProducerMetadata>,
+    transactional_id: Option<&str>,
+) -> std::result::Result<i64, i16> {
+    let inserted = if transactional_id.is_some() {
         match producer_metadata {
             Some(meta) => store.insert_transactional_records(
                 topic_id,
@@ -244,44 +302,44 @@ fn produce_partition(
     } else {
         store.insert_records(topic_id, partition_index, records)
     };
-
-    let base_offset = match insert_result {
-        Ok(base_offset) => base_offset,
-        Err(e) => {
-            if e.is_server_error() {
-                crate::pg_warning!(
-                    "Failed to insert records for topic_id={}, partition={}: {}",
-                    topic_id,
-                    partition_index,
-                    e
-                );
-            }
-            return failed_partition(partition_index, e.to_kafka_error_code());
-        }
-    };
-
-    // The producer's sequence advances only after the insert succeeded, so a failed
-    // insert leaves it in place and the retry is inserted instead of being dropped as a
-    // false duplicate. The batch is remembered with its offset, so a retry is answered
-    // with it.
-    if let Some(meta) = seq_meta {
-        if let Err(e) = store.record_producer_batch(ProducerBatch {
-            producer_id: meta.producer_id,
-            topic_id,
-            partition_id: partition_index,
-            first_sequence: meta.base_sequence,
-            last_sequence: batch_last_sequence(meta.base_sequence, record_count),
-            base_offset,
-        }) {
+    inserted.map_err(|e| {
+        if e.is_server_error() {
             crate::pg_warning!(
-                "Failed to record producer sequence (topic_id={}, partition={}): {}",
+                "Failed to insert records for topic_id={}, partition={}: {}",
                 topic_id,
                 partition_index,
                 e
             );
         }
+        e.to_kafka_error_code()
+    })
+}
+
+/// Remember an appended idempotent batch with its offset, so a retry of it is answered
+/// with that offset. The records are already written, so a failure only logs.
+fn record_appended_batch(
+    store: &dyn KafkaStore,
+    meta: &ProducerMetadata,
+    topic_id: i32,
+    partition_index: i32,
+    record_count: i32,
+    base_offset: i64,
+) {
+    if let Err(e) = store.record_producer_batch(ProducerBatch {
+        producer_id: meta.producer_id,
+        topic_id,
+        partition_id: partition_index,
+        first_sequence: meta.base_sequence,
+        last_sequence: batch_last_sequence(meta.base_sequence, record_count),
+        base_offset,
+    }) {
+        crate::pg_warning!(
+            "Failed to record producer sequence (topic_id={}, partition={}): {}",
+            topic_id,
+            partition_index,
+            e
+        );
     }
-    appended_partition(store, topic_id, partition_index, base_offset)
 }
 
 /// A partition answer for records stored at `base_offset`.
@@ -337,24 +395,6 @@ fn reported_log_start_offset(store: &dyn LogStore, topic_id: i32, partition_id: 
             );
             -1
         })
-}
-
-/// Check that `txn_id` belongs to this producer/epoch and is in the Ongoing state.
-fn validate_ongoing_transaction(
-    store: &dyn TransactionStore,
-    txn_id: &str,
-    meta: &ProducerMetadata,
-) -> Result<()> {
-    store.validate_transaction(txn_id, meta.producer_id, meta.producer_epoch)?;
-    match store.get_transaction_state(txn_id)? {
-        Some(TransactionState::Ongoing) => Ok(()),
-        Some(other) => Err(KafkaError::invalid_txn_state(
-            txn_id,
-            format!("{other:?}"),
-            "Produce",
-        )),
-        None => Err(KafkaError::transactional_id_not_found(txn_id)),
-    }
 }
 
 #[cfg(test)]

@@ -2,7 +2,7 @@
 
 use crate::kafka::constants::{ERROR_NONE, ERROR_UNKNOWN_TOPIC_OR_PARTITION};
 use crate::kafka::error::KafkaError;
-use crate::kafka::storage::TopicStore;
+use crate::kafka::storage::{TopicStore, TransactionState, TransactionStore};
 
 /// Result of resolving a topic name to its ID
 pub enum TopicResolution {
@@ -100,6 +100,27 @@ pub fn topic_resolution_error_code(resolution: &TopicResolution) -> i16 {
         TopicResolution::Found(_) => ERROR_NONE,
         TopicResolution::NotFound => ERROR_UNKNOWN_TOPIC_OR_PARTITION,
         TopicResolution::Error(code) => *code,
+    }
+}
+
+/// Check that `txn_id` belongs to this producer and epoch and is in the Ongoing state;
+/// `api` names the request in the INVALID_TXN_STATE error.
+pub(super) fn validate_ongoing_transaction(
+    store: &dyn TransactionStore,
+    txn_id: &str,
+    producer_id: i64,
+    producer_epoch: i16,
+    api: &str,
+) -> crate::kafka::error::Result<()> {
+    store.validate_transaction(txn_id, producer_id, producer_epoch)?;
+    match store.get_transaction_state(txn_id)? {
+        Some(TransactionState::Ongoing) => Ok(()),
+        Some(other) => Err(KafkaError::invalid_txn_state(
+            txn_id,
+            format!("{other:?}"),
+            api,
+        )),
+        None => Err(KafkaError::transactional_id_not_found(txn_id)),
     }
 }
 
