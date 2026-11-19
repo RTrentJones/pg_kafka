@@ -1,21 +1,8 @@
-// Pending fetch registry for long polling support
-//
-// This module implements a registry for tracking FetchRequest handlers that are
-// waiting for new data. When a ProduceRequest completes, the registry is notified
-// and wakes up any handlers waiting for that topic-partition.
-//
-// ## Thread Safety
-//
-// This module runs entirely in the network thread (tokio runtime). It uses
-// tokio::sync primitives for async-safe access. It does NOT call any pgrx
-// functions and is safe to use from async code.
-//
-// ## Design
-//
-// The registry maps TopicPartitionKey -> Vec<PendingFetch>. When new data arrives
-// for a topic-partition, all waiting fetches are notified via tokio::sync::Notify.
-// The fetch handler then decides whether to re-fetch or continue waiting based on
-// whether min_bytes threshold is met.
+//! Registry of the Fetch long polls waiting for data (network thread only).
+//!
+//! It maps a topic-partition to the long polls waiting on it; a notification from the
+//! DB thread wakes them through their `tokio::sync::Notify`, and each decides whether to
+//! re-fetch. It uses only tokio primitives and never calls pgrx.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -23,9 +10,9 @@ use tokio::sync::{Notify, RwLock};
 
 /// Key for identifying a topic-partition.
 ///
-/// QA-5: keyed by topic **name** (not the internal topic ID) because the FetchRequest handler on
-/// the network thread only has the client-supplied topic name; resolving it to an ID would require
-/// an SPI round-trip on the DB thread. The produce path already has the name, so it travels with the
+/// Keyed by topic **name** (not the internal topic ID) because a Fetch on the network thread
+/// only has the client-supplied topic name; resolving it to an ID would take an SPI round-trip
+/// on the DB thread. The produce path already has the name, so it travels with the
 /// notification (`InternalNotification::NewMessages.topic_name`).
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct TopicPartitionKey {
@@ -185,7 +172,7 @@ impl PendingFetchRegistry {
     #[cfg(test)]
     pub async fn len(&self) -> usize {
         let guard = self.inner.read().await;
-        guard.values().map(|v| v.len()).sum()
+        guard.values().map(Vec::len).sum()
     }
 
     /// Check if registry is empty (for testing/debugging)
@@ -244,7 +231,7 @@ mod tests {
     async fn test_notify_wrong_topic() {
         let registry = PendingFetchRegistry::new();
 
-        // QA-5: the registry is keyed by topic name, so a produce to a different topic must not
+        // The registry is keyed by topic name, so a produce to a different topic must not
         // wake a waiter on this one.
         let notify = Arc::new(Notify::new());
         registry
@@ -382,7 +369,7 @@ mod tests {
             let reg = registry.clone();
             handles.push(tokio::spawn(async move {
                 let notify = Arc::new(Notify::new());
-                reg.register("topic-a", 0, i as i64, notify.clone(), false)
+                reg.register("topic-a", 0, i64::from(i), notify.clone(), false)
                     .await;
                 timeout(Duration::from_millis(500), notify.notified()).await
             }));

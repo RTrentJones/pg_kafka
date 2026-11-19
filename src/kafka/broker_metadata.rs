@@ -1,60 +1,20 @@
-//! Broker metadata for advertised host/port information
+//! The broker's advertised host and port, as Metadata and FindCoordinator responses
+//! report them.
 //!
-//! This module provides the BrokerMetadata struct which eliminates hot-path
-//! string allocations by using Arc<String> for the broker host. This is
-//! particularly important for Metadata and FindCoordinator requests which
-//! previously cloned broker_host on every request (~10,000 allocations/sec
-//! at high throughput).
+//! The host is shared behind an `Arc`, so handing it to every request is a pointer
+//! copy rather than a string allocation on the hot Metadata / FindCoordinator path.
 
 use std::sync::Arc;
 
-/// Broker metadata containing advertised host and port
-///
-/// Uses Arc<String> internally to enable zero-cost cloning of the host
-/// reference across threads and requests. Cloning this struct only copies
-/// a pointer, not the string data.
-///
-/// # Usage
-///
-/// ```rust,ignore
-/// // Create once at startup
-/// let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-///
-/// // Clone for passing to handlers (cheap Arc pointer copy)
-/// let broker_clone = broker.clone();
-///
-/// // Access host without allocation (returns &str)
-/// let host_ref: &str = broker.host();
-/// assert_eq!(host_ref, "localhost");
-///
-/// // Access port (simple copy)
-/// let port: i32 = broker.port();
-/// assert_eq!(port, 9092);
-/// ```
+/// The advertised host and port. Cloning copies a pointer, not the host string.
 #[derive(Clone)]
 pub struct BrokerMetadata {
-    /// Advertised host for clients to connect to
-    ///
-    /// Wrapped in Arc to enable cheap cloning across threads/requests.
-    /// The string is allocated once and shared via reference counting.
     advertised_host: Arc<String>,
-
-    /// Advertised port for clients to connect to
     advertised_port: i32,
 }
 
 impl BrokerMetadata {
-    /// Create new broker metadata
-    ///
-    /// # Arguments
-    /// * `host` - Advertised hostname or IP (e.g., "localhost", "broker.example.com")
-    /// * `port` - Advertised port (typically 9092 for Kafka)
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let broker = BrokerMetadata::new("kafka.example.com".to_string(), 9092);
-    /// ```
+    /// Metadata for `host` (a hostname or IP) and `port`.
     pub fn new(host: String, port: i32) -> Self {
         Self {
             advertised_host: Arc::new(host),
@@ -62,32 +22,12 @@ impl BrokerMetadata {
         }
     }
 
-    /// Get advertised host as string slice (zero allocation)
-    ///
-    /// Returns a reference to the underlying string without any allocation
-    /// or copying. This is the preferred way to access the host for
-    /// constructing responses.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-    /// assert_eq!(broker.host(), "localhost");
-    /// ```
+    /// The advertised host, borrowed.
     pub fn host(&self) -> &str {
         &self.advertised_host
     }
 
-    /// Get advertised port (copy)
-    ///
-    /// Returns the port number as a simple integer copy.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-    /// assert_eq!(broker.port(), 9092);
-    /// ```
+    /// The advertised port.
     pub fn port(&self) -> i32 {
         self.advertised_port
     }

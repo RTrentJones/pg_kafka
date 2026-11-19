@@ -114,8 +114,8 @@ pub enum ScramError {
 impl std::fmt::Display for ScramError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ScramError::Malformed(m) => write!(f, "malformed SCRAM message: {}", m),
-            ScramError::Unsupported(m) => write!(f, "unsupported SCRAM feature: {}", m),
+            ScramError::Malformed(m) => write!(f, "malformed SCRAM message: {m}"),
+            ScramError::Unsupported(m) => write!(f, "unsupported SCRAM feature: {m}"),
             ScramError::InvalidCredentials => write!(f, "invalid credentials"),
         }
     }
@@ -304,7 +304,7 @@ fn fake_credential_secret() -> &'static [u8] {
     SECRET.get_or_init(|| random_bytes(32))
 }
 
-/// What the fake credential of an unknown user looks like on the wire (wave3 net): the
+/// What the fake credential of an unknown user looks like on the wire: the
 /// salt length and iteration count are those most common among the stored credentials
 /// of the mechanism, and the salt is keyed by a durable secret, so it is stable for a
 /// username across worker restarts.
@@ -391,8 +391,8 @@ fn decode_saslname(raw: &str) -> Result<String, ScramError> {
         out.push_str(&rest[..pos]);
         let esc = rest.get(pos..pos + 3);
         match esc {
-            Some("=2C") | Some("=2c") => out.push(','),
-            Some("=3D") | Some("=3d") => out.push('='),
+            Some("=2C" | "=2c") => out.push(','),
+            Some("=3D" | "=3d") => out.push('='),
             _ => return Err(ScramError::Malformed("invalid escape in username")),
         }
         rest = &rest[pos + 3..];
@@ -537,7 +537,7 @@ impl ScramServerState {
         Self::start(mechanism, client_first, credential, fake, server_nonce)
     }
 
-    /// wave3 net: start an exchange with the stored credential, or (unknown user) with
+    /// Start an exchange with the stored credential, or (unknown user) with
     /// `fake`, a fake credential built on the DB thread ([`fake_credential_with`]).
     pub fn start(
         mechanism: ScramMechanism,
@@ -684,7 +684,7 @@ pub(crate) mod tests {
         let client_key = hmac_bytes(mechanism, &salted, b"Client Key");
         let stored_key = hash_bytes(mechanism, &client_key);
         let without_proof = format!("c={},r={}", B64.encode(gs2_header), nonce);
-        let auth_message = format!("{},{},{}", client_first_bare, server_first, without_proof);
+        let auth_message = format!("{client_first_bare},{server_first},{without_proof}");
         let signature = hmac_bytes(mechanism, &stored_key, auth_message.as_bytes());
         let proof: Vec<u8> = client_key
             .iter()
@@ -936,7 +936,7 @@ pub(crate) mod tests {
     #[test]
     fn debug_output_redacts_keys() {
         let cred = ScramCredential::generate(ScramMechanism::Sha256, b"pw", 4096);
-        let s = format!("{:?}", cred);
+        let s = format!("{cred:?}");
         assert!(s.contains("REDACTED"));
         assert!(!s.contains(&format!("{:?}", cred.stored_key)));
     }

@@ -1,71 +1,36 @@
-//! Runtime context for shared configuration and state
+//! The runtime configuration shared by the worker's threads.
 //!
-//! This module provides centralized access to configuration across all Kafka modules,
-//! eliminating redundant Config::load() calls and enabling zero-cost config sharing.
+//! The worker loads the GUCs into a `Config` once and reloads it periodically; every
+//! module reads it through [`RuntimeContext`] instead of calling `Config::load()` itself.
 
 use parking_lot::RwLock;
 use std::sync::Arc;
 
 use crate::config::Config;
 
-/// Global runtime context accessible from any module
+/// The current configuration, replaceable as a whole.
 ///
-/// Provides thread-safe, shared access to configuration with support for
-/// periodic reloading. Uses Arc<Config> internally so that cloning the
-/// config reference is a single pointer copy (zero allocation).
-///
-/// # Thread Safety
-///
-/// Multiple threads can read config concurrently. Reload operations acquire
-/// a write lock briefly to swap the Arc pointer.
-///
-/// # Usage
-///
-/// ```rust,ignore
-/// // Create once at startup
-/// let ctx = Arc::new(RuntimeContext::new(Config::load()));
-///
-/// // Clone Arc for passing to async tasks (cheap pointer copy)
-/// let ctx_clone = ctx.clone();
-///
-/// // Access config (returns Arc<Config>, single pointer copy)
-/// let cfg = ctx.config();
-/// println!("Port: {}", cfg.port);
-///
-/// // Periodic reload (e.g., every 30 seconds)
-/// ctx.reload();
-/// ```
+/// [`config`](Self::config) returns an `Arc<Config>` (a pointer copy); [`reload`](Self::reload)
+/// takes the write lock only to swap that pointer, so readers on any thread never wait
+/// for a GUC read. A reader keeps the configuration it got until it asks again.
 pub struct RuntimeContext {
     config: RwLock<Arc<Config>>,
 }
 
 impl RuntimeContext {
-    /// Create a new runtime context with the given configuration
+    /// A context holding `config`.
     pub fn new(config: Config) -> Self {
         Self {
             config: RwLock::new(Arc::new(config)),
         }
     }
 
-    /// Get current config (cheap Arc clone - single pointer copy)
-    ///
-    /// This is a low-cost operation that returns a reference-counted
-    /// pointer to the current configuration. Multiple callers can hold
-    /// references to the same config instance.
+    /// The current configuration.
     pub fn config(&self) -> Arc<Config> {
         self.config.read().clone()
     }
 
-    /// Reload config from GUCs
-    ///
-    /// This loads fresh configuration from PostgreSQL GUCs and atomically
-    /// swaps the internal Arc pointer. All subsequent calls to config()
-    /// will return the new configuration.
-    ///
-    /// # Note
-    ///
-    /// Existing config references remain valid (Arc keeps them alive) but
-    /// will reference the old configuration values.
+    /// Reload the configuration from the GUCs (DB thread: `Config::load` reads them).
     pub fn reload(&self) {
         let new_config = Config::load();
         *self.config.write() = Arc::new(new_config);

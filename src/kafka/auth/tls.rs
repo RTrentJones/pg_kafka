@@ -9,22 +9,20 @@
 
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 fn read_file(setting: &str, path: &str) -> Result<Vec<u8>, String> {
-    std::fs::read(path).map_err(|e| format!("cannot read {} '{}': {}", setting, path, e))
+    std::fs::read(path).map_err(|e| format!("cannot read {setting} '{path}': {e}"))
 }
 
 fn load_certs(setting: &str, path: &str) -> Result<Vec<CertificateDer<'static>>, String> {
     let pem = read_file(setting, path)?;
     let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&pem)
         .collect::<Result<_, _>>()
-        .map_err(|e| format!("{} '{}': invalid PEM: {}", setting, path, e))?;
+        .map_err(|e| format!("{setting} '{path}': invalid PEM: {e}"))?;
     if certs.is_empty() {
-        return Err(format!(
-            "{} '{}' contains no PEM CERTIFICATE",
-            setting, path
-        ));
+        return Err(format!("{setting} '{path}' contains no PEM CERTIFICATE"));
     }
     Ok(certs)
 }
@@ -42,38 +40,32 @@ pub fn build_server_config(
     let certs = load_certs("pg_kafka.ssl_cert_file", cert_file)?;
     let key_pem = read_file("pg_kafka.ssl_key_file", key_file)?;
     let key = PrivateKeyDer::from_pem_slice(&key_pem).map_err(|e| {
-        format!(
-            "pg_kafka.ssl_key_file '{}': no usable PEM private key ({})",
-            key_file, e
-        )
+        format!("pg_kafka.ssl_key_file '{key_file}': no usable PEM private key ({e})")
     })?;
     let provider = ring_provider();
     let builder = rustls::ServerConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
-        .map_err(|e| format!("TLS configuration: {}", e))?;
+        .map_err(|e| format!("TLS configuration: {e}"))?;
     let builder = match ca_file {
         Some(ca) => {
             let mut roots = rustls::RootCertStore::empty();
             for cert in load_certs("pg_kafka.ssl_ca_file", ca)? {
                 roots
                     .add(cert)
-                    .map_err(|e| format!("pg_kafka.ssl_ca_file '{}': {}", ca, e))?;
+                    .map_err(|e| format!("pg_kafka.ssl_ca_file '{ca}': {e}"))?;
             }
             let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
                 Arc::new(roots),
                 provider,
             )
             .build()
-            .map_err(|e| format!("pg_kafka.ssl_ca_file '{}': {}", ca, e))?;
+            .map_err(|e| format!("pg_kafka.ssl_ca_file '{ca}': {e}"))?;
             builder.with_client_cert_verifier(verifier)
         }
         None => builder.with_no_client_auth(),
     };
     let config = builder.with_single_cert(certs, key).map_err(|e| {
-        format!(
-            "pg_kafka.ssl_cert_file '{}' / pg_kafka.ssl_key_file '{}': {}",
-            cert_file, key_file, e
-        )
+        format!("pg_kafka.ssl_cert_file '{cert_file}' / pg_kafka.ssl_key_file '{key_file}': {e}")
     })?;
     Ok(Arc::new(config))
 }
@@ -104,10 +96,10 @@ fn der_tlv(input: &[u8]) -> Option<(u8, &[u8], &[u8])> {
 
 fn oid_to_string(oid: &[u8]) -> Option<String> {
     let (&first, rest) = oid.split_first()?;
-    let mut parts = vec![(first / 40) as u64, (first % 40) as u64];
+    let mut parts = vec![u64::from(first / 40), u64::from(first % 40)];
     let mut value: u64 = 0;
     for &b in rest {
-        value = value.checked_mul(128)? | (b & 0x7f) as u64;
+        value = value.checked_mul(128)? | u64::from(b & 0x7f);
         if b & 0x80 == 0 {
             parts.push(value);
             value = 0;
@@ -116,7 +108,7 @@ fn oid_to_string(oid: &[u8]) -> Option<String> {
     Some(
         parts
             .iter()
-            .map(|p| p.to_string())
+            .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join("."),
     )
@@ -149,7 +141,7 @@ fn escape_value(v: &str) -> String {
             out.push('\\');
         }
         if c.is_control() {
-            out.push_str(&format!("\\{:02X}", c as u32 & 0xff));
+            let _ = write!(out, "\\{:02X}", u32::from(c) & 0xff);
         } else {
             out.push(c);
         }
@@ -158,7 +150,12 @@ fn escape_value(v: &str) -> String {
 }
 
 fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut out, b| {
+            let _ = write!(out, "{b:02x}");
+            out
+        })
 }
 
 /// Render one AttributeTypeAndValue.
