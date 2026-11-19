@@ -258,6 +258,7 @@ use kafka_test::{
     test_produce_invalid_partition,
     test_produce_large_key,
     test_produce_latency_percentiles,
+    test_produce_response_reports_log_start_offset,
     test_produce_throughput_baseline,
     test_produce_timeout,
     test_produce_two_batches_in_one_partition_is_rejected,
@@ -997,6 +998,12 @@ fn get_all_tests() -> Vec<TestDef> {
             category: "error_paths",
             name: "test_fetch_bad_partition_or_offset_returns_error",
             test_fn: wrap_test!(test_fetch_bad_partition_or_offset_returns_error),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_produce_response_reports_log_start_offset",
+            test_fn: wrap_test!(test_produce_response_reports_log_start_offset),
             parallel_safe: true,
         },
         TestDef {

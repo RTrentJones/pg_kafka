@@ -245,7 +245,8 @@ pub fn handle_produce(
                         partition_response.error_code = ERROR_NONE;
                         partition_response.base_offset = base_offset;
                         partition_response.log_append_time_ms = -1;
-                        partition_response.log_start_offset = -1;
+                        partition_response.log_start_offset =
+                            reported_log_start_offset(store, topic_id, partition_index);
 
                         // RV-8: advance the idempotent producer's sequence only AFTER the
                         // insert has succeeded. If the insert had failed, the sequence
@@ -296,7 +297,8 @@ pub fn handle_produce(
                 partition_response.error_code = ERROR_NONE;
                 partition_response.base_offset = base_offset;
                 partition_response.log_append_time_ms = -1;
-                partition_response.log_start_offset = -1;
+                partition_response.log_start_offset =
+                    reported_log_start_offset(store, topic_id, partition_index);
             }
 
             topic_response.partition_responses.push(partition_response);
@@ -319,6 +321,27 @@ fn produce_error_code(e: &crate::kafka::error::KafkaError) -> i16 {
         }
         _ => e.to_kafka_error_code(),
     }
+}
+
+/// The log start offset a successful partition response reports, as Kafka does. The
+/// records are already written, so a failed lookup does not fail the produce: the
+/// field is then -1, the value Kafka sends when it has none.
+fn reported_log_start_offset(
+    store: &dyn crate::kafka::storage::LogStore,
+    topic_id: i32,
+    partition_id: i32,
+) -> i64 {
+    store
+        .get_log_start_offset(topic_id, partition_id)
+        .unwrap_or_else(|e| {
+            crate::pg_warning!(
+                "Failed to read the log start offset (topic_id={}, partition={}): {}",
+                topic_id,
+                partition_id,
+                e
+            );
+            -1
+        })
 }
 
 /// Check that `txn_id` belongs to this producer/epoch and is in the Ongoing state.
@@ -399,6 +422,7 @@ mod wave3_tests {
     #[test]
     fn transactional_produce_to_an_unregistered_partition_is_refused() {
         let mut mock = MockKafkaStore::new();
+        mock.expect_get_log_start_offset().returning(|_, _| Ok(0));
         mock.expect_validate_transaction()
             .returning(|_, _, _| Ok(()));
         mock.expect_get_transaction_state()
@@ -422,6 +446,68 @@ mod wave3_tests {
                 (0, crate::kafka::constants::ERROR_NONE, 11),
                 (1, crate::kafka::constants::ERROR_INVALID_TXN_STATE, -1)
             ]
+        );
+    }
+
+    /// Kafka reports the partition's log start offset on a successful produce, for an
+    /// appended batch and for a retried duplicate alike.
+    #[test]
+    fn successful_produce_reports_the_log_start_offset() {
+        let mut mock = MockKafkaStore::new();
+        mock.expect_get_or_create_topic()
+            .returning(|_, _| Ok((1, 2)));
+        mock.expect_check_and_update_sequence()
+            .returning(|_, _, _, partition, _, _| {
+                Ok(if partition == 0 {
+                    SequenceCheck::Append
+                } else {
+                    SequenceCheck::Duplicate { base_offset: 3 }
+                })
+            });
+        mock.expect_insert_records().returning(|_, _, _| Ok(11));
+        mock.expect_record_producer_batch().returning(|_| Ok(()));
+        mock.expect_get_log_start_offset()
+            .returning(|_, partition| Ok(5 + i64::from(partition)));
+        let coordinator = GroupCoordinator::new();
+        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+        let response = handle_produce(&ctx, request(&[0, 1]), Some(&meta()), None).unwrap();
+        let mut got: Vec<(i32, i16, i64, i64)> = response.responses[0]
+            .partition_responses
+            .iter()
+            .map(|p| (p.index, p.error_code, p.base_offset, p.log_start_offset))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                (0, crate::kafka::constants::ERROR_NONE, 11, 5),
+                (1, crate::kafka::constants::ERROR_NONE, 3, 6)
+            ]
+        );
+    }
+
+    /// A failed log-start lookup after the records are written leaves the produce
+    /// successful and reports -1.
+    #[test]
+    fn log_start_lookup_failure_keeps_the_produce_successful() {
+        let mut mock = MockKafkaStore::new();
+        mock.expect_get_or_create_topic()
+            .returning(|_, _| Ok((1, 1)));
+        mock.expect_check_and_update_sequence()
+            .returning(|_, _, _, _, _, _| Ok(SequenceCheck::Append));
+        mock.expect_insert_records().returning(|_, _, _| Ok(4));
+        mock.expect_record_producer_batch().returning(|_| Ok(()));
+        mock.expect_get_log_start_offset()
+            .returning(|_, _| Err(KafkaError::Internal("boom".into())));
+        let coordinator = GroupCoordinator::new();
+        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+        let response = handle_produce(&ctx, request(&[0]), Some(&meta()), None).unwrap();
+        let p = &response.responses[0].partition_responses[0];
+        assert_eq!(
+            (p.error_code, p.base_offset, p.log_start_offset),
+            (crate::kafka::constants::ERROR_NONE, 4, -1)
         );
     }
 

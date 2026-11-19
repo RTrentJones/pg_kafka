@@ -25,6 +25,7 @@ mod tests {
     #[test]
     fn test_handle_produce_success() {
         let mut mock = MockKafkaStore::new();
+        mock.expect_get_log_start_offset().returning(|_, _| Ok(0));
 
         // Expect topic lookup - now returns (topic_id, partition_count) in single call
         mock.expect_get_or_create_topic()
@@ -229,6 +230,7 @@ mod tests {
         // partition_index == -1 routes each record by key via compute_partition
         // and produces to the resolved partitions (produce.rs routing branch).
         let mut mock = MockKafkaStore::new();
+        mock.expect_get_log_start_offset().returning(|_, _| Ok(0));
         mock.expect_get_or_create_topic()
             .returning(|_, _| Ok((1, 3)));
         mock.expect_insert_records().returning(|_, _, _| Ok(0));
@@ -1286,6 +1288,7 @@ mod tests {
     #[test]
     fn test_handle_produce_with_idempotent_producer_success() {
         let mut mock = MockKafkaStore::new();
+        mock.expect_get_log_start_offset().returning(|_, _| Ok(0));
 
         // Expect topic lookup
         mock.expect_get_or_create_topic()
@@ -1390,6 +1393,7 @@ mod tests {
     #[test]
     fn test_handle_produce_duplicate_sequence_rejected() {
         let mut mock = MockKafkaStore::new();
+        mock.expect_get_log_start_offset().returning(|_, _| Ok(0));
 
         mock.expect_get_or_create_topic()
             .returning(|_, _| Ok((1, 1)));
@@ -1486,6 +1490,7 @@ mod tests {
     #[test]
     fn test_handle_produce_non_idempotent_skips_validation() {
         let mut mock = MockKafkaStore::new();
+        mock.expect_get_log_start_offset().returning(|_, _| Ok(0));
 
         mock.expect_get_or_create_topic()
             .returning(|_, _| Ok((1, 1)));
@@ -2514,6 +2519,7 @@ mod bug_hunt_regressions {
     #[test]
     fn idempotent_produce_uses_each_partitions_own_sequence() {
         let mut mock = MockKafkaStore::new();
+        mock.expect_get_log_start_offset().returning(|_, _| Ok(0));
         mock.expect_get_or_create_topic()
             .returning(|_, _| Ok((1, 2)));
         mock.expect_check_and_update_sequence()
@@ -2608,6 +2614,7 @@ mod bug_hunt_regressions {
     #[test]
     fn non_idempotent_produce_to_partition_minus_one_still_routes() {
         let mut mock = MockKafkaStore::new();
+        mock.expect_get_log_start_offset().returning(|_, _| Ok(0));
         mock.expect_get_or_create_topic()
             .returning(|_, _| Ok((1, 2)));
         mock.expect_insert_records().returning(|_, _, _| Ok(0));
