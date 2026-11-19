@@ -99,7 +99,7 @@ pub(crate) use guc_flags;
 /// [vis] fn register_x;
 ///
 /// /// docs of the static
-/// [vis] int|bool|string STATIC = default => c"pg_kafka.name" {
+/// [vis] int|bool|string STATIC = default => c"<guc name>" {
 ///     short: c"...", long: c"...", context: Postmaster|Sighup|...,
 ///     range: (min, max),   // int only
 ///     flags: GucFlags::..., // optional, default GucFlags::default()
