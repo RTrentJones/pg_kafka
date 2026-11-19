@@ -484,79 +484,14 @@ fn delete_expired_rows(
             if pass_start.elapsed() >= RETENTION_PASS_BUDGET {
                 break 'work;
             }
-            let table = if !partitioned {
-                client.update(
-                    "DELETE FROM kafka.messages
-                     WHERE ctid IN (
-                         SELECT d.ctid FROM kafka.messages d
-                         WHERE d.topic_id = $1
-                           AND d.created_at < NOW() - $2::bigint * INTERVAL '1 millisecond'
-                           AND (d.txn_state IS NULL OR d.txn_state <> 'pending')
-                         LIMIT $3
-                     )
-                     RETURNING topic_id, partition_id",
-                    None,
-                    &[
-                        item.topic_id.into(),
-                        item.window_ms.into(),
-                        RETENTION_DELETE_BATCH.into(),
-                    ],
-                )?
+            let target = if !partitioned {
+                DeleteTarget::Unpartitioned
             } else if Some(item.leaf_oid) == default_oid {
-                client.update(
-                    "DELETE FROM kafka.messages_default
-                     WHERE ctid IN (
-                         SELECT d.ctid FROM kafka.messages_default d
-                         WHERE d.topic_id = $1
-                           AND d.created_at < NOW() - $2::bigint * INTERVAL '1 millisecond'
-                           AND (d.txn_state IS NULL OR d.txn_state <> 'pending')
-                         LIMIT $3
-                     )
-                     RETURNING topic_id, partition_id",
-                    None,
-                    &[
-                        item.topic_id.into(),
-                        item.window_ms.into(),
-                        RETENTION_DELETE_BATCH.into(),
-                    ],
-                )?
+                DeleteTarget::DefaultLeaf
             } else {
-                let leaf = leaves.iter().find(|l| l.partition.oid == item.leaf_oid);
-                let lower = leaf.and_then(|l| l.lower_txt.clone());
-                let upper = leaf.and_then(|l| l.upper_txt.clone());
-                client.update(
-                    "DELETE FROM kafka.messages
-                     WHERE created_at >= COALESCE($4::text::timestamptz, '-infinity')
-                       AND created_at < COALESCE($5::text::timestamptz, 'infinity')
-                       AND tableoid = $6::bigint::oid
-                       AND ctid = ANY (ARRAY(
-                           SELECT m.ctid FROM kafka.messages m
-                           WHERE m.created_at >= COALESCE($4::text::timestamptz, '-infinity')
-                             AND m.created_at < COALESCE($5::text::timestamptz, 'infinity')
-                             AND m.tableoid = $6::bigint::oid
-                             AND m.topic_id = $1
-                             AND m.created_at < NOW() - $2::bigint * INTERVAL '1 millisecond'
-                             AND (m.txn_state IS NULL OR m.txn_state <> 'pending')
-                           LIMIT $3))
-                     RETURNING topic_id, partition_id",
-                    None,
-                    &[
-                        item.topic_id.into(),
-                        item.window_ms.into(),
-                        RETENTION_DELETE_BATCH.into(),
-                        lower.into(),
-                        upper.into(),
-                        i64::from(item.leaf_oid).into(),
-                    ],
-                )?
+                DeleteTarget::Leaf(leaves.iter().find(|l| l.partition.oid == item.leaf_oid))
             };
-            let mut deleted = 0u64;
-            for row in table {
-                deleted += 1;
-                let topic_id: i32 = row.get_by_name("topic_id")?.unwrap_or(0);
-                let partition_id: i32 = row.get_by_name("partition_id")?.unwrap_or(0);
-                affected.insert((topic_id, partition_id));
-            }
+            let deleted = delete_expired_batch(client, item, target, affected)?;
             expired += deleted;
             if !retention::should_run_another_batch(
                 deleted,
@@ -569,6 +504,102 @@ fn delete_expired_rows(
         }
     }
     Ok(expired)
+}
+
+/// Where one batch of row deletes runs.
+#[derive(Clone, Copy)]
+enum DeleteTarget<'a> {
+    /// `kafka.messages` is a plain table.
+    Unpartitioned,
+    /// `kafka.messages_default`, directly.
+    DefaultLeaf,
+    /// One time leaf, through the parent (its bounds and tableoid; `None` when the
+    /// leaf is not in the listing, which leaves the bounds open).
+    Leaf(Option<&'a Leaf>),
+}
+
+/// Delete one batch of at most [`RETENTION_DELETE_BATCH`] of `item`'s expired rows
+/// from `target`, record the partitions they came from, and return how many were
+/// deleted.
+fn delete_expired_batch(
+    client: &mut SpiClient<'_>,
+    item: &ExpiryWork,
+    target: DeleteTarget<'_>,
+    affected: &mut AffectedPartitions,
+) -> Result<u64> {
+    let table = match target {
+        DeleteTarget::Unpartitioned => client.update(
+            "DELETE FROM kafka.messages
+             WHERE ctid IN (
+                 SELECT d.ctid FROM kafka.messages d
+                 WHERE d.topic_id = $1
+                   AND d.created_at < NOW() - $2::bigint * INTERVAL '1 millisecond'
+                   AND (d.txn_state IS NULL OR d.txn_state <> 'pending')
+                 LIMIT $3
+             )
+             RETURNING topic_id, partition_id",
+            None,
+            &[
+                item.topic_id.into(),
+                item.window_ms.into(),
+                RETENTION_DELETE_BATCH.into(),
+            ],
+        )?,
+        DeleteTarget::DefaultLeaf => client.update(
+            "DELETE FROM kafka.messages_default
+             WHERE ctid IN (
+                 SELECT d.ctid FROM kafka.messages_default d
+                 WHERE d.topic_id = $1
+                   AND d.created_at < NOW() - $2::bigint * INTERVAL '1 millisecond'
+                   AND (d.txn_state IS NULL OR d.txn_state <> 'pending')
+                 LIMIT $3
+             )
+             RETURNING topic_id, partition_id",
+            None,
+            &[
+                item.topic_id.into(),
+                item.window_ms.into(),
+                RETENTION_DELETE_BATCH.into(),
+            ],
+        )?,
+        DeleteTarget::Leaf(leaf) => {
+            let lower = leaf.and_then(|l| l.lower_txt.clone());
+            let upper = leaf.and_then(|l| l.upper_txt.clone());
+            client.update(
+                "DELETE FROM kafka.messages
+                 WHERE created_at >= COALESCE($4::text::timestamptz, '-infinity')
+                   AND created_at < COALESCE($5::text::timestamptz, 'infinity')
+                   AND tableoid = $6::bigint::oid
+                   AND ctid = ANY (ARRAY(
+                       SELECT m.ctid FROM kafka.messages m
+                       WHERE m.created_at >= COALESCE($4::text::timestamptz, '-infinity')
+                         AND m.created_at < COALESCE($5::text::timestamptz, 'infinity')
+                         AND m.tableoid = $6::bigint::oid
+                         AND m.topic_id = $1
+                         AND m.created_at < NOW() - $2::bigint * INTERVAL '1 millisecond'
+                         AND (m.txn_state IS NULL OR m.txn_state <> 'pending')
+                       LIMIT $3))
+                 RETURNING topic_id, partition_id",
+                None,
+                &[
+                    item.topic_id.into(),
+                    item.window_ms.into(),
+                    RETENTION_DELETE_BATCH.into(),
+                    lower.into(),
+                    upper.into(),
+                    i64::from(item.leaf_oid).into(),
+                ],
+            )?
+        }
+    };
+    let mut deleted = 0u64;
+    for row in table {
+        deleted += 1;
+        let topic_id: i32 = row.get_by_name("topic_id")?.unwrap_or(0);
+        let partition_id: i32 = row.get_by_name("partition_id")?.unwrap_or(0);
+        affected.insert((topic_id, partition_id));
+    }
+    Ok(deleted)
 }
 
 /// Drop the planned leaves (each re-checked under its lock by

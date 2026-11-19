@@ -16,6 +16,7 @@ use crate::kafka::storage::{
     MAX_TIMESTAMP,
 };
 use pgrx::prelude::*;
+use pgrx::spi::SpiClient;
 
 /// The log-end offset of one partition (`$1` topic, `$2` partition): the next offset
 /// Produce assigns, which is also the high watermark.
@@ -78,6 +79,132 @@ pub(super) struct TxnStamp {
     pub(super) producer_epoch: i16,
 }
 
+/// The per-row columns of one append, as parallel arrays for a single UNNEST insert:
+/// type-safe, and no SQL is built from data.
+#[derive(Debug, PartialEq)]
+struct MessageColumns<'a> {
+    offsets: Vec<i64>,
+    keys: Vec<Option<Vec<u8>>>,
+    values: Vec<Option<Vec<u8>>>,
+    headers: Vec<String>,
+    timestamps: Vec<i64>,
+    producer_ids: Vec<Option<i64>>,
+    producer_epochs: Vec<Option<i16>>,
+    txn_states: Vec<Option<&'a str>>,
+}
+
+impl MessageColumns<'_> {
+    /// The columns of `records` at offsets `base_offset..base_offset + count`
+    /// (`count` is `records.len()`), stamped with `txn`'s producer and
+    /// `txn_state = 'pending'` when it is a transactional batch.
+    fn new(records: &[Record], base_offset: i64, count: i64, txn: Option<TxnStamp>) -> Self {
+        let n = records.len();
+        Self {
+            offsets: (base_offset..base_offset + count).collect(),
+            keys: records.iter().map(|r| r.key.clone()).collect(),
+            values: records.iter().map(|r| r.value.clone()).collect(),
+            headers: records
+                .iter()
+                .map(|r| {
+                    encode_headers_json(
+                        r.headers
+                            .iter()
+                            .map(|h| (h.key.as_str(), h.value.as_slice())),
+                    )
+                })
+                .collect(),
+            // BUG-7: the producer's record timestamp is stored verbatim.
+            timestamps: records
+                .iter()
+                .map(|r| r.timestamp.unwrap_or(NO_TIMESTAMP))
+                .collect(),
+            producer_ids: vec![txn.map(|t| t.producer_id); n],
+            producer_epochs: vec![txn.map(|t| t.producer_epoch); n],
+            txn_states: vec![txn.map(|_| "pending"); n],
+        }
+    }
+}
+
+/// Take the partition's append lock and read its log-end offset, the base offset of
+/// the next append.
+///
+/// DR-13: every extension write runs on the single DB thread, so this lock is
+/// uncontended there; it guards the read-then-insert offset assignment against
+/// out-of-band writers (direct SQL inserts).
+fn lock_and_read_log_end(client: &SpiClient<'_>, topic_id: i32, partition_id: i32) -> Result<i64> {
+    client.select(
+        "SELECT pg_advisory_xact_lock($1, $2)",
+        None,
+        &[topic_id.into(), partition_id.into()],
+    )?;
+    Ok(select_cached(
+        client,
+        LOG_END_OFFSET_SQL,
+        &[INT4OID, INT4OID],
+        &[topic_id.into(), partition_id.into()],
+    )?
+    .first()
+    .get_by_name("log_end_offset")?
+    .unwrap_or(0))
+}
+
+/// Insert one append's rows into `kafka.messages`.
+fn insert_message_rows(
+    client: &mut SpiClient<'_>,
+    topic_id: i32,
+    partition_id: i32,
+    columns: MessageColumns<'_>,
+) -> Result<()> {
+    client
+        .update(
+            "INSERT INTO kafka.messages (topic_id, partition_id, partition_offset, key, value,
+                                         headers, producer_id, producer_epoch, txn_state,
+                                         timestamp_ms)
+             SELECT $1, $2, u.partition_offset, u.key, u.value, u.headers, u.producer_id,
+                    u.producer_epoch, u.txn_state, u.timestamp_ms
+             FROM unnest($3::bigint[], $4::bytea[], $5::bytea[], $6::jsonb[], $7::bigint[],
+                         $8::smallint[], $9::text[], $10::bigint[])
+                  AS u(partition_offset, key, value, headers, producer_id, producer_epoch,
+                       txn_state, timestamp_ms)",
+            None,
+            &[
+                topic_id.into(),
+                partition_id.into(),
+                columns.offsets.into(),
+                columns.keys.into(),
+                columns.values.into(),
+                columns.headers.into(),
+                columns.producer_ids.into(),
+                columns.producer_epochs.into(),
+                columns.txn_states.into(),
+                columns.timestamps.into(),
+            ],
+        )
+        .map_err(|e| KafkaError::Internal(format!("Failed to insert records: {e}")))?;
+    Ok(())
+}
+
+/// Advance the partition's offset counter to `next_offset` (it never moves back).
+fn advance_next_offset(
+    client: &mut SpiClient<'_>,
+    topic_id: i32,
+    partition_id: i32,
+    next_offset: i64,
+) -> Result<()> {
+    client
+        .update(
+            "INSERT INTO kafka.partition_offsets (topic_id, partition_id, next_offset)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (topic_id, partition_id) DO UPDATE
+                 SET next_offset = GREATEST(kafka.partition_offsets.next_offset,
+                                            EXCLUDED.next_offset)",
+            None,
+            &[topic_id.into(), partition_id.into(), next_offset.into()],
+        )
+        .map_err(|e| KafkaError::Internal(format!("Failed to advance partition offset: {e}")))?;
+    Ok(())
+}
+
 impl PostgresStore {
     /// Append `records` to a partition and return the base offset; shared by plain and
     /// transactional produce (DR-24) so the offset assignment exists once. `txn`
@@ -95,93 +222,12 @@ impl PostgresStore {
             .map_err(|_| KafkaError::Internal("record batch too large".into()))?;
 
         Spi::connect_mut(|client| {
-            // DR-13: every extension write runs on the single DB thread, so this lock is
-            // uncontended there; it guards the read-then-insert offset assignment below
-            // against out-of-band writers (direct SQL inserts).
-            client.select(
-                "SELECT pg_advisory_xact_lock($1, $2)",
-                None,
-                &[topic_id.into(), partition_id.into()],
-            )?;
-
-            let base_offset: i64 = select_cached(
-                client,
-                LOG_END_OFFSET_SQL,
-                &[INT4OID, INT4OID],
-                &[topic_id.into(), partition_id.into()],
-            )?
-            .first()
-            .get_by_name("log_end_offset")?
-            .unwrap_or(0);
+            let base_offset = lock_and_read_log_end(client, topic_id, partition_id)?;
             crate::pg_debug!("Assigning base_offset={base_offset}");
 
-            // Parallel arrays for one UNNEST insert: type-safe, no SQL built from data.
-            let n = records.len();
-            let offsets: Vec<i64> = (base_offset..base_offset + count).collect();
-            let keys: Vec<Option<Vec<u8>>> = records.iter().map(|r| r.key.clone()).collect();
-            let values: Vec<Option<Vec<u8>>> = records.iter().map(|r| r.value.clone()).collect();
-            let headers: Vec<String> = records
-                .iter()
-                .map(|r| {
-                    encode_headers_json(
-                        r.headers.iter().map(|h| (h.key.as_str(), h.value.as_slice())),
-                    )
-                })
-                .collect();
-            // BUG-7: the producer's record timestamp is stored verbatim.
-            let timestamps: Vec<i64> = records
-                .iter()
-                .map(|r| r.timestamp.unwrap_or(NO_TIMESTAMP))
-                .collect();
-            let producer_ids: Vec<Option<i64>> = vec![txn.map(|t| t.producer_id); n];
-            let producer_epochs: Vec<Option<i16>> = vec![txn.map(|t| t.producer_epoch); n];
-            let txn_states: Vec<Option<&str>> = vec![txn.map(|_| "pending"); n];
-
-            client
-                .update(
-                    "INSERT INTO kafka.messages (topic_id, partition_id, partition_offset, key, value,
-                                                 headers, producer_id, producer_epoch, txn_state,
-                                                 timestamp_ms)
-                     SELECT $1, $2, u.partition_offset, u.key, u.value, u.headers, u.producer_id,
-                            u.producer_epoch, u.txn_state, u.timestamp_ms
-                     FROM unnest($3::bigint[], $4::bytea[], $5::bytea[], $6::jsonb[], $7::bigint[],
-                                 $8::smallint[], $9::text[], $10::bigint[])
-                          AS u(partition_offset, key, value, headers, producer_id, producer_epoch,
-                               txn_state, timestamp_ms)",
-                    None,
-                    &[
-                        topic_id.into(),
-                        partition_id.into(),
-                        offsets.into(),
-                        keys.into(),
-                        values.into(),
-                        headers.into(),
-                        producer_ids.into(),
-                        producer_epochs.into(),
-                        txn_states.into(),
-                        timestamps.into(),
-                    ],
-                )
-                .map_err(|e| KafkaError::Internal(format!("Failed to insert records: {e}")))?;
-
-            // Advance the counter past these offsets (it never moves back).
-            client
-                .update(
-                    "INSERT INTO kafka.partition_offsets (topic_id, partition_id, next_offset)
-                     VALUES ($1, $2, $3)
-                     ON CONFLICT (topic_id, partition_id) DO UPDATE
-                         SET next_offset = GREATEST(kafka.partition_offsets.next_offset,
-                                                    EXCLUDED.next_offset)",
-                    None,
-                    &[
-                        topic_id.into(),
-                        partition_id.into(),
-                        (base_offset + count).into(),
-                    ],
-                )
-                .map_err(|e| {
-                    KafkaError::Internal(format!("Failed to advance partition offset: {e}"))
-                })?;
+            let columns = MessageColumns::new(records, base_offset, count, txn);
+            insert_message_rows(client, topic_id, partition_id, columns)?;
+            advance_next_offset(client, topic_id, partition_id, base_offset + count)?;
 
             crate::pg_debug!(
                 "Inserted {count} records (offsets {base_offset} to {}, txn={})",
@@ -563,5 +609,66 @@ impl PostgresStore {
                 .unwrap_or(before_offset))
         })
         .map_err(internal("delete_records_before"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MessageColumns, TxnStamp, NO_TIMESTAMP};
+    use crate::kafka::messages::{Record, RecordHeader};
+    use crate::kafka::storage::encode_headers_json;
+
+    fn records() -> Vec<Record> {
+        vec![
+            Record {
+                key: Some(b"k".to_vec()),
+                value: Some(b"v".to_vec()),
+                headers: vec![RecordHeader {
+                    key: "h".into(),
+                    value: b"x".to_vec(),
+                }],
+                timestamp: Some(1_700_000_000_000),
+            },
+            Record {
+                key: None,
+                value: None,
+                headers: Vec::new(),
+                timestamp: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn message_columns_of_a_plain_batch() {
+        let columns = MessageColumns::new(&records(), 40, 2, None);
+        assert_eq!(columns.offsets, [40, 41]);
+        assert_eq!(columns.keys, [Some(b"k".to_vec()), None]);
+        assert_eq!(columns.values, [Some(b"v".to_vec()), None]);
+        assert_eq!(
+            columns.headers,
+            [
+                encode_headers_json([("h", b"x".as_slice())].into_iter()),
+                encode_headers_json(std::iter::empty())
+            ]
+        );
+        // A record without a timestamp is stored as NO_TIMESTAMP (the fetch path then
+        // reports the insert time).
+        assert_eq!(columns.timestamps, [1_700_000_000_000, NO_TIMESTAMP]);
+        assert_eq!(columns.producer_ids, [None, None]);
+        assert_eq!(columns.producer_epochs, [None, None]);
+        assert_eq!(columns.txn_states, [None, None]);
+    }
+
+    #[test]
+    fn message_columns_of_a_transactional_batch_are_stamped_pending() {
+        let txn = TxnStamp {
+            producer_id: 7,
+            producer_epoch: 3,
+        };
+        let columns = MessageColumns::new(&records(), 0, 2, Some(txn));
+        assert_eq!(columns.offsets, [0, 1]);
+        assert_eq!(columns.producer_ids, [Some(7), Some(7)]);
+        assert_eq!(columns.producer_epochs, [Some(3), Some(3)]);
+        assert_eq!(columns.txn_states, [Some("pending"), Some("pending")]);
     }
 }

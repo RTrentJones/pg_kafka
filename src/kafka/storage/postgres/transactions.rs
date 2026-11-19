@@ -105,6 +105,78 @@ fn clear_finished_txn_partitions(
     Ok(())
 }
 
+/// Re-initialize an existing transactional id: abort what its previous epoch left in
+/// flight, then move it to its next epoch (which fences that producer). Returns the
+/// new `(producer_id, epoch)`.
+///
+/// RV-2: InitProducerId aborts any transaction still in flight for the
+/// transactional id (the producer crash-restart path). Otherwise the old epoch's
+/// pending records would be stranded: commit/abort filter on the new epoch, the
+/// timeout sweep only scans Ongoing transactions and cleanup only touches aborted
+/// rows, so nothing would reclaim them and the last stable offset would stay pinned
+/// (a hanging transaction).
+fn fence_previous_epoch(
+    client: &mut SpiClient<'_>,
+    transactional_id: &str,
+    producer_id: i64,
+    old_epoch: i16,
+) -> Result<(i64, i16)> {
+    client.update(
+        "UPDATE kafka.messages SET txn_state = 'aborted'
+         WHERE producer_id = $1 AND producer_epoch = $2 AND txn_state = 'pending'",
+        None,
+        &[producer_id.into(), old_epoch.into()],
+    )?;
+    client.update(
+        "DELETE FROM kafka.txn_pending_offsets WHERE transactional_id = $1",
+        None,
+        &[transactional_id.into()],
+    )?;
+    // The aborted transaction's partition registry goes with it.
+    client.update(
+        "DELETE FROM kafka.txn_partitions WHERE transactional_id = $1",
+        None,
+        &[transactional_id.into()],
+    )?;
+    clear_producer_sequences(client, producer_id)?;
+
+    let (new_producer_id, new_epoch) = bump_producer_epoch(client, producer_id, old_epoch)?;
+    crate::pg_debug!(
+        "Existing transactional producer_id={producer_id} -> producer_id={new_producer_id}, new_epoch={new_epoch}"
+    );
+    Ok((new_producer_id, new_epoch))
+}
+
+/// Point a transactional id's `kafka.transactions` row at `owner` and reset it to
+/// Empty with `timeout_ms` (inserting it for a new transactional id).
+fn reset_transaction_row(
+    client: &mut SpiClient<'_>,
+    transactional_id: &str,
+    owner: TxnStamp,
+    timeout_ms: i32,
+) -> Result<()> {
+    client.update(
+        "INSERT INTO kafka.transactions (transactional_id, producer_id, producer_epoch,
+                                         state, timeout_ms)
+         VALUES ($1, $2, $3, 'Empty', $4)
+         ON CONFLICT (transactional_id) DO UPDATE
+             SET producer_id = EXCLUDED.producer_id,
+                 producer_epoch = EXCLUDED.producer_epoch,
+                 state = 'Empty',
+                 timeout_ms = EXCLUDED.timeout_ms,
+                 started_at = NULL,
+                 last_updated_at = NOW()",
+        None,
+        &[
+            transactional_id.into(),
+            owner.producer_id.into(),
+            owner.producer_epoch.into(),
+            timeout_ms.into(),
+        ],
+    )?;
+    Ok(())
+}
+
 impl PostgresStore {
     /// End an Ongoing transaction (shared by commit and abort): its pending rows
     /// become visible (`txn_state = NULL`) or `'aborted'`, a commit moves its pending
@@ -221,60 +293,18 @@ impl PostgresStore {
                 let row = existing.first();
                 let producer_id: i64 = row.get_by_name("producer_id")?.unwrap_or(0);
                 let old_epoch: i16 = row.get_by_name("epoch")?.unwrap_or(0);
-
-                // RV-2: InitProducerId aborts any transaction still in flight for the
-                // transactional id (the producer crash-restart path). Otherwise the old
-                // epoch's pending records would be stranded: commit/abort filter on the
-                // new epoch, the timeout sweep only scans Ongoing transactions and
-                // cleanup only touches aborted rows, so nothing would reclaim them and
-                // the last stable offset would stay pinned (a hanging transaction).
-                client.update(
-                    "UPDATE kafka.messages SET txn_state = 'aborted'
-                     WHERE producer_id = $1 AND producer_epoch = $2 AND txn_state = 'pending'",
-                    None,
-                    &[producer_id.into(), old_epoch.into()],
-                )?;
-                client.update(
-                    "DELETE FROM kafka.txn_pending_offsets WHERE transactional_id = $1",
-                    None,
-                    &[transactional_id.into()],
-                )?;
-                // The aborted transaction's partition registry goes with it.
-                client.update(
-                    "DELETE FROM kafka.txn_partitions WHERE transactional_id = $1",
-                    None,
-                    &[transactional_id.into()],
-                )?;
-                clear_producer_sequences(client, producer_id)?;
-
-                let (new_producer_id, new_epoch) =
-                    bump_producer_epoch(client, producer_id, old_epoch)?;
-                crate::pg_debug!(
-                    "Existing transactional producer_id={producer_id} -> producer_id={new_producer_id}, new_epoch={new_epoch}"
-                );
-                (new_producer_id, new_epoch)
+                fence_previous_epoch(client, transactional_id, producer_id, old_epoch)?
             };
 
-            client.update(
-                "INSERT INTO kafka.transactions (transactional_id, producer_id, producer_epoch,
-                                                 state, timeout_ms)
-                 VALUES ($1, $2, $3, 'Empty', $4)
-                 ON CONFLICT (transactional_id) DO UPDATE
-                     SET producer_id = EXCLUDED.producer_id,
-                         producer_epoch = EXCLUDED.producer_epoch,
-                         state = 'Empty',
-                         timeout_ms = EXCLUDED.timeout_ms,
-                         started_at = NULL,
-                         last_updated_at = NOW()",
-                None,
-                &[
-                    transactional_id.into(),
-                    producer_id.into(),
-                    epoch.into(),
-                    transaction_timeout_ms.into(),
-                ],
+            reset_transaction_row(
+                client,
+                transactional_id,
+                TxnStamp {
+                    producer_id,
+                    producer_epoch: epoch,
+                },
+                transaction_timeout_ms,
             )?;
-
             Ok((producer_id, epoch))
         })
         .map_err(internal("get_or_create_transactional_producer"))

@@ -79,6 +79,24 @@ pub fn next_sequence(last_sequence: Option<i32>) -> i32 {
     }
 }
 
+/// The partition's last sequence as stored in `kafka.producer_sequences`: a negative
+/// value records no sequence.
+pub fn stored_last_sequence(stored: Option<i32>) -> Option<i32> {
+    stored.filter(|s| *s >= 0)
+}
+
+/// Whether a transactional producer's batch carries a stale epoch. A transactional
+/// producer's epoch is owned by its transactional id (InitProducerId); it never bumps
+/// it itself, so any epoch but `current_epoch` is stale. An idempotent producer's
+/// epoch is judged by [`validate_sequence`] instead.
+pub fn transactional_epoch_is_stale(
+    transactional: bool,
+    producer_epoch: i16,
+    current_epoch: i16,
+) -> bool {
+    transactional && producer_epoch != current_epoch
+}
+
 /// Validate an idempotent producer batch, following Kafka's producer state model
 /// (`ProducerStateManager`/`ProducerAppendInfo`):
 ///
@@ -147,7 +165,10 @@ pub fn validate_sequence(
 
 #[cfg(test)]
 mod tests {
-    use super::{batch_last_sequence, validate_sequence, CachedBatch, SequenceValidation};
+    use super::{
+        batch_last_sequence, stored_last_sequence, transactional_epoch_is_stale, validate_sequence,
+        CachedBatch, SequenceValidation,
+    };
 
     fn proceed(last: i32) -> SequenceValidation {
         SequenceValidation::Proceed {
@@ -284,5 +305,24 @@ mod tests {
             validate_sequence(0, Some(1), &wrapped, 0, i32::MAX - 1, 4),
             SequenceValidation::Duplicate { base_offset: 99 }
         );
+    }
+
+    #[test]
+    fn test_stored_last_sequence_negative_is_none() {
+        assert_eq!(stored_last_sequence(None), None);
+        assert_eq!(stored_last_sequence(Some(-1)), None);
+        assert_eq!(stored_last_sequence(Some(0)), Some(0));
+        assert_eq!(stored_last_sequence(Some(i32::MAX)), Some(i32::MAX));
+    }
+
+    #[test]
+    fn test_transactional_epoch_is_stale() {
+        // A transactional producer must present exactly its current epoch ...
+        assert!(!transactional_epoch_is_stale(true, 3, 3));
+        assert!(transactional_epoch_is_stale(true, 2, 3));
+        assert!(transactional_epoch_is_stale(true, 4, 3));
+        // ... an idempotent one is left to validate_sequence (it may bump its epoch).
+        assert!(!transactional_epoch_is_stale(false, 2, 3));
+        assert!(!transactional_epoch_is_stale(false, 4, 3));
     }
 }
