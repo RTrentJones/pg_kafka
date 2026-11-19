@@ -12,7 +12,7 @@
 \echo Use "ALTER EXTENSION pg_kafka UPDATE TO '0.1.0'" to load this file. \quit
 
 -- Take the pg_kafka schema lock first. Every transaction of a running
--- background worker holds it in SHARE mode (src/worker.rs, SCHEMA_LOCK_KEY), so this
+-- background worker holds it in SHARE mode (src/worker/txn.rs, SCHEMA_LOCK_KEY), so this
 -- waits for the worker's current transaction and keeps new ones out until the upgrade
 -- commits: the script's DDL never meets a worker transaction holding some of the same
 -- tables in another order (lock-order deadlocks). Every upgrade script must start so.
