@@ -312,6 +312,26 @@ fn unsupported_version_echoes_the_decoded_request() {
 }
 
 #[test]
+fn unsupported_produce_version_with_acks_0_closes_the_connection() {
+    // A client that expects no response cannot be told UNSUPPORTED_VERSION, and dropping
+    // the request silently would lose its records unnoticed. Kafka closes the connection.
+    use kafka_protocol::messages::ProduceRequest;
+    for acks in [0, 1] {
+        let mut request = ProduceRequest::default();
+        request.acks = acks;
+        let (parsed, response) = parse(frame(&request, 10, 9));
+        if acks == 0 {
+            assert!(parsed.is_err(), "acks=0 at v10 must close the connection");
+            assert!(response.is_none(), "acks=0 must not get a response");
+        } else {
+            assert!(parsed.unwrap().is_none());
+            let response = response.expect("UNSUPPORTED_VERSION response");
+            assert_eq!((response.correlation_id, response.api_version), (9, 10));
+        }
+    }
+}
+
+#[test]
 fn unsupported_fetch_version_reports_top_level_and_partition_codes() {
     use kafka_protocol::messages::fetch_request::{FetchPartition, FetchRequest, FetchTopic};
     let mut request = FetchRequest::default();
