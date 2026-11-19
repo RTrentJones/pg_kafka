@@ -2036,6 +2036,56 @@ fn get_all_tests() -> Vec<TestDef> {
             ),
             parallel_safe: false,
         },
+        // wave3 groups: consumer groups, admin validation, resource bounds (kafka_test/src/w3_groups)
+        TestDef {
+            category: "w3_groups",
+            name: "test_w3g_partition_cap",
+            test_fn: wrap_test!(kafka_test::w3_groups::test_w3g_partition_cap),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "w3_groups",
+            name: "test_w3g_create_topics_validation",
+            test_fn: wrap_test!(kafka_test::w3_groups::test_w3g_create_topics_validation),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "w3_groups",
+            name: "test_w3g_join_group_protocol_rules",
+            test_fn: wrap_test!(kafka_test::w3_groups::test_w3g_join_group_protocol_rules),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "w3_groups",
+            name: "test_w3g_offset_commit_rules",
+            test_fn: wrap_test!(kafka_test::w3_groups::test_w3g_offset_commit_rules),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "w3_groups",
+            name: "test_w3g_different_assignor_is_refused_group_unaffected",
+            test_fn: wrap_test!(
+                kafka_test::w3_groups::test_w3g_different_assignor_is_refused_group_unaffected
+            ),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "w3_groups",
+            name: "test_w3g_metadata_survives_corrupt_partition_count",
+            test_fn: wrap_test!(
+                kafka_test::w3_groups::test_w3g_metadata_survives_corrupt_partition_count
+            ),
+            parallel_safe: false, // drops and restores the CHECK constraint on kafka.topics
+        },
+        TestDef {
+            category: "w3_groups",
+            name: "test_w3g_offsets_only_group_survives_restart",
+            test_fn: wrap_test!(
+                kafka_test::w3_groups::test_w3g_offsets_only_group_survives_restart
+            ),
+            parallel_safe: false, // restarts the listener worker
+        },
+        // end wave3 groups
     ]
 }
 

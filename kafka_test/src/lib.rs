@@ -247,3 +247,6 @@ pub use part::{
     test_time_partition_retention_drops_whole_partitions,
     test_time_partition_retention_waits_for_pending_transaction,
 };
+
+// wave3 groups
+pub mod w3_groups;
