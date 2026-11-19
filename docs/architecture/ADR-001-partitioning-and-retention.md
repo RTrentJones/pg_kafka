@@ -101,6 +101,35 @@ high watermark (caught by `test_fetch_bounds_from_single_statement`).
 A pending transactional row blocks its leaf's drop until the transaction ends (the transaction
 timeout bounds that). `pg_kafka_run_retention_sweep()` reports the drops as `dropped_partitions`.
 
+### Concurrency with the worker and with manual maintenance (wave 3)
+
+Maintenance can run in the worker and, at the same time, in any session
+(`pg_kafka_run_partition_maintenance()`, `pg_kafka_run_retention_sweep()`). The rules:
+
+* **Moving rows out of the DEFAULT leaf never overlaps a worker transaction.** The move
+  (`DELETE` from `kafka.messages_default` + `INSERT` into the new leaf, in
+  `create_message_partition`) used to race the worker's UPDATEs of `kafka.messages`
+  (EndTxn's `txn_state` change, the timeout/fencing aborts, DeleteRecords): an UPDATE that
+  met a row the move had deleted skipped it after the move committed and never saw its
+  copy, leaving a committed transaction `pending` forever. Every worker transaction now
+  starts by taking the pg_kafka schema advisory lock (key 8099547369649367906) in SHARE
+  mode (`worker::lock_schema`), and the move takes it EXCLUSIVE, bounded by the function's
+  `lock_timeout`; on a timeout the leaf is not created and the next pass retries. The
+  upgrade scripts take the same lock first.
+* **Every lock wait in maintenance is bounded and handled.** `ensure_message_partitions`
+  takes its serializing advisory lock (8099547369649367905) inside a `lock_not_available`
+  handler under `lock_timeout = 2s`: a session that ran maintenance and stayed open makes
+  the next pass skip with a WARNING instead of stalling it (and, for the worker, the
+  whole broker). `drop_message_partition` takes the same lock and `ACCESS EXCLUSIVE` on
+  `kafka.messages` inside its handler, so a timeout skips that leaf instead of rolling
+  back the caller's whole sweep.
+* **A leaf dropped concurrently is "not dropped", not an error.** When two sweeps pick
+  the same leaf, the second waits for the first's locks; afterwards
+  `drop_message_partition` (and `message_partition_contents`) find the leaf gone and
+  return `dropped = false` (NULL contents) instead of erroring on the vanished OID.
+* The worker's own lock waits are bounded by `pg_kafka.worker_lock_timeout_ms` (default
+  5 s), which applies to these locks too.
+
 ### Least privilege
 
 The worker runs as `pgkafka_worker`, which has no DDL rights. All partition DDL runs inside
@@ -124,7 +153,10 @@ partitioned parent (same `global_offset` sequence, now owned by the parent) with
 and attaches the old table as one leaf `[MINVALUE, upgrade time)`; the rows are not copied. It
 reads the old table three times (MAX(created_at) for the bound, the attach's bound check, the BRIN
 build) under ACCESS EXCLUSIVE. The legacy leaf is then retained and dropped like any past leaf.
-The views that read the table are recreated on the parent. `scripts/check-upgrade.sh` compares
+The views that read the table are recreated on the parent. A new binary
+running before the update (docs/UPGRADING.md step 2) detects the missing partitioning and
+skips partition maintenance; its retention sweep expires rows row by row on the
+unpartitioned table. `scripts/check-upgrade.sh` compares
 the upgraded and fresh schemas with leaves normalized (each leaf's index set and grants must be
 identical; leaf names and counts are data-dependent), then checks that maintenance works on both,
 that the legacy leaf drops whole without losing the sequence, and that `pg_dump` emits no kafka

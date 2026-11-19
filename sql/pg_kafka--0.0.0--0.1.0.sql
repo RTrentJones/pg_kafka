@@ -11,6 +11,13 @@
 
 \echo Use "ALTER EXTENSION pg_kafka UPDATE TO '0.1.0'" to load this file. \quit
 
+-- wave3 worker: take the pg_kafka schema lock first. Every transaction of a running
+-- background worker holds it in SHARE mode (src/worker.rs, SCHEMA_LOCK_KEY), so this
+-- waits for the worker's current transaction and keeps new ones out until the upgrade
+-- commits: the script's DDL never meets a worker transaction holding some of the same
+-- tables in another order (lock-order deadlocks). Every upgrade script must start so.
+SELECT pg_advisory_xact_lock(8099547369649367906);
+
 -- 0.0.0 installs that predate these additive columns (see the notes in bootstrap.sql).
 ALTER TABLE kafka.topics ADD COLUMN IF NOT EXISTS retention_ms BIGINT;
 ALTER TABLE kafka.partition_offsets
@@ -179,6 +186,11 @@ LANGUAGE plpgsql STABLE SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
 AS $$
 BEGIN
+    -- A leaf dropped since the caller listed it (a concurrent sweep): no contents
+    -- (all NULL), not an error, so the caller's pass goes on.
+    IF NOT EXISTS (SELECT 1 FROM pg_class WHERE oid = p_partition) THEN
+        RETURN;
+    END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_inherits
                    WHERE inhrelid = p_partition AND inhparent = 'kafka.messages'::regclass) THEN
         RAISE EXCEPTION '% is not a partition of kafka.messages', p_partition;
@@ -231,6 +243,12 @@ BEGIN
     BEGIN
         IF EXISTS (SELECT 1 FROM kafka.messages_default
                    WHERE created_at >= p_lower AND created_at < p_upper) THEN
+            -- Moving rows (DELETE from the DEFAULT leaf + INSERT into the new leaf) must
+            -- not overlap any worker transaction: an UPDATE of the worker (EndTxn's
+            -- txn_state change, DeleteRecords) that met a moved row would skip it and
+            -- never see its copy. Every worker transaction holds the pg_kafka schema
+            -- lock in SHARE mode; take it EXCLUSIVE (bounded by lock_timeout).
+            PERFORM pg_advisory_xact_lock(8099547369649367906);
             EXECUTE format('CREATE TABLE kafka.%I (LIKE kafka.messages INCLUDING DEFAULTS INCLUDING CONSTRAINTS)', v_name);
             EXECUTE format(
                 'WITH moved AS (DELETE FROM kafka.messages_default
@@ -281,6 +299,7 @@ CREATE FUNCTION kafka.ensure_message_partitions(p_width_minutes INT, p_ahead INT
 RETURNS INT
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
+SET lock_timeout = '2s'
 AS $$
 DECLARE
     v_width_s BIGINT;
@@ -297,7 +316,14 @@ BEGIN
     v_width_s := p_width_minutes::BIGINT * 60;
     v_width := make_interval(secs => v_width_s);
     -- Serializes concurrent maintenance (worker and a manual call). Key: 'pg_kafka'.
-    PERFORM pg_advisory_xact_lock(8099547369649367905);
+    -- Bounded: a session that ran maintenance and stayed open must not stall the next
+    -- pass (the worker's included) indefinitely; this pass is skipped instead.
+    BEGIN
+        PERFORM pg_advisory_xact_lock(8099547369649367905);
+    EXCEPTION WHEN lock_not_available THEN
+        RAISE WARNING 'pg_kafka: partition maintenance skipped: another session holds the maintenance lock; will retry';
+        RETURN 0;
+    END;
     FOR v_bucket IN
         SELECT DISTINCT b FROM (
             SELECT to_timestamp((floor(extract(epoch FROM now()) / v_width_s) + g) * v_width_s) AS b
@@ -355,15 +381,32 @@ DECLARE
     v_contents RECORD;
 BEGIN
     dropped := false;
+    -- Already gone (a concurrent sweep dropped it): nothing to do, not an error.
+    IF NOT EXISTS (SELECT 1 FROM pg_class WHERE oid = p_partition) THEN
+        RETURN;
+    END IF;
     IF NOT EXISTS (SELECT 1 FROM kafka.message_partitions() p
                    WHERE p.partition_oid = p_partition AND NOT p.is_default) THEN
+        -- message_partitions() opens each leaf, so this check can wait behind a
+        -- concurrent drop of p_partition and then miss it: gone is not an error.
+        IF NOT EXISTS (SELECT 1 FROM pg_class WHERE oid = p_partition) THEN
+            RETURN;
+        END IF;
         RAISE EXCEPTION '% is not a time partition of kafka.messages', p_partition;
     END IF;
-    PERFORM pg_advisory_xact_lock(8099547369649367905);
     BEGIN
+        -- Every lock wait is inside this block, so a lock timeout skips this leaf
+        -- (the next sweep retries) instead of failing the caller's whole sweep.
+        PERFORM pg_advisory_xact_lock(8099547369649367905);
         -- DROP takes ACCESS EXCLUSIVE on the parent; take it first (parent, then leaf,
         -- the order inserts use) so the contents check below cannot race a writer.
         LOCK TABLE kafka.messages IN ACCESS EXCLUSIVE MODE;
+        -- Re-check under the locks: a concurrent drop of the same leaf may have
+        -- committed while this call waited for them.
+        IF NOT EXISTS (SELECT 1 FROM pg_inherits
+                       WHERE inhrelid = p_partition AND inhparent = 'kafka.messages'::regclass) THEN
+            RETURN;
+        END IF;
         SELECT * INTO v_contents FROM kafka.message_partition_contents(p_partition);
         topic_ids := v_contents.topic_ids;
         partition_ids := v_contents.partition_ids;
