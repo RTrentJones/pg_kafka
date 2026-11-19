@@ -2036,6 +2036,52 @@ fn get_all_tests() -> Vec<TestDef> {
             ),
             parallel_safe: false,
         },
+        // wave3 shadow
+        TestDef {
+            category: "w3_shadow",
+            name: "test_shadow_lag_view_is_per_partition",
+            test_fn: wrap_test!(kafka_test::w3_shadow::test_shadow_lag_view_is_per_partition),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "shadow",
+            name: "test_shadow_forward_throughput",
+            test_fn: wrap_test!(kafka_test::shadow::pipelined::test_shadow_forward_throughput),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "shadow",
+            name: "test_shadow_forwards_headers_and_timestamps",
+            test_fn: wrap_test!(
+                kafka_test::shadow::pipelined::test_shadow_forwards_headers_and_timestamps
+            ),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "shadow",
+            name: "test_shadow_order_preserved_across_a_retried_failure",
+            test_fn: wrap_test!(
+                kafka_test::shadow::pipelined::test_shadow_order_preserved_across_a_retried_failure
+            ),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "shadow",
+            name: "test_shadow_sync_stall_is_bounded_to_its_own_response",
+            test_fn: wrap_test!(
+                kafka_test::shadow::pipelined::test_shadow_sync_stall_is_bounded_to_its_own_response
+            ),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "shadow",
+            name: "test_shadow_gucs_take_effect_on_reload",
+            test_fn: wrap_test!(
+                kafka_test::shadow::pipelined::test_shadow_gucs_take_effect_on_reload
+            ),
+            parallel_safe: false,
+        },
+        // end wave3 shadow
     ]
 }
 

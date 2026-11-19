@@ -118,8 +118,9 @@ async fn run_no_duplicates_check(topic: String) -> Result<(), String> {
         ));
     }
 
-    // The claim accounting must agree: each row claimed exactly once (the SQL
-    // in-flight exclusion kept lease-expiry re-claims away entirely).
+    // The attempt accounting must agree: no row was re-claimed (a re-claim of an
+    // in-flight row would count as a lost attempt) and none failed. Wave 3:
+    // retry_count counts failed attempts, not claims, so a clean run is 0.
     let claims: i64 = db
         .query_one(
             "SELECT COALESCE(SUM(st.retry_count), 0)::bigint \
@@ -131,10 +132,10 @@ async fn run_no_duplicates_check(topic: String) -> Result<(), String> {
         .await
         .map_err(|e| format!("claim count query failed: {e}"))?
         .get(0);
-    if claims != MESSAGE_COUNT as i64 {
+    if claims != 0 {
         return Err(format!(
-            "RE-CLAIM DETECTED: outbox rows were claimed {claims} times for {MESSAGE_COUNT} \
-             produced — in-flight rows are still being re-claimed at lease expiry"
+            "RE-CLAIM DETECTED: {claims} failed/lost attempts recorded for {MESSAGE_COUNT} \
+             produced — in-flight rows are being re-claimed"
         ));
     }
     println!("✅ Exactly-once dispatch: {claims} claims, {delivered} deliveries\n");

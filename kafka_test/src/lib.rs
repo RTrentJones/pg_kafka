@@ -247,3 +247,7 @@ pub use part::{
     test_time_partition_retention_drops_whole_partitions,
     test_time_partition_retention_waits_for_pending_transaction,
 };
+
+// wave3 shadow
+pub mod w3_shadow;
+// end wave3 shadow
