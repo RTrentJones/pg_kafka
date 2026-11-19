@@ -1,5 +1,32 @@
 //! Record headers as stored in the `kafka.messages.headers` JSONB column.
 
+/// Encode record headers for the JSONB headers column: an array of `[key, hex(value)]`
+/// pairs, which keeps the producer's header order (a JSONB object would reorder its
+/// keys). No headers encode as `{}`.
+pub fn encode_headers_json<'a>(
+    headers: impl ExactSizeIterator<Item = (&'a str, &'a [u8])>,
+) -> String {
+    if headers.len() == 0 {
+        return EMPTY_HEADERS.to_string();
+    }
+    let pairs: Vec<(&str, String)> = headers.map(|(k, v)| (k, hex_encode(v))).collect();
+    serde_json::to_string(&pairs).unwrap_or_else(|_| EMPTY_HEADERS.to_string())
+}
+
+/// The headers column of a record without headers.
+const EMPTY_HEADERS: &str = "{}";
+
+/// Lowercase hex of `bytes`.
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut out, b| {
+            let _ = write!(out, "{b:02x}");
+            out
+        })
+}
+
 /// Decode the JSONB headers column back into header pairs (DR-8). The column holds an
 /// ordered array of `[key, hex(value)]` pairs; rows written before that hold a
 /// `{key: hex(value)}` object, which is still accepted.
@@ -44,7 +71,25 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_headers_json;
+    use super::{decode_headers_json, encode_headers_json};
+
+    const NO_HEADERS: Vec<(String, Vec<u8>)> = Vec::new();
+
+    #[test]
+    fn encoded_headers_decode_in_order() {
+        let headers: [(&str, &[u8]); 3] = [("z", b"\x01"), ("a", b""), ("k", b"hi")];
+        let json = encode_headers_json(headers.iter().copied());
+        assert_eq!(json, r#"[["z","01"],["a",""],["k","6869"]]"#);
+        assert_eq!(
+            decode_headers_json(Some(&json)),
+            vec![
+                ("z".to_string(), vec![1u8]),
+                ("a".to_string(), Vec::new()),
+                ("k".to_string(), b"hi".to_vec()),
+            ]
+        );
+        assert_eq!(encode_headers_json(std::iter::empty()), "{}");
+    }
 
     #[test]
     fn test_decode_headers_json_roundtrip() {
@@ -63,15 +108,15 @@ mod tests {
 
     #[test]
     fn test_decode_headers_json_absent_or_empty() {
-        assert!(decode_headers_json(None).is_empty());
-        assert!(decode_headers_json(Some("{}")).is_empty());
-        assert!(decode_headers_json(Some("")).is_empty());
+        assert_eq!(decode_headers_json(None), NO_HEADERS);
+        assert_eq!(decode_headers_json(Some("{}")), NO_HEADERS);
+        assert_eq!(decode_headers_json(Some("")), NO_HEADERS);
     }
 
     #[test]
     fn test_decode_headers_json_malformed_is_lenient() {
         // Malformed JSON: drop all headers rather than failing the fetch
-        assert!(decode_headers_json(Some("not-json")).is_empty());
+        assert_eq!(decode_headers_json(Some("not-json")), NO_HEADERS);
         // Malformed hex value: that header is dropped, valid ones survive
         let json = r#"{"bad":"zz","good":"6869"}"#;
         assert_eq!(
@@ -79,14 +124,14 @@ mod tests {
             vec![("good".to_string(), b"hi".to_vec())]
         );
         // Odd-length hex is malformed
-        assert!(decode_headers_json(Some(r#"{"odd":"abc"}"#)).is_empty());
+        assert_eq!(decode_headers_json(Some(r#"{"odd":"abc"}"#)), NO_HEADERS);
     }
 
     #[test]
     fn test_decode_headers_json_non_ascii_hex_does_not_panic() {
         // A multi-byte char puts the 2-byte hex window off a char boundary; that must
         // drop the header (None), not panic with "not a char boundary".
-        assert!(decode_headers_json(Some(r#"{"k":"aé0"}"#)).is_empty());
+        assert_eq!(decode_headers_json(Some(r#"{"k":"aé0"}"#)), NO_HEADERS);
         let ok = decode_headers_json(Some(r#"{"bad":"aé0","good":"6869"}"#));
         assert_eq!(ok, vec![("good".to_string(), b"hi".to_vec())]);
     }

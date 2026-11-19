@@ -7,17 +7,17 @@
 pub const PRODUCER_BATCH_CACHE: usize = 5;
 
 /// What the produce path does with an idempotent batch
-/// ([`ProducerStore::check_and_update_sequence`]).
+/// ([`ProducerStore::check_and_update_sequence`](super::ProducerStore::check_and_update_sequence)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SequenceCheck {
-    /// Insert the batch, then record it with [`ProducerStore::record_producer_batch`].
+    /// Insert the batch, then record it with [`ProducerStore::record_producer_batch`](super::ProducerStore::record_producer_batch).
     Append,
     /// A retry of a batch already appended at `base_offset`: skip the insert and
     /// answer success with that offset.
     Duplicate { base_offset: i64 },
 }
 
-/// One appended idempotent batch ([`ProducerStore::record_producer_batch`]).
+/// One appended idempotent batch ([`ProducerStore::record_producer_batch`](super::ProducerStore::record_producer_batch)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProducerBatch {
     pub producer_id: i64,
@@ -145,9 +145,7 @@ pub fn validate_sequence(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        batch_last_sequence, validate_sequence, CachedBatch, SequenceValidation,
-    };
+    use super::{batch_last_sequence, validate_sequence, CachedBatch, SequenceValidation};
 
     fn proceed(last: i32) -> SequenceValidation {
         SequenceValidation::Proceed {
@@ -193,7 +191,7 @@ mod tests {
 
     #[test]
     fn test_validate_sequence_retry_of_a_cached_batch_keeps_its_offset() {
-        // Wave 3: a retry of ANY of the remembered batches (not only the last one) is a
+        // A retry of ANY of the remembered batches (not only the last one) is a
         // duplicate and carries the original base offset (was: no offset, -1).
         assert_eq!(
             validate_sequence(0, Some(7), &cache(), 0, 5, 3),
@@ -207,8 +205,8 @@ mod tests {
 
     #[test]
     fn test_validate_sequence_never_sent_range_is_out_of_order() {
-        // Wave 3: a range at or below the last sequence that is NOT a remembered batch
-        // was never appended. It used to be acked as a duplicate and dropped.
+        // A range at or below the last sequence that is NOT a remembered batch was
+        // never appended: acking it as a duplicate would drop it silently.
         assert_eq!(validate_sequence(0, Some(7), &cache(), 0, 1, 1), ooo(8));
         assert_eq!(validate_sequence(0, Some(7), &cache(), 0, 7, 1), ooo(8));
         // A range older than the cache is out of order too (Kafka: same).

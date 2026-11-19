@@ -1,10 +1,17 @@
-// Storage abstraction layer for pg_kafka
-//
-// This module defines the KafkaStore trait that abstracts data persistence operations.
-// By separating storage concerns from protocol logic, we achieve:
-// 1. Testability - handlers can be tested with mock stores
-// 2. Clean separation of concerns - protocol logic doesn't know about SQL
-// 3. Transaction safety - transaction boundaries remain explicit in worker.rs
+//! The storage layer: the contract between the Kafka protocol handlers and the store.
+//!
+//! The contract is split into role traits ([`TopicStore`], [`LogStore`],
+//! [`OffsetStore`], [`ProducerStore`], [`TransactionStore`], [`MaintenanceStore`]);
+//! [`KafkaStore`] is their sum and is what handlers see. Each role groups the methods
+//! one concern needs, so a wrapper (`ShadowStore`) can forward the roles it does not
+//! change wholesale (the `delegate_*_store!` macros) and code that needs one concern
+//! can take just that role. Handlers stay testable against `MockKafkaStore`, and
+//! transaction boundaries stay with the caller: every method assumes it runs inside a
+//! transaction the background worker (or a `#[pg_extern]`) manages.
+//!
+//! [`PostgresStore`] is the implementation; the pure logic it relies on (header
+//! encoding, sequence validation, retention planning, the role grants) lives in
+//! submodules that unit tests reach without a database.
 
 use std::time::Duration;
 
@@ -19,12 +26,11 @@ pub(crate) use delegate::{
     delegate_log_store, delegate_maintenance_store, delegate_offset_store, delegate_producer_store,
     delegate_topic_store, delegate_transaction_store,
 };
-pub use headers::decode_headers_json;
+pub use headers::{decode_headers_json, encode_headers_json};
 pub use sequence::{
     batch_last_sequence, next_sequence, validate_sequence, CachedBatch, ProducerBatch,
     SequenceCheck, SequenceValidation, PRODUCER_BATCH_CACHE,
 };
-
 
 /// Metadata about a topic (storage layer representation)
 ///
@@ -54,14 +60,11 @@ pub struct FetchedMessage {
     pub value: Option<Vec<u8>>,
     /// Timestamp (milliseconds since epoch)
     pub timestamp: i64,
-    /// Record headers, decoded from JSONB storage (DR-8, DEEP-REVIEW-2026-07).
-    /// Before DR-8, headers were written on every produce but never selected on
-    /// fetch, so consumers silently received empty headers. Headers are stored as
-    /// an ordered array of pairs, so their order survives; duplicate keys do not,
-    /// because the kafka-protocol record type holds headers in a map (documented
-    /// in PROTOCOL_DEVIATIONS.md).
+    /// Record headers, decoded from JSONB storage (DR-8). They are stored as an
+    /// ordered array of pairs, so their order survives; duplicate keys do not, because
+    /// the kafka-protocol record type holds headers in a map (PROTOCOL_DEVIATIONS.md).
     pub headers: Vec<(String, Vec<u8>)>,
-    /// Producer id stamped on the row (wave 3 txn): set for records written by a
+    /// Producer id stamped on the row: set for records written by a
     /// transactional producer, `None` otherwise. Fetch groups consecutive records of
     /// one producer id/epoch into one RecordBatch and marks it transactional.
     pub producer_id: Option<i64>,
@@ -78,7 +81,7 @@ pub struct CommittedOffset {
     pub metadata: Option<String>,
 }
 
-/// Transaction state (Phase 10)
+/// Transaction state (the `kafka.transactions.state` column).
 ///
 /// Represents the lifecycle state of a Kafka transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,7 +127,7 @@ impl TransactionState {
     }
 }
 
-/// Consumer isolation level (Phase 10)
+/// Consumer isolation level.
 ///
 /// Controls visibility of transactional messages during fetch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -177,7 +180,7 @@ impl PartitionBounds {
         let log_start = log_start_offset.unwrap_or(0);
         let high_watermark = next_offset
             .unwrap_or(0)
-            .max(max_offset.map(|m| m.saturating_add(1)).unwrap_or(0));
+            .max(max_offset.map_or(0, |m| m.saturating_add(1)));
         let last_stable_offset = match isolation_level {
             IsolationLevel::ReadCommitted => min_pending_offset.unwrap_or(high_watermark),
             IsolationLevel::ReadUncommitted => high_watermark,
@@ -193,7 +196,7 @@ impl PartitionBounds {
 
 /// Order `rows` (`(name, id, partition_count)` from one batched lookup) as the
 /// requested `names`, dropping names with no row. A name requested twice appears
-/// twice, matching the former one-query-per-name loop.
+/// twice.
 pub fn order_topic_metadata(names: &[String], rows: Vec<(String, i32, i32)>) -> Vec<TopicMetadata> {
     let by_name: std::collections::HashMap<String, (i32, i32)> = rows
         .into_iter()
@@ -213,18 +216,6 @@ pub fn order_topic_metadata(names: &[String], rows: Vec<(String, i32, i32)>) -> 
         .collect()
 }
 
-/// Abstract storage interface for Kafka data operations, split into role traits.
-///
-/// These traits define the contract between the Kafka protocol handlers and the
-/// underlying storage implementation. Implementors handle the actual data persistence
-/// (SQL, file system, etc.) while handlers focus on protocol logic. Each role groups the
-/// methods one concern needs, so a wrapper (`ShadowStore`) can delegate whole roles it
-/// does not change ([`DelegateTopicStore`], [`DelegateOffsetStore`],
-/// [`DelegateProducerStore`]) and code that needs one concern can take just that role.
-/// [`KafkaStore`] is the sum of all roles.
-///
-/// All methods are assumed to run within a transaction context managed by the caller
-/// (typically the background worker).
 /// Topic catalog: lookup, auto-create, admin (create/delete/partition count) and per-topic config.
 pub trait TopicStore {
     /// Get or create a topic by name
@@ -320,7 +311,6 @@ pub trait TopicStore {
     ///   clear the override and fall back to the global GUC
     fn set_topic_retention_ms(&self, topic_id: i32, retention_ms: Option<i64>) -> Result<()>;
 
-    // wave3 groups
     /// An existing topic whose name collides with `name` once '.' and '_' are treated as equal
     /// (Kafka's metric-name collision rule), other than `name` itself; `None` if there is none.
     fn find_colliding_topic(&self, name: &str) -> Result<Option<String>>;
@@ -554,7 +544,6 @@ pub trait OffsetStore {
     /// Ok on success
     fn delete_consumer_group_offsets(&self, group_id: &str) -> Result<()>;
 
-    // wave3 groups
     /// The ids of every group that has at least one committed offset (sorted). These groups
     /// exist for DescribeGroups / ListGroups even when the in-memory coordinator does not know
     /// them (e.g. after a worker restart), as Kafka reports them as Empty groups.
@@ -564,11 +553,11 @@ pub trait OffsetStore {
     fn group_has_offsets(&self, group_id: &str) -> Result<bool>;
     /// The `(topic name, partition)` pairs of `group_id` that have a transactional
     /// offset commit (TxnOffsetCommit) whose transaction has not ended yet. OffsetFetch
-    /// with `require_stable` (KIP-447) answers UNSTABLE_OFFSET_COMMIT for them (wave 3).
+    /// with `require_stable` (KIP-447) answers UNSTABLE_OFFSET_COMMIT for them.
     fn pending_txn_offset_partitions(&self, group_id: &str) -> Result<Vec<(String, i32)>>;
 }
 
-/// Idempotent producer state: producer ids, epochs and sequence numbers (Phase 9).
+/// Idempotent producer state: producer ids, epochs and sequence numbers.
 pub trait ProducerStore {
     /// Allocate a new producer ID with epoch 0
     ///
@@ -612,7 +601,7 @@ pub trait ProducerStore {
     fn increment_producer_epoch(&self, producer_id: i64) -> Result<(i64, i16)>;
 
     /// Validate an idempotent producer's batch against the producer state of one
-    /// partition (wave 3: Kafka's model, see [`validate_sequence`]).
+    /// partition (Kafka's model, see [`validate_sequence`]).
     ///
     /// The batch is appended when it starts right after the partition's last sequence
     /// (or at 0 on a fresh partition or with a new epoch), and is a duplicate when its
@@ -648,11 +637,11 @@ pub trait ProducerStore {
     /// Persist an appended idempotent batch AFTER its records were inserted (RV-8):
     /// advance the partition's last sequence and remember the batch (sequence range and
     /// base offset) among the producer's last [`PRODUCER_BATCH_CACHE`] batches there, so
-    /// a retry of it is answered with its original offset (wave 3).
+    /// a retry of it is answered with its original offset.
     fn record_producer_batch(&self, batch: ProducerBatch) -> Result<()>;
 
     /// Register partitions in a transaction (AddPartitionsToTxn). A transactional
-    /// Produce is accepted only for registered partitions (wave 3). The registry is
+    /// Produce is accepted only for registered partitions. The registry is
     /// cleared when the next transaction of the transactional id begins and on
     /// InitProducerId.
     fn add_txn_partitions(&self, transactional_id: &str, partitions: &[(i32, i32)]) -> Result<()>;
@@ -668,10 +657,10 @@ pub trait ProducerStore {
 
     /// Persist a producer's advanced `last_sequence` AFTER a successful insert (RV-8).
     ///
-    /// The sequence advance is split out from `check_and_update_sequence` (which now
-    /// only validates) so it happens only once the records are durably inserted.
-    /// Otherwise a failed insert would leave the sequence advanced and a retry of
-    /// the same batch would be misclassified as a duplicate and silently dropped.
+    /// `check_and_update_sequence` only validates, so the advance happens only once
+    /// the records are durably inserted: a failed insert must not leave the sequence
+    /// advanced, or a retry of the same batch would be taken for a duplicate and
+    /// dropped.
     ///
     /// Sets only the last sequence; the produce path uses
     /// [`record_producer_batch`](Self::record_producer_batch), which also remembers
@@ -685,7 +674,7 @@ pub trait ProducerStore {
     ) -> Result<()>;
 }
 
-/// Transactions: transactional producers, state, transactional writes and offsets, commit/abort (Phase 10).
+/// Transactions: transactional producers, state, transactional writes and offsets, commit/abort.
 pub trait TransactionStore {
     /// Look up or create producer by transactional_id
     ///
@@ -906,7 +895,6 @@ pub mod roles {
 /// ListOffsets' MAX_TIMESTAMP (-3, KIP-734): the record with the largest timestamp.
 pub const MAX_TIMESTAMP: i64 = -3;
 
-// Submodules
 pub mod postgres;
 pub mod privileges;
 pub mod retention;
@@ -917,5 +905,4 @@ mod tests;
 #[cfg(test)]
 mod schema_tests;
 
-// Re-export main types
 pub use postgres::PostgresStore;

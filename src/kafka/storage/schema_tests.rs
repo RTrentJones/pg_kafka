@@ -107,15 +107,13 @@ fn security_definer_partition_functions_pin_search_path_and_lock_timeout() {
         if b.contains("security definer") {
             assert!(
                 b.contains("set search_path = pg_catalog, pg_temp"),
-                "{} lacks a fixed search_path",
-                name
+                "{name} lacks a fixed search_path"
             );
         }
         if b.contains("create table") || b.contains("drop table") {
             assert!(
                 b.contains("set lock_timeout"),
-                "{} DDL without lock_timeout",
-                name
+                "{name} DDL without lock_timeout"
             );
         }
     }
