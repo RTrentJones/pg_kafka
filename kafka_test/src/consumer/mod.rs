@@ -6,6 +6,7 @@
 //! - Consume from specific offsets
 
 mod basic;
+mod batching;
 mod from_offset;
 mod headers;
 mod multiple;
@@ -17,5 +18,6 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         headers::test_consumer_receives_headers,
         multiple::test_consumer_multiple_messages,
         from_offset::test_consumer_from_offset,
+        batching::test_w3_fetch_groups_records_into_batches,
     ]
 }

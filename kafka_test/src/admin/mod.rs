@@ -6,6 +6,9 @@
 //! - CreatePartitions (API 37)
 //! - DeleteGroups (API 42)
 
+mod configs;
+mod create_validation;
+
 use crate::common::{create_db_client, get_bootstrap_servers, TestResult};
 use rdkafka::admin::{AdminClient, AdminOptions, NewPartitions, NewTopic, TopicReplication};
 use rdkafka::client::DefaultClientContext;
@@ -714,15 +717,17 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         test_delete_group_empty,
         test_delete_group_non_empty: sequential, // Uses shared consumer group state
         test_delete_group_after_leave: sequential, // Uses shared consumer group state
-        crate::configs::test_describe_configs_reports_topic_configs,
-        crate::configs::test_incremental_alter_configs_retention_roundtrip,
-        crate::configs::test_delete_records_truncates_partition,
-        crate::configs::test_per_topic_retention_override_enforced_by_sweep: sequential, // Runs the global retention sweep
+        configs::test_describe_configs_reports_topic_configs,
+        configs::test_incremental_alter_configs_retention_roundtrip,
+        configs::test_delete_records_truncates_partition,
+        configs::test_per_topic_retention_override_enforced_by_sweep: sequential, // Runs the global retention sweep
         test_create_multiple_topics,
         test_create_topic_invalid_name,
         test_create_partitions_not_found,
         test_delete_group_idempotent,
         test_create_topic_with_config,
         test_create_topic_invalid_partitions,
+        create_validation::test_w3g_partition_cap,
+        create_validation::test_w3g_create_topics_validation,
     ]
 }

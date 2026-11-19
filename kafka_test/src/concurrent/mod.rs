@@ -2,6 +2,7 @@
 //!
 //! Tests for concurrent producer/consumer scenarios and race conditions.
 
+mod batch_composition;
 mod liveness_lane;
 mod multi_consumer;
 mod multi_producer;
@@ -27,5 +28,6 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         race_conditions::test_coordinator_state_race: sequential, // Tests coordinator state
         race_conditions::test_partition_assignment_race: sequential, // Tests partition assignment
         race_conditions::test_group_rejoin_race: sequential, // Tests group membership
+        batch_composition::test_w3_heartbeats_do_not_split_batches: sequential,
     ]
 }

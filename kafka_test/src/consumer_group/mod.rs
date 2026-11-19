@@ -9,6 +9,7 @@
 
 mod coordinator_state;
 mod lifecycle;
+mod protocol_rules;
 mod rebalance;
 mod rebalance_edge_cases;
 
@@ -30,5 +31,8 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         coordinator_state::test_leave_during_rebalance: sequential, // Tests rebalance timing
         coordinator_state::test_heartbeat_keeps_membership,
         coordinator_state::test_group_state_transitions,
+        protocol_rules::test_w3g_join_group_protocol_rules,
+        protocol_rules::test_w3g_different_assignor_is_refused_group_unaffected,
+        protocol_rules::test_w3g_offsets_only_group_survives_restart: sequential, // restarts the listener worker
     ]
 }

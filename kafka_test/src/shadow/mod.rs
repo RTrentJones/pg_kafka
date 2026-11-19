@@ -24,6 +24,7 @@ pub mod dialup;
 pub mod error_handling;
 pub mod external_client;
 pub mod helpers;
+mod lag_view;
 pub mod no_duplicates;
 pub mod percentage_routing;
 pub mod pipelined;
@@ -76,5 +77,6 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         pipelined::test_shadow_order_preserved_across_a_retried_failure: sequential,
         pipelined::test_shadow_sync_stall_is_bounded_to_its_own_response: sequential,
         pipelined::test_shadow_gucs_take_effect_on_reload: sequential,
+        lag_view::test_shadow_lag_view_is_per_partition,
     ]
 }

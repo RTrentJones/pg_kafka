@@ -9,6 +9,7 @@
 mod edge_cases;
 mod task_cap;
 mod timeout;
+mod transaction_end;
 mod wakeup;
 
 /// The `long_poll` tests, in run order.
@@ -24,5 +25,6 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         edge_cases::test_long_poll_consumer_disconnect,
         edge_cases::test_long_poll_multiple_consumers_same_partition: sequential, // Multiple consumers
         edge_cases::test_long_poll_auto_commit_interval: sequential, // Timing-sensitive
+        transaction_end::test_w3_transaction_end_wakes_read_committed: sequential,
     ]
 }

@@ -10,6 +10,7 @@
 mod basic;
 mod deduplication;
 mod edge_cases;
+mod kafka_model;
 pub mod protocol_encoding;
 
 /// The `idempotent` tests, in run order.
@@ -22,5 +23,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         edge_cases::test_idempotent_producer_restart,
         edge_cases::test_idempotent_concurrent_producers: sequential, // Concurrent producers
         edge_cases::test_idempotent_high_sequence,
+        kafka_model::test_w3_idempotent_producer_follows_kafka: sequential,
+        kafka_model::test_w3_idempotent_sequence_wraps,
     ]
 }

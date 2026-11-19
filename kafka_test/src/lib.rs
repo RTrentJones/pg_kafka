@@ -44,12 +44,12 @@ pub mod common;
 pub mod fixtures;
 pub mod registry;
 pub mod setup;
+pub mod wire;
 
 // Test modules
 pub mod admin;
 pub mod compression;
 pub mod concurrent;
-pub mod configs;
 pub mod consumer;
 pub mod consumer_group;
 pub mod edge_cases;
@@ -58,6 +58,7 @@ pub mod idempotent;
 pub mod long_poll;
 pub mod metadata;
 pub mod negative;
+pub mod network;
 pub mod offset_management;
 pub mod partition;
 pub mod performance;
@@ -65,22 +66,17 @@ pub mod producer;
 pub mod protocol;
 pub mod shadow;
 pub mod transaction;
+pub mod worker;
 // Stream `part` (wave 2): time-partitioned kafka.messages
 pub mod part;
 // auth stream: TLS + SASL listener tests
 pub mod auth;
 // wave3 worker: lifecycle, locking, maintenance races (kafka_test/src/w3_worker)
-pub mod w3_worker;
 
 // Re-export infrastructure
 pub use assertions::*;
 pub use fixtures::*;
 pub use setup::TestContext;
-
-pub mod w3_groups;
-pub mod w3_net;
-pub mod w3_shadow;
-pub mod w3_txn;
 
 /// Every registered test, category by category, in run order.
 pub fn all_tests() -> Vec<registry::TestDef> {
@@ -105,11 +101,8 @@ pub fn all_tests() -> Vec<registry::TestDef> {
         protocol::tests(),
         part::tests(),
         auth::tests(),
-        w3_groups::tests(),
-        w3_txn::tests(),
-        w3_net::tests(),
-        w3_shadow::tests(),
-        w3_worker::tests(),
+        network::tests(),
+        worker::tests(),
     ]
     .into_iter()
     .flatten()

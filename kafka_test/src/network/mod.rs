@@ -13,8 +13,8 @@
 //! source addresses (127.0.0.2, ...) so their per-IP accounting is separate from the
 //! well-behaved clients on 127.0.0.1. All tests are `parallel_safe: false`.
 
+pub mod hostile_clients;
 pub mod limits;
-pub mod tests;
 
 use crate::common::TestResult;
 use bytes::{BufMut, Bytes, BytesMut};
@@ -262,17 +262,17 @@ pub async fn rdkafka_roundtrip(cfg: ClientConfig, topic: &str, n: usize) -> Test
     Ok(())
 }
 
-/// The `w3_net` tests, in run order.
+/// The `network` tests, in run order.
 pub fn tests() -> Vec<crate::registry::TestDef> {
-    crate::test_defs!["w3_net";
+    crate::test_defs!["network";
         // shared broker resources or reconfigure + restart the listener (limits::*,
         // setup first, teardown last).
-        tests::test_w3_net_frame_budget_lockout: sequential,
-        tests::test_w3_net_oversized_response_is_delivered: sequential,
-        tests::test_w3_net_tcp_nodelay: sequential,
-        tests::test_w3_net_acks0_error_closes_connection: sequential,
-        tests::test_w3_net_invalid_acks_rejected: sequential,
-        tests::test_w3_net_response_before_close: sequential,
+        hostile_clients::test_w3_net_frame_budget_lockout: sequential,
+        hostile_clients::test_w3_net_oversized_response_is_delivered: sequential,
+        hostile_clients::test_w3_net_tcp_nodelay: sequential,
+        hostile_clients::test_w3_net_acks0_error_closes_connection: sequential,
+        hostile_clients::test_w3_net_invalid_acks_rejected: sequential,
+        hostile_clients::test_w3_net_response_before_close: sequential,
         limits::test_w3_net_limits_setup: sequential,
         limits::test_w3_net_scram_unknown_user_indistinguishable: sequential,
         limits::test_w3_net_per_ip_limit: sequential,

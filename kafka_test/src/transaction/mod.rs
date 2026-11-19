@@ -11,7 +11,9 @@
 mod atomicity;
 mod basic;
 mod eos;
+mod invisible_offsets;
 mod isolation;
+mod validation;
 
 /// The `transaction` tests, in run order.
 pub fn tests() -> Vec<crate::registry::TestDef> {
@@ -36,5 +38,11 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         atomicity::test_transaction_boundary_isolation,
         atomicity::test_transaction_honors_per_txn_timeout_ms,
         atomicity::test_producer_id_reallocated_on_epoch_exhaustion,
+        invisible_offsets::test_w3_read_committed_passes_aborted_tail,
+        invisible_offsets::test_w3_read_committed_passes_aborted_middle,
+        invisible_offsets::test_w3_consumers_pass_cleaned_up_aborted_rows: sequential,
+        invisible_offsets::test_w3_consumers_pass_delete_records_gap,
+        invisible_offsets::test_w3_read_committed_stops_at_open_transaction,
+        validation::test_w3_transaction_validation,
     ]
 }

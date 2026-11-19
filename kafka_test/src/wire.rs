@@ -3,6 +3,8 @@
 //! these tests assert on (base offsets of duplicate batches, per-partition error codes,
 //! the batches inside a fetch response), so they speak the protocol directly.
 
+pub mod requests;
+
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use kafka_protocol::messages::{RequestHeader, ResponseHeader};
 use kafka_protocol::protocol::{Decodable, Encodable, HeaderVersion, StrBytes};

@@ -10,11 +10,11 @@
 //! its position and committed offset; the open-transaction test checks that it still
 //! stops at the LSO.
 
-use super::wire::{batch_headers, Wire};
 use crate::common::TestResult;
 use crate::common::{create_producer, create_transactional_producer, get_bootstrap_servers};
 use crate::fixtures::TestTopicBuilder;
 use crate::setup::TestContext;
+use crate::wire::{batch_headers, Wire};
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, CommitMode, Consumer};
 use rdkafka::producer::{FutureProducer, FutureRecord, Producer};

@@ -9,11 +9,13 @@
 //! the frozen 0.0.0 install script (`sql/upgrade-test/pg_kafka--0.0.0.sql`) into the
 //! server's extension directory, exactly as `scripts/check-upgrade.sh` does.
 
-pub mod tests;
+mod lifecycle;
 
 use crate::common::{create_db_client, get_bootstrap_servers, TestResult};
 use rdkafka::config::ClientConfig;
+use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::producer::{FutureProducer, FutureRecord};
+use rdkafka::{Message, Offset, TopicPartitionList};
 use std::io::{Read, Seek, SeekFrom};
 use std::time::{Duration, Instant};
 use tokio_postgres::Client;
@@ -193,17 +195,108 @@ pub async fn session() -> DynResult<Client> {
     create_db_client().await.map_err(boxed)
 }
 
-/// The `w3_worker` tests, in run order.
+/// The `worker` tests, in run order.
 pub fn tests() -> Vec<crate::registry::TestDef> {
-    crate::test_defs!["w3_worker";
-        tests::test_w3_partition_maintenance_lock_waits_are_bounded: sequential,
-        tests::test_w3_end_txn_during_default_leaf_move: sequential,
-        tests::test_w3_lock_timeout_bounds_stuck_lock: sequential,
-        tests::test_w3_sigterm_interrupts_lock_wait: sequential,
-        tests::test_w3_commit_failure_answered_without_restart: sequential,
-        tests::test_w3_heartbeats_do_not_split_batches: sequential,
-        tests::test_w3_transaction_end_wakes_read_committed: sequential,
-        tests::test_w3_old_schema_degrades_gracefully: sequential,
-        tests::test_w3_extension_ddl_loop_under_load: sequential,
+    crate::test_defs!["worker";
+        lifecycle::test_w3_lock_timeout_bounds_stuck_lock: sequential,
+        lifecycle::test_w3_sigterm_interrupts_lock_wait: sequential,
+        lifecycle::test_w3_commit_failure_answered_without_restart: sequential,
+        lifecycle::test_w3_old_schema_degrades_gracefully: sequential,
+        lifecycle::test_w3_extension_ddl_loop_under_load: sequential,
     ]
+}
+
+pub(crate) const WORKER_LOCK_TIMEOUT_GUC: &str = "pg_kafka.worker_lock_timeout_ms";
+
+pub(crate) fn unique(base: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("w3-worker-{}-{}", base, nanos % 1_000_000_000_000)
+}
+
+pub(crate) async fn send(producer: &FutureProducer, topic: &str, value: &str) -> DynResult<i64> {
+    producer
+        .send(
+            FutureRecord::to(topic).key("k").payload(value).partition(0),
+            Duration::from_secs(30),
+        )
+        .await
+        .map(|(_, offset)| offset)
+        .map_err(|(e, _)| boxed(e))
+}
+
+pub(crate) fn assign_consumer(
+    topic: &str,
+    read_committed: bool,
+    extra: &[(&str, &str)],
+) -> DynResult<StreamConsumer> {
+    let mut cfg = ClientConfig::new();
+    cfg.set("bootstrap.servers", get_bootstrap_servers())
+        .set("broker.address.family", "v4")
+        .set("group.id", unique("assign"))
+        .set("enable.auto.commit", "false")
+        .set(
+            "isolation.level",
+            if read_committed {
+                "read_committed"
+            } else {
+                "read_uncommitted"
+            },
+        );
+    for (k, v) in extra {
+        cfg.set(*k, *v);
+    }
+    let consumer: StreamConsumer = cfg.create().map_err(boxed)?;
+    let mut tpl = TopicPartitionList::new();
+    tpl.add_partition_offset(topic, 0, Offset::Beginning)
+        .map_err(boxed)?;
+    consumer.assign(&tpl).map_err(boxed)?;
+    Ok(consumer)
+}
+
+/// Read `n` values from partition 0 of `topic` (read_committed or not), within `within`.
+pub(crate) async fn read_values(
+    topic: &str,
+    read_committed: bool,
+    n: usize,
+    within: Duration,
+) -> DynResult<Vec<String>> {
+    let consumer = assign_consumer(topic, read_committed, &[])?;
+    let deadline = Instant::now() + within;
+    let mut out = Vec::new();
+    while out.len() < n && Instant::now() < deadline {
+        if let Ok(Ok(m)) = tokio::time::timeout(Duration::from_millis(500), consumer.recv()).await {
+            out.push(String::from_utf8_lossy(m.payload().unwrap_or_default()).into_owned());
+        }
+    }
+    Ok(out)
+}
+
+// -------------------------------------------------------------------------------------
+// Item 3: SIGTERM interrupts a lock wait; lock_timeout bounds a stuck lock.
+// -------------------------------------------------------------------------------------
+
+/// Hold the counter row of partition 0 of `topic` (FOR UPDATE) in an open transaction
+/// on `holder`: a Produce to that partition then waits on the row lock.
+pub(crate) async fn hold_partition_counter(holder: &Client, topic: &str) -> DynResult<()> {
+    holder.batch_execute("BEGIN").await.map_err(boxed)?;
+    let n = holder
+        .query(
+            "SELECT 1 FROM kafka.partition_offsets po JOIN kafka.topics t ON t.id = po.topic_id
+             WHERE t.name = $1 AND po.partition_id = 0 FOR UPDATE OF po",
+            &[&topic],
+        )
+        .await
+        .map_err(boxed)?
+        .len();
+    if n != 1 {
+        return Err(format!(
+            "expected one partition_offsets row for {}, got {}",
+            topic, n
+        )
+        .into());
+    }
+    Ok(())
 }

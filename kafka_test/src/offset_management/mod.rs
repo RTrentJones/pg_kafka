@@ -8,8 +8,11 @@
 mod boundaries;
 mod by_timestamp;
 mod commit_fetch;
+mod commit_rules;
 mod edge_cases;
+mod list_offsets_isolation;
 mod no_reuse;
+mod require_stable;
 
 /// The `offset_management` tests, in run order.
 pub fn tests() -> Vec<crate::registry::TestDef> {
@@ -24,5 +27,8 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         edge_cases::test_offset_reset_policy,
         edge_cases::test_offset_commit_multi_partition,
         edge_cases::test_offset_seek,
+        commit_rules::test_w3g_offset_commit_rules,
+        list_offsets_isolation::test_w3_list_offsets_isolation_max_timestamp_and_partitions,
+        require_stable::test_w3_offset_fetch_require_stable,
     ]
 }
