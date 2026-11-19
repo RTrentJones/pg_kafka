@@ -576,30 +576,6 @@ pub trait ProducerStore {
         transactional_id: Option<&str>,
     ) -> Result<(i64, i16)>;
 
-    /// Get the current epoch for a producer ID
-    ///
-    /// # Arguments
-    /// * `producer_id` - The producer ID to look up
-    ///
-    /// # Returns
-    /// The current epoch if producer exists, None otherwise
-    fn get_producer_epoch(&self, producer_id: i64) -> Result<Option<i16>>;
-
-    /// Increment the producer epoch (for reconnection/fencing)
-    ///
-    /// Atomically increments the epoch for the given producer ID.
-    /// Used when a producer reconnects and needs a new epoch.
-    ///
-    /// # Arguments
-    /// * `producer_id` - The producer ID to update
-    ///
-    /// # Returns
-    /// `(producer_id, epoch)`: normally the same id with the bumped epoch; a fresh id at
-    /// epoch 0 once the epoch is exhausted. Clears the producer's sequence state, since
-    /// a new epoch restarts sequence numbers. Errors if the producer is unknown or is
-    /// transactional.
-    fn increment_producer_epoch(&self, producer_id: i64) -> Result<(i64, i16)>;
-
     /// Validate an idempotent producer's batch against the producer state of one
     /// partition (Kafka's model, see [`validate_sequence`]).
     ///
