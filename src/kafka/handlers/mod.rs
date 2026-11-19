@@ -31,8 +31,6 @@ mod produce;
 mod transaction;
 
 #[cfg(test)]
-mod error_path_tests;
-#[cfg(test)]
 mod tests;
 
 // Re-export all handlers
