@@ -79,13 +79,6 @@ KNOWN = {
                                     "unknown_pid (the record is not written)"),
     ("produce_idempotent", "log.offsets"): ("deviation", "PROTOCOL_DEVIATIONS.md §3: follows "
                                             "from unknown_pid"),
-    # ---- known defects
-    ("produce_plain", "log_start_offset"): ("bug", "ProduceResponse log_start_offset is -1 "
-                                            "(Kafka returns the partition's log start offset)"),
-    ("list_offsets", "after_last"): ("bug", "ListOffsets for a timestamp after the last record "
-                                     "answers UNKNOWN_SERVER_ERROR (Kafka: NONE, offset -1)"),
-    ("offsets", "unknown_partition"): ("bug", "OffsetCommit to a partition the topic does not "
-                                       "have is accepted (Kafka: UNKNOWN_TOPIC_OR_PARTITION)"),
 }
 
 # Response fields that differ between any two brokers and carry no protocol meaning here.

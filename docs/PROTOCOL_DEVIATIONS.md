@@ -102,7 +102,7 @@ pg_kafka.compression_type = 'gzip'
   UNKNOWN_PRODUCER_ID (59). Kafka 3.7 creates the producer's state on the fly and accepts
   it at sequence 0. Clients get their ids from InitProducerId, so only a producer idle long
   enough for its state to be removed meets this.
-- Produce responses report `log_start_offset = -1` and `log_append_time_ms = -1`
+- Produce responses report `log_append_time_ms = -1` (topics use CreateTime)
 
 **Client Impact:**
 - Clients can use `enable.idempotence=true` (default in librdkafka 2.0+)
