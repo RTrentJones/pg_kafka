@@ -323,42 +323,42 @@ honored; producer CreateTime timestamps are preserved — BUG-7).
 
 ## API Version Support
 
-### Supported APIs (28 total)
+### Supported APIs (<!--gen:api-count-->28<!--/gen--> total)
 
 These ranges are both advertised in ApiVersions and enforced on inbound requests (each API's `MIN_VERSION`/`MAX_VERSION` in `src/kafka/api/`); a request above its range gets UNSUPPORTED_VERSION in the requested version (see "Error responses" above).
 
 | API Key | Name | Versions | Status |
 |---------|------|----------|--------|
-| 0 | Produce | 3-9 | ✅ Full support (with key-based routing) |
-| 1 | Fetch | 4-11 | ✅ Full support (v12+ not advertised; v13+ uses topic IDs) |
-| 2 | ListOffsets | 1-7 | ✅ Implemented (incl. timestamp lookup) |
-| 3 | Metadata | 0-10 | ✅ Full support (v10 `topic_id` is the zero UUID) |
-| 8 | OffsetCommit | 2-8 | ✅ Full support |
-| 9 | OffsetFetch | 1-7 | ✅ Full support |
-| 10 | FindCoordinator | 0-3 | ✅ Full support |
-| 11 | JoinGroup | 0-7 | ✅ Full support |
-| 12 | Heartbeat | 0-4 | ✅ Full support |
-| 13 | LeaveGroup | 0-4 | ✅ Full support |
-| 14 | SyncGroup | 0-4 | ✅ Full support |
-| 15 | DescribeGroups | 0-5 | ✅ Full support |
-| 16 | ListGroups | 0-4 | ✅ Full support |
-| 17 | SaslHandshake | 0-1 | ✅ Network thread; v0 is advertised (librdkafka requires it) but answered UNSUPPORTED_VERSION, see "Network Security Posture" |
-| 18 | ApiVersions | 0-3 | ✅ Full support |
-| 19 | CreateTopics | 2-5 | ✅ Supported (topic configs ignored, see §13) |
-| 20 | DeleteTopics | 1-4 | ✅ Full support |
-| 21 | DeleteRecords | 0-2 | ✅ Full support |
-| 22 | InitProducerId | 0-4 | ✅ Full support |
-| 24 | AddPartitionsToTxn | 0-3 | ✅ Full support |
-| 25 | AddOffsetsToTxn | 0-3 | ✅ Full support |
-| 26 | EndTxn | 0-3 | ✅ Full support |
-| 28 | TxnOffsetCommit | 0-3 | ✅ Full support |
-| 32 | DescribeConfigs | 1-4 | ✅ Minimal (TOPIC resources, see §13) |
-| 36 | SaslAuthenticate | 0-2 | ✅ PLAIN, SCRAM-SHA-256, SCRAM-SHA-512; `session_lifetime_ms` = 0 (no re-authentication) |
-| 37 | CreatePartitions | 0-2 | ✅ Full support |
-| 42 | DeleteGroups | 0-2 | ✅ Full support |
-| 44 | IncrementalAlterConfigs | 0-1 | ✅ Minimal (`retention.ms` only, see §13) |
+| 0 | Produce | <!--gen:api-versions:Produce-->3-9<!--/gen--> | ✅ Full support (with key-based routing) |
+| 1 | Fetch | <!--gen:api-versions:Fetch-->4-11<!--/gen--> | ✅ Full support (v12+ not advertised; v13+ uses topic IDs) |
+| 2 | ListOffsets | <!--gen:api-versions:ListOffsets-->1-7<!--/gen--> | ✅ Implemented (incl. timestamp lookup) |
+| 3 | Metadata | <!--gen:api-versions:Metadata-->0-10<!--/gen--> | ✅ Full support (v10 `topic_id` is the zero UUID) |
+| 8 | OffsetCommit | <!--gen:api-versions:OffsetCommit-->2-8<!--/gen--> | ✅ Full support |
+| 9 | OffsetFetch | <!--gen:api-versions:OffsetFetch-->1-7<!--/gen--> | ✅ Full support |
+| 10 | FindCoordinator | <!--gen:api-versions:FindCoordinator-->0-3<!--/gen--> | ✅ Full support |
+| 11 | JoinGroup | <!--gen:api-versions:JoinGroup-->0-7<!--/gen--> | ✅ Full support |
+| 12 | Heartbeat | <!--gen:api-versions:Heartbeat-->0-4<!--/gen--> | ✅ Full support |
+| 13 | LeaveGroup | <!--gen:api-versions:LeaveGroup-->0-4<!--/gen--> | ✅ Full support |
+| 14 | SyncGroup | <!--gen:api-versions:SyncGroup-->0-4<!--/gen--> | ✅ Full support |
+| 15 | DescribeGroups | <!--gen:api-versions:DescribeGroups-->0-5<!--/gen--> | ✅ Full support |
+| 16 | ListGroups | <!--gen:api-versions:ListGroups-->0-4<!--/gen--> | ✅ Full support |
+| 17 | SaslHandshake | <!--gen:api-versions:SaslHandshake-->0-1<!--/gen--> | ✅ Network thread; v0 is advertised (librdkafka requires it) but answered UNSUPPORTED_VERSION, see "Network Security Posture" |
+| 18 | ApiVersions | <!--gen:api-versions:ApiVersions-->0-3<!--/gen--> | ✅ Full support |
+| 19 | CreateTopics | <!--gen:api-versions:CreateTopics-->2-5<!--/gen--> | ✅ Supported (topic configs ignored, see §13) |
+| 20 | DeleteTopics | <!--gen:api-versions:DeleteTopics-->1-4<!--/gen--> | ✅ Full support |
+| 21 | DeleteRecords | <!--gen:api-versions:DeleteRecords-->0-2<!--/gen--> | ✅ Full support |
+| 22 | InitProducerId | <!--gen:api-versions:InitProducerId-->0-4<!--/gen--> | ✅ Full support |
+| 24 | AddPartitionsToTxn | <!--gen:api-versions:AddPartitionsToTxn-->0-3<!--/gen--> | ✅ Full support |
+| 25 | AddOffsetsToTxn | <!--gen:api-versions:AddOffsetsToTxn-->0-3<!--/gen--> | ✅ Full support |
+| 26 | EndTxn | <!--gen:api-versions:EndTxn-->0-3<!--/gen--> | ✅ Full support |
+| 28 | TxnOffsetCommit | <!--gen:api-versions:TxnOffsetCommit-->0-3<!--/gen--> | ✅ Full support |
+| 32 | DescribeConfigs | <!--gen:api-versions:DescribeConfigs-->1-4<!--/gen--> | ✅ Minimal (TOPIC resources, see §13) |
+| 36 | SaslAuthenticate | <!--gen:api-versions:SaslAuthenticate-->0-2<!--/gen--> | ✅ PLAIN, SCRAM-SHA-256, SCRAM-SHA-512; `session_lifetime_ms` = 0 (no re-authentication) |
+| 37 | CreatePartitions | <!--gen:api-versions:CreatePartitions-->0-2<!--/gen--> | ✅ Full support |
+| 42 | DeleteGroups | <!--gen:api-versions:DeleteGroups-->0-2<!--/gen--> | ✅ Full support |
+| 44 | IncrementalAlterConfigs | <!--gen:api-versions:IncrementalAlterConfigs-->0-1<!--/gen--> | ✅ Minimal (`retention.ms` only, see §13) |
 
-**Note:** OffsetFetch v8+ uses a different (multi-group) response format. We support v0-7.
+**Note:** OffsetFetch v8+ uses a different (multi-group) response format. We support <!--gen:api-vversions:OffsetFetch-->v1-v7<!--/gen-->.
 
 ## Error Handling
 

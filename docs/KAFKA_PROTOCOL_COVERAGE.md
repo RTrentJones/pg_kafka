@@ -10,7 +10,7 @@
 
 | Metric | Value |
 |--------|-------|
-| **API Coverage** | 28 of ~50 standard Kafka APIs (56%) |
+| **API Coverage** | <!--gen:api-coverage-->28 of ~50 standard Kafka APIs (56%)<!--/gen--> |
 | **Build Status** | ✅ Compiles with zero warnings |
 | **Test Suite** | Unit + property + E2E; counts in [TEST_STRATEGY.md](TEST_STRATEGY.md#test-summary) |
 | **Architecture** | Repository Pattern with typed errors |
@@ -18,21 +18,21 @@
 
 ---
 
-## Implemented APIs (28 total)
+## Implemented APIs (<!--gen:api-count-->28<!--/gen--> total)
 
 Version ranges below are the ones advertised in the ApiVersions response and enforced on inbound requests (each API's `MIN_VERSION`/`MAX_VERSION` in `src/kafka/api/`). A request above its range is answered with UNSUPPORTED_VERSION in the requested version (echoing the requested topics/partitions/groups where the response has no top-level error code); a request below it closes the connection, as Kafka does (the minimums are the lowest versions the kafka-protocol crate can decode and encode). A body that does not decode gets INVALID_REQUEST; see PROTOCOL_DEVIATIONS.md, "Error responses". ApiVersions outside v0-v3 is answered in the v0 format with UNSUPPORTED_VERSION and the full key list (KIP-511).
 
 ### 1. Core Metadata (2 APIs) ✅ 100% Coverage
 | API | Key | Versions | Status | Notes |
 |-----|-----|----------|--------|-------|
-| ApiVersions | 18 | v0-v3 | ✅ Complete | Returns supported API versions |
-| Metadata | 3 | v0-v10 | ✅ Complete | Topic and broker discovery; v4+ `allow_auto_topic_creation=false` is honored; v10 `topic_id` is left as the zero UUID |
+| ApiVersions | 18 | <!--gen:api-vversions:ApiVersions-->v0-v3<!--/gen--> | ✅ Complete | Returns supported API versions |
+| Metadata | 3 | <!--gen:api-vversions:Metadata-->v0-v10<!--/gen--> | ✅ Complete | Topic and broker discovery; v4+ `allow_auto_topic_creation=false` is honored; v10 `topic_id` is left as the zero UUID |
 
 ### 2. Producer (2 APIs) ✅ 100% Coverage
 | API | Key | Versions | Status | Notes |
 |-----|-----|----------|--------|-------|
-| Produce | 0 | v3-v9 | ✅ Complete | RecordBatch v2 format with sequence validation |
-| InitProducerId | 22 | v0-v4 | ✅ Complete | Allocate producer ID for idempotency |
+| Produce | 0 | <!--gen:api-vversions:Produce-->v3-v9<!--/gen--> | ✅ Complete | RecordBatch v2 format with sequence validation |
+| InitProducerId | 22 | <!--gen:api-vversions:InitProducerId-->v0-v4<!--/gen--> | ✅ Complete | Allocate producer ID for idempotency |
 
 **Implementation Notes (Phase 9)**:
 - ✅ Idempotent producer support with sequence validation
@@ -43,27 +43,27 @@ Version ranges below are the ones advertised in the ApiVersions response and enf
 ### 3. Consumer - Data Access (4 APIs) ✅ 100% Coverage
 | API | Key | Versions | Status | Notes |
 |-----|-----|----------|--------|-------|
-| Fetch | 1 | v4-v11 | ✅ Complete | Read messages with long polling support (capped at v11: v13+ drops topic names for topic IDs) |
-| OffsetCommit | 8 | v2-v8 | ✅ Complete | Commit consumed offsets |
-| OffsetFetch | 9 | v1-v7 | ✅ Complete | Retrieve committed offsets (v8+ not supported) |
-| ListOffsets | 2 | v1-v7 | ✅ Complete | Get earliest/latest/by-timestamp offsets |
+| Fetch | 1 | <!--gen:api-vversions:Fetch-->v4-v11<!--/gen--> | ✅ Complete | Read messages with long polling support (capped at v11: v13+ drops topic names for topic IDs) |
+| OffsetCommit | 8 | <!--gen:api-vversions:OffsetCommit-->v2-v8<!--/gen--> | ✅ Complete | Commit consumed offsets |
+| OffsetFetch | 9 | <!--gen:api-vversions:OffsetFetch-->v1-v7<!--/gen--> | ✅ Complete | Retrieve committed offsets (v8+ not supported) |
+| ListOffsets | 2 | <!--gen:api-vversions:ListOffsets-->v1-v7<!--/gen--> | ✅ Complete | Get earliest/latest/by-timestamp offsets |
 
 **Implementation Notes:**
 - ✅ ListOffsets supports special timestamps (-2 = earliest, -1 = latest) and arbitrary timestamp lookup (earliest offset whose record timestamp ≥ target; AUDIT-2026-06 BUG-7 + CONF-7)
-- ✅ OffsetFetch limited to v0-v7 (v8+ requires different response format)
+- ✅ OffsetFetch limited to <!--gen:api-vversions:OffsetFetch-->v1-v7<!--/gen--> (v8+ requires different response format)
 - ✅ All consumer data access APIs fully functional
 - ✅ Long polling with max_wait_ms/min_bytes support
 
 ### 4. Consumer Group Coordinator (7 APIs) ✅ 100% Coverage
 | API | Key | Versions | Status | Notes |
 |-----|-----|----------|--------|-------|
-| FindCoordinator | 10 | v0-v3 | ✅ Complete | Discover group coordinator |
-| JoinGroup | 11 | v0-v7 | ✅ Complete | Join group, get member ID |
-| Heartbeat | 12 | v0-v4 | ✅ Complete | Maintain membership, returns REBALANCE_IN_PROGRESS |
-| LeaveGroup | 13 | v0-v4 | ✅ Complete | Graceful departure, triggers rebalance |
-| SyncGroup | 14 | v0-v4 | ✅ Complete | Partition assignment sync |
-| DescribeGroups | 15 | v0-v5 | ✅ Complete | Get consumer group state and members |
-| ListGroups | 16 | v0-v4 | ✅ Complete | List all consumer groups |
+| FindCoordinator | 10 | <!--gen:api-vversions:FindCoordinator-->v0-v3<!--/gen--> | ✅ Complete | Discover group coordinator |
+| JoinGroup | 11 | <!--gen:api-vversions:JoinGroup-->v0-v7<!--/gen--> | ✅ Complete | Join group, get member ID |
+| Heartbeat | 12 | <!--gen:api-vversions:Heartbeat-->v0-v4<!--/gen--> | ✅ Complete | Maintain membership, returns REBALANCE_IN_PROGRESS |
+| LeaveGroup | 13 | <!--gen:api-vversions:LeaveGroup-->v0-v4<!--/gen--> | ✅ Complete | Graceful departure, triggers rebalance |
+| SyncGroup | 14 | <!--gen:api-vversions:SyncGroup-->v0-v4<!--/gen--> | ✅ Complete | Partition assignment sync |
+| DescribeGroups | 15 | <!--gen:api-vversions:DescribeGroups-->v0-v5<!--/gen--> | ✅ Complete | Get consumer group state and members |
+| ListGroups | 16 | <!--gen:api-vversions:ListGroups-->v0-v4<!--/gen--> | ✅ Complete | List all consumer groups |
 
 **Implementation Notes (Phase 5 Complete)**:
 - In-memory coordinator state (ephemeral, rebuilt on restart)
@@ -76,10 +76,10 @@ Version ranges below are the ones advertised in the ApiVersions response and enf
 ### 5. Admin APIs (4 APIs) ✅ 100% Coverage (Phase 6)
 | API | Key | Versions | Status | Notes |
 |-----|-----|----------|--------|-------|
-| CreateTopics | 19 | v2-v5 | ✅ Complete | Create topics with partition count |
-| DeleteTopics | 20 | v1-v4 | ✅ Complete | Delete topics and messages |
-| CreatePartitions | 37 | v0-v2 | ✅ Complete | Add partitions to existing topics |
-| DeleteGroups | 42 | v0-v2 | ✅ Complete | Delete consumer groups |
+| CreateTopics | 19 | <!--gen:api-vversions:CreateTopics-->v2-v5<!--/gen--> | ✅ Complete | Create topics with partition count |
+| DeleteTopics | 20 | <!--gen:api-vversions:DeleteTopics-->v1-v4<!--/gen--> | ✅ Complete | Delete topics and messages |
+| CreatePartitions | 37 | <!--gen:api-vversions:CreatePartitions-->v0-v2<!--/gen--> | ✅ Complete | Add partitions to existing topics |
+| DeleteGroups | 42 | <!--gen:api-vversions:DeleteGroups-->v0-v2<!--/gen--> | ✅ Complete | Delete consumer groups |
 
 **Implementation Notes (Phase 6):**
 - ✅ CreateTopics respects the partition count parameter (`num_partitions = -1` uses `pg_kafka.default_partitions`; `0` or other values below 1 return INVALID_PARTITIONS); per-topic `configs`, replica assignments, and `replication_factor` are ignored (the response always reports replication factor 1)
@@ -91,10 +91,10 @@ Version ranges below are the ones advertised in the ApiVersions response and enf
 ### 6. Transaction APIs (4 APIs) ✅ 100% Coverage
 | API | Key | Versions | Status | Notes |
 |-----|-----|----------|--------|-------|
-| AddPartitionsToTxn | 24 | v0-v3 | ✅ Complete | Register partitions in transaction |
-| AddOffsetsToTxn | 25 | v0-v3 | ✅ Complete | Include consumer offsets in transaction |
-| EndTxn | 26 | v0-v3 | ✅ Complete | Commit or abort transaction |
-| TxnOffsetCommit | 28 | v0-v3 | ✅ Complete | Commit offsets atomically within transaction |
+| AddPartitionsToTxn | 24 | <!--gen:api-vversions:AddPartitionsToTxn-->v0-v3<!--/gen--> | ✅ Complete | Register partitions in transaction |
+| AddOffsetsToTxn | 25 | <!--gen:api-vversions:AddOffsetsToTxn-->v0-v3<!--/gen--> | ✅ Complete | Include consumer offsets in transaction |
+| EndTxn | 26 | <!--gen:api-vversions:EndTxn-->v0-v3<!--/gen--> | ✅ Complete | Commit or abort transaction |
+| TxnOffsetCommit | 28 | <!--gen:api-vversions:TxnOffsetCommit-->v0-v3<!--/gen--> | ✅ Complete | Commit offsets atomically within transaction |
 
 **Implementation Notes (Phase 10):**
 - ✅ Full exactly-once semantics (EOS)
@@ -106,9 +106,9 @@ Version ranges below are the ones advertised in the ApiVersions response and enf
 ### 7. Configuration & Log Management (3 APIs) ✅
 | API | Key | Versions | Status | Notes |
 |-----|-----|----------|--------|-------|
-| DescribeConfigs | 32 | v1-v4 | ✅ Complete | TOPIC resources only: `retention.ms` and `cleanup.policy=delete` |
-| IncrementalAlterConfigs | 44 | v0-v1 | ✅ Complete | SET/DELETE of `retention.ms` per topic only |
-| DeleteRecords | 21 | v0-v2 | ✅ Complete | Truncate a partition below an offset |
+| DescribeConfigs | 32 | <!--gen:api-vversions:DescribeConfigs-->v1-v4<!--/gen--> | ✅ Complete | TOPIC resources only: `retention.ms` and `cleanup.policy=delete` |
+| IncrementalAlterConfigs | 44 | <!--gen:api-vversions:IncrementalAlterConfigs-->v0-v1<!--/gen--> | ✅ Complete | SET/DELETE of `retention.ms` per topic only |
+| DeleteRecords | 21 | <!--gen:api-vversions:DeleteRecords-->v0-v2<!--/gen--> | ✅ Complete | Truncate a partition below an offset |
 
 **Implementation Notes:**
 - ✅ DescribeConfigs reports `retention.ms` with its real value and source (DYNAMIC_TOPIC when a per-topic override is set, otherwise DEFAULT derived from `pg_kafka.message_retention_hours`, `-1` = infinite); non-topic resources get INVALID_REQUEST and unknown topics UNKNOWN_TOPIC_OR_PARTITION. Min version is v1 because the kafka-protocol crate implements v1-v4 only
@@ -118,8 +118,8 @@ Version ranges below are the ones advertised in the ApiVersions response and enf
 ### 8. Security APIs (2 APIs) ✅
 | API | Key | Versions | Status | Notes |
 |-----|-----|----------|--------|-------|
-| SaslHandshake | 17 | v0-v1 | ✅ Complete | Mechanism negotiation; v0 (unframed tokens) advertised but answered UNSUPPORTED_VERSION |
-| SaslAuthenticate | 36 | v0-v2 | ✅ Complete | PLAIN, SCRAM-SHA-256, SCRAM-SHA-512; no re-authentication (`session_lifetime_ms` 0) |
+| SaslHandshake | 17 | <!--gen:api-vversions:SaslHandshake-->v0-v1<!--/gen--> | ✅ Complete | Mechanism negotiation; v0 (unframed tokens) advertised but answered UNSUPPORTED_VERSION |
+| SaslAuthenticate | 36 | <!--gen:api-vversions:SaslAuthenticate-->v0-v2<!--/gen--> | ✅ Complete | PLAIN, SCRAM-SHA-256, SCRAM-SHA-512; no re-authentication (`session_lifetime_ms` 0) |
 
 **Implementation Notes:**
 - ✅ Kafka-style listener security protocols (PLAINTEXT, SSL, SASL_PLAINTEXT, SASL_SSL), several listeners at once, TLS via rustls with optional mutual TLS
@@ -378,17 +378,14 @@ This section analyzes all unimplemented APIs, their use cases, and priority for 
 ### Recommendation for Drop-In Replacement
 
 **Current State**:
-```
-28 APIs (produce/consume, coordinator, transactions, admin, config/log management, SASL)
-= 99% of produce/consume workloads covered
-```
+<!--gen:api-count-->28<!--/gen--> APIs (produce/consume, coordinator, transactions, admin, config/log
+management, SASL), covering the produce/consume workloads.
 
-**Comfortable Drop-In (Add 1 API)**:
+**Comfortable Drop-In (add 1 API)**:
 ```
 ✅ DescribeConfigs (32)    - Already implemented
 ✅ DeleteRecords (21)      - Already implemented
 + DescribeCluster (60)     - Admin tools work (easy to stub)
-= 27 APIs total (54% coverage)
 ```
 
 **With Authentication**:
@@ -397,7 +394,7 @@ This section analyzes all unimplemented APIs, their use cases, and priority for 
 ✅ SaslAuthenticate (36)   - Already implemented
 ```
 
-**Verdict**: pg_kafka is already a viable drop-in replacement for **most Kafka workloads**. The remaining ~24 APIs are either:
+**Verdict**: pg_kafka is already a viable drop-in replacement for **most Kafka workloads**. The remaining standard APIs are either:
 - Advanced or monitoring features (transaction admin APIs, share groups)
 - Multi-broker operations (replication, leader election)
 - Admin utilities (can be done via SQL)
@@ -519,7 +516,7 @@ one place: [TEST_STRATEGY.md](TEST_STRATEGY.md#test-summary).
 
 ## Conclusion
 
-**Current State**: Comprehensive Kafka-compatible broker with 28 APIs implemented
+**Current State**: Comprehensive Kafka-compatible broker with <!--gen:api-count-->28<!--/gen--> APIs implemented
 **Coverage**: 56% of standard Kafka protocol (full producer/consumer/coordinator/admin/transaction/config support)
 **Architecture**: Clean, maintainable, well-documented with Repository Pattern
 **Test Status**: CI-gated; counts in [TEST_STRATEGY.md](TEST_STRATEGY.md#test-summary)

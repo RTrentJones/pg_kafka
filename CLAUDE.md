@@ -51,7 +51,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Listener security protocols PLAINTEXT / SSL / SASL_PLAINTEXT / SASL_SSL, several listeners at once (`pg_kafka.additional_listeners`), each advertising its own address; SCRAM credentials in `kafka.sasl_credentials`, managed with `pg_kafka_create_user` & co.; per-connection principal recorded (authorization is not implemented)
 - Automated E2E tests with real Kafka client (rdkafka)
 
-**API Coverage:** 28 of ~50 standard Kafka APIs (56%)
+**API Coverage:** <!--gen:api-coverage-->28 of ~50 standard Kafka APIs (56%)<!--/gen--> (full table: README "Implemented APIs", generated from the `kafka_apis!` registry)
 **Test Status:** unit + property + E2E, all CI-gated. Counts live only in `docs/TEST_STRATEGY.md` ("Test Summary"); do not repeat them elsewhere.
 **Coverage Target:** 80%+ (testable code)
 
@@ -577,6 +577,9 @@ leaves), and confine a ctid-based statement to one leaf (`tableoid`), since ctid
 
 ## Configuration
 
+The complete, generated reference (type, default, range, context of every GUC) is
+`docs/CONFIGURATION.md`; the block below is an annotated overview.
+
 ```sql
 -- In postgresql.conf:
 shared_preload_libraries = 'pg_kafka'
@@ -769,7 +772,7 @@ Per-category counts are in `docs/TEST_STRATEGY.md`; `cargo run --release -- --li
 | **performance** | Throughput baselines, latency percentiles, scaling |
 | **metadata** | Metadata refresh, all topics, nonexistent topic |
 | **protocol** | ApiVersions negotiation, correlation ID, unknown API, pipelining, response ordering |
-| **auth** | SASL_PLAINTEXT (PLAIN, SCRAM-SHA-256/512), SSL (+ untrusted CA, mutual TLS), SASL_SSL, wrong passwords, pre-auth gating, user SQL. Sequential: generates certs with the `openssl` CLI, adds listeners 9093-9095 via ALTER SYSTEM and restarts the worker; the last test resets them. Needs the DB host's filesystem and superuser |
+| **auth** | SASL_PLAINTEXT (PLAIN, SCRAM-SHA-256/512), SSL (+ untrusted CA, mutual TLS), SASL_SSL, wrong passwords, pre-auth gating, user SQL. Sequential: generates certs with the `openssl` CLI, adds listeners 19093-19095 via ALTER SYSTEM and restarts the worker; the last test resets them. Needs the DB host's filesystem and superuser |
 
 ### Running E2E Tests with CLI Options
 

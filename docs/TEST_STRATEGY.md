@@ -8,25 +8,23 @@
 ## Test Summary
 
 **This section is the one place the repository states test counts.** Other docs
-(`README.md`, `CLAUDE.md`, `docs/*`) link here instead of repeating numbers, so
-there is one table to refresh when tests land. Counts drift between refreshes;
-the CI run is the source of truth.
+(`README.md`, `CLAUDE.md`, `docs/*`) link here instead of repeating numbers. The numbers below
+are generated (`scripts/gen-docs.py --write --only tests`) and CI fails when they are stale, so
+they match the commit they are in.
 
-Counted on 2026-11-18, with the full 0.1.0 change set (group commit, held JoinGroup/SyncGroup, metrics, roles, API registry, time partitions, TLS/SASL):
+| Suite | Count | Coverage |
+|-------|-------|----------|
+| Unit Tests | <!--gen:tests-unit-->859<!--/gen--> | Core logic, handlers, storage, protocol, shadow (`src/`, includes in-module proptest fuzz harnesses) |
+| Property Tests | <!--gen:tests-property-->10<!--/gen--> | `tests/property_tests.rs`: proptest wire-format invariants and boundary tests |
+| E2E Tests | <!--gen:tests-e2e-->259<!--/gen--> | Full protocol integration (`kafka_test/`, per category [below](#e2e-test-categories)) |
+| **Total** | **<!--gen:tests-total-->1128<!--/gen-->** | |
 
-| Category | Count | Coverage |
-|----------|-------|----------|
-| Unit Tests | 855 | Core logic, handlers, storage, protocol, shadow (`src/`, includes in-module proptest fuzz harnesses) |
-| Property Tests | 10 | `tests/property_tests.rs`: 8 proptest wire-format invariants + 2 boundary tests (CI-run) |
-| E2E Tests | 259 | Full protocol integration (`kafka_test/`, 20 categories) |
-| **Total** | **1124** | |
-
-Regenerate (none of these needs a running broker):
+The generator counts with (none of these needs a running broker):
 
 ```bash
 cargo test --features pg14 --lib -- --list | grep -c ': test$'                # unit
 cargo test --features pg14 --test property_tests -- --list | grep -c ': test$'  # property
-cd kafka_test && cargo run --release -- --list | tail -1                      # E2E total + categories
+cd kafka_test && cargo run --release -- --list                                 # E2E per category
 ```
 
 `kafka_test`'s own runner unit tests (`cargo test --bin kafka_test` in `kafka_test/`)
@@ -34,25 +32,22 @@ are not counted above.
 
 ---
 
-## Unit Test Distribution (indicative)
+## Unit Test Distribution
 
-| Module | Tests | Focus |
-|--------|-------|-------|
-| Shadow Mode (`kafka/shadow/`) | 149 | External forwarding, SASL/SSL settings, licensing, routing, outbox, config |
-| Handler Logic (`kafka/handlers/`) | 144 | All 26 API handlers, mostly with MockKafkaStore (`handlers/tests.rs` holds 80) |
-| Protocol (`kafka/protocol/`) | 110 | Decoding, encoding, RecordBatch framing, 4 proptest fuzz harnesses |
-| Assignment (`kafka/assignment/`) | 63 | Range, RoundRobin, Sticky algorithms, subscription/assignment codecs |
-| Storage Layer (`kafka/storage/`) | 90 | Store role traits, types, mock verification, retention and partition-drop planning, privileges |
-| API Registry (`kafka/api/`) | 17 | Every advertised version encodes, error-response echoes, network-thread APIs |
-| Authentication (`kafka/auth/`) | 30 | SCRAM (RFC 5802/7677 vectors), PLAIN, session rules, listener and TLS config |
-| Messages | 53 | Request/response types, size estimators |
-| Config | 36 | GUC configuration |
-| Response Builders | 35 | Response construction |
-| Coordinator | 60 | Group state management |
-| Testing Infrastructure (`testing/`) | 23 | Mocks, helpers |
-| Error Handling | 22 | Error code mapping, typed errors |
-| Partitioner | 9 | Murmur2 hash, key-based routing |
-| Other | 45 | Constants, dispatch, pending fetches, broker metadata, context, listener, worker |
+Where the unit tests live (`cargo test --features pg14 --lib <module path> -- --list` counts one
+module):
+
+| Module | Focus |
+|--------|-------|
+| Shadow Mode (`kafka/shadow/`) | External forwarding, SASL/SSL settings, licensing, routing, outbox, config |
+| Handler Logic (`kafka/handlers/`) | Every API handler, mostly with MockKafkaStore (`handlers/tests.rs`) |
+| Protocol (`kafka/protocol/`) | Decoding, encoding, RecordBatch framing, proptest fuzz harnesses |
+| Assignment (`kafka/assignment/`) | Range, RoundRobin, Sticky algorithms, subscription/assignment codecs |
+| Storage Layer (`kafka/storage/`) | Store role traits, types, mock verification, retention and partition-drop planning, privileges |
+| API Registry (`kafka/api/`) | Every advertised version encodes, error-response echoes, network-thread APIs, generated docs |
+| Authentication (`kafka/auth/`) | SCRAM (RFC 5802/7677 vectors), PLAIN, session rules, listener and TLS config |
+| Messages, response builders, coordinator, errors, partitioner, config | Request/response types, group state, error-code mapping, murmur2, GUC defaults |
+| Testing Infrastructure (`testing/`) | Mocks, helpers |
 
 ### Running Unit Tests
 
@@ -66,30 +61,33 @@ cargo test --features pg14                           # both
 
 ## E2E Test Categories
 
-Per-category counts from `kafka_test --list` at the commit named in [Test Summary](#test-summary).
+Generated from `kafka_test --list` (what each category covers: CLAUDE.md, "Test Categories").
 
-| Category | Tests | Purpose |
-|----------|-------|---------|
-| Admin APIs (`admin`) | 19 | CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups, DescribeConfigs, IncrementalAlterConfigs, DeleteRecords, per-topic retention |
-| Producer (`producer`) | 5 | Basic produce, batch produce, acks=0, ack-implies-visibility, timestamps |
-| Consumer (`consumer`) | 4 | Basic consume, headers, from offset, multiple messages |
-| Consumer Groups (`consumer_group`) | 13 | Lifecycle, two-member, rebalance, strategies |
-| Offset Management (`offset_management`) | 10 | Commit/fetch, boundaries, no offset reuse, ListOffsets by timestamp, multi-partition |
-| Partitioning (`partition`) | 9 | Multi-partition produce, key routing, distribution |
-| Compression (`compression`) | 10 | gzip, snappy, lz4, zstd, roundtrip, edge cases |
-| Idempotent (`idempotent`) | 7 | InitProducerId, deduplication, epoch, multi-partition |
-| Transaction (`transaction`) | 20 | EOS, isolation levels, LSO, fencing, timeouts, atomicity |
-| Shadow (`shadow`) | 29 | Dual-write, external-only/local-only, percentage dial-up, topic mapping, outbox, transactions, replay |
-| Long Polling (`long_poll`) | 10 | Timeout, immediate return, producer wakeup, precision, per-connection cap |
-| Error Paths (`error_paths`) | 61 | Invalid partitions, unknown topics, coordinator errors, protocol/transaction/group regressions |
-| Edge Cases (`edge_cases`) | 13 | Empty topics, large messages, boundary values, retention sweep |
-| Concurrent (`concurrent`) | 14 | Multi-producer, multi-consumer, pipelining, races, heartbeat bypass |
-| Negative (`negative`) | 5 | Connection refused, timeouts, invalid operations, superuser-only GUC |
-| Performance (`performance`) | 7 | Throughput baselines, latency percentiles, scaling |
-| Metadata (`metadata`) | 3 | Metadata refresh, all topics, nonexistent topic |
-| Protocol (`protocol`) | 5 | ApiVersions negotiation, correlation ID, unknown API, pipelining, ordering with long poll |
-| Time Partitions (`part`) | 3 | Whole-partition retention drops, pending-transaction blocking, maintenance, least privilege |
-| Authentication (`auth`) | 12 | SASL PLAIN/SCRAM, TLS, mutual TLS, SASL_SSL, pre-auth gating, user management SQL |
+<!--gen:tests-e2e-categories-->
+| Category | Tests |
+|----------|-------|
+| `admin` | 19 |
+| `producer` | 5 |
+| `consumer` | 4 |
+| `offset_management` | 10 |
+| `consumer_group` | 13 |
+| `partition` | 9 |
+| `error_paths` | 61 |
+| `edge_cases` | 13 |
+| `concurrent` | 14 |
+| `negative` | 5 |
+| `performance` | 7 |
+| `long_poll` | 10 |
+| `compression` | 10 |
+| `idempotent` | 7 |
+| `transaction` | 20 |
+| `shadow` | 29 |
+| `metadata` | 3 |
+| `protocol` | 5 |
+| `part` | 3 |
+| `auth` | 12 |
+| **Total** | **259** |
+<!--/gen-->
 
 ### Running E2E Tests
 
@@ -156,7 +154,7 @@ pg_kafka uses `PGC_POSTMASTER` GUC variables that must be defined before Postgre
 | 1-2 | Producer/Metadata | Protocol encoding | Basic produce |
 | 3 | Consumer | Fetch handlers | Consumer tests |
 | 3B | Coordinator | Group state tests | Group lifecycle |
-| 4 | Assignment | 69 assignment-module tests | Multi-member |
+| 4 | Assignment | Assignment-module tests | Multi-member |
 | 5 | Rebalancing | Timeout detection | Session timeout |
 | 6 | Admin APIs | Handler tests | Create/delete ops |
 | 7 | Partitioning | Murmur2 hash | Key routing |

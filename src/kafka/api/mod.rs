@@ -685,4 +685,6 @@ kafka_apis! {
 }
 
 #[cfg(test)]
+mod docs;
+#[cfg(test)]
 pub(crate) mod tests;
