@@ -63,15 +63,15 @@
 //! The forwarder maintains internal mutable state for primary detection caching.
 
 use super::config::{SyncMode, TopicConfigCache, TopicShadowConfig, WriteMode};
-use super::forwarder::ForwardDecision;
 use super::license::LicenseValidator;
 use super::outbox::{
     OutboxClaim, PendingForwardRecord, ShadowDb, SpiShadowDb, OUTBOX_MAX_BACKOFF_MS,
 };
 use super::primary::PrimaryStatus;
-use super::routing::make_forward_decision;
+use super::routing::{make_forward_decision, ForwardDecision};
 use super::{
-    ForwardAck, ForwardOutcome, ForwardRecord, ForwardRequest, HeldRelease, RowKey, SyncHold,
+    lock, read_lock, write_lock, ForwardAck, ForwardOutcome, ForwardRecord, ForwardRequest,
+    HeldRelease, RowKey, SyncHold,
 };
 use crate::kafka::error::{KafkaError, Result};
 use crate::kafka::messages::Record;
@@ -82,7 +82,7 @@ use crate::kafka::storage::{
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 // A committed transactional record's outbox pointer (`PendingForwardRecord`,
@@ -126,37 +126,19 @@ impl From<Vec<PendingForwardRecord>> for PendingTxnBuffer {
     }
 }
 
-/// Cache of pending transactional records awaiting commit
-type PendingTxnMessages = Arc<RwLock<HashMap<TxnKey, PendingTxnBuffer>>>;
+/// Pending transactional records awaiting commit, by producer.
+type PendingTxnMessages = RwLock<HashMap<TxnKey, PendingTxnBuffer>>;
 
-/// Metrics for shadow forwarding operations
+/// In-memory forwarding counters since the last [`ShadowStore::flush_metrics_to_db`]
+/// (the durable per-partition counts are in `kafka.shadow_metrics`).
 #[derive(Debug, Default)]
 pub struct ShadowMetrics {
-    /// Messages successfully forwarded to external Kafka
+    /// Messages delivered to the external cluster.
     pub forwarded: AtomicU64,
-    /// Messages skipped due to percentage routing
+    /// Messages sampled out by percentage routing.
     pub skipped: AtomicU64,
-    /// Forward attempts that failed
+    /// Failed forward attempts.
     pub failed: AtomicU64,
-    /// Messages written to local due to external failure (external_only mode)
-    pub fallback_local: AtomicU64,
-}
-
-impl ShadowMetrics {
-    /// Create new metrics with all counters at zero
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Get a snapshot of current metric values
-    pub fn snapshot(&self) -> (u64, u64, u64, u64) {
-        (
-            self.forwarded.load(Ordering::Relaxed),
-            self.skipped.load(Ordering::Relaxed),
-            self.failed.load(Ordering::Relaxed),
-            self.fallback_local.load(Ordering::Relaxed),
-        )
-    }
 }
 
 /// How often the worker's outbox tick runs when nothing asked for an earlier one.
@@ -200,7 +182,7 @@ pub struct ShadowStore<S: KafkaStore, D: ShadowDb = SpiShadowDb> {
     /// Shadow mode's own SQL and GUC reads (outbox, config, dead letters)
     db: D,
     /// Topic configuration cache
-    topic_cache: Arc<TopicConfigCache>,
+    topic_cache: TopicConfigCache,
     /// Primary status checker
     primary_status: Mutex<PrimaryStatus>,
     /// Shadow forwarding metrics
@@ -254,12 +236,12 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
         Self {
             inner,
             db,
-            topic_cache: Arc::new(TopicConfigCache::new()),
+            topic_cache: TopicConfigCache::new(),
             primary_status: Mutex::new(PrimaryStatus::new()),
-            metrics: ShadowMetrics::new(),
+            metrics: ShadowMetrics::default(),
             forward_tx: RwLock::new(None),
             forward_ack_rx: RwLock::new(None),
-            pending_txn_messages: Arc::new(RwLock::new(HashMap::new())),
+            pending_txn_messages: RwLock::new(HashMap::new()),
             license: RwLock::new(None),
             inflight: super::inflight::InflightTracker::new(INFLIGHT_EVICT_AFTER),
             current_slot: AtomicU64::new(0),
@@ -277,10 +259,7 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
 
     /// Set the forward channel to the network-thread forwarder.
     pub fn set_forward_channel(&self, tx: crossbeam_channel::Sender<ForwardRequest>) {
-        let mut guard = self.forward_tx.write().unwrap_or_else(|poisoned| {
-            tracing::warn!("forward_tx write lock was poisoned, recovering");
-            poisoned.into_inner()
-        });
+        let mut guard = write_lock(&self.forward_tx);
         *guard = Some(tx);
     }
 
@@ -290,55 +269,40 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
     /// thread drains this on its outbox tick to finalize
     /// `kafka.shadow_tracking` rows. (SH-9)
     pub fn set_ack_channel(&self, rx: crossbeam_channel::Receiver<ForwardAck>) {
-        let mut guard = self.forward_ack_rx.write().unwrap_or_else(|poisoned| {
-            tracing::warn!("forward_ack_rx write lock was poisoned, recovering");
-            poisoned.into_inner()
-        });
+        let mut guard = write_lock(&self.forward_ack_rx);
         *guard = Some(rx);
     }
 
     /// Set license key and initialize validator (Commercial License)
     pub fn set_license_key(&self, license_key: &str) {
         let validator = LicenseValidator::new(license_key);
-        let mut guard = self.license.write().unwrap_or_else(|poisoned| {
-            tracing::warn!("license write lock was poisoned, recovering");
-            poisoned.into_inner()
-        });
+        let mut guard = write_lock(&self.license);
         *guard = Some(validator);
     }
 
     /// Check license and emit rate-limited warnings if shadow mode is active
     fn check_license(&self) {
-        let guard = self.license.read().unwrap_or_else(|poisoned| {
-            tracing::warn!("license read lock was poisoned, recovering");
-            poisoned.into_inner()
-        });
+        let guard = read_lock(&self.license);
         if let Some(ref validator) = *guard {
             validator.check_and_warn();
         }
     }
 
-    /// Get the topic configuration cache
+    /// The per-topic configuration cache.
+    #[cfg(test)]
     pub fn topic_cache(&self) -> &TopicConfigCache {
         &self.topic_cache
     }
 
-    /// Get the inner store
-    pub fn inner(&self) -> &S {
-        &self.inner
-    }
-
-    /// Get shadow forwarding metrics
+    /// The in-memory forwarding counters.
+    #[cfg(test)]
     pub fn metrics(&self) -> &ShadowMetrics {
         &self.metrics
     }
 
     /// Check if we're running on the primary (not a standby)
     fn is_primary(&self) -> bool {
-        let mut status = self.primary_status.lock().unwrap_or_else(|poisoned| {
-            tracing::warn!("primary_status lock was poisoned, recovering");
-            poisoned.into_inner()
-        });
+        let mut status = lock(&self.primary_status);
         status.check()
     }
 
@@ -399,10 +363,7 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
     /// start forwarding. The worker calls this on its periodic config-reload
     /// cycle so a promotion is picked up within one reload interval.
     pub fn refresh_primary_status(&self) -> bool {
-        let mut status = self.primary_status.lock().unwrap_or_else(|poisoned| {
-            tracing::warn!("primary_status lock was poisoned, recovering");
-            poisoned.into_inner()
-        });
+        let mut status = lock(&self.primary_status);
         status.refresh()
     }
 
@@ -432,10 +393,7 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
         &self,
         msg: ForwardRequest,
     ) -> std::result::Result<(), Box<ForwardRequest>> {
-        let guard = self.forward_tx.read().unwrap_or_else(|poisoned| {
-            tracing::warn!("forward_tx read lock was poisoned, recovering");
-            poisoned.into_inner()
-        });
+        let guard = read_lock(&self.forward_tx);
         match guard.as_ref() {
             Some(tx) => tx.try_send(msg).map_err(|e| Box::new(e.into_inner())),
             None => Err(Box::new(msg)),
@@ -575,7 +533,7 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
         if config.sync_mode == SyncMode::Sync && settings.sync_timeout_ms > 0 {
             let xid = self.db.current_transaction_id();
             let slot = self.current_slot.load(Ordering::Relaxed);
-            let mut queue = self.sync_pending.lock().unwrap_or_else(|p| p.into_inner());
+            let mut queue = lock(&self.sync_pending);
             for key in rows {
                 if queue.len() >= SYNC_PENDING_CAP {
                     tracing::warn!(
@@ -600,8 +558,7 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
     /// dropped: its outbox row is gone too). Asks for an immediate outbox poll
     /// so the rows go out at once.
     pub fn take_sync_holds(&self) -> HashMap<u64, Vec<RowKey>> {
-        let queued =
-            std::mem::take(&mut *self.sync_pending.lock().unwrap_or_else(|p| p.into_inner()));
+        let queued = std::mem::take(&mut *lock(&self.sync_pending));
         let mut holds: HashMap<u64, Vec<RowKey>> = HashMap::new();
         let mut committed: HashMap<u32, bool> = HashMap::new();
         for SyncPending { slot, xid, key } in queued {
@@ -640,10 +597,7 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
     /// previous one: every `OUTBOX_POLL_INTERVAL`, at once when requested, and
     /// never during a failure backoff.
     pub fn outbox_tick_due(&self, since_last: Duration) -> bool {
-        let failures = self
-            .outbox_failures
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let failures = lock(&self.outbox_failures);
         if let Some(until) = failures.1 {
             if Instant::now() < until {
                 return false;
@@ -656,10 +610,7 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
     /// (up to `OUTBOX_FAILURE_BACKOFF_MAX`); returns whether this failure should
     /// be logged (the first, then at the 2nd, 4th, 8th... in a row).
     pub fn note_outbox_tick(&self, ok: bool) -> bool {
-        let mut failures = self
-            .outbox_failures
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let mut failures = lock(&self.outbox_failures);
         if ok {
             *failures = (0, None);
             return false;
@@ -682,10 +633,7 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
         self.poll_requested.store(false, Ordering::Relaxed);
         // Nothing to do if no forward channel is wired up yet.
         {
-            let guard = self.forward_tx.read().unwrap_or_else(|poisoned| {
-                tracing::warn!("forward_tx read lock was poisoned, recovering");
-                poisoned.into_inner()
-            });
+            let guard = read_lock(&self.forward_tx);
             if guard.is_none() {
                 return Ok(0);
             }
@@ -752,10 +700,7 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
     pub fn drain_forward_acks(&self) -> usize {
         let mut acks: Vec<ForwardAck> = Vec::new();
         {
-            let guard = self.forward_ack_rx.read().unwrap_or_else(|poisoned| {
-                tracing::warn!("forward_ack_rx read lock was poisoned, recovering");
-                poisoned.into_inner()
-            });
+            let guard = read_lock(&self.forward_ack_rx);
             if let Some(rx) = guard.as_ref() {
                 while acks.len() < MAX_ACKS_PER_TICK {
                     match rx.try_recv() {
@@ -874,39 +819,26 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
         }
 
         let count = new_configs.len();
-        self.topic_cache.clear();
-        for config in new_configs {
-            self.topic_cache.update(config);
-        }
+        self.topic_cache.replace(new_configs);
 
         Ok(count)
     }
 
-    /// Flush accumulated metrics to logs
-    ///
-    /// Logs metrics summary and resets counters. Call periodically from the worker loop.
+    /// Log the in-memory counters (if any moved) and reset them. Called
+    /// periodically by the worker.
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "the worker handles this like its other fallible maintenance steps"
+    )]
     pub fn flush_metrics_to_db(&self) -> super::error::ShadowResult<()> {
-        let (forwarded, skipped, failed, fallback_local) = self.metrics.snapshot();
-
-        // Only log if there's something to report
-        if forwarded == 0 && skipped == 0 && failed == 0 && fallback_local == 0 {
-            return Ok(());
+        let forwarded = self.metrics.forwarded.swap(0, Ordering::Relaxed);
+        let skipped = self.metrics.skipped.swap(0, Ordering::Relaxed);
+        let failed = self.metrics.failed.swap(0, Ordering::Relaxed);
+        if forwarded > 0 || skipped > 0 || failed > 0 {
+            tracing::info!(
+                "Shadow metrics: forwarded={forwarded}, skipped={skipped}, failed={failed}"
+            );
         }
-
-        tracing::info!(
-            "Shadow metrics: forwarded={}, skipped={}, failed={}, fallback_local={}",
-            forwarded,
-            skipped,
-            failed,
-            fallback_local
-        );
-
-        // Reset counters after logging
-        self.metrics.forwarded.store(0, Ordering::Relaxed);
-        self.metrics.skipped.store(0, Ordering::Relaxed);
-        self.metrics.failed.store(0, Ordering::Relaxed);
-        self.metrics.fallback_local.store(0, Ordering::Relaxed);
-
         Ok(())
     }
 }
@@ -1087,13 +1019,7 @@ impl<S: KafkaStore, D: ShadowDb> TransactionStore for ShadowStore<S, D> {
         // because commit/abort look it up by the NEW epoch. Drop any stale-epoch
         // buffer for this producer now (no-op when the epoch didn't change).
         {
-            let mut pending = self
-                .pending_txn_messages
-                .write()
-                .unwrap_or_else(|poisoned| {
-                    tracing::warn!("pending_txn_messages write lock was poisoned, recovering");
-                    poisoned.into_inner()
-                });
+            let mut pending = write_lock(&self.pending_txn_messages);
             pending.retain(|&(pid, ep), _| pid != producer_id || ep == new_epoch);
         }
         Ok((producer_id, new_epoch))
@@ -1187,13 +1113,7 @@ impl<S: KafkaStore, D: ShadowDb> TransactionStore for ShadowStore<S, D> {
                 .collect();
 
             let key = (producer_id, producer_epoch);
-            let mut pending = self
-                .pending_txn_messages
-                .write()
-                .unwrap_or_else(|poisoned| {
-                    tracing::warn!("pending_txn_messages write lock was poisoned, recovering");
-                    poisoned.into_inner()
-                });
+            let mut pending = write_lock(&self.pending_txn_messages);
             let buf = pending.entry(key).or_default();
             buf.records.extend(pending_records);
 
@@ -1236,13 +1156,7 @@ impl<S: KafkaStore, D: ShadowDb> TransactionStore for ShadowStore<S, D> {
         // 1. Get pending records BEFORE commit
         let key = (producer_id, producer_epoch);
         let pending_records = {
-            let mut pending = self
-                .pending_txn_messages
-                .write()
-                .unwrap_or_else(|poisoned| {
-                    tracing::warn!("pending_txn_messages write lock was poisoned, recovering");
-                    poisoned.into_inner()
-                });
+            let mut pending = write_lock(&self.pending_txn_messages);
             pending.remove(&key)
         };
 
@@ -1291,13 +1205,7 @@ impl<S: KafkaStore, D: ShadowDb> TransactionStore for ShadowStore<S, D> {
         // 1. Get pending records to check if any were written locally
         let key = (producer_id, producer_epoch);
         let pending_records = {
-            let mut pending = self
-                .pending_txn_messages
-                .write()
-                .unwrap_or_else(|poisoned| {
-                    tracing::warn!("pending_txn_messages write lock was poisoned, recovering");
-                    poisoned.into_inner()
-                });
+            let mut pending = write_lock(&self.pending_txn_messages);
             pending.remove(&key)
         };
 
@@ -1338,13 +1246,7 @@ impl<S: KafkaStore, D: ShadowDb> MaintenanceStore for ShadowStore<S, D> {
         // forward buffer for an abandoned producer would leak forever. Evict any
         // buffer older than the same timeout the sweeper just applied.
         {
-            let mut pending = self
-                .pending_txn_messages
-                .write()
-                .unwrap_or_else(|poisoned| {
-                    tracing::warn!("pending_txn_messages write lock was poisoned, recovering");
-                    poisoned.into_inner()
-                });
+            let mut pending = write_lock(&self.pending_txn_messages);
             let before = pending.len();
             pending.retain(|_, buf| buf.first_buffered.elapsed() < timeout);
             let evicted = before - pending.len();

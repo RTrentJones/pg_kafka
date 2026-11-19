@@ -670,7 +670,7 @@ fn sync_timeout_zero_holds_nothing() {
 fn hold_goes_to_the_forwarder_or_is_released_at_once() {
     use std::sync::atomic::AtomicUsize;
     let h = sync_harness();
-    let released = Arc::new(AtomicUsize::new(0));
+    let released = std::sync::Arc::new(AtomicUsize::new(0));
     let r = released.clone();
     h.store.hold_response(
         vec![(T, 0, 10)],

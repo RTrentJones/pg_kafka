@@ -48,34 +48,61 @@
 //! - `forward_percentage`: 0-100
 //! - `sync_mode`: async or sync
 
-pub mod config;
-pub mod error;
-pub mod forwarder;
-pub mod forwarder_task;
-pub mod inflight;
-pub mod license;
-pub mod outbox;
-pub mod primary;
-pub mod producer;
-pub mod routing;
-pub mod store;
+pub(crate) mod config;
+pub(crate) mod error;
+pub(crate) mod forwarder_task;
+pub(crate) mod inflight;
+pub(crate) mod license;
+pub(crate) mod outbox;
+pub(crate) mod primary;
+pub(crate) mod producer;
+pub(crate) mod routing;
+pub(crate) mod store;
 
-#[cfg(test)]
-mod tests;
+// The types the rest of the crate (and `crate::kafka`'s public re-exports) name.
+pub use config::{ShadowConfig, ShadowMode, SyncMode, TopicShadowConfig};
+pub use error::ShadowError;
+pub(crate) use producer::ShadowProducer;
+pub(crate) use store::ShadowStore;
 
-// Re-export commonly used types
-pub use config::{
-    ShadowConfig, ShadowMode, SyncMode, TopicConfigCache, TopicShadowConfig, WriteMode,
-};
-pub use error::{ShadowError, ShadowResult};
-pub use forwarder::ForwardDecision;
-pub use primary::{is_primary, PrimaryStatus};
-pub use producer::{EnqueueError, ShadowProducer, ShadowProducerBuilder};
-pub use routing::{compute_routing_hash, make_forward_decision};
-pub use store::{ShadowMetrics, ShadowStore};
+use std::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-// License validation (Commercial License)
-pub use license::{LicenseStatus, LicenseValidator};
+/// Lock a mutex. Shadow mode's locks guard plain data that a panicking holder
+/// cannot leave half-updated, so a poisoned lock is recovered (with a warning
+/// naming the call site) instead of taking the worker down.
+#[track_caller]
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| {
+        warn_poisoned();
+        poisoned.into_inner()
+    })
+}
+
+/// Read-lock an `RwLock`, recovering a poisoned one (see [`lock`]).
+#[track_caller]
+pub(crate) fn read_lock<T>(rwlock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    rwlock.read().unwrap_or_else(|poisoned| {
+        warn_poisoned();
+        poisoned.into_inner()
+    })
+}
+
+/// Write-lock an `RwLock`, recovering a poisoned one (see [`lock`]).
+#[track_caller]
+pub(crate) fn write_lock<T>(rwlock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    rwlock.write().unwrap_or_else(|poisoned| {
+        warn_poisoned();
+        poisoned.into_inner()
+    })
+}
+
+#[track_caller]
+fn warn_poisoned() {
+    tracing::warn!(
+        "shadow mode lock at {} was poisoned, recovering",
+        std::panic::Location::caller()
+    );
+}
 
 /// Outbox row key: `(topic_id, partition_id, local_offset)`.
 pub type RowKey = (i32, i32, i64);

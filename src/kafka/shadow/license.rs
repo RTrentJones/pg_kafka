@@ -137,7 +137,8 @@ impl LicenseValidator {
         }
     }
 
-    /// Get current license status
+    /// The key's classification.
+    #[cfg(test)]
     pub fn status(&self) -> &LicenseStatus {
         &self.status
     }

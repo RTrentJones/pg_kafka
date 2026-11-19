@@ -73,16 +73,6 @@ impl Default for OutboxSettings {
 /// Upper bound of the outbox re-attempt backoff.
 pub const OUTBOX_MAX_BACKOFF_MS: i64 = 30_000;
 
-/// Backoff before re-attempting a row that failed `retry_count` times:
-/// `base * 2^(retry_count-1)`, capped at `max`. Zero for a row that never failed.
-pub fn retry_backoff_ms(retry_count: i64, base: i64, max: i64) -> i64 {
-    if retry_count <= 0 {
-        return 0;
-    }
-    let shift = (retry_count - 1).min(30) as u32;
-    base.saturating_mul(1i64 << shift).min(max)
-}
-
 /// Parameters of one outbox claim (see [`ShadowDb::claim_due_outbox_rows`]).
 #[derive(Clone, Debug, Default)]
 pub struct OutboxClaim {
@@ -90,7 +80,8 @@ pub struct OutboxClaim {
     pub batch_limit: i64,
     /// Rows with `retry_count >= max_retries` are dead letters and never claimed.
     pub max_retries: i64,
-    /// Exponential re-attempt backoff (see [`retry_backoff_ms`]).
+    /// Re-attempt backoff after a row's `n`-th failure: `base * 2^(n-1)`, at
+    /// most `max` (milliseconds).
     pub backoff_base_ms: i64,
     pub backoff_max_ms: i64,
     /// In-flight row keys (topic ids, partition ids, offsets; parallel arrays),
@@ -147,9 +138,9 @@ pub trait ShadowDb {
     /// The candidates of a partition are its pending rows under the retry cap
     /// whose message still exists. A candidate is *backing off* when it failed
     /// (`retry_count > 0`), has no open attempt, and its last attempt is more
-    /// recent than [`retry_backoff_ms`]. A candidate is claimed when it is not in
-    /// flight, not backing off, and no backing-off candidate of its partition has
-    /// a lower offset (so a retry is never overtaken by a later record). A row
+    /// recent than its backoff (see [`OutboxClaim`]). A candidate is claimed
+    /// when it is not in flight, not backing off, and no backing-off candidate
+    /// of its partition has a lower offset (so a retry is never overtaken by a later record). A row
     /// whose attempt is still open in the table but not in flight in this worker
     /// lost its ack (worker restart, eviction): it is claimed and that lost
     /// attempt counts as one failure. Claiming opens an attempt and stamps
@@ -671,18 +662,3 @@ impl ShadowDb for SpiShadowDb {
 
 #[cfg(test)]
 pub(crate) mod fake;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn backoff_doubles_from_the_base_and_is_capped() {
-        assert_eq!(retry_backoff_ms(0, 100, 30_000), 0);
-        assert_eq!(retry_backoff_ms(1, 100, 30_000), 100);
-        assert_eq!(retry_backoff_ms(2, 100, 30_000), 200);
-        assert_eq!(retry_backoff_ms(4, 100, 30_000), 800);
-        assert_eq!(retry_backoff_ms(20, 100, 30_000), 30_000);
-        assert_eq!(retry_backoff_ms(1000, 60_000, 30_000), 30_000);
-    }
-}

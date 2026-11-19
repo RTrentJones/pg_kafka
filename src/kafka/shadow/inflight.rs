@@ -65,10 +65,6 @@ impl InflightTracker {
         self.lock().len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
     /// Snapshot of the live (non-evicted) in-flight keys as three parallel
     /// column vectors, shaped for a SQL `unnest($t::int4[], $p::int4[],
     /// $o::int8[])` exclusion in the outbox claim query — claiming an
@@ -141,7 +137,7 @@ mod tests {
         let tracker = InflightTracker::new(EVICT);
         assert!(tracker.try_begin(KEY));
         tracker.complete(&KEY);
-        assert!(tracker.is_empty());
+        assert_eq!(tracker.len(), 0);
         assert!(tracker.try_begin(KEY), "completed row must be dispatchable");
     }
 

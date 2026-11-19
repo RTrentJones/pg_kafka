@@ -357,3 +357,27 @@ impl ShadowDb for InMemoryShadowDb {
         xid != 0 && self.state().committed_xids.contains(&xid)
     }
 }
+
+/// Backoff before re-attempting a row that failed `retry_count` times:
+/// `base * 2^(retry_count-1)`, capped at `max`. Zero for a row that never failed.
+fn retry_backoff_ms(retry_count: i64, base: i64, max: i64) -> i64 {
+    if retry_count <= 0 {
+        return 0;
+    }
+    let shift = (retry_count - 1).min(30) as u32;
+    base.saturating_mul(1i64 << shift).min(max)
+}
+
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_doubles_from_the_base_and_is_capped() {
+        assert_eq!(retry_backoff_ms(0, 100, 30_000), 0);
+        assert_eq!(retry_backoff_ms(1, 100, 30_000), 100);
+        assert_eq!(retry_backoff_ms(2, 100, 30_000), 200);
+        assert_eq!(retry_backoff_ms(4, 100, 30_000), 800);
+        assert_eq!(retry_backoff_ms(20, 100, 30_000), 30_000);
+        assert_eq!(retry_backoff_ms(1000, 60_000, 30_000), 30_000);
+    }
+}

@@ -105,7 +105,8 @@ impl PrimaryStatus {
         self.check()
     }
 
-    /// Check if status has been cached
+    /// Whether a result is cached.
+    #[cfg(test)]
     pub fn is_cached(&self) -> bool {
         self.is_primary.is_some()
     }
