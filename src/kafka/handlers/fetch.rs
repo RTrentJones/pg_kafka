@@ -476,23 +476,35 @@ pub fn handle_fetch_with_max_bytes(
 
 /// The response entry of a partition whose records were read: `records` holds the
 /// encoded record batches, or why they could not be encoded.
+///
+/// Rows that cannot be encoded are answered KAFKA_STORAGE_ERROR, Kafka's code for a
+/// log it cannot serve: an empty success would leave the consumer refetching the
+/// same offset forever with nothing on its side to show why. The error is
+/// retriable, so a client keeps trying (and reports it) rather than failing over a
+/// condition that a fix of the stored rows clears.
 fn fetched_partition_data(
     topic_id: i32,
     partition_id: i32,
     bounds: &crate::kafka::storage::PartitionBounds,
     records: std::result::Result<bytes::Bytes, String>,
 ) -> kafka_protocol::messages::fetch_response::PartitionData {
-    let records = records.unwrap_or_else(|e| {
-        crate::pg_warning!(
-            "Failed to encode RecordBatch for topic_id={}, partition={}: {}",
-            topic_id,
-            partition_id,
-            e
-        );
-        bytes::Bytes::new()
-    });
     let mut partition_data = kafka_protocol::messages::fetch_response::PartitionData::default();
     partition_data.partition_index = partition_id;
+    let records = match records {
+        Ok(records) => records,
+        Err(e) => {
+            crate::pg_warning!(
+                "Failed to encode RecordBatch for topic_id={}, partition={}: {}",
+                topic_id,
+                partition_id,
+                e
+            );
+            partition_data.error_code = crate::kafka::constants::ERROR_KAFKA_STORAGE_ERROR;
+            partition_data.high_watermark = -1;
+            partition_data.records = Some(bytes::Bytes::new());
+            return partition_data;
+        }
+    };
     partition_data.error_code = ERROR_NONE;
     partition_data.high_watermark = bounds.high_watermark;
     partition_data.last_stable_offset = bounds.last_stable_offset;
@@ -663,6 +675,38 @@ mod storage_stream_tests {
             producer_id: None,
             producer_epoch: None,
         }
+    }
+
+    fn bounds() -> PartitionBounds {
+        PartitionBounds {
+            high_watermark: 9,
+            last_stable_offset: 8,
+            earliest_offset: 2,
+            log_start_offset: 1,
+        }
+    }
+
+    /// Rows that cannot be encoded are a per-partition KAFKA_STORAGE_ERROR the client
+    /// sees, not an empty success that stalls it at the same offset.
+    #[test]
+    fn unencodable_records_are_a_storage_error() {
+        let p = fetched_partition_data(1, 3, &bounds(), Err("too far apart".to_string()));
+        assert_eq!(p.partition_index, 3);
+        assert_eq!(
+            p.error_code,
+            crate::kafka::constants::ERROR_KAFKA_STORAGE_ERROR
+        );
+        assert_eq!(p.high_watermark, -1);
+        assert_eq!(p.records.as_deref(), Some(&[][..]));
+
+        let encoded = bytes::Bytes::from_static(b"batch");
+        let p = fetched_partition_data(1, 3, &bounds(), Ok(encoded.clone()));
+        assert_eq!(p.error_code, ERROR_NONE);
+        assert_eq!(
+            (p.high_watermark, p.last_stable_offset, p.log_start_offset),
+            (9, 8, 2)
+        );
+        assert_eq!(p.records, Some(encoded));
     }
 
     #[test]
