@@ -309,6 +309,7 @@ fn decode_api<A: KafkaApi>(
 ) -> Decoded {
     let version = header.api_version;
     let reply = |encode_version: i16, response: ResponseOf<A>| {
+        // A closed channel means the connection is gone; there is nobody to answer.
         let _ = response_tx.send(KafkaResponse::new(
             header.correlation_id,
             encode_version,
@@ -316,59 +317,10 @@ fn decode_api<A: KafkaApi>(
         ));
     };
 
-    // The kafka-protocol body decoders index without bounds checks and panic on a
-    // truncated body, so the decode runs under catch_unwind: a malformed body after a
-    // valid header is answered with an error response instead of tearing the connection
-    // down.
-    let wire_range = <A::Wire as Message>::VERSIONS;
-    let parsed: Option<Result<A::Request, Rejection<A::Echo>>> =
-        if (wire_range.min..=wire_range.max).contains(&version) {
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                A::Wire::decode(buf, version)
-            })) {
-                Ok(Ok(wire)) => Some(A::decode(wire, &header)),
-                Ok(Err(e)) => {
-                    warn!("Failed to decode {} v{} body: {}", A::NAME, version, e);
-                    None
-                }
-                Err(_) => {
-                    warn!("Malformed {} v{} body (decoder panicked)", A::NAME, version);
-                    None
-                }
-            }
-        } else {
-            None
-        };
+    let parsed = decode_wire::<A>(buf, &header);
 
-    // A version outside the advertised range is answered with the API's own error
-    // response (when it can be encoded), echoing what the body told us.
     if !(A::MIN_VERSION..=A::MAX_VERSION).contains(&version) {
-        warn!(
-            "Rejecting {} version {} outside supported range {}..={}",
-            A::NAME,
-            version,
-            A::MIN_VERSION,
-            A::MAX_VERSION
-        );
-        let echo = match &parsed {
-            Some(Ok(request)) if !A::expects_response(request) => return Decoded::Answered,
-            Some(Ok(request)) => Some(A::echo(request)),
-            Some(Err(Rejection::Silent)) => return Decoded::Answered,
-            Some(Err(Rejection::Close(reason))) => return Decoded::Close(reason.to_string()),
-            Some(Err(Rejection::Reply { echo, .. })) => echo.clone(),
-            None => None,
-        };
-        return match A::unsupported_version_reply(echo.as_ref(), version) {
-            Some((encode_version, response)) => {
-                reply(encode_version, response);
-                Decoded::Answered
-            }
-            None => Decoded::Close(format!(
-                "{} version {} has no response format to answer in",
-                A::NAME,
-                version
-            )),
-        };
+        return reject_unsupported_version::<A>(parsed.as_ref(), version, reply);
     }
 
     match parsed {
@@ -393,6 +345,69 @@ fn decode_api<A: KafkaApi>(
             );
             Decoded::Answered
         }
+    }
+}
+
+/// The body of a request for `A`, decoded and turned into the handler's input; `None` when
+/// it does not decode (or kafka-protocol has no decoder for `version`).
+///
+/// The kafka-protocol body decoders index without bounds checks and panic on a truncated
+/// body, so the decode runs under `catch_unwind`: a malformed body after a valid header is
+/// answered with an error response instead of tearing the connection down.
+fn decode_wire<A: KafkaApi>(
+    buf: &mut BytesMut,
+    header: &RequestHeader,
+) -> Option<Result<A::Request, Rejection<A::Echo>>> {
+    let version = header.api_version;
+    let wire_range = <A::Wire as Message>::VERSIONS;
+    if !(wire_range.min..=wire_range.max).contains(&version) {
+        return None;
+    }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        A::Wire::decode(buf, version)
+    })) {
+        Ok(Ok(wire)) => Some(A::decode(wire, header)),
+        Ok(Err(e)) => {
+            warn!("Failed to decode {} v{version} body: {e}", A::NAME);
+            None
+        }
+        Err(_) => {
+            warn!("Malformed {} v{version} body (decoder panicked)", A::NAME);
+            None
+        }
+    }
+}
+
+/// Answer a request for `A` at a `version` outside the advertised range with the API's
+/// own error response (when it can be encoded), echoing what the body told us.
+fn reject_unsupported_version<A: KafkaApi>(
+    parsed: Option<&Result<A::Request, Rejection<A::Echo>>>,
+    version: i16,
+    reply: impl FnOnce(i16, ResponseOf<A>),
+) -> Decoded {
+    warn!(
+        "Rejecting {} version {version} outside supported range {}..={}",
+        A::NAME,
+        A::MIN_VERSION,
+        A::MAX_VERSION
+    );
+    let echo = match parsed {
+        Some(Ok(request)) if !A::expects_response(request) => return Decoded::Answered,
+        Some(Ok(request)) => Some(A::echo(request)),
+        Some(Err(Rejection::Silent)) => return Decoded::Answered,
+        Some(Err(Rejection::Close(reason))) => return Decoded::Close((*reason).to_string()),
+        Some(Err(Rejection::Reply { echo, .. })) => echo.clone(),
+        None => None,
+    };
+    match A::unsupported_version_reply(echo.as_ref(), version) {
+        Some((encode_version, response)) => {
+            reply(encode_version, response);
+            Decoded::Answered
+        }
+        None => Decoded::Close(format!(
+            "{} version {version} has no response format to answer in",
+            A::NAME
+        )),
     }
 }
 
