@@ -29,64 +29,130 @@ use crate::kafka::messages::{CreatePartitionsTopicRequest, CreateTopicRequest};
 
 /// Handle CreateTopics request
 ///
-/// Creates topics with the specified configuration. Topics that already exist
-/// will return TOPIC_ALREADY_EXISTS error.
+/// Validates each topic as Kafka 3.7 does (wave3 groups) and creates the valid ones:
+/// - a name repeated in the request: one result, INVALID_REQUEST ("Duplicate topic name.");
+/// - an invalid name, or one that collides with an existing topic once '.' and '_' are treated
+///   as equal (`a.b` vs `a_b`): INVALID_TOPIC_EXCEPTION;
+/// - `num_partitions` 0 or below -1, or above `pg_kafka.max_partitions_per_topic`:
+///   INVALID_PARTITIONS (-1 means `pg_kafka.default_partitions`, capped at the maximum);
+/// - `replication_factor` other than 1 or -1 (the default): INVALID_REPLICATION_FACTOR, since
+///   this is a single-broker cluster;
+/// - an existing topic: TOPIC_ALREADY_EXISTS.
 pub fn handle_create_topics(
     ctx: &HandlerContext,
     topics: Vec<CreateTopicRequest>,
     validate_only: bool,
 ) -> Result<CreateTopicsResponse> {
     let store = ctx.store;
+    let max_partitions = crate::kafka::limits::max_partitions_per_topic();
     let mut results = Vec::new();
 
+    // A name given more than once fails as a whole, reported once (Kafka answers one
+    // INVALID_REQUEST entry and creates nothing for it).
+    let mut seen = std::collections::HashMap::<String, usize>::new();
+    for t in &topics {
+        *seen.entry(t.name.clone()).or_default() += 1;
+    }
+    let mut reported = std::collections::HashSet::<String>::new();
+
     for topic in topics {
+        if !reported.insert(topic.name.clone()) {
+            continue;
+        }
         let mut result = CreatableTopicResult::default();
         result.name = TopicName(StrBytes::from_string(topic.name.clone()));
+        result.num_partitions = -1;
+        result.replication_factor = -1;
+        let fail = |mut result: CreatableTopicResult, code: i16, msg: String| {
+            result.error_code = code;
+            result.error_message = Some(StrBytes::from_string(msg));
+            result
+        };
 
-        // Validate topic name (CONF-4: length, charset, and "."/".." in addition to empty).
-        if let Err(msg) = validate_topic_name(&topic.name) {
-            result.error_code = ERROR_INVALID_TOPIC_EXCEPTION;
-            result.error_message = Some(StrBytes::from_static_str(msg));
-            results.push(result);
+        if seen.get(&topic.name).copied().unwrap_or(0) > 1 {
+            results.push(fail(
+                result,
+                ERROR_INVALID_REQUEST,
+                "Duplicate topic name.".to_string(),
+            ));
             continue;
         }
 
-        // Validate partition count
-        // -1 means "use the broker default" (pg_kafka.default_partitions); any
-        // other value < 1 (e.g. 0) is rejected by the check below.
+        // Validate topic name (CONF-4: length, charset, and "."/".." in addition to empty).
+        if let Err(msg) = validate_topic_name(&topic.name) {
+            results.push(fail(result, ERROR_INVALID_TOPIC_EXCEPTION, msg.to_string()));
+            continue;
+        }
+
+        // -1 means "use the broker default" (pg_kafka.default_partitions, capped like an
+        // auto-created topic); any other value < 1 (e.g. 0) is rejected.
         let num_partitions = if topic.num_partitions == -1 {
-            ctx.default_partitions
+            crate::kafka::limits::auto_create_partitions(ctx.default_partitions)
         } else {
             topic.num_partitions
         };
-
         if num_partitions < 1 {
-            result.error_code = ERROR_INVALID_PARTITIONS;
-            result.error_message = Some(StrBytes::from_static_str(
-                "Number of partitions must be at least 1",
+            results.push(fail(
+                result,
+                ERROR_INVALID_PARTITIONS,
+                "Number of partitions was set to an invalid non-positive value.".to_string(),
             ));
-            results.push(result);
+            continue;
+        }
+        if let Err(msg) =
+            crate::kafka::limits::check_partition_count(num_partitions, max_partitions)
+        {
+            results.push(fail(result, ERROR_INVALID_PARTITIONS, msg));
+            continue;
+        }
+
+        if let Err(msg) = validate_replication_factor(topic.replication_factor) {
+            results.push(fail(result, ERROR_INVALID_REPLICATION_FACTOR, msg));
             continue;
         }
 
         // Check if topic already exists
         match store.topic_exists(&topic.name) {
             Ok(true) => {
-                result.error_code = ERROR_TOPIC_ALREADY_EXISTS;
-                result.error_message = Some(StrBytes::from_static_str(
-                    "Topic with this name already exists",
+                results.push(fail(
+                    result,
+                    ERROR_TOPIC_ALREADY_EXISTS,
+                    format!("Topic '{}' already exists.", topic.name),
                 ));
-                results.push(result);
                 continue;
             }
             Ok(false) => {}
             Err(e) => {
-                result.error_code = ERROR_UNKNOWN_SERVER_ERROR;
-                result.error_message = Some(StrBytes::from_string(format!(
-                    "Error checking topic: {}",
-                    e
-                )));
-                results.push(result);
+                results.push(fail(
+                    result,
+                    ERROR_UNKNOWN_SERVER_ERROR,
+                    format!("Error checking topic: {}", e),
+                ));
+                continue;
+            }
+        }
+
+        // Kafka rejects a name that collides with an existing one once '.' and '_' are
+        // treated as equal (their metric names would clash).
+        match store.find_colliding_topic(&topic.name) {
+            Ok(Some(existing)) => {
+                results.push(fail(
+                    result,
+                    ERROR_INVALID_TOPIC_EXCEPTION,
+                    format!(
+                        "Topic '{}' collides with existing topic: {}",
+                        topic.name, existing
+                    ),
+                ));
+                continue;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                results.push(fail(
+                    result,
+                    ERROR_UNKNOWN_SERVER_ERROR,
+                    format!("Error checking topic: {}", e),
+                ));
                 continue;
             }
         }
@@ -109,11 +175,11 @@ pub fn handle_create_topics(
                 result.replication_factor = 1; // Single-node, always 1
             }
             Err(e) => {
-                result.error_code = ERROR_UNKNOWN_SERVER_ERROR;
-                result.error_message = Some(StrBytes::from_string(format!(
-                    "Failed to create topic: {}",
-                    e
-                )));
+                result = fail(
+                    result,
+                    ERROR_UNKNOWN_SERVER_ERROR,
+                    format!("Failed to create topic: {}", e),
+                );
             }
         }
 
@@ -124,6 +190,22 @@ pub fn handle_create_topics(
     response.throttle_time_ms = 0;
     response.topics = results;
     Ok(response)
+}
+
+/// Replication factor rule for this one-broker cluster (Kafka's messages): -1 (the broker
+/// default, 1) and 1 are accepted; 0 or below -1 are invalid, above 1 cannot be placed.
+pub fn validate_replication_factor(replication_factor: i16) -> std::result::Result<(), String> {
+    match replication_factor {
+        -1 | 1 => Ok(()),
+        rf if rf < 1 => Err(
+            "Replication factor must be larger than 0, or -1 to use the default value.".to_string(),
+        ),
+        rf => Err(format!(
+            "Unable to replicate the partition {} time(s): The target replication factor of {} \
+             cannot be reached because only 1 broker(s) are registered.",
+            rf, rf
+        )),
+    }
 }
 
 /// Handle DeleteTopics request
@@ -213,6 +295,13 @@ pub fn handle_create_partitions(
                         "Topic already has {} partitions",
                         current_count
                     )));
+                } else if let Err(msg) = crate::kafka::limits::check_partition_count(
+                    topic.count,
+                    crate::kafka::limits::max_partitions_per_topic(),
+                ) {
+                    // wave3 groups: the per-topic partition cap applies to growth too.
+                    result.error_code = ERROR_INVALID_PARTITIONS;
+                    result.error_message = Some(StrBytes::from_string(msg));
                 } else if validate_only {
                     // Validation passed
                     result.error_code = ERROR_NONE;
@@ -296,15 +385,16 @@ pub fn handle_delete_groups(
                 }
             }
             None => {
-                // Group doesn't exist in coordinator - check if there are committed offsets
-                match store.delete_consumer_group_offsets(&group_name) {
-                    Ok(()) => {
-                        // Successfully deleted any orphaned offsets, or nothing to delete
-                        result.error_code = ERROR_NONE;
-                    }
-                    Err(e) => {
-                        result.error_code = e.to_kafka_error_code();
-                    }
+                // wave3 groups: a group the coordinator does not hold exists only through its
+                // committed offsets (an Empty group, as DescribeGroups/ListGroups report it).
+                // Without any, it does not exist: GROUP_ID_NOT_FOUND, as Kafka answers.
+                match store.group_has_offsets(&group_name) {
+                    Ok(false) => result.error_code = ERROR_GROUP_ID_NOT_FOUND,
+                    Ok(true) => match store.delete_consumer_group_offsets(&group_name) {
+                        Ok(()) => result.error_code = ERROR_NONE,
+                        Err(e) => result.error_code = e.to_kafka_error_code(),
+                    },
+                    Err(e) => result.error_code = e.to_kafka_error_code(),
                 }
             }
         }
@@ -341,6 +431,7 @@ mod tests {
     fn test_create_topics_success() {
         let mut store = MockKafkaStore::new();
         store.expect_topic_exists().returning(|_| Ok(false));
+        store.expect_find_colliding_topic().returning(|_| Ok(None));
         store.expect_create_topic().returning(|_, _| Ok(1));
 
         let topics = vec![CreateTopicRequest {
@@ -385,6 +476,7 @@ mod tests {
         // 0 is not a valid partition count.
         let mut store = MockKafkaStore::new();
         store.expect_topic_exists().returning(|_| Ok(false));
+        store.expect_find_colliding_topic().returning(|_| Ok(None));
         store
             .expect_create_topic()
             .withf(|name, n| name == "defaulted" && *n == 6)
@@ -423,6 +515,7 @@ mod tests {
     fn test_create_topics_validate_only() {
         let mut store = MockKafkaStore::new();
         store.expect_topic_exists().returning(|_| Ok(false));
+        store.expect_find_colliding_topic().returning(|_| Ok(None));
         // create_topic should NOT be called when validate_only is true
 
         let topics = vec![CreateTopicRequest {
@@ -585,20 +678,218 @@ mod tests {
 
     #[test]
     fn test_delete_groups_unknown_group_deletes_offsets() {
-        // A group absent from the coordinator still attempts to delete any
-        // orphaned committed offsets and reports NONE (delete_groups None arm).
+        // A group absent from the coordinator but holding committed offsets is an Empty
+        // group: its offsets are deleted and the result is NONE.
         let mut store = MockKafkaStore::new();
+        store.expect_group_has_offsets().returning(|_| Ok(true));
         store
             .expect_delete_consumer_group_offsets()
+            .times(1)
             .returning(|_| Ok(()));
 
         let coordinator = crate::kafka::GroupCoordinator::new();
         let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
         let ctx = make_test_context(&store, &coordinator, &broker);
-        let result = handle_delete_groups(&ctx, vec!["ghost".to_string()]);
-        assert!(result.is_ok());
-
-        let response = result.unwrap();
+        let response = handle_delete_groups(&ctx, vec!["ghost".to_string()]).unwrap();
         assert_eq!(response.results[0].error_code, ERROR_NONE);
+    }
+
+    // ----- wave3 groups -----
+
+    fn ctx_for<'a>(
+        store: &'a MockKafkaStore,
+        coordinator: &'a crate::kafka::GroupCoordinator,
+        broker: &'a crate::kafka::BrokerMetadata,
+    ) -> HandlerContext<'a> {
+        make_test_context(store, coordinator, broker)
+    }
+
+    fn topic(name: &str, partitions: i32, rf: i16) -> CreateTopicRequest {
+        CreateTopicRequest {
+            name: name.to_string(),
+            num_partitions: partitions,
+            replication_factor: rf,
+        }
+    }
+
+    #[test]
+    fn test_delete_groups_nonexistent_group_is_not_found() {
+        // Kafka answers GROUP_ID_NOT_FOUND for a group that has neither members nor offsets.
+        let mut store = MockKafkaStore::new();
+        store.expect_group_has_offsets().returning(|_| Ok(false));
+        store.expect_delete_consumer_group_offsets().times(0);
+        let coordinator = crate::kafka::GroupCoordinator::new();
+        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = ctx_for(&store, &coordinator, &broker);
+        let response = handle_delete_groups(&ctx, vec!["nobody".to_string()]).unwrap();
+        assert_eq!(response.results[0].error_code, ERROR_GROUP_ID_NOT_FOUND);
+    }
+
+    #[test]
+    fn test_create_topics_partition_cap() {
+        // Item 1: a huge partition count is refused before anything is stored (it used to be
+        // written and then crash every Metadata request).
+        let mut store = MockKafkaStore::new();
+        store.expect_topic_exists().returning(|_| Ok(false));
+        store.expect_find_colliding_topic().returning(|_| Ok(None));
+        store
+            .expect_create_topic()
+            .withf(|name, n| name == "at-cap" && *n == 10_000)
+            .times(1)
+            .returning(|_, _| Ok(1));
+        let coordinator = crate::kafka::GroupCoordinator::new();
+        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = ctx_for(&store, &coordinator, &broker);
+        let response = handle_create_topics(
+            &ctx,
+            vec![
+                topic("huge", 2_000_000_000, 1),
+                topic("over", 10_001, 1),
+                topic("at-cap", 10_000, 1),
+                topic("neg", -2, 1),
+            ],
+            false,
+        )
+        .unwrap();
+        let codes: Vec<i16> = response.topics.iter().map(|t| t.error_code).collect();
+        assert_eq!(
+            codes,
+            vec![
+                ERROR_INVALID_PARTITIONS,
+                ERROR_INVALID_PARTITIONS,
+                ERROR_NONE,
+                ERROR_INVALID_PARTITIONS
+            ]
+        );
+    }
+
+    #[test]
+    fn test_create_topics_minus_one_default_is_capped() {
+        let mut store = MockKafkaStore::new();
+        store.expect_topic_exists().returning(|_| Ok(false));
+        store.expect_find_colliding_topic().returning(|_| Ok(None));
+        store
+            .expect_create_topic()
+            .withf(|_, n| *n == crate::kafka::limits::DEFAULT_MAX_PARTITIONS_PER_TOPIC)
+            .times(1)
+            .returning(|_, _| Ok(1));
+        let coordinator = crate::kafka::GroupCoordinator::new();
+        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(
+            &store,
+            &coordinator,
+            &broker,
+            50_000,
+            kafka_protocol::records::Compression::None,
+        );
+        let response = handle_create_topics(&ctx, vec![topic("d", -1, -1)], false).unwrap();
+        assert_eq!(response.topics[0].error_code, ERROR_NONE);
+    }
+
+    #[test]
+    fn test_create_topics_replication_factor() {
+        let mut store = MockKafkaStore::new();
+        store.expect_topic_exists().returning(|_| Ok(false));
+        store.expect_find_colliding_topic().returning(|_| Ok(None));
+        store.expect_create_topic().times(2).returning(|_, _| Ok(1));
+        let coordinator = crate::kafka::GroupCoordinator::new();
+        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = ctx_for(&store, &coordinator, &broker);
+        let response = handle_create_topics(
+            &ctx,
+            vec![
+                topic("rf1", 1, 1),
+                topic("rfdefault", 1, -1),
+                topic("rf3", 1, 3),
+                topic("rf0", 1, 0),
+                topic("rfneg", 1, -2),
+            ],
+            false,
+        )
+        .unwrap();
+        let codes: Vec<i16> = response.topics.iter().map(|t| t.error_code).collect();
+        assert_eq!(
+            codes,
+            vec![
+                ERROR_NONE,
+                ERROR_NONE,
+                ERROR_INVALID_REPLICATION_FACTOR,
+                ERROR_INVALID_REPLICATION_FACTOR,
+                ERROR_INVALID_REPLICATION_FACTOR
+            ]
+        );
+        assert!(response.topics[2]
+            .error_message
+            .as_ref()
+            .unwrap()
+            .contains("only 1 broker(s)"));
+    }
+
+    #[test]
+    fn test_create_topics_duplicate_name_in_request() {
+        // Kafka: one INVALID_REQUEST result for the repeated name, nothing created for it;
+        // the other topics are unaffected.
+        let mut store = MockKafkaStore::new();
+        store.expect_topic_exists().returning(|_| Ok(false));
+        store.expect_find_colliding_topic().returning(|_| Ok(None));
+        store
+            .expect_create_topic()
+            .withf(|name, _| name == "other")
+            .times(1)
+            .returning(|_, _| Ok(1));
+        let coordinator = crate::kafka::GroupCoordinator::new();
+        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = ctx_for(&store, &coordinator, &broker);
+        let response = handle_create_topics(
+            &ctx,
+            vec![topic("dup", 1, 1), topic("other", 1, 1), topic("dup", 1, 1)],
+            false,
+        )
+        .unwrap();
+        assert_eq!(response.topics.len(), 2);
+        assert_eq!(response.topics[0].name.0.as_str(), "dup");
+        assert_eq!(response.topics[0].error_code, ERROR_INVALID_REQUEST);
+        assert_eq!(response.topics[1].error_code, ERROR_NONE);
+    }
+
+    #[test]
+    fn test_create_topics_name_collision() {
+        let mut store = MockKafkaStore::new();
+        store.expect_topic_exists().returning(|_| Ok(false));
+        store
+            .expect_find_colliding_topic()
+            .returning(|_| Ok(Some("a.b".to_string())));
+        store.expect_create_topic().times(0);
+        let coordinator = crate::kafka::GroupCoordinator::new();
+        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = ctx_for(&store, &coordinator, &broker);
+        let response = handle_create_topics(&ctx, vec![topic("a_b", 1, 1)], false).unwrap();
+        assert_eq!(response.topics[0].error_code, ERROR_INVALID_TOPIC_EXCEPTION);
+        assert_eq!(
+            response.topics[0].error_message.as_ref().unwrap().as_str(),
+            "Topic 'a_b' collides with existing topic: a.b"
+        );
+    }
+
+    #[test]
+    fn test_create_partitions_over_cap_rejected() {
+        let mut store = MockKafkaStore::new();
+        store
+            .expect_get_topic_partition_count()
+            .returning(|_| Ok(Some(1)));
+        store.expect_set_topic_partition_count().times(0);
+        let coordinator = crate::kafka::GroupCoordinator::new();
+        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = ctx_for(&store, &coordinator, &broker);
+        let response = handle_create_partitions(
+            &ctx,
+            vec![CreatePartitionsTopicRequest {
+                name: "t".to_string(),
+                count: 2_000_000_000,
+            }],
+            false,
+        )
+        .unwrap();
+        assert_eq!(response.results[0].error_code, ERROR_INVALID_PARTITIONS);
     }
 }

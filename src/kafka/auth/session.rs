@@ -72,9 +72,31 @@ pub const ANONYMOUS_PRINCIPAL: &str = "User:ANONYMOUS";
 /// user exists.
 const AUTH_FAILED_MESSAGE: &str = "Authentication failed: invalid credentials";
 
-/// Result of a credential lookup: the stored credential, `None` for an unknown user, or
-/// an error (the DB thread could not answer).
-pub type LookupResult = Result<Option<ScramCredential>, String>;
+/// What a credential lookup found (wave3 net).
+#[derive(Debug, Clone)]
+pub enum StoredCredential {
+    /// The user's stored credential.
+    Known(ScramCredential),
+    /// No such user: a fake credential to run the exchange against (salt keyed by the
+    /// durable secret, parameters imitating the stored credentials; see
+    /// `scram::fake_credential_with`), so the answer does not reveal that the user is
+    /// unknown. Verification against it always fails.
+    Unknown(ScramCredential),
+}
+
+impl StoredCredential {
+    /// The real credential, if the user exists.
+    pub fn known(self) -> Option<ScramCredential> {
+        match self {
+            StoredCredential::Known(c) => Some(c),
+            StoredCredential::Unknown(_) => None,
+        }
+    }
+}
+
+/// Result of a credential lookup: what was found, or an error (the DB thread could not
+/// answer).
+pub type LookupResult = Result<StoredCredential, String>;
 
 /// A credential lookup handed to the DB thread.
 #[derive(Debug)]
@@ -445,8 +467,17 @@ impl SaslSession {
                             Ok(s) => s,
                             Err(e) => return fail(format!("{}: {}", m.name(), e)),
                         };
-                        let server =
-                            ScramServerState::new(m, first, stored, &generate_server_nonce());
+                        let (known, fake) = match stored {
+                            StoredCredential::Known(c) => (Some(c), None),
+                            StoredCredential::Unknown(f) => (None, Some(f)),
+                        };
+                        let server = ScramServerState::start(
+                            m,
+                            first,
+                            known,
+                            fake,
+                            &generate_server_nonce(),
+                        );
                         let server_first = Bytes::copy_from_slice(server.server_first().as_bytes());
                         self.state = State::ScramFinal(Box::new(server));
                         SaslOutcome::Reply(authenticate_response(
@@ -499,16 +530,22 @@ impl SaslSession {
 /// Check a PLAIN password off the async workers, at most
 /// [`MAX_CONCURRENT_PASSWORD_CHECKS`] at a time. An unknown user costs the same PBKDF2
 /// as a known one (against a fake credential) and then fails.
-async fn check_password(
-    creds: super::plain::PlainCredentials,
-    stored: Option<ScramCredential>,
-) -> bool {
+async fn check_password(creds: super::plain::PlainCredentials, stored: StoredCredential) -> bool {
     let Ok(_permit) = PASSWORD_CHECKS.acquire().await else {
         return false;
     };
+    // wave3 net: an unknown user's fake credential imitates the stored credentials'
+    // iteration count, so the PBKDF2 costs (and the response time) match a real user's
+    // to within the spread of the stored iteration counts.
     tokio::task::spawn_blocking(move || match stored {
-        Some(cred) if cred.validate().is_ok() => cred.verify_password(&creds.password),
-        _ => {
+        StoredCredential::Known(cred) if cred.validate().is_ok() => {
+            cred.verify_password(&creds.password)
+        }
+        StoredCredential::Unknown(fake) => {
+            let _ = fake.verify_password(&creds.password);
+            false
+        }
+        StoredCredential::Known(_) => {
             let fake = scram::fake_credential(ScramMechanism::Sha256, &creds.username);
             let _ = fake.verify_password(&creds.password);
             false
@@ -561,7 +598,10 @@ mod tests {
                 Err("db down".to_string())
             } else {
                 let m = mechanism.unwrap_or(ScramMechanism::Sha256);
-                Ok(self.creds.get(&(username.to_string(), m)).cloned())
+                Ok(match self.creds.get(&(username.to_string(), m)) {
+                    Some(c) => StoredCredential::Known(c.clone()),
+                    None => StoredCredential::Unknown(scram::fake_credential(m, username)),
+                })
             };
             async move { result }
         }

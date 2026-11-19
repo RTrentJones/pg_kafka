@@ -1,0 +1,56 @@
+name: Set up PostgreSQL + cargo-pgrx
+description: >
+  Install PostgreSQL <major> from apt.postgresql.org (server, headers, pg_config), the build
+  dependencies, cargo-pgrx, and point pgrx at that PostgreSQL. Exports PG_CONFIG.
+inputs:
+  pg:
+    description: PostgreSQL major version (14-18)
+    required: true
+  pgrx-version:
+    description: cargo-pgrx version (must match the pgrx dependency in Cargo.toml)
+    required: true
+  owned:
+    description: >
+      Make the extension install directories writable by the runner user, so
+      `cargo pgrx install` and scripts/check-upgrade.sh work without sudo.
+    default: 'false'
+runs:
+  using: composite
+  steps:
+    - name: Install PostgreSQL ${{ inputs.pg }} (pgdg) and build dependencies
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y postgresql-common
+        sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+        # -server-dev-N has the headers + pg_config bindgen needs; `cargo pgrx init` also
+        # runs initdb, which lives in the server package.
+        sudo apt-get install -y postgresql-${{ inputs.pg }} postgresql-server-dev-${{ inputs.pg }} \
+          libpq-dev libreadline-dev zlib1g-dev flex bison libxml2-dev libxslt-dev \
+          libssl-dev libsasl2-dev libzstd-dev netcat-openbsd openssl
+        # The packaged cluster is not used (tests run their own, scripts/ci-pg.sh).
+        sudo systemctl stop postgresql || true
+        echo "PG_CONFIG=/usr/lib/postgresql/${{ inputs.pg }}/bin/pg_config" >> "$GITHUB_ENV"
+
+    - name: Make the extension directories writable
+      if: inputs.owned == 'true'
+      shell: bash
+      run: |
+        pgc=/usr/lib/postgresql/${{ inputs.pg }}/bin/pg_config
+        sudo chown -R "$USER" "$($pgc --pkglibdir)" "$($pgc --sharedir)/extension"
+
+    - name: Cache cargo-pgrx binary
+      id: cache-cargo-pgrx
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/bin/cargo-pgrx
+        key: ${{ runner.os }}-cargo-pgrx-bin-${{ inputs.pgrx-version }}
+
+    - name: Install cargo-pgrx
+      if: steps.cache-cargo-pgrx.outputs.cache-hit != 'true'
+      shell: bash
+      run: cargo install --locked cargo-pgrx --version ${{ inputs.pgrx-version }}
+
+    - name: Point pgrx at PostgreSQL ${{ inputs.pg }}
+      shell: bash
+      run: cargo pgrx init --pg${{ inputs.pg }} /usr/lib/postgresql/${{ inputs.pg }}/bin/pg_config

@@ -288,6 +288,8 @@ pub const ERROR_UNKNOWN_SERVER_ERROR: i16 = -1;
 
 /// Corrupt message (invalid RecordBatch format)
 pub const ERROR_CORRUPT_MESSAGE: i16 = 2;
+/// wave3 net: Produce with acks other than -1, 0, 1.
+pub const ERROR_INVALID_REQUIRED_ACKS: i16 = 21;
 
 /// Message too large (request exceeds the configured maximum size)
 pub const ERROR_MESSAGE_TOO_LARGE: i16 = 10;
@@ -388,6 +390,18 @@ pub const ERROR_ILLEGAL_SASL_STATE: i16 = 34;
 /// SASL_AUTHENTICATION_FAILED: SASL authentication failed
 pub const ERROR_SASL_AUTHENTICATION_FAILED: i16 = 58;
 
+// wave3 txn: idempotence, transactions and KIP-447 offsets
+/// INVALID_PRODUCER_EPOCH: a Produce carries an epoch older than the producer's current one
+pub const ERROR_INVALID_PRODUCER_EPOCH: i16 = 47;
+/// INVALID_TRANSACTION_TIMEOUT: InitProducerId timeout <= 0 or above transaction.max.timeout.ms
+pub const ERROR_INVALID_TRANSACTION_TIMEOUT: i16 = 50;
+/// OPERATION_NOT_ATTEMPTED: the request failed for another of its entries
+pub const ERROR_OPERATION_NOT_ATTEMPTED: i16 = 55;
+/// UNSTABLE_OFFSET_COMMIT: a transactional offset commit for the partition is pending (KIP-447)
+pub const ERROR_UNSTABLE_OFFSET_COMMIT: i16 = 88;
+/// Default of pg_kafka.transaction_max_timeout_ms (Kafka's transaction.max.timeout.ms: 15 minutes)
+pub const DEFAULT_TRANSACTION_MAX_TIMEOUT_MS: i32 = 900_000;
+
 // NOTE: there is no "transaction timed out" code in the Kafka protocol — 94 is
 // INCONSISTENT_VOTER_SET. A server-side transaction timeout fences the producer, so the
 // internal TransactionTimedOut error maps to ERROR_PRODUCER_FENCED (see error.rs). (BUG-1)
@@ -455,8 +469,10 @@ pub const MIN_SHADOW_RETRY_BACKOFF_MS: i32 = 10;
 /// Maximum shadow retry backoff
 pub const MAX_SHADOW_RETRY_BACKOFF_MS: i32 = 60_000;
 
-/// Default shadow max retries per message
-pub const DEFAULT_SHADOW_MAX_RETRIES: i32 = 3;
+/// Default shadow max retries per message: failed delivery attempts after which
+/// an outbox row is dead-lettered (wave 3: this is the outbox cap; it was the
+/// hard-coded 10 while the GUC fed librdkafka's `retries`).
+pub const DEFAULT_SHADOW_MAX_RETRIES: i32 = 10;
 
 /// Minimum shadow max retries
 pub const MIN_SHADOW_MAX_RETRIES: i32 = 0;
@@ -466,6 +482,14 @@ pub const MAX_SHADOW_MAX_RETRIES: i32 = 100;
 
 /// Default shadow metrics enabled
 pub const DEFAULT_SHADOW_METRICS_ENABLED: bool = true;
+
+/// Default `pg_kafka.shadow_sync_timeout_ms`: how long a sync-mode produce
+/// response waits for the external ack (wave 3).
+pub const DEFAULT_SHADOW_SYNC_TIMEOUT_MS: i32 = 5_000;
+/// Minimum (0 = sync responses are not held).
+pub const MIN_SHADOW_SYNC_TIMEOUT_MS: i32 = 0;
+/// Maximum.
+pub const MAX_SHADOW_SYNC_TIMEOUT_MS: i32 = 120_000;
 
 /// Configuration reload interval (milliseconds) - reloads both GUCs and shadow config
 pub const DEFAULT_CONFIG_RELOAD_MS: i32 = 30_000; // 30 seconds
@@ -489,6 +513,13 @@ pub const ERROR_SHADOW_KAFKA_UNAVAILABLE: i16 = 1003;
 
 /// Shadow mode replay operation failed
 pub const ERROR_SHADOW_REPLAY_FAILED: i16 = 1004;
+
+// wave3 groups: consumer-group and admin validation error codes
+/// INCONSISTENT_GROUP_PROTOCOL: a JoinGroup whose protocol type or protocols do not match the group
+pub const ERROR_INCONSISTENT_GROUP_PROTOCOL: i16 = 23;
+/// INVALID_REPLICATION_FACTOR: replication factor not 1 / -1 on this single-broker cluster
+pub const ERROR_INVALID_REPLICATION_FACTOR: i16 = 38;
+// end wave3 groups
 
 #[cfg(test)]
 mod tests {

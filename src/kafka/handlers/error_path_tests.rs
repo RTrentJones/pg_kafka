@@ -187,6 +187,7 @@ mod tests {
                     list_topic("bad", &[(0, -1), (1, -1)]),
                     list_topic("ok", &[(0, -2), (1, -1), (2, 1_000)]),
                 ],
+                crate::kafka::storage::IsolationLevel::ReadUncommitted,
             )
         })
         .unwrap();
@@ -205,7 +206,8 @@ mod tests {
 
     #[test]
     fn describe_groups_answers_every_requested_group() {
-        let store = MockKafkaStore::new();
+        let mut store = MockKafkaStore::new();
+        store.expect_group_has_offsets().returning(|_| Ok(false));
         let resp = with_ctx(&store, |ctx| {
             handle_describe_groups(ctx, vec!["a".to_string(), "b".to_string(), "a".to_string()])
         })
@@ -216,7 +218,8 @@ mod tests {
 
     #[test]
     fn describe_groups_survives_a_poisoned_coordinator_lock() {
-        let store = MockKafkaStore::new();
+        let mut store = MockKafkaStore::new();
+        store.expect_group_has_offsets().returning(|_| Ok(false));
         let coordinator = GroupCoordinator::new();
         let groups = coordinator.groups.clone();
         let _ = std::thread::spawn(move || {
@@ -254,6 +257,7 @@ mod tests {
                 Ok(false)
             }
         });
+        store.expect_find_colliding_topic().returning(|_| Ok(None));
         store.expect_create_topic().returning(|name, _| {
             if name == "create-fails" {
                 Err(boom())
@@ -431,6 +435,7 @@ mod tests {
     #[test]
     fn delete_groups_unknown_group_storage_failure_is_reported() {
         let mut store = MockKafkaStore::new();
+        store.expect_group_has_offsets().returning(|_| Ok(true));
         store
             .expect_delete_consumer_group_offsets()
             .returning(|_| Err(boom()));

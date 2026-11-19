@@ -148,6 +148,9 @@ pub struct OffsetFetchRequestData {
     /// Topics to read; `None` (v2+ null array) = every partition of the group. An empty
     /// array asks for nothing.
     pub topics: Option<Vec<OffsetFetchTopicData>>,
+    /// v7+ (KIP-447): answer UNSTABLE_OFFSET_COMMIT for partitions with a pending
+    /// transactional offset commit (wave3 txn).
+    pub require_stable: bool,
 }
 
 impl ApiSchema for OffsetFetchApi {
@@ -246,8 +249,10 @@ impl KafkaApi for OffsetFetchApi {
     ) -> Result<Self::Request, Rejection<Self::Echo>> {
         // v8+ (not served, but echoed in its UNSUPPORTED_VERSION reply) moves the group
         // and its topics into `groups`.
+        let require_stable = wire.require_stable;
         if let Some(group) = wire.groups.into_iter().next() {
             return Ok(OffsetFetchRequestData {
+                require_stable,
                 group_id: group.group_id.to_string(),
                 topics: group.topics.map(|topics| {
                     topics
@@ -261,6 +266,7 @@ impl KafkaApi for OffsetFetchApi {
             });
         }
         Ok(OffsetFetchRequestData {
+            require_stable,
             group_id: wire.group_id.to_string(),
             topics: wire.topics.map(|topics| {
                 topics
@@ -288,7 +294,7 @@ impl KafkaApi for OffsetFetchApi {
 
     fn handle(request: Self::Request, call: Call<Self>, env: &ApiEnv<'_>) -> RequestOutcome {
         call.run(request, |r, _| {
-            handlers::handle_offset_fetch(&env.ctx, r.group_id, r.topics)
+            handlers::handle_offset_fetch(&env.ctx, r.group_id, r.topics, r.require_stable)
         })
     }
 }

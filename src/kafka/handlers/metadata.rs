@@ -3,7 +3,9 @@
 // Handlers for ApiVersions and Metadata requests.
 // These are discovery-focused APIs that help clients understand broker capabilities.
 
-use crate::kafka::constants::{DEFAULT_BROKER_ID, ERROR_NONE, ERROR_UNKNOWN_TOPIC_OR_PARTITION};
+use crate::kafka::constants::{
+    DEFAULT_BROKER_ID, ERROR_NONE, ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+};
 use crate::kafka::error::Result;
 use crate::kafka::handler_context::HandlerContext;
 
@@ -53,20 +55,7 @@ pub fn handle_metadata(
             let stored_topics = store.get_topic_metadata(None)?;
             stored_topics
                 .into_iter()
-                .map(|tm| {
-                    // Build partition metadata for all partitions
-                    let partitions: Vec<_> = (0..tm.partition_count)
-                        .map(|partition_id| {
-                            crate::kafka::build_partition_metadata(
-                                partition_id,
-                                DEFAULT_BROKER_ID,
-                                vec![DEFAULT_BROKER_ID],
-                                vec![DEFAULT_BROKER_ID],
-                            )
-                        })
-                        .collect();
-                    crate::kafka::build_topic_metadata(tm.name, ERROR_NONE, partitions)
-                })
+                .map(|tm| topic_metadata_for(tm.name, tm.partition_count))
                 .collect()
         }
         Some(topic_names) => {
@@ -90,19 +79,7 @@ pub fn handle_metadata(
                 };
 
                 let topic = match resolved {
-                    Ok(Some(partition_count)) => {
-                        let partitions: Vec<_> = (0..partition_count)
-                            .map(|partition_id| {
-                                crate::kafka::build_partition_metadata(
-                                    partition_id,
-                                    DEFAULT_BROKER_ID,
-                                    vec![DEFAULT_BROKER_ID],
-                                    vec![DEFAULT_BROKER_ID],
-                                )
-                            })
-                            .collect();
-                        crate::kafka::build_topic_metadata(topic_name, ERROR_NONE, partitions)
-                    }
+                    Ok(Some(partition_count)) => topic_metadata_for(topic_name, partition_count),
                     Ok(None) => {
                         // Topic doesn't exist and auto-creation is disabled — report, don't create.
                         crate::kafka::build_topic_metadata(
@@ -127,4 +104,56 @@ pub fn handle_metadata(
 
     response.topics = topics_to_add;
     Ok(response)
+}
+
+/// One topic's Metadata entry with one partition entry per partition (wave3 groups). A stored
+/// partition count outside `1..=HARD_MAX_PARTITIONS` (only possible if the CHECK constraint on
+/// `kafka.topics.partitions` was bypassed) is reported as UNKNOWN_SERVER_ERROR with no
+/// partitions instead of being allocated: a count of 2,000,000,000 used to abort the worker on an
+/// allocation failure and send Postgres into crash recovery on every Metadata request.
+pub fn topic_metadata_for(
+    topic_name: String,
+    partition_count: i32,
+) -> kafka_protocol::messages::metadata_response::MetadataResponseTopic {
+    let Some(count) = crate::kafka::limits::sane_partition_count(partition_count) else {
+        crate::pg_warning!(
+            "Topic '{}' has an invalid stored partition count {}; reporting it as unavailable",
+            topic_name,
+            partition_count
+        );
+        return crate::kafka::build_topic_metadata(topic_name, ERROR_UNKNOWN_SERVER_ERROR, vec![]);
+    };
+    let partitions: Vec<_> = (0..count)
+        .map(|partition_id| {
+            crate::kafka::build_partition_metadata(
+                partition_id,
+                DEFAULT_BROKER_ID,
+                vec![DEFAULT_BROKER_ID],
+                vec![DEFAULT_BROKER_ID],
+            )
+        })
+        .collect();
+    crate::kafka::build_topic_metadata(topic_name, ERROR_NONE, partitions)
+}
+
+#[cfg(test)]
+mod wave3_groups_tests {
+    use super::*;
+
+    #[test]
+    fn test_topic_metadata_for_rejects_corrupt_partition_counts() {
+        let ok = topic_metadata_for("t".to_string(), 3);
+        assert_eq!(ok.error_code, ERROR_NONE);
+        assert_eq!(ok.partitions.len(), 3);
+        for bad in [
+            0,
+            -1,
+            2_000_000_000,
+            crate::kafka::limits::HARD_MAX_PARTITIONS + 1,
+        ] {
+            let t = topic_metadata_for("t".to_string(), bad);
+            assert_eq!(t.error_code, ERROR_UNKNOWN_SERVER_ERROR, "count {}", bad);
+            assert!(t.partitions.is_empty());
+        }
+    }
 }

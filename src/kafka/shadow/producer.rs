@@ -26,14 +26,14 @@
 
 use super::config::ShadowConfig;
 use super::error::{ShadowError, ShadowResult};
+use super::ForwardRecord;
 use rdkafka::config::ClientConfig;
-use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
+use rdkafka::error::RDKafkaErrorCode;
+use rdkafka::message::{Header, OwnedHeaders};
+use rdkafka::producer::{DeliveryFuture, FutureProducer, FutureRecord, Producer, PurgeConfig};
 use rdkafka::util::Timeout;
 use std::sync::Arc;
 use std::time::Duration;
-
-/// Default delivery timeout for async sends (30 seconds)
-const DEFAULT_DELIVERY_TIMEOUT_MS: u64 = 30_000;
 
 /// librdkafka tuning for the shadow forwarding producer. Named here rather than
 /// inlined as string literals at the `client_config.set` call sites so the intent
@@ -42,10 +42,9 @@ const DEFAULT_DELIVERY_TIMEOUT_MS: u64 = 30_000;
 /// Max in-flight requests per connection. librdkafka requires this to be ≤ 5 for
 /// `enable.idempotence=true` (ordering guarantee), so 5 is the idempotent maximum.
 const PRODUCER_MAX_IN_FLIGHT: &str = "5";
-/// Fallback retry count when the configured `max_retries` is < 1 — idempotence
-/// needs at least one retry to be meaningful.
-const PRODUCER_IDEMPOTENCE_MIN_RETRIES: &str = "3";
-/// Per-request timeout (30 s) and total message delivery timeout (120 s).
+/// Per-request timeout (30 s) and total message delivery timeout (120 s). One
+/// outbox attempt therefore resolves (delivered or failed) within 120 s, which the
+/// DB thread's in-flight eviction (`INFLIGHT_EVICT_AFTER`, 150 s) relies on.
 const PRODUCER_REQUEST_TIMEOUT_MS: &str = "30000";
 const PRODUCER_MESSAGE_TIMEOUT_MS: &str = "120000";
 
@@ -54,11 +53,20 @@ const PRODUCER_MESSAGE_TIMEOUT_MS: &str = "120000";
 /// Pure — no client creation, no IO — so the security/idempotence invariants can
 /// be unit-tested without a live broker (mirrors the `validate_sequence`
 /// extraction in `storage/mod.rs`). [`ShadowProducer::create_producer`] applies
-/// these to a `ClientConfig` and calls `.create()`. Behaviour is identical to the
-/// previous inline `client_config.set(...)` calls; the only structural change is
-/// that `retries` is now resolved once (the idempotence fallback folded in)
-/// instead of being set then conditionally overwritten.
-fn build_producer_settings(config: &ShadowConfig) -> Vec<(&'static str, String)> {
+/// these to a `ClientConfig` and calls `.create()`.
+///
+/// What each shadow GUC maps to (wave 3: every GUC does what its doc says):
+/// - `shadow_batch_size` (messages) → `batch.num.messages` (librdkafka's
+///   per-batch message cap; it used to be passed to `batch.size`, which is bytes);
+/// - `shadow_linger_ms` → `linger.ms`;
+/// - `shadow_retry_backoff_ms` → `retry.backoff.ms` (librdkafka's own retries
+///   inside one delivery attempt; the outbox uses the same base for its re-attempt
+///   backoff, see `ShadowStore`);
+/// - `shadow_max_retries` is NOT a librdkafka setting any more: it is the outbox's
+///   dead-letter cap (failed delivery attempts per record). Inside one attempt
+///   librdkafka retries as often as `message.timeout.ms` allows (its default
+///   `retries`), which is what idempotence wants.
+pub(crate) fn build_producer_settings(config: &ShadowConfig) -> Vec<(&'static str, String)> {
     // Basic configuration + security protocol are always set.
     // (SASL_SSL, SASL_PLAINTEXT, SSL, or PLAINTEXT for security.protocol.)
     let mut settings: Vec<(&'static str, String)> = vec![
@@ -89,37 +97,37 @@ fn build_producer_settings(config: &ShadowConfig) -> Vec<(&'static str, String)>
         settings.push(("ssl.endpoint.identification.algorithm", https));
     }
 
-    // Producer performance settings
-    settings.push(("batch.size", config.batch_size.to_string()));
+    // Producer performance settings (see the GUC mapping above).
+    settings.push(("batch.num.messages", config.batch_size.to_string()));
     settings.push(("linger.ms", config.linger_ms.to_string()));
     settings.push(("retry.backoff.ms", config.retry_backoff_ms.to_string()));
 
     // Compression (use none for maximum compatibility)
     settings.push(("compression.type", "none".to_string()));
 
-    // SH-12: idempotent producer. The durable outbox replays a row on any crash
-    // before its ack is recorded, so the forwarding producer de-dups retries to
-    // avoid double-delivery to the external broker. Note the guarantee is bounded:
-    // librdkafka idempotence only suppresses duplicates *within a single producer
-    // session* (a stable PID + per-partition sequence). A replay that crosses a
-    // producer restart (new PID) is NOT recognized as a duplicate, so external
-    // delivery is at-least-once, not exactly-once. Idempotence still requires
-    // acks=all, a bounded in-flight window, and retries > 0 — set them explicitly
-    // so the config is valid regardless of librdkafka defaults.
-    //
-    // Long const values are bound to short locals first so each `push` stays well
-    // inside rustfmt's width heuristics (and to avoid a re-alloc per call site).
+    // The partitioner of the Java client (murmur2 over the key, random for a
+    // null key), so a keyed record forwarded by pg_kafka lands in the same
+    // external partition as the same record produced by a Java client: a
+    // migration that cuts producers over keeps per-key placement. librdkafka's
+    // default (CRC32) would scatter keys differently.
+    settings.push(("partitioner", "murmur2_random".to_string()));
+
+    // SH-12 + wave 3: idempotent, order-preserving producer. Many deliveries are
+    // in flight at once (the forwarder pipelines), so ordering rests on the
+    // idempotent producer: per-partition sequence numbers, acks=all, at most 5
+    // requests in flight, librdkafka's own retries. `enable.gapless.guarantee`
+    // turns any error that could leave a gap (a later record delivered while an
+    // earlier one failed) into a fatal producer error that fails every
+    // outstanding record instead; the forwarder then rebuilds the producer and
+    // the outbox re-sends from the first undelivered offset of each partition,
+    // so a record is never delivered after a later record of its local
+    // partition. Duplicates are suppressed only within one producer session
+    // (stable PID): a re-send that crosses a producer rebuild is at-least-once.
     let max_in_flight = PRODUCER_MAX_IN_FLIGHT.to_string();
-    let retries = if config.max_retries < 1 {
-        // Idempotence needs at least one retry to be meaningful.
-        PRODUCER_IDEMPOTENCE_MIN_RETRIES.to_string()
-    } else {
-        config.max_retries.to_string()
-    };
     settings.push(("enable.idempotence", "true".to_string()));
+    settings.push(("enable.gapless.guarantee", "true".to_string()));
     settings.push(("max.in.flight.requests.per.connection", max_in_flight));
     settings.push(("acks", "all".to_string()));
-    settings.push(("retries", retries));
 
     // NOTE: deprecated api.version.* settings are intentionally NOT set — they
     // caused "Required feature not supported by broker" errors with modern Kafka,
@@ -130,6 +138,15 @@ fn build_producer_settings(config: &ShadowConfig) -> Vec<(&'static str, String)>
     settings.push(("message.timeout.ms", message_timeout));
 
     settings
+}
+
+/// Why [`ShadowProducer::enqueue`] did not accept a record.
+#[derive(Debug)]
+pub enum EnqueueError {
+    /// librdkafka's local queue is full: back off and retry the same record.
+    QueueFull,
+    /// The record was refused (too large, unknown topic, fatal producer...).
+    Refused(String),
 }
 
 /// Shadow producer for forwarding messages to external Kafka
@@ -182,110 +199,60 @@ impl ShadowProducer {
             .map_err(|e| ShadowError::ProducerError(format!("Failed to create producer: {}", e)))
     }
 
-    /// Send a message asynchronously
-    ///
-    /// Returns immediately after queueing the message. The message will be
-    /// delivered in the background with retries as configured.
-    pub async fn send_async(
-        &self,
-        topic: &str,
-        partition: Option<i32>,
-        key: Option<&[u8]>,
-        payload: Option<&[u8]>,
-    ) -> ShadowResult<()> {
-        self.send_async_offset(topic, partition, key, payload)
-            .await
-            .map(|_| ())
+    /// Hand one outbox record to librdkafka without waiting for its delivery
+    /// (the forwarder keeps many deliveries in flight). The record keeps its key,
+    /// value, headers and timestamp; `partition` is left to the partitioner (the
+    /// external cluster re-partitions by key, SH-15).
+    pub fn enqueue(&self, record: &ForwardRecord) -> Result<DeliveryFuture, EnqueueError> {
+        let mut future_record: FutureRecord<'_, [u8], [u8]> = FutureRecord::to(&record.topic_name);
+        if let Some(k) = record.key.as_deref() {
+            future_record = future_record.key(k);
+        }
+        if let Some(v) = record.value.as_deref() {
+            future_record = future_record.payload(v);
+        }
+        if let Some(ts) = record.timestamp_ms {
+            future_record = future_record.timestamp(ts);
+        }
+        if !record.headers.is_empty() {
+            let mut headers = OwnedHeaders::new_with_capacity(record.headers.len());
+            for (key, value) in &record.headers {
+                headers = headers.insert(Header {
+                    key,
+                    value: Some(value.as_slice()),
+                });
+            }
+            future_record = future_record.headers(headers);
+        }
+        self.producer.send_result(future_record).map_err(|(e, _)| {
+            if e.rdkafka_error_code() == Some(RDKafkaErrorCode::QueueFull) {
+                EnqueueError::QueueFull
+            } else {
+                EnqueueError::Refused(e.to_string())
+            }
+        })
     }
 
-    /// Send a message asynchronously, returning the external partition offset
-    /// it was written at on success.
-    ///
-    /// The durable-outbox forwarder records this offset in
-    /// `kafka.shadow_tracking.external_offset` so an operator can correlate a
-    /// local message with its external position (and so a non-NULL value marks
-    /// the row delivered). Behaves exactly like [`send_async`] otherwise.
-    pub async fn send_async_offset(
-        &self,
-        topic: &str,
-        partition: Option<i32>,
-        key: Option<&[u8]>,
-        payload: Option<&[u8]>,
-    ) -> ShadowResult<i64> {
-        let mut record = FutureRecord::to(topic);
-
-        if let Some(k) = key {
-            record = record.key(k);
-        }
-
-        if let Some(p) = payload {
-            record = record.payload(p);
-        }
-
-        if let Some(part) = partition {
-            record = record.partition(part);
-        }
-
-        let timeout = Timeout::After(Duration::from_millis(DEFAULT_DELIVERY_TIMEOUT_MS));
-
-        let result = self.producer.send(record, timeout).await;
-        match result {
-            Ok((_partition, offset)) => Ok(offset),
-            Err((err, _)) => Err(ShadowError::ForwardFailed {
-                topic: topic.to_string(),
-                partition: partition.unwrap_or(-1),
-                error: err.to_string(),
-            }),
-        }
+    /// The producer's fatal error, if it has one (it then fails every record and
+    /// must be rebuilt; see `enable.gapless.guarantee`).
+    pub fn fatal_error(&self) -> Option<String> {
+        self.producer
+            .client()
+            .fatal_error()
+            .map(|(code, msg)| format!("{:?}: {}", code, msg))
     }
 
-    /// Send a message synchronously (blocking)
-    ///
-    /// Waits for delivery confirmation before returning. Use this for
-    /// sync_mode = "sync" topics where we need to confirm delivery before
-    /// acknowledging to the original producer.
-    ///
-    /// This uses `futures::executor::block_on` which works without a tokio
-    /// runtime context. This is essential for the DB worker thread which
-    /// does not have access to the tokio runtime (that lives in the network thread).
-    #[allow(clippy::result_large_err)]
-    pub fn send_sync(
-        &self,
-        topic: &str,
-        partition: Option<i32>,
-        key: Option<&[u8]>,
-        payload: Option<&[u8]>,
-        timeout_ms: u64,
-    ) -> ShadowResult<()> {
-        // Use futures::executor::block_on which works without a tokio runtime
-        // This is critical: the DB thread doesn't have a tokio runtime context
-        let result = futures::executor::block_on(async {
-            let mut record = FutureRecord::to(topic);
+    /// Fail every queued and in-flight record now (their delivery futures
+    /// resolve with a purge error). Used when the producer is replaced.
+    pub fn purge_outstanding(&self) {
+        self.producer
+            .purge(PurgeConfig::default().queue().inflight());
+    }
 
-            if let Some(k) = key {
-                record = record.key(k);
-            }
-
-            if let Some(p) = payload {
-                record = record.payload(p);
-            }
-
-            if let Some(part) = partition {
-                record = record.partition(part);
-            }
-
-            let timeout = Timeout::After(Duration::from_millis(timeout_ms));
-
-            self.producer.send(record, timeout).await
-        });
-
-        result.map_err(|(err, _)| ShadowError::ForwardFailed {
-            topic: topic.to_string(),
-            partition: partition.unwrap_or(-1),
-            error: err.to_string(),
-        })?;
-
-        Ok(())
+    /// Serve librdkafka's delivery callbacks for a moment (the FutureProducer's
+    /// own polling thread does this too; used while waiting on a full queue).
+    pub fn poll(&self, timeout: Duration) {
+        self.producer.poll(Timeout::After(timeout));
     }
 
     /// Flush pending messages
@@ -300,39 +267,6 @@ impl ShadowProducer {
     /// Get the configuration used by this producer
     pub fn config(&self) -> &ShadowConfig {
         &self.config
-    }
-
-    /// Check if the producer is healthy by attempting metadata fetch
-    pub async fn health_check(&self) -> ShadowResult<()> {
-        let timeout = Duration::from_secs(10);
-        self.producer
-            .client()
-            .fetch_metadata(None, timeout)
-            .map_err(|e| {
-                ShadowError::KafkaUnavailable(format!("Failed to fetch metadata: {}", e))
-            })?;
-
-        Ok(())
-    }
-
-    /// Check if the producer can communicate with Kafka (sync version)
-    ///
-    /// Returns true if metadata fetch succeeds, false otherwise.
-    /// Uses a short timeout (5s) to avoid blocking too long on unhealthy connections.
-    /// This is called from ensure_producer() to detect stale connections after
-    /// network failures or broker restarts.
-    pub fn is_healthy(&self) -> bool {
-        // Use a short timeout to avoid blocking too long
-        let timeout = Duration::from_secs(5);
-
-        // Try to fetch metadata - this verifies broker connectivity
-        match self.producer.client().fetch_metadata(None, timeout) {
-            Ok(metadata) => {
-                // Check that we have at least one broker
-                !metadata.brokers().is_empty()
-            }
-            Err(_) => false,
-        }
     }
 }
 
@@ -633,19 +567,20 @@ mod tests {
     }
 
     #[test]
-    fn test_build_producer_settings_retries_fallback() {
-        // Idempotence needs >= 1 retry: when max_retries < 1 the assembly must
-        // fall back to the idempotence minimum, otherwise the configured value.
-        let mut config = ShadowConfig {
+    fn test_build_producer_settings_max_retries_is_not_a_librdkafka_setting() {
+        // Wave 3: shadow_max_retries is the outbox dead-letter cap. librdkafka
+        // keeps its own (time-bounded) retries, as idempotence wants, and the
+        // ordering guard is on.
+        let config = ShadowConfig {
             enabled: true,
             bootstrap_servers: "kafka:9092".to_string(),
             max_retries: 0,
             ..Default::default()
         };
-        assert!(has(&build_producer_settings(&config), "retries", "3"));
-
-        config.max_retries = 7;
-        assert!(has(&build_producer_settings(&config), "retries", "7"));
+        let s = build_producer_settings(&config);
+        assert!(!has_key(&s, "retries"));
+        assert!(has(&s, "enable.gapless.guarantee", "true"));
+        assert!(has(&s, "partitioner", "murmur2_random"));
     }
 
     #[test]
@@ -755,7 +690,10 @@ mod tests {
         let s = build_producer_settings(&config);
         assert!(has(&s, "bootstrap.servers", "a:9092,b:9092"));
         assert!(has(&s, "security.protocol", "PLAINTEXT"));
-        assert!(has(&s, "batch.size", "4096"));
+        // shadow_batch_size counts messages: batch.num.messages, never the
+        // byte-sized batch.size (wave 3 fix).
+        assert!(has(&s, "batch.num.messages", "4096"));
+        assert!(!has_key(&s, "batch.size"));
         assert!(has(&s, "linger.ms", "25"));
         assert!(has(&s, "retry.backoff.ms", "200"));
         assert!(has(&s, "request.timeout.ms", "30000"));

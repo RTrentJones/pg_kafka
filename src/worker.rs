@@ -765,7 +765,11 @@ fn wait_for_schema(database: &str) -> bool {
 /// postmaster does not restart workers, so status 1 is also correct there (it is
 /// what Postgres's own default SIGTERM handler for bgworkers does).
 fn exit_for_restart() -> ! {
-    unsafe { pg_sys::proc_exit(1) }
+    unsafe { pg_sys::proc_exit(1) };
+    // PG18 declares proc_exit with a leading `pg_noreturn`, which bindgen does not turn
+    // into `-> !`, so the binding returns `()` there.
+    #[cfg(feature = "pg18")]
+    unreachable!("proc_exit returned")
 }
 
 /// How long the postmaster waits before restarting a worker that exited
@@ -804,6 +808,8 @@ fn build_listener_securities(
                     .map(tokio_rustls::TlsAcceptor::from),
                 sasl_mechanisms: mechanisms.clone(),
                 advertised: spec.advertised.clone(),
+                // wave3 net: connection caps and timeouts.
+                limits: settings.limits,
             })
         })
         .collect())
@@ -1085,6 +1091,9 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     let network_handle = std::thread::Builder::new()
         .name("pg_kafka-net".to_string())
         .spawn(move || {
+            // wave3 net: signals belong to the main worker thread (pgrx's handlers
+            // panic, and abort the process, on any other thread).
+            crate::kafka::listener::block_signals_on_this_thread();
             let _finished = NetworkFinished;
             // Network-thread logging to stderr: warnings by default, RUST_LOG overrides.
             crate::kafka::listener::init_network_tracing();
@@ -1214,7 +1223,8 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     // SH-9: how often the DB thread drains forward acks and forwards due outbox
     // rows. Short so async forwarding has sub-second latency, but throttled so
     // an idle instance isn't opening an SPI transaction on every 100ms wakeup.
-    let outbox_poll_interval = Duration::from_millis(250);
+    // The interval and the "poll again now" requests live in the ShadowStore
+    // (outbox_tick_due), which also backs off after failed ticks.
     let mut last_outbox_poll = Instant::now();
 
     // Phase 11: Initial shadow config load
@@ -1396,7 +1406,7 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
         // Runs on the DB thread (SPI). Gated on shadow mode being enabled and
         // the poll interval, so an idle or non-shadow instance does no work.
         if crate::config::SHADOW_MODE_ENABLED.get()
-            && last_outbox_poll.elapsed() >= outbox_poll_interval
+            && shadow_store.outbox_tick_due(last_outbox_poll.elapsed())
         {
             let shadow_outbox = &shadow_store;
             let outcome = worker_transaction(|| {
@@ -1410,14 +1420,18 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
                 // the applied acks and lose them (delivered rows left pending,
                 // re-sent, and eventually dead-lettered).
                 let mut applied = 0;
+                // Failures (for example a dropped schema) pause the tick
+                // exponentially and are logged sparsely (note_outbox_tick).
+                let mut failure: Option<String> = None;
                 if let Err(panic_msg) = run_request_in_subtransaction(|| {
                     applied = shadow_outbox.drain_forward_acks();
                 }) {
-                    pg_warning!(
-                        "Shadow ack application panicked, rolled back (worker survived): {}",
+                    failure = Some(format!(
+                        "ack application failed, rolled back: {}",
                         panic_msg
-                    );
+                    ));
                 }
+                let mut poll_error: Option<String> = None;
                 let result = run_request_in_subtransaction(|| {
                     // Then dispatch the next due batch.
                     match shadow_outbox.poll_and_forward_outbox() {
@@ -1430,16 +1444,19 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
                                 );
                             }
                         }
-                        Err(e) => {
-                            pg_warning!("Shadow outbox poll failed: {:?}", e);
-                        }
+                        Err(e) => poll_error = Some(format!("poll failed: {:?}", e)),
                     }
                 });
                 if let Err(panic_msg) = result {
-                    pg_warning!(
-                        "Shadow outbox maintenance panicked, rolled back (worker survived): {}",
-                        panic_msg
-                    );
+                    poll_error = Some(format!("poll failed, rolled back: {}", panic_msg));
+                }
+                failure = failure.or(poll_error);
+                if let Some(msg) = failure {
+                    if shadow_outbox.note_outbox_tick(false) {
+                        pg_warning!("Shadow outbox {} (worker survived; backing off)", msg);
+                    }
+                } else {
+                    shadow_outbox.note_outbox_tick(true);
                 }
             });
             if let Err(e) = outcome {
@@ -1851,6 +1868,9 @@ struct BufferedResponse {
     /// recorded when this value is dropped (after release or fail), so latency
     /// covers the handler and the batch commit.
     metrics: crate::kafka::metrics::RequestTimer<'static>,
+    /// The request's slot in the ShadowStore (`begin_request`), under which its
+    /// sync-mode shadow rows are reported after the commit.
+    shadow_slot: u64,
 }
 
 impl BufferedResponse {
@@ -1870,7 +1890,28 @@ impl BufferedResponse {
             echo: request.body.echo(),
             expects_response: request.body.expects_response(),
             metrics: crate::kafka::metrics::RequestTimer::start(api_key),
+            shadow_slot: 0,
         }
+    }
+
+    /// The batch committed and the response must wait for the external
+    /// cluster (a sync-mode shadow produce): take the buffered response(s) out
+    /// into a release the shadow forwarder runs on the network thread (no pgrx
+    /// in it), after the commit like `release` (RB-1).
+    fn into_held(mut self) -> crate::kafka::shadow::HeldRelease {
+        let mut responses = Vec::new();
+        while let Ok(response) = self.buffer_rx.try_recv() {
+            self.metrics.observe(&response);
+            responses.push(response);
+        }
+        let client_tx = self.client_tx;
+        let metrics = self.metrics;
+        crate::kafka::shadow::HeldRelease::new(move || {
+            for response in responses {
+                let _ = client_tx.send(response);
+            }
+            drop(metrics);
+        })
     }
 
     /// The batch committed: forward the buffered response(s) to the client, in
@@ -1897,6 +1938,13 @@ impl BufferedResponse {
         while self.buffer_rx.try_recv().is_ok() {}
         self.metrics.mark_error();
         if !self.expects_response {
+            // wave3 net: an acks=0 produce whose writes were lost closes the
+            // connection, as any acks=0 error does (Kafka), so the client notices.
+            let _ = self.client_tx.send(crate::kafka::KafkaResponse::new(
+                -1,
+                -1,
+                crate::kafka::api::ResponseBody::CloseConnection,
+            ));
             return;
         }
         // The API's own error response, echoing the request's topics/partitions/groups
@@ -1916,8 +1964,6 @@ fn run_one_request(
     request: crate::kafka::KafkaRequest,
     env: &RequestEnv,
 ) -> Result<RequestOutcome, String> {
-    // New request, new sync-forward budget (see ShadowStore::begin_request).
-    env.shadow_store.begin_request();
     let result = run_request_in_subtransaction(|| {
         // Each request reads from its own snapshot. pgrx runs read-only SPI statements
         // (the transaction has not written yet) on the active snapshot, which
@@ -2013,7 +2059,9 @@ fn execute_batch(
         let mut next = first.take();
         while let Some(mut request) = next.take() {
             api_keys.push(request.header.api_key);
-            pending.push(BufferedResponse::intercept(&mut request));
+            let mut buffered = BufferedResponse::intercept(&mut request);
+            buffered.shadow_slot = env.shadow_store.begin_request();
+            pending.push(buffered);
 
             let handler_start = Instant::now();
             let _ = run_one_request(request, env);
@@ -2031,14 +2079,23 @@ fn execute_batch(
         apply_test_pre_commit_delay(api_keys.contains(&API_KEY_PRODUCE));
     });
 
-    // Sync-mode shadow forwards go out only now that the local writes are committed;
-    // responses are released after the (bounded) external wait. After a failed batch
-    // this only discards the queue (forwards of uncommitted transactions are skipped).
-    env.shadow_store.forward_sync_after_commit();
     let batch_size = pending.len();
     match txn_result {
         Ok(()) => {
-            after_batch_commit(pending);
+            // A sync-mode shadow produce's response waits for the external ack
+            // (bounded by pg_kafka.shadow_sync_timeout_ms) on the network thread;
+            // the DB thread does not wait (wave 3). Everything else is released now.
+            let mut holds = env.shadow_store.take_sync_holds();
+            let mut release_now = Vec::with_capacity(pending.len());
+            for response in pending {
+                match holds.remove(&response.shadow_slot) {
+                    Some(keys) if response.expects_response => {
+                        env.shadow_store.hold_response(keys, response.into_held())
+                    }
+                    _ => release_now.push(response),
+                }
+            }
+            after_batch_commit(release_now);
             if batch_may_end_transactions(&api_keys) {
                 notify_transaction_ended(env.notify_tx);
             }
@@ -2048,6 +2105,8 @@ fn execute_batch(
             // (a retriable one) instead of its buffered success; a request the batch
             // never started (the schema locks failed first) is rejected the same way.
             log_txn_error("Request batch", &err);
+            // Sync holds of rolled-back requests are void (their outbox rows are gone).
+            drop(env.shadow_store.take_sync_holds());
             let code = err.kafka_error_code();
             after_batch_commit_failure(pending, code);
             if let Some(request) = first.take() {
@@ -2358,12 +2417,20 @@ mod tests {
     #[test]
     fn test_commit_failure_sends_nothing_to_acks0_produce() {
         // An acks=0 client expects no response frame at all; an error frame would
-        // be read as the answer to its next request.
+        // be read as the answer to its next request. wave3 net: the connection gets
+        // the close instruction instead (Kafka closes it on any acks=0 error).
         let (mut p, mut p_rx) = produce_request(21, 0);
         let pending = vec![BufferedResponse::intercept(&mut p)];
         drop(p); // the acks=0 path sends nothing
         after_batch_commit_failure(pending, ERROR_KAFKA_STORAGE_ERROR);
-        assert!(p_rx.try_recv().is_err());
+        match p_rx.try_recv() {
+            Ok(r) => assert!(matches!(
+                r.body,
+                crate::kafka::api::ResponseBody::CloseConnection
+            )),
+            Err(e) => panic!("expected the close instruction, got {e:?}"),
+        }
+        assert!(p_rx.try_recv().is_err(), "nothing else");
     }
 
     #[test]

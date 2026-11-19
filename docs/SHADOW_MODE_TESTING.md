@@ -132,15 +132,23 @@ The IP `172.23.0.2` is stale. Fix by:
 1. Verify actual Kafka IP: `docker inspect external_kafka | grep IPAddress`
 2. If it is not `172.18.0.2`, another network on the host may already claim the `172.18.0.0/16` subnet; free it, or change the subnet, `ipv4_address`, and CONTAINER advertised listener together in `docker-compose.yml` and set `INTERNAL_KAFKA_BOOTSTRAP_SERVERS` to match
 3. Recreate Kafka container: `docker-compose up -d --force-recreate external-kafka`
-4. Restart PostgreSQL: `./scripts/restart.sh`
+4. Restart PostgreSQL: `./scripts/restart.sh` (rebuilds and restarts, keeping the data; `--fresh` would also drop and recreate the extension, deleting all pg_kafka data)
 
-### Producer Cache Issues
+### Producer Settings Changes
 
-If the producer uses old bootstrap servers after a GUC change:
+The forwarding producer lives in the network thread (`run_shadow_forwarder` in
+`src/kafka/shadow/forwarder_task.rs`). It is rebuilt whenever any producer GUC changes (bootstrap
+servers, security protocol, SASL, CA, batch size, linger, backoff), within about 0.5 s of the reload
+(`SELECT pg_reload_conf()`); no restart is needed. Every shadow GUC is `Sighup`: set it with
+`ALTER SYSTEM` (a session `SET` is refused).
 
-1. The forwarding producer lives in the network thread (`run_shadow_forwarder` in `src/kafka/listener.rs`) and is rebuilt when the reloaded `pg_kafka.shadow_bootstrap_servers` differs from the value it was built with
-2. Make sure the change was reloaded (`SELECT pg_reload_conf()`); the forwarder reads the worker's reloaded config snapshot
-3. Other producer settings (batch size, linger, retries, SASL/SSL) are applied only when the producer is rebuilt, so restart PostgreSQL to force a fresh producer: `./scripts/restart.sh`
+### Running Against a Local Kafka Without Docker
+
+Any Apache Kafka reachable from Postgres works. For example, a KRaft broker on `127.0.0.1:9093`:
+set `pg_kafka.shadow_bootstrap_servers = '127.0.0.1:9093'` (plus the other GUCs above) and run the
+suite with `INTERNAL_KAFKA_BOOTSTRAP_SERVERS=127.0.0.1:9093 EXTERNAL_KAFKA_BOOTSTRAP_SERVERS=127.0.0.1:9093`.
+The order test creates and alters an external topic through the admin API, so the broker must allow
+it (the default does).
 
 ### DNS Resolution
 
@@ -159,7 +167,7 @@ The `shadow` category's tests are registered in `kafka_test/src/main.rs`, all `p
 |------|-------------|
 | `test_dual_write_sync` | DualWrite + sync: stored locally and delivered to external Kafka |
 | `test_dual_write_async` | DualWrite + async: stored locally and delivered by the outbox poll |
-| `test_async_forwarding_no_duplicates_on_slow_ack` | Issue #93: with `pg_kafka.test_forward_ack_delay_ms` holding acks past the 5 s retry lease, each record reaches external Kafka exactly once |
+| `test_async_forwarding_no_duplicates_on_slow_ack` | Issue #93: with `pg_kafka.test_forward_ack_delay_ms` holding acks for 6.5 s, each record reaches external Kafka exactly once and no attempt is re-claimed (`retry_count` stays 0) |
 | `test_external_only_mode` | ExternalOnly (external-primary): delivered externally, stored locally, but a pg_kafka consumer reads nothing |
 | `test_local_only_mode` | `mode = 'local_only'`: stored locally, not forwarded |
 | `test_reload_clears_deleted_topic_config` | Deleting a `kafka.shadow_config` row stops forwarding after reload |
@@ -174,9 +182,18 @@ The `shadow` category's tests are registered in `kafka_test/src/main.rs`, all `p
 | `test_committed_txn_leaves_no_orphan_outbox_rows` | A committed transaction leaves no outbox rows without a backing message |
 | `test_dual_write_external_down` | DualWrite (async): the local write succeeds regardless of forwarding. It runs against the normal broker config and does not take the broker down |
 | `test_external_only_fallback` | ExternalOnly produce succeeds. It accepts either local count, and with the current code the record is always stored locally |
-| `test_external_primary_dead_letter_serves_local` | RV-6: once a forward is dead-lettered (`retry_count >= 10`), an external-primary topic serves the record locally |
+| `test_external_primary_dead_letter_serves_local` | RV-6: once a forward is dead-lettered (`retry_count >= pg_kafka.shadow_max_retries`), an external-primary topic serves the record locally |
 | `test_replay_historical_messages` | `kafka.replay_shadow_messages()` re-queues stored messages and they are forwarded |
 | `test_replay_skips_aborted_records` | Replay never re-queues aborted transactional records |
+| `test_shadow_forward_throughput` | 20 000 records forwarded end to end at ≥ 2000 msg/s with no failed attempts (pipelined forwarder) |
+| `test_shadow_forwards_headers_and_timestamps` | Record headers (in order, binary values) and the producer's CreateTime reach the external topic |
+| `test_shadow_order_preserved_across_a_retried_failure` | An external topic rejects the batch holding an oversized record until its `max.message.bytes` is raised; nothing after the failed record is delivered before its retry and the external order equals the local order |
+| `test_shadow_sync_stall_is_bounded_to_its_own_response` | External cluster unreachable: a sync produce is held ~`shadow_sync_timeout_ms` (3 s) while produces to another topic stay < 1 s |
+| `test_shadow_gucs_take_effect_on_reload` | Session `SET` of shadow GUCs is refused; a security-protocol change rebuilds the producer; `shadow_metrics_enabled = off` writes no metrics; sampled-out records are counted in `messages_skipped` |
+
+The `w3_shadow` category (no external Kafka, part of the functional suite) has
+`test_shadow_lag_view_is_per_partition` (`kafka.shadow_partition_status` / `kafka.shadow_status`
+lag, dead letters and in-flight counts per partition).
 
 ## Running Tests
 

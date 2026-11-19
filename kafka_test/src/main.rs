@@ -2036,29 +2036,286 @@ fn get_all_tests() -> Vec<TestDef> {
             ),
             parallel_safe: false,
         },
+        // wave3 groups: consumer groups, admin validation, resource bounds (kafka_test/src/w3_groups)
+        TestDef {
+            category: "w3_groups",
+            name: "test_w3g_partition_cap",
+            test_fn: wrap_test!(kafka_test::w3_groups::test_w3g_partition_cap),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "w3_groups",
+            name: "test_w3g_create_topics_validation",
+            test_fn: wrap_test!(kafka_test::w3_groups::test_w3g_create_topics_validation),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "w3_groups",
+            name: "test_w3g_join_group_protocol_rules",
+            test_fn: wrap_test!(kafka_test::w3_groups::test_w3g_join_group_protocol_rules),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "w3_groups",
+            name: "test_w3g_offset_commit_rules",
+            test_fn: wrap_test!(kafka_test::w3_groups::test_w3g_offset_commit_rules),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "w3_groups",
+            name: "test_w3g_different_assignor_is_refused_group_unaffected",
+            test_fn: wrap_test!(
+                kafka_test::w3_groups::test_w3g_different_assignor_is_refused_group_unaffected
+            ),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "w3_groups",
+            name: "test_w3g_metadata_survives_corrupt_partition_count",
+            test_fn: wrap_test!(
+                kafka_test::w3_groups::test_w3g_metadata_survives_corrupt_partition_count
+            ),
+            parallel_safe: false, // drops and restores the CHECK constraint on kafka.topics
+        },
+        TestDef {
+            category: "w3_groups",
+            name: "test_w3g_offsets_only_group_survives_restart",
+            test_fn: wrap_test!(
+                kafka_test::w3_groups::test_w3g_offsets_only_group_survives_restart
+            ),
+            parallel_safe: false, // restarts the listener worker
+        },
+        // end wave3 groups
+        // wave3 txn: fetch past invisible offsets, ListOffsets, require_stable,
+        // idempotence, transaction validation, batching (kafka_test/src/w3_txn).
+        // Not parallel safe: the cleanup test runs the retention sweep (deletes every
+        // aborted row), the idempotence test restarts the listener.
+        TestDef {
+            category: "w3_txn",
+            name: "test_w3_read_committed_passes_aborted_tail",
+            test_fn: wrap_test!(kafka_test::w3_txn::consume::test_w3_read_committed_passes_aborted_tail),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "w3_txn",
+            name: "test_w3_read_committed_passes_aborted_middle",
+            test_fn: wrap_test!(kafka_test::w3_txn::consume::test_w3_read_committed_passes_aborted_middle),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "w3_txn",
+            name: "test_w3_consumers_pass_cleaned_up_aborted_rows",
+            test_fn: wrap_test!(kafka_test::w3_txn::consume::test_w3_consumers_pass_cleaned_up_aborted_rows),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "w3_txn",
+            name: "test_w3_consumers_pass_delete_records_gap",
+            test_fn: wrap_test!(kafka_test::w3_txn::consume::test_w3_consumers_pass_delete_records_gap),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "w3_txn",
+            name: "test_w3_read_committed_stops_at_open_transaction",
+            test_fn: wrap_test!(kafka_test::w3_txn::consume::test_w3_read_committed_stops_at_open_transaction),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "w3_txn",
+            name: "test_w3_list_offsets_isolation_max_timestamp_and_partitions",
+            test_fn: wrap_test!(kafka_test::w3_txn::protocol::test_w3_list_offsets_isolation_max_timestamp_and_partitions),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "w3_txn",
+            name: "test_w3_offset_fetch_require_stable",
+            test_fn: wrap_test!(kafka_test::w3_txn::protocol::test_w3_offset_fetch_require_stable),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "w3_txn",
+            name: "test_w3_idempotent_producer_follows_kafka",
+            test_fn: wrap_test!(kafka_test::w3_txn::protocol::test_w3_idempotent_producer_follows_kafka),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "w3_txn",
+            name: "test_w3_idempotent_sequence_wraps",
+            test_fn: wrap_test!(kafka_test::w3_txn::protocol::test_w3_idempotent_sequence_wraps),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "w3_txn",
+            name: "test_w3_transaction_validation",
+            test_fn: wrap_test!(kafka_test::w3_txn::protocol::test_w3_transaction_validation),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "w3_txn",
+            name: "test_w3_fetch_groups_records_into_batches",
+            test_fn: wrap_test!(kafka_test::w3_txn::protocol::test_w3_fetch_groups_records_into_batches),
+            parallel_safe: true,
+        },
+        // wave3 net: hostile clients (kafka_test/src/w3_net). Sequential: they hold
+        // shared broker resources or reconfigure + restart the listener (limits::*,
+        // setup first, teardown last).
+        TestDef {
+            category: "w3_net",
+            name: "test_w3_net_frame_budget_lockout",
+            test_fn: wrap_test!(kafka_test::w3_net::tests::test_w3_net_frame_budget_lockout),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "w3_net",
+            name: "test_w3_net_oversized_response_is_delivered",
+            test_fn: wrap_test!(
+                kafka_test::w3_net::tests::test_w3_net_oversized_response_is_delivered
+            ),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "w3_net",
+            name: "test_w3_net_tcp_nodelay",
+            test_fn: wrap_test!(kafka_test::w3_net::tests::test_w3_net_tcp_nodelay),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "w3_net",
+            name: "test_w3_net_acks0_error_closes_connection",
+            test_fn: wrap_test!(
+                kafka_test::w3_net::tests::test_w3_net_acks0_error_closes_connection
+            ),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "w3_net",
+            name: "test_w3_net_invalid_acks_rejected",
+            test_fn: wrap_test!(kafka_test::w3_net::tests::test_w3_net_invalid_acks_rejected),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "w3_net",
+            name: "test_w3_net_response_before_close",
+            test_fn: wrap_test!(kafka_test::w3_net::tests::test_w3_net_response_before_close),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "w3_net",
+            name: "test_w3_net_limits_setup",
+            test_fn: wrap_test!(kafka_test::w3_net::limits::test_w3_net_limits_setup),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "w3_net",
+            name: "test_w3_net_scram_unknown_user_indistinguishable",
+            test_fn: wrap_test!(
+                kafka_test::w3_net::limits::test_w3_net_scram_unknown_user_indistinguishable
+            ),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "w3_net",
+            name: "test_w3_net_per_ip_limit",
+            test_fn: wrap_test!(kafka_test::w3_net::limits::test_w3_net_per_ip_limit),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "w3_net",
+            name: "test_w3_net_per_listener_limit",
+            test_fn: wrap_test!(kafka_test::w3_net::limits::test_w3_net_per_listener_limit),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "w3_net",
+            name: "test_w3_net_idle_and_frame_read_timeouts",
+            test_fn: wrap_test!(
+                kafka_test::w3_net::limits::test_w3_net_idle_and_frame_read_timeouts
+            ),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "w3_net",
+            name: "test_w3_net_pre_auth_deadline_from_accept",
+            test_fn: wrap_test!(
+                kafka_test::w3_net::limits::test_w3_net_pre_auth_deadline_from_accept
+            ),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "w3_net",
+            name: "test_w3_net_sasl_lookup_rate_limit",
+            test_fn: wrap_test!(kafka_test::w3_net::limits::test_w3_net_sasl_lookup_rate_limit),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "w3_net",
+            name: "test_w3_net_limits_teardown",
+            test_fn: wrap_test!(kafka_test::w3_net::limits::test_w3_net_limits_teardown),
+            parallel_safe: false,
+        },
+        // wave3 shadow
+        TestDef {
+            category: "w3_shadow",
+            name: "test_shadow_lag_view_is_per_partition",
+            test_fn: wrap_test!(kafka_test::w3_shadow::test_shadow_lag_view_is_per_partition),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "shadow",
+            name: "test_shadow_forward_throughput",
+            test_fn: wrap_test!(kafka_test::shadow::pipelined::test_shadow_forward_throughput),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "shadow",
+            name: "test_shadow_forwards_headers_and_timestamps",
+            test_fn: wrap_test!(
+                kafka_test::shadow::pipelined::test_shadow_forwards_headers_and_timestamps
+            ),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "shadow",
+            name: "test_shadow_order_preserved_across_a_retried_failure",
+            test_fn: wrap_test!(
+                kafka_test::shadow::pipelined::test_shadow_order_preserved_across_a_retried_failure
+            ),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "shadow",
+            name: "test_shadow_sync_stall_is_bounded_to_its_own_response",
+            test_fn: wrap_test!(
+                kafka_test::shadow::pipelined::test_shadow_sync_stall_is_bounded_to_its_own_response
+            ),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "shadow",
+            name: "test_shadow_gucs_take_effect_on_reload",
+            test_fn: wrap_test!(
+                kafka_test::shadow::pipelined::test_shadow_gucs_take_effect_on_reload
+            ),
+            parallel_safe: false,
+        },
+        // end wave3 shadow
         // wave3 worker: sequential (GUCs, held locks, worker restarts, DROP/CREATE EXTENSION).
         TestDef {
             category: "w3_worker",
             name: "test_w3_partition_maintenance_lock_waits_are_bounded",
-            test_fn: wrap_test!(
-                kafka_test::w3_worker::tests::test_w3_partition_maintenance_lock_waits_are_bounded
-            ),
+            test_fn: wrap_test!(kafka_test::w3_worker::tests::test_w3_partition_maintenance_lock_waits_are_bounded),
             parallel_safe: false,
         },
         TestDef {
             category: "w3_worker",
             name: "test_w3_end_txn_during_default_leaf_move",
-            test_fn: wrap_test!(
-                kafka_test::w3_worker::tests::test_w3_end_txn_during_default_leaf_move
-            ),
+            test_fn: wrap_test!(kafka_test::w3_worker::tests::test_w3_end_txn_during_default_leaf_move),
             parallel_safe: false,
         },
         TestDef {
             category: "w3_worker",
             name: "test_w3_lock_timeout_bounds_stuck_lock",
-            test_fn: wrap_test!(
-                kafka_test::w3_worker::tests::test_w3_lock_timeout_bounds_stuck_lock
-            ),
+            test_fn: wrap_test!(kafka_test::w3_worker::tests::test_w3_lock_timeout_bounds_stuck_lock),
             parallel_safe: false,
         },
         TestDef {
@@ -2070,41 +2327,31 @@ fn get_all_tests() -> Vec<TestDef> {
         TestDef {
             category: "w3_worker",
             name: "test_w3_commit_failure_answered_without_restart",
-            test_fn: wrap_test!(
-                kafka_test::w3_worker::tests::test_w3_commit_failure_answered_without_restart
-            ),
+            test_fn: wrap_test!(kafka_test::w3_worker::tests::test_w3_commit_failure_answered_without_restart),
             parallel_safe: false,
         },
         TestDef {
             category: "w3_worker",
             name: "test_w3_heartbeats_do_not_split_batches",
-            test_fn: wrap_test!(
-                kafka_test::w3_worker::tests::test_w3_heartbeats_do_not_split_batches
-            ),
+            test_fn: wrap_test!(kafka_test::w3_worker::tests::test_w3_heartbeats_do_not_split_batches),
             parallel_safe: false,
         },
         TestDef {
             category: "w3_worker",
             name: "test_w3_transaction_end_wakes_read_committed",
-            test_fn: wrap_test!(
-                kafka_test::w3_worker::tests::test_w3_transaction_end_wakes_read_committed
-            ),
+            test_fn: wrap_test!(kafka_test::w3_worker::tests::test_w3_transaction_end_wakes_read_committed),
             parallel_safe: false,
         },
         TestDef {
             category: "w3_worker",
             name: "test_w3_old_schema_degrades_gracefully",
-            test_fn: wrap_test!(
-                kafka_test::w3_worker::tests::test_w3_old_schema_degrades_gracefully
-            ),
+            test_fn: wrap_test!(kafka_test::w3_worker::tests::test_w3_old_schema_degrades_gracefully),
             parallel_safe: false,
         },
         TestDef {
             category: "w3_worker",
             name: "test_w3_extension_ddl_loop_under_load",
-            test_fn: wrap_test!(
-                kafka_test::w3_worker::tests::test_w3_extension_ddl_loop_under_load
-            ),
+            test_fn: wrap_test!(kafka_test::w3_worker::tests::test_w3_extension_ddl_loop_under_load),
             parallel_safe: false,
         },
     ]
@@ -2230,6 +2477,9 @@ fn print_text_summary(suite_result: &SuiteResult) {
             let status = if test.passed { "PASSED" } else { "FAILED" };
             let duration = format!("({:.2}s)", test.duration_ms as f64 / 1000.0);
             println!("  {} - {} {}", test.name, status, duration);
+            if let Some(error) = &test.error {
+                println!("      error: {}", error);
+            }
         }
         println!(
             "  Category: {}/{} passed in {:.2}s\n",

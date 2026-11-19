@@ -300,6 +300,26 @@ pub static MESSAGE_PARTITION_MINUTES: GucSetting<i32> =
 // prove a late ack no longer causes a duplicate delivery. Read via the
 // RuntimeContext config snapshot (reloaded on SIGHUP). Never set in production.
 static TEST_FORWARD_ACK_DELAY_MS: GucSetting<i32> = GucSetting::<i32>::new(0);
+
+// wave3 shadow
+use crate::kafka::constants::{
+    DEFAULT_SHADOW_SYNC_TIMEOUT_MS, MAX_SHADOW_SYNC_TIMEOUT_MS, MIN_SHADOW_SYNC_TIMEOUT_MS,
+};
+static SHADOW_SYNC_TIMEOUT_MS: GucSetting<i32> =
+    GucSetting::<i32>::new(DEFAULT_SHADOW_SYNC_TIMEOUT_MS);
+
+/// The shadow outbox GUCs as the DB thread uses them (read per use: all are
+/// Sighup, so a reload takes effect at once).
+pub fn shadow_outbox_settings() -> crate::kafka::shadow::outbox::OutboxSettings {
+    crate::kafka::shadow::outbox::OutboxSettings {
+        max_retries: SHADOW_MAX_RETRIES.get() as i64,
+        retry_backoff_ms: SHADOW_RETRY_BACKOFF_MS.get() as i64,
+        batch_size: SHADOW_BATCH_SIZE.get() as i64,
+        metrics_enabled: SHADOW_METRICS_ENABLED.get(),
+        sync_timeout_ms: SHADOW_SYNC_TIMEOUT_MS.get().max(0) as u64,
+    }
+}
+// end wave3 shadow
 // RB-1: test-only fault injection for the response-after-commit barrier. When > 0,
 // the worker sleeps this many ms inside the transaction after a Produce handler
 // runs and before commit, widening the response-send→commit window so the E2E
@@ -507,18 +527,18 @@ pub fn init() {
     GucRegistry::define_string_guc(
         c"pg_kafka.shadow_sasl_mechanism",
         c"SASL mechanism for external Kafka",
-        c"SASL mechanism: PLAIN, SCRAM-SHA-256, SCRAM-SHA-512. Default: PLAIN. Requires restart.",
+        c"SASL mechanism: PLAIN, SCRAM-SHA-256, SCRAM-SHA-512. Default: PLAIN. Reloadable with pg_reload_conf() (the forwarder rebuilds its producer).",
         &SHADOW_SASL_MECHANISM,
-        GucContext::Postmaster,
+        GucContext::Sighup,
         GucFlags::default(),
     );
 
     GucRegistry::define_string_guc(
         c"pg_kafka.shadow_sasl_username",
         c"SASL username for external Kafka",
-        c"Username for SASL authentication to external Kafka. Requires restart.",
+        c"Username for SASL authentication to external Kafka. Reloadable with pg_reload_conf().",
         &SHADOW_SASL_USERNAME,
-        GucContext::Postmaster,
+        GucContext::Sighup,
         // DR-21 (DEEP-REVIEW-2026-07): same lockdown as the password (SEC-8). The
         // username identifies the external-broker principal; with default flags it
         // was visible in pg_settings/SHOW ALL to every role while the password was
@@ -529,9 +549,9 @@ pub fn init() {
     GucRegistry::define_string_guc(
         c"pg_kafka.shadow_sasl_password",
         c"SASL password for external Kafka",
-        c"Password for SASL authentication to external Kafka. Requires restart.",
+        c"Password for SASL authentication to external Kafka. Reloadable with pg_reload_conf().",
         &SHADOW_SASL_PASSWORD,
-        GucContext::Postmaster,
+        GucContext::Sighup,
         // SEC-8: lock down like the license key — only superusers may read/set it, and it is
         // excluded from SHOW ALL / pg_settings. Without these flags any DB role could read the
         // cleartext external-Kafka credential via `SHOW pg_kafka.shadow_sasl_password`.
@@ -541,62 +561,62 @@ pub fn init() {
     GucRegistry::define_string_guc(
         c"pg_kafka.shadow_ssl_ca_location",
         c"SSL CA certificate location for external Kafka",
-        c"Path to CA certificate file for SSL verification. Leave empty to use system CAs. Requires restart.",
+        c"Path to CA certificate file for SSL verification. Leave empty to use system CAs. Reloadable with pg_reload_conf().",
         &SHADOW_SSL_CA_LOCATION,
-        GucContext::Postmaster,
+        GucContext::Sighup,
         GucFlags::default(),
     );
 
     GucRegistry::define_int_guc(
         c"pg_kafka.shadow_batch_size",
         c"Messages per batch for shadow forwarding",
-        c"Number of messages to batch before sending to external Kafka. Default: 1000.",
+        c"Max records the outbox claims per poll, and librdkafka's batch.num.messages (records per produce batch). Default: 1000. Reloadable with pg_reload_conf().",
         &SHADOW_BATCH_SIZE,
         MIN_SHADOW_BATCH_SIZE,
         MAX_SHADOW_BATCH_SIZE,
-        GucContext::Suset,
+        GucContext::Sighup,
         GucFlags::default(),
     );
 
     GucRegistry::define_int_guc(
         c"pg_kafka.shadow_linger_ms",
         c"Batching delay for shadow forwarding (milliseconds)",
-        c"How long to wait for more messages before sending a batch. Default: 10ms.",
+        c"librdkafka linger.ms: how long to wait for more messages before sending a batch. Default: 10ms. Reloadable with pg_reload_conf().",
         &SHADOW_LINGER_MS,
         MIN_SHADOW_LINGER_MS,
         MAX_SHADOW_LINGER_MS,
-        GucContext::Suset,
+        GucContext::Sighup,
         GucFlags::default(),
     );
 
     GucRegistry::define_int_guc(
         c"pg_kafka.shadow_retry_backoff_ms",
         c"Retry backoff for shadow forwarding (milliseconds)",
-        c"Initial backoff between retries for failed forwards. Default: 100ms.",
+        c"librdkafka retry.backoff.ms, and the base of the outbox re-attempt backoff after a failed delivery (doubling per failure, capped at 30 s). Default: 100ms. Reloadable with pg_reload_conf().",
         &SHADOW_RETRY_BACKOFF_MS,
         MIN_SHADOW_RETRY_BACKOFF_MS,
         MAX_SHADOW_RETRY_BACKOFF_MS,
-        GucContext::Suset,
+        GucContext::Sighup,
         GucFlags::default(),
     );
 
     GucRegistry::define_int_guc(
         c"pg_kafka.shadow_max_retries",
-        c"Maximum retries per message for shadow forwarding",
-        c"Maximum number of retry attempts for failed forwards. Default: 3.",
+        c"Failed delivery attempts after which a shadow outbox row is dead-lettered",
+        c"A record whose forward failed this many times stays pending in kafka.shadow_tracking but is not retried (re-queue it with kafka.replay_shadow_messages). Raising it revives dead letters below the new cap. Default: 10. Reloadable with pg_reload_conf().",
         &SHADOW_MAX_RETRIES,
         MIN_SHADOW_MAX_RETRIES,
         MAX_SHADOW_MAX_RETRIES,
-        GucContext::Suset,
+        GucContext::Sighup,
         GucFlags::default(),
     );
 
     GucRegistry::define_bool_guc(
         c"pg_kafka.shadow_metrics_enabled",
         c"Enable shadow mode metrics",
-        c"When enabled, tracks forwarding statistics in kafka.shadow_metrics table. Default: true.",
+        c"When enabled, the worker counts forwarded, failed and sampled-out records in kafka.shadow_metrics. Default: true. Reloadable with pg_reload_conf().",
         &SHADOW_METRICS_ENABLED,
-        GucContext::Suset,
+        GucContext::Sighup,
         GucFlags::default(),
     );
 
@@ -605,7 +625,7 @@ pub fn init() {
         c"Keep external-primary topics fully read-suppressed even when a forward is dead-lettered",
         c"When true, external-primary topics never fall back to local reads (external-only-strict; a dead-lettered record is accepted as lost). When false (default), a dead-lettered external-primary topic serves the record locally so it is never readable nowhere (RV-6).",
         &SHADOW_EXTERNAL_PRIMARY_STRICT,
-        GucContext::Suset,
+        GucContext::Sighup,
         GucFlags::default(),
     );
 
@@ -636,6 +656,31 @@ pub fn init() {
     // auth stream: listener security protocols, TLS files, SASL mechanisms.
     crate::kafka::auth::settings::register_gucs();
 
+    // wave3 groups: partition / group-size / group-count caps (kafka::limits).
+    crate::kafka::limits::register_gucs();
+    // wave3 txn: Kafka's transaction.max.timeout.ms (InitProducerId bound).
+    GucRegistry::define_int_guc(
+        c"pg_kafka.transaction_max_timeout_ms",
+        c"Largest transaction timeout a transactional producer may request (milliseconds)",
+        c"InitProducerId with a transaction_timeout_ms <= 0 or above this value is refused with INVALID_TRANSACTION_TIMEOUT, as Kafka's transaction.max.timeout.ms. Default 900000 (15 minutes). Reloadable.",
+        &crate::kafka::handlers::TRANSACTION_MAX_TIMEOUT_MS,
+        1,
+        i32::MAX,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+    // wave3 shadow
+    GucRegistry::define_int_guc(
+        c"pg_kafka.shadow_sync_timeout_ms",
+        c"How long a sync-mode shadow produce response waits for the external ack (milliseconds)",
+        c"The response of a produce to a sync_mode = 'sync' topic is released when its records are delivered to the external cluster or after this long (the record stays in the outbox and is retried). Only that response waits, never the worker. 0 = do not hold sync responses. Default: 5000. Reloadable with pg_reload_conf().",
+        &SHADOW_SYNC_TIMEOUT_MS,
+        MIN_SHADOW_SYNC_TIMEOUT_MS,
+        MAX_SHADOW_SYNC_TIMEOUT_MS,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+    // end wave3 shadow
     // wave3 worker: lock_timeout of every worker transaction.
     GucRegistry::define_int_guc(
         c"pg_kafka.worker_lock_timeout_ms",
@@ -818,7 +863,7 @@ mod tests {
         );
         assert_eq!(config.shadow_max_retries, DEFAULT_SHADOW_MAX_RETRIES);
         assert_eq!(config.shadow_retry_backoff_ms, 100);
-        assert_eq!(config.shadow_max_retries, 3);
+        assert_eq!(config.shadow_max_retries, 10);
     }
 
     #[test]

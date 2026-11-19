@@ -10,7 +10,7 @@
 //! * `SASL_SSL://127.0.0.1:19095`
 //!
 //! The first auth test ([`auth_env`]) generates a throwaway CA, server and client
-//! certificates with the `openssl` CLI into `$TMPDIR/pg_kafka_auth_e2e`, points the
+//! certificates with the `openssl` CLI into `$TMPDIR/pg_kafka_auth_e2e-<pid>`, points the
 //! TLS GUCs at them with ALTER SYSTEM, reloads, and restarts the `pg_kafka_listener`
 //! worker (listener settings are read at worker start), then creates a Kafka user. The
 //! last test ([`test_auth_teardown_restores_default_listeners`]) resets the GUCs and
@@ -47,9 +47,32 @@ const LISTENERS: &str =
 
 pub type DynResult<T> = Result<T, Box<dyn std::error::Error>>;
 
-/// Where the generated certificates live.
+/// Where the generated certificates live: one directory per test process.
+///
+/// wave3 net: it used to be one fixed `$TMPDIR/pg_kafka_auth_e2e` for every process,
+/// so two suites running at once on one host (parallel CI jobs, several clusters on a
+/// dev box) regenerated each other's CA and server certificate between a server loading
+/// one and a client trusting the other: intermittent "certificate verify failed".
 pub fn cert_dir() -> PathBuf {
-    std::env::temp_dir().join("pg_kafka_auth_e2e")
+    std::env::temp_dir().join(format!("pg_kafka_auth_e2e-{}", std::process::id()))
+}
+
+/// Generate the certificates for this test process unless they exist (the auth and
+/// w3_net setups share them; each category's teardown removes them with
+/// [`remove_certificates`]).
+pub fn ensure_certificates() -> DynResult<PathBuf> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = cert_dir();
+    if dir.join("server.key").exists() && dir.join("client.pem").exists() {
+        return Ok(dir);
+    }
+    generate_certificates()
+}
+
+/// Remove this process's certificate directory.
+pub fn remove_certificates() {
+    let _ = std::fs::remove_dir_all(cert_dir());
 }
 
 pub fn cert_path(name: &str) -> String {
@@ -254,7 +277,7 @@ pub async fn restart_listener(db: &Client, open: &[u16], closed: &[u16]) -> DynR
 static ENV: tokio::sync::OnceCell<Result<(), String>> = tokio::sync::OnceCell::const_new();
 
 async fn setup() -> DynResult<()> {
-    generate_certificates()?;
+    ensure_certificates()?;
     let db = create_db_client().await?;
     configure_listeners(&db, true, false).await?;
     restart_listener(&db, &[SASL_PLAINTEXT_PORT, SSL_PORT, SASL_SSL_PORT], &[]).await?;

@@ -458,15 +458,21 @@ pub async fn test_corrupt_acks0_produce_sends_no_reply() -> TestResult {
     frame.extend_from_slice(&body);
     stream.write_all(&frame).await?;
 
-    // ...then an ordinary request: its reply must be the first frame we read.
-    send_raw(&mut stream, 18, 0, 507, &[]).await?;
-    let first = read_raw(&mut stream).await?.ok_or("connection closed")?;
-    let correlation = (&first[..]).get_i32();
-    println!("   first reply correlation id: {}", correlation);
-    assert_eq!(
-        correlation, 507,
-        "the acks=0 produce must not have been answered"
-    );
+    // ...then an ordinary request. wave3 net: as in Kafka, an acks=0 produce that fails
+    // closes the connection (so the client notices) instead of being silently dropped;
+    // it is never answered, so no frame at all may arrive before the close.
+    let _ = send_raw(&mut stream, 18, 0, 507, &[]).await; // may race the close
+    match read_raw(&mut stream).await? {
+        None => println!("   connection closed without a reply"),
+        Some(frame) => {
+            let correlation = (&frame[..]).get_i32();
+            return Err(format!(
+                "expected the connection to close, got a frame (correlation id {})",
+                correlation
+            )
+            .into());
+        }
+    }
 
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");

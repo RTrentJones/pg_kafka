@@ -15,7 +15,7 @@ mod tests {
         OffsetCommitTopicData, OffsetFetchTopicData, PartitionFetchData, PartitionProduceData,
         Record, TopicFetchData, TopicProduceData,
     };
-    use crate::kafka::storage::{CommittedOffset, FetchedMessage, TopicMetadata};
+    use crate::kafka::storage::{CommittedOffset, FetchedMessage, IsolationLevel, TopicMetadata};
     use crate::kafka::{BrokerMetadata, GroupCoordinator, HandlerContext};
     use crate::testing::mocks::MockKafkaStore;
     use kafka_protocol::records::Compression;
@@ -290,6 +290,8 @@ mod tests {
                     value: Some(b"value1".to_vec()),
                     timestamp: 1234567890,
                     headers: vec![],
+                    producer_id: None,
+                    producer_epoch: None,
                 }])
             });
 
@@ -351,6 +353,8 @@ mod tests {
                     value: Some(b"value1".to_vec()),
                     timestamp: 1234567890,
                     headers: vec![("trace-id".to_string(), b"abc123".to_vec())],
+                    producer_id: None,
+                    producer_epoch: None,
                 }])
             });
 
@@ -607,7 +611,12 @@ mod tests {
         let broker = BrokerMetadata::new("localhost".to_string(), 9092);
         let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
 
-        let response = fetch::handle_list_offsets(&ctx, topics).unwrap();
+        let response = fetch::handle_list_offsets(
+            &ctx,
+            topics,
+            crate::kafka::storage::IsolationLevel::ReadUncommitted,
+        )
+        .unwrap();
 
         let partition_response = &response.topics[0].partitions[0];
         assert_eq!(partition_response.error_code, ERROR_NONE);
@@ -642,7 +651,12 @@ mod tests {
         let broker = BrokerMetadata::new("localhost".to_string(), 9092);
         let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
 
-        let response = fetch::handle_list_offsets(&ctx, topics).unwrap();
+        let response = fetch::handle_list_offsets(
+            &ctx,
+            topics,
+            crate::kafka::storage::IsolationLevel::ReadUncommitted,
+        )
+        .unwrap();
 
         let partition_response = &response.topics[0].partitions[0];
         assert_eq!(partition_response.error_code, ERROR_NONE);
@@ -663,6 +677,7 @@ mod tests {
         });
         mock.expect_get_offset_for_timestamp()
             .returning(|_, _, _| Ok(Some((7, 1_600_000_002_000))));
+        mock.expect_get_high_watermark().returning(|_, _| Ok(10));
 
         let topics = vec![ListOffsetsTopicData {
             name: "test-topic".to_string(),
@@ -677,12 +692,106 @@ mod tests {
         let broker = BrokerMetadata::new("localhost".to_string(), 9092);
         let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
 
-        let response = fetch::handle_list_offsets(&ctx, topics).unwrap();
+        let response = fetch::handle_list_offsets(
+            &ctx,
+            topics,
+            crate::kafka::storage::IsolationLevel::ReadUncommitted,
+        )
+        .unwrap();
 
         let partition_response = &response.topics[0].partitions[0];
         assert_eq!(partition_response.error_code, ERROR_NONE);
         assert_eq!(partition_response.offset, 7);
         assert_eq!(partition_response.timestamp, 1_600_000_002_000);
+    }
+
+    /// wave3 txn: one ListOffsets partition query against a 2-partition topic with
+    /// HWM 10, LSO 4 (a transaction open at offset 4), a timestamp match at offset 6
+    /// and the max-timestamp record at offset 3.
+    fn list_one(partition: i32, timestamp: i64, isolation: IsolationLevel) -> (i16, i64, i64) {
+        let mut mock = MockKafkaStore::new();
+        mock.expect_get_topic_metadata().returning(|_| {
+            Ok(vec![TopicMetadata {
+                name: "t".to_string(),
+                id: 1,
+                partition_count: 2,
+            }])
+        });
+        mock.expect_get_high_watermark().returning(|_, _| Ok(10));
+        mock.expect_get_last_stable_offset().returning(|_, _| Ok(4));
+        mock.expect_get_earliest_offset().returning(|_, _| Ok(0));
+        mock.expect_get_offset_for_timestamp()
+            .returning(|_, _, ts| {
+                Ok(Some(if ts == crate::kafka::storage::MAX_TIMESTAMP {
+                    (3, 9_000)
+                } else {
+                    (6, 5_000)
+                }))
+            });
+        let coordinator = GroupCoordinator::new();
+        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+        let topics = vec![ListOffsetsTopicData {
+            name: "t".to_string(),
+            partitions: vec![ListOffsetsPartitionData {
+                partition_index: partition,
+                current_leader_epoch: -1,
+                timestamp,
+            }],
+        }];
+        let r = fetch::handle_list_offsets(&ctx, topics, isolation).unwrap();
+        let p = &r.topics[0].partitions[0];
+        (p.error_code, p.offset, p.timestamp)
+    }
+
+    #[test]
+    fn test_list_offsets_latest_honours_isolation_level() {
+        // Before wave 3 read_committed LATEST returned the high watermark, so a
+        // read_committed consumer saw lag it could never consume.
+        assert_eq!(
+            list_one(0, -1, IsolationLevel::ReadUncommitted),
+            (0, 10, -1)
+        );
+        assert_eq!(list_one(0, -1, IsolationLevel::ReadCommitted), (0, 4, -1));
+        assert_eq!(list_one(0, -2, IsolationLevel::ReadCommitted), (0, 0, -1));
+    }
+
+    #[test]
+    fn test_list_offsets_max_timestamp() {
+        // KIP-734: -3 is the record with the largest timestamp (was: treated as a
+        // literal timestamp, i.e. the first record).
+        assert_eq!(
+            list_one(0, -3, IsolationLevel::ReadUncommitted),
+            (0, 3, 9_000)
+        );
+    }
+
+    #[test]
+    fn test_list_offsets_timestamp_lookup_is_bounded_by_readable_end() {
+        // Kafka: a timestamp match at or past the LSO (read_committed) is offset -1.
+        assert_eq!(
+            list_one(0, 4_000, IsolationLevel::ReadUncommitted),
+            (0, 6, 5_000)
+        );
+        assert_eq!(
+            list_one(0, 4_000, IsolationLevel::ReadCommitted),
+            (0, -1, -1)
+        );
+    }
+
+    #[test]
+    fn test_list_offsets_unknown_partition() {
+        // Was: error NONE, offset 0 for a partition the topic does not have.
+        for ts in [-1, -2, -3, 1_000] {
+            assert_eq!(
+                list_one(7, ts, IsolationLevel::ReadUncommitted),
+                (ERROR_UNKNOWN_TOPIC_OR_PARTITION, -1, -1)
+            );
+        }
+        assert_eq!(
+            list_one(-1, -1, IsolationLevel::ReadUncommitted),
+            (ERROR_UNKNOWN_TOPIC_OR_PARTITION, -1, -1)
+        );
     }
 
     // ========== Metadata Handler Tests ==========
@@ -956,7 +1065,7 @@ mod tests {
         let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
 
         let response =
-            consumer::handle_offset_fetch(&ctx, "test-group".to_string(), topics).unwrap();
+            consumer::handle_offset_fetch(&ctx, "test-group".to_string(), topics, false).unwrap();
 
         let partition_response = &response.topics[0].partitions[0];
         assert_eq!(partition_response.error_code, ERROR_NONE);
@@ -989,7 +1098,7 @@ mod tests {
         let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
 
         let response =
-            consumer::handle_offset_fetch(&ctx, "test-group".to_string(), topics).unwrap();
+            consumer::handle_offset_fetch(&ctx, "test-group".to_string(), topics, false).unwrap();
 
         let partition_response = &response.topics[0].partitions[0];
         assert_eq!(partition_response.error_code, ERROR_NONE);
@@ -1027,7 +1136,8 @@ mod tests {
         let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
 
         // Request with None = fetch all
-        let response = consumer::handle_offset_fetch(&ctx, "test-group".to_string(), None).unwrap();
+        let response =
+            consumer::handle_offset_fetch(&ctx, "test-group".to_string(), None, false).unwrap();
 
         // Should have 2 topics
         assert_eq!(response.topics.len(), 2);
@@ -1184,17 +1294,18 @@ mod tests {
         // Expect sequence check to pass (returns true = insert)
         mock.expect_check_and_update_sequence()
             .times(1)
-            .returning(|_, _, _, _, _, _| Ok(true));
+            .returning(|_, _, _, _, _, _| Ok(crate::kafka::storage::SequenceCheck::Append));
 
         // Expect record insertion
         mock.expect_insert_records()
             .times(1)
             .returning(|_, _, _| Ok(0));
 
-        // RV-8: the producer sequence is recorded after the successful insert
-        mock.expect_record_producer_sequence()
+        // RV-8: the producer batch is recorded (with its offset) after the insert
+        mock.expect_record_producer_batch()
+            .withf(|b| b.base_offset == 0 && b.first_sequence == 0 && b.last_sequence == 0)
             .times(1)
-            .returning(|_, _, _, _| Ok(()));
+            .returning(|_| Ok(()));
 
         let topic_data = vec![TopicProduceData {
             name: "test-topic".to_string(),
@@ -1241,11 +1352,11 @@ mod tests {
             .returning(|_, _| Ok((1, 1)));
         mock.expect_check_and_update_sequence()
             .times(1)
-            .returning(|_, _, _, _, _, _| Ok(true));
+            .returning(|_, _, _, _, _, _| Ok(crate::kafka::storage::SequenceCheck::Append));
         mock.expect_insert_records()
             .times(1)
             .returning(|_, _, _| Err(KafkaError::database("insert boom")));
-        // Intentionally NO expect_record_producer_sequence — it must not be called.
+        // Intentionally NO expect_record_producer_batch — it must not be called.
 
         let topic_data = vec![TopicProduceData {
             name: "test-topic".to_string(),
@@ -1286,7 +1397,9 @@ mod tests {
         // Sequence check detects duplicate (returns Ok(false) - skip insert, return success)
         mock.expect_check_and_update_sequence()
             .times(1)
-            .returning(|_, _, _, _, _, _| Ok(false)); // Duplicate - skip insert
+            .returning(|_, _, _, _, _, _| {
+                Ok(crate::kafka::storage::SequenceCheck::Duplicate { base_offset: 42 })
+            }); // Duplicate - skip insert
 
         // No expect_insert_records - should be skipped for duplicates
 
@@ -1320,7 +1433,7 @@ mod tests {
         let partition_response = &response.responses[0].partition_responses[0];
         // Kafka spec: Duplicates return SUCCESS (error_code=0), not error
         assert_eq!(partition_response.error_code, ERROR_NONE);
-        assert_eq!(partition_response.base_offset, -1); // Duplicate - original offset unknown
+        assert_eq!(partition_response.base_offset, 42); // wave 3: the original offset
     }
 
     #[test]
@@ -1421,6 +1534,34 @@ mod tests {
 
     // ========== AddPartitionsToTxn Tests ==========
 
+    /// Every known topic has `partitions` partitions (id 1); names starting with
+    /// "missing" do not exist.
+    fn topics_with_partitions(mock: &mut MockKafkaStore, partitions: i32) {
+        mock.expect_get_topic_metadata().returning(move |names| {
+            Ok(names
+                .into_iter()
+                .flatten()
+                .filter(|n| !n.starts_with("missing"))
+                .map(|n| crate::kafka::storage::TopicMetadata {
+                    name: n.clone(),
+                    id: 1,
+                    partition_count: partitions,
+                })
+                .collect())
+        });
+    }
+
+    fn add_partitions_codes(
+        response: &kafka_protocol::messages::add_partitions_to_txn_response::AddPartitionsToTxnResponse,
+    ) -> Vec<i16> {
+        response
+            .results_by_topic_v3_and_below
+            .iter()
+            .flat_map(|t| t.results_by_partition.iter())
+            .map(|p| p.partition_error_code)
+            .collect()
+    }
+
     #[test]
     fn test_add_partitions_success() {
         let mut mock = MockKafkaStore::new();
@@ -1429,13 +1570,13 @@ mod tests {
         mock.expect_begin_or_continue_transaction()
             .times(1)
             .returning(|_, _, _| Ok(()));
-
-        // Topic exists with 4 partitions
-        mock.expect_get_topic_partition_count()
+        topics_with_partitions(&mut mock, 4);
+        // Wave 3: the partitions are registered for the transactional produce check.
+        mock.expect_add_txn_partitions()
+            .withf(|txn, parts| txn == "txn-1" && parts == [(1, 0), (1, 1)])
             .times(1)
-            .returning(|_| Ok(Some(4)));
+            .returning(|_, _| Ok(()));
 
-        // Create HandlerContext AFTER setting expectations
         let coordinator = GroupCoordinator::new();
         let broker = BrokerMetadata::new("localhost".to_string(), 9092);
         let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
@@ -1445,45 +1586,35 @@ mod tests {
         let response =
             transaction::handle_add_partitions_to_txn(&ctx, "txn-1", 1000, 0, topics).unwrap();
 
-        // Should have one topic result
         assert_eq!(response.results_by_topic_v3_and_below.len(), 1);
-        let topic_result = &response.results_by_topic_v3_and_below[0];
-        assert_eq!(topic_result.results_by_partition.len(), 2);
-
-        // Both partitions should succeed
-        for partition_result in &topic_result.results_by_partition {
-            assert_eq!(partition_result.partition_error_code, ERROR_NONE);
-        }
+        assert_eq!(
+            add_partitions_codes(&response),
+            vec![ERROR_NONE, ERROR_NONE]
+        );
     }
 
     #[test]
     fn test_add_partitions_invalid_partition() {
+        // Wave 3 (Kafka): one unknown partition fails the request: it gets
+        // UNKNOWN_TOPIC_OR_PARTITION, the valid ones OPERATION_NOT_ATTEMPTED, and
+        // neither the transaction state nor the registry is touched (no expectations).
         let mut mock = MockKafkaStore::new();
-
-        mock.expect_begin_or_continue_transaction()
-            .returning(|_, _, _| Ok(()));
-        // Topic has only 2 partitions
-        mock.expect_get_topic_partition_count()
-            .returning(|_| Ok(Some(2)));
+        topics_with_partitions(&mut mock, 2);
 
         let coordinator = GroupCoordinator::new();
         let broker = BrokerMetadata::new("localhost".to_string(), 9092);
         let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
 
-        // Request partition 0 (valid) and partition 5 (invalid >= 2)
         let topics = vec![("test-topic".to_string(), vec![0, 5])];
-
         let response =
             transaction::handle_add_partitions_to_txn(&ctx, "txn-1", 1000, 0, topics).unwrap();
 
         let partitions = &response.results_by_topic_v3_and_below[0].results_by_partition;
-        assert_eq!(partitions.len(), 2);
-
-        // Partition 0 should succeed
         assert_eq!(partitions[0].partition_index, 0);
-        assert_eq!(partitions[0].partition_error_code, ERROR_NONE);
-
-        // Partition 5 should fail
+        assert_eq!(
+            partitions[0].partition_error_code,
+            crate::kafka::constants::ERROR_OPERATION_NOT_ATTEMPTED
+        );
         assert_eq!(partitions[1].partition_index, 5);
         assert_eq!(
             partitions[1].partition_error_code,
@@ -1492,143 +1623,68 @@ mod tests {
     }
 
     #[test]
-    fn test_add_partitions_auto_creates_topic() {
-        // AddPartitionsToTxn auto-creates topics (matching Kafka behavior)
-        // because rdkafka calls this before the topic exists
+    fn test_add_partitions_unknown_topic_is_not_created() {
+        // Wave 3: AddPartitionsToTxn used to auto-create a missing topic. Kafka answers
+        // UNKNOWN_TOPIC_OR_PARTITION (clients create topics through Metadata); no
+        // get_or_create_topic expectation, so creating it would fail the test.
         let mut mock = MockKafkaStore::new();
-
-        mock.expect_begin_or_continue_transaction()
-            .returning(|_, _, _| Ok(()));
-        // Topic doesn't exist initially
-        mock.expect_get_topic_partition_count()
-            .returning(|_| Ok(None));
-        // Handler auto-creates the topic
-        mock.expect_get_or_create_topic()
-            .returning(|_, _| Ok((1, 1))); // topic_id=1, partition_count=1
+        topics_with_partitions(&mut mock, 1);
 
         let coordinator = GroupCoordinator::new();
         let broker = BrokerMetadata::new("localhost".to_string(), 9092);
         let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
 
-        let topics = vec![("new-topic".to_string(), vec![0])];
-
+        let topics = vec![
+            ("missing-topic".to_string(), vec![0]),
+            ("test-topic".to_string(), vec![0]),
+        ];
         let response =
             transaction::handle_add_partitions_to_txn(&ctx, "txn-1", 1000, 0, topics).unwrap();
-
-        // Should succeed because topic was auto-created
         assert_eq!(
-            response.results_by_topic_v3_and_below[0].results_by_partition[0].partition_error_code,
-            ERROR_NONE
+            add_partitions_codes(&response),
+            vec![
+                ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+                crate::kafka::constants::ERROR_OPERATION_NOT_ATTEMPTED
+            ]
         );
+    }
+
+    fn add_partitions_with_begin_error(err: fn() -> KafkaError) -> Vec<i16> {
+        let mut mock = MockKafkaStore::new();
+        topics_with_partitions(&mut mock, 1);
+        mock.expect_begin_or_continue_transaction()
+            .returning(move |_, _, _| Err(err()));
+        let coordinator = GroupCoordinator::new();
+        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+        let topics = vec![("test-topic".to_string(), vec![0])];
+        // The error is reported on every requested partition (v0-3 has no
+        // top-level error code), not returned as Err.
+        let response =
+            transaction::handle_add_partitions_to_txn(&ctx, "txn-1", 1000, 0, topics).unwrap();
+        add_partitions_codes(&response)
     }
 
     #[test]
     fn test_add_partitions_invalid_state() {
-        let mut mock = MockKafkaStore::new();
-
-        // Atomic method returns error for invalid state
-        mock.expect_begin_or_continue_transaction()
-            .returning(|_, _, _| {
-                Err(KafkaError::invalid_txn_state(
-                    "txn-1",
-                    "CompleteCommit",
-                    "AddPartitionsToTxn",
-                ))
-            });
-
-        // Create HandlerContext AFTER setting expectations
-        let coordinator = GroupCoordinator::new();
-        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
-
-        let topics = vec![("test-topic".to_string(), vec![0])];
-
-        let result = transaction::handle_add_partitions_to_txn(&ctx, "txn-1", 1000, 0, topics);
-
-        // The error is reported on every requested partition (v0-3 has no
-        // top-level error code), not returned as Err.
-        let response = result.unwrap();
-        let codes: Vec<i16> = response
-            .results_by_topic_v3_and_below
-            .iter()
-            .flat_map(|t| t.results_by_partition.iter())
-            .map(|p| p.partition_error_code)
-            .collect();
-        assert!(!codes.is_empty());
-        assert!(
-            codes.iter().all(|c| *c == ERROR_INVALID_TXN_STATE),
-            "{:?}",
-            codes
-        );
+        let codes = add_partitions_with_begin_error(|| {
+            KafkaError::invalid_txn_state("txn-1", "CompleteCommit", "AddPartitionsToTxn")
+        });
+        assert_eq!(codes, vec![ERROR_INVALID_TXN_STATE]);
     }
 
     #[test]
     fn test_add_partitions_txn_not_found() {
-        let mut mock = MockKafkaStore::new();
-
-        // Atomic method returns error for non-existent transaction
-        mock.expect_begin_or_continue_transaction()
-            .returning(|_, _, _| Err(KafkaError::transactional_id_not_found("unknown-txn")));
-
-        // Create HandlerContext AFTER setting expectations
-        let coordinator = GroupCoordinator::new();
-        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
-
-        let topics = vec![("test-topic".to_string(), vec![0])];
-
-        let result =
-            transaction::handle_add_partitions_to_txn(&ctx, "unknown-txn", 1000, 0, topics);
-
-        // The error is reported on every requested partition (v0-3 has no
-        // top-level error code), not returned as Err.
-        let response = result.unwrap();
-        let codes: Vec<i16> = response
-            .results_by_topic_v3_and_below
-            .iter()
-            .flat_map(|t| t.results_by_partition.iter())
-            .map(|p| p.partition_error_code)
-            .collect();
-        assert!(!codes.is_empty());
-        assert!(
-            codes.iter().all(|c| *c == ERROR_TRANSACTIONAL_ID_NOT_FOUND),
-            "{:?}",
-            codes
-        );
+        let codes = add_partitions_with_begin_error(|| {
+            KafkaError::transactional_id_not_found("unknown-txn")
+        });
+        assert_eq!(codes, vec![ERROR_TRANSACTIONAL_ID_NOT_FOUND]);
     }
 
     #[test]
     fn test_add_partitions_producer_fenced() {
-        let mut mock = MockKafkaStore::new();
-
-        // Atomic method returns ProducerFenced error
-        mock.expect_begin_or_continue_transaction()
-            .returning(|_, _, _| Err(KafkaError::producer_fenced(1000, 0, 1)));
-
-        // Create HandlerContext AFTER setting expectations
-        let coordinator = GroupCoordinator::new();
-        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
-
-        let topics = vec![("test-topic".to_string(), vec![0])];
-
-        let result = transaction::handle_add_partitions_to_txn(&ctx, "txn-1", 1000, 0, topics);
-
-        // The error is reported on every requested partition (v0-3 has no
-        // top-level error code), not returned as Err.
-        let response = result.unwrap();
-        let codes: Vec<i16> = response
-            .results_by_topic_v3_and_below
-            .iter()
-            .flat_map(|t| t.results_by_partition.iter())
-            .map(|p| p.partition_error_code)
-            .collect();
-        assert!(!codes.is_empty());
-        assert!(
-            codes.iter().all(|c| *c == ERROR_PRODUCER_FENCED),
-            "{:?}",
-            codes
-        );
+        let codes = add_partitions_with_begin_error(|| KafkaError::producer_fenced(1000, 0, 1));
+        assert_eq!(codes, vec![ERROR_PRODUCER_FENCED]);
     }
 
     // ========== AddOffsetsToTxn Tests ==========
@@ -2463,20 +2519,36 @@ mod bug_hunt_regressions {
         mock.expect_check_and_update_sequence()
             .with(eq(1000), eq(0), eq(1), eq(0), eq(5), eq(1))
             .times(1)
-            .returning(|_, _, _, _, _, _| Ok(true));
+            .returning(|_, _, _, _, _, _| Ok(crate::kafka::storage::SequenceCheck::Append));
         mock.expect_check_and_update_sequence()
             .with(eq(1000), eq(0), eq(1), eq(1), eq(0), eq(1))
             .times(1)
-            .returning(|_, _, _, _, _, _| Ok(true));
+            .returning(|_, _, _, _, _, _| Ok(crate::kafka::storage::SequenceCheck::Append));
         mock.expect_insert_records().returning(|_, _, _| Ok(0));
-        mock.expect_record_producer_sequence()
-            .with(eq(1000), eq(1), eq(0), eq(5))
+        mock.expect_record_producer_batch()
+            .withf(|b| {
+                (
+                    b.producer_id,
+                    b.topic_id,
+                    b.partition_id,
+                    b.first_sequence,
+                    b.last_sequence,
+                ) == (1000, 1, 0, 5, 5)
+            })
             .times(1)
-            .returning(|_, _, _, _| Ok(()));
-        mock.expect_record_producer_sequence()
-            .with(eq(1000), eq(1), eq(1), eq(0))
+            .returning(|_| Ok(()));
+        mock.expect_record_producer_batch()
+            .withf(|b| {
+                (
+                    b.producer_id,
+                    b.topic_id,
+                    b.partition_id,
+                    b.first_sequence,
+                    b.last_sequence,
+                ) == (1000, 1, 1, 0, 0)
+            })
             .times(1)
-            .returning(|_, _, _, _| Ok(()));
+            .returning(|_| Ok(()));
 
         let topic_data = vec![TopicProduceData {
             name: "t".to_string(),
@@ -2705,7 +2777,8 @@ mod bug_hunt_regressions {
     /// Bug 11: DescribeGroups on an unknown group reports success with state Dead.
     #[test]
     fn describe_unknown_group_is_dead_not_server_error() {
-        let mock = MockKafkaStore::new();
+        let mut mock = MockKafkaStore::new();
+        mock.expect_group_has_offsets().returning(|_| Ok(false));
         let coordinator = GroupCoordinator::new();
         let broker = BrokerMetadata::new("localhost".to_string(), 9092);
         let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);

@@ -182,6 +182,8 @@ pub struct SecuritySettings {
     /// by it (mutual TLS).
     pub ssl_ca_file: String,
     pub sasl_mechanisms: Vec<SaslMechanism>,
+    /// wave3 net: connection limits, idle timeout and request read deadline.
+    pub limits: crate::kafka::conn_limits::NetworkLimits,
 }
 
 /// The raw GUC values, before validation.
@@ -193,6 +195,9 @@ pub struct RawSecuritySettings {
     pub ssl_key_file: String,
     pub ssl_ca_file: String,
     pub sasl_enabled_mechanisms: String,
+    /// wave3 net: `pg_kafka.max_connections`, `pg_kafka.max_connections_per_ip`,
+    /// `pg_kafka.connections_max_idle_ms`, `pg_kafka.request_read_timeout_ms`.
+    pub limits: crate::kafka::conn_limits::NetworkLimits,
 }
 
 impl SecuritySettings {
@@ -230,6 +235,7 @@ impl SecuritySettings {
             ssl_key_file: raw.ssl_key_file.trim().to_string(),
             ssl_ca_file: raw.ssl_ca_file.trim().to_string(),
             sasl_mechanisms,
+            limits: raw.limits,
         };
         if settings.needs_tls()
             && (settings.ssl_cert_file.is_empty() || settings.ssl_key_file.is_empty())
@@ -308,6 +314,16 @@ static SSL_CA_FILE: GucSetting<Option<CString>> = GucSetting::<Option<CString>>:
 static SASL_ENABLED_MECHANISMS: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(Some(c"PLAIN,SCRAM-SHA-256,SCRAM-SHA-512"));
 
+// wave3 net: connection-limit GUCs.
+static MAX_CONNECTIONS: GucSetting<i32> =
+    GucSetting::<i32>::new(crate::kafka::conn_limits::DEFAULT_MAX_CONNECTIONS);
+static MAX_CONNECTIONS_PER_IP: GucSetting<i32> =
+    GucSetting::<i32>::new(crate::kafka::conn_limits::DEFAULT_MAX_CONNECTIONS_PER_IP);
+static CONNECTIONS_MAX_IDLE_MS: GucSetting<i32> =
+    GucSetting::<i32>::new(crate::kafka::conn_limits::DEFAULT_CONNECTIONS_MAX_IDLE_MS);
+static REQUEST_READ_TIMEOUT_MS: GucSetting<i32> =
+    GucSetting::<i32>::new(crate::kafka::conn_limits::DEFAULT_REQUEST_READ_TIMEOUT_MS);
+
 /// Register the listener-security GUCs. Called from `config::init()`.
 pub fn register_gucs() {
     let define = |name: &'static std::ffi::CStr,
@@ -359,6 +375,62 @@ pub fn register_gucs() {
         c"Comma-separated subset of PLAIN, SCRAM-SHA-256, SCRAM-SHA-512 (default: all three). Read when the worker starts.",
         &SASL_ENABLED_MECHANISMS,
     );
+
+    // wave3 net: connection limits (read when the worker starts, like the listener GUCs).
+    let define_int = |name: &'static std::ffi::CStr,
+                      short: &'static std::ffi::CStr,
+                      long: &'static std::ffi::CStr,
+                      setting: &'static GucSetting<i32>,
+                      min: i32,
+                      max: i32,
+                      flags: GucFlags| {
+        GucRegistry::define_int_guc(
+            name,
+            short,
+            long,
+            setting,
+            min,
+            max,
+            GucContext::Sighup,
+            flags,
+        );
+    };
+    define_int(
+        c"pg_kafka.max_connections",
+        c"Maximum concurrent Kafka client connections per listener",
+        c"Each listener has its own cap, so a flood on one listener cannot lock clients out of another (e.g. a loopback admin listener). Connections over the cap are closed at accept. Read when the worker starts.",
+        &MAX_CONNECTIONS,
+        1,
+        crate::kafka::conn_limits::MAX_CONNECTIONS_LIMIT,
+        GucFlags::default(),
+    );
+    define_int(
+        c"pg_kafka.max_connections_per_ip",
+        c"Maximum concurrent Kafka client connections from one IP address, across all listeners",
+        c"Kafka's max.connections.per.ip. Connections over the cap are closed at accept. Read when the worker starts.",
+        &MAX_CONNECTIONS_PER_IP,
+        1,
+        crate::kafka::conn_limits::MAX_CONNECTIONS_LIMIT,
+        GucFlags::default(),
+    );
+    define_int(
+        c"pg_kafka.connections_max_idle_ms",
+        c"Close Kafka client connections idle for this long",
+        c"Kafka's connections.max.idle.ms: a connection with no request read, no response written and nothing outstanding for this long is closed. Read when the worker starts.",
+        &CONNECTIONS_MAX_IDLE_MS,
+        100,
+        i32::MAX,
+        GucFlags::UNIT_MS,
+    );
+    define_int(
+        c"pg_kafka.request_read_timeout_ms",
+        c"Deadline for receiving one request frame, from its first byte",
+        c"A client that starts a request and does not finish sending it within this time is disconnected (slow-loris protection). Read when the worker starts.",
+        &REQUEST_READ_TIMEOUT_MS,
+        100,
+        3_600_000,
+        GucFlags::UNIT_MS,
+    );
 }
 
 fn guc_string(setting: &GucSetting<Option<CString>>) -> String {
@@ -377,6 +449,12 @@ pub fn raw_from_gucs() -> RawSecuritySettings {
         ssl_key_file: guc_string(&SSL_KEY_FILE),
         ssl_ca_file: guc_string(&SSL_CA_FILE),
         sasl_enabled_mechanisms: guc_string(&SASL_ENABLED_MECHANISMS),
+        limits: crate::kafka::conn_limits::NetworkLimits::from_raw(
+            MAX_CONNECTIONS.get(),
+            MAX_CONNECTIONS_PER_IP.get(),
+            CONNECTIONS_MAX_IDLE_MS.get(),
+            REQUEST_READ_TIMEOUT_MS.get(),
+        ),
     }
 }
 

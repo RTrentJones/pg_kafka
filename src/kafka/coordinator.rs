@@ -68,6 +68,7 @@
 //! released.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
@@ -76,12 +77,8 @@ use super::error::{KafkaError, Result};
 /// TTL for empty consumer groups before cleanup (24 hours)
 const EMPTY_GROUP_TTL_SECS: u64 = 86400;
 
-/// Maximum number of consumer groups to prevent DoS
-const MAX_CONSUMER_GROUPS: usize = 100_000;
-
-/// CG-4: maximum members in a single consumer group (DoS protection). A genuinely new member is
-/// rejected with GROUP_MAX_SIZE_REACHED once a group is full; rejoining members are always allowed.
-const MAX_MEMBERS_PER_GROUP: usize = 1000;
+// Group-count and group-size caps: `pg_kafka.max_consumer_groups` / `pg_kafka.group_max_size`
+// (crate::kafka::limits), applied through `GroupCoordinator::set_limits` (wave3 groups).
 
 /// Default rebalance timeout (5 minutes), used when a member advertises neither a
 /// positive rebalance timeout nor a positive session timeout.
@@ -333,6 +330,11 @@ pub struct ConsumerGroup {
 
     /// When the current join or sync phase started (for the rebalance timeout)
     pub rebalance_started_at: Option<Instant>,
+
+    /// The group's protocol type ("consumer", "connect", ...), set by the first member to join
+    /// and kept when the group empties, as in Kafka (wave3 groups). Every later member must use
+    /// the same one (INCONSISTENT_GROUP_PROTOCOL otherwise) while the group has members.
+    pub protocol_type: Option<String>,
 }
 
 impl ConsumerGroup {
@@ -348,7 +350,41 @@ impl ConsumerGroup {
             previous_assignments: HashMap::new(),
             last_activity: Instant::now(),
             rebalance_started_at: None,
+            protocol_type: None,
         }
+    }
+
+    /// Kafka's `supportsProtocols` rule for a JoinGroup (wave3 groups): joining an Empty group
+    /// needs a non-empty protocol type and at least one protocol; joining a group with members
+    /// needs the group's protocol type and at least one protocol every *other* member supports
+    /// (a known member's own previous list does not count, it is being replaced; Kafka counts
+    /// it, so a lone member there cannot switch to a disjoint protocol list without leaving).
+    fn supports_protocols(
+        &self,
+        member_id: Option<&str>,
+        protocol_type: &str,
+        protocols: &[(String, Vec<u8>)],
+    ) -> bool {
+        if protocols.is_empty() || protocol_type.is_empty() {
+            return false;
+        }
+        // A group with members keeps its protocol type, even for its only member's rejoin.
+        if !self.members.is_empty() && self.protocol_type.as_deref() != Some(protocol_type) {
+            return false;
+        }
+        let others: Vec<&GroupMember> = self
+            .members
+            .values()
+            .filter(|m| Some(m.member_id.as_str()) != member_id)
+            .collect();
+        if others.is_empty() {
+            return true;
+        }
+        protocols.iter().any(|(name, _)| {
+            others
+                .iter()
+                .all(|m| m.protocols.iter().any(|(n, _)| n == name))
+        })
     }
 
     /// Insert or update a member from its JoinGroup. An existing member keeps its
@@ -374,6 +410,11 @@ impl ConsumerGroup {
             group_instance_id: params.group_instance_id.clone(),
         };
         self.members.insert(member_id.to_string(), member);
+        // The group adopts the protocol type of the member that fills it; joins that do not
+        // match it are refused before this point (supports_protocols).
+        if self.members.len() == 1 {
+            self.protocol_type = Some(params.protocol_type.clone());
+        }
 
         // The first member to join a leaderless group becomes the leader; an existing
         // leader rejoining stays the leader (BUG-9).
@@ -505,29 +546,46 @@ impl ConsumerGroup {
         );
     }
 
-    /// CG-1: choose the group protocol as the most-preferred strategy supported by EVERY member
-    /// (Kafka's common-protocol rule), walking the leader's preference order. The previous code took
-    /// the leader's first advertised strategy outright, so a follower that didn't support it would be
-    /// handed a server-computed assignment for a strategy it never asked for. Falls back to the
-    /// leader's first advertised strategy only when the members share none (non-conformant clients).
+    /// Choose the group protocol by Kafka's member vote (wave3 groups): the candidates are the
+    /// protocols every member supports; each member votes for the first candidate in its own
+    /// preference order and the candidate with the most votes wins. Ties go to the candidate
+    /// the leader prefers (Kafka leaves ties to hash order; this keeps the choice
+    /// deterministic). `supports_protocols` guarantees a common protocol at every join; should
+    /// there be none anyway, the leader's first protocol is used.
     fn select_group_protocol(&self) -> Option<String> {
         let leader = self
             .leader
             .as_ref()
             .and_then(|l| self.members.get(l))
             .or_else(|| self.members.values().next())?;
-
-        for (name, _) in &leader.protocols {
-            let supported_by_all = self
-                .members
-                .values()
-                .all(|m| m.protocols.iter().any(|(n, _)| n == name));
-            if supported_by_all {
-                return Some(name.clone());
+        let candidates: Vec<&String> = leader
+            .protocols
+            .iter()
+            .map(|(name, _)| name)
+            .filter(|name| {
+                self.members
+                    .values()
+                    .all(|m| m.protocols.iter().any(|(n, _)| n == *name))
+            })
+            .collect();
+        if candidates.is_empty() {
+            return leader.protocols.first().map(|(name, _)| name.clone());
+        }
+        let mut votes: HashMap<&String, usize> = HashMap::new();
+        for m in self.members.values() {
+            if let Some((name, _)) = m.protocols.iter().find(|(n, _)| candidates.contains(&n)) {
+                *votes.entry(name).or_default() += 1;
             }
         }
-
-        leader.protocols.first().map(|(name, _)| name.clone())
+        // Highest vote count; among equals, the earliest in the leader's preference.
+        let mut best: Option<(&String, usize)> = None;
+        for name in &candidates {
+            let v = votes.get(name).copied().unwrap_or(0);
+            if best.is_none_or(|(_, bv)| v > bv) {
+                best = Some((name, v));
+            }
+        }
+        best.map(|(name, _)| name.clone())
     }
 
     /// Remove a member from the group. A member whose JoinGroup is held gets
@@ -719,6 +777,12 @@ pub struct GroupCoordinator {
     /// exists exactly while that member's `awaiting_sync` is true. Same locking rules
     /// as `pending_joins` (never both at once).
     pending_syncs: Mutex<HashMap<(String, String), SyncResponder>>,
+
+    /// `pg_kafka.max_consumer_groups`: the most groups held in memory (wave3 groups).
+    max_groups: AtomicUsize,
+
+    /// `pg_kafka.group_max_size`: the most members one group may have (wave3 groups).
+    max_group_size: AtomicUsize,
 }
 
 impl GroupCoordinator {
@@ -728,7 +792,20 @@ impl GroupCoordinator {
             groups: Arc::new(RwLock::new(HashMap::new())),
             pending_joins: Mutex::new(HashMap::new()),
             pending_syncs: Mutex::new(HashMap::new()),
+            max_groups: AtomicUsize::new(
+                crate::kafka::limits::DEFAULT_MAX_CONSUMER_GROUPS as usize,
+            ),
+            max_group_size: AtomicUsize::new(crate::kafka::limits::DEFAULT_GROUP_MAX_SIZE as usize),
         }
+    }
+
+    /// Set the group-count and group-size caps (the JoinGroup handler applies the current
+    /// `pg_kafka.max_consumer_groups` / `pg_kafka.group_max_size` before every join, so a
+    /// reload takes effect at the next JoinGroup). Values below 1 are treated as 1.
+    pub fn set_limits(&self, max_groups: usize, max_group_size: usize) {
+        self.max_groups.store(max_groups.max(1), Ordering::Relaxed);
+        self.max_group_size
+            .store(max_group_size.max(1), Ordering::Relaxed);
     }
 
     fn lock_pending(&self) -> std::sync::MutexGuard<'_, HashMap<(String, String), JoinResponder>> {
@@ -818,7 +895,13 @@ impl GroupCoordinator {
 
         // The outcome to answer now, if this JoinGroup is not held.
         let immediate: Option<JoinOutcome> = match self.groups.write() {
-            Ok(mut groups) => match Self::join_locked(&mut groups, params, &mut deliveries) {
+            Ok(mut groups) => match Self::join_locked(
+                &mut groups,
+                params,
+                self.max_groups.load(Ordering::Relaxed),
+                self.max_group_size.load(Ordering::Relaxed),
+                &mut deliveries,
+            ) {
                 Ok(JoinDisposition::Respond(outcome)) => Some(outcome),
                 Ok(JoinDisposition::Hold {
                     group_id,
@@ -860,6 +943,8 @@ impl GroupCoordinator {
     fn join_locked(
         groups: &mut HashMap<String, ConsumerGroup>,
         params: JoinGroupParams,
+        max_groups: usize,
+        max_group_size: usize,
         out: &mut Vec<Delivery>,
     ) -> Result<JoinDisposition> {
         // Clean up stale empty groups (TTL-based)
@@ -872,34 +957,78 @@ impl GroupCoordinator {
 
         let group_id = params.group_id.clone();
 
-        // Check MAX_CONSUMER_GROUPS limit (DoS protection)
-        if !groups.contains_key(&group_id) && groups.len() >= MAX_CONSUMER_GROUPS {
-            return Err(KafkaError::Internal(format!(
-                "Maximum consumer groups limit ({}) reached",
-                MAX_CONSUMER_GROUPS
-            )));
+        // As in Kafka: a JoinGroup presenting a member id is a rejoin. If the group or the
+        // member is unknown (evicted, or lost in a worker restart) it gets UNKNOWN_MEMBER_ID and
+        // the client rejoins with an empty id; it is not silently given a new identity, and no
+        // group is created for it (wave3 groups).
+        if let Some(id) = params.member_id.as_deref() {
+            if !groups
+                .get(&group_id)
+                .is_some_and(|g| g.members.contains_key(id))
+            {
+                return Err(KafkaError::unknown_member(&group_id, id));
+            }
+        }
+
+        if !groups.contains_key(&group_id) {
+            // A new group must also be a valid one (checked here so a refused join leaves no
+            // group behind).
+            if params.protocol_type.is_empty() || params.protocols.is_empty() {
+                return Err(inconsistent_protocol(&group_id));
+            }
+            // Bound the coordinator's memory (pg_kafka.max_consumer_groups): make room by
+            // forgetting the least recently active Empty group (its committed offsets stay in
+            // the database, so it remains visible as an Empty group), else refuse with the
+            // retriable COORDINATOR_NOT_AVAILABLE.
+            if groups.len() >= max_groups {
+                let victim = groups
+                    .values()
+                    .filter(|g| g.state == GroupState::Empty)
+                    .min_by_key(|g| g.last_activity)
+                    .map(|g| g.group_id.clone());
+                match victim {
+                    Some(v) if groups.len() == max_groups => {
+                        groups.remove(&v);
+                    }
+                    _ => {
+                        crate::pg_warning!(
+                            "JoinGroup for new group '{}' refused: {} groups in memory (pg_kafka.max_consumer_groups = {})",
+                            group_id,
+                            groups.len(),
+                            max_groups
+                        );
+                        return Err(KafkaError::CoordinatorNotAvailable { group_id });
+                    }
+                }
+            }
         }
 
         let group = groups
             .entry(group_id.clone())
             .or_insert_with(|| ConsumerGroup::new(group_id.clone()));
 
-        let known_id = params
-            .member_id
-            .as_ref()
-            .filter(|id| group.members.contains_key(*id))
-            .cloned();
+        let known_id = params.member_id.clone();
 
-        // CG-4: cap members per group (DoS protection). A rejoining member (already present) is
-        // always allowed; only a genuinely new member is rejected when the group is at capacity.
-        if known_id.is_none() && group.members.len() >= MAX_MEMBERS_PER_GROUP {
+        // CG-4: cap members per group (DoS protection; Kafka's group.max.size). A rejoining
+        // member (already present) is always allowed; only a new member is rejected.
+        if known_id.is_none() && group.members.len() >= max_group_size {
             return Err(KafkaError::Protocol {
                 code: crate::kafka::constants::ERROR_GROUP_MAX_SIZE_REACHED,
                 message: format!(
                     "group '{}' has reached the maximum of {} members",
-                    group_id, MAX_MEMBERS_PER_GROUP
+                    group_id, max_group_size
                 ),
             });
+        }
+
+        // Kafka's protocol check: the member's protocol type must be the group's and it must
+        // share at least one protocol with every other member (wave3 groups).
+        if !group.supports_protocols(
+            known_id.as_deref(),
+            &params.protocol_type,
+            &params.protocols,
+        ) {
+            return Err(inconsistent_protocol(&group_id));
         }
 
         let unchanged = known_id
@@ -1165,6 +1294,57 @@ impl GroupCoordinator {
             });
         }
 
+        Ok(())
+    }
+
+    /// Validate a (non-transactional) OffsetCommit as Kafka 3.7 does (wave3 groups):
+    /// - generation < 0 for an unknown or Empty group: a simple consumer (or an admin tool such
+    ///   as `kafka-consumer-groups --reset-offsets`) committing outside group management; accepted
+    ///   whatever the member id;
+    /// - generation >= 0 for a group the coordinator does not know: ILLEGAL_GENERATION (Kafka's
+    ///   answer; the consumer rejoins);
+    /// - otherwise the member must be in the group (UNKNOWN_MEMBER_ID, which also covers
+    ///   generation -1 / empty member id against a group that has members) and the generation
+    ///   must be the current one (ILLEGAL_GENERATION); CompletingRebalance gets
+    ///   REBALANCE_IN_PROGRESS, and PreparingRebalance accepts the commit of a member that has not
+    ///   rejoined yet (see [`Self::validate_commit`]).
+    ///
+    /// [`Self::validate_commit`] keeps the older rules for TxnOffsetCommit, where Kafka exempts
+    /// transactional commits from the Empty-group requirement.
+    pub fn validate_offset_commit(
+        &self,
+        group_id: &str,
+        member_id: &str,
+        generation_id: i32,
+    ) -> Result<()> {
+        let groups = self.groups.read().map_err(|e| {
+            KafkaError::Internal(format!("Failed to acquire groups read lock: {}", e))
+        })?;
+        let Some(group) = groups.get(group_id) else {
+            return if generation_id < 0 {
+                Ok(())
+            } else {
+                Err(KafkaError::illegal_generation(group_id, generation_id, -1))
+            };
+        };
+        if generation_id < 0 && group.state == GroupState::Empty {
+            return Ok(());
+        }
+        if !group.members.contains_key(member_id) {
+            return Err(KafkaError::unknown_member(group_id, member_id));
+        }
+        if group.generation_id != generation_id {
+            return Err(KafkaError::illegal_generation(
+                group_id,
+                generation_id,
+                group.generation_id,
+            ));
+        }
+        if group.state == GroupState::CompletingRebalance {
+            return Err(KafkaError::RebalanceInProgress {
+                group_id: group_id.to_string(),
+            });
+        }
         Ok(())
     }
 
@@ -1513,6 +1693,18 @@ impl GroupCoordinator {
 impl Default for GroupCoordinator {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// INCONSISTENT_GROUP_PROTOCOL for a JoinGroup whose protocol type or protocols do not fit the
+/// group (wave3 groups).
+fn inconsistent_protocol(group_id: &str) -> KafkaError {
+    KafkaError::Protocol {
+        code: crate::kafka::constants::ERROR_INCONSISTENT_GROUP_PROTOCOL,
+        message: format!(
+            "the member's protocol type or protocols are incompatible with group '{}'",
+            group_id
+        ),
     }
 }
 
@@ -2151,12 +2343,194 @@ mod tests {
         assert_eq!(state(&c, "g"), GroupState::CompletingRebalance);
     }
 
+    // ----- wave3 groups: Kafka 3.7 join / commit rules and limits -----
+
     #[test]
-    fn test_unknown_member_id_joins_as_new_member() {
+    fn test_unknown_member_id_gets_unknown_member_id() {
+        // Kafka: a JoinGroup with a non-empty member id the group does not know is answered
+        // UNKNOWN_MEMBER_ID (the client then rejoins with an empty id); it used to be given a
+        // fresh id silently. No group is created for it either.
         let c = GroupCoordinator::new();
-        let r = joined(&join(&c, "g", Some("evicted-long-ago")));
-        assert_ne!(r.member_id, "evicted-long-ago");
-        assert!(r.member_id.starts_with("client-"));
+        assert_eq!(
+            join_error_code(&join(&c, "g", Some("evicted-long-ago"))),
+            crate::kafka::constants::ERROR_UNKNOWN_MEMBER_ID
+        );
+        assert!(c.get_group_state("g").is_none());
+        stable_single(&c, "g");
+        assert_eq!(
+            join_error_code(&join(&c, "g", Some("evicted-long-ago"))),
+            crate::kafka::constants::ERROR_UNKNOWN_MEMBER_ID
+        );
+        assert_eq!(state(&c, "g"), GroupState::Stable, "group unaffected");
+    }
+
+    #[test]
+    fn test_inconsistent_group_protocol() {
+        use crate::kafka::constants::ERROR_INCONSISTENT_GROUP_PROTOCOL as E;
+        let c = GroupCoordinator::new();
+        // Empty protocol list or empty protocol type on a new group: refused, no group left.
+        assert_eq!(join_error_code(&join_with(&c, params("n", None, &[]))), E);
+        let mut p = params("n", None, &[("range", b"")]);
+        p.protocol_type = String::new();
+        assert_eq!(join_error_code(&join_with(&c, p)), E);
+        assert!(c.get_group_state("n").is_none());
+
+        let leader = stable_single(&c, "g");
+        // Different protocol type, same protocol.
+        let mut p = params("g", None, &[("range", b"sub")]);
+        p.protocol_type = "connect".to_string();
+        assert_eq!(join_error_code(&join_with(&c, p)), E);
+        // Same type, no protocol in common.
+        assert_eq!(
+            join_error_code(&join_with(&c, params("g", None, &[("roundrobin", b"")]))),
+            E
+        );
+        // Empty protocol list on an existing group.
+        assert_eq!(join_error_code(&join_with(&c, params("g", None, &[]))), E);
+        // None of these disturbed the group.
+        assert_eq!(state(&c, "g"), GroupState::Stable);
+        assert_eq!(c.get_group_state("g").unwrap().members.len(), 1);
+        // The only member keeps the group's protocol type...
+        let mut p = params("g", Some(&leader), &[("range", b"sub")]);
+        p.protocol_type = "connect".to_string();
+        assert_eq!(join_error_code(&join_with(&c, p)), E);
+        // ...but may switch protocols: there is no one else to agree with.
+        let r = joined(&join_with(
+            &c,
+            params("g", Some(&leader), &[("roundrobin", b"x")]),
+        ));
+        assert_eq!(r.protocol_name.as_deref(), Some("roundrobin"));
+    }
+
+    #[test]
+    fn test_protocol_type_is_kept_when_group_empties() {
+        let c = GroupCoordinator::new();
+        let m = stable_single(&c, "g");
+        c.leave_group("g".to_string(), m).unwrap();
+        let g = c.get_group_state("g").unwrap();
+        assert_eq!(g.state, GroupState::Empty);
+        assert_eq!(g.protocol_type.as_deref(), Some("consumer"));
+        // An Empty group accepts any protocol type again (Kafka's rule).
+        let mut p = params("g", None, &[("x", b"")]);
+        p.protocol_type = "connect".to_string();
+        joined(&join_with(&c, p));
+        assert_eq!(
+            c.get_group_state("g").unwrap().protocol_type.as_deref(),
+            Some("connect")
+        );
+    }
+
+    #[test]
+    fn test_group_protocol_is_chosen_by_member_vote() {
+        // Kafka: candidates = protocols every member supports; each member votes for its
+        // first candidate. Leader prefers range, both followers prefer roundrobin.
+        let c = GroupCoordinator::new();
+        let both_rr: &[(&str, &[u8])] = &[("roundrobin", b""), ("range", b"")];
+        let leader = joined(&join_with(
+            &c,
+            params("g", None, &[("range", b""), ("roundrobin", b"")]),
+        ));
+        assert_eq!(leader.protocol_name.as_deref(), Some("range"));
+        let f1 = join_with(&c, params("g", None, both_rr));
+        let f2 = join_with(&c, params("g", None, both_rr));
+        let l = joined(&join_with(
+            &c,
+            params(
+                "g",
+                Some(&leader.member_id),
+                &[("range", b""), ("roundrobin", b"")],
+            ),
+        ));
+        assert_eq!(l.protocol_name.as_deref(), Some("roundrobin"));
+        assert_eq!(joined(&f1).protocol_name.as_deref(), Some("roundrobin"));
+        assert_eq!(joined(&f2).protocol_name.as_deref(), Some("roundrobin"));
+    }
+
+    #[test]
+    fn test_vote_tie_goes_to_leader_preference() {
+        let mut g = ConsumerGroup::new("g".to_string());
+        g.upsert_member("a", &params("g", None, &[("range", b""), ("rr", b"")]));
+        g.upsert_member("b", &params("g", None, &[("rr", b""), ("range", b"")]));
+        assert_eq!(g.leader.as_deref(), Some("a"));
+        assert_eq!(g.select_group_protocol().as_deref(), Some("range"));
+    }
+
+    #[test]
+    fn test_group_max_size_is_configurable() {
+        let c = GroupCoordinator::new();
+        c.set_limits(100, 2);
+        let a = joined(&join(&c, "g", None));
+        let _b = join(&c, "g", None);
+        assert_eq!(
+            join_error_code(&join(&c, "g", None)),
+            crate::kafka::constants::ERROR_GROUP_MAX_SIZE_REACHED
+        );
+        // A member already in the group may always rejoin.
+        let _ = join(&c, "g", Some(&a.member_id));
+        assert_eq!(c.get_group_state("g").unwrap().members.len(), 2);
+    }
+
+    #[test]
+    fn test_max_groups_evicts_oldest_empty_group_then_refuses() {
+        let c = GroupCoordinator::new();
+        c.set_limits(2, 10);
+        let a = stable_single(&c, "a");
+        c.leave_group("a".to_string(), a).unwrap(); // "a" is Empty now
+        stable_single(&c, "b");
+        // Full (2): the Empty "a" is forgotten to make room for "c".
+        joined(&join(&c, "c", None));
+        assert!(c.get_group_state("a").is_none());
+        assert!(c.get_group_state("c").is_some());
+        // Full of non-empty groups: a new group is refused (retriable), existing ones work.
+        assert_eq!(
+            join_error_code(&join(&c, "d", None)),
+            crate::kafka::constants::ERROR_COORDINATOR_NOT_AVAILABLE
+        );
+        assert!(c.get_group_state("d").is_none());
+        assert_eq!(c.groups.read().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_validate_offset_commit_matches_kafka() {
+        use crate::kafka::constants::{
+            ERROR_ILLEGAL_GENERATION as IG, ERROR_REBALANCE_IN_PROGRESS as RIP,
+            ERROR_UNKNOWN_MEMBER_ID as UM,
+        };
+        let c = GroupCoordinator::new();
+        let code = |g: &str, m: &str, gen: i32| {
+            c.validate_offset_commit(g, m, gen)
+                .err()
+                .map(|e| e.to_kafka_error_code())
+                .unwrap_or(0)
+        };
+        // Unknown group: generation -1 is a simple consumer (any member id); >= 0 is stale.
+        assert_eq!(code("nope", "", -1), 0);
+        assert_eq!(code("nope", "x", -1), 0);
+        assert_eq!(code("nope", "x", 5), IG);
+
+        let m = stable_single(&c, "g");
+        // Group with members: generation -1 / "" is not allowed, members only.
+        assert_eq!(code("g", "", -1), UM);
+        assert_eq!(code("g", "x", -1), UM);
+        assert_eq!(code("g", "x", 1), UM);
+        assert_eq!(code("g", &m, -1), IG);
+        assert_eq!(code("g", &m, 7), IG);
+        assert_eq!(code("g", &m, 1), 0);
+
+        // CompletingRebalance: REBALANCE_IN_PROGRESS for the current generation.
+        let follower = join(&c, "g", None);
+        let _ = joined(&join(&c, "g", Some(&m)));
+        let f = joined(&follower);
+        assert_eq!(state(&c, "g"), GroupState::CompletingRebalance);
+        assert_eq!(code("g", &f.member_id, f.generation_id), RIP);
+
+        // Empty group: anything at generation -1 goes; a generation needs membership.
+        let e = stable_single(&c, "e");
+        c.leave_group("e".to_string(), e.clone()).unwrap();
+        assert_eq!(code("e", "", -1), 0);
+        assert_eq!(code("e", &e, -1), 0);
+        assert_eq!(code("e", "x", 5), UM);
+        assert_eq!(code("e", "", 1), UM);
     }
 
     #[test]
@@ -2490,12 +2864,12 @@ mod tests {
 
     #[test]
     fn test_join_group_enforces_member_cap() {
-        // CG-4: a group is capped at MAX_MEMBERS_PER_GROUP new members.
+        // CG-4: a group is capped at pg_kafka.group_max_size (default) new members.
         let c = GroupCoordinator::new();
         {
             let mut groups = c.groups.write().unwrap();
             let mut g = ConsumerGroup::new("g".to_string());
-            for i in 0..MAX_MEMBERS_PER_GROUP {
+            for i in 0..crate::kafka::limits::DEFAULT_GROUP_MAX_SIZE {
                 g.upsert_member(&format!("m{}", i), &params("g", None, &[("range", b"")]));
             }
             g.state = GroupState::Stable;

@@ -31,7 +31,11 @@ This document lists intentional deviations from the official Kafka protocol spec
 - No response is sent for acks=0 (sending one would desync clients that
   enforce strict per-connection request/response pairing, e.g. the Java client)
 - Data is still written to PostgreSQL (best-effort)
-- Errors are logged but not returned to client (per acks=0 contract)
+- Errors are not returned to the client (per acks=0 contract); as in Kafka, any error
+  (a partition error, a corrupt batch, a failed commit) **closes the connection** after the
+  partitions that succeeded are committed, so the client refreshes its metadata (wave 3)
+- `acks` other than -1, 0 and 1 is answered `INVALID_REQUIRED_ACKS` (21) on every
+  partition and nothing is written, as in Kafka
 - Long-polling consumers are notified if write succeeds
 - Idempotency/transactional validation is intentionally skipped for acks=0
 
@@ -73,11 +77,26 @@ pg_kafka.compression_type = 'gzip'
 
 **Implementation:**
 - ✅ InitProducerId API allocates producer IDs with epoch
-- ✅ Sequence number tracking per topic-partition
-- ✅ Duplicate detection: a retried batch whose sequence range was already written is acknowledged with error code 0 and not re-inserted (this matches Kafka; the DUPLICATE_SEQUENCE_NUMBER code is defined but not returned). Unlike Kafka, the ack carries `base_offset = 0` rather than the original batch's offset
-- ✅ Out-of-order detection (OUT_OF_ORDER_SEQUENCE_NUMBER error)
-- ✅ Producer fencing via epoch (PRODUCER_FENCED error)
+- ✅ Sequence number tracking per topic-partition, Kafka's model (wave 3): the last 5
+  batches of every producer on every partition are remembered (`kafka.producer_batches`:
+  first/last sequence and base offset, durable, so it survives worker restarts)
+- ✅ Duplicate detection: a retry of one of those 5 batches (same epoch, same sequence
+  range) is acknowledged with error code 0, **its original base offset**, and nothing is
+  re-inserted, as in Kafka (DUPLICATE_SEQUENCE_NUMBER is defined but, as in Kafka, never
+  returned)
+- ✅ Anything else out of sequence (a gap, an overlap, a range at or below the last
+  sequence that was never written, a retry older than the 5 cached batches) is
+  OUT_OF_ORDER_SEQUENCE_NUMBER (45); sequences wrap from 2147483647 to 0
+- ✅ Epochs: a Produce with an epoch older than the producer's current one gets
+  INVALID_PRODUCER_EPOCH (47), what Kafka 3.7 answers on Produce for idempotent and
+  transactional producers alike; a higher epoch (an idempotent producer bumping its own
+  epoch, KIP-360, as the Java client does) is accepted when it starts at sequence 0 and
+  becomes the producer's epoch
 - ✅ PostgreSQL advisory locks for sequence serialization
+- **Deviation:** a producer with no state on a partition must start at sequence 0 there
+  (OUT_OF_ORDER_SEQUENCE_NUMBER otherwise). Kafka accepts any first sequence from an
+  unknown producer (its producer state can expire with the log); pg_kafka keeps producer
+  state for 7 idle days and refuses a first batch whose predecessors never arrived.
 - Produce responses report `log_start_offset = -1` and `log_append_time_ms = -1`
 
 **Client Impact:**
@@ -92,7 +111,14 @@ pg_kafka.compression_type = 'gzip'
 **pg_kafka Behavior:** Full transaction coordinator with EOS
 
 **Implementation:**
-- ✅ AddPartitionsToTxn registers partitions in transaction
+- ✅ AddPartitionsToTxn registers partitions in the transaction (`kafka.txn_partitions`);
+  a transactional Produce to a partition the open transaction did not add is refused with
+  INVALID_TXN_STATE (48), as Kafka 3.6+ does. AddPartitionsToTxn does not create topics: an
+  unknown topic or partition is UNKNOWN_TOPIC_OR_PARTITION and the request's other
+  partitions get OPERATION_NOT_ATTEMPTED (55), nothing is added
+- ✅ InitProducerId refuses a transaction timeout <= 0 or above
+  `pg_kafka.transaction_max_timeout_ms` (Kafka's `transaction.max.timeout.ms`, default
+  900000) with INVALID_TRANSACTION_TIMEOUT (50)
 - ✅ AddOffsetsToTxn includes consumer offsets in transaction
 - ✅ EndTxn commits or aborts atomically
 - ✅ TxnOffsetCommit commits offsets within transaction context
@@ -163,6 +189,33 @@ pg_kafka.compression_type = 'gzip'
   of an empty group completes its join at once, and members joining right after it
   start a second rebalance.
 
+- ✅ Kafka 3.7's JoinGroup checks: a member whose protocol type differs from the group's, that
+  shares no protocol with every other member, or that sends an empty protocol list (or an
+  empty protocol type for a new group) gets INCONSISTENT_GROUP_PROTOCOL and the group is
+  untouched; a JoinGroup with a non-empty member id the group does not know (evicted, or lost in
+  a worker restart) gets UNKNOWN_MEMBER_ID and the client rejoins with an empty id. The group
+  protocol is chosen by Kafka's member vote (each member votes for its most preferred protocol
+  that all members support; ties go to the leader's preference, where Kafka's order is
+  unspecified). JoinGroup error responses before v7 carry protocol_name "" (non-nullable there).
+- ✅ OffsetCommit follows Kafka 3.7: generation -1 (simple consumers, `kafka-consumer-groups
+  --reset-offsets`) is accepted only for an unknown or Empty group (any member id); a group with
+  members answers UNKNOWN_MEMBER_ID to a non-member and ILLEGAL_GENERATION to a wrong
+  generation (also -1 from a member); a generation >= 0 for a group the coordinator does not
+  know gets ILLEGAL_GENERATION. (TxnOffsetCommit keeps its own rules.)
+- ✅ Groups known only by their committed offsets (none of their members joined since the
+  worker started, e.g. after a restart, or the group was reclaimed from memory) are reported by
+  ListGroups and DescribeGroups as Empty groups with protocol type "consumer", so
+  `kafka-consumer-groups --list/--describe` shows them with offsets and lag. (Kafka keeps the
+  group's actual protocol type; an offsets-only group here is always "consumer", which also
+  covers groups that only ever committed as simple consumers, for which Kafka reports "".)
+- Resource bounds (deviation: Kafka's `group.max.size` defaults to unlimited and it has no
+  group-count cap): `pg_kafka.group_max_size` (default 1000) members per group, beyond which a
+  new member gets GROUP_MAX_SIZE_REACHED; `pg_kafka.max_consumer_groups` (default 100000) groups
+  in memory, beyond which the least recently active Empty group is forgotten (its offsets stay)
+  or, if none is Empty, a JoinGroup for a new group gets COORDINATOR_NOT_AVAILABLE; a member's
+  protocol list is limited to 64 protocols and 1 MiB (Kafka bounds it by the 1 MiB
+  `__consumer_offsets` record), beyond which JoinGroup gets INVALID_REQUEST.
+
 **Client Impact:**
 - Full consumer group functionality works with standard Kafka clients
 - Both manual partition assignment and automatic subscription supported
@@ -176,6 +229,9 @@ pg_kafka.compression_type = 'gzip'
 **Implementation:**
 - ✅ OffsetCommit API stores offsets in PostgreSQL
 - ✅ OffsetFetch API retrieves committed offsets
+- ✅ `require_stable` (OffsetFetch v7, KIP-447): a partition with a TxnOffsetCommit whose
+  transaction is still open is answered UNSTABLE_OFFSET_COMMIT (88) with offset -1, at
+  partition level as Kafka 3.7 does, so a read_committed consumer waits for it
 - ✅ Consumer groups can track progress across restarts
 - ✅ Supports offset metadata field
 
@@ -217,24 +273,37 @@ pg_kafka.compression_type = 'gzip'
 - Works with standard Kafka clients
 - Low latency with long polling enabled (default: on)
 
-**Deviation: server-side read_committed filtering (DR-11, DEEP-REVIEW-2026-07)**
+**Deviation: server-side read_committed filtering (DR-11, DEEP-REVIEW-2026-07; wave 3)**
 
 Real Kafka returns *all* records (including aborted ones) to a `read_committed`
 consumer along with control batches and an `aborted_transactions` list, and the
 client filters aborted ranges itself (the wire contract for Fetch ≥ v4).
 pg_kafka instead filters **server-side**: pending/aborted rows are excluded by
 the fetch query, results are clamped to the Last Stable Offset (RV-4), and the
-response carries an **empty** `aborted_transactions` list with **no control
-batches**. Fetched batches are also re-encoded rather than replayed verbatim,
-so they carry `producer_id = -1`, `producer_epoch = -1`, batch boundaries that
-may differ from the original produce, and `partition_leader_epoch = 0`.
+response carries no `aborted_transactions` list. pg_kafka writes no transaction
+markers, so aborted offsets (and rows the aborted-row cleanup deleted) are holes in
+the log:
 
-- Works with rdkafka/librdkafka, kafka-python, KafkaJS, and Sarama (all tolerate
-  an empty aborted list because the aborted data simply never appears).
-- A client that *relies* on doing its own abort filtering (rather than trusting
-  the served rows) sees no aborted ranges and no control markers — the data it
-  receives is already clean, so correctness holds, but byte-level batch
-  equivalence with a real broker does not.
+- Records between holes carry their own offsets, so consumers skip holes in the
+  middle of a response.
+- When nothing is visible from the fetch offset up to the readable end (the LSO for
+  `read_committed`, the high watermark for `read_uncommitted`), the response holds one
+  **control batch** covering the hole, with a single COMMIT marker at its last offset,
+  like the marker Kafka writes when a transaction ends. Clients skip control records
+  and move their position past it (the Java client to the batch's last offset + 1,
+  librdkafka to the marker's offset + 1), so their position and committed offset reach
+  the end and the lag goes to 0. Before wave 3 such a fetch was empty and the consumer
+  re-fetched the same offset forever. An open transaction still blocks at the LSO.
+- Fetched records are re-encoded, grouped into one RecordBatch per run of consecutive
+  offsets written by the same producer id/epoch (wave 3; before, every record was its own
+  batch, ~60 bytes of overhead each). Batches of transactional rows carry their producer
+  id/epoch and the transactional flag; other batches `producer_id = -1`. The base
+  sequence is sent as -1, `partition_leader_epoch` is 0, and batch boundaries may differ
+  from the original produce.
+- The data a client receives is already clean, so read_committed correctness holds for
+  clients that do their own abort filtering too (verified with the Java consumer and
+  librdkafka); what differs from Kafka is the byte-level batch layout and that
+  `read_uncommitted` consumers no longer see aborted records once the cleanup deleted them.
 - Header order is preserved (headers are stored as an ordered array of pairs), but
   duplicate header keys collapse to the last value: the kafka-protocol record type
   holds headers in a map on both decode and encode. Kafka's wire format permits
@@ -248,12 +317,19 @@ honored; producer CreateTime timestamps are preserved — BUG-7).
 
 **Status:** Fully implemented
 **Kafka Behavior:** Returns offsets by timestamp or special values
-**pg_kafka Behavior:** Supports earliest (-2), latest (-1), and timestamp lookup
+**pg_kafka Behavior:** Supports earliest (-2), latest (-1), max timestamp (-3) and timestamp lookup
 
 **Implementation:**
-- ✅ Returns earliest offset (first message in partition)
-- ✅ Returns latest offset (high watermark)
+- ✅ Returns earliest offset (first message in partition; -4 EARLIEST_LOCAL is the same)
+- ✅ Returns latest offset: the high watermark, or the last stable offset for a
+  `read_committed` request (wave 3)
+- ✅ MAX_TIMESTAMP (-3, KIP-734): the offset and timestamp of the record with the largest
+  timestamp (the lowest offset among equal ones; wave 3). Kafka 3.7.0 itself answers the
+  last offset of that record's batch (KAFKA-16310, fixed in later releases)
 - ✅ Timestamp-based lookup — returns the earliest offset whose record timestamp is ≥ the requested time (record timestamps are persisted; AUDIT-2026-06 BUG-7 + CONF-7)
+- ✅ Timestamp lookups are bounded like Kafka's: a match at or past the high watermark
+  (`read_committed`: the LSO) is offset -1; aborted records are never a match
+- ✅ A partition the topic does not have is UNKNOWN_TOPIC_OR_PARTITION (was: offset 0)
 
 ## Metadata API Deviations
 
@@ -283,7 +359,7 @@ honored; producer CreateTime timestamps are preserved — BUG-7).
 **pg_kafka Behavior:** Same, with configurable default partition count
 
 **Implementation:**
-- ✅ Topics can have any number of partitions (set via CreateTopics or `pg_kafka.default_partitions` GUC)
+- ✅ Topics have 1 to `pg_kafka.max_partitions_per_topic` partitions (default 10000, at most 100000; set via CreateTopics/CreatePartitions or, for auto-created topics, `pg_kafka.default_partitions` capped at the maximum). A larger count is refused with INVALID_PARTITIONS and `kafka.topics` carries a `CHECK (partitions BETWEEN 1 AND 100000)`; a stored count outside that range (only possible by bypassing the constraint) is reported by Metadata as UNKNOWN_SERVER_ERROR for that topic and ignored by the server-side assignors instead of being allocated (an unbounded count used to abort the worker and send Postgres into crash recovery). Kafka itself has no per-topic cap.
 - ✅ Key-based partition routing using murmur2 hash (Kafka-compatible)
 - ✅ Explicit partition assignment in ProduceRequest supported
 - ✅ Metadata reports correct partition count
@@ -314,9 +390,10 @@ honored; producer CreateTime timestamps are preserved — BUG-7).
 
 **Status:** Minor deviations by design
 
-- **CreateTopics ignores topic configs.** Per-topic `configs` (e.g. `retention.ms`), manual replica assignments, and `replication_factor` in the request are accepted but not applied; the response always reports replication factor 1. Set `retention.ms` afterwards with IncrementalAlterConfigs.
-- **CreateTopics default partition count.** `num_partitions = -1` ("broker default", what most admin clients send) creates a topic with `pg_kafka.default_partitions` partitions, the same default auto-created topics get. Any other value below 1, such as `0`, is rejected with INVALID_PARTITIONS.
-- **DeleteGroups on an unknown group** succeeds (error code 0, any orphaned committed offsets are deleted) instead of returning GROUP_ID_NOT_FOUND.
+- **CreateTopics ignores topic configs.** Per-topic `configs` (e.g. `retention.ms`) and manual replica assignments are accepted but not applied. Set `retention.ms` afterwards with IncrementalAlterConfigs.
+- **CreateTopics validation follows Kafka 3.7** (checked against a real 3.7 broker): a name repeated in one request gets a single INVALID_REQUEST "Duplicate topic name." result and is not created; a name that collides with an existing topic once `.` and `_` are treated as equal (`a.b` vs `a_b`) gets INVALID_TOPIC_EXCEPTION "Topic 'a_b' collides with existing topic: a.b"; `replication_factor` must be 1 or -1 (the default): 0 or below -1 gets INVALID_REPLICATION_FACTOR "Replication factor must be larger than 0, or -1 to use the default value.", above 1 gets INVALID_REPLICATION_FACTOR (single broker), and the response reports 1. Remaining differences: two colliding names created in the *same* request are refused here (Kafka 3.7 creates both, checking collisions only against existing topics), and topics auto-created by Metadata/Produce are not collision-checked (that would cost a query per produce).
+- **CreateTopics default partition count.** `num_partitions = -1` ("broker default", what most admin clients send) creates a topic with `pg_kafka.default_partitions` partitions (capped at `pg_kafka.max_partitions_per_topic`), the same default auto-created topics get. Any other value below 1, such as `0`, is rejected with INVALID_PARTITIONS, as is any count above `pg_kafka.max_partitions_per_topic` (CreateTopics and CreatePartitions; Kafka has no such cap).
+- **DeleteGroups** deletes an Empty group's committed offsets (also a group known only by its offsets, see §5) and answers GROUP_ID_NOT_FOUND for a group that has neither members nor offsets, as Kafka does.
 - **CreatePartitions** does not itself trigger a rebalance; consumers pick up the new partitions on their next metadata refresh.
 - **DescribeConfigs** supports only TOPIC resources and reports only `retention.ms` and `cleanup.policy` (always `delete`; there is no log compaction). BROKER and other resource types return INVALID_REQUEST. Versions v1-v4 only (the kafka-protocol crate does not implement v0).
 - **IncrementalAlterConfigs** accepts only SET/DELETE of `retention.ms` on TOPIC resources. Any other key or operation (APPEND/SUBTRACT) fails the whole resource with INVALID_CONFIG rather than being silently accepted.
@@ -324,42 +401,42 @@ honored; producer CreateTime timestamps are preserved — BUG-7).
 
 ## API Version Support
 
-### Supported APIs (28 total)
+### Supported APIs (<!--gen:api-count-->28<!--/gen--> total)
 
 These ranges are both advertised in ApiVersions and enforced on inbound requests (each API's `MIN_VERSION`/`MAX_VERSION` in `src/kafka/api/`); a request above its range gets UNSUPPORTED_VERSION in the requested version (see "Error responses" above).
 
 | API Key | Name | Versions | Status |
 |---------|------|----------|--------|
-| 0 | Produce | 3-9 | ✅ Full support (with key-based routing) |
-| 1 | Fetch | 4-11 | ✅ Full support (v12+ not advertised; v13+ uses topic IDs) |
-| 2 | ListOffsets | 1-7 | ✅ Implemented (incl. timestamp lookup) |
-| 3 | Metadata | 0-10 | ✅ Full support (v10 `topic_id` is the zero UUID) |
-| 8 | OffsetCommit | 2-8 | ✅ Full support |
-| 9 | OffsetFetch | 1-7 | ✅ Full support |
-| 10 | FindCoordinator | 0-3 | ✅ Full support |
-| 11 | JoinGroup | 0-7 | ✅ Full support |
-| 12 | Heartbeat | 0-4 | ✅ Full support |
-| 13 | LeaveGroup | 0-4 | ✅ Full support |
-| 14 | SyncGroup | 0-4 | ✅ Full support |
-| 15 | DescribeGroups | 0-5 | ✅ Full support |
-| 16 | ListGroups | 0-4 | ✅ Full support |
-| 17 | SaslHandshake | 0-1 | ✅ Network thread; v0 is advertised (librdkafka requires it) but answered UNSUPPORTED_VERSION, see "Network Security Posture" |
-| 18 | ApiVersions | 0-3 | ✅ Full support |
-| 19 | CreateTopics | 2-5 | ✅ Supported (topic configs ignored, see §13) |
-| 20 | DeleteTopics | 1-4 | ✅ Full support |
-| 21 | DeleteRecords | 0-2 | ✅ Full support |
-| 22 | InitProducerId | 0-4 | ✅ Full support |
-| 24 | AddPartitionsToTxn | 0-3 | ✅ Full support |
-| 25 | AddOffsetsToTxn | 0-3 | ✅ Full support |
-| 26 | EndTxn | 0-3 | ✅ Full support |
-| 28 | TxnOffsetCommit | 0-3 | ✅ Full support |
-| 32 | DescribeConfigs | 1-4 | ✅ Minimal (TOPIC resources, see §13) |
-| 36 | SaslAuthenticate | 0-2 | ✅ PLAIN, SCRAM-SHA-256, SCRAM-SHA-512; `session_lifetime_ms` = 0 (no re-authentication) |
-| 37 | CreatePartitions | 0-2 | ✅ Full support |
-| 42 | DeleteGroups | 0-2 | ✅ Full support |
-| 44 | IncrementalAlterConfigs | 0-1 | ✅ Minimal (`retention.ms` only, see §13) |
+| 0 | Produce | <!--gen:api-versions:Produce-->3-9<!--/gen--> | ✅ Full support (with key-based routing) |
+| 1 | Fetch | <!--gen:api-versions:Fetch-->4-11<!--/gen--> | ✅ Full support (v12+ not advertised; v13+ uses topic IDs) |
+| 2 | ListOffsets | <!--gen:api-versions:ListOffsets-->1-7<!--/gen--> | ✅ Implemented (incl. timestamp lookup) |
+| 3 | Metadata | <!--gen:api-versions:Metadata-->0-10<!--/gen--> | ✅ Full support (v10 `topic_id` is the zero UUID) |
+| 8 | OffsetCommit | <!--gen:api-versions:OffsetCommit-->2-8<!--/gen--> | ✅ Full support |
+| 9 | OffsetFetch | <!--gen:api-versions:OffsetFetch-->1-7<!--/gen--> | ✅ Full support |
+| 10 | FindCoordinator | <!--gen:api-versions:FindCoordinator-->0-3<!--/gen--> | ✅ Full support |
+| 11 | JoinGroup | <!--gen:api-versions:JoinGroup-->0-7<!--/gen--> | ✅ Full support |
+| 12 | Heartbeat | <!--gen:api-versions:Heartbeat-->0-4<!--/gen--> | ✅ Full support |
+| 13 | LeaveGroup | <!--gen:api-versions:LeaveGroup-->0-4<!--/gen--> | ✅ Full support |
+| 14 | SyncGroup | <!--gen:api-versions:SyncGroup-->0-4<!--/gen--> | ✅ Full support |
+| 15 | DescribeGroups | <!--gen:api-versions:DescribeGroups-->0-5<!--/gen--> | ✅ Full support |
+| 16 | ListGroups | <!--gen:api-versions:ListGroups-->0-4<!--/gen--> | ✅ Full support |
+| 17 | SaslHandshake | <!--gen:api-versions:SaslHandshake-->0-1<!--/gen--> | ✅ Network thread; v0 is advertised (librdkafka requires it) but answered UNSUPPORTED_VERSION, see "Network Security Posture" |
+| 18 | ApiVersions | <!--gen:api-versions:ApiVersions-->0-3<!--/gen--> | ✅ Full support |
+| 19 | CreateTopics | <!--gen:api-versions:CreateTopics-->2-5<!--/gen--> | ✅ Supported (topic configs ignored, see §13) |
+| 20 | DeleteTopics | <!--gen:api-versions:DeleteTopics-->1-4<!--/gen--> | ✅ Full support |
+| 21 | DeleteRecords | <!--gen:api-versions:DeleteRecords-->0-2<!--/gen--> | ✅ Full support |
+| 22 | InitProducerId | <!--gen:api-versions:InitProducerId-->0-4<!--/gen--> | ✅ Full support |
+| 24 | AddPartitionsToTxn | <!--gen:api-versions:AddPartitionsToTxn-->0-3<!--/gen--> | ✅ Full support |
+| 25 | AddOffsetsToTxn | <!--gen:api-versions:AddOffsetsToTxn-->0-3<!--/gen--> | ✅ Full support |
+| 26 | EndTxn | <!--gen:api-versions:EndTxn-->0-3<!--/gen--> | ✅ Full support |
+| 28 | TxnOffsetCommit | <!--gen:api-versions:TxnOffsetCommit-->0-3<!--/gen--> | ✅ Full support |
+| 32 | DescribeConfigs | <!--gen:api-versions:DescribeConfigs-->1-4<!--/gen--> | ✅ Minimal (TOPIC resources, see §13) |
+| 36 | SaslAuthenticate | <!--gen:api-versions:SaslAuthenticate-->0-2<!--/gen--> | ✅ PLAIN, SCRAM-SHA-256, SCRAM-SHA-512; `session_lifetime_ms` = 0 (no re-authentication) |
+| 37 | CreatePartitions | <!--gen:api-versions:CreatePartitions-->0-2<!--/gen--> | ✅ Full support |
+| 42 | DeleteGroups | <!--gen:api-versions:DeleteGroups-->0-2<!--/gen--> | ✅ Full support |
+| 44 | IncrementalAlterConfigs | <!--gen:api-versions:IncrementalAlterConfigs-->0-1<!--/gen--> | ✅ Minimal (`retention.ms` only, see §13) |
 
-**Note:** OffsetFetch v8+ uses a different (multi-group) response format. We support v0-7.
+**Note:** OffsetFetch v8+ uses a different (multi-group) response format. We support <!--gen:api-vversions:OffsetFetch-->v1-v7<!--/gen-->.
 
 ## Error Handling
 
@@ -494,6 +571,20 @@ reference: [AUTHENTICATION.md](AUTHENTICATION.md).
 - **Loud by default:** the worker logs a startup `WARNING` for every listener bound to a
   non-loopback address that does not authenticate clients (PLAINTEXT, or SSL without a client
   CA), and for SASL/PLAIN offered on an exposed SASL_PLAINTEXT listener.
+<!-- wave3 net -->
+- **Network edge limits (wave 3):** connections are capped per listener
+  (`pg_kafka.max_connections`, default 1024; Kafka's cap is broker-wide with per-listener
+  overrides) and per IP address across listeners (`pg_kafka.max_connections_per_ip`, default 256,
+  where Kafka's default is unlimited); over a cap the socket is closed at accept. Idle
+  connections close after `pg_kafka.connections_max_idle_ms` (600000, as Kafka), a request frame
+  must arrive within `pg_kafka.request_read_timeout_ms` (60000; Kafka has no such deadline) of its
+  first byte, and the pre-authentication phase (TLS + SASL) has 10 s from accept. Memory for an
+  incoming frame is reserved as its bytes arrive, under a 512 MiB budget for frames over 1 MiB
+  (Kafka's `queued.max.request.bytes` is unbounded by default); a connection whose frame would
+  exceed the budget is closed. Responses are not size-capped (they are bounded by the request's
+  `max_bytes`). `TCP_NODELAY` is set on every socket. SASL credential lookups are rate limited
+  per IP address (10/s, burst 20; Kafka has none). A connection closed for a bad frame, a timeout
+  or an acks=0 error first delivers the responses of every request it read before (up to 30 s).
 
 ## Compatibility Testing
 
@@ -503,6 +594,11 @@ reference: [AUTHENTICATION.md](AUTHENTICATION.md).
 |--------|---------|--------|-------|
 | kcat | 1.7.0+ | ✅ Works | Producer and consumer tested |
 | rdkafka (Rust) | 0.36+ | ✅ Works | Full E2E test suite (`kafka_test/`) |
+| Apache Kafka Java clients and tools | 3.7.0 | ✅ Checked in CI | <!-- wave3 infra -->`interop/run-java-checks.sh`: verifiable producer/consumers through rebalances, consumer-groups, get-offsets, transactions (perf-test, TransactionalMessageCopier), SASL SCRAM/PLAIN, Kafka Streams; checks still failing are marked XFAIL with the defect |
+
+Every behavioural difference from Apache Kafka 3.7 that `interop/diff/run.py` (the differential
+harness: the same raw requests to pg_kafka and to Kafka, responses compared) observes is either
+documented in this file (the harness cites the section) or listed there as a known bug.
 
 ### Client Configuration
 
@@ -538,7 +634,6 @@ auto.offset.reset=earliest
 | Log compaction | PostgreSQL UPDATE provides similar semantics |
 | Replication protocol | Rely on PostgreSQL HA (Patroni, RDS) |
 | Quotas | Not needed for target use cases |
-| SASL authentication | Use PostgreSQL authentication instead |
 
 > Exactly-once semantics (EOS) **is** implemented via the Phase 10 transaction APIs and read-committed isolation — see the Summary above and `KAFKA_PROTOCOL_COVERAGE.md`.
 
@@ -546,5 +641,5 @@ auto.offset.reset=earliest
 
 **Last Updated:** 2026-10-29
 **Applies To:** pg_kafka Phase 11 Complete (Shadow Mode)
-**API Coverage:** 26 of ~50 Kafka APIs (52%)
+**API Coverage:** 28 of ~50 Kafka APIs (56%)
 **Test Status:** unit + property + E2E, CI-gated; counts in [TEST_STRATEGY.md](TEST_STRATEGY.md#test-summary)

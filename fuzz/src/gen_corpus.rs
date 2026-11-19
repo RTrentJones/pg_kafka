@@ -1,0 +1,165 @@
+//! Write the seed corpora: valid request frames for the registry's APIs (each at its
+//! lowest and highest served version) and a few record batches.
+//!
+//!   cargo run --bin gen_corpus   (from fuzz/)
+
+use bytes::{BufMut, Bytes, BytesMut};
+use kafka_protocol::messages::*;
+use kafka_protocol::protocol::{Encodable, Request, StrBytes};
+use kafka_protocol::records::{
+    Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
+};
+use std::path::Path;
+
+fn frame<R: Request + Encodable>(version: i16, request: &R) -> Option<Vec<u8>> {
+    let mut header = RequestHeader::default();
+    header.request_api_key = R::KEY;
+    header.request_api_version = version;
+    header.correlation_id = 7;
+    header.client_id = Some(StrBytes::from_static_str("fuzz"));
+    let mut buf = BytesMut::new();
+    header.encode(&mut buf, R::header_version(version)).ok()?;
+    request.encode(&mut buf, version).ok()?;
+    Some(buf.to_vec())
+}
+
+fn batch(compression: Compression, n: usize) -> Bytes {
+    let records: Vec<Record> = (0..n)
+        .map(|i| Record {
+            transactional: false,
+            control: false,
+            partition_leader_epoch: 0,
+            producer_id: if i % 2 == 0 { -1 } else { 5 },
+            producer_epoch: 0,
+            timestamp_type: TimestampType::Creation,
+            offset: i as i64,
+            sequence: i as i32,
+            timestamp: 1_700_000_000_000,
+            key: Some(Bytes::from(format!("k{}", i))),
+            value: Some(Bytes::from(format!("value-{}", i))),
+            headers: Default::default(),
+        })
+        .collect();
+    let mut buf = BytesMut::new();
+    RecordBatchEncoder::encode(
+        &mut buf,
+        records.iter(),
+        &RecordEncodeOptions {
+            version: 2,
+            compression,
+        },
+    )
+    .expect("encode batch");
+    buf.freeze()
+}
+
+fn write(dir: &Path, name: &str, data: &[u8]) {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(dir.join(format!("seed-{}", name)), data).unwrap();
+}
+
+fn main() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus");
+    let mut frames: Vec<(String, Vec<u8>)> = Vec::new();
+    macro_rules! seed {
+        ($name:literal, $req:expr, [$($v:expr),*]) => {
+            $(if let Some(f) = frame($v, &$req) {
+                frames.push((format!("{}-v{}", $name, $v), f));
+            })*
+        };
+    }
+    let mut produce = ProduceRequest::default();
+    produce.acks = 1;
+    produce.timeout_ms = 1000;
+    let mut t = produce_request::TopicProduceData::default();
+    t.name = TopicName(StrBytes::from_static_str("fuzz-topic"));
+    let mut p = produce_request::PartitionProduceData::default();
+    p.records = Some(batch(Compression::None, 3));
+    t.partition_data.push(p);
+    produce.topic_data.push(t);
+    let mut fetch = FetchRequest::default();
+    let mut ft = fetch_request::FetchTopic::default();
+    ft.topic = TopicName(StrBytes::from_static_str("fuzz-topic"));
+    ft.partitions.push(fetch_request::FetchPartition::default());
+    fetch.topics.push(ft);
+    fetch.max_wait_ms = 100;
+    seed!("produce", produce, [3, 9]);
+    seed!("fetch", fetch, [4, 11]);
+    seed!("api_versions", ApiVersionsRequest::default(), [0, 3]);
+    seed!("metadata", MetadataRequest::default(), [0, 12]);
+    seed!("list_offsets", ListOffsetsRequest::default(), [1, 7]);
+    seed!("offset_commit", OffsetCommitRequest::default(), [2, 8]);
+    seed!("offset_fetch", OffsetFetchRequest::default(), [1, 7]);
+    seed!(
+        "find_coordinator",
+        FindCoordinatorRequest::default(),
+        [0, 4]
+    );
+    seed!("join_group", JoinGroupRequest::default(), [0, 9]);
+    seed!("heartbeat", HeartbeatRequest::default(), [0, 4]);
+    seed!("leave_group", LeaveGroupRequest::default(), [0, 5]);
+    seed!("sync_group", SyncGroupRequest::default(), [0, 5]);
+    seed!("describe_groups", DescribeGroupsRequest::default(), [0, 5]);
+    seed!("list_groups", ListGroupsRequest::default(), [0, 4]);
+    seed!("sasl_handshake", SaslHandshakeRequest::default(), [1]);
+    seed!(
+        "sasl_authenticate",
+        SaslAuthenticateRequest::default(),
+        [0, 2]
+    );
+    seed!("create_topics", CreateTopicsRequest::default(), [2, 5]);
+    seed!("delete_topics", DeleteTopicsRequest::default(), [1, 4]);
+    seed!("delete_records", DeleteRecordsRequest::default(), [0, 2]);
+    seed!("init_producer_id", InitProducerIdRequest::default(), [0, 4]);
+    seed!(
+        "add_partitions_to_txn",
+        AddPartitionsToTxnRequest::default(),
+        [0, 3]
+    );
+    seed!(
+        "add_offsets_to_txn",
+        AddOffsetsToTxnRequest::default(),
+        [0, 3]
+    );
+    seed!("end_txn", EndTxnRequest::default(), [0, 3]);
+    seed!(
+        "txn_offset_commit",
+        TxnOffsetCommitRequest::default(),
+        [0, 3]
+    );
+    seed!(
+        "describe_configs",
+        DescribeConfigsRequest::default(),
+        [0, 4]
+    );
+    seed!(
+        "create_partitions",
+        CreatePartitionsRequest::default(),
+        [0, 3]
+    );
+    seed!("delete_groups", DeleteGroupsRequest::default(), [0, 2]);
+    seed!(
+        "incremental_alter_configs",
+        IncrementalAlterConfigsRequest::default(),
+        [0, 1]
+    );
+
+    for (name, f) in &frames {
+        write(&root.join("request_decode"), name, f);
+        let mut framed = Vec::with_capacity(f.len() + 5);
+        framed.push(0); // chunking byte
+        framed.put_i32(f.len() as i32);
+        framed.extend_from_slice(f);
+        write(&root.join("frame_codec"), name, &framed);
+    }
+    for (name, c) in [
+        ("none", Compression::None),
+        ("gzip", Compression::Gzip),
+        ("snappy", Compression::Snappy),
+        ("lz4", Compression::Lz4),
+        ("zstd", Compression::Zstd),
+    ] {
+        write(&root.join("record_batch"), name, &batch(c, 4));
+    }
+    println!("wrote {} request seeds", frames.len());
+}

@@ -171,13 +171,51 @@ mod tests {
     }
 
     #[test]
+    fn test_unsupported_version_reply_always_encodes() {
+        // wave3 net, found by fuzz/request_decode: FindCoordinator v4 (we serve v0-3)
+        // was answered UNSUPPORTED_VERSION with a top-level error code, which v4 does
+        // not have: the response failed to encode on the network thread (the connection
+        // hung before wave 3). Every response the decoder queues must encode; when none
+        // can be shaped the connection is closed instead.
+        let crash: &[u8] = &[
+            0x00, 0x0a, 0x00, 0x04, 0x00, 0x00, 0x00, 0x07, 0x00, 0x04, 0x66, 0x75, 0x7a, 0x7a,
+            0x00, 0x00, 0x01, 0x00,
+        ];
+        let (tx, mut rx) = create_test_channel();
+        let _ = parse_request(BytesMut::from(crash), tx);
+        while let Ok(response) = rx.try_recv() {
+            crate::kafka::protocol::encode_response(response).expect("queued response encodes");
+        }
+        // Every registered API at every version just past what it serves.
+        for info in crate::kafka::api::APIS {
+            for version in [info.max_version + 1, info.max_version + 2, 15, 16] {
+                let mut frame = BytesMut::new();
+                frame.extend_from_slice(&info.key.to_be_bytes());
+                frame.extend_from_slice(&version.to_be_bytes());
+                frame.extend_from_slice(&9i32.to_be_bytes());
+                frame.extend_from_slice(&(-1i16).to_be_bytes());
+                frame.extend_from_slice(&[0u8; 16]);
+                let (tx, mut rx) = create_test_channel();
+                let _ = parse_request(frame, tx);
+                while let Ok(response) = rx.try_recv() {
+                    assert!(
+                        crate::kafka::protocol::encode_response(response).is_ok(),
+                        "{} v{}: queued an unencodable response",
+                        info.name,
+                        version
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_corrupt_produce_acks0_gets_no_response() {
         // acks=0 never gets a reply; an unsolicited error frame would be read as the
-        // reply to the client's next request.
+        // reply to the client's next request. wave3 net: as in Kafka, the connection is
+        // closed instead (parse_request errs, and the listener closes).
         let (tx, mut rx) = create_test_channel();
-        assert!(parse_request(corrupt_produce_frame(0), tx)
-            .unwrap()
-            .is_none());
+        assert!(parse_request(corrupt_produce_frame(0), tx).is_err());
         assert!(rx.try_recv().is_err(), "acks=0 must not get a response");
     }
 

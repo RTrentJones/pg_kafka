@@ -101,6 +101,9 @@ pub enum Rejection<E> {
     },
     /// Send nothing (the client expects no response, e.g. an acks=0 Produce).
     Silent,
+    /// wave3 net: send nothing and close the connection (an acks=0 Produce Kafka would
+    /// fail, e.g. a corrupt batch: Kafka closes the connection so the client notices).
+    Close(&'static str),
 }
 
 /// What a DB-thread handler may use besides its request.
@@ -181,12 +184,22 @@ pub trait KafkaApi: ApiSchema {
         echo: Option<&Self::Echo>,
         version: i16,
     ) -> Option<(i16, ResponseOf<Self>)> {
-        response_encodable::<Self>(version).then(|| {
-            (
-                version,
-                Self::error_response(echo, version, ERROR_UNSUPPORTED_VERSION),
-            )
-        })
+        if !response_encodable::<Self>(version) {
+            return None;
+        }
+        // wave3 net (found by fuzz/request_decode): an error response built for a
+        // version the API does not serve may set a field that version lacks (e.g.
+        // FindCoordinator v4+ has no top-level error code); it would fail to encode on
+        // the network thread. Answer only with a response that encodes: the full one,
+        // else one echoing nothing (e.g. AddPartitionsToTxn v4: a top-level error code
+        // but no v0-3 per-partition results), else close the connection.
+        let encodes = |r: &ResponseOf<Self>| r.encode(&mut BytesMut::new(), version).is_ok();
+        let response = Self::error_response(echo, version, ERROR_UNSUPPORTED_VERSION);
+        if encodes(&response) {
+            return Some((version, response));
+        }
+        let bare = Self::error_response(None, version, ERROR_UNSUPPORTED_VERSION);
+        encodes(&bare).then_some((version, bare))
     }
 
     /// Run the request on the DB thread. Most APIs call [`Call::run`] with their handler;
@@ -340,6 +353,7 @@ fn decode_api<A: KafkaApi>(
             Some(Ok(request)) if !A::expects_response(request) => return Decoded::Answered,
             Some(Ok(request)) => Some(A::echo(request)),
             Some(Err(Rejection::Silent)) => return Decoded::Answered,
+            Some(Err(Rejection::Close(reason))) => return Decoded::Close(reason.to_string()),
             Some(Err(Rejection::Reply { echo, .. })) => echo.clone(),
             None => None,
         };
@@ -370,6 +384,7 @@ fn decode_api<A: KafkaApi>(
             Decoded::Answered
         }
         Some(Err(Rejection::Silent)) => Decoded::Answered,
+        Some(Err(Rejection::Close(reason))) => Decoded::Close(reason.to_string()),
         None => {
             reply(
                 version,
@@ -483,6 +498,12 @@ macro_rules! kafka_apis {
                 /// Kafka error code.
                 error_code: i16,
             },
+            /// wave3 net: not a frame. Tells the connection's writer to close the
+            /// connection once every earlier response is written (an acks=0 Produce that
+            /// hit an error: Kafka closes the connection so the client refreshes its
+            /// metadata). Sent through the request's response channel, so it passes the
+            /// worker's commit barrier like a response (RB-1).
+            CloseConnection,
         }
 
         /// What an error response for a request echoes, one variant per registered API.
@@ -540,7 +561,7 @@ macro_rules! kafka_apis {
                 match self {
                     $(Self::$variant(_) => Some(api_key_of::<$api>()),)*
                     $(Self::$net_variant(_) => Some(api_key_of::<$net_api>()),)*
-                    Self::UnknownApi { .. } => None,
+                    Self::UnknownApi { .. } | Self::CloseConnection => None,
                 }
             }
             /// Whether the response carries any non-zero error code.
@@ -549,6 +570,7 @@ macro_rules! kafka_apis {
                     $(Self::$variant(r) => <$api as ApiSchema>::response_has_error(r),)*
                     $(Self::$net_variant(r) => <$net_api as ApiSchema>::response_has_error(r),)*
                     Self::UnknownApi { error_code } => *error_code != 0,
+                    Self::CloseConnection => true,
                 }
             }
             /// Encode header and body.
@@ -564,6 +586,9 @@ macro_rules! kafka_apis {
                     Self::UnknownApi { error_code } => {
                         encode_unknown_api_frame(correlation_id, *error_code, buf)
                     }
+                    Self::CloseConnection => Err(crate::kafka::error::KafkaError::Encoding(
+                        "CloseConnection is a connection instruction, not a frame".into(),
+                    )),
                 }
             }
         }
@@ -684,5 +709,7 @@ kafka_apis! {
     }
 }
 
+#[cfg(test)]
+mod docs;
 #[cfg(test)]
 pub(crate) mod tests;

@@ -24,7 +24,9 @@ To ensure all PRs must pass tests before merging:
        - `Test Suite`
        - `Security Audit`
        - `Verify Lockfile`
-       - `Check pg15`, `Check pg16`, `Check pg17`
+       - `Build kafka_test`
+       - `E2E pg14`, `E2E pg15`, `E2E pg16`, `E2E pg17`, `E2E pg18`
+       - `Interop (Java clients, differential vs Kafka)`
        - `SPI change needs E2E test` (runs on pull requests only)
      - Codecov reports `codecov/project` and `codecov/patch` as separate statuses once Step 3 is done
    - ✅ **Require branches to be up to date before merging**

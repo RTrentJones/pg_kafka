@@ -7,7 +7,8 @@
 
 | Document | Purpose |
 |----------|---------|
-| [KAFKA_PROTOCOL_COVERAGE.md](KAFKA_PROTOCOL_COVERAGE.md) | API coverage analysis (28 of ~50 APIs) |
+| [CONFIGURATION.md](CONFIGURATION.md) | Every `pg_kafka.*` setting (generated from the GUC definitions) |
+| [KAFKA_PROTOCOL_COVERAGE.md](KAFKA_PROTOCOL_COVERAGE.md) | API coverage analysis (<!--gen:api-coverage-->28 of ~50 standard Kafka APIs (56%)<!--/gen-->) |
 | [PROTOCOL_DEVIATIONS.md](PROTOCOL_DEVIATIONS.md) | Intentional spec differences from Apache Kafka |
 | [AUTHENTICATION.md](AUTHENTICATION.md) | TLS and SASL listeners, Kafka users, what is and is not protected |
 | [TEST_STRATEGY.md](TEST_STRATEGY.md) | Test architecture; the one place test counts are kept |
@@ -25,7 +26,7 @@
 
 | Document | Status |
 |----------|--------|
-| [ADR-001: Partitioning and Retention](architecture/ADR-001-partitioning-and-retention.md) | Proposed. Table partitioning is not implemented; time-based retention ships as a bounded `DELETE` sweep instead. |
+| [ADR-001: Partitioning and Retention](architecture/ADR-001-partitioning-and-retention.md) | Accepted and implemented in 0.1.0: `kafka.messages` is time-partitioned and retention drops whole leaves ("As built" section). |
 | [ADR-002: Staff-Level Architectural Improvements](architecture/ADR-002-staff-level-architectural-improvements.md) | Accepted. The byte-weighted backpressure item was never wired in and was removed; see the ADR's status note. |
 
 ## Reviews and Audits (dated records, in `archive/`)
@@ -66,7 +67,7 @@ These are point-in-time records. Their counts and line numbers describe the tree
 
 | Metric | Value |
 |--------|-------|
-| APIs Implemented | 26 of ~50 (52%) |
+| APIs Implemented | <!--gen:api-coverage-->28 of ~50 standard Kafka APIs (56%)<!--/gen--> |
 | Compression Codecs | gzip, snappy, lz4, zstd |
 | Assignment Strategies | Range, RoundRobin, Sticky |
 | Transaction Support | Full EOS |

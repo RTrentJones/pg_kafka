@@ -28,10 +28,11 @@ pub fn handle_offset_commit(
 
     // CONF-1: reject zombie commits. A member committing with a stale generation (or an unknown
     // member id) for a live group must be rejected with ILLEGAL_GENERATION / UNKNOWN_MEMBER_ID
-    // rather than silently persisting an offset. Simple consumers (generation -1) are not validated.
+    // rather than silently persisting an offset. wave3 groups: Kafka 3.7's rules, see
+    // `GroupCoordinator::validate_offset_commit` (generation -1 only for an unknown/Empty group).
     if let Err(e) = ctx
         .coordinator
-        .validate_commit(&group_id, &member_id, generation_id)
+        .validate_offset_commit(&group_id, &member_id, generation_id)
     {
         let error_code = e.to_kafka_error_code();
         let response_topics: Vec<_> = topics
@@ -142,12 +143,30 @@ pub fn handle_offset_commit(
 /// Handle OffsetFetch request
 ///
 /// Fetches committed offsets for a consumer group
+///
+/// `require_stable` (v7+, KIP-447; wave 3): a partition with a transactional offset
+/// commit whose transaction is still open is answered UNSTABLE_OFFSET_COMMIT with
+/// offset -1 (partition level, as Kafka 3.7), so a read_committed consumer retries
+/// instead of starting from an offset the transaction may still replace.
 pub fn handle_offset_fetch(
     ctx: &HandlerContext,
     group_id: String,
     topics: Option<Vec<crate::kafka::messages::OffsetFetchTopicData>>,
+    require_stable: bool,
 ) -> Result<kafka_protocol::messages::offset_fetch_response::OffsetFetchResponse> {
     let store = ctx.store;
+    // wave3 txn: partitions with a pending transactional commit (require_stable only).
+    let unstable: std::collections::HashSet<(String, i32)> = if require_stable {
+        store
+            .pending_txn_offset_partitions(&group_id)?
+            .into_iter()
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+    let is_unstable = |topic: &str, partition: i32| {
+        !unstable.is_empty() && unstable.contains(&(topic.to_string(), partition))
+    };
     use kafka_protocol::messages::offset_fetch_response::{
         OffsetFetchResponse, OffsetFetchResponsePartition, OffsetFetchResponseTopic,
     };
@@ -194,6 +213,14 @@ pub fn handle_offset_fetch(
 
                 let mut partition_response = OffsetFetchResponsePartition::default();
                 partition_response.partition_index = partition_index;
+
+                if is_unstable(&topic_name, partition_index) {
+                    partition_response.committed_offset = -1;
+                    partition_response.error_code =
+                        crate::kafka::constants::ERROR_UNSTABLE_OFFSET_COMMIT;
+                    partition_responses.push(partition_response);
+                    continue;
+                }
 
                 match offset_result {
                     Ok(Some(CommittedOffset { offset, metadata })) => {
@@ -246,9 +273,15 @@ pub fn handle_offset_fetch(
                 for (topic_name, partition_id, CommittedOffset { offset, metadata }) in offsets {
                     let mut partition_response = OffsetFetchResponsePartition::default();
                     partition_response.partition_index = partition_id;
-                    partition_response.committed_offset = offset;
-                    partition_response.metadata = metadata.map(StrBytes::from_string);
-                    partition_response.error_code = ERROR_NONE;
+                    if is_unstable(&topic_name, partition_id) {
+                        partition_response.committed_offset = -1;
+                        partition_response.error_code =
+                            crate::kafka::constants::ERROR_UNSTABLE_OFFSET_COMMIT;
+                    } else {
+                        partition_response.committed_offset = offset;
+                        partition_response.metadata = metadata.map(StrBytes::from_string);
+                        partition_response.error_code = ERROR_NONE;
+                    }
 
                     topics_map
                         .entry(topic_name)
@@ -311,7 +344,67 @@ mod tests {
         );
 
         // topics = None selects the fetch-all path.
-        let resp = handle_offset_fetch(&ctx, "g".to_string(), None).unwrap();
+        let resp = handle_offset_fetch(&ctx, "g".to_string(), None, false).unwrap();
         assert_ne!(resp.error_code, ERROR_NONE);
+    }
+
+    /// wave3 txn (KIP-447): with require_stable, a partition with a pending
+    /// transactional offset commit is UNSTABLE_OFFSET_COMMIT (offset -1); the others
+    /// and the same request without require_stable read the committed offset. Before
+    /// wave 3 the flag was ignored and the stale committed offset was returned.
+    #[test]
+    fn test_offset_fetch_require_stable_reports_pending_txn_commits() {
+        use crate::kafka::messages::OffsetFetchTopicData;
+        use crate::kafka::storage::TopicMetadata;
+        let mut store = MockKafkaStore::new();
+        store.expect_get_topic_metadata().returning(|_| {
+            Ok(vec![TopicMetadata {
+                name: "t".to_string(),
+                id: 1,
+                partition_count: 2,
+            }])
+        });
+        store.expect_fetch_offset().returning(|_, _, _| {
+            Ok(Some(CommittedOffset {
+                offset: 5,
+                metadata: None,
+            }))
+        });
+        store
+            .expect_pending_txn_offset_partitions()
+            .times(1)
+            .returning(|_| Ok(vec![("t".to_string(), 0)]));
+        let coordinator = crate::kafka::GroupCoordinator::new();
+        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(
+            &store,
+            &coordinator,
+            &broker,
+            1,
+            kafka_protocol::records::Compression::None,
+        );
+        let topics = || {
+            Some(vec![OffsetFetchTopicData {
+                name: "t".to_string(),
+                partition_indexes: vec![0, 1],
+            }])
+        };
+        let resp = handle_offset_fetch(&ctx, "g".to_string(), topics(), true).unwrap();
+        assert_eq!(resp.error_code, ERROR_NONE);
+        let parts = &resp.topics[0].partitions;
+        assert_eq!(
+            parts[0].error_code,
+            crate::kafka::constants::ERROR_UNSTABLE_OFFSET_COMMIT
+        );
+        assert_eq!(parts[0].committed_offset, -1);
+        assert_eq!(parts[1].error_code, ERROR_NONE);
+        assert_eq!(parts[1].committed_offset, 5);
+
+        // Without require_stable the pending set is not even read (times(1) above).
+        let resp = handle_offset_fetch(&ctx, "g".to_string(), topics(), false).unwrap();
+        assert!(resp.topics[0]
+            .partitions
+            .iter()
+            .all(|p| p.committed_offset == 5));
     }
 }

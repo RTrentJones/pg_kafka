@@ -20,7 +20,7 @@
 // - InternalNotification: signals from DB thread when new data arrives
 // - Per-connection long poll handlers that manage the wait/retry logic
 
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use crossbeam_channel::{Receiver, Sender};
 use futures::sink::SinkExt;
 use futures::stream::StreamExt;
@@ -29,37 +29,24 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::UnboundedSender;
-use tokio_util::codec::{Decoder, Encoder, Framed, LengthDelimitedCodec};
+use tokio_util::codec::Framed;
 use tracing::{debug, error, info, warn};
 
 use super::api::{FetchRequestData, RequestBody, RequestHeader, ResponseBody};
+use super::conn_limits::{IpPermit, IpTracker, LookupAdmission, NetworkLimits};
 use super::messages::{KafkaRequest, KafkaResponse, TopicFetchData};
 use super::notifications::InternalNotification;
 use super::pending_fetches::PendingFetchRegistry;
 use super::protocol;
-use super::shadow::{ForwardAck, ForwardRequest, ShadowConfig, ShadowProducer};
+use super::protocol::framing::{FrameClock, FrameCodec, PRE_AUTH_MAX_FRAME};
+use super::shadow::{ForwardAck, ForwardRequest};
+use crate::kafka::auth::scram::ScramMechanism;
+use crate::kafka::auth::session::{CredentialLookup, LookupResult};
 use crate::kafka::auth::session::{SaslOutcome, AUTH_FAILURE_DELAY};
 use crate::kafka::auth::{
     ChannelLookup, ConnectionPrincipal, CredentialRequest, SaslMechanism, SaslSession,
     SecurityProtocol,
 };
-
-// ============================================================================
-// RV-9: aggregate in-flight frame-reservation budget.
-//
-// LengthDelimitedCodec reserves the full declared frame length as soon as the
-// 4-byte length prefix arrives, so MAX_CONNECTIONS (1024) connections each
-// declaring a MAX_REQUEST_SIZE (100 MB) frame could reserve ~100 GB from a few KB
-// of attacker input. This budget bounds the *aggregate* reservation across all
-// connections while still admitting individual large frames until it is hit;
-// small requests are effectively unrestricted.
-// ============================================================================
-
-/// Total bytes that may be reserved across all connections for in-flight frame
-/// reads at once. 512 MiB comfortably admits several concurrent max-size frames
-/// while keeping the worst case far below the ~100 GB the connection cap alone
-/// allowed.
-const FRAME_RESERVE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 
 // Max concurrent long-poll fetch tasks per connection (RV-10 follow-up).
 // Each long-poll fetch spawns a detached task; without a cap, a client
@@ -110,6 +97,64 @@ pub fn init_network_tracing() {
         .try_init();
 }
 
+// wave3 net: signal mask of the network thread.
+extern "C" {
+    fn sigfillset(set: *mut pgrx::pg_sys::__sigset_t) -> std::os::raw::c_int;
+    fn pthread_sigmask(
+        how: std::os::raw::c_int,
+        set: *const pgrx::pg_sys::__sigset_t,
+        old: *mut pgrx::pg_sys::__sigset_t,
+    ) -> std::os::raw::c_int;
+}
+
+/// Block every signal on the calling thread. Called first thing on the network thread,
+/// before it creates the tokio runtime (whose threads inherit the mask).
+///
+/// The worker's signal handlers (pgrx's SIGTERM / SIGHUP handlers) must run on the
+/// worker's main thread. The kernel delivers a process-directed signal to any thread
+/// that does not block it; when `pg_terminate_backend()`'s SIGTERM landed on the network
+/// thread, pgrx's handler panicked ("postgres FFI may not be called from multiple
+/// threads"), the panic in the handler aborted the process, and the postmaster put the
+/// whole cluster through crash recovery (seen in the E2E suite at listener restarts).
+pub fn block_signals_on_this_thread() {
+    // SAFETY: plain libc calls on a local, zero-initialised sigset.
+    unsafe {
+        let mut set = std::mem::MaybeUninit::<pgrx::pg_sys::__sigset_t>::zeroed();
+        sigfillset(set.as_mut_ptr());
+        let rc = pthread_sigmask(
+            pgrx::pg_sys::SIG_BLOCK as std::os::raw::c_int,
+            set.as_ptr(),
+            std::ptr::null_mut(),
+        );
+        if rc != 0 {
+            warn!(
+                "could not block signals on the network thread (error {})",
+                rc
+            );
+        }
+    }
+}
+
+/// Whether `signum` is blocked on the calling thread (tests).
+#[cfg(test)]
+fn signal_blocked_on_this_thread(signum: i32) -> bool {
+    extern "C" {
+        fn sigismember(
+            set: *const pgrx::pg_sys::__sigset_t,
+            signum: std::os::raw::c_int,
+        ) -> std::os::raw::c_int;
+    }
+    unsafe {
+        let mut old = std::mem::MaybeUninit::<pgrx::pg_sys::__sigset_t>::zeroed();
+        pthread_sigmask(
+            pgrx::pg_sys::SIG_BLOCK as std::os::raw::c_int,
+            std::ptr::null(),
+            old.as_mut_ptr(),
+        );
+        sigismember(old.as_ptr(), signum) == 1
+    }
+}
+
 /// Whether an I/O error is just the peer going away (reset / broken pipe /
 /// aborted / EOF mid-frame). Those are routine for a broker and logged at
 /// debug; anything else (oversized frame, exhausted budget, ...) is a warning.
@@ -121,293 +166,6 @@ fn is_peer_disconnect(e: &std::io::Error) -> bool {
     )
 }
 
-static FRAME_RESERVE_REMAINING: AtomicUsize = AtomicUsize::new(FRAME_RESERVE_BUDGET_BYTES);
-
-/// Try to charge `n` bytes to `budget`. Returns false if it lacks `n` bytes, in
-/// which case the caller rejects the frame.
-fn charge_frame_budget(budget: &AtomicUsize, n: usize) -> bool {
-    let mut remaining = budget.load(Ordering::Relaxed);
-    loop {
-        if n > remaining {
-            return false;
-        }
-        match budget.compare_exchange_weak(
-            remaining,
-            remaining - n,
-            Ordering::Acquire,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => return true,
-            Err(actual) => remaining = actual,
-        }
-    }
-}
-
-fn release_frame_budget(budget: &AtomicUsize, n: usize) {
-    if n > 0 {
-        budget.fetch_add(n, Ordering::Release);
-    }
-}
-
-/// A `LengthDelimitedCodec` wrapper that charges the global reservation budget for
-/// a frame's declared length before the inner codec reserves it, and releases it
-/// once the frame is fully decoded (RV-9). Encoding is delegated unchanged.
-struct BudgetedFrameCodec {
-    inner: LengthDelimitedCodec,
-    /// Bytes charged to the budget for the in-progress frame (0 = none charged).
-    charged: usize,
-    /// auth stream: largest frame accepted right now. A SASL listener starts at
-    /// [`PRE_AUTH_MAX_FRAME`] and the connection raises it to `MAX_REQUEST_SIZE` once
-    /// authentication succeeds (Kafka's `sasl.server.max.receive.size`), so an
-    /// unauthenticated client cannot make the broker reserve 100 MB frames.
-    limit: Arc<AtomicUsize>,
-}
-
-/// auth stream: largest frame an unauthenticated client may send on a SASL listener
-/// (Kafka's `sasl.server.max.receive.size` default).
-const PRE_AUTH_MAX_FRAME: usize = 512 * 1024;
-
-impl BudgetedFrameCodec {
-    #[cfg(test)]
-    fn new() -> Self {
-        Self::with_limit(Arc::new(AtomicUsize::new(
-            super::constants::MAX_REQUEST_SIZE as usize,
-        )))
-    }
-
-    fn with_limit(limit: Arc<AtomicUsize>) -> Self {
-        Self {
-            limit,
-            inner: LengthDelimitedCodec::builder()
-                .big_endian()
-                .length_field_length(4)
-                .max_frame_length(super::constants::MAX_REQUEST_SIZE as usize)
-                .new_codec(),
-            charged: 0,
-        }
-    }
-}
-
-impl Decoder for BudgetedFrameCodec {
-    type Item = BytesMut;
-    type Error = std::io::Error;
-
-    fn decode(&mut self, src: &mut BytesMut) -> std::io::Result<Option<BytesMut>> {
-        // Charge the budget for this frame's declared payload length as soon as the
-        // 4-byte big-endian prefix is available, before the inner codec reserves it.
-        if self.charged == 0 && src.len() >= 4 {
-            let len = u32::from_be_bytes([src[0], src[1], src[2], src[3]]) as usize;
-            let limit = self.limit.load(Ordering::Relaxed);
-            if len > limit && limit < super::constants::MAX_REQUEST_SIZE as usize {
-                return Err(std::io::Error::other(
-                    "frame larger than allowed before SASL authentication",
-                ));
-            }
-            if len <= super::constants::MAX_REQUEST_SIZE as usize {
-                if !charge_frame_budget(&FRAME_RESERVE_REMAINING, len) {
-                    return Err(std::io::Error::other(
-                        "aggregate request reservation budget exhausted",
-                    ));
-                }
-                self.charged = len;
-            }
-            // len > MAX_REQUEST_SIZE is left uncharged; the inner codec rejects it.
-        }
-
-        match self.inner.decode(src) {
-            Ok(Some(frame)) => {
-                release_frame_budget(&FRAME_RESERVE_REMAINING, self.charged);
-                self.charged = 0;
-                Ok(Some(frame))
-            }
-            Ok(None) => Ok(None),
-            Err(e) => {
-                release_frame_budget(&FRAME_RESERVE_REMAINING, self.charged);
-                self.charged = 0;
-                Err(e)
-            }
-        }
-    }
-}
-
-/// Release any charge still held for a partially received frame when the codec goes
-/// away (e.g. the client disconnects mid-frame). Without this, each abandoned frame
-/// would permanently shrink the global reservation budget.
-impl Drop for BudgetedFrameCodec {
-    fn drop(&mut self) {
-        release_frame_budget(&FRAME_RESERVE_REMAINING, self.charged);
-        self.charged = 0;
-    }
-}
-
-impl Encoder<Bytes> for BudgetedFrameCodec {
-    type Error = std::io::Error;
-
-    fn encode(&mut self, item: Bytes, dst: &mut BytesMut) -> std::io::Result<()> {
-        self.inner.encode(item, dst)
-    }
-}
-
-/// Shadow forwarder task for async forwarding
-///
-/// Receives ForwardRequest messages from the DB thread via crossbeam channel
-/// and forwards them to external Kafka asynchronously (fire-and-forget).
-///
-/// This task uses RuntimeContext to check configuration dynamically, allowing
-/// shadow mode to be enabled/disabled at runtime via ALTER SYSTEM + pg_reload_conf().
-/// The producer is lazily created when shadow mode is first enabled and recreated
-/// if the bootstrap servers change.
-async fn run_shadow_forwarder(
-    forward_rx: Receiver<ForwardRequest>,
-    ack_tx: Sender<ForwardAck>,
-    runtime_context: Arc<crate::kafka::RuntimeContext>,
-) {
-    info!("Shadow forwarder task started (dynamic config mode)");
-
-    // Track current producer and config for change detection
-    let mut producer: Option<Arc<ShadowProducer>> = None;
-    let mut current_bootstrap_servers: String = String::new();
-
-    loop {
-        // Use spawn_blocking to receive from crossbeam channel in async context
-        let rx = forward_rx.clone();
-        let result =
-            tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_millis(100))).await;
-
-        match result {
-            Ok(Ok(req)) => {
-                // Check current config from RuntimeContext (dynamic reload support)
-                let config = runtime_context.config();
-
-                // Skip if shadow mode is not enabled or not configured
-                if !config.shadow_mode_enabled || config.shadow_bootstrap_servers.is_empty() {
-                    debug!(
-                        "Shadow mode disabled or not configured, dropping forward request for {}[{}]",
-                        req.topic_name, req.partition_id
-                    );
-                    continue;
-                }
-
-                // Check if config changed - recreate producer if bootstrap servers changed
-                if config.shadow_bootstrap_servers != current_bootstrap_servers {
-                    info!(
-                        "Shadow config changed: bootstrap_servers '{}' -> '{}'",
-                        current_bootstrap_servers, config.shadow_bootstrap_servers
-                    );
-
-                    let shadow_config = Arc::new(ShadowConfig::from_config(&config));
-                    match ShadowProducer::new(shadow_config) {
-                        Ok(p) => {
-                            current_bootstrap_servers = config.shadow_bootstrap_servers.clone();
-                            producer = Some(Arc::new(p));
-                            info!(
-                                "Shadow producer created/recreated for bootstrap_servers='{}'",
-                                current_bootstrap_servers
-                            );
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Failed to create shadow producer for '{}': {:?}",
-                                config.shadow_bootstrap_servers, e
-                            );
-                            // Clear producer so we retry on next config check
-                            producer = None;
-                            current_bootstrap_servers.clear();
-                            continue;
-                        }
-                    }
-                }
-
-                // Get producer (should exist if we passed the config check)
-                let p = match &producer {
-                    Some(p) => p.clone(),
-                    None => {
-                        warn!("No producer available, dropping forward request");
-                        continue;
-                    }
-                };
-
-                // SH-15: forward with partition=None so the external cluster
-                // re-partitions by key. The local partition count may differ
-                // from the external topic's, so forcing the local partition id
-                // would misroute.
-                //
-                // SH-9: this is the durable-outbox forward. Every attempt sends
-                // a ForwardAck back to the DB thread, which finalizes the
-                // kafka.shadow_tracking row (success → external_offset set;
-                // failure → row stays pending and is retried). The send is no
-                // longer fire-and-forget.
-                let result = p
-                    .send_async_offset(
-                        &req.topic_name,
-                        None,
-                        req.key.as_deref(),
-                        req.value.as_deref(),
-                    )
-                    .await;
-
-                let ack_result = match result {
-                    Ok(external_offset) => {
-                        debug!(
-                            "Forward OK {}[{}] local_offset {} -> external_offset {}",
-                            req.topic_name, req.partition_id, req.local_offset, external_offset
-                        );
-                        Ok(external_offset)
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Forward FAILED {}[{}] local_offset {}: {:?} (row stays pending)",
-                            req.topic_name, req.partition_id, req.local_offset, e
-                        );
-                        Err(e.to_string())
-                    }
-                };
-
-                let ack = ForwardAck {
-                    topic_id: req.topic_id,
-                    partition_id: req.partition_id,
-                    local_offset: req.local_offset,
-                    result: ack_result,
-                };
-                // Issue #93 test hook: hold the ack so it arrives later than
-                // the outbox retry lease, letting the E2E suite prove the
-                // in-flight gate prevents duplicate re-dispatch. 0 in
-                // production (async sleep; only this forwarder task waits).
-                let ack_delay_ms = config.test_forward_ack_delay_ms;
-                if ack_delay_ms > 0 {
-                    tokio::time::sleep(Duration::from_millis(ack_delay_ms as u64)).await;
-                }
-                // RA-6: non-blocking send. A blocking `send` here could park this
-                // tokio worker if the ack channel were full (the SEC-4
-                // anti-pattern). On full/closed, drop the ack — the row stays
-                // pending in the outbox and the poll re-forwards it, so the
-                // external topic is at-least-once. The re-forward is a duplicate;
-                // the idempotent producer suppresses it only if it happens within
-                // the same producer session (stable PID) — a duplicate that spans
-                // a producer restart still lands on the external topic.
-                if ack_tx.try_send(ack).is_err() {
-                    debug!("Forward ack channel full or closed, dropping ack (row stays pending)");
-                }
-            }
-            Ok(Err(crossbeam_channel::RecvTimeoutError::Timeout)) => {
-                // Normal timeout, continue
-            }
-            Ok(Err(crossbeam_channel::RecvTimeoutError::Disconnected)) => {
-                info!("Forward channel disconnected, stopping shadow forwarder");
-                break;
-            }
-            Err(_) => {
-                // spawn_blocking panicked
-                error!("Shadow forwarder recv task panicked");
-                break;
-            }
-        }
-    }
-
-    info!("Shadow forwarder task stopped");
-}
-
-/// Try to admit a new connection under the concurrent-connection cap (SEC-3).
 ///
 /// Returns a permit to hold for the connection's lifetime, or `None` if the cap has been
 /// reached (the caller must then close the new socket). Dropping the returned permit — which the
@@ -419,13 +177,20 @@ fn try_admit_connection(
     Arc::clone(limiter).try_acquire_owned().ok()
 }
 
-/// How long a client on a SASL listener may take, from connecting, to complete SASL
-/// authentication before the connection is closed.
-const SASL_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
+/// wave3 net: how long a client has, from the moment its TCP connection is accepted, to
+/// finish everything before it is authenticated: the TLS handshake (SSL / SASL_SSL) and,
+/// on a SASL listener, SASL authentication, including any wait for a credential lookup
+/// or a password check. One deadline from accept, so SASL_SSL gets 10 s in total.
+const PRE_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How long a client may take to complete the TLS handshake before the connection is
-/// dropped (bounds what a client that connects and stalls can hold).
-const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// wave3 net: how long a connection that is being closed (bad frame, SASL failure,
+/// timeout, acks=0 error) waits for the responses of the requests it read before, so
+/// that they are delivered first as Kafka's serial reader guarantees (a committed
+/// produce is answered). Peers that went away get only a short grace.
+const CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Grace for the writer when the peer disconnected (nothing can be delivered).
+const PEER_GONE_GRACE: Duration = Duration::from_millis(100);
 
 /// Security of one listener, shared by its connections.
 pub struct ListenerSecurity {
@@ -439,6 +204,9 @@ pub struct ListenerSecurity {
     /// The `(host, port)` advertised in Metadata/FindCoordinator responses served on
     /// this listener; `None` keeps what the worker built (the primary listener).
     pub advertised: Option<(String, i32)>,
+    /// wave3 net: connection caps and timeouts (`pg_kafka.max_connections` is per
+    /// listener; the per-IP cap is shared by all listeners).
+    pub limits: NetworkLimits,
 }
 
 impl ListenerSecurity {
@@ -450,6 +218,7 @@ impl ListenerSecurity {
             tls: None,
             sasl_mechanisms: Arc::new(Vec::new()),
             advertised: None,
+            limits: NetworkLimits::default(),
         }
     }
 }
@@ -467,6 +236,8 @@ pub struct ConnectionAuth {
     pub sasl: SaslSession,
     pub lookup: ChannelLookup,
     pub log_connections: bool,
+    /// wave3 net: the per-IP credential-lookup rate limit (absent in unit tests).
+    pub lookup_throttle: Option<(Arc<IpTracker>, std::net::IpAddr)>,
 }
 
 impl ConnectionAuth {
@@ -488,6 +259,40 @@ impl ConnectionAuth {
             sasl,
             lookup,
             log_connections,
+            lookup_throttle: None,
+        }
+    }
+}
+
+/// wave3 net: a credential lookup that first takes a token from the peer IP's lookup
+/// bucket (net item 9: each SCRAM client-first / PLAIN token costs the DB thread a
+/// SELECT, so an IP may start only so many per second). Over the sustained rate the
+/// lookup waits; far over it, it never happens and the pre-auth deadline closes the
+/// connection without an answer (a disconnect is retriable; an authentication failure
+/// is fatal for the Java client).
+struct ThrottledLookup<'a> {
+    inner: &'a ChannelLookup,
+    throttle: Option<&'a (Arc<IpTracker>, std::net::IpAddr)>,
+}
+
+impl CredentialLookup for ThrottledLookup<'_> {
+    fn lookup(
+        &self,
+        username: &str,
+        mechanism: Option<ScramMechanism>,
+    ) -> impl std::future::Future<Output = LookupResult> + Send {
+        let admission = self
+            .throttle
+            .map(|(tracker, ip)| tracker.admit_lookup(*ip))
+            .unwrap_or(LookupAdmission::Now);
+        let lookup = self.inner.lookup(username, mechanism);
+        async move {
+            match admission {
+                LookupAdmission::Now => {}
+                LookupAdmission::After(delay) => tokio::time::sleep(delay).await,
+                LookupAdmission::Refused => std::future::pending::<()>().await,
+            }
+            lookup.await
         }
     }
 }
@@ -497,7 +302,8 @@ impl ConnectionAuth {
 struct AcceptContext {
     request_lanes: crate::kafka::RequestLanes,
     registry: Arc<PendingFetchRegistry>,
-    conn_limiter: Arc<tokio::sync::Semaphore>,
+    /// wave3 net: per-IP connection counts and lookup buckets, shared by all listeners.
+    ip_tracker: Arc<IpTracker>,
     lookup: ChannelLookup,
     enable_long_polling: bool,
     fetch_poll_interval_ms: i32,
@@ -602,19 +408,26 @@ pub async fn run(
     // Always spawned - config is checked dynamically to support runtime enable/disable.
     let runtime_context_for_forwarder = runtime_context.clone();
     let _forward_handle = tokio::spawn(async move {
-        run_shadow_forwarder(forward_rx, forward_ack_tx, runtime_context_for_forwarder).await;
+        super::shadow::forwarder_task::run_shadow_forwarder(
+            forward_rx,
+            forward_ack_tx,
+            runtime_context_for_forwarder,
+        )
+        .await;
     });
 
-    // SEC-3: bound concurrent client connections to prevent fd/memory exhaustion. Each
-    // connection task can buffer up to one MAX_REQUEST_SIZE frame, so unbounded connections
-    // are a DoS vector. A permit is held for the connection's lifetime and freed on close.
-    // The cap is shared by all listeners.
+    // SEC-3 / wave3 net: bound concurrent client connections to prevent fd/memory
+    // exhaustion. Each listener has its own cap (pg_kafka.max_connections, see
+    // accept_loop) and each IP address one across all listeners
+    // (pg_kafka.max_connections_per_ip). Every listener carries the same limits.
+    let max_per_ip = listeners
+        .first()
+        .map(|(_, s)| s.limits.max_connections_per_ip)
+        .unwrap_or(usize::MAX);
     let accept_context = AcceptContext {
         request_lanes,
         registry,
-        conn_limiter: Arc::new(tokio::sync::Semaphore::new(
-            crate::kafka::constants::MAX_CONNECTIONS,
-        )),
+        ip_tracker: IpTracker::new(max_per_ip),
         lookup: ChannelLookup(credential_tx),
         enable_long_polling,
         fetch_poll_interval_ms,
@@ -664,27 +477,49 @@ pub async fn run(
 
 /// Accept connections on one listener until aborted.
 async fn accept_loop(listener: TcpListener, security: Arc<ListenerSecurity>, ctx: AcceptContext) {
+    // wave3 net: this listener's own cap, so a flood on another listener cannot lock its
+    // clients out.
+    let limiter = Arc::new(tokio::sync::Semaphore::new(security.limits.max_connections));
     loop {
         match listener.accept().await {
             Ok((socket, addr)) => {
-                // SEC-3: enforce the concurrent-connection cap. try_acquire is non-blocking;
-                // at the cap we close the new socket rather than buffer an unbounded number
-                // of connections.
-                let permit = match try_admit_connection(&ctx.conn_limiter) {
-                    Some(permit) => permit,
-                    None => {
-                        if ctx.log_connections {
-                            warn!(
-                                "Connection limit ({}) reached; rejecting {}",
-                                crate::kafka::constants::MAX_CONNECTIONS,
-                                addr
-                            );
-                        }
-                        crate::kafka::metrics::connection_rejected();
-                        drop(socket);
-                        continue;
+                let accepted_at = tokio::time::Instant::now();
+                // SEC-3: enforce the listener's concurrent-connection cap. try_acquire is
+                // non-blocking; at the cap we close the new socket rather than buffer an
+                // unbounded number of connections.
+                let Some(permit) = try_admit_connection(&limiter) else {
+                    if ctx.log_connections {
+                        warn!(
+                            "Connection limit ({}) of {}://{} reached; rejecting {}",
+                            security.limits.max_connections,
+                            security.protocol.name(),
+                            security.bind_addr,
+                            addr
+                        );
                     }
+                    crate::kafka::metrics::connection_rejected();
+                    drop(socket);
+                    continue;
                 };
+                // wave3 net: and the per-IP cap.
+                let Some(ip_permit) = ctx.ip_tracker.try_open(addr.ip()) else {
+                    if ctx.log_connections {
+                        warn!(
+                            "Per-IP connection limit ({}) reached for {}; rejecting",
+                            security.limits.max_connections_per_ip,
+                            addr.ip()
+                        );
+                    }
+                    crate::kafka::metrics::connection_rejected();
+                    drop(socket);
+                    continue;
+                };
+                // wave3 net: Kafka clients pipeline small requests; with Nagle on, a
+                // response that follows another unacknowledged one waits for the
+                // client's delayed ACK (~40 ms). Kafka sets TCP_NODELAY on every socket.
+                if let Err(e) = socket.set_nodelay(true) {
+                    debug!("Could not set TCP_NODELAY for {}: {}", addr, e);
+                }
 
                 // Log connections if enabled
                 if ctx.log_connections {
@@ -701,12 +536,13 @@ async fn accept_loop(listener: TcpListener, security: Arc<ListenerSecurity>, ctx
                 // Spawn a new async task to handle this connection
                 // Use tokio::spawn (not spawn_local) since we're in multi-thread runtime
                 tokio::spawn(async move {
-                    // Hold the connection permit for the task's lifetime; dropping it on exit
-                    // frees a slot for a new connection (SEC-3).
+                    // Hold the connection permits for the task's lifetime; dropping them
+                    // on exit frees the slots for new connections (SEC-3).
                     let _permit = permit;
                     let _conn_metrics = crate::kafka::metrics::ConnectionGuard::open();
                     let should_log = ctx.log_connections;
-                    let result = serve_connection(socket, addr, security, ctx).await;
+                    let _ip_permit: IpPermit = ip_permit;
+                    let result = serve_connection(socket, addr, security, ctx, accepted_at).await;
                     match result {
                         Err(e) if should_log => {
                             warn!("Error handling connection from {}: {}", addr, e)
@@ -731,16 +567,22 @@ async fn serve_connection(
     addr: std::net::SocketAddr,
     security: Arc<ListenerSecurity>,
     ctx: AcceptContext,
+    accepted_at: tokio::time::Instant,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let peer = addr.to_string();
+    // wave3 net (item 10): one pre-auth deadline from accept covers TLS and SASL.
+    let pre_auth_deadline = accepted_at + PRE_AUTH_TIMEOUT;
+    let limits = security.limits;
+    let throttle = Some((ctx.ip_tracker.clone(), addr.ip()));
     let Some(acceptor) = security.tls.clone() else {
-        let auth = ConnectionAuth::new(
+        let mut auth = ConnectionAuth::new(
             peer,
             security,
             ConnectionPrincipal::anonymous(),
             ctx.lookup,
             ctx.log_connections,
         );
+        auth.lookup_throttle = throttle;
         return handle_connection(
             socket,
             ctx.request_lanes,
@@ -748,10 +590,12 @@ async fn serve_connection(
             ctx.enable_long_polling,
             ctx.fetch_poll_interval_ms,
             auth,
+            limits,
+            pre_auth_deadline,
         )
         .await;
     };
-    let tls = match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(socket)).await {
+    let tls = match tokio::time::timeout_at(pre_auth_deadline, acceptor.accept(socket)).await {
         Ok(Ok(tls)) => tls,
         Ok(Err(e)) => {
             // A peer that connects and leaves without a ClientHello (port probe, load
@@ -774,6 +618,8 @@ async fn serve_connection(
             return Ok(());
         }
     };
+    // wave3 net: Nagle off on the TLS stream's socket too (set at accept, on the TCP
+    // socket underneath; rustls adds no buffering of its own between records).
     // Mutual TLS: the verified client certificate's subject is the principal (Kafka's
     // default SSL principal, `User:<RFC 2253 subject>`), until SASL replaces it.
     let principal = tls
@@ -793,7 +639,8 @@ async fn serve_connection(
             peer, principal.principal
         );
     }
-    let auth = ConnectionAuth::new(peer, security, principal, ctx.lookup, ctx.log_connections);
+    let mut auth = ConnectionAuth::new(peer, security, principal, ctx.lookup, ctx.log_connections);
+    auth.lookup_throttle = throttle;
     handle_connection(
         tls,
         ctx.request_lanes,
@@ -801,6 +648,8 @@ async fn serve_connection(
         ctx.enable_long_polling,
         ctx.fetch_poll_interval_ms,
         auth,
+        limits,
+        pre_auth_deadline,
     )
     .await
 }
@@ -831,6 +680,7 @@ async fn serve_connection(
 ///
 /// # Thread Safety
 /// This function runs in the network thread and MUST NOT call pgrx functions.
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection<S>(
     socket: S,
     request_lanes: crate::kafka::RequestLanes,
@@ -838,16 +688,17 @@ async fn handle_connection<S>(
     enable_long_polling: bool,
     poll_interval_ms: i32,
     mut auth: ConnectionAuth,
+    limits: NetworkLimits,
+    pre_auth_deadline: tokio::time::Instant,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     debug!("New connection established, starting pipelined handle loop");
 
-    // Wrap socket in a budgeted length-delimited codec (big-endian 4-byte size
-    // prefix). RV-9: the codec charges a global reservation budget for each frame's
-    // declared length so aggregate in-flight reservations across connections are
-    // bounded, not just the connection count.
+    // Frame codec (protocol::framing): charges the global budget only for bytes actually
+    // buffered of a large incomplete frame (RV-9, wave3 net item 1) and records when that
+    // frame started arriving, for the per-frame read deadline.
     let frame_limit = Arc::new(AtomicUsize::new(
         if auth.sasl.is_authenticated() || !auth.security.protocol.uses_sasl() {
             super::constants::MAX_REQUEST_SIZE as usize
@@ -855,8 +706,8 @@ where
             PRE_AUTH_MAX_FRAME
         },
     ));
-    let framed = Framed::new(socket, BudgetedFrameCodec::with_limit(frame_limit.clone()));
-    let auth_deadline = tokio::time::Instant::now() + SASL_AUTH_TIMEOUT;
+    let clock = Arc::new(FrameClock::new());
+    let framed = Framed::new(socket, FrameCodec::new(frame_limit.clone(), clock.clone()));
 
     // Split the framed socket into independent reader and writer halves
     // This enables concurrent reading and writing for pipelining support
@@ -897,15 +748,38 @@ where
     // advertised.listeners).
     let advertised = auth.security.advertised.clone();
 
+    // wave3 net: last time a frame was read or a response written (idle timeout).
+    let activity = Arc::new(ActivityClock::new());
+    let writer_activity = activity.clone();
+    // wave3 net (item 2): the writer owns `writer_gone_tx`; however it exits (an encode
+    // or write error, a panic, an acks=0 close request, all slots done), the sender is
+    // dropped and the reader closes the connection instead of reading requests whose
+    // responses can never be written.
+    let (writer_gone_tx, mut writer_gone_rx) = tokio::sync::oneshot::channel::<()>();
+
     // Spawn the Writer Task
     // This task sits and waits for responses from the DB.
     // It runs completely independently of the reader.
-    let writer_handle: tokio::task::JoinHandle<Result<(), String>> = tokio::spawn(async move {
+    let peer_for_writer = auth.peer.clone();
+    let mut writer_handle: tokio::task::JoinHandle<Result<(), String>> = tokio::spawn(async move {
+        let _writer_gone = writer_gone_tx;
         while let Some((mut slot, _in_flight_permit)) = order_rx.recv().await {
             // A request yields at most one response; one that yields none
             // (acks=0 produce) closes the channel without sending and is
             // skipped here.
             while let Some(mut response) = slot.recv().await {
+                if matches!(response.body, ResponseBody::CloseConnection) {
+                    // wave3 net (item 4): an acks=0 produce hit a partition error;
+                    // Kafka closes the connection (after the request's writes
+                    // committed) so the client refreshes its metadata. Earlier
+                    // responses are already on the socket.
+                    debug!(
+                        "Closing connection from {} after an acks=0 produce error",
+                        peer_for_writer
+                    );
+                    let _ = writer.close().await;
+                    return Ok(());
+                }
                 debug!("Writer received response, encoding...");
                 if let Some((host, port)) = &advertised {
                     rewrite_advertised(&mut response, host, *port);
@@ -930,6 +804,7 @@ where
                     }
                     return Err(format!("Write error: {}", e));
                 }
+                writer_activity.touch();
                 debug!("Response sent to client successfully");
             }
             // `_in_flight_permit` drops here: this request's response (if any) is
@@ -940,42 +815,102 @@ where
 
     // Run the Reader Loop (Main Task)
     // This loop ONLY reads and dispatches. It never waits for the DB response.
-    loop {
+    let close = 'conn: loop {
         // Backpressure: wait for an in-flight slot before reading the next frame.
         // The semaphore is never closed, so acquire only fails if that changes.
-        let in_flight_permit = match in_flight.clone().acquire_owned().await {
-            Ok(permit) => permit,
-            Err(_) => break,
+        // An unauthenticated client that pipelines without reading its responses is still
+        // bound by the pre-auth deadline here.
+        let pre_auth = !auth.sasl.admits(-1);
+        let in_flight_permit = tokio::select! {
+            biased;
+            _ = &mut writer_gone_rx => break 'conn Close::WriterGone,
+            permit = in_flight.clone().acquire_owned() => match permit {
+                Ok(permit) => permit,
+                Err(_) => break 'conn Close::Protocol,
+            },
+            _ = tokio::time::sleep_until(pre_auth_deadline), if pre_auth => {
+                warn!(
+                    "Closing connection from {}: SASL authentication not completed within {:?}",
+                    auth.peer, PRE_AUTH_TIMEOUT
+                );
+                break 'conn Close::Timeout;
+            }
         };
-        // auth stream: an unauthenticated connection on a SASL listener must finish
-        // authenticating within SASL_AUTH_TIMEOUT, so idle unauthenticated clients
-        // cannot hold connection slots forever.
-        let next = if auth.sasl.admits(-1) {
-            reader.next().await
-        } else {
-            match tokio::time::timeout_at(auth_deadline, reader.next()).await {
-                Ok(next) => next,
-                Err(_) => {
+        // Time spent not reading (backpressure) does not count against a frame the
+        // client had started.
+        clock.restart_if_pending();
+
+        // wave3 net (items 1, 8): wait for the next frame under three deadlines: the
+        // pre-auth deadline (SASL listeners, until authenticated), the per-frame read
+        // deadline (from the first byte of a frame) and the idle timeout (nothing read,
+        // nothing written, nothing outstanding).
+        let next = loop {
+            let now = tokio::time::Instant::now();
+            let mut wake = now + limits.request_read_timeout;
+            if !auth.sasl.admits(-1) {
+                if now >= pre_auth_deadline {
                     warn!(
                         "Closing connection from {}: SASL authentication not completed within {:?}",
-                        auth.peer, SASL_AUTH_TIMEOUT
+                        auth.peer, PRE_AUTH_TIMEOUT
                     );
-                    break;
+                    break 'conn Close::Timeout;
                 }
+                wake = wake.min(pre_auth_deadline);
+            }
+            let pending_frame = clock.pending_since();
+            if let Some(started) = pending_frame {
+                let deadline =
+                    tokio::time::Instant::from_std(started) + limits.request_read_timeout;
+                if now >= deadline {
+                    warn!(
+                        "Closing connection from {}: request not received completely within {:?}",
+                        auth.peer, limits.request_read_timeout
+                    );
+                    break 'conn Close::Timeout;
+                }
+                wake = wake.min(deadline);
+            }
+            // We hold one permit ourselves; every other missing one is a request whose
+            // response is not written yet.
+            let outstanding =
+                MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION - 1 - in_flight.available_permits();
+            if outstanding == 0 && pending_frame.is_none() {
+                let deadline =
+                    tokio::time::Instant::from_std(activity.last()) + limits.connections_max_idle;
+                if now >= deadline {
+                    debug!(
+                        "Closing connection from {}: idle for {:?}",
+                        auth.peer, limits.connections_max_idle
+                    );
+                    break 'conn Close::Timeout;
+                }
+                wake = wake.min(deadline);
+            } else {
+                // Re-check once the outstanding requests may have been answered.
+                wake = wake.min(now + limits.connections_max_idle);
+            }
+            tokio::select! {
+                biased;
+                _ = &mut writer_gone_rx => break 'conn Close::WriterGone,
+                read = tokio::time::timeout_at(wake, reader.next()) => match read {
+                    Ok(next) => break next,
+                    Err(_) => continue,
+                },
             }
         };
         let frame = match next {
-            None => break,
+            None => break 'conn Close::PeerGone,
             Some(Ok(f)) => f,
             Some(Err(e)) => {
                 if is_peer_disconnect(&e) {
                     debug!("Client disconnected mid-frame: {}", e);
-                } else {
-                    warn!("Error reading frame: {}", e);
+                    break 'conn Close::PeerGone;
                 }
-                break;
+                warn!("Error reading frame from {}: {}", auth.peer, e);
+                break 'conn Close::Protocol;
             }
         };
+        activity.touch();
 
         debug!("Received frame of {} bytes", frame.len());
 
@@ -985,7 +920,7 @@ where
         let (response_tx, response_rx) = tokio::sync::mpsc::unbounded_channel();
         if order_tx.send((response_rx, in_flight_permit)).is_err() {
             warn!("Writer task gone, closing connection");
-            break;
+            break 'conn Close::WriterGone;
         }
 
         // Listener security: SaslHandshake / SaslAuthenticate are answered here, on
@@ -995,7 +930,28 @@ where
         let api_key = crate::kafka::auth::session::peek_api_key(&frame);
         if let Some(key) = api_key.filter(|k| crate::kafka::auth::session::is_sasl_api(*k)) {
             debug!("SASL request api_key={} from {}", key, auth.peer);
-            if handle_sasl_frame(&mut auth, frame, response_tx).await {
+            // wave3 net (item 8): the pre-auth deadline also covers the wait for the
+            // credential lookup, the lookup rate limit and the password-check slots.
+            let keep_open = if auth.sasl.is_authenticated() {
+                handle_sasl_frame(&mut auth, frame, response_tx).await
+            } else {
+                match tokio::time::timeout_at(
+                    pre_auth_deadline,
+                    handle_sasl_frame(&mut auth, frame, response_tx),
+                )
+                .await
+                {
+                    Ok(keep_open) => keep_open,
+                    Err(_) => {
+                        warn!(
+                            "Closing connection from {}: SASL authentication not completed within {:?}",
+                            auth.peer, PRE_AUTH_TIMEOUT
+                        );
+                        break 'conn Close::Timeout;
+                    }
+                }
+            };
+            if keep_open {
                 if auth.sasl.is_authenticated() {
                     frame_limit.store(
                         super::constants::MAX_REQUEST_SIZE as usize,
@@ -1004,7 +960,7 @@ where
                 }
                 continue;
             }
-            break;
+            break 'conn Close::Protocol;
         }
         if !auth.sasl.admits(api_key.unwrap_or(-1)) {
             warn!(
@@ -1014,102 +970,23 @@ where
                 auth.security.bind_addr,
                 api_key
             );
-            break;
+            break 'conn Close::Protocol;
         }
 
         match protocol::parse_request(frame, response_tx) {
             Ok(Some(request)) => {
-                debug!("Request parsed successfully, dispatching to worker...");
-
-                // Check if this is a Fetch request that should use long polling
-                let should_long_poll = enable_long_polling
-                    && matches!(
-                        &request.body,
-                        RequestBody::Fetch(fetch) if fetch.max_wait_ms > 0
-                    );
-
-                // Acquire a long-poll slot; at the cap the fetch falls through
-                // to the immediate path below instead of spawning a task.
-                let long_poll_permit = if should_long_poll {
-                    match long_poll_permits.clone().try_acquire_owned() {
-                        Ok(permit) => Some(permit),
-                        Err(_) => {
-                            debug!(
-                                "Per-connection long-poll cap ({}) reached; serving fetch immediately",
-                                MAX_LONG_POLLS_PER_CONNECTION
-                            );
-                            None
-                        }
-                    }
-                } else {
-                    None
-                };
-
-                if let Some(permit) = long_poll_permit {
-                    // Destructure for long polling - we know it's a Fetch with max_wait_ms > 0
-                    if let KafkaRequest {
-                        header:
-                            RequestHeader {
-                                correlation_id,
-                                client_id,
-                                api_version,
-                                ..
-                            },
-                        body:
-                            RequestBody::Fetch(FetchRequestData {
-                                max_wait_ms,
-                                min_bytes,
-                                max_bytes,
-                                isolation_level,
-                                topic_data,
-                            }),
-                        response_tx: original_response_tx,
-                    } = request
-                    {
-                        debug!(
-                            "Fetch request with long polling: max_wait_ms={}, min_bytes={}, isolation_level={}",
-                            max_wait_ms, min_bytes, isolation_level
-                        );
-
-                        let long_poll_registry = registry.clone();
-                        let long_poll_request_tx = request_lanes.main.clone();
-                        let poll_interval = poll_interval_ms;
-
-                        tokio::spawn(async move {
-                            // Hold the per-connection slot for the task's lifetime.
-                            let _long_poll_slot = permit;
-                            if let Err(e) = handle_fetch_long_poll(
-                                correlation_id,
-                                client_id,
-                                api_version,
-                                max_wait_ms,
-                                min_bytes,
-                                max_bytes,
-                                isolation_level,
-                                topic_data,
-                                long_poll_request_tx,
-                                original_response_tx,
-                                long_poll_registry,
-                                poll_interval,
-                            )
-                            .await
-                            {
-                                warn!("Long poll handler error: {}", e);
-                            }
-                        });
-
-                        // Don't send to worker directly - the long poll handler will do it
-                        continue;
-                    }
-                }
-
-                // Normal path - send to worker directly (SEC-4: non-blocking handoff).
-                // DR-12: Heartbeat routes to the liveness lane, everything else to
-                // the main lane, so group liveness never queues behind heavy work.
-                let lane = request_lanes.route(&request).clone();
-                if !send_with_backpressure(&lane, request).await {
+                if !dispatch_request(
+                    request,
+                    &request_lanes,
+                    &registry,
+                    &long_poll_permits,
+                    enable_long_polling,
+                    poll_interval_ms,
+                )
+                .await
+                {
                     error!("Worker channel closed");
-                    break;
+                    break 'conn Close::Protocol;
                 }
             }
             Ok(None) => {
@@ -1118,36 +995,188 @@ where
                 debug!("Parse returned None, continuing...");
             }
             Err(e) => {
-                warn!("Framing/Parse error: {}", e);
-                break;
+                warn!("Framing/Parse error from {}: {}", auth.peer, e);
+                break 'conn Close::Protocol;
             }
         }
-    }
+    };
 
     // Cleanup: Drop order_tx so the writer exits once it has drained the
     // response slots of requests that were already dispatched
     drop(order_tx);
 
-    // Wait briefly for writer to finish sending any pending responses, then
-    // abort it: an in-flight long poll could otherwise hold the task (and
-    // the half-open socket) alive for up to max_wait_ms after disconnect
-    let mut writer_handle = writer_handle;
-    if tokio::time::timeout(std::time::Duration::from_millis(100), &mut writer_handle)
+    // wave3 net (item 6): Kafka reads a connection serially, so every request read
+    // before the one that closes the connection is answered first. Give the writer the
+    // time to deliver them (bounded; a committed acks=1 produce must be answered),
+    // unless the peer is gone, then abort it: an in-flight long poll could otherwise
+    // hold the task (and the half-open socket) alive for up to max_wait_ms.
+    let grace = match close {
+        Close::PeerGone => PEER_GONE_GRACE,
+        Close::WriterGone => Duration::ZERO,
+        Close::Protocol | Close::Timeout => CLOSE_DRAIN_TIMEOUT,
+    };
+    if tokio::time::timeout(grace, &mut writer_handle)
         .await
         .is_err()
     {
+        if grace >= CLOSE_DRAIN_TIMEOUT {
+            warn!(
+                "Closing connection from {}: responses still pending after {:?}",
+                auth.peer, grace
+            );
+        }
         writer_handle.abort();
         let _ = writer_handle.await;
     }
 
     if auth.log_connections {
         info!(
-            "Kafka connection from {} ({}) closed",
-            auth.peer, auth.principal
+            "Kafka connection from {} ({}) closed ({:?})",
+            auth.peer, auth.principal, close
         );
     }
     debug!("Connection handler exiting");
     Ok(())
+}
+
+/// Why a connection's read loop ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Close {
+    /// EOF or reset: the peer went away.
+    PeerGone,
+    /// The writer task exited (write/encode error, acks=0 close request).
+    WriterGone,
+    /// A frame the broker closes the connection for (malformed, refused, SASL failure).
+    Protocol,
+    /// Pre-auth, per-frame read or idle deadline.
+    Timeout,
+}
+
+/// wave3 net: when a connection last read a frame or wrote a response.
+struct ActivityClock {
+    epoch: Instant,
+    last_ms: std::sync::atomic::AtomicU64,
+}
+
+impl ActivityClock {
+    fn new() -> Self {
+        ActivityClock {
+            epoch: Instant::now(),
+            last_ms: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn touch(&self) {
+        self.last_ms
+            .store(self.epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+
+    fn last(&self) -> Instant {
+        self.epoch + Duration::from_millis(self.last_ms.load(Ordering::Relaxed))
+    }
+}
+
+/// Hand one parsed request to the DB thread: a Fetch with `max_wait_ms > 0` goes to a
+/// long-poll task (while the per-connection cap allows), everything else straight to
+/// its lane. Returns false when the worker channel is gone.
+async fn dispatch_request(
+    request: KafkaRequest,
+    request_lanes: &crate::kafka::RequestLanes,
+    registry: &Arc<PendingFetchRegistry>,
+    long_poll_permits: &Arc<tokio::sync::Semaphore>,
+    enable_long_polling: bool,
+    poll_interval_ms: i32,
+) -> bool {
+    debug!("Request parsed successfully, dispatching to worker...");
+
+    // Check if this is a Fetch request that should use long polling
+    let should_long_poll = enable_long_polling
+        && matches!(
+            &request.body,
+            RequestBody::Fetch(fetch) if fetch.max_wait_ms > 0
+        );
+
+    // Acquire a long-poll slot; at the cap the fetch falls through
+    // to the immediate path below instead of spawning a task.
+    let long_poll_permit = if should_long_poll {
+        match long_poll_permits.clone().try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                debug!(
+                    "Per-connection long-poll cap ({}) reached; serving fetch immediately",
+                    MAX_LONG_POLLS_PER_CONNECTION
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let request = match (long_poll_permit, request) {
+        (
+            Some(permit),
+            KafkaRequest {
+                header:
+                    RequestHeader {
+                        correlation_id,
+                        client_id,
+                        api_version,
+                        ..
+                    },
+                body:
+                    RequestBody::Fetch(FetchRequestData {
+                        max_wait_ms,
+                        min_bytes,
+                        max_bytes,
+                        isolation_level,
+                        topic_data,
+                    }),
+                response_tx: original_response_tx,
+            },
+        ) => {
+            debug!(
+                "Fetch request with long polling: max_wait_ms={}, min_bytes={}, isolation_level={}",
+                max_wait_ms, min_bytes, isolation_level
+            );
+
+            let long_poll_registry = registry.clone();
+            let long_poll_request_tx = request_lanes.main.clone();
+
+            tokio::spawn(async move {
+                // Hold the per-connection slot for the task's lifetime.
+                let _long_poll_slot = permit;
+                if let Err(e) = handle_fetch_long_poll(
+                    correlation_id,
+                    client_id,
+                    api_version,
+                    max_wait_ms,
+                    min_bytes,
+                    max_bytes,
+                    isolation_level,
+                    topic_data,
+                    long_poll_request_tx,
+                    original_response_tx,
+                    long_poll_registry,
+                    poll_interval_ms,
+                )
+                .await
+                {
+                    warn!("Long poll handler error: {}", e);
+                }
+            });
+
+            // Don't send to worker directly - the long poll handler will do it
+            return true;
+        }
+        (_, request) => request,
+    };
+
+    // Normal path - send to worker directly (SEC-4: non-blocking handoff).
+    // DR-12: Heartbeat routes to the liveness lane, everything else to
+    // the main lane, so group liveness never queues behind heavy work.
+    let lane = request_lanes.route(&request).clone();
+    send_with_backpressure(&lane, request).await
 }
 
 /// Answer one SaslHandshake / SaslAuthenticate request. Returns false when the
@@ -1171,6 +1200,11 @@ async fn handle_sasl_frame(
         }
     };
     let lookup = auth.lookup.clone();
+    let throttle = auth.lookup_throttle.clone();
+    let lookup = ThrottledLookup {
+        inner: &lookup,
+        throttle: throttle.as_ref(),
+    };
     match auth.sasl.handle(request, &lookup).await {
         SaslOutcome::Reply(response) => {
             timer.observe(&response);
@@ -1499,6 +1533,7 @@ fn response_has_partition_error(response: &KafkaResponse) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
 
     #[test]
     fn test_try_admit_connection_enforces_cap_and_frees_on_drop() {
@@ -1556,9 +1591,6 @@ mod tests {
         );
     }
 
-    // RV-9: the aggregate frame-reservation budget admits reservations up to its
-    // ceiling, rejects a frame that would overshoot without mutating the budget,
-    // and restores capacity on release so completed frames free their reservation.
     #[test]
     fn test_long_poll_stops_when_client_is_gone() {
         // A long poll whose client has disconnected (response slot closed) must return
@@ -1602,6 +1634,28 @@ mod tests {
     }
 
     // ===== Network-thread logging =====
+
+    #[test]
+    fn test_network_thread_blocks_termination_signals() {
+        // wave3 net: SIGTERM / SIGHUP / SIGINT must never be handled on the network thread
+        // (or the tokio threads it spawns, which inherit the mask).
+        let (term, hup, int) = std::thread::spawn(|| {
+            assert!(!signal_blocked_on_this_thread(15));
+            block_signals_on_this_thread();
+            std::thread::spawn(|| {
+                (
+                    signal_blocked_on_this_thread(15),
+                    signal_blocked_on_this_thread(1),
+                    signal_blocked_on_this_thread(2),
+                )
+            })
+            .join()
+            .unwrap()
+        })
+        .join()
+        .unwrap();
+        assert!(term && hup && int);
+    }
 
     #[test]
     fn test_network_log_filter_defaults_to_warn() {
@@ -1904,6 +1958,8 @@ mod tests {
                 false,
                 1000,
                 auth,
+                NetworkLimits::default(),
+                tokio::time::Instant::now() + PRE_AUTH_TIMEOUT,
             )
             .await;
         });
@@ -1951,64 +2007,181 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_budgeted_codec_releases_charge_when_dropped_mid_frame() {
-        // A client that sends a length prefix and disconnects leaves the codec holding a
-        // charge for a frame that never completes. Dropping the codec (the connection
-        // closing) must return that charge to the global budget. This is the only test
-        // that touches FRAME_RESERVE_REMAINING, so the before/after reads are stable.
-        let before = FRAME_RESERVE_REMAINING.load(Ordering::Acquire);
-        let mut codec = BudgetedFrameCodec::new();
-        let mut src = BytesMut::from(&1_000_000u32.to_be_bytes()[..]);
-        assert!(codec.decode(&mut src).unwrap().is_none());
-        assert_eq!(
-            FRAME_RESERVE_REMAINING.load(Ordering::Acquire),
-            before - 1_000_000,
-            "the declared frame length is charged as soon as the prefix arrives"
+    // ===== wave3 net: connection lifecycle =====
+
+    /// Serve one connection on an ephemeral port with `limits`; requests go to the
+    /// returned receiver (the fake DB thread).
+    async fn serve_one(
+        limits: NetworkLimits,
+    ) -> (
+        std::net::SocketAddr,
+        crossbeam_channel::Receiver<KafkaRequest>,
+    ) {
+        let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        let (main_tx, main_rx) = crossbeam_channel::bounded::<KafkaRequest>(1000);
+        let (liveness_tx, _liveness_rx) = crossbeam_channel::bounded::<KafkaRequest>(16);
+        tokio::spawn(async move {
+            let (socket, _) = server.accept().await.unwrap();
+            let (cred_tx, _cred_rx) = crossbeam_channel::bounded(1);
+            let auth = ConnectionAuth::new(
+                "test".into(),
+                Arc::new(ListenerSecurity::plaintext("127.0.0.1:0")),
+                ConnectionPrincipal::anonymous(),
+                ChannelLookup(cred_tx),
+                false,
+            );
+            let _ = handle_connection(
+                socket,
+                crate::kafka::RequestLanes {
+                    main: main_tx,
+                    liveness: liveness_tx,
+                },
+                Arc::new(PendingFetchRegistry::new()),
+                false,
+                1000,
+                auth,
+                limits,
+                tokio::time::Instant::now() + PRE_AUTH_TIMEOUT,
+            )
+            .await;
+        });
+        (addr, main_rx)
+    }
+
+    async fn recv_request(rx: &crossbeam_channel::Receiver<KafkaRequest>) -> KafkaRequest {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(r) = rx.try_recv() {
+                return r;
+            }
+            assert!(Instant::now() < deadline, "no request reached the worker");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    /// Bytes until EOF (or `None` if the connection stays open for `within`).
+    async fn read_until_eof(
+        client: &mut tokio::net::TcpStream,
+        within: Duration,
+    ) -> Option<(Vec<u8>, Duration)> {
+        use tokio::io::AsyncReadExt;
+        let started = Instant::now();
+        let mut out = Vec::new();
+        let mut buf = [0u8; 1024];
+        loop {
+            let left = within.checked_sub(started.elapsed())?;
+            match tokio::time::timeout(left, client.read(&mut buf)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => return Some((out, started.elapsed())),
+                Ok(Ok(n)) => out.extend_from_slice(&buf[..n]),
+                Err(_) => return None,
+            }
+        }
+    }
+
+    fn api_versions_response(correlation_id: i32) -> KafkaResponse {
+        KafkaResponse::new(
+            correlation_id,
+            0,
+            ResponseBody::ApiVersions(kafka_protocol::messages::ApiVersionsResponse::default()),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_close_instruction_ends_the_connection_after_earlier_responses() {
+        // Item 2/4: the writer exiting (here on the acks=0 CloseConnection instruction)
+        // ends the connection; the earlier request's response is written first.
+        use tokio::io::AsyncWriteExt;
+        let (addr, rx) = serve_one(NetworkLimits::default()).await;
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut bytes = api_versions_v0_frame(1);
+        bytes.extend_from_slice(&api_versions_v0_frame(2));
+        client.write_all(&bytes).await.unwrap();
+        let first = recv_request(&rx).await;
+        let second = recv_request(&rx).await;
+        let _ = first.response_tx.send(api_versions_response(1));
+        let _ = second
+            .response_tx
+            .send(KafkaResponse::new(-1, -1, ResponseBody::CloseConnection));
+        // The worker drops a request once answered, closing its response slot.
+        drop((first, second));
+        let (bytes, _) = read_until_eof(&mut client, Duration::from_secs(3))
+            .await
+            .expect("the connection must close");
+        assert!(bytes.len() > 8, "the first response is delivered");
+        assert_eq!(i32::from_be_bytes(bytes[4..8].try_into().unwrap()), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_response_delivered_before_a_bad_frame_closes() {
+        // Item 6: the old code gave the writer 100 ms after a bad frame and then aborted
+        // it, so a response that took longer (a long poll, a slow commit) was lost.
+        use tokio::io::AsyncWriteExt;
+        let (addr, rx) = serve_one(NetworkLimits::default()).await;
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut bytes = api_versions_v0_frame(7);
+        bytes.extend_from_slice(&[0, 0, 0, 3, 0, 0x12, 0]); // truncated header
+        client.write_all(&bytes).await.unwrap();
+        let request = recv_request(&rx).await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let _ = request.response_tx.send(api_versions_response(7));
+        drop(request);
+        let (bytes, _) = read_until_eof(&mut client, Duration::from_secs(3))
+            .await
+            .expect("the connection must close");
+        assert!(
+            bytes.len() > 8,
+            "the response is delivered before the close"
         );
-        drop(codec);
-        assert_eq!(FRAME_RESERVE_REMAINING.load(Ordering::Acquire), before);
+        assert_eq!(i32::from_be_bytes(bytes[4..8].try_into().unwrap()), 7);
     }
 
-    #[test]
-    fn test_codec_enforces_the_pre_auth_frame_limit() {
-        // A SASL listener's codec refuses a frame declared larger than the pre-auth
-        // limit before reserving anything. (Raising the limit after authentication is
-        // covered by the auth E2E tests; decoding here would touch the global budget.)
-        let limit = Arc::new(AtomicUsize::new(PRE_AUTH_MAX_FRAME));
-        let mut codec = BudgetedFrameCodec::with_limit(limit);
-        let big = (PRE_AUTH_MAX_FRAME as u32 + 1).to_be_bytes();
-        let mut src = BytesMut::from(&big[..]);
-        assert!(codec.decode(&mut src).is_err());
-        // Nothing was charged to the global budget for the refused frame.
-        assert_eq!(codec.charged, 0);
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_idle_timeout_waits_for_outstanding_requests() {
+        use tokio::io::AsyncWriteExt;
+        let limits = NetworkLimits {
+            connections_max_idle: Duration::from_millis(300),
+            ..Default::default()
+        };
+        // Idle with nothing outstanding: closed after ~300 ms.
+        let (addr, _rx) = serve_one(limits).await;
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (_, after) = read_until_eof(&mut client, Duration::from_secs(3))
+            .await
+            .expect("an idle connection must close");
+        assert!(after >= Duration::from_millis(250), "{after:?}");
+
+        // A request outstanding for 800 ms keeps the connection open past the timeout.
+        let (addr, rx) = serve_one(limits).await;
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client.write_all(&api_versions_v0_frame(3)).await.unwrap();
+        let request = recv_request(&rx).await;
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let _ = request.response_tx.send(api_versions_response(3));
+        drop(request);
+        let (bytes, after) = read_until_eof(&mut client, Duration::from_secs(3))
+            .await
+            .expect("idle again after the response: closes");
+        assert_eq!(i32::from_be_bytes(bytes[4..8].try_into().unwrap()), 3);
+        // Counted from the response (its write is activity), not from the request.
+        assert!(after >= Duration::from_millis(250), "{after:?}");
     }
 
-    #[test]
-    fn test_frame_reserve_budget_admits_then_rejects_then_releases() {
-        let budget = AtomicUsize::new(100);
-
-        // A reservation that fits is admitted and deducted.
-        assert!(charge_frame_budget(&budget, 60));
-        assert_eq!(budget.load(Ordering::Relaxed), 40);
-
-        // A reservation larger than what remains is rejected and leaves the
-        // budget untouched (no partial charge).
-        assert!(!charge_frame_budget(&budget, 50));
-        assert_eq!(budget.load(Ordering::Relaxed), 40);
-
-        // A reservation that exactly fits the remainder is admitted, exhausting it.
-        assert!(charge_frame_budget(&budget, 40));
-        assert_eq!(budget.load(Ordering::Relaxed), 0);
-
-        // With the budget exhausted, even a single byte is refused.
-        assert!(!charge_frame_budget(&budget, 1));
-
-        // Releasing a completed frame's reservation restores capacity, which the
-        // next reservation can then draw on.
-        release_frame_budget(&budget, 60);
-        assert_eq!(budget.load(Ordering::Relaxed), 60);
-        assert!(charge_frame_budget(&budget, 60));
-        assert_eq!(budget.load(Ordering::Relaxed), 0);
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_partial_frame_read_deadline() {
+        // Item 1: a frame that never completes used to be waited for forever.
+        use tokio::io::AsyncWriteExt;
+        let limits = NetworkLimits {
+            request_read_timeout: Duration::from_millis(300),
+            ..Default::default()
+        };
+        let (addr, _rx) = serve_one(limits).await;
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client.write_all(&1000u32.to_be_bytes()).await.unwrap();
+        client.write_all(&[1, 2, 3]).await.unwrap();
+        let (_, after) = read_until_eof(&mut client, Duration::from_secs(3))
+            .await
+            .expect("a stalled frame must close the connection");
+        assert!(after >= Duration::from_millis(250), "{after:?}");
     }
 }

@@ -30,7 +30,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - TCP listener on port 9092 with full Kafka wire protocol parsing
 - ProduceRequest handling with database persistence (acks=0 and acks>=1 supported)
 - Idempotent producer support with InitProducerId API and sequence validation
-- Producer deduplication (DUPLICATE_SEQUENCE_NUMBER, OUT_OF_ORDER_SEQUENCE_NUMBER detection)
+- Producer deduplication, Kafka's model: a retry of one of the last 5 batches is acked with its original offset; anything else out of sequence is OUT_OF_ORDER_SEQUENCE_NUMBER
 - Transaction support (AddPartitionsToTxn, AddOffsetsToTxn, EndTxn, TxnOffsetCommit)
 - Read-committed isolation level for consumers (filters pending/aborted transactions)
 - FetchRequest with RecordBatch v2 encoding/decoding
@@ -50,8 +50,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Shadow mode for forwarding to external Kafka with SASL/SSL, per-topic config, replay support
 - Listener security protocols PLAINTEXT / SSL / SASL_PLAINTEXT / SASL_SSL, several listeners at once (`pg_kafka.additional_listeners`), each advertising its own address; SCRAM credentials in `kafka.sasl_credentials`, managed with `pg_kafka_create_user` & co.; per-connection principal recorded (authorization is not implemented)
 - Automated E2E tests with real Kafka client (rdkafka)
+- wave3 txn: read_committed (and read_uncommitted after aborted-row cleanup) consumers move past offsets they cannot see: a fetch with nothing visible below its readable end returns a control batch covering them (PROTOCOL_DEVIATIONS §7); fetched records are grouped into one RecordBatch per run of a producer's offsets; ListOffsets honours isolation_level (LSO) and MAX_TIMESTAMP (-3); OffsetFetch `require_stable` (KIP-447); transactional Produce only to partitions added with AddPartitionsToTxn (which no longer creates topics); InitProducerId timeout bound `pg_kafka.transaction_max_timeout_ms`
 
-**API Coverage:** 28 of ~50 standard Kafka APIs (56%)
+**API Coverage:** <!--gen:api-coverage-->28 of ~50 standard Kafka APIs (56%)<!--/gen--> (full table: README "Implemented APIs", generated from the `kafka_apis!` registry)
 **Test Status:** unit + property + E2E, all CI-gated. Counts live only in `docs/TEST_STRATEGY.md` ("Test Summary"); do not repeat them elsewhere.
 **Coverage Target:** 80%+ (testable code)
 
@@ -72,7 +73,7 @@ The devcontainer includes:
 - Rust toolchain with nightly channel
 - pgrx pre-initialized with pg14
 - Rust-analyzer and debugging extensions
-- Port forwarding for PostgreSQL (5432) and Kafka Protocol (9092)
+- Port forwarding for PostgreSQL (28814, pgrx's pg14) and Kafka Protocol (9092)
 
 ### Option 2: Manual Docker Setup
 
@@ -126,8 +127,9 @@ cargo pgrx test pg14
 cargo pgrx start pg14
 cd kafka_test && cargo run --release
 
-# Quick development iteration (kills postgres, rebuilds, restarts, recreates extension)
+# Quick development iteration: rebuild, install (.so + generated SQL), restart, keep the data
 ./scripts/restart.sh
+./scripts/restart.sh --fresh         # ...and DROP/CREATE EXTENSION: deletes all pg_kafka data
 
 # Test coverage
 cargo llvm-cov --lib --features pg14 --lcov --output-path lcov.info
@@ -143,7 +145,7 @@ cargo pgrx schema pg14               # Generate SQL schema files
 
 **Note on pgrx tests:** This extension uses `PGC_POSTMASTER` GUCs which require `shared_preload_libraries` BEFORE Postgres starts. `cargo pgrx test` creates the extension AFTER startup, causing "FATAL: cannot create PGC_POSTMASTER variables after startup". Most integration testing is done via the E2E suite in `kafka_test/`. See `docs/PGRX_TESTING_GUIDE.md` for the full testing strategy.
 
-**Note:** The project includes a [rust-toolchain.toml](rust-toolchain.toml) that specifies Rust nightly, which is required for the `home` crate dependency that uses edition2024 features (needed by pgrx 0.16.1). The default feature is `pg14` as specified in [Cargo.toml](Cargo.toml); features `pg13` through `pg18` exist, and CI additionally checks and unit-tests `pg15`, `pg16` and `pg17`.
+**Note:** The project includes a [rust-toolchain.toml](rust-toolchain.toml) that specifies Rust nightly, which is required for the `home` crate dependency that uses edition2024 features (needed by pgrx 0.16.1). The toolchain file pins a dated nightly (`nightly-2026-11-08`); bump it deliberately and re-run clippy on both crates. The default feature is `pg14` as specified in [Cargo.toml](Cargo.toml); features `pg13` through `pg18` exist. CI (`.github/workflows/ci.yml`, job `e2e`) builds, lints and unit-tests every major from 14 to 18, installs the extension into that PostgreSQL (from apt.postgresql.org) and runs the functional E2E suite and `scripts/check-upgrade.sh` against it (`scripts/ci-pg.sh` brings the cluster up the same way locally); pg14 also runs the shadow and performance categories. PG18-specific code is `#[cfg(feature = "pg18")]`-scoped. `pg13` is built by no CI job (PostgreSQL 13 is end-of-life).
 
 ## Code Coverage Requirements
 
@@ -157,18 +159,23 @@ cargo pgrx schema pg14               # Generate SQL schema files
 - Files in `codecov.yml` ignore list are excluded (SPI-dependent code tested via E2E)
 
 **QA-1 rule — SPI/async change ⇒ E2E test (machine-enforced):**
-The SPI/async files in the `codecov.yml` `ignore:` list (`worker.rs`, `storage/postgres.rs`,
-`shadow/store.rs`, `listener.rs`) can't be seen by unit coverage, so the coverage gate
-can't protect them. The mitigation is mandatory: **every behavioural change to one of
-those files must ship a fail-before / pass-after `kafka_test/` regression test.** This is
-enforced by the `spi-e2e-guard` CI job (`.github/scripts/require-e2e-for-spi.sh`), which
-fails a PR that touches one of those files without also changing a Rust file under
-`kafka_test/src/`. The guard derives its file list from every `src/` entry in that
-`ignore:` list, so it also fires on `src/lib.rs` and `src/kafka/handler_context.rs`. For a genuinely test-neutral edit (comments/docs/renames), add the
-`no-e2e-needed` label to waive it. Do **not** add a file to the ignore list to route
-untested logic around the patch gate — prefer extracting the pure logic into a testable
-free function (see `validate_sequence` in `storage/mod.rs` and `build_producer_settings`
-in `shadow/producer.rs` for the pattern).
+Code that needs a live Postgres (SPI) or the tokio listener can't be seen by unit coverage,
+so the coverage gate can't protect it. `codecov.yml` lists these files twice over: its
+`ignore:` list holds the files that are SPI/async/generated through and through (`lib.rs`,
+`worker.rs`, `storage/postgres.rs`, `storage/postgres/roles.rs`, `shadow/store.rs`,
+`auth/credentials.rs`, `auth/users.rs`, `listener.rs`), and its `# qa1-guard:` lines hold the
+files that mix SPI calls with unit-tested logic and so stay in the coverage figures
+(`metrics.rs`, `shadow/outbox.rs`, `shadow/primary.rs`). The mitigation is mandatory:
+**every behavioural change to a file on either list must ship a fail-before / pass-after
+`kafka_test/` regression test.** The `spi-e2e-guard` CI job
+(`.github/scripts/require-e2e-for-spi.sh`, which reads both lists) fails a PR that touches
+one of them without also changing a Rust file under `kafka_test/src/`, and
+`.github/scripts/check-coverage-policy.sh` (lint job) fails when a `src/` file that calls SPI
+(`Spi::*`, `BackgroundWorker::*`, `#[pg_extern]`) is on neither list. For a genuinely
+test-neutral edit (comments/docs/renames), add the `no-e2e-needed` label to waive the guard.
+Do **not** add a file to the ignore list to route untested logic around the patch gate —
+prefer extracting the pure logic into a testable free function (see `validate_sequence` in
+`storage/mod.rs` and `build_producer_settings` in `shadow/producer.rs` for the pattern).
 
 **Single-DB-thread invariant (why the above is safe):** all handlers, the `Arc<RwLock>`
 coordinator, and the `ShadowStore` run on the *one* background-worker DB thread; only the
@@ -203,8 +210,10 @@ src/
 │   │   ├── sasl.rs     # SaslHandshake/SaslAuthenticate schema (answered on the network thread)
 │   │   └── tests.rs    # Registry-wide tests (every advertised version encodes, echoes, header versions)
 │   ├── listener.rs     # TCP listener, tokio runtime, connection handling
+│   ├── conn_limits.rs  # (wave3 net) per-listener / per-IP connection caps, SASL lookup rate limit
 │   ├── protocol/       # Binary protocol parsing/encoding (uses kafka-protocol crate)
-│   │   ├── mod.rs      # Framing and module exports
+│   │   ├── mod.rs      # Module exports
+│   │   ├── framing.rs  # (wave3 net) FrameCodec: length prefix, frame budget, per-frame read clock
 │   │   ├── decoding.rs # Header parsing; the body goes to the API registry
 │   │   ├── encoding.rs # Response encoding (header version from the API's response type)
 │   │   └── recordbatch.rs  # RecordBatch v2 / legacy MessageSet parsing
@@ -217,6 +226,7 @@ src/
 │   ├── notifications.rs    # DB-thread/network-thread notifications for long polling
 │   ├── pending_fetches.rs  # Registry of FetchRequests waiting for data (long polling)
 │   ├── coordinator.rs  # Consumer group coordinator (Arc<RwLock> shared state)
+│   ├── limits.rs       # Caps on client-controlled state (partitions per topic, group size, group count GUCs)
 │   ├── auth/           # Listener security (TLS, SASL), see docs/AUTHENTICATION.md
 │   │   ├── mod.rs      # ConnectionPrincipal, re-exports
 │   │   ├── settings.rs # Security protocols, listener specs, the listener-security GUCs
@@ -254,6 +264,8 @@ src/
 │   │   ├── config.rs   # ShadowConfig, per-topic TopicShadowConfig, modes
 │   │   ├── store.rs    # ShadowStore: store wrapper writing the durable outbox
 │   │   ├── forwarder.rs, routing.rs  # Forward decision + percentage routing hash
+│   │   ├── forwarder_task.rs # Network-thread forwarder: pipelined, ordered, sync-response holds
+│   │   ├── outbox.rs   # ShadowDb: the outbox SQL (claim, batched acks) + in-memory fake
 │   │   ├── producer.rs # rdkafka FutureProducer wrapper (SASL/SSL settings)
 │   │   ├── inflight.rs # In-flight forward tracking for the outbox
 │   │   ├── primary.rs  # Primary detection (only the primary forwards)
@@ -412,6 +424,7 @@ In-memory state management (`src/kafka/coordinator.rs`):
 - Automatic rebalancing on member leave or session timeout
 - Tracks: generation IDs, member registry, partition assignments
 - JoinGroup responses are held until the join phase completes (every known member rejoined, or the rest left / timed out), as in Kafka; the generation moves when the join completes. `GroupCoordinator::join_group` takes a `JoinResponder` it calls exactly once (immediately or later, from another member's JoinGroup, a LeaveGroup or the ~1 s `check_and_remove_timed_out_members` sweep). `JoinGroupApi::handle` answers on the client's own sender (`KafkaApi::DEFERRED_REPLY`, so `swap_response_tx` leaves it in place for JoinGroup and SyncGroup), wrapped in `handlers::JoinGroupReply`, which answers UNKNOWN_SERVER_ERROR if dropped unsent. A follower's SyncGroup is held the same way (`handlers::SyncGroupReply`, `pending_syncs`) until the leader's SyncGroup delivers the assignment, so a follower that syncs first waits instead of being told REBALANCE_IN_PROGRESS
+- wave3 groups: Kafka 3.7's JoinGroup checks (INCONSISTENT_GROUP_PROTOCOL; UNKNOWN_MEMBER_ID for an unknown non-empty member id; protocol chosen by member vote) and OffsetCommit rules (`validate_offset_commit`: generation -1 only for an unknown/Empty group). Groups with committed offsets but no in-memory state are Empty "consumer" groups for ListGroups/DescribeGroups (`OffsetStore::list_offset_groups`/`group_has_offsets`). Group size and count are capped (`kafka::limits`, applied per JoinGroup via `GroupCoordinator::set_limits`)
 
 ### Storage Schema
 
@@ -524,7 +537,8 @@ CREATE TABLE kafka.txn_pending_offsets (
 );
 
 -- Phase 11 (Shadow Mode): kafka.shadow_config, kafka.shadow_tracking (durable outbox),
--- kafka.shadow_metrics, view kafka.shadow_status, function kafka.replay_shadow_messages().
+-- kafka.shadow_metrics, views kafka.shadow_status and kafka.shadow_partition_status,
+-- function kafka.replay_shadow_messages().
 -- Monitoring: view kafka.metrics (row-count snapshot); views kafka.api_metrics (per-API
 -- requests/errors/latency), kafka.broker_metrics (connections, request-queue depth) and
 -- kafka.consumer_lag. The first two read UNLOGGED tables the worker upserts at most once per
@@ -541,6 +555,8 @@ CREATE TABLE kafka.txn_pending_offsets (
 **Idempotent Producer Tables:**
 - `producer_ids`: Tracks allocated producer IDs with epochs (fencing mechanism)
 - `producer_sequences`: Per-partition sequence tracking for deduplication
+- `producer_batches` (wave3 txn): the last 5 batches (sequence range, base offset) per producer and partition, for duplicate detection; rows follow their `producer_sequences` row (ON DELETE CASCADE), so every epoch change clears them
+- `txn_partitions` (wave3 txn): partitions added to the open transaction of each transactional id (AddPartitionsToTxn); cleared when the next transaction begins and on InitProducerId
 
 **Transaction Tables (Phase 10):**
 - `transactions`: Tracks transaction state by transactional_id
@@ -579,6 +595,9 @@ leaves), and confine a ctid-based statement to one leaf (`tableoid`), since ctid
 
 ## Configuration
 
+The complete, generated reference (type, default, range, context of every GUC) is
+`docs/CONFIGURATION.md`; the block below is an annotated overview.
+
 ```sql
 -- In postgresql.conf:
 shared_preload_libraries = 'pg_kafka'
@@ -601,6 +620,13 @@ pg_kafka.run_as_role = 'pgkafka_worker' -- Role the worker switches to once the 
 pg_kafka.message_retention_hours = 0 -- Retention sweep for kafka.messages (0 = keep forever; 0-87600; DR-2)
 pg_kafka.message_partition_minutes = 1440 -- Width of one time partition of kafka.messages (5-43200; new leaves only; ADR-001)
 pg_kafka.config_reload_interval_ms = 30000  -- How often the worker reloads GUCs + shadow config (100-300000ms)
+-- wave3 groups: resource bounds (src/kafka/limits.rs)
+pg_kafka.max_partitions_per_topic = 10000 -- Partition cap for CreateTopics/CreatePartitions/auto-create (1-100000; INVALID_PARTITIONS above;
+                                          -- kafka.topics also has CHECK (partitions BETWEEN 1 AND 100000))
+pg_kafka.group_max_size = 1000            -- Members per consumer group (1-100000; GROUP_MAX_SIZE_REACHED above)
+pg_kafka.max_consumer_groups = 100000     -- Groups held in the in-memory coordinator (1-1000000; the least recently active
+                                          -- Empty group is evicted when full, else COORDINATOR_NOT_AVAILABLE)
+pg_kafka.transaction_max_timeout_ms = 900000 -- wave3 txn: largest InitProducerId transaction timeout (Kafka's transaction.max.timeout.ms; larger or <= 0 = INVALID_TRANSACTION_TIMEOUT)
 
 -- Test-only fault injection (Sighup, default 0 = off; never set in production)
 pg_kafka.test_forward_ack_delay_ms = 0   -- Delay before the shadow forwarder acks (0-30000ms)
@@ -614,6 +640,11 @@ pg_kafka.ssl_cert_file = ''                -- PEM chain (required by SSL / SASL_
 pg_kafka.ssl_key_file = ''                 -- PEM private key
 pg_kafka.ssl_ca_file = ''                  -- client CA bundle; set = mutual TLS on TLS listeners
 pg_kafka.sasl_enabled_mechanisms = 'PLAIN,SCRAM-SHA-256,SCRAM-SHA-512'
+-- wave3 net: network edge limits (Sighup, read when the worker starts, like the above)
+pg_kafka.max_connections = 1024            -- concurrent connections per listener (each listener its own cap)
+pg_kafka.max_connections_per_ip = 256      -- concurrent connections per client IP, across listeners
+pg_kafka.connections_max_idle_ms = 600000  -- close connections idle this long (Kafka's connections.max.idle.ms)
+pg_kafka.request_read_timeout_ms = 60000   -- a request frame must arrive within this long of its first byte
 
 -- See "Shadow Mode Configuration" section below for shadow mode settings
 
@@ -626,26 +657,28 @@ pg_kafka.worker_lock_timeout_ms = 5000 -- lock_timeout of the worker's transacti
 Shadow mode allows pg_kafka to forward messages to an external Kafka cluster while still storing them locally. This enables dual-write patterns for migration, validation, or hybrid architectures.
 
 ```sql
--- Enable shadow mode globally (Sighup)
+-- Every shadow GUC except the license key is Sighup (ALTER SYSTEM + pg_reload_conf();
+-- a session SET is refused). A change to any producer setting rebuilds the forwarder's producer.
 pg_kafka.shadow_mode_enabled = true                    -- Default: false
 
 -- External Kafka connection
-pg_kafka.shadow_bootstrap_servers = 'kafka1:9092,kafka2:9092'  -- Required (Sighup)
-pg_kafka.shadow_security_protocol = 'SASL_SSL'         -- Default: SASL_SSL (use PLAINTEXT for local/no-auth) (Sighup)
-pg_kafka.shadow_sasl_mechanism = 'SCRAM-SHA-256'       -- Default: PLAIN (restart)
-pg_kafka.shadow_sasl_username = 'your_username'        -- Default: empty (restart; superuser-only, hidden from SHOW ALL)
-pg_kafka.shadow_sasl_password = 'your_password'        -- Default: empty (restart; superuser-only, hidden from SHOW ALL)
-pg_kafka.shadow_ssl_ca_location = '/path/to/ca-cert'   -- Default: empty (restart)
+pg_kafka.shadow_bootstrap_servers = 'kafka1:9092,kafka2:9092'  -- Required
+pg_kafka.shadow_security_protocol = 'SASL_SSL'         -- Default: SASL_SSL (use PLAINTEXT for local/no-auth)
+pg_kafka.shadow_sasl_mechanism = 'SCRAM-SHA-256'       -- Default: PLAIN
+pg_kafka.shadow_sasl_username = 'your_username'        -- Default: empty (superuser-only, hidden from SHOW ALL)
+pg_kafka.shadow_sasl_password = 'your_password'        -- Default: empty (superuser-only, hidden from SHOW ALL)
+pg_kafka.shadow_ssl_ca_location = '/path/to/ca-cert'   -- Default: empty
 
--- Batching and retry configuration (Suset)
-pg_kafka.shadow_batch_size = 1000                      -- Messages per batch (default 1000; 1-100000)
-pg_kafka.shadow_linger_ms = 10                         -- Batch delay (default 10; 0-60000ms)
-pg_kafka.shadow_retry_backoff_ms = 100                 -- Retry delay (default 100; 10-60000ms)
-pg_kafka.shadow_max_retries = 3                        -- Max retries (default 3; 0-100)
+-- Batching and retry configuration
+pg_kafka.shadow_batch_size = 1000                      -- Records per outbox claim and librdkafka batch.num.messages (1-100000)
+pg_kafka.shadow_linger_ms = 10                         -- librdkafka linger.ms (0-60000)
+pg_kafka.shadow_retry_backoff_ms = 100                 -- librdkafka retry.backoff.ms + outbox re-attempt backoff base (doubles, cap 30 s; 10-60000)
+pg_kafka.shadow_max_retries = 10                       -- Failed delivery attempts before a row is dead-lettered (0-100)
+pg_kafka.shadow_sync_timeout_ms = 5000                 -- How long a sync-mode produce response waits for the external ack (0 = not held; 0-120000)
 pg_kafka.shadow_external_primary_strict = false        -- Keep external_only topics read-suppressed even after a dead-lettered forward (default false)
 
--- Observability (Suset)
-pg_kafka.shadow_metrics_enabled = true                 -- Enable metrics collection (kafka.shadow_metrics)
+-- Observability
+pg_kafka.shadow_metrics_enabled = true                 -- Write kafka.shadow_metrics (forwarded/failed/skipped)
 
 -- License (restart; superuser-only, hidden from SHOW ALL)
 pg_kafka.shadow_license_key = 'eval'                   -- 'sponsor_id:token' or 'eval'
@@ -653,7 +686,7 @@ pg_kafka.shadow_license_key = 'eval'                   -- 'sponsor_id:token' or 
 
 **Per-Topic Shadow Configuration:**
 
-Shadow mode is configured per-topic via the `kafka.shadow_config` table, keyed by `topic_id`. Columns: `mode` (`'local_only'` | `'shadow'`), `forward_percentage` (0-100), `external_topic_name`, `sync_mode` (`'async'` | `'sync'`, default `'sync'`; there is no global default GUC; `sync` forwards right after the local commit and holds the produce response until the external ack or 5 s), `write_mode` (`'dual_write'` | `'external_only'`). The worker picks up changes on its next config reload (`pg_kafka.config_reload_interval_ms`, or immediately after `pg_reload_conf()`).
+Shadow mode is configured per-topic via the `kafka.shadow_config` table, keyed by `topic_id`. Columns: `mode` (`'local_only'` | `'shadow'`), `forward_percentage` (0-100), `external_topic_name`, `sync_mode` (`'async'` | `'sync'`, default `'sync'`; there is no global default GUC; `sync` holds the produce response, after the local commit, until the record is delivered externally or `pg_kafka.shadow_sync_timeout_ms` passes; the worker never waits), `write_mode` (`'dual_write'` | `'external_only'`). The worker picks up changes on its next config reload (`pg_kafka.config_reload_interval_ms`, or immediately after `pg_reload_conf()`).
 
 ```sql
 -- Forward specific topics with different settings
@@ -668,8 +701,9 @@ SELECT pg_reload_conf();
 -- Only committed/non-transactional rows are replayed. Returns the number of rows queued.
 SELECT kafka.replay_shadow_messages(p_topic_id => 1, p_from_offset => 0, p_to_offset => NULL);
 
--- Monitoring
+-- Monitoring (lag = records still to forward; per partition in kafka.shadow_partition_status)
 SELECT * FROM kafka.shadow_status;
+SELECT * FROM kafka.shadow_partition_status;
 ```
 
 **Use Cases:**
@@ -764,7 +798,7 @@ Per-category counts are in `docs/TEST_STRATEGY.md`; `cargo run --release -- --li
 | **compression** | gzip, snappy, lz4, zstd, roundtrip, edge cases |
 | **idempotent** | InitProducerId, deduplication, epoch, multi-partition |
 | **transaction** | Transactions, isolation levels, EOS, fencing, atomicity, timeouts |
-| **shadow** | External forwarding, SASL/SSL, topic mapping, replay, dial-up |
+| **shadow** | External forwarding, SASL/SSL, topic mapping, replay, dial-up, throughput floor, headers/timestamps, order across a retried failure, sync-stall bound, GUC reload |
 | **long_poll** | Timeout behavior, immediate return, producer wakeup, precision, per-connection task cap |
 | **error_paths** | Invalid partitions, unknown topics, coordinator errors, protocol/transaction/group regressions |
 | **edge_cases** | Empty topics, large messages, boundary values, retention sweep |
@@ -774,7 +808,11 @@ Per-category counts are in `docs/TEST_STRATEGY.md`; `cargo run --release -- --li
 | **performance** | Throughput baselines, latency percentiles, scaling |
 | **metadata** | Metadata refresh, all topics, nonexistent topic |
 | **protocol** | ApiVersions negotiation, correlation ID, unknown API, pipelining, response ordering |
-| **auth** | SASL_PLAINTEXT (PLAIN, SCRAM-SHA-256/512), SSL (+ untrusted CA, mutual TLS), SASL_SSL, wrong passwords, pre-auth gating, user SQL. Sequential: generates certs with the `openssl` CLI, adds listeners 9093-9095 via ALTER SYSTEM and restarts the worker; the last test resets them. Needs the DB host's filesystem and superuser |
+| **auth** | SASL_PLAINTEXT (PLAIN, SCRAM-SHA-256/512), SSL (+ untrusted CA, mutual TLS), SASL_SSL, wrong passwords, pre-auth gating, user SQL. Sequential: generates certs with the `openssl` CLI, adds listeners 19093-19095 via ALTER SYSTEM and restarts the worker; the last test resets them. Needs the DB host's filesystem and superuser |
+| **w3_groups** | Wave 3 groups stream: partition caps (raw 2e9 CreateTopics, corrupt stored count), CreateTopics validation, JoinGroup protocol rules, OffsetCommit rules, offsets-only groups after a worker restart, a consumer with no common assignor |
+| **w3_txn** | Wave 3 txn: consumers reach the end past aborted/cleaned-up/DeleteRecords holes and stop at an open transaction's LSO; ListOffsets isolation/-3/partition checks; OffsetFetch require_stable; Kafka's idempotent model (5-batch cache, original offsets, epochs, wrap, survives restarts); transaction validation; fetch batching |
+| **w3_net** | (wave3 net) Hostile clients at the network edge: frame-budget lockout, >100 MB response, TCP_NODELAY, acks=0 close / invalid acks, responses before close, per-IP and per-listener caps, idle and frame-read deadlines, pre-auth deadline from accept, SASL lookup rate limit, unknown-user SCRAM fake. Sequential; the `limits` tests add listeners 19096-19098 via ALTER SYSTEM, connect from 127.0.0.x source addresses and need `openssl` |
+| **w3_shadow** | Shadow checks without an external Kafka (functional suite): per-partition lag view |
 | **w3_worker** | wave3 worker: DROP/CREATE/ALTER EXTENSION under load, old 0.0.0 schema, SIGTERM in a lock wait, worker lock_timeout, maintenance lock races, commit failure, heartbeats inside batches, TransactionEnded on fencing/timeout. Sequential; needs superuser and the DB host's filesystem |
 
 ### Running E2E Tests with CLI Options

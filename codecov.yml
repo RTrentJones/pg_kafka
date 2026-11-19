@@ -51,24 +51,36 @@ coverage:
 #     timestamps, CONF-7 ListOffsets, SEC-3/4 admission/backpressure). A reviewer should reject an
 #     ignored-file change that lands without one.
 #   * Do NOT add a file here to route untested logic around the patch gate. The list below is for
-#     genuinely SPI/async/generated code only; new entries need a one-line justification.
+#     genuinely SPI/async/generated code only; new entries need a one-line justification. A file
+#     that mixes SPI calls with unit-testable logic goes on the `# qa1-guard:` list instead.
+#   * Mechanically checked: every src/ file that calls SPI (Spi::*, BackgroundWorker::*,
+#     #[pg_extern]) must be on one of the two lists (.github/scripts/check-coverage-policy.sh).
 ignore:
   # pgrx generated/macro code
   - "src/bin/**"                      # pgrx embedding binary
   - "**/*_embed.rs"                   # pgrx generated files
-  - "src/lib.rs"                      # _PG_init hook (pgrx macros)
+  - "src/lib.rs"                      # _PG_init hook, #[pg_extern] SQL functions (pgrx macros, SPI)
 
   # SPI-dependent code (requires PostgreSQL, E2E tested)
   - "src/worker.rs"                   # Main BGWorker loop (SPI-dependent)
   - "src/kafka/storage/postgres.rs"   # PostgresStore (SPI-dependent)
+  - "src/kafka/storage/postgres/roles.rs"  # Forwards every storage role to postgres.rs (SPI)
   - "src/kafka/shadow/store.rs"       # ShadowStore (SPI-dependent, wraps PostgresStore)
+  - "src/kafka/auth/credentials.rs"   # DB-thread SELECT on kafka.sasl_credentials (SPI)
+  - "src/kafka/auth/users.rs"         # #[pg_extern] SASL user-management functions (SPI)
 
   # Async runtime code (E2E tested)
   - "src/kafka/listener.rs"           # Async TCP listener (tokio runtime)
 
-  # Test infrastructure (MockStore impl is ~260 lines of stub methods)
-  # The actual HandlerContext code is tested, but MockStore drags down metrics
-  - "src/kafka/handler_context.rs"    # Contains MockStore impl for handler tests
+# QA-1 guard without an ignore entry. These files mix SPI calls with logic that unit tests do
+# reach, so they stay in the coverage figures, but their SPI part is invisible to unit tests,
+# so the spi-e2e-guard treats them like the ignored files: a change to one needs a kafka_test
+# change. .github/scripts/require-e2e-for-spi.sh reads both lists (the `- "src/..."` entries
+# above and the `# qa1-guard:` lines below); .github/scripts/check-coverage-policy.sh fails CI
+# when a src/ file that calls SPI is on neither list, or a listed file does not exist.
+# qa1-guard: "src/kafka/metrics.rs"         # write_batch: the SPI flush of the request metrics
+# qa1-guard: "src/kafka/shadow/outbox.rs"   # SpiShadowDb (the rest is tested with a fake DB)
+# qa1-guard: "src/kafka/shadow/primary.rs"  # is_primary(): SELECT NOT pg_is_in_recovery()
 
 # Comment configuration for PR reviews
 comment:

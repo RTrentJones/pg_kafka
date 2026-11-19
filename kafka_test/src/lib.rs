@@ -249,3 +249,13 @@ pub use part::{
     test_time_partition_retention_drops_whole_partitions,
     test_time_partition_retention_waits_for_pending_transaction,
 };
+
+// wave3 groups
+pub mod w3_groups;
+// wave3 txn
+pub mod w3_txn;
+// wave3 net: hostile clients at the network edge (kafka_test/src/w3_net).
+pub mod w3_net;
+// wave3 shadow
+pub mod w3_shadow;
+// end wave3 shadow

@@ -121,6 +121,8 @@ mod tests {
             value: Some(b"value".to_vec()),
             timestamp: 1234567890,
             headers: vec![],
+            producer_id: None,
+            producer_epoch: None,
         };
 
         assert_eq!(msg.partition_offset, 100);
@@ -137,6 +139,8 @@ mod tests {
             value: None,
             timestamp: 0,
             headers: vec![],
+            producer_id: None,
+            producer_epoch: None,
         };
 
         assert!(msg.key.is_none());
@@ -279,6 +283,8 @@ mod tests {
                         value: Some(b"value".to_vec()),
                         timestamp: 12345,
                         headers: vec![],
+                        producer_id: None,
+                        producer_epoch: None,
                     },
                     FetchedMessage {
                         partition_offset: 1,
@@ -286,6 +292,8 @@ mod tests {
                         value: Some(b"value2".to_vec()),
                         timestamp: 12346,
                         headers: vec![],
+                        producer_id: None,
+                        producer_epoch: None,
                     },
                 ])
             });
@@ -865,6 +873,8 @@ mod tests {
                     value: Some(b"committed-value".to_vec()),
                     timestamp: 12345,
                     headers: vec![],
+                    producer_id: None,
+                    producer_epoch: None,
                 }])
             });
 
@@ -889,112 +899,146 @@ mod tests {
         assert_eq!(result, 50);
     }
 
-    // ========== Sequence Validation Tests (Idempotent Producer) ==========
+    // ========== Sequence Validation Tests (Idempotent Producer, wave 3: Kafka's model) ==========
 
-    use crate::kafka::storage::{validate_sequence, SequenceValidation};
+    use crate::kafka::storage::{
+        batch_last_sequence, validate_sequence, CachedBatch, SequenceValidation,
+    };
+
+    fn proceed(last: i32) -> SequenceValidation {
+        SequenceValidation::Proceed {
+            new_last_sequence: last,
+            new_epoch: false,
+        }
+    }
+
+    fn ooo(expected: i32) -> SequenceValidation {
+        SequenceValidation::OutOfOrder {
+            expected_sequence: expected,
+        }
+    }
+
+    /// Two remembered batches: sequences 0..=4 at offset 10 and 5..=7 at offset 20.
+    fn cache() -> Vec<CachedBatch> {
+        vec![
+            CachedBatch {
+                first_sequence: 0,
+                last_sequence: 4,
+                base_offset: 10,
+            },
+            CachedBatch {
+                first_sequence: 5,
+                last_sequence: 7,
+                base_offset: 20,
+            },
+        ]
+    }
 
     #[test]
     fn test_validate_sequence_first_batch() {
-        // No prior state (last_sequence = -1): batch starting at 0 proceeds
-        assert_eq!(
-            validate_sequence(-1, 0, 5),
-            SequenceValidation::Proceed {
-                new_last_sequence: 4
-            }
-        );
+        // No state on the partition: a batch starting at 0 proceeds.
+        assert_eq!(validate_sequence(0, None, &[], 0, 0, 5), proceed(4));
+        // ... and any other first sequence is out of order (stricter than Kafka).
+        assert_eq!(validate_sequence(0, None, &[], 0, 5, 1), ooo(0));
     }
 
     #[test]
     fn test_validate_sequence_next_batch_proceeds() {
+        assert_eq!(validate_sequence(0, Some(4), &[], 0, 5, 3), proceed(7));
+    }
+
+    #[test]
+    fn test_validate_sequence_retry_of_a_cached_batch_keeps_its_offset() {
+        // Wave 3: a retry of ANY of the remembered batches (not only the last one) is a
+        // duplicate and carries the original base offset (was: no offset, -1).
         assert_eq!(
-            validate_sequence(4, 5, 3),
-            SequenceValidation::Proceed {
-                new_last_sequence: 7
-            }
+            validate_sequence(0, Some(7), &cache(), 0, 5, 3),
+            SequenceValidation::Duplicate { base_offset: 20 }
+        );
+        assert_eq!(
+            validate_sequence(0, Some(7), &cache(), 0, 0, 5),
+            SequenceValidation::Duplicate { base_offset: 10 }
         );
     }
 
     #[test]
-    fn test_validate_sequence_exact_replay_is_duplicate() {
-        // Batch 5..=7 already persisted (last_sequence = 7): exact replay
-        assert_eq!(validate_sequence(7, 5, 3), SequenceValidation::Duplicate);
-        // Older fully-persisted batch is also a duplicate
-        assert_eq!(validate_sequence(7, 0, 5), SequenceValidation::Duplicate);
-        // Single-record replay at the boundary
-        assert_eq!(validate_sequence(7, 7, 1), SequenceValidation::Duplicate);
+    fn test_validate_sequence_never_sent_range_is_out_of_order() {
+        // Wave 3: a range at or below the last sequence that is NOT a remembered batch
+        // was never appended. It used to be acked as a duplicate and dropped.
+        assert_eq!(validate_sequence(0, Some(7), &cache(), 0, 1, 1), ooo(8));
+        assert_eq!(validate_sequence(0, Some(7), &cache(), 0, 7, 1), ooo(8));
+        // A range older than the cache is out of order too (Kafka: same).
+        assert_eq!(validate_sequence(0, Some(7), &[], 0, 0, 5), ooo(8));
     }
 
     #[test]
     fn test_validate_sequence_gap_is_out_of_order() {
-        assert_eq!(
-            validate_sequence(7, 10, 3),
-            SequenceValidation::OutOfOrder {
-                expected_sequence: 8
-            }
-        );
+        assert_eq!(validate_sequence(0, Some(7), &cache(), 0, 10, 3), ooo(8));
     }
 
     #[test]
     fn test_validate_sequence_partial_overlap_is_out_of_order() {
         // last_sequence = 7, batch covers 5..=12: records 8..=12 were never
         // persisted, so treating this as a duplicate would silently lose them
-        assert_eq!(
-            validate_sequence(7, 5, 8),
-            SequenceValidation::OutOfOrder {
-                expected_sequence: 8
-            }
-        );
-        // Overlap by one (batch 7..=8 against last_sequence = 7)
-        assert_eq!(
-            validate_sequence(7, 7, 2),
-            SequenceValidation::OutOfOrder {
-                expected_sequence: 8
-            }
-        );
+        assert_eq!(validate_sequence(0, Some(7), &cache(), 0, 5, 8), ooo(8));
+        assert_eq!(validate_sequence(0, Some(7), &cache(), 0, 7, 2), ooo(8));
     }
 
     #[test]
     fn test_validate_sequence_negative_base_is_rejected() {
         // RV-12: a negative base_sequence must be rejected (out of order), not
-        // misclassified as a Duplicate and silently dropped. On a fresh partition
-        // (last_sequence = -1), base_sequence = -1 would otherwise hit the Duplicate
-        // branch (batch_last -1 <= last_sequence -1) and lose the records + ack ok.
-        assert_eq!(
-            validate_sequence(-1, -1, 1),
-            SequenceValidation::OutOfOrder {
-                expected_sequence: 0
-            }
-        );
-        assert_eq!(
-            validate_sequence(7, -5, 3),
-            SequenceValidation::OutOfOrder {
-                expected_sequence: 8
-            }
-        );
+        // misclassified as a Duplicate and silently dropped.
+        assert_eq!(validate_sequence(0, None, &[], 0, -1, 1), ooo(0));
+        assert_eq!(validate_sequence(0, Some(7), &cache(), 0, -5, 3), ooo(8));
         // A negative record_count is likewise rejected.
-        assert_eq!(
-            validate_sequence(7, 8, -1),
-            SequenceValidation::OutOfOrder {
-                expected_sequence: 8
-            }
-        );
+        assert_eq!(validate_sequence(0, Some(7), &cache(), 0, 8, -1), ooo(8));
     }
 
     #[test]
-    fn test_validate_sequence_no_overflow_near_i32_max() {
-        // Batch base behind expected near i32::MAX must not overflow when
-        // computing the batch's last sequence (i64 arithmetic internally)
+    fn test_validate_sequence_epochs() {
+        // A lower epoch is stale (INVALID_PRODUCER_EPOCH), whatever the sequence.
         assert_eq!(
-            validate_sequence(i32::MAX, i32::MAX, 1),
-            SequenceValidation::Duplicate
+            validate_sequence(3, Some(7), &cache(), 2, 8, 1),
+            SequenceValidation::StaleEpoch { current_epoch: 3 }
         );
-        // Advancing past i32::MAX is refused (wraparound unsupported), not
-        // silently wrapped
+        // A higher (client-bumped) epoch must restart at 0 ...
         assert_eq!(
-            validate_sequence(i32::MAX - 1, i32::MAX, 2),
-            SequenceValidation::OutOfOrder {
-                expected_sequence: i32::MAX
+            validate_sequence(3, Some(7), &cache(), 4, 0, 2),
+            SequenceValidation::Proceed {
+                new_last_sequence: 1,
+                new_epoch: true
             }
+        );
+        // ... anything else is out of order, and old-epoch batches are not duplicates.
+        assert_eq!(validate_sequence(3, Some(7), &cache(), 4, 5, 3), ooo(0));
+    }
+
+    #[test]
+    fn test_validate_sequence_wraps_at_i32_max() {
+        // Kafka's incrementSequence: sequences wrap from i32::MAX to 0.
+        assert_eq!(batch_last_sequence(i32::MAX - 1, 2), i32::MAX);
+        assert_eq!(batch_last_sequence(i32::MAX, 2), 0);
+        assert_eq!(batch_last_sequence(i32::MAX - 1, 5), 2);
+        assert_eq!(batch_last_sequence(7, 0), 7);
+        // The batch after the one ending at i32::MAX starts at 0.
+        assert_eq!(
+            validate_sequence(0, Some(i32::MAX), &[], 0, 0, 3),
+            proceed(2)
+        );
+        // A batch crossing i32::MAX is appended with its wrapped last sequence.
+        assert_eq!(
+            validate_sequence(0, Some(i32::MAX - 2), &[], 0, i32::MAX - 1, 4),
+            proceed(1)
+        );
+        // ... and its retry is recognised.
+        let wrapped = [CachedBatch {
+            first_sequence: i32::MAX - 1,
+            last_sequence: 1,
+            base_offset: 99,
+        }];
+        assert_eq!(
+            validate_sequence(0, Some(1), &wrapped, 0, i32::MAX - 1, 4),
+            SequenceValidation::Duplicate { base_offset: 99 }
         );
     }
     // ========== DR-8: header JSONB decode (DEEP-REVIEW-2026-07) ==========
