@@ -174,3 +174,12 @@ pub async fn test_metadata_refresh_after_create() -> TestResult {
     println!("✅ Test PASSED\n");
     Ok(())
 }
+
+/// The `metadata` tests, in run order.
+pub fn tests() -> Vec<crate::registry::TestDef> {
+    crate::test_defs!["metadata";
+        test_metadata_all_topics,
+        test_metadata_nonexistent_topic,
+        test_metadata_refresh_after_create,
+    ]
+}

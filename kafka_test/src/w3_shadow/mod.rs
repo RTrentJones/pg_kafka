@@ -95,3 +95,10 @@ pub async fn test_shadow_lag_view_is_per_partition() -> TestResult {
     println!("✅ Test PASSED\n");
     Ok(())
 }
+
+/// The `w3_shadow` tests, in run order.
+pub fn tests() -> Vec<crate::registry::TestDef> {
+    crate::test_defs!["w3_shadow";
+        test_shadow_lag_view_is_per_partition,
+    ]
+}

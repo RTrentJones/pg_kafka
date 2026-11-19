@@ -701,3 +701,28 @@ pub async fn test_create_topic_invalid_partitions() -> TestResult {
     println!("\n✅ Test: Create Topic with Invalid Partitions PASSED\n");
     Ok(())
 }
+
+/// The `admin` tests, in run order.
+pub fn tests() -> Vec<crate::registry::TestDef> {
+    crate::test_defs!["admin";
+        test_create_topic,
+        test_create_topic_already_exists,
+        test_delete_topic,
+        test_delete_topic_not_found,
+        test_create_partitions,
+        test_create_partitions_cannot_decrease,
+        test_delete_group_empty,
+        test_delete_group_non_empty: sequential, // Uses shared consumer group state
+        test_delete_group_after_leave: sequential, // Uses shared consumer group state
+        crate::configs::test_describe_configs_reports_topic_configs,
+        crate::configs::test_incremental_alter_configs_retention_roundtrip,
+        crate::configs::test_delete_records_truncates_partition,
+        crate::configs::test_per_topic_retention_override_enforced_by_sweep: sequential, // Runs the global retention sweep
+        test_create_multiple_topics,
+        test_create_topic_invalid_name,
+        test_create_partitions_not_found,
+        test_delete_group_idempotent,
+        test_create_topic_with_config,
+        test_create_topic_invalid_partitions,
+    ]
+}

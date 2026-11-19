@@ -12,8 +12,13 @@ mod basic;
 mod batch;
 mod timestamp;
 
-pub use ack_visibility::test_produce_ack_implies_committed_visibility;
-pub use acks_zero::test_producer_acks_zero;
-pub use basic::test_producer;
-pub use batch::test_batch_produce;
-pub use timestamp::test_producer_timestamp_roundtrip;
+/// The `producer` tests, in run order.
+pub fn tests() -> Vec<crate::registry::TestDef> {
+    crate::test_defs!["producer";
+        basic::test_producer,
+        batch::test_batch_produce,
+        acks_zero::test_producer_acks_zero,
+        ack_visibility::test_produce_ack_implies_committed_visibility: sequential, // Mutates global GUC (test_pre_commit_delay_ms)
+        timestamp::test_producer_timestamp_roundtrip,
+    ]
+}

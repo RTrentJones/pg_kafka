@@ -355,3 +355,14 @@ pub async fn test_response_ordering_with_long_poll() -> TestResult {
     println!("✅ Test PASSED\n");
     Ok(())
 }
+
+/// The `protocol` tests, in run order.
+pub fn tests() -> Vec<crate::registry::TestDef> {
+    crate::test_defs!["protocol";
+        test_api_versions_negotiation,
+        test_correlation_id_preserved,
+        test_unknown_api_key_handling,
+        test_protocol_request_pipelining,
+        test_response_ordering_with_long_poll: sequential, // timing-sensitive: asserts long-poll wait duration
+    ]
+}

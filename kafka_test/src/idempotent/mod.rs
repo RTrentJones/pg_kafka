@@ -12,10 +12,15 @@ mod deduplication;
 mod edge_cases;
 pub mod protocol_encoding;
 
-pub use basic::test_idempotent_producer_basic;
-pub use deduplication::test_true_deduplication_manual_replay;
-pub use edge_cases::{
-    test_idempotent_concurrent_producers, test_idempotent_high_sequence,
-    test_idempotent_multi_partition, test_idempotent_producer_epoch_bump,
-    test_idempotent_producer_restart,
-};
+/// The `idempotent` tests, in run order.
+pub fn tests() -> Vec<crate::registry::TestDef> {
+    crate::test_defs!["idempotent";
+        basic::test_idempotent_producer_basic,
+        deduplication::test_true_deduplication_manual_replay,
+        edge_cases::test_idempotent_producer_epoch_bump,
+        edge_cases::test_idempotent_multi_partition,
+        edge_cases::test_idempotent_producer_restart,
+        edge_cases::test_idempotent_concurrent_producers: sequential, // Concurrent producers
+        edge_cases::test_idempotent_high_sequence,
+    ]
+}

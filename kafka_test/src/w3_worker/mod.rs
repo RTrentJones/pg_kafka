@@ -192,3 +192,18 @@ pub fn into_test_result(r: DynResult<()>) -> TestResult {
 pub async fn session() -> DynResult<Client> {
     create_db_client().await.map_err(boxed)
 }
+
+/// The `w3_worker` tests, in run order.
+pub fn tests() -> Vec<crate::registry::TestDef> {
+    crate::test_defs!["w3_worker";
+        tests::test_w3_partition_maintenance_lock_waits_are_bounded: sequential,
+        tests::test_w3_end_txn_during_default_leaf_move: sequential,
+        tests::test_w3_lock_timeout_bounds_stuck_lock: sequential,
+        tests::test_w3_sigterm_interrupts_lock_wait: sequential,
+        tests::test_w3_commit_failure_answered_without_restart: sequential,
+        tests::test_w3_heartbeats_do_not_split_batches: sequential,
+        tests::test_w3_transaction_end_wakes_read_committed: sequential,
+        tests::test_w3_old_schema_degrades_gracefully: sequential,
+        tests::test_w3_extension_ddl_loop_under_load: sequential,
+    ]
+}

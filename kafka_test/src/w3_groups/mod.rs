@@ -831,3 +831,16 @@ pub async fn test_w3g_different_assignor_is_refused_group_unaffected() -> TestRe
     println!("✅ Test PASSED\n");
     Ok(())
 }
+
+/// The `w3_groups` tests, in run order.
+pub fn tests() -> Vec<crate::registry::TestDef> {
+    crate::test_defs!["w3_groups";
+        test_w3g_partition_cap,
+        test_w3g_create_topics_validation,
+        test_w3g_join_group_protocol_rules,
+        test_w3g_offset_commit_rules,
+        test_w3g_different_assignor_is_refused_group_unaffected,
+        test_w3g_metadata_survives_corrupt_partition_count: sequential, // drops and restores the CHECK constraint on kafka.topics
+        test_w3g_offsets_only_group_survives_restart: sequential, // restarts the listener worker
+    ]
+}

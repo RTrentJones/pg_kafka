@@ -295,3 +295,23 @@ pub async fn auth_env() -> TestResult {
         .clone()
         .map_err(|e| format!("auth E2E setup failed: {}", e).into())
 }
+
+/// The `auth` tests, in run order.
+pub fn tests() -> Vec<crate::registry::TestDef> {
+    crate::test_defs!["auth";
+        // All sequential: they restart the listener worker. The teardown test stays last.
+        tests::test_auth_sasl_plain_roundtrip: sequential,
+        tests::test_auth_sasl_scram_sha256_roundtrip: sequential,
+        tests::test_auth_sasl_scram_sha512_roundtrip: sequential,
+        tests::test_auth_wrong_password_rejected: sequential,
+        tests::test_auth_unauthenticated_request_rejected: sequential,
+        tests::test_auth_plaintext_listener_unaffected: sequential,
+        tests::test_auth_tls_roundtrip_and_untrusted_ca: sequential,
+        tests::test_auth_sasl_ssl_roundtrip: sequential,
+        tests::test_auth_user_management_sql: sequential,
+        tests::test_auth_mutual_tls: sequential,
+        // Before the teardown, which restarts the worker and so resets the counters.
+        api_metrics::test_auth_sasl_requests_counted_in_api_metrics: sequential,
+        tests::test_auth_teardown_restores_default_listeners: sequential,
+    ]
+}

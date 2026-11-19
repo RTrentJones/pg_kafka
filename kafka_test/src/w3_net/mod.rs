@@ -261,3 +261,25 @@ pub async fn rdkafka_roundtrip(cfg: ClientConfig, topic: &str, n: usize) -> Test
     }
     Ok(())
 }
+
+/// The `w3_net` tests, in run order.
+pub fn tests() -> Vec<crate::registry::TestDef> {
+    crate::test_defs!["w3_net";
+        // shared broker resources or reconfigure + restart the listener (limits::*,
+        // setup first, teardown last).
+        tests::test_w3_net_frame_budget_lockout: sequential,
+        tests::test_w3_net_oversized_response_is_delivered: sequential,
+        tests::test_w3_net_tcp_nodelay: sequential,
+        tests::test_w3_net_acks0_error_closes_connection: sequential,
+        tests::test_w3_net_invalid_acks_rejected: sequential,
+        tests::test_w3_net_response_before_close: sequential,
+        limits::test_w3_net_limits_setup: sequential,
+        limits::test_w3_net_scram_unknown_user_indistinguishable: sequential,
+        limits::test_w3_net_per_ip_limit: sequential,
+        limits::test_w3_net_per_listener_limit: sequential,
+        limits::test_w3_net_idle_and_frame_read_timeouts: sequential,
+        limits::test_w3_net_pre_auth_deadline_from_accept: sequential,
+        limits::test_w3_net_sasl_lookup_rate_limit: sequential,
+        limits::test_w3_net_limits_teardown: sequential,
+    ]
+}
