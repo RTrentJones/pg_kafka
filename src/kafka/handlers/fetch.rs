@@ -2,10 +2,14 @@
 //! resolving offsets by position or timestamp.
 
 use super::helpers::resolve_topic;
-use crate::kafka::constants::ERROR_NONE;
+use crate::kafka::constants::{
+    ERROR_KAFKA_STORAGE_ERROR, ERROR_NONE, ERROR_OFFSET_OUT_OF_RANGE,
+    ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+};
 use crate::kafka::error::Result;
 use crate::kafka::handler_context::HandlerContext;
-use crate::kafka::storage::{FetchedMessage, IsolationLevel};
+use crate::kafka::messages::{PartitionFetchData, TopicFetchData};
+use crate::kafka::storage::{FetchedMessage, IsolationLevel, KafkaStore, PartitionBounds};
 use bytes::BufMut;
 use kafka_protocol::indexmap::IndexMap;
 use kafka_protocol::messages::fetch_response::{
@@ -16,7 +20,9 @@ use kafka_protocol::messages::list_offsets_response::{
 };
 use kafka_protocol::messages::TopicName;
 use kafka_protocol::protocol::StrBytes;
-use kafka_protocol::records::{Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType};
+use kafka_protocol::records::{
+    Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
+};
 
 /// Handle Fetch request
 ///
@@ -31,7 +37,7 @@ use kafka_protocol::records::{Record, RecordBatchEncoder, RecordEncodeOptions, T
 /// offset of any pending transaction. Consumers can safely process up to LSO.
 pub fn handle_fetch(
     ctx: &HandlerContext,
-    topic_data: Vec<crate::kafka::messages::TopicFetchData>,
+    topic_data: Vec<TopicFetchData>,
     isolation_level: IsolationLevel,
 ) -> Result<FetchResponse> {
     handle_fetch_with_max_bytes(ctx, topic_data, isolation_level, i32::MAX)
@@ -95,7 +101,7 @@ pub(crate) fn trim_to_response_budget(
 /// stored and is sent as -1. Rows are in offset order.
 pub(crate) fn encode_record_batches(
     messages: Vec<FetchedMessage>,
-    compression: kafka_protocol::records::Compression,
+    compression: Compression,
 ) -> std::result::Result<bytes::Bytes, String> {
     let mut records: Vec<Record> = Vec::with_capacity(messages.len());
     let mut group_base = 0i64;
@@ -280,204 +286,53 @@ fn crc32c(data: &[u8]) -> u32 {
 /// each partition's own `partition_max_bytes`.
 pub fn handle_fetch_with_max_bytes(
     ctx: &HandlerContext,
-    topic_data: Vec<crate::kafka::messages::TopicFetchData>,
+    topic_data: Vec<TopicFetchData>,
     isolation_level: IsolationLevel,
     max_bytes: i32,
 ) -> Result<FetchResponse> {
     let store = ctx.store;
-    let mut response_remaining: i64 = i64::from(max_bytes.max(0));
-    let mut returned_any = false;
-    let compression = ctx.compression;
+    let mut budget = FetchBudget {
+        remaining: i64::from(max_bytes.max(0)),
+        returned_any: false,
+    };
     let mut responses = Vec::new();
 
-    // Process each topic requested
     for topic_fetch in topic_data {
-        let topic_name = topic_fetch.name.clone();
-
-        // Look up topic by name (id + partition count in one lookup)
-        let (topic_id, partition_count) = match resolve_topic(store, &topic_name) {
-            Ok(Some(found)) => found,
-            unresolved => {
-                // Topic not found or error - return error for all partitions
-                let error_code = match unresolved {
-                    Err(code) => code,
-                    _ => crate::kafka::constants::ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+        // Topic id and partition count in one lookup; a missing topic (or a failed
+        // lookup) is reported on every requested partition.
+        let partitions = match resolve_topic(store, &topic_fetch.name) {
+            Ok(Some((topic_id, partition_count))) => {
+                let topic = TopicPartitions {
+                    id: topic_id,
+                    partition_count,
                 };
-                let mut error_partitions = Vec::new();
-                for p in topic_fetch.partitions {
-                    let mut partition_data = PartitionData::default();
-                    partition_data.partition_index = p.partition_index;
-                    partition_data.error_code = error_code;
-                    partition_data.high_watermark = -1;
-                    error_partitions.push(partition_data);
-                }
-                let mut topic_response = FetchableTopicResponse::default();
-                topic_response.topic = TopicName(StrBytes::from_string(topic_name));
-                topic_response.partitions = error_partitions;
-                responses.push(topic_response);
-                continue;
+                topic_fetch
+                    .partitions
+                    .iter()
+                    .map(|partition| {
+                        fetch_partition(
+                            store,
+                            topic,
+                            partition,
+                            isolation_level,
+                            ctx.compression,
+                            &mut budget,
+                        )
+                    })
+                    .collect()
+            }
+            unresolved => {
+                let error_code = unresolved.err().unwrap_or(ERROR_UNKNOWN_TOPIC_OR_PARTITION);
+                topic_fetch
+                    .partitions
+                    .iter()
+                    .map(|p| partition_error(p.partition_index, error_code))
+                    .collect()
             }
         };
-
-        let mut partition_responses = Vec::new();
-
-        // Process each partition
-        for partition_fetch in topic_fetch.partitions {
-            let partition_id = partition_fetch.partition_index;
-            let fetch_offset = partition_fetch.fetch_offset;
-            let partition_max_bytes = partition_fetch.partition_max_bytes;
-
-            // A partition outside [0, partition_count) does not exist: report
-            // UNKNOWN_TOPIC_OR_PARTITION instead of an empty success, which would
-            // leave the consumer polling it forever.
-            if partition_id < 0 || partition_id >= partition_count {
-                let mut partition_data = PartitionData::default();
-                partition_data.partition_index = partition_id;
-                partition_data.error_code =
-                    crate::kafka::constants::ERROR_UNKNOWN_TOPIC_OR_PARTITION;
-                partition_data.high_watermark = -1;
-                partition_responses.push(partition_data);
-                continue;
-            }
-
-            // A storage error computing the offset
-            // bounds must surface as a per-partition error code, not be swallowed
-            // as offset 0 — `unwrap_or(0)` made a transient Postgres error look
-            // like an empty partition, which can reset a consumer's position.
-            // All bounds come from one storage call (one statement in
-            // PostgresStore) instead of four or five.
-            let bounds = match store.get_partition_bounds(topic_id, partition_id, isolation_level) {
-                Ok(b) => b,
-                Err(e) => {
-                    if e.is_server_error() {
-                        crate::pg_warning!(
-                            "Failed to compute offset bounds for topic_id={}, partition={}: {}",
-                            topic_id,
-                            partition_id,
-                            e
-                        );
-                    }
-                    let mut partition_data = PartitionData::default();
-                    partition_data.partition_index = partition_id;
-                    partition_data.error_code = e.to_kafka_error_code();
-                    partition_data.high_watermark = -1;
-                    partition_responses.push(partition_data);
-                    continue;
-                }
-            };
-            let high_watermark = bounds.high_watermark;
-            // LSO is the lowest offset of any pending transaction, or
-            // the HWM if none pending (always the HWM for ReadUncommitted).
-            let last_stable_offset = bounds.last_stable_offset;
-            // Report the real log-start offset — the earliest retained
-            // offset after cleanup/retention — rather than a hardcoded 0.
-            let log_start_offset = bounds.earliest_offset;
-
-            // An offset before the durable log start (retired by DeleteRecords or
-            // retention) or past the high watermark is OFFSET_OUT_OF_RANGE, so the
-            // consumer applies its auto.offset.reset policy. The lower bound is the
-            // durable log start, not the first surviving row: aborted-message cleanup
-            // can delete leading rows without retiring their offsets, and a fetch
-            // from such a hole must skip ahead to the next committed record.
-            // fetch_offset == high_watermark is valid (caught up, waiting for data).
-            let durable_log_start = bounds.log_start_offset;
-            if fetch_offset < durable_log_start || fetch_offset > high_watermark {
-                let mut partition_data = PartitionData::default();
-                partition_data.partition_index = partition_id;
-                partition_data.error_code = crate::kafka::constants::ERROR_OFFSET_OUT_OF_RANGE;
-                partition_data.high_watermark = high_watermark;
-                partition_data.last_stable_offset = last_stable_offset;
-                partition_data.log_start_offset = log_start_offset;
-                partition_responses.push(partition_data);
-                continue;
-            }
-
-            // Fetch messages from storage
-            // Use isolation-aware fetch for transactional reads
-            // Request-level max_bytes: once the response budget is spent, later
-            // partitions report their bounds but no records.
-            let Some(limit) =
-                partition_fetch_limit(partition_max_bytes, response_remaining, returned_any)
-            else {
-                let mut partition_data = PartitionData::default();
-                partition_data.partition_index = partition_id;
-                partition_data.error_code = ERROR_NONE;
-                partition_data.high_watermark = high_watermark;
-                partition_data.last_stable_offset = last_stable_offset;
-                partition_data.log_start_offset = log_start_offset;
-                partition_data.records = Some(bytes::Bytes::new());
-                partition_responses.push(partition_data);
-                continue;
-            };
-            let storage_empty: bool;
-            let db_records = match store.fetch_records_with_isolation(
-                topic_id,
-                partition_id,
-                fetch_offset,
-                limit,
-                isolation_level,
-            ) {
-                Ok(records) => {
-                    storage_empty = records.is_empty();
-                    let (kept, used) =
-                        trim_to_response_budget(records, response_remaining, returned_any);
-                    response_remaining -= used;
-                    returned_any |= !kept.is_empty();
-                    kept
-                }
-                Err(e) => {
-                    // Use typed error's Kafka error code for proper protocol response
-                    let error_code = e.to_kafka_error_code();
-                    if e.is_server_error() {
-                        crate::pg_warning!(
-                            "Failed to fetch records for topic_id={}, partition={}, offset={}: {}",
-                            topic_id,
-                            partition_id,
-                            fetch_offset,
-                            e
-                        );
-                    }
-                    let mut partition_data = PartitionData::default();
-                    partition_data.partition_index = partition_id;
-                    partition_data.error_code = error_code;
-                    partition_data.high_watermark = -1;
-                    partition_responses.push(partition_data);
-                    continue;
-                }
-            };
-
-            // Convert database records to Kafka RecordBatch format: one batch per run of
-            // consecutive offsets of one producer.
-            let records = if !db_records.is_empty() {
-                encode_record_batches(db_records, compression)
-            } else if storage_empty {
-                // Nothing visible from fetch_offset up to the readable end. With offsets in
-                // between (aborted rows filtered for read_committed, rows deleted by
-                // aborted-row cleanup or retention), an empty response would leave the
-                // consumer polling the same offset forever; a marker batch covering them
-                // moves it to the readable end, as the abort marker after an aborted
-                // transaction does in Kafka.
-                let readable_end = match isolation_level {
-                    IsolationLevel::ReadCommitted => last_stable_offset,
-                    IsolationLevel::ReadUncommitted => high_watermark,
-                };
-                Ok(gap_batch(fetch_offset, readable_end).unwrap_or_default())
-            } else {
-                // Empty bytes rather than None: a null records field is an "invalid
-                // MessageSetSize -1" in the flexible format.
-                Ok(bytes::Bytes::new())
-            };
-            partition_responses.push(fetched_partition_data(
-                topic_id,
-                partition_id,
-                &bounds,
-                records,
-            ));
-        }
-
         let mut topic_response = FetchableTopicResponse::default();
-        topic_response.topic = TopicName(StrBytes::from_string(topic_name));
-        topic_response.partitions = partition_responses;
+        topic_response.topic = TopicName(StrBytes::from_string(topic_fetch.name));
+        topic_response.partitions = partitions;
         responses.push(topic_response);
     }
 
@@ -488,6 +343,149 @@ pub fn handle_fetch_with_max_bytes(
     kafka_response.responses = responses;
 
     Ok(kafka_response)
+}
+
+/// The topic a fetch reads from.
+#[derive(Clone, Copy)]
+struct TopicPartitions {
+    id: i32,
+    partition_count: i32,
+}
+
+/// What is left of a fetch request's `max_bytes`, and whether an earlier partition
+/// already returned records (see [`partition_fetch_limit`]).
+struct FetchBudget {
+    remaining: i64,
+    returned_any: bool,
+}
+
+/// Read one partition for a fetch and build its response entry.
+fn fetch_partition(
+    store: &dyn KafkaStore,
+    topic: TopicPartitions,
+    partition_fetch: &PartitionFetchData,
+    isolation_level: IsolationLevel,
+    compression: Compression,
+    budget: &mut FetchBudget,
+) -> PartitionData {
+    let topic_id = topic.id;
+    let partition_id = partition_fetch.partition_index;
+    let fetch_offset = partition_fetch.fetch_offset;
+
+    // A partition outside [0, partition_count) does not exist: report
+    // UNKNOWN_TOPIC_OR_PARTITION instead of an empty success, which would leave the
+    // consumer polling it forever.
+    if partition_id < 0 || partition_id >= topic.partition_count {
+        return partition_error(partition_id, ERROR_UNKNOWN_TOPIC_OR_PARTITION);
+    }
+
+    // All bounds come from one storage call. A storage error is a per-partition error
+    // code: offset 0 would make a transient Postgres error look like an empty
+    // partition, which can reset a consumer's position.
+    let bounds = match store.get_partition_bounds(topic_id, partition_id, isolation_level) {
+        Ok(b) => b,
+        Err(e) => {
+            if e.is_server_error() {
+                crate::pg_warning!(
+                    "Failed to compute offset bounds for topic_id={}, partition={}: {}",
+                    topic_id,
+                    partition_id,
+                    e
+                );
+            }
+            return partition_error(partition_id, e.to_kafka_error_code());
+        }
+    };
+
+    // An offset before the durable log start (retired by DeleteRecords or retention) or
+    // past the high watermark is OFFSET_OUT_OF_RANGE, so the consumer applies its
+    // auto.offset.reset policy. The lower bound is the durable log start, not the first
+    // surviving row: aborted-message cleanup can delete leading rows without retiring
+    // their offsets, and a fetch from such a hole must skip ahead to the next committed
+    // record. fetch_offset == high_watermark is valid (caught up, waiting for data).
+    if fetch_offset < bounds.log_start_offset || fetch_offset > bounds.high_watermark {
+        let mut partition_data = partition_with_bounds(partition_id, &bounds);
+        partition_data.error_code = ERROR_OFFSET_OUT_OF_RANGE;
+        partition_data.records = None;
+        return partition_data;
+    }
+
+    // Once the request-level max_bytes is spent, later partitions report their bounds
+    // but no records.
+    let Some(limit) = partition_fetch_limit(
+        partition_fetch.partition_max_bytes,
+        budget.remaining,
+        budget.returned_any,
+    ) else {
+        return partition_with_bounds(partition_id, &bounds);
+    };
+    let fetched = match store.fetch_records_with_isolation(
+        topic_id,
+        partition_id,
+        fetch_offset,
+        limit,
+        isolation_level,
+    ) {
+        Ok(records) => records,
+        Err(e) => {
+            if e.is_server_error() {
+                crate::pg_warning!(
+                    "Failed to fetch records for topic_id={}, partition={}, offset={}: {}",
+                    topic_id,
+                    partition_id,
+                    fetch_offset,
+                    e
+                );
+            }
+            return partition_error(partition_id, e.to_kafka_error_code());
+        }
+    };
+    let storage_empty = fetched.is_empty();
+    let (db_records, used) =
+        trim_to_response_budget(fetched, budget.remaining, budget.returned_any);
+    budget.remaining -= used;
+    budget.returned_any |= !db_records.is_empty();
+
+    // One RecordBatch per run of consecutive offsets of one producer.
+    let records = if !db_records.is_empty() {
+        encode_record_batches(db_records, compression)
+    } else if storage_empty {
+        // Nothing visible from fetch_offset up to the readable end. With offsets in
+        // between (aborted rows filtered for read_committed, rows deleted by aborted-row
+        // cleanup or retention), an empty response would leave the consumer polling the
+        // same offset forever; a marker batch covering them moves it to the readable end,
+        // as the abort marker after an aborted transaction does in Kafka.
+        let readable_end = match isolation_level {
+            IsolationLevel::ReadCommitted => bounds.last_stable_offset,
+            IsolationLevel::ReadUncommitted => bounds.high_watermark,
+        };
+        Ok(gap_batch(fetch_offset, readable_end).unwrap_or_default())
+    } else {
+        Ok(bytes::Bytes::new())
+    };
+    fetched_partition_data(topic_id, partition_id, &bounds, records)
+}
+
+/// A partition entry for an error that leaves its bounds unknown.
+fn partition_error(partition_id: i32, error_code: i16) -> PartitionData {
+    let mut partition_data = PartitionData::default();
+    partition_data.partition_index = partition_id;
+    partition_data.error_code = error_code;
+    partition_data.high_watermark = -1;
+    partition_data
+}
+
+/// A successful partition entry with its bounds and no records. Empty bytes rather than
+/// None: a null records field is an "invalid MessageSetSize -1" in the flexible format.
+fn partition_with_bounds(partition_id: i32, bounds: &PartitionBounds) -> PartitionData {
+    let mut partition_data = PartitionData::default();
+    partition_data.partition_index = partition_id;
+    partition_data.error_code = ERROR_NONE;
+    partition_data.high_watermark = bounds.high_watermark;
+    partition_data.last_stable_offset = bounds.last_stable_offset;
+    partition_data.log_start_offset = bounds.earliest_offset;
+    partition_data.records = Some(bytes::Bytes::new());
+    partition_data
 }
 
 /// The response entry of a partition whose records were read: `records` holds the
@@ -501,13 +499,15 @@ pub fn handle_fetch_with_max_bytes(
 fn fetched_partition_data(
     topic_id: i32,
     partition_id: i32,
-    bounds: &crate::kafka::storage::PartitionBounds,
+    bounds: &PartitionBounds,
     records: std::result::Result<bytes::Bytes, String>,
 ) -> PartitionData {
-    let mut partition_data = PartitionData::default();
-    partition_data.partition_index = partition_id;
-    let records = match records {
-        Ok(records) => records,
+    match records {
+        Ok(records) => {
+            let mut partition_data = partition_with_bounds(partition_id, bounds);
+            partition_data.records = Some(records);
+            partition_data
+        }
         Err(e) => {
             crate::pg_warning!(
                 "Failed to encode RecordBatch for topic_id={}, partition={}: {}",
@@ -515,18 +515,11 @@ fn fetched_partition_data(
                 partition_id,
                 e
             );
-            partition_data.error_code = crate::kafka::constants::ERROR_KAFKA_STORAGE_ERROR;
-            partition_data.high_watermark = -1;
+            let mut partition_data = partition_error(partition_id, ERROR_KAFKA_STORAGE_ERROR);
             partition_data.records = Some(bytes::Bytes::new());
-            return partition_data;
+            partition_data
         }
-    };
-    partition_data.error_code = ERROR_NONE;
-    partition_data.high_watermark = bounds.high_watermark;
-    partition_data.last_stable_offset = bounds.last_stable_offset;
-    partition_data.log_start_offset = bounds.earliest_offset;
-    partition_data.records = Some(records);
-    partition_data
+    }
 }
 
 /// Handle ListOffsets request
@@ -559,7 +552,7 @@ pub fn handle_list_offsets(
             unresolved => {
                 let error_code = match unresolved {
                     Err(code) => code,
-                    _ => crate::kafka::constants::ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+                    _ => ERROR_UNKNOWN_TOPIC_OR_PARTITION,
                 };
                 let mut topic_response = ListOffsetsTopicResponse::default();
                 topic_response.name = TopicName(StrBytes::from_string(topic_name));
@@ -579,7 +572,7 @@ pub fn handle_list_offsets(
             if partition_id < 0 || partition_id >= partition_count {
                 partition_responses.push(list_offsets_error(
                     partition_id,
-                    crate::kafka::constants::ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+                    ERROR_UNKNOWN_TOPIC_OR_PARTITION,
                 ));
                 continue;
             }
@@ -639,7 +632,7 @@ fn list_offsets_error(partition_index: i32, error_code: i16) -> ListOffsetsParti
 /// `(offset, timestamp)` for one ListOffsets partition query (see
 /// [`handle_list_offsets`]).
 fn list_partition_offset(
-    store: &dyn crate::kafka::storage::KafkaStore,
+    store: &dyn KafkaStore,
     topic_id: i32,
     partition_id: i32,
     timestamp: i64,
@@ -702,10 +695,7 @@ mod tests {
     fn unencodable_records_are_a_storage_error() {
         let p = fetched_partition_data(1, 3, &bounds(), Err("too far apart".to_string()));
         assert_eq!(p.partition_index, 3);
-        assert_eq!(
-            p.error_code,
-            crate::kafka::constants::ERROR_KAFKA_STORAGE_ERROR
-        );
+        assert_eq!(p.error_code, ERROR_KAFKA_STORAGE_ERROR);
         assert_eq!(p.high_watermark, -1);
         assert_eq!(p.records.as_deref(), Some(&[][..]));
 
@@ -878,7 +868,7 @@ mod tests {
         let response = handle_fetch(&ctx, req, IsolationLevel::ReadCommitted).unwrap();
         assert_eq!(
             response.responses[0].partitions[0].error_code,
-            crate::kafka::constants::ERROR_OFFSET_OUT_OF_RANGE
+            ERROR_OFFSET_OUT_OF_RANGE
         );
     }
 
