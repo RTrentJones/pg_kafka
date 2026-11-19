@@ -357,7 +357,8 @@ impl ConsumerGroup {
     /// Kafka's `supportsProtocols` rule for a JoinGroup (wave3 groups): joining an Empty group
     /// needs a non-empty protocol type and at least one protocol; joining a group with members
     /// needs the group's protocol type and at least one protocol every *other* member supports
-    /// (a known member's own previous list does not count, it is being replaced).
+    /// (a known member's own previous list does not count, it is being replaced; Kafka counts
+    /// it, so a lone member there cannot switch to a disjoint protocol list without leaving).
     fn supports_protocols(
         &self,
         member_id: Option<&str>,
@@ -367,6 +368,10 @@ impl ConsumerGroup {
         if protocols.is_empty() || protocol_type.is_empty() {
             return false;
         }
+        // A group with members keeps its protocol type, even for its only member's rejoin.
+        if !self.members.is_empty() && self.protocol_type.as_deref() != Some(protocol_type) {
+            return false;
+        }
         let others: Vec<&GroupMember> = self
             .members
             .values()
@@ -374,9 +379,6 @@ impl ConsumerGroup {
             .collect();
         if others.is_empty() {
             return true;
-        }
-        if self.protocol_type.as_deref() != Some(protocol_type) {
-            return false;
         }
         protocols.iter().any(|(name, _)| {
             others
@@ -2388,7 +2390,11 @@ mod tests {
         // None of these disturbed the group.
         assert_eq!(state(&c, "g"), GroupState::Stable);
         assert_eq!(c.get_group_state("g").unwrap().members.len(), 1);
-        // The only member may switch to anything: there is no one else to agree with.
+        // The only member keeps the group's protocol type...
+        let mut p = params("g", Some(&leader), &[("range", b"sub")]);
+        p.protocol_type = "connect".to_string();
+        assert_eq!(join_error_code(&join_with(&c, p)), E);
+        // ...but may switch protocols: there is no one else to agree with.
         let r = joined(&join_with(
             &c,
             params("g", Some(&leader), &[("roundrobin", b"x")]),
