@@ -1,9 +1,8 @@
 -- Optional autovacuum tuning for pg_kafka tables
 --
--- DR-5 (DEEP-REVIEW-2026-07): this script targets the tables by their actual churn
--- profile. kafka.messages is append-mostly (UPDATE only when a transaction aborts,
--- DELETE only via retention/cleanup sweeps), so its bloat pressure is modest; the
--- genuinely high-churn tables are the small counters that take an UPDATE/UPSERT on
+-- The settings target the tables by their churn profile. kafka.messages is
+-- append-mostly (UPDATE only when a transaction ends, DELETE only via the retention
+-- and cleanup sweeps), so its bloat pressure is modest; the high-churn tables are the small counters that take an UPDATE/UPSERT on
 -- every produce or commit:
 --
 --   - kafka.partition_offsets   UPDATE on every produce (per topic/partition)
