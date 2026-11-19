@@ -54,9 +54,15 @@ Upgrade scripts take locks on the tables they alter. Run them in a quiet period 
 large `kafka.messages`. A running worker does not deadlock with them: every upgrade
 script starts with `SELECT pg_advisory_xact_lock(8099547369649367906)`, the pg_kafka
 schema lock that every worker transaction holds in SHARE mode, so the script waits for
-the worker's current transaction (a request batch, at most a few milliseconds) and the
-worker's next transactions wait (up to `pg_kafka.worker_lock_timeout_ms`, then their
-requests get a retriable error) until the upgrade commits.
+the worker's current transaction and the worker's next transactions wait (up to
+`pg_kafka.worker_lock_timeout_ms`, default 5 s, then their requests get a retriable
+error) until the upgrade commits. The script's wait is usually short, a request batch
+(up to 50 ms of handlers plus its commit), but the worker's maintenance runs in
+transactions too and can hold the lock for seconds: a retention sweep spends up to
+1.5 s on row deletes and then up to 2 s waiting for the locks of each leaf it drops,
+and partition maintenance moves rows out of the DEFAULT leaf in one transaction. The
+upgrade itself holds the lock for as long as it runs (see step 1 of 0.0.0 -> 0.1.0), so
+on a large `kafka.messages` requests fail retriably for most of it.
 
 `DROP EXTENSION pg_kafka` while the worker runs is safe too: every worker transaction
 first takes a share lock on the extension object, which DROP EXTENSION locks before any
@@ -95,10 +101,12 @@ After the upgrade:
 - **Readers.** Roles that read `kafka.*` directly (dashboards, monitoring using
   `kafka.metrics`, ad-hoc queries) need `GRANT pgkafka_reader TO <role>;`. Superusers
   are unaffected.
-- **Worker role.** `pg_kafka.run_as_role` defaults to `pgkafka_worker`. Once it sees the
-  updated schema (step 4) the worker logs `background worker now runs as role
-  'pgkafka_worker'`. Set `pg_kafka.run_as_role = ''` to keep the old behaviour (run as
-  the bootstrap superuser), or name another role with the same privileges.
+- **Worker role.** `pg_kafka.run_as_role` defaults to `pgkafka_worker`. With that
+  default nothing is restarted: once the worker sees the updated schema (step 4) it logs
+  `background worker now runs as role 'pgkafka_worker'`. To keep the old behaviour (run
+  as the bootstrap superuser) set `pg_kafka.run_as_role = ''`, or name another role with
+  the same privileges. The setting is read only at server start (a reload does not
+  change it), so set it in `postgresql.conf` before the restart of step 2.
 - **Roles are cluster-wide.** They are not dropped by `DROP EXTENSION`; drop them by
   hand once no database uses pg_kafka.
 
