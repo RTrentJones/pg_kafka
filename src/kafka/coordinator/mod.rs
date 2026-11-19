@@ -588,26 +588,7 @@ impl GroupCoordinator {
         assignments: Vec<(String, Vec<u8>)>,
         out: &mut Vec<Delivery>,
     ) -> Result<Option<Vec<u8>>> {
-        // A group this coordinator has no record of (e.g. lost in a worker restart):
-        // UNKNOWN_MEMBER_ID, as Kafka answers, makes the client rejoin.
-        // COORDINATOR_NOT_AVAILABLE made it look up the same coordinator and retry.
-        let group = groups
-            .get_mut(group_id)
-            .ok_or_else(|| KafkaError::unknown_member(group_id, member_id))?;
-
-        // As in Kafka: an unknown member first (it must rejoin as a new member), then
-        // a generation other than the current one.
-        if !group.members.contains_key(member_id) {
-            return Err(KafkaError::unknown_member(group_id, member_id));
-        }
-        if group.generation_id != generation_id {
-            return Err(KafkaError::illegal_generation(
-                group_id,
-                generation_id,
-                group.generation_id,
-            ));
-        }
-
+        let group = current_member_group(groups, group_id, member_id, generation_id)?;
         let is_leader = group.leader.as_deref() == Some(member_id);
         pg_log!(
             "SyncGroup: group_id={}, member_id={}, is_leader={}, assignments={}, state={:?}",
@@ -638,13 +619,7 @@ impl GroupCoordinator {
                     }
                 }
                 group.complete_sync(out);
-                Ok(Some(
-                    group
-                        .members
-                        .get(member_id)
-                        .and_then(|m| m.assignment.clone())
-                        .unwrap_or_default(),
-                ))
+                Ok(Some(group.assignment_of(member_id)))
             }
             GroupState::CompletingRebalance => {
                 // A follower ahead of the leader waits for the leader's assignments.
@@ -654,13 +629,7 @@ impl GroupCoordinator {
                 Ok(None)
             }
             // Stable always carries an assignment (complete_sync fills in empty ones).
-            GroupState::Stable => Ok(Some(
-                group
-                    .members
-                    .get(member_id)
-                    .and_then(|m| m.assignment.clone())
-                    .unwrap_or_default(),
-            )),
+            GroupState::Stable => Ok(Some(group.assignment_of(member_id))),
         }
     }
 
@@ -792,23 +761,7 @@ impl GroupCoordinator {
             KafkaError::Internal(format!("Failed to acquire groups write lock: {e}"))
         })?;
 
-        // Unknown group (e.g. lost in a worker restart): UNKNOWN_MEMBER_ID so the
-        // client rejoins, as Kafka answers.
-        let group = groups
-            .get_mut(group_id)
-            .ok_or_else(|| KafkaError::unknown_member(group_id, member_id))?;
-
-        if !group.members.contains_key(member_id) {
-            return Err(KafkaError::unknown_member(group_id, member_id));
-        }
-        if group.generation_id != generation_id {
-            return Err(KafkaError::illegal_generation(
-                group_id,
-                generation_id,
-                group.generation_id,
-            ));
-        }
-
+        let group = current_member_group(&mut groups, group_id, member_id, generation_id)?;
         let Some(member) = group.members.get_mut(member_id) else {
             return Err(KafkaError::unknown_member(group_id, member_id));
         };
@@ -1121,6 +1074,32 @@ impl Default for GroupCoordinator {
 
 /// INCONSISTENT_GROUP_PROTOCOL for a JoinGroup whose protocol type or protocols do not fit the
 /// group.
+/// The group of a member presenting `generation_id`, fenced as Kafka fences SyncGroup and
+/// Heartbeat: a group this coordinator has no record of (e.g. lost in a worker restart)
+/// or an unknown member gets UNKNOWN_MEMBER_ID, which makes the client rejoin as a new
+/// member; then a generation other than the current one gets ILLEGAL_GENERATION.
+fn current_member_group<'a>(
+    groups: &'a mut HashMap<String, ConsumerGroup>,
+    group_id: &str,
+    member_id: &str,
+    generation_id: i32,
+) -> Result<&'a mut ConsumerGroup> {
+    let group = groups
+        .get_mut(group_id)
+        .ok_or_else(|| KafkaError::unknown_member(group_id, member_id))?;
+    if !group.members.contains_key(member_id) {
+        return Err(KafkaError::unknown_member(group_id, member_id));
+    }
+    if group.generation_id != generation_id {
+        return Err(KafkaError::illegal_generation(
+            group_id,
+            generation_id,
+            group.generation_id,
+        ));
+    }
+    Ok(group)
+}
+
 fn inconsistent_protocol(group_id: &str) -> KafkaError {
     KafkaError::Protocol {
         code: crate::kafka::constants::ERROR_INCONSISTENT_GROUP_PROTOCOL,
