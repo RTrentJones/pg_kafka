@@ -4,7 +4,7 @@
 use crate::common::TestResult;
 use crate::fixtures::TestTopicBuilder;
 use crate::setup::TestContext;
-use crate::w3_txn::wire::{batch, Wire};
+use crate::w3_txn::wire::{batch, now_ms, Wire};
 use kafka_protocol::messages::produce_request::{
     PartitionProduceData, ProduceRequest, TopicProduceData,
 };
@@ -56,6 +56,53 @@ pub async fn test_produce_response_reports_log_start_offset() -> TestResult {
         (ERROR_NONE, 3, 2)
     );
     println!("✅ log_start_offset 0, then 2 after DeleteRecords\n");
+
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// ListOffsets for a timestamp after every record, and MAX_TIMESTAMP on an empty
+/// partition, answer NONE with offset -1 and timestamp -1, as Kafka does.
+pub async fn test_list_offsets_without_a_matching_record_is_offset_minus_one() -> TestResult {
+    println!("=== Test: ListOffsets with no matching record ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = TestTopicBuilder::new(&ctx, "parity-list-offsets")
+        .with_partitions(2)
+        .build()
+        .await?
+        .name;
+    let mut wire = Wire::connect().await?;
+    let now = now_ms();
+    let (code, _) = wire
+        .produce(
+            &topic,
+            0,
+            batch(&["a", "b"], -1, -1, -1, false, Some(&[now, now])),
+            None,
+        )
+        .await?;
+    assert_eq!(code, ERROR_NONE);
+
+    let after_last = wire.list_offsets(&topic, 0, now + 3_600_000, 0).await?;
+    assert_eq!(
+        after_last,
+        (ERROR_NONE, -1, -1),
+        "timestamp after the last record"
+    );
+    let by_timestamp = wire.list_offsets(&topic, 0, now, 0).await?;
+    assert_eq!(
+        by_timestamp,
+        (ERROR_NONE, 0, now),
+        "a matching record still resolves"
+    );
+    let max_on_empty = wire.list_offsets(&topic, 1, -3, 0).await?;
+    assert_eq!(
+        max_on_empty,
+        (ERROR_NONE, -1, -1),
+        "MAX_TIMESTAMP of an empty partition"
+    );
+    println!("✅ NONE / -1 / -1 when no record matches\n");
 
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");

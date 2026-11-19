@@ -210,6 +210,7 @@ use kafka_test::{
     test_leave_during_rebalance,
     test_list_offsets_by_timestamp,
     test_list_offsets_empty_topic,
+    test_list_offsets_without_a_matching_record_is_offset_minus_one,
     test_listener_idle_long_poll_does_not_refetch,
     test_listener_pipelined_requests_beyond_in_flight_cap,
     test_listener_produce_wakes_long_poll_promptly,
@@ -1004,6 +1005,12 @@ fn get_all_tests() -> Vec<TestDef> {
             category: "error_paths",
             name: "test_produce_response_reports_log_start_offset",
             test_fn: wrap_test!(test_produce_response_reports_log_start_offset),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_list_offsets_without_a_matching_record_is_offset_minus_one",
+            test_fn: wrap_test!(test_list_offsets_without_a_matching_record_is_offset_minus_one),
             parallel_safe: true,
         },
         TestDef {

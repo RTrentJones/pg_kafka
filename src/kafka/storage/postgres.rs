@@ -1264,6 +1264,11 @@ impl PostgresStore {
                 )?
             };
 
+            // No matching record (a timestamp after the last one, or an empty
+            // partition): reading the first row of an empty result is an error in SPI.
+            if table.is_empty() {
+                return Ok(None);
+            }
             let row = table.first();
             match row.get_by_name::<i64, _>("partition_offset")? {
                 Some(offset) => {
