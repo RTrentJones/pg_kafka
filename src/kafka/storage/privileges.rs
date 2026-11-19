@@ -191,7 +191,7 @@ mod tests {
         ("shadow/store.rs", include_str!("../shadow/store.rs")),
         ("shadow/outbox.rs", include_str!("../shadow/outbox.rs")),
         ("metrics.rs", include_str!("../metrics.rs")),
-        ("worker.rs", include_str!("../../worker.rs")),
+        ("worker/schema.rs", include_str!("../../worker/schema.rs")),
         (
             "auth/credentials.rs",
             include_str!("../auth/credentials.rs"),
