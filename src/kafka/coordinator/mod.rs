@@ -382,71 +382,20 @@ impl GroupCoordinator {
         }
 
         if !groups.contains_key(&group_id) {
-            // A new group must also be a valid one (checked here so a refused join leaves no
-            // group behind).
-            if params.protocol_type.is_empty() || params.protocols.is_empty() {
-                return Err(inconsistent_protocol(&group_id));
-            }
-            // Bound the coordinator's memory (pg_kafka.max_consumer_groups): make room by
-            // forgetting the least recently active Empty group (its committed offsets stay in
-            // the database, so it remains visible as an Empty group), else refuse with the
-            // retriable COORDINATOR_NOT_AVAILABLE.
-            if groups.len() >= max_groups {
-                let victim = groups
-                    .values()
-                    .filter(|g| g.state == GroupState::Empty)
-                    .min_by_key(|g| g.last_activity)
-                    .map(|g| g.group_id.clone());
-                match victim {
-                    Some(v) if groups.len() == max_groups => {
-                        groups.remove(&v);
-                    }
-                    _ => {
-                        crate::pg_warning!(
-                            "JoinGroup for new group '{}' refused: {} groups in memory (pg_kafka.max_consumer_groups = {})",
-                            group_id,
-                            groups.len(),
-                            max_groups
-                        );
-                        return Err(KafkaError::CoordinatorNotAvailable { group_id });
-                    }
-                }
-            }
+            Self::admit_new_group(groups, params, max_groups)?;
         }
 
         let group = groups
             .entry(group_id.clone())
             .or_insert_with(|| ConsumerGroup::new(group_id.clone()));
+        Self::admit_member(group, params, max_group_size)?;
 
         let known_id = params.member_id.clone();
-
-        // Cap members per group (DoS protection; Kafka's group.max.size). A rejoining
-        // member (already present) is always allowed; only a new member is rejected.
-        if known_id.is_none() && group.members.len() >= max_group_size {
-            return Err(KafkaError::Protocol {
-                code: crate::kafka::constants::ERROR_GROUP_MAX_SIZE_REACHED,
-                message: format!(
-                    "group '{group_id}' has reached the maximum of {max_group_size} members"
-                ),
-            });
-        }
-
-        // Kafka's protocol check: the member's protocol type must be the group's and it must
-        // share at least one protocol with every other member.
-        if !group.supports_protocols(
-            known_id.as_deref(),
-            &params.protocol_type,
-            &params.protocols,
-        ) {
-            return Err(inconsistent_protocol(&group_id));
-        }
-
         let unchanged = known_id
             .as_ref()
             .and_then(|id| group.members.get(id))
             .is_some_and(|m| m.protocols == params.protocols);
         let member_id = known_id.unwrap_or_else(|| generate_member_id(&params.client_id));
-        let is_leader = group.leader.as_deref() == Some(member_id.as_str());
 
         pg_log!(
             "JoinGroup: group_id={}, member_id={}, state={:?}",
@@ -454,19 +403,95 @@ impl GroupCoordinator {
             member_id,
             group.state
         );
+        Ok(Self::apply_join(group, member_id, params, unchanged, out))
+    }
 
+    /// Whether a JoinGroup may create the group it names: a new group must be a valid one
+    /// (checked first, so a refused join leaves no group behind), and the coordinator's
+    /// memory is bounded (pg_kafka.max_consumer_groups). Room is made by forgetting the
+    /// least recently active Empty group (its committed offsets stay in the database, so
+    /// it remains visible as an Empty group), else the join gets the retriable
+    /// COORDINATOR_NOT_AVAILABLE.
+    fn admit_new_group(
+        groups: &mut HashMap<String, ConsumerGroup>,
+        params: &JoinGroupParams,
+        max_groups: usize,
+    ) -> Result<()> {
+        let group_id = &params.group_id;
+        if params.protocol_type.is_empty() || params.protocols.is_empty() {
+            return Err(inconsistent_protocol(group_id));
+        }
+        if groups.len() < max_groups {
+            return Ok(());
+        }
+        let victim = groups
+            .values()
+            .filter(|g| g.state == GroupState::Empty)
+            .min_by_key(|g| g.last_activity)
+            .map(|g| g.group_id.clone());
+        match victim {
+            Some(v) if groups.len() == max_groups => {
+                groups.remove(&v);
+                Ok(())
+            }
+            _ => {
+                crate::pg_warning!(
+                    "JoinGroup for new group '{}' refused: {} groups in memory (pg_kafka.max_consumer_groups = {})",
+                    group_id,
+                    groups.len(),
+                    max_groups
+                );
+                Err(KafkaError::CoordinatorNotAvailable {
+                    group_id: group_id.clone(),
+                })
+            }
+        }
+    }
+
+    /// Whether the group admits this member: a new member is refused once the group has
+    /// pg_kafka.group_max_size members (Kafka's group.max.size; a rejoining member is
+    /// always allowed), and by Kafka's protocol check the member's protocol type must be
+    /// the group's and it must share at least one protocol with every other member.
+    fn admit_member(
+        group: &ConsumerGroup,
+        params: &JoinGroupParams,
+        max_group_size: usize,
+    ) -> Result<()> {
+        let known_id = params.member_id.as_deref();
+        if known_id.is_none() && group.members.len() >= max_group_size {
+            return Err(KafkaError::Protocol {
+                code: crate::kafka::constants::ERROR_GROUP_MAX_SIZE_REACHED,
+                message: format!(
+                    "group '{}' has reached the maximum of {max_group_size} members",
+                    params.group_id
+                ),
+            });
+        }
+        if !group.supports_protocols(known_id, &params.protocol_type, &params.protocols) {
+            return Err(inconsistent_protocol(&params.group_id));
+        }
+        Ok(())
+    }
+
+    /// Add or update an admitted member and decide its JoinGroup: an unchanged rejoin of a
+    /// Stable group's follower, or of a CompletingRebalance group's member, is answered with
+    /// the current generation; anything else joins (or starts) a join phase and is held.
+    fn apply_join(
+        group: &mut ConsumerGroup,
+        member_id: String,
+        params: &JoinGroupParams,
+        unchanged: bool,
+        out: &mut Vec<Delivery>,
+    ) -> JoinDisposition {
+        let is_leader = group.leader.as_deref() == Some(member_id.as_str());
         match group.state {
             GroupState::Stable if unchanged && !is_leader => {
                 group.upsert_member(&member_id, params);
-                return Ok(JoinDisposition::Respond(Ok(
-                    group.join_result_for(&member_id)
-                )));
+                return JoinDisposition::Respond(Ok(group.join_result_for(&member_id)));
             }
             GroupState::CompletingRebalance if unchanged => {
                 group.upsert_member(&member_id, params);
-                return Ok(JoinDisposition::Respond(Ok(
-                    group.join_result_for(&member_id)
-                )));
+                return JoinDisposition::Respond(Ok(group.join_result_for(&member_id)));
             }
             GroupState::Empty | GroupState::Stable | GroupState::CompletingRebalance => {
                 group.upsert_member(&member_id, params);
@@ -482,10 +507,10 @@ impl GroupCoordinator {
         }
         group.maybe_complete_join(out);
 
-        Ok(JoinDisposition::Hold {
-            group_id,
+        JoinDisposition::Hold {
+            group_id: group.group_id.clone(),
             member_id,
-        })
+        }
     }
 
     /// Handle a SyncGroup request.
