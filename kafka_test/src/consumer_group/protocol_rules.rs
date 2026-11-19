@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 /// protocol type, no common protocol, or an empty protocol list; UNKNOWN_MEMBER_ID for a JoinGroup
 /// with a member id the group does not know (no group is created for it); and a v5 error
 /// response decodes (protocol_name "" rather than null before v7). The group is unaffected.
-pub async fn test_w3g_join_group_protocol_rules() -> TestResult {
+pub async fn test_join_group_protocol_and_member_id_rules() -> TestResult {
     println!("=== Test: JoinGroup protocol rules ===\n");
     let ctx = TestContext::new().await?;
     let group = ctx.unique_group("w3g-proto").await;
@@ -89,7 +89,7 @@ pub async fn test_w3g_join_group_protocol_rules() -> TestResult {
 /// Items 3 + 7 with real clients: an rdkafka consumer using the cooperative-sticky assignor
 /// joining a group whose member uses range gets INCONSISTENT_GROUP_PROTOCOL, and the existing
 /// member keeps its assignment and keeps consuming (no rebalance is started by the refused join).
-pub async fn test_w3g_different_assignor_is_refused_group_unaffected() -> TestResult {
+pub async fn test_join_with_no_common_assignor_is_refused() -> TestResult {
     println!("=== Test: a consumer with no common assignor is refused ===\n");
     let ctx = TestContext::new().await?;
     let topic = ctx.unique_topic("w3g-assignor").await;
@@ -162,7 +162,7 @@ pub async fn test_w3g_different_assignor_is_refused_group_unaffected() -> TestRe
 /// group to commit. Before: after a restart the group was missing from ListGroups and "Dead" in
 /// DescribeGroups (`kafka-consumer-groups --describe` said it does not exist), and DeleteGroups of
 /// a group that never existed answered NONE. Sequential: restarts the listener worker.
-pub async fn test_w3g_offsets_only_group_survives_restart() -> TestResult {
+pub async fn test_offsets_only_group_is_listed_after_restart() -> TestResult {
     println!("=== Test: offsets-only groups are Empty groups after a restart ===\n");
     let ctx = TestContext::new().await?;
     let topic = ctx.unique_topic("w3g-oo").await;

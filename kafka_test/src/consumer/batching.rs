@@ -6,7 +6,7 @@ use crate::wire::requests::{topic, NONE};
 use crate::wire::{batch, batch_headers, fetched_values, Wire};
 
 /// Fetch groups records into batches (was: one RecordBatch per record).
-pub async fn test_w3_fetch_groups_records_into_batches() -> TestResult {
+pub async fn test_fetch_groups_records_into_batches() -> TestResult {
     println!("=== Test: fetch returns records grouped into batches ===\n");
     let ctx = TestContext::new().await?;
     let t = topic(&ctx, "w3-txn-batch", 1).await?;

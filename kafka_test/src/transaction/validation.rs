@@ -11,7 +11,7 @@ use crate::wire::{batch, Wire};
 /// Transaction validation: InitProducerId timeouts, AddPartitionsToTxn on an unknown
 /// topic (not created any more), and a transactional Produce to a partition the
 /// transaction did not add.
-pub async fn test_w3_transaction_validation() -> TestResult {
+pub async fn test_transactional_requests_are_validated() -> TestResult {
     println!("=== Test: transaction validation ===\n");
     let ctx = TestContext::new().await?;
     let t = topic(&ctx, "w3-txn-val", 2).await?;

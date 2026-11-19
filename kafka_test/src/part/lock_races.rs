@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 /// that has just moved them (maintenance, uncommitted), a commit_transaction that arrives meanwhile:
 /// after the session commits, the commit succeeds, no row of the transaction is left
 /// pending and a read_committed consumer reads all of them.
-pub async fn test_w3_end_txn_during_default_leaf_move() -> TestResult {
+pub async fn test_end_txn_during_default_leaf_move() -> TestResult {
     into_test_result(end_txn_during_move().await)
 }
 
@@ -190,7 +190,7 @@ async fn end_txn_during_move() -> DynResult<()> {
 /// maintenance returns within 6 s, `drop_message_partition` returns dropped=false
 /// without an error and a retention sweep succeeds; and a drop that waits behind
 /// another session's drop of the same leaf returns dropped=false after it commits.
-pub async fn test_w3_partition_maintenance_lock_waits_are_bounded() -> TestResult {
+pub async fn test_partition_maintenance_lock_waits_are_bounded() -> TestResult {
     into_test_result(maintenance_lock_waits().await)
 }
 

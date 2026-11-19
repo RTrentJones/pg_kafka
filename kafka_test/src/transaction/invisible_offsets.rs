@@ -150,7 +150,7 @@ async fn high_watermark(
 }
 
 /// Aborted transaction at the end of the partition.
-pub async fn test_w3_read_committed_passes_aborted_tail() -> TestResult {
+pub async fn test_read_committed_consumer_passes_aborted_tail() -> TestResult {
     println!("=== Test: read_committed consumer passes an aborted tail ===\n");
     let ctx = TestContext::new().await?;
     let topic = TestTopicBuilder::new(&ctx, "w3-txn-tail")
@@ -197,7 +197,7 @@ pub async fn test_w3_read_committed_passes_aborted_tail() -> TestResult {
 }
 
 /// Aborted transaction between two committed ones.
-pub async fn test_w3_read_committed_passes_aborted_middle() -> TestResult {
+pub async fn test_read_committed_consumer_passes_aborted_middle() -> TestResult {
     println!("=== Test: read_committed consumer passes an aborted transaction in the middle ===\n");
     let ctx = TestContext::new().await?;
     let topic = TestTopicBuilder::new(&ctx, "w3-txn-mid")
@@ -221,7 +221,7 @@ pub async fn test_w3_read_committed_passes_aborted_middle() -> TestResult {
 
 /// Aborted rows deleted by the cleanup (retention sweep): read_uncommitted consumers
 /// see a hole at the tail too.
-pub async fn test_w3_consumers_pass_cleaned_up_aborted_rows() -> TestResult {
+pub async fn test_consumers_pass_cleaned_up_aborted_rows() -> TestResult {
     println!("=== Test: consumers pass aborted rows deleted by the cleanup ===\n");
     let ctx = TestContext::new().await?;
     let topic = TestTopicBuilder::new(&ctx, "w3-txn-clean")
@@ -259,7 +259,7 @@ pub async fn test_w3_consumers_pass_cleaned_up_aborted_rows() -> TestResult {
 
 /// DeleteRecords up to the end, then an aborted transaction: a consumer starting from
 /// the log start sees nothing and must still reach the end.
-pub async fn test_w3_consumers_pass_delete_records_gap() -> TestResult {
+pub async fn test_consumers_pass_delete_records_gap() -> TestResult {
     println!("=== Test: consumers pass a DeleteRecords gap followed by an abort ===\n");
     let ctx = TestContext::new().await?;
     let topic = TestTopicBuilder::new(&ctx, "w3-txn-del")
@@ -293,7 +293,7 @@ pub async fn test_w3_consumers_pass_delete_records_gap() -> TestResult {
 
 /// An open transaction still blocks read_committed consumers at the LSO, and they
 /// continue once it commits.
-pub async fn test_w3_read_committed_stops_at_open_transaction() -> TestResult {
+pub async fn test_read_committed_consumer_stops_at_open_transaction() -> TestResult {
     println!("=== Test: read_committed consumer stops at an open transaction ===\n");
     let ctx = TestContext::new().await?;
     let topic = TestTopicBuilder::new(&ctx, "w3-txn-open")

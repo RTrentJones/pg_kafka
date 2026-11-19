@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 /// consumer and shadow-outbox polling run: every DDL statement succeeds, neither the server
 /// log nor pg_stat_database records a deadlock, the listener process survives (same pid), and afterwards a new
 /// topic round-trips through rdkafka.
-pub async fn test_w3_extension_ddl_loop_under_load() -> TestResult {
+pub async fn test_extension_ddl_loop_under_load() -> TestResult {
     into_test_result(extension_ddl_loop().await)
 }
 
@@ -196,7 +196,7 @@ async fn extension_ddl_loop() -> DynResult<()> {
 /// a restarted worker logs none of the per-cycle failures and the degrade WARNING at
 /// most once per start; after the update and a reload, broker metrics are published
 /// and a time partition covering now exists.
-pub async fn test_w3_old_schema_degrades_gracefully() -> TestResult {
+pub async fn test_old_schema_degrades_gracefully() -> TestResult {
     into_test_result(old_schema().await)
 }
 
@@ -324,7 +324,7 @@ async fn old_schema() -> DynResult<()> {
 /// Asserts: with the worker lock timeout disabled and a Produce blocked on a held row
 /// lock (pg_stat_activity shows a Lock wait), `pg_terminate_backend` ends the worker
 /// within 3 s while the lock is still held; a new worker then serves.
-pub async fn test_w3_sigterm_interrupts_lock_wait() -> TestResult {
+pub async fn test_sigterm_interrupts_a_worker_lock_wait() -> TestResult {
     into_test_result(sigterm_lock_wait().await)
 }
 
@@ -396,7 +396,7 @@ async fn sigterm_lock_wait() -> DynResult<()> {
 /// Asserts: with the timeout at 1 s and a Produce blocked on a held row lock, a
 /// ListOffsets for another topic is answered within 4 s, and after the lock is released
 /// the blocked partition accepts produces again.
-pub async fn test_w3_lock_timeout_bounds_stuck_lock() -> TestResult {
+pub async fn test_worker_lock_timeout_bounds_a_stuck_lock() -> TestResult {
     into_test_result(lock_timeout_bounds().await)
 }
 
@@ -472,7 +472,7 @@ async fn lock_timeout_bounds() -> DynResult<()> {
 /// Asserts: with a deferred constraint trigger that fails at commit for one topic, a
 /// produce (no retries) to that topic gets an error response within 5 s, the listener
 /// pid is unchanged, and another produce succeeds right after.
-pub async fn test_w3_commit_failure_answered_without_restart() -> TestResult {
+pub async fn test_commit_failure_answered_without_restart() -> TestResult {
     into_test_result(commit_failure().await)
 }
 

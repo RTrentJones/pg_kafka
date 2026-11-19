@@ -27,8 +27,8 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         edge_cases::test_offset_reset_policy,
         edge_cases::test_offset_commit_multi_partition,
         edge_cases::test_offset_seek,
-        commit_rules::test_w3g_offset_commit_rules,
-        list_offsets_isolation::test_w3_list_offsets_isolation_max_timestamp_and_partitions,
-        require_stable::test_w3_offset_fetch_require_stable,
+        commit_rules::test_offset_commit_generation_and_member_rules,
+        list_offsets_isolation::test_list_offsets_isolation_max_timestamp_and_partitions,
+        require_stable::test_offset_fetch_require_stable,
     ]
 }

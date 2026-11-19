@@ -9,7 +9,7 @@ use crate::wire::{batch, now_ms, Wire};
 /// lookup past the readable end is -1, and a partition the topic lacks is
 /// UNKNOWN_TOPIC_OR_PARTITION (were: HWM; the first record; the pending record; NONE
 /// and offset 0).
-pub async fn test_w3_list_offsets_isolation_max_timestamp_and_partitions() -> TestResult {
+pub async fn test_list_offsets_isolation_max_timestamp_and_partitions() -> TestResult {
     println!("=== Test: ListOffsets isolation, MAX_TIMESTAMP, partition check ===\n");
     let ctx = TestContext::new().await?;
     let t = topic(&ctx, "w3-txn-lo", 1).await?;

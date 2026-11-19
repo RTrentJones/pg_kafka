@@ -10,7 +10,7 @@ use crate::wire::requests::*;
 /// the right member and generation accepted; Empty group: gen -1 accepted, gen >= 0
 /// UNKNOWN_MEMBER_ID. Before: gen -1 was accepted for a group with members, and an unknown group
 /// at gen >= 0 got UNKNOWN_MEMBER_ID.
-pub async fn test_w3g_offset_commit_rules() -> TestResult {
+pub async fn test_offset_commit_generation_and_member_rules() -> TestResult {
     println!("=== Test: OffsetCommit rules ===\n");
     let ctx = TestContext::new().await?;
     let topic = ctx.unique_topic("w3g-commit").await;

@@ -82,7 +82,7 @@ async fn produce_ok(
 /// used to hold the whole 512 MiB frame budget: every other client, even a 20-byte
 /// ApiVersions, was refused until they went away. Now only bytes actually received are
 /// charged, and small frames never are.
-pub async fn test_w3_net_frame_budget_lockout() -> TestResult {
+pub async fn test_partial_frames_cannot_exhaust_the_frame_budget() -> TestResult {
     println!("=== Test: w3_net frame-budget lockout ===\n");
     let ctx = TestContext::new().await?;
     let topic = ctx.unique_topic("w3-net-budget").await;
@@ -135,7 +135,7 @@ pub async fn test_w3_net_frame_budget_lockout() -> TestResult {
 /// (LengthDelimitedCodec caps outbound frames too) and the connection hung: the client
 /// never got an answer, and nothing else on the connection was answered either. A
 /// response is bounded by the request's max_bytes, as in Kafka.
-pub async fn test_w3_net_oversized_response_is_delivered() -> TestResult {
+pub async fn test_response_larger_than_the_request_limit_is_delivered() -> TestResult {
     println!("=== Test: w3_net >100 MB fetch response ===\n");
     let ctx = TestContext::new().await?;
     let topic = ctx.unique_topic("w3-net-big").await;
@@ -185,7 +185,7 @@ pub async fn test_w3_net_oversized_response_is_delivered() -> TestResult {
 
 /// Item 3: without TCP_NODELAY the second of two pipelined responses waits for the
 /// client's delayed ACK (~40 ms on Linux).
-pub async fn test_w3_net_tcp_nodelay() -> TestResult {
+pub async fn test_pipelined_requests_are_not_delayed_by_nagle() -> TestResult {
     println!("=== Test: w3_net TCP_NODELAY ===\n");
     let mut s = TcpStream::connect(("127.0.0.1", PORT)).await?;
     s.set_nodelay(true)?;
@@ -224,7 +224,7 @@ pub async fn test_w3_net_tcp_nodelay() -> TestResult {
 
 /// Item 4: Kafka closes the connection when an acks=0 produce hits any partition error
 /// (after the good partitions are written), so the client refreshes its metadata.
-pub async fn test_w3_net_acks0_error_closes_connection() -> TestResult {
+pub async fn test_acks0_produce_error_closes_connection() -> TestResult {
     println!("=== Test: w3_net acks=0 error closes the connection ===\n");
     let ctx = TestContext::new().await?;
     let topic = ctx.unique_topic("w3-net-acks0").await;
@@ -321,7 +321,7 @@ pub async fn test_w3_net_acks0_error_closes_connection() -> TestResult {
 
 /// Item 5: acks other than -1, 0, 1 are answered INVALID_REQUIRED_ACKS and nothing is
 /// written.
-pub async fn test_w3_net_invalid_acks_rejected() -> TestResult {
+pub async fn test_invalid_acks_rejected_and_nothing_written() -> TestResult {
     println!("=== Test: w3_net invalid acks ===\n");
     let ctx = TestContext::new().await?;
     let topic = ctx.unique_topic("w3-net-acks").await;
@@ -368,7 +368,7 @@ pub async fn test_w3_net_invalid_acks_rejected() -> TestResult {
 /// Item 6: Kafka reads a connection serially, so a request before the frame that closes
 /// the connection is always answered. The listener used to give the writer 100 ms and
 /// then abort it, dropping e.g. a long-poll fetch's response.
-pub async fn test_w3_net_response_before_close() -> TestResult {
+pub async fn test_request_before_closing_frame_is_answered() -> TestResult {
     println!("=== Test: w3_net responses before close ===\n");
     let ctx = TestContext::new().await?;
     let topic = ctx.unique_topic("w3-net-close").await;

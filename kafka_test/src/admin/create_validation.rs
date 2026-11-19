@@ -18,7 +18,7 @@ use std::time::Duration;
 /// backs it up. Before: 2,000,000,000 was accepted and stored, and the next Metadata request
 /// aborted the worker (memory allocation of 224000000000 bytes failed, signal 6, crash
 /// recovery, repeated on every Metadata as long as the row existed).
-pub async fn test_w3g_partition_cap() -> TestResult {
+pub async fn test_partition_count_above_cap_is_rejected() -> TestResult {
     println!("=== Test: partition counts are capped ===\n");
     let ctx = TestContext::new().await?;
     let huge = ctx.unique_topic("w3g-huge").await;
@@ -112,7 +112,7 @@ pub async fn test_w3g_partition_cap() -> TestResult {
 /// replication factor 3 -> INVALID_REPLICATION_FACTOR, 0 / -2 -> INVALID_REPLICATION_FACTOR,
 /// -1 -> created. Before: duplicates were created then TOPIC_ALREADY_EXISTS, collisions and any
 /// replication factor were accepted.
-pub async fn test_w3g_create_topics_validation() -> TestResult {
+pub async fn test_create_topics_rejects_duplicates_collisions_and_bad_replication() -> TestResult {
     println!("=== Test: CreateTopics validation ===\n");
     let ctx = TestContext::new().await?;
     let base = ctx.unique_topic("w3g-val").await.replace('-', "");

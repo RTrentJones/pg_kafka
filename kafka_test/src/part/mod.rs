@@ -12,7 +12,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         time_partitions::test_time_partition_retention_drops_whole_partitions: sequential,
         time_partitions::test_time_partition_retention_waits_for_pending_transaction: sequential,
         time_partitions::test_time_partition_maintenance_and_least_privilege: sequential,
-        lock_races::test_w3_partition_maintenance_lock_waits_are_bounded: sequential,
-        lock_races::test_w3_end_txn_during_default_leaf_move: sequential,
+        lock_races::test_partition_maintenance_lock_waits_are_bounded: sequential,
+        lock_races::test_end_txn_during_default_leaf_move: sequential,
     ]
 }

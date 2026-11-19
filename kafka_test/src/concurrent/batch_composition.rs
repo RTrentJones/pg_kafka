@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 ///
 /// Asserts: the 60 produces complete within 5 s while the heartbeat flood is served
 /// (every flood connection keeps getting responses).
-pub async fn test_w3_heartbeats_do_not_split_batches() -> TestResult {
+pub async fn test_heartbeats_do_not_split_group_commit_batches() -> TestResult {
     into_test_result(heartbeats_batches().await)
 }
 

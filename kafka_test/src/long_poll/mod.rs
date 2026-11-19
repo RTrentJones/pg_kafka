@@ -25,6 +25,6 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         edge_cases::test_long_poll_consumer_disconnect,
         edge_cases::test_long_poll_multiple_consumers_same_partition: sequential, // Multiple consumers
         edge_cases::test_long_poll_auto_commit_interval: sequential, // Timing-sensitive
-        transaction_end::test_w3_transaction_end_wakes_read_committed: sequential,
+        transaction_end::test_transaction_end_wakes_parked_read_committed_fetch: sequential,
     ]
 }

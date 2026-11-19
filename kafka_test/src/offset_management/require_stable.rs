@@ -7,7 +7,7 @@ use crate::wire::Wire;
 
 /// OffsetFetch v7 require_stable (KIP-447): UNSTABLE_OFFSET_COMMIT while a
 /// TxnOffsetCommit is pending, the committed offset once the transaction ends.
-pub async fn test_w3_offset_fetch_require_stable() -> TestResult {
+pub async fn test_offset_fetch_require_stable() -> TestResult {
     println!("=== Test: OffsetFetch require_stable ===\n");
     let ctx = TestContext::new().await?;
     let t = topic(&ctx, "w3-txn-of", 2).await?;

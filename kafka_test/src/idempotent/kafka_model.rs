@@ -12,7 +12,7 @@ use std::time::Duration;
 /// client-bumped epoch must restart at 0 and fences the old epoch with
 /// INVALID_PRODUCER_EPOCH. Before wave 3 every range at or below the last sequence was
 /// acked with offset -1 and dropped, and any other epoch was PRODUCER_FENCED.
-pub async fn test_w3_idempotent_producer_follows_kafka() -> TestResult {
+pub async fn test_idempotent_duplicates_and_epochs_follow_kafka() -> TestResult {
     println!("=== Test: idempotent producer follows Kafka's model ===\n");
     let ctx = TestContext::new().await?;
     let t = topic(&ctx, "w3-txn-idem", 1).await?;
@@ -137,7 +137,7 @@ async fn reconnect() -> Result<Wire, Box<dyn std::error::Error>> {
 }
 
 /// Sequence numbers wrap at i32::MAX, as in Kafka.
-pub async fn test_w3_idempotent_sequence_wraps() -> TestResult {
+pub async fn test_idempotent_sequence_wraps_at_i32_max() -> TestResult {
     println!("=== Test: idempotent sequence wraps at i32::MAX ===\n");
     let ctx = TestContext::new().await?;
     let t = topic(&ctx, "w3-txn-wrap", 1).await?;

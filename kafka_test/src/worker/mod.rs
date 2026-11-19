@@ -198,11 +198,11 @@ pub async fn session() -> DynResult<Client> {
 /// The `worker` tests, in run order.
 pub fn tests() -> Vec<crate::registry::TestDef> {
     crate::test_defs!["worker";
-        lifecycle::test_w3_lock_timeout_bounds_stuck_lock: sequential,
-        lifecycle::test_w3_sigterm_interrupts_lock_wait: sequential,
-        lifecycle::test_w3_commit_failure_answered_without_restart: sequential,
-        lifecycle::test_w3_old_schema_degrades_gracefully: sequential,
-        lifecycle::test_w3_extension_ddl_loop_under_load: sequential,
+        lifecycle::test_worker_lock_timeout_bounds_a_stuck_lock: sequential,
+        lifecycle::test_sigterm_interrupts_a_worker_lock_wait: sequential,
+        lifecycle::test_commit_failure_answered_without_restart: sequential,
+        lifecycle::test_old_schema_degrades_gracefully: sequential,
+        lifecycle::test_extension_ddl_loop_under_load: sequential,
     ]
 }
 

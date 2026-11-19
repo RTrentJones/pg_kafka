@@ -23,7 +23,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         edge_cases::test_idempotent_producer_restart,
         edge_cases::test_idempotent_concurrent_producers: sequential, // Concurrent producers
         edge_cases::test_idempotent_high_sequence,
-        kafka_model::test_w3_idempotent_producer_follows_kafka: sequential,
-        kafka_model::test_w3_idempotent_sequence_wraps,
+        kafka_model::test_idempotent_duplicates_and_epochs_follow_kafka: sequential,
+        kafka_model::test_idempotent_sequence_wraps_at_i32_max,
     ]
 }

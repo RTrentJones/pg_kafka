@@ -62,7 +62,7 @@ async fn drop_users(db: &Client) -> DynResult<()> {
 /// Reconfigure + restart the listener; create the SASL users: three SCRAM users with
 /// 8192 iterations (the most common parameters) and two libpq-style verifiers (4096
 /// iterations, 16-byte salt).
-pub async fn test_w3_net_limits_setup() -> TestResult {
+pub async fn test_network_limits_setup() -> TestResult {
     println!("=== Test: w3_net limits setup ===\n");
     ensure_certificates()?;
     let db = create_db_client().await?;
@@ -94,7 +94,7 @@ pub async fn test_w3_net_limits_setup() -> TestResult {
 }
 
 /// Reset everything the setup changed.
-pub async fn test_w3_net_limits_teardown() -> TestResult {
+pub async fn test_network_limits_teardown() -> TestResult {
     println!("=== Test: w3_net limits teardown ===\n");
     let db = create_db_client().await?;
     for (name, _) in gucs() {
@@ -133,7 +133,7 @@ async fn rejected(src: Ipv4Addr, port: u16) -> DynResult<bool> {
 }
 
 /// Item 8: `pg_kafka.max_connections_per_ip`, across listeners; other IPs unaffected.
-pub async fn test_w3_net_per_ip_limit() -> TestResult {
+pub async fn test_per_ip_connection_limit() -> TestResult {
     println!("=== Test: w3_net per-IP connection limit ===\n");
     let attacker = Ipv4Addr::new(127, 0, 0, 2);
     let mut conns = open_answering(attacker, PORT, MAX_PER_IP).await?;
@@ -171,7 +171,7 @@ pub async fn test_w3_net_per_ip_limit() -> TestResult {
 
 /// Item 8: each listener has its own `pg_kafka.max_connections`, so a flood on one
 /// (here 19096) does not lock clients out of another (9092).
-pub async fn test_w3_net_per_listener_limit() -> TestResult {
+pub async fn test_per_listener_connection_limit() -> TestResult {
     println!("=== Test: w3_net per-listener connection limit ===\n");
     let mut conns = open_answering(Ipv4Addr::new(127, 0, 0, 3), PLAIN_PORT, MAX_PER_IP).await?;
     conns.extend(
@@ -200,7 +200,7 @@ pub async fn test_w3_net_per_listener_limit() -> TestResult {
 /// that does not arrive completely within `request_read_timeout_ms` closes its
 /// connection; a consumer that keeps polling is not affected, and a producer whose idle
 /// connection was closed reconnects.
-pub async fn test_w3_net_idle_and_frame_read_timeouts() -> TestResult {
+pub async fn test_idle_and_frame_read_timeouts_close_connections() -> TestResult {
     println!("=== Test: w3_net idle and frame read timeouts ===\n");
     let low = Duration::from_millis(IDLE_MS - 500);
     let high = Duration::from_millis(IDLE_MS + 3000);
@@ -298,7 +298,7 @@ pub async fn test_w3_net_idle_and_frame_read_timeouts() -> TestResult {
 /// Item 10: one pre-auth deadline (10 s) from accept. A SASL_SSL client whose TLS
 /// handshake takes 7 s used to get another 10 s for SASL (closed at ~17 s); now it is
 /// closed at ~10 s. Also a SASL_PLAINTEXT client that stops after the handshake.
-pub async fn test_w3_net_pre_auth_deadline_from_accept() -> TestResult {
+pub async fn test_pre_auth_deadline_runs_from_accept() -> TestResult {
     println!("=== Test: w3_net pre-auth deadline from accept ===\n");
     // SASL_PLAINTEXT: handshake, then silence.
     let mut s = connect_from(Ipv4Addr::new(127, 0, 0, 8), SASL_PORT).await?;
@@ -488,7 +488,7 @@ fn server_first_params(m: &str) -> DynResult<(Vec<u8>, u32)> {
 /// most common iteration count and salt length) and its salt is stable across worker
 /// restarts (a durable secret); it used to be i=4096 / 32 bytes always, with a salt that
 /// changed on every restart.
-pub async fn test_w3_net_scram_unknown_user_indistinguishable() -> TestResult {
+pub async fn test_scram_unknown_user_is_indistinguishable() -> TestResult {
     println!("=== Test: w3_net SCRAM unknown-user fake credential ===\n");
     let mut s = TcpStream::connect(("127.0.0.1", SASL_PORT)).await?;
     let real = scram_first(&mut s, "SCRAM-SHA-256", USER)
@@ -551,7 +551,7 @@ pub async fn test_w3_net_scram_unknown_user_indistinguishable() -> TestResult {
 /// 10 lookups per second (burst 20); over that they wait, and far over it the lookup
 /// never happens and the connection is closed at its pre-auth deadline, unanswered.
 /// Well-behaved clients from other addresses authenticate meanwhile.
-pub async fn test_w3_net_sasl_lookup_rate_limit() -> TestResult {
+pub async fn test_sasl_credential_lookups_are_rate_limited() -> TestResult {
     println!("=== Test: w3_net SASL lookup rate limit ===\n");
     let attacker = Ipv4Addr::new(127, 0, 0, 7);
     const N: usize = 45;

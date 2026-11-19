@@ -183,6 +183,6 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         test_metadata_all_topics,
         test_metadata_nonexistent_topic,
         test_metadata_refresh_after_create,
-        corrupt_partition_count::test_w3g_metadata_survives_corrupt_partition_count: sequential, // drops and restores the CHECK constraint on kafka.topics
+        corrupt_partition_count::test_metadata_survives_corrupt_partition_count: sequential, // drops and restores the CHECK constraint on kafka.topics
     ]
 }

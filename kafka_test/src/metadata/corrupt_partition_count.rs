@@ -10,7 +10,7 @@ use kafka_protocol::messages::metadata_request::MetadataRequest;
 /// bypassed) is reported as an error for that topic instead of being allocated; the worker and
 /// the server stay up and other topics keep working. Sequential: drops and restores the
 /// constraint for the duration of the test.
-pub async fn test_w3g_metadata_survives_corrupt_partition_count() -> TestResult {
+pub async fn test_metadata_survives_corrupt_partition_count() -> TestResult {
     println!("=== Test: Metadata survives a corrupt stored partition count ===\n");
     let ctx = TestContext::new().await?;
     let bad = ctx.unique_topic("w3g-corrupt").await;

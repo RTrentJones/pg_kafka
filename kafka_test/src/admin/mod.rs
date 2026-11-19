@@ -727,7 +727,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         test_delete_group_idempotent,
         test_create_topic_with_config,
         test_create_topic_invalid_partitions,
-        create_validation::test_w3g_partition_cap,
-        create_validation::test_w3g_create_topics_validation,
+        create_validation::test_partition_count_above_cap_is_rejected,
+        create_validation::test_create_topics_rejects_duplicates_collisions_and_bad_replication,
     ]
 }

@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 /// pending transaction and a committed record after it: in 5 fencing rounds the
 /// record arrives within 300 ms of the fencing InitProducerId, and after a
 /// transaction-timeout abort within 500 ms of the abort.
-pub async fn test_w3_transaction_end_wakes_read_committed() -> TestResult {
+pub async fn test_transaction_end_wakes_parked_read_committed_fetch() -> TestResult {
     into_test_result(txn_end_wakes().await)
 }
 
