@@ -107,6 +107,16 @@ impl GroupMember {
         }
     }
 
+    /// Clear `awaiting_sync` as the parked SyncGroup is answered. The member sends no
+    /// Heartbeat while it waits (librdkafka does not), and the sweep exempts it for that
+    /// time, so the answer restarts its session clock, as Kafka's propagateAssignment
+    /// does for every member it answers; otherwise the first sweep after a wait longer
+    /// than the session timeout would evict it.
+    pub(super) fn release_parked_sync(&mut self, now: Instant) {
+        self.awaiting_sync = false;
+        self.last_heartbeat = now;
+    }
+
     /// How long this member allows a rebalance to take: its rebalance timeout, or for a
     /// v0 JoinGroup (which carries none) its session timeout, as Kafka does.
     pub(super) fn effective_rebalance_timeout_ms(&self) -> u128 {
@@ -316,12 +326,13 @@ impl ConsumerGroup {
     /// the sync phase being abandoned are answered REBALANCE_IN_PROGRESS (Kafka's
     /// answer too), so those members rejoin.
     pub(super) fn prepare_rebalance(&mut self, out: &mut Vec<Delivery>) {
+        let now = Instant::now();
         let mut parked: Vec<String> = self
             .members
             .values_mut()
             .filter(|m| m.awaiting_sync)
             .map(|m| {
-                m.awaiting_sync = false;
+                m.release_parked_sync(now);
                 m.member_id.clone()
             })
             .collect();
@@ -582,15 +593,16 @@ impl ConsumerGroup {
         // Save current assignments for sticky strategy
         self.previous_assignments.clear();
         let mut parked = Vec::new();
+        let now = Instant::now();
         for (member_id, member) in &mut self.members {
-            let assignment = member.assignment.get_or_insert_with(Vec::new);
+            let assignment = member.assignment.get_or_insert_with(Vec::new).clone();
             if !assignment.is_empty() {
                 self.previous_assignments
                     .insert(member_id.clone(), assignment.clone());
             }
             if member.awaiting_sync {
-                member.awaiting_sync = false;
-                parked.push((member_id.clone(), assignment.clone()));
+                member.release_parked_sync(now);
+                parked.push((member_id.clone(), assignment));
             }
         }
         parked.sort();

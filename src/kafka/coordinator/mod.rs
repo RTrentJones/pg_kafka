@@ -614,6 +614,12 @@ impl GroupCoordinator {
                 })
             }
             GroupState::CompletingRebalance if is_leader => {
+                // The leader's SyncGroup counts as liveness, as in Kafka: a leader that
+                // took longer than its session timeout to compute the assignments (it
+                // sends no Heartbeat meanwhile) is not evicted by the next sweep.
+                if let Some(member) = group.members.get_mut(member_id) {
+                    member.last_heartbeat = Instant::now();
+                }
                 // Membership cannot have changed since the leader got its member
                 // list: any join, leave or eviction after the join phase completed
                 // moved the group back to PreparingRebalance. Assignments for ids
@@ -634,7 +640,13 @@ impl GroupCoordinator {
                 Ok(None)
             }
             // Stable always carries an assignment (complete_sync fills in empty ones).
-            GroupState::Stable => Ok(Some(group.assignment_of(member_id))),
+            // Kafka counts this SyncGroup as liveness too.
+            GroupState::Stable => {
+                if let Some(member) = group.members.get_mut(member_id) {
+                    member.last_heartbeat = Instant::now();
+                }
+                Ok(Some(group.assignment_of(member_id)))
+            }
         }
     }
 

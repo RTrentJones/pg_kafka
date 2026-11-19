@@ -12,6 +12,7 @@ mod lifecycle;
 mod protocol_rules;
 mod rebalance;
 mod rebalance_edge_cases;
+mod sync_liveness;
 
 /// The `consumer_group` tests, in run order.
 pub fn tests() -> Vec<crate::registry::TestDef> {
@@ -34,5 +35,6 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         protocol_rules::test_join_group_protocol_and_member_id_rules,
         protocol_rules::test_join_with_no_common_assignor_is_refused,
         protocol_rules::test_offsets_only_group_is_listed_after_restart: sequential, // restarts the listener worker
+        sync_liveness::test_slow_leader_sync_keeps_silent_follower: sequential, // Has sleep delays
     ]
 }

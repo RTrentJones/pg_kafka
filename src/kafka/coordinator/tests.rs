@@ -1395,3 +1395,56 @@ fn test_is_group_leader() {
     assert!(!c.is_group_leader("g", &follower));
     assert!(!c.is_group_leader("nope", &leader));
 }
+
+#[test]
+fn test_late_leader_sync_answers_count_as_liveness() {
+    // Neither member heartbeats while the sync phase lasts longer than their session
+    // timeout (librdkafka sends no Heartbeat while its SyncGroup is outstanding). The
+    // SyncGroup answers restart both session clocks, as Kafka's propagateAssignment
+    // does, so the next sweep evicts nobody.
+    let c = GroupCoordinator::new();
+    let (leader, follower, gen) = completing_pair(&c, "g");
+    let parked = c.sync_park("g".to_string(), follower.clone(), gen, vec![]);
+    age_member(&c, "g", &follower, Duration::from_secs(31));
+    age_member(&c, "g", &leader, Duration::from_secs(31));
+    c.sync_now(
+        "g".to_string(),
+        leader.clone(),
+        gen,
+        vec![
+            (leader.clone(), b"L".to_vec()),
+            (follower.clone(), b"F".to_vec()),
+        ],
+    )
+    .unwrap();
+    assert_eq!(synced(&parked).unwrap(), b"F".to_vec());
+    assert_eq!(
+        c.check_and_remove_timed_out_members(),
+        [] as [(String, String); 0]
+    );
+    assert_eq!(state(&c, "g"), GroupState::Stable);
+    assert_eq!(c.get_group_state("g").unwrap().members.len(), 2);
+}
+
+#[test]
+fn test_follower_released_by_sync_phase_timeout_is_not_session_expired() {
+    // The leader never syncs: the sweep evicts it and tells the parked follower to
+    // rejoin. That answer restarts the follower's session clock, so the same sweep
+    // does not also evict the follower, which had not heartbeated while parked.
+    let c = GroupCoordinator::new();
+    let (leader, follower, gen) = completing_pair(&c, "g");
+    let parked = c.sync_park("g".to_string(), follower.clone(), gen, vec![]);
+    age_member(&c, "g", &follower, Duration::from_secs(31));
+    age_rebalance(&c, "g", Duration::from_secs(61));
+    assert_eq!(
+        c.check_and_remove_timed_out_members(),
+        vec![("g".to_string(), leader)]
+    );
+    assert_eq!(
+        synced(&parked).unwrap_err().to_kafka_error_code(),
+        crate::kafka::constants::ERROR_REBALANCE_IN_PROGRESS
+    );
+    let f = joined(&join(&c, "g", Some(&follower)));
+    assert!(f.is_leader());
+    assert_eq!(f.generation_id, gen + 1);
+}
