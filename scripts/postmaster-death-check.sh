@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Check that the pg_kafka listener worker does not outlive its postmaster (wave 3).
+# Check that the pg_kafka listener worker does not outlive its postmaster.
 #
 # Against a running cluster with pg_kafka installed and its listener up, this
 #   1. finds the postmaster (from $PGDATA/postmaster.pid) and the pg_kafka_listener pid;
@@ -8,9 +8,9 @@
 #   4. waits for every remaining process of the cluster to exit, starts the cluster
 #      again with pg_ctl, and fails unless it comes up and the Kafka port answers.
 #
-# Before the fix the worker never noticed: it kept serving (and committing) Kafka
-# requests as an orphan, and the new postmaster refused to start because the old
-# shared memory segment was still attached.
+# A listener that missed the postmaster's death would keep serving (and committing)
+# Kafka requests as an orphan, and the new postmaster would refuse to start while the
+# old shared memory segment is still attached.
 #
 # DESTRUCTIVE for the target cluster (it is crashed and restarted). Use a scratch
 # cluster. Usage (as root or the cluster owner):
@@ -76,7 +76,7 @@ for p in $(pgrep -u "$RUN_AS" -f "postgres" || true); do
   # Only processes still attached to this data directory's shared memory matter:
   # postgres children have no -D of their own, so check their cwd.
   if [ "$(readlink "/proc/$p/cwd" 2>/dev/null || true)" = "$(readlink -f "$PGDATA")" ]; then
-    echo "  leftover process $p ($(tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null | cut -c1-60))"
+    echo "  leftover process $p ($(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | cut -c1-60))"
   fi
 done
 
@@ -99,7 +99,7 @@ fi
 for _ in $(seq 1 60); do
   if (echo > "/dev/tcp/127.0.0.1/$KAFKA_PORT") 2>/dev/null; then
     echo "OK: cluster restarted and the Kafka port answers"
-    exit $status
+    exit "$status"
   fi
   sleep 1
 done

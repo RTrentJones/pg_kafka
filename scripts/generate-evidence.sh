@@ -6,9 +6,10 @@
 #   - a real broker on $REAL_BROKER               (default localhost:9093)
 #   - libpq env (PGHOST/PGPORT/PGUSER/PGDATABASE) pointing at the same Postgres (for psql + the
 #     raw-INSERT baseline + the recorded SELECT)
-# Each step is best-effort so a single failure during a shakeout still yields the other artifacts.
+# Each step is best-effort (a failed step is a warning) so one failure still yields the other
+# artifacts.
 # Usage: scripts/generate-evidence.sh <out-dir>
-set -uo pipefail
+set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT_DIR="${1:?usage: generate-evidence.sh <out-dir>}"
 mkdir -p "$OUT_DIR"
