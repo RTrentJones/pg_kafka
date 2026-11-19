@@ -293,6 +293,8 @@ jobs:
       - name: Differential test against Apache Kafka
         timeout-minutes: 10
         run: python3 interop/diff/run.py --pg 127.0.0.1:9092 --kafka 127.0.0.1:9093
+        env:
+          KAFKA_HOME: ${{ runner.temp }}/kafka_2.13-${{ env.KAFKA_VERSION }}
       - name: Logs (on failure)
         if: failure()
         run: |

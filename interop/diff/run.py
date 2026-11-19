@@ -614,6 +614,9 @@ COMPARE = {("api_versions", "ranges"): cmp_api_subset}
 
 
 def compile_wire():
+    if not (KAFKA_HOME / "libs").is_dir():
+        sys.exit(f"KAFKA_HOME={KAFKA_HOME} has no libs/ directory; set KAFKA_HOME to an unpacked "
+                 "kafka_2.13-3.7.0 distribution")
     classes = Path(tempfile.mkdtemp(prefix="pgk-diff-"))
     r = subprocess.run(["javac", "-cp", f"{KAFKA_HOME}/libs/*", "-d", str(classes),
                         str(HERE / "KafkaWire.java")], capture_output=True, text=True)
