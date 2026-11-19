@@ -321,8 +321,15 @@ static CONNECTIONS_MAX_IDLE_MS: GucSetting<i32> =
 static REQUEST_READ_TIMEOUT_MS: GucSetting<i32> =
     GucSetting::<i32>::new(crate::kafka::conn_limits::DEFAULT_REQUEST_READ_TIMEOUT_MS);
 
-/// Register the listener-security GUCs. Called from `config::init()`.
+/// Register the listener-security and connection-limit GUCs. Called from
+/// `config::init()`.
 pub fn register_gucs() {
+    register_listener_gucs();
+    register_limit_gucs();
+}
+
+/// The listener-security GUCs (strings).
+fn register_listener_gucs() {
     let define = |name: &'static std::ffi::CStr,
                   short: &'static std::ffi::CStr,
                   long: &'static std::ffi::CStr,
@@ -372,8 +379,10 @@ pub fn register_gucs() {
         c"Comma-separated subset of PLAIN, SCRAM-SHA-256, SCRAM-SHA-512 (default: all three). Read when the worker starts.",
         &SASL_ENABLED_MECHANISMS,
     );
+}
 
-    // Connection limits (read when the worker starts, like the listener GUCs).
+/// The connection-limit GUCs (read when the worker starts, like the listener GUCs).
+fn register_limit_gucs() {
     let define_int = |name: &'static std::ffi::CStr,
                       short: &'static std::ffi::CStr,
                       long: &'static std::ffi::CStr,
