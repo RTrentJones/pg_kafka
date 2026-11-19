@@ -18,9 +18,6 @@
 //!
 //! Role names cannot start with `pg_` (a reserved prefix), hence `pgkafka_*`.
 
-use pgrx::{GucContext, GucFlags, GucRegistry, GucSetting};
-use std::ffi::CString;
-
 /// Read-only role.
 pub const READER_ROLE: &str = "pgkafka_reader";
 /// Least-privilege role for the background worker's SQL.
@@ -104,19 +101,15 @@ pub const WORKER_FUNCTION_GRANTS: &[&str] = &[
 /// [`WORKER_ROLE`] as the GUC's compiled-in default.
 const WORKER_ROLE_C: &std::ffi::CStr = c"pgkafka_worker";
 
-static RUN_AS_ROLE: GucSetting<Option<CString>> =
-    GucSetting::<Option<CString>>::new(Some(WORKER_ROLE_C));
+crate::config::gucs! {
+    /// Register `pg_kafka.run_as_role`. Called from `config::init()`.
+    pub fn register_gucs;
 
-/// Register `pg_kafka.run_as_role`. Called from `config::init()`.
-pub fn register_gucs() {
-    GucRegistry::define_string_guc(
-        c"pg_kafka.run_as_role",
-        c"Role the background worker switches to once the schema exists",
-        c"Default 'pgkafka_worker', created by the extension with only the privileges the worker's SQL needs. Empty = keep running as the bootstrap superuser. If the role does not exist or lacks a required privilege (e.g. the binary was upgraded but ALTER EXTENSION pg_kafka UPDATE has not run yet) the worker logs a WARNING and keeps the superuser. Requires restart.",
-        &RUN_AS_ROLE,
-        GucContext::Postmaster,
-        GucFlags::default(),
-    );
+    string RUN_AS_ROLE = Some(WORKER_ROLE_C) => c"pg_kafka.run_as_role" {
+        short: c"Role the background worker switches to once the schema exists",
+        long: c"Default 'pgkafka_worker', created by the extension with only the privileges the worker's SQL needs. Empty = keep running as the bootstrap superuser. If the role does not exist or lacks a required privilege (e.g. the binary was upgraded but ALTER EXTENSION pg_kafka UPDATE has not run yet) the worker logs a WARNING and keeps the superuser. Requires restart.",
+        context: Postmaster,
+    }
 }
 
 /// The configured role, `None` when the switch is disabled (unset or blank).

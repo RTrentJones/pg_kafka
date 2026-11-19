@@ -63,6 +63,20 @@ const NOTIFY_RECV_TIMEOUT: Duration = Duration::from_millis(100);
 /// How often [`run`] checks for the worker's shutdown signal.
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// The network thread's ends of the channels it shares with the DB thread.
+pub struct NetworkChannels {
+    /// Where parsed requests go (main and liveness lanes).
+    pub request_lanes: crate::kafka::RequestLanes,
+    /// SASL credential lookups, answered by the DB thread.
+    pub credential_tx: Sender<CredentialRequest>,
+    /// The DB thread's long-poll wake-ups.
+    pub notify_rx: Receiver<InternalNotification>,
+    /// Shadow-mode records to forward to the external Kafka.
+    pub forward_rx: Receiver<ForwardRequest>,
+    /// One ack per forward attempt, back to the DB thread.
+    pub forward_ack_tx: Sender<ForwardAck>,
+}
+
 /// Run the Kafka listeners until the worker signals shutdown.
 ///
 /// `listeners` are the pre-bound sockets (the primary listener first) with their
@@ -71,22 +85,21 @@ const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// forwarder (always spawned: it reads the shadow configuration on the fly, so shadow
 /// mode can be enabled with `pg_reload_conf()`).
 ///
-/// Runs on the network thread and MUST NOT call pgrx functions. The result is always
-/// `Ok`; errors of individual connections are logged and end only that connection.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one parameter per channel end the worker creates for the network thread"
-)]
+/// Runs on the network thread and MUST NOT call pgrx functions. Errors of individual
+/// connections are logged and end only that connection.
 pub async fn run(
     listeners: Vec<(TcpListener, Arc<ListenerSecurity>)>,
-    request_lanes: crate::kafka::RequestLanes,
-    credential_tx: Sender<CredentialRequest>,
-    notify_rx: Receiver<InternalNotification>,
-    forward_rx: Receiver<ForwardRequest>,
-    forward_ack_tx: Sender<ForwardAck>,
+    channels: NetworkChannels,
     runtime_context: Arc<crate::kafka::RuntimeContext>,
     shutdown_rx: std::sync::mpsc::Receiver<()>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) {
+    let NetworkChannels {
+        request_lanes,
+        credential_tx,
+        notify_rx,
+        forward_rx,
+        forward_ack_tx,
+    } = channels;
     let config = runtime_context.config();
     info!(
         "pg_kafka TCP listener started (long_polling={}, log_connections={})",
@@ -140,7 +153,6 @@ pub async fn run(
     }
     notifier.abort();
     let _ = notifier.await;
-    Ok(())
 }
 
 /// Wait until the worker sends the shutdown signal or drops its sender.

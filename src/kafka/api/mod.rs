@@ -148,7 +148,7 @@ pub trait ApiSchema: Sized + 'static {
 /// module documentation.
 ///
 /// APIs answered entirely on the network thread (SaslHandshake/SaslAuthenticate, from
-/// the connection's SASL state in `listener.rs` / `auth::session`) implement only
+/// the connection's SASL state in `listener::sasl` / `auth::session`) implement only
 /// [`ApiSchema`] and are listed in the registry's `network_thread` section: they are
 /// advertised, version-checked, encoded and counted like the others, but never decoded
 /// into a [`KafkaRequest`] or dispatched to the worker.
@@ -648,7 +648,7 @@ macro_rules! kafka_apis {
                 }
             )*
             $(
-                // Answered by the connection (listener.rs) before parse_request; a frame
+                // Answered by the connection (`listener::sasl`) before parse_request; a frame
                 // that reaches the worker decoder anyway has no handler to run.
                 if header.api_key == api_key_of::<$net_api>() {
                     return Ok(Decoded::Close(format!(

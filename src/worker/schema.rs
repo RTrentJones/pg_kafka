@@ -10,8 +10,9 @@ use std::time::{Duration, Instant};
 use super::batch::reject_request;
 use super::lifecycle::{postmaster_alive, sigterm_received};
 use super::network::Inbox;
-use super::txn::{schema_found_again, worker_transaction, ERROR_KAFKA_STORAGE_ERROR};
+use super::txn::{schema_found_again, worker_transaction};
 use super::RECV_TIMEOUT;
+use crate::kafka::ERROR_KAFKA_STORAGE_ERROR;
 use crate::pg_warning;
 
 /// How often the schema waits re-check for the kafka schema.

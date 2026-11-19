@@ -10,7 +10,7 @@ them to the network thread, whose forwarder owns the idempotent rdkafka producer
 deliveries in flight, and returns a `ForwardAck` per record. Delivery to the external broker is
 at-least-once and, per local partition, in order. The code lives in `src/kafka/shadow/`
 (`store.rs`: outbox logic on the DB thread; `outbox.rs`: its SQL; `forwarder_task.rs`: the
-network-thread forwarder; `producer.rs`: librdkafka settings) and the worker loop in `src/worker.rs`.
+network-thread forwarder; `producer.rs`: librdkafka settings) and the worker loop in `src/worker/`.
 
 ## Architecture Overview
 

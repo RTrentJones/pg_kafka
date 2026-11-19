@@ -483,7 +483,7 @@ fn error_responses_without_echo_still_carry_top_level_codes() {
 #[test]
 fn network_thread_apis_are_advertised_but_never_reach_the_worker() {
     // SaslHandshake and SaslAuthenticate are answered by the connection's SASL session
-    // (listener.rs); the registry still advertises and encodes them, but a frame that
+    // (`listener::sasl`); the registry still advertises and encodes them, but a frame that
     // reaches the worker decoder is not turned into a request.
     for (key, versions) in [
         (API_KEY_SASL_HANDSHAKE, (0, 1)),

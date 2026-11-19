@@ -2,7 +2,7 @@
 //! fetch bounds, the request-level Fetch `max_bytes`, batched topic metadata, and the
 //! least-privilege worker role.
 //!
-//! The code under test lives in `storage/postgres.rs` (SPI) and the worker's role switch,
+//! The code under test lives in `src/kafka/storage/postgres/` (SPI) and the worker's role switch,
 //! which unit coverage cannot see, so each test drives the broker or the SQL entry point
 //! and checks the stored state.
 

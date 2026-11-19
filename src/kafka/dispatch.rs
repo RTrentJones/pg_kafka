@@ -18,7 +18,7 @@ use tokio::sync::mpsc::UnboundedSender;
 /// A handler that fails part-way through may already have written to the database
 /// (e.g. IncrementalAlterConfigs applied resource 1, then failed on resource 2). The
 /// client is told the request failed, so those writes must not commit. The request
-/// runs inside `worker::run_request_in_subtransaction`, which releases the
+/// runs inside `worker::txn::run_request_in_subtransaction`, which releases the
 /// subtransaction on `Commit` and rolls it back on `Rollback`. Panics (including
 /// Postgres ERRORs, which pgrx surfaces as panics) are not an outcome: they still
 /// unwind, and the subtransaction wrapper's `catch_unwind` rolls them back.
@@ -60,7 +60,7 @@ where
     // A handler panic (a Postgres ERROR surfaces as one) must not leave the client waiting
     // until its request timeout: reply UNKNOWN_SERVER_ERROR, then re-raise the payload so the
     // surrounding subtransaction still rolls back the request's partial writes (see
-    // worker::run_request_in_subtransaction). The guard covers the success response builder
+    // worker::txn::run_request_in_subtransaction). The guard covers the success response builder
     // too, since a builder may read SPI. The panic branch does only Rust work (channel send,
     // enum construction, no Postgres calls), so it is safe before FlushErrorState at the
     // subtransaction boundary.

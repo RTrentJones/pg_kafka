@@ -55,7 +55,7 @@ leaves). Very small widths with long retention multiply the leaf count and shoul
 Planning is the larger cost: planning a statement over a partitioned table expands every leaf,
 so with 11 leaves a one-shot `MAX(partition_offset)` probe cost 0.75 ms against 0.10 ms on the
 unpartitioned table (pgbench, simple protocol), almost all of it planning. The hot read
-statements in `storage/postgres.rs` (produce's base-offset probe, Fetch, the partition-bounds,
+statements in `storage/postgres/log.rs` (produce's base-offset probe, Fetch, the partition-bounds,
 HWM and earliest-offset probes) therefore run through prepared plans kept for the life of the
 backend (`select_cached`, `SPI_keepplan`; the plan cache re-plans them when a leaf is created
 or dropped). With cached plans, at 11 leaves: Fetch of 100 rows 0.20 ms vs 0.135 ms, MAX probe
@@ -113,7 +113,7 @@ Maintenance can run in the worker and, at the same time, in any session
   meets a row the move deleted skips it once the move commits and never sees its copy,
   leaving a committed transaction `pending` forever. So every worker transaction
   starts by taking the pg_kafka schema advisory lock (key 8099547369649367906) in SHARE
-  mode (`worker::lock_schema`), and the move takes it EXCLUSIVE, bounded by the function's
+  mode (`worker::txn::lock_schema`), and the move takes it EXCLUSIVE, bounded by the function's
   `lock_timeout`; on a timeout the leaf is not created and the next pass retries. The
   upgrade scripts take the same lock first.
 * **Every lock wait in maintenance is bounded and handled.** `ensure_message_partitions`

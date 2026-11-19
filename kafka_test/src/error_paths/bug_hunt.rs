@@ -1,5 +1,5 @@
 //! Error responses and resource accounting whose code lives in the SPI/async files
-//! (`worker.rs`, `listener.rs`) that unit coverage cannot see, plus broker-visible
+//! (`src/worker/`, `src/kafka/listener/`) that unit coverage cannot see, plus broker-visible
 //! handler behaviour. They speak the wire protocol directly so each request is exactly
 //! the one under test.
 
@@ -22,7 +22,7 @@ use crate::wire::{raw_frame, read_raw_response, roundtrip};
 
 const BROKER: &str = "localhost:9092";
 
-/// Bug 6 (+ the long-poll path in listener.rs): fetching a partition that does not
+/// Bug 6 (+ the long-poll path in `src/kafka/listener/long_poll.rs`): fetching a partition that does not
 /// exist, or an offset past the high watermark, returns the matching error code, and
 /// does so straight away instead of after max_wait_ms.
 pub async fn test_fetch_bad_partition_or_offset_returns_error() -> TestResult {
@@ -141,7 +141,7 @@ pub async fn test_fetch_into_cleaned_up_aborted_rows_is_in_range() -> TestResult
     Ok(())
 }
 
-/// Bug 4 (worker.rs): a TxnOffsetCommit whose handler fails (here: a transactional id
+/// Bug 4 (the handler error path, `src/kafka/dispatch.rs`): a TxnOffsetCommit whose handler fails (here: a transactional id
 /// that was never initialised) must report the error on every requested partition: an
 /// empty response reads as success to the client.
 pub async fn test_txn_offset_commit_failure_reports_partition_errors() -> TestResult {
@@ -279,10 +279,10 @@ pub async fn test_create_topics_default_and_zero_partitions() -> TestResult {
     Ok(())
 }
 
-/// Bug 3 (listener.rs): a client that sends a length prefix and then disconnects must
-/// not keep its frame charge against the global 512 MiB reservation budget. Before the
-/// fix, six abandoned 100 MB prefixes exhausted the budget and every later large frame
-/// was refused until a restart.
+/// Bug 3 (`src/kafka/listener/connection.rs`): a client that sends a length prefix and
+/// then disconnects must not keep its frame charge against the global 512 MiB
+/// reservation budget; otherwise six abandoned 100 MB prefixes exhaust the budget and
+/// every later large frame is refused until a restart.
 ///
 /// Not parallel-safe: it deliberately reserves most of the shared budget.
 pub async fn test_frame_budget_released_on_mid_frame_disconnect() -> TestResult {

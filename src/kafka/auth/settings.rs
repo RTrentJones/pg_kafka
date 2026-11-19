@@ -15,7 +15,7 @@
 //! when it sees a changed value.
 
 use super::scram::ScramMechanism;
-use pgrx::{GucContext, GucFlags, GucRegistry, GucSetting};
+use pgrx::{GucFlags, GucSetting};
 use std::ffi::CString;
 
 /// Kafka's listener security protocols.
@@ -302,141 +302,69 @@ impl SecuritySettings {
 
 // ===== GUCs =====
 
-static SECURITY_PROTOCOL: GucSetting<Option<CString>> =
-    GucSetting::<Option<CString>>::new(Some(c"PLAINTEXT"));
-static ADDITIONAL_LISTENERS: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
-static SSL_CERT_FILE: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
-static SSL_KEY_FILE: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
-static SSL_CA_FILE: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
-static SASL_ENABLED_MECHANISMS: GucSetting<Option<CString>> =
-    GucSetting::<Option<CString>>::new(Some(c"PLAIN,SCRAM-SHA-256,SCRAM-SHA-512"));
+crate::config::gucs! {
+    /// Register the listener-security and connection-limit GUCs. Called from
+    /// `config::init()`.
+    pub fn register_gucs;
 
-// Connection-limit GUCs.
-static MAX_CONNECTIONS: GucSetting<i32> =
-    GucSetting::<i32>::new(crate::kafka::conn_limits::DEFAULT_MAX_CONNECTIONS);
-static MAX_CONNECTIONS_PER_IP: GucSetting<i32> =
-    GucSetting::<i32>::new(crate::kafka::conn_limits::DEFAULT_MAX_CONNECTIONS_PER_IP);
-static CONNECTIONS_MAX_IDLE_MS: GucSetting<i32> =
-    GucSetting::<i32>::new(crate::kafka::conn_limits::DEFAULT_CONNECTIONS_MAX_IDLE_MS);
-static REQUEST_READ_TIMEOUT_MS: GucSetting<i32> =
-    GucSetting::<i32>::new(crate::kafka::conn_limits::DEFAULT_REQUEST_READ_TIMEOUT_MS);
+    string SECURITY_PROTOCOL = Some(c"PLAINTEXT") => c"pg_kafka.security_protocol" {
+        short: c"Security protocol of the primary listener (pg_kafka.host:pg_kafka.port)",
+        long: c"PLAINTEXT (default), SSL, SASL_PLAINTEXT or SASL_SSL. Read when the worker starts.",
+        context: Sighup,
+    }
+    string ADDITIONAL_LISTENERS = None => c"pg_kafka.additional_listeners" {
+        short: c"Extra Kafka listeners, e.g. 'SASL_SSL://0.0.0.0:9093,SSL://:9094'",
+        long: c"Comma-separated PROTOCOL://host:port. Each advertises its own host:port in Metadata. Empty (default) = none. Read when the worker starts.",
+        context: Sighup,
+    }
+    string SSL_CERT_FILE = None => c"pg_kafka.ssl_cert_file" {
+        short: c"PEM certificate chain for SSL / SASL_SSL listeners",
+        long: c"Read when the worker starts.",
+        context: Sighup,
+    }
+    string SSL_KEY_FILE = None => c"pg_kafka.ssl_key_file" {
+        short: c"PEM private key for SSL / SASL_SSL listeners",
+        long: c"Read when the worker starts.",
+        context: Sighup,
+    }
+    string SSL_CA_FILE = None => c"pg_kafka.ssl_ca_file" {
+        short: c"PEM CA bundle for client certificates; when set, TLS listeners require a client certificate (mutual TLS)",
+        long: c"Empty (default) = no client certificates. Read when the worker starts.",
+        context: Sighup,
+    }
+    string SASL_ENABLED_MECHANISMS = Some(c"PLAIN,SCRAM-SHA-256,SCRAM-SHA-512") => c"pg_kafka.sasl_enabled_mechanisms" {
+        short: c"SASL mechanisms offered on SASL listeners",
+        long: c"Comma-separated subset of PLAIN, SCRAM-SHA-256, SCRAM-SHA-512 (default: all three). Read when the worker starts.",
+        context: Sighup,
+    }
 
-/// Register the listener-security and connection-limit GUCs. Called from
-/// `config::init()`.
-pub fn register_gucs() {
-    register_listener_gucs();
-    register_limit_gucs();
-}
-
-/// The listener-security GUCs (strings).
-fn register_listener_gucs() {
-    let define = |name: &'static std::ffi::CStr,
-                  short: &'static std::ffi::CStr,
-                  long: &'static std::ffi::CStr,
-                  setting: &'static GucSetting<Option<CString>>| {
-        GucRegistry::define_string_guc(
-            name,
-            short,
-            long,
-            setting,
-            GucContext::Sighup,
-            GucFlags::default(),
-        );
-    };
-    define(
-        c"pg_kafka.security_protocol",
-        c"Security protocol of the primary listener (pg_kafka.host:pg_kafka.port)",
-        c"PLAINTEXT (default), SSL, SASL_PLAINTEXT or SASL_SSL. Read when the worker starts.",
-        &SECURITY_PROTOCOL,
-    );
-    define(
-        c"pg_kafka.additional_listeners",
-        c"Extra Kafka listeners, e.g. 'SASL_SSL://0.0.0.0:9093,SSL://:9094'",
-        c"Comma-separated PROTOCOL://host:port. Each advertises its own host:port in Metadata. Empty (default) = none. Read when the worker starts.",
-        &ADDITIONAL_LISTENERS,
-    );
-    define(
-        c"pg_kafka.ssl_cert_file",
-        c"PEM certificate chain for SSL / SASL_SSL listeners",
-        c"Read when the worker starts.",
-        &SSL_CERT_FILE,
-    );
-    define(
-        c"pg_kafka.ssl_key_file",
-        c"PEM private key for SSL / SASL_SSL listeners",
-        c"Read when the worker starts.",
-        &SSL_KEY_FILE,
-    );
-    define(
-        c"pg_kafka.ssl_ca_file",
-        c"PEM CA bundle for client certificates; when set, TLS listeners require a client certificate (mutual TLS)",
-        c"Empty (default) = no client certificates. Read when the worker starts.",
-        &SSL_CA_FILE,
-    );
-    define(
-        c"pg_kafka.sasl_enabled_mechanisms",
-        c"SASL mechanisms offered on SASL listeners",
-        c"Comma-separated subset of PLAIN, SCRAM-SHA-256, SCRAM-SHA-512 (default: all three). Read when the worker starts.",
-        &SASL_ENABLED_MECHANISMS,
-    );
-}
-
-/// The connection-limit GUCs (read when the worker starts, like the listener GUCs).
-fn register_limit_gucs() {
-    let define_int = |name: &'static std::ffi::CStr,
-                      short: &'static std::ffi::CStr,
-                      long: &'static std::ffi::CStr,
-                      setting: &'static GucSetting<i32>,
-                      min: i32,
-                      max: i32,
-                      flags: GucFlags| {
-        GucRegistry::define_int_guc(
-            name,
-            short,
-            long,
-            setting,
-            min,
-            max,
-            GucContext::Sighup,
-            flags,
-        );
-    };
-    define_int(
-        c"pg_kafka.max_connections",
-        c"Maximum concurrent Kafka client connections per listener",
-        c"Each listener has its own cap, so a flood on one listener cannot lock clients out of another (e.g. a loopback admin listener). Connections over the cap are closed at accept. Read when the worker starts.",
-        &MAX_CONNECTIONS,
-        1,
-        crate::kafka::conn_limits::MAX_CONNECTIONS_LIMIT,
-        GucFlags::default(),
-    );
-    define_int(
-        c"pg_kafka.max_connections_per_ip",
-        c"Maximum concurrent Kafka client connections from one IP address, across all listeners",
-        c"Kafka's max.connections.per.ip. Connections over the cap are closed at accept. Read when the worker starts.",
-        &MAX_CONNECTIONS_PER_IP,
-        1,
-        crate::kafka::conn_limits::MAX_CONNECTIONS_LIMIT,
-        GucFlags::default(),
-    );
-    define_int(
-        c"pg_kafka.connections_max_idle_ms",
-        c"Close Kafka client connections idle for this long",
-        c"Kafka's connections.max.idle.ms: a connection with no request read, no response written and nothing outstanding for this long is closed. Read when the worker starts.",
-        &CONNECTIONS_MAX_IDLE_MS,
-        100,
-        i32::MAX,
-        GucFlags::UNIT_MS,
-    );
-    define_int(
-        c"pg_kafka.request_read_timeout_ms",
-        c"Deadline for receiving one request frame, from its first byte",
-        c"A client that starts a request and does not finish sending it within this time is disconnected (slow-loris protection). Read when the worker starts.",
-        &REQUEST_READ_TIMEOUT_MS,
-        100,
-        3_600_000,
-        GucFlags::UNIT_MS,
-    );
+    // The connection limits, read when the worker starts like the listener GUCs.
+    int MAX_CONNECTIONS = crate::kafka::conn_limits::DEFAULT_MAX_CONNECTIONS => c"pg_kafka.max_connections" {
+        short: c"Maximum concurrent Kafka client connections per listener",
+        long: c"Each listener has its own cap, so a flood on one listener cannot lock clients out of another (e.g. a loopback admin listener). Connections over the cap are closed at accept. Read when the worker starts.",
+        context: Sighup,
+        range: (1, crate::kafka::conn_limits::MAX_CONNECTIONS_LIMIT),
+    }
+    int MAX_CONNECTIONS_PER_IP = crate::kafka::conn_limits::DEFAULT_MAX_CONNECTIONS_PER_IP => c"pg_kafka.max_connections_per_ip" {
+        short: c"Maximum concurrent Kafka client connections from one IP address, across all listeners",
+        long: c"Kafka's max.connections.per.ip. Connections over the cap are closed at accept. Read when the worker starts.",
+        context: Sighup,
+        range: (1, crate::kafka::conn_limits::MAX_CONNECTIONS_LIMIT),
+    }
+    int CONNECTIONS_MAX_IDLE_MS = crate::kafka::conn_limits::DEFAULT_CONNECTIONS_MAX_IDLE_MS => c"pg_kafka.connections_max_idle_ms" {
+        short: c"Close Kafka client connections idle for this long",
+        long: c"Kafka's connections.max.idle.ms: a connection with no request read, no response written and nothing outstanding for this long is closed. Read when the worker starts.",
+        context: Sighup,
+        range: (100, i32::MAX),
+        flags: GucFlags::UNIT_MS,
+    }
+    int REQUEST_READ_TIMEOUT_MS = crate::kafka::conn_limits::DEFAULT_REQUEST_READ_TIMEOUT_MS => c"pg_kafka.request_read_timeout_ms" {
+        short: c"Deadline for receiving one request frame, from its first byte",
+        long: c"A client that starts a request and does not finish sending it within this time is disconnected (slow-loris protection). Read when the worker starts.",
+        context: Sighup,
+        range: (100, 3_600_000),
+        flags: GucFlags::UNIT_MS,
+    }
 }
 
 fn guc_string(setting: &GucSetting<Option<CString>>) -> String {

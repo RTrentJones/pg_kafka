@@ -23,7 +23,7 @@ set -euo pipefail
 CODECOV_YML="${CODECOV_YML:-codecov.yml}"
 
 # The guarded files: the src/ entries of codecov.yml's ignore list (lines like
-#   - "src/worker.rs") plus the `# qa1-guard: "src/..."` lines (files that mix SPI with
+#   - "src/worker/txn.rs") plus the `# qa1-guard: "src/..."` lines (files that mix SPI with
 # unit-tested logic, so they are not ignored). Globs (src/bin/**) are pgrx-generated code.
 spi_files="$(grep -E '^[[:space:]]*(- |# qa1-guard: )"src/[^"*]+"' "$CODECOV_YML" \
   | grep -oE '"src/[^"]+"' | tr -d '"' || true)"

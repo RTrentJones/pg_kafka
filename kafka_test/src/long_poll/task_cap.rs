@@ -1,7 +1,7 @@
 //! RV-10 follow-up E2E: per-connection long-poll task cap.
 //!
 //! Each long-poll fetch spawns a detached task on the network thread. The cap
-//! (`MAX_LONG_POLLS_PER_CONNECTION` = 64 in listener.rs) bounds how many one
+//! (`MAX_LONG_POLLS_PER_CONNECTION` = 64 in `src/kafka/constants.rs`) bounds how many one
 //! connection can hold; a fetch over the cap degrades to the immediate
 //! (non-waiting) fetch path and returns a valid — possibly empty — response.
 //!
@@ -29,7 +29,7 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
-/// Must exceed listener.rs MAX_LONG_POLLS_PER_CONNECTION (64).
+/// Must exceed the broker's MAX_LONG_POLLS_PER_CONNECTION (64, `src/kafka/constants.rs`).
 const PIPELINED_FETCHES: usize = 80;
 const EXPECTED_LONG_POLLED: usize = 64;
 const FETCH_MAX_WAIT_MS: i32 = 8_000;

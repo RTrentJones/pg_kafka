@@ -183,7 +183,7 @@ Each connection carries a principal in Kafka syntax:
   listener with mutual TLS;
 * `User:ANONYMOUS` otherwise.
 
-It lives in the connection's `ConnectionAuth` (`src/kafka/listener.rs`) and is logged
+It lives in the connection's `ConnectionAuth` (`src/kafka/listener/sasl.rs`) and is logged
 when the connection authenticates and when it closes (with `pg_kafka.log_connections =
 on`; the network thread logs through `tracing`, so also run with
 `RUST_LOG=pg_kafka=info`). Failed authentications are logged as warnings with the peer

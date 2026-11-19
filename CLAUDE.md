@@ -108,14 +108,23 @@ thread requires adding synchronization.
 src/
 ├── lib.rs              # _PG_init, bootstrap SQL include, #[pg_extern] SQL functions
 ├── config.rs           # GUC definitions and loading
-├── worker.rs           # Background worker: startup/schema wait, main loop, group commit, maintenance
+├── worker/             # Background worker (DB thread)
+│   ├── mod.rs          # Entry point and main loop
+│   ├── batch.rs        # Group commit: request batches, subtransactions, the response barrier
+│   ├── lifecycle.rs    # SIGTERM, postmaster death, restart and exit
+│   ├── maintenance.rs  # Periodic maintenance (time partitions, retention, txn timeouts) and its schedule
+│   ├── network.rs      # Channels, listener sockets and the network thread's start
+│   ├── schema.rs       # Waiting for the schema, feature detection, role reset
+│   └── txn.rs          # worker_transaction, the extension and schema locks, subtransactions
 ├── testing/            # MockKafkaStore and test helpers
 ├── bin/pgrx_embed.rs   # pgrx embedding binary (generated)
 └── kafka/
     ├── api/            # One `KafkaApi` impl per API + the kafka_apis! registry (decode, versions,
     │                   # lanes, error responses, dispatch, generated docs)
     ├── protocol/       # Framing (FrameCodec), header decoding, response encoding, RecordBatch parsing
-    ├── listener.rs     # tokio runtime, accept, per-connection read/write loop, TLS
+    ├── listener/       # Network thread: accept and connection caps (accept), TLS (tls), the read
+    │                   # loop (connection), ordered responses (writer), SASL frames (sasl),
+    │                   # hand-off to the DB thread (dispatch), Fetch long polling (long_poll)
     ├── conn_limits.rs  # Per-listener / per-IP connection caps, SASL lookup rate limit
     ├── auth/           # TLS config, SASL session state machine, SCRAM/PLAIN, credentials, user SQL
     ├── messages.rs     # KafkaRequest/KafkaResponse envelopes, request lanes
@@ -125,8 +134,14 @@ src/
     ├── coordinator.rs  # Consumer group coordinator (in-memory group state)
     ├── assignment/     # Range, RoundRobin, Sticky; subscription/assignment encoding
     ├── limits.rs       # Caps on client-controlled state (partitions, group size, group count)
-    ├── storage/        # Storage role traits + PostgresStore (SPI), retention planning, privileges
-    ├── shadow/         # Shadow mode: ShadowStore, outbox, forwarder task, rdkafka producer, license
+    ├── storage/        # Storage role traits (mod.rs), delegation macros, retention planning,
+    │   │               # sequence validation, privileges, schema checks
+    │   ├── postgres.rs # PostgresStore and the kept-plan cache (select_cached)
+    │   └── postgres/   # Its SQL per concern: topics, log, offsets, producers, transactions,
+    │                   # maintenance; roles.rs implements the role traits; worker_role.rs
+    ├── shadow/         # Shadow mode: ShadowStore (store.rs; unit tests in store/), the outbox
+    │                   # trait (outbox.rs; in-memory test double outbox/fake.rs), forwarder task,
+    │                   # in-flight tracking, routing, rdkafka producer, license
     ├── notifications.rs, pending_fetches.rs  # Long polling
     ├── metrics.rs      # Request metrics (atomics) flushed to kafka.broker_* tables
     ├── broker_metadata.rs, context.rs, partitioner.rs, response_builders.rs
@@ -150,10 +165,10 @@ The extension runs **one BackgroundWorker process**. Its tokio runtime serves th
 thread is the only one that touches the database:
 
 ```
-TCP:9092 → tokio runtime (listener) → crossbeam-channel → background worker (worker.rs) → SPI
+TCP:9092 → tokio runtime (listener) → crossbeam-channel → background worker (src/worker/) → SPI
 ```
 
-1. **Network thread** (`src/kafka/listener.rs`): accepts TCP connections on every configured
+1. **Network thread** (`src/kafka/listener/`): accepts TCP connections on every configured
    listener (TLS handshake where configured) and parses the Kafka framing and header.
    SaslHandshake/SaslAuthenticate never become `KafkaRequest`s: the per-connection `SaslSession`
    (`src/kafka/auth/session.rs`) answers them and gates every other request until authentication
@@ -161,7 +176,7 @@ TCP:9092 → tokio runtime (listener) → crossbeam-channel → background worke
 2. **Channels** (`src/kafka/messages.rs`): `KafkaRequest`s travel on two lanes (`RequestLanes`:
    `main`, and a `liveness` lane for Heartbeat that the worker drains first); each carries a tokio
    `response_tx` the worker answers with a `KafkaResponse`.
-3. **DB thread** (`src/worker.rs`): **group commit**: every request already queued (up to 64,
+3. **DB thread** (`src/worker/`, the batch in `batch.rs`): **group commit**: every request already queued (up to 64,
    ~50 ms budget; Heartbeats arriving meanwhile are answered between its requests) runs in one
    top-level transaction, each request in its own subtransaction (a handler `Err` returns
    `RequestOutcome::Rollback`; a panic is caught and rolled back), and all responses are released
@@ -196,8 +211,9 @@ pub trait MaintenanceStore { /* transaction timeouts, aborted-row cleanup */ }
 pub trait KafkaStore: TopicStore + LogStore + OffsetStore + ProducerStore + TransactionStore + MaintenanceStore {}
 ```
 
-- `PostgresStore` (`storage/postgres.rs`): the SPI implementation; `storage/postgres/roles.rs`
-  implements the roles by forwarding to its inherent methods.
+- `PostgresStore` (`storage/postgres.rs`): the SPI implementation, its SQL in one
+  `storage/postgres/` submodule per concern; `storage/postgres/roles.rs` implements the roles by
+  forwarding to those inherent methods.
 - `ShadowStore` (`shadow/store.rs`): wraps `PostgresStore`, forwards the roles it does not change
   (`delegate_topic_store!` and friends) and implements `LogStore`, `TransactionStore` and
   `MaintenanceStore` to write the shadow outbox.
@@ -246,7 +262,7 @@ must keep:
   least one width is leaf-granular; shorter windows and the DEFAULT leaf expire row by row.
   **Never** write an UPDATE that changes `created_at` (it moves rows between leaves), confine a
   ctid-based statement to one leaf (`tableoid`; ctids repeat across leaves), and send hot
-  statements that do not name `created_at` through `select_cached` in `postgres.rs` (kept
+  statements that do not name `created_at` through `select_cached` in `storage/postgres.rs` (kept
   prepared plans, run with a fresh snapshot).
 - **Visibility:** `messages.txn_state` is NULL (visible), `'pending'` or `'aborted'`; no transaction
   markers are written. `kafka.producer_batches` holds the last 5 batches per producer and partition
@@ -348,11 +364,12 @@ ApiVersions list, the metrics names and the error path; nothing else lists the A
 3. Add `Variant => YourApi,` to `kafka_apis!` (and an `API_KEY_*` constant in `constants.rs`
    if other code needs the key). The registry tests (`src/kafka/api/tests.rs`) then check that
    every advertised version encodes and that the error responses encode.
-4. Add an E2E test under `kafka_test/src/` and register it in `kafka_test/src/main.rs`.
+4. Add an E2E test under the fitting `kafka_test/src/<category>/` and list it in that
+   category's `tests()` (see "E2E Testing" below).
 
 **An API answered on the network thread** (from per-connection state, never sent to the
 worker; today SaslHandshake/SaslAuthenticate, answered by `auth::session` from
-`listener.rs`) implements only `ApiSchema` (wire types, name, versions, error response,
+`listener/sasl.rs`) implements only `ApiSchema` (wire types, name, versions, error response,
 `response_has_error`; see `src/kafka/api/sasl.rs`) and goes in the registry's
 `network_thread { .. }` section. It is advertised, encoded and named from the table like
 the others (`ApiInfo::served_by` is `ServedBy::NetworkThread`) but has no `RequestBody`
@@ -364,7 +381,8 @@ variant: the listener must intercept its frames before `parse_request`, build re
 Shared infrastructure in `kafka_test/src/`: `common.rs` (client factories such as
 `create_producer()`, `create_idempotent_producer()`, `create_transactional_producer()`,
 `create_stream_consumer()`), `setup.rs` (`TestContext`: unique names, cleanup), `fixtures.rs`
-(builders), `assertions.rs` (domain assertions).
+(builders), `assertions.rs` (domain assertions), `wire/` (raw protocol), `error_codes.rs`
+(expected Kafka error codes), `registry.rs` (`TestDef`, `test_defs!`).
 
 ### Test Categories
 
@@ -372,31 +390,28 @@ Per-category counts are in `docs/TEST_STRATEGY.md`; `cargo run --release -- --li
 
 | Category | Purpose |
 |----------|---------|
-| **admin** | CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups, DescribeConfigs, IncrementalAlterConfigs, DeleteRecords, per-topic retention |
+| **admin** | CreateTopics (incl. validation and the partition cap), DeleteTopics, CreatePartitions, DeleteGroups, DescribeConfigs, IncrementalAlterConfigs, DeleteRecords, per-topic retention |
 | **producer** | Basic produce, batch produce, acks=0, ack-implies-committed, timestamp roundtrip |
-| **consumer** | Basic consume, from offset, multiple messages, headers |
-| **consumer_group** | Lifecycle, two-member groups, rebalancing, strategies |
-| **offset_management** | Commit/fetch, boundary conditions, multi-partition, by-timestamp, no offset reuse |
+| **consumer** | Basic consume, from offset, multiple messages, headers, fetch record batching |
+| **consumer_group** | Lifecycle, two-member groups, rebalancing, strategies, JoinGroup protocol and member-id rules, no common assignor, offsets-only groups after a restart |
+| **offset_management** | Commit/fetch, OffsetCommit generation/member rules, boundary conditions, multi-partition, by-timestamp, ListOffsets isolation, OffsetFetch require_stable, no offset reuse |
 | **partition** | Multi-partition topics, key routing, distribution |
 | **compression** | gzip, snappy, lz4, zstd, roundtrip, edge cases |
-| **idempotent** | InitProducerId, deduplication, epoch, multi-partition |
-| **transaction** | Transactions, isolation levels, EOS, fencing, atomicity, timeouts |
-| **shadow** | External forwarding, SASL/SSL, topic mapping, replay, dial-up, throughput floor, headers/timestamps, order across a retried failure, sync-stall bound, GUC reload |
-| **long_poll** | Timeout behavior, immediate return, producer wakeup, precision, per-connection task cap |
+| **idempotent** | InitProducerId, deduplication, epoch, multi-partition, Kafka's idempotent model (5-batch cache, original offsets, epochs, sequence wrap) |
+| **transaction** | Transactions, isolation levels, EOS, fencing, atomicity, timeouts, validation; read_committed consumers past aborted/cleaned-up/DeleteRecords holes and stopping at an open transaction |
+| **shadow** | External forwarding, SASL/SSL, topic mapping, replay, dial-up, throughput floor, headers/timestamps, order across a retried failure, sync-stall bound, GUC reload, per-partition lag view |
+| **long_poll** | Timeout behavior, immediate return, producer wakeup, precision, per-connection task cap, a transaction end waking a read_committed fetch |
 | **error_paths** | Invalid partitions, unknown topics, coordinator errors, protocol/transaction/group regressions |
 | **edge_cases** | Empty topics, large messages, boundary values, retention sweep |
-| **part** | Time partitions of kafka.messages: whole-leaf retention drops, row-delete fallback, pending-transaction blocking, maintenance, least privilege |
-| **concurrent** | Multi-producer, multi-consumer, request pipelining, races, heartbeat liveness lane |
+| **part** | Time partitions of kafka.messages: whole-leaf retention drops, row-delete fallback, pending-transaction blocking, maintenance and its lock waits, EndTxn during the default-leaf move, least privilege |
+| **concurrent** | Multi-producer, multi-consumer, request pipelining, races, heartbeat liveness lane, heartbeats inside group-commit batches |
 | **negative** | Connection refused, timeouts, expected failures, superuser-only SASL password GUC |
 | **performance** | Throughput baselines, latency percentiles, scaling |
-| **metadata** | Metadata refresh, all topics, nonexistent topic |
+| **metadata** | Metadata refresh, all topics, nonexistent topic, a corrupt stored partition count |
 | **protocol** | ApiVersions negotiation, correlation ID, unknown API, pipelining, response ordering |
 | **auth** | SASL_PLAINTEXT (PLAIN, SCRAM-SHA-256/512), SSL (+ untrusted CA, mutual TLS), SASL_SSL, wrong passwords, pre-auth gating, user SQL. Sequential: generates certs with the `openssl` CLI, adds listeners 19093-19095 via ALTER SYSTEM and restarts the worker; the last test resets them. Needs the DB host's filesystem and superuser |
-| **w3_groups** | Wave 3 groups stream: partition caps (raw 2e9 CreateTopics, corrupt stored count), CreateTopics validation, JoinGroup protocol rules, OffsetCommit rules, offsets-only groups after a worker restart, a consumer with no common assignor |
-| **w3_txn** | Wave 3 txn: consumers reach the end past aborted/cleaned-up/DeleteRecords holes and stop at an open transaction's LSO; ListOffsets isolation/-3/partition checks; OffsetFetch require_stable; Kafka's idempotent model (5-batch cache, original offsets, epochs, wrap, survives restarts); transaction validation; fetch batching |
-| **w3_net** | (wave3 net) Hostile clients at the network edge: frame-budget lockout, >100 MB response, TCP_NODELAY, acks=0 close / invalid acks, responses before close, per-IP and per-listener caps, idle and frame-read deadlines, pre-auth deadline from accept, SASL lookup rate limit, unknown-user SCRAM fake. Sequential; the `limits` tests add listeners 19096-19098 via ALTER SYSTEM, connect from 127.0.0.x source addresses and need `openssl` |
-| **w3_shadow** | Shadow checks without an external Kafka (functional suite): per-partition lag view |
-| **w3_worker** | wave3 worker: DROP/CREATE/ALTER EXTENSION under load, old 0.0.0 schema, SIGTERM in a lock wait, worker lock_timeout, maintenance lock races, commit failure, heartbeats inside batches, TransactionEnded on fencing/timeout. Sequential; needs superuser and the DB host's filesystem |
+| **network** | Hostile clients at the network edge: frame-budget lockout, >100 MB response, Nagle, acks=0 close / invalid acks, response before close, per-IP and per-listener caps, idle and frame-read deadlines, pre-auth deadline from accept, SASL lookup rate limit, unknown-user SCRAM. Sequential; the `limits` tests add listeners 19096-19098 via ALTER SYSTEM, connect from 127.0.0.x source addresses and need `openssl` |
+| **worker** | Worker lifecycle and robustness: DROP/CREATE/ALTER EXTENSION under load, old 0.0.0 schema, SIGTERM in a lock wait, worker lock_timeout, commit failure. Sequential; needs superuser and the DB host's filesystem |
 
 ### Running E2E Tests with CLI Options
 
@@ -473,13 +488,16 @@ pub async fn test_feature_name() -> TestResult {
 1. Use unique resource names (`ctx.unique_topic()`, `ctx.unique_group()`).
 2. Verify both the Kafka protocol response and the database state (through `ctx.db()`).
 3. Use the shared client factories.
-4. Mark timing-sensitive tests or tests that change global state `parallel_safe: false`.
+4. Mark timing-sensitive tests or tests that change global state `: sequential`.
 5. Print step-by-step progress; CI logs are the debugging aid.
 
-To add a test: put it in the fitting category directory, export it from the category's `mod.rs`
-and `lib.rs`, and register it in `main.rs` with its category and `parallel_safe` flag. When rdkafka
-lacks a feature, encode the request on raw TCP (see `idempotent/protocol_encoding.rs`) and verify
-through the database.
+To add a test: write it in the fitting category directory and add its path to the
+`test_defs!` list in that category's `tests()` (`kafka_test/src/<category>/mod.rs`), with
+`: sequential` if it must not run concurrently; nothing else lists tests (`registry.rs`,
+`lib.rs`'s `all_tests()`). A new category is a new module plus one line in `all_tests()`.
+When rdkafka hides what the test asserts on, speak the protocol with `kafka_test/src/wire/`
+(framing, the typed `Wire` connection, record batches, shared request builders), compare
+against the codes in `error_codes.rs`, and verify through the database.
 
 ## Debugging
 

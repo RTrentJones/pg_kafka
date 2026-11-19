@@ -234,6 +234,8 @@ pub const ERROR_OFFSET_OUT_OF_RANGE: i16 = 1;
 pub const ERROR_CORRUPT_MESSAGE: i16 = 2;
 /// UNKNOWN_TOPIC_OR_PARTITION.
 pub const ERROR_UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
+/// REQUEST_TIMED_OUT (retriable): the request timed out, e.g. waiting on a lock.
+pub const ERROR_REQUEST_TIMED_OUT: i16 = 7;
 /// COORDINATOR_NOT_AVAILABLE.
 pub const ERROR_COORDINATOR_NOT_AVAILABLE: i16 = 15;
 /// INVALID_TOPIC_EXCEPTION: a topic name that breaks Kafka's naming rules.
@@ -284,7 +286,7 @@ pub const ERROR_INVALID_TRANSACTION_TIMEOUT: i16 = 50;
 pub const ERROR_CONCURRENT_TRANSACTIONS: i16 = 51;
 /// OPERATION_NOT_ATTEMPTED: the request failed for another of its entries.
 pub const ERROR_OPERATION_NOT_ATTEMPTED: i16 = 55;
-/// KAFKA_STORAGE_ERROR (retriable): the broker cannot serve the partition from its log.
+/// KAFKA_STORAGE_ERROR (retriable): the broker cannot read, write or serve the partition's log.
 pub const ERROR_KAFKA_STORAGE_ERROR: i16 = 56;
 /// SASL_AUTHENTICATION_FAILED.
 pub const ERROR_SASL_AUTHENTICATION_FAILED: i16 = 58;
