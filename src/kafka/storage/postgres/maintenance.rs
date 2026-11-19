@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+use super::producers::{bump_producer_epoch, clear_producer_sequences};
 use super::{internal, PostgresStore};
 use crate::kafka::error::{KafkaError, Result};
 use crate::kafka::storage::retention::{
@@ -238,30 +239,27 @@ impl PostgresStore {
                     &[txn_id.as_str().into()],
                 )?;
 
-                // Fence the timed-out producer, as Kafka does, by bumping its epoch:
-                // otherwise the stalled producer could resume with the same epoch
+                // Fence the timed-out producer, as Kafka does, by moving it to its next
+                // epoch: otherwise the stalled producer could resume with the same epoch
                 // (AddPartitionsToTxn accepts CompleteAbort -> Ongoing), add more
-                // partitions and commit only the part written after the abort. The
-                // guard leaves the epoch alone if it already moved or is exhausted
-                // (the next InitProducerId then allocates a fresh producer id).
-                let bumped = client.update(
-                    "UPDATE kafka.producer_ids SET epoch = epoch + 1
-                     WHERE producer_id = $1 AND epoch = $2 AND epoch < $3
-                     RETURNING epoch",
-                    None,
-                    &[producer_id.into(), producer_epoch.into(), i16::MAX.into()],
-                )?;
-                let new_epoch: i16 = if bumped.is_empty() {
-                    producer_epoch
-                } else {
-                    bumped.first().get_by_name("epoch")?.unwrap_or(producer_epoch)
-                };
-                // The new epoch restarts sequence numbers.
-                client.update(
-                    "DELETE FROM kafka.producer_sequences WHERE producer_id = $1",
-                    None,
+                // partitions and commit only the part written after the abort. An
+                // exhausted epoch gets a fresh producer id instead (bump_producer_epoch,
+                // as for InitProducerId); the transaction row follows it through its ON
+                // UPDATE CASCADE foreign key. An epoch that already moved is left alone.
+                let current = client.select(
+                    "SELECT epoch FROM kafka.producer_ids WHERE producer_id = $1",
+                    Some(1),
                     &[producer_id.into()],
                 )?;
+                let still_current = !current.is_empty()
+                    && current.first().get_by_name::<i16, _>("epoch")? == Some(producer_epoch);
+                let new_epoch = if still_current {
+                    bump_producer_epoch(client, producer_id, producer_epoch)?.1
+                } else {
+                    producer_epoch
+                };
+                // The new epoch (or id) restarts sequence numbers.
+                clear_producer_sequences(client, producer_id)?;
                 client.update(
                     "UPDATE kafka.transactions
                      SET state = 'CompleteAbort', producer_epoch = $2, last_updated_at = NOW()
