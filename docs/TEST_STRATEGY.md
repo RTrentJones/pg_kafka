@@ -198,30 +198,21 @@ pg_kafka uses `PGC_POSTMASTER` GUC variables that must be defined before Postgre
 
 ## CI/CD Integration
 
-The `Test Suite` job in `.github/workflows/ci.yml` runs every suite (abridged):
+`.github/workflows/ci.yml` (PostgreSQL from apt.postgresql.org through
+`.github/actions/setup-pg`, toolchain from `rust-toolchain.toml`):
 
-```yaml
-- name: Run unit tests and generate coverage
-  run: cargo llvm-cov --lib --features pg14 --lcov --output-path lcov.info
+| Job | What it runs |
+|-----|--------------|
+| `Lint & Format` | `cargo fmt --check` and clippy `-D warnings` on both crates (pg14), the QA-1 policy check (`.github/scripts/check-coverage-policy.sh`) |
+| `Test Suite` | unit tests under `cargo llvm-cov` (pg14, uploaded to Codecov; includes the API-docs drift test), property tests |
+| `Build kafka_test` | the E2E runner, once, shared with the `e2e` legs as an artifact |
+| `E2E pg14` … `E2E pg18` | per major: clippy, unit and property tests, `cargo pgrx install` into that PostgreSQL, `scripts/ci-pg.sh start`, the functional E2E suite (`--exclude performance --exclude shadow`, 25 min step timeout), `scripts/check-upgrade.sh`, the generated GUC reference check; pg14 also the test-count check and the `shadow` and `performance` categories |
+| `Interop` | `interop/run-java-checks.sh` and `interop/diff/run.py` on PG18 against Kafka 3.7 (see above) |
+| `Security Audit`, `Verify Lockfile`, `SPI change needs E2E test` | `cargo audit` + `cargo deny`; `--locked` checks; the QA-1 guard (pull requests) |
 
-- name: Run property tests
-  run: cargo test --features pg14 --test property_tests
-
-# ... install the extension, add it to shared_preload_libraries, cargo pgrx start pg14 ...
-
-- name: Run Functional E2E Tests
-  run: cd kafka_test && cargo run --release -- --exclude performance --exclude shadow
-
-- name: Run Shadow Mode E2E Tests      # against the external-kafka docker compose service
-  run: cd kafka_test && cargo run --release -- --category shadow
-
-- name: Run Performance E2E Tests      # blocking; conservative regression floors
-  run: cd kafka_test && cargo run --release -- --category performance
-```
-
-Separate jobs cover lint/format (`Lint & Format`), `cargo audit` + `cargo deny` (`Security Audit`),
-lockfile freshness (`Verify Lockfile`), compile + unit tests on PostgreSQL 15/16/17 (`pg-matrix`), and the
-QA-1 guard (`spi-e2e-guard`, pull requests only).
+The functional suite took 4.5 minutes (223 tests, including the auth category's listener
+restarts) on PG18 in a 4-core sandbox; the step timeout leaves about a 5x margin and the job
+timeout (90 min) covers a cold build.
 
 ---
 

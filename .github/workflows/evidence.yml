@@ -1,7 +1,7 @@
 name: evidence
 
 # Continuously-verified evidence for the pg_kafka showcase (rtrentjones.dev/pg_kafka). Brings the
-# extension up exactly the way ci.yml's E2E job does (pgrx on the runner + the real-broker compose),
+# extension up exactly the way ci.yml's E2E jobs do (scripts/ci-pg.sh + the real-broker compose),
 # then runs the client conformance matrix, the benchmark (with raw-INSERT floor + real-broker
 # ceiling) and the recorded session, and:
 #   1. force-pushes conformance.json / bench.json / session.svg to the orphan `evidence` branch
@@ -26,7 +26,6 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   PGRX_VERSION: '0.16.1'
-  PG_VERSION: '14.20'
 
 jobs:
   evidence:
@@ -48,89 +47,29 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libpq-dev libreadline-dev zlib1g-dev flex bison \
-            libxml2-dev libxslt-dev libssl-dev libsasl2-dev libzstd-dev \
-            netcat-openbsd postgresql-client kafkacat asciinema
+      - uses: ./.github/actions/setup-pg
+        with:
+          pg: 14
+          pgrx-version: ${{ env.PGRX_VERSION }}
+          owned: 'true'
+
+      - name: Install evidence tooling
+        run: sudo apt-get install -y postgresql-client kafkacat asciinema
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: v2
-
-      - name: Cache cargo-pgrx binary
-        id: cache-cargo-pgrx
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/bin/cargo-pgrx
-          key: ${{ runner.os }}-cargo-pgrx-bin-${{ env.PGRX_VERSION }}
-
-      - name: Install pgrx
-        if: steps.cache-cargo-pgrx.outputs.cache-hit != 'true'
-        run: cargo install --locked cargo-pgrx --version ${{ env.PGRX_VERSION }}
-
-      - name: Cache pgrx PostgreSQL binaries
-        id: cache-pgrx
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.pgrx/14.*
-            ~/.pgrx/14.*_unpack
-            ~/.pgrx/config.toml
-          key: ${{ runner.os }}-pgrx-pg14-${{ env.PGRX_VERSION }}-pg${{ env.PG_VERSION }}-v2
-          restore-keys: |
-            ${{ runner.os }}-pgrx-pg14-${{ env.PGRX_VERSION }}-
-
-      - name: Initialize pgrx
-        if: steps.cache-pgrx.outputs.cache-hit != 'true'
-        run: cargo pgrx init --pg14 download
+          prefix-key: v3-evidence
 
       - name: Install extension
-        run: |
-          PG_CONFIG=$(find ~/.pgrx -name pg_config -type f -executable 2>/dev/null | grep "14\." | head -n 1)
-          [ -n "$PG_CONFIG" ] || { echo "no pg_config for pg14"; exit 1; }
-          export PATH="$(dirname "$PG_CONFIG"):$PATH"
-          cargo pgrx install --release --pg-config="$PG_CONFIG"
+        run: cargo pgrx install --release --pg-config "$PG_CONFIG"
 
-      - name: Initialize Postgres data dir
-        run: |
-          cargo pgrx start pg14 || true
-          sleep 2
-          cargo pgrx stop pg14 || true
-          sleep 1
-
-      - name: Configure background worker (shared_preload_libraries)
-        run: |
-          PG14_DATA_DIR=$(find ~/.pgrx -maxdepth 1 -type d -name "data-14*" | head -n 1)
-          [ -n "$PG14_DATA_DIR" ] || { echo "no pgrx data dir"; exit 1; }
-          # Advertise 127.0.0.1 (not 'localhost'): pg_kafka returns pg_kafka.host as the broker's
-          # advertised address, and librdkafka/kcat follow 'localhost' to IPv6 ::1 (which nothing
-          # binds) → connection refused. 127.0.0.1 keeps every client on IPv4.
-          if ! grep -q "shared_preload_libraries.*pg_kafka" "$PG14_DATA_DIR/postgresql.conf"; then
-            printf "\nshared_preload_libraries = 'pg_kafka'\npg_kafka.host = '127.0.0.1'\n" >> "$PG14_DATA_DIR/postgresql.conf"
-          fi
-
-      - name: Start Postgres + create extension
-        run: |
-          cargo pgrx start pg14
-          PG14_DATA_DIR=$(find ~/.pgrx -maxdepth 1 -type d -name "data-14*" | head -n 1)
-          PG_PORT=$(grep "port =" "$PG14_DATA_DIR/postgresql.conf" | awk '{print $3}')
-          DB_USER=$(whoami)
-          psql -h localhost -p "$PG_PORT" -U "$DB_USER" -d postgres -c "CREATE EXTENSION IF NOT EXISTS pg_kafka;"
-          {
-            echo "PGHOST=localhost"
-            echo "PGPORT=$PG_PORT"
-            echo "PGUSER=$DB_USER"
-            echo "PGDATABASE=postgres"
-          } >> "$GITHUB_ENV"
-
-      - name: Wait for Kafka port 9092
-        timeout-minutes: 1
-        run: |
-          timeout 30s bash -c 'until nc -z 127.0.0.1 9092; do sleep 1; done'
-          sleep 3 # protocol readiness
+      - name: Start Postgres with pg_kafka preloaded
+        # Same cluster setup as ci.yml's E2E jobs (scripts/ci-pg.sh): pg_kafka on 127.0.0.1:9092,
+        # advertised as 127.0.0.1 (librdkafka/kcat follow 'localhost' to ::1, which nothing
+        # binds). Exports PGHOST/PGPORT/PGUSER/PGDATABASE.
+        timeout-minutes: 3
+        run: scripts/ci-pg.sh start "$RUNNER_TEMP/pg"
 
       - name: Start real broker (ceiling baseline)
         run: |
@@ -187,4 +126,4 @@ jobs:
         if: always()
         run: |
           docker compose down -v || true
-          cargo pgrx stop pg14 || true
+          scripts/ci-pg.sh stop "$RUNNER_TEMP/pg" || true
