@@ -179,7 +179,16 @@ pub struct ShadowStore<S: KafkaStore, D: ShadowDb = SpiShadowDb> {
     /// waiting `OUTBOX_POLL_INTERVAL` (sync rows committed, a full claim).
     poll_requested: AtomicBool,
     /// Consecutive failed outbox ticks and the pause they imposed.
-    outbox_failures: Mutex<(u32, Option<Instant>)>,
+    outbox_failures: Mutex<TickFailures>,
+}
+
+/// The outbox tick's failure backoff.
+#[derive(Debug, Default)]
+struct TickFailures {
+    /// Failed ticks in a row.
+    consecutive: u32,
+    /// No tick runs before this instant.
+    paused_until: Option<Instant>,
 }
 
 /// One sync-mode outbox row waiting for its request's commit.
@@ -216,7 +225,7 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
             current_slot: AtomicU64::new(0),
             sync_pending: Mutex::new(Vec::new()),
             poll_requested: AtomicBool::new(false),
-            outbox_failures: Mutex::new((0, None)),
+            outbox_failures: Mutex::new(TickFailures::default()),
         }
     }
 
@@ -535,11 +544,11 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
     /// previous one: every `OUTBOX_POLL_INTERVAL`, at once when requested, and
     /// never during a failure backoff.
     pub fn outbox_tick_due(&self, since_last: Duration) -> bool {
-        let failures = lock(&self.outbox_failures);
-        if let Some(until) = failures.1 {
-            if Instant::now() < until {
-                return false;
-            }
+        if lock(&self.outbox_failures)
+            .paused_until
+            .is_some_and(|until| Instant::now() < until)
+        {
+            return false;
         }
         self.poll_requested.load(Ordering::Relaxed) || since_last >= OUTBOX_POLL_INTERVAL
     }
@@ -550,15 +559,15 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
     pub fn note_outbox_tick(&self, ok: bool) -> bool {
         let mut failures = lock(&self.outbox_failures);
         if ok {
-            *failures = (0, None);
+            *failures = TickFailures::default();
             return false;
         }
-        failures.0 = failures.0.saturating_add(1);
-        let n = failures.0;
+        failures.consecutive = failures.consecutive.saturating_add(1);
+        let n = failures.consecutive;
         let pause = OUTBOX_POLL_INTERVAL
             .saturating_mul(1u32 << (n - 1).min(10))
             .min(OUTBOX_FAILURE_BACKOFF_MAX);
-        failures.1 = Some(Instant::now() + pause);
+        failures.paused_until = Some(Instant::now() + pause);
         self.poll_requested.store(false, Ordering::Relaxed);
         n.is_power_of_two()
     }
