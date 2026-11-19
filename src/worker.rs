@@ -101,6 +101,7 @@ extern "C" {
     // bindings. Neither raises a Postgres error.
     fn PostmasterIsAliveInternal() -> bool;
     fn disable_all_timeouts(keep_indicators: bool);
+    fn _exit(status: std::ffi::c_int) -> !;
     #[link_name = "SetLatch"]
     fn RawSetLatch(latch: *mut pg_sys::Latch);
     #[cfg(target_os = "linux")]
@@ -461,6 +462,8 @@ static NETWORK_SHUTDOWN: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>> =
     std::sync::Mutex::new(None);
 /// Set when the network thread has finished (its runtime is shut down).
 static NETWORK_FINISHED: AtomicBool = AtomicBool::new(false);
+/// How long [`stop_network_on_exit`] waits for the network thread, in ms.
+static NETWORK_EXIT_WAIT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(2000);
 
 /// Sets [`NETWORK_FINISHED`] when the network thread's closure ends, however it ends.
 struct NetworkFinished;
@@ -482,7 +485,8 @@ unsafe extern "C-unwind" fn stop_network_on_exit(_code: std::ffi::c_int, _arg: p
             let _ = tx.send(());
         }
         let start = Instant::now();
-        while !NETWORK_FINISHED.load(Ordering::SeqCst) && start.elapsed() < Duration::from_secs(2) {
+        let wait = Duration::from_millis(NETWORK_EXIT_WAIT_MS.load(Ordering::SeqCst));
+        while !NETWORK_FINISHED.load(Ordering::SeqCst) && start.elapsed() < wait {
             std::thread::sleep(Duration::from_millis(10));
         }
     });
@@ -495,6 +499,8 @@ fn shutdown_and_exit(
     timeout: Duration,
 ) -> ! {
     let _ = shutdown_tx.send(());
+    // The exit hook must not wait longer than the caller allowed.
+    NETWORK_EXIT_WAIT_MS.store(timeout.as_millis() as u64, Ordering::SeqCst);
     let join_start = Instant::now();
     loop {
         if network_handle.is_finished() {
@@ -1233,7 +1239,15 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
         // committing Kafka writes and block a new postmaster from starting.
         if !postmaster_alive() {
             log!("pg_kafka background worker exiting: the postmaster died");
-            shutdown_and_exit(&shutdown_tx, &network_handle, Duration::from_secs(1));
+            // Stop the network thread (bounded), then leave at once: the shared memory
+            // dies with the cluster anyway, and a new postmaster can start only once
+            // every process of the old one is gone (proc_exit's cleanup took >1 s).
+            let _ = shutdown_tx.send(());
+            let start = Instant::now();
+            while !network_handle.is_finished() && start.elapsed() < Duration::from_millis(300) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            unsafe { _exit(1) };
         }
 
         // wave3 worker: the extension was dropped (DROP EXTENSION). Answer requests with

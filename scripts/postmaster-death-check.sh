@@ -44,7 +44,8 @@ gone=""
 while :; do
   now=$(date +%s.%N)
   elapsed=$(echo "$now - $start" | bc)
-  if ! kill -0 "$listener" 2>/dev/null; then
+  # Gone, or a zombie waiting to be reaped by its new parent (it has exited).
+  if ! kill -0 "$listener" 2>/dev/null || grep -q '^State:[[:space:]]*Z' "/proc/$listener/status" 2>/dev/null; then
     gone="$elapsed"
     break
   fi
@@ -80,7 +81,17 @@ for p in $(pgrep -u "$RUN_AS" -f "postgres" || true); do
 done
 
 echo "restarting the cluster"
-if ! as_owner "$PG_CTL" -D "$PGDATA" -l "$PGLOG" -w -t 60 start >/dev/null; then
+# The killed postmaster may linger as a zombie until its new parent reaps it, and
+# Postgres refuses to start while that pid exists: retry for up to 30 s.
+started=""
+for _ in $(seq 1 30); do
+  if as_owner "$PG_CTL" -D "$PGDATA" -l "$PGLOG" -w -t 60 start >/dev/null 2>&1; then
+    started=1
+    break
+  fi
+  sleep 1
+done
+if [ -z "$started" ]; then
   echo "FAIL: the cluster did not restart"
   tail -20 "$PGLOG"
   exit 1
