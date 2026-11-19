@@ -7,7 +7,7 @@ use kafka_protocol::messages::produce_response::{
 use tracing::warn;
 
 use super::{ApiEnv, ApiSchema, Call, KafkaApi, Rejection, RequestHeader, TopicPartitions};
-use crate::kafka::constants::{ERROR_CORRUPT_MESSAGE, ERROR_NONE};
+use crate::kafka::constants::{ERROR_CORRUPT_MESSAGE, ERROR_INVALID_REQUIRED_ACKS, ERROR_NONE};
 use crate::kafka::dispatch::RequestOutcome;
 use crate::kafka::error::KafkaError;
 use crate::kafka::handlers;
@@ -93,6 +93,16 @@ impl KafkaApi for ProduceApi {
             })
             .collect();
 
+        // wave3 net (item 5): Kafka accepts only acks -1, 0 and 1; anything else is
+        // answered INVALID_REQUIRED_ACKS on every partition and nothing is written.
+        if !valid_acks(acks) {
+            warn!("Rejecting Produce with invalid acks={}", acks);
+            return Err(Rejection::Reply {
+                error_code: ERROR_INVALID_REQUIRED_ACKS,
+                echo: Some(requested),
+            });
+        }
+
         let mut topic_data = Vec::with_capacity(wire.topic_data.len());
         for topic in wire.topic_data {
             let name = topic.name.to_string();
@@ -110,9 +120,12 @@ impl KafkaApi for ProduceApi {
                                 name, partition.index, e
                             );
                             // acks=0 never gets a response: an unsolicited one would be read
-                            // as the reply to the client's next request.
+                            // as the reply to the client's next request. Kafka closes the
+                            // connection instead (wave3 net item 4), so the client notices.
                             if acks == 0 {
-                                return Err(Rejection::Silent);
+                                return Err(Rejection::Close(
+                                    "acks=0 Produce with a corrupt record batch",
+                                ));
                             }
                             let error_code = match e {
                                 KafkaError::InvalidRecord { .. } => e.to_kafka_error_code(),
@@ -165,18 +178,36 @@ impl KafkaApi for ProduceApi {
     fn handle(request: Self::Request, call: Call<Self>, env: &ApiEnv<'_>) -> RequestOutcome {
         let store = env.ctx.store;
         if request.acks == 0 {
-            // Best effort, no response either way. Idempotency (Phase 9) and transactions
-            // (Phase 10) need acks >= 1 to mean anything, so neither is applied here. A
-            // request-level failure rolls back like the acks >= 1 path.
+            // Best effort, no response. Idempotency (Phase 9) and transactions (Phase 10)
+            // need acks >= 1 to mean anything, so neither is applied here. A request-level
+            // failure rolls back like the acks >= 1 path.
+            //
+            // wave3 net (item 4): as in Kafka, any error (a partition error, or the whole
+            // request failing) closes the connection, so the client refreshes its metadata
+            // instead of producing into the void. The partitions that succeeded still
+            // commit: the close instruction travels through the response channel, so the
+            // worker releases it only after the batch committed (RB-1).
+            let (_header, response_tx) = call.into_parts();
+            let close = || {
+                let _ = response_tx.send(crate::kafka::messages::KafkaResponse::new(
+                    -1,
+                    -1,
+                    super::ResponseBody::CloseConnection,
+                ));
+            };
             return match handlers::handle_produce(&env.ctx, request.topic_data, None, None) {
                 Ok(response) => {
                     emit_produce_notifications(&response, store, env.notify_tx);
+                    if acks0_must_close(&response) {
+                        close();
+                    }
                     RequestOutcome::Commit
                 }
                 Err(e) => {
                     if e.is_server_error() {
                         crate::pg_warning!("acks=0 produce error (data may be lost): {}", e);
                     }
+                    close();
                     RequestOutcome::Rollback
                 }
             };
@@ -196,6 +227,16 @@ impl KafkaApi for ProduceApi {
             Ok(response)
         })
     }
+}
+
+/// wave3 net: the `acks` values Kafka accepts (all ISR, none, leader).
+pub(crate) fn valid_acks(acks: i16) -> bool {
+    matches!(acks, -1..=1)
+}
+
+/// wave3 net: whether an acks=0 Produce must close the connection (any partition error).
+pub(crate) fn acks0_must_close(response: &ProduceResponse) -> bool {
+    ProduceApi::response_has_error(response)
 }
 
 /// The producer identity of a request: the metadata of the first batch written by an

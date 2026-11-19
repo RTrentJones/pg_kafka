@@ -333,6 +333,8 @@ fn build_listener_securities(
                     .map(tokio_rustls::TlsAcceptor::from),
                 sasl_mechanisms: mechanisms.clone(),
                 advertised: spec.advertised.clone(),
+                // wave3 net: connection caps and timeouts.
+                limits: settings.limits,
             })
         })
         .collect())
@@ -596,6 +598,9 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     let network_handle = std::thread::Builder::new()
         .name("pg_kafka-net".to_string())
         .spawn(move || {
+            // wave3 net: signals belong to the main worker thread (pgrx's handlers
+            // panic, and abort the process, on any other thread).
+            crate::kafka::listener::block_signals_on_this_thread();
             // Network-thread logging to stderr: warnings by default, RUST_LOG overrides.
             crate::kafka::listener::init_network_tracing();
 
@@ -1214,6 +1219,13 @@ impl BufferedResponse {
         while self.buffer_rx.try_recv().is_ok() {}
         self.metrics.mark_error();
         if !self.expects_response {
+            // wave3 net: an acks=0 produce whose writes were lost closes the
+            // connection, as any acks=0 error does (Kafka), so the client notices.
+            let _ = self.client_tx.send(crate::kafka::KafkaResponse::new(
+                -1,
+                -1,
+                crate::kafka::api::ResponseBody::CloseConnection,
+            ));
             return;
         }
         // The API's own error response, echoing the request's topics/partitions/groups
@@ -1570,12 +1582,20 @@ mod tests {
     #[test]
     fn test_commit_failure_sends_nothing_to_acks0_produce() {
         // An acks=0 client expects no response frame at all; an error frame would
-        // be read as the answer to its next request.
+        // be read as the answer to its next request. wave3 net: the connection gets
+        // the close instruction instead (Kafka closes it on any acks=0 error).
         let (mut p, mut p_rx) = produce_request(21, 0);
         let pending = vec![BufferedResponse::intercept(&mut p)];
         drop(p); // the acks=0 path sends nothing
         after_batch_commit_failure(pending);
-        assert!(p_rx.try_recv().is_err());
+        match p_rx.try_recv() {
+            Ok(r) => assert!(matches!(
+                r.body,
+                crate::kafka::api::ResponseBody::CloseConnection
+            )),
+            Err(e) => panic!("expected the close instruction, got {e:?}"),
+        }
+        assert!(p_rx.try_recv().is_err(), "nothing else");
     }
 
     #[test]

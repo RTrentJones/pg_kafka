@@ -13,6 +13,7 @@
 
 mod decoding;
 mod encoding;
+pub mod framing;
 mod recordbatch;
 
 // Re-export public functions
