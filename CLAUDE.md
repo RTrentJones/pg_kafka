@@ -75,7 +75,7 @@ python3 scripts/gen-docs.py --check                  # generated doc regions are
 afterwards ("FATAL: cannot create PGC_POSTMASTER variables after startup"). SQL-visible code is
 covered by the E2E suite instead (`docs/PGRX_TESTING_GUIDE.md`).
 
-Generated doc regions (`<!--gen:...-->`): the `api-*` ones are owned by the unit test
+Generated doc regions (between `gen:` marker comments): the `api-*` ones are owned by the unit test
 `kafka::api::docs::generated_api_docs` (rerun with `PG_KAFKA_UPDATE_DOCS=1` to rewrite them), the
 `guc-*` and `tests-*` ones by `scripts/gen-docs.py` (`--write`, needs a running server for GUCs).
 
