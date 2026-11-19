@@ -217,6 +217,7 @@ src/
 │   ├── notifications.rs    # DB-thread/network-thread notifications for long polling
 │   ├── pending_fetches.rs  # Registry of FetchRequests waiting for data (long polling)
 │   ├── coordinator.rs  # Consumer group coordinator (Arc<RwLock> shared state)
+│   ├── limits.rs       # Caps on client-controlled state (partitions per topic, group size, group count GUCs)
 │   ├── auth/           # Listener security (TLS, SASL), see docs/AUTHENTICATION.md
 │   │   ├── mod.rs      # ConnectionPrincipal, re-exports
 │   │   ├── settings.rs # Security protocols, listener specs, the listener-security GUCs
@@ -410,6 +411,7 @@ In-memory state management (`src/kafka/coordinator.rs`):
 - Automatic rebalancing on member leave or session timeout
 - Tracks: generation IDs, member registry, partition assignments
 - JoinGroup responses are held until the join phase completes (every known member rejoined, or the rest left / timed out), as in Kafka; the generation moves when the join completes. `GroupCoordinator::join_group` takes a `JoinResponder` it calls exactly once (immediately or later, from another member's JoinGroup, a LeaveGroup or the ~1 s `check_and_remove_timed_out_members` sweep). `JoinGroupApi::handle` answers on the client's own sender (`KafkaApi::DEFERRED_REPLY`, so `swap_response_tx` leaves it in place for JoinGroup and SyncGroup), wrapped in `handlers::JoinGroupReply`, which answers UNKNOWN_SERVER_ERROR if dropped unsent. A follower's SyncGroup is held the same way (`handlers::SyncGroupReply`, `pending_syncs`) until the leader's SyncGroup delivers the assignment, so a follower that syncs first waits instead of being told REBALANCE_IN_PROGRESS
+- wave3 groups: Kafka 3.7's JoinGroup checks (INCONSISTENT_GROUP_PROTOCOL; UNKNOWN_MEMBER_ID for an unknown non-empty member id; protocol chosen by member vote) and OffsetCommit rules (`validate_offset_commit`: generation -1 only for an unknown/Empty group). Groups with committed offsets but no in-memory state are Empty "consumer" groups for ListGroups/DescribeGroups (`OffsetStore::list_offset_groups`/`group_has_offsets`). Group size and count are capped (`kafka::limits`, applied per JoinGroup via `GroupCoordinator::set_limits`)
 
 ### Storage Schema
 
@@ -599,6 +601,12 @@ pg_kafka.run_as_role = 'pgkafka_worker' -- Role the worker switches to once the 
 pg_kafka.message_retention_hours = 0 -- Retention sweep for kafka.messages (0 = keep forever; 0-87600; DR-2)
 pg_kafka.message_partition_minutes = 1440 -- Width of one time partition of kafka.messages (5-43200; new leaves only; ADR-001)
 pg_kafka.config_reload_interval_ms = 30000  -- How often the worker reloads GUCs + shadow config (100-300000ms)
+-- wave3 groups: resource bounds (src/kafka/limits.rs)
+pg_kafka.max_partitions_per_topic = 10000 -- Partition cap for CreateTopics/CreatePartitions/auto-create (1-100000; INVALID_PARTITIONS above;
+                                          -- kafka.topics also has CHECK (partitions BETWEEN 1 AND 100000))
+pg_kafka.group_max_size = 1000            -- Members per consumer group (1-100000; GROUP_MAX_SIZE_REACHED above)
+pg_kafka.max_consumer_groups = 100000     -- Groups held in the in-memory coordinator (1-1000000; the least recently active
+                                          -- Empty group is evicted when full, else COORDINATOR_NOT_AVAILABLE)
 
 -- Test-only fault injection (Sighup, default 0 = off; never set in production)
 pg_kafka.test_forward_ack_delay_ms = 0   -- Delay before the shadow forwarder acks (0-30000ms)
@@ -770,6 +778,7 @@ Per-category counts are in `docs/TEST_STRATEGY.md`; `cargo run --release -- --li
 | **metadata** | Metadata refresh, all topics, nonexistent topic |
 | **protocol** | ApiVersions negotiation, correlation ID, unknown API, pipelining, response ordering |
 | **auth** | SASL_PLAINTEXT (PLAIN, SCRAM-SHA-256/512), SSL (+ untrusted CA, mutual TLS), SASL_SSL, wrong passwords, pre-auth gating, user SQL. Sequential: generates certs with the `openssl` CLI, adds listeners 9093-9095 via ALTER SYSTEM and restarts the worker; the last test resets them. Needs the DB host's filesystem and superuser |
+| **w3_groups** | Wave 3 groups stream: partition caps (raw 2e9 CreateTopics, corrupt stored count), CreateTopics validation, JoinGroup protocol rules, OffsetCommit rules, offsets-only groups after a worker restart, a consumer with no common assignor |
 
 ### Running E2E Tests with CLI Options
 

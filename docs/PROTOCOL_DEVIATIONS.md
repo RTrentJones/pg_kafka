@@ -163,6 +163,33 @@ pg_kafka.compression_type = 'gzip'
   of an empty group completes its join at once, and members joining right after it
   start a second rebalance.
 
+- ✅ Kafka 3.7's JoinGroup checks: a member whose protocol type differs from the group's, that
+  shares no protocol with every other member, or that sends an empty protocol list (or an
+  empty protocol type for a new group) gets INCONSISTENT_GROUP_PROTOCOL and the group is
+  untouched; a JoinGroup with a non-empty member id the group does not know (evicted, or lost in
+  a worker restart) gets UNKNOWN_MEMBER_ID and the client rejoins with an empty id. The group
+  protocol is chosen by Kafka's member vote (each member votes for its most preferred protocol
+  that all members support; ties go to the leader's preference, where Kafka's order is
+  unspecified). JoinGroup error responses before v7 carry protocol_name "" (non-nullable there).
+- ✅ OffsetCommit follows Kafka 3.7: generation -1 (simple consumers, `kafka-consumer-groups
+  --reset-offsets`) is accepted only for an unknown or Empty group (any member id); a group with
+  members answers UNKNOWN_MEMBER_ID to a non-member and ILLEGAL_GENERATION to a wrong
+  generation (also -1 from a member); a generation >= 0 for a group the coordinator does not
+  know gets ILLEGAL_GENERATION. (TxnOffsetCommit keeps its own rules.)
+- ✅ Groups known only by their committed offsets (none of their members joined since the
+  worker started, e.g. after a restart, or the group was reclaimed from memory) are reported by
+  ListGroups and DescribeGroups as Empty groups with protocol type "consumer", so
+  `kafka-consumer-groups --list/--describe` shows them with offsets and lag. (Kafka keeps the
+  group's actual protocol type; an offsets-only group here is always "consumer", which also
+  covers groups that only ever committed as simple consumers, for which Kafka reports "".)
+- Resource bounds (deviation: Kafka's `group.max.size` defaults to unlimited and it has no
+  group-count cap): `pg_kafka.group_max_size` (default 1000) members per group, beyond which a
+  new member gets GROUP_MAX_SIZE_REACHED; `pg_kafka.max_consumer_groups` (default 100000) groups
+  in memory, beyond which the least recently active Empty group is forgotten (its offsets stay)
+  or, if none is Empty, a JoinGroup for a new group gets COORDINATOR_NOT_AVAILABLE; a member's
+  protocol list is limited to 64 protocols and 1 MiB (Kafka bounds it by the 1 MiB
+  `__consumer_offsets` record), beyond which JoinGroup gets INVALID_REQUEST.
+
 **Client Impact:**
 - Full consumer group functionality works with standard Kafka clients
 - Both manual partition assignment and automatic subscription supported
@@ -282,7 +309,7 @@ honored; producer CreateTime timestamps are preserved — BUG-7).
 **pg_kafka Behavior:** Same, with configurable default partition count
 
 **Implementation:**
-- ✅ Topics can have any number of partitions (set via CreateTopics or `pg_kafka.default_partitions` GUC)
+- ✅ Topics have 1 to `pg_kafka.max_partitions_per_topic` partitions (default 10000, at most 100000; set via CreateTopics/CreatePartitions or, for auto-created topics, `pg_kafka.default_partitions` capped at the maximum). A larger count is refused with INVALID_PARTITIONS and `kafka.topics` carries a `CHECK (partitions BETWEEN 1 AND 100000)`; a stored count outside that range (only possible by bypassing the constraint) is reported by Metadata as UNKNOWN_SERVER_ERROR for that topic and ignored by the server-side assignors instead of being allocated (an unbounded count used to abort the worker and send Postgres into crash recovery). Kafka itself has no per-topic cap.
 - ✅ Key-based partition routing using murmur2 hash (Kafka-compatible)
 - ✅ Explicit partition assignment in ProduceRequest supported
 - ✅ Metadata reports correct partition count
@@ -313,9 +340,10 @@ honored; producer CreateTime timestamps are preserved — BUG-7).
 
 **Status:** Minor deviations by design
 
-- **CreateTopics ignores topic configs.** Per-topic `configs` (e.g. `retention.ms`), manual replica assignments, and `replication_factor` in the request are accepted but not applied; the response always reports replication factor 1. Set `retention.ms` afterwards with IncrementalAlterConfigs.
-- **CreateTopics default partition count.** `num_partitions = -1` ("broker default", what most admin clients send) creates a topic with `pg_kafka.default_partitions` partitions, the same default auto-created topics get. Any other value below 1, such as `0`, is rejected with INVALID_PARTITIONS.
-- **DeleteGroups on an unknown group** succeeds (error code 0, any orphaned committed offsets are deleted) instead of returning GROUP_ID_NOT_FOUND.
+- **CreateTopics ignores topic configs.** Per-topic `configs` (e.g. `retention.ms`) and manual replica assignments are accepted but not applied. Set `retention.ms` afterwards with IncrementalAlterConfigs.
+- **CreateTopics validation follows Kafka 3.7** (checked against a real 3.7 broker): a name repeated in one request gets a single INVALID_REQUEST "Duplicate topic name." result and is not created; a name that collides with an existing topic once `.` and `_` are treated as equal (`a.b` vs `a_b`) gets INVALID_TOPIC_EXCEPTION "Topic 'a_b' collides with existing topic: a.b"; `replication_factor` must be 1 or -1 (the default): 0 or below -1 gets INVALID_REPLICATION_FACTOR "Replication factor must be larger than 0, or -1 to use the default value.", above 1 gets INVALID_REPLICATION_FACTOR (single broker), and the response reports 1. Remaining differences: two colliding names created in the *same* request are refused here (Kafka 3.7 creates both, checking collisions only against existing topics), and topics auto-created by Metadata/Produce are not collision-checked (that would cost a query per produce).
+- **CreateTopics default partition count.** `num_partitions = -1` ("broker default", what most admin clients send) creates a topic with `pg_kafka.default_partitions` partitions (capped at `pg_kafka.max_partitions_per_topic`), the same default auto-created topics get. Any other value below 1, such as `0`, is rejected with INVALID_PARTITIONS, as is any count above `pg_kafka.max_partitions_per_topic` (CreateTopics and CreatePartitions; Kafka has no such cap).
+- **DeleteGroups** deletes an Empty group's committed offsets (also a group known only by its offsets, see §5) and answers GROUP_ID_NOT_FOUND for a group that has neither members nor offsets, as Kafka does.
 - **CreatePartitions** does not itself trigger a rebalance; consumers pick up the new partitions on their next metadata refresh.
 - **DescribeConfigs** supports only TOPIC resources and reports only `retention.ms` and `cleanup.policy` (always `delete`; there is no log compaction). BROKER and other resource types return INVALID_REQUEST. Versions v1-v4 only (the kafka-protocol crate does not implement v0).
 - **IncrementalAlterConfigs** accepts only SET/DELETE of `retention.ms` on TOPIC resources. Any other key or operation (APPEND/SUBTRACT) fails the whole resource with INVALID_CONFIG rather than being silently accepted.
