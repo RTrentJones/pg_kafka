@@ -204,9 +204,9 @@ mod tests {
         // Only first 2 consumers get partitions
         assert_eq!(result["member-1"].partitions("topic-a"), vec![0]);
         assert_eq!(result["member-2"].partitions("topic-a"), vec![1]);
-        assert!(result["member-3"].partitions("topic-a").is_empty());
-        assert!(result["member-4"].partitions("topic-a").is_empty());
-        assert!(result["member-5"].partitions("topic-a").is_empty());
+        assert_eq!(result["member-3"].partitions("topic-a"), [] as [i32; 0]);
+        assert_eq!(result["member-4"].partitions("topic-a"), [] as [i32; 0]);
+        assert_eq!(result["member-5"].partitions("topic-a"), [] as [i32; 0]);
     }
 
     #[test]
@@ -252,7 +252,7 @@ mod tests {
         assert_eq!(result["member-2"].partitions("topic-a"), vec![1, 3]);
 
         // topic-b: only member-2 subscribes -> all to member-2
-        assert!(result["member-1"].partitions("topic-b").is_empty());
+        assert_eq!(result["member-1"].partitions("topic-b"), [] as [i32; 0]);
         assert_eq!(result["member-2"].partitions("topic-b"), vec![0, 1, 2, 3]);
     }
 
@@ -304,7 +304,7 @@ mod tests {
         let result = strategy.assign(&input);
 
         assert_eq!(result["member-1"].partitions("topic-a"), vec![0, 1, 2, 3]);
-        assert!(result["member-1"].partitions("topic-b").is_empty());
+        assert_eq!(result["member-1"].partitions("topic-b"), [] as [i32; 0]);
     }
 
     #[test]
@@ -324,6 +324,6 @@ mod tests {
         let strategy = RoundRobinStrategy::new();
         let result = strategy.assign(&input);
 
-        assert!(result["member-1"].partitions("topic-a").is_empty());
+        assert_eq!(result["member-1"].partitions("topic-a"), [] as [i32; 0]);
     }
 }

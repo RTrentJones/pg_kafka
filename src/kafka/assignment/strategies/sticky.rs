@@ -80,7 +80,7 @@ impl AssignmentStrategy for StickyStrategy {
         let total_partitions: usize = input
             .topic_partitions
             .values()
-            .map(|&count| count.max(0) as usize)
+            .map(|&count| usize::try_from(count).unwrap_or(0))
             .sum();
 
         let num_members = input.subscriptions.len();
@@ -231,9 +231,8 @@ fn balance_assignments(
             }
         }
 
-        let (from, to, topic, partition) = match chosen {
-            Some(mv) => mv,
-            None => break,
+        let Some((from, to, topic, partition)) = chosen else {
+            break;
         };
 
         if let Some(parts) = result
@@ -307,7 +306,7 @@ mod tests {
             .values()
             .flat_map(|a| a.partitions("topic-a"))
             .collect();
-        assert_eq!(all_partitions, [0, 1, 2, 3].iter().cloned().collect());
+        assert_eq!(all_partitions, [0, 1, 2, 3].iter().copied().collect());
     }
 
     #[test]
@@ -454,7 +453,7 @@ mod tests {
 
         // topic-a preserved, topic-b removed
         assert_eq!(result["member-1"].partitions("topic-a"), vec![0, 1]);
-        assert!(result["member-1"].partitions("topic-b").is_empty());
+        assert_eq!(result["member-1"].partitions("topic-b"), [] as [i32; 0]);
     }
 
     #[test]

@@ -97,26 +97,23 @@ pub struct GroupMember {
 impl GroupMember {
     /// Check if member's session has timed out
     pub fn is_timed_out(&self) -> bool {
-        // CG-4: a non-positive session timeout is invalid. `self.session_timeout_ms as u128`
-        // would wrap a negative value to ~1.8e19 ms, making the member effectively immortal and
-        // never reaped. Treat an invalid timeout as already expired so the sweep removes it.
-        if self.session_timeout_ms <= 0 {
-            return true;
+        // A non-positive session timeout is invalid; it counts as already expired, so the
+        // sweep removes the member instead of keeping it forever.
+        match u128::try_from(self.session_timeout_ms) {
+            Ok(timeout_ms) if timeout_ms > 0 => {
+                self.last_heartbeat.elapsed().as_millis() > timeout_ms
+            }
+            _ => true,
         }
-        let elapsed = self.last_heartbeat.elapsed();
-        elapsed.as_millis() > self.session_timeout_ms as u128
     }
 
     /// How long this member allows a rebalance to take: its rebalance timeout, or for a
     /// v0 JoinGroup (which carries none) its session timeout, as Kafka does.
     pub(super) fn effective_rebalance_timeout_ms(&self) -> u128 {
-        if self.rebalance_timeout_ms > 0 {
-            self.rebalance_timeout_ms as u128
-        } else if self.session_timeout_ms > 0 {
-            self.session_timeout_ms as u128
-        } else {
-            u128::from(DEFAULT_REBALANCE_TIMEOUT_MS)
-        }
+        [self.rebalance_timeout_ms, self.session_timeout_ms]
+            .into_iter()
+            .find_map(|ms| u128::try_from(ms).ok().filter(|&ms| ms > 0))
+            .unwrap_or(u128::from(DEFAULT_REBALANCE_TIMEOUT_MS))
     }
 }
 

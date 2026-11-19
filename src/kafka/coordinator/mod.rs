@@ -1003,10 +1003,10 @@ impl GroupCoordinator {
         };
 
         // Encode assignments to bytes
-        let encoded: HashMap<String, Vec<u8>> = assignments
+        let encoded = assignments
             .into_iter()
-            .map(|(id, assignment)| (id, assignment.encode()))
-            .collect();
+            .map(|(id, assignment)| Ok((id, assignment.encode()?)))
+            .collect::<Result<HashMap<String, Vec<u8>>>>()?;
 
         pg_log!(
             "Computed assignments for group {} using strategy {}: {} members",

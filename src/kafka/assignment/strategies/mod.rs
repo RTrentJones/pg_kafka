@@ -217,6 +217,6 @@ mod tests {
             input.members_for_topic("topic-b"),
             vec!["member-2", "member-3"]
         );
-        assert!(input.members_for_topic("topic-c").is_empty());
+        assert_eq!(input.members_for_topic("topic-c"), [] as [String; 0]);
     }
 }

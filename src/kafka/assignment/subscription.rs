@@ -21,6 +21,7 @@
 
 use bytes::{Buf, BufMut};
 
+use super::wire;
 use crate::kafka::constants::MAX_PREALLOC_ELEMENTS;
 use crate::kafka::error::{KafkaError, Result};
 
@@ -79,16 +80,14 @@ impl MemberSubscription {
 
         // Read topics array
         let topics_len = buf.get_i32();
-        if topics_len < 0 {
-            return Err(KafkaError::CorruptMessage {
-                message: format!("Invalid topics array length: {topics_len}"),
-            });
-        }
+        let topics_len = usize::try_from(topics_len).map_err(|_| KafkaError::CorruptMessage {
+            message: format!("Invalid topics array length: {topics_len}"),
+        })?;
 
         // Cap the pre-allocation hint: `topics_len` is attacker-controlled, so never
         // pre-allocate the claimed count directly (memory-exhaustion DoS). The loop below
         // bounds-checks every element, so an honestly-large array still parses correctly.
-        let mut topics = Vec::with_capacity((topics_len as usize).min(MAX_PREALLOC_ELEMENTS));
+        let mut topics = Vec::with_capacity(topics_len.min(MAX_PREALLOC_ELEMENTS));
         for _ in 0..topics_len {
             // Check we have enough for string length
             if buf.remaining() < 2 {
@@ -97,13 +96,10 @@ impl MemberSubscription {
                 });
             }
 
-            let str_len = buf.get_i16();
-            if str_len < 0 {
-                // Null string - skip
+            // A null (negative-length) topic name is skipped.
+            let Ok(str_len) = usize::try_from(buf.get_i16()) else {
                 continue;
-            }
-
-            let str_len = str_len as usize;
+            };
             if buf.remaining() < str_len {
                 return Err(KafkaError::CorruptMessage {
                     message: format!(
@@ -125,21 +121,7 @@ impl MemberSubscription {
         }
 
         // Read user_data (optional)
-        let user_data = if buf.remaining() >= 4 {
-            let data_len = buf.get_i32();
-            if data_len < 0 {
-                None
-            } else if buf.remaining() >= data_len as usize {
-                let mut data = vec![0u8; data_len as usize];
-                buf.copy_to_slice(&mut data);
-                Some(data)
-            } else {
-                // Not enough data - ignore
-                None
-            }
-        } else {
-            None
-        };
+        let user_data = wire::get_trailing_user_data(&mut buf);
 
         Ok(Self {
             version,
@@ -151,33 +133,17 @@ impl MemberSubscription {
     /// Encode this subscription to bytes for wire format
     ///
     /// # Returns
-    /// Encoded bytes suitable for JoinGroup protocol metadata
-    pub fn encode(&self) -> Vec<u8> {
+    /// Encoded bytes for JoinGroup protocol metadata, or `Internal` if a length does not fit
+    /// its prefix
+    pub fn encode(&self) -> Result<Vec<u8>> {
         let mut buf = Vec::with_capacity(64);
-
-        // Write version
         buf.put_i16(self.version);
-
-        // Write topics array
-        buf.put_i32(self.topics.len() as i32);
+        wire::put_i32_len(&mut buf, self.topics.len(), "topics array")?;
         for topic in &self.topics {
-            let topic_bytes = topic.as_bytes();
-            buf.put_i16(topic_bytes.len() as i16);
-            buf.put_slice(topic_bytes);
+            wire::put_string(&mut buf, topic)?;
         }
-
-        // Write user_data
-        match &self.user_data {
-            Some(data) => {
-                buf.put_i32(data.len() as i32);
-                buf.put_slice(data);
-            }
-            None => {
-                buf.put_i32(-1); // null marker
-            }
-        }
-
-        buf
+        wire::put_nullable_bytes(&mut buf, self.user_data.as_deref())?;
+        Ok(buf)
     }
 }
 
@@ -189,7 +155,7 @@ mod tests {
     fn test_parse_empty() {
         let sub = MemberSubscription::parse(&[]).unwrap();
         assert_eq!(sub.version, 0);
-        assert!(sub.topics.is_empty());
+        assert_eq!(sub.topics, [] as [String; 0]);
         assert!(sub.user_data.is_none());
     }
 
@@ -262,7 +228,7 @@ mod tests {
             user_data: Some(vec![1, 2, 3, 4]),
         };
 
-        let encoded = original.encode();
+        let encoded = original.encode().unwrap();
         let decoded = MemberSubscription::parse(&encoded).unwrap();
 
         assert_eq!(original, decoded);
@@ -271,7 +237,7 @@ mod tests {
     #[test]
     fn test_encode_empty_subscription() {
         let sub = MemberSubscription::default();
-        let encoded = sub.encode();
+        let encoded = sub.encode().unwrap();
         let decoded = MemberSubscription::parse(&encoded).unwrap();
 
         assert_eq!(sub, decoded);
