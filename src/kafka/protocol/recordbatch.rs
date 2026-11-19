@@ -178,6 +178,51 @@ fn read_nullable_bytes(
     Ok(Some(msg.copy_to_bytes(len).to_vec()))
 }
 
+/// One legacy message (CRC, magic, attributes, optional timestamp, key, value) as a
+/// record, or `None` when it fails its CRC or is cut short. `msg` holds at least
+/// [`MIN_LEGACY_MESSAGE_BYTES`].
+fn parse_legacy_message(msg: &Bytes) -> Option<Record> {
+    // The CRC32 covers everything after the CRC field (magic, attributes, key, value);
+    // a mismatch means a corrupt message, so stop rather than persist garbage. (The
+    // RecordBatch v2 path has its CRC32C checked by the kafka-protocol decoder.)
+    let stored_crc = u32::from_be_bytes([msg[0], msg[1], msg[2], msg[3]]);
+    let computed_crc = crc32_ieee(&msg[LEGACY_CRC_BYTES..]);
+    if stored_crc != computed_crc {
+        warn!(
+            "MessageSet CRC mismatch (corrupt message): stored={stored_crc:#010x} computed={computed_crc:#010x}"
+        );
+        return None;
+    }
+
+    // The size floor keeps these two reads within `msg`.
+    let mut msg = msg.slice(LEGACY_CRC_BYTES..);
+    let magic = msg.get_i8();
+    let _attributes = msg.get_i8(); // compression, timestamp type
+
+    // Message v1 (magic=1) carries an 8-byte timestamp between attributes and the key;
+    // v0 does not.
+    let timestamp = if magic >= 1 {
+        if msg.remaining() < 8 {
+            warn!("Insufficient bytes for v1 message timestamp");
+            return None;
+        }
+        let ts = msg.get_i64();
+        (ts >= 0).then_some(ts)
+    } else {
+        None
+    };
+
+    let key = read_nullable_bytes(&mut msg, "key").ok()?;
+    let value = read_nullable_bytes(&mut msg, "value").ok()?;
+
+    Some(Record {
+        key,
+        value,
+        headers: Vec::new(), // MessageSet v0/v1 has no headers
+        timestamp,           // None for v0; the producer timestamp for v1 (-1 = none)
+    })
+}
+
 /// Parse a legacy MessageSet v0/v1:
 ///
 /// ```text
@@ -201,8 +246,9 @@ fn parse_message_set_legacy(
         let message_size = buf.get_i32();
 
         // The size must cover the 6-byte message header and fit what remains. Without the
-        // floor, a crafted size in 0..=5 would pass and the header reads below would
-        // underflow the buffer and panic on the untrusted network path.
+        // floor, a crafted size in 0..=5 would pass and the header reads of
+        // `parse_legacy_message` would underflow the buffer and panic on the untrusted
+        // network path.
         let Some(message_size) = usize::try_from(message_size)
             .ok()
             .filter(|&n| (MIN_LEGACY_MESSAGE_BYTES..=buf.remaining()).contains(&n))
@@ -211,52 +257,13 @@ fn parse_message_set_legacy(
             break;
         };
 
-        // Carve out exactly this message so every read below is bounded by its size.
+        // Carve out exactly this message so every read of it is bounded by its size.
         let msg = buf.copy_to_bytes(message_size);
 
-        // The CRC32 covers everything after the CRC field (magic, attributes, key, value);
-        // a mismatch means a corrupt message, so stop rather than persist garbage. (The
-        // RecordBatch v2 path has its CRC32C checked by the kafka-protocol decoder.)
-        let stored_crc = u32::from_be_bytes([msg[0], msg[1], msg[2], msg[3]]);
-        let computed_crc = crc32_ieee(&msg[LEGACY_CRC_BYTES..]);
-        if stored_crc != computed_crc {
-            warn!(
-                "MessageSet CRC mismatch (corrupt message): stored={stored_crc:#010x} computed={computed_crc:#010x}"
-            );
-            break;
-        }
-
-        // The size floor keeps these two reads within `msg`.
-        let mut msg = msg.slice(LEGACY_CRC_BYTES..);
-        let magic = msg.get_i8();
-        let _attributes = msg.get_i8(); // compression, timestamp type
-
-        // Message v1 (magic=1) carries an 8-byte timestamp between attributes and the key;
-        // v0 does not.
-        let timestamp = if magic >= 1 {
-            if msg.remaining() < 8 {
-                warn!("Insufficient bytes for v1 message timestamp");
-                break;
-            }
-            let ts = msg.get_i64();
-            (ts >= 0).then_some(ts)
-        } else {
-            None
-        };
-
-        let Ok(key) = read_nullable_bytes(&mut msg, "key") else {
+        let Some(record) = parse_legacy_message(&msg) else {
             break;
         };
-        let Ok(value) = read_nullable_bytes(&mut msg, "value") else {
-            break;
-        };
-
-        records.push(Record {
-            key,
-            value,
-            headers: Vec::new(), // MessageSet v0/v1 has no headers
-            timestamp,           // None for v0; the producer timestamp for v1 (-1 = none)
-        });
+        records.push(record);
     }
 
     if records.is_empty() {
