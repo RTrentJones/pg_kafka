@@ -14,10 +14,10 @@ they match the commit they are in.
 
 | Suite | Count | Coverage |
 |-------|-------|----------|
-| Unit Tests | <!--gen:tests-unit-->859<!--/gen--> | Core logic, handlers, storage, protocol, shadow (`src/`, includes in-module proptest fuzz harnesses) |
+| Unit Tests | <!--gen:tests-unit-->811<!--/gen--> | Core logic, handlers, storage, protocol, shadow (`src/`, includes in-module proptest fuzz harnesses) |
 | Property Tests | <!--gen:tests-property-->10<!--/gen--> | `tests/property_tests.rs`: proptest wire-format invariants and boundary tests |
-| E2E Tests | <!--gen:tests-e2e-->259<!--/gen--> | Full protocol integration (`kafka_test/`, per category [below](#e2e-test-categories)) |
-| **Total** | **<!--gen:tests-total-->1128<!--/gen-->** | |
+| E2E Tests | <!--gen:tests-e2e-->306<!--/gen--> | Full protocol integration (`kafka_test/`, per category [below](#e2e-test-categories)) |
+| **Total** | **<!--gen:tests-total-->1127<!--/gen-->** | |
 
 The generator counts with (none of these needs a running broker):
 
@@ -66,27 +66,29 @@ Generated from `kafka_test --list` (what each category covers: CLAUDE.md, "Test 
 <!--gen:tests-e2e-categories-->
 | Category | Tests |
 |----------|-------|
-| `admin` | 19 |
+| `admin` | 21 |
 | `producer` | 5 |
-| `consumer` | 4 |
-| `offset_management` | 10 |
-| `consumer_group` | 13 |
+| `consumer` | 5 |
+| `offset_management` | 13 |
+| `consumer_group` | 16 |
 | `partition` | 9 |
 | `error_paths` | 61 |
 | `edge_cases` | 13 |
-| `concurrent` | 14 |
+| `concurrent` | 15 |
 | `negative` | 5 |
 | `performance` | 7 |
-| `long_poll` | 10 |
+| `long_poll` | 11 |
 | `compression` | 10 |
-| `idempotent` | 7 |
-| `transaction` | 20 |
-| `shadow` | 29 |
-| `metadata` | 3 |
+| `idempotent` | 9 |
+| `transaction` | 26 |
+| `shadow` | 35 |
+| `metadata` | 4 |
 | `protocol` | 5 |
-| `part` | 3 |
+| `part` | 5 |
 | `auth` | 12 |
-| **Total** | **259** |
+| `network` | 14 |
+| `worker` | 5 |
+| **Total** | **306** |
 <!--/gen-->
 
 ### Running E2E Tests
