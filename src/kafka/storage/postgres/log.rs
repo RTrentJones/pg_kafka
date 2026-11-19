@@ -1,113 +1,157 @@
 //! Message log SQL: append, fetch (both isolation levels), offset bounds and
 //! DeleteRecords.
+//!
+//! Offsets: every `partition_offset` is assigned from the per-partition counter
+//! `kafka.partition_offsets.next_offset`, which is never decremented (BUG-3), so
+//! deleting rows (aborted-row cleanup, retention, DeleteRecords) never lets an offset
+//! be reused or the high watermark regress (BUG-4). Every log-end computation takes
+//! `GREATEST(next_offset, MAX(partition_offset) + 1)`: the second term covers rows
+//! written before their partition had a counter row.
 
-use super::{select_cached, PostgresStore, INT4OID, INT8OID};
+use super::{internal, internal_unless, select_cached, PostgresStore, INT4OID, INT8OID};
 use crate::kafka::error::{KafkaError, Result};
 use crate::kafka::messages::Record;
-use crate::kafka::storage::{FetchedMessage, IsolationLevel, PartitionBounds};
+use crate::kafka::storage::{
+    decode_headers_json, encode_headers_json, FetchedMessage, IsolationLevel, PartitionBounds,
+    MAX_TIMESTAMP,
+};
 use pgrx::prelude::*;
 
+/// The log-end offset of one partition (`$1` topic, `$2` partition): the next offset
+/// Produce assigns, which is also the high watermark.
+const LOG_END_OFFSET_SQL: &str = "SELECT GREATEST(
+         COALESCE((SELECT next_offset FROM kafka.partition_offsets
+                   WHERE topic_id = $1 AND partition_id = $2), 0),
+         COALESCE((SELECT MAX(partition_offset) + 1 FROM kafka.messages
+                   WHERE topic_id = $1 AND partition_id = $2), 0)
+     ) AS log_end_offset";
+
+/// Fetch of committed records (ReadCommitted). RV-4: besides filtering uncommitted
+/// rows it stops below the last stable offset: a committed record above a still-open
+/// lower-offset transaction must not be returned, or the consumer moves past the
+/// pending offset and never re-reads it. With nothing pending the COALESCE default
+/// makes the bound a no-op.
+const FETCH_COMMITTED_SQL: &str =
+    "SELECT partition_offset, key, value, headers::text AS headers_json,
+        producer_id, producer_epoch,
+        CASE WHEN timestamp_ms >= 0 THEN timestamp_ms
+             ELSE (EXTRACT(EPOCH FROM created_at) * 1000)::bigint END AS timestamp_ms,
+        SUM(COALESCE(pg_column_size(key), 0) + COALESCE(pg_column_size(value), 0) + 64)
+            OVER (ORDER BY partition_offset) AS cumulative_bytes
+ FROM kafka.messages
+ WHERE topic_id = $1 AND partition_id = $2 AND partition_offset >= $3
+   AND txn_state IS NULL
+   AND partition_offset < COALESCE(
+       (SELECT MIN(m2.partition_offset) FROM kafka.messages m2
+        WHERE m2.topic_id = $1 AND m2.partition_id = $2
+          AND m2.txn_state = 'pending'),
+       partition_offset + 1)
+ ORDER BY partition_offset
+ LIMIT $4";
+
+/// Fetch of every record (ReadUncommitted).
+const FETCH_ALL_SQL: &str = "SELECT partition_offset, key, value, headers::text AS headers_json,
+        producer_id, producer_epoch,
+        CASE WHEN timestamp_ms >= 0 THEN timestamp_ms
+             ELSE (EXTRACT(EPOCH FROM created_at) * 1000)::bigint END AS timestamp_ms,
+        SUM(COALESCE(pg_column_size(key), 0) + COALESCE(pg_column_size(value), 0) + 64)
+            OVER (ORDER BY partition_offset) AS cumulative_bytes
+ FROM kafka.messages
+ WHERE topic_id = $1 AND partition_id = $2 AND partition_offset >= $3
+ ORDER BY partition_offset
+ LIMIT $4";
+
+/// Rough size of one stored message, to turn a byte budget into a row LIMIT.
+const ESTIMATE_BYTES_PER_MESSAGE: i64 = 500;
+/// Row bounds of one fetch query; the fetch loops until its byte budget is spent.
+const MIN_ROWS_PER_QUERY: i64 = 10;
+const MAX_ROWS_PER_QUERY: i64 = 5_000;
+
+/// `timestamp_ms` of a record that carried no timestamp: the fetch path then reports
+/// the broker insert time (BUG-7).
+const NO_TIMESTAMP: i64 = -1;
+
+/// The producer a transactional batch is stamped with.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct TxnStamp {
+    pub(super) producer_id: i64,
+    pub(super) producer_epoch: i16,
+}
+
 impl PostgresStore {
-    /// Shared produce-path insert for plain and transactional batches (DR-24,
-    /// DEEP-REVIEW-2026-07): the two paths were ~90% identical copies (advisory
-    /// lock -> BUG-3 base-offset -> UNNEST insert -> counter advance) that had
-    /// already diverged once (RV-5-style "fix landed on one twin only" bugs).
-    /// `txn = Some((producer_id, producer_epoch))` stamps the transaction columns
-    /// and txn_state='pending'; None inserts NULLs (plain produce).
+    /// Append `records` to a partition and return the base offset; shared by plain and
+    /// transactional produce (DR-24) so the offset assignment exists once. `txn`
+    /// stamps the producer columns and `txn_state = 'pending'`; `None` leaves them NULL.
     pub(super) fn insert_records_inner(
-        &self,
         topic_id: i32,
         partition_id: i32,
         records: &[Record],
-        txn: Option<(i64, i16)>,
+        txn: Option<TxnStamp>,
     ) -> Result<i64> {
         if records.is_empty() {
             return Ok(0);
         }
+        let count = i64::try_from(records.len())
+            .map_err(|_| KafkaError::Internal("record batch too large".into()))?;
 
         Spi::connect_mut(|client| {
-            // Step 1: Lock the partition using advisory lock.
-            // DR-13 (DEEP-REVIEW-2026-07): in the shipped topology this lock is
-            // uncontended overhead — all extension writes serialize on the single
-            // DB thread, so no in-extension writer can race it. It is kept as
-            // defense-in-depth against OUT-OF-BAND writers (direct SQL inserts, a
-            // future second worker): the offset-assignment read below is a
-            // check-then-act that would race such a writer without it. Cost is one
-            // fast-path lock acquisition per produce; revisit only with a benchmark
-            // showing it matters.
+            // DR-13: every extension write runs on the single DB thread, so this lock is
+            // uncontended there; it guards the read-then-insert offset assignment below
+            // against out-of-band writers (direct SQL inserts).
             client.select(
                 "SELECT pg_advisory_xact_lock($1, $2)",
                 None,
                 &[topic_id.into(), partition_id.into()],
             )?;
 
-            // Step 2: Compute base_offset = GREATEST(persisted next_offset, MAX(partition_offset)+1).
-            // BUG-3: the persisted per-partition counter (kafka.partition_offsets) is never
-            // decremented, so deleting the highest (aborted) rows in cleanup_aborted_messages can't
-            // lower the next offset and cause offset reuse. The MAX+1 term seeds the counter from
-            // existing data the first time a partition is produced to after this counter existed.
-            // (Transactional rows are exactly the ones cleanup later deletes, so both paths MUST
-            // advance the same counter — the historical duplication risked them drifting.)
-            let table = select_cached(
+            let base_offset: i64 = select_cached(
                 client,
-                "SELECT GREATEST(
-                          COALESCE((SELECT next_offset FROM kafka.partition_offsets
-                                    WHERE topic_id = $1 AND partition_id = $2), 0),
-                          COALESCE((SELECT MAX(partition_offset) + 1 FROM kafka.messages
-                                    WHERE topic_id = $1 AND partition_id = $2), 0)
-                        ) AS base_offset",
+                LOG_END_OFFSET_SQL,
                 &[INT4OID, INT4OID],
                 &[topic_id.into(), partition_id.into()],
-            )?;
+            )?
+            .first()
+            .get_by_name("log_end_offset")?
+            .unwrap_or(0);
+            crate::pg_debug!("Assigning base_offset={base_offset}");
 
-            let base_offset: i64 = table
-                .first()
-                .get_by_name::<i64, _>("base_offset")?
-                .unwrap_or(0);
-
-            crate::pg_debug!("Assigning base_offset={}", base_offset);
-
-            // Step 3: Build parallel arrays for UNNEST-based bulk insert
-            // (type-safe, no SQL built from data, PostgreSQL-optimized).
-            let count = records.len();
-            let topic_ids: Vec<i32> = vec![topic_id; count];
-            let partition_ids: Vec<i32> = vec![partition_id; count];
-            let offsets: Vec<i64> = (0..count).map(|i| base_offset + i as i64).collect();
+            // Parallel arrays for one UNNEST insert: type-safe, no SQL built from data.
+            let n = records.len();
+            let offsets: Vec<i64> = (base_offset..base_offset + count).collect();
             let keys: Vec<Option<Vec<u8>>> = records.iter().map(|r| r.key.clone()).collect();
             let values: Vec<Option<Vec<u8>>> = records.iter().map(|r| r.value.clone()).collect();
             let headers: Vec<String> = records
                 .iter()
                 .map(|r| {
-                    if r.headers.is_empty() {
-                        "{}".to_string()
-                    } else {
-                        // An array of [key, hex(value)] pairs keeps the producer's header
-                        // order (a JSONB object would reorder its keys).
-                        let pairs: Vec<(&str, String)> = r
-                            .headers
-                            .iter()
-                            .map(|h| (h.key.as_str(), hex_encode(&h.value)))
-                            .collect();
-                        serde_json::to_string(&pairs).unwrap_or_else(|_| "{}".to_string())
-                    }
+                    encode_headers_json(
+                        r.headers.iter().map(|h| (h.key.as_str(), h.value.as_slice())),
+                    )
                 })
                 .collect();
-            // BUG-7: persist the producer's record timestamp (epoch ms) instead of dropping it; -1
-            // marks "no timestamp" so the fetch path falls back to the broker insert time.
-            let timestamps: Vec<i64> = records.iter().map(|r| r.timestamp.unwrap_or(-1)).collect();
-            // Transaction columns: stamped for transactional batches, NULL otherwise.
-            let producer_ids: Vec<Option<i64>> = vec![txn.map(|(pid, _)| pid); count];
-            let producer_epochs: Vec<Option<i16>> = vec![txn.map(|(_, epoch)| epoch); count];
-            let txn_states: Vec<Option<&str>> = vec![txn.map(|_| "pending"); count];
+            // BUG-7: the producer's record timestamp is stored verbatim.
+            let timestamps: Vec<i64> = records
+                .iter()
+                .map(|r| r.timestamp.unwrap_or(NO_TIMESTAMP))
+                .collect();
+            let producer_ids: Vec<Option<i64>> = vec![txn.map(|t| t.producer_id); n];
+            let producer_epochs: Vec<Option<i16>> = vec![txn.map(|t| t.producer_epoch); n];
+            let txn_states: Vec<Option<&str>> = vec![txn.map(|_| "pending"); n];
 
             client
                 .update(
-                    "INSERT INTO kafka.messages (topic_id, partition_id, partition_offset, key, value, headers, producer_id, producer_epoch, txn_state, timestamp_ms)
-                     SELECT * FROM unnest($1::int[], $2::int[], $3::bigint[], $4::bytea[], $5::bytea[], $6::jsonb[], $7::bigint[], $8::smallint[], $9::text[], $10::bigint[])",
+                    "INSERT INTO kafka.messages (topic_id, partition_id, partition_offset, key, value,
+                                                 headers, producer_id, producer_epoch, txn_state,
+                                                 timestamp_ms)
+                     SELECT $1, $2, u.partition_offset, u.key, u.value, u.headers, u.producer_id,
+                            u.producer_epoch, u.txn_state, u.timestamp_ms
+                     FROM unnest($3::bigint[], $4::bytea[], $5::bytea[], $6::jsonb[], $7::bigint[],
+                                 $8::smallint[], $9::text[], $10::bigint[])
+                          AS u(partition_offset, key, value, headers, producer_id, producer_epoch,
+                               txn_state, timestamp_ms)",
                     None,
                     &[
-                        topic_ids.into(),
-                        partition_ids.into(),
+                        topic_id.into(),
+                        partition_id.into(),
                         offsets.into(),
                         keys.into(),
                         values.into(),
@@ -118,113 +162,69 @@ impl PostgresStore {
                         timestamps.into(),
                     ],
                 )
-                .map_err(|e| KafkaError::Internal(format!("Failed to insert records: {}", e)))?;
+                .map_err(|e| KafkaError::Internal(format!("Failed to insert records: {e}")))?;
 
-            // BUG-3: advance the monotonic per-partition counter so the next produce — even after
-            // cleanup_aborted_messages deletes the highest rows — cannot reuse these offsets.
+            // Advance the counter past these offsets (it never moves back).
             client
                 .update(
                     "INSERT INTO kafka.partition_offsets (topic_id, partition_id, next_offset)
                      VALUES ($1, $2, $3)
-                     ON CONFLICT (topic_id, partition_id)
-                     DO UPDATE SET next_offset = GREATEST(kafka.partition_offsets.next_offset, EXCLUDED.next_offset)",
+                     ON CONFLICT (topic_id, partition_id) DO UPDATE
+                         SET next_offset = GREATEST(kafka.partition_offsets.next_offset,
+                                                    EXCLUDED.next_offset)",
                     None,
                     &[
                         topic_id.into(),
                         partition_id.into(),
-                        (base_offset + count as i64).into(),
+                        (base_offset + count).into(),
                     ],
                 )
                 .map_err(|e| {
-                    KafkaError::Internal(format!("Failed to advance partition offset: {}", e))
+                    KafkaError::Internal(format!("Failed to advance partition offset: {e}"))
                 })?;
 
             crate::pg_debug!(
-                "Successfully inserted {} records (offsets {} to {}, txn={})",
-                count,
-                base_offset,
-                base_offset + count as i64 - 1,
+                "Inserted {count} records (offsets {base_offset} to {}, txn={})",
+                base_offset + count - 1,
                 txn.is_some()
             );
-
             Ok(base_offset)
         })
-        .map_err(|e| match e {
-            KafkaError::Internal(_) => e,
-            _ => KafkaError::Internal(format!("insert_records failed: {}", e)),
-        })
+        .map_err(internal_unless("insert_records", |e| {
+            matches!(e, KafkaError::Internal(_))
+        }))
     }
 
-    /// Shared fetch implementation for both isolation levels (DR-8/DR-9/DR-24,
-    /// DEEP-REVIEW-2026-07). Previously `fetch_records` and the ReadUncommitted
-    /// branch of `fetch_records_with_isolation` were byte-identical copies, and
-    /// both capped every fetch at 5,000 rows regardless of the client's
-    /// `max_bytes` budget — a 1 MB fetch of small messages returned tens of KB
-    /// and forced extra round trips through the single DB thread.
-    ///
-    /// This version iterates: each query is bounded (MAX_ROWS_PER_QUERY) so one
-    /// pass can't hold a huge result set, but the loop continues until the byte
-    /// budget is spent or the partition has no more rows. Headers are selected
-    /// and decoded (DR-8) so consumers actually receive them.
-    pub(super) fn fetch_records_filtered(
-        &self,
+    /// Records from `fetch_offset` on, up to about `max_bytes` (always at least one
+    /// record, as Kafka does), for either isolation level (DR-24). Each query is
+    /// bounded to [`MAX_ROWS_PER_QUERY`] rows so a pass never holds a huge result set;
+    /// the loop runs until the byte budget is spent or the partition has no more rows
+    /// (DR-9). Sizes come from `pg_column_size()` in a window function (ADR-002).
+    fn fetch_records_filtered(
         topic_id: i32,
         partition_id: i32,
         fetch_offset: i64,
         max_bytes: i32,
-        read_committed: bool,
+        isolation_level: IsolationLevel,
     ) -> Result<Vec<FetchedMessage>> {
-        // ADR-002: Dynamic Fetch Sizing — pg_column_size() tracks actual bytes via a
-        // window function; the row LIMIT is only a per-query bound, not the fetch cap.
-        const ESTIMATE_BYTES_PER_MESSAGE: i64 = 500;
-        const MAX_ROWS_PER_QUERY: i64 = 5_000;
-
-        // RV-4 (ReadCommitted): filter uncommitted rows AND clamp below the Last
-        // Stable Offset — a committed record above a still-open lower-offset
-        // transaction must not be returned, or the consumer advances past the
-        // pending offset and never re-reads it (lost/reordered delivery). With
-        // nothing pending the COALESCE default makes the bound a no-op.
-        let query = if read_committed {
-            "SELECT partition_offset, key, value, headers::text AS headers_json,
-                    producer_id, producer_epoch,
-                    CASE WHEN timestamp_ms >= 0 THEN timestamp_ms ELSE (EXTRACT(EPOCH FROM created_at) * 1000)::bigint END as timestamp_ms,
-                    SUM(COALESCE(pg_column_size(key), 0) + COALESCE(pg_column_size(value), 0) + 64)
-                        OVER (ORDER BY partition_offset) as cumulative_bytes
-             FROM kafka.messages
-             WHERE topic_id = $1 AND partition_id = $2 AND partition_offset >= $3
-               AND (txn_state IS NULL)
-               AND partition_offset < COALESCE(
-                   (SELECT MIN(m2.partition_offset) FROM kafka.messages m2
-                    WHERE m2.topic_id = $1 AND m2.partition_id = $2
-                      AND m2.txn_state = 'pending'),
-                   partition_offset + 1)
-             ORDER BY partition_offset
-             LIMIT $4"
-        } else {
-            "SELECT partition_offset, key, value, headers::text AS headers_json,
-                    producer_id, producer_epoch,
-                    CASE WHEN timestamp_ms >= 0 THEN timestamp_ms ELSE (EXTRACT(EPOCH FROM created_at) * 1000)::bigint END as timestamp_ms,
-                    SUM(COALESCE(pg_column_size(key), 0) + COALESCE(pg_column_size(value), 0) + 64)
-                        OVER (ORDER BY partition_offset) as cumulative_bytes
-             FROM kafka.messages
-             WHERE topic_id = $1 AND partition_id = $2 AND partition_offset >= $3
-             ORDER BY partition_offset
-             LIMIT $4"
+        let query = match isolation_level {
+            IsolationLevel::ReadCommitted => FETCH_COMMITTED_SQL,
+            IsolationLevel::ReadUncommitted => FETCH_ALL_SQL,
         };
 
         Spi::connect(|client| {
             let mut messages: Vec<FetchedMessage> = Vec::new();
-            let max_bytes_i64 = max_bytes.max(0) as i64;
+            let budget = i64::from(max_bytes.max(0));
             let mut consumed: i64 = 0;
             let mut next_offset = fetch_offset;
 
             loop {
-                let remaining = max_bytes_i64 - consumed;
+                let remaining = budget - consumed;
                 if remaining <= 0 && !messages.is_empty() {
                     break;
                 }
-                let limit =
-                    (remaining / ESTIMATE_BYTES_PER_MESSAGE + 1).clamp(10, MAX_ROWS_PER_QUERY);
+                let limit = (remaining / ESTIMATE_BYTES_PER_MESSAGE + 1)
+                    .clamp(MIN_ROWS_PER_QUERY, MAX_ROWS_PER_QUERY);
 
                 let table = select_cached(
                     client,
@@ -237,8 +237,7 @@ impl PostgresStore {
                         limit.into(),
                     ],
                 )?;
-
-                let row_count = table.len() as i64;
+                let row_count = i64::try_from(table.len()).unwrap_or(i64::MAX);
                 let batch_base = consumed;
                 let mut budget_hit = false;
 
@@ -246,170 +245,157 @@ impl PostgresStore {
                     // cumulative_bytes restarts per query; add the running total.
                     let batch_cumulative: i64 = row.get_by_name("cumulative_bytes")?.unwrap_or(0);
                     let total = batch_base + batch_cumulative;
-
-                    // Always include at least one message even if it exceeds max_bytes
-                    // (Kafka protocol behavior: one message is the minimum response).
-                    if !messages.is_empty() && total > max_bytes_i64 {
+                    if !messages.is_empty() && total > budget {
                         budget_hit = true;
                         break;
                     }
 
                     let partition_offset: i64 = row.get_by_name("partition_offset")?.unwrap_or(0);
-                    let key: Option<Vec<u8>> = row.get_by_name("key")?;
-                    let value: Option<Vec<u8>> = row.get_by_name("value")?;
-                    let timestamp: i64 = row.get_by_name("timestamp_ms")?.unwrap_or(0);
                     let headers_json: Option<String> = row.get_by_name("headers_json")?;
-                    let headers = crate::kafka::storage::decode_headers_json(headers_json.as_deref());
-                    let producer_id: Option<i64> = row.get_by_name("producer_id")?;
-                    let producer_epoch: Option<i16> = row.get_by_name("producer_epoch")?;
-
                     messages.push(FetchedMessage {
                         partition_offset,
-                        key,
-                        value,
-                        timestamp,
-                        headers,
-                        producer_id,
-                        producer_epoch,
+                        key: row.get_by_name("key")?,
+                        value: row.get_by_name("value")?,
+                        timestamp: row.get_by_name("timestamp_ms")?.unwrap_or(0),
+                        headers: decode_headers_json(headers_json.as_deref()),
+                        producer_id: row.get_by_name("producer_id")?,
+                        producer_epoch: row.get_by_name("producer_epoch")?,
                     });
                     next_offset = partition_offset + 1;
                     consumed = total;
                 }
 
-                // Stop when the budget is spent or the partition is drained
-                // (a short batch means no more matching rows past next_offset).
+                // A short batch means no more matching rows past next_offset.
                 if budget_hit || row_count < limit {
                     break;
                 }
             }
 
             crate::pg_debug!(
-                "Fetched {} messages ({} bytes of {} budget, read_committed={})",
-                messages.len(),
-                consumed,
-                max_bytes_i64,
-                read_committed
+                "Fetched {} messages ({consumed} bytes of {budget} budget, {isolation_level:?})",
+                messages.len()
             );
             Ok(messages)
         })
-        .map_err(|e: KafkaError| KafkaError::Internal(format!("fetch_records failed: {}", e)))
+        .map_err(internal("fetch_records"))
     }
 
-    pub(super) fn insert_records(&self, topic_id: i32, partition_id: i32, records: &[Record]) -> Result<i64> {
+    pub(super) fn insert_records(
+        topic_id: i32,
+        partition_id: i32,
+        records: &[Record],
+    ) -> Result<i64> {
         crate::pg_debug!(
-            "PostgresStore::insert_records: {} records for topic_id={}, partition_id={}",
-            records.len(),
-            topic_id,
-            partition_id
+            "PostgresStore::insert_records: {} records for topic_id={topic_id}, partition_id={partition_id}",
+            records.len()
         );
-        // DR-24: shared implementation with the transactional path (txn = None).
-        self.insert_records_inner(topic_id, partition_id, records, None)
+        Self::insert_records_inner(topic_id, partition_id, records, None)
     }
 
+    /// ReadUncommitted fetch; the ShadowStore read-suppression path (SH-6) uses it,
+    /// consumers go through [`Self::fetch_records_with_isolation`].
     pub(super) fn fetch_records(
-        &self,
         topic_id: i32,
         partition_id: i32,
         fetch_offset: i64,
         max_bytes: i32,
     ) -> Result<Vec<FetchedMessage>> {
         crate::pg_debug!(
-            "PostgresStore::fetch_records: topic_id={}, partition_id={}, fetch_offset={}, max_bytes={}",
+            "PostgresStore::fetch_records: topic_id={topic_id}, partition_id={partition_id}, fetch_offset={fetch_offset}, max_bytes={max_bytes}"
+        );
+        Self::fetch_records_filtered(
             topic_id,
             partition_id,
             fetch_offset,
-            max_bytes
+            max_bytes,
+            IsolationLevel::ReadUncommitted,
+        )
+    }
+
+    pub(super) fn fetch_records_with_isolation(
+        topic_id: i32,
+        partition_id: i32,
+        fetch_offset: i64,
+        max_bytes: i32,
+        isolation_level: IsolationLevel,
+    ) -> Result<Vec<FetchedMessage>> {
+        crate::pg_debug!(
+            "PostgresStore::fetch_records_with_isolation: topic_id={topic_id}, partition_id={partition_id}, offset={fetch_offset}, isolation={isolation_level:?}"
         );
-
-        // Kept on the trait for the ShadowStore SH-6 suppression path; the consumer
-        // path goes through fetch_records_with_isolation. Both share one
-        // implementation (DR-24): this is the ReadUncommitted filter.
-        self.fetch_records_filtered(topic_id, partition_id, fetch_offset, max_bytes, false)
+        Self::fetch_records_filtered(
+            topic_id,
+            partition_id,
+            fetch_offset,
+            max_bytes,
+            isolation_level,
+        )
     }
 
-    pub(super) fn get_high_watermark(&self, topic_id: i32, partition_id: i32) -> Result<i64> {
+    /// The log-end offset; the read isolation level does not change it (that is the
+    /// fetch filter's and the last stable offset's job).
+    pub(super) fn get_high_watermark(topic_id: i32, partition_id: i32) -> Result<i64> {
         Spi::connect(|client| {
-            // BUG-4: the high watermark must be the log-end offset and must never regress. A plain
-            // MAX(partition_offset)+1 drops when cleanup_aborted_messages deletes the highest
-            // (aborted) rows, reporting a HWM below offsets already handed out. Use the never-
-            // decreasing per-partition counter (kafka.partition_offsets, the same source produce
-            // assigns from — see BUG-3), taking GREATEST with MAX+1 as a backstop for partitions
-            // that predate the counter. Read isolation (read_committed vs read_uncommitted) is
-            // unaffected: that is decided by the fetch row filter and the last-stable-offset, not by
-            // the HWM bound reported here.
-            let table = select_cached(
+            Ok(select_cached(
+                client,
+                LOG_END_OFFSET_SQL,
+                &[INT4OID, INT4OID],
+                &[topic_id.into(), partition_id.into()],
+            )?
+            .first()
+            .get_by_name("log_end_offset")?
+            .unwrap_or(0))
+        })
+        .map_err(internal("get_high_watermark"))
+    }
+
+    /// GREATEST(smallest remaining offset, durable log start). The durable log start
+    /// dominates only once truncation emptied the partition's front; it is 0 for a
+    /// partition without a counter row.
+    pub(super) fn get_earliest_offset(topic_id: i32, partition_id: i32) -> Result<i64> {
+        Spi::connect(|client| {
+            Ok(select_cached(
                 client,
                 "SELECT GREATEST(
-                     COALESCE((SELECT next_offset FROM kafka.partition_offsets
+                     COALESCE((SELECT MIN(partition_offset) FROM kafka.messages
                                WHERE topic_id = $1 AND partition_id = $2), 0),
-                     COALESCE((SELECT MAX(partition_offset) + 1 FROM kafka.messages
+                     COALESCE((SELECT log_start_offset FROM kafka.partition_offsets
                                WHERE topic_id = $1 AND partition_id = $2), 0)
-                 ) AS high_watermark",
+                 ) AS earliest_offset",
                 &[INT4OID, INT4OID],
                 &[topic_id.into(), partition_id.into()],
-            )?;
-
-            let high_watermark: i64 = table.first().get_by_name("high_watermark")?.unwrap_or(0);
-
-            Ok(high_watermark)
+            )?
+            .first()
+            .get_by_name("earliest_offset")?
+            .unwrap_or(0))
         })
-        .map_err(|e: KafkaError| KafkaError::Internal(format!("get_high_watermark failed: {}", e)))
+        .map_err(internal("get_earliest_offset"))
     }
 
-    pub(super) fn get_earliest_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64> {
+    pub(super) fn get_log_start_offset(topic_id: i32, partition_id: i32) -> Result<i64> {
         Spi::connect(|client| {
-            // Earliest = GREATEST(smallest remaining offset, durable log start).
-            // The durable log start (kafka.partition_offsets.log_start_offset,
-            // advanced by DeleteRecords) dominates only when the partition has
-            // been emptied by truncation — otherwise MIN(partition_offset) is at
-            // or above it. For a never-truncated partition log_start is 0, so
-            // this is unchanged. The LEFT JOIN covers a partition with rows but
-            // no counter row (log_start defaults to 0).
-            let table = select_cached(
-                client,
-                "SELECT GREATEST(
-                            COALESCE((SELECT MIN(partition_offset) FROM kafka.messages
-                                      WHERE topic_id = $1 AND partition_id = $2), 0),
-                            COALESCE((SELECT log_start_offset FROM kafka.partition_offsets
+            Ok(client
+                .select(
+                    "SELECT COALESCE((SELECT log_start_offset FROM kafka.partition_offsets
                                       WHERE topic_id = $1 AND partition_id = $2), 0)
-                        ) AS earliest_offset",
-                &[INT4OID, INT4OID],
-                &[topic_id.into(), partition_id.into()],
-            )?;
-
-            let earliest_offset: i64 = table.first().get_by_name("earliest_offset")?.unwrap_or(0);
-
-            Ok(earliest_offset)
+                            AS log_start_offset",
+                    None,
+                    &[topic_id.into(), partition_id.into()],
+                )?
+                .first()
+                .get_by_name("log_start_offset")?
+                .unwrap_or(0))
         })
-        .map_err(|e: KafkaError| KafkaError::Internal(format!("get_earliest_offset failed: {}", e)))
+        .map_err(internal("get_log_start_offset"))
     }
 
-    pub(super) fn get_log_start_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64> {
-        Spi::connect(|client| {
-            let table = client.select(
-                "SELECT COALESCE((SELECT log_start_offset FROM kafka.partition_offsets
-                                  WHERE topic_id = $1 AND partition_id = $2), 0)
-                        AS log_start_offset",
-                None,
-                &[topic_id.into(), partition_id.into()],
-            )?;
-            Ok(table.first().get_by_name("log_start_offset")?.unwrap_or(0))
-        })
-        .map_err(|e: KafkaError| {
-            KafkaError::Internal(format!("get_log_start_offset failed: {}", e))
-        })
-    }
-
+    /// Every bound a Fetch reports, in one statement of primary-key (or
+    /// idx_messages_txn_pending) probes; [`PartitionBounds::from_raw`] combines them
+    /// exactly as the single-value methods do.
     pub(super) fn get_partition_bounds(
-        &self,
         topic_id: i32,
         partition_id: i32,
         isolation_level: IsolationLevel,
     ) -> Result<PartitionBounds> {
-        // One statement for every bound a Fetch reports (it used to run 4-5: high
-        // watermark, LSO, earliest, log start). Each scalar subquery is a
-        // primary-key (or idx_messages_txn_pending) probe; PartitionBounds::from_raw
-        // combines them exactly as the single-value methods above do.
         Spi::connect(|client| {
             let table = select_cached(
                 client,
@@ -438,25 +424,21 @@ impl PostgresStore {
                 isolation_level,
             ))
         })
-        .map_err(|e: KafkaError| {
-            KafkaError::Internal(format!("get_partition_bounds failed: {}", e))
-        })
+        .map_err(internal("get_partition_bounds"))
     }
 
+    /// CONF-7: the lowest offset whose stored producer timestamp is at or after
+    /// `timestamp_ms`, or for [`MAX_TIMESTAMP`] the record with the largest timestamp
+    /// (the lowest offset among equal ones). Records without a timestamp and aborted
+    /// records are excluded; pending records count, and the handler bounds the answer
+    /// by the high watermark or the last stable offset, as Kafka does.
     pub(super) fn get_offset_for_timestamp(
-        &self,
         topic_id: i32,
         partition_id: i32,
         timestamp_ms: i64,
     ) -> Result<Option<(i64, i64)>> {
         Spi::connect(|client| {
-            // CONF-7: the lowest offset whose stored producer timestamp (BUG-7) is at or after
-            // the target. Records with no timestamp (-1) and aborted records are excluded;
-            // pending records count, and the handler bounds the answer by the HWM or LSO, as
-            // Kafka does (wave 3; aborted rows are invisible here and later deleted).
-            // MAX_TIMESTAMP (-3, KIP-734): the record with the largest timestamp, the
-            // lowest offset among equal ones.
-            let table = if timestamp_ms == crate::kafka::storage::MAX_TIMESTAMP {
+            let table = if timestamp_ms == MAX_TIMESTAMP {
                 client.select(
                     "SELECT partition_offset, timestamp_ms
                      FROM kafka.messages
@@ -483,96 +465,54 @@ impl PostgresStore {
             };
 
             let row = table.first();
-            match row.get_by_name::<i64, _>("partition_offset")? {
-                Some(offset) => {
-                    let ts: i64 = row.get_by_name("timestamp_ms")?.unwrap_or(-1);
-                    Ok(Some((offset, ts)))
-                }
-                None => Ok(None),
-            }
+            let Some(offset) = row.get_by_name::<i64, _>("partition_offset")? else {
+                return Ok(None);
+            };
+            let timestamp: i64 = row.get_by_name("timestamp_ms")?.unwrap_or(NO_TIMESTAMP);
+            Ok(Some((offset, timestamp)))
         })
-        .map_err(|e: KafkaError| {
-            KafkaError::Internal(format!("get_offset_for_timestamp failed: {}", e))
-        })
+        .map_err(internal("get_offset_for_timestamp"))
     }
 
-    pub(super) fn fetch_records_with_isolation(
-        &self,
-        topic_id: i32,
-        partition_id: i32,
-        fetch_offset: i64,
-        max_bytes: i32,
-        isolation_level: IsolationLevel,
-    ) -> Result<Vec<FetchedMessage>> {
+    /// The lowest pending transactional offset, or the log-end offset when nothing is
+    /// pending (RV-10: computed like the high watermark, so neither regresses after
+    /// aborted-row cleanup and the two agree).
+    pub(super) fn get_last_stable_offset(topic_id: i32, partition_id: i32) -> Result<i64> {
         crate::pg_debug!(
-            "PostgresStore::fetch_records_with_isolation: topic_id={}, partition_id={}, offset={}, isolation={:?}",
-            topic_id,
-            partition_id,
-            fetch_offset,
-            isolation_level
+            "PostgresStore::get_last_stable_offset: topic_id={topic_id}, partition_id={partition_id}"
         );
-
-        // DR-24: both isolation levels share fetch_records_filtered; ReadCommitted
-        // adds the txn_state filter + RV-4 LSO clamp inside the shared query.
-        let read_committed = matches!(isolation_level, IsolationLevel::ReadCommitted);
-        self.fetch_records_filtered(
-            topic_id,
-            partition_id,
-            fetch_offset,
-            max_bytes,
-            read_committed,
-        )
-    }
-
-    pub(super) fn get_last_stable_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64> {
-        crate::pg_debug!(
-            "PostgresStore::get_last_stable_offset: topic_id={}, partition_id={}",
-            topic_id,
-            partition_id
-        );
-
         Spi::connect(|client| {
-            // Get the minimum offset of pending messages, or the high watermark if
-            // none. RV-10/BUG-4: when there are no pending rows the LSO equals the
-            // HWM, which must never regress. A plain MAX(partition_offset)+1 drops
-            // when cleanup_aborted_messages deletes the highest (aborted) rows,
-            // reporting an LSO below offsets already handed out. Use the same
-            // GREATEST(monotonic next_offset counter, MAX+1) the HWM uses so the two
-            // agree and neither regresses after cleanup.
-            let table = client.select(
-                "SELECT COALESCE(
-                    (SELECT MIN(partition_offset) FROM kafka.messages
-                     WHERE topic_id = $1 AND partition_id = $2 AND txn_state = 'pending'),
-                    GREATEST(
-                        COALESCE((SELECT next_offset FROM kafka.partition_offsets
-                                  WHERE topic_id = $1 AND partition_id = $2), 0),
-                        COALESCE((SELECT MAX(partition_offset) + 1 FROM kafka.messages
-                                  WHERE topic_id = $1 AND partition_id = $2), 0)
-                    )
-                 ) as lso",
-                None,
-                &[topic_id.into(), partition_id.into()],
-            )?;
-
-            let lso: i64 = table.first().get_by_name("lso")?.unwrap_or(0);
-            Ok(lso)
+            Ok(client
+                .select(
+                    "SELECT COALESCE(
+                         (SELECT MIN(partition_offset) FROM kafka.messages
+                          WHERE topic_id = $1 AND partition_id = $2 AND txn_state = 'pending'),
+                         GREATEST(
+                             COALESCE((SELECT next_offset FROM kafka.partition_offsets
+                                       WHERE topic_id = $1 AND partition_id = $2), 0),
+                             COALESCE((SELECT MAX(partition_offset) + 1 FROM kafka.messages
+                                       WHERE topic_id = $1 AND partition_id = $2), 0)
+                         )
+                     ) AS lso",
+                    None,
+                    &[topic_id.into(), partition_id.into()],
+                )?
+                .first()
+                .get_by_name("lso")?
+                .unwrap_or(0))
         })
-        .map_err(|e: KafkaError| {
-            KafkaError::Internal(format!("get_last_stable_offset failed: {}", e))
-        })
+        .map_err(internal("get_last_stable_offset"))
     }
 
+    /// DeleteRecords: remove every row below `before_offset` (pending ones too, as
+    /// Kafka advances the log start unconditionally) and return the new log start.
     pub(super) fn delete_records_before(
-        &self,
         topic_id: i32,
         partition_id: i32,
         before_offset: i64,
     ) -> Result<i64> {
         crate::pg_debug!(
-            "PostgresStore::delete_records_before: topic_id={}, partition_id={}, before_offset={}",
-            topic_id,
-            partition_id,
-            before_offset
+            "PostgresStore::delete_records_before: topic_id={topic_id}, partition_id={partition_id}, before_offset={before_offset}"
         );
         Spi::connect_mut(|client| {
             client.update(
@@ -582,54 +522,41 @@ impl PostgresStore {
                 &[topic_id.into(), partition_id.into(), before_offset.into()],
             )?;
 
-            // Persist the advanced log start so it survives an emptied partition.
-            // Without this, get_earliest_offset would fall back to
-            // COALESCE(MIN(partition_offset), 0) = 0 once every row is deleted,
-            // regressing the reported log start (ListOffsets EARLIEST / Fetch
-            // log_start_offset) to offsets that were explicitly truncated. The
-            // per-partition counter row already exists (created on produce);
-            // GREATEST keeps log_start monotonic. next_offset is untouched here,
-            // so producer monotonicity (GREATEST(next_offset, MAX+1), BUG-3)
-            // is preserved.
+            // Persist the advanced log start, so a partition emptied by the delete still
+            // reports it (ListOffsets EARLIEST, Fetch log_start_offset) instead of 0.
+            // GREATEST keeps it monotonic; next_offset is untouched.
             client.update(
-                "INSERT INTO kafka.partition_offsets (topic_id, partition_id, next_offset, log_start_offset)
+                "INSERT INTO kafka.partition_offsets (topic_id, partition_id, next_offset,
+                                                      log_start_offset)
                  VALUES ($1, $2, $3, $3)
-                 ON CONFLICT (topic_id, partition_id) DO UPDATE SET
-                     log_start_offset = GREATEST(kafka.partition_offsets.log_start_offset, EXCLUDED.log_start_offset)",
+                 ON CONFLICT (topic_id, partition_id) DO UPDATE
+                     SET log_start_offset = GREATEST(kafka.partition_offsets.log_start_offset,
+                                                     EXCLUDED.log_start_offset)",
                 None,
                 &[topic_id.into(), partition_id.into(), before_offset.into()],
             )?;
 
-            // New log start offset = the persisted log start, or the earliest
-            // remaining row if it sits above it (a contiguous log reports MIN,
-            // which equals the truncation point). Matches Kafka's DeleteRecords
-            // semantics.
-            let table = client.select(
-                "SELECT GREATEST(
-                            po.log_start_offset,
-                            COALESCE((SELECT MIN(m.partition_offset)
-                                      FROM kafka.messages m
-                                      WHERE m.topic_id = po.topic_id AND m.partition_id = po.partition_id),
-                                     po.log_start_offset)
-                        ) AS low_watermark
-                 FROM kafka.partition_offsets po
-                 WHERE po.topic_id = $1 AND po.partition_id = $2",
-                None,
-                &[topic_id.into(), partition_id.into()],
-            )?;
-            let low_watermark: i64 = table
+            // The new log start: the persisted one, or the earliest remaining row if it
+            // sits above it (Kafka's DeleteRecords low watermark).
+            Ok(client
+                .select(
+                    "SELECT GREATEST(
+                         po.log_start_offset,
+                         COALESCE((SELECT MIN(m.partition_offset)
+                                   FROM kafka.messages m
+                                   WHERE m.topic_id = po.topic_id
+                                     AND m.partition_id = po.partition_id),
+                                  po.log_start_offset)
+                     ) AS low_watermark
+                     FROM kafka.partition_offsets po
+                     WHERE po.topic_id = $1 AND po.partition_id = $2",
+                    None,
+                    &[topic_id.into(), partition_id.into()],
+                )?
                 .first()
                 .get_by_name("low_watermark")?
-                .unwrap_or(before_offset);
-            Ok(low_watermark)
+                .unwrap_or(before_offset))
         })
-        .map_err(|e: KafkaError| {
-            KafkaError::Internal(format!("delete_records_before failed: {}", e))
-        })
+        .map_err(internal("delete_records_before"))
     }
-}
-
-/// Helper function to encode bytes as hex string for JSONB storage
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }

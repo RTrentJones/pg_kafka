@@ -1,13 +1,13 @@
-//! Committed consumer-group offset SQL.
+//! Committed consumer-group offset SQL. `committed_offset` is NOT NULL, so its
+//! `unwrap_or(-1)` fallback on a row that exists is unreachable.
 
-use super::PostgresStore;
-use crate::kafka::error::{KafkaError, Result};
+use super::{internal, PostgresStore};
+use crate::kafka::error::Result;
 use crate::kafka::storage::CommittedOffset;
 use pgrx::prelude::*;
 
 impl PostgresStore {
     pub(super) fn commit_offset(
-        &self,
         group_id: &str,
         topic_id: i32,
         partition_id: i32,
@@ -44,11 +44,10 @@ impl PostgresStore {
             )?;
             Ok(())
         })
-        .map_err(|e: KafkaError| KafkaError::Internal(format!("commit_offset failed: {}", e)))
+        .map_err(internal("commit_offset"))
     }
 
     pub(super) fn fetch_offset(
-        &self,
         group_id: &str,
         topic_id: i32,
         partition_id: i32,
@@ -73,10 +72,11 @@ impl PostgresStore {
                 Ok(None)
             }
         })
-        .map_err(|e: KafkaError| KafkaError::Internal(format!("fetch_offset failed: {}", e)))
+        .map_err(internal("fetch_offset"))
     }
 
-    pub(super) fn fetch_all_offsets(&self, group_id: &str) -> Result<Vec<(String, i32, CommittedOffset)>> {
+    /// Every committed offset of a group as `(topic name, partition, offset)`, sorted.
+    pub(super) fn fetch_all_offsets(group_id: &str) -> Result<Vec<(String, i32, CommittedOffset)>> {
         Spi::connect(|client| {
             let query = "SELECT t.name, co.partition_id, co.committed_offset, co.metadata
                  FROM kafka.consumer_offsets co
@@ -102,12 +102,10 @@ impl PostgresStore {
 
             Ok(results)
         })
-        .map_err(|e: KafkaError| KafkaError::Internal(format!("fetch_all_offsets failed: {}", e)))
+        .map_err(internal("fetch_all_offsets"))
     }
 
-    // ===== Admin Consumer Group Operations (Phase 6) =====
-
-    pub(super) fn delete_consumer_group_offsets(&self, group_id: &str) -> Result<()> {
+    pub(super) fn delete_consumer_group_offsets(group_id: &str) -> Result<()> {
         crate::pg_debug!(
             "PostgresStore::delete_consumer_group_offsets: '{}'",
             group_id
@@ -123,12 +121,11 @@ impl PostgresStore {
             crate::pg_debug!("Deleted consumer offsets for group '{}'", group_id);
             Ok(())
         })
-        .map_err(|e: KafkaError| {
-            KafkaError::Internal(format!("delete_consumer_group_offsets failed: {}", e))
-        })
+        .map_err(internal("delete_consumer_group_offsets"))
     }
 
-    pub(super) fn list_offset_groups(&self) -> Result<Vec<String>> {
+    /// Every group with a committed offset, sorted.
+    pub(super) fn list_offset_groups() -> Result<Vec<String>> {
         Spi::connect(|client| {
             let table = client.select(
                 "SELECT DISTINCT group_id FROM kafka.consumer_offsets ORDER BY group_id",
@@ -143,10 +140,10 @@ impl PostgresStore {
             }
             Ok(groups)
         })
-        .map_err(|e: KafkaError| KafkaError::Internal(format!("list_offset_groups failed: {}", e)))
+        .map_err(internal("list_offset_groups"))
     }
 
-    pub(super) fn group_has_offsets(&self, group_id: &str) -> Result<bool> {
+    pub(super) fn group_has_offsets(group_id: &str) -> Result<bool> {
         Spi::connect(|client| {
             let table = client.select(
                 "SELECT 1 FROM kafka.consumer_offsets WHERE group_id = $1 LIMIT 1",
@@ -155,12 +152,12 @@ impl PostgresStore {
             )?;
             Ok(!table.is_empty())
         })
-        .map_err(|e: KafkaError| KafkaError::Internal(format!("group_has_offsets failed: {}", e)))
+        .map_err(internal("group_has_offsets"))
     }
 
-    pub(super) fn pending_txn_offset_partitions(&self, group_id: &str) -> Result<Vec<(String, i32)>> {
-        // Wave 3 (KIP-447 require_stable): rows exist only while the transaction that
-        // wrote them is open (EndTxn, the timeout sweep and InitProducerId delete them).
+    pub(super) fn pending_txn_offset_partitions(group_id: &str) -> Result<Vec<(String, i32)>> {
+        // KIP-447 require_stable: rows exist only while the transaction that wrote them
+        // is open (EndTxn, the timeout sweep and InitProducerId delete them).
         Spi::connect(|client| {
             let table = client.select(
                 "SELECT DISTINCT t.name, p.partition_id
@@ -177,8 +174,6 @@ impl PostgresStore {
             }
             Ok(out)
         })
-        .map_err(|e: KafkaError| {
-            KafkaError::Internal(format!("pending_txn_offset_partitions failed: {}", e))
-        })
+        .map_err(internal("pending_txn_offset_partitions"))
     }
 }
