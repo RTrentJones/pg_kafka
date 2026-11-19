@@ -1,30 +1,83 @@
-//! The request batch executor (group commit) and the RB-1 response barrier.
+//! The request batch executor: group commit of everything already queued, each request
+//! in its own subtransaction, the RB-1 barrier that holds every response until the commit,
+//! and the SASL credential lookups the network thread asks for.
 
+use crossbeam_channel::{Receiver, Sender};
 use pgrx::prelude::*;
 use std::time::{Duration, Instant};
 
-use super::schema::reject_request;
 use super::txn::{log_txn_error, run_request_in_subtransaction, worker_transaction};
-use crate::kafka::constants::*;
+use crate::kafka::api::ResponseBody;
+use crate::kafka::auth::CredentialRequest;
+use crate::kafka::constants::{API_KEY_INIT_PRODUCER_ID, API_KEY_PRODUCE};
 use crate::kafka::dispatch::RequestOutcome;
 use crate::kafka::shadow::ShadowStore;
-use crate::kafka::{KafkaStore, PostgresStore};
+use crate::kafka::{
+    BrokerMetadata, GroupCoordinator, InternalNotification, KafkaRequest, KafkaResponse,
+    KafkaStore, PostgresStore,
+};
 use crate::pg_warning;
+
+/// Most requests one top-level transaction carries (group commit).
+///
+/// Each request runs in its own subtransaction, and every one that writes is
+/// assigned a subtransaction XID. 64 is `PGPROC_MAX_CACHED_SUBXIDS`, so a batch
+/// never overflows the worker's subxid cache (an overflowed cache forces other
+/// backends' snapshot checks into `pg_subtrans` lookups until it commits).
+const MAX_GROUP_COMMIT_REQUESTS: usize = 64;
+
+/// A batch stops taking more requests once it has run this long, so group
+/// commit delays the first request's response by at most about this much (plus
+/// the request still running and the commit).
+const GROUP_COMMIT_TIME_BUDGET: Duration = Duration::from_millis(50);
+
+/// Most SASL credential lookups answered in one transaction.
+const MAX_CREDENTIAL_LOOKUPS: usize = 64;
+
+/// Everything a request needs from the worker, borrowed once by the main loop.
+pub(super) struct RequestEnv<'a> {
+    pub(super) coordinator: &'a GroupCoordinator,
+    pub(super) broker_metadata: &'a BrokerMetadata,
+    pub(super) default_partitions: i32,
+    pub(super) notify_tx: &'a Sender<InternalNotification>,
+    pub(super) compression: kafka_protocol::records::Compression,
+    /// The store every handler uses: it wraps PostgresStore and decides per request,
+    /// from the shadow GUCs, whether to forward.
+    pub(super) shadow_store: &'a ShadowStore<PostgresStore>,
+    /// `pg_kafka.log_timing`: log each batch's handler and transaction time.
+    pub(super) log_timing: bool,
+}
+
+/// Answer a request that will not run (schema missing, worker stopping) with its API's
+/// error response, on its own sender. An acks=0 produce gets nothing.
+pub(super) fn reject_request(request: KafkaRequest, error_code: i16) {
+    let KafkaRequest {
+        header,
+        body,
+        response_tx,
+    } = request;
+    if !body.expects_response() {
+        return;
+    }
+    let response = KafkaResponse::new(
+        header.correlation_id,
+        header.api_version,
+        body.echo().error_response(header.api_version, error_code),
+    );
+    let _ = response_tx.send(response);
+}
 
 /// Answer SASL credential lookups: `first` plus whatever else is queued, in one
 /// transaction (each lookup in its own subtransaction, so one failure cannot affect the
 /// others). The network thread waits on each reply.
 pub(super) fn serve_credential_requests(
-    first: crate::kafka::auth::CredentialRequest,
-    rx: &crossbeam_channel::Receiver<crate::kafka::auth::CredentialRequest>,
+    first: CredentialRequest,
+    rx: &Receiver<CredentialRequest>,
 ) {
     let mut batch = vec![first];
-    while batch.len() < 64 {
-        match rx.try_recv() {
-            Ok(r) => batch.push(r),
-            Err(_) => break,
-        }
-    }
+    batch.extend(rx.try_iter().take(MAX_CREDENTIAL_LOOKUPS - 1));
+    // Taken by the transaction once it runs, so a transaction that never ran leaves the
+    // lookups here to be failed below.
     let mut batch = Some(batch);
     let outcome = worker_transaction(|| {
         for request in batch.take().unwrap_or_default() {
@@ -36,10 +89,10 @@ pub(super) fn serve_credential_requests(
                 );
             });
             if let Err(panic_msg) = outcome {
-                pg_warning!("SASL credential lookup rolled back: {}", panic_msg);
+                pg_warning!("SASL credential lookup rolled back: {panic_msg}");
                 result = Err("credential lookup failed".to_string());
             } else if let Err(e) = &result {
-                pg_warning!("SASL credential lookup failed: {}", e);
+                pg_warning!("SASL credential lookup failed: {e}");
             }
             // The receiver may have given up (timeout / disconnect); nothing to do then.
             let _ = request.reply.send(result);
@@ -60,51 +113,21 @@ pub(super) fn serve_credential_requests(
 /// Tell the network thread that transactions ended, so parked read_committed fetches
 /// re-check their last stable offset now. Best effort: a full channel only means the
 /// long-poll safety net picks it up.
-pub(super) fn notify_transaction_ended(
-    notify_tx: &crossbeam_channel::Sender<crate::kafka::InternalNotification>,
-) {
-    let _ = notify_tx.try_send(crate::kafka::InternalNotification::TransactionEnded);
+pub(super) fn notify_transaction_ended(notify_tx: &Sender<InternalNotification>) {
+    let _ = notify_tx.try_send(InternalNotification::TransactionEnded);
 }
 
 /// Whether a committed batch ended (or may have ended) transactions other than through
 /// EndTxn, which notifies by itself: InitProducerId fences and aborts the previous
 /// epoch's open transaction.
-pub(super) fn batch_may_end_transactions(api_keys: &[i16]) -> bool {
+fn batch_may_end_transactions(api_keys: &[i16]) -> bool {
     api_keys.contains(&API_KEY_INIT_PRODUCER_ID)
 }
 
-/// Most requests one top-level transaction carries (group commit).
-///
-/// Each request runs in its own subtransaction, and every one that writes is
-/// assigned a subtransaction XID. 64 is `PGPROC_MAX_CACHED_SUBXIDS`, so a batch
-/// never overflows the worker's subxid cache (an overflowed cache forces other
-/// backends' snapshot checks into `pg_subtrans` lookups until it commits).
-pub(super) const MAX_GROUP_COMMIT_REQUESTS: usize = 64;
-
-/// A batch stops taking more requests once it has run this long, so group
-/// commit delays the first request's response by at most about this much (plus
-/// the request still running and the commit).
-pub(super) const GROUP_COMMIT_TIME_BUDGET: Duration = Duration::from_millis(50);
-
-/// Everything `process_request` needs, borrowed once by the main loop.
-pub(super) struct RequestEnv<'a> {
-    pub(super) coordinator: &'a std::sync::Arc<crate::kafka::GroupCoordinator>,
-    pub(super) broker_metadata: &'a crate::kafka::BrokerMetadata,
-    pub(super) default_partitions: i32,
-    pub(super) notify_tx: &'a crossbeam_channel::Sender<crate::kafka::InternalNotification>,
-    pub(super) compression: kafka_protocol::records::Compression,
-    pub(super) shadow_store: &'a std::sync::Arc<ShadowStore<PostgresStore>>,
-    pub(super) log_timing: bool,
-}
-
-/// Whether a group-commit batch should take another already-queued request.
-///
-/// It stops at the request cap or at the time budget. A waiting Heartbeat no longer
-/// ends it (wave 3): heartbeats are answered between the batch's requests instead
-/// ([`serve_liveness_in_batch`]), so liveness traffic still waits behind at most one
-/// in-flight request, and many heartbeating consumers no longer shrink produce
-/// batches to one request each.
-pub(super) fn batch_has_room(taken: usize, elapsed: Duration) -> bool {
+/// Whether a group-commit batch should take another already-queued request: it stops
+/// at the request cap or at the time budget. Heartbeats waiting meanwhile do not end it;
+/// they are answered between the batch's requests ([`serve_liveness_in_batch`]).
+fn batch_has_room(taken: usize, elapsed: Duration) -> bool {
     taken < MAX_GROUP_COMMIT_REQUESTS && elapsed < GROUP_COMMIT_TIME_BUDGET
 }
 
@@ -113,29 +136,47 @@ pub(super) fn batch_has_room(taken: usize, elapsed: Duration) -> bool {
 /// A Heartbeat only reads and updates the in-memory coordinator (no SPI, nothing to
 /// commit), so its response does not need the RB-1 commit barrier: it runs in its
 /// own subtransaction like any request (an empty one, no XID) and its response is
-/// released at once. Returns how many it served. `serve` runs one heartbeat (the
-/// worker passes [`serve_heartbeat_now`]; unit tests pass a fake).
-pub(super) fn serve_liveness_in_batch(
-    liveness: &crossbeam_channel::Receiver<crate::kafka::KafkaRequest>,
-    mut serve: impl FnMut(crate::kafka::KafkaRequest),
+/// released at once. Returns how many it served. `serve` runs one heartbeat.
+fn serve_liveness_in_batch(
+    liveness: &Receiver<KafkaRequest>,
+    serve: impl FnMut(KafkaRequest),
 ) -> usize {
     // At most what was waiting on entry (and never more than one batch's worth), so a
     // stream of heartbeats cannot keep the batch from its own work.
     let limit = liveness.len().min(MAX_GROUP_COMMIT_REQUESTS);
-    let mut served = 0;
-    while served < limit {
-        match liveness.try_recv() {
-            Ok(request) => serve(request),
-            Err(_) => break,
+    liveness.try_iter().take(limit).map(serve).count()
+}
+
+/// The request loop of one batch: run `first`, then every request already queued on
+/// `source` while the batch has room ([`batch_has_room`]), answering the heartbeats
+/// waiting on `liveness` (if given) with `serve_heartbeat` after each request. `run`
+/// executes one request. Returns how many requests ran.
+fn drive_batch(
+    first: KafkaRequest,
+    source: &Receiver<KafkaRequest>,
+    liveness: Option<&Receiver<KafkaRequest>>,
+    mut run: impl FnMut(KafkaRequest),
+    mut serve_heartbeat: impl FnMut(KafkaRequest),
+) -> usize {
+    let start = Instant::now();
+    let mut taken = 0;
+    let mut next = Some(first);
+    while let Some(request) = next.take() {
+        taken += 1;
+        run(request);
+        if let Some(liveness) = liveness {
+            serve_liveness_in_batch(liveness, &mut serve_heartbeat);
         }
-        served += 1;
+        if batch_has_room(taken, start.elapsed()) {
+            next = source.try_recv().ok();
+        }
     }
-    served
+    taken
 }
 
 /// Run one liveness-lane request inside the current transaction and release its
 /// response immediately (see [`serve_liveness_in_batch`]).
-pub(super) fn serve_heartbeat_now(mut request: crate::kafka::KafkaRequest, env: &RequestEnv) {
+fn serve_heartbeat_now(mut request: KafkaRequest, env: &RequestEnv) {
     let buffered = BufferedResponse::intercept(&mut request);
     let _ = run_one_request(request, env);
     buffered.release();
@@ -160,9 +201,9 @@ pub(super) fn serve_heartbeat_now(mut request: crate::kafka::KafkaRequest, env: 
 /// This relies on the writer task queueing response slots at parse time
 /// (listener.rs), so deferring the send cannot reorder responses. If that
 /// ordering scheme ever changes, re-review this barrier.
-pub(super) struct BufferedResponse {
-    client_tx: tokio::sync::mpsc::UnboundedSender<crate::kafka::KafkaResponse>,
-    buffer_rx: tokio::sync::mpsc::UnboundedReceiver<crate::kafka::KafkaResponse>,
+struct BufferedResponse {
+    client_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
+    buffer_rx: tokio::sync::mpsc::UnboundedReceiver<KafkaResponse>,
     api_version: i16,
     correlation_id: i32,
     /// What the request's error response echoes (its topics/partitions/groups), for
@@ -182,10 +223,10 @@ pub(super) struct BufferedResponse {
 
 impl BufferedResponse {
     /// Swap the request's client sender for a buffer the handler writes into.
-    /// Both ends of the buffer live on this one DB thread — tokio's unbounded
+    /// Both ends of the buffer live on this one DB thread: tokio's unbounded
     /// send/try_recv are plain synchronous calls, so no runtime or extra
     /// synchronization is involved.
-    fn intercept(request: &mut crate::kafka::KafkaRequest) -> Self {
+    fn intercept(request: &mut KafkaRequest) -> Self {
         let api_key = request.header.api_key;
         let (buffer_tx, buffer_rx) = tokio::sync::mpsc::unbounded_channel();
         let client_tx = request.swap_response_tx(buffer_tx);
@@ -222,8 +263,8 @@ impl BufferedResponse {
     }
 
     /// The batch committed: forward the buffered response(s) to the client, in
-    /// order. Today a request yields at most one response, but the loop keeps a
-    /// future multi-response request from silently dropping frames.
+    /// order. A request yields at most one response; the loop keeps a multi-response
+    /// request from silently dropping frames.
     fn release(mut self) {
         while let Ok(response) = self.buffer_rx.try_recv() {
             self.metrics.observe(&response);
@@ -245,18 +286,16 @@ impl BufferedResponse {
         while self.buffer_rx.try_recv().is_ok() {}
         self.metrics.mark_error();
         if !self.expects_response {
-            // wave3 net: an acks=0 produce whose writes were lost closes the
-            // connection, as any acks=0 error does (Kafka), so the client notices.
-            let _ = self.client_tx.send(crate::kafka::KafkaResponse::new(
-                -1,
-                -1,
-                crate::kafka::api::ResponseBody::CloseConnection,
-            ));
+            // An acks=0 produce whose writes were lost closes the connection, as any
+            // acks=0 error does in Kafka, so the client notices.
+            let _ = self
+                .client_tx
+                .send(KafkaResponse::new(-1, -1, ResponseBody::CloseConnection));
             return;
         }
         // The API's own error response, echoing the request's topics/partitions/groups
         // so an API without a top-level error code still reports the failure.
-        let error_response = crate::kafka::KafkaResponse::new(
+        let error_response = KafkaResponse::new(
             self.correlation_id,
             self.api_version,
             self.echo.error_response(self.api_version, error_code),
@@ -267,10 +306,7 @@ impl BufferedResponse {
 
 /// Run one request of a batch in its own subtransaction (so a handler error or
 /// panic rolls back only that request) and log a caught panic.
-pub(super) fn run_one_request(
-    request: crate::kafka::KafkaRequest,
-    env: &RequestEnv,
-) -> Result<RequestOutcome, String> {
+fn run_one_request(request: KafkaRequest, env: &RequestEnv) -> Result<RequestOutcome, String> {
     let result = run_request_in_subtransaction(|| {
         // Each request reads from its own snapshot. pgrx runs read-only SPI statements
         // (the transaction has not written yet) on the active snapshot, which
@@ -279,77 +315,102 @@ pub(super) fn run_one_request(
         // since (e.g. a topic created by SQL just before the client asked for it). In READ
         // COMMITTED, GetTransactionSnapshot takes a fresh snapshot. A panic unwinds to the
         // subtransaction abort, which pops snapshots pushed inside it.
+        // SAFETY: inside the batch's transaction, on the main thread.
         unsafe { pg_sys::PushActiveSnapshot(pg_sys::GetTransactionSnapshot()) };
-        let outcome = process_request(
-            request,
-            env.coordinator,
-            env.broker_metadata,
-            env.default_partitions,
-            env.notify_tx,
-            env.compression,
-            env.shadow_store,
-        );
+        let outcome = process_request(request, env);
+        // SAFETY: pops the snapshot pushed above (process_request returned normally).
         unsafe { pg_sys::PopActiveSnapshot() };
         outcome
     });
     // A reported rollback (handler error) already logged itself and sent its
     // response; only a real panic is worth a warning here.
     if let Err(panic_msg) = &result {
-        pg_warning!(
-            "Handler panic caught, request rolled back (worker survived): {}",
-            panic_msg
-        );
+        pg_warning!("Handler panic caught, request rolled back (worker survived): {panic_msg}");
     }
     result
+}
+
+/// Run one request on the DB thread: build its handler context and hand it to the
+/// API's [`crate::kafka::api::KafkaApi::handle`] through the registry.
+fn process_request(request: KafkaRequest, env: &RequestEnv) -> RequestOutcome {
+    let store: &dyn KafkaStore = env.shadow_store;
+    let api_env = crate::kafka::api::ApiEnv {
+        ctx: crate::kafka::HandlerContext::new(
+            store,
+            env.coordinator,
+            env.broker_metadata,
+            env.default_partitions,
+            env.compression,
+        ),
+        notify_tx: env.notify_tx,
+    };
+    crate::kafka::api::dispatch(request, &api_env)
 }
 
 /// RB-1 test hook: widen the response-send→commit window so the E2E barrier
 /// test can prove the ack implies a visible commit. Produce-gated so heartbeats
 /// (DR-12 lane) and unrelated traffic are unaffected while a test has the GUC
 /// set. Applied once per batch, just before its commit.
-pub(super) fn apply_test_pre_commit_delay(batch_has_produce: bool) {
+fn apply_test_pre_commit_delay(batch_has_produce: bool) {
     if batch_has_produce {
-        let delay_ms = crate::config::TEST_PRE_COMMIT_DELAY_MS.get();
-        if delay_ms > 0 {
-            std::thread::sleep(Duration::from_millis(delay_ms as u64));
+        let delay = crate::config::guc_millis(crate::config::TEST_PRE_COMMIT_DELAY_MS.get());
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
         }
     }
 }
 
 /// The batch's transaction committed: release every buffered response, in
 /// arrival order.
-pub(super) fn after_batch_commit(pending: Vec<BufferedResponse>) {
+fn after_batch_commit(pending: Vec<BufferedResponse>) {
     for response in pending {
         response.release();
     }
 }
 
 /// The batch's commit failed: every request in it gets an API-typed error.
-pub(super) fn after_batch_commit_failure(pending: Vec<BufferedResponse>, error_code: i16) {
+fn after_batch_commit_failure(pending: Vec<BufferedResponse>, error_code: i16) {
     for response in pending {
         response.fail(error_code);
     }
 }
 
+/// The batch committed. A sync-mode shadow produce's response waits for the external
+/// ack (bounded by `pg_kafka.shadow_sync_timeout_ms`) on the network thread, so the DB
+/// thread never waits for it; everything else is released now.
+fn release_committed(pending: Vec<BufferedResponse>, shadow_store: &ShadowStore<PostgresStore>) {
+    let mut holds = shadow_store.take_sync_holds();
+    let mut release_now = Vec::with_capacity(pending.len());
+    for response in pending {
+        match holds.remove(&response.shadow_slot) {
+            Some(keys) if response.expects_response => {
+                shadow_store.hold_response(keys, response.into_held());
+            }
+            _ => release_now.push(response),
+        }
+    }
+    after_batch_commit(release_now);
+}
+
 /// Execute `first` plus every request already queued behind it on `source`
 /// (no waiting for more) in ONE top-level transaction: group commit.
 ///
-/// Each request used to be its own top-level transaction and therefore its own
-/// WAL flush, which capped produce throughput at the fsync rate (~220
-/// requests/s). Now a batch pays one flush. Each request still runs in its own
-/// subtransaction, so a handler error or panic rolls back only that request; the
+/// One top-level transaction per request would pay one WAL flush each, capping produce
+/// throughput at the fsync rate; a batch pays one flush. Each request still runs in its
+/// own subtransaction, so a handler error or panic rolls back only that request; the
 /// responses of all requests are buffered and released only after the single
 /// commit (RB-1, see [`BufferedResponse`]). A batch takes at most
-/// `MAX_GROUP_COMMIT_REQUESTS` requests and stops early on
-/// `GROUP_COMMIT_TIME_BUDGET` or when `yield_to` (the liveness lane) has work.
+/// [`MAX_GROUP_COMMIT_REQUESTS`] requests and stops early at
+/// [`GROUP_COMMIT_TIME_BUDGET`]; heartbeats waiting on `liveness` are answered between
+/// its requests.
 ///
-/// Used for both lanes: the DR-12 liveness lane passes `yield_to = None` (a
-/// Heartbeat does no SPI, but taking the same guarded path keeps one code path
-/// and costs only an empty transaction).
+/// Used for both lanes: the DR-12 liveness lane passes `liveness = None` (a Heartbeat
+/// does no SPI, but taking the same guarded path keeps one code path and costs only an
+/// empty transaction).
 pub(super) fn execute_batch(
-    first: crate::kafka::KafkaRequest,
-    source: &crossbeam_channel::Receiver<crate::kafka::KafkaRequest>,
-    yield_to: Option<&crossbeam_channel::Receiver<crate::kafka::KafkaRequest>>,
+    first: KafkaRequest,
+    source: &Receiver<KafkaRequest>,
+    liveness: Option<&Receiver<KafkaRequest>>,
     env: &RequestEnv,
 ) {
     let batch_start = Instant::now();
@@ -357,52 +418,38 @@ pub(super) fn execute_batch(
     let mut api_keys: Vec<i16> = Vec::new();
     // Time spent inside handlers (timing instrumentation, pg_kafka.log_timing).
     let mut handler_time = Duration::ZERO;
+    // Taken by the transaction once it runs: a batch whose schema locks failed first
+    // still has its first request here, to be rejected below.
     let mut first = Some(first);
 
     // worker_transaction takes the schema locks first; a Postgres ERROR outside the
     // requests' subtransactions (a lock timeout there, or the COMMIT itself) rolls the
     // whole batch back and is reported as Err, and the worker carries on.
     let txn_result = worker_transaction(|| {
-        let mut next = first.take();
-        while let Some(mut request) = next.take() {
-            api_keys.push(request.header.api_key);
-            let mut buffered = BufferedResponse::intercept(&mut request);
-            buffered.shadow_slot = env.shadow_store.begin_request();
-            pending.push(buffered);
+        let Some(first) = first.take() else { return };
+        drive_batch(
+            first,
+            source,
+            liveness,
+            |mut request| {
+                api_keys.push(request.header.api_key);
+                let mut buffered = BufferedResponse::intercept(&mut request);
+                buffered.shadow_slot = env.shadow_store.begin_request();
+                pending.push(buffered);
 
-            let handler_start = Instant::now();
-            let _ = run_one_request(request, env);
-            handler_time += handler_start.elapsed();
-
-            // wave3 worker: heartbeats that arrived meanwhile are answered now, and
-            // the batch goes on taking queued work.
-            if let Some(liveness) = yield_to {
-                serve_liveness_in_batch(liveness, |hb| serve_heartbeat_now(hb, env));
-            }
-            if batch_has_room(pending.len(), batch_start.elapsed()) {
-                next = source.try_recv().ok();
-            }
-        }
+                let handler_start = Instant::now();
+                let _ = run_one_request(request, env);
+                handler_time += handler_start.elapsed();
+            },
+            |heartbeat| serve_heartbeat_now(heartbeat, env),
+        );
         apply_test_pre_commit_delay(api_keys.contains(&API_KEY_PRODUCE));
     });
 
     let batch_size = pending.len();
     match txn_result {
         Ok(()) => {
-            // A sync-mode shadow produce's response waits for the external ack
-            // (bounded by pg_kafka.shadow_sync_timeout_ms) on the network thread;
-            // the DB thread does not wait (wave 3). Everything else is released now.
-            let mut holds = env.shadow_store.take_sync_holds();
-            let mut release_now = Vec::with_capacity(pending.len());
-            for response in pending {
-                match holds.remove(&response.shadow_slot) {
-                    Some(keys) if response.expects_response => {
-                        env.shadow_store.hold_response(keys, response.into_held())
-                    }
-                    _ => release_now.push(response),
-                }
-            }
-            after_batch_commit(release_now);
+            release_committed(pending, env.shadow_store);
             if batch_may_end_transactions(&api_keys) {
                 notify_transaction_ended(env.notify_tx);
             }
@@ -423,62 +470,33 @@ pub(super) fn execute_batch(
     }
 
     if env.log_timing {
-        let total = batch_start.elapsed();
-        let tx_overhead = total.saturating_sub(handler_time);
-        log!(
-            "TIMING: batch={} total={}us handler={}us tx_overhead={}us ({}%)",
-            batch_size,
-            total.as_micros(),
-            handler_time.as_micros(),
-            tx_overhead.as_micros(),
-            if total.as_micros() > 0 {
-                (tx_overhead.as_micros() * 100) / total.as_micros()
-            } else {
-                0
-            }
-        );
+        log_batch_timing(batch_size, batch_start.elapsed(), handler_time);
     }
 }
 
-/// Run one request on the DB thread: build its handler context and hand it to the
-/// API's [`crate::kafka::api::KafkaApi::handle`] through the registry.
-///
-/// # Testing
-/// This function is public to allow unit testing, but is not part of the
-/// public API and should not be called directly by external code.
-#[doc(hidden)]
-#[allow(clippy::too_many_arguments)]
-pub fn process_request(
-    request: crate::kafka::KafkaRequest,
-    coordinator: &std::sync::Arc<crate::kafka::GroupCoordinator>,
-    broker_metadata: &crate::kafka::BrokerMetadata,
-    default_partitions: i32,
-    notify_tx: &crossbeam_channel::Sender<crate::kafka::InternalNotification>,
-    compression: kafka_protocol::records::Compression,
-    shadow_store: &std::sync::Arc<ShadowStore<PostgresStore>>,
-) -> RequestOutcome {
-    // ShadowStore wraps PostgresStore and handles shadow mode internally.
-    // It checks the GUC at runtime to decide whether to forward.
-    let store: &dyn KafkaStore = shadow_store.as_ref();
-    let env = crate::kafka::api::ApiEnv {
-        ctx: crate::kafka::HandlerContext::new(
-            store,
-            coordinator,
-            broker_metadata,
-            default_partitions,
-            compression,
-        ),
-        notify_tx,
-    };
-    crate::kafka::api::dispatch(request, &env)
+/// The `pg_kafka.log_timing` line of one batch.
+fn log_batch_timing(batch_size: usize, total: Duration, handler_time: Duration) {
+    let tx_overhead = total.saturating_sub(handler_time);
+    let overhead_pct = (tx_overhead.as_micros() * 100)
+        .checked_div(total.as_micros())
+        .unwrap_or(0);
+    log!(
+        "TIMING: batch={} total={}us handler={}us tx_overhead={}us ({}%)",
+        batch_size,
+        total.as_micros(),
+        handler_time.as_micros(),
+        tx_overhead.as_micros(),
+        overhead_pct
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::kafka::api::{
-        ApiVersionsRequestData, ProduceRequestData, RequestBody, RequestHeader, ResponseBody,
+        ApiVersionsRequestData, ProduceRequestData, RequestBody, RequestHeader,
     };
+    use crate::kafka::constants::{API_KEY_API_VERSIONS, API_KEY_FETCH};
     use crate::worker::txn::ERROR_KAFKA_STORAGE_ERROR;
 
     #[test]
@@ -496,30 +514,30 @@ mod tests {
         const { assert!(MAX_GROUP_COMMIT_REQUESTS <= 64) };
     }
 
-    /// wave3 worker (item 7): heartbeats waiting on the liveness lane are served from
-    /// inside the batch, and the batch keeps taking main-lane work. Before, the first
-    /// waiting heartbeat ended the batch (`batch_has_room(.., liveness_waiting=true)`
-    /// was false), so a steady heartbeat stream cut every batch to one request.
+    /// Heartbeats waiting on the liveness lane are served from inside the batch, and
+    /// the batch keeps taking main-lane work: a steady heartbeat stream must not cut
+    /// every batch down to one request.
     #[test]
     fn test_heartbeats_are_served_inside_a_batch_without_ending_it() {
         let (main_tx, main_rx) = crossbeam_channel::unbounded();
         let (hb_tx, hb_rx) = crossbeam_channel::unbounded();
-        for i in 0..10 {
+        for i in 1..10 {
             main_tx.send(api_versions_request(i).0).unwrap();
+        }
+        for i in 0..10 {
             // A heartbeat arrives behind every main-lane request.
             hb_tx.send(api_versions_request(100 + i).0).unwrap();
         }
         let mut batch = Vec::new();
         let mut heartbeats = Vec::new();
-        let start = Instant::now();
-        let mut next = main_rx.try_recv().ok();
-        while let Some(r) = next.take() {
-            batch.push(r.header.correlation_id);
-            serve_liveness_in_batch(&hb_rx, |hb| heartbeats.push(hb.header.correlation_id));
-            if batch_has_room(batch.len(), start.elapsed()) {
-                next = main_rx.try_recv().ok();
-            }
-        }
+        let taken = drive_batch(
+            api_versions_request(0).0,
+            &main_rx,
+            Some(&hb_rx),
+            |r| batch.push(r.header.correlation_id),
+            |hb| heartbeats.push(hb.header.correlation_id),
+        );
+        assert_eq!(taken, 10);
         assert_eq!(batch, (0..10).collect::<Vec<_>>(), "one batch took all ten");
         assert_eq!(
             heartbeats,
@@ -532,9 +550,43 @@ mod tests {
     /// A flood of heartbeats is served at most one batch's worth per slot, so the batch
     /// still gets to its own requests.
     #[test]
+    fn test_liveness_batch_does_not_serve_heartbeats_inside_itself() {
+        let (hb_tx, hb_rx) = crossbeam_channel::unbounded();
+        for i in 1..5 {
+            hb_tx.send(api_versions_request(i).0).unwrap();
+        }
+        let mut served = Vec::new();
+        let taken = drive_batch(
+            api_versions_request(0).0,
+            &hb_rx,
+            None,
+            |r| served.push(r.header.correlation_id),
+            |_| panic!("no liveness lane to serve"),
+        );
+        assert_eq!(taken, 5);
+        assert_eq!(served, (0..5).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_batch_stops_at_the_request_cap() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        for i in 1..=MAX_GROUP_COMMIT_REQUESTS {
+            tx.send(api_versions_request(i32::try_from(i).unwrap()).0)
+                .unwrap();
+        }
+        let taken = drive_batch(api_versions_request(0).0, &rx, None, |_| {}, |_| {});
+        assert_eq!(taken, MAX_GROUP_COMMIT_REQUESTS);
+        assert_eq!(
+            rx.len(),
+            1,
+            "the request past the cap waits for the next batch"
+        );
+    }
+
+    #[test]
     fn test_heartbeat_service_per_slot_is_bounded() {
         let (hb_tx, hb_rx) = crossbeam_channel::unbounded();
-        for i in 0..(3 * MAX_GROUP_COMMIT_REQUESTS as i32) {
+        for i in 0..i32::try_from(3 * MAX_GROUP_COMMIT_REQUESTS).unwrap() {
             hb_tx.send(api_versions_request(i).0).unwrap();
         }
         let served = serve_liveness_in_batch(&hb_rx, |_| {});
@@ -560,12 +612,12 @@ mod tests {
         correlation_id: i32,
         body: RequestBody,
     ) -> (
-        crate::kafka::KafkaRequest,
-        tokio::sync::mpsc::UnboundedReceiver<crate::kafka::KafkaResponse>,
+        KafkaRequest,
+        tokio::sync::mpsc::UnboundedReceiver<KafkaResponse>,
     ) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         (
-            crate::kafka::KafkaRequest {
+            KafkaRequest {
                 header: RequestHeader {
                     api_key,
                     api_version: 7,
@@ -582,8 +634,8 @@ mod tests {
     fn api_versions_request(
         correlation_id: i32,
     ) -> (
-        crate::kafka::KafkaRequest,
-        tokio::sync::mpsc::UnboundedReceiver<crate::kafka::KafkaResponse>,
+        KafkaRequest,
+        tokio::sync::mpsc::UnboundedReceiver<KafkaResponse>,
     ) {
         let (mut r, rx) = request(
             API_KEY_API_VERSIONS,
@@ -598,8 +650,8 @@ mod tests {
         correlation_id: i32,
         acks: i16,
     ) -> (
-        crate::kafka::KafkaRequest,
-        tokio::sync::mpsc::UnboundedReceiver<crate::kafka::KafkaResponse>,
+        KafkaRequest,
+        tokio::sync::mpsc::UnboundedReceiver<KafkaResponse>,
     ) {
         request(
             API_KEY_PRODUCE,
@@ -615,10 +667,10 @@ mod tests {
 
     /// What a handler does: send its (success) response on the request's (swapped)
     /// response channel.
-    fn handler_sends(request: crate::kafka::KafkaRequest, correlation_id: i32) {
+    fn handler_sends(request: &KafkaRequest, correlation_id: i32) {
         request
             .response_tx
-            .send(crate::kafka::KafkaResponse::new(
+            .send(KafkaResponse::new(
                 correlation_id,
                 0,
                 ResponseBody::UnknownApi { error_code: 0 },
@@ -636,8 +688,8 @@ mod tests {
             BufferedResponse::intercept(&mut a),
             BufferedResponse::intercept(&mut b),
         ];
-        handler_sends(a, 1);
-        handler_sends(b, 2);
+        handler_sends(&a, 1);
+        handler_sends(&b, 2);
         assert!(a_rx.try_recv().is_err(), "no response before commit");
         assert!(b_rx.try_recv().is_err(), "no response before commit");
 
@@ -660,16 +712,16 @@ mod tests {
             BufferedResponse::intercept(&mut a),
             BufferedResponse::intercept(&mut p),
         ];
-        handler_sends(a, 11);
-        handler_sends(p, 12);
+        handler_sends(&a, 11);
+        handler_sends(&p, 12);
 
         after_batch_commit_failure(pending, ERROR_KAFKA_STORAGE_ERROR);
-        // Each request gets its own API's error response — never the buffered success.
+        // Each request gets its own API's error response, never the buffered success.
         let response = a_rx.try_recv().expect("an error response");
         assert_eq!(response.correlation_id, 11);
         match response.body {
             ResponseBody::ApiVersions(r) => assert_eq!(r.error_code, ERROR_KAFKA_STORAGE_ERROR),
-            other => panic!("expected an ApiVersions error, got {:?}", other),
+            other => panic!("expected an ApiVersions error, got {other:?}"),
         }
         assert!(a_rx.try_recv().is_err(), "the buffered success is dropped");
         // Produce (acks=1): a Produce-typed error.
@@ -680,19 +732,16 @@ mod tests {
     }
 
     #[test]
-    fn test_commit_failure_sends_nothing_to_acks0_produce() {
+    fn test_commit_failure_closes_the_connection_of_an_acks0_produce() {
         // An acks=0 client expects no response frame at all; an error frame would
-        // be read as the answer to its next request. wave3 net: the connection gets
-        // the close instruction instead (Kafka closes it on any acks=0 error).
+        // be read as the answer to its next request. The connection gets the close
+        // instruction instead (Kafka closes it on any acks=0 error).
         let (mut p, mut p_rx) = produce_request(21, 0);
         let pending = vec![BufferedResponse::intercept(&mut p)];
         drop(p); // the acks=0 path sends nothing
         after_batch_commit_failure(pending, ERROR_KAFKA_STORAGE_ERROR);
         match p_rx.try_recv() {
-            Ok(r) => assert!(matches!(
-                r.body,
-                crate::kafka::api::ResponseBody::CloseConnection
-            )),
+            Ok(r) => assert!(matches!(r.body, ResponseBody::CloseConnection)),
             Err(e) => panic!("expected the close instruction, got {e:?}"),
         }
         assert!(p_rx.try_recv().is_err(), "nothing else");

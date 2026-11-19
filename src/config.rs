@@ -696,6 +696,12 @@ pub fn init() {
     pgrx::log!("pg_kafka GUC parameters initialized (including shadow mode)");
 }
 
+/// An integer millisecond GUC value as a `Duration`; a negative value (which no GUC
+/// range allows) is zero.
+pub fn guc_millis(ms: i32) -> std::time::Duration {
+    std::time::Duration::from_millis(u64::try_from(ms).unwrap_or(0))
+}
+
 /// The bind host from the `pg_kafka.host` GUC. Unset, empty or all-whitespace means the default
 /// (`127.0.0.1`, loopback only); an empty string used to reach the bind as `":9092"`, which fails to resolve and
 /// stops the worker.
