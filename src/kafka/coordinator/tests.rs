@@ -773,6 +773,36 @@ fn test_max_groups_evicts_oldest_empty_group_then_refuses() {
 }
 
 #[test]
+fn test_lowered_max_groups_evicts_empty_groups_down_to_the_cap() {
+    // pg_kafka.max_consumer_groups lowered below the number of groups in memory: a new
+    // group still gets in by forgetting as many least recently active Empty groups as
+    // it takes, and is refused only once no Empty group is left.
+    let c = GroupCoordinator::new();
+    for g in ["a", "b", "c"] {
+        let m = stable_single(&c, g);
+        c.leave_group(g, &m).unwrap();
+    }
+    stable_single(&c, "busy");
+    c.set_limits(2, 10);
+    joined(&join(&c, "new", None));
+    assert!(c.get_group_state("new").is_some());
+    let groups = c.groups.read().unwrap();
+    assert_eq!(
+        groups.len(),
+        2,
+        "evicted down to the cap: {:?}",
+        groups.keys()
+    );
+    assert!(groups.contains_key("busy"));
+    drop(groups);
+    // Only non-empty groups remain: the next new group is refused.
+    assert_eq!(
+        join_error_code(&join(&c, "newer", None)),
+        crate::kafka::constants::ERROR_COORDINATOR_NOT_AVAILABLE
+    );
+}
+
+#[test]
 fn test_validate_offset_commit_matches_kafka() {
     use crate::kafka::constants::{
         ERROR_ILLEGAL_GENERATION as IG, ERROR_REBALANCE_IN_PROGRESS as RIP,

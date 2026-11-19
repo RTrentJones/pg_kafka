@@ -414,9 +414,9 @@ impl GroupCoordinator {
     /// Whether a JoinGroup may create the group it names: a new group must be a valid one
     /// (checked first, so a refused join leaves no group behind), and the coordinator's
     /// memory is bounded (pg_kafka.max_consumer_groups). Room is made by forgetting the
-    /// least recently active Empty group (its committed offsets stay in the database, so
-    /// it remains visible as an Empty group), else the join gets the retriable
-    /// COORDINATOR_NOT_AVAILABLE.
+    /// least recently active Empty groups (their committed offsets stay in the database,
+    /// so they remain visible as Empty groups) until the count is below the cap, else the
+    /// join gets the retriable COORDINATOR_NOT_AVAILABLE.
     fn admit_new_group(
         groups: &mut HashMap<String, ConsumerGroup>,
         params: &JoinGroupParams,
@@ -426,31 +426,29 @@ impl GroupCoordinator {
         if params.protocol_type.is_empty() || params.protocols.is_empty() {
             return Err(inconsistent_protocol(group_id));
         }
+        // A reload can lower the cap below the number of groups in memory, so as many
+        // Empty groups are forgotten as it takes.
+        while groups.len() >= max_groups {
+            let victim = groups
+                .values()
+                .filter(|g| g.state == GroupState::Empty)
+                .min_by_key(|g| g.last_activity)
+                .map(|g| g.group_id.clone());
+            let Some(victim) = victim else { break };
+            groups.remove(&victim);
+        }
         if groups.len() < max_groups {
             return Ok(());
         }
-        let victim = groups
-            .values()
-            .filter(|g| g.state == GroupState::Empty)
-            .min_by_key(|g| g.last_activity)
-            .map(|g| g.group_id.clone());
-        match victim {
-            Some(v) if groups.len() == max_groups => {
-                groups.remove(&v);
-                Ok(())
-            }
-            _ => {
-                crate::pg_warning!(
-                    "JoinGroup for new group '{}' refused: {} groups in memory (pg_kafka.max_consumer_groups = {})",
-                    group_id,
-                    groups.len(),
-                    max_groups
-                );
-                Err(KafkaError::CoordinatorNotAvailable {
-                    group_id: group_id.clone(),
-                })
-            }
-        }
+        crate::pg_warning!(
+            "JoinGroup for new group '{}' refused: {} groups in memory (pg_kafka.max_consumer_groups = {})",
+            group_id,
+            groups.len(),
+            max_groups
+        );
+        Err(KafkaError::CoordinatorNotAvailable {
+            group_id: group_id.clone(),
+        })
     }
 
     /// Whether the group admits this member: a new member is refused once the group has

@@ -8,6 +8,7 @@
 //! - Coordinator state machine transitions
 
 mod coordinator_state;
+mod group_cap;
 mod lifecycle;
 mod protocol_rules;
 mod rebalance;
@@ -36,5 +37,6 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         protocol_rules::test_join_with_no_common_assignor_is_refused,
         protocol_rules::test_offsets_only_group_is_listed_after_restart: sequential, // restarts the listener worker
         sync_liveness::test_slow_leader_sync_keeps_silent_follower: sequential, // Has sleep delays
+        group_cap::test_lowered_group_cap_still_admits_new_groups: sequential, // changes a GUC
     ]
 }
