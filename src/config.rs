@@ -4,8 +4,7 @@
 //! The GUCs of the listener security, the least-privilege role and the resource limits are
 //! declared next to the code that uses them and registered from [`init`].
 
-use pgrx::{GucContext, GucFlags, GucRegistry, GucSetting};
-use std::ffi::CString;
+use pgrx::{GucContext, GucFlags, GucRegistry};
 use std::time::Duration;
 
 #[cfg(test)]
@@ -36,48 +35,69 @@ const MAX_SHUTDOWN_TIMEOUT_MS: i32 = 60_000;
 macro_rules! guc_type {
     (int) => { i32 };
     (bool) => { bool };
-    (string) => { Option<CString> };
+    (string) => { Option<::std::ffi::CString> };
 }
+pub(crate) use guc_type;
 
 /// Registers one GUC of a kind in [`gucs!`] (an `int` takes its range).
 macro_rules! define_guc {
     (int, $name:literal, $short:literal, $long:literal, $setting:expr, $context:ident,
      [$min:expr, $max:expr], $flags:expr) => {
-        GucRegistry::define_int_guc(
+        ::pgrx::GucRegistry::define_int_guc(
             $name,
             $short,
             $long,
             $setting,
             $min,
             $max,
-            GucContext::$context,
+            ::pgrx::GucContext::$context,
             $flags,
         )
     };
     (bool, $name:literal, $short:literal, $long:literal, $setting:expr, $context:ident,
      [], $flags:expr) => {
-        GucRegistry::define_bool_guc($name, $short, $long, $setting, GucContext::$context, $flags)
+        ::pgrx::GucRegistry::define_bool_guc(
+            $name,
+            $short,
+            $long,
+            $setting,
+            ::pgrx::GucContext::$context,
+            $flags,
+        )
     };
     (string, $name:literal, $short:literal, $long:literal, $setting:expr, $context:ident,
      [], $flags:expr) => {
-        GucRegistry::define_string_guc($name, $short, $long, $setting, GucContext::$context, $flags)
+        ::pgrx::GucRegistry::define_string_guc(
+            $name,
+            $short,
+            $long,
+            $setting,
+            ::pgrx::GucContext::$context,
+            $flags,
+        )
     };
 }
+pub(crate) use define_guc;
 
 /// The flags of a GUC in [`gucs!`]: the given ones, else the defaults.
 macro_rules! guc_flags {
     () => {
-        GucFlags::default()
+        ::pgrx::GucFlags::default()
     };
     ($flags:expr) => {
         $flags
     };
 }
+pub(crate) use guc_flags;
 
-/// Declares GUCs: one static per entry, and `register_declared_gucs()`, which registers
-/// them in declaration order. An entry reads
+/// Declares GUCs: one static per entry, and the named function, which registers them
+/// in declaration order. The block starts with that function's signature, then the
+/// entries; an entry reads
 ///
 /// ```text
+/// /// docs of the function
+/// [vis] fn register_x;
+///
 /// /// docs of the static
 /// [vis] int|bool|string STATIC = default => c"pg_kafka.name" {
 ///     short: c"...", long: c"...", context: Postmaster|Sighup|...,
@@ -88,7 +108,10 @@ macro_rules! guc_flags {
 ///
 /// so each setting's name, description, bounds and storage are written once, in one place.
 macro_rules! gucs {
-    ($(
+    (
+    $(#[doc = $fn_doc:literal])*
+    $fn_vis:vis fn $register:ident;
+    $(
         $(#[doc = $doc:literal])*
         $vis:vis $kind:ident $static:ident = $default:expr => $name:literal {
             short: $short:literal,
@@ -100,24 +123,28 @@ macro_rules! gucs {
     )*) => {
         $(
             $(#[doc = $doc])*
-            $vis static $static: GucSetting<guc_type!($kind)> =
-                GucSetting::<guc_type!($kind)>::new($default);
+            $vis static $static: ::pgrx::GucSetting<$crate::config::guc_type!($kind)> =
+                ::pgrx::GucSetting::<$crate::config::guc_type!($kind)>::new($default);
         )*
 
-        /// Register every GUC of the `gucs!` block, in declaration order.
-        fn register_declared_gucs() {
+        $(#[doc = $fn_doc])*
+        $fn_vis fn $register() {
             $(
-                define_guc!(
+                $crate::config::define_guc!(
                     $kind, $name, $short, $long, &$static, $context,
                     [$($min, $max)?],
-                    guc_flags!($($flags)?)
+                    $crate::config::guc_flags!($($flags)?)
                 );
             )*
         }
     };
 }
+pub(crate) use gucs;
 
 gucs! {
+    /// Register the GUCs declared in this module, in declaration order.
+    fn register_declared_gucs;
+
     /// TCP port of the primary Kafka listener.
     int PORT = DEFAULT_KAFKA_PORT => c"pg_kafka.port" {
         short: c"Port to listen on for Kafka protocol connections",
@@ -415,7 +442,7 @@ pub fn init() {
 
 /// The value of a string GUC, `None` when unset.
 #[cfg(not(test))]
-fn guc_string(setting: &GucSetting<Option<CString>>) -> Option<String> {
+fn guc_string(setting: &pgrx::GucSetting<Option<std::ffi::CString>>) -> Option<String> {
     setting
         .get()
         .as_deref()
