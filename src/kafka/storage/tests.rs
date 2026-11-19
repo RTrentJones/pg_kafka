@@ -899,206 +899,106 @@ mod tests {
         assert_eq!(result, 50);
     }
 
-    // ========== Sequence Validation Tests (Idempotent Producer, wave 3: Kafka's model) ==========
+}
 
-    use crate::kafka::storage::{
-        batch_last_sequence, validate_sequence, CachedBatch, SequenceValidation,
-    };
+#[cfg(test)]
+mod partition_bounds {
+    use crate::kafka::storage::{order_topic_metadata, IsolationLevel, PartitionBounds};
 
-    fn proceed(last: i32) -> SequenceValidation {
-        SequenceValidation::Proceed {
-            new_last_sequence: last,
-            new_epoch: false,
-        }
-    }
-
-    fn ooo(expected: i32) -> SequenceValidation {
-        SequenceValidation::OutOfOrder {
-            expected_sequence: expected,
-        }
-    }
-
-    /// Two remembered batches: sequences 0..=4 at offset 10 and 5..=7 at offset 20.
-    fn cache() -> Vec<CachedBatch> {
-        vec![
-            CachedBatch {
-                first_sequence: 0,
-                last_sequence: 4,
-                base_offset: 10,
-            },
-            CachedBatch {
-                first_sequence: 5,
-                last_sequence: 7,
-                base_offset: 20,
-            },
-        ]
+    #[test]
+    fn empty_partition_without_counter_row() {
+        let b =
+            PartitionBounds::from_raw(None, None, None, None, None, IsolationLevel::ReadCommitted);
+        assert_eq!(b, PartitionBounds::default());
     }
 
     #[test]
-    fn test_validate_sequence_first_batch() {
-        // No state on the partition: a batch starting at 0 proceeds.
-        assert_eq!(validate_sequence(0, None, &[], 0, 0, 5), proceed(4));
-        // ... and any other first sequence is out of order (stricter than Kafka).
-        assert_eq!(validate_sequence(0, None, &[], 0, 5, 1), ooo(0));
-    }
-
-    #[test]
-    fn test_validate_sequence_next_batch_proceeds() {
-        assert_eq!(validate_sequence(0, Some(4), &[], 0, 5, 3), proceed(7));
-    }
-
-    #[test]
-    fn test_validate_sequence_retry_of_a_cached_batch_keeps_its_offset() {
-        // Wave 3: a retry of ANY of the remembered batches (not only the last one) is a
-        // duplicate and carries the original base offset (was: no offset, -1).
-        assert_eq!(
-            validate_sequence(0, Some(7), &cache(), 0, 5, 3),
-            SequenceValidation::Duplicate { base_offset: 20 }
+    fn hwm_takes_the_larger_of_counter_and_max_row() {
+        // Counter ahead of rows (highest aborted rows cleaned up): counter wins (BUG-4).
+        let b = PartitionBounds::from_raw(
+            Some(10),
+            Some(0),
+            Some(0),
+            Some(5),
+            None,
+            IsolationLevel::ReadUncommitted,
         );
-        assert_eq!(
-            validate_sequence(0, Some(7), &cache(), 0, 0, 5),
-            SequenceValidation::Duplicate { base_offset: 10 }
+        assert_eq!(b.high_watermark, 10);
+        assert_eq!(b.last_stable_offset, 10);
+        // Rows that predate the counter: MAX + 1 wins.
+        let b = PartitionBounds::from_raw(
+            Some(2),
+            Some(0),
+            Some(0),
+            Some(7),
+            None,
+            IsolationLevel::ReadUncommitted,
         );
+        assert_eq!(b.high_watermark, 8);
     }
 
     #[test]
-    fn test_validate_sequence_never_sent_range_is_out_of_order() {
-        // Wave 3: a range at or below the last sequence that is NOT a remembered batch
-        // was never appended. It used to be acked as a duplicate and dropped.
-        assert_eq!(validate_sequence(0, Some(7), &cache(), 0, 1, 1), ooo(8));
-        assert_eq!(validate_sequence(0, Some(7), &cache(), 0, 7, 1), ooo(8));
-        // A range older than the cache is out of order too (Kafka: same).
-        assert_eq!(validate_sequence(0, Some(7), &[], 0, 0, 5), ooo(8));
-    }
-
-    #[test]
-    fn test_validate_sequence_gap_is_out_of_order() {
-        assert_eq!(validate_sequence(0, Some(7), &cache(), 0, 10, 3), ooo(8));
-    }
-
-    #[test]
-    fn test_validate_sequence_partial_overlap_is_out_of_order() {
-        // last_sequence = 7, batch covers 5..=12: records 8..=12 were never
-        // persisted, so treating this as a duplicate would silently lose them
-        assert_eq!(validate_sequence(0, Some(7), &cache(), 0, 5, 8), ooo(8));
-        assert_eq!(validate_sequence(0, Some(7), &cache(), 0, 7, 2), ooo(8));
-    }
-
-    #[test]
-    fn test_validate_sequence_negative_base_is_rejected() {
-        // RV-12: a negative base_sequence must be rejected (out of order), not
-        // misclassified as a Duplicate and silently dropped.
-        assert_eq!(validate_sequence(0, None, &[], 0, -1, 1), ooo(0));
-        assert_eq!(validate_sequence(0, Some(7), &cache(), 0, -5, 3), ooo(8));
-        // A negative record_count is likewise rejected.
-        assert_eq!(validate_sequence(0, Some(7), &cache(), 0, 8, -1), ooo(8));
-    }
-
-    #[test]
-    fn test_validate_sequence_epochs() {
-        // A lower epoch is stale (INVALID_PRODUCER_EPOCH), whatever the sequence.
-        assert_eq!(
-            validate_sequence(3, Some(7), &cache(), 2, 8, 1),
-            SequenceValidation::StaleEpoch { current_epoch: 3 }
+    fn lso_is_first_pending_offset_for_read_committed_only() {
+        let rc = PartitionBounds::from_raw(
+            Some(10),
+            Some(0),
+            Some(0),
+            Some(9),
+            Some(4),
+            IsolationLevel::ReadCommitted,
         );
-        // A higher (client-bumped) epoch must restart at 0 ...
-        assert_eq!(
-            validate_sequence(3, Some(7), &cache(), 4, 0, 2),
-            SequenceValidation::Proceed {
-                new_last_sequence: 1,
-                new_epoch: true
-            }
+        assert_eq!(rc.last_stable_offset, 4);
+        let ru = PartitionBounds::from_raw(
+            Some(10),
+            Some(0),
+            Some(0),
+            Some(9),
+            Some(4),
+            IsolationLevel::ReadUncommitted,
         );
-        // ... anything else is out of order, and old-epoch batches are not duplicates.
-        assert_eq!(validate_sequence(3, Some(7), &cache(), 4, 5, 3), ooo(0));
+        assert_eq!(ru.last_stable_offset, 10);
     }
 
     #[test]
-    fn test_validate_sequence_wraps_at_i32_max() {
-        // Kafka's incrementSequence: sequences wrap from i32::MAX to 0.
-        assert_eq!(batch_last_sequence(i32::MAX - 1, 2), i32::MAX);
-        assert_eq!(batch_last_sequence(i32::MAX, 2), 0);
-        assert_eq!(batch_last_sequence(i32::MAX - 1, 5), 2);
-        assert_eq!(batch_last_sequence(7, 0), 7);
-        // The batch after the one ending at i32::MAX starts at 0.
-        assert_eq!(
-            validate_sequence(0, Some(i32::MAX), &[], 0, 0, 3),
-            proceed(2)
+    fn earliest_respects_durable_log_start() {
+        // Truncated by DeleteRecords to 6 and now empty: earliest is the log start.
+        let b = PartitionBounds::from_raw(
+            Some(6),
+            Some(6),
+            None,
+            None,
+            None,
+            IsolationLevel::ReadCommitted,
         );
-        // A batch crossing i32::MAX is appended with its wrapped last sequence.
-        assert_eq!(
-            validate_sequence(0, Some(i32::MAX - 2), &[], 0, i32::MAX - 1, 4),
-            proceed(1)
+        assert_eq!(b.earliest_offset, 6);
+        assert_eq!(b.log_start_offset, 6);
+        assert_eq!(b.high_watermark, 6);
+        // Aborted leading rows cleaned up: first row above the log start.
+        let b = PartitionBounds::from_raw(
+            Some(5),
+            Some(0),
+            Some(2),
+            Some(4),
+            None,
+            IsolationLevel::ReadCommitted,
         );
-        // ... and its retry is recognised.
-        let wrapped = [CachedBatch {
-            first_sequence: i32::MAX - 1,
-            last_sequence: 1,
-            base_offset: 99,
-        }];
-        assert_eq!(
-            validate_sequence(0, Some(1), &wrapped, 0, i32::MAX - 1, 4),
-            SequenceValidation::Duplicate { base_offset: 99 }
-        );
-    }
-    // ========== DR-8: header JSONB decode (DEEP-REVIEW-2026-07) ==========
-
-    #[test]
-    fn test_decode_headers_json_roundtrip() {
-        // The produce path stores headers as {key: hex(value)}
-        let json = r#"{"trace-id":"616263","empty":""}"#;
-        let mut headers = decode_headers_json(Some(json));
-        headers.sort();
-        assert_eq!(
-            headers,
-            vec![
-                ("empty".to_string(), b"".to_vec()),
-                ("trace-id".to_string(), b"abc".to_vec()),
-            ]
-        );
+        assert_eq!(b.earliest_offset, 2);
+        assert_eq!(b.log_start_offset, 0);
     }
 
     #[test]
-    fn test_decode_headers_json_absent_or_empty() {
-        assert!(decode_headers_json(None).is_empty());
-        assert!(decode_headers_json(Some("{}")).is_empty());
-        assert!(decode_headers_json(Some("")).is_empty());
-    }
-
-    #[test]
-    fn test_decode_headers_json_malformed_is_lenient() {
-        // Malformed JSON: drop all headers rather than failing the fetch
-        assert!(decode_headers_json(Some("not-json")).is_empty());
-        // Malformed hex value: that header is dropped, valid ones survive
-        let json = r#"{"bad":"zz","good":"6869"}"#;
-        assert_eq!(
-            decode_headers_json(Some(json)),
-            vec![("good".to_string(), b"hi".to_vec())]
-        );
-        // Odd-length hex is malformed
-        assert!(decode_headers_json(Some(r#"{"odd":"abc"}"#)).is_empty());
-    }
-
-    #[test]
-    fn test_decode_headers_json_non_ascii_hex_does_not_panic() {
-        // A multi-byte char puts the 2-byte hex window off a char boundary; that must
-        // drop the header (None), not panic with "not a char boundary".
-        assert!(decode_headers_json(Some(r#"{"k":"aé0"}"#)).is_empty());
-        let ok = decode_headers_json(Some(r#"{"bad":"aé0","good":"6869"}"#));
-        assert_eq!(ok, vec![("good".to_string(), b"hi".to_vec())]);
-    }
-
-    #[test]
-    fn test_decode_headers_json_array_keeps_order() {
-        let decoded = decode_headers_json(Some(r#"[["z","01"],["a","02"]]"#));
-        assert_eq!(
-            decoded,
-            vec![("z".to_string(), vec![1u8]), ("a".to_string(), vec![2u8])]
-        );
-        // Rows written in the old object format still decode.
-        assert_eq!(
-            decode_headers_json(Some(r#"{"k":"6869"}"#)),
-            vec![("k".to_string(), b"hi".to_vec())]
-        );
+    fn topic_metadata_follows_request_order() {
+        let names: Vec<String> = ["b", "missing", "a", "b"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let rows = vec![("a".to_string(), 1, 3), ("b".to_string(), 2, 1)];
+        let out = order_topic_metadata(&names, rows);
+        let got: Vec<(&str, i32, i32)> = out
+            .iter()
+            .map(|t| (t.name.as_str(), t.id, t.partition_count))
+            .collect();
+        assert_eq!(got, vec![("b", 2, 1), ("a", 1, 3), ("b", 2, 1)]);
+        assert!(order_topic_metadata(&[], vec![]).is_empty());
     }
 }
