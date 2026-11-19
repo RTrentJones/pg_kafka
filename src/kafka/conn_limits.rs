@@ -153,7 +153,9 @@ impl IpTracker {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<IpAddr, IpEntry>> {
         // The critical sections cannot panic; recover from poisoning anyway.
-        self.entries.lock().unwrap_or_else(|p| p.into_inner())
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Admit a new connection from `ip`, or `None` when the IP is at its cap.
@@ -176,7 +178,7 @@ impl IpTracker {
 
     /// Live connections of `ip`.
     pub fn connections(&self, ip: IpAddr) -> usize {
-        self.lock().get(&ip).map(|e| e.connections).unwrap_or(0)
+        self.lock().get(&ip).map_or(0, |e| e.connections)
     }
 
     /// Entries in the table (tests).

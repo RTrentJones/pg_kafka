@@ -26,7 +26,7 @@ impl std::fmt::Debug for PlainCredentials {
 impl Drop for PlainCredentials {
     /// Best effort: overwrite the password bytes before the allocation is freed.
     fn drop(&mut self) {
-        for b in self.password.iter_mut() {
+        for b in &mut self.password {
             // SAFETY: `b` is a valid, aligned, exclusive reference into the Vec.
             unsafe { std::ptr::write_volatile(b, 0) };
         }
@@ -43,7 +43,7 @@ pub enum PlainError {
 impl std::fmt::Display for PlainError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PlainError::Malformed(m) => write!(f, "malformed PLAIN message: {}", m),
+            PlainError::Malformed(m) => write!(f, "malformed PLAIN message: {m}"),
             PlainError::AuthzidMismatch => {
                 write!(f, "authorization id differs from the username")
             }

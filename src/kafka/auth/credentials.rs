@@ -32,15 +32,14 @@ pub fn lookup_credential(
     username: &str,
     mechanism: Option<ScramMechanism>,
 ) -> Result<StoredCredential, String> {
-    match lookup_stored(username, mechanism)? {
-        Some(cred) => Ok(StoredCredential::Known(cred)),
-        None => {
-            let m = mechanism.unwrap_or(ScramMechanism::Sha256);
-            let params = fake_params(m);
-            Ok(StoredCredential::Unknown(fake_credential_with(
-                m, username, &params,
-            )))
-        }
+    if let Some(cred) = lookup_stored(username, mechanism)? {
+        Ok(StoredCredential::Known(cred))
+    } else {
+        let m = mechanism.unwrap_or(ScramMechanism::Sha256);
+        let params = fake_params(m);
+        Ok(StoredCredential::Unknown(fake_credential_with(
+            m, username, &params,
+        )))
     }
 }
 
@@ -71,23 +70,23 @@ fn lookup_stored(
         let salt: Vec<u8> = row.get_by_name("salt")?.unwrap_or_default();
         let stored_key: Vec<u8> = row.get_by_name("stored_key")?.unwrap_or_default();
         let server_key: Vec<u8> = row.get_by_name("server_key")?.unwrap_or_default();
-        Ok::<_, pgrx::spi::SpiError>(Some((mechanism, iterations, salt, stored_key, server_key)))
+        Ok::<_, spi::SpiError>(Some((mechanism, iterations, salt, stored_key, server_key)))
     })
-    .map_err(|e| format!("credential lookup failed: {}", e))
+    .map_err(|e| format!("credential lookup failed: {e}"))
     .and_then(|row| {
         let Some((mechanism, iterations, salt, stored_key, server_key)) = row else {
             return Ok(None);
         };
         let cred = ScramCredential {
             mechanism: ScramMechanism::from_name(&mechanism)
-                .ok_or_else(|| format!("stored credential has unknown mechanism {}", mechanism))?,
+                .ok_or_else(|| format!("stored credential has unknown mechanism {mechanism}"))?,
             salt,
             iterations: iterations.max(0) as u32,
             stored_key,
             server_key,
         };
         cred.validate()
-            .map_err(|e| format!("stored credential is invalid: {}", e))?;
+            .map_err(|e| format!("stored credential is invalid: {e}"))?;
         Ok(Some(cred))
     })
 }
@@ -95,7 +94,9 @@ fn lookup_stored(
 /// The fake-credential parameters for `mechanism`, cached for [`FAKE_PARAMS_TTL`].
 fn fake_params(mechanism: ScramMechanism) -> FakeCredentialParams {
     let now = Instant::now();
-    let mut cache = FAKE_PARAMS.lock().unwrap_or_else(|p| p.into_inner());
+    let mut cache = FAKE_PARAMS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let cache = cache.get_or_insert_with(HashMap::new);
     if let Some((at, params)) = cache.get(mechanism.name()) {
         if now.duration_since(*at) < FAKE_PARAMS_TTL {
@@ -158,7 +159,7 @@ fn read_fake_params(mechanism: ScramMechanism) -> Result<FakeCredentialParams, S
                 params.salt_len = l.max(1) as usize;
             }
         }
-        Ok::<_, pgrx::spi::SpiError>(params)
+        Ok::<_, spi::SpiError>(params)
     })
     .map_err(|e| e.to_string())
 }

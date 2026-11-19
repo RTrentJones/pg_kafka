@@ -114,8 +114,8 @@ pub enum ScramError {
 impl std::fmt::Display for ScramError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ScramError::Malformed(m) => write!(f, "malformed SCRAM message: {}", m),
-            ScramError::Unsupported(m) => write!(f, "unsupported SCRAM feature: {}", m),
+            ScramError::Malformed(m) => write!(f, "malformed SCRAM message: {m}"),
+            ScramError::Unsupported(m) => write!(f, "unsupported SCRAM feature: {m}"),
             ScramError::InvalidCredentials => write!(f, "invalid credentials"),
         }
     }
@@ -391,8 +391,8 @@ fn decode_saslname(raw: &str) -> Result<String, ScramError> {
         out.push_str(&rest[..pos]);
         let esc = rest.get(pos..pos + 3);
         match esc {
-            Some("=2C") | Some("=2c") => out.push(','),
-            Some("=3D") | Some("=3d") => out.push('='),
+            Some("=2C" | "=2c") => out.push(','),
+            Some("=3D" | "=3d") => out.push('='),
             _ => return Err(ScramError::Malformed("invalid escape in username")),
         }
         rest = &rest[pos + 3..];

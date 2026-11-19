@@ -202,7 +202,7 @@ fn decode_inner(mut frame: BytesMut) -> Result<SaslRequest, String> {
             versions::<SaslAuthenticateApi>(),
             SaslAuthenticateRequest::header_version(api_version),
         ),
-        other => return Err(format!("api_key {} is not a SASL API", other)),
+        other => return Err(format!("api_key {other} is not a SASL API")),
     };
     if api_version < range.0 || api_version > range.1 {
         return Err(format!(
@@ -393,25 +393,22 @@ impl SaslSession {
                 let wanted = SaslMechanism::parse(mechanism)
                     .ok()
                     .filter(|m| self.mechanisms.contains(m));
-                match wanted {
-                    Some(m) => {
-                        self.state = State::AwaitingToken(m);
-                        SaslOutcome::Reply(handshake_response(
-                            correlation_id,
-                            api_version,
-                            ERROR_NONE,
-                            &self.mechanisms,
-                        ))
-                    }
-                    None => {
-                        self.state = State::Failed;
-                        SaslOutcome::ReplyAndClose(handshake_response(
-                            correlation_id,
-                            api_version,
-                            ERROR_UNSUPPORTED_SASL_MECHANISM,
-                            &self.mechanisms,
-                        ))
-                    }
+                if let Some(m) = wanted {
+                    self.state = State::AwaitingToken(m);
+                    SaslOutcome::Reply(handshake_response(
+                        correlation_id,
+                        api_version,
+                        ERROR_NONE,
+                        &self.mechanisms,
+                    ))
+                } else {
+                    self.state = State::Failed;
+                    SaslOutcome::ReplyAndClose(handshake_response(
+                        correlation_id,
+                        api_version,
+                        ERROR_UNSUPPORTED_SASL_MECHANISM,
+                        &self.mechanisms,
+                    ))
                 }
             }
             SaslRequest::Authenticate {
@@ -434,11 +431,11 @@ impl SaslSession {
                     State::AwaitingToken(SaslMechanism::Plain) => {
                         let creds = match parse_plain(auth_bytes) {
                             Ok(c) => c,
-                            Err(e) => return fail(format!("PLAIN: {}", e)),
+                            Err(e) => return fail(format!("PLAIN: {e}")),
                         };
                         let stored = match lookup.lookup(&creds.username, None).await {
                             Ok(s) => s,
-                            Err(e) => return fail(format!("PLAIN: {}", e)),
+                            Err(e) => return fail(format!("PLAIN: {e}")),
                         };
                         let username = creds.username.clone();
                         if check_password(creds, stored).await {
@@ -451,7 +448,7 @@ impl SaslSession {
                                     None,
                                     Bytes::new(),
                                 ),
-                                principal: format!("User:{}", username),
+                                principal: format!("User:{username}"),
                                 mechanism: "PLAIN",
                             }
                         } else {
@@ -503,7 +500,7 @@ impl SaslSession {
                                 mechanism: server.mechanism().name(),
                             }
                         }
-                        Err(e) => fail(format!("SCRAM: {}", e)),
+                        Err(e) => fail(format!("SCRAM: {e}")),
                     },
                     State::AwaitingHandshake => SaslOutcome::ReplyAndClose(authenticate_response(
                         correlation_id,

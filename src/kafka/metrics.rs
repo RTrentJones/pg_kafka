@@ -62,7 +62,7 @@ struct ApiCounters {
 }
 
 impl ApiCounters {
-    #[allow(clippy::declare_interior_mutable_const)] // only used as an array-repeat initializer
+    #[expect(clippy::declare_interior_mutable_const)] // only used as an array-repeat initializer
     const NEW: ApiCounters = ApiCounters {
         requests: AtomicU64::new(0),
         errors: AtomicU64::new(0),
@@ -295,7 +295,7 @@ fn to_i64(v: u64) -> i64 {
 impl FlushBatch {
     /// Column arrays for the `unnest()` in [`FLUSH_SQL`], in parameter order
     /// ($1 api_key, $2 api_name, $3 requests, $4 errors, $5 latency sum, $6 latency max).
-    #[allow(clippy::type_complexity)]
+    #[expect(clippy::type_complexity)]
     pub fn api_columns(
         &self,
     ) -> (
@@ -432,8 +432,7 @@ impl<'a> MetricsFlusher<'a> {
                 first.then(|| {
                     format!(
                         "Failed to publish broker metrics (kafka.broker_api_stats / \
-                         kafka.broker_gauges); retrying each interval, further failures not logged: {}",
-                        e
+                         kafka.broker_gauges); retrying each interval, further failures not logged: {e}"
                     )
                 })
             }
