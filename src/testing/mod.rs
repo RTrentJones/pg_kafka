@@ -1,20 +1,7 @@
-//! Testing utilities for pg_kafka
+//! Test doubles for unit tests that cannot use the PostgreSQL runtime.
 //!
-//! This module provides test infrastructure that works around pgrx's requirement
-//! for the PostgreSQL runtime. It's only compiled when running tests.
-//!
-//! # Organization
-//! - `mocks.rs` - Mock implementations of pgrx-dependent types
-//! - `helpers.rs` - Test helper functions for creating requests/responses
-//!
-//! # Logging Macros
-//! The conditional logging macros (`pg_log!`, `pg_warning!`) are defined in src/lib.rs
-//! and are available throughout the codebase.
+//! - [`mocks::MockKafkaStore`]: a storage double with mockall expectations.
 
 #![cfg(test)]
 
-pub mod helpers;
 pub mod mocks;
-
-// Re-export commonly used items
-pub use mocks::mock_config;
