@@ -72,6 +72,8 @@ pub const WORKER_TABLE_GRANTS: &[(&str, &[&str])] = &[
     ("kafka.shadow_metrics", &["SELECT", "INSERT", "UPDATE"]),
     // auth stream: SASL credential lookups (kafka/auth/credentials.rs), read only.
     ("kafka.sasl_credentials", &["SELECT"]),
+    // wave3 net: the unknown-user fake-credential secret (kafka/auth/credentials.rs).
+    ("kafka.sasl_server_secret", &["SELECT"]),
 ];
 
 /// Sequences behind the SERIAL/BIGSERIAL columns the worker inserts into, plus the

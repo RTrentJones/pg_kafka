@@ -297,29 +297,87 @@ impl ScramCredential {
     }
 }
 
-/// A per-process random key so the fake credential for an unknown user is stable for
-/// that user (a client probing twice sees the same salt) but not predictable.
+/// A per-process random key, the fallback when the durable secret
+/// (`kafka.sasl_server_secret`, read on the DB thread) is not available.
 fn fake_credential_secret() -> &'static [u8] {
     static SECRET: once_cell::sync::OnceCell<Vec<u8>> = once_cell::sync::OnceCell::new();
     SECRET.get_or_init(|| random_bytes(32))
 }
 
-/// A credential for a user that does not exist. A SCRAM exchange for an unknown user
-/// runs to the end with this (deterministic salt, default iteration count, random keys)
-/// and then fails exactly like a wrong password, so the server-first-message does not
-/// reveal which users exist.
+/// What the fake credential of an unknown user looks like on the wire (wave3 net): the
+/// salt length and iteration count are those most common among the stored credentials
+/// of the mechanism, and the salt is keyed by a durable secret, so it is stable for a
+/// username across worker restarts.
+#[derive(Clone, PartialEq, Eq)]
+pub struct FakeCredentialParams {
+    pub secret: Vec<u8>,
+    pub iterations: u32,
+    pub salt_len: usize,
+}
+
+impl std::fmt::Debug for FakeCredentialParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FakeCredentialParams")
+            .field("secret", &"[REDACTED]")
+            .field("iterations", &self.iterations)
+            .field("salt_len", &self.salt_len)
+            .finish()
+    }
+}
+
+impl FakeCredentialParams {
+    /// The defaults (no stored credential to imitate): what `pg_kafka_create_user`
+    /// generates, keyed by the per-process secret.
+    pub fn process_default() -> Self {
+        FakeCredentialParams {
+            secret: fake_credential_secret().to_vec(),
+            iterations: DEFAULT_ITERATIONS,
+            salt_len: SALT_LEN,
+        }
+    }
+}
+
+/// A credential for a user that does not exist, with the default parameters and the
+/// per-process secret. See [`fake_credential_with`].
 pub fn fake_credential(mechanism: ScramMechanism, username: &str) -> ScramCredential {
+    fake_credential_with(
+        mechanism,
+        username,
+        &FakeCredentialParams::process_default(),
+    )
+}
+
+/// A credential for a user that does not exist. A SCRAM exchange for an unknown user
+/// runs to the end with this (deterministic salt, imitated iteration count and salt
+/// length, random keys) and then fails exactly like a wrong password, so the
+/// server-first-message does not reveal which users exist. Residual leak (documented in
+/// docs/AUTHENTICATION.md): a real user whose iteration count or salt length differs
+/// from the most common one is recognizable as real.
+pub fn fake_credential_with(
+    mechanism: ScramMechanism,
+    username: &str,
+    params: &FakeCredentialParams,
+) -> ScramCredential {
     let mut msg = Vec::with_capacity(username.len() + 32);
     msg.extend_from_slice(b"pg_kafka-fake-salt:");
     msg.extend_from_slice(mechanism.name().as_bytes());
     msg.push(b':');
     msg.extend_from_slice(username.as_bytes());
-    let mut salt = hmac_bytes(ScramMechanism::Sha256, fake_credential_secret(), &msg);
-    salt.truncate(SALT_LEN);
+    // Expand HMAC output in counter mode to any salt length (1..=1024 bytes).
+    let salt_len = params.salt_len.clamp(1, 1024);
+    let mut salt = Vec::with_capacity(salt_len + 32);
+    let mut counter = 0u32;
+    while salt.len() < salt_len {
+        let mut block = msg.clone();
+        block.extend_from_slice(&counter.to_be_bytes());
+        salt.extend(hmac_bytes(ScramMechanism::Sha256, &params.secret, &block));
+        counter += 1;
+    }
+    salt.truncate(salt_len);
     ScramCredential {
         mechanism,
         salt,
-        iterations: DEFAULT_ITERATIONS,
+        iterations: params.iterations.clamp(MIN_ITERATIONS, MAX_ITERATIONS),
         stored_key: random_bytes(mechanism.key_len()),
         server_key: random_bytes(mechanism.key_len()),
     }
@@ -473,10 +531,27 @@ impl ScramServerState {
         credential: Option<ScramCredential>,
         server_nonce: &str,
     ) -> Self {
+        let fake = credential
+            .is_none()
+            .then(|| fake_credential(mechanism, &client_first.username));
+        Self::start(mechanism, client_first, credential, fake, server_nonce)
+    }
+
+    /// wave3 net: start an exchange with the stored credential, or (unknown user) with
+    /// `fake`, a fake credential built on the DB thread ([`fake_credential_with`]).
+    pub fn start(
+        mechanism: ScramMechanism,
+        client_first: ClientFirst,
+        credential: Option<ScramCredential>,
+        fake: Option<ScramCredential>,
+        server_nonce: &str,
+    ) -> Self {
+        let credential = credential.filter(|c| c.mechanism == mechanism);
         let unknown_user = credential.is_none();
-        let credential = credential
-            .filter(|c| c.mechanism == mechanism)
-            .unwrap_or_else(|| fake_credential(mechanism, &client_first.username));
+        let credential = credential.unwrap_or_else(|| {
+            fake.filter(|c| c.mechanism == mechanism)
+                .unwrap_or_else(|| fake_credential(mechanism, &client_first.username))
+        });
         let nonce = format!("{}{}", client_first.client_nonce, server_nonce);
         let server_first = format!(
             "r={},s={},i={}",
