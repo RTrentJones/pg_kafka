@@ -117,6 +117,15 @@ mod tests {
     }
 
     #[test]
+    fn test_forward_decision_variants_are_distinct_and_named() {
+        assert_eq!(ForwardDecision::Forward, ForwardDecision::Forward);
+        assert_eq!(ForwardDecision::Skip, ForwardDecision::Skip);
+        assert_ne!(ForwardDecision::Forward, ForwardDecision::Skip);
+        assert_eq!(format!("{:?}", ForwardDecision::Forward), "Forward");
+        assert_eq!(format!("{:?}", ForwardDecision::Skip), "Skip");
+    }
+
+    #[test]
     fn test_make_forward_decision_boundaries() {
         // 0% - always skip
         assert_eq!(

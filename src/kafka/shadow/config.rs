@@ -411,18 +411,32 @@ mod tests {
         cache.update(topic(1, ShadowMode::Shadow, 50));
         let got = cache.get(1).expect("cached");
         assert_eq!(got.topic_id, 1);
+        assert_eq!(got.topic_name, "topic-1");
         assert_eq!(got.forward_percentage, 50);
+        assert!(got.should_forward());
 
         // An update replaces the topic's entry.
         let mut changed = topic(1, ShadowMode::Shadow, 100);
         changed.external_topic_name = Some("prod-events".to_string());
         changed.sync_mode = SyncMode::Sync;
+        changed.write_mode = WriteMode::ExternalOnly;
         cache.update(changed);
         let got = cache.get(1).expect("cached");
         assert_eq!(got.forward_percentage, 100);
         assert_eq!(got.external_topic_name.as_deref(), Some("prod-events"));
         assert_eq!(got.sync_mode, SyncMode::Sync);
+        assert_eq!(got.write_mode, WriteMode::ExternalOnly);
+        assert!(got.should_forward());
         assert_eq!(cache.len(), 1);
+
+        // Every topic updated is held at once.
+        for id in 2..=5 {
+            cache.update(topic(id, ShadowMode::Shadow, 100));
+        }
+        assert_eq!(cache.len(), 5);
+        for id in 1..=5 {
+            assert_eq!(cache.get(id).expect("cached").topic_id, id);
+        }
 
         // A replace drops every topic it does not list.
         cache.update(topic(2, ShadowMode::Shadow, 100));

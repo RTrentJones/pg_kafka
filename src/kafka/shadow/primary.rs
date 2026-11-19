@@ -150,9 +150,13 @@ mod tests {
         status.check();
         assert!(status.is_cached());
 
-        // Refresh clears and re-checks
-        status.refresh();
+        // Refresh clears and re-checks; it returns the fresh result, and later
+        // checks return the same cached value.
+        let refreshed = status.refresh();
+        assert!(refreshed, "the test build's is_primary() is always true");
         assert!(status.is_cached()); // Re-cached after refresh
+        assert_eq!(status.check(), refreshed);
+        assert_eq!(status.check(), refreshed);
     }
 
     #[test]

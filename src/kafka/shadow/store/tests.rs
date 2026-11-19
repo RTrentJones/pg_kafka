@@ -176,12 +176,112 @@ fn test_reinit_drops_stale_epoch_pending_buffer() {
     );
 }
 
+/// Producer keys at the edges of both halves of the `(producer_id, epoch)`
+/// buffer key: distinct ids, distinct epochs of one id, and the extremes.
+const BOUNDARY_TXN_KEYS: [TxnKey; 8] = [
+    (1000, 0),
+    (1000, 1),
+    (1001, 0),
+    (1000, i16::MAX),
+    (1000, i16::MIN),
+    (i64::MAX, 0),
+    (i64::MIN, 0),
+    (0, 0),
+];
+
+fn store_with_buffers(mock: MockKafkaStore) -> ShadowStore<MockKafkaStore, InMemoryShadowDb> {
+    let store = ShadowStore::with_db(mock, InMemoryShadowDb::default());
+    {
+        let mut pending = store.pending_txn_messages.write().unwrap();
+        for key in BOUNDARY_TXN_KEYS {
+            pending.insert(key, PendingTxnBuffer::from(vec![buffered_record(1)]));
+        }
+    }
+    store
+}
+
+#[test]
+fn test_commit_removes_only_its_own_pending_buffer() {
+    let mut mock = MockKafkaStore::new();
+    mock.expect_commit_transaction()
+        .times(BOUNDARY_TXN_KEYS.len())
+        .returning(|_, _, _| Ok(()));
+    let store = store_with_buffers(mock);
+
+    for (done, &(producer_id, epoch)) in BOUNDARY_TXN_KEYS.iter().enumerate() {
+        store.commit_transaction("txn", producer_id, epoch).unwrap();
+        let pending = store.pending_txn_messages.read().unwrap();
+        assert!(
+            !pending.contains_key(&(producer_id, epoch)),
+            "{producer_id}/{epoch}"
+        );
+        for later in &BOUNDARY_TXN_KEYS[done + 1..] {
+            assert!(
+                pending.contains_key(later),
+                "{later:?} dropped by {producer_id}/{epoch}"
+            );
+        }
+    }
+    assert!(store.pending_txn_messages.read().unwrap().is_empty());
+}
+
+#[test]
+fn test_abort_discards_only_its_own_pending_buffer() {
+    let mut mock = MockKafkaStore::new();
+    mock.expect_abort_transaction()
+        .times(BOUNDARY_TXN_KEYS.len())
+        .returning(|_, _, _| Ok(()));
+    let store = store_with_buffers(mock);
+
+    for (done, &(producer_id, epoch)) in BOUNDARY_TXN_KEYS.iter().enumerate() {
+        store.abort_transaction("txn", producer_id, epoch).unwrap();
+        let pending = store.pending_txn_messages.read().unwrap();
+        assert!(
+            !pending.contains_key(&(producer_id, epoch)),
+            "{producer_id}/{epoch}"
+        );
+        assert_eq!(pending.len(), BOUNDARY_TXN_KEYS.len() - done - 1);
+    }
+}
+
+#[test]
+fn test_metrics_counters_are_safe_to_share_between_threads() {
+    let metrics = std::sync::Arc::new(ShadowMetrics::default());
+    let handles: Vec<_> = (0..10)
+        .map(|i| {
+            let m = std::sync::Arc::clone(&metrics);
+            std::thread::spawn(move || {
+                for _ in 0..100 {
+                    m.forwarded.fetch_add(1, Ordering::Relaxed);
+                }
+                if i % 2 == 0 {
+                    m.skipped.fetch_add(3, Ordering::Relaxed);
+                } else {
+                    m.failed.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    assert_eq!(metrics.forwarded.load(Ordering::Relaxed), 1000);
+    assert_eq!(metrics.skipped.load(Ordering::Relaxed), 15);
+    assert_eq!(metrics.failed.load(Ordering::Relaxed), 5);
+}
+
 #[test]
 fn test_metrics_flush_resets_the_counters() {
     let store = ShadowStore::with_db(MockKafkaStore::new(), InMemoryShadowDb::default());
+    assert_eq!(store.metrics.forwarded.load(Ordering::Relaxed), 0);
+    assert_eq!(store.metrics.skipped.load(Ordering::Relaxed), 0);
+    assert_eq!(store.metrics.failed.load(Ordering::Relaxed), 0);
     store.metrics.forwarded.fetch_add(10, Ordering::Relaxed);
     store.metrics.skipped.fetch_add(5, Ordering::Relaxed);
     store.metrics.failed.fetch_add(2, Ordering::Relaxed);
+    assert_eq!(store.metrics.forwarded.load(Ordering::Relaxed), 10);
+    assert_eq!(store.metrics.skipped.load(Ordering::Relaxed), 5);
+    assert_eq!(store.metrics.failed.load(Ordering::Relaxed), 2);
     store.flush_metrics_to_db().unwrap();
     assert_eq!(store.metrics.forwarded.load(Ordering::Relaxed), 0);
     assert_eq!(store.metrics.skipped.load(Ordering::Relaxed), 0);

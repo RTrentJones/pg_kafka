@@ -71,6 +71,9 @@ mod tests {
             ),
         ] {
             assert_eq!(err.to_string(), expected);
+            // ShadowError is a std error, so `?` can box it.
+            let boxed: Box<dyn std::error::Error> = Box::new(err);
+            assert_eq!(boxed.to_string(), expected);
         }
     }
 }
