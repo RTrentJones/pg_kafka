@@ -53,7 +53,7 @@ Version ranges below are the ones advertised in the ApiVersions response and enf
 | ListOffsets | 2 | <!--gen:api-vversions:ListOffsets-->v1-v7<!--/gen--> | ✅ Complete | Get earliest/latest/by-timestamp offsets |
 
 **Implementation Notes:**
-- ✅ ListOffsets supports special timestamps (-2 = earliest, -1 = latest: the LSO for read_committed, -3 = max timestamp, KIP-734) and arbitrary timestamp lookup (earliest offset whose record timestamp ≥ target; AUDIT-2026-06 BUG-7 + CONF-7), bounded by the readable end like Kafka; an unknown partition is UNKNOWN_TOPIC_OR_PARTITION
+- ✅ ListOffsets supports special timestamps (-2 = earliest, -1 = latest: the LSO for read_committed, -3 = max timestamp, KIP-734) and arbitrary timestamp lookup (earliest offset whose record timestamp ≥ target), bounded by the readable end like Kafka; an unknown partition is UNKNOWN_TOPIC_OR_PARTITION
 - ✅ OffsetFetch v7 `require_stable` (KIP-447): UNSTABLE_OFFSET_COMMIT for partitions with a pending transactional offset commit
 - ✅ Fetch returns records grouped into one RecordBatch per run of a producer's consecutive offsets, and a control batch over offsets a consumer cannot see (aborted, cleaned up) so its position reaches the end (see PROTOCOL_DEVIATIONS.md §7)
 - ✅ OffsetFetch limited to <!--gen:api-vversions:OffsetFetch-->v1-v7<!--/gen--> (v8+ requires different response format)

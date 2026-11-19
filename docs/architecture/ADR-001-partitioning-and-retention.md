@@ -38,7 +38,7 @@ Postgres only accepts a unique constraint on a partitioned table if it includes 
 key, so the parent has no primary key and no `UNIQUE (global_offset)`. What actually makes
 offsets unique has always been the allocator: `partition_offset` comes from
 `kafka.partition_offsets.next_offset`, read and advanced under the per-partition advisory lock
-and the counter row's lock in the same transaction, and never decremented (BUG-3);
+and the counter row's lock in the same transaction, and never decremented;
 `global_offset` comes from one sequence. As a backstop every leaf carries
 `UNIQUE (topic_id, partition_id, partition_offset)` and `UNIQUE (global_offset)` btrees
 (created by `kafka.create_message_partition` for every leaf, by bootstrap for the DEFAULT leaf,
