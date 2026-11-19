@@ -7,7 +7,7 @@
 //! change wholesale (the `delegate_*_store!` macros) and code that needs one concern
 //! can take just that role. Handlers stay testable against `MockKafkaStore`, and
 //! transaction boundaries stay with the caller: every method assumes it runs inside a
-//! transaction the background worker (or a `#[pg_extern]`) manages.
+//! transaction the background worker (or a SQL function) manages.
 //!
 //! [`PostgresStore`] is the implementation; the pure logic it relies on (header
 //! encoding, sequence validation, retention planning, the role grants) lives in

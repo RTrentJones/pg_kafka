@@ -2,7 +2,7 @@
 //!
 //! [`PostgresStore`] implements every storage role (see `roles`); the SQL for each
 //! concern lives in its own submodule as inherent methods. Every method assumes it runs
-//! inside a transaction the caller (the background worker, or a `#[pg_extern]`)
+//! inside a transaction the caller (the background worker, or a SQL function)
 //! manages.
 
 use std::cell::RefCell;
