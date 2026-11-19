@@ -13,6 +13,7 @@ mod basic;
 mod eos;
 mod invisible_offsets;
 mod isolation;
+mod timeouts;
 mod validation;
 
 /// The `transaction` tests, in run order.
@@ -44,5 +45,6 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         invisible_offsets::test_consumers_pass_delete_records_gap,
         invisible_offsets::test_read_committed_consumer_stops_at_open_transaction,
         validation::test_transactional_requests_are_validated,
+        timeouts::test_second_transaction_gets_its_own_timeout,
     ]
 }

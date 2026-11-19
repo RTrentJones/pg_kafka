@@ -124,6 +124,8 @@ pg_kafka.compression_type = 'gzip'
 - ✅ InitProducerId refuses a transaction timeout <= 0 or above
   `pg_kafka.transaction_max_timeout_ms` (Kafka's `transaction.max.timeout.ms`, default
   900000) with INVALID_TRANSACTION_TIMEOUT (50)
+- ✅ The transaction timeout (`transaction.timeout.ms`) runs from the start of each
+  transaction, as Kafka's does; the timeout sweep aborts an expired one
 - ✅ AddOffsetsToTxn includes consumer offsets in transaction
 - ✅ EndTxn commits or aborts atomically
 - ✅ TxnOffsetCommit commits offsets within transaction context
