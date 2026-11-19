@@ -73,6 +73,117 @@ pub struct State {
     pub committed_xids: std::collections::HashSet<u32>,
 }
 
+/// A claimable outbox row: pending, under the retry cap, its message still present.
+struct Candidate {
+    key: RowKey,
+    /// The forwarder holds it already (`OutboxClaim::inflight`).
+    in_flight: bool,
+    /// It failed and its retry backoff has not elapsed.
+    backing_off: bool,
+}
+
+impl State {
+    /// The claimable rows in key order (the `BTreeMap` order is the claim's
+    /// `ORDER BY topic_id, partition_id, local_offset`).
+    fn claim_candidates(&self, claim: &OutboxClaim, now: i64) -> Vec<Candidate> {
+        let inflight: std::collections::HashSet<RowKey> = claim
+            .inflight
+            .topic_ids
+            .iter()
+            .zip(&claim.inflight.partition_ids)
+            .zip(&claim.inflight.local_offsets)
+            .map(|((&t, &p), &o)| RowKey::new(t, p, o))
+            .collect();
+        self.tracking
+            .iter()
+            .filter(|(k, r)| {
+                r.external_offset.is_none()
+                    && r.retry_count < claim.max_retries
+                    && self.messages.contains_key(k)
+            })
+            .map(|(k, r)| Candidate {
+                key: *k,
+                in_flight: inflight.contains(k),
+                backing_off: !r.attempt_open
+                    && r.retry_count > 0
+                    && r.forwarded_at.is_some_and(|at| {
+                        at > now
+                            - retry_backoff_ms(
+                                r.retry_count,
+                                claim.backoff_base_ms,
+                                claim.backoff_max_ms,
+                            )
+                    }),
+            })
+            .collect()
+    }
+
+    /// Open a forward attempt on a claimed row and stamp `forwarded_at`. A row whose
+    /// previous attempt is still open lost its ack, and that attempt counts as one
+    /// failure.
+    fn open_attempt(&mut self, key: RowKey, now: i64) {
+        let row = self
+            .tracking
+            .get_mut(&key)
+            .expect("a claimed row is a tracking row");
+        if row.attempt_open {
+            row.retry_count += 1;
+        }
+        row.attempt_open = true;
+        row.forwarded_at = Some(now);
+    }
+
+    /// The record to forward for a claimed row, under the topic's external name (the
+    /// local name when none is configured); `None` when the topic is gone.
+    fn forward_record(&self, key: RowKey, restart: bool) -> Option<ForwardRecord> {
+        let topic_name = self.topics.get(&key.topic_id).cloned()?;
+        let external = self
+            .external_names
+            .get(&key.topic_id)
+            .cloned()
+            .flatten()
+            .unwrap_or(topic_name);
+        let m = &self.messages[&key];
+        Some(ForwardRecord {
+            row: key,
+            topic_name: external,
+            key: m.key.clone(),
+            value: m.value.clone(),
+            headers: m.headers.clone(),
+            timestamp_ms: m.timestamp_ms,
+            restart,
+        })
+    }
+}
+
+/// The candidates due now, at most `batch_limit`, each with its `restart` flag
+/// (it is its partition's lowest candidate). Rows in flight or backing off are not
+/// due, and a backing-off row that is not in flight blocks every later row of its
+/// partition, so a retry is never overtaken by a later record.
+fn due_rows(candidates: &[Candidate], batch_limit: i64) -> Vec<(RowKey, bool)> {
+    let mut head: HashMap<(i32, i32), i64> = HashMap::new();
+    let mut blocked: HashMap<(i32, i32), i64> = HashMap::new();
+    for c in candidates {
+        let part = c.key.partition();
+        head.entry(part).or_insert(c.key.local_offset);
+        if c.backing_off && !c.in_flight {
+            blocked.entry(part).or_insert(c.key.local_offset);
+        }
+    }
+    candidates
+        .iter()
+        .filter(|c| {
+            !c.in_flight
+                && !c.backing_off
+                && blocked
+                    .get(&c.key.partition())
+                    .is_none_or(|&b| c.key.local_offset < b)
+        })
+        .map(|c| (c.key, head[&c.key.partition()] == c.key.local_offset))
+        .take(usize::try_from(batch_limit).unwrap_or(0))
+        .collect()
+}
+
 /// In-memory [`ShadowDb`].
 #[derive(Default)]
 pub struct InMemoryShadowDb {
@@ -179,96 +290,20 @@ impl ShadowDb for InMemoryShadowDb {
     }
 
     fn claim_due_outbox_rows(&self, claim: &OutboxClaim) -> Result<Vec<ForwardRecord>> {
-        // cand: pending, under the cap, message exists (BTreeMap = key order).
-        struct Cand {
-            key: RowKey,
-            in_flight: bool,
-            backing_off: bool,
-        }
         let mut s = self.state();
         if s.fail_claim {
             return Err(KafkaError::Internal("claim failed".to_string()));
         }
         let now = s.now_ms;
-        let inflight: std::collections::HashSet<RowKey> = claim
-            .inflight
-            .topic_ids
-            .iter()
-            .zip(&claim.inflight.partition_ids)
-            .zip(&claim.inflight.local_offsets)
-            .map(|((&t, &p), &o)| RowKey::new(t, p, o))
-            .collect();
-        let cands: Vec<Cand> = s
-            .tracking
-            .iter()
-            .filter(|(k, r)| {
-                r.external_offset.is_none()
-                    && r.retry_count < claim.max_retries
-                    && s.messages.contains_key(k)
-            })
-            .map(|(k, r)| Cand {
-                key: *k,
-                in_flight: inflight.contains(k),
-                backing_off: !r.attempt_open
-                    && r.retry_count > 0
-                    && r.forwarded_at.is_some_and(|at| {
-                        at > now
-                            - retry_backoff_ms(
-                                r.retry_count,
-                                claim.backoff_base_ms,
-                                claim.backoff_max_ms,
-                            )
-                    }),
-            })
-            .collect();
-        let mut head: HashMap<(i32, i32), i64> = HashMap::new();
-        let mut blocked: HashMap<(i32, i32), i64> = HashMap::new();
-        for c in &cands {
-            let part = c.key.partition();
-            head.entry(part).or_insert(c.key.local_offset);
-            if c.backing_off && !c.in_flight {
-                blocked.entry(part).or_insert(c.key.local_offset);
-            }
-        }
-        let due: Vec<(RowKey, bool)> = cands
-            .iter()
-            .filter(|c| {
-                !c.in_flight
-                    && !c.backing_off
-                    && blocked
-                        .get(&c.key.partition())
-                        .is_none_or(|&b| c.key.local_offset < b)
-            })
-            .map(|c| (c.key, head[&c.key.partition()] == c.key.local_offset))
-            .take(usize::try_from(claim.batch_limit).unwrap_or(0))
-            .collect();
+        let candidates = s.claim_candidates(claim, now);
+        let due = due_rows(&candidates, claim.batch_limit);
         let mut out = Vec::new();
         for (key, restart) in due {
-            let row = s.tracking.get_mut(&key).unwrap();
-            if row.attempt_open {
-                row.retry_count += 1;
+            s.open_attempt(key, now);
+            // The JOIN with kafka.topics drops a row whose topic is gone.
+            if let Some(record) = s.forward_record(key, restart) {
+                out.push(record);
             }
-            row.attempt_open = true;
-            row.forwarded_at = Some(now);
-            let Some(topic_name) = s.topics.get(&key.topic_id).cloned() else {
-                continue; // JOIN kafka.topics drops it
-            };
-            let external = s
-                .external_names
-                .get(&key.topic_id)
-                .cloned()
-                .flatten()
-                .unwrap_or(topic_name);
-            let m = &s.messages[&key];
-            out.push(ForwardRecord {
-                row: key,
-                topic_name: external,
-                key: m.key.clone(),
-                value: m.value.clone(),
-                headers: m.headers.clone(),
-                timestamp_ms: m.timestamp_ms,
-                restart,
-            });
         }
         Ok(out)
     }
