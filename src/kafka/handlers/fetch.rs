@@ -92,14 +92,31 @@ pub(crate) fn encode_record_batches(
 
     let mut records: Vec<Record> = Vec::with_capacity(messages.len());
     let mut group_base = 0i64;
+    // Smallest and largest timestamp of the current batch: the encoder stores each
+    // record's timestamp as an i32 delta from the batch minimum, so a record that would
+    // stretch the span past i32::MAX milliseconds starts a new batch.
+    let mut group_timestamps = (0i64, 0i64);
     let mut previous: Option<(i64, Option<i64>, Option<i16>)> = None;
     for msg in messages {
         let producer = (msg.producer_id, msg.producer_epoch);
+        let span_fits = || {
+            let (min, max) = group_timestamps;
+            msg.timestamp
+                .max(max)
+                .saturating_sub(msg.timestamp.min(min))
+                <= i64::from(i32::MAX)
+        };
         let continues = previous.is_some_and(|(offset, pid, epoch)| {
             msg.partition_offset == offset + 1 && (pid, epoch) == producer
-        });
-        if !continues {
+        }) && span_fits();
+        if continues {
+            group_timestamps = (
+                group_timestamps.0.min(msg.timestamp),
+                group_timestamps.1.max(msg.timestamp),
+            );
+        } else {
             group_base = msg.partition_offset;
+            group_timestamps = (msg.timestamp, msg.timestamp);
         }
         previous = Some((msg.partition_offset, msg.producer_id, msg.producer_epoch));
         // The encoder keeps records in one batch while `offset - sequence` stays the
@@ -833,6 +850,24 @@ mod storage_stream_tests {
     #[test]
     fn crc32c_matches_the_standard_check_value() {
         assert_eq!(crc32c(b"123456789"), 0xE306_9283);
+    }
+
+    #[test]
+    fn timestamps_too_far_apart_start_a_new_batch() {
+        // A batch stores timestamps as i32 deltas from its minimum. A record stamped 0
+        // (a client that sent no time) followed by records stamped with the current
+        // time used to be grouped into one batch that could not be encoded, and every
+        // fetch of the partition failed.
+        let now = 1_795_078_665_492;
+        let mut rows: Vec<FetchedMessage> = (0..4).map(|o| msg(o, 10)).collect();
+        rows[1].timestamp = now;
+        rows[2].timestamp = now + 5;
+        rows[3].timestamp = now - i64::from(i32::MAX) - 1;
+        let bytes = encode_record_batches(rows, Compression::None).unwrap();
+        assert_eq!(
+            decode_batches(bytes),
+            vec![(0, 1, -1, false), (1, 2, -1, false), (3, 1, -1, false)]
+        );
     }
 
     #[test]

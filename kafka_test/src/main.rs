@@ -2376,6 +2376,9 @@ fn print_text_summary(suite_result: &SuiteResult) {
             let status = if test.passed { "PASSED" } else { "FAILED" };
             let duration = format!("({:.2}s)", test.duration_ms as f64 / 1000.0);
             println!("  {} - {} {}", test.name, status, duration);
+            if let Some(error) = &test.error {
+                println!("      error: {}", error);
+            }
         }
         println!(
             "  Category: {}/{} passed in {:.2}s\n",
