@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use super::lifecycle::NetworkFinished;
 use crate::kafka::auth::{CredentialRequest, SecuritySettings};
-use crate::kafka::listener::ListenerSecurity;
+use crate::kafka::listener::{ListenerSecurity, NetworkChannels};
 use crate::kafka::shadow::{ForwardAck, ForwardRequest, ShadowStore};
 use crate::kafka::{
     InternalNotification, KafkaRequest, PostgresStore, RequestLanes, RuntimeContext,
@@ -63,11 +63,7 @@ pub(super) struct Network {
 /// Everything the network thread takes ownership of.
 struct NetworkThreadParts {
     listeners: Vec<(std::net::TcpListener, Arc<ListenerSecurity>)>,
-    request_lanes: RequestLanes,
-    credential_tx: Sender<CredentialRequest>,
-    notify_rx: Receiver<InternalNotification>,
-    forward_rx: Receiver<ForwardRequest>,
-    forward_ack_tx: Sender<ForwardAck>,
+    channels: NetworkChannels,
     runtime_context: Arc<RuntimeContext>,
     shutdown_rx: std::sync::mpsc::Receiver<()>,
 }
@@ -110,14 +106,16 @@ pub(super) fn start(
 
     let parts = NetworkThreadParts {
         listeners: sockets.into_iter().zip(securities).collect(),
-        request_lanes: RequestLanes {
-            main: request_tx,
-            liveness: liveness_tx,
+        channels: NetworkChannels {
+            request_lanes: RequestLanes {
+                main: request_tx,
+                liveness: liveness_tx,
+            },
+            credential_tx,
+            notify_rx,
+            forward_rx,
+            forward_ack_tx,
         },
-        credential_tx,
-        notify_rx,
-        forward_rx,
-        forward_ack_tx,
         runtime_context,
         shutdown_rx,
     };
@@ -274,18 +272,11 @@ async fn serve(parts: NetworkThreadParts) {
             }
         }
     }
-    if let Err(e) = crate::kafka::listener::run(
+    crate::kafka::listener::run(
         tcp_listeners,
-        parts.request_lanes,
-        parts.credential_tx,
-        parts.notify_rx,
-        parts.forward_rx,
-        parts.forward_ack_tx,
+        parts.channels,
         parts.runtime_context,
         parts.shutdown_rx,
     )
-    .await
-    {
-        tracing::error!("TCP listener error: {}", e);
-    }
+    .await;
 }
