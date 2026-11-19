@@ -87,14 +87,10 @@ pub async fn test_long_poll_min_bytes_threshold() -> TestResult {
                     let value = msg
                         .payload()
                         .map(|v| String::from_utf8_lossy(v).to_string());
-                    if value
-                        .as_deref()
-                        .map(|v| v.starts_with("batch-"))
-                        .unwrap_or(false)
-                    {
+                    if value.as_deref().is_some_and(|v| v.starts_with("batch-")) {
                         received_clone.fetch_add(1, Ordering::SeqCst);
                         let elapsed = start.elapsed();
-                        println!("  Consumer received message in {:?}", elapsed);
+                        println!("  Consumer received message in {elapsed:?}");
                         if received_clone.load(Ordering::SeqCst) >= 3 {
                             return elapsed;
                         }
@@ -102,10 +98,10 @@ pub async fn test_long_poll_min_bytes_threshold() -> TestResult {
                 }
                 Ok(Err(e)) => {
                     if !e.to_string().contains("BrokerTransportFailure") {
-                        println!("  Consumer error: {}", e);
+                        println!("  Consumer error: {e}");
                     }
                 }
-                Err(_) => continue,
+                Err(_) => {}
             }
         }
         start.elapsed()
@@ -122,7 +118,7 @@ pub async fn test_long_poll_min_bytes_threshold() -> TestResult {
             .send(
                 FutureRecord::to(&topic_name)
                     .payload(&payload)
-                    .key(&format!("key-{}", i)),
+                    .key(&format!("key-{i}")),
                 Duration::from_secs(5),
             )
             .await
@@ -135,14 +131,13 @@ pub async fn test_long_poll_min_bytes_threshold() -> TestResult {
     let count = received.load(Ordering::SeqCst);
 
     println!("\nStep 4: Verifying behavior...");
-    println!("  Messages received: {}", count);
-    println!("  Time to receive: {:?}", duration);
+    println!("  Messages received: {count}");
+    println!("  Time to receive: {duration:?}");
 
     // Consumer should have received messages after batch accumulated
     assert!(
         count >= 3,
-        "Should receive at least 3 messages, got {}",
-        count
+        "Should receive at least 3 messages, got {count}"
     );
 
     ctx.cleanup().await?;
@@ -241,10 +236,7 @@ pub async fn test_long_poll_timeout_precision() -> TestResult {
 
     let total_duration = start.elapsed();
     println!("\nStep 4: Verifying behavior...");
-    println!(
-        "  Total time for {} polls: {:?}",
-        poll_count, total_duration
-    );
+    println!("  Total time for {poll_count} polls: {total_duration:?}");
 
     // Should complete all polls reasonably quickly
     assert!(
@@ -345,18 +337,17 @@ pub async fn test_long_poll_consumer_disconnect() -> TestResult {
     let start = Instant::now();
     let mut received = false;
     while start.elapsed() < Duration::from_secs(5) {
-        match tokio::time::timeout(Duration::from_millis(500), consumer2.recv()).await {
-            Ok(Ok(msg)) => {
-                let value = msg
-                    .payload()
-                    .map(|v| String::from_utf8_lossy(v).to_string());
-                if value.as_deref() == Some("test-message") {
-                    received = true;
-                    println!("  ✅ New consumer received message");
-                    break;
-                }
+        if let Ok(Ok(msg)) =
+            tokio::time::timeout(Duration::from_millis(500), consumer2.recv()).await
+        {
+            let value = msg
+                .payload()
+                .map(|v| String::from_utf8_lossy(v).to_string());
+            if value.as_deref() == Some("test-message") {
+                received = true;
+                println!("  ✅ New consumer received message");
+                break;
             }
-            _ => continue,
         }
     }
 
@@ -433,22 +424,21 @@ pub async fn test_long_poll_multiple_consumers_same_partition() -> TestResult {
         let handle = tokio::spawn(async move {
             let start = Instant::now();
             while start.elapsed() < Duration::from_secs(5) {
-                match tokio::time::timeout(Duration::from_millis(100), consumer.recv()).await {
-                    Ok(Ok(msg)) => {
-                        let value = msg
-                            .payload()
-                            .map(|v| String::from_utf8_lossy(v).to_string());
-                        if value.as_deref() == Some("broadcast-message") {
-                            count.fetch_add(1, Ordering::SeqCst);
-                            println!(
-                                "  Consumer {} received broadcast in {:?}",
-                                i + 1,
-                                start.elapsed()
-                            );
-                            return true;
-                        }
+                if let Ok(Ok(msg)) =
+                    tokio::time::timeout(Duration::from_millis(100), consumer.recv()).await
+                {
+                    let value = msg
+                        .payload()
+                        .map(|v| String::from_utf8_lossy(v).to_string());
+                    if value.as_deref() == Some("broadcast-message") {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        println!(
+                            "  Consumer {} received broadcast in {:?}",
+                            i + 1,
+                            start.elapsed()
+                        );
+                        return true;
                     }
-                    _ => continue,
                 }
             }
             false
@@ -481,13 +471,12 @@ pub async fn test_long_poll_multiple_consumers_same_partition() -> TestResult {
     }
 
     println!("\nStep 5: Verifying results...");
-    println!("  Consumers that received message: {}/3", success_count);
+    println!("  Consumers that received message: {success_count}/3");
 
     // At least 2 of 3 consumers should receive (accounting for timing)
     assert!(
         success_count >= 2,
-        "At least 2 of 3 consumers should receive the broadcast, got {}",
-        success_count
+        "At least 2 of 3 consumers should receive the broadcast, got {success_count}"
     );
 
     ctx.cleanup().await?;
@@ -521,8 +510,8 @@ pub async fn test_long_poll_auto_commit_interval() -> TestResult {
         producer
             .send(
                 FutureRecord::to(&topic.name)
-                    .payload(&format!("message-{}", i))
-                    .key(&format!("key-{}", i)),
+                    .payload(&format!("message-{i}"))
+                    .key(&format!("key-{i}")),
                 Duration::from_secs(5),
             )
             .await
@@ -552,22 +541,20 @@ pub async fn test_long_poll_auto_commit_interval() -> TestResult {
     let mut consumed = 0;
     let start = Instant::now();
     while consumed < 3 && start.elapsed() < Duration::from_secs(5) {
-        match tokio::time::timeout(Duration::from_millis(500), consumer.recv()).await {
-            Ok(Ok(msg)) => {
-                let value = msg
-                    .payload()
-                    .map(|v| String::from_utf8_lossy(v).to_string());
-                if let Some(v) = value {
-                    if v.starts_with("message-") {
-                        consumed += 1;
-                        println!("  Consumed: {}", v);
-                    }
+        if let Ok(Ok(msg)) = tokio::time::timeout(Duration::from_millis(500), consumer.recv()).await
+        {
+            let value = msg
+                .payload()
+                .map(|v| String::from_utf8_lossy(v).to_string());
+            if let Some(v) = value {
+                if v.starts_with("message-") {
+                    consumed += 1;
+                    println!("  Consumed: {v}");
                 }
             }
-            _ => continue,
         }
     }
-    println!("  Consumed {} messages", consumed);
+    println!("  Consumed {consumed} messages");
 
     // Wait for auto-commit interval
     println!("\nStep 4: Waiting for auto-commit interval (3s)...");
@@ -601,7 +588,7 @@ pub async fn test_long_poll_auto_commit_interval() -> TestResult {
     match offset_result {
         Some(row) => {
             let offset: i64 = row.get(0);
-            println!("  Committed offset: {}", offset);
+            println!("  Committed offset: {offset}");
             assert!(offset >= 1, "Should have auto-committed after consuming");
         }
         None => {

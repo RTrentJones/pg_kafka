@@ -1,20 +1,20 @@
-//! Wave 3 (txn): consumers move past offsets they cannot see.
+//! Consumers move past offsets they cannot see.
 //!
 //! pg_kafka filters aborted rows server-side and writes no transaction markers, so an
 //! aborted range at the end of a partition (or rows deleted by the aborted-row cleanup)
-//! left a fetch with nothing to return: the consumer re-fetched the same offset forever,
-//! its position and committed offset never reached the end, and its lag stayed above 0.
-//! A fetch that finds nothing visible below its readable end (the LSO for
-//! read_committed, the high watermark otherwise) now returns a control batch covering
-//! the hidden offsets. Each test drives a real rdkafka consumer to the end and checks
+//! leaves a fetch nothing to return; without help the consumer re-fetches the same
+//! offset forever and its lag never reaches 0. A fetch that finds nothing visible below
+//! its readable end (the LSO for read_committed, the high watermark otherwise) returns a
+//! control batch covering the hidden offsets. Each test drives a real rdkafka consumer to the end and checks
 //! its position and committed offset; the open-transaction test checks that it still
 //! stops at the LSO.
 
-use super::wire::{batch_headers, Wire};
 use crate::common::TestResult;
 use crate::common::{create_producer, create_transactional_producer, get_bootstrap_servers};
 use crate::fixtures::TestTopicBuilder;
 use crate::setup::TestContext;
+use crate::wire::records::batch_headers;
+use crate::wire::Wire;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, CommitMode, Consumer};
 use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
@@ -116,25 +116,20 @@ async fn assert_reaches_end(
     end: i64,
     expected: &[&str],
 ) -> TestResult {
-    let group = ctx.unique_group("w3-txn-end").await;
+    let group = ctx.unique_group("txn-end").await;
     let c = consumer(&group, isolation)?;
     let (values, pos) = consume_to(&c, topic, end, Duration::from_secs(20))?;
-    println!(
-        "  {}: values={:?} position={} (end {})",
-        isolation, values, pos, end
-    );
+    println!("  {isolation}: values={values:?} position={pos} (end {end})");
     assert_eq!(
         values, expected,
-        "{} consumer read the wrong records",
-        isolation
+        "{isolation} consumer read the wrong records"
     );
-    assert_eq!(pos, end, "{} consumer stalled before the end", isolation);
+    assert_eq!(pos, end, "{isolation} consumer stalled before the end");
     c.commit_consumer_state(CommitMode::Sync)?;
     let committed = committed(ctx, &group, topic).await?;
     assert_eq!(
         committed, end,
-        "{} committed offset (lag must be 0)",
-        isolation
+        "{isolation} committed offset (lag must be 0)"
     );
     Ok(())
 }
@@ -150,14 +145,11 @@ async fn high_watermark(
 }
 
 /// Aborted transaction at the end of the partition.
-pub async fn test_w3_read_committed_passes_aborted_tail() -> TestResult {
+pub async fn test_read_committed_consumer_passes_aborted_tail() -> TestResult {
     println!("=== Test: read_committed consumer passes an aborted tail ===\n");
     let ctx = TestContext::new().await?;
-    let topic = TestTopicBuilder::new(&ctx, "w3-txn-tail")
-        .build()
-        .await?
-        .name;
-    let txn_id = ctx.unique_topic("w3-txn-tail-tx").await;
+    let topic = TestTopicBuilder::new(&ctx, "txn-tail").build().await?.name;
+    let txn_id = ctx.unique_topic("txn-tail-tx").await;
     let p = create_transactional_producer(&txn_id)?;
     p.init_transactions(Duration::from_secs(10))?;
     txn(&p, &topic, &["a", "b", "c"], true).await?;
@@ -172,7 +164,7 @@ pub async fn test_w3_read_committed_passes_aborted_tail() -> TestResult {
         "LSO = HWM after the abort"
     );
     // On the wire: one batch with the committed records, then a marker batch covering
-    // the aborted offsets 3..=4 (was: an empty response, forever).
+    // the aborted offsets 3..=4.
     let pd = wire.fetch(&topic, 0, 3, 1).await?;
     let records = pd.records.clone().unwrap_or_default();
     assert_eq!(batch_headers(&records), vec![(3, 1, 1)]);
@@ -197,14 +189,11 @@ pub async fn test_w3_read_committed_passes_aborted_tail() -> TestResult {
 }
 
 /// Aborted transaction between two committed ones.
-pub async fn test_w3_read_committed_passes_aborted_middle() -> TestResult {
+pub async fn test_read_committed_consumer_passes_aborted_middle() -> TestResult {
     println!("=== Test: read_committed consumer passes an aborted transaction in the middle ===\n");
     let ctx = TestContext::new().await?;
-    let topic = TestTopicBuilder::new(&ctx, "w3-txn-mid")
-        .build()
-        .await?
-        .name;
-    let txn_id = ctx.unique_topic("w3-txn-mid-tx").await;
+    let topic = TestTopicBuilder::new(&ctx, "txn-mid").build().await?.name;
+    let txn_id = ctx.unique_topic("txn-mid-tx").await;
     let p = create_transactional_producer(&txn_id)?;
     p.init_transactions(Duration::from_secs(10))?;
     txn(&p, &topic, &["a"], true).await?;
@@ -221,14 +210,11 @@ pub async fn test_w3_read_committed_passes_aborted_middle() -> TestResult {
 
 /// Aborted rows deleted by the cleanup (retention sweep): read_uncommitted consumers
 /// see a hole at the tail too.
-pub async fn test_w3_consumers_pass_cleaned_up_aborted_rows() -> TestResult {
+pub async fn test_consumers_pass_cleaned_up_aborted_rows() -> TestResult {
     println!("=== Test: consumers pass aborted rows deleted by the cleanup ===\n");
     let ctx = TestContext::new().await?;
-    let topic = TestTopicBuilder::new(&ctx, "w3-txn-clean")
-        .build()
-        .await?
-        .name;
-    let txn_id = ctx.unique_topic("w3-txn-clean-tx").await;
+    let topic = TestTopicBuilder::new(&ctx, "txn-clean").build().await?.name;
+    let txn_id = ctx.unique_topic("txn-clean-tx").await;
     let p = create_transactional_producer(&txn_id)?;
     p.init_transactions(Duration::from_secs(10))?;
     txn(&p, &topic, &["a"], true).await?;
@@ -259,13 +245,10 @@ pub async fn test_w3_consumers_pass_cleaned_up_aborted_rows() -> TestResult {
 
 /// DeleteRecords up to the end, then an aborted transaction: a consumer starting from
 /// the log start sees nothing and must still reach the end.
-pub async fn test_w3_consumers_pass_delete_records_gap() -> TestResult {
+pub async fn test_consumers_pass_delete_records_gap() -> TestResult {
     println!("=== Test: consumers pass a DeleteRecords gap followed by an abort ===\n");
     let ctx = TestContext::new().await?;
-    let topic = TestTopicBuilder::new(&ctx, "w3-txn-del")
-        .build()
-        .await?
-        .name;
+    let topic = TestTopicBuilder::new(&ctx, "txn-del").build().await?.name;
     let plain = create_producer()?;
     for v in ["p0", "p1", "p2"] {
         plain
@@ -279,7 +262,7 @@ pub async fn test_w3_consumers_pass_delete_records_gap() -> TestResult {
     let mut wire = Wire::connect().await?;
     let (err, low) = wire.delete_records(&topic, 0, 3).await?;
     assert_eq!((err, low), (0, 3));
-    let txn_id = ctx.unique_topic("w3-txn-del-tx").await;
+    let txn_id = ctx.unique_topic("txn-del-tx").await;
     let p = create_transactional_producer(&txn_id)?;
     p.init_transactions(Duration::from_secs(10))?;
     txn(&p, &topic, &["x", "y"], false).await?;
@@ -293,14 +276,11 @@ pub async fn test_w3_consumers_pass_delete_records_gap() -> TestResult {
 
 /// An open transaction still blocks read_committed consumers at the LSO, and they
 /// continue once it commits.
-pub async fn test_w3_read_committed_stops_at_open_transaction() -> TestResult {
+pub async fn test_read_committed_consumer_stops_at_open_transaction() -> TestResult {
     println!("=== Test: read_committed consumer stops at an open transaction ===\n");
     let ctx = TestContext::new().await?;
-    let topic = TestTopicBuilder::new(&ctx, "w3-txn-open")
-        .build()
-        .await?
-        .name;
-    let txn_id = ctx.unique_topic("w3-txn-open-tx").await;
+    let topic = TestTopicBuilder::new(&ctx, "txn-open").build().await?.name;
+    let txn_id = ctx.unique_topic("txn-open-tx").await;
     let p = create_transactional_producer(&txn_id)?;
     p.init_transactions(Duration::from_secs(10))?;
     txn(&p, &topic, &["a"], true).await?;
@@ -330,7 +310,7 @@ pub async fn test_w3_read_committed_stops_at_open_transaction() -> TestResult {
         "nothing past the LSO"
     );
 
-    let group = ctx.unique_group("w3-txn-open").await;
+    let group = ctx.unique_group("txn-open").await;
     let c = consumer(&group, "read_committed")?;
     let (values, pos) = consume_to(&c, &topic, 3, Duration::from_secs(4))?;
     assert_eq!(values, vec!["a"]);

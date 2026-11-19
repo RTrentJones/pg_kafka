@@ -21,7 +21,7 @@ pub async fn test_list_offsets_by_timestamp() -> TestResult {
     let base: i64 = 1_600_000_000_000; // 2020-09-13
     let mut partition = 0i32;
     for i in 0..3i64 {
-        let payload = format!("m{}", i);
+        let payload = format!("m{i}");
         let (p, _off) = producer
             .send(
                 FutureRecord::to(&topic)
@@ -34,7 +34,7 @@ pub async fn test_list_offsets_by_timestamp() -> TestResult {
             .map_err(|(e, _msg)| e)?;
         partition = p;
     }
-    println!("Produced 3 records at {}, +1000, +2000 ms", base);
+    println!("Produced 3 records at {base}, +1000, +2000 ms");
 
     let consumer = create_base_consumer("listoffsets-ts-probe")?;
 
@@ -48,22 +48,22 @@ pub async fn test_list_offsets_by_timestamp() -> TestResult {
             .ok_or("partition missing from offsets_for_times result")?;
         match elem.offset() {
             Offset::Offset(o) => Ok(o),
-            other => Err(format!("expected a concrete offset, got {:?}", other).into()),
+            other => Err(format!("expected a concrete offset, got {other:?}").into()),
         }
     };
 
     // base+1500 lies between record 1 (base+1000) and record 2 (base+2000): earliest at/after is 2.
     let mid = resolve(base + 1500)?;
-    println!("offset for base+1500 = {} (expected 2)", mid);
+    println!("offset for base+1500 = {mid} (expected 2)");
     if mid != 2 {
-        return Err(format!("CONF-7: expected offset 2 for base+1500, got {}", mid).into());
+        return Err(format!("CONF-7: expected offset 2 for base+1500, got {mid}").into());
     }
 
     // base-1 is before all records: the earliest offset is 0.
     let early = resolve(base - 1)?;
-    println!("offset for base-1 = {} (expected 0)", early);
+    println!("offset for base-1 = {early} (expected 0)");
     if early != 0 {
-        return Err(format!("CONF-7: expected offset 0 for base-1, got {}", early).into());
+        return Err(format!("CONF-7: expected offset 0 for base-1, got {early}").into());
     }
 
     println!("✅ ListOffsets resolves timestamps to offsets");

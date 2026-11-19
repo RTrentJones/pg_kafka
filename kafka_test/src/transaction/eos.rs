@@ -3,6 +3,7 @@
 //! Tests for consume-process-produce loop with transactional offset commits.
 //! This validates TxnOffsetCommit API functionality.
 
+use crate::common::to_i64;
 use crate::common::{create_db_client, create_producer, create_transactional_producer, TestResult};
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, Consumer};
@@ -89,10 +90,10 @@ pub async fn test_txn_offset_commit() -> TestResult {
             Some(Ok(msg)) => {
                 last_offset = msg.offset();
                 consumed_count += 1;
-                println!("  Consumed message at offset {}", last_offset);
+                println!("  Consumed message at offset {last_offset}");
             }
             Some(Err(e)) => {
-                println!("  Consumer error: {}", e);
+                println!("  Consumer error: {e}");
                 break;
             }
             None => {
@@ -108,10 +109,7 @@ pub async fn test_txn_offset_commit() -> TestResult {
         "Should consume all {} messages",
         source_messages.len()
     );
-    println!(
-        "  Consumed {} messages, last offset: {}\n",
-        consumed_count, last_offset
-    );
+    println!("  Consumed {consumed_count} messages, last offset: {last_offset}\n");
 
     // Step 3: Create transactional producer and begin transaction
     println!("Step 3: Beginning transaction...");
@@ -123,7 +121,7 @@ pub async fn test_txn_offset_commit() -> TestResult {
     // Step 4: Produce processed messages to destination topic
     println!("Step 4: Producing processed messages to destination...");
     for i in 0..consumed_count {
-        let processed = format!("processed-{}", i);
+        let processed = format!("processed-{i}");
         txn_producer
             .send(
                 FutureRecord::to(&dest_topic).payload(&processed).key("key"),
@@ -131,7 +129,7 @@ pub async fn test_txn_offset_commit() -> TestResult {
             )
             .await
             .map_err(|(e, _)| e)?;
-        println!("  Produced processed message {}", i);
+        println!("  Produced processed message {i}");
     }
     println!();
 
@@ -145,22 +143,17 @@ pub async fn test_txn_offset_commit() -> TestResult {
 
     // Get consumer group metadata and send offsets to transaction
     let cgm = consumer.group_metadata();
-    match cgm {
-        Some(metadata) => {
-            txn_producer.send_offsets_to_transaction(
-                &commit_tpl,
-                &metadata,
-                Duration::from_secs(10),
-            )?;
-            println!("  Sent offset {} to transaction\n", commit_offset);
-        }
-        None => {
-            // If group_metadata returns None, we can still test via database verification
-            println!(
-                "  Note: group_metadata() returned None, skipping send_offsets_to_transaction"
-            );
-            println!("  Will verify via database instead\n");
-        }
+    if let Some(metadata) = cgm {
+        txn_producer.send_offsets_to_transaction(
+            &commit_tpl,
+            &metadata,
+            Duration::from_secs(10),
+        )?;
+        println!("  Sent offset {commit_offset} to transaction\n");
+    } else {
+        // If group_metadata returns None, we can still test via database verification
+        println!("  Note: group_metadata() returned None, skipping send_offsets_to_transaction");
+        println!("  Will verify via database instead\n");
     }
 
     // Step 6: Commit transaction
@@ -189,10 +182,10 @@ pub async fn test_txn_offset_commit() -> TestResult {
         .await?
         .get(0);
 
-    println!("  Destination messages visible: {}", dest_count);
+    println!("  Destination messages visible: {dest_count}");
     assert_eq!(
         dest_count,
-        source_messages.len() as i64,
+        to_i64(source_messages.len()),
         "All {} processed messages should be visible",
         source_messages.len()
     );
@@ -216,37 +209,31 @@ pub async fn test_txn_offset_commit() -> TestResult {
         )
         .await?;
 
-    match committed_offset_row {
-        Some(row) => {
-            let committed: i64 = row.get(0);
-            println!(
-                "  Consumer offset committed: {} (expected: {})",
-                committed, commit_offset
-            );
-            assert_eq!(
-                committed, commit_offset,
-                "Committed offset should match expected"
-            );
-            println!("  Consumer offset correctly committed as part of transaction\n");
-        }
-        None => {
-            // Check if offsets are in pending table (transaction not fully processed)
-            let pending_row = client
-                .query_opt(
-                    "SELECT pending_offset FROM kafka.txn_pending_offsets
-                     WHERE transactional_id = $1 AND group_id = $2",
-                    &[&txn_id, &group_id],
-                )
-                .await?;
+    if let Some(row) = committed_offset_row {
+        let committed: i64 = row.get(0);
+        println!("  Consumer offset committed: {committed} (expected: {commit_offset})");
+        assert_eq!(
+            committed, commit_offset,
+            "Committed offset should match expected"
+        );
+        println!("  Consumer offset correctly committed as part of transaction\n");
+    } else {
+        // Check if offsets are in pending table (transaction not fully processed)
+        let pending_row = client
+            .query_opt(
+                "SELECT pending_offset FROM kafka.txn_pending_offsets
+                 WHERE transactional_id = $1 AND group_id = $2",
+                &[&txn_id, &group_id],
+            )
+            .await?;
 
-            if pending_row.is_some() {
-                return Err("Offset still pending after transaction commit".into());
-            }
-
-            // If no offset in either table but group_metadata was None, that's OK
-            println!("  Note: No committed offset found (group_metadata may have been None)");
-            println!("  Destination messages verified as committed\n");
+        if pending_row.is_some() {
+            return Err("Offset still pending after transaction commit".into());
         }
+
+        // If no offset in either table but group_metadata was None, that's OK
+        println!("  Note: No committed offset found (group_metadata may have been None)");
+        println!("  Destination messages verified as committed\n");
     }
 
     // Verify transaction state
@@ -258,7 +245,7 @@ pub async fn test_txn_offset_commit() -> TestResult {
         .await?;
     let txn_state: String = txn_state_row.get(0);
 
-    println!("  Transaction state: {}", txn_state);
+    println!("  Transaction state: {txn_state}");
     assert_eq!(
         txn_state, "CompleteCommit",
         "Transaction should be in CompleteCommit state"

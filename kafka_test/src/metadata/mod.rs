@@ -1,5 +1,7 @@
 //! Metadata API edge case tests
 
+mod corrupt_partition_count;
+
 use crate::common::{create_producer, TestResult};
 use crate::setup::TestContext;
 use rdkafka::consumer::{Consumer, StreamConsumer};
@@ -44,7 +46,11 @@ pub async fn test_metadata_all_topics() -> TestResult {
     println!("Step 2: Fetched metadata for all topics\n");
 
     // Verify our topics are in the list
-    let topic_names: Vec<&str> = metadata.topics().iter().map(|t| t.name()).collect();
+    let topic_names: Vec<&str> = metadata
+        .topics()
+        .iter()
+        .map(rdkafka::metadata::MetadataTopic::name)
+        .collect();
 
     assert!(
         topic_names.contains(&topic1.as_str()),
@@ -130,7 +136,7 @@ pub async fn test_metadata_refresh_after_create() -> TestResult {
     let initial_metadata = consumer.fetch_metadata(None, Duration::from_secs(5))?;
     let initial_count = initial_metadata.topics().len();
 
-    println!("Step 1: Initial metadata has {} topics\n", initial_count);
+    println!("Step 1: Initial metadata has {initial_count} topics\n");
 
     // Create a new topic
     let new_topic = ctx.unique_topic("newmeta").await;
@@ -143,16 +149,13 @@ pub async fn test_metadata_refresh_after_create() -> TestResult {
         .await
         .map_err(|(e, _)| e)?;
 
-    println!("Step 2: Created new topic: {}\n", new_topic);
+    println!("Step 2: Created new topic: {new_topic}\n");
 
     // Fetch metadata again
     let refreshed_metadata = consumer.fetch_metadata(None, Duration::from_secs(5))?;
     let refreshed_count = refreshed_metadata.topics().len();
 
-    println!(
-        "Step 3: Refreshed metadata has {} topics\n",
-        refreshed_count
-    );
+    println!("Step 3: Refreshed metadata has {refreshed_count} topics\n");
 
     // Verify new topic appears
     let has_new_topic = refreshed_metadata
@@ -173,4 +176,14 @@ pub async fn test_metadata_refresh_after_create() -> TestResult {
     println!("✅ New topic found in refreshed metadata\n");
     println!("✅ Test PASSED\n");
     Ok(())
+}
+
+/// The `metadata` tests, in run order.
+pub fn tests() -> Vec<crate::registry::TestDef> {
+    crate::test_defs!["metadata";
+        test_metadata_all_topics,
+        test_metadata_nonexistent_topic,
+        test_metadata_refresh_after_create,
+        corrupt_partition_count::test_metadata_survives_corrupt_partition_count: sequential, // drops and restores the CHECK constraint on kafka.topics
+    ]
 }

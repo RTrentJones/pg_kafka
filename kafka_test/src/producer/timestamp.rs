@@ -34,10 +34,7 @@ pub async fn test_producer_timestamp_roundtrip() -> TestResult {
         )
         .await
         .map_err(|(err, _msg)| err)?;
-    println!(
-        "Produced at partition={}, offset={}, ts={}",
-        partition, offset, expected_ts
-    );
+    println!("Produced at partition={partition}, offset={offset}, ts={expected_ts}");
 
     let consumer = create_base_consumer("ts-probe")?;
     let mut assignment = TopicPartitionList::new();
@@ -51,11 +48,10 @@ pub async fn test_producer_timestamp_roundtrip() -> TestResult {
                 Timestamp::CreateTime(ms) | Timestamp::LogAppendTime(ms) => Some(ms),
                 Timestamp::NotAvailable => None,
             };
-            println!("Consumed timestamp = {:?} (expected {})", ts, expected_ts);
+            println!("Consumed timestamp = {ts:?} (expected {expected_ts})");
             if ts != Some(expected_ts) {
                 return Err(format!(
-                    "BUG-7 regression: expected record timestamp {}, got {:?} (broker insert time?)",
-                    expected_ts, ts
+                    "BUG-7 regression: expected record timestamp {expected_ts}, got {ts:?} (broker insert time?)"
                 )
                 .into());
             }

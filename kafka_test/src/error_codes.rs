@@ -1,0 +1,27 @@
+//! Kafka protocol error codes the tests expect, as in the Kafka protocol guide.
+
+pub const UNKNOWN_SERVER_ERROR: i16 = -1;
+pub const NONE: i16 = 0;
+pub const OFFSET_OUT_OF_RANGE: i16 = 1;
+pub const UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
+pub const INVALID_TOPIC_EXCEPTION: i16 = 17;
+pub const INVALID_REQUIRED_ACKS: i16 = 21;
+pub const ILLEGAL_GENERATION: i16 = 22;
+pub const INCONSISTENT_GROUP_PROTOCOL: i16 = 23;
+pub const UNKNOWN_MEMBER_ID: i16 = 25;
+pub const REBALANCE_IN_PROGRESS: i16 = 27;
+pub const UNSUPPORTED_SASL_MECHANISM: i16 = 33;
+pub const ILLEGAL_SASL_STATE: i16 = 34;
+pub const UNSUPPORTED_VERSION: i16 = 35;
+pub const INVALID_PARTITIONS: i16 = 37;
+pub const INVALID_REPLICATION_FACTOR: i16 = 38;
+pub const INVALID_CONFIG: i16 = 40;
+pub const INVALID_REQUEST: i16 = 42;
+pub const OUT_OF_ORDER_SEQUENCE_NUMBER: i16 = 45;
+pub const INVALID_PRODUCER_EPOCH: i16 = 47;
+pub const INVALID_TXN_STATE: i16 = 48;
+pub const INVALID_TRANSACTION_TIMEOUT: i16 = 50;
+pub const OPERATION_NOT_ATTEMPTED: i16 = 55;
+pub const SASL_AUTHENTICATION_FAILED: i16 = 58;
+pub const GROUP_ID_NOT_FOUND: i16 = 69;
+pub const UNSTABLE_OFFSET_COMMIT: i16 = 88;

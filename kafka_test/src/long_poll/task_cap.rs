@@ -17,16 +17,16 @@
 //! Pre-cap builds long-poll all 80, so all 80 would contain the record; the
 //! capped build yields exactly 64 with records / 16 empty.
 
+use crate::common::to_i32;
 use crate::common::{create_producer, get_bootstrap_servers, TestResult};
 use crate::setup::TestContext;
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use crate::wire::{read_response, request_frame};
 use kafka_protocol::messages::fetch_request::{FetchPartition, FetchRequest, FetchTopic};
-use kafka_protocol::messages::fetch_response::FetchResponse;
-use kafka_protocol::messages::{RequestHeader, TopicName};
-use kafka_protocol::protocol::{Decodable, Encodable, StrBytes};
+use kafka_protocol::messages::TopicName;
+use kafka_protocol::protocol::StrBytes;
 use rdkafka::producer::FutureRecord;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
 /// Must exceed listener.rs MAX_LONG_POLLS_PER_CONNECTION (64).
@@ -34,8 +34,8 @@ const PIPELINED_FETCHES: usize = 80;
 const EXPECTED_LONG_POLLED: usize = 64;
 const FETCH_MAX_WAIT_MS: i32 = 8_000;
 
-/// Encode a Fetch v4 request ([size][header v1][body v4]) for one partition.
-fn encode_fetch_v4(correlation_id: i32, topic: &str, fetch_offset: i64) -> Bytes {
+/// A Fetch v4 request frame for partition 0 of `topic`.
+fn encode_fetch_v4(correlation_id: i32, topic: &str, fetch_offset: i64) -> Vec<u8> {
     let partition = FetchPartition::default()
         .with_partition(0)
         .with_fetch_offset(fetch_offset)
@@ -50,42 +50,15 @@ fn encode_fetch_v4(correlation_id: i32, topic: &str, fetch_offset: i64) -> Bytes
         .with_max_bytes(4 * 1024 * 1024)
         .with_isolation_level(0)
         .with_topics(vec![fetch_topic]);
-
-    let header = RequestHeader::default()
-        .with_request_api_key(1) // Fetch
-        .with_request_api_version(4)
-        .with_correlation_id(correlation_id)
-        .with_client_id(Some(StrBytes::from_static_str("task-cap-test")));
-
-    let mut body = BytesMut::new();
-    header.encode(&mut body, 1).unwrap(); // header v1 for fetch v4
-    request.encode(&mut body, 4).unwrap();
-
-    let mut framed = BytesMut::with_capacity(body.len() + 4);
-    framed.put_i32(body.len() as i32);
-    framed.put(body);
-    framed.freeze()
+    request_frame(4, correlation_id, &request)
 }
 
 /// Read one [size][correlation_id][FetchResponse v4] frame; return
 /// (correlation_id, has_records).
 async fn read_fetch_response(stream: &mut TcpStream) -> Result<(i32, bool), String> {
-    let mut size_buf = [0u8; 4];
-    stream
-        .read_exact(&mut size_buf)
+    let (correlation_id, response) = read_response::<FetchRequest>(stream, 4)
         .await
-        .map_err(|e| format!("read size failed: {e}"))?;
-    let size = i32::from_be_bytes(size_buf) as usize;
-    let mut frame = vec![0u8; size];
-    stream
-        .read_exact(&mut frame)
-        .await
-        .map_err(|e| format!("read frame failed: {e}"))?;
-
-    let mut buf = Bytes::from(frame);
-    let correlation_id = buf.get_i32(); // response header v0
-    let response = FetchResponse::decode(&mut buf, 4)
-        .map_err(|e| format!("decode fetch response failed: {e}"))?;
+        .map_err(|e| format!("read fetch response failed: {e}"))?;
     let has_records = response.responses.iter().any(|t| {
         t.partitions
             .iter()
@@ -119,14 +92,13 @@ pub async fn test_long_poll_per_connection_task_cap() -> TestResult {
 
     // 2. ACTION: pipeline 80 long-poll fetches on ONE raw connection.
     println!(
-        "Step 2: Pipelining {} long-poll fetches (cap is {})...",
-        PIPELINED_FETCHES, EXPECTED_LONG_POLLED
+        "Step 2: Pipelining {PIPELINED_FETCHES} long-poll fetches (cap is {EXPECTED_LONG_POLLED})..."
     );
     let mut stream = TcpStream::connect(get_bootstrap_servers())
         .await
         .map_err(|e| format!("connect failed: {e}"))?;
     for i in 0..PIPELINED_FETCHES {
-        let frame = encode_fetch_v4(i as i32, &topic, 1);
+        let frame = encode_fetch_v4(to_i32(i), &topic, 1);
         stream
             .write_all(&frame)
             .await
@@ -155,7 +127,7 @@ pub async fn test_long_poll_per_connection_task_cap() -> TestResult {
     println!("✅ Wake-up record produced\n");
 
     // 3. VERIFY: read all 80 responses; count which carry the record.
-    println!("Step 4: Reading {} responses...", PIPELINED_FETCHES);
+    println!("Step 4: Reading {PIPELINED_FETCHES} responses...");
     let mut with_records = 0usize;
     let mut empty = 0usize;
     for i in 0..PIPELINED_FETCHES {
@@ -166,7 +138,7 @@ pub async fn test_long_poll_per_connection_task_cap() -> TestResult {
         .await
         .map_err(|_| format!("timed out waiting for response {i}"))??;
         let (corr, has_records) = read;
-        if corr != i as i32 {
+        if corr != to_i32(i) {
             return Err(format!("response order violated: expected corr {i}, got {corr}").into());
         }
         if has_records {

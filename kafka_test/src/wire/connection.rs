@@ -1,19 +1,13 @@
-//! Raw Kafka protocol client for the wave-3 txn tests: one TCP connection, typed
-//! requests and responses from the kafka-protocol crate. rdkafka hides the details
-//! these tests assert on (base offsets of duplicate batches, per-partition error codes,
-//! the batches inside a fetch response), so they speak the protocol directly.
+//! [`Wire`]: one raw connection with typed calls for the produce, fetch, offset and
+//! transaction APIs. rdkafka hides what these tests assert on (base offsets of duplicate
+//! batches, per-partition error codes, the batches inside a fetch response), so they
+//! speak the protocol directly.
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
-use kafka_protocol::messages::{RequestHeader, ResponseHeader};
-use kafka_protocol::protocol::{Decodable, Encodable, HeaderVersion, StrBytes};
-use kafka_protocol::records::{
-    Compression, Record, RecordBatchDecoder, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
-};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use super::{roundtrip, Result};
+use bytes::Bytes;
+use kafka_protocol::protocol::{Request, StrBytes};
+use std::time::Duration;
 use tokio::net::TcpStream;
-
-pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 /// One connection to the broker under test.
 pub struct Wire {
@@ -32,130 +26,12 @@ impl Wire {
         })
     }
 
-    /// Send `request` as `api_key` v`version` and decode the response.
-    pub async fn call<Req, Resp>(
-        &mut self,
-        api_key: i16,
-        version: i16,
-        request: &Req,
-    ) -> Result<Resp>
-    where
-        Req: Encodable + HeaderVersion,
-        Resp: Decodable + HeaderVersion,
-    {
+    /// Send `request` at `version` and decode its response (within 30 s).
+    pub async fn call<R: Request>(&mut self, version: i16, request: &R) -> Result<R::Response> {
         self.correlation_id += 1;
-        let header = RequestHeader::default()
-            .with_request_api_key(api_key)
-            .with_request_api_version(version)
-            .with_correlation_id(self.correlation_id)
-            .with_client_id(Some(StrBytes::from_static_str("w3-txn")));
-        let mut body = BytesMut::new();
-        header.encode(&mut body, Req::header_version(version))?;
-        request.encode(&mut body, version)?;
-        let mut frame = BytesMut::with_capacity(body.len() + 4);
-        frame.put_i32(body.len() as i32);
-        frame.put(body);
-        self.stream.write_all(&frame).await?;
-
-        let mut len = [0u8; 4];
-        tokio::time::timeout(Duration::from_secs(30), self.stream.read_exact(&mut len)).await??;
-        let mut buf = vec![0u8; i32::from_be_bytes(len) as usize];
-        self.stream.read_exact(&mut buf).await?;
-        let mut buf = Bytes::from(buf);
-        let header = ResponseHeader::decode(&mut buf, Resp::header_version(version))?;
-        if header.correlation_id != self.correlation_id {
-            return Err(format!(
-                "correlation id {} != {}",
-                header.correlation_id, self.correlation_id
-            )
-            .into());
-        }
-        Ok(Resp::decode(&mut buf, version)?)
+        let call = roundtrip(&mut self.stream, version, self.correlation_id, request);
+        tokio::time::timeout(Duration::from_secs(30), call).await?
     }
-}
-
-pub fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64
-}
-
-/// A RecordBatch v2 of `values` (timestamps `timestamps[i]`, or now), written by
-/// `producer_id`/`epoch` from `base_sequence` (all -1 for a plain producer).
-pub fn batch(
-    values: &[&str],
-    producer_id: i64,
-    epoch: i16,
-    base_sequence: i32,
-    transactional: bool,
-    timestamps: Option<&[i64]>,
-) -> Bytes {
-    let now = now_ms();
-    let records: Vec<Record> = values
-        .iter()
-        .enumerate()
-        .map(|(i, v)| Record {
-            transactional,
-            control: false,
-            partition_leader_epoch: -1,
-            producer_id,
-            producer_epoch: epoch,
-            timestamp_type: TimestampType::Creation,
-            offset: i as i64,
-            // The encoder keeps records in one batch while offset - sequence is
-            // constant; the batch's base sequence is the first record's (-1 = none).
-            sequence: base_sequence.wrapping_add(i as i32),
-            timestamp: timestamps.map_or(now, |t| t[i]),
-            key: None,
-            value: Some(Bytes::copy_from_slice(v.as_bytes())),
-            headers: Default::default(),
-        })
-        .collect();
-    let mut out = BytesMut::new();
-    RecordBatchEncoder::encode(
-        &mut out,
-        records.iter(),
-        &RecordEncodeOptions {
-            version: 2,
-            compression: Compression::None,
-        },
-    )
-    .expect("encode batch");
-    out.freeze()
-}
-
-/// The batch headers inside a fetched `records` blob:
-/// `(base_offset, last_offset_delta, record_count)`.
-pub fn batch_headers(records: &Bytes) -> Vec<(i64, i32, i32)> {
-    let mut out = Vec::new();
-    let mut b = records.clone();
-    while b.remaining() >= 61 {
-        let base = b.get_i64();
-        let len = b.get_i32() as usize;
-        let body = b.copy_to_bytes(len.min(b.remaining()));
-        // body: leader epoch(4) magic(1) crc(4) attributes(2) last delta(4) ...
-        let last_delta = i32::from_be_bytes(body[11..15].try_into().unwrap());
-        let count = i32::from_be_bytes(body[45..49].try_into().unwrap());
-        out.push((base, last_delta, count));
-    }
-    out
-}
-
-/// Every record (offset, value) in a fetched `records` blob.
-pub fn fetched_values(records: &Bytes) -> Result<Vec<(i64, String)>> {
-    let mut b = records.clone();
-    let mut out = Vec::new();
-    for set in RecordBatchDecoder::decode_all(&mut b)? {
-        for r in set.records {
-            let v = r
-                .value
-                .map(|v| String::from_utf8_lossy(&v).into_owned())
-                .unwrap_or_default();
-            out.push((r.offset, v));
-        }
-    }
-    Ok(out)
 }
 
 use kafka_protocol::messages::{
@@ -212,7 +88,7 @@ impl Wire {
         req.timeout_ms = 10_000;
         req.transactional_id = transactional_id.map(txn_id);
         req.topic_data = vec![t];
-        let resp: ProduceResponse = self.call(0, 7, &req).await?;
+        let resp: ProduceResponse = self.call(7, &req).await?;
         let p = &resp.responses[0].partition_responses[0];
         Ok((p.error_code, p.base_offset))
     }
@@ -228,7 +104,7 @@ impl Wire {
         req.transaction_timeout_ms = timeout_ms;
         req.producer_id = ProducerId(-1);
         req.producer_epoch = -1;
-        let resp: InitProducerIdResponse = self.call(22, 1, &req).await?;
+        let resp: InitProducerIdResponse = self.call(1, &req).await?;
         Ok((resp.error_code, resp.producer_id.0, resp.producer_epoch))
     }
 
@@ -253,7 +129,7 @@ impl Wire {
                 t
             })
             .collect();
-        let resp: AddPartitionsToTxnResponse = self.call(24, 1, &req).await?;
+        let resp: AddPartitionsToTxnResponse = self.call(1, &req).await?;
         let mut out = Vec::new();
         for t in resp.results_by_topic_v3_and_below {
             for p in t.results_by_partition {
@@ -279,12 +155,15 @@ impl Wire {
         req.producer_id = ProducerId(producer_id);
         req.producer_epoch = epoch;
         req.group_id = GroupId(StrBytes::from_string(group.to_string()));
-        let resp: AddOffsetsToTxnResponse = self.call(25, 1, &req).await?;
+        let resp: AddOffsetsToTxnResponse = self.call(1, &req).await?;
         Ok(resp.error_code)
     }
 
     /// TxnOffsetCommit v1 (generation -1, simple-consumer style).
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one argument per TxnOffsetCommit field the tests vary"
+    )]
     pub async fn txn_offset_commit(
         &mut self,
         transactional_id: &str,
@@ -308,7 +187,7 @@ impl Wire {
         req.producer_epoch = epoch;
         req.generation_id = -1;
         req.topics = vec![t];
-        let resp: TxnOffsetCommitResponse = self.call(28, 1, &req).await?;
+        let resp: TxnOffsetCommitResponse = self.call(1, &req).await?;
         Ok(resp.topics[0].partitions[0].error_code)
     }
 
@@ -324,7 +203,7 @@ impl Wire {
         req.producer_id = ProducerId(producer_id);
         req.producer_epoch = epoch;
         req.committed = commit;
-        let resp: EndTxnResponse = self.call(26, 1, &req).await?;
+        let resp: EndTxnResponse = self.call(1, &req).await?;
         Ok(resp.error_code)
     }
 
@@ -354,7 +233,7 @@ impl Wire {
         req.isolation_level = isolation_level;
         req.session_epoch = -1;
         req.topics = vec![t];
-        let resp: FetchResponse = self.call(1, 11, &req).await?;
+        let resp: FetchResponse = self.call(11, &req).await?;
         Ok(resp.responses[0].partitions[0].clone())
     }
 
@@ -377,7 +256,7 @@ impl Wire {
         req.replica_id = BrokerId(-1);
         req.isolation_level = isolation_level;
         req.topics = vec![t];
-        let resp: ListOffsetsResponse = self.call(2, 7, &req).await?;
+        let resp: ListOffsetsResponse = self.call(7, &req).await?;
         let p = &resp.topics[0].partitions[0];
         Ok((p.error_code, p.offset, p.timestamp))
     }
@@ -397,7 +276,7 @@ impl Wire {
         req.group_id = GroupId(StrBytes::from_string(group.to_string()));
         req.topics = Some(vec![t]);
         req.require_stable = require_stable;
-        let resp: OffsetFetchResponse = self.call(9, 7, &req).await?;
+        let resp: OffsetFetchResponse = self.call(7, &req).await?;
         let parts = resp
             .topics
             .iter()
@@ -423,7 +302,7 @@ impl Wire {
         let mut req = DeleteRecordsRequest::default();
         req.topics = vec![t];
         req.timeout_ms = 10_000;
-        let resp: DeleteRecordsResponse = self.call(21, 1, &req).await?;
+        let resp: DeleteRecordsResponse = self.call(1, &req).await?;
         let p = &resp.topics[0].partitions[0];
         Ok((p.error_code, p.low_watermark))
     }

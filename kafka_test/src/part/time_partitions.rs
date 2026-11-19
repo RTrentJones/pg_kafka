@@ -1,15 +1,10 @@
-//! E2E tests for the time-partitioned `kafka.messages` (ADR-001, stream `part`).
-//!
-//! Fail-before/pass-after: before this change kafka.messages was one table, so
-//! `kafka.message_partitions()` / `pg_kafka_run_partition_maintenance()` did not exist
-//! and the sweep had no `dropped_partitions` category; every test here fails on the
-//! old extension.
+//! E2E tests for the time-partitioned `kafka.messages` (ADR-001).
 //!
 //! The tests are width-agnostic: they read `pg_kafka.message_partition_minutes` and
 //! backdate rows by whole multiples of it (an UPDATE of created_at moves a row into
 //! kafka.messages_default when no leaf covers that time; partition maintenance then
 //! gives it a leaf). Retention is set straight in kafka.topics.retention_ms (the
-//! IncrementalAlterConfigs path is covered in configs.rs).
+//! IncrementalAlterConfigs path is covered in admin/configs.rs).
 //!
 //! All `parallel_safe: false`: they create and drop leaves far in the past and run
 //! the sweep, which also reaps other topics' rows that have a per-topic window.
@@ -25,7 +20,7 @@ use rdkafka::{Message, Offset, TopicPartitionList};
 use std::time::{Duration, Instant};
 use tokio_postgres::Client;
 
-type DynResult<T> = Result<T, Box<dyn std::error::Error>>;
+use crate::common::DynResult;
 
 /// `pg_kafka.message_partition_minutes` in milliseconds.
 async fn width_ms(db: &Client) -> DynResult<i64> {
@@ -166,8 +161,7 @@ fn consume_from_beginning(
         if let Some(Ok(m)) = consumer.poll(Duration::from_millis(500)) {
             let v = m
                 .payload()
-                .map(|p| String::from_utf8_lossy(p).to_string())
-                .unwrap_or_default();
+                .map_or_default(|p| String::from_utf8_lossy(p).to_string());
             out.push((m.offset(), v));
         }
     }
@@ -331,7 +325,7 @@ pub async fn test_time_partition_retention_waits_for_pending_transaction() -> Te
     let (_, dropped) = sweep(db).await?;
     assert!(dropped >= 1);
     assert!(!leaf_exists(db, &leaf).await?, "{leaf} must be dropped");
-    assert!(offsets_of(db, &topic).await?.is_empty());
+    assert_eq!(offsets_of(db, &topic).await?, Vec::<i64>::new());
     let (low, high) = consumer.fetch_watermarks(&topic, 0, Duration::from_secs(5))?;
     assert!(high >= 3);
     assert_eq!(low, high, "emptied partition: earliest == latest");

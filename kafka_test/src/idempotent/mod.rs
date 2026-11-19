@@ -10,12 +10,19 @@
 mod basic;
 mod deduplication;
 mod edge_cases;
-pub mod protocol_encoding;
+mod kafka_model;
 
-pub use basic::test_idempotent_producer_basic;
-pub use deduplication::test_true_deduplication_manual_replay;
-pub use edge_cases::{
-    test_idempotent_concurrent_producers, test_idempotent_high_sequence,
-    test_idempotent_multi_partition, test_idempotent_producer_epoch_bump,
-    test_idempotent_producer_restart,
-};
+/// The `idempotent` tests, in run order.
+pub fn tests() -> Vec<crate::registry::TestDef> {
+    crate::test_defs!["idempotent";
+        basic::test_idempotent_producer_basic,
+        deduplication::test_true_deduplication_manual_replay,
+        edge_cases::test_idempotent_producer_epoch_bump,
+        edge_cases::test_idempotent_multi_partition,
+        edge_cases::test_idempotent_producer_restart,
+        edge_cases::test_idempotent_concurrent_producers: sequential, // Concurrent producers
+        edge_cases::test_idempotent_high_sequence,
+        kafka_model::test_idempotent_duplicates_and_epochs_follow_kafka: sequential,
+        kafka_model::test_idempotent_sequence_wraps_at_i32_max,
+    ]
+}

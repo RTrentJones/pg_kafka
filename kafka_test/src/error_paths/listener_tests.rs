@@ -1,6 +1,6 @@
-//! Regression tests for the `listener` workstream (src/kafka/listener.rs and friends).
+//! Listener behaviour (src/kafka/listener.rs and friends):
 //!
-//! - Idle long polls are no longer re-run every 100 ms: a waiting fetch re-runs only on a
+//! - Idle long polls are not re-run on a short timer: a waiting fetch re-runs only on a
 //!   new-data notification, its `max_wait_ms` deadline, or the slow safety-net interval
 //!   (`pg_kafka.fetch_poll_interval_ms`, default 1000 ms).
 //! - A produce still wakes a waiting fetch at once.
@@ -16,11 +16,12 @@
 use crate::common::{
     create_producer, create_transactional_producer, get_bootstrap_servers, TestResult,
 };
-use crate::error_paths::bug_hunt::{fetch_request, roundtrip};
 use crate::setup::TestContext;
+use crate::wire::requests::fetch_request;
+use crate::wire::{raw_frame, read_raw_response, roundtrip};
 use rdkafka::producer::{FutureRecord, Producer};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
 /// The shipped default of `pg_kafka.fetch_poll_interval_ms` (the long-poll safety net).
@@ -90,6 +91,8 @@ fn spawn_long_poll(
 /// 100 ms and returned the record ~300 ms after it was sent. New behaviour: nothing re-runs
 /// it until the safety-net interval (1 s by default), so the record arrives at ~1 s.
 pub async fn test_listener_idle_long_poll_does_not_refetch() -> TestResult {
+    const MAX_WAIT_MS: i32 = 6_000;
+
     println!("=== Test: Idle Long Poll Does Not Re-Fetch (listener) ===\n");
 
     let ctx = TestContext::new().await?;
@@ -111,7 +114,6 @@ pub async fn test_listener_idle_long_poll_does_not_refetch() -> TestResult {
         "this test assumes the shipped safety-net default (>= {DEFAULT_SAFETY_NET_MS} ms), got {interval_ms} ms"
     );
 
-    const MAX_WAIT_MS: i32 = 6_000;
     println!("Step 2: long poll at offset {hwm} (max_wait_ms={MAX_WAIT_MS})...");
     let fetch = spawn_long_poll(topic.clone(), hwm, MAX_WAIT_MS, 0);
 
@@ -159,6 +161,9 @@ pub async fn test_listener_idle_long_poll_does_not_refetch() -> TestResult {
 /// i.e. 0.2 s after a safety-net tick (ticks at ~1 s, ~2 s, ~3 s). Notification delivery is
 /// well under 400 ms; the safety net alone would take ~800 ms.
 pub async fn test_listener_produce_wakes_long_poll_promptly() -> TestResult {
+    // Metadata for the test topic too.
+    use rdkafka::producer::Producer;
+
     println!("=== Test: Produce Wakes Long Poll Promptly (listener) ===\n");
 
     let ctx = TestContext::new().await?;
@@ -176,8 +181,6 @@ pub async fn test_listener_produce_wakes_long_poll_promptly() -> TestResult {
         )
         .await
         .map_err(|(e, _)| e)?;
-    // Metadata for the test topic too.
-    use rdkafka::producer::Producer;
     producer
         .client()
         .fetch_metadata(Some(&topic), Duration::from_secs(5))?;
@@ -279,29 +282,18 @@ pub async fn test_listener_read_committed_long_poll_wakes_on_commit() -> TestRes
     Ok(())
 }
 
-/// ApiVersions v0 request frame: [size][api_key=18][api_version=0][correlation_id][client_id=null].
-fn api_versions_v0_frame(correlation_id: i32) -> Vec<u8> {
-    let mut body = Vec::with_capacity(10);
-    body.extend_from_slice(&18i16.to_be_bytes());
-    body.extend_from_slice(&0i16.to_be_bytes());
-    body.extend_from_slice(&correlation_id.to_be_bytes());
-    body.extend_from_slice(&(-1i16).to_be_bytes());
-    let mut frame = (body.len() as i32).to_be_bytes().to_vec();
-    frame.extend_from_slice(&body);
-    frame
-}
-
 /// Pipelining far beyond the per-connection in-flight bound (128) without reading must
 /// neither deadlock nor drop or reorder responses: once the client reads, every response
 /// arrives, in request order.
 pub async fn test_listener_pipelined_requests_beyond_in_flight_cap() -> TestResult {
+    const REQUESTS: i32 = 400;
+
     println!("=== Test: Pipelining Beyond The In-Flight Cap (listener) ===\n");
 
-    const REQUESTS: i32 = 400;
     let mut stream = TcpStream::connect(get_bootstrap_servers()).await?;
     let mut bytes = Vec::new();
     for i in 0..REQUESTS {
-        bytes.extend_from_slice(&api_versions_v0_frame(i));
+        bytes.extend_from_slice(&raw_frame(18, 0, i, &[]));
     }
     println!("Step 1: writing {REQUESTS} pipelined ApiVersions requests without reading...");
     stream.write_all(&bytes).await?;
@@ -312,16 +304,10 @@ pub async fn test_listener_pipelined_requests_beyond_in_flight_cap() -> TestResu
 
     println!("Step 2: reading all responses...");
     for expected in 0..REQUESTS {
-        let read = async {
-            let mut size = [0u8; 4];
-            stream.read_exact(&mut size).await?;
-            let mut frame = vec![0u8; i32::from_be_bytes(size) as usize];
-            stream.read_exact(&mut frame).await?;
-            Ok::<_, std::io::Error>(i32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]))
-        };
-        let correlation_id = tokio::time::timeout(Duration::from_secs(10), read)
-            .await
-            .map_err(|_| format!("timed out waiting for response {expected}"))??;
+        let (correlation_id, _) =
+            tokio::time::timeout(Duration::from_secs(10), read_raw_response(&mut stream))
+                .await
+                .map_err(|_| format!("timed out waiting for response {expected}"))??;
         assert_eq!(
             correlation_id, expected,
             "responses must arrive in request order"

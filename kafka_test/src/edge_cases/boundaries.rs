@@ -1,5 +1,6 @@
 //! Boundary condition tests
 
+use crate::common::to_i64;
 use crate::common::TestResult;
 use crate::fixtures::{generate_messages, TestTopicBuilder};
 use crate::setup::TestContext;
@@ -24,6 +25,9 @@ pub async fn test_offset_zero_boundary() -> TestResult {
 
 /// Test partition 0 explicit targeting
 pub async fn test_partition_zero() -> TestResult {
+    // Produce explicitly to partition 0
+    use crate::fixtures::TestMessage;
+
     println!("=== Test: Partition Zero Targeting ===\n");
 
     let ctx = TestContext::new().await?;
@@ -32,8 +36,6 @@ pub async fn test_partition_zero() -> TestResult {
         .build()
         .await?;
 
-    // Produce explicitly to partition 0
-    use crate::fixtures::TestMessage;
     let msg = TestMessage {
         key: Some("key".to_string()),
         value: "value".to_string(),
@@ -81,7 +83,7 @@ pub async fn test_single_partition_topic() -> TestResult {
 
     // All should go to partition 0
     for (i, offset) in offsets.iter().enumerate() {
-        assert_eq!(*offset, i as i64, "Offset {} should be {}", offset, i);
+        assert_eq!(*offset, to_i64(i), "Offset {offset} should be {i}");
     }
     println!("✅ All messages in single partition with sequential offsets");
 
@@ -103,7 +105,7 @@ pub async fn test_high_offset_values() -> TestResult {
 
     let last_offset = offsets.last().unwrap();
     assert_eq!(*last_offset, 19, "Last offset should be 19");
-    println!("✅ Produced 20 messages, last offset: {}", last_offset);
+    println!("✅ Produced 20 messages, last offset: {last_offset}");
 
     ctx.cleanup().await?;
     println!("\n✅ High offset values test PASSED\n");

@@ -138,12 +138,12 @@ pub async fn test_external_only_fallback() -> TestResult {
     let row = ctx
         .db()
         .query_one(
-            r#"
+            r"
         SELECT COUNT(*) as count
         FROM kafka.messages m
         JOIN kafka.topics t ON m.topic_id = t.id
         WHERE t.name = $1
-        "#,
+        ",
             &[&topic],
         )
         .await?;
@@ -207,8 +207,7 @@ pub async fn test_external_primary_dead_letter_serves_local() -> TestResult {
 
     // Control: while the forward is not dead-lettered, an external-primary topic
     // suppresses local reads (the consumer sees nothing).
-    let consumer: BaseConsumer =
-        create_read_committed_consumer(&format!("g-deadletter-{}", topic))?;
+    let consumer: BaseConsumer = create_read_committed_consumer(&format!("g-deadletter-{topic}"))?;
     let mut tpl = TopicPartitionList::new();
     tpl.add_partition_offset(&topic, 0, rdkafka::Offset::Beginning)?;
     consumer.assign(&tpl)?;

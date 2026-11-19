@@ -79,7 +79,7 @@ pub async fn test_batch_1000_messages() -> TestResult {
     let elapsed = start.elapsed();
 
     assert_eq!(offsets.len(), 20);
-    println!("✅ Produced 20 messages in {:?}", elapsed);
+    println!("✅ Produced 20 messages in {elapsed:?}");
     println!("   Rate: {:.0} msg/sec", 20.0 / elapsed.as_secs_f64());
 
     // Verify in database

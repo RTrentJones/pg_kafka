@@ -6,21 +6,14 @@
 //! - CreatePartitions (API 37)
 //! - DeleteGroups (API 42)
 
-use crate::common::{create_db_client, get_bootstrap_servers, TestResult};
-use rdkafka::admin::{AdminClient, AdminOptions, NewPartitions, NewTopic, TopicReplication};
-use rdkafka::client::DefaultClientContext;
-use rdkafka::config::ClientConfig;
+mod configs;
+mod create_validation;
+
+use crate::common::create_admin_client;
+use crate::common::{create_db_client, TestResult};
+use rdkafka::admin::{AdminOptions, NewPartitions, NewTopic, TopicReplication};
 use std::time::Duration;
 use uuid::Uuid;
-
-/// Create an admin client for testing
-fn create_admin_client() -> Result<AdminClient<DefaultClientContext>, Box<dyn std::error::Error>> {
-    let admin: AdminClient<DefaultClientContext> = ClientConfig::new()
-        .set("bootstrap.servers", get_bootstrap_servers())
-        .set("broker.address.family", "v4")
-        .create()?;
-    Ok(admin)
-}
 
 // wait_for_count lives in fixtures.rs (shared across all E2E categories); see
 // its doc comment for the RB-1 rationale.
@@ -59,10 +52,10 @@ pub async fn test_create_topic() -> TestResult {
 
     // Cleanup - wait for completion to prevent race conditions with next test
     if let Err(e) = admin.delete_topics(&[&topic_name], &opts).await {
-        eprintln!("    Cleanup warning: {:?}", e);
+        eprintln!("    Cleanup warning: {e:?}");
     }
 
-    println!("    Created topic '{}' with 3 partitions", topic_name);
+    println!("    Created topic '{topic_name}' with 3 partitions");
     Ok(())
 }
 
@@ -88,22 +81,18 @@ pub async fn test_create_topic_already_exists() -> TestResult {
     let err = result.as_ref().unwrap_err();
     // rdkafka error code 36 is TOPIC_ALREADY_EXISTS
     assert!(
-        format!("{:?}", err).contains("TopicAlreadyExists")
-            || format!("{:?}", err).contains("36")
-            || format!("{:?}", err).contains("already exists"),
-        "Expected TOPIC_ALREADY_EXISTS error, got: {:?}",
-        err
+        format!("{err:?}").contains("TopicAlreadyExists")
+            || format!("{err:?}").contains("36")
+            || format!("{err:?}").contains("already exists"),
+        "Expected TOPIC_ALREADY_EXISTS error, got: {err:?}"
     );
 
     // Cleanup - wait for completion to prevent race conditions with next test
     if let Err(e) = admin.delete_topics(&[&topic_name], &opts).await {
-        eprintln!("    Cleanup warning: {:?}", e);
+        eprintln!("    Cleanup warning: {e:?}");
     }
 
-    println!(
-        "    Correctly rejected duplicate topic creation for '{}'",
-        topic_name
-    );
+    println!("    Correctly rejected duplicate topic creation for '{topic_name}'");
     Ok(())
 }
 
@@ -141,7 +130,7 @@ pub async fn test_delete_topic() -> TestResult {
     .await?;
     assert_eq!(count, 0, "Topic should be deleted from database");
 
-    println!("    Deleted topic '{}'", topic_name);
+    println!("    Deleted topic '{topic_name}'");
     Ok(())
 }
 
@@ -161,17 +150,13 @@ pub async fn test_delete_topic_not_found() -> TestResult {
 
     let err = result.as_ref().unwrap_err();
     assert!(
-        format!("{:?}", err).contains("UnknownTopicOrPartition")
-            || format!("{:?}", err).contains("3")
-            || format!("{:?}", err).contains("does not exist"),
-        "Expected UNKNOWN_TOPIC_OR_PARTITION error, got: {:?}",
-        err
+        format!("{err:?}").contains("UnknownTopicOrPartition")
+            || format!("{err:?}").contains('3')
+            || format!("{err:?}").contains("does not exist"),
+        "Expected UNKNOWN_TOPIC_OR_PARTITION error, got: {err:?}"
     );
 
-    println!(
-        "    Correctly rejected deletion of non-existent topic '{}'",
-        topic_name
-    );
+    println!("    Correctly rejected deletion of non-existent topic '{topic_name}'");
     Ok(())
 }
 
@@ -212,10 +197,10 @@ pub async fn test_create_partitions() -> TestResult {
 
     // Cleanup - wait for completion to prevent race conditions with next test
     if let Err(e) = admin.delete_topics(&[&topic_name], &opts).await {
-        eprintln!("    Cleanup warning: {:?}", e);
+        eprintln!("    Cleanup warning: {e:?}");
     }
 
-    println!("    Increased partitions for '{}' from 2 to 5", topic_name);
+    println!("    Increased partitions for '{topic_name}' from 2 to 5");
     Ok(())
 }
 
@@ -242,30 +227,26 @@ pub async fn test_create_partitions_cannot_decrease() -> TestResult {
 
     let err = result.as_ref().unwrap_err();
     assert!(
-        format!("{:?}", err).contains("InvalidPartitions")
-            || format!("{:?}", err).contains("37")
-            || format!("{:?}", err).contains("reduce")
-            || format!("{:?}", err).contains("Cannot"),
-        "Expected INVALID_PARTITIONS error, got: {:?}",
-        err
+        format!("{err:?}").contains("InvalidPartitions")
+            || format!("{err:?}").contains("37")
+            || format!("{err:?}").contains("reduce")
+            || format!("{err:?}").contains("Cannot"),
+        "Expected INVALID_PARTITIONS error, got: {err:?}"
     );
 
     // Cleanup - wait for completion to prevent race conditions with next test
     if let Err(e) = admin.delete_topics(&[&topic_name], &opts).await {
-        eprintln!("    Cleanup warning: {:?}", e);
+        eprintln!("    Cleanup warning: {e:?}");
     }
 
-    println!(
-        "    Correctly rejected partition decrease for '{}'",
-        topic_name
-    );
+    println!("    Correctly rejected partition decrease for '{topic_name}'");
     Ok(())
 }
 
 /// Test deleting an empty consumer group
 pub async fn test_delete_group_empty() -> TestResult {
     let admin = create_admin_client()?;
-    // wave3 groups: a group that never existed (no members, no committed offsets) is
+    // A group that never existed (no members, no committed offsets) is
     // GROUP_ID_NOT_FOUND, as Kafka answers; an Empty group with offsets is deleted.
     let group_id = format!("test-delete-group-{}", Uuid::new_v4());
 
@@ -276,11 +257,9 @@ pub async fn test_delete_group_empty() -> TestResult {
     match &results[0] {
         Err((_, rdkafka::types::RDKafkaErrorCode::GroupIdNotFound)) => {}
         other => {
-            return Err(format!(
-                "non-existent group: expected GroupIdNotFound, got {:?}",
-                other
+            return Err(
+                format!("non-existent group: expected GroupIdNotFound, got {other:?}").into(),
             )
-            .into())
         }
     }
 
@@ -311,7 +290,7 @@ pub async fn test_delete_group_empty() -> TestResult {
     db.execute("DELETE FROM kafka.topics WHERE name = $1", &[&topic])
         .await?;
 
-    println!("    Successfully deleted empty group '{}'", group_id);
+    println!("    Successfully deleted empty group '{group_id}'");
     Ok(())
 }
 
@@ -352,11 +331,10 @@ pub async fn test_delete_group_non_empty() -> TestResult {
 
     let err = result.as_ref().unwrap_err();
     assert!(
-        format!("{:?}", err).contains("NonEmptyGroup")
-            || format!("{:?}", err).contains("68")
-            || format!("{:?}", err).contains("active"),
-        "Expected NON_EMPTY_GROUP error, got: {:?}",
-        err
+        format!("{err:?}").contains("NonEmptyGroup")
+            || format!("{err:?}").contains("68")
+            || format!("{err:?}").contains("active"),
+        "Expected NON_EMPTY_GROUP error, got: {err:?}"
     );
 
     // Consumer will be dropped here, leaving the group
@@ -364,19 +342,16 @@ pub async fn test_delete_group_non_empty() -> TestResult {
 
     // Cleanup - wait for completion to prevent race conditions with next test
     if let Err(e) = admin.delete_topics(&[&topic_name], &opts).await {
-        eprintln!("    Cleanup warning: {:?}", e);
+        eprintln!("    Cleanup warning: {e:?}");
     }
 
-    println!(
-        "    Correctly rejected deletion of non-empty group '{}'",
-        group_id
-    );
+    println!("    Correctly rejected deletion of non-empty group '{group_id}'");
     Ok(())
 }
 
 /// Test that a group can be deleted after its members cleanly leave.
 ///
-/// Regression: modern clients (kafkajs / Sarama / librdkafka) send LeaveGroup v3+ with the leaving
+/// Modern clients (kafkajs / Sarama / librdkafka) send LeaveGroup v3+ with the leaving
 /// members batched in a `members` array and an empty top-level member_id. pg_kafka must remove each
 /// so the group becomes Empty and DeleteGroups succeeds — otherwise it keeps returning
 /// NON_EMPTY_GROUP long after a clean leave.
@@ -413,10 +388,10 @@ pub async fn test_delete_group_after_leave() -> TestResult {
 
     // Cleanup
     if let Err(e) = admin.delete_topics(&[&topic_name], &opts).await {
-        eprintln!("    Cleanup warning: {:?}", e);
+        eprintln!("    Cleanup warning: {e:?}");
     }
 
-    println!("    Deleted empty group '{}' after a clean leave", group_id);
+    println!("    Deleted empty group '{group_id}' after a clean leave");
     Ok(())
 }
 
@@ -439,7 +414,7 @@ pub async fn test_create_multiple_topics() -> TestResult {
     assert_eq!(results.len(), 3);
 
     for result in &results {
-        assert!(result.is_ok(), "Topic creation failed: {:?}", result);
+        assert!(result.is_ok(), "Topic creation failed: {result:?}");
     }
 
     // Verify in database
@@ -458,7 +433,7 @@ pub async fn test_create_multiple_topics() -> TestResult {
         .delete_topics(&[&topic1, &topic2, &topic3], &opts)
         .await
     {
-        eprintln!("    Cleanup warning: {:?}", e);
+        eprintln!("    Cleanup warning: {e:?}");
     }
 
     println!("    Created 3 topics in single request");
@@ -547,14 +522,13 @@ pub async fn test_create_partitions_not_found() -> TestResult {
     );
 
     let err = result.as_ref().unwrap_err();
-    println!("   Expected error received: {:?}", err);
+    println!("   Expected error received: {err:?}");
 
     assert!(
-        format!("{:?}", err).contains("UnknownTopicOrPartition")
-            || format!("{:?}", err).contains("3")
-            || format!("{:?}", err).contains("does not exist"),
-        "Expected UNKNOWN_TOPIC_OR_PARTITION error, got: {:?}",
-        err
+        format!("{err:?}").contains("UnknownTopicOrPartition")
+            || format!("{err:?}").contains('3')
+            || format!("{err:?}").contains("does not exist"),
+        "Expected UNKNOWN_TOPIC_OR_PARTITION error, got: {err:?}"
     );
     println!("✅ Correctly rejected CreatePartitions on non-existent topic\n");
 
@@ -573,7 +547,7 @@ pub async fn test_delete_group_idempotent() -> TestResult {
     let opts = AdminOptions::new().operation_timeout(Some(Duration::from_secs(5)));
 
     // Deleting the same non-existent group repeatedly always gives the same answer:
-    // GROUP_ID_NOT_FOUND, as Kafka does (wave3 groups; it used to be NONE).
+    // GROUP_ID_NOT_FOUND, as Kafka does.
     println!("Step 1: Deleting non-existent group 3 times...");
     for i in 1..=3 {
         let results = admin.delete_groups(&[&group_id], &opts).await?;
@@ -581,9 +555,7 @@ pub async fn test_delete_group_idempotent() -> TestResult {
         match &results[0] {
             Err((_, rdkafka::types::RDKafkaErrorCode::GroupIdNotFound)) => {}
             other => {
-                return Err(
-                    format!("Delete #{}: expected GroupIdNotFound, got {:?}", i, other).into(),
-                )
+                return Err(format!("Delete #{i}: expected GroupIdNotFound, got {other:?}").into())
             }
         }
     }
@@ -636,7 +608,7 @@ pub async fn test_create_topic_with_config() -> TestResult {
 
     if let Some(row) = row {
         let partitions: i32 = row.get(0);
-        println!("   Topic exists with {} partitions", partitions);
+        println!("   Topic exists with {partitions} partitions");
 
         // Cleanup
         let _ = admin.delete_topics(&[&topic_name], &opts).await;
@@ -674,7 +646,7 @@ pub async fn test_create_topic_invalid_partitions() -> TestResult {
     );
     // Zero partitions must be rejected (INVALID_PARTITIONS), not silently created with 1.
     match result {
-        Err(e) => println!("   Expected error: {:?}", e),
+        Err(e) => println!("   Expected error: {e:?}"),
         Ok(_) => return Err("CreateTopics with 0 partitions was accepted".into()),
     }
 
@@ -700,4 +672,31 @@ pub async fn test_create_topic_invalid_partitions() -> TestResult {
 
     println!("\n✅ Test: Create Topic with Invalid Partitions PASSED\n");
     Ok(())
+}
+
+/// The `admin` tests, in run order.
+pub fn tests() -> Vec<crate::registry::TestDef> {
+    crate::test_defs!["admin";
+        test_create_topic,
+        test_create_topic_already_exists,
+        test_delete_topic,
+        test_delete_topic_not_found,
+        test_create_partitions,
+        test_create_partitions_cannot_decrease,
+        test_delete_group_empty,
+        test_delete_group_non_empty: sequential, // Uses shared consumer group state
+        test_delete_group_after_leave: sequential, // Uses shared consumer group state
+        configs::test_describe_configs_reports_topic_configs,
+        configs::test_incremental_alter_configs_retention_roundtrip,
+        configs::test_delete_records_truncates_partition,
+        configs::test_per_topic_retention_override_enforced_by_sweep: sequential, // Runs the global retention sweep
+        test_create_multiple_topics,
+        test_create_topic_invalid_name,
+        test_create_partitions_not_found,
+        test_delete_group_idempotent,
+        test_create_topic_with_config,
+        test_create_topic_invalid_partitions,
+        create_validation::test_partition_count_above_cap_is_rejected,
+        create_validation::test_create_topics_rejects_duplicates_collisions_and_bad_replication,
+    ]
 }

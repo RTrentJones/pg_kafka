@@ -7,6 +7,7 @@
 //! - Producer restart scenarios
 //! - Concurrent idempotent producers
 
+use crate::common::to_i64;
 use crate::common::{create_idempotent_producer, TestResult};
 use crate::fixtures::TestTopicBuilder;
 use crate::setup::TestContext;
@@ -45,7 +46,7 @@ pub async fn test_idempotent_producer_epoch_bump() -> TestResult {
         .await
         .map_err(|(e, _)| e)?;
     producer1.flush(Duration::from_secs(5))?;
-    println!("  First producer sent message at offset {}", offset1);
+    println!("  First producer sent message at offset {offset1}");
 
     // Check initial producer state
     let topic_row = ctx
@@ -73,10 +74,7 @@ pub async fn test_idempotent_producer_epoch_bump() -> TestResult {
     if let Some(row) = msg_row {
         initial_producer_id = row.get(0);
         initial_epoch = row.get(1);
-        println!(
-            "  Initial producer_id: {:?}, epoch: {:?}\n",
-            initial_producer_id, initial_epoch
-        );
+        println!("  Initial producer_id: {initial_producer_id:?}, epoch: {initial_epoch:?}\n");
     } else {
         println!("  Note: Message doesn't have producer tracking (rdkafka may not send)\n");
         initial_producer_id = None;
@@ -102,7 +100,7 @@ pub async fn test_idempotent_producer_epoch_bump() -> TestResult {
         .await
         .map_err(|(e, _)| e)?;
     producer2.flush(Duration::from_secs(5))?;
-    println!("  Second producer sent message at offset {}", offset2);
+    println!("  Second producer sent message at offset {offset2}");
 
     // Check new producer state
     let msg_row2 = ctx
@@ -117,10 +115,7 @@ pub async fn test_idempotent_producer_epoch_bump() -> TestResult {
     if let Some(row) = msg_row2 {
         let new_producer_id: Option<i64> = row.get(0);
         let new_epoch: Option<i16> = row.get(1);
-        println!(
-            "  New producer_id: {:?}, epoch: {:?}\n",
-            new_producer_id, new_epoch
-        );
+        println!("  New producer_id: {new_producer_id:?}, epoch: {new_epoch:?}\n");
 
         // If both have values, verify epoch behavior
         if let (Some(_), Some(e1), Some(_), Some(e2)) = (
@@ -130,7 +125,7 @@ pub async fn test_idempotent_producer_epoch_bump() -> TestResult {
             new_epoch,
         ) {
             // New producer may have same or different ID, but epoch should be tracked
-            println!("  Epoch tracking verified: {} -> {}", e1, e2);
+            println!("  Epoch tracking verified: {e1} -> {e2}");
         }
     }
 
@@ -179,17 +174,14 @@ pub async fn test_idempotent_multi_partition() -> TestResult {
             let (p, offset) = producer
                 .send(
                     FutureRecord::to(&topic.name)
-                        .payload(&format!("partition-{}-msg-{}", partition, msg_num))
-                        .key(&format!("key-{}", msg_num))
+                        .payload(&format!("partition-{partition}-msg-{msg_num}"))
+                        .key(&format!("key-{msg_num}"))
                         .partition(partition),
                     Duration::from_secs(5),
                 )
                 .await
                 .map_err(|(e, _)| e)?;
-            println!(
-                "  Partition {}: msg {} delivered at offset {}",
-                p, msg_num, offset
-            );
+            println!("  Partition {p}: msg {msg_num} delivered at offset {offset}");
         }
     }
     producer.flush(Duration::from_secs(5))?;
@@ -216,8 +208,8 @@ pub async fn test_idempotent_multi_partition() -> TestResult {
             .await?
             .get(0);
 
-        assert_eq!(count, 3, "Partition {} should have 3 messages", partition);
-        println!("  Partition {}: {} messages", partition, count);
+        assert_eq!(count, 3, "Partition {partition} should have 3 messages");
+        println!("  Partition {partition}: {count} messages");
     }
 
     // Verify offsets are sequential within each partition
@@ -237,9 +229,9 @@ pub async fn test_idempotent_multi_partition() -> TestResult {
 
         for (i, offset) in offsets.iter().enumerate() {
             assert_eq!(
-                *offset, i as i64,
-                "Partition {} offset {} should be {}",
-                partition, i, offset
+                *offset,
+                to_i64(i),
+                "Partition {partition} offset {i} should be {offset}"
             );
         }
     }
@@ -275,8 +267,8 @@ pub async fn test_idempotent_producer_restart() -> TestResult {
             producer
                 .send(
                     FutureRecord::to(&topic.name)
-                        .payload(&format!("session1-msg-{}", i))
-                        .key(&format!("key-{}", i)),
+                        .payload(&format!("session1-msg-{i}"))
+                        .key(&format!("key-{i}")),
                     Duration::from_secs(5),
                 )
                 .await
@@ -297,8 +289,8 @@ pub async fn test_idempotent_producer_restart() -> TestResult {
             producer
                 .send(
                     FutureRecord::to(&topic.name)
-                        .payload(&format!("session2-msg-{}", i))
-                        .key(&format!("key-{}", i)),
+                        .payload(&format!("session2-msg-{i}"))
+                        .key(&format!("key-{i}")),
                     Duration::from_secs(5),
                 )
                 .await
@@ -328,7 +320,7 @@ pub async fn test_idempotent_producer_restart() -> TestResult {
         .get(0);
 
     assert_eq!(total, 10, "Should have 10 messages total");
-    println!("  Total messages: {}", total);
+    println!("  Total messages: {total}");
 
     // Verify no duplicate offsets
     let unique_offsets: i64 = ctx
@@ -341,7 +333,7 @@ pub async fn test_idempotent_producer_restart() -> TestResult {
         .get(0);
 
     assert_eq!(unique_offsets, 10, "Should have 10 unique offsets");
-    println!("  Unique offsets: {} (no duplicates)\n", unique_offsets);
+    println!("  Unique offsets: {unique_offsets} (no duplicates)\n");
 
     ctx.cleanup().await?;
     println!("Idempotent producer restart test PASSED\n");
@@ -381,8 +373,8 @@ pub async fn test_idempotent_concurrent_producers() -> TestResult {
                 let result = producer
                     .send(
                         FutureRecord::to(&topic)
-                            .payload(&format!("producer-{}-msg-{}", producer_id, i))
-                            .key(&format!("key-{}-{}", producer_id, i)),
+                            .payload(&format!("producer-{producer_id}-msg-{i}"))
+                            .key(&format!("key-{producer_id}-{i}")),
                         Duration::from_secs(5),
                     )
                     .await;
@@ -430,9 +422,10 @@ pub async fn test_idempotent_concurrent_producers() -> TestResult {
         .await?
         .get(0);
 
-    println!("  Database count: {}", db_count);
+    println!("  Database count: {db_count}");
     assert_eq!(
-        db_count, total_sent as i64,
+        db_count,
+        i64::from(total_sent),
         "Database should match sent count"
     );
 
@@ -474,14 +467,14 @@ pub async fn test_idempotent_high_sequence() -> TestResult {
 
     // Send a batch of messages
     let num_messages = 100;
-    println!("Sending {} messages...", num_messages);
+    println!("Sending {num_messages} messages...");
 
     for i in 0..num_messages {
         producer
             .send(
                 FutureRecord::to(&topic.name)
-                    .payload(&format!("message-{}", i))
-                    .key(&format!("key-{}", i)),
+                    .payload(&format!("message-{i}"))
+                    .key(&format!("key-{i}")),
                 Duration::from_secs(5),
             )
             .await
@@ -514,7 +507,7 @@ pub async fn test_idempotent_high_sequence() -> TestResult {
         .get(0);
 
     assert_eq!(count, num_messages, "Should have all messages");
-    println!("  Total messages: {}", count);
+    println!("  Total messages: {count}");
 
     // Verify offsets are sequential (0 to num_messages-1)
     let max_offset: i64 = ctx
@@ -531,7 +524,7 @@ pub async fn test_idempotent_high_sequence() -> TestResult {
         num_messages - 1,
         "Max offset should be num_messages - 1"
     );
-    println!("  Max offset: {} (correct)", max_offset);
+    println!("  Max offset: {max_offset} (correct)");
 
     // Verify no gaps
     let min_offset: i64 = ctx
@@ -544,7 +537,7 @@ pub async fn test_idempotent_high_sequence() -> TestResult {
         .get(0);
 
     assert_eq!(min_offset, 0, "Min offset should be 0");
-    println!("  Min offset: {} (correct)", min_offset);
+    println!("  Min offset: {min_offset} (correct)");
     println!("  No gaps in sequence\n");
 
     ctx.cleanup().await?;

@@ -16,6 +16,7 @@
 //! Registered `parallel_safe: false`: mutates a global GUC and slows all
 //! shadow forwarding while active.
 
+use crate::common::to_i64;
 use crate::common::{create_db_client, create_producer, TestResult};
 use crate::setup::TestContext;
 use rdkafka::producer::FutureRecord;
@@ -53,8 +54,7 @@ async fn run_no_duplicates_check(topic: String) -> Result<(), String> {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     println!(
-        "Step 3: Producing {} messages (acks delayed {}ms > 5s outbox lease)...",
-        MESSAGE_COUNT, ACK_DELAY_MS
+        "Step 3: Producing {MESSAGE_COUNT} messages (acks delayed {ACK_DELAY_MS}ms > 5s outbox lease)..."
     );
     for i in 0..MESSAGE_COUNT {
         producer
@@ -90,7 +90,7 @@ async fn run_no_duplicates_check(topic: String) -> Result<(), String> {
         let done: i64 = row.get("done");
         let total: i64 = row.get("total");
         let claims: i64 = row.get("claims");
-        if total == MESSAGE_COUNT as i64 && done == total {
+        if total == to_i64(MESSAGE_COUNT) && done == total {
             println!("   All {done} outbox rows finalized (total claim count: {claims})\n");
             break;
         }
@@ -119,7 +119,7 @@ async fn run_no_duplicates_check(topic: String) -> Result<(), String> {
     }
 
     // The attempt accounting must agree: no row was re-claimed (a re-claim of an
-    // in-flight row would count as a lost attempt) and none failed. Wave 3:
+    // in-flight row would count as a lost attempt) and none failed:
     // retry_count counts failed attempts, not claims, so a clean run is 0.
     let claims: i64 = db
         .query_one(

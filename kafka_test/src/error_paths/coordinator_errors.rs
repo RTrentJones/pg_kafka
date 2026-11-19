@@ -101,10 +101,10 @@ pub async fn test_rejoin_after_leave() -> TestResult {
         match tokio::time::timeout(Duration::from_secs(2), consumer2.recv()).await {
             Ok(Ok(_)) => {
                 received += 1;
-                println!("   Second consumer received message {}", received);
+                println!("   Second consumer received message {received}");
             }
             Ok(Err(e)) => {
-                println!("   Consumer error: {}", e);
+                println!("   Consumer error: {e}");
             }
             Err(_) => {
                 // Timeout, continue
@@ -127,6 +127,9 @@ pub async fn test_rejoin_after_leave() -> TestResult {
 ///
 /// Should handle gracefully (either succeed or return appropriate error).
 pub async fn test_commit_new_group() -> TestResult {
+    // Assign partition manually
+    use rdkafka::TopicPartitionList;
+
     println!("=== Test: Commit Offset for New Group ===\n");
 
     let ctx = TestContext::new().await?;
@@ -143,8 +146,6 @@ pub async fn test_commit_new_group() -> TestResult {
     // Create consumer and commit without first joining
     let consumer = crate::common::create_manual_commit_consumer(&group_id)?;
 
-    // Assign partition manually
-    use rdkafka::TopicPartitionList;
     let mut assignment = TopicPartitionList::new();
     assignment.add_partition_offset(&topic.name, 0, rdkafka::Offset::Beginning)?;
     consumer.assign(&assignment)?;
@@ -161,7 +162,7 @@ pub async fn test_commit_new_group() -> TestResult {
     // either way is consistency between the reported outcome and storage: a reported success means
     // offset 1 is actually persisted, a reported failure means nothing was written.
     match &commit_result {
-        Ok(_) => {
+        Ok(()) => {
             println!("   Commit succeeded; verifying offset 1 is persisted");
             assert_offset_committed(ctx.db(), &group_id, &topic.name, 0, 1).await?;
         }
@@ -202,18 +203,18 @@ pub async fn test_empty_group_id() -> TestResult {
         Ok(consumer) => {
             println!("Consumer created with empty group ID, trying to subscribe...");
             match consumer.subscribe(&[&topic.name]) {
-                Ok(_) => {
+                Ok(()) => {
                     println!("   Subscribe unexpectedly succeeded with empty group.id");
                     true
                 }
                 Err(e) => {
-                    println!("   Subscribe failed (expected): {}", e);
+                    println!("   Subscribe failed (expected): {e}");
                     false
                 }
             }
         }
         Err(e) => {
-            println!("   Consumer creation failed (expected): {}", e);
+            println!("   Consumer creation failed (expected): {e}");
             false
         }
     };
@@ -280,10 +281,7 @@ pub async fn test_multiple_consumers_same_group() -> TestResult {
         }
     }
 
-    println!(
-        "   Consumer 1 received: {}, Consumer 2 received: {}",
-        c1_received, c2_received
-    );
+    println!("   Consumer 1 received: {c1_received}, Consumer 2 received: {c2_received}");
 
     ctx.cleanup().await?;
     // QA-3: two consumers in one group over a 2-partition topic with 10 earliest messages must,

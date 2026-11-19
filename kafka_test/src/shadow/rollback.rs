@@ -1,75 +1,32 @@
 //! Sync-mode forwarding happens only after the local commit.
 //!
-//! A sync-mode produce used to send its records to the external broker from
-//! inside the request's transaction, before the commit. If the request then
-//! rolled back, the external broker kept a copy of records pg_kafka never
-//! stored. The forward now runs after the commit (`forward_sync_after_commit`),
-//! and only for rows whose writing subtransaction committed.
+//! A sync-mode forward runs after the commit (`forward_sync_after_commit`), and only
+//! for rows whose writing subtransaction committed: forwarded from inside the
+//! request's transaction, a request that then rolled back would leave the external
+//! broker a copy of records pg_kafka never stored.
 
 use super::external_client::{consume_from_external, verify_external_kafka_ready};
 use super::helpers::{enable_shadow_mode, ShadowMode, ShadowTopicConfig, SyncMode, WriteMode};
 use crate::common::TestResult;
 use crate::setup::TestContext;
-use bytes::BytesMut;
-use kafka_protocol::messages::produce_request::{
-    PartitionProduceData, ProduceRequest, TopicProduceData,
-};
-use kafka_protocol::messages::TopicName;
-use kafka_protocol::protocol::StrBytes;
-use kafka_protocol::records::{
-    Compression, Record as PRecord, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
-};
+use crate::wire::records::{encode, plain_record};
+use kafka_protocol::messages::produce_request::ProduceRequest;
+use kafka_protocol::records::Compression;
 use std::time::Duration;
 use tokio::net::TcpStream;
 
 const BROKER: &str = "localhost:9092";
 
-fn record_batch(key: &str, value: &str) -> bytes::Bytes {
-    let record = PRecord {
-        transactional: false,
-        control: false,
-        partition_leader_epoch: 0,
-        producer_id: -1,
-        producer_epoch: -1,
-        timestamp_type: TimestampType::Creation,
-        offset: 0,
-        sequence: -1,
-        timestamp: 0,
-        key: Some(bytes::Bytes::from(key.to_string())),
-        value: Some(bytes::Bytes::from(value.to_string())),
-        headers: Default::default(),
-    };
-    let mut buf = BytesMut::new();
-    RecordBatchEncoder::encode(
-        &mut buf,
-        [record].iter(),
-        &RecordEncodeOptions {
-            version: 2,
-            compression: Compression::None,
-        },
-    )
-    .expect("encode record batch");
-    buf.freeze()
-}
-
 /// One acks=1 produce carrying one record per listed partition, in order.
 fn produce_request(topic: &str, partitions: &[(i32, &str)]) -> ProduceRequest {
-    let mut t = TopicProduceData::default();
-    t.name = TopicName(StrBytes::from_string(topic.to_string()));
-    t.partition_data = partitions
+    let parts = partitions
         .iter()
         .map(|&(index, value)| {
-            let mut p = PartitionProduceData::default();
-            p.index = index;
-            p.records = Some(record_batch(value, value));
-            p
+            let record = plain_record(0, Some(value), value.as_bytes());
+            (index, encode(&[record], Compression::None))
         })
         .collect();
-    let mut req = ProduceRequest::default();
-    req.acks = 1;
-    req.timeout_ms = 5000;
-    req.topic_data = vec![t];
-    req
+    crate::wire::requests::produce_request(topic, parts, 1)
 }
 
 async fn local_count(ctx: &TestContext, topic: &str) -> Result<i64, Box<dyn std::error::Error>> {
@@ -89,9 +46,7 @@ async fn local_count(ctx: &TestContext, topic: &str) -> Result<i64, Box<dyn std:
 ///
 /// One raw Produce writes partition 0 (fine) and then partition 1, where a test
 /// trigger on `kafka.messages` raises an ERROR. The ERROR rolls the whole
-/// request back, including partition 0. Before the fix partition 0's record had
-/// already been forwarded inside the request (sync mode), so it reached the
-/// external broker; now nothing does. A second, clean produce to partition 0
+/// request back, including partition 0, and nothing reaches the external broker. A second, clean produce to partition 0
 /// checks that sync forwarding still delivers after commit.
 pub async fn test_sync_forward_skips_rolled_back_request() -> TestResult {
     println!("=== Test: Sync Forward Skips A Rolled-Back Request ===\n");
@@ -123,7 +78,7 @@ pub async fn test_sync_forward_skips_rolled_back_request() -> TestResult {
     .await?;
 
     // Inject a Postgres ERROR on any insert into partition 1 of this topic.
-    let function = format!("kafka.test_fail_partition_one_{}", topic_id);
+    let function = format!("kafka.test_fail_partition_one_{topic_id}");
     ctx.db()
         .batch_execute(&format!(
             "CREATE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS \
@@ -136,7 +91,7 @@ pub async fn test_sync_forward_skips_rolled_back_request() -> TestResult {
 
     let outcome = async {
         let mut stream = TcpStream::connect(BROKER).await?;
-        let failed = crate::error_paths::bug_hunt::roundtrip(
+        let failed = crate::wire::roundtrip(
             &mut stream,
             7,
             701,
@@ -152,7 +107,7 @@ pub async fn test_sync_forward_skips_rolled_back_request() -> TestResult {
             .collect();
         let stored_after_failure = local_count(&ctx, &topic).await?;
 
-        let ok = crate::error_paths::bug_hunt::roundtrip(
+        let ok = crate::wire::roundtrip(
             &mut stream,
             7,
             702,
@@ -174,14 +129,10 @@ pub async fn test_sync_forward_skips_rolled_back_request() -> TestResult {
         .await?;
     let (codes, stored_after_failure, ok_code) = outcome?;
 
-    println!(
-        "   failed produce: partition codes {:?}, {} local row(s)",
-        codes, stored_after_failure
-    );
+    println!("   failed produce: partition codes {codes:?}, {stored_after_failure} local row(s)");
     assert!(
         !codes.contains(&0),
-        "no partition of the poisoned request may report success: {:?}",
-        codes
+        "no partition of the poisoned request may report success: {codes:?}"
     );
     assert_eq!(
         stored_after_failure, 0,
@@ -195,11 +146,10 @@ pub async fn test_sync_forward_skips_rolled_back_request() -> TestResult {
         .iter()
         .map(|m| String::from_utf8_lossy(m.value.as_deref().unwrap_or_default()).to_string())
         .collect();
-    println!("   external values: {:?}", values);
+    println!("   external values: {values:?}");
     assert!(
         !values.iter().any(|v| v == "rolled-back" || v == "poison"),
-        "a rolled-back record reached the external broker: {:?}",
-        values
+        "a rolled-back record reached the external broker: {values:?}"
     );
     assert_eq!(
         values,

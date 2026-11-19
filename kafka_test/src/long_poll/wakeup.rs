@@ -77,15 +77,15 @@ pub async fn test_long_poll_producer_wakeup() -> TestResult {
                         .payload()
                         .map(|v| String::from_utf8_lossy(v).to_string());
                     if value.as_deref() == Some("wakeup-message") {
-                        println!("   ✅ Consumer received wakeup message in {:?}", elapsed);
+                        println!("   ✅ Consumer received wakeup message in {elapsed:?}");
                         received_clone.store(true, Ordering::SeqCst);
                         return elapsed;
                     }
                 }
                 Ok(Err(e)) => {
-                    println!("   Consumer error: {}", e);
+                    println!("   Consumer error: {e}");
                 }
-                Err(_) => continue, // Timeout, keep polling
+                Err(_) => {} // Timeout, keep polling
             }
         }
         start.elapsed()
@@ -110,8 +110,8 @@ pub async fn test_long_poll_producer_wakeup() -> TestResult {
     let total_duration = consumer_start.elapsed();
 
     println!("\nStep 5: Verifying timing...");
-    println!("   Consumer received message in: {:?}", consumer_duration);
-    println!("   Total test duration: {:?}", total_duration);
+    println!("   Consumer received message in: {consumer_duration:?}");
+    println!("   Total test duration: {total_duration:?}");
 
     // Consumer should have received the message
     assert!(
@@ -123,8 +123,7 @@ pub async fn test_long_poll_producer_wakeup() -> TestResult {
     // With long polling, we expect < 5 seconds after produce
     assert!(
         consumer_duration < Duration::from_secs(5),
-        "Consumer should wake up quickly after produce, took {:?}",
-        consumer_duration
+        "Consumer should wake up quickly after produce, took {consumer_duration:?}"
     );
 
     println!("\n✅ Long poll producer wakeup test PASSED\n");
@@ -178,7 +177,7 @@ pub async fn test_long_poll_multiple_waiters() -> TestResult {
     match msg {
         Ok(Ok(m)) => {
             let val = m.payload().map(|v| String::from_utf8_lossy(v).to_string());
-            println!("   Received: {:?}", val);
+            println!("   Received: {val:?}");
         }
         _ => println!("   No message or error"),
     }
@@ -189,13 +188,13 @@ pub async fn test_long_poll_multiple_waiters() -> TestResult {
         producer
             .send(
                 FutureRecord::to(&topic)
-                    .payload(&format!("message-{}", i))
-                    .key(&format!("key-{}", i)),
+                    .payload(&format!("message-{i}"))
+                    .key(&format!("key-{i}")),
                 Duration::from_secs(5),
             )
             .await
             .map_err(|(err, _)| err)?;
-        println!("   Produced message-{}", i);
+        println!("   Produced message-{i}");
     }
 
     // Receive all 3 messages
@@ -215,18 +214,17 @@ pub async fn test_long_poll_multiple_waiters() -> TestResult {
                     }
                 }
             }
-            Ok(Err(e)) => println!("   Error: {}", e),
-            Err(_) => continue,
+            Ok(Err(e)) => println!("   Error: {e}"),
+            Err(_) => {}
         }
     }
 
     println!("\nStep 6: Verifying results...");
     assert!(
         received >= 2,
-        "Should receive at least 2 of 3 messages, got {}",
-        received
+        "Should receive at least 2 of 3 messages, got {received}"
     );
-    println!("   Received {} messages", received);
+    println!("   Received {received} messages");
 
     println!("\n✅ Long poll sequential operations test PASSED\n");
     Ok(())

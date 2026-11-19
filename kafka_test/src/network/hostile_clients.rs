@@ -1,14 +1,30 @@
-//! w3_net tests that run against the default configuration.
+//! Hostile clients against the listener in its default configuration.
 
-use super::*;
+use super::{
+    answers, api_versions_frame, client_config, connect_from, rdkafka_roundtrip, stored_rows,
+    time_until_closed, PORT,
+};
+use crate::common::to_i32;
+use crate::common::{DynResult, TestResult};
+use crate::error_codes;
 use crate::setup::TestContext;
+use crate::wire::records::plain_batch;
+use crate::wire::requests::produce_request;
+use crate::wire::{correlation_of, decode_response, read_frame_within, request_frame};
+use bytes::Bytes;
 use kafka_protocol::messages::create_topics_request::{CreatableTopic, CreateTopicsRequest};
 use kafka_protocol::messages::fetch_request::{FetchPartition, FetchRequest, FetchTopic};
 use kafka_protocol::messages::{
     ApiVersionsRequest, BrokerId, CreateTopicsResponse, FetchResponse, ProduceResponse,
 };
-
-const ERROR_INVALID_REQUIRED_ACKS: i16 = 21;
+use kafka_protocol::messages::{ProduceRequest, TopicName};
+use kafka_protocol::protocol::StrBytes;
+use kafka_protocol::records::Compression;
+use rdkafka::producer::{FutureProducer, FutureRecord};
+use std::net::Ipv4Addr;
+use std::time::{Duration, Instant};
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
 
 /// A frame the broker cannot parse (header cut short): it closes the connection.
 const BAD_FRAME: [u8; 7] = [0, 0, 0, 3, 0, 0x12, 0];
@@ -45,7 +61,7 @@ fn fetch(
     r.max_wait_ms = max_wait;
     r.min_bytes = 1;
     r.max_bytes = max_bytes
-        .saturating_mul(partitions.len() as i32)
+        .saturating_mul(to_i32(partitions.len()))
         .max(max_bytes);
     r.topics = vec![t];
     r
@@ -61,12 +77,12 @@ async fn produce_ok(
         topic,
         vec![(
             0,
-            record_batch(&[Bytes::copy_from_slice(value)], Compression::None),
+            plain_batch(&[Bytes::copy_from_slice(value)], Compression::None),
         )],
         1,
     );
     stream.write_all(&request_frame(3, corr, &req)).await?;
-    let frame = read_frame(stream, Duration::from_secs(10))
+    let frame = read_frame_within(stream, Duration::from_secs(10))
         .await?
         .ok_or("connection closed instead of a produce response")?;
     let (c, resp) = decode_response::<ProduceRequest>(3, &frame)?;
@@ -78,14 +94,13 @@ async fn produce_ok(
     Ok(p.base_offset)
 }
 
-/// Item 1: six connections that each send only a 4-byte length prefix (99 MB, 37 MB)
-/// used to hold the whole 512 MiB frame budget: every other client, even a 20-byte
-/// ApiVersions, was refused until they went away. Now only bytes actually received are
-/// charged, and small frames never are.
-pub async fn test_w3_net_frame_budget_lockout() -> TestResult {
-    println!("=== Test: w3_net frame-budget lockout ===\n");
+/// Six connections that each send only a 4-byte length prefix (99 MB, 37 MB) must not
+/// hold the whole 512 MiB frame budget and lock every other client out: only bytes
+/// actually received are charged, and small frames never are.
+pub async fn test_partial_frames_cannot_exhaust_the_frame_budget() -> TestResult {
+    println!("=== Test: frame-budget lockout ===\n");
     let ctx = TestContext::new().await?;
-    let topic = ctx.unique_topic("w3-net-budget").await;
+    let topic = ctx.unique_topic("net-budget").await;
     let attacker = Ipv4Addr::new(127, 0, 0, 2);
 
     let mut hogs = Vec::new();
@@ -131,27 +146,25 @@ pub async fn test_w3_net_frame_budget_lockout() -> TestResult {
     Ok(())
 }
 
-/// Item 2: a response above the 100 MB inbound request limit used to fail to encode
-/// (LengthDelimitedCodec caps outbound frames too) and the connection hung: the client
-/// never got an answer, and nothing else on the connection was answered either. A
+/// A response above the 100 MB inbound request limit is delivered (the outbound codec
+/// does not apply the inbound cap; a refused encode would hang the connection). A
 /// response is bounded by the request's max_bytes, as in Kafka.
-pub async fn test_w3_net_oversized_response_is_delivered() -> TestResult {
-    println!("=== Test: w3_net >100 MB fetch response ===\n");
+pub async fn test_response_larger_than_the_request_limit_is_delivered() -> TestResult {
+    println!("=== Test: >100 MB fetch response ===\n");
     let ctx = TestContext::new().await?;
-    let topic = ctx.unique_topic("w3-net-big").await;
+    let topic = ctx.unique_topic("net-big").await;
     let mut s = TcpStream::connect(("127.0.0.1", PORT)).await?;
     let created: CreateTopicsResponse =
-        crate::error_paths::bug_hunt::roundtrip(&mut s, 2, 1, &create_topic_request(&topic, 2))
-            .await?;
+        crate::wire::roundtrip(&mut s, 2, 1, &create_topic_request(&topic, 2)).await?;
     assert_eq!(created.topics[0].error_code, 0);
 
     // 2 x 51 MB of zeros, gzip-compressed on the wire (a few hundred KB each).
     let value = Bytes::from(vec![0u8; 51_000_000]);
     for p in 0..2 {
-        let batch = record_batch(std::slice::from_ref(&value), Compression::Gzip);
+        let batch = plain_batch(std::slice::from_ref(&value), Compression::Gzip);
         let req = produce_request(&topic, vec![(p, batch)], 1);
         s.write_all(&request_frame(3, 10 + p, &req)).await?;
-        let f = read_frame(&mut s, Duration::from_secs(60))
+        let f = read_frame_within(&mut s, Duration::from_secs(60))
             .await?
             .ok_or("closed on produce")?;
         let (_, resp) = decode_response::<ProduceRequest>(3, &f)?;
@@ -163,7 +176,7 @@ pub async fn test_w3_net_oversized_response_is_delivered() -> TestResult {
     let req = fetch(&topic, &[0, 1], 0, 0, 60_000_000);
     let started = Instant::now();
     s.write_all(&request_frame(4, 20, &req)).await?;
-    let frame = read_frame(&mut s, Duration::from_secs(120))
+    let frame = read_frame_within(&mut s, Duration::from_secs(120))
         .await?
         .ok_or("the connection was closed instead of answering the fetch")?;
     println!(
@@ -183,10 +196,10 @@ pub async fn test_w3_net_oversized_response_is_delivered() -> TestResult {
     Ok(())
 }
 
-/// Item 3: without TCP_NODELAY the second of two pipelined responses waits for the
+/// Without TCP_NODELAY the second of two pipelined responses waits for the
 /// client's delayed ACK (~40 ms on Linux).
-pub async fn test_w3_net_tcp_nodelay() -> TestResult {
-    println!("=== Test: w3_net TCP_NODELAY ===\n");
+pub async fn test_pipelined_requests_are_not_delayed_by_nagle() -> TestResult {
+    println!("=== Test: TCP_NODELAY ===\n");
     let mut s = TcpStream::connect(("127.0.0.1", PORT)).await?;
     s.set_nodelay(true)?;
     let mut times = Vec::new();
@@ -198,7 +211,7 @@ pub async fn test_w3_net_tcp_nodelay() -> TestResult {
         let t0 = Instant::now();
         s.write_all(&bytes).await?;
         for _ in 0..3 {
-            read_frame(&mut s, Duration::from_secs(3))
+            read_frame_within(&mut s, Duration::from_secs(3))
                 .await?
                 .ok_or("closed")?;
         }
@@ -206,28 +219,27 @@ pub async fn test_w3_net_tcp_nodelay() -> TestResult {
     }
     times.sort();
     let median = times[times.len() / 2];
-    println!("   3 pipelined ApiVersions: median {:?}", median);
+    println!("   3 pipelined ApiVersions: median {median:?}");
     assert!(
         median < Duration::from_millis(20),
-        "median {:?}: responses are held back by Nagle",
-        median
+        "median {median:?}: responses are held back by Nagle"
     );
 
     // A real client: 50 sequential acks=1 produces.
     let ctx = TestContext::new().await?;
-    let topic = ctx.unique_topic("w3-net-nodelay").await;
+    let topic = ctx.unique_topic("net-nodelay").await;
     rdkafka_roundtrip(client_config(PORT), &topic, 50).await?;
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");
     Ok(())
 }
 
-/// Item 4: Kafka closes the connection when an acks=0 produce hits any partition error
+/// Kafka closes the connection when an acks=0 produce hits any partition error
 /// (after the good partitions are written), so the client refreshes its metadata.
-pub async fn test_w3_net_acks0_error_closes_connection() -> TestResult {
-    println!("=== Test: w3_net acks=0 error closes the connection ===\n");
+pub async fn test_acks0_produce_error_closes_connection() -> TestResult {
+    println!("=== Test: acks=0 error closes the connection ===\n");
     let ctx = TestContext::new().await?;
-    let topic = ctx.unique_topic("w3-net-acks0").await;
+    let topic = ctx.unique_topic("net-acks0").await;
     let mut s = TcpStream::connect(("127.0.0.1", PORT)).await?;
     produce_ok(&mut s, 1, &topic, b"seed").await?;
 
@@ -236,7 +248,7 @@ pub async fn test_w3_net_acks0_error_closes_connection() -> TestResult {
         &topic,
         vec![(
             0,
-            record_batch(&[Bytes::from_static(b"ok")], Compression::None),
+            plain_batch(&[Bytes::from_static(b"ok")], Compression::None),
         )],
         0,
     );
@@ -252,7 +264,7 @@ pub async fn test_w3_net_acks0_error_closes_connection() -> TestResult {
         &topic,
         vec![(
             7,
-            record_batch(&[Bytes::from_static(b"x")], Compression::None),
+            plain_batch(&[Bytes::from_static(b"x")], Compression::None),
         )],
         0,
     );
@@ -274,11 +286,11 @@ pub async fn test_w3_net_acks0_error_closes_connection() -> TestResult {
         vec![
             (
                 0,
-                record_batch(&[Bytes::from_static(b"kept")], Compression::None),
+                plain_batch(&[Bytes::from_static(b"kept")], Compression::None),
             ),
             (
                 7,
-                record_batch(&[Bytes::from_static(b"y")], Compression::None),
+                plain_batch(&[Bytes::from_static(b"y")], Compression::None),
             ),
         ],
         0,
@@ -301,7 +313,7 @@ pub async fn test_w3_net_acks0_error_closes_connection() -> TestResult {
         producer
             .send(
                 FutureRecord::<(), _>::to(&topic)
-                    .payload(&format!("r{}", i))
+                    .payload(&format!("r{i}"))
                     .partition(0),
                 Duration::from_secs(10),
             )
@@ -319,26 +331,29 @@ pub async fn test_w3_net_acks0_error_closes_connection() -> TestResult {
     Ok(())
 }
 
-/// Item 5: acks other than -1, 0, 1 are answered INVALID_REQUIRED_ACKS and nothing is
+/// Acks other than -1, 0, 1 are answered INVALID_REQUIRED_ACKS and nothing is
 /// written.
-pub async fn test_w3_net_invalid_acks_rejected() -> TestResult {
-    println!("=== Test: w3_net invalid acks ===\n");
+pub async fn test_invalid_acks_rejected_and_nothing_written() -> TestResult {
+    println!("=== Test: invalid acks ===\n");
     let ctx = TestContext::new().await?;
-    let topic = ctx.unique_topic("w3-net-acks").await;
+    let topic = ctx.unique_topic("net-acks").await;
     let mut s = TcpStream::connect(("127.0.0.1", PORT)).await?;
     for (i, acks) in [2i16, -2, 5, i16::MAX].into_iter().enumerate() {
         let req = produce_request(
             &topic,
             vec![(
                 0,
-                record_batch(&[Bytes::from_static(b"no")], Compression::None),
+                plain_batch(&[Bytes::from_static(b"no")], Compression::None),
             )],
             acks,
         );
-        let resp: ProduceResponse =
-            crate::error_paths::bug_hunt::roundtrip(&mut s, 7, i as i32, &req).await?;
+        let resp: ProduceResponse = crate::wire::roundtrip(&mut s, 7, to_i32(i), &req).await?;
         let p = &resp.responses[0].partition_responses[0];
-        assert_eq!(p.error_code, ERROR_INVALID_REQUIRED_ACKS, "acks={}", acks);
+        assert_eq!(
+            p.error_code,
+            error_codes::INVALID_REQUIRED_ACKS,
+            "acks={acks}"
+        );
         assert_eq!(p.base_offset, -1);
     }
     assert_eq!(stored_rows(ctx.db(), &topic).await?, 0, "nothing written");
@@ -347,16 +362,14 @@ pub async fn test_w3_net_invalid_acks_rejected() -> TestResult {
             &topic,
             vec![(
                 0,
-                record_batch(&[Bytes::from_static(b"yes")], Compression::None),
+                plain_batch(&[Bytes::from_static(b"yes")], Compression::None),
             )],
             acks,
         );
-        let resp: ProduceResponse =
-            crate::error_paths::bug_hunt::roundtrip(&mut s, 7, 100, &req).await?;
+        let resp: ProduceResponse = crate::wire::roundtrip(&mut s, 7, 100, &req).await?;
         assert_eq!(
             resp.responses[0].partition_responses[0].error_code, 0,
-            "acks={}",
-            acks
+            "acks={acks}"
         );
     }
     assert_eq!(stored_rows(ctx.db(), &topic).await?, 2);
@@ -365,13 +378,13 @@ pub async fn test_w3_net_invalid_acks_rejected() -> TestResult {
     Ok(())
 }
 
-/// Item 6: Kafka reads a connection serially, so a request before the frame that closes
-/// the connection is always answered. The listener used to give the writer 100 ms and
-/// then abort it, dropping e.g. a long-poll fetch's response.
-pub async fn test_w3_net_response_before_close() -> TestResult {
-    println!("=== Test: w3_net responses before close ===\n");
+/// Kafka reads a connection serially, so a request before the frame that closes the
+/// connection is always answered: the writer is not cut off after a grace period, which
+/// would drop e.g. a long-poll fetch's response.
+pub async fn test_request_before_closing_frame_is_answered() -> TestResult {
+    println!("=== Test: responses before close ===\n");
     let ctx = TestContext::new().await?;
-    let topic = ctx.unique_topic("w3-net-close").await;
+    let topic = ctx.unique_topic("net-close").await;
     let mut s = TcpStream::connect(("127.0.0.1", PORT)).await?;
     produce_ok(&mut s, 1, &topic, b"seed").await?;
 
@@ -381,7 +394,7 @@ pub async fn test_w3_net_response_before_close() -> TestResult {
     bytes.extend_from_slice(&BAD_FRAME);
     let t0 = Instant::now();
     s.write_all(&bytes).await?;
-    let frame = read_frame(&mut s, Duration::from_secs(5))
+    let frame = read_frame_within(&mut s, Duration::from_secs(5))
         .await?
         .ok_or("the long-poll response was dropped when the connection closed")?;
     assert_eq!(correlation_of(&frame), 7);
@@ -396,14 +409,14 @@ pub async fn test_w3_net_response_before_close() -> TestResult {
         &topic,
         vec![(
             0,
-            record_batch(&[Bytes::from_static(b"durable")], Compression::None),
+            plain_batch(&[Bytes::from_static(b"durable")], Compression::None),
         )],
         1,
     );
     let mut bytes = request_frame(3, 8, &req);
     bytes.extend_from_slice(&BAD_FRAME);
     s.write_all(&bytes).await?;
-    let frame = read_frame(&mut s, Duration::from_secs(5))
+    let frame = read_frame_within(&mut s, Duration::from_secs(5))
         .await?
         .ok_or("the produce response was dropped when the connection closed")?;
     let (corr, resp) = decode_response::<ProduceRequest>(3, &frame)?;
@@ -425,7 +438,7 @@ pub async fn test_w3_net_response_before_close() -> TestResult {
     bytes.extend_from_slice(&BAD_FRAME);
     s.write_all(&bytes).await?;
     for i in 0..20 {
-        let f = read_frame(&mut s, Duration::from_secs(5))
+        let f = read_frame_within(&mut s, Duration::from_secs(5))
             .await?
             .ok_or("an ApiVersions response was dropped")?;
         assert_eq!(correlation_of(&f), 100 + i);
