@@ -1,4 +1,4 @@
-name: evidence
+name: Evidence
 
 # Continuously-verified evidence for the pg_kafka showcase (rtrentjones.dev/pg_kafka). Brings the
 # extension up exactly the way ci.yml's E2E jobs do (scripts/ci-pg.sh + the real-broker compose),
@@ -25,7 +25,6 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  PGRX_VERSION: '0.16.1'
 
 jobs:
   evidence:
@@ -36,30 +35,20 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/android
-          sudo apt-get clean
+      - uses: ./.github/actions/free-disk-space
 
       - name: Install Rust toolchain
-        # DR-14: toolchain from rust-toolchain.toml (dated nightly pin)
+        # The toolchain comes from rust-toolchain.toml (a dated nightly pin).
         uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          components: rustfmt, clippy
 
       - uses: ./.github/actions/setup-pg
         with:
           pg: 14
-          pgrx-version: ${{ env.PGRX_VERSION }}
           owned: 'true'
+          cache-prefix: v3-evidence
 
       - name: Install evidence tooling
         run: sudo apt-get install -y postgresql-client kafkacat asciinema
-
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: v3-evidence
 
       - name: Install extension
         run: cargo pgrx install --release --pg-config "$PG_CONFIG"
@@ -72,9 +61,7 @@ jobs:
         run: scripts/ci-pg.sh start "$RUNNER_TEMP/pg"
 
       - name: Start real broker (ceiling baseline)
-        run: |
-          docker compose up -d external-kafka
-          timeout 90 bash -c 'until docker compose ps external-kafka | grep -q "(healthy)"; do sleep 2; done'
+        uses: ./.github/actions/start-external-kafka
 
       - uses: actions/setup-node@v4
         with:

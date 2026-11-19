@@ -14,16 +14,15 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  PGRX_VERSION: "0.16.1"
 
 permissions:
   contents: read
   pull-requests: write
 
-# Every job gets PostgreSQL from apt.postgresql.org through .github/actions/setup-pg (no pgrx
-# source download), and the Rust toolchain from rust-toolchain.toml (a dated nightly pin, the
-# single source of truth for local builds and CI; actions-rust-lang/setup-rust-toolchain reads
-# it when no toolchain is given).
+# Every job gets PostgreSQL from apt.postgresql.org and the cargo-pgrx that Cargo.lock pins
+# through .github/actions/setup-pg (no pgrx source download), and the Rust toolchain from
+# rust-toolchain.toml (a dated nightly pin, the single source of truth for local builds and CI;
+# actions-rust-lang/setup-rust-toolchain reads it when no toolchain is given).
 
 jobs:
   lint:
@@ -48,10 +47,9 @@ jobs:
       - uses: ./.github/actions/setup-pg
         with:
           pg: 14
-          pgrx-version: ${{ env.PGRX_VERSION }}
 
       - name: Run clippy
-        # DR-16: --all-targets so test code is linted too. The other majors are linted in `e2e`.
+        # --all-targets so test code is linted too. The other majors are linted in `e2e`.
         run: cargo clippy --all-targets --features pg14 -- -D warnings
 
       - name: Run clippy (kafka_test)
@@ -72,12 +70,7 @@ jobs:
       - uses: ./.github/actions/setup-pg
         with:
           pg: 14
-          pgrx-version: ${{ env.PGRX_VERSION }}
-
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: v3-cov
+          cache-prefix: v3-cov
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
@@ -132,7 +125,7 @@ jobs:
           path: kafka_test/target/release/kafka_test
           retention-days: 3
 
-  # DR-15: every supported major, for real: build + unit/property tests + clippy on that major,
+  # Every supported major, for real: build + unit/property tests + clippy on that major,
   # install the extension into PostgreSQL N, run the functional E2E suite and the 0.0.0 -> 0.1.0
   # upgrade check against it. PG14 also runs the shadow and performance categories and the
   # test-count drift check.
@@ -152,12 +145,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Free disk space
-        # pgrx builds are large; remove unused preinstalled software (~10 GB)
-        run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/android
-          sudo apt-get clean
-          df -h /
+      - uses: ./.github/actions/free-disk-space
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -166,13 +154,8 @@ jobs:
       - uses: ./.github/actions/setup-pg
         with:
           pg: ${{ matrix.pg }}
-          pgrx-version: ${{ env.PGRX_VERSION }}
           owned: 'true'
-
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: v3-pg${{ matrix.pg }}
+          cache-prefix: v3-pg${{ matrix.pg }}
 
       - name: Clippy (pg${{ matrix.pg }})
         run: cargo clippy --all-targets $FEATURES -- -D warnings
@@ -228,10 +211,7 @@ jobs:
 
       - name: Start external Kafka (shadow tests)
         if: matrix.pg == 14
-        timeout-minutes: 3
-        run: |
-          docker compose up -d external-kafka
-          timeout 90 bash -c 'until docker compose ps external-kafka | grep -q "(healthy)"; do sleep 2; done'
+        uses: ./.github/actions/start-external-kafka
 
       - name: Shadow mode E2E tests
         if: matrix.pg == 14
@@ -244,7 +224,7 @@ jobs:
         run: docker compose down -v || true
 
       - name: Performance E2E tests
-        # DR-18: blocking. The thresholds are conservative floors (~5-10x below dev-machine
+        # Blocking. The thresholds are conservative floors (~5-10x below dev-machine
         # measurements), so this fails only on order-of-magnitude regressions.
         if: matrix.pg == 14
         timeout-minutes: 10
@@ -263,8 +243,8 @@ jobs:
 
   # Real Kafka clients against pg_kafka: the Apache Kafka 3.7 Java tools (interop/run-java-checks.sh)
   # and the differential harness that replays the same raw requests against pg_kafka and a real
-  # Kafka broker (interop/diff/). Checks the integrator expects to fail until the protocol
-  # streams land are marked XFAIL in the scripts; an XFAIL that passes is reported as XPASS.
+  # Kafka broker (interop/diff/). Known failures are listed in the scripts (XFAIL in
+  # java_checks.py, KNOWN in diff/run.py); one that passes is reported as XPASS and fails the job.
   interop:
     name: Interop (Java clients, differential vs Kafka)
     runs-on: ubuntu-latest
@@ -278,12 +258,8 @@ jobs:
       - uses: ./.github/actions/setup-pg
         with:
           pg: 18
-          pgrx-version: ${{ env.PGRX_VERSION }}
           owned: 'true'
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: v3-interop
+          cache-prefix: v3-interop
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -327,7 +303,7 @@ jobs:
           scripts/ci-pg.sh stop "$RUNNER_TEMP/pg"
 
   # Security audit for known vulnerabilities.
-  # DR-16: BLOCKING. Both lockfiles are scanned — the kafka_test crate has its own Cargo.lock.
+  # Blocking. Both lockfiles are scanned — the kafka_test crate has its own Cargo.lock.
   # cargo-deny additionally enforces license policy and pins the allowed git sources to the
   # patched kafka-protocol fork (see deny.toml).
   security:
@@ -363,7 +339,6 @@ jobs:
       - uses: ./.github/actions/setup-pg
         with:
           pg: 14
-          pgrx-version: ${{ env.PGRX_VERSION }}
       - name: Check Cargo.lock is up-to-date
         run: cargo check --locked --features pg14
       - name: Check kafka_test Cargo.lock is up-to-date

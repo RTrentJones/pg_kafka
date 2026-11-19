@@ -1,4 +1,4 @@
-# wave3 net: short libFuzzer runs of the network-edge decoders (fuzz/, cargo-fuzz).
+# Short libFuzzer runs of the network-edge decoders (fuzz/, cargo-fuzz).
 # Each target runs for FUZZ_SECONDS from the committed seed corpus; a crash fails the job
 # and uploads the reproducer.
 name: Fuzz
@@ -18,8 +18,6 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  PGRX_VERSION: "0.16.1"
-  PG_VERSION: "14.20"
 
 permissions:
   contents: read
@@ -38,41 +36,21 @@ jobs:
       # The action reads rust-toolchain.toml (nightly, which cargo-fuzz needs).
       - uses: actions-rust-lang/setup-rust-toolchain@v1
 
-      - name: Install System Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libpq-dev libreadline-dev zlib1g-dev flex bison libxml2-dev libxslt-dev libssl-dev libzstd-dev
+      # The fuzz crate links pg_kafka (pg14), whose pgrx build needs pg_config.
+      - uses: ./.github/actions/setup-pg
+        with:
+          pg: 14
 
-      - name: Cache cargo tools
-        id: cache-tools
+      - name: Cache cargo-fuzz
+        id: cache-cargo-fuzz
         uses: actions/cache@v4
         with:
-          path: |
-            ~/.cargo/bin/cargo-pgrx
-            ~/.cargo/bin/cargo-fuzz
-          key: ${{ runner.os }}-fuzz-tools-pgrx-${{ env.PGRX_VERSION }}-v1
+          path: ~/.cargo/bin/cargo-fuzz
+          key: ${{ runner.os }}-cargo-fuzz-v1
 
-      - name: Install cargo-pgrx and cargo-fuzz
-        if: steps.cache-tools.outputs.cache-hit != 'true'
-        run: |
-          cargo install --locked cargo-pgrx --version ${{ env.PGRX_VERSION }}
-          cargo install --locked cargo-fuzz
-
-      - name: Cache pgrx PostgreSQL Binaries
-        id: cache-pgrx
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.pgrx/14.*
-            ~/.pgrx/14.*_unpack
-            ~/.pgrx/config.toml
-          key: ${{ runner.os }}-pgrx-pg14-${{ env.PGRX_VERSION }}-pg${{ env.PG_VERSION }}-v2
-          restore-keys: |
-            ${{ runner.os }}-pgrx-pg14-${{ env.PGRX_VERSION }}-
-
-      - name: Initialize pgrx
-        if: steps.cache-pgrx.outputs.cache-hit != 'true'
-        run: cargo pgrx init --pg14 download
+      - name: Install cargo-fuzz
+        if: steps.cache-cargo-fuzz.outputs.cache-hit != 'true'
+        run: cargo install --locked cargo-fuzz
 
       - name: Fuzz ${{ matrix.target }}
         working-directory: fuzz
@@ -80,7 +58,7 @@ jobs:
           FUZZ_SECONDS: ${{ github.event_name == 'schedule' && '1800' || '180' }}
         run: |
           cargo fuzz run ${{ matrix.target }} corpus/${{ matrix.target }} -- \
-            -max_total_time=$FUZZ_SECONDS -rss_limit_mb=4096 -max_len=1048576
+            -max_total_time="$FUZZ_SECONDS" -rss_limit_mb=4096 -max_len=1048576
 
       - name: Upload crash artifacts
         if: failure()
