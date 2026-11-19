@@ -33,16 +33,15 @@ pub fn transaction_timeout_is_valid(timeout_ms: i32, max_timeout_ms: i32) -> boo
 /// - If found, bumps epoch (fences old producer instances)
 /// - If not found, allocates new producer ID and creates transaction record
 ///
-/// For idempotent-only producers (transactional_id is None):
-/// - If existing_producer_id is -1, allocates new producer ID
-/// - Otherwise, validates and bumps epoch for reconnecting producer
+/// For idempotent-only producers (transactional_id is None) a new producer ID is
+/// allocated, whatever `existing_producer_id` / `existing_epoch` say (Kafka 3.7).
 ///
 /// # Arguments
 /// * `ctx` - Handler context (store, coordinator, broker metadata, etc.)
 /// * `transactional_id` - Optional transactional ID (for transactional producers)
 /// * `transaction_timeout_ms` - Transaction timeout in ms (for transactional producers)
-/// * `existing_producer_id` - Existing producer ID for reconnection (-1 for new)
-/// * `existing_epoch` - Existing epoch for reconnection (-1 for new)
+/// * `existing_producer_id` - Producer ID the client holds (-1 for none; ignored)
+/// * `existing_epoch` - Epoch the client holds (-1 for none; ignored)
 /// * `client_id` - Optional client identifier for debugging
 ///
 /// # Returns
@@ -51,8 +50,8 @@ pub fn handle_init_producer_id(
     ctx: &HandlerContext,
     transactional_id: Option<String>,
     transaction_timeout_ms: i32,
-    existing_producer_id: i64,
-    existing_epoch: i16,
+    _existing_producer_id: i64,
+    _existing_epoch: i16,
     client_id: Option<&str>,
 ) -> Result<InitProducerIdResponse> {
     // The GUC is read only for a transactional producer (the bound does not apply to
@@ -66,8 +65,6 @@ pub fn handle_init_producer_id(
         ctx,
         transactional_id,
         transaction_timeout_ms,
-        existing_producer_id,
-        existing_epoch,
         client_id,
         max_timeout_ms,
     )
@@ -78,8 +75,6 @@ pub(crate) fn init_producer_id_bounded(
     ctx: &HandlerContext,
     transactional_id: Option<String>,
     transaction_timeout_ms: i32,
-    existing_producer_id: i64,
-    existing_epoch: i16,
     client_id: Option<&str>,
     max_timeout_ms: i32,
 ) -> Result<InitProducerIdResponse> {
@@ -113,46 +108,15 @@ pub(crate) fn init_producer_id_bounded(
         return Ok(response);
     }
 
-    // Idempotent-only producer (no transactional_id)
-    if existing_producer_id == -1 {
-        // New producer: allocate a fresh producer ID with epoch 0
-        let (producer_id, epoch) = store.allocate_producer_id(client_id, None)?;
-
-        response.error_code = ERROR_NONE;
-        response.producer_id = ProducerId(producer_id);
-        response.producer_epoch = epoch;
-    } else {
-        // Existing producer reconnecting: validate and bump epoch
-        // First, check if the producer exists and get current epoch
-        match store.get_producer_epoch(existing_producer_id)? {
-            Some(current_epoch) => {
-                // KIP-360: the client must present the epoch it currently holds. A
-                // lower epoch means a newer instance took over (fenced); a higher one
-                // was never issued by this broker.
-                if existing_epoch != current_epoch {
-                    return Err(crate::kafka::error::KafkaError::producer_fenced(
-                        existing_producer_id,
-                        existing_epoch,
-                        current_epoch,
-                    ));
-                }
-
-                // Bump the epoch (or, once it is exhausted, get a fresh producer id).
-                let (producer_id, new_epoch) =
-                    store.increment_producer_epoch(existing_producer_id)?;
-
-                response.error_code = ERROR_NONE;
-                response.producer_id = ProducerId(producer_id);
-                response.producer_epoch = new_epoch;
-            }
-            None => {
-                // Producer ID not found - client has an invalid ID
-                return Err(crate::kafka::error::KafkaError::unknown_producer_id(
-                    existing_producer_id,
-                ));
-            }
-        }
-    }
+    // Idempotent-only producer: as in Kafka, always a fresh producer id at epoch 0,
+    // whatever id and epoch the request presents. A client resuming after its state
+    // expired (KIP-360) presents its old id; refusing it (UNKNOWN_PRODUCER_ID, or
+    // PRODUCER_FENCED for a retried request whose epoch was already bumped) is fatal
+    // to the Java producer, while a new id lets it reset its sequences and go on.
+    let (producer_id, epoch) = store.allocate_producer_id(client_id, None)?;
+    response.error_code = ERROR_NONE;
+    response.producer_id = ProducerId(producer_id);
+    response.producer_epoch = epoch;
 
     Ok(response)
 }
@@ -189,8 +153,6 @@ mod tests {
             &ctx,
             Some("tx".to_string()),
             timeout_ms,
-            -1,
-            -1,
             None,
             crate::kafka::constants::DEFAULT_TRANSACTION_MAX_TIMEOUT_MS,
         )
@@ -230,36 +192,30 @@ mod tests {
         assert_eq!(run_txn(&store, 900_000).error_code, ERROR_NONE);
     }
 
+    /// Kafka 3.7 answers an idempotent InitProducerId that presents a producer id
+    /// (KIP-360: a client resuming after its state expired, or retrying a request
+    /// whose epoch bump it never saw) with a fresh producer id at epoch 0, whether
+    /// the id is current, stale or unknown. pg_kafka answered PRODUCER_FENCED or
+    /// UNKNOWN_PRODUCER_ID, which the Java producer treats as fatal.
     #[test]
-    fn reinit_requires_the_current_epoch() {
-        // KIP-360: both a stale and a never-issued (higher) epoch are fenced; the
-        // epoch must not be bumped for either.
-        for epoch in [2i16, 4] {
+    fn idempotent_reinit_with_an_existing_id_gets_a_new_producer_id() {
+        for epoch in [-1i16, 0, 2, 3, 4, i16::MAX] {
             let mut store = MockKafkaStore::new();
-            store.expect_get_producer_epoch().returning(|_| Ok(Some(3)));
-            let err = run(&store, epoch).unwrap_err();
-            assert!(
-                matches!(err, crate::kafka::error::KafkaError::ProducerFenced { .. }),
-                "epoch {} should be fenced, got {:?}",
-                epoch,
-                err
+            store
+                .expect_allocate_producer_id()
+                .times(1)
+                .returning(|_, _| Ok((2000, 0)));
+            let response = run(&store, epoch).unwrap();
+            assert_eq!(
+                (
+                    response.error_code,
+                    response.producer_id.0,
+                    response.producer_epoch
+                ),
+                (ERROR_NONE, 2000, 0),
+                "presented epoch {}",
+                epoch
             );
         }
-    }
-
-    #[test]
-    fn reinit_returns_the_id_the_store_hands_out() {
-        // Once the epoch is exhausted the store allocates a fresh producer id; the
-        // response must carry that id, not the old one.
-        let mut store = MockKafkaStore::new();
-        store
-            .expect_get_producer_epoch()
-            .returning(|_| Ok(Some(i16::MAX)));
-        store
-            .expect_increment_producer_epoch()
-            .returning(|_| Ok((2000, 0)));
-        let response = run(&store, i16::MAX).unwrap();
-        assert_eq!(response.producer_id.0, 2000);
-        assert_eq!(response.producer_epoch, 0);
     }
 }

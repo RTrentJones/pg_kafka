@@ -5,6 +5,8 @@ use crate::common::TestResult;
 use crate::fixtures::TestTopicBuilder;
 use crate::setup::TestContext;
 use crate::w3_txn::wire::{batch, now_ms, Wire};
+use kafka_protocol::messages::init_producer_id_request::InitProducerIdRequest;
+use kafka_protocol::messages::init_producer_id_response::InitProducerIdResponse;
 use kafka_protocol::messages::offset_commit_request::{
     OffsetCommitRequest, OffsetCommitRequestPartition, OffsetCommitRequestTopic,
 };
@@ -13,7 +15,7 @@ use kafka_protocol::messages::produce_request::{
     PartitionProduceData, ProduceRequest, TopicProduceData,
 };
 use kafka_protocol::messages::produce_response::ProduceResponse;
-use kafka_protocol::messages::{GroupId, TopicName};
+use kafka_protocol::messages::{GroupId, ProducerId, TopicName};
 use kafka_protocol::protocol::StrBytes;
 
 const ERROR_NONE: i16 = 0;
@@ -163,6 +165,61 @@ pub async fn test_offset_commit_to_a_missing_partition_is_refused() -> TestResul
         .get(0);
     assert_eq!(stored, 0, "nothing is stored for the missing partition");
     println!("✅ partition 5 refused, partition 0 committed\n");
+
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// InitProducerId v4 without a transactional id: `(error_code, producer_id, epoch)`.
+async fn init_idempotent(
+    wire: &mut Wire,
+    producer_id: i64,
+    epoch: i16,
+) -> crate::w3_txn::wire::Result<(i16, i64, i16)> {
+    let mut req = InitProducerIdRequest::default();
+    req.transactional_id = None;
+    req.transaction_timeout_ms = 60_000;
+    req.producer_id = ProducerId(producer_id);
+    req.producer_epoch = epoch;
+    let resp: InitProducerIdResponse = wire.call(22, 4, &req).await?;
+    Ok((resp.error_code, resp.producer_id.0, resp.producer_epoch))
+}
+
+/// An idempotent InitProducerId presenting a producer id (KIP-360: a producer
+/// resuming after its state expired, or retrying an epoch bump whose answer it lost)
+/// gets a fresh producer id at epoch 0, as from Kafka 3.7, whether the presented id
+/// is current, stale or unknown; the Java producer treats PRODUCER_FENCED and
+/// UNKNOWN_PRODUCER_ID here as fatal. The new id produces from sequence 0.
+pub async fn test_idempotent_reinit_with_an_old_producer_id_gets_a_new_one() -> TestResult {
+    println!("=== Test: idempotent InitProducerId with an existing producer id ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = TestTopicBuilder::new(&ctx, "parity-reinit")
+        .build()
+        .await?
+        .name;
+    let mut wire = Wire::connect().await?;
+
+    let (code, first, epoch) = init_idempotent(&mut wire, -1, -1).await?;
+    assert_eq!((code, epoch), (ERROR_NONE, 0));
+    let mut seen = vec![first];
+    for (presented, presented_epoch, what) in [
+        (first, 0, "current id and epoch"),
+        (first, 0, "a retry of the same request"),
+        (first + 1_000_000, 0, "an id never issued"),
+    ] {
+        let (code, id, epoch) = init_idempotent(&mut wire, presented, presented_epoch).await?;
+        assert_eq!((code, epoch), (ERROR_NONE, 0), "{what}");
+        assert!(!seen.contains(&id), "{what}: a new producer id");
+        seen.push(id);
+    }
+
+    let last = *seen.last().expect("ids were allocated");
+    let (code, _) = wire
+        .produce(&topic, 0, batch(&["a"], last, 0, 0, false, None), None)
+        .await?;
+    assert_eq!(code, ERROR_NONE, "the new id produces from sequence 0");
+    println!("✅ every re-init got a fresh producer id\n");
 
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");

@@ -194,6 +194,7 @@ use kafka_test::{
     test_idempotent_producer_basic,
     test_idempotent_producer_epoch_bump,
     test_idempotent_producer_restart,
+    test_idempotent_reinit_with_an_old_producer_id_gets_a_new_one,
     test_incremental_alter_configs_retention_roundtrip,
     test_invalid_group_id,
     test_join_group_held_until_all_members_rejoin,
@@ -1018,6 +1019,12 @@ fn get_all_tests() -> Vec<TestDef> {
             category: "error_paths",
             name: "test_offset_commit_to_a_missing_partition_is_refused",
             test_fn: wrap_test!(test_offset_commit_to_a_missing_partition_is_refused),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_idempotent_reinit_with_an_old_producer_id_gets_a_new_one",
+            test_fn: wrap_test!(test_idempotent_reinit_with_an_old_producer_id_gets_a_new_one),
             parallel_safe: true,
         },
         TestDef {
