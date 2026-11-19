@@ -25,6 +25,7 @@ use std::collections::HashMap;
 
 use bytes::{Buf, BufMut};
 
+use super::wire;
 use crate::kafka::constants::MAX_PREALLOC_ELEMENTS;
 use crate::kafka::error::{KafkaError, Result};
 
@@ -37,7 +38,7 @@ pub struct MemberAssignment {
     /// Protocol version
     pub version: i16,
 
-    /// Assigned partitions per topic: topic_name -> [partition_ids]
+    /// Assigned partitions per topic: topic name -> partition ids
     pub topic_partitions: HashMap<String, Vec<i32>>,
 
     /// Optional user-defined data (passed through unchanged)
@@ -69,12 +70,12 @@ impl MemberAssignment {
 
     /// Check if this assignment is empty (no partitions assigned)
     pub fn is_empty(&self) -> bool {
-        self.topic_partitions.is_empty() || self.topic_partitions.values().all(|p| p.is_empty())
+        self.topic_partitions.is_empty() || self.topic_partitions.values().all(Vec::is_empty)
     }
 
     /// Total number of partitions assigned
     pub fn partition_count(&self) -> usize {
-        self.topic_partitions.values().map(|p| p.len()).sum()
+        self.topic_partitions.values().map(Vec::len).sum()
     }
 
     /// Parse a MemberAssignment from raw bytes
@@ -106,17 +107,14 @@ impl MemberAssignment {
 
         // Read topic_partitions array
         let topics_len = buf.get_i32();
-        if topics_len < 0 {
-            return Err(KafkaError::CorruptMessage {
-                message: format!("Invalid topic_partitions array length: {}", topics_len),
-            });
-        }
+        let topics_len = usize::try_from(topics_len).map_err(|_| KafkaError::CorruptMessage {
+            message: format!("Invalid topic_partitions array length: {topics_len}"),
+        })?;
 
         // Cap the pre-allocation hint: `topics_len` is attacker-controlled (see
         // MAX_PREALLOC_ELEMENTS). The per-element bounds checks below still allow an
         // honestly-large array to parse; only the up-front allocation is bounded.
-        let mut topic_partitions =
-            HashMap::with_capacity((topics_len as usize).min(MAX_PREALLOC_ELEMENTS));
+        let mut topic_partitions = HashMap::with_capacity(topics_len.min(MAX_PREALLOC_ELEMENTS));
 
         for _ in 0..topics_len {
             // Read topic name
@@ -126,12 +124,10 @@ impl MemberAssignment {
                 });
             }
 
-            let str_len = buf.get_i16();
-            if str_len < 0 {
-                continue; // Null topic - skip
-            }
-
-            let str_len = str_len as usize;
+            // A null (negative-length) topic name is skipped.
+            let Ok(str_len) = usize::try_from(buf.get_i16()) else {
+                continue;
+            };
             if buf.remaining() < str_len {
                 return Err(KafkaError::CorruptMessage {
                     message: format!(
@@ -147,7 +143,7 @@ impl MemberAssignment {
 
             let topic_name =
                 String::from_utf8(str_bytes).map_err(|e| KafkaError::CorruptMessage {
-                    message: format!("Invalid UTF-8 in topic name: {}", e),
+                    message: format!("Invalid UTF-8 in topic name: {e}"),
                 })?;
 
             // Read partitions array
@@ -157,13 +153,11 @@ impl MemberAssignment {
                 });
             }
 
-            let partitions_len = buf.get_i32();
-            if partitions_len < 0 {
+            // A null (negative-length) partitions array is an empty assignment.
+            let Ok(partitions_len) = usize::try_from(buf.get_i32()) else {
                 topic_partitions.insert(topic_name, Vec::new());
                 continue;
-            }
-
-            let partitions_len = partitions_len as usize;
+            };
             if buf.remaining() < partitions_len * 4 {
                 return Err(KafkaError::CorruptMessage {
                     message: format!(
@@ -183,20 +177,7 @@ impl MemberAssignment {
         }
 
         // Read user_data (optional)
-        let user_data = if buf.remaining() >= 4 {
-            let data_len = buf.get_i32();
-            if data_len < 0 {
-                None
-            } else if buf.remaining() >= data_len as usize {
-                let mut data = vec![0u8; data_len as usize];
-                buf.copy_to_slice(&mut data);
-                Some(data)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        let user_data = wire::get_trailing_user_data(&mut buf);
 
         Ok(Self {
             version,
@@ -208,47 +189,28 @@ impl MemberAssignment {
     /// Encode this assignment to bytes for wire format
     ///
     /// # Returns
-    /// Encoded bytes suitable for SyncGroup response assignment field
-    pub fn encode(&self) -> Vec<u8> {
+    /// Encoded bytes for the SyncGroup response's assignment field, or `Internal` if a length
+    /// does not fit its prefix
+    pub fn encode(&self) -> Result<Vec<u8>> {
         let mut buf = Vec::with_capacity(128);
-
-        // Write version
         buf.put_i16(self.version);
 
-        // Write topic_partitions array
-        // Sort topics for deterministic output
+        // Topics and their partitions are sorted so the encoding is deterministic.
         let mut topics: Vec<_> = self.topic_partitions.iter().collect();
         topics.sort_by_key(|(name, _)| *name);
-
-        buf.put_i32(topics.len() as i32);
+        wire::put_i32_len(&mut buf, topics.len(), "topic_partitions array")?;
         for (topic_name, partitions) in topics {
-            // Write topic name
-            let name_bytes = topic_name.as_bytes();
-            buf.put_i16(name_bytes.len() as i16);
-            buf.put_slice(name_bytes);
-
-            // Write partitions array (sorted for determinism)
+            wire::put_string(&mut buf, topic_name)?;
             let mut sorted_partitions = partitions.clone();
-            sorted_partitions.sort();
-
-            buf.put_i32(sorted_partitions.len() as i32);
+            sorted_partitions.sort_unstable();
+            wire::put_i32_len(&mut buf, sorted_partitions.len(), "partitions array")?;
             for partition in sorted_partitions {
                 buf.put_i32(partition);
             }
         }
 
-        // Write user_data
-        match &self.user_data {
-            Some(data) => {
-                buf.put_i32(data.len() as i32);
-                buf.put_slice(data);
-            }
-            None => {
-                buf.put_i32(-1); // null marker
-            }
-        }
-
-        buf
+        wire::put_nullable_bytes(&mut buf, self.user_data.as_deref())?;
+        Ok(buf)
     }
 }
 
@@ -266,10 +228,9 @@ mod tests {
 
     #[test]
     fn test_parse_huge_topics_len_does_not_oom() {
-        // SEC-6 regression: before the `with_capacity(.. .min(MAX_PREALLOC_ELEMENTS))` cap, a
-        // huge topic_partitions array length pre-allocated a multi-GB HashMap up front and
-        // aborted the process. With the cap it must error gracefully instead. An OOM here means
-        // the cap regressed.
+        // A huge declared topic_partitions length must not be pre-allocated (a multi-GB
+        // HashMap would abort the process); the capacity is capped at MAX_PREALLOC_ELEMENTS
+        // and the missing data is an error. An OOM here means the cap is gone.
         let mut buf = Vec::new();
         buf.extend_from_slice(&0i16.to_be_bytes()); // version
         buf.extend_from_slice(&i32::MAX.to_be_bytes()); // topic_partitions len = 2.1B, no data follows
@@ -351,7 +312,7 @@ mod tests {
             user_data: Some(vec![1, 2, 3, 4]),
         };
 
-        let encoded = original.encode();
+        let encoded = original.encode().unwrap();
         let decoded = MemberAssignment::parse(&encoded).unwrap();
 
         assert_eq!(original.version, decoded.version);
@@ -361,7 +322,7 @@ mod tests {
         for (topic, partitions) in &original.topic_partitions {
             let decoded_partitions = decoded.partitions(topic);
             let mut orig_sorted = partitions.clone();
-            orig_sorted.sort();
+            orig_sorted.sort_unstable();
             assert_eq!(orig_sorted, decoded_partitions);
         }
     }
@@ -369,7 +330,7 @@ mod tests {
     #[test]
     fn test_encode_empty_assignment() {
         let assign = MemberAssignment::default();
-        let encoded = assign.encode();
+        let encoded = assign.encode().unwrap();
         let decoded = MemberAssignment::parse(&encoded).unwrap();
 
         assert!(decoded.is_empty());

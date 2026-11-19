@@ -35,6 +35,7 @@
 pub mod member_assignment;
 pub mod strategies;
 pub mod subscription;
+mod wire;
 
 #[cfg(test)]
 mod tests;

@@ -1,7 +1,5 @@
-// Metadata handlers
-//
-// Handlers for ApiVersions and Metadata requests.
-// These are discovery-focused APIs that help clients understand broker capabilities.
+//! ApiVersions and Metadata: what the broker supports, and topic and partition discovery with
+//! auto-creation of requested topics.
 
 use crate::kafka::constants::{
     DEFAULT_BROKER_ID, ERROR_NONE, ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
@@ -20,7 +18,7 @@ pub fn handle_api_versions() -> kafka_protocol::messages::api_versions_response:
 /// Handle Metadata request
 ///
 /// Returns metadata for all topics or specific requested topics. A specifically-requested topic
-/// that doesn't exist is auto-created only when `allow_auto_topic_creation` is true (CONF-2);
+/// that doesn't exist is auto-created only when `allow_auto_topic_creation` is true;
 /// otherwise it is reported as UNKNOWN_TOPIC_OR_PARTITION and left uncreated.
 ///
 /// # Arguments
@@ -62,7 +60,7 @@ pub fn handle_metadata(
             let mut topics_metadata = Vec::new();
             for topic_name in topic_names {
                 // Resolve the topic's partition count. With auto-creation enabled (the default, and
-                // the only behaviour pre-v4) a missing topic is created; with it disabled (CONF-2)
+                // the only behaviour pre-v4) a missing topic is created; with it disabled
                 // a missing topic resolves to None and is reported as UNKNOWN_TOPIC_OR_PARTITION
                 // rather than being created.
                 let resolved: Result<Option<i32>> = if allow_auto_topic_creation {
@@ -106,11 +104,12 @@ pub fn handle_metadata(
     Ok(response)
 }
 
-/// One topic's Metadata entry with one partition entry per partition (wave3 groups). A stored
+/// One topic's Metadata entry with one partition entry per partition. A stored
 /// partition count outside `1..=HARD_MAX_PARTITIONS` (only possible if the CHECK constraint on
 /// `kafka.topics.partitions` was bypassed) is reported as UNKNOWN_SERVER_ERROR with no
-/// partitions instead of being allocated: a count of 2,000,000,000 used to abort the worker on an
-/// allocation failure and send Postgres into crash recovery on every Metadata request.
+/// partitions instead of being allocated: allocating a count of 2,000,000,000 would abort the
+/// worker on an allocation failure and send Postgres into crash recovery on every Metadata
+/// request.
 pub fn topic_metadata_for(
     topic_name: String,
     partition_count: i32,
@@ -137,7 +136,7 @@ pub fn topic_metadata_for(
 }
 
 #[cfg(test)]
-mod wave3_groups_tests {
+mod tests {
     use super::*;
 
     #[test]
@@ -152,8 +151,11 @@ mod wave3_groups_tests {
             crate::kafka::limits::HARD_MAX_PARTITIONS + 1,
         ] {
             let t = topic_metadata_for("t".to_string(), bad);
-            assert_eq!(t.error_code, ERROR_UNKNOWN_SERVER_ERROR, "count {}", bad);
-            assert!(t.partitions.is_empty());
+            assert_eq!(t.error_code, ERROR_UNKNOWN_SERVER_ERROR, "count {bad}");
+            assert_eq!(
+                t.partitions,
+                [] as [kafka_protocol::messages::metadata_response::MetadataResponsePartition; 0]
+            );
         }
     }
 }

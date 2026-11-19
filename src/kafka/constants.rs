@@ -284,6 +284,8 @@ pub const ERROR_INVALID_TRANSACTION_TIMEOUT: i16 = 50;
 pub const ERROR_CONCURRENT_TRANSACTIONS: i16 = 51;
 /// OPERATION_NOT_ATTEMPTED: the request failed for another of its entries.
 pub const ERROR_OPERATION_NOT_ATTEMPTED: i16 = 55;
+/// KAFKA_STORAGE_ERROR (retriable): the broker cannot serve the partition from its log.
+pub const ERROR_KAFKA_STORAGE_ERROR: i16 = 56;
 /// SASL_AUTHENTICATION_FAILED.
 pub const ERROR_SASL_AUTHENTICATION_FAILED: i16 = 58;
 /// UNKNOWN_PRODUCER_ID.

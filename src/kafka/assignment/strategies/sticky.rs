@@ -20,9 +20,11 @@
 //!
 //! # Example
 //!
+//! ```text
 //! Previous: Consumer A has [0,1,2], Consumer B has [3,4,5]
 //! Consumer B leaves -> partitions [3,4,5] become orphaned
-//! Consumer A gets [3,4,5] added -> Consumer A now has [0,1,2,3,4,5]
+//! Consumer A gets [3,4,5] added -> Consumer A has [0,1,2,3,4,5]
+//! ```
 //!
 //! # Characteristics
 //!
@@ -61,7 +63,7 @@ impl StickyStrategy {
 
 impl AssignmentStrategy for StickyStrategy {
     fn name(&self) -> &'static str {
-        // CG-2: this is the *eager* sticky assignor — it computes a full assignment server-side and
+        // This is the *eager* sticky assignor — it computes a full assignment server-side and
         // does not implement the cooperative (incremental, KIP-429) rebalance protocol. Advertising
         // "cooperative-sticky" would tell clients to skip revoking moved partitions, briefly
         // double-owning them. Report the honest eager name.
@@ -80,7 +82,7 @@ impl AssignmentStrategy for StickyStrategy {
         let total_partitions: usize = input
             .topic_partitions
             .values()
-            .map(|&count| count.max(0) as usize)
+            .map(|&count| usize::try_from(count).unwrap_or(0))
             .sum();
 
         let num_members = input.subscriptions.len();
@@ -173,16 +175,15 @@ impl AssignmentStrategy for StickyStrategy {
                 .push(partition);
         }
 
-        // Step 4: Balance — move partitions from overloaded members to underloaded ones. CG-2:
-        // sticky preservation (Step 1) can leave a member holding far more partitions than a peer
-        // (e.g. when a new member joins an assignment one member already fully owns), and this was
-        // previously never corrected ("skip for MVP").
+        // Step 4: Balance: move partitions from overloaded members to underloaded ones. Sticky
+        // preservation (Step 1) can leave a member holding far more partitions than a peer
+        // (e.g. when a new member joins an assignment one member already fully owns).
         balance_assignments(&mut result, input, total_partitions);
 
         // Sort partition lists for consistent output
         for assignment in result.values_mut() {
             for partitions in assignment.topic_partitions.values_mut() {
-                partitions.sort();
+                partitions.sort_unstable();
             }
         }
 
@@ -191,7 +192,7 @@ impl AssignmentStrategy for StickyStrategy {
 }
 
 /// Move partitions from overloaded members to subscribed, less-loaded members until the load spread
-/// is at most one (CG-2). Each move takes a partition from a member and hands it to a member that
+/// is at most one. Each move takes a partition from a member and hands it to a member that
 /// subscribes to its topic and is at least two partitions lighter, which strictly reduces the
 /// most-loaded member's count — so the loop terminates within `total_partitions` iterations.
 fn balance_assignments(
@@ -231,9 +232,8 @@ fn balance_assignments(
             }
         }
 
-        let (from, to, topic, partition) = match chosen {
-            Some(mv) => mv,
-            None => break,
+        let Some((from, to, topic, partition)) = chosen else {
+            break;
         };
 
         if let Some(parts) = result
@@ -307,7 +307,7 @@ mod tests {
             .values()
             .flat_map(|a| a.partitions("topic-a"))
             .collect();
-        assert_eq!(all_partitions, [0, 1, 2, 3].iter().cloned().collect());
+        assert_eq!(all_partitions, [0, 1, 2, 3].iter().copied().collect());
     }
 
     #[test]
@@ -383,7 +383,7 @@ mod tests {
         let strategy = StickyStrategy::with_previous(previous);
         let result = strategy.assign(&input);
 
-        // CG-2: a new member joining an assignment member-1 fully owns must trigger rebalancing —
+        // A new member joining an assignment member-1 fully owns must trigger rebalancing —
         // the load is split evenly (2/2), with every partition still assigned exactly once.
         assert_eq!(result["member-1"].partition_count(), 2);
         assert_eq!(result["member-2"].partition_count(), 2);
@@ -454,7 +454,7 @@ mod tests {
 
         // topic-a preserved, topic-b removed
         assert_eq!(result["member-1"].partitions("topic-a"), vec![0, 1]);
-        assert!(result["member-1"].partitions("topic-b").is_empty());
+        assert_eq!(result["member-1"].partitions("topic-b"), [] as [i32; 0]);
     }
 
     #[test]

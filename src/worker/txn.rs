@@ -13,9 +13,9 @@ use super::lifecycle::{begin_db_work, end_db_work};
 use crate::kafka::dispatch::RequestOutcome;
 use crate::pg_warning;
 
-/// Kafka error code KAFKA_STORAGE_ERROR (retriable): what a request gets when its batch
-/// could not run or commit (schema missing, commit failure).
-pub(super) const ERROR_KAFKA_STORAGE_ERROR: i16 = 56;
+/// What a request gets when its batch could not run or commit (schema missing, commit
+/// failure).
+pub(super) use crate::kafka::constants::ERROR_KAFKA_STORAGE_ERROR;
 
 /// Kafka error code REQUEST_TIMED_OUT (retriable): the batch timed out waiting on a lock.
 pub(super) const ERROR_REQUEST_TIMED_OUT: i16 = 7;

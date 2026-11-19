@@ -43,7 +43,7 @@ impl AssignmentInput {
         subscriptions: HashMap<String, MemberSubscription>,
         topic_partitions: HashMap<String, i32>,
     ) -> Self {
-        // wave3 groups: the assignors iterate every partition, so a topic whose stored count
+        // The assignors iterate every partition, so a topic whose stored count
         // is corrupt (outside 1..=HARD_MAX_PARTITIONS) is left out instead of being expanded.
         let mut topic_partitions = topic_partitions;
         topic_partitions
@@ -123,7 +123,7 @@ mod tests {
 
     #[test]
     fn test_assignment_input_drops_corrupt_partition_counts() {
-        // wave3 groups: a corrupt stored count must not be expanded into billions of partitions.
+        // A corrupt stored count must not be expanded into billions of partitions.
         let input = AssignmentInput::new(
             HashMap::new(),
             HashMap::from([
@@ -152,7 +152,7 @@ mod tests {
 
     #[test]
     fn test_create_strategy_sticky() {
-        // CG-2: both aliases resolve to the eager sticky assignor, which reports the honest "sticky"
+        // Both aliases resolve to the eager sticky assignor, which reports the honest "sticky"
         // name (not "cooperative-sticky" — it does not implement the cooperative rebalance protocol).
         let strategy = create_strategy("sticky").unwrap();
         assert_eq!(strategy.name(), "sticky");
@@ -217,6 +217,6 @@ mod tests {
             input.members_for_topic("topic-b"),
             vec!["member-2", "member-3"]
         );
-        assert!(input.members_for_topic("topic-c").is_empty());
+        assert_eq!(input.members_for_topic("topic-c"), [] as [String; 0]);
     }
 }

@@ -1,10 +1,4 @@
-// Transaction handlers
-//
-// Handles transaction-related requests for Kafka transactions (Phase 10).
-// - AddPartitionsToTxn: Register partitions in an active transaction
-// - AddOffsetsToTxn: Include consumer offset commits in a transaction
-// - EndTxn: Commit or abort a transaction
-// - TxnOffsetCommit: Commit offsets as part of a transaction
+//! Transaction handlers: AddPartitionsToTxn, AddOffsetsToTxn, EndTxn and TxnOffsetCommit.
 
 use crate::kafka::constants::ERROR_NONE;
 use crate::kafka::error::{KafkaError, Result};
@@ -45,17 +39,17 @@ pub fn handle_add_partitions_to_txn(
     transactional_id: &str,
     producer_id: i64,
     producer_epoch: i16,
-    topics: Vec<(String, Vec<i32>)>, // (topic_name, partition_ids)
+    topics: &[(String, Vec<i32>)], // (topic_name, partition_ids)
 ) -> Result<AddPartitionsToTxnResponse> {
     let store = ctx.store;
 
-    // Wave 3: resolve every partition first, without creating topics (Kafka answers
+    // Resolve every partition first, without creating topics (Kafka answers
     // UNKNOWN_TOPIC_OR_PARTITION for a missing topic; producers create topics through
     // Metadata). If any partition is unknown, nothing is added, the transaction does
     // not begin, and the valid partitions get OPERATION_NOT_ATTEMPTED, as in Kafka.
     let mut resolved: Vec<ResolvedTopic> = Vec::new();
     let mut any_failed = false;
-    for (topic_name, partition_ids) in &topics {
+    for (topic_name, partition_ids) in topics {
         let topic = super::helpers::resolve_topic(store, topic_name);
         let results = partition_ids
             .iter()
@@ -115,7 +109,7 @@ pub fn handle_add_partitions_to_txn(
         store.begin_or_continue_transaction(transactional_id, producer_id, producer_epoch)
     {
         return Ok(add_partitions_to_txn_error_response(
-            &topics,
+            topics,
             e.to_kafka_error_code(),
         ));
     }
@@ -219,7 +213,7 @@ pub fn handle_end_txn(
         Some(other) => {
             return Err(KafkaError::invalid_txn_state(
                 transactional_id,
-                format!("{:?}", other),
+                format!("{other:?}"),
                 "EndTxn",
             ));
         }
@@ -255,7 +249,10 @@ pub fn handle_end_txn(
 ///
 /// # Returns
 /// TxnOffsetCommitResponse with per-partition error codes
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one parameter per TxnOffsetCommit request field the handler checks"
+)]
 pub fn handle_txn_offset_commit(
     ctx: &HandlerContext,
     transactional_id: &str,
@@ -268,10 +265,10 @@ pub fn handle_txn_offset_commit(
 ) -> Result<TxnOffsetCommitResponse> {
     let store = ctx.store;
 
-    // RV-5: fence a zombie EOS consumer. A member committing offsets inside a
+    // Fence a zombie EOS consumer. A member committing offsets inside a
     // transaction with a stale group generation (or an unknown member id) must be
-    // rejected with ILLEGAL_GENERATION / UNKNOWN_MEMBER_ID — the same fence RA-5
-    // added to the non-transactional OffsetCommit path. The producer-epoch fence
+    // rejected with ILLEGAL_GENERATION / UNKNOWN_MEMBER_ID, the same fence as on the
+    // non-transactional OffsetCommit path. The producer-epoch fence
     // alone does not cover KIP-447 (the new owner uses a *different*
     // transactional_id, so the zombie keeps a valid epoch). Simple consumers /
     // pre-v3 clients (generation -1) are exempt inside validate_commit.
@@ -297,7 +294,7 @@ pub fn handle_txn_offset_commit(
         Some(other) => {
             return Err(KafkaError::invalid_txn_state(
                 transactional_id,
-                format!("{:?}", other),
+                format!("{other:?}"),
                 "TxnOffsetCommit",
             ));
         }
@@ -425,6 +422,7 @@ pub fn txn_offset_commit_error_response(
 mod tests {
     use super::*;
     use crate::testing::mocks::MockKafkaStore;
+    use crate::testing::TestEnv;
 
     #[test]
     fn test_end_txn_retry_with_same_outcome_succeeds() {
@@ -444,17 +442,10 @@ mod tests {
             store
                 .expect_get_transaction_state()
                 .returning(move |_| Ok(Some(st.clone())));
-            let coordinator = crate::kafka::GroupCoordinator::new();
-            let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
-            let ctx = HandlerContext::new(
-                &store,
-                &coordinator,
-                &broker,
-                1,
-                kafka_protocol::records::Compression::None,
-            );
+            let env = TestEnv::new();
+            let ctx = env.ctx(&store);
             let result = handle_end_txn(&ctx, "txn", 1, 0, committed);
-            assert_eq!(result.is_ok(), ok, "{:?} commit={}", state, committed);
+            assert_eq!(result.is_ok(), ok, "{state:?} commit={committed}");
             if let Ok(r) = result {
                 assert_eq!(r.error_code, ERROR_NONE);
             }
@@ -463,8 +454,8 @@ mod tests {
 
     #[test]
     fn test_add_partitions_to_txn_rejects_negative_partition() {
-        // CONF-5: a negative partition id must be rejected (UNKNOWN_TOPIC_OR_PARTITION), not
-        // accepted as ERROR_NONE. Wave 3: the request then fails as a whole (Kafka), the
+        // A negative partition id must be rejected (UNKNOWN_TOPIC_OR_PARTITION), not
+        // accepted as ERROR_NONE. The request then fails as a whole (Kafka), the
         // valid partition 0 gets OPERATION_NOT_ATTEMPTED and nothing begins.
         let mut store = MockKafkaStore::new();
         store.expect_get_topic_metadata().returning(|_| {
@@ -475,18 +466,11 @@ mod tests {
             }])
         });
 
-        let coordinator = crate::kafka::GroupCoordinator::new();
-        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
-        let ctx = HandlerContext::new(
-            &store,
-            &coordinator,
-            &broker,
-            1,
-            kafka_protocol::records::Compression::None,
-        );
+        let env = TestEnv::new();
+        let ctx = env.ctx(&store);
 
         let topics = vec![("t".to_string(), vec![-1, 0])];
-        let resp = handle_add_partitions_to_txn(&ctx, "txn-1", 1, 0, topics).unwrap();
+        let resp = handle_add_partitions_to_txn(&ctx, "txn-1", 1, 0, &topics).unwrap();
         let by_partition = &resp.results_by_topic_v3_and_below[0].results_by_partition;
         let neg = by_partition
             .iter()
@@ -508,21 +492,14 @@ mod tests {
 
     #[test]
     fn test_txn_offset_commit_fences_stale_generation() {
-        // RV-5: a TxnOffsetCommit carrying a real group generation (>= 0) for an
+        // A TxnOffsetCommit carrying a real group generation (>= 0) for an
         // unknown / stale group membership must be fenced with UNKNOWN_MEMBER_ID,
         // not silently accepted. The producer-epoch fence alone does not cover this
         // (KIP-447: the new owner uses a different transactional_id). The fence
         // returns before any store access, so the mock needs no expectations.
         let store = MockKafkaStore::new();
-        let coordinator = crate::kafka::GroupCoordinator::new();
-        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
-        let ctx = HandlerContext::new(
-            &store,
-            &coordinator,
-            &broker,
-            1,
-            kafka_protocol::records::Compression::None,
-        );
+        let env = TestEnv::new();
+        let ctx = env.ctx(&store);
 
         let topics = vec![("t".to_string(), vec![(0i32, 100i64, None)])];
         let resp =

@@ -1,38 +1,44 @@
-// Consumer offset handlers
-//
-// Handlers for OffsetCommit and OffsetFetch requests.
-// These track consumer group progress through partitions.
+//! OffsetCommit and OffsetFetch: a consumer group's committed offsets.
 
-use super::helpers::{resolve_topic_id, topic_resolution_error_code, TopicResolution};
-use crate::kafka::constants::ERROR_NONE;
+use super::helpers::{
+    resolve_topic, resolve_topic_id, topic_resolution_error_code, TopicResolution,
+};
+use crate::kafka::constants::{
+    ERROR_NONE, ERROR_UNKNOWN_TOPIC_OR_PARTITION, ERROR_UNSTABLE_OFFSET_COMMIT,
+};
 use crate::kafka::error::Result;
 use crate::kafka::handler_context::HandlerContext;
-use crate::kafka::storage::CommittedOffset;
+use crate::kafka::messages::OffsetFetchTopicData;
+use crate::kafka::storage::{CommittedOffset, KafkaStore};
+use kafka_protocol::messages::offset_commit_response::{
+    OffsetCommitResponse, OffsetCommitResponsePartition, OffsetCommitResponseTopic,
+};
+use kafka_protocol::messages::offset_fetch_response::{
+    OffsetFetchResponse, OffsetFetchResponsePartition, OffsetFetchResponseTopic,
+};
 use kafka_protocol::messages::TopicName;
 use kafka_protocol::protocol::StrBytes;
+use std::collections::{HashMap, HashSet};
 
 /// Handle OffsetCommit request
 ///
 /// Commits consumer offsets for a consumer group
 pub fn handle_offset_commit(
     ctx: &HandlerContext,
-    group_id: String,
+    group_id: &str,
     generation_id: i32,
-    member_id: String,
+    member_id: &str,
     topics: Vec<crate::kafka::messages::OffsetCommitTopicData>,
-) -> Result<kafka_protocol::messages::offset_commit_response::OffsetCommitResponse> {
+) -> Result<OffsetCommitResponse> {
     let store = ctx.store;
-    use kafka_protocol::messages::offset_commit_response::{
-        OffsetCommitResponse, OffsetCommitResponsePartition, OffsetCommitResponseTopic,
-    };
 
-    // CONF-1: reject zombie commits. A member committing with a stale generation (or an unknown
+    // Reject zombie commits. A member committing with a stale generation (or an unknown
     // member id) for a live group must be rejected with ILLEGAL_GENERATION / UNKNOWN_MEMBER_ID
-    // rather than silently persisting an offset. wave3 groups: Kafka 3.7's rules, see
+    // rather than silently persisting an offset. Kafka 3.7's rules, see
     // `GroupCoordinator::validate_offset_commit` (generation -1 only for an unknown/Empty group).
     if let Err(e) = ctx
         .coordinator
-        .validate_offset_commit(&group_id, &member_id, generation_id)
+        .validate_offset_commit(group_id, member_id, generation_id)
     {
         let error_code = e.to_kafka_error_code();
         let response_topics: Vec<_> = topics
@@ -65,12 +71,12 @@ pub fn handle_offset_commit(
     for topic in topics {
         let topic_name = topic.name.clone();
 
-        // Look up topic_id using helper
-        let topic_id = match resolve_topic_id(store, &topic_name) {
-            TopicResolution::Found(id) => id,
-            resolution => {
+        // Look up topic_id and partition count using helper
+        let (topic_id, partition_count) = match resolve_topic(store, &topic_name) {
+            Ok(Some(found)) => found,
+            unresolved => {
                 // Topic not found or error - return error for all partitions
-                let error_code = topic_resolution_error_code(&resolution);
+                let error_code = unresolved.err().unwrap_or(ERROR_UNKNOWN_TOPIC_OR_PARTITION);
                 let mut error_partitions = Vec::new();
                 for partition in topic.partitions {
                     let mut partition_response = OffsetCommitResponsePartition::default();
@@ -95,15 +101,24 @@ pub fn handle_offset_commit(
             let committed_offset = partition.committed_offset;
             let metadata = partition.metadata.as_deref();
 
+            // Kafka refuses a commit for a partition the topic does not have.
+            if partition_id < 0 || partition_id >= partition_count {
+                let mut partition_response = OffsetCommitResponsePartition::default();
+                partition_response.partition_index = partition_id;
+                partition_response.error_code = ERROR_UNKNOWN_TOPIC_OR_PARTITION;
+                partition_responses.push(partition_response);
+                continue;
+            }
+
             // Commit offset
             let error_code = match store.commit_offset(
-                &group_id,
+                group_id,
                 topic_id,
                 partition_id,
                 committed_offset,
                 metadata,
             ) {
-                Ok(_) => ERROR_NONE,
+                Ok(()) => ERROR_NONE,
                 Err(e) => {
                     // Use typed error's Kafka error code
                     let code = e.to_kafka_error_code();
@@ -144,98 +159,66 @@ pub fn handle_offset_commit(
 ///
 /// Fetches committed offsets for a consumer group
 ///
-/// `require_stable` (v7+, KIP-447; wave 3): a partition with a transactional offset
+/// `require_stable` (v7+, KIP-447): a partition with a transactional offset
 /// commit whose transaction is still open is answered UNSTABLE_OFFSET_COMMIT with
 /// offset -1 (partition level, as Kafka 3.7), so a read_committed consumer retries
 /// instead of starting from an offset the transaction may still replace.
 pub fn handle_offset_fetch(
     ctx: &HandlerContext,
-    group_id: String,
-    topics: Option<Vec<crate::kafka::messages::OffsetFetchTopicData>>,
+    group_id: &str,
+    topics: Option<Vec<OffsetFetchTopicData>>,
     require_stable: bool,
-) -> Result<kafka_protocol::messages::offset_fetch_response::OffsetFetchResponse> {
+) -> Result<OffsetFetchResponse> {
     let store = ctx.store;
-    // wave3 txn: partitions with a pending transactional commit (require_stable only).
-    let unstable: std::collections::HashSet<(String, i32)> = if require_stable {
+    // Partitions with a pending transactional commit (require_stable only).
+    let unstable: HashSet<(String, i32)> = if require_stable {
         store
-            .pending_txn_offset_partitions(&group_id)?
+            .pending_txn_offset_partitions(group_id)?
             .into_iter()
             .collect()
     } else {
-        std::collections::HashSet::new()
-    };
-    let is_unstable = |topic: &str, partition: i32| {
-        !unstable.is_empty() && unstable.contains(&(topic.to_string(), partition))
-    };
-    use kafka_protocol::messages::offset_fetch_response::{
-        OffsetFetchResponse, OffsetFetchResponsePartition, OffsetFetchResponseTopic,
+        HashSet::new()
     };
 
-    let mut response_topics = Vec::new();
-    // BUG-6: track a top-level error so a fetch-all storage failure surfaces to the client as an
-    // error instead of a success response with no offsets (which a consumer reads as "no committed
-    // offsets" and may reset from).
-    let mut top_level_error = ERROR_NONE;
+    let mut kafka_response = OffsetFetchResponse::default();
+    kafka_response.throttle_time_ms = 0;
+    kafka_response.error_code = ERROR_NONE;
+    match topics {
+        Some(topics) => {
+            kafka_response.topics = topics
+                .into_iter()
+                .map(|topic| fetch_topic_offsets(store, group_id, topic, &unstable))
+                .collect();
+        }
+        // A fetch-all storage failure is a top-level error: a success with no offsets
+        // reads to a consumer as "no committed offsets", and it may reset.
+        None => match fetch_all_group_offsets(store, group_id, &unstable) {
+            Ok(topics) => kafka_response.topics = topics,
+            Err(error_code) => kafka_response.error_code = error_code,
+        },
+    }
+    Ok(kafka_response)
+}
 
-    if let Some(topic_list) = topics {
-        // Fetch specific topics and partitions
-        for topic_request in topic_list {
-            let topic_name = topic_request.name.clone();
-
-            // Look up topic_id using helper
-            let topic_id = match resolve_topic_id(store, &topic_name) {
-                TopicResolution::Found(id) => id,
-                resolution => {
-                    // Topic not found or error - return error for all partitions
-                    let error_code = topic_resolution_error_code(&resolution);
-                    let mut error_partitions = Vec::new();
-                    for partition_index in topic_request.partition_indexes {
-                        let mut partition_response = OffsetFetchResponsePartition::default();
-                        partition_response.partition_index = partition_index;
-                        partition_response.error_code = error_code;
-                        partition_response.committed_offset = -1;
-                        error_partitions.push(partition_response);
-                    }
-
-                    let mut topic_response = OffsetFetchResponseTopic::default();
-                    topic_response.name = TopicName(StrBytes::from_string(topic_name));
-                    topic_response.partitions = error_partitions;
-                    response_topics.push(topic_response);
-                    continue;
+/// The committed offsets of one requested topic's partitions.
+fn fetch_topic_offsets(
+    store: &dyn KafkaStore,
+    group_id: &str,
+    topic: OffsetFetchTopicData,
+    unstable: &HashSet<(String, i32)>,
+) -> OffsetFetchResponseTopic {
+    let partitions = match resolve_topic_id(store, &topic.name) {
+        TopicResolution::Found(topic_id) => topic
+            .partition_indexes
+            .iter()
+            .map(|&partition_index| {
+                let offset = store.fetch_offset(group_id, topic_id, partition_index);
+                if unstable.contains(&(topic.name.clone(), partition_index)) {
+                    return offset_partition(partition_index, ERROR_UNSTABLE_OFFSET_COMMIT, None);
                 }
-            };
-
-            let mut partition_responses = Vec::new();
-
-            // Fetch committed offset for each requested partition
-            for partition_index in topic_request.partition_indexes {
-                let offset_result = store.fetch_offset(&group_id, topic_id, partition_index);
-
-                let mut partition_response = OffsetFetchResponsePartition::default();
-                partition_response.partition_index = partition_index;
-
-                if is_unstable(&topic_name, partition_index) {
-                    partition_response.committed_offset = -1;
-                    partition_response.error_code =
-                        crate::kafka::constants::ERROR_UNSTABLE_OFFSET_COMMIT;
-                    partition_responses.push(partition_response);
-                    continue;
-                }
-
-                match offset_result {
-                    Ok(Some(CommittedOffset { offset, metadata })) => {
-                        partition_response.committed_offset = offset;
-                        partition_response.metadata = metadata.map(StrBytes::from_string);
-                        partition_response.error_code = ERROR_NONE;
-                    }
-                    Ok(None) => {
-                        // No committed offset yet, return -1
-                        partition_response.committed_offset = -1;
-                        partition_response.error_code = ERROR_NONE;
-                    }
+                match offset {
+                    Ok(committed) => offset_partition(partition_index, ERROR_NONE, committed),
                     Err(e) => {
-                        // Use typed error's Kafka error code
-                        let error_code = e.to_kafka_error_code();
                         if e.is_server_error() {
                             crate::pg_warning!(
                                 "Failed to fetch offset for group='{}', topic_id={}, partition={}: {}",
@@ -245,76 +228,79 @@ pub fn handle_offset_fetch(
                                 e
                             );
                         }
-                        partition_response.committed_offset = -1;
-                        partition_response.error_code = error_code;
+                        offset_partition(partition_index, e.to_kafka_error_code(), None)
                     }
                 }
+            })
+            .collect(),
+        // A missing topic (or a failed lookup) is reported on every requested partition.
+        resolution => {
+            let error_code = topic_resolution_error_code(&resolution);
+            topic
+                .partition_indexes
+                .iter()
+                .map(|&partition_index| offset_partition(partition_index, error_code, None))
+                .collect()
+        }
+    };
+    let mut topic_response = OffsetFetchResponseTopic::default();
+    topic_response.name = TopicName(StrBytes::from_string(topic.name));
+    topic_response.partitions = partitions;
+    topic_response
+}
 
-                partition_responses.push(partition_response);
-            }
-
+/// Every committed offset of the group, by topic, or the error code of a failed read.
+fn fetch_all_group_offsets(
+    store: &dyn KafkaStore,
+    group_id: &str,
+    unstable: &HashSet<(String, i32)>,
+) -> std::result::Result<Vec<OffsetFetchResponseTopic>, i16> {
+    let offsets = store.fetch_all_offsets(group_id).map_err(|e| {
+        crate::pg_warning!(
+            "Failed to fetch all offsets for group='{}': {}",
+            group_id,
+            e
+        );
+        e.to_kafka_error_code()
+    })?;
+    let mut by_topic: HashMap<String, Vec<OffsetFetchResponsePartition>> = HashMap::new();
+    for (topic_name, partition_id, committed) in offsets {
+        let partition = if unstable.contains(&(topic_name.clone(), partition_id)) {
+            offset_partition(partition_id, ERROR_UNSTABLE_OFFSET_COMMIT, None)
+        } else {
+            offset_partition(partition_id, ERROR_NONE, Some(committed))
+        };
+        by_topic.entry(topic_name).or_default().push(partition);
+    }
+    Ok(by_topic
+        .into_iter()
+        .map(|(topic_name, partitions)| {
             let mut topic_response = OffsetFetchResponseTopic::default();
             topic_response.name = TopicName(StrBytes::from_string(topic_name));
-            topic_response.partitions = partition_responses;
-            response_topics.push(topic_response);
+            topic_response.partitions = partitions;
+            topic_response
+        })
+        .collect())
+}
+
+/// An OffsetFetch partition entry: the committed offset and metadata, or offset -1 when
+/// there is none to report.
+fn offset_partition(
+    partition_index: i32,
+    error_code: i16,
+    committed: Option<CommittedOffset>,
+) -> OffsetFetchResponsePartition {
+    let mut partition = OffsetFetchResponsePartition::default();
+    partition.partition_index = partition_index;
+    partition.error_code = error_code;
+    match committed {
+        Some(CommittedOffset { offset, metadata }) => {
+            partition.committed_offset = offset;
+            partition.metadata = metadata.map(StrBytes::from_string);
         }
-    } else {
-        // Fetch all topics for this consumer group
-        let all_offsets_result = store.fetch_all_offsets(&group_id);
-
-        match all_offsets_result {
-            Ok(offsets) => {
-                // Group by topic
-                let mut topics_map: std::collections::HashMap<
-                    String,
-                    Vec<OffsetFetchResponsePartition>,
-                > = std::collections::HashMap::new();
-
-                for (topic_name, partition_id, CommittedOffset { offset, metadata }) in offsets {
-                    let mut partition_response = OffsetFetchResponsePartition::default();
-                    partition_response.partition_index = partition_id;
-                    if is_unstable(&topic_name, partition_id) {
-                        partition_response.committed_offset = -1;
-                        partition_response.error_code =
-                            crate::kafka::constants::ERROR_UNSTABLE_OFFSET_COMMIT;
-                    } else {
-                        partition_response.committed_offset = offset;
-                        partition_response.metadata = metadata.map(StrBytes::from_string);
-                        partition_response.error_code = ERROR_NONE;
-                    }
-
-                    topics_map
-                        .entry(topic_name)
-                        .or_default()
-                        .push(partition_response);
-                }
-
-                for (topic_name, partitions) in topics_map {
-                    let mut topic_response = OffsetFetchResponseTopic::default();
-                    topic_response.name = TopicName(StrBytes::from_string(topic_name));
-                    topic_response.partitions = partitions;
-                    response_topics.push(topic_response);
-                }
-            }
-            Err(e) => {
-                // BUG-6: surface the storage failure to the client instead of swallowing it.
-                top_level_error = e.to_kafka_error_code();
-                crate::pg_warning!(
-                    "Failed to fetch all offsets for group='{}': {}",
-                    group_id,
-                    e
-                );
-            }
-        }
+        None => partition.committed_offset = -1,
     }
-
-    // Build response
-    let mut kafka_response = OffsetFetchResponse::default();
-    kafka_response.throttle_time_ms = 0;
-    kafka_response.error_code = top_level_error;
-    kafka_response.topics = response_topics;
-
-    Ok(kafka_response)
+    partition
 }
 
 #[cfg(test)]
@@ -322,36 +308,75 @@ mod tests {
     use super::*;
     use crate::kafka::error::KafkaError;
     use crate::testing::mocks::MockKafkaStore;
+    use crate::testing::TestEnv;
 
     #[test]
     fn test_offset_fetch_all_propagates_storage_error() {
-        // BUG-6: when fetch_all_offsets fails, the fetch-all OffsetFetch path used to log and
-        // return error_code = NONE with no topics — a consumer reads that as "no committed
-        // offsets" and may reset. It must surface the error instead.
+        // When fetch_all_offsets fails, a fetch-all OffsetFetch must surface the error: NONE
+        // with no topics reads to a consumer as "no committed offsets", and it may reset.
         let mut store = MockKafkaStore::new();
         store
             .expect_fetch_all_offsets()
             .returning(|_| Err(KafkaError::database("boom")));
 
-        let coordinator = crate::kafka::GroupCoordinator::new();
-        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
-        let ctx = HandlerContext::new(
-            &store,
-            &coordinator,
-            &broker,
-            1,
-            kafka_protocol::records::Compression::None,
-        );
+        let env = TestEnv::new();
+        let ctx = env.ctx(&store);
 
         // topics = None selects the fetch-all path.
-        let resp = handle_offset_fetch(&ctx, "g".to_string(), None, false).unwrap();
+        let resp = handle_offset_fetch(&ctx, "g", None, false).unwrap();
         assert_ne!(resp.error_code, ERROR_NONE);
     }
 
-    /// wave3 txn (KIP-447): with require_stable, a partition with a pending
-    /// transactional offset commit is UNSTABLE_OFFSET_COMMIT (offset -1); the others
-    /// and the same request without require_stable read the committed offset. Before
-    /// wave 3 the flag was ignored and the stale committed offset was returned.
+    /// Kafka answers UNKNOWN_TOPIC_OR_PARTITION for a commit to a partition the topic
+    /// does not have, and stores nothing for it; the topic's real partitions commit.
+    #[test]
+    fn test_offset_commit_to_a_missing_partition_is_unknown_topic_or_partition() {
+        use crate::kafka::messages::{OffsetCommitPartitionData, OffsetCommitTopicData};
+        use crate::kafka::storage::TopicMetadata;
+        let mut store = MockKafkaStore::new();
+        store.expect_get_topic_metadata().returning(|_| {
+            Ok(vec![TopicMetadata {
+                name: "t".to_string(),
+                id: 1,
+                partition_count: 2,
+            }])
+        });
+        store
+            .expect_commit_offset()
+            .withf(|_, _, partition, _, _| *partition == 1)
+            .times(1)
+            .returning(|_, _, _, _, _| Ok(()));
+        let env = TestEnv::new();
+        let ctx = env.ctx(&store);
+        let partition = |partition_index| OffsetCommitPartitionData {
+            partition_index,
+            committed_offset: 3,
+            metadata: None,
+        };
+        let topics = vec![OffsetCommitTopicData {
+            name: "t".to_string(),
+            partitions: vec![partition(1), partition(2), partition(-1)],
+        }];
+        let resp = handle_offset_commit(&ctx, "g", -1, "", topics).unwrap();
+        let codes: Vec<(i32, i16)> = resp.topics[0]
+            .partitions
+            .iter()
+            .map(|p| (p.partition_index, p.error_code))
+            .collect();
+        assert_eq!(
+            codes,
+            vec![
+                (1, ERROR_NONE),
+                (2, ERROR_UNKNOWN_TOPIC_OR_PARTITION),
+                (-1, ERROR_UNKNOWN_TOPIC_OR_PARTITION)
+            ]
+        );
+    }
+
+    /// KIP-447: with require_stable, a partition with a pending transactional offset
+    /// commit is UNSTABLE_OFFSET_COMMIT (offset -1), so a consumer does not start from
+    /// an offset the transaction may still replace; the others and the same request
+    /// without require_stable read the committed offset.
     #[test]
     fn test_offset_fetch_require_stable_reports_pending_txn_commits() {
         use crate::kafka::messages::OffsetFetchTopicData;
@@ -374,34 +399,24 @@ mod tests {
             .expect_pending_txn_offset_partitions()
             .times(1)
             .returning(|_| Ok(vec![("t".to_string(), 0)]));
-        let coordinator = crate::kafka::GroupCoordinator::new();
-        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
-        let ctx = HandlerContext::new(
-            &store,
-            &coordinator,
-            &broker,
-            1,
-            kafka_protocol::records::Compression::None,
-        );
+        let env = TestEnv::new();
+        let ctx = env.ctx(&store);
         let topics = || {
             Some(vec![OffsetFetchTopicData {
                 name: "t".to_string(),
                 partition_indexes: vec![0, 1],
             }])
         };
-        let resp = handle_offset_fetch(&ctx, "g".to_string(), topics(), true).unwrap();
+        let resp = handle_offset_fetch(&ctx, "g", topics(), true).unwrap();
         assert_eq!(resp.error_code, ERROR_NONE);
         let parts = &resp.topics[0].partitions;
-        assert_eq!(
-            parts[0].error_code,
-            crate::kafka::constants::ERROR_UNSTABLE_OFFSET_COMMIT
-        );
+        assert_eq!(parts[0].error_code, ERROR_UNSTABLE_OFFSET_COMMIT);
         assert_eq!(parts[0].committed_offset, -1);
         assert_eq!(parts[1].error_code, ERROR_NONE);
         assert_eq!(parts[1].committed_offset, 5);
 
         // Without require_stable the pending set is not even read (times(1) above).
-        let resp = handle_offset_fetch(&ctx, "g".to_string(), topics(), false).unwrap();
+        let resp = handle_offset_fetch(&ctx, "g", topics(), false).unwrap();
         assert!(resp.topics[0]
             .partitions
             .iter()

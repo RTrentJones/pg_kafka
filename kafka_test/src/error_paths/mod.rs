@@ -10,6 +10,7 @@ mod consumer_errors;
 mod coordinator_errors;
 mod coordinator_tests;
 mod fetch_errors;
+mod kafka_parity;
 mod lifecycle_tests;
 mod listener_tests;
 mod metrics_tests;
@@ -83,5 +84,9 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         api_errors::test_truncated_body_gets_invalid_request,
         api_errors::test_handler_failure_gets_typed_error_response: sequential, // revokes a worker privilege for a moment
         api_errors::test_request_sees_rows_committed_during_its_batch: sequential, // holds a lock on kafka.partition_offsets
+        kafka_parity::test_produce_response_reports_log_start_offset,
+        kafka_parity::test_list_offsets_without_a_matching_record_is_offset_minus_one,
+        kafka_parity::test_offset_commit_to_a_missing_partition_is_refused,
+        kafka_parity::test_idempotent_reinit_with_an_old_producer_id_gets_a_new_one,
     ]
 }

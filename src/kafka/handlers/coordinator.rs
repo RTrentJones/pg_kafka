@@ -1,13 +1,22 @@
-// Consumer group coordinator handlers
-//
-// Handlers for consumer group management APIs:
-// FindCoordinator, JoinGroup, SyncGroup, Heartbeat, LeaveGroup, DescribeGroups, ListGroups
+//! Consumer group handlers: FindCoordinator, JoinGroup, SyncGroup, Heartbeat, LeaveGroup,
+//! DescribeGroups and ListGroups, over the in-memory `GroupCoordinator`.
 
 use crate::kafka::constants::{DEFAULT_BROKER_ID, ERROR_NONE};
 use crate::kafka::error::Result;
 use crate::kafka::handler_context::HandlerContext;
+use kafka_protocol::messages::describe_groups_response::{
+    DescribeGroupsResponse, DescribedGroup, DescribedGroupMember,
+};
+use kafka_protocol::messages::find_coordinator_response::FindCoordinatorResponse;
+use kafka_protocol::messages::heartbeat_response::HeartbeatResponse;
 use kafka_protocol::messages::join_group_response::JoinGroupResponse;
+use kafka_protocol::messages::join_group_response::JoinGroupResponseMember;
+use kafka_protocol::messages::leave_group_response::{LeaveGroupResponse, MemberResponse};
+use kafka_protocol::messages::list_groups_response::{ListGroupsResponse, ListedGroup};
 use kafka_protocol::messages::sync_group_response::SyncGroupResponse;
+use kafka_protocol::messages::GroupId;
+use kafka_protocol::protocol::StrBytes;
+use std::collections::HashMap;
 
 /// Placeholder for a JoinGroup member's `client_host`. This field is informational
 /// only — echoed back in DescribeGroups member listings, never used for routing or
@@ -23,12 +32,11 @@ const PLACEHOLDER_CLIENT_HOST: &str = "localhost";
 /// In our single-node setup, we always return ourselves as the coordinator.
 pub fn handle_find_coordinator(
     ctx: &HandlerContext,
-    key: String,
+    key: &str,
     key_type: i8,
-) -> Result<kafka_protocol::messages::find_coordinator_response::FindCoordinatorResponse> {
+) -> Result<FindCoordinatorResponse> {
     let broker_host = ctx.broker.host();
     let broker_port = ctx.broker.port();
-    use kafka_protocol::messages::find_coordinator_response::FindCoordinatorResponse;
 
     crate::pg_debug!("FindCoordinator: key={}, key_type={}", key, key_type);
 
@@ -116,7 +124,7 @@ impl JoinGroupReply {
     }
 }
 
-/// Make a JoinGroup response encodable as Kafka encodes it at `api_version` (wave3 groups):
+/// Make a JoinGroup response encodable as Kafka encodes it at `api_version`:
 /// `protocol_name` is nullable only from v7, so an absent name (an error response) is sent as ""
 /// to older versions (Kafka's `GroupCoordinator.NoProtocol`); a null there made the Java client
 /// fail to parse the response.
@@ -125,7 +133,7 @@ pub fn normalize_join_group_response(
     api_version: i16,
 ) -> JoinGroupResponse {
     if api_version < 7 && response.protocol_name.is_none() {
-        response.protocol_name = Some(kafka_protocol::protocol::StrBytes::from_static_str(""));
+        response.protocol_name = Some(StrBytes::from_static_str(""));
     }
     response
 }
@@ -162,7 +170,7 @@ where
         request.client_id
     );
 
-    // RV-10: reject a session_timeout_ms outside the broker's accepted range with
+    // Reject a session_timeout_ms outside the broker's accepted range with
     // INVALID_SESSION_TIMEOUT before touching group state, matching Kafka. This
     // prevents a hostile client from pinning a member alive far beyond any real
     // heartbeat cadence (blocking rebalances for the whole group) or requesting a
@@ -192,7 +200,7 @@ where
         .map(|p| (p.name, p.metadata))
         .collect();
 
-    // wave3 groups: bound what one member parks in coordinator memory. Kafka keeps a group's
+    // Bound what one member parks in coordinator memory. Kafka keeps a group's
     // member metadata in one __consumer_offsets record (message.max.bytes, 1 MiB by default).
     let protocol_bytes: usize = protocols.iter().map(|(n, m)| n.len() + m.len()).sum();
     if protocols.len() > crate::kafka::limits::MAX_MEMBER_PROTOCOLS
@@ -236,13 +244,13 @@ where
     };
 
     ctx.coordinator.join_group(
-        params,
+        &params,
         Box::new(move |outcome| {
             respond(build_join_group_response(
                 outcome,
                 protocol_type,
                 fallback_protocol,
-            ))
+            ));
         }),
     );
 }
@@ -254,8 +262,6 @@ fn build_join_group_response(
     protocol_type: String,
     fallback_protocol: Option<String>,
 ) -> JoinGroupResponse {
-    use kafka_protocol::messages::join_group_response::JoinGroupResponseMember;
-
     let result = match outcome {
         Ok(result) => result,
         Err(e) => {
@@ -271,7 +277,7 @@ fn build_join_group_response(
     response.error_code = ERROR_NONE;
     response.generation_id = result.generation_id;
     response.protocol_type = Some(protocol_type.into());
-    // RA-6: advertise the protocol the GROUP selected (common to all members).
+    // Advertise the protocol the GROUP selected (common to all members).
     response.protocol_name = result.protocol_name.or(fallback_protocol).map(Into::into);
     response.leader = result.leader_id.into();
     response.member_id = result.member_id.into();
@@ -358,8 +364,8 @@ impl Drop for SyncGroupReply {
 /// `GroupCoordinator::sync_group`).
 pub fn handle_sync_group<F>(
     ctx: &HandlerContext,
-    group_id: String,
-    member_id: String,
+    group_id: &str,
+    member_id: &str,
     generation_id: i32,
     assignments: Vec<crate::kafka::messages::SyncGroupAssignment>,
     respond: F,
@@ -368,7 +374,6 @@ pub fn handle_sync_group<F>(
 {
     let coordinator = ctx.coordinator;
     let store = ctx.store;
-    use std::collections::HashMap;
 
     crate::pg_debug!(
         "SyncGroup: group_id={}, member_id={}, generation_id={}, assignments={}",
@@ -389,9 +394,9 @@ pub fn handle_sync_group<F>(
     let assignments_empty =
         coord_assignments.is_empty() || coord_assignments.iter().all(|(_, bytes)| bytes.is_empty());
 
-    if assignments_empty && coordinator.is_group_leader(&group_id, &member_id) {
+    if assignments_empty && coordinator.is_group_leader(group_id, member_id) {
         // Get subscribed topics from group members
-        if let Ok(topics) = coordinator.get_subscribed_topics(&group_id) {
+        if let Ok(topics) = coordinator.get_subscribed_topics(group_id) {
             if !topics.is_empty() {
                 // Get partition counts for all topics in a single query (avoid N+1)
                 let mut topic_partitions: HashMap<String, i32> = HashMap::new();
@@ -404,7 +409,7 @@ pub fn handle_sync_group<F>(
                 // Compute assignments server-side
                 if !topic_partitions.is_empty() {
                     if let Ok(computed) =
-                        coordinator.compute_assignments(&group_id, &topic_partitions)
+                        coordinator.compute_assignments(group_id, &topic_partitions)
                     {
                         crate::pg_debug!(
                             "SyncGroup: computed {} assignments server-side for group {}",
@@ -453,12 +458,11 @@ fn build_sync_group_response(outcome: crate::kafka::coordinator::SyncOutcome) ->
 /// Updates member's last heartbeat timestamp.
 pub fn handle_heartbeat(
     ctx: &HandlerContext,
-    group_id: String,
-    member_id: String,
+    group_id: &str,
+    member_id: &str,
     generation_id: i32,
-) -> Result<kafka_protocol::messages::heartbeat_response::HeartbeatResponse> {
+) -> Result<HeartbeatResponse> {
     let coordinator = ctx.coordinator;
-    use kafka_protocol::messages::heartbeat_response::HeartbeatResponse;
 
     crate::pg_debug!(
         "Heartbeat: group_id={}, member_id={}, generation_id={}",
@@ -484,13 +488,11 @@ pub fn handle_heartbeat(
 /// Consumer gracefully leaves the consumer group.
 pub fn handle_leave_group(
     ctx: &HandlerContext,
-    group_id: String,
-    member_id: String,
+    group_id: &str,
+    member_id: &str,
     members: Vec<crate::kafka::messages::MemberIdentity>,
-) -> Result<kafka_protocol::messages::leave_group_response::LeaveGroupResponse> {
+) -> Result<LeaveGroupResponse> {
     let coordinator = ctx.coordinator;
-    use kafka_protocol::messages::leave_group_response::{LeaveGroupResponse, MemberResponse};
-    use kafka_protocol::protocol::StrBytes;
 
     let mut response = LeaveGroupResponse::default();
     response.throttle_time_ms = 0;
@@ -513,7 +515,7 @@ pub fn handle_leave_group(
                 group_id,
                 m.member_id
             );
-            let error_code = match coordinator.leave_group(group_id.clone(), m.member_id.clone()) {
+            let error_code = match coordinator.leave_group(group_id, &m.member_id) {
                 Ok(()) => ERROR_NONE,
                 Err(e) => e.to_kafka_error_code(),
             };
@@ -535,97 +537,91 @@ pub fn handle_leave_group(
 pub fn handle_describe_groups(
     ctx: &HandlerContext,
     groups: Vec<String>,
-) -> Result<kafka_protocol::messages::describe_groups_response::DescribeGroupsResponse> {
+) -> Result<DescribeGroupsResponse> {
     let coordinator = ctx.coordinator;
-    use kafka_protocol::messages::describe_groups_response::{
-        DescribeGroupsResponse, DescribedGroup, DescribedGroupMember,
-    };
-    use kafka_protocol::messages::GroupId;
-    use kafka_protocol::protocol::StrBytes;
 
     let mut response = DescribeGroupsResponse::default();
     response.throttle_time_ms = 0;
 
     // Get coordinator state
-    // CG-7: recover from a poisoned lock instead of panicking (which would crash the worker). A
+    // Recover from a poisoned lock instead of panicking (which would crash the worker). A
     // poisoned lock only means some writer panicked; the group map itself is still readable.
-    let coordinator_groups = coordinator.groups.read().unwrap_or_else(|e| e.into_inner());
+    let coordinator_groups = coordinator
+        .groups
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     for group_id in groups {
         let mut described_group = DescribedGroup::default();
         described_group.group_id = GroupId(StrBytes::from_string(group_id.clone()));
 
-        match coordinator_groups.get(&group_id) {
-            Some(group) => {
-                // Group exists - return detailed information
-                described_group.error_code = ERROR_NONE;
-                described_group.group_state = StrBytes::from_static_str(group.state.as_str());
-                described_group.protocol_type = StrBytes::from_string(
-                    group
-                        .protocol_type
-                        .clone()
-                        .unwrap_or_else(|| "consumer".to_string()),
-                );
-                described_group.protocol_data =
-                    StrBytes::from_string(group.protocol_name.clone().unwrap_or_default());
+        if let Some(group) = coordinator_groups.get(&group_id) {
+            // Group exists - return detailed information
+            described_group.error_code = ERROR_NONE;
+            described_group.group_state = StrBytes::from_static_str(group.state.as_str());
+            described_group.protocol_type = StrBytes::from_string(
+                group
+                    .protocol_type
+                    .clone()
+                    .unwrap_or_else(|| "consumer".to_string()),
+            );
+            described_group.protocol_data =
+                StrBytes::from_string(group.protocol_name.clone().unwrap_or_default());
 
-                // Add member information
-                for member in group.members.values() {
-                    let mut described_member = DescribedGroupMember::default();
-                    described_member.member_id = StrBytes::from_string(member.member_id.clone());
-                    described_member.client_id = StrBytes::from_string(member.client_id.clone());
-                    described_member.client_host =
-                        StrBytes::from_string(member.client_host.clone());
+            // Add member information
+            for member in group.members.values() {
+                let mut described_member = DescribedGroupMember::default();
+                described_member.member_id = StrBytes::from_string(member.member_id.clone());
+                described_member.client_id = StrBytes::from_string(member.client_id.clone());
+                described_member.client_host = StrBytes::from_string(member.client_host.clone());
 
-                    // Member metadata for the group's selected protocol, as Kafka reports it
-                    // (the first protocol before a protocol has been selected).
-                    if let Some((_, metadata)) = member
-                        .protocols
-                        .iter()
-                        .find(|(n, _)| Some(n) == group.protocol_name.as_ref())
-                        .or_else(|| member.protocols.first())
-                    {
-                        described_member.member_metadata = metadata.clone().into();
-                    }
-
-                    // Member assignment
-                    if let Some(assignment) = &member.assignment {
-                        described_member.member_assignment = assignment.clone().into();
-                    }
-
-                    // Static group instance ID (KIP-345)
-                    if let Some(instance_id) = &member.group_instance_id {
-                        described_member.group_instance_id =
-                            Some(StrBytes::from_string(instance_id.clone()));
-                    }
-
-                    described_group.members.push(described_member);
+                // Member metadata for the group's selected protocol, as Kafka reports it
+                // (the first protocol before a protocol has been selected).
+                if let Some((_, metadata)) = member
+                    .protocols
+                    .iter()
+                    .find(|(n, _)| Some(n) == group.protocol_name.as_ref())
+                    .or_else(|| member.protocols.first())
+                {
+                    described_member.member_metadata = metadata.clone().into();
                 }
+
+                // Member assignment
+                if let Some(assignment) = &member.assignment {
+                    described_member.member_assignment = assignment.clone().into();
+                }
+
+                // Static group instance ID (KIP-345)
+                if let Some(instance_id) = &member.group_instance_id {
+                    described_member.group_instance_id =
+                        Some(StrBytes::from_string(instance_id.clone()));
+                }
+
+                described_group.members.push(described_member);
             }
-            None => {
-                // wave3 groups: a group the coordinator does not hold (none of its members
-                // joined since the worker started, or it was reclaimed) still exists while it
-                // has committed offsets: Kafka reports it as an Empty "consumer" group, which is
-                // what lets `kafka-consumer-groups --describe` show its offsets and lag. Without
-                // offsets it does not exist: for the versions we advertise (v0-5) Kafka reports
-                // that as success with state Dead (GROUP_ID_NOT_FOUND only applies from v6).
-                described_group.protocol_data = StrBytes::from_static_str("");
-                match ctx.store.group_has_offsets(&group_id) {
-                    Ok(true) => {
-                        described_group.error_code = ERROR_NONE;
-                        described_group.group_state = StrBytes::from_static_str("Empty");
-                        described_group.protocol_type = StrBytes::from_static_str("consumer");
-                    }
-                    Ok(false) => {
-                        described_group.error_code = ERROR_NONE;
-                        described_group.group_state = StrBytes::from_static_str("Dead");
-                        described_group.protocol_type = StrBytes::from_static_str("");
-                    }
-                    Err(e) => {
-                        described_group.error_code = e.to_kafka_error_code();
-                        described_group.group_state = StrBytes::from_static_str("");
-                        described_group.protocol_type = StrBytes::from_static_str("");
-                    }
+        } else {
+            // A group the coordinator does not hold (none of its members
+            // joined since the worker started, or it was reclaimed) still exists while it
+            // has committed offsets: Kafka reports it as an Empty "consumer" group, which is
+            // what lets `kafka-consumer-groups --describe` show its offsets and lag. Without
+            // offsets it does not exist: for the versions we advertise (v0-5) Kafka reports
+            // that as success with state Dead (GROUP_ID_NOT_FOUND only applies from v6).
+            described_group.protocol_data = StrBytes::from_static_str("");
+            match ctx.store.group_has_offsets(&group_id) {
+                Ok(true) => {
+                    described_group.error_code = ERROR_NONE;
+                    described_group.group_state = StrBytes::from_static_str("Empty");
+                    described_group.protocol_type = StrBytes::from_static_str("consumer");
+                }
+                Ok(false) => {
+                    described_group.error_code = ERROR_NONE;
+                    described_group.group_state = StrBytes::from_static_str("Dead");
+                    described_group.protocol_type = StrBytes::from_static_str("");
+                }
+                Err(e) => {
+                    described_group.error_code = e.to_kafka_error_code();
+                    described_group.group_state = StrBytes::from_static_str("");
+                    described_group.protocol_type = StrBytes::from_static_str("");
                 }
             }
         }
@@ -642,21 +638,21 @@ pub fn handle_describe_groups(
 /// This is useful for discovery, administration, and monitoring.
 pub fn handle_list_groups(
     ctx: &HandlerContext,
-    states_filter: Vec<String>,
-) -> Result<kafka_protocol::messages::list_groups_response::ListGroupsResponse> {
+    states_filter: &[String],
+) -> Result<ListGroupsResponse> {
     let coordinator = ctx.coordinator;
-    use kafka_protocol::messages::list_groups_response::{ListGroupsResponse, ListedGroup};
-    use kafka_protocol::messages::GroupId;
-    use kafka_protocol::protocol::StrBytes;
 
     let mut response = ListGroupsResponse::default();
     response.error_code = ERROR_NONE;
     response.throttle_time_ms = 0;
 
     // Get coordinator state
-    // CG-7: recover from a poisoned lock instead of panicking (which would crash the worker). A
+    // Recover from a poisoned lock instead of panicking (which would crash the worker). A
     // poisoned lock only means some writer panicked; the group map itself is still readable.
-    let coordinator_groups = coordinator.groups.read().unwrap_or_else(|e| e.into_inner());
+    let coordinator_groups = coordinator
+        .groups
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     // Filter groups by state if requested (v4+)
     let filter_enabled = !states_filter.is_empty();
@@ -674,7 +670,7 @@ pub fn handle_list_groups(
             )
         })
         .collect();
-    // wave3 groups: groups known only by their committed offsets are Empty "consumer" groups
+    // Groups known only by their committed offsets are Empty "consumer" groups
     // (see handle_describe_groups), so `kafka-consumer-groups --list` keeps showing them after a
     // worker restart.
     for group_id in ctx.store.list_offset_groups()? {
@@ -709,6 +705,7 @@ mod tests {
     use crate::kafka::messages::{JoinGroupProtocol, SyncGroupAssignment};
     use crate::kafka::{BrokerMetadata, GroupCoordinator};
     use crate::testing::mocks::MockKafkaStore;
+    use crate::testing::TestEnv;
     use std::sync::{Arc, Mutex};
 
     type ResponseSlot = Arc<Mutex<Option<JoinGroupResponse>>>;
@@ -721,7 +718,7 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
-            // wave3 groups: groups unknown to the coordinator are looked up by their offsets.
+            // Groups unknown to the coordinator are looked up by their offsets.
             let mut store = MockKafkaStore::new();
             store.expect_group_has_offsets().returning(|_| Ok(false));
             store.expect_list_offset_groups().returning(|| Ok(vec![]));
@@ -803,8 +800,8 @@ mod tests {
             let writer = slot.clone();
             handle_sync_group(
                 &self.ctx(),
-                group.to_string(),
-                member_id.to_string(),
+                group,
+                member_id,
                 generation,
                 assignments,
                 move |response| {
@@ -820,7 +817,7 @@ mod tests {
     #[test]
     fn test_handle_find_coordinator_success() {
         let f = Fixture::new();
-        let response = handle_find_coordinator(&f.ctx(), "test-group".to_string(), 0).unwrap();
+        let response = handle_find_coordinator(&f.ctx(), "test-group", 0).unwrap();
         assert_eq!(response.error_code, ERROR_NONE);
         assert_eq!(response.node_id, DEFAULT_BROKER_ID);
         assert_eq!(response.host.as_str(), "localhost");
@@ -842,7 +839,7 @@ mod tests {
 
     #[test]
     fn test_handle_join_group_rejects_out_of_bounds_session_timeout() {
-        // RV-10: a session_timeout_ms outside the accepted range is rejected with
+        // A session_timeout_ms outside the accepted range is rejected with
         // INVALID_SESSION_TIMEOUT before any group state is created.
         let f = Fixture::new();
         for bad in [100, i32::MAX] {
@@ -920,7 +917,7 @@ mod tests {
                 assert_eq!((correlation_id, api_version), (7, 5));
                 assert_eq!(response.error_code, ERROR_NONE);
             }
-            other => panic!("unexpected response {:?}", other),
+            other => panic!("unexpected response {other:?}"),
         }
         assert!(rx.try_recv().is_err(), "exactly one response");
 
@@ -937,7 +934,7 @@ mod tests {
                     crate::kafka::constants::ERROR_UNKNOWN_SERVER_ERROR
                 );
             }
-            other => panic!("unexpected response {:?}", other),
+            other => panic!("unexpected response {other:?}"),
         }
 
         // A disconnected client is ignored.
@@ -1007,7 +1004,7 @@ mod tests {
                 assert_eq!((correlation_id, api_version), (7, 3));
                 assert_eq!(response.error_code, ERROR_NONE);
             }
-            other => panic!("unexpected response {:?}", other),
+            other => panic!("unexpected response {other:?}"),
         }
         assert!(rx.try_recv().is_err(), "exactly one response");
 
@@ -1024,7 +1021,7 @@ mod tests {
                     crate::kafka::constants::ERROR_UNKNOWN_SERVER_ERROR
                 );
             }
-            other => panic!("unexpected response {:?}", other),
+            other => panic!("unexpected response {other:?}"),
         }
         drop(rx);
         SyncGroupReply::new(9, 3, tx).send(SyncGroupResponse::default());
@@ -1035,18 +1032,12 @@ mod tests {
         let f = Fixture::new();
         let join = f.join_now("test-group", "");
         let member_id = join.member_id.to_string();
-        let ok = handle_heartbeat(
-            &f.ctx(),
-            "test-group".to_string(),
-            member_id,
-            join.generation_id,
-        )
-        .unwrap();
+        let ok = handle_heartbeat(&f.ctx(), "test-group", &member_id, join.generation_id).unwrap();
         assert_eq!(ok.error_code, ERROR_NONE);
         let unknown = handle_heartbeat(
             &f.ctx(),
-            "test-group".to_string(),
-            "unknown-member-id".to_string(),
+            "test-group",
+            "unknown-member-id",
             join.generation_id,
         );
         assert!(matches!(unknown, Err(KafkaError::UnknownMemberId { .. })));
@@ -1056,22 +1047,11 @@ mod tests {
     fn test_handle_leave_group_v0_and_unknown_member() {
         let f = Fixture::new();
         let member_id = f.join_now("test-group", "").member_id.to_string();
-        let unknown = handle_leave_group(
-            &f.ctx(),
-            "test-group".to_string(),
-            "unknown-member-id".to_string(),
-            vec![],
-        );
+        let unknown = handle_leave_group(&f.ctx(), "test-group", "unknown-member-id", vec![]);
         assert!(matches!(unknown, Err(KafkaError::UnknownMemberId { .. })));
-        let leave = handle_leave_group(
-            &f.ctx(),
-            "test-group".to_string(),
-            member_id.clone(),
-            vec![],
-        )
-        .unwrap();
+        let leave = handle_leave_group(&f.ctx(), "test-group", &member_id, vec![]).unwrap();
         assert_eq!(leave.error_code, ERROR_NONE);
-        assert!(handle_heartbeat(&f.ctx(), "test-group".to_string(), member_id, 1).is_err());
+        assert!(handle_heartbeat(&f.ctx(), "test-group", &member_id, 1).is_err());
     }
 
     #[test]
@@ -1082,8 +1062,8 @@ mod tests {
         let member_id = f.join_now("test-group", "").member_id.to_string();
         let leave = handle_leave_group(
             &f.ctx(),
-            "test-group".to_string(),
-            String::new(),
+            "test-group",
+            "",
             vec![
                 crate::kafka::messages::MemberIdentity {
                     member_id: member_id.clone(),
@@ -1100,7 +1080,7 @@ mod tests {
         assert_eq!(leave.members.len(), 2);
         assert_eq!(leave.members[0].error_code, ERROR_NONE);
         assert_ne!(leave.members[1].error_code, ERROR_NONE);
-        assert!(handle_heartbeat(&f.ctx(), "test-group".to_string(), member_id, 1).is_err());
+        assert!(handle_heartbeat(&f.ctx(), "test-group", &member_id, 1).is_err());
     }
 
     #[test]
@@ -1109,7 +1089,7 @@ mod tests {
         let leader = f.join_now("test-group", "").member_id.to_string();
         let second = f.join("test-group", "", 30_000);
         assert!(take(&second).is_none());
-        handle_leave_group(&f.ctx(), "test-group".to_string(), leader, vec![]).unwrap();
+        handle_leave_group(&f.ctx(), "test-group", &leader, vec![]).unwrap();
         let second = take(&second).expect("answered by the LeaveGroup");
         assert_eq!(second.error_code, ERROR_NONE);
         assert_eq!(second.leader, second.member_id);
@@ -1132,22 +1112,21 @@ mod tests {
         assert_eq!(group.members[0].member_id.as_str(), join.member_id.as_str());
         assert_eq!(described.groups[1].group_state.as_str(), "Dead");
 
-        let all = handle_list_groups(&f.ctx(), vec![]).unwrap();
+        let all = handle_list_groups(&f.ctx(), &[]).unwrap();
         assert_eq!(all.groups.len(), 1);
         let completing =
-            handle_list_groups(&f.ctx(), vec!["CompletingRebalance".to_string()]).unwrap();
+            handle_list_groups(&f.ctx(), &["CompletingRebalance".to_string()]).unwrap();
         assert_eq!(completing.groups.len(), 1);
-        let empty = handle_list_groups(&f.ctx(), vec!["Empty".to_string()]).unwrap();
-        assert!(empty.groups.is_empty());
+        let empty = handle_list_groups(&f.ctx(), &["Empty".to_string()]).unwrap();
+        assert_eq!(empty.groups, [] as [ListedGroup; 0]);
     }
 
     #[test]
     fn test_describe_and_list_groups_recover_from_poisoned_lock() {
-        // CG-7: a poisoned groups lock (a writer panicked while holding it) must NOT crash
-        // DescribeGroups / ListGroups. They previously did `groups.read().unwrap()`, which panics
-        // on a poisoned lock; now they recover via into_inner(). This test poisons the lock and
-        // asserts both handlers still return Ok (it also covers the recovery closures).
-        let coordinator = crate::kafka::GroupCoordinator::new();
+        // A poisoned groups lock (a writer panicked while holding it) must not crash
+        // DescribeGroups / ListGroups: they recover the guard with into_inner(). This test
+        // poisons the lock and asserts both handlers still return Ok.
+        let coordinator = GroupCoordinator::new();
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = coordinator.groups.write().unwrap();
             panic!("intentionally poison the lock");
@@ -1157,7 +1136,7 @@ mod tests {
         let mut store = MockKafkaStore::new();
         store.expect_group_has_offsets().returning(|_| Ok(false));
         store.expect_list_offset_groups().returning(|| Ok(vec![]));
-        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
+        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
         let ctx = HandlerContext::new(
             &store,
             &coordinator,
@@ -1167,10 +1146,10 @@ mod tests {
         );
 
         assert!(handle_describe_groups(&ctx, vec!["g".to_string()]).is_ok());
-        assert!(handle_list_groups(&ctx, vec![]).is_ok());
+        assert!(handle_list_groups(&ctx, &[]).is_ok());
     }
 
-    // ----- wave3 groups -----
+    // ----- Groups known only by their committed offsets -----
 
     fn offsets_store(groups: &'static [&'static str]) -> MockKafkaStore {
         let mut store = MockKafkaStore::new();
@@ -1179,25 +1158,18 @@ mod tests {
             .returning(move |g| Ok(groups.contains(&g)));
         store
             .expect_list_offset_groups()
-            .returning(move || Ok(groups.iter().map(|g| g.to_string()).collect()));
+            .returning(move || Ok(groups.iter().map(ToString::to_string).collect()));
         store
     }
 
     #[test]
     fn test_offsets_only_group_is_an_empty_consumer_group() {
-        // Item 2: a group the coordinator does not hold (e.g. after a worker restart) but that
+        // A group the coordinator does not hold (e.g. after a worker restart) but that
         // has committed offsets is reported as an Empty "consumer" group, as Kafka does;
         // it was "Dead" in DescribeGroups and missing from ListGroups.
         let store = offsets_store(&["committed-only", "live"]);
-        let coordinator = GroupCoordinator::new();
-        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-        let ctx = HandlerContext::new(
-            &store,
-            &coordinator,
-            &broker,
-            1,
-            kafka_protocol::records::Compression::None,
-        );
+        let env = TestEnv::new();
+        let ctx = env.ctx(&store);
         // "live" is also in memory: it must be listed once, with its real state.
         let (responder, slot) = {
             let slot: ResponseSlot = Arc::new(Mutex::new(None));
@@ -1234,10 +1206,10 @@ mod tests {
         assert_eq!(d.groups[0].error_code, ERROR_NONE);
         assert_eq!(d.groups[0].group_state.as_str(), "Empty");
         assert_eq!(d.groups[0].protocol_type.as_str(), "consumer");
-        assert!(d.groups[0].members.is_empty());
+        assert_eq!(d.groups[0].members, [] as [DescribedGroupMember; 0]);
         assert_eq!(d.groups[1].group_state.as_str(), "Dead");
 
-        let l = handle_list_groups(&ctx, vec![]).unwrap();
+        let l = handle_list_groups(&ctx, &[]).unwrap();
         let listed: Vec<(&str, &str, &str)> = l
             .groups
             .iter()
@@ -1256,7 +1228,7 @@ mod tests {
                 ("live", "consumer", "CompletingRebalance")
             ]
         );
-        let empty_only = handle_list_groups(&ctx, vec!["empty".to_string()]).unwrap();
+        let empty_only = handle_list_groups(&ctx, &["empty".to_string()]).unwrap();
         assert_eq!(
             empty_only.groups.len(),
             1,

@@ -34,7 +34,7 @@ mod integration_tests {
     fn test_subscription_roundtrip_in_assignment() {
         // Test that subscription can be encoded, decoded, and used in assignment
         let original = MemberSubscription::new(vec!["topic-a".to_string(), "topic-b".to_string()]);
-        let encoded = original.encode();
+        let encoded = original.encode().unwrap();
         let decoded = MemberSubscription::parse(&encoded).unwrap();
 
         assert_eq!(original.topics, decoded.topics);
@@ -48,7 +48,7 @@ mod integration_tests {
         partitions.insert("topic-b".to_string(), vec![0]);
 
         let original = MemberAssignment::with_partitions(partitions);
-        let encoded = original.encode();
+        let encoded = original.encode().unwrap();
         let decoded = MemberAssignment::parse(&encoded).unwrap();
 
         assert_eq!(original.partition_count(), decoded.partition_count());
@@ -70,7 +70,7 @@ mod integration_tests {
             let result = strategy.assign(&input);
 
             // All members have assignments
-            assert_eq!(result.len(), 3, "Strategy {} failed", strategy_name);
+            assert_eq!(result.len(), 3, "Strategy {strategy_name} failed");
 
             // Count total partitions assigned
             let total_a: usize = result.values().map(|a| a.partitions("topic-a").len()).sum();
@@ -78,20 +78,17 @@ mod integration_tests {
 
             assert_eq!(
                 total_a, 6,
-                "Strategy {} didn't assign all topic-a partitions",
-                strategy_name
+                "Strategy {strategy_name} didn't assign all topic-a partitions"
             );
             assert_eq!(
                 total_b, 4,
-                "Strategy {} didn't assign all topic-b partitions",
-                strategy_name
+                "Strategy {strategy_name} didn't assign all topic-b partitions"
             );
 
             // Verify member-3 only gets topic-a (not subscribed to topic-b)
             assert!(
                 result["member-3"].partitions("topic-b").is_empty(),
-                "Strategy {} assigned topic-b to non-subscriber",
-                strategy_name
+                "Strategy {strategy_name} assigned topic-b to non-subscriber"
             );
         }
     }
@@ -118,14 +115,13 @@ mod integration_tests {
                 .collect();
 
             let original_len = all_partitions.len();
-            all_partitions.sort();
+            all_partitions.sort_unstable();
             all_partitions.dedup();
 
             assert_eq!(
                 all_partitions.len(),
                 original_len,
-                "Strategy {} produced overlapping assignments",
-                strategy_name
+                "Strategy {strategy_name} produced overlapping assignments"
             );
         }
     }
@@ -146,13 +142,12 @@ mod integration_tests {
                 .values()
                 .flat_map(|a| a.partitions("topic-a"))
                 .collect();
-            all_partitions.sort();
+            all_partitions.sort_unstable();
 
             let expected: Vec<i32> = (0..7).collect();
             assert_eq!(
                 all_partitions, expected,
-                "Strategy {} didn't assign all partitions",
-                strategy_name
+                "Strategy {strategy_name} didn't assign all partitions"
             );
         }
     }

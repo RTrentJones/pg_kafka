@@ -78,7 +78,7 @@ impl AssignmentStrategy for RoundRobinStrategy {
             return result;
         }
 
-        // CG-6: use a SINGLE global round-robin pointer across all (topic, partition) pairs — as
+        // Use a SINGLE global round-robin pointer across all (topic, partition) pairs — as
         // Kafka does and as this module's doc example describes — not a per-topic counter that
         // restarts at 0 for each topic (which imbalances heterogeneous multi-topic subscriptions).
         // The pointer walks the sorted members and skips any not subscribed to the current topic.
@@ -94,8 +94,7 @@ impl AssignmentStrategy for RoundRobinStrategy {
                 let subscribed = input
                     .subscriptions
                     .get(candidate)
-                    .map(|sub| sub.topics.contains(&topic))
-                    .unwrap_or(false);
+                    .is_some_and(|sub| sub.topics.contains(&topic));
                 if subscribed {
                     assigned = Some(candidate);
                     break;
@@ -205,9 +204,9 @@ mod tests {
         // Only first 2 consumers get partitions
         assert_eq!(result["member-1"].partitions("topic-a"), vec![0]);
         assert_eq!(result["member-2"].partitions("topic-a"), vec![1]);
-        assert!(result["member-3"].partitions("topic-a").is_empty());
-        assert!(result["member-4"].partitions("topic-a").is_empty());
-        assert!(result["member-5"].partitions("topic-a").is_empty());
+        assert_eq!(result["member-3"].partitions("topic-a"), [] as [i32; 0]);
+        assert_eq!(result["member-4"].partitions("topic-a"), [] as [i32; 0]);
+        assert_eq!(result["member-5"].partitions("topic-a"), [] as [i32; 0]);
     }
 
     #[test]
@@ -228,8 +227,8 @@ mod tests {
         assert_eq!(result["member-1"].partitions("topic-a"), vec![0, 2]);
         assert_eq!(result["member-2"].partitions("topic-a"), vec![1]);
 
-        // CG-6: topic-b continues the GLOBAL pointer from topic-a (B0->m2, B1->m1), rather than
-        // restarting per topic (which previously, wrongly, gave m1 B0 and m2 B1).
+        // topic-b continues the global pointer from topic-a (B0->m2, B1->m1), as Kafka's
+        // assignor does, rather than restarting per topic (m1 B0, m2 B1).
         assert_eq!(result["member-1"].partitions("topic-b"), vec![1]);
         assert_eq!(result["member-2"].partitions("topic-b"), vec![0]);
     }
@@ -253,7 +252,7 @@ mod tests {
         assert_eq!(result["member-2"].partitions("topic-a"), vec![1, 3]);
 
         // topic-b: only member-2 subscribes -> all to member-2
-        assert!(result["member-1"].partitions("topic-b").is_empty());
+        assert_eq!(result["member-1"].partitions("topic-b"), [] as [i32; 0]);
         assert_eq!(result["member-2"].partitions("topic-b"), vec![0, 1, 2, 3]);
     }
 
@@ -305,7 +304,7 @@ mod tests {
         let result = strategy.assign(&input);
 
         assert_eq!(result["member-1"].partitions("topic-a"), vec![0, 1, 2, 3]);
-        assert!(result["member-1"].partitions("topic-b").is_empty());
+        assert_eq!(result["member-1"].partitions("topic-b"), [] as [i32; 0]);
     }
 
     #[test]
@@ -325,6 +324,6 @@ mod tests {
         let strategy = RoundRobinStrategy::new();
         let result = strategy.assign(&input);
 
-        assert!(result["member-1"].partitions("topic-a").is_empty());
+        assert_eq!(result["member-1"].partitions("topic-a"), [] as [i32; 0]);
     }
 }

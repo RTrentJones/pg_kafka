@@ -1,10 +1,4 @@
-// Admin API handlers (Phase 6)
-//
-// This module contains handlers for Kafka admin operations:
-// - CreateTopics: Programmatically create topics
-// - DeleteTopics: Delete existing topics
-// - CreatePartitions: Add partitions to existing topics
-// - DeleteGroups: Delete consumer groups
+//! Admin handlers: CreateTopics, DeleteTopics, CreatePartitions and DeleteGroups.
 
 use kafka_protocol::messages::create_partitions_response::{
     CreatePartitionsResponse, CreatePartitionsTopicResult,
@@ -22,14 +16,18 @@ use kafka_protocol::messages::{GroupId, TopicName};
 use kafka_protocol::protocol::StrBytes;
 
 use super::helpers::validate_topic_name;
-use crate::kafka::constants::*;
+use crate::kafka::constants::{
+    ERROR_GROUP_ID_NOT_FOUND, ERROR_INVALID_PARTITIONS, ERROR_INVALID_REPLICATION_FACTOR,
+    ERROR_INVALID_REQUEST, ERROR_INVALID_TOPIC_EXCEPTION, ERROR_NONE, ERROR_NON_EMPTY_GROUP,
+    ERROR_TOPIC_ALREADY_EXISTS, ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+};
 use crate::kafka::error::Result;
 use crate::kafka::handler_context::HandlerContext;
 use crate::kafka::messages::{CreatePartitionsTopicRequest, CreateTopicRequest};
 
 /// Handle CreateTopics request
 ///
-/// Validates each topic as Kafka 3.7 does (wave3 groups) and creates the valid ones:
+/// Validates each topic as Kafka 3.7 does and creates the valid ones:
 /// - a name repeated in the request: one result, INVALID_REQUEST ("Duplicate topic name.");
 /// - an invalid name, or one that collides with an existing topic once '.' and '_' are treated
 ///   as equal (`a.b` vs `a_b`): INVALID_TOPIC_EXCEPTION;
@@ -78,7 +76,7 @@ pub fn handle_create_topics(
             continue;
         }
 
-        // Validate topic name (CONF-4: length, charset, and "."/".." in addition to empty).
+        // Validate topic name (length, charset, and "."/".." in addition to empty).
         if let Err(msg) = validate_topic_name(&topic.name) {
             results.push(fail(result, ERROR_INVALID_TOPIC_EXCEPTION, msg.to_string()));
             continue;
@@ -126,7 +124,7 @@ pub fn handle_create_topics(
                 results.push(fail(
                     result,
                     ERROR_UNKNOWN_SERVER_ERROR,
-                    format!("Error checking topic: {}", e),
+                    format!("Error checking topic: {e}"),
                 ));
                 continue;
             }
@@ -151,7 +149,7 @@ pub fn handle_create_topics(
                 results.push(fail(
                     result,
                     ERROR_UNKNOWN_SERVER_ERROR,
-                    format!("Error checking topic: {}", e),
+                    format!("Error checking topic: {e}"),
                 ));
                 continue;
             }
@@ -178,7 +176,7 @@ pub fn handle_create_topics(
                 result = fail(
                     result,
                     ERROR_UNKNOWN_SERVER_ERROR,
-                    format!("Failed to create topic: {}", e),
+                    format!("Failed to create topic: {e}"),
                 );
             }
         }
@@ -201,9 +199,8 @@ pub fn validate_replication_factor(replication_factor: i16) -> std::result::Resu
             "Replication factor must be larger than 0, or -1 to use the default value.".to_string(),
         ),
         rf => Err(format!(
-            "Unable to replicate the partition {} time(s): The target replication factor of {} \
-             cannot be reached because only 1 broker(s) are registered.",
-            rf, rf
+            "Unable to replicate the partition {rf} time(s): The target replication factor of {rf} \
+             cannot be reached because only 1 broker(s) are registered."
         )),
     }
 }
@@ -234,8 +231,7 @@ pub fn handle_delete_topics(
                     Err(e) => {
                         result.error_code = ERROR_UNKNOWN_SERVER_ERROR;
                         result.error_message = Some(StrBytes::from_string(format!(
-                            "Failed to delete topic: {}",
-                            e
+                            "Failed to delete topic: {e}"
                         )));
                     }
                 }
@@ -247,8 +243,7 @@ pub fn handle_delete_topics(
             Err(e) => {
                 result.error_code = ERROR_UNKNOWN_SERVER_ERROR;
                 result.error_message = Some(StrBytes::from_string(format!(
-                    "Error looking up topic: {}",
-                    e
+                    "Error looking up topic: {e}"
                 )));
             }
         }
@@ -288,18 +283,17 @@ pub fn handle_create_partitions(
                         current_count, topic.count
                     )));
                 } else if topic.count == current_count {
-                    // CONF-4: Kafka rejects a no-op partition count as INVALID_PARTITIONS
+                    // Kafka rejects a no-op partition count as INVALID_PARTITIONS
                     // ("Topic already has N partitions") rather than silently succeeding.
                     result.error_code = ERROR_INVALID_PARTITIONS;
                     result.error_message = Some(StrBytes::from_string(format!(
-                        "Topic already has {} partitions",
-                        current_count
+                        "Topic already has {current_count} partitions"
                     )));
                 } else if let Err(msg) = crate::kafka::limits::check_partition_count(
                     topic.count,
                     crate::kafka::limits::max_partitions_per_topic(),
                 ) {
-                    // wave3 groups: the per-topic partition cap applies to growth too.
+                    // The per-topic partition cap applies to growth too.
                     result.error_code = ERROR_INVALID_PARTITIONS;
                     result.error_message = Some(StrBytes::from_string(msg));
                 } else if validate_only {
@@ -314,8 +308,7 @@ pub fn handle_create_partitions(
                         Err(e) => {
                             result.error_code = ERROR_UNKNOWN_SERVER_ERROR;
                             result.error_message = Some(StrBytes::from_string(format!(
-                                "Failed to increase partitions: {}",
-                                e
+                                "Failed to increase partitions: {e}"
                             )));
                         }
                     }
@@ -328,8 +321,7 @@ pub fn handle_create_partitions(
             Err(e) => {
                 result.error_code = ERROR_UNKNOWN_SERVER_ERROR;
                 result.error_message = Some(StrBytes::from_string(format!(
-                    "Error looking up topic: {}",
-                    e
+                    "Error looking up topic: {e}"
                 )));
             }
         }
@@ -385,7 +377,7 @@ pub fn handle_delete_groups(
                 }
             }
             None => {
-                // wave3 groups: a group the coordinator does not hold exists only through its
+                // A group the coordinator does not hold exists only through its
                 // committed offsets (an Empty group, as DescribeGroups/ListGroups report it).
                 // Without any, it does not exist: GROUP_ID_NOT_FOUND, as Kafka answers.
                 match store.group_has_offsets(&group_name) {
@@ -455,7 +447,7 @@ mod tests {
     fn test_create_topics_empty_name() {
         let store = MockKafkaStore::new();
         let topics = vec![CreateTopicRequest {
-            name: "".to_string(),
+            name: String::new(),
             num_partitions: 1,
             replication_factor: 1,
         }];
@@ -640,7 +632,7 @@ mod tests {
 
     #[test]
     fn test_create_partitions_no_op_rejected() {
-        // CONF-4: increasing to the current count is a no-op and must be rejected with
+        // Increasing to the current count is a no-op and must be rejected with
         // INVALID_PARTITIONS, not silently succeed.
         let mut store = MockKafkaStore::new();
         store
@@ -665,7 +657,7 @@ mod tests {
 
     #[test]
     fn test_validate_topic_name() {
-        // CONF-4: name validation mirrors Apache Kafka's Topic.validate.
+        // Name validation mirrors Apache Kafka's Topic.validate.
         assert!(validate_topic_name("valid.topic_name-1").is_ok());
         assert!(validate_topic_name(&"x".repeat(249)).is_ok());
         assert!(validate_topic_name("").is_err());
@@ -694,7 +686,7 @@ mod tests {
         assert_eq!(response.results[0].error_code, ERROR_NONE);
     }
 
-    // ----- wave3 groups -----
+    // ----- CreateTopics / CreatePartitions validation and offsets-only groups -----
 
     fn ctx_for<'a>(
         store: &'a MockKafkaStore,
@@ -727,8 +719,8 @@ mod tests {
 
     #[test]
     fn test_create_topics_partition_cap() {
-        // Item 1: a huge partition count is refused before anything is stored (it used to be
-        // written and then crash every Metadata request).
+        // A huge partition count is refused before anything is stored; stored, it would make
+        // every Metadata request allocate for it.
         let mut store = MockKafkaStore::new();
         store.expect_topic_exists().returning(|_| Ok(false));
         store.expect_find_colliding_topic().returning(|_| Ok(None));

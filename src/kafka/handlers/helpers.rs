@@ -1,7 +1,4 @@
-// Handler helper functions
-//
-// These helpers reduce code duplication across handlers by providing
-// common operations like topic resolution and error code mapping.
+//! Helpers shared by the handlers: topic resolution and validation, and error-code mapping.
 
 use crate::kafka::constants::{ERROR_NONE, ERROR_UNKNOWN_TOPIC_OR_PARTITION};
 use crate::kafka::error::KafkaError;
@@ -38,7 +35,7 @@ pub fn resolve_topic_id<S: TopicStore + ?Sized>(store: &S, topic_name: &str) -> 
 pub fn resolve_topic<S: TopicStore + ?Sized>(
     store: &S,
     topic_name: &str,
-) -> std::result::Result<Option<(i32, i32)>, i16> {
+) -> Result<Option<(i32, i32)>, i16> {
     match store.get_topic_metadata(Some(std::slice::from_ref(&topic_name.to_string()))) {
         Ok(topics) => Ok(topics.first().map(|tm| (tm.id, tm.partition_count))),
         Err(e) => {
@@ -52,8 +49,8 @@ pub fn resolve_topic<S: TopicStore + ?Sized>(
 }
 
 /// Validate a topic name against Kafka's rules (mirrors `Topic.validate` in Apache Kafka):
-/// non-empty, not "." or "..", at most 249 characters, and only `[a-zA-Z0-9._-]`. (CONF-4)
-pub fn validate_topic_name(name: &str) -> std::result::Result<(), &'static str> {
+/// non-empty, not "." or "..", at most 249 characters, and only `[a-zA-Z0-9._-]`.
+pub fn validate_topic_name(name: &str) -> Result<(), &'static str> {
     if name.is_empty() {
         return Err("Topic name cannot be empty");
     }
@@ -90,7 +87,7 @@ pub fn get_or_create_valid_topic<S: TopicStore + ?Sized>(
             }),
         };
     }
-    // wave3 groups: never auto-create above pg_kafka.max_partitions_per_topic.
+    // Never auto-create above pg_kafka.max_partitions_per_topic.
     store.get_or_create_topic(
         topic_name,
         crate::kafka::limits::auto_create_partitions(default_partitions),

@@ -78,7 +78,7 @@ impl KafkaApi for FindCoordinatorApi {
 
     fn handle(request: Self::Request, call: Call<Self>, env: &ApiEnv<'_>) -> RequestOutcome {
         call.run(request, |r, _| {
-            handlers::handle_find_coordinator(&env.ctx, r.key, r.key_type)
+            handlers::handle_find_coordinator(&env.ctx, &r.key, r.key_type)
         })
     }
 }
@@ -200,7 +200,7 @@ impl KafkaApi for HeartbeatApi {
 
     fn handle(request: Self::Request, call: Call<Self>, env: &ApiEnv<'_>) -> RequestOutcome {
         call.run(request, |r, _| {
-            handlers::handle_heartbeat(&env.ctx, r.group_id, r.member_id, r.generation_id)
+            handlers::handle_heartbeat(&env.ctx, &r.group_id, &r.member_id, r.generation_id)
         })
     }
 }
@@ -253,7 +253,7 @@ impl KafkaApi for LeaveGroupApi {
 
     fn handle(request: Self::Request, call: Call<Self>, env: &ApiEnv<'_>) -> RequestOutcome {
         call.run(request, |r, _| {
-            handlers::handle_leave_group(&env.ctx, r.group_id, r.member_id, r.members)
+            handlers::handle_leave_group(&env.ctx, &r.group_id, &r.member_id, r.members)
         })
     }
 }
@@ -331,8 +331,8 @@ impl KafkaApi for SyncGroupApi {
             handlers::SyncGroupReply::new(header.correlation_id, header.api_version, response_tx);
         handlers::handle_sync_group(
             &env.ctx,
-            request.group_id,
-            request.member_id,
+            &request.group_id,
+            &request.member_id,
             request.generation_id,
             request.assignments,
             move |response| reply.send(response),
@@ -458,7 +458,7 @@ impl KafkaApi for ListGroupsApi {
 
     fn handle(request: Self::Request, call: Call<Self>, env: &ApiEnv<'_>) -> RequestOutcome {
         call.run(request, |r, _| {
-            handlers::handle_list_groups(&env.ctx, r.states_filter)
+            handlers::handle_list_groups(&env.ctx, &r.states_filter)
         })
     }
 }
