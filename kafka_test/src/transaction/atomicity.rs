@@ -54,7 +54,7 @@ pub async fn test_transaction_timeout_auto_abort() -> TestResult {
         )
         .await
         .map_err(|(err, _msg)| err)?;
-    println!("  Message queued at offset {}\n", offset);
+    println!("  Message queued at offset {offset}\n");
 
     // Get the topic ID
     let topic_row = client
@@ -89,7 +89,7 @@ pub async fn test_transaction_timeout_auto_abort() -> TestResult {
         )
         .await?
         .get(0);
-    println!("  Visible messages (read_committed): {}", visible_count);
+    println!("  Visible messages (read_committed): {visible_count}");
     assert_eq!(
         visible_count, 0,
         "Pending transaction messages should not be visible"
@@ -114,7 +114,7 @@ pub async fn test_transaction_timeout_auto_abort() -> TestResult {
         Some(row) => {
             let final_state: Option<String> = row.get(0);
             // After abort, message should be marked as aborted (not pending or NULL)
-            println!("  Final message state: {:?}", final_state);
+            println!("  Final message state: {final_state:?}");
             assert!(
                 final_state == Some("aborted".to_string())
                     || final_state == Some("pending".to_string()),
@@ -209,17 +209,14 @@ pub async fn test_concurrent_transactions_same_producer() -> TestResult {
                     )
                     .await?
                     .get(0);
-                println!(
-                    "  First topic visible messages: {} (expected 0 - was aborted)",
-                    visible
-                );
+                println!("  First topic visible messages: {visible} (expected 0 - was aborted)");
             } else {
                 println!("  First topic doesn't exist (transaction aborted before produce)");
             }
         }
         Err(e) => {
             // This is also valid behavior - rejecting concurrent transaction
-            println!("  Second transaction rejected: {}", e);
+            println!("  Second transaction rejected: {e}");
             println!("  This is expected behavior for concurrent transaction prevention\n");
 
             // Clean up first transaction
@@ -274,7 +271,7 @@ pub async fn test_producer_fencing_mid_transaction() -> TestResult {
             }
         }
     };
-    println!("  First producer epoch: {}", epoch1);
+    println!("  First producer epoch: {epoch1}");
 
     // Produce a message with first producer (in transaction)
     let result1 = producer1
@@ -317,12 +314,9 @@ pub async fn test_producer_fencing_mid_transaction() -> TestResult {
             }
         }
     };
-    println!("  Second producer epoch: {}", epoch2);
+    println!("  Second producer epoch: {epoch2}");
     assert!(epoch2 > epoch1, "Epoch should be bumped");
-    println!(
-        "  Epoch bumped: {} -> {} (fencing confirmed)\n",
-        epoch1, epoch2
-    );
+    println!("  Epoch bumped: {epoch1} -> {epoch2} (fencing confirmed)\n");
 
     // Try to commit the fenced producer's transaction (should fail)
     println!("Attempting to commit with fenced producer...");
@@ -347,15 +341,12 @@ pub async fn test_producer_fencing_mid_transaction() -> TestResult {
                     )
                     .await?
                     .get(0);
-                println!(
-                    "  Visible messages: {} (fenced messages may not be visible)",
-                    visible
-                );
+                println!("  Visible messages: {visible} (fenced messages may not be visible)");
             }
         }
         Err(e) => {
             let err_str = e.to_string().to_lowercase();
-            println!("  Commit failed (expected): {}", e);
+            println!("  Commit failed (expected): {e}");
 
             let is_fencing_error = err_str.contains("fenced")
                 || err_str.contains("epoch")
@@ -413,7 +404,7 @@ pub async fn test_add_partitions_to_txn_idempotent() -> TestResult {
         .await;
     assert!(result1.is_ok(), "First produce should succeed");
     let (_p1, offset1) = result1.unwrap();
-    println!("  First message at offset {}\n", offset1);
+    println!("  First message at offset {offset1}\n");
 
     // Produce second message to same partition (AddPartitionsToTxn already called)
     println!("Producing second message to same partition 0...");
@@ -431,7 +422,7 @@ pub async fn test_add_partitions_to_txn_idempotent() -> TestResult {
         "Second produce to same partition should succeed"
     );
     let (_p2, offset2) = result2.unwrap();
-    println!("  Second message at offset {}\n", offset2);
+    println!("  Second message at offset {offset2}\n");
 
     // Commit transaction
     println!("Committing transaction...");
@@ -454,7 +445,7 @@ pub async fn test_add_partitions_to_txn_idempotent() -> TestResult {
         .await?
         .get(0);
 
-    println!("  Visible messages: {}", visible_count);
+    println!("  Visible messages: {visible_count}");
     assert_eq!(visible_count, 2, "Both messages should be visible");
     println!("  AddPartitionsToTxn idempotency confirmed\n");
 
@@ -486,7 +477,7 @@ pub async fn test_txn_offset_commit_visibility_timing() -> TestResult {
         seed_producer
             .send(
                 FutureRecord::to(&source_topic)
-                    .payload(&format!("msg-{}", i))
+                    .payload(&format!("msg-{i}"))
                     .key("key"),
                 Duration::from_secs(5),
             )
@@ -538,10 +529,7 @@ pub async fn test_txn_offset_commit_visibility_timing() -> TestResult {
         )
         .await?
         .get(0);
-    println!(
-        "  Committed offsets before transaction commit: {}",
-        committed_before
-    );
+    println!("  Committed offsets before transaction commit: {committed_before}");
     assert_eq!(committed_before, 0, "Offset should not be committed yet");
 
     // Produce something to keep transaction alive
@@ -589,30 +577,27 @@ pub async fn test_txn_offset_commit_visibility_timing() -> TestResult {
         )
         .await?;
 
-    match committed_after {
-        Some(row) => {
-            let offset: i64 = row.get(0);
-            println!("  Committed offset after transaction: {}", offset);
-            assert_eq!(offset, 3, "Offset should be committed");
-            println!("  TxnOffsetCommit visibility confirmed\n");
-        }
-        None => {
-            // Check if pending offsets were cleaned up
-            let pending_count: i64 = client
-                .query_one(
-                    "SELECT COUNT(*) FROM kafka.txn_pending_offsets WHERE transactional_id = $1",
-                    &[&txn_id],
-                )
-                .await?
-                .get(0);
-            println!("  Pending offsets remaining: {}", pending_count);
+    if let Some(row) = committed_after {
+        let offset: i64 = row.get(0);
+        println!("  Committed offset after transaction: {offset}");
+        assert_eq!(offset, 3, "Offset should be committed");
+        println!("  TxnOffsetCommit visibility confirmed\n");
+    } else {
+        // Check if pending offsets were cleaned up
+        let pending_count: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM kafka.txn_pending_offsets WHERE transactional_id = $1",
+                &[&txn_id],
+            )
+            .await?
+            .get(0);
+        println!("  Pending offsets remaining: {pending_count}");
 
-            // Pending offsets should be moved to committed on transaction commit
-            if pending_count == 0 {
-                println!(
-                    "  Note: Pending offsets were processed (may need EndTxn handler enhancement)"
-                );
-            }
+        // Pending offsets should be moved to committed on transaction commit
+        if pending_count == 0 {
+            println!(
+                "  Note: Pending offsets were processed (may need EndTxn handler enhancement)"
+            );
         }
     }
 
@@ -720,7 +705,7 @@ pub async fn test_abort_transaction_discards_pending_offsets() -> TestResult {
         0,
     )
     .await?;
-    println!("  Pending offsets after abort: {}", pending_after);
+    println!("  Pending offsets after abort: {pending_after}");
 
     // Verify offset is NOT in consumer_offsets
     let committed_count: i64 = client
@@ -730,7 +715,7 @@ pub async fn test_abort_transaction_discards_pending_offsets() -> TestResult {
         )
         .await?
         .get(0);
-    println!("  Committed offsets: {}", committed_count);
+    println!("  Committed offsets: {committed_count}");
     assert_eq!(
         committed_count, 0,
         "Aborted transaction should not commit offsets"
@@ -784,7 +769,7 @@ pub async fn test_transaction_partial_failure_atomicity() -> TestResult {
     let first_success = result1.is_ok();
     if first_success {
         let (_, offset) = result1.unwrap();
-        println!("  First message sent to offset {}\n", offset);
+        println!("  First message sent to offset {offset}\n");
     } else {
         println!("  First message failed (unexpected): {:?}\n", result1.err());
     }
@@ -804,7 +789,7 @@ pub async fn test_transaction_partial_failure_atomicity() -> TestResult {
     let second_failed = result2.is_err();
     if second_failed {
         let (err, _) = result2.err().unwrap();
-        println!("  Second message failed as expected: {}\n", err);
+        println!("  Second message failed as expected: {err}\n");
     } else {
         println!("  Second message unexpectedly succeeded\n");
     }
@@ -831,7 +816,7 @@ pub async fn test_transaction_partial_failure_atomicity() -> TestResult {
                     )
                     .await?
                     .get(0);
-                println!("  Visible messages: {}", visible);
+                println!("  Visible messages: {visible}");
 
                 // If the second produce failed before commit, first might be visible
                 // This tests whether the error propagates to transaction abort
@@ -842,7 +827,7 @@ pub async fn test_transaction_partial_failure_atomicity() -> TestResult {
             }
         }
         Err(e) => {
-            println!("  Transaction commit failed: {}\n", e);
+            println!("  Transaction commit failed: {e}\n");
             println!("  This indicates atomicity - partial failure aborted entire txn\n");
         }
     }
@@ -886,10 +871,7 @@ pub async fn test_transaction_boundary_isolation() -> TestResult {
         .map_err(|(e, _)| e)?;
 
     producer1.commit_transaction(Duration::from_secs(10))?;
-    println!(
-        "  First transaction committed, message at offset {}\n",
-        offset1
-    );
+    println!("  First transaction committed, message at offset {offset1}\n");
 
     // Create second transaction but don't commit (keep pending)
     println!("Creating second producer with pending transaction...");
@@ -906,10 +888,7 @@ pub async fn test_transaction_boundary_isolation() -> TestResult {
         )
         .await
         .map_err(|(e, _)| e)?;
-    println!(
-        "  Second transaction pending, message at offset {}\n",
-        offset2
-    );
+    println!("  Second transaction pending, message at offset {offset2}\n");
 
     // Verify database state
     println!("=== Database Verification ===\n");
@@ -936,8 +915,8 @@ pub async fn test_transaction_boundary_isolation() -> TestResult {
         .await?
         .get(0);
 
-    println!("  Message 1 (committed): txn_state = {:?}", msg1_state);
-    println!("  Message 2 (pending): txn_state = {:?}", msg2_state);
+    println!("  Message 1 (committed): txn_state = {msg1_state:?}");
+    println!("  Message 2 (pending): txn_state = {msg2_state:?}");
 
     assert!(
         msg1_state.is_none(),
@@ -966,8 +945,8 @@ pub async fn test_transaction_boundary_isolation() -> TestResult {
         .await?
         .get(0);
 
-    println!("\n  read_committed sees: {} message(s)", visible_count);
-    println!("  read_uncommitted sees: {} message(s)", total_count);
+    println!("\n  read_committed sees: {visible_count} message(s)");
+    println!("  read_uncommitted sees: {total_count} message(s)");
 
     assert_eq!(
         visible_count, 1,
@@ -988,12 +967,11 @@ pub async fn test_transaction_boundary_isolation() -> TestResult {
     for _ in 0..5 {
         match consumer.poll(Duration::from_secs(1)) {
             Some(Ok(_msg)) => received += 1,
-            Some(Err(_)) => break,
-            None => break,
+            Some(Err(_)) | None => break,
         }
     }
 
-    println!("  Consumer received: {} message(s)", received);
+    println!("  Consumer received: {received} message(s)");
 
     // Clean up - abort second transaction
     println!("\nCleaning up - aborting second transaction...");
@@ -1089,7 +1067,7 @@ pub async fn test_transaction_honors_per_txn_timeout_ms() -> TestResult {
         )
         .await?
         .get(0);
-    println!("  Transaction state after sweep: {:?}", state);
+    println!("  Transaction state after sweep: {state:?}");
     assert_eq!(
         state,
         Some("Ongoing".to_string()),
@@ -1149,10 +1127,7 @@ pub async fn test_producer_id_reallocated_on_epoch_exhaustion() -> TestResult {
         .await?;
     let new_pid: i64 = row.get(0);
     let new_epoch: i16 = row.get(1);
-    println!(
-        "  orig producer_id={}, new producer_id={}, epoch={}",
-        orig_pid, new_pid, new_epoch
-    );
+    println!("  orig producer_id={orig_pid}, new producer_id={new_pid}, epoch={new_epoch}");
     assert_ne!(
         new_pid, orig_pid,
         "epoch exhaustion must allocate a fresh producer_id (RV-13)"

@@ -42,8 +42,8 @@ pub async fn test_offset_commit_with_metadata() -> TestResult {
         producer
             .send(
                 FutureRecord::to(&topic.name)
-                    .payload(&format!("message-{}", i))
-                    .key(&format!("key-{}", i)),
+                    .payload(&format!("message-{i}"))
+                    .key(&format!("key-{i}")),
                 Duration::from_secs(5),
             )
             .await
@@ -77,12 +77,12 @@ pub async fn test_offset_commit_with_metadata() -> TestResult {
             _ => break,
         }
     }
-    println!("  Consumed {} messages", consumed);
+    println!("  Consumed {consumed} messages");
 
     // Commit with rdkafka (which stores metadata)
     println!("\nStep 4: Committing offset...");
     if let Err(e) = consumer.commit_consumer_state(rdkafka::consumer::CommitMode::Sync) {
-        println!("  Commit error (expected for some scenarios): {}", e);
+        println!("  Commit error (expected for some scenarios): {e}");
     } else {
         println!("  Commit successful");
     }
@@ -110,8 +110,8 @@ pub async fn test_offset_commit_with_metadata() -> TestResult {
     if let Some(row) = offset_row {
         let offset: i64 = row.get(0);
         let metadata: Option<String> = row.get(1);
-        println!("  Committed offset: {}", offset);
-        println!("  Metadata: {:?}", metadata);
+        println!("  Committed offset: {offset}");
+        println!("  Metadata: {metadata:?}");
     } else {
         println!("  Note: No offset committed (may require explicit commit)");
     }
@@ -173,7 +173,7 @@ pub async fn test_fetch_offset_new_group() -> TestResult {
     match offset_row {
         Some(row) => {
             let offset: i64 = row.get(0);
-            println!("  Offset found: {} (unexpected for new group)", offset);
+            println!("  Offset found: {offset} (unexpected for new group)");
         }
         None => {
             println!("  ✅ No offset found (expected for new group)");
@@ -226,8 +226,8 @@ pub async fn test_offset_reset_policy() -> TestResult {
         producer
             .send(
                 FutureRecord::to(&topic.name)
-                    .payload(&format!("existing-{}", i))
-                    .key(&format!("key-{}", i)),
+                    .payload(&format!("existing-{i}"))
+                    .key(&format!("key-{i}")),
                 Duration::from_secs(5),
             )
             .await
@@ -258,7 +258,7 @@ pub async fn test_offset_reset_policy() -> TestResult {
             let value = msg
                 .payload()
                 .map(|v| String::from_utf8_lossy(v).to_string());
-            println!("  ✅ Earliest consumer received: {:?}", value);
+            println!("  ✅ Earliest consumer received: {value:?}");
         }
         _ => println!("  Note: No message received"),
     }
@@ -286,10 +286,10 @@ pub async fn test_offset_reset_policy() -> TestResult {
             let value = msg
                 .payload()
                 .map(|v| String::from_utf8_lossy(v).to_string());
-            println!("  Latest consumer received: {:?} (may be expected)", value);
+            println!("  Latest consumer received: {value:?} (may be expected)");
         }
         Err(_) => println!("  ✅ Latest consumer didn't receive old messages (expected)"),
-        Ok(Err(e)) => println!("  Consumer error: {}", e),
+        Ok(Err(e)) => println!("  Consumer error: {e}"),
     }
 
     // Now produce a new message
@@ -312,7 +312,7 @@ pub async fn test_offset_reset_policy() -> TestResult {
             let value = msg
                 .payload()
                 .map(|v| String::from_utf8_lossy(v).to_string());
-            println!("  ✅ Latest consumer received new message: {:?}", value);
+            println!("  ✅ Latest consumer received new message: {value:?}");
         }
         _ => println!("  Note: Latest consumer didn't receive new message"),
     }
@@ -350,8 +350,8 @@ pub async fn test_offset_commit_multi_partition() -> TestResult {
             producer
                 .send(
                     FutureRecord::to(&topic.name)
-                        .payload(&format!("p{}-msg-{}", p, i))
-                        .key(&format!("key-{}", i))
+                        .payload(&format!("p{p}-msg-{i}"))
+                        .key(&format!("key-{i}"))
                         .partition(p),
                     Duration::from_secs(5),
                 )
@@ -382,7 +382,7 @@ pub async fn test_offset_commit_multi_partition() -> TestResult {
     while start.elapsed() < Duration::from_secs(5) {
         match tokio::time::timeout(Duration::from_millis(500), consumer.recv()).await {
             Ok(Ok(msg)) => {
-                let p = msg.partition() as usize;
+                let p = usize::try_from(msg.partition()).expect("partition ids are non-negative");
                 if p < 3 {
                     partition_counts[p] += 1;
                 }
@@ -390,12 +390,12 @@ pub async fn test_offset_commit_multi_partition() -> TestResult {
             _ => break,
         }
     }
-    println!("  Received from partitions: {:?}", partition_counts);
+    println!("  Received from partitions: {partition_counts:?}");
 
     // Commit
     println!("\nStep 4: Committing offsets...");
     if let Err(e) = consumer.commit_consumer_state(rdkafka::consumer::CommitMode::Sync) {
-        println!("  Commit error: {}", e);
+        println!("  Commit error: {e}");
     } else {
         println!("  Commit successful");
     }
@@ -424,10 +424,10 @@ pub async fn test_offset_commit_multi_partition() -> TestResult {
         match offset_row {
             Some(row) => {
                 let offset: i64 = row.get(0);
-                println!("  Partition {}: committed offset = {}", p, offset);
+                println!("  Partition {p}: committed offset = {offset}");
             }
             None => {
-                println!("  Partition {}: no offset committed", p);
+                println!("  Partition {p}: no offset committed");
             }
         }
     }
@@ -459,8 +459,8 @@ pub async fn test_offset_seek() -> TestResult {
         producer
             .send(
                 FutureRecord::to(&topic.name)
-                    .payload(&format!("message-at-offset-{}", i))
-                    .key(&format!("key-{}", i)),
+                    .payload(&format!("message-at-offset-{i}"))
+                    .key(&format!("key-{i}")),
                 Duration::from_secs(5),
             )
             .await
@@ -493,7 +493,7 @@ pub async fn test_offset_seek() -> TestResult {
                 .payload()
                 .map(|v| String::from_utf8_lossy(v).to_string());
             let offset = msg.offset();
-            println!("  First message at offset {}: {:?}", offset, value);
+            println!("  First message at offset {offset}: {value:?}");
         }
         _ => println!("  Note: No message received"),
     }
@@ -502,7 +502,7 @@ pub async fn test_offset_seek() -> TestResult {
     println!("\nStep 4: Attempting to seek to offset 5...");
     let mut tpl = rdkafka::topic_partition_list::TopicPartitionList::new();
     tpl.add_partition_offset(&topic.name, 0, rdkafka::Offset::Offset(5))
-        .map_err(|e| format!("Failed to add partition: {}", e))?;
+        .map_err(|e| format!("Failed to add partition: {e}"))?;
 
     match consumer.seek(
         &topic.name,
@@ -510,9 +510,9 @@ pub async fn test_offset_seek() -> TestResult {
         rdkafka::Offset::Offset(5),
         Duration::from_secs(2),
     ) {
-        Ok(_) => println!("  Seek successful"),
+        Ok(()) => println!("  Seek successful"),
         Err(e) => {
-            println!("  Seek not supported or failed: {}", e);
+            println!("  Seek not supported or failed: {e}");
             // Continue anyway - test the offset verification
         }
     }
@@ -525,7 +525,7 @@ pub async fn test_offset_seek() -> TestResult {
                 .payload()
                 .map(|v| String::from_utf8_lossy(v).to_string());
             let offset = msg.offset();
-            println!("  Message at offset {}: {:?}", offset, value);
+            println!("  Message at offset {offset}: {value:?}");
             // Offset should be >= 1 (we consumed one already)
         }
         _ => println!("  Note: No message received after seek"),

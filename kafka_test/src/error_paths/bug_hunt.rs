@@ -3,6 +3,7 @@
 //! handler behaviour. They speak the wire protocol directly so each request is exactly
 //! the one under test.
 
+use crate::common::to_i32;
 use crate::common::TestResult;
 use crate::fixtures::{generate_messages, TestTopicBuilder};
 use crate::setup::TestContext;
@@ -45,7 +46,7 @@ pub async fn test_fetch_bad_partition_or_offset_returns_error() -> TestResult {
         let response = roundtrip(
             &mut stream,
             4,
-            100 + i as i32,
+            100 + to_i32(i),
             &fetch_request(&topic.name, partition, offset, 5000),
         )
         .await?;
@@ -64,8 +65,7 @@ pub async fn test_fetch_bad_partition_or_offset_returns_error() -> TestResult {
         }
         if expected != 0 && elapsed >= Duration::from_secs(3) {
             return Err(format!(
-                "error for partition {} offset {} took {:?}; it should not wait out max_wait_ms",
-                partition, offset, elapsed
+                "error for partition {partition} offset {offset} took {elapsed:?}; it should not wait out max_wait_ms"
             )
             .into());
         }
@@ -119,7 +119,7 @@ pub async fn test_fetch_into_cleaned_up_aborted_rows_is_in_range() -> TestResult
     stream.set_nodelay(true)?;
     let response = roundtrip(&mut stream, 4, 150, &fetch_request(&topic.name, 0, 0, 0)).await?;
     let p = &response.responses[0].partitions[0];
-    let bytes = p.records.as_ref().map(|r| r.len()).unwrap_or(0);
+    let bytes = p.records.as_ref().map_or(0, bytes::Bytes::len);
     println!(
         "   fetch from 0 -> error_code={} hwm={} record bytes={}",
         p.error_code, p.high_watermark, bytes
@@ -184,13 +184,11 @@ pub async fn test_txn_offset_commit_failure_reports_partition_errors() -> TestRe
         .flat_map(|t| t.partitions.iter())
         .map(|p| (p.partition_index, p.error_code))
         .collect();
-    println!("   per-partition results: {:?}", codes);
+    println!("   per-partition results: {codes:?}");
     if codes.len() != 2 || codes.iter().any(|(_, code)| *code == 0) {
-        return Err(format!(
-            "expected an error on both requested partitions, got {:?}",
-            codes
-        )
-        .into());
+        return Err(
+            format!("expected an error on both requested partitions, got {codes:?}").into(),
+        );
     }
 
     // Nothing may have been stored as a pending offset.
@@ -288,13 +286,14 @@ pub async fn test_create_topics_default_and_zero_partitions() -> TestResult {
 ///
 /// Not parallel-safe: it deliberately reserves most of the shared budget.
 pub async fn test_frame_budget_released_on_mid_frame_disconnect() -> TestResult {
-    println!("=== Test: Frame Budget Released on Mid-Frame Disconnect ===\n");
-
     const DECLARED: i32 = 100_000_000; // == MAX_REQUEST_SIZE, the largest charged frame
 
     // Abandon more frames than the budget can hold (8 x 100 MB > 512 MiB).
     for i in 0..8 {
         let mut stream = TcpStream::connect(BROKER).await?;
+
+        println!("=== Test: Frame Budget Released on Mid-Frame Disconnect ===\n");
+
         stream.write_all(&DECLARED.to_be_bytes()).await?;
         stream.flush().await?;
         // Give the listener time to read the prefix and charge it.
@@ -314,7 +313,7 @@ pub async fn test_frame_budget_released_on_mid_frame_disconnect() -> TestResult 
     let mut probe = [0u8; 1];
     match tokio::time::timeout(Duration::from_millis(1500), stream.read(&mut probe)).await {
         Err(_) => println!("   large frame admitted (connection held open)"),
-        Ok(Ok(0)) | Ok(Err(_)) => {
+        Ok(Ok(0) | Err(_)) => {
             return Err(
                 "a 100 MB frame was refused: abandoned frames leaked the reservation budget".into(),
             )

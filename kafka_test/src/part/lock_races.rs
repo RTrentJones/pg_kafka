@@ -2,7 +2,10 @@
 
 use crate::common::create_transactional_producer;
 use crate::common::TestResult;
-use crate::worker::*;
+use crate::worker::{
+    boxed, into_test_result, read_values, send, session, unique, wait_for_serving_listener,
+    SendResult,
+};
 use rdkafka::producer::Producer;
 use std::time::{Duration, Instant};
 
@@ -39,7 +42,7 @@ async fn end_txn_during_move() -> SendResult<()> {
     }
     producer.begin_transaction().map_err(boxed)?;
     for i in 0..5 {
-        send(&producer, &topic, &format!("t{}", i)).await?;
+        send(&producer, &topic, &format!("t{i}")).await?;
     }
     // Backdate the pending rows 100 partition widths: no leaf covers that time, so they
     // land in kafka.messages_default.
@@ -107,10 +110,7 @@ async fn end_txn_during_move() -> SendResult<()> {
         .await
         .map_err(boxed)?
         .get(0);
-    println!(
-        "Step 1: maintenance (uncommitted) created {} leaf/leaves",
-        created
-    );
+    println!("Step 1: maintenance (uncommitted) created {created} leaf/leaves");
 
     let committing = {
         let p = producer.clone();
@@ -158,18 +158,14 @@ async fn end_txn_during_move() -> SendResult<()> {
 
     assert_eq!(
         pending, 0,
-        "committed transaction left {} row(s) pending (moved by concurrent maintenance)",
-        pending
+        "committed transaction left {pending} row(s) pending (moved by concurrent maintenance)"
     );
     assert_eq!(
         got.len(),
         5,
         "read_committed consumer sees the committed rows"
     );
-    println!(
-        "✅ no pending rows; read_committed reads all 5 (leaf {:?})",
-        leaf
-    );
+    println!("✅ no pending rows; read_committed reads all 5 (leaf {leaf:?})");
     Ok(())
 }
 
@@ -211,7 +207,7 @@ async fn maintenance_lock_waits() -> SendResult<()> {
         .map_err(boxed)?
         .get(0)
     };
-    println!("Step 0: test leaf {}", leaf);
+    println!("Step 0: test leaf {leaf}");
 
     other.batch_execute("BEGIN").await.map_err(boxed)?;
     other
@@ -222,7 +218,7 @@ async fn maintenance_lock_waits() -> SendResult<()> {
         let t = Instant::now();
         db.query("SELECT pg_kafka_run_partition_maintenance()", &[])
             .await
-            .map_err(|e| format!("(b) maintenance behind a held lock: {:?}", e))?;
+            .map_err(|e| format!("(b) maintenance behind a held lock: {e:?}"))?;
         assert!(
             t.elapsed() < Duration::from_secs(6),
             "(b) took {:?}",
@@ -236,11 +232,11 @@ async fn maintenance_lock_waits() -> SendResult<()> {
                 &[&leaf],
             )
             .await
-            .map_err(|e| format!("(c) drop behind a held lock: {:?}", e))?;
+            .map_err(|e| format!("(c) drop behind a held lock: {e:?}"))?;
         assert!(!row.get::<_, bool>(0), "(c) must not drop without the lock");
         db.query("SELECT * FROM pg_kafka_run_retention_sweep(0, 3600)", &[])
             .await
-            .map_err(|e| format!("(c) sweep behind a held lock: {:?}", e))?;
+            .map_err(|e| format!("(c) sweep behind a held lock: {e:?}"))?;
         println!("Step 2 (c): drop returned not-dropped, sweep succeeded");
         Ok(())
     }
@@ -277,7 +273,7 @@ async fn maintenance_lock_waits() -> SendResult<()> {
     let second = waiter
         .await
         .map_err(boxed)?
-        .map_err(|e| format!("(d) drop of a leaf dropped concurrently: {:?}", e))?;
+        .map_err(|e| format!("(d) drop of a leaf dropped concurrently: {e:?}"))?;
     assert!(!second, "(d) the waiter must report not-dropped");
     println!("Step 3 (d): the waiting drop returned not-dropped");
     println!("✅ every maintenance lock wait is bounded and handled");

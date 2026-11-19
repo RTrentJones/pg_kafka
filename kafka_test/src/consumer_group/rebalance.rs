@@ -33,12 +33,12 @@ pub async fn test_rebalance_after_leave() -> TestResult {
     let producer = create_producer()?;
 
     for i in 0..5 {
-        let value = format!("Rebalance test message {}", i);
+        let value = format!("Rebalance test message {i}");
         producer
             .send(
                 FutureRecord::to(&topic)
                     .payload(&value)
-                    .key(&format!("key-{}", i)),
+                    .key(&format!("key-{i}")),
                 Duration::from_secs(5),
             )
             .await
@@ -76,14 +76,14 @@ pub async fn test_rebalance_after_leave() -> TestResult {
                 );
             }
             Ok(Err(e)) => {
-                println!("   ⚠️  Consumer 1 error: {}", e);
+                println!("   ⚠️  Consumer 1 error: {e}");
             }
             Err(_) => {
                 println!("   (polling...)");
             }
         }
     }
-    println!("✅ Consumer 1 received {} messages", received);
+    println!("✅ Consumer 1 received {received} messages");
 
     // 3. Consumer 1 leaves group (triggers LeaveGroup API)
     println!("\nStep 3: Consumer 1 leaving group...");
@@ -117,14 +117,14 @@ pub async fn test_rebalance_after_leave() -> TestResult {
                 println!("   Consumer 2 received message at offset {}", msg.offset());
             }
             Ok(Err(e)) => {
-                println!("   ⚠️  Consumer 2 error: {}", e);
+                println!("   ⚠️  Consumer 2 error: {e}");
             }
             Err(_) => {
                 println!("   (polling...)");
             }
         }
     }
-    println!("✅ Consumer 2 received {} messages", received2);
+    println!("✅ Consumer 2 received {received2} messages");
 
     drop(consumer2);
 
@@ -154,12 +154,12 @@ pub async fn test_session_timeout_rebalance() -> TestResult {
     let producer = create_producer()?;
 
     for i in 0..3 {
-        let value = format!("Timeout test message {}", i);
+        let value = format!("Timeout test message {i}");
         producer
             .send(
                 FutureRecord::to(&topic)
                     .payload(&value)
-                    .key(&format!("key-{}", i)),
+                    .key(&format!("key-{i}")),
                 Duration::from_secs(5),
             )
             .await
@@ -224,7 +224,7 @@ pub async fn test_session_timeout_rebalance() -> TestResult {
                 println!("   Consumer 2 received message at offset {}", msg.offset());
             }
             Ok(Err(e)) => {
-                println!("   ⚠️  Consumer 2 error: {}", e);
+                println!("   ⚠️  Consumer 2 error: {e}");
             }
             Err(_) => {
                 println!("   (polling...)");

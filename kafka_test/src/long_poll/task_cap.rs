@@ -17,6 +17,7 @@
 //! Pre-cap builds long-poll all 80, so all 80 would contain the record; the
 //! capped build yields exactly 64 with records / 16 empty.
 
+use crate::common::to_i32;
 use crate::common::{create_producer, get_bootstrap_servers, TestResult};
 use crate::setup::TestContext;
 use crate::wire::{read_response, request_frame};
@@ -91,14 +92,13 @@ pub async fn test_long_poll_per_connection_task_cap() -> TestResult {
 
     // 2. ACTION: pipeline 80 long-poll fetches on ONE raw connection.
     println!(
-        "Step 2: Pipelining {} long-poll fetches (cap is {})...",
-        PIPELINED_FETCHES, EXPECTED_LONG_POLLED
+        "Step 2: Pipelining {PIPELINED_FETCHES} long-poll fetches (cap is {EXPECTED_LONG_POLLED})..."
     );
     let mut stream = TcpStream::connect(get_bootstrap_servers())
         .await
         .map_err(|e| format!("connect failed: {e}"))?;
     for i in 0..PIPELINED_FETCHES {
-        let frame = encode_fetch_v4(i as i32, &topic, 1);
+        let frame = encode_fetch_v4(to_i32(i), &topic, 1);
         stream
             .write_all(&frame)
             .await
@@ -127,7 +127,7 @@ pub async fn test_long_poll_per_connection_task_cap() -> TestResult {
     println!("✅ Wake-up record produced\n");
 
     // 3. VERIFY: read all 80 responses; count which carry the record.
-    println!("Step 4: Reading {} responses...", PIPELINED_FETCHES);
+    println!("Step 4: Reading {PIPELINED_FETCHES} responses...");
     let mut with_records = 0usize;
     let mut empty = 0usize;
     for i in 0..PIPELINED_FETCHES {
@@ -138,7 +138,7 @@ pub async fn test_long_poll_per_connection_task_cap() -> TestResult {
         .await
         .map_err(|_| format!("timed out waiting for response {i}"))??;
         let (corr, has_records) = read;
-        if corr != i as i32 {
+        if corr != to_i32(i) {
             return Err(format!("response order violated: expected corr {i}, got {corr}").into());
         }
         if has_records {

@@ -31,7 +31,7 @@ async fn produce_txn(
     producer.init_transactions(Duration::from_secs(10))?;
     producer.begin_transaction()?;
     for i in 0..count {
-        let value = format!("{}-{}", label, i);
+        let value = format!("{label}-{i}");
         producer
             .send(
                 FutureRecord::<(), _>::to(topic)
@@ -64,12 +64,11 @@ pub async fn test_producer_restart_new_epoch_records_are_stored() -> TestResult 
     produce_txn(&txn_id, &topic, 3, "second").await?;
 
     let stored = count_messages(&ctx, &topic).await?;
-    println!("   committed records stored: {}", stored);
+    println!("   committed records stored: {stored}");
     if stored != 13 {
         return Err(format!(
-            "expected 13 committed records after the restart, found {} \
-             (the new epoch's batches were dropped as duplicates)",
-            stored
+            "expected 13 committed records after the restart, found {stored} \
+             (the new epoch's batches were dropped as duplicates)"
         )
         .into());
     }
@@ -133,10 +132,7 @@ pub async fn test_active_idempotent_producer_survives_retention_sweep() -> TestR
         )
         .await?
         .get(0);
-    println!(
-        "   producer {} rows after sweep: {}",
-        producer_id, still_there
-    );
+    println!("   producer {producer_id} rows after sweep: {still_there}");
     if still_there != 1 {
         return Err("the sweep pruned a producer that is still producing".into());
     }
@@ -188,26 +184,25 @@ pub async fn test_fenced_producer_cannot_write() -> TestResult {
             .map_err(|e| e.to_string())
     }
     .await;
-    println!("   zombie outcome: {:?}", outcome);
+    println!("   zombie outcome: {outcome:?}");
 
     let visible = count_messages(&ctx, &topic.name).await?;
     let fatal = zombie.client().fatal_error();
-    println!(
-        "   committed records: {}, fatal error: {:?}",
-        visible, fatal
-    );
+    println!("   committed records: {visible}, fatal error: {fatal:?}");
     if outcome.is_ok() {
         return Err("the fenced producer's transaction was reported as committed".into());
     }
     // The broker must tell the client it was fenced (a fatal ProducerFenced error),
     // not leave it to time out.
     match fatal {
-        Some((rdkafka::types::RDKafkaErrorCode::Fenced, _))
-        | Some((rdkafka::types::RDKafkaErrorCode::ProducerFenced, _)) => {}
+        Some((
+            rdkafka::types::RDKafkaErrorCode::Fenced
+            | rdkafka::types::RDKafkaErrorCode::ProducerFenced,
+            _,
+        )) => {}
         other => {
             return Err(format!(
-                "expected rdkafka to record a fatal ProducerFenced error, got {:?}",
-                other
+                "expected rdkafka to record a fatal ProducerFenced error, got {other:?}"
             )
             .into())
         }
@@ -264,7 +259,7 @@ pub async fn test_api_versions_above_range_negotiates_down() -> TestResult {
     assert_eq!(b.get_i32(), 501, "correlation id");
     let error_code = b.get_i16();
     let key_count = b.get_i32();
-    println!("   error_code={} api_keys={}", error_code, key_count);
+    println!("   error_code={error_code} api_keys={key_count}");
     assert_eq!(error_code, 35, "UNSUPPORTED_VERSION");
     assert!(key_count > 0, "the key list lets the client pick a version");
     println!("✅ Test PASSED\n");
@@ -380,8 +375,7 @@ pub async fn test_corrupt_acks0_produce_sends_no_reply() -> TestResult {
         Some(frame) => {
             let correlation = (&frame[..]).get_i32();
             return Err(format!(
-                "expected the connection to close, got a frame (correlation id {})",
-                correlation
+                "expected the connection to close, got a frame (correlation id {correlation})"
             )
             .into());
         }
@@ -432,15 +426,12 @@ pub async fn test_huge_retention_ms_does_not_break_sweep() -> TestResult {
         .db()
         .query("SELECT * FROM pg_kafka_run_retention_sweep(0, 60)", &[])
         .await;
-    println!("   sweep result: {:?}", swept.as_ref().map(|r| r.len()));
-    swept.map_err(|e| format!("the retention sweep failed: {}", e))?;
+    println!("   sweep result: {:?}", swept.as_ref().map(Vec::len));
+    swept.map_err(|e| format!("the retention sweep failed: {e}"))?;
 
     let kept = count_messages(&ctx, &forever.name).await?;
     let dropped = count_messages(&ctx, &expiring.name).await?;
-    println!(
-        "   forever topic: {} row(s), retention 0 topic: {} row(s)",
-        kept, dropped
-    );
+    println!("   forever topic: {kept} row(s), retention 0 topic: {dropped} row(s)");
     assert_eq!(kept, 1, "retention.ms = i64::MAX keeps the record");
     assert_eq!(
         dropped, 0,
@@ -499,11 +490,9 @@ pub async fn test_timed_out_transaction_cannot_be_resumed() -> TestResult {
             break;
         }
         if std::time::Instant::now() > deadline {
-            return Err(format!(
-                "the timeout sweep never aborted the transaction (state {})",
-                state
-            )
-            .into());
+            return Err(
+                format!("the timeout sweep never aborted the transaction (state {state})").into(),
+            );
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
@@ -526,10 +515,7 @@ pub async fn test_timed_out_transaction_cannot_be_resumed() -> TestResult {
     }
     .await;
     let committed = count_messages(&ctx, &topic.name).await?;
-    println!(
-        "   resumed commit: {:?}; committed rows: {}",
-        outcome, committed
-    );
+    println!("   resumed commit: {outcome:?}; committed rows: {committed}");
     assert!(outcome.is_err(), "a timed-out transaction must not commit");
     assert_eq!(
         committed, 0,
@@ -674,14 +660,13 @@ pub async fn test_headers_keep_their_order() -> TestResult {
         if let Some(Ok(msg)) = consumer.poll(Duration::from_millis(500)) {
             break msg
                 .headers()
-                .map(|hs| hs.iter().map(|h| h.key.to_string()).collect())
-                .unwrap_or_default();
+                .map_or_default(|hs| hs.iter().map(|h| h.key.to_string()).collect());
         }
         if std::time::Instant::now() > deadline {
             return Err("no record consumed".into());
         }
     };
-    println!("   header keys: {:?}", keys);
+    println!("   header keys: {keys:?}");
     assert_eq!(keys, vec!["zeta", "alpha", "mu"]);
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");
@@ -691,7 +676,7 @@ pub async fn test_headers_keep_their_order() -> TestResult {
 // ----- consumer-group coordinator regressions -----
 
 mod group_wire {
-    use super::*;
+    use super::{Bytes, Duration, StrBytes, TcpStream, TopicName};
     use crate::wire::roundtrip;
     use kafka_protocol::messages::heartbeat_request::HeartbeatRequest;
     use kafka_protocol::messages::join_group_request::{
@@ -837,7 +822,7 @@ mod group_wire {
 /// - Heartbeat for a group the coordinator does not know returns UNKNOWN_MEMBER_ID
 ///   so the client rejoins (not COORDINATOR_NOT_AVAILABLE).
 pub async fn test_group_rebalance_keeps_old_generation_usable() -> TestResult {
-    use group_wire::*;
+    use group_wire::{commit, heartbeat, heartbeat_until_rebalance, join, sync};
     println!("=== Test: Rebalance Keeps The Old Generation Usable ===\n");
     let ctx = TestContext::new().await?;
     let topic = crate::fixtures::TestTopicBuilder::new(&ctx, "review-group")
@@ -887,7 +872,7 @@ pub async fn test_group_rebalance_keeps_old_generation_usable() -> TestResult {
     assert_eq!(code, 0, "leader sync");
     let (code, got) = sync(&mut sb, &group, &b.member_id, gen, &[], 805).await?;
     assert_eq!((code, got.as_slice()), (0, b"assign-b".as_slice()));
-    println!("Step 1: stable at generation {}", gen);
+    println!("Step 1: stable at generation {gen}");
 
     // A follower rejoining with the same metadata keeps generation and assignment.
     let b2 = join(&mut sb, &group, &b.member_id, b"sub", 806).await?;
@@ -920,10 +905,7 @@ pub async fn test_group_rebalance_keeps_old_generation_usable() -> TestResult {
             let commit_code = commit(&mut sb, &group, &b.member_id, gen, &topic.name, 5, 810)
                 .await
                 .map_err(|e| e.to_string())?;
-            println!(
-                "   during rebalance: current-generation heartbeat={} commit={}",
-                hb, commit_code
-            );
+            println!("   during rebalance: current-generation heartbeat={hb} commit={commit_code}");
             assert_eq!(hb, 27, "REBALANCE_IN_PROGRESS, so the member rejoins");
             assert_eq!(commit_code, 0, "the revoke-time commit must be accepted");
             let (a3, b3) = tokio::join!(
@@ -962,7 +944,7 @@ pub async fn test_group_rebalance_keeps_old_generation_usable() -> TestResult {
 
     // Unknown group.
     let unknown = heartbeat(&mut sa, "review-no-such-group", "m", 1, 813).await?;
-    println!("   heartbeat for an unknown group: {}", unknown);
+    println!("   heartbeat for an unknown group: {unknown}");
     assert_eq!(unknown, 25, "UNKNOWN_MEMBER_ID");
 
     ctx.cleanup().await?;

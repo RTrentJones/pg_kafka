@@ -161,8 +161,7 @@ fn consume_from_beginning(
         if let Some(Ok(m)) = consumer.poll(Duration::from_millis(500)) {
             let v = m
                 .payload()
-                .map(|p| String::from_utf8_lossy(p).to_string())
-                .unwrap_or_default();
+                .map_or_default(|p| String::from_utf8_lossy(p).to_string());
             out.push((m.offset(), v));
         }
     }
@@ -326,7 +325,7 @@ pub async fn test_time_partition_retention_waits_for_pending_transaction() -> Te
     let (_, dropped) = sweep(db).await?;
     assert!(dropped >= 1);
     assert!(!leaf_exists(db, &leaf).await?, "{leaf} must be dropped");
-    assert!(offsets_of(db, &topic).await?.is_empty());
+    assert_eq!(offsets_of(db, &topic).await?, Vec::<i64>::new());
     let (low, high) = consumer.fetch_watermarks(&topic, 0, Duration::from_secs(5))?;
     assert!(high >= 3);
     assert_eq!(low, high, "emptied partition: earliest == latest");

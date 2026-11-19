@@ -91,7 +91,7 @@ async fn listener_pid(db: &Client) -> Option<i32> {
 }
 
 fn rss_kib(pid: i32) -> Option<u64> {
-    let status = std::fs::read_to_string(format!("/proc/{}/status", pid)).ok()?;
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     status
         .lines()
         .find(|l| l.starts_with("VmRSS:"))
@@ -120,16 +120,15 @@ async fn create_topics(args: &Args, db: &Client, names: &[String]) -> Res<()> {
                 &AdminOptions::new().operation_timeout(Some(Duration::from_secs(10))),
             )
             .await;
-        let ok = r.map(|v| v.iter().all(|t| t.is_ok())).unwrap_or(false);
+        let ok = r.is_ok_and(|v| v.iter().all(Result::is_ok));
         let n: i64 = db
             .query_one(
                 "SELECT count(*) FROM kafka.topics WHERE name = ANY($1)",
                 &[&names],
             )
             .await
-            .map(|r| r.get(0))
-            .unwrap_or(0);
-        if ok || n == names.len() as i64 {
+            .map_or(0, |r| r.get(0));
+        if ok || usize::try_from(n).is_ok_and(|n| n == names.len()) {
             break;
         }
         if Instant::now() > deadline {
@@ -195,6 +194,8 @@ async fn idempotent_producer(
     failed: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
 ) {
+    use futures::StreamExt;
+
     let producer: FutureProducer = base(&args.bootstrap)
         .set("enable.idempotence", "true")
         .set("message.timeout.ms", "120000")
@@ -203,11 +204,10 @@ async fn idempotent_producer(
         .expect("idempotent producer");
     let mut n = 0u64;
     let mut inflight = futures::stream::FuturesUnordered::new();
-    use futures::StreamExt;
     while !stop.load(Ordering::Relaxed) {
         for _ in 0..20 {
             n += 1;
-            let value = format!("i{}:{}", epoch, n);
+            let value = format!("i{epoch}:{n}");
             let p = producer.clone();
             let t = topic.clone();
             inflight.push(async move {
@@ -222,25 +222,25 @@ async fn idempotent_producer(
         }
         while inflight.len() > 200 {
             if let Some((value, r)) = inflight.next().await {
-                record(&acked, &failed, value, r);
+                record(&acked, &failed, &value, &r);
             }
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     while let Some((value, r)) = inflight.next().await {
-        record(&acked, &failed, value, r);
+        record(&acked, &failed, &value, &r);
     }
 }
 
 fn record(
     acked: &Arc<Mutex<HashMap<(i32, i64), String>>>,
     failed: &Arc<AtomicU64>,
-    value: String,
-    r: Result<(i32, i64), rdkafka::error::KafkaError>,
+    value: &str,
+    r: &Result<(i32, i64), rdkafka::error::KafkaError>,
 ) {
     match r {
         Ok((p, o)) => {
-            acked.lock().unwrap().insert((p, o), value);
+            acked.lock().unwrap().insert((*p, *o), value.to_string());
         }
         Err(_) => {
             failed.fetch_add(1, Ordering::Relaxed);
@@ -269,7 +269,7 @@ async fn transactional_producer(
         commits: 0,
         errors: 0,
     };
-    let txn_id = format!("soak-txn-{}", epoch);
+    let txn_id = format!("soak-txn-{epoch}");
     let make = || -> Option<FutureProducer> {
         let p: FutureProducer = base(&args.bootstrap)
             .set("transactional.id", &txn_id)
@@ -305,27 +305,26 @@ async fn transactional_producer(
         let mut failed = false;
         for _ in 0..5 {
             n += 1;
-            let value = format!("t{}:{}", epoch, n);
+            let value = format!("t{epoch}:{n}");
             values.push(value.clone());
-            match p
+            if let Ok(po) = p
                 .send(
                     FutureRecord::to(&topic).key(&value).payload(&value),
                     Duration::from_secs(10),
                 )
                 .await
             {
-                Ok(po) => sent.push((po, value)),
-                Err(_) => {
-                    failed = true;
-                    break;
-                }
+                sent.push((po, value));
+            } else {
+                failed = true;
+                break;
             }
         }
         let outcome = tokio::task::block_in_place(|| {
             if failed || abort_on_purpose {
-                p.abort_transaction(Duration::from_secs(30)).map(|_| false)
+                p.abort_transaction(Duration::from_secs(30)).map(|()| false)
             } else {
-                p.commit_transaction(Duration::from_secs(30)).map(|_| true)
+                p.commit_transaction(Duration::from_secs(30)).map(|()| true)
             }
         });
         match outcome {
@@ -421,8 +420,7 @@ async fn verify_epoch(db: &Client, epoch: u32, idem: &str, txn: &str, e: &Epoch)
                 lost += 1;
                 if lost <= 3 {
                     problems.push(format!(
-                        "epoch {}: acked {} at {}/{} but stored {:?}",
-                        epoch, v, p, o, other
+                        "epoch {epoch}: acked {v} at {p}/{o} but stored {other:?}"
                     ));
                 }
             }
@@ -430,8 +428,7 @@ async fn verify_epoch(db: &Client, epoch: u32, idem: &str, txn: &str, e: &Epoch)
     }
     if lost > 0 {
         problems.push(format!(
-            "epoch {}: {} acked idempotent record(s) lost",
-            epoch, lost
+            "epoch {epoch}: {lost} acked idempotent record(s) lost"
         ));
     }
     let idem_unseen = e
@@ -467,8 +464,7 @@ async fn verify_epoch(db: &Client, epoch: u32, idem: &str, txn: &str, e: &Epoch)
     }
     if pending > 0 {
         problems.push(format!(
-            "epoch {}: {} transactional row(s) still pending",
-            epoch, pending
+            "epoch {epoch}: {pending} transactional row(s) still pending"
         ));
     }
     let txn_start = log_start(txn).await;
@@ -484,8 +480,7 @@ async fn verify_epoch(db: &Client, epoch: u32, idem: &str, txn: &str, e: &Epoch)
     }
     if missing_commits > 0 {
         problems.push(format!(
-            "epoch {}: {} committed transactional record(s) not visible",
-            epoch, missing_commits
+            "epoch {epoch}: {missing_commits} committed transactional record(s) not visible"
         ));
     }
     let visible_aborted = e
@@ -495,8 +490,7 @@ async fn verify_epoch(db: &Client, epoch: u32, idem: &str, txn: &str, e: &Epoch)
         .count();
     if visible_aborted > 0 {
         problems.push(format!(
-            "epoch {}: {} aborted record(s) visible",
-            epoch, visible_aborted
+            "epoch {epoch}: {visible_aborted} aborted record(s) visible"
         ));
     }
     let seen_aborted = e
@@ -506,8 +500,7 @@ async fn verify_epoch(db: &Client, epoch: u32, idem: &str, txn: &str, e: &Epoch)
         .count();
     if seen_aborted > 0 {
         problems.push(format!(
-            "epoch {}: read_committed group saw {} aborted record(s)",
-            epoch, seen_aborted
+            "epoch {epoch}: read_committed group saw {seen_aborted} aborted record(s)"
         ));
     }
     let mut torn = 0;
@@ -525,8 +518,7 @@ async fn verify_epoch(db: &Client, epoch: u32, idem: &str, txn: &str, e: &Epoch)
     }
     if torn > 0 {
         problems.push(format!(
-            "epoch {}: {} indeterminate transaction(s) partially visible",
-            epoch, torn
+            "epoch {epoch}: {torn} indeterminate transaction(s) partially visible"
         ));
     }
     println!(
@@ -615,10 +607,10 @@ async fn main() {
     let mut totals = (0usize, 0usize, 0u64);
     while start.elapsed() < Duration::from_secs(args.duration_secs) {
         epoch += 1;
-        let idem = format!("soak-idem-{}", epoch);
-        let txn = format!("soak-txn-{}", epoch);
+        let idem = format!("soak-idem-{epoch}");
+        let txn = format!("soak-txn-{epoch}");
         if let Err(e) = create_topics(&args, &db, &[idem.clone(), txn.clone()]).await {
-            problems.push(format!("epoch {}: {}", epoch, e));
+            problems.push(format!("epoch {epoch}: {e}"));
             break;
         }
         println!(
@@ -635,7 +627,7 @@ async fn main() {
             consumers.push(spawn_consumer(
                 &args,
                 txn.clone(),
-                format!("soak-g-txn-{}", epoch),
+                format!("soak-g-txn-{epoch}"),
                 true,
                 seen_txn.clone(),
                 consumers_stop.clone(),
@@ -643,7 +635,7 @@ async fn main() {
             consumers.push(spawn_consumer(
                 &args,
                 idem.clone(),
-                format!("soak-g-idem-{}", epoch),
+                format!("soak-g-idem-{epoch}"),
                 false,
                 seen_idem.clone(),
                 consumers_stop.clone(),
@@ -715,7 +707,7 @@ async fn main() {
                         t.elapsed()
                     );
                 }
-                Err(err) => problems.push(format!("DROP/CREATE EXTENSION failed: {:?}", err)),
+                Err(err) => problems.push(format!("DROP/CREATE EXTENSION failed: {err:?}")),
             }
         }
     }
@@ -733,22 +725,21 @@ async fn main() {
     let mut max_rss = 0;
     let mut worst_growth: i64 = 0;
     for v in by_pid.values() {
-        let born = v.first().map(|s| s.0).unwrap_or(0);
+        let born = v.first().map_or(0, |s| s.0);
         let settled = v.iter().find(|s| s.0 >= born + 60).map(|s| s.1);
         let last = v.last().map(|s| s.1);
         if let (Some(a), Some(b)) = (settled, last) {
-            worst_growth = worst_growth.max(b as i64 - a as i64);
+            worst_growth = worst_growth.max(kib(b) - kib(a));
         }
         max_rss = max_rss.max(v.iter().map(|s| s.1).max().unwrap_or(0));
     }
-    if worst_growth > (args.max_rss_growth_mib * 1024) as i64 {
+    if worst_growth > kib(args.max_rss_growth_mib * 1024) {
         problems.push(format!(
-            "listener RSS grew {} KiB within one incarnation",
-            worst_growth
+            "listener RSS grew {worst_growth} KiB within one incarnation"
         ));
     }
     for p in &problems {
-        println!("PROBLEM: {}", p);
+        println!("PROBLEM: {p}");
     }
     println!(
         "{{\"duration_s\":{},\"epochs\":{},\"ddl_cycles\":{},\"terminations\":{},\"idempotent_acked\":{},\"txn_records_committed\":{},\"txn_commits\":{},\"max_rss_kib\":{},\"worst_rss_growth_kib\":{},\"listener_incarnations\":{},\"problems\":{}}}",
@@ -764,5 +755,10 @@ async fn main() {
         by_pid.len(),
         problems.len()
     );
-    std::process::exit(if problems.is_empty() { 0 } else { 1 });
+    std::process::exit(i32::from(!problems.is_empty()));
+}
+
+/// A resident-set size in KiB as an `i64`, for growth arithmetic.
+fn kib(v: u64) -> i64 {
+    i64::try_from(v).expect("a resident-set size in KiB fits in i64")
 }

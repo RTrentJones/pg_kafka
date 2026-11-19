@@ -5,6 +5,7 @@
 //! The code under test lives in `src/worker.rs` / `src/lib.rs`, which unit
 //! coverage cannot see (QA-1), so these drive the running broker.
 
+use crate::common::to_i64;
 use crate::common::{create_db_client, create_producer, TestResult};
 use crate::setup::TestContext;
 use crate::wire::records::{encode, plain_record};
@@ -76,19 +77,15 @@ pub async fn test_worker_restarts_after_terminate() -> TestResult {
         broker_answers_api_versions().await,
         "broker must answer before the test terminates it"
     );
-    println!("Step 1: listener pid {} is serving", old_pid);
+    println!("Step 1: listener pid {old_pid} is serving");
 
     let terminated: bool = ctx
         .db()
         .query_one("SELECT pg_terminate_backend($1)", &[&old_pid])
         .await?
         .get(0);
-    assert!(
-        terminated,
-        "pg_terminate_backend({}) returned false",
-        old_pid
-    );
-    println!("Step 2: terminated pid {}", old_pid);
+    assert!(terminated, "pg_terminate_backend({old_pid}) returned false");
+    println!("Step 2: terminated pid {old_pid}");
 
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut new_pid = None;
@@ -110,10 +107,9 @@ pub async fn test_worker_restarts_after_terminate() -> TestResult {
     let new_pid = new_pid.ok_or("no new pg_kafka_listener appeared within 20 s")?;
     assert!(
         serving,
-        "new listener pid {} did not serve ApiVersions on {} within 20 s",
-        new_pid, BROKER
+        "new listener pid {new_pid} did not serve ApiVersions on {BROKER} within 20 s"
     );
-    println!("Step 3: new listener pid {} serves the port", new_pid);
+    println!("Step 3: new listener pid {new_pid} serves the port");
 
     // The restarted worker handles real traffic end to end.
     let topic = ctx.unique_topic("lifecycle-restart").await;
@@ -175,8 +171,7 @@ fn produce_ok(
 ) -> Result<i64, Box<dyn std::error::Error>> {
     if *correlation_id != expected_correlation_id {
         return Err(format!(
-            "response order: expected correlation id {}, got {}",
-            expected_correlation_id, correlation_id
+            "response order: expected correlation id {expected_correlation_id}, got {correlation_id}"
         )
         .into());
     }
@@ -301,7 +296,7 @@ pub async fn test_group_commit_concurrent_acks_visible() -> TestResult {
                 let db = create_db_client().await?;
                 let mut offsets = Vec::new();
                 for i in 0..GROUP_COMMIT_RECORDS_PER_PRODUCER {
-                    let key = format!("p{}-r{}", producer_index, i);
+                    let key = format!("p{producer_index}-r{i}");
                     let (partition, offset) = producer
                         .send(
                             rdkafka::producer::FutureRecord::to(&topic)
@@ -324,9 +319,8 @@ pub async fn test_group_commit_concurrent_acks_visible() -> TestResult {
                         .get(0);
                     if visible != 1 {
                         return Err(format!(
-                            "BARRIER VIOLATION: record {} acked at offset {} but the first \
-                             read from another connection saw {} rows",
-                            key, offset, visible
+                            "BARRIER VIOLATION: record {key} acked at offset {offset} but the first \
+                             read from another connection saw {visible} rows"
                         )
                         .into());
                     }
@@ -355,7 +349,7 @@ pub async fn test_group_commit_concurrent_acks_visible() -> TestResult {
         expected,
         "acked offsets must be distinct"
     );
-    assert_eq!(count_messages(&ctx, &topic.name).await?, expected as i64);
+    assert_eq!(count_messages(&ctx, &topic.name).await?, to_i64(expected));
     println!("✅ Verification passed\n");
 
     ctx.cleanup().await?;
@@ -386,7 +380,7 @@ pub async fn test_group_commit_pipelined_produces_in_order() -> TestResult {
         frames.extend_from_slice(&request_frame(
             PRODUCE_VERSION,
             100 + i,
-            &produce_value(&topic.name, &format!("pipelined-{}", i)),
+            &produce_value(&topic.name, &format!("pipelined-{i}")),
         ));
     }
     let mut stream = TcpStream::connect(BROKER).await?;
@@ -399,9 +393,9 @@ pub async fn test_group_commit_pipelined_produces_in_order() -> TestResult {
             read_response::<ProduceRequest>(&mut stream, PRODUCE_VERSION),
         )
         .await
-        .map_err(|_| format!("timed out waiting for response {}", i))??;
+        .map_err(|_| format!("timed out waiting for response {i}"))??;
         let offset = produce_ok(&response, 100 + i)?;
-        assert_eq!(offset, i as i64, "produce {} got base offset {}", i, offset);
+        assert_eq!(offset, i64::from(i), "produce {i} got base offset {offset}");
     }
     println!(
         "   {} responses in order, offsets 0..{}",
@@ -410,7 +404,7 @@ pub async fn test_group_commit_pipelined_produces_in_order() -> TestResult {
     );
     assert_eq!(
         count_messages(&ctx, &topic.name).await?,
-        PIPELINED_PRODUCES as i64,
+        i64::from(PIPELINED_PRODUCES),
         "every acked record must already be visible"
     );
     println!("✅ Verification passed\n");

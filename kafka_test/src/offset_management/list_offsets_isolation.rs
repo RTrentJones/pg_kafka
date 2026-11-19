@@ -49,8 +49,7 @@ pub async fn test_list_offsets_isolation_max_timestamp_and_partitions() -> TestR
         assert_eq!(
             w.list_offsets(&t, 7, ts, 0).await?,
             (error_codes::UNKNOWN_TOPIC_OR_PARTITION, -1, -1),
-            "partition 7, timestamp {}",
-            ts
+            "partition 7, timestamp {ts}"
         );
     }
 

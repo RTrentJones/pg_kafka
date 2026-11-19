@@ -19,7 +19,7 @@ pub async fn test_request_pipelining() -> TestResult {
     println!("=== Test: Request Pipelining ===\n");
 
     let bootstrap = get_bootstrap_servers();
-    println!("Connecting to {}...", bootstrap);
+    println!("Connecting to {bootstrap}...");
 
     let mut stream = TcpStream::connect(&bootstrap).await?;
     println!("Connected\n");
@@ -29,15 +29,12 @@ pub async fn test_request_pipelining() -> TestResult {
     let num_requests = correlation_ids.len();
 
     // Send all requests WITHOUT waiting for responses
-    println!(
-        "Sending {} requests without waiting for responses...",
-        num_requests
-    );
+    println!("Sending {num_requests} requests without waiting for responses...");
 
     for &corr_id in &correlation_ids {
         let request = raw_frame(18, 0, corr_id, &[]);
         stream.write_all(&request).await?;
-        println!("  Sent request with correlation_id={}", corr_id);
+        println!("  Sent request with correlation_id={corr_id}");
     }
 
     // Flush to ensure all requests are sent
@@ -72,7 +69,7 @@ pub async fn test_request_pipelining() -> TestResult {
         );
     }
 
-    println!("All {} responses received in correct order", num_requests);
+    println!("All {num_requests} responses received in correct order");
     println!("Pipelining test PASSED\n");
 
     Ok(())

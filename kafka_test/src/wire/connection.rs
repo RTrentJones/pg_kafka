@@ -160,7 +160,10 @@ impl Wire {
     }
 
     /// TxnOffsetCommit v1 (generation -1, simple-consumer style).
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one argument per TxnOffsetCommit field the tests vary"
+    )]
     pub async fn txn_offset_commit(
         &mut self,
         transactional_id: &str,

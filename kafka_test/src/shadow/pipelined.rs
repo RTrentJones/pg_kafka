@@ -10,6 +10,7 @@
 //!   session SET, `shadow_metrics_enabled` and `messages_skipped` are real.
 
 use crate::common::{create_db_client, create_producer, TestResult};
+use crate::common::{to_f64, to_i64};
 use crate::setup::TestContext;
 use rdkafka::admin::{
     AdminClient, AdminOptions, AlterConfig, NewTopic, ResourceSpecifier, TopicReplication,
@@ -97,8 +98,7 @@ async fn wait_all_forwarded(
         }
         if start.elapsed() > timeout {
             return Err(format!(
-                "only {done}/{total} of {expected} outbox rows delivered after {:?}",
-                timeout
+                "only {done}/{total} of {expected} outbox rows delivered after {timeout:?}"
             )
             .into());
         }
@@ -128,13 +128,12 @@ fn read_external(
 }
 
 /// Throughput floor: the pipelined forwarder moves thousands of records per
-/// second to a healthy external broker. The old forwarder awaited every
-/// delivery report before sending the next record (< ~100 msg/s here) and the
-/// poll claimed at most 256 rows per 250 ms.
+/// second to a healthy external broker (a forwarder that awaited every delivery
+/// report before sending the next record manages < ~100 msg/s here).
 pub async fn test_shadow_forward_throughput() -> TestResult {
-    println!("=== Test: shadow forwarding throughput ===\n");
-    const N: i64 = 20_000;
+    const N: usize = 20_000;
     const FLOOR_MSG_PER_SEC: f64 = 2_000.0;
+    println!("=== Test: shadow forwarding throughput ===\n");
 
     let ctx = TestContext::new().await?;
     let topic = ctx.unique_topic("shadow-throughput").await;
@@ -144,7 +143,7 @@ pub async fn test_shadow_forward_throughput() -> TestResult {
     let producer = bulk_producer()?;
     let value = vec![b'x'; 100];
     let start = Instant::now();
-    let mut pending = Vec::with_capacity(N as usize);
+    let mut pending = Vec::with_capacity(N);
     for i in 0..N {
         let key = format!("k{}", i % 97);
         pending.push(
@@ -157,14 +156,14 @@ pub async fn test_shadow_forward_throughput() -> TestResult {
         f.await?.map_err(|(e, _)| e)?;
     }
     let produced_in = start.elapsed();
-    println!("Produced {N} records to pg_kafka in {:?}", produced_in);
+    println!("Produced {N} records to pg_kafka in {produced_in:?}");
 
-    let forwarded_in = wait_all_forwarded(ctx.db(), &topic, N, Duration::from_secs(240)).await?;
+    let forwarded_in =
+        wait_all_forwarded(ctx.db(), &topic, to_i64(N), Duration::from_secs(240)).await?;
     let total = start.elapsed();
-    let rate = N as f64 / total.as_secs_f64();
+    let rate = to_f64(N) / total.as_secs_f64();
     println!(
-        "All {N} forwarded {:?} after the last produce ack; end-to-end {:?} = {:.0} msg/s",
-        forwarded_in, total, rate
+        "All {N} forwarded {forwarded_in:?} after the last produce ack; end-to-end {total:?} = {rate:.0} msg/s"
     );
     println!("SHADOW_THROUGHPUT_MSG_PER_SEC={rate:.0}");
 
@@ -181,9 +180,9 @@ pub async fn test_shadow_forward_throughput() -> TestResult {
         failures, 0,
         "a healthy broker must not record failed attempts"
     );
-    let external = read_external(&topic, N as usize, Duration::from_secs(60))?;
+    let external = read_external(&topic, N, Duration::from_secs(60))?;
     assert!(
-        external.len() >= N as usize,
+        external.len() >= N,
         "external topic has {} of {N} records",
         external.len()
     );
@@ -261,12 +260,11 @@ pub async fn test_shadow_forwards_headers_and_timestamps() -> TestResult {
 /// A record that fails is retried BEFORE any later record of its partition is
 /// delivered, so the external topic keeps the local order. Failure injection:
 /// the external topic's max.message.bytes is below one (large) record until the
-/// test raises it. The old forwarder delivered the later records first and the
-/// retried one last.
+/// test raises it; the later records must not overtake the retried one.
 pub async fn test_shadow_order_preserved_across_a_retried_failure() -> TestResult {
-    println!("=== Test: shadow order preserved across a retried failure ===\n");
     const N: usize = 40;
     const BIG: usize = 5;
+    println!("=== Test: shadow order preserved across a retried failure ===\n");
     let ctx = TestContext::new().await?;
     let topic = ctx.unique_topic("shadow-order").await;
     let external = format!("{topic}-ext");
@@ -346,7 +344,7 @@ pub async fn test_shadow_order_preserved_across_a_retried_failure() -> TestResul
         for r in admin.alter_configs(&[alter], &opts).await? {
             r.map_err(|(t, e)| format!("alter {t:?}: {e}"))?;
         }
-        wait_all_forwarded(ctx.db(), &topic, N as i64, Duration::from_secs(120)).await?;
+        wait_all_forwarded(ctx.db(), &topic, to_i64(N), Duration::from_secs(120)).await?;
 
         let msgs = read_external(&external, N, Duration::from_secs(30))?;
         let idx: Vec<usize> = msgs
@@ -450,10 +448,7 @@ pub async fn test_shadow_sync_stall_is_bounded_to_its_own_response() -> TestResu
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         let (held_for, ok) = sync_send.await?;
-        println!(
-            "unrelated produce worst latency {:?}; sync produce held {:?}",
-            worst, held_for
-        );
+        println!("unrelated produce worst latency {worst:?}; sync produce held {held_for:?}");
         println!("SHADOW_SYNC_UNRELATED_WORST_MS={}", worst.as_millis());
         assert!(
             ok,

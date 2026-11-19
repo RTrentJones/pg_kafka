@@ -20,10 +20,7 @@ pub async fn test_fetch_unknown_topic() -> TestResult {
     let ctx = TestContext::new().await?;
     let unknown_topic = ctx.unique_topic("nonexistent").await;
 
-    println!(
-        "Attempting to fetch from non-existent topic '{}'",
-        unknown_topic
-    );
+    println!("Attempting to fetch from non-existent topic '{unknown_topic}'");
 
     let group_id = ctx.unique_group("fetch-unknown").await;
     let consumer = create_base_consumer(&group_id)?;
@@ -45,7 +42,7 @@ pub async fn test_fetch_unknown_topic() -> TestResult {
                 got_message = true;
             }
             Some(Err(e)) => {
-                println!("   Expected error: {}", e);
+                println!("   Expected error: {e}");
                 got_error = true;
                 break;
             }
@@ -98,10 +95,7 @@ pub async fn test_fetch_invalid_partition() -> TestResult {
     assignment.add_partition_offset(&topic.name, invalid_partition, rdkafka::Offset::Beginning)?;
     consumer.assign(&assignment)?;
 
-    println!(
-        "Attempting to fetch from partition {}...",
-        invalid_partition
-    );
+    println!("Attempting to fetch from partition {invalid_partition}...");
 
     let timeout = Duration::from_secs(3);
     let start = std::time::Instant::now();
@@ -114,7 +108,7 @@ pub async fn test_fetch_invalid_partition() -> TestResult {
                 got_message = true;
             }
             Some(Err(e)) => {
-                println!("   Expected error: {}", e);
+                println!("   Expected error: {e}");
                 break;
             }
             None => {
@@ -164,7 +158,7 @@ pub async fn test_fetch_offset_out_of_range() -> TestResult {
     )?;
     consumer.assign(&assignment)?;
 
-    println!("Attempting to fetch from offset {}...", out_of_range_offset);
+    println!("Attempting to fetch from offset {out_of_range_offset}...");
 
     let timeout = Duration::from_secs(3);
     let start = std::time::Instant::now();
@@ -180,7 +174,7 @@ pub async fn test_fetch_offset_out_of_range() -> TestResult {
                 received_any = true;
             }
             Some(Err(e)) => {
-                println!("   Error (expected): {}", e);
+                println!("   Error (expected): {e}");
                 break;
             }
             None => {
@@ -234,7 +228,7 @@ pub async fn test_consume_empty_topic() -> TestResult {
                 message_count += 1;
             }
             Some(Err(e)) => {
-                println!("   Error: {}", e);
+                println!("   Error: {e}");
             }
             None => {
                 // Expected - no messages

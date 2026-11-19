@@ -4,7 +4,7 @@ use crate::common::TestResult;
 use crate::error_codes;
 use crate::fixtures::produce_one;
 use crate::setup::TestContext;
-use crate::wire::requests::*;
+use crate::wire::requests::{commit, conn, join_now, join_req, leave, sync_leader};
 
 /// OffsetCommit validation, Kafka 3.7's answers (each checked against a real broker):
 /// unknown group: gen -1 accepted (any member id), gen >= 0 ILLEGAL_GENERATION; group with

@@ -20,8 +20,7 @@ pub async fn test_transactional_requests_are_validated() -> TestResult {
         assert_eq!(
             w.init_producer_id(Some(&tx), timeout).await?,
             (error_codes::INVALID_TRANSACTION_TIMEOUT, -1, -1),
-            "timeout {}",
-            timeout
+            "timeout {timeout}"
         );
     }
     // Idempotent producers ignore the timeout.

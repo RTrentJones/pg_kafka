@@ -299,11 +299,10 @@ pub async fn test_held_join_completed_by_session_timeout_sweep() -> TestResult {
         .await
         .map_err(|_| "the sweep did not complete the held JoinGroup within 15s")??;
     let waited = sent.elapsed();
-    println!("   held for {:?}", waited);
+    println!("   held for {waited:?}");
     assert!(
         waited >= Duration::from_secs(4),
-        "answered after {:?}, before the first member's session could expire",
-        waited
+        "answered after {waited:?}, before the first member's session could expire"
     );
     assert_eq!(b.generation_id, a.generation_id + 1);
     assert_eq!(b.leader, b.member_id, "the remaining member leads");

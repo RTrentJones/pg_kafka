@@ -7,6 +7,7 @@
 //! Each response must decode completely in the request's version, which is what a strict
 //! client does with it.
 
+use crate::common::to_i32;
 use crate::common::TestResult;
 use crate::error_codes;
 use crate::setup::TestContext;
@@ -162,17 +163,17 @@ pub async fn test_unsupported_versions_get_typed_error_responses() -> TestResult
 /// A body cut short after a valid header (the kafka-protocol decoder runs out of input) is
 /// answered with INVALID_REQUEST in the API's own schema, and the connection stays usable.
 pub async fn test_truncated_body_gets_invalid_request() -> TestResult {
-    println!("=== Test: Truncated Body Gets INVALID_REQUEST ===\n");
-    let mut stream = TcpStream::connect(BROKER).await?;
-
     /// `framed` without its last `cut` bytes, with the size prefix adjusted.
     fn truncate(framed: &[u8], cut: usize) -> BytesMut {
         let payload = &framed[4..framed.len() - cut];
         let mut out = BytesMut::new();
-        out.extend_from_slice(&(payload.len() as i32).to_be_bytes());
+        out.extend_from_slice(&to_i32(payload.len()).to_be_bytes());
         out.extend_from_slice(payload);
         out
     }
+
+    println!("=== Test: Truncated Body Gets INVALID_REQUEST ===\n");
+    let mut stream = TcpStream::connect(BROKER).await?;
 
     let mut heartbeat = HeartbeatRequest::default();
     heartbeat.group_id = GroupId(StrBytes::from_static_str("api-errors-group"));
@@ -200,7 +201,7 @@ pub async fn test_truncated_body_gets_invalid_request() -> TestResult {
     produce.topic_data = vec![t];
     let framed = truncate(&request_frame(7, 203, &produce), 4);
     let response: ProduceResponse = exchange(&mut stream, &framed, 7, 203).await?;
-    assert!(response.responses.is_empty());
+    assert_eq!(response.responses, Vec::new());
     println!("✅ Produce v7: well-formed response");
 
     connection_still_usable(&mut stream).await?;
@@ -235,7 +236,7 @@ pub async fn test_handler_failure_gets_typed_error_response() -> TestResult {
 
     ctx.db()
         .execute(
-            &format!("REVOKE SELECT ON kafka.partition_offsets FROM {}", role),
+            &format!("REVOKE SELECT ON kafka.partition_offsets FROM {role}"),
             &[],
         )
         .await?;
@@ -245,7 +246,7 @@ pub async fn test_handler_failure_gets_typed_error_response() -> TestResult {
         .map_err(|e| e.to_string());
     ctx.db()
         .execute(
-            &format!("GRANT SELECT ON kafka.partition_offsets TO {}", role),
+            &format!("GRANT SELECT ON kafka.partition_offsets TO {role}"),
             &[],
         )
         .await?;
@@ -386,7 +387,7 @@ pub async fn test_request_sees_rows_committed_during_its_batch() -> TestResult {
         assert_eq!(header.correlation_id, 500 + attempt);
         let response = FetchResponse::decode(&mut reply, 4)?;
         let code = response.responses[0].partitions[0].error_code;
-        println!("   attempt {}: fetch error_code={}", attempt, code);
+        println!("   attempt {attempt}: fetch error_code={code}");
         if code != 0 {
             stale += 1;
         }

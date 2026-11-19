@@ -91,6 +91,8 @@ fn spawn_long_poll(
 /// 100 ms and returned the record ~300 ms after it was sent. New behaviour: nothing re-runs
 /// it until the safety-net interval (1 s by default), so the record arrives at ~1 s.
 pub async fn test_listener_idle_long_poll_does_not_refetch() -> TestResult {
+    const MAX_WAIT_MS: i32 = 6_000;
+
     println!("=== Test: Idle Long Poll Does Not Re-Fetch (listener) ===\n");
 
     let ctx = TestContext::new().await?;
@@ -112,7 +114,6 @@ pub async fn test_listener_idle_long_poll_does_not_refetch() -> TestResult {
         "this test assumes the shipped safety-net default (>= {DEFAULT_SAFETY_NET_MS} ms), got {interval_ms} ms"
     );
 
-    const MAX_WAIT_MS: i32 = 6_000;
     println!("Step 2: long poll at offset {hwm} (max_wait_ms={MAX_WAIT_MS})...");
     let fetch = spawn_long_poll(topic.clone(), hwm, MAX_WAIT_MS, 0);
 
@@ -160,6 +161,9 @@ pub async fn test_listener_idle_long_poll_does_not_refetch() -> TestResult {
 /// i.e. 0.2 s after a safety-net tick (ticks at ~1 s, ~2 s, ~3 s). Notification delivery is
 /// well under 400 ms; the safety net alone would take ~800 ms.
 pub async fn test_listener_produce_wakes_long_poll_promptly() -> TestResult {
+    // Metadata for the test topic too.
+    use rdkafka::producer::Producer;
+
     println!("=== Test: Produce Wakes Long Poll Promptly (listener) ===\n");
 
     let ctx = TestContext::new().await?;
@@ -177,8 +181,6 @@ pub async fn test_listener_produce_wakes_long_poll_promptly() -> TestResult {
         )
         .await
         .map_err(|(e, _)| e)?;
-    // Metadata for the test topic too.
-    use rdkafka::producer::Producer;
     producer
         .client()
         .fetch_metadata(Some(&topic), Duration::from_secs(5))?;
@@ -284,9 +286,10 @@ pub async fn test_listener_read_committed_long_poll_wakes_on_commit() -> TestRes
 /// neither deadlock nor drop or reorder responses: once the client reads, every response
 /// arrives, in request order.
 pub async fn test_listener_pipelined_requests_beyond_in_flight_cap() -> TestResult {
+    const REQUESTS: i32 = 400;
+
     println!("=== Test: Pipelining Beyond The In-Flight Cap (listener) ===\n");
 
-    const REQUESTS: i32 = 400;
     let mut stream = TcpStream::connect(get_bootstrap_servers()).await?;
     let mut bytes = Vec::new();
     for i in 0..REQUESTS {

@@ -1,13 +1,30 @@
 //! Hostile clients against the listener in its default configuration.
 
-use super::*;
+use super::{
+    answers, api_versions_frame, client_config, connect_from, rdkafka_roundtrip, stored_rows,
+    time_until_closed, PORT,
+};
+use crate::common::to_i32;
+use crate::common::{DynResult, TestResult};
 use crate::error_codes;
 use crate::setup::TestContext;
+use crate::wire::records::plain_batch;
+use crate::wire::requests::produce_request;
+use crate::wire::{correlation_of, decode_response, read_frame_within, request_frame};
+use bytes::Bytes;
 use kafka_protocol::messages::create_topics_request::{CreatableTopic, CreateTopicsRequest};
 use kafka_protocol::messages::fetch_request::{FetchPartition, FetchRequest, FetchTopic};
 use kafka_protocol::messages::{
     ApiVersionsRequest, BrokerId, CreateTopicsResponse, FetchResponse, ProduceResponse,
 };
+use kafka_protocol::messages::{ProduceRequest, TopicName};
+use kafka_protocol::protocol::StrBytes;
+use kafka_protocol::records::Compression;
+use rdkafka::producer::{FutureProducer, FutureRecord};
+use std::net::Ipv4Addr;
+use std::time::{Duration, Instant};
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
 
 /// A frame the broker cannot parse (header cut short): it closes the connection.
 const BAD_FRAME: [u8; 7] = [0, 0, 0, 3, 0, 0x12, 0];
@@ -44,7 +61,7 @@ fn fetch(
     r.max_wait_ms = max_wait;
     r.min_bytes = 1;
     r.max_bytes = max_bytes
-        .saturating_mul(partitions.len() as i32)
+        .saturating_mul(to_i32(partitions.len()))
         .max(max_bytes);
     r.topics = vec![t];
     r
@@ -202,11 +219,10 @@ pub async fn test_pipelined_requests_are_not_delayed_by_nagle() -> TestResult {
     }
     times.sort();
     let median = times[times.len() / 2];
-    println!("   3 pipelined ApiVersions: median {:?}", median);
+    println!("   3 pipelined ApiVersions: median {median:?}");
     assert!(
         median < Duration::from_millis(20),
-        "median {:?}: responses are held back by Nagle",
-        median
+        "median {median:?}: responses are held back by Nagle"
     );
 
     // A real client: 50 sequential acks=1 produces.
@@ -297,7 +313,7 @@ pub async fn test_acks0_produce_error_closes_connection() -> TestResult {
         producer
             .send(
                 FutureRecord::<(), _>::to(&topic)
-                    .payload(&format!("r{}", i))
+                    .payload(&format!("r{i}"))
                     .partition(0),
                 Duration::from_secs(10),
             )
@@ -331,13 +347,12 @@ pub async fn test_invalid_acks_rejected_and_nothing_written() -> TestResult {
             )],
             acks,
         );
-        let resp: ProduceResponse = crate::wire::roundtrip(&mut s, 7, i as i32, &req).await?;
+        let resp: ProduceResponse = crate::wire::roundtrip(&mut s, 7, to_i32(i), &req).await?;
         let p = &resp.responses[0].partition_responses[0];
         assert_eq!(
             p.error_code,
             error_codes::INVALID_REQUIRED_ACKS,
-            "acks={}",
-            acks
+            "acks={acks}"
         );
         assert_eq!(p.base_offset, -1);
     }
@@ -354,8 +369,7 @@ pub async fn test_invalid_acks_rejected_and_nothing_written() -> TestResult {
         let resp: ProduceResponse = crate::wire::roundtrip(&mut s, 7, 100, &req).await?;
         assert_eq!(
             resp.responses[0].partition_responses[0].error_code, 0,
-            "acks={}",
-            acks
+            "acks={acks}"
         );
     }
     assert_eq!(stored_rows(ctx.db(), &topic).await?, 2);

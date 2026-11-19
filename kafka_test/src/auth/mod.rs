@@ -61,7 +61,9 @@ pub fn cert_dir() -> PathBuf {
 /// [`remove_certificates`]).
 pub fn ensure_certificates() -> DynResult<PathBuf> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _guard = LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = cert_dir();
     if dir.join("server.key").exists() && dir.join("client.pem").exists() {
         return Ok(dir);
@@ -108,9 +110,9 @@ fn generate_certificates() -> DynResult<PathBuf> {
         "-nodes",
     ];
     for (name, cn) in [("ca", "pg_kafka e2e CA"), ("other-ca", "untrusted e2e CA")] {
-        let key = format!("{}.key", name);
-        let pem = format!("{}.pem", name);
-        let subj = format!("/CN={}", cn);
+        let key = format!("{name}.key");
+        let pem = format!("{name}.pem");
+        let subj = format!("/CN={cn}");
         let mut args = vec!["req", "-x509"];
         args.extend(ec);
         args.extend([
@@ -138,10 +140,10 @@ fn generate_certificates() -> DynResult<PathBuf> {
         ("server", "/CN=localhost"),
         ("client", "/O=pg_kafka e2e/CN=e2e-client"),
     ] {
-        let key = format!("{}.key", name);
-        let csr = format!("{}.csr", name);
-        let pem = format!("{}.pem", name);
-        let ext = format!("{}.ext", name);
+        let key = format!("{name}.key");
+        let csr = format!("{name}.csr");
+        let pem = format!("{name}.pem");
+        let ext = format!("{name}.ext");
         let mut args = vec!["req"];
         args.extend(ec);
         args.extend(["-keyout", &key, "-out", &csr, "-subj", subj]);
@@ -196,7 +198,7 @@ pub async fn configure_listeners(db: &Client, enable: bool, mutual_tls: bool) ->
         let sql = if set {
             format!("ALTER SYSTEM SET {} = {}", name, quote(&value))
         } else {
-            format!("ALTER SYSTEM RESET {}", name)
+            format!("ALTER SYSTEM RESET {name}")
         };
         db.execute(&sql, &[]).await?;
     }
@@ -266,9 +268,8 @@ pub async fn restart_listener(db: &Client, open: &[u16], closed: &[u16]) -> DynR
         }
     }
     Err(format!(
-        "listener did not come back with ports {:?} open and {:?} closed within 40 s \
-         (check the server log for a pg_kafka listener security error)",
-        open, closed
+        "listener did not come back with ports {open:?} open and {closed:?} closed within 40 s \
+         (check the server log for a pg_kafka listener security error)"
     )
     .into())
 }
@@ -292,7 +293,7 @@ pub async fn auth_env() -> TestResult {
     ENV.get_or_init(|| async { setup().await.map_err(|e| e.to_string()) })
         .await
         .clone()
-        .map_err(|e| format!("auth E2E setup failed: {}", e).into())
+        .map_err(|e| format!("auth E2E setup failed: {e}").into())
 }
 
 /// The `auth` tests, in run order.

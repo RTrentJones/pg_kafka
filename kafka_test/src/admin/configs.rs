@@ -97,7 +97,7 @@ async fn alter_topic_config(
         .ok_or("empty alter response".to_string())?;
     Ok((
         resource.error_code,
-        resource.error_message.as_ref().map(|m| m.to_string()),
+        resource.error_message.as_ref().map(ToString::to_string),
     ))
 }
 

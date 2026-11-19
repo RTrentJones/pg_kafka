@@ -119,22 +119,17 @@ async fn assert_reaches_end(
     let group = ctx.unique_group("txn-end").await;
     let c = consumer(&group, isolation)?;
     let (values, pos) = consume_to(&c, topic, end, Duration::from_secs(20))?;
-    println!(
-        "  {}: values={:?} position={} (end {})",
-        isolation, values, pos, end
-    );
+    println!("  {isolation}: values={values:?} position={pos} (end {end})");
     assert_eq!(
         values, expected,
-        "{} consumer read the wrong records",
-        isolation
+        "{isolation} consumer read the wrong records"
     );
-    assert_eq!(pos, end, "{} consumer stalled before the end", isolation);
+    assert_eq!(pos, end, "{isolation} consumer stalled before the end");
     c.commit_consumer_state(CommitMode::Sync)?;
     let committed = committed(ctx, &group, topic).await?;
     assert_eq!(
         committed, end,
-        "{} committed offset (lag must be 0)",
-        isolation
+        "{isolation} committed offset (lag must be 0)"
     );
     Ok(())
 }

@@ -55,6 +55,10 @@ use kafka_test::registry::{TestDef, TestFn};
 #[command(name = "kafka_test")]
 #[command(about = "pg_kafka E2E Test Suite")]
 #[command(version)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each bool is an independent command-line flag"
+)]
 struct Args {
     /// Run only tests in this category
     #[arg(short, long)]
@@ -129,6 +133,16 @@ struct SuiteResult {
 /// only exists so a hung test reports FAILED instead of stalling the run.
 const DEFAULT_TEST_TIMEOUT_SECS: u64 = 300;
 
+/// `d` in whole milliseconds (saturating; no test runs for 584 million years).
+fn millis(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// `ms` milliseconds in seconds, for display.
+fn secs(ms: u64) -> f64 {
+    Duration::from_millis(ms).as_secs_f64()
+}
+
 /// Extract a readable message from a panic payload.
 fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
@@ -161,7 +175,7 @@ async fn execute_test_fn(test_fn: TestFn, timeout: Duration) -> (bool, Option<St
                 Some(format!("panicked: {}", panic_message(payload.as_ref()))),
             )
         }
-        Ok(Err(join_err)) => (false, Some(format!("test task failed: {}", join_err))),
+        Ok(Err(join_err)) => (false, Some(format!("test task failed: {join_err}"))),
         Err(_) => {
             abort.abort();
             (
@@ -180,7 +194,7 @@ async fn run_single_test(test: &TestDef, verbose: bool, timeout: Duration) -> Te
 
     if verbose {
         if let Some(ref e) = error {
-            println!("   Error: {}", e);
+            println!("   Error: {e}");
         }
     }
 
@@ -188,7 +202,7 @@ async fn run_single_test(test: &TestDef, verbose: bool, timeout: Duration) -> Te
         category: test.category.to_string(),
         name: test.name.to_string(),
         passed,
-        duration_ms: duration.as_millis() as u64,
+        duration_ms: millis(duration),
         error,
     }
 }
@@ -242,17 +256,17 @@ fn print_text_summary(suite_result: &SuiteResult) {
         println!("{}:", cat.name);
         for test in &cat.tests {
             let status = if test.passed { "PASSED" } else { "FAILED" };
-            let duration = format!("({:.2}s)", test.duration_ms as f64 / 1000.0);
+            let duration = format!("({:.2}s)", secs(test.duration_ms));
             println!("  {} - {} {}", test.name, status, duration);
             if let Some(error) = &test.error {
-                println!("      error: {}", error);
+                println!("      error: {error}");
             }
         }
         println!(
             "  Category: {}/{} passed in {:.2}s\n",
             cat.passed,
             cat.passed + cat.failed,
-            cat.duration_ms as f64 / 1000.0
+            secs(cat.duration_ms)
         );
     }
 
@@ -261,7 +275,7 @@ fn print_text_summary(suite_result: &SuiteResult) {
         "Total: {} passed, {} failed in {:.2}s",
         suite_result.total_passed,
         suite_result.total_failed,
-        suite_result.total_duration_ms as f64 / 1000.0
+        secs(suite_result.total_duration_ms)
     );
 
     if suite_result.total_failed == 0 {
@@ -318,10 +332,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if tests_to_run.is_empty() {
         eprintln!("No tests match the specified criteria");
         if let Some(ref cat) = args.category {
-            eprintln!("Category: {}", cat);
+            eprintln!("Category: {cat}");
         }
         if let Some(ref test_name) = args.test {
-            eprintln!("Test: {}", test_name);
+            eprintln!("Test: {test_name}");
         }
         std::process::exit(1);
     }
@@ -351,7 +365,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut attempts = 0;
     let max_attempts = 5;
     loop {
-        match kafka_test::setup::verify_server_ready().await {
+        match kafka_test::setup::verify_server_ready() {
             Ok(()) => {
                 if !args.json {
                     println!("OK");
@@ -361,11 +375,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(e) => {
                 attempts += 1;
                 if attempts >= max_attempts {
-                    eprintln!("FAILED after {} attempts: {}", max_attempts, e);
+                    eprintln!("FAILED after {max_attempts} attempts: {e}");
                     std::process::exit(1);
                 }
                 if !args.json {
-                    print!("retry {}... ", attempts);
+                    print!("retry {attempts}... ");
                     let _ = std::io::Write::flush(&mut std::io::stdout());
                 }
                 tokio::time::sleep(Duration::from_secs(2)).await;
@@ -376,7 +390,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let suite_start = Instant::now();
     let test_timeout = Duration::from_secs(args.timeout_secs);
 
-    let all_results: Vec<TestResult> = if !args.sequential {
+    let all_results: Vec<TestResult> = if args.sequential {
+        // Sequential execution mode (original behavior)
+        let mut results = Vec::new();
+        let mut current_category = "";
+
+        for test in &tests_to_run {
+            if test.category != current_category {
+                current_category = test.category;
+                if !args.json {
+                    print_category_header(current_category);
+                }
+            }
+
+            let result = run_single_test(test, args.verbose, test_timeout).await;
+            if !args.json {
+                let status = if result.passed { "PASSED" } else { "FAILED" };
+                let duration = format!("({:.2}s)", secs(result.duration_ms));
+                println!("  {} - {} {}", test.name, status, duration);
+            }
+            results.push(result);
+        }
+        results
+    } else {
         // Parallel execution mode
         let (parallel_tests, sequential_tests): (Vec<_>, Vec<_>) =
             tests_to_run.iter().partition(|t| t.parallel_safe);
@@ -408,10 +444,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if !json_mode {
                         let _lock = print_lock.lock().await;
                         let icon = if result.passed { "✓" } else { "✗" };
-                        let duration_str = format!("{:.2}s", result.duration_ms as f64 / 1000.0);
+                        let duration_str = format!("{:.2}s", secs(result.duration_ms));
                         println!("  {} {} ({})", icon, result.name, duration_str);
                         if let Some(ref e) = result.error {
-                            eprintln!("    Error: {}", e);
+                            eprintln!("    Error: {e}");
                         }
                     }
 
@@ -432,7 +468,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let result = run_single_test(test, args.verbose, test_timeout).await;
             if !args.json {
                 let status = if result.passed { "PASSED" } else { "FAILED" };
-                let duration = format!("({:.2}s)", result.duration_ms as f64 / 1000.0);
+                let duration = format!("({:.2}s)", secs(result.duration_ms));
                 println!("  {} - {} {}", test.name, status, duration);
             }
             sequential_results.push(result);
@@ -443,28 +479,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .into_iter()
             .chain(sequential_results)
             .collect()
-    } else {
-        // Sequential execution mode (original behavior)
-        let mut results = Vec::new();
-        let mut current_category = "";
-
-        for test in &tests_to_run {
-            if test.category != current_category {
-                current_category = test.category;
-                if !args.json {
-                    print_category_header(current_category);
-                }
-            }
-
-            let result = run_single_test(test, args.verbose, test_timeout).await;
-            if !args.json {
-                let status = if result.passed { "PASSED" } else { "FAILED" };
-                let duration = format!("({:.2}s)", result.duration_ms as f64 / 1000.0);
-                println!("  {} - {} {}", test.name, status, duration);
-            }
-            results.push(result);
-        }
-        results
     };
 
     // Group results by category
@@ -504,7 +518,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         timestamp: Utc::now(),
         total_passed,
         total_failed,
-        total_duration_ms: suite_start.elapsed().as_millis() as u64,
+        total_duration_ms: millis(suite_start.elapsed()),
         categories: category_results,
     };
 
@@ -534,19 +548,23 @@ mod runner_tests {
         };
     }
 
+    #[expect(clippy::unused_async, reason = "a registered test is an async fn")]
     async fn passes() -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     }
 
+    #[expect(clippy::unused_async, reason = "a registered test is an async fn")]
     async fn returns_err() -> Result<(), Box<dyn std::error::Error>> {
         Err("expected failure".into())
     }
 
+    #[expect(clippy::unused_async, reason = "a registered test is an async fn")]
     async fn panics_with_str() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(1, 2, "assertion inside test");
         Ok(())
     }
 
+    #[expect(clippy::unused_async, reason = "a registered test is an async fn")]
     async fn panics_with_static_str() -> Result<(), Box<dyn std::error::Error>> {
         panic!("plain panic");
     }

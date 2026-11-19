@@ -10,6 +10,7 @@
 //! connection, then sends a Heartbeat on a second connection mid-flood and asserts
 //! it answers long before the flood drains.
 
+use crate::common::to_i32;
 use crate::common::TestResult;
 use crate::wire::requests::sequenced_produce_request;
 use crate::wire::{read_raw_response, request_frame};
@@ -60,7 +61,7 @@ pub async fn test_heartbeat_bypasses_produce_backlog() -> TestResult {
                 &[&writer_payload],
             );
             stream
-                .write_all(&request_frame(7, 1000 + i as i32, &req))
+                .write_all(&request_frame(7, 1000 + to_i32(i), &req))
                 .await
                 .map_err(|e| e.to_string())?;
         }
@@ -93,50 +94,42 @@ pub async fn test_heartbeat_bypasses_produce_backlog() -> TestResult {
         hb_stream
             .write_all(&request_frame(0, 42 + probe, &heartbeat))
             .await
-            .map_err(|e| format!("heartbeat send failed: {}", e))?;
+            .map_err(|e| format!("heartbeat send failed: {e}"))?;
         tokio::time::timeout(Duration::from_secs(30), read_raw_response(&mut hb_stream))
             .await
             .map_err(|_| "heartbeat response timed out entirely")?
-            .map_err(|e| format!("heartbeat read failed: {}", e))?;
+            .map_err(|e| format!("heartbeat read failed: {e}"))?;
         let rtt = hb_start.elapsed();
-        println!("  Heartbeat probe {} RTT: {:?}", probe, rtt);
+        println!("  Heartbeat probe {probe} RTT: {rtt:?}");
         hb_rtt = hb_rtt.min(rtt);
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
-    println!("  Best heartbeat RTT: {:?}", hb_rtt);
+    println!("  Best heartbeat RTT: {hb_rtt:?}");
 
     // 3. Wait for the flood to drain and compare.
     let flood_total = flood_task
         .await?
-        .map_err(|e| format!("flood task failed: {}", e))?;
-    println!("  Flood drained in: {:?}\n", flood_total);
+        .map_err(|e| format!("flood task failed: {e}"))?;
+    println!("  Flood drained in: {flood_total:?}\n");
 
     // 4. Assertions. If the machine drained the flood too fast to build a real
     //    backlog, the probe proves nothing — pass with a warning rather than
     //    flake (the assertion is meaningful on any CI-class machine).
     if flood_total < Duration::from_millis(1500) {
         println!(
-            "⚠️  Flood drained in {:?} (<1.5s) — backlog too small to exercise the lane; inconclusive pass",
-            flood_total
+            "⚠️  Flood drained in {flood_total:?} (<1.5s) — backlog too small to exercise the lane; inconclusive pass"
         );
         return Ok(());
     }
     assert!(
         hb_rtt < Duration::from_millis(1000),
-        "Heartbeat took {:?} while the produce backlog drained in {:?} — liveness traffic is queueing behind the main lane (DR-12 regression)",
-        hb_rtt,
-        flood_total
+        "Heartbeat took {hb_rtt:?} while the produce backlog drained in {flood_total:?} — liveness traffic is queueing behind the main lane (DR-12 regression)"
     );
     assert!(
         hb_rtt < flood_total / 2,
-        "Heartbeat RTT {:?} is not meaningfully faster than the {:?} backlog — liveness lane not effective",
-        hb_rtt,
-        flood_total
+        "Heartbeat RTT {hb_rtt:?} is not meaningfully faster than the {flood_total:?} backlog — liveness lane not effective"
     );
-    println!(
-        "  ✅ Heartbeat answered in {:?} despite {:?} backlog\n",
-        hb_rtt, flood_total
-    );
+    println!("  ✅ Heartbeat answered in {hb_rtt:?} despite {flood_total:?} backlog\n");
 
     println!("✅ Test PASSED\n");
     Ok(())

@@ -143,9 +143,8 @@ pub async fn test_idempotent_duplicates_and_epochs_follow_kafka() -> TestResult 
 async fn reconnect() -> Result<Wire, Box<dyn std::error::Error>> {
     for _ in 0..60 {
         tokio::time::sleep(Duration::from_millis(500)).await;
-        let mut w = match Wire::connect().await {
-            Ok(w) => w,
-            Err(_) => continue,
+        let Ok(mut w) = Wire::connect().await else {
+            continue;
         };
         let ready = w.init_producer_id(None, 60_000).await.is_ok();
         if ready {
@@ -175,12 +174,12 @@ pub async fn test_idempotent_sequence_wraps_at_i32_max() -> TestResult {
             &[&pid],
         )
         .await?;
-    // 2147483646, 2147483647, 0: crosses the wrap.
+    // 2_147_483_646, 2147483647, 0: crosses the wrap.
     assert_eq!(
         w.produce(
             &t,
             0,
-            batch(&["b", "c", "d"], pid, ep, 2147483646, false, None),
+            batch(&["b", "c", "d"], pid, ep, 2_147_483_646, false, None),
             None
         )
         .await?,
@@ -195,7 +194,7 @@ pub async fn test_idempotent_sequence_wraps_at_i32_max() -> TestResult {
         w.produce(
             &t,
             0,
-            batch(&["b", "c", "d"], pid, ep, 2147483646, false, None),
+            batch(&["b", "c", "d"], pid, ep, 2_147_483_646, false, None),
             None
         )
         .await?,

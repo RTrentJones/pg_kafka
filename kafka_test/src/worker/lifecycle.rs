@@ -1,7 +1,11 @@
 //! Worker lifecycle under extension DDL, old schemas, SIGTERM, lock waits and failed commits.
 
 use crate::common::{get_bootstrap_servers, TestResult};
-use crate::worker::*;
+use crate::worker::{
+    boxed, deadlocks, ensure_old_version_available, hold_partition_counter, into_test_result,
+    listener_pid, quick_producer, read_values, send, session, set_guc, unique,
+    wait_for_serving_listener, SendResult, ServerLog, WORKER_LOCK_TIMEOUT_GUC,
+};
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, Consumer, StreamConsumer};
 use rdkafka::producer::{FutureProducer, FutureRecord};
@@ -34,7 +38,7 @@ async fn extension_ddl_loop() -> SendResult<()> {
     // The worker's own statistics are not flushed promptly (a background worker does
     // not report them between transactions), so the log is the reliable witness.
     let log = ServerLog::open(&db).await?;
-    let log_from = log.as_ref().map(|l| l.end()).unwrap_or(0);
+    let log_from = log.as_ref().map_or(0, ServerLog::end);
 
     // Shadow mode on (no shadow topics, unreachable broker): the worker polls the
     // outbox every 250 ms, which is one of the lock orders that deadlocked.
@@ -73,9 +77,7 @@ async fn extension_ddl_loop() -> SendResult<()> {
                 i += 1;
                 if producer
                     .send(
-                        FutureRecord::to(&topic)
-                            .key("k")
-                            .payload(&format!("v{}", i)),
+                        FutureRecord::to(&topic).key("k").payload(&format!("v{i}")),
                         Duration::from_secs(10),
                     )
                     .await
@@ -123,7 +125,7 @@ async fn extension_ddl_loop() -> SendResult<()> {
                 .map_err(boxed)?;
             db.batch_execute(sql)
                 .await
-                .map_err(|e| format!("round {}: {}: {:?}", round, sql, e))?;
+                .map_err(|e| format!("round {round}: {sql}: {e:?}"))?;
             println!("  round {}: DDL done in {:?}", round, start.elapsed());
             tokio::time::sleep(Duration::from_millis(1500)).await;
         }
@@ -145,8 +147,7 @@ async fn extension_ddl_loop() -> SendResult<()> {
         let n = log.since(log_from).matches("deadlock detected").count();
         assert_eq!(
             n, 0,
-            "the server log reports {} deadlock(s) during the loop",
-            n
+            "the server log reports {n} deadlock(s) during the loop"
         );
         println!("✅ server log: no deadlock detected");
     }
@@ -195,7 +196,7 @@ async fn old_schema() -> SendResult<()> {
     ensure_old_version_available(&db).await?;
     wait_for_serving_listener(&db, None, Duration::from_secs(30)).await?;
     let log = ServerLog::open(&db).await?;
-    let log_from = log.as_ref().map(|l| l.end()).unwrap_or(0);
+    let log_from = log.as_ref().map_or(0, ServerLog::end);
 
     let result: SendResult<()> = async {
         db.batch_execute(
@@ -207,7 +208,7 @@ async fn old_schema() -> SendResult<()> {
         let topic = unique("old-schema");
         let producer = quick_producer("10000")?;
         for i in 0..20 {
-            send(&producer, &topic, &format!("v{}", i)).await?;
+            send(&producer, &topic, &format!("v{i}")).await?;
         }
         let got = read_values(&topic, false, 20, Duration::from_secs(15)).await?;
         assert_eq!(got.len(), 20, "consume on the 0.0.0 schema");
@@ -215,7 +216,7 @@ async fn old_schema() -> SendResult<()> {
         // The on-demand sweep runs on the unpartitioned table.
         db.query("SELECT * FROM pg_kafka_run_retention_sweep(0, 3600)", &[])
             .await
-            .map_err(|e| format!("retention sweep on 0.0.0 failed: {:?}", e))?;
+            .map_err(|e| format!("retention sweep on 0.0.0 failed: {e:?}"))?;
 
         // A worker started on the old schema (startup maintenance path).
         db.query("SELECT pg_terminate_backend($1)", &[&pid])
@@ -223,7 +224,7 @@ async fn old_schema() -> SendResult<()> {
             .map_err(boxed)?;
         wait_for_serving_listener(&db, Some(pid), Duration::from_secs(30)).await?;
         for i in 0..20 {
-            send(&producer, &topic, &format!("w{}", i)).await?;
+            send(&producer, &topic, &format!("w{i}")).await?;
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         tokio::time::sleep(Duration::from_millis(1500)).await;
@@ -239,15 +240,13 @@ async fn old_schema() -> SendResult<()> {
             ] {
                 assert!(
                     !text.contains(bad),
-                    "the worker on the 0.0.0 schema logged '{}'",
-                    bad
+                    "the worker on the 0.0.0 schema logged '{bad}'"
                 );
             }
             let degrade = text.matches("older pg_kafka schema").count();
             assert!(
                 (1..=3).contains(&degrade),
-                "expected the old-schema WARNING once per worker start, found {}",
-                degrade
+                "expected the old-schema WARNING once per worker start, found {degrade}"
             );
             println!("✅ server log: one old-schema WARNING per start, no per-cycle failures");
         } else {
@@ -284,8 +283,7 @@ async fn old_schema() -> SendResult<()> {
             }
             if Instant::now() > deadline {
                 return Err(format!(
-                    "after ALTER EXTENSION UPDATE: broker_api_stats rows={}, leaf for now={}",
-                    metrics, leaf_now
+                    "after ALTER EXTENSION UPDATE: broker_api_stats rows={metrics}, leaf for now={leaf_now}"
                 )
                 .into());
             }
@@ -352,7 +350,7 @@ async fn sigterm_lock_wait() -> SendResult<()> {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        println!("Step 1: worker {} waits on the held lock", pid);
+        println!("Step 1: worker {pid} waits on the held lock");
         db.query("SELECT pg_terminate_backend($1)", &[&pid])
             .await
             .map_err(boxed)?;
@@ -372,7 +370,7 @@ async fn sigterm_lock_wait() -> SendResult<()> {
     let _ = tokio::time::timeout(Duration::from_secs(40), blocked).await;
     let new_pid = wait_for_serving_listener(&db, Some(pid), Duration::from_secs(30)).await?;
     result?;
-    println!("✅ new worker {} serves", new_pid);
+    println!("✅ new worker {new_pid} serves");
     Ok(())
 }
 
@@ -429,15 +427,9 @@ async fn lock_timeout_bounds() -> SendResult<()> {
 
     let (wm, took) = watermarks?;
     let (low, high) = wm.map_err(|e| {
-        format!(
-            "ListOffsets for another topic failed while one row was locked: {}",
-            e
-        )
+        format!("ListOffsets for another topic failed while one row was locked: {e}")
     })?;
-    println!(
-        "Step 1: ListOffsets on {} answered in {:?} (low {}, high {})",
-        other, took, low, high
-    );
+    println!("Step 1: ListOffsets on {other} answered in {took:?} (low {low}, high {high})");
     assert_eq!(high, 1);
     println!(
         "Step 2: blocked produce finished: {:?}",
@@ -502,24 +494,17 @@ async fn commit_failure() -> SendResult<()> {
         let start = Instant::now();
         let r = send(&no_retry, &topic, "doomed").await;
         let took = start.elapsed();
-        println!(
-            "Step 1: produce into the failing commit -> {:?} after {:?}",
-            r, took
-        );
+        println!("Step 1: produce into the failing commit -> {r:?} after {took:?}");
         assert!(r.is_err(), "the produce must not be acknowledged");
         assert!(
             took < Duration::from_secs(5),
-            "the error must be an answer, not a timeout ({:?})",
-            took
+            "the error must be an answer, not a timeout ({took:?})"
         );
         let other = unique("commitfail-other");
         send(&producer, &other, "fine").await?;
         let now = listener_pid(&db).await?;
         assert_eq!(now, Some(pid), "the listener must not restart");
-        println!(
-            "✅ error answered in {:?}; listener {} still serving",
-            took, pid
-        );
+        println!("✅ error answered in {took:?}; listener {pid} still serving");
         Ok(())
     }
     .await;

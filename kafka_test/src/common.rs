@@ -18,6 +18,25 @@ pub type DynResult<T> = Result<T, Box<dyn std::error::Error>>;
 /// What every test returns.
 pub type TestResult = DynResult<()>;
 
+/// A count or index of test records as an `i64` (database counts, offsets).
+pub fn to_i64(n: usize) -> i64 {
+    i64::try_from(n).expect("a test count fits in i64")
+}
+
+/// A count or index of test requests as an `i32` (correlation ids, sizes).
+pub fn to_i32(n: usize) -> i32 {
+    i32::try_from(n).expect("a test count fits in i32")
+}
+
+/// A count of test records as an `f64`, for rates and percentages.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "test counts are far below 2^53, where every integer is an exact f64"
+)]
+pub fn to_f64(n: usize) -> f64 {
+    n as f64
+}
+
 /// An rdkafka admin client for the broker under test.
 pub fn create_admin_client() -> DynResult<AdminClient<DefaultClientContext>> {
     Ok(ClientConfig::new()
@@ -45,7 +64,7 @@ pub async fn create_db_client() -> Result<Client, Box<dyn std::error::Error>> {
     // Spawn connection handler
     tokio::spawn(async move {
         if let Err(e) = connection.await {
-            eprintln!("PostgreSQL connection error: {}", e);
+            eprintln!("PostgreSQL connection error: {e}");
         }
     });
 
@@ -170,8 +189,7 @@ pub fn get_test_timeout() -> Duration {
     env::var("TEST_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .map(Duration::from_secs)
-        .unwrap_or(TEST_TIMEOUT)
+        .map_or(TEST_TIMEOUT, Duration::from_secs)
 }
 
 /// Get poll timeout from environment or use default
@@ -179,8 +197,7 @@ pub fn get_poll_timeout() -> Duration {
     env::var("POLL_TIMEOUT_MS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(POLL_TIMEOUT)
+        .map_or(POLL_TIMEOUT, Duration::from_millis)
 }
 
 // ========== Transaction Support (Phase 10) ==========

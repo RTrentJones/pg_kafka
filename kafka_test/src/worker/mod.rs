@@ -26,7 +26,7 @@ pub type SendResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 /// Box any error into the suite's error type.
 pub fn boxed<E: std::fmt::Debug>(e: E) -> Box<dyn std::error::Error + Send + Sync> {
-    format!("{:?}", e).into()
+    format!("{e:?}").into()
 }
 
 /// The pid of the one `pg_kafka_listener` worker, if it runs.
@@ -68,7 +68,7 @@ pub async fn wait_for_serving_listener(
             }
         }
         if Instant::now() > deadline {
-            return Err(format!("no serving pg_kafka_listener within {:?}", within).into());
+            return Err(format!("no serving pg_kafka_listener within {within:?}").into());
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
@@ -91,10 +91,10 @@ pub fn quick_producer(timeout_ms: &str) -> SendResult<FutureProducer> {
 pub async fn set_guc(db: &Client, name: &str, value: Option<&str>) -> SendResult<bool> {
     let sql = match value {
         Some(v) => format!("ALTER SYSTEM SET {} = '{}'", name, v.replace('\'', "''")),
-        None => format!("ALTER SYSTEM RESET {}", name),
+        None => format!("ALTER SYSTEM RESET {name}"),
     };
     if let Err(e) = db.batch_execute(&sql).await {
-        println!("  (could not set {}: {})", name, e);
+        println!("  (could not set {name}: {e})");
         return Ok(false);
     }
     db.batch_execute("SELECT pg_reload_conf()")
@@ -113,14 +113,12 @@ pub struct ServerLog {
 
 impl ServerLog {
     pub async fn open(db: &Client) -> SendResult<Option<ServerLog>> {
-        let pid = match listener_pid(db).await? {
-            Some(p) => p,
-            None => return Ok(None),
+        let Some(pid) = listener_pid(db).await? else {
+            return Ok(None);
         };
-        let link = std::path::PathBuf::from(format!("/proc/{}/fd/2", pid));
-        let target = match std::fs::read_link(&link) {
-            Ok(t) => t,
-            Err(_) => return Ok(None),
+        let link = std::path::PathBuf::from(format!("/proc/{pid}/fd/2"));
+        let Ok(target) = std::fs::read_link(&link) else {
+            return Ok(None);
         };
         match std::fs::metadata(&target) {
             Ok(m) if m.is_file() => Ok(Some(ServerLog { path: target })),
@@ -130,7 +128,7 @@ impl ServerLog {
 
     /// The current end of the log.
     pub fn end(&self) -> u64 {
-        std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0)
+        std::fs::metadata(&self.path).map_or(0, |m| m.len())
     }
 
     /// Everything written since `from`.
@@ -213,8 +211,7 @@ pub(crate) const WORKER_LOCK_TIMEOUT_GUC: &str = "pg_kafka.worker_lock_timeout_m
 pub(crate) fn unique(base: &str) -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_nanos());
     format!("worker-{}-{}", base, nanos % 1_000_000_000_000)
 }
 
@@ -290,11 +287,7 @@ pub(crate) async fn hold_partition_counter(holder: &Client, topic: &str) -> Send
         .map_err(boxed)?
         .len();
     if n != 1 {
-        return Err(format!(
-            "expected one partition_offsets row for {}, got {}",
-            topic, n
-        )
-        .into());
+        return Err(format!("expected one partition_offsets row for {topic}, got {n}").into());
     }
     Ok(())
 }

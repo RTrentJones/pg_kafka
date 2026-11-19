@@ -50,12 +50,12 @@ pub async fn test_produce_while_consuming() -> TestResult {
         let producer = crate::common::create_producer().unwrap();
 
         for i in 0..20 {
-            let value = format!("message-{}", i);
+            let value = format!("message-{i}");
             if producer
                 .send(
                     FutureRecord::to(&topic_name_clone)
                         .payload(&value)
-                        .key(&format!("key-{}", i)),
+                        .key(&format!("key-{i}")),
                     Duration::from_secs(5),
                 )
                 .await
@@ -74,10 +74,7 @@ pub async fn test_produce_while_consuming() -> TestResult {
     let produced_count = produced.load(Ordering::SeqCst);
     let consumed_count = consumed.load(Ordering::SeqCst);
 
-    println!(
-        "   Produced: {}, Consumed: {}",
-        produced_count, consumed_count
-    );
+    println!("   Produced: {produced_count}, Consumed: {consumed_count}");
     assert!(produced_count >= 15, "Should produce at least 15 messages");
     assert!(consumed_count >= 5, "Should consume at least 5 messages");
     println!("✅ Simultaneous produce/consume working");
@@ -100,8 +97,8 @@ pub async fn test_consumer_catches_up() -> TestResult {
         producer
             .send(
                 FutureRecord::to(&topic.name)
-                    .payload(&format!("message-{}", i))
-                    .key(&format!("key-{}", i)),
+                    .payload(&format!("message-{i}"))
+                    .key(&format!("key-{i}")),
                 Duration::from_secs(5),
             )
             .await
@@ -127,7 +124,7 @@ pub async fn test_consumer_catches_up() -> TestResult {
         }
     }
 
-    println!("   Consumer caught up, received: {}", consumed);
+    println!("   Consumer caught up, received: {consumed}");
     assert!(consumed >= 8, "Should consume at least 8 of 10 messages");
     println!("✅ Consumer successfully caught up");
 

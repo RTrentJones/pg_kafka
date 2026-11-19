@@ -5,7 +5,9 @@ use crate::common::{create_db_client, get_bootstrap_servers, TestResult};
 use crate::error_codes;
 use crate::fixtures::produce_one;
 use crate::setup::TestContext;
-use crate::wire::requests::*;
+use crate::wire::requests::{
+    conn, delete_group, describe, join_now, join_req, leave, list_groups, sync_leader,
+};
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::error::KafkaError;
@@ -48,8 +50,8 @@ pub async fn test_join_group_protocol_and_member_id_rules() -> TestResult {
     ] {
         let mut c = conn().await?;
         let (e, _, _, proto) = join_now(&mut c, &req).await?;
-        println!("{}: error {} protocol_name {:?}", what, e, proto);
-        assert_eq!(e, error_codes::INCONSISTENT_GROUP_PROTOCOL, "{}", what);
+        println!("{what}: error {e} protocol_name {proto:?}");
+        assert_eq!(e, error_codes::INCONSISTENT_GROUP_PROTOCOL, "{what}");
         assert_eq!(
             proto.as_deref(),
             Some(""),
@@ -130,7 +132,7 @@ pub async fn test_join_with_no_common_assignor_is_refused() -> TestResult {
         // keep A alive
         let _ = a.poll(Duration::from_millis(100));
         if let Some(Err(e)) = b.poll(Duration::from_millis(200)) {
-            println!("B: {}", e);
+            println!("B: {e}");
             if let KafkaError::Global(RDKafkaErrorCode::InconsistentGroupProtocol)
             | KafkaError::MessageConsumption(RDKafkaErrorCode::InconsistentGroupProtocol) = e
             {

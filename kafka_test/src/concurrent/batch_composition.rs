@@ -2,7 +2,10 @@
 
 use crate::common::TestResult;
 use crate::wire::request_frame;
-use crate::worker::*;
+use crate::worker::{
+    boxed, into_test_result, quick_producer, send, session, set_guc, unique,
+    wait_for_serving_listener, SendResult,
+};
 use kafka_protocol::messages::{GroupId, HeartbeatRequest};
 use kafka_protocol::protocol::StrBytes;
 use rdkafka::producer::FutureProducer;
@@ -60,7 +63,7 @@ async fn heartbeat_flood(stop: Arc<AtomicBool>) -> SendResult<u64> {
             }
             Err(_) => continue,
         }
-        let mut buf = vec![0u8; i32::from_be_bytes(size) as usize];
+        let mut buf = vec![0u8; usize::try_from(i32::from_be_bytes(size)).map_err(boxed)?];
         reader.read_exact(&mut buf).await.map_err(boxed)?;
         responses += 1;
     }
@@ -94,7 +97,7 @@ async fn heartbeats_batches() -> SendResult<()> {
             let t = topic.clone();
             tasks.push(tokio::spawn(async move {
                 for i in 0..5 {
-                    send(&p, &t, &format!("r{}", i)).await?;
+                    send(&p, &t, &format!("r{i}")).await?;
                 }
                 Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
             }));
@@ -112,18 +115,14 @@ async fn heartbeats_batches() -> SendResult<()> {
         served.push(f.await.map_err(boxed)??);
     }
     let took = result?;
-    println!(
-        "Step 1: 60 produces in {:?} while the flood got {:?} heartbeat responses",
-        took, served
-    );
+    println!("Step 1: 60 produces in {took:?} while the flood got {served:?} heartbeat responses");
     assert!(
         served.iter().all(|n| *n > 0),
         "every heartbeat connection must be served"
     );
     assert!(
         took < Duration::from_millis(5000),
-        "produces were committed one batch each under heartbeat traffic ({:?})",
-        took
+        "produces were committed one batch each under heartbeat traffic ({took:?})"
     );
     println!("✅ produce batches stay large under heartbeat traffic");
     Ok(())

@@ -54,10 +54,7 @@ pub async fn test_read_committed_filters_pending() -> TestResult {
         )
         .await
         .map_err(|(err, _msg)| err)?;
-    println!(
-        "  Message queued: partition={}, offset={}\n",
-        partition, offset
-    );
+    println!("  Message queued: partition={partition}, offset={offset}\n");
 
     // Verify message is pending in database
     let topic_row = client
@@ -73,7 +70,7 @@ pub async fn test_read_committed_filters_pending() -> TestResult {
         .await?;
     let txn_state: Option<String> = msg_row.get(0);
 
-    println!("  Database verification: txn_state = {:?}", txn_state);
+    println!("  Database verification: txn_state = {txn_state:?}");
     assert_eq!(
         txn_state,
         Some("pending".to_string()),
@@ -89,7 +86,7 @@ pub async fn test_read_committed_filters_pending() -> TestResult {
     let mut tpl = TopicPartitionList::new();
     tpl.add_partition_offset(&topic, partition, rdkafka::Offset::Beginning)?;
     consumer.assign(&tpl)?;
-    println!("  Consumer assigned to partition {}\n", partition);
+    println!("  Consumer assigned to partition {partition}\n");
 
     // Try to consume - should get nothing (pending messages filtered)
     println!("Polling for messages (expecting none)...");
@@ -104,7 +101,7 @@ pub async fn test_read_committed_filters_pending() -> TestResult {
             return Err("Read committed consumer should not see pending messages".into());
         }
         Some(Err(e)) => {
-            println!("  Poll error: {} (expected for empty topic)\n", e);
+            println!("  Poll error: {e} (expected for empty topic)\n");
         }
     }
 
@@ -126,8 +123,8 @@ pub async fn test_read_committed_filters_pending() -> TestResult {
         .get(0);
 
     println!("  Database state:");
-    println!("    Total messages: {}", total_count);
-    println!("    Visible (txn_state IS NULL): {}", visible_count);
+    println!("    Total messages: {total_count}");
+    println!("    Visible (txn_state IS NULL): {visible_count}");
     assert_eq!(visible_count, 0, "No messages should be visible");
     assert!(total_count >= 1, "Message should exist but be pending");
     println!("  Read committed filtering confirmed\n");
@@ -183,10 +180,7 @@ pub async fn test_read_uncommitted_sees_pending() -> TestResult {
         )
         .await
         .map_err(|(err, _msg)| err)?;
-    println!(
-        "  Message queued: partition={}, offset={}\n",
-        partition, offset
-    );
+    println!("  Message queued: partition={partition}, offset={offset}\n");
 
     // Verify message is pending in database
     let topic_row = client
@@ -202,7 +196,7 @@ pub async fn test_read_uncommitted_sees_pending() -> TestResult {
         .await?;
     let txn_state: Option<String> = msg_row.get(0);
 
-    println!("  Database verification: txn_state = {:?}", txn_state);
+    println!("  Database verification: txn_state = {txn_state:?}");
     assert_eq!(
         txn_state,
         Some("pending".to_string()),
@@ -218,7 +212,7 @@ pub async fn test_read_uncommitted_sees_pending() -> TestResult {
     let mut tpl = TopicPartitionList::new();
     tpl.add_partition_offset(&topic, partition, rdkafka::Offset::Beginning)?;
     consumer.assign(&tpl)?;
-    println!("  Consumer assigned to partition {}\n", partition);
+    println!("  Consumer assigned to partition {partition}\n");
 
     // Try to consume - should see the pending message
     println!("Polling for messages (expecting the pending message)...");
@@ -237,7 +231,7 @@ pub async fn test_read_uncommitted_sees_pending() -> TestResult {
             println!("  Message received! offset={}\n", msg.offset());
         }
         Some(Err(e)) => {
-            println!("  Poll error: {}\n", e);
+            println!("  Poll error: {e}\n");
         }
     }
 
@@ -251,7 +245,7 @@ pub async fn test_read_uncommitted_sees_pending() -> TestResult {
         .get(0);
 
     println!("  Database state:");
-    println!("    Total messages: {}", total_count);
+    println!("    Total messages: {total_count}");
     assert!(total_count >= 1, "Message should exist (pending)");
     println!("  Message exists in database\n");
 
@@ -306,10 +300,7 @@ pub async fn test_read_committed_after_commit() -> TestResult {
         )
         .await
         .map_err(|(err, _msg)| err)?;
-    println!(
-        "  Message queued: partition={}, offset={}\n",
-        partition, offset
-    );
+    println!("  Message queued: partition={partition}, offset={offset}\n");
 
     // Verify message is initially pending
     let topic_row = client
@@ -325,7 +316,7 @@ pub async fn test_read_committed_after_commit() -> TestResult {
         .await?;
     let txn_state_before: Option<String> = msg_row.get(0);
 
-    println!("  Before commit: txn_state = {:?}", txn_state_before);
+    println!("  Before commit: txn_state = {txn_state_before:?}");
     assert_eq!(
         txn_state_before,
         Some("pending".to_string()),
@@ -352,8 +343,7 @@ pub async fn test_read_committed_after_commit() -> TestResult {
                     &[&topic_id, &offset],
                 )
                 .await
-                .map(|row| row.get::<_, bool>(0))
-                .unwrap_or(false)
+                .is_ok_and(|row| row.get::<_, bool>(0))
         },
     )
     .await;
@@ -367,7 +357,7 @@ pub async fn test_read_committed_after_commit() -> TestResult {
         .await?;
     let txn_state_after: Option<String> = msg_row_after.get(0);
 
-    println!("  After commit: txn_state = {:?}", txn_state_after);
+    println!("  After commit: txn_state = {txn_state_after:?}");
     assert!(
         txn_state_after.is_none(),
         "Message should have NULL txn_state after commit"
@@ -397,7 +387,7 @@ pub async fn test_read_committed_after_commit() -> TestResult {
             assert_eq!(msg.offset(), offset, "Should receive the committed message");
         }
         Some(Err(e)) => {
-            println!("  Poll error: {}\n", e);
+            println!("  Poll error: {e}\n");
         }
     }
 
@@ -410,7 +400,7 @@ pub async fn test_read_committed_after_commit() -> TestResult {
         .await?
         .get(0);
 
-    println!("  Final verification: {} visible message(s)", visible_count);
+    println!("  Final verification: {visible_count} visible message(s)");
     assert!(visible_count >= 1, "At least one message should be visible");
 
     println!("\nRead committed after commit test PASSED\n");
@@ -441,7 +431,7 @@ pub async fn test_reinit_aborts_in_flight_transaction() -> TestResult {
         )
         .await
         .map_err(|(e, _)| e)?;
-    println!("  Producer 1 produced pending record at offset {}", offset);
+    println!("  Producer 1 produced pending record at offset {offset}");
 
     let topic_id: i32 = client
         .query_one("SELECT id FROM kafka.topics WHERE name = $1", &[&topic])
@@ -475,7 +465,7 @@ pub async fn test_reinit_aborts_in_flight_transaction() -> TestResult {
         )
         .await?
         .get(0);
-    println!("  After re-init: txn_state = {:?}", after);
+    println!("  After re-init: txn_state = {after:?}");
     assert_eq!(
         after,
         Some("aborted".to_string()),
@@ -525,7 +515,7 @@ pub async fn test_read_committed_clamped_to_lso() -> TestResult {
         )
         .await
         .map_err(|(e, _)| e)?;
-    println!("  Producer A pending at offset {}", offset_a);
+    println!("  Producer A pending at offset {offset_a}");
 
     // Producer B: produce a higher-offset record on the same partition and COMMIT.
     let producer_b = create_transactional_producer(&txn_b)?;
@@ -542,7 +532,7 @@ pub async fn test_read_committed_clamped_to_lso() -> TestResult {
         .await
         .map_err(|(e, _)| e)?;
     producer_b.commit_transaction(Duration::from_secs(10))?;
-    println!("  Producer B committed at offset {}", offset_b);
+    println!("  Producer B committed at offset {offset_b}");
     assert!(
         offset_b > offset_a,
         "B must be at a higher offset than the pending A"
@@ -561,12 +551,11 @@ pub async fn test_read_committed_clamped_to_lso() -> TestResult {
             received.push(msg.offset());
         }
     }
-    println!("  read_committed received offsets: {:?}", received);
+    println!("  read_committed received offsets: {received:?}");
     assert!(
         received.is_empty(),
         "read_committed must not deliver a committed record >= LSO while a lower \
-         offset is pending (RV-4); got {:?}",
-        received
+         offset is pending (RV-4); got {received:?}"
     );
 
     // Clean up: abort A.

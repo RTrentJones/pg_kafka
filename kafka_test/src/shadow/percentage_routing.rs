@@ -2,6 +2,7 @@
 //!
 //! Tests for 0%, 50%, 100% routing and deterministic key-based routing.
 
+use crate::common::to_f64;
 use crate::common::{create_producer, TestResult};
 use crate::setup::TestContext;
 use rdkafka::producer::FutureRecord;
@@ -50,8 +51,8 @@ pub async fn test_zero_percent_forwarding() -> TestResult {
     let message_count = 10;
 
     for i in 0..message_count {
-        let key = format!("zero-key-{}", i);
-        let value = format!("zero-value-{}", i);
+        let key = format!("zero-key-{i}");
+        let value = format!("zero-value-{i}");
         producer
             .send(
                 FutureRecord::to(&topic)
@@ -62,7 +63,7 @@ pub async fn test_zero_percent_forwarding() -> TestResult {
             .await
             .map_err(|(e, _)| e)?;
     }
-    println!("✅ {} messages produced\n", message_count);
+    println!("✅ {message_count} messages produced\n");
 
     // 3. VERIFY
     println!("=== Verification ===\n");
@@ -114,8 +115,8 @@ pub async fn test_hundred_percent_forwarding() -> TestResult {
     let message_count = 10;
 
     for i in 0..message_count {
-        let key = format!("hundred-key-{}", i);
-        let value = format!("hundred-value-{}", i);
+        let key = format!("hundred-key-{i}");
+        let value = format!("hundred-value-{i}");
         producer
             .send(
                 FutureRecord::to(&topic)
@@ -126,7 +127,7 @@ pub async fn test_hundred_percent_forwarding() -> TestResult {
             .await
             .map_err(|(e, _)| e)?;
     }
-    println!("✅ {} messages produced\n", message_count);
+    println!("✅ {message_count} messages produced\n");
 
     // 3. VERIFY
     println!("=== Verification ===\n");
@@ -135,8 +136,7 @@ pub async fn test_hundred_percent_forwarding() -> TestResult {
     println!("Checking external Kafka...");
     assert_external_message_count(&topic, message_count, Duration::from_secs(10)).await?;
     println!(
-        "✅ All {} messages found in external Kafka (100% forwarding confirmed)\n",
-        message_count
+        "✅ All {message_count} messages found in external Kafka (100% forwarding confirmed)\n"
     );
 
     // 4. CLEANUP
@@ -181,8 +181,8 @@ pub async fn test_fifty_percent_forwarding() -> TestResult {
     let message_count = 20;
 
     for i in 0..message_count {
-        let key = format!("fifty-key-{}", i);
-        let value = format!("fifty-value-{}", i);
+        let key = format!("fifty-key-{i}");
+        let value = format!("fifty-value-{i}");
         producer
             .send(
                 FutureRecord::to(&topic)
@@ -193,7 +193,7 @@ pub async fn test_fifty_percent_forwarding() -> TestResult {
             .await
             .map_err(|(e, _)| e)?;
     }
-    println!("✅ {} messages produced\n", message_count);
+    println!("✅ {message_count} messages produced\n");
 
     // 3. VERIFY
     println!("=== Verification ===\n");
@@ -203,10 +203,7 @@ pub async fn test_fifty_percent_forwarding() -> TestResult {
     let min_expected = 8; // 40%
     let max_expected = 12; // 60%
 
-    println!(
-        "Checking external Kafka (expecting {}-{} messages)...",
-        min_expected, max_expected
-    );
+    println!("Checking external Kafka (expecting {min_expected}-{max_expected} messages)...");
     assert_external_message_count_in_range(
         &topic,
         min_expected,
@@ -216,7 +213,7 @@ pub async fn test_fifty_percent_forwarding() -> TestResult {
     .await?;
 
     let messages = consume_from_external(&topic, max_expected + 5, Duration::from_secs(5)).await?;
-    let actual_percentage = (messages.len() as f64 / message_count as f64) * 100.0;
+    let actual_percentage = (to_f64(messages.len()) / f64::from(message_count)) * 100.0;
     println!(
         "✅ Found {} messages ({:.1}%) in external Kafka\n",
         messages.len(),
@@ -266,7 +263,7 @@ pub async fn test_deterministic_routing() -> TestResult {
     let test_key = b"deterministic-same-key";
 
     for i in 0..message_count {
-        let value = format!("deterministic-value-{}", i);
+        let value = format!("deterministic-value-{i}");
         producer
             .send(
                 FutureRecord::to(&topic)
@@ -277,7 +274,7 @@ pub async fn test_deterministic_routing() -> TestResult {
             .await
             .map_err(|(e, _)| e)?;
     }
-    println!("✅ {} messages produced with same key\n", message_count);
+    println!("✅ {message_count} messages produced with same key\n");
 
     // 3. VERIFY - All messages with same key should have same routing decision
     println!("=== Verification ===\n");
@@ -287,17 +284,13 @@ pub async fn test_deterministic_routing() -> TestResult {
         consume_from_external(&topic, message_count + 5, Duration::from_secs(10)).await?;
     let external_count = messages.len();
 
-    println!(
-        "Found {} messages in external Kafka (out of {})",
-        external_count, message_count
-    );
+    println!("Found {external_count} messages in external Kafka (out of {message_count})");
 
     // With same key, all should route the same way: either 0 or message_count
     if external_count != 0 && external_count != message_count {
         return Err(format!(
-            "Expected deterministic routing (0 or {}), but got {} messages. \
-             Same key should always route the same way.",
-            message_count, external_count
+            "Expected deterministic routing (0 or {message_count}), but got {external_count} messages. \
+             Same key should always route the same way."
         )
         .into());
     }

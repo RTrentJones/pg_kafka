@@ -2,6 +2,7 @@
 //!
 //! These tests establish performance baselines and detect regressions.
 
+use crate::common::to_f64;
 use crate::common::{create_producer, create_stream_consumer, TestResult};
 use crate::fixtures::{generate_messages, TestTopicBuilder};
 use crate::setup::TestContext;
@@ -33,17 +34,17 @@ pub async fn test_produce_throughput_baseline() -> TestResult {
     let producer = create_producer()?;
     let message_count = 500;
 
-    println!("   Producing {} messages...", message_count);
+    println!("   Producing {message_count} messages...");
     let start = Instant::now();
 
     let mut success_count = 0;
     for i in 0..message_count {
-        let value = format!("throughput-message-{}", i);
+        let value = format!("throughput-message-{i}");
         let result = producer
             .send(
                 FutureRecord::to(&topic.name)
                     .payload(&value)
-                    .key(&format!("key-{}", i)),
+                    .key(&format!("key-{i}")),
                 Duration::from_secs(10),
             )
             .await;
@@ -54,11 +55,11 @@ pub async fn test_produce_throughput_baseline() -> TestResult {
     }
 
     let elapsed = start.elapsed();
-    let throughput = success_count as f64 / elapsed.as_secs_f64();
+    let throughput = f64::from(success_count) / elapsed.as_secs_f64();
 
-    println!("   Produced: {} messages", success_count);
+    println!("   Produced: {success_count} messages");
     println!("   Duration: {:.2}s", elapsed.as_secs_f64());
-    println!("   Throughput: {:.2} msgs/sec", throughput);
+    println!("   Throughput: {throughput:.2} msgs/sec");
 
     assert!(
         success_count == message_count,
@@ -68,15 +69,11 @@ pub async fn test_produce_throughput_baseline() -> TestResult {
     // A miss fails the test (DR-18), it does not just print a warning.
     if throughput < MIN_PRODUCE_THROUGHPUT {
         return Err(format!(
-            "Produce throughput regression: {:.2} msg/s is below the {:.0} msg/s floor",
-            throughput, MIN_PRODUCE_THROUGHPUT
+            "Produce throughput regression: {throughput:.2} msg/s is below the {MIN_PRODUCE_THROUGHPUT:.0} msg/s floor"
         )
         .into());
     }
-    println!(
-        "   Throughput meets baseline ({:.0} msgs/sec)",
-        MIN_PRODUCE_THROUGHPUT
-    );
+    println!("   Throughput meets baseline ({MIN_PRODUCE_THROUGHPUT:.0} msgs/sec)");
 
     ctx.cleanup().await?;
     println!("\n   Produce throughput baseline test PASSED\n");
@@ -105,7 +102,7 @@ pub async fn test_consume_throughput_baseline() -> TestResult {
     let message_count = messages.len();
     let mut consumed = 0;
 
-    println!("   Consuming {} messages...", message_count);
+    println!("   Consuming {message_count} messages...");
     let start = Instant::now();
     let timeout = Duration::from_secs(30);
 
@@ -116,11 +113,11 @@ pub async fn test_consume_throughput_baseline() -> TestResult {
     }
 
     let elapsed = start.elapsed();
-    let throughput = consumed as f64 / elapsed.as_secs_f64();
+    let throughput = to_f64(consumed) / elapsed.as_secs_f64();
 
-    println!("   Consumed: {} messages", consumed);
+    println!("   Consumed: {consumed} messages");
     println!("   Duration: {:.2}s", elapsed.as_secs_f64());
-    println!("   Throughput: {:.2} msgs/sec", throughput);
+    println!("   Throughput: {throughput:.2} msgs/sec");
 
     assert!(
         consumed >= message_count * 80 / 100,
@@ -130,15 +127,11 @@ pub async fn test_consume_throughput_baseline() -> TestResult {
     // A miss fails the test (DR-18), it does not just print a warning.
     if throughput < MIN_CONSUME_THROUGHPUT {
         return Err(format!(
-            "Consume throughput regression: {:.2} msg/s is below the {:.0} msg/s floor",
-            throughput, MIN_CONSUME_THROUGHPUT
+            "Consume throughput regression: {throughput:.2} msg/s is below the {MIN_CONSUME_THROUGHPUT:.0} msg/s floor"
         )
         .into());
     }
-    println!(
-        "   Throughput meets baseline ({:.0} msgs/sec)",
-        MIN_CONSUME_THROUGHPUT
-    );
+    println!("   Throughput meets baseline ({MIN_CONSUME_THROUGHPUT:.0} msgs/sec)");
 
     ctx.cleanup().await?;
     println!("\n   Consume throughput baseline test PASSED\n");
@@ -157,23 +150,23 @@ pub async fn test_batch_vs_single_performance() -> TestResult {
     let producer = create_producer()?;
     let message_count = 100;
 
-    println!("   Single-message mode ({} messages)...", message_count);
+    println!("   Single-message mode ({message_count} messages)...");
     let start_single = Instant::now();
 
     for i in 0..message_count {
-        let value = format!("single-{}", i);
+        let value = format!("single-{i}");
         let _ = producer
             .send(
                 FutureRecord::to(&single_topic.name)
                     .payload(&value)
-                    .key(&format!("key-{}", i)),
+                    .key(&format!("key-{i}")),
                 Duration::from_secs(10),
             )
             .await;
     }
 
     let single_elapsed = start_single.elapsed();
-    let single_throughput = message_count as f64 / single_elapsed.as_secs_f64();
+    let single_throughput = f64::from(message_count) / single_elapsed.as_secs_f64();
     println!(
         "   Single: {:.2}s ({:.2} msgs/sec)",
         single_elapsed.as_secs_f64(),
@@ -184,7 +177,7 @@ pub async fn test_batch_vs_single_performance() -> TestResult {
     let batch_topic = TestTopicBuilder::new(&ctx, "perf-batch").build().await?;
     let batch_topic_name = batch_topic.name.clone();
 
-    println!("   Batch mode ({} messages)...", message_count);
+    println!("   Batch mode ({message_count} messages)...");
     let start_batch = Instant::now();
 
     // Spawn concurrent tasks for true parallelism
@@ -193,8 +186,8 @@ pub async fn test_batch_vs_single_performance() -> TestResult {
         let topic_name = batch_topic_name.clone();
         let producer_clone = producer.clone();
         let handle = tokio::spawn(async move {
-            let value = format!("batch-{}", i);
-            let key = format!("key-{}", i);
+            let value = format!("batch-{i}");
+            let key = format!("key-{i}");
             producer_clone
                 .send(
                     FutureRecord::to(&topic_name).payload(&value).key(&key),
@@ -215,7 +208,7 @@ pub async fn test_batch_vs_single_performance() -> TestResult {
     }
 
     let batch_elapsed = start_batch.elapsed();
-    let batch_throughput = batch_success as f64 / batch_elapsed.as_secs_f64();
+    let batch_throughput = f64::from(batch_success) / batch_elapsed.as_secs_f64();
     println!(
         "   Batch:  {:.2}s ({:.2} msgs/sec, {} succeeded)",
         batch_elapsed.as_secs_f64(),
@@ -225,7 +218,7 @@ pub async fn test_batch_vs_single_performance() -> TestResult {
 
     // Calculate speedup
     let speedup = batch_throughput / single_throughput;
-    println!("   Batch speedup: {:.2}x", speedup);
+    println!("   Batch speedup: {speedup:.2}x");
 
     // DR-18: batch must not be grossly slower than sequential sends — a real
     // inversion here means pipelining/parallel dispatch broke. The 0.5x floor
@@ -233,12 +226,11 @@ pub async fn test_batch_vs_single_performance() -> TestResult {
     // failing on a genuine serialization regression.
     if speedup < 0.5 {
         return Err(format!(
-            "Batch produce regression: {:.2}x vs single (floor 0.5x) — parallel dispatch appears serialized",
-            speedup
+            "Batch produce regression: {speedup:.2}x vs single (floor 0.5x) — parallel dispatch appears serialized"
         )
         .into());
     }
-    println!("   Batch performance is acceptable ({:.2}x)", speedup);
+    println!("   Batch performance is acceptable ({speedup:.2}x)");
 
     ctx.cleanup().await?;
     println!("\n   Batch vs single performance test PASSED\n");

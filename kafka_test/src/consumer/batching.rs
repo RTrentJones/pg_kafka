@@ -1,5 +1,6 @@
 //! RecordBatch grouping of fetched records.
 
+use crate::common::to_i64;
 use crate::common::TestResult;
 use crate::error_codes;
 use crate::fixtures::topic_with_partitions as topic;
@@ -16,7 +17,7 @@ pub async fn test_fetch_groups_records_into_batches() -> TestResult {
     let mut w = Wire::connect().await?;
     for i in 0..10 {
         let values: Vec<String> = (0..10).map(|j| format!("m{}", i * 10 + j)).collect();
-        let refs: Vec<&str> = values.iter().map(|s| s.as_str()).collect();
+        let refs: Vec<&str> = values.iter().map(String::as_str).collect();
         assert_eq!(
             w.produce(&t, 0, batch(&refs, -1, -1, -1, false, None), None)
                 .await?
@@ -36,7 +37,7 @@ pub async fn test_fetch_groups_records_into_batches() -> TestResult {
     assert!(values
         .iter()
         .enumerate()
-        .all(|(i, (o, v))| *o == i as i64 && *v == format!("m{}", i)));
+        .all(|(i, (o, v))| *o == to_i64(i) && *v == format!("m{i}")));
     println!("  100 records in {} bytes (one batch)", records.len());
     // From the middle of the run.
     let pd = w.fetch(&t, 0, 37, 0).await?;

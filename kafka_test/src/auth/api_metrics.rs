@@ -19,7 +19,7 @@ async fn counts(db: &Client, api_name: &str) -> DynResult<(i64, i64)> {
             &[&api_name],
         )
         .await?;
-    Ok(row.map(|r| (r.get(0), r.get(1))).unwrap_or((0, 0)))
+    Ok(row.map_or((0, 0), |r| (r.get(0), r.get(1))))
 }
 
 /// Poll until `api_name` reaches at least `requests`/`errors` (the worker flushes at most
@@ -47,7 +47,7 @@ async fn sasl_plain(user: &str, password: &str) -> DynResult<i16> {
     let hs = roundtrip(&mut s, 1, 1, &hs).await?;
     assert_eq!(hs.error_code, 0, "handshake");
     let mut au = SaslAuthenticateRequest::default();
-    au.auth_bytes = Bytes::from(format!("\0{}\0{}", user, password).into_bytes());
+    au.auth_bytes = Bytes::from(format!("\0{user}\0{password}").into_bytes());
     Ok(roundtrip(&mut s, 2, 2, &au).await?.error_code)
 }
 
@@ -68,8 +68,8 @@ pub async fn test_auth_sasl_requests_counted_in_api_metrics() -> TestResult {
 
     let (hs, hs_err) = wait_for(&db, "SaslHandshake", hs0 + 2, 0).await?;
     let (au, au_err) = wait_for(&db, "SaslAuthenticate", au0 + 2, au_err0 + 1).await?;
-    println!("SaslHandshake requests={} errors={}", hs, hs_err);
-    println!("SaslAuthenticate requests={} errors={}", au, au_err);
+    println!("SaslHandshake requests={hs} errors={hs_err}");
+    println!("SaslAuthenticate requests={au} errors={au_err}");
     assert!(hs >= hs0 + 2, "both handshakes are counted");
     assert!(au >= au0 + 2, "both authentications are counted");
     assert!(au_err > au_err0, "the failed authentication is an error");

@@ -78,7 +78,7 @@ pub async fn test_sync_forward_skips_rolled_back_request() -> TestResult {
     .await?;
 
     // Inject a Postgres ERROR on any insert into partition 1 of this topic.
-    let function = format!("kafka.test_fail_partition_one_{}", topic_id);
+    let function = format!("kafka.test_fail_partition_one_{topic_id}");
     ctx.db()
         .batch_execute(&format!(
             "CREATE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS \
@@ -129,14 +129,10 @@ pub async fn test_sync_forward_skips_rolled_back_request() -> TestResult {
         .await?;
     let (codes, stored_after_failure, ok_code) = outcome?;
 
-    println!(
-        "   failed produce: partition codes {:?}, {} local row(s)",
-        codes, stored_after_failure
-    );
+    println!("   failed produce: partition codes {codes:?}, {stored_after_failure} local row(s)");
     assert!(
         !codes.contains(&0),
-        "no partition of the poisoned request may report success: {:?}",
-        codes
+        "no partition of the poisoned request may report success: {codes:?}"
     );
     assert_eq!(
         stored_after_failure, 0,
@@ -150,11 +146,10 @@ pub async fn test_sync_forward_skips_rolled_back_request() -> TestResult {
         .iter()
         .map(|m| String::from_utf8_lossy(m.value.as_deref().unwrap_or_default()).to_string())
         .collect();
-    println!("   external values: {:?}", values);
+    println!("   external values: {values:?}");
     assert!(
         !values.iter().any(|v| v == "rolled-back" || v == "poison"),
-        "a rolled-back record reached the external broker: {:?}",
-        values
+        "a rolled-back record reached the external broker: {values:?}"
     );
     assert_eq!(
         values,

@@ -35,8 +35,8 @@ pub async fn test_offset_commit_fetch() -> TestResult {
     let producer = create_producer()?;
 
     for i in 0..5 {
-        let value = format!("Commit test message {}", i);
-        let key = format!("commit-key-{}", i);
+        let value = format!("Commit test message {i}");
+        let key = format!("commit-key-{i}");
         producer
             .send(
                 FutureRecord::to(topic).payload(&value).key(&key),
@@ -71,7 +71,7 @@ pub async fn test_offset_commit_fetch() -> TestResult {
                 let offset = msg.offset();
                 let partition = msg.partition();
 
-                println!("   Consumed message at offset {}", offset);
+                println!("   Consumed message at offset {offset}");
 
                 // Manually commit offset after processing
                 let mut tpl = TopicPartitionList::new();
@@ -81,7 +81,7 @@ pub async fn test_offset_commit_fetch() -> TestResult {
                 println!("   ✅ Committed offset {}", offset + 1);
             }
             Some(Err(e)) => {
-                println!("⚠️  Consumer error: {}", e);
+                println!("⚠️  Consumer error: {e}");
             }
             None => {
                 if start.elapsed() > timeout {
@@ -109,7 +109,7 @@ pub async fn test_offset_commit_fetch() -> TestResult {
         .await?;
 
     let committed_offset: i64 = offset_row.get(0);
-    println!("✅ Database shows committed offset: {}", committed_offset);
+    println!("✅ Database shows committed offset: {committed_offset}");
 
     // The committed offset should be 3 (we consumed offsets 0, 1, 2 and committed up to 3)
     assert_eq!(committed_offset, 3, "Committed offset should be 3");
@@ -140,11 +140,9 @@ pub async fn test_offset_commit_fetch() -> TestResult {
                 break;
             }
             Ok(Err(e)) => {
-                println!("⚠️  Consumer error: {}", e);
+                println!("⚠️  Consumer error: {e}");
             }
-            Err(_) => {
-                continue;
-            }
+            Err(_) => {}
         }
     }
 

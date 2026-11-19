@@ -6,6 +6,7 @@
 //! - Empty vs null key handling
 //! - Partition expansion behavior
 
+use crate::common::to_i64;
 use crate::common::{create_producer, TestResult};
 use crate::setup::TestContext;
 use rdkafka::producer::FutureRecord;
@@ -24,10 +25,7 @@ pub async fn test_large_key_routing() -> TestResult {
     let num_partitions = 4i32;
 
     // 1. Create topic with multiple partitions
-    println!(
-        "Step 1: Creating topic with {} partitions...",
-        num_partitions
-    );
+    println!("Step 1: Creating topic with {num_partitions} partitions...");
     ctx.db()
         .execute(
             "INSERT INTO kafka.topics (name, partitions) VALUES ($1, $2)
@@ -35,7 +33,7 @@ pub async fn test_large_key_routing() -> TestResult {
             &[&topic, &num_partitions],
         )
         .await?;
-    println!("✅ Topic '{}' created\n", topic);
+    println!("✅ Topic '{topic}' created\n");
 
     // 2. Create a large key (100KB - large enough to test, small enough to be practical)
     println!("Step 2: Creating large key (100KB)...");
@@ -48,21 +46,18 @@ pub async fn test_large_key_routing() -> TestResult {
     let mut delivered_partitions = Vec::new();
 
     for i in 0..5 {
-        let value = format!("value-{}", i);
+        let value = format!("value-{i}");
         let record = FutureRecord::to(&topic)
             .payload(&value)
             .key(large_key.as_str());
 
         match producer.send(record, Duration::from_secs(10)).await {
             Ok((partition, offset)) => {
-                println!(
-                    "   Message {}: partition={}, offset={}",
-                    i, partition, offset
-                );
+                println!("   Message {i}: partition={partition}, offset={offset}");
                 delivered_partitions.push(partition);
             }
             Err((err, _)) => {
-                println!("   Message {} failed: {}", i, err);
+                println!("   Message {i} failed: {err}");
                 return Err(Box::new(err));
             }
         }
@@ -76,8 +71,7 @@ pub async fn test_large_key_routing() -> TestResult {
 
     assert!(
         all_same,
-        "All messages with same large key should route to same partition. Got: {:?}",
-        delivered_partitions
+        "All messages with same large key should route to same partition. Got: {delivered_partitions:?}"
     );
     println!(
         "✅ All {} messages routed to partition {}\n",
@@ -98,7 +92,7 @@ pub async fn test_large_key_routing() -> TestResult {
         .await?;
     let count: i64 = row.get(0);
     assert_eq!(count, 5, "Expected 5 messages in database");
-    println!("✅ Database confirms {} messages stored\n", count);
+    println!("✅ Database confirms {count} messages stored\n");
 
     ctx.cleanup().await?;
     println!("✅ Test: Large Key Routing PASSED\n");
@@ -144,7 +138,7 @@ pub async fn test_special_character_key_routing() -> TestResult {
         // Send same key multiple times to verify consistency
         let mut partitions = Vec::new();
         for i in 0..3 {
-            let value = format!("{}-value-{}", name, i);
+            let value = format!("{name}-value-{i}");
             let record = FutureRecord::to(&topic).payload(&value).key(*key);
 
             match producer.send(record, Duration::from_secs(5)).await {
@@ -162,12 +156,11 @@ pub async fn test_special_character_key_routing() -> TestResult {
         let consistent = partitions.iter().all(|p| *p == first);
         assert!(
             consistent,
-            "Key '{}' should consistently route to same partition",
-            name
+            "Key '{name}' should consistently route to same partition"
         );
 
         results.insert(name, first);
-        println!("   {} -> partition {}", name, first);
+        println!("   {name} -> partition {first}");
     }
     println!("✅ All special character keys route consistently\n");
 
@@ -183,9 +176,9 @@ pub async fn test_special_character_key_routing() -> TestResult {
         )
         .await?;
     let count: i64 = row.get(0);
-    let expected = (special_keys.len() * 3) as i64;
-    assert_eq!(count, expected, "Expected {} messages", expected);
-    println!("✅ Database confirms {} messages\n", count);
+    let expected = to_i64(special_keys.len() * 3);
+    assert_eq!(count, expected, "Expected {expected} messages");
+    println!("✅ Database confirms {count} messages\n");
 
     ctx.cleanup().await?;
     println!("✅ Test: Special Character Key Routing PASSED\n");
@@ -203,10 +196,7 @@ pub async fn test_empty_vs_null_key_routing() -> TestResult {
     let num_partitions = 4i32;
 
     // 1. Create topic
-    println!(
-        "Step 1: Creating topic with {} partitions...",
-        num_partitions
-    );
+    println!("Step 1: Creating topic with {num_partitions} partitions...");
     ctx.db()
         .execute(
             "INSERT INTO kafka.topics (name, partitions) VALUES ($1, $2)
@@ -222,7 +212,7 @@ pub async fn test_empty_vs_null_key_routing() -> TestResult {
 
     let mut empty_key_partitions = Vec::new();
     for i in 0..5 {
-        let value = format!("empty-key-value-{}", i);
+        let value = format!("empty-key-value-{i}");
         // Empty string key
         let record = FutureRecord::to(&topic).payload(&value).key("");
 
@@ -235,14 +225,14 @@ pub async fn test_empty_vs_null_key_routing() -> TestResult {
             }
         }
     }
-    println!("   Empty key partitions: {:?}", empty_key_partitions);
+    println!("   Empty key partitions: {empty_key_partitions:?}");
     println!("✅ Empty string key messages delivered\n");
 
     // 3. Send messages with null key (may vary with rdkafka's sticky partitioner)
     println!("Step 3: Sending messages with null key...");
     let mut null_key_partitions = Vec::new();
     for i in 0..5 {
-        let value = format!("null-key-value-{}", i);
+        let value = format!("null-key-value-{i}");
         // No key specified - null key
         let record = FutureRecord::<(), str>::to(&topic).payload(&value);
 
@@ -255,7 +245,7 @@ pub async fn test_empty_vs_null_key_routing() -> TestResult {
             }
         }
     }
-    println!("   Null key partitions: {:?}", null_key_partitions);
+    println!("   Null key partitions: {null_key_partitions:?}");
     println!("✅ Null key messages delivered\n");
 
     // 4. Verify in database that both types are stored
@@ -272,7 +262,7 @@ pub async fn test_empty_vs_null_key_routing() -> TestResult {
         )
         .await?;
     let empty_count: i64 = empty_row.get(0);
-    println!("   Messages with empty key: {}", empty_count);
+    println!("   Messages with empty key: {empty_count}");
 
     // Count messages with null key
     let null_row = ctx
@@ -285,7 +275,7 @@ pub async fn test_empty_vs_null_key_routing() -> TestResult {
         )
         .await?;
     let null_count: i64 = null_row.get(0);
-    println!("   Messages with null key: {}", null_count);
+    println!("   Messages with null key: {null_count}");
 
     assert_eq!(empty_count, 5, "Expected 5 messages with empty key");
     assert_eq!(null_count, 5, "Expected 5 messages with null key");
@@ -328,7 +318,7 @@ pub async fn test_key_routing_after_partition_expansion() -> TestResult {
         match producer.send(record, Duration::from_secs(5)).await {
             Ok((partition, _)) => {
                 initial_partitions.insert(key.to_string(), partition);
-                println!("   {} -> partition {}", key, partition);
+                println!("   {key} -> partition {partition}");
             }
             Err((err, _)) => return Err(Box::new(err)),
         }
@@ -353,7 +343,7 @@ pub async fn test_key_routing_after_partition_expansion() -> TestResult {
         match producer.send(record, Duration::from_secs(5)).await {
             Ok((partition, _)) => {
                 expanded_partitions.insert(key.to_string(), partition);
-                println!("   {} -> partition {}", key, partition);
+                println!("   {key} -> partition {partition}");
             }
             Err((err, _)) => return Err(Box::new(err)),
         }
@@ -376,7 +366,7 @@ pub async fn test_key_routing_after_partition_expansion() -> TestResult {
         count, 8,
         "Expected 8 messages (4 before + 4 after expansion)"
     );
-    println!("✅ Database confirms {} messages\n", count);
+    println!("✅ Database confirms {count} messages\n");
 
     // Note: Same key may route to different partition after expansion
     // This is expected Kafka behavior (hash % new_partition_count)
@@ -399,10 +389,7 @@ pub async fn test_key_routing_across_producers() -> TestResult {
     let num_partitions = 4i32;
 
     // 1. Create topic
-    println!(
-        "Step 1: Creating topic with {} partitions...",
-        num_partitions
-    );
+    println!("Step 1: Creating topic with {num_partitions} partitions...");
     ctx.db()
         .execute(
             "INSERT INTO kafka.topics (name, partitions) VALUES ($1, $2)
@@ -425,12 +412,12 @@ pub async fn test_key_routing_across_producers() -> TestResult {
 
     let mut partitions = Vec::new();
     for (i, producer) in [&producer1, &producer2, &producer3].iter().enumerate() {
-        let value = format!("producer-{}-value", i);
+        let value = format!("producer-{i}-value");
         let record = FutureRecord::to(&topic).payload(&value).key(test_key);
 
         match producer.send(record, Duration::from_secs(5)).await {
             Ok((partition, _)) => {
-                println!("   Producer {} -> partition {}", i, partition);
+                println!("   Producer {i} -> partition {partition}");
                 partitions.push(partition);
             }
             Err((err, _)) => return Err(Box::new(err)),
@@ -444,10 +431,9 @@ pub async fn test_key_routing_across_producers() -> TestResult {
     let consistent = partitions.iter().all(|p| *p == first);
     assert!(
         consistent,
-        "Same key from different producers should route to same partition: {:?}",
-        partitions
+        "Same key from different producers should route to same partition: {partitions:?}"
     );
-    println!("✅ All producers routed key to partition {}\n", first);
+    println!("✅ All producers routed key to partition {first}\n");
 
     // 5. Verify in database
     println!("=== Database Verification ===\n");

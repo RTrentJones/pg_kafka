@@ -1,7 +1,8 @@
 //! Building and parsing record batches (RecordBatch v2).
 
-use crate::common::DynResult as Result;
+use crate::common::{to_i32, to_i64, DynResult as Result};
 use bytes::{Buf, Bytes, BytesMut};
+use kafka_protocol::indexmap::IndexMap;
 use kafka_protocol::records::{
     Compression, Record, RecordBatchDecoder, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
 };
@@ -22,7 +23,7 @@ pub fn plain_record(offset: i64, key: Option<&str>, value: &[u8]) -> Record {
         timestamp: 0,
         key: key.map(|k| Bytes::copy_from_slice(k.as_bytes())),
         value: Some(Bytes::copy_from_slice(value)),
-        headers: Default::default(),
+        headers: IndexMap::default(),
     }
 }
 
@@ -52,10 +53,10 @@ pub fn plain_batch(values: &[Bytes], compression: Compression) -> Bytes {
 
 /// Milliseconds since the Unix epoch.
 pub fn now_ms() -> i64 {
-    SystemTime::now()
+    let since_epoch = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64
+        .expect("the clock is after 1970");
+    i64::try_from(since_epoch.as_millis()).expect("milliseconds since 1970 fit in i64")
 }
 
 /// A RecordBatch v2 of `values` (timestamps `timestamps[i]`, or now), written by
@@ -79,14 +80,14 @@ pub fn batch(
             producer_id,
             producer_epoch: epoch,
             timestamp_type: TimestampType::Creation,
-            offset: i as i64,
+            offset: to_i64(i),
             // The encoder keeps records in one batch while offset - sequence is
             // constant; the batch's base sequence is the first record's (-1 = none).
-            sequence: base_sequence.wrapping_add(i as i32),
+            sequence: base_sequence.wrapping_add(to_i32(i)),
             timestamp: timestamps.map_or(now, |t| t[i]),
             key: None,
             value: Some(Bytes::copy_from_slice(v.as_bytes())),
-            headers: Default::default(),
+            headers: IndexMap::default(),
         })
         .collect();
     encode(&records, Compression::None)
@@ -99,7 +100,8 @@ pub fn batch_headers(records: &Bytes) -> Vec<(i64, i32, i32)> {
     let mut b = records.clone();
     while b.remaining() >= 61 {
         let base = b.get_i64();
-        let len = b.get_i32() as usize;
+        // A negative length (corrupt input) takes the rest of the blob.
+        let len = usize::try_from(b.get_i32()).unwrap_or(usize::MAX);
         let body = b.copy_to_bytes(len.min(b.remaining()));
         // body: leader epoch(4) magic(1) crc(4) attributes(2) last delta(4) ...
         let last_delta = i32::from_be_bytes(body[11..15].try_into().unwrap());
@@ -117,8 +119,7 @@ pub fn fetched_values(records: &Bytes) -> Result<Vec<(i64, String)>> {
         for r in set.records {
             let v = r
                 .value
-                .map(|v| String::from_utf8_lossy(&v).into_owned())
-                .unwrap_or_default();
+                .map_or_default(|v| String::from_utf8_lossy(&v).into_owned());
             out.push((r.offset, v));
         }
     }

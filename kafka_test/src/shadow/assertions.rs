@@ -4,6 +4,7 @@
 //! including external Kafka message verification and metrics checking.
 
 use super::external_client::{consume_from_external, ExternalMessage};
+use crate::common::to_f64;
 use crate::common::TestResult;
 use std::time::Duration;
 use tokio_postgres::Client;
@@ -119,12 +120,12 @@ pub async fn assert_local_message_count(
     loop {
         let row = db
             .query_one(
-                r#"
+                r"
         SELECT COUNT(*) as count
         FROM kafka.messages m
         JOIN kafka.topics t ON m.topic_id = t.id
         WHERE t.name = $1
-        "#,
+        ",
                 &[&topic_name],
             )
             .await?;
@@ -134,8 +135,7 @@ pub async fn assert_local_message_count(
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(format!(
-                "Expected {} messages in local DB for topic '{}', found {} after polling",
-                expected_count, topic_name, count
+                "Expected {expected_count} messages in local DB for topic '{topic_name}', found {count} after polling"
             )
             .into());
         }
@@ -147,18 +147,18 @@ pub async fn assert_local_message_count(
 pub async fn assert_shadow_config_exists(db: &Client, topic_name: &str) -> TestResult {
     let row = db
         .query_opt(
-            r#"
+            r"
         SELECT sc.mode, sc.forward_percentage
         FROM kafka.shadow_config sc
         JOIN kafka.topics t ON sc.topic_id = t.id
         WHERE t.name = $1
-        "#,
+        ",
             &[&topic_name],
         )
         .await?;
 
     if row.is_none() {
-        return Err(format!("Shadow config not found for topic '{}'", topic_name).into());
+        return Err(format!("Shadow config not found for topic '{topic_name}'").into());
     }
 
     Ok(())
@@ -168,12 +168,12 @@ pub async fn assert_shadow_config_exists(db: &Client, topic_name: &str) -> TestR
 pub async fn assert_shadow_mode(db: &Client, topic_name: &str, expected_mode: &str) -> TestResult {
     let row = db
         .query_one(
-            r#"
+            r"
         SELECT sc.mode
         FROM kafka.shadow_config sc
         JOIN kafka.topics t ON sc.topic_id = t.id
         WHERE t.name = $1
-        "#,
+        ",
             &[&topic_name],
         )
         .await?;
@@ -182,8 +182,7 @@ pub async fn assert_shadow_mode(db: &Client, topic_name: &str, expected_mode: &s
 
     if mode != expected_mode {
         return Err(format!(
-            "Expected shadow mode '{}' for topic '{}', found '{}'",
-            expected_mode, topic_name, mode
+            "Expected shadow mode '{expected_mode}' for topic '{topic_name}', found '{mode}'"
         )
         .into());
     }
@@ -210,12 +209,12 @@ pub async fn verify_message_forwarded_correctly(
     // Get local message
     let local_row = db
         .query_one(
-            r#"
+            r"
         SELECT m.key, m.value
         FROM kafka.messages m
         JOIN kafka.topics t ON m.topic_id = t.id
         WHERE t.name = $1 AND m.partition_offset = $2
-        "#,
+        ",
             &[&topic_name, &partition_offset],
         )
         .await?;
@@ -232,8 +231,7 @@ pub async fn verify_message_forwarded_correctly(
 
     if !found {
         return Err(format!(
-            "Message at partition_offset {} not found in external Kafka",
-            partition_offset
+            "Message at partition_offset {partition_offset} not found in external Kafka"
         )
         .into());
     }
@@ -246,7 +244,7 @@ pub fn calculate_forward_percentage(forwarded: usize, total: usize) -> f64 {
     if total == 0 {
         0.0
     } else {
-        (forwarded as f64 / total as f64) * 100.0
+        (to_f64(forwarded) / to_f64(total)) * 100.0
     }
 }
 
@@ -263,8 +261,7 @@ pub fn assert_percentage_in_range(
 
     if actual < min || actual > max {
         return Err(format!(
-            "Expected forwarding percentage {:.1}% +/- {:.1}%, got {:.1}% ({}/{})",
-            expected_percentage, tolerance, actual, forwarded, total
+            "Expected forwarding percentage {expected_percentage:.1}% +/- {tolerance:.1}%, got {actual:.1}% ({forwarded}/{total})"
         )
         .into());
     }

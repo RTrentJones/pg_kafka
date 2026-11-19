@@ -33,12 +33,12 @@ pub async fn test_offset_boundaries() -> TestResult {
     let mut last_offset = None;
 
     for i in 0..5 {
-        let value = format!("Boundary test message {}", i);
+        let value = format!("Boundary test message {i}");
         let (partition, offset) = producer
             .send(
                 FutureRecord::to(&topic)
                     .payload(&value)
-                    .key(&format!("boundary-{}", i)),
+                    .key(&format!("boundary-{i}")),
                 Duration::from_secs(5),
             )
             .await
@@ -52,7 +52,7 @@ pub async fn test_offset_boundaries() -> TestResult {
 
     let (partition, _) = first_offset.unwrap();
     let (_, last_off) = last_offset.unwrap();
-    println!("✅ Produced messages, offsets 0..={}", last_off);
+    println!("✅ Produced messages, offsets 0..={last_off}");
 
     // 2. Test consuming from Beginning (earliest)
     println!("\nStep 2: Testing consume from Beginning (earliest)...");
@@ -94,7 +94,7 @@ pub async fn test_offset_boundaries() -> TestResult {
             );
         }
         Some(Err(e)) => {
-            println!("   ⚠️  Error: {}", e);
+            println!("   ⚠️  Error: {e}");
         }
         None => {
             println!("   No messages (correct - we're at End)");
@@ -159,10 +159,7 @@ pub async fn test_offset_boundaries() -> TestResult {
     let db_latest: i64 = boundary_row.get(1);
     let db_total: i64 = boundary_row.get(2);
 
-    println!(
-        "   Database offsets: earliest={}, latest={}, total={}",
-        db_earliest, db_latest, db_total
-    );
+    println!("   Database offsets: earliest={db_earliest}, latest={db_latest}, total={db_total}");
     println!("✅ Offset boundaries verified");
 
     ctx.cleanup().await?;

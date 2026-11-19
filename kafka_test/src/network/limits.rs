@@ -2,14 +2,29 @@
 //! idle and frame-read deadlines, the pre-auth deadline from accept, the SASL lookup
 //! rate limit and the unknown-user SCRAM fake credential.
 
-use super::*;
+use super::{
+    answers, api_versions_frame, client_config, connect_from, rdkafka_roundtrip, time_until_closed,
+    PORT,
+};
 use crate::auth::{cert_path, ensure_certificates, remove_certificates, restart_listener};
 use crate::common::create_db_client;
+use crate::common::to_i32;
+use crate::common::{DynResult, TestResult};
 use crate::setup::TestContext;
+use crate::wire::{decode_response, read_frame_within, request_frame};
+use bytes::Bytes;
 use kafka_protocol::messages::{
     SaslAuthenticateRequest, SaslAuthenticateResponse, SaslHandshakeRequest, SaslHandshakeResponse,
 };
+use kafka_protocol::protocol::StrBytes;
+use rdkafka::consumer::{BaseConsumer, Consumer};
+use rdkafka::producer::{FutureProducer, FutureRecord};
+use rdkafka::{Offset, TopicPartitionList};
+use std::net::Ipv4Addr;
 use std::process::Stdio;
+use std::time::{Duration, Instant};
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
 use tokio_postgres::Client;
 
 pub const PLAIN_PORT: u16 = 19096;
@@ -36,8 +51,7 @@ fn gucs() -> Vec<(&'static str, String)> {
         (
             "pg_kafka.additional_listeners",
             format!(
-                "PLAINTEXT://127.0.0.1:{},SASL_PLAINTEXT://127.0.0.1:{},SASL_SSL://127.0.0.1:{}",
-                PLAIN_PORT, SASL_PORT, SASL_SSL_PORT
+                "PLAINTEXT://127.0.0.1:{PLAIN_PORT},SASL_PLAINTEXT://127.0.0.1:{SASL_PORT},SASL_SSL://127.0.0.1:{SASL_SSL_PORT}"
             ),
         ),
         ("pg_kafka.ssl_cert_file", cert_path("server.pem")),
@@ -98,7 +112,7 @@ pub async fn test_network_limits_teardown() -> TestResult {
     println!("=== Test: limits teardown ===\n");
     let db = create_db_client().await?;
     for (name, _) in gucs() {
-        db.execute(&format!("ALTER SYSTEM RESET {}", name), &[])
+        db.execute(&format!("ALTER SYSTEM RESET {name}"), &[])
             .await?;
     }
     db.execute("SELECT pg_reload_conf()", &[]).await?;
@@ -113,7 +127,7 @@ async fn open_answering(src: Ipv4Addr, port: u16, n: usize) -> DynResult<Vec<Tcp
     let mut out = Vec::new();
     for i in 0..n {
         let mut s = connect_from(src, port).await?;
-        if !answers(&mut s, i as i32).await {
+        if !answers(&mut s, to_i32(i)).await {
             return Err(format!("connection {} from {} to {} not served", i + 1, src, port).into());
         }
         out.push(s);
@@ -122,9 +136,8 @@ async fn open_answering(src: Ipv4Addr, port: u16, n: usize) -> DynResult<Vec<Tcp
 }
 
 async fn rejected(src: Ipv4Addr, port: u16) -> DynResult<bool> {
-    let mut s = match connect_from(src, port).await {
-        Ok(s) => s,
-        Err(_) => return Ok(true),
+    let Ok(mut s) = connect_from(src, port).await else {
+        return Ok(true);
     };
     let _ = s.write_all(&api_versions_frame(9999)).await;
     Ok(time_until_closed(&mut s, Duration::from_secs(2))
@@ -137,7 +150,7 @@ pub async fn test_per_ip_connection_limit() -> TestResult {
     println!("=== Test: per-IP connection limit ===\n");
     let attacker = Ipv4Addr::new(127, 0, 0, 2);
     let mut conns = open_answering(attacker, PORT, MAX_PER_IP).await?;
-    println!("Step 1: {} connections from {}", MAX_PER_IP, attacker);
+    println!("Step 1: {MAX_PER_IP} connections from {attacker}");
     assert!(
         rejected(attacker, PORT).await?,
         "connection over the per-IP cap"
@@ -146,10 +159,7 @@ pub async fn test_per_ip_connection_limit() -> TestResult {
         rejected(attacker, PLAIN_PORT).await?,
         "the per-IP cap spans listeners"
     );
-    println!(
-        "✅ the next connection from {} is closed at accept",
-        attacker
-    );
+    println!("✅ the next connection from {attacker} is closed at accept");
     let mut other = connect_from(Ipv4Addr::new(127, 0, 0, 3), PORT).await?;
     assert!(answers(&mut other, 1).await, "another IP is unaffected");
     conns.pop();
@@ -210,8 +220,8 @@ pub async fn test_idle_and_frame_read_timeouts_close_connections() -> TestResult
     let t = time_until_closed(&mut idle, Duration::from_secs(10))
         .await
         .ok_or("an idle connection was never closed")?;
-    assert!(t >= low && t <= high, "idle close after {:?}", t);
-    println!("✅ idle connection closed after {:?}", t);
+    assert!(t >= low && t <= high, "idle close after {t:?}");
+    println!("✅ idle connection closed after {t:?}");
 
     // A slow sender: a 1000-byte frame, one byte every 500 ms.
     let mut slow = connect_from(Ipv4Addr::new(127, 0, 0, 6), PORT).await?;
@@ -233,10 +243,9 @@ pub async fn test_idle_and_frame_read_timeouts_close_connections() -> TestResult
     let read_high = Duration::from_millis(READ_TIMEOUT_MS + 3000);
     assert!(
         t >= read_low && t <= read_high,
-        "slow frame cut after {:?}",
-        t
+        "slow frame cut after {t:?}"
     );
-    println!("✅ slow frame cut off after {:?}", t);
+    println!("✅ slow frame cut off after {t:?}");
 
     // Real clients: records produced 5 s apart (longer than the idle timeout) all arrive.
     let ctx = TestContext::new().await?;
@@ -251,7 +260,7 @@ pub async fn test_idle_and_frame_read_timeouts_close_connections() -> TestResult
         async move {
             p.send(
                 FutureRecord::<(), _>::to(&topic)
-                    .payload(&format!("idle-{}", i))
+                    .payload(&format!("idle-{i}"))
                     .partition(0),
                 Duration::from_secs(20),
             )
@@ -277,9 +286,9 @@ pub async fn test_idle_and_frame_read_timeouts_close_connections() -> TestResult
                 // Kafka's connections.max.idle.ms does the same.
                 Some(Err(rdkafka::error::KafkaError::MessageConsumption(
                     rdkafka::types::RDKafkaErrorCode::BrokerTransportFailure,
-                ))) => {}
+                )))
+                | None => {}
                 Some(Err(e)) => return Err(e.to_string()),
-                None => {}
             }
         }
         Ok(count)
@@ -329,20 +338,19 @@ pub async fn test_pre_auth_deadline_runs_from_accept() -> TestResult {
     };
     assert!(
         t >= Duration::from_secs(9) && t <= Duration::from_secs(13),
-        "SASL_PLAINTEXT pre-auth close after {:?}",
-        t
+        "SASL_PLAINTEXT pre-auth close after {t:?}"
     );
-    println!("✅ SASL_PLAINTEXT: closed {:?} after connect", t);
+    println!("✅ SASL_PLAINTEXT: closed {t:?} after connect");
 
     // SASL_SSL through a relay that holds the client's first byte for 7 s.
     let relay = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let relay_port = relay.local_addr()?.port();
-    let mut _client = KillOnDrop(
+    let mut client = KillOnDrop(
         std::process::Command::new("openssl")
             .args([
                 "s_client",
                 "-connect",
-                &format!("127.0.0.1:{}", relay_port),
+                &format!("127.0.0.1:{relay_port}"),
                 "-quiet",
             ])
             .stdin(Stdio::piped())
@@ -350,7 +358,7 @@ pub async fn test_pre_auth_deadline_runs_from_accept() -> TestResult {
             .stderr(Stdio::null())
             .spawn()?,
     );
-    let mut stdin = _client.0.stdin.take().ok_or("no s_client stdin")?;
+    let mut stdin = client.0.stdin.take().ok_or("no s_client stdin")?;
     let (mut downstream, _) =
         tokio::time::timeout(Duration::from_secs(10), relay.accept()).await??;
     let mut upstream = connect_from(Ipv4Addr::new(127, 0, 0, 9), SASL_SSL_PORT).await?;
@@ -371,25 +379,24 @@ pub async fn test_pre_auth_deadline_runs_from_accept() -> TestResult {
     let (mut ur, mut uw) = upstream.split();
     let up = async {
         let _ = tokio::io::copy(&mut dr, &mut uw).await;
-        std::future::pending::<()>().await
+        std::future::pending::<()>().await;
     };
     let down = async {
         let _ = tokio::io::copy(&mut ur, &mut dw).await;
         accepted.elapsed()
     };
     let t = tokio::select! {
-        _ = up => unreachable!(),
+        () = up => unreachable!(),
         t = down => t,
-        _ = tokio::time::sleep(Duration::from_secs(25)) => {
+        () = tokio::time::sleep(Duration::from_secs(25)) => {
             return Err("SASL_SSL connection never closed".into());
         }
     };
     assert!(
         t >= Duration::from_secs(9) && t <= Duration::from_secs(13),
-        "SASL_SSL pre-auth close {:?} after accept (expected ~10 s, not ~17 s)",
-        t
+        "SASL_SSL pre-auth close {t:?} after accept (expected ~10 s, not ~17 s)"
     );
-    println!("✅ SASL_SSL: closed {:?} after accept (TLS took 7 s)", t);
+    println!("✅ SASL_SSL: closed {t:?} after accept (TLS took 7 s)");
 
     // A real SASL_SSL client still authenticates.
     let ctx = TestContext::new().await?;
@@ -432,7 +439,7 @@ async fn scram_first(
     let (_, r) = decode_response::<SaslHandshakeRequest>(1, &f)?;
     assert_eq!(r.error_code, 0);
     let mut auth = SaslAuthenticateRequest::default();
-    auth.auth_bytes = Bytes::from(format!("n,,n={},r=netnonce", user).into_bytes());
+    auth.auth_bytes = Bytes::from(format!("n,,n={user},r=netnonce").into_bytes());
     s.write_all(&request_frame(2, 2, &auth)).await?;
     let Some(f) = read_frame_within(s, Duration::from_secs(15)).await? else {
         return Ok(None);
@@ -449,7 +456,7 @@ fn b64decode(s: &str) -> Option<Vec<u8>> {
     let mut acc = 0u32;
     let mut bits = 0;
     for c in s.bytes() {
-        let v = match c {
+        let v = u32::from(match c {
             b'A'..=b'Z' => c - b'A',
             b'a'..=b'z' => c - b'a' + 26,
             b'0'..=b'9' => c - b'0' + 52,
@@ -457,12 +464,12 @@ fn b64decode(s: &str) -> Option<Vec<u8>> {
             b'/' => 63,
             b'=' => break,
             _ => return None,
-        } as u32;
+        });
         acc = (acc << 6) | v;
         bits += 6;
         if bits >= 8 {
             bits -= 8;
-            out.push((acc >> bits) as u8);
+            out.push(u8::try_from((acc >> bits) & 0xFF).expect("masked to 8 bits"));
             acc &= (1 << bits) - 1;
         }
     }
@@ -551,9 +558,10 @@ pub async fn test_scram_unknown_user_is_indistinguishable() -> TestResult {
 /// never happens and the connection is closed at its pre-auth deadline, unanswered.
 /// Well-behaved clients from other addresses authenticate meanwhile.
 pub async fn test_sasl_credential_lookups_are_rate_limited() -> TestResult {
+    const N: usize = 45;
+
     println!("=== Test: SASL lookup rate limit ===\n");
     let attacker = Ipv4Addr::new(127, 0, 0, 7);
-    const N: usize = 45;
     let started = Instant::now();
     let mut tasks = Vec::new();
     for i in 0..N {
@@ -561,7 +569,7 @@ pub async fn test_sasl_credential_lookups_are_rate_limited() -> TestResult {
             let mut s = connect_from(attacker, SASL_PORT)
                 .await
                 .map_err(|e| e.to_string())?;
-            let user = format!("net-ghost-{}", i);
+            let user = format!("net-ghost-{i}");
             let r = scram_first(&mut s, "SCRAM-SHA-256", &user)
                 .await
                 .map_err(|e| e.to_string())?;
@@ -584,9 +592,9 @@ pub async fn test_sasl_credential_lookups_are_rate_limited() -> TestResult {
     for t in tasks {
         let (ok, at) = t.await??;
         if ok {
-            answered.push(at)
+            answered.push(at);
         } else {
-            closed.push(at)
+            closed.push(at);
         }
     }
     answered.sort();
@@ -604,8 +612,7 @@ pub async fn test_sasl_credential_lookups_are_rate_limited() -> TestResult {
     for at in &closed {
         assert!(
             *at >= Duration::from_secs(8) && *at <= Duration::from_secs(14),
-            "refused lookups close at the pre-auth deadline, got {:?}",
-            at
+            "refused lookups close at the pre-auth deadline, got {at:?}"
         );
     }
     ctx.cleanup().await?;

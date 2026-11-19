@@ -55,7 +55,7 @@ pub async fn test_true_deduplication_manual_replay() -> TestResult {
         return Err(format!("InitProducerId failed: error_code={}", init.error_code).into());
     }
     let producer_id = init.producer_id.0;
-    println!("✅ InitProducerId returned producer_id={}\n", producer_id);
+    println!("✅ InitProducerId returned producer_id={producer_id}\n");
 
     // Step 3: Craft ProduceRequest with RecordBatch containing producer metadata
     println!("Step 3: Encoding ProduceRequest with producer metadata...");
@@ -88,28 +88,26 @@ pub async fn test_true_deduplication_manual_replay() -> TestResult {
     stream.write_all(&produce_request).await?;
     let (_, response1) = read_response::<ProduceRequest>(&mut stream, PRODUCE_VERSION).await?;
     let error_code1 = first_partition_error(&response1);
-    println!("✅ Response #1: error_code={}\n", error_code1);
+    println!("✅ Response #1: error_code={error_code1}\n");
 
     println!("Step 4b: Sending request #2 (IDENTICAL BYTES)...");
     stream.write_all(&produce_request).await?; // SAME BYTES!
     let (_, response2) = read_response::<ProduceRequest>(&mut stream, PRODUCE_VERSION).await?;
     let error_code2 = first_partition_error(&response2);
-    println!("✅ Response #2: error_code={}\n", error_code2);
+    println!("✅ Response #2: error_code={error_code2}\n");
 
     // Step 5: Verify both responses are SUCCESS (error_code=0)
     println!("=== Verifying Protocol Responses ===\n");
     assert_eq!(
         error_code1, 0,
-        "First request should succeed, got error_code={}",
-        error_code1
+        "First request should succeed, got error_code={error_code1}"
     );
     println!("✅ First request succeeded (error_code=0)");
 
     assert_eq!(
         error_code2, 0,
-        "Duplicate request should also return SUCCESS (error_code=0), got error_code={}. \
-         This is correct Kafka behavior - duplicates are ACKed, not rejected!",
-        error_code2
+        "Duplicate request should also return SUCCESS (error_code=0), got error_code={error_code2}. \
+         This is correct Kafka behavior - duplicates are ACKed, not rejected!"
     );
     println!("✅ Duplicate request succeeded (error_code=0) - Correct behavior!\n");
 
@@ -126,14 +124,13 @@ pub async fn test_true_deduplication_manual_replay() -> TestResult {
         .await?;
     let message_count: i64 = count_row.get(0);
 
-    println!("Messages in database: {}", message_count);
+    println!("Messages in database: {message_count}");
 
     // This is the CRITICAL assertion
     assert_eq!(
         message_count, 1,
-        "DEDUPLICATION FAILED! Expected 1 message, found {}. \
-         The broker should have detected the duplicate and skipped the second insert.",
-        message_count
+        "DEDUPLICATION FAILED! Expected 1 message, found {message_count}. \
+         The broker should have detected the duplicate and skipped the second insert."
     );
 
     println!("✅ Database has exactly 1 message (not 2)\n");
@@ -149,10 +146,7 @@ pub async fn test_true_deduplication_manual_replay() -> TestResult {
         .await?;
     let stored_producer_id: i64 = producer_row.get(0);
     let stored_epoch: i16 = producer_row.get(1);
-    println!(
-        "✅ Producer metadata: producer_id={}, epoch={}",
-        stored_producer_id, stored_epoch
-    );
+    println!("✅ Producer metadata: producer_id={stored_producer_id}, epoch={stored_epoch}");
 
     let seq_row = ctx
         .db()
@@ -163,7 +157,7 @@ pub async fn test_true_deduplication_manual_replay() -> TestResult {
         )
         .await?;
     let last_sequence: i32 = seq_row.get(0);
-    println!("✅ Last sequence: {}\n", last_sequence);
+    println!("✅ Last sequence: {last_sequence}\n");
 
     assert_eq!(
         last_sequence, 0,
@@ -178,7 +172,7 @@ pub async fn test_true_deduplication_manual_replay() -> TestResult {
     println!("╚════════════════════════════════════════════════════════════╝");
     println!();
     println!("Summary:");
-    println!("  ✅ InitProducerId allocated producer_id={}", producer_id);
+    println!("  ✅ InitProducerId allocated producer_id={producer_id}");
     println!("  ✅ First ProduceRequest succeeded (error_code=0)");
     println!("  ✅ Duplicate ProduceRequest succeeded (error_code=0) - Correct!");
     println!("  ✅ Database has 1 message (not 2) - Deduplication works!");

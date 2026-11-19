@@ -26,11 +26,13 @@ impl TestMessageBuilder {
         }
     }
 
+    #[must_use]
     pub fn with_key(mut self, key: impl Into<String>) -> Self {
         self.key = Some(key.into());
         self
     }
 
+    #[must_use]
     pub fn with_partition(mut self, partition: i32) -> Self {
         self.partition = Some(partition);
         self
@@ -75,8 +77,8 @@ impl TestMessage {
 pub fn generate_messages(count: usize, prefix: &str) -> Vec<TestMessage> {
     (0..count)
         .map(|i| TestMessage {
-            key: Some(format!("{}-key-{}", prefix, i)),
-            value: format!("{}-value-{}", prefix, i),
+            key: Some(format!("{prefix}-key-{i}")),
+            value: format!("{prefix}-value-{i}"),
             partition: None,
         })
         .collect()
@@ -92,8 +94,8 @@ pub fn generate_partitioned_messages(
     for p in 0..partitions {
         for i in 0..messages_per_partition {
             messages.push(TestMessage {
-                key: Some(format!("{}-p{}-key-{}", prefix, p, i)),
-                value: format!("{}-p{}-value-{}", prefix, p, i),
+                key: Some(format!("{prefix}-p{p}-key-{i}")),
+                value: format!("{prefix}-p{p}-value-{i}"),
                 partition: Some(p),
             });
         }
@@ -117,6 +119,7 @@ impl<'a> TestTopicBuilder<'a> {
         }
     }
 
+    #[must_use]
     pub fn with_partitions(mut self, partitions: i32) -> Self {
         self.partitions = partitions;
         self
@@ -211,16 +214,19 @@ impl<'a> TestConsumerBuilder<'a> {
         }
     }
 
+    #[must_use]
     pub fn with_auto_commit(mut self, enabled: bool) -> Self {
         self.auto_commit = enabled;
         self
     }
 
+    #[must_use]
     pub fn with_session_timeout(mut self, ms: u32) -> Self {
         self.session_timeout_ms = ms;
         self
     }
 
+    #[must_use]
     pub fn with_auto_offset_reset(mut self, reset: impl Into<String>) -> Self {
         self.auto_offset_reset = reset.into();
         self
@@ -279,11 +285,13 @@ impl TestProducerBuilder {
         }
     }
 
+    #[must_use]
     pub fn with_timeout(mut self, ms: u32) -> Self {
         self.timeout_ms = ms;
         self
     }
 
+    #[must_use]
     pub fn with_batching(mut self, batch_size: u32, linger_ms: u32) -> Self {
         self.batch_size = Some(batch_size);
         self.linger_ms = Some(linger_ms);

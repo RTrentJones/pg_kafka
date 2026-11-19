@@ -89,7 +89,7 @@ pub async fn test_connection_refused() -> TestResult {
 
             match result {
                 Err((kafka_error, _)) => {
-                    println!("   Expected failure occurred: {}", kafka_error);
+                    println!("   Expected failure occurred: {kafka_error}");
                 }
                 Ok(_) => {
                     // QA-3: producing to a broker that isn't listening (localhost:19999) must NOT
@@ -100,7 +100,7 @@ pub async fn test_connection_refused() -> TestResult {
         }
         Err(e) => {
             // Failing to even build the client is also an acceptable "refused" outcome.
-            println!("   Producer creation failed (expected): {}", e);
+            println!("   Producer creation failed (expected): {e}");
         }
     }
 
@@ -128,8 +128,8 @@ pub async fn test_produce_timeout() -> TestResult {
         let result = producer
             .send(
                 rdkafka::producer::FutureRecord::to(&topic.name)
-                    .payload(&format!("message-{}", i))
-                    .key(&format!("key-{}", i)),
+                    .payload(&format!("message-{i}"))
+                    .key(&format!("key-{i}")),
                 Duration::from_millis(1),
             )
             .await;
@@ -138,7 +138,7 @@ pub async fn test_produce_timeout() -> TestResult {
             Err((e, _)) => {
                 timeout_count += 1;
                 if i == 0 {
-                    println!("   Timeout error (expected): {}", e);
+                    println!("   Timeout error (expected): {e}");
                 }
             }
             Ok(_) => {
@@ -147,10 +147,7 @@ pub async fn test_produce_timeout() -> TestResult {
         }
     }
 
-    println!(
-        "   Timeouts: {}, Successes: {}",
-        timeout_count, success_count
-    );
+    println!("   Timeouts: {timeout_count}, Successes: {success_count}");
     // QA-3: a 1ms message.timeout.ms is far below the time a real produce (network + SPI insert)
     // takes, so at least one of five sends must trip the local delivery timeout. (Returning Err
     // rather than asserting keeps a failure isolated to this test instead of unwinding the suite.)
@@ -197,21 +194,18 @@ pub async fn test_invalid_group_id() -> TestResult {
     // only that the invalid configuration cannot silently behave like a valid consumer.
     let consumed_with_empty_group = match consumer_result {
         Err(e) => {
-            println!(
-                "   Consumer creation rejected empty group.id (expected): {}",
-                e
-            );
+            println!("   Consumer creation rejected empty group.id (expected): {e}");
             false
         }
         Ok(consumer) => match consumer.subscribe(&[&topic.name]) {
             Err(e) => {
-                println!("   Subscribe rejected empty group.id (expected): {}", e);
+                println!("   Subscribe rejected empty group.id (expected): {e}");
                 false
             }
-            Ok(_) => match tokio::time::timeout(Duration::from_secs(2), consumer.recv()).await {
+            Ok(()) => match tokio::time::timeout(Duration::from_secs(2), consumer.recv()).await {
                 Ok(Ok(_)) => true, // a real delivery — that's the regression we guard against
                 Ok(Err(e)) => {
-                    println!("   Recv error (expected): {}", e);
+                    println!("   Recv error (expected): {e}");
                     false
                 }
                 Err(_) => {
@@ -249,7 +243,7 @@ pub async fn test_duplicate_consumer_join() -> TestResult {
         .create()?;
 
     consumer1.subscribe(&[&topic.name])?;
-    println!("   Consumer 1 joined group: {}", group_id);
+    println!("   Consumer 1 joined group: {group_id}");
 
     // Let first consumer establish itself
     tokio::time::sleep(Duration::from_millis(500)).await;

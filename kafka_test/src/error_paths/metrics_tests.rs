@@ -19,7 +19,7 @@ async fn api_requests(ctx: &TestContext, api: &str) -> Result<i64, Box<dyn std::
             &[&api],
         )
         .await?;
-    Ok(row.map(|r| r.get::<_, i64>(0)).unwrap_or(0))
+    Ok(row.map_or(0, |r| r.get::<_, i64>(0)))
 }
 
 /// After a produce and a fetch, `kafka.api_metrics` shows the Produce and Fetch request
@@ -32,7 +32,7 @@ pub async fn test_metrics_count_produce_and_fetch() -> TestResult {
 
     let produce_before = api_requests(&ctx, "Produce").await?;
     let fetch_before = api_requests(&ctx, "Fetch").await?;
-    println!("Before: Produce={}, Fetch={}", produce_before, fetch_before);
+    println!("Before: Produce={produce_before}, Fetch={fetch_before}");
 
     println!("Step 1: produce one record...");
     let producer = create_producer()?;
@@ -70,18 +70,14 @@ pub async fn test_metrics_count_produce_and_fetch() -> TestResult {
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    println!("After: Produce={}, Fetch={}", produce_after, fetch_after);
+    println!("After: Produce={produce_after}, Fetch={fetch_after}");
     assert!(
         produce_after > produce_before,
-        "Produce request counter must increase ({} -> {})",
-        produce_before,
-        produce_after
+        "Produce request counter must increase ({produce_before} -> {produce_after})"
     );
     assert!(
         fetch_after > fetch_before,
-        "Fetch request counter must increase ({} -> {})",
-        fetch_before,
-        fetch_after
+        "Fetch request counter must increase ({fetch_before} -> {fetch_after})"
     );
 
     // Latency is recorded alongside the count.
@@ -96,15 +92,11 @@ pub async fn test_metrics_count_produce_and_fetch() -> TestResult {
     let (sum, max, errors): (i64, i64, i64) = (row.get(0), row.get(1), row.get(2));
     assert!(
         sum > 0 && max > 0,
-        "Produce latency must be recorded (sum={}, max={})",
-        sum,
-        max
+        "Produce latency must be recorded (sum={sum}, max={max})"
     );
     assert!(
         errors >= 0 && max <= sum,
-        "max ({}) cannot exceed sum ({})",
-        max,
-        sum
+        "max ({max}) cannot exceed sum ({sum})"
     );
 
     // Gauges are published with every flush; our producer/consumer connections are open.
@@ -124,16 +116,11 @@ pub async fn test_metrics_count_produce_and_fetch() -> TestResult {
     let open = get("connections_open").expect("connections_open gauge is published");
     let accepted =
         get("connections_accepted_total").expect("connections_accepted_total is published");
-    println!(
-        "Gauges: connections_open={}, connections_accepted_total={}",
-        open, accepted
-    );
+    println!("Gauges: connections_open={open}, connections_accepted_total={accepted}");
     assert!(open >= 1, "at least this test's connections are open");
     assert!(
         accepted >= open,
-        "accepted total ({}) >= open ({})",
-        accepted,
-        open
+        "accepted total ({accepted}) >= open ({open})"
     );
 
     drop(consumer);
@@ -156,7 +143,7 @@ pub async fn test_consumer_lag_view() -> TestResult {
         producer
             .send(
                 FutureRecord::<(), _>::to(&topic)
-                    .payload(&format!("lag-{}", i))
+                    .payload(&format!("lag-{i}"))
                     .partition(0),
                 Duration::from_secs(5),
             )
@@ -179,10 +166,7 @@ pub async fn test_consumer_lag_view() -> TestResult {
         )
         .await?;
     let (committed, hwm, lag): (i64, i64, Option<i64>) = (row.get(0), row.get(1), row.get(2));
-    println!(
-        "committed={}, high_watermark={}, lag={:?}",
-        committed, hwm, lag
-    );
+    println!("committed={committed}, high_watermark={hwm}, lag={lag:?}");
     assert_eq!(committed, 1);
     assert_eq!(hwm, 3);
     assert_eq!(lag, Some(2));

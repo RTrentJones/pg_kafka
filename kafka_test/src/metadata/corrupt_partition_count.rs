@@ -4,7 +4,7 @@ use crate::common::{create_db_client, TestResult};
 use crate::error_codes;
 use crate::fixtures::produce_one;
 use crate::setup::TestContext;
-use crate::wire::requests::*;
+use crate::wire::requests::{conn, metadata_raw};
 use crate::wire::roundtrip;
 use kafka_protocol::messages::metadata_request::MetadataRequest;
 
@@ -30,7 +30,7 @@ pub async fn test_metadata_survives_corrupt_partition_count() -> TestResult {
         .await?;
         let mut c = conn().await?;
         let md = metadata_raw(&mut c, &[&bad, &good]).await?;
-        println!("Metadata: {:?}", md);
+        println!("Metadata: {md:?}");
         assert_eq!(
             md[0].error_code,
             error_codes::UNKNOWN_SERVER_ERROR,

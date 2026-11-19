@@ -16,17 +16,10 @@
 pub mod hostile_clients;
 
 use crate::common::DynResult;
-use crate::wire::records::plain_batch;
-use crate::wire::requests::produce_request;
-use crate::wire::{correlation_of, decode_response, read_frame_within, request_frame};
+use crate::wire::{correlation_of, read_frame_within, request_frame};
 pub mod limits;
 
 use crate::common::TestResult;
-use bytes::Bytes;
-use kafka_protocol::messages::produce_request::ProduceRequest;
-use kafka_protocol::messages::TopicName;
-use kafka_protocol::protocol::StrBytes;
-use kafka_protocol::records::Compression;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::message::Message;
@@ -65,8 +58,8 @@ pub async fn time_until_closed(stream: &mut TcpStream, within: Duration) -> Opti
     loop {
         let left = within.checked_sub(start.elapsed())?;
         match tokio::time::timeout(left, stream.read(&mut buf)).await {
-            Ok(Ok(0)) | Ok(Err(_)) => return Some(start.elapsed()),
-            Ok(Ok(_)) => continue,
+            Ok(Ok(0) | Err(_)) => return Some(start.elapsed()),
+            Ok(Ok(_)) => {}
             Err(_) => return None,
         }
     }
@@ -102,7 +95,7 @@ pub async fn stored_rows(db: &tokio_postgres::Client, topic: &str) -> DynResult<
 /// rdkafka client config for `127.0.0.1:port`.
 pub fn client_config(port: u16) -> ClientConfig {
     let mut cfg = ClientConfig::new();
-    cfg.set("bootstrap.servers", format!("127.0.0.1:{}", port))
+    cfg.set("bootstrap.servers", format!("127.0.0.1:{port}"))
         .set("broker.address.family", "v4")
         .set("message.timeout.ms", "15000")
         .set("socket.timeout.ms", "15000");
@@ -117,13 +110,13 @@ pub async fn rdkafka_roundtrip(cfg: ClientConfig, topic: &str, n: usize) -> Test
         producer
             .send(
                 FutureRecord::to(topic)
-                    .key(&format!("k{}", i))
-                    .payload(&format!("v{}", i))
+                    .key(&format!("k{i}"))
+                    .payload(&format!("v{i}"))
                     .partition(0),
                 Duration::from_secs(20),
             )
             .await
-            .map_err(|(e, _)| format!("rdkafka produce failed: {}", e))?;
+            .map_err(|(e, _)| format!("rdkafka produce failed: {e}"))?;
     }
     let mut ccfg = cfg.clone();
     ccfg.set("group.id", format!("net-{}", uuid::Uuid::new_v4()))
@@ -143,7 +136,7 @@ pub async fn rdkafka_roundtrip(cfg: ClientConfig, topic: &str, n: usize) -> Test
                     assert!(m.payload().is_some());
                     count += 1;
                 }
-                Some(Err(e)) => return Err(format!("rdkafka consume error: {}", e)),
+                Some(Err(e)) => return Err(format!("rdkafka consume error: {e}")),
                 None => {}
             }
         }
@@ -151,7 +144,7 @@ pub async fn rdkafka_roundtrip(cfg: ClientConfig, topic: &str, n: usize) -> Test
     })
     .await??;
     if got != n {
-        return Err(format!("rdkafka consumed {} of {} records", got, n).into());
+        return Err(format!("rdkafka consumed {got} of {n} records").into());
     }
     Ok(())
 }

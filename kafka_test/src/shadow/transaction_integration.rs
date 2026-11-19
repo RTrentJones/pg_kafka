@@ -213,13 +213,13 @@ pub async fn test_committed_transaction_uses_durable_outbox() -> TestResult {
         let row = ctx
             .db()
             .query_one(
-                r#"
+                r"
                 SELECT COUNT(*) FILTER (WHERE st.external_offset IS NOT NULL) AS done,
                        COUNT(*) AS total
                 FROM kafka.shadow_tracking st
                 JOIN kafka.topics t ON t.id = st.topic_id
                 WHERE t.name = $1
-                "#,
+                ",
                 &[&topic],
             )
             .await?;
@@ -287,11 +287,11 @@ pub async fn test_committed_txn_leaves_no_orphan_outbox_rows() -> TestResult {
     let deleted = ctx
         .db()
         .execute(
-            r#"
+            r"
             DELETE FROM kafka.messages m
             USING kafka.topics t
             WHERE m.topic_id = t.id AND t.name = $1 AND m.txn_state = 'pending'
-            "#,
+            ",
             &[&topic],
         )
         .await?;
@@ -305,7 +305,7 @@ pub async fn test_committed_txn_leaves_no_orphan_outbox_rows() -> TestResult {
     let row = ctx
         .db()
         .query_one(
-            r#"
+            r"
             SELECT COUNT(*) AS orphans
             FROM kafka.shadow_tracking st
             JOIN kafka.topics t ON t.id = st.topic_id
@@ -316,15 +316,14 @@ pub async fn test_committed_txn_leaves_no_orphan_outbox_rows() -> TestResult {
                   AND m.partition_id = st.partition_id
                   AND m.partition_offset = st.local_offset
               )
-            "#,
+            ",
             &[&topic],
         )
         .await?;
     let orphans: i64 = row.get("orphans");
     assert_eq!(
         orphans, 0,
-        "commit enqueued {} orphan shadow_tracking row(s) with no backing message",
-        orphans
+        "commit enqueued {orphans} orphan shadow_tracking row(s) with no backing message"
     );
     println!("✅ No orphan outbox rows after commit\n");
 

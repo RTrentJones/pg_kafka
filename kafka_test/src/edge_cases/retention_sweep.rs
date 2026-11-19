@@ -66,10 +66,7 @@ pub async fn test_retention_sweep_reclaims_aborted_messages() -> TestResult {
         .find(|r| r.get::<_, String>(0) == "aborted_messages")
         .map(|r| r.get(1))
         .ok_or("sweep result missing aborted_messages row")?;
-    println!(
-        "  Sweep reported {} aborted message(s) deleted",
-        aborted_deleted
-    );
+    println!("  Sweep reported {aborted_deleted} aborted message(s) deleted");
     assert!(
         aborted_deleted >= 1,
         "Sweep should report at least our 1 aborted row deleted"
@@ -119,7 +116,7 @@ pub async fn test_retention_sweep_expires_old_messages() -> TestResult {
         producer
             .send(
                 FutureRecord::to(&topic)
-                    .payload(&format!("msg-{}", i))
+                    .payload(&format!("msg-{i}"))
                     .key("k"),
                 Duration::from_secs(5),
             )
@@ -184,12 +181,11 @@ pub async fn test_retention_sweep_expires_old_messages() -> TestResult {
         )
         .await?;
     let survivors: Vec<(i64, Option<String>)> = rows.iter().map(|r| (r.get(0), r.get(1))).collect();
-    println!("  Survivors: {:?}", survivors);
+    println!("  Survivors: {survivors:?}");
     assert_eq!(
         survivors.len(),
         2,
-        "Expected 2 survivors (fresh committed + aged pending), got {:?}",
-        survivors
+        "Expected 2 survivors (fresh committed + aged pending), got {survivors:?}"
     );
     assert!(
         survivors

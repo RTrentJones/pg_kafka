@@ -1,7 +1,10 @@
 //! Transaction ends wake parked read_committed fetches.
 
 use crate::common::{get_bootstrap_servers, TestResult};
-use crate::worker::*;
+use crate::worker::{
+    assign_consumer, boxed, into_test_result, quick_producer, send, session, unique,
+    wait_for_serving_listener, SendResult,
+};
 use rdkafka::config::ClientConfig;
 use rdkafka::producer::FutureProducer;
 use rdkafka::producer::Producer;
@@ -23,6 +26,23 @@ pub async fn test_transaction_end_wakes_parked_read_committed_fetch() -> TestRes
 }
 
 async fn txn_end_wakes() -> SendResult<()> {
+    async fn wait_for(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<(String, Instant, std::time::SystemTime)>,
+        want: &str,
+    ) -> SendResult<(Instant, std::time::SystemTime)> {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            if let Ok(Some((v, at, wall))) =
+                tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
+            {
+                if v == want {
+                    return Ok((at, wall));
+                }
+            }
+        }
+        Err(format!("never received {want}").into())
+    }
+
     println!("=== Test: fencing / timeout aborts wake read_committed long polls ===\n");
     let db = session().await?;
     wait_for_serving_listener(&db, None, Duration::from_secs(30)).await?;
@@ -48,22 +68,6 @@ async fn txn_end_wakes() -> SendResult<()> {
             }
         })
     };
-    async fn wait_for(
-        rx: &mut tokio::sync::mpsc::UnboundedReceiver<(String, Instant, std::time::SystemTime)>,
-        want: &str,
-    ) -> SendResult<(Instant, std::time::SystemTime)> {
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while Instant::now() < deadline {
-            if let Ok(Some((v, at, wall))) =
-                tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
-            {
-                if v == want {
-                    return Ok((at, wall));
-                }
-            }
-        }
-        Err(format!("never received {}", want).into())
-    }
     wait_for(&mut rx, "start").await?;
 
     let result: SendResult<()> = async {
@@ -89,23 +93,18 @@ async fn txn_end_wakes() -> SendResult<()> {
         let mut current = init(txn_id.clone(), None).await?;
         for round in 0..5 {
             current.begin_transaction().map_err(boxed)?;
-            send(&current, &topic, &format!("pending-{}", round)).await?;
-            let visible = format!("visible-{}", round);
+            send(&current, &topic, &format!("pending-{round}")).await?;
+            let visible = format!("visible-{round}");
             send(&plain, &topic, &visible).await?;
             tokio::time::sleep(Duration::from_millis(400)).await;
             let fenced_by = init(txn_id.clone(), None).await?;
             let after_init = Instant::now();
             let (got, _) = wait_for(&mut rx, &visible).await?;
             let latency = got.saturating_duration_since(after_init);
-            println!(
-                "  round {}: committed record after fencing in {:?}",
-                round, latency
-            );
+            println!("  round {round}: committed record after fencing in {latency:?}");
             assert!(
                 latency < Duration::from_millis(300),
-                "round {}: read_committed fetch woke {:?} after the fencing abort",
-                round,
-                latency
+                "round {round}: read_committed fetch woke {latency:?} after the fencing abort"
             );
             keep.push(std::mem::replace(&mut current, fenced_by));
         }
@@ -131,14 +130,10 @@ async fn txn_end_wakes() -> SendResult<()> {
             .map_err(boxed)?
             .as_secs_f64();
         let latency = received - aborted_at;
-        println!(
-            "  timeout abort: committed record {:.3} s after the abort",
-            latency
-        );
+        println!("  timeout abort: committed record {latency:.3} s after the abort");
         assert!(
             latency < 0.5,
-            "read_committed fetch woke {:.3} s after the timeout abort",
-            latency
+            "read_committed fetch woke {latency:.3} s after the timeout abort"
         );
         keep.push(p);
         drop(keep);

@@ -51,7 +51,7 @@ pub async fn test_api_versions_negotiation() -> TestResult {
     // Parse API versions array
     if body.len() >= 6 {
         let api_count = i32::from_be_bytes([body[2], body[3], body[4], body[5]]);
-        println!("✅ Server supports {} API keys\n", api_count);
+        println!("✅ Server supports {api_count} API keys\n");
         assert!(api_count > 0, "Server should support at least one API");
     }
 
@@ -77,10 +77,7 @@ pub async fn test_correlation_id_preserved() -> TestResult {
         stream.write_all(&request).await?;
     }
 
-    println!(
-        "Step 2: Sent 5 requests with correlation IDs: {:?}\n",
-        correlation_ids
-    );
+    println!("Step 2: Sent 5 requests with correlation IDs: {correlation_ids:?}\n");
 
     // Read all responses
     let mut received_ids = Vec::new();
@@ -90,17 +87,13 @@ pub async fn test_correlation_id_preserved() -> TestResult {
         received_ids.push(corr_id);
     }
 
-    println!(
-        "Step 3: Received responses with correlation IDs: {:?}\n",
-        received_ids
-    );
+    println!("Step 3: Received responses with correlation IDs: {received_ids:?}\n");
 
     // Verify all correlation IDs match (order may vary if pipelined)
     for expected in &correlation_ids {
         assert!(
             received_ids.contains(expected),
-            "Response for correlation ID {} not received",
-            expected
+            "Response for correlation ID {expected} not received"
         );
     }
 
@@ -130,21 +123,18 @@ pub async fn test_unknown_api_key_handling() -> TestResult {
 
     match result {
         Ok(Ok((corr_id, body))) => {
-            println!(
-                "Step 3: Received response with correlation ID: {}\n",
-                corr_id
-            );
+            println!("Step 3: Received response with correlation ID: {corr_id}\n");
 
             // Check for error code in response
             if body.len() >= 2 {
                 let error_code = i16::from_be_bytes([body[0], body[1]]);
-                println!("✅ Error code in response: {}\n", error_code);
+                println!("✅ Error code in response: {error_code}\n");
                 // UNSUPPORTED_VERSION = 35
                 assert!(error_code != 0, "Unknown API key should return an error");
             }
         }
         Ok(Err(e)) => {
-            println!("✅ Connection error (expected for unknown API): {}\n", e);
+            println!("✅ Connection error (expected for unknown API): {e}\n");
         }
         Err(_) => {
             println!("✅ Request timed out (acceptable behavior)\n");
@@ -188,11 +178,7 @@ pub async fn test_protocol_request_pipelining() -> TestResult {
         // Verify each response is valid
         if body.len() >= 2 {
             let error_code = i16::from_be_bytes([body[0], body[1]]);
-            assert_eq!(
-                error_code, 0,
-                "Pipelined request {} should succeed",
-                corr_id
-            );
+            assert_eq!(error_code, 0, "Pipelined request {corr_id} should succeed");
         }
     }
 
@@ -230,7 +216,7 @@ fn encode_fetch_v4_body(
     body.put_i32(1024 * 1024); // max_bytes (v3+)
     body.put_i8(0); // isolation_level: read_uncommitted (v4+)
     body.put_i32(1); // topics array count
-    body.put_i16(topic.len() as i16);
+    body.put_i16(i16::try_from(topic.len()).expect("a test topic name fits a Kafka string"));
     body.extend_from_slice(topic.as_bytes());
     body.put_i32(1); // partitions array count
     body.put_i32(partition);
@@ -249,6 +235,10 @@ fn encode_fetch_v4_body(
 /// 2. Pipeline an ApiVersions request behind it on the same connection
 /// 3. The fetch response must arrive FIRST (after ~max_wait_ms), then ApiVersions
 pub async fn test_response_ordering_with_long_poll() -> TestResult {
+    const FETCH_CORR: i32 = 111;
+    const API_VERSIONS_CORR: i32 = 222;
+    const MAX_WAIT_MS: i32 = 1500;
+
     println!("=== Test: Response Ordering Across Long Poll ===\n");
 
     // Create the topic with one message so the fetch targets a real partition
@@ -271,9 +261,6 @@ pub async fn test_response_ordering_with_long_poll() -> TestResult {
 
     // Fetch from offset 1 (the high watermark): no data available, so the
     // broker long-polls for max_wait_ms
-    const FETCH_CORR: i32 = 111;
-    const API_VERSIONS_CORR: i32 = 222;
-    const MAX_WAIT_MS: i32 = 1500;
 
     let fetch_body = encode_fetch_v4_body(&topic, 0, 1, MAX_WAIT_MS, 1);
     let fetch_request = raw_frame(1, 4, FETCH_CORR, &fetch_body);
@@ -293,14 +280,12 @@ pub async fn test_response_ordering_with_long_poll() -> TestResult {
         tokio::time::timeout(Duration::from_secs(10), read_raw_response(&mut stream)).await??;
 
     println!(
-        "Step 3: Responses: first corr={} after {:?}, second corr={}\n",
-        first_corr, first_elapsed, second_corr
+        "Step 3: Responses: first corr={first_corr} after {first_elapsed:?}, second corr={second_corr}\n"
     );
 
     assert_eq!(
         first_corr, FETCH_CORR,
-        "Fetch response must be written first (request order), got corr {}",
-        first_corr
+        "Fetch response must be written first (request order), got corr {first_corr}"
     );
     assert_eq!(
         second_corr, API_VERSIONS_CORR,
@@ -310,9 +295,7 @@ pub async fn test_response_ordering_with_long_poll() -> TestResult {
     // max_wait_ms), proving the ApiVersions response was held behind it
     assert!(
         first_elapsed >= Duration::from_millis(1000),
-        "Fetch should have long-polled ~{}ms, returned after {:?}",
-        MAX_WAIT_MS,
-        first_elapsed
+        "Fetch should have long-polled ~{MAX_WAIT_MS}ms, returned after {first_elapsed:?}"
     );
 
     ctx.cleanup().await?;

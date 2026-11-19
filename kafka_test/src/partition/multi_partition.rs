@@ -3,6 +3,7 @@
 //! Validates multi-partition topic support and independent
 //! offset sequences per partition.
 
+use crate::common::to_i64;
 use crate::common::{create_db_client, create_producer, TestResult};
 use rdkafka::producer::FutureRecord;
 use std::time::Duration;
@@ -22,10 +23,7 @@ pub async fn test_multi_partition_produce() -> TestResult {
     let num_partitions = 3;
 
     // 1. Create topic with multiple partitions in database
-    println!(
-        "Step 1: Creating topic with {} partitions...",
-        num_partitions
-    );
+    println!("Step 1: Creating topic with {num_partitions} partitions...");
     let db_client = create_db_client().await?;
 
     db_client
@@ -36,18 +34,15 @@ pub async fn test_multi_partition_produce() -> TestResult {
         )
         .await?;
 
-    println!(
-        "✅ Topic '{}' created with {} partitions",
-        topic, num_partitions
-    );
+    println!("✅ Topic '{topic}' created with {num_partitions} partitions");
 
     // 2. Produce messages to different partitions
     println!("\nStep 2: Producing messages to each partition...");
     let producer = create_producer()?;
 
     for partition in 0..num_partitions {
-        let key = format!("partition-{}-key", partition);
-        let value = format!("Message for partition {}", partition);
+        let key = format!("partition-{partition}-key");
+        let value = format!("Message for partition {partition}");
 
         let record = FutureRecord::to(&topic)
             .payload(&value)
@@ -56,11 +51,11 @@ pub async fn test_multi_partition_produce() -> TestResult {
 
         match producer.send(record, Duration::from_secs(5)).await {
             Ok((p, offset)) => {
-                println!("   ✅ Partition {}: delivered at offset {}", p, offset);
+                println!("   ✅ Partition {p}: delivered at offset {offset}");
                 assert_eq!(p, partition, "Message should be in requested partition");
             }
             Err((err, _)) => {
-                println!("   ❌ Partition {}: failed - {}", partition, err);
+                println!("   ❌ Partition {partition}: failed - {err}");
                 return Err(Box::new(err));
             }
         }
@@ -85,10 +80,9 @@ pub async fn test_multi_partition_produce() -> TestResult {
 
         assert!(
             count > 0,
-            "Partition {} should have at least one message",
-            partition
+            "Partition {partition} should have at least one message"
         );
-        println!("   Partition {}: {} messages", partition, count);
+        println!("   Partition {partition}: {count} messages");
     }
 
     println!("✅ All partitions have messages");
@@ -112,10 +106,7 @@ pub async fn test_multi_partition_produce() -> TestResult {
             println!("   ⚠️  Message to invalid partition succeeded (may be auto-created)");
         }
         Err((err, _)) => {
-            println!(
-                "   ✅ Invalid partition {} correctly rejected: {}",
-                invalid_partition, err
-            );
+            println!("   ✅ Invalid partition {invalid_partition} correctly rejected: {err}");
         }
     }
 
@@ -123,12 +114,12 @@ pub async fn test_multi_partition_produce() -> TestResult {
     println!("\nStep 5: Verifying independent offset sequences...");
 
     for partition in 0..num_partitions {
-        let value = format!("Second message for partition {}", partition);
+        let value = format!("Second message for partition {partition}");
         producer
             .send(
                 FutureRecord::to(&topic)
                     .payload(&value)
-                    .key(&format!("second-key-{}", partition))
+                    .key(&format!("second-key-{partition}"))
                     .partition(partition),
                 Duration::from_secs(5),
             )
@@ -151,15 +142,12 @@ pub async fn test_multi_partition_produce() -> TestResult {
 
         for (i, offset) in offsets.iter().enumerate() {
             assert_eq!(
-                *offset, i as i64,
-                "Partition {} offset {} should be {}",
-                partition, offset, i
+                *offset,
+                to_i64(i),
+                "Partition {partition} offset {offset} should be {i}"
             );
         }
-        println!(
-            "   Partition {}: offsets {:?} (sequential ✓)",
-            partition, offsets
-        );
+        println!("   Partition {partition}: offsets {offsets:?} (sequential ✓)");
     }
 
     println!("✅ Independent partition offset sequences verified");
