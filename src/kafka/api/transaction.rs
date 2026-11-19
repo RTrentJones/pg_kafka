@@ -23,7 +23,8 @@ use crate::kafka::handlers;
 use crate::kafka::messages::TxnOffsetCommitTopics;
 use crate::kafka::notifications::InternalNotification;
 
-/// InitProducerId: allocate (or re-init) a producer id and epoch.
+/// InitProducerId: allocate a producer id and epoch (an idempotent producer always gets a
+/// new id; the producer id and epoch the request presents are not read).
 pub struct InitProducerIdApi;
 
 /// InitProducerId request.
@@ -33,10 +34,6 @@ pub struct InitProducerIdRequestData {
     pub transactional_id: Option<String>,
     /// Transaction timeout (milliseconds).
     pub transaction_timeout_ms: i32,
-    /// Existing producer id when reconnecting (-1 for a new producer).
-    pub producer_id: i64,
-    /// Existing producer epoch when reconnecting (-1 for a new producer).
-    pub producer_epoch: i16,
 }
 
 impl ApiSchema for InitProducerIdApi {
@@ -69,8 +66,6 @@ impl KafkaApi for InitProducerIdApi {
         Ok(InitProducerIdRequestData {
             transactional_id: wire.transactional_id.map(|s| s.to_string()),
             transaction_timeout_ms: wire.transaction_timeout_ms,
-            producer_id: wire.producer_id.0,
-            producer_epoch: wire.producer_epoch,
         })
     }
 
