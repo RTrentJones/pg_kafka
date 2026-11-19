@@ -157,18 +157,23 @@ cargo pgrx schema pg14               # Generate SQL schema files
 - Files in `codecov.yml` ignore list are excluded (SPI-dependent code tested via E2E)
 
 **QA-1 rule — SPI/async change ⇒ E2E test (machine-enforced):**
-The SPI/async files in the `codecov.yml` `ignore:` list (`worker.rs`, `storage/postgres.rs`,
-`shadow/store.rs`, `listener.rs`) can't be seen by unit coverage, so the coverage gate
-can't protect them. The mitigation is mandatory: **every behavioural change to one of
-those files must ship a fail-before / pass-after `kafka_test/` regression test.** This is
-enforced by the `spi-e2e-guard` CI job (`.github/scripts/require-e2e-for-spi.sh`), which
-fails a PR that touches one of those files without also changing a Rust file under
-`kafka_test/src/`. The guard derives its file list from every `src/` entry in that
-`ignore:` list, so it also fires on `src/lib.rs` and `src/kafka/handler_context.rs`. For a genuinely test-neutral edit (comments/docs/renames), add the
-`no-e2e-needed` label to waive it. Do **not** add a file to the ignore list to route
-untested logic around the patch gate — prefer extracting the pure logic into a testable
-free function (see `validate_sequence` in `storage/mod.rs` and `build_producer_settings`
-in `shadow/producer.rs` for the pattern).
+Code that needs a live Postgres (SPI) or the tokio listener can't be seen by unit coverage,
+so the coverage gate can't protect it. `codecov.yml` lists these files twice over: its
+`ignore:` list holds the files that are SPI/async/generated through and through (`lib.rs`,
+`worker.rs`, `storage/postgres.rs`, `storage/postgres/roles.rs`, `shadow/store.rs`,
+`auth/credentials.rs`, `auth/users.rs`, `listener.rs`), and its `# qa1-guard:` lines hold the
+files that mix SPI calls with unit-tested logic and so stay in the coverage figures
+(`metrics.rs`, `shadow/outbox.rs`, `shadow/primary.rs`). The mitigation is mandatory:
+**every behavioural change to a file on either list must ship a fail-before / pass-after
+`kafka_test/` regression test.** The `spi-e2e-guard` CI job
+(`.github/scripts/require-e2e-for-spi.sh`, which reads both lists) fails a PR that touches
+one of them without also changing a Rust file under `kafka_test/src/`, and
+`.github/scripts/check-coverage-policy.sh` (lint job) fails when a `src/` file that calls SPI
+(`Spi::*`, `BackgroundWorker::*`, `#[pg_extern]`) is on neither list. For a genuinely
+test-neutral edit (comments/docs/renames), add the `no-e2e-needed` label to waive the guard.
+Do **not** add a file to the ignore list to route untested logic around the patch gate —
+prefer extracting the pure logic into a testable free function (see `validate_sequence` in
+`storage/mod.rs` and `build_producer_settings` in `shadow/producer.rs` for the pattern).
 
 **Single-DB-thread invariant (why the above is safe):** all handlers, the `Arc<RwLock>`
 coordinator, and the `ShadowStore` run on the *one* background-worker DB thread; only the

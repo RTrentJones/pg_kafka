@@ -9,8 +9,9 @@
 # a machine check instead of prose.
 #
 # DR-19 (DEEP-REVIEW-2026-07) hardening:
-#   - The SPI file list is DERIVED from codecov.yml's ignore section at run
-#     time, so there is one source of truth instead of a hand-synced regex.
+#   - The SPI file list is DERIVED from codecov.yml (its ignore section and its
+#     `# qa1-guard:` lines) at run time, so there is one source of truth instead
+#     of a hand-synced regex.
 #   - The satisfying change must touch a Rust source file under kafka_test/src/
 #     (touching a README or Cargo.lock under kafka_test/ no longer counts).
 #
@@ -23,9 +24,11 @@ set -euo pipefail
 
 CODECOV_YML="${CODECOV_YML:-codecov.yml}"
 
-# Extract the src/ ignore entries from codecov.yml (the SPI/async list).
-# Lines look like:   - "src/worker.rs"
-spi_files="$(grep -oE '"src/[^"]+"' "$CODECOV_YML" | tr -d '"' || true)"
+# The guarded files: the src/ entries of codecov.yml's ignore list (lines like
+#   - "src/worker.rs") plus the `# qa1-guard: "src/..."` lines (files that mix SPI with
+# unit-tested logic, so they are not ignored). Globs (src/bin/**) are pgrx-generated code.
+spi_files="$(grep -E '^[[:space:]]*(- |# qa1-guard: )"src/[^"*]+"' "$CODECOV_YML" \
+  | grep -oE '"src/[^"]+"' | tr -d '"' || true)"
 if [ -z "$spi_files" ]; then
   echo "::error::Could not derive the SPI file list from $CODECOV_YML ignore section."
   exit 1

@@ -234,23 +234,35 @@ See `codecov.yml` for configuration details.
 
 ### Intentionally Uncovered Code
 
-Some code cannot be unit tested due to pgrx/SPI dependencies. These are excluded (via the `ignore:` list in
-`codecov.yml`, mirrored here):
+Some code cannot be unit tested due to pgrx/SPI dependencies. These files are excluded via the
+`ignore:` list in `codecov.yml` (mirrored here):
 
 | File | Reason | Tested By |
 |------|--------|-----------|
 | `src/kafka/storage/postgres.rs` | SPI calls | E2E tests |
+| `src/kafka/storage/postgres/roles.rs` | Forwards every storage role to `postgres.rs` | E2E tests |
 | `src/worker.rs` | Main loop, SPI | E2E tests |
 | `src/kafka/listener.rs` | Async runtime | E2E tests |
 | `src/kafka/shadow/store.rs` | SPI (wraps `PostgresStore`) | E2E (shadow) tests |
-| `src/kafka/handler_context.rs` | Holds the `MockStore` test double | Handler unit tests |
-| `src/lib.rs` | `_PG_init` hook | E2E tests |
+| `src/kafka/auth/credentials.rs` | SELECT on `kafka.sasl_credentials` | E2E (auth) tests |
+| `src/kafka/auth/users.rs` | `#[pg_extern]` user-management functions | E2E (auth) tests |
+| `src/lib.rs` | `_PG_init` hook, SQL functions | E2E tests |
 | `src/bin/**`, `**/*_embed.rs` | pgrx-generated | N/A |
 
-**QA-1 guard:** because unit coverage cannot see these files, the `spi-e2e-guard` CI job
-(`.github/scripts/require-e2e-for-spi.sh`) fails a pull request that changes any `src/` entry in this
-list without also changing a Rust file under `kafka_test/src/`. The `no-e2e-needed` label waives it for
-test-neutral edits.
+Files that mix SPI with unit-tested logic stay in the coverage figures but are listed as
+`# qa1-guard:` lines in `codecov.yml`: `src/kafka/metrics.rs` (the SPI flush),
+`src/kafka/shadow/outbox.rs` (`SpiShadowDb`), `src/kafka/shadow/primary.rs` (`is_primary`).
+
+**QA-1 guard:** because unit coverage cannot see this code, the `spi-e2e-guard` CI job
+(`.github/scripts/require-e2e-for-spi.sh`) fails a pull request that changes a file on either
+list without also changing a Rust file under `kafka_test/src/`. The `no-e2e-needed` label waives
+it for test-neutral edits. `.github/scripts/check-coverage-policy.sh` (lint job) keeps the lists
+honest: it fails when a `src/` file calls SPI (`Spi::*`, `BackgroundWorker::*`, `#[pg_extern]`)
+without being on one of them, when a listed file does not exist, or when the guard does not fire
+for a listed file.
+
+`src/kafka/handler_context.rs` is **not** excluded any more: it never held a mock store (that is
+`src/testing/mocks.rs`), it is a plain struct the handler unit tests construct.
 
 **Note:** `src/config.rs` is **not** excluded — its parse/validation/default logic is unit-tested and
 subject to the coverage targets (it was previously listed here in error).
