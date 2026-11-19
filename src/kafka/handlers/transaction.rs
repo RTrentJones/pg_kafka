@@ -2,7 +2,8 @@
 
 use super::helpers::validate_ongoing_transaction;
 use crate::kafka::constants::{
-    ERROR_NONE, ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+    ERROR_NONE, ERROR_OPERATION_NOT_ATTEMPTED, ERROR_UNKNOWN_SERVER_ERROR,
+    ERROR_UNKNOWN_TOPIC_OR_PARTITION,
 };
 use crate::kafka::error::{KafkaError, Result};
 use crate::kafka::handler_context::HandlerContext;
@@ -51,64 +52,21 @@ pub fn handle_add_partitions_to_txn(
     // UNKNOWN_TOPIC_OR_PARTITION for a missing topic; producers create topics through
     // Metadata). If any partition is unknown, nothing is added, the transaction does
     // not begin, and the valid partitions get OPERATION_NOT_ATTEMPTED, as in Kafka.
-    let mut resolved: Vec<ResolvedTopic> = Vec::new();
-    let mut any_failed = false;
-    for (topic_name, partition_ids) in topics {
-        let topic = super::helpers::resolve_topic(store, topic_name);
-        let results = partition_ids
-            .iter()
-            .map(|&partition_id| {
-                let r = match topic {
-                    Ok(Some((topic_id, count))) if partition_id >= 0 && partition_id < count => {
-                        Ok(topic_id)
-                    }
-                    Err(code) => Err(code),
-                    _ => Err(ERROR_UNKNOWN_TOPIC_OR_PARTITION),
-                };
-                any_failed |= r.is_err();
-                (partition_id, r)
-            })
-            .collect();
-        resolved.push((topic_name.clone(), results));
-    }
-
-    let build = |resolved: &[ResolvedTopic], ok_code: i16| {
-        let mut response = AddPartitionsToTxnResponse::default();
-        response.results_by_topic_v3_and_below = resolved
-            .iter()
-            .map(|(topic_name, results)| {
-                let mut topic_result = AddPartitionsToTxnTopicResult::default();
-                topic_result.name = TopicName(StrBytes::from_string(topic_name.clone()));
-                topic_result.results_by_partition = results
-                    .iter()
-                    .map(|(partition_id, r)| {
-                        let mut p = AddPartitionsToTxnPartitionResult::default();
-                        p.partition_index = *partition_id;
-                        p.partition_error_code = match r {
-                            Ok(_) => ok_code,
-                            Err(code) => *code,
-                        };
-                        p
-                    })
-                    .collect();
-                topic_result
-            })
-            .collect();
-        response
-    };
-
+    let resolved = resolve_txn_partitions(store, topics);
+    let any_failed = resolved
+        .iter()
+        .any(|(_, results)| results.iter().any(|(_, r)| r.is_err()));
     if any_failed {
-        return Ok(build(
+        return Ok(add_partitions_response(
             &resolved,
-            crate::kafka::constants::ERROR_OPERATION_NOT_ATTEMPTED,
+            ERROR_OPERATION_NOT_ATTEMPTED,
         ));
     }
 
-    // Atomically begin or continue the transaction
-    // This handles the race condition between checking state and transitioning.
-    // On failure (fenced epoch, invalid state, ...) report the error on every
-    // requested partition: the response's top-level error_code only exists from v4,
-    // and an empty v0-3 response reads as success.
+    // Atomically begin or continue the transaction (no race between checking the state
+    // and the transition). On failure (fenced epoch, invalid state, ...) report the error
+    // on every requested partition: the response's top-level error_code only exists from
+    // v4, and an empty v0-3 response reads as success.
     if let Err(e) =
         store.begin_or_continue_transaction(transactional_id, producer_id, producer_epoch)
     {
@@ -129,7 +87,64 @@ pub fn handle_add_partitions_to_txn(
         .collect();
     store.add_txn_partitions(transactional_id, &partitions)?;
 
-    Ok(build(&resolved, ERROR_NONE))
+    Ok(add_partitions_response(&resolved, ERROR_NONE))
+}
+
+/// Each requested partition's topic id, or the error code that refuses it (a missing topic,
+/// a failed lookup, or a partition outside the topic).
+fn resolve_txn_partitions(
+    store: &dyn KafkaStore,
+    topics: &[(String, Vec<i32>)],
+) -> Vec<ResolvedTopic> {
+    topics
+        .iter()
+        .map(|(topic_name, partition_ids)| {
+            let topic = super::helpers::resolve_topic(store, topic_name);
+            let results = partition_ids
+                .iter()
+                .map(|&partition_id| {
+                    let r = match topic {
+                        Ok(Some((topic_id, count)))
+                            if partition_id >= 0 && partition_id < count =>
+                        {
+                            Ok(topic_id)
+                        }
+                        Err(code) => Err(code),
+                        _ => Err(ERROR_UNKNOWN_TOPIC_OR_PARTITION),
+                    };
+                    (partition_id, r)
+                })
+                .collect();
+            (topic_name.clone(), results)
+        })
+        .collect()
+}
+
+/// The AddPartitionsToTxn (v0-3) response for resolved partitions: `ok_code` for each
+/// resolved one, its own error code for the others.
+fn add_partitions_response(resolved: &[ResolvedTopic], ok_code: i16) -> AddPartitionsToTxnResponse {
+    let mut response = AddPartitionsToTxnResponse::default();
+    response.results_by_topic_v3_and_below = resolved
+        .iter()
+        .map(|(topic_name, results)| {
+            let mut topic_result = AddPartitionsToTxnTopicResult::default();
+            topic_result.name = TopicName(StrBytes::from_string(topic_name.clone()));
+            topic_result.results_by_partition = results
+                .iter()
+                .map(|(partition_id, r)| {
+                    let mut p = AddPartitionsToTxnPartitionResult::default();
+                    p.partition_index = *partition_id;
+                    p.partition_error_code = match r {
+                        Ok(_) => ok_code,
+                        Err(code) => *code,
+                    };
+                    p
+                })
+                .collect();
+            topic_result
+        })
+        .collect();
+    response
 }
 
 /// Handle AddOffsetsToTxn request
@@ -475,10 +490,7 @@ mod tests {
             .find(|p| p.partition_index == 0)
             .unwrap();
         assert_eq!(neg.partition_error_code, ERROR_UNKNOWN_TOPIC_OR_PARTITION);
-        assert_eq!(
-            zero.partition_error_code,
-            crate::kafka::constants::ERROR_OPERATION_NOT_ATTEMPTED
-        );
+        assert_eq!(zero.partition_error_code, ERROR_OPERATION_NOT_ATTEMPTED);
     }
 
     #[test]
