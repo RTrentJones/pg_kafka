@@ -27,7 +27,9 @@ permissions:
 jobs:
   lint:
     name: Lint & Format
-    runs-on: ubuntu-latest
+    # Pinned: on ubuntu-26.04 pgrx 0.16.1's bindgen generates incomplete PostgreSQL bindings
+    # (RelationData without rd_tableam), so nothing that links pgrx-pg-sys compiles there.
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -57,7 +59,7 @@ jobs:
 
   test:
     name: Test Suite
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: lint
     timeout-minutes: 60
     steps:
@@ -102,7 +104,7 @@ jobs:
   # The E2E runner does not depend on the PostgreSQL major: build it once.
   kafka-test-build:
     name: Build kafka_test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: lint
     timeout-minutes: 45
     steps:
@@ -131,7 +133,7 @@ jobs:
   # test-count drift check.
   e2e:
     name: E2E pg${{ matrix.pg }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [lint, kafka-test-build]
     # Cold build ~20 min + suite (~5 min measured on 4 cores, 223 functional tests including
     # listener restarts) + shadow/performance on pg14.
@@ -247,7 +249,7 @@ jobs:
   # java_checks.py, KNOWN in diff/run.py); one that passes is reported as XPASS and fails the job.
   interop:
     name: Interop (Java clients, differential vs Kafka)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: lint
     timeout-minutes: 75
     env:
@@ -308,7 +310,7 @@ jobs:
   # patched kafka-protocol fork (see deny.toml).
   security:
     name: Security Audit
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -331,7 +333,7 @@ jobs:
   # Verify Cargo.lock is up-to-date
   lockfile:
     name: Verify Lockfile
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -349,7 +351,7 @@ jobs:
   # change to one of them must ship a kafka_test E2E regression test.
   spi-e2e-guard:
     name: SPI change needs E2E test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: github.event_name == 'pull_request'
     timeout-minutes: 5
     steps:
