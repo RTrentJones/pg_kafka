@@ -4,7 +4,16 @@
 //!   cargo run --bin gen_corpus   (from fuzz/)
 
 use bytes::{BufMut, Bytes, BytesMut};
-use kafka_protocol::messages::*;
+use kafka_protocol::messages::{
+    fetch_request, produce_request, AddOffsetsToTxnRequest, AddPartitionsToTxnRequest,
+    ApiVersionsRequest, CreatePartitionsRequest, CreateTopicsRequest, DeleteGroupsRequest,
+    DeleteRecordsRequest, DeleteTopicsRequest, DescribeConfigsRequest, DescribeGroupsRequest,
+    EndTxnRequest, FetchRequest, FindCoordinatorRequest, HeartbeatRequest,
+    IncrementalAlterConfigsRequest, InitProducerIdRequest, JoinGroupRequest, LeaveGroupRequest,
+    ListGroupsRequest, ListOffsetsRequest, MetadataRequest, OffsetCommitRequest,
+    OffsetFetchRequest, ProduceRequest, RequestHeader, SaslAuthenticateRequest,
+    SaslHandshakeRequest, SyncGroupRequest, TopicName, TxnOffsetCommitRequest,
+};
 use kafka_protocol::protocol::{Encodable, Request, StrBytes};
 use kafka_protocol::records::{
     Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
@@ -32,12 +41,12 @@ fn batch(compression: Compression, n: usize) -> Bytes {
             producer_id: if i % 2 == 0 { -1 } else { 5 },
             producer_epoch: 0,
             timestamp_type: TimestampType::Creation,
-            offset: i as i64,
-            sequence: i as i32,
+            offset: i64::try_from(i).expect("seed batches are small"),
+            sequence: i32::try_from(i).expect("seed batches are small"),
             timestamp: 1_700_000_000_000,
-            key: Some(Bytes::from(format!("k{}", i))),
-            value: Some(Bytes::from(format!("value-{}", i))),
-            headers: Default::default(),
+            key: Some(Bytes::from(format!("k{i}"))),
+            value: Some(Bytes::from(format!("value-{i}"))),
+            headers: kafka_protocol::indexmap::IndexMap::default(),
         })
         .collect();
     let mut buf = BytesMut::new();
@@ -55,7 +64,7 @@ fn batch(compression: Compression, n: usize) -> Bytes {
 
 fn write(dir: &Path, name: &str, data: &[u8]) {
     std::fs::create_dir_all(dir).unwrap();
-    std::fs::write(dir.join(format!("seed-{}", name)), data).unwrap();
+    std::fs::write(dir.join(format!("seed-{name}")), data).unwrap();
 }
 
 fn main() {
@@ -148,7 +157,7 @@ fn main() {
         write(&root.join("request_decode"), name, f);
         let mut framed = Vec::with_capacity(f.len() + 5);
         framed.push(0); // chunking byte
-        framed.put_i32(f.len() as i32);
+        framed.put_i32(i32::try_from(f.len()).expect("seed frames are small"));
         framed.extend_from_slice(f);
         write(&root.join("frame_codec"), name, &framed);
     }
