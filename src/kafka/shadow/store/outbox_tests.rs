@@ -64,26 +64,26 @@ fn record(key: &[u8], value: &[u8]) -> Record {
     }
 }
 
-fn ok_ack(key: (i32, i32, i64), external_offset: i64) -> ForwardAck {
+fn ok_ack(key: RowKey, external_offset: i64) -> ForwardAck {
     ForwardAck::new(key, ForwardOutcome::Delivered(external_offset))
 }
 
-fn err_ack(key: (i32, i32, i64)) -> ForwardAck {
+fn err_ack(key: RowKey) -> ForwardAck {
     ForwardAck::new(key, ForwardOutcome::Failed("broker down".to_string()))
 }
 
-fn skipped_ack(key: (i32, i32, i64)) -> ForwardAck {
+fn skipped_ack(key: RowKey) -> ForwardAck {
     ForwardAck::new(key, ForwardOutcome::NotAttempted("fenced".to_string()))
 }
 
 /// Seed messages and pending outbox rows for `keys`.
-fn seed_rows(store: &Store, keys: &[(i32, i32, i64)]) {
+fn seed_rows(store: &Store, keys: &[RowKey]) {
     for &k in keys {
         store
             .db()
-            .add_message(k, b"k", format!("v{}", k.2).as_bytes());
+            .add_message(k, b"k", format!("v{}", k.local_offset).as_bytes());
     }
-    store.insert_outbox_rows(keys).unwrap();
+    store.db().insert_outbox_rows(keys).unwrap();
 }
 
 fn async_harness(cap: usize) -> Harness {
@@ -106,7 +106,7 @@ fn sent_records(h: &Harness) -> Vec<ForwardRecord> {
 }
 
 fn offsets(records: &[ForwardRecord]) -> Vec<i64> {
-    records.iter().map(|r| r.local_offset).collect()
+    records.iter().map(|r| r.row.local_offset).collect()
 }
 
 #[test]
@@ -118,8 +118,8 @@ fn produce_writes_one_pending_outbox_row_per_record() {
         vec![topic_config(SyncMode::Async, WriteMode::DualWrite)],
         16,
     );
-    h.store.db().add_message((T, 0, 10), b"a", b"1");
-    h.store.db().add_message((T, 0, 11), b"b", b"2");
+    h.store.db().add_message(RowKey::new(T, 0, 10), b"a", b"1");
+    h.store.db().add_message(RowKey::new(T, 0, 11), b"b", b"2");
 
     let base = h
         .store
@@ -128,7 +128,11 @@ fn produce_writes_one_pending_outbox_row_per_record() {
 
     assert_eq!(base, 10);
     for off in [10, 11] {
-        let row = h.store.db().row((T, 0, off)).expect("outbox row");
+        let row = h
+            .store
+            .db()
+            .row(RowKey::new(T, 0, off))
+            .expect("outbox row");
         assert_eq!(row.retry_count, 0);
         assert_eq!(row.external_offset, None);
         assert_eq!(row.forwarded_at, None);
@@ -148,7 +152,7 @@ fn produce_with_shadow_disabled_writes_no_outbox_row() {
         16,
     );
     h.store.db().state().enabled = false;
-    h.store.db().add_message((T, 0, 0), b"a", b"1");
+    h.store.db().add_message(RowKey::new(T, 0, 0), b"a", b"1");
 
     h.store.insert_records(T, 0, &[record(b"a", b"1")]).unwrap();
 
@@ -158,27 +162,34 @@ fn produce_with_shadow_disabled_writes_no_outbox_row() {
 #[test]
 fn outbox_row_is_only_written_for_an_existing_message() {
     let h = async_harness(16);
-    h.store.db().add_message((T, 0, 1), b"a", b"1");
+    h.store.db().add_message(RowKey::new(T, 0, 1), b"a", b"1");
 
-    h.store.insert_outbox_rows(&[(T, 0, 1), (T, 0, 2)]).unwrap();
+    h.store
+        .db()
+        .insert_outbox_rows(&[RowKey::new(T, 0, 1), RowKey::new(T, 0, 2)])
+        .unwrap();
 
-    assert!(h.store.db().row((T, 0, 1)).is_some());
-    assert!(h.store.db().row((T, 0, 2)).is_none());
+    assert!(h.store.db().row(RowKey::new(T, 0, 1)).is_some());
+    assert!(h.store.db().row(RowKey::new(T, 0, 2)).is_none());
 }
 
 #[test]
 fn duplicate_success_ack_counts_once() {
     let h = async_harness(16);
-    seed_rows(&h.store, &[(T, 0, 1)]);
+    seed_rows(&h.store, &[RowKey::new(T, 0, 1)]);
     h.store.poll_and_forward_outbox().unwrap();
 
     sent_records(&h);
-    h.acks.send(ok_ack((T, 0, 1), 9)).unwrap();
-    h.acks.send(ok_ack((T, 0, 1), 10)).unwrap();
+    h.acks.send(ok_ack(RowKey::new(T, 0, 1), 9)).unwrap();
+    h.acks.send(ok_ack(RowKey::new(T, 0, 1), 10)).unwrap();
     assert_eq!(h.store.drain_forward_acks(), 2);
 
     assert_eq!(
-        h.store.db().row((T, 0, 1)).unwrap().external_offset,
+        h.store
+            .db()
+            .row(RowKey::new(T, 0, 1))
+            .unwrap()
+            .external_offset,
         Some(9)
     );
     let m = h.store.db().state().metrics[&(T, 0)].clone();
@@ -211,7 +222,7 @@ fn commit_enqueues_the_transactions_records_read_from_messages() {
     for off in [5, 6] {
         let mut s = h.store.db().state();
         s.messages.insert(
-            (T, 0, off),
+            RowKey::new(T, 0, off),
             crate::kafka::shadow::outbox::fake::FakeMessage {
                 txn: Some((100, 0)),
                 txn_pending: true,
@@ -221,7 +232,7 @@ fn commit_enqueues_the_transactions_records_read_from_messages() {
     }
     // Another producer's pending record is not part of this commit.
     h.store.db().state().messages.insert(
-        (T, 0, 7),
+        RowKey::new(T, 0, 7),
         crate::kafka::shadow::outbox::fake::FakeMessage {
             txn: Some((200, 0)),
             txn_pending: true,
@@ -232,9 +243,9 @@ fn commit_enqueues_the_transactions_records_read_from_messages() {
     // No RAM buffer (e.g. after a worker restart): the DB read still finds them.
     h.store.commit_transaction("txn", 100, 0).unwrap();
 
-    assert!(h.store.db().row((T, 0, 5)).is_some());
-    assert!(h.store.db().row((T, 0, 6)).is_some());
-    assert!(h.store.db().row((T, 0, 7)).is_none());
+    assert!(h.store.db().row(RowKey::new(T, 0, 5)).is_some());
+    assert!(h.store.db().row(RowKey::new(T, 0, 6)).is_some());
+    assert!(h.store.db().row(RowKey::new(T, 0, 7)).is_none());
 }
 
 #[test]
@@ -248,21 +259,19 @@ fn commit_falls_back_to_the_ram_buffer_when_the_lookup_fails() {
         vec![topic_config(SyncMode::Async, WriteMode::DualWrite)],
         16,
     );
-    h.store.db().add_message((T, 0, 5), b"k", b"v");
+    h.store.db().add_message(RowKey::new(T, 0, 5), b"k", b"v");
     h.store.db().state().fail_pending_txn_lookup = true;
     h.store.pending_txn_messages.write().unwrap().insert(
         (100, 0),
         PendingTxnBuffer::from(vec![PendingForwardRecord {
-            topic_id: T,
-            partition_id: 0,
-            offset: 5,
+            row: RowKey::new(T, 0, 5),
             key: None,
         }]),
     );
 
     h.store.commit_transaction("txn", 100, 0).unwrap();
 
-    assert!(h.store.db().row((T, 0, 5)).is_some());
+    assert!(h.store.db().row(RowKey::new(T, 0, 5)).is_some());
 }
 
 #[test]
@@ -277,7 +286,7 @@ fn commit_with_shadow_disabled_enqueues_nothing() {
         16,
     );
     h.store.db().state().messages.insert(
-        (T, 0, 5),
+        RowKey::new(T, 0, 5),
         crate::kafka::shadow::outbox::fake::FakeMessage {
             txn: Some((100, 0)),
             txn_pending: true,
@@ -323,10 +332,10 @@ fn config_load_replaces_cache_and_forces_full_forwarding_for_external_primary() 
 #[test]
 fn poll_claims_due_rows_in_order_with_payload_headers_and_timestamp() {
     let h = async_harness(16);
-    seed_rows(&h.store, &[(T, 0, 2), (T, 0, 1)]);
+    seed_rows(&h.store, &[RowKey::new(T, 0, 2), RowKey::new(T, 0, 1)]);
     {
         let mut s = h.store.db().state();
-        let m = s.messages.get_mut(&(T, 0, 1)).unwrap();
+        let m = s.messages.get_mut(&RowKey::new(T, 0, 1)).unwrap();
         m.headers = vec![("h".to_string(), b"x".to_vec())];
         m.timestamp_ms = Some(1234);
     }
@@ -342,7 +351,7 @@ fn poll_claims_due_rows_in_order_with_payload_headers_and_timestamp() {
     assert!(sent[0].restart, "lowest pending row of the partition");
     assert!(!sent[1].restart);
     for off in [1, 2] {
-        let row = h.store.db().row((T, 0, off)).unwrap();
+        let row = h.store.db().row(RowKey::new(T, 0, off)).unwrap();
         assert_eq!(row.retry_count, 0, "a claim is not a failure (wave 3)");
         assert!(row.attempt_open);
         assert_eq!(row.forwarded_at, Some(0));
@@ -352,7 +361,7 @@ fn poll_claims_due_rows_in_order_with_payload_headers_and_timestamp() {
 #[test]
 fn in_flight_rows_are_never_reclaimed_and_only_real_failures_count() {
     let h = async_harness(16);
-    seed_rows(&h.store, &[(T, 0, 1), (T, 1, 2)]);
+    seed_rows(&h.store, &[RowKey::new(T, 0, 1), RowKey::new(T, 1, 2)]);
     assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 2);
     sent_records(&h);
 
@@ -361,15 +370,19 @@ fn in_flight_rows_are_never_reclaimed_and_only_real_failures_count() {
     assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 0);
 
     // Row (T,0,1) fails, (T,1,2) is delivered.
-    h.acks.send(err_ack((T, 0, 1))).unwrap();
-    h.acks.send(ok_ack((T, 1, 2), 500)).unwrap();
+    h.acks.send(err_ack(RowKey::new(T, 0, 1))).unwrap();
+    h.acks.send(ok_ack(RowKey::new(T, 1, 2), 500)).unwrap();
     assert_eq!(h.store.drain_forward_acks(), 2);
-    let failed = h.store.db().row((T, 0, 1)).unwrap();
+    let failed = h.store.db().row(RowKey::new(T, 0, 1)).unwrap();
     assert_eq!(failed.error_message.as_deref(), Some("broker down"));
     assert_eq!(failed.retry_count, 1);
     assert!(!failed.attempt_open);
     assert_eq!(
-        h.store.db().row((T, 1, 2)).unwrap().external_offset,
+        h.store
+            .db()
+            .row(RowKey::new(T, 1, 2))
+            .unwrap()
+            .external_offset,
         Some(500)
     );
 
@@ -378,32 +391,46 @@ fn in_flight_rows_are_never_reclaimed_and_only_real_failures_count() {
     h.store.db().advance_ms(101);
     assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 1);
     assert_eq!(offsets(&sent_records(&h)), vec![1]);
-    assert_eq!(h.store.db().row((T, 0, 1)).unwrap().retry_count, 1);
+    assert_eq!(
+        h.store.db().row(RowKey::new(T, 0, 1)).unwrap().retry_count,
+        1
+    );
 }
 
 #[test]
 fn a_backing_off_row_blocks_later_rows_of_its_partition_only() {
     let h = async_harness(16);
-    seed_rows(&h.store, &[(T, 0, 1), (T, 0, 2), (T, 0, 3), (T, 1, 1)]);
+    seed_rows(
+        &h.store,
+        &[
+            RowKey::new(T, 0, 1),
+            RowKey::new(T, 0, 2),
+            RowKey::new(T, 0, 3),
+            RowKey::new(T, 1, 1),
+        ],
+    );
     h.store.poll_and_forward_outbox().unwrap();
     sent_records(&h);
     // 1 fails, 2 and 3 are fenced by the forwarder, partition 1 succeeds.
     for ack in [
-        err_ack((T, 0, 1)),
-        skipped_ack((T, 0, 2)),
-        skipped_ack((T, 0, 3)),
-        ok_ack((T, 1, 1), 7),
+        err_ack(RowKey::new(T, 0, 1)),
+        skipped_ack(RowKey::new(T, 0, 2)),
+        skipped_ack(RowKey::new(T, 0, 3)),
+        ok_ack(RowKey::new(T, 1, 1), 7),
     ] {
         h.acks.send(ack).unwrap();
     }
     h.store.drain_forward_acks();
     // The fenced rows were not attempted: no retry counted.
-    assert_eq!(h.store.db().row((T, 0, 2)).unwrap().retry_count, 0);
+    assert_eq!(
+        h.store.db().row(RowKey::new(T, 0, 2)).unwrap().retry_count,
+        0
+    );
 
     // While 1 backs off, 2 and 3 must not overtake it.
-    seed_rows(&h.store, &[(T, 1, 2)]);
+    seed_rows(&h.store, &[RowKey::new(T, 1, 2)]);
     assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 1);
-    assert_eq!(sent_records(&h)[0].row_key(), (T, 1, 2));
+    assert_eq!(sent_records(&h)[0].row, RowKey::new(T, 1, 2));
 
     // After the backoff the partition resumes from 1, in order.
     h.store.db().advance_ms(101);
@@ -418,16 +445,19 @@ fn a_lost_attempt_counts_as_a_failure() {
     // The attempt stays open in the table but this worker has no in-flight
     // entry for it (worker restart): claimed again, counting one failure.
     let h = async_harness(16);
-    seed_rows(&h.store, &[(T, 0, 1)]);
+    seed_rows(&h.store, &[RowKey::new(T, 0, 1)]);
     h.store
         .db()
         .state()
         .tracking
-        .get_mut(&(T, 0, 1))
+        .get_mut(&RowKey::new(T, 0, 1))
         .unwrap()
         .attempt_open = true;
     assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 1);
-    assert_eq!(h.store.db().row((T, 0, 1)).unwrap().retry_count, 1);
+    assert_eq!(
+        h.store.db().row(RowKey::new(T, 0, 1)).unwrap().retry_count,
+        1
+    );
 }
 
 #[test]
@@ -444,7 +474,7 @@ fn failing_forward_is_dead_lettered_and_external_primary_reads_fall_back() {
     );
     let cap = 4;
     h.store.db().state().settings.max_retries = cap;
-    seed_rows(&h.store, &[(T, 0, 1), (T, 0, 2)]);
+    seed_rows(&h.store, &[RowKey::new(T, 0, 1), RowKey::new(T, 0, 2)]);
 
     // Healthy external-primary topic: local reads suppressed.
     assert!(h.store.fetch_records(T, 0, 0, 1024).unwrap().is_empty());
@@ -452,10 +482,10 @@ fn failing_forward_is_dead_lettered_and_external_primary_reads_fall_back() {
     for attempt in 1..=cap {
         h.store.poll_and_forward_outbox().unwrap();
         let sent = sent_records(&h);
-        assert_eq!(sent[0].local_offset, 1, "attempt {attempt}");
-        h.acks.send(err_ack((T, 0, 1))).unwrap();
+        assert_eq!(sent[0].row.local_offset, 1, "attempt {attempt}");
+        h.acks.send(err_ack(RowKey::new(T, 0, 1))).unwrap();
         for r in &sent[1..] {
-            h.acks.send(skipped_ack(r.row_key())).unwrap();
+            h.acks.send(skipped_ack(r.row)).unwrap();
         }
         h.store.drain_forward_acks();
         h.store.db().advance_ms(OUTBOX_MAX_BACKOFF_MS + 1);
@@ -467,10 +497,13 @@ fn failing_forward_is_dead_lettered_and_external_primary_reads_fall_back() {
     let sent = sent_records(&h);
     assert_eq!(offsets(&sent), vec![2]);
     assert!(sent[0].restart);
-    let row = h.store.db().row((T, 0, 1)).unwrap();
+    let row = h.store.db().row(RowKey::new(T, 0, 1)).unwrap();
     assert_eq!(row.retry_count as i64, cap);
     assert_eq!(row.external_offset, None);
-    assert_eq!(h.store.db().row((T, 0, 2)).unwrap().retry_count, 0);
+    assert_eq!(
+        h.store.db().row(RowKey::new(T, 0, 2)).unwrap().retry_count,
+        0
+    );
     assert_eq!(h.store.db().state().metrics[&(T, 0)].messages_failed, cap);
     assert!(h.store.topic_has_dead_letters(T));
 
@@ -485,9 +518,9 @@ fn failing_forward_is_dead_lettered_and_external_primary_reads_fall_back() {
 fn raising_the_retry_cap_revives_dead_letters() {
     let h = async_harness(16);
     h.store.db().state().settings.max_retries = 1;
-    seed_rows(&h.store, &[(T, 0, 1)]);
+    seed_rows(&h.store, &[RowKey::new(T, 0, 1)]);
     h.store.poll_and_forward_outbox().unwrap();
-    h.acks.send(err_ack((T, 0, 1))).unwrap();
+    h.acks.send(err_ack(RowKey::new(T, 0, 1))).unwrap();
     h.store.drain_forward_acks();
     h.store.db().advance_ms(OUTBOX_MAX_BACKOFF_MS + 1);
     sent_records(&h);
@@ -501,7 +534,14 @@ fn raising_the_retry_cap_revives_dead_letters() {
 fn batch_size_bounds_the_claim_and_requests_another_poll() {
     let h = async_harness(64);
     h.store.db().state().settings.batch_size = 2;
-    seed_rows(&h.store, &[(T, 0, 1), (T, 0, 2), (T, 0, 3)]);
+    seed_rows(
+        &h.store,
+        &[
+            RowKey::new(T, 0, 1),
+            RowKey::new(T, 0, 2),
+            RowKey::new(T, 0, 3),
+        ],
+    );
 
     assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 2);
     assert!(
@@ -516,14 +556,25 @@ fn batch_size_bounds_the_claim_and_requests_another_poll() {
 #[test]
 fn full_forward_channel_closes_the_attempt_without_counting_it() {
     let h = async_harness(1);
-    seed_rows(&h.store, &[(T, 0, 1), (T, 0, 2), (T, 0, 3)]);
+    seed_rows(
+        &h.store,
+        &[
+            RowKey::new(T, 0, 1),
+            RowKey::new(T, 0, 2),
+            RowKey::new(T, 0, 3),
+        ],
+    );
 
     assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 1);
-    let (topics, _, offs) = h.store.inflight.live_keys();
-    assert_eq!(topics.len(), 1, "undelivered rows must not stay in flight");
-    assert_eq!(offs, vec![1]);
+    let live = h.store.inflight.live_keys();
+    assert_eq!(
+        live.topic_ids.len(),
+        1,
+        "undelivered rows must not stay in flight"
+    );
+    assert_eq!(live.local_offsets, vec![1]);
     for off in [2, 3] {
-        let row = h.store.db().row((T, 0, off)).unwrap();
+        let row = h.store.db().row(RowKey::new(T, 0, off)).unwrap();
         assert!(!row.attempt_open);
         assert_eq!(row.retry_count, 0);
     }
@@ -531,7 +582,10 @@ fn full_forward_channel_closes_the_attempt_without_counting_it() {
     // They are due again at once.
     sent_records(&h);
     assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 1);
-    assert_eq!(h.store.db().row((T, 0, 2)).unwrap().retry_count, 0);
+    assert_eq!(
+        h.store.db().row(RowKey::new(T, 0, 2)).unwrap().retry_count,
+        0
+    );
 }
 
 #[test]
@@ -539,10 +593,10 @@ fn poll_without_forward_channel_is_a_no_op() {
     let db = InMemoryShadowDb::enabled();
     db.add_topic(T, "local", None);
     let store = ShadowStore::with_db(MockKafkaStore::new(), db);
-    seed_rows(&store, &[(T, 0, 1)]);
+    seed_rows(&store, &[RowKey::new(T, 0, 1)]);
 
     assert_eq!(store.poll_and_forward_outbox().unwrap(), 0);
-    assert!(!store.db().row((T, 0, 1)).unwrap().attempt_open);
+    assert!(!store.db().row(RowKey::new(T, 0, 1)).unwrap().attempt_open);
 }
 
 #[test]
@@ -576,12 +630,16 @@ fn skipped_records_are_counted_in_shadow_metrics() {
 fn metrics_disabled_still_finalizes_rows() {
     let h = async_harness(16);
     h.store.db().state().settings.metrics_enabled = false;
-    seed_rows(&h.store, &[(T, 0, 1)]);
+    seed_rows(&h.store, &[RowKey::new(T, 0, 1)]);
     h.store.poll_and_forward_outbox().unwrap();
-    h.acks.send(ok_ack((T, 0, 1), 3)).unwrap();
+    h.acks.send(ok_ack(RowKey::new(T, 0, 1), 3)).unwrap();
     h.store.drain_forward_acks();
     assert_eq!(
-        h.store.db().row((T, 0, 1)).unwrap().external_offset,
+        h.store
+            .db()
+            .row(RowKey::new(T, 0, 1))
+            .unwrap()
+            .external_offset,
         Some(3)
     );
     assert!(!h.store.db().state().metrics.contains_key(&(T, 0)));
@@ -609,7 +667,7 @@ fn sync_harness() -> Harness {
         vec![topic_config(SyncMode::Sync, WriteMode::DualWrite)],
         16,
     );
-    h.store.db().add_message((T, 0, 10), b"a", b"1");
+    h.store.db().add_message(RowKey::new(T, 0, 10), b"a", b"1");
     h.store.db().state().current_xid = 77;
     h
 }
@@ -623,7 +681,7 @@ fn sync_produce_forwards_nothing_before_commit() {
 
     // The outbox row is written in the request's transaction, but nothing is
     // sent while that transaction can still roll back.
-    assert!(h.store.db().row((T, 0, 10)).is_some());
+    assert!(h.store.db().row(RowKey::new(T, 0, 10)).is_some());
     assert!(h.forwards.try_recv().is_err());
     assert_eq!(h.store.sync_pending.lock().unwrap().len(), 1);
 }
@@ -638,7 +696,7 @@ fn committed_sync_rows_are_reported_per_request_and_request_a_poll() {
     h.store.db().state().committed_xids.insert(77);
 
     let holds = h.store.take_sync_holds();
-    assert_eq!(holds.get(&slot), Some(&vec![(T, 0, 10)]));
+    assert_eq!(holds.get(&slot), Some(&vec![RowKey::new(T, 0, 10)]));
     assert!(!holds.contains_key(&other));
     assert!(h.store.sync_pending.lock().unwrap().is_empty());
     assert!(h.store.outbox_tick_due(Duration::ZERO));
@@ -673,14 +731,14 @@ fn hold_goes_to_the_forwarder_or_is_released_at_once() {
     let released = std::sync::Arc::new(AtomicUsize::new(0));
     let r = released.clone();
     h.store.hold_response(
-        vec![(T, 0, 10)],
+        vec![RowKey::new(T, 0, 10)],
         HeldRelease::new(move || {
             r.fetch_add(1, Ordering::SeqCst);
         }),
     );
     match h.forwards.try_recv().unwrap() {
         ForwardRequest::Hold(hold) => {
-            assert_eq!(hold.keys, vec![(T, 0, 10)]);
+            assert_eq!(hold.keys, vec![RowKey::new(T, 0, 10)]);
             assert_eq!(hold.timeout, Duration::from_millis(5_000));
             assert_eq!(released.load(Ordering::SeqCst), 0);
             hold.release.release();
@@ -694,7 +752,7 @@ fn hold_goes_to_the_forwarder_or_is_released_at_once() {
     let store = ShadowStore::with_db(MockKafkaStore::new(), db);
     let r = released.clone();
     store.hold_response(
-        vec![(T, 0, 10)],
+        vec![RowKey::new(T, 0, 10)],
         HeldRelease::new(move || {
             r.fetch_add(1, Ordering::SeqCst);
         }),

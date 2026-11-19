@@ -16,9 +16,7 @@ use crate::testing::mocks::MockKafkaStore;
 
 fn external_only_record(topic_id: i32) -> PendingForwardRecord {
     PendingForwardRecord {
-        topic_id,
-        partition_id: 0,
-        offset: -1,
+        row: RowKey::new(topic_id, 0, -1),
         key: None,
     }
 }

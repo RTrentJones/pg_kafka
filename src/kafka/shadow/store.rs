@@ -372,19 +372,6 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
         self.db.shadow_mode_enabled()
     }
 
-    /// Decide whether to forward a message based on percentage routing.
-    ///
-    /// Delegates to the shared `routing` module so the live produce path and the
-    /// outbox poll make identical decisions.
-    fn decide_forward(
-        &self,
-        key: Option<&[u8]>,
-        offset: i64,
-        forward_percentage: u8,
-    ) -> ForwardDecision {
-        make_forward_decision(key, offset, forward_percentage)
-    }
-
     // ===== Durable forwarding outbox (SH-9, SH-7, SH-8, SH-14, SH-15) =====
 
     /// Try to hand a message to the network thread. Never blocks; gives the
@@ -400,80 +387,75 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
         }
     }
 
-    /// Insert a batch of pending `(topic_id, partition_id, local_offset)` rows
-    /// into the `kafka.shadow_tracking` outbox in the current transaction. The
-    /// shared write path for both the live produce and the txn-commit enqueue.
-    fn insert_outbox_rows(&self, rows: &[(i32, i32, i64)]) -> Result<()> {
-        self.db.insert_outbox_rows(rows)
-    }
-
-    /// Count sampled-out records in `kafka.shadow_metrics.messages_skipped`
-    /// (when `pg_kafka.shadow_metrics_enabled`) and in the in-RAM counter.
-    fn count_skipped(&self, skipped: &HashMap<(i32, i32), i64>, metrics_enabled: bool) {
-        for (&(topic_id, partition_id), &n) in skipped {
-            if n == 0 {
-                continue;
-            }
-            self.metrics.skipped.fetch_add(n as u64, Ordering::Relaxed);
-            if metrics_enabled {
-                if let Err(e) = self.db.record_skipped(topic_id, partition_id, n) {
-                    tracing::warn!("Shadow: failed to count skipped records: {:?}", e);
-                }
-            }
+    /// Count sampled-out records of one partition in
+    /// `kafka.shadow_metrics.messages_skipped` (when
+    /// `pg_kafka.shadow_metrics_enabled`) and in the in-RAM counter.
+    fn count_skipped(&self, (topic_id, partition_id): (i32, i32), n: u64, metrics_enabled: bool) {
+        if n == 0 {
+            return;
+        }
+        self.metrics.skipped.fetch_add(n, Ordering::Relaxed);
+        if !metrics_enabled {
+            return;
+        }
+        let Ok(n) = i64::try_from(n) else {
+            return;
+        };
+        if let Err(e) = self.db.record_skipped(topic_id, partition_id, n) {
+            tracing::warn!("Shadow: failed to count skipped records: {e:?}");
         }
     }
 
     /// Enqueue the records of a just-committed transaction into the durable
     /// outbox (RA-1/RA-2).
     ///
-    /// Each percentage-selected record (looked up against the current per-topic
-    /// config) gets a pending `shadow_tracking` row written inside the commit
-    /// transaction; the outbox poll then forwards it via the idempotent
-    /// producer — non-blocking, at-least-once, re-partitioned by key, and
-    /// (crucially for external-primary topics, whose local reads are suppressed)
-    /// durably retried instead of best-effort-and-dropped.
+    /// Each record the topic's current configuration selects gets a pending
+    /// `shadow_tracking` row written inside the commit transaction; the outbox
+    /// poll then forwards it like a plain produce: non-blocking, at-least-once,
+    /// re-partitioned by key, and durably retried (which matters most for
+    /// external-primary topics, whose local reads are suppressed).
     fn enqueue_committed_txn_outbox(&self, records: &[PendingForwardRecord]) {
         if records.is_empty() {
             return;
         }
         self.check_license();
 
-        let mut rows: Vec<(i32, i32, i64)> = Vec::with_capacity(records.len());
-        let mut skipped: HashMap<(i32, i32), i64> = HashMap::new();
+        let mut rows: Vec<RowKey> = Vec::with_capacity(records.len());
+        let mut skipped: HashMap<(i32, i32), u64> = HashMap::new();
         for r in records {
             // The topic may have stopped forwarding since the records were
-            // buffered (config reload); re-check at commit time.
-            let percentage = match self.topic_cache.get(r.topic_id) {
+            // buffered (config reload): decide at commit time.
+            let percentage = match self.topic_cache.get(r.row.topic_id) {
                 Some(c) if c.should_forward() => c.forward_percentage,
                 _ => continue,
             };
-            match self.decide_forward(r.key.as_deref(), r.offset, percentage) {
-                ForwardDecision::Skip => {
-                    *skipped.entry((r.topic_id, r.partition_id)).or_default() += 1;
-                }
-                ForwardDecision::Forward => rows.push((r.topic_id, r.partition_id, r.offset)),
+            match make_forward_decision(r.key.as_deref(), r.row.local_offset, percentage) {
+                ForwardDecision::Skip => *skipped.entry(r.row.partition()).or_default() += 1,
+                ForwardDecision::Forward => rows.push(r.row),
             }
         }
-        self.count_skipped(&skipped, self.db.settings().metrics_enabled);
+        let metrics_enabled = self.db.settings().metrics_enabled;
+        for (partition, n) in skipped {
+            self.count_skipped(partition, n, metrics_enabled);
+        }
 
         if rows.is_empty() {
             return;
         }
-        if let Err(e) = self.insert_outbox_rows(&rows) {
+        if let Err(e) = self.db.insert_outbox_rows(&rows) {
             tracing::warn!(
-                "Shadow: failed to enqueue {} committed txn outbox row(s): {:?}",
-                rows.len(),
-                e
+                "Shadow: failed to enqueue {} committed txn outbox row(s): {e:?}",
+                rows.len()
             );
         }
     }
 
     /// Write durable outbox rows for a freshly-produced batch (SH-9).
     ///
-    /// For each record the percentage router selects (SH-8), insert a *pending*
+    /// For each record percentage routing selects (SH-8), insert a *pending*
     /// `kafka.shadow_tracking` row in the CURRENT transaction (this runs inside
     /// the produce request's subtransaction), so the outbox is exactly
-    /// consistent with what was persisted locally. No payload is copied — it
+    /// consistent with what was persisted locally. No payload is copied: it
     /// already lives in `kafka.messages`. Sync topics also note the rows so the
     /// worker can hold the request's response until they are delivered.
     fn enqueue_outbox(
@@ -484,44 +466,32 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
         base_offset: i64,
         config: &TopicShadowConfig,
     ) {
-        let forward_percentage = config.forward_percentage;
         let settings = self.db.settings();
-
-        // License nag (rate-limited).
         self.check_license();
 
-        // SH-8: select records by percentage first (decide_forward is pure).
-        let mut selected: Vec<i64> = Vec::with_capacity(records.len());
-        let mut skipped = 0i64;
-        for (i, record) in records.iter().enumerate() {
-            let local_offset = base_offset + i as i64;
-            match self.decide_forward(record.key.as_deref(), local_offset, forward_percentage) {
+        let mut rows: Vec<RowKey> = Vec::with_capacity(records.len());
+        let mut skipped = 0u64;
+        for (local_offset, record) in (base_offset..).zip(records) {
+            match make_forward_decision(
+                record.key.as_deref(),
+                local_offset,
+                config.forward_percentage,
+            ) {
                 ForwardDecision::Skip => skipped += 1,
-                ForwardDecision::Forward => selected.push(local_offset),
+                ForwardDecision::Forward => {
+                    rows.push(RowKey::new(topic_id, partition_id, local_offset));
+                }
             }
         }
-        if skipped > 0 {
-            let mut by_partition = HashMap::new();
-            by_partition.insert((topic_id, partition_id), skipped);
-            self.count_skipped(&by_partition, settings.metrics_enabled);
-        }
+        self.count_skipped((topic_id, partition_id), skipped, settings.metrics_enabled);
 
-        if selected.is_empty() {
+        if rows.is_empty() {
             return;
         }
-
-        // SH-9: persist a pending pointer row per selected record, same txn.
-        let rows: Vec<(i32, i32, i64)> = selected
-            .iter()
-            .map(|&local_offset| (topic_id, partition_id, local_offset))
-            .collect();
-        if let Err(e) = self.insert_outbox_rows(&rows) {
+        if let Err(e) = self.db.insert_outbox_rows(&rows) {
             tracing::warn!(
-                "Shadow: failed to write {} outbox row(s) for topic_id={} partition={}: {:?}",
-                selected.len(),
-                topic_id,
-                partition_id,
-                e
+                "Shadow: failed to write {} outbox row(s) for topic_id={topic_id} partition={partition_id}: {e:?}",
+                rows.len()
             );
             return;
         }
@@ -641,32 +611,31 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
 
         let settings = self.db.settings();
         let room = MAX_INFLIGHT.saturating_sub(self.inflight.len());
-        let limit = (settings.batch_size.max(1) as usize).min(room);
+        let limit = usize::try_from(settings.batch_size.max(1))
+            .unwrap_or(usize::MAX)
+            .min(room);
         if limit == 0 {
             return Ok(0);
         }
-        let (inflight_topics, inflight_partitions, inflight_offsets) = self.inflight.live_keys();
 
         let records: Vec<ForwardRecord> = self
             .db
             .claim_due_outbox_rows(&OutboxClaim {
-                batch_limit: limit as i64,
+                batch_limit: i64::try_from(limit).unwrap_or(i64::MAX),
                 max_retries: settings.max_retries,
                 backoff_base_ms: settings.retry_backoff_ms,
                 backoff_max_ms: OUTBOX_MAX_BACKOFF_MS,
-                inflight_topics,
-                inflight_partitions,
-                inflight_offsets,
+                inflight: self.inflight.live_keys(),
             })
             .map_err(|e: KafkaError| {
-                super::error::ShadowError::DatabaseError(format!("outbox poll failed: {}", e))
+                super::error::ShadowError::DatabaseError(format!("outbox poll failed: {e}"))
             })?;
         let claimed = records.len();
 
         let mut dispatched = 0usize;
         let mut not_sent: Vec<RowKey> = Vec::new();
         for record in records {
-            let key = record.row_key();
+            let key = record.row;
             // The claim excluded in-flight rows, so this registers a fresh entry.
             self.inflight.try_begin(key);
             match self.try_send_forward(ForwardRequest::Record(record)) {
@@ -734,11 +703,11 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
         let mut not_attempted: Vec<RowKey> = Vec::new();
         for ack in acks {
             // Issue #93: the forward has resolved, so the row may be claimed again.
-            self.inflight.complete(&ack.row_key());
+            self.inflight.complete(&ack.row);
             match &ack.outcome {
-                ForwardOutcome::Delivered(x) => delivered.push((ack.row_key(), *x)),
-                ForwardOutcome::Failed(e) => failed.push((ack.row_key(), e.clone())),
-                ForwardOutcome::NotAttempted(_) => not_attempted.push(ack.row_key()),
+                ForwardOutcome::Delivered(x) => delivered.push((ack.row, *x)),
+                ForwardOutcome::Failed(e) => failed.push((ack.row, e.clone())),
+                ForwardOutcome::NotAttempted(_) => not_attempted.push(ack.row),
             }
         }
 
@@ -768,9 +737,9 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
                     crate::pg_warning!(
                         "shadow forward dead-lettered after {} failed attempts (topic_id={}, partition_id={}, local_offset={}): {} — re-queue it with kafka.replay_shadow_messages(); external-primary reads for this topic fall back to local unless pg_kafka.shadow_external_primary_strict is set",
                         settings.max_retries,
-                        key.0,
-                        key.1,
-                        key.2,
+                        key.topic_id,
+                        key.partition_id,
+                        key.local_offset,
                         msg
                     );
                 }
@@ -1101,16 +1070,13 @@ impl<S: KafkaStore, D: ShadowDb> TransactionStore for ShadowStore<S, D> {
 
         // Buffer the committed offsets so commit_transaction forwards them.
         if should_forward {
-            let pending_records: Vec<PendingForwardRecord> = records
-                .iter()
-                .enumerate()
-                .map(|(i, r)| PendingForwardRecord {
-                    topic_id,
-                    partition_id,
-                    offset: base_offset + i as i64,
-                    key: r.key.clone(),
-                })
-                .collect();
+            let pending_records =
+                (base_offset..)
+                    .zip(records)
+                    .map(|(local_offset, r)| PendingForwardRecord {
+                        row: RowKey::new(topic_id, partition_id, local_offset),
+                        key: r.key.clone(),
+                    });
 
             let key = (producer_id, producer_epoch);
             let mut pending = write_lock(&self.pending_txn_messages);

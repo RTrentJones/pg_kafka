@@ -103,10 +103,10 @@ pub(crate) struct ForwarderCore {
 impl ForwarderCore {
     /// Ordering fence check for a record about to be sent.
     pub(crate) fn admit(&mut self, record: &ForwardRecord) -> Admit {
-        let part = (record.topic_id, record.partition_id);
+        let part = record.row.partition();
         match self.fences.get(&part) {
             None => Admit::Send,
-            Some(&fence) if record.restart || record.local_offset <= fence => {
+            Some(&fence) if record.restart || record.row.local_offset <= fence => {
                 self.fences.remove(&part);
                 Admit::Send
             }
@@ -123,8 +123,11 @@ impl ForwarderCore {
     }
 
     fn fence(&mut self, key: RowKey) {
-        let fence = self.fences.entry((key.0, key.1)).or_insert(key.2);
-        *fence = (*fence).min(key.2);
+        let fence = self
+            .fences
+            .entry(key.partition())
+            .or_insert(key.local_offset);
+        *fence = (*fence).min(key.local_offset);
     }
 
     /// A producer generation was retired (rebuilt for new settings, its
@@ -476,7 +479,7 @@ async fn forward_one(
     last_error: &mut Option<String>,
     deliveries: &mut FuturesUnordered<BoxFuture<'static, Delivery>>,
 ) {
-    let key = record.row_key();
+    let key = record.row;
     let config = runtime_context.config();
     if !config.shadow_mode_enabled || config.shadow_bootstrap_servers.is_empty() {
         core.not_attempted(key, "shadow mode is not enabled or not configured");
@@ -537,23 +540,26 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn rec(p: i32, o: i64, restart: bool) -> ForwardRecord {
-        let mut r = ForwardRecord::new(1, "t".into(), p, None, None, o);
-        r.restart = restart;
-        r
+        ForwardRecord {
+            row: RowKey::new(1, p, o),
+            topic_name: "t".into(),
+            key: None,
+            value: None,
+            headers: Vec::new(),
+            timestamp_ms: None,
+            restart,
+        }
     }
 
     fn outcomes(core: &mut ForwarderCore) -> Vec<(RowKey, ForwardOutcome)> {
-        core.acks
-            .drain(..)
-            .map(|a| (a.row_key(), a.outcome))
-            .collect()
+        core.acks.drain(..).map(|a| (a.row, a.outcome)).collect()
     }
 
     #[test]
     fn failure_fences_later_records_of_the_partition_only() {
         let mut core = ForwarderCore::default();
         assert_eq!(core.admit(&rec(0, 5, false)), Admit::Send);
-        core.on_result((1, 0, 5), 1, Err("boom".into()), false);
+        core.on_result(RowKey::new(1, 0, 5), 1, Err("boom".into()), false);
         // Later record of partition 0: fenced (would overtake the retry of 5).
         assert_eq!(core.admit(&rec(0, 6, false)), Admit::Fenced);
         // Another partition is unaffected.
@@ -566,7 +572,7 @@ mod tests {
     #[test]
     fn partition_head_lifts_the_fence_after_a_dead_letter() {
         let mut core = ForwarderCore::default();
-        core.on_result((1, 0, 5), 1, Err("poison".into()), false);
+        core.on_result(RowKey::new(1, 0, 5), 1, Err("poison".into()), false);
         assert_eq!(core.admit(&rec(0, 6, false)), Admit::Fenced);
         // 5 was dead-lettered: the DB marks 6 as the partition's head.
         assert_eq!(core.admit(&rec(0, 6, true)), Admit::Send);
@@ -575,8 +581,8 @@ mod tests {
     #[test]
     fn fence_keeps_the_lowest_failed_offset() {
         let mut core = ForwarderCore::default();
-        core.on_result((1, 0, 9), 1, Err("x".into()), false);
-        core.on_result((1, 0, 7), 1, Err("x".into()), false);
+        core.on_result(RowKey::new(1, 0, 9), 1, Err("x".into()), false);
+        core.on_result(RowKey::new(1, 0, 7), 1, Err("x".into()), false);
         assert_eq!(core.admit(&rec(0, 8, false)), Admit::Fenced);
         assert_eq!(core.admit(&rec(0, 7, false)), Admit::Send);
     }
@@ -584,21 +590,21 @@ mod tests {
     #[test]
     fn only_the_first_failure_of_a_fatal_generation_counts() {
         let mut core = ForwarderCore::default();
-        core.on_result((1, 0, 1), 3, Err("root cause".into()), true);
-        core.on_result((1, 1, 1), 3, Err("fatal".into()), true);
-        core.on_result((1, 0, 2), 3, Err("fatal".into()), true);
+        core.on_result(RowKey::new(1, 0, 1), 3, Err("root cause".into()), true);
+        core.on_result(RowKey::new(1, 1, 1), 3, Err("fatal".into()), true);
+        core.on_result(RowKey::new(1, 0, 2), 3, Err("fatal".into()), true);
         let got = outcomes(&mut core);
         assert_eq!(got[0].1, ForwardOutcome::Failed("root cause".into()));
         assert!(matches!(got[1].1, ForwardOutcome::NotAttempted(_)));
         assert!(matches!(got[2].1, ForwardOutcome::NotAttempted(_)));
         // A late failure of that generation is still collateral; a new
         // producer generation counts failures again.
-        core.on_result((1, 0, 4), 3, Err("late".into()), false);
+        core.on_result(RowKey::new(1, 0, 4), 3, Err("late".into()), false);
         assert!(matches!(
             outcomes(&mut core)[0].1,
             ForwardOutcome::NotAttempted(_)
         ));
-        core.on_result((1, 0, 3), 4, Err("again".into()), false);
+        core.on_result(RowKey::new(1, 0, 3), 4, Err("again".into()), false);
         assert_eq!(
             outcomes(&mut core)[0].1,
             ForwardOutcome::Failed("again".into())
@@ -609,8 +615,8 @@ mod tests {
     fn failures_of_a_retired_generation_are_not_attempts() {
         let mut core = ForwarderCore::default();
         core.retire_generation(2);
-        core.on_result((1, 0, 1), 2, Err("purged".into()), false);
-        core.on_result((1, 0, 2), 3, Err("real".into()), false);
+        core.on_result(RowKey::new(1, 0, 1), 2, Err("purged".into()), false);
+        core.on_result(RowKey::new(1, 0, 2), 3, Err("real".into()), false);
         let got = outcomes(&mut core);
         assert!(matches!(got[0].1, ForwardOutcome::NotAttempted(_)));
         assert_eq!(got[1].1, ForwardOutcome::Failed("real".into()));
@@ -623,10 +629,10 @@ mod tests {
     #[test]
     fn success_is_acked_with_the_external_offset() {
         let mut core = ForwarderCore::default();
-        core.on_result((1, 0, 1), 1, Ok(42), false);
+        core.on_result(RowKey::new(1, 0, 1), 1, Ok(42), false);
         assert_eq!(
             outcomes(&mut core),
-            vec![((1, 0, 1), ForwardOutcome::Delivered(42))]
+            vec![(RowKey::new(1, 0, 1), ForwardOutcome::Delivered(42))]
         );
     }
 
@@ -647,15 +653,19 @@ mod tests {
         let n = Arc::new(AtomicUsize::new(0));
         let now = Instant::now();
         core.add_hold(
-            counting_hold(vec![(1, 0, 1), (1, 0, 2)], Duration::from_secs(5), &n),
+            counting_hold(
+                vec![RowKey::new(1, 0, 1), RowKey::new(1, 0, 2)],
+                Duration::from_secs(5),
+                &n,
+            ),
             now,
         );
-        core.on_result((1, 0, 1), 1, Ok(0), false);
+        core.on_result(RowKey::new(1, 0, 1), 1, Ok(0), false);
         assert_eq!(n.load(Ordering::SeqCst), 0);
         // A failure does not release it: the retry may still land in time.
-        core.on_result((1, 0, 2), 1, Err("transient".into()), false);
+        core.on_result(RowKey::new(1, 0, 2), 1, Err("transient".into()), false);
         assert_eq!(n.load(Ordering::SeqCst), 0);
-        core.on_result((1, 0, 2), 1, Ok(1), false);
+        core.on_result(RowKey::new(1, 0, 2), 1, Ok(1), false);
         assert_eq!(n.load(Ordering::SeqCst), 1);
         assert_eq!(core.held(), 0);
     }
@@ -666,14 +676,14 @@ mod tests {
         let n = Arc::new(AtomicUsize::new(0));
         let now = Instant::now();
         core.add_hold(
-            counting_hold(vec![(1, 0, 1)], Duration::from_millis(100), &n),
+            counting_hold(vec![RowKey::new(1, 0, 1)], Duration::from_millis(100), &n),
             now,
         );
         assert_eq!(core.expire_holds(now + Duration::from_millis(50)), 0);
         assert_eq!(core.expire_holds(now + Duration::from_millis(100)), 1);
         assert_eq!(n.load(Ordering::SeqCst), 1);
         // A late delivery report finds nothing to release.
-        core.on_result((1, 0, 1), 1, Ok(0), false);
+        core.on_result(RowKey::new(1, 0, 1), 1, Ok(0), false);
         assert_eq!(n.load(Ordering::SeqCst), 1);
     }
 
@@ -683,14 +693,14 @@ mod tests {
         let n = Arc::new(AtomicUsize::new(0));
         let now = Instant::now();
         core.add_hold(
-            counting_hold(vec![(1, 0, 1)], Duration::from_secs(5), &n),
+            counting_hold(vec![RowKey::new(1, 0, 1)], Duration::from_secs(5), &n),
             now,
         );
         core.add_hold(
-            counting_hold(vec![(1, 0, 1)], Duration::from_secs(5), &n),
+            counting_hold(vec![RowKey::new(1, 0, 1)], Duration::from_secs(5), &n),
             now,
         );
-        core.on_result((1, 0, 1), 1, Ok(0), false);
+        core.on_result(RowKey::new(1, 0, 1), 1, Ok(0), false);
         assert_eq!(n.load(Ordering::SeqCst), 2);
     }
 
@@ -709,15 +719,15 @@ mod tests {
     fn acks_wait_for_room_instead_of_being_dropped() {
         let mut core = ForwarderCore::default();
         let (tx, rx) = crossbeam_channel::bounded(1);
-        core.on_result((1, 0, 1), 1, Ok(1), false);
-        core.on_result((1, 0, 2), 1, Ok(2), false);
+        core.on_result(RowKey::new(1, 0, 1), 1, Ok(1), false);
+        core.on_result(RowKey::new(1, 0, 2), 1, Ok(2), false);
         assert!(core.flush_acks(&tx));
         assert_eq!(core.acks.len(), 1, "second ack kept, not dropped");
-        assert_eq!(rx.try_recv().unwrap().local_offset, 1);
+        assert_eq!(rx.try_recv().unwrap().row.local_offset, 1);
         assert!(core.flush_acks(&tx));
-        assert_eq!(rx.try_recv().unwrap().local_offset, 2);
+        assert_eq!(rx.try_recv().unwrap().row.local_offset, 2);
         drop(rx);
-        core.on_result((1, 0, 3), 1, Ok(3), false);
+        core.on_result(RowKey::new(1, 0, 3), 1, Ok(3), false);
         assert!(!core.flush_acks(&tx), "closed channel reported");
     }
 

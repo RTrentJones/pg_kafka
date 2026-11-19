@@ -20,7 +20,7 @@
 //!   in memory, so the claim/ack/retry/dead-letter behaviour is unit-tested.
 
 use super::config::TopicShadowConfig;
-use super::{ForwardRecord, RowKey};
+use super::{ForwardRecord, KeyColumns, RowKey};
 use crate::kafka::error::Result;
 
 /// A transactional record's outbox pointer: the row key plus the record key
@@ -28,13 +28,9 @@ use crate::kafka::error::Result;
 /// from `kafka.messages` by the forwarder.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PendingForwardRecord {
-    /// Topic ID (outbox row key + per-topic config lookup)
-    pub topic_id: i32,
-    /// Partition ID (outbox row key)
-    pub partition_id: i32,
-    /// Local offset the record was committed at (outbox row key)
-    pub offset: i64,
-    /// Record key — used only for percentage routing at enqueue time
+    /// The record's row (and future outbox row).
+    pub row: RowKey,
+    /// Record key, used only for percentage routing at enqueue time.
     pub key: Option<Vec<u8>>,
 }
 
@@ -84,11 +80,8 @@ pub struct OutboxClaim {
     /// most `max` (milliseconds).
     pub backoff_base_ms: i64,
     pub backoff_max_ms: i64,
-    /// In-flight row keys (topic ids, partition ids, offsets; parallel arrays),
-    /// excluded from the claim.
-    pub inflight_topics: Vec<i32>,
-    pub inflight_partitions: Vec<i32>,
-    pub inflight_offsets: Vec<i64>,
+    /// In-flight row keys, excluded from the claim.
+    pub inflight: KeyColumns,
 }
 
 /// What one batch of failure acks did.
@@ -115,10 +108,9 @@ pub trait ShadowDb {
     /// `retry_count >= max_retries`).
     fn topic_has_dead_letters(&self, topic_id: i32, max_retries: i64) -> Result<bool>;
 
-    /// Insert pending outbox rows `(topic_id, partition_id, local_offset)` in the
-    /// current transaction, each only if its `kafka.messages` row exists;
+    /// Insert pending outbox rows in the current transaction, each only if its `kafka.messages` row exists;
     /// existing rows are left alone.
-    fn insert_outbox_rows(&self, rows: &[(i32, i32, i64)]) -> Result<()>;
+    fn insert_outbox_rows(&self, rows: &[RowKey]) -> Result<()>;
 
     /// Count `n` records of a partition that percentage routing sampled out
     /// (`kafka.shadow_metrics.messages_skipped`), in the current transaction.
@@ -183,19 +175,6 @@ pub trait ShadowDb {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SpiShadowDb;
 
-/// Split row keys into the parallel arrays the SQL unnests.
-fn key_arrays<'a>(keys: impl Iterator<Item = &'a RowKey>) -> (Vec<i32>, Vec<i32>, Vec<i64>) {
-    let mut t = Vec::new();
-    let mut p = Vec::new();
-    let mut o = Vec::new();
-    for k in keys {
-        t.push(k.0);
-        p.push(k.1);
-        o.push(k.2);
-    }
-    (t, p, o)
-}
-
 impl ShadowDb for SpiShadowDb {
     fn shadow_mode_enabled(&self) -> bool {
         crate::config::SHADOW_MODE_ENABLED.get()
@@ -223,12 +202,12 @@ impl ShadowDb for SpiShadowDb {
         })
     }
 
-    fn insert_outbox_rows(&self, rows: &[(i32, i32, i64)]) -> Result<()> {
+    fn insert_outbox_rows(&self, rows: &[RowKey]) -> Result<()> {
         use pgrx::prelude::*;
         if rows.is_empty() {
             return Ok(());
         }
-        let (t, p, o) = key_arrays(rows.iter());
+        let keys: KeyColumns = rows.iter().collect();
         Spi::connect_mut(|client| {
             // B1: only enqueue an outbox pointer when the backing
             // kafka.messages row actually exists. The live-produce enqueue
@@ -252,7 +231,11 @@ impl ShadowDb for SpiShadowDb {
                  ) has_message \
                  ON CONFLICT (topic_id, partition_id, local_offset) DO NOTHING",
                 None,
-                &[t.into(), p.into(), o.into()],
+                &[
+                    keys.topic_ids.into(),
+                    keys.partition_ids.into(),
+                    keys.local_offsets.into(),
+                ],
             )?;
             Ok(())
         })
@@ -292,9 +275,11 @@ impl ShadowDb for SpiShadowDb {
                 let mut records = Vec::new();
                 for row in table {
                     records.push(PendingForwardRecord {
-                        topic_id: row.get_by_name("topic_id")?.unwrap_or(0),
-                        partition_id: row.get_by_name("partition_id")?.unwrap_or(0),
-                        offset: row.get_by_name("partition_offset")?.unwrap_or(0),
+                        row: RowKey::new(
+                            row.get_by_name("topic_id")?.unwrap_or(0),
+                            row.get_by_name("partition_id")?.unwrap_or(0),
+                            row.get_by_name("partition_offset")?.unwrap_or(0),
+                        ),
                         key: row.get_by_name::<Vec<u8>, _>("key")?,
                     });
                 }
@@ -429,9 +414,9 @@ impl ShadowDb for SpiShadowDb {
                 &[
                     claim.batch_limit.into(),
                     claim.max_retries.into(),
-                    claim.inflight_topics.clone().into(),
-                    claim.inflight_partitions.clone().into(),
-                    claim.inflight_offsets.clone().into(),
+                    claim.inflight.topic_ids.clone().into(),
+                    claim.inflight.partition_ids.clone().into(),
+                    claim.inflight.local_offsets.clone().into(),
                     (claim.backoff_base_ms as f64).into(),
                     (claim.backoff_max_ms as f64).into(),
                 ],
@@ -441,14 +426,16 @@ impl ShadowDb for SpiShadowDb {
             for row in table {
                 let headers_json: Option<String> = row.get_by_name("headers_json")?;
                 records.push(ForwardRecord {
-                    topic_id: row.get_by_name("topic_id")?.unwrap_or(0),
+                    row: RowKey::new(
+                        row.get_by_name("topic_id")?.unwrap_or(0),
+                        row.get_by_name("partition_id")?.unwrap_or(0),
+                        row.get_by_name("local_offset")?.unwrap_or(0),
+                    ),
                     topic_name: row.get_by_name("external_topic")?.unwrap_or_default(),
-                    partition_id: row.get_by_name("partition_id")?.unwrap_or(0),
                     key: row.get_by_name("msg_key")?,
                     value: row.get_by_name("msg_value")?,
                     headers: crate::kafka::storage::decode_headers_json(headers_json.as_deref()),
                     timestamp_ms: row.get_by_name("ts")?,
-                    local_offset: row.get_by_name("local_offset")?.unwrap_or(0),
                     restart: row.get_by_name("restart")?.unwrap_or(false),
                 });
             }
@@ -461,8 +448,8 @@ impl ShadowDb for SpiShadowDb {
         if rows.is_empty() {
             return Ok(0);
         }
-        let (t, p, o) = key_arrays(rows.iter().map(|(k, _)| k));
-        let x: Vec<i64> = rows.iter().map(|&(_, x)| x).collect();
+        let keys: KeyColumns = rows.iter().map(|(k, _)| k).collect();
+        let external_offsets: Vec<i64> = rows.iter().map(|&(_, x)| x).collect();
         // SH-7: the metric is bumped in the SAME statement that flips the rows,
         // guarded by `external_offset IS NULL`, so a duplicate ack updates
         // nothing and counts nothing — exactly-once per row. One statement for
@@ -494,7 +481,13 @@ impl ShadowDb for SpiShadowDb {
                  ) \
                  SELECT COUNT(*)::int8 AS n FROM done",
                 None,
-                &[t.into(), p.into(), o.into(), x.into(), metrics.into()],
+                &[
+                    keys.topic_ids.into(),
+                    keys.partition_ids.into(),
+                    keys.local_offsets.into(),
+                    external_offsets.into(),
+                    metrics.into(),
+                ],
             )?;
             let mut n = 0i64;
             for row in table {
@@ -514,8 +507,8 @@ impl ShadowDb for SpiShadowDb {
         if rows.is_empty() {
             return Ok(FailedApplied::default());
         }
-        let (t, p, o) = key_arrays(rows.iter().map(|(k, _)| k));
-        let e: Vec<String> = rows.iter().map(|(_, e)| e.clone()).collect();
+        let keys: KeyColumns = rows.iter().map(|(k, _)| k).collect();
+        let errors: Vec<&str> = rows.iter().map(|(_, e)| e.as_str()).collect();
         Spi::connect_mut(|client| {
             let table = client.update(
                 "WITH a AS ( \
@@ -541,7 +534,13 @@ impl ShadowDb for SpiShadowDb {
                  ) \
                  SELECT topic_id, partition_id, local_offset, retry_count, error_message FROM failed",
                 None,
-                &[t.into(), p.into(), o.into(), e.into(), metrics.into()],
+                &[
+                    keys.topic_ids.into(),
+                    keys.partition_ids.into(),
+                    keys.local_offsets.into(),
+                    errors.into(),
+                    metrics.into(),
+                ],
             )?;
             let mut out = FailedApplied::default();
             for row in table {
@@ -549,7 +548,7 @@ impl ShadowDb for SpiShadowDb {
                 let retry_count: i32 = row.get_by_name("retry_count")?.unwrap_or(0);
                 if retry_count as i64 >= max_retries {
                     out.dead_lettered.push((
-                        (
+                        RowKey::new(
                             row.get_by_name("topic_id")?.unwrap_or(0),
                             row.get_by_name("partition_id")?.unwrap_or(0),
                             row.get_by_name("local_offset")?.unwrap_or(0),
@@ -567,7 +566,7 @@ impl ShadowDb for SpiShadowDb {
         if rows.is_empty() {
             return Ok(());
         }
-        let (t, p, o) = key_arrays(rows.iter());
+        let keys: KeyColumns = rows.iter().collect();
         Spi::connect_mut(|client| {
             client.update(
                 "UPDATE kafka.shadow_tracking st SET attempt_open = false \
@@ -575,7 +574,11 @@ impl ShadowDb for SpiShadowDb {
                  WHERE st.topic_id = a.t AND st.partition_id = a.p AND st.local_offset = a.o \
                    AND st.external_offset IS NULL",
                 None,
-                &[t.into(), p.into(), o.into()],
+                &[
+                    keys.topic_ids.into(),
+                    keys.partition_ids.into(),
+                    keys.local_offsets.into(),
+                ],
             )?;
             Ok(())
         })

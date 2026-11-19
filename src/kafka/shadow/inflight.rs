@@ -27,13 +27,12 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// Outbox row identity: (topic_id, partition_id, local_offset).
-pub type ForwardKey = (i32, i32, i64);
+use super::{KeyColumns, RowKey};
 
 /// Tracks outbox rows whose forward has been dispatched to the network thread
 /// but whose `ForwardAck` has not yet been applied.
 pub struct InflightTracker {
-    entries: Mutex<HashMap<ForwardKey, Instant>>,
+    entries: Mutex<HashMap<RowKey, Instant>>,
     evict_after: Duration,
 }
 
@@ -50,13 +49,13 @@ impl InflightTracker {
     /// same row is already outstanding — the caller must skip the re-send.
     /// A stale entry (older than `evict_after`, meaning its ack was lost) is
     /// replaced and dispatch proceeds.
-    pub fn try_begin(&self, key: ForwardKey) -> bool {
+    pub fn try_begin(&self, key: RowKey) -> bool {
         self.try_begin_at(key, Instant::now())
     }
 
     /// Clear `key` after its ack (success or failure) has been applied, so a
     /// future lease-expiry re-claim may dispatch it again.
-    pub fn complete(&self, key: &ForwardKey) {
+    pub fn complete(&self, key: &RowKey) {
         self.lock().remove(key);
     }
 
@@ -65,32 +64,24 @@ impl InflightTracker {
         self.lock().len()
     }
 
-    /// Snapshot of the live (non-evicted) in-flight keys as three parallel
-    /// column vectors, shaped for a SQL `unnest($t::int4[], $p::int4[],
-    /// $o::int8[])` exclusion in the outbox claim query — claiming an
-    /// in-flight row would bump its `retry_count` and erode the dead-letter
-    /// budget even though the dispatcher skips it.
-    pub fn live_keys(&self) -> (Vec<i32>, Vec<i32>, Vec<i64>) {
+    /// The live (non-evicted) in-flight keys, shaped for the outbox claim's
+    /// SQL exclusion: claiming an in-flight row would bump its `retry_count`
+    /// and erode the dead-letter budget even though the dispatcher skips it.
+    pub fn live_keys(&self) -> KeyColumns {
         self.live_keys_at(Instant::now())
     }
 
-    fn live_keys_at(&self, now: Instant) -> (Vec<i32>, Vec<i32>, Vec<i64>) {
+    fn live_keys_at(&self, now: Instant) -> KeyColumns {
         let entries = self.lock();
-        let mut topics = Vec::with_capacity(entries.len());
-        let mut partitions = Vec::with_capacity(entries.len());
-        let mut offsets = Vec::with_capacity(entries.len());
-        for ((t, p, o), started) in entries.iter() {
-            if now.saturating_duration_since(*started) < self.evict_after {
-                topics.push(*t);
-                partitions.push(*p);
-                offsets.push(*o);
-            }
-        }
-        (topics, partitions, offsets)
+        entries
+            .iter()
+            .filter(|(_, started)| now.saturating_duration_since(**started) < self.evict_after)
+            .map(|(key, _)| key)
+            .collect()
     }
 
     /// Clock-injected core of [`try_begin`], separated for deterministic tests.
-    fn try_begin_at(&self, key: ForwardKey, now: Instant) -> bool {
+    fn try_begin_at(&self, key: RowKey, now: Instant) -> bool {
         let mut entries = self.lock();
         match entries.get(&key) {
             Some(started) if now.saturating_duration_since(*started) < self.evict_after => false,
@@ -102,11 +93,8 @@ impl InflightTracker {
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<ForwardKey, Instant>> {
-        self.entries.lock().unwrap_or_else(|poisoned| {
-            tracing::warn!("inflight tracker lock was poisoned, recovering");
-            poisoned.into_inner()
-        })
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<RowKey, Instant>> {
+        super::lock(&self.entries)
     }
 }
 
@@ -115,7 +103,7 @@ mod tests {
     use super::*;
 
     const EVICT: Duration = Duration::from_secs(150);
-    const KEY: ForwardKey = (1, 0, 42);
+    const KEY: RowKey = RowKey::new(1, 0, 42);
 
     /// A dispatched row must not be re-dispatched while its ack is pending —
     /// this is the exact mechanism behind the issue #93 duplicates.
@@ -164,30 +152,34 @@ mod tests {
     fn test_live_keys_snapshot_excludes_evicted() {
         let tracker = InflightTracker::new(EVICT);
         let t0 = Instant::now();
-        assert!(tracker.try_begin_at((1, 0, 10), t0));
-        assert!(tracker.try_begin_at((1, 0, 11), t0 + EVICT / 2));
+        assert!(tracker.try_begin_at(RowKey::new(1, 0, 10), t0));
+        assert!(tracker.try_begin_at(RowKey::new(1, 0, 11), t0 + EVICT / 2));
 
-        let (t, p, o) = tracker.live_keys_at(t0 + EVICT / 2);
-        assert_eq!(t.len(), 2, "both entries live at half the horizon");
-        assert_eq!(p.len(), 2);
-        assert_eq!(o.len(), 2);
+        let live = tracker.live_keys_at(t0 + EVICT / 2);
+        assert_eq!(
+            live.topic_ids.len(),
+            2,
+            "both entries live at half the horizon"
+        );
+        assert_eq!(live.partition_ids.len(), 2);
+        assert_eq!(live.local_offsets.len(), 2);
 
         // Past the first entry's horizon only the second remains.
-        let (t, _, o) = tracker.live_keys_at(t0 + EVICT);
-        assert_eq!(t, vec![1]);
-        assert_eq!(o, vec![11]);
+        let live = tracker.live_keys_at(t0 + EVICT);
+        assert_eq!(live.topic_ids, vec![1]);
+        assert_eq!(live.local_offsets, vec![11]);
     }
 
     /// Distinct rows are tracked independently.
     #[test]
     fn test_keys_are_independent() {
         let tracker = InflightTracker::new(EVICT);
-        assert!(tracker.try_begin((1, 0, 1)));
-        assert!(tracker.try_begin((1, 0, 2)));
-        assert!(tracker.try_begin((2, 0, 1)));
+        assert!(tracker.try_begin(RowKey::new(1, 0, 1)));
+        assert!(tracker.try_begin(RowKey::new(1, 0, 2)));
+        assert!(tracker.try_begin(RowKey::new(2, 0, 1)));
         assert_eq!(tracker.len(), 3);
-        tracker.complete(&(1, 0, 2));
-        assert!(!tracker.try_begin((1, 0, 1)));
-        assert!(tracker.try_begin((1, 0, 2)));
+        tracker.complete(&RowKey::new(1, 0, 2));
+        assert!(!tracker.try_begin(RowKey::new(1, 0, 1)));
+        assert!(tracker.try_begin(RowKey::new(1, 0, 2)));
     }
 }

@@ -134,11 +134,13 @@ impl ShadowDb for InMemoryShadowDb {
 
     fn topic_has_dead_letters(&self, topic_id: i32, max_retries: i64) -> Result<bool> {
         Ok(self.state().tracking.iter().any(|(k, r)| {
-            k.0 == topic_id && r.external_offset.is_none() && r.retry_count as i64 >= max_retries
+            k.topic_id == topic_id
+                && r.external_offset.is_none()
+                && r.retry_count as i64 >= max_retries
         }))
     }
 
-    fn insert_outbox_rows(&self, rows: &[(i32, i32, i64)]) -> Result<()> {
+    fn insert_outbox_rows(&self, rows: &[RowKey]) -> Result<()> {
         let mut s = self.state();
         for &key in rows {
             if s.messages.contains_key(&key) {
@@ -170,10 +172,8 @@ impl ShadowDb for InMemoryShadowDb {
             s.messages
                 .iter()
                 .filter(|(_, m)| m.txn == Some((producer_id, producer_epoch)) && m.txn_pending)
-                .map(|(&(t, p, o), m)| PendingForwardRecord {
-                    topic_id: t,
-                    partition_id: p,
-                    offset: o,
+                .map(|(&row, m)| PendingForwardRecord {
+                    row,
                     key: m.key.clone(),
                 })
                 .collect(),
@@ -187,11 +187,12 @@ impl ShadowDb for InMemoryShadowDb {
         }
         let now = s.now_ms;
         let inflight: std::collections::HashSet<RowKey> = claim
-            .inflight_topics
+            .inflight
+            .topic_ids
             .iter()
-            .zip(&claim.inflight_partitions)
-            .zip(&claim.inflight_offsets)
-            .map(|((&t, &p), &o)| (t, p, o))
+            .zip(&claim.inflight.partition_ids)
+            .zip(&claim.inflight.local_offsets)
+            .map(|((&t, &p), &o)| RowKey::new(t, p, o))
             .collect();
         // cand: pending, under the cap, message exists (BTreeMap = key order).
         struct Cand {
@@ -225,10 +226,10 @@ impl ShadowDb for InMemoryShadowDb {
         let mut head: HashMap<(i32, i32), i64> = HashMap::new();
         let mut blocked: HashMap<(i32, i32), i64> = HashMap::new();
         for c in &cands {
-            let part = (c.key.0, c.key.1);
-            head.entry(part).or_insert(c.key.2);
+            let part = c.key.partition();
+            head.entry(part).or_insert(c.key.local_offset);
             if c.backing_off && !c.in_flight {
-                blocked.entry(part).or_insert(c.key.2);
+                blocked.entry(part).or_insert(c.key.local_offset);
             }
         }
         let due: Vec<(RowKey, bool)> = cands
@@ -237,10 +238,10 @@ impl ShadowDb for InMemoryShadowDb {
                 !c.in_flight
                     && !c.backing_off
                     && blocked
-                        .get(&(c.key.0, c.key.1))
-                        .is_none_or(|&b| c.key.2 < b)
+                        .get(&c.key.partition())
+                        .is_none_or(|&b| c.key.local_offset < b)
             })
-            .map(|c| (c.key, head[&(c.key.0, c.key.1)] == c.key.2))
+            .map(|c| (c.key, head[&c.key.partition()] == c.key.local_offset))
             .take(claim.batch_limit.max(0) as usize)
             .collect();
         let mut out = Vec::new();
@@ -251,25 +252,23 @@ impl ShadowDb for InMemoryShadowDb {
             }
             row.attempt_open = true;
             row.forwarded_at = Some(now);
-            let Some(topic_name) = s.topics.get(&key.0).cloned() else {
+            let Some(topic_name) = s.topics.get(&key.topic_id).cloned() else {
                 continue; // JOIN kafka.topics drops it
             };
             let external = s
                 .external_names
-                .get(&key.0)
+                .get(&key.topic_id)
                 .cloned()
                 .flatten()
                 .unwrap_or(topic_name);
             let m = &s.messages[&key];
             out.push(ForwardRecord {
-                topic_id: key.0,
+                row: key,
                 topic_name: external,
-                partition_id: key.1,
                 key: m.key.clone(),
                 value: m.value.clone(),
                 headers: m.headers.clone(),
                 timestamp_ms: m.timestamp_ms,
-                local_offset: key.2,
                 restart,
             });
         }
@@ -293,10 +292,13 @@ impl ShadowDb for InMemoryShadowDb {
             row.attempt_open = false;
             n += 1;
             if metrics {
-                let m = s.metrics.entry((key.0, key.1)).or_default();
+                let m = s.metrics.entry(key.partition()).or_default();
                 m.messages_forwarded += 1;
-                m.last_forwarded_offset =
-                    Some(m.last_forwarded_offset.unwrap_or(i64::MIN).max(key.2));
+                m.last_forwarded_offset = Some(
+                    m.last_forwarded_offset
+                        .unwrap_or(i64::MIN)
+                        .max(key.local_offset),
+                );
             }
         }
         Ok(n)
@@ -327,7 +329,10 @@ impl ShadowDb for InMemoryShadowDb {
                 out.dead_lettered.push((*key, error.clone()));
             }
             if metrics {
-                s.metrics.entry((key.0, key.1)).or_default().messages_failed += 1;
+                s.metrics
+                    .entry(key.partition())
+                    .or_default()
+                    .messages_failed += 1;
             }
         }
         Ok(out)
