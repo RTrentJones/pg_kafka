@@ -58,7 +58,7 @@ ignore:
   - "src/worker/schema.rs"            # Schema wait, feature detection, role reset (SPI)
   - "src/worker/txn.rs"               # worker_transaction, schema locks, subtransactions (SPI)
   - "src/kafka/storage/postgres.rs"   # PostgresStore (SPI-dependent)
-  - "src/kafka/storage/postgres/roles.rs"  # Forwards every storage role to postgres.rs (SPI)
+  - "src/kafka/storage/postgres/roles.rs"  # Forwards every storage role to the postgres/ modules (SPI)
   - "src/kafka/storage/postgres/log.rs"          # LogStore SQL: records, offset bounds, DeleteRecords (SPI)
   - "src/kafka/storage/postgres/maintenance.rs"  # Retention sweep, partition maintenance, txn timeouts (SPI)
   - "src/kafka/storage/postgres/offsets.rs"      # OffsetStore SQL: group offsets (SPI)

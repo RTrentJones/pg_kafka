@@ -2,7 +2,7 @@
 //!
 //! [`KafkaRequest`] and [`KafkaResponse`] are the envelopes around the per-API bodies, which
 //! the API registry (`crate::kafka::api`) generates; [`RequestLanes`] are the two channels
-//! requests cross on, created in `worker.rs` and handed to the listener; the remaining types
+//! requests cross on, created in `worker::network` and handed to the listener; the remaining types
 //! are the request data the handlers take.
 
 use crate::kafka::api::{Lane, RequestBody, RequestHeader, ResponseBody};

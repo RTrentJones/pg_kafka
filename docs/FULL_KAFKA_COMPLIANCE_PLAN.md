@@ -36,8 +36,8 @@
 - `src/kafka/handlers/admin.rs` - Create new file with `handle_create_topics()`
 - `src/kafka/handlers/mod.rs` - Export admin handlers
 - `src/kafka/storage/mod.rs` - Add `create_topic()` to KafkaStore trait
-- `src/kafka/storage/postgres.rs` - Implement `create_topic()` with partition count
-- `src/worker.rs` - Wire up dispatch
+- `src/kafka/storage/postgres/topics.rs` - Implement `create_topic()` with partition count
+- `src/kafka/api/admin.rs` + the `kafka_apis!` registry - Wire up dispatch
 
 **Implementation:**
 ```rust
@@ -52,17 +52,17 @@ fn handle_create_topics(store: &impl KafkaStore, topics: Vec<CreateTopicRequest>
 
 #### 6.3 CreatePartitions (API 37)
 **Files to modify:**
-- `src/kafka/storage/postgres.rs` - `set_topic_partition_count(name, new_count)` (as built)
+- `src/kafka/storage/postgres/topics.rs` - `set_topic_partition_count(name, new_count)` (as built)
 - Trigger rebalance for affected consumer groups (not implemented; consumers pick up new partitions on metadata refresh)
 
 #### 6.4 DeleteGroups (API 42)
 **Files to modify:**
 - `src/kafka/coordinator.rs` - Add `remove_group()` method (as built)
-- `src/kafka/storage/postgres.rs` - Delete from `kafka.consumer_offsets`
+- `src/kafka/storage/postgres/offsets.rs` - Delete from `kafka.consumer_offsets`
 
 **Testing:**
 - Unit tests in `src/kafka/handlers/tests.rs`
-- E2E tests in `kafka_test/src/admin.rs`
+- E2E tests in `kafka_test/src/admin/mod.rs`
 
 ---
 
@@ -72,7 +72,7 @@ fn handle_create_topics(store: &impl KafkaStore, topics: Vec<CreateTopicRequest>
 #### 7.1 Partition Count Configuration
 **Files to modify:**
 - `src/config.rs` - Add `pg_kafka.default_partitions` GUC
-- `src/kafka/storage/postgres.rs` - Use partition count in `get_or_create_topic()`
+- `src/kafka/storage/postgres/topics.rs` - Use partition count in `get_or_create_topic()`
 
 #### 7.2 Key-Based Partition Routing
 **Files to modify:**
@@ -247,11 +247,11 @@ SELECT pg_reload_conf();
 | `src/kafka/api/*.rs` | One `KafkaApi` impl per API: `NAME`, advertised/enforced `MIN_VERSION`/`MAX_VERSION`, lane, decode, error responses |
 | `src/kafka/handlers/` | All API handlers |
 | `src/kafka/storage/mod.rs` | KafkaStore trait |
-| `src/kafka/storage/postgres.rs` | PostgresStore implementation |
+| `src/kafka/storage/postgres.rs`, `postgres/` | PostgresStore implementation (one submodule per storage concern) |
 | `src/kafka/coordinator.rs` | Group state machine |
 | `src/kafka/protocol/decoding.rs` | Request header parsing (bodies go to the registry) |
 | `src/kafka/messages.rs` | `KafkaRequest`/`KafkaResponse` envelopes, request lanes |
-| `src/worker.rs` | Background worker loop, transaction + response-after-commit barrier |
+| `src/worker/` | Background worker loop, transaction + response-after-commit barrier |
 | `src/kafka/dispatch.rs` | Handler `Err`/panic → error response, `RequestOutcome` |
 | `src/kafka/response_builders.rs` | ApiVersions list (built from the registry) |
 | `src/kafka/constants.rs` | API keys, error codes |

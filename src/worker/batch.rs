@@ -199,7 +199,7 @@ fn serve_heartbeat_now(mut request: KafkaRequest, env: &RequestEnv) {
 /// response of any request in it is released before the one commit.
 ///
 /// This relies on the writer task queueing response slots at parse time
-/// (listener.rs), so deferring the send cannot reorder responses. If that
+/// (`kafka::listener::writer`), so deferring the send cannot reorder responses. If that
 /// ordering scheme ever changes, re-review this barrier.
 struct BufferedResponse {
     client_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,

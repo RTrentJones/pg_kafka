@@ -115,7 +115,7 @@ pub const OUTBOX_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Max forwards outstanding at once (dispatched, ack not yet applied). The poll
 /// claims no more than the remaining room, so the forward channel (capacity
-/// 10 000, see worker.rs) never fills with records and a sync hold always finds
+/// 10 000, see `worker::network`) never fills with records and a sync hold always finds
 /// room; it also bounds the in-flight key arrays the claim passes to SQL.
 const MAX_INFLIGHT: usize = 8_192;
 

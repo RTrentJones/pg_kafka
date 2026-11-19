@@ -1,4 +1,4 @@
-//! Listener behaviour (src/kafka/listener.rs and friends):
+//! Listener behaviour (`src/kafka/listener/`):
 //!
 //! - Idle long polls are not re-run on a short timer: a waiting fetch re-runs only on a
 //!   new-data notification, its `max_wait_ms` deadline, or the slow safety-net interval

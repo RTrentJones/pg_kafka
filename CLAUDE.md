@@ -150,10 +150,10 @@ The extension runs **one BackgroundWorker process**. Its tokio runtime serves th
 thread is the only one that touches the database:
 
 ```
-TCP:9092 → tokio runtime (listener) → crossbeam-channel → background worker (worker.rs) → SPI
+TCP:9092 → tokio runtime (listener) → crossbeam-channel → background worker (src/worker/) → SPI
 ```
 
-1. **Network thread** (`src/kafka/listener.rs`): accepts TCP connections on every configured
+1. **Network thread** (`src/kafka/listener/`): accepts TCP connections on every configured
    listener (TLS handshake where configured) and parses the Kafka framing and header.
    SaslHandshake/SaslAuthenticate never become `KafkaRequest`s: the per-connection `SaslSession`
    (`src/kafka/auth/session.rs`) answers them and gates every other request until authentication
@@ -161,7 +161,7 @@ TCP:9092 → tokio runtime (listener) → crossbeam-channel → background worke
 2. **Channels** (`src/kafka/messages.rs`): `KafkaRequest`s travel on two lanes (`RequestLanes`:
    `main`, and a `liveness` lane for Heartbeat that the worker drains first); each carries a tokio
    `response_tx` the worker answers with a `KafkaResponse`.
-3. **DB thread** (`src/worker.rs`): **group commit**: every request already queued (up to 64,
+3. **DB thread** (`src/worker/`, the batch in `batch.rs`): **group commit**: every request already queued (up to 64,
    ~50 ms budget; Heartbeats arriving meanwhile are answered between its requests) runs in one
    top-level transaction, each request in its own subtransaction (a handler `Err` returns
    `RequestOutcome::Rollback`; a panic is caught and rolled back), and all responses are released
@@ -196,8 +196,9 @@ pub trait MaintenanceStore { /* transaction timeouts, aborted-row cleanup */ }
 pub trait KafkaStore: TopicStore + LogStore + OffsetStore + ProducerStore + TransactionStore + MaintenanceStore {}
 ```
 
-- `PostgresStore` (`storage/postgres.rs`): the SPI implementation; `storage/postgres/roles.rs`
-  implements the roles by forwarding to its inherent methods.
+- `PostgresStore` (`storage/postgres.rs`): the SPI implementation, its SQL in one
+  `storage/postgres/` submodule per concern; `storage/postgres/roles.rs` implements the roles by
+  forwarding to those inherent methods.
 - `ShadowStore` (`shadow/store.rs`): wraps `PostgresStore`, forwards the roles it does not change
   (`delegate_topic_store!` and friends) and implements `LogStore`, `TransactionStore` and
   `MaintenanceStore` to write the shadow outbox.
@@ -246,7 +247,7 @@ must keep:
   least one width is leaf-granular; shorter windows and the DEFAULT leaf expire row by row.
   **Never** write an UPDATE that changes `created_at` (it moves rows between leaves), confine a
   ctid-based statement to one leaf (`tableoid`; ctids repeat across leaves), and send hot
-  statements that do not name `created_at` through `select_cached` in `postgres.rs` (kept
+  statements that do not name `created_at` through `select_cached` in `storage/postgres.rs` (kept
   prepared plans, run with a fresh snapshot).
 - **Visibility:** `messages.txn_state` is NULL (visible), `'pending'` or `'aborted'`; no transaction
   markers are written. `kafka.producer_batches` holds the last 5 batches per producer and partition
@@ -352,7 +353,7 @@ ApiVersions list, the metrics names and the error path; nothing else lists the A
 
 **An API answered on the network thread** (from per-connection state, never sent to the
 worker; today SaslHandshake/SaslAuthenticate, answered by `auth::session` from
-`listener.rs`) implements only `ApiSchema` (wire types, name, versions, error response,
+`listener/sasl.rs`) implements only `ApiSchema` (wire types, name, versions, error response,
 `response_has_error`; see `src/kafka/api/sasl.rs`) and goes in the registry's
 `network_thread { .. }` section. It is advertised, encoded and named from the table like
 the others (`ApiInfo::served_by` is `ServedBy::NetworkThread`) but has no `RequestBody`

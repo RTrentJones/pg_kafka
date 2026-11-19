@@ -1,7 +1,7 @@
 //! SaslHandshake (17) and SaslAuthenticate (36): answered on the network thread.
 //!
 //! These two only describe the APIs ([`ApiSchema`]); the connection's SASL state machine
-//! (`crate::kafka::auth::session`, driven by `listener.rs`) decodes and answers them before
+//! (`crate::kafka::auth::session`, driven by `listener::sasl`) decodes and answers them before
 //! anything reaches the DB thread. See the `network_thread` section of the registry.
 
 use kafka_protocol::messages::sasl_authenticate_request::SaslAuthenticateRequest;

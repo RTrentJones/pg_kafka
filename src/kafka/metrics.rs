@@ -14,7 +14,7 @@
 //!   and the service time on the DB thread (handler + commit; queue wait is not included). A
 //!   long-poll Fetch that is re-submitted counts each execution.
 //! - The **network thread** tracks connections ([`ConnectionGuard`], [`connection_rejected`])
-//!   and records the APIs it answers itself (SaslHandshake/SaslAuthenticate, `listener.rs`)
+//!   and records the APIs it answers itself (SaslHandshake/SaslAuthenticate, `listener::sasl`)
 //!   with the same [`RequestTimer`].
 //! - The flush samples the request-lane depths at flush time.
 //!

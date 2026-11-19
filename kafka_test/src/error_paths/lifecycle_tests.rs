@@ -2,7 +2,7 @@
 //! outcome of each request, and group commit (several requests per top-level
 //! transaction).
 //!
-//! The code under test lives in `src/worker.rs` / `src/lib.rs`, which unit
+//! The code under test lives in `src/worker/` / `src/lib.rs`, which unit
 //! coverage cannot see (QA-1), so these drive the running broker.
 
 use crate::common::to_i64;

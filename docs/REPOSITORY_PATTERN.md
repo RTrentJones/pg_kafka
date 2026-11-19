@@ -33,8 +33,9 @@ concrete type imports `crate::kafka::storage::roles::*`.
 Implementations:
 
 - `PostgresStore` ([`storage/postgres.rs`](../src/kafka/storage/postgres.rs)): the production
-  implementation over pgrx SPI. Its SQL is in one inherent `impl PostgresStore` block whose methods
-  carry the role methods' names; [`postgres/roles.rs`](../src/kafka/storage/postgres/roles.rs)
+  implementation over pgrx SPI. Its SQL is in inherent methods, one submodule of `postgres/` per
+  concern (`topics`, `log`, `offsets`, `producers`, `transactions`, `maintenance`), named like the
+  role methods; [`postgres/roles.rs`](../src/kafka/storage/postgres/roles.rs)
   implements each role by forwarding to them (`delegate_*_store!(PostgresStore)`). Maintenance
   that is not a role, such as `run_retention_sweep`, is inherent too; the worker and the
   `pg_kafka_run_retention_sweep()` SQL function call it. Pure planning logic (retention windows,
