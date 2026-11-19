@@ -794,8 +794,9 @@ networks:
           gateway: 172.18.0.1
 ```
 
-The `pg_kafka_dev` service still sets `PG_KAFKA_SHADOW_BOOTSTRAP_SERVERS=external-kafka:9094`, but the
-E2E tests override the GUC with `ALTER SYSTEM` on every `enable_shadow_mode()` call.
+Shadow mode is configured only through GUCs: the E2E tests set `pg_kafka.shadow_bootstrap_servers`
+with `ALTER SYSTEM` on every `enable_shadow_mode()` call (the `PG_KAFKA_SHADOW_*` environment
+variables the `pg_kafka_dev` service used to set were never read and were removed).
 
 ### Test Code Configuration
 

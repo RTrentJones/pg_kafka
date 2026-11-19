@@ -72,7 +72,7 @@ The devcontainer includes:
 - Rust toolchain with nightly channel
 - pgrx pre-initialized with pg14
 - Rust-analyzer and debugging extensions
-- Port forwarding for PostgreSQL (5432) and Kafka Protocol (9092)
+- Port forwarding for PostgreSQL (28814, pgrx's pg14) and Kafka Protocol (9092)
 
 ### Option 2: Manual Docker Setup
 
@@ -126,8 +126,9 @@ cargo pgrx test pg14
 cargo pgrx start pg14
 cd kafka_test && cargo run --release
 
-# Quick development iteration (kills postgres, rebuilds, restarts, recreates extension)
+# Quick development iteration: rebuild, install (.so + generated SQL), restart, keep the data
 ./scripts/restart.sh
+./scripts/restart.sh --fresh         # ...and DROP/CREATE EXTENSION: deletes all pg_kafka data
 
 # Test coverage
 cargo llvm-cov --lib --features pg14 --lcov --output-path lcov.info
