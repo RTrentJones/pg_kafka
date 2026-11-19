@@ -121,6 +121,7 @@ pub const MAX_SHUTDOWN_TIMEOUT_MS: i32 = 60_000;
 
 const _: () = assert!(
     0 < MIN_SHUTDOWN_TIMEOUT_MS
+        && MIN_SHUTDOWN_TIMEOUT_MS < MAX_SHUTDOWN_TIMEOUT_MS
         && MIN_SHUTDOWN_TIMEOUT_MS <= DEFAULT_SHUTDOWN_TIMEOUT_MS
         && DEFAULT_SHUTDOWN_TIMEOUT_MS <= MAX_SHUTDOWN_TIMEOUT_MS
 );
@@ -195,8 +196,10 @@ pub const MIN_FETCH_POLL_INTERVAL_MS: i32 = 10;
 /// Maximum poll interval (milliseconds).
 pub const MAX_FETCH_POLL_INTERVAL_MS: i32 = 60_000;
 
+// Idle long polls wake on notifications; the poll interval is only a slow safety net.
 const _: () = assert!(
-    MIN_FETCH_POLL_INTERVAL_MS <= DEFAULT_FETCH_POLL_INTERVAL_MS
+    1_000 <= DEFAULT_FETCH_POLL_INTERVAL_MS
+        && MIN_FETCH_POLL_INTERVAL_MS <= DEFAULT_FETCH_POLL_INTERVAL_MS
         && DEFAULT_FETCH_POLL_INTERVAL_MS <= MAX_FETCH_POLL_INTERVAL_MS
 );
 

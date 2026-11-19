@@ -385,13 +385,13 @@ mod tests {
                 KafkaError::out_of_order_sequence(100, 0, 10, 5),
                 ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER,
                 false,
-                "expected 5",
+                "Out of order sequence 10 for producer 100 on partition 0 (expected 5)",
             ),
             (
                 KafkaError::producer_fenced(100, 1, 2),
                 ERROR_PRODUCER_FENCED,
                 false,
-                "epoch 1 is older than current epoch 2",
+                "Producer fenced: producer 100 epoch 1 is older than current epoch 2",
             ),
             (
                 KafkaError::unknown_producer_id(999),
