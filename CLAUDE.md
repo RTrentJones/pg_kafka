@@ -191,7 +191,10 @@ object (so DROP EXTENSION cannot deadlock with it) and the schema advisory lock
 `kafka.messages_default` take that lock exclusively. A dropped extension sends the loop back to the
 schema wait, which answers requests with KAFKA_STORAGE_ERROR; a failed COMMIT is rolled back and
 answered with errors. `pg_kafka.worker_lock_timeout_ms` bounds every lock wait. A schema older than
-the library is detected (one WARNING; the missing features are skipped).
+the library (objects its requests use are missing, e.g. 0.0.0 before `ALTER EXTENSION pg_kafka
+UPDATE`) is not served: one WARNING, every request answered with KAFKA_STORAGE_ERROR, no
+maintenance, and the schema re-checked every 500 ms until it is current
+(`schema::wait_for_schema_update`).
 
 **Critical constraint:** the tokio runtime cannot call SPI. All database work goes through the
 worker. One process multiplexes every client connection onto one SPI connection.

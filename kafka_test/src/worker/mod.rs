@@ -202,6 +202,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         lifecycle::test_sigterm_interrupts_a_worker_lock_wait: sequential,
         lifecycle::test_commit_failure_answered_without_restart: sequential,
         lifecycle::test_old_schema_degrades_gracefully: sequential,
+        lifecycle::test_old_schema_refuses_clients_until_update: sequential,
         lifecycle::test_extension_ddl_loop_under_load: sequential,
     ]
 }

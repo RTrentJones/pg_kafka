@@ -47,8 +47,8 @@ use maintenance::{
 };
 use network::Network;
 use schema::{
-    reapply_worker_role, refresh_schema_features, wait_for_schema, wait_for_schema_while_serving,
-    SchemaFeatures,
+    reapply_worker_role, refresh_schema_state, wait_for_schema, wait_for_schema_update,
+    wait_for_schema_while_serving, SchemaState,
 };
 use txn::{apply_worker_lock_timeout, schema_lost};
 
@@ -83,13 +83,16 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     // Bounded lock waits for every worker transaction.
     apply_worker_lock_timeout();
 
-    // What this schema has (an older extension version lacks some objects).
-    let mut features = SchemaFeatures::default();
-    refresh_schema_features(&mut features);
-    // ADR-001: create the time partitions of kafka.messages before serving (rows that
-    // arrive before a leaf exists land in kafka.messages_default, so this is about
-    // keeping that leaf empty, not about Produce succeeding).
-    run_partition_maintenance(&features);
+    // Whether the schema is current (an older extension version is not served until
+    // ALTER EXTENSION pg_kafka UPDATE; the main loop waits for it).
+    let mut schema = SchemaState::default();
+    refresh_schema_state(&mut schema);
+    if schema.is_current() {
+        // ADR-001: create the time partitions of kafka.messages before serving (rows
+        // that arrive before a leaf exists land in kafka.messages_default, so this is
+        // about keeping that leaf empty, not about Produce succeeding).
+        run_partition_maintenance();
+    }
 
     log!(
         "pg_kafka background worker started (port: {}, host: {}, database: {})",
@@ -130,7 +133,7 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
         runtime_context: &runtime_context,
         network: &network,
         env: &env,
-        features,
+        schema,
         sighup_pending: false,
         config_reload: Periodic::new(config_reload_interval()),
         last_outbox_tick: Instant::now(),
@@ -193,8 +196,9 @@ struct MainLoop<'a> {
     runtime_context: &'a RuntimeContext,
     network: &'a Network,
     env: &'a RequestEnv<'a>,
-    /// What the current schema has; re-detected on every configuration reload.
-    features: SchemaFeatures,
+    /// The installed schema as last detected (on every configuration reload, and every
+    /// 500 ms while it is older than the library).
+    schema: SchemaState,
     /// A SIGHUP arrived: reload the configuration on this iteration.
     sighup_pending: bool,
     config_reload: Periodic,
@@ -210,16 +214,20 @@ struct MainLoop<'a> {
 impl MainLoop<'_> {
     /// Serve until the worker exits (SIGTERM, postmaster death, network thread gone).
     ///
-    /// Each iteration: exit checks, a schema wait if the extension was dropped, the
-    /// configuration reload (before taking requests, so a request that arrives right
-    /// after `pg_reload_conf()` sees the new settings), the shadow outbox, one liveness
-    /// batch, then one main-lane batch (or credential lookups, or the receive timeout),
-    /// then the periodic maintenance.
+    /// Each iteration: exit checks, a schema wait if the extension was dropped or is
+    /// older than the library, the configuration reload (before taking requests, so a
+    /// request that arrives right after `pg_reload_conf()` sees the new settings), the
+    /// shadow outbox, one liveness batch, then one main-lane batch (or credential
+    /// lookups, or the receive timeout), then the periodic maintenance.
     fn run(mut self) -> ! {
         loop {
             self.exit_if_stopping();
             if schema_lost() {
                 self.wait_for_schema_again();
+                continue;
+            }
+            if !self.schema.is_current() {
+                self.wait_for_update();
                 continue;
             }
             if BackgroundWorker::sighup_received() {
@@ -270,15 +278,37 @@ impl MainLoop<'_> {
             return;
         }
         reapply_worker_role();
-        self.features = SchemaFeatures::default();
-        refresh_schema_features(&mut self.features);
-        run_partition_maintenance(&self.features);
+        self.schema = SchemaState::default();
+        refresh_schema_state(&mut self.schema);
+        self.resume_on_current_schema();
+    }
+
+    /// The schema is older than the library: answer requests with a retriable error
+    /// until ALTER EXTENSION pg_kafka UPDATE, then switch role and resume as at start.
+    /// Returns early on SIGTERM, postmaster death or a dropped extension, which the
+    /// next iteration handles.
+    fn wait_for_update(&mut self) {
+        if !wait_for_schema_update(&mut self.schema, &self.network.inbox) || schema_lost() {
+            return;
+        }
+        reapply_worker_role();
+        self.resume_on_current_schema();
+    }
+
+    /// Bring a schema the worker has just found current up to date before serving it:
+    /// partition maintenance, the shadow configuration, and the retention sweep's
+    /// schedule. Nothing on an older schema (the next iteration waits for its update).
+    fn resume_on_current_schema(&mut self) {
+        if !self.schema.is_current() {
+            return;
+        }
+        run_partition_maintenance();
         load_shadow_config(self.env.shadow_store);
         self.retention_sweep.ran();
     }
 
     /// Reload the configuration: the GUCs (after a SIGHUP, from the configuration
-    /// files), the worker's lock timeout, the schema features (an ALTER EXTENSION
+    /// files), the worker's lock timeout, the schema state (an ALTER EXTENSION
     /// UPDATE), the RuntimeContext snapshot, and the shadow configuration. Postmaster
     /// GUCs (port, host) still need a restart.
     fn reload_config(&mut self) {
@@ -298,9 +328,11 @@ impl MainLoop<'_> {
         apply_worker_lock_timeout();
 
         // A schema change (ALTER EXTENSION pg_kafka UPDATE).
-        if refresh_schema_features(&mut self.features) {
+        if refresh_schema_state(&mut self.schema) {
             reapply_worker_role();
-            run_partition_maintenance(&self.features);
+            if self.schema.is_current() {
+                run_partition_maintenance();
+            }
         }
 
         // Listener security settings apply at worker start only.
@@ -368,14 +400,10 @@ impl MainLoop<'_> {
             self.txn_timeouts.ran();
         }
         if self.retention_sweep.is_due() {
-            run_retention_sweep(&self.features);
+            run_retention_sweep();
             self.retention_sweep.ran();
         }
-        flush_broker_metrics(
-            &mut self.metrics_flusher,
-            &self.features,
-            &self.network.inbox,
-        );
+        flush_broker_metrics(&mut self.metrics_flusher, &self.network.inbox);
     }
 }
 

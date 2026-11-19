@@ -1,6 +1,9 @@
 //! Worker lifecycle under extension DDL, old schemas, SIGTERM, lock waits and failed commits.
 
 use crate::common::{get_bootstrap_servers, TestResult};
+use crate::error_codes::KAFKA_STORAGE_ERROR;
+use crate::wire::records::batch;
+use crate::wire::Wire;
 use crate::worker::{
     boxed, deadlocks, ensure_old_version_available, hold_partition_counter, into_test_result,
     listener_pid, quick_producer, read_values, send, session, set_guc, unique,
@@ -178,14 +181,15 @@ async fn extension_ddl_loop() -> SendResult<()> {
 
 /// A library newer than its schema (the 0.0.0 schema has no time partitions and no
 /// kafka.broker_api_stats) must not fail its partition maintenance, retention sweep and
-/// metrics flush on every cycle. The worker detects the schema version, logs one WARNING
-/// naming what is unavailable, sweeps the unpartitioned table row by row, and turns the
-/// features on once `ALTER EXTENSION pg_kafka UPDATE` has run (at the next reload).
+/// metrics flush on every cycle. The worker detects the older schema, logs one WARNING
+/// naming `ALTER EXTENSION pg_kafka UPDATE`, runs no maintenance and serves no client
+/// until the update (test_old_schema_refuses_clients_until_update covers the clients),
+/// then turns everything on without a restart.
 ///
-/// Asserts: on 0.0.0, produce/consume work, `pg_kafka_run_retention_sweep()` succeeds,
-/// a restarted worker logs none of the per-cycle failures and the degrade WARNING at
-/// most once per start; after the update and a reload, broker metrics are published
-/// and a time partition covering now exists.
+/// Asserts: on 0.0.0, `pg_kafka_run_retention_sweep()` succeeds from SQL; the worker,
+/// also after a restart on the old schema, logs none of the per-cycle failures and the
+/// old-schema WARNING at most once per start; after the update, the listener serves,
+/// broker metrics are published and a time partition covering now exists.
 pub async fn test_old_schema_degrades_gracefully() -> TestResult {
     into_test_result(old_schema().await)
 }
@@ -204,28 +208,35 @@ async fn old_schema() -> SendResult<()> {
         )
         .await
         .map_err(boxed)?;
-        let pid = wait_for_serving_listener(&db, None, Duration::from_secs(30)).await?;
+        let pid = listener_pid(&db)
+            .await?
+            .ok_or("no pg_kafka_listener on the 0.0.0 schema")?;
+        // Requests keep arriving (and are refused) while the worker waits.
         let topic = unique("old-schema");
-        let producer = quick_producer("10000")?;
-        for i in 0..20 {
-            send(&producer, &topic, &format!("v{i}")).await?;
-        }
-        let got = read_values(&topic, false, 20, Duration::from_secs(15)).await?;
-        assert_eq!(got.len(), 20, "consume on the 0.0.0 schema");
+        let producer = quick_producer("3000")?;
+        let _ = send(&producer, &topic, "refused").await;
 
         // The on-demand sweep runs on the unpartitioned table.
         db.query("SELECT * FROM pg_kafka_run_retention_sweep(0, 3600)", &[])
             .await
             .map_err(|e| format!("retention sweep on 0.0.0 failed: {e:?}"))?;
 
-        // A worker started on the old schema (startup maintenance path).
+        // A worker started on the old schema (startup path).
         db.query("SELECT pg_terminate_backend($1)", &[&pid])
             .await
             .map_err(boxed)?;
-        wait_for_serving_listener(&db, Some(pid), Duration::from_secs(30)).await?;
-        for i in 0..20 {
-            send(&producer, &topic, &format!("w{i}")).await?;
-            tokio::time::sleep(Duration::from_millis(100)).await;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match listener_pid(&db).await? {
+                Some(p) if p != pid => break,
+                _ if Instant::now() > deadline => {
+                    return Err("no new pg_kafka_listener after pg_terminate_backend".into())
+                }
+                _ => tokio::time::sleep(Duration::from_millis(250)).await,
+            }
+        }
+        for _ in 0..3 {
+            let _ = send(&producer, &topic, "refused").await;
         }
         tokio::time::sleep(Duration::from_millis(1500)).await;
 
@@ -248,18 +259,24 @@ async fn old_schema() -> SendResult<()> {
                 (1..=3).contains(&degrade),
                 "expected the old-schema WARNING once per worker start, found {degrade}"
             );
+            assert!(
+                text.contains("ALTER EXTENSION pg_kafka UPDATE"),
+                "the old-schema WARNING must name ALTER EXTENSION pg_kafka UPDATE"
+            );
             println!("✅ server log: one old-schema WARNING per start, no per-cycle failures");
         } else {
             println!("  (server log not readable; skipped the log assertions)");
         }
 
-        // Upgrade in place; the next reload turns the features on.
+        // Upgrade in place; the worker sees it within 500 ms and serves again.
         db.batch_execute("ALTER EXTENSION pg_kafka UPDATE")
             .await
             .map_err(boxed)?;
         db.batch_execute("SELECT pg_reload_conf()")
             .await
             .map_err(boxed)?;
+        wait_for_serving_listener(&db, None, Duration::from_secs(20)).await?;
+        let producer = quick_producer("10000")?;
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             send(&producer, &topic, "after-update").await?;
@@ -295,6 +312,183 @@ async fn old_schema() -> SendResult<()> {
     .await;
 
     // Leave a fresh current-version schema behind whatever happened.
+    db.batch_execute("DROP EXTENSION IF EXISTS pg_kafka CASCADE; CREATE EXTENSION pg_kafka;")
+        .await
+        .map_err(boxed)?;
+    wait_for_serving_listener(&db, None, Duration::from_secs(30)).await?;
+    result
+}
+
+/// The 0.0.0 schema lacks tables the library's request paths use (kafka.producer_batches
+/// for every idempotent Produce, kafka.txn_partitions for transactions,
+/// kafka.sasl_credentials for SASL, shadow_tracking.attempt_open for the outbox), so a
+/// library newer than its schema does not serve clients: it answers every request with
+/// the retriable KAFKA_STORAGE_ERROR until `ALTER EXTENSION pg_kafka UPDATE`, and serves
+/// once it sees the updated schema, without a restart.
+///
+/// Asserts: on 0.0.0, InitProducerId and an idempotent Produce (raw protocol) are answered
+/// KAFKA_STORAGE_ERROR and nothing is stored; an rdkafka idempotent producer's record stays
+/// unacknowledged (rdkafka retries); the server log names `ALTER EXTENSION pg_kafka
+/// UPDATE`; after the update and a reload, that same record is acked at offset 0 and stored
+/// once, a new idempotent producer produces, and the listener process is the same.
+pub async fn test_old_schema_refuses_clients_until_update() -> TestResult {
+    into_test_result(old_schema_refuses_clients().await)
+}
+
+async fn old_schema_refuses_clients() -> SendResult<()> {
+    println!("=== Test: the 0.0.0 schema is refused until ALTER EXTENSION UPDATE ===\n");
+    let db = session().await?;
+    ensure_old_version_available(&db).await?;
+    wait_for_serving_listener(&db, None, Duration::from_secs(30)).await?;
+    let log = ServerLog::open(&db).await?;
+    let log_from = log.as_ref().map_or(0, ServerLog::end);
+
+    let result: SendResult<()> = async {
+        db.batch_execute(
+            "DROP EXTENSION pg_kafka CASCADE; CREATE EXTENSION pg_kafka VERSION '0.0.0';",
+        )
+        .await
+        .map_err(boxed)?;
+        let topic = unique("old-idem");
+        db.execute(
+            "INSERT INTO kafka.topics (name, partitions) VALUES ($1, 1)",
+            &[&topic],
+        )
+        .await
+        .map_err(boxed)?;
+        let pid = listener_pid(&db)
+            .await?
+            .ok_or("no pg_kafka_listener on the 0.0.0 schema")?;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        println!("Step 1: raw InitProducerId and idempotent Produce on 0.0.0...");
+        let mut wire = Wire::connect().await.map_err(|e| e.to_string())?;
+        for _ in 0..3 {
+            let (init_code, producer_id, epoch) = wire
+                .init_producer_id(None, 60_000)
+                .await
+                .map_err(|e| e.to_string())?;
+            // On a schema that served InitProducerId, produce as that producer.
+            let (producer_id, epoch) = if init_code == 0 {
+                (producer_id, epoch)
+            } else {
+                (1, 0)
+            };
+            let records = batch(&["raw"], producer_id, epoch, 0, false, None);
+            let (produce_code, _) = wire
+                .produce(&topic, 0, records, None)
+                .await
+                .map_err(|e| e.to_string())?;
+            assert_eq!(
+                (init_code, produce_code),
+                (KAFKA_STORAGE_ERROR, KAFKA_STORAGE_ERROR),
+                "(InitProducerId, idempotent Produce) on the 0.0.0 schema: \
+                 expected KAFKA_STORAGE_ERROR for both"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        println!("✅ InitProducerId and Produce answered KAFKA_STORAGE_ERROR\n");
+
+        println!("Step 2: an rdkafka idempotent producer on 0.0.0...");
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", get_bootstrap_servers())
+            .set("broker.address.family", "v4")
+            .set("enable.idempotence", "true")
+            .set("message.timeout.ms", "60000")
+            .set("linger.ms", "0")
+            .create()
+            .map_err(boxed)?;
+        let pending = {
+            let producer = producer.clone();
+            let topic = topic.clone();
+            tokio::spawn(async move {
+                producer
+                    .send(
+                        FutureRecord::to(&topic)
+                            .key("k")
+                            .payload("during-window")
+                            .partition(0),
+                        Duration::from_secs(60),
+                    )
+                    .await
+                    .map(|(_, offset)| offset)
+                    .map_err(|(e, _)| format!("{e:?}"))
+            })
+        };
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        if pending.is_finished() {
+            let outcome = pending.await.map_err(boxed)?;
+            return Err(format!(
+                "the idempotent send on the 0.0.0 schema finished before the update: {outcome:?}"
+            )
+            .into());
+        }
+        let stored: i64 = db
+            .query_one(
+                "SELECT count(*) FROM kafka.messages m JOIN kafka.topics t ON t.id = m.topic_id
+                 WHERE t.name = $1",
+                &[&topic],
+            )
+            .await
+            .map_err(boxed)?
+            .get(0);
+        assert_eq!(stored, 0, "nothing may be stored on the 0.0.0 schema");
+        println!("✅ the record is still pending (rdkafka retries), nothing stored\n");
+
+        if let Some(log) = &log {
+            let text = log.since(log_from);
+            assert!(
+                text.contains("older pg_kafka schema")
+                    && text.contains("ALTER EXTENSION pg_kafka UPDATE")
+                    && text.contains("KAFKA_STORAGE_ERROR"),
+                "expected a WARNING that the old schema is refused until ALTER EXTENSION pg_kafka UPDATE"
+            );
+            println!("✅ server log names ALTER EXTENSION pg_kafka UPDATE\n");
+        }
+
+        println!("Step 3: ALTER EXTENSION pg_kafka UPDATE + reload...");
+        db.batch_execute("ALTER EXTENSION pg_kafka UPDATE")
+            .await
+            .map_err(boxed)?;
+        db.batch_execute("SELECT pg_reload_conf()")
+            .await
+            .map_err(boxed)?;
+        let offset = tokio::time::timeout(Duration::from_secs(50), pending)
+            .await
+            .map_err(|_| "the pending idempotent send was not acked after the update")?
+            .map_err(boxed)??;
+        assert_eq!(offset, 0, "the retried record is the partition's first");
+        let values: Vec<String> = db
+            .query(
+                "SELECT convert_from(m.value, 'UTF8') FROM kafka.messages m
+                 JOIN kafka.topics t ON t.id = m.topic_id WHERE t.name = $1
+                 ORDER BY m.partition_offset",
+                &[&topic],
+            )
+            .await
+            .map_err(boxed)?
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+        assert_eq!(values, vec!["during-window".to_string()], "stored once");
+        println!("✅ the pending record was acked at offset 0 and stored once\n");
+
+        let fresh: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", get_bootstrap_servers())
+            .set("broker.address.family", "v4")
+            .set("enable.idempotence", "true")
+            .set("message.timeout.ms", "15000")
+            .create()
+            .map_err(boxed)?;
+        let offset = send(&fresh, &topic, "after-update").await?;
+        assert_eq!(offset, 1, "a new idempotent producer appends after the update");
+        let pid_after = listener_pid(&db).await?;
+        assert_eq!(pid_after, Some(pid), "served without a worker restart");
+        println!("✅ a new idempotent producer produces; listener {pid} was not restarted");
+        Ok(())
+    }
+    .await;
+
     db.batch_execute("DROP EXTENSION IF EXISTS pg_kafka CASCADE; CREATE EXTENSION pg_kafka;")
         .await
         .map_err(boxed)?;
