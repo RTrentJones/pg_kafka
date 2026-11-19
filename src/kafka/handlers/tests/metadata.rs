@@ -79,7 +79,10 @@ fn test_handle_metadata_no_auto_create_missing_topic() {
         response.topics[0].error_code,
         ERROR_UNKNOWN_TOPIC_OR_PARTITION
     );
-    assert!(response.topics[0].partitions.is_empty());
+    assert_eq!(
+        response.topics[0].partitions,
+        [] as [kafka_protocol::messages::metadata_response::MetadataResponsePartition; 0]
+    );
 }
 
 #[test]

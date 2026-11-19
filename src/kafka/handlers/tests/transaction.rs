@@ -60,7 +60,7 @@ fn test_add_partitions_success() {
     let topics = vec![("test-topic".to_string(), vec![0, 1])];
 
     let response =
-        transaction::handle_add_partitions_to_txn(&ctx, "txn-1", 1000, 0, topics).unwrap();
+        transaction::handle_add_partitions_to_txn(&ctx, "txn-1", 1000, 0, &topics).unwrap();
 
     assert_eq!(response.results_by_topic_v3_and_below.len(), 1);
     assert_eq!(
@@ -82,7 +82,7 @@ fn test_add_partitions_invalid_partition() {
 
     let topics = vec![("test-topic".to_string(), vec![0, 5])];
     let response =
-        transaction::handle_add_partitions_to_txn(&ctx, "txn-1", 1000, 0, topics).unwrap();
+        transaction::handle_add_partitions_to_txn(&ctx, "txn-1", 1000, 0, &topics).unwrap();
 
     let partitions = &response.results_by_topic_v3_and_below[0].results_by_partition;
     assert_eq!(partitions[0].partition_index, 0);
@@ -113,7 +113,7 @@ fn test_add_partitions_unknown_topic_is_not_created() {
         ("test-topic".to_string(), vec![0]),
     ];
     let response =
-        transaction::handle_add_partitions_to_txn(&ctx, "txn-1", 1000, 0, topics).unwrap();
+        transaction::handle_add_partitions_to_txn(&ctx, "txn-1", 1000, 0, &topics).unwrap();
     assert_eq!(
         add_partitions_codes(&response),
         vec![
@@ -134,7 +134,7 @@ fn add_partitions_with_begin_error(err: fn() -> KafkaError) -> Vec<i16> {
     // The error is reported on every requested partition (v0-3 has no
     // top-level error code), not returned as Err.
     let response =
-        transaction::handle_add_partitions_to_txn(&ctx, "txn-1", 1000, 0, topics).unwrap();
+        transaction::handle_add_partitions_to_txn(&ctx, "txn-1", 1000, 0, &topics).unwrap();
     add_partitions_codes(&response)
 }
 
@@ -202,7 +202,7 @@ fn test_add_offsets_invalid_state() {
     assert!(result.is_err());
     match result.unwrap_err() {
         KafkaError::InvalidTxnState { .. } => {}
-        e => panic!("Expected InvalidTransactionState error, got {:?}", e),
+        e => panic!("Expected InvalidTransactionState error, got {e:?}"),
     }
 }
 
@@ -224,7 +224,7 @@ fn test_add_offsets_txn_not_found() {
     assert!(result.is_err());
     match result.unwrap_err() {
         KafkaError::TransactionalIdNotFound { .. } => {}
-        e => panic!("Expected TransactionalIdNotFound error, got {:?}", e),
+        e => panic!("Expected TransactionalIdNotFound error, got {e:?}"),
     }
 }
 
@@ -245,7 +245,7 @@ fn test_add_offsets_producer_fenced() {
     assert!(result.is_err());
     match result.unwrap_err() {
         KafkaError::ProducerFenced { .. } => {}
-        e => panic!("Expected ProducerFenced error, got {:?}", e),
+        e => panic!("Expected ProducerFenced error, got {e:?}"),
     }
 }
 
@@ -342,7 +342,7 @@ fn test_end_txn_invalid_state() {
     assert!(result.is_err());
     match result.unwrap_err() {
         KafkaError::InvalidTxnState { .. } => {}
-        e => panic!("Expected InvalidTransactionState error, got {:?}", e),
+        e => panic!("Expected InvalidTransactionState error, got {e:?}"),
     }
 }
 
@@ -363,7 +363,7 @@ fn test_end_txn_txn_not_found() {
     assert!(result.is_err());
     match result.unwrap_err() {
         KafkaError::TransactionalIdNotFound { .. } => {}
-        e => panic!("Expected TransactionalIdNotFound error, got {:?}", e),
+        e => panic!("Expected TransactionalIdNotFound error, got {e:?}"),
     }
 }
 
@@ -383,7 +383,7 @@ fn test_end_txn_producer_fenced() {
     assert!(result.is_err());
     match result.unwrap_err() {
         KafkaError::ProducerFenced { .. } => {}
-        e => panic!("Expected ProducerFenced error, got {:?}", e),
+        e => panic!("Expected ProducerFenced error, got {e:?}"),
     }
 }
 
@@ -538,7 +538,7 @@ fn test_txn_offset_commit_invalid_state_empty() {
     assert!(result.is_err());
     match result.unwrap_err() {
         KafkaError::InvalidTxnState { .. } => {}
-        e => panic!("Expected InvalidTransactionState error, got {:?}", e),
+        e => panic!("Expected InvalidTransactionState error, got {e:?}"),
     }
 }
 
@@ -569,7 +569,7 @@ fn test_txn_offset_commit_producer_fenced() {
     assert!(result.is_err());
     match result.unwrap_err() {
         KafkaError::ProducerFenced { .. } => {}
-        e => panic!("Expected ProducerFenced error, got {:?}", e),
+        e => panic!("Expected ProducerFenced error, got {e:?}"),
     }
 }
 

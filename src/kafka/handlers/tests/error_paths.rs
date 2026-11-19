@@ -102,9 +102,9 @@ fn offset_commit_topic_lookup_failure_errors_every_partition_of_that_topic() {
     let resp = with_ctx(&store, |ctx| {
         handle_offset_commit(
             ctx,
-            "g".to_string(),
+            "g",
             -1,
-            "".to_string(),
+            "",
             vec![commit_topic("bad", &[0, 1]), commit_topic("ok", &[0])],
         )
     })
@@ -128,13 +128,7 @@ fn offset_commit_write_failure_is_per_partition() {
         .returning(|_, _, partition, _, _| if partition == 1 { Err(boom()) } else { Ok(()) });
 
     let resp = with_ctx(&store, |ctx| {
-        handle_offset_commit(
-            ctx,
-            "g".to_string(),
-            -1,
-            "".to_string(),
-            vec![commit_topic("ok", &[0, 1, 2])],
-        )
+        handle_offset_commit(ctx, "g", -1, "", vec![commit_topic("ok", &[0, 1, 2])])
     })
     .unwrap();
 
@@ -379,7 +373,7 @@ fn make_empty_group(ctx: &HandlerContext, group: &str) {
         ctx,
         crate::kafka::handlers::JoinGroupRequestData {
             group_id: group.to_string(),
-            member_id: "".to_string(),
+            member_id: String::new(),
             client_id: "client".to_string(),
             group_instance_id: None,
             session_timeout_ms: 30_000,
@@ -397,7 +391,7 @@ fn make_empty_group(ctx: &HandlerContext, group: &str) {
         .unwrap()
         .take()
         .expect("lone join answered immediately");
-    handle_leave_group(ctx, group.to_string(), join.member_id.to_string(), vec![]).unwrap();
+    handle_leave_group(ctx, group, &join.member_id, vec![]).unwrap();
     let state = ctx.coordinator.get_group_state(group).expect("group kept");
     assert!(state.members.is_empty());
 }
@@ -474,9 +468,17 @@ fn describe_configs_topic_lookup_failure_is_per_resource() {
     assert_eq!(resp.results.len(), 2);
     assert_eq!(resp.results[0].error_code, ERROR_UNKNOWN_SERVER_ERROR);
     assert!(resp.results[0].error_message.is_some());
-    assert!(resp.results[0].configs.is_empty());
+    assert_eq!(
+        resp.results[0].configs,
+        [] as [kafka_protocol::messages::describe_configs_response::DescribeConfigsResourceResult;
+            0]
+    );
     assert_eq!(resp.results[1].error_code, ERROR_NONE);
-    assert!(!resp.results[1].configs.is_empty());
+    assert_ne!(
+        resp.results[1].configs,
+        [] as [kafka_protocol::messages::describe_configs_response::DescribeConfigsResourceResult;
+            0]
+    );
 }
 
 #[test]
@@ -506,7 +508,11 @@ fn describe_configs_retention_lookup_failure_is_per_resource() {
     .unwrap();
 
     assert_eq!(resp.results[0].error_code, ERROR_UNKNOWN_SERVER_ERROR);
-    assert!(resp.results[0].configs.is_empty());
+    assert_eq!(
+        resp.results[0].configs,
+        [] as [kafka_protocol::messages::describe_configs_response::DescribeConfigsResourceResult;
+            0]
+    );
     assert_eq!(resp.results[1].error_code, ERROR_NONE);
 }
 
@@ -702,7 +708,7 @@ fn delete_records_topic_lookup_failure_errors_every_partition_of_that_topic() {
         .expect("a storage failure must not become a handler Err");
 
         let bad = &resp.topics[0].partitions;
-        assert_eq!(bad.len(), 2, "fail_count={}", fail_count);
+        assert_eq!(bad.len(), 2, "fail_count={fail_count}");
         for p in bad {
             assert_eq!(p.error_code, ERROR_UNKNOWN_SERVER_ERROR);
             assert_eq!(p.low_watermark, -1);

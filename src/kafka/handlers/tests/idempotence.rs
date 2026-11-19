@@ -27,9 +27,7 @@ fn test_handle_init_producer_id_new_producer() {
     let response = init_producer_id::handle_init_producer_id(
         &ctx,
         None,  // No transactional ID
-        60000, // Transaction timeout (unused for non-transactional)
-        -1,    // New producer
-        -1,    // New producer
+        60000, // New producer
         Some("test-client"),
     )
     .unwrap();

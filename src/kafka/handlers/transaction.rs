@@ -45,7 +45,7 @@ pub fn handle_add_partitions_to_txn(
     transactional_id: &str,
     producer_id: i64,
     producer_epoch: i16,
-    topics: Vec<(String, Vec<i32>)>, // (topic_name, partition_ids)
+    topics: &[(String, Vec<i32>)], // (topic_name, partition_ids)
 ) -> Result<AddPartitionsToTxnResponse> {
     let store = ctx.store;
 
@@ -55,7 +55,7 @@ pub fn handle_add_partitions_to_txn(
     // not begin, and the valid partitions get OPERATION_NOT_ATTEMPTED, as in Kafka.
     let mut resolved: Vec<ResolvedTopic> = Vec::new();
     let mut any_failed = false;
-    for (topic_name, partition_ids) in &topics {
+    for (topic_name, partition_ids) in topics {
         let topic = super::helpers::resolve_topic(store, topic_name);
         let results = partition_ids
             .iter()
@@ -115,7 +115,7 @@ pub fn handle_add_partitions_to_txn(
         store.begin_or_continue_transaction(transactional_id, producer_id, producer_epoch)
     {
         return Ok(add_partitions_to_txn_error_response(
-            &topics,
+            topics,
             e.to_kafka_error_code(),
         ));
     }
@@ -255,7 +255,10 @@ pub fn handle_end_txn(
 ///
 /// # Returns
 /// TxnOffsetCommitResponse with per-partition error codes
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one parameter per TxnOffsetCommit request field the handler checks"
+)]
 pub fn handle_txn_offset_commit(
     ctx: &HandlerContext,
     transactional_id: &str,
@@ -448,7 +451,7 @@ mod tests {
             let env = TestEnv::new();
             let ctx = env.ctx(&store);
             let result = handle_end_txn(&ctx, "txn", 1, 0, committed);
-            assert_eq!(result.is_ok(), ok, "{:?} commit={}", state, committed);
+            assert_eq!(result.is_ok(), ok, "{state:?} commit={committed}");
             if let Ok(r) = result {
                 assert_eq!(r.error_code, ERROR_NONE);
             }
@@ -473,7 +476,7 @@ mod tests {
         let ctx = env.ctx(&store);
 
         let topics = vec![("t".to_string(), vec![-1, 0])];
-        let resp = handle_add_partitions_to_txn(&ctx, "txn-1", 1, 0, topics).unwrap();
+        let resp = handle_add_partitions_to_txn(&ctx, "txn-1", 1, 0, &topics).unwrap();
         let by_partition = &resp.results_by_topic_v3_and_below[0].results_by_partition;
         let neg = by_partition
             .iter()

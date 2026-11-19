@@ -128,9 +128,9 @@ impl KafkaApi for OffsetCommitApi {
         call.run(request, |r, _| {
             handlers::handle_offset_commit(
                 &env.ctx,
-                r.group_id,
+                &r.group_id,
                 r.generation_id,
-                r.member_id,
+                &r.member_id,
                 r.topics,
             )
         })
@@ -294,7 +294,7 @@ impl KafkaApi for OffsetFetchApi {
 
     fn handle(request: Self::Request, call: Call<Self>, env: &ApiEnv<'_>) -> RequestOutcome {
         call.run(request, |r, _| {
-            handlers::handle_offset_fetch(&env.ctx, r.group_id, r.topics, r.require_stable)
+            handlers::handle_offset_fetch(&env.ctx, &r.group_id, r.topics, r.require_stable)
         })
     }
 }

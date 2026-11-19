@@ -41,9 +41,7 @@ fn test_handle_offset_commit_success() {
     let env = TestEnv::new();
     let ctx = env.ctx(&mock);
 
-    let response =
-        consumer::handle_offset_commit(&ctx, "test-group".to_string(), -1, String::new(), topics)
-            .unwrap();
+    let response = consumer::handle_offset_commit(&ctx, "test-group", -1, "", topics).unwrap();
 
     let partition_response = &response.topics[0].partitions[0];
     assert_eq!(partition_response.error_code, ERROR_NONE);
@@ -59,7 +57,7 @@ fn test_handle_offset_commit_rejects_stale_generation() {
     let joined = std::sync::Arc::new(std::sync::Mutex::new(None));
     let slot = joined.clone();
     coordinator.join_group(
-        crate::kafka::coordinator::JoinGroupParams {
+        &crate::kafka::coordinator::JoinGroupParams {
             group_id: "zombie-group".to_string(),
             member_id: None,
             client_id: "c1".to_string(),
@@ -87,14 +85,9 @@ fn test_handle_offset_commit_rejects_stale_generation() {
     let broker = BrokerMetadata::new("localhost".to_string(), 9092);
     let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
 
-    let response = consumer::handle_offset_commit(
-        &ctx,
-        "zombie-group".to_string(),
-        generation - 1,
-        member,
-        topics,
-    )
-    .unwrap();
+    let response =
+        consumer::handle_offset_commit(&ctx, "zombie-group", generation - 1, &member, topics)
+            .unwrap();
 
     assert_eq!(
         response.topics[0].partitions[0].error_code,
@@ -122,9 +115,7 @@ fn test_handle_offset_commit_unknown_topic() {
     let env = TestEnv::new();
     let ctx = env.ctx(&mock);
 
-    let response =
-        consumer::handle_offset_commit(&ctx, "test-group".to_string(), -1, String::new(), topics)
-            .unwrap();
+    let response = consumer::handle_offset_commit(&ctx, "test-group", -1, "", topics).unwrap();
 
     let partition_response = &response.topics[0].partitions[0];
     assert_eq!(
@@ -163,8 +154,7 @@ fn test_handle_offset_fetch_found() {
     let env = TestEnv::new();
     let ctx = env.ctx(&mock);
 
-    let response =
-        consumer::handle_offset_fetch(&ctx, "test-group".to_string(), topics, false).unwrap();
+    let response = consumer::handle_offset_fetch(&ctx, "test-group", topics, false).unwrap();
 
     let partition_response = &response.topics[0].partitions[0];
     assert_eq!(partition_response.error_code, ERROR_NONE);
@@ -195,8 +185,7 @@ fn test_handle_offset_fetch_not_found() {
     let env = TestEnv::new();
     let ctx = env.ctx(&mock);
 
-    let response =
-        consumer::handle_offset_fetch(&ctx, "test-group".to_string(), topics, false).unwrap();
+    let response = consumer::handle_offset_fetch(&ctx, "test-group", topics, false).unwrap();
 
     let partition_response = &response.topics[0].partitions[0];
     assert_eq!(partition_response.error_code, ERROR_NONE);
@@ -233,8 +222,7 @@ fn test_handle_offset_fetch_all_offsets() {
     let ctx = env.ctx(&mock);
 
     // Request with None = fetch all
-    let response =
-        consumer::handle_offset_fetch(&ctx, "test-group".to_string(), None, false).unwrap();
+    let response = consumer::handle_offset_fetch(&ctx, "test-group", None, false).unwrap();
 
     // Should have 2 topics
     assert_eq!(response.topics.len(), 2);

@@ -80,10 +80,8 @@ impl KafkaApi for InitProducerIdApi {
         call.run(request, |r, header| {
             handlers::handle_init_producer_id(
                 &env.ctx,
-                r.transactional_id,
+                r.transactional_id.as_deref(),
                 r.transaction_timeout_ms,
-                r.producer_id,
-                r.producer_epoch,
                 header.client_id.as_deref(),
             )
         })
@@ -210,7 +208,7 @@ impl KafkaApi for AddPartitionsToTxnApi {
                 &r.transactional_id,
                 r.producer_id,
                 r.producer_epoch,
-                r.topics,
+                &r.topics,
             )
         })
     }

@@ -453,7 +453,7 @@ mod tests {
     fn test_create_topics_empty_name() {
         let store = MockKafkaStore::new();
         let topics = vec![CreateTopicRequest {
-            name: "".to_string(),
+            name: String::new(),
             num_partitions: 1,
             replication_factor: 1,
         }];

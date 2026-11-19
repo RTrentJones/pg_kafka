@@ -411,7 +411,7 @@ mod wave3_tests {
                 .flat_map(|t| t.partition_responses.iter())
                 .map(|p| (p.index, p.error_code, p.base_offset))
                 .collect();
-        out.sort();
+        out.sort_unstable();
         out
     }
 
@@ -474,7 +474,7 @@ mod wave3_tests {
             .iter()
             .map(|p| (p.index, p.error_code, p.base_offset, p.log_start_offset))
             .collect();
-        got.sort();
+        got.sort_unstable();
         assert_eq!(got, vec![(0, ERROR_NONE, 11, 5), (1, ERROR_NONE, 3, 6)]);
     }
 

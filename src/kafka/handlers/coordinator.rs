@@ -23,7 +23,7 @@ const PLACEHOLDER_CLIENT_HOST: &str = "localhost";
 /// In our single-node setup, we always return ourselves as the coordinator.
 pub fn handle_find_coordinator(
     ctx: &HandlerContext,
-    key: String,
+    key: &str,
     key_type: i8,
 ) -> Result<kafka_protocol::messages::find_coordinator_response::FindCoordinatorResponse> {
     let broker_host = ctx.broker.host();
@@ -236,7 +236,7 @@ where
     };
 
     ctx.coordinator.join_group(
-        params,
+        &params,
         Box::new(move |outcome| {
             respond(build_join_group_response(
                 outcome,
@@ -358,8 +358,8 @@ impl Drop for SyncGroupReply {
 /// `GroupCoordinator::sync_group`).
 pub fn handle_sync_group<F>(
     ctx: &HandlerContext,
-    group_id: String,
-    member_id: String,
+    group_id: &str,
+    member_id: &str,
     generation_id: i32,
     assignments: Vec<crate::kafka::messages::SyncGroupAssignment>,
     respond: F,
@@ -389,9 +389,9 @@ pub fn handle_sync_group<F>(
     let assignments_empty =
         coord_assignments.is_empty() || coord_assignments.iter().all(|(_, bytes)| bytes.is_empty());
 
-    if assignments_empty && coordinator.is_group_leader(&group_id, &member_id) {
+    if assignments_empty && coordinator.is_group_leader(group_id, member_id) {
         // Get subscribed topics from group members
-        if let Ok(topics) = coordinator.get_subscribed_topics(&group_id) {
+        if let Ok(topics) = coordinator.get_subscribed_topics(group_id) {
             if !topics.is_empty() {
                 // Get partition counts for all topics in a single query (avoid N+1)
                 let mut topic_partitions: HashMap<String, i32> = HashMap::new();
@@ -404,7 +404,7 @@ pub fn handle_sync_group<F>(
                 // Compute assignments server-side
                 if !topic_partitions.is_empty() {
                     if let Ok(computed) =
-                        coordinator.compute_assignments(&group_id, &topic_partitions)
+                        coordinator.compute_assignments(group_id, &topic_partitions)
                     {
                         crate::pg_debug!(
                             "SyncGroup: computed {} assignments server-side for group {}",
@@ -453,8 +453,8 @@ fn build_sync_group_response(outcome: crate::kafka::coordinator::SyncOutcome) ->
 /// Updates member's last heartbeat timestamp.
 pub fn handle_heartbeat(
     ctx: &HandlerContext,
-    group_id: String,
-    member_id: String,
+    group_id: &str,
+    member_id: &str,
     generation_id: i32,
 ) -> Result<kafka_protocol::messages::heartbeat_response::HeartbeatResponse> {
     let coordinator = ctx.coordinator;
@@ -484,8 +484,8 @@ pub fn handle_heartbeat(
 /// Consumer gracefully leaves the consumer group.
 pub fn handle_leave_group(
     ctx: &HandlerContext,
-    group_id: String,
-    member_id: String,
+    group_id: &str,
+    member_id: &str,
     members: Vec<crate::kafka::messages::MemberIdentity>,
 ) -> Result<kafka_protocol::messages::leave_group_response::LeaveGroupResponse> {
     let coordinator = ctx.coordinator;
@@ -513,7 +513,7 @@ pub fn handle_leave_group(
                 group_id,
                 m.member_id
             );
-            let error_code = match coordinator.leave_group(group_id.clone(), m.member_id.clone()) {
+            let error_code = match coordinator.leave_group(group_id, &m.member_id) {
                 Ok(()) => ERROR_NONE,
                 Err(e) => e.to_kafka_error_code(),
             };
@@ -641,7 +641,7 @@ pub fn handle_describe_groups(
 /// This is useful for discovery, administration, and monitoring.
 pub fn handle_list_groups(
     ctx: &HandlerContext,
-    states_filter: Vec<String>,
+    states_filter: &[String],
 ) -> Result<kafka_protocol::messages::list_groups_response::ListGroupsResponse> {
     let coordinator = ctx.coordinator;
     use kafka_protocol::messages::list_groups_response::{ListGroupsResponse, ListedGroup};
@@ -806,8 +806,8 @@ mod tests {
             let writer = slot.clone();
             handle_sync_group(
                 &self.ctx(),
-                group.to_string(),
-                member_id.to_string(),
+                group,
+                member_id,
                 generation,
                 assignments,
                 move |response| {
@@ -823,7 +823,7 @@ mod tests {
     #[test]
     fn test_handle_find_coordinator_success() {
         let f = Fixture::new();
-        let response = handle_find_coordinator(&f.ctx(), "test-group".to_string(), 0).unwrap();
+        let response = handle_find_coordinator(&f.ctx(), "test-group", 0).unwrap();
         assert_eq!(response.error_code, ERROR_NONE);
         assert_eq!(response.node_id, DEFAULT_BROKER_ID);
         assert_eq!(response.host.as_str(), "localhost");
@@ -923,7 +923,7 @@ mod tests {
                 assert_eq!((correlation_id, api_version), (7, 5));
                 assert_eq!(response.error_code, ERROR_NONE);
             }
-            other => panic!("unexpected response {:?}", other),
+            other => panic!("unexpected response {other:?}"),
         }
         assert!(rx.try_recv().is_err(), "exactly one response");
 
@@ -940,7 +940,7 @@ mod tests {
                     crate::kafka::constants::ERROR_UNKNOWN_SERVER_ERROR
                 );
             }
-            other => panic!("unexpected response {:?}", other),
+            other => panic!("unexpected response {other:?}"),
         }
 
         // A disconnected client is ignored.
@@ -1010,7 +1010,7 @@ mod tests {
                 assert_eq!((correlation_id, api_version), (7, 3));
                 assert_eq!(response.error_code, ERROR_NONE);
             }
-            other => panic!("unexpected response {:?}", other),
+            other => panic!("unexpected response {other:?}"),
         }
         assert!(rx.try_recv().is_err(), "exactly one response");
 
@@ -1027,7 +1027,7 @@ mod tests {
                     crate::kafka::constants::ERROR_UNKNOWN_SERVER_ERROR
                 );
             }
-            other => panic!("unexpected response {:?}", other),
+            other => panic!("unexpected response {other:?}"),
         }
         drop(rx);
         SyncGroupReply::new(9, 3, tx).send(SyncGroupResponse::default());
@@ -1038,18 +1038,12 @@ mod tests {
         let f = Fixture::new();
         let join = f.join_now("test-group", "");
         let member_id = join.member_id.to_string();
-        let ok = handle_heartbeat(
-            &f.ctx(),
-            "test-group".to_string(),
-            member_id,
-            join.generation_id,
-        )
-        .unwrap();
+        let ok = handle_heartbeat(&f.ctx(), "test-group", &member_id, join.generation_id).unwrap();
         assert_eq!(ok.error_code, ERROR_NONE);
         let unknown = handle_heartbeat(
             &f.ctx(),
-            "test-group".to_string(),
-            "unknown-member-id".to_string(),
+            "test-group",
+            "unknown-member-id",
             join.generation_id,
         );
         assert!(matches!(unknown, Err(KafkaError::UnknownMemberId { .. })));
@@ -1059,22 +1053,11 @@ mod tests {
     fn test_handle_leave_group_v0_and_unknown_member() {
         let f = Fixture::new();
         let member_id = f.join_now("test-group", "").member_id.to_string();
-        let unknown = handle_leave_group(
-            &f.ctx(),
-            "test-group".to_string(),
-            "unknown-member-id".to_string(),
-            vec![],
-        );
+        let unknown = handle_leave_group(&f.ctx(), "test-group", "unknown-member-id", vec![]);
         assert!(matches!(unknown, Err(KafkaError::UnknownMemberId { .. })));
-        let leave = handle_leave_group(
-            &f.ctx(),
-            "test-group".to_string(),
-            member_id.clone(),
-            vec![],
-        )
-        .unwrap();
+        let leave = handle_leave_group(&f.ctx(), "test-group", &member_id, vec![]).unwrap();
         assert_eq!(leave.error_code, ERROR_NONE);
-        assert!(handle_heartbeat(&f.ctx(), "test-group".to_string(), member_id, 1).is_err());
+        assert!(handle_heartbeat(&f.ctx(), "test-group", &member_id, 1).is_err());
     }
 
     #[test]
@@ -1085,8 +1068,8 @@ mod tests {
         let member_id = f.join_now("test-group", "").member_id.to_string();
         let leave = handle_leave_group(
             &f.ctx(),
-            "test-group".to_string(),
-            String::new(),
+            "test-group",
+            "",
             vec![
                 crate::kafka::messages::MemberIdentity {
                     member_id: member_id.clone(),
@@ -1103,7 +1086,7 @@ mod tests {
         assert_eq!(leave.members.len(), 2);
         assert_eq!(leave.members[0].error_code, ERROR_NONE);
         assert_ne!(leave.members[1].error_code, ERROR_NONE);
-        assert!(handle_heartbeat(&f.ctx(), "test-group".to_string(), member_id, 1).is_err());
+        assert!(handle_heartbeat(&f.ctx(), "test-group", &member_id, 1).is_err());
     }
 
     #[test]
@@ -1112,7 +1095,7 @@ mod tests {
         let leader = f.join_now("test-group", "").member_id.to_string();
         let second = f.join("test-group", "", 30_000);
         assert!(take(&second).is_none());
-        handle_leave_group(&f.ctx(), "test-group".to_string(), leader, vec![]).unwrap();
+        handle_leave_group(&f.ctx(), "test-group", &leader, vec![]).unwrap();
         let second = take(&second).expect("answered by the LeaveGroup");
         assert_eq!(second.error_code, ERROR_NONE);
         assert_eq!(second.leader, second.member_id);
@@ -1135,13 +1118,16 @@ mod tests {
         assert_eq!(group.members[0].member_id.as_str(), join.member_id.as_str());
         assert_eq!(described.groups[1].group_state.as_str(), "Dead");
 
-        let all = handle_list_groups(&f.ctx(), vec![]).unwrap();
+        let all = handle_list_groups(&f.ctx(), &[]).unwrap();
         assert_eq!(all.groups.len(), 1);
         let completing =
-            handle_list_groups(&f.ctx(), vec!["CompletingRebalance".to_string()]).unwrap();
+            handle_list_groups(&f.ctx(), &["CompletingRebalance".to_string()]).unwrap();
         assert_eq!(completing.groups.len(), 1);
-        let empty = handle_list_groups(&f.ctx(), vec!["Empty".to_string()]).unwrap();
-        assert!(empty.groups.is_empty());
+        let empty = handle_list_groups(&f.ctx(), &["Empty".to_string()]).unwrap();
+        assert_eq!(
+            empty.groups,
+            [] as [kafka_protocol::messages::list_groups_response::ListedGroup; 0]
+        );
     }
 
     #[test]
@@ -1170,7 +1156,7 @@ mod tests {
         );
 
         assert!(handle_describe_groups(&ctx, vec!["g".to_string()]).is_ok());
-        assert!(handle_list_groups(&ctx, vec![]).is_ok());
+        assert!(handle_list_groups(&ctx, &[]).is_ok());
     }
 
     // ----- wave3 groups -----
@@ -1182,7 +1168,7 @@ mod tests {
             .returning(move |g| Ok(groups.contains(&g)));
         store
             .expect_list_offset_groups()
-            .returning(move || Ok(groups.iter().map(|g| g.to_string()).collect()));
+            .returning(move || Ok(groups.iter().map(ToString::to_string).collect()));
         store
     }
 
@@ -1230,10 +1216,13 @@ mod tests {
         assert_eq!(d.groups[0].error_code, ERROR_NONE);
         assert_eq!(d.groups[0].group_state.as_str(), "Empty");
         assert_eq!(d.groups[0].protocol_type.as_str(), "consumer");
-        assert!(d.groups[0].members.is_empty());
+        assert_eq!(
+            d.groups[0].members,
+            [] as [kafka_protocol::messages::describe_groups_response::DescribedGroupMember; 0]
+        );
         assert_eq!(d.groups[1].group_state.as_str(), "Dead");
 
-        let l = handle_list_groups(&ctx, vec![]).unwrap();
+        let l = handle_list_groups(&ctx, &[]).unwrap();
         let listed: Vec<(&str, &str, &str)> = l
             .groups
             .iter()
@@ -1252,7 +1241,7 @@ mod tests {
                 ("live", "consumer", "CompletingRebalance")
             ]
         );
-        let empty_only = handle_list_groups(&ctx, vec!["empty".to_string()]).unwrap();
+        let empty_only = handle_list_groups(&ctx, &["empty".to_string()]).unwrap();
         assert_eq!(
             empty_only.groups.len(),
             1,

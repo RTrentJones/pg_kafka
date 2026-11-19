@@ -9,6 +9,7 @@ use crate::kafka::constants::ERROR_NONE;
 use crate::kafka::error::Result;
 use crate::kafka::handler_context::HandlerContext;
 use crate::kafka::storage::{FetchedMessage, IsolationLevel};
+use kafka_protocol::indexmap::IndexMap;
 use kafka_protocol::messages::TopicName;
 use kafka_protocol::protocol::StrBytes;
 
@@ -135,7 +136,7 @@ pub(crate) fn encode_record_batches(
             timestamp: msg.timestamp,
             key: msg.key.map(bytes::Bytes::from),
             value: msg.value.map(bytes::Bytes::from),
-            headers: Default::default(),
+            headers: IndexMap::default(),
         };
         // DR-8: return stored headers to the consumer.
         for (k, v) in msg.headers {
@@ -990,7 +991,7 @@ mod storage_stream_tests {
         assert_eq!(i32::from_be_bytes(b[23..27].try_into().unwrap()), i32::MAX);
         let mut buf = b.clone();
         let set = RecordBatchDecoder::decode_all(&mut buf).unwrap();
-        assert_eq!(set[0].records[0].offset, i32::MAX as i64);
+        assert_eq!(set[0].records[0].offset, i64::from(i32::MAX));
     }
 
     fn one_partition_mock(hwm: i64, lso: i64) -> MockKafkaStore {

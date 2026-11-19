@@ -300,7 +300,7 @@ impl GroupCoordinator {
     ///   follower whose SyncGroup preceded the leader's) is answered with the current
     ///   generation; anything else starts a new join phase.
     /// - PreparingRebalance: the member joins the phase in progress.
-    pub fn join_group(&self, params: JoinGroupParams, responder: JoinResponder) {
+    pub fn join_group(&self, params: &JoinGroupParams, responder: JoinResponder) {
         let mut deliveries = Vec::new();
         let mut replaced = None;
         let mut responder = Some(responder);
@@ -353,7 +353,7 @@ impl GroupCoordinator {
     /// JoinGroups (this one's included) are appended to `out`.
     fn join_locked(
         groups: &mut HashMap<String, ConsumerGroup>,
-        params: JoinGroupParams,
+        params: &JoinGroupParams,
         max_groups: usize,
         max_group_size: usize,
         out: &mut Vec<Delivery>,
@@ -457,23 +457,23 @@ impl GroupCoordinator {
 
         match group.state {
             GroupState::Stable if unchanged && !is_leader => {
-                group.upsert_member(&member_id, &params);
+                group.upsert_member(&member_id, params);
                 return Ok(JoinDisposition::Respond(Ok(
                     group.join_result_for(&member_id)
                 )));
             }
             GroupState::CompletingRebalance if unchanged => {
-                group.upsert_member(&member_id, &params);
+                group.upsert_member(&member_id, params);
                 return Ok(JoinDisposition::Respond(Ok(
                     group.join_result_for(&member_id)
                 )));
             }
             GroupState::Empty | GroupState::Stable | GroupState::CompletingRebalance => {
-                group.upsert_member(&member_id, &params);
+                group.upsert_member(&member_id, params);
                 group.prepare_rebalance(out);
             }
             GroupState::PreparingRebalance => {
-                group.upsert_member(&member_id, &params);
+                group.upsert_member(&member_id, params);
             }
         }
 
@@ -505,8 +505,8 @@ impl GroupCoordinator {
     /// - Stable: the stored assignment.
     pub fn sync_group(
         &self,
-        group_id: String,
-        member_id: String,
+        group_id: &str,
+        member_id: &str,
         generation_id: i32,
         assignments: Vec<(String, Vec<u8>)>, // (member_id, assignment_bytes)
         responder: SyncResponder,
@@ -518,8 +518,8 @@ impl GroupCoordinator {
         let immediate: Option<SyncOutcome> = match self.groups.write() {
             Ok(mut groups) => match Self::sync_locked(
                 &mut groups,
-                &group_id,
-                &member_id,
+                group_id,
+                member_id,
                 generation_id,
                 assignments,
                 &mut deliveries,
@@ -531,7 +531,7 @@ impl GroupCoordinator {
                     if let Some(responder) = responder.take() {
                         replaced = self
                             .lock_pending_syncs()
-                            .insert((group_id.clone(), member_id.clone()), responder);
+                            .insert((group_id.to_string(), member_id.to_string()), responder);
                     }
                     None
                 }
@@ -544,7 +544,7 @@ impl GroupCoordinator {
 
         if let Some(old) = replaced {
             old(Err(KafkaError::RebalanceInProgress {
-                group_id: group_id.clone(),
+                group_id: group_id.to_string(),
             }));
         }
         if let (Some(outcome), Some(responder)) = (immediate, responder) {
@@ -673,16 +673,8 @@ impl GroupCoordinator {
             KafkaError::Internal(format!("Failed to acquire groups read lock: {e}"))
         })?;
 
-        let group = match groups.get(group_id) {
-            Some(g) => g,
-            // RA-5: a consumer presenting a generation (>= 0, checked above) for a
-            // group this coordinator has no record of is stale — the group was
-            // almost certainly reaped by the empty-group sweep (CG-5) while the
-            // consumer was partitioned or lagging. Fence it with UNKNOWN_MEMBER_ID
-            // so it rejoins and gets a fresh generation, instead of accepting a
-            // zombie offset commit. (A simple consumer, generation < 0, already
-            // returned Ok above and is unaffected.)
-            None => return Err(KafkaError::unknown_member(group_id, member_id)),
+        let Some(group) = groups.get(group_id) else {
+            return Err(KafkaError::unknown_member(group_id, member_id));
         };
 
         if !group.members.contains_key(member_id) {
@@ -770,7 +762,7 @@ impl GroupCoordinator {
     /// member gets UNKNOWN_MEMBER_ID, then a generation other than the current one
     /// ILLEGAL_GENERATION; during the join phase a member gets REBALANCE_IN_PROGRESS
     /// (its cue to rejoin), and during the sync phase and when Stable it gets NONE.
-    pub fn heartbeat(&self, group_id: String, member_id: String, generation_id: i32) -> Result<()> {
+    pub fn heartbeat(&self, group_id: &str, member_id: &str, generation_id: i32) -> Result<()> {
         let mut groups = self.groups.write().map_err(|e| {
             KafkaError::Internal(format!("Failed to acquire groups write lock: {e}"))
         })?;
@@ -778,28 +770,28 @@ impl GroupCoordinator {
         // Unknown group (e.g. lost in a worker restart): UNKNOWN_MEMBER_ID so the
         // client rejoins, as Kafka answers.
         let group = groups
-            .get_mut(&group_id)
-            .ok_or_else(|| KafkaError::unknown_member(&group_id, &member_id))?;
+            .get_mut(group_id)
+            .ok_or_else(|| KafkaError::unknown_member(group_id, member_id))?;
 
-        if !group.members.contains_key(&member_id) {
-            return Err(KafkaError::unknown_member(&group_id, &member_id));
+        if !group.members.contains_key(member_id) {
+            return Err(KafkaError::unknown_member(group_id, member_id));
         }
         if group.generation_id != generation_id {
             return Err(KafkaError::illegal_generation(
-                &group_id,
+                group_id,
                 generation_id,
                 group.generation_id,
             ));
         }
 
-        let Some(member) = group.members.get_mut(&member_id) else {
-            return Err(KafkaError::unknown_member(&group_id, &member_id));
+        let Some(member) = group.members.get_mut(member_id) else {
+            return Err(KafkaError::unknown_member(group_id, member_id));
         };
         member.last_heartbeat = Instant::now();
 
         if group.state == GroupState::PreparingRebalance {
             return Err(KafkaError::RebalanceInProgress {
-                group_id: group_id.clone(),
+                group_id: group_id.to_string(),
             });
         }
 
@@ -811,22 +803,22 @@ impl GroupCoordinator {
     /// Removes the member from the group. Remaining members of a Stable or
     /// CompletingRebalance group rebalance; a join phase in progress completes if the
     /// leaver was the last member that had not rejoined.
-    pub fn leave_group(&self, group_id: String, member_id: String) -> Result<()> {
+    pub fn leave_group(&self, group_id: &str, member_id: &str) -> Result<()> {
         let mut deliveries = Vec::new();
         let result = {
             let mut groups = self.groups.write().map_err(|e| {
                 KafkaError::Internal(format!("Failed to acquire groups write lock: {e}"))
             })?;
 
-            match groups.get_mut(&group_id) {
-                None => Err(KafkaError::unknown_member(&group_id, &member_id)),
+            match groups.get_mut(group_id) {
+                None => Err(KafkaError::unknown_member(group_id, member_id)),
                 Some(group) => {
                     pg_log!("LeaveGroup: group_id={}, member_id={}", group_id, member_id);
-                    if group.remove_member(&member_id, &mut deliveries) {
+                    if group.remove_member(member_id, &mut deliveries) {
                         group.on_members_removed(&mut deliveries);
                         Ok(())
                     } else {
-                        Err(KafkaError::unknown_member(&group_id, &member_id))
+                        Err(KafkaError::unknown_member(group_id, member_id))
                     }
                 }
             }
@@ -853,12 +845,9 @@ impl GroupCoordinator {
         let mut deliveries = Vec::new();
 
         {
-            let mut groups = match self.groups.write() {
-                Ok(g) => g,
-                Err(_) => {
-                    // Lock poisoned, skip this check
-                    return removed;
-                }
+            let Ok(mut groups) = self.groups.write() else {
+                // Lock poisoned, skip this check
+                return removed;
             };
 
             for (group_id, group) in groups.iter_mut() {

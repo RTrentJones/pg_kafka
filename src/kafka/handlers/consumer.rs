@@ -18,9 +18,9 @@ use kafka_protocol::protocol::StrBytes;
 /// Commits consumer offsets for a consumer group
 pub fn handle_offset_commit(
     ctx: &HandlerContext,
-    group_id: String,
+    group_id: &str,
     generation_id: i32,
-    member_id: String,
+    member_id: &str,
     topics: Vec<crate::kafka::messages::OffsetCommitTopicData>,
 ) -> Result<kafka_protocol::messages::offset_commit_response::OffsetCommitResponse> {
     let store = ctx.store;
@@ -34,7 +34,7 @@ pub fn handle_offset_commit(
     // `GroupCoordinator::validate_offset_commit` (generation -1 only for an unknown/Empty group).
     if let Err(e) = ctx
         .coordinator
-        .validate_offset_commit(&group_id, &member_id, generation_id)
+        .validate_offset_commit(group_id, member_id, generation_id)
     {
         let error_code = e.to_kafka_error_code();
         let response_topics: Vec<_> = topics
@@ -108,7 +108,7 @@ pub fn handle_offset_commit(
 
             // Commit offset
             let error_code = match store.commit_offset(
-                &group_id,
+                group_id,
                 topic_id,
                 partition_id,
                 committed_offset,
@@ -161,7 +161,7 @@ pub fn handle_offset_commit(
 /// instead of starting from an offset the transaction may still replace.
 pub fn handle_offset_fetch(
     ctx: &HandlerContext,
-    group_id: String,
+    group_id: &str,
     topics: Option<Vec<crate::kafka::messages::OffsetFetchTopicData>>,
     require_stable: bool,
 ) -> Result<kafka_protocol::messages::offset_fetch_response::OffsetFetchResponse> {
@@ -169,7 +169,7 @@ pub fn handle_offset_fetch(
     // wave3 txn: partitions with a pending transactional commit (require_stable only).
     let unstable: std::collections::HashSet<(String, i32)> = if require_stable {
         store
-            .pending_txn_offset_partitions(&group_id)?
+            .pending_txn_offset_partitions(group_id)?
             .into_iter()
             .collect()
     } else {
@@ -220,7 +220,7 @@ pub fn handle_offset_fetch(
 
             // Fetch committed offset for each requested partition
             for partition_index in topic_request.partition_indexes {
-                let offset_result = store.fetch_offset(&group_id, topic_id, partition_index);
+                let offset_result = store.fetch_offset(group_id, topic_id, partition_index);
 
                 let mut partition_response = OffsetFetchResponsePartition::default();
                 partition_response.partition_index = partition_index;
@@ -271,7 +271,7 @@ pub fn handle_offset_fetch(
         }
     } else {
         // Fetch all topics for this consumer group
-        let all_offsets_result = store.fetch_all_offsets(&group_id);
+        let all_offsets_result = store.fetch_all_offsets(group_id);
 
         match all_offsets_result {
             Ok(offsets) => {
@@ -349,7 +349,7 @@ mod tests {
         let ctx = env.ctx(&store);
 
         // topics = None selects the fetch-all path.
-        let resp = handle_offset_fetch(&ctx, "g".to_string(), None, false).unwrap();
+        let resp = handle_offset_fetch(&ctx, "g", None, false).unwrap();
         assert_ne!(resp.error_code, ERROR_NONE);
     }
 
@@ -383,7 +383,7 @@ mod tests {
             name: "t".to_string(),
             partitions: vec![partition(1), partition(2), partition(-1)],
         }];
-        let resp = handle_offset_commit(&ctx, "g".to_string(), -1, String::new(), topics).unwrap();
+        let resp = handle_offset_commit(&ctx, "g", -1, "", topics).unwrap();
         let codes: Vec<(i32, i16)> = resp.topics[0]
             .partitions
             .iter()
@@ -433,7 +433,7 @@ mod tests {
                 partition_indexes: vec![0, 1],
             }])
         };
-        let resp = handle_offset_fetch(&ctx, "g".to_string(), topics(), true).unwrap();
+        let resp = handle_offset_fetch(&ctx, "g", topics(), true).unwrap();
         assert_eq!(resp.error_code, ERROR_NONE);
         let parts = &resp.topics[0].partitions;
         assert_eq!(
@@ -445,7 +445,7 @@ mod tests {
         assert_eq!(parts[1].committed_offset, 5);
 
         // Without require_stable the pending set is not even read (times(1) above).
-        let resp = handle_offset_fetch(&ctx, "g".to_string(), topics(), false).unwrap();
+        let resp = handle_offset_fetch(&ctx, "g", topics(), false).unwrap();
         assert!(resp.topics[0]
             .partitions
             .iter()

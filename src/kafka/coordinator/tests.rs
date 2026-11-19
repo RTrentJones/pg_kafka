@@ -63,7 +63,7 @@ impl SyncExt for GroupCoordinator {
         assignments: Vec<(String, Vec<u8>)>,
     ) -> SyncSlot {
         let (responder, slot) = sync_recorder();
-        self.sync_group(group, member, generation, assignments, responder);
+        self.sync_group(&group, &member, generation, assignments, responder);
         slot
     }
 
@@ -108,7 +108,7 @@ fn params(group: &str, member: Option<&str>, protocols: &[(&str, &[u8])]) -> Joi
     }
 }
 
-fn join_with(c: &GroupCoordinator, p: JoinGroupParams) -> Slot {
+fn join_with(c: &GroupCoordinator, p: &JoinGroupParams) -> Slot {
     let (responder, slot) = recorder();
     c.join_group(p, responder);
     slot
@@ -116,7 +116,7 @@ fn join_with(c: &GroupCoordinator, p: JoinGroupParams) -> Slot {
 
 /// Join with default parameters and the "range" protocol.
 fn join(c: &GroupCoordinator, group: &str, member: Option<&str>) -> Slot {
-    join_with(c, params(group, member, &[("range", b"sub")]))
+    join_with(c, &params(group, member, &[("range", b"sub")]))
 }
 
 fn is_pending(slot: &Slot) -> bool {
@@ -127,7 +127,7 @@ fn is_pending(slot: &Slot) -> bool {
 fn joined(slot: &Slot) -> JoinResult {
     match slot.lock().unwrap().take() {
         Some(Ok(r)) => r,
-        Some(Err(e)) => panic!("join failed: {}", e),
+        Some(Err(e)) => panic!("join failed: {e}"),
         None => panic!("join still pending"),
     }
 }
@@ -136,7 +136,7 @@ fn joined(slot: &Slot) -> JoinResult {
 fn join_error_code(slot: &Slot) -> i16 {
     match slot.lock().unwrap().take() {
         Some(Err(e)) => e.to_kafka_error_code(),
-        Some(Ok(r)) => panic!("expected an error, got {:?}", r),
+        Some(Ok(r)) => panic!("expected an error, got {r:?}"),
         None => panic!("join still pending"),
     }
 }
@@ -296,7 +296,7 @@ fn test_effective_rebalance_timeout_falls_back_to_session_timeout() {
     member.session_timeout_ms = 0;
     assert_eq!(
         member.effective_rebalance_timeout_ms(),
-        DEFAULT_REBALANCE_TIMEOUT_MS as u128
+        u128::from(DEFAULT_REBALANCE_TIMEOUT_MS)
     );
 }
 
@@ -331,7 +331,7 @@ fn test_leader_sync_moves_group_to_stable() {
         .unwrap();
     assert_eq!(assignment, b"A".to_vec());
     assert_eq!(state(&c, "g"), GroupState::Stable);
-    assert!(c.heartbeat("g".to_string(), a.member_id, 1).is_ok());
+    assert!(c.heartbeat("g", &a.member_id, 1).is_ok());
 }
 
 #[test]
@@ -351,7 +351,7 @@ fn test_new_member_join_on_stable_group_is_held_until_existing_member_rejoins() 
 
     // `a` learns of the rebalance from Heartbeat at its (still current) generation.
     assert!(matches!(
-        c.heartbeat("g".to_string(), a.clone(), 1),
+        c.heartbeat("g", &a, 1),
         Err(KafkaError::RebalanceInProgress { .. })
     ));
 
@@ -398,21 +398,21 @@ fn test_heartbeat_by_state() {
     let a = joined(&join(&c, "g", None)).member_id;
     // CompletingRebalance, current generation: NONE (Kafka; clients heartbeat
     // between the JoinGroup response and SyncGroup).
-    assert!(c.heartbeat("g".to_string(), a.clone(), 1).is_ok());
+    assert!(c.heartbeat("g", &a, 1).is_ok());
     // Stale generation.
     assert!(matches!(
-        c.heartbeat("g".to_string(), a.clone(), 0),
+        c.heartbeat("g", &a, 0),
         Err(KafkaError::IllegalGeneration { .. })
     ));
     // Unknown member / unknown group. An unknown member is reported as such even
     // with a stale generation (Kafka checks the member first), so an evicted
     // client rejoins as a new member.
     assert!(matches!(
-        c.heartbeat("g".to_string(), "ghost".to_string(), 1),
+        c.heartbeat("g", "ghost", 1),
         Err(KafkaError::UnknownMemberId { .. })
     ));
     assert!(matches!(
-        c.heartbeat("g".to_string(), "ghost".to_string(), 0),
+        c.heartbeat("g", "ghost", 0),
         Err(KafkaError::UnknownMemberId { .. })
     ));
     assert!(matches!(
@@ -424,17 +424,17 @@ fn test_heartbeat_by_state() {
         Err(KafkaError::UnknownMemberId { .. })
     ));
     assert!(matches!(
-        c.heartbeat("nope".to_string(), a.clone(), 1),
+        c.heartbeat("nope", &a, 1),
         Err(KafkaError::UnknownMemberId { .. })
     ));
     c.sync_now("g".to_string(), a.clone(), 1, vec![(a.clone(), vec![1])])
         .unwrap();
-    assert!(c.heartbeat("g".to_string(), a.clone(), 1).is_ok());
+    assert!(c.heartbeat("g", &a, 1).is_ok());
     // PreparingRebalance: REBALANCE_IN_PROGRESS, and the heartbeat counts.
     let _b = join(&c, "g", None);
     age_member(&c, "g", &a, Duration::from_secs(20));
     assert!(matches!(
-        c.heartbeat("g".to_string(), a.clone(), 1),
+        c.heartbeat("g", &a, 1),
         Err(KafkaError::RebalanceInProgress { .. })
     ));
     let g = c.get_group_state("g").unwrap();
@@ -507,7 +507,7 @@ fn test_sync_group_by_state() {
     assert_eq!(state(&c, "g"), GroupState::CompletingRebalance);
     assert_eq!(generation(&c, "g"), gen2);
     // A parked member keeps its session alive (and may heartbeat meanwhile).
-    assert!(c.heartbeat("g".to_string(), follower.clone(), gen2).is_ok());
+    assert!(c.heartbeat("g", &follower, gen2).is_ok());
 
     // Wrong generation / unknown member / unknown group.
     assert!(matches!(
@@ -575,7 +575,7 @@ fn test_follower_rejoin_with_unchanged_metadata_keeps_generation_and_assignment(
 fn test_follower_rejoin_with_changed_metadata_starts_rebalance() {
     let c = GroupCoordinator::new();
     let (_leader, follower, gen) = stable_pair(&c, "g");
-    let slot = join_with(&c, params("g", Some(&follower), &[("range", b"new")]));
+    let slot = join_with(&c, &params("g", Some(&follower), &[("range", b"new")]));
     assert!(is_pending(&slot));
     assert_eq!(state(&c, "g"), GroupState::PreparingRebalance);
     assert_eq!(generation(&c, "g"), gen);
@@ -651,35 +651,35 @@ fn test_inconsistent_group_protocol() {
     use crate::kafka::constants::ERROR_INCONSISTENT_GROUP_PROTOCOL as E;
     let c = GroupCoordinator::new();
     // Empty protocol list or empty protocol type on a new group: refused, no group left.
-    assert_eq!(join_error_code(&join_with(&c, params("n", None, &[]))), E);
+    assert_eq!(join_error_code(&join_with(&c, &params("n", None, &[]))), E);
     let mut p = params("n", None, &[("range", b"")]);
     p.protocol_type = String::new();
-    assert_eq!(join_error_code(&join_with(&c, p)), E);
+    assert_eq!(join_error_code(&join_with(&c, &p)), E);
     assert!(c.get_group_state("n").is_none());
 
     let leader = stable_single(&c, "g");
     // Different protocol type, same protocol.
     let mut p = params("g", None, &[("range", b"sub")]);
     p.protocol_type = "connect".to_string();
-    assert_eq!(join_error_code(&join_with(&c, p)), E);
+    assert_eq!(join_error_code(&join_with(&c, &p)), E);
     // Same type, no protocol in common.
     assert_eq!(
-        join_error_code(&join_with(&c, params("g", None, &[("roundrobin", b"")]))),
+        join_error_code(&join_with(&c, &params("g", None, &[("roundrobin", b"")]))),
         E
     );
     // Empty protocol list on an existing group.
-    assert_eq!(join_error_code(&join_with(&c, params("g", None, &[]))), E);
+    assert_eq!(join_error_code(&join_with(&c, &params("g", None, &[]))), E);
     // None of these disturbed the group.
     assert_eq!(state(&c, "g"), GroupState::Stable);
     assert_eq!(c.get_group_state("g").unwrap().members.len(), 1);
     // The only member keeps the group's protocol type...
     let mut p = params("g", Some(&leader), &[("range", b"sub")]);
     p.protocol_type = "connect".to_string();
-    assert_eq!(join_error_code(&join_with(&c, p)), E);
+    assert_eq!(join_error_code(&join_with(&c, &p)), E);
     // ...but may switch protocols: there is no one else to agree with.
     let r = joined(&join_with(
         &c,
-        params("g", Some(&leader), &[("roundrobin", b"x")]),
+        &params("g", Some(&leader), &[("roundrobin", b"x")]),
     ));
     assert_eq!(r.protocol_name.as_deref(), Some("roundrobin"));
 }
@@ -688,14 +688,14 @@ fn test_inconsistent_group_protocol() {
 fn test_protocol_type_is_kept_when_group_empties() {
     let c = GroupCoordinator::new();
     let m = stable_single(&c, "g");
-    c.leave_group("g".to_string(), m).unwrap();
+    c.leave_group("g", &m).unwrap();
     let g = c.get_group_state("g").unwrap();
     assert_eq!(g.state, GroupState::Empty);
     assert_eq!(g.protocol_type.as_deref(), Some("consumer"));
     // An Empty group accepts any protocol type again (Kafka's rule).
     let mut p = params("g", None, &[("x", b"")]);
     p.protocol_type = "connect".to_string();
-    joined(&join_with(&c, p));
+    joined(&join_with(&c, &p));
     assert_eq!(
         c.get_group_state("g").unwrap().protocol_type.as_deref(),
         Some("connect")
@@ -710,14 +710,14 @@ fn test_group_protocol_is_chosen_by_member_vote() {
     let both_rr: &[(&str, &[u8])] = &[("roundrobin", b""), ("range", b"")];
     let leader = joined(&join_with(
         &c,
-        params("g", None, &[("range", b""), ("roundrobin", b"")]),
+        &params("g", None, &[("range", b""), ("roundrobin", b"")]),
     ));
     assert_eq!(leader.protocol_name.as_deref(), Some("range"));
-    let f1 = join_with(&c, params("g", None, both_rr));
-    let f2 = join_with(&c, params("g", None, both_rr));
+    let f1 = join_with(&c, &params("g", None, both_rr));
+    let f2 = join_with(&c, &params("g", None, both_rr));
     let l = joined(&join_with(
         &c,
-        params(
+        &params(
             "g",
             Some(&leader.member_id),
             &[("range", b""), ("roundrobin", b"")],
@@ -757,7 +757,7 @@ fn test_max_groups_evicts_oldest_empty_group_then_refuses() {
     let c = GroupCoordinator::new();
     c.set_limits(2, 10);
     let a = stable_single(&c, "a");
-    c.leave_group("a".to_string(), a).unwrap(); // "a" is Empty now
+    c.leave_group("a", &a).unwrap(); // "a" is Empty now
     stable_single(&c, "b");
     // Full (2): the Empty "a" is forgotten to make room for "c".
     joined(&join(&c, "c", None));
@@ -782,8 +782,7 @@ fn test_validate_offset_commit_matches_kafka() {
     let code = |g: &str, m: &str, gen: i32| {
         c.validate_offset_commit(g, m, gen)
             .err()
-            .map(|e| e.to_kafka_error_code())
-            .unwrap_or(0)
+            .map_or(0, |e| e.to_kafka_error_code())
     };
     // Unknown group: generation -1 is a simple consumer (any member id); >= 0 is stale.
     assert_eq!(code("nope", "", -1), 0);
@@ -808,7 +807,7 @@ fn test_validate_offset_commit_matches_kafka() {
 
     // Empty group: anything at generation -1 goes; a generation needs membership.
     let e = stable_single(&c, "e");
-    c.leave_group("e".to_string(), e.clone()).unwrap();
+    c.leave_group("e", &e).unwrap();
     assert_eq!(code("e", "", -1), 0);
     assert_eq!(code("e", &e, -1), 0);
     assert_eq!(code("e", "x", 5), UM);
@@ -861,13 +860,13 @@ fn test_join_selects_strategy_common_to_all_members() {
     let c = GroupCoordinator::new();
     let leader = joined(&join_with(
         &c,
-        params("g", None, &[("sticky", b"s"), ("range", b"r")]),
+        &params("g", None, &[("sticky", b"s"), ("range", b"r")]),
     ))
     .member_id;
-    let follower = join_with(&c, params("g", None, &[("range", b"r2")]));
+    let follower = join_with(&c, &params("g", None, &[("range", b"r2")]));
     let l = joined(&join_with(
         &c,
-        params("g", Some(&leader), &[("sticky", b"s"), ("range", b"r")]),
+        &params("g", Some(&leader), &[("sticky", b"s"), ("range", b"r")]),
     ));
     let f = joined(&follower);
     assert_eq!(l.protocol_name.as_deref(), Some("range"));
@@ -883,12 +882,12 @@ fn test_join_leader_gets_selected_protocol_metadata() {
     let c = GroupCoordinator::new();
     let leader = joined(&join_with(
         &c,
-        params("g", None, &[("roundrobin", b"rr-leader")]),
+        &params("g", None, &[("roundrobin", b"rr-leader")]),
     ))
     .member_id;
     let follower = join_with(
         &c,
-        params(
+        &params(
             "g",
             None,
             &[("range", b"range-follower"), ("roundrobin", b"rr-follower")],
@@ -896,7 +895,7 @@ fn test_join_leader_gets_selected_protocol_metadata() {
     );
     let l = joined(&join_with(
         &c,
-        params("g", Some(&leader), &[("roundrobin", b"rr-leader")]),
+        &params("g", Some(&leader), &[("roundrobin", b"rr-leader")]),
     ));
     let f = joined(&follower);
     assert_eq!(l.protocol_name.as_deref(), Some("roundrobin"));
@@ -913,7 +912,7 @@ fn test_leave_of_member_that_had_not_rejoined_completes_held_join() {
     let a = stable_single(&c, "g");
     let b = join(&c, "g", None);
     assert!(is_pending(&b));
-    c.leave_group("g".to_string(), a.clone()).unwrap();
+    c.leave_group("g", &a).unwrap();
     let b = joined(&b);
     assert_eq!(b.generation_id, 2);
     assert!(b.is_leader(), "leadership passes to the remaining member");
@@ -927,7 +926,7 @@ fn test_leave_of_waiting_member_answers_its_join_unknown_member() {
     let (leader, follower, gen) = stable_pair(&c, "g");
     let l = join(&c, "g", Some(&leader));
     assert!(is_pending(&l));
-    c.leave_group("g".to_string(), leader.clone()).unwrap();
+    c.leave_group("g", &leader).unwrap();
     assert_eq!(
         join_error_code(&l),
         crate::kafka::constants::ERROR_UNKNOWN_MEMBER_ID
@@ -943,7 +942,7 @@ fn test_leave_of_waiting_member_answers_its_join_unknown_member() {
 fn test_leave_triggers_rebalance_from_stable_and_sync_phase() {
     let c = GroupCoordinator::new();
     let (leader, _follower, _) = stable_pair(&c, "g");
-    c.leave_group("g".to_string(), leader).unwrap();
+    c.leave_group("g", &leader).unwrap();
     assert_eq!(state(&c, "g"), GroupState::PreparingRebalance);
 
     let c = GroupCoordinator::new();
@@ -952,7 +951,7 @@ fn test_leave_triggers_rebalance_from_stable_and_sync_phase() {
     let _ = joined(&join(&c, "g2", Some(&a)));
     let b = joined(&b).member_id;
     assert_eq!(state(&c, "g2"), GroupState::CompletingRebalance);
-    c.leave_group("g2".to_string(), b).unwrap();
+    c.leave_group("g2", &b).unwrap();
     assert_eq!(state(&c, "g2"), GroupState::PreparingRebalance);
 }
 
@@ -960,17 +959,17 @@ fn test_leave_triggers_rebalance_from_stable_and_sync_phase() {
 fn test_last_leave_empties_group_and_keeps_generation() {
     let c = GroupCoordinator::new();
     let a = stable_single(&c, "g");
-    c.leave_group("g".to_string(), a.clone()).unwrap();
+    c.leave_group("g", &a).unwrap();
     let g = c.get_group_state("g").unwrap();
     assert_eq!(g.state, GroupState::Empty);
     assert!(g.leader.is_none());
     assert_eq!(g.generation_id, 1);
     assert!(matches!(
-        c.leave_group("g".to_string(), a),
+        c.leave_group("g", &a),
         Err(KafkaError::UnknownMemberId { .. })
     ));
     assert!(matches!(
-        c.leave_group("nope".to_string(), "m".to_string()),
+        c.leave_group("nope", "m"),
         Err(KafkaError::UnknownMemberId { .. })
     ));
     // Rejoining continues the generation (zombie fencing).
@@ -1008,13 +1007,19 @@ fn test_sweep_does_not_expire_session_of_member_waiting_on_its_join() {
         .unwrap();
     // `b` cannot heartbeat while blocked on its JoinGroup.
     age_member(&c, "g", &b_id, Duration::from_secs(31));
-    assert!(c.check_and_remove_timed_out_members().is_empty());
+    assert_eq!(
+        c.check_and_remove_timed_out_members(),
+        [] as [(String, String); 0]
+    );
     assert!(is_pending(&b_slot));
     assert_eq!(c.pending_join_count(), 1);
     // When the phase completes, the session clock restarts.
     let _ = joined(&join(&c, "g", Some(&a)));
-    assert!(joined(&b_slot).generation_id == 2);
-    assert!(c.check_and_remove_timed_out_members().is_empty());
+    assert_eq!(joined(&b_slot).generation_id, 2);
+    assert_eq!(
+        c.check_and_remove_timed_out_members(),
+        [] as [(String, String); 0]
+    );
 }
 
 #[test]
@@ -1025,12 +1030,15 @@ fn test_sweep_rebalance_timeout_evicts_stragglers_and_completes_join() {
     let l = join(&c, "g", Some(&leader));
     // The follower keeps heartbeating but never rejoins.
     assert!(matches!(
-        c.heartbeat("g".to_string(), follower.clone(), gen),
+        c.heartbeat("g", &follower, gen),
         Err(KafkaError::RebalanceInProgress { .. })
     ));
     // Within the 60s rebalance timeout nothing happens.
     age_rebalance(&c, "g", Duration::from_secs(59));
-    assert!(c.check_and_remove_timed_out_members().is_empty());
+    assert_eq!(
+        c.check_and_remove_timed_out_members(),
+        [] as [(String, String); 0]
+    );
     assert!(is_pending(&l));
 
     age_rebalance(&c, "g", Duration::from_secs(61));
@@ -1044,11 +1052,14 @@ fn test_sweep_rebalance_timeout_evicts_stragglers_and_completes_join() {
     assert_eq!(state(&c, "g"), GroupState::CompletingRebalance);
     // The evicted follower is fenced and must rejoin as a new member.
     assert!(matches!(
-        c.heartbeat("g".to_string(), follower, gen + 1),
+        c.heartbeat("g", &follower, gen + 1),
         Err(KafkaError::UnknownMemberId { .. })
     ));
     // The sync phase starts a fresh window: the leader is not evicted next sweep.
-    assert!(c.check_and_remove_timed_out_members().is_empty());
+    assert_eq!(
+        c.check_and_remove_timed_out_members(),
+        [] as [(String, String); 0]
+    );
 }
 
 #[test]
@@ -1059,7 +1070,7 @@ fn test_rebalance_timeout_honors_member_rebalance_timeout_ms() {
     let mut p = params("g", None, &[("range", b"sub")]);
     p.rebalance_timeout_ms = 20;
     p.session_timeout_ms = 300_000;
-    let a = joined(&join_with(&c, p)).member_id;
+    let a = joined(&join_with(&c, &p)).member_id;
     c.sync_now("g".to_string(), a.clone(), 1, vec![(a.clone(), vec![])])
         .unwrap();
     let b = join(&c, "g", None);
@@ -1152,7 +1163,7 @@ fn test_join_group_enforces_member_cap() {
         let mut groups = c.groups.write().unwrap();
         let mut g = ConsumerGroup::new("g".to_string());
         for i in 0..crate::kafka::limits::DEFAULT_GROUP_MAX_SIZE {
-            g.upsert_member(&format!("m{}", i), &params("g", None, &[("range", b"")]));
+            g.upsert_member(&format!("m{i}"), &params("g", None, &[("range", b"")]));
         }
         g.state = GroupState::Stable;
         groups.insert("g".to_string(), g);
@@ -1162,7 +1173,7 @@ fn test_join_group_enforces_member_cap() {
         crate::kafka::constants::ERROR_GROUP_MAX_SIZE_REACHED
     );
     // A known member may still rejoin.
-    let rejoin = joined(&join_with(&c, params("g", Some("m1"), &[("range", b"")])));
+    let rejoin = joined(&join_with(&c, &params("g", Some("m1"), &[("range", b"")])));
     assert_eq!(rejoin.member_id, "m1");
     assert_eq!(
         state(&c, "g"),
@@ -1197,7 +1208,10 @@ fn test_poisoned_lock_answers_join_with_error() {
         join_error_code(&slot),
         crate::kafka::constants::ERROR_UNKNOWN_SERVER_ERROR
     );
-    assert!(c.check_and_remove_timed_out_members().is_empty());
+    assert_eq!(
+        c.check_and_remove_timed_out_members(),
+        [] as [(String, String); 0]
+    );
 }
 
 // ----- parked follower SyncGroup -----
@@ -1266,7 +1280,7 @@ fn test_parked_sync_fails_when_another_member_leaves() {
         b.generation_id,
         vec![],
     );
-    c.leave_group("g".to_string(), x.member_id).unwrap();
+    c.leave_group("g", &x.member_id).unwrap();
     assert_eq!(
         synced(&parked).unwrap_err().to_kafka_error_code(),
         crate::kafka::constants::ERROR_REBALANCE_IN_PROGRESS
@@ -1279,7 +1293,7 @@ fn test_parked_sync_of_leaving_member_answered_unknown_member() {
     let c = GroupCoordinator::new();
     let (_leader, follower, gen) = completing_pair(&c, "g");
     let parked = c.sync_park("g".to_string(), follower.clone(), gen, vec![]);
-    c.leave_group("g".to_string(), follower).unwrap();
+    c.leave_group("g", &follower).unwrap();
     assert_eq!(
         synced(&parked).unwrap_err().to_kafka_error_code(),
         crate::kafka::constants::ERROR_UNKNOWN_MEMBER_ID
@@ -1296,10 +1310,13 @@ fn test_parked_sync_times_out_when_leader_never_syncs() {
     let parked = c.sync_park("g".to_string(), follower.clone(), gen, vec![]);
     // A parked member is exempt from the session timeout (as a waiting joiner).
     age_member(&c, "g", &follower, Duration::from_secs(31));
-    assert!(c.check_and_remove_timed_out_members().is_empty());
+    assert_eq!(
+        c.check_and_remove_timed_out_members(),
+        [] as [(String, String); 0]
+    );
     assert!(sync_pending(&parked));
     // (Clients heartbeat while their SyncGroup waits; Heartbeat answers NONE.)
-    assert!(c.heartbeat("g".to_string(), follower.clone(), gen).is_ok());
+    assert!(c.heartbeat("g", &follower, gen).is_ok());
 
     age_rebalance(&c, "g", Duration::from_secs(61));
     let removed = c.check_and_remove_timed_out_members();

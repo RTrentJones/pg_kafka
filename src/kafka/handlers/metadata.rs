@@ -152,8 +152,11 @@ mod wave3_groups_tests {
             crate::kafka::limits::HARD_MAX_PARTITIONS + 1,
         ] {
             let t = topic_metadata_for("t".to_string(), bad);
-            assert_eq!(t.error_code, ERROR_UNKNOWN_SERVER_ERROR, "count {}", bad);
-            assert!(t.partitions.is_empty());
+            assert_eq!(t.error_code, ERROR_UNKNOWN_SERVER_ERROR, "count {bad}");
+            assert_eq!(
+                t.partitions,
+                [] as [kafka_protocol::messages::metadata_response::MetadataResponsePartition; 0]
+            );
         }
     }
 }

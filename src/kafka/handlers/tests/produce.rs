@@ -157,11 +157,10 @@ fn test_handle_produce_txn_wrong_state_rejected() {
         .flat_map(|t| t.partition_responses.iter())
         .map(|p| p.error_code)
         .collect();
-    assert!(!codes.is_empty());
+    assert_ne!(codes, [] as [i16; 0]);
     assert!(
         codes.iter().all(|c| *c == ERROR_INVALID_TXN_STATE),
-        "{:?}",
-        codes
+        "{codes:?}"
     );
 }
 
@@ -199,11 +198,10 @@ fn test_handle_produce_txn_id_not_found_rejected() {
         .flat_map(|t| t.partition_responses.iter())
         .map(|p| p.error_code)
         .collect();
-    assert!(!codes.is_empty());
+    assert_ne!(codes, [] as [i16; 0]);
     assert!(
         codes.iter().all(|c| *c == ERROR_TRANSACTIONAL_ID_NOT_FOUND),
-        "{:?}",
-        codes
+        "{codes:?}"
     );
 }
 
@@ -244,7 +242,10 @@ fn test_handle_produce_key_based_routing() {
 
     let response = produce::handle_produce(&ctx, topic_data, None, None).unwrap();
     let topic_response = &response.responses[0];
-    assert!(!topic_response.partition_responses.is_empty());
+    assert_ne!(
+        topic_response.partition_responses,
+        [] as [kafka_protocol::messages::produce_response::PartitionProduceResponse; 0]
+    );
     for pr in &topic_response.partition_responses {
         assert_eq!(pr.error_code, ERROR_NONE);
         assert!((0..3).contains(&pr.index));

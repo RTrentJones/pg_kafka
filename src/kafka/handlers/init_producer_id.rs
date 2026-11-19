@@ -34,24 +34,20 @@ pub fn transaction_timeout_is_valid(timeout_ms: i32, max_timeout_ms: i32) -> boo
 /// - If not found, allocates new producer ID and creates transaction record
 ///
 /// For idempotent-only producers (transactional_id is None) a new producer ID is
-/// allocated, whatever `existing_producer_id` / `existing_epoch` say (Kafka 3.7).
+/// allocated; the producer id and epoch the request presents are ignored, as in Kafka 3.7.
 ///
 /// # Arguments
 /// * `ctx` - Handler context (store, coordinator, broker metadata, etc.)
 /// * `transactional_id` - Optional transactional ID (for transactional producers)
 /// * `transaction_timeout_ms` - Transaction timeout in ms (for transactional producers)
-/// * `existing_producer_id` - Producer ID the client holds (-1 for none; ignored)
-/// * `existing_epoch` - Epoch the client holds (-1 for none; ignored)
 /// * `client_id` - Optional client identifier for debugging
 ///
 /// # Returns
 /// InitProducerIdResponse with allocated (producer_id, epoch) or error
 pub fn handle_init_producer_id(
     ctx: &HandlerContext,
-    transactional_id: Option<String>,
+    transactional_id: Option<&str>,
     transaction_timeout_ms: i32,
-    _existing_producer_id: i64,
-    _existing_epoch: i16,
     client_id: Option<&str>,
 ) -> Result<InitProducerIdResponse> {
     // The GUC is read only for a transactional producer (the bound does not apply to
@@ -73,7 +69,7 @@ pub fn handle_init_producer_id(
 /// [`handle_init_producer_id`] with an explicit `transaction.max.timeout.ms`.
 pub(crate) fn init_producer_id_bounded(
     ctx: &HandlerContext,
-    transactional_id: Option<String>,
+    transactional_id: Option<&str>,
     transaction_timeout_ms: i32,
     client_id: Option<&str>,
     max_timeout_ms: i32,
@@ -82,7 +78,7 @@ pub(crate) fn init_producer_id_bounded(
     let mut response = InitProducerIdResponse::default();
 
     // Phase 10: Handle transactional producers
-    if let Some(ref txn_id) = transactional_id {
+    if let Some(txn_id) = transactional_id {
         // Wave 3: validate the timeout first, as Kafka does (the producer is not
         // touched, so an existing transaction is not fenced by a bad request).
         if !transaction_timeout_is_valid(transaction_timeout_ms, max_timeout_ms) {
@@ -127,18 +123,12 @@ mod tests {
     use crate::testing::mocks::MockKafkaStore;
     use crate::testing::TestEnv;
 
-    fn run(store: &MockKafkaStore, existing_epoch: i16) -> Result<InitProducerIdResponse> {
-        let env = TestEnv::new();
-        let ctx = env.ctx(store);
-        handle_init_producer_id(&ctx, None, 60000, 1000, existing_epoch, None)
-    }
-
     fn run_txn(store: &MockKafkaStore, timeout_ms: i32) -> InitProducerIdResponse {
         let env = TestEnv::new();
         let ctx = env.ctx(store);
         init_producer_id_bounded(
             &ctx,
-            Some("tx".to_string()),
+            Some("tx"),
             timeout_ms,
             None,
             crate::kafka::constants::DEFAULT_TRANSACTION_MAX_TIMEOUT_MS,
@@ -177,32 +167,5 @@ mod tests {
             .times(1)
             .returning(|_, _, _| Ok((7, 0)));
         assert_eq!(run_txn(&store, 900_000).error_code, ERROR_NONE);
-    }
-
-    /// Kafka 3.7 answers an idempotent InitProducerId that presents a producer id
-    /// (KIP-360: a client resuming after its state expired, or retrying a request
-    /// whose epoch bump it never saw) with a fresh producer id at epoch 0, whether
-    /// the id is current, stale or unknown. pg_kafka answered PRODUCER_FENCED or
-    /// UNKNOWN_PRODUCER_ID, which the Java producer treats as fatal.
-    #[test]
-    fn idempotent_reinit_with_an_existing_id_gets_a_new_producer_id() {
-        for epoch in [-1i16, 0, 2, 3, 4, i16::MAX] {
-            let mut store = MockKafkaStore::new();
-            store
-                .expect_allocate_producer_id()
-                .times(1)
-                .returning(|_, _| Ok((2000, 0)));
-            let response = run(&store, epoch).unwrap();
-            assert_eq!(
-                (
-                    response.error_code,
-                    response.producer_id.0,
-                    response.producer_epoch
-                ),
-                (ERROR_NONE, 2000, 0),
-                "presented epoch {}",
-                epoch
-            );
-        }
     }
 }
