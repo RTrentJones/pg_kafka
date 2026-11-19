@@ -90,7 +90,11 @@ pub fn get_or_create_valid_topic<S: TopicStore + ?Sized>(
             }),
         };
     }
-    store.get_or_create_topic(topic_name, default_partitions)
+    // wave3 groups: never auto-create above pg_kafka.max_partitions_per_topic.
+    store.get_or_create_topic(
+        topic_name,
+        crate::kafka::limits::auto_create_partitions(default_partitions),
+    )
 }
 
 /// Returns the appropriate Kafka error code for a topic resolution failure.

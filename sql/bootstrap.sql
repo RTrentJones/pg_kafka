@@ -998,3 +998,15 @@ COMMENT ON VIEW kafka.sasl_users IS 'Kafka SASL users and their mechanisms, with
 
 -- END SASL credentials (auth stream)
 -- =============================================================================
+
+-- =============================================================================
+-- wave3 groups: bound kafka.topics.partitions
+-- =============================================================================
+-- Metadata and the assignors allocate one entry per partition, so an unbounded stored count
+-- (CreateTopics used to accept 2000000000) aborted the worker on every Metadata request and
+-- sent the server into crash recovery. The handlers cap counts at
+-- pg_kafka.max_partitions_per_topic (at most 100000); this is the schema backstop.
+ALTER TABLE kafka.topics ADD CONSTRAINT topics_partitions_range
+    CHECK (partitions >= 1 AND partitions <= 100000);
+-- END wave3 groups
+-- =============================================================================

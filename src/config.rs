@@ -629,6 +629,9 @@ pub fn init() {
     // auth stream: listener security protocols, TLS files, SASL mechanisms.
     crate::kafka::auth::settings::register_gucs();
 
+    // wave3 groups: partition / group-size / group-count caps (kafka::limits).
+    crate::kafka::limits::register_gucs();
+
     pgrx::log!("pg_kafka GUC parameters initialized (including shadow mode)");
 }
 

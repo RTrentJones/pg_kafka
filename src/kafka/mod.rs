@@ -53,6 +53,8 @@ pub mod protocol;
 pub mod response_builders;
 pub mod shadow;
 pub mod storage;
+// wave3 groups
+pub mod limits;
 
 // Re-export commonly used types for convenience
 pub use broker_metadata::BrokerMetadata;

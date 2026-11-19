@@ -43,6 +43,11 @@ impl AssignmentInput {
         subscriptions: HashMap<String, MemberSubscription>,
         topic_partitions: HashMap<String, i32>,
     ) -> Self {
+        // wave3 groups: the assignors iterate every partition, so a topic whose stored count
+        // is corrupt (outside 1..=HARD_MAX_PARTITIONS) is left out instead of being expanded.
+        let mut topic_partitions = topic_partitions;
+        topic_partitions
+            .retain(|_, count| crate::kafka::limits::sane_partition_count(*count).is_some());
         Self {
             subscriptions,
             topic_partitions,
@@ -115,6 +120,23 @@ pub fn create_strategy(name: &str) -> Option<Box<dyn AssignmentStrategy>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_assignment_input_drops_corrupt_partition_counts() {
+        // wave3 groups: a corrupt stored count must not be expanded into billions of partitions.
+        let input = AssignmentInput::new(
+            HashMap::new(),
+            HashMap::from([
+                ("ok".to_string(), 4),
+                ("zero".to_string(), 0),
+                ("huge".to_string(), 2_000_000_000),
+            ]),
+        );
+        assert_eq!(input.topic_partitions.len(), 1);
+        assert_eq!(input.topic_partitions.get("ok"), Some(&4));
+        let out = RangeStrategy::new().assign(&input);
+        assert!(out.is_empty() || out.values().all(|a| a.topic_partitions.len() <= 1));
+    }
 
     #[test]
     fn test_create_strategy_range() {
