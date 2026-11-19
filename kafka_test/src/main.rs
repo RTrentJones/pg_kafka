@@ -2155,6 +2155,7 @@ fn get_all_tests() -> Vec<TestDef> {
             name: "test_w3_fetch_groups_records_into_batches",
             test_fn: wrap_test!(kafka_test::w3_txn::protocol::test_w3_fetch_groups_records_into_batches),
             parallel_safe: true,
+        },
         // wave3 net: hostile clients (kafka_test/src/w3_net). Sequential: they hold
         // shared broker resources or reconfigure + restart the listener (limits::*,
         // setup first, teardown last).
