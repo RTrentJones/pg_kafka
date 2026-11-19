@@ -1,66 +1,113 @@
-//! Fetch long polling: re-run a Fetch until it has `min_bytes`, an error, or its
-//! `max_wait_ms` deadline passes.
+//! Fetch long polling: re-run a Fetch until it has `min_bytes`, a partition error, or
+//! its `max_wait_ms` deadline passes.
+//!
+//! The fetch is re-run only when there is reason to expect new data:
+//! 1. Every requested topic-partition is registered in the [`PendingFetchRegistry`] (one
+//!    shared `Notify`) BEFORE the first fetch attempt, and stays registered for the
+//!    whole long poll. A notification that lands while an attempt is in flight leaves a
+//!    stored permit on the `Notify`, so there is no missed wake-up window between "fetch
+//!    returned too little" and "start waiting".
+//! 2. The fetch goes to the worker; its response is returned if it meets `min_bytes`,
+//!    carries a partition error, or the deadline has passed.
+//! 3. Otherwise the long poll waits for a new-data notification (Produce for this
+//!    partition, or EndTxn for a `read_committed` fetch), the deadline, or the slow
+//!    safety-net interval (`pg_kafka.fetch_poll_interval_ms`, for a dropped notification
+//!    or data that became visible without one), then goes to 2.
+//!
+//! An idle long poll therefore costs one fetch at the start, one per safety-net interval
+//! and one at the deadline.
 
+use bytes::Bytes;
 use crossbeam_channel::Sender;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::Notify;
 use tracing::{debug, warn};
 
 use super::dispatch::send_with_backpressure;
 use crate::kafka::api::{FetchRequestData, RequestBody, RequestHeader, ResponseBody};
-use crate::kafka::messages::{KafkaRequest, KafkaResponse, TopicFetchData};
+use crate::kafka::constants::API_KEY_FETCH;
+use crate::kafka::messages::{KafkaRequest, KafkaResponse};
 use crate::kafka::pending_fetches::PendingFetchRegistry;
+use crate::kafka::storage::IsolationLevel;
 
-/// Handle a FetchRequest with long polling support
-///
-/// The fetch is re-run only when there is reason to expect new data:
-/// 1. Register every requested topic-partition in the registry (one shared
-///    `Notify`) BEFORE the first fetch attempt, and keep the registration for
-///    the whole long poll. A notification that lands while an attempt is in
-///    flight leaves a stored permit on the `Notify`, so there is no missed
-///    wake-up window between "fetch returned too little" and "start waiting".
-/// 2. Send the fetch to the worker; return it if it meets `min_bytes`, carries a
-///    partition error, or the deadline has passed.
-/// 3. Otherwise wait for a new-data notification (Produce for this partition,
-///    or EndTxn for a `read_committed` fetch), the deadline, or the slow
-///    safety-net interval `poll_interval_ms` (for a dropped notification or data
-///    that became visible without one), then go to 2.
-///
-/// An idle long poll therefore costs one fetch at the start, one per safety-net
-/// interval (default 1 s), and one at the deadline, instead of one per 100 ms.
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn handle_fetch_long_poll(
-    correlation_id: i32,
-    client_id: Option<String>,
-    api_version: i16,
-    max_wait_ms: i32,
-    min_bytes: i32,
-    max_bytes: i32,
-    isolation_level: i8,
-    topic_data: Vec<TopicFetchData>,
+/// The safety-net interval for a `pg_kafka.fetch_poll_interval_ms` value (at least 1 ms).
+pub(super) fn poll_interval(fetch_poll_interval_ms: i32) -> Duration {
+    Duration::from_millis(u64::try_from(fetch_poll_interval_ms).unwrap_or(0).max(1))
+}
+
+/// Why a long poll ended without answering its client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LongPollError {
+    /// The worker's request channel is closed.
+    WorkerGone,
+    /// The worker dropped a fetch attempt without answering it.
+    NoResponse,
+}
+
+impl std::fmt::Display for LongPollError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            LongPollError::WorkerGone => "Worker channel closed",
+            LongPollError::NoResponse => "Response channel closed",
+        })
+    }
+}
+
+impl std::error::Error for LongPollError {}
+
+/// One Fetch request that waits for data.
+pub(super) struct LongPoll {
+    header: RequestHeader,
+    fetch: FetchRequestData,
+    /// The worker's main lane.
     request_tx: Sender<KafkaRequest>,
-    final_response_tx: UnboundedSender<KafkaResponse>,
-    registry: Arc<PendingFetchRegistry>,
-    poll_interval_ms: i32,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let deadline = Instant::now() + Duration::from_millis(max_wait_ms.max(0) as u64);
-    let poll_interval = Duration::from_millis(poll_interval_ms.max(1) as u64);
-    let read_committed = isolation_level == 1;
+    /// The client's response slot.
+    response_tx: UnboundedSender<KafkaResponse>,
+}
 
-    // The client is gone (its connection's writer, which owns the response slot,
-    // has been torn down): do nothing rather than queue work for the DB thread.
-    if final_response_tx.is_closed() {
-        debug!("Long poll: client disconnected, abandoning fetch");
-        return Ok(());
+impl LongPoll {
+    /// The long poll of one Fetch request; `request_tx` is the worker's main lane.
+    pub(super) fn new(
+        header: RequestHeader,
+        fetch: FetchRequestData,
+        request_tx: Sender<KafkaRequest>,
+        response_tx: UnboundedSender<KafkaResponse>,
+    ) -> Self {
+        debug!(
+            "Fetch request with long polling: max_wait_ms={}, min_bytes={}, isolation_level={}",
+            fetch.max_wait_ms, fetch.min_bytes, fetch.isolation_level
+        );
+        LongPoll {
+            header,
+            fetch,
+            request_tx,
+            response_tx,
+        }
     }
 
-    let notify = Arc::new(tokio::sync::Notify::new());
-    for topic in &topic_data {
-        for partition in &topic.partitions {
+    /// Answer the client: register for wake-ups, fetch until done, unregister.
+    pub(super) async fn run(
+        self,
+        registry: &PendingFetchRegistry,
+        poll_interval: Duration,
+    ) -> Result<(), LongPollError> {
+        // The client is gone (its connection's writer, which owns the response slot,
+        // has been torn down): do nothing rather than queue work for the DB thread.
+        if self.response_tx.is_closed() {
+            debug!("Long poll: client disconnected, abandoning fetch");
+            return Ok(());
+        }
+        let max_wait = u64::try_from(self.fetch.max_wait_ms).unwrap_or(0);
+        let deadline = Instant::now() + Duration::from_millis(max_wait);
+        let read_committed =
+            IsolationLevel::from_i8(self.fetch.isolation_level) == IsolationLevel::ReadCommitted;
+
+        let notify = std::sync::Arc::new(Notify::new());
+        for (topic, partition) in self.partitions() {
             registry
                 .register(
-                    &topic.name,
+                    topic,
                     partition.partition_index,
                     partition.fetch_offset,
                     notify.clone(),
@@ -68,143 +115,112 @@ pub(super) async fn handle_fetch_long_poll(
                 )
                 .await;
         }
-    }
 
-    let result = long_poll_loop(
-        correlation_id,
-        client_id,
-        api_version,
-        max_bytes,
-        min_bytes,
-        isolation_level,
-        &topic_data,
-        &request_tx,
-        &final_response_tx,
-        &notify,
-        deadline,
-        poll_interval,
-    )
-    .await;
+        let result = self
+            .fetch_until_done(&notify, deadline, poll_interval)
+            .await;
 
-    // Always drop our registrations, whatever the outcome.
-    for topic in &topic_data {
-        for partition in &topic.partitions {
+        // Always drop the registrations, whatever the outcome.
+        for (topic, partition) in self.partitions() {
             registry
-                .unregister(&topic.name, partition.partition_index, &notify)
+                .unregister(topic, partition.partition_index, &notify)
                 .await;
         }
+        result
     }
 
-    result
-}
+    /// Every requested `(topic name, partition)`.
+    fn partitions(
+        &self,
+    ) -> impl Iterator<Item = (&str, &crate::kafka::messages::PartitionFetchData)> {
+        self.fetch
+            .topic_data
+            .iter()
+            .flat_map(|t| t.partitions.iter().map(move |p| (t.name.as_str(), p)))
+    }
 
-/// The fetch / wait loop of [`handle_fetch_long_poll`]; the caller owns the
-/// registry registration around it.
-#[allow(clippy::too_many_arguments)]
-async fn long_poll_loop(
-    correlation_id: i32,
-    client_id: Option<String>,
-    api_version: i16,
-    max_bytes: i32,
-    min_bytes: i32,
-    isolation_level: i8,
-    topic_data: &[TopicFetchData],
-    request_tx: &Sender<KafkaRequest>,
-    final_response_tx: &UnboundedSender<KafkaResponse>,
-    notify: &tokio::sync::Notify,
-    deadline: Instant,
-    poll_interval: Duration,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    loop {
-        // Stop instead of re-fetching for a client that has disconnected.
-        if final_response_tx.is_closed() {
-            debug!("Long poll: client disconnected, abandoning fetch");
-            return Ok(());
+    /// The fetch / wait loop; [`run`](Self::run) owns the registration around it.
+    async fn fetch_until_done(
+        &self,
+        notify: &Notify,
+        deadline: Instant,
+        poll_interval: Duration,
+    ) -> Result<(), LongPollError> {
+        loop {
+            // Stop instead of re-fetching for a client that has disconnected.
+            if self.response_tx.is_closed() {
+                debug!("Long poll: client disconnected, abandoning fetch");
+                return Ok(());
+            }
+            let response = self.fetch_once().await?;
+
+            let total_bytes = calculate_response_bytes(&response);
+            let min_bytes = self.fetch.min_bytes;
+            debug!("Long poll fetch returned {total_bytes} bytes (min_bytes={min_bytes})");
+            // A partition error (unknown partition, offset out of range, ...) is returned
+            // straight away, as Kafka does, so the consumer can react instead of waiting
+            // out max_wait_ms for data that will not arrive. A non-positive min_bytes is
+            // met by any response.
+            let enough =
+                min_bytes <= 0 || usize::try_from(min_bytes).is_ok_and(|min| total_bytes >= min);
+            if enough || response_has_partition_error(&response) {
+                debug!("Long poll: min_bytes threshold met, returning response");
+                let _ = self.response_tx.send(response);
+                return Ok(());
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                debug!("Long poll: timeout reached, returning response");
+                let _ = self.response_tx.send(response);
+                return Ok(());
+            }
+
+            // Not enough data and not timed out: wait for a wake-up. The deadline wait is
+            // exact (the final re-fetch happens at max_wait_ms); the safety-net interval
+            // only bounds how long a missed notification can delay delivery.
+            let wait_time = remaining.min(poll_interval);
+            debug!(
+                "Long poll: waiting up to {wait_time:?} for new-data notification (remaining: {remaining:?})"
+            );
+            tokio::select! {
+                () = notify.notified() => {
+                    debug!("Long poll: woken by new-data notification");
+                }
+                () = tokio::time::sleep(wait_time) => {
+                    debug!("Long poll: deadline or safety-net interval elapsed, re-fetching");
+                }
+                () = self.response_tx.closed() => {
+                    debug!("Long poll: client disconnected while waiting");
+                }
+            }
         }
+    }
 
-        // Create a response channel for this fetch attempt
-        let (inner_tx, mut inner_rx) = tokio::sync::mpsc::unbounded_channel();
-
-        // Reconstruct the Fetch request with our response channel
-        let fetch_request = KafkaRequest {
+    /// One fetch attempt on the worker, without waiting (`max_wait_ms = 0`) and accepting
+    /// any amount of data (`min_bytes = 0`).
+    async fn fetch_once(&self) -> Result<KafkaResponse, LongPollError> {
+        let (attempt_tx, mut attempt_rx) = tokio::sync::mpsc::unbounded_channel();
+        let request = KafkaRequest {
             header: RequestHeader {
-                api_key: crate::kafka::constants::API_KEY_FETCH,
-                api_version,
-                correlation_id,
-                client_id: client_id.clone(),
+                api_key: API_KEY_FETCH,
+                ..self.header.clone()
             },
             body: RequestBody::Fetch(FetchRequestData {
-                max_wait_ms: 0, // Don't long poll again in worker
-                min_bytes: 0,   // Accept any amount of data
-                max_bytes,
-                isolation_level,
-                topic_data: topic_data.to_vec(),
+                max_wait_ms: 0,
+                min_bytes: 0,
+                ..self.fetch.clone()
             }),
-            response_tx: inner_tx,
+            response_tx: attempt_tx,
         };
-
-        // Send to worker (SEC-4: non-blocking handoff)
-        if !send_with_backpressure(request_tx, fetch_request).await {
+        if !send_with_backpressure(&self.request_tx, request).await {
             warn!("Worker channel closed during long poll");
-            return Err("Worker channel closed".into());
+            return Err(LongPollError::WorkerGone);
         }
-
-        // Wait for response
-        let response = match inner_rx.recv().await {
-            Some(resp) => resp,
-            None => {
-                warn!("Response channel closed during long poll");
-                return Err("Response channel closed".into());
-            }
-        };
-
-        // Check if we have enough data
-        let total_bytes = calculate_response_bytes(&response);
-        debug!(
-            "Long poll fetch returned {} bytes (min_bytes={})",
-            total_bytes, min_bytes
-        );
-
-        // A partition error (unknown partition, offset out of range, ...) is returned
-        // straight away, as Kafka does, so the consumer can react instead of waiting
-        // out max_wait_ms for data that will not arrive.
-        if total_bytes >= min_bytes as usize
-            || min_bytes <= 0
-            || response_has_partition_error(&response)
-        {
-            debug!("Long poll: min_bytes threshold met, returning response");
-            let _ = final_response_tx.send(response);
-            return Ok(());
-        }
-
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            debug!("Long poll: timeout reached, returning response");
-            let _ = final_response_tx.send(response);
-            return Ok(());
-        }
-
-        // Not enough data and not timed out: wait for a wake-up. The deadline
-        // wait is exact (the final re-fetch happens at max_wait_ms); the
-        // safety-net interval only bounds how long a missed notification can
-        // delay delivery.
-        let wait_time = remaining.min(poll_interval);
-        debug!(
-            "Long poll: waiting up to {:?} for new-data notification (remaining: {:?})",
-            wait_time, remaining
-        );
-
-        tokio::select! {
-            _ = notify.notified() => {
-                debug!("Long poll: woken by new-data notification");
-            }
-            _ = tokio::time::sleep(wait_time) => {
-                debug!("Long poll: deadline or safety-net interval elapsed, re-fetching");
-            }
-            _ = final_response_tx.closed() => {
-                debug!("Long poll: client disconnected while waiting");
-            }
-        }
+        attempt_rx.recv().await.ok_or_else(|| {
+            warn!("Response channel closed during long poll");
+            LongPollError::NoResponse
+        })
     }
 }
 
@@ -216,7 +232,7 @@ fn calculate_response_bytes(response: &KafkaResponse) -> usize {
             .iter()
             .flat_map(|t| t.partitions.iter())
             .filter_map(|p| p.records.as_ref())
-            .map(|r| r.len())
+            .map(Bytes::len)
             .sum(),
         _ => 0,
     }
@@ -237,8 +253,38 @@ fn response_has_partition_error(response: &KafkaResponse) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
+    use crate::kafka::messages::{PartitionFetchData, TopicFetchData};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// A Fetch v4 long poll (correlation id 1, `max_bytes` 1024) of `topics`.
+    fn long_poll(
+        max_wait_ms: i32,
+        min_bytes: i32,
+        isolation_level: i8,
+        topics: Vec<TopicFetchData>,
+        request_tx: Sender<KafkaRequest>,
+        response_tx: UnboundedSender<KafkaResponse>,
+    ) -> LongPoll {
+        LongPoll {
+            header: RequestHeader {
+                api_key: API_KEY_FETCH,
+                api_version: 4,
+                correlation_id: 1,
+                client_id: None,
+            },
+            fetch: FetchRequestData {
+                max_wait_ms,
+                min_bytes,
+                max_bytes: 1024,
+                isolation_level,
+                topic_data: topics,
+            },
+            request_tx,
+            response_tx,
+        }
+    }
+
     #[test]
     fn test_long_poll_stops_when_client_is_gone() {
         // A long poll whose client has disconnected (response slot closed) must return
@@ -248,7 +294,7 @@ mod tests {
         drop(final_rx);
         let topic = TopicFetchData {
             name: "t".to_string(),
-            partitions: vec![crate::kafka::messages::PartitionFetchData {
+            partitions: vec![PartitionFetchData {
                 partition_index: 0,
                 fetch_offset: 0,
                 partition_max_bytes: 1024,
@@ -259,20 +305,10 @@ mod tests {
             .build()
             .unwrap();
         let started = Instant::now();
-        rt.block_on(handle_fetch_long_poll(
-            1,
-            None,
-            4,
-            i32::MAX,
-            i32::MAX,
-            1024,
-            0,
-            vec![topic],
-            request_tx,
-            final_tx,
-            Arc::new(PendingFetchRegistry::new()),
-            100,
-        ))
+        rt.block_on(
+            long_poll(i32::MAX, i32::MAX, 0, vec![topic], request_tx, final_tx)
+                .run(&PendingFetchRegistry::new(), Duration::from_millis(100)),
+        )
         .unwrap();
         assert!(started.elapsed() < Duration::from_secs(1));
         assert!(
@@ -284,7 +320,7 @@ mod tests {
     fn one_partition_topic(name: &str) -> TopicFetchData {
         TopicFetchData {
             name: name.to_string(),
-            partitions: vec![crate::kafka::messages::PartitionFetchData {
+            partitions: vec![PartitionFetchData {
                 partition_index: 0,
                 fetch_offset: 0,
                 partition_max_bytes: 1024,
@@ -334,7 +370,7 @@ mod tests {
                     }
                     Ok(_) => {}
                     Err(crossbeam_channel::TryRecvError::Empty) => {
-                        tokio::time::sleep(Duration::from_millis(1)).await
+                        tokio::time::sleep(Duration::from_millis(1)).await;
                     }
                     Err(crossbeam_channel::TryRecvError::Disconnected) => return,
                 }
@@ -354,20 +390,15 @@ mod tests {
         let registry = Arc::new(PendingFetchRegistry::new());
 
         let started = Instant::now();
-        handle_fetch_long_poll(
-            1,
-            None,
-            4,
+        long_poll(
             600,
             1,
-            1024,
             0,
             vec![one_partition_topic("t")],
             request_tx,
             final_tx,
-            registry.clone(),
-            10_000,
         )
+        .run(&registry, Duration::from_millis(10_000))
         .await
         .unwrap();
 
@@ -386,20 +417,15 @@ mod tests {
         let (final_tx, mut final_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let started = Instant::now();
-        handle_fetch_long_poll(
-            1,
-            None,
-            4,
+        long_poll(
             10_000,
             1,
-            1024,
             0,
             vec![one_partition_topic("t")],
             request_tx,
             final_tx,
-            Arc::new(PendingFetchRegistry::new()),
-            200,
         )
+        .run(&PendingFetchRegistry::new(), Duration::from_millis(200))
         .await
         .unwrap();
 
@@ -433,20 +459,15 @@ mod tests {
         let (final_tx, mut final_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let started = Instant::now();
-        handle_fetch_long_poll(
-            1,
-            None,
-            4,
+        long_poll(
             10_000,
             1,
-            1024,
             0,
             vec![one_partition_topic("t")],
             request_tx,
             final_tx,
-            registry.clone(),
-            10_000,
         )
+        .run(&registry, Duration::from_millis(10_000))
         .await
         .unwrap();
 
@@ -481,20 +502,15 @@ mod tests {
         let (final_tx, mut final_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let started = Instant::now();
-        handle_fetch_long_poll(
-            1,
-            None,
-            4,
+        long_poll(
             10_000,
             1,
-            1024,
-            1, // read_committed
+            1,
             vec![one_partition_topic("t")],
             request_tx,
             final_tx,
-            registry,
-            10_000,
         )
+        .run(&registry, Duration::from_millis(10_000))
         .await
         .unwrap();
 

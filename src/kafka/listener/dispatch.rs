@@ -3,118 +3,94 @@
 use crossbeam_channel::Sender;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, warn};
 
-use super::long_poll::handle_fetch_long_poll;
-use crate::kafka::api::{FetchRequestData, RequestBody, RequestHeader};
+use super::long_poll::LongPoll;
+use crate::kafka::api::RequestBody;
 use crate::kafka::constants::MAX_LONG_POLLS_PER_CONNECTION;
-use crate::kafka::messages::KafkaRequest;
+use crate::kafka::messages::{KafkaRequest, RequestLanes};
 use crate::kafka::pending_fetches::PendingFetchRegistry;
 
-/// Hand one parsed request to the DB thread: a Fetch with `max_wait_ms > 0` goes to a
-/// long-poll task (while the per-connection cap allows), everything else straight to
-/// its lane. Returns false when the worker channel is gone.
-pub(super) async fn dispatch_request(
-    request: KafkaRequest,
-    request_lanes: &crate::kafka::RequestLanes,
-    registry: &Arc<PendingFetchRegistry>,
-    long_poll_permits: &Arc<tokio::sync::Semaphore>,
-    enable_long_polling: bool,
-    poll_interval_ms: i32,
-) -> bool {
-    debug!("Request parsed successfully, dispatching to worker...");
+/// How long a full request channel is waited on before the next try.
+const FULL_CHANNEL_BACKOFF: Duration = Duration::from_millis(1);
 
-    // Check if this is a Fetch request that should use long polling
-    let should_long_poll = enable_long_polling
-        && matches!(
-            &request.body,
-            RequestBody::Fetch(fetch) if fetch.max_wait_ms > 0
-        );
-
-    // Acquire a long-poll slot; at the cap the fetch falls through
-    // to the immediate path below instead of spawning a task.
-    let long_poll_permit = if should_long_poll {
-        match long_poll_permits.clone().try_acquire_owned() {
-            Ok(permit) => Some(permit),
-            Err(_) => {
-                debug!(
-                    "Per-connection long-poll cap ({}) reached; serving fetch immediately",
-                    MAX_LONG_POLLS_PER_CONNECTION
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    let request = match (long_poll_permit, request) {
-        (
-            Some(permit),
-            KafkaRequest {
-                header:
-                    RequestHeader {
-                        correlation_id,
-                        client_id,
-                        api_version,
-                        ..
-                    },
-                body:
-                    RequestBody::Fetch(FetchRequestData {
-                        max_wait_ms,
-                        min_bytes,
-                        max_bytes,
-                        isolation_level,
-                        topic_data,
-                    }),
-                response_tx: original_response_tx,
-            },
-        ) => {
-            debug!(
-                "Fetch request with long polling: max_wait_ms={}, min_bytes={}, isolation_level={}",
-                max_wait_ms, min_bytes, isolation_level
-            );
-
-            let long_poll_registry = registry.clone();
-            let long_poll_request_tx = request_lanes.main.clone();
-
-            tokio::spawn(async move {
-                // Hold the per-connection slot for the task's lifetime.
-                let _long_poll_slot = permit;
-                if let Err(e) = handle_fetch_long_poll(
-                    correlation_id,
-                    client_id,
-                    api_version,
-                    max_wait_ms,
-                    min_bytes,
-                    max_bytes,
-                    isolation_level,
-                    topic_data,
-                    long_poll_request_tx,
-                    original_response_tx,
-                    long_poll_registry,
-                    poll_interval_ms,
-                )
-                .await
-                {
-                    warn!("Long poll handler error: {}", e);
-                }
-            });
-
-            // Don't send to worker directly - the long poll handler will do it
-            return true;
-        }
-        (_, request) => request,
-    };
-
-    // Normal path - send to worker directly (SEC-4: non-blocking handoff).
-    // DR-12: Heartbeat routes to the liveness lane, everything else to
-    // the main lane, so group liveness never queues behind heavy work.
-    let lane = request_lanes.route(&request).clone();
-    send_with_backpressure(&lane, request).await
+/// Where a connection's requests go: the DB thread's lanes, and the long-poll machinery.
+#[derive(Clone)]
+pub(super) struct Dispatcher {
+    pub(super) request_lanes: RequestLanes,
+    pub(super) registry: Arc<PendingFetchRegistry>,
+    /// The safety-net re-fetch interval of a long poll (`pg_kafka.fetch_poll_interval_ms`),
+    /// or `None` when long polling is disabled.
+    pub(super) long_poll_interval: Option<Duration>,
 }
 
-/// SEC-4: hand a request to the DB thread without blocking the async runtime.
+impl Dispatcher {
+    /// Hand one parsed request to the DB thread: a Fetch with `max_wait_ms > 0` goes to a
+    /// long-poll task while the connection's `long_poll_permits` allow, everything else
+    /// straight to its lane. Returns false when the worker channel is gone.
+    pub(super) async fn dispatch(
+        &self,
+        request: KafkaRequest,
+        long_poll_permits: &Arc<Semaphore>,
+    ) -> bool {
+        let request = match (self.long_poll_slot(&request, long_poll_permits), request) {
+            (
+                Some((permit, poll_interval)),
+                KafkaRequest {
+                    header,
+                    body: RequestBody::Fetch(fetch),
+                    response_tx,
+                },
+            ) => {
+                let long_poll =
+                    LongPoll::new(header, fetch, self.request_lanes.main.clone(), response_tx);
+                let registry = Arc::clone(&self.registry);
+                tokio::spawn(async move {
+                    // Hold the per-connection slot for the task's lifetime.
+                    let _slot = permit;
+                    if let Err(e) = long_poll.run(&registry, poll_interval).await {
+                        warn!("Long poll handler error: {e}");
+                    }
+                });
+                return true;
+            }
+            (_, request) => request,
+        };
+        // Heartbeat goes to the liveness lane, everything else to the main lane, so
+        // group liveness never queues behind heavy work (DR-12).
+        let lane = self.request_lanes.route(&request);
+        send_with_backpressure(lane, request).await
+    }
+
+    /// A long-poll slot and the safety-net interval, when `request` is a Fetch that may
+    /// wait. A connection holds at most [`MAX_LONG_POLLS_PER_CONNECTION`] long polls; a
+    /// Fetch over the cap is served by the immediate path, a valid (possibly empty)
+    /// response, so the degradation is latency, never an error.
+    fn long_poll_slot(
+        &self,
+        request: &KafkaRequest,
+        long_poll_permits: &Arc<Semaphore>,
+    ) -> Option<(OwnedSemaphorePermit, Duration)> {
+        let poll_interval = self.long_poll_interval?;
+        let RequestBody::Fetch(fetch) = &request.body else {
+            return None;
+        };
+        if fetch.max_wait_ms <= 0 {
+            return None;
+        }
+        let Ok(permit) = Arc::clone(long_poll_permits).try_acquire_owned() else {
+            debug!(
+                "Per-connection long-poll cap ({MAX_LONG_POLLS_PER_CONNECTION}) reached; \
+                 serving fetch immediately"
+            );
+            return None;
+        };
+        Some((permit, poll_interval))
+    }
+}
+
+/// Hand a request to the DB thread without blocking the async runtime (SEC-4).
 ///
 /// The request channel is a bounded crossbeam channel; a plain `Sender::send` *blocks the calling
 /// thread* when the channel is full (DB thread behind), which on the tokio runtime parks a whole
@@ -132,7 +108,7 @@ pub(super) async fn send_with_backpressure<T>(tx: &Sender<T>, mut item: T) -> bo
             Err(crossbeam_channel::TrySendError::Full(returned)) => {
                 item = returned;
                 // Yield the worker thread instead of blocking it, then retry.
-                tokio::time::sleep(Duration::from_millis(1)).await;
+                tokio::time::sleep(FULL_CHANNEL_BACKOFF).await;
             }
             Err(crossbeam_channel::TrySendError::Disconnected(_)) => return false,
         }
@@ -142,9 +118,10 @@ pub(super) async fn send_with_backpressure<T>(tx: &Sender<T>, mut item: T) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[tokio::test]
     async fn test_send_with_backpressure_succeeds_once_room_frees() {
-        // SEC-4: a full bounded channel must not make the send hang forever or drop the item — it
+        // A full bounded channel must not make the send hang forever or drop the item — it
         // waits (yielding the runtime) until a slot frees, then enqueues the item in order.
         let (tx, rx) = crossbeam_channel::bounded::<i32>(1);
         tx.try_send(1).unwrap(); // fill to capacity
@@ -169,7 +146,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_with_backpressure_reports_disconnect() {
-        // SEC-4: if the DB thread is gone (receiver dropped), the send reports failure so the caller
+        // If the DB thread is gone (receiver dropped), the send reports failure so the caller
         // tears down the connection instead of looping forever.
         let (tx, rx) = crossbeam_channel::bounded::<i32>(1);
         drop(rx);

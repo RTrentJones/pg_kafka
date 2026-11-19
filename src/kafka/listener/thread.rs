@@ -13,9 +13,8 @@ const DEFAULT_NETWORK_LOG_FILTER: &str = "pg_kafka=warn";
 
 /// The `tracing` filter directive string for the network thread: `RUST_LOG` when
 /// it is set to something non-empty, otherwise [`DEFAULT_NETWORK_LOG_FILTER`].
-///
-/// (Previously the code appended a hard `pg_kafka=error` directive on top of
-/// `RUST_LOG`, which both hid warnings and overrode `RUST_LOG=pg_kafka=debug`.)
+/// A set `RUST_LOG` replaces the default entirely, so `RUST_LOG=pg_kafka=debug`
+/// shows debug events.
 fn network_log_filter(rust_log: Option<&str>) -> String {
     match rust_log.map(str::trim) {
         Some(v) if !v.is_empty() => v.to_string(),
@@ -39,7 +38,7 @@ pub fn init_network_tracing() {
         .try_init();
 }
 
-// wave3 net: signal mask of the network thread.
+// The signal-mask calls of libc (not bound by pgrx).
 extern "C" {
     fn sigfillset(set: *mut pgrx::pg_sys::__sigset_t) -> std::os::raw::c_int;
     fn pthread_sigmask(
@@ -54,17 +53,17 @@ extern "C" {
 ///
 /// The worker's signal handlers (pgrx's SIGTERM / SIGHUP handlers) must run on the
 /// worker's main thread. The kernel delivers a process-directed signal to any thread
-/// that does not block it; when `pg_terminate_backend()`'s SIGTERM landed on the network
-/// thread, pgrx's handler panicked ("postgres FFI may not be called from multiple
-/// threads"), the panic in the handler aborted the process, and the postmaster put the
-/// whole cluster through crash recovery (seen in the E2E suite at listener restarts).
+/// that does not block it; if `pg_terminate_backend()`'s SIGTERM lands on the network
+/// thread, pgrx's handler panics ("postgres FFI may not be called from multiple
+/// threads"), and a panic in a signal handler aborts the process, which makes the
+/// postmaster put the whole cluster through crash recovery.
 pub fn block_signals_on_this_thread() {
     // SAFETY: plain libc calls on a local, zero-initialised sigset.
     unsafe {
         let mut set = std::mem::MaybeUninit::<pgrx::pg_sys::__sigset_t>::zeroed();
         sigfillset(set.as_mut_ptr());
         let rc = pthread_sigmask(
-            pgrx::pg_sys::SIG_BLOCK as std::os::raw::c_int,
+            pgrx::pg_sys::SIG_BLOCK.cast_signed(),
             set.as_ptr(),
             std::ptr::null_mut(),
         );
@@ -86,10 +85,11 @@ fn signal_blocked_on_this_thread(signum: i32) -> bool {
             signum: std::os::raw::c_int,
         ) -> std::os::raw::c_int;
     }
+    // SAFETY: plain libc calls on a local, zero-initialised sigset.
     unsafe {
         let mut old = std::mem::MaybeUninit::<pgrx::pg_sys::__sigset_t>::zeroed();
         pthread_sigmask(
-            pgrx::pg_sys::SIG_BLOCK as std::os::raw::c_int,
+            pgrx::pg_sys::SIG_BLOCK.cast_signed(),
             std::ptr::null(),
             old.as_mut_ptr(),
         );
@@ -104,7 +104,7 @@ mod tests {
 
     #[test]
     fn test_network_thread_blocks_termination_signals() {
-        // wave3 net: SIGTERM / SIGHUP / SIGINT must never be handled on the network thread
+        // SIGTERM / SIGHUP / SIGINT must never be handled on the network thread
         // (or the tokio threads it spawns, which inherit the mask).
         let (term, hup, int) = std::thread::spawn(|| {
             assert!(!signal_blocked_on_this_thread(15));
@@ -135,7 +135,6 @@ mod tests {
 
     #[test]
     fn test_network_log_filter_honours_rust_log() {
-        // RUST_LOG used to be overridden by a hard `pg_kafka=error` directive.
         assert_eq!(network_log_filter(Some("pg_kafka=debug")), "pg_kafka=debug");
     }
 }

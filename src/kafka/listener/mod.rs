@@ -3,11 +3,14 @@
 //!
 //! It runs on its own thread inside a multi-threaded tokio runtime and MUST NOT call any
 //! pgrx function (logging, SPI, ...); it logs through `tracing`. Requests cross to the
-//! background worker over bounded crossbeam channels.
+//! background worker over bounded crossbeam channels; responses come back on per-request
+//! tokio channels.
 //!
 //! * [`thread`]: logging and the signal mask of the network thread.
-//! * [`accept`]: the accept loops and connection admission (connection caps, TLS).
-//! * [`connection`]: one connection's read loop, response writer and close handling.
+//! * [`accept`]: the accept loops and connection admission (connection caps).
+//! * [`tls`]: the TLS handshake and the client-certificate principal.
+//! * [`connection`]: one connection's read loop and how it closes.
+//! * [`writer`]: the task that writes a connection's responses in request order.
 //! * [`sasl`]: per-connection authentication state and the SASL frames.
 //! * [`dispatch`]: handing requests to the DB thread.
 //! * [`long_poll`]: Fetch long polling.
@@ -18,6 +21,8 @@ mod dispatch;
 mod long_poll;
 mod sasl;
 mod thread;
+mod tls;
+mod writer;
 
 pub use accept::ListenerSecurity;
 pub use thread::{block_signals_on_this_thread, init_network_tracing};
@@ -34,36 +39,44 @@ use super::notifications::InternalNotification;
 use super::pending_fetches::PendingFetchRegistry;
 use super::shadow::{ForwardAck, ForwardRequest};
 use accept::{accept_loop, AcceptContext};
+use dispatch::Dispatcher;
 
 /// Whether an I/O error is just the peer going away (reset / broken pipe /
 /// aborted / EOF mid-frame). Those are routine for a broker and logged at
 /// debug; anything else (oversized frame, exhausted budget, ...) is a warning.
 fn is_peer_disconnect(e: &std::io::Error) -> bool {
-    use std::io::ErrorKind::*;
+    use std::io::ErrorKind;
     matches!(
         e.kind(),
-        ConnectionReset | ConnectionAborted | BrokenPipe | UnexpectedEof | NotConnected
+        ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::BrokenPipe
+            | ErrorKind::UnexpectedEof
+            | ErrorKind::NotConnected
     )
 }
 
-/// Run the TCP listener
+/// How long a blocking receive from the notification channel waits before the
+/// notifier task checks again (so it sees an aborted runtime promptly).
+const NOTIFY_RECV_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// How often [`run`] checks for the worker's shutdown signal.
+const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Run the Kafka listeners until the worker signals shutdown.
 ///
-/// This is the main entry point for the Kafka protocol listener.
-/// It accepts the pre-bound TcpListeners (the primary one first) and spawns a new
-/// async task for each incoming connection.
+/// `listeners` are the pre-bound sockets (the primary listener first) with their
+/// security. Besides one accept loop per listener, this spawns the task that turns the
+/// DB thread's [`InternalNotification`]s into long-poll wake-ups and the shadow-mode
+/// forwarder (always spawned: it reads the shadow configuration on the fly, so shadow
+/// mode can be enabled with `pg_reload_conf()`).
 ///
-/// # Arguments
-/// * `listeners` - Pre-bound TcpListeners (bound in worker.rs) and their security
-/// * `request_lanes` - Channel senders (main + DR-12 liveness lanes) to the DB thread
-/// * `credential_tx` - Channel to the DB thread for SASL credential lookups
-/// * `notify_rx` - Channel receiver for notifications from DB thread (long polling)
-/// * `forward_rx` - Channel receiver for async shadow forwarding requests
-/// * `runtime_context` - Runtime context for accessing configuration
-/// * `shutdown_rx` - Channel receiver for shutdown signal from main thread
-///
-/// # Thread Safety
-/// This function runs in a spawned thread and MUST NOT call pgrx functions.
-#[allow(clippy::too_many_arguments)]
+/// Runs on the network thread and MUST NOT call pgrx functions. The result is always
+/// `Ok`; errors of individual connections are logged and end only that connection.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one parameter per channel end the worker creates for the network thread"
+)]
 pub async fn run(
     listeners: Vec<(TcpListener, Arc<ListenerSecurity>)>,
     request_lanes: crate::kafka::RequestLanes,
@@ -74,104 +87,40 @@ pub async fn run(
     runtime_context: Arc<crate::kafka::RuntimeContext>,
     shutdown_rx: std::sync::mpsc::Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Extract config values from RuntimeContext
     let config = runtime_context.config();
-    let enable_long_polling = config.enable_long_polling;
-    let log_connections = config.log_connections;
-    let fetch_poll_interval_ms = config.fetch_poll_interval_ms;
-
-    // Note: Shadow config is now checked dynamically in run_shadow_forwarder
-    // to support runtime enable/disable via ALTER SYSTEM + pg_reload_conf()
-
     info!(
         "pg_kafka TCP listener started (long_polling={}, log_connections={})",
-        enable_long_polling, log_connections
+        config.enable_long_polling, config.log_connections
     );
 
-    // Create the pending fetch registry for long polling
     let registry = Arc::new(PendingFetchRegistry::new());
+    let notifier = spawn_notifier(notify_rx, Arc::clone(&registry));
 
-    // Spawn the notification receiver task
-    // This task receives notifications from the DB thread and wakes waiting fetch handlers
-    let registry_for_notifier = registry.clone();
-    let notify_handle = tokio::spawn(async move {
-        loop {
-            // Use spawn_blocking to receive from crossbeam channel in async context
-            let rx = notify_rx.clone();
-            let result =
-                tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_millis(100)))
-                    .await;
+    // Detached: the forwarder ends when the DB thread drops its end of `forward_rx`.
+    tokio::spawn(super::shadow::forwarder_task::run_shadow_forwarder(
+        forward_rx,
+        forward_ack_tx,
+        Arc::clone(&runtime_context),
+    ));
 
-            match result {
-                Ok(Ok(notification)) => match notification {
-                    InternalNotification::TransactionEnded => {
-                        debug!("Notification: transaction ended, waking read_committed waiters");
-                        registry_for_notifier.notify_transaction_ended().await;
-                    }
-                    InternalNotification::NewMessages {
-                        topic_name,
-                        topic_id,
-                        partition_id,
-                        high_watermark,
-                    } => {
-                        debug!(
-                            "Notification: new messages for topic={} (id={}), partition_id={}, hwm={}",
-                            topic_name, topic_id, partition_id, high_watermark
-                        );
-                        registry_for_notifier
-                            .notify_new_data(&topic_name, partition_id, high_watermark)
-                            .await;
-                    }
-                },
-                Ok(Err(crossbeam_channel::RecvTimeoutError::Timeout)) => {
-                    // Normal timeout, continue
-                }
-                Ok(Err(crossbeam_channel::RecvTimeoutError::Disconnected)) => {
-                    info!("Notification channel disconnected, stopping notifier task");
-                    break;
-                }
-                Err(_) => {
-                    // spawn_blocking panicked
-                    error!("Notification receiver task panicked");
-                    break;
-                }
-            }
-        }
-    });
-
-    // Spawn the shadow forwarder task (async forwarding from DB thread)
-    // This task receives ForwardRequest messages and sends them to external Kafka.
-    // Always spawned - config is checked dynamically to support runtime enable/disable.
-    let runtime_context_for_forwarder = runtime_context.clone();
-    let _forward_handle = tokio::spawn(async move {
-        super::shadow::forwarder_task::run_shadow_forwarder(
-            forward_rx,
-            forward_ack_tx,
-            runtime_context_for_forwarder,
-        )
-        .await;
-    });
-
-    // SEC-3 / wave3 net: bound concurrent client connections to prevent fd/memory
-    // exhaustion. Each listener has its own cap (pg_kafka.max_connections, see
-    // accept_loop) and each IP address one across all listeners
-    // (pg_kafka.max_connections_per_ip). Every listener carries the same limits.
+    // Each listener has its own connection cap (see `accept_loop`); the per-IP cap is
+    // shared by all of them. Every listener carries the same limits.
     let max_per_ip = listeners
         .first()
-        .map(|(_, s)| s.limits.max_connections_per_ip)
-        .unwrap_or(usize::MAX);
+        .map_or(usize::MAX, |(_, s)| s.limits.max_connections_per_ip);
     let accept_context = AcceptContext {
-        request_lanes,
-        registry,
+        dispatcher: Dispatcher {
+            request_lanes,
+            registry,
+            long_poll_interval: config
+                .enable_long_polling
+                .then(|| long_poll::poll_interval(config.fetch_poll_interval_ms)),
+        },
         ip_tracker: IpTracker::new(max_per_ip),
         lookup: ChannelLookup(credential_tx),
-        enable_long_polling,
-        fetch_poll_interval_ms,
-        log_connections,
+        log_connections: config.log_connections,
     };
 
-    // One accept loop per listener (the primary listener plus
-    // pg_kafka.additional_listeners).
     let accept_tasks: Vec<_> = listeners
         .into_iter()
         .map(|(listener, security)| {
@@ -184,31 +133,84 @@ pub async fn run(
         })
         .collect();
 
-    // Wait for the shutdown signal.
+    wait_for_shutdown(&shutdown_rx).await;
+
+    for task in &accept_tasks {
+        task.abort();
+    }
+    notifier.abort();
+    let _ = notifier.await;
+    Ok(())
+}
+
+/// Wait until the worker sends the shutdown signal or drops its sender.
+async fn wait_for_shutdown(shutdown_rx: &std::sync::mpsc::Receiver<()>) {
     loop {
         match shutdown_rx.try_recv() {
             Ok(()) => {
                 info!("TCP listener received shutdown signal");
-                break;
+                return;
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                tokio::time::sleep(SHUTDOWN_POLL_INTERVAL).await;
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 info!("Shutdown channel disconnected, exiting");
-                break;
+                return;
             }
         }
     }
+}
 
-    // Cleanup: stop accepting and abort the notifier task
-    for task in &accept_tasks {
-        task.abort();
+/// Spawn the task that receives the DB thread's notifications and wakes the long
+/// polls waiting on them. The crossbeam receive blocks, so it runs on the blocking pool.
+fn spawn_notifier(
+    notify_rx: Receiver<InternalNotification>,
+    registry: Arc<PendingFetchRegistry>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let rx = notify_rx.clone();
+            let received =
+                tokio::task::spawn_blocking(move || rx.recv_timeout(NOTIFY_RECV_TIMEOUT)).await;
+            match received {
+                Ok(Ok(notification)) => wake_waiters(&registry, notification).await,
+                Ok(Err(crossbeam_channel::RecvTimeoutError::Timeout)) => {}
+                Ok(Err(crossbeam_channel::RecvTimeoutError::Disconnected)) => {
+                    info!("Notification channel disconnected, stopping notifier task");
+                    return;
+                }
+                Err(_) => {
+                    error!("Notification receiver task panicked");
+                    return;
+                }
+            }
+        }
+    })
+}
+
+/// Wake the long polls one notification concerns.
+async fn wake_waiters(registry: &PendingFetchRegistry, notification: InternalNotification) {
+    match notification {
+        InternalNotification::TransactionEnded => {
+            debug!("Notification: transaction ended, waking read_committed waiters");
+            registry.notify_transaction_ended().await;
+        }
+        InternalNotification::NewMessages {
+            topic_name,
+            topic_id,
+            partition_id,
+            high_watermark,
+        } => {
+            debug!(
+                "Notification: new messages for topic={topic_name} (id={topic_id}), \
+                 partition_id={partition_id}, hwm={high_watermark}"
+            );
+            registry
+                .notify_new_data(&topic_name, partition_id, high_watermark)
+                .await;
+        }
     }
-    notify_handle.abort();
-    let _ = notify_handle.await;
-
-    Ok(())
 }
 
 #[cfg(test)]
