@@ -29,7 +29,7 @@ use crate::kafka::constants::{
     ERROR_INVALID_CONFIG, ERROR_INVALID_REQUEST, ERROR_NONE, ERROR_OFFSET_OUT_OF_RANGE,
     ERROR_UNKNOWN_TOPIC_OR_PARTITION,
 };
-use crate::kafka::error::Result;
+use crate::kafka::error::{KafkaError, Result};
 use crate::kafka::handler_context::HandlerContext;
 
 /// Kafka resource type for topics (DescribeConfigs/IncrementalAlterConfigs).
@@ -201,92 +201,97 @@ pub fn handle_incremental_alter_configs(
     resources: crate::kafka::messages::AlterConfigsResources,
     validate_only: bool,
 ) -> Result<IncrementalAlterConfigsResponse> {
-    let mut responses = Vec::with_capacity(resources.len());
-
-    for (resource_type, resource_name, configs) in resources {
-        let mut resp = AlterConfigsResourceResponse::default()
-            .with_resource_type(resource_type)
-            .with_resource_name(StrBytes::from_string(resource_name.clone()));
-
-        if resource_type != RESOURCE_TYPE_TOPIC {
-            resp.error_code = ERROR_INVALID_REQUEST;
-            resp.error_message = Some(StrBytes::from_static_str(
-                "pg_kafka only supports TOPIC resources",
-            ));
-            responses.push(resp);
-            continue;
-        }
-
-        let topic_id = match ctx.store.get_topic_id(&resource_name) {
-            Ok(Some(id)) => id,
-            Ok(None) => {
-                resp.error_code = ERROR_UNKNOWN_TOPIC_OR_PARTITION;
-                resp.error_message = Some(StrBytes::from_string(format!(
-                    "Unknown topic '{resource_name}'"
-                )));
-                responses.push(resp);
-                continue;
-            }
-            Err(e) => {
-                warn_if_server_error("alter configs for", &resource_name, &e);
-                resp.error_code = e.to_kafka_error_code();
-                resp.error_message = Some(StrBytes::from_string(e.to_string()));
-                responses.push(resp);
-                continue;
-            }
-        };
-
-        // Validate everything first (all-or-nothing per resource). Every supported
-        // alteration targets the same column, so applying them in order is the same
-        // as applying the last one: `planned` keeps only the final value, and the
-        // resource is applied with ONE write that either fully succeeds or fails.
-        let mut planned: Option<Option<i64>> = None;
-        let mut validation_error: Option<String> = None;
-        for (name, op, value) in &configs {
-            if name != "retention.ms" {
-                validation_error = Some(format!(
-                    "Unsupported config '{name}' (pg_kafka honors: retention.ms)"
-                ));
-                break;
-            }
-            match *op {
-                OP_SET => match parse_retention_ms(value.as_deref()) {
-                    Ok(ms) => planned = Some(Some(ms)),
-                    Err(msg) => {
-                        validation_error = Some(msg.to_string());
-                        break;
-                    }
-                },
-                OP_DELETE => planned = Some(None),
-                _ => {
-                    validation_error =
-                        Some("Unsupported operation (only SET and DELETE)".to_string());
-                    break;
+    let responses = resources
+        .into_iter()
+        .map(|(resource_type, resource_name, configs)| {
+            let mut resp = AlterConfigsResourceResponse::default()
+                .with_resource_type(resource_type)
+                .with_resource_name(StrBytes::from_string(resource_name.clone()));
+            match alter_topic_configs(ctx, resource_type, &resource_name, &configs, validate_only) {
+                Ok(()) => resp.error_code = ERROR_NONE,
+                Err((error_code, message)) => {
+                    resp.error_code = error_code;
+                    resp.error_message = Some(StrBytes::from_string(message));
                 }
             }
-        }
-
-        if let Some(msg) = validation_error {
-            resp.error_code = ERROR_INVALID_CONFIG;
-            resp.error_message = Some(StrBytes::from_string(msg));
-            responses.push(resp);
-            continue;
-        }
-
-        if let (false, Some(retention_ms)) = (validate_only, planned) {
-            if let Err(e) = ctx.store.set_topic_retention_ms(topic_id, retention_ms) {
-                warn_if_server_error("alter configs for", &resource_name, &e);
-                resp.error_code = e.to_kafka_error_code();
-                resp.error_message = Some(StrBytes::from_string(e.to_string()));
-                responses.push(resp);
-                continue;
-            }
-        }
-        resp.error_code = ERROR_NONE;
-        responses.push(resp);
-    }
+            resp
+        })
+        .collect();
 
     Ok(IncrementalAlterConfigsResponse::default().with_responses(responses))
+}
+
+/// Validate one resource's alterations and, unless `validate_only`, apply them: the
+/// resource's error code and message if it is refused.
+fn alter_topic_configs(
+    ctx: &HandlerContext,
+    resource_type: i8,
+    resource_name: &str,
+    configs: &[(String, i8, Option<String>)],
+    validate_only: bool,
+) -> std::result::Result<(), (i16, String)> {
+    if resource_type != RESOURCE_TYPE_TOPIC {
+        return Err((
+            ERROR_INVALID_REQUEST,
+            "pg_kafka only supports TOPIC resources".to_string(),
+        ));
+    }
+    let storage_error = |e: KafkaError| {
+        warn_if_server_error("alter configs for", resource_name, &e);
+        (e.to_kafka_error_code(), e.to_string())
+    };
+    let topic_id = ctx
+        .store
+        .get_topic_id(resource_name)
+        .map_err(storage_error)?
+        .ok_or_else(|| {
+            (
+                ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+                format!("Unknown topic '{resource_name}'"),
+            )
+        })?;
+    let planned = plan_retention_change(configs).map_err(|msg| (ERROR_INVALID_CONFIG, msg))?;
+    if let (false, Some(change)) = (validate_only, planned) {
+        let retention_ms = match change {
+            RetentionChange::Set(ms) => Some(ms),
+            RetentionChange::Delete => None,
+        };
+        ctx.store
+            .set_topic_retention_ms(topic_id, retention_ms)
+            .map_err(storage_error)?;
+    }
+    Ok(())
+}
+
+/// A topic's `retention.ms` alteration.
+#[derive(Clone, Copy)]
+enum RetentionChange {
+    Set(i64),
+    Delete,
+}
+
+/// Validate a resource's alterations before any is applied (all-or-nothing per resource):
+/// the `retention.ms` change (`None` for no change), or why they are refused. Every supported alteration targets the same column, so applying them in
+/// order is the same as applying the last one, and the resource is applied with one write.
+fn plan_retention_change(
+    configs: &[(String, i8, Option<String>)],
+) -> std::result::Result<Option<RetentionChange>, String> {
+    let mut planned = None;
+    for (name, op, value) in configs {
+        if name != "retention.ms" {
+            return Err(format!(
+                "Unsupported config '{name}' (pg_kafka honors: retention.ms)"
+            ));
+        }
+        planned = match *op {
+            OP_SET => Some(RetentionChange::Set(
+                parse_retention_ms(value.as_deref()).map_err(str::to_string)?,
+            )),
+            OP_DELETE => Some(RetentionChange::Delete),
+            _ => return Err("Unsupported operation (only SET and DELETE)".to_string()),
+        };
+    }
+    Ok(planned)
 }
 
 /// Handle DeleteRecords (API 21).
@@ -364,7 +369,7 @@ fn delete_partition_records(
     if partition_id < 0 || partition_id >= partition_count {
         return Err(ERROR_UNKNOWN_TOPIC_OR_PARTITION);
     }
-    let on_err = |e: crate::kafka::error::KafkaError| {
+    let on_err = |e: KafkaError| {
         warn_if_server_error(
             "delete records from",
             &format!("topic_id={topic_id} partition={partition_id}"),
@@ -391,7 +396,7 @@ fn delete_partition_records(
 }
 
 /// Log a storage failure that is being reported to the client per item.
-fn warn_if_server_error(action: &str, target: &str, e: &crate::kafka::error::KafkaError) {
+fn warn_if_server_error(action: &str, target: &str, e: &KafkaError) {
     if e.is_server_error() {
         crate::pg_warning!("Failed to {} '{}': {}", action, target, e);
     }
