@@ -115,7 +115,7 @@ pub async fn assert_local_message_count(
     // Poll until the local count reaches the expected value rather than asserting
     // once after a fixed sleep: async forwarding and the produce commit can lag
     // under CI load, which made the fixed-sleep callers flaky.
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
     loop {
         let row = db
             .query_one(
@@ -139,7 +139,7 @@ pub async fn assert_local_message_count(
             )
             .into());
         }
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
 

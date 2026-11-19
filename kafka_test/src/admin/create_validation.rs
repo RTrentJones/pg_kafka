@@ -1,9 +1,11 @@
 //! CreateTopics / CreatePartitions validation.
 
+use crate::common::create_admin_client;
 use crate::common::TestResult;
-use crate::error_paths::bug_hunt::roundtrip;
+use crate::error_codes;
 use crate::setup::TestContext;
 use crate::wire::requests::*;
+use crate::wire::roundtrip;
 use kafka_protocol::messages::create_partitions_request::{
     CreatePartitionsRequest, CreatePartitionsTopic,
 };
@@ -29,9 +31,9 @@ pub async fn test_partition_count_above_cap_is_rejected() -> TestResult {
     // (any other client, or a hostile one, can send it).
     let r = create_topics_raw(vec![creatable(&huge, 2_000_000_000, 1)]).await?;
     println!("raw CreateTopics 2e9: {:?}", r);
-    assert_eq!(r[0].1, ERROR_INVALID_PARTITIONS);
+    assert_eq!(r[0].error_code, error_codes::INVALID_PARTITIONS);
 
-    let admin = admin()?;
+    let admin = create_admin_client()?;
     let opts = AdminOptions::new().operation_timeout(Some(Duration::from_secs(10)));
     let results = admin
         .create_topics(
@@ -65,7 +67,7 @@ pub async fn test_partition_count_above_cap_is_rejected() -> TestResult {
     raw.timeout_ms = 5_000;
     let mut c = conn().await?;
     let resp = roundtrip(&mut c, 1, 1, &raw).await?;
-    assert_eq!(resp.results[0].error_code, ERROR_INVALID_PARTITIONS);
+    assert_eq!(resp.results[0].error_code, error_codes::INVALID_PARTITIONS);
     println!("✅ CreatePartitions to 10001 (rdkafka) / 2e9 (raw) -> INVALID_PARTITIONS\n");
 
     let row = ctx
@@ -99,8 +101,8 @@ pub async fn test_partition_count_above_cap_is_rejected() -> TestResult {
     // The broker is alive and serves metadata.
     let mut c = conn().await?;
     let md = metadata_raw(&mut c, &[&at_cap]).await?;
-    assert_eq!(md[0].1, ERROR_NONE);
-    assert_eq!(md[0].2, 1);
+    assert_eq!(md[0].error_code, error_codes::NONE);
+    assert_eq!(md[0].partitions, 1);
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");
     Ok(())
@@ -129,18 +131,21 @@ pub async fn test_create_topics_rejects_duplicates_collisions_and_bad_replicatio
     .await?;
     println!("duplicates: {:?}", r);
     assert_eq!(r.len(), 2, "one result per distinct name");
-    let d = r.iter().find(|t| t.0 == dup).unwrap();
-    assert_eq!(d.1, ERROR_INVALID_REQUEST);
-    assert_eq!(d.2.as_deref(), Some("Duplicate topic name."));
-    assert_eq!(r.iter().find(|t| t.0 == other).unwrap().1, ERROR_NONE);
+    let d = r.iter().find(|t| t.name == dup).unwrap();
+    assert_eq!(d.error_code, error_codes::INVALID_REQUEST);
+    assert_eq!(d.error_message.as_deref(), Some("Duplicate topic name."));
+    assert_eq!(
+        r.iter().find(|t| t.name == other).unwrap().error_code,
+        error_codes::NONE
+    );
 
     let r = create_topics_raw(vec![creatable(&dotted, 1, 1)]).await?;
-    assert_eq!(r[0].1, ERROR_NONE);
+    assert_eq!(r[0].error_code, error_codes::NONE);
     let r = create_topics_raw(vec![creatable(&underscored, 1, 1)]).await?;
     println!("collision: {:?}", r);
-    assert_eq!(r[0].1, ERROR_INVALID_TOPIC_EXCEPTION);
+    assert_eq!(r[0].error_code, error_codes::INVALID_TOPIC_EXCEPTION);
     assert_eq!(
-        r[0].2.as_deref(),
+        r[0].error_message.as_deref(),
         Some(
             format!(
                 "Topic '{}' collides with existing topic: {}",
@@ -160,16 +165,16 @@ pub async fn test_create_topics_rejects_duplicates_collisions_and_bad_replicatio
     ])
     .await?;
     println!("replication factors: {:?}", r);
-    let code = |n: &str| r.iter().find(|t| t.0 == rf(n)).unwrap().1;
-    assert_eq!(code("3"), ERROR_INVALID_REPLICATION_FACTOR);
-    assert_eq!(code("0"), ERROR_INVALID_REPLICATION_FACTOR);
-    assert_eq!(code("m2"), ERROR_INVALID_REPLICATION_FACTOR);
-    assert_eq!(code("m1"), ERROR_NONE);
-    assert_eq!(code("p0"), ERROR_INVALID_PARTITIONS);
+    let code = |n: &str| r.iter().find(|t| t.name == rf(n)).unwrap().error_code;
+    assert_eq!(code("3"), error_codes::INVALID_REPLICATION_FACTOR);
+    assert_eq!(code("0"), error_codes::INVALID_REPLICATION_FACTOR);
+    assert_eq!(code("m2"), error_codes::INVALID_REPLICATION_FACTOR);
+    assert_eq!(code("m1"), error_codes::NONE);
+    assert_eq!(code("p0"), error_codes::INVALID_PARTITIONS);
 
     // The real admin client sees the same.
     let opts = AdminOptions::new().operation_timeout(Some(Duration::from_secs(10)));
-    let admin = admin()?;
+    let admin = create_admin_client()?;
     let res = admin
         .create_topics(
             &[NewTopic::new(&rf("3b"), 1, TopicReplication::Fixed(3))],

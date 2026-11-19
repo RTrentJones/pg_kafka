@@ -1,12 +1,14 @@
 //! One-call raw requests for the admin and consumer-group APIs.
 
-use crate::common::{create_producer, get_bootstrap_servers, TestResult};
-use crate::error_paths::bug_hunt::roundtrip;
-use crate::fixtures::TestTopicBuilder;
-use crate::setup::TestContext;
+use crate::common::DynResult;
+use crate::wire::records::batch;
+use crate::wire::roundtrip;
+use bytes::Bytes;
 use kafka_protocol::messages::create_topics_request::{CreatableTopic, CreateTopicsRequest};
 use kafka_protocol::messages::delete_groups_request::DeleteGroupsRequest;
 use kafka_protocol::messages::describe_groups_request::DescribeGroupsRequest;
+use kafka_protocol::messages::fetch_request::{FetchPartition, FetchRequest, FetchTopic};
+use kafka_protocol::messages::init_producer_id_request::InitProducerIdRequest;
 use kafka_protocol::messages::join_group_request::{JoinGroupRequest, JoinGroupRequestProtocol};
 use kafka_protocol::messages::leave_group_request::LeaveGroupRequest;
 use kafka_protocol::messages::list_groups_request::ListGroupsRequest;
@@ -14,46 +16,16 @@ use kafka_protocol::messages::metadata_request::{MetadataRequest, MetadataReques
 use kafka_protocol::messages::offset_commit_request::{
     OffsetCommitRequest, OffsetCommitRequestPartition, OffsetCommitRequestTopic,
 };
+use kafka_protocol::messages::produce_request::{
+    PartitionProduceData, ProduceRequest, TopicProduceData,
+};
 use kafka_protocol::messages::sync_group_request::{SyncGroupRequest, SyncGroupRequestAssignment};
-use kafka_protocol::messages::{GroupId, TopicName};
+use kafka_protocol::messages::{GroupId, ProducerId, TopicName, TransactionalId};
 use kafka_protocol::protocol::StrBytes;
-use rdkafka::admin::AdminClient;
-use rdkafka::client::DefaultClientContext;
-use rdkafka::config::ClientConfig;
-use rdkafka::producer::FutureRecord;
 use std::time::Duration;
 use tokio::net::TcpStream;
 
 pub(crate) const BROKER: &str = "127.0.0.1:9092";
-
-pub(crate) const ERROR_NONE: i16 = 0;
-
-pub(crate) const ERROR_UNKNOWN_SERVER_ERROR: i16 = -1;
-
-pub(crate) const ERROR_ILLEGAL_GENERATION: i16 = 22;
-
-pub(crate) const ERROR_INCONSISTENT_GROUP_PROTOCOL: i16 = 23;
-
-pub(crate) const ERROR_UNKNOWN_MEMBER_ID: i16 = 25;
-
-pub(crate) const ERROR_INVALID_PARTITIONS: i16 = 37;
-
-pub(crate) const ERROR_INVALID_REPLICATION_FACTOR: i16 = 38;
-
-pub(crate) const ERROR_INVALID_REQUEST: i16 = 42;
-
-pub(crate) const ERROR_INVALID_TOPIC_EXCEPTION: i16 = 17;
-
-pub(crate) const ERROR_GROUP_ID_NOT_FOUND: i16 = 69;
-
-pub(crate) type DynResult<T> = Result<T, Box<dyn std::error::Error>>;
-
-pub(crate) fn admin() -> DynResult<AdminClient<DefaultClientContext>> {
-    Ok(ClientConfig::new()
-        .set("bootstrap.servers", get_bootstrap_servers())
-        .set("broker.address.family", "v4")
-        .create()?)
-}
 
 pub(crate) fn s(v: &str) -> StrBytes {
     StrBytes::from_string(v.to_string())
@@ -71,10 +43,23 @@ pub(crate) fn creatable(name: &str, partitions: i32, rf: i16) -> CreatableTopic 
     t
 }
 
-/// CreateTopics v5 over a raw connection; `(name, error_code, message)` per result.
-pub(crate) async fn create_topics_raw(
-    topics: Vec<CreatableTopic>,
-) -> DynResult<Vec<(String, i16, Option<String>)>> {
+/// One topic's result in a CreateTopics response.
+#[derive(Debug)]
+pub(crate) struct CreatedTopic {
+    pub name: String,
+    pub error_code: i16,
+    pub error_message: Option<String>,
+}
+
+/// One topic's entry in a Metadata response.
+#[derive(Debug)]
+pub(crate) struct TopicMetadata {
+    pub error_code: i16,
+    pub partitions: usize,
+}
+
+/// CreateTopics v5 over a raw connection; one result per distinct topic.
+pub(crate) async fn create_topics_raw(topics: Vec<CreatableTopic>) -> DynResult<Vec<CreatedTopic>> {
     let mut c = conn().await?;
     let mut req = CreateTopicsRequest::default();
     req.topics = topics;
@@ -83,20 +68,19 @@ pub(crate) async fn create_topics_raw(
     Ok(resp
         .topics
         .into_iter()
-        .map(|t| {
-            (
-                t.name.0.to_string(),
-                t.error_code,
-                t.error_message.map(|m| m.to_string()),
-            )
+        .map(|t| CreatedTopic {
+            name: t.name.0.to_string(),
+            error_code: t.error_code,
+            error_message: t.error_message.map(|m| m.to_string()),
         })
         .collect())
 }
 
+/// Metadata v9 of `topics` (no auto-creation), in request order.
 pub(crate) async fn metadata_raw(
     c: &mut TcpStream,
     topics: &[&str],
-) -> DynResult<Vec<(String, i16, usize)>> {
+) -> DynResult<Vec<TopicMetadata>> {
     let mut req = MetadataRequest::default();
     req.topics = Some(
         topics
@@ -113,12 +97,9 @@ pub(crate) async fn metadata_raw(
     Ok(resp
         .topics
         .into_iter()
-        .map(|t| {
-            (
-                t.name.map(|n| n.0.to_string()).unwrap_or_default(),
-                t.error_code,
-                t.partitions.len(),
-            )
+        .map(|t| TopicMetadata {
+            error_code: t.error_code,
+            partitions: t.partitions.len(),
         })
         .collect())
 }
@@ -126,7 +107,7 @@ pub(crate) async fn metadata_raw(
 pub(crate) fn protocol(name: &str) -> JoinGroupRequestProtocol {
     let mut p = JoinGroupRequestProtocol::default();
     p.name = s(name);
-    p.metadata = bytes::Bytes::from_static(b"\x00\x01");
+    p.metadata = Bytes::from_static(b"\x00\x01");
     p
 }
 
@@ -169,7 +150,7 @@ pub(crate) async fn sync_leader(
 ) -> DynResult<i16> {
     let mut a = SyncGroupRequestAssignment::default();
     a.member_id = s(member);
-    a.assignment = bytes::Bytes::from_static(b"");
+    a.assignment = Bytes::from_static(b"");
     let mut r = SyncGroupRequest::default();
     r.group_id = GroupId(s(group));
     r.generation_id = generation;
@@ -249,42 +230,77 @@ pub(crate) async fn delete_group(group: &str) -> DynResult<i16> {
     Ok(roundtrip(&mut c, 1, 9, &r).await?.results[0].error_code)
 }
 
-pub(crate) async fn produce_one(topic: &str) -> TestResult {
-    let producer = create_producer()?;
-    producer
-        .send(
-            FutureRecord::to(topic).payload("v").key("k"),
-            Duration::from_secs(10),
-        )
-        .await
-        .map_err(|(e, _)| e)?;
-    Ok(())
+/// A Produce request: one topic, `(partition, batch)` pairs.
+pub(crate) fn produce_request(topic: &str, parts: Vec<(i32, Bytes)>, acks: i16) -> ProduceRequest {
+    let mut t = TopicProduceData::default();
+    t.name = TopicName(StrBytes::from_string(topic.to_string()));
+    for (index, batch) in parts {
+        let mut p = PartitionProduceData::default();
+        p.index = index;
+        p.records = Some(batch);
+        t.partition_data.push(p);
+    }
+    let mut r = ProduceRequest::default();
+    r.acks = acks;
+    r.timeout_ms = 5000;
+    r.topic_data = vec![t];
+    r
 }
 
-pub(crate) const NONE: i16 = 0;
+pub(crate) fn fetch_request(
+    topic: &str,
+    partition: i32,
+    offset: i64,
+    max_wait_ms: i32,
+) -> FetchRequest {
+    let mut p = FetchPartition::default();
+    p.partition = partition;
+    p.fetch_offset = offset;
+    p.partition_max_bytes = 1024 * 1024;
+    let mut t = FetchTopic::default();
+    t.topic = TopicName(StrBytes::from_string(topic.to_string()));
+    t.partitions = vec![p];
+    let mut req = FetchRequest::default();
+    req.replica_id = kafka_protocol::messages::BrokerId(-1);
+    req.max_wait_ms = max_wait_ms;
+    req.min_bytes = 1;
+    req.max_bytes = 1024 * 1024;
+    req.topics = vec![t];
+    req
+}
 
-pub(crate) const UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
+/// An InitProducerId request for a new producer id (`transactional_id` None: an
+/// idempotent producer).
+pub(crate) fn init_producer_id_request(
+    transactional_id: Option<&str>,
+    transaction_timeout_ms: i32,
+) -> InitProducerIdRequest {
+    let mut request = InitProducerIdRequest::default();
+    request.transactional_id =
+        transactional_id.map(|id| TransactionalId(StrBytes::from_string(id.to_string())));
+    request.transaction_timeout_ms = transaction_timeout_ms;
+    request.producer_id = ProducerId(-1);
+    request.producer_epoch = -1;
+    request
+}
 
-pub(crate) const OUT_OF_ORDER_SEQUENCE_NUMBER: i16 = 45;
-
-pub(crate) const INVALID_PRODUCER_EPOCH: i16 = 47;
-
-pub(crate) const INVALID_TXN_STATE: i16 = 48;
-
-pub(crate) const INVALID_TRANSACTION_TIMEOUT: i16 = 50;
-
-pub(crate) const OPERATION_NOT_ATTEMPTED: i16 = 55;
-
-pub(crate) const UNSTABLE_OFFSET_COMMIT: i16 = 88;
-
-pub(crate) async fn topic(
-    ctx: &TestContext,
-    base: &str,
-    partitions: i32,
-) -> Result<String, Box<dyn std::error::Error>> {
-    Ok(TestTopicBuilder::new(ctx, base)
-        .with_partitions(partitions)
-        .build()
-        .await?
-        .name)
+/// An acks=1 Produce of `values` to one partition, written by `producer_id`/`epoch`
+/// from `base_sequence` (all -1 for a plain producer).
+pub(crate) fn sequenced_produce_request(
+    topic: &str,
+    partition: i32,
+    producer_id: i64,
+    producer_epoch: i16,
+    base_sequence: i32,
+    values: &[&str],
+) -> ProduceRequest {
+    let records = batch(
+        values,
+        producer_id,
+        producer_epoch,
+        base_sequence,
+        false,
+        None,
+    );
+    produce_request(topic, vec![(partition, records)], 1)
 }

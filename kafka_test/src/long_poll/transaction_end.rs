@@ -27,7 +27,7 @@ pub async fn test_transaction_end_wakes_parked_read_committed_fetch() -> TestRes
     into_test_result(txn_end_wakes().await)
 }
 
-async fn txn_end_wakes() -> DynResult<()> {
+async fn txn_end_wakes() -> SendResult<()> {
     println!("=== Test: fencing / timeout aborts wake read_committed long polls ===\n");
     let db = session().await?;
     wait_for_serving_listener(&db, None, Duration::from_secs(30)).await?;
@@ -56,7 +56,7 @@ async fn txn_end_wakes() -> DynResult<()> {
     async fn wait_for(
         rx: &mut tokio::sync::mpsc::UnboundedReceiver<(String, Instant, std::time::SystemTime)>,
         want: &str,
-    ) -> DynResult<(Instant, std::time::SystemTime)> {
+    ) -> SendResult<(Instant, std::time::SystemTime)> {
         let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
             if let Ok(Some((v, at, wall))) =
@@ -71,7 +71,7 @@ async fn txn_end_wakes() -> DynResult<()> {
     }
     wait_for(&mut rx, "start").await?;
 
-    let result: DynResult<()> = async {
+    let result: SendResult<()> = async {
         let init = |id: String, timeout_ms: Option<&'static str>| async move {
             let mut cfg = ClientConfig::new();
             cfg.set("bootstrap.servers", get_bootstrap_servers())

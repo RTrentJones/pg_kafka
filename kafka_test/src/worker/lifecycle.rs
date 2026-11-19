@@ -30,7 +30,7 @@ pub async fn test_extension_ddl_loop_under_load() -> TestResult {
     into_test_result(extension_ddl_loop().await)
 }
 
-async fn extension_ddl_loop() -> DynResult<()> {
+async fn extension_ddl_loop() -> SendResult<()> {
     println!("=== Test: DROP/CREATE/ALTER EXTENSION loop under load ===\n");
     let db = session().await?;
     ensure_old_version_available(&db).await?;
@@ -114,7 +114,7 @@ async fn extension_ddl_loop() -> DynResult<()> {
     }
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    let result: DynResult<()> = async {
+    let result: SendResult<()> = async {
         for round in 0..8 {
             let sql = if round % 2 == 0 {
                 "DROP EXTENSION pg_kafka CASCADE; CREATE EXTENSION pg_kafka;"
@@ -200,7 +200,7 @@ pub async fn test_old_schema_degrades_gracefully() -> TestResult {
     into_test_result(old_schema().await)
 }
 
-async fn old_schema() -> DynResult<()> {
+async fn old_schema() -> SendResult<()> {
     println!("=== Test: new binary on the 0.0.0 schema ===\n");
     let db = session().await?;
     ensure_old_version_available(&db).await?;
@@ -208,7 +208,7 @@ async fn old_schema() -> DynResult<()> {
     let log = ServerLog::open(&db).await?;
     let log_from = log.as_ref().map(|l| l.end()).unwrap_or(0);
 
-    let result: DynResult<()> = async {
+    let result: SendResult<()> = async {
         db.batch_execute(
             "DROP EXTENSION pg_kafka CASCADE; CREATE EXTENSION pg_kafka VERSION '0.0.0';",
         )
@@ -328,7 +328,7 @@ pub async fn test_sigterm_interrupts_a_worker_lock_wait() -> TestResult {
     into_test_result(sigterm_lock_wait().await)
 }
 
-async fn sigterm_lock_wait() -> DynResult<()> {
+async fn sigterm_lock_wait() -> SendResult<()> {
     println!("=== Test: SIGTERM interrupts a worker blocked on a lock ===\n");
     let db = session().await?;
     let holder = session().await?;
@@ -344,7 +344,7 @@ async fn sigterm_lock_wait() -> DynResult<()> {
         let topic = topic.clone();
         tokio::spawn(async move { send(&producer, &topic, "blocked").await.is_ok() })
     };
-    let result: DynResult<()> = async {
+    let result: SendResult<()> = async {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let waiting: bool = db
@@ -400,7 +400,7 @@ pub async fn test_worker_lock_timeout_bounds_a_stuck_lock() -> TestResult {
     into_test_result(lock_timeout_bounds().await)
 }
 
-async fn lock_timeout_bounds() -> DynResult<()> {
+async fn lock_timeout_bounds() -> SendResult<()> {
     println!("=== Test: worker lock_timeout bounds a stuck lock ===\n");
     let db = session().await?;
     let holder = session().await?;
@@ -476,7 +476,7 @@ pub async fn test_commit_failure_answered_without_restart() -> TestResult {
     into_test_result(commit_failure().await)
 }
 
-async fn commit_failure() -> DynResult<()> {
+async fn commit_failure() -> SendResult<()> {
     println!("=== Test: commit failure is answered, worker survives ===\n");
     let db = session().await?;
     let pid = wait_for_serving_listener(&db, None, Duration::from_secs(30)).await?;
@@ -506,7 +506,7 @@ async fn commit_failure() -> DynResult<()> {
     .await
     .map_err(boxed)?;
 
-    let result: DynResult<()> = async {
+    let result: SendResult<()> = async {
         let no_retry: FutureProducer = ClientConfig::new()
             .set("bootstrap.servers", get_bootstrap_servers())
             .set("broker.address.family", "v4")

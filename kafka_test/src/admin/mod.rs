@@ -9,21 +9,11 @@
 mod configs;
 mod create_validation;
 
-use crate::common::{create_db_client, get_bootstrap_servers, TestResult};
-use rdkafka::admin::{AdminClient, AdminOptions, NewPartitions, NewTopic, TopicReplication};
-use rdkafka::client::DefaultClientContext;
-use rdkafka::config::ClientConfig;
+use crate::common::create_admin_client;
+use crate::common::{create_db_client, TestResult};
+use rdkafka::admin::{AdminOptions, NewPartitions, NewTopic, TopicReplication};
 use std::time::Duration;
 use uuid::Uuid;
-
-/// Create an admin client for testing
-fn create_admin_client() -> Result<AdminClient<DefaultClientContext>, Box<dyn std::error::Error>> {
-    let admin: AdminClient<DefaultClientContext> = ClientConfig::new()
-        .set("bootstrap.servers", get_bootstrap_servers())
-        .set("broker.address.family", "v4")
-        .create()?;
-    Ok(admin)
-}
 
 // wait_for_count lives in fixtures.rs (shared across all E2E categories); see
 // its doc comment for the RB-1 rationale.

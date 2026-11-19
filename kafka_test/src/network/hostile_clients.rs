@@ -1,14 +1,13 @@
 //! w3_net tests that run against the default configuration.
 
 use super::*;
+use crate::error_codes;
 use crate::setup::TestContext;
 use kafka_protocol::messages::create_topics_request::{CreatableTopic, CreateTopicsRequest};
 use kafka_protocol::messages::fetch_request::{FetchPartition, FetchRequest, FetchTopic};
 use kafka_protocol::messages::{
     ApiVersionsRequest, BrokerId, CreateTopicsResponse, FetchResponse, ProduceResponse,
 };
-
-const ERROR_INVALID_REQUIRED_ACKS: i16 = 21;
 
 /// A frame the broker cannot parse (header cut short): it closes the connection.
 const BAD_FRAME: [u8; 7] = [0, 0, 0, 3, 0, 0x12, 0];
@@ -61,12 +60,12 @@ async fn produce_ok(
         topic,
         vec![(
             0,
-            record_batch(&[Bytes::copy_from_slice(value)], Compression::None),
+            plain_batch(&[Bytes::copy_from_slice(value)], Compression::None),
         )],
         1,
     );
     stream.write_all(&request_frame(3, corr, &req)).await?;
-    let frame = read_frame(stream, Duration::from_secs(10))
+    let frame = read_frame_within(stream, Duration::from_secs(10))
         .await?
         .ok_or("connection closed instead of a produce response")?;
     let (c, resp) = decode_response::<ProduceRequest>(3, &frame)?;
@@ -141,17 +140,16 @@ pub async fn test_response_larger_than_the_request_limit_is_delivered() -> TestR
     let topic = ctx.unique_topic("w3-net-big").await;
     let mut s = TcpStream::connect(("127.0.0.1", PORT)).await?;
     let created: CreateTopicsResponse =
-        crate::error_paths::bug_hunt::roundtrip(&mut s, 2, 1, &create_topic_request(&topic, 2))
-            .await?;
+        crate::wire::roundtrip(&mut s, 2, 1, &create_topic_request(&topic, 2)).await?;
     assert_eq!(created.topics[0].error_code, 0);
 
     // 2 x 51 MB of zeros, gzip-compressed on the wire (a few hundred KB each).
     let value = Bytes::from(vec![0u8; 51_000_000]);
     for p in 0..2 {
-        let batch = record_batch(std::slice::from_ref(&value), Compression::Gzip);
+        let batch = plain_batch(std::slice::from_ref(&value), Compression::Gzip);
         let req = produce_request(&topic, vec![(p, batch)], 1);
         s.write_all(&request_frame(3, 10 + p, &req)).await?;
-        let f = read_frame(&mut s, Duration::from_secs(60))
+        let f = read_frame_within(&mut s, Duration::from_secs(60))
             .await?
             .ok_or("closed on produce")?;
         let (_, resp) = decode_response::<ProduceRequest>(3, &f)?;
@@ -163,7 +161,7 @@ pub async fn test_response_larger_than_the_request_limit_is_delivered() -> TestR
     let req = fetch(&topic, &[0, 1], 0, 0, 60_000_000);
     let started = Instant::now();
     s.write_all(&request_frame(4, 20, &req)).await?;
-    let frame = read_frame(&mut s, Duration::from_secs(120))
+    let frame = read_frame_within(&mut s, Duration::from_secs(120))
         .await?
         .ok_or("the connection was closed instead of answering the fetch")?;
     println!(
@@ -198,7 +196,7 @@ pub async fn test_pipelined_requests_are_not_delayed_by_nagle() -> TestResult {
         let t0 = Instant::now();
         s.write_all(&bytes).await?;
         for _ in 0..3 {
-            read_frame(&mut s, Duration::from_secs(3))
+            read_frame_within(&mut s, Duration::from_secs(3))
                 .await?
                 .ok_or("closed")?;
         }
@@ -236,7 +234,7 @@ pub async fn test_acks0_produce_error_closes_connection() -> TestResult {
         &topic,
         vec![(
             0,
-            record_batch(&[Bytes::from_static(b"ok")], Compression::None),
+            plain_batch(&[Bytes::from_static(b"ok")], Compression::None),
         )],
         0,
     );
@@ -252,7 +250,7 @@ pub async fn test_acks0_produce_error_closes_connection() -> TestResult {
         &topic,
         vec![(
             7,
-            record_batch(&[Bytes::from_static(b"x")], Compression::None),
+            plain_batch(&[Bytes::from_static(b"x")], Compression::None),
         )],
         0,
     );
@@ -274,11 +272,11 @@ pub async fn test_acks0_produce_error_closes_connection() -> TestResult {
         vec![
             (
                 0,
-                record_batch(&[Bytes::from_static(b"kept")], Compression::None),
+                plain_batch(&[Bytes::from_static(b"kept")], Compression::None),
             ),
             (
                 7,
-                record_batch(&[Bytes::from_static(b"y")], Compression::None),
+                plain_batch(&[Bytes::from_static(b"y")], Compression::None),
             ),
         ],
         0,
@@ -331,14 +329,18 @@ pub async fn test_invalid_acks_rejected_and_nothing_written() -> TestResult {
             &topic,
             vec![(
                 0,
-                record_batch(&[Bytes::from_static(b"no")], Compression::None),
+                plain_batch(&[Bytes::from_static(b"no")], Compression::None),
             )],
             acks,
         );
-        let resp: ProduceResponse =
-            crate::error_paths::bug_hunt::roundtrip(&mut s, 7, i as i32, &req).await?;
+        let resp: ProduceResponse = crate::wire::roundtrip(&mut s, 7, i as i32, &req).await?;
         let p = &resp.responses[0].partition_responses[0];
-        assert_eq!(p.error_code, ERROR_INVALID_REQUIRED_ACKS, "acks={}", acks);
+        assert_eq!(
+            p.error_code,
+            error_codes::INVALID_REQUIRED_ACKS,
+            "acks={}",
+            acks
+        );
         assert_eq!(p.base_offset, -1);
     }
     assert_eq!(stored_rows(ctx.db(), &topic).await?, 0, "nothing written");
@@ -347,12 +349,11 @@ pub async fn test_invalid_acks_rejected_and_nothing_written() -> TestResult {
             &topic,
             vec![(
                 0,
-                record_batch(&[Bytes::from_static(b"yes")], Compression::None),
+                plain_batch(&[Bytes::from_static(b"yes")], Compression::None),
             )],
             acks,
         );
-        let resp: ProduceResponse =
-            crate::error_paths::bug_hunt::roundtrip(&mut s, 7, 100, &req).await?;
+        let resp: ProduceResponse = crate::wire::roundtrip(&mut s, 7, 100, &req).await?;
         assert_eq!(
             resp.responses[0].partition_responses[0].error_code, 0,
             "acks={}",
@@ -381,7 +382,7 @@ pub async fn test_request_before_closing_frame_is_answered() -> TestResult {
     bytes.extend_from_slice(&BAD_FRAME);
     let t0 = Instant::now();
     s.write_all(&bytes).await?;
-    let frame = read_frame(&mut s, Duration::from_secs(5))
+    let frame = read_frame_within(&mut s, Duration::from_secs(5))
         .await?
         .ok_or("the long-poll response was dropped when the connection closed")?;
     assert_eq!(correlation_of(&frame), 7);
@@ -396,14 +397,14 @@ pub async fn test_request_before_closing_frame_is_answered() -> TestResult {
         &topic,
         vec![(
             0,
-            record_batch(&[Bytes::from_static(b"durable")], Compression::None),
+            plain_batch(&[Bytes::from_static(b"durable")], Compression::None),
         )],
         1,
     );
     let mut bytes = request_frame(3, 8, &req);
     bytes.extend_from_slice(&BAD_FRAME);
     s.write_all(&bytes).await?;
-    let frame = read_frame(&mut s, Duration::from_secs(5))
+    let frame = read_frame_within(&mut s, Duration::from_secs(5))
         .await?
         .ok_or("the produce response was dropped when the connection closed")?;
     let (corr, resp) = decode_response::<ProduceRequest>(3, &frame)?;
@@ -425,7 +426,7 @@ pub async fn test_request_before_closing_frame_is_answered() -> TestResult {
     bytes.extend_from_slice(&BAD_FRAME);
     s.write_all(&bytes).await?;
     for i in 0..20 {
-        let f = read_frame(&mut s, Duration::from_secs(5))
+        let f = read_frame_within(&mut s, Duration::from_secs(5))
             .await?
             .ok_or("an ApiVersions response was dropped")?;
         assert_eq!(correlation_of(&f), 100 + i);

@@ -1,6 +1,9 @@
 //! JoinGroup protocol rules and offsets-only groups.
 
+use crate::common::DynResult;
 use crate::common::{create_db_client, get_bootstrap_servers, TestResult};
+use crate::error_codes;
+use crate::fixtures::produce_one;
 use crate::setup::TestContext;
 use crate::wire::requests::*;
 use rdkafka::config::ClientConfig;
@@ -26,10 +29,10 @@ pub async fn test_join_group_protocol_and_member_id_rules() -> TestResult {
         &join_req(&group, "", "consumer", &["range", "roundrobin"]),
     )
     .await?;
-    assert_eq!((e, proto.as_deref()), (ERROR_NONE, Some("range")));
+    assert_eq!((e, proto.as_deref()), (error_codes::NONE, Some("range")));
     assert_eq!(
         sync_leader(&mut a, &group, generation, &member).await?,
-        ERROR_NONE
+        error_codes::NONE
     );
 
     for (what, req) in [
@@ -46,7 +49,7 @@ pub async fn test_join_group_protocol_and_member_id_rules() -> TestResult {
         let mut c = conn().await?;
         let (e, _, _, proto) = join_now(&mut c, &req).await?;
         println!("{}: error {} protocol_name {:?}", what, e, proto);
-        assert_eq!(e, ERROR_INCONSISTENT_GROUP_PROTOCOL, "{}", what);
+        assert_eq!(e, error_codes::INCONSISTENT_GROUP_PROTOCOL, "{}", what);
         assert_eq!(
             proto.as_deref(),
             Some(""),
@@ -56,7 +59,8 @@ pub async fn test_join_group_protocol_and_member_id_rules() -> TestResult {
     let mut c = conn().await?;
     let (e, ..) = join_now(&mut c, &join_req(&fresh, "", "consumer", &[])).await?;
     assert_eq!(
-        e, ERROR_INCONSISTENT_GROUP_PROTOCOL,
+        e,
+        error_codes::INCONSISTENT_GROUP_PROTOCOL,
         "empty protocols, new group"
     );
 
@@ -65,22 +69,22 @@ pub async fn test_join_group_protocol_and_member_id_rules() -> TestResult {
         &join_req(&group, "no-such-member", "consumer", &["range"]),
     )
     .await?;
-    assert_eq!(e, ERROR_UNKNOWN_MEMBER_ID);
+    assert_eq!(e, error_codes::UNKNOWN_MEMBER_ID);
     let (e, ..) = join_now(
         &mut c,
         &join_req(&fresh, "no-such-member", "consumer", &["range"]),
     )
     .await?;
-    assert_eq!(e, ERROR_UNKNOWN_MEMBER_ID);
+    assert_eq!(e, error_codes::UNKNOWN_MEMBER_ID);
     let (_, state, _, _) = describe(&fresh).await?;
     assert_eq!(state, "Dead", "refused joins create no group");
 
     let (e, state, ptype, members) = describe(&group).await?;
     assert_eq!(
         (e, state.as_str(), ptype.as_str(), members),
-        (ERROR_NONE, "Stable", "consumer", 1)
+        (error_codes::NONE, "Stable", "consumer", 1)
     );
-    assert_eq!(leave(&mut a, &group, &member).await?, ERROR_NONE);
+    assert_eq!(leave(&mut a, &group, &member).await?, error_codes::NONE);
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");
     Ok(())
@@ -210,7 +214,7 @@ pub async fn test_offsets_only_group_is_listed_after_restart() -> TestResult {
     );
     assert_eq!(
         describe(&group).await?,
-        (ERROR_NONE, "Empty".into(), "consumer".into(), 0)
+        (error_codes::NONE, "Empty".into(), "consumer".into(), 0)
     );
     println!("✅ ListGroups / DescribeGroups report the group as Empty \"consumer\"\n");
 
@@ -233,8 +237,8 @@ pub async fn test_offsets_only_group_is_listed_after_restart() -> TestResult {
         ("Empty", "consumer")
     );
 
-    assert_eq!(delete_group(&group).await?, ERROR_NONE);
-    assert_eq!(delete_group(&group).await?, ERROR_GROUP_ID_NOT_FOUND);
+    assert_eq!(delete_group(&group).await?, error_codes::NONE);
+    assert_eq!(delete_group(&group).await?, error_codes::GROUP_ID_NOT_FOUND);
     assert_eq!(describe(&group).await?.1, "Dead");
     let left: i64 = ctx
         .db()

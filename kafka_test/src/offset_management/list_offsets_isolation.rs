@@ -1,9 +1,11 @@
 //! ListOffsets isolation, MAX_TIMESTAMP and partition checks.
 
 use crate::common::TestResult;
+use crate::error_codes;
+use crate::fixtures::topic_with_partitions as topic;
 use crate::setup::TestContext;
-use crate::wire::requests::{topic, NONE, UNKNOWN_TOPIC_OR_PARTITION};
-use crate::wire::{batch, now_ms, Wire};
+use crate::wire::records::{batch, now_ms};
+use crate::wire::Wire;
 
 /// ListOffsets: read_committed LATEST is the LSO, -3 is the max-timestamp record, a
 /// lookup past the readable end is -1, and a partition the topic lacks is
@@ -31,14 +33,23 @@ pub async fn test_list_offsets_isolation_max_timestamp_and_partitions() -> TestR
             None,
         )
         .await?;
-    assert_eq!((err, base), (NONE, 0));
-    assert_eq!(w.list_offsets(&t, 0, -3, 0).await?, (NONE, 1, now + 50_000));
-    assert_eq!(w.list_offsets(&t, 0, -2, 0).await?, (NONE, 0, -1));
-    assert_eq!(w.list_offsets(&t, 0, -1, 0).await?, (NONE, 3, -1));
+    assert_eq!((err, base), (error_codes::NONE, 0));
+    assert_eq!(
+        w.list_offsets(&t, 0, -3, 0).await?,
+        (error_codes::NONE, 1, now + 50_000)
+    );
+    assert_eq!(
+        w.list_offsets(&t, 0, -2, 0).await?,
+        (error_codes::NONE, 0, -1)
+    );
+    assert_eq!(
+        w.list_offsets(&t, 0, -1, 0).await?,
+        (error_codes::NONE, 3, -1)
+    );
     for ts in [-1, -2, -3, now] {
         assert_eq!(
             w.list_offsets(&t, 7, ts, 0).await?,
-            (UNKNOWN_TOPIC_OR_PARTITION, -1, -1),
+            (error_codes::UNKNOWN_TOPIC_OR_PARTITION, -1, -1),
             "partition 7, timestamp {}",
             ts
         );
@@ -47,10 +58,10 @@ pub async fn test_list_offsets_isolation_max_timestamp_and_partitions() -> TestR
     // An open transaction at offset 3 with an even later timestamp.
     let tx = ctx.unique_topic("w3-txn-lo-tx").await;
     let (err, pid, ep) = w.init_producer_id(Some(&tx), 60_000).await?;
-    assert_eq!(err, NONE);
+    assert_eq!(err, error_codes::NONE);
     assert_eq!(
         w.add_partitions(&tx, pid, ep, &[(&t, &[0])]).await?[0].2,
-        NONE
+        error_codes::NONE
     );
     let (err, base) = w
         .produce(
@@ -60,24 +71,44 @@ pub async fn test_list_offsets_isolation_max_timestamp_and_partitions() -> TestR
             Some(&tx),
         )
         .await?;
-    assert_eq!((err, base), (NONE, 3));
-    assert_eq!(w.list_offsets(&t, 0, -1, 0).await?, (NONE, 4, -1), "HWM");
-    assert_eq!(w.list_offsets(&t, 0, -1, 1).await?, (NONE, 3, -1), "LSO");
+    assert_eq!((err, base), (error_codes::NONE, 3));
+    assert_eq!(
+        w.list_offsets(&t, 0, -1, 0).await?,
+        (error_codes::NONE, 4, -1),
+        "HWM"
+    );
+    assert_eq!(
+        w.list_offsets(&t, 0, -1, 1).await?,
+        (error_codes::NONE, 3, -1),
+        "LSO"
+    );
     // Kafka bounds timestamp lookups by the readable end.
-    assert_eq!(w.list_offsets(&t, 0, -3, 0).await?, (NONE, 3, now + 90_000));
-    assert_eq!(w.list_offsets(&t, 0, -3, 1).await?, (NONE, -1, -1));
+    assert_eq!(
+        w.list_offsets(&t, 0, -3, 0).await?,
+        (error_codes::NONE, 3, now + 90_000)
+    );
+    assert_eq!(
+        w.list_offsets(&t, 0, -3, 1).await?,
+        (error_codes::NONE, -1, -1)
+    );
     assert_eq!(
         w.list_offsets(&t, 0, now + 60_000, 1).await?,
-        (NONE, -1, -1)
+        (error_codes::NONE, -1, -1)
     );
     assert_eq!(
         w.list_offsets(&t, 0, now + 60_000, 0).await?,
-        (NONE, 3, now + 90_000)
+        (error_codes::NONE, 3, now + 90_000)
     );
-    assert_eq!(w.end_txn(&tx, pid, ep, false).await?, NONE);
+    assert_eq!(w.end_txn(&tx, pid, ep, false).await?, error_codes::NONE);
     // Aborted rows are not candidates.
-    assert_eq!(w.list_offsets(&t, 0, -3, 0).await?, (NONE, 1, now + 50_000));
-    assert_eq!(w.list_offsets(&t, 0, -1, 1).await?, (NONE, 4, -1));
+    assert_eq!(
+        w.list_offsets(&t, 0, -3, 0).await?,
+        (error_codes::NONE, 1, now + 50_000)
+    );
+    assert_eq!(
+        w.list_offsets(&t, 0, -1, 1).await?,
+        (error_codes::NONE, 4, -1)
+    );
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");
     Ok(())

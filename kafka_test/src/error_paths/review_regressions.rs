@@ -223,51 +223,27 @@ pub async fn test_fenced_producer_cannot_write() -> TestResult {
 
 // ----- wire-level protocol regressions -----
 
-use bytes::{Buf, BufMut, BytesMut};
-use kafka_protocol::messages::produce_request::{
-    PartitionProduceData, ProduceRequest, TopicProduceData,
-};
+use crate::wire::records::{encode, plain_record};
+use crate::wire::requests::produce_request;
+use crate::wire::{raw_frame, read_frame_within, request_frame};
+use bytes::{Buf, Bytes};
 use kafka_protocol::messages::TopicName;
 use kafka_protocol::protocol::StrBytes;
-use kafka_protocol::records::{
-    Compression, Record as PRecord, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
-};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use kafka_protocol::records::Compression;
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
 const BROKER: &str = "localhost:9092";
 
-/// Write a raw request frame with a v1 (non-flexible) header and an empty client id.
-async fn send_raw(
-    stream: &mut TcpStream,
-    api_key: i16,
-    version: i16,
-    correlation_id: i32,
-    body: &[u8],
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut frame = BytesMut::new();
-    frame.put_i32((2 + 2 + 4 + 2 + body.len()) as i32);
-    frame.put_i16(api_key);
-    frame.put_i16(version);
-    frame.put_i32(correlation_id);
-    frame.put_i16(-1);
-    frame.extend_from_slice(body);
-    stream.write_all(&frame).await?;
-    Ok(())
-}
+/// How long a test waits for a response (or for the connection to close).
+const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Read one response frame, or None if the broker closed the connection.
-async fn read_raw(stream: &mut TcpStream) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
-    let mut size = [0u8; 4];
-    match tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut size)).await? {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => return Ok(None),
-        Err(e) => return Err(e.into()),
-    }
-    let mut body = vec![0u8; i32::from_be_bytes(size) as usize];
-    stream.read_exact(&mut body).await?;
-    Ok(Some(body))
+/// One batch with one plain record holding `value`.
+fn value_batch(value: &str) -> Bytes {
+    encode(
+        &[plain_record(0, None, value.as_bytes())],
+        Compression::None,
+    )
 }
 
 /// ApiVersions above the supported range is answered in the v0 format with
@@ -278,18 +254,9 @@ pub async fn test_api_versions_above_range_negotiates_down() -> TestResult {
     let mut stream = TcpStream::connect(BROKER).await?;
     // ApiVersions v3+ uses the flexible request header (v2), which ends with an empty
     // tagged-field section after the client id; the body is likewise just tagged fields.
-    let mut frame = BytesMut::new();
-    frame.put_i16(18);
-    frame.put_i16(5);
-    frame.put_i32(501);
-    frame.put_i16(-1); // null client id
-    frame.put_u8(0); // header tagged fields
-    frame.put_u8(0); // body tagged fields
-    let mut sized = BytesMut::new();
-    sized.put_i32(frame.len() as i32);
-    sized.extend_from_slice(&frame);
-    stream.write_all(&sized).await?;
-    let body = read_raw(&mut stream)
+    // Header tagged fields, then body tagged fields.
+    stream.write_all(&raw_frame(18, 5, 501, &[0, 0])).await?;
+    let body = read_frame_within(&mut stream, READ_TIMEOUT)
         .await?
         .ok_or("the broker closed the connection instead of answering ApiVersions v5")?;
     let mut b = &body[..];
@@ -308,7 +275,7 @@ pub async fn test_api_versions_above_range_negotiates_down() -> TestResult {
 pub async fn test_fetch_advertised_minimum_is_usable() -> TestResult {
     println!("=== Test: Fetch Advertised Minimum Is Usable ===\n");
     let mut stream = TcpStream::connect(BROKER).await?;
-    let response = crate::error_paths::bug_hunt::roundtrip(
+    let response = crate::wire::roundtrip(
         &mut stream,
         0,
         502,
@@ -331,59 +298,17 @@ pub async fn test_fetch_advertised_minimum_is_usable() -> TestResult {
         .with_partitions(1)
         .build()
         .await?;
-    let fetched = crate::error_paths::bug_hunt::roundtrip(
+    let fetched = crate::wire::roundtrip(
         &mut stream,
         fetch.min_version,
         503,
-        &crate::error_paths::bug_hunt::fetch_request(&topic.name, 0, 0, 0),
+        &crate::wire::requests::fetch_request(&topic.name, 0, 0, 0),
     )
     .await?;
     assert_eq!(fetched.responses[0].partitions[0].error_code, 0);
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");
     Ok(())
-}
-
-fn record_batch(value: &str) -> BytesMut {
-    let record = PRecord {
-        transactional: false,
-        control: false,
-        partition_leader_epoch: 0,
-        producer_id: -1,
-        producer_epoch: -1,
-        timestamp_type: TimestampType::Creation,
-        offset: 0,
-        sequence: -1,
-        timestamp: 0,
-        key: None,
-        value: Some(bytes::Bytes::from(value.to_string())),
-        headers: Default::default(),
-    };
-    let mut buf = BytesMut::new();
-    RecordBatchEncoder::encode(
-        &mut buf,
-        [record].iter(),
-        &RecordEncodeOptions {
-            version: 2,
-            compression: Compression::None,
-        },
-    )
-    .expect("encode record batch");
-    buf
-}
-
-fn produce_request(topic: &str, records: bytes::Bytes, acks: i16) -> ProduceRequest {
-    let mut p = PartitionProduceData::default();
-    p.index = 0;
-    p.records = Some(records);
-    let mut t = TopicProduceData::default();
-    t.name = TopicName(StrBytes::from_string(topic.to_string()));
-    t.partition_data = vec![p];
-    let mut req = ProduceRequest::default();
-    req.acks = acks;
-    req.timeout_ms = 5000;
-    req.topic_data = vec![t];
-    req
 }
 
 /// Produce v3+ allows one record batch per partition. A second batch used to be
@@ -396,15 +321,14 @@ pub async fn test_produce_two_batches_in_one_partition_is_rejected() -> TestResu
         .with_partitions(1)
         .build()
         .await?;
-    let mut two = record_batch("first");
-    two.extend_from_slice(&record_batch("second"));
+    let two = Bytes::from([value_batch("first"), value_batch("second")].concat());
 
     let mut stream = TcpStream::connect(BROKER).await?;
-    let response = crate::error_paths::bug_hunt::roundtrip(
+    let response = crate::wire::roundtrip(
         &mut stream,
         7,
         504,
-        &produce_request(&topic.name, two.freeze(), 1),
+        &produce_request(&topic.name, vec![(0, two)], 1),
     )
     .await?;
     let p = &response.responses[0].partition_responses[0];
@@ -414,11 +338,11 @@ pub async fn test_produce_two_batches_in_one_partition_is_rejected() -> TestResu
     assert_eq!(stored, 0, "neither batch may be stored");
 
     // A single batch is still accepted.
-    let ok = crate::error_paths::bug_hunt::roundtrip(
+    let ok = crate::wire::roundtrip(
         &mut stream,
         7,
         505,
-        &produce_request(&topic.name, record_batch("only").freeze(), 1),
+        &produce_request(&topic.name, vec![(0, value_batch("only"))], 1),
     )
     .await?;
     assert_eq!(ok.responses[0].partition_responses[0].error_code, 0);
@@ -442,27 +366,16 @@ pub async fn test_corrupt_acks0_produce_sends_no_reply() -> TestResult {
     // Fire-and-forget produce with garbage in place of a record batch...
     let req = produce_request(
         &topic.name,
-        bytes::Bytes::from_static(b"not a record batch at all"),
+        vec![(0, Bytes::from_static(b"not a record batch at all"))],
         0,
     );
-    let mut header = kafka_protocol::messages::RequestHeader::default();
-    header.request_api_key = 0;
-    header.request_api_version = 7;
-    header.correlation_id = 506;
-    let mut body = BytesMut::new();
-    use kafka_protocol::protocol::Encodable;
-    header.encode(&mut body, 1)?;
-    req.encode(&mut body, 7)?;
-    let mut frame = BytesMut::new();
-    frame.put_i32(body.len() as i32);
-    frame.extend_from_slice(&body);
-    stream.write_all(&frame).await?;
+    stream.write_all(&request_frame(7, 506, &req)).await?;
 
     // ...then an ordinary request. wave3 net: as in Kafka, an acks=0 produce that fails
     // closes the connection (so the client notices) instead of being silently dropped;
     // it is never answered, so no frame at all may arrive before the close.
-    let _ = send_raw(&mut stream, 18, 0, 507, &[]).await; // may race the close
-    match read_raw(&mut stream).await? {
+    let _ = stream.write_all(&raw_frame(18, 0, 507, &[])).await; // may race the close
+    match read_frame_within(&mut stream, READ_TIMEOUT).await? {
         None => println!("   connection closed without a reply"),
         Some(frame) => {
             let correlation = (&frame[..]).get_i32();
@@ -630,7 +543,7 @@ pub async fn test_timed_out_transaction_cannot_be_resumed() -> TestResult {
 /// EndTxn retried after a lost response finds the transaction already finished
 /// with the requested outcome; Kafka answers NONE, not INVALID_TXN_STATE.
 pub async fn test_end_txn_retry_is_idempotent() -> TestResult {
-    use crate::error_paths::bug_hunt::roundtrip;
+    use crate::wire::roundtrip;
     use kafka_protocol::messages::add_partitions_to_txn_request::{
         AddPartitionsToTxnRequest, AddPartitionsToTxnTopic,
     };
@@ -702,7 +615,7 @@ pub async fn test_auto_create_rejects_invalid_topic_name() -> TestResult {
     req.topics = Some(vec![t]);
     req.allow_auto_topic_creation = true;
     let mut stream = TcpStream::connect(BROKER).await?;
-    let response = crate::error_paths::bug_hunt::roundtrip(&mut stream, 4, 701, &req).await?;
+    let response = crate::wire::roundtrip(&mut stream, 4, 701, &req).await?;
     let code = response.topics[0].error_code;
     let rows = ctx
         .db()
@@ -780,7 +693,7 @@ pub async fn test_headers_keep_their_order() -> TestResult {
 
 mod group_wire {
     use super::*;
-    use crate::error_paths::bug_hunt::roundtrip;
+    use crate::wire::roundtrip;
     use kafka_protocol::messages::heartbeat_request::HeartbeatRequest;
     use kafka_protocol::messages::join_group_request::{
         JoinGroupRequest, JoinGroupRequestProtocol,
@@ -808,7 +721,7 @@ mod group_wire {
     ) -> Result<Joined, Box<dyn std::error::Error>> {
         let mut p = JoinGroupRequestProtocol::default();
         p.name = StrBytes::from_static_str("range");
-        p.metadata = bytes::Bytes::copy_from_slice(metadata);
+        p.metadata = Bytes::copy_from_slice(metadata);
         let mut req = JoinGroupRequest::default();
         req.group_id = GroupId(StrBytes::from_string(group.to_string()));
         req.session_timeout_ms = 30000;
@@ -844,7 +757,7 @@ mod group_wire {
             .map(|(m, a)| {
                 let mut x = SyncGroupRequestAssignment::default();
                 x.member_id = StrBytes::from_string(m.to_string());
-                x.assignment = bytes::Bytes::copy_from_slice(a);
+                x.assignment = Bytes::copy_from_slice(a);
                 x
             })
             .collect();

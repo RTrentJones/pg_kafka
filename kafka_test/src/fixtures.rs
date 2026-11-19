@@ -317,7 +317,7 @@ where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
-    let start = std::time::Instant::now();
+    let start = Instant::now();
 
     while start.elapsed() < timeout {
         if condition().await {
@@ -356,4 +356,30 @@ pub async fn wait_for_count(
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// Produce one record (key "k", value "v") to `topic` and wait for its ack.
+pub async fn produce_one(topic: &str) -> TestResult {
+    let producer = crate::common::create_producer()?;
+    producer
+        .send(
+            FutureRecord::to(topic).payload("v").key("k"),
+            Duration::from_secs(10),
+        )
+        .await
+        .map_err(|(e, _)| e)?;
+    Ok(())
+}
+
+/// Create a topic named after `base` with `partitions` partitions; its name.
+pub async fn topic_with_partitions(
+    ctx: &TestContext,
+    base: &str,
+    partitions: i32,
+) -> crate::common::DynResult<String> {
+    Ok(TestTopicBuilder::new(ctx, base)
+        .with_partitions(partitions)
+        .build()
+        .await?
+        .name)
 }

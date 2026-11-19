@@ -6,23 +6,18 @@
 //! coverage cannot see (QA-1), so these drive the running broker.
 
 use crate::common::{create_db_client, create_producer, TestResult};
-use crate::error_paths::bug_hunt::roundtrip;
 use crate::setup::TestContext;
-use bytes::{BufMut, BytesMut};
-use kafka_protocol::messages::produce_request::{
-    PartitionProduceData, ProduceRequest, TopicProduceData,
-};
+use crate::wire::records::{encode, plain_record};
+use crate::wire::requests::produce_request;
+use crate::wire::roundtrip;
+use crate::wire::{read_response, request_frame};
+use kafka_protocol::messages::produce_request::ProduceRequest;
 use kafka_protocol::messages::produce_response::ProduceResponse;
-use kafka_protocol::messages::{
-    ApiVersionsRequest, EndTxnRequest, ProducerId, RequestHeader, ResponseHeader, TopicName,
-    TransactionalId,
-};
-use kafka_protocol::protocol::{Decodable, Encodable, HeaderVersion, Request, StrBytes};
-use kafka_protocol::records::{
-    Compression, Record as PRecord, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
-};
+use kafka_protocol::messages::{ApiVersionsRequest, EndTxnRequest, ProducerId, TransactionalId};
+use kafka_protocol::protocol::StrBytes;
+use kafka_protocol::records::Compression;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
 const BROKER: &str = "localhost:9092";
@@ -164,87 +159,13 @@ async fn count_messages(ctx: &TestContext, topic: &str) -> Result<i64, Box<dyn s
         .get(0))
 }
 
-/// Encode one request frame (size prefix + header + body).
-fn encode_frame<R: Request>(
-    version: i16,
-    correlation_id: i32,
-    request: &R,
-) -> Result<BytesMut, Box<dyn std::error::Error>> {
-    let mut header = RequestHeader::default();
-    header.request_api_key = R::KEY;
-    header.request_api_version = version;
-    header.correlation_id = correlation_id;
-    header.client_id = Some(StrBytes::from_static_str("lifecycle-e2e"));
-    let mut body = BytesMut::new();
-    header.encode(&mut body, R::header_version(version))?;
-    request.encode(&mut body, version)?;
-    let mut frame = BytesMut::with_capacity(4 + body.len());
-    frame.put_i32(body.len() as i32);
-    frame.extend_from_slice(&body);
-    Ok(frame)
-}
-
-/// Read one response frame and decode it as `R::Response`, returning its
-/// correlation id too.
-async fn read_response<R: Request>(
-    stream: &mut TcpStream,
-    version: i16,
-) -> Result<(i32, R::Response), Box<dyn std::error::Error>> {
-    let mut size = [0u8; 4];
-    stream.read_exact(&mut size).await?;
-    let mut buf = vec![0u8; i32::from_be_bytes(size) as usize];
-    stream.read_exact(&mut buf).await?;
-    let mut buf = BytesMut::from(&buf[..]);
-    let header = ResponseHeader::decode(
-        &mut buf,
-        <R::Response as HeaderVersion>::header_version(version),
-    )?;
-    Ok((
-        header.correlation_id,
-        R::Response::decode(&mut buf, version)?,
-    ))
-}
-
-fn record_batch(value: &str) -> bytes::Bytes {
-    let record = PRecord {
-        transactional: false,
-        control: false,
-        partition_leader_epoch: 0,
-        producer_id: -1,
-        producer_epoch: -1,
-        timestamp_type: TimestampType::Creation,
-        offset: 0,
-        sequence: -1,
-        timestamp: 0,
-        key: None,
-        value: Some(bytes::Bytes::from(value.to_string())),
-        headers: Default::default(),
-    };
-    let mut buf = BytesMut::new();
-    RecordBatchEncoder::encode(
-        &mut buf,
-        [record].iter(),
-        &RecordEncodeOptions {
-            version: 2,
-            compression: Compression::None,
-        },
-    )
-    .expect("encode record batch");
-    buf.freeze()
-}
-
-fn produce_request(topic: &str, value: &str) -> ProduceRequest {
-    let mut p = PartitionProduceData::default();
-    p.index = 0;
-    p.records = Some(record_batch(value));
-    let mut t = TopicProduceData::default();
-    t.name = TopicName(StrBytes::from_string(topic.to_string()));
-    t.partition_data = vec![p];
-    let mut req = ProduceRequest::default();
-    req.acks = 1;
-    req.timeout_ms = 5000;
-    req.topic_data = vec![t];
-    req
+/// An acks=1 Produce of one plain record holding `value` to partition 0.
+fn produce_value(topic: &str, value: &str) -> ProduceRequest {
+    let batch = encode(
+        &[plain_record(0, None, value.as_bytes())],
+        Compression::None,
+    );
+    produce_request(topic, vec![(0, batch)], 1)
 }
 
 const PRODUCE_VERSION: i16 = 7;
@@ -304,13 +225,13 @@ pub async fn test_failed_request_rolls_back_alone() -> TestResult {
     end_txn.producer_epoch = 0;
     end_txn.committed = true;
 
-    let mut frames = encode_frame(PRODUCE_VERSION, 1, &produce_request(&topic.name, "a"))?;
-    frames.extend_from_slice(&encode_frame(0, 2, &end_txn)?);
-    frames.extend_from_slice(&encode_frame(
+    let mut frames = request_frame(PRODUCE_VERSION, 1, &produce_value(&topic.name, "a"));
+    frames.extend_from_slice(&request_frame(0, 2, &end_txn));
+    frames.extend_from_slice(&request_frame(
         PRODUCE_VERSION,
         3,
-        &produce_request(&topic.name, "b"),
-    )?);
+        &produce_value(&topic.name, "b"),
+    ));
 
     let mut stream = TcpStream::connect(BROKER).await?;
     stream.write_all(&frames).await?;
@@ -464,13 +385,13 @@ pub async fn test_group_commit_pipelined_produces_in_order() -> TestResult {
         .build()
         .await?;
 
-    let mut frames = BytesMut::new();
+    let mut frames = Vec::new();
     for i in 0..PIPELINED_PRODUCES {
-        frames.extend_from_slice(&encode_frame(
+        frames.extend_from_slice(&request_frame(
             PRODUCE_VERSION,
             100 + i,
-            &produce_request(&topic.name, &format!("pipelined-{}", i)),
-        )?);
+            &produce_value(&topic.name, &format!("pipelined-{}", i)),
+        ));
     }
     let mut stream = TcpStream::connect(BROKER).await?;
     stream.write_all(&frames).await?;

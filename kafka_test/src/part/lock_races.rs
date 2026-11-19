@@ -27,7 +27,7 @@ pub async fn test_end_txn_during_default_leaf_move() -> TestResult {
     into_test_result(end_txn_during_move().await)
 }
 
-async fn end_txn_during_move() -> DynResult<()> {
+async fn end_txn_during_move() -> SendResult<()> {
     println!("=== Test: EndTxn while maintenance moves rows out of DEFAULT ===\n");
     let db = session().await?;
     let mover = session().await?;
@@ -194,7 +194,7 @@ pub async fn test_partition_maintenance_lock_waits_are_bounded() -> TestResult {
     into_test_result(maintenance_lock_waits().await)
 }
 
-async fn maintenance_lock_waits() -> DynResult<()> {
+async fn maintenance_lock_waits() -> SendResult<()> {
     println!("=== Test: bounded lock waits in partition maintenance ===\n");
     let db = session().await?;
     let other = session().await?;
@@ -225,7 +225,7 @@ async fn maintenance_lock_waits() -> DynResult<()> {
         .query("SELECT pg_advisory_xact_lock(8099547369649367905)", &[])
         .await
         .map_err(boxed)?;
-    let result: DynResult<()> = async {
+    let result: SendResult<()> = async {
         let t = Instant::now();
         db.query("SELECT pg_kafka_run_partition_maintenance()", &[])
             .await

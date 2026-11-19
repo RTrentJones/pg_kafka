@@ -1,6 +1,7 @@
 //! The auth E2E tests (see `auth/mod.rs` for the listener setup).
 
 use super::*;
+use crate::error_codes;
 use crate::setup::TestContext;
 use bytes::Bytes;
 use kafka_protocol::messages::{MetadataRequest, SaslAuthenticateRequest, SaslHandshakeRequest};
@@ -11,11 +12,6 @@ use rdkafka::message::Message;
 use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 use rdkafka::{Offset, TopicPartitionList};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-const ERROR_UNSUPPORTED_SASL_MECHANISM: i16 = 33;
-const ERROR_ILLEGAL_SASL_STATE: i16 = 34;
-const ERROR_SASL_AUTHENTICATION_FAILED: i16 = 58;
-const ERROR_UNSUPPORTED_VERSION: i16 = 35;
 
 /// Client config for one of the listeners.
 fn client_config(port: u16, protocol: &str) -> ClientConfig {
@@ -276,7 +272,7 @@ pub async fn test_auth_wrong_password_rejected() -> TestResult {
     assert_eq!(hs.error_code, 0);
     assert!(hs.mechanisms.iter().any(|m| m.as_str() == "SCRAM-SHA-512"));
     let au = roundtrip(&mut s, 2, 2, &authenticate(plain_token(USER, "nope"))).await?;
-    assert_eq!(au.error_code, ERROR_SASL_AUTHENTICATION_FAILED);
+    assert_eq!(au.error_code, error_codes::SASL_AUTHENTICATION_FAILED);
     let msg = au.error_message.as_deref().unwrap_or("").to_string();
     assert!(
         !msg.contains("nope"),
@@ -353,13 +349,13 @@ pub async fn test_auth_unauthenticated_request_rejected() -> TestResult {
 
     let mut s = TcpStream::connect(("127.0.0.1", SASL_PLAINTEXT_PORT)).await?;
     let au = roundtrip(&mut s, 2, 3, &authenticate(plain_token(USER, PASSWORD))).await?;
-    assert_eq!(au.error_code, ERROR_ILLEGAL_SASL_STATE);
+    assert_eq!(au.error_code, error_codes::ILLEGAL_SASL_STATE);
     assert!(closed_by_server(&mut s).await);
     println!("✅ SaslAuthenticate before SaslHandshake: ILLEGAL_SASL_STATE + close");
 
     let mut s = TcpStream::connect(("127.0.0.1", SASL_PLAINTEXT_PORT)).await?;
     let hs = roundtrip(&mut s, 1, 5, &handshake("GSSAPI")).await?;
-    assert_eq!(hs.error_code, ERROR_UNSUPPORTED_SASL_MECHANISM);
+    assert_eq!(hs.error_code, error_codes::UNSUPPORTED_SASL_MECHANISM);
     assert_eq!(hs.mechanisms.len(), 3);
     assert!(closed_by_server(&mut s).await);
     println!("✅ unsupported mechanism: UNSUPPORTED_SASL_MECHANISM + close");
@@ -393,7 +389,7 @@ pub async fn test_auth_unauthenticated_request_rejected() -> TestResult {
 
     let mut s = TcpStream::connect(("127.0.0.1", SASL_PLAINTEXT_PORT)).await?;
     let hs = roundtrip(&mut s, 0, 6, &handshake("PLAIN")).await?;
-    assert_eq!(hs.error_code, ERROR_UNSUPPORTED_VERSION);
+    assert_eq!(hs.error_code, error_codes::UNSUPPORTED_VERSION);
     assert!(closed_by_server(&mut s).await);
     println!("✅ SaslHandshake v0 (unframed tokens): UNSUPPORTED_VERSION + close");
 
@@ -412,9 +408,9 @@ pub async fn test_auth_plaintext_listener_unaffected() -> TestResult {
     auth_env().await?;
     let mut s = TcpStream::connect(("127.0.0.1", PLAINTEXT_PORT)).await?;
     let hs = roundtrip(&mut s, 1, 1, &handshake("PLAIN")).await?;
-    assert_eq!(hs.error_code, ERROR_ILLEGAL_SASL_STATE);
+    assert_eq!(hs.error_code, error_codes::ILLEGAL_SASL_STATE);
     let au = roundtrip(&mut s, 2, 2, &authenticate(plain_token(USER, PASSWORD))).await?;
-    assert_eq!(au.error_code, ERROR_ILLEGAL_SASL_STATE);
+    assert_eq!(au.error_code, error_codes::ILLEGAL_SASL_STATE);
     let md = roundtrip(&mut s, 4, 3, &MetadataRequest::default()).await?;
     assert_eq!(md.brokers.len(), 1);
     assert_eq!(md.brokers[0].port, PLAINTEXT_PORT as i32);

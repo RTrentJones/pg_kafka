@@ -1,9 +1,11 @@
 //! Metadata over a corrupt stored partition count.
 
 use crate::common::{create_db_client, TestResult};
-use crate::error_paths::bug_hunt::roundtrip;
+use crate::error_codes;
+use crate::fixtures::produce_one;
 use crate::setup::TestContext;
 use crate::wire::requests::*;
+use crate::wire::roundtrip;
 use kafka_protocol::messages::metadata_request::MetadataRequest;
 
 /// Item 1: a corrupt stored partition count (only possible when the CHECK constraint is
@@ -30,12 +32,16 @@ pub async fn test_metadata_survives_corrupt_partition_count() -> TestResult {
         let md = metadata_raw(&mut c, &[&bad, &good]).await?;
         println!("Metadata: {:?}", md);
         assert_eq!(
-            md[0].1, ERROR_UNKNOWN_SERVER_ERROR,
+            md[0].error_code,
+            error_codes::UNKNOWN_SERVER_ERROR,
             "corrupt topic is an error"
         );
-        assert_eq!(md[0].2, 0, "no partition entries for a corrupt count");
-        assert_eq!(md[1].1, ERROR_NONE);
-        assert_eq!(md[1].2, 1);
+        assert_eq!(
+            md[0].partitions, 0,
+            "no partition entries for a corrupt count"
+        );
+        assert_eq!(md[1].error_code, error_codes::NONE);
+        assert_eq!(md[1].partitions, 1);
         // An all-topics Metadata (what every client sends on startup) too.
         let mut req = MetadataRequest::default();
         req.topics = None;

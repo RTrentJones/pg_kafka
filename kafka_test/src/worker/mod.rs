@@ -20,7 +20,8 @@ use std::io::{Read, Seek, SeekFrom};
 use std::time::{Duration, Instant};
 use tokio_postgres::Client;
 
-pub type DynResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+/// A result whose error can cross tasks (these tests spawn work that fails).
+pub type SendResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 /// Box any error into the suite's error type.
 pub fn boxed<E: std::fmt::Debug>(e: E) -> Box<dyn std::error::Error + Send + Sync> {
@@ -28,7 +29,7 @@ pub fn boxed<E: std::fmt::Debug>(e: E) -> Box<dyn std::error::Error + Send + Syn
 }
 
 /// The pid of the one `pg_kafka_listener` worker, if it runs.
-pub async fn listener_pid(db: &Client) -> DynResult<Option<i32>> {
+pub async fn listener_pid(db: &Client) -> SendResult<Option<i32>> {
     let rows = db
         .query(
             "SELECT pid FROM pg_stat_activity WHERE backend_type = 'pg_kafka_listener'",
@@ -44,7 +45,7 @@ pub async fn wait_for_serving_listener(
     db: &Client,
     not: Option<i32>,
     within: Duration,
-) -> DynResult<i32> {
+) -> SendResult<i32> {
     let deadline = Instant::now() + within;
     let producer = quick_producer("5000")?;
     loop {
@@ -73,7 +74,7 @@ pub async fn wait_for_serving_listener(
 }
 
 /// A plain producer with the given `message.timeout.ms`.
-pub fn quick_producer(timeout_ms: &str) -> DynResult<FutureProducer> {
+pub fn quick_producer(timeout_ms: &str) -> SendResult<FutureProducer> {
     ClientConfig::new()
         .set("bootstrap.servers", get_bootstrap_servers())
         .set("broker.address.family", "v4")
@@ -86,7 +87,7 @@ pub fn quick_producer(timeout_ms: &str) -> DynResult<FutureProducer> {
 /// ALTER SYSTEM SET name = value (or RESET when `value` is None), then reload.
 /// Returns false (and leaves things alone) if the server does not know the GUC,
 /// so a test can run against a build that predates it.
-pub async fn set_guc(db: &Client, name: &str, value: Option<&str>) -> DynResult<bool> {
+pub async fn set_guc(db: &Client, name: &str, value: Option<&str>) -> SendResult<bool> {
     let sql = match value {
         Some(v) => format!("ALTER SYSTEM SET {} = '{}'", name, v.replace('\'', "''")),
         None => format!("ALTER SYSTEM RESET {}", name),
@@ -110,7 +111,7 @@ pub struct ServerLog {
 }
 
 impl ServerLog {
-    pub async fn open(db: &Client) -> DynResult<Option<ServerLog>> {
+    pub async fn open(db: &Client) -> SendResult<Option<ServerLog>> {
         let pid = match listener_pid(db).await? {
             Some(p) => p,
             None => return Ok(None),
@@ -147,7 +148,7 @@ impl ServerLog {
 
 /// Make `CREATE EXTENSION pg_kafka VERSION '0.0.0'` possible: copy the frozen 0.0.0
 /// install script next to the extension (what scripts/check-upgrade.sh does).
-pub async fn ensure_old_version_available(db: &Client) -> DynResult<()> {
+pub async fn ensure_old_version_available(db: &Client) -> SendResult<()> {
     let available: bool = db
         .query_one(
             "SELECT EXISTS (SELECT 1 FROM pg_available_extension_versions
@@ -174,7 +175,7 @@ pub async fn ensure_old_version_available(db: &Client) -> DynResult<()> {
 }
 
 /// The cumulative deadlock count of the current database.
-pub async fn deadlocks(db: &Client) -> DynResult<i64> {
+pub async fn deadlocks(db: &Client) -> SendResult<i64> {
     Ok(db
         .query_one(
             "SELECT deadlocks FROM pg_stat_database WHERE datname = current_database()",
@@ -186,12 +187,12 @@ pub async fn deadlocks(db: &Client) -> DynResult<i64> {
 }
 
 /// Convert this module's error type into the suite's.
-pub fn into_test_result(r: DynResult<()>) -> TestResult {
+pub fn into_test_result(r: SendResult<()>) -> TestResult {
     r.map_err(|e| e.to_string().into())
 }
 
 /// A second database session.
-pub async fn session() -> DynResult<Client> {
+pub async fn session() -> SendResult<Client> {
     create_db_client().await.map_err(boxed)
 }
 
@@ -216,7 +217,7 @@ pub(crate) fn unique(base: &str) -> String {
     format!("w3-worker-{}-{}", base, nanos % 1_000_000_000_000)
 }
 
-pub(crate) async fn send(producer: &FutureProducer, topic: &str, value: &str) -> DynResult<i64> {
+pub(crate) async fn send(producer: &FutureProducer, topic: &str, value: &str) -> SendResult<i64> {
     producer
         .send(
             FutureRecord::to(topic).key("k").payload(value).partition(0),
@@ -231,7 +232,7 @@ pub(crate) fn assign_consumer(
     topic: &str,
     read_committed: bool,
     extra: &[(&str, &str)],
-) -> DynResult<StreamConsumer> {
+) -> SendResult<StreamConsumer> {
     let mut cfg = ClientConfig::new();
     cfg.set("bootstrap.servers", get_bootstrap_servers())
         .set("broker.address.family", "v4")
@@ -262,7 +263,7 @@ pub(crate) async fn read_values(
     read_committed: bool,
     n: usize,
     within: Duration,
-) -> DynResult<Vec<String>> {
+) -> SendResult<Vec<String>> {
     let consumer = assign_consumer(topic, read_committed, &[])?;
     let deadline = Instant::now() + within;
     let mut out = Vec::new();
@@ -280,7 +281,7 @@ pub(crate) async fn read_values(
 
 /// Hold the counter row of partition 0 of `topic` (FOR UPDATE) in an open transaction
 /// on `holder`: a Produce to that partition then waits on the row lock.
-pub(crate) async fn hold_partition_counter(holder: &Client, topic: &str) -> DynResult<()> {
+pub(crate) async fn hold_partition_counter(holder: &Client, topic: &str) -> SendResult<()> {
     holder.batch_execute("BEGIN").await.map_err(boxed)?;
     let n = holder
         .query(

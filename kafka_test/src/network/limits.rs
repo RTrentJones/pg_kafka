@@ -305,8 +305,7 @@ pub async fn test_pre_auth_deadline_runs_from_accept() -> TestResult {
     let t0 = Instant::now();
     let mut hs = SaslHandshakeRequest::default();
     hs.mechanism = StrBytes::from_static_str("PLAIN");
-    let r: SaslHandshakeResponse =
-        crate::error_paths::bug_hunt::roundtrip(&mut s, 1, 1, &hs).await?;
+    let r: SaslHandshakeResponse = crate::wire::roundtrip(&mut s, 1, 1, &hs).await?;
     assert_eq!(r.error_code, 0);
     // Keep the connection busy with ApiVersions (allowed before authentication), so it
     // is the pre-auth deadline that closes it, not the idle timeout.
@@ -320,7 +319,7 @@ pub async fn test_pre_auth_deadline_runs_from_accept() -> TestResult {
         }
         corr += 1;
         let answered = matches!(
-            read_frame(&mut s, Duration::from_secs(2)).await,
+            read_frame_within(&mut s, Duration::from_secs(2)).await,
             Ok(Some(_))
         );
         if !answered {
@@ -427,7 +426,7 @@ async fn scram_first(
     let mut hs = SaslHandshakeRequest::default();
     hs.mechanism = StrBytes::from_static_str(mechanism);
     s.write_all(&request_frame(1, 1, &hs)).await?;
-    let Some(f) = read_frame(s, Duration::from_secs(15)).await? else {
+    let Some(f) = read_frame_within(s, Duration::from_secs(15)).await? else {
         return Ok(None);
     };
     let (_, r) = decode_response::<SaslHandshakeRequest>(1, &f)?;
@@ -435,7 +434,7 @@ async fn scram_first(
     let mut auth = SaslAuthenticateRequest::default();
     auth.auth_bytes = Bytes::from(format!("n,,n={},r=w3netnonce", user).into_bytes());
     s.write_all(&request_frame(2, 2, &auth)).await?;
-    let Some(f) = read_frame(s, Duration::from_secs(15)).await? else {
+    let Some(f) = read_frame_within(s, Duration::from_secs(15)).await? else {
         return Ok(None);
     };
     let (_, r): (i32, SaslAuthenticateResponse) =

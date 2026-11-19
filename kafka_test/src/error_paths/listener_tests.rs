@@ -16,11 +16,12 @@
 use crate::common::{
     create_producer, create_transactional_producer, get_bootstrap_servers, TestResult,
 };
-use crate::error_paths::bug_hunt::{fetch_request, roundtrip};
 use crate::setup::TestContext;
+use crate::wire::requests::fetch_request;
+use crate::wire::{raw_frame, read_raw_response, roundtrip};
 use rdkafka::producer::{FutureRecord, Producer};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
 /// The shipped default of `pg_kafka.fetch_poll_interval_ms` (the long-poll safety net).
@@ -279,18 +280,6 @@ pub async fn test_listener_read_committed_long_poll_wakes_on_commit() -> TestRes
     Ok(())
 }
 
-/// ApiVersions v0 request frame: [size][api_key=18][api_version=0][correlation_id][client_id=null].
-fn api_versions_v0_frame(correlation_id: i32) -> Vec<u8> {
-    let mut body = Vec::with_capacity(10);
-    body.extend_from_slice(&18i16.to_be_bytes());
-    body.extend_from_slice(&0i16.to_be_bytes());
-    body.extend_from_slice(&correlation_id.to_be_bytes());
-    body.extend_from_slice(&(-1i16).to_be_bytes());
-    let mut frame = (body.len() as i32).to_be_bytes().to_vec();
-    frame.extend_from_slice(&body);
-    frame
-}
-
 /// Pipelining far beyond the per-connection in-flight bound (128) without reading must
 /// neither deadlock nor drop or reorder responses: once the client reads, every response
 /// arrives, in request order.
@@ -301,7 +290,7 @@ pub async fn test_listener_pipelined_requests_beyond_in_flight_cap() -> TestResu
     let mut stream = TcpStream::connect(get_bootstrap_servers()).await?;
     let mut bytes = Vec::new();
     for i in 0..REQUESTS {
-        bytes.extend_from_slice(&api_versions_v0_frame(i));
+        bytes.extend_from_slice(&raw_frame(18, 0, i, &[]));
     }
     println!("Step 1: writing {REQUESTS} pipelined ApiVersions requests without reading...");
     stream.write_all(&bytes).await?;
@@ -312,16 +301,10 @@ pub async fn test_listener_pipelined_requests_beyond_in_flight_cap() -> TestResu
 
     println!("Step 2: reading all responses...");
     for expected in 0..REQUESTS {
-        let read = async {
-            let mut size = [0u8; 4];
-            stream.read_exact(&mut size).await?;
-            let mut frame = vec![0u8; i32::from_be_bytes(size) as usize];
-            stream.read_exact(&mut frame).await?;
-            Ok::<_, std::io::Error>(i32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]))
-        };
-        let correlation_id = tokio::time::timeout(Duration::from_secs(10), read)
-            .await
-            .map_err(|_| format!("timed out waiting for response {expected}"))??;
+        let (correlation_id, _) =
+            tokio::time::timeout(Duration::from_secs(10), read_raw_response(&mut stream))
+                .await
+                .map_err(|_| format!("timed out waiting for response {expected}"))??;
         assert_eq!(
             correlation_id, expected,
             "responses must arrive in request order"

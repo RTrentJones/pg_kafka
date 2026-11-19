@@ -1,11 +1,15 @@
 //! Heartbeats and group-commit batches.
 
 use crate::common::TestResult;
+use crate::wire::request_frame;
 use crate::worker::*;
+use kafka_protocol::messages::{GroupId, HeartbeatRequest};
+use kafka_protocol::protocol::StrBytes;
 use rdkafka::producer::FutureProducer;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 // -------------------------------------------------------------------------------------
 // Item 7: heartbeats no longer split group-commit batches.
@@ -31,30 +35,12 @@ pub async fn test_heartbeats_do_not_split_group_commit_batches() -> TestResult {
 
 /// One connection that keeps 32 pipelined Heartbeat (v0) requests in flight until
 /// `stop`; returns how many responses it read.
-async fn heartbeat_flood(stop: Arc<AtomicBool>) -> DynResult<u64> {
-    use bytes::{BufMut, BytesMut};
-    use kafka_protocol::messages::{GroupId, HeartbeatRequest, RequestHeader};
-    use kafka_protocol::protocol::{Encodable, HeaderVersion, Request, StrBytes};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let mut header = RequestHeader::default();
-    header.request_api_key = HeartbeatRequest::KEY;
-    header.request_api_version = 0;
-    header.correlation_id = 7;
-    header.client_id = Some(StrBytes::from_static_str("w3-heartbeat-flood"));
+async fn heartbeat_flood(stop: Arc<AtomicBool>) -> SendResult<u64> {
     let mut request = HeartbeatRequest::default();
     request.group_id = GroupId(StrBytes::from_static_str("w3-worker-flood-group"));
     request.generation_id = 1;
     request.member_id = StrBytes::from_static_str("w3-flood-member");
-    let mut body = BytesMut::new();
-    header
-        .encode(&mut body, HeartbeatRequest::header_version(0))
-        .map_err(boxed)?;
-    request.encode(&mut body, 0).map_err(boxed)?;
-    let mut frame = BytesMut::new();
-    frame.put_i32(body.len() as i32);
-    frame.extend_from_slice(&body);
-    let burst: Vec<u8> = frame.repeat(32);
+    let burst: Vec<u8> = request_frame(0, 7, &request).repeat(32);
 
     let stream = tokio::net::TcpStream::connect("127.0.0.1:9092")
         .await
@@ -87,14 +73,14 @@ async fn heartbeat_flood(stop: Arc<AtomicBool>) -> DynResult<u64> {
     Ok(responses)
 }
 
-async fn heartbeats_batches() -> DynResult<()> {
+async fn heartbeats_batches() -> SendResult<()> {
     println!("=== Test: heartbeats do not split group-commit batches ===\n");
     let db = session().await?;
     wait_for_serving_listener(&db, None, Duration::from_secs(30)).await?;
     let topic = unique("hb-batch");
     let producers: Vec<FutureProducer> = (0..12)
         .map(|_| quick_producer("30000"))
-        .collect::<DynResult<_>>()?;
+        .collect::<SendResult<_>>()?;
     for p in &producers {
         send(p, &topic, "warm").await?;
     }
@@ -105,7 +91,7 @@ async fn heartbeats_batches() -> DynResult<()> {
         .collect();
     tokio::time::sleep(Duration::from_millis(500)).await;
     set_guc(&db, "pg_kafka.test_pre_commit_delay_ms", Some("200")).await?;
-    let result: DynResult<Duration> = async {
+    let result: SendResult<Duration> = async {
         let start = Instant::now();
         let mut tasks = Vec::new();
         for p in &producers {

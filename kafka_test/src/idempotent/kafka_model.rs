@@ -1,9 +1,11 @@
 //! Kafka's idempotent-producer model over the raw protocol.
 
 use crate::common::TestResult;
+use crate::error_codes;
+use crate::fixtures::topic_with_partitions as topic;
 use crate::setup::TestContext;
-use crate::wire::requests::{topic, INVALID_PRODUCER_EPOCH, NONE, OUT_OF_ORDER_SEQUENCE_NUMBER};
-use crate::wire::{batch, Wire};
+use crate::wire::records::batch;
+use crate::wire::Wire;
 use std::time::Duration;
 
 /// Kafka's idempotent producer model: a retry of any of the last 5 batches is acked with
@@ -18,55 +20,64 @@ pub async fn test_idempotent_duplicates_and_epochs_follow_kafka() -> TestResult 
     let t = topic(&ctx, "w3-txn-idem", 1).await?;
     let mut w = Wire::connect().await?;
     let (err, pid, ep) = w.init_producer_id(None, 60_000).await?;
-    assert_eq!(err, NONE);
+    assert_eq!(err, error_codes::NONE);
     let b = |seq: i32, n: usize, epoch: i16| {
         let values: Vec<&str> = (0..n).map(|_| "v").collect();
         batch(&values, pid, epoch, seq, false, None)
     };
-    assert_eq!(w.produce(&t, 0, b(0, 2, ep), None).await?, (NONE, 0));
-    assert_eq!(w.produce(&t, 0, b(2, 2, ep), None).await?, (NONE, 2));
     assert_eq!(
         w.produce(&t, 0, b(0, 2, ep), None).await?,
-        (NONE, 0),
+        (error_codes::NONE, 0)
+    );
+    assert_eq!(
+        w.produce(&t, 0, b(2, 2, ep), None).await?,
+        (error_codes::NONE, 2)
+    );
+    assert_eq!(
+        w.produce(&t, 0, b(0, 2, ep), None).await?,
+        (error_codes::NONE, 0),
         "retry of batch 1"
     );
     assert_eq!(
         w.produce(&t, 0, b(2, 2, ep), None).await?,
-        (NONE, 2),
+        (error_codes::NONE, 2),
         "retry of batch 2"
     );
     assert_eq!(
         w.produce(&t, 0, b(1, 1, ep), None).await?.0,
-        OUT_OF_ORDER_SEQUENCE_NUMBER,
+        error_codes::OUT_OF_ORDER_SEQUENCE_NUMBER,
         "never-sent range"
     );
     assert_eq!(
         w.produce(&t, 0, b(0, 3, ep), None).await?.0,
-        OUT_OF_ORDER_SEQUENCE_NUMBER,
+        error_codes::OUT_OF_ORDER_SEQUENCE_NUMBER,
         "overlap"
     );
     assert_eq!(
         w.produce(&t, 0, b(9, 1, ep), None).await?.0,
-        OUT_OF_ORDER_SEQUENCE_NUMBER,
+        error_codes::OUT_OF_ORDER_SEQUENCE_NUMBER,
         "gap"
     );
     for seq in 4..10 {
-        assert_eq!(w.produce(&t, 0, b(seq, 1, ep), None).await?.0, NONE);
+        assert_eq!(
+            w.produce(&t, 0, b(seq, 1, ep), None).await?.0,
+            error_codes::NONE
+        );
     }
     // Offsets now 0..=9; the cache holds the batches at sequences 5..=9.
     assert_eq!(
         w.produce(&t, 0, b(0, 2, ep), None).await?.0,
-        OUT_OF_ORDER_SEQUENCE_NUMBER,
+        error_codes::OUT_OF_ORDER_SEQUENCE_NUMBER,
         "older than the cache"
     );
     assert_eq!(
         w.produce(&t, 0, b(4, 1, ep), None).await?.0,
-        OUT_OF_ORDER_SEQUENCE_NUMBER,
+        error_codes::OUT_OF_ORDER_SEQUENCE_NUMBER,
         "6th newest"
     );
     assert_eq!(
         w.produce(&t, 0, b(5, 1, ep), None).await?,
-        (NONE, 5),
+        (error_codes::NONE, 5),
         "5th newest"
     );
     let cached: i64 = ctx
@@ -90,23 +101,32 @@ pub async fn test_idempotent_duplicates_and_epochs_follow_kafka() -> TestResult 
     let mut w = reconnect().await?;
     assert_eq!(
         w.produce(&t, 0, b(9, 1, ep), None).await?,
-        (NONE, 9),
+        (error_codes::NONE, 9),
         "retry after restart"
     );
 
     // Client-side epoch bump (KIP-360, the Java client does it): must restart at 0.
     assert_eq!(
         w.produce(&t, 0, b(3, 1, ep + 1), None).await?.0,
-        OUT_OF_ORDER_SEQUENCE_NUMBER
+        error_codes::OUT_OF_ORDER_SEQUENCE_NUMBER
     );
-    assert_eq!(w.produce(&t, 0, b(0, 1, ep + 1), None).await?, (NONE, 10));
+    assert_eq!(
+        w.produce(&t, 0, b(0, 1, ep + 1), None).await?,
+        (error_codes::NONE, 10)
+    );
     assert_eq!(
         w.produce(&t, 0, b(10, 1, ep), None).await?.0,
-        INVALID_PRODUCER_EPOCH,
+        error_codes::INVALID_PRODUCER_EPOCH,
         "old epoch"
     );
-    assert_eq!(w.produce(&t, 0, b(1, 1, ep + 1), None).await?, (NONE, 11));
-    assert_eq!(w.list_offsets(&t, 0, -1, 0).await?, (NONE, 12, -1));
+    assert_eq!(
+        w.produce(&t, 0, b(1, 1, ep + 1), None).await?,
+        (error_codes::NONE, 11)
+    );
+    assert_eq!(
+        w.list_offsets(&t, 0, -1, 0).await?,
+        (error_codes::NONE, 12, -1)
+    );
     let rows: i64 = ctx
         .db()
         .query_one(
@@ -143,11 +163,11 @@ pub async fn test_idempotent_sequence_wraps_at_i32_max() -> TestResult {
     let t = topic(&ctx, "w3-txn-wrap", 1).await?;
     let mut w = Wire::connect().await?;
     let (err, pid, ep) = w.init_producer_id(None, 60_000).await?;
-    assert_eq!(err, NONE);
+    assert_eq!(err, error_codes::NONE);
     assert_eq!(
         w.produce(&t, 0, batch(&["a"], pid, ep, 0, false, None), None)
             .await?,
-        (NONE, 0)
+        (error_codes::NONE, 0)
     );
     // Jump the stored state to just below the wrap (no client sends 2^31 records here).
     ctx.db()
@@ -165,12 +185,12 @@ pub async fn test_idempotent_sequence_wraps_at_i32_max() -> TestResult {
             None
         )
         .await?,
-        (NONE, 1)
+        (error_codes::NONE, 1)
     );
     assert_eq!(
         w.produce(&t, 0, batch(&["e"], pid, ep, 1, false, None), None)
             .await?,
-        (NONE, 4)
+        (error_codes::NONE, 4)
     );
     assert_eq!(
         w.produce(
@@ -180,7 +200,7 @@ pub async fn test_idempotent_sequence_wraps_at_i32_max() -> TestResult {
             None
         )
         .await?,
-        (NONE, 1),
+        (error_codes::NONE, 1),
         "retry of the wrapping batch"
     );
     ctx.cleanup().await?;

@@ -19,14 +19,13 @@
 
 use crate::common::{create_producer, get_bootstrap_servers, TestResult};
 use crate::setup::TestContext;
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use crate::wire::{read_response, request_frame};
 use kafka_protocol::messages::fetch_request::{FetchPartition, FetchRequest, FetchTopic};
-use kafka_protocol::messages::fetch_response::FetchResponse;
-use kafka_protocol::messages::{RequestHeader, TopicName};
-use kafka_protocol::protocol::{Decodable, Encodable, StrBytes};
+use kafka_protocol::messages::TopicName;
+use kafka_protocol::protocol::StrBytes;
 use rdkafka::producer::FutureRecord;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
 /// Must exceed listener.rs MAX_LONG_POLLS_PER_CONNECTION (64).
@@ -34,8 +33,8 @@ const PIPELINED_FETCHES: usize = 80;
 const EXPECTED_LONG_POLLED: usize = 64;
 const FETCH_MAX_WAIT_MS: i32 = 8_000;
 
-/// Encode a Fetch v4 request ([size][header v1][body v4]) for one partition.
-fn encode_fetch_v4(correlation_id: i32, topic: &str, fetch_offset: i64) -> Bytes {
+/// A Fetch v4 request frame for partition 0 of `topic`.
+fn encode_fetch_v4(correlation_id: i32, topic: &str, fetch_offset: i64) -> Vec<u8> {
     let partition = FetchPartition::default()
         .with_partition(0)
         .with_fetch_offset(fetch_offset)
@@ -50,42 +49,15 @@ fn encode_fetch_v4(correlation_id: i32, topic: &str, fetch_offset: i64) -> Bytes
         .with_max_bytes(4 * 1024 * 1024)
         .with_isolation_level(0)
         .with_topics(vec![fetch_topic]);
-
-    let header = RequestHeader::default()
-        .with_request_api_key(1) // Fetch
-        .with_request_api_version(4)
-        .with_correlation_id(correlation_id)
-        .with_client_id(Some(StrBytes::from_static_str("task-cap-test")));
-
-    let mut body = BytesMut::new();
-    header.encode(&mut body, 1).unwrap(); // header v1 for fetch v4
-    request.encode(&mut body, 4).unwrap();
-
-    let mut framed = BytesMut::with_capacity(body.len() + 4);
-    framed.put_i32(body.len() as i32);
-    framed.put(body);
-    framed.freeze()
+    request_frame(4, correlation_id, &request)
 }
 
 /// Read one [size][correlation_id][FetchResponse v4] frame; return
 /// (correlation_id, has_records).
 async fn read_fetch_response(stream: &mut TcpStream) -> Result<(i32, bool), String> {
-    let mut size_buf = [0u8; 4];
-    stream
-        .read_exact(&mut size_buf)
+    let (correlation_id, response) = read_response::<FetchRequest>(stream, 4)
         .await
-        .map_err(|e| format!("read size failed: {e}"))?;
-    let size = i32::from_be_bytes(size_buf) as usize;
-    let mut frame = vec![0u8; size];
-    stream
-        .read_exact(&mut frame)
-        .await
-        .map_err(|e| format!("read frame failed: {e}"))?;
-
-    let mut buf = Bytes::from(frame);
-    let correlation_id = buf.get_i32(); // response header v0
-    let response = FetchResponse::decode(&mut buf, 4)
-        .map_err(|e| format!("decode fetch response failed: {e}"))?;
+        .map_err(|e| format!("read fetch response failed: {e}"))?;
     let has_records = response.responses.iter().any(|t| {
         t.partitions
             .iter()

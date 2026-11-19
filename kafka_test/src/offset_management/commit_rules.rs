@@ -1,6 +1,8 @@
 //! OffsetCommit generation and member-id rules.
 
 use crate::common::TestResult;
+use crate::error_codes;
+use crate::fixtures::produce_one;
 use crate::setup::TestContext;
 use crate::wire::requests::*;
 
@@ -20,46 +22,55 @@ pub async fn test_offset_commit_generation_and_member_rules() -> TestResult {
 
     assert_eq!(
         commit(&unknown, 5, "x", &topic, 1).await?,
-        ERROR_ILLEGAL_GENERATION
+        error_codes::ILLEGAL_GENERATION
     );
-    assert_eq!(commit(&unknown, -1, "x", &topic, 1).await?, ERROR_NONE);
-    assert_eq!(commit(&unknown, -1, "", &topic, 1).await?, ERROR_NONE);
+    assert_eq!(
+        commit(&unknown, -1, "x", &topic, 1).await?,
+        error_codes::NONE
+    );
+    assert_eq!(
+        commit(&unknown, -1, "", &topic, 1).await?,
+        error_codes::NONE
+    );
 
     let mut a = conn().await?;
     let (e, generation, member, _) =
         join_now(&mut a, &join_req(&group, "", "consumer", &["range"])).await?;
-    assert_eq!(e, ERROR_NONE);
+    assert_eq!(e, error_codes::NONE);
     assert_eq!(
         sync_leader(&mut a, &group, generation, &member).await?,
-        ERROR_NONE
+        error_codes::NONE
     );
     assert_eq!(
         commit(&group, -1, "", &topic, 2).await?,
-        ERROR_UNKNOWN_MEMBER_ID
+        error_codes::UNKNOWN_MEMBER_ID
     );
     assert_eq!(
         commit(&group, -1, "x", &topic, 2).await?,
-        ERROR_UNKNOWN_MEMBER_ID
+        error_codes::UNKNOWN_MEMBER_ID
     );
     assert_eq!(
         commit(&group, -1, &member, &topic, 2).await?,
-        ERROR_ILLEGAL_GENERATION
+        error_codes::ILLEGAL_GENERATION
     );
     assert_eq!(
         commit(&group, generation + 3, &member, &topic, 2).await?,
-        ERROR_ILLEGAL_GENERATION
+        error_codes::ILLEGAL_GENERATION
     );
     assert_eq!(
         commit(&group, generation, &member, &topic, 3).await?,
-        ERROR_NONE
+        error_codes::NONE
     );
 
-    assert_eq!(leave(&mut a, &group, &member).await?, ERROR_NONE);
-    assert_eq!(commit(&group, -1, "", &topic, 4).await?, ERROR_NONE);
-    assert_eq!(commit(&group, -1, &member, &topic, 4).await?, ERROR_NONE);
+    assert_eq!(leave(&mut a, &group, &member).await?, error_codes::NONE);
+    assert_eq!(commit(&group, -1, "", &topic, 4).await?, error_codes::NONE);
+    assert_eq!(
+        commit(&group, -1, &member, &topic, 4).await?,
+        error_codes::NONE
+    );
     assert_eq!(
         commit(&group, 5, "x", &topic, 4).await?,
-        ERROR_UNKNOWN_MEMBER_ID
+        error_codes::UNKNOWN_MEMBER_ID
     );
 
     let committed: i64 = ctx

@@ -25,7 +25,7 @@ use rdkafka::{Message, Offset, TopicPartitionList};
 use std::time::{Duration, Instant};
 use tokio_postgres::Client;
 
-type DynResult<T> = Result<T, Box<dyn std::error::Error>>;
+use crate::common::DynResult;
 
 /// `pg_kafka.message_partition_minutes` in milliseconds.
 async fn width_ms(db: &Client) -> DynResult<i64> {

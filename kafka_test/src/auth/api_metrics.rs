@@ -3,7 +3,7 @@
 
 use super::{auth_env, DynResult, PASSWORD, SASL_PLAINTEXT_PORT, USER};
 use crate::common::{create_db_client, TestResult};
-use crate::error_paths::bug_hunt::roundtrip;
+use crate::wire::roundtrip;
 use bytes::Bytes;
 use kafka_protocol::messages::{SaslAuthenticateRequest, SaslHandshakeRequest};
 use kafka_protocol::protocol::StrBytes;

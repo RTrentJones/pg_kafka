@@ -7,26 +7,24 @@
 //! (established pattern: idempotent/protocol_encoding.rs) with database
 //! verification through ctx.db().
 
+use crate::common::create_admin_client;
 use crate::common::{create_base_consumer, create_producer, get_bootstrap_servers, TestResult};
+use crate::error_codes;
 use crate::setup::TestContext;
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use crate::wire::roundtrip;
 use kafka_protocol::messages::delete_records_request::{
     DeleteRecordsPartition, DeleteRecordsRequest, DeleteRecordsTopic,
 };
-use kafka_protocol::messages::delete_records_response::DeleteRecordsResponse;
 use kafka_protocol::messages::incremental_alter_configs_request::{
     AlterConfigsResource, AlterableConfig, IncrementalAlterConfigsRequest,
 };
-use kafka_protocol::messages::incremental_alter_configs_response::IncrementalAlterConfigsResponse;
-use kafka_protocol::messages::{RequestHeader, TopicName};
-use kafka_protocol::protocol::{Decodable, Encodable, StrBytes};
-use rdkafka::admin::{AdminClient, AdminOptions, ResourceSpecifier};
-use rdkafka::client::DefaultClientContext;
-use rdkafka::config::ClientConfig;
+use kafka_protocol::messages::TopicName;
+use kafka_protocol::protocol::Request;
+use kafka_protocol::protocol::StrBytes;
+use rdkafka::admin::{AdminOptions, ResourceSpecifier};
 use rdkafka::consumer::Consumer;
 use rdkafka::producer::FutureRecord;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 async fn db_topic_retention(
@@ -56,55 +54,21 @@ async fn db_message_count(
     Ok(count)
 }
 
-const ERROR_NONE: i16 = 0;
-const ERROR_OFFSET_OUT_OF_RANGE: i16 = 1;
-const ERROR_INVALID_CONFIG: i16 = 40;
 const OP_SET: i8 = 0;
 const RESOURCE_TYPE_TOPIC: i8 = 2;
 
-fn create_admin_client() -> Result<AdminClient<DefaultClientContext>, Box<dyn std::error::Error>> {
-    let admin: AdminClient<DefaultClientContext> = ClientConfig::new()
-        .set("bootstrap.servers", get_bootstrap_servers())
-        .set("broker.address.family", "v4")
-        .create()?;
-    Ok(admin)
-}
-
-/// Frame a header+body into a length-prefixed request.
-fn frame(
-    header: &RequestHeader,
-    header_version: i16,
-    encode_body: impl FnOnce(&mut BytesMut),
-) -> Bytes {
-    let mut body = BytesMut::new();
-    header.encode(&mut body, header_version).unwrap();
-    encode_body(&mut body);
-    let mut framed = BytesMut::with_capacity(body.len() + 4);
-    framed.put_i32(body.len() as i32);
-    framed.put(body);
-    framed.freeze()
-}
-
-async fn roundtrip(request: Bytes) -> Result<Bytes, String> {
+/// One request on a fresh connection.
+async fn call<R: Request>(
+    version: i16,
+    correlation_id: i32,
+    request: &R,
+) -> Result<R::Response, String> {
     let mut stream = TcpStream::connect(get_bootstrap_servers())
         .await
         .map_err(|e| format!("connect failed: {e}"))?;
-    stream
-        .write_all(&request)
+    roundtrip(&mut stream, version, correlation_id, request)
         .await
-        .map_err(|e| format!("send failed: {e}"))?;
-    let mut size_buf = [0u8; 4];
-    stream
-        .read_exact(&mut size_buf)
-        .await
-        .map_err(|e| format!("read size failed: {e}"))?;
-    let size = i32::from_be_bytes(size_buf) as usize;
-    let mut payload = vec![0u8; size];
-    stream
-        .read_exact(&mut payload)
-        .await
-        .map_err(|e| format!("read frame failed: {e}"))?;
-    Ok(Bytes::from(payload))
+        .map_err(|e| format!("{} v{version} failed: {e}", std::any::type_name::<R>()))
 }
 
 /// Send an IncrementalAlterConfigs v0 SET/DELETE for one topic config and
@@ -125,17 +89,8 @@ async fn alter_topic_config(
                 .with_config_operation(op)
                 .with_value(value.map(|v| StrBytes::from_string(v.to_string())))])]);
 
-    let header = RequestHeader::default()
-        .with_request_api_key(44)
-        .with_request_api_version(0) // v0 = non-flexible (header v1)
-        .with_correlation_id(7001)
-        .with_client_id(Some(StrBytes::from_static_str("configs-test")));
-    let framed = frame(&header, 1, |buf| request.encode(buf, 0).unwrap());
-
-    let mut payload = roundtrip(framed).await?;
-    let _correlation_id = payload.get_i32(); // response header v0
-    let response = IncrementalAlterConfigsResponse::decode(&mut payload, 0)
-        .map_err(|e| format!("decode alter response failed: {e}"))?;
+    // v0 = non-flexible.
+    let response = call(0, 7001, &request).await?;
     let resource = response
         .responses
         .first()
@@ -157,17 +112,8 @@ async fn delete_records(topic: &str, partition: i32, offset: i64) -> Result<(i16
                 .with_partition_index(partition)
                 .with_offset(offset)])]);
 
-    let header = RequestHeader::default()
-        .with_request_api_key(21)
-        .with_request_api_version(1) // v1 = non-flexible (header v1)
-        .with_correlation_id(7002)
-        .with_client_id(Some(StrBytes::from_static_str("configs-test")));
-    let framed = frame(&header, 1, |buf| request.encode(buf, 1).unwrap());
-
-    let mut payload = roundtrip(framed).await?;
-    let _correlation_id = payload.get_i32(); // response header v0
-    let response = DeleteRecordsResponse::decode(&mut payload, 1)
-        .map_err(|e| format!("decode delete-records response failed: {e}"))?;
+    // v1 = non-flexible.
+    let response = call(1, 7002, &request).await?;
     let partition_result = response
         .topics
         .first()
@@ -222,7 +168,11 @@ pub async fn test_describe_configs_reports_topic_configs() -> TestResult {
     println!("Step 3: Setting retention.ms=86400000 and re-describing...");
     let (error_code, error_message) =
         alter_topic_config(&topic, "retention.ms", OP_SET, Some("86400000")).await?;
-    assert_eq!(error_code, ERROR_NONE, "alter failed: {error_message:?}");
+    assert_eq!(
+        error_code,
+        error_codes::NONE,
+        "alter failed: {error_message:?}"
+    );
     let results = admin
         .describe_configs(&[ResourceSpecifier::Topic(&topic)], &opts)
         .await?;
@@ -259,21 +209,21 @@ pub async fn test_incremental_alter_configs_retention_roundtrip() -> TestResult 
 
     println!("Step 1: SET retention.ms=60000...");
     let (code, msg) = alter_topic_config(&topic, "retention.ms", OP_SET, Some("60000")).await?;
-    assert_eq!(code, ERROR_NONE, "SET failed: {msg:?}");
+    assert_eq!(code, error_codes::NONE, "SET failed: {msg:?}");
     assert_eq!(db_topic_retention(ctx.db(), &topic).await?, Some(60000));
     println!("✅ Persisted to kafka.topics.retention_ms\n");
 
     println!("Step 2: DELETE the override...");
     let (code, msg) = alter_topic_config(&topic, "retention.ms", 1 /* DELETE */, None).await?;
-    assert_eq!(code, ERROR_NONE, "DELETE failed: {msg:?}");
+    assert_eq!(code, error_codes::NONE, "DELETE failed: {msg:?}");
     assert_eq!(db_topic_retention(ctx.db(), &topic).await?, None);
     println!("✅ Override cleared\n");
 
     println!("Step 3: Unsupported key and bad value are rejected...");
     let (code, _) = alter_topic_config(&topic, "max.message.bytes", OP_SET, Some("1")).await?;
-    assert_eq!(code, ERROR_INVALID_CONFIG);
+    assert_eq!(code, error_codes::INVALID_CONFIG);
     let (code, _) = alter_topic_config(&topic, "retention.ms", OP_SET, Some("abc")).await?;
-    assert_eq!(code, ERROR_INVALID_CONFIG);
+    assert_eq!(code, error_codes::INVALID_CONFIG);
     assert_eq!(db_topic_retention(ctx.db(), &topic).await?, None);
     println!("✅ Rejected with INVALID_CONFIG, nothing written\n");
 
@@ -308,7 +258,7 @@ pub async fn test_delete_records_truncates_partition() -> TestResult {
 
     println!("Step 2: DeleteRecords(offset=3)...");
     let (code, low_watermark) = delete_records(&topic, 0, 3).await?;
-    assert_eq!(code, ERROR_NONE);
+    assert_eq!(code, error_codes::NONE);
     assert_eq!(low_watermark, 3, "low watermark must advance to 3");
 
     let row = ctx
@@ -328,14 +278,14 @@ pub async fn test_delete_records_truncates_partition() -> TestResult {
 
     println!("Step 3: Out-of-range offset errors, unknown topic errors...");
     let (code, _) = delete_records(&topic, 0, 99).await?;
-    assert_eq!(code, ERROR_OFFSET_OUT_OF_RANGE);
+    assert_eq!(code, error_codes::OFFSET_OUT_OF_RANGE);
     let (code, _) = delete_records("no-such-topic-xyz", 0, 1).await?;
     assert_eq!(code, 3 /* UNKNOWN_TOPIC_OR_PARTITION */);
     println!("✅ Error paths correct\n");
 
     println!("Step 4: DeleteRecords(offset=-1) truncates to the high watermark...");
     let (code, low_watermark) = delete_records(&topic, 0, -1).await?;
-    assert_eq!(code, ERROR_NONE);
+    assert_eq!(code, error_codes::NONE);
     assert_eq!(low_watermark, 5);
     let count: i64 = ctx
         .db()
@@ -432,7 +382,7 @@ pub async fn test_per_topic_retention_override_enforced_by_sweep() -> TestResult
     println!("Step 2: Setting retention.ms=60000 on ONE topic (via API 44)...");
     let (code, msg) =
         alter_topic_config(&topic_with, "retention.ms", OP_SET, Some("60000")).await?;
-    assert_eq!(code, ERROR_NONE, "alter failed: {msg:?}");
+    assert_eq!(code, error_codes::NONE, "alter failed: {msg:?}");
     println!("✅ Override set\n");
 
     println!("Step 3: Running the sweep with the GLOBAL retention disabled (0)...");

@@ -11,7 +11,6 @@ mod basic;
 mod deduplication;
 mod edge_cases;
 mod kafka_model;
-pub mod protocol_encoding;
 
 /// The `idempotent` tests, in run order.
 pub fn tests() -> Vec<crate::registry::TestDef> {

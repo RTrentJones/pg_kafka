@@ -368,7 +368,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     print!("retry {}... ", attempts);
                     let _ = std::io::Write::flush(&mut std::io::stdout());
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                tokio::time::sleep(Duration::from_secs(2)).await;
             }
         }
     }

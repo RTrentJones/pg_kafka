@@ -25,7 +25,7 @@ pub mod tests;
 pub mod api_metrics;
 
 use crate::common::{create_db_client, TestResult};
-use crate::error_paths::bug_hunt::roundtrip;
+use crate::wire::roundtrip;
 use kafka_protocol::messages::ApiVersionsRequest;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -45,7 +45,7 @@ pub const PASSWORD: &str = "e2e auth pässword";
 const LISTENERS: &str =
     "SASL_PLAINTEXT://127.0.0.1:19093,SSL://127.0.0.1:19094,SASL_SSL://127.0.0.1:19095";
 
-pub type DynResult<T> = Result<T, Box<dyn std::error::Error>>;
+use crate::common::DynResult;
 
 /// Where the generated certificates live: one directory per test process.
 ///

@@ -14,18 +14,19 @@
 //! well-behaved clients on 127.0.0.1. All tests are `parallel_safe: false`.
 
 pub mod hostile_clients;
+
+use crate::common::DynResult;
+use crate::wire::records::plain_batch;
+use crate::wire::requests::produce_request;
+use crate::wire::{correlation_of, decode_response, read_frame_within, request_frame};
 pub mod limits;
 
 use crate::common::TestResult;
-use bytes::{BufMut, Bytes, BytesMut};
-use kafka_protocol::messages::produce_request::{
-    PartitionProduceData, ProduceRequest, TopicProduceData,
-};
-use kafka_protocol::messages::{RequestHeader, ResponseHeader, TopicName};
-use kafka_protocol::protocol::{Decodable, Encodable, HeaderVersion, Request, StrBytes};
-use kafka_protocol::records::{
-    Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
-};
+use bytes::Bytes;
+use kafka_protocol::messages::produce_request::ProduceRequest;
+use kafka_protocol::messages::TopicName;
+use kafka_protocol::protocol::StrBytes;
+use kafka_protocol::records::Compression;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::message::Message;
@@ -35,8 +36,6 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpSocket, TcpStream};
-
-pub type DynResult<T> = Result<T, Box<dyn std::error::Error>>;
 
 pub const PORT: u16 = 9092;
 
@@ -49,24 +48,6 @@ pub async fn connect_from(src: Ipv4Addr, port: u16) -> std::io::Result<TcpStream
         .await
 }
 
-/// An encoded request frame (length prefix included).
-pub fn request_frame<R: Request>(version: i16, correlation_id: i32, request: &R) -> Vec<u8> {
-    let mut header = RequestHeader::default();
-    header.request_api_key = R::KEY;
-    header.request_api_version = version;
-    header.correlation_id = correlation_id;
-    header.client_id = Some(StrBytes::from_static_str("w3-net-e2e"));
-    let mut body = BytesMut::new();
-    header
-        .encode(&mut body, R::header_version(version))
-        .expect("encode header");
-    request.encode(&mut body, version).expect("encode body");
-    let mut frame = Vec::with_capacity(4 + body.len());
-    frame.put_i32(body.len() as i32);
-    frame.extend_from_slice(&body);
-    frame
-}
-
 /// An ApiVersions v0 frame.
 pub fn api_versions_frame(correlation_id: i32) -> Vec<u8> {
     request_frame(
@@ -74,43 +55,6 @@ pub fn api_versions_frame(correlation_id: i32) -> Vec<u8> {
         correlation_id,
         &kafka_protocol::messages::ApiVersionsRequest::default(),
     )
-}
-
-/// Read one frame; `Ok(None)` on EOF / reset (the server closed the connection).
-pub async fn read_frame(stream: &mut TcpStream, within: Duration) -> DynResult<Option<Vec<u8>>> {
-    let read = async {
-        let mut size = [0u8; 4];
-        if stream.read_exact(&mut size).await.is_err() {
-            return Ok::<_, Box<dyn std::error::Error>>(None);
-        }
-        let mut buf = vec![0u8; i32::from_be_bytes(size) as usize];
-        if stream.read_exact(&mut buf).await.is_err() {
-            return Ok(None);
-        }
-        Ok(Some(buf))
-    };
-    match tokio::time::timeout(within, read).await {
-        Ok(r) => r,
-        Err(_) => Err(format!("no frame and no close within {:?}", within).into()),
-    }
-}
-
-/// Decode a response frame for `R` at `version`: (correlation id, body).
-pub fn decode_response<R: Request>(version: i16, frame: &[u8]) -> DynResult<(i32, R::Response)> {
-    let mut buf = BytesMut::from(frame);
-    let header = ResponseHeader::decode(
-        &mut buf,
-        <R::Response as HeaderVersion>::header_version(version),
-    )?;
-    Ok((
-        header.correlation_id,
-        R::Response::decode(&mut buf, version)?,
-    ))
-}
-
-/// The correlation id of a response frame (first 4 bytes for every header version).
-pub fn correlation_of(frame: &[u8]) -> i32 {
-    i32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]])
 }
 
 /// How long until the server closes `stream` (EOF or reset), if it does within `within`.
@@ -138,59 +82,9 @@ pub async fn answers(stream: &mut TcpStream, correlation_id: i32) -> bool {
         return false;
     }
     matches!(
-        read_frame(stream, Duration::from_secs(3)).await,
+        read_frame_within(stream, Duration::from_secs(3)).await,
         Ok(Some(f)) if correlation_of(&f) == correlation_id
     )
-}
-
-/// One record batch (v2) holding `values`.
-pub fn record_batch(values: &[Bytes], compression: Compression) -> Bytes {
-    let records: Vec<Record> = values
-        .iter()
-        .enumerate()
-        .map(|(i, v)| Record {
-            transactional: false,
-            control: false,
-            partition_leader_epoch: 0,
-            producer_id: -1,
-            producer_epoch: -1,
-            timestamp_type: TimestampType::Creation,
-            offset: i as i64,
-            sequence: -1,
-            timestamp: 0,
-            key: None,
-            value: Some(v.clone()),
-            headers: Default::default(),
-        })
-        .collect();
-    let mut buf = BytesMut::new();
-    RecordBatchEncoder::encode(
-        &mut buf,
-        records.iter(),
-        &RecordEncodeOptions {
-            version: 2,
-            compression,
-        },
-    )
-    .expect("encode record batch");
-    buf.freeze()
-}
-
-/// A Produce request: one topic, `(partition, batch)` pairs.
-pub fn produce_request(topic: &str, parts: Vec<(i32, Bytes)>, acks: i16) -> ProduceRequest {
-    let mut t = TopicProduceData::default();
-    t.name = TopicName(StrBytes::from_string(topic.to_string()));
-    for (index, batch) in parts {
-        let mut p = PartitionProduceData::default();
-        p.index = index;
-        p.records = Some(batch);
-        t.partition_data.push(p);
-    }
-    let mut r = ProduceRequest::default();
-    r.acks = acks;
-    r.timeout_ms = 5000;
-    r.topic_data = vec![t];
-    r
 }
 
 /// Rows stored for `topic`.

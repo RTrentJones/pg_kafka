@@ -13,41 +13,18 @@
 //! ahead of it, tripping the latency assertion.
 
 use crate::common::TestResult;
-use crate::idempotent::protocol_encoding::{read_response, send_request};
-use bytes::{BufMut, Bytes, BytesMut};
+use crate::wire::requests::sequenced_produce_request;
+use crate::wire::{read_raw_response, request_frame};
 use kafka_protocol::messages::heartbeat_request::HeartbeatRequest;
-use kafka_protocol::messages::{GroupId, RequestHeader};
-use kafka_protocol::protocol::{Encodable, StrBytes};
+use kafka_protocol::messages::GroupId;
+use kafka_protocol::protocol::StrBytes;
 use std::time::{Duration, Instant};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use uuid::Uuid;
 
-const API_KEY_HEARTBEAT: i16 = 12;
 const FLOOD_REQUESTS: usize = 400;
 const FLOOD_PAYLOAD_BYTES: usize = 512 * 1024;
-
-fn encode_heartbeat_request(correlation_id: i32, group_id: &str) -> Bytes {
-    let mut request = HeartbeatRequest::default();
-    request.group_id = GroupId(StrBytes::from_string(group_id.to_string()));
-    request.generation_id = 1;
-    request.member_id = StrBytes::from_static_str("liveness-probe-member");
-
-    // Heartbeat v0 with header v1 (non-flexible) — matches the produce helper style.
-    let header = RequestHeader::default()
-        .with_request_api_key(API_KEY_HEARTBEAT)
-        .with_request_api_version(0)
-        .with_correlation_id(correlation_id)
-        .with_client_id(Some(StrBytes::from_static_str("liveness-probe")));
-
-    let mut body_buf = BytesMut::new();
-    header.encode(&mut body_buf, 1).unwrap();
-    request.encode(&mut body_buf, 0).unwrap();
-
-    let mut buf = BytesMut::new();
-    buf.put_i32(body_buf.len() as i32);
-    buf.put(body_buf);
-    buf.freeze()
-}
 
 pub async fn test_heartbeat_bypasses_produce_backlog() -> TestResult {
     println!("=== Test: Heartbeat Bypasses Produce Backlog (DR-12) ===\n");
@@ -76,21 +53,21 @@ pub async fn test_heartbeat_bypasses_produce_backlog() -> TestResult {
         // the backlog is what we want), then drain all responses.
         let writer_payload = payload;
         for i in 0..FLOOD_REQUESTS {
-            let req = crate::idempotent::protocol_encoding::encode_produce_request(
-                1000 + i as i32,
+            let req = sequenced_produce_request(
                 &flood_topic,
                 0,
                 -1, // non-idempotent
                 -1,
                 -1,
-                vec![&writer_payload],
+                &[&writer_payload],
             );
-            send_request(&mut stream, &req)
+            stream
+                .write_all(&request_frame(7, 1000 + i as i32, &req))
                 .await
                 .map_err(|e| e.to_string())?;
         }
         for _ in 0..FLOOD_REQUESTS {
-            read_response(&mut stream)
+            read_raw_response(&mut stream)
                 .await
                 .map_err(|e| e.to_string())?;
         }
@@ -108,14 +85,18 @@ pub async fn test_heartbeat_bypasses_produce_backlog() -> TestResult {
     tokio::time::sleep(Duration::from_millis(150)).await;
     println!("Step 2: Sending heartbeat probes mid-flood...");
     let mut hb_stream = TcpStream::connect(&bootstrap).await?;
+    let mut heartbeat = HeartbeatRequest::default();
+    heartbeat.group_id = GroupId(StrBytes::from_string(group.clone()));
+    heartbeat.generation_id = 1;
+    heartbeat.member_id = StrBytes::from_static_str("liveness-probe-member");
     let mut hb_rtt = Duration::MAX;
     for probe in 0..3 {
-        let hb_req = encode_heartbeat_request(42 + probe, &group);
         let hb_start = Instant::now();
-        send_request(&mut hb_stream, &hb_req)
+        hb_stream
+            .write_all(&request_frame(0, 42 + probe, &heartbeat))
             .await
             .map_err(|e| format!("heartbeat send failed: {}", e))?;
-        tokio::time::timeout(Duration::from_secs(30), read_response(&mut hb_stream))
+        tokio::time::timeout(Duration::from_secs(30), read_raw_response(&mut hb_stream))
             .await
             .map_err(|_| "heartbeat response timed out entirely")?
             .map_err(|e| format!("heartbeat read failed: {}", e))?;

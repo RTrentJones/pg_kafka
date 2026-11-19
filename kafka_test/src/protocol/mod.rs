@@ -7,46 +7,11 @@
 //! - Request/response framing
 
 use crate::common::TestResult;
+use crate::wire::{raw_frame, read_raw_response};
 use bytes::{BufMut, BytesMut};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
-
-/// Encode a Kafka request frame with the given API key, version, and correlation ID
-fn encode_request(api_key: i16, api_version: i16, correlation_id: i32, body: &[u8]) -> BytesMut {
-    let mut buf = BytesMut::new();
-    let size = 2 + 2 + 4 + 2 + body.len() as i32; // api_key + version + correlation + client_id(-1) + body
-
-    buf.put_i32(size);
-    buf.put_i16(api_key);
-    buf.put_i16(api_version);
-    buf.put_i32(correlation_id);
-    buf.put_i16(-1); // null client_id
-    buf.extend_from_slice(body);
-
-    buf
-}
-
-/// Read a Kafka response and return the correlation ID
-async fn read_response(
-    stream: &mut TcpStream,
-) -> Result<(i32, Vec<u8>), Box<dyn std::error::Error>> {
-    let mut size_buf = [0u8; 4];
-    stream.read_exact(&mut size_buf).await?;
-    let size = i32::from_be_bytes(size_buf) as usize;
-
-    let mut response = vec![0u8; size];
-    stream.read_exact(&mut response).await?;
-
-    if response.len() < 4 {
-        return Err("Response too short".into());
-    }
-
-    let correlation_id = i32::from_be_bytes([response[0], response[1], response[2], response[3]]);
-    let body = response[4..].to_vec();
-
-    Ok((correlation_id, body))
-}
 
 /// Test: API versions request/response
 /// Verifies that ApiVersions (API key 18) returns supported API versions
@@ -59,14 +24,14 @@ pub async fn test_api_versions_negotiation() -> TestResult {
     println!("Step 1: Connected to broker\n");
 
     // Send ApiVersions request (API key 18, version 0)
-    let request = encode_request(18, 0, 12345, &[]);
+    let request = raw_frame(18, 0, 12345, &[]);
     stream.write_all(&request).await?;
 
     println!("Step 2: Sent ApiVersions request\n");
 
     // Read response
     let (correlation_id, body) =
-        tokio::time::timeout(Duration::from_secs(5), read_response(&mut stream)).await??;
+        tokio::time::timeout(Duration::from_secs(5), read_raw_response(&mut stream)).await??;
 
     println!("Step 3: Received response\n");
 
@@ -108,7 +73,7 @@ pub async fn test_correlation_id_preserved() -> TestResult {
     let correlation_ids = [1001, 2002, 3003, 4004, 5005];
 
     for &corr_id in &correlation_ids {
-        let request = encode_request(18, 0, corr_id, &[]); // ApiVersions
+        let request = raw_frame(18, 0, corr_id, &[]); // ApiVersions
         stream.write_all(&request).await?;
     }
 
@@ -121,7 +86,7 @@ pub async fn test_correlation_id_preserved() -> TestResult {
     let mut received_ids = Vec::new();
     for _ in 0..5 {
         let (corr_id, _body) =
-            tokio::time::timeout(Duration::from_secs(5), read_response(&mut stream)).await??;
+            tokio::time::timeout(Duration::from_secs(5), read_raw_response(&mut stream)).await??;
         received_ids.push(corr_id);
     }
 
@@ -155,13 +120,13 @@ pub async fn test_unknown_api_key_handling() -> TestResult {
     println!("Step 1: Connected to broker\n");
 
     // Send request with unknown API key (999)
-    let request = encode_request(999, 0, 77777, &[]);
+    let request = raw_frame(999, 0, 77777, &[]);
     stream.write_all(&request).await?;
 
     println!("Step 2: Sent request with unknown API key 999\n");
 
     // Read response (may be error or connection close)
-    let result = tokio::time::timeout(Duration::from_secs(5), read_response(&mut stream)).await;
+    let result = tokio::time::timeout(Duration::from_secs(5), read_raw_response(&mut stream)).await;
 
     match result {
         Ok(Ok((corr_id, body))) => {
@@ -203,7 +168,7 @@ pub async fn test_protocol_request_pipelining() -> TestResult {
     // Build 10 pipelined requests
     let mut all_requests = BytesMut::new();
     for i in 0..10 {
-        let request = encode_request(18, 0, 1000 + i, &[]); // ApiVersions
+        let request = raw_frame(18, 0, 1000 + i, &[]); // ApiVersions
         all_requests.extend_from_slice(&request);
     }
 
@@ -216,7 +181,7 @@ pub async fn test_protocol_request_pipelining() -> TestResult {
     let mut received = std::collections::HashSet::new();
     for _ in 0..10 {
         let (corr_id, body) =
-            tokio::time::timeout(Duration::from_secs(10), read_response(&mut stream)).await??;
+            tokio::time::timeout(Duration::from_secs(10), read_raw_response(&mut stream)).await??;
 
         received.insert(corr_id);
 
@@ -311,8 +276,8 @@ pub async fn test_response_ordering_with_long_poll() -> TestResult {
     const MAX_WAIT_MS: i32 = 1500;
 
     let fetch_body = encode_fetch_v4_body(&topic, 0, 1, MAX_WAIT_MS, 1);
-    let fetch_request = encode_request(1, 4, FETCH_CORR, &fetch_body);
-    let api_versions_request = encode_request(18, 0, API_VERSIONS_CORR, &[]);
+    let fetch_request = raw_frame(1, 4, FETCH_CORR, &fetch_body);
+    let api_versions_request = raw_frame(18, 0, API_VERSIONS_CORR, &[]);
 
     let start = std::time::Instant::now();
     stream.write_all(&fetch_request).await?;
@@ -322,10 +287,10 @@ pub async fn test_response_ordering_with_long_poll() -> TestResult {
     // First response on the wire must be the fetch, even though ApiVersions
     // completed long before the long poll expired
     let (first_corr, _) =
-        tokio::time::timeout(Duration::from_secs(10), read_response(&mut stream)).await??;
+        tokio::time::timeout(Duration::from_secs(10), read_raw_response(&mut stream)).await??;
     let first_elapsed = start.elapsed();
     let (second_corr, _) =
-        tokio::time::timeout(Duration::from_secs(10), read_response(&mut stream)).await??;
+        tokio::time::timeout(Duration::from_secs(10), read_raw_response(&mut stream)).await??;
 
     println!(
         "Step 3: Responses: first corr={} after {:?}, second corr={}\n",

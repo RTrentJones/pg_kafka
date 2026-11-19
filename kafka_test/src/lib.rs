@@ -41,6 +41,7 @@
 // Infrastructure modules
 pub mod assertions;
 pub mod common;
+pub mod error_codes;
 pub mod fixtures;
 pub mod registry;
 pub mod setup;

@@ -8,86 +8,20 @@
 use crate::common::TestResult;
 use crate::fixtures::{generate_messages, TestTopicBuilder};
 use crate::setup::TestContext;
-use bytes::{Buf, BufMut, BytesMut};
 use kafka_protocol::messages::create_topics_request::{CreatableTopic, CreateTopicsRequest};
-use kafka_protocol::messages::fetch_request::{FetchPartition, FetchRequest, FetchTopic};
 use kafka_protocol::messages::txn_offset_commit_request::{
     TxnOffsetCommitRequest, TxnOffsetCommitRequestPartition, TxnOffsetCommitRequestTopic,
 };
-use kafka_protocol::messages::{
-    GroupId, ProducerId, RequestHeader, ResponseHeader, TopicName, TransactionalId,
-};
-use kafka_protocol::protocol::{Decodable, Encodable, HeaderVersion, Request, StrBytes};
+use kafka_protocol::messages::{GroupId, ProducerId, TopicName, TransactionalId};
+use kafka_protocol::protocol::StrBytes;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+use crate::wire::requests::fetch_request;
+use crate::wire::{raw_frame, read_raw_response, roundtrip};
+
 const BROKER: &str = "localhost:9092";
-
-/// Send one request at `version` and decode its response.
-pub(crate) async fn roundtrip<R: Request>(
-    stream: &mut TcpStream,
-    version: i16,
-    correlation_id: i32,
-    request: &R,
-) -> Result<R::Response, Box<dyn std::error::Error>> {
-    let mut header = RequestHeader::default();
-    header.request_api_key = R::KEY;
-    header.request_api_version = version;
-    header.correlation_id = correlation_id;
-    header.client_id = Some(StrBytes::from_static_str("bug-hunt-e2e"));
-
-    let mut body = BytesMut::new();
-    header.encode(&mut body, R::header_version(version))?;
-    request.encode(&mut body, version)?;
-
-    let mut frame = BytesMut::with_capacity(4 + body.len());
-    frame.put_i32(body.len() as i32);
-    frame.extend_from_slice(&body);
-    stream.write_all(&frame).await?;
-    stream.flush().await?;
-
-    let mut size = [0u8; 4];
-    stream.read_exact(&mut size).await?;
-    let mut buf = vec![0u8; i32::from_be_bytes(size) as usize];
-    stream.read_exact(&mut buf).await?;
-    let mut buf = BytesMut::from(&buf[..]);
-
-    let response_header = ResponseHeader::decode(
-        &mut buf,
-        <R::Response as HeaderVersion>::header_version(version),
-    )?;
-    if response_header.correlation_id != correlation_id {
-        return Err(format!(
-            "correlation id mismatch: sent {}, got {}",
-            correlation_id, response_header.correlation_id
-        )
-        .into());
-    }
-    Ok(R::Response::decode(&mut buf, version)?)
-}
-
-pub(crate) fn fetch_request(
-    topic: &str,
-    partition: i32,
-    offset: i64,
-    max_wait_ms: i32,
-) -> FetchRequest {
-    let mut p = FetchPartition::default();
-    p.partition = partition;
-    p.fetch_offset = offset;
-    p.partition_max_bytes = 1024 * 1024;
-    let mut t = FetchTopic::default();
-    t.topic = TopicName(StrBytes::from_string(topic.to_string()));
-    t.partitions = vec![p];
-    let mut req = FetchRequest::default();
-    req.replica_id = kafka_protocol::messages::BrokerId(-1);
-    req.max_wait_ms = max_wait_ms;
-    req.min_bytes = 1;
-    req.max_bytes = 1024 * 1024;
-    req.topics = vec![t];
-    req
-}
 
 /// Bug 6 (+ the long-poll path in listener.rs): fetching a partition that does not
 /// exist, or an offset past the high watermark, returns the matching error code, and
@@ -394,19 +328,10 @@ pub async fn test_frame_budget_released_on_mid_frame_disconnect() -> TestResult 
     // The broker still serves ordinary requests.
     tokio::time::sleep(Duration::from_millis(300)).await;
     let mut stream = TcpStream::connect(BROKER).await?;
-    let mut req = BytesMut::new();
-    req.put_i32(10);
-    req.put_i16(18); // ApiVersions
-    req.put_i16(0);
-    req.put_i32(4242);
-    req.put_i16(-1); // null client id
-    stream.write_all(&req).await?;
-    let mut size = [0u8; 4];
-    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut size)).await??;
-    let mut body = vec![0u8; i32::from_be_bytes(size) as usize];
-    stream.read_exact(&mut body).await?;
-    let mut body = &body[..];
-    assert_eq!(body.get_i32(), 4242, "ApiVersions correlation id");
+    stream.write_all(&raw_frame(18, 0, 4242, &[])).await?;
+    let (correlation_id, _) =
+        tokio::time::timeout(Duration::from_secs(5), read_raw_response(&mut stream)).await??;
+    assert_eq!(correlation_id, 4242, "ApiVersions correlation id");
 
     println!("✅ Test PASSED\n");
     Ok(())

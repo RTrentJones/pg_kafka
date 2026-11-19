@@ -7,9 +7,10 @@
 //! and checks the stored state.
 
 use crate::common::{create_db_client, get_bootstrap_servers, TestResult};
-use crate::error_paths::bug_hunt::{fetch_request, roundtrip};
 use crate::fixtures::{generate_messages, TestMessage, TestTopicBuilder};
 use crate::setup::TestContext;
+use crate::wire::requests::fetch_request;
+use crate::wire::roundtrip;
 use rdkafka::config::ClientConfig;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use std::time::Duration;

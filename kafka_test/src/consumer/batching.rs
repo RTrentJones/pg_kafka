@@ -1,9 +1,11 @@
 //! RecordBatch grouping of fetched records.
 
 use crate::common::TestResult;
+use crate::error_codes;
+use crate::fixtures::topic_with_partitions as topic;
 use crate::setup::TestContext;
-use crate::wire::requests::{topic, NONE};
-use crate::wire::{batch, batch_headers, fetched_values, Wire};
+use crate::wire::records::{batch, batch_headers, fetched_values};
+use crate::wire::Wire;
 
 /// Fetch groups records into batches (was: one RecordBatch per record).
 pub async fn test_fetch_groups_records_into_batches() -> TestResult {
@@ -18,7 +20,7 @@ pub async fn test_fetch_groups_records_into_batches() -> TestResult {
             w.produce(&t, 0, batch(&refs, -1, -1, -1, false, None), None)
                 .await?
                 .0,
-            NONE
+            error_codes::NONE
         );
     }
     let pd = w.fetch(&t, 0, 0, 0).await?;

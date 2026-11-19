@@ -187,7 +187,7 @@ pub async fn test_session_timeout_rebalance() -> TestResult {
     // 3. Drop consumer (simulates crash - no LeaveGroup sent)
     // We drop without calling consumer.close() to simulate abrupt failure
     println!("\nStep 3: Simulating consumer crash (no LeaveGroup)...");
-    std::mem::drop(consumer1);
+    drop(consumer1);
 
     // Note: In a real crash, the TCP connection would close without LeaveGroup
     // rdkafka may still send LeaveGroup on drop, but the timeout mechanism

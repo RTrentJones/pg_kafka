@@ -4,7 +4,7 @@
 //! These tests verify that pg_kafka returns appropriate error codes
 //! when given invalid inputs.
 
-pub(crate) mod bug_hunt;
+mod bug_hunt;
 mod consumer_errors;
 mod coordinator_errors;
 mod coordinator_tests;

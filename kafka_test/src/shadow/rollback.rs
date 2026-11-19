@@ -10,66 +10,24 @@ use super::external_client::{consume_from_external, verify_external_kafka_ready}
 use super::helpers::{enable_shadow_mode, ShadowMode, ShadowTopicConfig, SyncMode, WriteMode};
 use crate::common::TestResult;
 use crate::setup::TestContext;
-use bytes::BytesMut;
-use kafka_protocol::messages::produce_request::{
-    PartitionProduceData, ProduceRequest, TopicProduceData,
-};
-use kafka_protocol::messages::TopicName;
-use kafka_protocol::protocol::StrBytes;
-use kafka_protocol::records::{
-    Compression, Record as PRecord, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
-};
+use crate::wire::records::{encode, plain_record};
+use kafka_protocol::messages::produce_request::ProduceRequest;
+use kafka_protocol::records::Compression;
 use std::time::Duration;
 use tokio::net::TcpStream;
 
 const BROKER: &str = "localhost:9092";
 
-fn record_batch(key: &str, value: &str) -> bytes::Bytes {
-    let record = PRecord {
-        transactional: false,
-        control: false,
-        partition_leader_epoch: 0,
-        producer_id: -1,
-        producer_epoch: -1,
-        timestamp_type: TimestampType::Creation,
-        offset: 0,
-        sequence: -1,
-        timestamp: 0,
-        key: Some(bytes::Bytes::from(key.to_string())),
-        value: Some(bytes::Bytes::from(value.to_string())),
-        headers: Default::default(),
-    };
-    let mut buf = BytesMut::new();
-    RecordBatchEncoder::encode(
-        &mut buf,
-        [record].iter(),
-        &RecordEncodeOptions {
-            version: 2,
-            compression: Compression::None,
-        },
-    )
-    .expect("encode record batch");
-    buf.freeze()
-}
-
 /// One acks=1 produce carrying one record per listed partition, in order.
 fn produce_request(topic: &str, partitions: &[(i32, &str)]) -> ProduceRequest {
-    let mut t = TopicProduceData::default();
-    t.name = TopicName(StrBytes::from_string(topic.to_string()));
-    t.partition_data = partitions
+    let parts = partitions
         .iter()
         .map(|&(index, value)| {
-            let mut p = PartitionProduceData::default();
-            p.index = index;
-            p.records = Some(record_batch(value, value));
-            p
+            let record = plain_record(0, Some(value), value.as_bytes());
+            (index, encode(&[record], Compression::None))
         })
         .collect();
-    let mut req = ProduceRequest::default();
-    req.acks = 1;
-    req.timeout_ms = 5000;
-    req.topic_data = vec![t];
-    req
+    crate::wire::requests::produce_request(topic, parts, 1)
 }
 
 async fn local_count(ctx: &TestContext, topic: &str) -> Result<i64, Box<dyn std::error::Error>> {
@@ -136,7 +94,7 @@ pub async fn test_sync_forward_skips_rolled_back_request() -> TestResult {
 
     let outcome = async {
         let mut stream = TcpStream::connect(BROKER).await?;
-        let failed = crate::error_paths::bug_hunt::roundtrip(
+        let failed = crate::wire::roundtrip(
             &mut stream,
             7,
             701,
@@ -152,7 +110,7 @@ pub async fn test_sync_forward_skips_rolled_back_request() -> TestResult {
             .collect();
         let stored_after_failure = local_count(&ctx, &topic).await?;
 
-        let ok = crate::error_paths::bug_hunt::roundtrip(
+        let ok = crate::wire::roundtrip(
             &mut stream,
             7,
             702,

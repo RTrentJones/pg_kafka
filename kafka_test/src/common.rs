@@ -3,6 +3,8 @@
 //! This module provides shared functionality for database connections,
 //! Kafka client creation, and test result types.
 
+use rdkafka::admin::AdminClient;
+use rdkafka::client::DefaultClientContext;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, StreamConsumer};
 use rdkafka::producer::FutureProducer;
@@ -10,8 +12,19 @@ use std::env;
 use std::time::Duration;
 use tokio_postgres::{Client, NoTls};
 
-/// Test result type alias for cleaner function signatures
-pub type TestResult = Result<(), Box<dyn std::error::Error>>;
+/// The error-carrying result of test code.
+pub type DynResult<T> = Result<T, Box<dyn std::error::Error>>;
+
+/// What every test returns.
+pub type TestResult = DynResult<()>;
+
+/// An rdkafka admin client for the broker under test.
+pub fn create_admin_client() -> DynResult<AdminClient<DefaultClientContext>> {
+    Ok(ClientConfig::new()
+        .set("bootstrap.servers", get_bootstrap_servers())
+        .set("broker.address.family", "v4")
+        .create()?)
+}
 
 /// Get database connection string from DATABASE_URL env var or use default
 pub fn get_database_url() -> String {
