@@ -340,6 +340,11 @@ pub trait TopicStore {
     /// * `retention_ms` - `Some(ms)` to set (negative = infinite), `None` to
     ///   clear the override and fall back to the global GUC
     fn set_topic_retention_ms(&self, topic_id: i32, retention_ms: Option<i64>) -> Result<()>;
+
+    // wave3 groups
+    /// An existing topic whose name collides with `name` once '.' and '_' are treated as equal
+    /// (Kafka's metric-name collision rule), other than `name` itself; `None` if there is none.
+    fn find_colliding_topic(&self, name: &str) -> Result<Option<String>>;
 }
 
 /// The message log: append, read (with isolation), offset bounds and truncation.
@@ -564,6 +569,15 @@ pub trait OffsetStore {
     /// # Returns
     /// Ok on success
     fn delete_consumer_group_offsets(&self, group_id: &str) -> Result<()>;
+
+    // wave3 groups
+    /// The ids of every group that has at least one committed offset (sorted). These groups
+    /// exist for DescribeGroups / ListGroups even when the in-memory coordinator does not know
+    /// them (e.g. after a worker restart), as Kafka reports them as Empty groups.
+    fn list_offset_groups(&self) -> Result<Vec<String>>;
+
+    /// Whether `group_id` has at least one committed offset.
+    fn group_has_offsets(&self, group_id: &str) -> Result<bool>;
 }
 
 /// Idempotent producer state: producer ids, epochs and sequence numbers (Phase 9).
@@ -910,6 +924,10 @@ macro_rules! delegate_topic_store {
         fn set_topic_retention_ms(&self, topic_id: i32, retention_ms: Option<i64>) -> $crate::kafka::error::Result<()> {
             $via::set_topic_retention_ms(&self $(.$field)?, topic_id, retention_ms)
         }
+        // wave3 groups
+        fn find_colliding_topic(&self, name: &str) -> $crate::kafka::error::Result<Option<String>> {
+            $via::find_colliding_topic(&self $(.$field)?, name)
+        }
     };
 }
 pub(crate) use delegate_topic_store;
@@ -969,6 +987,13 @@ macro_rules! delegate_offset_store {
         }
         fn delete_consumer_group_offsets(&self, group_id: &str) -> $crate::kafka::error::Result<()> {
             $via::delete_consumer_group_offsets(&self $(.$field)?, group_id)
+        }
+        // wave3 groups
+        fn list_offset_groups(&self) -> $crate::kafka::error::Result<Vec<String>> {
+            $via::list_offset_groups(&self $(.$field)?)
+        }
+        fn group_has_offsets(&self, group_id: &str) -> $crate::kafka::error::Result<bool> {
+            $via::group_has_offsets(&self $(.$field)?, group_id)
         }
     };
 }

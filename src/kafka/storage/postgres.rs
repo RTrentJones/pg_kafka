@@ -1448,6 +1448,57 @@ impl PostgresStore {
         })
     }
 
+    // ===== wave3 groups: topic-name collisions, groups known only by their offsets =====
+
+    fn find_colliding_topic(&self, name: &str) -> Result<Option<String>> {
+        Spi::connect(|client| {
+            let mut table = client.select(
+                "SELECT name FROM kafka.topics
+                 WHERE replace(name, '.', '_') = replace($1, '.', '_') AND name <> $1
+                 ORDER BY name LIMIT 1",
+                Some(1),
+                &[name.into()],
+            )?;
+            match table.next() {
+                Some(row) => Ok(row.get_by_name::<String, _>("name")?),
+                None => Ok(None),
+            }
+        })
+        .map_err(|e: KafkaError| {
+            KafkaError::Internal(format!("find_colliding_topic failed: {}", e))
+        })
+    }
+
+    fn list_offset_groups(&self) -> Result<Vec<String>> {
+        Spi::connect(|client| {
+            let table = client.select(
+                "SELECT DISTINCT group_id FROM kafka.consumer_offsets ORDER BY group_id",
+                None,
+                &[],
+            )?;
+            let mut groups = Vec::new();
+            for row in table {
+                if let Some(g) = row.get_by_name::<String, _>("group_id")? {
+                    groups.push(g);
+                }
+            }
+            Ok(groups)
+        })
+        .map_err(|e: KafkaError| KafkaError::Internal(format!("list_offset_groups failed: {}", e)))
+    }
+
+    fn group_has_offsets(&self, group_id: &str) -> Result<bool> {
+        Spi::connect(|client| {
+            let table = client.select(
+                "SELECT 1 FROM kafka.consumer_offsets WHERE group_id = $1 LIMIT 1",
+                Some(1),
+                &[group_id.into()],
+            )?;
+            Ok(!table.is_empty())
+        })
+        .map_err(|e: KafkaError| KafkaError::Internal(format!("group_has_offsets failed: {}", e)))
+    }
+
     // ===== Idempotent Producer Operations (Phase 9) =====
 
     fn allocate_producer_id(
