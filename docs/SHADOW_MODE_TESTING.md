@@ -195,7 +195,7 @@ Should show `172.18.0.2` (or current actual IP). If it shows a different IP, Doc
 
 ## Test Categories
 
-The `shadow` category's tests are registered in `kafka_test/src/main.rs`, all `parallel_safe: false` (`cargo run --release -- --list` prints the live set under `shadow:`):
+The `shadow` category's tests are listed in `tests()` in `kafka_test/src/shadow/mod.rs`; all but `test_shadow_lag_view_is_per_partition` are sequential (`cargo run --release -- --list` prints the live set under `shadow:`):
 
 | Test | Description |
 |------|-------------|
@@ -224,10 +224,7 @@ The `shadow` category's tests are registered in `kafka_test/src/main.rs`, all `p
 | `test_shadow_order_preserved_across_a_retried_failure` | An external topic rejects the batch holding an oversized record until its `max.message.bytes` is raised; nothing after the failed record is delivered before its retry and the external order equals the local order |
 | `test_shadow_sync_stall_is_bounded_to_its_own_response` | External cluster unreachable: a sync produce is held ~`shadow_sync_timeout_ms` (3 s) while produces to another topic stay < 1 s |
 | `test_shadow_gucs_take_effect_on_reload` | Session `SET` of shadow GUCs is refused; a security-protocol change rebuilds the producer; `shadow_metrics_enabled = off` writes no metrics; sampled-out records are counted in `messages_skipped` |
-
-The functional suite (no external Kafka) also has
-`test_shadow_lag_view_is_per_partition` (`kafka.shadow_partition_status` / `kafka.shadow_status`
-lag, dead letters and in-flight counts per partition).
+| `test_shadow_lag_view_is_per_partition` | `kafka.shadow_partition_status` / `kafka.shadow_status` report lag, dead letters and in-flight counts per partition (needs no external Kafka; runs in the shadow job with the rest of the category) |
 
 ## Running Tests
 
