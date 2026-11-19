@@ -225,10 +225,11 @@ pub async fn test_external_primary_dead_letter_serves_local() -> TestResult {
     );
 
     // Force the forward into the dead-letter state (retry cap exhausted, external
-    // delivery abandoned): retry_count >= MAX_FORWARD_RETRIES (10), still un-forwarded.
+    // delivery abandoned): retry_count >= pg_kafka.shadow_max_retries, still un-forwarded.
     ctx.db()
         .execute(
-            "UPDATE kafka.shadow_tracking SET external_offset = NULL, retry_count = 10 WHERE topic_id = $1",
+            "UPDATE kafka.shadow_tracking SET external_offset = NULL, \
+             retry_count = current_setting('pg_kafka.shadow_max_retries')::int WHERE topic_id = $1",
             &[&topic_id],
         )
         .await?;

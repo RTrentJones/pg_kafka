@@ -198,9 +198,10 @@ Sequential merges under the strict `main` gate; rebase each on latest `main`.
    rows = **BASELINE** (dead producer code still present, but off the live path).
 2. ✅ **PR-B (site reporting)** → blog loop; renders the compliance table + shadow throughput rows (shows the
    baseline once published).
-3. ⏳ **PR4 (dead-`ShadowStore`-producer removal)** → merge (rebased on post-A `main`). *Not done:*
-   `ShadowStore.producer`, `ensure_producer()` and the uncalled `ShadowStore::flush()` are still in
-   `src/kafka/shadow/store.rs`. (`ShadowProducer::send_sync` in `producer.rs` is also no longer called.)
+3. ✅ **PR4 (dead-`ShadowStore`-producer removal)**: done in wave 3 together with the forwarder rebuild
+   (`ShadowStore.producer`, `ensure_producer()`, `ShadowStore::flush()` and `ShadowProducer::send_*`
+   are gone). Because the same change made the forwarder pipelined, the AFTER throughput rows are
+   expected to differ from the baseline (higher), not to be identical.
 4. ⏳ **Re-dispatch `evidence.yml`** → new evidence: every compliance check still `pass`, `counts` identical, and
    the shadow-async/-sync TPS rows unchanged = **AFTER**, published proof PR4 was behaviour-neutral for
    forwarding.

@@ -871,3 +871,127 @@ GRANT SELECT ON kafka.sasl_server_secret TO pgkafka_worker;
 COMMENT ON TABLE kafka.sasl_server_secret IS 'Secret keying the fake SCRAM salts of unknown SASL users (wave3 net); never shown to clients.';
 -- END wave3 net
 -- =============================================================================
+-- wave3 shadow: pipelined forwarder, per-partition order, truthful lag
+-- =============================================================================
+-- attempt_open: a claim opens an attempt; its ack closes it. retry_count now
+-- counts failed delivery attempts only (an ack of a failure, or an attempt still
+-- open when its worker no longer tracks it, i.e. a lost ack), not claims.
+ALTER TABLE kafka.shadow_tracking
+    ADD COLUMN attempt_open BOOLEAN NOT NULL DEFAULT false;
+GRANT SELECT (attempt_open) ON kafka.shadow_tracking TO pgkafka_reader;
+-- Failed, still pending rows: the outbox claim finds each partition's first
+-- backing-off row here without scanning the whole backlog.
+CREATE INDEX idx_shadow_tracking_retrying
+ON kafka.shadow_tracking(topic_id, partition_id, local_offset)
+WHERE external_offset IS NULL AND retry_count > 0;
+COMMENT ON COLUMN kafka.shadow_tracking.retry_count IS 'Failed delivery attempts. At pg_kafka.shadow_max_retries the row is a dead letter (pending, never retried) until replayed or the cap is raised.';
+COMMENT ON COLUMN kafka.shadow_tracking.attempt_open IS 'True while a forward of the row is in flight (claimed, not yet acked).';
+
+-- Replay also closes any open attempt.
+CREATE OR REPLACE FUNCTION kafka.replay_shadow_messages(
+    p_topic_id INT,
+    p_from_offset BIGINT DEFAULT 0,
+    p_to_offset BIGINT DEFAULT NULL
+) RETURNS BIGINT
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_count BIGINT;
+BEGIN
+    INSERT INTO kafka.shadow_tracking (topic_id, partition_id, local_offset)
+    SELECT m.topic_id, m.partition_id, m.partition_offset
+    FROM kafka.messages m
+    WHERE m.topic_id = p_topic_id
+      AND m.partition_offset >= p_from_offset
+      AND (p_to_offset IS NULL OR m.partition_offset < p_to_offset)
+      -- RA-6: only replay committed/non-transactional records.
+      AND m.txn_state IS NULL
+    ON CONFLICT (topic_id, partition_id, local_offset) DO UPDATE
+        SET external_offset = NULL,
+            forwarded_at    = NULL,
+            error_message   = NULL,
+            retry_count     = 0,
+            attempt_open    = false;
+    GET DIAGNOSTICS v_count = ROW_COUNT;
+    RETURN v_count;
+END;
+$$;
+REVOKE EXECUTE ON FUNCTION kafka.replay_shadow_messages(INT, BIGINT, BIGINT) FROM PUBLIC;
+
+-- Per-partition forwarding state. lag = records of the partition still to be
+-- forwarded (pending outbox rows under the retry cap): exact under sampling
+-- (sampled-out records are never in the outbox) and 0 when caught up.
+-- dead_lettered = pending rows at the cap (never retried until replayed).
+CREATE VIEW kafka.shadow_partition_status AS
+WITH cap AS (
+    SELECT COALESCE(NULLIF(current_setting('pg_kafka.shadow_max_retries', true), '')::int, 10) AS n
+),
+parts AS (
+    SELECT topic_id, partition_id FROM kafka.shadow_metrics
+    UNION
+    SELECT DISTINCT topic_id, partition_id FROM kafka.shadow_tracking
+)
+SELECT
+    t.name AS topic_name,
+    p.topic_id,
+    p.partition_id,
+    COALESCE(q.lag, 0)::BIGINT AS lag,
+    COALESCE(q.dead_lettered, 0)::BIGINT AS dead_lettered,
+    COALESCE(q.in_flight, 0)::BIGINT AS in_flight,
+    q.oldest_pending_offset,
+    sm.last_forwarded_offset,
+    sm.last_forwarded_at,
+    COALESCE(sm.messages_forwarded, 0)::BIGINT AS messages_forwarded,
+    COALESCE(sm.messages_skipped, 0)::BIGINT AS messages_skipped,
+    COALESCE(sm.messages_failed, 0)::BIGINT AS messages_failed
+FROM parts p
+JOIN kafka.topics t ON t.id = p.topic_id
+LEFT JOIN kafka.shadow_metrics sm
+       ON sm.topic_id = p.topic_id AND sm.partition_id = p.partition_id
+LEFT JOIN LATERAL (
+    SELECT COUNT(*) FILTER (WHERE st.retry_count < cap.n) AS lag,
+           COUNT(*) FILTER (WHERE st.retry_count >= cap.n) AS dead_lettered,
+           COUNT(*) FILTER (WHERE st.attempt_open) AS in_flight,
+           MIN(st.local_offset) FILTER (WHERE st.retry_count < cap.n) AS oldest_pending_offset
+    FROM kafka.shadow_tracking st, cap
+    WHERE st.topic_id = p.topic_id AND st.partition_id = p.partition_id
+      AND st.external_offset IS NULL
+) q ON true;
+GRANT SELECT ON kafka.shadow_partition_status TO pgkafka_reader;
+COMMENT ON VIEW kafka.shadow_partition_status IS 'Per-partition shadow forwarding state: lag (records still to forward), dead letters, in-flight forwards, metrics.';
+
+-- shadow_status: lag is now the sum of the per-partition lags (it was
+-- MAX(offset) - MAX(last_forwarded_offset) across partitions: hid lagging
+-- partitions, off by one, never 0 under sampling); totals come from
+-- kafka.shadow_metrics without a join fan-out. New trailing columns:
+-- dead_lettered and max_partition_lag.
+CREATE OR REPLACE VIEW kafka.shadow_status AS
+SELECT
+    t.name AS topic_name,
+    COALESCE(sc.mode, 'local_only') AS mode,
+    COALESCE(sc.forward_percentage, 0) AS forward_percentage,
+    COALESCE(sc.sync_mode, 'async') AS sync_mode,
+    sc.external_topic_name,
+    COALESCE(ps.total_forwarded, 0)::BIGINT AS total_forwarded,
+    COALESCE(ps.total_skipped, 0)::BIGINT AS total_skipped,
+    COALESCE(ps.total_failed, 0)::BIGINT AS total_failed,
+    ps.last_forwarded_offset,
+    ps.last_forwarded_at::timestamp AS last_forwarded_at,
+    COALESCE(ps.lag, 0)::BIGINT AS lag,
+    COALESCE(ps.dead_lettered, 0)::BIGINT AS dead_lettered,
+    COALESCE(ps.max_partition_lag, 0)::BIGINT AS max_partition_lag
+FROM kafka.topics t
+LEFT JOIN kafka.shadow_config sc ON t.id = sc.topic_id
+LEFT JOIN (
+    SELECT topic_id,
+           SUM(messages_forwarded) AS total_forwarded,
+           SUM(messages_skipped) AS total_skipped,
+           SUM(messages_failed) AS total_failed,
+           MAX(last_forwarded_offset) AS last_forwarded_offset,
+           MAX(last_forwarded_at) AS last_forwarded_at,
+           SUM(lag) AS lag,
+           SUM(dead_lettered) AS dead_lettered,
+           MAX(lag) AS max_partition_lag
+    FROM kafka.shadow_partition_status
+    GROUP BY topic_id
+) ps ON ps.topic_id = t.id;
+-- end wave3 shadow

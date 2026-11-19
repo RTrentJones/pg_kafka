@@ -26,6 +26,7 @@ pub mod external_client;
 pub mod helpers;
 pub mod no_duplicates;
 pub mod percentage_routing;
+pub mod pipelined;
 pub mod replay;
 pub mod rollback;
 pub mod topic_mapping;

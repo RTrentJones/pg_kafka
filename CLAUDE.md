@@ -264,6 +264,8 @@ src/
 │   │   ├── config.rs   # ShadowConfig, per-topic TopicShadowConfig, modes
 │   │   ├── store.rs    # ShadowStore: store wrapper writing the durable outbox
 │   │   ├── forwarder.rs, routing.rs  # Forward decision + percentage routing hash
+│   │   ├── forwarder_task.rs # Network-thread forwarder: pipelined, ordered, sync-response holds
+│   │   ├── outbox.rs   # ShadowDb: the outbox SQL (claim, batched acks) + in-memory fake
 │   │   ├── producer.rs # rdkafka FutureProducer wrapper (SASL/SSL settings)
 │   │   ├── inflight.rs # In-flight forward tracking for the outbox
 │   │   ├── primary.rs  # Primary detection (only the primary forwards)
@@ -533,7 +535,8 @@ CREATE TABLE kafka.txn_pending_offsets (
 );
 
 -- Phase 11 (Shadow Mode): kafka.shadow_config, kafka.shadow_tracking (durable outbox),
--- kafka.shadow_metrics, view kafka.shadow_status, function kafka.replay_shadow_messages().
+-- kafka.shadow_metrics, views kafka.shadow_status and kafka.shadow_partition_status,
+-- function kafka.replay_shadow_messages().
 -- Monitoring: view kafka.metrics (row-count snapshot); views kafka.api_metrics (per-API
 -- requests/errors/latency), kafka.broker_metrics (connections, request-queue depth) and
 -- kafka.consumer_lag. The first two read UNLOGGED tables the worker upserts at most once per
@@ -649,26 +652,28 @@ pg_kafka.request_read_timeout_ms = 60000   -- a request frame must arrive within
 Shadow mode allows pg_kafka to forward messages to an external Kafka cluster while still storing them locally. This enables dual-write patterns for migration, validation, or hybrid architectures.
 
 ```sql
--- Enable shadow mode globally (Sighup)
+-- Every shadow GUC except the license key is Sighup (ALTER SYSTEM + pg_reload_conf();
+-- a session SET is refused). A change to any producer setting rebuilds the forwarder's producer.
 pg_kafka.shadow_mode_enabled = true                    -- Default: false
 
 -- External Kafka connection
-pg_kafka.shadow_bootstrap_servers = 'kafka1:9092,kafka2:9092'  -- Required (Sighup)
-pg_kafka.shadow_security_protocol = 'SASL_SSL'         -- Default: SASL_SSL (use PLAINTEXT for local/no-auth) (Sighup)
-pg_kafka.shadow_sasl_mechanism = 'SCRAM-SHA-256'       -- Default: PLAIN (restart)
-pg_kafka.shadow_sasl_username = 'your_username'        -- Default: empty (restart; superuser-only, hidden from SHOW ALL)
-pg_kafka.shadow_sasl_password = 'your_password'        -- Default: empty (restart; superuser-only, hidden from SHOW ALL)
-pg_kafka.shadow_ssl_ca_location = '/path/to/ca-cert'   -- Default: empty (restart)
+pg_kafka.shadow_bootstrap_servers = 'kafka1:9092,kafka2:9092'  -- Required
+pg_kafka.shadow_security_protocol = 'SASL_SSL'         -- Default: SASL_SSL (use PLAINTEXT for local/no-auth)
+pg_kafka.shadow_sasl_mechanism = 'SCRAM-SHA-256'       -- Default: PLAIN
+pg_kafka.shadow_sasl_username = 'your_username'        -- Default: empty (superuser-only, hidden from SHOW ALL)
+pg_kafka.shadow_sasl_password = 'your_password'        -- Default: empty (superuser-only, hidden from SHOW ALL)
+pg_kafka.shadow_ssl_ca_location = '/path/to/ca-cert'   -- Default: empty
 
--- Batching and retry configuration (Suset)
-pg_kafka.shadow_batch_size = 1000                      -- Messages per batch (default 1000; 1-100000)
-pg_kafka.shadow_linger_ms = 10                         -- Batch delay (default 10; 0-60000ms)
-pg_kafka.shadow_retry_backoff_ms = 100                 -- Retry delay (default 100; 10-60000ms)
-pg_kafka.shadow_max_retries = 3                        -- Max retries (default 3; 0-100)
+-- Batching and retry configuration
+pg_kafka.shadow_batch_size = 1000                      -- Records per outbox claim and librdkafka batch.num.messages (1-100000)
+pg_kafka.shadow_linger_ms = 10                         -- librdkafka linger.ms (0-60000)
+pg_kafka.shadow_retry_backoff_ms = 100                 -- librdkafka retry.backoff.ms + outbox re-attempt backoff base (doubles, cap 30 s; 10-60000)
+pg_kafka.shadow_max_retries = 10                       -- Failed delivery attempts before a row is dead-lettered (0-100)
+pg_kafka.shadow_sync_timeout_ms = 5000                 -- How long a sync-mode produce response waits for the external ack (0 = not held; 0-120000)
 pg_kafka.shadow_external_primary_strict = false        -- Keep external_only topics read-suppressed even after a dead-lettered forward (default false)
 
--- Observability (Suset)
-pg_kafka.shadow_metrics_enabled = true                 -- Enable metrics collection (kafka.shadow_metrics)
+-- Observability
+pg_kafka.shadow_metrics_enabled = true                 -- Write kafka.shadow_metrics (forwarded/failed/skipped)
 
 -- License (restart; superuser-only, hidden from SHOW ALL)
 pg_kafka.shadow_license_key = 'eval'                   -- 'sponsor_id:token' or 'eval'
@@ -676,7 +681,7 @@ pg_kafka.shadow_license_key = 'eval'                   -- 'sponsor_id:token' or 
 
 **Per-Topic Shadow Configuration:**
 
-Shadow mode is configured per-topic via the `kafka.shadow_config` table, keyed by `topic_id`. Columns: `mode` (`'local_only'` | `'shadow'`), `forward_percentage` (0-100), `external_topic_name`, `sync_mode` (`'async'` | `'sync'`, default `'sync'`; there is no global default GUC; `sync` forwards right after the local commit and holds the produce response until the external ack or 5 s), `write_mode` (`'dual_write'` | `'external_only'`). The worker picks up changes on its next config reload (`pg_kafka.config_reload_interval_ms`, or immediately after `pg_reload_conf()`).
+Shadow mode is configured per-topic via the `kafka.shadow_config` table, keyed by `topic_id`. Columns: `mode` (`'local_only'` | `'shadow'`), `forward_percentage` (0-100), `external_topic_name`, `sync_mode` (`'async'` | `'sync'`, default `'sync'`; there is no global default GUC; `sync` holds the produce response, after the local commit, until the record is delivered externally or `pg_kafka.shadow_sync_timeout_ms` passes; the worker never waits), `write_mode` (`'dual_write'` | `'external_only'`). The worker picks up changes on its next config reload (`pg_kafka.config_reload_interval_ms`, or immediately after `pg_reload_conf()`).
 
 ```sql
 -- Forward specific topics with different settings
@@ -691,8 +696,9 @@ SELECT pg_reload_conf();
 -- Only committed/non-transactional rows are replayed. Returns the number of rows queued.
 SELECT kafka.replay_shadow_messages(p_topic_id => 1, p_from_offset => 0, p_to_offset => NULL);
 
--- Monitoring
+-- Monitoring (lag = records still to forward; per partition in kafka.shadow_partition_status)
 SELECT * FROM kafka.shadow_status;
+SELECT * FROM kafka.shadow_partition_status;
 ```
 
 **Use Cases:**
@@ -787,7 +793,7 @@ Per-category counts are in `docs/TEST_STRATEGY.md`; `cargo run --release -- --li
 | **compression** | gzip, snappy, lz4, zstd, roundtrip, edge cases |
 | **idempotent** | InitProducerId, deduplication, epoch, multi-partition |
 | **transaction** | Transactions, isolation levels, EOS, fencing, atomicity, timeouts |
-| **shadow** | External forwarding, SASL/SSL, topic mapping, replay, dial-up |
+| **shadow** | External forwarding, SASL/SSL, topic mapping, replay, dial-up, throughput floor, headers/timestamps, order across a retried failure, sync-stall bound, GUC reload |
 | **long_poll** | Timeout behavior, immediate return, producer wakeup, precision, per-connection task cap |
 | **error_paths** | Invalid partitions, unknown topics, coordinator errors, protocol/transaction/group regressions |
 | **edge_cases** | Empty topics, large messages, boundary values, retention sweep |
@@ -801,6 +807,7 @@ Per-category counts are in `docs/TEST_STRATEGY.md`; `cargo run --release -- --li
 | **w3_groups** | Wave 3 groups stream: partition caps (raw 2e9 CreateTopics, corrupt stored count), CreateTopics validation, JoinGroup protocol rules, OffsetCommit rules, offsets-only groups after a worker restart, a consumer with no common assignor |
 | **w3_txn** | Wave 3 txn: consumers reach the end past aborted/cleaned-up/DeleteRecords holes and stop at an open transaction's LSO; ListOffsets isolation/-3/partition checks; OffsetFetch require_stable; Kafka's idempotent model (5-batch cache, original offsets, epochs, wrap, survives restarts); transaction validation; fetch batching |
 | **w3_net** | (wave3 net) Hostile clients at the network edge: frame-budget lockout, >100 MB response, TCP_NODELAY, acks=0 close / invalid acks, responses before close, per-IP and per-listener caps, idle and frame-read deadlines, pre-auth deadline from accept, SASL lookup rate limit, unknown-user SCRAM fake. Sequential; the `limits` tests add listeners 19096-19098 via ALTER SYSTEM, connect from 127.0.0.x source addresses and need `openssl` |
+| **w3_shadow** | Shadow checks without an external Kafka (functional suite): per-partition lag view |
 
 ### Running E2E Tests with CLI Options
 

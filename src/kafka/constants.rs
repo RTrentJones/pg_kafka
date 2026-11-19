@@ -469,8 +469,10 @@ pub const MIN_SHADOW_RETRY_BACKOFF_MS: i32 = 10;
 /// Maximum shadow retry backoff
 pub const MAX_SHADOW_RETRY_BACKOFF_MS: i32 = 60_000;
 
-/// Default shadow max retries per message
-pub const DEFAULT_SHADOW_MAX_RETRIES: i32 = 3;
+/// Default shadow max retries per message: failed delivery attempts after which
+/// an outbox row is dead-lettered (wave 3: this is the outbox cap; it was the
+/// hard-coded 10 while the GUC fed librdkafka's `retries`).
+pub const DEFAULT_SHADOW_MAX_RETRIES: i32 = 10;
 
 /// Minimum shadow max retries
 pub const MIN_SHADOW_MAX_RETRIES: i32 = 0;
@@ -480,6 +482,14 @@ pub const MAX_SHADOW_MAX_RETRIES: i32 = 100;
 
 /// Default shadow metrics enabled
 pub const DEFAULT_SHADOW_METRICS_ENABLED: bool = true;
+
+/// Default `pg_kafka.shadow_sync_timeout_ms`: how long a sync-mode produce
+/// response waits for the external ack (wave 3).
+pub const DEFAULT_SHADOW_SYNC_TIMEOUT_MS: i32 = 5_000;
+/// Minimum (0 = sync responses are not held).
+pub const MIN_SHADOW_SYNC_TIMEOUT_MS: i32 = 0;
+/// Maximum.
+pub const MAX_SHADOW_SYNC_TIMEOUT_MS: i32 = 120_000;
 
 /// Configuration reload interval (milliseconds) - reloads both GUCs and shadow config
 pub const DEFAULT_CONFIG_RELOAD_MS: i32 = 30_000; // 30 seconds

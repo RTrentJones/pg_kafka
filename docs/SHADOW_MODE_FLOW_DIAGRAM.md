@@ -1,433 +1,218 @@
 # Shadow Mode Flow Diagram
 
-This document describes the shadow mode lifecycle in pg_kafka, including configuration, client creation, message flow, and potential issues.
+This document describes the shadow mode lifecycle in pg_kafka: configuration, the forwarder,
+message flow, ordering, sync mode, observability, and the E2E setup.
 
 Shadow mode forwards produced records to an external Kafka cluster through a **durable outbox**
 (`kafka.shadow_tracking`). A produce never forwards inline: it writes the record locally and, in the
-same transaction, a pending outbox pointer row. The DB thread's periodic poll claims due rows and
-hands them to the network thread, which owns the idempotent rdkafka producer and returns a
-`ForwardAck` per attempt. Delivery to the external broker is at-least-once. The code lives in
-`src/kafka/shadow/` (`store.rs` is the core), `src/kafka/listener.rs` (`run_shadow_forwarder`), and the
-worker loop in `src/worker.rs`.
+same transaction, a pending outbox pointer row. The DB thread's outbox tick claims due rows and hands
+them to the network thread, whose forwarder owns the idempotent rdkafka producer, keeps many
+deliveries in flight, and returns a `ForwardAck` per record. Delivery to the external broker is
+at-least-once and, per local partition, in order. The code lives in `src/kafka/shadow/`
+(`store.rs`: outbox logic on the DB thread; `outbox.rs`: its SQL; `forwarder_task.rs`: the
+network-thread forwarder; `producer.rs`: librdkafka settings) and the worker loop in `src/worker.rs`.
 
 ## Architecture Overview
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                     pg_kafka Background Worker process                           │
-├─────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                  │
-│  ┌─────────────────────────────────────────────────────────────────────────┐    │
-│  │                    DB Thread (SPI, single-threaded)                      │    │
-│  │                                                                          │    │
-│  │  ┌──────────────┐    ┌──────────────┐    ┌──────────────────────────┐   │    │
-│  │  │ GUCs (read   │───▶│ ShadowStore  │───▶│ TopicConfigCache         │   │    │
-│  │  │ directly)    │    │ (decorator   │    │ (kafka.shadow_config,    │   │    │
-│  │  └──────────────┘    │ over         │    │  keyed by topic_id)      │   │    │
-│  │                      │ PostgresStore│    └──────────────────────────┘   │    │
-│  │                      └──────┬───────┘                                   │    │
-│  │                             ▼                                           │    │
-│  │  ┌────────────────────────────────────────────────────────────────────┐ │    │
-│  │  │ insert_records()  (produce, inside the request's subtransaction)   │ │    │
-│  │  │  is_enabled()? ─▶ is_primary()? ─▶ topic_cache.get(topic_id)        │ │    │
-│  │  │                                                                    │ │    │
-│  │  │  1. inner.insert_records()          → kafka.messages (local write) │ │    │
-│  │  │  2. enqueue_outbox(): percentage routing, then INSERT pending      │ │    │
-│  │  │     rows into kafka.shadow_tracking (same transaction)             │ │    │
-│  │  │  3. sync_mode = sync only: the rows are queued; after commit the   │ │    │
-│  │  │     worker calls forward_sync_after_commit(), which sends them     │ │    │
-│  │  │     and waits ≤ 5s (SYNC_FORWARD_WAIT_MS) before the response      │ │    │
-│  │  │                                                                    │ │    │
-│  │  │  write_mode (dual_write | external_only) does NOT change this      │ │    │
-│  │  │  path; it only controls READS (external_only suppresses local      │ │    │
-│  │  │  fetches, see "Read Path")                                         │ │    │
-│  │  └────────────────────────────────────────────────────────────────────┘ │    │
-│  │                                                                          │    │
-│  │  ┌────────────────────────────────────────────────────────────────────┐ │    │
-│  │  │ Outbox poll (worker loop, every 250 ms while shadow_mode_enabled)  │ │    │
-│  │  │  1. drain_forward_acks()     → apply_ack() finalizes rows          │ │    │
-│  │  │  2. poll_and_forward_outbox() → claim ≤ 256 due rows, join         │ │    │
-│  │  │     kafka.messages for the payload, try_send(ForwardRequest)       │ │    │
-│  │  └──────────────┬──────────────────────────────────▲──────────────────┘ │    │
-│  └─────────────────┼──────────────────────────────────┼────────────────────┘    │
-│                    │ ForwardRequest                   │ ForwardAck              │
-│                    │ crossbeam bounded(10_000)        │ crossbeam bounded(10_000)│
-│                    ▼                                  │                         │
-│  ┌─────────────────────────────────────────────────────────────────────────┐    │
-│  │                 Network Thread: Tokio Runtime (2 workers)                │    │
-│  │                                                                          │    │
-│  │   ┌──────────────────────────────────────────────────────────────┐      │    │
-│  │   │  run_shadow_forwarder() task (listener.rs)                   │      │    │
-│  │   │   1. spawn_blocking(recv_timeout 100ms from forward_rx)      │      │    │
-│  │   │   2. (re)create ShadowProducer if bootstrap_servers changed  │      │    │
-│  │   │   3. producer.send_async_offset(topic, partition=None, ...)  │      │    │
-│  │   │   4. ack_tx.try_send(ForwardAck { Ok(ext_offset) | Err })    │      │    │
-│  │   └──────────────────────────────────────────────────────────────┘      │    │
-│  │                                                                          │    │
-│  │   ┌──────────────────────────────────────────────────────────────┐      │    │
-│  │   │      TCP Listener (port 9092) — Kafka client connections     │      │    │
-│  │   └──────────────────────────────────────────────────────────────┘      │    │
-│  └──────────────────────────────────┬──────────────────────────────────────┘    │
-└─────────────────────────────────────┼───────────────────────────────────────────┘
-                                      ▼
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                          External Kafka Cluster                                  │
-│               (pg_kafka.shadow_bootstrap_servers; re-partitions by key)          │
-└─────────────────────────────────────────────────────────────────────────────────┘
+DB thread (SPI, single-threaded)                       network thread (tokio)
+─────────────────────────────────                      ──────────────────────────────────────
+produce → ShadowStore::insert_records
+   1. inner.insert_records        → kafka.messages
+   2. enqueue_outbox: percentage routing; INSERT pending
+      rows into kafka.shadow_tracking (same subtxn);
+      sampled-out records counted in shadow_metrics
+   3. sync topic: rows noted under the request's slot
+commit (group commit, RB-1)
+   sync produce: response handed over ──Hold──────────▶ forwarder holds it until its records
+   (other responses released at once)                   are delivered or shadow_sync_timeout_ms
+
+outbox tick (every 250 ms, or at once after a full
+claim / committed sync rows; backs off after failures)
+   1. drain_forward_acks: apply acks in batches  ◀──ForwardAck── delivery reports (never dropped)
+   2. poll_and_forward_outbox: claim ≤ batch_size ──ForwardRecord─▶ fence check → librdkafka
+      rows (≤ in-flight room 8192), in row-key order                (pipelined: idempotent,
+                                                                     max.in.flight 5, gapless)
+                       crossbeam bounded(10 000) both ways                     │
+                                                                               ▼
+                                                          external Kafka (re-partitions by key,
+                                                          murmur2 like the Java client)
 ```
 
-Only the network thread talks to the external broker. The DB thread never blocks on rdkafka; the
-only wait on the DB thread is the bounded sync wait after commit (at most 5 s per request), which
-reads acks from the network thread over the ack channel and queues them for `drain_forward_acks()`.
+Only the network thread talks to the external broker, and the DB thread never waits for it: not for
+async topics, and not for sync topics either (the produce response waits, the worker does not).
 
-## Configuration Lifecycle
+## Configuration
 
-```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                          CONFIGURATION SOURCES                                   │
-├─────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                  │
-│   ┌────────────────────────────────────────────────────────────────────────┐    │
-│   │                          postgresql.conf / GUCs                         │    │
-│   │                                                                         │    │
-│   │  Reloadable (Sighup, ALTER SYSTEM + pg_reload_conf()):                  │    │
-│   │  pg_kafka.shadow_mode_enabled = true                  (default false)  │    │
-│   │  pg_kafka.shadow_bootstrap_servers = 'kafka1:9092,kafka2:9092'         │    │
-│   │  pg_kafka.shadow_security_protocol = 'SASL_SSL' | 'PLAINTEXT' ...      │    │
-│   │  pg_kafka.config_reload_interval_ms = 30000  (tests: 2000)             │    │
-│   │                                                                         │    │
-│   │  Restart required (Postmaster):                                         │    │
-│   │  pg_kafka.shadow_sasl_mechanism = 'SCRAM-SHA-256'      (default PLAIN) │    │
-│   │  pg_kafka.shadow_sasl_username = 'user'     (superuser-only, hidden)   │    │
-│   │  pg_kafka.shadow_sasl_password = 'pass'     (superuser-only, hidden)   │    │
-│   │  pg_kafka.shadow_ssl_ca_location = '/path/to/ca.pem'                   │    │
-│   │  pg_kafka.shadow_license_key = 'eval'       (superuser-only, hidden)   │    │
-│   │                                                                         │    │
-│   │  Superuser-settable (Suset):                                            │    │
-│   │  pg_kafka.shadow_batch_size = 1000                                     │    │
-│   │  pg_kafka.shadow_linger_ms = 10                                        │    │
-│   │  pg_kafka.shadow_retry_backoff_ms = 100                                │    │
-│   │  pg_kafka.shadow_max_retries = 3                                       │    │
-│   │  pg_kafka.shadow_metrics_enabled = true                                │    │
-│   │  pg_kafka.shadow_external_primary_strict = false                       │    │
-│   └────────────────────────────────────────────────────────────────────────┘    │
-│                                        │                                         │
-│                                        ▼                                         │
-│   ┌────────────────────────────────────────────────────────────────────────┐    │
-│   │                        kafka.shadow_config TABLE                        │    │
-│   │                 (per-topic, PRIMARY KEY topic_id → kafka.topics)        │    │
-│   │                                                                         │    │
-│   │  topic_id | mode       | forward_percentage | external_topic_name |    │    │
-│   │           |            |                    | sync_mode | write_mode  │    │
-│   │  ─────────┼────────────┼────────────────────┼─────────────────────    │    │
-│   │  1        | shadow     | 100                | prod-orders         |    │    │
-│   │           |            |                    | sync      | dual_write  │    │
-│   │  2        | shadow     | 50                 | NULL                |    │    │
-│   │           |            |                    | async     | dual_write  │    │
-│   │  3        | shadow     | 100 (forced)       | events-external     |    │    │
-│   │           |            |                    | sync      | external_only│   │
-│   │  4        | local_only | 0                  | NULL                |    │    │
-│   │           |            |                    | sync      | dual_write  │    │
-│   └────────────────────────────────────────────────────────────────────────┘    │
-│                                                                                  │
-└─────────────────────────────────────────────────────────────────────────────────┘
-                                        │
-                                        ▼
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                          CONFIG RELOAD CYCLE                                     │
-│        (on SIGHUP, or every config_reload_interval_ms; checked each loop)        │
-├─────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                  │
-│   ┌──────────────────────────────────────────────────────────────────────────┐  │
-│   │  Worker main loop (worker.rs)                                            │  │
-│   │                                                                          │  │
-│   │  loop {                                                                  │  │
-│   │      // 1. SIGHUP or interval elapsed → config reload                   │  │
-│   │      if sighup_pending || last_config_reload.elapsed() >= interval {    │  │
-│   │          if sighup_pending { ProcessConfigFile(PGC_SIGHUP); }           │  │
-│   │          runtime_context.reload();          // GUC snapshot             │  │
-│   │          // in a guarded transaction:                                   │  │
-│   │          shadow_store.load_topic_config_from_db();  // replace cache    │  │
-│   │          shadow_store.refresh_primary_status();     // failover pickup  │  │
-│   │          shadow_store.flush_metrics_to_db();  // logs + resets RAM ctrs │  │
-│   │      }                                                                  │  │
-│   │      // 2. Outbox poll, every 250 ms while shadow_mode_enabled          │  │
-│   │      drain_forward_acks(); poll_and_forward_outbox();                   │  │
-│   │      // 3. Liveness lane, then the next request                         │  │
-│   │      match request_rx.recv_timeout(100ms) {                             │  │
-│   │          Ok(request) => execute_request_in_transaction(request, ...),   │  │
-│   │          Err(Timeout) => {}                                             │  │
-│   │      }                                                                  │  │
-│   │      // 4. periodic maintenance (member timeouts, txn timeouts, ...)    │  │
-│   │  }                                                                      │  │
-│   └──────────────────────────────────────────────────────────────────────────┘  │
-│                                                                                  │
-└─────────────────────────────────────────────────────────────────────────────────┘
-```
+GUCs (all reloadable with `pg_reload_conf()` unless noted; the forwarder reads the reloaded
+`RuntimeContext` snapshot, the DB thread reads the GUCs directly):
 
-Notes on what the reload cycle does and does not do:
+| GUC | Default | Meaning |
+|---|---|---|
+| `pg_kafka.shadow_mode_enabled` | false | Global switch. |
+| `pg_kafka.shadow_bootstrap_servers` | '' | External brokers. |
+| `pg_kafka.shadow_security_protocol` | SASL_SSL | PLAINTEXT, SSL, SASL_PLAINTEXT, SASL_SSL. |
+| `pg_kafka.shadow_sasl_mechanism` | PLAIN | PLAIN, SCRAM-SHA-256, SCRAM-SHA-512. |
+| `pg_kafka.shadow_sasl_username` / `_password` | '' | Superuser-only, hidden from SHOW ALL. |
+| `pg_kafka.shadow_ssl_ca_location` | '' | CA file for SSL. |
+| `pg_kafka.shadow_batch_size` | 1000 | Records per outbox claim, and librdkafka `batch.num.messages`. |
+| `pg_kafka.shadow_linger_ms` | 10 | librdkafka `linger.ms`. |
+| `pg_kafka.shadow_retry_backoff_ms` | 100 | librdkafka `retry.backoff.ms`, and the base of the outbox re-attempt backoff (doubling per failure, capped at 30 s). |
+| `pg_kafka.shadow_max_retries` | 10 | Failed delivery attempts after which a row is a dead letter. |
+| `pg_kafka.shadow_sync_timeout_ms` | 5000 | How long a sync-mode produce response is held for the external ack (0 = not held). |
+| `pg_kafka.shadow_metrics_enabled` | true | Write `kafka.shadow_metrics`. |
+| `pg_kafka.shadow_external_primary_strict` | false | See "Read Path". |
+| `pg_kafka.shadow_license_key` | '' | Restart; read once at worker start. |
 
-- `load_topic_config_from_db()` **replaces** the cache (so a deleted `shadow_config` row stops
-  forwarding), but only when the query succeeds; a failed query keeps the previous cache.
-- When a row has `write_mode = 'external_only'` and `forward_percentage <> 100`, the loader logs a
-  warning and forces 100% in the cache, because a sampled-out record would otherwise be readable
-  nowhere.
-- `flush_metrics_to_db()` only logs and resets the in-RAM counters. The persistent per-partition
-  counters in `kafka.shadow_metrics` are written by `apply_ack()` in the same statement that
-  finalizes the outbox row.
-- `ShadowStore::is_enabled()` reads `pg_kafka.shadow_mode_enabled` directly on every produce, while
-  the network-thread forwarder reads the `RuntimeContext` snapshot refreshed by `runtime_context.reload()`.
-- The license key is read once at worker start (`set_license_key`), since its GUC is Postmaster.
+Every shadow GUC except the license key is `Sighup`: it is set in `postgresql.conf` or with
+`ALTER SYSTEM` and reloaded. A session `SET` is refused, since it could never reach the worker (the
+batching, retry and metrics GUCs used to be `Suset`, which accepted a session `SET` with no effect;
+the SASL/SSL ones used to need a restart). Any change to a producer setting (servers, protocol, SASL,
+CA, batch size, linger, backoff) makes the forwarder rebuild its producer, on the next record or
+within about 0.5 s; the old producer's outstanding records are purged and re-sent by the new one
+without counting as failures. The config goes through `ShadowConfig::validate()` first; an invalid
+or unbuildable config is logged once per distinct error and every record fails (and is eventually
+dead-lettered) until it is fixed.
 
-## Shadow Producer Initialization
+Per-topic settings are rows of `kafka.shadow_config` (`mode`, `forward_percentage`,
+`external_topic_name`, `sync_mode`, `write_mode`), reloaded into the `TopicConfigCache` on SIGHUP or
+every `pg_kafka.config_reload_interval_ms`. The reload replaces the cache (a deleted row stops
+forwarding) only when the query succeeds. A row with `write_mode = 'external_only'` and
+`forward_percentage <> 100` is forced to 100% with a warning, because a sampled-out record would
+otherwise be readable nowhere.
 
-The producer that actually forwards lives in the network thread's `run_shadow_forwarder()` task. It
-is created lazily on the first `ForwardRequest` and recreated whenever the reloaded
-`shadow_bootstrap_servers` value differs from the one it was built with.
+## The Forwarder (network thread)
 
-```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                       LAZY PRODUCER INITIALIZATION                               │
-│                  run_shadow_forwarder() (listener.rs, network thread)            │
-├─────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                  │
-│   ┌───────────────────────────┐                                                 │
-│   │ ForwardRequest received   │                                                 │
-│   └─────────────┬─────────────┘                                                 │
-│                 ▼                                                                │
-│   ┌──────────────────────────────────────────────┐                              │
-│   │ config = runtime_context.config()            │                              │
-│   │ shadow_mode_enabled && bootstrap non-empty?  │── NO ──▶ drop request         │
-│   └─────────────┬────────────────────────────────┘          (no ack; the row    │
-│                 │ YES                                         stays pending and  │
-│                 │                                             is re-claimed once │
-│                 │                                             its in-flight entry│
-│                 ▼                                             is evicted)        │
-│   ┌──────────────────────────────────────────────┐                              │
-│   │ bootstrap_servers changed since last build?  │                              │
-│   └──────┬───────────────────────────┬───────────┘                              │
-│          │ YES                       │ NO                                       │
-│          ▼                           ▼                                          │
-│   ┌─────────────────────────┐   ┌──────────────────────┐                        │
-│   │ ShadowProducer::new()   │   │ reuse cached producer│                        │
-│   │ rdkafka FutureProducer: │   └──────────────────────┘                        │
-│   │ - enable.idempotence    │                                                   │
-│   │ - acks=all              │                                                   │
-│   │ - max.in.flight=5       │                                                   │
-│   │ - retries=max_retries   │                                                   │
-│   │   (3 if < 1)            │                                                   │
-│   │ - compression.type=none │                                                   │
-│   │ - batch.size, linger.ms,│                                                   │
-│   │   retry.backoff.ms      │                                                   │
-│   │ - SASL/SSL config       │                                                   │
-│   │ - request.timeout=30s   │                                                   │
-│   │ - message.timeout=120s  │                                                   │
-│   └──────────┬──────────────┘                                                   │
-│              │ Err → warn, clear producer, drop request (row stays pending)     │
-│              ▼                                                                   │
-│   ┌──────────────────────────────────────────────┐                              │
-│   │ send_async_offset(external_topic, None, ...) │                              │
-│   └──────────────────────────────────────────────┘                              │
-│                                                                                  │
-└─────────────────────────────────────────────────────────────────────────────────┘
-```
+`run_shadow_forwarder()` (`forwarder_task.rs`) receives `ForwardRequest`s (records and sync holds)
+in batches from a blocking-pool bridge and waits on three things at once: new requests, delivery
+reports of the records in flight, and a 20 ms tick for hold timeouts and settings changes.
 
-The producer settings are assembled by the pure `build_producer_settings()` in
-`src/kafka/shadow/producer.rs` (unit-tested without a broker). Because the producer is only rebuilt
-when `bootstrap_servers` changes, edits to other producer GUCs reach an existing producer only after
-a bootstrap change or a restart.
+A record is handed to librdkafka as soon as it arrives (`ShadowProducer::enqueue`, no wait for the
+previous delivery); a full librdkafka queue pauses intake briefly, keeping order. Key, value,
+headers and the timestamp are forwarded (`kafka.messages.timestamp_ms`, or the insert time when the
+producer sent none, which is what local consumers see). `partition` is left to the partitioner
+(`murmur2_random`, the Java client's), so the external cluster re-partitions by key.
 
-`ShadowStore` still contains an older, DB-thread producer cache (`ensure_producer()`, with config
-validation and a 30 s health-check TTL). In the current code it is reachable only from
-`ShadowStore::flush()`, which nothing calls, so it is not on the forwarding path. Removing it is the
-"PR4" step tracked in [SHADOW_EVIDENCE_PLAN.md](SHADOW_EVIDENCE_PLAN.md).
+### Ordering
+
+The records of one local partition reach the external topic in local-offset order (the first copy
+of each; see duplicates below). That rests on:
+
+1. **The claim.** Rows are claimed in row-key order and dispatched over one FIFO channel. A row is
+   never claimed behind an earlier row of its partition that is backing off after a failure.
+2. **The producer.** `enable.idempotence=true`, `acks=all`, `max.in.flight.requests.per.connection=5`
+   keep the order on the wire through librdkafka's own retries. `enable.gapless.guarantee=true`
+   turns any error that could deliver a later record after an earlier failed one into a fatal
+   producer error that fails every outstanding record; the forwarder then rebuilds the producer.
+3. **The fence.** Once a record of a partition fails, every later record of that partition the
+   forwarder receives is answered `NotAttempted` without being sent, until the partition restarts:
+   a record at or below the failed offset, or one the claim marks as the partition head (`restart`,
+   the lowest pending row, which is how a partition moves on after its failed record is
+   dead-lettered).
+
+Failures are classified: a real delivery failure is `Failed` (counts against
+`shadow_max_retries`); a record fenced, failed only because the producer went fatal on another
+record's error (the first failure of a fatal producer generation is taken as its cause), purged by a
+settings change, or received while shadow mode is off is `NotAttempted` and does not consume its
+retry budget.
+
+Trade-off: with the gapless guarantee one poison record (for example one over the external topic's
+`max.message.bytes`) makes the producer fatal on each attempt, so every partition's in-flight
+records are re-sent until the poison record is dead-lettered. That is the price of never
+reordering a partition; `shadow_max_retries` and the backoff bound it.
+
+### Held sync-mode responses
+
+A `Hold` carries the buffered response of a committed sync-mode produce and the outbox rows it waits
+for. The forwarder releases it when every one of those rows is delivered, or at the timeout. If a
+hold cannot be handed over (full channel, no forwarder), or is dropped, the response is released at
+once (`HeldRelease` releases on drop), so a client is never left hanging.
 
 ## Message Flow: Produce Path
 
-```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                            PRODUCE REQUEST HANDLING                              │
-├─────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                  │
-│   ┌────────────┐                                                                │
-│   │ Kafka      │                                                                │
-│   │ Client     │──────TCP:9092──────▶┌─────────────────────────────────────┐    │
-│   │ (rdkafka)  │                     │ TCP Listener (listener.rs)          │    │
-│   └────────────┘                     │ Parse ProduceRequest                │    │
-│                                      └──────────────┬──────────────────────┘    │
-│                                                     ▼                           │
-│                                      ┌─────────────────────────────────────┐    │
-│                                      │ Request via crossbeam               │    │
-│                                      │ (async → sync bridge)               │    │
-│                                      └──────────────┬──────────────────────┘    │
-│                                                     ▼                           │
-│   ┌─────────────────────────────────────────────────────────────────────────┐   │
-│   │   Background Worker: execute_request_in_transaction() (worker.rs)        │   │
-│   │   handle_produce() → ShadowStore::insert_records()                       │   │
-│   │                                                                          │   │
-│   │   Step 1: Guards                                                         │   │
-│   │   ┌─────────────────┐  ┌────────────────────────────┐                    │   │
-│   │   │ is_enabled()?   │  │ is_primary()?              │                    │   │
-│   │   │ (reads GUC)     │  │ (cached NOT                │                    │   │
-│   │   │                 │  │  pg_is_in_recovery(),      │                    │   │
-│   │   │                 │  │  refreshed on each reload) │                    │   │
-│   │   └────────┬────────┘  └─────────────┬──────────────┘                    │   │
-│   │            └──── either false ───────┴──▶ inner.insert_records() only    │   │
-│   │                                                                          │   │
-│   │   Step 2: Local write (always)                                           │   │
-│   │   base_offset = inner.insert_records()   → kafka.messages                │   │
-│   │                                                                          │   │
-│   │   Step 3: topic_cache.get(topic_id); if should_forward()                 │   │
-│   │           (mode = 'shadow' AND forward_percentage > 0):                  │   │
-│   │   ┌──────────────────────────────────────────────────────────────────┐  │   │
-│   │   │ enqueue_outbox()                                                  │  │   │
-│   │   │  for each record: make_forward_decision(key, offset, pct)         │  │   │
-│   │   │    Skip    → metrics.skipped++ (in-RAM)                           │  │   │
-│   │   │    Forward → selected                                             │  │   │
-│   │   │  INSERT INTO kafka.shadow_tracking (topic_id, partition_id,       │  │   │
-│   │   │         local_offset) ... ON CONFLICT DO NOTHING   (same txn)     │  │   │
-│   │   │  if sync_mode = sync → queue for forward_sync_after_commit()      │  │   │
-│   │   └──────────────────────────────────────────────────────────────────┘  │   │
-│   │                                                                          │   │
-│   │   Step 4: Commit; then forward_sync_after_commit() (sync rows            │   │
-│   │           whose subtransaction committed); then the buffered             │   │
-│   │           produce response is sent (response-after-commit barrier)       │   │
-│   └─────────────────────────────────────────────────────────────────────────┘   │
-│                                                                                  │
-└─────────────────────────────────────────────────────────────────────────────────┘
-```
-
-`dual_write` and `external_only` follow this path identically. There is no "forward first, fall
-back to local" branch any more, and no synthetic offsets: every record is stored locally with a real
-offset.
+`ShadowStore::insert_records()`: if shadow mode is off or this node is a standby, it only writes
+locally. Otherwise it writes locally (real offsets), then, when the topic forwards
+(`mode = 'shadow'`, `forward_percentage > 0`), `enqueue_outbox()` routes each record
+(`make_forward_decision`: murmur2 of the key, or the offset for a null key, `% 100 < pct`), counts
+the skipped ones in `kafka.shadow_metrics.messages_skipped`, and inserts one pending
+`kafka.shadow_tracking` row per selected record in the same subtransaction. `dual_write` and
+`external_only` write identically; `write_mode` only governs reads.
 
 ### Read Path (external_only)
 
 `external_only` marks a topic as **external-primary**. Its writes are forwarded as above, but local
-reads are suppressed so consumers cut over to the external broker: `fetch_records` /
-`fetch_records_with_isolation` return no records, and `get_high_watermark`,
-`get_earliest_offset` and `get_last_stable_offset` return 0 (`get_offset_for_timestamp` returns
-none). Suppression depends only on the global GUC plus the per-topic config, so a standby suppresses
-these reads too.
-
-If any forward for the topic is dead-lettered (`external_offset IS NULL` and
-`retry_count >= 10`), suppression is lifted and the topic is served locally again, so a record is
-never readable nowhere. Setting `pg_kafka.shadow_external_primary_strict = true` keeps full
-suppression and accepts the dead-lettered record as lost.
+reads are suppressed so consumers cut over to the external broker: fetches return no records and the
+offset bounds report an empty partition. Suppression depends only on the global GUC plus the
+per-topic config, so a standby suppresses these reads too. If any forward of the topic is
+dead-lettered (`external_offset IS NULL` and `retry_count >= pg_kafka.shadow_max_retries`),
+suppression is lifted and the topic is served locally again, so a record is never readable nowhere;
+`pg_kafka.shadow_external_primary_strict = true` keeps full suppression.
 
 ### Transactional Produce
 
-`insert_transactional_records()` writes locally (real offsets) and, if the topic forwards, buffers
-`(topic_id, partition_id, offset, key)` in RAM keyed by `(producer_id, producer_epoch)`. On
-`commit_transaction()` the inner commit runs first, then the buffered records are re-checked against
-the current topic config, percentage-routed, and inserted into `kafka.shadow_tracking` in the same
-commit transaction (only where the backing `kafka.messages` row exists). On `abort_transaction()` the
-buffer is discarded, so aborted records are never forwarded. Transactional records are always
-forwarded by the poll, regardless of `sync_mode`. Buffers are also evicted by the transaction-timeout
-sweeper and when a producer re-initializes with a new epoch.
+`insert_transactional_records()` writes locally and, if the topic forwards, buffers the records'
+keys in RAM. `commit_transaction()` reads the transaction's records from `kafka.messages` (falling
+back to the RAM buffer), commits, re-checks the topic config, routes them and inserts their outbox
+rows in the commit transaction. An abort discards them. Transactional records are forwarded by the
+outbox tick (they are never held as sync).
 
 ## Sync vs Async Forwarding
 
-`sync_mode` only changes **when** a record is first sent, never whether it is durable. Both modes
-write the same outbox row and both are finalized by the same `apply_ack()`.
+`sync_mode` only changes **when the client gets its response**, never whether the record is durable
+or how it is forwarded. Both modes write the same outbox row and are dispatched by the same claim.
 
-```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                          FORWARDING DECISION TREE                                │
-├─────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                  │
-│   enqueue_outbox(records)   (outbox rows already written, same txn)             │
-│                     │                                                            │
-│          ┌──────────┴───────────────────────────────────────┐                   │
-│          ▼                                                  ▼                   │
-│   ┌──────────────────────────────┐      ┌──────────────────────────────────┐    │
-│   │       SYNC MODE              │      │         ASYNC MODE               │    │
-│   │  forward_sync_after_commit() │      │                                  │    │
-│   │  (worker, after the commit,  │      │  return immediately; the outbox  │    │
-│   │  before the response)        │      │  poll (≤ 250 ms later, after     │    │
-│   │                              │      │  commit) claims and dispatches   │    │
-│   │  for each queued row whose   │      │  the row                         │    │
-│   │  subtransaction committed:   │      │                                  │    │
-│   │   inflight.try_begin(row)    │      └──────────────────────────────────┘    │
-│   │   forward_tx.try_send(req)   │                                              │
-│   │   (full → leave for poll)    │                                              │
-│   │  rolled back → dropped, never│                                              │
-│   │  sent                        │                                              │
-│   │                              │                                              │
-│   │  wait ≤ SYNC_FORWARD_WAIT_MS │                                              │
-│   │  (5s) on the ack channel;    │                                              │
-│   │  every ack read is queued for│                                              │
-│   │  drain_forward_acks() (no    │                                              │
-│   │  transaction is open here)   │                                              │
-│   │                              │                                              │
-│   │  timeout → return anyway;    │                                              │
-│   │  the row stays pending and   │                                              │
-│   │  the poll retries it         │                                              │
-│   └──────────────────────────────┘                                              │
-│                                                                                  │
-│   ┌──────────────────────────────────────────────────────────────────────────┐  │
-│   │ OUTBOX POLL: poll_and_forward_outbox()                                    │  │
-│   │                                                                           │  │
-│   │  claim (one UPDATE ... RETURNING, LIMIT 256) rows where:                  │  │
-│   │    external_offset IS NULL                                                │  │
-│   │    AND retry_count < 10                         (MAX_FORWARD_RETRIES)     │  │
-│   │    AND (forwarded_at IS NULL OR forwarded_at < NOW() - 5000 ms)           │  │
-│   │                                                 (OUTBOX_RETRY_INTERVAL_MS)│  │
-│   │    AND row not in the in-flight set             (issue #93)               │  │
-│   │    AND the kafka.messages row still exists                                │  │
-│   │  claim sets forwarded_at = NOW(), retry_count = retry_count + 1           │  │
-│   │  payload: JOIN kafka.messages; topic: COALESCE(external_topic_name, name) │  │
-│   │  per row: inflight.try_begin → forward_tx.try_send                        │  │
-│   │           (full → inflight.complete, retried after the lease)             │  │
-│   └──────────────────────────────────────────────────────────────────────────┘  │
-│                                                                                  │
-│   ┌──────────────────────────────────────────────────────────────────────────┐  │
-│   │ apply_ack(ack)                                                            │  │
-│   │  inflight.complete(row)                                                   │  │
-│   │  Ok(ext_offset): UPDATE ... SET external_offset, forwarded_at = NOW(),    │  │
-│   │                  error_message = NULL WHERE external_offset IS NULL       │  │
-│   │                  + kafka.shadow_metrics.messages_forwarded++ (same stmt)  │  │
-│   │  Err(msg):       UPDATE ... SET error_message = msg                       │  │
-│   │                  + kafka.shadow_metrics.messages_failed++                 │  │
-│   │                  (retry_count >= 10 → logged as dead-lettered)            │  │
-│   │  A duplicate ack matches no pending row and counts nothing.               │  │
-│   └──────────────────────────────────────────────────────────────────────────┘  │
-│                                                                                  │
-└─────────────────────────────────────────────────────────────────────────────────┘
-```
+- **async**: the response is released right after the commit; the outbox tick forwards the row
+  within about 250 ms.
+- **sync**: after the commit the worker takes the request's committed sync rows
+  (`take_sync_holds`, by request slot; a rolled-back request's rows are gone and nothing is held),
+  hands its response to the forwarder (`hold_response`) and asks for an immediate outbox tick. The
+  response is released when the records are delivered to the external cluster, or after
+  `pg_kafka.shadow_sync_timeout_ms`; on timeout the record stays pending and is retried like any
+  other. Nothing is sent before the commit, so a rolled-back request never leaves a copy on the
+  external broker.
 
-Delivery guarantees and their limits:
+What sync guarantees: an OK response means the record was committed locally, and, unless the timeout
+expired first, delivered externally. It does not stall the broker: only that client's response
+waits (and the responses behind it on the same connection, which Kafka orders), the worker and every
+other client carry on. The old design waited on the DB thread for up to 5 s per batch, stalling all
+clients while the external cluster was slow or down. With `shadow_sync_timeout_ms = 0` sync topics
+behave like async ones.
 
-- **At-least-once.** A crash, a dropped request or a dropped ack leaves the row pending. A row that
-  never reached the forward channel (channel full) is re-claimed after the 5 s lease. A row the
-  network thread dropped (shadow disabled or no producer on that side) or whose ack was dropped (ack
-  channel full) stays in the in-flight set, so it is re-claimed only after that entry is evicted
-  (150 s, see below). After a worker restart the in-flight set is empty and the lease alone applies. The idempotent producer only deduplicates librdkafka's own internal retries of a send. An
-  outbox re-dispatch builds a new `FutureRecord` and is a new send, so if the first send was in
-  fact delivered (only its ack was lost or late), the re-dispatch lands on the external topic as a
-  duplicate, within the same producer session as well as across a restart. Downstream consumers of
-  the external topic should deduplicate on an application-level id if they need exactly-once.
-- **In-flight gate (issue #93).** `InflightTracker` (`inflight.rs`) records every dispatched row until
-  its ack is applied, and the poll excludes those rows from the claim, so a forward that is merely
-  slower than the 5 s lease is no longer re-sent. Entries are evicted after 150 s
-  (`INFLIGHT_EVICT_AFTER`, above rdkafka's 120 s `message.timeout.ms`), after which a genuinely lost
-  ack falls back to lease-based retry. The tracker is in-memory and is forgotten on worker restart.
-- **Dead-letter.** Because the claim bumps `retry_count`, every row gets at most 10 attempts. A row
-  at the cap stays in `kafka.shadow_tracking` (pending, with `error_message`) and is not re-sent until
-  an operator re-queues it with `kafka.replay_shadow_messages`.
-- **Partitioning.** Forwards are sent with `partition = None`, so the external cluster re-partitions
-  by key. Local and external partition numbers are independent.
-- **Percentage routing.** `make_forward_decision()` (`routing.rs`): 0% skips, 100% forwards, otherwise
-  `murmur2(key, seed 0x9747b28c) % 100 < pct`. Records with no key or an empty key use
-  `local_offset % 100` instead.
+## Outbox Rows, Retries and Dead Letters
+
+`kafka.shadow_tracking` columns: `external_offset` (set = delivered), `forwarded_at` (last claim or
+failure), `retry_count` (failed delivery attempts), `attempt_open` (claimed, ack not yet applied),
+`error_message` (last failure; withheld from `pgkafka_reader`).
+
+The claim (`SpiShadowDb::claim_due_outbox_rows`) takes, in row-key order, up to
+`min(shadow_batch_size, 8192 - in flight)` rows that are pending, under the retry cap, not in flight
+in this worker, whose message still exists, that are not backing off (failed, attempt closed, and
+`forwarded_at` within `retry_backoff_ms * 2^(retry_count-1)`, at most 30 s), and that have no
+backing-off row of their partition below them. It opens their attempts and returns payload, headers,
+timestamp, external topic name and the `restart` flag. It reads the pending index up to the limit
+(O(limit), not O(backlog)); the first backing-off row per partition comes from the small partial
+index `idx_shadow_tracking_retrying`. A full claim requests another tick at once.
+
+Acks are applied in three statements per tick (delivered, failed, not attempted). Delivered sets
+`external_offset` and counts `messages_forwarded` once per row (a duplicate ack matches nothing).
+Failed bumps `retry_count`, records the error, starts the backoff and counts `messages_failed`; at the
+cap the row is a dead letter, logged once. Not attempted only closes the attempt. A row whose attempt
+is still open but that this worker no longer tracks (worker restart, or an in-flight entry evicted
+after 150 s, above librdkafka's 120 s message timeout) lost its ack: the claim takes it again and
+counts the lost attempt as a failure, so a forward that never answers still reaches the cap. A dead
+letter stays pending until it is replayed (`kafka.replay_shadow_messages`) or the cap is raised.
+
+At-least-once and duplicates: the idempotent producer suppresses duplicates of its own retries
+within one producer session. A record re-sent by a new producer (rebuilt after a fatal error or a
+settings change) or after a lost ack can land twice. Consumers that need exactly-once should
+deduplicate on an application id.
 
 ### Replay
 
 `kafka.replay_shadow_messages(p_topic_id INT, p_from_offset BIGINT DEFAULT 0, p_to_offset BIGINT DEFAULT NULL)`
-inserts (or resets to pending) a `kafka.shadow_tracking` row for every committed or non-transactional
-message (`txn_state IS NULL`) of that topic with `p_from_offset <= partition_offset < p_to_offset`
-(`NULL` = to the end), across all partitions. It returns the number of rows re-queued; the normal
-outbox poll then forwards them.
+inserts (or resets to pending, closing any open attempt) a `kafka.shadow_tracking` row for every
+committed or non-transactional message of that topic in `[p_from_offset, p_to_offset)` (`NULL` = to
+the end), across all partitions, and returns the number of rows re-queued.
 
 ```sql
 SELECT kafka.replay_shadow_messages(
@@ -436,16 +221,21 @@ SELECT kafka.replay_shadow_messages(
 
 ### Observability
 
-- `kafka.shadow_tracking`: one row per selected record. `external_offset IS NOT NULL` means
-  delivered. `error_message` is withheld from `PUBLIC` (column-level grant).
-- `kafka.shadow_metrics`: per-partition `messages_forwarded`, `messages_failed`,
-  `last_forwarded_offset`, `last_forwarded_at`. The `messages_skipped` column exists but is never
-  incremented by the code; skips are only counted in RAM and logged.
-- `kafka.shadow_status` view: per-topic config plus summed metrics. Its `lag` column is
-  `MAX(partition_offset) - MAX(last_forwarded_offset)` across partitions, which is approximate for
-  multi-partition or sampled topics.
-- `kafka.metrics` view, category `shadow`: `forwarded`, `failed`, and `lag` (the count of pending
-  outbox rows).
+- `kafka.shadow_partition_status` (view, one row per partition that has outbox rows or metrics):
+  `lag` = records of the partition still to forward (pending rows under the cap; exact under
+  sampling, since sampled-out records are never queued, and 0 when caught up), `dead_lettered`,
+  `in_flight`, `oldest_pending_offset`, `last_forwarded_offset`, and the three counters.
+- `kafka.shadow_status` (view, per topic): config, summed counters, `lag` (sum of the partition
+  lags), `dead_lettered`, `max_partition_lag`. (Its `lag` used to be `MAX(partition_offset) -
+  MAX(last_forwarded_offset)` across partitions: it hid a lagging partition, was off by one and never
+  reached 0 under sampling.)
+- `kafka.shadow_metrics`: per-partition `messages_forwarded`, `messages_failed`, `messages_skipped`,
+  `last_forwarded_offset`, `last_forwarded_at`, written only while `shadow_metrics_enabled`.
+- `kafka.metrics`, category `shadow`: `forwarded`, `failed`, `lag` (all pending rows, dead letters
+  included).
+- Logs: no per-produce lines (`insert_records` used to log twice per Produce, even with shadow mode
+  off); a failing outbox tick (for example after `DROP EXTENSION`) pauses up to 30 s and logs at the
+  1st, 2nd, 4th, 8th... failure in a row.
 
 ## E2E Test Setup Sequence
 
@@ -564,33 +354,10 @@ SELECT kafka.replay_shadow_messages(
 
 ### Issue 3: Channel Backpressure
 
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│ DESIGN: Bounded channels never lose a record; they defer it                  │
-├──────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  ┌─────────────────────────┐      ┌───────────────────────────────────────┐ │
-│  │ DB thread               │─────▶│ forward channel bounded(10_000)       │ │
-│  │ ForwardRequest          │      │  try_send() full → row stays pending, │ │
-│  └─────────────────────────┘      │  retried after the 5s lease           │ │
-│                                   └───────────────────────────────────────┘ │
-│  ┌─────────────────────────┐      ┌───────────────────────────────────────┐ │
-│  │ Network thread          │─────▶│ ack channel bounded(10_000)           │ │
-│  │ ForwardAck              │      │  try_send() full → ack dropped, row   │ │
-│  └─────────────────────────┘      │  re-claimed after the in-flight entry │ │
-│                                   │  is evicted (150s); may duplicate     │ │
-│                                   └───────────────────────────────────────┘ │
-│                                                                              │
-│  Test Impact: LOW                                                            │
-│  - Tests produce 1-500 messages; the poll claims ≤ 256 rows per 250 ms tick │
-│  - Channel capacity: 10,000                                                  │
-│                                                                              │
-│  Production Risk: LOW for loss (the outbox is durable); a sustained burst   │
-│  raises forwarding latency and each deferral consumes one of the 10 retry   │
-│  attempts                                                                    │
-│                                                                              │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
+Neither channel loses anything. The DB thread dispatches at most 8192 records in flight, below the
+forward channel's 10 000, so a record send does not fail for lack of room (if it ever does, the
+attempt is closed without counting it and the row is claimed again). The forwarder keeps acks the
+ack channel cannot take yet and sends them later instead of dropping them.
 
 ### Issue 4: Test Isolation via Sequential Execution
 

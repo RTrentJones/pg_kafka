@@ -254,3 +254,6 @@ pub mod w3_groups;
 pub mod w3_txn;
 // wave3 net: hostile clients at the network edge (kafka_test/src/w3_net).
 pub mod w3_net;
+// wave3 shadow
+pub mod w3_shadow;
+// end wave3 shadow
