@@ -89,6 +89,12 @@ static IN_DB_WORK: AtomicBool = AtomicBool::new(false);
 /// Set when a worker transaction found the extension gone (DROP EXTENSION); the main
 /// loop then goes back to waiting for the schema.
 static SCHEMA_LOST: AtomicBool = AtomicBool::new(false);
+/// OID of the pg_kafka extension the worker initialised against (0 = not yet known;
+/// the next [`lock_schema`] records it). A different OID means the extension was
+/// dropped and re-created between two worker transactions (possibly in one DDL
+/// transaction the worker never saw "gone"): that is treated like a lost schema, so
+/// the worker re-initialises (features, role, maintenance) for the new one.
+static KNOWN_EXTENSION_OID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 extern "C" {
     // Exported by the postgres executable (pmsignal.c, latch support); not in pgrx's
@@ -177,7 +183,8 @@ impl TxnError {
 ///    could otherwise miss rows being moved, or deadlock with the script's DDL).
 ///
 /// Both waits are bounded by `lock_timeout` (`pg_kafka.worker_lock_timeout_ms`).
-/// Returns false if the extension does not exist.
+/// Returns false if the extension does not exist, or was re-created since the worker
+/// initialised against it ([`KNOWN_EXTENSION_OID`]).
 fn lock_schema() -> bool {
     unsafe {
         let name = c"pg_kafka";
@@ -196,6 +203,12 @@ fn lock_schema() -> bool {
         pg_sys::InvalidateCatalogSnapshot();
         if pg_sys::get_extension_oid(name.as_ptr(), true) != oid {
             return false;
+        }
+        let known = KNOWN_EXTENSION_OID.load(Ordering::SeqCst);
+        if known == 0 {
+            KNOWN_EXTENSION_OID.store(oid.to_u32(), Ordering::SeqCst);
+        } else if known != oid.to_u32() {
+            return false; // re-created since the worker initialised
         }
         let key = SCHEMA_LOCK_KEY as u64;
         let tag = pg_sys::LOCKTAG {
@@ -1630,6 +1643,8 @@ fn wait_for_schema_while_serving(
         }
         if Instant::now() >= next_check {
             if BackgroundWorker::transaction(|| verify_schema(database)).is_ok() {
+                // The next worker transaction records the (new) extension's OID.
+                KNOWN_EXTENSION_OID.store(0, Ordering::SeqCst);
                 SCHEMA_LOST.store(false, Ordering::SeqCst);
                 log!(
                     "pg_kafka schema found again after {} ms; resuming",
