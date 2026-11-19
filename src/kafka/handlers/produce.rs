@@ -1,6 +1,7 @@
 //! Produce: writes records to their partitions, with key routing for partition -1,
 //! idempotent sequence checks and transactional writes.
 
+use super::helpers::validate_ongoing_transaction;
 use crate::kafka::constants::{
     ERROR_INVALID_PRODUCER_EPOCH, ERROR_INVALID_TXN_STATE, ERROR_NONE,
     ERROR_UNKNOWN_TOPIC_OR_PARTITION,
@@ -11,8 +12,7 @@ use crate::kafka::messages::{ProducerMetadata, Record, TopicProduceData};
 use crate::kafka::partitioner::compute_partition;
 use crate::kafka::response_builders::build_produce_partition_error_response;
 use crate::kafka::storage::{
-    batch_last_sequence, KafkaStore, LogStore, ProducerBatch, SequenceCheck, TransactionState,
-    TransactionStore,
+    batch_last_sequence, KafkaStore, LogStore, ProducerBatch, SequenceCheck,
 };
 use kafka_protocol::messages::produce_response::{
     PartitionProduceResponse, ProduceResponse, TopicProduceResponse,
@@ -47,7 +47,13 @@ pub fn handle_produce(
     // requested partition; an empty response would leave the client without the error.
     if let (Some(txn_id), Some(meta)) = (transactional_id, producer_metadata) {
         if meta.producer_id >= 0 {
-            if let Err(e) = validate_ongoing_transaction(store, txn_id, meta) {
+            if let Err(e) = validate_ongoing_transaction(
+                store,
+                txn_id,
+                meta.producer_id,
+                meta.producer_epoch,
+                "Produce",
+            ) {
                 return Ok(build_produce_partition_error_response(
                     &topic_data,
                     produce_error_code(&e),
@@ -337,24 +343,6 @@ fn reported_log_start_offset(store: &dyn LogStore, topic_id: i32, partition_id: 
             );
             -1
         })
-}
-
-/// Check that `txn_id` belongs to this producer/epoch and is in the Ongoing state.
-fn validate_ongoing_transaction(
-    store: &dyn TransactionStore,
-    txn_id: &str,
-    meta: &ProducerMetadata,
-) -> Result<()> {
-    store.validate_transaction(txn_id, meta.producer_id, meta.producer_epoch)?;
-    match store.get_transaction_state(txn_id)? {
-        Some(TransactionState::Ongoing) => Ok(()),
-        Some(other) => Err(KafkaError::invalid_txn_state(
-            txn_id,
-            format!("{other:?}"),
-            "Produce",
-        )),
-        None => Err(KafkaError::transactional_id_not_found(txn_id)),
-    }
 }
 
 #[cfg(test)]

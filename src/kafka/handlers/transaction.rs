@@ -1,8 +1,12 @@
 //! Transaction handlers: AddPartitionsToTxn, AddOffsetsToTxn, EndTxn and TxnOffsetCommit.
 
-use crate::kafka::constants::ERROR_NONE;
+use super::helpers::validate_ongoing_transaction;
+use crate::kafka::constants::{
+    ERROR_NONE, ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+};
 use crate::kafka::error::{KafkaError, Result};
 use crate::kafka::handler_context::HandlerContext;
+use crate::kafka::storage::KafkaStore;
 use kafka_protocol::messages::add_offsets_to_txn_response::AddOffsetsToTxnResponse;
 use kafka_protocol::messages::add_partitions_to_txn_response::{
     AddPartitionsToTxnPartitionResult, AddPartitionsToTxnResponse, AddPartitionsToTxnTopicResult,
@@ -59,7 +63,7 @@ pub fn handle_add_partitions_to_txn(
                         Ok(topic_id)
                     }
                     Err(code) => Err(code),
-                    _ => Err(crate::kafka::constants::ERROR_UNKNOWN_TOPIC_OR_PARTITION),
+                    _ => Err(ERROR_UNKNOWN_TOPIC_OR_PARTITION),
                 };
                 any_failed |= r.is_err();
                 (partition_id, r)
@@ -282,83 +286,73 @@ pub fn handle_txn_offset_commit(
         ));
     }
 
-    // Validate the transaction state
-    store.validate_transaction(transactional_id, producer_id, producer_epoch)?;
+    validate_ongoing_transaction(
+        store,
+        transactional_id,
+        producer_id,
+        producer_epoch,
+        "TxnOffsetCommit",
+    )?;
 
-    // Ensure transaction is ongoing
-    let state = store.get_transaction_state(transactional_id)?;
-    match state {
-        Some(crate::kafka::storage::TransactionState::Ongoing) => {
-            // Good, transaction is active
-        }
-        Some(other) => {
-            return Err(KafkaError::invalid_txn_state(
-                transactional_id,
-                format!("{other:?}"),
-                "TxnOffsetCommit",
-            ));
-        }
-        None => {
-            return Err(KafkaError::transactional_id_not_found(transactional_id));
-        }
-    }
-
-    // Build response with results for each partition
     let mut response = TxnOffsetCommitResponse::default();
-    let mut topic_results = Vec::new();
+    response.topics = topics
+        .into_iter()
+        .map(|(topic_name, partitions)| {
+            store_txn_topic_offsets(store, transactional_id, group_id, topic_name, partitions)
+        })
+        .collect();
+    Ok(response)
+}
 
-    for (topic_name, partitions) in topics {
-        let mut partition_results = Vec::new();
-
-        // Resolve topic ID and partition count. The partition range check mirrors
-        // AddPartitionsToTxn: a partition outside [0, partition_count) is rejected with
-        // UNKNOWN_TOPIC_OR_PARTITION instead of being stored as a pending offset.
-        let topic_result = store.get_topic_id(&topic_name).and_then(|id| match id {
-            Some(id) => Ok(store
-                .get_topic_partition_count(&topic_name)?
-                .map(|count| (id, count))),
-            None => Ok(None),
-        });
-
-        for (partition_id, offset, metadata) in partitions {
-            let error_code = match &topic_result {
+/// Store one topic's offsets as pending offsets of the transaction and answer for each
+/// partition. The partition range check mirrors AddPartitionsToTxn: a partition outside
+/// `[0, partition_count)` is UNKNOWN_TOPIC_OR_PARTITION instead of a stored offset.
+fn store_txn_topic_offsets(
+    store: &dyn KafkaStore,
+    transactional_id: &str,
+    group_id: &str,
+    topic_name: String,
+    partitions: Vec<(i32, i64, Option<String>)>,
+) -> TxnOffsetCommitResponseTopic {
+    let topic = store.get_topic_id(&topic_name).and_then(|id| match id {
+        Some(id) => Ok(store
+            .get_topic_partition_count(&topic_name)?
+            .map(|count| (id, count))),
+        None => Ok(None),
+    });
+    let partition_results = partitions
+        .into_iter()
+        .map(|(partition_id, offset, metadata)| {
+            let error_code = match &topic {
                 Ok(Some((_, partition_count)))
                     if partition_id < 0 || partition_id >= *partition_count =>
                 {
-                    crate::kafka::constants::ERROR_UNKNOWN_TOPIC_OR_PARTITION
+                    ERROR_UNKNOWN_TOPIC_OR_PARTITION
                 }
-                Ok(Some((topic_id, _))) => {
-                    // Store the pending offset commit
-                    match store.store_txn_pending_offset(
-                        transactional_id,
-                        group_id,
-                        *topic_id,
-                        partition_id,
-                        offset,
-                        metadata.as_deref(),
-                    ) {
-                        Ok(()) => ERROR_NONE,
-                        Err(_) => crate::kafka::constants::ERROR_UNKNOWN_SERVER_ERROR,
-                    }
-                }
-                Ok(None) => crate::kafka::constants::ERROR_UNKNOWN_TOPIC_OR_PARTITION,
-                Err(_) => crate::kafka::constants::ERROR_UNKNOWN_SERVER_ERROR,
+                Ok(Some((topic_id, _))) => match store.store_txn_pending_offset(
+                    transactional_id,
+                    group_id,
+                    *topic_id,
+                    partition_id,
+                    offset,
+                    metadata.as_deref(),
+                ) {
+                    Ok(()) => ERROR_NONE,
+                    Err(_) => ERROR_UNKNOWN_SERVER_ERROR,
+                },
+                Ok(None) => ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+                Err(_) => ERROR_UNKNOWN_SERVER_ERROR,
             };
-
             let mut partition_result = TxnOffsetCommitResponsePartition::default();
             partition_result.partition_index = partition_id;
             partition_result.error_code = error_code;
-            partition_results.push(partition_result);
-        }
-
-        let mut topic_result = TxnOffsetCommitResponseTopic::default();
-        topic_result.name = TopicName(StrBytes::from_string(topic_name));
-        topic_result.partitions = partition_results;
-        topic_results.push(topic_result);
-    }
-
-    response.topics = topic_results;
-    Ok(response)
+            partition_result
+        })
+        .collect();
+    let mut topic_result = TxnOffsetCommitResponseTopic::default();
+    topic_result.name = TopicName(StrBytes::from_string(topic_name));
+    topic_result.partitions = partition_results;
+    topic_result
 }
 
 /// An AddPartitionsToTxn (v0-3) response reporting `error_code` on every requested
@@ -480,10 +474,7 @@ mod tests {
             .iter()
             .find(|p| p.partition_index == 0)
             .unwrap();
-        assert_eq!(
-            neg.partition_error_code,
-            crate::kafka::constants::ERROR_UNKNOWN_TOPIC_OR_PARTITION
-        );
+        assert_eq!(neg.partition_error_code, ERROR_UNKNOWN_TOPIC_OR_PARTITION);
         assert_eq!(
             zero.partition_error_code,
             crate::kafka::constants::ERROR_OPERATION_NOT_ATTEMPTED
