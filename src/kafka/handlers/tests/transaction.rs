@@ -88,7 +88,7 @@ fn test_add_partitions_invalid_partition() {
     assert_eq!(partitions[0].partition_index, 0);
     assert_eq!(
         partitions[0].partition_error_code,
-        crate::kafka::constants::ERROR_OPERATION_NOT_ATTEMPTED
+        ERROR_OPERATION_NOT_ATTEMPTED
     );
     assert_eq!(partitions[1].partition_index, 5);
     assert_eq!(
@@ -118,7 +118,7 @@ fn test_add_partitions_unknown_topic_is_not_created() {
         add_partitions_codes(&response),
         vec![
             ERROR_UNKNOWN_TOPIC_OR_PARTITION,
-            crate::kafka::constants::ERROR_OPERATION_NOT_ATTEMPTED
+            ERROR_OPERATION_NOT_ATTEMPTED
         ]
     );
 }

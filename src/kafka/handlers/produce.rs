@@ -441,7 +441,7 @@ mod wave3_tests {
         assert_eq!(
             run(&mock, &[0, 1], Some("tx")),
             vec![
-                (0, crate::kafka::constants::ERROR_NONE, 11),
+                (0, ERROR_NONE, 11),
                 (1, crate::kafka::constants::ERROR_INVALID_TXN_STATE, -1)
             ]
         );
@@ -475,13 +475,7 @@ mod wave3_tests {
             .map(|p| (p.index, p.error_code, p.base_offset, p.log_start_offset))
             .collect();
         got.sort();
-        assert_eq!(
-            got,
-            vec![
-                (0, crate::kafka::constants::ERROR_NONE, 11, 5),
-                (1, crate::kafka::constants::ERROR_NONE, 3, 6)
-            ]
-        );
+        assert_eq!(got, vec![(0, ERROR_NONE, 11, 5), (1, ERROR_NONE, 3, 6)]);
     }
 
     /// A failed log-start lookup after the records are written leaves the produce
@@ -503,7 +497,7 @@ mod wave3_tests {
         let p = &response.responses[0].partition_responses[0];
         assert_eq!(
             (p.error_code, p.base_offset, p.log_start_offset),
-            (crate::kafka::constants::ERROR_NONE, 4, -1)
+            (ERROR_NONE, 4, -1)
         );
     }
 

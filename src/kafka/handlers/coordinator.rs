@@ -1150,7 +1150,7 @@ mod tests {
         // DescribeGroups / ListGroups. They previously did `groups.read().unwrap()`, which panics
         // on a poisoned lock; now they recover via into_inner(). This test poisons the lock and
         // asserts both handlers still return Ok (it also covers the recovery closures).
-        let coordinator = crate::kafka::GroupCoordinator::new();
+        let coordinator = GroupCoordinator::new();
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = coordinator.groups.write().unwrap();
             panic!("intentionally poison the lock");
@@ -1160,7 +1160,7 @@ mod tests {
         let mut store = MockKafkaStore::new();
         store.expect_group_has_offsets().returning(|_| Ok(false));
         store.expect_list_offset_groups().returning(|| Ok(vec![]));
-        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
+        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
         let ctx = HandlerContext::new(
             &store,
             &coordinator,

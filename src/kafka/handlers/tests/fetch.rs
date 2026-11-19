@@ -57,12 +57,7 @@ fn test_handle_fetch_success() {
     let env = TestEnv::new();
     let ctx = env.ctx(&mock);
 
-    let response = fetch::handle_fetch(
-        &ctx,
-        topic_data,
-        crate::kafka::storage::IsolationLevel::ReadUncommitted,
-    )
-    .unwrap();
+    let response = fetch::handle_fetch(&ctx, topic_data, IsolationLevel::ReadUncommitted).unwrap();
 
     assert_eq!(response.responses.len(), 1);
     let partition_data = &response.responses[0].partitions[0];
@@ -116,12 +111,7 @@ fn test_handle_fetch_returns_headers() {
     let env = TestEnv::new();
     let ctx = env.ctx(&mock);
 
-    let response = fetch::handle_fetch(
-        &ctx,
-        topic_data,
-        crate::kafka::storage::IsolationLevel::ReadUncommitted,
-    )
-    .unwrap();
+    let response = fetch::handle_fetch(&ctx, topic_data, IsolationLevel::ReadUncommitted).unwrap();
 
     // Decode the encoded RecordBatch and assert the header survived.
     let partition_data = &response.responses[0].partitions[0];
@@ -159,7 +149,7 @@ fn test_handle_fetch_hwm_error_returns_partition_error() {
     mock.expect_fetch_records_with_isolation()
         .returning(|_, _, _, _, _| Ok(vec![]));
     mock.expect_get_high_watermark()
-        .returning(|_, _| Err(crate::kafka::error::KafkaError::Internal("db down".into())));
+        .returning(|_, _| Err(KafkaError::Internal("db down".into())));
 
     let topic_data = vec![TopicFetchData {
         name: "test-topic".to_string(),
@@ -173,12 +163,7 @@ fn test_handle_fetch_hwm_error_returns_partition_error() {
     let env = TestEnv::new();
     let ctx = env.ctx(&mock);
 
-    let response = fetch::handle_fetch(
-        &ctx,
-        topic_data,
-        crate::kafka::storage::IsolationLevel::ReadUncommitted,
-    )
-    .unwrap();
+    let response = fetch::handle_fetch(&ctx, topic_data, IsolationLevel::ReadUncommitted).unwrap();
 
     let partition_data = &response.responses[0].partitions[0];
     assert_ne!(
@@ -208,12 +193,7 @@ fn test_handle_fetch_unknown_topic() {
     let env = TestEnv::new();
     let ctx = env.ctx(&mock);
 
-    let response = fetch::handle_fetch(
-        &ctx,
-        topic_data,
-        crate::kafka::storage::IsolationLevel::ReadUncommitted,
-    )
-    .unwrap();
+    let response = fetch::handle_fetch(&ctx, topic_data, IsolationLevel::ReadUncommitted).unwrap();
 
     let partition_data = &response.responses[0].partitions[0];
     assert_eq!(partition_data.error_code, ERROR_UNKNOWN_TOPIC_OR_PARTITION);
@@ -256,12 +236,7 @@ fn test_handle_fetch_storage_error() {
     let env = TestEnv::new();
     let ctx = env.ctx(&mock);
 
-    let response = fetch::handle_fetch(
-        &ctx,
-        topic_data,
-        crate::kafka::storage::IsolationLevel::ReadUncommitted,
-    )
-    .unwrap();
+    let response = fetch::handle_fetch(&ctx, topic_data, IsolationLevel::ReadUncommitted).unwrap();
 
     let partition_data = &response.responses[0].partitions[0];
     assert_eq!(partition_data.error_code, ERROR_UNKNOWN_SERVER_ERROR);
@@ -302,12 +277,7 @@ fn test_handle_fetch_read_committed_uses_lso() {
     let env = TestEnv::new();
     let ctx = env.ctx(&mock);
 
-    let response = fetch::handle_fetch(
-        &ctx,
-        topic_data,
-        crate::kafka::storage::IsolationLevel::ReadCommitted,
-    )
-    .unwrap();
+    let response = fetch::handle_fetch(&ctx, topic_data, IsolationLevel::ReadCommitted).unwrap();
 
     let partition_data = &response.responses[0].partitions[0];
     assert_eq!(partition_data.error_code, ERROR_NONE);
@@ -345,12 +315,8 @@ fn test_handle_list_offsets_earliest() {
     let env = TestEnv::new();
     let ctx = env.ctx(&mock);
 
-    let response = fetch::handle_list_offsets(
-        &ctx,
-        topics,
-        crate::kafka::storage::IsolationLevel::ReadUncommitted,
-    )
-    .unwrap();
+    let response =
+        fetch::handle_list_offsets(&ctx, topics, IsolationLevel::ReadUncommitted).unwrap();
 
     let partition_response = &response.topics[0].partitions[0];
     assert_eq!(partition_response.error_code, ERROR_NONE);
@@ -384,12 +350,8 @@ fn test_handle_list_offsets_latest() {
     let env = TestEnv::new();
     let ctx = env.ctx(&mock);
 
-    let response = fetch::handle_list_offsets(
-        &ctx,
-        topics,
-        crate::kafka::storage::IsolationLevel::ReadUncommitted,
-    )
-    .unwrap();
+    let response =
+        fetch::handle_list_offsets(&ctx, topics, IsolationLevel::ReadUncommitted).unwrap();
 
     let partition_response = &response.topics[0].partitions[0];
     assert_eq!(partition_response.error_code, ERROR_NONE);
@@ -424,12 +386,8 @@ fn test_handle_list_offsets_by_timestamp() {
     let env = TestEnv::new();
     let ctx = env.ctx(&mock);
 
-    let response = fetch::handle_list_offsets(
-        &ctx,
-        topics,
-        crate::kafka::storage::IsolationLevel::ReadUncommitted,
-    )
-    .unwrap();
+    let response =
+        fetch::handle_list_offsets(&ctx, topics, IsolationLevel::ReadUncommitted).unwrap();
 
     let partition_response = &response.topics[0].partitions[0];
     assert_eq!(partition_response.error_code, ERROR_NONE);
