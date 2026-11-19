@@ -547,10 +547,10 @@ mod tests {
     #[test]
     fn test_record_header_with_empty_key() {
         let header = RecordHeader {
-            key: "".to_string(),
+            key: String::new(),
             value: b"value".to_vec(),
         };
-        assert!(header.key.is_empty());
+        assert_eq!(header.key, "");
         assert_eq!(header.value, b"value".to_vec());
     }
 
@@ -561,7 +561,7 @@ mod tests {
             value: vec![],
         };
         assert_eq!(header.key, "key");
-        assert!(header.value.is_empty());
+        assert_eq!(header.value, [] as [u8; 0]);
     }
 
     #[test]
@@ -581,7 +581,7 @@ mod tests {
             key: "debug-key".to_string(),
             value: vec![0xDE, 0xAD],
         };
-        let debug_str = format!("{:?}", header);
+        let debug_str = format!("{header:?}");
         assert!(debug_str.contains("debug-key"));
         assert!(debug_str.contains("RecordHeader"));
     }

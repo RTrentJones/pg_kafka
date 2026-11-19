@@ -341,7 +341,7 @@ mod tests {
 
         assert_eq!(topic.error_code, ERROR_UNKNOWN_TOPIC_OR_PARTITION);
         assert_eq!(topic.name.unwrap().0.as_str(), "unknown-topic");
-        assert!(topic.partitions.is_empty());
+        assert_eq!(topic.partitions, [] as [MetadataResponsePartition; 0]);
     }
 
     #[test]
@@ -372,7 +372,10 @@ mod tests {
         let response = build_produce_response();
 
         assert_eq!(response.throttle_time_ms, 0);
-        assert!(response.responses.is_empty());
+        assert_eq!(
+            response.responses,
+            [] as [kafka_protocol::messages::produce_response::TopicProduceResponse; 0]
+        );
     }
 
     // ========== Coordinator Response Tests ==========
@@ -463,7 +466,7 @@ mod tests {
         assert_eq!(response.throttle_time_ms, 0);
         assert!(response.cluster_id.is_none());
         assert_eq!(response.controller_id.0, -1);
-        assert!(response.brokers.is_empty());
-        assert!(response.topics.is_empty());
+        assert_eq!(response.brokers, [] as [MetadataResponseBroker; 0]);
+        assert_eq!(response.topics, [] as [MetadataResponseTopic; 0]);
     }
 }

@@ -3,7 +3,7 @@
 
 use bytes::BufMut;
 use kafka_protocol::messages::*;
-use kafka_protocol::protocol::{Encodable, HeaderVersion, Request, StrBytes};
+use kafka_protocol::protocol::{Encodable, Request, StrBytes};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use super::*;
@@ -150,7 +150,7 @@ fn test_unsupported_version_reply_always_encodes() {
         crate::kafka::protocol::encode_response(response).expect("queued response encodes");
     }
     // Every registered API at every version just past what it serves.
-    for info in crate::kafka::api::APIS {
+    for info in api::APIS {
         for version in [info.max_version + 1, info.max_version + 2, 15, 16] {
             let mut frame = BytesMut::new();
             frame.put_i16(info.key);
@@ -309,7 +309,7 @@ fn test_parse_config_log_apis_malformed_body() {
 #[test]
 fn test_correlation_id_preserved() {
     for correlation_id in [0i32, 1, -1, i32::MAX, i32::MIN] {
-        let request = api_versions_request::ApiVersionsRequest::default();
+        let request = ApiVersionsRequest::default();
         let parsed = parse_to_request(frame(&request, 3, correlation_id));
         assert_eq!(
             parsed.header.correlation_id, correlation_id,
@@ -321,15 +321,13 @@ fn test_correlation_id_preserved() {
 
 fn api_versions_frame(client_id: Option<&'static str>) -> BytesMut {
     let header = RequestHeader::default()
-        .with_request_api_key(api_versions_request::ApiVersionsRequest::KEY)
+        .with_request_api_key(ApiVersionsRequest::KEY)
         .with_request_api_version(3)
         .with_correlation_id(1)
         .with_client_id(client_id.map(str));
     let mut buf = BytesMut::new();
     header.encode(&mut buf, 2).unwrap();
-    api_versions_request::ApiVersionsRequest::default()
-        .encode(&mut buf, 3)
-        .unwrap();
+    ApiVersionsRequest::default().encode(&mut buf, 3).unwrap();
     buf
 }
 
@@ -357,7 +355,7 @@ fn test_client_id_none() {
 #[test]
 fn test_parse_unsupported_api_key() {
     let (tx, mut rx) = channel();
-    let request = describe_acls_request::DescribeAclsRequest::default();
+    let request = DescribeAclsRequest::default();
     assert!(parse_request(frame(&request, 1, 9999), tx)
         .unwrap()
         .is_none());
@@ -376,16 +374,9 @@ fn test_parse_unsupported_api_key() {
 #[test]
 fn test_request_version_out_of_range_rejected() {
     let (tx, mut rx) = channel();
-    let request = metadata_request::MetadataRequest::default();
+    let request = MetadataRequest::default();
     // v11's header is flexible like v10's, so the header still decodes.
-    let frame = raw_frame(
-        metadata_request::MetadataRequest::KEY,
-        11,
-        2,
-        7777,
-        &request,
-        9,
-    );
+    let frame = raw_frame(MetadataRequest::KEY, 11, 2, 7777, &request, 9);
     let parsed = parse_request(frame, tx).unwrap();
     assert!(
         parsed.is_none(),
@@ -408,7 +399,7 @@ fn test_request_version_out_of_range_rejected() {
 /// for its bootstrap Metadata, parses.
 #[test]
 fn test_request_version_in_range_accepted() {
-    let request = metadata_request::MetadataRequest::default();
+    let request = MetadataRequest::default();
     expect_body!(decode(&request, 10), Metadata);
 }
 
@@ -418,7 +409,7 @@ fn test_request_version_in_range_accepted() {
 #[test]
 fn test_parse_add_partitions_to_txn_request_v4() {
     let (tx, mut rx) = channel();
-    let mut request = add_partitions_to_txn_request::AddPartitionsToTxnRequest::default();
+    let mut request = AddPartitionsToTxnRequest::default();
     let mut txn = add_partitions_to_txn_request::AddPartitionsToTxnTransaction::default();
     txn.transactional_id = txn_id("batch-txn");
     txn.producer_id = ProducerId(44444);
@@ -448,7 +439,7 @@ fn test_parse_add_partitions_to_txn_request_v4() {
 
 #[test]
 fn test_parse_api_versions_request() {
-    let request = api_versions_request::ApiVersionsRequest::default();
+    let request = ApiVersionsRequest::default();
     expect_body!(decode(&request, 3), ApiVersions);
 }
 
@@ -456,7 +447,7 @@ fn test_parse_api_versions_request() {
 /// depend on the crate's default for the field.
 #[test]
 fn test_parse_metadata_request_all_topics() {
-    let mut request = metadata_request::MetadataRequest::default();
+    let mut request = MetadataRequest::default();
     request.topics = None;
     let data = expect_body!(decode(&request, 9), Metadata);
     assert!(data.topics.is_none());
@@ -464,7 +455,7 @@ fn test_parse_metadata_request_all_topics() {
 
 #[test]
 fn test_parse_metadata_request_specific_topics() {
-    let mut request = metadata_request::MetadataRequest::default();
+    let mut request = MetadataRequest::default();
     let mut t = metadata_request::MetadataRequestTopic::default();
     t.name = Some(topic("test-topic"));
     request.topics = Some(vec![t]);
@@ -475,7 +466,7 @@ fn test_parse_metadata_request_specific_topics() {
 /// At v1+ an empty topics array means "no topics", not "all topics".
 #[test]
 fn test_parse_metadata_empty_array_v9_means_no_topics() {
-    let mut request = metadata_request::MetadataRequest::default();
+    let mut request = MetadataRequest::default();
     request.topics = Some(vec![]);
     let data = expect_body!(decode(&request, 9), Metadata);
     let topics = data.topics.expect("v9 empty array should be Some(empty)");
@@ -488,7 +479,7 @@ fn test_parse_metadata_empty_array_v9_means_no_topics() {
 /// v0 has no nullable array, so an empty array means "all topics" (None downstream).
 #[test]
 fn test_parse_metadata_empty_array_v0_means_all_topics() {
-    let mut request = metadata_request::MetadataRequest::default();
+    let mut request = MetadataRequest::default();
     request.topics = Some(vec![]);
     let data = expect_body!(decode(&request, 0), Metadata);
     assert!(
@@ -501,7 +492,7 @@ fn test_parse_metadata_empty_array_v0_means_all_topics() {
 /// The v4+ allow_auto_topic_creation flag is carried into the request.
 #[test]
 fn test_parse_metadata_allow_auto_topic_creation_flag() {
-    let mut request = metadata_request::MetadataRequest::default();
+    let mut request = MetadataRequest::default();
     request.allow_auto_topic_creation = false;
     let data = expect_body!(decode(&request, 4), Metadata);
     assert!(!data.allow_auto_topic_creation);
@@ -511,7 +502,7 @@ fn test_parse_metadata_allow_auto_topic_creation_flag() {
 
 #[test]
 fn test_parse_find_coordinator_request() {
-    let mut request = find_coordinator_request::FindCoordinatorRequest::default();
+    let mut request = FindCoordinatorRequest::default();
     request.key = str("test-group");
     request.key_type = 0; // consumer group
     let data = expect_body!(decode(&request, 3), FindCoordinator);
@@ -521,7 +512,7 @@ fn test_parse_find_coordinator_request() {
 
 #[test]
 fn test_parse_join_group_request() {
-    let mut request = join_group_request::JoinGroupRequest::default();
+    let mut request = JoinGroupRequest::default();
     request.group_id = group("consumer-group-1");
     request.session_timeout_ms = 30000;
     request.rebalance_timeout_ms = 60000;
@@ -536,7 +527,7 @@ fn test_parse_join_group_request() {
 /// v4 is the highest SyncGroup version pg_kafka advertises.
 #[test]
 fn test_parse_sync_group_request() {
-    let mut request = sync_group_request::SyncGroupRequest::default();
+    let mut request = SyncGroupRequest::default();
     request.group_id = group("sync-group");
     request.generation_id = 1;
     request.member_id = str("member-123");
@@ -548,7 +539,7 @@ fn test_parse_sync_group_request() {
 
 #[test]
 fn test_parse_heartbeat_request() {
-    let mut request = heartbeat_request::HeartbeatRequest::default();
+    let mut request = HeartbeatRequest::default();
     request.group_id = group("heartbeat-group");
     request.generation_id = 5;
     request.member_id = str("hb-member");
@@ -561,7 +552,7 @@ fn test_parse_heartbeat_request() {
 /// v2 carries a single member_id (v3+ a members array).
 #[test]
 fn test_parse_leave_group_request() {
-    let mut request = leave_group_request::LeaveGroupRequest::default();
+    let mut request = LeaveGroupRequest::default();
     request.group_id = group("leave-group");
     request.member_id = str("leaving-member");
     let data = expect_body!(decode(&request, 2), LeaveGroup);
@@ -571,7 +562,7 @@ fn test_parse_leave_group_request() {
 
 #[test]
 fn test_parse_describe_groups_request() {
-    let mut request = describe_groups_request::DescribeGroupsRequest::default();
+    let mut request = DescribeGroupsRequest::default();
     request.groups = vec![group("describe-group")];
     let data = expect_body!(decode(&request, 3), DescribeGroups);
     assert_eq!(data.groups, vec!["describe-group".to_string()]);
@@ -579,13 +570,13 @@ fn test_parse_describe_groups_request() {
 
 #[test]
 fn test_parse_list_groups_request() {
-    let request = list_groups_request::ListGroupsRequest::default();
+    let request = ListGroupsRequest::default();
     expect_body!(decode(&request, 4), ListGroups);
 }
 
 #[test]
 fn test_parse_delete_groups_request() {
-    let mut request = delete_groups_request::DeleteGroupsRequest::default();
+    let mut request = DeleteGroupsRequest::default();
     request.groups_names = vec![group("old-group")];
     let data = expect_body!(decode(&request, 2), DeleteGroups);
     assert_eq!(data.groups_names, vec!["old-group".to_string()]);
@@ -596,7 +587,7 @@ fn test_parse_delete_groups_request() {
 /// The generation and member id are carried into the request.
 #[test]
 fn test_parse_offset_commit_request() {
-    let mut request = offset_commit_request::OffsetCommitRequest::default();
+    let mut request = OffsetCommitRequest::default();
     request.group_id = group("commit-group");
     request.generation_id_or_member_epoch = 7;
     request.member_id = str("member-7");
@@ -619,7 +610,7 @@ fn test_parse_offset_commit_request() {
 
 #[test]
 fn test_parse_offset_commit_request_with_metadata() {
-    let mut request = offset_commit_request::OffsetCommitRequest::default();
+    let mut request = OffsetCommitRequest::default();
     request.group_id = group("metadata-group");
     let mut t = offset_commit_request::OffsetCommitRequestTopic::default();
     t.name = topic("metadata-topic");
@@ -642,7 +633,7 @@ fn test_parse_offset_commit_request_with_metadata() {
 
 #[test]
 fn test_parse_offset_fetch_request() {
-    let mut request = offset_fetch_request::OffsetFetchRequest::default();
+    let mut request = OffsetFetchRequest::default();
     request.group_id = group("fetch-group");
     let data = expect_body!(decode(&request, 7), OffsetFetch);
     assert_eq!(data.group_id, "fetch-group");
@@ -650,7 +641,7 @@ fn test_parse_offset_fetch_request() {
 
 #[test]
 fn test_parse_offset_fetch_request_with_topics() {
-    let mut request = offset_fetch_request::OffsetFetchRequest::default();
+    let mut request = OffsetFetchRequest::default();
     request.group_id = group("fetch-offsets-group");
     let mut t = offset_fetch_request::OffsetFetchRequestTopic::default();
     t.name = topic("offset-topic");
@@ -670,7 +661,7 @@ fn test_parse_offset_fetch_request_with_topics() {
 #[test]
 fn test_parse_offset_fetch_empty_vs_null_topics() {
     for (wire_topics, expect_all) in [(Some(vec![]), false), (None, true)] {
-        let mut request = offset_fetch_request::OffsetFetchRequest::default();
+        let mut request = OffsetFetchRequest::default();
         request.group_id = group("g");
         request.topics = wire_topics;
         let data = expect_body!(decode(&request, 7), OffsetFetch);
@@ -684,7 +675,7 @@ fn test_parse_offset_fetch_empty_vs_null_topics() {
 
 #[test]
 fn test_parse_list_offsets_request() {
-    let mut request = list_offsets_request::ListOffsetsRequest::default();
+    let mut request = ListOffsetsRequest::default();
     request.replica_id = BrokerId(-1);
     request.isolation_level = 0;
     let mut t = list_offsets_request::ListOffsetsTopic::default();
@@ -704,7 +695,7 @@ fn test_parse_list_offsets_request() {
 
 #[test]
 fn test_parse_fetch_request() {
-    let mut request = fetch_request::FetchRequest::default();
+    let mut request = FetchRequest::default();
     request.max_wait_ms = 5000;
     request.min_bytes = 1;
     request.max_bytes = 1_048_576;
@@ -729,7 +720,7 @@ fn test_parse_fetch_request() {
 
 #[test]
 fn test_parse_fetch_request_with_isolation_level() {
-    let mut request = fetch_request::FetchRequest::default();
+    let mut request = FetchRequest::default();
     request.max_wait_ms = 1000;
     request.min_bytes = 0;
     request.max_bytes = 1_048_576;
@@ -747,7 +738,7 @@ fn test_parse_fetch_request_multiple_topics() {
         p.partition_max_bytes = 32768;
         p
     }
-    let mut request = fetch_request::FetchRequest::default();
+    let mut request = FetchRequest::default();
     request.max_wait_ms = 1000;
     request.min_bytes = 1;
     request.max_bytes = 1_048_576;
@@ -776,7 +767,7 @@ fn test_parse_fetch_request_multiple_topics() {
 #[test]
 fn test_parse_produce_request_acks() {
     for (acks, timeout_ms) in [(1, 5000), (0, 1000), (-1, 30000)] {
-        let mut request = produce_request::ProduceRequest::default();
+        let mut request = ProduceRequest::default();
         request.acks = acks;
         request.timeout_ms = timeout_ms;
         let data = expect_body!(decode(&request, 7), Produce);
@@ -787,7 +778,7 @@ fn test_parse_produce_request_acks() {
 
 #[test]
 fn test_parse_produce_request_with_transactional_id() {
-    let mut request = produce_request::ProduceRequest::default();
+    let mut request = ProduceRequest::default();
     request.transactional_id = Some(txn_id("txn-producer"));
     request.acks = -1;
     request.timeout_ms = 30000;
@@ -800,7 +791,7 @@ fn test_parse_produce_request_with_transactional_id() {
 
 #[test]
 fn test_parse_create_topics_request() {
-    let mut request = create_topics_request::CreateTopicsRequest::default();
+    let mut request = CreateTopicsRequest::default();
     let mut t = create_topics_request::CreatableTopic::default();
     t.name = topic("new-topic");
     t.num_partitions = 3;
@@ -820,7 +811,7 @@ fn test_parse_create_topics_request() {
 /// v4 is the highest DeleteTopics version pg_kafka advertises.
 #[test]
 fn test_parse_delete_topics_request() {
-    let mut request = delete_topics_request::DeleteTopicsRequest::default();
+    let mut request = DeleteTopicsRequest::default();
     request.topic_names = vec![topic("delete-me")];
     request.timeout_ms = 5000;
     let data = expect_body!(decode(&request, 4), DeleteTopics);
@@ -831,7 +822,7 @@ fn test_parse_delete_topics_request() {
 /// v2 is the highest CreatePartitions version pg_kafka advertises.
 #[test]
 fn test_parse_create_partitions_request() {
-    let mut request = create_partitions_request::CreatePartitionsRequest::default();
+    let mut request = CreatePartitionsRequest::default();
     let mut t = create_partitions_request::CreatePartitionsTopic::default();
     t.name = topic("expand-topic");
     t.count = 6;
@@ -920,7 +911,7 @@ fn test_parse_incremental_alter_configs_request() {
 
 #[test]
 fn test_parse_init_producer_id_request() {
-    let mut request = init_producer_id_request::InitProducerIdRequest::default();
+    let mut request = InitProducerIdRequest::default();
     request.transactional_id = None;
     request.transaction_timeout_ms = 60000;
     request.producer_id = ProducerId(-1); // new producer
@@ -934,7 +925,7 @@ fn test_parse_init_producer_id_request() {
 
 #[test]
 fn test_parse_init_producer_id_with_transactional_id() {
-    let mut request = init_producer_id_request::InitProducerIdRequest::default();
+    let mut request = InitProducerIdRequest::default();
     request.transactional_id = Some(txn_id("txn-producer-1"));
     request.transaction_timeout_ms = 30000;
     request.producer_id = ProducerId(-1);
@@ -947,7 +938,7 @@ fn test_parse_init_producer_id_with_transactional_id() {
 /// v3 is the last version before the batched format.
 #[test]
 fn test_parse_add_partitions_to_txn_request_v3() {
-    let mut request = add_partitions_to_txn_request::AddPartitionsToTxnRequest::default();
+    let mut request = AddPartitionsToTxnRequest::default();
     request.v3_and_below_transactional_id = txn_id("txn-test");
     request.v3_and_below_producer_id = ProducerId(11111);
     request.v3_and_below_producer_epoch = 0;
@@ -964,7 +955,7 @@ fn test_parse_add_partitions_to_txn_request_v3() {
 
 #[test]
 fn test_parse_add_offsets_to_txn_request() {
-    let mut request = add_offsets_to_txn_request::AddOffsetsToTxnRequest::default();
+    let mut request = AddOffsetsToTxnRequest::default();
     request.transactional_id = txn_id("txn-1");
     request.producer_id = ProducerId(12345);
     request.producer_epoch = 0;
@@ -982,7 +973,7 @@ fn test_parse_end_txn_request() {
         ("txn-commit", 99999, 1, true),
         ("txn-abort", 88888, 2, false),
     ] {
-        let mut request = end_txn_request::EndTxnRequest::default();
+        let mut request = EndTxnRequest::default();
         request.transactional_id = txn_id(id);
         request.producer_id = ProducerId(producer_id);
         request.producer_epoch = epoch;
@@ -996,7 +987,7 @@ fn test_parse_end_txn_request() {
 
 #[test]
 fn test_parse_txn_offset_commit_request() {
-    let mut request = txn_offset_commit_request::TxnOffsetCommitRequest::default();
+    let mut request = TxnOffsetCommitRequest::default();
     request.transactional_id = txn_id("txn-commit");
     request.group_id = group("commit-group");
     request.producer_id = ProducerId(22222);

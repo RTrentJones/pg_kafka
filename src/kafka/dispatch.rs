@@ -196,7 +196,7 @@ mod tests {
         // hanging) AND re-raise the panic (so the surrounding subtransaction rolls back).
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
             let _ = dispatch_response(
                 "Test",
                 tx,
@@ -231,7 +231,7 @@ mod tests {
         // moved inside the guard.
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
             let _ = dispatch_response(
                 "Test",
                 tx,

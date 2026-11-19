@@ -374,7 +374,7 @@ mod tests {
         let mut two = one;
         two.extend_from_slice(&encode_batch(&["b"]));
         let err = parse_record_batch(&two.freeze()).unwrap_err();
-        assert!(matches!(err, KafkaError::InvalidRecord { .. }), "{:?}", err);
+        assert!(matches!(err, KafkaError::InvalidRecord { .. }), "{err:?}");
         assert_eq!(
             err.to_kafka_error_code(),
             crate::kafka::constants::ERROR_INVALID_RECORD
@@ -623,7 +623,7 @@ mod tests {
             buf.extend_from_slice(&size.to_be_bytes()); // tiny message_size
             let bytes = Bytes::from(buf);
             let result = parse_message_set_legacy(&bytes, "test error");
-            assert!(result.is_err(), "size {} should yield Err, not panic", size);
+            assert!(result.is_err(), "size {size} should yield Err, not panic");
         }
     }
 
@@ -700,7 +700,7 @@ mod tests {
         };
 
         // Should be Debug printable
-        let debug_str = format!("{:?}", batch);
+        let debug_str = format!("{batch:?}");
         assert!(debug_str.contains("ParsedRecordBatch"));
     }
 }

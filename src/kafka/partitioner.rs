@@ -101,7 +101,7 @@ mod tests {
         // With enough different keys, we should see different partitions
         let mut seen_partitions = std::collections::HashSet::new();
         for i in 0..1000 {
-            let key = format!("key-{}", i);
+            let key = format!("key-{i}");
             let partition = compute_partition(Some(key.as_bytes()), partition_count, -1);
             seen_partitions.insert(partition);
         }
@@ -122,9 +122,7 @@ mod tests {
             let partition = compute_partition(None, partition_count, -1);
             assert!(
                 partition >= 0 && partition < partition_count,
-                "Partition {} out of range [0, {})",
-                partition,
-                partition_count
+                "Partition {partition} out of range [0, {partition_count})"
             );
         }
     }
@@ -175,7 +173,7 @@ mod tests {
         let mut counts = vec![0u32; partition_count as usize];
 
         for i in 0..10000 {
-            let key = format!("unique-key-{}", i);
+            let key = format!("unique-key-{i}");
             let partition = compute_partition(Some(key.as_bytes()), partition_count, -1);
             counts[partition as usize] += 1;
         }
@@ -184,9 +182,7 @@ mod tests {
         for (i, &count) in counts.iter().enumerate() {
             assert!(
                 (500..=1500).contains(&count),
-                "Partition {} got {} messages, expected ~1000",
-                i,
-                count
+                "Partition {i} got {count} messages, expected ~1000"
             );
         }
     }

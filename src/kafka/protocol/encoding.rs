@@ -41,7 +41,7 @@ mod tests {
         let response = KafkaResponse::new(
             123,
             3,
-            ResponseBody::ApiVersions(api_versions_response::ApiVersionsResponse::default()),
+            ResponseBody::ApiVersions(ApiVersionsResponse::default()),
         );
 
         let encoded = encode_response(response).unwrap();
@@ -55,7 +55,7 @@ mod tests {
         let response = KafkaResponse::new(
             1,
             0,
-            ResponseBody::ApiVersions(api_versions_response::ApiVersionsResponse::default()),
+            ResponseBody::ApiVersions(ApiVersionsResponse::default()),
         );
 
         let encoded = encode_response(response).unwrap();
@@ -66,11 +66,8 @@ mod tests {
 
     #[test]
     fn test_encode_metadata_response() {
-        let response = KafkaResponse::new(
-            456,
-            9,
-            ResponseBody::Metadata(metadata_response::MetadataResponse::default()),
-        );
+        let response =
+            KafkaResponse::new(456, 9, ResponseBody::Metadata(MetadataResponse::default()));
 
         let encoded = encode_response(response).unwrap();
         assert!(!encoded.is_empty());
@@ -78,11 +75,8 @@ mod tests {
 
     #[test]
     fn test_encode_metadata_response_v0() {
-        let response = KafkaResponse::new(
-            1,
-            0,
-            ResponseBody::Metadata(metadata_response::MetadataResponse::default()),
-        );
+        let response =
+            KafkaResponse::new(1, 0, ResponseBody::Metadata(MetadataResponse::default()));
 
         let encoded = encode_response(response).unwrap();
         assert!(!encoded.is_empty());
@@ -92,11 +86,8 @@ mod tests {
 
     #[test]
     fn test_encode_produce_response() {
-        let response = KafkaResponse::new(
-            789,
-            8,
-            ResponseBody::Produce(produce_response::ProduceResponse::default()),
-        );
+        let response =
+            KafkaResponse::new(789, 8, ResponseBody::Produce(ProduceResponse::default()));
 
         let encoded = encode_response(response).unwrap();
         assert!(!encoded.is_empty());
@@ -105,11 +96,7 @@ mod tests {
     #[test]
     fn test_encode_produce_response_v3() {
         // Note: kafka-protocol crate doesn't support v0 for Produce, use v3+
-        let response = KafkaResponse::new(
-            1,
-            3,
-            ResponseBody::Produce(produce_response::ProduceResponse::default()),
-        );
+        let response = KafkaResponse::new(1, 3, ResponseBody::Produce(ProduceResponse::default()));
 
         let encoded = encode_response(response).unwrap();
         assert!(!encoded.is_empty());
@@ -119,11 +106,7 @@ mod tests {
 
     #[test]
     fn test_encode_fetch_response() {
-        let response = KafkaResponse::new(
-            111,
-            11,
-            ResponseBody::Fetch(fetch_response::FetchResponse::default()),
-        );
+        let response = KafkaResponse::new(111, 11, ResponseBody::Fetch(FetchResponse::default()));
 
         let encoded = encode_response(response).unwrap();
         assert!(!encoded.is_empty());
@@ -132,11 +115,7 @@ mod tests {
     #[test]
     fn test_encode_fetch_response_v4() {
         // Note: kafka-protocol crate doesn't support v0 for Fetch, use v4+
-        let response = KafkaResponse::new(
-            1,
-            4,
-            ResponseBody::Fetch(fetch_response::FetchResponse::default()),
-        );
+        let response = KafkaResponse::new(1, 4, ResponseBody::Fetch(FetchResponse::default()));
 
         let encoded = encode_response(response).unwrap();
         assert!(!encoded.is_empty());
@@ -149,7 +128,7 @@ mod tests {
         let response = KafkaResponse::new(
             222,
             8,
-            ResponseBody::OffsetCommit(offset_commit_response::OffsetCommitResponse::default()),
+            ResponseBody::OffsetCommit(OffsetCommitResponse::default()),
         );
 
         let encoded = encode_response(response).unwrap();
@@ -163,7 +142,7 @@ mod tests {
         let response = KafkaResponse::new(
             333,
             7,
-            ResponseBody::OffsetFetch(offset_fetch_response::OffsetFetchResponse::default()),
+            ResponseBody::OffsetFetch(OffsetFetchResponse::default()),
         );
 
         let encoded = encode_response(response).unwrap();
@@ -177,9 +156,7 @@ mod tests {
         let response = KafkaResponse::new(
             444,
             3,
-            ResponseBody::FindCoordinator(
-                find_coordinator_response::FindCoordinatorResponse::default(),
-            ),
+            ResponseBody::FindCoordinator(FindCoordinatorResponse::default()),
         );
 
         let encoded = encode_response(response).unwrap();
@@ -193,7 +170,7 @@ mod tests {
         let response = KafkaResponse::new(
             555,
             7,
-            ResponseBody::JoinGroup(join_group_response::JoinGroupResponse::default()),
+            ResponseBody::JoinGroup(JoinGroupResponse::default()),
         );
 
         let encoded = encode_response(response).unwrap();
@@ -207,7 +184,7 @@ mod tests {
         let response = KafkaResponse::new(
             666,
             5,
-            ResponseBody::SyncGroup(sync_group_response::SyncGroupResponse::default()),
+            ResponseBody::SyncGroup(SyncGroupResponse::default()),
         );
 
         let encoded = encode_response(response).unwrap();
@@ -221,7 +198,7 @@ mod tests {
         let response = KafkaResponse::new(
             777,
             4,
-            ResponseBody::Heartbeat(heartbeat_response::HeartbeatResponse::default()),
+            ResponseBody::Heartbeat(HeartbeatResponse::default()),
         );
 
         let encoded = encode_response(response).unwrap();
@@ -235,7 +212,7 @@ mod tests {
         let response = KafkaResponse::new(
             888,
             4,
-            ResponseBody::LeaveGroup(leave_group_response::LeaveGroupResponse::default()),
+            ResponseBody::LeaveGroup(LeaveGroupResponse::default()),
         );
 
         let encoded = encode_response(response).unwrap();
@@ -249,7 +226,7 @@ mod tests {
         let response = KafkaResponse::new(
             999,
             5,
-            ResponseBody::ListOffsets(list_offsets_response::ListOffsetsResponse::default()),
+            ResponseBody::ListOffsets(ListOffsetsResponse::default()),
         );
 
         let encoded = encode_response(response).unwrap();
@@ -263,9 +240,7 @@ mod tests {
         let response = KafkaResponse::new(
             1000,
             4,
-            ResponseBody::DescribeGroups(
-                describe_groups_response::DescribeGroupsResponse::default(),
-            ),
+            ResponseBody::DescribeGroups(DescribeGroupsResponse::default()),
         );
 
         let encoded = encode_response(response).unwrap();
@@ -279,7 +254,7 @@ mod tests {
         let response = KafkaResponse::new(
             1001,
             4,
-            ResponseBody::ListGroups(list_groups_response::ListGroupsResponse::default()),
+            ResponseBody::ListGroups(ListGroupsResponse::default()),
         );
 
         let encoded = encode_response(response).unwrap();
@@ -293,7 +268,7 @@ mod tests {
         let response = KafkaResponse::new(
             1002,
             5,
-            ResponseBody::CreateTopics(create_topics_response::CreateTopicsResponse::default()),
+            ResponseBody::CreateTopics(CreateTopicsResponse::default()),
         );
 
         let encoded = encode_response(response).unwrap();
@@ -307,7 +282,7 @@ mod tests {
         let response = KafkaResponse::new(
             1003,
             5,
-            ResponseBody::DeleteTopics(delete_topics_response::DeleteTopicsResponse::default()),
+            ResponseBody::DeleteTopics(DeleteTopicsResponse::default()),
         );
 
         let encoded = encode_response(response).unwrap();
@@ -321,9 +296,7 @@ mod tests {
         let response = KafkaResponse::new(
             1004,
             3,
-            ResponseBody::CreatePartitions(
-                create_partitions_response::CreatePartitionsResponse::default(),
-            ),
+            ResponseBody::CreatePartitions(CreatePartitionsResponse::default()),
         );
 
         let encoded = encode_response(response).unwrap();
@@ -337,7 +310,7 @@ mod tests {
         let response = KafkaResponse::new(
             1005,
             2,
-            ResponseBody::DeleteGroups(delete_groups_response::DeleteGroupsResponse::default()),
+            ResponseBody::DeleteGroups(DeleteGroupsResponse::default()),
         );
 
         let encoded = encode_response(response).unwrap();
@@ -351,9 +324,7 @@ mod tests {
         let response = KafkaResponse::new(
             1006,
             4,
-            ResponseBody::InitProducerId(
-                init_producer_id_response::InitProducerIdResponse::default(),
-            ),
+            ResponseBody::InitProducerId(InitProducerIdResponse::default()),
         );
 
         let encoded = encode_response(response).unwrap();
@@ -367,9 +338,7 @@ mod tests {
         let response = KafkaResponse::new(
             1007,
             3,
-            ResponseBody::AddPartitionsToTxn(
-                add_partitions_to_txn_response::AddPartitionsToTxnResponse::default(),
-            ),
+            ResponseBody::AddPartitionsToTxn(AddPartitionsToTxnResponse::default()),
         );
 
         let encoded = encode_response(response).unwrap();
@@ -381,9 +350,7 @@ mod tests {
         let response = KafkaResponse::new(
             1008,
             3,
-            ResponseBody::AddOffsetsToTxn(
-                add_offsets_to_txn_response::AddOffsetsToTxnResponse::default(),
-            ),
+            ResponseBody::AddOffsetsToTxn(AddOffsetsToTxnResponse::default()),
         );
 
         let encoded = encode_response(response).unwrap();
@@ -392,11 +359,7 @@ mod tests {
 
     #[test]
     fn test_encode_end_txn_response() {
-        let response = KafkaResponse::new(
-            1009,
-            3,
-            ResponseBody::EndTxn(end_txn_response::EndTxnResponse::default()),
-        );
+        let response = KafkaResponse::new(1009, 3, ResponseBody::EndTxn(EndTxnResponse::default()));
 
         let encoded = encode_response(response).unwrap();
         assert!(!encoded.is_empty());
@@ -407,9 +370,7 @@ mod tests {
         let response = KafkaResponse::new(
             1010,
             3,
-            ResponseBody::TxnOffsetCommit(
-                txn_offset_commit_response::TxnOffsetCommitResponse::default(),
-            ),
+            ResponseBody::TxnOffsetCommit(TxnOffsetCommitResponse::default()),
         );
 
         let encoded = encode_response(response).unwrap();
@@ -472,12 +433,12 @@ mod tests {
         let response1 = KafkaResponse::new(
             12345,
             3,
-            ResponseBody::ApiVersions(api_versions_response::ApiVersionsResponse::default()),
+            ResponseBody::ApiVersions(ApiVersionsResponse::default()),
         );
         let response2 = KafkaResponse::new(
             54321,
             3,
-            ResponseBody::ApiVersions(api_versions_response::ApiVersionsResponse::default()),
+            ResponseBody::ApiVersions(ApiVersionsResponse::default()),
         );
 
         let encoded1 = encode_response(response1).unwrap();
@@ -500,11 +461,11 @@ mod tests {
             let response = KafkaResponse::new(
                 100,
                 version,
-                ResponseBody::Produce(produce_response::ProduceResponse::default()),
+                ResponseBody::Produce(ProduceResponse::default()),
             );
 
             let encoded = encode_response(response).unwrap();
-            assert!(!encoded.is_empty(), "Failed to encode Produce v{}", version);
+            assert!(!encoded.is_empty(), "Failed to encode Produce v{version}");
         }
     }
 
@@ -512,14 +473,11 @@ mod tests {
     fn test_encode_fetch_multiple_versions() {
         // Note: kafka-protocol crate supports Fetch v4+
         for version in [4i16, 7, 11, 12] {
-            let response = KafkaResponse::new(
-                200,
-                version,
-                ResponseBody::Fetch(fetch_response::FetchResponse::default()),
-            );
+            let response =
+                KafkaResponse::new(200, version, ResponseBody::Fetch(FetchResponse::default()));
 
             let encoded = encode_response(response).unwrap();
-            assert!(!encoded.is_empty(), "Failed to encode Fetch v{}", version);
+            assert!(!encoded.is_empty(), "Failed to encode Fetch v{version}");
         }
     }
 
@@ -530,7 +488,7 @@ mod tests {
         let response = KafkaResponse::new(
             21,
             1,
-            ResponseBody::DeleteRecords(delete_records_response::DeleteRecordsResponse::default()),
+            ResponseBody::DeleteRecords(DeleteRecordsResponse::default()),
         );
         assert!(!encode_response(response).unwrap().is_empty());
     }
@@ -542,9 +500,7 @@ mod tests {
         let response = KafkaResponse::new(
             32,
             4,
-            ResponseBody::DescribeConfigs(
-                describe_configs_response::DescribeConfigsResponse::default(),
-            ),
+            ResponseBody::DescribeConfigs(DescribeConfigsResponse::default()),
         );
         assert!(!encode_response(response).unwrap().is_empty());
     }
@@ -554,9 +510,7 @@ mod tests {
         let response = KafkaResponse::new(
             44,
             1,
-            ResponseBody::IncrementalAlterConfigs(
-                incremental_alter_configs_response::IncrementalAlterConfigsResponse::default(),
-            ),
+            ResponseBody::IncrementalAlterConfigs(IncrementalAlterConfigsResponse::default()),
         );
         assert!(!encode_response(response).unwrap().is_empty());
     }

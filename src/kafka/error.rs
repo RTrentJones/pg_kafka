@@ -469,7 +469,7 @@ mod tests {
     #[test]
     fn test_error_display() {
         let err = KafkaError::InvalidRequestSize { size: 150_000_000 };
-        let msg = format!("{}", err);
+        let msg = format!("{err}");
         assert!(msg.contains("Invalid request size"));
         assert!(msg.contains("150000000"));
     }
@@ -477,7 +477,7 @@ mod tests {
     #[test]
     fn test_unsupported_api_key() {
         let err = KafkaError::UnsupportedApiKey { api_key: 99 };
-        let msg = format!("{}", err);
+        let msg = format!("{err}");
         assert!(msg.contains("Unsupported API key: 99"));
         assert_eq!(err.to_kafka_error_code(), ERROR_UNSUPPORTED_VERSION);
     }
@@ -488,7 +488,7 @@ mod tests {
             expected: 100,
             actual: 50,
         };
-        let msg = format!("{}", err);
+        let msg = format!("{err}");
         assert!(msg.contains("expected 100 bytes"));
         assert!(msg.contains("got 50"));
         assert_eq!(err.to_kafka_error_code(), ERROR_CORRUPT_MESSAGE);
@@ -498,7 +498,7 @@ mod tests {
     fn test_io_error_conversion() {
         let io_err = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "connection closed");
         let kafka_err: KafkaError = io_err.into();
-        let msg = format!("{}", kafka_err);
+        let msg = format!("{kafka_err}");
         assert!(msg.contains("IO error"));
         assert!(msg.contains("connection closed"));
         assert_eq!(kafka_err.to_kafka_error_code(), ERROR_UNKNOWN_SERVER_ERROR);
@@ -508,7 +508,7 @@ mod tests {
     #[test]
     fn test_encoding_error() {
         let err = KafkaError::encoding("Invalid UTF-8 sequence");
-        let msg = format!("{}", err);
+        let msg = format!("{err}");
         assert!(msg.contains("Encoding error"));
         assert!(msg.contains("Invalid UTF-8"));
     }
@@ -575,7 +575,7 @@ mod tests {
         // InvalidTxnState
         let err = KafkaError::invalid_txn_state("my-txn-id", "Empty", "EndTxn");
         assert_eq!(err.to_kafka_error_code(), ERROR_INVALID_TXN_STATE);
-        let msg = format!("{}", err);
+        let msg = format!("{err}");
         assert!(msg.contains("my-txn-id"));
         assert!(msg.contains("Empty"));
         assert!(msg.contains("EndTxn"));
@@ -587,7 +587,7 @@ mod tests {
         // TransactionTimedOut → PRODUCER_FENCED (Kafka has no TRANSACTION_TIMED_OUT code; BUG-1)
         let err = KafkaError::transaction_timed_out("my-txn-id", 60000);
         assert_eq!(err.to_kafka_error_code(), ERROR_PRODUCER_FENCED);
-        let msg = format!("{}", err);
+        let msg = format!("{err}");
         assert!(msg.contains("my-txn-id"));
         assert!(msg.contains("60000"));
     }
@@ -689,7 +689,7 @@ mod tests {
         ];
 
         for err in errors {
-            let display = format!("{}", err);
+            let display = format!("{err}");
             assert!(!display.is_empty(), "Error should have display text");
         }
     }
@@ -801,8 +801,7 @@ mod tests {
         for err in client_errors {
             assert!(
                 !err.is_server_error(),
-                "Error {:?} should not be a server error",
-                err
+                "Error {err:?} should not be a server error"
             );
         }
     }
@@ -823,8 +822,7 @@ mod tests {
         for err in server_errors {
             assert!(
                 err.is_server_error(),
-                "Error {:?} should be a server error",
-                err
+                "Error {err:?} should be a server error"
             );
         }
     }
@@ -834,7 +832,7 @@ mod tests {
         // DuplicateSequence
         let err = KafkaError::duplicate_sequence(100, 0, 5, 5);
         assert_eq!(err.to_kafka_error_code(), ERROR_DUPLICATE_SEQUENCE_NUMBER);
-        let msg = format!("{}", err);
+        let msg = format!("{err}");
         assert!(msg.contains("100")); // producer_id
         assert!(msg.contains("Duplicate"));
 
@@ -844,21 +842,21 @@ mod tests {
             err.to_kafka_error_code(),
             ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER
         );
-        let msg = format!("{}", err);
+        let msg = format!("{err}");
         assert!(msg.contains("Out of order"));
         assert!(msg.contains("expected 5"));
 
         // ProducerFenced
         let err = KafkaError::producer_fenced(100, 1, 2);
         assert_eq!(err.to_kafka_error_code(), ERROR_PRODUCER_FENCED);
-        let msg = format!("{}", err);
+        let msg = format!("{err}");
         assert!(msg.contains("fenced"));
         assert!(msg.contains("epoch"));
 
         // UnknownProducerId
         let err = KafkaError::unknown_producer_id(999);
         assert_eq!(err.to_kafka_error_code(), ERROR_UNKNOWN_PRODUCER_ID);
-        let msg = format!("{}", err);
+        let msg = format!("{err}");
         assert!(msg.contains("999"));
     }
 
@@ -867,13 +865,13 @@ mod tests {
         // corrupt_message
         let err = KafkaError::corrupt_message("invalid data");
         assert!(matches!(err, KafkaError::CorruptMessage { .. }));
-        assert!(format!("{}", err).contains("invalid data"));
+        assert!(format!("{err}").contains("invalid data"));
 
         // unknown_partition
         let err = KafkaError::unknown_partition("my-topic", 5);
         assert!(matches!(err, KafkaError::UnknownPartition { .. }));
-        assert!(format!("{}", err).contains("my-topic"));
-        assert!(format!("{}", err).contains("5"));
+        assert!(format!("{err}").contains("my-topic"));
+        assert!(format!("{err}").contains('5'));
 
         // database
         let err = KafkaError::database("query failed");
@@ -924,7 +922,7 @@ mod tests {
         let err = KafkaError::UnknownTopic {
             topic: "test".to_string(),
         };
-        let debug = format!("{:?}", err);
+        let debug = format!("{err:?}");
         assert!(debug.contains("UnknownTopic"));
         assert!(debug.contains("test"));
     }
