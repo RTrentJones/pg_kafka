@@ -412,7 +412,7 @@ pub type Result<T> = std::result::Result<T, KafkaError>;
 impl From<pgrx::spi::SpiError> for KafkaError {
     fn from(err: pgrx::spi::SpiError) -> Self {
         KafkaError::Database {
-            message: format!("SPI error: {}", err),
+            message: format!("SPI error: {err}"),
         }
     }
 }
@@ -422,19 +422,19 @@ impl From<pgrx::spi::SpiError> for KafkaError {
 
 impl KafkaError {
     /// Create from legacy InvalidRequestSize(i32) pattern
-    #[allow(non_snake_case)]
+    #[expect(non_snake_case)]
     pub fn InvalidRequestSize(size: i32) -> Self {
         KafkaError::InvalidRequestSize { size }
     }
 
     /// Create from legacy UnsupportedApiKey(i16) pattern
-    #[allow(non_snake_case)]
+    #[expect(non_snake_case)]
     pub fn UnsupportedApiKey(api_key: i16) -> Self {
         KafkaError::UnsupportedApiKey { api_key }
     }
 
     /// Create from legacy Encoding(String) pattern
-    #[allow(non_snake_case)]
+    #[expect(non_snake_case)]
     pub fn Encoding(message: String) -> Self {
         KafkaError::Encoding { message }
     }
@@ -444,19 +444,19 @@ impl KafkaError {
     // `KafkaError::InvalidConfig { key, message }` with the actual key instead.
 
     /// Create from legacy SchemaNotFound(String) pattern
-    #[allow(non_snake_case)]
+    #[expect(non_snake_case)]
     pub fn SchemaNotFound(message: String) -> Self {
         KafkaError::SchemaNotReady { message }
     }
 
     /// Create from legacy TopicNotFound(String) pattern
-    #[allow(non_snake_case)]
+    #[expect(non_snake_case)]
     pub fn TopicNotFound(topic: String) -> Self {
         KafkaError::UnknownTopic { topic }
     }
 
     /// Create from legacy CoordinatorError(i16, String) pattern
-    #[allow(non_snake_case)]
+    #[expect(non_snake_case)]
     pub fn CoordinatorError(code: i16, message: String) -> Self {
         KafkaError::Protocol { code, message }
     }

@@ -10,7 +10,7 @@ use kafka_protocol::messages::metadata_response::{
 use kafka_protocol::messages::produce_response::ProduceResponse;
 use kafka_protocol::messages::{BrokerId, TopicName};
 
-use super::constants::*;
+use super::constants::ERROR_NONE;
 
 /// Build an ApiVersionsResponse advertising every registered API (`crate::kafka::api::APIS`)
 /// with its supported version range. The same ranges are enforced on decode (CONF-6), so
@@ -109,14 +109,14 @@ use kafka_protocol::messages::sync_group_response::SyncGroupResponse;
 pub fn build_produce_partition_error_response(
     topic_data: &[crate::kafka::messages::TopicProduceData],
     error_code: i16,
-) -> kafka_protocol::messages::produce_response::ProduceResponse {
+) -> ProduceResponse {
     use kafka_protocol::messages::produce_response::{
         PartitionProduceResponse, TopicProduceResponse,
     };
     let mut response = build_produce_response();
     for topic in topic_data {
         let mut t = TopicProduceResponse::default();
-        t.name = kafka_protocol::messages::TopicName(topic.name.clone().into());
+        t.name = TopicName(topic.name.clone().into());
         for p in &topic.partitions {
             let mut pr = PartitionProduceResponse::default();
             pr.index = p.partition_index;
@@ -201,6 +201,7 @@ pub fn build_init_producer_id_error_response(error_code: i16) -> InitProducerIdR
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kafka::constants::*;
 
     // ========== API Versions Response Tests ==========
 

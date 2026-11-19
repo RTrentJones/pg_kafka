@@ -12,7 +12,7 @@ use kafka_protocol::protocol::decode_request_header_from_buffer;
 use tracing::{debug, warn};
 
 use super::super::api::{self, Decoded, ResponseBody};
-use super::super::constants::*;
+use super::super::constants::ERROR_UNSUPPORTED_VERSION;
 use super::super::error::{KafkaError, Result};
 use super::super::messages::{KafkaRequest, KafkaResponse};
 

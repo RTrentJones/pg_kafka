@@ -161,7 +161,7 @@ pub fn parse_record_batch(batch_bytes: &bytes::Bytes) -> Result<Vec<Record>> {
                     .into_iter()
                     .map(|(k, v)| RecordHeader {
                         key: k.to_string(),
-                        value: v.map(|b: bytes::Bytes| b.to_vec()).unwrap_or_default(),
+                        value: v.map_or_default(|b: bytes::Bytes| b.to_vec()),
                     })
                     .collect();
 
@@ -198,7 +198,7 @@ pub fn parse_record_batch(batch_bytes: &bytes::Bytes) -> Result<Vec<Record>> {
 fn crc32_ieee(data: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
     for &byte in data {
-        crc ^= byte as u32;
+        crc ^= u32::from(byte);
         for _ in 0..8 {
             crc = if crc & 1 != 0 {
                 (crc >> 1) ^ 0xEDB8_8320
@@ -313,8 +313,7 @@ fn parse_message_set_legacy(
 
     if records.is_empty() {
         Err(KafkaError::Encoding(format!(
-            "Failed to parse as both RecordBatch and MessageSet: {}",
-            original_error
+            "Failed to parse as both RecordBatch and MessageSet: {original_error}"
         )))
     } else {
         debug!(

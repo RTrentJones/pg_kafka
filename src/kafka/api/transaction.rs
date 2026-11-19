@@ -172,7 +172,7 @@ impl KafkaApi for AddPartitionsToTxnApi {
         let topics = |topics: &[kafka_protocol::messages::add_partitions_to_txn_request::AddPartitionsToTxnTopic]| {
             topics
                 .iter()
-                .map(|t| (t.name.to_string(), t.partitions.to_vec()))
+                .map(|t| (t.name.to_string(), t.partitions.clone()))
                 .collect::<TopicPartitions>()
         };
         if header.api_version >= 4 {
@@ -440,7 +440,7 @@ impl KafkaApi for TxnOffsetCommitApi {
                                 (
                                     p.partition_index,
                                     p.committed_offset,
-                                    p.committed_metadata.as_ref().map(|s| s.to_string()),
+                                    p.committed_metadata.as_ref().map(ToString::to_string),
                                 )
                             })
                             .collect(),

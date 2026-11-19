@@ -35,7 +35,7 @@ pub enum RequestOutcome {
 
 /// A closure that returns nothing (maintenance work) keeps its writes.
 impl From<()> for RequestOutcome {
-    fn from(_: ()) -> Self {
+    fn from((): ()) -> Self {
         RequestOutcome::Commit
     }
 }

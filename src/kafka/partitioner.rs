@@ -42,19 +42,16 @@ pub fn compute_partition(key: Option<&[u8]>, partition_count: i32, explicit_part
         return 0;
     }
 
-    match key {
-        Some(k) => {
-            // Hash-based routing using Kafka-compatible murmur2
-            let hash = murmur2(k, KAFKA_SEED);
-            // Mask sign bit (& 0x7fffffff) then modulo
-            // This matches Kafka's Utils.toPositive(Utils.murmur2(key)) % numPartitions
-            ((hash & 0x7fffffff) as i32) % partition_count
-        }
-        None => {
-            // Random partition for null keys
-            let mut rng = rand::thread_rng();
-            rng.gen_range(0..partition_count)
-        }
+    if let Some(k) = key {
+        // Hash-based routing using Kafka-compatible murmur2
+        let hash = murmur2(k, KAFKA_SEED);
+        // Mask sign bit (& 0x7fffffff) then modulo
+        // This matches Kafka's Utils.toPositive(Utils.murmur2(key)) % numPartitions
+        ((hash & 0x7fffffff) as i32) % partition_count
+    } else {
+        // Random partition for null keys
+        let mut rng = rand::thread_rng();
+        rng.gen_range(0..partition_count)
     }
 }
 

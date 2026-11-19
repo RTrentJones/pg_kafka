@@ -455,7 +455,7 @@ pub fn api_info(api_key: i16) -> Option<&'static ApiInfo> {
 
 /// Display name of `api_key` (`"Unknown"` for an API pg_kafka does not serve).
 pub fn api_name(api_key: i16) -> &'static str {
-    api_info(api_key).map(|info| info.name).unwrap_or("Unknown")
+    api_info(api_key).map_or("Unknown", |info| info.name)
 }
 
 /// The registry: one line per API, `Variant => ApiType`. It generates [`RequestBody`],

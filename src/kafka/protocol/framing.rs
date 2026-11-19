@@ -185,8 +185,7 @@ impl Decoder for FrameCodec {
         if len > MAX_REQUEST_SIZE as usize {
             self.release();
             return Err(std::io::Error::other(format!(
-                "frame of {} bytes exceeds the maximum request size of {} bytes",
-                len, MAX_REQUEST_SIZE
+                "frame of {len} bytes exceeds the maximum request size of {MAX_REQUEST_SIZE} bytes"
             )));
         }
         let limit = self.limit.load(Ordering::Relaxed);
