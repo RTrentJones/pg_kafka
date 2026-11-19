@@ -58,7 +58,7 @@ impl Dispatcher {
             (_, request) => request,
         };
         // Heartbeat goes to the liveness lane, everything else to the main lane, so
-        // group liveness never queues behind heavy work (DR-12).
+        // group liveness never queues behind heavy work.
         let lane = self.request_lanes.route(&request);
         send_with_backpressure(lane, request).await
     }
@@ -90,7 +90,7 @@ impl Dispatcher {
     }
 }
 
-/// Hand a request to the DB thread without blocking the async runtime (SEC-4).
+/// Hand a request to the DB thread without blocking the async runtime.
 ///
 /// The request channel is a bounded crossbeam channel; a plain `Sender::send` *blocks the calling
 /// thread* when the channel is full (DB thread behind), which on the tokio runtime parks a whole

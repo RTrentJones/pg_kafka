@@ -179,7 +179,7 @@ pub struct SecuritySettings {
     /// by it (mutual TLS).
     pub ssl_ca_file: String,
     pub sasl_mechanisms: Vec<SaslMechanism>,
-    /// wave3 net: connection limits, idle timeout and request read deadline.
+    /// Connection limits, idle timeout and request read deadline.
     pub limits: crate::kafka::conn_limits::NetworkLimits,
 }
 
@@ -192,7 +192,7 @@ pub struct RawSecuritySettings {
     pub ssl_key_file: String,
     pub ssl_ca_file: String,
     pub sasl_enabled_mechanisms: String,
-    /// wave3 net: `pg_kafka.max_connections`, `pg_kafka.max_connections_per_ip`,
+    /// `pg_kafka.max_connections`, `pg_kafka.max_connections_per_ip`,
     /// `pg_kafka.connections_max_idle_ms`, `pg_kafka.request_read_timeout_ms`.
     pub limits: crate::kafka::conn_limits::NetworkLimits,
 }
@@ -311,7 +311,7 @@ static SSL_CA_FILE: GucSetting<Option<CString>> = GucSetting::<Option<CString>>:
 static SASL_ENABLED_MECHANISMS: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(Some(c"PLAIN,SCRAM-SHA-256,SCRAM-SHA-512"));
 
-// wave3 net: connection-limit GUCs.
+// Connection-limit GUCs.
 static MAX_CONNECTIONS: GucSetting<i32> =
     GucSetting::<i32>::new(crate::kafka::conn_limits::DEFAULT_MAX_CONNECTIONS);
 static MAX_CONNECTIONS_PER_IP: GucSetting<i32> =
@@ -373,7 +373,7 @@ pub fn register_gucs() {
         &SASL_ENABLED_MECHANISMS,
     );
 
-    // wave3 net: connection limits (read when the worker starts, like the listener GUCs).
+    // Connection limits (read when the worker starts, like the listener GUCs).
     let define_int = |name: &'static std::ffi::CStr,
                       short: &'static std::ffi::CStr,
                       long: &'static std::ffi::CStr,

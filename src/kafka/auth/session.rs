@@ -72,7 +72,7 @@ pub const ANONYMOUS_PRINCIPAL: &str = "User:ANONYMOUS";
 /// user exists.
 const AUTH_FAILED_MESSAGE: &str = "Authentication failed: invalid credentials";
 
-/// What a credential lookup found (wave3 net).
+/// What a credential lookup found.
 #[derive(Debug, Clone)]
 pub enum StoredCredential {
     /// The user's stored credential.
@@ -137,7 +137,7 @@ impl CredentialLookup for ChannelLookup {
                 reply,
             };
             let deadline = tokio::time::Instant::now() + LOOKUP_TIMEOUT;
-            // Non-blocking handoff, as for Kafka requests (SEC-4).
+            // Non-blocking handoff, as for Kafka requests (a blocking send would park a tokio worker).
             loop {
                 match tx.try_send(request) {
                     Ok(()) => break,
@@ -533,7 +533,7 @@ async fn check_password(creds: super::plain::PlainCredentials, stored: StoredCre
     let Ok(_permit) = PASSWORD_CHECKS.acquire().await else {
         return false;
     };
-    // wave3 net: an unknown user's fake credential imitates the stored credentials'
+    // An unknown user's fake credential imitates the stored credentials'
     // iteration count, so the PBKDF2 costs (and the response time) match a real user's
     // to within the spread of the stored iteration counts.
     tokio::task::spawn_blocking(move || match stored {

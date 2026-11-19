@@ -4,7 +4,7 @@
 //! `session::CredentialRequest` over the worker's credential channel; the DB thread
 //! answers it with [`lookup_credential`]. `pgkafka_worker` holds only SELECT on the table.
 //!
-//! wave3 net: for a user that does not exist the DB thread builds the fake credential
+//! For a user that does not exist the DB thread builds the fake credential
 //! itself, from the durable secret in `kafka.sasl_server_secret` and the iteration count
 //! and salt length most common among the stored credentials of the mechanism (cached
 //! for [`FAKE_PARAMS_TTL`], so an unknown user normally costs the same one SELECT as a
@@ -119,7 +119,7 @@ fn fake_params(mechanism: ScramMechanism) -> FakeCredentialParams {
 fn read_fake_params(mechanism: ScramMechanism) -> Result<FakeCredentialParams, String> {
     Spi::connect(|client| {
         let mut params = FakeCredentialParams::process_default();
-        // The secret table is new in 0.1.0 (wave 3); a schema without it keeps the
+        // The secret table is part of the 0.1.0 schema; a 0.0.0 schema without it keeps the
         // per-process secret instead of failing the lookup.
         let has_secret = client
             .select(

@@ -103,7 +103,7 @@ pub(super) async fn handle_connection<S>(
     debug!("New connection established, starting pipelined handle loop");
 
     // The frame codec charges the global budget only for bytes actually buffered of a
-    // large incomplete frame (RV-9) and records when that frame started arriving, for
+    // large incomplete frame and records when that frame started arriving, for
     // the per-frame read deadline. Before SASL authentication frames are small.
     let frame_limit = Arc::new(AtomicUsize::new(
         if auth.sasl.is_authenticated() || !auth.security.protocol.uses_sasl() {

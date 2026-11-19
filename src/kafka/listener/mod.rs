@@ -6,14 +6,14 @@
 //! background worker over bounded crossbeam channels; responses come back on per-request
 //! tokio channels.
 //!
-//! * [`thread`]: logging and the signal mask of the network thread.
-//! * [`accept`]: the accept loops and connection admission (connection caps).
-//! * [`tls`]: the TLS handshake and the client-certificate principal.
-//! * [`connection`]: one connection's read loop and how it closes.
-//! * [`writer`]: the task that writes a connection's responses in request order.
-//! * [`sasl`]: per-connection authentication state and the SASL frames.
-//! * [`dispatch`]: handing requests to the DB thread.
-//! * [`long_poll`]: Fetch long polling.
+//! * `thread`: logging and the signal mask of the network thread.
+//! * `accept`: the accept loops and connection admission (connection caps).
+//! * `tls`: the TLS handshake and the client-certificate principal.
+//! * `connection`: one connection's read loop and how it closes.
+//! * `writer`: the task that writes a connection's responses in request order.
+//! * `sasl`: per-connection authentication state and the SASL frames.
+//! * `dispatch`: handing requests to the DB thread.
+//! * `long_poll`: Fetch long polling.
 
 mod accept;
 mod connection;

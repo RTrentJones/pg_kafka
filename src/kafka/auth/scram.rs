@@ -304,7 +304,7 @@ fn fake_credential_secret() -> &'static [u8] {
     SECRET.get_or_init(|| random_bytes(32))
 }
 
-/// What the fake credential of an unknown user looks like on the wire (wave3 net): the
+/// What the fake credential of an unknown user looks like on the wire: the
 /// salt length and iteration count are those most common among the stored credentials
 /// of the mechanism, and the salt is keyed by a durable secret, so it is stable for a
 /// username across worker restarts.
@@ -537,7 +537,7 @@ impl ScramServerState {
         Self::start(mechanism, client_first, credential, fake, server_nonce)
     }
 
-    /// wave3 net: start an exchange with the stored credential, or (unknown user) with
+    /// Start an exchange with the stored credential, or (unknown user) with
     /// `fake`, a fake credential built on the DB thread ([`fake_credential_with`]).
     pub fn start(
         mechanism: ScramMechanism,

@@ -89,7 +89,7 @@ pub(super) async fn accept_loop(
     ctx: AcceptContext,
 ) {
     // This listener's own cap, so a flood on another listener cannot lock its clients
-    // out (SEC-3: bounds fd and memory use).
+    // out; together they bound fd and memory use.
     let limiter = Arc::new(Semaphore::new(security.limits.max_connections));
     loop {
         let (socket, addr) = match listener.accept().await {
