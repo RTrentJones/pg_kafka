@@ -185,12 +185,14 @@ impl IpTracker {
     }
 
     /// Live connections of `ip`.
-    pub fn connections(&self, ip: IpAddr) -> usize {
+    #[cfg(test)]
+    fn connections(&self, ip: IpAddr) -> usize {
         self.lock().get(&ip).map_or(0, |e| e.connections)
     }
 
-    /// Entries in the table (tests).
-    pub fn tracked(&self) -> usize {
+    /// Entries in the table.
+    #[cfg(test)]
+    fn tracked(&self) -> usize {
         self.lock().len()
     }
 

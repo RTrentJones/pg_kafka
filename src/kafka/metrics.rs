@@ -45,7 +45,7 @@ pub const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 /// APIs and their names come from the API registry (`crate::kafka::api::APIS`); the first
 /// flush after a worker start writes a row for each, so stale values from a previous worker
 /// are reset.
-pub fn api_name(api_key: i16) -> &'static str {
+fn api_name(api_key: i16) -> &'static str {
     crate::kafka::api::api_name(api_key)
 }
 
@@ -200,7 +200,7 @@ impl RequestTimer<'static> {
 
 impl<'a> RequestTimer<'a> {
     /// Start timing against a specific registry (tests).
-    pub fn start_in(metrics: &'a BrokerMetrics, api_key: i16) -> Self {
+    fn start_in(metrics: &'a BrokerMetrics, api_key: i16) -> Self {
         RequestTimer {
             metrics,
             api_key,
@@ -232,7 +232,7 @@ impl Drop for RequestTimer<'_> {
 
 /// Whether a response carries a non-zero error code anywhere (top level, or on any topic,
 /// partition, group, member or resource entry); see `KafkaApi::response_has_error`.
-pub fn response_has_error(response: &KafkaResponse) -> bool {
+fn response_has_error(response: &KafkaResponse) -> bool {
     response.body.has_error()
 }
 
@@ -383,7 +383,7 @@ impl Default for MetricsFlusher<'static> {
 }
 
 impl<'a> MetricsFlusher<'a> {
-    pub fn with_registry(metrics: &'a BrokerMetrics, interval: Duration) -> Self {
+    fn with_registry(metrics: &'a BrokerMetrics, interval: Duration) -> Self {
         MetricsFlusher {
             metrics,
             interval,
@@ -404,7 +404,7 @@ impl<'a> MetricsFlusher<'a> {
     }
 
     /// [`poll`](Self::poll) with an explicit clock (tests).
-    pub fn poll_at(
+    fn poll_at(
         &mut self,
         now: Instant,
         request_queue_depth: usize,
