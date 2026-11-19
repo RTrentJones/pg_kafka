@@ -35,9 +35,10 @@ pub fn handle_fetch(
 /// Per-message size estimate used for the response-level `max_bytes` budget. Matches
 /// the storage layer's own byte accounting (key + value + 64 bytes of overhead).
 pub(crate) fn message_size_estimate(msg: &FetchedMessage) -> i64 {
-    msg.key.as_ref().map_or(0, |k| k.len() as i64)
-        + msg.value.as_ref().map_or(0, |v| v.len() as i64)
-        + 64
+    let len = |b: Option<&Vec<u8>>| b.map_or(0, |b| i64::try_from(b.len()).unwrap_or(i64::MAX));
+    len(msg.key.as_ref())
+        .saturating_add(len(msg.value.as_ref()))
+        .saturating_add(64)
 }
 
 /// The byte limit to pass to storage for one partition, or `None` to return no
@@ -54,7 +55,9 @@ pub(crate) fn partition_fetch_limit(
     if returned_any && remaining <= 0 {
         return None;
     }
-    Some(i64::from(partition_max_bytes).min(remaining.max(0)) as i32)
+    let limit = i64::from(partition_max_bytes).min(remaining.max(0));
+    // At most partition_max_bytes, so the conversion cannot fail.
+    Some(i32::try_from(limit).unwrap_or(partition_max_bytes))
 }
 
 /// Drop trailing messages that overflow the remaining response budget. The first
@@ -123,7 +126,9 @@ pub(crate) fn encode_record_batches(
         // The encoder keeps records in one batch while `offset - sequence` stays the
         // same: -1 + (offset - group start) gives every group its own constant and a
         // base sequence of -1 (NO_SEQUENCE).
-        let sequence = (msg.partition_offset - group_base) as i32 - 1;
+        let sequence = i32::try_from(msg.partition_offset - group_base).map_err(|_| {
+            format!("batch at offset {group_base} spans more than i32::MAX offsets")
+        })? - 1;
         let mut record = Record {
             transactional: msg.producer_id.is_some(),
             control: false,
@@ -167,8 +172,12 @@ const BATCH_HEADER_LEN: usize = 61;
 /// delta `offset_delta`, timestamp delta 0.
 fn gap_marker_record(offset_delta: i32) -> bytes::Bytes {
     use bytes::BufMut;
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "each byte takes the low 7 bits of the zigzag value by design"
+    )]
     fn varint(out: &mut bytes::BytesMut, v: i64) {
-        let mut z = ((v << 1) ^ (v >> 63)) as u64;
+        let mut z = ((v << 1) ^ (v >> 63)).cast_unsigned();
         while z >= 0x80 {
             out.put_u8((z as u8) | 0x80);
             z >>= 7;
@@ -187,7 +196,10 @@ fn gap_marker_record(offset_delta: i32) -> bytes::Bytes {
     body.put_i32(0); // coordinator epoch
     varint(&mut body, 0); // header count
     let mut out = bytes::BytesMut::new();
-    varint(&mut out, body.len() as i64);
+    varint(
+        &mut out,
+        i64::try_from(body.len()).expect("a control record is a few bytes"),
+    );
     out.put(body);
     out.freeze()
 }
@@ -205,7 +217,7 @@ pub(crate) fn gap_batch(from: i64, to: i64) -> Option<bytes::Bytes> {
     if to <= from {
         return None;
     }
-    let last_offset_delta = (to - from - 1).min(i64::from(i32::MAX)) as i32;
+    let last_offset_delta = i32::try_from(to - from - 1).unwrap_or(i32::MAX);
     let record = gap_marker_record(last_offset_delta);
     // Everything after the CRC field: what the CRC covers.
     let mut body = bytes::BytesMut::with_capacity(BATCH_HEADER_LEN - 21 + record.len());
@@ -220,7 +232,8 @@ pub(crate) fn gap_batch(from: i64, to: i64) -> Option<bytes::Bytes> {
     body.put(record);
     let mut out = bytes::BytesMut::with_capacity(BATCH_HEADER_LEN + body.len());
     out.put_i64(from); // base offset
-    out.put_i32((4 + 1 + 4 + body.len()) as i32); // batch length (after this field)
+                       // Batch length (after this field): a fixed header and one control record.
+    out.put_i32(i32::try_from(4 + 1 + 4 + body.len()).expect("a gap batch is under 100 bytes"));
     out.put_i32(0); // partition leader epoch
     out.put_i8(2); // magic
     out.put_u32(crc32c(&body));
@@ -230,6 +243,10 @@ pub(crate) fn gap_batch(from: i64, to: i64) -> Option<bytes::Bytes> {
 
 /// CRC-32C (Castagnoli), the RecordBatch v2 checksum.
 fn crc32c(data: &[u8]) -> u32 {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "i < 256; TryFrom is not const"
+    )]
     const fn table() -> [u32; 256] {
         let mut t = [0u32; 256];
         let mut i = 0;
@@ -969,7 +986,7 @@ mod storage_stream_tests {
         assert!(gap_batch(6, 5).is_none());
         let b = gap_batch(2, 5).unwrap();
         assert_eq!(i64::from_be_bytes(b[0..8].try_into().unwrap()), 2); // base offset
-        let len = i32::from_be_bytes(b[8..12].try_into().unwrap()) as usize;
+        let len = usize::try_from(i32::from_be_bytes(b[8..12].try_into().unwrap())).unwrap();
         assert_eq!(len + 12, b.len());
         assert_eq!(b[16], 2); // magic
         let crc = u32::from_be_bytes(b[17..21].try_into().unwrap());
