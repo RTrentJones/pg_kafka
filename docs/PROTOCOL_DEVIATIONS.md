@@ -97,6 +97,11 @@ pg_kafka.compression_type = 'gzip'
   (OUT_OF_ORDER_SEQUENCE_NUMBER otherwise). Kafka accepts any first sequence from an
   unknown producer (its producer state can expire with the log); pg_kafka keeps producer
   state for 7 idle days and refuses a first batch whose predecessors never arrived.
+- **Deviation:** a Produce with a producer id that has no `kafka.producer_ids` row (never
+  issued by InitProducerId, or removed by the retention sweep after 7 idle days) is
+  UNKNOWN_PRODUCER_ID (59). Kafka 3.7 creates the producer's state on the fly and accepts
+  it at sequence 0. Clients get their ids from InitProducerId, so only a producer idle long
+  enough for its state to be removed meets this.
 - Produce responses report `log_start_offset = -1` and `log_append_time_ms = -1`
 
 **Client Impact:**
