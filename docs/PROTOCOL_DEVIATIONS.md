@@ -502,6 +502,11 @@ reference: [AUTHENTICATION.md](AUTHENTICATION.md).
 |--------|---------|--------|-------|
 | kcat | 1.7.0+ | ✅ Works | Producer and consumer tested |
 | rdkafka (Rust) | 0.36+ | ✅ Works | Full E2E test suite (`kafka_test/`) |
+| Apache Kafka Java clients and tools | 3.7.0 | ✅ Checked in CI | <!-- wave3 infra -->`interop/run-java-checks.sh`: verifiable producer/consumers through rebalances, consumer-groups, get-offsets, transactions (perf-test, TransactionalMessageCopier), SASL SCRAM/PLAIN, Kafka Streams; checks still failing are marked XFAIL with the defect |
+
+Every behavioural difference from Apache Kafka 3.7 that `interop/diff/run.py` (the differential
+harness: the same raw requests to pg_kafka and to Kafka, responses compared) observes is either
+documented in this file (the harness cites the section) or listed there as a known bug.
 
 ### Client Configuration
 
