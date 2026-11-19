@@ -100,7 +100,7 @@ pub struct TopicShadowConfig {
     pub external_topic_name: Option<String>,
     /// When the produce response goes out (see [`SyncMode`]).
     pub sync_mode: SyncMode,
-    /// Which copy consumers read (see [`WriteMode`]).
+    /// Which copy consumers read (see `WriteMode`).
     pub write_mode: WriteMode,
 }
 
@@ -185,8 +185,8 @@ impl ShadowConfig {
 
     /// Validate and normalize the configuration.
     ///
-    /// - `security_protocol` must be one of [`VALID_SECURITY_PROTOCOLS`] and
-    ///   `sasl_mechanism` (for a SASL protocol) one of [`VALID_SASL_MECHANISMS`],
+    /// - `security_protocol` must be one of `VALID_SECURITY_PROTOCOLS` and
+    ///   `sasl_mechanism` (for a SASL protocol) one of `VALID_SASL_MECHANISMS`,
     ///   case-insensitively; both are normalized to upper case;
     /// - every `bootstrap_servers` entry must be `host:port` (when enabled);
     /// - `batch_size` and `linger_ms` are clamped into their ranges.

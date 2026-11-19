@@ -13,13 +13,13 @@
 //!
 //! - **Per-topic configuration** (`kafka.shadow_config`): `mode`
 //!   (`local_only` | `shadow`), `forward_percentage` (0-100, a deterministic
-//!   dial, see [`routing`]), `sync_mode` (`async` | `sync`: whether the produce
+//!   dial, see `routing`), `sync_mode` (`async` | `sync`: whether the produce
 //!   response waits for the external ack) and `write_mode` (`dual_write` |
 //!   `external_only`: whether local reads are suppressed).
 //! - **Durable outbox**: a forwarded record gets a `kafka.shadow_tracking` row
 //!   in the produce's own transaction; delivery is at-least-once and retried
 //!   up to `pg_kafka.shadow_max_retries`, then dead-lettered.
-//! - **Primary only**: a standby never forwards ([`primary`]).
+//! - **Primary only**: a standby never forwards (`primary`).
 //! - **Global settings**: the `pg_kafka.shadow_*` GUCs (bootstrap servers,
 //!   security protocol, SASL, batching, retries), read at runtime so a reload
 //!   takes effect without a restart.
@@ -35,9 +35,9 @@
 //!                                                         on delivery or timeout
 //! ```
 //!
-//! The DB-thread half is [`store`] (with its SQL in [`outbox`]); the
-//! network-thread half is [`forwarder_task`] (with the rdkafka producer in
-//! [`producer`]). The types below are the messages between them.
+//! The DB-thread half is `store` (with its SQL in `outbox`); the
+//! network-thread half is `forwarder_task` (with the rdkafka producer in
+//! `producer`). The types below are the messages between them.
 
 pub(crate) mod config;
 pub(crate) mod error;

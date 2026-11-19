@@ -14,7 +14,7 @@ use super::*;
 use crate::kafka::shadow::outbox::fake::InMemoryShadowDb;
 use crate::testing::mocks::MockKafkaStore;
 
-fn external_only_record(topic_id: i32) -> PendingForwardRecord {
+fn buffered_record(topic_id: i32) -> PendingForwardRecord {
     PendingForwardRecord {
         row: RowKey::new(topic_id, 0, -1),
         key: None,
@@ -22,9 +22,8 @@ fn external_only_record(topic_id: i32) -> PendingForwardRecord {
 }
 
 #[test]
-fn test_abort_finalizes_inner_txn_with_only_external_only_records() {
-    // Regression: aborting a transaction with no locally-written records
-    // used to skip the inner abort, leaving the transaction Ongoing
+fn test_abort_finalizes_inner_txn_whatever_was_buffered() {
+    // The inner abort always runs, or the transaction stays Ongoing.
     let mut mock = MockKafkaStore::new();
     mock.expect_abort_transaction()
         .times(1)
@@ -37,7 +36,7 @@ fn test_abort_finalizes_inner_txn_with_only_external_only_records() {
             .entry((100, 0))
             .or_default()
             .records
-            .push(external_only_record(1));
+            .push(buffered_record(1));
     }
 
     store.abort_transaction("txn-1", 100, 0).unwrap();
@@ -45,10 +44,8 @@ fn test_abort_finalizes_inner_txn_with_only_external_only_records() {
 
 #[test]
 fn test_commit_finalizes_inner_txn() {
-    // The inner commit must run unconditionally (state row → committed,
-    // pending offsets applied) even though forwarding is now deferred to the
-    // durable outbox (RA-1/RA-2) rather than done inline. In test builds the
-    // outbox enqueue is a no-op stub, so this asserts the inner commit fires.
+    // The inner commit runs unconditionally (state row → committed, pending
+    // offsets applied); forwarding happens later, through the outbox.
     let mut mock = MockKafkaStore::new();
     mock.expect_commit_transaction()
         .times(1)
@@ -61,7 +58,7 @@ fn test_commit_finalizes_inner_txn() {
             .entry((100, 0))
             .or_default()
             .records
-            .push(external_only_record(1));
+            .push(buffered_record(1));
     }
 
     store.commit_transaction("txn-1", 100, 0).unwrap();
@@ -107,7 +104,7 @@ fn test_unchanged_roles_are_delegated_to_the_inner_store() {
 
 #[test]
 fn test_abort_timed_out_evicts_stale_pending_buffers() {
-    // SH-4: the storage sweeper force-aborts timed-out transactions without
+    // The storage sweeper force-aborts timed-out transactions without
     // routing through abort_transaction(), so a buffer for an abandoned
     // producer must be evicted on the same timeout or it leaks forever.
     let mut mock = MockKafkaStore::new();
@@ -119,16 +116,13 @@ fn test_abort_timed_out_evicts_stale_pending_buffers() {
     {
         let mut pending = store.pending_txn_messages.write().unwrap();
         // Stale: first_buffered older than the timeout we will sweep with.
-        let mut stale = PendingTxnBuffer::from(vec![external_only_record(1)]);
+        let mut stale = PendingTxnBuffer::from(vec![buffered_record(1)]);
         stale.first_buffered = Instant::now()
             .checked_sub(Duration::from_secs(120))
             .unwrap_or_else(Instant::now);
         pending.insert((1, 0), stale);
         // Fresh: just buffered, well within the timeout.
-        pending.insert(
-            (2, 0),
-            PendingTxnBuffer::from(vec![external_only_record(1)]),
-        );
+        pending.insert((2, 0), PendingTxnBuffer::from(vec![buffered_record(1)]));
     }
 
     store
@@ -148,7 +142,7 @@ fn test_abort_timed_out_evicts_stale_pending_buffers() {
 
 #[test]
 fn test_reinit_drops_stale_epoch_pending_buffer() {
-    // RV-2 residual: a producer re-init bumps the epoch; the old-epoch in-RAM
+    // A producer re-init bumps the epoch; the old-epoch in-RAM
     // forward buffer must be dropped on re-init (commit/abort look it up by the
     // NEW epoch and would otherwise never free it). A different producer's
     // buffer must be left untouched.
@@ -161,15 +155,9 @@ fn test_reinit_drops_stale_epoch_pending_buffer() {
     {
         let mut pending = store.pending_txn_messages.write().unwrap();
         // Stale: producer 100 at the OLD epoch 0.
-        pending.insert(
-            (100, 0),
-            PendingTxnBuffer::from(vec![external_only_record(1)]),
-        );
+        pending.insert((100, 0), PendingTxnBuffer::from(vec![buffered_record(1)]));
         // Unrelated producer 200 — must be kept.
-        pending.insert(
-            (200, 0),
-            PendingTxnBuffer::from(vec![external_only_record(1)]),
-        );
+        pending.insert((200, 0), PendingTxnBuffer::from(vec![buffered_record(1)]));
     }
 
     let (pid, epoch) = store

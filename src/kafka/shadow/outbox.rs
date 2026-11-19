@@ -13,9 +13,8 @@
 //! to dispatch, how an ack finalizes a row, the sync wait, the config-cache
 //! swap). Every SQL statement and GUC read it needs goes through [`ShadowDb`]:
 //!
-//! - [`SpiShadowDb`] is the production implementation. Its statements are the
-//!   ones `ShadowStore` used to run inline, unchanged and in the same order.
-//! - `InMemoryShadowDb` (test builds only) models the `kafka.shadow_tracking`
+//! - [`SpiShadowDb`] is the production implementation (SPI and the real GUCs).
+//! - `InMemoryShadowDb` (test builds only, in [`fake`]) models the `kafka.shadow_tracking`
 //!   outbox, the `kafka.messages` rows it points at, and `kafka.shadow_metrics`
 //!   in memory, so the claim/ack/retry/dead-letter behaviour is unit-tested.
 
@@ -212,16 +211,16 @@ impl ShadowDb for SpiShadowDb {
         }
         let keys: KeyColumns = rows.iter().collect();
         Spi::connect_mut(|client| {
-            // B1: only enqueue an outbox pointer when the backing
-            // kafka.messages row actually exists. The live-produce enqueue
-            // runs in the same subtransaction as the message insert, so the
-            // row is always visible and this is a no-op there. On the txn
-            // commit path it drops orphan pointers left by a transactional
-            // produce that buffered offsets in RAM but whose message rows were
-            // rolled back (a panic mid-txn) — which would otherwise be
-            // never-claimed, never-cleaned rows. One statement per batch; the
-            // LATERAL + LIMIT 1 keeps the check an index probe per row (an EXISTS
-            // was planned as a hash join over every message).
+            // Only enqueue an outbox pointer when the backing kafka.messages
+            // row exists. The live-produce enqueue runs in the same
+            // subtransaction as the message insert, so the row is always
+            // visible there. On the txn commit path it drops orphan pointers
+            // left by a transactional produce that buffered offsets in RAM but
+            // whose message rows were rolled back (a panic mid-txn), which
+            // would otherwise be never-claimed, never-cleaned rows. One
+            // statement per batch; the LATERAL + LIMIT 1 keeps the check an
+            // index probe per row (an EXISTS is planned as a hash join over
+            // every message).
             client.update(
                 "INSERT INTO kafka.shadow_tracking (topic_id, partition_id, local_offset) \
                  SELECT r.t, r.p, r.o \
@@ -363,8 +362,8 @@ impl ShadowDb for SpiShadowDb {
                     -- An attempt that is still open here lost its ack (the worker
                     -- restarted, or the in-flight entry was evicted): count it as
                     -- one failure so a forward that never answers still reaches
-                    -- the dead-letter cap (RV-10). A fresh claim counts nothing;
-                    -- real failures are counted by their ack (wave 3).
+                    -- the dead-letter cap. A fresh claim counts nothing; real
+                    -- failures are counted by their ack.
                     UPDATE kafka.shadow_tracking st
                     SET forwarded_at = NOW(),
                         attempt_open = true,
@@ -459,9 +458,9 @@ impl ShadowDb for SpiShadowDb {
         }
         let keys: KeyColumns = rows.iter().map(|(k, _)| k).collect();
         let external_offsets: Vec<i64> = rows.iter().map(|&(_, x)| x).collect();
-        // SH-7: the metric is bumped in the SAME statement that flips the rows,
+        // The metric is bumped in the SAME statement that flips the rows,
         // guarded by `external_offset IS NULL`, so a duplicate ack updates
-        // nothing and counts nothing — exactly-once per row. One statement for
+        // nothing and counts nothing: exactly once per row. One statement for
         // the whole batch of acks.
         Spi::connect_mut(|client| {
             let table = client.update(

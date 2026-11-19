@@ -352,7 +352,7 @@ fn poll_claims_due_rows_in_order_with_payload_headers_and_timestamp() {
     assert!(!sent[1].restart);
     for off in [1, 2] {
         let row = h.store.db().row(RowKey::new(T, 0, off)).unwrap();
-        assert_eq!(row.retry_count, 0, "a claim is not a failure (wave 3)");
+        assert_eq!(row.retry_count, 0, "a claim is not a failure");
         assert!(row.attempt_open);
         assert_eq!(row.forwarded_at, Some(0));
     }
@@ -365,7 +365,7 @@ fn in_flight_rows_are_never_reclaimed_and_only_real_failures_count() {
     assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 2);
     sent_records(&h);
 
-    // Still in flight, however long: excluded from the claim (issue #93).
+    // Still in flight, however long: excluded from the claim.
     h.store.db().advance_ms(60_000);
     assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 0);
 
@@ -507,7 +507,7 @@ fn failing_forward_is_dead_lettered_and_external_primary_reads_fall_back() {
     assert_eq!(h.store.db().state().metrics[&(T, 0)].messages_failed, cap);
     assert!(h.store.topic_has_dead_letters(T));
 
-    // RV-6: the dead letter lifts read suppression (inner is now called) ...
+    // The dead letter lifts read suppression (inner is now called) ...
     h.store.fetch_records(T, 0, 0, 1024).unwrap();
     // ... unless strict mode keeps it.
     h.store.db().state().strict = true;

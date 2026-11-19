@@ -55,14 +55,14 @@ const PRODUCER_MESSAGE_TIMEOUT_MS: &str = "120000";
 /// extraction in `storage/mod.rs`). [`ShadowProducer::create_producer`] applies
 /// these to a `ClientConfig` and calls `.create()`.
 ///
-/// What each shadow GUC maps to (wave 3: every GUC does what its doc says):
+/// What each shadow GUC maps to:
 /// - `shadow_batch_size` (messages) → `batch.num.messages` (librdkafka's
-///   per-batch message cap; it used to be passed to `batch.size`, which is bytes);
+///   per-batch message cap; `batch.size` would be bytes);
 /// - `shadow_linger_ms` → `linger.ms`;
 /// - `shadow_retry_backoff_ms` → `retry.backoff.ms` (librdkafka's own retries
 ///   inside one delivery attempt; the outbox uses the same base for its re-attempt
 ///   backoff, see `ShadowStore`);
-/// - `shadow_max_retries` is NOT a librdkafka setting any more: it is the outbox's
+/// - `shadow_max_retries` is not a librdkafka setting: it is the outbox's
 ///   dead-letter cap (failed delivery attempts per record). Inside one attempt
 ///   librdkafka retries as often as `message.timeout.ms` allows (its default
 ///   `retries`), which is what idempotence wants.
@@ -112,7 +112,7 @@ pub(crate) fn build_producer_settings(config: &ShadowConfig) -> Vec<(&'static st
     // default (CRC32) would scatter keys differently.
     settings.push(("partitioner", "murmur2_random".to_string()));
 
-    // SH-12 + wave 3: idempotent, order-preserving producer. Many deliveries are
+    // An idempotent, order-preserving producer. Many deliveries are
     // in flight at once (the forwarder pipelines), so ordering rests on the
     // idempotent producer: per-partition sequence numbers, acks=all, at most 5
     // requests in flight, librdkafka's own retries. `enable.gapless.guarantee`
@@ -129,9 +129,9 @@ pub(crate) fn build_producer_settings(config: &ShadowConfig) -> Vec<(&'static st
     settings.push(("max.in.flight.requests.per.connection", max_in_flight));
     settings.push(("acks", "all".to_string()));
 
-    // NOTE: deprecated api.version.* settings are intentionally NOT set — they
-    // caused "Required feature not supported by broker" errors with modern Kafka,
-    // which negotiates the API version automatically.
+    // The deprecated api.version.* settings are deliberately not set: modern
+    // brokers negotiate the API version and answer them with "Required
+    // feature not supported by broker".
     let request_timeout = PRODUCER_REQUEST_TIMEOUT_MS.to_string();
     let message_timeout = PRODUCER_MESSAGE_TIMEOUT_MS.to_string();
     settings.push(("request.timeout.ms", request_timeout));
@@ -202,7 +202,7 @@ impl ShadowProducer {
     /// Hand one outbox record to librdkafka without waiting for its delivery
     /// (the forwarder keeps many deliveries in flight). The record keeps its key,
     /// value, headers and timestamp; `partition` is left to the partitioner (the
-    /// external cluster re-partitions by key, SH-15).
+    /// external cluster re-partitions by key).
     pub fn enqueue(&self, record: &ForwardRecord) -> Result<DeliveryFuture, EnqueueError> {
         let mut future_record: FutureRecord<'_, [u8], [u8]> = FutureRecord::to(&record.topic_name);
         if let Some(k) = record.key.as_deref() {
@@ -336,9 +336,9 @@ mod tests {
     }
 
     #[test]
-    fn test_build_producer_settings_max_retries_is_not_a_librdkafka_setting() {
-        // Wave 3: shadow_max_retries is the outbox dead-letter cap. librdkafka
-        // keeps its own (time-bounded) retries, as idempotence wants, and the
+    fn test_build_producer_settings_leave_retries_to_librdkafka() {
+        // shadow_max_retries is the outbox dead-letter cap. librdkafka keeps
+        // its own (time-bounded) retries, as idempotence wants, and the
         // ordering guard is on.
         let config = ShadowConfig {
             enabled: true,
@@ -459,7 +459,7 @@ mod tests {
         assert!(has(&s, "bootstrap.servers", "a:9092,b:9092"));
         assert!(has(&s, "security.protocol", "PLAINTEXT"));
         // shadow_batch_size counts messages: batch.num.messages, never the
-        // byte-sized batch.size (wave 3 fix).
+        // byte-sized batch.size.
         assert!(has(&s, "batch.num.messages", "4096"));
         assert!(!has_key(&s, "batch.size"));
         assert!(has(&s, "linger.ms", "25"));

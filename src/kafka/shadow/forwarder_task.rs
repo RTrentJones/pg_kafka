@@ -14,7 +14,7 @@
 //! Like the rest of the network thread it MUST NOT call pgrx (no SPI, no
 //! pg_log!); it logs through `tracing`.
 //!
-//! ## Pipelining and ordering (wave 3)
+//! ## Pipelining and ordering
 //!
 //! Records are handed to librdkafka as they arrive, without waiting for the
 //! previous delivery report: many deliveries are in flight at once and the

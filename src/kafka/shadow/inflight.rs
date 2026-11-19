@@ -1,23 +1,18 @@
-//! In-flight forward tracking for the durable outbox (issue #93).
+//! In-flight forward tracking for the durable outbox.
 //!
-//! The outbox claim query re-claims a pending row once its retry lease
-//! (`OUTBOX_RETRY_INTERVAL_MS`) expires. That lease is a crash-recovery
-//! mechanism, but it also fired while a first forward was still legitimately
-//! in flight (external-broker warmup, batching, slow acks), re-sending the
-//! record and delivering ~8% duplicates to the external broker on async
-//! paths. This tracker closes that gap: the DB thread registers each row when
-//! it hands the forward to the network thread and clears it when the ack
-//! comes back, and the outbox dispatcher skips any re-claimed row that is
-//! still registered — the re-send now happens only when the ack was truly
-//! lost, not merely late.
+//! The DB thread registers each outbox row when it hands the forward to the
+//! network thread and clears it when the ack is applied. The outbox claim
+//! excludes registered rows, so a forward that is merely slow (external-broker
+//! warmup, batching, a long delivery) is never claimed and sent a second time;
+//! a row whose attempt is still open in the table but not registered here lost
+//! its ack, and the claim counts that lost attempt as a failure.
 //!
-//! Delivery semantics stay at-least-once: entries are evicted after
-//! `evict_after` (sized above rdkafka's `message.timeout.ms`, after which a
-//! delivery ack — success or failure — is guaranteed to have been produced),
-//! so a genuinely lost ack (dropped on a full channel, network-thread crash)
-//! only delays the lease-based retry, never prevents it. The tracker is
-//! in-memory: a worker restart forgets in-flight state, and the lease alone
-//! governs recovery, exactly as before.
+//! Delivery stays at-least-once: entries are evicted after `evict_after`
+//! (sized above rdkafka's `message.timeout.ms`, after which a delivery report,
+//! success or failure, is guaranteed to have been produced), so a genuinely
+//! lost ack (network-thread crash) only delays the re-claim, never prevents it.
+//! The tracker is in memory: a worker restart forgets it, and the open
+//! attempts in the table drive recovery.
 //!
 //! Thread model: touched only from the single DB worker thread (the poll and
 //! the ack drain both run there). The mutex exists because `ShadowStore` must
@@ -54,7 +49,7 @@ impl InflightTracker {
     }
 
     /// Clear `key` after its ack (success or failure) has been applied, so a
-    /// future lease-expiry re-claim may dispatch it again.
+    /// later claim may dispatch it again.
     pub fn complete(&self, key: &RowKey) {
         self.lock().remove(key);
     }
@@ -105,8 +100,8 @@ mod tests {
     const EVICT: Duration = Duration::from_secs(150);
     const KEY: RowKey = RowKey::new(1, 0, 42);
 
-    /// A dispatched row must not be re-dispatched while its ack is pending —
-    /// this is the exact mechanism behind the issue #93 duplicates.
+    /// A dispatched row is not re-dispatched while its ack is pending (it
+    /// would be delivered twice).
     #[test]
     fn test_second_dispatch_blocked_while_in_flight() {
         let tracker = InflightTracker::new(EVICT);
@@ -147,7 +142,7 @@ mod tests {
 
     /// The SQL-exclusion snapshot must list live entries and omit evicted
     /// ones — a stale (lost-ack) entry left in the snapshot would block the
-    /// row's lease-based retry at the claim query forever.
+    /// row's re-claim forever.
     #[test]
     fn test_live_keys_snapshot_excludes_evicted() {
         let tracker = InflightTracker::new(EVICT);
