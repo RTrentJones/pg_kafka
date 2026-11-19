@@ -67,6 +67,11 @@
 //! invariant in CLAUDE.md); responders are called after the coordinator's locks are
 //! released.
 
+use crate::kafka::assignment::strategies::StickyStrategy;
+use crate::kafka::assignment::{
+    create_strategy, AssignmentInput, AssignmentOutput, AssignmentStrategy, MemberAssignment,
+    MemberSubscription,
+};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -899,12 +904,6 @@ impl GroupCoordinator {
         group_id: &str,
         topic_partitions: &HashMap<String, i32>,
     ) -> Result<HashMap<String, Vec<u8>>> {
-        use crate::kafka::assignment::strategies::StickyStrategy;
-        use crate::kafka::assignment::{
-            create_strategy, AssignmentInput, AssignmentStrategy, MemberAssignment,
-            MemberSubscription,
-        };
-
         let groups = self.groups.read().map_err(|e| {
             KafkaError::Internal(format!("Failed to acquire groups read lock: {e}"))
         })?;
@@ -915,59 +914,10 @@ impl GroupCoordinator {
                 group_id: group_id.to_string(),
             })?;
 
-        // Parse subscriptions from member protocol metadata
-        let mut subscriptions = HashMap::new();
-        for (member_id, member) in &group.members {
-            // Find the protocol matching the chosen strategy
-            if let Some((_, metadata)) = member
-                .protocols
-                .iter()
-                .find(|(name, _)| Some(name) == group.protocol_name.as_ref())
-            {
-                match MemberSubscription::parse(metadata) {
-                    Ok(sub) => {
-                        subscriptions.insert(member_id.clone(), sub);
-                    }
-                    Err(e) => {
-                        pg_log!(
-                            "Failed to parse subscription for member {}: {}",
-                            member_id,
-                            e
-                        );
-                        // Use empty subscription as fallback
-                        subscriptions.insert(member_id.clone(), MemberSubscription::default());
-                    }
-                }
-            } else {
-                // No matching protocol, use empty subscription
-                subscriptions.insert(member_id.clone(), MemberSubscription::default());
-            }
-        }
-
-        // Create assignment input
-        let input = AssignmentInput::new(subscriptions, topic_partitions.clone());
-
-        // Get strategy name (default to "range")
+        let input = AssignmentInput::new(member_subscriptions(group), topic_partitions.clone());
+        // The group's selected assignor, "range" if none was selected.
         let strategy_name = group.protocol_name.as_deref().unwrap_or("range");
-
-        // Create strategy - for sticky, include previous assignments
-        let assignments = if strategy_name.contains("sticky") {
-            // Parse previous assignments for sticky strategy
-            let mut previous = HashMap::new();
-            for (member_id, bytes) in &group.previous_assignments {
-                if let Ok(assign) = MemberAssignment::parse(bytes) {
-                    previous.insert(member_id.clone(), assign);
-                }
-            }
-            let strategy = StickyStrategy::with_previous(previous);
-            strategy.assign(&input)
-        } else {
-            // Use standard strategy
-            let strategy = create_strategy(strategy_name).ok_or_else(|| {
-                KafkaError::Internal(format!("Unknown assignment strategy: {strategy_name}"))
-            })?;
-            strategy.assign(&input)
-        };
+        let assignments = run_assignor(group, &input, strategy_name)?;
 
         // Encode assignments to bytes
         let encoded = assignments
@@ -1074,6 +1024,58 @@ impl Default for GroupCoordinator {
 
 /// INCONSISTENT_GROUP_PROTOCOL for a JoinGroup whose protocol type or protocols do not fit the
 /// group.
+/// Every member's subscription, parsed from its metadata for the group's selected
+/// protocol. A member without that protocol, or whose metadata does not parse, is
+/// assigned as if it subscribed to nothing.
+fn member_subscriptions(group: &ConsumerGroup) -> HashMap<String, MemberSubscription> {
+    group
+        .members
+        .iter()
+        .map(|(member_id, member)| {
+            let subscription = member
+                .protocols
+                .iter()
+                .find(|(name, _)| Some(name) == group.protocol_name.as_ref())
+                .map_or_else(MemberSubscription::default, |(_, metadata)| {
+                    MemberSubscription::parse(metadata).unwrap_or_else(|e| {
+                        pg_log!(
+                            "Failed to parse subscription for member {}: {}",
+                            member_id,
+                            e
+                        );
+                        MemberSubscription::default()
+                    })
+                });
+            (member_id.clone(), subscription)
+        })
+        .collect()
+}
+
+/// Run the assignor `strategy_name` over `input`. The sticky assignor starts from the
+/// group's previous assignments.
+fn run_assignor(
+    group: &ConsumerGroup,
+    input: &AssignmentInput,
+    strategy_name: &str,
+) -> Result<AssignmentOutput> {
+    if strategy_name.contains("sticky") {
+        let previous = group
+            .previous_assignments
+            .iter()
+            .filter_map(|(member_id, bytes)| {
+                MemberAssignment::parse(bytes)
+                    .ok()
+                    .map(|assignment| (member_id.clone(), assignment))
+            })
+            .collect();
+        return Ok(StickyStrategy::with_previous(previous).assign(input));
+    }
+    let strategy = create_strategy(strategy_name).ok_or_else(|| {
+        KafkaError::Internal(format!("Unknown assignment strategy: {strategy_name}"))
+    })?;
+    Ok(strategy.assign(input))
+}
+
 /// The group of a member presenting `generation_id`, fenced as Kafka fences SyncGroup and
 /// Heartbeat: a group this coordinator has no record of (e.g. lost in a worker restart)
 /// or an unknown member gets UNKNOWN_MEMBER_ID, which makes the client rejoin as a new
