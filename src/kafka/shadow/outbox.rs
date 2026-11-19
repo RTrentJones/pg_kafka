@@ -173,6 +173,54 @@ pub trait ShadowDb {
     fn transaction_committed(&self, xid: u32) -> bool;
 }
 
+/// Typed reads of one `kafka.shadow_config` row, by column name.
+pub trait ConfigColumns {
+    /// Why a column could not be read.
+    type Error;
+    /// An integer column (NULL is `None`).
+    fn int(&self, column: &str) -> std::result::Result<Option<i32>, Self::Error>;
+    /// A text column (NULL is `None`).
+    fn text(&self, column: &str) -> std::result::Result<Option<String>, Self::Error>;
+}
+
+impl ConfigColumns for pgrx::spi::SpiHeapTupleData<'_> {
+    type Error = pgrx::spi::SpiError;
+
+    fn int(&self, column: &str) -> std::result::Result<Option<i32>, Self::Error> {
+        self.get_by_name(column)
+    }
+
+    fn text(&self, column: &str) -> std::result::Result<Option<String>, Self::Error> {
+        self.get_by_name(column)
+    }
+}
+
+/// One topic's configuration from its `kafka.shadow_config` row.
+///
+/// A NULL column takes its default (`mode`, `sync_mode` and `write_mode`
+/// through their `parse`). A column that cannot be read at all fails the
+/// row, so `load_topic_configs` fails and the reload keeps the previous
+/// cache instead of loading a config whose unreadable fields were guessed.
+pub fn topic_config_from_row<R: ConfigColumns>(
+    row: &R,
+) -> std::result::Result<TopicShadowConfig, R::Error> {
+    use super::config::{ShadowMode, SyncMode, WriteMode};
+    let text = |column: &str| -> std::result::Result<String, R::Error> {
+        Ok(row.text(column)?.unwrap_or_default())
+    };
+    let percentage = row.int("forward_percentage")?.unwrap_or(0);
+    Ok(TopicShadowConfig {
+        topic_id: row.int("topic_id")?.unwrap_or(0),
+        topic_name: text("name")?,
+        mode: ShadowMode::parse(&text("mode")?),
+        forward_percentage: u8::try_from(percentage.clamp(0, 100))
+            .expect("a value in 0..=100 fits in u8"),
+        external_topic_name: row.text("external_topic_name")?,
+        sync_mode: SyncMode::parse(&text("sync_mode")?),
+        write_mode: WriteMode::parse(&text("write_mode")?),
+    })
+}
+
 /// Production [`ShadowDb`]: SPI and the real GUCs.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SpiShadowDb;
@@ -593,7 +641,6 @@ impl ShadowDb for SpiShadowDb {
     }
 
     fn load_topic_configs(&self) -> Option<Vec<TopicShadowConfig>> {
-        use super::config::{ShadowMode, SyncMode, WriteMode};
         use pgrx::prelude::*;
 
         let result: std::result::Result<Vec<TopicShadowConfig>, spi::SpiError> =
@@ -607,33 +654,7 @@ impl ShadowDb for SpiShadowDb {
                     None,
                     &[],
                 )?;
-                let mut configs = Vec::new();
-                for row in table {
-                    // A NULL text column parses as its mode's default; a column
-                    // that cannot be read at all falls back to `on_error`.
-                    let text = |column: &str, on_error: &str| -> String {
-                        row.get_by_name::<String, _>(column)
-                            .unwrap_or_else(|_| Some(on_error.to_string()))
-                            .unwrap_or_default()
-                    };
-                    let int = |column: &str| -> i32 {
-                        row.get_by_name::<i32, _>(column)
-                            .ok()
-                            .flatten()
-                            .unwrap_or(0)
-                    };
-                    configs.push(TopicShadowConfig {
-                        topic_id: int("topic_id"),
-                        topic_name: text("name", ""),
-                        mode: ShadowMode::parse(&text("mode", "local_only")),
-                        forward_percentage: u8::try_from(int("forward_percentage").clamp(0, 100))
-                            .expect("a value in 0..=100 fits in u8"),
-                        external_topic_name: row.get_by_name("external_topic_name").ok().flatten(),
-                        sync_mode: SyncMode::parse(&text("sync_mode", "sync")),
-                        write_mode: WriteMode::parse(&text("write_mode", "dual_write")),
-                    });
-                }
-                Ok(configs)
+                table.map(|row| topic_config_from_row(&row)).collect()
             });
         match result {
             Ok(configs) => Some(configs),
@@ -663,3 +684,124 @@ impl ShadowDb for SpiShadowDb {
 
 #[cfg(test)]
 pub(crate) mod fake;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kafka::shadow::config::{ShadowMode, SyncMode, WriteMode};
+    use std::collections::HashMap;
+
+    /// A config row: a column is a value, NULL, or unreadable (`Err`).
+    #[derive(Default)]
+    struct Row(HashMap<&'static str, std::result::Result<Option<String>, ()>>);
+
+    impl Row {
+        fn full() -> Self {
+            let mut row = Self::default();
+            for (column, value) in [
+                ("topic_id", "7"),
+                ("name", "orders"),
+                ("mode", "shadow"),
+                ("forward_percentage", "40"),
+                ("external_topic_name", "prod-orders"),
+                ("sync_mode", "sync"),
+                ("write_mode", "external_only"),
+            ] {
+                row.0.insert(column, Ok(Some(value.to_string())));
+            }
+            row
+        }
+
+        fn with(
+            mut self,
+            column: &'static str,
+            value: std::result::Result<Option<&str>, ()>,
+        ) -> Self {
+            self.0.insert(column, value.map(|v| v.map(str::to_string)));
+            self
+        }
+    }
+
+    impl ConfigColumns for Row {
+        type Error = String;
+
+        fn int(&self, column: &str) -> std::result::Result<Option<i32>, String> {
+            self.text(column)?
+                .map(|v| v.parse().map_err(|_| format!("{column}: not an int")))
+                .transpose()
+        }
+
+        fn text(&self, column: &str) -> std::result::Result<Option<String>, String> {
+            match self.0.get(column) {
+                Some(Ok(value)) => Ok(value.clone()),
+                Some(Err(())) | None => Err(format!("{column}: unreadable")),
+            }
+        }
+    }
+
+    #[test]
+    fn test_topic_config_from_a_full_row() {
+        let config = topic_config_from_row(&Row::full()).unwrap();
+        assert_eq!(config.topic_id, 7);
+        assert_eq!(config.topic_name, "orders");
+        assert_eq!(config.mode, ShadowMode::Shadow);
+        assert_eq!(config.forward_percentage, 40);
+        assert_eq!(config.external_topic_name.as_deref(), Some("prod-orders"));
+        assert_eq!(config.sync_mode, SyncMode::Sync);
+        assert_eq!(config.write_mode, WriteMode::ExternalOnly);
+    }
+
+    #[test]
+    fn test_topic_config_null_columns_take_their_defaults() {
+        let mut row = Row::default();
+        for column in [
+            "topic_id",
+            "name",
+            "mode",
+            "forward_percentage",
+            "external_topic_name",
+            "sync_mode",
+            "write_mode",
+        ] {
+            row = row.with(column, Ok(None));
+        }
+        let config = topic_config_from_row(&row).unwrap();
+        assert_eq!(config.topic_id, 0);
+        assert_eq!(config.topic_name, "");
+        assert_eq!(config.mode, ShadowMode::LocalOnly);
+        assert_eq!(config.forward_percentage, 0);
+        assert_eq!(config.external_topic_name, None);
+        assert_eq!(config.sync_mode, SyncMode::Async);
+        assert_eq!(config.write_mode, WriteMode::DualWrite);
+    }
+
+    #[test]
+    fn test_topic_config_percentage_is_clamped() {
+        for (stored, expected) in [("-5", 0), ("0", 0), ("100", 100), ("250", 100)] {
+            let row = Row::full().with("forward_percentage", Ok(Some(stored)));
+            assert_eq!(
+                topic_config_from_row(&row).unwrap().forward_percentage,
+                expected,
+                "{stored}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_topic_config_unreadable_column_fails_the_row() {
+        // Each column, unreadable, fails the whole row rather than defaulting:
+        // load_topic_configs then fails and the previous cache stays.
+        for column in [
+            "topic_id",
+            "name",
+            "mode",
+            "forward_percentage",
+            "external_topic_name",
+            "sync_mode",
+            "write_mode",
+        ] {
+            let row = Row::full().with(column, Err(()));
+            assert!(topic_config_from_row(&row).is_err(), "{column}");
+        }
+    }
+}
