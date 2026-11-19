@@ -203,8 +203,10 @@ src/
 │   │   ├── sasl.rs     # SaslHandshake/SaslAuthenticate schema (answered on the network thread)
 │   │   └── tests.rs    # Registry-wide tests (every advertised version encodes, echoes, header versions)
 │   ├── listener.rs     # TCP listener, tokio runtime, connection handling
+│   ├── conn_limits.rs  # (wave3 net) per-listener / per-IP connection caps, SASL lookup rate limit
 │   ├── protocol/       # Binary protocol parsing/encoding (uses kafka-protocol crate)
-│   │   ├── mod.rs      # Framing and module exports
+│   │   ├── mod.rs      # Module exports
+│   │   ├── framing.rs  # (wave3 net) FrameCodec: length prefix, frame budget, per-frame read clock
 │   │   ├── decoding.rs # Header parsing; the body goes to the API registry
 │   │   ├── encoding.rs # Response encoding (header version from the API's response type)
 │   │   └── recordbatch.rs  # RecordBatch v2 / legacy MessageSet parsing
@@ -612,6 +614,11 @@ pg_kafka.ssl_cert_file = ''                -- PEM chain (required by SSL / SASL_
 pg_kafka.ssl_key_file = ''                 -- PEM private key
 pg_kafka.ssl_ca_file = ''                  -- client CA bundle; set = mutual TLS on TLS listeners
 pg_kafka.sasl_enabled_mechanisms = 'PLAIN,SCRAM-SHA-256,SCRAM-SHA-512'
+-- wave3 net: network edge limits (Sighup, read when the worker starts, like the above)
+pg_kafka.max_connections = 1024            -- concurrent connections per listener (each listener its own cap)
+pg_kafka.max_connections_per_ip = 256      -- concurrent connections per client IP, across listeners
+pg_kafka.connections_max_idle_ms = 600000  -- close connections idle this long (Kafka's connections.max.idle.ms)
+pg_kafka.request_read_timeout_ms = 60000   -- a request frame must arrive within this long of its first byte
 
 -- See "Shadow Mode Configuration" section below for shadow mode settings
 ```
@@ -770,6 +777,7 @@ Per-category counts are in `docs/TEST_STRATEGY.md`; `cargo run --release -- --li
 | **metadata** | Metadata refresh, all topics, nonexistent topic |
 | **protocol** | ApiVersions negotiation, correlation ID, unknown API, pipelining, response ordering |
 | **auth** | SASL_PLAINTEXT (PLAIN, SCRAM-SHA-256/512), SSL (+ untrusted CA, mutual TLS), SASL_SSL, wrong passwords, pre-auth gating, user SQL. Sequential: generates certs with the `openssl` CLI, adds listeners 9093-9095 via ALTER SYSTEM and restarts the worker; the last test resets them. Needs the DB host's filesystem and superuser |
+| **w3_net** | (wave3 net) Hostile clients at the network edge: frame-budget lockout, >100 MB response, TCP_NODELAY, acks=0 close / invalid acks, responses before close, per-IP and per-listener caps, idle and frame-read deadlines, pre-auth deadline from accept, SASL lookup rate limit, unknown-user SCRAM fake. Sequential; the `limits` tests add listeners 19096-19098 via ALTER SYSTEM, connect from 127.0.0.x source addresses and need `openssl` |
 
 ### Running E2E Tests with CLI Options
 
