@@ -10,7 +10,8 @@ use crate::kafka::error::Result;
 use crate::kafka::messages::Record;
 use crate::kafka::storage::{
     CommittedOffset, FetchedMessage, IsolationLevel, LogStore, MaintenanceStore, OffsetStore,
-    ProducerStore, TopicMetadata, TopicStore, TransactionState, TransactionStore,
+    ProducerBatch, ProducerStore, SequenceCheck, TopicMetadata, TopicStore, TransactionState,
+    TransactionStore,
 };
 use mockall::mock;
 use mockall::predicate::*;
@@ -90,6 +91,7 @@ mock! {
         // wave3 groups
         fn list_offset_groups(&self) -> Result<Vec<String>>;
         fn group_has_offsets<'a>(&self, group_id: &'a str) -> Result<bool>;
+        fn pending_txn_offset_partitions<'a>(&self, group_id: &'a str) -> Result<Vec<(String, i32)>>;
     }
 
     impl ProducerStore for KafkaStore {
@@ -108,6 +110,18 @@ mock! {
             partition_id: i32,
             base_sequence: i32,
             record_count: i32,
+        ) -> Result<SequenceCheck>;
+        fn record_producer_batch(&self, batch: ProducerBatch) -> Result<()>;
+        fn add_txn_partitions<'a, 'b>(
+            &self,
+            transactional_id: &'a str,
+            partitions: &'b [(i32, i32)],
+        ) -> Result<()>;
+        fn txn_has_partition<'a>(
+            &self,
+            transactional_id: &'a str,
+            topic_id: i32,
+            partition_id: i32,
         ) -> Result<bool>;
         fn record_producer_sequence(
             &self,

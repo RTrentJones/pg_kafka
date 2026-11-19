@@ -388,6 +388,18 @@ pub const ERROR_ILLEGAL_SASL_STATE: i16 = 34;
 /// SASL_AUTHENTICATION_FAILED: SASL authentication failed
 pub const ERROR_SASL_AUTHENTICATION_FAILED: i16 = 58;
 
+// wave3 txn: idempotence, transactions and KIP-447 offsets
+/// INVALID_PRODUCER_EPOCH: a Produce carries an epoch older than the producer's current one
+pub const ERROR_INVALID_PRODUCER_EPOCH: i16 = 47;
+/// INVALID_TRANSACTION_TIMEOUT: InitProducerId timeout <= 0 or above transaction.max.timeout.ms
+pub const ERROR_INVALID_TRANSACTION_TIMEOUT: i16 = 50;
+/// OPERATION_NOT_ATTEMPTED: the request failed for another of its entries
+pub const ERROR_OPERATION_NOT_ATTEMPTED: i16 = 55;
+/// UNSTABLE_OFFSET_COMMIT: a transactional offset commit for the partition is pending (KIP-447)
+pub const ERROR_UNSTABLE_OFFSET_COMMIT: i16 = 88;
+/// Default of pg_kafka.transaction_max_timeout_ms (Kafka's transaction.max.timeout.ms: 15 minutes)
+pub const DEFAULT_TRANSACTION_MAX_TIMEOUT_MS: i32 = 900_000;
+
 // NOTE: there is no "transaction timed out" code in the Kafka protocol — 94 is
 // INCONSISTENT_VOTER_SET. A server-side transaction timeout fences the producer, so the
 // internal TransactionTimedOut error maps to ERROR_PRODUCER_FENCED (see error.rs). (BUG-1)

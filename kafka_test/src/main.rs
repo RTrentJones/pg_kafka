@@ -2086,6 +2086,76 @@ fn get_all_tests() -> Vec<TestDef> {
             parallel_safe: false, // restarts the listener worker
         },
         // end wave3 groups
+        // wave3 txn: fetch past invisible offsets, ListOffsets, require_stable,
+        // idempotence, transaction validation, batching (kafka_test/src/w3_txn).
+        // Not parallel safe: the cleanup test runs the retention sweep (deletes every
+        // aborted row), the idempotence test restarts the listener.
+        TestDef {
+            category: "w3_txn",
+            name: "test_w3_read_committed_passes_aborted_tail",
+            test_fn: wrap_test!(kafka_test::w3_txn::consume::test_w3_read_committed_passes_aborted_tail),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "w3_txn",
+            name: "test_w3_read_committed_passes_aborted_middle",
+            test_fn: wrap_test!(kafka_test::w3_txn::consume::test_w3_read_committed_passes_aborted_middle),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "w3_txn",
+            name: "test_w3_consumers_pass_cleaned_up_aborted_rows",
+            test_fn: wrap_test!(kafka_test::w3_txn::consume::test_w3_consumers_pass_cleaned_up_aborted_rows),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "w3_txn",
+            name: "test_w3_consumers_pass_delete_records_gap",
+            test_fn: wrap_test!(kafka_test::w3_txn::consume::test_w3_consumers_pass_delete_records_gap),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "w3_txn",
+            name: "test_w3_read_committed_stops_at_open_transaction",
+            test_fn: wrap_test!(kafka_test::w3_txn::consume::test_w3_read_committed_stops_at_open_transaction),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "w3_txn",
+            name: "test_w3_list_offsets_isolation_max_timestamp_and_partitions",
+            test_fn: wrap_test!(kafka_test::w3_txn::protocol::test_w3_list_offsets_isolation_max_timestamp_and_partitions),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "w3_txn",
+            name: "test_w3_offset_fetch_require_stable",
+            test_fn: wrap_test!(kafka_test::w3_txn::protocol::test_w3_offset_fetch_require_stable),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "w3_txn",
+            name: "test_w3_idempotent_producer_follows_kafka",
+            test_fn: wrap_test!(kafka_test::w3_txn::protocol::test_w3_idempotent_producer_follows_kafka),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "w3_txn",
+            name: "test_w3_idempotent_sequence_wraps",
+            test_fn: wrap_test!(kafka_test::w3_txn::protocol::test_w3_idempotent_sequence_wraps),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "w3_txn",
+            name: "test_w3_transaction_validation",
+            test_fn: wrap_test!(kafka_test::w3_txn::protocol::test_w3_transaction_validation),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "w3_txn",
+            name: "test_w3_fetch_groups_records_into_batches",
+            test_fn: wrap_test!(kafka_test::w3_txn::protocol::test_w3_fetch_groups_records_into_batches),
+            parallel_safe: true,
+        },
     ]
 }
 

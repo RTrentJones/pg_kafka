@@ -631,6 +631,17 @@ pub fn init() {
 
     // wave3 groups: partition / group-size / group-count caps (kafka::limits).
     crate::kafka::limits::register_gucs();
+    // wave3 txn: Kafka's transaction.max.timeout.ms (InitProducerId bound).
+    GucRegistry::define_int_guc(
+        c"pg_kafka.transaction_max_timeout_ms",
+        c"Largest transaction timeout a transactional producer may request (milliseconds)",
+        c"InitProducerId with a transaction_timeout_ms <= 0 or above this value is refused with INVALID_TRANSACTION_TIMEOUT, as Kafka's transaction.max.timeout.ms. Default 900000 (15 minutes). Reloadable.",
+        &crate::kafka::handlers::TRANSACTION_MAX_TIMEOUT_MS,
+        1,
+        i32::MAX,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
 
     pgrx::log!("pg_kafka GUC parameters initialized (including shadow mode)");
 }

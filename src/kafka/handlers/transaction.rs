@@ -22,6 +22,9 @@ use kafka_protocol::protocol::StrBytes;
 
 use crate::kafka::messages::TxnOffsetCommitTopics;
 
+/// A requested topic and, per requested partition, its topic id or error code.
+type ResolvedTopic = (String, Vec<(i32, std::result::Result<i32, i16>)>);
+
 /// Handle AddPartitionsToTxn request
 ///
 /// Registers partitions in an active transaction. This must be called before
@@ -45,7 +48,64 @@ pub fn handle_add_partitions_to_txn(
     topics: Vec<(String, Vec<i32>)>, // (topic_name, partition_ids)
 ) -> Result<AddPartitionsToTxnResponse> {
     let store = ctx.store;
-    let default_partitions = ctx.default_partitions;
+
+    // Wave 3: resolve every partition first, without creating topics (Kafka answers
+    // UNKNOWN_TOPIC_OR_PARTITION for a missing topic; producers create topics through
+    // Metadata). If any partition is unknown, nothing is added, the transaction does
+    // not begin, and the valid partitions get OPERATION_NOT_ATTEMPTED, as in Kafka.
+    let mut resolved: Vec<ResolvedTopic> = Vec::new();
+    let mut any_failed = false;
+    for (topic_name, partition_ids) in &topics {
+        let topic = super::helpers::resolve_topic(store, topic_name);
+        let results = partition_ids
+            .iter()
+            .map(|&partition_id| {
+                let r = match topic {
+                    Ok(Some((topic_id, count))) if partition_id >= 0 && partition_id < count => {
+                        Ok(topic_id)
+                    }
+                    Err(code) => Err(code),
+                    _ => Err(crate::kafka::constants::ERROR_UNKNOWN_TOPIC_OR_PARTITION),
+                };
+                any_failed |= r.is_err();
+                (partition_id, r)
+            })
+            .collect();
+        resolved.push((topic_name.clone(), results));
+    }
+
+    let build = |resolved: &[ResolvedTopic], ok_code: i16| {
+        let mut response = AddPartitionsToTxnResponse::default();
+        response.results_by_topic_v3_and_below = resolved
+            .iter()
+            .map(|(topic_name, results)| {
+                let mut topic_result = AddPartitionsToTxnTopicResult::default();
+                topic_result.name = TopicName(StrBytes::from_string(topic_name.clone()));
+                topic_result.results_by_partition = results
+                    .iter()
+                    .map(|(partition_id, r)| {
+                        let mut p = AddPartitionsToTxnPartitionResult::default();
+                        p.partition_index = *partition_id;
+                        p.partition_error_code = match r {
+                            Ok(_) => ok_code,
+                            Err(code) => *code,
+                        };
+                        p
+                    })
+                    .collect();
+                topic_result
+            })
+            .collect();
+        response
+    };
+
+    if any_failed {
+        return Ok(build(
+            &resolved,
+            crate::kafka::constants::ERROR_OPERATION_NOT_ATTEMPTED,
+        ));
+    }
+
     // Atomically begin or continue the transaction
     // This handles the race condition between checking state and transitioning.
     // On failure (fenced epoch, invalid state, ...) report the error on every
@@ -60,82 +120,18 @@ pub fn handle_add_partitions_to_txn(
         ));
     }
 
-    // Build response with results for each partition
-    let mut response = AddPartitionsToTxnResponse::default();
-    let mut topic_results = Vec::new();
+    // Register the partitions: a transactional Produce is accepted only for them.
+    let partitions: Vec<(i32, i32)> = resolved
+        .iter()
+        .flat_map(|(_, results)| {
+            results
+                .iter()
+                .filter_map(|(partition_id, r)| r.ok().map(|topic_id| (topic_id, *partition_id)))
+        })
+        .collect();
+    store.add_txn_partitions(transactional_id, &partitions)?;
 
-    for (topic_name, partition_ids) in topics {
-        let mut partition_results = Vec::new();
-
-        // Auto-create topic if it doesn't exist (matching Produce behavior)
-        // This is necessary because rdkafka calls AddPartitionsToTxn before the topic exists
-        let partition_count = match store.get_topic_partition_count(&topic_name) {
-            Ok(Some(count)) => count,
-            Ok(None) => {
-                // Topic doesn't exist, auto-create it
-                match super::helpers::get_or_create_valid_topic(
-                    store,
-                    &topic_name,
-                    default_partitions,
-                ) {
-                    Ok((_, count)) => count,
-                    Err(_) => {
-                        // Failed to create, return error for all partitions
-                        for partition_id in partition_ids {
-                            let mut partition_result = AddPartitionsToTxnPartitionResult::default();
-                            partition_result.partition_index = partition_id;
-                            partition_result.partition_error_code =
-                                crate::kafka::constants::ERROR_UNKNOWN_SERVER_ERROR;
-                            partition_results.push(partition_result);
-                        }
-                        let mut topic_result = AddPartitionsToTxnTopicResult::default();
-                        topic_result.name = TopicName(StrBytes::from_string(topic_name));
-                        topic_result.results_by_partition = partition_results;
-                        topic_results.push(topic_result);
-                        continue;
-                    }
-                }
-            }
-            Err(_) => {
-                // Error checking topic, return error for all partitions
-                for partition_id in partition_ids {
-                    let mut partition_result = AddPartitionsToTxnPartitionResult::default();
-                    partition_result.partition_index = partition_id;
-                    partition_result.partition_error_code =
-                        crate::kafka::constants::ERROR_UNKNOWN_SERVER_ERROR;
-                    partition_results.push(partition_result);
-                }
-                let mut topic_result = AddPartitionsToTxnTopicResult::default();
-                topic_result.name = TopicName(StrBytes::from_string(topic_name));
-                topic_result.results_by_partition = partition_results;
-                topic_results.push(topic_result);
-                continue;
-            }
-        };
-
-        for partition_id in partition_ids {
-            // CONF-5: a negative partition id is not valid. The previous check only bounded the
-            // upper end (`< partition_count`), so e.g. -1 was accepted as ERROR_NONE.
-            let error_code = if partition_id >= 0 && partition_id < partition_count {
-                ERROR_NONE
-            } else {
-                crate::kafka::constants::ERROR_UNKNOWN_TOPIC_OR_PARTITION
-            };
-
-            let mut partition_result = AddPartitionsToTxnPartitionResult::default();
-            partition_result.partition_index = partition_id;
-            partition_result.partition_error_code = error_code;
-            partition_results.push(partition_result);
-        }
-
-        let mut topic_result = AddPartitionsToTxnTopicResult::default();
-        topic_result.name = TopicName(StrBytes::from_string(topic_name));
-        topic_result.results_by_partition = partition_results;
-        topic_results.push(topic_result);
-    }
-
-    response.results_by_topic_v3_and_below = topic_results;
-    Ok(response)
+    Ok(build(&resolved, ERROR_NONE))
 }
 
 /// Handle AddOffsetsToTxn request
@@ -468,14 +464,16 @@ mod tests {
     #[test]
     fn test_add_partitions_to_txn_rejects_negative_partition() {
         // CONF-5: a negative partition id must be rejected (UNKNOWN_TOPIC_OR_PARTITION), not
-        // accepted as ERROR_NONE. The old check only bounded the upper end (< partition_count).
+        // accepted as ERROR_NONE. Wave 3: the request then fails as a whole (Kafka), the
+        // valid partition 0 gets OPERATION_NOT_ATTEMPTED and nothing begins.
         let mut store = MockKafkaStore::new();
-        store
-            .expect_begin_or_continue_transaction()
-            .returning(|_, _, _| Ok(()));
-        store
-            .expect_get_topic_partition_count()
-            .returning(|_| Ok(Some(3)));
+        store.expect_get_topic_metadata().returning(|_| {
+            Ok(vec![crate::kafka::storage::TopicMetadata {
+                name: "t".to_string(),
+                id: 1,
+                partition_count: 3,
+            }])
+        });
 
         let coordinator = crate::kafka::GroupCoordinator::new();
         let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
@@ -502,7 +500,10 @@ mod tests {
             neg.partition_error_code,
             crate::kafka::constants::ERROR_UNKNOWN_TOPIC_OR_PARTITION
         );
-        assert_eq!(zero.partition_error_code, ERROR_NONE);
+        assert_eq!(
+            zero.partition_error_code,
+            crate::kafka::constants::ERROR_OPERATION_NOT_ATTEMPTED
+        );
     }
 
     #[test]

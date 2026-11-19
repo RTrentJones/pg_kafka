@@ -10,6 +10,7 @@ use crate::kafka::error::Result;
 use crate::kafka::handler_context::HandlerContext;
 use crate::kafka::messages::ProducerMetadata;
 use crate::kafka::partitioner::compute_partition;
+use crate::kafka::storage::{batch_last_sequence, ProducerBatch, SequenceCheck};
 use std::collections::HashMap;
 
 /// Handle Produce request
@@ -46,7 +47,7 @@ pub fn handle_produce(
                     return Ok(
                         crate::kafka::response_builders::build_produce_partition_error_response(
                             &topic_data,
-                            e.to_kafka_error_code(),
+                            produce_error_code(&e),
                         ),
                     );
                 }
@@ -172,12 +173,28 @@ pub fn handle_produce(
                 continue;
             }
 
+            // Wave 3: a transactional producer may only write to partitions it added to
+            // the transaction (AddPartitionsToTxn); Kafka answers INVALID_TXN_STATE.
+            if let Some(txn_id) = transactional_id {
+                let registered = store.txn_has_partition(txn_id, topic_id, partition_index);
+                if !matches!(registered, Ok(true)) {
+                    partition_response.error_code = match registered {
+                        Err(e) => e.to_kafka_error_code(),
+                        _ => crate::kafka::constants::ERROR_INVALID_TXN_STATE,
+                    };
+                    partition_response.base_offset = -1;
+                    partition_response.log_append_time_ms = -1;
+                    partition_response.log_start_offset = -1;
+                    topic_response.partition_responses.push(partition_response);
+                    continue;
+                }
+            }
+
             // Sequence metadata for this partition (idempotent producers only).
             let seq_meta = partition_meta.as_ref().filter(|m| m.producer_id >= 0);
 
             // Phase 9: Validate sequence for idempotent producers BEFORE inserting
-            let should_insert = if let Some(meta) = seq_meta {
-                // Idempotent producer - check and update sequence
+            let check = if let Some(meta) = seq_meta {
                 match store.check_and_update_sequence(
                     meta.producer_id,
                     meta.producer_epoch,
@@ -186,10 +203,10 @@ pub fn handle_produce(
                     meta.base_sequence,
                     records.len() as i32,
                 ) {
-                    Ok(should_insert) => should_insert, // true=insert, false=duplicate (skip insert)
+                    Ok(check) => check,
                     Err(e) => {
                         // Sequence validation failed - return error for this partition
-                        partition_response.error_code = e.to_kafka_error_code();
+                        partition_response.error_code = produce_error_code(&e);
                         partition_response.base_offset = -1;
                         partition_response.log_append_time_ms = -1;
                         partition_response.log_start_offset = -1;
@@ -198,11 +215,11 @@ pub fn handle_produce(
                     }
                 }
             } else {
-                true // Non-idempotent producer - always insert
+                SequenceCheck::Append // Non-idempotent producer - always insert
             };
 
             // Insert records (skip for duplicates)
-            if should_insert {
+            if check == SequenceCheck::Append {
                 // Phase 10: Use transactional insert if transactional_id is set
                 let insert_result = if transactional_id.is_some() {
                     if let Some(meta) = producer_metadata {
@@ -233,16 +250,20 @@ pub fn handle_produce(
                         // RV-8: advance the idempotent producer's sequence only AFTER the
                         // insert has succeeded. If the insert had failed, the sequence
                         // would stay un-advanced and a retry re-inserts, instead of being
-                        // dropped as a false duplicate. new_last_sequence matches the value
-                        // validate_sequence would have stored (base + count - 1).
+                        // dropped as a false duplicate. The batch is remembered with its
+                        // offset, so a retry is answered with it (wave 3).
                         if let Some(meta) = seq_meta {
-                            let new_last_sequence = meta.base_sequence + records.len() as i32 - 1;
-                            if let Err(e) = store.record_producer_sequence(
-                                meta.producer_id,
+                            if let Err(e) = store.record_producer_batch(ProducerBatch {
+                                producer_id: meta.producer_id,
                                 topic_id,
-                                partition_index,
-                                new_last_sequence,
-                            ) {
+                                partition_id: partition_index,
+                                first_sequence: meta.base_sequence,
+                                last_sequence: batch_last_sequence(
+                                    meta.base_sequence,
+                                    records.len() as i32,
+                                ),
+                                base_offset,
+                            }) {
                                 crate::pg_warning!(
                                     "Failed to record producer sequence (topic_id={}, partition={}): {}",
                                     topic_id,
@@ -269,13 +290,11 @@ pub fn handle_produce(
                         partition_response.log_start_offset = -1;
                     }
                 }
-            } else {
-                // Duplicate detected - return success (error_code=0) but skip insert
-                // This is the correct Kafka idempotency behavior
+            } else if let SequenceCheck::Duplicate { base_offset } = check {
+                // A retry of an appended batch: success with the ORIGINAL base offset,
+                // nothing inserted (Kafka's idempotent producer semantics, wave 3).
                 partition_response.error_code = ERROR_NONE;
-                // The original batch's offset is not stored, so report it as unknown
-                // (-1) rather than claim offset 0, which the client would record.
-                partition_response.base_offset = -1;
+                partition_response.base_offset = base_offset;
                 partition_response.log_append_time_ms = -1;
                 partition_response.log_start_offset = -1;
             }
@@ -287,6 +306,19 @@ pub fn handle_produce(
     }
 
     Ok(kafka_response)
+}
+
+/// The Produce error code for `e`. A stale epoch is INVALID_PRODUCER_EPOCH (47) on
+/// Produce in Kafka 3.7, for idempotent and transactional producers alike (since
+/// Kafka 2.7 PRODUCER_FENCED is no longer sent in a produce response), so a fenced
+/// transactional epoch maps to it too.
+fn produce_error_code(e: &crate::kafka::error::KafkaError) -> i16 {
+    match e {
+        crate::kafka::error::KafkaError::ProducerFenced { .. } => {
+            crate::kafka::constants::ERROR_INVALID_PRODUCER_EPOCH
+        }
+        _ => e.to_kafka_error_code(),
+    }
 }
 
 /// Check that `txn_id` belongs to this producer/epoch and is in the Ongoing state.
@@ -306,5 +338,118 @@ fn validate_ongoing_transaction(
         None => Err(crate::kafka::error::KafkaError::transactional_id_not_found(
             txn_id,
         )),
+    }
+}
+
+#[cfg(test)]
+mod wave3_tests {
+    use super::*;
+    use crate::kafka::error::KafkaError;
+    use crate::kafka::messages::{PartitionProduceData, Record, TopicProduceData};
+    use crate::kafka::storage::TransactionState;
+    use crate::kafka::{BrokerMetadata, GroupCoordinator};
+    use crate::testing::mocks::MockKafkaStore;
+    use kafka_protocol::records::Compression;
+
+    fn request(partitions: &[i32]) -> Vec<TopicProduceData> {
+        vec![TopicProduceData {
+            name: "t".to_string(),
+            partitions: partitions
+                .iter()
+                .map(|&p| PartitionProduceData {
+                    partition_index: p,
+                    records: vec![Record {
+                        key: None,
+                        value: Some(b"v".to_vec()),
+                        headers: vec![],
+                        timestamp: None,
+                    }],
+                    producer_metadata: Some(meta()),
+                })
+                .collect(),
+        }]
+    }
+
+    fn meta() -> ProducerMetadata {
+        ProducerMetadata {
+            producer_id: 7,
+            producer_epoch: 2,
+            base_sequence: 0,
+        }
+    }
+
+    fn run(mock: &MockKafkaStore, partitions: &[i32], txn: Option<&str>) -> Vec<(i32, i16, i64)> {
+        let coordinator = GroupCoordinator::new();
+        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(mock, &coordinator, &broker, 1, Compression::None);
+        let mut out: Vec<(i32, i16, i64)> =
+            handle_produce(&ctx, request(partitions), Some(&meta()), txn)
+                .unwrap()
+                .responses
+                .iter()
+                .flat_map(|t| t.partition_responses.iter())
+                .map(|p| (p.index, p.error_code, p.base_offset))
+                .collect();
+        out.sort();
+        out
+    }
+
+    /// Kafka: a transactional Produce to a partition the transaction never added
+    /// (AddPartitionsToTxn) is INVALID_TXN_STATE; it used to be written.
+    #[test]
+    fn transactional_produce_to_an_unregistered_partition_is_refused() {
+        let mut mock = MockKafkaStore::new();
+        mock.expect_validate_transaction()
+            .returning(|_, _, _| Ok(()));
+        mock.expect_get_transaction_state()
+            .returning(|_| Ok(Some(TransactionState::Ongoing)));
+        mock.expect_get_or_create_topic()
+            .returning(|_, _| Ok((1, 2)));
+        mock.expect_txn_has_partition()
+            .returning(|_, _, p| Ok(p == 0));
+        mock.expect_check_and_update_sequence()
+            .times(1)
+            .returning(|_, _, _, _, _, _| Ok(SequenceCheck::Append));
+        mock.expect_insert_transactional_records()
+            .times(1)
+            .returning(|_, _, _, _, _| Ok(11));
+        mock.expect_record_producer_batch()
+            .times(1)
+            .returning(|_| Ok(()));
+        assert_eq!(
+            run(&mock, &[0, 1], Some("tx")),
+            vec![
+                (0, crate::kafka::constants::ERROR_NONE, 11),
+                (1, crate::kafka::constants::ERROR_INVALID_TXN_STATE, -1)
+            ]
+        );
+    }
+
+    /// Kafka 3.7 answers a stale epoch on Produce with INVALID_PRODUCER_EPOCH (47),
+    /// for transactional producers too (was PRODUCER_FENCED, 90).
+    #[test]
+    fn stale_epoch_is_invalid_producer_epoch() {
+        let mut mock = MockKafkaStore::new();
+        mock.expect_validate_transaction()
+            .returning(|_, _, _| Err(KafkaError::producer_fenced(7, 2, 3)));
+        assert_eq!(
+            run(&mock, &[0], Some("tx")),
+            vec![(0, crate::kafka::constants::ERROR_INVALID_PRODUCER_EPOCH, -1)]
+        );
+
+        let mut mock = MockKafkaStore::new();
+        mock.expect_get_or_create_topic()
+            .returning(|_, _| Ok((1, 1)));
+        mock.expect_check_and_update_sequence()
+            .returning(|_, _, _, _, _, _| {
+                Err(KafkaError::Protocol {
+                    code: crate::kafka::constants::ERROR_INVALID_PRODUCER_EPOCH,
+                    message: "stale".into(),
+                })
+            });
+        assert_eq!(
+            run(&mock, &[0], None),
+            vec![(0, crate::kafka::constants::ERROR_INVALID_PRODUCER_EPOCH, -1)]
+        );
     }
 }

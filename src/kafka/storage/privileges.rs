@@ -72,6 +72,13 @@ pub const WORKER_TABLE_GRANTS: &[(&str, &[&str])] = &[
     ("kafka.shadow_metrics", &["SELECT", "INSERT", "UPDATE"]),
     // auth stream: SASL credential lookups (kafka/auth/credentials.rs), read only.
     ("kafka.sasl_credentials", &["SELECT"]),
+    // wave3 txn: idempotent batch cache (upsert + trim) and the partitions registered
+    // in each open transaction.
+    (
+        "kafka.producer_batches",
+        &["SELECT", "INSERT", "UPDATE", "DELETE"],
+    ),
+    ("kafka.txn_partitions", &["SELECT", "INSERT", "DELETE"]),
 ];
 
 /// Sequences behind the SERIAL/BIGSERIAL columns the worker inserts into, plus the

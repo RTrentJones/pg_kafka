@@ -242,7 +242,11 @@ impl KafkaApi for ListOffsetsApi {
 
     fn handle(request: Self::Request, call: Call<Self>, env: &ApiEnv<'_>) -> RequestOutcome {
         call.run(request, |r, _| {
-            handlers::handle_list_offsets(&env.ctx, r.topics)
+            handlers::handle_list_offsets(
+                &env.ctx,
+                r.topics,
+                IsolationLevel::from_i8(r.isolation_level),
+            )
         })
     }
 }
