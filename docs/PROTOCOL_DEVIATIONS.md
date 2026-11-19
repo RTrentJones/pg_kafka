@@ -73,11 +73,26 @@ pg_kafka.compression_type = 'gzip'
 
 **Implementation:**
 - ✅ InitProducerId API allocates producer IDs with epoch
-- ✅ Sequence number tracking per topic-partition
-- ✅ Duplicate detection: a retried batch whose sequence range was already written is acknowledged with error code 0 and not re-inserted (this matches Kafka; the DUPLICATE_SEQUENCE_NUMBER code is defined but not returned). Unlike Kafka, the ack carries `base_offset = 0` rather than the original batch's offset
-- ✅ Out-of-order detection (OUT_OF_ORDER_SEQUENCE_NUMBER error)
-- ✅ Producer fencing via epoch (PRODUCER_FENCED error)
+- ✅ Sequence number tracking per topic-partition, Kafka's model (wave 3): the last 5
+  batches of every producer on every partition are remembered (`kafka.producer_batches`:
+  first/last sequence and base offset, durable, so it survives worker restarts)
+- ✅ Duplicate detection: a retry of one of those 5 batches (same epoch, same sequence
+  range) is acknowledged with error code 0, **its original base offset**, and nothing is
+  re-inserted, as in Kafka (DUPLICATE_SEQUENCE_NUMBER is defined but, as in Kafka, never
+  returned)
+- ✅ Anything else out of sequence (a gap, an overlap, a range at or below the last
+  sequence that was never written, a retry older than the 5 cached batches) is
+  OUT_OF_ORDER_SEQUENCE_NUMBER (45); sequences wrap from 2147483647 to 0
+- ✅ Epochs: a Produce with an epoch older than the producer's current one gets
+  INVALID_PRODUCER_EPOCH (47), what Kafka 3.7 answers on Produce for idempotent and
+  transactional producers alike; a higher epoch (an idempotent producer bumping its own
+  epoch, KIP-360, as the Java client does) is accepted when it starts at sequence 0 and
+  becomes the producer's epoch
 - ✅ PostgreSQL advisory locks for sequence serialization
+- **Deviation:** a producer with no state on a partition must start at sequence 0 there
+  (OUT_OF_ORDER_SEQUENCE_NUMBER otherwise). Kafka accepts any first sequence from an
+  unknown producer (its producer state can expire with the log); pg_kafka keeps producer
+  state for 7 idle days and refuses a first batch whose predecessors never arrived.
 - Produce responses report `log_start_offset = -1` and `log_append_time_ms = -1`
 
 **Client Impact:**
@@ -92,7 +107,14 @@ pg_kafka.compression_type = 'gzip'
 **pg_kafka Behavior:** Full transaction coordinator with EOS
 
 **Implementation:**
-- ✅ AddPartitionsToTxn registers partitions in transaction
+- ✅ AddPartitionsToTxn registers partitions in the transaction (`kafka.txn_partitions`);
+  a transactional Produce to a partition the open transaction did not add is refused with
+  INVALID_TXN_STATE (48), as Kafka 3.6+ does. AddPartitionsToTxn does not create topics: an
+  unknown topic or partition is UNKNOWN_TOPIC_OR_PARTITION and the request's other
+  partitions get OPERATION_NOT_ATTEMPTED (55), nothing is added
+- ✅ InitProducerId refuses a transaction timeout <= 0 or above
+  `pg_kafka.transaction_max_timeout_ms` (Kafka's `transaction.max.timeout.ms`, default
+  900000) with INVALID_TRANSACTION_TIMEOUT (50)
 - ✅ AddOffsetsToTxn includes consumer offsets in transaction
 - ✅ EndTxn commits or aborts atomically
 - ✅ TxnOffsetCommit commits offsets within transaction context
@@ -176,6 +198,9 @@ pg_kafka.compression_type = 'gzip'
 **Implementation:**
 - ✅ OffsetCommit API stores offsets in PostgreSQL
 - ✅ OffsetFetch API retrieves committed offsets
+- ✅ `require_stable` (OffsetFetch v7, KIP-447): a partition with a TxnOffsetCommit whose
+  transaction is still open is answered UNSTABLE_OFFSET_COMMIT (88) with offset -1, at
+  partition level as Kafka 3.7 does, so a read_committed consumer waits for it
 - ✅ Consumer groups can track progress across restarts
 - ✅ Supports offset metadata field
 
@@ -216,24 +241,37 @@ pg_kafka.compression_type = 'gzip'
 - Works with standard Kafka clients
 - Low latency with long polling enabled (default: on)
 
-**Deviation: server-side read_committed filtering (DR-11, DEEP-REVIEW-2026-07)**
+**Deviation: server-side read_committed filtering (DR-11, DEEP-REVIEW-2026-07; wave 3)**
 
 Real Kafka returns *all* records (including aborted ones) to a `read_committed`
 consumer along with control batches and an `aborted_transactions` list, and the
 client filters aborted ranges itself (the wire contract for Fetch ≥ v4).
 pg_kafka instead filters **server-side**: pending/aborted rows are excluded by
 the fetch query, results are clamped to the Last Stable Offset (RV-4), and the
-response carries an **empty** `aborted_transactions` list with **no control
-batches**. Fetched batches are also re-encoded rather than replayed verbatim,
-so they carry `producer_id = -1`, `producer_epoch = -1`, batch boundaries that
-may differ from the original produce, and `partition_leader_epoch = 0`.
+response carries no `aborted_transactions` list. pg_kafka writes no transaction
+markers, so aborted offsets (and rows the aborted-row cleanup deleted) are holes in
+the log:
 
-- Works with rdkafka/librdkafka, kafka-python, KafkaJS, and Sarama (all tolerate
-  an empty aborted list because the aborted data simply never appears).
-- A client that *relies* on doing its own abort filtering (rather than trusting
-  the served rows) sees no aborted ranges and no control markers — the data it
-  receives is already clean, so correctness holds, but byte-level batch
-  equivalence with a real broker does not.
+- Records between holes carry their own offsets, so consumers skip holes in the
+  middle of a response.
+- When nothing is visible from the fetch offset up to the readable end (the LSO for
+  `read_committed`, the high watermark for `read_uncommitted`), the response holds one
+  **control batch** covering the hole, with a single COMMIT marker at its last offset,
+  like the marker Kafka writes when a transaction ends. Clients skip control records
+  and move their position past it (the Java client to the batch's last offset + 1,
+  librdkafka to the marker's offset + 1), so their position and committed offset reach
+  the end and the lag goes to 0. Before wave 3 such a fetch was empty and the consumer
+  re-fetched the same offset forever. An open transaction still blocks at the LSO.
+- Fetched records are re-encoded, grouped into one RecordBatch per run of consecutive
+  offsets written by the same producer id/epoch (wave 3; before, every record was its own
+  batch, ~60 bytes of overhead each). Batches of transactional rows carry their producer
+  id/epoch and the transactional flag; other batches `producer_id = -1`. The base
+  sequence is sent as -1, `partition_leader_epoch` is 0, and batch boundaries may differ
+  from the original produce.
+- The data a client receives is already clean, so read_committed correctness holds for
+  clients that do their own abort filtering too (verified with the Java consumer and
+  librdkafka); what differs from Kafka is the byte-level batch layout and that
+  `read_uncommitted` consumers no longer see aborted records once the cleanup deleted them.
 - Header order is preserved (headers are stored as an ordered array of pairs), but
   duplicate header keys collapse to the last value: the kafka-protocol record type
   holds headers in a map on both decode and encode. Kafka's wire format permits
@@ -247,12 +285,19 @@ honored; producer CreateTime timestamps are preserved — BUG-7).
 
 **Status:** Fully implemented
 **Kafka Behavior:** Returns offsets by timestamp or special values
-**pg_kafka Behavior:** Supports earliest (-2), latest (-1), and timestamp lookup
+**pg_kafka Behavior:** Supports earliest (-2), latest (-1), max timestamp (-3) and timestamp lookup
 
 **Implementation:**
-- ✅ Returns earliest offset (first message in partition)
-- ✅ Returns latest offset (high watermark)
+- ✅ Returns earliest offset (first message in partition; -4 EARLIEST_LOCAL is the same)
+- ✅ Returns latest offset: the high watermark, or the last stable offset for a
+  `read_committed` request (wave 3)
+- ✅ MAX_TIMESTAMP (-3, KIP-734): the offset and timestamp of the record with the largest
+  timestamp (the lowest offset among equal ones; wave 3). Kafka 3.7.0 itself answers the
+  last offset of that record's batch (KAFKA-16310, fixed in later releases)
 - ✅ Timestamp-based lookup — returns the earliest offset whose record timestamp is ≥ the requested time (record timestamps are persisted; AUDIT-2026-06 BUG-7 + CONF-7)
+- ✅ Timestamp lookups are bounded like Kafka's: a match at or past the high watermark
+  (`read_committed`: the LSO) is offset -1; aborted records are never a match
+- ✅ A partition the topic does not have is UNKNOWN_TOPIC_OR_PARTITION (was: offset 0)
 
 ## Metadata API Deviations
 
@@ -537,7 +582,6 @@ auto.offset.reset=earliest
 | Log compaction | PostgreSQL UPDATE provides similar semantics |
 | Replication protocol | Rely on PostgreSQL HA (Patroni, RDS) |
 | Quotas | Not needed for target use cases |
-| SASL authentication | Use PostgreSQL authentication instead |
 
 > Exactly-once semantics (EOS) **is** implemented via the Phase 10 transaction APIs and read-committed isolation — see the Summary above and `KAFKA_PROTOCOL_COVERAGE.md`.
 
@@ -545,5 +589,5 @@ auto.offset.reset=earliest
 
 **Last Updated:** 2026-10-29
 **Applies To:** pg_kafka Phase 11 Complete (Shadow Mode)
-**API Coverage:** 26 of ~50 Kafka APIs (52%)
+**API Coverage:** 28 of ~50 Kafka APIs (56%)
 **Test Status:** unit + property + E2E, CI-gated; counts in [TEST_STRATEGY.md](TEST_STRATEGY.md#test-summary)

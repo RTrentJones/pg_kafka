@@ -30,7 +30,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - TCP listener on port 9092 with full Kafka wire protocol parsing
 - ProduceRequest handling with database persistence (acks=0 and acks>=1 supported)
 - Idempotent producer support with InitProducerId API and sequence validation
-- Producer deduplication (DUPLICATE_SEQUENCE_NUMBER, OUT_OF_ORDER_SEQUENCE_NUMBER detection)
+- Producer deduplication, Kafka's model: a retry of one of the last 5 batches is acked with its original offset; anything else out of sequence is OUT_OF_ORDER_SEQUENCE_NUMBER
 - Transaction support (AddPartitionsToTxn, AddOffsetsToTxn, EndTxn, TxnOffsetCommit)
 - Read-committed isolation level for consumers (filters pending/aborted transactions)
 - FetchRequest with RecordBatch v2 encoding/decoding
@@ -50,6 +50,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Shadow mode for forwarding to external Kafka with SASL/SSL, per-topic config, replay support
 - Listener security protocols PLAINTEXT / SSL / SASL_PLAINTEXT / SASL_SSL, several listeners at once (`pg_kafka.additional_listeners`), each advertising its own address; SCRAM credentials in `kafka.sasl_credentials`, managed with `pg_kafka_create_user` & co.; per-connection principal recorded (authorization is not implemented)
 - Automated E2E tests with real Kafka client (rdkafka)
+- wave3 txn: read_committed (and read_uncommitted after aborted-row cleanup) consumers move past offsets they cannot see: a fetch with nothing visible below its readable end returns a control batch covering them (PROTOCOL_DEVIATIONS §7); fetched records are grouped into one RecordBatch per run of a producer's offsets; ListOffsets honours isolation_level (LSO) and MAX_TIMESTAMP (-3); OffsetFetch `require_stable` (KIP-447); transactional Produce only to partitions added with AddPartitionsToTxn (which no longer creates topics); InitProducerId timeout bound `pg_kafka.transaction_max_timeout_ms`
 
 **API Coverage:** 28 of ~50 standard Kafka APIs (56%)
 **Test Status:** unit + property + E2E, all CI-gated. Counts live only in `docs/TEST_STRATEGY.md` ("Test Summary"); do not repeat them elsewhere.
@@ -539,6 +540,8 @@ CREATE TABLE kafka.txn_pending_offsets (
 **Idempotent Producer Tables:**
 - `producer_ids`: Tracks allocated producer IDs with epochs (fencing mechanism)
 - `producer_sequences`: Per-partition sequence tracking for deduplication
+- `producer_batches` (wave3 txn): the last 5 batches (sequence range, base offset) per producer and partition, for duplicate detection; rows follow their `producer_sequences` row (ON DELETE CASCADE), so every epoch change clears them
+- `txn_partitions` (wave3 txn): partitions added to the open transaction of each transactional id (AddPartitionsToTxn); cleared when the next transaction begins and on InitProducerId
 
 **Transaction Tables (Phase 10):**
 - `transactions`: Tracks transaction state by transactional_id
@@ -599,6 +602,7 @@ pg_kafka.run_as_role = 'pgkafka_worker' -- Role the worker switches to once the 
 pg_kafka.message_retention_hours = 0 -- Retention sweep for kafka.messages (0 = keep forever; 0-87600; DR-2)
 pg_kafka.message_partition_minutes = 1440 -- Width of one time partition of kafka.messages (5-43200; new leaves only; ADR-001)
 pg_kafka.config_reload_interval_ms = 30000  -- How often the worker reloads GUCs + shadow config (100-300000ms)
+pg_kafka.transaction_max_timeout_ms = 900000 -- wave3 txn: largest InitProducerId transaction timeout (Kafka's transaction.max.timeout.ms; larger or <= 0 = INVALID_TRANSACTION_TIMEOUT)
 
 -- Test-only fault injection (Sighup, default 0 = off; never set in production)
 pg_kafka.test_forward_ack_delay_ms = 0   -- Delay before the shadow forwarder acks (0-30000ms)
@@ -770,6 +774,7 @@ Per-category counts are in `docs/TEST_STRATEGY.md`; `cargo run --release -- --li
 | **metadata** | Metadata refresh, all topics, nonexistent topic |
 | **protocol** | ApiVersions negotiation, correlation ID, unknown API, pipelining, response ordering |
 | **auth** | SASL_PLAINTEXT (PLAIN, SCRAM-SHA-256/512), SSL (+ untrusted CA, mutual TLS), SASL_SSL, wrong passwords, pre-auth gating, user SQL. Sequential: generates certs with the `openssl` CLI, adds listeners 9093-9095 via ALTER SYSTEM and restarts the worker; the last test resets them. Needs the DB host's filesystem and superuser |
+| **w3_txn** | Wave 3 txn: consumers reach the end past aborted/cleaned-up/DeleteRecords holes and stop at an open transaction's LSO; ListOffsets isolation/-3/partition checks; OffsetFetch require_stable; Kafka's idempotent model (5-batch cache, original offsets, epochs, wrap, survives restarts); transaction validation; fetch batching |
 
 ### Running E2E Tests with CLI Options
 

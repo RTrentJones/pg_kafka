@@ -36,8 +36,12 @@ Version ranges below are the ones advertised in the ApiVersions response and enf
 
 **Implementation Notes (Phase 9)**:
 - ✅ Idempotent producer support with sequence validation
-- ✅ Deduplication (DUPLICATE_SEQUENCE_NUMBER, OUT_OF_ORDER_SEQUENCE_NUMBER)
-- ✅ Producer epoch fencing (PRODUCER_FENCED)
+- ✅ Deduplication, Kafka's model (wave 3): a retry of one of the producer's last 5 batches
+  on the partition is acked with its original base offset and not re-written (as in Kafka,
+  DUPLICATE_SEQUENCE_NUMBER is never returned); anything else out of sequence is
+  OUT_OF_ORDER_SEQUENCE_NUMBER; sequences wrap at 2147483647
+- ✅ Producer epoch fencing: a stale epoch on Produce is INVALID_PRODUCER_EPOCH (47, as
+  Kafka 3.7); a client-bumped epoch (KIP-360) is accepted from sequence 0
 - ✅ Full transaction support via Phase 10 APIs (see Transaction APIs section)
 
 ### 3. Consumer - Data Access (4 APIs) ✅ 100% Coverage
@@ -49,7 +53,9 @@ Version ranges below are the ones advertised in the ApiVersions response and enf
 | ListOffsets | 2 | v1-v7 | ✅ Complete | Get earliest/latest/by-timestamp offsets |
 
 **Implementation Notes:**
-- ✅ ListOffsets supports special timestamps (-2 = earliest, -1 = latest) and arbitrary timestamp lookup (earliest offset whose record timestamp ≥ target; AUDIT-2026-06 BUG-7 + CONF-7)
+- ✅ ListOffsets supports special timestamps (-2 = earliest, -1 = latest: the LSO for read_committed, -3 = max timestamp, KIP-734) and arbitrary timestamp lookup (earliest offset whose record timestamp ≥ target; AUDIT-2026-06 BUG-7 + CONF-7), bounded by the readable end like Kafka; an unknown partition is UNKNOWN_TOPIC_OR_PARTITION
+- ✅ OffsetFetch v7 `require_stable` (KIP-447): UNSTABLE_OFFSET_COMMIT for partitions with a pending transactional offset commit
+- ✅ Fetch returns records grouped into one RecordBatch per run of a producer's consecutive offsets, and a control batch over offsets a consumer cannot see (aborted, cleaned up) so its position reaches the end (see PROTOCOL_DEVIATIONS.md §7)
 - ✅ OffsetFetch limited to v0-v7 (v8+ requires different response format)
 - ✅ All consumer data access APIs fully functional
 - ✅ Long polling with max_wait_ms/min_bytes support
@@ -101,7 +107,13 @@ Version ranges below are the ones advertised in the ApiVersions response and enf
 - ✅ Read-committed isolation level for consumers
 - ✅ Transaction state machine (Empty → Ongoing → CompleteCommit/CompleteAbort). EndTxn applies the outcome in a single PostgreSQL transaction, so the PrepareCommit/PrepareAbort states are defined but never persisted
 - ✅ Transactional producer fencing via epoch
-- ✅ Pending/aborted messages filtered for read_committed consumers
+- ✅ Pending/aborted messages filtered server-side for read_committed consumers; a fetch over
+  only hidden offsets returns a control batch so the consumer moves past them (see
+  PROTOCOL_DEVIATIONS.md §7)
+- ✅ Validation as Kafka: InitProducerId timeout bound (`pg_kafka.transaction_max_timeout_ms`,
+  INVALID_TRANSACTION_TIMEOUT), AddPartitionsToTxn never creates topics
+  (UNKNOWN_TOPIC_OR_PARTITION, others OPERATION_NOT_ATTEMPTED), a transactional Produce
+  to a partition not added to the transaction is INVALID_TXN_STATE
 
 ### 7. Configuration & Log Management (3 APIs) ✅
 | API | Key | Versions | Status | Notes |
