@@ -1,12 +1,9 @@
 # Shadow-mode forwarding — evidence & reporting plan
 
-> Status: **partially executed.** Part A (evidence generation) landed in c013b78 (#91), with the harness
-> instrumentation fix in 013aa9b (#92). Part B (site reporting) is live in the site repo. The first
-> `evidence.yml` run published the BASELINE (`shadow.json` at `ae666ab`, 2026-10-26: all six checks `pass`,
-> `passed: true`). Still open: PR4 (the dead `ShadowStore` producer removal), the post-PR4 re-dispatch, and
-> the optional items marked below. This doc is the execution spec (every file, schema, and wiring point is
-> named). Paths are relative to the repo root shown, absolute where cross-repo (the cross-repo paths are the
-> author's local checkout).
+> **Archived plan (October 2026).** Parts A and B and the dead `ShadowStore` producer removal
+> (PR4) are done; the evidence pipeline itself is described in `evidence/README.md` and
+> `.github/workflows/evidence.yml`. Kept as the record of how the shadow evidence was introduced.
+> Paths outside this repo are the author's local checkout.
 
 ## Why
 

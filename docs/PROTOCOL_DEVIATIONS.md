@@ -4,7 +4,7 @@ This document lists intentional deviations from the official Kafka protocol spec
 
 ## Summary
 
-`pg_kafka` implements a **subset** of the Kafka wire protocol (56% API coverage). The following deviations are intentional design decisions that optimize for PostgreSQL's strengths while maintaining compatibility with standard Kafka clients.
+`pg_kafka` implements a **subset** of the Kafka wire protocol (<!--gen:api-coverage-->28 of ~50 standard Kafka APIs (56%)<!--/gen-->). The following deviations are intentional design decisions that optimize for PostgreSQL's strengths while maintaining compatibility with standard Kafka clients.
 
 | Category | Status |
 |----------|--------|
@@ -33,7 +33,7 @@ This document lists intentional deviations from the official Kafka protocol spec
 - Data is still written to PostgreSQL (best-effort)
 - Errors are not returned to the client (per acks=0 contract); as in Kafka, any error
   (a partition error, a corrupt batch, a failed commit) **closes the connection** after the
-  partitions that succeeded are committed, so the client refreshes its metadata (wave 3)
+  partitions that succeeded are committed, so the client refreshes its metadata
 - `acks` other than -1, 0 and 1 is answered `INVALID_REQUIRED_ACKS` (21) on every
   partition and nothing is written, as in Kafka
 - Long-polling consumers are notified if write succeeds
@@ -77,7 +77,7 @@ pg_kafka.compression_type = 'gzip'
 
 **Implementation:**
 - ✅ InitProducerId API allocates producer IDs with epoch
-- ✅ Sequence number tracking per topic-partition, Kafka's model (wave 3): the last 5
+- ✅ Sequence number tracking per topic-partition, Kafka's model: the last 5
   batches of every producer on every partition are remembered (`kafka.producer_batches`:
   first/last sequence and base offset, durable, so it survives worker restarts)
 - ✅ Duplicate detection: a retry of one of those 5 batches (same epoch, same sequence
@@ -253,11 +253,11 @@ pg_kafka.compression_type = 'gzip'
 **What Works:**
 - ✅ FetchRequest/Response handling
 - ✅ RecordBatch v2 encoding
-- ✅ Record headers returned to consumers (DR-8, DEEP-REVIEW-2026-07)
+- ✅ Record headers returned to consumers
 - ✅ Empty fetch responses (returns empty bytes)
 - ✅ Partition watermarks (high watermark, log start offset)
 - ✅ Byte-budget fetch sizing — small-message fetches fill `max_bytes` via bounded
-  iterative queries instead of capping at a fixed row count (DR-9)
+  iterative queries instead of capping at a fixed row count
 - ✅ Request-level `max_bytes` (KIP-74): partitions are filled in request order until
   the response budget is spent; the first partition with data always returns at least
   one message, later partitions return only what still fits (sizes are estimated as
@@ -278,13 +278,13 @@ pg_kafka.compression_type = 'gzip'
 - Works with standard Kafka clients
 - Low latency with long polling enabled (default: on)
 
-**Deviation: server-side read_committed filtering (DR-11, DEEP-REVIEW-2026-07; wave 3)**
+**Deviation: server-side read_committed filtering**
 
 Real Kafka returns *all* records (including aborted ones) to a `read_committed`
 consumer along with control batches and an `aborted_transactions` list, and the
 client filters aborted ranges itself (the wire contract for Fetch ≥ v4).
 pg_kafka instead filters **server-side**: pending/aborted rows are excluded by
-the fetch query, results are clamped to the Last Stable Offset (RV-4), and the
+the fetch query, results are clamped to the Last Stable Offset, and the
 response carries no `aborted_transactions` list. pg_kafka writes no transaction
 markers, so aborted offsets (and rows the aborted-row cleanup deleted) are holes in
 the log:
@@ -297,18 +297,16 @@ the log:
   like the marker Kafka writes when a transaction ends. Clients skip control records
   and move their position past it (the Java client to the batch's last offset + 1,
   librdkafka to the marker's offset + 1), so their position and committed offset reach
-  the end and the lag goes to 0. Before wave 3 such a fetch was empty and the consumer
-  re-fetched the same offset forever. An open transaction still blocks at the LSO.
+  the end and the lag goes to 0. An open transaction still blocks at the LSO.
 - Fetched records are re-encoded, grouped into one RecordBatch per run of consecutive
-  offsets written by the same producer id/epoch (wave 3; before, every record was its own
-  batch, ~60 bytes of overhead each). Batches of transactional rows carry their producer
+  offsets written by the same producer id/epoch. Batches of transactional rows carry their producer
   id/epoch and the transactional flag; other batches `producer_id = -1`. The base
   sequence is sent as -1, `partition_leader_epoch` is 0, and batch boundaries may differ
   from the original produce.
 - The data a client receives is already clean, so read_committed correctness holds for
   clients that do their own abort filtering too (verified with the Java consumer and
   librdkafka); what differs from Kafka is the byte-level batch layout and that
-  `read_uncommitted` consumers no longer see aborted records once the cleanup deleted them.
+  `read_uncommitted` consumers do not see aborted records once the cleanup deleted them.
 - Header order is preserved (headers are stored as an ordered array of pairs), but
   duplicate header keys collapse to the last value: the kafka-protocol record type
   holds headers in a map on both decode and encode. Kafka's wire format permits
@@ -316,7 +314,7 @@ the log:
 
 Related minor deviations: `throttle_time_ms` is always 0 (no quota system) and
 `log_append_time_ms` is always -1 (LogAppendTime timestamp type is not
-honored; producer CreateTime timestamps are preserved — BUG-7).
+honored; producer CreateTime timestamps are preserved).
 
 ### 8. ListOffsets ✅ Implemented
 
@@ -327,14 +325,14 @@ honored; producer CreateTime timestamps are preserved — BUG-7).
 **Implementation:**
 - ✅ Returns earliest offset (first message in partition; -4 EARLIEST_LOCAL is the same)
 - ✅ Returns latest offset: the high watermark, or the last stable offset for a
-  `read_committed` request (wave 3)
+  `read_committed` request
 - ✅ MAX_TIMESTAMP (-3, KIP-734): the offset and timestamp of the record with the largest
-  timestamp (the lowest offset among equal ones; wave 3). Kafka 3.7.0 itself answers the
+  timestamp (the lowest offset among equal ones). Kafka 3.7.0 itself answers the
   last offset of that record's batch (KAFKA-16310, fixed in later releases)
-- ✅ Timestamp-based lookup — returns the earliest offset whose record timestamp is ≥ the requested time (record timestamps are persisted; AUDIT-2026-06 BUG-7 + CONF-7)
+- ✅ Timestamp-based lookup — returns the earliest offset whose record timestamp is ≥ the requested time (record timestamps are persisted)
 - ✅ Timestamp lookups are bounded like Kafka's: a match at or past the high watermark
   (`read_committed`: the LSO) is offset -1; aborted records are never a match
-- ✅ A partition the topic does not have is UNKNOWN_TOPIC_OR_PARTITION (was: offset 0)
+- ✅ A partition the topic does not have is UNKNOWN_TOPIC_OR_PARTITION
 
 ## Metadata API Deviations
 
@@ -364,7 +362,7 @@ honored; producer CreateTime timestamps are preserved — BUG-7).
 **pg_kafka Behavior:** Same, with configurable default partition count
 
 **Implementation:**
-- ✅ Topics have 1 to `pg_kafka.max_partitions_per_topic` partitions (default 10000, at most 100000; set via CreateTopics/CreatePartitions or, for auto-created topics, `pg_kafka.default_partitions` capped at the maximum). A larger count is refused with INVALID_PARTITIONS and `kafka.topics` carries a `CHECK (partitions BETWEEN 1 AND 100000)`; a stored count outside that range (only possible by bypassing the constraint) is reported by Metadata as UNKNOWN_SERVER_ERROR for that topic and ignored by the server-side assignors instead of being allocated (an unbounded count used to abort the worker and send Postgres into crash recovery). Kafka itself has no per-topic cap.
+- ✅ Topics have 1 to `pg_kafka.max_partitions_per_topic` partitions (default 10000, at most 100000; set via CreateTopics/CreatePartitions or, for auto-created topics, `pg_kafka.default_partitions` capped at the maximum). A larger count is refused with INVALID_PARTITIONS and `kafka.topics` carries a `CHECK (partitions BETWEEN 1 AND 100000)`; a stored count outside that range (only possible by bypassing the constraint) is reported by Metadata as UNKNOWN_SERVER_ERROR for that topic and ignored by the server-side assignors instead of being allocated, so a corrupt count cannot make the worker allocate without bound. Kafka itself has no per-topic cap.
 - ✅ Key-based partition routing using murmur2 hash (Kafka-compatible)
 - ✅ Explicit partition assignment in ProduceRequest supported
 - ✅ Metadata reports correct partition count
@@ -509,19 +507,17 @@ response schema to answer in. An acks=0 Produce never gets a response.
 
 > Transaction APIs (InitProducerId 22, AddPartitionsToTxn 24, AddOffsetsToTxn 25, EndTxn 26, TxnOffsetCommit 28), the core Admin APIs (CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups), and the config/log APIs (DescribeConfigs 32, IncrementalAlterConfigs 44, DeleteRecords 21) **are** implemented — see the Summary above and `KAFKA_PROTOCOL_COVERAGE.md`.
 
-## Acknowledgment Durability (RB-1)
+## Acknowledgment Durability
 
 **Status:** Kafka-conformant as of the response-after-commit barrier.
 
 For `acks >= 1`, a produce (or offset-commit/admin) response is delivered to
 the client **only after the backing PostgreSQL transaction has committed** —
 the ack implies the write is durable (WAL-flushed) and visible to any other
-PostgreSQL connection. Historically the response was sent from inside the
-open transaction, leaving a microsecond-scale window where an acked write
-could be lost on a crash; that window no longer exists. (`acks=0` remains
+PostgreSQL connection. (`acks=0` remains
 fire-and-forget with no response frame and no durability claim — see §1.)
 
-## Shadow Forwarding Delivery Semantics (Issue #93)
+## Shadow Forwarding Delivery Semantics
 
 **Status:** At-least-once on decoupled paths, by design.
 
@@ -542,14 +538,14 @@ Shadow forwarding to an external Kafka cluster uses a durable outbox
   need exactly-once semantics must deduplicate (e.g. by key + producer
   metadata).
 - **In-flight gating:** a row whose forward is merely *slow* (ack pending) is
-  no longer re-claimed at lease expiry — the DB thread tracks dispatched
+  not re-claimed at lease expiry — the DB thread tracks dispatched
   forwards and the outbox claim skips them until the ack resolves or the
   entry ages out (`INFLIGHT_EVICT_AFTER`, sized above rdkafka's
   `message.timeout.ms`). Duplicates therefore occur only on genuine ack
   *loss*, not ack *latency*. Local storage and `kafka.shadow_tracking`
   finalization remain exactly-once in all modes.
 
-## Network Security Posture (SEC-7)
+## Network Security Posture
 
 **Status:** Authentication available (TLS, SASL); **authorization not implemented**. Full
 reference: [AUTHENTICATION.md](AUTHENTICATION.md).
@@ -576,8 +572,7 @@ reference: [AUTHENTICATION.md](AUTHENTICATION.md).
 - **Loud by default:** the worker logs a startup `WARNING` for every listener bound to a
   non-loopback address that does not authenticate clients (PLAINTEXT, or SSL without a client
   CA), and for SASL/PLAIN offered on an exposed SASL_PLAINTEXT listener.
-<!-- wave3 net -->
-- **Network edge limits (wave 3):** connections are capped per listener
+- **Network edge limits:** connections are capped per listener
   (`pg_kafka.max_connections`, default 1024; Kafka's cap is broker-wide with per-listener
   overrides) and per IP address across listeners (`pg_kafka.max_connections_per_ip`, default 256,
   where Kafka's default is unlimited); over a cap the socket is closed at accept. Idle
@@ -599,7 +594,7 @@ reference: [AUTHENTICATION.md](AUTHENTICATION.md).
 |--------|---------|--------|-------|
 | kcat | 1.7.0+ | ✅ Works | Producer and consumer tested |
 | rdkafka (Rust) | 0.36+ | ✅ Works | Full E2E test suite (`kafka_test/`) |
-| Apache Kafka Java clients and tools | 3.7.0 | ✅ Checked in CI | <!-- wave3 infra -->`interop/run-java-checks.sh`: verifiable producer/consumers through rebalances, consumer-groups, get-offsets, transactions (perf-test, TransactionalMessageCopier), SASL SCRAM/PLAIN, Kafka Streams; checks still failing are marked XFAIL with the defect |
+| Apache Kafka Java clients and tools | 3.7.0 | ✅ Checked in CI | `interop/run-java-checks.sh`: verifiable producer/consumers through rebalances, consumer-groups, get-offsets, transactions (perf-test, TransactionalMessageCopier), SASL SCRAM/PLAIN, Kafka Streams; checks still failing are marked XFAIL with the defect |
 
 Every behavioural difference from Apache Kafka 3.7 that `interop/diff/run.py` (the differential
 harness: the same raw requests to pg_kafka and to Kafka, responses compared) observes is either
@@ -623,7 +618,7 @@ auto.offset.reset=earliest
 
 ## Future Work
 
-> **Shadow Mode is implemented** (Phase 11 — external Kafka forwarding, per-topic config, SASL/SSL) and is no longer future work. See `KAFKA_PROTOCOL_COVERAGE.md` and the `SHADOW_MODE_*` docs. Known correctness limitations (durable forwarding, replay idempotency, the license gate) are tracked as SH-1..16 in `archive/AUDIT-2026-06.md`.
+> **Shadow Mode is implemented** (Phase 11: external Kafka forwarding, per-topic config, SASL/SSL). See `KAFKA_PROTOCOL_COVERAGE.md` and the `SHADOW_MODE_*` docs; delivery semantics are under "Shadow Forwarding Delivery Semantics" above.
 
 ### Advanced Consumer Features (Future)
 
@@ -646,5 +641,5 @@ auto.offset.reset=earliest
 
 **Last Updated:** 2026-10-29
 **Applies To:** pg_kafka Phase 11 Complete (Shadow Mode)
-**API Coverage:** 28 of ~50 Kafka APIs (56%)
+**API Coverage:** <!--gen:api-coverage-->28 of ~50 standard Kafka APIs (56%)<!--/gen-->
 **Test Status:** unit + property + E2E, CI-gated; counts in [TEST_STRATEGY.md](TEST_STRATEGY.md#test-summary)

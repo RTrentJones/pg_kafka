@@ -44,10 +44,9 @@ ROOT = Path(__file__).resolve().parent.parent
 MARKER = re.compile(r"<!--gen:([a-z0-9-]+)(?::([^>]*?))?-->(.*?)<!--/gen-->", re.S)
 # Not GUCs: file names and the like that share the prefix.
 NOT_GUCS = {"pg_kafka.so", "pg_kafka.control", "pg_kafka.sql", "pg_kafka.mdx"}
-# Settings that never existed but are named on purpose: the original ADR-001 proposal and
-# PERFORMANCE.md's note that they were never implemented (DR-23).
-HISTORICAL_GUCS = {"pg_kafka.retention_days", "pg_kafka.partition_interval",
-                   "pg_kafka.autovacuum_aggressive"}
+# Settings that never existed but are named on purpose: the original ADR-001 proposal, kept
+# for the record.
+HISTORICAL_GUCS = {"pg_kafka.retention_days"}
 
 
 def doc_files():

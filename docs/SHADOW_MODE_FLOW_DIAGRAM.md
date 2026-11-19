@@ -23,7 +23,7 @@ produce → ShadowStore::insert_records
       rows into kafka.shadow_tracking (same subtxn);
       sampled-out records counted in shadow_metrics
    3. sync topic: rows noted under the request's slot
-commit (group commit, RB-1)
+commit (group commit)
    sync produce: response handed over ──Hold──────────▶ forwarder holds it until its records
    (other responses released at once)                   are delivered or shadow_sync_timeout_ms
 
@@ -65,10 +65,8 @@ GUCs (all reloadable with `pg_reload_conf()` unless noted; the forwarder reads t
 | `pg_kafka.shadow_license_key` | '' | Restart; read once at worker start. |
 
 Every shadow GUC except the license key is `Sighup`: it is set in `postgresql.conf` or with
-`ALTER SYSTEM` and reloaded. A session `SET` is refused, since it could never reach the worker (the
-batching, retry and metrics GUCs used to be `Suset`, which accepted a session `SET` with no effect;
-the SASL/SSL ones used to need a restart). Any change to a producer setting (servers, protocol, SASL,
-CA, batch size, linger, backoff) makes the forwarder rebuild its producer, on the next record or
+`ALTER SYSTEM` and reloaded. A session `SET` is refused, since it could never reach the worker.
+Any change to a producer setting (servers, protocol, SASL, CA, batch size, linger, backoff) makes the forwarder rebuild its producer, on the next record or
 within about 0.5 s; the old producer's outstanding records are purged and re-sent by the new one
 without counting as failures. The config goes through `ShadowConfig::validate()` first; an invalid
 or unbuildable config is logged once per distinct error and every record fails (and is eventually
@@ -226,15 +224,12 @@ SELECT kafka.replay_shadow_messages(
   sampling, since sampled-out records are never queued, and 0 when caught up), `dead_lettered`,
   `in_flight`, `oldest_pending_offset`, `last_forwarded_offset`, and the three counters.
 - `kafka.shadow_status` (view, per topic): config, summed counters, `lag` (sum of the partition
-  lags), `dead_lettered`, `max_partition_lag`. (Its `lag` used to be `MAX(partition_offset) -
-  MAX(last_forwarded_offset)` across partitions: it hid a lagging partition, was off by one and never
-  reached 0 under sampling.)
+  lags), `dead_lettered`, `max_partition_lag`.
 - `kafka.shadow_metrics`: per-partition `messages_forwarded`, `messages_failed`, `messages_skipped`,
   `last_forwarded_offset`, `last_forwarded_at`, written only while `shadow_metrics_enabled`.
 - `kafka.metrics`, category `shadow`: `forwarded`, `failed`, `lag` (all pending rows, dead letters
   included).
-- Logs: no per-produce lines (`insert_records` used to log twice per Produce, even with shadow mode
-  off); a failing outbox tick (for example after `DROP EXTENSION`) pauses up to 30 s and logs at the
+- Logs: no per-produce lines; a failing outbox tick (for example after `DROP EXTENSION`) pauses up to 30 s and logs at the
   1st, 2nd, 4th, 8th... failure in a row.
 
 ## E2E Test Setup Sequence

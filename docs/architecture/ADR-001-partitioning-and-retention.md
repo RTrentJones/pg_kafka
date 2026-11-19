@@ -1,6 +1,6 @@
 # ADR-001: Partitioning and Retention Strategy
 
-**Status:** Accepted and implemented in 0.1.0 (wave 2, stream `part`). The sections from "Summary" on are the
+**Status:** Accepted and implemented in 0.1.0. The sections from "Summary" on are the
 original 2026-01 proposal, kept for the record; where they differ, "As built" below wins.
 **Date:** 2026-01-02
 **Last Reviewed:** 2026-11-18
@@ -101,17 +101,17 @@ high watermark (caught by `test_fetch_bounds_from_single_statement`).
 A pending transactional row blocks its leaf's drop until the transaction ends (the transaction
 timeout bounds that). `pg_kafka_run_retention_sweep()` reports the drops as `dropped_partitions`.
 
-### Concurrency with the worker and with manual maintenance (wave 3)
+### Concurrency with the worker and with manual maintenance
 
 Maintenance can run in the worker and, at the same time, in any session
 (`pg_kafka_run_partition_maintenance()`, `pg_kafka_run_retention_sweep()`). The rules:
 
 * **Moving rows out of the DEFAULT leaf never overlaps a worker transaction.** The move
   (`DELETE` from `kafka.messages_default` + `INSERT` into the new leaf, in
-  `create_message_partition`) used to race the worker's UPDATEs of `kafka.messages`
+  `create_message_partition`) would otherwise race the worker's UPDATEs of `kafka.messages`
   (EndTxn's `txn_state` change, the timeout/fencing aborts, DeleteRecords): an UPDATE that
-  met a row the move had deleted skipped it after the move committed and never saw its
-  copy, leaving a committed transaction `pending` forever. Every worker transaction now
+  meets a row the move deleted skips it once the move commits and never sees its copy,
+  leaving a committed transaction `pending` forever. So every worker transaction
   starts by taking the pg_kafka schema advisory lock (key 8099547369649367906) in SHARE
   mode (`worker::lock_schema`), and the move takes it EXCLUSIVE, bounded by the function's
   `lock_timeout`; on a timeout the leaf is not created and the next pass retries. The
@@ -173,12 +173,12 @@ not members, pg_dump would emit them, their `ATTACH` and their rows, and the res
 the foreign key to the (not dumped) `kafka.topics`. Back up pg_kafka data physically (base
 backup + WAL), as before. `pg_upgrade` (binary-upgrade dump of extension members) was not tested.
 
-### PG14-17
+### PostgreSQL versions
 
 Only features present since PG11-12 are used (declarative RANGE partitioning with DEFAULT,
 partitioned BRIN/partial indexes, FKs from partitioned tables, `pg_partition_tree`,
 `ATTACH PARTITION`, run-time partition pruning); no catalog column or syntax newer than PG14.
-Validated on PG15 in the wave-2 sandbox; CI builds PG14-17.
+Measured on PG15; CI runs the E2E suite (time partitions included) on PG14-18.
 
 ### Measured (PG15 sandbox, 1,000,000 expired + 100,000 retained rows, one topic, retention 1 day)
 

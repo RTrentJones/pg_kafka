@@ -22,7 +22,7 @@ kcat -C -b localhost:9092 -t my-topic -p 0 -o beginning
 | **Transactions** | Complete | Full EOS with read-committed isolation |
 | **Shadow Mode** | Complete | External Kafka forwarding with SASL/SSL |
 | **Test Suite** | Unit + property + E2E | Counts in [docs/TEST_STRATEGY.md](docs/TEST_STRATEGY.md#test-summary) (CI is the source of truth) |
-| **CI/CD** | Complete | GitHub Actions with lint, test, security audit |
+| **CI/CD** | Complete | GitHub Actions: lint, tests, E2E on PostgreSQL 14-18, interop, fuzzing, security audit |
 
 **Current Phase:** Phase 11 Complete - Shadow Mode
 
@@ -158,7 +158,7 @@ FROM kafka.consumer_offsets;
 
 ### Key Design Decisions
 
-1. **Async/Sync Bridge** - Tokio handles network I/O; PostgreSQL SPI runs on main thread
+1. **Async/Sync Bridge** - Tokio handles network I/O; all SPI runs on the background worker's one database thread
 2. **Repository Pattern** - `KafkaStore` trait abstracts storage for testability
 3. **Typed Error Handling** - `KafkaError` variants map directly to Kafka protocol error codes
 4. **Modular Handlers** - Each API handler is a separate module with its own tests
@@ -233,61 +233,29 @@ CREATE TABLE kafka.producer_sequences (
 );
 
 -- Also: kafka.partition_offsets (per-partition offset counter + log start offset),
--- kafka.transactions and kafka.txn_pending_offsets (Phase 10), and the shadow-mode
--- tables kafka.shadow_config / shadow_tracking / shadow_metrics (Phase 11).
+-- kafka.producer_batches (the last 5 batches per producer and partition, for duplicates),
+-- kafka.transactions / txn_partitions / txn_pending_offsets (Phase 10), the shadow-mode
+-- tables kafka.shadow_config / shadow_tracking / shadow_metrics (Phase 11), the SASL
+-- credentials (kafka.sasl_credentials, kafka.sasl_server_secret), the broker metrics
+-- tables, and the views kafka.metrics, api_metrics, broker_metrics, consumer_lag,
+-- shadow_status, shadow_partition_status and sasl_users.
 ```
 
 ---
 
 ## Project Structure
 
-```
-src/
-├── lib.rs                  # Extension entry point, _PG_init hook, SQL functions
-├── config.rs               # GUC configuration (pg_kafka.port, etc.)
-├── worker.rs               # Background worker main loop, SPI integration
-├── testing/
-│   ├── helpers.rs          # Test fixtures and assertions
-│   └── mocks.rs            # MockKafkaStore for unit testing
-├── kafka/
-│   ├── mod.rs              # Module organization
-│   ├── listener.rs         # TCP listener, tokio runtime
-│   ├── protocol/           # Binary protocol decoding/encoding, RecordBatch parsing (kafka-protocol crate)
-│   ├── messages.rs         # Request/response types, message queues
-│   ├── dispatch.rs         # Request dispatch helpers
-│   ├── handler_context.rs  # HandlerContext passed to every handler
-│   ├── coordinator.rs      # Consumer group coordinator (Arc<RwLock>)
-│   ├── assignment/         # Range, RoundRobin, Sticky assignment strategies
-│   ├── partitioner.rs      # Key-based partition routing (murmur2)
-│   ├── notifications.rs, pending_fetches.rs  # Long polling support
-│   ├── response_builders.rs  # Response construction, supported API version table
-│   ├── constants.rs        # Protocol constants, Kafka error codes
-│   ├── error.rs            # Typed errors with to_kafka_error_code()
-│   ├── handlers/           # Protocol request handlers
-│   │   ├── admin.rs        # CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups
-│   │   ├── configs.rs      # DescribeConfigs, IncrementalAlterConfigs, DeleteRecords
-│   │   ├── consumer.rs     # OffsetCommit/OffsetFetch
-│   │   ├── coordinator.rs  # FindCoordinator, JoinGroup, SyncGroup, Heartbeat, LeaveGroup, DescribeGroups, ListGroups
-│   │   ├── fetch.rs        # Fetch, ListOffsets
-│   │   ├── helpers.rs      # Topic resolution utilities
-│   │   ├── init_producer_id.rs  # InitProducerId
-│   │   ├── metadata.rs     # ApiVersions, Metadata
-│   │   ├── produce.rs      # ProduceRequest
-│   │   ├── transaction.rs  # AddPartitionsToTxn, AddOffsetsToTxn, EndTxn, TxnOffsetCommit
-│   │   └── tests.rs        # Handler unit tests (MockKafkaStore)
-│   ├── shadow/             # Shadow mode: ShadowStore, outbox forwarder, rdkafka producer, licensing
-│   └── storage/            # Storage abstraction layer
-│       ├── mod.rs          # KafkaStore trait definition
-│       ├── postgres.rs     # PostgreSQL implementation
-│       └── tests.rs        # Storage tests
-└── bin/
-    └── pgrx_embed.rs       # pgrx embedding binary
-
-tests/property_tests.rs     # proptest suite
-kafka_test/                 # E2E test suite using rdkafka client
-sql/bootstrap.sql           # Schema definition
-docs/                       # Architecture decisions, protocol coverage
-```
+| Path | Contents |
+|------|----------|
+| `src/` | The extension: worker, listener, protocol, handlers, coordinator, storage, shadow mode ([module map](CLAUDE.md#codebase-structure)) |
+| `sql/` | Schema (`bootstrap.sql`), the 0.0.0 to 0.1.0 upgrade script, optional tuning |
+| `tests/property_tests.rs` | proptest suite |
+| `kafka_test/` | E2E suite: a real rdkafka client against a running extension |
+| `fuzz/` | libFuzzer targets for the network-edge decoders |
+| `interop/` | Apache Kafka Java client checks and the differential harness against a real broker |
+| `evidence/` | Conformance matrix, benchmark and recorded session published by `evidence.yml` |
+| `scripts/` | Development and CI helpers (`restart.sh`, `ci-pg.sh`, `check-upgrade.sh`, ...) |
+| `docs/` | Protocol coverage and deviations, configuration, testing, ADRs ([index](docs/README.md)) |
 
 ---
 
@@ -316,14 +284,10 @@ cd kafka_test && cargo run --release
 
 ### CI Pipeline
 
-The GitHub Actions pipeline runs:
-1. **Lint** - `cargo fmt` and `cargo clippy` (root crate and `kafka_test/`)
-2. **Unit Tests** - With code coverage via `cargo-llvm-cov`, plus the property tests
-3. **E2E Tests** - Functional, shadow mode (against an external Kafka container), and performance suites with the rdkafka client
-4. **Security Audit** - `cargo-audit` and `cargo-deny`
-5. **Lockfile Verification** - Ensures `Cargo.lock` is synchronized (root and `kafka_test/`)
-6. **PostgreSQL Matrix** - `cargo check` and unit tests against PostgreSQL 15, 16 and 17
-7. **SPI E2E Guard** - On PRs, a change to an SPI/async file must come with a `kafka_test/src/` test change
+GitHub Actions runs lint, unit and property tests with coverage, the E2E suite on PostgreSQL 14
+to 18 (plus the shadow and performance categories on 14), the Java-client and differential
+interop checks, fuzzing, a security audit, the lockfile check, and on pull requests the SPI E2E
+guard. [.github/SETUP.md](.github/SETUP.md) lists the jobs.
 
 ---
 
@@ -353,7 +317,7 @@ pg_kafka.shutdown_timeout_ms = 5000
 -- Reloadable with pg_reload_conf()
 pg_kafka.message_retention_hours = 0  -- Time-based retention sweep (0 = keep forever)
 pg_kafka.message_partition_minutes = 1440  -- Width of one time partition of kafka.messages
--- wave3 groups: resource bounds
+-- Resource bounds
 pg_kafka.max_partitions_per_topic = 10000  -- CreateTopics/CreatePartitions cap (1-100000; INVALID_PARTITIONS above)
 pg_kafka.group_max_size = 1000             -- members per consumer group (GROUP_MAX_SIZE_REACHED above)
 pg_kafka.max_consumer_groups = 100000      -- groups held in memory (oldest Empty group evicted when full)
@@ -390,12 +354,12 @@ See [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for every setting (generated 
 - [x] **Phase 9:** Idempotent Producer (InitProducerId, sequence validation)
 - [x] **Phase 10:** Transaction Support (AddPartitionsToTxn, AddOffsetsToTxn, EndTxn, TxnOffsetCommit)
 - [x] **Phase 11:** Shadow Mode (external Kafka forwarding, SASL/SSL, per-topic config)
+- [x] Time partitioning of kafka.messages with retention by partition drop (0.1.0, ADR-001)
 
 ### Planned
 
 - [ ] **Cooperative Rebalancing** (KIP-429)
 - [ ] **Static Group Membership** (KIP-345)
-- [x] Time partitioning of kafka.messages with retention by partition drop (0.1.0, ADR-001)
 
 ---
 
@@ -429,7 +393,7 @@ See [PROTOCOL_DEVIATIONS.md](docs/PROTOCOL_DEVIATIONS.md) for detailed compatibi
 | Protocol Parsing | kafka-protocol 0.17 |
 | Message Queue | crossbeam-channel 0.5 |
 | Error Handling | thiserror 2.0 |
-| Testing | mockall, proptest, rdkafka |
+| Testing | mockall, proptest, rdkafka (E2E), libFuzzer |
 
 ---
 

@@ -285,6 +285,6 @@ ssl.key.location=/etc/pg_kafka/client.key
   It must run on the database host as a superuser with `openssl` on PATH. The
   PLAINTEXT 9092 listener the rest of the suite uses is never changed.
 * CI needs nothing new beyond what the root crate already needs: `libssl-dev` (the
-  E2E crate's rdkafka now builds with `ssl`, which also enables librdkafka's built-in
+  E2E crate's rdkafka builds with `ssl`, which also enables librdkafka's built-in
   PLAIN and SCRAM) and the `openssl` CLI for the E2E certificates. libsasl2 is not
   needed for these mechanisms (only for GSSAPI).
