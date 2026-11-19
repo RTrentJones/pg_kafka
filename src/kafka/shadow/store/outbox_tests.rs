@@ -498,7 +498,7 @@ fn failing_forward_is_dead_lettered_and_external_primary_reads_fall_back() {
     assert_eq!(offsets(&sent), vec![2]);
     assert!(sent[0].restart);
     let row = h.store.db().row(RowKey::new(T, 0, 1)).unwrap();
-    assert_eq!(row.retry_count as i64, cap);
+    assert_eq!(row.retry_count, cap);
     assert_eq!(row.external_offset, None);
     assert_eq!(
         h.store.db().row(RowKey::new(T, 0, 2)).unwrap().retry_count,
@@ -606,10 +606,11 @@ fn skipped_records_are_counted_in_shadow_metrics() {
     let mut cfg = topic_config(SyncMode::Async, WriteMode::DualWrite);
     cfg.forward_percentage = 50;
     let h = harness(mock, vec![cfg.clone()], 16);
-    let records: Vec<Record> = (0..20).map(|i| record(&[i], b"v")).collect();
-    let expected = (0..20)
-        .filter(|&i| make_forward_decision(Some(&[i as u8]), i, 50) == ForwardDecision::Skip)
-        .count() as i64;
+    let records: Vec<Record> = (0..20u8).map(|i| record(&[i], b"v")).collect();
+    let expected = (0..20u8)
+        .filter(|&i| make_forward_decision(Some(&[i]), i64::from(i), 50) == ForwardDecision::Skip)
+        .count();
+    let expected = i64::try_from(expected).unwrap();
     assert!(expected > 0);
     h.store.insert_records(T, 0, &records).unwrap();
     assert_eq!(
@@ -743,7 +744,7 @@ fn hold_goes_to_the_forwarder_or_is_released_at_once() {
             assert_eq!(released.load(Ordering::SeqCst), 0);
             hold.release.release();
         }
-        other => panic!("expected a hold, got {:?}", other),
+        ForwardRequest::Record(record) => panic!("expected a hold, got {record:?}"),
     }
     assert_eq!(released.load(Ordering::SeqCst), 1);
 

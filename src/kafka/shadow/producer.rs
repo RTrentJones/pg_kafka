@@ -196,7 +196,7 @@ impl ShadowProducer {
         }
         client_config
             .create()
-            .map_err(|e| ShadowError::ProducerError(format!("Failed to create producer: {}", e)))
+            .map_err(|e| ShadowError::ProducerError(format!("Failed to create producer: {e}")))
     }
 
     /// Hand one outbox record to librdkafka without waiting for its delivery
@@ -239,7 +239,7 @@ impl ShadowProducer {
         self.producer
             .client()
             .fatal_error()
-            .map(|(code, msg)| format!("{:?}: {}", code, msg))
+            .map(|(code, msg)| format!("{code:?}: {msg}"))
     }
 
     /// Fail every queued and in-flight record now (their delivery futures
@@ -261,7 +261,7 @@ impl std::fmt::Debug for ShadowProducer {
         f.debug_struct("ShadowProducer")
             .field("bootstrap_servers", &self.config.bootstrap_servers)
             .field("security_protocol", &self.config.security_protocol)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -297,7 +297,7 @@ mod tests {
     fn test_shadow_config_default() {
         let config = ShadowConfig::default();
         assert!(!config.enabled);
-        assert!(config.bootstrap_servers.is_empty());
+        assert_eq!(config.bootstrap_servers, "");
         assert_eq!(config.security_protocol, "SASL_SSL");
         assert_eq!(config.sasl_mechanism, "PLAIN");
     }

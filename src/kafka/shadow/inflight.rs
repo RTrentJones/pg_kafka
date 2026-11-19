@@ -138,7 +138,7 @@ mod tests {
         let t0 = Instant::now();
         assert!(tracker.try_begin_at(KEY, t0));
         // Just under the eviction horizon: still blocked.
-        assert!(!tracker.try_begin_at(KEY, t0 + EVICT - Duration::from_millis(1)));
+        assert!(!tracker.try_begin_at(KEY, t0 + EVICT.saturating_sub(Duration::from_millis(1))));
         // Past it: the lost-ack forward is presumed dead, dispatch resumes.
         assert!(tracker.try_begin_at(KEY, t0 + EVICT));
         // And the new dispatch is itself tracked from the new timestamp.

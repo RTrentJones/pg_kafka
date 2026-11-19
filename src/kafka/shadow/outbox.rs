@@ -55,13 +55,16 @@ pub struct OutboxSettings {
 
 impl Default for OutboxSettings {
     fn default() -> Self {
-        use crate::kafka::constants::*;
+        use crate::kafka::constants::{
+            DEFAULT_SHADOW_BATCH_SIZE, DEFAULT_SHADOW_MAX_RETRIES, DEFAULT_SHADOW_METRICS_ENABLED,
+            DEFAULT_SHADOW_RETRY_BACKOFF_MS, DEFAULT_SHADOW_SYNC_TIMEOUT_MS,
+        };
         Self {
-            max_retries: DEFAULT_SHADOW_MAX_RETRIES as i64,
-            retry_backoff_ms: DEFAULT_SHADOW_RETRY_BACKOFF_MS as i64,
-            batch_size: DEFAULT_SHADOW_BATCH_SIZE as i64,
+            max_retries: i64::from(DEFAULT_SHADOW_MAX_RETRIES),
+            retry_backoff_ms: i64::from(DEFAULT_SHADOW_RETRY_BACKOFF_MS),
+            batch_size: i64::from(DEFAULT_SHADOW_BATCH_SIZE),
             metrics_enabled: DEFAULT_SHADOW_METRICS_ENABLED,
-            sync_timeout_ms: DEFAULT_SHADOW_SYNC_TIMEOUT_MS as u64,
+            sync_timeout_ms: u64::try_from(DEFAULT_SHADOW_SYNC_TIMEOUT_MS).unwrap_or(0),
         }
     }
 }
@@ -262,7 +265,7 @@ impl ShadowDb for SpiShadowDb {
         producer_epoch: i16,
     ) -> Option<Vec<PendingForwardRecord>> {
         use pgrx::prelude::*;
-        let result: std::result::Result<Vec<PendingForwardRecord>, pgrx::spi::SpiError> =
+        let result: std::result::Result<Vec<PendingForwardRecord>, spi::SpiError> =
             Spi::connect(|client| {
                 let table = client.select(
                     "SELECT topic_id, partition_id, partition_offset, key
@@ -296,9 +299,15 @@ impl ShadowDb for SpiShadowDb {
 
     fn claim_due_outbox_rows(&self, claim: &OutboxClaim) -> Result<Vec<ForwardRecord>> {
         use pgrx::prelude::*;
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "backoffs are GUC-bounded milliseconds (at most a minute), exact in f64"
+        )]
+        let (backoff_base_ms, backoff_max_ms) =
+            (claim.backoff_base_ms as f64, claim.backoff_max_ms as f64);
         Spi::connect_mut(|client| {
             let table = client.update(
-                r#"
+                r"
                 WITH inf AS (
                     SELECT * FROM unnest($3::int4[], $4::int4[], $5::int8[]) AS i(t, p, o)
                 ),
@@ -409,7 +418,7 @@ impl ShadowDb for SpiShadowDb {
                     LIMIT 1
                 ) m ON true
                 ORDER BY c.topic_id, c.partition_id, c.local_offset
-                "#,
+                ",
                 None,
                 &[
                     claim.batch_limit.into(),
@@ -417,8 +426,8 @@ impl ShadowDb for SpiShadowDb {
                     claim.inflight.topic_ids.clone().into(),
                     claim.inflight.partition_ids.clone().into(),
                     claim.inflight.local_offsets.clone().into(),
-                    (claim.backoff_base_ms as f64).into(),
-                    (claim.backoff_max_ms as f64).into(),
+                    backoff_base_ms.into(),
+                    backoff_max_ms.into(),
                 ],
             )?;
 
@@ -493,7 +502,7 @@ impl ShadowDb for SpiShadowDb {
             for row in table {
                 n = row.get_by_name::<i64, _>("n")?.unwrap_or(0);
             }
-            Ok(n as usize)
+            Ok(usize::try_from(n).unwrap_or(0))
         })
     }
 
@@ -546,7 +555,7 @@ impl ShadowDb for SpiShadowDb {
             for row in table {
                 out.transitioned += 1;
                 let retry_count: i32 = row.get_by_name("retry_count")?.unwrap_or(0);
-                if retry_count as i64 >= max_retries {
+                if i64::from(retry_count) >= max_retries {
                     out.dead_lettered.push((
                         RowKey::new(
                             row.get_by_name("topic_id")?.unwrap_or(0),
@@ -588,62 +597,52 @@ impl ShadowDb for SpiShadowDb {
         use super::config::{ShadowMode, SyncMode, WriteMode};
         use pgrx::prelude::*;
 
-        let query = r#"
-            SELECT sc.topic_id, t.name, sc.mode, sc.forward_percentage,
-                   sc.external_topic_name, sc.sync_mode,
-                   COALESCE(sc.write_mode, 'dual_write') as write_mode
-            FROM kafka.shadow_config sc
-            JOIN kafka.topics t ON sc.topic_id = t.id
-        "#;
-
-        let mut configs: Vec<TopicShadowConfig> = Vec::new();
-        let mut query_ok = false;
-
-        Spi::connect(|client| {
-            let result = client.select(query, None, &[]);
-
-            if let Ok(table) = result {
-                query_ok = true;
+        let result: std::result::Result<Vec<TopicShadowConfig>, spi::SpiError> =
+            Spi::connect(|client| {
+                let table = client.select(
+                    "SELECT sc.topic_id, t.name, sc.mode, sc.forward_percentage, \
+                            sc.external_topic_name, sc.sync_mode, \
+                            COALESCE(sc.write_mode, 'dual_write') AS write_mode \
+                     FROM kafka.shadow_config sc \
+                     JOIN kafka.topics t ON sc.topic_id = t.id",
+                    None,
+                    &[],
+                )?;
+                let mut configs = Vec::new();
                 for row in table {
-                    // Use named columns for clarity and safety
-                    let topic_id: i32 = row.get_by_name("topic_id").unwrap_or(Some(0)).unwrap_or(0);
-                    let topic_name: String = row
-                        .get_by_name("name")
-                        .unwrap_or(Some(String::new()))
-                        .unwrap_or_default();
-                    let mode_str: String = row
-                        .get_by_name("mode")
-                        .unwrap_or(Some("local_only".to_string()))
-                        .unwrap_or_default();
-                    let forward_percentage: i32 = row
-                        .get_by_name("forward_percentage")
-                        .unwrap_or(Some(0))
-                        .unwrap_or(0);
-                    let external_topic_name: Option<String> =
-                        row.get_by_name("external_topic_name").unwrap_or(None);
-                    let sync_mode_str: String = row
-                        .get_by_name("sync_mode")
-                        .unwrap_or(Some("sync".to_string()))
-                        .unwrap_or_default();
-                    let write_mode_str: String = row
-                        .get_by_name("write_mode")
-                        .unwrap_or(Some("dual_write".to_string()))
-                        .unwrap_or_default();
-
+                    // A NULL text column parses as its mode's default; a column
+                    // that cannot be read at all falls back to `on_error`.
+                    let text = |column: &str, on_error: &str| -> String {
+                        row.get_by_name::<String, _>(column)
+                            .unwrap_or_else(|_| Some(on_error.to_string()))
+                            .unwrap_or_default()
+                    };
+                    let int = |column: &str| -> i32 {
+                        row.get_by_name::<i32, _>(column)
+                            .ok()
+                            .flatten()
+                            .unwrap_or(0)
+                    };
                     configs.push(TopicShadowConfig {
-                        topic_id,
-                        topic_name,
-                        mode: ShadowMode::parse(&mode_str),
-                        forward_percentage: forward_percentage.clamp(0, 100) as u8,
-                        external_topic_name,
-                        sync_mode: SyncMode::parse(&sync_mode_str),
-                        write_mode: WriteMode::parse(&write_mode_str),
+                        topic_id: int("topic_id"),
+                        topic_name: text("name", ""),
+                        mode: ShadowMode::parse(&text("mode", "local_only")),
+                        forward_percentage: u8::try_from(int("forward_percentage").clamp(0, 100))
+                            .expect("a value in 0..=100 fits in u8"),
+                        external_topic_name: row.get_by_name("external_topic_name").ok().flatten(),
+                        sync_mode: SyncMode::parse(&text("sync_mode", "sync")),
+                        write_mode: WriteMode::parse(&text("write_mode", "dual_write")),
                     });
                 }
+                Ok(configs)
+            });
+        match result {
+            Ok(configs) => Some(configs),
+            Err(e) => {
+                tracing::warn!("Shadow: failed to read kafka.shadow_config: {e:?}");
+                None
             }
-        });
-
-        query_ok.then_some(configs)
+        }
     }
 
     fn current_transaction_id(&self) -> u32 {

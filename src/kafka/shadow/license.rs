@@ -223,17 +223,17 @@ mod tests {
     #[test]
     fn test_license_status_debug_format() {
         let registered = LicenseStatus::Registered;
-        assert!(format!("{:?}", registered).contains("Registered"));
+        assert!(format!("{registered:?}").contains("Registered"));
 
         let eval = LicenseStatus::Evaluation;
-        assert!(format!("{:?}", eval).contains("Evaluation"));
+        assert!(format!("{eval:?}").contains("Evaluation"));
 
         let unlicensed = LicenseStatus::Unlicensed;
-        assert!(format!("{:?}", unlicensed).contains("Unlicensed"));
+        assert!(format!("{unlicensed:?}").contains("Unlicensed"));
 
         let invalid = LicenseStatus::Invalid("test reason".to_string());
-        assert!(format!("{:?}", invalid).contains("Invalid"));
-        assert!(format!("{:?}", invalid).contains("test reason"));
+        assert!(format!("{invalid:?}").contains("Invalid"));
+        assert!(format!("{invalid:?}").contains("test reason"));
     }
 
     #[test]
@@ -262,11 +262,7 @@ mod tests {
     fn test_validator_last_warning_starts_at_zero() {
         let v = LicenseValidator::new("eval");
         // The last_warning_epoch should start at 0 (never warned)
-        assert_eq!(
-            v.last_warning_epoch
-                .load(std::sync::atomic::Ordering::Relaxed),
-            0
-        );
+        assert_eq!(v.last_warning_epoch.load(Ordering::Relaxed), 0);
     }
 
     #[test]

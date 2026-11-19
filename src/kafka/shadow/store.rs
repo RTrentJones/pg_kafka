@@ -325,8 +325,7 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
         }
         self.topic_cache
             .get(topic_id)
-            .map(|c| c.should_forward() && c.write_mode == WriteMode::ExternalOnly)
-            .unwrap_or(false)
+            .is_some_and(|c| c.should_forward() && c.write_mode == WriteMode::ExternalOnly)
     }
 
     /// RV-6: whether to suppress local reads for a topic.
@@ -638,12 +637,14 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
             let key = record.row;
             // The claim excluded in-flight rows, so this registers a fresh entry.
             self.inflight.try_begin(key);
-            match self.try_send_forward(ForwardRequest::Record(record)) {
-                Ok(()) => dispatched += 1,
-                Err(_) => {
-                    self.inflight.complete(&key);
-                    not_sent.push(key);
-                }
+            if self
+                .try_send_forward(ForwardRequest::Record(record))
+                .is_ok()
+            {
+                dispatched += 1;
+            } else {
+                self.inflight.complete(&key);
+                not_sent.push(key);
             }
         }
         if !not_sent.is_empty() {
@@ -935,7 +936,7 @@ impl<S: KafkaStore, D: ShadowDb> LogStore for ShadowStore<S, D> {
         &self,
         topic_id: i32,
         partition_id: i32,
-        isolation_level: crate::kafka::storage::IsolationLevel,
+        isolation_level: IsolationLevel,
     ) -> Result<crate::kafka::storage::PartitionBounds> {
         // SH-6: same suppression as the single-value bound methods above.
         if self.suppress_external_primary_reads(topic_id) {
@@ -1139,7 +1140,7 @@ impl<S: KafkaStore, D: ShadowDb> TransactionStore for ShadowStore<S, D> {
         let records = if forwarding {
             self.db
                 .pending_txn_records(producer_id, producer_epoch)
-                .unwrap_or_else(|| pending_records.map(|buf| buf.records).unwrap_or_default())
+                .unwrap_or_else(|| pending_records.map_or_default(|buf| buf.records))
         } else {
             Vec::new()
         };

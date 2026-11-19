@@ -172,8 +172,7 @@ impl ForwarderCore {
                 }
                 let outcome = if collateral {
                     ForwardOutcome::NotAttempted(format!(
-                        "failed with the producer after an earlier error: {}",
-                        error
+                        "failed with the producer after an earlier error: {error}"
                     ))
                 } else {
                     ForwardOutcome::Failed(error)
@@ -443,7 +442,7 @@ pub(crate) async fn run_shadow_forwarder(
                 // outstanding records) even when no new record arrives to
                 // notice it.
                 ticks = ticks.wrapping_add(1);
-                if ticks % SETTINGS_CHECK_TICKS == 0 && slot.live.is_some() {
+                if ticks.is_multiple_of(SETTINGS_CHECK_TICKS) && slot.live.is_some() {
                     let config = runtime_context.config();
                     if config.shadow_mode_enabled && !config.shadow_bootstrap_servers.is_empty() {
                         // A failed rebuild is logged by `current` and retried on the

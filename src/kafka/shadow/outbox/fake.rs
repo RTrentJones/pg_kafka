@@ -32,7 +32,7 @@ pub struct FakeMessage {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct FakeTrackingRow {
     pub external_offset: Option<i64>,
-    pub retry_count: i32,
+    pub retry_count: i64,
     /// Last attempt, in fake-clock ms.
     pub forwarded_at: Option<i64>,
     pub error_message: Option<String>,
@@ -134,9 +134,7 @@ impl ShadowDb for InMemoryShadowDb {
 
     fn topic_has_dead_letters(&self, topic_id: i32, max_retries: i64) -> Result<bool> {
         Ok(self.state().tracking.iter().any(|(k, r)| {
-            k.topic_id == topic_id
-                && r.external_offset.is_none()
-                && r.retry_count as i64 >= max_retries
+            k.topic_id == topic_id && r.external_offset.is_none() && r.retry_count >= max_retries
         }))
     }
 
@@ -181,6 +179,12 @@ impl ShadowDb for InMemoryShadowDb {
     }
 
     fn claim_due_outbox_rows(&self, claim: &OutboxClaim) -> Result<Vec<ForwardRecord>> {
+        // cand: pending, under the cap, message exists (BTreeMap = key order).
+        struct Cand {
+            key: RowKey,
+            in_flight: bool,
+            backing_off: bool,
+        }
         let mut s = self.state();
         if s.fail_claim {
             return Err(KafkaError::Internal("claim failed".to_string()));
@@ -194,18 +198,12 @@ impl ShadowDb for InMemoryShadowDb {
             .zip(&claim.inflight.local_offsets)
             .map(|((&t, &p), &o)| RowKey::new(t, p, o))
             .collect();
-        // cand: pending, under the cap, message exists (BTreeMap = key order).
-        struct Cand {
-            key: RowKey,
-            in_flight: bool,
-            backing_off: bool,
-        }
         let cands: Vec<Cand> = s
             .tracking
             .iter()
             .filter(|(k, r)| {
                 r.external_offset.is_none()
-                    && (r.retry_count as i64) < claim.max_retries
+                    && r.retry_count < claim.max_retries
                     && s.messages.contains_key(k)
             })
             .map(|(k, r)| Cand {
@@ -216,7 +214,7 @@ impl ShadowDb for InMemoryShadowDb {
                     && r.forwarded_at.is_some_and(|at| {
                         at > now
                             - retry_backoff_ms(
-                                r.retry_count as i64,
+                                r.retry_count,
                                 claim.backoff_base_ms,
                                 claim.backoff_max_ms,
                             )
@@ -242,7 +240,7 @@ impl ShadowDb for InMemoryShadowDb {
                         .is_none_or(|&b| c.key.local_offset < b)
             })
             .map(|c| (c.key, head[&c.key.partition()] == c.key.local_offset))
-            .take(claim.batch_limit.max(0) as usize)
+            .take(usize::try_from(claim.batch_limit).unwrap_or(0))
             .collect();
         let mut out = Vec::new();
         for (key, restart) in due {
@@ -325,7 +323,7 @@ impl ShadowDb for InMemoryShadowDb {
             row.forwarded_at = Some(now);
             row.attempt_open = false;
             out.transitioned += 1;
-            if row.retry_count as i64 >= max_retries {
+            if row.retry_count >= max_retries {
                 out.dead_lettered.push((*key, error.clone()));
             }
             if metrics {
@@ -369,7 +367,7 @@ fn retry_backoff_ms(retry_count: i64, base: i64, max: i64) -> i64 {
     if retry_count <= 0 {
         return 0;
     }
-    let shift = (retry_count - 1).min(30) as u32;
+    let shift = u32::try_from((retry_count - 1).min(30)).expect("0..=30 fits in u32");
     base.saturating_mul(1i64 << shift).min(max)
 }
 
