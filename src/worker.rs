@@ -101,6 +101,8 @@ extern "C" {
     // bindings. Neither raises a Postgres error.
     fn PostmasterIsAliveInternal() -> bool;
     fn disable_all_timeouts(keep_indicators: bool);
+    #[link_name = "SetLatch"]
+    fn RawSetLatch(latch: *mut pg_sys::Latch);
     #[cfg(target_os = "linux")]
     fn __errno_location() -> *mut std::ffi::c_int;
 }
@@ -118,7 +120,10 @@ unsafe extern "C-unwind" fn handle_sigterm(_signal: std::ffi::c_int) {
         (&raw mut pg_sys::InterruptPending).write_volatile(1);
         (&raw mut pg_sys::ProcDiePending).write_volatile(1);
     }
-    pg_sys::SetLatch(pg_sys::MyLatch);
+    // The raw C function, not pgrx's wrapper: the wrapper checks it runs on the main
+    // thread and panics otherwise, and a panic in a signal handler unwinds into
+    // whatever that thread was doing.
+    RawSetLatch(pg_sys::MyLatch);
     #[cfg(target_os = "linux")]
     {
         *__errno_location() = saved_errno;
@@ -449,6 +454,38 @@ fn reject_request(request: crate::kafka::KafkaRequest, error_code: i16) {
             .error_response(request.header.api_version, error_code),
     );
     let _ = request.response_tx.send(response);
+}
+
+/// The network thread's shutdown sender, for [`stop_network_on_exit`].
+static NETWORK_SHUTDOWN: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>> =
+    std::sync::Mutex::new(None);
+/// Set when the network thread has finished (its runtime is shut down).
+static NETWORK_FINISHED: AtomicBool = AtomicBool::new(false);
+
+/// Sets [`NETWORK_FINISHED`] when the network thread's closure ends, however it ends.
+struct NetworkFinished;
+impl Drop for NetworkFinished {
+    fn drop(&mut self) {
+        NETWORK_FINISHED.store(true, Ordering::SeqCst);
+    }
+}
+
+/// `before_shmem_exit` callback: ask the network thread to stop and wait for it (at
+/// most 2 s). Never unwinds into Postgres.
+unsafe extern "C-unwind" fn stop_network_on_exit(_code: std::ffi::c_int, _arg: pg_sys::Datum) {
+    let _ = catch_unwind(|| {
+        let tx = NETWORK_SHUTDOWN
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        if let Some(tx) = tx {
+            let _ = tx.send(());
+        }
+        let start = Instant::now();
+        while !NETWORK_FINISHED.load(Ordering::SeqCst) && start.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    });
 }
 
 /// Stop the network thread (bounded by `timeout`) and exit with status 1.
@@ -1042,6 +1079,7 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     let network_handle = std::thread::Builder::new()
         .name("pg_kafka-net".to_string())
         .spawn(move || {
+            let _finished = NetworkFinished;
             // Network-thread logging to stderr: warnings by default, RUST_LOG overrides.
             crate::kafka::listener::init_network_tracing();
 
@@ -1061,37 +1099,59 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
 
             // Run the listener inside the runtime context
             // IMPORTANT: from_std() must be called inside block_on() to have reactor context
-            rt.block_on(async move {
-                // Convert std listener to tokio listener inside the async context
-                // This ensures the listener is registered with THIS runtime's reactor
-                let mut tcp_listeners = Vec::new();
-                for (std_listener, security) in std_listeners.into_iter().zip(listener_securities) {
-                    match tokio::net::TcpListener::from_std(std_listener) {
-                        Ok(listener) => tcp_listeners.push((listener, security)),
-                        Err(e) => {
-                            tracing::error!("Failed to convert std listener to tokio: {}", e);
-                            return;
+            // A panic is contained here and the runtime is shut down with a bound, so no
+            // destructor runs while this thread unwinds (a panic in a destructor during
+            // unwinding aborts the process).
+            let served = catch_unwind(AssertUnwindSafe(|| {
+                rt.block_on(async move {
+                    // Convert std listener to tokio listener inside the async context
+                    // This ensures the listener is registered with THIS runtime's reactor
+                    let mut tcp_listeners = Vec::new();
+                    for (std_listener, security) in
+                        std_listeners.into_iter().zip(listener_securities)
+                    {
+                        match tokio::net::TcpListener::from_std(std_listener) {
+                            Ok(listener) => tcp_listeners.push((listener, security)),
+                            Err(e) => {
+                                tracing::error!("Failed to convert std listener to tokio: {}", e);
+                                return;
+                            }
                         }
                     }
-                }
 
-                if let Err(e) = crate::kafka::listener::run(
-                    tcp_listeners,
-                    request_lanes,
-                    credential_tx,
-                    notify_rx,
-                    forward_rx,
-                    forward_ack_tx,
-                    runtime_context_for_network,
-                    shutdown_rx,
-                )
-                .await
-                {
-                    tracing::error!("TCP listener error: {}", e);
-                }
-            });
+                    if let Err(e) = crate::kafka::listener::run(
+                        tcp_listeners,
+                        request_lanes,
+                        credential_tx,
+                        notify_rx,
+                        forward_rx,
+                        forward_ack_tx,
+                        runtime_context_for_network,
+                        shutdown_rx,
+                    )
+                    .await
+                    {
+                        tracing::error!("TCP listener error: {}", e);
+                    }
+                })
+            }));
+            if served.is_err() {
+                tracing::error!("pg_kafka network thread panicked; shutting its runtime down");
+            }
+            if catch_unwind(AssertUnwindSafe(|| {
+                rt.shutdown_timeout(Duration::from_secs(1))
+            }))
+            .is_err()
+            {
+                tracing::error!("pg_kafka network runtime shutdown panicked");
+            }
         })
         .expect("Failed to spawn network thread");
+    // wave3 worker: whatever ends the process (a FATAL from SIGTERM during database
+    // work, an ERROR escaping to the bgworker's top level, proc_exit) first stops the
+    // network thread, bounded, instead of exiting under a running tokio runtime.
+    *NETWORK_SHUTDOWN.lock().unwrap_or_else(|p| p.into_inner()) = Some(shutdown_tx.clone());
+    unsafe { pg_sys::before_shmem_exit(Some(stop_network_on_exit), pg_sys::Datum::from(0)) };
 
     // Step 9: Create consumer group coordinator
     // This manages consumer group membership state in-memory
@@ -1386,7 +1446,10 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
         // execute_batch), so heartbeat queueing delay stays bounded by one
         // in-flight request (plus RECV_TIMEOUT when idle), not by the main queue,
         // and heartbeats no longer cut produce batches short (wave 3).
-        while let Ok(request) = liveness_rx.try_recv() {
+        // One liveness batch (up to 64) per iteration, not "until empty": a flood of
+        // heartbeats must not starve the main lane (the rest are served between the
+        // main batch's requests or on the next iteration).
+        if let Ok(request) = liveness_rx.try_recv() {
             execute_batch(request, &liveness_rx, None, &env);
         }
 
@@ -1718,9 +1781,15 @@ fn serve_liveness_in_batch(
     liveness: &crossbeam_channel::Receiver<crate::kafka::KafkaRequest>,
     mut serve: impl FnMut(crate::kafka::KafkaRequest),
 ) -> usize {
+    // At most what was waiting on entry (and never more than one batch's worth), so a
+    // stream of heartbeats cannot keep the batch from its own work.
+    let limit = liveness.len().min(MAX_GROUP_COMMIT_REQUESTS);
     let mut served = 0;
-    while let Ok(request) = liveness.try_recv() {
-        serve(request);
+    while served < limit {
+        match liveness.try_recv() {
+            Ok(request) => serve(request),
+            Err(_) => break,
+        }
         served += 1;
     }
     served
@@ -2077,6 +2146,19 @@ mod tests {
             "every heartbeat served"
         );
         assert!(hb_rx.is_empty());
+    }
+
+    /// A flood of heartbeats is served at most one batch's worth per slot, so the batch
+    /// still gets to its own requests.
+    #[test]
+    fn test_heartbeat_service_per_slot_is_bounded() {
+        let (hb_tx, hb_rx) = crossbeam_channel::unbounded();
+        for i in 0..(3 * MAX_GROUP_COMMIT_REQUESTS as i32) {
+            hb_tx.send(api_versions_request(i).0).unwrap();
+        }
+        let served = serve_liveness_in_batch(&hb_rx, |_| {});
+        assert_eq!(served, MAX_GROUP_COMMIT_REQUESTS);
+        assert_eq!(hb_rx.len(), 2 * MAX_GROUP_COMMIT_REQUESTS);
     }
 
     #[test]

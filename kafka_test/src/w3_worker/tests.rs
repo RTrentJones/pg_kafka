@@ -938,13 +938,13 @@ async fn commit_failure() -> DynResult<()> {
 /// answered between its requests and the batch keeps taking queued work.
 ///
 /// Construction: four raw connections keep the liveness lane busy with pipelined
-/// Heartbeats (32 in flight each), and every produce batch is delayed 200 ms before
+/// Heartbeats (written continuously, read by a separate task), and every produce batch is delayed 200 ms before
 /// its commit (`pg_kafka.test_pre_commit_delay_ms`), so the number of batches shows in
-/// the elapsed time. 12 producers send 3 records each, one at a time. Before, each of
-/// the 36 produces committed in its own batch (>= 7 s); now concurrent produces share
-/// batches (a few rounds of ~200 ms).
+/// the elapsed time. 12 producers send 5 records each, one at a time. Before, most of
+/// the 60 produces committed in batches of their own (measured 5-6 s); now concurrent
+/// produces share batches (a few rounds of ~200 ms).
 ///
-/// Asserts: the 36 produces complete within 3.5 s while the heartbeat flood is served
+/// Asserts: the 60 produces complete within 5 s while the heartbeat flood is served
 /// (every flood connection keeps getting responses).
 pub async fn test_w3_heartbeats_do_not_split_batches() -> TestResult {
     into_test_result(heartbeats_batches().await)
@@ -977,20 +977,34 @@ async fn heartbeat_flood(stop: Arc<AtomicBool>) -> DynResult<u64> {
     frame.extend_from_slice(&body);
     let burst: Vec<u8> = frame.repeat(32);
 
-    let mut stream = tokio::net::TcpStream::connect("127.0.0.1:9092")
+    let stream = tokio::net::TcpStream::connect("127.0.0.1:9092")
         .await
         .map_err(boxed)?;
+    let (mut reader, mut writer) = stream.into_split();
+    // Writer and reader are decoupled: the socket always holds unread Heartbeats, so
+    // the broker re-fills the liveness lane the moment it has room.
+    let writer_stop = stop.clone();
+    let writing = tokio::spawn(async move {
+        while !writer_stop.load(Ordering::Relaxed) {
+            if writer.write_all(&burst).await.is_err() {
+                break;
+            }
+        }
+    });
     let mut responses = 0u64;
     while !stop.load(Ordering::Relaxed) {
-        stream.write_all(&burst).await.map_err(boxed)?;
-        for _ in 0..32 {
-            let mut size = [0u8; 4];
-            stream.read_exact(&mut size).await.map_err(boxed)?;
-            let mut buf = vec![0u8; i32::from_be_bytes(size) as usize];
-            stream.read_exact(&mut buf).await.map_err(boxed)?;
-            responses += 1;
+        let mut size = [0u8; 4];
+        match tokio::time::timeout(Duration::from_millis(500), reader.read_exact(&mut size)).await {
+            Ok(r) => {
+                r.map_err(boxed)?;
+            }
+            Err(_) => continue,
         }
+        let mut buf = vec![0u8; i32::from_be_bytes(size) as usize];
+        reader.read_exact(&mut buf).await.map_err(boxed)?;
+        responses += 1;
     }
+    writing.abort();
     Ok(responses)
 }
 
@@ -1019,7 +1033,7 @@ async fn heartbeats_batches() -> DynResult<()> {
             let p = p.clone();
             let t = topic.clone();
             tasks.push(tokio::spawn(async move {
-                for i in 0..3 {
+                for i in 0..5 {
                     send(&p, &t, &format!("r{}", i)).await?;
                 }
                 Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
@@ -1039,7 +1053,7 @@ async fn heartbeats_batches() -> DynResult<()> {
     }
     let took = result?;
     println!(
-        "Step 1: 36 produces in {:?} while the flood got {:?} heartbeat responses",
+        "Step 1: 60 produces in {:?} while the flood got {:?} heartbeat responses",
         took, served
     );
     assert!(
@@ -1047,7 +1061,7 @@ async fn heartbeats_batches() -> DynResult<()> {
         "every heartbeat connection must be served"
     );
     assert!(
-        took < Duration::from_millis(3500),
+        took < Duration::from_millis(5000),
         "produces were committed one batch each under heartbeat traffic ({:?})",
         took
     );

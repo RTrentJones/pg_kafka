@@ -202,7 +202,8 @@ pg_kafka.compression_type = 'gzip'
   one message, later partitions return only what still fits (sizes are estimated as
   key + value + 64 bytes per record, the same accounting `partition_max_bytes` uses)
 - ✅ Long polling (max_wait_ms/min_bytes support). A waiting fetch is re-run only
-  when a Produce to one of its partitions (or, for `read_committed`, any EndTxn)
+  when a Produce to one of its partitions (or, for `read_committed`, any transaction
+  end: EndTxn, an abort by fencing InitProducerId or by the transaction timeout)
   signals new data, at `max_wait_ms`, or at the slow safety-net interval
   `pg_kafka.fetch_poll_interval_ms` (default 1000 ms) — idle consumers do not
   generate repeated fetch work on the DB thread
