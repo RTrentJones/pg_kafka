@@ -11,14 +11,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use super::lifecycle::{begin_db_work, end_db_work};
 use crate::kafka::dispatch::RequestOutcome;
+use crate::kafka::{ERROR_KAFKA_STORAGE_ERROR, ERROR_REQUEST_TIMED_OUT};
 use crate::pg_warning;
-
-/// Kafka error code KAFKA_STORAGE_ERROR (retriable): what a request gets when its batch
-/// could not run or commit (schema missing, commit failure).
-pub(super) const ERROR_KAFKA_STORAGE_ERROR: i16 = 56;
-
-/// Kafka error code REQUEST_TIMED_OUT (retriable): the batch timed out waiting on a lock.
-pub(super) const ERROR_REQUEST_TIMED_OUT: i16 = 7;
 
 /// Key of the pg_kafka schema lock: a transaction-level advisory lock every worker
 /// transaction takes in SHARE mode right after the extension lock. Whatever must not

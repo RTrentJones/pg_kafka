@@ -497,7 +497,7 @@ mod tests {
         ApiVersionsRequestData, ProduceRequestData, RequestBody, RequestHeader,
     };
     use crate::kafka::constants::{API_KEY_API_VERSIONS, API_KEY_FETCH};
-    use crate::worker::txn::ERROR_KAFKA_STORAGE_ERROR;
+    use crate::kafka::ERROR_KAFKA_STORAGE_ERROR;
 
     #[test]
     fn test_batch_has_room_stops_at_cap_and_budget_only() {
