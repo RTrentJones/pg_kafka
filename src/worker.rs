@@ -294,7 +294,11 @@ fn wait_for_schema(database: &str) -> bool {
 /// postmaster does not restart workers, so status 1 is also correct there (it is
 /// what Postgres's own default SIGTERM handler for bgworkers does).
 fn exit_for_restart() -> ! {
-    unsafe { pg_sys::proc_exit(1) }
+    unsafe { pg_sys::proc_exit(1) };
+    // PG18 declares proc_exit with a leading `pg_noreturn`, which bindgen does not turn
+    // into `-> !`, so the binding returns `()` there.
+    #[cfg(feature = "pg18")]
+    unreachable!("proc_exit returned")
 }
 
 /// How long the postmaster waits before restarting a worker that exited
