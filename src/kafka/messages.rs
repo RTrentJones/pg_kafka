@@ -1,19 +1,9 @@
-// Message types module for pg_kafka
-//
-// This module defines the message types used to communicate between
-// the network thread (tokio) and the database thread (main BGWorker).
-//
-// ## Two-Thread Architecture
-//
-// - Network thread: Parses Kafka requests, sends via crossbeam channel
-// - Database thread: Receives requests, processes via SPI, sends responses
-// - Response channel: Per-connection tokio mpsc for async response handling
-//
-// The crossbeam channel is created in worker.rs and passed to the listener.
-//
-// The per-API request and response bodies are generated from the API registry in
-// `crate::kafka::api`; this module holds the envelopes around them and the request data
-// types the handlers take.
+//! What travels between the network thread and the DB thread.
+//!
+//! [`KafkaRequest`] and [`KafkaResponse`] are the envelopes around the per-API bodies, which
+//! the API registry (`crate::kafka::api`) generates; [`RequestLanes`] are the two channels
+//! requests cross on, created in `worker.rs` and handed to the listener; the remaining types
+//! are the request data the handlers take.
 
 use crate::kafka::api::{Lane, RequestBody, RequestHeader, ResponseBody};
 
@@ -24,17 +14,15 @@ pub type TxnOffsetCommitTopics = Vec<(String, Vec<(i32, i64, Option<String>)>)>;
 /// (resource_type, resource_name, [(config_name, operation, value)])
 pub type AlterConfigsResources = Vec<(i8, String, Vec<(String, i8, Option<String>)>)>;
 
-/// DR-12 (DEEP-REVIEW-2026-07): the two request lanes from the network thread to
-/// the single DB thread.
+/// The two request lanes from the network thread to the single DB thread.
 ///
-/// All requests used to share one FIFO channel, so a heavy Produce (large UNNEST,
-/// advisory-lock wait) delayed every queued Heartbeat behind it — and under DB
-/// pressure, delayed heartbeats cascade into spurious consumer-group rebalances,
-/// a self-amplifying failure mode. Heartbeat is served purely from the in-memory
-/// coordinator, so it now travels on a dedicated `liveness` lane that the worker
-/// drains *before* taking the next main-lane request. A heartbeat can still wait
-/// behind the one request currently executing, but never behind the queue. Which
-/// lane an API uses is [`crate::kafka::api::KafkaApi::LANE`].
+/// On one FIFO channel a heavy Produce (large UNNEST, advisory-lock wait) would delay
+/// every queued Heartbeat behind it, and under DB pressure delayed heartbeats cascade into
+/// spurious consumer-group rebalances, which add more load. Heartbeat is served purely from
+/// the in-memory coordinator, so it travels on a dedicated `liveness` lane that the worker
+/// drains *before* taking the next main-lane request: a heartbeat can wait behind the one
+/// request executing, never behind the queue. Which lane an API uses is
+/// [`crate::kafka::api::KafkaApi::LANE`].
 #[derive(Clone)]
 pub struct RequestLanes {
     /// Everything except liveness traffic (Produce, Fetch, Metadata, ...).
@@ -67,10 +55,10 @@ pub struct KafkaRequest {
 impl KafkaRequest {
     /// Replace this request's response channel, returning the previous sender.
     ///
-    /// RB-1: the worker swaps in a same-typed buffer channel before dispatching
+    /// The worker swaps in a same-typed buffer channel before dispatching
     /// the request and forwards buffered responses to the returned (real) sender
     /// only after `BackgroundWorker::transaction` has committed, so a client can
-    /// never observe an ack for state that is not yet durable/visible.
+    /// never observe an ack for state that is not yet durable/visible (RB-1).
     ///
     /// APIs whose reply the coordinator may hold past the request's transaction
     /// ([`crate::kafka::api::KafkaApi::DEFERRED_REPLY`]: JoinGroup, SyncGroup) are the
@@ -129,8 +117,8 @@ pub struct PartitionProduceData {
     pub partition_index: i32,
     /// Records to write
     pub records: Vec<Record>,
-    /// Producer metadata extracted from RecordBatch header (Phase 9)
-    /// None for non-idempotent producers or when metadata extraction fails
+    /// Producer metadata from the RecordBatch header; `None` when the partition carried no
+    /// record data (null records).
     pub producer_metadata: Option<ProducerMetadata>,
 }
 
@@ -147,10 +135,8 @@ pub struct Record {
     pub timestamp: Option<i64>,
 }
 
-/// Producer metadata from RecordBatch header (Phase 9 - Idempotent Producer)
-///
-/// This struct captures the producer identity and sequence information
-/// from a RecordBatch for idempotent producer validation.
+/// The producer identity and sequence of a RecordBatch, for idempotent-producer
+/// validation.
 #[derive(Debug, Clone, Default)]
 pub struct ProducerMetadata {
     /// Producer ID allocated by InitProducerId (-1 for non-idempotent producers)
@@ -271,7 +257,7 @@ pub struct ListOffsetsPartitionData {
 
 // ========== Admin API Request Types ==========
 
-/// Request data for creating a single topic (Phase 6)
+/// Request data for creating a single topic.
 #[derive(Debug, Clone)]
 pub struct CreateTopicRequest {
     /// Topic name
@@ -282,7 +268,7 @@ pub struct CreateTopicRequest {
     pub replication_factor: i16,
 }
 
-/// Request data for adding partitions to a topic (Phase 6)
+/// Request data for adding partitions to a topic.
 #[derive(Debug, Clone)]
 pub struct CreatePartitionsTopicRequest {
     /// Topic name
@@ -291,8 +277,7 @@ pub struct CreatePartitionsTopicRequest {
     pub count: i32,
 }
 
-// ========== From implementations for type conversions ==========
-// These reduce boilerplate conversion code in decoding.rs
+// ========== Conversions from the wire types ==========
 
 impl From<kafka_protocol::messages::join_group_request::JoinGroupRequestProtocol>
     for JoinGroupProtocol
@@ -337,12 +322,6 @@ impl From<kafka_protocol::messages::list_offsets_request::ListOffsetsPartition>
     }
 }
 
-// Note: The request channel is now created in worker.rs and passed explicitly
-// to the listener. This enables:
-// - Bounded channels for backpressure (10,000 capacity)
-// - Cleaner ownership model (no global static)
-// - Easier testing with injected channels
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,9 +344,9 @@ mod tests {
         )
     }
 
-    // ========== RequestLanes Tests (DR-12) ==========
+    // ========== RequestLanes Tests ==========
 
-    /// DR-12: Heartbeat must route to the liveness lane; everything else to the
+    /// Heartbeat must route to the liveness lane; everything else to the
     /// main lane. Misrouting either way silently loses the liveness guarantee
     /// (heartbeats queue behind produce) or starves the main lane's ordering.
     #[test]
@@ -433,7 +412,7 @@ mod tests {
 
     // ========== RB-1 barrier accessor tests ==========
 
-    /// RB-1: `swap_response_tx` must install the new sender on the request and
+    /// `swap_response_tx` must install the new sender on the request and
     /// hand back the original one. If the swap silently returned the wrong end,
     /// the worker's post-commit flush would deliver responses to the buffer
     /// instead of the client (hang) or vice versa (barrier bypassed).
@@ -470,7 +449,7 @@ mod tests {
         );
     }
 
-    /// RB-1: every non-deferred API gets the buffer installed by `swap_response_tx`.
+    /// Every non-deferred API gets the buffer installed by `swap_response_tx`.
     #[test]
     fn test_swap_response_tx_all_apis() {
         for info in crate::kafka::api::tests::worker_apis() {
@@ -547,10 +526,10 @@ mod tests {
     #[test]
     fn test_record_header_with_empty_key() {
         let header = RecordHeader {
-            key: "".to_string(),
+            key: String::new(),
             value: b"value".to_vec(),
         };
-        assert!(header.key.is_empty());
+        assert_eq!(header.key, "");
         assert_eq!(header.value, b"value".to_vec());
     }
 
@@ -561,7 +540,7 @@ mod tests {
             value: vec![],
         };
         assert_eq!(header.key, "key");
-        assert!(header.value.is_empty());
+        assert_eq!(header.value, [] as [u8; 0]);
     }
 
     #[test]
@@ -581,7 +560,7 @@ mod tests {
             key: "debug-key".to_string(),
             value: vec![0xDE, 0xAD],
         };
-        let debug_str = format!("{:?}", header);
+        let debug_str = format!("{header:?}");
         assert!(debug_str.contains("debug-key"));
         assert!(debug_str.contains("RecordHeader"));
     }
@@ -611,12 +590,12 @@ mod tests {
                 key: "h1".to_string(),
                 value: b"v1".to_vec(),
             }],
-            timestamp: Some(1234567890123),
+            timestamp: Some(1_234_567_890_123),
         };
         assert_eq!(record.key, Some(b"my-key".to_vec()));
         assert_eq!(record.value, Some(b"my-value".to_vec()));
         assert_eq!(record.headers.len(), 1);
-        assert_eq!(record.timestamp, Some(1234567890123));
+        assert_eq!(record.timestamp, Some(1_234_567_890_123));
     }
 
     #[test]
@@ -847,11 +826,11 @@ mod tests {
         let data = PartitionFetchData {
             partition_index: 3,
             fetch_offset: 12345,
-            partition_max_bytes: 1048576,
+            partition_max_bytes: 1_048_576,
         };
         assert_eq!(data.partition_index, 3);
         assert_eq!(data.fetch_offset, 12345);
-        assert_eq!(data.partition_max_bytes, 1048576);
+        assert_eq!(data.partition_max_bytes, 1_048_576);
     }
 
     // ========== OffsetCommitTopicData Tests ==========
@@ -996,9 +975,9 @@ mod tests {
         let data = ListOffsetsPartitionData {
             partition_index: 1,
             current_leader_epoch: 5,
-            timestamp: 1704067200000, // 2024-01-01 00:00:00 UTC
+            timestamp: 1_704_067_200_000, // 2024-01-01 00:00:00 UTC
         };
-        assert_eq!(data.timestamp, 1704067200000);
+        assert_eq!(data.timestamp, 1_704_067_200_000);
         assert_eq!(data.current_leader_epoch, 5);
     }
 

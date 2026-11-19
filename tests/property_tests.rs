@@ -1,7 +1,5 @@
-// Property-based tests using proptest for fuzzing Kafka protocol implementation
-//
-// These tests generate random inputs to verify our protocol handling is robust
-// against edge cases, extreme values, and malformed data.
+//! Property tests of the Kafka wire encodings pg_kafka relies on: header fields, size and
+//! port fields, round-tripping through kafka-protocol for arbitrary values.
 
 #[cfg(test)]
 mod property_tests {
@@ -26,10 +24,7 @@ mod property_tests {
 
         #[test]
         fn test_api_key_header_roundtrip(api_key in 0i16..100i16) {
-            // DR-18 (DEEP-REVIEW-2026-07): the old form asserted the sampled value
-            // was inside its own sampling range — a tautology. Assert something
-            // real instead: any api_key encodes into a request header and decodes
-            // back unchanged.
+            // Property: any api_key encodes into a request header and reads back unchanged.
             use bytes::BytesMut;
             use kafka_protocol::messages::RequestHeader;
             use kafka_protocol::protocol::Encodable;
@@ -44,7 +39,7 @@ mod property_tests {
         }
 
         #[test]
-        fn test_size_field_encoding(size in 1i32..1000000i32) {
+        fn test_size_field_encoding(size in 1i32..1_000_000_i32) {
             // Property: Size fields should round-trip correctly
             let size_bytes = size.to_be_bytes();
             let decoded_size = i32::from_be_bytes(size_bytes);

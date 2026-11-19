@@ -1,10 +1,6 @@
-//! Kafka-compatible partitioner
-//!
-//! Implements partition selection for ProduceRequests when the client
-//! doesn't specify an explicit partition (partition_index = -1).
-//!
-//! Uses the `murmur2` crate with `KAFKA_SEED` for hash-based routing,
-//! matching Apache Kafka's default partitioner behavior.
+//! Kafka-compatible partition selection for records produced without an explicit partition
+//! (partition_index = -1): murmur2 with Kafka's seed for keyed records, as Apache Kafka's
+//! default partitioner does.
 
 use murmur2::{murmur2, KAFKA_SEED};
 use rand::Rng;
@@ -35,26 +31,20 @@ pub fn compute_partition(key: Option<&[u8]>, partition_count: i32, explicit_part
         return explicit_partition;
     }
 
-    // BUG-8: guard the modulo / random paths against a non-positive partition count. In release
-    // builds there is no debug_assert, so `% 0` and gen_range(0..0) would panic and abort the
-    // produce request. A real topic always has >= 1 partition, so this is purely defensive.
+    // `% 0` and gen_range(0..0) would panic and abort the produce request. A real topic always
+    // has >= 1 partition, so this only guards against a corrupt partition count.
     if partition_count <= 0 {
         return 0;
     }
 
-    match key {
-        Some(k) => {
-            // Hash-based routing using Kafka-compatible murmur2
-            let hash = murmur2(k, KAFKA_SEED);
-            // Mask sign bit (& 0x7fffffff) then modulo
-            // This matches Kafka's Utils.toPositive(Utils.murmur2(key)) % numPartitions
-            ((hash & 0x7fffffff) as i32) % partition_count
-        }
-        None => {
-            // Random partition for null keys
-            let mut rng = rand::thread_rng();
-            rng.gen_range(0..partition_count)
-        }
+    if let Some(k) = key {
+        // Kafka's Utils.toPositive(Utils.murmur2(key)) % numPartitions: clear the sign bit,
+        // then take the remainder.
+        (murmur2(k, KAFKA_SEED) & 0x7fff_ffff).cast_signed() % partition_count
+    } else {
+        // Random partition for null keys
+        let mut rng = rand::thread_rng();
+        rng.gen_range(0..partition_count)
     }
 }
 
@@ -64,7 +54,7 @@ mod tests {
 
     #[test]
     fn test_non_positive_partition_count_no_panic() {
-        // BUG-8: a degenerate partition_count must not panic (% 0 / gen_range(0..0) would).
+        // A degenerate partition_count must not panic (% 0 / gen_range(0..0) would).
         assert_eq!(compute_partition(Some(b"k"), 0, -1), 0);
         assert_eq!(compute_partition(None, 0, -1), 0);
         assert_eq!(compute_partition(Some(b"k"), -5, -1), 0);
@@ -104,7 +94,7 @@ mod tests {
         // With enough different keys, we should see different partitions
         let mut seen_partitions = std::collections::HashSet::new();
         for i in 0..1000 {
-            let key = format!("key-{}", i);
+            let key = format!("key-{i}");
             let partition = compute_partition(Some(key.as_bytes()), partition_count, -1);
             seen_partitions.insert(partition);
         }
@@ -125,9 +115,7 @@ mod tests {
             let partition = compute_partition(None, partition_count, -1);
             assert!(
                 partition >= 0 && partition < partition_count,
-                "Partition {} out of range [0, {})",
-                partition,
-                partition_count
+                "Partition {partition} out of range [0, {partition_count})"
             );
         }
     }
@@ -175,21 +163,19 @@ mod tests {
         // Statistical test: with 10000 messages across 10 partitions,
         // each partition should get roughly 1000 (allow 500-1500 range)
         let partition_count = 10;
-        let mut counts = vec![0u32; partition_count as usize];
+        let mut counts = [0u32; 10];
 
         for i in 0..10000 {
-            let key = format!("unique-key-{}", i);
+            let key = format!("unique-key-{i}");
             let partition = compute_partition(Some(key.as_bytes()), partition_count, -1);
-            counts[partition as usize] += 1;
+            counts[usize::try_from(partition).unwrap()] += 1;
         }
 
         // Check each partition got a reasonable share
         for (i, &count) in counts.iter().enumerate() {
             assert!(
                 (500..=1500).contains(&count),
-                "Partition {} got {} messages, expected ~1000",
-                i,
-                count
+                "Partition {i} got {count} messages, expected ~1000"
             );
         }
     }

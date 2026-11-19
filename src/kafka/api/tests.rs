@@ -26,9 +26,9 @@ pub(crate) fn sample_request(api_key: i16) -> RequestBody {
     encode_default_request(api_key, header.api_version, &mut buf);
     match decode_body(&mut buf, header, tx) {
         Ok(Decoded::Request(request)) => request.body,
-        Ok(Decoded::Answered) => panic!("api_key {} default request was rejected", api_key),
-        Ok(Decoded::Close(reason)) => panic!("api_key {}: {}", api_key, reason),
-        Err(_) => panic!("api_key {} is not registered", api_key),
+        Ok(Decoded::Answered) => panic!("api_key {api_key} default request was rejected"),
+        Ok(Decoded::Close(reason)) => panic!("api_key {api_key}: {reason}"),
+        Err((_header, _tx)) => panic!("api_key {api_key} is not registered"),
     }
 }
 
@@ -129,7 +129,7 @@ fn registry_matches_the_api_key_constants() {
     ];
     assert_eq!(APIS.len(), expected.len());
     for (key, name) in expected {
-        assert_eq!(api_name(key), name, "api key {}", key);
+        assert_eq!(api_name(key), name, "api key {key}");
     }
 }
 
@@ -253,7 +253,7 @@ fn truncated_body_gets_invalid_request_with_correlation_id() {
     assert_eq!(response.api_version, 3);
     match response.body {
         ResponseBody::Heartbeat(r) => assert_eq!(r.error_code, ERROR_INVALID_REQUEST),
-        other => panic!("expected a Heartbeat response, got {:?}", other),
+        other => panic!("expected a Heartbeat response, got {other:?}"),
     }
 }
 
@@ -307,7 +307,7 @@ fn unsupported_version_echoes_the_decoded_request() {
             assert_eq!(r.topics[0].name.as_ref().unwrap().as_str(), "orders");
             assert_eq!(r.topics[0].error_code, ERROR_UNSUPPORTED_VERSION);
         }
-        other => panic!("expected Metadata, got {:?}", other),
+        other => panic!("expected Metadata, got {other:?}"),
     }
 }
 
@@ -332,7 +332,7 @@ fn unsupported_fetch_version_reports_top_level_and_partition_codes() {
                 ERROR_UNSUPPORTED_VERSION
             );
         }
-        other => panic!("expected Fetch, got {:?}", other),
+        other => panic!("expected Fetch, got {other:?}"),
     }
 }
 
@@ -353,7 +353,7 @@ fn version_without_a_response_format_closes_the_connection() {
 #[test]
 fn handler_error_echoes_requested_partitions() {
     // A handler Err for an API without a top-level error code reports the code on every
-    // requested partition (previously an empty response the client read as success).
+    // requested partition; an empty response would read as success to the client.
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let header = RequestHeader {
         api_key: API_KEY_LIST_OFFSETS,
@@ -385,7 +385,7 @@ fn handler_error_echoes_requested_partitions() {
             assert_eq!(p.error_code, ERROR_UNKNOWN_SERVER_ERROR);
             assert_eq!(p.offset, -1);
         }
-        other => panic!("expected ListOffsets, got {:?}", other),
+        other => panic!("expected ListOffsets, got {other:?}"),
     }
 }
 
@@ -419,7 +419,7 @@ fn handler_panic_echoes_requested_partitions_and_resumes() {
                 .collect();
             assert_eq!(codes, vec![ERROR_UNKNOWN_SERVER_ERROR; 2]);
         }
-        other => panic!("expected DeleteRecords, got {:?}", other),
+        other => panic!("expected DeleteRecords, got {other:?}"),
     }
 }
 
@@ -443,7 +443,7 @@ fn commit_failure_echo_reports_every_produce_partition() {
             let p = &r.responses[0].partition_responses[0];
             assert_eq!((p.index, p.error_code), (4, ERROR_UNKNOWN_SERVER_ERROR));
         }
-        other => panic!("expected Produce, got {:?}", other),
+        other => panic!("expected Produce, got {other:?}"),
     }
 }
 
@@ -475,7 +475,7 @@ fn error_responses_without_echo_still_carry_top_level_codes() {
         }),
     ] {
         let body = error_response_for(key, 0, ERROR_INVALID_REQUEST).unwrap();
-        assert_eq!(code_of(&body), ERROR_INVALID_REQUEST, "api key {}", key);
+        assert_eq!(code_of(&body), ERROR_INVALID_REQUEST, "api key {key}");
         assert!(body.has_error());
     }
 }
@@ -507,8 +507,7 @@ fn network_thread_apis_are_advertised_but_never_reach_the_worker() {
         let (parsed, response) = parse(buf);
         assert!(
             parsed.is_err(),
-            "api key {} must not be decoded for the worker",
-            key
+            "api key {key} must not be decoded for the worker"
         );
         assert!(response.is_none());
         let body = error_response_for(key, 1, ERROR_ILLEGAL_SASL_STATE).unwrap();

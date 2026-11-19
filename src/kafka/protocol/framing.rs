@@ -1,26 +1,23 @@
 //! Request framing on the network thread: the 4-byte big-endian length prefix.
 //!
-//! [`FrameCodec`] splits the byte stream into request frames and writes response frames.
-//! It replaces `LengthDelimitedCodec`, which (a) reserved the full declared length of a
-//! frame as soon as its 4-byte prefix arrived and (b) capped *outbound* frames at the
-//! inbound request limit. With (a), the global reservation budget had to be charged on the
-//! prefix, so a handful of connections that each sent only a length prefix held the whole
-//! budget and locked every other client out (wave 3, net item 1). With (b), a response
-//! larger than 100 MB failed to encode and the connection hung (item 2).
+//! [`FrameCodec`] splits a connection's byte stream into request frames and writes response
+//! frames. It bounds what peers can make the broker hold:
 //!
-//! Now:
-//!
-//! * memory is reserved as payload bytes actually arrive, and the global budget
-//!   ([`FRAME_RESERVE_REMAINING`]) is charged for the bytes buffered of an incomplete
-//!   frame, so holding budget costs the peer real traffic; frames up to
-//!   [`UNMETERED_FRAME_BYTES`] are never charged (control traffic such as ApiVersions,
-//!   Metadata and Heartbeat cannot be locked out by large frames);
-//! * one connection holds at most one incomplete frame, i.e. at most
-//!   `MAX_REQUEST_SIZE` (under a fifth of the budget);
+//! * memory is reserved as payload bytes arrive, never for a length that is merely
+//!   declared, and the global budget ([`FRAME_RESERVE_REMAINING`]) is charged for the bytes
+//!   buffered of an incomplete frame, so holding budget costs the peer real traffic. Charging
+//!   on the prefix would let a handful of connections that send only a length prefix hold
+//!   the whole budget and lock every other client out;
+//! * frames up to [`UNMETERED_FRAME_BYTES`] are never charged, so control traffic
+//!   (ApiVersions, Metadata, Heartbeat) cannot be locked out by large frames;
+//! * one connection holds at most one incomplete frame, i.e. at most `MAX_REQUEST_SIZE`
+//!   (under a fifth of the budget);
 //! * [`FrameClock`] records when the incomplete frame started arriving so the connection
-//!   can enforce a per-frame read deadline (`pg_kafka.request_read_timeout_ms`);
-//! * outbound frames are only bounded by the wire format (`i32::MAX`); a response's size
-//!   is bounded by the request's own `max_bytes`, as in Kafka.
+//!   can enforce a per-frame read deadline (`pg_kafka.request_read_timeout_ms`).
+//!
+//! Outbound frames are bounded only by the wire format (`i32::MAX`), not by the inbound
+//! request limit: a response's size is bounded by the request's own `max_bytes`, as in
+//! Kafka.
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -31,7 +28,7 @@ use tokio_util::codec::{Decoder, Encoder};
 use crate::kafka::constants::MAX_REQUEST_SIZE;
 
 /// Total bytes that may be buffered across all connections for incomplete frames larger
-/// than [`UNMETERED_FRAME_BYTES`] (RV-9).
+/// than [`UNMETERED_FRAME_BYTES`].
 pub const FRAME_RESERVE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 
 /// Frames up to this size are never charged to the budget. They are bounded by the
@@ -41,6 +38,12 @@ pub const UNMETERED_FRAME_BYTES: usize = 1024 * 1024;
 /// Largest frame an unauthenticated client may send on a SASL listener (Kafka's
 /// `sasl.server.max.receive.size` default).
 pub const PRE_AUTH_MAX_FRAME: usize = 512 * 1024;
+
+/// Bytes of the big-endian length prefix in front of every frame.
+const LENGTH_PREFIX_BYTES: usize = 4;
+
+/// Smallest step the buffer of an incomplete large frame grows by.
+const MIN_BUFFER_GROWTH: usize = 64 * 1024;
 
 /// Remaining global budget, in bytes.
 pub static FRAME_RESERVE_REMAINING: AtomicUsize = AtomicUsize::new(FRAME_RESERVE_BUDGET_BYTES);
@@ -95,7 +98,10 @@ impl FrameClock {
     }
 
     fn now_mark(&self) -> u64 {
-        self.epoch.elapsed().as_millis() as u64 + 1
+        // Saturates after 584 million years of uptime.
+        u64::try_from(self.epoch.elapsed().as_millis())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1)
     }
 
     /// A frame has started arriving (no-op while one is already pending).
@@ -178,15 +184,14 @@ impl Decoder for FrameCodec {
             return Ok(None);
         }
         self.clock.mark_started();
-        if src.len() < 4 {
+        let Some(prefix) = src.first_chunk::<LENGTH_PREFIX_BYTES>() else {
             return Ok(None);
-        }
-        let len = u32::from_be_bytes([src[0], src[1], src[2], src[3]]) as usize;
-        if len > MAX_REQUEST_SIZE as usize {
+        };
+        let len = u32::from_be_bytes(*prefix) as usize;
+        if len > MAX_REQUEST_SIZE {
             self.release();
             return Err(std::io::Error::other(format!(
-                "frame of {} bytes exceeds the maximum request size of {} bytes",
-                len, MAX_REQUEST_SIZE
+                "frame of {len} bytes exceeds the maximum request size of {MAX_REQUEST_SIZE} bytes"
             )));
         }
         let limit = self.limit.load(Ordering::Relaxed);
@@ -196,12 +201,12 @@ impl Decoder for FrameCodec {
                 "frame larger than allowed before SASL authentication",
             ));
         }
-        let total = 4 + len;
+        let total = LENGTH_PREFIX_BYTES + len;
         if src.len() >= total {
             self.release();
             self.clock.clear();
             let mut frame = src.split_to(total);
-            frame.advance(4);
+            frame.advance(LENGTH_PREFIX_BYTES);
             if !src.is_empty() {
                 // The next frame has started arriving.
                 self.clock.mark_started();
@@ -212,7 +217,7 @@ impl Decoder for FrameCodec {
         // declared, and let the buffer grow as bytes arrive (at most doubling, bounded by
         // the frame) instead of reserving the declared length up front.
         if len > UNMETERED_FRAME_BYTES {
-            let buffered = src.len() - 4;
+            let buffered = src.len() - LENGTH_PREFIX_BYTES;
             if buffered > self.charged {
                 let delta = buffered - self.charged;
                 if !charge_frame_budget(self.budget, delta) {
@@ -223,7 +228,7 @@ impl Decoder for FrameCodec {
                 }
                 self.charged = buffered;
             }
-            let want = (total - src.len()).min(src.len().max(64 * 1024));
+            let want = (total - src.len()).min(src.len().max(MIN_BUFFER_GROWTH));
             src.reserve(want);
         }
         Ok(None)
@@ -242,14 +247,14 @@ impl Encoder<Bytes> for FrameCodec {
     type Error = std::io::Error;
 
     fn encode(&mut self, item: Bytes, dst: &mut BytesMut) -> std::io::Result<()> {
-        if item.len() > i32::MAX as usize {
-            return Err(std::io::Error::other(format!(
+        let len = i32::try_from(item.len()).map_err(|_| {
+            std::io::Error::other(format!(
                 "response of {} bytes does not fit a Kafka frame",
                 item.len()
-            )));
-        }
-        dst.reserve(4 + item.len());
-        dst.put_u32(item.len() as u32);
+            ))
+        })?;
+        dst.reserve(LENGTH_PREFIX_BYTES + item.len());
+        dst.put_i32(len);
         dst.extend_from_slice(&item);
         Ok(())
     }
@@ -263,7 +268,7 @@ mod tests {
         let clock = Arc::new(FrameClock::new());
         (
             FrameCodec::with_budget(
-                Arc::new(AtomicUsize::new(MAX_REQUEST_SIZE as usize)),
+                Arc::new(AtomicUsize::new(MAX_REQUEST_SIZE)),
                 clock.clone(),
                 budget,
             ),
@@ -272,7 +277,7 @@ mod tests {
     }
 
     fn frame(payload: &[u8]) -> Vec<u8> {
-        let mut v = (payload.len() as u32).to_be_bytes().to_vec();
+        let mut v = u32::try_from(payload.len()).unwrap().to_be_bytes().to_vec();
         v.extend_from_slice(payload);
         v
     }
@@ -302,8 +307,8 @@ mod tests {
 
     #[test]
     fn a_length_prefix_alone_reserves_and_charges_nothing() {
-        // Item 1 (fail-before: LengthDelimitedCodec reserved the declared 99 MB and the old
-        // codec charged it to the budget on the prefix).
+        // A codec that reserved (or charged) the declared 99 MB on the prefix would let a
+        // few idle connections exhaust memory or the budget.
         static B: AtomicUsize = AtomicUsize::new(FRAME_RESERVE_BUDGET_BYTES);
         let (mut c, _clock) = codec(&B);
         let mut src = BytesMut::from(&99_999_999u32.to_be_bytes()[..]);
@@ -319,7 +324,7 @@ mod tests {
         let (mut c, _clock) = codec(&B);
         let len = 3 * 1024 * 1024;
         let mut src = BytesMut::new();
-        src.extend_from_slice(&(len as u32).to_be_bytes());
+        src.extend_from_slice(&u32::try_from(len).unwrap().to_be_bytes());
         src.extend_from_slice(&vec![7u8; 2 * 1024 * 1024]);
         assert!(c.decode(&mut src).unwrap().is_none());
         assert_eq!(c.charged(), 2 * 1024 * 1024);
@@ -373,7 +378,8 @@ mod tests {
     fn oversized_and_pre_auth_frames_are_refused() {
         static B: AtomicUsize = AtomicUsize::new(FRAME_RESERVE_BUDGET_BYTES);
         let (mut c, _clock) = codec(&B);
-        let mut src = BytesMut::from(&(MAX_REQUEST_SIZE as u32 + 1).to_be_bytes()[..]);
+        let oversized = u32::try_from(MAX_REQUEST_SIZE + 1).unwrap();
+        let mut src = BytesMut::from(&oversized.to_be_bytes()[..]);
         assert!(c.decode(&mut src).is_err());
         // Lengths with the top bit set (negative i32) are oversized too.
         let mut src = BytesMut::from(&u32::MAX.to_be_bytes()[..]);
@@ -382,23 +388,25 @@ mod tests {
         let clock = Arc::new(FrameClock::new());
         let mut c =
             FrameCodec::with_budget(Arc::new(AtomicUsize::new(PRE_AUTH_MAX_FRAME)), clock, &B);
-        let mut src = BytesMut::from(&(PRE_AUTH_MAX_FRAME as u32 + 1).to_be_bytes()[..]);
+        let mut src =
+            BytesMut::from(&(u32::try_from(PRE_AUTH_MAX_FRAME).unwrap() + 1).to_be_bytes()[..]);
         assert!(c.decode(&mut src).is_err());
         assert_eq!(c.charged(), 0);
     }
 
     #[test]
     fn encoder_has_no_request_size_cap() {
-        // Item 2 (fail-before: LengthDelimitedCodec refused to encode > MAX_REQUEST_SIZE).
+        // A response larger than the request limit must still be framed, or the
+        // connection would hang on it.
         static B: AtomicUsize = AtomicUsize::new(FRAME_RESERVE_BUDGET_BYTES);
         let (mut c, _clock) = codec(&B);
-        let big = Bytes::from(vec![0u8; MAX_REQUEST_SIZE as usize + 10]);
+        let big = Bytes::from(vec![0u8; MAX_REQUEST_SIZE + 10]);
         let mut dst = BytesMut::new();
         c.encode(big, &mut dst).unwrap();
-        assert_eq!(dst.len(), MAX_REQUEST_SIZE as usize + 14);
+        assert_eq!(dst.len(), MAX_REQUEST_SIZE + 14);
         assert_eq!(
             u32::from_be_bytes([dst[0], dst[1], dst[2], dst[3]]) as usize,
-            MAX_REQUEST_SIZE as usize + 10
+            MAX_REQUEST_SIZE + 10
         );
     }
 

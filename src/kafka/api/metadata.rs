@@ -72,7 +72,7 @@ pub struct MetadataApi;
 pub struct MetadataRequestData {
     /// Topics to describe; `None` = all topics, `Some(vec![])` = none (v1+ empty array).
     pub topics: Option<Vec<String>>,
-    /// v4+ `allow_auto_topic_creation` (true for older versions). CONF-2: when false, a
+    /// v4+ `allow_auto_topic_creation` (true for older versions). When false, a
     /// missing requested topic is reported as UNKNOWN_TOPIC_OR_PARTITION, not created.
     pub allow_auto_topic_creation: bool,
 }
@@ -129,7 +129,7 @@ impl KafkaApi for MetadataApi {
         wire: MetadataRequest,
         header: &RequestHeader,
     ) -> Result<Self::Request, Rejection<Self::Echo>> {
-        // CONF-3: empty-vs-null is version dependent. v0 has no nullable array and an empty
+        // Empty-vs-null is version dependent. v0 has no nullable array and an empty
         // array means "all topics"; v1+ null means all topics and an empty array none.
         let topics = match wire.topics {
             Some(t) if !t.is_empty() => Some(

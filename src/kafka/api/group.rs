@@ -180,7 +180,8 @@ impl ApiSchema for HeartbeatApi {
 impl KafkaApi for HeartbeatApi {
     type Request = HeartbeatRequestData;
 
-    // DR-12: served from the in-memory coordinator, never queued behind heavy work.
+    // Served from the in-memory coordinator; never queued behind heavy work, so a slow
+    // Produce cannot make a member miss its session timeout.
     const LANE: Lane = Lane::Liveness;
 
     fn decode(

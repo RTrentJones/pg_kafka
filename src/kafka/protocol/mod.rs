@@ -1,22 +1,20 @@
-// Kafka protocol parsing and encoding module
-//
-// This module handles the binary Kafka wire protocol format:
-// [4 bytes: Size (big-endian i32)] [RequestHeader] [RequestBody]
-//
-// The kafka-protocol crate provides auto-generated structs for all Kafka messages,
-// but we need to handle the framing (size prefix) and routing (api_key matching) ourselves.
-//
-// Module organization:
-// - decoding: Request parsing (parse_request and per-API parsers)
-// - encoding: Response encoding (encode_response)
-// - recordbatch: RecordBatch/MessageSet parsing
+//! The Kafka wire format on the network thread.
+//!
+//! A request arrives as `[4-byte big-endian length][RequestHeader][RequestBody]`:
+//!
+//! - [`framing`]: the length prefix ([`framing::FrameCodec`]), with the frame-size budget and
+//!   the per-frame read clock;
+//! - `decoding`: the request header ([`parse_request`]); the body goes to the API registry
+//!   (`crate::kafka::api`);
+//! - `encoding`: response frames ([`encode_response`]);
+//! - `recordbatch`: the records of a Produce partition, RecordBatch v2 or legacy
+//!   MessageSet v0/v1 ([`parse_record_batch_with_metadata`]).
 
 mod decoding;
 mod encoding;
 pub mod framing;
 mod recordbatch;
 
-// Re-export public functions
 pub use decoding::parse_request;
 pub use encoding::encode_response;
 pub use recordbatch::{parse_record_batch, parse_record_batch_with_metadata, ParsedRecordBatch};

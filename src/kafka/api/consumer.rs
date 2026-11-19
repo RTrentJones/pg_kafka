@@ -26,7 +26,7 @@ pub struct OffsetCommitApi;
 pub struct OffsetCommitRequestData {
     /// Consumer group id.
     pub group_id: String,
-    /// Generation the member believes it holds (-1 for a simple consumer). CONF-1:
+    /// Generation the member believes it holds (-1 for a simple consumer),
     /// validated against the coordinator to reject zombie commits.
     pub generation_id: i32,
     /// Member id ("" for a simple consumer).
@@ -149,7 +149,7 @@ pub struct OffsetFetchRequestData {
     /// array asks for nothing.
     pub topics: Option<Vec<OffsetFetchTopicData>>,
     /// v7+ (KIP-447): answer UNSTABLE_OFFSET_COMMIT for partitions with a pending
-    /// transactional offset commit (wave3 txn).
+    /// transactional offset commit.
     pub require_stable: bool,
 }
 
