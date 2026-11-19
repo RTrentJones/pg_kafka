@@ -7,17 +7,19 @@
 pub const PRODUCER_BATCH_CACHE: usize = 5;
 
 /// What the produce path does with an idempotent batch
-/// ([`ProducerStore::check_and_update_sequence`](super::ProducerStore::check_and_update_sequence)).
+/// ([`check_and_update_sequence`](super::ProducerStore::check_and_update_sequence)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SequenceCheck {
-    /// Insert the batch, then record it with [`ProducerStore::record_producer_batch`](super::ProducerStore::record_producer_batch).
+    /// Insert the batch, then record it with
+    /// [`record_producer_batch`](super::ProducerStore::record_producer_batch).
     Append,
     /// A retry of a batch already appended at `base_offset`: skip the insert and
     /// answer success with that offset.
     Duplicate { base_offset: i64 },
 }
 
-/// One appended idempotent batch ([`ProducerStore::record_producer_batch`](super::ProducerStore::record_producer_batch)).
+/// One appended idempotent batch
+/// ([`record_producer_batch`](super::ProducerStore::record_producer_batch)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProducerBatch {
     pub producer_id: i64,

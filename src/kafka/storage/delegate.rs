@@ -6,9 +6,10 @@
 //! functions of `Type` with the same names and no receiver (`PostgresStore`, which is
 //! stateless).
 
-/// Implement every [`TopicStore`](super::TopicStore) method by forwarding to `$via`:
-/// `delegate_topic_store!(Trait, field)` forwards to `&self.field`, `delegate_topic_store!(assoc Type)` to
-/// `Type`'s associated functions of the same names. Used inside an `impl TopicStore for ...`.
+/// Implement every [`TopicStore`](super::TopicStore) method, inside an
+/// `impl TopicStore for ...`: `delegate_topic_store!(Trait, field)` forwards to
+/// `&self.field`, `delegate_topic_store!(assoc Type)` to `Type`'s associated functions of the
+/// same names.
 macro_rules! delegate_topic_store {
     (assoc $via:ident) => {
         fn get_or_create_topic(
@@ -133,9 +134,10 @@ macro_rules! delegate_topic_store {
 }
 pub(crate) use delegate_topic_store;
 
-/// Implement every [`LogStore`](super::LogStore) method by forwarding to `$via`:
-/// `delegate_log_store!(Trait, field)` forwards to `&self.field`, `delegate_log_store!(assoc Type)` to
-/// `Type`'s associated functions of the same names. Used inside an `impl LogStore for ...`.
+/// Implement every [`LogStore`](super::LogStore) method, inside an
+/// `impl LogStore for ...`: `delegate_log_store!(Trait, field)` forwards to
+/// `&self.field`, `delegate_log_store!(assoc Type)` to `Type`'s associated functions of the
+/// same names.
 macro_rules! delegate_log_store {
     (assoc $via:ident) => {
         fn insert_records(
@@ -321,9 +323,10 @@ macro_rules! delegate_log_store {
 }
 pub(crate) use delegate_log_store;
 
-/// Implement every [`OffsetStore`](super::OffsetStore) method by forwarding to `$via`:
-/// `delegate_offset_store!(Trait, field)` forwards to `&self.field`, `delegate_offset_store!(assoc Type)` to
-/// `Type`'s associated functions of the same names. Used inside an `impl OffsetStore for ...`.
+/// Implement every [`OffsetStore`](super::OffsetStore) method, inside an
+/// `impl OffsetStore for ...`: `delegate_offset_store!(Trait, field)` forwards to
+/// `&self.field`, `delegate_offset_store!(assoc Type)` to `Type`'s associated functions of the
+/// same names.
 macro_rules! delegate_offset_store {
     (assoc $via:ident) => {
         fn commit_offset(&self, group_id: &str, topic_id: i32, partition_id: i32, offset: i64, metadata: Option<&str>) -> $crate::kafka::error::Result<()> {
@@ -374,9 +377,10 @@ macro_rules! delegate_offset_store {
 }
 pub(crate) use delegate_offset_store;
 
-/// Implement every [`ProducerStore`](super::ProducerStore) method by forwarding to `$via`:
-/// `delegate_producer_store!(Trait, field)` forwards to `&self.field`, `delegate_producer_store!(assoc Type)` to
-/// `Type`'s associated functions of the same names. Used inside an `impl ProducerStore for ...`.
+/// Implement every [`ProducerStore`](super::ProducerStore) method, inside an
+/// `impl ProducerStore for ...`: `delegate_producer_store!(Trait, field)` forwards to
+/// `&self.field`, `delegate_producer_store!(assoc Type)` to `Type`'s associated functions of the
+/// same names.
 macro_rules! delegate_producer_store {
     (assoc $via:ident) => {
         fn allocate_producer_id(
@@ -526,9 +530,10 @@ macro_rules! delegate_producer_store {
 }
 pub(crate) use delegate_producer_store;
 
-/// Implement every [`TransactionStore`](super::TransactionStore) method by forwarding to `$via`:
-/// `delegate_transaction_store!(Trait, field)` forwards to `&self.field`, `delegate_transaction_store!(assoc Type)` to
-/// `Type`'s associated functions of the same names. Used inside an `impl TransactionStore for ...`.
+/// Implement every [`TransactionStore`](super::TransactionStore) method, inside an
+/// `impl TransactionStore for ...`: `delegate_transaction_store!(Trait, field)` forwards to
+/// `&self.field`, `delegate_transaction_store!(assoc Type)` to `Type`'s associated functions of the
+/// same names.
 macro_rules! delegate_transaction_store {
     (assoc $via:ident) => {
         fn get_or_create_transactional_producer(
@@ -729,9 +734,10 @@ macro_rules! delegate_transaction_store {
 }
 pub(crate) use delegate_transaction_store;
 
-/// Implement every [`MaintenanceStore`](super::MaintenanceStore) method by forwarding to `$via`:
-/// `delegate_maintenance_store!(Trait, field)` forwards to `&self.field`, `delegate_maintenance_store!(assoc Type)` to
-/// `Type`'s associated functions of the same names. Used inside an `impl MaintenanceStore for ...`.
+/// Implement every [`MaintenanceStore`](super::MaintenanceStore) method, inside an
+/// `impl MaintenanceStore for ...`: `delegate_maintenance_store!(Trait, field)` forwards to
+/// `&self.field`, `delegate_maintenance_store!(assoc Type)` to `Type`'s associated functions of the
+/// same names.
 macro_rules! delegate_maintenance_store {
     (assoc $via:ident) => {
         fn abort_timed_out_transactions(
