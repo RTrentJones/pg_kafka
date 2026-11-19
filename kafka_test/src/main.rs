@@ -40,7 +40,6 @@
 //! - 0: All tests passed
 //! - 1: One or more tests failed
 
-use chrono::{DateTime, Utc};
 use clap::Parser;
 use futures::stream::{self, StreamExt};
 use serde::Serialize;
@@ -118,10 +117,38 @@ struct CategoryResult {
     tests: Vec<TestResult>,
 }
 
+/// Format `time` as an RFC 3339 UTC timestamp with millisecond precision
+/// (`2026-11-19T22:57:41.269Z`). Days are converted to a civil date with Howard Hinnant's
+/// `civil_from_days` algorithm, valid for every date after 1970.
+fn rfc3339_utc(time: std::time::SystemTime) -> String {
+    let since_epoch = time
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = since_epoch.as_secs();
+    let (days, rem) = (secs / 86_400, secs % 86_400);
+    let z = i64::try_from(days).expect("days since 1970 fit in i64") + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60,
+        since_epoch.subsec_millis()
+    )
+}
+
 /// Suite result for JSON output
 #[derive(Debug, Serialize)]
 struct SuiteResult {
-    timestamp: DateTime<Utc>,
+    /// When the run finished, RFC 3339 in UTC.
+    timestamp: String,
     total_passed: usize,
     total_failed: usize,
     total_duration_ms: u64,
@@ -515,7 +542,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let total_failed: usize = category_results.iter().map(|c| c.failed).sum();
 
     let suite_result = SuiteResult {
-        timestamp: Utc::now(),
+        timestamp: rfc3339_utc(std::time::SystemTime::now()),
         total_passed,
         total_failed,
         total_duration_ms: millis(suite_start.elapsed()),
@@ -681,5 +708,24 @@ mod runner_tests {
         let before = names.len();
         names.dedup();
         assert_eq!(before, names.len(), "duplicate test name in registry");
+    }
+}
+
+#[cfg(test)]
+mod timestamp_tests {
+    use super::rfc3339_utc;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn formats_known_instants_as_rfc3339_utc() {
+        for (secs, millis, expected) in [
+            (0, 0, "1970-01-01T00:00:00.000Z"),
+            (951_782_400, 5, "2000-02-29T00:00:00.005Z"),
+            (1_795_129_061, 269, "2026-11-19T22:57:41.269Z"),
+            (4_102_444_799, 999, "2099-12-31T23:59:59.999Z"),
+        ] {
+            let t = UNIX_EPOCH + Duration::from_secs(secs) + Duration::from_millis(millis);
+            assert_eq!(rfc3339_utc(t), expected);
+        }
     }
 }
