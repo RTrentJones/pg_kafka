@@ -134,7 +134,9 @@ pub const DEFAULT_BROKER_ID: i32 = 1;
 // ===== Request limits =====
 
 /// Largest request frame accepted (100 MB), against memory-exhaustion by huge requests.
-pub const MAX_REQUEST_SIZE: i32 = 100_000_000;
+/// A byte count compared with frame lengths; it stays below `i32::MAX`, the largest
+/// length the 4-byte size prefix can carry.
+pub const MAX_REQUEST_SIZE: usize = 100_000_000;
 
 const _: () = assert!(0 < MAX_REQUEST_SIZE && MAX_REQUEST_SIZE <= 1_000_000_000);
 

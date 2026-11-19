@@ -188,7 +188,7 @@ impl Decoder for FrameCodec {
             return Ok(None);
         };
         let len = u32::from_be_bytes(*prefix) as usize;
-        if len > MAX_REQUEST_SIZE as usize {
+        if len > MAX_REQUEST_SIZE {
             self.release();
             return Err(std::io::Error::other(format!(
                 "frame of {len} bytes exceeds the maximum request size of {MAX_REQUEST_SIZE} bytes"
@@ -268,7 +268,7 @@ mod tests {
         let clock = Arc::new(FrameClock::new());
         (
             FrameCodec::with_budget(
-                Arc::new(AtomicUsize::new(MAX_REQUEST_SIZE as usize)),
+                Arc::new(AtomicUsize::new(MAX_REQUEST_SIZE)),
                 clock.clone(),
                 budget,
             ),
@@ -378,7 +378,8 @@ mod tests {
     fn oversized_and_pre_auth_frames_are_refused() {
         static B: AtomicUsize = AtomicUsize::new(FRAME_RESERVE_BUDGET_BYTES);
         let (mut c, _clock) = codec(&B);
-        let mut src = BytesMut::from(&(MAX_REQUEST_SIZE + 1).to_be_bytes()[..]);
+        let oversized = u32::try_from(MAX_REQUEST_SIZE + 1).unwrap();
+        let mut src = BytesMut::from(&oversized.to_be_bytes()[..]);
         assert!(c.decode(&mut src).is_err());
         // Lengths with the top bit set (negative i32) are oversized too.
         let mut src = BytesMut::from(&u32::MAX.to_be_bytes()[..]);
@@ -399,13 +400,13 @@ mod tests {
         // connection would hang on it.
         static B: AtomicUsize = AtomicUsize::new(FRAME_RESERVE_BUDGET_BYTES);
         let (mut c, _clock) = codec(&B);
-        let big = Bytes::from(vec![0u8; MAX_REQUEST_SIZE as usize + 10]);
+        let big = Bytes::from(vec![0u8; MAX_REQUEST_SIZE + 10]);
         let mut dst = BytesMut::new();
         c.encode(big, &mut dst).unwrap();
-        assert_eq!(dst.len(), MAX_REQUEST_SIZE as usize + 14);
+        assert_eq!(dst.len(), MAX_REQUEST_SIZE + 14);
         assert_eq!(
             u32::from_be_bytes([dst[0], dst[1], dst[2], dst[3]]) as usize,
-            MAX_REQUEST_SIZE as usize + 10
+            MAX_REQUEST_SIZE + 10
         );
     }
 

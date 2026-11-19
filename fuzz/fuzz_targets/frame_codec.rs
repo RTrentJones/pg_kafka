@@ -26,7 +26,7 @@ fuzz_target!(|data: &[u8]| {
     let limit = Arc::new(AtomicUsize::new(if chunking & 0x80 != 0 {
         pg_kafka::kafka::protocol::framing::PRE_AUTH_MAX_FRAME
     } else {
-        MAX_REQUEST_SIZE as usize
+        MAX_REQUEST_SIZE
     }));
     {
         let mut codec = FrameCodec::with_budget(limit, Arc::new(FrameClock::new()), &BUDGET);
@@ -36,7 +36,7 @@ fuzz_target!(|data: &[u8]| {
             loop {
                 match codec.decode(&mut src) {
                     Ok(Some(frame)) => {
-                        assert!(frame.len() <= MAX_REQUEST_SIZE as usize);
+                        assert!(frame.len() <= MAX_REQUEST_SIZE);
                         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
                         let _ = pg_kafka::kafka::protocol::parse_request(frame, tx);
                     }
