@@ -187,6 +187,7 @@ mod tests {
                     list_topic("bad", &[(0, -1), (1, -1)]),
                     list_topic("ok", &[(0, -2), (1, -1), (2, 1_000)]),
                 ],
+                crate::kafka::storage::IsolationLevel::ReadUncommitted,
             )
         })
         .unwrap();

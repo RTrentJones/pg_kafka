@@ -784,3 +784,48 @@ AS 'MODULE_PATHNAME', 'pg_kafka_drop_user_wrapper';
 
 -- END SASL credentials (auth stream)
 -- =============================================================================
+
+-- =============================================================================
+-- wave3 txn: idempotent producer batch cache + transaction partition registry
+-- =============================================================================
+-- The last 5 batches (Kafka's max.in.flight bound for idempotence) of every producer
+-- on every partition: their sequence range and base offset, so a retried batch is
+-- answered with its original offset and anything else out of sequence is refused.
+-- Rows belong to the current epoch only: every epoch change deletes the producer's
+-- kafka.producer_sequences rows, and this table follows them (ON DELETE CASCADE).
+CREATE TABLE kafka.producer_batches (
+    producer_id BIGINT NOT NULL,
+    topic_id INT NOT NULL,
+    partition_id INT NOT NULL,
+    first_sequence INT NOT NULL CHECK (first_sequence >= 0),
+    last_sequence INT NOT NULL CHECK (last_sequence >= 0),
+    base_offset BIGINT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (producer_id, topic_id, partition_id, base_offset),
+    FOREIGN KEY (producer_id, topic_id, partition_id)
+        REFERENCES kafka.producer_sequences (producer_id, topic_id, partition_id)
+        ON DELETE CASCADE
+);
+
+-- Partitions registered in the open transaction of a transactional id
+-- (AddPartitionsToTxn). A transactional Produce to any other partition is refused with
+-- INVALID_TXN_STATE, as in Kafka. Cleared when the next transaction begins and on
+-- InitProducerId.
+CREATE TABLE kafka.txn_partitions (
+    transactional_id TEXT NOT NULL
+        REFERENCES kafka.transactions (transactional_id) ON DELETE CASCADE,
+    topic_id INT NOT NULL REFERENCES kafka.topics (id) ON DELETE CASCADE,
+    partition_id INT NOT NULL CHECK (partition_id >= 0),
+    PRIMARY KEY (transactional_id, topic_id, partition_id)
+);
+
+GRANT SELECT ON kafka.producer_batches TO pgkafka_reader;
+GRANT SELECT ON kafka.txn_partitions TO pgkafka_reader;
+GRANT SELECT, INSERT, UPDATE, DELETE ON kafka.producer_batches TO pgkafka_worker;
+GRANT SELECT, INSERT, DELETE ON kafka.txn_partitions TO pgkafka_worker;
+
+COMMENT ON TABLE kafka.producer_batches IS 'Last 5 batches per idempotent producer and partition (sequence range, base offset) for duplicate detection.';
+COMMENT ON TABLE kafka.txn_partitions IS 'Partitions added (AddPartitionsToTxn) to the open transaction of each transactional id.';
+
+-- END wave3 txn
+-- =============================================================================

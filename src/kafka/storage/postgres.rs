@@ -795,6 +795,7 @@ impl PostgresStore {
         // nothing pending the COALESCE default makes the bound a no-op.
         let query = if read_committed {
             "SELECT partition_offset, key, value, headers::text AS headers_json,
+                    producer_id, producer_epoch,
                     CASE WHEN timestamp_ms >= 0 THEN timestamp_ms ELSE (EXTRACT(EPOCH FROM created_at) * 1000)::bigint END as timestamp_ms,
                     SUM(COALESCE(pg_column_size(key), 0) + COALESCE(pg_column_size(value), 0) + 64)
                         OVER (ORDER BY partition_offset) as cumulative_bytes
@@ -810,6 +811,7 @@ impl PostgresStore {
              LIMIT $4"
         } else {
             "SELECT partition_offset, key, value, headers::text AS headers_json,
+                    producer_id, producer_epoch,
                     CASE WHEN timestamp_ms >= 0 THEN timestamp_ms ELSE (EXTRACT(EPOCH FROM created_at) * 1000)::bigint END as timestamp_ms,
                     SUM(COALESCE(pg_column_size(key), 0) + COALESCE(pg_column_size(value), 0) + 64)
                         OVER (ORDER BY partition_offset) as cumulative_bytes
@@ -867,6 +869,8 @@ impl PostgresStore {
                     let timestamp: i64 = row.get_by_name("timestamp_ms")?.unwrap_or(0);
                     let headers_json: Option<String> = row.get_by_name("headers_json")?;
                     let headers = super::decode_headers_json(headers_json.as_deref());
+                    let producer_id: Option<i64> = row.get_by_name("producer_id")?;
+                    let producer_epoch: Option<i16> = row.get_by_name("producer_epoch")?;
 
                     messages.push(FetchedMessage {
                         partition_offset,
@@ -874,6 +878,8 @@ impl PostgresStore {
                         value,
                         timestamp,
                         headers,
+                        producer_id,
+                        producer_epoch,
                     });
                     next_offset = partition_offset + 1;
                     consumed = total;
@@ -902,6 +908,44 @@ impl PostgresStore {
 impl Default for PostgresStore {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Wave 3: a new transaction starts with an empty partition registry. Called right
+/// before a transactional id moves from a finished state (Empty, CompleteCommit,
+/// CompleteAbort) to Ongoing; it deletes nothing for an Ongoing transaction or for a
+/// producer that does not own the transactional id.
+fn clear_finished_txn_partitions(
+    client: &mut pgrx::spi::SpiClient<'_>,
+    transactional_id: &str,
+    producer_id: i64,
+    producer_epoch: i16,
+) -> std::result::Result<(), pgrx::spi::SpiError> {
+    client.update(
+        "DELETE FROM kafka.txn_partitions p
+         USING kafka.transactions t
+         WHERE p.transactional_id = $1 AND t.transactional_id = $1
+           AND t.producer_id = $2 AND t.producer_epoch = $3
+           AND t.state IN ('Empty', 'CompleteCommit', 'CompleteAbort')",
+        None,
+        &[
+            transactional_id.into(),
+            producer_id.into(),
+            producer_epoch.into(),
+        ],
+    )?;
+    Ok(())
+}
+
+/// INVALID_PRODUCER_EPOCH (47): what Kafka 3.7 answers a Produce with a stale epoch,
+/// for idempotent and transactional producers alike (wave 3).
+fn invalid_producer_epoch(producer_id: i64, epoch: i16, current_epoch: i16) -> KafkaError {
+    KafkaError::Protocol {
+        code: crate::kafka::constants::ERROR_INVALID_PRODUCER_EPOCH,
+        message: format!(
+            "producer {} epoch {} is not the current epoch {}",
+            producer_id, epoch, current_epoch
+        ),
     }
 }
 
@@ -1154,20 +1198,37 @@ impl PostgresStore {
         timestamp_ms: i64,
     ) -> Result<Option<(i64, i64)>> {
         Spi::connect(|client| {
-            // CONF-7: the lowest committed offset whose stored producer timestamp (BUG-7) is at or
-            // after the target. Records with no timestamp (-1) are excluded; pending/aborted txn
-            // rows are excluded so the lookup matches read-committed visibility.
-            let table = client.select(
-                "SELECT partition_offset, timestamp_ms
-                 FROM kafka.messages
-                 WHERE topic_id = $1 AND partition_id = $2
-                   AND timestamp_ms >= 0 AND timestamp_ms >= $3
-                   AND txn_state IS NULL
-                 ORDER BY partition_offset ASC
-                 LIMIT 1",
-                None,
-                &[topic_id.into(), partition_id.into(), timestamp_ms.into()],
-            )?;
+            // CONF-7: the lowest offset whose stored producer timestamp (BUG-7) is at or after
+            // the target. Records with no timestamp (-1) and aborted records are excluded;
+            // pending records count, and the handler bounds the answer by the HWM or LSO, as
+            // Kafka does (wave 3; aborted rows are invisible here and later deleted).
+            // MAX_TIMESTAMP (-3, KIP-734): the record with the largest timestamp, the
+            // lowest offset among equal ones.
+            let table = if timestamp_ms == super::MAX_TIMESTAMP {
+                client.select(
+                    "SELECT partition_offset, timestamp_ms
+                     FROM kafka.messages
+                     WHERE topic_id = $1 AND partition_id = $2
+                       AND timestamp_ms >= 0
+                       AND txn_state IS DISTINCT FROM 'aborted'
+                     ORDER BY timestamp_ms DESC, partition_offset ASC
+                     LIMIT 1",
+                    None,
+                    &[topic_id.into(), partition_id.into()],
+                )?
+            } else {
+                client.select(
+                    "SELECT partition_offset, timestamp_ms
+                     FROM kafka.messages
+                     WHERE topic_id = $1 AND partition_id = $2
+                       AND timestamp_ms >= 0 AND timestamp_ms >= $3
+                       AND txn_state IS DISTINCT FROM 'aborted'
+                     ORDER BY partition_offset ASC
+                     LIMIT 1",
+                    None,
+                    &[topic_id.into(), partition_id.into(), timestamp_ms.into()],
+                )?
+            };
 
             let row = table.first();
             match row.get_by_name::<i64, _>("partition_offset")? {
@@ -1448,6 +1509,30 @@ impl PostgresStore {
         })
     }
 
+    fn pending_txn_offset_partitions(&self, group_id: &str) -> Result<Vec<(String, i32)>> {
+        // Wave 3 (KIP-447 require_stable): rows exist only while the transaction that
+        // wrote them is open (EndTxn, the timeout sweep and InitProducerId delete them).
+        Spi::connect(|client| {
+            let table = client.select(
+                "SELECT DISTINCT t.name, p.partition_id
+                 FROM kafka.txn_pending_offsets p JOIN kafka.topics t ON t.id = p.topic_id
+                 WHERE p.group_id = $1",
+                None,
+                &[group_id.into()],
+            )?;
+            let mut out = Vec::new();
+            for row in table {
+                let name: String = row.get_by_name("name")?.unwrap_or_default();
+                let partition: i32 = row.get_by_name("partition_id")?.unwrap_or(0);
+                out.push((name, partition));
+            }
+            Ok(out)
+        })
+        .map_err(|e: KafkaError| {
+            KafkaError::Internal(format!("pending_txn_offset_partitions failed: {}", e))
+        })
+    }
+
     // ===== Idempotent Producer Operations (Phase 9) =====
 
     fn allocate_producer_id(
@@ -1591,7 +1676,7 @@ impl PostgresStore {
         partition_id: i32,
         base_sequence: i32,
         record_count: i32,
-    ) -> Result<bool> {
+    ) -> Result<super::SequenceCheck> {
         crate::pg_debug!(
             "PostgresStore::check_and_update_sequence: producer_id={}, epoch={}, topic_id={}, partition_id={}, base_seq={}, count={}",
             producer_id,
@@ -1603,9 +1688,10 @@ impl PostgresStore {
         );
 
         Spi::connect_mut(|client| {
-            // Step 1: Verify producer epoch (fencing check)
+            // Step 1: the producer's current epoch (fencing check).
             let epoch_table = client.select(
-                "SELECT epoch FROM kafka.producer_ids WHERE producer_id = $1",
+                "SELECT epoch, transactional_id IS NOT NULL AS transactional
+                 FROM kafka.producer_ids WHERE producer_id = $1",
                 Some(1),
                 &[producer_id.into()],
             )?;
@@ -1614,21 +1700,14 @@ impl PostgresStore {
                 return Err(KafkaError::unknown_producer_id(producer_id));
             }
 
-            let current_epoch: i16 = epoch_table
-                .first()
-                .get_by_name("epoch")?
-                .unwrap_or(0);
+            let row = epoch_table.first();
+            let current_epoch: i16 = row.get_by_name("epoch")?.unwrap_or(0);
+            let transactional: bool = row.get_by_name("transactional")?.unwrap_or(false);
 
-            // The epoch must be exactly the current one. A lower epoch is a zombie
-            // (fenced). A higher epoch was never issued by this broker, so its sequence
-            // numbers cannot be validated against anything; reject it too rather than
-            // check it against another epoch's sequence state.
-            if producer_epoch != current_epoch {
-                return Err(KafkaError::producer_fenced(
-                    producer_id,
-                    producer_epoch,
-                    current_epoch,
-                ));
+            // A transactional producer's epoch is owned by its transactional id
+            // (InitProducerId); it never bumps it itself, so any other epoch is stale.
+            if transactional && producer_epoch != current_epoch {
+                return Err(invalid_producer_epoch(producer_id, producer_epoch, current_epoch));
             }
 
             // Step 2: Use advisory lock to serialize sequence checks for this producer+partition
@@ -1643,42 +1722,57 @@ impl PostgresStore {
                 &[lock_key.into()],
             )?;
 
-            // Step 3: Get current last_sequence for this producer/topic/partition
+            // Step 3: the partition's producer state at the current epoch: the last
+            // sequence and the remembered batches (every epoch change deletes both).
             let seq_table = client.select(
                 "SELECT last_sequence FROM kafka.producer_sequences
                  WHERE producer_id = $1 AND topic_id = $2 AND partition_id = $3",
                 Some(1),
                 &[producer_id.into(), topic_id.into(), partition_id.into()],
             )?;
-
-            let last_sequence: i32 = if seq_table.is_empty() {
-                -1 // First batch for this producer/partition
+            let last_sequence: Option<i32> = if seq_table.is_empty() {
+                None
             } else {
                 seq_table
                     .first()
-                    .get_by_name("last_sequence")?
-                    .unwrap_or(-1)
+                    .get_by_name::<i32, _>("last_sequence")?
+                    .filter(|s| *s >= 0)
             };
+            let batch_table = client.select(
+                "SELECT first_sequence, last_sequence, base_offset FROM kafka.producer_batches
+                 WHERE producer_id = $1 AND topic_id = $2 AND partition_id = $3",
+                None,
+                &[producer_id.into(), topic_id.into(), partition_id.into()],
+            )?;
+            let mut cached = Vec::new();
+            for row in batch_table {
+                cached.push(super::CachedBatch {
+                    first_sequence: row.get_by_name("first_sequence")?.unwrap_or(-1),
+                    last_sequence: row.get_by_name("last_sequence")?.unwrap_or(-1),
+                    base_offset: row.get_by_name("base_offset")?.unwrap_or(-1),
+                });
+            }
 
-            // Step 4: Validate the sequence range (pure logic in storage::validate_sequence).
-            // A batch is only a duplicate if it is ENTIRELY at or behind last_sequence;
-            // a partially overlapping batch must be rejected, not silently skipped.
-            //
-            // RV-8: the stored last_sequence is NOT advanced here. record_producer_sequence
-            // persists it AFTER a successful insert, so a failed insert leaves the sequence
-            // un-advanced and a retry of the same batch re-inserts instead of being dropped
-            // as a false duplicate.
-            match super::validate_sequence(last_sequence, base_sequence, record_count) {
-                super::SequenceValidation::Duplicate => {
-                    // Kafka spec: exact replay returns success, skip insert.
+            // Step 4: validate (pure logic in storage::validate_sequence, Kafka's model).
+            // RV-8: nothing is advanced here; record_producer_batch persists the batch
+            // only after a successful insert.
+            match super::validate_sequence(
+                current_epoch,
+                last_sequence,
+                &cached,
+                producer_epoch,
+                base_sequence,
+                record_count,
+            ) {
+                super::SequenceValidation::Duplicate { base_offset } => {
                     crate::pg_debug!(
-                        "Duplicate detected: producer_id={}, partition_id={}, base_sequence={}, last_sequence={}",
+                        "Duplicate batch: producer_id={}, partition_id={}, base_sequence={}, original base_offset={}",
                         producer_id,
                         partition_id,
                         base_sequence,
-                        last_sequence
+                        base_offset
                     );
-                    Ok(false) // Duplicate - skip insert
+                    Ok(super::SequenceCheck::Duplicate { base_offset })
                 }
                 super::SequenceValidation::OutOfOrder { expected_sequence } => {
                     Err(KafkaError::out_of_order_sequence(
@@ -1688,16 +1782,143 @@ impl PostgresStore {
                         expected_sequence,
                     ))
                 }
-                super::SequenceValidation::Proceed { .. } => Ok(true), // valid - proceed with insert
+                super::SequenceValidation::StaleEpoch { current_epoch } => Err(
+                    invalid_producer_epoch(producer_id, producer_epoch, current_epoch),
+                ),
+                super::SequenceValidation::Proceed { new_epoch, .. } => {
+                    if new_epoch {
+                        // KIP-360: an idempotent producer bumped its own epoch (the Java
+                        // client does after an unresolved sequence error). Adopt it, and
+                        // drop the old epoch's sequence state on every partition (the
+                        // new epoch restarts all of them at 0).
+                        client.update(
+                            "UPDATE kafka.producer_ids SET epoch = $2, last_active_at = NOW()
+                             WHERE producer_id = $1 AND epoch < $2",
+                            None,
+                            &[producer_id.into(), producer_epoch.into()],
+                        )?;
+                        client.update(
+                            "DELETE FROM kafka.producer_sequences WHERE producer_id = $1",
+                            None,
+                            &[producer_id.into()],
+                        )?;
+                    }
+                    Ok(super::SequenceCheck::Append)
+                }
             }
         })
         .map_err(|e| match e {
             KafkaError::UnknownProducerId { .. }
             | KafkaError::ProducerFenced { .. }
+            | KafkaError::Protocol { .. }
             | KafkaError::DuplicateSequence { .. }
             | KafkaError::OutOfOrderSequence { .. } => e,
             _ => KafkaError::Internal(format!("check_and_update_sequence failed: {}", e)),
         })
+    }
+
+    fn record_producer_batch(&self, batch: super::ProducerBatch) -> Result<()> {
+        // RV-8: called only AFTER the batch's records were inserted (same request
+        // subtransaction). Advance the last sequence, remember the batch, and keep only
+        // the newest PRODUCER_BATCH_CACHE batches of the producer on the partition.
+        let keep = super::PRODUCER_BATCH_CACHE as i64;
+        Spi::connect_mut(|client| {
+            client.update(
+                "INSERT INTO kafka.producer_sequences (producer_id, topic_id, partition_id, last_sequence)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (producer_id, topic_id, partition_id)
+                 DO UPDATE SET last_sequence = EXCLUDED.last_sequence, updated_at = NOW()",
+                None,
+                &[
+                    batch.producer_id.into(),
+                    batch.topic_id.into(),
+                    batch.partition_id.into(),
+                    batch.last_sequence.into(),
+                ],
+            )?;
+            client.update(
+                "INSERT INTO kafka.producer_batches
+                     (producer_id, topic_id, partition_id, first_sequence, last_sequence, base_offset)
+                 VALUES ($1, $2, $3, $4, $5, $6)
+                 ON CONFLICT (producer_id, topic_id, partition_id, base_offset) DO UPDATE SET
+                     first_sequence = EXCLUDED.first_sequence,
+                     last_sequence = EXCLUDED.last_sequence",
+                None,
+                &[
+                    batch.producer_id.into(),
+                    batch.topic_id.into(),
+                    batch.partition_id.into(),
+                    batch.first_sequence.into(),
+                    batch.last_sequence.into(),
+                    batch.base_offset.into(),
+                ],
+            )?;
+            client.update(
+                "DELETE FROM kafka.producer_batches
+                 WHERE producer_id = $1 AND topic_id = $2 AND partition_id = $3
+                   AND base_offset < (
+                       SELECT MIN(base_offset) FROM (
+                           SELECT base_offset FROM kafka.producer_batches
+                           WHERE producer_id = $1 AND topic_id = $2 AND partition_id = $3
+                           ORDER BY base_offset DESC LIMIT $4) newest)",
+                None,
+                &[
+                    batch.producer_id.into(),
+                    batch.topic_id.into(),
+                    batch.partition_id.into(),
+                    keep.into(),
+                ],
+            )?;
+            Ok(())
+        })
+        .map_err(|e: KafkaError| {
+            KafkaError::Internal(format!("record_producer_batch failed: {}", e))
+        })
+    }
+
+    fn add_txn_partitions(&self, transactional_id: &str, partitions: &[(i32, i32)]) -> Result<()> {
+        if partitions.is_empty() {
+            return Ok(());
+        }
+        let topic_ids: Vec<i32> = partitions.iter().map(|p| p.0).collect();
+        let partition_ids: Vec<i32> = partitions.iter().map(|p| p.1).collect();
+        Spi::connect_mut(|client| {
+            client.update(
+                "INSERT INTO kafka.txn_partitions (transactional_id, topic_id, partition_id)
+                 SELECT $1, t, p FROM unnest($2::int[], $3::int[]) AS u(t, p)
+                 ON CONFLICT DO NOTHING",
+                None,
+                &[
+                    transactional_id.into(),
+                    topic_ids.into(),
+                    partition_ids.into(),
+                ],
+            )?;
+            Ok(())
+        })
+        .map_err(|e: KafkaError| KafkaError::Internal(format!("add_txn_partitions failed: {}", e)))
+    }
+
+    fn txn_has_partition(
+        &self,
+        transactional_id: &str,
+        topic_id: i32,
+        partition_id: i32,
+    ) -> Result<bool> {
+        Spi::connect(|client| {
+            let table = client.select(
+                "SELECT 1 FROM kafka.txn_partitions
+                 WHERE transactional_id = $1 AND topic_id = $2 AND partition_id = $3",
+                Some(1),
+                &[
+                    transactional_id.into(),
+                    topic_id.into(),
+                    partition_id.into(),
+                ],
+            )?;
+            Ok(!table.is_empty())
+        })
+        .map_err(|e: KafkaError| KafkaError::Internal(format!("txn_has_partition failed: {}", e)))
     }
 
     fn record_producer_sequence(
@@ -1799,6 +2020,12 @@ impl PostgresStore {
                     None,
                     &[transactional_id.into()],
                 )?;
+                // Wave 3: the aborted transaction's partition registry goes with it.
+                client.update(
+                    "DELETE FROM kafka.txn_partitions WHERE transactional_id = $1",
+                    None,
+                    &[transactional_id.into()],
+                )?;
                 // The new epoch restarts sequence numbers at 0; drop the old epoch's
                 // sequence state so its first batches are not dropped as duplicates.
                 client.update(
@@ -1892,6 +2119,7 @@ impl PostgresStore {
         );
 
         Spi::connect_mut(|client| {
+            clear_finished_txn_partitions(client, transactional_id, producer_id, producer_epoch)?;
             // Verify ownership and update state to 'Ongoing'
             let table = client.update(
                 "UPDATE kafka.transactions
@@ -1957,6 +2185,7 @@ impl PostgresStore {
         );
 
         Spi::connect_mut(|client| {
+            clear_finished_txn_partitions(client, transactional_id, producer_id, producer_epoch)?;
             // Atomic compare-and-swap: transition to 'Ongoing' if in valid starting state
             // OR continue if already 'Ongoing' with matching producer
             let updated = client.update(

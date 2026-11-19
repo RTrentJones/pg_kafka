@@ -50,7 +50,7 @@ pub use coordinator::{
 };
 pub use fetch::{handle_fetch, handle_fetch_with_max_bytes, handle_list_offsets};
 pub use helpers::{resolve_topic_id, topic_resolution_error_code, TopicResolution};
-pub use init_producer_id::handle_init_producer_id;
+pub use init_producer_id::{handle_init_producer_id, TRANSACTION_MAX_TIMEOUT_MS};
 pub use metadata::{handle_api_versions, handle_metadata};
 pub use produce::handle_produce;
 pub use transaction::{

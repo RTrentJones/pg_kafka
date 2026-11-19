@@ -4,9 +4,7 @@
 // These are read-focused APIs for consuming messages from topics.
 // Phase 10: Added isolation_level support for transactional reads.
 
-use super::helpers::{
-    resolve_topic, resolve_topic_id, topic_resolution_error_code, TopicResolution,
-};
+use super::helpers::resolve_topic;
 use crate::kafka::constants::ERROR_NONE;
 use crate::kafka::error::Result;
 use crate::kafka::handler_context::HandlerContext;
@@ -80,6 +78,167 @@ pub(crate) fn trim_to_response_budget(
     (kept, used)
 }
 
+/// Encode fetched rows as RecordBatch v2 (wave 3). Consecutive offsets written by the
+/// same producer id and epoch form one batch (rows without a producer id, i.e. not
+/// written by a transactional producer, likewise): the batch header (61 bytes) and the
+/// compression are paid per batch instead of per record. Batches of transactional rows
+/// carry the producer id and epoch and the transactional flag; the base sequence is not
+/// stored and is sent as -1. Rows are in offset order.
+pub(crate) fn encode_record_batches(
+    messages: Vec<FetchedMessage>,
+    compression: kafka_protocol::records::Compression,
+) -> std::result::Result<bytes::Bytes, String> {
+    use kafka_protocol::records::{Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType};
+
+    let mut records: Vec<Record> = Vec::with_capacity(messages.len());
+    let mut group_base = 0i64;
+    let mut previous: Option<(i64, Option<i64>, Option<i16>)> = None;
+    for msg in messages {
+        let producer = (msg.producer_id, msg.producer_epoch);
+        let continues = previous.is_some_and(|(offset, pid, epoch)| {
+            msg.partition_offset == offset + 1 && (pid, epoch) == producer
+        });
+        if !continues {
+            group_base = msg.partition_offset;
+        }
+        previous = Some((msg.partition_offset, msg.producer_id, msg.producer_epoch));
+        // The encoder keeps records in one batch while `offset - sequence` stays the
+        // same: -1 + (offset - group start) gives every group its own constant and a
+        // base sequence of -1 (NO_SEQUENCE).
+        let sequence = (msg.partition_offset - group_base) as i32 - 1;
+        let mut record = Record {
+            transactional: msg.producer_id.is_some(),
+            control: false,
+            partition_leader_epoch: 0,
+            producer_id: msg.producer_id.unwrap_or(-1),
+            producer_epoch: msg.producer_epoch.unwrap_or(-1),
+            timestamp_type: TimestampType::Creation,
+            offset: msg.partition_offset,
+            sequence,
+            timestamp: msg.timestamp,
+            key: msg.key.map(bytes::Bytes::from),
+            value: msg.value.map(bytes::Bytes::from),
+            headers: Default::default(),
+        };
+        // DR-8: return stored headers to the consumer.
+        for (k, v) in msg.headers {
+            record
+                .headers
+                .insert(StrBytes::from_string(k), Some(bytes::Bytes::from(v)));
+        }
+        records.push(record);
+    }
+    let mut encoded = bytes::BytesMut::new();
+    RecordBatchEncoder::encode(
+        &mut encoded,
+        records.iter(),
+        &RecordEncodeOptions {
+            version: 2,
+            compression,
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(encoded.freeze())
+}
+
+/// Bytes of a RecordBatch v2 header (everything but the records).
+const BATCH_HEADER_LEN: usize = 61;
+
+/// The one record of a [`gap_batch`]: a control record (key: version 0, type 1 =
+/// COMMIT; value: an EndTransactionMarker, version 0, coordinator epoch 0) at offset
+/// delta `offset_delta`, timestamp delta 0.
+fn gap_marker_record(offset_delta: i32) -> bytes::Bytes {
+    use bytes::BufMut;
+    fn varint(out: &mut bytes::BytesMut, v: i64) {
+        let mut z = ((v << 1) ^ (v >> 63)) as u64;
+        while z >= 0x80 {
+            out.put_u8((z as u8) | 0x80);
+            z >>= 7;
+        }
+        out.put_u8(z as u8);
+    }
+    let mut body = bytes::BytesMut::new();
+    body.put_i8(0); // attributes
+    varint(&mut body, 0); // timestamp delta
+    varint(&mut body, offset_delta as i64);
+    varint(&mut body, 4); // key length
+    body.put_i16(0); // control record key version
+    body.put_i16(1); // control record type: COMMIT
+    varint(&mut body, 6); // value length
+    body.put_i16(0); // EndTransactionMarker version
+    body.put_i32(0); // coordinator epoch
+    varint(&mut body, 0); // header count
+    let mut out = bytes::BytesMut::new();
+    varint(&mut out, body.len() as i64);
+    out.put(body);
+    out.freeze()
+}
+
+/// A batch covering offsets `[from, to)` without data (wave 3), or `None` when the
+/// range is empty: a control batch holding one COMMIT marker at offset `to - 1`, like
+/// the marker Kafka writes when a transaction ends. Clients skip control records but
+/// move their position past them: the Java client to the batch's last offset + 1,
+/// librdkafka to the marker's offset + 1 (it advances the application position, and
+/// so the committed offset and the lag, only on a record, which is why the batch is not
+/// simply empty). A range longer than `i32::MAX + 1` offsets is covered up to that
+/// length; the next fetch covers the rest.
+pub(crate) fn gap_batch(from: i64, to: i64) -> Option<bytes::Bytes> {
+    use bytes::BufMut;
+    if to <= from {
+        return None;
+    }
+    let last_offset_delta = (to - from - 1).min(i32::MAX as i64) as i32;
+    let record = gap_marker_record(last_offset_delta);
+    // Everything after the CRC field: what the CRC covers.
+    let mut body = bytes::BytesMut::with_capacity(BATCH_HEADER_LEN - 21 + record.len());
+    body.put_i16(0x30); // attributes: transactional | control, no compression
+    body.put_i32(last_offset_delta);
+    body.put_i64(-1); // base timestamp (none)
+    body.put_i64(-1); // max timestamp
+    body.put_i64(-1); // producer id
+    body.put_i16(-1); // producer epoch
+    body.put_i32(-1); // base sequence
+    body.put_i32(1); // record count
+    body.put(record);
+    let mut out = bytes::BytesMut::with_capacity(BATCH_HEADER_LEN + body.len());
+    out.put_i64(from); // base offset
+    out.put_i32((4 + 1 + 4 + body.len()) as i32); // batch length (after this field)
+    out.put_i32(0); // partition leader epoch
+    out.put_i8(2); // magic
+    out.put_u32(crc32c(&body));
+    out.put(body);
+    Some(out.freeze())
+}
+
+/// CRC-32C (Castagnoli), the RecordBatch v2 checksum.
+fn crc32c(data: &[u8]) -> u32 {
+    const fn table() -> [u32; 256] {
+        let mut t = [0u32; 256];
+        let mut i = 0;
+        while i < 256 {
+            let mut c = i as u32;
+            let mut k = 0;
+            while k < 8 {
+                c = if c & 1 != 0 {
+                    (c >> 1) ^ 0x82F6_3B78
+                } else {
+                    c >> 1
+                };
+                k += 1;
+            }
+            t[i] = c;
+            i += 1;
+        }
+        t
+    }
+    static TABLE: [u32; 256] = table();
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        crc = TABLE[((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
+    }
+    crc ^ 0xFFFF_FFFF
+}
+
 /// [`handle_fetch`] honouring the request-level `max_bytes` (Fetch v3+): partitions
 /// are filled in request order until the response budget is spent, in addition to
 /// each partition's own `partition_max_bytes`.
@@ -96,8 +255,6 @@ pub fn handle_fetch_with_max_bytes(
     use kafka_protocol::messages::fetch_response::{
         FetchResponse, FetchableTopicResponse, PartitionData,
     };
-    use kafka_protocol::records::{Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType};
-
     let mut responses = Vec::new();
 
     // Process each topic requested
@@ -219,6 +376,7 @@ pub fn handle_fetch_with_max_bytes(
                 partition_responses.push(partition_data);
                 continue;
             };
+            let storage_empty: bool;
             let db_records = match store.fetch_records_with_isolation(
                 topic_id,
                 partition_id,
@@ -227,6 +385,7 @@ pub fn handle_fetch_with_max_bytes(
                 isolation_level,
             ) {
                 Ok(records) => {
+                    storage_empty = records.is_empty();
                     let (kept, used) =
                         trim_to_response_budget(records, response_remaining, returned_any);
                     response_remaining -= used;
@@ -254,57 +413,34 @@ pub fn handle_fetch_with_max_bytes(
                 }
             };
 
-            // Convert database records to Kafka RecordBatch format
+            // Convert database records to Kafka RecordBatch format: one batch per run of
+            // consecutive offsets of one producer (wave 3; was one batch per record).
             let records_bytes = if !db_records.is_empty() {
-                let kafka_records: Vec<Record> = db_records
-                    .into_iter()
-                    .map(|msg| {
-                        let mut record = Record {
-                            transactional: false,
-                            control: false,
-                            partition_leader_epoch: 0,
-                            producer_id: -1,
-                            producer_epoch: -1,
-                            timestamp_type: TimestampType::Creation,
-                            offset: msg.partition_offset,
-                            sequence: 0, // Sequence in fetch response is not used; avoid i64→i32 overflow
-                            timestamp: msg.timestamp,
-                            key: msg.key.map(bytes::Bytes::from),
-                            value: msg.value.map(bytes::Bytes::from),
-                            headers: Default::default(),
-                        };
-                        // DR-8: return stored headers to the consumer (they were
-                        // written on produce but never fetched before this).
-                        for (k, v) in msg.headers {
-                            record
-                                .headers
-                                .insert(StrBytes::from_string(k), Some(bytes::Bytes::from(v)));
-                        }
-                        record
-                    })
-                    .collect();
-
-                // Encode records as RecordBatch
-                let mut encoded = bytes::BytesMut::new();
-                if let Err(e) = RecordBatchEncoder::encode(
-                    &mut encoded,
-                    kafka_records.iter(),
-                    &RecordEncodeOptions {
-                        version: 2,
-                        compression,
-                    },
-                ) {
-                    // On error, return empty bytes to avoid protocol errors
-                    crate::pg_warning!(
-                        "Failed to encode RecordBatch for topic_id={}, partition={}: {}",
-                        topic_id,
-                        partition_id,
-                        e
-                    );
-                    Some(bytes::Bytes::new())
-                } else {
-                    Some(encoded.freeze())
+                match encode_record_batches(db_records, compression) {
+                    Ok(bytes) => Some(bytes),
+                    Err(e) => {
+                        // On error, return empty bytes to avoid protocol errors
+                        crate::pg_warning!(
+                            "Failed to encode RecordBatch for topic_id={}, partition={}: {}",
+                            topic_id,
+                            partition_id,
+                            e
+                        );
+                        Some(bytes::Bytes::new())
+                    }
                 }
+            } else if storage_empty {
+                // Wave 3: nothing visible from fetch_offset up to the readable end. With
+                // offsets in between (aborted rows filtered for read_committed, rows
+                // deleted by aborted-row cleanup or retention), an empty response would
+                // leave the consumer polling the same offset forever; a marker batch
+                // covering them moves it to the readable end, as the abort marker after
+                // an aborted transaction does in Kafka.
+                let readable_end = match isolation_level {
+                    IsolationLevel::ReadCommitted => last_stable_offset,
+                    IsolationLevel::ReadUncommitted => high_watermark,
+                };
+                Some(gap_batch(fetch_offset, readable_end).unwrap_or_default())
             } else {
                 // Empty result set - return empty bytes instead of None
                 // This avoids "invalid MessageSetSize -1" errors in flexible format
@@ -338,14 +474,21 @@ pub fn handle_fetch_with_max_bytes(
 
 /// Handle ListOffsets request
 ///
-/// Returns earliest or latest offsets for requested partitions.
-/// Supports Kafka's special timestamps:
-/// - -2 = earliest offset
-/// - -1 = latest offset (high watermark)
-/// - >= 0 = offset at timestamp (not yet implemented)
+/// Kafka's special timestamps:
+/// - -2 = earliest offset (log start)
+/// - -1 = latest offset: the high watermark, or the last stable offset for a
+///   read_committed request (wave 3)
+/// - -3 = MAX_TIMESTAMP (KIP-734): offset and timestamp of the record with the largest
+///   timestamp (wave 3)
+/// - >= 0 = the earliest offset whose timestamp is at or after it
+///
+/// Timestamp lookups (-3 and >= 0) are bounded like Kafka's: a match at or beyond the
+/// high watermark (read_committed: the last stable offset) is reported as offset -1.
+/// A partition outside the topic is UNKNOWN_TOPIC_OR_PARTITION (wave 3; was offset 0).
 pub fn handle_list_offsets(
     ctx: &HandlerContext,
     topics: Vec<crate::kafka::messages::ListOffsetsTopicData>,
+    isolation_level: IsolationLevel,
 ) -> Result<kafka_protocol::messages::list_offsets_response::ListOffsetsResponse> {
     let store = ctx.store;
     use kafka_protocol::messages::list_offsets_response::{
@@ -354,122 +497,66 @@ pub fn handle_list_offsets(
 
     let mut response_topics = Vec::new();
 
-    // Process each topic
     for topic_request in topics {
         let topic_name = topic_request.name.clone();
 
-        // Look up topic_id using helper
-        let topic_id = match resolve_topic_id(store, &topic_name) {
-            TopicResolution::Found(id) => id,
-            resolution => {
-                // Topic not found or error - return error for all partitions
-                let error_code = topic_resolution_error_code(&resolution);
-                let mut error_partitions = Vec::new();
-                for partition in topic_request.partitions {
-                    let mut partition_response = ListOffsetsPartitionResponse::default();
-                    partition_response.partition_index = partition.partition_index;
-                    partition_response.error_code = error_code;
-                    error_partitions.push(partition_response);
-                }
-
+        let (topic_id, partition_count) = match resolve_topic(store, &topic_name) {
+            Ok(Some(found)) => found,
+            unresolved => {
+                let error_code = match unresolved {
+                    Err(code) => code,
+                    _ => crate::kafka::constants::ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+                };
                 let mut topic_response = ListOffsetsTopicResponse::default();
                 topic_response.name = TopicName(StrBytes::from_string(topic_name));
-                topic_response.partitions = error_partitions;
+                topic_response.partitions = topic_request
+                    .partitions
+                    .iter()
+                    .map(|p| list_offsets_error(p.partition_index, error_code))
+                    .collect();
                 response_topics.push(topic_response);
                 continue;
             }
         };
 
         let mut partition_responses = Vec::new();
-
-        // Process each partition
         for partition_request in topic_request.partitions {
             let partition_id = partition_request.partition_index;
-            let timestamp = partition_request.timestamp;
-
+            if partition_id < 0 || partition_id >= partition_count {
+                partition_responses.push(list_offsets_error(
+                    partition_id,
+                    crate::kafka::constants::ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+                ));
+                continue;
+            }
+            let result = list_partition_offset(
+                store,
+                topic_id,
+                partition_id,
+                partition_request.timestamp,
+                isolation_level,
+            );
             let mut partition_response = ListOffsetsPartitionResponse::default();
             partition_response.partition_index = partition_id;
-
-            // Determine which offset to return based on timestamp
-            let offset = match timestamp {
-                -2 => {
-                    // Earliest offset
-                    match store.get_earliest_offset(topic_id, partition_id) {
-                        Ok(offset) => offset,
-                        Err(e) => {
-                            // Use typed error's Kafka error code
-                            let error_code = e.to_kafka_error_code();
-                            if e.is_server_error() {
-                                crate::pg_warning!(
-                                    "Failed to get earliest offset for topic_id={}, partition={}: {}",
-                                    topic_id,
-                                    partition_id,
-                                    e
-                                );
-                            }
-                            partition_response.error_code = error_code;
-                            partition_responses.push(partition_response);
-                            continue;
-                        }
-                    }
+            match result {
+                Ok((offset, timestamp)) => {
+                    partition_response.error_code = ERROR_NONE;
+                    partition_response.offset = offset;
+                    partition_response.timestamp = timestamp;
                 }
-                -1 => {
-                    // Latest offset (high watermark)
-                    match store.get_high_watermark(topic_id, partition_id) {
-                        Ok(offset) => offset,
-                        Err(e) => {
-                            // Use typed error's Kafka error code
-                            let error_code = e.to_kafka_error_code();
-                            if e.is_server_error() {
-                                crate::pg_warning!(
-                                    "Failed to get high watermark for topic_id={}, partition={}: {}",
-                                    topic_id,
-                                    partition_id,
-                                    e
-                                );
-                            }
-                            partition_response.error_code = error_code;
-                            partition_responses.push(partition_response);
-                            continue;
-                        }
+                Err(e) => {
+                    if e.is_server_error() {
+                        crate::pg_warning!(
+                            "ListOffsets failed for topic_id={}, partition={}, timestamp={}: {}",
+                            topic_id,
+                            partition_id,
+                            partition_request.timestamp,
+                            e
+                        );
                     }
+                    partition_response = list_offsets_error(partition_id, e.to_kafka_error_code());
                 }
-                _ => {
-                    // CONF-7: a real timestamp lookup — the earliest offset whose stored record
-                    // timestamp (BUG-7) is at or after the requested one. Per the protocol, return
-                    // offset -1 (and timestamp -1) when no record qualifies, rather than erroring.
-                    match store.get_offset_for_timestamp(topic_id, partition_id, timestamp) {
-                        Ok(Some((offset, record_ts))) => {
-                            partition_response.error_code = ERROR_NONE;
-                            partition_response.offset = offset;
-                            partition_response.timestamp = record_ts;
-                        }
-                        Ok(None) => {
-                            partition_response.error_code = ERROR_NONE;
-                            partition_response.offset = -1;
-                            partition_response.timestamp = -1;
-                        }
-                        Err(e) => {
-                            let error_code = e.to_kafka_error_code();
-                            if e.is_server_error() {
-                                crate::pg_warning!(
-                                    "Failed timestamp lookup for topic_id={}, partition={}: {}",
-                                    topic_id,
-                                    partition_id,
-                                    e
-                                );
-                            }
-                            partition_response.error_code = error_code;
-                        }
-                    }
-                    partition_responses.push(partition_response);
-                    continue;
-                }
-            };
-
-            partition_response.error_code = ERROR_NONE;
-            partition_response.offset = offset;
-            partition_response.timestamp = -1; // Not used for special offsets
+            }
             partition_responses.push(partition_response);
         }
 
@@ -479,12 +566,52 @@ pub fn handle_list_offsets(
         response_topics.push(topic_response);
     }
 
-    // Build response
     let mut kafka_response = ListOffsetsResponse::default();
     kafka_response.throttle_time_ms = 0;
     kafka_response.topics = response_topics;
-
     Ok(kafka_response)
+}
+
+/// A ListOffsets partition entry carrying `error_code` (offset and timestamp -1).
+fn list_offsets_error(
+    partition_index: i32,
+    error_code: i16,
+) -> kafka_protocol::messages::list_offsets_response::ListOffsetsPartitionResponse {
+    let mut p =
+        kafka_protocol::messages::list_offsets_response::ListOffsetsPartitionResponse::default();
+    p.partition_index = partition_index;
+    p.error_code = error_code;
+    p.offset = -1;
+    p.timestamp = -1;
+    p
+}
+
+/// `(offset, timestamp)` for one ListOffsets partition query (see
+/// [`handle_list_offsets`]).
+fn list_partition_offset(
+    store: &dyn crate::kafka::storage::KafkaStore,
+    topic_id: i32,
+    partition_id: i32,
+    timestamp: i64,
+    isolation_level: IsolationLevel,
+) -> Result<(i64, i64)> {
+    // The end of what a consumer at this isolation level may read.
+    let readable_end = || match isolation_level {
+        IsolationLevel::ReadCommitted => store.get_last_stable_offset(topic_id, partition_id),
+        IsolationLevel::ReadUncommitted => store.get_high_watermark(topic_id, partition_id),
+    };
+    match timestamp {
+        // EARLIEST, and EARLIEST_LOCAL (-4): no tiered storage, so the same.
+        -2 | -4 => Ok((store.get_earliest_offset(topic_id, partition_id)?, -1)),
+        -1 => Ok((readable_end()?, -1)),
+        _ => {
+            let found = store.get_offset_for_timestamp(topic_id, partition_id, timestamp)?;
+            match found {
+                Some((offset, record_ts)) if offset < readable_end()? => Ok((offset, record_ts)),
+                _ => Ok((-1, -1)),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -504,6 +631,8 @@ mod storage_stream_tests {
             value: Some(vec![b'x'; value_len]),
             timestamp: 0,
             headers: vec![],
+            producer_id: None,
+            producer_epoch: None,
         }
     }
 
@@ -671,6 +800,170 @@ mod storage_stream_tests {
             response.responses[0].partitions[0].error_code,
             crate::kafka::constants::ERROR_OFFSET_OUT_OF_RANGE
         );
+    }
+
+    // ===== wave3 txn: batch grouping and gap batches =====
+
+    fn txn_msg(offset: i64, pid: Option<i64>) -> FetchedMessage {
+        FetchedMessage {
+            producer_id: pid,
+            producer_epoch: pid.map(|_| 3),
+            ..msg(offset, 10)
+        }
+    }
+
+    /// (base offset, record count, producer id, transactional) of every batch.
+    fn decode_batches(bytes: bytes::Bytes) -> Vec<(i64, usize, i64, bool)> {
+        use kafka_protocol::records::RecordBatchDecoder;
+        let mut buf = bytes;
+        let mut out = Vec::new();
+        let set = RecordBatchDecoder::decode_all(&mut buf).unwrap();
+        for batch in set {
+            let first = &batch.records[0];
+            out.push((
+                first.offset,
+                batch.records.len(),
+                first.producer_id,
+                first.transactional,
+            ));
+        }
+        out
+    }
+
+    #[test]
+    fn crc32c_matches_the_standard_check_value() {
+        assert_eq!(crc32c(b"123456789"), 0xE306_9283);
+    }
+
+    #[test]
+    fn records_are_grouped_into_batches() {
+        // Before wave 3 every record was its own batch (61 bytes of header each).
+        let plain: Vec<FetchedMessage> = (0..100).map(|o| msg(o, 10)).collect();
+        let bytes = encode_record_batches(plain, Compression::None).unwrap();
+        assert_eq!(decode_batches(bytes.clone()), vec![(0, 100, -1, false)]);
+        assert!(bytes.len() < 100 * 40, "{} bytes", bytes.len());
+
+        // Runs split on a producer change and on an offset gap; transactional rows
+        // carry their producer id and the transactional flag.
+        let mixed = vec![
+            txn_msg(0, None),
+            txn_msg(1, None),
+            txn_msg(2, Some(7)),
+            txn_msg(3, Some(7)),
+            txn_msg(5, Some(7)), // gap: 4 was filtered (aborted)
+            txn_msg(6, Some(8)),
+            txn_msg(7, None),
+        ];
+        let bytes = encode_record_batches(mixed, Compression::None).unwrap();
+        assert_eq!(
+            decode_batches(bytes),
+            vec![
+                (0, 2, -1, false),
+                (2, 2, 7, true),
+                (5, 1, 7, true),
+                (6, 1, 8, true),
+                (7, 1, -1, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn grouped_batches_survive_compression() {
+        let plain: Vec<FetchedMessage> = (10..60).map(|o| msg(o, 100)).collect();
+        let bytes = encode_record_batches(plain, Compression::Gzip).unwrap();
+        assert_eq!(decode_batches(bytes), vec![(10, 50, -1, false)]);
+    }
+
+    #[test]
+    fn gap_batch_is_a_control_batch_covering_the_range() {
+        assert!(gap_batch(5, 5).is_none());
+        assert!(gap_batch(6, 5).is_none());
+        let b = gap_batch(2, 5).unwrap();
+        assert_eq!(i64::from_be_bytes(b[0..8].try_into().unwrap()), 2); // base offset
+        let len = i32::from_be_bytes(b[8..12].try_into().unwrap()) as usize;
+        assert_eq!(len + 12, b.len());
+        assert_eq!(b[16], 2); // magic
+        let crc = u32::from_be_bytes(b[17..21].try_into().unwrap());
+        assert_eq!(crc, crc32c(&b[21..]));
+        assert_eq!(i16::from_be_bytes(b[21..23].try_into().unwrap()), 0x30);
+        assert_eq!(i32::from_be_bytes(b[23..27].try_into().unwrap()), 2); // last delta
+        assert_eq!(i32::from_be_bytes(b[57..61].try_into().unwrap()), 1); // records
+                                                                          // What a client decodes: one control record (COMMIT marker) at offset 4.
+        use kafka_protocol::records::RecordBatchDecoder;
+        let mut buf = b.clone();
+        let set = RecordBatchDecoder::decode_all(&mut buf).unwrap();
+        assert_eq!(set.len(), 1);
+        let r = &set[0].records[0];
+        assert!(r.control && r.transactional);
+        assert_eq!(r.offset, 4);
+        assert_eq!(r.key.as_deref(), Some(&[0u8, 0, 0, 1][..]));
+        // A huge gap is covered up to i32::MAX + 1 offsets.
+        let b = gap_batch(0, i64::MAX).unwrap();
+        assert_eq!(i32::from_be_bytes(b[23..27].try_into().unwrap()), i32::MAX);
+        let mut buf = b.clone();
+        let set = RecordBatchDecoder::decode_all(&mut buf).unwrap();
+        assert_eq!(set[0].records[0].offset, i32::MAX as i64);
+    }
+
+    fn one_partition_mock(hwm: i64, lso: i64) -> MockKafkaStore {
+        let mut mock = MockKafkaStore::new();
+        mock.expect_get_topic_metadata().returning(|_| {
+            Ok(vec![TopicMetadata {
+                name: "t".to_string(),
+                id: 1,
+                partition_count: 1,
+            }])
+        });
+        mock.expect_get_high_watermark()
+            .returning(move |_, _| Ok(hwm));
+        mock.expect_get_last_stable_offset()
+            .returning(move |_, _| Ok(lso));
+        mock.expect_get_earliest_offset().returning(|_, _| Ok(0));
+        mock.expect_get_log_start_offset().returning(|_, _| Ok(0));
+        mock
+    }
+
+    fn fetch_one(mock: &MockKafkaStore, offset: i64, isolation: IsolationLevel) -> bytes::Bytes {
+        let coordinator = GroupCoordinator::new();
+        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(mock, &coordinator, &broker, 1, Compression::None);
+        let mut req = two_partition_request();
+        req[0].partitions.truncate(1);
+        req[0].partitions[0].fetch_offset = offset;
+        let r = handle_fetch(&ctx, req, isolation).unwrap();
+        assert_eq!(r.responses[0].partitions[0].error_code, ERROR_NONE);
+        r.responses[0].partitions[0].records.clone().unwrap()
+    }
+
+    /// The read_committed stall: offsets 2..5 are aborted (filtered), nothing visible
+    /// is left. Before wave 3 the response was empty and the consumer re-fetched offset
+    /// 2 forever; now an empty batch moves it to the LSO (= HWM 5).
+    #[test]
+    fn invisible_tail_is_covered_by_a_gap_batch() {
+        let mut mock = one_partition_mock(5, 5);
+        mock.expect_fetch_records_with_isolation()
+            .returning(|_, _, _, _, _| Ok(vec![]));
+        let b = fetch_one(&mock, 2, IsolationLevel::ReadCommitted);
+        assert_eq!(b, gap_batch(2, 5).unwrap());
+        // read_uncommitted after cleanup deleted the rows: up to the HWM.
+        let b = fetch_one(&mock, 3, IsolationLevel::ReadUncommitted);
+        assert_eq!(b, gap_batch(3, 5).unwrap());
+        // Caught up: nothing to cover.
+        assert!(fetch_one(&mock, 5, IsolationLevel::ReadCommitted).is_empty());
+    }
+
+    /// An open transaction at offset 3 keeps blocking at the LSO: the gap batch ends
+    /// there, never beyond it.
+    #[test]
+    fn gap_batch_stops_at_the_last_stable_offset() {
+        let mut mock = one_partition_mock(9, 3);
+        mock.expect_fetch_records_with_isolation()
+            .returning(|_, _, _, _, _| Ok(vec![]));
+        assert_eq!(
+            fetch_one(&mock, 1, IsolationLevel::ReadCommitted),
+            gap_batch(1, 3).unwrap()
+        );
+        assert!(fetch_one(&mock, 3, IsolationLevel::ReadCommitted).is_empty());
     }
 
     /// The default get_partition_bounds skips the LSO query for ReadUncommitted.

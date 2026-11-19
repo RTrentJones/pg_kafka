@@ -46,6 +46,12 @@ pub struct FetchedMessage {
     /// because the kafka-protocol record type holds headers in a map (documented
     /// in PROTOCOL_DEVIATIONS.md).
     pub headers: Vec<(String, Vec<u8>)>,
+    /// Producer id stamped on the row (wave 3 txn): set for records written by a
+    /// transactional producer, `None` otherwise. Fetch groups consecutive records of
+    /// one producer id/epoch into one RecordBatch and marks it transactional.
+    pub producer_id: Option<i64>,
+    /// Producer epoch stamped with `producer_id`.
+    pub producer_epoch: Option<i16>,
 }
 
 /// Decode the JSONB headers column back into header pairs (DR-8). The column holds an
@@ -479,7 +485,12 @@ pub trait LogStore {
 
     /// Find the earliest offset whose record timestamp is at or after `timestamp_ms` (CONF-7,
     /// Kafka's ListOffsets-by-timestamp). Returns `(offset, record_timestamp_ms)`, or `None` when no
-    /// visible record qualifies. Records that carried no timestamp (stored as -1) are excluded.
+    /// record qualifies. Records that carried no timestamp (stored as -1) and aborted records are
+    /// excluded; pending transactional records are included (the caller bounds the result by the
+    /// high watermark or the last stable offset, as Kafka does).
+    ///
+    /// `timestamp_ms == MAX_TIMESTAMP` (-3, KIP-734) instead returns the record with the
+    /// largest timestamp (the lowest offset among equal ones).
     fn get_offset_for_timestamp(
         &self,
         topic_id: i32,
@@ -564,6 +575,11 @@ pub trait OffsetStore {
     /// # Returns
     /// Ok on success
     fn delete_consumer_group_offsets(&self, group_id: &str) -> Result<()>;
+
+    /// The `(topic name, partition)` pairs of `group_id` that have a transactional
+    /// offset commit (TxnOffsetCommit) whose transaction has not ended yet. OffsetFetch
+    /// with `require_stable` (KIP-447) answers UNSTABLE_OFFSET_COMMIT for them (wave 3).
+    fn pending_txn_offset_partitions(&self, group_id: &str) -> Result<Vec<(String, i32)>>;
 }
 
 /// Idempotent producer state: producer ids, epochs and sequence numbers (Phase 9).
@@ -609,11 +625,15 @@ pub trait ProducerStore {
     /// transactional.
     fn increment_producer_epoch(&self, producer_id: i64) -> Result<(i64, i16)>;
 
-    /// Check and update sequence number for idempotent producer
+    /// Validate an idempotent producer's batch against the producer state of one
+    /// partition (wave 3: Kafka's model, see [`validate_sequence`]).
     ///
-    /// Validates that the sequence number is exactly `last_sequence + 1` for
-    /// the given (producer_id, topic_id, partition_id) tuple. If valid, updates
-    /// the last_sequence to `base_sequence + record_count - 1`.
+    /// The batch is appended when it starts right after the partition's last sequence
+    /// (or at 0 on a fresh partition or with a new epoch), and is a duplicate when its
+    /// exact sequence range is one of the producer's last [`PRODUCER_BATCH_CACHE`]
+    /// batches on the partition; then the original base offset is returned. Nothing is
+    /// written for a duplicate or an error; a batch at a new (client-bumped) epoch
+    /// moves the producer's stored epoch and clears its sequence state first.
     ///
     /// # Arguments
     /// * `producer_id` - The producer ID
@@ -624,10 +644,11 @@ pub trait ProducerStore {
     /// * `record_count` - Number of records in the batch
     ///
     /// # Returns
-    /// * `Ok(true)` if sequence is valid and should be inserted (new message)
-    /// * `Ok(false)` if sequence is a duplicate (skip insert, return success to client)
-    /// * `Err(OutOfOrderSequence)` if there's a gap in the sequence
-    /// * `Err(ProducerFenced)` if the epoch is stale
+    /// * `Ok(SequenceCheck::Append)`: insert the batch, then [`record_producer_batch`](Self::record_producer_batch)
+    /// * `Ok(SequenceCheck::Duplicate { base_offset })`: a retry; skip the insert and
+    ///   answer success with the original base offset
+    /// * `Err(OutOfOrderSequence)`: anything else out of sequence
+    /// * `Err(Protocol { code: INVALID_PRODUCER_EPOCH })`: a stale epoch
     fn check_and_update_sequence(
         &self,
         producer_id: i64,
@@ -636,6 +657,27 @@ pub trait ProducerStore {
         partition_id: i32,
         base_sequence: i32,
         record_count: i32,
+    ) -> Result<SequenceCheck>;
+
+    /// Persist an appended idempotent batch AFTER its records were inserted (RV-8):
+    /// advance the partition's last sequence and remember the batch (sequence range and
+    /// base offset) among the producer's last [`PRODUCER_BATCH_CACHE`] batches there, so
+    /// a retry of it is answered with its original offset (wave 3).
+    fn record_producer_batch(&self, batch: ProducerBatch) -> Result<()>;
+
+    /// Register partitions in a transaction (AddPartitionsToTxn). A transactional
+    /// Produce is accepted only for registered partitions (wave 3). The registry is
+    /// cleared when the next transaction of the transactional id begins and on
+    /// InitProducerId.
+    fn add_txn_partitions(&self, transactional_id: &str, partitions: &[(i32, i32)]) -> Result<()>;
+
+    /// Whether `(topic_id, partition_id)` was registered for the current transaction of
+    /// `transactional_id` with [`add_txn_partitions`](Self::add_txn_partitions).
+    fn txn_has_partition(
+        &self,
+        transactional_id: &str,
+        topic_id: i32,
+        partition_id: i32,
     ) -> Result<bool>;
 
     /// Persist a producer's advanced `last_sequence` AFTER a successful insert (RV-8).
@@ -644,6 +686,10 @@ pub trait ProducerStore {
     /// only validates) so it happens only once the records are durably inserted.
     /// Otherwise a failed insert would leave the sequence advanced and a retry of
     /// the same batch would be misclassified as a duplicate and silently dropped.
+    ///
+    /// Sets only the last sequence; the produce path uses
+    /// [`record_producer_batch`](Self::record_producer_batch), which also remembers
+    /// the batch for duplicate detection.
     fn record_producer_sequence(
         &self,
         producer_id: i64,
@@ -970,6 +1016,9 @@ macro_rules! delegate_offset_store {
         fn delete_consumer_group_offsets(&self, group_id: &str) -> $crate::kafka::error::Result<()> {
             $via::delete_consumer_group_offsets(&self $(.$field)?, group_id)
         }
+        fn pending_txn_offset_partitions(&self, group_id: &str) -> $crate::kafka::error::Result<Vec<(String, i32)>> {
+            $via::pending_txn_offset_partitions(&self $(.$field)?, group_id)
+        }
     };
 }
 pub(crate) use delegate_offset_store;
@@ -988,8 +1037,17 @@ macro_rules! delegate_producer_store {
         fn increment_producer_epoch(&self, producer_id: i64) -> $crate::kafka::error::Result<(i64, i16)> {
             $via::increment_producer_epoch(&self $(.$field)?, producer_id)
         }
-        fn check_and_update_sequence(&self, producer_id: i64, producer_epoch: i16, topic_id: i32, partition_id: i32, base_sequence: i32, record_count: i32) -> $crate::kafka::error::Result<bool> {
+        fn check_and_update_sequence(&self, producer_id: i64, producer_epoch: i16, topic_id: i32, partition_id: i32, base_sequence: i32, record_count: i32) -> $crate::kafka::error::Result<$crate::kafka::storage::SequenceCheck> {
             $via::check_and_update_sequence(&self $(.$field)?, producer_id, producer_epoch, topic_id, partition_id, base_sequence, record_count)
+        }
+        fn record_producer_batch(&self, batch: $crate::kafka::storage::ProducerBatch) -> $crate::kafka::error::Result<()> {
+            $via::record_producer_batch(&self $(.$field)?, batch)
+        }
+        fn add_txn_partitions(&self, transactional_id: &str, partitions: &[(i32, i32)]) -> $crate::kafka::error::Result<()> {
+            $via::add_txn_partitions(&self $(.$field)?, transactional_id, partitions)
+        }
+        fn txn_has_partition(&self, transactional_id: &str, topic_id: i32, partition_id: i32) -> $crate::kafka::error::Result<bool> {
+            $via::txn_has_partition(&self $(.$field)?, transactional_id, topic_id, partition_id)
         }
         fn record_producer_sequence(&self, producer_id: i64, topic_id: i32, partition_id: i32, last_sequence: i32) -> $crate::kafka::error::Result<()> {
             $via::record_producer_sequence(&self $(.$field)?, producer_id, topic_id, partition_id, last_sequence)
@@ -1049,69 +1107,147 @@ macro_rules! delegate_maintenance_store {
 }
 pub(crate) use delegate_maintenance_store;
 
-/// Outcome of validating a producer batch's sequence range against the last
-/// persisted sequence for a (producer, topic, partition).
+/// How many of a producer's most recent batches per partition are remembered for
+/// duplicate detection, as Kafka's `max.in.flight.requests.per.connection` bound for
+/// idempotence (5).
+pub const PRODUCER_BATCH_CACHE: usize = 5;
+
+/// ListOffsets' MAX_TIMESTAMP (-3, KIP-734): the record with the largest timestamp.
+pub const MAX_TIMESTAMP: i64 = -3;
+
+/// What the produce path does with an idempotent batch
+/// ([`ProducerStore::check_and_update_sequence`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SequenceValidation {
-    /// The entire batch is at or behind the last persisted sequence: a replay
-    /// of already-persisted records. Skip the insert, report success.
-    Duplicate,
-    /// The batch starts exactly at the expected sequence. Persist it and
-    /// advance the stored sequence to `new_last_sequence`.
-    Proceed { new_last_sequence: i32 },
-    /// The batch leaves a gap ahead of the expected sequence, or partially
-    /// overlaps already-persisted records (base behind expected but extending
-    /// past the last persisted sequence). Persisting it would drop or
-    /// duplicate records, so the producer must be told to back off.
-    OutOfOrder { expected_sequence: i32 },
+pub enum SequenceCheck {
+    /// Insert the batch, then record it with [`ProducerStore::record_producer_batch`].
+    Append,
+    /// A retry of a batch already appended at `base_offset`: skip the insert and
+    /// answer success with that offset.
+    Duplicate { base_offset: i64 },
 }
 
-/// Validate a producer batch's sequence range.
+/// One appended idempotent batch ([`ProducerStore::record_producer_batch`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProducerBatch {
+    pub producer_id: i64,
+    pub topic_id: i32,
+    pub partition_id: i32,
+    pub first_sequence: i32,
+    pub last_sequence: i32,
+    pub base_offset: i64,
+}
+
+/// A remembered batch of a producer on one partition (sequence range and base offset).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CachedBatch {
+    pub first_sequence: i32,
+    pub last_sequence: i32,
+    pub base_offset: i64,
+}
+
+/// Outcome of validating a producer batch against the producer state of a partition
+/// ([`validate_sequence`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SequenceValidation {
+    /// The batch's exact range is one of the remembered batches: a retry. Skip the
+    /// insert and report the original base offset.
+    Duplicate { base_offset: i64 },
+    /// Append the batch; the partition's last sequence becomes `new_last_sequence`.
+    /// `new_epoch`: the batch carries a higher epoch than the stored one (an
+    /// idempotent producer bumped its own epoch, KIP-360), so the stored epoch moves
+    /// to it and the old epoch's sequence state is discarded first.
+    Proceed {
+        new_last_sequence: i32,
+        new_epoch: bool,
+    },
+    /// Out of sequence: neither the next sequence nor a remembered batch.
+    OutOfOrder { expected_sequence: i32 },
+    /// The batch's epoch is older than the producer's current epoch.
+    StaleEpoch { current_epoch: i16 },
+}
+
+/// The last sequence of a batch of `record_count` records starting at `base_sequence`.
+/// Sequences wrap from `i32::MAX` to 0, as Kafka's `DefaultRecordBatch.incrementSequence`.
+pub fn batch_last_sequence(base_sequence: i32, record_count: i32) -> i32 {
+    let increment = record_count.max(1) - 1;
+    if base_sequence > i32::MAX - increment {
+        increment - (i32::MAX - base_sequence) - 1
+    } else {
+        base_sequence + increment
+    }
+}
+
+/// The sequence expected after `last_sequence` (wrapping at `i32::MAX`); 0 when the
+/// partition has no state yet.
+pub fn next_sequence(last_sequence: Option<i32>) -> i32 {
+    match last_sequence {
+        None | Some(i32::MAX) => 0,
+        Some(last) => last + 1,
+    }
+}
+
+/// Validate an idempotent producer batch, following Kafka's producer state model
+/// (`ProducerStateManager`/`ProducerAppendInfo`):
 ///
-/// A batch is only a duplicate when *every* record in it is at or behind
-/// `last_sequence`. A batch whose base is behind the expected sequence but
-/// which extends past `last_sequence` is NOT a duplicate: silently skipping
-/// it would lose the unseen tail records, so it is rejected as out of order
-/// (matching Kafka, which only honors exact replays of cached batches).
+/// * a lower epoch than `current_epoch` is stale (INVALID_PRODUCER_EPOCH); a higher
+///   one (a client-side epoch bump) must start at sequence 0;
+/// * at the current epoch, a batch whose exact `[first, last]` sequence range is one of
+///   the `cached` (last [`PRODUCER_BATCH_CACHE`]) batches is a duplicate and keeps its
+///   original offset; otherwise it must start at the next sequence (0 on a partition
+///   without state), anything else is out of order;
+/// * sequences wrap at `i32::MAX` ([`batch_last_sequence`]).
 ///
-/// All arithmetic is done in i64 so sequence ranges near `i32::MAX` cannot
-/// overflow. Sequence wraparound (mod 2^31) is not yet supported; a batch
-/// that would advance past `i32::MAX` is rejected as out of order rather
-/// than wrapping silently.
+/// `last_sequence` is the partition's last sequence at `current_epoch` (`None`: no
+/// state). A negative base sequence or record count is malformed and rejected as out
+/// of order (RV-12). Deviation from Kafka: a producer without state on a partition
+/// must start at 0 (Kafka accepts any first sequence there), which only refuses
+/// batches whose predecessors never arrived.
 pub fn validate_sequence(
-    last_sequence: i32,
+    current_epoch: i16,
+    last_sequence: Option<i32>,
+    cached: &[CachedBatch],
+    producer_epoch: i16,
     base_sequence: i32,
     record_count: i32,
 ) -> SequenceValidation {
-    // RV-12: a negative base_sequence (or record_count) is malformed wire input. It
-    // must not fall through to the Duplicate branch below — for e.g. a fresh
-    // partition (last_sequence = -1) with base_sequence = -1, `batch_last` (-1) is
-    // <= last_sequence, so it would be classified Duplicate, skipped, and acked
-    // success = silent data loss. Reject it as out of order so the client resyncs.
+    let expected = next_sequence(last_sequence);
     if base_sequence < 0 || record_count < 0 {
         return SequenceValidation::OutOfOrder {
-            expected_sequence: last_sequence.wrapping_add(1),
+            expected_sequence: expected,
         };
     }
-
-    let expected = last_sequence as i64 + 1;
-    let base = base_sequence as i64;
-    let batch_last = base + (record_count.max(1) as i64) - 1;
-
-    if base == expected {
-        match i32::try_from(batch_last) {
-            Ok(new_last_sequence) => SequenceValidation::Proceed { new_last_sequence },
-            // Would overflow i32 (client wrapped mod 2^31, which we don't
-            // support yet): refuse rather than wrap silently.
-            Err(_) => SequenceValidation::OutOfOrder {
-                expected_sequence: last_sequence.wrapping_add(1),
-            },
+    let last = batch_last_sequence(base_sequence, record_count);
+    if producer_epoch < current_epoch {
+        return SequenceValidation::StaleEpoch { current_epoch };
+    }
+    if producer_epoch > current_epoch {
+        return if base_sequence == 0 {
+            SequenceValidation::Proceed {
+                new_last_sequence: last,
+                new_epoch: true,
+            }
+        } else {
+            SequenceValidation::OutOfOrder {
+                expected_sequence: 0,
+            }
+        };
+    }
+    if let Some(dup) = cached
+        .iter()
+        .find(|b| b.first_sequence == base_sequence && b.last_sequence == last)
+    {
+        return SequenceValidation::Duplicate {
+            base_offset: dup.base_offset,
+        };
+    }
+    if base_sequence == expected {
+        SequenceValidation::Proceed {
+            new_last_sequence: last,
+            new_epoch: false,
         }
-    } else if batch_last <= last_sequence as i64 {
-        SequenceValidation::Duplicate
     } else {
         SequenceValidation::OutOfOrder {
-            expected_sequence: last_sequence.wrapping_add(1),
+            expected_sequence: expected,
         }
     }
 }
