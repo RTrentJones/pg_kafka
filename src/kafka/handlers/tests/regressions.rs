@@ -8,9 +8,8 @@ use crate::kafka::messages::{
     TopicProduceData,
 };
 use crate::kafka::storage::{TopicMetadata, TransactionState};
-use crate::kafka::{BrokerMetadata, GroupCoordinator, HandlerContext};
 use crate::testing::mocks::MockKafkaStore;
-use kafka_protocol::records::Compression;
+use crate::testing::TestEnv;
 use mockall::predicate::eq;
 
 fn record(key: &[u8]) -> Record {
@@ -88,9 +87,8 @@ fn idempotent_produce_uses_each_partitions_own_sequence() {
         ],
     }];
 
-    let coordinator = GroupCoordinator::new();
-    let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-    let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
     // The request-level metadata is the first partition's (worker.rs).
     let response = produce::handle_produce(&ctx, topic_data, Some(&meta(5)), None).unwrap();
     for pr in &response.responses[0].partition_responses {
@@ -116,9 +114,8 @@ fn idempotent_produce_to_partition_minus_one_is_rejected() {
         }],
     }];
 
-    let coordinator = GroupCoordinator::new();
-    let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-    let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
     let response = produce::handle_produce(&ctx, topic_data, Some(&meta(0)), None).unwrap();
     let prs = &response.responses[0].partition_responses;
     assert_eq!(prs.len(), 1);
@@ -144,9 +141,8 @@ fn non_idempotent_produce_to_partition_minus_one_still_routes() {
         }],
     }];
 
-    let coordinator = GroupCoordinator::new();
-    let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-    let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
     let response = produce::handle_produce(&ctx, topic_data, None, None).unwrap();
     let prs = &response.responses[0].partition_responses;
     assert_eq!(prs.len(), 1);
@@ -175,9 +171,8 @@ fn fetch_mock(partition_count: i32, hwm: i64, log_start: i64) -> MockKafkaStore 
 }
 
 fn fetch_one(mock: &MockKafkaStore, partition_index: i32, fetch_offset: i64) -> (i16, i64) {
-    let coordinator = GroupCoordinator::new();
-    let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-    let ctx = HandlerContext::new(mock, &coordinator, &broker, 1, Compression::None);
+    let env = TestEnv::new();
+    let ctx = env.ctx(mock);
     let response = fetch::handle_fetch(
         &ctx,
         vec![TopicFetchData {
@@ -272,9 +267,8 @@ fn txn_offset_commit_checks_partition_range() {
         .times(1)
         .returning(|_, _, _, _, _, _| Ok(()));
 
-    let coordinator = GroupCoordinator::new();
-    let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-    let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
     let topics = vec![(
         "t".to_string(),
         vec![(-1, 1i64, None), (99, 1i64, None), (0, 1i64, None)],
@@ -301,9 +295,8 @@ fn txn_offset_commit_checks_partition_range() {
 fn describe_unknown_group_is_dead_not_server_error() {
     let mut mock = MockKafkaStore::new();
     mock.expect_group_has_offsets().returning(|_| Ok(false));
-    let coordinator = GroupCoordinator::new();
-    let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-    let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
     let response = coordinator::handle_describe_groups(&ctx, vec!["missing".to_string()]).unwrap();
     assert_eq!(response.groups[0].error_code, ERROR_NONE);
     assert_eq!(response.groups[0].group_state.as_str(), "Dead");

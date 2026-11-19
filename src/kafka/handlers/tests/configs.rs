@@ -2,9 +2,8 @@
 
 use crate::kafka::constants::*;
 use crate::kafka::handlers::configs;
-use crate::kafka::{BrokerMetadata, GroupCoordinator, HandlerContext};
 use crate::testing::mocks::MockKafkaStore;
-use kafka_protocol::records::Compression;
+use crate::testing::TestEnv;
 
 // ========== DescribeConfigs Handler Tests (API 32) ==========
 
@@ -38,9 +37,8 @@ fn test_handle_describe_configs_retention_sources() {
     mock.expect_get_topic_retention_ms()
         .returning(|topic_id| Ok(if topic_id == 1 { Some(60_000) } else { None }));
 
-    let coordinator = GroupCoordinator::new();
-    let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-    let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
 
     let response = configs::handle_describe_configs(
         &ctx,
@@ -73,9 +71,8 @@ fn test_handle_describe_configs_key_filter() {
     mock.expect_get_topic_id().returning(|_| Ok(Some(1)));
     mock.expect_get_topic_retention_ms().returning(|_| Ok(None));
 
-    let coordinator = GroupCoordinator::new();
-    let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-    let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
 
     let response = configs::handle_describe_configs(
         &ctx,
@@ -99,9 +96,8 @@ fn test_handle_describe_configs_errors() {
     let mut mock = MockKafkaStore::new();
     mock.expect_get_topic_id().returning(|_| Ok(None));
 
-    let coordinator = GroupCoordinator::new();
-    let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-    let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
 
     let response = configs::handle_describe_configs(
         &ctx,
@@ -139,9 +135,8 @@ fn test_handle_incremental_alter_configs_set_and_delete() {
         .times(1)
         .returning(|_, _| Ok(()));
 
-    let coordinator = GroupCoordinator::new();
-    let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-    let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
 
     let response = configs::handle_incremental_alter_configs(
         &ctx,
@@ -176,9 +171,8 @@ fn test_handle_incremental_alter_configs_validate_only() {
     mock.expect_get_topic_id().returning(|_| Ok(Some(7)));
     mock.expect_set_topic_retention_ms().times(0);
 
-    let coordinator = GroupCoordinator::new();
-    let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-    let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
 
     let response = configs::handle_incremental_alter_configs(
         &ctx,
@@ -201,9 +195,8 @@ fn test_handle_incremental_alter_configs_rejections() {
     mock.expect_get_topic_id().returning(|_| Ok(Some(7)));
     mock.expect_set_topic_retention_ms().times(0);
 
-    let coordinator = GroupCoordinator::new();
-    let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-    let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
 
     let response = configs::handle_incremental_alter_configs(
         &ctx,
@@ -270,9 +263,8 @@ fn test_handle_delete_records_success_and_minus_one() {
         .times(1)
         .returning(|_, _, before| Ok(before));
 
-    let coordinator = GroupCoordinator::new();
-    let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-    let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
 
     let response =
         configs::handle_delete_records(&ctx, vec![("t".to_string(), vec![(0, 5), (0, -1)])])
@@ -297,9 +289,8 @@ fn test_handle_delete_records_errors() {
     mock.expect_get_high_watermark().returning(|_, _| Ok(10));
     mock.expect_delete_records_before().times(0);
 
-    let coordinator = GroupCoordinator::new();
-    let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-    let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
 
     let response = configs::handle_delete_records(
         &ctx,

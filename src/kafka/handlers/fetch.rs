@@ -661,8 +661,8 @@ mod storage_stream_tests {
     use crate::kafka::messages::{PartitionFetchData, TopicFetchData};
     use crate::kafka::storage::roles::*;
     use crate::kafka::storage::{PartitionBounds, TopicMetadata};
-    use crate::kafka::{BrokerMetadata, GroupCoordinator};
     use crate::testing::mocks::MockKafkaStore;
+    use crate::testing::TestEnv;
     use kafka_protocol::records::Compression;
 
     fn msg(offset: i64, value_len: usize) -> FetchedMessage {
@@ -791,9 +791,8 @@ mod storage_stream_tests {
             .times(1)
             .withf(|_, partition, _, limit, _| *partition == 0 && *limit == 1)
             .returning(|_, _, _, _, _| Ok(vec![msg(0, 100), msg(1, 100)]));
-        let coordinator = GroupCoordinator::new();
-        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+        let env = TestEnv::new();
+        let ctx = env.ctx(&mock);
 
         let response = handle_fetch_with_max_bytes(
             &ctx,
@@ -817,9 +816,8 @@ mod storage_stream_tests {
         mock.expect_fetch_records_with_isolation()
             .times(2)
             .returning(|_, _, _, _, _| Ok(vec![msg(0, 100)]));
-        let coordinator = GroupCoordinator::new();
-        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+        let env = TestEnv::new();
+        let ctx = env.ctx(&mock);
 
         let response = handle_fetch(
             &ctx,
@@ -851,9 +849,8 @@ mod storage_stream_tests {
         mock.expect_get_log_start_offset().returning(|_, _| Ok(1));
         mock.expect_fetch_records_with_isolation()
             .returning(|_, _, _, _, _| Ok(vec![]));
-        let coordinator = GroupCoordinator::new();
-        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+        let env = TestEnv::new();
+        let ctx = env.ctx(&mock);
 
         let mut req = two_partition_request();
         req[0].partitions.truncate(1);
@@ -1015,9 +1012,8 @@ mod storage_stream_tests {
     }
 
     fn fetch_one(mock: &MockKafkaStore, offset: i64, isolation: IsolationLevel) -> bytes::Bytes {
-        let coordinator = GroupCoordinator::new();
-        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-        let ctx = HandlerContext::new(mock, &coordinator, &broker, 1, Compression::None);
+        let env = TestEnv::new();
+        let ctx = env.ctx(mock);
         let mut req = two_partition_request();
         req[0].partitions.truncate(1);
         req[0].partitions[0].fetch_offset = offset;

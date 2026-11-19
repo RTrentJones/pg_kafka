@@ -6,9 +6,8 @@ use crate::kafka::handlers::init_producer_id;
 use crate::kafka::handlers::produce;
 use crate::kafka::messages::ProducerMetadata;
 use crate::kafka::messages::{PartitionProduceData, Record, TopicProduceData};
-use crate::kafka::{BrokerMetadata, GroupCoordinator, HandlerContext};
 use crate::testing::mocks::MockKafkaStore;
-use kafka_protocol::records::Compression;
+use crate::testing::TestEnv;
 
 // ========== InitProducerId Handler Tests (Phase 9) ==========
 
@@ -22,9 +21,8 @@ fn test_handle_init_producer_id_new_producer() {
         .returning(|_, _| Ok((1000, 0))); // producer_id=1000, epoch=0
 
     // Create HandlerContext AFTER setting expectations
-    let coordinator = GroupCoordinator::new();
-    let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-    let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
 
     let response = init_producer_id::handle_init_producer_id(
         &ctx,
@@ -89,9 +87,8 @@ fn test_handle_produce_with_idempotent_producer_success() {
     };
 
     // Create HandlerContext AFTER setting expectations
-    let coordinator = GroupCoordinator::new();
-    let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-    let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
 
     let response =
         produce::handle_produce(&ctx, topic_data, Some(&producer_metadata), None).unwrap();
@@ -137,9 +134,8 @@ fn test_handle_produce_insert_failure_does_not_advance_sequence() {
         producer_epoch: 0,
         base_sequence: 0,
     };
-    let coordinator = GroupCoordinator::new();
-    let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-    let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
 
     let response =
         produce::handle_produce(&ctx, topic_data, Some(&producer_metadata), None).unwrap();
@@ -185,9 +181,8 @@ fn test_handle_produce_duplicate_sequence_rejected() {
         base_sequence: 5, // Duplicate - already processed
     };
 
-    let coordinator = GroupCoordinator::new();
-    let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-    let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
 
     let response =
         produce::handle_produce(&ctx, topic_data, Some(&producer_metadata), None).unwrap();
@@ -230,9 +225,8 @@ fn test_handle_produce_out_of_order_sequence_rejected() {
         base_sequence: 15, // Gap - expected 10
     };
 
-    let coordinator = GroupCoordinator::new();
-    let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-    let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
 
     let response =
         produce::handle_produce(&ctx, topic_data, Some(&producer_metadata), None).unwrap();
@@ -279,9 +273,8 @@ fn test_handle_produce_non_idempotent_skips_validation() {
         base_sequence: -1,
     };
 
-    let coordinator = GroupCoordinator::new();
-    let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-    let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
 
     let response =
         produce::handle_produce(&ctx, topic_data, Some(&producer_metadata), None).unwrap();

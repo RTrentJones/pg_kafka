@@ -4,9 +4,8 @@ use crate::kafka::constants::*;
 use crate::kafka::error::KafkaError;
 use crate::kafka::handlers::produce;
 use crate::kafka::messages::{PartitionProduceData, Record, TopicProduceData};
-use crate::kafka::{BrokerMetadata, GroupCoordinator, HandlerContext};
 use crate::testing::mocks::MockKafkaStore;
-use kafka_protocol::records::Compression;
+use crate::testing::TestEnv;
 
 // ========== Produce Handler Tests ==========
 
@@ -43,9 +42,8 @@ fn test_handle_produce_success() {
     }];
 
     // Create HandlerContext AFTER setting expectations
-    let coordinator = GroupCoordinator::new();
-    let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-    let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
 
     let response = produce::handle_produce(&ctx, topic_data, None, None).unwrap();
 
@@ -76,9 +74,8 @@ fn test_handle_produce_unknown_partition() {
     }];
 
     // Create HandlerContext AFTER setting expectations
-    let coordinator = GroupCoordinator::new();
-    let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-    let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
 
     let response = produce::handle_produce(&ctx, topic_data, None, None).unwrap();
 
@@ -116,9 +113,8 @@ fn test_handle_produce_insert_error() {
     }];
 
     // Create HandlerContext AFTER setting expectations
-    let coordinator = GroupCoordinator::new();
-    let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-    let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
 
     let response = produce::handle_produce(&ctx, topic_data, None, None).unwrap();
 
@@ -150,9 +146,8 @@ fn test_handle_produce_txn_wrong_state_rejected() {
         base_sequence: 0,
     };
 
-    let coordinator = GroupCoordinator::new();
-    let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-    let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
 
     // Reported on every requested partition, not returned as Err.
     let response = produce::handle_produce(&ctx, topic_data, Some(&meta), Some("tx1")).unwrap();
@@ -193,9 +188,8 @@ fn test_handle_produce_txn_id_not_found_rejected() {
         base_sequence: 0,
     };
 
-    let coordinator = GroupCoordinator::new();
-    let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-    let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
 
     // Reported on every requested partition, not returned as Err.
     let response = produce::handle_produce(&ctx, topic_data, Some(&meta), Some("tx1")).unwrap();
@@ -245,9 +239,8 @@ fn test_handle_produce_key_based_routing() {
         }],
     }];
 
-    let coordinator = GroupCoordinator::new();
-    let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-    let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
 
     let response = produce::handle_produce(&ctx, topic_data, None, None).unwrap();
     let topic_response = &response.responses[0];

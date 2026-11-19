@@ -125,30 +125,17 @@ pub(crate) fn init_producer_id_bounded(
 mod tests {
     use super::*;
     use crate::testing::mocks::MockKafkaStore;
+    use crate::testing::TestEnv;
 
     fn run(store: &MockKafkaStore, existing_epoch: i16) -> Result<InitProducerIdResponse> {
-        let coordinator = crate::kafka::GroupCoordinator::new();
-        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
-        let ctx = HandlerContext::new(
-            store,
-            &coordinator,
-            &broker,
-            1,
-            kafka_protocol::records::Compression::None,
-        );
+        let env = TestEnv::new();
+        let ctx = env.ctx(store);
         handle_init_producer_id(&ctx, None, 60000, 1000, existing_epoch, None)
     }
 
     fn run_txn(store: &MockKafkaStore, timeout_ms: i32) -> InitProducerIdResponse {
-        let coordinator = crate::kafka::GroupCoordinator::new();
-        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
-        let ctx = HandlerContext::new(
-            store,
-            &coordinator,
-            &broker,
-            1,
-            kafka_protocol::records::Compression::None,
-        );
+        let env = TestEnv::new();
+        let ctx = env.ctx(store);
         init_producer_id_bounded(
             &ctx,
             Some("tx".to_string()),

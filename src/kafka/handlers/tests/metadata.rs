@@ -4,9 +4,8 @@ use crate::kafka::constants::*;
 use crate::kafka::error::KafkaError;
 use crate::kafka::handlers::metadata;
 use crate::kafka::storage::TopicMetadata;
-use crate::kafka::{BrokerMetadata, GroupCoordinator, HandlerContext};
 use crate::testing::mocks::MockKafkaStore;
-use kafka_protocol::records::Compression;
+use crate::testing::TestEnv;
 
 // ========== Metadata Handler Tests ==========
 
@@ -30,9 +29,8 @@ fn test_handle_metadata_all_topics() {
     });
 
     // Create HandlerContext AFTER setting expectations
-    let coordinator = GroupCoordinator::new();
-    let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-    let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
 
     let response = metadata::handle_metadata(&ctx, None, true).unwrap();
 
@@ -53,9 +51,8 @@ fn test_handle_metadata_specific_topic() {
         .returning(|_, _| Ok((5, 1))); // (topic_id=5, partition_count=1)
 
     // Create HandlerContext AFTER setting expectations
-    let coordinator = GroupCoordinator::new();
-    let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-    let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
 
     let response =
         metadata::handle_metadata(&ctx, Some(vec!["my-topic".to_string()]), true).unwrap();
@@ -71,9 +68,8 @@ fn test_handle_metadata_no_auto_create_missing_topic() {
     let mut mock = MockKafkaStore::new();
     mock.expect_get_topic_metadata().returning(|_| Ok(vec![])); // topic doesn't exist
 
-    let coordinator = GroupCoordinator::new();
-    let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-    let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
 
     let response =
         metadata::handle_metadata(&ctx, Some(vec!["missing".to_string()]), false).unwrap();
@@ -105,9 +101,8 @@ fn test_handle_metadata_storage_error_propagates() {
         })
     });
 
-    let coordinator = GroupCoordinator::new();
-    let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-    let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
 
     let result = metadata::handle_metadata(&ctx, None, true);
     assert!(result.is_err());

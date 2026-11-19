@@ -709,6 +709,7 @@ mod tests {
     use crate::kafka::messages::{JoinGroupProtocol, SyncGroupAssignment};
     use crate::kafka::{BrokerMetadata, GroupCoordinator};
     use crate::testing::mocks::MockKafkaStore;
+    use crate::testing::TestEnv;
     use std::sync::{Arc, Mutex};
 
     type ResponseSlot = Arc<Mutex<Option<JoinGroupResponse>>>;
@@ -1189,15 +1190,8 @@ mod tests {
         // has committed offsets is reported as an Empty "consumer" group, as Kafka does;
         // it was "Dead" in DescribeGroups and missing from ListGroups.
         let store = offsets_store(&["committed-only", "live"]);
-        let coordinator = GroupCoordinator::new();
-        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-        let ctx = HandlerContext::new(
-            &store,
-            &coordinator,
-            &broker,
-            1,
-            kafka_protocol::records::Compression::None,
-        );
+        let env = TestEnv::new();
+        let ctx = env.ctx(&store);
         // "live" is also in memory: it must be listed once, with its real state.
         let (responder, slot) = {
             let slot: ResponseSlot = Arc::new(Mutex::new(None));

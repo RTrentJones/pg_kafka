@@ -7,9 +7,8 @@ use crate::kafka::messages::{
     ListOffsetsPartitionData, ListOffsetsTopicData, PartitionFetchData, TopicFetchData,
 };
 use crate::kafka::storage::{FetchedMessage, IsolationLevel, TopicMetadata};
-use crate::kafka::{BrokerMetadata, GroupCoordinator, HandlerContext};
 use crate::testing::mocks::MockKafkaStore;
-use kafka_protocol::records::Compression;
+use crate::testing::TestEnv;
 
 // ========== Fetch Handler Tests ==========
 
@@ -55,9 +54,8 @@ fn test_handle_fetch_success() {
     }];
 
     // Create HandlerContext AFTER setting expectations
-    let coordinator = GroupCoordinator::new();
-    let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-    let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
 
     let response = fetch::handle_fetch(
         &ctx,
@@ -115,9 +113,8 @@ fn test_handle_fetch_returns_headers() {
         }],
     }];
 
-    let coordinator = GroupCoordinator::new();
-    let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-    let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
 
     let response = fetch::handle_fetch(
         &ctx,
@@ -173,9 +170,8 @@ fn test_handle_fetch_hwm_error_returns_partition_error() {
         }],
     }];
 
-    let coordinator = GroupCoordinator::new();
-    let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-    let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
 
     let response = fetch::handle_fetch(
         &ctx,
@@ -209,9 +205,8 @@ fn test_handle_fetch_unknown_topic() {
     }];
 
     // Create HandlerContext AFTER setting expectations
-    let coordinator = GroupCoordinator::new();
-    let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-    let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
 
     let response = fetch::handle_fetch(
         &ctx,
@@ -258,9 +253,8 @@ fn test_handle_fetch_storage_error() {
         }],
     }];
 
-    let coordinator = GroupCoordinator::new();
-    let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-    let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
 
     let response = fetch::handle_fetch(
         &ctx,
@@ -305,9 +299,8 @@ fn test_handle_fetch_read_committed_uses_lso() {
         }],
     }];
 
-    let coordinator = GroupCoordinator::new();
-    let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-    let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
 
     let response = fetch::handle_fetch(
         &ctx,
@@ -349,9 +342,8 @@ fn test_handle_list_offsets_earliest() {
     }];
 
     // Create HandlerContext AFTER setting expectations
-    let coordinator = GroupCoordinator::new();
-    let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-    let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
 
     let response = fetch::handle_list_offsets(
         &ctx,
@@ -389,9 +381,8 @@ fn test_handle_list_offsets_latest() {
     }];
 
     // Create HandlerContext AFTER setting expectations
-    let coordinator = GroupCoordinator::new();
-    let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-    let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
 
     let response = fetch::handle_list_offsets(
         &ctx,
@@ -430,9 +421,8 @@ fn test_handle_list_offsets_by_timestamp() {
         }],
     }];
 
-    let coordinator = GroupCoordinator::new();
-    let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-    let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
 
     let response = fetch::handle_list_offsets(
         &ctx,
@@ -470,9 +460,8 @@ fn list_one(partition: i32, timestamp: i64, isolation: IsolationLevel) -> (i16, 
                 (6, 5_000)
             }))
         });
-    let coordinator = GroupCoordinator::new();
-    let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-    let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
     let topics = vec![ListOffsetsTopicData {
         name: "t".to_string(),
         partitions: vec![ListOffsetsPartitionData {

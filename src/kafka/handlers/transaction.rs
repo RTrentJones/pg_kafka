@@ -425,6 +425,7 @@ pub fn txn_offset_commit_error_response(
 mod tests {
     use super::*;
     use crate::testing::mocks::MockKafkaStore;
+    use crate::testing::TestEnv;
 
     #[test]
     fn test_end_txn_retry_with_same_outcome_succeeds() {
@@ -444,15 +445,8 @@ mod tests {
             store
                 .expect_get_transaction_state()
                 .returning(move |_| Ok(Some(st.clone())));
-            let coordinator = crate::kafka::GroupCoordinator::new();
-            let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
-            let ctx = HandlerContext::new(
-                &store,
-                &coordinator,
-                &broker,
-                1,
-                kafka_protocol::records::Compression::None,
-            );
+            let env = TestEnv::new();
+            let ctx = env.ctx(&store);
             let result = handle_end_txn(&ctx, "txn", 1, 0, committed);
             assert_eq!(result.is_ok(), ok, "{:?} commit={}", state, committed);
             if let Ok(r) = result {
@@ -475,15 +469,8 @@ mod tests {
             }])
         });
 
-        let coordinator = crate::kafka::GroupCoordinator::new();
-        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
-        let ctx = HandlerContext::new(
-            &store,
-            &coordinator,
-            &broker,
-            1,
-            kafka_protocol::records::Compression::None,
-        );
+        let env = TestEnv::new();
+        let ctx = env.ctx(&store);
 
         let topics = vec![("t".to_string(), vec![-1, 0])];
         let resp = handle_add_partitions_to_txn(&ctx, "txn-1", 1, 0, topics).unwrap();
@@ -514,15 +501,8 @@ mod tests {
         // (KIP-447: the new owner uses a different transactional_id). The fence
         // returns before any store access, so the mock needs no expectations.
         let store = MockKafkaStore::new();
-        let coordinator = crate::kafka::GroupCoordinator::new();
-        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
-        let ctx = HandlerContext::new(
-            &store,
-            &coordinator,
-            &broker,
-            1,
-            kafka_protocol::records::Compression::None,
-        );
+        let env = TestEnv::new();
+        let ctx = env.ctx(&store);
 
         let topics = vec![("t".to_string(), vec![(0i32, 100i64, None)])];
         let resp =

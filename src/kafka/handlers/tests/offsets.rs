@@ -8,6 +8,7 @@ use crate::kafka::messages::{
 use crate::kafka::storage::{CommittedOffset, TopicMetadata};
 use crate::kafka::{BrokerMetadata, GroupCoordinator, HandlerContext};
 use crate::testing::mocks::MockKafkaStore;
+use crate::testing::TestEnv;
 use kafka_protocol::records::Compression;
 
 // ========== OffsetCommit Handler Tests ==========
@@ -37,9 +38,8 @@ fn test_handle_offset_commit_success() {
     }];
 
     // Create HandlerContext AFTER setting expectations
-    let coordinator = GroupCoordinator::new();
-    let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-    let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
 
     let response =
         consumer::handle_offset_commit(&ctx, "test-group".to_string(), -1, String::new(), topics)
@@ -119,9 +119,8 @@ fn test_handle_offset_commit_unknown_topic() {
     }];
 
     // Create HandlerContext AFTER setting expectations
-    let coordinator = GroupCoordinator::new();
-    let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-    let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
 
     let response =
         consumer::handle_offset_commit(&ctx, "test-group".to_string(), -1, String::new(), topics)
@@ -161,9 +160,8 @@ fn test_handle_offset_fetch_found() {
     }]);
 
     // Create HandlerContext AFTER setting expectations
-    let coordinator = GroupCoordinator::new();
-    let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-    let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
 
     let response =
         consumer::handle_offset_fetch(&ctx, "test-group".to_string(), topics, false).unwrap();
@@ -194,9 +192,8 @@ fn test_handle_offset_fetch_not_found() {
     }]);
 
     // Create HandlerContext AFTER setting expectations
-    let coordinator = GroupCoordinator::new();
-    let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-    let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
 
     let response =
         consumer::handle_offset_fetch(&ctx, "test-group".to_string(), topics, false).unwrap();
@@ -232,9 +229,8 @@ fn test_handle_offset_fetch_all_offsets() {
     });
 
     // Create HandlerContext AFTER setting expectations
-    let coordinator = GroupCoordinator::new();
-    let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-    let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
 
     // Request with None = fetch all
     let response =

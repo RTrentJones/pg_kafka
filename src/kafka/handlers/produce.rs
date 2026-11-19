@@ -370,9 +370,8 @@ mod wave3_tests {
     use crate::kafka::error::KafkaError;
     use crate::kafka::messages::{PartitionProduceData, Record, TopicProduceData};
     use crate::kafka::storage::TransactionState;
-    use crate::kafka::{BrokerMetadata, GroupCoordinator};
     use crate::testing::mocks::MockKafkaStore;
-    use kafka_protocol::records::Compression;
+    use crate::testing::TestEnv;
 
     fn request(partitions: &[i32]) -> Vec<TopicProduceData> {
         vec![TopicProduceData {
@@ -402,9 +401,8 @@ mod wave3_tests {
     }
 
     fn run(mock: &MockKafkaStore, partitions: &[i32], txn: Option<&str>) -> Vec<(i32, i16, i64)> {
-        let coordinator = GroupCoordinator::new();
-        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-        let ctx = HandlerContext::new(mock, &coordinator, &broker, 1, Compression::None);
+        let env = TestEnv::new();
+        let ctx = env.ctx(mock);
         let mut out: Vec<(i32, i16, i64)> =
             handle_produce(&ctx, request(partitions), Some(&meta()), txn)
                 .unwrap()
@@ -468,9 +466,8 @@ mod wave3_tests {
         mock.expect_record_producer_batch().returning(|_| Ok(()));
         mock.expect_get_log_start_offset()
             .returning(|_, partition| Ok(5 + i64::from(partition)));
-        let coordinator = GroupCoordinator::new();
-        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+        let env = TestEnv::new();
+        let ctx = env.ctx(&mock);
         let response = handle_produce(&ctx, request(&[0, 1]), Some(&meta()), None).unwrap();
         let mut got: Vec<(i32, i16, i64, i64)> = response.responses[0]
             .partition_responses
@@ -500,9 +497,8 @@ mod wave3_tests {
         mock.expect_record_producer_batch().returning(|_| Ok(()));
         mock.expect_get_log_start_offset()
             .returning(|_, _| Err(KafkaError::Internal("boom".into())));
-        let coordinator = GroupCoordinator::new();
-        let broker = BrokerMetadata::new("localhost".to_string(), 9092);
-        let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);
+        let env = TestEnv::new();
+        let ctx = env.ctx(&mock);
         let response = handle_produce(&ctx, request(&[0]), Some(&meta()), None).unwrap();
         let p = &response.responses[0].partition_responses[0];
         assert_eq!(

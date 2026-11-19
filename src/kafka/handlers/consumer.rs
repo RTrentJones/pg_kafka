@@ -333,6 +333,7 @@ mod tests {
     use super::*;
     use crate::kafka::error::KafkaError;
     use crate::testing::mocks::MockKafkaStore;
+    use crate::testing::TestEnv;
 
     #[test]
     fn test_offset_fetch_all_propagates_storage_error() {
@@ -344,15 +345,8 @@ mod tests {
             .expect_fetch_all_offsets()
             .returning(|_| Err(KafkaError::database("boom")));
 
-        let coordinator = crate::kafka::GroupCoordinator::new();
-        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
-        let ctx = HandlerContext::new(
-            &store,
-            &coordinator,
-            &broker,
-            1,
-            kafka_protocol::records::Compression::None,
-        );
+        let env = TestEnv::new();
+        let ctx = env.ctx(&store);
 
         // topics = None selects the fetch-all path.
         let resp = handle_offset_fetch(&ctx, "g".to_string(), None, false).unwrap();
@@ -378,15 +372,8 @@ mod tests {
             .withf(|_, _, partition, _, _| *partition == 1)
             .times(1)
             .returning(|_, _, _, _, _| Ok(()));
-        let coordinator = crate::kafka::GroupCoordinator::new();
-        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
-        let ctx = HandlerContext::new(
-            &store,
-            &coordinator,
-            &broker,
-            1,
-            kafka_protocol::records::Compression::None,
-        );
+        let env = TestEnv::new();
+        let ctx = env.ctx(&store);
         let partition = |partition_index| OffsetCommitPartitionData {
             partition_index,
             committed_offset: 3,
@@ -438,15 +425,8 @@ mod tests {
             .expect_pending_txn_offset_partitions()
             .times(1)
             .returning(|_| Ok(vec![("t".to_string(), 0)]));
-        let coordinator = crate::kafka::GroupCoordinator::new();
-        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
-        let ctx = HandlerContext::new(
-            &store,
-            &coordinator,
-            &broker,
-            1,
-            kafka_protocol::records::Compression::None,
-        );
+        let env = TestEnv::new();
+        let ctx = env.ctx(&store);
         let topics = || {
             Some(vec![OffsetFetchTopicData {
                 name: "t".to_string(),
