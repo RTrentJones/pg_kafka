@@ -312,7 +312,7 @@ fn parse_message_set_legacy(
     }
 
     if records.is_empty() {
-        Err(KafkaError::Encoding(format!(
+        Err(KafkaError::encoding(format!(
             "Failed to parse as both RecordBatch and MessageSet: {original_error}"
         )))
     } else {

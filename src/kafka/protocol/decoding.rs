@@ -95,7 +95,7 @@ fn parse_request_inner(
     match api::decode_body(&mut payload_buf, header, response_tx) {
         Ok(Decoded::Request(request)) => Ok(Some(request)),
         Ok(Decoded::Answered) => Ok(None),
-        Ok(Decoded::Close(reason)) => Err(KafkaError::Encoding(reason)),
+        Ok(Decoded::Close(reason)) => Err(KafkaError::encoding(reason)),
         Err((header, response_tx)) => {
             // An API key the crate knows but pg_kafka does not serve: there is no
             // registered response schema, so answer with the generic error frame.

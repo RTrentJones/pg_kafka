@@ -586,8 +586,8 @@ macro_rules! kafka_apis {
                     Self::UnknownApi { error_code } => {
                         encode_unknown_api_frame(correlation_id, *error_code, buf)
                     }
-                    Self::CloseConnection => Err(crate::kafka::error::KafkaError::Encoding(
-                        "CloseConnection is a connection instruction, not a frame".into(),
+                    Self::CloseConnection => Err(KafkaError::encoding(
+                        "CloseConnection is a connection instruction, not a frame",
                     )),
                 }
             }
