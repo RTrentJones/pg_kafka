@@ -77,7 +77,7 @@ if [ -n "$SERVER_LOG" ]; then
   expected='terminating background worker "pg_kafka_listener" due to administrator command|Failed to handle [A-Za-z]+ request|Client disconnected before response flush|Request batch failed and was rolled back.*(lock timeout|extension)|canceling statement due to lock timeout|could not (create|drop) time partition .*lock timeout|partition maintenance skipped'
   echo "server log: $(wc -l < "$segment") lines in the run"
   grep -E 'deadlock detected' "$segment" && { echo "FAIL: deadlock detected"; status=1; } || true
-  grep -E '(ERROR|FATAL|PANIC|WARNING|panicked)' "$segment" \
+  grep -E '(\b(ERROR|FATAL|PANIC|WARNING):|panicked)' "$segment" \
     | sed -E 's/^[0-9-]+ [0-9:.]+ [A-Z]+ \[[0-9]+\] //; s/[0-9]+/N/g' | cut -c1-160 \
     | sort | uniq -c | sort -rn > "$segment.kinds" || true
   echo "log message kinds (count, message):"
