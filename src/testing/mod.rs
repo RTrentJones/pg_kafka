@@ -32,3 +32,9 @@ impl TestEnv {
         HandlerContext::new(store, &self.coordinator, &self.broker, 1, Compression::None)
     }
 }
+
+impl Default for TestEnv {
+    fn default() -> Self {
+        Self::new()
+    }
+}
