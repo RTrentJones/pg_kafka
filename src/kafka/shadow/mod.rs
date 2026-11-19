@@ -48,6 +48,7 @@
 pub mod config;
 pub mod error;
 pub mod forwarder;
+pub mod forwarder_task;
 pub mod inflight;
 pub mod license;
 pub mod outbox;
