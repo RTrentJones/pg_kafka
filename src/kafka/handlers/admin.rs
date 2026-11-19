@@ -22,7 +22,11 @@ use kafka_protocol::messages::{GroupId, TopicName};
 use kafka_protocol::protocol::StrBytes;
 
 use super::helpers::validate_topic_name;
-use crate::kafka::constants::*;
+use crate::kafka::constants::{
+    ERROR_GROUP_ID_NOT_FOUND, ERROR_INVALID_PARTITIONS, ERROR_INVALID_REPLICATION_FACTOR,
+    ERROR_INVALID_REQUEST, ERROR_INVALID_TOPIC_EXCEPTION, ERROR_NONE, ERROR_NON_EMPTY_GROUP,
+    ERROR_TOPIC_ALREADY_EXISTS, ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+};
 use crate::kafka::error::Result;
 use crate::kafka::handler_context::HandlerContext;
 use crate::kafka::messages::{CreatePartitionsTopicRequest, CreateTopicRequest};
@@ -126,7 +130,7 @@ pub fn handle_create_topics(
                 results.push(fail(
                     result,
                     ERROR_UNKNOWN_SERVER_ERROR,
-                    format!("Error checking topic: {}", e),
+                    format!("Error checking topic: {e}"),
                 ));
                 continue;
             }
@@ -151,7 +155,7 @@ pub fn handle_create_topics(
                 results.push(fail(
                     result,
                     ERROR_UNKNOWN_SERVER_ERROR,
-                    format!("Error checking topic: {}", e),
+                    format!("Error checking topic: {e}"),
                 ));
                 continue;
             }
@@ -178,7 +182,7 @@ pub fn handle_create_topics(
                 result = fail(
                     result,
                     ERROR_UNKNOWN_SERVER_ERROR,
-                    format!("Failed to create topic: {}", e),
+                    format!("Failed to create topic: {e}"),
                 );
             }
         }
@@ -201,9 +205,8 @@ pub fn validate_replication_factor(replication_factor: i16) -> std::result::Resu
             "Replication factor must be larger than 0, or -1 to use the default value.".to_string(),
         ),
         rf => Err(format!(
-            "Unable to replicate the partition {} time(s): The target replication factor of {} \
-             cannot be reached because only 1 broker(s) are registered.",
-            rf, rf
+            "Unable to replicate the partition {rf} time(s): The target replication factor of {rf} \
+             cannot be reached because only 1 broker(s) are registered."
         )),
     }
 }
@@ -234,8 +237,7 @@ pub fn handle_delete_topics(
                     Err(e) => {
                         result.error_code = ERROR_UNKNOWN_SERVER_ERROR;
                         result.error_message = Some(StrBytes::from_string(format!(
-                            "Failed to delete topic: {}",
-                            e
+                            "Failed to delete topic: {e}"
                         )));
                     }
                 }
@@ -247,8 +249,7 @@ pub fn handle_delete_topics(
             Err(e) => {
                 result.error_code = ERROR_UNKNOWN_SERVER_ERROR;
                 result.error_message = Some(StrBytes::from_string(format!(
-                    "Error looking up topic: {}",
-                    e
+                    "Error looking up topic: {e}"
                 )));
             }
         }
@@ -292,8 +293,7 @@ pub fn handle_create_partitions(
                     // ("Topic already has N partitions") rather than silently succeeding.
                     result.error_code = ERROR_INVALID_PARTITIONS;
                     result.error_message = Some(StrBytes::from_string(format!(
-                        "Topic already has {} partitions",
-                        current_count
+                        "Topic already has {current_count} partitions"
                     )));
                 } else if let Err(msg) = crate::kafka::limits::check_partition_count(
                     topic.count,
@@ -314,8 +314,7 @@ pub fn handle_create_partitions(
                         Err(e) => {
                             result.error_code = ERROR_UNKNOWN_SERVER_ERROR;
                             result.error_message = Some(StrBytes::from_string(format!(
-                                "Failed to increase partitions: {}",
-                                e
+                                "Failed to increase partitions: {e}"
                             )));
                         }
                     }
@@ -328,8 +327,7 @@ pub fn handle_create_partitions(
             Err(e) => {
                 result.error_code = ERROR_UNKNOWN_SERVER_ERROR;
                 result.error_message = Some(StrBytes::from_string(format!(
-                    "Error looking up topic: {}",
-                    e
+                    "Error looking up topic: {e}"
                 )));
             }
         }

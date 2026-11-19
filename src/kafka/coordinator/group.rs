@@ -115,7 +115,7 @@ impl GroupMember {
         } else if self.session_timeout_ms > 0 {
             self.session_timeout_ms as u128
         } else {
-            DEFAULT_REBALANCE_TIMEOUT_MS as u128
+            u128::from(DEFAULT_REBALANCE_TIMEOUT_MS)
         }
     }
 }
@@ -525,7 +525,7 @@ impl ConsumerGroup {
             .values()
             .map(GroupMember::effective_rebalance_timeout_ms)
             .max()
-            .unwrap_or(DEFAULT_REBALANCE_TIMEOUT_MS as u128);
+            .unwrap_or(u128::from(DEFAULT_REBALANCE_TIMEOUT_MS));
         if started.elapsed().as_millis() <= effective_timeout_ms {
             return Vec::new();
         }
@@ -578,7 +578,7 @@ impl ConsumerGroup {
         // Save current assignments for sticky strategy
         self.previous_assignments.clear();
         let mut parked = Vec::new();
-        for (member_id, member) in self.members.iter_mut() {
+        for (member_id, member) in &mut self.members {
             let assignment = member.assignment.get_or_insert_with(Vec::new);
             if !assignment.is_empty() {
                 self.previous_assignments

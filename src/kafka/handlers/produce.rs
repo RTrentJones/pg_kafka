@@ -355,7 +355,7 @@ fn validate_ongoing_transaction(
         Some(crate::kafka::storage::TransactionState::Ongoing) => Ok(()),
         Some(other) => Err(crate::kafka::error::KafkaError::invalid_txn_state(
             txn_id,
-            format!("{:?}", other),
+            format!("{other:?}"),
             "Produce",
         )),
         None => Err(crate::kafka::error::KafkaError::transactional_id_not_found(

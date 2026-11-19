@@ -53,7 +53,7 @@ pub(crate) fn partition_fetch_limit(
     if returned_any && remaining <= 0 {
         return None;
     }
-    Some((partition_max_bytes as i64).min(remaining.max(0)) as i32)
+    Some(i64::from(partition_max_bytes).min(remaining.max(0)) as i32)
 }
 
 /// Drop trailing messages that overflow the remaining response budget. The first
@@ -177,7 +177,7 @@ fn gap_marker_record(offset_delta: i32) -> bytes::Bytes {
     let mut body = bytes::BytesMut::new();
     body.put_i8(0); // attributes
     varint(&mut body, 0); // timestamp delta
-    varint(&mut body, offset_delta as i64);
+    varint(&mut body, i64::from(offset_delta));
     varint(&mut body, 4); // key length
     body.put_i16(0); // control record key version
     body.put_i16(1); // control record type: COMMIT
@@ -204,7 +204,7 @@ pub(crate) fn gap_batch(from: i64, to: i64) -> Option<bytes::Bytes> {
     if to <= from {
         return None;
     }
-    let last_offset_delta = (to - from - 1).min(i32::MAX as i64) as i32;
+    let last_offset_delta = (to - from - 1).min(i64::from(i32::MAX)) as i32;
     let record = gap_marker_record(last_offset_delta);
     // Everything after the CRC field: what the CRC covers.
     let mut body = bytes::BytesMut::with_capacity(BATCH_HEADER_LEN - 21 + record.len());
@@ -251,7 +251,7 @@ fn crc32c(data: &[u8]) -> u32 {
     static TABLE: [u32; 256] = table();
     let mut crc = 0xFFFF_FFFFu32;
     for &b in data {
-        crc = TABLE[((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
+        crc = TABLE[((crc ^ u32::from(b)) & 0xFF) as usize] ^ (crc >> 8);
     }
     crc ^ 0xFFFF_FFFF
 }
@@ -266,7 +266,7 @@ pub fn handle_fetch_with_max_bytes(
     max_bytes: i32,
 ) -> Result<kafka_protocol::messages::fetch_response::FetchResponse> {
     let store = ctx.store;
-    let mut response_remaining: i64 = max_bytes.max(0) as i64;
+    let mut response_remaining: i64 = i64::from(max_bytes.max(0));
     let mut returned_any = false;
     let compression = ctx.compression;
     use kafka_protocol::messages::fetch_response::{

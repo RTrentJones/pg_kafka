@@ -218,13 +218,17 @@ impl GroupCoordinator {
 
     fn lock_pending(&self) -> std::sync::MutexGuard<'_, HashMap<(String, String), JoinResponder>> {
         // A poisoned lock only means a writer panicked; the map is still usable.
-        self.pending_joins.lock().unwrap_or_else(|e| e.into_inner())
+        self.pending_joins
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn lock_pending_syncs(
         &self,
     ) -> std::sync::MutexGuard<'_, HashMap<(String, String), SyncResponder>> {
-        self.pending_syncs.lock().unwrap_or_else(|e| e.into_inner())
+        self.pending_syncs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Route queued answers to their held responders and call them. Must be called
@@ -328,8 +332,7 @@ impl GroupCoordinator {
                 Err(e) => Some(Err(e)),
             },
             Err(e) => Some(Err(KafkaError::Internal(format!(
-                "Failed to acquire groups write lock: {}",
-                e
+                "Failed to acquire groups write lock: {e}"
             )))),
         };
 
@@ -423,8 +426,7 @@ impl GroupCoordinator {
             return Err(KafkaError::Protocol {
                 code: crate::kafka::constants::ERROR_GROUP_MAX_SIZE_REACHED,
                 message: format!(
-                    "group '{}' has reached the maximum of {} members",
-                    group_id, max_group_size
+                    "group '{group_id}' has reached the maximum of {max_group_size} members"
                 ),
             });
         }
@@ -536,8 +538,7 @@ impl GroupCoordinator {
                 Err(e) => Some(Err(e)),
             },
             Err(e) => Some(Err(KafkaError::Internal(format!(
-                "Failed to acquire groups write lock: {}",
-                e
+                "Failed to acquire groups write lock: {e}"
             )))),
         };
 
@@ -669,7 +670,7 @@ impl GroupCoordinator {
         }
 
         let groups = self.groups.read().map_err(|e| {
-            KafkaError::Internal(format!("Failed to acquire groups read lock: {}", e))
+            KafkaError::Internal(format!("Failed to acquire groups read lock: {e}"))
         })?;
 
         let group = match groups.get(group_id) {
@@ -726,7 +727,7 @@ impl GroupCoordinator {
         generation_id: i32,
     ) -> Result<()> {
         let groups = self.groups.read().map_err(|e| {
-            KafkaError::Internal(format!("Failed to acquire groups read lock: {}", e))
+            KafkaError::Internal(format!("Failed to acquire groups read lock: {e}"))
         })?;
         let Some(group) = groups.get(group_id) else {
             return if generation_id < 0 {
@@ -771,7 +772,7 @@ impl GroupCoordinator {
     /// (its cue to rejoin), and during the sync phase and when Stable it gets NONE.
     pub fn heartbeat(&self, group_id: String, member_id: String, generation_id: i32) -> Result<()> {
         let mut groups = self.groups.write().map_err(|e| {
-            KafkaError::Internal(format!("Failed to acquire groups write lock: {}", e))
+            KafkaError::Internal(format!("Failed to acquire groups write lock: {e}"))
         })?;
 
         // Unknown group (e.g. lost in a worker restart): UNKNOWN_MEMBER_ID so the
@@ -814,7 +815,7 @@ impl GroupCoordinator {
         let mut deliveries = Vec::new();
         let result = {
             let mut groups = self.groups.write().map_err(|e| {
-                KafkaError::Internal(format!("Failed to acquire groups write lock: {}", e))
+                KafkaError::Internal(format!("Failed to acquire groups write lock: {e}"))
             })?;
 
             match groups.get_mut(&group_id) {
@@ -938,7 +939,7 @@ impl GroupCoordinator {
         };
 
         let groups = self.groups.read().map_err(|e| {
-            KafkaError::Internal(format!("Failed to acquire groups read lock: {}", e))
+            KafkaError::Internal(format!("Failed to acquire groups read lock: {e}"))
         })?;
 
         let group = groups
@@ -996,7 +997,7 @@ impl GroupCoordinator {
         } else {
             // Use standard strategy
             let strategy = create_strategy(strategy_name).ok_or_else(|| {
-                KafkaError::Internal(format!("Unknown assignment strategy: {}", strategy_name))
+                KafkaError::Internal(format!("Unknown assignment strategy: {strategy_name}"))
             })?;
             strategy.assign(&input)
         };
@@ -1025,7 +1026,7 @@ impl GroupCoordinator {
         use crate::kafka::assignment::MemberSubscription;
 
         let groups = self.groups.read().map_err(|e| {
-            KafkaError::Internal(format!("Failed to acquire groups read lock: {}", e))
+            KafkaError::Internal(format!("Failed to acquire groups read lock: {e}"))
         })?;
 
         let group = groups
@@ -1110,8 +1111,7 @@ fn inconsistent_protocol(group_id: &str) -> KafkaError {
     KafkaError::Protocol {
         code: crate::kafka::constants::ERROR_INCONSISTENT_GROUP_PROTOCOL,
         message: format!(
-            "the member's protocol type or protocols are incompatible with group '{}'",
-            group_id
+            "the member's protocol type or protocols are incompatible with group '{group_id}'"
         ),
     }
 }
@@ -1122,5 +1122,5 @@ fn inconsistent_protocol(group_id: &str) -> KafkaError {
 fn generate_member_id(client_id: &str) -> String {
     use uuid::Uuid;
     let uuid = Uuid::new_v4();
-    format!("{}-{}", client_id, uuid)
+    format!("{client_id}-{uuid}")
 }

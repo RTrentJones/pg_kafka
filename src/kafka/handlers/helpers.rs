@@ -38,7 +38,7 @@ pub fn resolve_topic_id<S: TopicStore + ?Sized>(store: &S, topic_name: &str) -> 
 pub fn resolve_topic<S: TopicStore + ?Sized>(
     store: &S,
     topic_name: &str,
-) -> std::result::Result<Option<(i32, i32)>, i16> {
+) -> Result<Option<(i32, i32)>, i16> {
     match store.get_topic_metadata(Some(std::slice::from_ref(&topic_name.to_string()))) {
         Ok(topics) => Ok(topics.first().map(|tm| (tm.id, tm.partition_count))),
         Err(e) => {
@@ -53,7 +53,7 @@ pub fn resolve_topic<S: TopicStore + ?Sized>(
 
 /// Validate a topic name against Kafka's rules (mirrors `Topic.validate` in Apache Kafka):
 /// non-empty, not "." or "..", at most 249 characters, and only `[a-zA-Z0-9._-]`. (CONF-4)
-pub fn validate_topic_name(name: &str) -> std::result::Result<(), &'static str> {
+pub fn validate_topic_name(name: &str) -> Result<(), &'static str> {
     if name.is_empty() {
         return Err("Topic name cannot be empty");
     }

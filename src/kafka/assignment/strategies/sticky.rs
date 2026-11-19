@@ -182,7 +182,7 @@ impl AssignmentStrategy for StickyStrategy {
         // Sort partition lists for consistent output
         for assignment in result.values_mut() {
             for partitions in assignment.topic_partitions.values_mut() {
-                partitions.sort();
+                partitions.sort_unstable();
             }
         }
 

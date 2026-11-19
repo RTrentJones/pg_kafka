@@ -114,7 +114,7 @@ pub fn handle_offset_commit(
                 committed_offset,
                 metadata,
             ) {
-                Ok(_) => ERROR_NONE,
+                Ok(()) => ERROR_NONE,
                 Err(e) => {
                     // Use typed error's Kafka error code
                     let code = e.to_kafka_error_code();

@@ -25,7 +25,10 @@ use kafka_protocol::messages::incremental_alter_configs_response::{
 use kafka_protocol::messages::TopicName;
 use kafka_protocol::protocol::StrBytes;
 
-use crate::kafka::constants::*;
+use crate::kafka::constants::{
+    ERROR_INVALID_CONFIG, ERROR_INVALID_REQUEST, ERROR_NONE, ERROR_OFFSET_OUT_OF_RANGE,
+    ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+};
 use crate::kafka::error::Result;
 use crate::kafka::handler_context::HandlerContext;
 
@@ -70,7 +73,7 @@ fn effective_topic_configs(
         Some(_) => ("-1".to_string(), CONFIG_SOURCE_DYNAMIC_TOPIC),
         None => {
             let value = if global_retention_hours > 0 {
-                (global_retention_hours as i64 * 60 * 60 * 1000).to_string()
+                (i64::from(global_retention_hours) * 60 * 60 * 1000).to_string()
             } else {
                 "-1".to_string()
             };
@@ -156,8 +159,7 @@ pub fn handle_describe_configs(
             Ok(None) => {
                 result.error_code = ERROR_UNKNOWN_TOPIC_OR_PARTITION;
                 result.error_message = Some(StrBytes::from_string(format!(
-                    "Unknown topic '{}'",
-                    resource_name
+                    "Unknown topic '{resource_name}'"
                 )));
             }
             Err(e) => {
@@ -220,8 +222,7 @@ pub fn handle_incremental_alter_configs(
             Ok(None) => {
                 resp.error_code = ERROR_UNKNOWN_TOPIC_OR_PARTITION;
                 resp.error_message = Some(StrBytes::from_string(format!(
-                    "Unknown topic '{}'",
-                    resource_name
+                    "Unknown topic '{resource_name}'"
                 )));
                 responses.push(resp);
                 continue;
@@ -244,8 +245,7 @@ pub fn handle_incremental_alter_configs(
         for (name, op, value) in &configs {
             if name != "retention.ms" {
                 validation_error = Some(format!(
-                    "Unsupported config '{}' (pg_kafka honors: retention.ms)",
-                    name
+                    "Unsupported config '{name}' (pg_kafka honors: retention.ms)"
                 ));
                 break;
             }
@@ -367,7 +367,7 @@ fn delete_partition_records(
     let on_err = |e: crate::kafka::error::KafkaError| {
         warn_if_server_error(
             "delete records from",
-            &format!("topic_id={} partition={}", topic_id, partition_id),
+            &format!("topic_id={topic_id} partition={partition_id}"),
             &e,
         );
         e.to_kafka_error_code()

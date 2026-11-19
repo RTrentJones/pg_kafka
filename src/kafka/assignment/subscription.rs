@@ -81,7 +81,7 @@ impl MemberSubscription {
         let topics_len = buf.get_i32();
         if topics_len < 0 {
             return Err(KafkaError::CorruptMessage {
-                message: format!("Invalid topics array length: {}", topics_len),
+                message: format!("Invalid topics array length: {topics_len}"),
             });
         }
 
@@ -118,7 +118,7 @@ impl MemberSubscription {
             buf.copy_to_slice(&mut str_bytes);
 
             let topic = String::from_utf8(str_bytes).map_err(|e| KafkaError::CorruptMessage {
-                message: format!("Invalid UTF-8 in topic name: {}", e),
+                message: format!("Invalid UTF-8 in topic name: {e}"),
             })?;
 
             topics.push(topic);

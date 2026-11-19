@@ -109,13 +109,12 @@ pub fn max_consumer_groups() -> usize {
 }
 
 /// Why a requested partition count is refused, or `Ok` if `1 <= count <= max`.
-pub fn check_partition_count(count: i32, max: i32) -> std::result::Result<(), String> {
+pub fn check_partition_count(count: i32, max: i32) -> Result<(), String> {
     if count < 1 {
         Err("Number of partitions must be at least 1".to_string())
     } else if count > max {
         Err(format!(
-            "Number of partitions {} exceeds the maximum of {} (pg_kafka.max_partitions_per_topic)",
-            count, max
+            "Number of partitions {count} exceeds the maximum of {max} (pg_kafka.max_partitions_per_topic)"
         ))
     } else {
         Ok(())

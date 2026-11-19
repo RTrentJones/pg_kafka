@@ -74,12 +74,7 @@ impl AssignmentStrategy for RangeStrategy {
 
             for (member_idx, member_id) in subscribed_members.iter().enumerate() {
                 // First `extra_partitions` members get one additional partition
-                let range_size = base_range
-                    + if (member_idx as i32) < extra_partitions {
-                        1
-                    } else {
-                        0
-                    };
+                let range_size = base_range + i32::from((member_idx as i32) < extra_partitions);
 
                 if range_size > 0 {
                     let partitions: Vec<i32> =

@@ -94,8 +94,7 @@ impl AssignmentStrategy for RoundRobinStrategy {
                 let subscribed = input
                     .subscriptions
                     .get(candidate)
-                    .map(|sub| sub.topics.contains(&topic))
-                    .unwrap_or(false);
+                    .is_some_and(|sub| sub.topics.contains(&topic));
                 if subscribed {
                     assigned = Some(candidate);
                     break;

@@ -242,7 +242,7 @@ where
                 outcome,
                 protocol_type,
                 fallback_protocol,
-            ))
+            ));
         }),
     );
 }
@@ -549,83 +549,82 @@ pub fn handle_describe_groups(
     // Get coordinator state
     // CG-7: recover from a poisoned lock instead of panicking (which would crash the worker). A
     // poisoned lock only means some writer panicked; the group map itself is still readable.
-    let coordinator_groups = coordinator.groups.read().unwrap_or_else(|e| e.into_inner());
+    let coordinator_groups = coordinator
+        .groups
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     for group_id in groups {
         let mut described_group = DescribedGroup::default();
         described_group.group_id = GroupId(StrBytes::from_string(group_id.clone()));
 
-        match coordinator_groups.get(&group_id) {
-            Some(group) => {
-                // Group exists - return detailed information
-                described_group.error_code = ERROR_NONE;
-                described_group.group_state = StrBytes::from_static_str(group.state.as_str());
-                described_group.protocol_type = StrBytes::from_string(
-                    group
-                        .protocol_type
-                        .clone()
-                        .unwrap_or_else(|| "consumer".to_string()),
-                );
-                described_group.protocol_data =
-                    StrBytes::from_string(group.protocol_name.clone().unwrap_or_default());
+        if let Some(group) = coordinator_groups.get(&group_id) {
+            // Group exists - return detailed information
+            described_group.error_code = ERROR_NONE;
+            described_group.group_state = StrBytes::from_static_str(group.state.as_str());
+            described_group.protocol_type = StrBytes::from_string(
+                group
+                    .protocol_type
+                    .clone()
+                    .unwrap_or_else(|| "consumer".to_string()),
+            );
+            described_group.protocol_data =
+                StrBytes::from_string(group.protocol_name.clone().unwrap_or_default());
 
-                // Add member information
-                for member in group.members.values() {
-                    let mut described_member = DescribedGroupMember::default();
-                    described_member.member_id = StrBytes::from_string(member.member_id.clone());
-                    described_member.client_id = StrBytes::from_string(member.client_id.clone());
-                    described_member.client_host =
-                        StrBytes::from_string(member.client_host.clone());
+            // Add member information
+            for member in group.members.values() {
+                let mut described_member = DescribedGroupMember::default();
+                described_member.member_id = StrBytes::from_string(member.member_id.clone());
+                described_member.client_id = StrBytes::from_string(member.client_id.clone());
+                described_member.client_host = StrBytes::from_string(member.client_host.clone());
 
-                    // Member metadata for the group's selected protocol, as Kafka reports it
-                    // (the first protocol before a protocol has been selected).
-                    if let Some((_, metadata)) = member
-                        .protocols
-                        .iter()
-                        .find(|(n, _)| Some(n) == group.protocol_name.as_ref())
-                        .or_else(|| member.protocols.first())
-                    {
-                        described_member.member_metadata = metadata.clone().into();
-                    }
-
-                    // Member assignment
-                    if let Some(assignment) = &member.assignment {
-                        described_member.member_assignment = assignment.clone().into();
-                    }
-
-                    // Static group instance ID (KIP-345)
-                    if let Some(instance_id) = &member.group_instance_id {
-                        described_member.group_instance_id =
-                            Some(StrBytes::from_string(instance_id.clone()));
-                    }
-
-                    described_group.members.push(described_member);
+                // Member metadata for the group's selected protocol, as Kafka reports it
+                // (the first protocol before a protocol has been selected).
+                if let Some((_, metadata)) = member
+                    .protocols
+                    .iter()
+                    .find(|(n, _)| Some(n) == group.protocol_name.as_ref())
+                    .or_else(|| member.protocols.first())
+                {
+                    described_member.member_metadata = metadata.clone().into();
                 }
+
+                // Member assignment
+                if let Some(assignment) = &member.assignment {
+                    described_member.member_assignment = assignment.clone().into();
+                }
+
+                // Static group instance ID (KIP-345)
+                if let Some(instance_id) = &member.group_instance_id {
+                    described_member.group_instance_id =
+                        Some(StrBytes::from_string(instance_id.clone()));
+                }
+
+                described_group.members.push(described_member);
             }
-            None => {
-                // wave3 groups: a group the coordinator does not hold (none of its members
-                // joined since the worker started, or it was reclaimed) still exists while it
-                // has committed offsets: Kafka reports it as an Empty "consumer" group, which is
-                // what lets `kafka-consumer-groups --describe` show its offsets and lag. Without
-                // offsets it does not exist: for the versions we advertise (v0-5) Kafka reports
-                // that as success with state Dead (GROUP_ID_NOT_FOUND only applies from v6).
-                described_group.protocol_data = StrBytes::from_static_str("");
-                match ctx.store.group_has_offsets(&group_id) {
-                    Ok(true) => {
-                        described_group.error_code = ERROR_NONE;
-                        described_group.group_state = StrBytes::from_static_str("Empty");
-                        described_group.protocol_type = StrBytes::from_static_str("consumer");
-                    }
-                    Ok(false) => {
-                        described_group.error_code = ERROR_NONE;
-                        described_group.group_state = StrBytes::from_static_str("Dead");
-                        described_group.protocol_type = StrBytes::from_static_str("");
-                    }
-                    Err(e) => {
-                        described_group.error_code = e.to_kafka_error_code();
-                        described_group.group_state = StrBytes::from_static_str("");
-                        described_group.protocol_type = StrBytes::from_static_str("");
-                    }
+        } else {
+            // wave3 groups: a group the coordinator does not hold (none of its members
+            // joined since the worker started, or it was reclaimed) still exists while it
+            // has committed offsets: Kafka reports it as an Empty "consumer" group, which is
+            // what lets `kafka-consumer-groups --describe` show its offsets and lag. Without
+            // offsets it does not exist: for the versions we advertise (v0-5) Kafka reports
+            // that as success with state Dead (GROUP_ID_NOT_FOUND only applies from v6).
+            described_group.protocol_data = StrBytes::from_static_str("");
+            match ctx.store.group_has_offsets(&group_id) {
+                Ok(true) => {
+                    described_group.error_code = ERROR_NONE;
+                    described_group.group_state = StrBytes::from_static_str("Empty");
+                    described_group.protocol_type = StrBytes::from_static_str("consumer");
+                }
+                Ok(false) => {
+                    described_group.error_code = ERROR_NONE;
+                    described_group.group_state = StrBytes::from_static_str("Dead");
+                    described_group.protocol_type = StrBytes::from_static_str("");
+                }
+                Err(e) => {
+                    described_group.error_code = e.to_kafka_error_code();
+                    described_group.group_state = StrBytes::from_static_str("");
+                    described_group.protocol_type = StrBytes::from_static_str("");
                 }
             }
         }
@@ -656,7 +655,10 @@ pub fn handle_list_groups(
     // Get coordinator state
     // CG-7: recover from a poisoned lock instead of panicking (which would crash the worker). A
     // poisoned lock only means some writer panicked; the group map itself is still readable.
-    let coordinator_groups = coordinator.groups.read().unwrap_or_else(|e| e.into_inner());
+    let coordinator_groups = coordinator
+        .groups
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     // Filter groups by state if requested (v4+)
     let filter_enabled = !states_filter.is_empty();

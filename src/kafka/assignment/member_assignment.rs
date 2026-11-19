@@ -69,12 +69,12 @@ impl MemberAssignment {
 
     /// Check if this assignment is empty (no partitions assigned)
     pub fn is_empty(&self) -> bool {
-        self.topic_partitions.is_empty() || self.topic_partitions.values().all(|p| p.is_empty())
+        self.topic_partitions.is_empty() || self.topic_partitions.values().all(Vec::is_empty)
     }
 
     /// Total number of partitions assigned
     pub fn partition_count(&self) -> usize {
-        self.topic_partitions.values().map(|p| p.len()).sum()
+        self.topic_partitions.values().map(Vec::len).sum()
     }
 
     /// Parse a MemberAssignment from raw bytes
@@ -108,7 +108,7 @@ impl MemberAssignment {
         let topics_len = buf.get_i32();
         if topics_len < 0 {
             return Err(KafkaError::CorruptMessage {
-                message: format!("Invalid topic_partitions array length: {}", topics_len),
+                message: format!("Invalid topic_partitions array length: {topics_len}"),
             });
         }
 
@@ -147,7 +147,7 @@ impl MemberAssignment {
 
             let topic_name =
                 String::from_utf8(str_bytes).map_err(|e| KafkaError::CorruptMessage {
-                    message: format!("Invalid UTF-8 in topic name: {}", e),
+                    message: format!("Invalid UTF-8 in topic name: {e}"),
                 })?;
 
             // Read partitions array
@@ -229,7 +229,7 @@ impl MemberAssignment {
 
             // Write partitions array (sorted for determinism)
             let mut sorted_partitions = partitions.clone();
-            sorted_partitions.sort();
+            sorted_partitions.sort_unstable();
 
             buf.put_i32(sorted_partitions.len() as i32);
             for partition in sorted_partitions {

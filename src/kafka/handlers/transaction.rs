@@ -219,7 +219,7 @@ pub fn handle_end_txn(
         Some(other) => {
             return Err(KafkaError::invalid_txn_state(
                 transactional_id,
-                format!("{:?}", other),
+                format!("{other:?}"),
                 "EndTxn",
             ));
         }
@@ -255,7 +255,7 @@ pub fn handle_end_txn(
 ///
 /// # Returns
 /// TxnOffsetCommitResponse with per-partition error codes
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub fn handle_txn_offset_commit(
     ctx: &HandlerContext,
     transactional_id: &str,
@@ -297,7 +297,7 @@ pub fn handle_txn_offset_commit(
         Some(other) => {
             return Err(KafkaError::invalid_txn_state(
                 transactional_id,
-                format!("{:?}", other),
+                format!("{other:?}"),
                 "TxnOffsetCommit",
             ));
         }
