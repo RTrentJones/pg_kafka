@@ -849,4 +849,25 @@ COMMENT ON TABLE kafka.producer_batches IS 'Last 5 batches per idempotent produc
 COMMENT ON TABLE kafka.txn_partitions IS 'Partitions added (AddPartitionsToTxn) to the open transaction of each transactional id.';
 
 -- END wave3 txn
+-- wave3 net: durable secret for unknown-user SCRAM/PLAIN fake credentials
+--
+-- A SASL exchange for a user that does not exist runs to the end against a fake
+-- credential whose salt is HMAC(secret, mechanism:username), so probing a username
+-- twice, even across worker restarts, shows the same salt as a real user would. The
+-- secret is generated once, at CREATE EXTENSION (gen_random_uuid() draws from the
+-- server's strong random source). Readable only by superusers and pgkafka_worker.
+-- Not dumped by pg_dump: a restore into a new installation gets a new secret (fake
+-- salts change once, nothing else does).
+CREATE TABLE kafka.sasl_server_secret (
+    id BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (id),
+    secret BYTEA NOT NULL CHECK (octet_length(secret) >= 32)
+);
+INSERT INTO kafka.sasl_server_secret (secret)
+SELECT decode(
+    replace(gen_random_uuid()::text, '-', '') || replace(gen_random_uuid()::text, '-', '')
+        || replace(gen_random_uuid()::text, '-', ''),
+    'hex');
+GRANT SELECT ON kafka.sasl_server_secret TO pgkafka_worker;
+COMMENT ON TABLE kafka.sasl_server_secret IS 'Secret keying the fake SCRAM salts of unknown SASL users (wave3 net); never shown to clients.';
+-- END wave3 net
 -- =============================================================================

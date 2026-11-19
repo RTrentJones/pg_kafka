@@ -1,0 +1,6 @@
+target
+artifacts
+coverage
+# The seed corpus is committed; what the fuzzer adds is not.
+corpus/*/*
+!corpus/*/seed-*

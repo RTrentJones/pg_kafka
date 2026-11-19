@@ -51,6 +51,10 @@ operator migrate clients one at a time (and lets the E2E suite keep using PLAINT
 | `pg_kafka.ssl_key_file` | empty | PEM private key (PKCS#8, PKCS#1 or SEC1) |
 | `pg_kafka.ssl_ca_file` | empty | PEM CA bundle; when set, TLS clients must present a certificate signed by it |
 | `pg_kafka.sasl_enabled_mechanisms` | `PLAIN,SCRAM-SHA-256,SCRAM-SHA-512` | Mechanisms offered on SASL listeners |
+| `pg_kafka.max_connections` | `1024` | Concurrent connections **per listener** (each listener has its own cap) |
+| `pg_kafka.max_connections_per_ip` | `256` | Concurrent connections from one IP address, across all listeners (Kafka's `max.connections.per.ip`) |
+| `pg_kafka.connections_max_idle_ms` | `600000` | Close a connection idle this long (nothing read, nothing written, nothing outstanding; Kafka's `connections.max.idle.ms`) |
+| `pg_kafka.request_read_timeout_ms` | `60000` | A request frame must arrive completely within this long of its first byte |
 
 All of them are read once, **when the background worker starts**. They are `SIGHUP`
 settings so `ALTER SYSTEM` + `pg_reload_conf()` can change them, but the new values take
@@ -69,7 +73,22 @@ names the setting and the file; the postmaster retries every 5 s, so fix the set
 reload. The private key file must be readable by the server's OS user.
 
 TLS uses rustls (TLS 1.2 and 1.3, rustls' safe default cipher suites, ring crypto); no
-system TLS library is involved. A client has 10 s to complete the TLS handshake.
+system TLS library is involved. Every socket has `TCP_NODELAY` set (Kafka does the
+same), so pipelined responses are not held back by Nagle's algorithm.
+
+**Pre-authentication deadline.** A client has **10 s from the moment its TCP connection
+is accepted** to finish everything before authentication: the TLS handshake (SSL,
+SASL_SSL) and, on a SASL listener, SASL authentication, including any wait for a
+credential lookup, the lookup rate limit below, or a password-check slot. It is one
+deadline (a SASL_SSL client does not get 10 s for TLS plus 10 s for SASL).
+
+**Connection limits.** Each listener has its own `pg_kafka.max_connections` cap and each
+IP address its own `pg_kafka.max_connections_per_ip` cap across all listeners;
+connections over a cap are closed at accept (counted in `kafka.broker_metrics` as
+rejected). Because the caps are per listener, a flood on an exposed listener cannot lock
+clients out of another one: keep a loopback PLAINTEXT (or SASL) listener for local
+administration and applications. A distributed flood from many addresses can still fill
+the exposed listener's slots; use a firewall or a proxy in front of it for that.
 
 ## SASL
 
@@ -102,6 +121,13 @@ response (as Kafka does).
 The SASL state machine runs on the network thread, one per connection. Only the
 credential lookup needs the database: it goes to the background worker over a dedicated
 channel, and the worker answers it with one `SELECT` between request batches.
+
+**Lookup rate limit.** Each SCRAM client-first message or PLAIN token costs the database
+thread a `SELECT` and costs the client nothing, so each IP address may start at most 10
+lookups per second (burst 20). Beyond that, lookups wait their turn; an address more than
+20 lookups behind gets no lookup at all, and its connection is closed without an answer
+at the pre-authentication deadline (a disconnect, which clients retry, rather than an
+authentication failure, which the Java client treats as fatal).
 
 ## Users and credentials
 
@@ -179,14 +205,30 @@ Protected, when configured:
   server to a SCRAM client), not passwords. `pgkafka_reader` cannot read them.
 * **Pre-authentication resources**: before SASL succeeds a connection may send frames
   of at most 512 KiB (Kafka's `sasl.server.max.receive.size`) and only the three APIs
-  above, and it must authenticate within 10 s of connecting (TLS handshakes also have
-  10 s), so idle unauthenticated clients cannot hold the 1024 connection slots.
+  above, and it must finish TLS and SASL within 10 s of being accepted, so idle
+  unauthenticated clients cannot hold connection slots. Connections are capped per
+  listener and per IP address, and credential lookups are rate limited per IP address
+  (see above).
 * **Online guessing cost**: one attempt per connection, a 100 ms delay before every
-  failure, connections capped at 1024, and SASL/PLAIN's PBKDF2 (at most 16384
-  iterations) runs on at most two blocking threads at a time, off the async runtime and
-  off the database thread. SCRAM costs the server only a few HMACs per attempt.
-* **User enumeration**: unknown users get a deterministic fake salt and the standard
-  iteration count, and fail exactly like a wrong password.
+  failure, connection caps, 10 lookups per second per address, and SASL/PLAIN's PBKDF2
+  (at most 16384 iterations) runs on at most two blocking threads at a time, off the
+  async runtime and off the database thread. SCRAM costs the server only a few HMACs per
+  attempt.
+* **User enumeration**: an unknown user's exchange runs to the end against a fake
+  credential and fails exactly like a wrong password. Its salt is
+  `HMAC(secret, mechanism:username)`, keyed by a random secret generated at `CREATE
+  EXTENSION` and kept in `kafka.sasl_server_secret` (readable only by superusers and
+  `pgkafka_worker`), so it is stable for a username across worker restarts, as a real
+  user's salt is. Its iteration count and salt length are the most common ones among the
+  stored credentials of that mechanism (re-read at most once a minute; 4096 and 32 bytes
+  when there are none), and SASL/PLAIN runs the same PBKDF2 against it, so a PLAIN
+  failure for an unknown user costs what one for a typical user costs.
+  **Residual leak:** a real user whose iteration count or salt length differs from the
+  most common one (for example one installed from a libpq verifier, 16-byte salt, among
+  users created by `pg_kafka_create_user`, 32-byte salt) is recognizable as real, and so
+  is the iteration count's effect on PLAIN timing. Create all users with the same
+  parameters to avoid that. A dump/restore into a new installation gets a new secret, so
+  fake salts change once then.
 * **Timing**: proofs and password-derived keys are compared in constant time.
 
 Not protected:

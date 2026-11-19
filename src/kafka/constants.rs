@@ -288,6 +288,8 @@ pub const ERROR_UNKNOWN_SERVER_ERROR: i16 = -1;
 
 /// Corrupt message (invalid RecordBatch format)
 pub const ERROR_CORRUPT_MESSAGE: i16 = 2;
+/// wave3 net: Produce with acks other than -1, 0, 1.
+pub const ERROR_INVALID_REQUIRED_ACKS: i16 = 21;
 
 /// Message too large (request exceeds the configured maximum size)
 pub const ERROR_MESSAGE_TOO_LARGE: i16 = 10;

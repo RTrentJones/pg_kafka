@@ -79,6 +79,8 @@ pub const WORKER_TABLE_GRANTS: &[(&str, &[&str])] = &[
         &["SELECT", "INSERT", "UPDATE", "DELETE"],
     ),
     ("kafka.txn_partitions", &["SELECT", "INSERT", "DELETE"]),
+    // wave3 net: the unknown-user fake-credential secret (kafka/auth/credentials.rs).
+    ("kafka.sasl_server_secret", &["SELECT"]),
 ];
 
 /// Sequences behind the SERIAL/BIGSERIAL columns the worker inserts into, plus the

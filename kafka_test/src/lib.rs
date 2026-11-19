@@ -252,3 +252,5 @@ pub use part::{
 pub mod w3_groups;
 // wave3 txn
 pub mod w3_txn;
+// wave3 net: hostile clients at the network edge (kafka_test/src/w3_net).
+pub mod w3_net;

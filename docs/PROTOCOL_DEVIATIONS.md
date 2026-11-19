@@ -31,7 +31,11 @@ This document lists intentional deviations from the official Kafka protocol spec
 - No response is sent for acks=0 (sending one would desync clients that
   enforce strict per-connection request/response pairing, e.g. the Java client)
 - Data is still written to PostgreSQL (best-effort)
-- Errors are logged but not returned to client (per acks=0 contract)
+- Errors are not returned to the client (per acks=0 contract); as in Kafka, any error
+  (a partition error, a corrupt batch, a failed commit) **closes the connection** after the
+  partitions that succeeded are committed, so the client refreshes its metadata (wave 3)
+- `acks` other than -1, 0 and 1 is answered `INVALID_REQUIRED_ACKS` (21) on every
+  partition and nothing is written, as in Kafka
 - Long-polling consumers are notified if write succeeds
 - Idempotency/transactional validation is intentionally skipped for acks=0
 
@@ -566,6 +570,20 @@ reference: [AUTHENTICATION.md](AUTHENTICATION.md).
 - **Loud by default:** the worker logs a startup `WARNING` for every listener bound to a
   non-loopback address that does not authenticate clients (PLAINTEXT, or SSL without a client
   CA), and for SASL/PLAIN offered on an exposed SASL_PLAINTEXT listener.
+<!-- wave3 net -->
+- **Network edge limits (wave 3):** connections are capped per listener
+  (`pg_kafka.max_connections`, default 1024; Kafka's cap is broker-wide with per-listener
+  overrides) and per IP address across listeners (`pg_kafka.max_connections_per_ip`, default 256,
+  where Kafka's default is unlimited); over a cap the socket is closed at accept. Idle
+  connections close after `pg_kafka.connections_max_idle_ms` (600000, as Kafka), a request frame
+  must arrive within `pg_kafka.request_read_timeout_ms` (60000; Kafka has no such deadline) of its
+  first byte, and the pre-authentication phase (TLS + SASL) has 10 s from accept. Memory for an
+  incoming frame is reserved as its bytes arrive, under a 512 MiB budget for frames over 1 MiB
+  (Kafka's `queued.max.request.bytes` is unbounded by default); a connection whose frame would
+  exceed the budget is closed. Responses are not size-capped (they are bounded by the request's
+  `max_bytes`). `TCP_NODELAY` is set on every socket. SASL credential lookups are rate limited
+  per IP address (10/s, burst 20; Kafka has none). A connection closed for a bad frame, a timeout
+  or an acks=0 error first delivers the responses of every request it read before (up to 30 s).
 
 ## Compatibility Testing
 
