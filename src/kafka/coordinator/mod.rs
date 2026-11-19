@@ -1032,8 +1032,6 @@ impl Default for GroupCoordinator {
     }
 }
 
-/// INCONSISTENT_GROUP_PROTOCOL for a JoinGroup whose protocol type or protocols do not fit the
-/// group.
 /// Every member's subscription, parsed from its metadata for the group's selected
 /// protocol. A member without that protocol, or whose metadata does not parse, is
 /// assigned as if it subscribed to nothing.
@@ -1112,6 +1110,8 @@ fn current_member_group<'a>(
     Ok(group)
 }
 
+/// INCONSISTENT_GROUP_PROTOCOL for a JoinGroup whose protocol type or protocols do not fit the
+/// group.
 fn inconsistent_protocol(group_id: &str) -> KafkaError {
     KafkaError::Protocol {
         code: crate::kafka::constants::ERROR_INCONSISTENT_GROUP_PROTOCOL,
