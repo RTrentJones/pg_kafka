@@ -628,6 +628,8 @@ pub async fn test_auth_teardown_restores_default_listeners() -> TestResult {
     configure_listeners(&db, false, false).await?;
     restart_listener(&db, &[], &[SASL_PLAINTEXT_PORT, SSL_PORT, SASL_SSL_PORT]).await?;
     println!("✅ only the PLAINTEXT listener is left");
+    // The listeners that used them are gone: remove this run's certificates.
+    remove_certificates();
     println!("✅ Test PASSED\n");
     Ok(())
 }

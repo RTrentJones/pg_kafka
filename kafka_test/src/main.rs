@@ -2036,6 +2036,103 @@ fn get_all_tests() -> Vec<TestDef> {
             ),
             parallel_safe: false,
         },
+        // wave3 net: hostile clients (kafka_test/src/w3_net). Sequential: they hold
+        // shared broker resources or reconfigure + restart the listener (limits::*,
+        // setup first, teardown last).
+        TestDef {
+            category: "w3_net",
+            name: "test_w3_net_frame_budget_lockout",
+            test_fn: wrap_test!(kafka_test::w3_net::tests::test_w3_net_frame_budget_lockout),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "w3_net",
+            name: "test_w3_net_oversized_response_is_delivered",
+            test_fn: wrap_test!(
+                kafka_test::w3_net::tests::test_w3_net_oversized_response_is_delivered
+            ),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "w3_net",
+            name: "test_w3_net_tcp_nodelay",
+            test_fn: wrap_test!(kafka_test::w3_net::tests::test_w3_net_tcp_nodelay),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "w3_net",
+            name: "test_w3_net_acks0_error_closes_connection",
+            test_fn: wrap_test!(
+                kafka_test::w3_net::tests::test_w3_net_acks0_error_closes_connection
+            ),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "w3_net",
+            name: "test_w3_net_invalid_acks_rejected",
+            test_fn: wrap_test!(kafka_test::w3_net::tests::test_w3_net_invalid_acks_rejected),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "w3_net",
+            name: "test_w3_net_response_before_close",
+            test_fn: wrap_test!(kafka_test::w3_net::tests::test_w3_net_response_before_close),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "w3_net",
+            name: "test_w3_net_limits_setup",
+            test_fn: wrap_test!(kafka_test::w3_net::limits::test_w3_net_limits_setup),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "w3_net",
+            name: "test_w3_net_scram_unknown_user_indistinguishable",
+            test_fn: wrap_test!(
+                kafka_test::w3_net::limits::test_w3_net_scram_unknown_user_indistinguishable
+            ),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "w3_net",
+            name: "test_w3_net_per_ip_limit",
+            test_fn: wrap_test!(kafka_test::w3_net::limits::test_w3_net_per_ip_limit),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "w3_net",
+            name: "test_w3_net_per_listener_limit",
+            test_fn: wrap_test!(kafka_test::w3_net::limits::test_w3_net_per_listener_limit),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "w3_net",
+            name: "test_w3_net_idle_and_frame_read_timeouts",
+            test_fn: wrap_test!(
+                kafka_test::w3_net::limits::test_w3_net_idle_and_frame_read_timeouts
+            ),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "w3_net",
+            name: "test_w3_net_pre_auth_deadline_from_accept",
+            test_fn: wrap_test!(
+                kafka_test::w3_net::limits::test_w3_net_pre_auth_deadline_from_accept
+            ),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "w3_net",
+            name: "test_w3_net_sasl_lookup_rate_limit",
+            test_fn: wrap_test!(kafka_test::w3_net::limits::test_w3_net_sasl_lookup_rate_limit),
+            parallel_safe: false,
+        },
+        TestDef {
+            category: "w3_net",
+            name: "test_w3_net_limits_teardown",
+            test_fn: wrap_test!(kafka_test::w3_net::limits::test_w3_net_limits_teardown),
+            parallel_safe: false,
+        },
     ]
 }
 
