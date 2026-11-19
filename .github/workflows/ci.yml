@@ -233,6 +233,19 @@ jobs:
         working-directory: kafka_test
         run: '"$KAFKA_TEST_BIN" --category performance'
 
+      - name: Listener exits with its postmaster (SIGKILL + restart)
+        # Last, because it crashes the cluster: a listener that outlives its postmaster keeps
+        # serving Kafka requests as an orphan and blocks the restart. One major is enough; the
+        # check is in the worker's lifecycle code, not in version-specific bindings.
+        if: matrix.pg == 18
+        timeout-minutes: 3
+        run: |
+          command -v bc >/dev/null || sudo apt-get install -y bc
+          PATH="$(dirname "$PG_CONFIG"):$PATH" \
+          PGDATA="$RUNNER_TEMP/pg/data" PGLOG="$RUNNER_TEMP/pg/server.log" \
+          PG_CTL="$(dirname "$PG_CONFIG")/pg_ctl" \
+            scripts/postmaster-death-check.sh
+
       - name: Postgres log (on failure)
         if: failure()
         run: |
