@@ -307,6 +307,13 @@ static TEST_FORWARD_ACK_DELAY_MS: GucSetting<i32> = GucSetting::<i32>::new(0);
 // Never set this in production — it stalls the single DB thread per produce.
 pub static TEST_PRE_COMMIT_DELAY_MS: GucSetting<i32> = GucSetting::<i32>::new(0);
 
+// wave3 worker: `pg_kafka.worker_lock_timeout_ms`, applied as the worker session's
+// lock_timeout (worker::apply_worker_lock_timeout). 0 disables it.
+pub static WORKER_LOCK_TIMEOUT_MS: GucSetting<i32> =
+    GucSetting::<i32>::new(DEFAULT_WORKER_LOCK_TIMEOUT_MS);
+pub const DEFAULT_WORKER_LOCK_TIMEOUT_MS: i32 = 5000;
+pub const MAX_WORKER_LOCK_TIMEOUT_MS: i32 = 600_000;
+
 /// Initialize GUC parameters
 pub fn init() {
     GucRegistry::define_int_guc(
@@ -628,6 +635,18 @@ pub fn init() {
 
     // auth stream: listener security protocols, TLS files, SASL mechanisms.
     crate::kafka::auth::settings::register_gucs();
+
+    // wave3 worker: lock_timeout of every worker transaction.
+    GucRegistry::define_int_guc(
+        c"pg_kafka.worker_lock_timeout_ms",
+        c"lock_timeout of the pg_kafka background worker, in milliseconds (0 = wait forever)",
+        c"Bounds every lock wait of the worker's transactions, so one session holding a lock the broker needs fails one request batch (retriable error) instead of wedging the single database thread. Default 5000. Reloadable with pg_reload_conf().",
+        &WORKER_LOCK_TIMEOUT_MS,
+        0,
+        MAX_WORKER_LOCK_TIMEOUT_MS,
+        GucContext::Sighup,
+        GucFlags::UNIT_MS,
+    );
 
     pgrx::log!("pg_kafka GUC parameters initialized (including shadow mode)");
 }

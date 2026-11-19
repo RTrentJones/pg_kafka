@@ -14,9 +14,18 @@ as an upgrade script `sql/pg_kafka--<from>--<to>.sql`; `cargo pgrx install` and
    ```
 
 2. Restart Postgres so the new shared library (and its background worker) is loaded.
-   The worker of a new binary runs fine against the previous schema until step 3:
-   features that need new objects stay as they were, and the 0.1.0 role switch falls
-   back to the bootstrap superuser with a WARNING until the role exists.
+   The worker of a new binary serves Kafka clients against the previous schema until
+   step 3. At start (and at every configuration reload) it reads the installed
+   `extversion` and which optional objects exist, and logs **one** WARNING naming what
+   is unavailable (`running against an older pg_kafka schema (version 0.0.0, library
+   0.1.0); unavailable until ALTER EXTENSION pg_kafka UPDATE: ...`); it then skips
+   those features instead of failing every cycle. On a 0.0.0 schema that means: no
+   time-partition maintenance (the retention sweep, including
+   `pg_kafka_run_retention_sweep()`, deletes expired rows row by row from the
+   unpartitioned `kafka.messages`), no broker metrics (`kafka.broker_api_stats` /
+   `kafka.broker_gauges` do not exist), no SASL users (lookups fail, so SASL
+   listeners reject every login). The 0.1.0 role switch falls back to the bootstrap
+   superuser with a WARNING until the role exists.
 
 3. In the database named by `pg_kafka.database`, run:
 
@@ -25,12 +34,27 @@ as an upgrade script `sql/pg_kafka--<from>--<to>.sql`; `cargo pgrx install` and
    SELECT extversion FROM pg_extension WHERE extname = 'pg_kafka';
    ```
 
-4. Restart Postgres again (or terminate the `pg_kafka_listener` backend) if the
-   upgrade added something the worker only picks up at startup. For 0.1.0 this is the
-   switch to `pg_kafka.run_as_role`.
+4. Nothing else is needed for 0.1.0: at its next configuration reload (at most
+   `pg_kafka.config_reload_interval_ms`, or right away after `SELECT
+   pg_reload_conf()`) the worker sees the new version, logs that all features are
+   enabled, switches to `pg_kafka.run_as_role` if the role now has its privileges,
+   and runs partition maintenance. Terminating the `pg_kafka_listener` backend has
+   the same effect immediately.
 
 Upgrade scripts take locks on the tables they alter. Run them in a quiet period on a
-large `kafka.messages`.
+large `kafka.messages`. A running worker does not deadlock with them: every upgrade
+script starts with `SELECT pg_advisory_xact_lock(8099547369649367906)`, the pg_kafka
+schema lock that every worker transaction holds in SHARE mode, so the script waits for
+the worker's current transaction (a request batch, at most a few milliseconds) and the
+worker's next transactions wait (up to `pg_kafka.worker_lock_timeout_ms`, then their
+requests get a retriable error) until the upgrade commits.
+
+`DROP EXTENSION pg_kafka` while the worker runs is safe too: every worker transaction
+first takes a share lock on the extension object, which DROP EXTENSION locks before any
+member table, so the two cannot deadlock. Once the extension is gone the worker keeps
+the Kafka port open, answers every request with the retriable `KAFKA_STORAGE_ERROR`,
+and resumes (partition maintenance, shadow configuration, role) as soon as `CREATE
+EXTENSION pg_kafka` has run, without a restart.
 
 ## 0.0.0 -> 0.1.0
 
@@ -88,7 +112,9 @@ PG_CONFIG=$(which pg_config) PGHOST=localhost PGPORT=28814 PGUSER=postgres \
 1. Bump `version` in `Cargo.toml`.
 2. Change `sql/bootstrap.sql` (a fresh install) and write
    `sql/pg_kafka--<old>--<new>.sql` with the same changes for existing installs.
-3. Copy the old version's generated install script (`$(pg_config
+3. Start the upgrade script with `SELECT pg_advisory_xact_lock(8099547369649367906);`
+   (the pg_kafka schema lock, see above), before any statement that locks a table.
+4. Copy the old version's generated install script (`$(pg_config
    --sharedir)/extension/pg_kafka--<old>.sql` from an install of the old release)
    into `sql/upgrade-test/` and point `scripts/check-upgrade.sh` at it, so CI checks
    the new path.

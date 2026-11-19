@@ -332,6 +332,8 @@ docs/
 scripts/
 ├── restart.sh          # Quick rebuild and restart script for development
 ├── check-upgrade.sh    # CI: 0.0.0 -> current upgrade must match a fresh install
+├── soak.sh             # wave3 worker: long soak (chaos + invariants), driver kafka_test/src/bin/soak.rs
+├── postmaster-death-check.sh  # wave3 worker: kill -9 the postmaster, the listener must exit
 ├── run-shadow-tests.sh # Sets up Docker + PostgreSQL and runs the shadow E2E tests
 ├── generate-evidence.sh  # Builds the evidence artifacts (conformance, bench, session, shadow)
 └── record-session.sh   # Records the kcat produce/consume session as an animated SVG
@@ -350,7 +352,7 @@ TCP:9092 → Tokio Runtime (listener.rs) → crossbeam-channel → Background Wo
 
 1. **Async Layer** (`src/kafka/listener.rs`): Tokio runtime accepts TCP connections on every configured listener (TLS handshake where configured), parses Kafka wire protocol. SaslHandshake/SaslAuthenticate never become `KafkaRequest`s: the per-connection `SaslSession` (`src/kafka/auth/session.rs`) answers them on the network thread and gates every other request until authentication succeeds; its credential lookups go to the worker over a separate `CredentialRequest` channel that the main loop `select!`s next to the main lane
 2. **Message Queue** (`src/kafka/messages.rs`): `crossbeam-channel` bridges async→sync with `KafkaRequest` values on two lanes (`RequestLanes`: `main`, plus a `liveness` lane for Heartbeat that the worker drains first); each request carries a tokio `response_tx` that the worker answers with a `KafkaResponse`
-3. **Sync Layer** (`src/worker.rs`): Background worker processes requests via SPI within postgres transactions. **Group commit:** every request already queued (cap 64, ~50 ms budget, ends early when a Heartbeat waits) runs in one top-level transaction, each request in its own subtransaction (a handler returns `RequestOutcome::Rollback` on `Err`; panics are caught and rolled back), and all responses are released only after the single commit (RB-1). The worker is registered with a 5 s restart interval and exits with status 1 on SIGTERM, so `pg_terminate_backend()` or a crash brings up a fresh listener; it waits for the schema indefinitely. It starts once recovery finishes, so it does not run on a hot standby.
+3. **Sync Layer** (`src/worker.rs`): Background worker processes requests via SPI within postgres transactions. **Group commit:** every request already queued (cap 64, ~50 ms budget; Heartbeats that arrive meanwhile are answered between its requests) runs in one top-level transaction, each request in its own subtransaction (a handler returns `RequestOutcome::Rollback` on `Err`; panics are caught and rolled back), and all responses are released only after the single commit (RB-1). The worker is registered with a 5 s restart interval and exits with status 1 on SIGTERM, so `pg_terminate_backend()` or a crash brings up a fresh listener; it waits for the schema indefinitely. It starts once recovery finishes, so it does not run on a hot standby. Lifecycle (wave 3): every worker transaction goes through `worker_transaction` (worker.rs), which first takes a share lock on the extension object (DROP EXTENSION cannot deadlock with it) and the pg_kafka schema advisory lock (key 8099547369649367906) in SHARE mode (upgrade scripts and the move of rows out of `kafka.messages_default` take it exclusive); a dropped extension sends the loop back to a schema wait that answers requests with KAFKA_STORAGE_ERROR, and a failed COMMIT is rolled back and answered with errors without exiting. SIGTERM during database work interrupts it (ProcDiePending), the loop exits when the postmaster dies, `pg_kafka.worker_lock_timeout_ms` bounds every lock wait, and a schema older than the library is detected (one WARNING; missing features skipped).
 
 **Critical constraint:** The tokio runtime cannot call SPI directly (different thread context). All database operations must go through the background worker.
 
@@ -614,6 +616,9 @@ pg_kafka.ssl_ca_file = ''                  -- client CA bundle; set = mutual TLS
 pg_kafka.sasl_enabled_mechanisms = 'PLAIN,SCRAM-SHA-256,SCRAM-SHA-512'
 
 -- See "Shadow Mode Configuration" section below for shadow mode settings
+
+-- wave3 worker (Sighup)
+pg_kafka.worker_lock_timeout_ms = 5000 -- lock_timeout of the worker's transactions (0 = wait forever, max 600000)
 ```
 
 ## Shadow Mode Configuration (Phase 11)
@@ -770,6 +775,7 @@ Per-category counts are in `docs/TEST_STRATEGY.md`; `cargo run --release -- --li
 | **metadata** | Metadata refresh, all topics, nonexistent topic |
 | **protocol** | ApiVersions negotiation, correlation ID, unknown API, pipelining, response ordering |
 | **auth** | SASL_PLAINTEXT (PLAIN, SCRAM-SHA-256/512), SSL (+ untrusted CA, mutual TLS), SASL_SSL, wrong passwords, pre-auth gating, user SQL. Sequential: generates certs with the `openssl` CLI, adds listeners 9093-9095 via ALTER SYSTEM and restarts the worker; the last test resets them. Needs the DB host's filesystem and superuser |
+| **w3_worker** | wave3 worker: DROP/CREATE/ALTER EXTENSION under load, old 0.0.0 schema, SIGTERM in a lock wait, worker lock_timeout, maintenance lock races, commit failure, heartbeats inside batches, TransactionEnded on fencing/timeout. Sequential; needs superuser and the DB host's filesystem |
 
 ### Running E2E Tests with CLI Options
 

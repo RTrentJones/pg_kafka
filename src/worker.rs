@@ -26,6 +26,7 @@ use pgrx::bgworkers::{BackgroundWorker, SignalWakeFlags};
 use pgrx::prelude::*;
 use pgrx::Spi;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 // Import conditional logging macros from lib.rs
@@ -59,6 +60,407 @@ const REQUEST_CHANNEL_CAPACITY: usize = 10_000;
 /// DR-12: capacity of the liveness (Heartbeat) lane. Heartbeats are small and
 /// per-member periodic; 1,000 pending already implies severe DB-thread stall.
 const LIVENESS_CHANNEL_CAPACITY: usize = 1_000;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Lifecycle (wave 3, stream `worker`): SIGTERM, postmaster death, the per-transaction
+// schema locks, and recovery from a failed top-level transaction.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Kafka error code KAFKA_STORAGE_ERROR (retriable): what a request gets when its batch
+/// could not run or commit (schema missing, commit failure).
+const ERROR_KAFKA_STORAGE_ERROR: i16 = 56;
+/// Kafka error code REQUEST_TIMED_OUT (retriable): the batch timed out waiting on a lock.
+const ERROR_REQUEST_TIMED_OUT: i16 = 7;
+
+/// Key of the pg_kafka schema lock: a transaction-level advisory lock every worker
+/// transaction takes in SHARE mode right after the extension lock. Whatever must not
+/// overlap any worker transaction takes it EXCLUSIVE: moving rows out of
+/// kafka.messages_default (`kafka.create_message_partition`) and the upgrade scripts.
+/// (8099547369649367905, one less, is the partition-maintenance lock.)
+pub const SCHEMA_LOCK_KEY: i64 = 8099547369649367906;
+
+/// Set by our SIGTERM handler; never reset (the worker exits once it is set).
+static GOT_SIGTERM: AtomicBool = AtomicBool::new(false);
+/// True while the worker is inside a database transaction: a SIGTERM then also sets
+/// Postgres's ProcDiePending, so a statement or lock wait is interrupted at its next
+/// CHECK_FOR_INTERRUPTS (FATAL, exit status 1, restarted by the postmaster). Outside
+/// database work the main loop sees GOT_SIGTERM and shuts down gracefully.
+static IN_DB_WORK: AtomicBool = AtomicBool::new(false);
+/// Set when a worker transaction found the extension gone (DROP EXTENSION); the main
+/// loop then goes back to waiting for the schema.
+static SCHEMA_LOST: AtomicBool = AtomicBool::new(false);
+
+extern "C" {
+    // Exported by the postgres executable (pmsignal.c, latch support); not in pgrx's
+    // bindings. Neither raises a Postgres error.
+    fn PostmasterIsAliveInternal() -> bool;
+    fn disable_all_timeouts(keep_indicators: bool);
+    #[cfg(target_os = "linux")]
+    fn __errno_location() -> *mut std::ffi::c_int;
+}
+
+/// SIGTERM handler. pgrx's handler only sets a flag the main loop polls between
+/// requests, so a worker blocked in SQL or a lock wait could not be stopped. This one
+/// also requests ProcDie while database work is in progress (what Postgres's own
+/// `die()` does), and keeps errno intact like Postgres's handlers.
+unsafe extern "C-unwind" fn handle_sigterm(_signal: std::ffi::c_int) {
+    #[cfg(target_os = "linux")]
+    let saved_errno = *__errno_location();
+    GOT_SIGTERM.store(true, Ordering::SeqCst);
+    (&raw mut pg_sys::ShutdownRequestPending).write_volatile(1);
+    if IN_DB_WORK.load(Ordering::SeqCst) {
+        (&raw mut pg_sys::InterruptPending).write_volatile(1);
+        (&raw mut pg_sys::ProcDiePending).write_volatile(1);
+    }
+    pg_sys::SetLatch(pg_sys::MyLatch);
+    #[cfg(target_os = "linux")]
+    {
+        *__errno_location() = saved_errno;
+    }
+}
+
+/// Replace pgrx's SIGTERM handler with [`handle_sigterm`] (after
+/// `attach_signal_handlers`, which unblocks signals).
+fn install_sigterm_handler() {
+    unsafe {
+        #[cfg(not(feature = "pg18"))]
+        pg_sys::pqsignal(pg_sys::SIGTERM as i32, Some(handle_sigterm));
+        #[cfg(feature = "pg18")]
+        pg_sys::pqsignal_be(pg_sys::SIGTERM as i32, Some(handle_sigterm));
+    }
+}
+
+/// Whether SIGTERM has arrived (sticky).
+fn sigterm_received() -> bool {
+    GOT_SIGTERM.load(Ordering::SeqCst)
+}
+
+/// Whether the postmaster is still alive (one non-blocking read on the postmaster-death
+/// pipe). The worker must not outlive it: an orphan would keep committing Kafka writes
+/// and block a new postmaster from starting.
+fn postmaster_alive() -> bool {
+    unsafe { PostmasterIsAliveInternal() }
+}
+
+/// Why a worker transaction did not run or commit.
+#[derive(Debug)]
+enum TxnError {
+    /// The extension is gone (DROP EXTENSION); nothing ran.
+    SchemaGone,
+    /// A Postgres ERROR outside any request's subtransaction: taking the schema locks
+    /// (lock_timeout), or the COMMIT itself. The transaction was rolled back.
+    Failed { message: String, lock_timeout: bool },
+}
+
+impl TxnError {
+    /// The Kafka error code for requests of a batch that failed this way.
+    fn kafka_error_code(&self) -> i16 {
+        match self {
+            TxnError::Failed {
+                lock_timeout: true, ..
+            } => ERROR_REQUEST_TIMED_OUT,
+            _ => ERROR_KAFKA_STORAGE_ERROR,
+        }
+    }
+}
+
+/// Take the locks every worker transaction starts with, in this order:
+///
+/// 1. `AccessShareLock` on the pg_kafka extension object. DROP EXTENSION (and ALTER
+///    EXTENSION ... ADD/DROP) lock it before touching any member, so the worker can no
+///    longer hold a member table while DROP waits for it and vice versa (the lock-order
+///    deadlock DROP EXTENSION used to hit). After the wait the extension is looked up
+///    again: if it was dropped (or dropped and re-created) meanwhile, report it gone.
+/// 2. The schema advisory lock ([`SCHEMA_LOCK_KEY`]) in SHARE mode: ALTER EXTENSION
+///    UPDATE's script and the move of rows out of the DEFAULT leaf take it exclusive,
+///    so neither overlaps a worker transaction (EndTxn's or DeleteRecords' statements
+///    could otherwise miss rows being moved, or deadlock with the script's DDL).
+///
+/// Both waits are bounded by `lock_timeout` (`pg_kafka.worker_lock_timeout_ms`).
+/// Returns false if the extension does not exist.
+fn lock_schema() -> bool {
+    unsafe {
+        let name = c"pg_kafka";
+        let oid = pg_sys::get_extension_oid(name.as_ptr(), true);
+        if oid == pg_sys::Oid::INVALID {
+            return false;
+        }
+        pg_sys::LockDatabaseObject(
+            pg_sys::ExtensionRelationId,
+            oid,
+            0,
+            pg_sys::AccessShareLock as pg_sys::LOCKMODE,
+        );
+        // LockDatabaseObject processed the invalidations of whatever we waited for;
+        // look the extension up again with a fresh catalog snapshot.
+        pg_sys::InvalidateCatalogSnapshot();
+        if pg_sys::get_extension_oid(name.as_ptr(), true) != oid {
+            return false;
+        }
+        let key = SCHEMA_LOCK_KEY as u64;
+        let tag = pg_sys::LOCKTAG {
+            locktag_field1: pg_sys::MyDatabaseId.to_u32(),
+            locktag_field2: (key >> 32) as u32,
+            locktag_field3: key as u32,
+            locktag_field4: 1, // an int8 advisory key, like pg_advisory_xact_lock_shared(bigint)
+            locktag_type: pg_sys::LockTagType::LOCKTAG_ADVISORY as u8,
+            locktag_lockmethodid: pg_sys::USER_LOCKMETHOD as u8,
+        };
+        pg_sys::LockAcquire(&tag, pg_sys::ShareLock as pg_sys::LOCKMODE, false, false);
+        true
+    }
+}
+
+/// Clean up after a Postgres ERROR caught outside any subtransaction, the way
+/// PostgresMain's error handler does: abort the transaction, flush the error state,
+/// and return to TopMemoryContext.
+fn recover_from_transaction_error() {
+    unsafe {
+        pg_sys::InterruptHoldoffCount += 1; // HOLD_INTERRUPTS()
+        disable_all_timeouts(false);
+        (&raw mut pg_sys::QueryCancelPending).write_volatile(0);
+        pg_sys::AbortCurrentTransaction();
+        pg_sys::MemoryContextSwitchTo(pg_sys::TopMemoryContext);
+        pg_sys::FlushErrorState();
+        pg_sys::InterruptHoldoffCount -= 1; // RESUME_INTERRUPTS()
+    }
+}
+
+/// Whether a caught panic payload is a Postgres lock-timeout ERROR (55P03).
+fn is_lock_timeout(payload: &(dyn std::any::Any + Send)) -> bool {
+    use pgrx::pg_sys::panic::CaughtError;
+    match payload.downcast_ref::<CaughtError>() {
+        Some(CaughtError::PostgresError(r))
+        | Some(CaughtError::ErrorReport(r))
+        | Some(CaughtError::RustPanic { ereport: r, .. }) => {
+            r.sql_error_code() == pgrx::PgSqlErrorCode::ERRCODE_LOCK_NOT_AVAILABLE
+        }
+        None => false,
+    }
+}
+
+/// Run `f` in one worker transaction: start it, take the schema locks
+/// ([`lock_schema`]), run `f`, commit. Every database transaction of the main loop goes
+/// through here.
+///
+/// * `Err(SchemaGone)`: the extension does not exist; `f` did not run, and the main
+///   loop is told to wait for the schema again.
+/// * `Err(Failed)`: a Postgres ERROR escaped `f` or the commit failed. The transaction
+///   is rolled back and the worker carries on (it used to exit, dropping the error
+///   responses it had queued).
+///
+/// While it runs, SIGTERM interrupts the backend (see [`handle_sigterm`]).
+fn worker_transaction<R>(f: impl FnOnce() -> R) -> Result<R, TxnError> {
+    IN_DB_WORK.store(true, Ordering::SeqCst);
+    if sigterm_received() {
+        // A SIGTERM that arrived just before: let it interrupt this transaction too.
+        unsafe {
+            (&raw mut pg_sys::InterruptPending).write_volatile(1);
+            (&raw mut pg_sys::ProcDiePending).write_volatile(1);
+        }
+    }
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        BackgroundWorker::transaction(AssertUnwindSafe(|| {
+            if !lock_schema() {
+                return None;
+            }
+            Some(f())
+        }))
+    }));
+    IN_DB_WORK.store(false, Ordering::SeqCst);
+    match result {
+        Ok(Some(value)) => Ok(value),
+        Ok(None) => {
+            SCHEMA_LOST.store(true, Ordering::SeqCst);
+            Err(TxnError::SchemaGone)
+        }
+        Err(payload) => {
+            let message = panic_payload_message(payload.as_ref());
+            let lock_timeout = is_lock_timeout(payload.as_ref());
+            recover_from_transaction_error();
+            Err(TxnError::Failed {
+                message,
+                lock_timeout,
+            })
+        }
+    }
+}
+
+/// Log a worker transaction that did not run (`what` names the task). A missing
+/// schema is reported once by the schema wait, not here.
+fn log_txn_error(what: &str, err: &TxnError) {
+    if let TxnError::Failed { message, .. } = err {
+        pg_warning!(
+            "{} failed and was rolled back (worker survived): {}",
+            what,
+            message
+        );
+    }
+}
+
+/// Apply `pg_kafka.worker_lock_timeout_ms` as the worker session's `lock_timeout`.
+/// Called at start and after every configuration reload, outside any transaction.
+fn apply_worker_lock_timeout() {
+    let ms = crate::config::WORKER_LOCK_TIMEOUT_MS.get();
+    let value = std::ffi::CString::new(format!("{}ms", ms)).expect("no NUL");
+    unsafe {
+        pg_sys::SetConfigOption(
+            c"lock_timeout".as_ptr(),
+            value.as_ptr(),
+            pg_sys::GucContext::PGC_SUSET,
+            pg_sys::GucSource::PGC_S_SESSION,
+        );
+    }
+}
+
+/// Which optional parts of the schema this database has. A new binary can run against
+/// the schema of an older extension version until `ALTER EXTENSION pg_kafka UPDATE`
+/// (docs/UPGRADING.md step 2): it then skips what that schema lacks instead of failing
+/// every cycle.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct SchemaFeatures {
+    /// `extversion` of the installed extension.
+    version: String,
+    /// kafka.messages is time-partitioned (0.1.0, ADR-001): partition maintenance and
+    /// the partition-aware retention sweep.
+    time_partitions: bool,
+    /// kafka.broker_api_stats / kafka.broker_gauges exist (broker metrics flush).
+    broker_metrics: bool,
+    /// kafka.sasl_credentials exists (SASL users).
+    sasl_credentials: bool,
+}
+
+impl SchemaFeatures {
+    /// Human-readable list of what this schema lacks (empty: nothing).
+    fn missing(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if !self.time_partitions {
+            out.push("time partitions of kafka.messages (partition maintenance; retention runs row by row)");
+        }
+        if !self.broker_metrics {
+            out.push("broker metrics (kafka.broker_api_stats / kafka.broker_gauges)");
+        }
+        if !self.sasl_credentials {
+            out.push("SASL users (kafka.sasl_credentials)");
+        }
+        out
+    }
+}
+
+/// Read the [`SchemaFeatures`] of the current database (inside a transaction).
+fn detect_schema_features() -> SchemaFeatures {
+    Spi::connect(|client| {
+        let row = client
+            .select(
+                "SELECT (SELECT extversion FROM pg_extension WHERE extname = 'pg_kafka') AS v,
+                        to_regprocedure('kafka.message_partitions()') IS NOT NULL AS tp,
+                        to_regclass('kafka.broker_api_stats') IS NOT NULL
+                          AND to_regclass('kafka.broker_gauges') IS NOT NULL AS bm,
+                        to_regclass('kafka.sasl_credentials') IS NOT NULL AS sc",
+                None,
+                &[],
+            )
+            .ok()?;
+        let row = row.first();
+        Some(SchemaFeatures {
+            version: row.get_by_name::<String, _>("v").ok()??,
+            time_partitions: row.get_by_name("tp").ok()?.unwrap_or(false),
+            broker_metrics: row.get_by_name("bm").ok()?.unwrap_or(false),
+            sasl_credentials: row.get_by_name("sc").ok()?.unwrap_or(false),
+        })
+    })
+    .unwrap_or_default()
+}
+
+/// Re-detect the schema features; log once whenever they change (a WARNING listing
+/// what is unavailable, or a LOG line when everything is there again). Returns true
+/// if they changed.
+fn refresh_schema_features(features: &mut SchemaFeatures) -> bool {
+    let now = match worker_transaction(detect_schema_features) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    if now == *features {
+        return false;
+    }
+    let missing = now.missing();
+    if missing.is_empty() {
+        if !features.version.is_empty() {
+            log!(
+                "pg_kafka schema is now version {}: all features enabled",
+                now.version
+            );
+        }
+    } else {
+        pg_warning!(
+            "pg_kafka: running against an older pg_kafka schema (version {}, library {}); \
+             unavailable until ALTER EXTENSION pg_kafka UPDATE: {}",
+            now.version,
+            env!("CARGO_PKG_VERSION"),
+            missing.join("; ")
+        );
+    }
+    *features = now;
+    true
+}
+
+/// Re-decide the worker's role after the schema changed under it (DROP + CREATE
+/// EXTENSION, ALTER EXTENSION UPDATE): go back to the bootstrap superuser (`SET ROLE
+/// NONE`), then apply `pg_kafka.run_as_role` again if the new schema grants it what the
+/// worker needs. Otherwise a worker that had switched to `pgkafka_worker` would be
+/// denied everything on a re-created 0.0.0 schema (which grants nothing to that role),
+/// and one that kept the superuser on 0.0.0 would never switch after the update.
+fn reapply_worker_role() {
+    let reset: Result<(), pgrx::spi::Error> = BackgroundWorker::transaction(|| {
+        Spi::run("SELECT pg_catalog.set_config('role', 'none', false)")
+    });
+    if let Err(e) = reset {
+        pg_warning!("pg_kafka: could not reset the worker role: {}", e);
+        return;
+    }
+    crate::kafka::storage::postgres::apply_worker_role();
+}
+
+/// Answer a request that will not run (schema missing, worker stopping) with its API's
+/// error response, on its own sender. An acks=0 produce gets nothing.
+fn reject_request(request: crate::kafka::KafkaRequest, error_code: i16) {
+    if !request.body.expects_response() {
+        return;
+    }
+    let response = crate::kafka::KafkaResponse::new(
+        request.header.correlation_id,
+        request.header.api_version,
+        request
+            .body
+            .echo()
+            .error_response(request.header.api_version, error_code),
+    );
+    let _ = request.response_tx.send(response);
+}
+
+/// Stop the network thread (bounded by `timeout`) and exit with status 1.
+fn shutdown_and_exit(
+    shutdown_tx: &std::sync::mpsc::Sender<()>,
+    network_handle: &std::thread::JoinHandle<()>,
+    timeout: Duration,
+) -> ! {
+    let _ = shutdown_tx.send(());
+    let join_start = Instant::now();
+    loop {
+        if network_handle.is_finished() {
+            log!("pg_kafka network thread shut down cleanly");
+            break;
+        }
+        if join_start.elapsed() > timeout {
+            pgrx::warning!("pg_kafka network thread shutdown timed out");
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Status 1, not a plain return: a SIGTERM from pg_terminate_backend() must lead to
+    // a restarted worker (see exit_for_restart).
+    exit_for_restart();
+}
 
 /// Extract a human-readable message from a caught panic payload.
 ///
@@ -139,8 +541,14 @@ where
 /// rows caught by kafka.messages_default moved into their leaf. Guarded like the other
 /// maintenance blocks, so an ERROR (for example a schema that predates 0.1.0, before
 /// `ALTER EXTENSION pg_kafka UPDATE`) is logged and the worker carries on.
-fn run_partition_maintenance() {
-    BackgroundWorker::transaction(|| {
+///
+/// Skipped on a schema without time partitions (an older extension version, see
+/// [`SchemaFeatures`]): the old-schema WARNING already said so, once.
+fn run_partition_maintenance(features: &SchemaFeatures) {
+    if !features.time_partitions {
+        return;
+    }
+    let outcome = worker_transaction(|| {
         let result = run_request_in_subtransaction(|| {
             let store = PostgresStore::new();
             match store.ensure_time_partitions(crate::config::MESSAGE_PARTITION_MINUTES.get()) {
@@ -163,6 +571,9 @@ fn run_partition_maintenance() {
             );
         }
     });
+    if let Err(e) = outcome {
+        log_txn_error("Partition maintenance", &e);
+    }
 }
 
 /// Verify that the kafka schema and required tables exist.
@@ -190,9 +601,12 @@ fn verify_schema(database: &str) -> Result<(), String> {
 
     let result: Result<Option<String>, pgrx::spi::SpiError> = Spi::connect(|client| {
         for table in required_tables {
+            // pg_catalog, not information_schema: information_schema.tables lists only
+            // tables the current role may use, so a worker running as pgkafka_worker
+            // would never see a schema that does not grant to it (e.g. a re-created
+            // 0.0.0 schema).
             let query = format!(
-                "SELECT 1 FROM information_schema.tables \
-                 WHERE table_schema = 'kafka' AND table_name = '{}'",
+                "SELECT 1 WHERE pg_catalog.to_regclass('kafka.{}') IS NOT NULL",
                 table
             );
             match client.select(&query, None, &[]) {
@@ -277,7 +691,8 @@ fn wait_for_schema(database: &str) -> bool {
         }
         // wait_latch returns false once SIGTERM has been received (it consumes the
         // flag) or the postmaster has died.
-        if !BackgroundWorker::wait_latch(Some(SCHEMA_CHECK_INTERVAL)) {
+        // (Our own SIGTERM handler replaces pgrx's flag, so check ours too.)
+        if !BackgroundWorker::wait_latch(Some(SCHEMA_CHECK_INTERVAL)) || sigterm_received() {
             return false;
         }
         waited = waited.saturating_add(SCHEMA_CHECK_INTERVAL);
@@ -352,11 +767,9 @@ fn serve_credential_requests(
             Err(_) => break,
         }
     }
-    let batch = AssertUnwindSafe(batch);
-    BackgroundWorker::transaction(move || {
-        let batch = batch; // capture the whole AssertUnwindSafe, not its field
-        let batch = batch.0;
-        for request in batch {
+    let mut batch = Some(batch);
+    let outcome = worker_transaction(|| {
+        for request in batch.take().unwrap_or_default() {
             let mut result = Err("credential lookup failed".to_string());
             let outcome = run_request_in_subtransaction(|| {
                 result = crate::kafka::auth::credentials::lookup_credential(
@@ -374,6 +787,16 @@ fn serve_credential_requests(
             let _ = request.reply.send(result);
         }
     });
+    if let Err(e) = outcome {
+        log_txn_error("SASL credential lookup", &e);
+        // Not run (schema missing, lock timeout): fail the lookups, do not leave the
+        // network thread waiting.
+        for request in batch.take().unwrap_or_default() {
+            let _ = request
+                .reply
+                .send(Err("credential lookup unavailable".to_string()));
+        }
+    }
 }
 
 /// Main entry point for the pg_kafka background worker.
@@ -388,6 +811,8 @@ fn serve_credential_requests(
 pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     // Step 1: Attach to Postgres signal handling system
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
+    // wave3 worker: a SIGTERM handler that can interrupt SQL and lock waits.
+    install_sigterm_handler();
 
     // Step 2: Load configuration (GUCs are available after _PG_init)
     // Create RuntimeContext for centralized config access across all modules
@@ -409,10 +834,17 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     // 0.1.0: drop from the bootstrap superuser to pg_kafka.run_as_role.
     crate::kafka::storage::postgres::apply_worker_role();
 
+    // wave3 worker: bounded lock waits for every worker transaction.
+    apply_worker_lock_timeout();
+
+    // What this schema has (an older extension version lacks some objects).
+    let mut features = SchemaFeatures::default();
+    refresh_schema_features(&mut features);
+
     // ADR-001: create the time partitions of kafka.messages before serving (rows that
     // arrive before a leaf exists land in kafka.messages_default, so this is about
     // keeping that leaf empty, not about Produce succeeding).
-    run_partition_maintenance();
+    run_partition_maintenance(&features);
 
     log!(
         "pg_kafka background worker started (port: {}, host: {}, database: {})",
@@ -466,8 +898,9 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     // thread drains this lane before taking the next main-lane request, so group
     // liveness never waits behind a queue of heavy Produce/Fetch work (which
     // previously let DB pressure cascade into spurious rebalances). Small bound:
-    // heartbeats are tiny and frequent, and try_send drops excess into the
-    // client's retry path rather than blocking the network thread.
+    // heartbeats are tiny and each member has at most one in flight; a full lane
+    // applies the same backpressure as the main lane (the connection's reader
+    // waits in send_with_backpressure), nothing is dropped.
     let (liveness_tx, liveness_rx) =
         crossbeam_channel::bounded::<crate::kafka::KafkaRequest>(LIVENESS_CHANNEL_CAPACITY);
     let request_lanes = crate::kafka::RequestLanes {
@@ -706,19 +1139,7 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     let mut last_outbox_poll = Instant::now();
 
     // Phase 11: Initial shadow config load
-    {
-        let shadow_init = AssertUnwindSafe(&shadow_store);
-        BackgroundWorker::transaction(move || match shadow_init.load_topic_config_from_db() {
-            Ok(count) => {
-                if count > 0 {
-                    log!("Loaded {} shadow topic configurations", count);
-                }
-            }
-            Err(e) => {
-                pg_warning!("Failed to load shadow config: {:?}", e);
-            }
-        });
-    }
+    load_shadow_config(&shadow_store);
 
     // Flag to track if SIGHUP was received (triggers immediate config reload)
     let mut sighup_pending = false;
@@ -730,29 +1151,36 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
         // ┌─────────────────────────────────────────────────────────────┐
         // │ Check for Postgres Shutdown Signal                          │
         // └─────────────────────────────────────────────────────────────┘
-        if BackgroundWorker::sigterm_received() {
+        if sigterm_received() {
             log!("pg_kafka background worker shutting down");
+            shutdown_and_exit(&shutdown_tx, &network_handle, shutdown_timeout);
+        }
 
-            // Signal the network thread to stop
-            let _ = shutdown_tx.send(());
+        // wave3 worker: never outlive the postmaster. An orphaned worker would keep
+        // committing Kafka writes and block a new postmaster from starting.
+        if !postmaster_alive() {
+            log!("pg_kafka background worker exiting: the postmaster died");
+            shutdown_and_exit(&shutdown_tx, &network_handle, Duration::from_secs(1));
+        }
 
-            // Wait for network thread to finish (with timeout)
-            let join_start = Instant::now();
-            loop {
-                if network_handle.is_finished() {
-                    log!("pg_kafka network thread shut down cleanly");
-                    break;
-                }
-                if join_start.elapsed() > shutdown_timeout {
-                    pgrx::warning!("pg_kafka network thread shutdown timed out");
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(10));
+        // wave3 worker: the extension was dropped (DROP EXTENSION). Answer requests with
+        // a retriable error until it exists again, then re-initialize as at start.
+        if SCHEMA_LOST.load(Ordering::SeqCst) {
+            if !wait_for_schema_while_serving(
+                &config.database,
+                &request_rx,
+                &liveness_rx,
+                &credential_rx,
+            ) {
+                continue; // SIGTERM or postmaster death: handled at the top
             }
-
-            // Status 1, not a plain return: a SIGTERM from pg_terminate_backend()
-            // must lead to a restarted worker (see exit_for_restart).
-            exit_for_restart();
+            reapply_worker_role();
+            features = SchemaFeatures::default();
+            refresh_schema_features(&mut features);
+            run_partition_maintenance(&features);
+            load_shadow_config(&shadow_store);
+            last_retention_sweep = Instant::now();
+            continue;
         }
 
         // ┌─────────────────────────────────────────────────────────────┐
@@ -801,6 +1229,13 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
                 }
                 pg_log!("ProcessConfigFile called, GUCs reloaded from postgresql.auto.conf");
             }
+            apply_worker_lock_timeout();
+
+            // wave3 worker: pick up a schema change (ALTER EXTENSION pg_kafka UPDATE).
+            if refresh_schema_features(&mut features) {
+                reapply_worker_role();
+                run_partition_maintenance(&features);
+            }
 
             // auth stream: listener security settings apply at worker start only.
             if let Ok(now) = crate::kafka::auth::SecuritySettings::resolve(
@@ -822,8 +1257,8 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
             pg_log!("Reloaded GUC configuration");
 
             // 2. Reload shadow config and flush metrics
-            let shadow_reload = AssertUnwindSafe(&shadow_store);
-            BackgroundWorker::transaction(move || {
+            let shadow_reload = &shadow_store;
+            let outcome = worker_transaction(|| {
                 // RV-10: run this periodic maintenance inside the same subtransaction
                 // guard the request path uses, so a Postgres ERROR here (surfaced by
                 // pgrx as a panic) rolls back and is logged instead of unwinding out
@@ -861,6 +1296,9 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
                     );
                 }
             });
+            if let Err(e) = outcome {
+                log_txn_error("Shadow config reload", &e);
+            }
 
             last_config_reload = Instant::now();
         }
@@ -873,8 +1311,8 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
         if crate::config::SHADOW_MODE_ENABLED.get()
             && last_outbox_poll.elapsed() >= outbox_poll_interval
         {
-            let shadow_outbox = AssertUnwindSafe(&shadow_store);
-            BackgroundWorker::transaction(move || {
+            let shadow_outbox = &shadow_store;
+            let outcome = worker_transaction(|| {
                 // RV-10: guard the outbox maintenance with the subtransaction wrapper
                 // (see the config-reload block above) so a Postgres ERROR rolls back
                 // and is logged rather than aborting the bgworker.
@@ -917,6 +1355,9 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
                     );
                 }
             });
+            if let Err(e) = outcome {
+                log_txn_error("Shadow outbox poll", &e);
+            }
             last_outbox_poll = Instant::now();
         }
 
@@ -927,10 +1368,11 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
         // No CPU usage when idle, instant wake-up when requests come in.
         // DR-12 (DEEP-REVIEW-2026-07): drain the liveness lane BEFORE taking the
         // next main-lane request. Heartbeats are served from the in-memory
-        // coordinator, so each drains in microseconds. A main-lane batch also
-        // ends early as soon as a heartbeat is waiting (see execute_batch), so
-        // heartbeat queueing delay stays bounded by one in-flight request plus
-        // one commit (plus RECV_TIMEOUT when idle), not by the main queue.
+        // coordinator, so each drains in microseconds. Heartbeats that arrive while
+        // a main-lane batch runs are answered between its requests (see
+        // execute_batch), so heartbeat queueing delay stays bounded by one
+        // in-flight request (plus RECV_TIMEOUT when idle), not by the main queue,
+        // and heartbeats no longer cut produce batches short (wave 3).
         while let Ok(request) = liveness_rx.try_recv() {
             execute_batch(request, &liveness_rx, None, &env);
         }
@@ -991,8 +1433,9 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
         // │ Check Transaction Timeouts (Periodic, ~10 seconds)         │
         // └─────────────────────────────────────────────────────────────┘
         if last_txn_timeout_check.elapsed() >= TXN_TIMEOUT_CHECK_INTERVAL {
-            // Must run within a BackgroundWorker transaction for SPI access
-            BackgroundWorker::transaction(|| {
+            // Must run within a worker transaction for SPI access
+            let mut aborted_any = false;
+            let outcome = worker_transaction(|| {
                 // RV-10: guard the timeout sweep with the subtransaction wrapper (see
                 // the config-reload block above) so a Postgres ERROR rolls back and is
                 // logged rather than aborting the bgworker.
@@ -1003,6 +1446,7 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
                     let default_timeout = Duration::from_secs(60);
                     match store.abort_timed_out_transactions(default_timeout) {
                         Ok(aborted) => {
+                            aborted_any = !aborted.is_empty();
                             for txn_id in aborted {
                                 pg_log!(
                                     "Transaction timeout: Aborted timed-out transaction '{}'",
@@ -1020,8 +1464,16 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
                         "Transaction-timeout maintenance panicked, rolled back (worker survived): {}",
                         panic_msg
                     );
+                    aborted_any = false;
                 }
             });
+            match outcome {
+                // wave3 worker: a timeout abort ends transactions too; wake parked
+                // read_committed fetches now (the LSO moved), not on the 1 s safety net.
+                Ok(()) if aborted_any => notify_transaction_ended(&notify_tx),
+                Ok(()) => {}
+                Err(e) => log_txn_error("Transaction-timeout check", &e),
+            }
             last_txn_timeout_check = Instant::now();
         }
 
@@ -1036,8 +1488,8 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
         if last_retention_sweep.elapsed() >= RETENTION_SWEEP_INTERVAL {
             // ADR-001: keep the next time partitions ready (and drain the DEFAULT
             // leaf) before the sweep decides which leaves to drop.
-            run_partition_maintenance();
-            BackgroundWorker::transaction(|| {
+            run_partition_maintenance(&features);
+            let outcome = worker_transaction(|| {
                 // RV-10: guard with the subtransaction wrapper (see the config-reload
                 // block above) so a Postgres ERROR rolls back and is logged rather
                 // than aborting the bgworker.
@@ -1079,6 +1531,9 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
                     );
                 }
             });
+            if let Err(e) = outcome {
+                log_txn_error("Retention sweep", &e);
+            }
             last_retention_sweep = Instant::now();
         }
 
@@ -1086,17 +1541,118 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
         // │ Publish Broker Metrics (≤ once per second, only if changed) │
         // └─────────────────────────────────────────────────────────────┘
         // One upsert statement per flush; no SQL at all while nothing changed.
-        if let Some(batch) = metrics_flusher.poll(request_rx.len(), liveness_rx.len()) {
-            let written = BackgroundWorker::transaction(|| {
+        // Skipped on a schema without the metrics tables (older extension version).
+        let metrics_batch = if features.broker_metrics {
+            metrics_flusher.poll(request_rx.len(), liveness_rx.len())
+        } else {
+            None
+        };
+        if let Some(batch) = metrics_batch {
+            let written = worker_transaction(|| {
                 let mut written = Ok(());
                 let guard = run_request_in_subtransaction(|| {
                     written = crate::kafka::metrics::write_batch(&batch);
                 });
                 guard.and(written)
             });
+            let written = match written {
+                Ok(w) => w,
+                // The schema wait reports a dropped extension; nothing to log here.
+                Err(TxnError::SchemaGone) => continue,
+                Err(e) => Err(format!("{:?}", e)),
+            };
             if let Some(msg) = metrics_flusher.finish(batch, written) {
                 pg_warning!("{}", msg);
             }
+        }
+    }
+}
+
+/// (Re)load the per-topic shadow configuration into the ShadowStore cache.
+fn load_shadow_config(shadow_store: &std::sync::Arc<ShadowStore<PostgresStore>>) {
+    let outcome = worker_transaction(|| match shadow_store.load_topic_config_from_db() {
+        Ok(count) => {
+            if count > 0 {
+                log!("Loaded {} shadow topic configurations", count);
+            }
+        }
+        Err(e) => {
+            pg_warning!("Failed to load shadow config: {:?}", e);
+        }
+    });
+    if let Err(e) = outcome {
+        log_txn_error("Shadow config load", &e);
+    }
+}
+
+/// Tell the network thread that transactions ended, so parked read_committed fetches
+/// re-check their last stable offset now. Best effort: a full channel only means the
+/// long-poll safety net picks it up.
+fn notify_transaction_ended(
+    notify_tx: &crossbeam_channel::Sender<crate::kafka::InternalNotification>,
+) {
+    let _ = notify_tx.try_send(crate::kafka::InternalNotification::TransactionEnded);
+}
+
+/// Whether a committed batch ended (or may have ended) transactions other than through
+/// EndTxn, which notifies by itself: InitProducerId fences and aborts the previous
+/// epoch's open transaction.
+fn batch_may_end_transactions(api_keys: &[i16]) -> bool {
+    api_keys.contains(&API_KEY_INIT_PRODUCER_ID)
+}
+
+/// The extension was dropped while the worker ran. Keep the listener up and answer
+/// every request with a retriable KAFKA_STORAGE_ERROR (credential lookups fail) until
+/// the schema exists again, re-checking every `SCHEMA_CHECK_INTERVAL`. Returns true
+/// once it exists, false on SIGTERM or postmaster death (the caller's loop handles
+/// those).
+fn wait_for_schema_while_serving(
+    database: &str,
+    request_rx: &crossbeam_channel::Receiver<crate::kafka::KafkaRequest>,
+    liveness_rx: &crossbeam_channel::Receiver<crate::kafka::KafkaRequest>,
+    credential_rx: &crossbeam_channel::Receiver<crate::kafka::auth::CredentialRequest>,
+) -> bool {
+    log!(
+        "pg_kafka extension is gone from database '{}' (DROP EXTENSION?); answering requests \
+         with KAFKA_STORAGE_ERROR until CREATE EXTENSION pg_kafka",
+        database
+    );
+    // Back to the bootstrap superuser while waiting: whatever schema appears next is
+    // checked (and its grants re-evaluated by reapply_worker_role) from there.
+    let _: Result<(), pgrx::spi::Error> = BackgroundWorker::transaction(|| {
+        Spi::run("SELECT pg_catalog.set_config('role', 'none', false)")
+    });
+    let started = Instant::now();
+    let mut next_check = Instant::now();
+    loop {
+        if sigterm_received() || !postmaster_alive() {
+            return false;
+        }
+        if Instant::now() >= next_check {
+            if BackgroundWorker::transaction(|| verify_schema(database)).is_ok() {
+                SCHEMA_LOST.store(false, Ordering::SeqCst);
+                log!(
+                    "pg_kafka schema found again after {} ms; resuming",
+                    started.elapsed().as_millis()
+                );
+                return true;
+            }
+            next_check = Instant::now() + SCHEMA_CHECK_INTERVAL;
+        }
+        while let Ok(r) = liveness_rx.try_recv() {
+            reject_request(r, ERROR_KAFKA_STORAGE_ERROR);
+        }
+        while let Ok(c) = credential_rx.try_recv() {
+            let _ = c.reply.send(Err("pg_kafka schema is missing".to_string()));
+        }
+        crossbeam_channel::select! {
+            recv(request_rx) -> r => {
+                match r {
+                    Ok(r) => reject_request(r, ERROR_KAFKA_STORAGE_ERROR),
+                    Err(_) => std::thread::sleep(RECV_TIMEOUT), // network thread gone
+                }
+            },
+            default(RECV_TIMEOUT) => {},
         }
     }
 }
@@ -1127,11 +1683,40 @@ struct RequestEnv<'a> {
 
 /// Whether a group-commit batch should take another already-queued request.
 ///
-/// It stops at the request cap, at the time budget, or as soon as a Heartbeat is
-/// waiting on the liveness lane (DR-12), so liveness traffic never waits behind
-/// more than one in-flight request and one commit.
-fn batch_has_room(taken: usize, elapsed: Duration, liveness_waiting: bool) -> bool {
-    taken < MAX_GROUP_COMMIT_REQUESTS && elapsed < GROUP_COMMIT_TIME_BUDGET && !liveness_waiting
+/// It stops at the request cap or at the time budget. A waiting Heartbeat no longer
+/// ends it (wave 3): heartbeats are answered between the batch's requests instead
+/// ([`serve_liveness_in_batch`]), so liveness traffic still waits behind at most one
+/// in-flight request, and many heartbeating consumers no longer shrink produce
+/// batches to one request each.
+fn batch_has_room(taken: usize, elapsed: Duration) -> bool {
+    taken < MAX_GROUP_COMMIT_REQUESTS && elapsed < GROUP_COMMIT_TIME_BUDGET
+}
+
+/// Answer every Heartbeat waiting on the liveness lane from inside a running batch.
+///
+/// A Heartbeat only reads and updates the in-memory coordinator (no SPI, nothing to
+/// commit), so its response does not need the RB-1 commit barrier: it runs in its
+/// own subtransaction like any request (an empty one, no XID) and its response is
+/// released at once. Returns how many it served. `serve` runs one heartbeat (the
+/// worker passes [`serve_heartbeat_now`]; unit tests pass a fake).
+fn serve_liveness_in_batch(
+    liveness: &crossbeam_channel::Receiver<crate::kafka::KafkaRequest>,
+    mut serve: impl FnMut(crate::kafka::KafkaRequest),
+) -> usize {
+    let mut served = 0;
+    while let Ok(request) = liveness.try_recv() {
+        serve(request);
+        served += 1;
+    }
+    served
+}
+
+/// Run one liveness-lane request inside the current transaction and release its
+/// response immediately (see [`serve_liveness_in_batch`]).
+fn serve_heartbeat_now(mut request: crate::kafka::KafkaRequest, env: &RequestEnv) {
+    let buffered = BufferedResponse::intercept(&mut request);
+    let _ = run_one_request(request, env);
+    buffered.release();
 }
 
 /// The RB-1 response buffer for one request in a batch.
@@ -1210,7 +1795,7 @@ impl BufferedResponse {
     /// commit-failure granularity. Discard it and send an API-typed error frame
     /// instead (pure Rust construction + channel send; safe before Postgres
     /// error-state cleanup). An acks=0 produce gets nothing.
-    fn fail(mut self) {
+    fn fail(mut self, error_code: i16) {
         while self.buffer_rx.try_recv().is_ok() {}
         self.metrics.mark_error();
         if !self.expects_response {
@@ -1221,8 +1806,7 @@ impl BufferedResponse {
         let error_response = crate::kafka::KafkaResponse::new(
             self.correlation_id,
             self.api_version,
-            self.echo
-                .error_response(self.api_version, ERROR_UNKNOWN_SERVER_ERROR),
+            self.echo.error_response(self.api_version, error_code),
         );
         let _ = self.client_tx.send(error_response);
     }
@@ -1290,9 +1874,9 @@ fn after_batch_commit(pending: Vec<BufferedResponse>) {
 }
 
 /// The batch's commit failed: every request in it gets an API-typed error.
-fn after_batch_commit_failure(pending: Vec<BufferedResponse>) {
+fn after_batch_commit_failure(pending: Vec<BufferedResponse>, error_code: i16) {
     for response in pending {
-        response.fail();
+        response.fail(error_code);
     }
 }
 
@@ -1319,47 +1903,58 @@ fn execute_batch(
 ) {
     let batch_start = Instant::now();
     let mut pending: Vec<BufferedResponse> = Vec::new();
-    let mut has_produce = false;
+    let mut api_keys: Vec<i16> = Vec::new();
     // Time spent inside handlers (timing instrumentation, pg_kafka.log_timing).
     let mut handler_time = Duration::ZERO;
+    let mut first = Some(first);
 
-    // The closure is not UnwindSafe (it borrows the ShadowStore, whose
-    // FutureProducer isn't); any unwind out of it is either re-raised below or
-    // already rolled back by the subtransaction guard.
-    let txn_result = catch_unwind(AssertUnwindSafe(|| {
-        BackgroundWorker::transaction(AssertUnwindSafe(|| {
-            let mut next = Some(first);
-            while let Some(mut request) = next.take() {
-                has_produce |= request.header.api_key == API_KEY_PRODUCE;
-                pending.push(BufferedResponse::intercept(&mut request));
+    // worker_transaction takes the schema locks first; a Postgres ERROR outside the
+    // requests' subtransactions (a lock timeout there, or the COMMIT itself) rolls the
+    // whole batch back and is reported as Err, and the worker carries on.
+    let txn_result = worker_transaction(|| {
+        let mut next = first.take();
+        while let Some(mut request) = next.take() {
+            api_keys.push(request.header.api_key);
+            pending.push(BufferedResponse::intercept(&mut request));
 
-                let handler_start = Instant::now();
-                let _ = run_one_request(request, env);
-                handler_time += handler_start.elapsed();
+            let handler_start = Instant::now();
+            let _ = run_one_request(request, env);
+            handler_time += handler_start.elapsed();
 
-                let liveness_waiting = yield_to.is_some_and(|rx| !rx.is_empty());
-                if batch_has_room(pending.len(), batch_start.elapsed(), liveness_waiting) {
-                    next = source.try_recv().ok();
-                }
+            // wave3 worker: heartbeats that arrived meanwhile are answered now, and
+            // the batch goes on taking queued work.
+            if let Some(liveness) = yield_to {
+                serve_liveness_in_batch(liveness, |hb| serve_heartbeat_now(hb, env));
             }
-            apply_test_pre_commit_delay(has_produce);
-        }))
-    }));
+            if batch_has_room(pending.len(), batch_start.elapsed()) {
+                next = source.try_recv().ok();
+            }
+        }
+        apply_test_pre_commit_delay(api_keys.contains(&API_KEY_PRODUCE));
+    });
 
+    // Sync-mode shadow forwards go out only now that the local writes are committed;
+    // responses are released after the (bounded) external wait. After a failed batch
+    // this only discards the queue (forwards of uncommitted transactions are skipped).
+    env.shadow_store.forward_sync_after_commit();
     let batch_size = pending.len();
     match txn_result {
         Ok(()) => {
-            // Sync-mode shadow forwards go out only now that the local writes are
-            // committed; responses are released after the (bounded) external wait.
-            env.shadow_store.forward_sync_after_commit();
-            after_batch_commit(pending)
+            after_batch_commit(pending);
+            if batch_may_end_transactions(&api_keys) {
+                notify_transaction_ended(env.notify_tx);
+            }
         }
-        Err(panic_payload) => {
-            // The transaction itself failed (commit-time panic). Answer every
-            // request, then re-raise: the worker exits and the postmaster
-            // restarts it (WORKER_RESTART_INTERVAL).
-            after_batch_commit_failure(pending);
-            std::panic::resume_unwind(panic_payload);
+        Err(err) => {
+            // Nothing of the batch committed. Every request gets an API-typed error
+            // (a retriable one) instead of its buffered success; a request the batch
+            // never started (the schema locks failed first) is rejected the same way.
+            log_txn_error("Request batch", &err);
+            let code = err.kafka_error_code();
+            after_batch_commit_failure(pending, code);
+            if let Some(request) = first.take() {
+                reject_request(request, code);
+            }
         }
     }
 
@@ -1422,25 +2017,107 @@ mod tests {
     };
 
     #[test]
-    fn test_batch_has_room_stops_at_cap_budget_and_liveness() {
-        assert!(batch_has_room(1, Duration::ZERO, false));
+    fn test_batch_has_room_stops_at_cap_and_budget_only() {
+        assert!(batch_has_room(1, Duration::ZERO));
         assert!(batch_has_room(
             MAX_GROUP_COMMIT_REQUESTS - 1,
-            Duration::from_millis(1),
-            false
+            Duration::from_millis(1)
         ));
         // Request cap.
-        assert!(!batch_has_room(
-            MAX_GROUP_COMMIT_REQUESTS,
-            Duration::ZERO,
-            false
-        ));
+        assert!(!batch_has_room(MAX_GROUP_COMMIT_REQUESTS, Duration::ZERO));
         // Time budget.
-        assert!(!batch_has_room(1, GROUP_COMMIT_TIME_BUDGET, false));
-        // A waiting heartbeat ends the batch (DR-12).
-        assert!(!batch_has_room(1, Duration::ZERO, true));
+        assert!(!batch_has_room(1, GROUP_COMMIT_TIME_BUDGET));
         // The cap keeps a batch within the subxid cache.
         const { assert!(MAX_GROUP_COMMIT_REQUESTS <= 64) };
+    }
+
+    /// wave3 worker (item 7): heartbeats waiting on the liveness lane are served from
+    /// inside the batch, and the batch keeps taking main-lane work. Before, the first
+    /// waiting heartbeat ended the batch (`batch_has_room(.., liveness_waiting=true)`
+    /// was false), so a steady heartbeat stream cut every batch to one request.
+    #[test]
+    fn test_heartbeats_are_served_inside_a_batch_without_ending_it() {
+        let (main_tx, main_rx) = crossbeam_channel::unbounded();
+        let (hb_tx, hb_rx) = crossbeam_channel::unbounded();
+        for i in 0..10 {
+            main_tx.send(api_versions_request(i).0).unwrap();
+            // A heartbeat arrives behind every main-lane request.
+            hb_tx.send(api_versions_request(100 + i).0).unwrap();
+        }
+        let mut batch = Vec::new();
+        let mut heartbeats = Vec::new();
+        let start = Instant::now();
+        let mut next = main_rx.try_recv().ok();
+        while let Some(r) = next.take() {
+            batch.push(r.header.correlation_id);
+            serve_liveness_in_batch(&hb_rx, |hb| heartbeats.push(hb.header.correlation_id));
+            if batch_has_room(batch.len(), start.elapsed()) {
+                next = main_rx.try_recv().ok();
+            }
+        }
+        assert_eq!(batch, (0..10).collect::<Vec<_>>(), "one batch took all ten");
+        assert_eq!(
+            heartbeats,
+            (100..110).collect::<Vec<_>>(),
+            "every heartbeat served"
+        );
+        assert!(hb_rx.is_empty());
+    }
+
+    #[test]
+    fn test_batch_failure_codes_are_retriable_kafka_errors() {
+        assert_eq!(
+            TxnError::SchemaGone.kafka_error_code(),
+            ERROR_KAFKA_STORAGE_ERROR
+        );
+        assert_eq!(
+            TxnError::Failed {
+                message: String::new(),
+                lock_timeout: true
+            }
+            .kafka_error_code(),
+            ERROR_REQUEST_TIMED_OUT
+        );
+        assert_eq!(
+            TxnError::Failed {
+                message: String::new(),
+                lock_timeout: false
+            }
+            .kafka_error_code(),
+            ERROR_KAFKA_STORAGE_ERROR
+        );
+    }
+
+    #[test]
+    fn test_init_producer_id_batches_notify_transaction_end() {
+        assert!(batch_may_end_transactions(&[
+            API_KEY_PRODUCE,
+            API_KEY_INIT_PRODUCER_ID
+        ]));
+        assert!(!batch_may_end_transactions(&[
+            API_KEY_PRODUCE,
+            API_KEY_FETCH
+        ]));
+        assert!(!batch_may_end_transactions(&[]));
+    }
+
+    #[test]
+    fn test_schema_features_missing_lists_what_an_old_schema_lacks() {
+        let full = SchemaFeatures {
+            version: "0.1.0".into(),
+            time_partitions: true,
+            broker_metrics: true,
+            sasl_credentials: true,
+        };
+        assert!(full.missing().is_empty());
+        let old = SchemaFeatures {
+            version: "0.0.0".into(),
+            ..Default::default()
+        };
+        let missing = old.missing().join("; ");
+        assert!(missing.contains("time partitions"));
+        assert!(missing.contains("broker metrics"));
+        assert!(missing.contains("SASL users"));
     }
 
     fn request(
@@ -1551,12 +2228,12 @@ mod tests {
         handler_sends(a, 11);
         handler_sends(p, 12);
 
-        after_batch_commit_failure(pending);
+        after_batch_commit_failure(pending, ERROR_KAFKA_STORAGE_ERROR);
         // Each request gets its own API's error response — never the buffered success.
         let response = a_rx.try_recv().expect("an error response");
         assert_eq!(response.correlation_id, 11);
         match response.body {
-            ResponseBody::ApiVersions(r) => assert_eq!(r.error_code, ERROR_UNKNOWN_SERVER_ERROR),
+            ResponseBody::ApiVersions(r) => assert_eq!(r.error_code, ERROR_KAFKA_STORAGE_ERROR),
             other => panic!("expected an ApiVersions error, got {:?}", other),
         }
         assert!(a_rx.try_recv().is_err(), "the buffered success is dropped");
@@ -1574,7 +2251,7 @@ mod tests {
         let (mut p, mut p_rx) = produce_request(21, 0);
         let pending = vec![BufferedResponse::intercept(&mut p)];
         drop(p); // the acks=0 path sends nothing
-        after_batch_commit_failure(pending);
+        after_batch_commit_failure(pending, ERROR_KAFKA_STORAGE_ERROR);
         assert!(p_rx.try_recv().is_err());
     }
 

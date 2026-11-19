@@ -315,16 +315,36 @@ impl PostgresStore {
                 .get_by_name("now_ms")?
                 .unwrap_or(0);
 
+            // wave3 worker: a schema older than 0.1.0 (new binary before ALTER EXTENSION
+            // UPDATE) has no time partitions and no kafka.message_partitions(). Treat the
+            // whole table as one DEFAULT-like leaf: expiry row by row, nothing to drop.
+            let partitioned: bool = client
+                .select(
+                    "SELECT to_regprocedure('kafka.message_partitions()') IS NOT NULL AS p",
+                    None,
+                    &[],
+                )?
+                .first()
+                .get_by_name("p")?
+                .unwrap_or(false);
+
             // The leaves, oldest first (DEFAULT and the upgrade's MINVALUE leaf first).
             // Bounds travel back into SQL as text: same session, same DateStyle, so the
             // timestamptz round-trips exactly (to the microsecond).
-            let table = client.select(
+            let leaf_sql = if partitioned {
                 "SELECT partition_oid::bigint AS oid, partition_name, is_default,
                         lower_bound::text AS lower_txt, upper_bound::text AS upper_txt,
                         (EXTRACT(EPOCH FROM lower_bound) * 1000)::bigint AS lower_ms,
                         (EXTRACT(EPOCH FROM upper_bound) * 1000)::bigint AS upper_ms
                  FROM kafka.message_partitions()
-                 ORDER BY lower_bound NULLS FIRST, upper_bound",
+                 ORDER BY lower_bound NULLS FIRST, upper_bound"
+            } else {
+                "SELECT 0::bigint AS oid, 'messages'::text AS partition_name, true AS is_default,
+                        NULL::text AS lower_txt, NULL::text AS upper_txt,
+                        NULL::bigint AS lower_ms, NULL::bigint AS upper_ms"
+            };
+            let table = client.select(
+                leaf_sql,
                 None,
                 &[],
             )?;
@@ -412,7 +432,21 @@ impl PostgresStore {
                     }
                     // Window built by multiplication: PG14 rejects a text
                     // 'N milliseconds' literal above the int32 range.
-                    let table = if Some(leaf_oid) == default_oid {
+                    let table = if !partitioned {
+                        client.update(
+                            "DELETE FROM kafka.messages
+                             WHERE ctid IN (
+                                 SELECT d.ctid FROM kafka.messages d
+                                 WHERE d.topic_id = $1
+                                   AND d.created_at < NOW() - $2::bigint * INTERVAL '1 millisecond'
+                                   AND (d.txn_state IS NULL OR d.txn_state <> 'pending')
+                                 LIMIT $3
+                             )
+                             RETURNING topic_id, partition_id",
+                            None,
+                            &[topic_id.into(), window_ms.into(), RETENTION_DELETE_BATCH.into()],
+                        )?
+                    } else if Some(leaf_oid) == default_oid {
                         client.update(
                             "DELETE FROM kafka.messages_default
                              WHERE ctid IN (
