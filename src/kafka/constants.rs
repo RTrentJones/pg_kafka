@@ -490,6 +490,13 @@ pub const ERROR_SHADOW_KAFKA_UNAVAILABLE: i16 = 1003;
 /// Shadow mode replay operation failed
 pub const ERROR_SHADOW_REPLAY_FAILED: i16 = 1004;
 
+// wave3 groups: consumer-group and admin validation error codes
+/// INCONSISTENT_GROUP_PROTOCOL: a JoinGroup whose protocol type or protocols do not match the group
+pub const ERROR_INCONSISTENT_GROUP_PROTOCOL: i16 = 23;
+/// INVALID_REPLICATION_FACTOR: replication factor not 1 / -1 on this single-broker cluster
+pub const ERROR_INVALID_REPLICATION_FACTOR: i16 = 38;
+// end wave3 groups
+
 #[cfg(test)]
 mod tests {
     // Constant-range invariants asserted on purpose (documentation-as-test).

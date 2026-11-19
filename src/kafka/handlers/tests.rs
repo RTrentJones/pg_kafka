@@ -2705,7 +2705,8 @@ mod bug_hunt_regressions {
     /// Bug 11: DescribeGroups on an unknown group reports success with state Dead.
     #[test]
     fn describe_unknown_group_is_dead_not_server_error() {
-        let mock = MockKafkaStore::new();
+        let mut mock = MockKafkaStore::new();
+        mock.expect_group_has_offsets().returning(|_| Ok(false));
         let coordinator = GroupCoordinator::new();
         let broker = BrokerMetadata::new("localhost".to_string(), 9092);
         let ctx = HandlerContext::new(&mock, &coordinator, &broker, 1, Compression::None);

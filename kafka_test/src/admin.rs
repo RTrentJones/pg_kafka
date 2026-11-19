@@ -265,21 +265,51 @@ pub async fn test_create_partitions_cannot_decrease() -> TestResult {
 /// Test deleting an empty consumer group
 pub async fn test_delete_group_empty() -> TestResult {
     let admin = create_admin_client()?;
-    // Use a group that doesn't exist - should succeed (no-op)
+    // wave3 groups: a group that never existed (no members, no committed offsets) is
+    // GROUP_ID_NOT_FOUND, as Kafka answers; an Empty group with offsets is deleted.
     let group_id = format!("test-delete-group-{}", Uuid::new_v4());
 
     let opts = AdminOptions::new().operation_timeout(Some(Duration::from_secs(5)));
 
     let results = admin.delete_groups(&[&group_id], &opts).await?;
     assert_eq!(results.len(), 1);
+    match &results[0] {
+        Err((_, rdkafka::types::RDKafkaErrorCode::GroupIdNotFound)) => {}
+        other => {
+            return Err(format!(
+                "non-existent group: expected GroupIdNotFound, got {:?}",
+                other
+            )
+            .into())
+        }
+    }
 
-    // Deleting a non-existent group should succeed (it's empty)
-    let result = &results[0];
-    assert!(
-        result.is_ok(),
-        "Deleting empty/non-existent group should succeed: {:?}",
-        result.as_ref().err()
-    );
+    // A group that exists only through a committed offset is an Empty group: deletable.
+    let db = create_db_client().await?;
+    let topic = format!("test-delete-group-topic-{}", Uuid::new_v4());
+    db.execute(
+        "INSERT INTO kafka.topics (name, partitions) VALUES ($1, 1)",
+        &[&topic],
+    )
+    .await?;
+    db.execute(
+        "INSERT INTO kafka.consumer_offsets (group_id, topic_id, partition_id, committed_offset)
+         SELECT $1, id, 0, 5 FROM kafka.topics WHERE name = $2",
+        &[&group_id, &topic],
+    )
+    .await?;
+    let results = admin.delete_groups(&[&group_id], &opts).await?;
+    assert!(results[0].is_ok(), "Empty group: {:?}", results[0]);
+    let left: i64 = db
+        .query_one(
+            "SELECT count(*) FROM kafka.consumer_offsets WHERE group_id = $1",
+            &[&group_id],
+        )
+        .await?
+        .get(0);
+    assert_eq!(left, 0, "its offsets are deleted");
+    db.execute("DELETE FROM kafka.topics WHERE name = $1", &[&topic])
+        .await?;
 
     println!("    Successfully deleted empty group '{}'", group_id);
     Ok(())
@@ -542,28 +572,22 @@ pub async fn test_delete_group_idempotent() -> TestResult {
     let group_id = format!("idempotent-delete-group-{}", Uuid::new_v4());
     let opts = AdminOptions::new().operation_timeout(Some(Duration::from_secs(5)));
 
-    // Delete the same non-existent group multiple times
+    // Deleting the same non-existent group repeatedly always gives the same answer:
+    // GROUP_ID_NOT_FOUND, as Kafka does (wave3 groups; it used to be NONE).
     println!("Step 1: Deleting non-existent group 3 times...");
     for i in 1..=3 {
         let results = admin.delete_groups(&[&group_id], &opts).await?;
         assert_eq!(results.len(), 1);
-
-        let result = &results[0];
-        println!(
-            "   Delete #{}: {}",
-            i,
-            if result.is_ok() { "success" } else { "failed" }
-        );
-
-        // All deletes should succeed (idempotent)
-        assert!(
-            result.is_ok(),
-            "Delete #{} should succeed (idempotent), got: {:?}",
-            i,
-            result.as_ref().err()
-        );
+        match &results[0] {
+            Err((_, rdkafka::types::RDKafkaErrorCode::GroupIdNotFound)) => {}
+            other => {
+                return Err(
+                    format!("Delete #{}: expected GroupIdNotFound, got {:?}", i, other).into(),
+                )
+            }
+        }
     }
-    println!("✅ All 3 deletes succeeded (idempotent behavior)\n");
+    println!("✅ All 3 deletes answered GROUP_ID_NOT_FOUND\n");
 
     println!("✅ Test: Delete Group Idempotent PASSED\n");
     Ok(())

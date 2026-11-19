@@ -784,3 +784,27 @@ AS 'MODULE_PATHNAME', 'pg_kafka_drop_user_wrapper';
 
 -- END SASL credentials (auth stream)
 -- =============================================================================
+
+-- =============================================================================
+-- wave3 groups: bound kafka.topics.partitions (see bootstrap.sql)
+-- =============================================================================
+-- A 0.0.0 install may hold an out-of-range count written before the cap existed (such a topic
+-- made every Metadata request crash the server). Clamp it into range, loudly, so the
+-- constraint can be added; no partition at or above 100000 can hold data in practice.
+DO $wave3_groups$
+DECLARE
+    r RECORD;
+BEGIN
+    FOR r IN SELECT name, partitions FROM kafka.topics
+             WHERE partitions < 1 OR partitions > 100000 LOOP
+        RAISE WARNING 'pg_kafka: topic % had % partitions; clamping to %',
+            r.name, r.partitions, LEAST(GREATEST(r.partitions, 1), 100000);
+    END LOOP;
+    UPDATE kafka.topics SET partitions = LEAST(GREATEST(partitions, 1), 100000)
+    WHERE partitions < 1 OR partitions > 100000;
+END
+$wave3_groups$;
+ALTER TABLE kafka.topics ADD CONSTRAINT topics_partitions_range
+    CHECK (partitions >= 1 AND partitions <= 100000);
+-- END wave3 groups
+-- =============================================================================

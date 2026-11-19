@@ -28,10 +28,11 @@ pub fn handle_offset_commit(
 
     // CONF-1: reject zombie commits. A member committing with a stale generation (or an unknown
     // member id) for a live group must be rejected with ILLEGAL_GENERATION / UNKNOWN_MEMBER_ID
-    // rather than silently persisting an offset. Simple consumers (generation -1) are not validated.
+    // rather than silently persisting an offset. wave3 groups: Kafka 3.7's rules, see
+    // `GroupCoordinator::validate_offset_commit` (generation -1 only for an unknown/Empty group).
     if let Err(e) = ctx
         .coordinator
-        .validate_commit(&group_id, &member_id, generation_id)
+        .validate_offset_commit(&group_id, &member_id, generation_id)
     {
         let error_code = e.to_kafka_error_code();
         let response_topics: Vec<_> = topics

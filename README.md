@@ -351,6 +351,10 @@ pg_kafka.shutdown_timeout_ms = 5000
 -- Reloadable with pg_reload_conf()
 pg_kafka.message_retention_hours = 0  -- Time-based retention sweep (0 = keep forever)
 pg_kafka.message_partition_minutes = 1440  -- Width of one time partition of kafka.messages
+-- wave3 groups: resource bounds
+pg_kafka.max_partitions_per_topic = 10000  -- CreateTopics/CreatePartitions cap (1-100000; INVALID_PARTITIONS above)
+pg_kafka.group_max_size = 1000             -- members per consumer group (GROUP_MAX_SIZE_REACHED above)
+pg_kafka.max_consumer_groups = 100000      -- groups held in memory (oldest Empty group evicted when full)
 
 -- Listener security (read when the worker starts; see docs/AUTHENTICATION.md)
 pg_kafka.security_protocol = 'PLAINTEXT'      -- primary listener: PLAINTEXT, SSL, SASL_PLAINTEXT, SASL_SSL
