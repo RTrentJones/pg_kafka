@@ -44,7 +44,10 @@ const DESCRIPTIONS: &[(&str, &str)] = &[
     ("Metadata", "Broker and topic metadata"),
     ("OffsetCommit", "Commit consumer offsets"),
     ("OffsetFetch", "Retrieve committed offsets"),
-    ("FindCoordinator", "Locate the group / transaction coordinator"),
+    (
+        "FindCoordinator",
+        "Locate the group / transaction coordinator",
+    ),
     ("JoinGroup", "Join a consumer group"),
     ("Heartbeat", "Keep group membership alive"),
     ("LeaveGroup", "Leave a consumer group"),
@@ -59,12 +62,18 @@ const DESCRIPTIONS: &[(&str, &str)] = &[
     ("CreateTopics", "Create topics"),
     ("DeleteTopics", "Delete topics and their messages"),
     ("DeleteRecords", "Truncate partitions below an offset"),
-    ("InitProducerId", "Allocate a producer id (idempotence, transactions)"),
+    (
+        "InitProducerId",
+        "Allocate a producer id (idempotence, transactions)",
+    ),
     ("AddPartitionsToTxn", "Register partitions in a transaction"),
     ("AddOffsetsToTxn", "Add a group's offsets to a transaction"),
     ("EndTxn", "Commit or abort a transaction"),
     ("TxnOffsetCommit", "Commit offsets inside a transaction"),
-    ("DescribeConfigs", "Report the topic configs pg_kafka honors"),
+    (
+        "DescribeConfigs",
+        "Report the topic configs pg_kafka honors",
+    ),
     (
         "SaslAuthenticate",
         "PLAIN / SCRAM-SHA-256 / SCRAM-SHA-512 exchange",
@@ -222,7 +231,10 @@ fn every_api_has_a_description() {
         );
     }
     for (n, _) in DESCRIPTIONS {
-        assert!(api_by_name(n).is_some(), "description for unregistered API {n}");
+        assert!(
+            api_by_name(n).is_some(),
+            "description for unregistered API {n}"
+        );
     }
 }
 
@@ -245,7 +257,9 @@ fn regenerate_rewrites_only_owned_regions() {
 
 #[test]
 fn regenerate_reports_bad_markers() {
-    assert!(!regenerate("<!--gen:api-versions:NoSuchApi-->x<!--/gen-->").1.is_empty());
+    assert!(!regenerate("<!--gen:api-versions:NoSuchApi-->x<!--/gen-->")
+        .1
+        .is_empty());
     assert!(!regenerate("<!--gen:api-bogus-->x<!--/gen-->").1.is_empty());
     assert!(!regenerate("<!--gen:api-count-->x").1.is_empty());
 }
