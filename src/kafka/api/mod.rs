@@ -10,19 +10,19 @@
 //! - which request lane it travels on ([`Lane`]) and whether its reply may be held past the
 //!   request's transaction ([`KafkaApi::DEFERRED_REPLY`]),
 //! - how the decoded wire request becomes the handler's input ([`KafkaApi::decode`]),
-//! - how to answer it with an error code ([`KafkaApi::error_response`]), echoing the requested
-//!   topics/partitions/groups ([`KafkaApi::Echo`]) where the response has no top-level code,
+//! - how to answer it with an error code ([`ApiSchema::error_response`]), echoing the requested
+//!   topics/partitions/groups ([`ApiSchema::Echo`]) where the response has no top-level code,
 //! - whether a response carries an error (metrics),
 //! - and how the DB thread runs it ([`KafkaApi::handle`]).
 //!
-//! The registry at the bottom of this file ([`kafka_apis!`]) lists each API once and
+//! The registry at the bottom of this file (`kafka_apis!`) lists each API once and
 //! generates the request/response enums and the per-API dispatch from it. Adding an API is
 //! one `impl KafkaApi` plus one registry line; see "Adding a New Kafka API Handler" in
 //! CLAUDE.md.
 //!
 //! ## Thread safety
 //!
-//! Decoding ([`decode_request`]) and encoding run on the network thread and must not touch
+//! Decoding (`decode_body`) and encoding run on the network thread and must not touch
 //! pgrx. [`dispatch`] runs on the DB thread.
 
 use bytes::BytesMut;
@@ -93,7 +93,7 @@ pub enum Lane {
 /// Why [`KafkaApi::decode`] refused a request whose body did decode.
 #[derive(Debug)]
 pub enum Rejection<E> {
-    /// Answer with [`KafkaApi::error_response`] for `echo` and `error_code`.
+    /// Answer with [`ApiSchema::error_response`] for `echo` and `error_code`.
     Reply {
         /// Kafka error code to report.
         error_code: i16,
@@ -248,7 +248,7 @@ impl<A: KafkaApi> Call<A> {
     }
 
     /// Run `handler` for `request` and send its response. A handler `Err` is answered with
-    /// [`KafkaApi::error_response`] (echoing the request) and rolls the request's writes
+    /// [`ApiSchema::error_response`] (echoing the request) and rolls the request's writes
     /// back; a panic is answered with UNKNOWN_SERVER_ERROR and re-raised, so the
     /// surrounding subtransaction rolls back (see [`dispatch_response`]).
     pub fn run<F>(self, request: A::Request, handler: F) -> RequestOutcome
