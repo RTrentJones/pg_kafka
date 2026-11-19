@@ -4,7 +4,7 @@
 
 ## Current State (Phase 11 Complete)
 
-**APIs Implemented:** 26 of ~50 (52%)
+**APIs Implemented:** <!--gen:api-coverage-->28 of ~50 standard Kafka APIs (56%)<!--/gen-->
 **Tests:** unit + property + E2E; counts in [TEST_STRATEGY.md](TEST_STRATEGY.md#test-summary)
 **Architecture:** Repository Pattern, typed errors, clean handler structure, key-based partition routing, compression, transactions, shadow mode
 
@@ -19,6 +19,7 @@
 | Transaction | AddPartitionsToTxn (24), AddOffsetsToTxn (25), EndTxn (26), TxnOffsetCommit (28) |
 | Config | DescribeConfigs (32), IncrementalAlterConfigs (44) |
 | Log Management | DeleteRecords (21) |
+| Security | SaslHandshake (17), SaslAuthenticate (36) |
 
 ---
 
@@ -242,15 +243,17 @@ SELECT pg_reload_conf();
 
 | File | Purpose |
 |------|---------|
+| `src/kafka/api/mod.rs` | The `kafka_apis!` registry: one line per API; generates decode/encode/dispatch, ApiVersions and the error path |
+| `src/kafka/api/*.rs` | One `KafkaApi` impl per API: `NAME`, advertised/enforced `MIN_VERSION`/`MAX_VERSION`, lane, decode, error responses |
 | `src/kafka/handlers/` | All API handlers |
 | `src/kafka/storage/mod.rs` | KafkaStore trait |
 | `src/kafka/storage/postgres.rs` | PostgresStore implementation |
 | `src/kafka/coordinator.rs` | Group state machine |
-| `src/kafka/protocol/decoding.rs` | Request parsing |
-| `src/kafka/messages.rs` | Request/Response enums |
+| `src/kafka/protocol/decoding.rs` | Request header parsing (bodies go to the registry) |
+| `src/kafka/messages.rs` | `KafkaRequest`/`KafkaResponse` envelopes, request lanes |
 | `src/worker.rs` | Background worker loop, transaction + response-after-commit barrier |
-| `src/kafka/dispatch.rs` | Request → handler dispatch |
-| `src/kafka/response_builders.rs` | Advertised/enforced API version ranges |
+| `src/kafka/dispatch.rs` | Handler `Err`/panic → error response, `RequestOutcome` |
+| `src/kafka/response_builders.rs` | ApiVersions list (built from the registry) |
 | `src/kafka/constants.rs` | API keys, error codes |
 | `src/kafka/error.rs` | KafkaError → error codes |
 

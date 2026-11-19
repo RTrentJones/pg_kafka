@@ -132,7 +132,7 @@ The IP `172.23.0.2` is stale. Fix by:
 1. Verify actual Kafka IP: `docker inspect external_kafka | grep IPAddress`
 2. If it is not `172.18.0.2`, another network on the host may already claim the `172.18.0.0/16` subnet; free it, or change the subnet, `ipv4_address`, and CONTAINER advertised listener together in `docker-compose.yml` and set `INTERNAL_KAFKA_BOOTSTRAP_SERVERS` to match
 3. Recreate Kafka container: `docker-compose up -d --force-recreate external-kafka`
-4. Restart PostgreSQL: `./scripts/restart.sh`
+4. Restart PostgreSQL: `./scripts/restart.sh` (rebuilds and restarts, keeping the data; `--fresh` would also drop and recreate the extension, deleting all pg_kafka data)
 
 ### Producer Cache Issues
 
@@ -140,7 +140,7 @@ If the producer uses old bootstrap servers after a GUC change:
 
 1. The forwarding producer lives in the network thread (`run_shadow_forwarder` in `src/kafka/listener.rs`) and is rebuilt when the reloaded `pg_kafka.shadow_bootstrap_servers` differs from the value it was built with
 2. Make sure the change was reloaded (`SELECT pg_reload_conf()`); the forwarder reads the worker's reloaded config snapshot
-3. Other producer settings (batch size, linger, retries, SASL/SSL) are applied only when the producer is rebuilt, so restart PostgreSQL to force a fresh producer: `./scripts/restart.sh`
+3. Other producer settings (batch size, linger, retries, SASL/SSL) are applied only when the producer is rebuilt, so restart PostgreSQL to force a fresh producer: `./scripts/restart.sh` (keeps the data; do not pass `--fresh`, which drops every topic and message)
 
 ### DNS Resolution
 

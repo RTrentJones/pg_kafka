@@ -13,15 +13,16 @@ services:
       # Persist the Cargo cache so re-builds are fast
       - cargo_cache:/home/postgres/.cargo/registry
       - target_cache:/home/postgres/workspace/target
-    ports:
-      - "5432:5432"  # Access Postgres from host
-      - "9092:9092"  # Access Kafka Protocol from host
+    # No published ports: pgrx's PostgreSQL 14 listens on 28814 and pg_kafka binds
+    # pg_kafka.host = 127.0.0.1 (the default) inside the container, which a published port
+    # cannot reach. The devcontainer forwards both ports (devcontainer.json forwardPorts:
+    # VS Code tunnels to the container's localhost). Without VS Code, run clients inside the
+    # container (docker exec), or set pg_kafka.host = '0.0.0.0' and publish 9092 yourself.
     environment:
       - RUST_LOG=info
-      # Shadow mode configuration for testing (Phase 11)
-      # Using INTERNAL listener for container-to-container communication
-      - PG_KAFKA_SHADOW_BOOTSTRAP_SERVERS=external-kafka:9094
-      - PG_KAFKA_SHADOW_SECURITY_PROTOCOL=PLAINTEXT
+      # Shadow mode is configured with GUCs (pg_kafka.shadow_bootstrap_servers etc.; the E2E
+      # tests set them with ALTER SYSTEM), not environment variables. From this container the
+      # external broker is external-kafka:9094 (INTERNAL) or 172.18.0.2:9095 (CONTAINER).
     # Security tweak to allow gdb/perf if you need to debug crashes
     privileged: true
     cap_add:

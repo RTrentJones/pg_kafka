@@ -52,7 +52,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Automated E2E tests with real Kafka client (rdkafka)
 - wave3 txn: read_committed (and read_uncommitted after aborted-row cleanup) consumers move past offsets they cannot see: a fetch with nothing visible below its readable end returns a control batch covering them (PROTOCOL_DEVIATIONS §7); fetched records are grouped into one RecordBatch per run of a producer's offsets; ListOffsets honours isolation_level (LSO) and MAX_TIMESTAMP (-3); OffsetFetch `require_stable` (KIP-447); transactional Produce only to partitions added with AddPartitionsToTxn (which no longer creates topics); InitProducerId timeout bound `pg_kafka.transaction_max_timeout_ms`
 
-**API Coverage:** 28 of ~50 standard Kafka APIs (56%)
+**API Coverage:** <!--gen:api-coverage-->28 of ~50 standard Kafka APIs (56%)<!--/gen--> (full table: README "Implemented APIs", generated from the `kafka_apis!` registry)
 **Test Status:** unit + property + E2E, all CI-gated. Counts live only in `docs/TEST_STRATEGY.md` ("Test Summary"); do not repeat them elsewhere.
 **Coverage Target:** 80%+ (testable code)
 
@@ -73,7 +73,7 @@ The devcontainer includes:
 - Rust toolchain with nightly channel
 - pgrx pre-initialized with pg14
 - Rust-analyzer and debugging extensions
-- Port forwarding for PostgreSQL (5432) and Kafka Protocol (9092)
+- Port forwarding for PostgreSQL (28814, pgrx's pg14) and Kafka Protocol (9092)
 
 ### Option 2: Manual Docker Setup
 
@@ -127,8 +127,9 @@ cargo pgrx test pg14
 cargo pgrx start pg14
 cd kafka_test && cargo run --release
 
-# Quick development iteration (kills postgres, rebuilds, restarts, recreates extension)
+# Quick development iteration: rebuild, install (.so + generated SQL), restart, keep the data
 ./scripts/restart.sh
+./scripts/restart.sh --fresh         # ...and DROP/CREATE EXTENSION: deletes all pg_kafka data
 
 # Test coverage
 cargo llvm-cov --lib --features pg14 --lcov --output-path lcov.info
@@ -144,7 +145,7 @@ cargo pgrx schema pg14               # Generate SQL schema files
 
 **Note on pgrx tests:** This extension uses `PGC_POSTMASTER` GUCs which require `shared_preload_libraries` BEFORE Postgres starts. `cargo pgrx test` creates the extension AFTER startup, causing "FATAL: cannot create PGC_POSTMASTER variables after startup". Most integration testing is done via the E2E suite in `kafka_test/`. See `docs/PGRX_TESTING_GUIDE.md` for the full testing strategy.
 
-**Note:** The project includes a [rust-toolchain.toml](rust-toolchain.toml) that specifies Rust nightly, which is required for the `home` crate dependency that uses edition2024 features (needed by pgrx 0.16.1). The default feature is `pg14` as specified in [Cargo.toml](Cargo.toml); features `pg13` through `pg18` exist, and CI additionally checks and unit-tests `pg15`, `pg16` and `pg17`.
+**Note:** The project includes a [rust-toolchain.toml](rust-toolchain.toml) that specifies Rust nightly, which is required for the `home` crate dependency that uses edition2024 features (needed by pgrx 0.16.1). The toolchain file pins a dated nightly (`nightly-2026-11-08`); bump it deliberately and re-run clippy on both crates. The default feature is `pg14` as specified in [Cargo.toml](Cargo.toml); features `pg13` through `pg18` exist. CI (`.github/workflows/ci.yml`, job `e2e`) builds, lints and unit-tests every major from 14 to 18, installs the extension into that PostgreSQL (from apt.postgresql.org) and runs the functional E2E suite and `scripts/check-upgrade.sh` against it (`scripts/ci-pg.sh` brings the cluster up the same way locally); pg14 also runs the shadow and performance categories. PG18-specific code is `#[cfg(feature = "pg18")]`-scoped. `pg13` is built by no CI job (PostgreSQL 13 is end-of-life).
 
 ## Code Coverage Requirements
 
@@ -158,18 +159,23 @@ cargo pgrx schema pg14               # Generate SQL schema files
 - Files in `codecov.yml` ignore list are excluded (SPI-dependent code tested via E2E)
 
 **QA-1 rule — SPI/async change ⇒ E2E test (machine-enforced):**
-The SPI/async files in the `codecov.yml` `ignore:` list (`worker.rs`, `storage/postgres.rs`,
-`shadow/store.rs`, `listener.rs`) can't be seen by unit coverage, so the coverage gate
-can't protect them. The mitigation is mandatory: **every behavioural change to one of
-those files must ship a fail-before / pass-after `kafka_test/` regression test.** This is
-enforced by the `spi-e2e-guard` CI job (`.github/scripts/require-e2e-for-spi.sh`), which
-fails a PR that touches one of those files without also changing a Rust file under
-`kafka_test/src/`. The guard derives its file list from every `src/` entry in that
-`ignore:` list, so it also fires on `src/lib.rs` and `src/kafka/handler_context.rs`. For a genuinely test-neutral edit (comments/docs/renames), add the
-`no-e2e-needed` label to waive it. Do **not** add a file to the ignore list to route
-untested logic around the patch gate — prefer extracting the pure logic into a testable
-free function (see `validate_sequence` in `storage/mod.rs` and `build_producer_settings`
-in `shadow/producer.rs` for the pattern).
+Code that needs a live Postgres (SPI) or the tokio listener can't be seen by unit coverage,
+so the coverage gate can't protect it. `codecov.yml` lists these files twice over: its
+`ignore:` list holds the files that are SPI/async/generated through and through (`lib.rs`,
+`worker.rs`, `storage/postgres.rs`, `storage/postgres/roles.rs`, `shadow/store.rs`,
+`auth/credentials.rs`, `auth/users.rs`, `listener.rs`), and its `# qa1-guard:` lines hold the
+files that mix SPI calls with unit-tested logic and so stay in the coverage figures
+(`metrics.rs`, `shadow/outbox.rs`, `shadow/primary.rs`). The mitigation is mandatory:
+**every behavioural change to a file on either list must ship a fail-before / pass-after
+`kafka_test/` regression test.** The `spi-e2e-guard` CI job
+(`.github/scripts/require-e2e-for-spi.sh`, which reads both lists) fails a PR that touches
+one of them without also changing a Rust file under `kafka_test/src/`, and
+`.github/scripts/check-coverage-policy.sh` (lint job) fails when a `src/` file that calls SPI
+(`Spi::*`, `BackgroundWorker::*`, `#[pg_extern]`) is on neither list. For a genuinely
+test-neutral edit (comments/docs/renames), add the `no-e2e-needed` label to waive the guard.
+Do **not** add a file to the ignore list to route untested logic around the patch gate —
+prefer extracting the pure logic into a testable free function (see `validate_sequence` in
+`storage/mod.rs` and `build_producer_settings` in `shadow/producer.rs` for the pattern).
 
 **Single-DB-thread invariant (why the above is safe):** all handlers, the `Arc<RwLock>`
 coordinator, and the `ShadowStore` run on the *one* background-worker DB thread; only the
@@ -584,6 +590,9 @@ leaves), and confine a ctid-based statement to one leaf (`tableoid`), since ctid
 
 ## Configuration
 
+The complete, generated reference (type, default, range, context of every GUC) is
+`docs/CONFIGURATION.md`; the block below is an annotated overview.
+
 ```sql
 -- In postgresql.conf:
 shared_preload_libraries = 'pg_kafka'
@@ -788,7 +797,7 @@ Per-category counts are in `docs/TEST_STRATEGY.md`; `cargo run --release -- --li
 | **performance** | Throughput baselines, latency percentiles, scaling |
 | **metadata** | Metadata refresh, all topics, nonexistent topic |
 | **protocol** | ApiVersions negotiation, correlation ID, unknown API, pipelining, response ordering |
-| **auth** | SASL_PLAINTEXT (PLAIN, SCRAM-SHA-256/512), SSL (+ untrusted CA, mutual TLS), SASL_SSL, wrong passwords, pre-auth gating, user SQL. Sequential: generates certs with the `openssl` CLI, adds listeners 9093-9095 via ALTER SYSTEM and restarts the worker; the last test resets them. Needs the DB host's filesystem and superuser |
+| **auth** | SASL_PLAINTEXT (PLAIN, SCRAM-SHA-256/512), SSL (+ untrusted CA, mutual TLS), SASL_SSL, wrong passwords, pre-auth gating, user SQL. Sequential: generates certs with the `openssl` CLI, adds listeners 19093-19095 via ALTER SYSTEM and restarts the worker; the last test resets them. Needs the DB host's filesystem and superuser |
 | **w3_groups** | Wave 3 groups stream: partition caps (raw 2e9 CreateTopics, corrupt stored count), CreateTopics validation, JoinGroup protocol rules, OffsetCommit rules, offsets-only groups after a worker restart, a consumer with no common assignor |
 | **w3_txn** | Wave 3 txn: consumers reach the end past aborted/cleaned-up/DeleteRecords holes and stop at an open transaction's LSO; ListOffsets isolation/-3/partition checks; OffsetFetch require_stable; Kafka's idempotent model (5-batch cache, original offsets, epochs, wrap, survives restarts); transaction validation; fetch batching |
 | **w3_net** | (wave3 net) Hostile clients at the network edge: frame-budget lockout, >100 MB response, TCP_NODELAY, acks=0 close / invalid acks, responses before close, per-IP and per-listener caps, idle and frame-read deadlines, pre-auth deadline from accept, SASL lookup rate limit, unknown-user SCRAM fake. Sequential; the `limits` tests add listeners 19096-19098 via ALTER SYSTEM, connect from 127.0.0.x source addresses and need `openssl` |

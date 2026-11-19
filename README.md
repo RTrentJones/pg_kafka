@@ -15,7 +15,7 @@ kcat -C -b localhost:9092 -t my-topic -p 0 -o beginning
 
 | Component | Status | Details |
 |-----------|--------|---------|
-| **Protocol Layer** | Production-ready | 28 Kafka APIs implemented (56% coverage) |
+| **Protocol Layer** | Production-ready | <!--gen:api-coverage-->28 of ~50 standard Kafka APIs (56%)<!--/gen--> |
 | **Producer** | Production-ready | Idempotent + transactional support |
 | **Consumer** | Production-ready | Fetch, ListOffsets, automatic partition assignment |
 | **Consumer Groups** | Complete | Full coordinator with auto-rebalancing |
@@ -51,40 +51,42 @@ kcat -C -b localhost:9092 -t my-topic -p 0 -o beginning
 - **Shadow Mode** - Dual-write to external Kafka with SASL/SSL authentication
 - **Listener Security** - TLS (rustls, optional mutual TLS) and SASL PLAIN / SCRAM-SHA-256 / SCRAM-SHA-512 on Kafka-style `SSL` / `SASL_PLAINTEXT` / `SASL_SSL` listeners; no ACLs ([docs/AUTHENTICATION.md](docs/AUTHENTICATION.md))
 
-### Implemented APIs (28 total)
+### Implemented APIs
 
-Versions are the ranges advertised in ApiVersions and enforced on inbound requests (each API's `MIN_VERSION`/`MAX_VERSION` in `src/kafka/api/`).
+<!--gen:api-count-->28<!--/gen--> APIs. Versions are the ranges advertised in ApiVersions and enforced on inbound requests (each API's `MIN_VERSION`/`MAX_VERSION` in `src/kafka/api/`). The table is generated from the `kafka_apis!` registry (`src/kafka/api/docs.rs`); a unit test fails when it is stale.
 
-| API | Key | Versions | Description |
-|-----|-----|----------|-------------|
-| Produce | 0 | 3-9 | Write messages to database |
-| Fetch | 1 | 0-11 | Read messages with RecordBatch v2 encoding |
-| ListOffsets | 2 | 0-7 | Query earliest/latest/by-timestamp offsets |
-| Metadata | 3 | 0-10 | Broker and topic metadata |
-| OffsetCommit | 8 | 0-8 | Commit consumer offsets |
-| OffsetFetch | 9 | 0-7 | Retrieve committed offsets |
-| FindCoordinator | 10 | 0-3 | Locate group coordinator |
-| JoinGroup | 11 | 0-7 | Register consumer group member |
-| Heartbeat | 12 | 0-4 | Maintain group membership |
-| LeaveGroup | 13 | 0-4 | Graceful group departure |
-| SyncGroup | 14 | 0-4 | Distribute partition assignments |
-| DescribeGroups | 15 | 0-5 | Get consumer group state and members |
-| ListGroups | 16 | 0-4 | List all consumer groups |
-| SaslHandshake | 17 | 0-1 | Negotiate the SASL mechanism (SASL listeners; v0 answered UNSUPPORTED_VERSION) |
-| ApiVersions | 18 | 0-3 | Protocol version negotiation |
-| CreateTopics | 19 | 0-5 | Create topics with partition count |
-| DeleteTopics | 20 | 0-4 | Delete topics and messages |
-| DeleteRecords | 21 | 0-2 | Truncate partitions below an offset |
-| InitProducerId | 22 | 0-4 | Allocate producer ID for idempotency |
-| AddPartitionsToTxn | 24 | 0-3 | Register partitions in transaction |
-| AddOffsetsToTxn | 25 | 0-3 | Include offsets in transaction |
-| EndTxn | 26 | 0-3 | Commit or abort transaction |
-| TxnOffsetCommit | 28 | 0-3 | Commit offsets within transaction |
-| DescribeConfigs | 32 | 1-4 | Report the topic configs pg_kafka honors |
-| SaslAuthenticate | 36 | 0-2 | PLAIN / SCRAM-SHA-256 / SCRAM-SHA-512 exchange |
-| CreatePartitions | 37 | 0-2 | Add partitions to existing topics |
-| DeleteGroups | 42 | 0-2 | Delete consumer groups |
-| IncrementalAlterConfigs | 44 | 0-1 | Set per-topic `retention.ms` (other keys rejected) |
+<!--gen:api-table-->
+| API | Key | Versions | Served by | Description |
+|-----|-----|----------|-----------|-------------|
+| Produce | 0 | 3-9 | DB thread | Write messages to the database |
+| Fetch | 1 | 4-11 | DB thread | Read messages (RecordBatch v2), with long polling |
+| ListOffsets | 2 | 1-7 | DB thread | Earliest/latest/by-timestamp offsets |
+| Metadata | 3 | 0-10 | DB thread | Broker and topic metadata |
+| OffsetCommit | 8 | 2-8 | DB thread | Commit consumer offsets |
+| OffsetFetch | 9 | 1-7 | DB thread | Retrieve committed offsets |
+| FindCoordinator | 10 | 0-3 | DB thread | Locate the group / transaction coordinator |
+| JoinGroup | 11 | 0-7 | DB thread | Join a consumer group |
+| Heartbeat | 12 | 0-4 | DB thread (liveness lane) | Keep group membership alive |
+| LeaveGroup | 13 | 0-4 | DB thread | Leave a consumer group |
+| SyncGroup | 14 | 0-4 | DB thread | Distribute partition assignments |
+| DescribeGroups | 15 | 0-5 | DB thread | Consumer group state and members |
+| ListGroups | 16 | 0-4 | DB thread | List consumer groups |
+| SaslHandshake | 17 | 0-1 | network thread | Negotiate the SASL mechanism (SASL listeners; v0 answered UNSUPPORTED_VERSION) |
+| ApiVersions | 18 | 0-3 | DB thread | Protocol version negotiation |
+| CreateTopics | 19 | 2-5 | DB thread | Create topics |
+| DeleteTopics | 20 | 1-4 | DB thread | Delete topics and their messages |
+| DeleteRecords | 21 | 0-2 | DB thread | Truncate partitions below an offset |
+| InitProducerId | 22 | 0-4 | DB thread | Allocate a producer id (idempotence, transactions) |
+| AddPartitionsToTxn | 24 | 0-3 | DB thread | Register partitions in a transaction |
+| AddOffsetsToTxn | 25 | 0-3 | DB thread | Add a group's offsets to a transaction |
+| EndTxn | 26 | 0-3 | DB thread | Commit or abort a transaction |
+| TxnOffsetCommit | 28 | 0-3 | DB thread | Commit offsets inside a transaction |
+| DescribeConfigs | 32 | 1-4 | DB thread | Report the topic configs pg_kafka honors |
+| SaslAuthenticate | 36 | 0-2 | network thread | PLAIN / SCRAM-SHA-256 / SCRAM-SHA-512 exchange |
+| CreatePartitions | 37 | 0-2 | DB thread | Add partitions to existing topics |
+| DeleteGroups | 42 | 0-2 | DB thread | Delete consumer groups |
+| IncrementalAlterConfigs | 44 | 0-1 | DB thread | Set per-topic `retention.ms` (other keys rejected) |
+<!--/gen-->
 
 ---
 
@@ -368,7 +370,7 @@ pg_kafka.sasl_enabled_mechanisms = 'PLAIN,SCRAM-SHA-256,SCRAM-SHA-512'
 Kafka users: `SELECT pg_kafka_create_user('alice', 'secret');` (also `pg_kafka_alter_user`,
 `pg_kafka_set_user_verifier`, `pg_kafka_drop_user`, view `kafka.sasl_users`).
 
-See [CLAUDE.md](CLAUDE.md#configuration) for the full GUC list, including long polling, compression and Shadow Mode settings.
+See [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for every setting (generated from the GUC definitions: type, default, range, when a change takes effect).
 
 ---
 

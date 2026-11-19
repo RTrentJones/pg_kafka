@@ -45,13 +45,15 @@
     }
   },
   // Ports to forward
+  // pgrx runs PostgreSQL 14 on 28814; pg_kafka listens on 127.0.0.1:9092 inside the
+  // container, which VS Code's forwarding reaches (it tunnels to the container's localhost).
   "forwardPorts": [
-    5432,
+    28814,
     9092
   ],
   "portsAttributes": {
-    "5432": {
-      "label": "PostgreSQL",
+    "28814": {
+      "label": "PostgreSQL (pgrx pg14)",
       "onAutoForward": "notify"
     },
     "9092": {
