@@ -8,7 +8,9 @@ use crate::kafka::constants::{
 };
 use crate::kafka::error::Result;
 use crate::kafka::handler_context::HandlerContext;
-use crate::kafka::messages::OffsetFetchTopicData;
+use crate::kafka::messages::{
+    OffsetCommitPartitionData, OffsetCommitTopicData, OffsetFetchTopicData,
+};
 use crate::kafka::storage::{CommittedOffset, KafkaStore};
 use kafka_protocol::messages::offset_commit_response::{
     OffsetCommitResponse, OffsetCommitResponsePartition, OffsetCommitResponseTopic,
@@ -28,9 +30,10 @@ pub fn handle_offset_commit(
     group_id: &str,
     generation_id: i32,
     member_id: &str,
-    topics: Vec<crate::kafka::messages::OffsetCommitTopicData>,
+    topics: Vec<OffsetCommitTopicData>,
 ) -> Result<OffsetCommitResponse> {
-    let store = ctx.store;
+    let mut response = OffsetCommitResponse::default();
+    response.throttle_time_ms = 0;
 
     // Reject zombie commits. A member committing with a stale generation (or an unknown
     // member id) for a live group must be rejected with ILLEGAL_GENERATION / UNKNOWN_MEMBER_ID
@@ -41,118 +44,109 @@ pub fn handle_offset_commit(
         .validate_offset_commit(group_id, member_id, generation_id)
     {
         let error_code = e.to_kafka_error_code();
-        let response_topics: Vec<_> = topics
+        response.topics = topics
             .into_iter()
             .map(|topic| {
-                let partitions: Vec<_> = topic
+                let partitions = topic
                     .partitions
-                    .into_iter()
-                    .map(|partition| {
-                        let mut partition_response = OffsetCommitResponsePartition::default();
-                        partition_response.partition_index = partition.partition_index;
-                        partition_response.error_code = error_code;
-                        partition_response
-                    })
+                    .iter()
+                    .map(|p| commit_partition(p.partition_index, error_code))
                     .collect();
-                let mut topic_response = OffsetCommitResponseTopic::default();
-                topic_response.name = TopicName(StrBytes::from_string(topic.name));
-                topic_response.partitions = partitions;
-                topic_response
+                commit_topic(topic.name, partitions)
             })
             .collect();
-        let mut response = OffsetCommitResponse::default();
-        response.topics = response_topics;
         return Ok(response);
     }
 
-    let mut response_topics = Vec::new();
+    response.topics = topics
+        .into_iter()
+        .map(|topic| commit_topic_offsets(ctx.store, group_id, topic))
+        .collect();
+    Ok(response)
+}
 
-    // Process each topic
-    for topic in topics {
-        let topic_name = topic.name.clone();
-
-        // Look up topic_id and partition count using helper
-        let (topic_id, partition_count) = match resolve_topic(store, &topic_name) {
-            Ok(Some(found)) => found,
-            unresolved => {
-                // Topic not found or error - return error for all partitions
-                let error_code = unresolved.err().unwrap_or(ERROR_UNKNOWN_TOPIC_OR_PARTITION);
-                let mut error_partitions = Vec::new();
-                for partition in topic.partitions {
-                    let mut partition_response = OffsetCommitResponsePartition::default();
-                    partition_response.partition_index = partition.partition_index;
-                    partition_response.error_code = error_code;
-                    error_partitions.push(partition_response);
-                }
-
-                let mut topic_response = OffsetCommitResponseTopic::default();
-                topic_response.name = TopicName(StrBytes::from_string(topic_name));
-                topic_response.partitions = error_partitions;
-                response_topics.push(topic_response);
-                continue;
-            }
-        };
-
-        let mut partition_responses = Vec::new();
-
-        // Process each partition offset commit
-        for partition in topic.partitions {
-            let partition_id = partition.partition_index;
-            let committed_offset = partition.committed_offset;
-            let metadata = partition.metadata.as_deref();
-
-            // Kafka refuses a commit for a partition the topic does not have.
-            if partition_id < 0 || partition_id >= partition_count {
-                let mut partition_response = OffsetCommitResponsePartition::default();
-                partition_response.partition_index = partition_id;
-                partition_response.error_code = ERROR_UNKNOWN_TOPIC_OR_PARTITION;
-                partition_responses.push(partition_response);
-                continue;
-            }
-
-            // Commit offset
-            let error_code = match store.commit_offset(
-                group_id,
-                topic_id,
-                partition_id,
-                committed_offset,
-                metadata,
-            ) {
-                Ok(()) => ERROR_NONE,
-                Err(e) => {
-                    // Use typed error's Kafka error code
-                    let code = e.to_kafka_error_code();
-                    if e.is_server_error() {
-                        crate::pg_warning!(
-                            "Failed to commit offset for group='{}', topic_id={}, partition={}: {}",
-                            group_id,
-                            topic_id,
-                            partition_id,
-                            e
-                        );
-                    }
-                    code
-                }
-            };
-
-            let mut partition_response = OffsetCommitResponsePartition::default();
-            partition_response.partition_index = partition_id;
-            partition_response.error_code = error_code;
-            partition_responses.push(partition_response);
+/// Commit one topic's offsets and answer for each of its partitions.
+fn commit_topic_offsets(
+    store: &dyn KafkaStore,
+    group_id: &str,
+    topic: OffsetCommitTopicData,
+) -> OffsetCommitResponseTopic {
+    let partitions = match resolve_topic(store, &topic.name) {
+        Ok(Some((topic_id, partition_count))) => topic
+            .partitions
+            .iter()
+            .map(|partition| {
+                let partition_id = partition.partition_index;
+                // Kafka refuses a commit for a partition the topic does not have.
+                let error_code = if partition_id < 0 || partition_id >= partition_count {
+                    ERROR_UNKNOWN_TOPIC_OR_PARTITION
+                } else {
+                    commit_partition_offset(store, group_id, topic_id, partition)
+                };
+                commit_partition(partition_id, error_code)
+            })
+            .collect(),
+        // A missing topic (or a failed lookup) is reported on every partition.
+        unresolved => {
+            let error_code = unresolved.err().unwrap_or(ERROR_UNKNOWN_TOPIC_OR_PARTITION);
+            topic
+                .partitions
+                .iter()
+                .map(|p| commit_partition(p.partition_index, error_code))
+                .collect()
         }
+    };
+    commit_topic(topic.name, partitions)
+}
 
-        let mut topic_response = OffsetCommitResponseTopic::default();
-        topic_response.name = TopicName(StrBytes::from_string(topic_name));
-        topic_response.partitions = partition_responses;
-        response_topics.push(topic_response);
+/// Store one partition's committed offset: the partition's error code.
+fn commit_partition_offset(
+    store: &dyn KafkaStore,
+    group_id: &str,
+    topic_id: i32,
+    partition: &OffsetCommitPartitionData,
+) -> i16 {
+    let partition_id = partition.partition_index;
+    match store.commit_offset(
+        group_id,
+        topic_id,
+        partition_id,
+        partition.committed_offset,
+        partition.metadata.as_deref(),
+    ) {
+        Ok(()) => ERROR_NONE,
+        Err(e) => {
+            if e.is_server_error() {
+                crate::pg_warning!(
+                    "Failed to commit offset for group='{}', topic_id={}, partition={}: {}",
+                    group_id,
+                    topic_id,
+                    partition_id,
+                    e
+                );
+            }
+            e.to_kafka_error_code()
+        }
     }
+}
 
-    // Build response
-    let mut kafka_response = OffsetCommitResponse::default();
-    kafka_response.throttle_time_ms = 0;
-    kafka_response.topics = response_topics;
+/// An OffsetCommit topic entry.
+fn commit_topic(
+    name: String,
+    partitions: Vec<OffsetCommitResponsePartition>,
+) -> OffsetCommitResponseTopic {
+    let mut topic = OffsetCommitResponseTopic::default();
+    topic.name = TopicName(StrBytes::from_string(name));
+    topic.partitions = partitions;
+    topic
+}
 
-    Ok(kafka_response)
+/// An OffsetCommit partition entry.
+fn commit_partition(partition_index: i32, error_code: i16) -> OffsetCommitResponsePartition {
+    let mut partition = OffsetCommitResponsePartition::default();
+    partition.partition_index = partition_index;
+    partition.error_code = error_code;
+    partition
 }
 
 /// Handle OffsetFetch request
