@@ -59,6 +59,42 @@ impl StickyStrategy {
             previous_assignments: previous,
         }
     }
+
+    /// Keep each remaining member's previous partitions that still exist, that it still
+    /// subscribes to and that no other member kept first; returns the kept partitions.
+    fn keep_previous_assignments(
+        &self,
+        input: &AssignmentInput,
+        all_partitions: &HashSet<(String, i32)>,
+        result: &mut AssignmentOutput,
+    ) -> HashSet<(String, i32)> {
+        let mut assigned = HashSet::new();
+        for (member_id, prev_assignment) in &self.previous_assignments {
+            // Departed members keep nothing.
+            let Some(subscription) = input.subscriptions.get(member_id) else {
+                continue;
+            };
+            for (topic, prev_partitions) in &prev_assignment.topic_partitions {
+                if !subscription.topics.contains(topic) {
+                    continue;
+                }
+                for &partition in prev_partitions {
+                    let key = (topic.clone(), partition);
+                    if all_partitions.contains(&key) && !assigned.contains(&key) {
+                        result
+                            .get_mut(member_id)
+                            .expect("every member is initialised in `result` before this step")
+                            .topic_partitions
+                            .entry(topic.clone())
+                            .or_default()
+                            .push(partition);
+                        assigned.insert(key);
+                    }
+                }
+            }
+        }
+        assigned
+    }
 }
 
 impl AssignmentStrategy for StickyStrategy {
@@ -100,80 +136,17 @@ impl AssignmentStrategy for StickyStrategy {
             }
         }
 
-        // Track which partitions have been assigned
-        let mut assigned: HashSet<(String, i32)> = HashSet::new();
-
         // Step 1: Preserve valid assignments from previous state
-        for (member_id, prev_assignment) in &self.previous_assignments {
-            // Skip departed members
-            if !input.subscriptions.contains_key(member_id) {
-                continue;
-            }
+        let assigned = self.keep_previous_assignments(input, &all_partitions, &mut result);
 
-            let subscription = &input.subscriptions[member_id];
-
-            for (topic, prev_partitions) in &prev_assignment.topic_partitions {
-                // Skip topics the member no longer subscribes to
-                if !subscription.topics.contains(topic) {
-                    continue;
-                }
-
-                // Keep valid partitions (still exist and not yet assigned)
-                for &partition in prev_partitions {
-                    let key = (topic.clone(), partition);
-                    if all_partitions.contains(&key) && !assigned.contains(&key) {
-                        result
-                            .get_mut(member_id)
-                            .expect("every member is initialised in `result` before this loop")
-                            .topic_partitions
-                            .entry(topic.clone())
-                            .or_default()
-                            .push(partition);
-                        assigned.insert(key);
-                    }
-                }
-            }
-        }
-
-        // Step 2: Collect orphaned partitions (not yet assigned)
+        // Step 2: Collect orphaned partitions (not yet assigned), sorted for a deterministic
+        // assignment order
         let mut orphaned: Vec<(String, i32)> =
             all_partitions.difference(&assigned).cloned().collect();
-
-        // Sort for deterministic assignment order
         orphaned.sort();
 
         // Step 3: Distribute orphaned partitions to members
-        // Assign to members with fewest partitions who subscribe to the topic
-        for (topic, partition) in orphaned {
-            // Find eligible members (subscribed to this topic)
-            let mut eligible: Vec<&String> = input
-                .subscriptions
-                .iter()
-                .filter(|(_, sub)| sub.topics.contains(&topic))
-                .map(|(id, _)| id)
-                .collect();
-
-            if eligible.is_empty() {
-                continue;
-            }
-
-            // Sort by current assignment count (ascending), then by member_id (for determinism)
-            eligible.sort_by(|a, b| {
-                let count_a = result[*a].partition_count();
-                let count_b = result[*b].partition_count();
-                count_a.cmp(&count_b).then_with(|| a.cmp(b))
-            });
-
-            // Assign to member with fewest partitions
-            let best_member = eligible[0];
-            result
-                .get_mut(best_member)
-                .expect("`best_member` came from `result`'s own keys")
-                .topic_partitions
-                .entry(topic)
-                .or_default()
-                .push(partition);
-        }
+        distribute_orphans(input, orphaned, &mut result);
 
         // Step 4: Balance: move partitions from overloaded members to underloaded ones. Sticky
         // preservation (Step 1) can leave a member holding far more partitions than a peer
@@ -188,6 +161,38 @@ impl AssignmentStrategy for StickyStrategy {
         }
 
         result
+    }
+}
+
+/// Give each orphaned partition (in order) to the subscribed member with the fewest
+/// partitions, ties broken by member id; a partition no member subscribes to stays
+/// unassigned.
+fn distribute_orphans(
+    input: &AssignmentInput,
+    orphaned: Vec<(String, i32)>,
+    result: &mut AssignmentOutput,
+) {
+    for (topic, partition) in orphaned {
+        let best_member = input
+            .subscriptions
+            .iter()
+            .filter(|(_, sub)| sub.topics.contains(&topic))
+            .map(|(id, _)| id)
+            .min_by(|a, b| {
+                let count_a = result[*a].partition_count();
+                let count_b = result[*b].partition_count();
+                count_a.cmp(&count_b).then_with(|| a.cmp(b))
+            });
+        let Some(best_member) = best_member else {
+            continue;
+        };
+        result
+            .get_mut(best_member)
+            .expect("`best_member` came from `result`'s own keys")
+            .topic_partitions
+            .entry(topic)
+            .or_default()
+            .push(partition);
     }
 }
 
