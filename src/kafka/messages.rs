@@ -412,7 +412,7 @@ mod tests {
 
     // ========== RB-1 barrier accessor tests ==========
 
-    /// RB-1: `swap_response_tx` must install the new sender on the request and
+    /// `swap_response_tx` must install the new sender on the request and
     /// hand back the original one. If the swap silently returned the wrong end,
     /// the worker's post-commit flush would deliver responses to the buffer
     /// instead of the client (hang) or vice versa (barrier bypassed).
@@ -449,7 +449,7 @@ mod tests {
         );
     }
 
-    /// RB-1: every non-deferred API gets the buffer installed by `swap_response_tx`.
+    /// Every non-deferred API gets the buffer installed by `swap_response_tx`.
     #[test]
     fn test_swap_response_tx_all_apis() {
         for info in crate::kafka::api::tests::worker_apis() {

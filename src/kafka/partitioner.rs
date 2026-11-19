@@ -54,7 +54,7 @@ mod tests {
 
     #[test]
     fn test_non_positive_partition_count_no_panic() {
-        // BUG-8: a degenerate partition_count must not panic (% 0 / gen_range(0..0) would).
+        // A degenerate partition_count must not panic (% 0 / gen_range(0..0) would).
         assert_eq!(compute_partition(Some(b"k"), 0, -1), 0);
         assert_eq!(compute_partition(None, 0, -1), 0);
         assert_eq!(compute_partition(Some(b"k"), -5, -1), 0);

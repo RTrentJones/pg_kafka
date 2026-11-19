@@ -239,7 +239,7 @@ mod tests {
         assert_eq!(metadata.min_version, 0);
         assert_eq!(metadata.max_version, 10);
 
-        // Verify InitProducerId entry (Phase 9)
+        // Verify InitProducerId entry
         let init_producer = response
             .api_keys
             .iter()
@@ -248,7 +248,7 @@ mod tests {
         assert_eq!(init_producer.min_version, 0);
         assert_eq!(init_producer.max_version, 4);
 
-        // Verify transaction APIs (Phase 10)
+        // Verify transaction APIs
         let add_partitions = response
             .api_keys
             .iter()
