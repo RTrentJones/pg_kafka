@@ -188,6 +188,25 @@ mod tests {
     /// issuing SQL from the background worker.
     const WORKER_SQL_SOURCES: &[(&str, &str)] = &[
         ("storage/postgres.rs", include_str!("postgres.rs")),
+        ("storage/postgres/log.rs", include_str!("postgres/log.rs")),
+        (
+            "storage/postgres/maintenance.rs",
+            include_str!("postgres/maintenance.rs"),
+        ),
+        ("storage/postgres/offsets.rs", include_str!("postgres/offsets.rs")),
+        (
+            "storage/postgres/producers.rs",
+            include_str!("postgres/producers.rs"),
+        ),
+        ("storage/postgres/topics.rs", include_str!("postgres/topics.rs")),
+        (
+            "storage/postgres/transactions.rs",
+            include_str!("postgres/transactions.rs"),
+        ),
+        (
+            "storage/postgres/worker_role.rs",
+            include_str!("postgres/worker_role.rs"),
+        ),
         ("shadow/store.rs", include_str!("../shadow/store.rs")),
         ("shadow/outbox.rs", include_str!("../shadow/outbox.rs")),
         ("metrics.rs", include_str!("../metrics.rs")),
