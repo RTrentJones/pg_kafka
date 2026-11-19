@@ -8,8 +8,8 @@ use super::{internal, internal_unless, PostgresStore};
 use crate::kafka::constants::ERROR_INVALID_PRODUCER_EPOCH;
 use crate::kafka::error::{KafkaError, Result};
 use crate::kafka::storage::{
-    validate_sequence, CachedBatch, ProducerBatch, SequenceCheck, SequenceValidation,
-    PRODUCER_BATCH_CACHE,
+    stored_last_sequence, transactional_epoch_is_stale, validate_sequence, CachedBatch,
+    ProducerBatch, SequenceCheck, SequenceValidation, PRODUCER_BATCH_CACHE,
 };
 use pgrx::prelude::*;
 use pgrx::spi::{SpiClient, SpiError};
@@ -122,6 +122,140 @@ fn upsert_last_sequence(
     Ok(())
 }
 
+/// The batch an idempotent Produce asks to append, as far as the sequence check needs it.
+struct IdempotentBatch {
+    producer_id: i64,
+    producer_epoch: i16,
+    topic_id: i32,
+    partition_id: i32,
+    base_sequence: i32,
+}
+
+/// A producer's stored epoch and whether it belongs to a transactional id.
+struct ProducerState {
+    epoch: i16,
+    transactional: bool,
+}
+
+/// A producer's sequence state on one partition at its current epoch: the last
+/// sequence and the remembered batches (every epoch change deletes both).
+struct PartitionSequenceState {
+    last_sequence: Option<i32>,
+    cached: Vec<CachedBatch>,
+}
+
+/// Read a producer's [`ProducerState`]; UNKNOWN_PRODUCER_ID when it has none.
+fn read_producer_state(client: &SpiClient<'_>, producer_id: i64) -> Result<ProducerState> {
+    let table = client.select(
+        "SELECT epoch, transactional_id IS NOT NULL AS transactional
+         FROM kafka.producer_ids
+         WHERE producer_id = $1",
+        Some(1),
+        &[producer_id.into()],
+    )?;
+    if table.is_empty() {
+        return Err(KafkaError::unknown_producer_id(producer_id));
+    }
+    let row = table.first();
+    Ok(ProducerState {
+        epoch: row.get_by_name("epoch")?.unwrap_or(0),
+        transactional: row.get_by_name("transactional")?.unwrap_or(false),
+    })
+}
+
+/// Read the batch's producer [`PartitionSequenceState`] on its partition.
+fn read_partition_sequence_state(
+    client: &SpiClient<'_>,
+    batch: &IdempotentBatch,
+) -> Result<PartitionSequenceState> {
+    let args = [
+        batch.producer_id.into(),
+        batch.topic_id.into(),
+        batch.partition_id.into(),
+    ];
+    let seq_table = client.select(
+        "SELECT last_sequence FROM kafka.producer_sequences
+         WHERE producer_id = $1 AND topic_id = $2 AND partition_id = $3",
+        Some(1),
+        &args,
+    )?;
+    let last_sequence = if seq_table.is_empty() {
+        None
+    } else {
+        stored_last_sequence(seq_table.first().get_by_name::<i32, _>("last_sequence")?)
+    };
+    let batch_table = client.select(
+        "SELECT first_sequence, last_sequence, base_offset FROM kafka.producer_batches
+         WHERE producer_id = $1 AND topic_id = $2 AND partition_id = $3",
+        None,
+        &args,
+    )?;
+    let mut cached = Vec::new();
+    for row in batch_table {
+        cached.push(CachedBatch {
+            first_sequence: row.get_by_name("first_sequence")?.unwrap_or(-1),
+            last_sequence: row.get_by_name("last_sequence")?.unwrap_or(-1),
+            base_offset: row.get_by_name("base_offset")?.unwrap_or(-1),
+        });
+    }
+    Ok(PartitionSequenceState {
+        last_sequence,
+        cached,
+    })
+}
+
+/// Act on a [`validate_sequence`] outcome: the produce path's [`SequenceCheck`], the
+/// error Kafka answers, or, for a client-bumped epoch, adopting that epoch first.
+fn apply_sequence_validation(
+    client: &mut SpiClient<'_>,
+    batch: &IdempotentBatch,
+    validation: SequenceValidation,
+) -> Result<SequenceCheck> {
+    let IdempotentBatch {
+        producer_id,
+        producer_epoch,
+        partition_id,
+        base_sequence,
+        ..
+    } = *batch;
+    match validation {
+        SequenceValidation::Duplicate { base_offset } => {
+            crate::pg_debug!(
+                "Duplicate batch: producer_id={producer_id}, partition_id={partition_id}, base_sequence={base_sequence}, original base_offset={base_offset}"
+            );
+            Ok(SequenceCheck::Duplicate { base_offset })
+        }
+        SequenceValidation::OutOfOrder { expected_sequence } => {
+            Err(KafkaError::out_of_order_sequence(
+                producer_id,
+                partition_id,
+                base_sequence,
+                expected_sequence,
+            ))
+        }
+        SequenceValidation::StaleEpoch { current_epoch } => Err(invalid_producer_epoch(
+            producer_id,
+            producer_epoch,
+            current_epoch,
+        )),
+        SequenceValidation::Proceed { new_epoch, .. } => {
+            if new_epoch {
+                // KIP-360: an idempotent producer bumped its own epoch (the Java
+                // client does after an unresolved sequence error). Adopt it, and
+                // drop the old epoch's sequence state on every partition.
+                client.update(
+                    "UPDATE kafka.producer_ids SET epoch = $2, last_active_at = NOW()
+                     WHERE producer_id = $1 AND epoch < $2",
+                    None,
+                    &[producer_id.into(), producer_epoch.into()],
+                )?;
+                clear_producer_sequences(client, producer_id)?;
+            }
+            Ok(SequenceCheck::Append)
+        }
+    }
+}
+
 impl PostgresStore {
     pub(super) fn allocate_producer_id(
         client_id: Option<&str>,
@@ -150,26 +284,23 @@ impl PostgresStore {
         crate::pg_debug!(
             "PostgresStore::check_and_update_sequence: producer_id={producer_id}, epoch={producer_epoch}, topic_id={topic_id}, partition_id={partition_id}, base_seq={base_sequence}, count={record_count}"
         );
+        let batch = IdempotentBatch {
+            producer_id,
+            producer_epoch,
+            topic_id,
+            partition_id,
+            base_sequence,
+        };
 
         Spi::connect_mut(|client| {
-            let epoch_table = client.select(
-                "SELECT epoch, transactional_id IS NOT NULL AS transactional
-                 FROM kafka.producer_ids
-                 WHERE producer_id = $1",
-                Some(1),
-                &[producer_id.into()],
-            )?;
-            if epoch_table.is_empty() {
-                return Err(KafkaError::unknown_producer_id(producer_id));
-            }
-            let row = epoch_table.first();
-            let current_epoch: i16 = row.get_by_name("epoch")?.unwrap_or(0);
-            let transactional: bool = row.get_by_name("transactional")?.unwrap_or(false);
-
-            // A transactional producer's epoch is owned by its transactional id
-            // (InitProducerId); it never bumps it itself, so any other epoch is stale.
-            if transactional && producer_epoch != current_epoch {
-                return Err(invalid_producer_epoch(producer_id, producer_epoch, current_epoch));
+            let producer = read_producer_state(client, producer_id)?;
+            if transactional_epoch_is_stale(producer.transactional, producer_epoch, producer.epoch)
+            {
+                return Err(invalid_producer_epoch(
+                    producer_id,
+                    producer_epoch,
+                    producer.epoch,
+                ));
             }
 
             client.select(
@@ -177,83 +308,19 @@ impl PostgresStore {
                 None,
                 &[sequence_lock_key(producer_id, topic_id, partition_id).into()],
             )?;
-
-            // The partition's producer state at the current epoch: the last sequence and
-            // the remembered batches (every epoch change deletes both).
-            let seq_table = client.select(
-                "SELECT last_sequence FROM kafka.producer_sequences
-                 WHERE producer_id = $1 AND topic_id = $2 AND partition_id = $3",
-                Some(1),
-                &[producer_id.into(), topic_id.into(), partition_id.into()],
-            )?;
-            let last_sequence: Option<i32> = if seq_table.is_empty() {
-                None
-            } else {
-                seq_table
-                    .first()
-                    .get_by_name::<i32, _>("last_sequence")?
-                    .filter(|s| *s >= 0)
-            };
-            let batch_table = client.select(
-                "SELECT first_sequence, last_sequence, base_offset FROM kafka.producer_batches
-                 WHERE producer_id = $1 AND topic_id = $2 AND partition_id = $3",
-                None,
-                &[producer_id.into(), topic_id.into(), partition_id.into()],
-            )?;
-            let mut cached = Vec::new();
-            for row in batch_table {
-                cached.push(CachedBatch {
-                    first_sequence: row.get_by_name("first_sequence")?.unwrap_or(-1),
-                    last_sequence: row.get_by_name("last_sequence")?.unwrap_or(-1),
-                    base_offset: row.get_by_name("base_offset")?.unwrap_or(-1),
-                });
-            }
+            let partition = read_partition_sequence_state(client, &batch)?;
 
             // RV-8: nothing is advanced here; record_producer_batch persists the batch
             // only after a successful insert.
-            match validate_sequence(
-                current_epoch,
-                last_sequence,
-                &cached,
+            let validation = validate_sequence(
+                producer.epoch,
+                partition.last_sequence,
+                &partition.cached,
                 producer_epoch,
                 base_sequence,
                 record_count,
-            ) {
-                SequenceValidation::Duplicate { base_offset } => {
-                    crate::pg_debug!(
-                        "Duplicate batch: producer_id={producer_id}, partition_id={partition_id}, base_sequence={base_sequence}, original base_offset={base_offset}"
-                    );
-                    Ok(SequenceCheck::Duplicate { base_offset })
-                }
-                SequenceValidation::OutOfOrder { expected_sequence } => {
-                    Err(KafkaError::out_of_order_sequence(
-                        producer_id,
-                        partition_id,
-                        base_sequence,
-                        expected_sequence,
-                    ))
-                }
-                SequenceValidation::StaleEpoch { current_epoch } => Err(invalid_producer_epoch(
-                    producer_id,
-                    producer_epoch,
-                    current_epoch,
-                )),
-                SequenceValidation::Proceed { new_epoch, .. } => {
-                    if new_epoch {
-                        // KIP-360: an idempotent producer bumped its own epoch (the Java
-                        // client does after an unresolved sequence error). Adopt it, and
-                        // drop the old epoch's sequence state on every partition.
-                        client.update(
-                            "UPDATE kafka.producer_ids SET epoch = $2, last_active_at = NOW()
-                             WHERE producer_id = $1 AND epoch < $2",
-                            None,
-                            &[producer_id.into(), producer_epoch.into()],
-                        )?;
-                        clear_producer_sequences(client, producer_id)?;
-                    }
-                    Ok(SequenceCheck::Append)
-                }
-            }
+            );
+            apply_sequence_validation(client, &batch, validation)
         })
         .map_err(internal_unless("check_and_update_sequence", |e| {
             matches!(
