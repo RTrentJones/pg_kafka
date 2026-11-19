@@ -11,8 +11,8 @@ use rdkafka::producer::FutureProducer;
 use std::time::Duration;
 
 /// SEC-8: the external-Kafka SASL password GUC must be readable only by superusers, so an
-/// ordinary DB role cannot read the cleartext credential via `SHOW`. The fix locks it down with
-/// `SUPERUSER_ONLY | NO_SHOW_ALL` (mirroring the license-key GUC).
+/// ordinary DB role cannot read the cleartext credential via `SHOW` (`SUPERUSER_ONLY |
+/// NO_SHOW_ALL`, like the license-key GUC).
 pub async fn test_sasl_password_guc_is_superuser_only() -> TestResult {
     println!("=== Test: shadow_sasl_password GUC is superuser-only (SEC-8) ===\n");
     let ctx = TestContext::new().await?;
@@ -48,9 +48,8 @@ pub async fn test_sasl_password_guc_is_superuser_only() -> TestResult {
     }
     println!("✅ a non-superuser cannot read the SASL password GUC");
 
-    // DR-21 (DEEP-REVIEW-2026-07): the USERNAME must have the same lockdown — it
-    // identifies the external-broker principal, and before DR-21 it was visible
-    // in pg_settings to every role while the password was superuser-only.
+    // The USERNAME has the same lockdown: it identifies the external-broker principal
+    // (DR-21, DEEP-REVIEW-2026-07).
     db.simple_query("SET ROLE sec8_unpriv_probe").await?;
     let unpriv_user_read = db.simple_query("SHOW pg_kafka.shadow_sasl_username").await;
     db.simple_query("RESET ROLE").await?;

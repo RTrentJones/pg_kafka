@@ -4,6 +4,7 @@
 //! These tests verify that pg_kafka returns appropriate error codes
 //! when given invalid inputs.
 
+mod api_errors;
 mod bug_hunt;
 mod consumer_errors;
 mod coordinator_errors;
@@ -16,8 +17,6 @@ mod offset_errors;
 mod producer_errors;
 mod review_regressions;
 mod storage_tests;
-// Stream `api`: typed error responses for every request failure after a valid header.
-mod api_errors;
 
 /// The `error_paths` tests, in run order.
 pub fn tests() -> Vec<crate::registry::TestDef> {

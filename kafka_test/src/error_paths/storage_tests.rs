@@ -1,8 +1,8 @@
-//! Regression tests for the `storage` workstream: retention catch-up, single-statement
+//! Storage behaviour seen through the broker: retention catch-up, single-statement
 //! fetch bounds, the request-level Fetch `max_bytes`, batched topic metadata, and the
 //! least-privilege worker role.
 //!
-//! The changed code lives in `storage/postgres.rs` (SPI) and the worker's role switch,
+//! The code under test lives in `storage/postgres.rs` (SPI) and the worker's role switch,
 //! which unit coverage cannot see, so each test drives the broker or the SQL entry point
 //! and checks the stored state.
 
@@ -43,8 +43,8 @@ async fn create_topic_sql(
 /// single 10,000-row batch per pass (which let the table grow without bound above
 /// ~167 records/s), and must still advance the partition's durable log start.
 ///
-/// Fails before the fix: one `pg_kafka_run_retention_sweep()` call left 15,000 of the
-/// 25,000 expired rows behind.
+/// One `pg_kafka_run_retention_sweep()` call must not leave expired rows behind (a
+/// sweep bounded to one batch would leave 15,000 of the 25,000).
 pub async fn test_retention_sweep_catches_up_on_backlog() -> TestResult {
     println!("=== Test: Retention Sweep Catches Up On A Backlog ===\n");
 
@@ -223,8 +223,8 @@ pub async fn test_fetch_bounds_from_single_statement() -> TestResult {
 /// has returned data the budget is spent, so the second partition reports its bounds
 /// but no records. With a large `max_bytes` both partitions return records.
 ///
-/// Fails before the fix: only `partition_max_bytes` was used, so both partitions
-/// returned records even with `max_bytes = 1`.
+/// A fetch that honoured only `partition_max_bytes` would return records from both
+/// partitions even with `max_bytes = 1`.
 pub async fn test_fetch_honours_request_max_bytes() -> TestResult {
     println!("=== Test: Fetch Honours Request-Level max_bytes ===\n");
 
@@ -315,7 +315,7 @@ async fn produce_once(topic: &str, timeout_ms: u32) -> Result<(), String> {
         .map_err(|(e, _)| e.to_string())
 }
 
-/// 0.1.0 privileges: the kafka schema is no longer readable by PUBLIC (a fresh role
+/// 0.1.0 privileges: the kafka schema is not readable by PUBLIC (a fresh role
 /// is denied, and can read once granted `pgkafka_reader`), and the background worker
 /// really runs as `pgkafka_worker`: with that role's INSERT on kafka.topics revoked,
 /// auto-creating a topic fails; once re-granted, it succeeds.

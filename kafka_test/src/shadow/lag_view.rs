@@ -1,22 +1,20 @@
-//! Wave 3 stream `shadow`: shadow-mode checks that need no external Kafka, so
-//! they run in the functional suite (category `w3_shadow`).
+//! The shadow lag views, checked without an external Kafka.
 
 use crate::common::TestResult;
 use crate::setup::TestContext;
 
 /// kafka.shadow_partition_status / kafka.shadow_status report lag per
 /// partition: the number of outbox rows still to forward (exact under
-/// sampling, 0 when caught up), dead letters separately. The old
-/// shadow_status.lag was MAX(offset) - MAX(last_forwarded_offset) across all
-/// partitions of the topic.
+/// sampling, 0 when caught up), dead letters separately, not a difference of
+/// offsets across the topic's partitions.
 ///
 /// The outbox rows are written by hand for offsets that have no message, so the
 /// worker's outbox poll (which only claims rows whose message exists) leaves
 /// them alone even when shadow mode is on.
 pub async fn test_shadow_lag_view_is_per_partition() -> TestResult {
-    println!("=== Test: shadow lag view is per partition (wave 3) ===\n");
+    println!("=== Test: shadow lag view is per partition ===\n");
     let ctx = TestContext::new().await?;
-    let topic = ctx.unique_topic("w3-lag").await;
+    let topic = ctx.unique_topic("shadow-lag").await;
     let db = ctx.db();
     let topic_id: i32 = db
         .query_one(

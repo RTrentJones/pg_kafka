@@ -1,4 +1,4 @@
-//! w3_net tests that run against the default configuration.
+//! Hostile clients against the listener in its default configuration.
 
 use super::*;
 use crate::error_codes;
@@ -77,14 +77,13 @@ async fn produce_ok(
     Ok(p.base_offset)
 }
 
-/// Item 1: six connections that each send only a 4-byte length prefix (99 MB, 37 MB)
-/// used to hold the whole 512 MiB frame budget: every other client, even a 20-byte
-/// ApiVersions, was refused until they went away. Now only bytes actually received are
-/// charged, and small frames never are.
+/// Six connections that each send only a 4-byte length prefix (99 MB, 37 MB) must not
+/// hold the whole 512 MiB frame budget and lock every other client out: only bytes
+/// actually received are charged, and small frames never are.
 pub async fn test_partial_frames_cannot_exhaust_the_frame_budget() -> TestResult {
-    println!("=== Test: w3_net frame-budget lockout ===\n");
+    println!("=== Test: frame-budget lockout ===\n");
     let ctx = TestContext::new().await?;
-    let topic = ctx.unique_topic("w3-net-budget").await;
+    let topic = ctx.unique_topic("net-budget").await;
     let attacker = Ipv4Addr::new(127, 0, 0, 2);
 
     let mut hogs = Vec::new();
@@ -130,14 +129,13 @@ pub async fn test_partial_frames_cannot_exhaust_the_frame_budget() -> TestResult
     Ok(())
 }
 
-/// Item 2: a response above the 100 MB inbound request limit used to fail to encode
-/// (LengthDelimitedCodec caps outbound frames too) and the connection hung: the client
-/// never got an answer, and nothing else on the connection was answered either. A
+/// A response above the 100 MB inbound request limit is delivered (the outbound codec
+/// does not apply the inbound cap; a refused encode would hang the connection). A
 /// response is bounded by the request's max_bytes, as in Kafka.
 pub async fn test_response_larger_than_the_request_limit_is_delivered() -> TestResult {
-    println!("=== Test: w3_net >100 MB fetch response ===\n");
+    println!("=== Test: >100 MB fetch response ===\n");
     let ctx = TestContext::new().await?;
-    let topic = ctx.unique_topic("w3-net-big").await;
+    let topic = ctx.unique_topic("net-big").await;
     let mut s = TcpStream::connect(("127.0.0.1", PORT)).await?;
     let created: CreateTopicsResponse =
         crate::wire::roundtrip(&mut s, 2, 1, &create_topic_request(&topic, 2)).await?;
@@ -181,10 +179,10 @@ pub async fn test_response_larger_than_the_request_limit_is_delivered() -> TestR
     Ok(())
 }
 
-/// Item 3: without TCP_NODELAY the second of two pipelined responses waits for the
+/// Without TCP_NODELAY the second of two pipelined responses waits for the
 /// client's delayed ACK (~40 ms on Linux).
 pub async fn test_pipelined_requests_are_not_delayed_by_nagle() -> TestResult {
-    println!("=== Test: w3_net TCP_NODELAY ===\n");
+    println!("=== Test: TCP_NODELAY ===\n");
     let mut s = TcpStream::connect(("127.0.0.1", PORT)).await?;
     s.set_nodelay(true)?;
     let mut times = Vec::new();
@@ -213,19 +211,19 @@ pub async fn test_pipelined_requests_are_not_delayed_by_nagle() -> TestResult {
 
     // A real client: 50 sequential acks=1 produces.
     let ctx = TestContext::new().await?;
-    let topic = ctx.unique_topic("w3-net-nodelay").await;
+    let topic = ctx.unique_topic("net-nodelay").await;
     rdkafka_roundtrip(client_config(PORT), &topic, 50).await?;
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");
     Ok(())
 }
 
-/// Item 4: Kafka closes the connection when an acks=0 produce hits any partition error
+/// Kafka closes the connection when an acks=0 produce hits any partition error
 /// (after the good partitions are written), so the client refreshes its metadata.
 pub async fn test_acks0_produce_error_closes_connection() -> TestResult {
-    println!("=== Test: w3_net acks=0 error closes the connection ===\n");
+    println!("=== Test: acks=0 error closes the connection ===\n");
     let ctx = TestContext::new().await?;
-    let topic = ctx.unique_topic("w3-net-acks0").await;
+    let topic = ctx.unique_topic("net-acks0").await;
     let mut s = TcpStream::connect(("127.0.0.1", PORT)).await?;
     produce_ok(&mut s, 1, &topic, b"seed").await?;
 
@@ -317,12 +315,12 @@ pub async fn test_acks0_produce_error_closes_connection() -> TestResult {
     Ok(())
 }
 
-/// Item 5: acks other than -1, 0, 1 are answered INVALID_REQUIRED_ACKS and nothing is
+/// Acks other than -1, 0, 1 are answered INVALID_REQUIRED_ACKS and nothing is
 /// written.
 pub async fn test_invalid_acks_rejected_and_nothing_written() -> TestResult {
-    println!("=== Test: w3_net invalid acks ===\n");
+    println!("=== Test: invalid acks ===\n");
     let ctx = TestContext::new().await?;
-    let topic = ctx.unique_topic("w3-net-acks").await;
+    let topic = ctx.unique_topic("net-acks").await;
     let mut s = TcpStream::connect(("127.0.0.1", PORT)).await?;
     for (i, acks) in [2i16, -2, 5, i16::MAX].into_iter().enumerate() {
         let req = produce_request(
@@ -366,13 +364,13 @@ pub async fn test_invalid_acks_rejected_and_nothing_written() -> TestResult {
     Ok(())
 }
 
-/// Item 6: Kafka reads a connection serially, so a request before the frame that closes
-/// the connection is always answered. The listener used to give the writer 100 ms and
-/// then abort it, dropping e.g. a long-poll fetch's response.
+/// Kafka reads a connection serially, so a request before the frame that closes the
+/// connection is always answered: the writer is not cut off after a grace period, which
+/// would drop e.g. a long-poll fetch's response.
 pub async fn test_request_before_closing_frame_is_answered() -> TestResult {
-    println!("=== Test: w3_net responses before close ===\n");
+    println!("=== Test: responses before close ===\n");
     let ctx = TestContext::new().await?;
-    let topic = ctx.unique_topic("w3-net-close").await;
+    let topic = ctx.unique_topic("net-close").await;
     let mut s = TcpStream::connect(("127.0.0.1", PORT)).await?;
     produce_ok(&mut s, 1, &topic, b"seed").await?;
 

@@ -1,10 +1,9 @@
 //! Sync-mode forwarding happens only after the local commit.
 //!
-//! A sync-mode produce used to send its records to the external broker from
-//! inside the request's transaction, before the commit. If the request then
-//! rolled back, the external broker kept a copy of records pg_kafka never
-//! stored. The forward now runs after the commit (`forward_sync_after_commit`),
-//! and only for rows whose writing subtransaction committed.
+//! A sync-mode forward runs after the commit (`forward_sync_after_commit`), and only
+//! for rows whose writing subtransaction committed: forwarded from inside the
+//! request's transaction, a request that then rolled back would leave the external
+//! broker a copy of records pg_kafka never stored.
 
 use super::external_client::{consume_from_external, verify_external_kafka_ready};
 use super::helpers::{enable_shadow_mode, ShadowMode, ShadowTopicConfig, SyncMode, WriteMode};
@@ -47,9 +46,7 @@ async fn local_count(ctx: &TestContext, topic: &str) -> Result<i64, Box<dyn std:
 ///
 /// One raw Produce writes partition 0 (fine) and then partition 1, where a test
 /// trigger on `kafka.messages` raises an ERROR. The ERROR rolls the whole
-/// request back, including partition 0. Before the fix partition 0's record had
-/// already been forwarded inside the request (sync mode), so it reached the
-/// external broker; now nothing does. A second, clean produce to partition 0
+/// request back, including partition 0, and nothing reaches the external broker. A second, clean produce to partition 0
 /// checks that sync forwarding still delivers after commit.
 pub async fn test_sync_forward_skips_rolled_back_request() -> TestResult {
     println!("=== Test: Sync Forward Skips A Rolled-Back Request ===\n");

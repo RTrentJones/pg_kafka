@@ -6,20 +6,15 @@ use crate::worker::*;
 use rdkafka::producer::Producer;
 use std::time::{Duration, Instant};
 
-// -------------------------------------------------------------------------------------
-// Item 4: partition-maintenance races.
-// -------------------------------------------------------------------------------------
-
-/// (a) Before: the maintenance move (DELETE from kafka.messages_default + INSERT into
-/// the new leaf) ran concurrently with EndTxn's `UPDATE kafka.messages SET txn_state`;
-/// the UPDATE waited on the deleted rows, skipped them once the move committed and never
-/// saw their copies, so a committed transaction's rows stayed `pending` forever (and the
-/// LSO stuck). Now the move takes the pg_kafka schema lock exclusively and every worker
+/// The maintenance move (DELETE from kafka.messages_default + INSERT into the new leaf)
+/// must not run concurrently with EndTxn's `UPDATE kafka.messages SET txn_state`: the
+/// UPDATE would wait on the deleted rows, skip them once the move commits and never see
+/// their copies, leaving a committed transaction's rows `pending` forever (and the LSO
+/// stuck). The move takes the pg_kafka schema lock exclusively and every worker
 /// transaction takes it shared first, so they never overlap.
 ///
 /// Asserts: while a session holds the schema lock in SHARE mode, maintenance does not
-/// move rows out of DEFAULT (before: it moved them regardless of open worker
-/// transactions); and with pending rows backdated into the DEFAULT leaf, an open session
+/// move rows out of DEFAULT; and with pending rows backdated into the DEFAULT leaf, an open session
 /// that has just moved them (maintenance, uncommitted), a commit_transaction that arrives meanwhile:
 /// after the session commits, the commit succeeds, no row of the transaction is left
 /// pending and a read_committed consumer reads all of them.
@@ -178,13 +173,11 @@ async fn end_txn_during_move() -> SendResult<()> {
     Ok(())
 }
 
-/// (b) ensure_message_partitions took its advisory lock with no timeout, so a session
-/// that had called maintenance and stayed open stalled the next pass (the worker's
-/// included) indefinitely. (c) drop_message_partition's advisory lock was outside its
-/// lock_not_available handler: a 2 s timeout ERRORed and rolled back the whole sweep.
-/// (d) when a concurrent sweep dropped the same leaf first, the waiter errored on the
-/// vanished OID. Now all lock waits are bounded and handled, and a vanished leaf is
-/// "not dropped", not an error.
+/// Every lock wait of the partition functions is bounded and handled: a session that
+/// called maintenance and stays open must not stall the next pass (the worker's
+/// included); a lock timeout in drop_message_partition must not roll back the whole
+/// sweep; and a leaf a concurrent sweep dropped first is "not dropped", not an error on
+/// its vanished OID.
 ///
 /// Asserts: with the maintenance advisory lock held by another session, manual
 /// maintenance returns within 6 s, `drop_message_partition` returns dropped=false
@@ -255,7 +248,7 @@ async fn maintenance_lock_waits() -> SendResult<()> {
     other.batch_execute("ROLLBACK").await.map_err(boxed)?;
     result?;
 
-    // (d) another session drops the leaf; ours waits, then finds it gone.
+    // Another session drops the leaf; ours waits, then finds it gone.
     other.batch_execute("BEGIN").await.map_err(boxed)?;
     let first: bool = other
         .query_one(

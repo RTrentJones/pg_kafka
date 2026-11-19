@@ -1,6 +1,7 @@
-//! Wave 3, stream `worker`: worker lifecycle, locking, maintenance races and robustness.
+//! The `worker` category (worker lifecycle and robustness) and the helpers it shares with
+//! the `part`, `concurrent` and `long_poll` tests that drive the worker the same way.
 //!
-//! Every test here is `parallel_safe: false`: they change GUCs, hold locks on broker
+//! Every such test is sequential: they change GUCs, hold locks on broker
 //! tables, terminate the listener worker, or DROP/CREATE the extension.
 //!
 //! Shared requirements (like the `auth` category): the test process runs on the
@@ -51,7 +52,7 @@ pub async fn wait_for_serving_listener(
     loop {
         if let Some(pid) = listener_pid(db).await? {
             if Some(pid) != not {
-                let topic = format!("w3-worker-probe-{}", std::process::id());
+                let topic = format!("worker-probe-{}", std::process::id());
                 let ok = producer
                     .send(
                         FutureRecord::<(), _>::to(&topic)
@@ -214,7 +215,7 @@ pub(crate) fn unique(base: &str) -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!("w3-worker-{}-{}", base, nanos % 1_000_000_000_000)
+    format!("worker-{}-{}", base, nanos % 1_000_000_000_000)
 }
 
 pub(crate) async fn send(producer: &FutureProducer, topic: &str, value: &str) -> SendResult<i64> {
@@ -274,10 +275,6 @@ pub(crate) async fn read_values(
     }
     Ok(out)
 }
-
-// -------------------------------------------------------------------------------------
-// Item 3: SIGTERM interrupts a lock wait; lock_timeout bounds a stuck lock.
-// -------------------------------------------------------------------------------------
 
 /// Hold the counter row of partition 0 of `topic` (FOR UPDATE) in an open transaction
 /// on `holder`: a Produce to that partition then waits on the row lock.

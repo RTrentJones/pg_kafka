@@ -119,7 +119,7 @@ async fn run_no_duplicates_check(topic: String) -> Result<(), String> {
     }
 
     // The attempt accounting must agree: no row was re-claimed (a re-claim of an
-    // in-flight row would count as a lost attempt) and none failed. Wave 3:
+    // in-flight row would count as a lost attempt) and none failed:
     // retry_count counts failed attempts, not claims, so a clean run is 0.
     let claims: i64 = db
         .query_one(

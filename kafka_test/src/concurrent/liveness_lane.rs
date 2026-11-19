@@ -1,16 +1,14 @@
-//! DR-12 (DEEP-REVIEW-2026-07): heartbeat liveness-lane test.
+//! Heartbeat liveness lane (DR-12, DEEP-REVIEW-2026-07).
 //!
-//! Before DR-12 every request shared one FIFO channel into the single DB
-//! thread, so a Heartbeat queued behind a backlog of heavy Produce work waited
-//! for the whole queue — and under sustained DB pressure that cascades into
-//! spurious consumer-group rebalances. Heartbeats now travel on a dedicated
-//! liveness lane the worker drains before each main-lane request.
+//! Heartbeats travel on a dedicated liveness lane the worker drains before each
+//! main-lane request. On one FIFO channel into the single DB thread a Heartbeat
+//! queued behind a backlog of heavy Produce work would wait for the whole queue,
+//! and under sustained DB pressure that cascades into spurious consumer-group
+//! rebalances.
 //!
-//! Fail-before/pass-after: this test floods the main lane with large pipelined
-//! Produce requests from one connection, then sends a Heartbeat on a second
-//! connection mid-flood and asserts it answers long before the flood drains.
-//! Pre-DR-12 the heartbeat's response arrives only after the produce backlog
-//! ahead of it, tripping the latency assertion.
+//! The test floods the main lane with large pipelined Produce requests from one
+//! connection, then sends a Heartbeat on a second connection mid-flood and asserts
+//! it answers long before the flood drains.
 
 use crate::common::TestResult;
 use crate::wire::requests::sequenced_produce_request;
@@ -80,8 +78,8 @@ pub async fn test_heartbeat_bypasses_produce_backlog() -> TestResult {
     //    heartbeat takes the same lane as a valid one. A heartbeat can
     //    legitimately wait behind the ONE request currently executing (which can
     //    be slow if it hits a checkpoint/WAL stall), so probe several times and
-    //    judge the fastest: pre-DR-12 every probe waits for the whole remaining
-    //    queue, so even the minimum stays large.
+    //    judge the fastest: on a shared lane every probe waits for the whole
+    //    remaining queue, so even the minimum stays large.
     tokio::time::sleep(Duration::from_millis(150)).await;
     println!("Step 2: Sending heartbeat probes mid-flood...");
     let mut hb_stream = TcpStream::connect(&bootstrap).await?;

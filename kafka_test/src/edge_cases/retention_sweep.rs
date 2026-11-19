@@ -1,8 +1,6 @@
 //! E2E tests for the storage-lifecycle retention sweep (DR-1/DR-2, DEEP-REVIEW-2026-07).
 //!
-//! Fail-before/pass-after: before the fix, `pg_kafka_run_retention_sweep()` did not
-//! exist (and `cleanup_aborted_messages` had no production caller), so these tests
-//! fail on the pre-fix extension. The SQL function runs the exact sweep the worker
+//! The SQL function `pg_kafka_run_retention_sweep()` runs the exact sweep the worker
 //! runs every RETENTION_SWEEP_INTERVAL, so exercising it exercises the production
 //! path without waiting out the interval.
 //!

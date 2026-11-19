@@ -258,7 +258,7 @@ pub async fn test_create_partitions_cannot_decrease() -> TestResult {
 /// Test deleting an empty consumer group
 pub async fn test_delete_group_empty() -> TestResult {
     let admin = create_admin_client()?;
-    // wave3 groups: a group that never existed (no members, no committed offsets) is
+    // A group that never existed (no members, no committed offsets) is
     // GROUP_ID_NOT_FOUND, as Kafka answers; an Empty group with offsets is deleted.
     let group_id = format!("test-delete-group-{}", Uuid::new_v4());
 
@@ -369,7 +369,7 @@ pub async fn test_delete_group_non_empty() -> TestResult {
 
 /// Test that a group can be deleted after its members cleanly leave.
 ///
-/// Regression: modern clients (kafkajs / Sarama / librdkafka) send LeaveGroup v3+ with the leaving
+/// Modern clients (kafkajs / Sarama / librdkafka) send LeaveGroup v3+ with the leaving
 /// members batched in a `members` array and an empty top-level member_id. pg_kafka must remove each
 /// so the group becomes Empty and DeleteGroups succeeds — otherwise it keeps returning
 /// NON_EMPTY_GROUP long after a clean leave.
@@ -566,7 +566,7 @@ pub async fn test_delete_group_idempotent() -> TestResult {
     let opts = AdminOptions::new().operation_timeout(Some(Duration::from_secs(5)));
 
     // Deleting the same non-existent group repeatedly always gives the same answer:
-    // GROUP_ID_NOT_FOUND, as Kafka does (wave3 groups; it used to be NONE).
+    // GROUP_ID_NOT_FOUND, as Kafka does.
     println!("Step 1: Deleting non-existent group 3 times...");
     for i in 1..=3 {
         let results = admin.delete_groups(&[&group_id], &opts).await?;

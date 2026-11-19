@@ -1,10 +1,9 @@
 //! Record-header roundtrip test (DR-8, DEEP-REVIEW-2026-07).
 //!
-//! Fail-before/pass-after: before DR-8, headers were written to
-//! `kafka.messages.headers` on every produce but the fetch path never selected
-//! the column and re-encoded batches with empty headers — so a consumer always
-//! saw none. This test produces a record with headers and asserts the consumer
-//! receives them back over the wire.
+//! Headers are stored in `kafka.messages.headers` and the fetch path must select
+//! them and encode them into the batches it returns (a fetch that re-encodes with
+//! empty headers hands a consumer none). The test produces a record with headers and
+//! asserts the consumer receives them back over the wire.
 
 use crate::common::{
     create_base_consumer, create_producer, TestResult, POLL_TIMEOUT, TEST_TIMEOUT,

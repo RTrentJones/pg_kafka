@@ -23,8 +23,8 @@ use std::time::Duration;
 pub async fn test_offset_commit_fetch() -> TestResult {
     println!("=== Test: OffsetCommit/OffsetFetch ===\n");
 
-    // Unique names: the fixed ones accumulated messages and commits across runs on a
-    // reused database, so the expected committed offset drifted.
+    // Unique names: fixed ones would accumulate messages and commits across runs on a
+    // reused database, so the expected committed offset would drift.
     let topic_name = format!("offset-commit-test-topic-{}", uuid::Uuid::new_v4());
     let group_name = format!("test-commit-group-{}", uuid::Uuid::new_v4());
     let topic = topic_name.as_str();

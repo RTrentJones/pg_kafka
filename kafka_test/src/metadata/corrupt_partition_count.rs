@@ -8,15 +8,15 @@ use crate::wire::requests::*;
 use crate::wire::roundtrip;
 use kafka_protocol::messages::metadata_request::MetadataRequest;
 
-/// Item 1: a corrupt stored partition count (only possible when the CHECK constraint is
+/// A corrupt stored partition count (only possible when the CHECK constraint is
 /// bypassed) is reported as an error for that topic instead of being allocated; the worker and
 /// the server stay up and other topics keep working. Sequential: drops and restores the
 /// constraint for the duration of the test.
 pub async fn test_metadata_survives_corrupt_partition_count() -> TestResult {
     println!("=== Test: Metadata survives a corrupt stored partition count ===\n");
     let ctx = TestContext::new().await?;
-    let bad = ctx.unique_topic("w3g-corrupt").await;
-    let good = ctx.unique_topic("w3g-good").await;
+    let bad = ctx.unique_topic("corrupt").await;
+    let good = ctx.unique_topic("good").await;
     produce_one(&good).await?;
 
     let db = create_db_client().await?;

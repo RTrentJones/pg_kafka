@@ -6,19 +6,18 @@ use crate::fixtures::produce_one;
 use crate::setup::TestContext;
 use crate::wire::requests::*;
 
-/// Item 4: OffsetCommit validation, Kafka 3.7's answers (each checked against a real broker):
+/// OffsetCommit validation, Kafka 3.7's answers (each checked against a real broker):
 /// unknown group: gen -1 accepted (any member id), gen >= 0 ILLEGAL_GENERATION; group with
 /// members: gen -1 / "" UNKNOWN_MEMBER_ID, gen -1 with the member's id ILLEGAL_GENERATION,
 /// the right member and generation accepted; Empty group: gen -1 accepted, gen >= 0
-/// UNKNOWN_MEMBER_ID. Before: gen -1 was accepted for a group with members, and an unknown group
-/// at gen >= 0 got UNKNOWN_MEMBER_ID.
+/// UNKNOWN_MEMBER_ID.
 pub async fn test_offset_commit_generation_and_member_rules() -> TestResult {
     println!("=== Test: OffsetCommit rules ===\n");
     let ctx = TestContext::new().await?;
-    let topic = ctx.unique_topic("w3g-commit").await;
+    let topic = ctx.unique_topic("commit").await;
     produce_one(&topic).await?;
-    let unknown = ctx.unique_group("w3g-commit-unknown").await;
-    let group = ctx.unique_group("w3g-commit-live").await;
+    let unknown = ctx.unique_group("commit-unknown").await;
+    let group = ctx.unique_group("commit-live").await;
 
     assert_eq!(
         commit(&unknown, 5, "x", &topic, 1).await?,

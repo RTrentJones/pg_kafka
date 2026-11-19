@@ -243,12 +243,11 @@ pub async fn test_committed_transaction_uses_durable_outbox() -> TestResult {
 }
 
 /// B1: a transactional commit must not enqueue outbox pointers for message rows
-/// that no longer exist. This reproduces the mid-txn rollback leak black-box: the
+/// that do not exist any more. This reproduces the mid-txn rollback leak black-box: the
 /// pending message row is deleted after it is written but before commit, while the
-/// worker's in-RAM forward buffer still holds the offset. The old code enqueued an
-/// orphan `kafka.shadow_tracking` row (never claimable by the poll's EXISTS guard,
-/// never cleaned → slow leak). The existence-checked enqueue must drop it.
-/// Fails before the fix; passes after.
+/// worker's in-RAM forward buffer still holds the offset. The existence-checked
+/// enqueue drops it; an orphan `kafka.shadow_tracking` row would never be claimable by
+/// the poll's EXISTS guard and never cleaned (a slow leak).
 pub async fn test_committed_txn_leaves_no_orphan_outbox_rows() -> TestResult {
     println!("=== Test: Committed Txn Leaves No Orphan Outbox Rows (B1) ===\n");
 

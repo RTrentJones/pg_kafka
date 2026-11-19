@@ -1,8 +1,7 @@
-//! Regression tests for the `coordinator` workstream: JoinGroup responses are held
-//! until the group's join phase completes, as Kafka does.
+//! JoinGroup responses are held until the group's join phase completes, as Kafka does.
 //!
-//! The worker change (`worker.rs` JoinGroup arm answering on the client's own sender,
-//! possibly long after the request's transaction) is only visible end to end, so these
+//! The worker answers JoinGroup on the client's own sender, possibly long after the
+//! request's transaction, which is only visible end to end, so these
 //! drive raw wire requests over separate connections: a held JoinGroup blocks its
 //! connection's response stream, exactly as it blocks a real client's coordinator
 //! connection.

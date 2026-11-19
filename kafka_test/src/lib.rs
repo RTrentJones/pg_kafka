@@ -1,42 +1,13 @@
-//! pg_kafka E2E Test Suite
+//! pg_kafka E2E test suite.
 //!
-//! A comprehensive end-to-end test framework for pg_kafka with:
-//! - Test isolation via unique topic/group names
-//! - Automatic cleanup via RAII
-//! - Custom assertions for database verification
-//! - Fixtures and builders for test data
+//! The tests run against a live PostgreSQL with the extension loaded, through real
+//! Kafka clients (rdkafka) and, where rdkafka hides what a test asserts on, the raw
+//! protocol ([`wire`]). Each category is a module whose `tests()` lists its tests
+//! ([`registry`]); [`all_tests`] joins them for the runner in `main.rs`.
 //!
-//! ## Test Categories
-//!
-//! - **producer**: Producer functionality tests (basic, batch)
-//! - **consumer**: Consumer functionality tests (basic, multiple, from offset)
-//! - **offset_management**: Offset commit/fetch and boundary tests
-//! - **consumer_group**: Consumer group lifecycle tests
-//! - **partition**: Multi-partition functionality tests
-//! - **error_paths**: Error condition tests (16 tests)
-//! - **edge_cases**: Boundary and edge case tests (11 tests)
-//! - **concurrent**: Concurrency tests (8 tests)
-//! - **negative**: Expected failure tests (4 tests)
-//! - **performance**: Throughput baseline tests (3 tests)
-//! - **long_poll**: Long polling tests (4 tests)
-//! - **compression**: Compression tests (5 tests)
-//! - **idempotent**: Idempotent producer tests (1 test)
-//!
-//! ## Usage
-//!
-//! ```bash
-//! # Run all tests
-//! cargo run --release
-//!
-//! # Run specific category
-//! cargo run --release -- --category producer
-//!
-//! # Run single test
-//! cargo run --release -- --test test_producer
-//!
-//! # JSON output for CI
-//! cargo run --release -- --json
-//! ```
+//! Shared infrastructure: [`common`] (client factories, result types), [`setup`]
+//! ([`TestContext`]: unique names, cleanup), [`fixtures`] (builders, waits),
+//! [`assertions`] (database assertions), [`error_codes`] and [`wire`].
 
 // Infrastructure modules
 pub mod assertions;
@@ -49,6 +20,7 @@ pub mod wire;
 
 // Test modules
 pub mod admin;
+pub mod auth;
 pub mod compression;
 pub mod concurrent;
 pub mod consumer;
@@ -61,6 +33,7 @@ pub mod metadata;
 pub mod negative;
 pub mod network;
 pub mod offset_management;
+pub mod part;
 pub mod partition;
 pub mod performance;
 pub mod producer;
@@ -68,11 +41,6 @@ pub mod protocol;
 pub mod shadow;
 pub mod transaction;
 pub mod worker;
-// Stream `part` (wave 2): time-partitioned kafka.messages
-pub mod part;
-// auth stream: TLS + SASL listener tests
-pub mod auth;
-// wave3 worker: lifecycle, locking, maintenance races (kafka_test/src/w3_worker)
 
 // Re-export infrastructure
 pub use assertions::*;

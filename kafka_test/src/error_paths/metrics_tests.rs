@@ -1,9 +1,8 @@
-//! E2E tests for the broker request metrics (metrics stream).
+//! E2E tests for the broker request metrics.
 //!
 //! The worker counts every request per API in memory and publishes the counters to
 //! `kafka.broker_api_stats` / `kafka.broker_gauges` (views `kafka.api_metrics`,
-//! `kafka.broker_metrics`) at most once per second. Before this change there were no
-//! such tables, so every query here fails before and passes after.
+//! `kafka.broker_metrics`) at most once per second.
 
 use crate::common::{create_base_consumer, create_producer, TestResult, POLL_TIMEOUT};
 use crate::setup::TestContext;

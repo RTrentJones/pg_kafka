@@ -1,9 +1,7 @@
-//! Regression tests for the bug hunt at commit 6c982be.
-//!
-//! These cover the fixes whose code lives in the SPI/async files (`worker.rs`,
-//! `listener.rs`) that unit coverage cannot see, plus the broker-visible behaviour of
-//! the handler fixes. They speak the wire protocol directly (via the kafka-protocol
-//! crate) so each request is exactly the one the bug report describes.
+//! Error responses and resource accounting whose code lives in the SPI/async files
+//! (`worker.rs`, `listener.rs`) that unit coverage cannot see, plus broker-visible
+//! handler behaviour. They speak the wire protocol directly so each request is exactly
+//! the one under test.
 
 use crate::common::TestResult;
 use crate::fixtures::{generate_messages, TestTopicBuilder};
@@ -144,8 +142,8 @@ pub async fn test_fetch_into_cleaned_up_aborted_rows_is_in_range() -> TestResult
 }
 
 /// Bug 4 (worker.rs): a TxnOffsetCommit whose handler fails (here: a transactional id
-/// that was never initialised) must report the error on every requested partition. It
-/// used to come back as an empty response, which the client reads as success.
+/// that was never initialised) must report the error on every requested partition: an
+/// empty response reads as success to the client.
 pub async fn test_txn_offset_commit_failure_reports_partition_errors() -> TestResult {
     println!("=== Test: Failed TxnOffsetCommit Reports Partition Errors ===\n");
 

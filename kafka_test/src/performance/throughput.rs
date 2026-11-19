@@ -65,7 +65,7 @@ pub async fn test_produce_throughput_baseline() -> TestResult {
         "All messages should be produced successfully"
     );
 
-    // DR-18: a miss FAILS (it used to print a warning and pass).
+    // A miss fails the test (DR-18), it does not just print a warning.
     if throughput < MIN_PRODUCE_THROUGHPUT {
         return Err(format!(
             "Produce throughput regression: {:.2} msg/s is below the {:.0} msg/s floor",
@@ -127,7 +127,7 @@ pub async fn test_consume_throughput_baseline() -> TestResult {
         "Should consume at least 80% of messages"
     );
 
-    // DR-18: a miss FAILS (it used to print a warning and pass).
+    // A miss fails the test (DR-18), it does not just print a warning.
     if throughput < MIN_CONSUME_THROUGHPUT {
         return Err(format!(
             "Consume throughput regression: {:.2} msg/s is below the {:.0} msg/s floor",

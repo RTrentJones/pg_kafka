@@ -169,11 +169,10 @@ pub async fn test_partition_assignment_strategies() -> TestResult {
     }
 
     // Poll the consumers in a retry loop until at least one delivers a record,
-    // bounded by an overall deadline. This replaces the flaky "blind 3s sleep
-    // then a single 500ms poll": actively polling each consumer both drives the
+    // bounded by an overall deadline. Actively polling each consumer both drives the
     // group rebalance (rdkafka only progresses the join/sync while the stream is
-    // polled) and collects the record, so a slow-to-stabilize group under CI
-    // load no longer yields zero receives.
+    // polled) and collects the record, so a group slow to stabilize under CI load
+    // still receives (a blind sleep followed by one poll would not).
     println!("\nStep 3-4: Polling until a consumer receives...");
     let overall = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut total_received = 0;

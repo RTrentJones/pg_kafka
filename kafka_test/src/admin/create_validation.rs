@@ -14,18 +14,17 @@ use rdkafka::admin::{AdminOptions, NewPartitions, NewTopic, TopicReplication};
 use rdkafka::types::RDKafkaErrorCode;
 use std::time::Duration;
 
-/// Item 1: CreateTopics / CreatePartitions refuse partition counts above
-/// `pg_kafka.max_partitions_per_topic` (default 10000) with INVALID_PARTITIONS, through the real
-/// rdkafka admin client and raw requests, and nothing is stored. The schema's CHECK constraint
-/// backs it up. Before: 2,000,000,000 was accepted and stored, and the next Metadata request
-/// aborted the worker (memory allocation of 224000000000 bytes failed, signal 6, crash
-/// recovery, repeated on every Metadata as long as the row existed).
+/// CreateTopics / CreatePartitions refuse partition counts above
+/// `pg_kafka.max_partitions_per_topic` (default 10000) with INVALID_PARTITIONS, through the
+/// real rdkafka admin client and raw requests, and nothing is stored; the schema's CHECK
+/// constraint backs it up. A stored count of 2,000,000,000 would make every Metadata
+/// request try to allocate ~224 GB and abort the worker.
 pub async fn test_partition_count_above_cap_is_rejected() -> TestResult {
     println!("=== Test: partition counts are capped ===\n");
     let ctx = TestContext::new().await?;
-    let huge = ctx.unique_topic("w3g-huge").await;
-    let over = ctx.unique_topic("w3g-over").await;
-    let at_cap = ctx.unique_topic("w3g-atcap").await;
+    let huge = ctx.unique_topic("huge").await;
+    let over = ctx.unique_topic("over").await;
+    let at_cap = ctx.unique_topic("atcap").await;
 
     // librdkafka refuses counts above 100000 client-side, so 2e9 goes over a raw request
     // (any other client, or a hostile one, can send it).
@@ -108,16 +107,15 @@ pub async fn test_partition_count_above_cap_is_rejected() -> TestResult {
     Ok(())
 }
 
-/// Item 5: CreateTopics validation as Kafka 3.7 answers it (checked against a real broker):
+/// CreateTopics validation as Kafka 3.7 answers it (checked against a real broker):
 /// a name repeated in one request -> one INVALID_REQUEST "Duplicate topic name." result;
 /// `x.N` after `x_N` (or the reverse) -> INVALID_TOPIC_EXCEPTION "collides with existing topic";
 /// replication factor 3 -> INVALID_REPLICATION_FACTOR, 0 / -2 -> INVALID_REPLICATION_FACTOR,
-/// -1 -> created. Before: duplicates were created then TOPIC_ALREADY_EXISTS, collisions and any
-/// replication factor were accepted.
+/// -1 -> created.
 pub async fn test_create_topics_rejects_duplicates_collisions_and_bad_replication() -> TestResult {
     println!("=== Test: CreateTopics validation ===\n");
     let ctx = TestContext::new().await?;
-    let base = ctx.unique_topic("w3g-val").await.replace('-', "");
+    let base = ctx.unique_topic("val").await.replace('-', "");
     let dup = format!("{}-dup", base);
     let other = format!("{}-other", base);
     let dotted = format!("{}.col", base);

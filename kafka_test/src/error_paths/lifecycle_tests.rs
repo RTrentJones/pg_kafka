@@ -1,5 +1,5 @@
-//! Regression tests for the `lifecycle` workstream: worker restart, the explicit
-//! commit/rollback outcome, and group commit (several requests per top-level
+//! Worker lifecycle and group commit: worker restart, the explicit commit/rollback
+//! outcome of each request, and group commit (several requests per top-level
 //! transaction).
 //!
 //! The code under test lives in `src/worker.rs` / `src/lib.rs`, which unit
@@ -55,12 +55,9 @@ async fn broker_answers_api_versions() -> bool {
     )
 }
 
-/// Item 1: terminating the listener worker must not leave the Kafka port dead.
-///
-/// Before the fix the worker was registered with no restart interval and returned
-/// (exit status 0) on SIGTERM, so `pg_terminate_backend` on it left port 9092
-/// closed until Postgres was restarted. Now it exits with status 1 and the
-/// postmaster restarts it after 5 s; the new worker re-binds the port.
+/// Terminating the listener worker must not leave the Kafka port dead: the worker
+/// exits with status 1 on SIGTERM and is registered with a restart interval, so the
+/// postmaster restarts it after 5 s and the new worker re-binds the port.
 ///
 /// Asserts: (1) exactly one pg_kafka_listener exists and the broker answers;
 /// (2) after pg_terminate_backend, the old pid leaves pg_stat_activity; (3)
@@ -194,14 +191,13 @@ fn produce_ok(
     Ok(p.base_offset)
 }
 
-/// Item 3 (explicit rollback outcome) + item 4 (rollback isolation inside a
-/// group-commit batch).
+/// A failed request inside a group-commit batch rolls back alone.
 ///
 /// Three requests are written to one connection in a single write, so the
 /// worker sees them queued together (and, with group commit, runs them in one
 /// top-level transaction): Produce "a", an EndTxn for a transactional id that
-/// does not exist (the handler returns `Err`, which the worker now receives as a
-/// reported Rollback instead of an unwind marker), then Produce "b".
+/// does not exist (the handler returns `Err`, which the worker receives as a
+/// reported Rollback), then Produce "b".
 ///
 /// Asserts: the three responses arrive in request order; both produces succeed
 /// with consecutive base offsets 0 and 1; the EndTxn response carries a non-zero
@@ -276,7 +272,7 @@ pub async fn test_failed_request_rolls_back_alone() -> TestResult {
 const GROUP_COMMIT_PRODUCERS: usize = 16;
 const GROUP_COMMIT_RECORDS_PER_PRODUCER: usize = 20;
 
-/// Item 4 (group commit) — RB-1 across a batch.
+/// Group commit keeps RB-1 (an ack implies a durable write) across a batch.
 ///
 /// 16 producers (separate rdkafka clients, so separate connections) send 20
 /// records each, concurrently, to one partition. Concurrent requests queue up
@@ -369,7 +365,7 @@ pub async fn test_group_commit_concurrent_acks_visible() -> TestResult {
 
 const PIPELINED_PRODUCES: i32 = 40;
 
-/// Item 4 (group commit) — response order and offsets within a batch.
+/// Group commit keeps response order and offsets within a batch.
 ///
 /// 40 Produce requests are written to one connection in a single write, so the
 /// worker finds them queued together and commits them in one or a few batches.

@@ -420,9 +420,9 @@ pub async fn test_read_committed_after_commit() -> TestResult {
 
 /// RV-2 regression: InitProducerId (producer re-init) must abort any transaction
 /// still in flight for the same `transactional_id` — the canonical producer
-/// crash-restart path. Before the fix the previous epoch's `pending` records were
-/// stranded forever (nothing reclaimed them; `get_last_stable_offset` pinned the
-/// LSO = a hanging transaction). After the fix they are marked `aborted`.
+/// crash-restart path. The previous epoch's `pending` records are marked `aborted`;
+/// stranded, nothing would reclaim them and they would pin the LSO (a hanging
+/// transaction).
 pub async fn test_reinit_aborts_in_flight_transaction() -> TestResult {
     println!("=== Test: Re-init Aborts In-Flight Transaction (RV-2) ===\n");
 
@@ -482,7 +482,7 @@ pub async fn test_reinit_aborts_in_flight_transaction() -> TestResult {
         "re-init must abort the stranded in-flight record (RV-2), not leave it pending"
     );
 
-    // The LSO is no longer pinned: no pending rows remain for this topic.
+    // The LSO is not pinned: no pending rows remain for this topic.
     let pending_count: i64 = client2
         .query_one(
             "SELECT COUNT(*) FROM kafka.messages WHERE topic_id = $1 AND txn_state = 'pending'",
@@ -500,9 +500,9 @@ pub async fn test_reinit_aborts_in_flight_transaction() -> TestResult {
 }
 
 /// RV-4 regression: a read_committed consumer must not receive a committed record
-/// at or above the LSO (the lowest pending offset). Before the fix an interleaved
-/// higher-offset committed txn was returned while a lower-offset txn was still
-/// pending, so the consumer advanced past the pending offset and lost it on commit.
+/// at or above the LSO (the lowest pending offset), even from an interleaved
+/// higher-offset committed transaction: the consumer would advance past the pending
+/// offset and lose it on commit.
 pub async fn test_read_committed_clamped_to_lso() -> TestResult {
     println!("=== Test: Read Committed Clamped To LSO (RV-4) ===\n");
 

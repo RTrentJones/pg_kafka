@@ -1,4 +1,4 @@
-//! Stream `api`: SaslHandshake / SaslAuthenticate are answered on the network thread, and
+//! SaslHandshake / SaslAuthenticate are answered on the network thread, and
 //! still counted in `kafka.api_metrics` (requests and errors) like worker-served APIs.
 
 use super::{auth_env, DynResult, PASSWORD, SASL_PLAINTEXT_PORT, USER};

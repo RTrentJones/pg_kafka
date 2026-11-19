@@ -13,8 +13,8 @@ use crate::wire::Wire;
 pub async fn test_transactional_requests_are_validated() -> TestResult {
     println!("=== Test: transaction validation ===\n");
     let ctx = TestContext::new().await?;
-    let t = topic(&ctx, "w3-txn-val", 2).await?;
-    let tx = ctx.unique_topic("w3-txn-val-tx").await;
+    let t = topic(&ctx, "txn-val", 2).await?;
+    let tx = ctx.unique_topic("txn-val-tx").await;
     let mut w = Wire::connect().await?;
     for timeout in [-5, 0, 900_001, i32::MAX] {
         assert_eq!(
@@ -29,7 +29,7 @@ pub async fn test_transactional_requests_are_validated() -> TestResult {
     let (err, pid, ep) = w.init_producer_id(Some(&tx), 900_000).await?;
     assert_eq!(err, error_codes::NONE);
 
-    let missing = ctx.unique_topic("w3-txn-val-missing").await;
+    let missing = ctx.unique_topic("txn-val-missing").await;
     assert_eq!(
         w.add_partitions(&tx, pid, ep, &[(&missing, &[0]), (&t, &[0])])
             .await?,

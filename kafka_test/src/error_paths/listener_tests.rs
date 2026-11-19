@@ -1,6 +1,6 @@
-//! Regression tests for the `listener` workstream (src/kafka/listener.rs and friends).
+//! Listener behaviour (src/kafka/listener.rs and friends):
 //!
-//! - Idle long polls are no longer re-run every 100 ms: a waiting fetch re-runs only on a
+//! - Idle long polls are not re-run on a short timer: a waiting fetch re-runs only on a
 //!   new-data notification, its `max_wait_ms` deadline, or the slow safety-net interval
 //!   (`pg_kafka.fetch_poll_interval_ms`, default 1000 ms).
 //! - A produce still wakes a waiting fetch at once.

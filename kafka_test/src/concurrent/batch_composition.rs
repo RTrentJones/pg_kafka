@@ -11,21 +11,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-// -------------------------------------------------------------------------------------
-// Item 7: heartbeats no longer split group-commit batches.
-// -------------------------------------------------------------------------------------
-
-/// Before: a batch stopped taking requests as soon as a Heartbeat waited on the
-/// liveness lane, so with many consumers heartbeating, produce batches collapsed to one
-/// request each (one commit, one fsync each). Now heartbeats waiting during a batch are
-/// answered between its requests and the batch keeps taking queued work.
+/// A Heartbeat waiting on the liveness lane is answered between a batch's requests; it
+/// does not end the batch. Otherwise, with many consumers heartbeating, produce batches
+/// collapse to one request each (one commit, one fsync each).
 ///
 /// Construction: four raw connections keep the liveness lane busy with pipelined
-/// Heartbeats (written continuously, read by a separate task), and every produce batch is delayed 200 ms before
-/// its commit (`pg_kafka.test_pre_commit_delay_ms`), so the number of batches shows in
-/// the elapsed time. 12 producers send 5 records each, one at a time. Before, most of
-/// the 60 produces committed in batches of their own (measured 5-6 s); now concurrent
-/// produces share batches (a few rounds of ~200 ms).
+/// Heartbeats (written continuously, read by a separate task), and every produce batch
+/// is delayed 200 ms before its commit (`pg_kafka.test_pre_commit_delay_ms`), so the
+/// number of batches shows in the elapsed time. 12 producers send 5 records each, one at
+/// a time: in batches of their own the 60 produces take 5-6 s; sharing batches, a few
+/// rounds of ~200 ms.
 ///
 /// Asserts: the 60 produces complete within 5 s while the heartbeat flood is served
 /// (every flood connection keeps getting responses).
@@ -37,9 +32,9 @@ pub async fn test_heartbeats_do_not_split_group_commit_batches() -> TestResult {
 /// `stop`; returns how many responses it read.
 async fn heartbeat_flood(stop: Arc<AtomicBool>) -> SendResult<u64> {
     let mut request = HeartbeatRequest::default();
-    request.group_id = GroupId(StrBytes::from_static_str("w3-worker-flood-group"));
+    request.group_id = GroupId(StrBytes::from_static_str("heartbeat-flood-group"));
     request.generation_id = 1;
-    request.member_id = StrBytes::from_static_str("w3-flood-member");
+    request.member_id = StrBytes::from_static_str("heartbeat-flood-member");
     let burst: Vec<u8> = request_frame(0, 7, &request).repeat(32);
 
     let stream = tokio::net::TcpStream::connect("127.0.0.1:9092")

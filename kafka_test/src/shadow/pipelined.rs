@@ -1,4 +1,4 @@
-//! Wave 3 shadow tests: the pipelined, order-preserving forwarder.
+//! Shadow tests of the pipelined, order-preserving forwarder.
 //!
 //! Every test here talks to the external Kafka (category `shadow`):
 //! - throughput floor of the forwarder;
@@ -112,7 +112,7 @@ fn read_external(
     expected: usize,
     timeout: Duration,
 ) -> Result<Vec<rdkafka::message::OwnedMessage>, Box<dyn std::error::Error>> {
-    let consumer = create_external_consumer(&format!("w3-{}", uuid::Uuid::new_v4()))?;
+    let consumer = create_external_consumer(&format!("shadow-{}", uuid::Uuid::new_v4()))?;
     consumer.subscribe(&[topic])?;
     let mut out = Vec::new();
     let start = Instant::now();
@@ -132,12 +132,12 @@ fn read_external(
 /// delivery report before sending the next record (< ~100 msg/s here) and the
 /// poll claimed at most 256 rows per 250 ms.
 pub async fn test_shadow_forward_throughput() -> TestResult {
-    println!("=== Test: shadow forwarding throughput (wave 3) ===\n");
+    println!("=== Test: shadow forwarding throughput ===\n");
     const N: i64 = 20_000;
     const FLOOR_MSG_PER_SEC: f64 = 2_000.0;
 
     let ctx = TestContext::new().await?;
-    let topic = ctx.unique_topic("w3-throughput").await;
+    let topic = ctx.unique_topic("shadow-throughput").await;
     verify_external_kafka_ready().await?;
     enable_shadow_mode(ctx.db(), &topic, &async_config(None)).await?;
 
@@ -196,12 +196,12 @@ pub async fn test_shadow_forward_throughput() -> TestResult {
     Ok(())
 }
 
-/// Headers and timestamps reach the external topic (they used to be dropped:
-/// only key and value were forwarded, stamped with the forward time).
+/// Headers and timestamps reach the external topic, not only key and value stamped
+/// with the forward time.
 pub async fn test_shadow_forwards_headers_and_timestamps() -> TestResult {
-    println!("=== Test: shadow forwards headers and timestamps (wave 3) ===\n");
+    println!("=== Test: shadow forwards headers and timestamps ===\n");
     let ctx = TestContext::new().await?;
-    let topic = ctx.unique_topic("w3-headers").await;
+    let topic = ctx.unique_topic("shadow-headers").await;
     verify_external_kafka_ready().await?;
     enable_shadow_mode(ctx.db(), &topic, &async_config(None)).await?;
 
@@ -264,11 +264,11 @@ pub async fn test_shadow_forwards_headers_and_timestamps() -> TestResult {
 /// test raises it. The old forwarder delivered the later records first and the
 /// retried one last.
 pub async fn test_shadow_order_preserved_across_a_retried_failure() -> TestResult {
-    println!("=== Test: shadow order preserved across a retried failure (wave 3) ===\n");
+    println!("=== Test: shadow order preserved across a retried failure ===\n");
     const N: usize = 40;
     const BIG: usize = 5;
     let ctx = TestContext::new().await?;
-    let topic = ctx.unique_topic("w3-order").await;
+    let topic = ctx.unique_topic("shadow-order").await;
     let external = format!("{topic}-ext");
     verify_external_kafka_ready().await?;
 
@@ -380,13 +380,13 @@ pub async fn test_shadow_order_preserved_across_a_retried_failure() -> TestResul
 
 /// Sync mode with the external cluster unreachable: the sync produce waits at
 /// most pg_kafka.shadow_sync_timeout_ms, and a concurrent produce to an
-/// unrelated topic is not delayed (the old code blocked the DB thread, and so
-/// every client, up to 5 s per batch).
+/// unrelated topic is not delayed (waiting on the DB thread would stall every client,
+/// up to 5 s per batch).
 pub async fn test_shadow_sync_stall_is_bounded_to_its_own_response() -> TestResult {
-    println!("=== Test: sync-mode stall is bounded to its own response (wave 3) ===\n");
+    println!("=== Test: sync-mode stall is bounded to its own response ===\n");
     let ctx = TestContext::new().await?;
-    let sync_topic = ctx.unique_topic("w3-sync-down").await;
-    let other_topic = ctx.unique_topic("w3-unrelated").await;
+    let sync_topic = ctx.unique_topic("shadow-sync-down").await;
+    let other_topic = ctx.unique_topic("shadow-unrelated").await;
     verify_external_kafka_ready().await?;
     enable_shadow_mode(
         ctx.db(),
@@ -404,7 +404,7 @@ pub async fn test_shadow_sync_stall_is_bounded_to_its_own_response() -> TestResu
         "ALTER SYSTEM SET pg_kafka.shadow_bootstrap_servers = '127.0.0.1:1'",
     )
     .await?;
-    // Best effort: a build without this GUC (the pre-wave-3 baseline) rejects it.
+    // Best effort: a build without this GUC rejects it.
     let _ = alter_system(
         &db,
         "ALTER SYSTEM SET pg_kafka.shadow_sync_timeout_ms = 3000",
@@ -493,10 +493,10 @@ pub async fn test_shadow_sync_stall_is_bounded_to_its_own_response() -> TestResu
 /// shadow_metrics_enabled gates kafka.shadow_metrics; sampled-out records are
 /// counted in messages_skipped.
 pub async fn test_shadow_gucs_take_effect_on_reload() -> TestResult {
-    println!("=== Test: shadow GUCs take effect on reload (wave 3) ===\n");
+    println!("=== Test: shadow GUCs take effect on reload ===\n");
     let ctx = TestContext::new().await?;
-    let topic = ctx.unique_topic("w3-guc").await;
-    let sampled = ctx.unique_topic("w3-sampled").await;
+    let topic = ctx.unique_topic("shadow-guc").await;
+    let sampled = ctx.unique_topic("shadow-sampled").await;
     verify_external_kafka_ready().await?;
     enable_shadow_mode(ctx.db(), &topic, &async_config(None)).await?;
     enable_shadow_mode(

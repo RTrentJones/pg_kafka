@@ -7,11 +7,12 @@ use crate::setup::TestContext;
 use crate::wire::records::{batch, batch_headers, fetched_values};
 use crate::wire::Wire;
 
-/// Fetch groups records into batches (was: one RecordBatch per record).
+/// Fetch groups a producer's consecutive records into one RecordBatch, not one batch per
+/// record.
 pub async fn test_fetch_groups_records_into_batches() -> TestResult {
     println!("=== Test: fetch returns records grouped into batches ===\n");
     let ctx = TestContext::new().await?;
-    let t = topic(&ctx, "w3-txn-batch", 1).await?;
+    let t = topic(&ctx, "txn-batch", 1).await?;
     let mut w = Wire::connect().await?;
     for i in 0..10 {
         let values: Vec<String> = (0..10).map(|j| format!("m{}", i * 10 + j)).collect();

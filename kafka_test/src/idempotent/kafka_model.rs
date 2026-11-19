@@ -12,12 +12,11 @@ use std::time::Duration;
 /// its ORIGINAL base offset; a never-sent range at or below the last sequence, an
 /// overlap, a gap or a retry older than the cache is OUT_OF_ORDER_SEQUENCE_NUMBER; a
 /// client-bumped epoch must restart at 0 and fences the old epoch with
-/// INVALID_PRODUCER_EPOCH. Before wave 3 every range at or below the last sequence was
-/// acked with offset -1 and dropped, and any other epoch was PRODUCER_FENCED.
+/// INVALID_PRODUCER_EPOCH.
 pub async fn test_idempotent_duplicates_and_epochs_follow_kafka() -> TestResult {
     println!("=== Test: idempotent producer follows Kafka's model ===\n");
     let ctx = TestContext::new().await?;
-    let t = topic(&ctx, "w3-txn-idem", 1).await?;
+    let t = topic(&ctx, "txn-idem", 1).await?;
     let mut w = Wire::connect().await?;
     let (err, pid, ep) = w.init_producer_id(None, 60_000).await?;
     assert_eq!(err, error_codes::NONE);
@@ -160,7 +159,7 @@ async fn reconnect() -> Result<Wire, Box<dyn std::error::Error>> {
 pub async fn test_idempotent_sequence_wraps_at_i32_max() -> TestResult {
     println!("=== Test: idempotent sequence wraps at i32::MAX ===\n");
     let ctx = TestContext::new().await?;
-    let t = topic(&ctx, "w3-txn-wrap", 1).await?;
+    let t = topic(&ctx, "txn-wrap", 1).await?;
     let mut w = Wire::connect().await?;
     let (err, pid, ep) = w.init_producer_id(None, 60_000).await?;
     assert_eq!(err, error_codes::NONE);

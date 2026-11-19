@@ -20,9 +20,8 @@
 //! generated files), connects as a superuser, and has `openssl` on PATH. All tests are
 //! registered `parallel_safe: false` because they restart the listener.
 
-pub mod tests;
-// Stream `api`: SASL requests in kafka.api_metrics.
 pub mod api_metrics;
+pub mod tests;
 
 use crate::common::{create_db_client, TestResult};
 use crate::wire::roundtrip;
@@ -49,16 +48,16 @@ use crate::common::DynResult;
 
 /// Where the generated certificates live: one directory per test process.
 ///
-/// wave3 net: it used to be one fixed `$TMPDIR/pg_kafka_auth_e2e` for every process,
-/// so two suites running at once on one host (parallel CI jobs, several clusters on a
-/// dev box) regenerated each other's CA and server certificate between a server loading
-/// one and a client trusting the other: intermittent "certificate verify failed".
+/// A directory shared by every process would let two suites running at once on one host
+/// (parallel CI jobs, several clusters on a dev box) regenerate each other's CA and
+/// server certificate between a server loading one and a client trusting the other:
+/// intermittent "certificate verify failed".
 pub fn cert_dir() -> PathBuf {
     std::env::temp_dir().join(format!("pg_kafka_auth_e2e-{}", std::process::id()))
 }
 
 /// Generate the certificates for this test process unless they exist (the auth and
-/// w3_net setups share them; each category's teardown removes them with
+/// network setups share them; each category's teardown removes them with
 /// [`remove_certificates`]).
 pub fn ensure_certificates() -> DynResult<PathBuf> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

@@ -9,17 +9,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-// -------------------------------------------------------------------------------------
-// Item 1 (+5): DROP / CREATE / ALTER EXTENSION UPDATE in a loop under load.
-// -------------------------------------------------------------------------------------
-
-/// Before: the worker locked shadow_tracking/shadow_config/transactions/... in its own
-/// order while DROP EXTENSION locked the members in pg_depend order, and the two
-/// deadlocked ("deadlock detected", seen in the server logs); after a DROP the worker
-/// failed every request and every poll. Now every worker transaction first takes the
-/// extension object lock (which DROP takes before any member) and the pg_kafka schema
-/// advisory lock (which the upgrade script takes first), finds a dropped extension and
-/// goes back to waiting for the schema.
+/// DROP EXTENSION locks the extension's members in pg_depend order; a worker that locked
+/// shadow_tracking, shadow_config, transactions, ... in its own order would deadlock with
+/// it. Every worker transaction therefore first takes the extension object lock (which
+/// DROP takes before any member) and the pg_kafka schema advisory lock (which the upgrade
+/// script takes first), and a worker that finds the extension dropped goes back to
+/// waiting for the schema instead of failing every request.
 ///
 /// Asserts, over 8 rounds (alternating `CREATE EXTENSION` and `CREATE ... VERSION
 /// '0.0.0'` + `ALTER EXTENSION UPDATE`) while producers (plain + idempotent), a group
@@ -180,17 +175,11 @@ async fn extension_ddl_loop() -> SendResult<()> {
     Ok(())
 }
 
-// -------------------------------------------------------------------------------------
-// Item 5: a new binary on the 0.0.0 schema.
-// -------------------------------------------------------------------------------------
-
-/// Before: on a 0.0.0 schema the worker's partition maintenance failed at start and
-/// every sweep ("Partition maintenance failed ... message_partitions"), the retention
-/// sweep failed every cycle (and `pg_kafka_run_retention_sweep()` failed outright), and
-/// the metrics flush failed (no kafka.broker_api_stats). Now the worker detects the
-/// schema version, logs one WARNING naming what is unavailable, runs the retention
-/// sweep row by row on the unpartitioned table, and turns the features on once
-/// `ALTER EXTENSION pg_kafka UPDATE` has run (at the next reload).
+/// A library newer than its schema (the 0.0.0 schema has no time partitions and no
+/// kafka.broker_api_stats) must not fail its partition maintenance, retention sweep and
+/// metrics flush on every cycle. The worker detects the schema version, logs one WARNING
+/// naming what is unavailable, sweeps the unpartitioned table row by row, and turns the
+/// features on once `ALTER EXTENSION pg_kafka UPDATE` has run (at the next reload).
 ///
 /// Asserts: on 0.0.0, produce/consume work, `pg_kafka_run_retention_sweep()` succeeds,
 /// a restarted worker logs none of the per-cycle failures and the degrade WARNING at
@@ -315,11 +304,10 @@ async fn old_schema() -> SendResult<()> {
     result
 }
 
-/// Before: pgrx's SIGTERM handler only set a flag the main loop checks between
-/// requests, so a worker waiting on a lock (here: a row another session holds, with no
-/// lock_timeout) could not be terminated: the broker stayed wedged until the lock was
-/// released. Now SIGTERM during database work sets ProcDiePending, so the lock wait is
-/// interrupted and the worker exits (and is restarted).
+/// pgrx's SIGTERM handler only sets a flag the main loop checks between requests, which
+/// cannot end a worker waiting on a lock (here: a row another session holds, with no
+/// lock_timeout). SIGTERM during database work therefore also sets ProcDiePending, so the
+/// lock wait is interrupted and the worker exits (and is restarted).
 ///
 /// Asserts: with the worker lock timeout disabled and a Produce blocked on a held row
 /// lock (pg_stat_activity shows a Lock wait), `pg_terminate_backend` ends the worker
@@ -388,10 +376,10 @@ async fn sigterm_lock_wait() -> SendResult<()> {
     Ok(())
 }
 
-/// Before: no lock_timeout was set for the worker, so one stuck lock (an idle-in-
-/// transaction session holding a row the worker needs) blocked the single DB thread and
-/// with it every request of every client. Now `pg_kafka.worker_lock_timeout_ms` bounds
-/// each lock wait: the stuck request fails, the rest of the broker keeps serving.
+/// One stuck lock (an idle-in-transaction session holding a row the worker needs) must
+/// not block the single DB thread and with it every request of every client:
+/// `pg_kafka.worker_lock_timeout_ms` bounds each lock wait, so the stuck request fails and
+/// the rest of the broker keeps serving.
 ///
 /// Asserts: with the timeout at 1 s and a Produce blocked on a held row lock, a
 /// ListOffsets for another topic is answered within 4 s, and after the lock is released
@@ -460,14 +448,10 @@ async fn lock_timeout_bounds() -> SendResult<()> {
     Ok(())
 }
 
-// -------------------------------------------------------------------------------------
-// Item 6: a failing commit is answered, and the worker survives.
-// -------------------------------------------------------------------------------------
-
-/// Before: when a batch's COMMIT failed, the worker queued error responses and then
-/// re-raised, so the process exited before the network thread could send them: the
-/// client saw a dropped connection and the listener restarted. Now the worker aborts
-/// the failed transaction, answers every request of the batch with an error and goes on.
+/// A batch whose COMMIT fails must be answered: the worker aborts the failed
+/// transaction, answers every request of the batch with an error and goes on, instead of
+/// exiting before the network thread sends the responses (which the client would see as
+/// a dropped connection, followed by a listener restart).
 ///
 /// Asserts: with a deferred constraint trigger that fails at commit for one topic, a
 /// produce (no retries) to that topic gets an error response within 5 s, the listener
@@ -484,23 +468,23 @@ async fn commit_failure() -> SendResult<()> {
     let producer = quick_producer("10000")?;
     send(&producer, &topic, "create").await?;
     db.batch_execute(
-        "CREATE TABLE IF NOT EXISTS public.w3_commit_fail (topic_id INT PRIMARY KEY);
-         CREATE OR REPLACE FUNCTION public.w3_commit_fail_fn() RETURNS trigger
+        "CREATE TABLE IF NOT EXISTS public.e2e_commit_fail (topic_id INT PRIMARY KEY);
+         CREATE OR REPLACE FUNCTION public.e2e_commit_fail_fn() RETURNS trigger
          LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
          BEGIN
-             IF EXISTS (SELECT 1 FROM public.w3_commit_fail WHERE topic_id = NEW.topic_id) THEN
-                 RAISE EXCEPTION 'w3 injected commit failure';
+             IF EXISTS (SELECT 1 FROM public.e2e_commit_fail WHERE topic_id = NEW.topic_id) THEN
+                 RAISE EXCEPTION 'injected commit failure';
              END IF;
              RETURN NULL;
          END $$;
-         DROP TRIGGER IF EXISTS w3_commit_fail ON kafka.partition_offsets;
-         CREATE CONSTRAINT TRIGGER w3_commit_fail AFTER INSERT OR UPDATE ON kafka.partition_offsets
-         DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.w3_commit_fail_fn();",
+         DROP TRIGGER IF EXISTS e2e_commit_fail ON kafka.partition_offsets;
+         CREATE CONSTRAINT TRIGGER e2e_commit_fail AFTER INSERT OR UPDATE ON kafka.partition_offsets
+         DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.e2e_commit_fail_fn();",
     )
     .await
     .map_err(boxed)?;
     db.execute(
-        "INSERT INTO public.w3_commit_fail SELECT id FROM kafka.topics WHERE name = $1",
+        "INSERT INTO public.e2e_commit_fail SELECT id FROM kafka.topics WHERE name = $1",
         &[&topic],
     )
     .await
@@ -540,9 +524,9 @@ async fn commit_failure() -> SendResult<()> {
     }
     .await;
     db.batch_execute(
-        "DROP TRIGGER IF EXISTS w3_commit_fail ON kafka.partition_offsets;
-         DROP FUNCTION IF EXISTS public.w3_commit_fail_fn();
-         DROP TABLE IF EXISTS public.w3_commit_fail;",
+        "DROP TRIGGER IF EXISTS e2e_commit_fail ON kafka.partition_offsets;
+         DROP FUNCTION IF EXISTS public.e2e_commit_fail_fn();
+         DROP TABLE IF EXISTS public.e2e_commit_fail;",
     )
     .await
     .map_err(boxed)?;

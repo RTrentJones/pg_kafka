@@ -151,8 +151,9 @@ pub async fn test_active_idempotent_producer_survives_retention_sweep() -> TestR
 
 /// A producer fenced by a newer instance (same transactional.id) must get an error
 /// when it tries to write again, and nothing it sends may become visible. The fenced
-/// AddPartitionsToTxn used to come back as an empty response (its top-level error
-/// field only exists from v4, and the broker advertises v0-3), which reads as success.
+/// A fenced producer's AddPartitionsToTxn carries its error per partition: the
+/// top-level error field only exists from v4 and the broker advertises v0-3, so an
+/// empty response would read as success.
 pub async fn test_fenced_producer_cannot_write() -> TestResult {
     println!("=== Test: Fenced Producer Cannot Write ===\n");
 
@@ -270,8 +271,8 @@ pub async fn test_api_versions_above_range_negotiates_down() -> TestResult {
     Ok(())
 }
 
-/// Fetch v0-3 used to be advertised although the protocol crate cannot encode
-/// them. The advertised range now starts at v4, and a v4 fetch works.
+/// The advertised Fetch range starts at v4 (the protocol crate cannot encode v0-3), and
+/// a v4 fetch works.
 pub async fn test_fetch_advertised_minimum_is_usable() -> TestResult {
     println!("=== Test: Fetch Advertised Minimum Is Usable ===\n");
     let mut stream = TcpStream::connect(BROKER).await?;
@@ -311,9 +312,8 @@ pub async fn test_fetch_advertised_minimum_is_usable() -> TestResult {
     Ok(())
 }
 
-/// Produce v3+ allows one record batch per partition. A second batch used to be
-/// dropped while the request was acked; it must now be rejected (INVALID_RECORD)
-/// with nothing stored.
+/// Produce v3+ allows one record batch per partition. A request with a second batch is
+/// rejected (INVALID_RECORD) with nothing stored, not acked with the second dropped.
 pub async fn test_produce_two_batches_in_one_partition_is_rejected() -> TestResult {
     println!("=== Test: Two Record Batches In One Partition Are Rejected ===\n");
     let ctx = TestContext::new().await?;
@@ -371,7 +371,7 @@ pub async fn test_corrupt_acks0_produce_sends_no_reply() -> TestResult {
     );
     stream.write_all(&request_frame(7, 506, &req)).await?;
 
-    // ...then an ordinary request. wave3 net: as in Kafka, an acks=0 produce that fails
+    // ...then an ordinary request. As in Kafka, an acks=0 produce that fails
     // closes the connection (so the client notices) instead of being silently dropped;
     // it is never answered, so no frame at all may arrive before the close.
     let _ = stream.write_all(&raw_frame(18, 0, 507, &[])).await; // may race the close
@@ -394,9 +394,9 @@ pub async fn test_corrupt_acks0_produce_sends_no_reply() -> TestResult {
 
 // ----- storage / transaction regressions -----
 
-/// A topic with a huge retention.ms (i64::MAX is a common "forever") used to
-/// overflow the sweep's interval arithmetic, rolling back the whole sweep and
-/// stopping retention for every topic.
+/// A topic with a huge retention.ms (i64::MAX is a common "forever") must not overflow
+/// the sweep's interval arithmetic, which would roll back the whole sweep and stop
+/// retention for every topic.
 pub async fn test_huge_retention_ms_does_not_break_sweep() -> TestResult {
     println!("=== Test: Huge retention.ms Does Not Break The Sweep ===\n");
     let ctx = TestContext::new().await?;
@@ -602,8 +602,8 @@ pub async fn test_end_txn_retry_is_idempotent() -> TestResult {
     Ok(())
 }
 
-/// Metadata (and Produce) auto-creation used to skip the topic-name rules
-/// CreateTopics enforces, creating topics such as "bad name/x".
+/// Metadata (and Produce) auto-creation applies the topic-name rules CreateTopics
+/// enforces, so no topic such as "bad name/x" is created.
 pub async fn test_auto_create_rejects_invalid_topic_name() -> TestResult {
     use kafka_protocol::messages::metadata_request::{MetadataRequest, MetadataRequestTopic};
     println!("=== Test: Auto-Create Rejects Invalid Topic Name ===\n");
@@ -629,8 +629,7 @@ pub async fn test_auto_create_rejects_invalid_topic_name() -> TestResult {
     Ok(())
 }
 
-/// Headers come back in the order the producer sent them (they used to come back
-/// sorted by key).
+/// Headers come back in the order the producer sent them, not sorted by key.
 pub async fn test_headers_keep_their_order() -> TestResult {
     use rdkafka::consumer::{BaseConsumer, Consumer};
     use rdkafka::message::{Header, Headers, Message, OwnedHeaders};
@@ -834,10 +833,9 @@ mod group_wire {
 ///   "partitions lost") and their revoke-time OffsetCommit is accepted and stored;
 ///   once they rejoin, all three members get the same, next generation;
 /// - a follower that rejoins a stable group with unchanged metadata keeps its
-///   assignment and generation (it used to lose the assignment and force another
-///   rebalance);
+///   assignment and generation (no needless rebalance);
 /// - Heartbeat for a group the coordinator does not know returns UNKNOWN_MEMBER_ID
-///   so the client rejoins (it used to get COORDINATOR_NOT_AVAILABLE).
+///   so the client rejoins (not COORDINATOR_NOT_AVAILABLE).
 pub async fn test_group_rebalance_keeps_old_generation_usable() -> TestResult {
     use group_wire::*;
     println!("=== Test: Rebalance Keeps The Old Generation Usable ===\n");

@@ -1,12 +1,12 @@
-//! Wave 3, stream `net`: hostile clients at the network edge.
+//! The `network` category: hostile clients at the network edge.
 //!
-//! One test per finding (frame-budget lockout, oversized response, Nagle, acks=0 close,
+//! One test per attack (frame-budget lockout, oversized response, Nagle, acks=0 close,
 //! invalid acks, response before close, per-IP / per-listener limits, idle and frame
 //! read deadlines, the pre-auth deadline from accept, the SASL lookup rate limit, SCRAM
 //! enumeration), each checking that ordinary rdkafka clients keep working while the
 //! attack runs.
 //!
-//! `tests` run against the default configuration. `limits` reconfigure the listener
+//! `hostile_clients` run against the default configuration. `limits` reconfigure the listener
 //! (lower caps and timeouts, three extra listeners: PLAINTEXT 19096, SASL_PLAINTEXT
 //! 19097, SASL_SSL 19098) through ALTER SYSTEM and restart the worker, like the auth
 //! category; the last one resets everything. Attack connections bind other loopback
@@ -126,7 +126,7 @@ pub async fn rdkafka_roundtrip(cfg: ClientConfig, topic: &str, n: usize) -> Test
             .map_err(|(e, _)| format!("rdkafka produce failed: {}", e))?;
     }
     let mut ccfg = cfg.clone();
-    ccfg.set("group.id", format!("w3-net-{}", uuid::Uuid::new_v4()))
+    ccfg.set("group.id", format!("net-{}", uuid::Uuid::new_v4()))
         .set("enable.auto.commit", "false");
     let topic_c = topic.to_string();
     let got = tokio::task::spawn_blocking(move || -> Result<usize, String> {

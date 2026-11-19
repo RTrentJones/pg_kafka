@@ -1,4 +1,4 @@
-//! pg_kafka soak driver (wave 3, stream `worker`); run it through `scripts/soak.sh`.
+//! pg_kafka soak driver; run it through `scripts/soak.sh`.
 //!
 //! For `--duration-secs` it runs, in epochs of `--epoch-secs`:
 //! * an idempotent producer (3 partitions) and a transactional producer (commits, with

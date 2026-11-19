@@ -311,10 +311,9 @@ pub async fn test_local_only_mode() -> TestResult {
 
 /// Test that a reload drops a DELETED topic config from the cache (SH-3)
 ///
-/// Regression: the in-memory topic config cache was only ever *updated* on
-/// reload, never cleared, so a `kafka.shadow_config` row that was DELETED kept
-/// forwarding forever. After the fix the cache is replaced on each successful
-/// reload, so a deleted topic stops forwarding (but is still stored locally).
+/// The in-memory topic config cache is replaced on each successful reload, not only
+/// updated, so a topic whose `kafka.shadow_config` row was DELETED stops forwarding (but
+/// is still stored locally).
 pub async fn test_reload_clears_deleted_topic_config() -> TestResult {
     println!("=== Test: Reload Clears Deleted Topic Config (SH-3) ===\n");
 

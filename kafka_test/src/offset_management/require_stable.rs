@@ -11,9 +11,9 @@ use crate::wire::Wire;
 pub async fn test_offset_fetch_require_stable() -> TestResult {
     println!("=== Test: OffsetFetch require_stable ===\n");
     let ctx = TestContext::new().await?;
-    let t = topic(&ctx, "w3-txn-of", 2).await?;
-    let g = ctx.unique_group("w3-txn-of").await;
-    let tx = ctx.unique_topic("w3-txn-of-tx").await;
+    let t = topic(&ctx, "txn-of", 2).await?;
+    let g = ctx.unique_group("txn-of").await;
+    let tx = ctx.unique_topic("txn-of-tx").await;
     let mut w = Wire::connect().await?;
     let (err, pid, ep) = w.init_producer_id(Some(&tx), 60_000).await?;
     assert_eq!(err, error_codes::NONE);

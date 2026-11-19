@@ -1006,8 +1006,7 @@ pub async fn test_transaction_boundary_isolation() -> TestResult {
 
 /// RV-7 regression: the periodic timeout sweep must honor each transaction's own
 /// `timeout_ms` (from the client's `transaction.timeout.ms`), not a hardcoded 60 s.
-/// A transaction started 90 s ago with `timeout_ms = 120000` must NOT be aborted —
-/// before the fix the fixed 60 s would wrongly abort it.
+/// A transaction started 90 s ago with `timeout_ms = 120000` must NOT be aborted.
 pub async fn test_transaction_honors_per_txn_timeout_ms() -> TestResult {
     println!("=== Test: Transaction Honors Per-Txn timeout_ms (RV-7) ===\n");
 

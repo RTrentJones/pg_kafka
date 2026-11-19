@@ -9,12 +9,11 @@ use crate::wire::Wire;
 
 /// ListOffsets: read_committed LATEST is the LSO, -3 is the max-timestamp record, a
 /// lookup past the readable end is -1, and a partition the topic lacks is
-/// UNKNOWN_TOPIC_OR_PARTITION (were: HWM; the first record; the pending record; NONE
-/// and offset 0).
+/// UNKNOWN_TOPIC_OR_PARTITION, as Apache Kafka 3.7 answers.
 pub async fn test_list_offsets_isolation_max_timestamp_and_partitions() -> TestResult {
     println!("=== Test: ListOffsets isolation, MAX_TIMESTAMP, partition check ===\n");
     let ctx = TestContext::new().await?;
-    let t = topic(&ctx, "w3-txn-lo", 1).await?;
+    let t = topic(&ctx, "txn-lo", 1).await?;
     let mut w = Wire::connect().await?;
     let now = now_ms();
     // Offsets 0..=2 with timestamps now, now+50s, now+1s: the max is offset 1.
@@ -56,7 +55,7 @@ pub async fn test_list_offsets_isolation_max_timestamp_and_partitions() -> TestR
     }
 
     // An open transaction at offset 3 with an even later timestamp.
-    let tx = ctx.unique_topic("w3-txn-lo-tx").await;
+    let tx = ctx.unique_topic("txn-lo-tx").await;
     let (err, pid, ep) = w.init_producer_id(Some(&tx), 60_000).await?;
     assert_eq!(err, error_codes::NONE);
     assert_eq!(

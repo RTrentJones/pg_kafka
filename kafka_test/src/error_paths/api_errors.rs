@@ -1,4 +1,4 @@
-//! Stream `api`: every request that fails after a valid header gets a well-formed response of
+//! Every request that fails after a valid header gets a well-formed response of
 //! its own API and version, carrying an error code and the request's correlation id.
 //!
 //! These tests speak the wire protocol directly (kafka-protocol encodes the requests and

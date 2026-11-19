@@ -1,15 +1,10 @@
-//! E2E tests for the time-partitioned `kafka.messages` (ADR-001, stream `part`).
-//!
-//! Fail-before/pass-after: before this change kafka.messages was one table, so
-//! `kafka.message_partitions()` / `pg_kafka_run_partition_maintenance()` did not exist
-//! and the sweep had no `dropped_partitions` category; every test here fails on the
-//! old extension.
+//! E2E tests for the time-partitioned `kafka.messages` (ADR-001).
 //!
 //! The tests are width-agnostic: they read `pg_kafka.message_partition_minutes` and
 //! backdate rows by whole multiples of it (an UPDATE of created_at moves a row into
 //! kafka.messages_default when no leaf covers that time; partition maintenance then
 //! gives it a leaf). Retention is set straight in kafka.topics.retention_ms (the
-//! IncrementalAlterConfigs path is covered in configs.rs).
+//! IncrementalAlterConfigs path is covered in admin/configs.rs).
 //!
 //! All `parallel_safe: false`: they create and drop leaves far in the past and run
 //! the sweep, which also reaps other topics' rows that have a per-topic window.

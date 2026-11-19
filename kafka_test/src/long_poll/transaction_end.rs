@@ -10,14 +10,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-// -------------------------------------------------------------------------------------
-// Item 8: every transaction end wakes read_committed long polls.
-// -------------------------------------------------------------------------------------
-
-/// Before: only EndTxn sent `TransactionEnded`; a transaction aborted by fencing
-/// (InitProducerId of a new producer instance) or by its timeout woke a parked
-/// read_committed fetch only through the long-poll safety net (1 s). Now the worker
-/// notifies after every transaction end.
+/// Every transaction end notifies `TransactionEnded`, not only EndTxn: a transaction
+/// aborted by fencing (InitProducerId of a new producer instance) or by its timeout must
+/// wake a parked read_committed fetch at once, not through the long-poll safety net (1 s).
 ///
 /// Asserts, with a read_committed consumer parked (fetch.wait.max.ms 5000) behind a
 /// pending transaction and a committed record after it: in 5 fencing rounds the

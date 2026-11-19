@@ -13,15 +13,15 @@ use rdkafka::types::RDKafkaErrorCode;
 use rdkafka::TopicPartitionList;
 use std::time::{Duration, Instant};
 
-/// Items 3 and 4 (raw wire, Kafka 3.7's answers): INCONSISTENT_GROUP_PROTOCOL for a different
+/// Raw wire, Kafka 3.7's answers: INCONSISTENT_GROUP_PROTOCOL for a different
 /// protocol type, no common protocol, or an empty protocol list; UNKNOWN_MEMBER_ID for a JoinGroup
 /// with a member id the group does not know (no group is created for it); and a v5 error
 /// response decodes (protocol_name "" rather than null before v7). The group is unaffected.
 pub async fn test_join_group_protocol_and_member_id_rules() -> TestResult {
     println!("=== Test: JoinGroup protocol rules ===\n");
     let ctx = TestContext::new().await?;
-    let group = ctx.unique_group("w3g-proto").await;
-    let fresh = ctx.unique_group("w3g-unknown-member").await;
+    let group = ctx.unique_group("proto").await;
+    let fresh = ctx.unique_group("unknown-member").await;
 
     let mut a = conn().await?;
     let (e, generation, member, proto) = join_now(
@@ -90,14 +90,14 @@ pub async fn test_join_group_protocol_and_member_id_rules() -> TestResult {
     Ok(())
 }
 
-/// Items 3 + 7 with real clients: an rdkafka consumer using the cooperative-sticky assignor
+/// With real clients: an rdkafka consumer using the cooperative-sticky assignor
 /// joining a group whose member uses range gets INCONSISTENT_GROUP_PROTOCOL, and the existing
 /// member keeps its assignment and keeps consuming (no rebalance is started by the refused join).
 pub async fn test_join_with_no_common_assignor_is_refused() -> TestResult {
     println!("=== Test: a consumer with no common assignor is refused ===\n");
     let ctx = TestContext::new().await?;
-    let topic = ctx.unique_topic("w3g-assignor").await;
-    let group = ctx.unique_group("w3g-assignor").await;
+    let topic = ctx.unique_topic("assignor").await;
+    let group = ctx.unique_group("assignor").await;
     produce_one(&topic).await?;
 
     let make = |strategy: &str| -> DynResult<BaseConsumer> {
@@ -160,17 +160,16 @@ pub async fn test_join_with_no_common_assignor_is_refused() -> TestResult {
     Ok(())
 }
 
-/// Item 2: a group with only committed offsets is an Empty "consumer" group for ListGroups and
-/// DescribeGroups, including after a worker restart (which empties the in-memory coordinator);
-/// DeleteGroups deletes it and then answers GROUP_ID_NOT_FOUND. Uses a real rdkafka consumer
-/// group to commit. Before: after a restart the group was missing from ListGroups and "Dead" in
-/// DescribeGroups (`kafka-consumer-groups --describe` said it does not exist), and DeleteGroups of
-/// a group that never existed answered NONE. Sequential: restarts the listener worker.
+/// A group with only committed offsets is an Empty "consumer" group for ListGroups and
+/// DescribeGroups, including after a worker restart (which empties the in-memory
+/// coordinator), so `kafka-consumer-groups --describe` finds it; DeleteGroups deletes it and
+/// then answers GROUP_ID_NOT_FOUND. Uses a real rdkafka consumer group to commit.
+/// Sequential: restarts the listener worker.
 pub async fn test_offsets_only_group_is_listed_after_restart() -> TestResult {
     println!("=== Test: offsets-only groups are Empty groups after a restart ===\n");
     let ctx = TestContext::new().await?;
-    let topic = ctx.unique_topic("w3g-oo").await;
-    let group = ctx.unique_group("w3g-oo").await;
+    let topic = ctx.unique_topic("offsets-only").await;
+    let group = ctx.unique_group("offsets-only").await;
     produce_one(&topic).await?;
 
     {
@@ -209,7 +208,7 @@ pub async fn test_offsets_only_group_is_listed_after_restart() -> TestResult {
         "ListGroups: {:?}",
         listed
             .iter()
-            .filter(|g| g.0.starts_with("w3g"))
+            .filter(|g| g.0.starts_with("offsets-only"))
             .collect::<Vec<_>>()
     );
     assert_eq!(
