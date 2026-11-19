@@ -382,146 +382,183 @@ impl SaslSession {
                         request.illegal_state("unexpected SaslHandshake"),
                     );
                 }
-                if api_version < 1 {
-                    // v0 would switch the connection to unframed tokens; not served.
-                    self.state = State::Failed;
-                    return SaslOutcome::ReplyAndClose(handshake_response(
-                        correlation_id,
-                        api_version,
-                        ERROR_UNSUPPORTED_VERSION,
-                        &self.mechanisms,
-                    ));
-                }
-                let wanted = SaslMechanism::parse(mechanism)
-                    .ok()
-                    .filter(|m| self.mechanisms.contains(m));
-                if let Some(m) = wanted {
-                    self.state = State::AwaitingToken(m);
-                    SaslOutcome::Reply(handshake_response(
-                        correlation_id,
-                        api_version,
-                        ERROR_NONE,
-                        &self.mechanisms,
-                    ))
-                } else {
-                    self.state = State::Failed;
-                    SaslOutcome::ReplyAndClose(handshake_response(
-                        correlation_id,
-                        api_version,
-                        ERROR_UNSUPPORTED_SASL_MECHANISM,
-                        &self.mechanisms,
-                    ))
-                }
+                self.handshake(correlation_id, api_version, mechanism)
             }
             SaslRequest::Authenticate {
                 correlation_id,
                 api_version,
-                ref auth_bytes,
+                auth_bytes,
             } => {
-                let state = std::mem::replace(&mut self.state, State::Failed);
-                let fail = |reason: String| SaslOutcome::Failed {
-                    response: authenticate_response(
-                        correlation_id,
-                        api_version,
-                        ERROR_SASL_AUTHENTICATION_FAILED,
-                        Some(AUTH_FAILED_MESSAGE),
-                        Bytes::new(),
-                    ),
-                    reason,
+                let reply = AuthenticateReply {
+                    correlation_id,
+                    api_version,
                 };
-                match state {
-                    State::AwaitingToken(SaslMechanism::Plain) => {
-                        let creds = match parse_plain(auth_bytes) {
-                            Ok(c) => c,
-                            Err(e) => return fail(format!("PLAIN: {e}")),
-                        };
-                        let stored = match lookup.lookup(&creds.username, None).await {
-                            Ok(s) => s,
-                            Err(e) => return fail(format!("PLAIN: {e}")),
-                        };
-                        let username = creds.username.clone();
-                        if check_password(creds, stored).await {
-                            self.state = State::Authenticated;
-                            SaslOutcome::Authenticated {
-                                response: authenticate_response(
-                                    correlation_id,
-                                    api_version,
-                                    ERROR_NONE,
-                                    None,
-                                    Bytes::new(),
-                                ),
-                                principal: format!("User:{username}"),
-                                mechanism: "PLAIN",
-                            }
-                        } else {
-                            fail("PLAIN: invalid credentials".into())
-                        }
-                    }
-                    State::AwaitingToken(SaslMechanism::Scram(m)) => {
-                        let first = match parse_client_first(auth_bytes) {
-                            Ok(f) => f,
-                            Err(e) => return fail(format!("{}: {}", m.name(), e)),
-                        };
-                        let stored = match lookup.lookup(&first.username, Some(m)).await {
-                            Ok(s) => s,
-                            Err(e) => return fail(format!("{}: {}", m.name(), e)),
-                        };
-                        let (known, fake) = match stored {
-                            StoredCredential::Known(c) => (Some(c), None),
-                            StoredCredential::Unknown(f) => (None, Some(f)),
-                        };
-                        let server = ScramServerState::start(
-                            m,
-                            first,
-                            known,
-                            fake,
-                            &generate_server_nonce(),
-                        );
-                        let server_first = Bytes::copy_from_slice(server.server_first().as_bytes());
-                        self.state = State::ScramFinal(Box::new(server));
-                        SaslOutcome::Reply(authenticate_response(
-                            correlation_id,
-                            api_version,
-                            ERROR_NONE,
-                            None,
-                            server_first,
-                        ))
-                    }
-                    State::ScramFinal(server) => match server.verify_client_final(auth_bytes) {
-                        Ok(server_final) => {
-                            self.state = State::Authenticated;
-                            SaslOutcome::Authenticated {
-                                response: authenticate_response(
-                                    correlation_id,
-                                    api_version,
-                                    ERROR_NONE,
-                                    None,
-                                    Bytes::from(server_final.into_bytes()),
-                                ),
-                                principal: format!("User:{}", server.username()),
-                                mechanism: server.mechanism().name(),
-                            }
-                        }
-                        Err(e) => fail(format!("SCRAM: {e}")),
-                    },
-                    State::AwaitingHandshake => SaslOutcome::ReplyAndClose(authenticate_response(
-                        correlation_id,
-                        api_version,
-                        ERROR_ILLEGAL_SASL_STATE,
-                        Some("SaslAuthenticate before SaslHandshake"),
-                        Bytes::new(),
-                    )),
-                    State::Authenticated | State::Failed => {
-                        SaslOutcome::ReplyAndClose(authenticate_response(
-                            correlation_id,
-                            api_version,
-                            ERROR_ILLEGAL_SASL_STATE,
-                            Some("unexpected SaslAuthenticate"),
-                            Bytes::new(),
-                        ))
-                    }
+                self.authenticate(reply, &auth_bytes, lookup).await
+            }
+        }
+    }
+
+    /// A SaslHandshake while awaiting one: accept an enabled mechanism, refuse
+    /// anything else (and v0) and close.
+    fn handshake(&mut self, correlation_id: i32, api_version: i16, mechanism: &str) -> SaslOutcome {
+        let respond =
+            |code| handshake_response(correlation_id, api_version, code, &self.mechanisms);
+        if api_version < 1 {
+            // v0 would switch the connection to unframed tokens; not served.
+            self.state = State::Failed;
+            return SaslOutcome::ReplyAndClose(respond(ERROR_UNSUPPORTED_VERSION));
+        }
+        let wanted = SaslMechanism::parse(mechanism)
+            .ok()
+            .filter(|m| self.mechanisms.contains(m));
+        let Some(m) = wanted else {
+            let outcome = SaslOutcome::ReplyAndClose(respond(ERROR_UNSUPPORTED_SASL_MECHANISM));
+            self.state = State::Failed;
+            return outcome;
+        };
+        let outcome = SaslOutcome::Reply(respond(ERROR_NONE));
+        self.state = State::AwaitingToken(m);
+        outcome
+    }
+
+    /// A SaslAuthenticate: the next step of the exchange the handshake chose. Any
+    /// failure leaves the session `Failed`.
+    async fn authenticate<L: CredentialLookup>(
+        &mut self,
+        reply: AuthenticateReply,
+        auth_bytes: &[u8],
+        lookup: &L,
+    ) -> SaslOutcome {
+        match std::mem::replace(&mut self.state, State::Failed) {
+            State::AwaitingToken(SaslMechanism::Plain) => {
+                self.authenticate_plain(reply, auth_bytes, lookup).await
+            }
+            State::AwaitingToken(SaslMechanism::Scram(m)) => {
+                self.scram_client_first(reply, m, auth_bytes, lookup).await
+            }
+            State::ScramFinal(server) => self.scram_client_final(reply, &server, auth_bytes),
+            State::AwaitingHandshake => SaslOutcome::ReplyAndClose(
+                reply.illegal_state("SaslAuthenticate before SaslHandshake"),
+            ),
+            State::Authenticated | State::Failed => {
+                SaslOutcome::ReplyAndClose(reply.illegal_state("unexpected SaslAuthenticate"))
+            }
+        }
+    }
+
+    async fn authenticate_plain<L: CredentialLookup>(
+        &mut self,
+        reply: AuthenticateReply,
+        auth_bytes: &[u8],
+        lookup: &L,
+    ) -> SaslOutcome {
+        let creds = match parse_plain(auth_bytes) {
+            Ok(c) => c,
+            Err(e) => return reply.failed(format!("PLAIN: {e}")),
+        };
+        let stored = match lookup.lookup(&creds.username, None).await {
+            Ok(s) => s,
+            Err(e) => return reply.failed(format!("PLAIN: {e}")),
+        };
+        let principal = format!("User:{}", creds.username);
+        if !check_password(creds, stored).await {
+            return reply.failed("PLAIN: invalid credentials".into());
+        }
+        self.state = State::Authenticated;
+        SaslOutcome::Authenticated {
+            response: reply.ok(Bytes::new()),
+            principal,
+            mechanism: "PLAIN",
+        }
+    }
+
+    /// SCRAM client-first: look the user up and answer the server-first message.
+    async fn scram_client_first<L: CredentialLookup>(
+        &mut self,
+        reply: AuthenticateReply,
+        mechanism: ScramMechanism,
+        auth_bytes: &[u8],
+        lookup: &L,
+    ) -> SaslOutcome {
+        let first = match parse_client_first(auth_bytes) {
+            Ok(f) => f,
+            Err(e) => return reply.failed(format!("{}: {e}", mechanism.name())),
+        };
+        let stored = match lookup.lookup(&first.username, Some(mechanism)).await {
+            Ok(s) => s,
+            Err(e) => return reply.failed(format!("{}: {e}", mechanism.name())),
+        };
+        let (known, fake) = match stored {
+            StoredCredential::Known(c) => (Some(c), None),
+            StoredCredential::Unknown(f) => (None, Some(f)),
+        };
+        let server =
+            ScramServerState::start(mechanism, first, known, fake, &generate_server_nonce());
+        let server_first = Bytes::copy_from_slice(server.server_first().as_bytes());
+        self.state = State::ScramFinal(Box::new(server));
+        SaslOutcome::Reply(reply.ok(server_first))
+    }
+
+    /// SCRAM client-final: check the proof and answer the server-final message.
+    fn scram_client_final(
+        &mut self,
+        reply: AuthenticateReply,
+        server: &ScramServerState,
+        auth_bytes: &[u8],
+    ) -> SaslOutcome {
+        match server.verify_client_final(auth_bytes) {
+            Ok(server_final) => {
+                self.state = State::Authenticated;
+                SaslOutcome::Authenticated {
+                    response: reply.ok(Bytes::from(server_final.into_bytes())),
+                    principal: format!("User:{}", server.username()),
+                    mechanism: server.mechanism().name(),
                 }
             }
+            Err(e) => reply.failed(format!("SCRAM: {e}")),
+        }
+    }
+}
+
+/// Builds the SaslAuthenticate responses of one request.
+#[derive(Clone, Copy)]
+struct AuthenticateReply {
+    correlation_id: i32,
+    api_version: i16,
+}
+
+impl AuthenticateReply {
+    fn ok(self, auth_bytes: Bytes) -> KafkaResponse {
+        authenticate_response(
+            self.correlation_id,
+            self.api_version,
+            ERROR_NONE,
+            None,
+            auth_bytes,
+        )
+    }
+
+    fn illegal_state(self, message: &str) -> KafkaResponse {
+        authenticate_response(
+            self.correlation_id,
+            self.api_version,
+            ERROR_ILLEGAL_SASL_STATE,
+            Some(message),
+            Bytes::new(),
+        )
+    }
+
+    /// A failed authentication; `reason` is for the server log only.
+    fn failed(self, reason: String) -> SaslOutcome {
+        SaslOutcome::Failed {
+            response: authenticate_response(
+                self.correlation_id,
+                self.api_version,
+                ERROR_SASL_AUTHENTICATION_FAILED,
+                Some(AUTH_FAILED_MESSAGE),
+                Bytes::new(),
+            ),
+            reason,
         }
     }
 }
