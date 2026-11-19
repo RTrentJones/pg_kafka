@@ -115,6 +115,37 @@ Other flags: `--sequential` (disable parallelism; runs are parallel by default),
 
 ---
 
+## Real-Client and Differential Checks (`interop/`)
+
+Two harnesses check pg_kafka against Apache Kafka's own clients and against a real Kafka broker.
+Both run in CI (job `interop`, PostgreSQL 18) and locally against any running pg_kafka:
+
+```bash
+# Reference broker: single-node KRaft Kafka 3.7 on 127.0.0.1:9093
+interop/kafka-ref.sh start /path/to/kafka_2.13-3.7.0 /tmp/kref
+
+# Java tools and clients: verifiable producer + 3 verifiable consumers through a rebalance
+# (no loss, no duplicates, bounded rebalances), consumer-groups --describe lag, get-offsets,
+# transactional perf-test + read_committed consumer, TransactionalMessageCopier with random
+# aborts, aborted / open transactions at the tail, SASL SCRAM-SHA-256/512 + PLAIN, Kafka Streams
+KAFKA_HOME=/path/to/kafka_2.13-3.7.0 PGHOST=127.0.0.1 PGPORT=28814 PGUSER=postgres \
+  interop/run-java-checks.sh [--only name,...] [--list]
+
+# The same raw request sequences against pg_kafka and Kafka, normalised and compared
+KAFKA_HOME=/path/to/kafka_2.13-3.7.0 python3 interop/diff/run.py --pg 127.0.0.1:9092 --kafka 127.0.0.1:9093
+```
+
+`interop/diff/KafkaWire.java` encodes and decodes with Kafka's generated protocol classes, so
+every API and version is read exactly as the Java client reads it. Every difference the
+differential harness finds is classified in `KNOWN` (`interop/diff/run.py`) as a documented
+deviation (with its `PROTOCOL_DEVIATIONS.md` section) or a bug; an unclassified difference fails
+the run. Checks and observations marked as bugs (`XFAIL`) do not fail the run; once fixed they
+report `XPASS` and the mark should be removed. The Java checks pass against the reference broker
+itself (`BOOTSTRAP=127.0.0.1:9093`, skipping the two that need pg_kafka's SQL), which is how they
+were validated.
+
+---
+
 ## Test Architecture
 
 ### Unit Tests (No Database Required)
