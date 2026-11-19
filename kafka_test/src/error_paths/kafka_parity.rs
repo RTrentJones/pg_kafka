@@ -5,14 +5,19 @@ use crate::common::TestResult;
 use crate::fixtures::TestTopicBuilder;
 use crate::setup::TestContext;
 use crate::w3_txn::wire::{batch, now_ms, Wire};
+use kafka_protocol::messages::offset_commit_request::{
+    OffsetCommitRequest, OffsetCommitRequestPartition, OffsetCommitRequestTopic,
+};
+use kafka_protocol::messages::offset_commit_response::OffsetCommitResponse;
 use kafka_protocol::messages::produce_request::{
     PartitionProduceData, ProduceRequest, TopicProduceData,
 };
 use kafka_protocol::messages::produce_response::ProduceResponse;
-use kafka_protocol::messages::TopicName;
+use kafka_protocol::messages::{GroupId, TopicName};
 use kafka_protocol::protocol::StrBytes;
 
 const ERROR_NONE: i16 = 0;
+const ERROR_UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
 
 /// Produce v8 of `values` to partition 0: `(error_code, base_offset, log_start_offset)`.
 async fn produce_v8(
@@ -103,6 +108,61 @@ pub async fn test_list_offsets_without_a_matching_record_is_offset_minus_one() -
         "MAX_TIMESTAMP of an empty partition"
     );
     println!("✅ NONE / -1 / -1 when no record matches\n");
+
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// OffsetCommit to a partition the topic does not have answers
+/// UNKNOWN_TOPIC_OR_PARTITION for that partition and stores nothing for it.
+pub async fn test_offset_commit_to_a_missing_partition_is_refused() -> TestResult {
+    println!("=== Test: OffsetCommit to a missing partition ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = TestTopicBuilder::new(&ctx, "parity-commit")
+        .build()
+        .await?
+        .name;
+    let group = ctx.unique_group("parity-commit").await;
+    let mut wire = Wire::connect().await?;
+
+    let partitions = [0, 5]
+        .into_iter()
+        .map(|partition_index| {
+            let mut p = OffsetCommitRequestPartition::default();
+            p.partition_index = partition_index;
+            p.committed_offset = 1;
+            p
+        })
+        .collect();
+    let mut t = OffsetCommitRequestTopic::default();
+    t.name = TopicName(StrBytes::from_string(topic.clone()));
+    t.partitions = partitions;
+    let mut req = OffsetCommitRequest::default();
+    req.group_id = GroupId(StrBytes::from_string(group.clone()));
+    req.generation_id_or_member_epoch = -1;
+    req.topics = vec![t];
+    let resp: OffsetCommitResponse = wire.call(8, 8, &req).await?;
+    let codes: Vec<(i32, i16)> = resp.topics[0]
+        .partitions
+        .iter()
+        .map(|p| (p.partition_index, p.error_code))
+        .collect();
+    assert_eq!(
+        codes,
+        vec![(0, ERROR_NONE), (5, ERROR_UNKNOWN_TOPIC_OR_PARTITION)]
+    );
+
+    let stored: i64 = ctx
+        .db()
+        .query_one(
+            "SELECT COUNT(*) FROM kafka.consumer_offsets WHERE group_id = $1 AND partition_id = 5",
+            &[&group],
+        )
+        .await?
+        .get(0);
+    assert_eq!(stored, 0, "nothing is stored for the missing partition");
+    println!("✅ partition 5 refused, partition 0 committed\n");
 
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");

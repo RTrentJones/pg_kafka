@@ -3,8 +3,10 @@
 // Handlers for OffsetCommit and OffsetFetch requests.
 // These track consumer group progress through partitions.
 
-use super::helpers::{resolve_topic_id, topic_resolution_error_code, TopicResolution};
-use crate::kafka::constants::ERROR_NONE;
+use super::helpers::{
+    resolve_topic, resolve_topic_id, topic_resolution_error_code, TopicResolution,
+};
+use crate::kafka::constants::{ERROR_NONE, ERROR_UNKNOWN_TOPIC_OR_PARTITION};
 use crate::kafka::error::Result;
 use crate::kafka::handler_context::HandlerContext;
 use crate::kafka::storage::CommittedOffset;
@@ -65,12 +67,12 @@ pub fn handle_offset_commit(
     for topic in topics {
         let topic_name = topic.name.clone();
 
-        // Look up topic_id using helper
-        let topic_id = match resolve_topic_id(store, &topic_name) {
-            TopicResolution::Found(id) => id,
-            resolution => {
+        // Look up topic_id and partition count using helper
+        let (topic_id, partition_count) = match resolve_topic(store, &topic_name) {
+            Ok(Some(found)) => found,
+            unresolved => {
                 // Topic not found or error - return error for all partitions
-                let error_code = topic_resolution_error_code(&resolution);
+                let error_code = unresolved.err().unwrap_or(ERROR_UNKNOWN_TOPIC_OR_PARTITION);
                 let mut error_partitions = Vec::new();
                 for partition in topic.partitions {
                     let mut partition_response = OffsetCommitResponsePartition::default();
@@ -94,6 +96,15 @@ pub fn handle_offset_commit(
             let partition_id = partition.partition_index;
             let committed_offset = partition.committed_offset;
             let metadata = partition.metadata.as_deref();
+
+            // Kafka refuses a commit for a partition the topic does not have.
+            if partition_id < 0 || partition_id >= partition_count {
+                let mut partition_response = OffsetCommitResponsePartition::default();
+                partition_response.partition_index = partition_id;
+                partition_response.error_code = ERROR_UNKNOWN_TOPIC_OR_PARTITION;
+                partition_responses.push(partition_response);
+                continue;
+            }
 
             // Commit offset
             let error_code = match store.commit_offset(
@@ -346,6 +357,59 @@ mod tests {
         // topics = None selects the fetch-all path.
         let resp = handle_offset_fetch(&ctx, "g".to_string(), None, false).unwrap();
         assert_ne!(resp.error_code, ERROR_NONE);
+    }
+
+    /// Kafka answers UNKNOWN_TOPIC_OR_PARTITION for a commit to a partition the topic
+    /// does not have, and stores nothing for it; the topic's real partitions commit.
+    #[test]
+    fn test_offset_commit_to_a_missing_partition_is_unknown_topic_or_partition() {
+        use crate::kafka::messages::{OffsetCommitPartitionData, OffsetCommitTopicData};
+        use crate::kafka::storage::TopicMetadata;
+        let mut store = MockKafkaStore::new();
+        store.expect_get_topic_metadata().returning(|_| {
+            Ok(vec![TopicMetadata {
+                name: "t".to_string(),
+                id: 1,
+                partition_count: 2,
+            }])
+        });
+        store
+            .expect_commit_offset()
+            .withf(|_, _, partition, _, _| *partition == 1)
+            .times(1)
+            .returning(|_, _, _, _, _| Ok(()));
+        let coordinator = crate::kafka::GroupCoordinator::new();
+        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = HandlerContext::new(
+            &store,
+            &coordinator,
+            &broker,
+            1,
+            kafka_protocol::records::Compression::None,
+        );
+        let partition = |partition_index| OffsetCommitPartitionData {
+            partition_index,
+            committed_offset: 3,
+            metadata: None,
+        };
+        let topics = vec![OffsetCommitTopicData {
+            name: "t".to_string(),
+            partitions: vec![partition(1), partition(2), partition(-1)],
+        }];
+        let resp = handle_offset_commit(&ctx, "g".to_string(), -1, String::new(), topics).unwrap();
+        let codes: Vec<(i32, i16)> = resp.topics[0]
+            .partitions
+            .iter()
+            .map(|p| (p.partition_index, p.error_code))
+            .collect();
+        assert_eq!(
+            codes,
+            vec![
+                (1, ERROR_NONE),
+                (2, ERROR_UNKNOWN_TOPIC_OR_PARTITION),
+                (-1, ERROR_UNKNOWN_TOPIC_OR_PARTITION)
+            ]
+        );
     }
 
     /// wave3 txn (KIP-447): with require_stable, a partition with a pending

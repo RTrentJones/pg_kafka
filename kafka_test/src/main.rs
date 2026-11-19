@@ -242,6 +242,7 @@ use kafka_test::{
     test_offset_commit_fetch,
     test_offset_commit_multi_partition,
     test_offset_commit_race,
+    test_offset_commit_to_a_missing_partition_is_refused,
     test_offset_commit_with_metadata,
     test_offset_no_reuse_after_cleanup,
     test_offset_reset_policy,
@@ -1011,6 +1012,12 @@ fn get_all_tests() -> Vec<TestDef> {
             category: "error_paths",
             name: "test_list_offsets_without_a_matching_record_is_offset_minus_one",
             test_fn: wrap_test!(test_list_offsets_without_a_matching_record_is_offset_minus_one),
+            parallel_safe: true,
+        },
+        TestDef {
+            category: "error_paths",
+            name: "test_offset_commit_to_a_missing_partition_is_refused",
+            test_fn: wrap_test!(test_offset_commit_to_a_missing_partition_is_refused),
             parallel_safe: true,
         },
         TestDef {
