@@ -11,8 +11,8 @@
 
 \echo Use "ALTER EXTENSION pg_kafka UPDATE TO '0.1.0'" to load this file. \quit
 
--- wave3 worker: take the pg_kafka schema lock first. Every transaction of a running
--- background worker holds it in SHARE mode (src/worker.rs, SCHEMA_LOCK_KEY), so this
+-- Take the pg_kafka schema lock first. Every transaction of a running
+-- background worker holds it in SHARE mode (src/worker/txn.rs, SCHEMA_LOCK_KEY), so this
 -- waits for the worker's current transaction and keeps new ones out until the upgrade
 -- commits: the script's DDL never meets a worker transaction holding some of the same
 -- tables in another order (lock-order deadlocks). Every upgrade script must start so.
@@ -63,9 +63,7 @@ REVOKE ALL ON kafka.messages_legacy FROM PUBLIC;
 DROP VIEW kafka.shadow_status;
 DROP VIEW kafka.metrics;
 
--- Messages table: The actual message log with dual-offset design.
---
--- Time-partitioned (0.1.0, ADR-001): RANGE on created_at, the broker insert time.
+-- Time-partitioned (ADR-001): RANGE on created_at, the broker insert time.
 -- Each leaf ("time partition", like a Kafka log segment) covers
 -- pg_kafka.message_partition_minutes (default one day, aligned to UTC). The worker
 -- creates the current and the next two leaves ahead of time through
@@ -104,7 +102,7 @@ CREATE TABLE kafka.messages (
     -- against. TIMESTAMPTZ (not naive TIMESTAMP) so EXTRACT(EPOCH ...) is unambiguous and doesn't
     -- skew by the session time zone.
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    -- Phase 10: Transaction tracking columns
+    -- Transaction tracking (NULL for non-transactional records)
     producer_id BIGINT,                -- Producer ID for transactional messages (NULL for non-transactional)
     producer_epoch SMALLINT,           -- Producer epoch for fencing
     txn_state TEXT,                    -- NULL (committed/non-txn), 'pending' (uncommitted), 'aborted'
@@ -116,20 +114,18 @@ CREATE TABLE kafka.messages (
 
 -- Kafka fetch queries (WHERE topic_id = ? AND partition_id = ? AND partition_offset >= ?)
 -- are served by each leaf's UNIQUE (topic_id, partition_id, partition_offset) btree.
--- (The former idx_messages_topic_partition_offset duplicated the old primary key
--- exactly and only doubled write amplification; dropped in 0.1.0.)
 
 -- Retention expiry scans inside a leaf that cannot be dropped whole (WHERE topic_id = ?
 -- AND created_at < cutoff). BRIN, not btree: created_at grows with insertion order, so
 -- a BRIN summary per block range lets the sweep skip every block of still-retained
 -- messages at a tiny fraction of a btree's size and insert cost. autosummarize asks
 -- autovacuum to summarize each block range as it fills. Partitioned index: every leaf
--- gets one. Added in 0.1.0.
+-- gets one.
 CREATE INDEX idx_messages_created_at_brin
 ON kafka.messages USING brin (created_at) WITH (autosummarize = on);
 
--- Index for read_committed filtering (Phase 10: exclude pending transactional messages)
--- Supports: SELECT * FROM kafka.messages WHERE ... AND (txn_state IS NULL)
+-- The lowest pending transactional offset of a partition (the last stable offset of
+-- read_committed fetches).
 CREATE INDEX idx_messages_txn_pending
 ON kafka.messages(topic_id, partition_id, partition_offset)
 WHERE txn_state = 'pending';
@@ -548,7 +544,7 @@ SELECT
     'total' AS unit
 FROM kafka.consumer_offsets
 UNION ALL
--- Producer metrics (Phase 9)
+-- Producer metrics
 SELECT
     'producers' AS category,
     'active' AS metric,
@@ -557,7 +553,7 @@ SELECT
 FROM kafka.producer_ids
 WHERE last_active_at > NOW() - INTERVAL '5 minutes'
 UNION ALL
--- Transaction metrics (Phase 10)
+-- Transaction metrics
 SELECT
     'transactions' AS category,
     'ongoing' AS metric,
@@ -574,7 +570,7 @@ SELECT
 FROM kafka.messages
 WHERE txn_state = 'pending'
 UNION ALL
--- Shadow mode metrics (Phase 11)
+-- Shadow mode metrics
 SELECT
     'shadow' AS category,
     'forwarded' AS metric,
@@ -674,7 +670,8 @@ GRANT SELECT ON kafka.shadow_config TO pgkafka_worker;
 GRANT SELECT, INSERT, UPDATE, DELETE ON kafka.shadow_tracking TO pgkafka_worker;
 GRANT SELECT, INSERT, UPDATE ON kafka.shadow_metrics TO pgkafka_worker;
 
--- BEGIN broker request metrics (metrics stream)
+-- =============================================================================
+-- Broker request metrics
 -- =============================================================================
 -- The background worker keeps per-API request/error/latency counters and broker
 -- gauges (open connections, request-queue depth) in memory (src/kafka/metrics.rs)
@@ -745,15 +742,12 @@ COMMENT ON TABLE kafka.broker_gauges IS 'Broker gauges published by the pg_kafka
 COMMENT ON VIEW kafka.api_metrics IS 'Per-API requests, errors and latency (count/sum/max/avg, microseconds): handler plus batch commit for worker APIs, decode to response on the network thread for SaslHandshake/SaslAuthenticate.';
 COMMENT ON VIEW kafka.broker_metrics IS 'Broker gauges: open/accepted/rejected connections and request-lane depths.';
 COMMENT ON VIEW kafka.consumer_lag IS 'Committed offset vs log-end offset per consumer group/topic/partition.';
--- =============================================================================
 -- The worker flushes these two tables (storage::privileges::WORKER_TABLE_GRANTS).
 GRANT SELECT, INSERT, UPDATE ON kafka.broker_api_stats TO pgkafka_worker;
 GRANT SELECT, INSERT, UPDATE ON kafka.broker_gauges TO pgkafka_worker;
 
--- END broker request metrics (metrics stream)
-
 -- =============================================================================
--- SASL credentials (auth stream)
+-- SASL credentials
 -- =============================================================================
 -- One SCRAM credential per Kafka user and mechanism, stored the way Kafka stores
 -- them: salt, iteration count, StoredKey = H(HMAC(SaltedPassword, 'Client Key')),
@@ -825,16 +819,13 @@ STRICT VOLATILE
 LANGUAGE c
 AS 'MODULE_PATHNAME', 'pg_kafka_drop_user_wrapper';
 
--- END SASL credentials (auth stream)
 -- =============================================================================
-
--- =============================================================================
--- wave3 groups: bound kafka.topics.partitions (see bootstrap.sql)
+-- Bound kafka.topics.partitions (see bootstrap.sql)
 -- =============================================================================
 -- A 0.0.0 install may hold an out-of-range count written before the cap existed (such a topic
 -- made every Metadata request crash the server). Clamp it into range, loudly, so the
 -- constraint can be added; no partition at or above 100000 can hold data in practice.
-DO $wave3_groups$
+DO $$
 DECLARE
     r RECORD;
 BEGIN
@@ -846,11 +837,12 @@ BEGIN
     UPDATE kafka.topics SET partitions = LEAST(GREATEST(partitions, 1), 100000)
     WHERE partitions < 1 OR partitions > 100000;
 END
-$wave3_groups$;
+$$;
 ALTER TABLE kafka.topics ADD CONSTRAINT topics_partitions_range
     CHECK (partitions >= 1 AND partitions <= 100000);
--- END wave3 groups
--- wave3 txn: idempotent producer batch cache + transaction partition registry
+
+-- =============================================================================
+-- Idempotent producer batch cache and transaction partition registry
 -- =============================================================================
 -- The last 5 batches (Kafka's max.in.flight bound for idempotence) of every producer
 -- on every partition: their sequence range and base offset, so a retried batch is
@@ -891,9 +883,9 @@ GRANT SELECT, INSERT, DELETE ON kafka.txn_partitions TO pgkafka_worker;
 COMMENT ON TABLE kafka.producer_batches IS 'Last 5 batches per idempotent producer and partition (sequence range, base offset) for duplicate detection.';
 COMMENT ON TABLE kafka.txn_partitions IS 'Partitions added (AddPartitionsToTxn) to the open transaction of each transactional id.';
 
--- END wave3 txn
--- wave3 net: durable secret for unknown-user SCRAM/PLAIN fake credentials
---
+-- =============================================================================
+-- Durable secret for the fake credentials of unknown SASL users
+-- =============================================================================
 -- A SASL exchange for a user that does not exist runs to the end against a fake
 -- credential whose salt is HMAC(secret, mechanism:username), so probing a username
 -- twice, even across worker restarts, shows the same salt as a real user would. The
@@ -911,14 +903,14 @@ SELECT decode(
         || replace(gen_random_uuid()::text, '-', ''),
     'hex');
 GRANT SELECT ON kafka.sasl_server_secret TO pgkafka_worker;
-COMMENT ON TABLE kafka.sasl_server_secret IS 'Secret keying the fake SCRAM salts of unknown SASL users (wave3 net); never shown to clients.';
--- END wave3 net
+COMMENT ON TABLE kafka.sasl_server_secret IS 'Secret keying the fake SCRAM salts of unknown SASL users; never shown to clients.';
+
 -- =============================================================================
--- wave3 shadow: pipelined forwarder, per-partition order, truthful lag
+-- Shadow outbox attempts and per-partition lag
 -- =============================================================================
--- attempt_open: a claim opens an attempt; its ack closes it. retry_count now
--- counts failed delivery attempts only (an ack of a failure, or an attempt still
--- open when its worker no longer tracks it, i.e. a lost ack), not claims.
+-- attempt_open: a claim opens an attempt; its ack closes it. retry_count counts
+-- failed delivery attempts only (an ack of a failure, or an attempt still open when
+-- its worker no longer tracks it, i.e. a lost ack), not claims.
 ALTER TABLE kafka.shadow_tracking
     ADD COLUMN attempt_open BOOLEAN NOT NULL DEFAULT false;
 GRANT SELECT (attempt_open) ON kafka.shadow_tracking TO pgkafka_reader;
@@ -1002,11 +994,10 @@ LEFT JOIN LATERAL (
 GRANT SELECT ON kafka.shadow_partition_status TO pgkafka_reader;
 COMMENT ON VIEW kafka.shadow_partition_status IS 'Per-partition shadow forwarding state: lag (records still to forward), dead letters, in-flight forwards, metrics.';
 
--- shadow_status: lag is now the sum of the per-partition lags (it was
--- MAX(offset) - MAX(last_forwarded_offset) across partitions: hid lagging
--- partitions, off by one, never 0 under sampling); totals come from
--- kafka.shadow_metrics without a join fan-out. New trailing columns:
--- dead_lettered and max_partition_lag.
+-- shadow_status: lag is the sum of the per-partition lags (the 0.0.0 view's
+-- MAX(offset) - MAX(last_forwarded_offset) across partitions hid lagging partitions,
+-- was off by one and never 0 under sampling); totals come from kafka.shadow_metrics
+-- without a join fan-out. Trailing columns added: dead_lettered, max_partition_lag.
 CREATE OR REPLACE VIEW kafka.shadow_status AS
 SELECT
     t.name AS topic_name,
@@ -1037,4 +1028,3 @@ LEFT JOIN (
     FROM kafka.shadow_partition_status
     GROUP BY topic_id
 ) ps ON ps.topic_id = t.id;
--- end wave3 shadow

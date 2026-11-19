@@ -102,18 +102,14 @@ pub async fn enable_shadow_mode(
     // and needs to reach external-kafka via docker network (port 9094)
     let bootstrap_servers = get_internal_bootstrap_servers();
     println!(
-        "  Setting pg_kafka.shadow_bootstrap_servers = '{}' (INTERNAL listener for container)",
-        bootstrap_servers
+        "  Setting pg_kafka.shadow_bootstrap_servers = '{bootstrap_servers}' (INTERNAL listener for container)"
     );
 
     db.execute("ALTER SYSTEM SET pg_kafka.shadow_mode_enabled = true", &[])
         .await?;
 
     db.execute(
-        &format!(
-            "ALTER SYSTEM SET pg_kafka.shadow_bootstrap_servers = '{}'",
-            bootstrap_servers
-        ),
+        &format!("ALTER SYSTEM SET pg_kafka.shadow_bootstrap_servers = '{bootstrap_servers}'"),
         &[],
     )
     .await?;
@@ -139,9 +135,9 @@ pub async fn enable_shadow_mode(
         WriteMode::ExternalOnly => "external_only",
     };
 
-    println!("  Inserting shadow config for topic_id={}...", topic_id);
+    println!("  Inserting shadow config for topic_id={topic_id}...");
     db.execute(
-        r#"
+        r"
         INSERT INTO kafka.shadow_config
             (topic_id, mode, forward_percentage, external_topic_name, sync_mode, write_mode, updated_at)
         VALUES ($1, $2, $3, $4, $5, $6, NOW())
@@ -152,11 +148,11 @@ pub async fn enable_shadow_mode(
             sync_mode = EXCLUDED.sync_mode,
             write_mode = EXCLUDED.write_mode,
             updated_at = NOW()
-        "#,
+        ",
         &[
             &topic_id,
             &mode_str,
-            &(config.forward_percentage as i32),
+            &i32::from(config.forward_percentage),
             &config.external_topic_name,
             &sync_mode_str,
             &write_mode_str,
@@ -187,12 +183,12 @@ pub async fn disable_shadow_mode(db: &Client, topic_name: &str) -> TestResult {
 
     // Disable shadow mode for topic
     db.execute(
-        r#"
+        r"
         UPDATE kafka.shadow_config sc
         SET mode = 'local_only', updated_at = NOW()
         FROM kafka.topics t
         WHERE sc.topic_id = t.id AND t.name = $1
-        "#,
+        ",
         &[&topic_name],
     )
     .await?;
@@ -222,13 +218,13 @@ pub async fn disable_shadow_mode(db: &Client, topic_name: &str) -> TestResult {
 /// Update forward percentage for a topic
 pub async fn set_forward_percentage(db: &Client, topic_name: &str, percentage: u8) -> TestResult {
     db.execute(
-        r#"
+        r"
         UPDATE kafka.shadow_config sc
         SET forward_percentage = $2, updated_at = NOW()
         FROM kafka.topics t
         WHERE sc.topic_id = t.id AND t.name = $1
-        "#,
-        &[&topic_name, &(percentage as i32)],
+        ",
+        &[&topic_name, &i32::from(percentage)],
     )
     .await?;
     Ok(())
@@ -247,18 +243,17 @@ async fn get_or_create_topic_id(
         )
         .await?;
 
-    match row {
-        Some(r) => Ok(r.get(0)),
-        None => {
-            // Create topic
-            let row = db
-                .query_one(
-                    "INSERT INTO kafka.topics (name, partitions) VALUES ($1, 1) RETURNING id",
-                    &[&topic_name],
-                )
-                .await?;
-            Ok(row.get(0))
-        }
+    if let Some(r) = row {
+        Ok(r.get(0))
+    } else {
+        // Create topic
+        let row = db
+            .query_one(
+                "INSERT INTO kafka.topics (name, partitions) VALUES ($1, 1) RETURNING id",
+                &[&topic_name],
+            )
+            .await?;
+        Ok(row.get(0))
     }
 }
 
@@ -283,12 +278,12 @@ pub async fn get_shadow_metrics(
     // Count local messages for this topic
     let row = db
         .query_one(
-            r#"
+            r"
         SELECT COUNT(*) as count
         FROM kafka.messages m
         JOIN kafka.topics t ON m.topic_id = t.id
         WHERE t.name = $1
-        "#,
+        ",
             &[&topic_name],
         )
         .await?;
@@ -325,9 +320,8 @@ pub async fn wait_for_forwarding(
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 
-    Err(format!(
-        "Timeout waiting for {} messages to be forwarded to external Kafka",
-        expected_count
+    Err(
+        format!("Timeout waiting for {expected_count} messages to be forwarded to external Kafka")
+            .into(),
     )
-    .into())
 }

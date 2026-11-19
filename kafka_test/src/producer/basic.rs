@@ -29,7 +29,7 @@ pub async fn test_producer() -> TestResult {
     let topic = ctx.unique_topic("test-topic").await;
 
     // Send a test message
-    println!("Sending message to topic '{}'...", topic);
+    println!("Sending message to topic '{topic}'...");
     let key = "test-key";
     let payload = "Hello from rdkafka test client!";
 
@@ -40,14 +40,14 @@ pub async fn test_producer() -> TestResult {
         )
         .await
         .map_err(|(err, _msg)| {
-            println!("❌ Failed to deliver message: {}", err);
+            println!("❌ Failed to deliver message: {err}");
             err
         })?;
 
     println!("✅ Message delivered successfully!");
-    println!("   Topic: {}", topic);
-    println!("   Partition: {}", partition);
-    println!("   Offset: {}", offset);
+    println!("   Topic: {topic}");
+    println!("   Partition: {partition}");
+    println!("   Offset: {offset}");
 
     // === AUTOMATED VERIFICATION ===
     println!("\n=== Automated Database Verification ===");
@@ -67,7 +67,7 @@ pub async fn test_producer() -> TestResult {
     let topic_name: String = topic_row.get(1);
 
     assert_eq!(topic_name, topic, "Topic name mismatch");
-    println!("✅ Topic '{}' created with id={}", topic_name, topic_id);
+    println!("✅ Topic '{topic_name}' created with id={topic_id}");
 
     // Verify message was inserted
     println!("\nChecking message insertion...");
@@ -99,9 +99,9 @@ pub async fn test_producer() -> TestResult {
     assert_eq!(db_value, payload.as_bytes(), "Payload mismatch");
 
     println!("✅ Message verified in database:");
-    println!("   Topic ID: {}", db_topic_id);
-    println!("   Partition: {}", db_partition);
-    println!("   Offset: {}", db_offset);
+    println!("   Topic ID: {db_topic_id}");
+    println!("   Partition: {db_partition}");
+    println!("   Offset: {db_offset}");
     println!("   Key: {}", String::from_utf8_lossy(&db_key));
     println!("   Value: {}", String::from_utf8_lossy(&db_value));
 
@@ -113,7 +113,7 @@ pub async fn test_producer() -> TestResult {
         )
         .await?;
     let message_count: i64 = count_row.get(0);
-    println!("\n✅ Total messages in '{}': {}", topic, message_count);
+    println!("\n✅ Total messages in '{topic}': {message_count}");
 
     ctx.cleanup().await?;
     println!("✅ Producer test PASSED\n");

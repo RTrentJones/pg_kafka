@@ -1,5 +1,5 @@
-# (DR-25: the obsolete top-level `version:` key was removed — Compose v2
-# ignores it and warns.)
+# Development container (pg_kafka_dev) and the external Kafka broker the shadow-mode tests forward
+# to (external-kafka). CI starts only external-kafka.
 services:
   pg_kafka_dev:
     build:
@@ -35,9 +35,7 @@ services:
     networks:
       - pg_kafka_network
 
-  # External Kafka for shadow mode testing (Phase 11)
-  # Uses KRaft mode (no ZooKeeper) with PLAINTEXT for simplicity
-  # TODO: Add SASL/PLAIN auth when needed for production-like testing
+  # External Kafka for shadow mode testing: KRaft (no ZooKeeper), PLAINTEXT listeners only.
   external-kafka:
     image: apache/kafka:3.7.0
     container_name: external_kafka
@@ -57,14 +55,12 @@ services:
       # - EXTERNAL:9093 for host access (E2E tests, kcat from host)
       # - CONTROLLER:29094 for KRaft controller
       KAFKA_LISTENERS: INTERNAL://0.0.0.0:9094,CONTAINER://0.0.0.0:9095,EXTERNAL://0.0.0.0:9093,CONTROLLER://0.0.0.0:29094
-      # IMPORTANT: CONTAINER listener uses IP (172.18.0.2) not hostname because DNS resolution
-      # can be stale in devcontainer environments where containers are recreated.
-      # DR-25 note: the IP is deterministic because pg_kafka_network below pins
-      # ipam subnet 172.18.0.0/16 and this service gets a static ipv4_address.
-      # Caveat: 172.18.0.0/16 is a common Docker default-bridge range — if
-      # another network on your host already claims it, `docker compose up`
-      # fails with a pool-overlap error; change the subnet AND this advertised
-      # IP together.
+      # The CONTAINER listener advertises an IP, not the hostname: Docker DNS can be stale in
+      # devcontainers whose containers are recreated, and a host-run Postgres (CI) cannot resolve
+      # external-kafka at all. The IP is fixed because pg_kafka_network below pins the subnet
+      # 172.18.0.0/16 and this service's ipv4_address. If another network on the host already
+      # claims that range, `docker compose up` fails with a pool-overlap error: change the subnet
+      # and this advertised IP together.
       KAFKA_ADVERTISED_LISTENERS: INTERNAL://external-kafka:9094,CONTAINER://172.18.0.2:9095,EXTERNAL://localhost:9093
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,CONTAINER:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL

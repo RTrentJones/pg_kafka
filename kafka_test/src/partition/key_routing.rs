@@ -22,10 +22,7 @@ pub async fn test_key_routing_deterministic() -> TestResult {
     let test_key = "consistent-key";
 
     // 1. Create topic with multiple partitions in database
-    println!(
-        "Step 1: Creating topic with {} partitions...",
-        num_partitions
-    );
+    println!("Step 1: Creating topic with {num_partitions} partitions...");
     let db_client = create_db_client().await?;
 
     db_client
@@ -36,10 +33,7 @@ pub async fn test_key_routing_deterministic() -> TestResult {
         )
         .await?;
 
-    println!(
-        "   Topic '{}' created with {} partitions",
-        topic, num_partitions
-    );
+    println!("   Topic '{topic}' created with {num_partitions} partitions");
 
     // 2. Produce multiple messages with the same key (no explicit partition)
     println!("\nStep 2: Producing messages with same key (no explicit partition)...");
@@ -48,7 +42,7 @@ pub async fn test_key_routing_deterministic() -> TestResult {
     let mut delivered_partitions = Vec::new();
 
     for i in 0..5 {
-        let value = format!("value-{}", i);
+        let value = format!("value-{i}");
 
         // NOTE: rdkafka handles partition selection client-side when partition is not set
         // To truly test server-side routing, we would need to send partition=-1 in the wire protocol
@@ -57,14 +51,11 @@ pub async fn test_key_routing_deterministic() -> TestResult {
 
         match producer.send(record, Duration::from_secs(5)).await {
             Ok((partition, offset)) => {
-                println!(
-                    "   Message {}: partition={}, offset={}",
-                    i, partition, offset
-                );
+                println!("   Message {i}: partition={partition}, offset={offset}");
                 delivered_partitions.push(partition);
             }
             Err((err, _)) => {
-                println!("   Message {} failed: {}", i, err);
+                println!("   Message {i} failed: {err}");
                 return Err(Box::new(err));
             }
         }
@@ -78,8 +69,7 @@ pub async fn test_key_routing_deterministic() -> TestResult {
 
     assert!(
         all_same,
-        "All messages with same key should route to same partition. Got partitions: {:?}",
-        delivered_partitions
+        "All messages with same key should route to same partition. Got partitions: {delivered_partitions:?}"
     );
 
     println!(
@@ -127,10 +117,7 @@ pub async fn test_key_distribution() -> TestResult {
     let num_messages = 100;
 
     // 1. Create topic with multiple partitions
-    println!(
-        "Step 1: Creating topic with {} partitions...",
-        num_partitions
-    );
+    println!("Step 1: Creating topic with {num_partitions} partitions...");
     let db_client = create_db_client().await?;
 
     db_client
@@ -141,20 +128,17 @@ pub async fn test_key_distribution() -> TestResult {
         )
         .await?;
 
-    println!("   Topic '{}' created", topic);
+    println!("   Topic '{topic}' created");
 
     // 2. Produce messages with different keys
-    println!(
-        "\nStep 2: Producing {} messages with unique keys...",
-        num_messages
-    );
+    println!("\nStep 2: Producing {num_messages} messages with unique keys...");
     let producer = create_producer()?;
 
     let mut partition_counts: HashMap<i32, i32> = HashMap::new();
 
     for i in 0..num_messages {
-        let key = format!("unique-key-{}", i);
-        let value = format!("value-{}", i);
+        let key = format!("unique-key-{i}");
+        let value = format!("value-{i}");
 
         let record = FutureRecord::to(&topic).payload(&value).key(&key);
 
@@ -168,7 +152,7 @@ pub async fn test_key_distribution() -> TestResult {
         }
     }
 
-    println!("   Delivered {} messages", num_messages);
+    println!("   Delivered {num_messages} messages");
 
     // 3. Verify distribution
     println!("\nStep 3: Verifying key distribution...");
@@ -176,17 +160,13 @@ pub async fn test_key_distribution() -> TestResult {
     let partitions_used = partition_counts.len();
     assert!(
         partitions_used > 1,
-        "Keys should distribute across multiple partitions, only used {}",
-        partitions_used
+        "Keys should distribute across multiple partitions, only used {partitions_used}"
     );
 
-    println!("   Distribution across {} partitions:", partitions_used);
+    println!("   Distribution across {partitions_used} partitions:");
     for (partition, count) in &partition_counts {
-        let percentage = (*count as f64 / num_messages as f64) * 100.0;
-        println!(
-            "     Partition {}: {} messages ({:.1}%)",
-            partition, count, percentage
-        );
+        let percentage = (f64::from(*count) / f64::from(num_messages)) * 100.0;
+        println!("     Partition {partition}: {count} messages ({percentage:.1}%)");
     }
 
     // 4. Verify in database
@@ -211,10 +191,7 @@ pub async fn test_key_distribution() -> TestResult {
         "Database should show messages in multiple partitions"
     );
 
-    println!(
-        "   Database confirms {} partitions have messages",
-        db_partitions_used
-    );
+    println!("   Database confirms {db_partitions_used} partitions have messages");
 
     println!("\n Test: Key Distribution PASSED\n");
     Ok(())
@@ -232,10 +209,7 @@ pub async fn test_null_key_distribution() -> TestResult {
     let num_messages = 50;
 
     // 1. Create topic with multiple partitions
-    println!(
-        "Step 1: Creating topic with {} partitions...",
-        num_partitions
-    );
+    println!("Step 1: Creating topic with {num_partitions} partitions...");
     let db_client = create_db_client().await?;
 
     db_client
@@ -246,19 +220,16 @@ pub async fn test_null_key_distribution() -> TestResult {
         )
         .await?;
 
-    println!("   Topic '{}' created", topic);
+    println!("   Topic '{topic}' created");
 
     // 2. Produce messages without keys
-    println!(
-        "\nStep 2: Producing {} messages without keys...",
-        num_messages
-    );
+    println!("\nStep 2: Producing {num_messages} messages without keys...");
     let producer = create_producer()?;
 
     let mut partition_counts: HashMap<i32, i32> = HashMap::new();
 
     for i in 0..num_messages {
-        let value = format!("value-{}", i);
+        let value = format!("value-{i}");
 
         // No key specified
         let record = FutureRecord::<(), str>::to(&topic).payload(&value);
@@ -273,18 +244,15 @@ pub async fn test_null_key_distribution() -> TestResult {
         }
     }
 
-    println!("   Delivered {} messages", num_messages);
+    println!("   Delivered {num_messages} messages");
 
     // 3. Verify distribution (rdkafka does client-side round-robin for null keys)
     println!("\nStep 3: Checking null key distribution...");
 
     println!("   Distribution:");
     for (partition, count) in &partition_counts {
-        let percentage = (*count as f64 / num_messages as f64) * 100.0;
-        println!(
-            "     Partition {}: {} messages ({:.1}%)",
-            partition, count, percentage
-        );
+        let percentage = (f64::from(*count) / f64::from(num_messages)) * 100.0;
+        println!("     Partition {partition}: {count} messages ({percentage:.1}%)");
     }
 
     // Note: rdkafka uses sticky partitioner for null keys, so they may batch to one partition
@@ -306,12 +274,12 @@ pub async fn test_null_key_distribution() -> TestResult {
 
     let total: i64 = row.get(0);
     assert_eq!(
-        total, num_messages as i64,
-        "All {} messages should be in database",
-        num_messages
+        total,
+        i64::from(num_messages),
+        "All {num_messages} messages should be in database"
     );
 
-    println!("   Database confirms {} messages stored", total);
+    println!("   Database confirms {total} messages stored");
 
     println!("\n Test: Null Key Distribution PASSED\n");
     Ok(())

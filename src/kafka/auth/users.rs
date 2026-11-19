@@ -19,18 +19,28 @@
 use super::scram::{ScramCredential, ScramMechanism, MAX_ITERATIONS, MIN_ITERATIONS};
 use pgrx::prelude::*;
 
+/// Longest Kafka user name accepted, in bytes.
+const MAX_USERNAME_LEN: usize = 255;
+
+fn check_username(username: &str) {
+    if username.is_empty() || username.len() > MAX_USERNAME_LEN {
+        pgrx::error!("Kafka user name must be 1 to {MAX_USERNAME_LEN} bytes long");
+    }
+}
+
+/// `iterations` if it is in Kafka's accepted range, else an ERROR.
+fn check_iterations(iterations: u32) -> u32 {
+    if !(MIN_ITERATIONS..=MAX_ITERATIONS).contains(&iterations) {
+        pgrx::error!("iterations must be between {MIN_ITERATIONS} and {MAX_ITERATIONS}");
+    }
+    iterations
+}
+
+/// Validate the arguments of the password functions; returns the iteration count.
 fn check_user_args(username: &str, iterations: i32) -> u32 {
-    if username.is_empty() || username.len() > 255 {
-        pgrx::error!("Kafka user name must be 1 to 255 bytes long");
-    }
-    if !(MIN_ITERATIONS as i32..=MAX_ITERATIONS as i32).contains(&iterations) {
-        pgrx::error!(
-            "iterations must be between {} and {}",
-            MIN_ITERATIONS,
-            MAX_ITERATIONS
-        );
-    }
-    iterations as u32
+    check_username(username);
+    // A negative count maps to 0, which the range check rejects.
+    check_iterations(u32::try_from(iterations).unwrap_or(0))
 }
 
 fn user_exists(username: &str) -> bool {
@@ -42,6 +52,7 @@ fn user_exists(username: &str) -> bool {
     .unwrap_or(false)
 }
 
+/// Insert or replace one credential; its iteration count has passed [`check_iterations`].
 fn upsert_credential(username: &str, cred: &ScramCredential) {
     Spi::run_with_args(
         "INSERT INTO kafka.sasl_credentials \
@@ -55,7 +66,9 @@ fn upsert_credential(username: &str, cred: &ScramCredential) {
             username.into(),
             cred.mechanism.name().into(),
             cred.salt.clone().into(),
-            (cred.iterations as i32).into(),
+            i32::try_from(cred.iterations)
+                .expect("iterations are checked against MAX_ITERATIONS before any upsert")
+                .into(),
             cred.stored_key.clone().into(),
             cred.server_key.clone().into(),
         ],
@@ -104,7 +117,8 @@ fn pg_kafka_alter_user(username: &str, password: &str, iterations: default!(i32,
 fn pg_kafka_set_user_verifier(username: &str, verifier: &str) {
     let cred = ScramCredential::from_verifier(verifier)
         .unwrap_or_else(|e| pgrx::error!("invalid SCRAM verifier: {}", e));
-    check_user_args(username, cred.iterations as i32);
+    check_username(username);
+    check_iterations(cred.iterations);
     upsert_credential(username, &cred);
 }
 

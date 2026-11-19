@@ -1,79 +1,28 @@
-//! Regression tests for the `coordinator` workstream: JoinGroup responses are held
-//! until the group's join phase completes, as Kafka does.
+//! JoinGroup responses are held until the group's join phase completes, as Kafka does.
 //!
-//! The worker change (`worker.rs` JoinGroup arm answering on the client's own sender,
-//! possibly long after the request's transaction) is only visible end to end, so these
+//! The worker answers JoinGroup on the client's own sender, possibly long after the
+//! request's transaction, which is only visible end to end, so these
 //! drive raw wire requests over separate connections: a held JoinGroup blocks its
 //! connection's response stream, exactly as it blocks a real client's coordinator
 //! connection.
 
 use crate::common::TestResult;
-use crate::error_paths::bug_hunt::roundtrip;
+use crate::error_codes;
 use crate::setup::TestContext;
-use bytes::{BufMut, BytesMut};
+use crate::wire::roundtrip;
+use crate::wire::{recv, send};
 use kafka_protocol::messages::heartbeat_request::HeartbeatRequest;
 use kafka_protocol::messages::join_group_request::{JoinGroupRequest, JoinGroupRequestProtocol};
 use kafka_protocol::messages::join_group_response::JoinGroupResponse;
 use kafka_protocol::messages::leave_group_request::LeaveGroupRequest;
 use kafka_protocol::messages::sync_group_request::{SyncGroupRequest, SyncGroupRequestAssignment};
-use kafka_protocol::messages::{GroupId, RequestHeader, ResponseHeader};
-use kafka_protocol::protocol::{Decodable, Encodable, HeaderVersion, Request, StrBytes};
+use kafka_protocol::messages::GroupId;
+use kafka_protocol::protocol::StrBytes;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 const BROKER: &str = "localhost:9092";
 const JOIN_VERSION: i16 = 5;
-const ERROR_UNKNOWN_MEMBER_ID: i16 = 25;
-const ERROR_REBALANCE_IN_PROGRESS: i16 = 27;
-
-/// Write one request frame without waiting for its response.
-async fn send_request<R: Request>(
-    stream: &mut TcpStream,
-    version: i16,
-    correlation_id: i32,
-    request: &R,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut header = RequestHeader::default();
-    header.request_api_key = R::KEY;
-    header.request_api_version = version;
-    header.correlation_id = correlation_id;
-    header.client_id = Some(StrBytes::from_static_str("coordinator-e2e"));
-    let mut body = BytesMut::new();
-    header.encode(&mut body, R::header_version(version))?;
-    request.encode(&mut body, version)?;
-    let mut frame = BytesMut::with_capacity(4 + body.len());
-    frame.put_i32(body.len() as i32);
-    frame.extend_from_slice(&body);
-    stream.write_all(&frame).await?;
-    stream.flush().await?;
-    Ok(())
-}
-
-/// Read one response frame for a request sent with [`send_request`].
-async fn recv_response<R: Request>(
-    stream: &mut TcpStream,
-    version: i16,
-    correlation_id: i32,
-) -> Result<R::Response, Box<dyn std::error::Error>> {
-    let mut size = [0u8; 4];
-    stream.read_exact(&mut size).await?;
-    let mut buf = vec![0u8; i32::from_be_bytes(size) as usize];
-    stream.read_exact(&mut buf).await?;
-    let mut buf = BytesMut::from(&buf[..]);
-    let header = ResponseHeader::decode(
-        &mut buf,
-        <R::Response as HeaderVersion>::header_version(version),
-    )?;
-    if header.correlation_id != correlation_id {
-        return Err(format!(
-            "correlation id mismatch: sent {}, got {}",
-            correlation_id, header.correlation_id
-        )
-        .into());
-    }
-    Ok(R::Response::decode(&mut buf, version)?)
-}
 
 fn join_request(group: &str, member_id: &str, session_timeout_ms: i32) -> JoinGroupRequest {
     let mut protocol = JoinGroupRequestProtocol::default();
@@ -96,7 +45,7 @@ async fn send_join(
     session_timeout_ms: i32,
     corr: i32,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    send_request(
+    send(
         stream,
         JOIN_VERSION,
         corr,
@@ -109,7 +58,7 @@ async fn recv_join(
     stream: &mut TcpStream,
     corr: i32,
 ) -> Result<JoinGroupResponse, Box<dyn std::error::Error>> {
-    let response = recv_response::<JoinGroupRequest>(stream, JOIN_VERSION, corr).await?;
+    let response = recv::<JoinGroupRequest>(stream, JOIN_VERSION, corr).await?;
     if response.error_code != 0 {
         return Err(format!("JoinGroup error {}", response.error_code).into());
     }
@@ -200,7 +149,7 @@ async fn heartbeat_until_rebalance(
     let mut corr = first_corr;
     loop {
         let hb = heartbeat(stream, group, member_id, generation, corr).await?;
-        if hb == ERROR_REBALANCE_IN_PROGRESS || Instant::now() > deadline {
+        if hb == error_codes::REBALANCE_IN_PROGRESS || Instant::now() > deadline {
             return Ok(hb);
         }
         corr += 1;
@@ -264,13 +213,13 @@ pub async fn test_join_group_held_until_all_members_rejoin() -> TestResult {
     let mut corr = 100;
     let hb = loop {
         let hb = heartbeat(&mut conn_a, &group, &a_id, gen1, corr).await?;
-        if hb == ERROR_REBALANCE_IN_PROGRESS || Instant::now() > deadline {
+        if hb == error_codes::REBALANCE_IN_PROGRESS || Instant::now() > deadline {
             break hb;
         }
         corr += 1;
         tokio::time::sleep(Duration::from_millis(200)).await;
     };
-    assert_eq!(hb, ERROR_REBALANCE_IN_PROGRESS);
+    assert_eq!(hb, error_codes::REBALANCE_IN_PROGRESS);
 
     println!("Step 4: first member rejoins; both joins complete together...");
     let a2 = join_now(&mut conn_a, &group, &a_id, 4).await?;
@@ -350,18 +299,21 @@ pub async fn test_held_join_completed_by_session_timeout_sweep() -> TestResult {
         .await
         .map_err(|_| "the sweep did not complete the held JoinGroup within 15s")??;
     let waited = sent.elapsed();
-    println!("   held for {:?}", waited);
+    println!("   held for {waited:?}");
     assert!(
         waited >= Duration::from_secs(4),
-        "answered after {:?}, before the first member's session could expire",
-        waited
+        "answered after {waited:?}, before the first member's session could expire"
     );
     assert_eq!(b.generation_id, a.generation_id + 1);
     assert_eq!(b.leader, b.member_id, "the remaining member leads");
     assert_eq!(member_ids(&b), vec![b.member_id.to_string()]);
 
     let hb = heartbeat(&mut conn_a, &group, &a_id, a.generation_id, 3).await?;
-    assert_eq!(hb, ERROR_UNKNOWN_MEMBER_ID, "the evicted member is fenced");
+    assert_eq!(
+        hb,
+        error_codes::UNKNOWN_MEMBER_ID,
+        "the evicted member is fenced"
+    );
 
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");
@@ -419,7 +371,7 @@ pub async fn test_follower_sync_held_until_leader_syncs() -> TestResult {
     let a_id = a.member_id.to_string();
     send_join(&mut conn_b, &group, "", 30_000, 2).await?;
     let hb = heartbeat_until_rebalance(&mut conn_a, &group, &a_id, a.generation_id, 100).await?;
-    assert_eq!(hb, ERROR_REBALANCE_IN_PROGRESS);
+    assert_eq!(hb, error_codes::REBALANCE_IN_PROGRESS);
     let a2 = join_now(&mut conn_a, &group, &a_id, 3).await?;
     let b = tokio::time::timeout(Duration::from_secs(5), recv_join(&mut conn_b, 2))
         .await
@@ -430,7 +382,7 @@ pub async fn test_follower_sync_held_until_leader_syncs() -> TestResult {
     assert_eq!(a2.leader.as_str(), a_id.as_str());
 
     println!("Step 2: the follower syncs first; its response must be held...");
-    send_request(&mut conn_b, 3, 4, &sync_request(&group, &b_id, gen, &[])).await?;
+    send(&mut conn_b, 3, 4, &sync_request(&group, &b_id, gen, &[])).await?;
     assert!(
         nothing_arrives(&conn_b, Duration::from_millis(1500)).await,
         "the follower's SyncGroup must wait for the leader's"
@@ -449,7 +401,7 @@ pub async fn test_follower_sync_held_until_leader_syncs() -> TestResult {
     assert_eq!((code, own.as_slice()), (0, b"assign-a".as_slice()));
     let follower = tokio::time::timeout(
         Duration::from_secs(5),
-        recv_response::<SyncGroupRequest>(&mut conn_b, 3, 4),
+        recv::<SyncGroupRequest>(&mut conn_b, 3, 4),
     )
     .await
     .map_err(|_| "the held SyncGroup was not answered when the leader synced")??;

@@ -30,7 +30,7 @@ pub async fn test_large_batch_throughput() -> TestResult {
     let batch_size = 1000;
 
     // 1. Measure produce throughput for large batch
-    println!("Step 1: Producing {} messages...", batch_size);
+    println!("Step 1: Producing {batch_size} messages...");
     let produce_start = Instant::now();
 
     // Use concurrent sends for better throughput
@@ -39,8 +39,8 @@ pub async fn test_large_batch_throughput() -> TestResult {
         let topic_name = topic.name.clone();
         let prod = producer.clone();
         let handle = tokio::spawn(async move {
-            let value = format!("large-batch-msg-{}", i);
-            let key = format!("key-{}", i);
+            let value = format!("large-batch-msg-{i}");
+            let key = format!("key-{i}");
             prod.send(
                 FutureRecord::to(&topic_name).payload(&value).key(&key),
                 Duration::from_secs(30),
@@ -59,14 +59,14 @@ pub async fn test_large_batch_throughput() -> TestResult {
     }
 
     let produce_elapsed = produce_start.elapsed();
-    let produce_throughput = success_count as f64 / produce_elapsed.as_secs_f64();
+    let produce_throughput = f64::from(success_count) / produce_elapsed.as_secs_f64();
 
-    println!("   Produced: {} messages", success_count);
+    println!("   Produced: {success_count} messages");
     println!("   Duration: {:.2}s", produce_elapsed.as_secs_f64());
-    println!("   Throughput: {:.2} msgs/sec\n", produce_throughput);
+    println!("   Throughput: {produce_throughput:.2} msgs/sec\n");
 
     // 2. Consume and measure
-    println!("Step 2: Consuming {} messages...", batch_size);
+    println!("Step 2: Consuming {batch_size} messages...");
     let group = ctx.unique_group("large-batch").await;
     let consumer = create_stream_consumer(&group)?;
     consumer.subscribe(&[&topic.name])?;
@@ -82,16 +82,16 @@ pub async fn test_large_batch_throughput() -> TestResult {
     }
 
     let consume_elapsed = consume_start.elapsed();
-    let consume_throughput = consumed as f64 / consume_elapsed.as_secs_f64();
+    let consume_throughput = f64::from(consumed) / consume_elapsed.as_secs_f64();
 
-    println!("   Consumed: {} messages", consumed);
+    println!("   Consumed: {consumed} messages");
     println!("   Duration: {:.2}s", consume_elapsed.as_secs_f64());
-    println!("   Throughput: {:.2} msgs/sec\n", consume_throughput);
+    println!("   Throughput: {consume_throughput:.2} msgs/sec\n");
 
     // 3. Verify results
     println!("=== Performance Summary ===\n");
-    println!("   Produce throughput: {:.2} msgs/sec", produce_throughput);
-    println!("   Consume throughput: {:.2} msgs/sec", consume_throughput);
+    println!("   Produce throughput: {produce_throughput:.2} msgs/sec");
+    println!("   Consume throughput: {consume_throughput:.2} msgs/sec");
 
     // Basic assertions (set low to avoid flaky tests)
     assert!(
@@ -125,16 +125,16 @@ pub async fn test_produce_latency_percentiles() -> TestResult {
     let mut latencies: Vec<Duration> = Vec::with_capacity(sample_size);
 
     // 1. Measure individual message latencies
-    println!("Step 1: Measuring latency for {} messages...", sample_size);
+    println!("Step 1: Measuring latency for {sample_size} messages...");
     for i in 0..sample_size {
-        let value = format!("latency-msg-{}", i);
+        let value = format!("latency-msg-{i}");
         let start = Instant::now();
 
         let result = producer
             .send(
                 FutureRecord::to(&topic.name)
                     .payload(&value)
-                    .key(&format!("key-{}", i)),
+                    .key(&format!("key-{i}")),
                 Duration::from_secs(10),
             )
             .await;
@@ -163,11 +163,11 @@ pub async fn test_produce_latency_percentiles() -> TestResult {
     let min = latencies.first().copied().unwrap_or_default();
     let max = latencies.last().copied().unwrap_or_default();
 
-    println!("   Min:  {:?}", min);
-    println!("   P50:  {:?}", p50);
-    println!("   P95:  {:?}", p95);
-    println!("   P99:  {:?}", p99);
-    println!("   Max:  {:?}\n", max);
+    println!("   Min:  {min:?}");
+    println!("   P50:  {p50:?}");
+    println!("   P95:  {p95:?}");
+    println!("   P99:  {p99:?}");
+    println!("   Max:  {max:?}\n");
 
     // 3. Verify latencies are reasonable
     println!("=== Latency Assessment ===\n");
@@ -217,7 +217,7 @@ pub async fn test_concurrent_connection_scaling() -> TestResult {
 
     // 1. Create many concurrent producers
     let num_producers = 10;
-    println!("Step 1: Creating {} concurrent producers...", num_producers);
+    println!("Step 1: Creating {num_producers} concurrent producers...");
 
     let mut producers: Vec<FutureProducer> = Vec::new();
     for _ in 0..num_producers {
@@ -232,7 +232,7 @@ pub async fn test_concurrent_connection_scaling() -> TestResult {
 
     // 2. Create many concurrent consumers
     let num_consumers = 10;
-    println!("Step 2: Creating {} concurrent consumers...", num_consumers);
+    println!("Step 2: Creating {num_consumers} concurrent consumers...");
 
     let mut consumers: Vec<StreamConsumer> = Vec::new();
     for i in 0..num_consumers {
@@ -258,7 +258,7 @@ pub async fn test_concurrent_connection_scaling() -> TestResult {
         let topic = topic_name.clone();
         let prod = producer.clone();
         let handle = tokio::spawn(async move {
-            let value = format!("concurrent-msg-{}", i);
+            let value = format!("concurrent-msg-{i}");
             prod.send(
                 FutureRecord::to(&topic).payload(&value).key("concurrent"),
                 Duration::from_secs(5),
@@ -275,13 +275,13 @@ pub async fn test_concurrent_connection_scaling() -> TestResult {
             success += 1;
         }
     }
-    println!("   ✓ {} producers sent messages successfully\n", success);
+    println!("   ✓ {success} producers sent messages successfully\n");
 
     // 4. Verify all connections work
     println!("=== Connection Scaling Summary ===\n");
-    println!("   Total producers: {}", num_producers);
-    println!("   Total consumers: {}", num_consumers);
-    println!("   Successful sends: {}", success);
+    println!("   Total producers: {num_producers}");
+    println!("   Total consumers: {num_consumers}");
+    println!("   Successful sends: {success}");
 
     assert!(
         success >= num_producers * 80 / 100,
@@ -332,12 +332,8 @@ pub async fn test_long_poll_cpu_efficiency() -> TestResult {
     while poll_start.elapsed() < poll_duration {
         // Try to receive with short timeout
         match tokio::time::timeout(Duration::from_millis(500), consumer.recv()).await {
-            Ok(Ok(_)) => {
-                // Received a message (unexpected in empty topic)
-            }
-            Ok(Err(_)) => {
-                // Error during poll
-            }
+            // A message (unexpected in an empty topic) or a poll error.
+            Ok(_) => {}
             Err(_) => {
                 // Timeout - expected for empty topic
                 poll_count += 1;
@@ -346,7 +342,7 @@ pub async fn test_long_poll_cpu_efficiency() -> TestResult {
     }
 
     let actual_duration = poll_start.elapsed();
-    println!("   Poll cycles: {}", poll_count);
+    println!("   Poll cycles: {poll_count}");
     println!(
         "   Actual duration: {:.2}s\n",
         actual_duration.as_secs_f64()
@@ -357,12 +353,12 @@ pub async fn test_long_poll_cpu_efficiency() -> TestResult {
 
     // With 500ms timeout and 3s duration, we expect ~6 poll cycles
     // If we see many more, there might be busy-waiting
-    let expected_polls = (poll_duration.as_millis() / 500) as i32;
-    let poll_efficiency = poll_count as f64 / expected_polls as f64;
+    let expected_polls = i32::try_from(poll_duration.as_millis() / 500)?;
+    let poll_efficiency = f64::from(poll_count) / f64::from(expected_polls);
 
-    println!("   Expected poll cycles: ~{}", expected_polls);
-    println!("   Actual poll cycles: {}", poll_count);
-    println!("   Efficiency ratio: {:.2}", poll_efficiency);
+    println!("   Expected poll cycles: ~{expected_polls}");
+    println!("   Actual poll cycles: {poll_count}");
+    println!("   Efficiency ratio: {poll_efficiency:.2}");
 
     if poll_efficiency <= 2.0 {
         println!("   ✓ Polling is efficient (not busy-waiting)");

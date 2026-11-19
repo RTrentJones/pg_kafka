@@ -30,10 +30,7 @@ pub async fn test_produce_invalid_partition() -> TestResult {
     let producer = crate::common::create_producer()?;
     let invalid_partition = 5;
 
-    println!(
-        "Attempting to produce to partition {}...",
-        invalid_partition
-    );
+    println!("Attempting to produce to partition {invalid_partition}...");
 
     let result = producer
         .send(
@@ -51,14 +48,11 @@ pub async fn test_produce_invalid_partition() -> TestResult {
     // partition that doesn't exist — the regression we guard against.
     let delivered = match result {
         Ok((partition, offset)) => {
-            println!(
-                "   Unexpected delivery to partition {} offset {}",
-                partition, offset
-            );
+            println!("   Unexpected delivery to partition {partition} offset {offset}");
             true
         }
         Err((err, _)) => {
-            println!("   Expected error received: {}", err);
+            println!("   Expected error received: {err}");
             false
         }
     };
@@ -105,7 +99,7 @@ pub async fn test_produce_any_partition() -> TestResult {
         )
         .await?;
     let partition_id: i32 = row.get(0);
-    println!("   Partitioner assigned partition {}", partition_id);
+    println!("   Partitioner assigned partition {partition_id}");
 
     ctx.cleanup().await?;
     if !(0..3).contains(&partition_id) {
@@ -170,7 +164,7 @@ pub async fn test_produce_large_key() -> TestResult {
 
     let key_length: i32 = row.get(0);
     assert_eq!(key_length, 1024, "Key length should be 1024 bytes");
-    println!("✅ Large key stored correctly ({} bytes)", key_length);
+    println!("✅ Large key stored correctly ({key_length} bytes)");
 
     ctx.cleanup().await?;
     println!("\n✅ Produce large key test PASSED\n");

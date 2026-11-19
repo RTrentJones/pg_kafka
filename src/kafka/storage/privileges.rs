@@ -2,16 +2,16 @@
 //!
 //! The extension script (`sql/bootstrap.sql`) creates two NOLOGIN roles:
 //!
-//! * [`READER_ROLE`] — read-only access to the kafka schema, replacing the former
-//!   `GRANT SELECT ... TO PUBLIC` (which exposed every stored message to every role
-//!   in the database). Grant it to the roles that should read pg_kafka data.
+//! * [`READER_ROLE`] — read-only access to the kafka schema. Nothing is granted to
+//!   PUBLIC, which would expose every stored message to every role in the database;
+//!   grant this role to the roles that should read pg_kafka data.
 //! * [`WORKER_ROLE`] — exactly the privileges the background worker's SQL needs. Once
 //!   the schema exists the worker switches to the role named by `pg_kafka.run_as_role`
 //!   (default [`WORKER_ROLE`]) instead of running everything as the bootstrap
 //!   superuser.
 //!
 //! The worker's grants are derived from the statements it issues
-//! (`storage/postgres.rs`, `shadow/store.rs`, the retention sweep): [`WORKER_TABLE_GRANTS`]
+//! (`storage/postgres/`, `shadow/store.rs`, `shadow/outbox.rs`, `metrics.rs`, ...): [`WORKER_TABLE_GRANTS`]
 //! lists them, `bootstrap.sql` and the upgrade script grant exactly that, and the unit
 //! tests check both the scripts and the statement text against this list, so a new
 //! statement on a new table (or with a new verb) fails `cargo test` until it is granted.
@@ -21,7 +21,7 @@
 use pgrx::{GucContext, GucFlags, GucRegistry, GucSetting};
 use std::ffi::CString;
 
-/// Read-only role (replaces the PUBLIC SELECT grants).
+/// Read-only role.
 pub const READER_ROLE: &str = "pgkafka_reader";
 /// Least-privilege role for the background worker's SQL.
 pub const WORKER_ROLE: &str = "pgkafka_worker";
@@ -70,16 +70,16 @@ pub const WORKER_TABLE_GRANTS: &[(&str, &[&str])] = &[
         &["SELECT", "INSERT", "UPDATE", "DELETE"],
     ),
     ("kafka.shadow_metrics", &["SELECT", "INSERT", "UPDATE"]),
-    // auth stream: SASL credential lookups (kafka/auth/credentials.rs), read only.
+    // SASL credential lookups (kafka/auth/credentials.rs), read only.
     ("kafka.sasl_credentials", &["SELECT"]),
-    // wave3 txn: idempotent batch cache (upsert + trim) and the partitions registered
-    // in each open transaction.
+    // The idempotent batch cache (upsert + trim) and the partitions registered in
+    // each open transaction.
     (
         "kafka.producer_batches",
         &["SELECT", "INSERT", "UPDATE", "DELETE"],
     ),
     ("kafka.txn_partitions", &["SELECT", "INSERT", "DELETE"]),
-    // wave3 net: the unknown-user fake-credential secret (kafka/auth/credentials.rs).
+    // The unknown-user fake-credential secret (kafka/auth/credentials.rs).
     ("kafka.sasl_server_secret", &["SELECT"]),
 ];
 
@@ -129,22 +129,57 @@ pub fn normalize_role(raw: Option<String>) -> Option<String> {
     raw.map(|r| r.trim().to_string()).filter(|r| !r.is_empty())
 }
 
-/// Every privilege the worker role must hold, as `(kind, object, privilege)` rows for
-/// the startup check. `kind` is `schema`, `table`, `sequence` or `function`. One row per privilege:
-/// `has_table_privilege` with a comma list is true if ANY of them is held.
-pub fn required_worker_privileges() -> Vec<(&'static str, &'static str, &'static str)> {
-    let mut out = vec![("schema", "kafka", "USAGE")];
-    for (table, privs) in WORKER_TABLE_GRANTS {
-        for p in *privs {
-            out.push(("table", table, p));
+/// The kind of object a [`PrivilegeCheck`] is about (`has_*_privilege` to ask).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectKind {
+    Schema,
+    Table,
+    Sequence,
+    Function,
+}
+
+impl ObjectKind {
+    /// The name the startup check's SQL dispatches on.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Schema => "schema",
+            Self::Table => "table",
+            Self::Sequence => "sequence",
+            Self::Function => "function",
         }
     }
-    for seq in WORKER_SEQUENCE_GRANTS {
-        out.push(("sequence", seq, "USAGE"));
+}
+
+/// One privilege the worker role must hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrivilegeCheck {
+    pub kind: ObjectKind,
+    pub object: &'static str,
+    pub privilege: &'static str,
+}
+
+/// Every privilege the worker role must hold, for the startup check. One entry per
+/// privilege: `has_table_privilege` with a comma list is true if ANY of them is held.
+pub fn required_worker_privileges() -> Vec<PrivilegeCheck> {
+    let check = |kind, object, privilege| PrivilegeCheck {
+        kind,
+        object,
+        privilege,
+    };
+    let mut out = vec![check(ObjectKind::Schema, "kafka", "USAGE")];
+    for (table, privs) in WORKER_TABLE_GRANTS {
+        out.extend(privs.iter().map(|p| check(ObjectKind::Table, table, p)));
     }
-    for func in WORKER_FUNCTION_GRANTS {
-        out.push(("function", func, "EXECUTE"));
-    }
+    out.extend(
+        WORKER_SEQUENCE_GRANTS
+            .iter()
+            .map(|seq| check(ObjectKind::Sequence, seq, "USAGE")),
+    );
+    out.extend(
+        WORKER_FUNCTION_GRANTS
+            .iter()
+            .map(|func| check(ObjectKind::Function, func, "EXECUTE")),
+    );
     out
 }
 
@@ -188,10 +223,35 @@ mod tests {
     /// issuing SQL from the background worker.
     const WORKER_SQL_SOURCES: &[(&str, &str)] = &[
         ("storage/postgres.rs", include_str!("postgres.rs")),
+        ("storage/postgres/log.rs", include_str!("postgres/log.rs")),
+        (
+            "storage/postgres/maintenance.rs",
+            include_str!("postgres/maintenance.rs"),
+        ),
+        (
+            "storage/postgres/offsets.rs",
+            include_str!("postgres/offsets.rs"),
+        ),
+        (
+            "storage/postgres/producers.rs",
+            include_str!("postgres/producers.rs"),
+        ),
+        (
+            "storage/postgres/topics.rs",
+            include_str!("postgres/topics.rs"),
+        ),
+        (
+            "storage/postgres/transactions.rs",
+            include_str!("postgres/transactions.rs"),
+        ),
+        (
+            "storage/postgres/worker_role.rs",
+            include_str!("postgres/worker_role.rs"),
+        ),
         ("shadow/store.rs", include_str!("../shadow/store.rs")),
         ("shadow/outbox.rs", include_str!("../shadow/outbox.rs")),
         ("metrics.rs", include_str!("../metrics.rs")),
-        ("worker.rs", include_str!("../../worker.rs")),
+        ("worker/schema.rs", include_str!("../../worker/schema.rs")),
         (
             "auth/credentials.rs",
             include_str!("../auth/credentials.rs"),
@@ -206,7 +266,7 @@ mod tests {
 
     /// `(privileges, object)` of every `GRANT ... TO <role>;` line in `sql`.
     pub(crate) fn grants_to(sql: &str, role: &str) -> Vec<(Vec<String>, String)> {
-        let suffix = format!(" to {};", role);
+        let suffix = format!(" to {role};");
         sql.lines()
             .map(|l| l.trim().to_lowercase())
             .filter(|l| l.starts_with("grant ") && l.ends_with(&suffix))
@@ -246,7 +306,7 @@ mod tests {
         flat.sort();
         let mut expected: Vec<(String, String)> = required_worker_privileges()
             .into_iter()
-            .map(|(_, obj, p)| (obj.to_string(), p.to_string()))
+            .map(|c| (c.object.to_string(), c.privilege.to_string()))
             .collect();
         expected.sort();
         assert_eq!(flat, expected);
@@ -260,7 +320,7 @@ mod tests {
             let mut upgraded = grants_to(UPGRADE_0_1_0_SQL, role);
             fresh.sort();
             upgraded.sort();
-            assert_eq!(fresh, upgraded, "grants to {} differ", role);
+            assert_eq!(fresh, upgraded, "grants to {role} differ");
         }
         assert!(
             UPGRADE_0_1_0_SQL.contains("REVOKE EXECUTE ON FUNCTION kafka.replay_shadow_messages")
@@ -276,8 +336,7 @@ mod tests {
             }
             assert!(
                 !(l.starts_with("grant ") && l.contains(" to public")),
-                "PUBLIC grant left in bootstrap.sql: {}",
-                line
+                "PUBLIC grant left in bootstrap.sql: {line}"
             );
         }
         assert!(BOOTSTRAP_SQL.contains("REVOKE EXECUTE ON FUNCTION kafka.replay_shadow_messages"));
@@ -286,14 +345,12 @@ mod tests {
     #[test]
     fn reader_role_is_read_only() {
         let grants = grants_to(BOOTSTRAP_SQL, READER_ROLE);
-        assert!(!grants.is_empty());
+        assert_ne!(grants, Vec::new());
         for (privs, obj) in grants {
             for p in privs {
                 assert!(
                     p == "USAGE" || p.starts_with("SELECT"),
-                    "reader role granted {} on {}",
-                    p,
-                    obj
+                    "reader role granted {p} on {obj}"
                 );
             }
         }
@@ -329,7 +386,7 @@ mod tests {
                 if !sql_context {
                     continue;
                 }
-                let table = format!("kafka.{}", name);
+                let table = format!("kafka.{name}");
                 // Views and functions are not tables the worker writes.
                 if [
                     "kafka.shadow_status",
@@ -361,41 +418,35 @@ mod tests {
                 if let Some(v) = verb {
                     assert!(
                         granted(&table, v),
-                        "{}: {} on {} is not granted to {}",
-                        file,
-                        v,
-                        table,
-                        WORKER_ROLE
+                        "{file}: {v} on {table} is not granted to {WORKER_ROLE}"
                     );
                 }
                 checked += 1;
                 assert!(
                     granted(&table, "SELECT"),
-                    "{}: {} is used but SELECT is not granted to {}",
-                    file,
-                    table,
-                    WORKER_ROLE
+                    "{file}: {table} is used but SELECT is not granted to {WORKER_ROLE}"
                 );
                 if verb == Some("INSERT") {
                     let stmt_end = lower[i..].find("\",").map_or(lower.len(), |p| i + p);
                     if lower[i..stmt_end].contains("do update") {
                         assert!(
                             granted(&table, "UPDATE"),
-                            "{}: upsert on {} needs UPDATE",
-                            file,
-                            table
+                            "{file}: upsert on {table} needs UPDATE"
                         );
                     }
                 }
             }
         }
         // Guard against the scan silently matching nothing.
-        assert!(checked > 50, "only {} SQL table references found", checked);
+        assert!(checked > 50, "only {checked} SQL table references found");
     }
 
     #[test]
     fn required_privileges_list_one_row_per_privilege() {
-        let rows = required_worker_privileges();
+        let rows: Vec<(&str, &str, &str)> = required_worker_privileges()
+            .into_iter()
+            .map(|c| (c.kind.as_str(), c.object, c.privilege))
+            .collect();
         assert_eq!(rows[0], ("schema", "kafka", "USAGE"));
         assert!(rows.contains(&("table", "kafka.messages", "DELETE")));
         assert!(rows.contains(&("sequence", "kafka.producer_ids_producer_id_seq", "USAGE")));
@@ -427,8 +478,7 @@ mod tests {
                 if lower.contains(f) {
                     assert!(
                         granted.contains(&f.trim_end_matches('(').to_string()),
-                        "{} not granted",
-                        f
+                        "{f} not granted"
                     );
                 }
             }
@@ -441,9 +491,8 @@ mod tests {
             "kafka.drop_message_partition(regclass, int[])",
         ] {
             assert!(
-                bootstrap.contains(&format!("revoke execute on function {} from public;", f)),
-                "{} must be revoked from PUBLIC in bootstrap.sql",
-                f
+                bootstrap.contains(&format!("revoke execute on function {f} from public;")),
+                "{f} must be revoked from PUBLIC in bootstrap.sql"
             );
         }
         // Every partition DDL function pins its search_path.

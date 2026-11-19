@@ -1,8 +1,15 @@
 //! The auth E2E tests (see `auth/mod.rs` for the listener setup).
 
-use super::*;
+use super::{
+    auth_env, cert_path, configure_listeners, remove_certificates, restart_listener, PASSWORD,
+    PLAINTEXT_PORT, SASL_PLAINTEXT_PORT, SASL_SSL_PORT, SSL_PORT, USER,
+};
+use crate::common::{create_db_client, TestResult};
+use crate::error_codes;
 use crate::setup::TestContext;
+use crate::wire::roundtrip;
 use bytes::Bytes;
+use kafka_protocol::messages::ApiVersionsRequest;
 use kafka_protocol::messages::{MetadataRequest, SaslAuthenticateRequest, SaslHandshakeRequest};
 use kafka_protocol::protocol::StrBytes;
 use rdkafka::config::ClientConfig;
@@ -10,17 +17,14 @@ use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::message::Message;
 use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 use rdkafka::{Offset, TopicPartitionList};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-const ERROR_UNSUPPORTED_SASL_MECHANISM: i16 = 33;
-const ERROR_ILLEGAL_SASL_STATE: i16 = 34;
-const ERROR_SASL_AUTHENTICATION_FAILED: i16 = 58;
-const ERROR_UNSUPPORTED_VERSION: i16 = 35;
+use tokio::net::TcpStream;
 
 /// Client config for one of the listeners.
 fn client_config(port: u16, protocol: &str) -> ClientConfig {
     let mut cfg = ClientConfig::new();
-    cfg.set("bootstrap.servers", format!("127.0.0.1:{}", port))
+    cfg.set("bootstrap.servers", format!("127.0.0.1:{port}"))
         .set("broker.address.family", "v4")
         .set("security.protocol", protocol)
         .set("message.timeout.ms", "10000")
@@ -57,13 +61,13 @@ async fn round_trip(cfg: ClientConfig, port: u16, label: &str) -> TestResult {
         producer
             .send(
                 FutureRecord::to(&topic)
-                    .key(&format!("k{}", i))
-                    .payload(&format!("{}-{}", label, i))
+                    .key(&format!("k{i}"))
+                    .payload(&format!("{label}-{i}"))
                     .partition(0),
                 Duration::from_secs(15),
             )
             .await
-            .map_err(|(e, _)| format!("produce on port {} failed: {}", port, e))?;
+            .map_err(|(e, _)| format!("produce on port {port} failed: {e}"))?;
     }
     let md = producer
         .client()
@@ -71,10 +75,10 @@ async fn round_trip(cfg: ClientConfig, port: u16, label: &str) -> TestResult {
     assert_eq!(md.brokers().len(), 1);
     assert_eq!(
         md.brokers()[0].port(),
-        port as i32,
+        i32::from(port),
         "Metadata must advertise the listener the client is on"
     );
-    println!("✅ produced 5 records on port {}", port);
+    println!("✅ produced 5 records on port {port}");
 
     let mut ccfg = cfg.clone();
     ccfg.set("group.id", &group)
@@ -92,18 +96,18 @@ async fn round_trip(cfg: ClientConfig, port: u16, label: &str) -> TestResult {
         while out.len() < 5 && Instant::now() < deadline {
             match consumer.poll(Duration::from_millis(500)) {
                 Some(Ok(m)) => {
-                    out.push(String::from_utf8_lossy(m.payload().unwrap_or_default()).into_owned())
+                    out.push(String::from_utf8_lossy(m.payload().unwrap_or_default()).into_owned());
                 }
-                Some(Err(e)) => return Err(format!("{} consume error: {}", label_c, e)),
+                Some(Err(e)) => return Err(format!("{label_c} consume error: {e}")),
                 None => {}
             }
         }
         Ok(out)
     })
     .await??;
-    let expected: Vec<String> = (0..5).map(|i| format!("{}-{}", label, i)).collect();
-    assert_eq!(received, expected, "consumed records on port {}", port);
-    println!("✅ consumed the 5 records on port {}", port);
+    let expected: Vec<String> = (0..5).map(|i| format!("{label}-{i}")).collect();
+    assert_eq!(received, expected, "consumed records on port {port}");
+    println!("✅ consumed the 5 records on port {port}");
 
     let count: i64 = ctx
         .db()
@@ -141,7 +145,7 @@ async fn closed_by_server(stream: &mut TcpStream) -> bool {
     let mut buf = [0u8; 1];
     matches!(
         tokio::time::timeout(Duration::from_secs(3), stream.read(&mut buf)).await,
-        Ok(Ok(0)) | Ok(Err(_))
+        Ok(Ok(0) | Err(_))
     )
 }
 
@@ -158,7 +162,7 @@ fn authenticate(bytes: Vec<u8>) -> SaslAuthenticateRequest {
 }
 
 fn plain_token(user: &str, password: &str) -> Vec<u8> {
-    format!("\0{}\0{}", user, password).into_bytes()
+    format!("\0{user}\0{password}").into_bytes()
 }
 
 /// SASL_PLAINTEXT + PLAIN: produce/consume round trip; Metadata advertises 19093.
@@ -235,7 +239,7 @@ pub async fn test_auth_sasl_scram_sha512_roundtrip() -> TestResult {
             Duration::from_secs(15),
         )
         .await
-        .map_err(|(e, _)| format!("700 KiB produce after authentication failed: {}", e))?;
+        .map_err(|(e, _)| format!("700 KiB produce after authentication failed: {e}"))?;
     println!("✅ 700 KiB record accepted after authentication");
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");
@@ -259,15 +263,10 @@ pub async fn test_auth_wrong_password_rejected() -> TestResult {
             );
             assert!(
                 !can_connect(cfg).await,
-                "{} must reject user {:?} with a bad password",
-                mechanism,
-                user
+                "{mechanism} must reject user {user:?} with a bad password"
             );
         }
-        println!(
-            "✅ {} rejects a wrong password and an unknown user",
-            mechanism
-        );
+        println!("✅ {mechanism} rejects a wrong password and an unknown user");
     }
 
     // Raw wire: PLAIN with a wrong password.
@@ -276,7 +275,7 @@ pub async fn test_auth_wrong_password_rejected() -> TestResult {
     assert_eq!(hs.error_code, 0);
     assert!(hs.mechanisms.iter().any(|m| m.as_str() == "SCRAM-SHA-512"));
     let au = roundtrip(&mut s, 2, 2, &authenticate(plain_token(USER, "nope"))).await?;
-    assert_eq!(au.error_code, ERROR_SASL_AUTHENTICATION_FAILED);
+    assert_eq!(au.error_code, error_codes::SASL_AUTHENTICATION_FAILED);
     let msg = au.error_message.as_deref().unwrap_or("").to_string();
     assert!(
         !msg.contains("nope"),
@@ -338,7 +337,7 @@ pub async fn test_auth_unauthenticated_request_rejected() -> TestResult {
             .api_keys
             .iter()
             .find(|k| k.api_key == key)
-            .ok_or(format!("api {} not advertised", key))?;
+            .ok_or(format!("api {key} not advertised"))?;
         assert_eq!((api.min_version, api.max_version), (min, max));
     }
     let no_response = roundtrip(&mut s, 4, 2, &MetadataRequest::default())
@@ -353,13 +352,13 @@ pub async fn test_auth_unauthenticated_request_rejected() -> TestResult {
 
     let mut s = TcpStream::connect(("127.0.0.1", SASL_PLAINTEXT_PORT)).await?;
     let au = roundtrip(&mut s, 2, 3, &authenticate(plain_token(USER, PASSWORD))).await?;
-    assert_eq!(au.error_code, ERROR_ILLEGAL_SASL_STATE);
+    assert_eq!(au.error_code, error_codes::ILLEGAL_SASL_STATE);
     assert!(closed_by_server(&mut s).await);
     println!("✅ SaslAuthenticate before SaslHandshake: ILLEGAL_SASL_STATE + close");
 
     let mut s = TcpStream::connect(("127.0.0.1", SASL_PLAINTEXT_PORT)).await?;
     let hs = roundtrip(&mut s, 1, 5, &handshake("GSSAPI")).await?;
-    assert_eq!(hs.error_code, ERROR_UNSUPPORTED_SASL_MECHANISM);
+    assert_eq!(hs.error_code, error_codes::UNSUPPORTED_SASL_MECHANISM);
     assert_eq!(hs.mechanisms.len(), 3);
     assert!(closed_by_server(&mut s).await);
     println!("✅ unsupported mechanism: UNSUPPORTED_SASL_MECHANISM + close");
@@ -370,19 +369,15 @@ pub async fn test_auth_unauthenticated_request_rejected() -> TestResult {
     let mut buf = [0u8; 1];
     let closed = matches!(
         tokio::time::timeout(Duration::from_secs(20), idle.read(&mut buf)).await,
-        Ok(Ok(0)) | Ok(Err(_))
+        Ok(Ok(0) | Err(_))
     );
     let waited = started.elapsed();
     assert!(closed, "an unauthenticated idle connection must be closed");
     assert!(
         waited >= Duration::from_secs(8) && waited < Duration::from_secs(15),
-        "closed after {:?}, expected about 10 s",
-        waited
+        "closed after {waited:?}, expected about 10 s"
     );
-    println!(
-        "✅ idle unauthenticated connection closed after {:?}",
-        waited
-    );
+    println!("✅ idle unauthenticated connection closed after {waited:?}");
 
     // A frame larger than the pre-authentication limit (512 KiB) is refused.
     let mut s = TcpStream::connect(("127.0.0.1", SASL_PLAINTEXT_PORT)).await?;
@@ -393,7 +388,7 @@ pub async fn test_auth_unauthenticated_request_rejected() -> TestResult {
 
     let mut s = TcpStream::connect(("127.0.0.1", SASL_PLAINTEXT_PORT)).await?;
     let hs = roundtrip(&mut s, 0, 6, &handshake("PLAIN")).await?;
-    assert_eq!(hs.error_code, ERROR_UNSUPPORTED_VERSION);
+    assert_eq!(hs.error_code, error_codes::UNSUPPORTED_VERSION);
     assert!(closed_by_server(&mut s).await);
     println!("✅ SaslHandshake v0 (unframed tokens): UNSUPPORTED_VERSION + close");
 
@@ -412,12 +407,12 @@ pub async fn test_auth_plaintext_listener_unaffected() -> TestResult {
     auth_env().await?;
     let mut s = TcpStream::connect(("127.0.0.1", PLAINTEXT_PORT)).await?;
     let hs = roundtrip(&mut s, 1, 1, &handshake("PLAIN")).await?;
-    assert_eq!(hs.error_code, ERROR_ILLEGAL_SASL_STATE);
+    assert_eq!(hs.error_code, error_codes::ILLEGAL_SASL_STATE);
     let au = roundtrip(&mut s, 2, 2, &authenticate(plain_token(USER, PASSWORD))).await?;
-    assert_eq!(au.error_code, ERROR_ILLEGAL_SASL_STATE);
+    assert_eq!(au.error_code, error_codes::ILLEGAL_SASL_STATE);
     let md = roundtrip(&mut s, 4, 3, &MetadataRequest::default()).await?;
     assert_eq!(md.brokers.len(), 1);
-    assert_eq!(md.brokers[0].port, PLAINTEXT_PORT as i32);
+    assert_eq!(md.brokers[0].port, i32::from(PLAINTEXT_PORT));
     println!("✅ SASL APIs answer ILLEGAL_SASL_STATE; Metadata still served");
     round_trip(
         client_config(PLAINTEXT_PORT, "plaintext"),

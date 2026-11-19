@@ -22,8 +22,8 @@ pub async fn test_rapid_rebalance_cycles() -> TestResult {
         producer
             .send(
                 FutureRecord::to(&topic)
-                    .payload(&format!("msg-{}", i))
-                    .key(&format!("key-{}", i)),
+                    .payload(&format!("msg-{i}"))
+                    .key(&format!("key-{i}")),
                 Duration::from_secs(5),
             )
             .await
@@ -89,8 +89,8 @@ pub async fn test_heartbeat_during_rebalance_window() -> TestResult {
         producer
             .send(
                 FutureRecord::to(&topic)
-                    .payload(&format!("msg-{}", i))
-                    .key(&format!("key-{}", i)),
+                    .payload(&format!("msg-{i}"))
+                    .key(&format!("key-{i}")),
                 Duration::from_secs(5),
             )
             .await
@@ -144,8 +144,8 @@ pub async fn test_multiple_concurrent_timeouts() -> TestResult {
         producer
             .send(
                 FutureRecord::to(&topic)
-                    .payload(&format!("msg-{}", i))
-                    .key(&format!("key-{}", i)),
+                    .payload(&format!("msg-{i}"))
+                    .key(&format!("key-{i}")),
                 Duration::from_secs(5),
             )
             .await
@@ -247,8 +247,8 @@ pub async fn test_rebalance_mixed_timeout_values() -> TestResult {
         producer
             .send(
                 FutureRecord::to(&topic)
-                    .payload(&format!("msg-{}", i))
-                    .key(&format!("key-{}", i)),
+                    .payload(&format!("msg-{i}"))
+                    .key(&format!("key-{i}")),
                 Duration::from_secs(5),
             )
             .await

@@ -20,12 +20,11 @@
 //! generated files), connects as a superuser, and has `openssl` on PATH. All tests are
 //! registered `parallel_safe: false` because they restart the listener.
 
-pub mod tests;
-// Stream `api`: SASL requests in kafka.api_metrics.
 pub mod api_metrics;
+pub mod tests;
 
 use crate::common::{create_db_client, TestResult};
-use crate::error_paths::bug_hunt::roundtrip;
+use crate::wire::roundtrip;
 use kafka_protocol::messages::ApiVersionsRequest;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -45,24 +44,26 @@ pub const PASSWORD: &str = "e2e auth pässword";
 const LISTENERS: &str =
     "SASL_PLAINTEXT://127.0.0.1:19093,SSL://127.0.0.1:19094,SASL_SSL://127.0.0.1:19095";
 
-pub type DynResult<T> = Result<T, Box<dyn std::error::Error>>;
+use crate::common::DynResult;
 
 /// Where the generated certificates live: one directory per test process.
 ///
-/// wave3 net: it used to be one fixed `$TMPDIR/pg_kafka_auth_e2e` for every process,
-/// so two suites running at once on one host (parallel CI jobs, several clusters on a
-/// dev box) regenerated each other's CA and server certificate between a server loading
-/// one and a client trusting the other: intermittent "certificate verify failed".
+/// A directory shared by every process would let two suites running at once on one host
+/// (parallel CI jobs, several clusters on a dev box) regenerate each other's CA and
+/// server certificate between a server loading one and a client trusting the other:
+/// intermittent "certificate verify failed".
 pub fn cert_dir() -> PathBuf {
     std::env::temp_dir().join(format!("pg_kafka_auth_e2e-{}", std::process::id()))
 }
 
 /// Generate the certificates for this test process unless they exist (the auth and
-/// w3_net setups share them; each category's teardown removes them with
+/// network setups share them; each category's teardown removes them with
 /// [`remove_certificates`]).
 pub fn ensure_certificates() -> DynResult<PathBuf> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _guard = LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = cert_dir();
     if dir.join("server.key").exists() && dir.join("client.pem").exists() {
         return Ok(dir);
@@ -109,9 +110,9 @@ fn generate_certificates() -> DynResult<PathBuf> {
         "-nodes",
     ];
     for (name, cn) in [("ca", "pg_kafka e2e CA"), ("other-ca", "untrusted e2e CA")] {
-        let key = format!("{}.key", name);
-        let pem = format!("{}.pem", name);
-        let subj = format!("/CN={}", cn);
+        let key = format!("{name}.key");
+        let pem = format!("{name}.pem");
+        let subj = format!("/CN={cn}");
         let mut args = vec!["req", "-x509"];
         args.extend(ec);
         args.extend([
@@ -139,10 +140,10 @@ fn generate_certificates() -> DynResult<PathBuf> {
         ("server", "/CN=localhost"),
         ("client", "/O=pg_kafka e2e/CN=e2e-client"),
     ] {
-        let key = format!("{}.key", name);
-        let csr = format!("{}.csr", name);
-        let pem = format!("{}.pem", name);
-        let ext = format!("{}.ext", name);
+        let key = format!("{name}.key");
+        let csr = format!("{name}.csr");
+        let pem = format!("{name}.pem");
+        let ext = format!("{name}.ext");
         let mut args = vec!["req"];
         args.extend(ec);
         args.extend(["-keyout", &key, "-out", &csr, "-subj", subj]);
@@ -197,7 +198,7 @@ pub async fn configure_listeners(db: &Client, enable: bool, mutual_tls: bool) ->
         let sql = if set {
             format!("ALTER SYSTEM SET {} = {}", name, quote(&value))
         } else {
-            format!("ALTER SYSTEM RESET {}", name)
+            format!("ALTER SYSTEM RESET {name}")
         };
         db.execute(&sql, &[]).await?;
     }
@@ -267,9 +268,8 @@ pub async fn restart_listener(db: &Client, open: &[u16], closed: &[u16]) -> DynR
         }
     }
     Err(format!(
-        "listener did not come back with ports {:?} open and {:?} closed within 40 s \
-         (check the server log for a pg_kafka listener security error)",
-        open, closed
+        "listener did not come back with ports {open:?} open and {closed:?} closed within 40 s \
+         (check the server log for a pg_kafka listener security error)"
     )
     .into())
 }
@@ -293,5 +293,25 @@ pub async fn auth_env() -> TestResult {
     ENV.get_or_init(|| async { setup().await.map_err(|e| e.to_string()) })
         .await
         .clone()
-        .map_err(|e| format!("auth E2E setup failed: {}", e).into())
+        .map_err(|e| format!("auth E2E setup failed: {e}").into())
+}
+
+/// The `auth` tests, in run order.
+pub fn tests() -> Vec<crate::registry::TestDef> {
+    crate::test_defs!["auth";
+        // All sequential: they restart the listener worker. The teardown test stays last.
+        tests::test_auth_sasl_plain_roundtrip: sequential,
+        tests::test_auth_sasl_scram_sha256_roundtrip: sequential,
+        tests::test_auth_sasl_scram_sha512_roundtrip: sequential,
+        tests::test_auth_wrong_password_rejected: sequential,
+        tests::test_auth_unauthenticated_request_rejected: sequential,
+        tests::test_auth_plaintext_listener_unaffected: sequential,
+        tests::test_auth_tls_roundtrip_and_untrusted_ca: sequential,
+        tests::test_auth_sasl_ssl_roundtrip: sequential,
+        tests::test_auth_user_management_sql: sequential,
+        tests::test_auth_mutual_tls: sequential,
+        // Before the teardown, which restarts the worker and so resets the counters.
+        api_metrics::test_auth_sasl_requests_counted_in_api_metrics: sequential,
+        tests::test_auth_teardown_restores_default_listeners: sequential,
+    ]
 }

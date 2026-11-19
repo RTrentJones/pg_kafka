@@ -8,13 +8,18 @@ mod edge_cases;
 mod producer;
 mod roundtrip;
 
-pub use edge_cases::{
-    test_compression_incompressible_data, test_compression_mixed_formats,
-    test_compression_ratio_verification, test_compression_small_message_overhead,
-    test_large_value_compression,
-};
-pub use producer::{
-    test_compressed_producer_gzip, test_compressed_producer_lz4, test_compressed_producer_snappy,
-    test_compressed_producer_zstd,
-};
-pub use roundtrip::test_compression_roundtrip;
+/// The `compression` tests, in run order.
+pub fn tests() -> Vec<crate::registry::TestDef> {
+    crate::test_defs!["compression";
+        producer::test_compressed_producer_gzip,
+        producer::test_compressed_producer_snappy,
+        producer::test_compressed_producer_lz4,
+        producer::test_compressed_producer_zstd,
+        roundtrip::test_compression_roundtrip,
+        edge_cases::test_large_value_compression,
+        edge_cases::test_compression_mixed_formats,
+        edge_cases::test_compression_ratio_verification,
+        edge_cases::test_compression_incompressible_data,
+        edge_cases::test_compression_small_message_overhead,
+    ]
+}

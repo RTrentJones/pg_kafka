@@ -43,8 +43,8 @@ pub async fn test_replay_historical_messages() -> TestResult {
 
     let producer = create_producer()?;
     for i in 0..message_count {
-        let key = format!("historical-key-{}", i);
-        let value = format!("historical-value-{}", i);
+        let key = format!("historical-key-{i}");
+        let value = format!("historical-value-{i}");
         producer
             .send(
                 FutureRecord::to(&topic)
@@ -55,10 +55,7 @@ pub async fn test_replay_historical_messages() -> TestResult {
             .await
             .map_err(|(e, _)| e)?;
     }
-    println!(
-        "✅ {} historical messages produced (not forwarded)\n",
-        message_count
-    );
+    println!("✅ {message_count} historical messages produced (not forwarded)\n");
 
     // 2. Enable shadow mode
     println!("Step 2: Verifying external Kafka is ready...");
@@ -108,7 +105,7 @@ pub async fn test_replay_historical_messages() -> TestResult {
         }
         Err(e) => {
             // Replay function may not exist yet - this is expected during initial testing
-            println!("Note: Replay function not available ({})", e);
+            println!("Note: Replay function not available ({e})");
             println!("Skipping replay verification - function needs to be implemented\n");
 
             ctx.cleanup().await?;
@@ -123,10 +120,7 @@ pub async fn test_replay_historical_messages() -> TestResult {
 
     println!("Checking external Kafka for replayed messages...");
     assert_external_message_count(&topic, message_count, Duration::from_secs(15)).await?;
-    println!(
-        "✅ All {} historical messages replayed to external Kafka\n",
-        message_count
-    );
+    println!("✅ All {message_count} historical messages replayed to external Kafka\n");
 
     // 5. CLEANUP
     ctx.cleanup().await?;

@@ -1,4 +1,4 @@
-//! Stream `api`: every request that fails after a valid header gets a well-formed response of
+//! Every request that fails after a valid header gets a well-formed response of
 //! its own API and version, carrying an error code and the request's correlation id.
 //!
 //! These tests speak the wire protocol directly (kafka-protocol encodes the requests and
@@ -7,59 +7,31 @@
 //! Each response must decode completely in the request's version, which is what a strict
 //! client does with it.
 
+use crate::common::to_i32;
 use crate::common::TestResult;
+use crate::error_codes;
 use crate::setup::TestContext;
+use crate::wire::{read_frame_within, request_frame};
 use bytes::{Buf, BytesMut};
 use kafka_protocol::messages::{
     fetch_request, list_offsets_request, metadata_request, offset_fetch_request, produce_request,
-    ApiKey, FetchRequest, FetchResponse, FindCoordinatorRequest, FindCoordinatorResponse, GroupId,
+    FetchRequest, FetchResponse, FindCoordinatorRequest, FindCoordinatorResponse, GroupId,
     HeartbeatRequest, HeartbeatResponse, InitProducerIdRequest, InitProducerIdResponse,
     JoinGroupRequest, JoinGroupResponse, ListOffsetsRequest, ListOffsetsResponse, MetadataRequest,
     MetadataResponse, OffsetFetchRequest, OffsetFetchResponse, ProduceRequest, ProduceResponse,
-    RequestHeader, ResponseHeader, TopicName,
+    ResponseHeader, TopicName,
 };
-use kafka_protocol::protocol::{Decodable, Encodable, HeaderVersion, StrBytes};
+use kafka_protocol::protocol::{Decodable, HeaderVersion, StrBytes};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
 const BROKER: &str = "localhost:9092";
-const UNKNOWN_SERVER_ERROR: i16 = -1;
-const UNSUPPORTED_VERSION: i16 = 35;
-const INVALID_REQUEST: i16 = 42;
 
 type BoxError = Box<dyn std::error::Error>;
 
-/// Encode `request` (header + body) for API `key` at `version`, size-prefixed.
-fn frame<R: Encodable>(key: ApiKey, version: i16, correlation_id: i32, request: &R) -> BytesMut {
-    let mut payload = BytesMut::new();
-    RequestHeader::default()
-        .with_request_api_key(key as i16)
-        .with_request_api_version(version)
-        .with_correlation_id(correlation_id)
-        .with_client_id(Some(StrBytes::from_static_str("api-errors")))
-        .encode(&mut payload, key.request_header_version(version))
-        .unwrap();
-    request.encode(&mut payload, version).unwrap();
-    let mut framed = BytesMut::new();
-    framed.extend_from_slice(&(payload.len() as i32).to_be_bytes());
-    framed.extend_from_slice(&payload);
-    framed
-}
-
-/// Read one response frame (`None` if the broker closed the connection).
-async fn read_frame(stream: &mut TcpStream) -> Result<Option<BytesMut>, BoxError> {
-    let mut size = [0u8; 4];
-    match tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut size)).await? {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => return Ok(None),
-        Err(e) => return Err(e.into()),
-    }
-    let mut body = vec![0u8; i32::from_be_bytes(size) as usize];
-    stream.read_exact(&mut body).await?;
-    Ok(Some(BytesMut::from(&body[..])))
-}
+/// How long a test waits for any one response.
+const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Send `framed`, read the reply and decode it completely as `R` at `version`, checking the
 /// correlation id. A connection close or trailing bytes fail the test.
@@ -70,9 +42,10 @@ async fn exchange<R: Decodable + HeaderVersion>(
     correlation_id: i32,
 ) -> Result<R, BoxError> {
     stream.write_all(framed).await?;
-    let mut reply = read_frame(stream)
+    let reply = read_frame_within(stream, READ_TIMEOUT)
         .await?
         .ok_or("the broker closed the connection instead of answering")?;
+    let mut reply = BytesMut::from(&reply[..]);
     let header = ResponseHeader::decode(&mut reply, R::header_version(version))?;
     assert_eq!(header.correlation_id, correlation_id, "correlation id");
     let response = R::decode(&mut reply, version)?;
@@ -88,7 +61,7 @@ async fn exchange<R: Decodable + HeaderVersion>(
 async fn connection_still_usable(stream: &mut TcpStream) -> Result<(), BoxError> {
     let mut request = FindCoordinatorRequest::default();
     request.key = StrBytes::from_static_str("api-errors-probe");
-    let framed = frame(ApiKey::FindCoordinator, 2, 9_999, &request);
+    let framed = request_frame(2, 9_999, &request);
     let response: FindCoordinatorResponse = exchange(stream, &framed, 2, 9_999).await?;
     assert_eq!(response.error_code, 0, "the connection keeps working");
     Ok(())
@@ -110,15 +83,13 @@ pub async fn test_unsupported_versions_get_typed_error_responses() -> TestResult
     let mut t = metadata_request::MetadataRequestTopic::default();
     t.name = Some(topic("api-errors-meta"));
     request.topics = Some(vec![t]);
-    let response: MetadataResponse = exchange(
-        &mut stream,
-        &frame(ApiKey::Metadata, 11, 101, &request),
-        11,
-        101,
-    )
-    .await?;
+    let response: MetadataResponse =
+        exchange(&mut stream, &request_frame(11, 101, &request), 11, 101).await?;
     assert_eq!(response.topics.len(), 1);
-    assert_eq!(response.topics[0].error_code, UNSUPPORTED_VERSION);
+    assert_eq!(
+        response.topics[0].error_code,
+        error_codes::UNSUPPORTED_VERSION
+    );
     println!(
         "✅ Metadata v11: topic error {}",
         response.topics[0].error_code
@@ -132,18 +103,13 @@ pub async fn test_unsupported_versions_get_typed_error_responses() -> TestResult
     p.partition = 2;
     t.partitions = vec![p];
     request.topics = vec![t];
-    let response: FetchResponse = exchange(
-        &mut stream,
-        &frame(ApiKey::Fetch, 12, 102, &request),
-        12,
-        102,
-    )
-    .await?;
-    assert_eq!(response.error_code, UNSUPPORTED_VERSION);
+    let response: FetchResponse =
+        exchange(&mut stream, &request_frame(12, 102, &request), 12, 102).await?;
+    assert_eq!(response.error_code, error_codes::UNSUPPORTED_VERSION);
     assert_eq!(response.responses[0].partitions[0].partition_index, 2);
     assert_eq!(
         response.responses[0].partitions[0].error_code,
-        UNSUPPORTED_VERSION
+        error_codes::UNSUPPORTED_VERSION
     );
     println!("✅ Fetch v12: top-level and partition error");
 
@@ -157,16 +123,11 @@ pub async fn test_unsupported_versions_get_typed_error_responses() -> TestResult
     p.index = 0;
     t.partition_data = vec![p];
     request.topic_data = vec![t];
-    let response: ProduceResponse = exchange(
-        &mut stream,
-        &frame(ApiKey::Produce, 10, 103, &request),
-        10,
-        103,
-    )
-    .await?;
+    let response: ProduceResponse =
+        exchange(&mut stream, &request_frame(10, 103, &request), 10, 103).await?;
     assert_eq!(
         response.responses[0].partition_responses[0].error_code,
-        UNSUPPORTED_VERSION
+        error_codes::UNSUPPORTED_VERSION
     );
     println!("✅ Produce v10: partition error");
 
@@ -175,30 +136,23 @@ pub async fn test_unsupported_versions_get_typed_error_responses() -> TestResult
     let mut g = offset_fetch_request::OffsetFetchRequestGroup::default();
     g.group_id = GroupId(StrBytes::from_static_str("api-errors-group"));
     request.groups = vec![g];
-    let response: OffsetFetchResponse = exchange(
-        &mut stream,
-        &frame(ApiKey::OffsetFetch, 8, 104, &request),
-        8,
-        104,
-    )
-    .await?;
+    let response: OffsetFetchResponse =
+        exchange(&mut stream, &request_frame(8, 104, &request), 8, 104).await?;
     assert_eq!(response.groups.len(), 1);
     assert_eq!(response.groups[0].group_id.as_str(), "api-errors-group");
-    assert_eq!(response.groups[0].error_code, UNSUPPORTED_VERSION);
+    assert_eq!(
+        response.groups[0].error_code,
+        error_codes::UNSUPPORTED_VERSION
+    );
     println!("✅ OffsetFetch v8: group error");
 
     // JoinGroup v8 (max 7): top-level code.
     let mut request = JoinGroupRequest::default();
     request.group_id = GroupId(StrBytes::from_static_str("api-errors-group"));
     request.protocol_type = StrBytes::from_static_str("consumer");
-    let response: JoinGroupResponse = exchange(
-        &mut stream,
-        &frame(ApiKey::JoinGroup, 8, 105, &request),
-        8,
-        105,
-    )
-    .await?;
-    assert_eq!(response.error_code, UNSUPPORTED_VERSION);
+    let response: JoinGroupResponse =
+        exchange(&mut stream, &request_frame(8, 105, &request), 8, 105).await?;
+    assert_eq!(response.error_code, error_codes::UNSUPPORTED_VERSION);
     println!("✅ JoinGroup v8: top-level error");
 
     connection_still_usable(&mut stream).await?;
@@ -209,32 +163,32 @@ pub async fn test_unsupported_versions_get_typed_error_responses() -> TestResult
 /// A body cut short after a valid header (the kafka-protocol decoder runs out of input) is
 /// answered with INVALID_REQUEST in the API's own schema, and the connection stays usable.
 pub async fn test_truncated_body_gets_invalid_request() -> TestResult {
-    println!("=== Test: Truncated Body Gets INVALID_REQUEST ===\n");
-    let mut stream = TcpStream::connect(BROKER).await?;
-
     /// `framed` without its last `cut` bytes, with the size prefix adjusted.
-    fn truncate(framed: &BytesMut, cut: usize) -> BytesMut {
+    fn truncate(framed: &[u8], cut: usize) -> BytesMut {
         let payload = &framed[4..framed.len() - cut];
         let mut out = BytesMut::new();
-        out.extend_from_slice(&(payload.len() as i32).to_be_bytes());
+        out.extend_from_slice(&to_i32(payload.len()).to_be_bytes());
         out.extend_from_slice(payload);
         out
     }
+
+    println!("=== Test: Truncated Body Gets INVALID_REQUEST ===\n");
+    let mut stream = TcpStream::connect(BROKER).await?;
 
     let mut heartbeat = HeartbeatRequest::default();
     heartbeat.group_id = GroupId(StrBytes::from_static_str("api-errors-group"));
     heartbeat.generation_id = 1;
     heartbeat.member_id = StrBytes::from_static_str("member-1");
-    let framed = truncate(&frame(ApiKey::Heartbeat, 3, 201, &heartbeat), 6);
+    let framed = truncate(&request_frame(3, 201, &heartbeat), 6);
     let response: HeartbeatResponse = exchange(&mut stream, &framed, 3, 201).await?;
-    assert_eq!(response.error_code, INVALID_REQUEST);
+    assert_eq!(response.error_code, error_codes::INVALID_REQUEST);
     println!("✅ Heartbeat v3: error {}", response.error_code);
 
     let mut init = InitProducerIdRequest::default();
     init.transaction_timeout_ms = 60_000;
-    let framed = truncate(&frame(ApiKey::InitProducerId, 1, 202, &init), 3);
+    let framed = truncate(&request_frame(1, 202, &init), 3);
     let response: InitProducerIdResponse = exchange(&mut stream, &framed, 1, 202).await?;
-    assert_eq!(response.error_code, INVALID_REQUEST);
+    assert_eq!(response.error_code, error_codes::INVALID_REQUEST);
     println!("✅ InitProducerId v1: error {}", response.error_code);
 
     // Produce has no top-level code; a body that cannot be decoded has no partitions to
@@ -245,9 +199,9 @@ pub async fn test_truncated_body_gets_invalid_request() -> TestResult {
     let mut t = produce_request::TopicProduceData::default();
     t.name = topic("api-errors-produce");
     produce.topic_data = vec![t];
-    let framed = truncate(&frame(ApiKey::Produce, 7, 203, &produce), 4);
+    let framed = truncate(&request_frame(7, 203, &produce), 4);
     let response: ProduceResponse = exchange(&mut stream, &framed, 7, 203).await?;
-    assert!(response.responses.is_empty());
+    assert_eq!(response.responses, Vec::new());
     println!("✅ Produce v7: well-formed response");
 
     connection_still_usable(&mut stream).await?;
@@ -282,7 +236,7 @@ pub async fn test_handler_failure_gets_typed_error_response() -> TestResult {
 
     ctx.db()
         .execute(
-            &format!("REVOKE SELECT ON kafka.partition_offsets FROM {}", role),
+            &format!("REVOKE SELECT ON kafka.partition_offsets FROM {role}"),
             &[],
         )
         .await?;
@@ -292,7 +246,7 @@ pub async fn test_handler_failure_gets_typed_error_response() -> TestResult {
         .map_err(|e| e.to_string());
     ctx.db()
         .execute(
-            &format!("GRANT SELECT ON kafka.partition_offsets TO {}", role),
+            &format!("GRANT SELECT ON kafka.partition_offsets TO {role}"),
             &[],
         )
         .await?;
@@ -302,7 +256,8 @@ pub async fn test_handler_failure_gets_typed_error_response() -> TestResult {
     assert_eq!(partitions.len(), 2, "both requested partitions are echoed");
     for p in partitions {
         assert_eq!(
-            p.error_code, UNKNOWN_SERVER_ERROR,
+            p.error_code,
+            error_codes::UNKNOWN_SERVER_ERROR,
             "partition {}",
             p.partition_index
         );
@@ -314,7 +269,7 @@ pub async fn test_handler_failure_gets_typed_error_response() -> TestResult {
     let mut stream = TcpStream::connect(BROKER).await?;
     let response: ListOffsetsResponse = exchange(
         &mut stream,
-        &frame(ApiKey::ListOffsets, 5, 302, &list_offsets(&topic_name)),
+        &request_frame(5, 302, &list_offsets(&topic_name)),
         5,
         302,
     )
@@ -351,7 +306,7 @@ async fn list_offsets_while_revoked(topic_name: &str) -> Result<ListOffsetsRespo
     let mut stream = TcpStream::connect(BROKER).await?;
     let response = exchange(
         &mut stream,
-        &frame(ApiKey::ListOffsets, 5, 301, &list_offsets(topic_name)),
+        &request_frame(5, 301, &list_offsets(topic_name)),
         5,
         301,
     )
@@ -399,12 +354,7 @@ pub async fn test_request_sees_rows_committed_during_its_batch() -> TestResult {
         .await?;
         // R1: starts a batch, then waits for the lock.
         blocked
-            .write_all(&frame(
-                ApiKey::ListOffsets,
-                5,
-                400 + attempt,
-                &list_offsets(&existing),
-            ))
+            .write_all(&request_frame(5, 400 + attempt, &list_offsets(&existing)))
             .await?;
         tokio::time::sleep(Duration::from_millis(5)).await;
         // Committed before R2 is sent.
@@ -424,23 +374,24 @@ pub async fn test_request_sees_rows_committed_during_its_batch() -> TestResult {
         p.partition_max_bytes = 1 << 20;
         t.partitions = vec![p];
         fetch.topics = vec![t];
-        let fetch_frame = frame(ApiKey::Fetch, 4, 500 + attempt, &fetch);
+        let fetch_frame = request_frame(4, 500 + attempt, &fetch);
         fetcher.write_all(&fetch_frame).await?;
         tokio::time::sleep(Duration::from_millis(5)).await;
         txn.commit().await?; // R1 proceeds; R2 is already queued behind it
 
-        let mut reply = read_frame(&mut fetcher)
+        let reply = read_frame_within(&mut fetcher, READ_TIMEOUT)
             .await?
             .ok_or("the broker closed the fetch connection")?;
+        let mut reply = BytesMut::from(&reply[..]);
         let header = ResponseHeader::decode(&mut reply, FetchResponse::header_version(4))?;
         assert_eq!(header.correlation_id, 500 + attempt);
         let response = FetchResponse::decode(&mut reply, 4)?;
         let code = response.responses[0].partitions[0].error_code;
-        println!("   attempt {}: fetch error_code={}", attempt, code);
+        println!("   attempt {attempt}: fetch error_code={code}");
         if code != 0 {
             stale += 1;
         }
-        let _ = read_frame(&mut blocked).await?;
+        let _ = read_frame_within(&mut blocked, READ_TIMEOUT).await?;
     }
     ctx.cleanup().await?;
     assert_eq!(

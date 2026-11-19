@@ -10,19 +10,19 @@
 //! - which request lane it travels on ([`Lane`]) and whether its reply may be held past the
 //!   request's transaction ([`KafkaApi::DEFERRED_REPLY`]),
 //! - how the decoded wire request becomes the handler's input ([`KafkaApi::decode`]),
-//! - how to answer it with an error code ([`KafkaApi::error_response`]), echoing the requested
-//!   topics/partitions/groups ([`KafkaApi::Echo`]) where the response has no top-level code,
+//! - how to answer it with an error code ([`ApiSchema::error_response`]), echoing the requested
+//!   topics/partitions/groups ([`ApiSchema::Echo`]) where the response has no top-level code,
 //! - whether a response carries an error (metrics),
 //! - and how the DB thread runs it ([`KafkaApi::handle`]).
 //!
-//! The registry at the bottom of this file ([`kafka_apis!`]) lists each API once and
+//! The registry at the bottom of this file (`kafka_apis!`) lists each API once and
 //! generates the request/response enums and the per-API dispatch from it. Adding an API is
 //! one `impl KafkaApi` plus one registry line; see "Adding a New Kafka API Handler" in
 //! CLAUDE.md.
 //!
 //! ## Thread safety
 //!
-//! Decoding ([`decode_request`]) and encoding run on the network thread and must not touch
+//! Decoding (`decode_body`) and encoding run on the network thread and must not touch
 //! pgrx. [`dispatch`] runs on the DB thread.
 
 use bytes::BytesMut;
@@ -80,7 +80,8 @@ pub struct RequestHeader {
     pub client_id: Option<String>,
 }
 
-/// The two request lanes from the network thread to the DB thread (DR-12).
+/// The two request lanes from the network thread to the DB thread (see
+/// [`crate::kafka::messages::RequestLanes`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lane {
     /// Everything that is not liveness traffic.
@@ -92,7 +93,7 @@ pub enum Lane {
 /// Why [`KafkaApi::decode`] refused a request whose body did decode.
 #[derive(Debug)]
 pub enum Rejection<E> {
-    /// Answer with [`KafkaApi::error_response`] for `echo` and `error_code`.
+    /// Answer with [`ApiSchema::error_response`] for `echo` and `error_code`.
     Reply {
         /// Kafka error code to report.
         error_code: i16,
@@ -101,8 +102,8 @@ pub enum Rejection<E> {
     },
     /// Send nothing (the client expects no response, e.g. an acks=0 Produce).
     Silent,
-    /// wave3 net: send nothing and close the connection (an acks=0 Produce Kafka would
-    /// fail, e.g. a corrupt batch: Kafka closes the connection so the client notices).
+    /// Send nothing and close the connection (an acks=0 Produce Kafka would fail, e.g. a
+    /// corrupt batch: Kafka closes the connection so the client notices).
     Close(&'static str),
 }
 
@@ -187,8 +188,8 @@ pub trait KafkaApi: ApiSchema {
         if !response_encodable::<Self>(version) {
             return None;
         }
-        // wave3 net (found by fuzz/request_decode): an error response built for a
-        // version the API does not serve may set a field that version lacks (e.g.
+        // An error response built for a version the API does not serve may set a field
+        // that version lacks (e.g.
         // FindCoordinator v4+ has no top-level error code); it would fail to encode on
         // the network thread. Answer only with a response that encodes: the full one,
         // else one echoing nothing (e.g. AddPartitionsToTxn v4: a top-level error code
@@ -247,7 +248,7 @@ impl<A: KafkaApi> Call<A> {
     }
 
     /// Run `handler` for `request` and send its response. A handler `Err` is answered with
-    /// [`KafkaApi::error_response`] (echoing the request) and rolls the request's writes
+    /// [`ApiSchema::error_response`] (echoing the request) and rolls the request's writes
     /// back; a panic is answered with UNKNOWN_SERVER_ERROR and re-raised, so the
     /// surrounding subtransaction rolls back (see [`dispatch_response`]).
     pub fn run<F>(self, request: A::Request, handler: F) -> RequestOutcome
@@ -263,7 +264,7 @@ impl<A: KafkaApi> Call<A> {
         let (correlation_id, version) = (header.correlation_id, header.api_version);
         dispatch_response(
             A::NAME,
-            response_tx,
+            &response_tx,
             || handler(request, &header),
             move |response| KafkaResponse::new(correlation_id, version, wrap(response)),
             move |error_code| {
@@ -308,6 +309,7 @@ fn decode_api<A: KafkaApi>(
 ) -> Decoded {
     let version = header.api_version;
     let reply = |encode_version: i16, response: ResponseOf<A>| {
+        // A closed channel means the connection is gone; there is nobody to answer.
         let _ = response_tx.send(KafkaResponse::new(
             header.correlation_id,
             encode_version,
@@ -315,59 +317,10 @@ fn decode_api<A: KafkaApi>(
         ));
     };
 
-    // SEC-2: the kafka-protocol body decoders index without bounds checks and panic on a
-    // truncated body, so the decode runs under catch_unwind: a malformed body after a
-    // valid header is answered with an error response instead of tearing the connection
-    // down.
-    let wire_range = <A::Wire as Message>::VERSIONS;
-    let parsed: Option<Result<A::Request, Rejection<A::Echo>>> =
-        if (wire_range.min..=wire_range.max).contains(&version) {
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                A::Wire::decode(buf, version)
-            })) {
-                Ok(Ok(wire)) => Some(A::decode(wire, &header)),
-                Ok(Err(e)) => {
-                    warn!("Failed to decode {} v{} body: {}", A::NAME, version, e);
-                    None
-                }
-                Err(_) => {
-                    warn!("Malformed {} v{} body (decoder panicked)", A::NAME, version);
-                    None
-                }
-            }
-        } else {
-            None
-        };
+    let parsed = decode_wire::<A>(buf, &header);
 
-    // CONF-6: a version outside the advertised range is answered with the API's own error
-    // response (when it can be encoded), echoing what the body told us.
     if !(A::MIN_VERSION..=A::MAX_VERSION).contains(&version) {
-        warn!(
-            "Rejecting {} version {} outside supported range {}..={}",
-            A::NAME,
-            version,
-            A::MIN_VERSION,
-            A::MAX_VERSION
-        );
-        let echo = match &parsed {
-            Some(Ok(request)) if !A::expects_response(request) => return Decoded::Answered,
-            Some(Ok(request)) => Some(A::echo(request)),
-            Some(Err(Rejection::Silent)) => return Decoded::Answered,
-            Some(Err(Rejection::Close(reason))) => return Decoded::Close(reason.to_string()),
-            Some(Err(Rejection::Reply { echo, .. })) => echo.clone(),
-            None => None,
-        };
-        return match A::unsupported_version_reply(echo.as_ref(), version) {
-            Some((encode_version, response)) => {
-                reply(encode_version, response);
-                Decoded::Answered
-            }
-            None => Decoded::Close(format!(
-                "{} version {} has no response format to answer in",
-                A::NAME,
-                version
-            )),
-        };
+        return reject_unsupported_version::<A>(parsed.as_ref(), version, reply);
     }
 
     match parsed {
@@ -392,6 +345,69 @@ fn decode_api<A: KafkaApi>(
             );
             Decoded::Answered
         }
+    }
+}
+
+/// The body of a request for `A`, decoded and turned into the handler's input; `None` when
+/// it does not decode (or kafka-protocol has no decoder for `version`).
+///
+/// The kafka-protocol body decoders index without bounds checks and panic on a truncated
+/// body, so the decode runs under `catch_unwind`: a malformed body after a valid header is
+/// answered with an error response instead of tearing the connection down.
+fn decode_wire<A: KafkaApi>(
+    buf: &mut BytesMut,
+    header: &RequestHeader,
+) -> Option<Result<A::Request, Rejection<A::Echo>>> {
+    let version = header.api_version;
+    let wire_range = <A::Wire as Message>::VERSIONS;
+    if !(wire_range.min..=wire_range.max).contains(&version) {
+        return None;
+    }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        A::Wire::decode(buf, version)
+    })) {
+        Ok(Ok(wire)) => Some(A::decode(wire, header)),
+        Ok(Err(e)) => {
+            warn!("Failed to decode {} v{version} body: {e}", A::NAME);
+            None
+        }
+        Err(_) => {
+            warn!("Malformed {} v{version} body (decoder panicked)", A::NAME);
+            None
+        }
+    }
+}
+
+/// Answer a request for `A` at a `version` outside the advertised range with the API's
+/// own error response (when it can be encoded), echoing what the body told us.
+fn reject_unsupported_version<A: KafkaApi>(
+    parsed: Option<&Result<A::Request, Rejection<A::Echo>>>,
+    version: i16,
+    reply: impl FnOnce(i16, ResponseOf<A>),
+) -> Decoded {
+    warn!(
+        "Rejecting {} version {version} outside supported range {}..={}",
+        A::NAME,
+        A::MIN_VERSION,
+        A::MAX_VERSION
+    );
+    let echo = match parsed {
+        Some(Ok(request)) if !A::expects_response(request) => return Decoded::Answered,
+        Some(Ok(request)) => Some(A::echo(request)),
+        Some(Err(Rejection::Silent)) => return Decoded::Answered,
+        Some(Err(Rejection::Close(reason))) => return Decoded::Close((*reason).to_string()),
+        Some(Err(Rejection::Reply { echo, .. })) => echo.clone(),
+        None => None,
+    };
+    match A::unsupported_version_reply(echo.as_ref(), version) {
+        Some((encode_version, response)) => {
+            reply(encode_version, response);
+            Decoded::Answered
+        }
+        None => Decoded::Close(format!(
+            "{} version {version} has no response format to answer in",
+            A::NAME
+        )),
     }
 }
 
@@ -455,7 +471,7 @@ pub fn api_info(api_key: i16) -> Option<&'static ApiInfo> {
 
 /// Display name of `api_key` (`"Unknown"` for an API pg_kafka does not serve).
 pub fn api_name(api_key: i16) -> &'static str {
-    api_info(api_key).map(|info| info.name).unwrap_or("Unknown")
+    api_info(api_key).map_or("Unknown", |info| info.name)
 }
 
 /// The registry: one line per API, `Variant => ApiType`. It generates [`RequestBody`],
@@ -476,7 +492,7 @@ macro_rules! kafka_apis {
         #[derive(Debug)]
         pub enum RequestBody {
             $(
-                #[allow(missing_docs)]
+                #[doc = concat!("A decoded ", stringify!($variant), " request.")]
                 $variant(<$api as KafkaApi>::Request),
             )*
         }
@@ -485,11 +501,11 @@ macro_rules! kafka_apis {
         #[derive(Debug, Clone)]
         pub enum ResponseBody {
             $(
-                #[allow(missing_docs)]
+                #[doc = concat!("A ", stringify!($variant), " response.")]
                 $variant(ResponseOf<$api>),
             )*
             $(
-                #[allow(missing_docs)]
+                #[doc = concat!("A ", stringify!($net_variant), " response.")]
                 $net_variant(ResponseOf<$net_api>),
             )*
             /// The generic error frame for an API key pg_kafka does not serve (there is no
@@ -498,7 +514,7 @@ macro_rules! kafka_apis {
                 /// Kafka error code.
                 error_code: i16,
             },
-            /// wave3 net: not a frame. Tells the connection's writer to close the
+            /// Not a frame: tells the connection's writer to close the
             /// connection once every earlier response is written (an acks=0 Produce that
             /// hit an error: Kafka closes the connection so the client refreshes its
             /// metadata). Sent through the request's response channel, so it passes the
@@ -510,7 +526,7 @@ macro_rules! kafka_apis {
         #[derive(Debug, Clone)]
         pub enum Echo {
             $(
-                #[allow(missing_docs)]
+                #[doc = concat!("What a ", stringify!($variant), " error response echoes.")]
                 $variant(<$api as ApiSchema>::Echo),
             )*
         }
@@ -586,8 +602,8 @@ macro_rules! kafka_apis {
                     Self::UnknownApi { error_code } => {
                         encode_unknown_api_frame(correlation_id, *error_code, buf)
                     }
-                    Self::CloseConnection => Err(crate::kafka::error::KafkaError::Encoding(
-                        "CloseConnection is a connection instruction, not a frame".into(),
+                    Self::CloseConnection => Err(KafkaError::encoding(
+                        "CloseConnection is a connection instruction, not a frame",
                     )),
                 }
             }

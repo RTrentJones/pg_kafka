@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Quick rebuild-and-restart loop for pg_kafka development against the pgrx-managed PostgreSQL.
 #
 #   scripts/restart.sh            rebuild, install (.so + generated SQL + control file),

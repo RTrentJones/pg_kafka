@@ -1,36 +1,22 @@
-// Kafka protocol implementation module
-//
-// This module contains all Kafka-specific code:
-// - Binary protocol parsing/encoding
-// - Request/response types
-// - TCP listener for accepting Kafka client connections
-// - Request handlers (ApiVersions, Metadata, Produce, Fetch, etc.)
-//
-// ## Two-Thread Architecture
-//
-// This module bridges two threads:
-//
-// 1. **Network Thread** (spawned, runs tokio multi-thread runtime):
-//    - Fast, non-blocking network I/O
-//    - Handles thousands of concurrent TCP connections
-//    - Parses binary Kafka protocol
-//    - Sends requests to main thread via crossbeam bounded channel
-//    - Uses `tracing` crate for logging (NOT pgrx - thread safety)
-//
-// 2. **Database Thread** (main BGWorker):
-//    - Blocking database operations via Postgres SPI
-//    - Blocks on channel recv (instant wake-up when requests arrive)
-//    - Processes requests sequentially within transactions
-//    - Uses pgrx logging (safe on main thread)
-//
-// The CROSSBEAM CHANNEL is the bridge:
-//   Network thread → [bounded(10_000)] → Database thread → [per-connection mpsc] → Network
-//
-// Why this architecture?
-// - Postgres SPI is NOT thread-safe and CANNOT be called from spawned threads
-// - Network I/O runs in parallel with database operations
-// - Blocking recv eliminates the 100ms latency floor of the old time-slicing design
-// - Bounded channel provides backpressure when DB can't keep up
+//! Everything Kafka: the wire protocol, the listener, the API handlers, the consumer-group
+//! coordinator, storage and shadow mode.
+//!
+//! ## Two threads
+//!
+//! The extension's background worker runs two threads:
+//!
+//! 1. **Network thread** (a tokio runtime, [`listener`]): accepts connections, splits and
+//!    decodes frames ([`protocol`], [`api`]), answers SASL itself, and hands every other
+//!    request to the DB thread. It logs through `tracing`, never pgrx, which is not
+//!    thread-safe.
+//! 2. **DB thread** (the background worker's main thread, `crate::worker`): runs the
+//!    requests through SPI inside Postgres transactions and sends each response back on
+//!    the connection's own channel.
+//!
+//! Requests cross on bounded crossbeam channels ([`RequestLanes`]: a main lane and a
+//! liveness lane for Heartbeat), which give the network thread backpressure when the
+//! database falls behind; responses return on per-connection tokio channels. SPI can only
+//! be called from the DB thread, so every database operation goes through it.
 
 pub mod api;
 pub mod assignment;
@@ -44,6 +30,7 @@ pub mod dispatch;
 pub mod error;
 pub mod handler_context;
 pub mod handlers;
+pub mod limits;
 pub mod listener;
 pub mod messages;
 pub mod metrics;
@@ -54,10 +41,7 @@ pub mod protocol;
 pub mod response_builders;
 pub mod shadow;
 pub mod storage;
-// wave3 groups
-pub mod limits;
 
-// Re-export commonly used types for convenience
 pub use broker_metadata::BrokerMetadata;
 pub use constants::*;
 pub use context::RuntimeContext;

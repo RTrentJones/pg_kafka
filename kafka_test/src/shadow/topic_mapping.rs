@@ -21,15 +21,15 @@ pub async fn test_topic_name_mapping() -> TestResult {
     // 1. SETUP
     let ctx = TestContext::new().await?;
     let local_topic = ctx.unique_topic("local-topic").await;
-    let external_topic = format!("{}-external", local_topic);
+    let external_topic = format!("{local_topic}-external");
 
     println!("Step 1: Verifying external Kafka is ready...");
     verify_external_kafka_ready().await?;
     println!("✅ External Kafka ready\n");
 
     println!("Step 2: Enabling shadow mode with topic mapping...");
-    println!("  Local topic:    {}", local_topic);
-    println!("  External topic: {}", external_topic);
+    println!("  Local topic:    {local_topic}");
+    println!("  External topic: {external_topic}");
     enable_shadow_mode(
         ctx.db(),
         &local_topic,
@@ -66,10 +66,7 @@ pub async fn test_topic_name_mapping() -> TestResult {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Message should appear in the MAPPED external topic, not the local topic name
-    println!(
-        "Checking message in mapped external topic '{}'...",
-        external_topic
-    );
+    println!("Checking message in mapped external topic '{external_topic}'...");
     assert_message_in_external_kafka(
         &external_topic,
         Some(key),

@@ -35,8 +35,7 @@ impl SecurityProtocol {
             "SASL_PLAINTEXT" => Ok(SecurityProtocol::SaslPlaintext),
             "SASL_SSL" => Ok(SecurityProtocol::SaslSsl),
             other => Err(format!(
-                "unknown security protocol '{}' (expected PLAINTEXT, SSL, SASL_PLAINTEXT or SASL_SSL)",
-                other
+                "unknown security protocol '{other}' (expected PLAINTEXT, SSL, SASL_PLAINTEXT or SASL_SSL)"
             )),
         }
     }
@@ -79,8 +78,7 @@ impl SaslMechanism {
             .map(SaslMechanism::Scram)
             .ok_or_else(|| {
                 format!(
-                    "unsupported SASL mechanism '{}' (expected PLAIN, SCRAM-SHA-256 or SCRAM-SHA-512)",
-                    t
+                    "unsupported SASL mechanism '{t}' (expected PLAIN, SCRAM-SHA-256 or SCRAM-SHA-512)"
                 )
             })
     }
@@ -145,18 +143,17 @@ pub fn parse_listeners(s: &str, default_host: &str) -> Result<Vec<ListenerSpec>,
     for raw in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
         let (proto, addr) = raw
             .split_once("://")
-            .ok_or_else(|| format!("listener '{}' must look like PROTOCOL://host:port", raw))?;
+            .ok_or_else(|| format!("listener '{raw}' must look like PROTOCOL://host:port"))?;
         let protocol = SecurityProtocol::parse(proto)?;
         let (host, port) = addr
             .rsplit_once(':')
-            .ok_or_else(|| format!("listener '{}' has no port", raw))?;
+            .ok_or_else(|| format!("listener '{raw}' has no port"))?;
         let port: i32 = port
             .parse()
-            .map_err(|_| format!("listener '{}' has an invalid port", raw))?;
+            .map_err(|_| format!("listener '{raw}' has an invalid port"))?;
         if !(1024..=65535).contains(&port) {
             return Err(format!(
-                "listener '{}': port must be between 1024 and 65535",
-                raw
+                "listener '{raw}': port must be between 1024 and 65535"
             ));
         }
         let host = host.trim_start_matches('[').trim_end_matches(']');
@@ -182,7 +179,7 @@ pub struct SecuritySettings {
     /// by it (mutual TLS).
     pub ssl_ca_file: String,
     pub sasl_mechanisms: Vec<SaslMechanism>,
-    /// wave3 net: connection limits, idle timeout and request read deadline.
+    /// Connection limits, idle timeout and request read deadline.
     pub limits: crate::kafka::conn_limits::NetworkLimits,
 }
 
@@ -195,7 +192,7 @@ pub struct RawSecuritySettings {
     pub ssl_key_file: String,
     pub ssl_ca_file: String,
     pub sasl_enabled_mechanisms: String,
-    /// wave3 net: `pg_kafka.max_connections`, `pg_kafka.max_connections_per_ip`,
+    /// `pg_kafka.max_connections`, `pg_kafka.max_connections_per_ip`,
     /// `pg_kafka.connections_max_idle_ms`, `pg_kafka.request_read_timeout_ms`.
     pub limits: crate::kafka::conn_limits::NetworkLimits,
 }
@@ -209,7 +206,7 @@ impl SecuritySettings {
     ) -> Result<Self, String> {
         let primary = ListenerSpec {
             protocol: SecurityProtocol::parse(&raw.security_protocol)
-                .map_err(|e| format!("pg_kafka.security_protocol: {}", e))?,
+                .map_err(|e| format!("pg_kafka.security_protocol: {e}"))?,
             host: primary_host.to_string(),
             port: primary_port,
             advertised: None,
@@ -217,7 +214,7 @@ impl SecuritySettings {
         let mut listeners = vec![primary];
         listeners.extend(
             parse_listeners(&raw.additional_listeners, primary_host)
-                .map_err(|e| format!("pg_kafka.additional_listeners: {}", e))?,
+                .map_err(|e| format!("pg_kafka.additional_listeners: {e}"))?,
         );
         for (i, l) in listeners.iter().enumerate() {
             if listeners[..i].iter().any(|o| o.port == l.port) {
@@ -228,7 +225,7 @@ impl SecuritySettings {
             }
         }
         let sasl_mechanisms = parse_mechanisms(&raw.sasl_enabled_mechanisms)
-            .map_err(|e| format!("pg_kafka.sasl_enabled_mechanisms: {}", e))?;
+            .map_err(|e| format!("pg_kafka.sasl_enabled_mechanisms: {e}"))?;
         let settings = SecuritySettings {
             listeners,
             ssl_cert_file: raw.ssl_cert_file.trim().to_string(),
@@ -314,7 +311,7 @@ static SSL_CA_FILE: GucSetting<Option<CString>> = GucSetting::<Option<CString>>:
 static SASL_ENABLED_MECHANISMS: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(Some(c"PLAIN,SCRAM-SHA-256,SCRAM-SHA-512"));
 
-// wave3 net: connection-limit GUCs.
+// Connection-limit GUCs.
 static MAX_CONNECTIONS: GucSetting<i32> =
     GucSetting::<i32>::new(crate::kafka::conn_limits::DEFAULT_MAX_CONNECTIONS);
 static MAX_CONNECTIONS_PER_IP: GucSetting<i32> =
@@ -324,8 +321,15 @@ static CONNECTIONS_MAX_IDLE_MS: GucSetting<i32> =
 static REQUEST_READ_TIMEOUT_MS: GucSetting<i32> =
     GucSetting::<i32>::new(crate::kafka::conn_limits::DEFAULT_REQUEST_READ_TIMEOUT_MS);
 
-/// Register the listener-security GUCs. Called from `config::init()`.
+/// Register the listener-security and connection-limit GUCs. Called from
+/// `config::init()`.
 pub fn register_gucs() {
+    register_listener_gucs();
+    register_limit_gucs();
+}
+
+/// The listener-security GUCs (strings).
+fn register_listener_gucs() {
     let define = |name: &'static std::ffi::CStr,
                   short: &'static std::ffi::CStr,
                   long: &'static std::ffi::CStr,
@@ -375,8 +379,10 @@ pub fn register_gucs() {
         c"Comma-separated subset of PLAIN, SCRAM-SHA-256, SCRAM-SHA-512 (default: all three). Read when the worker starts.",
         &SASL_ENABLED_MECHANISMS,
     );
+}
 
-    // wave3 net: connection limits (read when the worker starts, like the listener GUCs).
+/// The connection-limit GUCs (read when the worker starts, like the listener GUCs).
+fn register_limit_gucs() {
     let define_int = |name: &'static std::ffi::CStr,
                       short: &'static std::ffi::CStr,
                       long: &'static std::ffi::CStr,
@@ -436,8 +442,7 @@ pub fn register_gucs() {
 fn guc_string(setting: &GucSetting<Option<CString>>) -> String {
     setting
         .get()
-        .map(|c| c.to_string_lossy().into_owned())
-        .unwrap_or_default()
+        .map_or_default(|c| c.to_string_lossy().into_owned())
 }
 
 /// Read the current GUC values.
@@ -478,7 +483,7 @@ mod tests {
         assert_eq!(s.listeners[0].protocol, SecurityProtocol::Plaintext);
         assert_eq!(s.listeners[0].advertised, None);
         assert!(!s.needs_tls() && !s.needs_sasl());
-        assert!(s.warnings().is_empty());
+        assert_eq!(s.warnings(), Vec::<String>::new());
     }
 
     #[test]
@@ -495,7 +500,7 @@ mod tests {
         assert_eq!(l[2].host, "::1");
         assert_eq!(l[2].bind_addr(), "[::1]:9095");
         assert_eq!(l[3].advertised, Some(("localhost".into(), 9096)));
-        assert!(parse_listeners("", "h").unwrap().is_empty());
+        assert_eq!(parse_listeners("", "h").unwrap(), Vec::new());
     }
 
     #[test]
@@ -566,6 +571,6 @@ mod tests {
         assert_eq!(s.warnings().len(), 1, "only the PLAINTEXT listener is left");
         // Loopback binds never warn.
         let s = SecuritySettings::resolve(&raw("PLAINTEXT", ""), "127.0.0.1", 9092).unwrap();
-        assert!(s.warnings().is_empty());
+        assert_eq!(s.warnings(), Vec::<String>::new());
     }
 }

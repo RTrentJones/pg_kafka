@@ -47,7 +47,7 @@ pub async fn test_list_offsets_empty_topic() -> TestResult {
     let earliest: i64 = row.get(0);
     let latest: i64 = row.get(1);
 
-    println!("   Earliest: {}, Latest: {}", earliest, latest);
+    println!("   Earliest: {earliest}, Latest: {latest}");
     assert_eq!(earliest, 0);
     assert_eq!(latest, 0);
     println!("✅ Empty topic has earliest=0, latest=0");
@@ -92,7 +92,7 @@ pub async fn test_consumer_group_empty() -> TestResult {
         )
         .await?;
 
-    let count: i64 = row.map(|r| r.get(0)).unwrap_or(0);
+    let count: i64 = row.map_or(0, |r| r.get(0));
     assert_eq!(count, 0, "Empty group should have no offsets");
     println!("✅ Empty group has no committed offsets");
 

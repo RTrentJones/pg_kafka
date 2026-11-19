@@ -2,7 +2,7 @@
 name = "kafka_test"
 version = "0.1.0"
 edition = "2021"
-# wave3 worker: src/bin/soak.rs is a second binary (scripts/soak.sh); `cargo run` stays the suite.
+# src/bin/soak.rs is a second binary (scripts/soak.sh); `cargo run` stays the suite.
 default-run = "kafka_test"
 # Test harness only, no Shadow Mode code — plain MIT like the project root
 # (required so `cargo deny check licenses` can evaluate this crate; DR-16).

@@ -1,93 +1,26 @@
-//! Regression tests for the bug hunt at commit 6c982be.
-//!
-//! These cover the fixes whose code lives in the SPI/async files (`worker.rs`,
-//! `listener.rs`) that unit coverage cannot see, plus the broker-visible behaviour of
-//! the handler fixes. They speak the wire protocol directly (via the kafka-protocol
-//! crate) so each request is exactly the one the bug report describes.
+//! Error responses and resource accounting whose code lives in the SPI/async files
+//! (`worker.rs`, `listener.rs`) that unit coverage cannot see, plus broker-visible
+//! handler behaviour. They speak the wire protocol directly so each request is exactly
+//! the one under test.
 
+use crate::common::to_i32;
 use crate::common::TestResult;
 use crate::fixtures::{generate_messages, TestTopicBuilder};
 use crate::setup::TestContext;
-use bytes::{Buf, BufMut, BytesMut};
 use kafka_protocol::messages::create_topics_request::{CreatableTopic, CreateTopicsRequest};
-use kafka_protocol::messages::fetch_request::{FetchPartition, FetchRequest, FetchTopic};
 use kafka_protocol::messages::txn_offset_commit_request::{
     TxnOffsetCommitRequest, TxnOffsetCommitRequestPartition, TxnOffsetCommitRequestTopic,
 };
-use kafka_protocol::messages::{
-    GroupId, ProducerId, RequestHeader, ResponseHeader, TopicName, TransactionalId,
-};
-use kafka_protocol::protocol::{Decodable, Encodable, HeaderVersion, Request, StrBytes};
+use kafka_protocol::messages::{GroupId, ProducerId, TopicName, TransactionalId};
+use kafka_protocol::protocol::StrBytes;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+use crate::wire::requests::fetch_request;
+use crate::wire::{raw_frame, read_raw_response, roundtrip};
+
 const BROKER: &str = "localhost:9092";
-
-/// Send one request at `version` and decode its response.
-pub(crate) async fn roundtrip<R: Request>(
-    stream: &mut TcpStream,
-    version: i16,
-    correlation_id: i32,
-    request: &R,
-) -> Result<R::Response, Box<dyn std::error::Error>> {
-    let mut header = RequestHeader::default();
-    header.request_api_key = R::KEY;
-    header.request_api_version = version;
-    header.correlation_id = correlation_id;
-    header.client_id = Some(StrBytes::from_static_str("bug-hunt-e2e"));
-
-    let mut body = BytesMut::new();
-    header.encode(&mut body, R::header_version(version))?;
-    request.encode(&mut body, version)?;
-
-    let mut frame = BytesMut::with_capacity(4 + body.len());
-    frame.put_i32(body.len() as i32);
-    frame.extend_from_slice(&body);
-    stream.write_all(&frame).await?;
-    stream.flush().await?;
-
-    let mut size = [0u8; 4];
-    stream.read_exact(&mut size).await?;
-    let mut buf = vec![0u8; i32::from_be_bytes(size) as usize];
-    stream.read_exact(&mut buf).await?;
-    let mut buf = BytesMut::from(&buf[..]);
-
-    let response_header = ResponseHeader::decode(
-        &mut buf,
-        <R::Response as HeaderVersion>::header_version(version),
-    )?;
-    if response_header.correlation_id != correlation_id {
-        return Err(format!(
-            "correlation id mismatch: sent {}, got {}",
-            correlation_id, response_header.correlation_id
-        )
-        .into());
-    }
-    Ok(R::Response::decode(&mut buf, version)?)
-}
-
-pub(crate) fn fetch_request(
-    topic: &str,
-    partition: i32,
-    offset: i64,
-    max_wait_ms: i32,
-) -> FetchRequest {
-    let mut p = FetchPartition::default();
-    p.partition = partition;
-    p.fetch_offset = offset;
-    p.partition_max_bytes = 1024 * 1024;
-    let mut t = FetchTopic::default();
-    t.topic = TopicName(StrBytes::from_string(topic.to_string()));
-    t.partitions = vec![p];
-    let mut req = FetchRequest::default();
-    req.replica_id = kafka_protocol::messages::BrokerId(-1);
-    req.max_wait_ms = max_wait_ms;
-    req.min_bytes = 1;
-    req.max_bytes = 1024 * 1024;
-    req.topics = vec![t];
-    req
-}
 
 /// Bug 6 (+ the long-poll path in listener.rs): fetching a partition that does not
 /// exist, or an offset past the high watermark, returns the matching error code, and
@@ -113,7 +46,7 @@ pub async fn test_fetch_bad_partition_or_offset_returns_error() -> TestResult {
         let response = roundtrip(
             &mut stream,
             4,
-            100 + i as i32,
+            100 + to_i32(i),
             &fetch_request(&topic.name, partition, offset, 5000),
         )
         .await?;
@@ -132,8 +65,7 @@ pub async fn test_fetch_bad_partition_or_offset_returns_error() -> TestResult {
         }
         if expected != 0 && elapsed >= Duration::from_secs(3) {
             return Err(format!(
-                "error for partition {} offset {} took {:?}; it should not wait out max_wait_ms",
-                partition, offset, elapsed
+                "error for partition {partition} offset {offset} took {elapsed:?}; it should not wait out max_wait_ms"
             )
             .into());
         }
@@ -187,7 +119,7 @@ pub async fn test_fetch_into_cleaned_up_aborted_rows_is_in_range() -> TestResult
     stream.set_nodelay(true)?;
     let response = roundtrip(&mut stream, 4, 150, &fetch_request(&topic.name, 0, 0, 0)).await?;
     let p = &response.responses[0].partitions[0];
-    let bytes = p.records.as_ref().map(|r| r.len()).unwrap_or(0);
+    let bytes = p.records.as_ref().map_or(0, bytes::Bytes::len);
     println!(
         "   fetch from 0 -> error_code={} hwm={} record bytes={}",
         p.error_code, p.high_watermark, bytes
@@ -210,8 +142,8 @@ pub async fn test_fetch_into_cleaned_up_aborted_rows_is_in_range() -> TestResult
 }
 
 /// Bug 4 (worker.rs): a TxnOffsetCommit whose handler fails (here: a transactional id
-/// that was never initialised) must report the error on every requested partition. It
-/// used to come back as an empty response, which the client reads as success.
+/// that was never initialised) must report the error on every requested partition: an
+/// empty response reads as success to the client.
 pub async fn test_txn_offset_commit_failure_reports_partition_errors() -> TestResult {
     println!("=== Test: Failed TxnOffsetCommit Reports Partition Errors ===\n");
 
@@ -252,13 +184,11 @@ pub async fn test_txn_offset_commit_failure_reports_partition_errors() -> TestRe
         .flat_map(|t| t.partitions.iter())
         .map(|p| (p.partition_index, p.error_code))
         .collect();
-    println!("   per-partition results: {:?}", codes);
+    println!("   per-partition results: {codes:?}");
     if codes.len() != 2 || codes.iter().any(|(_, code)| *code == 0) {
-        return Err(format!(
-            "expected an error on both requested partitions, got {:?}",
-            codes
-        )
-        .into());
+        return Err(
+            format!("expected an error on both requested partitions, got {codes:?}").into(),
+        );
     }
 
     // Nothing may have been stored as a pending offset.
@@ -356,13 +286,14 @@ pub async fn test_create_topics_default_and_zero_partitions() -> TestResult {
 ///
 /// Not parallel-safe: it deliberately reserves most of the shared budget.
 pub async fn test_frame_budget_released_on_mid_frame_disconnect() -> TestResult {
-    println!("=== Test: Frame Budget Released on Mid-Frame Disconnect ===\n");
-
     const DECLARED: i32 = 100_000_000; // == MAX_REQUEST_SIZE, the largest charged frame
 
     // Abandon more frames than the budget can hold (8 x 100 MB > 512 MiB).
     for i in 0..8 {
         let mut stream = TcpStream::connect(BROKER).await?;
+
+        println!("=== Test: Frame Budget Released on Mid-Frame Disconnect ===\n");
+
         stream.write_all(&DECLARED.to_be_bytes()).await?;
         stream.flush().await?;
         // Give the listener time to read the prefix and charge it.
@@ -382,7 +313,7 @@ pub async fn test_frame_budget_released_on_mid_frame_disconnect() -> TestResult 
     let mut probe = [0u8; 1];
     match tokio::time::timeout(Duration::from_millis(1500), stream.read(&mut probe)).await {
         Err(_) => println!("   large frame admitted (connection held open)"),
-        Ok(Ok(0)) | Ok(Err(_)) => {
+        Ok(Ok(0) | Err(_)) => {
             return Err(
                 "a 100 MB frame was refused: abandoned frames leaked the reservation budget".into(),
             )
@@ -394,19 +325,10 @@ pub async fn test_frame_budget_released_on_mid_frame_disconnect() -> TestResult 
     // The broker still serves ordinary requests.
     tokio::time::sleep(Duration::from_millis(300)).await;
     let mut stream = TcpStream::connect(BROKER).await?;
-    let mut req = BytesMut::new();
-    req.put_i32(10);
-    req.put_i16(18); // ApiVersions
-    req.put_i16(0);
-    req.put_i32(4242);
-    req.put_i16(-1); // null client id
-    stream.write_all(&req).await?;
-    let mut size = [0u8; 4];
-    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut size)).await??;
-    let mut body = vec![0u8; i32::from_be_bytes(size) as usize];
-    stream.read_exact(&mut body).await?;
-    let mut body = &body[..];
-    assert_eq!(body.get_i32(), 4242, "ApiVersions correlation id");
+    stream.write_all(&raw_frame(18, 0, 4242, &[])).await?;
+    let (correlation_id, _) =
+        tokio::time::timeout(Duration::from_secs(5), read_raw_response(&mut stream)).await??;
+    assert_eq!(correlation_id, 4242, "ApiVersions correlation id");
 
     println!("✅ Test PASSED\n");
     Ok(())

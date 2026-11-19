@@ -1,15 +1,36 @@
-// Storage abstraction layer for pg_kafka
-//
-// This module defines the KafkaStore trait that abstracts data persistence operations.
-// By separating storage concerns from protocol logic, we achieve:
-// 1. Testability - handlers can be tested with mock stores
-// 2. Clean separation of concerns - protocol logic doesn't know about SQL
-// 3. Transaction safety - transaction boundaries remain explicit in worker.rs
+//! The storage layer: the contract between the Kafka protocol handlers and the store.
+//!
+//! The contract is split into role traits ([`TopicStore`], [`LogStore`],
+//! [`OffsetStore`], [`ProducerStore`], [`TransactionStore`], [`MaintenanceStore`]);
+//! [`KafkaStore`] is their sum and is what handlers see. Each role groups the methods
+//! one concern needs, so a wrapper (`ShadowStore`) can forward the roles it does not
+//! change wholesale (the `delegate_*_store!` macros) and code that needs one concern
+//! can take just that role. Handlers stay testable against `MockKafkaStore`, and
+//! transaction boundaries stay with the caller: every method assumes it runs inside a
+//! transaction the background worker (or a SQL function) manages.
+//!
+//! [`PostgresStore`] is the implementation; the pure logic it relies on (header
+//! encoding, sequence validation, retention planning, the role grants) lives in
+//! submodules that unit tests reach without a database.
 
 use std::time::Duration;
 
 use super::error::Result;
 use super::messages::Record;
+
+mod delegate;
+mod headers;
+mod sequence;
+
+pub(crate) use delegate::{
+    delegate_log_store, delegate_maintenance_store, delegate_offset_store, delegate_producer_store,
+    delegate_topic_store, delegate_transaction_store,
+};
+pub use headers::{decode_headers_json, encode_headers_json};
+pub use sequence::{
+    batch_last_sequence, next_sequence, validate_sequence, CachedBatch, ProducerBatch,
+    SequenceCheck, SequenceValidation, PRODUCER_BATCH_CACHE,
+};
 
 /// Metadata about a topic (storage layer representation)
 ///
@@ -39,61 +60,16 @@ pub struct FetchedMessage {
     pub value: Option<Vec<u8>>,
     /// Timestamp (milliseconds since epoch)
     pub timestamp: i64,
-    /// Record headers, decoded from JSONB storage (DR-8, DEEP-REVIEW-2026-07).
-    /// Before DR-8, headers were written on every produce but never selected on
-    /// fetch, so consumers silently received empty headers. Headers are stored as
-    /// an ordered array of pairs, so their order survives; duplicate keys do not,
-    /// because the kafka-protocol record type holds headers in a map (documented
-    /// in PROTOCOL_DEVIATIONS.md).
+    /// Record headers, decoded from JSONB storage (DR-8). They are stored as an
+    /// ordered array of pairs, so their order survives; duplicate keys do not, because
+    /// the kafka-protocol record type holds headers in a map (PROTOCOL_DEVIATIONS.md).
     pub headers: Vec<(String, Vec<u8>)>,
-    /// Producer id stamped on the row (wave 3 txn): set for records written by a
+    /// Producer id stamped on the row: set for records written by a
     /// transactional producer, `None` otherwise. Fetch groups consecutive records of
     /// one producer id/epoch into one RecordBatch and marks it transactional.
     pub producer_id: Option<i64>,
     /// Producer epoch stamped with `producer_id`.
     pub producer_epoch: Option<i16>,
-}
-
-/// Decode the JSONB headers column back into header pairs (DR-8). The column holds an
-/// ordered array of `[key, hex(value)]` pairs; rows written before that hold a
-/// `{key: hex(value)}` object, which is still accepted.
-///
-/// Pure function so the decoding logic is unit-testable even though its only
-/// caller lives in the coverage-ignored SPI layer (QA-1 pattern, like
-/// `validate_sequence`). Malformed JSON or hex yields an empty/partial result
-/// rather than an error: headers are metadata, and failing a whole fetch over
-/// an undecodable header would be worse than dropping it.
-pub fn decode_headers_json(json: Option<&str>) -> Vec<(String, Vec<u8>)> {
-    let Some(json) = json else {
-        return Vec::new();
-    };
-    let pairs: Vec<(String, String)> = if let Ok(pairs) =
-        serde_json::from_str::<Vec<(String, String)>>(json)
-    {
-        pairs
-    } else if let Ok(map) = serde_json::from_str::<std::collections::BTreeMap<String, String>>(json)
-    {
-        map.into_iter().collect()
-    } else {
-        return Vec::new();
-    };
-    pairs
-        .into_iter()
-        .filter_map(|(k, hex)| hex_decode(&hex).map(|v| (k, v)))
-        .collect()
-}
-
-/// Decode a lowercase/uppercase hex string into bytes; `None` on malformed input.
-fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
-        return None;
-    }
-    (0..s.len())
-        .step_by(2)
-        // `get` instead of slicing: a non-ASCII char would put `i` off a char
-        // boundary and slicing would panic. Invalid input yields None instead.
-        .map(|i| s.get(i..i + 2).and_then(|h| u8::from_str_radix(h, 16).ok()))
-        .collect()
 }
 
 /// Committed offset information (internal representation)
@@ -105,7 +81,7 @@ pub struct CommittedOffset {
     pub metadata: Option<String>,
 }
 
-/// Transaction state (Phase 10)
+/// Transaction state (the `kafka.transactions.state` column).
 ///
 /// Represents the lifecycle state of a Kafka transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,7 +127,7 @@ impl TransactionState {
     }
 }
 
-/// Consumer isolation level (Phase 10)
+/// Consumer isolation level.
 ///
 /// Controls visibility of transactional messages during fetch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -204,7 +180,7 @@ impl PartitionBounds {
         let log_start = log_start_offset.unwrap_or(0);
         let high_watermark = next_offset
             .unwrap_or(0)
-            .max(max_offset.map(|m| m.saturating_add(1)).unwrap_or(0));
+            .max(max_offset.map_or(0, |m| m.saturating_add(1)));
         let last_stable_offset = match isolation_level {
             IsolationLevel::ReadCommitted => min_pending_offset.unwrap_or(high_watermark),
             IsolationLevel::ReadUncommitted => high_watermark,
@@ -220,7 +196,7 @@ impl PartitionBounds {
 
 /// Order `rows` (`(name, id, partition_count)` from one batched lookup) as the
 /// requested `names`, dropping names with no row. A name requested twice appears
-/// twice, matching the former one-query-per-name loop.
+/// twice.
 pub fn order_topic_metadata(names: &[String], rows: Vec<(String, i32, i32)>) -> Vec<TopicMetadata> {
     let by_name: std::collections::HashMap<String, (i32, i32)> = rows
         .into_iter()
@@ -240,18 +216,6 @@ pub fn order_topic_metadata(names: &[String], rows: Vec<(String, i32, i32)>) -> 
         .collect()
 }
 
-/// Abstract storage interface for Kafka data operations, split into role traits.
-///
-/// These traits define the contract between the Kafka protocol handlers and the
-/// underlying storage implementation. Implementors handle the actual data persistence
-/// (SQL, file system, etc.) while handlers focus on protocol logic. Each role groups the
-/// methods one concern needs, so a wrapper (`ShadowStore`) can delegate whole roles it
-/// does not change ([`DelegateTopicStore`], [`DelegateOffsetStore`],
-/// [`DelegateProducerStore`]) and code that needs one concern can take just that role.
-/// [`KafkaStore`] is the sum of all roles.
-///
-/// All methods are assumed to run within a transaction context managed by the caller
-/// (typically the background worker).
 /// Topic catalog: lookup, auto-create, admin (create/delete/partition count) and per-topic config.
 pub trait TopicStore {
     /// Get or create a topic by name
@@ -347,7 +311,6 @@ pub trait TopicStore {
     ///   clear the override and fall back to the global GUC
     fn set_topic_retention_ms(&self, topic_id: i32, retention_ms: Option<i64>) -> Result<()>;
 
-    // wave3 groups
     /// An existing topic whose name collides with `name` once '.' and '_' are treated as equal
     /// (Kafka's metric-name collision rule), other than `name` itself; `None` if there is none.
     fn find_colliding_topic(&self, name: &str) -> Result<Option<String>>;
@@ -581,7 +544,6 @@ pub trait OffsetStore {
     /// Ok on success
     fn delete_consumer_group_offsets(&self, group_id: &str) -> Result<()>;
 
-    // wave3 groups
     /// The ids of every group that has at least one committed offset (sorted). These groups
     /// exist for DescribeGroups / ListGroups even when the in-memory coordinator does not know
     /// them (e.g. after a worker restart), as Kafka reports them as Empty groups.
@@ -591,11 +553,11 @@ pub trait OffsetStore {
     fn group_has_offsets(&self, group_id: &str) -> Result<bool>;
     /// The `(topic name, partition)` pairs of `group_id` that have a transactional
     /// offset commit (TxnOffsetCommit) whose transaction has not ended yet. OffsetFetch
-    /// with `require_stable` (KIP-447) answers UNSTABLE_OFFSET_COMMIT for them (wave 3).
+    /// with `require_stable` (KIP-447) answers UNSTABLE_OFFSET_COMMIT for them.
     fn pending_txn_offset_partitions(&self, group_id: &str) -> Result<Vec<(String, i32)>>;
 }
 
-/// Idempotent producer state: producer ids, epochs and sequence numbers (Phase 9).
+/// Idempotent producer state: producer ids, epochs and sequence numbers.
 pub trait ProducerStore {
     /// Allocate a new producer ID with epoch 0
     ///
@@ -639,7 +601,7 @@ pub trait ProducerStore {
     fn increment_producer_epoch(&self, producer_id: i64) -> Result<(i64, i16)>;
 
     /// Validate an idempotent producer's batch against the producer state of one
-    /// partition (wave 3: Kafka's model, see [`validate_sequence`]).
+    /// partition (Kafka's model, see [`validate_sequence`]).
     ///
     /// The batch is appended when it starts right after the partition's last sequence
     /// (or at 0 on a fresh partition or with a new epoch), and is a duplicate when its
@@ -675,11 +637,11 @@ pub trait ProducerStore {
     /// Persist an appended idempotent batch AFTER its records were inserted (RV-8):
     /// advance the partition's last sequence and remember the batch (sequence range and
     /// base offset) among the producer's last [`PRODUCER_BATCH_CACHE`] batches there, so
-    /// a retry of it is answered with its original offset (wave 3).
+    /// a retry of it is answered with its original offset.
     fn record_producer_batch(&self, batch: ProducerBatch) -> Result<()>;
 
     /// Register partitions in a transaction (AddPartitionsToTxn). A transactional
-    /// Produce is accepted only for registered partitions (wave 3). The registry is
+    /// Produce is accepted only for registered partitions. The registry is
     /// cleared when the next transaction of the transactional id begins and on
     /// InitProducerId.
     fn add_txn_partitions(&self, transactional_id: &str, partitions: &[(i32, i32)]) -> Result<()>;
@@ -695,10 +657,10 @@ pub trait ProducerStore {
 
     /// Persist a producer's advanced `last_sequence` AFTER a successful insert (RV-8).
     ///
-    /// The sequence advance is split out from `check_and_update_sequence` (which now
-    /// only validates) so it happens only once the records are durably inserted.
-    /// Otherwise a failed insert would leave the sequence advanced and a retry of
-    /// the same batch would be misclassified as a duplicate and silently dropped.
+    /// `check_and_update_sequence` only validates, so the advance happens only once
+    /// the records are durably inserted: a failed insert must not leave the sequence
+    /// advanced, or a retry of the same batch would be taken for a duplicate and
+    /// dropped.
     ///
     /// Sets only the last sequence; the produce path uses
     /// [`record_producer_batch`](Self::record_producer_batch), which also remembers
@@ -712,7 +674,7 @@ pub trait ProducerStore {
     ) -> Result<()>;
 }
 
-/// Transactions: transactional producers, state, transactional writes and offsets, commit/abort (Phase 10).
+/// Transactions: transactional producers, state, transactional writes and offsets, commit/abort.
 pub trait TransactionStore {
     /// Look up or create producer by transactional_id
     ///
@@ -930,353 +892,9 @@ pub mod roles {
     };
 }
 
-// ===== Role delegation =====
-// A wrapper that changes nothing about a role forwards it wholesale with one of these
-// macros instead of re-listing the role method by method.
-
-/// Implement every [`TopicStore`] method by forwarding to `$via::method(receiver, ...)`:
-/// `delegate_topic_store!(Trait, field)` forwards to `&self.field`, `delegate_topic_store!(Type)` to `self` (for a
-/// type whose inherent methods carry the same names). Used inside an `impl TopicStore for ...`.
-macro_rules! delegate_topic_store {
-    ($via:ident $(, $field:ident)?) => {
-        fn get_or_create_topic(&self, name: &str, default_partitions: i32) -> $crate::kafka::error::Result<(i32, i32)> {
-            $via::get_or_create_topic(&self $(.$field)?, name, default_partitions)
-        }
-        fn get_topic_metadata(&self, names: Option<&[String]>) -> $crate::kafka::error::Result<Vec<$crate::kafka::storage::TopicMetadata>> {
-            $via::get_topic_metadata(&self $(.$field)?, names)
-        }
-        fn topic_exists(&self, name: &str) -> $crate::kafka::error::Result<bool> {
-            $via::topic_exists(&self $(.$field)?, name)
-        }
-        fn create_topic(&self, name: &str, partition_count: i32) -> $crate::kafka::error::Result<i32> {
-            $via::create_topic(&self $(.$field)?, name, partition_count)
-        }
-        fn get_topic_id(&self, name: &str) -> $crate::kafka::error::Result<Option<i32>> {
-            $via::get_topic_id(&self $(.$field)?, name)
-        }
-        fn delete_topic(&self, topic_id: i32) -> $crate::kafka::error::Result<()> {
-            $via::delete_topic(&self $(.$field)?, topic_id)
-        }
-        fn get_topic_partition_count(&self, name: &str) -> $crate::kafka::error::Result<Option<i32>> {
-            $via::get_topic_partition_count(&self $(.$field)?, name)
-        }
-        fn set_topic_partition_count(&self, name: &str, partition_count: i32) -> $crate::kafka::error::Result<()> {
-            $via::set_topic_partition_count(&self $(.$field)?, name, partition_count)
-        }
-        fn get_topic_retention_ms(&self, topic_id: i32) -> $crate::kafka::error::Result<Option<i64>> {
-            $via::get_topic_retention_ms(&self $(.$field)?, topic_id)
-        }
-        fn set_topic_retention_ms(&self, topic_id: i32, retention_ms: Option<i64>) -> $crate::kafka::error::Result<()> {
-            $via::set_topic_retention_ms(&self $(.$field)?, topic_id, retention_ms)
-        }
-        // wave3 groups
-        fn find_colliding_topic(&self, name: &str) -> $crate::kafka::error::Result<Option<String>> {
-            $via::find_colliding_topic(&self $(.$field)?, name)
-        }
-    };
-}
-pub(crate) use delegate_topic_store;
-
-/// Implement every [`LogStore`] method by forwarding to `$via::method(receiver, ...)`:
-/// `delegate_log_store!(Trait, field)` forwards to `&self.field`, `delegate_log_store!(Type)` to `self` (for a
-/// type whose inherent methods carry the same names). Used inside an `impl LogStore for ...`.
-macro_rules! delegate_log_store {
-    ($via:ident $(, $field:ident)?) => {
-        fn insert_records(&self, topic_id: i32, partition_id: i32, records: &[$crate::kafka::messages::Record]) -> $crate::kafka::error::Result<i64> {
-            $via::insert_records(&self $(.$field)?, topic_id, partition_id, records)
-        }
-        fn fetch_records(&self, topic_id: i32, partition_id: i32, fetch_offset: i64, max_bytes: i32) -> $crate::kafka::error::Result<Vec<$crate::kafka::storage::FetchedMessage>> {
-            $via::fetch_records(&self $(.$field)?, topic_id, partition_id, fetch_offset, max_bytes)
-        }
-        fn fetch_records_with_isolation(&self, topic_id: i32, partition_id: i32, fetch_offset: i64, max_bytes: i32, isolation_level: $crate::kafka::storage::IsolationLevel) -> $crate::kafka::error::Result<Vec<$crate::kafka::storage::FetchedMessage>> {
-            $via::fetch_records_with_isolation(&self $(.$field)?, topic_id, partition_id, fetch_offset, max_bytes, isolation_level)
-        }
-        fn get_high_watermark(&self, topic_id: i32, partition_id: i32) -> $crate::kafka::error::Result<i64> {
-            $via::get_high_watermark(&self $(.$field)?, topic_id, partition_id)
-        }
-        fn get_earliest_offset(&self, topic_id: i32, partition_id: i32) -> $crate::kafka::error::Result<i64> {
-            $via::get_earliest_offset(&self $(.$field)?, topic_id, partition_id)
-        }
-        fn get_log_start_offset(&self, topic_id: i32, partition_id: i32) -> $crate::kafka::error::Result<i64> {
-            $via::get_log_start_offset(&self $(.$field)?, topic_id, partition_id)
-        }
-        fn get_last_stable_offset(&self, topic_id: i32, partition_id: i32) -> $crate::kafka::error::Result<i64> {
-            $via::get_last_stable_offset(&self $(.$field)?, topic_id, partition_id)
-        }
-        fn get_partition_bounds(&self, topic_id: i32, partition_id: i32, isolation_level: $crate::kafka::storage::IsolationLevel) -> $crate::kafka::error::Result<$crate::kafka::storage::PartitionBounds> {
-            $via::get_partition_bounds(&self $(.$field)?, topic_id, partition_id, isolation_level)
-        }
-        fn get_offset_for_timestamp(&self, topic_id: i32, partition_id: i32, timestamp_ms: i64) -> $crate::kafka::error::Result<Option<(i64, i64)>> {
-            $via::get_offset_for_timestamp(&self $(.$field)?, topic_id, partition_id, timestamp_ms)
-        }
-        fn delete_records_before(&self, topic_id: i32, partition_id: i32, before_offset: i64) -> $crate::kafka::error::Result<i64> {
-            $via::delete_records_before(&self $(.$field)?, topic_id, partition_id, before_offset)
-        }
-    };
-}
-pub(crate) use delegate_log_store;
-
-/// Implement every [`OffsetStore`] method by forwarding to `$via::method(receiver, ...)`:
-/// `delegate_offset_store!(Trait, field)` forwards to `&self.field`, `delegate_offset_store!(Type)` to `self` (for a
-/// type whose inherent methods carry the same names). Used inside an `impl OffsetStore for ...`.
-macro_rules! delegate_offset_store {
-    ($via:ident $(, $field:ident)?) => {
-        fn commit_offset(&self, group_id: &str, topic_id: i32, partition_id: i32, offset: i64, metadata: Option<&str>) -> $crate::kafka::error::Result<()> {
-            $via::commit_offset(&self $(.$field)?, group_id, topic_id, partition_id, offset, metadata)
-        }
-        fn fetch_offset(&self, group_id: &str, topic_id: i32, partition_id: i32) -> $crate::kafka::error::Result<Option<$crate::kafka::storage::CommittedOffset>> {
-            $via::fetch_offset(&self $(.$field)?, group_id, topic_id, partition_id)
-        }
-        fn fetch_all_offsets(&self, group_id: &str) -> $crate::kafka::error::Result<Vec<(String, i32, $crate::kafka::storage::CommittedOffset)>> {
-            $via::fetch_all_offsets(&self $(.$field)?, group_id)
-        }
-        fn delete_consumer_group_offsets(&self, group_id: &str) -> $crate::kafka::error::Result<()> {
-            $via::delete_consumer_group_offsets(&self $(.$field)?, group_id)
-        }
-        // wave3 groups
-        fn list_offset_groups(&self) -> $crate::kafka::error::Result<Vec<String>> {
-            $via::list_offset_groups(&self $(.$field)?)
-        }
-        fn group_has_offsets(&self, group_id: &str) -> $crate::kafka::error::Result<bool> {
-            $via::group_has_offsets(&self $(.$field)?, group_id)
-        }
-        fn pending_txn_offset_partitions(&self, group_id: &str) -> $crate::kafka::error::Result<Vec<(String, i32)>> {
-            $via::pending_txn_offset_partitions(&self $(.$field)?, group_id)
-        }
-    };
-}
-pub(crate) use delegate_offset_store;
-
-/// Implement every [`ProducerStore`] method by forwarding to `$via::method(receiver, ...)`:
-/// `delegate_producer_store!(Trait, field)` forwards to `&self.field`, `delegate_producer_store!(Type)` to `self` (for a
-/// type whose inherent methods carry the same names). Used inside an `impl ProducerStore for ...`.
-macro_rules! delegate_producer_store {
-    ($via:ident $(, $field:ident)?) => {
-        fn allocate_producer_id(&self, client_id: Option<&str>, transactional_id: Option<&str>) -> $crate::kafka::error::Result<(i64, i16)> {
-            $via::allocate_producer_id(&self $(.$field)?, client_id, transactional_id)
-        }
-        fn get_producer_epoch(&self, producer_id: i64) -> $crate::kafka::error::Result<Option<i16>> {
-            $via::get_producer_epoch(&self $(.$field)?, producer_id)
-        }
-        fn increment_producer_epoch(&self, producer_id: i64) -> $crate::kafka::error::Result<(i64, i16)> {
-            $via::increment_producer_epoch(&self $(.$field)?, producer_id)
-        }
-        fn check_and_update_sequence(&self, producer_id: i64, producer_epoch: i16, topic_id: i32, partition_id: i32, base_sequence: i32, record_count: i32) -> $crate::kafka::error::Result<$crate::kafka::storage::SequenceCheck> {
-            $via::check_and_update_sequence(&self $(.$field)?, producer_id, producer_epoch, topic_id, partition_id, base_sequence, record_count)
-        }
-        fn record_producer_batch(&self, batch: $crate::kafka::storage::ProducerBatch) -> $crate::kafka::error::Result<()> {
-            $via::record_producer_batch(&self $(.$field)?, batch)
-        }
-        fn add_txn_partitions(&self, transactional_id: &str, partitions: &[(i32, i32)]) -> $crate::kafka::error::Result<()> {
-            $via::add_txn_partitions(&self $(.$field)?, transactional_id, partitions)
-        }
-        fn txn_has_partition(&self, transactional_id: &str, topic_id: i32, partition_id: i32) -> $crate::kafka::error::Result<bool> {
-            $via::txn_has_partition(&self $(.$field)?, transactional_id, topic_id, partition_id)
-        }
-        fn record_producer_sequence(&self, producer_id: i64, topic_id: i32, partition_id: i32, last_sequence: i32) -> $crate::kafka::error::Result<()> {
-            $via::record_producer_sequence(&self $(.$field)?, producer_id, topic_id, partition_id, last_sequence)
-        }
-    };
-}
-pub(crate) use delegate_producer_store;
-
-/// Implement every [`TransactionStore`] method by forwarding to `$via::method(receiver, ...)`:
-/// `delegate_transaction_store!(Trait, field)` forwards to `&self.field`, `delegate_transaction_store!(Type)` to `self` (for a
-/// type whose inherent methods carry the same names). Used inside an `impl TransactionStore for ...`.
-macro_rules! delegate_transaction_store {
-    ($via:ident $(, $field:ident)?) => {
-        fn get_or_create_transactional_producer(&self, transactional_id: &str, transaction_timeout_ms: i32, client_id: Option<&str>) -> $crate::kafka::error::Result<(i64, i16)> {
-            $via::get_or_create_transactional_producer(&self $(.$field)?, transactional_id, transaction_timeout_ms, client_id)
-        }
-        fn begin_transaction(&self, transactional_id: &str, producer_id: i64, producer_epoch: i16) -> $crate::kafka::error::Result<()> {
-            $via::begin_transaction(&self $(.$field)?, transactional_id, producer_id, producer_epoch)
-        }
-        fn begin_or_continue_transaction(&self, transactional_id: &str, producer_id: i64, producer_epoch: i16) -> $crate::kafka::error::Result<()> {
-            $via::begin_or_continue_transaction(&self $(.$field)?, transactional_id, producer_id, producer_epoch)
-        }
-        fn validate_transaction(&self, transactional_id: &str, producer_id: i64, producer_epoch: i16) -> $crate::kafka::error::Result<()> {
-            $via::validate_transaction(&self $(.$field)?, transactional_id, producer_id, producer_epoch)
-        }
-        fn insert_transactional_records(&self, topic_id: i32, partition_id: i32, records: &[$crate::kafka::messages::Record], producer_id: i64, producer_epoch: i16) -> $crate::kafka::error::Result<i64> {
-            $via::insert_transactional_records(&self $(.$field)?, topic_id, partition_id, records, producer_id, producer_epoch)
-        }
-        fn store_txn_pending_offset(&self, transactional_id: &str, group_id: &str, topic_id: i32, partition_id: i32, offset: i64, metadata: Option<&str>) -> $crate::kafka::error::Result<()> {
-            $via::store_txn_pending_offset(&self $(.$field)?, transactional_id, group_id, topic_id, partition_id, offset, metadata)
-        }
-        fn commit_transaction(&self, transactional_id: &str, producer_id: i64, producer_epoch: i16) -> $crate::kafka::error::Result<()> {
-            $via::commit_transaction(&self $(.$field)?, transactional_id, producer_id, producer_epoch)
-        }
-        fn abort_transaction(&self, transactional_id: &str, producer_id: i64, producer_epoch: i16) -> $crate::kafka::error::Result<()> {
-            $via::abort_transaction(&self $(.$field)?, transactional_id, producer_id, producer_epoch)
-        }
-        fn get_transaction_state(&self, transactional_id: &str) -> $crate::kafka::error::Result<Option<$crate::kafka::storage::TransactionState>> {
-            $via::get_transaction_state(&self $(.$field)?, transactional_id)
-        }
-    };
-}
-pub(crate) use delegate_transaction_store;
-
-/// Implement every [`MaintenanceStore`] method by forwarding to `$via::method(receiver, ...)`:
-/// `delegate_maintenance_store!(Trait, field)` forwards to `&self.field`, `delegate_maintenance_store!(Type)` to `self` (for a
-/// type whose inherent methods carry the same names). Used inside an `impl MaintenanceStore for ...`.
-macro_rules! delegate_maintenance_store {
-    ($via:ident $(, $field:ident)?) => {
-        fn abort_timed_out_transactions(&self, timeout: std::time::Duration) -> $crate::kafka::error::Result<Vec<String>> {
-            $via::abort_timed_out_transactions(&self $(.$field)?, timeout)
-        }
-        fn cleanup_aborted_messages(&self, older_than: std::time::Duration) -> $crate::kafka::error::Result<u64> {
-            $via::cleanup_aborted_messages(&self $(.$field)?, older_than)
-        }
-    };
-}
-pub(crate) use delegate_maintenance_store;
-
-/// How many of a producer's most recent batches per partition are remembered for
-/// duplicate detection, as Kafka's `max.in.flight.requests.per.connection` bound for
-/// idempotence (5).
-pub const PRODUCER_BATCH_CACHE: usize = 5;
-
 /// ListOffsets' MAX_TIMESTAMP (-3, KIP-734): the record with the largest timestamp.
 pub const MAX_TIMESTAMP: i64 = -3;
 
-/// What the produce path does with an idempotent batch
-/// ([`ProducerStore::check_and_update_sequence`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SequenceCheck {
-    /// Insert the batch, then record it with [`ProducerStore::record_producer_batch`].
-    Append,
-    /// A retry of a batch already appended at `base_offset`: skip the insert and
-    /// answer success with that offset.
-    Duplicate { base_offset: i64 },
-}
-
-/// One appended idempotent batch ([`ProducerStore::record_producer_batch`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ProducerBatch {
-    pub producer_id: i64,
-    pub topic_id: i32,
-    pub partition_id: i32,
-    pub first_sequence: i32,
-    pub last_sequence: i32,
-    pub base_offset: i64,
-}
-
-/// A remembered batch of a producer on one partition (sequence range and base offset).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CachedBatch {
-    pub first_sequence: i32,
-    pub last_sequence: i32,
-    pub base_offset: i64,
-}
-
-/// Outcome of validating a producer batch against the producer state of a partition
-/// ([`validate_sequence`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SequenceValidation {
-    /// The batch's exact range is one of the remembered batches: a retry. Skip the
-    /// insert and report the original base offset.
-    Duplicate { base_offset: i64 },
-    /// Append the batch; the partition's last sequence becomes `new_last_sequence`.
-    /// `new_epoch`: the batch carries a higher epoch than the stored one (an
-    /// idempotent producer bumped its own epoch, KIP-360), so the stored epoch moves
-    /// to it and the old epoch's sequence state is discarded first.
-    Proceed {
-        new_last_sequence: i32,
-        new_epoch: bool,
-    },
-    /// Out of sequence: neither the next sequence nor a remembered batch.
-    OutOfOrder { expected_sequence: i32 },
-    /// The batch's epoch is older than the producer's current epoch.
-    StaleEpoch { current_epoch: i16 },
-}
-
-/// The last sequence of a batch of `record_count` records starting at `base_sequence`.
-/// Sequences wrap from `i32::MAX` to 0, as Kafka's `DefaultRecordBatch.incrementSequence`.
-pub fn batch_last_sequence(base_sequence: i32, record_count: i32) -> i32 {
-    let increment = record_count.max(1) - 1;
-    if base_sequence > i32::MAX - increment {
-        increment - (i32::MAX - base_sequence) - 1
-    } else {
-        base_sequence + increment
-    }
-}
-
-/// The sequence expected after `last_sequence` (wrapping at `i32::MAX`); 0 when the
-/// partition has no state yet.
-pub fn next_sequence(last_sequence: Option<i32>) -> i32 {
-    match last_sequence {
-        None | Some(i32::MAX) => 0,
-        Some(last) => last + 1,
-    }
-}
-
-/// Validate an idempotent producer batch, following Kafka's producer state model
-/// (`ProducerStateManager`/`ProducerAppendInfo`):
-///
-/// * a lower epoch than `current_epoch` is stale (INVALID_PRODUCER_EPOCH); a higher
-///   one (a client-side epoch bump) must start at sequence 0;
-/// * at the current epoch, a batch whose exact `[first, last]` sequence range is one of
-///   the `cached` (last [`PRODUCER_BATCH_CACHE`]) batches is a duplicate and keeps its
-///   original offset; otherwise it must start at the next sequence (0 on a partition
-///   without state), anything else is out of order;
-/// * sequences wrap at `i32::MAX` ([`batch_last_sequence`]).
-///
-/// `last_sequence` is the partition's last sequence at `current_epoch` (`None`: no
-/// state). A negative base sequence or record count is malformed and rejected as out
-/// of order (RV-12). Deviation from Kafka: a producer without state on a partition
-/// must start at 0 (Kafka accepts any first sequence there), which only refuses
-/// batches whose predecessors never arrived.
-pub fn validate_sequence(
-    current_epoch: i16,
-    last_sequence: Option<i32>,
-    cached: &[CachedBatch],
-    producer_epoch: i16,
-    base_sequence: i32,
-    record_count: i32,
-) -> SequenceValidation {
-    let expected = next_sequence(last_sequence);
-    if base_sequence < 0 || record_count < 0 {
-        return SequenceValidation::OutOfOrder {
-            expected_sequence: expected,
-        };
-    }
-    let last = batch_last_sequence(base_sequence, record_count);
-    if producer_epoch < current_epoch {
-        return SequenceValidation::StaleEpoch { current_epoch };
-    }
-    if producer_epoch > current_epoch {
-        return if base_sequence == 0 {
-            SequenceValidation::Proceed {
-                new_last_sequence: last,
-                new_epoch: true,
-            }
-        } else {
-            SequenceValidation::OutOfOrder {
-                expected_sequence: 0,
-            }
-        };
-    }
-    if let Some(dup) = cached
-        .iter()
-        .find(|b| b.first_sequence == base_sequence && b.last_sequence == last)
-    {
-        return SequenceValidation::Duplicate {
-            base_offset: dup.base_offset,
-        };
-    }
-    if base_sequence == expected {
-        SequenceValidation::Proceed {
-            new_last_sequence: last,
-            new_epoch: false,
-        }
-    } else {
-        SequenceValidation::OutOfOrder {
-            expected_sequence: expected,
-        }
-    }
-}
-
-// Submodules
 pub mod postgres;
 pub mod privileges;
 pub mod retention;
@@ -1287,5 +905,4 @@ mod tests;
 #[cfg(test)]
 mod schema_tests;
 
-// Re-export main types
 pub use postgres::PostgresStore;

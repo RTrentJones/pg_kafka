@@ -8,12 +8,10 @@
 # pass-after regression test in kafka_test/. This script makes that mitigation
 # a machine check instead of prose.
 #
-# DR-19 (DEEP-REVIEW-2026-07) hardening:
-#   - The SPI file list is DERIVED from codecov.yml (its ignore section and its
-#     `# qa1-guard:` lines) at run time, so there is one source of truth instead
-#     of a hand-synced regex.
-#   - The satisfying change must touch a Rust source file under kafka_test/src/
-#     (touching a README or Cargo.lock under kafka_test/ no longer counts).
+# The SPI file list is derived from codecov.yml (its ignore section and its
+# `# qa1-guard:` lines) at run time, so it has one source of truth. The satisfying
+# change must touch a Rust source file under kafka_test/src/ (a README or
+# Cargo.lock under kafka_test/ does not count).
 #
 # Usage: pipe the PR's changed file paths (one per line) on stdin.
 #   gh pr view "$PR_NUMBER" --json files --jq '.files[].path' | bash "$0"
@@ -54,7 +52,6 @@ if echo "${PR_LABELS:-}" | tr ',' '\n' | grep -qx 'no-e2e-needed'; then
   exit 0
 fi
 
-# DR-19: require an actual Rust test-source change, not just any kafka_test/ path.
 if echo "$changed" | grep -qE '^kafka_test/src/.*\.rs$'; then
   echo "kafka_test/src/*.rs was also updated — requirement satisfied."
   exit 0

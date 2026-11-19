@@ -26,8 +26,8 @@ pub async fn test_consumer_from_offset() -> TestResult {
     let producer = create_producer()?;
 
     for i in 0..10 {
-        let value = format!("Offset test message {}", i);
-        let key = format!("offset-key-{}", i);
+        let value = format!("Offset test message {i}");
+        let key = format!("offset-key-{i}");
         producer
             .send(
                 FutureRecord::to(&topic).payload(&value).key(&key),
@@ -55,10 +55,7 @@ pub async fn test_consumer_from_offset() -> TestResult {
 
     // The topic is unique to this run, so exactly the 10 records above exist.
     assert_eq!(db_count, 10, "Expected exactly the 10 produced messages");
-    println!(
-        "✅ Database has {} messages for topic '{}'",
-        db_count, topic
-    );
+    println!("✅ Database has {db_count} messages for topic '{topic}'");
 
     // 3. Query high watermark
     let hw_row = db_client
@@ -71,7 +68,7 @@ pub async fn test_consumer_from_offset() -> TestResult {
         )
         .await?;
     let high_watermark: i64 = hw_row.get(0);
-    println!("✅ High watermark: {}", high_watermark);
+    println!("✅ High watermark: {high_watermark}");
 
     ctx.cleanup().await?;
     println!("\n✅ Offset test PASSED\n");

@@ -46,10 +46,7 @@ pub async fn test_find_coordinator_bootstrap() -> TestResult {
 
     // Create consumer with a new (non-existent) group
     let new_group = format!("new-coord-group-{}", uuid::Uuid::new_v4());
-    println!(
-        "\nStep 2: Creating consumer with new group '{}'...",
-        new_group
-    );
+    println!("\nStep 2: Creating consumer with new group '{new_group}'...");
 
     let consumer: StreamConsumer = ClientConfig::new()
         .set("bootstrap.servers", get_bootstrap_servers())
@@ -75,11 +72,11 @@ pub async fn test_find_coordinator_bootstrap() -> TestResult {
             let value = msg
                 .payload()
                 .map(|v| String::from_utf8_lossy(v).to_string());
-            println!("  ✅ Received message: {:?}", value);
+            println!("  ✅ Received message: {value:?}");
         }
         Ok(Err(e)) => {
             // Error but not timeout - coordinator was found
-            println!("  Consumer error (coordinator found): {}", e);
+            println!("  Consumer error (coordinator found): {e}");
         }
         Err(_) => {
             println!("  Timeout waiting for message (coordinator found, no data)");
@@ -132,8 +129,8 @@ pub async fn test_partition_assignment_strategies() -> TestResult {
         producer
             .send(
                 FutureRecord::to(&topic.name)
-                    .payload(&format!("partition-{}", p))
-                    .key(&format!("key-{}", p))
+                    .payload(&format!("partition-{p}"))
+                    .key(&format!("key-{p}"))
                     .partition(p),
                 Duration::from_secs(5),
             )
@@ -169,11 +166,10 @@ pub async fn test_partition_assignment_strategies() -> TestResult {
     }
 
     // Poll the consumers in a retry loop until at least one delivers a record,
-    // bounded by an overall deadline. This replaces the flaky "blind 3s sleep
-    // then a single 500ms poll": actively polling each consumer both drives the
+    // bounded by an overall deadline. Actively polling each consumer both drives the
     // group rebalance (rdkafka only progresses the join/sync while the stream is
-    // polled) and collects the record, so a slow-to-stabilize group under CI
-    // load no longer yields zero receives.
+    // polled) and collects the record, so a group slow to stabilize under CI load
+    // still receives (a blind sleep followed by one poll would not).
     println!("\nStep 3-4: Polling until a consumer receives...");
     let overall = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut total_received = 0;
@@ -199,7 +195,7 @@ pub async fn test_partition_assignment_strategies() -> TestResult {
 
     // At least one consumer should have received a record.
     println!("\nStep 5: Verifying results...");
-    println!("  Total messages received: {}", total_received);
+    println!("  Total messages received: {total_received}");
     assert!(
         total_received >= 1,
         "At least one consumer should receive messages"
@@ -291,7 +287,7 @@ pub async fn test_leave_during_rebalance() -> TestResult {
             let value = msg
                 .payload()
                 .map(|v| String::from_utf8_lossy(v).to_string());
-            println!("  ✅ Consumer 2 received: {:?}", value);
+            println!("  ✅ Consumer 2 received: {value:?}");
         }
         _ => {
             println!("  Consumer 2 active (no new messages)");
@@ -328,8 +324,8 @@ pub async fn test_heartbeat_keeps_membership() -> TestResult {
         producer
             .send(
                 FutureRecord::to(&topic.name)
-                    .payload(&format!("message-{}", i))
-                    .key(&format!("key-{}", i)),
+                    .payload(&format!("message-{i}"))
+                    .key(&format!("key-{i}")),
                 Duration::from_secs(5),
             )
             .await
@@ -365,16 +361,18 @@ pub async fn test_heartbeat_keeps_membership() -> TestResult {
                 let value = msg
                     .payload()
                     .map(|v| String::from_utf8_lossy(v).to_string());
-                println!("  Received: {:?}", value);
+                println!("  Received: {value:?}");
                 received += 1;
             }
             Ok(Err(e)) => {
                 // Check if error is session timeout (shouldn't happen with heartbeat)
                 let error_str = e.to_string();
-                if error_str.contains("session timeout") || error_str.contains("MemberIdRequired") {
-                    panic!("Session timed out despite heartbeat: {}", e);
-                }
-                println!("  Consumer error (not timeout): {}", e);
+                assert!(
+                    !(error_str.contains("session timeout")
+                        || error_str.contains("MemberIdRequired")),
+                    "Session timed out despite heartbeat: {e}"
+                );
+                println!("  Consumer error (not timeout): {e}");
             }
             Err(_) => {
                 println!("  Poll timeout (heartbeat still active)");
@@ -386,7 +384,7 @@ pub async fn test_heartbeat_keeps_membership() -> TestResult {
     }
 
     println!("\nStep 4: Verifying membership maintained...");
-    println!("  Messages received: {}", received);
+    println!("  Messages received: {received}");
 
     // Should have received at least some messages
     assert!(received >= 1, "Should receive at least 1 message");
@@ -423,8 +421,8 @@ pub async fn test_group_state_transitions() -> TestResult {
         producer
             .send(
                 FutureRecord::to(&topic.name)
-                    .payload(&format!("message-{}", i))
-                    .key(&format!("key-{}", i)),
+                    .payload(&format!("message-{i}"))
+                    .key(&format!("key-{i}")),
                 Duration::from_secs(5),
             )
             .await
@@ -458,13 +456,13 @@ pub async fn test_group_state_transitions() -> TestResult {
                 let value = msg
                     .payload()
                     .map(|v| String::from_utf8_lossy(v).to_string());
-                println!("  Consumer 1 received: {:?}", value);
+                println!("  Consumer 1 received: {value:?}");
                 received1 += 1;
             }
             _ => break,
         }
     }
-    println!("  Consumer 1 received {} messages", received1);
+    println!("  Consumer 1 received {received1} messages");
 
     // Drop consumer (triggers leave, state: Stable → Empty)
     println!("\nStep 4: Consumer 1 leaving group...");
@@ -498,13 +496,13 @@ pub async fn test_group_state_transitions() -> TestResult {
                 let value = msg
                     .payload()
                     .map(|v| String::from_utf8_lossy(v).to_string());
-                println!("  Consumer 2 received: {:?}", value);
+                println!("  Consumer 2 received: {value:?}");
                 received2 += 1;
             }
             _ => break,
         }
     }
-    println!("  Consumer 2 received {} messages", received2);
+    println!("  Consumer 2 received {received2} messages");
 
     // Verify at least one consumer received messages (offsets weren't committed)
     assert!(

@@ -1,4 +1,4 @@
-# wave3 net: libFuzzer targets for the network edge (cargo-fuzz).
+# libFuzzer targets for the network edge (cargo-fuzz).
 #
 #   cargo install cargo-fuzz
 #   cd fuzz && cargo +nightly fuzz run frame_codec    -- -max_total_time=300

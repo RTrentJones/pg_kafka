@@ -2,9 +2,11 @@
 //! because rdkafka does not expose the fields involved.
 
 use crate::common::TestResult;
+use crate::error_codes::{NONE, UNKNOWN_TOPIC_OR_PARTITION};
 use crate::fixtures::TestTopicBuilder;
 use crate::setup::TestContext;
-use crate::w3_txn::wire::{batch, now_ms, Wire};
+use crate::wire::records::{batch, now_ms};
+use crate::wire::Wire;
 use kafka_protocol::messages::init_producer_id_request::InitProducerIdRequest;
 use kafka_protocol::messages::init_producer_id_response::InitProducerIdResponse;
 use kafka_protocol::messages::offset_commit_request::{
@@ -18,15 +20,12 @@ use kafka_protocol::messages::produce_response::ProduceResponse;
 use kafka_protocol::messages::{GroupId, ProducerId, TopicName};
 use kafka_protocol::protocol::StrBytes;
 
-const ERROR_NONE: i16 = 0;
-const ERROR_UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
-
 /// Produce v8 of `values` to partition 0: `(error_code, base_offset, log_start_offset)`.
 async fn produce_v8(
     wire: &mut Wire,
     topic: &str,
     values: &[&str],
-) -> crate::w3_txn::wire::Result<(i16, i64, i64)> {
+) -> crate::common::DynResult<(i16, i64, i64)> {
     let mut p = PartitionProduceData::default();
     p.index = 0;
     p.records = Some(batch(values, -1, -1, -1, false, None));
@@ -37,7 +36,7 @@ async fn produce_v8(
     req.acks = -1;
     req.timeout_ms = 10_000;
     req.topic_data = vec![t];
-    let resp: ProduceResponse = wire.call(0, 8, &req).await?;
+    let resp: ProduceResponse = wire.call(8, &req).await?;
     let p = &resp.responses[0].partition_responses[0];
     Ok((p.error_code, p.base_offset, p.log_start_offset))
 }
@@ -55,13 +54,10 @@ pub async fn test_produce_response_reports_log_start_offset() -> TestResult {
 
     assert_eq!(
         produce_v8(&mut wire, &topic, &["a", "b", "c"]).await?,
-        (ERROR_NONE, 0, 0)
+        (NONE, 0, 0)
     );
-    assert_eq!(wire.delete_records(&topic, 0, 2).await?, (ERROR_NONE, 2));
-    assert_eq!(
-        produce_v8(&mut wire, &topic, &["d"]).await?,
-        (ERROR_NONE, 3, 2)
-    );
+    assert_eq!(wire.delete_records(&topic, 0, 2).await?, (NONE, 2));
+    assert_eq!(produce_v8(&mut wire, &topic, &["d"]).await?, (NONE, 3, 2));
     println!("✅ log_start_offset 0, then 2 after DeleteRecords\n");
 
     ctx.cleanup().await?;
@@ -89,24 +85,24 @@ pub async fn test_list_offsets_without_a_matching_record_is_offset_minus_one() -
             None,
         )
         .await?;
-    assert_eq!(code, ERROR_NONE);
+    assert_eq!(code, NONE);
 
     let after_last = wire.list_offsets(&topic, 0, now + 3_600_000, 0).await?;
     assert_eq!(
         after_last,
-        (ERROR_NONE, -1, -1),
+        (NONE, -1, -1),
         "timestamp after the last record"
     );
     let by_timestamp = wire.list_offsets(&topic, 0, now, 0).await?;
     assert_eq!(
         by_timestamp,
-        (ERROR_NONE, 0, now),
+        (NONE, 0, now),
         "a matching record still resolves"
     );
     let max_on_empty = wire.list_offsets(&topic, 1, -3, 0).await?;
     assert_eq!(
         max_on_empty,
-        (ERROR_NONE, -1, -1),
+        (NONE, -1, -1),
         "MAX_TIMESTAMP of an empty partition"
     );
     println!("✅ NONE / -1 / -1 when no record matches\n");
@@ -144,16 +140,13 @@ pub async fn test_offset_commit_to_a_missing_partition_is_refused() -> TestResul
     req.group_id = GroupId(StrBytes::from_string(group.clone()));
     req.generation_id_or_member_epoch = -1;
     req.topics = vec![t];
-    let resp: OffsetCommitResponse = wire.call(8, 8, &req).await?;
+    let resp: OffsetCommitResponse = wire.call(8, &req).await?;
     let codes: Vec<(i32, i16)> = resp.topics[0]
         .partitions
         .iter()
         .map(|p| (p.partition_index, p.error_code))
         .collect();
-    assert_eq!(
-        codes,
-        vec![(0, ERROR_NONE), (5, ERROR_UNKNOWN_TOPIC_OR_PARTITION)]
-    );
+    assert_eq!(codes, vec![(0, NONE), (5, UNKNOWN_TOPIC_OR_PARTITION)]);
 
     let stored: i64 = ctx
         .db()
@@ -176,13 +169,13 @@ async fn init_idempotent(
     wire: &mut Wire,
     producer_id: i64,
     epoch: i16,
-) -> crate::w3_txn::wire::Result<(i16, i64, i16)> {
+) -> crate::common::DynResult<(i16, i64, i16)> {
     let mut req = InitProducerIdRequest::default();
     req.transactional_id = None;
     req.transaction_timeout_ms = 60_000;
     req.producer_id = ProducerId(producer_id);
     req.producer_epoch = epoch;
-    let resp: InitProducerIdResponse = wire.call(22, 4, &req).await?;
+    let resp: InitProducerIdResponse = wire.call(4, &req).await?;
     Ok((resp.error_code, resp.producer_id.0, resp.producer_epoch))
 }
 
@@ -201,7 +194,7 @@ pub async fn test_idempotent_reinit_with_an_old_producer_id_gets_a_new_one() -> 
     let mut wire = Wire::connect().await?;
 
     let (code, first, epoch) = init_idempotent(&mut wire, -1, -1).await?;
-    assert_eq!((code, epoch), (ERROR_NONE, 0));
+    assert_eq!((code, epoch), (NONE, 0));
     let mut seen = vec![first];
     for (presented, presented_epoch, what) in [
         (first, 0, "current id and epoch"),
@@ -209,7 +202,7 @@ pub async fn test_idempotent_reinit_with_an_old_producer_id_gets_a_new_one() -> 
         (first + 1_000_000, 0, "an id never issued"),
     ] {
         let (code, id, epoch) = init_idempotent(&mut wire, presented, presented_epoch).await?;
-        assert_eq!((code, epoch), (ERROR_NONE, 0), "{what}");
+        assert_eq!((code, epoch), (NONE, 0), "{what}");
         assert!(!seen.contains(&id), "{what}: a new producer id");
         seen.push(id);
     }
@@ -218,7 +211,7 @@ pub async fn test_idempotent_reinit_with_an_old_producer_id_gets_a_new_one() -> 
     let (code, _) = wire
         .produce(&topic, 0, batch(&["a"], last, 0, 0, false, None), None)
         .await?;
-    assert_eq!(code, ERROR_NONE, "the new id produces from sequence 0");
+    assert_eq!(code, NONE, "the new id produces from sequence 0");
     println!("✅ every re-init got a fresh producer id\n");
 
     ctx.cleanup().await?;

@@ -36,7 +36,7 @@ Version ranges below are the ones advertised in the ApiVersions response and enf
 
 **Implementation Notes (Phase 9)**:
 - ✅ Idempotent producer support with sequence validation
-- ✅ Deduplication, Kafka's model (wave 3): a retry of one of the producer's last 5 batches
+- ✅ Deduplication, Kafka's model: a retry of one of the producer's last 5 batches
   on the partition is acked with its original base offset and not re-written (as in Kafka,
   DUPLICATE_SEQUENCE_NUMBER is never returned); anything else out of sequence is
   OUT_OF_ORDER_SEQUENCE_NUMBER; sequences wrap at 2147483647
@@ -53,7 +53,7 @@ Version ranges below are the ones advertised in the ApiVersions response and enf
 | ListOffsets | 2 | <!--gen:api-vversions:ListOffsets-->v1-v7<!--/gen--> | ✅ Complete | Get earliest/latest/by-timestamp offsets |
 
 **Implementation Notes:**
-- ✅ ListOffsets supports special timestamps (-2 = earliest, -1 = latest: the LSO for read_committed, -3 = max timestamp, KIP-734) and arbitrary timestamp lookup (earliest offset whose record timestamp ≥ target; AUDIT-2026-06 BUG-7 + CONF-7), bounded by the readable end like Kafka; an unknown partition is UNKNOWN_TOPIC_OR_PARTITION
+- ✅ ListOffsets supports special timestamps (-2 = earliest, -1 = latest: the LSO for read_committed, -3 = max timestamp, KIP-734) and arbitrary timestamp lookup (earliest offset whose record timestamp ≥ target), bounded by the readable end like Kafka; an unknown partition is UNKNOWN_TOPIC_OR_PARTITION
 - ✅ OffsetFetch v7 `require_stable` (KIP-447): UNSTABLE_OFFSET_COMMIT for partitions with a pending transactional offset commit
 - ✅ Fetch returns records grouped into one RecordBatch per run of a producer's consecutive offsets, and a control batch over offsets a consumer cannot see (aborted, cleaned up) so its position reaches the end (see PROTOCOL_DEVIATIONS.md §7)
 - ✅ OffsetFetch limited to <!--gen:api-vversions:OffsetFetch-->v1-v7<!--/gen--> (v8+ requires different response format)
@@ -145,7 +145,7 @@ Version ranges below are the ones advertised in the ApiVersions response and enf
 
 **Source**: [Apache Kafka Protocol Guide](https://kafka.apache.org/protocol.html)
 **Total Standard Kafka APIs**: ~50
-**Implemented**: 28 (56%)
+**Implemented**: <!--gen:api-coverage-->28 of ~50 standard Kafka APIs (56%)<!--/gen-->
 **Unimplemented**: ~22 (44%)
 
 This section analyzes all unimplemented APIs, their use cases, and priority for drop-in Kafka replacement.
@@ -170,7 +170,7 @@ This section analyzes all unimplemented APIs, their use cases, and priority for 
 
 ### Transactions (3 remaining APIs) - Priority: Low
 
-**Note:** 4 of 7 transaction APIs are now implemented (Phase 10). See "Implemented APIs" section above.
+**Note:** 4 of 7 transaction APIs are implemented (Phase 10). See "Implemented APIs" section above.
 
 | API | Key | Use Case | Drop-In Priority |
 |-----|-----|----------|------------------|
@@ -529,7 +529,7 @@ one place: [TEST_STRATEGY.md](TEST_STRATEGY.md#test-summary).
 ## Conclusion
 
 **Current State**: Comprehensive Kafka-compatible broker with <!--gen:api-count-->28<!--/gen--> APIs implemented
-**Coverage**: 56% of standard Kafka protocol (full producer/consumer/coordinator/admin/transaction/config support)
+**Coverage**: <!--gen:api-coverage-->28 of ~50 standard Kafka APIs (56%)<!--/gen--> (full producer/consumer/coordinator/admin/transaction/config support)
 **Architecture**: Clean, maintainable, well-documented with Repository Pattern
 **Test Status**: CI-gated; counts in [TEST_STRATEGY.md](TEST_STRATEGY.md#test-summary)
 

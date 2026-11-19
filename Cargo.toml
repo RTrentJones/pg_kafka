@@ -79,10 +79,8 @@ base64 = "0.22"
 
 [dev-dependencies]
 pgrx-tests = "=0.16.1"
-tokio-test = "0.4.4"
 proptest = "1.5"
 mockall = "0.13.1"
-insta = { version = "1.40", features = ["yaml"] }
 
 [profile.dev]
 panic = "unwind"
@@ -93,36 +91,21 @@ opt-level = 3
 lto = "thin"  # "thin" provides most benefits of "fat" with smaller intermediate files
 codegen-units = 1
 
-# SEC-9 (AUDIT-2026-06): bound array pre-allocation in the Kafka wire decoders. The upstream
-# kafka-protocol 0.17.0 Array/CompactArray decoders call Vec::with_capacity on a length read
-# straight from the wire, so a single crafted request can declare a huge array length and trigger
-# a multi-GB allocation that *aborts the worker process* (an allocation failure, not an unwinding
-# panic, so parse_request's catch_unwind cannot contain it). This fork caps the capacity hint; the
-# Vec still grows for honest inputs.
+# kafka-protocol is patched to a fork that bounds what a hostile request can make the decoders
+# allocate. Upstream 0.17.0 sizes Vec::with_capacity, the RecordBatch record-count `reserve` and
+# the byte/string buffers straight from wire lengths, so one crafted request can trigger a
+# multi-GB allocation; an allocation failure aborts the worker process (it is not an unwinding
+# panic, so parse_request's catch_unwind cannot contain it). The fork caps those capacity hints
+# (honest inputs still grow the Vec) and caps decompressed record-batch size at 256 MiB for
+# gzip/lz4/zstd/snappy, so a decompression bomb is rejected. It also moves to zstd 0.14, which
+# clears the zstd-safe 7.x / zstd-sys 2.0 advisories. The caps are in records.rs and
+# protocol/types.rs of https://github.com/RTrentJones/kafka-protocol-rs
+# (branch claude/upbeat-cori-utc1j7).
 #
-# SEC-5 (AUDIT-2026-06): the same fork also caps decompressed record-batch size (MAX_DECOMPRESSED_SIZE
-# = 256 MiB) across gzip/lz4/zstd/snappy, so a "decompression bomb" — a tiny compressed batch that
-# inflates to many GB — is rejected instead of allocated.
-#
-# RV-1/RV-15 (AUDIT-2026-06 post-remediation review): the SEC-9 caps missed two residual sites the fork
-# now also bounds — the RecordBatch record-count `reserve` (a ~60-byte Produce claiming record_count =
-# i32::MAX aborted the worker) and the four Vec<u8>/String vec![0; wire_len] decoders (guarded against
-# remaining bytes). See records.rs / protocol/types.rs in the fork.
-#
-# Fork: https://github.com/RTrentJones/kafka-protocol-rs (branch claude/upbeat-cori-utc1j7: the
-# bounded-decompress caps plus zstd 0.14, which clears the zstd-safe 7.x / zstd-sys 2.0 advisories)
-#
-# DR-14 (DEEP-REVIEW-2026-07) — supply-chain contingency for this fork:
-# the rev pin means builds are reproducible, but if the fork repo ever becomes
-# unavailable, builds break with no fallback. Recovery options, in order:
-#   1. Local mirror: `~/.cargo/git/checkouts` on any machine that has built the
-#      project contains the full clone — push it to a new remote and repoint.
-#   2. Vendor: `cargo vendor` snapshots the exact sources into vendor/ (works
-#      while the cache is intact even if the remote is gone).
-#   3. Upstream: the caps are small, self-contained patches to records.rs and
-#      protocol/types.rs — upstreaming them to tychedelia/kafka-protocol-rs
-#      removes the fork entirely (preferred long-term exit).
-# cargo-deny (deny.toml [sources]) pins this as the ONLY allowed git dependency.
+# The rev pin keeps builds reproducible; cargo-deny (deny.toml [sources]) allows no other git
+# source. If the fork ever disappears: push a clone from any ~/.cargo/git/checkouts to a new
+# remote and repoint, or `cargo vendor` from an intact cache; the long-term exit is upstreaming
+# the caps to tychedelia/kafka-protocol-rs.
 [patch.crates-io]
 kafka-protocol = { git = "https://github.com/RTrentJones/kafka-protocol-rs", rev = "642043e3a6681e51e2b6d37e5c8b69c2db633ea6" }
 

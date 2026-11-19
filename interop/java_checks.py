@@ -6,9 +6,9 @@ javac, psql reaching the pg_kafka database as a superuser (PG* environment), and
 BOOTSTRAP (default 127.0.0.1:9092). Every check uses fresh topic and group names, so the script
 can be re-run against the same database.
 
-A check listed in XFAIL is expected to fail on the current code (a defect another stream is
-fixing). It is reported XFAIL when it fails and XPASS when it passes; neither fails the run, so
-the integrator flips the mark once the fix is merged. Any other failure fails the run.
+A check listed in XFAIL is expected to fail on the current code (a known defect). It is reported
+XFAIL when it fails and XPASS when it passes; neither fails the run, and an XPASS means the entry
+can be removed. Any other failure fails the run.
 
   interop/java_checks.py [--only name,name] [--list]
 """
@@ -34,15 +34,8 @@ WORK = Path(tempfile.mkdtemp(prefix="pgk-java-"))
 ENV = dict(os.environ, KAFKA_HEAP_OPTS=os.environ.get("KAFKA_HEAP_OPTS", "-Xmx256m"),
            KAFKA_LOG4J_OPTS=f"-Dlog4j.configuration=file:{HERE / 'log4j.properties'}")
 
-# check name -> why it is expected to fail on the base code (wave 3; flip when fixed)
-XFAIL = {
-    "groups_after_restart": "stream groups item 2: offsets-only groups are invisible to "
-                            "ListGroups/DescribeGroups after a worker restart",
-    "get_offsets": "stream txn item 3b: ListOffsets MAX_TIMESTAMP (-3) is treated as a "
-                   "literal timestamp",
-    "read_committed_aborted_tail": "stream txn item 1: no abort markers, so a read_committed "
-                                   "consumer never moves past an aborted transaction at the tail",
-}
+# check name -> the defect that makes it fail
+XFAIL = {}
 
 
 class CheckFailed(Exception):
@@ -294,9 +287,15 @@ def check_get_offsets():
     p.p.wait(timeout=60)
     expect(get_offsets(t, -1) == {0: n}, f"latest: {get_offsets(t, -1)}")
     expect(get_offsets(t, -2) == {0: 0}, f"earliest: {get_offsets(t, -2)}")
-    # Records carry increasing create times, so the max-timestamp record is the last one.
+    # The producer sends faster than its clock ticks, so the last records share the largest
+    # timestamp. pg_kafka answers the lowest offset among them (PROTOCOL_DEVIATIONS.md §8;
+    # Kafka 3.7.0 answers the last offset of that record's batch, KAFKA-16310).
+    want = int(psql("SELECT m.partition_offset FROM kafka.messages m "
+                    "JOIN kafka.topics tp ON tp.id = m.topic_id "
+                    f"WHERE tp.name = '{t}' ORDER BY m.timestamp_ms DESC, m.partition_offset "
+                    "LIMIT 1"))
     mt = get_offsets(t, -3)
-    expect(mt == {0: n - 1}, f"max-timestamp (-3): {mt}, expected offset {n - 1}")
+    expect(mt == {0: want}, f"max-timestamp (-3): {mt}, expected offset {want}")
 
 
 def check_transactional_perf_read_committed():

@@ -32,12 +32,12 @@ pub async fn test_consumer_group_lifecycle() -> TestResult {
     let producer = create_producer()?;
 
     for i in 0..3 {
-        let value = format!("Lifecycle test message {}", i);
+        let value = format!("Lifecycle test message {i}");
         producer
             .send(
                 FutureRecord::to(&topic)
                     .payload(&value)
-                    .key(&format!("key-{}", i)),
+                    .key(&format!("key-{i}")),
                 Duration::from_secs(5),
             )
             .await
@@ -77,7 +77,7 @@ pub async fn test_consumer_group_lifecycle() -> TestResult {
                 );
             }
             Ok(Err(e)) => {
-                println!("   ⚠️  Consumer error: {}", e);
+                println!("   ⚠️  Consumer error: {e}");
             }
             Err(_) => {
                 println!("   (polling...)");
@@ -85,13 +85,13 @@ pub async fn test_consumer_group_lifecycle() -> TestResult {
         }
     }
 
-    println!("✅ Received {} messages", received);
+    println!("✅ Received {received} messages");
 
     // 4. Commit offsets (exercises OffsetCommit)
     println!("\nStep 4: Committing offsets...");
     match consumer.commit_consumer_state(rdkafka::consumer::CommitMode::Sync) {
-        Ok(_) => println!("✅ Offsets committed"),
-        Err(e) => println!("   ⚠️  Commit warning: {} (may be expected)", e),
+        Ok(()) => println!("✅ Offsets committed"),
+        Err(e) => println!("   ⚠️  Commit warning: {e} (may be expected)"),
     }
 
     // 5. Graceful shutdown (exercises LeaveGroup)

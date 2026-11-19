@@ -48,10 +48,7 @@ pub async fn test_multiple_consumer_groups() -> TestResult {
         }
     }
 
-    println!(
-        "   Group 1 received: {}, Group 2 received: {}",
-        c1_count, c2_count
-    );
+    println!("   Group 1 received: {c1_count}, Group 2 received: {c2_count}");
     assert!(c1_count >= 3, "Group 1 should receive at least 3 messages");
     assert!(c2_count >= 3, "Group 2 should receive at least 3 messages");
     println!("✅ Both consumer groups received messages independently");
@@ -104,10 +101,7 @@ pub async fn test_consumer_group_two_members() -> TestResult {
     }
 
     let total = c1_count + c2_count;
-    println!(
-        "   Consumer 1: {}, Consumer 2: {}, Total: {}",
-        c1_count, c2_count, total
-    );
+    println!("   Consumer 1: {c1_count}, Consumer 2: {c2_count}, Total: {total}");
     assert!(total >= 5, "Combined should receive at least 5 messages");
     println!("✅ Two consumers in same group working");
 
@@ -142,7 +136,7 @@ pub async fn test_consumer_rejoin_after_leave() -> TestResult {
         }
     }
 
-    println!("   First consumer received: {}", first_count);
+    println!("   First consumer received: {first_count}");
     drop(consumer1);
 
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -160,7 +154,7 @@ pub async fn test_consumer_rejoin_after_leave() -> TestResult {
         }
     }
 
-    println!("   Second consumer (rejoin) received: {}", second_count);
+    println!("   Second consumer (rejoin) received: {second_count}");
     println!("✅ Consumer successfully rejoined group");
 
     ctx.cleanup().await?;

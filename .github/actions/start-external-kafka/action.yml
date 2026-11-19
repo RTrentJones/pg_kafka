@@ -1,0 +1,12 @@
+name: Start the external Kafka broker
+description: >
+  Start docker-compose.yml's external-kafka service (Apache Kafka 3.7, PLAINTEXT on
+  localhost:9093) and wait until its health check passes. Stop it with `docker compose down -v`.
+runs:
+  using: composite
+  steps:
+    - name: Start external-kafka and wait for it to be healthy
+      shell: bash
+      run: |
+        docker compose up -d external-kafka
+        timeout 90 bash -c 'until docker compose ps external-kafka | grep -q "(healthy)"; do sleep 2; done'

@@ -26,7 +26,7 @@ impl std::fmt::Debug for PlainCredentials {
 impl Drop for PlainCredentials {
     /// Best effort: overwrite the password bytes before the allocation is freed.
     fn drop(&mut self) {
-        for b in self.password.iter_mut() {
+        for b in &mut self.password {
             // SAFETY: `b` is a valid, aligned, exclusive reference into the Vec.
             unsafe { std::ptr::write_volatile(b, 0) };
         }
@@ -43,7 +43,7 @@ pub enum PlainError {
 impl std::fmt::Display for PlainError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PlainError::Malformed(m) => write!(f, "malformed PLAIN message: {}", m),
+            PlainError::Malformed(m) => write!(f, "malformed PLAIN message: {m}"),
             PlainError::AuthzidMismatch => {
                 write!(f, "authorization id differs from the username")
             }
@@ -54,14 +54,12 @@ impl std::fmt::Display for PlainError {
 /// Parse a PLAIN message.
 pub fn parse_plain(message: &[u8]) -> Result<PlainCredentials, PlainError> {
     let mut parts = message.split(|b| *b == 0);
-    let (authzid, authcid, passwd) = match (parts.next(), parts.next(), parts.next(), parts.next())
-    {
-        (Some(z), Some(c), Some(p), None) => (z, c, p),
-        _ => {
-            return Err(PlainError::Malformed(
-                "expected authzid NUL authcid NUL passwd",
-            ))
-        }
+    let (Some(authzid), Some(authcid), Some(passwd), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(PlainError::Malformed(
+            "expected authzid NUL authcid NUL passwd",
+        ));
     };
     if authcid.is_empty() {
         return Err(PlainError::Malformed("empty username"));
@@ -127,7 +125,7 @@ mod tests {
     #[test]
     fn debug_hides_the_password() {
         let c = parse_plain(b"\0alice\0hunter2").unwrap();
-        let s = format!("{:?}", c);
+        let s = format!("{c:?}");
         assert!(s.contains("alice"));
         assert!(!s.contains("hunter2"));
     }

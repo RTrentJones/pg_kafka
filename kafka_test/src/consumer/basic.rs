@@ -41,10 +41,7 @@ pub async fn test_consumer_basic() -> TestResult {
         .await
         .map_err(|(err, _msg)| err)?;
 
-    println!(
-        "✅ Message produced: partition={}, offset={}",
-        partition, offset
-    );
+    println!("✅ Message produced: partition={partition}, offset={offset}");
 
     // 2. Create consumer with manual partition assignment
     println!("\nStep 2: Creating consumer with manual partition assignment...");
@@ -74,10 +71,10 @@ pub async fn test_consumer_basic() -> TestResult {
                 let msg_partition = msg.partition();
 
                 println!("✅ Message received:");
-                println!("   Key: {:?}", msg_key);
-                println!("   Value: {:?}", msg_value);
-                println!("   Offset: {}", msg_offset);
-                println!("   Partition: {}", msg_partition);
+                println!("   Key: {msg_key:?}");
+                println!("   Value: {msg_value:?}");
+                println!("   Offset: {msg_offset}");
+                println!("   Partition: {msg_partition}");
 
                 // Verify message content
                 assert_eq!(msg_key, Some(test_key.to_string()), "Key mismatch");
@@ -89,11 +86,9 @@ pub async fn test_consumer_basic() -> TestResult {
                 break;
             }
             Some(Err(e)) => {
-                println!("⚠️  Consumer error: {}", e);
+                println!("⚠️  Consumer error: {e}");
             }
-            None => {
-                continue;
-            }
+            None => {}
         }
     }
 

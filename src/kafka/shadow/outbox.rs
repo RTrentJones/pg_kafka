@@ -13,14 +13,13 @@
 //! to dispatch, how an ack finalizes a row, the sync wait, the config-cache
 //! swap). Every SQL statement and GUC read it needs goes through [`ShadowDb`]:
 //!
-//! - [`SpiShadowDb`] is the production implementation. Its statements are the
-//!   ones `ShadowStore` used to run inline, unchanged and in the same order.
-//! - `InMemoryShadowDb` (test builds only) models the `kafka.shadow_tracking`
+//! - [`SpiShadowDb`] is the production implementation (SPI and the real GUCs).
+//! - `InMemoryShadowDb` (test builds only, in [`fake`]) models the `kafka.shadow_tracking`
 //!   outbox, the `kafka.messages` rows it points at, and `kafka.shadow_metrics`
 //!   in memory, so the claim/ack/retry/dead-letter behaviour is unit-tested.
 
 use super::config::TopicShadowConfig;
-use super::{ForwardRecord, RowKey};
+use super::{ForwardRecord, KeyColumns, RowKey};
 use crate::kafka::error::Result;
 
 /// A transactional record's outbox pointer: the row key plus the record key
@@ -28,13 +27,9 @@ use crate::kafka::error::Result;
 /// from `kafka.messages` by the forwarder.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PendingForwardRecord {
-    /// Topic ID (outbox row key + per-topic config lookup)
-    pub topic_id: i32,
-    /// Partition ID (outbox row key)
-    pub partition_id: i32,
-    /// Local offset the record was committed at (outbox row key)
-    pub offset: i64,
-    /// Record key — used only for percentage routing at enqueue time
+    /// The record's row (and future outbox row).
+    pub row: RowKey,
+    /// Record key, used only for percentage routing at enqueue time.
     pub key: Option<Vec<u8>>,
 }
 
@@ -59,29 +54,22 @@ pub struct OutboxSettings {
 
 impl Default for OutboxSettings {
     fn default() -> Self {
-        use crate::kafka::constants::*;
+        use crate::kafka::constants::{
+            DEFAULT_SHADOW_BATCH_SIZE, DEFAULT_SHADOW_MAX_RETRIES, DEFAULT_SHADOW_METRICS_ENABLED,
+            DEFAULT_SHADOW_RETRY_BACKOFF_MS, DEFAULT_SHADOW_SYNC_TIMEOUT_MS,
+        };
         Self {
-            max_retries: DEFAULT_SHADOW_MAX_RETRIES as i64,
-            retry_backoff_ms: DEFAULT_SHADOW_RETRY_BACKOFF_MS as i64,
-            batch_size: DEFAULT_SHADOW_BATCH_SIZE as i64,
+            max_retries: i64::from(DEFAULT_SHADOW_MAX_RETRIES),
+            retry_backoff_ms: i64::from(DEFAULT_SHADOW_RETRY_BACKOFF_MS),
+            batch_size: i64::from(DEFAULT_SHADOW_BATCH_SIZE),
             metrics_enabled: DEFAULT_SHADOW_METRICS_ENABLED,
-            sync_timeout_ms: DEFAULT_SHADOW_SYNC_TIMEOUT_MS as u64,
+            sync_timeout_ms: u64::try_from(DEFAULT_SHADOW_SYNC_TIMEOUT_MS).unwrap_or(0),
         }
     }
 }
 
 /// Upper bound of the outbox re-attempt backoff.
 pub const OUTBOX_MAX_BACKOFF_MS: i64 = 30_000;
-
-/// Backoff before re-attempting a row that failed `retry_count` times:
-/// `base * 2^(retry_count-1)`, capped at `max`. Zero for a row that never failed.
-pub fn retry_backoff_ms(retry_count: i64, base: i64, max: i64) -> i64 {
-    if retry_count <= 0 {
-        return 0;
-    }
-    let shift = (retry_count - 1).min(30) as u32;
-    base.saturating_mul(1i64 << shift).min(max)
-}
 
 /// Parameters of one outbox claim (see [`ShadowDb::claim_due_outbox_rows`]).
 #[derive(Clone, Debug, Default)]
@@ -90,14 +78,12 @@ pub struct OutboxClaim {
     pub batch_limit: i64,
     /// Rows with `retry_count >= max_retries` are dead letters and never claimed.
     pub max_retries: i64,
-    /// Exponential re-attempt backoff (see [`retry_backoff_ms`]).
+    /// Re-attempt backoff after a row's `n`-th failure: `base * 2^(n-1)`, at
+    /// most `max` (milliseconds).
     pub backoff_base_ms: i64,
     pub backoff_max_ms: i64,
-    /// In-flight row keys (topic ids, partition ids, offsets; parallel arrays),
-    /// excluded from the claim.
-    pub inflight_topics: Vec<i32>,
-    pub inflight_partitions: Vec<i32>,
-    pub inflight_offsets: Vec<i64>,
+    /// In-flight row keys, excluded from the claim.
+    pub inflight: KeyColumns,
 }
 
 /// What one batch of failure acks did.
@@ -124,10 +110,9 @@ pub trait ShadowDb {
     /// `retry_count >= max_retries`).
     fn topic_has_dead_letters(&self, topic_id: i32, max_retries: i64) -> Result<bool>;
 
-    /// Insert pending outbox rows `(topic_id, partition_id, local_offset)` in the
-    /// current transaction, each only if its `kafka.messages` row exists;
+    /// Insert pending outbox rows in the current transaction, each only if its `kafka.messages` row exists;
     /// existing rows are left alone.
-    fn insert_outbox_rows(&self, rows: &[(i32, i32, i64)]) -> Result<()>;
+    fn insert_outbox_rows(&self, rows: &[RowKey]) -> Result<()>;
 
     /// Count `n` records of a partition that percentage routing sampled out
     /// (`kafka.shadow_metrics.messages_skipped`), in the current transaction.
@@ -147,9 +132,9 @@ pub trait ShadowDb {
     /// The candidates of a partition are its pending rows under the retry cap
     /// whose message still exists. A candidate is *backing off* when it failed
     /// (`retry_count > 0`), has no open attempt, and its last attempt is more
-    /// recent than [`retry_backoff_ms`]. A candidate is claimed when it is not in
-    /// flight, not backing off, and no backing-off candidate of its partition has
-    /// a lower offset (so a retry is never overtaken by a later record). A row
+    /// recent than its backoff (see [`OutboxClaim`]). A candidate is claimed
+    /// when it is not in flight, not backing off, and no backing-off candidate
+    /// of its partition has a lower offset (so a retry is never overtaken by a later record). A row
     /// whose attempt is still open in the table but not in flight in this worker
     /// lost its ack (worker restart, eviction): it is claimed and that lost
     /// attempt counts as one failure. Claiming opens an attempt and stamps
@@ -188,22 +173,57 @@ pub trait ShadowDb {
     fn transaction_committed(&self, xid: u32) -> bool;
 }
 
+/// Typed reads of one `kafka.shadow_config` row, by column name.
+pub trait ConfigColumns {
+    /// Why a column could not be read.
+    type Error;
+    /// An integer column (NULL is `None`).
+    fn int(&self, column: &str) -> std::result::Result<Option<i32>, Self::Error>;
+    /// A text column (NULL is `None`).
+    fn text(&self, column: &str) -> std::result::Result<Option<String>, Self::Error>;
+}
+
+impl ConfigColumns for pgrx::spi::SpiHeapTupleData<'_> {
+    type Error = pgrx::spi::SpiError;
+
+    fn int(&self, column: &str) -> std::result::Result<Option<i32>, Self::Error> {
+        self.get_by_name(column)
+    }
+
+    fn text(&self, column: &str) -> std::result::Result<Option<String>, Self::Error> {
+        self.get_by_name(column)
+    }
+}
+
+/// One topic's configuration from its `kafka.shadow_config` row.
+///
+/// A NULL column takes its default (`mode`, `sync_mode` and `write_mode`
+/// through their `parse`). A column that cannot be read at all fails the
+/// row, so `load_topic_configs` fails and the reload keeps the previous
+/// cache instead of loading a config whose unreadable fields were guessed.
+pub fn topic_config_from_row<R: ConfigColumns>(
+    row: &R,
+) -> std::result::Result<TopicShadowConfig, R::Error> {
+    use super::config::{ShadowMode, SyncMode, WriteMode};
+    let text = |column: &str| -> std::result::Result<String, R::Error> {
+        Ok(row.text(column)?.unwrap_or_default())
+    };
+    let percentage = row.int("forward_percentage")?.unwrap_or(0);
+    Ok(TopicShadowConfig {
+        topic_id: row.int("topic_id")?.unwrap_or(0),
+        topic_name: text("name")?,
+        mode: ShadowMode::parse(&text("mode")?),
+        forward_percentage: u8::try_from(percentage.clamp(0, 100))
+            .expect("a value in 0..=100 fits in u8"),
+        external_topic_name: row.text("external_topic_name")?,
+        sync_mode: SyncMode::parse(&text("sync_mode")?),
+        write_mode: WriteMode::parse(&text("write_mode")?),
+    })
+}
+
 /// Production [`ShadowDb`]: SPI and the real GUCs.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SpiShadowDb;
-
-/// Split row keys into the parallel arrays the SQL unnests.
-fn key_arrays<'a>(keys: impl Iterator<Item = &'a RowKey>) -> (Vec<i32>, Vec<i32>, Vec<i64>) {
-    let mut t = Vec::new();
-    let mut p = Vec::new();
-    let mut o = Vec::new();
-    for k in keys {
-        t.push(k.0);
-        p.push(k.1);
-        o.push(k.2);
-    }
-    (t, p, o)
-}
 
 impl ShadowDb for SpiShadowDb {
     fn shadow_mode_enabled(&self) -> bool {
@@ -232,23 +252,23 @@ impl ShadowDb for SpiShadowDb {
         })
     }
 
-    fn insert_outbox_rows(&self, rows: &[(i32, i32, i64)]) -> Result<()> {
+    fn insert_outbox_rows(&self, rows: &[RowKey]) -> Result<()> {
         use pgrx::prelude::*;
         if rows.is_empty() {
             return Ok(());
         }
-        let (t, p, o) = key_arrays(rows.iter());
+        let keys: KeyColumns = rows.iter().collect();
         Spi::connect_mut(|client| {
-            // B1: only enqueue an outbox pointer when the backing
-            // kafka.messages row actually exists. The live-produce enqueue
-            // runs in the same subtransaction as the message insert, so the
-            // row is always visible and this is a no-op there. On the txn
-            // commit path it drops orphan pointers left by a transactional
-            // produce that buffered offsets in RAM but whose message rows were
-            // rolled back (a panic mid-txn) — which would otherwise be
-            // never-claimed, never-cleaned rows. One statement per batch; the
-            // LATERAL + LIMIT 1 keeps the check an index probe per row (an EXISTS
-            // was planned as a hash join over every message).
+            // Only enqueue an outbox pointer when the backing kafka.messages
+            // row exists. The live-produce enqueue runs in the same
+            // subtransaction as the message insert, so the row is always
+            // visible there. On the txn commit path it drops orphan pointers
+            // left by a transactional produce that buffered offsets in RAM but
+            // whose message rows were rolled back (a panic mid-txn), which
+            // would otherwise be never-claimed, never-cleaned rows. One
+            // statement per batch; the LATERAL + LIMIT 1 keeps the check an
+            // index probe per row (an EXISTS is planned as a hash join over
+            // every message).
             client.update(
                 "INSERT INTO kafka.shadow_tracking (topic_id, partition_id, local_offset) \
                  SELECT r.t, r.p, r.o \
@@ -261,7 +281,11 @@ impl ShadowDb for SpiShadowDb {
                  ) has_message \
                  ON CONFLICT (topic_id, partition_id, local_offset) DO NOTHING",
                 None,
-                &[t.into(), p.into(), o.into()],
+                &[
+                    keys.topic_ids.into(),
+                    keys.partition_ids.into(),
+                    keys.local_offsets.into(),
+                ],
             )?;
             Ok(())
         })
@@ -288,7 +312,7 @@ impl ShadowDb for SpiShadowDb {
         producer_epoch: i16,
     ) -> Option<Vec<PendingForwardRecord>> {
         use pgrx::prelude::*;
-        let result: std::result::Result<Vec<PendingForwardRecord>, pgrx::spi::SpiError> =
+        let result: std::result::Result<Vec<PendingForwardRecord>, spi::SpiError> =
             Spi::connect(|client| {
                 let table = client.select(
                     "SELECT topic_id, partition_id, partition_offset, key
@@ -301,9 +325,11 @@ impl ShadowDb for SpiShadowDb {
                 let mut records = Vec::new();
                 for row in table {
                     records.push(PendingForwardRecord {
-                        topic_id: row.get_by_name("topic_id")?.unwrap_or(0),
-                        partition_id: row.get_by_name("partition_id")?.unwrap_or(0),
-                        offset: row.get_by_name("partition_offset")?.unwrap_or(0),
+                        row: RowKey::new(
+                            row.get_by_name("topic_id")?.unwrap_or(0),
+                            row.get_by_name("partition_id")?.unwrap_or(0),
+                            row.get_by_name("partition_offset")?.unwrap_or(0),
+                        ),
                         key: row.get_by_name::<Vec<u8>, _>("key")?,
                     });
                 }
@@ -320,9 +346,15 @@ impl ShadowDb for SpiShadowDb {
 
     fn claim_due_outbox_rows(&self, claim: &OutboxClaim) -> Result<Vec<ForwardRecord>> {
         use pgrx::prelude::*;
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "backoffs are GUC-bounded milliseconds (at most a minute), exact in f64"
+        )]
+        let (backoff_base_ms, backoff_max_ms) =
+            (claim.backoff_base_ms as f64, claim.backoff_max_ms as f64);
         Spi::connect_mut(|client| {
             let table = client.update(
-                r#"
+                r"
                 WITH inf AS (
                     SELECT * FROM unnest($3::int4[], $4::int4[], $5::int8[]) AS i(t, p, o)
                 ),
@@ -378,8 +410,8 @@ impl ShadowDb for SpiShadowDb {
                     -- An attempt that is still open here lost its ack (the worker
                     -- restarted, or the in-flight entry was evicted): count it as
                     -- one failure so a forward that never answers still reaches
-                    -- the dead-letter cap (RV-10). A fresh claim counts nothing;
-                    -- real failures are counted by their ack (wave 3).
+                    -- the dead-letter cap. A fresh claim counts nothing; real
+                    -- failures are counted by their ack.
                     UPDATE kafka.shadow_tracking st
                     SET forwarded_at = NOW(),
                         attempt_open = true,
@@ -433,16 +465,16 @@ impl ShadowDb for SpiShadowDb {
                     LIMIT 1
                 ) m ON true
                 ORDER BY c.topic_id, c.partition_id, c.local_offset
-                "#,
+                ",
                 None,
                 &[
                     claim.batch_limit.into(),
                     claim.max_retries.into(),
-                    claim.inflight_topics.clone().into(),
-                    claim.inflight_partitions.clone().into(),
-                    claim.inflight_offsets.clone().into(),
-                    (claim.backoff_base_ms as f64).into(),
-                    (claim.backoff_max_ms as f64).into(),
+                    claim.inflight.topic_ids.clone().into(),
+                    claim.inflight.partition_ids.clone().into(),
+                    claim.inflight.local_offsets.clone().into(),
+                    backoff_base_ms.into(),
+                    backoff_max_ms.into(),
                 ],
             )?;
 
@@ -450,14 +482,16 @@ impl ShadowDb for SpiShadowDb {
             for row in table {
                 let headers_json: Option<String> = row.get_by_name("headers_json")?;
                 records.push(ForwardRecord {
-                    topic_id: row.get_by_name("topic_id")?.unwrap_or(0),
+                    row: RowKey::new(
+                        row.get_by_name("topic_id")?.unwrap_or(0),
+                        row.get_by_name("partition_id")?.unwrap_or(0),
+                        row.get_by_name("local_offset")?.unwrap_or(0),
+                    ),
                     topic_name: row.get_by_name("external_topic")?.unwrap_or_default(),
-                    partition_id: row.get_by_name("partition_id")?.unwrap_or(0),
                     key: row.get_by_name("msg_key")?,
                     value: row.get_by_name("msg_value")?,
                     headers: crate::kafka::storage::decode_headers_json(headers_json.as_deref()),
                     timestamp_ms: row.get_by_name("ts")?,
-                    local_offset: row.get_by_name("local_offset")?.unwrap_or(0),
                     restart: row.get_by_name("restart")?.unwrap_or(false),
                 });
             }
@@ -470,11 +504,11 @@ impl ShadowDb for SpiShadowDb {
         if rows.is_empty() {
             return Ok(0);
         }
-        let (t, p, o) = key_arrays(rows.iter().map(|(k, _)| k));
-        let x: Vec<i64> = rows.iter().map(|&(_, x)| x).collect();
-        // SH-7: the metric is bumped in the SAME statement that flips the rows,
+        let keys: KeyColumns = rows.iter().map(|(k, _)| k).collect();
+        let external_offsets: Vec<i64> = rows.iter().map(|&(_, x)| x).collect();
+        // The metric is bumped in the SAME statement that flips the rows,
         // guarded by `external_offset IS NULL`, so a duplicate ack updates
-        // nothing and counts nothing — exactly-once per row. One statement for
+        // nothing and counts nothing: exactly once per row. One statement for
         // the whole batch of acks.
         Spi::connect_mut(|client| {
             let table = client.update(
@@ -503,13 +537,19 @@ impl ShadowDb for SpiShadowDb {
                  ) \
                  SELECT COUNT(*)::int8 AS n FROM done",
                 None,
-                &[t.into(), p.into(), o.into(), x.into(), metrics.into()],
+                &[
+                    keys.topic_ids.into(),
+                    keys.partition_ids.into(),
+                    keys.local_offsets.into(),
+                    external_offsets.into(),
+                    metrics.into(),
+                ],
             )?;
             let mut n = 0i64;
             for row in table {
                 n = row.get_by_name::<i64, _>("n")?.unwrap_or(0);
             }
-            Ok(n as usize)
+            Ok(usize::try_from(n).unwrap_or(0))
         })
     }
 
@@ -523,8 +563,8 @@ impl ShadowDb for SpiShadowDb {
         if rows.is_empty() {
             return Ok(FailedApplied::default());
         }
-        let (t, p, o) = key_arrays(rows.iter().map(|(k, _)| k));
-        let e: Vec<String> = rows.iter().map(|(_, e)| e.clone()).collect();
+        let keys: KeyColumns = rows.iter().map(|(k, _)| k).collect();
+        let errors: Vec<&str> = rows.iter().map(|(_, e)| e.as_str()).collect();
         Spi::connect_mut(|client| {
             let table = client.update(
                 "WITH a AS ( \
@@ -550,15 +590,21 @@ impl ShadowDb for SpiShadowDb {
                  ) \
                  SELECT topic_id, partition_id, local_offset, retry_count, error_message FROM failed",
                 None,
-                &[t.into(), p.into(), o.into(), e.into(), metrics.into()],
+                &[
+                    keys.topic_ids.into(),
+                    keys.partition_ids.into(),
+                    keys.local_offsets.into(),
+                    errors.into(),
+                    metrics.into(),
+                ],
             )?;
             let mut out = FailedApplied::default();
             for row in table {
                 out.transitioned += 1;
                 let retry_count: i32 = row.get_by_name("retry_count")?.unwrap_or(0);
-                if retry_count as i64 >= max_retries {
+                if i64::from(retry_count) >= max_retries {
                     out.dead_lettered.push((
-                        (
+                        RowKey::new(
                             row.get_by_name("topic_id")?.unwrap_or(0),
                             row.get_by_name("partition_id")?.unwrap_or(0),
                             row.get_by_name("local_offset")?.unwrap_or(0),
@@ -576,7 +622,7 @@ impl ShadowDb for SpiShadowDb {
         if rows.is_empty() {
             return Ok(());
         }
-        let (t, p, o) = key_arrays(rows.iter());
+        let keys: KeyColumns = rows.iter().collect();
         Spi::connect_mut(|client| {
             client.update(
                 "UPDATE kafka.shadow_tracking st SET attempt_open = false \
@@ -584,72 +630,39 @@ impl ShadowDb for SpiShadowDb {
                  WHERE st.topic_id = a.t AND st.partition_id = a.p AND st.local_offset = a.o \
                    AND st.external_offset IS NULL",
                 None,
-                &[t.into(), p.into(), o.into()],
+                &[
+                    keys.topic_ids.into(),
+                    keys.partition_ids.into(),
+                    keys.local_offsets.into(),
+                ],
             )?;
             Ok(())
         })
     }
 
     fn load_topic_configs(&self) -> Option<Vec<TopicShadowConfig>> {
-        use super::config::{ShadowMode, SyncMode, WriteMode};
         use pgrx::prelude::*;
 
-        let query = r#"
-            SELECT sc.topic_id, t.name, sc.mode, sc.forward_percentage,
-                   sc.external_topic_name, sc.sync_mode,
-                   COALESCE(sc.write_mode, 'dual_write') as write_mode
-            FROM kafka.shadow_config sc
-            JOIN kafka.topics t ON sc.topic_id = t.id
-        "#;
-
-        let mut configs: Vec<TopicShadowConfig> = Vec::new();
-        let mut query_ok = false;
-
-        Spi::connect(|client| {
-            let result = client.select(query, None, &[]);
-
-            if let Ok(table) = result {
-                query_ok = true;
-                for row in table {
-                    // Use named columns for clarity and safety
-                    let topic_id: i32 = row.get_by_name("topic_id").unwrap_or(Some(0)).unwrap_or(0);
-                    let topic_name: String = row
-                        .get_by_name("name")
-                        .unwrap_or(Some(String::new()))
-                        .unwrap_or_default();
-                    let mode_str: String = row
-                        .get_by_name("mode")
-                        .unwrap_or(Some("local_only".to_string()))
-                        .unwrap_or_default();
-                    let forward_percentage: i32 = row
-                        .get_by_name("forward_percentage")
-                        .unwrap_or(Some(0))
-                        .unwrap_or(0);
-                    let external_topic_name: Option<String> =
-                        row.get_by_name("external_topic_name").unwrap_or(None);
-                    let sync_mode_str: String = row
-                        .get_by_name("sync_mode")
-                        .unwrap_or(Some("sync".to_string()))
-                        .unwrap_or_default();
-                    let write_mode_str: String = row
-                        .get_by_name("write_mode")
-                        .unwrap_or(Some("dual_write".to_string()))
-                        .unwrap_or_default();
-
-                    configs.push(TopicShadowConfig {
-                        topic_id,
-                        topic_name,
-                        mode: ShadowMode::parse(&mode_str),
-                        forward_percentage: forward_percentage.clamp(0, 100) as u8,
-                        external_topic_name,
-                        sync_mode: SyncMode::parse(&sync_mode_str),
-                        write_mode: WriteMode::parse(&write_mode_str),
-                    });
-                }
+        let result: std::result::Result<Vec<TopicShadowConfig>, spi::SpiError> =
+            Spi::connect(|client| {
+                let table = client.select(
+                    "SELECT sc.topic_id, t.name, sc.mode, sc.forward_percentage, \
+                            sc.external_topic_name, sc.sync_mode, \
+                            COALESCE(sc.write_mode, 'dual_write') AS write_mode \
+                     FROM kafka.shadow_config sc \
+                     JOIN kafka.topics t ON sc.topic_id = t.id",
+                    None,
+                    &[],
+                )?;
+                table.map(|row| topic_config_from_row(&row)).collect()
+            });
+        match result {
+            Ok(configs) => Some(configs),
+            Err(e) => {
+                tracing::warn!("Shadow: failed to read kafka.shadow_config: {e:?}");
+                None
             }
-        });
-
-        query_ok.then_some(configs)
+        }
     }
 
     fn current_transaction_id(&self) -> u32 {
@@ -670,372 +683,125 @@ impl ShadowDb for SpiShadowDb {
 }
 
 #[cfg(test)]
-pub(crate) mod fake {
-    //! In-memory [`ShadowDb`] for unit tests. It models the semantics the SPI
-    //! statements implement (see each method), with a manual clock in place of
-    //! `NOW()`.
-
-    use super::*;
-    use crate::kafka::error::KafkaError;
-    use std::collections::{BTreeMap, HashMap};
-    use std::sync::Mutex;
-
-    /// A `kafka.messages` row as far as shadow mode cares.
-    #[derive(Clone, Debug, Default)]
-    pub struct FakeMessage {
-        pub key: Option<Vec<u8>>,
-        pub value: Option<Vec<u8>>,
-        pub headers: Vec<(String, Vec<u8>)>,
-        pub timestamp_ms: Option<i64>,
-        /// `(producer_id, producer_epoch)` and whether the row is still pending.
-        pub txn: Option<(i64, i16)>,
-        pub txn_pending: bool,
-    }
-
-    /// A `kafka.shadow_tracking` row.
-    #[derive(Clone, Debug, Default, PartialEq)]
-    pub struct FakeTrackingRow {
-        pub external_offset: Option<i64>,
-        pub retry_count: i32,
-        /// Last attempt, in fake-clock ms.
-        pub forwarded_at: Option<i64>,
-        pub error_message: Option<String>,
-        pub attempt_open: bool,
-    }
-
-    /// A `kafka.shadow_metrics` row.
-    #[derive(Clone, Debug, Default, PartialEq)]
-    pub struct FakeMetrics {
-        pub messages_forwarded: i64,
-        pub messages_failed: i64,
-        pub messages_skipped: i64,
-        pub last_forwarded_offset: Option<i64>,
-    }
-
-    #[derive(Default)]
-    pub struct State {
-        pub enabled: bool,
-        pub strict: bool,
-        pub settings: OutboxSettings,
-        pub now_ms: i64,
-        /// topic_id -> local topic name
-        pub topics: HashMap<i32, String>,
-        /// topic_id -> shadow_config.external_topic_name
-        pub external_names: HashMap<i32, Option<String>>,
-        pub messages: BTreeMap<RowKey, FakeMessage>,
-        pub tracking: BTreeMap<RowKey, FakeTrackingRow>,
-        pub metrics: HashMap<(i32, i32), FakeMetrics>,
-        /// `None` makes `load_topic_configs` fail.
-        pub configs: Option<Vec<TopicShadowConfig>>,
-        /// Make `pending_txn_records` fail (None).
-        pub fail_pending_txn_lookup: bool,
-        /// Make `claim_due_outbox_rows` fail.
-        pub fail_claim: bool,
-        /// What `current_transaction_id` returns.
-        pub current_xid: u32,
-        /// Xids `transaction_committed` reports as committed.
-        pub committed_xids: std::collections::HashSet<u32>,
-    }
-
-    /// In-memory [`ShadowDb`].
-    #[derive(Default)]
-    pub struct InMemoryShadowDb {
-        pub state: Mutex<State>,
-    }
-
-    impl InMemoryShadowDb {
-        /// Shadow mode enabled, no strict, empty tables.
-        pub fn enabled() -> Self {
-            let db = Self::default();
-            db.state().enabled = true;
-            db.state().configs = Some(Vec::new());
-            db
-        }
-
-        pub fn state(&self) -> std::sync::MutexGuard<'_, State> {
-            self.state.lock().unwrap()
-        }
-
-        pub fn add_topic(&self, topic_id: i32, name: &str, external_name: Option<&str>) {
-            let mut s = self.state();
-            s.topics.insert(topic_id, name.to_string());
-            s.external_names
-                .insert(topic_id, external_name.map(str::to_string));
-        }
-
-        pub fn add_message(&self, key: RowKey, record_key: &[u8], value: &[u8]) {
-            self.state().messages.insert(
-                key,
-                FakeMessage {
-                    key: Some(record_key.to_vec()),
-                    value: Some(value.to_vec()),
-                    ..Default::default()
-                },
-            );
-        }
-
-        pub fn row(&self, key: RowKey) -> Option<FakeTrackingRow> {
-            self.state().tracking.get(&key).cloned()
-        }
-
-        pub fn advance_ms(&self, ms: i64) {
-            self.state().now_ms += ms;
-        }
-    }
-
-    impl ShadowDb for InMemoryShadowDb {
-        fn shadow_mode_enabled(&self) -> bool {
-            self.state().enabled
-        }
-
-        fn external_primary_strict(&self) -> bool {
-            self.state().strict
-        }
-
-        fn settings(&self) -> OutboxSettings {
-            self.state().settings.clone()
-        }
-
-        fn topic_has_dead_letters(&self, topic_id: i32, max_retries: i64) -> Result<bool> {
-            Ok(self.state().tracking.iter().any(|(k, r)| {
-                k.0 == topic_id
-                    && r.external_offset.is_none()
-                    && r.retry_count as i64 >= max_retries
-            }))
-        }
-
-        fn insert_outbox_rows(&self, rows: &[(i32, i32, i64)]) -> Result<()> {
-            let mut s = self.state();
-            for &key in rows {
-                if s.messages.contains_key(&key) {
-                    s.tracking.entry(key).or_default();
-                }
-            }
-            Ok(())
-        }
-
-        fn record_skipped(&self, topic_id: i32, partition_id: i32, n: i64) -> Result<()> {
-            self.state()
-                .metrics
-                .entry((topic_id, partition_id))
-                .or_default()
-                .messages_skipped += n;
-            Ok(())
-        }
-
-        fn pending_txn_records(
-            &self,
-            producer_id: i64,
-            producer_epoch: i16,
-        ) -> Option<Vec<PendingForwardRecord>> {
-            let s = self.state();
-            if s.fail_pending_txn_lookup {
-                return None;
-            }
-            Some(
-                s.messages
-                    .iter()
-                    .filter(|(_, m)| m.txn == Some((producer_id, producer_epoch)) && m.txn_pending)
-                    .map(|(&(t, p, o), m)| PendingForwardRecord {
-                        topic_id: t,
-                        partition_id: p,
-                        offset: o,
-                        key: m.key.clone(),
-                    })
-                    .collect(),
-            )
-        }
-
-        fn claim_due_outbox_rows(&self, claim: &OutboxClaim) -> Result<Vec<ForwardRecord>> {
-            let mut s = self.state();
-            if s.fail_claim {
-                return Err(KafkaError::Internal("claim failed".to_string()));
-            }
-            let now = s.now_ms;
-            let inflight: std::collections::HashSet<RowKey> = claim
-                .inflight_topics
-                .iter()
-                .zip(&claim.inflight_partitions)
-                .zip(&claim.inflight_offsets)
-                .map(|((&t, &p), &o)| (t, p, o))
-                .collect();
-            // cand: pending, under the cap, message exists (BTreeMap = key order).
-            struct Cand {
-                key: RowKey,
-                in_flight: bool,
-                backing_off: bool,
-            }
-            let cands: Vec<Cand> = s
-                .tracking
-                .iter()
-                .filter(|(k, r)| {
-                    r.external_offset.is_none()
-                        && (r.retry_count as i64) < claim.max_retries
-                        && s.messages.contains_key(k)
-                })
-                .map(|(k, r)| Cand {
-                    key: *k,
-                    in_flight: inflight.contains(k),
-                    backing_off: !r.attempt_open
-                        && r.retry_count > 0
-                        && r.forwarded_at.is_some_and(|at| {
-                            at > now
-                                - retry_backoff_ms(
-                                    r.retry_count as i64,
-                                    claim.backoff_base_ms,
-                                    claim.backoff_max_ms,
-                                )
-                        }),
-                })
-                .collect();
-            let mut head: HashMap<(i32, i32), i64> = HashMap::new();
-            let mut blocked: HashMap<(i32, i32), i64> = HashMap::new();
-            for c in &cands {
-                let part = (c.key.0, c.key.1);
-                head.entry(part).or_insert(c.key.2);
-                if c.backing_off && !c.in_flight {
-                    blocked.entry(part).or_insert(c.key.2);
-                }
-            }
-            let due: Vec<(RowKey, bool)> = cands
-                .iter()
-                .filter(|c| {
-                    !c.in_flight
-                        && !c.backing_off
-                        && blocked
-                            .get(&(c.key.0, c.key.1))
-                            .is_none_or(|&b| c.key.2 < b)
-                })
-                .map(|c| (c.key, head[&(c.key.0, c.key.1)] == c.key.2))
-                .take(claim.batch_limit.max(0) as usize)
-                .collect();
-            let mut out = Vec::new();
-            for (key, restart) in due {
-                let row = s.tracking.get_mut(&key).unwrap();
-                if row.attempt_open {
-                    row.retry_count += 1;
-                }
-                row.attempt_open = true;
-                row.forwarded_at = Some(now);
-                let Some(topic_name) = s.topics.get(&key.0).cloned() else {
-                    continue; // JOIN kafka.topics drops it
-                };
-                let external = s
-                    .external_names
-                    .get(&key.0)
-                    .cloned()
-                    .flatten()
-                    .unwrap_or(topic_name);
-                let m = &s.messages[&key];
-                out.push(ForwardRecord {
-                    topic_id: key.0,
-                    topic_name: external,
-                    partition_id: key.1,
-                    key: m.key.clone(),
-                    value: m.value.clone(),
-                    headers: m.headers.clone(),
-                    timestamp_ms: m.timestamp_ms,
-                    local_offset: key.2,
-                    restart,
-                });
-            }
-            Ok(out)
-        }
-
-        fn apply_delivered(&self, rows: &[(RowKey, i64)], metrics: bool) -> Result<usize> {
-            let mut s = self.state();
-            let now = s.now_ms;
-            let mut n = 0;
-            for &(key, external_offset) in rows {
-                let Some(row) = s.tracking.get_mut(&key) else {
-                    continue;
-                };
-                if row.external_offset.is_some() {
-                    continue;
-                }
-                row.external_offset = Some(external_offset);
-                row.forwarded_at = Some(now);
-                row.error_message = None;
-                row.attempt_open = false;
-                n += 1;
-                if metrics {
-                    let m = s.metrics.entry((key.0, key.1)).or_default();
-                    m.messages_forwarded += 1;
-                    m.last_forwarded_offset =
-                        Some(m.last_forwarded_offset.unwrap_or(i64::MIN).max(key.2));
-                }
-            }
-            Ok(n)
-        }
-
-        fn apply_failed(
-            &self,
-            rows: &[(RowKey, String)],
-            max_retries: i64,
-            metrics: bool,
-        ) -> Result<FailedApplied> {
-            let mut s = self.state();
-            let now = s.now_ms;
-            let mut out = FailedApplied::default();
-            for (key, error) in rows {
-                let Some(row) = s.tracking.get_mut(key) else {
-                    continue;
-                };
-                if row.external_offset.is_some() {
-                    continue;
-                }
-                row.retry_count += 1;
-                row.error_message = Some(error.clone());
-                row.forwarded_at = Some(now);
-                row.attempt_open = false;
-                out.transitioned += 1;
-                if row.retry_count as i64 >= max_retries {
-                    out.dead_lettered.push((*key, error.clone()));
-                }
-                if metrics {
-                    s.metrics.entry((key.0, key.1)).or_default().messages_failed += 1;
-                }
-            }
-            Ok(out)
-        }
-
-        fn apply_not_attempted(&self, rows: &[RowKey]) -> Result<()> {
-            let mut s = self.state();
-            for key in rows {
-                if let Some(row) = s.tracking.get_mut(key) {
-                    if row.external_offset.is_none() {
-                        row.attempt_open = false;
-                    }
-                }
-            }
-            Ok(())
-        }
-
-        fn load_topic_configs(&self) -> Option<Vec<TopicShadowConfig>> {
-            self.state().configs.clone()
-        }
-
-        fn current_transaction_id(&self) -> u32 {
-            self.state().current_xid
-        }
-
-        fn transaction_committed(&self, xid: u32) -> bool {
-            xid != 0 && self.state().committed_xids.contains(&xid)
-        }
-    }
-}
+pub(crate) mod fake;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kafka::shadow::config::{ShadowMode, SyncMode, WriteMode};
+    use std::collections::HashMap;
+
+    /// A config row: a column is a value, NULL, or unreadable (`Err`).
+    #[derive(Default)]
+    struct Row(HashMap<&'static str, std::result::Result<Option<String>, ()>>);
+
+    impl Row {
+        fn full() -> Self {
+            let mut row = Self::default();
+            for (column, value) in [
+                ("topic_id", "7"),
+                ("name", "orders"),
+                ("mode", "shadow"),
+                ("forward_percentage", "40"),
+                ("external_topic_name", "prod-orders"),
+                ("sync_mode", "sync"),
+                ("write_mode", "external_only"),
+            ] {
+                row.0.insert(column, Ok(Some(value.to_string())));
+            }
+            row
+        }
+
+        fn with(
+            mut self,
+            column: &'static str,
+            value: std::result::Result<Option<&str>, ()>,
+        ) -> Self {
+            self.0.insert(column, value.map(|v| v.map(str::to_string)));
+            self
+        }
+    }
+
+    impl ConfigColumns for Row {
+        type Error = String;
+
+        fn int(&self, column: &str) -> std::result::Result<Option<i32>, String> {
+            self.text(column)?
+                .map(|v| v.parse().map_err(|_| format!("{column}: not an int")))
+                .transpose()
+        }
+
+        fn text(&self, column: &str) -> std::result::Result<Option<String>, String> {
+            match self.0.get(column) {
+                Some(Ok(value)) => Ok(value.clone()),
+                Some(Err(())) | None => Err(format!("{column}: unreadable")),
+            }
+        }
+    }
 
     #[test]
-    fn backoff_doubles_from_the_base_and_is_capped() {
-        assert_eq!(retry_backoff_ms(0, 100, 30_000), 0);
-        assert_eq!(retry_backoff_ms(1, 100, 30_000), 100);
-        assert_eq!(retry_backoff_ms(2, 100, 30_000), 200);
-        assert_eq!(retry_backoff_ms(4, 100, 30_000), 800);
-        assert_eq!(retry_backoff_ms(20, 100, 30_000), 30_000);
-        assert_eq!(retry_backoff_ms(1000, 60_000, 30_000), 30_000);
+    fn test_topic_config_from_a_full_row() {
+        let config = topic_config_from_row(&Row::full()).unwrap();
+        assert_eq!(config.topic_id, 7);
+        assert_eq!(config.topic_name, "orders");
+        assert_eq!(config.mode, ShadowMode::Shadow);
+        assert_eq!(config.forward_percentage, 40);
+        assert_eq!(config.external_topic_name.as_deref(), Some("prod-orders"));
+        assert_eq!(config.sync_mode, SyncMode::Sync);
+        assert_eq!(config.write_mode, WriteMode::ExternalOnly);
+    }
+
+    #[test]
+    fn test_topic_config_null_columns_take_their_defaults() {
+        let mut row = Row::default();
+        for column in [
+            "topic_id",
+            "name",
+            "mode",
+            "forward_percentage",
+            "external_topic_name",
+            "sync_mode",
+            "write_mode",
+        ] {
+            row = row.with(column, Ok(None));
+        }
+        let config = topic_config_from_row(&row).unwrap();
+        assert_eq!(config.topic_id, 0);
+        assert_eq!(config.topic_name, "");
+        assert_eq!(config.mode, ShadowMode::LocalOnly);
+        assert_eq!(config.forward_percentage, 0);
+        assert_eq!(config.external_topic_name, None);
+        assert_eq!(config.sync_mode, SyncMode::Async);
+        assert_eq!(config.write_mode, WriteMode::DualWrite);
+    }
+
+    #[test]
+    fn test_topic_config_percentage_is_clamped() {
+        for (stored, expected) in [("-5", 0), ("0", 0), ("100", 100), ("250", 100)] {
+            let row = Row::full().with("forward_percentage", Ok(Some(stored)));
+            assert_eq!(
+                topic_config_from_row(&row).unwrap().forward_percentage,
+                expected,
+                "{stored}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_topic_config_unreadable_column_fails_the_row() {
+        // Each column, unreadable, fails the whole row rather than defaulting:
+        // load_topic_configs then fails and the previous cache stays.
+        for column in [
+            "topic_id",
+            "name",
+            "mode",
+            "forward_percentage",
+            "external_topic_name",
+            "sync_mode",
+            "write_mode",
+        ] {
+            let row = Row::full().with(column, Err(()));
+            assert!(topic_config_from_row(&row).is_err(), "{column}");
+        }
     }
 }

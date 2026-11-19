@@ -29,6 +29,7 @@
 //! | `api-table` | the README table (key order) |
 
 use super::*;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 /// The "~50 standard Kafka APIs" the coverage figures are quoted against (the client-facing
@@ -111,20 +112,21 @@ fn render_table() -> String {
          |-----|-----|----------|-----------|-------------|\n",
     );
     for a in apis {
-        let desc = DESCRIPTIONS
-            .iter()
-            .find(|(n, _)| *n == a.name)
-            .map(|(_, d)| *d)
-            .unwrap_or_else(|| panic!("no README description for API {}", a.name));
+        let desc = DESCRIPTIONS.iter().find(|(n, _)| *n == a.name).map_or_else(
+            || panic!("no README description for API {}", a.name),
+            |(_, d)| *d,
+        );
         let served = match a.served_by {
             ServedBy::Worker(Lane::Main) => "DB thread",
             ServedBy::Worker(Lane::Liveness) => "DB thread (liveness lane)",
             ServedBy::NetworkThread => "network thread",
         };
-        out.push_str(&format!(
-            "| {} | {} | {}-{} | {} | {} |\n",
-            a.name, a.key, a.min_version, a.max_version, served, desc
-        ));
+        writeln!(
+            out,
+            "| {} | {} | {}-{} | {served} | {desc} |",
+            a.name, a.key, a.min_version, a.max_version
+        )
+        .expect("writing to a String cannot fail");
     }
     out
 }
@@ -257,9 +259,13 @@ fn regenerate_rewrites_only_owned_regions() {
 
 #[test]
 fn regenerate_reports_bad_markers() {
-    assert!(!regenerate("<!--gen:api-versions:NoSuchApi-->x<!--/gen-->")
-        .1
-        .is_empty());
-    assert!(!regenerate("<!--gen:api-bogus-->x<!--/gen-->").1.is_empty());
-    assert!(!regenerate("<!--gen:api-count-->x").1.is_empty());
+    assert_ne!(
+        regenerate("<!--gen:api-versions:NoSuchApi-->x<!--/gen-->").1,
+        [] as [String; 0]
+    );
+    assert_ne!(
+        regenerate("<!--gen:api-bogus-->x<!--/gen-->").1,
+        [] as [String; 0]
+    );
+    assert_ne!(regenerate("<!--gen:api-count-->x").1, [] as [String; 0]);
 }

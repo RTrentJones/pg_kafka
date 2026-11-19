@@ -1,10 +1,9 @@
 //! `PostgresStore`'s storage roles.
 //!
-//! The SQL lives in one inherent `impl PostgresStore` block in `postgres.rs` whose methods
-//! carry the role methods' names. Each role here forwards to them wholesale, so the role
-//! split did not have to move any SQL. A child module can call those private inherent
-//! methods; `PostgresStore::name(self, ...)` resolves to the inherent method, not back to
-//! the trait.
+//! The SQL lives in associated functions of `PostgresStore` (one submodule per role)
+//! that carry the role methods' names; each role here forwards to them wholesale.
+//! `PostgresStore::name(...)` resolves to the associated function, not back to the
+//! trait method.
 
 use super::PostgresStore;
 use crate::kafka::storage::{
@@ -12,25 +11,25 @@ use crate::kafka::storage::{
 };
 
 impl TopicStore for PostgresStore {
-    crate::kafka::storage::delegate_topic_store!(PostgresStore);
+    crate::kafka::storage::delegate_topic_store!(assoc PostgresStore);
 }
 
 impl LogStore for PostgresStore {
-    crate::kafka::storage::delegate_log_store!(PostgresStore);
+    crate::kafka::storage::delegate_log_store!(assoc PostgresStore);
 }
 
 impl OffsetStore for PostgresStore {
-    crate::kafka::storage::delegate_offset_store!(PostgresStore);
+    crate::kafka::storage::delegate_offset_store!(assoc PostgresStore);
 }
 
 impl ProducerStore for PostgresStore {
-    crate::kafka::storage::delegate_producer_store!(PostgresStore);
+    crate::kafka::storage::delegate_producer_store!(assoc PostgresStore);
 }
 
 impl TransactionStore for PostgresStore {
-    crate::kafka::storage::delegate_transaction_store!(PostgresStore);
+    crate::kafka::storage::delegate_transaction_store!(assoc PostgresStore);
 }
 
 impl MaintenanceStore for PostgresStore {
-    crate::kafka::storage::delegate_maintenance_store!(PostgresStore);
+    crate::kafka::storage::delegate_maintenance_store!(assoc PostgresStore);
 }

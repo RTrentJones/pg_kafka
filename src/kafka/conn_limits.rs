@@ -1,4 +1,4 @@
-//! Connection limits of the network edge (wave 3, stream `net`): per-listener and
+//! Connection limits of the network edge: per-listener and
 //! per-IP connection caps, and a per-IP rate limit on pre-authentication credential
 //! lookups. Pure logic (no I/O, no pgrx), shared by the accept loops on the network
 //! thread; the settings come from GUCs read when the worker starts
@@ -24,7 +24,11 @@ pub const MAX_CONNECTIONS_LIMIT: i32 = 100_000;
 /// second, sustained.
 pub const SASL_LOOKUPS_PER_IP_PER_SEC: f64 = 10.0;
 /// Burst of credential lookups one IP address may start at once.
-pub const SASL_LOOKUP_BURST: f64 = 20.0;
+pub const SASL_LOOKUP_BURST_COUNT: u16 = 20;
+/// [`SASL_LOOKUP_BURST_COUNT`] as a token count (`f64::from` is not usable in a const).
+pub const SASL_LOOKUP_BURST: f64 = SASL_LOOKUP_BURST_COUNT as f64;
+/// Shortest idle timeout or request read deadline, in milliseconds.
+const MIN_TIMEOUT_MS: i32 = 100;
 /// Entries kept in the per-IP table before idle ones are swept.
 const SWEEP_THRESHOLD: usize = 4096;
 
@@ -62,10 +66,14 @@ impl NetworkLimits {
         connections_max_idle_ms: i32,
         request_read_timeout_ms: i32,
     ) -> Self {
-        let ms = |v: i32| Duration::from_millis(v.max(100) as u64);
+        // Both clamps keep the value positive, so the conversions cannot fail.
+        let ms = |v: i32| {
+            Duration::from_millis(u64::try_from(v.max(MIN_TIMEOUT_MS)).unwrap_or(u64::MAX))
+        };
+        let count = |v: i32| usize::try_from(v.clamp(1, MAX_CONNECTIONS_LIMIT)).unwrap_or(1);
         NetworkLimits {
-            max_connections: max_connections.clamp(1, MAX_CONNECTIONS_LIMIT) as usize,
-            max_connections_per_ip: max_connections_per_ip.clamp(1, MAX_CONNECTIONS_LIMIT) as usize,
+            max_connections: count(max_connections),
+            max_connections_per_ip: count(max_connections_per_ip),
             connections_max_idle: ms(connections_max_idle_ms),
             request_read_timeout: ms(request_read_timeout_ms),
         }
@@ -153,7 +161,9 @@ impl IpTracker {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<IpAddr, IpEntry>> {
         // The critical sections cannot panic; recover from poisoning anyway.
-        self.entries.lock().unwrap_or_else(|p| p.into_inner())
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Admit a new connection from `ip`, or `None` when the IP is at its cap.
@@ -175,12 +185,14 @@ impl IpTracker {
     }
 
     /// Live connections of `ip`.
-    pub fn connections(&self, ip: IpAddr) -> usize {
-        self.lock().get(&ip).map(|e| e.connections).unwrap_or(0)
+    #[cfg(test)]
+    fn connections(&self, ip: IpAddr) -> usize {
+        self.lock().get(&ip).map_or(0, |e| e.connections)
     }
 
-    /// Entries in the table (tests).
-    pub fn tracked(&self) -> usize {
+    /// Entries in the table.
+    #[cfg(test)]
+    fn tracked(&self) -> usize {
         self.lock().len()
     }
 
@@ -263,7 +275,7 @@ mod tests {
         let t = IpTracker::new(4);
         let a = ip("192.0.2.7");
         let now = Instant::now();
-        for _ in 0..SASL_LOOKUP_BURST as usize {
+        for _ in 0..SASL_LOOKUP_BURST_COUNT {
             let p = t.try_open(a).unwrap();
             assert_eq!(t.admit_lookup_at(a, now), LookupAdmission::Now);
             drop(p);
@@ -274,7 +286,7 @@ mod tests {
                 assert!(
                     d > Duration::ZERO && d <= Duration::from_millis(101),
                     "{d:?}"
-                )
+                );
             }
             other => panic!("{other:?}"),
         }
@@ -286,14 +298,14 @@ mod tests {
         let a = ip("198.51.100.1");
         let now = Instant::now();
         let mut waits = Vec::new();
-        for _ in 0..(2 * SASL_LOOKUP_BURST as usize) {
+        for _ in 0..(2 * SASL_LOOKUP_BURST_COUNT) {
             match t.admit_lookup_at(a, now) {
                 LookupAdmission::Now => {}
                 LookupAdmission::After(d) => waits.push(d),
                 LookupAdmission::Refused => panic!("refused too early"),
             }
         }
-        assert_eq!(waits.len(), SASL_LOOKUP_BURST as usize);
+        assert_eq!(waits.len(), usize::from(SASL_LOOKUP_BURST_COUNT));
         assert!(
             waits.windows(2).all(|w| w[0] < w[1]),
             "queued lookups wait longer"
