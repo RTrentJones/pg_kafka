@@ -7,60 +7,45 @@
 //
 // GitHub Sponsors: https://github.com/sponsors/RTrentJones
 
-//! Shared routing utilities for shadow mode
+//! Percentage routing: which records of a forwarding topic go to the external
+//! cluster.
 //!
-//! Provides deterministic routing hash computation and forward decision logic
-//! used by ShadowStore (both the live produce path and the outbox poll).
+//! The decision is a deterministic function of the record: the Kafka murmur2
+//! hash of its key, or its local offset when it has no key. So the same key
+//! always routes the same way, raising the percentage only adds keys, and no
+//! state is shared between the produce path and the transaction-commit path
+//! that both decide.
 
-use super::forwarder::ForwardDecision;
 use murmur2::murmur2;
 
-/// Kafka-compatible murmur2 seed (same as Kafka's DefaultPartitioner)
-const KAFKA_SEED: u32 = 0x9747b28c;
+/// Kafka-compatible murmur2 seed (the Java client's default partitioner).
+const KAFKA_SEED: u32 = 0x9747_b28c;
 
-/// Compute a deterministic routing hash for percentage-based forwarding
+/// Whether one record is forwarded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForwardDecision {
+    /// Forward the record to the external cluster.
+    Forward,
+    /// Sampled out: the record stays local only.
+    Skip,
+}
+
+/// The routing hash of a record, compared against the percentage bucket.
 ///
-/// Uses murmur2 hash (same as Kafka partitioner) to ensure consistent routing.
-/// If no key is provided or key is empty, uses the offset for deterministic routing.
-///
-/// # Arguments
-/// * `key` - Optional message key (if Some and non-empty, used for hash-based routing)
-/// * `offset` - Fallback value when key is None or empty
-///
-/// # Returns
-/// A hash value suitable for modulo-based bucket selection
-///
-/// # Note on empty key handling
-/// Empty keys (`Some(&[])`) are treated as "no key" and fall back to offset routing.
-/// This matches the semantics where empty keys typically indicate the producer
-/// did not intend to use keyed routing.
-pub fn compute_routing_hash(key: Option<&[u8]>, offset: i64) -> u32 {
+/// A non-empty key is hashed with murmur2 (as Kafka's partitioner does). A
+/// record without a key, or with an empty one (a producer that did not mean to
+/// key it), is routed by its local offset instead, so the decision stays
+/// deterministic.
+fn compute_routing_hash(key: Option<&[u8]>, offset: i64) -> u32 {
     match key {
         Some(k) if !k.is_empty() => murmur2(k, KAFKA_SEED),
-        _ => {
-            // Use offset for deterministic routing when no key is provided.
-            // Use unsigned_abs() to handle negative offsets consistently,
-            // then mod 100 to keep in percentage range.
-            (offset.unsigned_abs() % 100) as u32
-        }
+        _ => u32::try_from(offset.unsigned_abs() % 100).expect("a value below 100 fits in u32"),
     }
 }
 
-/// Make a forward decision based on routing hash and percentage threshold
-///
-/// # Arguments
-/// * `key` - Optional message key for routing
-/// * `offset` - Message offset (used for routing when key is None/empty)
-/// * `forward_percentage` - Percentage of messages to forward (0-100)
-///
-/// # Returns
-/// `ForwardDecision::Forward` if message should be forwarded
-/// `ForwardDecision::Skip` if message should be skipped
-///
-/// # Behavior
-/// - 0%: Always skip
-/// - 100%: Always forward
-/// - 1-99%: Use deterministic hash to decide
+/// Decide whether a record is forwarded at `forward_percentage` (0-100;
+/// anything above 100 forwards everything): 0 skips everything, 100 forwards
+/// everything, and in between the routing hash picks a stable subset.
 pub fn make_forward_decision(
     key: Option<&[u8]>,
     offset: i64,
@@ -72,11 +57,7 @@ pub fn make_forward_decision(
     if forward_percentage >= 100 {
         return ForwardDecision::Forward;
     }
-
-    let hash = compute_routing_hash(key, offset);
-    let bucket = hash % 100;
-
-    if bucket < forward_percentage as u32 {
+    if compute_routing_hash(key, offset) % 100 < u32::from(forward_percentage) {
         ForwardDecision::Forward
     } else {
         ForwardDecision::Skip
@@ -136,6 +117,15 @@ mod tests {
     }
 
     #[test]
+    fn test_forward_decision_variants_are_distinct_and_named() {
+        assert_eq!(ForwardDecision::Forward, ForwardDecision::Forward);
+        assert_eq!(ForwardDecision::Skip, ForwardDecision::Skip);
+        assert_ne!(ForwardDecision::Forward, ForwardDecision::Skip);
+        assert_eq!(format!("{:?}", ForwardDecision::Forward), "Forward");
+        assert_eq!(format!("{:?}", ForwardDecision::Skip), "Skip");
+    }
+
+    #[test]
     fn test_make_forward_decision_boundaries() {
         // 0% - always skip
         assert_eq!(
@@ -180,8 +170,7 @@ mod tests {
         // Allow variance (20% to 40% range)
         assert!(
             (200..=400).contains(&forward_count),
-            "Forward count {} should be roughly 30%",
-            forward_count
+            "Forward count {forward_count} should be roughly 30%"
         );
     }
 }

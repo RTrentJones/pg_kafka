@@ -69,10 +69,10 @@ pub fn is_primary() -> bool {
     true
 }
 
-/// Cached primary status to avoid repeated SPI calls
-///
-/// The recovery state doesn't change during a session (a standby doesn't
-/// suddenly become primary), so we can cache the result.
+/// The cached result of [`is_primary`], so a produce does not cost an SPI
+/// call. The recovery state changes only on a promotion, so the worker calls
+/// [`PrimaryStatus::refresh`] on every config reload instead of re-checking per
+/// produce.
 pub struct PrimaryStatus {
     /// Cached result of is_primary() check
     is_primary: Option<bool>,
@@ -97,15 +97,14 @@ impl PrimaryStatus {
         result
     }
 
-    /// Force a refresh of the primary status
-    ///
-    /// Useful if the application suspects a failover occurred.
+    /// Re-check the primary status (picks up a promotion).
     pub fn refresh(&mut self) -> bool {
         self.is_primary = None;
         self.check()
     }
 
-    /// Check if status has been cached
+    /// Whether a result is cached.
+    #[cfg(test)]
     pub fn is_cached(&self) -> bool {
         self.is_primary.is_some()
     }
@@ -151,9 +150,13 @@ mod tests {
         status.check();
         assert!(status.is_cached());
 
-        // Refresh clears and re-checks
-        status.refresh();
+        // Refresh clears and re-checks; it returns the fresh result, and later
+        // checks return the same cached value.
+        let refreshed = status.refresh();
+        assert!(refreshed, "the test build's is_primary() is always true");
         assert!(status.is_cached()); // Re-cached after refresh
+        assert_eq!(status.check(), refreshed);
+        assert_eq!(status.check(), refreshed);
     }
 
     #[test]
