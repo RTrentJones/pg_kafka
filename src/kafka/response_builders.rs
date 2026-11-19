@@ -1,19 +1,32 @@
-// Response builder utilities for kafka-protocol types
-//
-// This module provides helper functions to construct kafka-protocol response types.
-// By centralizing this logic, we keep worker.rs clean and focused on business logic.
+//! Builders for kafka-protocol response values the handlers and the API registry share:
+//! the ApiVersions list, Metadata pieces, and the error responses of the APIs whose error
+//! lives in a top-level field.
+//!
+//! The full error response of every API (echoing requested topics/partitions/groups where
+//! the response has no top-level code) is `KafkaApi::error_response` in
+//! `crate::kafka::api`.
 
 use kafka_protocol::messages::api_versions_response::{ApiVersion, ApiVersionsResponse};
+use kafka_protocol::messages::find_coordinator_response::FindCoordinatorResponse;
+use kafka_protocol::messages::heartbeat_response::HeartbeatResponse;
+use kafka_protocol::messages::init_producer_id_response::InitProducerIdResponse;
+use kafka_protocol::messages::join_group_response::JoinGroupResponse;
+use kafka_protocol::messages::leave_group_response::LeaveGroupResponse;
+use kafka_protocol::messages::list_groups_response::ListGroupsResponse;
 use kafka_protocol::messages::metadata_response::{
-    MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic,
+    MetadataResponse, MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic,
 };
-use kafka_protocol::messages::produce_response::ProduceResponse;
-use kafka_protocol::messages::{BrokerId, TopicName};
+use kafka_protocol::messages::produce_response::{
+    PartitionProduceResponse, ProduceResponse, TopicProduceResponse,
+};
+use kafka_protocol::messages::sync_group_response::SyncGroupResponse;
+use kafka_protocol::messages::{BrokerId, ProducerId, TopicName};
 
-use super::constants::ERROR_NONE;
+use crate::kafka::constants::ERROR_NONE;
+use crate::kafka::messages::TopicProduceData;
 
 /// Build an ApiVersionsResponse advertising every registered API (`crate::kafka::api::APIS`)
-/// with its supported version range. The same ranges are enforced on decode (CONF-6), so
+/// with its supported version range. The same ranges are enforced on decode, so
 /// pg_kafka never accepts a version it does not advertise. The minimums follow the
 /// kafka-protocol crate (it cannot decode or encode Fetch v0-3, ListOffsets v0,
 /// OffsetCommit v0-1, OffsetFetch v0, CreateTopics v0-1, DeleteTopics v0 or
@@ -82,9 +95,8 @@ pub fn build_produce_response() -> ProduceResponse {
 }
 
 /// Build an error MetadataResponse for protocol-level errors
-pub fn build_metadata_error_response(
-) -> kafka_protocol::messages::metadata_response::MetadataResponse {
-    let mut response = kafka_protocol::messages::metadata_response::MetadataResponse::default();
+pub fn build_metadata_error_response() -> MetadataResponse {
+    let mut response = MetadataResponse::default();
     response.throttle_time_ms = 0;
     response.cluster_id = None;
     response.controller_id = BrokerId(-1);
@@ -92,27 +104,13 @@ pub fn build_metadata_error_response(
     response
 }
 
-// ========== Error Response Builders ==========
-// Builders for the APIs whose error lives in a top-level field. The full error
-// response of every API (echoing requested topics/partitions/groups where the
-// response has no top-level code) is `KafkaApi::error_response` in `crate::kafka::api`.
-
-use kafka_protocol::messages::find_coordinator_response::FindCoordinatorResponse;
-use kafka_protocol::messages::heartbeat_response::HeartbeatResponse;
-use kafka_protocol::messages::init_producer_id_response::InitProducerIdResponse;
-use kafka_protocol::messages::join_group_response::JoinGroupResponse;
-use kafka_protocol::messages::leave_group_response::LeaveGroupResponse;
-use kafka_protocol::messages::list_groups_response::ListGroupsResponse;
-use kafka_protocol::messages::sync_group_response::SyncGroupResponse;
+// ========== Error responses ==========
 
 /// A ProduceResponse reporting `error_code` on every requested partition.
 pub fn build_produce_partition_error_response(
-    topic_data: &[crate::kafka::messages::TopicProduceData],
+    topic_data: &[TopicProduceData],
     error_code: i16,
 ) -> ProduceResponse {
-    use kafka_protocol::messages::produce_response::{
-        PartitionProduceResponse, TopicProduceResponse,
-    };
     let mut response = build_produce_response();
     for topic in topic_data {
         let mut t = TopicProduceResponse::default();
@@ -187,9 +185,8 @@ pub fn build_list_groups_error_response(error_code: i16) -> ListGroupsResponse {
     response
 }
 
-/// Build an InitProducerIdResponse with an error code (Phase 9)
+/// Build an InitProducerIdResponse with an error code
 pub fn build_init_producer_id_error_response(error_code: i16) -> InitProducerIdResponse {
-    use kafka_protocol::messages::ProducerId;
     let mut response = InitProducerIdResponse::default();
     response.throttle_time_ms = 0;
     response.error_code = error_code;
@@ -372,10 +369,7 @@ mod tests {
         let response = build_produce_response();
 
         assert_eq!(response.throttle_time_ms, 0);
-        assert_eq!(
-            response.responses,
-            [] as [kafka_protocol::messages::produce_response::TopicProduceResponse; 0]
-        );
+        assert_eq!(response.responses, [] as [TopicProduceResponse; 0]);
     }
 
     // ========== Coordinator Response Tests ==========

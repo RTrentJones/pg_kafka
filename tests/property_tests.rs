@@ -44,7 +44,7 @@ mod property_tests {
         }
 
         #[test]
-        fn test_size_field_encoding(size in 1i32..1000000i32) {
+        fn test_size_field_encoding(size in 1i32..1_000_000_i32) {
             // Property: Size fields should round-trip correctly
             let size_bytes = size.to_be_bytes();
             let decoded_size = i32::from_be_bytes(size_bytes);
