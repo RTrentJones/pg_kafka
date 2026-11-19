@@ -431,47 +431,32 @@ pub fn handle_fetch_with_max_bytes(
             };
 
             // Convert database records to Kafka RecordBatch format: one batch per run of
-            // consecutive offsets of one producer (wave 3; was one batch per record).
-            let records_bytes = if !db_records.is_empty() {
-                match encode_record_batches(db_records, compression) {
-                    Ok(bytes) => Some(bytes),
-                    Err(e) => {
-                        // On error, return empty bytes to avoid protocol errors
-                        crate::pg_warning!(
-                            "Failed to encode RecordBatch for topic_id={}, partition={}: {}",
-                            topic_id,
-                            partition_id,
-                            e
-                        );
-                        Some(bytes::Bytes::new())
-                    }
-                }
+            // consecutive offsets of one producer.
+            let records = if !db_records.is_empty() {
+                encode_record_batches(db_records, compression)
             } else if storage_empty {
-                // Wave 3: nothing visible from fetch_offset up to the readable end. With
-                // offsets in between (aborted rows filtered for read_committed, rows
-                // deleted by aborted-row cleanup or retention), an empty response would
-                // leave the consumer polling the same offset forever; a marker batch
-                // covering them moves it to the readable end, as the abort marker after
-                // an aborted transaction does in Kafka.
+                // Nothing visible from fetch_offset up to the readable end. With offsets in
+                // between (aborted rows filtered for read_committed, rows deleted by
+                // aborted-row cleanup or retention), an empty response would leave the
+                // consumer polling the same offset forever; a marker batch covering them
+                // moves it to the readable end, as the abort marker after an aborted
+                // transaction does in Kafka.
                 let readable_end = match isolation_level {
                     IsolationLevel::ReadCommitted => last_stable_offset,
                     IsolationLevel::ReadUncommitted => high_watermark,
                 };
-                Some(gap_batch(fetch_offset, readable_end).unwrap_or_default())
+                Ok(gap_batch(fetch_offset, readable_end).unwrap_or_default())
             } else {
-                // Empty result set - return empty bytes instead of None
-                // This avoids "invalid MessageSetSize -1" errors in flexible format
-                Some(bytes::Bytes::new())
+                // Empty bytes rather than None: a null records field is an "invalid
+                // MessageSetSize -1" in the flexible format.
+                Ok(bytes::Bytes::new())
             };
-
-            let mut partition_data = PartitionData::default();
-            partition_data.partition_index = partition_id;
-            partition_data.error_code = ERROR_NONE;
-            partition_data.high_watermark = high_watermark;
-            partition_data.last_stable_offset = last_stable_offset;
-            partition_data.log_start_offset = log_start_offset;
-            partition_data.records = records_bytes;
-            partition_responses.push(partition_data);
+            partition_responses.push(fetched_partition_data(
+                topic_id,
+                partition_id,
+                &bounds,
+                records,
+            ));
         }
 
         let mut topic_response = FetchableTopicResponse::default();
@@ -487,6 +472,33 @@ pub fn handle_fetch_with_max_bytes(
     kafka_response.responses = responses;
 
     Ok(kafka_response)
+}
+
+/// The response entry of a partition whose records were read: `records` holds the
+/// encoded record batches, or why they could not be encoded.
+fn fetched_partition_data(
+    topic_id: i32,
+    partition_id: i32,
+    bounds: &crate::kafka::storage::PartitionBounds,
+    records: std::result::Result<bytes::Bytes, String>,
+) -> kafka_protocol::messages::fetch_response::PartitionData {
+    let records = records.unwrap_or_else(|e| {
+        crate::pg_warning!(
+            "Failed to encode RecordBatch for topic_id={}, partition={}: {}",
+            topic_id,
+            partition_id,
+            e
+        );
+        bytes::Bytes::new()
+    });
+    let mut partition_data = kafka_protocol::messages::fetch_response::PartitionData::default();
+    partition_data.partition_index = partition_id;
+    partition_data.error_code = ERROR_NONE;
+    partition_data.high_watermark = bounds.high_watermark;
+    partition_data.last_stable_offset = bounds.last_stable_offset;
+    partition_data.log_start_offset = bounds.earliest_offset;
+    partition_data.records = Some(records);
+    partition_data
 }
 
 /// Handle ListOffsets request
