@@ -11,9 +11,10 @@
 //! * the records, at [`RECORD_MEMORY`] each, from the record count in the batch header,
 //!   before anything is decompressed;
 //! * the decoded bytes, as the decompressors here produce them: they write through the
-//!   budget and stop at its limit, so a compressed batch never expands past what the
-//!   request may hold. The copies the records keep of their keys, values and headers are
-//!   covered by these bytes;
+//!   budget, which is charged their buffer's capacity before it grows, and stop at its
+//!   limit, so a compressed batch never expands past what the request may hold. The
+//!   copies the records keep of their keys, values and headers are covered by these
+//!   bytes;
 //! * every heap block of those copies, at [`ALLOCATION_OVERHEAD`], and the headers, at
 //!   [`HEADER_MEMORY`] each, as the records are read.
 //!
@@ -22,7 +23,7 @@
 use std::io::{self, Write};
 use std::mem::size_of;
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{Buf, Bytes};
 use kafka_protocol::records::Compression;
 use tracing::debug;
 
@@ -321,11 +322,14 @@ fn zstd_window(mut data: &[u8]) -> anyhow::Result<usize> {
     Ok(usize::try_from(largest)?)
 }
 
-/// Decoded output written through a [`DecodeBudget`]: a write that would pass the budget
-/// fails before anything is buffered. A decoder's window that fills as it decodes is
-/// charged with the output, up to `window` bytes.
+/// Decoded output written through a [`DecodeBudget`]: the buffer's capacity is charged
+/// before it grows, so a write that would pass the budget fails before anything is
+/// allocated. The buffer doubles while the budget has room for that and otherwise grows to
+/// exactly what it holds; once decoded it is shrunk to its bytes and the rest given back. A
+/// decoder's window that fills as it decodes is charged with the output, up to `window`
+/// bytes.
 struct BudgetedWriter<'a> {
-    out: BytesMut,
+    out: Vec<u8>,
     budget: &'a DecodeBudget,
     window: usize,
     window_charged: usize,
@@ -338,17 +342,20 @@ impl<'a> BudgetedWriter<'a> {
 
     fn with_window(budget: &'a DecodeBudget, window: usize) -> Self {
         Self {
-            out: BytesMut::new(),
+            out: Vec::new(),
             budget,
             window,
             window_charged: 0,
         }
     }
 
-    /// The output; what its window was charged is given back (the decoder is gone).
-    fn into_bytes(self) -> Bytes {
-        self.budget.release(self.window_charged);
-        self.out.freeze()
+    /// The output, shrunk to its bytes; what its window and spare capacity were charged is
+    /// given back (the decoder is gone).
+    fn into_bytes(mut self) -> Bytes {
+        let spare = self.out.capacity() - self.out.len();
+        self.out.shrink_to_fit();
+        self.budget.release(self.window_charged + spare);
+        Bytes::from(self.out)
     }
 }
 
@@ -363,11 +370,28 @@ fn over_budget() -> io::Error {
 impl Write for BudgetedWriter<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let window = buf.len().min(self.window - self.window_charged);
+        let capacity = self.out.capacity();
+        let needed = self.out.len() + buf.len();
+        let grown = if needed > capacity {
+            // The window still to charge keeps its room.
+            let room = self
+                .budget
+                .room()
+                .saturating_sub(self.window - self.window_charged);
+            capacity
+                .saturating_mul(2)
+                .min(capacity.saturating_add(room))
+                .max(needed)
+        } else {
+            capacity
+        };
         self.budget
-            .take(buf.len() + window)
+            .take(grown - capacity + window)
             .map_err(|_| over_budget())?;
         self.window_charged += window;
-        self.out.put_slice(buf);
+        // A Vec grown with `reserve_exact` has exactly the capacity asked for.
+        self.out.reserve_exact(grown - self.out.len());
+        self.out.extend_from_slice(buf);
         Ok(buf.len())
     }
 
@@ -380,32 +404,48 @@ impl Write for BudgetedWriter<'_> {
 /// version, then `[length u32][raw snappy block]` repeated.
 const XERIAL_SNAPPY_HEADER: &[u8; 16] = b"\x82SNAPPY\x00\x00\x00\x00\x01\x00\x00\x00\x01";
 
-/// Snappy (xerial-framed or raw), each block's declared length charged before it is
-/// allocated.
+/// The raw snappy blocks of `data`: the blocks of its xerial framing, or `data` itself.
+fn snappy_blocks(data: &[u8]) -> impl Iterator<Item = anyhow::Result<&[u8]>> {
+    let mut framed = data.strip_prefix(&XERIAL_SNAPPY_HEADER[..]);
+    let mut raw = framed.is_none().then_some(data);
+    std::iter::from_fn(move || {
+        if let Some(block) = raw.take() {
+            return Some(Ok(block));
+        }
+        let blocks = framed.as_mut().filter(|b| !b.is_empty())?;
+        let block = (|| {
+            anyhow::ensure!(blocks.len() >= 4, "snappy block length cut short");
+            let len = usize::try_from(blocks.get_u32())?;
+            anyhow::ensure!(blocks.len() >= len, "snappy block cut short");
+            let (block, rest) = blocks.split_at(len);
+            *blocks = rest;
+            Ok(block)
+        })();
+        if block.is_err() {
+            framed = None;
+        }
+        Some(block)
+    })
+}
+
+/// Snappy (xerial-framed or raw): the blocks' declared lengths are summed and charged, and
+/// the output allocated once at that size, before any block decodes.
 fn decompress_snappy(data: &Bytes, budget: &DecodeBudget) -> anyhow::Result<Bytes> {
     use snap::raw::{decompress_len, Decoder};
-    let decode_block = |block: &[u8], out: &mut BytesMut| -> anyhow::Result<()> {
-        let len = decompress_len(block)?;
-        budget.take(len).map_err(|_| over_budget())?;
-        let start = out.len();
-        out.resize(start + len, 0);
-        Decoder::new().decompress(block, &mut out[start..])?;
-        Ok(())
-    };
-    let mut out = BytesMut::new();
-    let Some(mut blocks) = data.strip_prefix(&XERIAL_SNAPPY_HEADER[..]) else {
-        decode_block(data, &mut out)?;
-        return Ok(out.freeze());
-    };
-    while !blocks.is_empty() {
-        anyhow::ensure!(blocks.len() >= 4, "snappy block length cut short");
-        let len = usize::try_from(blocks.get_u32())?;
-        anyhow::ensure!(blocks.len() >= len, "snappy block cut short");
-        let (block, rest) = blocks.split_at(len);
-        decode_block(block, &mut out)?;
-        blocks = rest;
+    let mut total = 0usize;
+    for block in snappy_blocks(data) {
+        total = total.saturating_add(decompress_len(block?)?);
     }
-    Ok(out.freeze())
+    budget.take(total).map_err(|_| over_budget())?;
+    let mut out = vec![0; total];
+    let mut at = 0;
+    for block in snappy_blocks(data) {
+        let block = block?;
+        let len = decompress_len(block)?;
+        Decoder::new().decompress(block, &mut out[at..at + len])?;
+        at += len;
+    }
+    Ok(Bytes::from(out))
 }
 
 /// The decompressed records section of a RecordBatch, every byte charged to `budget`.
@@ -546,9 +586,18 @@ impl<'a> RecordReader<'a> {
             self.charge(ALLOCATION_OVERHEAD)?;
             return Ok(key.to_owned());
         }
-        // Every invalid byte may become a 3-byte U+FFFD.
+        // Every invalid byte may become a 3-byte U+FFFD: the key is built in a block of that
+        // size, what is charged, and shrunk to what it holds.
         self.charge(ALLOCATION_OVERHEAD + 2 * bytes.len())?;
-        Ok(String::from_utf8_lossy(bytes).into_owned())
+        let mut key = String::with_capacity(3 * bytes.len());
+        for chunk in bytes.utf8_chunks() {
+            key.push_str(chunk.valid());
+            if !chunk.invalid().is_empty() {
+                key.push(char::REPLACEMENT_CHARACTER);
+            }
+        }
+        key.shrink_to_fit();
+        Ok(key)
     }
 
     /// The record, which must be exactly its fields.
@@ -712,7 +761,7 @@ mod tests {
         batch_with, header_records, raw_batch, record, tiny_records, v, Header,
     };
     use super::*;
-    use bytes::Bytes;
+    use bytes::{Bytes, BytesMut};
 
     use crate::kafka::protocol::decode_budget::{Exhausted, MAX_DECODED_REQUEST_BYTES};
 
@@ -801,6 +850,95 @@ mod tests {
                 "{compression:?}: {err}"
             );
         }
+    }
+
+    /// What the decompressors and record readers hold beyond their charge besides the
+    /// decoded bytes: their own state (inflate's window, an lz4 frame's block buffer, a
+    /// zstd context), which does not grow with the batch.
+    const DECODER_STATE: usize = 512 * 1024;
+
+    #[test]
+    fn a_decode_holds_at_most_twice_its_charge() {
+        // Decoded sizes just past a power of two, where an output buffer that doubles as
+        // it fills holds the most it ever does beyond its bytes; one record of the value,
+        // and 2000 records of a 600-byte value.
+        for compression in CODECS {
+            for batch in [
+                zeros_batch(1_100_000, compression),
+                zeros_batch(2_100_000, compression),
+                many_records_batch(2000, 600, compression),
+            ] {
+                let budget = budget();
+                let (records, peak) =
+                    crate::testing::heap_peak(|| parse_record_batch(&batch, &budget).unwrap());
+                let charged = budget.most_charged();
+                assert!(
+                    peak <= 2 * charged + DECODER_STATE,
+                    "{compression:?}: held {peak} bytes for a charge of {charged}"
+                );
+                drop(records);
+            }
+        }
+    }
+
+    #[test]
+    fn lossy_header_keys_hold_no_more_than_their_charge() {
+        // A 1000-byte header key of invalid UTF-8 becomes 3000 bytes of U+FFFD; its charge
+        // (its bytes in the section plus 2 per byte and a heap block) covers what the key
+        // keeps.
+        let invalid = vec![0xffu8; 1000];
+        let mut body = vec![0u8, 0, 0, 1, 1, 2];
+        body.extend(v(1000));
+        body.extend_from_slice(&invalid);
+        body.extend(v(-1));
+        let budget = budget();
+        let (record, held) = crate::testing::heap_peak(|| {
+            RecordReader {
+                body: &body,
+                budget: &budget,
+            }
+            .read(0)
+            .unwrap()
+        });
+        let key = &record.headers[0].key;
+        assert_eq!(key.len(), 3000);
+        let charge = budget.charged() + invalid.len();
+        assert!(held <= charge, "held {held} bytes for a charge of {charge}");
+    }
+
+    /// One record batch of `n` records of a `len`-byte value, compressed with
+    /// `compression`.
+    fn many_records_batch(n: usize, len: usize, compression: Compression) -> Bytes {
+        use kafka_protocol::records::{
+            Record as PRecord, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
+        };
+        let records: Vec<PRecord> = (0..n)
+            .map(|i| PRecord {
+                transactional: false,
+                control: false,
+                partition_leader_epoch: 0,
+                producer_id: -1,
+                producer_epoch: -1,
+                timestamp_type: TimestampType::Creation,
+                offset: i64::try_from(i).unwrap(),
+                sequence: i32::try_from(i).unwrap() - 1,
+                timestamp: 0,
+                key: Some(Bytes::from(format!("key-{i}"))),
+                value: Some(Bytes::from(vec![u8::try_from(i % 251).unwrap(); len])),
+                headers: kafka_protocol::indexmap::IndexMap::default(),
+            })
+            .collect();
+        let mut buf = BytesMut::new();
+        RecordBatchEncoder::encode(
+            &mut buf,
+            records.iter(),
+            &RecordEncodeOptions {
+                version: 2,
+                compression,
+            },
+        )
+        .unwrap();
+        buf.freeze()
     }
 
     #[test]

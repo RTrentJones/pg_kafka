@@ -3,10 +3,15 @@
 //! - [`mocks::MockKafkaStore`]: a storage double with mockall expectations.
 //! - [`TestEnv`]: the coordinator and broker metadata a [`HandlerContext`] borrows.
 //! - [`cpu_time`]: how long a closure ran on the CPU, for tests that bound a cost.
+//! - [`heap_peak`]: the most heap memory a closure held at once, for tests that bound
+//!   what a decode holds.
 
 #![cfg(test)]
 
+pub mod heap;
 pub mod mocks;
+
+pub use heap::heap_peak;
 
 use crate::kafka::storage::KafkaStore;
 use crate::kafka::{BrokerMetadata, GroupCoordinator, HandlerContext};
