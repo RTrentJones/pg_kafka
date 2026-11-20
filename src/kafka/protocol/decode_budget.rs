@@ -1,22 +1,27 @@
 //! How much memory the records of Produce requests may take once decoded.
 //!
-//! A frame's size says little about its records: a gzip or zstd batch of zeros expands about
-//! a thousandfold, so an 800 KB request can decode to gigabytes. The decoded bytes are
-//! therefore bounded while they are produced (every decompressor writes through a
-//! [`DecodeBudget`] and stops at the limit), never checked afterwards:
+//! A frame's size says little about what its records take: a gzip or zstd batch of zeros
+//! expands about a thousandfold, and every record, however small on the wire (7 bytes),
+//! becomes a few hundred bytes of decoded structure. The memory of a decode is therefore
+//! charged to a [`DecodeBudget`] before it is allocated, never checked afterwards: the
+//! records and headers at a fixed cost each, the decoded bytes as the decompressors produce
+//! them (they write through the budget and stop at its limit; see
+//! `super::recordbatch`):
 //!
-//! * per request, at most [`MAX_DECODED_REQUEST_BYTES`] across all its partitions (the
-//!   largest request an uncompressed client may send); beyond that the request is answered
-//!   MESSAGE_TOO_LARGE;
+//! * per request, at most [`MAX_DECODED_REQUEST_BYTES`] across all its partitions; beyond
+//!   that the request is answered MESSAGE_TOO_LARGE;
 //! * across the process, decoded requests that the DB thread has not run yet hold at most
 //!   [`DECODED_BUDGET_BYTES`] ([`DECODED_REMAINING`]); a request that would exceed it closes
 //!   its connection, as an exhausted frame budget does, and the client retries. The decoded
 //!   request keeps its share ([`DecodedCharge`]) until it is dropped after its handler ran.
 //!
+//! What a decode holds at its peak (the decompressed section, kafka-protocol's records and
+//! the copies they are converted to) is at most twice its charge; once converted it holds
+//! no more than its charge.
+//!
 //! Decoding is also kept off the two tokio I/O threads once it is large
 //! ([`run_large_decode`]): at most [`LARGE_DECODE_SLOTS`] such decodes run at once, each on a
-//! thread of its own, so they bound the transient copies too (a decompressed buffer and the
-//! records copied out of it, at most twice the request limit per decode).
+//! thread of its own.
 //!
 //! Runs on the network thread, so it logs through `tracing`, never pgrx.
 
@@ -27,11 +32,12 @@ use std::sync::{Condvar, Mutex, PoisonError};
 use super::framing::{charge_frame_budget, release_frame_budget};
 use crate::kafka::constants::MAX_REQUEST_SIZE;
 
-/// The most bytes one Produce request's records may decode to, summed over its partitions.
-/// A compressed request may decode to no more than an uncompressed one may be.
+/// The most memory one Produce request's records may take decoded, summed over its
+/// partitions: the size of the largest request frame, so a compressed request may decode to
+/// no more than an uncompressed one of large records.
 pub const MAX_DECODED_REQUEST_BYTES: usize = MAX_REQUEST_SIZE;
 
-/// The most decoded record bytes all requests waiting for the DB thread may hold together.
+/// The most decoded record memory all requests waiting for the DB thread may hold together.
 pub const DECODED_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 
 const _: () = assert!(MAX_DECODED_REQUEST_BYTES <= DECODED_BUDGET_BYTES);
@@ -39,8 +45,9 @@ const _: () = assert!(MAX_DECODED_REQUEST_BYTES <= DECODED_BUDGET_BYTES);
 /// Remaining process-wide decoded budget, in bytes.
 pub static DECODED_REMAINING: AtomicUsize = AtomicUsize::new(DECODED_BUDGET_BYTES);
 
-/// Decodes up to this many bytes run inline on the I/O thread (the cost of moving them
-/// elsewhere would exceed the work); a larger request decodes through [`run_large_decode`].
+/// Decodes taking up to this much memory run inline on the I/O thread (the cost of moving
+/// them elsewhere would exceed the work); a larger request decodes through
+/// [`run_large_decode`].
 pub const INLINE_DECODE_BYTES: usize = 1024 * 1024;
 
 /// How many large decodes may run at once.
@@ -55,9 +62,9 @@ pub enum Exhausted {
     Global,
 }
 
-/// The decoded-bytes allowance of one request while it decodes. Bytes are charged as they
-/// are produced; whatever is charged is given back when the budget is dropped, unless it
-/// is handed to the decoded request with [`DecodeBudget::into_charge`].
+/// The decoded-memory allowance of one request while it decodes, in bytes. Memory is
+/// charged before it is allocated; whatever is charged is given back when the budget is
+/// dropped, unless it is handed to the decoded request with [`DecodeBudget::into_charge`].
 #[derive(Debug)]
 pub struct DecodeBudget {
     global: &'static AtomicUsize,
@@ -82,7 +89,7 @@ impl DecodeBudget {
         }
     }
 
-    /// Charge `n` more decoded bytes. Fails, charging nothing, when that would pass the
+    /// Charge `n` more bytes. Fails, charging nothing, when that would pass the
     /// budget's limit or the process-wide budget; [`DecodeBudget::exhausted`] then says
     /// which.
     pub fn take(&self, n: usize) -> Result<(), Exhausted> {
@@ -106,6 +113,13 @@ impl DecodeBudget {
         self.exhausted.get()
     }
 
+    /// Give back `n` of the bytes charged (memory a decode no longer holds).
+    pub fn release(&self, n: usize) {
+        let n = n.min(self.charged.get());
+        self.charged.set(self.charged.get() - n);
+        release_frame_budget(self.global, n);
+    }
+
     /// Bytes charged so far.
     pub fn charged(&self) -> usize {
         self.charged.get()
@@ -126,7 +140,7 @@ impl Drop for DecodeBudget {
     }
 }
 
-/// The decoded bytes a request holds of the process-wide budget, given back when it is
+/// The decoded memory a request holds of the process-wide budget, given back when it is
 /// dropped (after the DB thread ran the request, or when the request is discarded).
 #[derive(Debug)]
 pub struct DecodedCharge {

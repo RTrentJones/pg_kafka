@@ -66,13 +66,18 @@ pg_kafka.compression_type = 'gzip'
 
 **Client Impact:**
 - Clients can use any compression type (gzip, snappy, lz4, zstd)
-- Server decompresses messages before storage. A request's records may decode to at most
-  100 MB across its partitions; past that every partition is answered MESSAGE_TOO_LARGE (Kafka
-  streams validation and has no such limit). zstd frames may declare at most a 16 MiB window
+- Server decompresses messages before storage. A request's records may take at most 100 MB
+  of memory once decoded, across its partitions: their decoded bytes plus a fixed cost per
+  record (264 bytes) and per header (136 bytes), charged from the declared record count before
+  anything decodes. Past that every partition is answered MESSAGE_TOO_LARGE (Kafka streams
+  validation and has no such limit), so a request of over ~380,000 records, or a request of
+  small records near the 100 MB frame limit, is refused. zstd frames may declare at most a 16 MiB window
   (Kafka's producers use 2^21, or the batch size).
 - Each partition's data must be exactly one RecordBatch v2, as in Kafka 3.7 for Produce v3+:
   a legacy MessageSet (magic 0/1), empty or cut-short data, or a negative record count is
-  INVALID_RECORD; a bad CRC or a batch length shorter than the header is CORRUPT_MESSAGE.
+  INVALID_RECORD, as is a record count that does not match the records (too few or too
+  many) or a record with bytes past its fields; a bad CRC or a batch length shorter than the
+  header is CORRUPT_MESSAGE.
   Unlike Kafka, which answers only the offending partition, pg_kafka answers every partition
   of the request with that code and writes none of them.
 - Server compresses responses based on GUC setting

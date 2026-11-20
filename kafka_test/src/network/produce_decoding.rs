@@ -12,7 +12,7 @@ use crate::wire::{decode_response, read_frame_within, request_frame};
 use bytes::Bytes;
 use kafka_protocol::messages::ProduceRequest;
 use kafka_protocol::records::Compression;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
@@ -152,6 +152,153 @@ pub async fn test_compressed_produce_past_the_decode_limit_is_refused() -> TestR
     assert_eq!(stored, 20_000_000);
     rdkafka_roundtrip(client_config(PORT), &topic, 3).await?;
     println!("✅ stored {stored} bytes; rdkafka round trip works");
+
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// A RecordBatch v2 built by hand around the records section `section`, gzip-compressed,
+/// declaring `record_count` records, with a valid CRC.
+fn raw_batch(section: &[u8], record_count: i32) -> Bytes {
+    use bytes::BufMut;
+    use kafka_protocol::compression::{Compressor, Gzip};
+    let mut records = bytes::BytesMut::new();
+    Gzip::compress(&mut records, |tmp: &mut bytes::BytesMut| {
+        tmp.put_slice(section);
+        Ok(())
+    })
+    .expect("gzip compresses");
+    let mut tail = bytes::BytesMut::new();
+    tail.put_i16(1); // attributes: gzip
+    tail.put_i32(record_count.max(1) - 1); // lastOffsetDelta
+    tail.put_i64(0); // baseTimestamp
+    tail.put_i64(0); // maxTimestamp
+    tail.put_i64(-1); // producerId
+    tail.put_i16(-1); // producerEpoch
+    tail.put_i32(-1); // baseSequence
+    tail.put_i32(record_count);
+    tail.put_slice(&records);
+    let mut batch = bytes::BytesMut::new();
+    batch.put_i64(0); // baseOffset
+    batch.put_i32(i32::try_from(4 + 1 + 4 + tail.len()).expect("a test batch fits an i32"));
+    batch.put_i32(0); // partitionLeaderEpoch
+    batch.put_i8(2); // magic
+    batch.put_u32(crc32c::crc32c(&tail));
+    batch.put_slice(&tail);
+    batch.freeze()
+}
+
+/// `n` of the smallest records: 7 bytes each (null key and value, no headers).
+fn tiny_records(n: usize) -> Vec<u8> {
+    [12u8, 0, 0, 0, 1, 1, 0].repeat(n)
+}
+
+/// `n` records of `headers` headers each, every header 2 bytes (an empty key and a null
+/// value).
+fn header_records(n: usize, headers: u16) -> Vec<u8> {
+    let zigzag = u32::from(headers) << 1;
+    let mut count = Vec::new();
+    let mut z = zigzag;
+    while z >= 0x80 {
+        count.push(u8::try_from(z & 0x7f).expect("7 bits") | 0x80);
+        z >>= 7;
+    }
+    count.push(u8::try_from(z).expect("7 bits"));
+    let mut body = vec![0u8, 0, 0, 1, 1];
+    body.extend_from_slice(&count);
+    body.extend_from_slice(&[0, 1].repeat(usize::from(headers)));
+    let mut size = Vec::new();
+    let mut z = u32::try_from(body.len()).expect("small") << 1;
+    while z >= 0x80 {
+        size.push(u8::try_from(z & 0x7f).expect("7 bits") | 0x80);
+        z >>= 7;
+    }
+    size.push(u8::try_from(z).expect("7 bits"));
+    let mut record = size;
+    record.extend_from_slice(&body);
+    record.repeat(n)
+}
+
+/// Batches that are small decoded but many records or headers, which each take a few
+/// hundred bytes once decoded: their declared record count is charged before anything
+/// decodes and their headers before kafka-protocol builds them, so they are refused with
+/// MESSAGE_TOO_LARGE quickly and the listener's memory stays bounded. A record count that
+/// does not match the records is INVALID_RECORD, also before the records are built.
+/// Unchecked, these four requests took gigabytes.
+pub async fn test_record_and_header_bombs_are_refused_before_decoding() -> TestResult {
+    println!("=== Test: record-count and header bombs refused before decoding ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("net-rec-bomb").await;
+    let created = create_topics_raw(vec![creatable(&topic, 4, 1)]).await?;
+    assert_eq!(created[0].error_code, 0, "{created:?}");
+    let mut s = TcpStream::connect(("127.0.0.1", PORT)).await?;
+    let peak_watch = reset_listener_peak(&ctx).await?;
+    let timed = |started: Instant, what: &str| {
+        let took = started.elapsed();
+        println!("  {what}: answered in {took:?}");
+        assert!(took < Duration::from_secs(2), "{what} took {took:?}");
+    };
+
+    let n = 1_300_000;
+    println!("Step 1: three gzip batches of {n} 7-byte records (27 MB decoded)");
+    let tiny = raw_batch(&tiny_records(n), i32::try_from(n)?);
+    let parts = (0..3).map(|p| (p, tiny.clone())).collect();
+    let started = Instant::now();
+    let codes = produce_codes(&mut s, 1, &topic, parts).await?;
+    timed(started, "tiny records");
+    assert_eq!(codes, vec![MESSAGE_TOO_LARGE; 3]);
+    println!("✅ refused: {codes:?}");
+
+    println!("Step 2: one gzip batch of 1000 records of 8192 2-byte headers (16 MB decoded)");
+    let headers = raw_batch(&header_records(1000, 8192), 1000);
+    let started = Instant::now();
+    let codes = produce_codes(&mut s, 2, &topic, vec![(0, headers)]).await?;
+    timed(started, "header-heavy records");
+    assert_eq!(codes, vec![MESSAGE_TOO_LARGE]);
+    println!("✅ refused: {codes:?}");
+
+    println!("Step 3: record counts that do not match the records");
+    let section = tiny_records(300_000);
+    for (corr, count) in (3..).zip([299_999, 300_001, 0]) {
+        let started = Instant::now();
+        let codes =
+            produce_codes(&mut s, corr, &topic, vec![(1, raw_batch(&section, count))]).await?;
+        timed(started, &format!("300000 records declared as {count}"));
+        assert_eq!(codes, vec![INVALID_RECORD], "declared {count}");
+    }
+    println!("✅ refused as INVALID_RECORD");
+
+    match peak_watch.and_then(|(pid, rss)| Some((rss, proc_kb(pid, "VmHWM:")?))) {
+        Some((rss, peak)) => {
+            let grew_mb = peak.saturating_sub(rss) / 1024;
+            println!(
+                "  listener RSS {} MB, peak while decoding +{grew_mb} MB",
+                rss / 1024
+            );
+            assert!(grew_mb < 300, "decoding grew the listener by {grew_mb} MB");
+        }
+        None => println!("  (listener memory not readable from here; skipping the RSS check)"),
+    }
+    assert_eq!(
+        stored_rows(ctx.db(), &topic).await?,
+        0,
+        "nothing is written"
+    );
+
+    println!("Step 4: the matching count is stored, and the broker still serves");
+    let codes = produce_codes(
+        &mut s,
+        10,
+        &topic,
+        vec![(2, raw_batch(&tiny_records(1000), 1000))],
+    )
+    .await?;
+    assert_eq!(codes, vec![0]);
+    assert_eq!(stored_rows(ctx.db(), &topic).await?, 1000);
+    assert!(answers(&mut s, 11).await, "the connection still answers");
+    rdkafka_roundtrip(client_config(PORT), &topic, 3).await?;
+    println!("✅ stored; rdkafka round trip works");
 
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");

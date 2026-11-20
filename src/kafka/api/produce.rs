@@ -18,7 +18,9 @@ use crate::kafka::protocol::decode_budget::{
     run_large_decode, DecodeBudget, DecodedCharge, Exhausted, INLINE_DECODE_BYTES,
     MAX_DECODED_REQUEST_BYTES,
 };
-use crate::kafka::protocol::{parse_record_batch_with_metadata, ParsedRecordBatch};
+use crate::kafka::protocol::{
+    least_decoded_memory, parse_record_batch_with_metadata, ParsedRecordBatch,
+};
 use crate::kafka::storage::{LogStore, TopicStore};
 
 /// Produce: append record batches.
@@ -222,7 +224,7 @@ impl KafkaApi for ProduceApi {
 /// Why a Produce request's records did not decode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DecodeFailure {
-    /// They decode to more than one request may hold ([`MAX_DECODED_REQUEST_BYTES`]).
+    /// They take more memory than one request may hold ([`MAX_DECODED_REQUEST_BYTES`]).
     TooLarge,
     /// The process-wide decode budget is exhausted.
     Busy,
@@ -281,20 +283,20 @@ fn decode_records(
 
 /// Decode the records of `topics`, keeping large decodes off the I/O threads.
 ///
-/// A request whose batches total at most [`INLINE_DECODE_BYTES`] is decoded in place,
-/// within that many decoded bytes: the common case of small (compressed or not) batches.
-/// One that is larger, or that expands past it, is decoded by [`run_large_decode`] within
-/// [`MAX_DECODED_REQUEST_BYTES`].
+/// A request whose batches take at most [`INLINE_DECODE_BYTES`] of memory by what they
+/// declare (their bytes and record counts) is decoded in place, within that budget: the
+/// common case of small (compressed or not) batches. One that declares more, or that
+/// expands past it, is decoded by [`run_large_decode`] within [`MAX_DECODED_REQUEST_BYTES`].
 fn decode_all_records(
     topics: &[kafka_protocol::messages::produce_request::TopicProduceData],
 ) -> Result<DecodedTopics, DecodeFailure> {
-    let wire_bytes: usize = topics
+    let declared: usize = topics
         .iter()
         .flat_map(|t| t.partition_data.iter())
         .filter_map(|p| p.records.as_ref())
-        .map(bytes::Bytes::len)
-        .sum();
-    if wire_bytes <= INLINE_DECODE_BYTES {
+        .map(|batch| least_decoded_memory(batch))
+        .fold(0, usize::saturating_add);
+    if declared <= INLINE_DECODE_BYTES {
         match decode_records(topics, DecodeBudget::new(INLINE_DECODE_BYTES)) {
             Err(DecodeFailure::TooLarge) => {}
             done => return done,
