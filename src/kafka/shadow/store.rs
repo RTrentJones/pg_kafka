@@ -125,12 +125,16 @@ const MAX_INFLIGHT: usize = 8_192;
 const MAX_ACKS_PER_TICK: usize = 20_000;
 
 /// How long an in-flight forward blocks re-dispatch of its outbox row before
-/// the entry is presumed lost and evicted. Sized above rdkafka's
-/// `message.timeout.ms` (120s — see shadow::producer), after which every send
-/// is guaranteed to have produced a delivery report; an entry older than this
-/// means the ack itself was lost (forwarder crash) and the row is claimed again,
-/// counting the lost attempt.
+/// the entry is presumed lost and evicted. Sized above the forwarder's delivery
+/// timeout (`shadow::producer::DELIVERY_TIMEOUT`, 120 s), after which every send
+/// has produced a delivery report; an entry older than this means the ack
+/// itself was lost (forwarder crash) and the row is claimed again, counting the
+/// lost attempt.
 const INFLIGHT_EVICT_AFTER: Duration = Duration::from_secs(150);
+const _: () = assert!(
+    INFLIGHT_EVICT_AFTER.as_secs() > super::producer::DELIVERY_TIMEOUT.as_secs(),
+    "in-flight entries must outlive the delivery timeout"
+);
 
 /// Cap on sync-mode responses waiting for their batch's commit. Entries beyond
 /// it are not held (their records are forwarded by the poll as usual).

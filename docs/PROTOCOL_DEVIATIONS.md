@@ -593,8 +593,8 @@ Shadow forwarding to an external Kafka cluster uses a durable outbox
 - **In-flight gating:** a row whose forward is merely *slow* (ack pending) is
   not re-claimed at lease expiry — the DB thread tracks dispatched
   forwards and the outbox claim skips them until the ack resolves or the
-  entry ages out (`INFLIGHT_EVICT_AFTER`, sized above rdkafka's
-  `message.timeout.ms`). Duplicates therefore occur only on genuine ack
+  entry ages out (`INFLIGHT_EVICT_AFTER`, 150 s, sized above the
+  forwarder's 120 s delivery timeout). Duplicates therefore occur only on genuine ack
   *loss*, not ack *latency*. Local storage and `kafka.shadow_tracking`
   finalization remain exactly-once in all modes.
 

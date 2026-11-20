@@ -76,6 +76,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         pipelined::test_shadow_forward_throughput: sequential,
         pipelined::test_shadow_forwards_headers_and_timestamps: sequential,
         pipelined::test_shadow_order_preserved_across_a_retried_failure: sequential,
+        pipelined::test_shadow_order_preserved_across_a_delivery_timeout: sequential, // Mutates global GUC (test_shadow_delivery_timeout_ms)
         pipelined::test_shadow_sync_stall_is_bounded_to_its_own_response: sequential,
         pipelined::test_shadow_gucs_take_effect_on_reload: sequential,
         lag_view::test_shadow_lag_view_is_per_partition,

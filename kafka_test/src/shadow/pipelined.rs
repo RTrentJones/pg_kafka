@@ -3,7 +3,8 @@
 //! Every test here talks to the external Kafka (category `shadow`):
 //! - throughput floor of the forwarder;
 //! - record headers and timestamps reach the external topic;
-//! - per-partition order survives a failing record that is retried;
+//! - per-partition order survives a failing record that is retried, and a
+//!   delivery timeout during an external outage;
 //! - a sync-mode produce against an unreachable cluster holds only its own
 //!   response, not the broker (the DB thread);
 //! - every producer GUC rebuilds the producer on reload, Sighup GUCs refuse a
@@ -313,7 +314,7 @@ pub async fn test_shadow_order_preserved_across_a_retried_failure() -> TestResul
         // record is rejected; with enable.gapless.guarantee the producer goes
         // fatal and the first failed record of the batch counts as the failure).
         // The broker's MESSAGE_TOO_LARGE is retried by the idempotent producer
-        // before it is reported, so this can take up to message.timeout.ms.
+        // before it is reported, so this can take up to the delivery timeout.
         let deadline = Instant::now() + Duration::from_secs(170);
         loop {
             let failed: i64 = ctx
@@ -384,6 +385,214 @@ pub async fn test_shadow_order_preserved_across_a_retried_failure() -> TestResul
     result?;
     println!("✅ Test PASSED\n");
     Ok(())
+}
+
+/// Shortened shadow delivery timeout for the delivery-timeout order test.
+const SHORT_DELIVERY_TIMEOUT_MS: u64 = 6_000;
+
+/// A delivery timeout must not let a later record overtake an earlier one.
+///
+/// The external broker is paused (its process stopped: connections are
+/// accepted by the kernel but never answered) and the shadow producer is
+/// rebuilt while it is, so every record waits in librdkafka's queue. The
+/// first records are enqueued at t0, the rest half a delivery timeout later,
+/// so their deadlines are staggered. When the first records time out (t0 +
+/// timeout) the later ones still have half a timeout to go, and the test
+/// resumes the broker in between. A producer that failed the first records
+/// alone (librdkafka's per-message `message.timeout.ms`) delivers the later
+/// records, still queued, before the outbox re-sends the first ones; the
+/// forwarder must fail everything outstanding together instead, so the
+/// partition restarts at its first undelivered record.
+///
+/// The pause and resume are shell commands: `EXTERNAL_KAFKA_PAUSE_CMD` /
+/// `EXTERNAL_KAFKA_RESUME_CMD`, by default `docker pause` / `docker unpause` of
+/// docker-compose.yml's `external_kafka` container.
+pub async fn test_shadow_order_preserved_across_a_delivery_timeout() -> TestResult {
+    const EARLY: usize = 5;
+    const N: usize = 10;
+    println!("=== Test: shadow order preserved across a delivery timeout ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("shadow-timeout-order").await;
+    let external = format!("{topic}-ext");
+    verify_external_kafka_ready().await?;
+    let db = create_db_client().await?;
+
+    let admin = external_admin()?;
+    let opts = AdminOptions::new().operation_timeout(Some(Duration::from_secs(10)));
+    let mut pause = None;
+    let result = async {
+        let new_topic = NewTopic::new(&external, 1, TopicReplication::Fixed(1));
+        for r in admin.create_topics(&[new_topic], &opts).await? {
+            r.map_err(|(t, e)| format!("create {t}: {e}"))?;
+        }
+        alter_system(
+            &db,
+            &format!(
+                "ALTER SYSTEM SET pg_kafka.test_shadow_delivery_timeout_ms = {SHORT_DELIVERY_TIMEOUT_MS}"
+            ),
+        )
+        .await?;
+        enable_shadow_mode(ctx.db(), &topic, &async_config(Some(external.clone()))).await?;
+
+        println!("Step 1: pause the external broker and rebuild the shadow producer");
+        pause = Some(BrokerPause::new()?);
+        // A producer setting change rebuilds the producer, which then cannot
+        // finish connecting: nothing it is handed leaves its queue.
+        alter_system(&db, "ALTER SYSTEM SET pg_kafka.shadow_linger_ms = 7").await?;
+
+        let producer = create_producer()?;
+        let send = |i: usize| {
+            let payload = format!("{i:04}");
+            let f = producer
+                .send_result(FutureRecord::to(&topic).key("same-key").payload(&payload))
+                .map_err(|(e, _)| e.to_string());
+            async move {
+                f?.await
+                    .map_err(|e| e.to_string())?
+                    .map_err(|(e, _)| e.to_string())?;
+                Ok::<(), String>(())
+            }
+        };
+        println!("Step 2: records 0..{EARLY} at t0, {EARLY}..{N} half a timeout later");
+        for i in 0..EARLY {
+            send(i).await?;
+        }
+        let t0 = Instant::now();
+        tokio::time::sleep(Duration::from_millis(SHORT_DELIVERY_TIMEOUT_MS / 2)).await;
+        for i in EARLY..N {
+            send(i).await?;
+        }
+
+        println!("Step 3: wait for the first failed attempt, then resume the broker");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let failed: i64 = ctx
+                .db()
+                .query_one(
+                    "SELECT COALESCE(MAX(st.retry_count), 0)::bigint FROM kafka.shadow_tracking st \
+                     JOIN kafka.topics t ON t.id = st.topic_id WHERE t.name = $1",
+                    &[&topic],
+                )
+                .await?
+                .get(0);
+            if failed >= 1 {
+                break;
+            }
+            if Instant::now() > deadline {
+                return Err("no delivery attempt ever timed out".into());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let failed_after = t0.elapsed();
+        if let Some(p) = pause.take() {
+            p.resume()?;
+        }
+        let resumed_after = t0.elapsed();
+        println!("First failure {failed_after:?} after t0; broker resumed {resumed_after:?} after t0");
+        // The scenario needs the broker back before the later records' own
+        // deadline (t0 + 1.5 timeouts).
+        assert!(
+            resumed_after < Duration::from_millis(SHORT_DELIVERY_TIMEOUT_MS * 3 / 2),
+            "resumed too late ({resumed_after:?}) to tell the orders apart"
+        );
+
+        wait_all_forwarded(ctx.db(), &topic, to_i64(N), Duration::from_secs(120)).await?;
+        let msgs = read_external(&external, N, Duration::from_secs(30))?;
+        let idx: Vec<usize> = msgs
+            .iter()
+            .map(|m| {
+                String::from_utf8_lossy(m.payload().unwrap_or_default())
+                    .parse()
+                    .unwrap_or(usize::MAX)
+            })
+            .collect();
+        println!("external order: {idx:?}");
+        // At-least-once: a re-send may duplicate, but the first occurrence of
+        // every record must be in local order, and none may be missing.
+        let mut seen = std::collections::HashSet::new();
+        let first: Vec<usize> = idx.iter().copied().filter(|i| seen.insert(*i)).collect();
+        assert_eq!(
+            first,
+            (0..N).collect::<Vec<_>>(),
+            "external order (first occurrences) must match the local order"
+        );
+        // Only the record the partition waited on counts a failed attempt; the
+        // records behind it keep their retry budget.
+        let rows = ctx
+            .db()
+            .query(
+                "SELECT st.local_offset, st.retry_count FROM kafka.shadow_tracking st \
+                 JOIN kafka.topics t ON t.id = st.topic_id WHERE t.name = $1 \
+                 ORDER BY st.local_offset",
+                &[&topic],
+            )
+            .await?;
+        let retries: Vec<(i64, i32)> = rows.iter().map(|r| (r.get(0), r.get(1))).collect();
+        println!("retry counts (local offset, retries): {retries:?}");
+        assert!(
+            retries.first().is_some_and(|&(_, n)| n >= 1)
+                && retries.iter().skip(1).all(|&(_, n)| n == 0),
+            "only the partition's first record may count failed attempts: {retries:?}"
+        );
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await
+    .map_err(|e| e.to_string());
+    if let Some(p) = pause.take() {
+        let _ = p.resume();
+    }
+    let _ = alter_system(&db, "ALTER SYSTEM RESET pg_kafka.shadow_linger_ms").await;
+    let _ = alter_system(
+        &db,
+        "ALTER SYSTEM RESET pg_kafka.test_shadow_delivery_timeout_ms",
+    )
+    .await;
+    ctx.cleanup().await?;
+    let _ = admin.delete_topics(&[&external], &opts).await;
+    result?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// The external broker, paused until [`BrokerPause::resume`] (or the drop,
+/// so a failing test never leaves it stopped).
+struct BrokerPause {
+    resumed: bool,
+}
+
+impl BrokerPause {
+    fn new() -> Result<Self, String> {
+        run_shell("EXTERNAL_KAFKA_PAUSE_CMD", "docker pause external_kafka")?;
+        Ok(Self { resumed: false })
+    }
+
+    fn resume(mut self) -> Result<(), String> {
+        self.resumed = true;
+        run_shell("EXTERNAL_KAFKA_RESUME_CMD", "docker unpause external_kafka")
+    }
+}
+
+impl Drop for BrokerPause {
+    fn drop(&mut self) {
+        if !self.resumed {
+            let _ = run_shell("EXTERNAL_KAFKA_RESUME_CMD", "docker unpause external_kafka");
+        }
+    }
+}
+
+/// Run the shell command in `var` (or `default`).
+fn run_shell(var: &str, default: &str) -> Result<(), String> {
+    let cmd = std::env::var(var).unwrap_or_else(|_| default.to_string());
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&cmd)
+        .status()
+        .map_err(|e| format!("{var} `{cmd}`: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{var} `{cmd}` failed: {status}"))
+    }
 }
 
 /// Sync mode with the external cluster unreachable: the sync produce waits at

@@ -102,6 +102,16 @@ of each; see duplicates below). That rests on:
    keep the order on the wire through librdkafka's own retries. `enable.gapless.guarantee=true`
    turns any error that could deliver a later record after an earlier failed one into a fatal
    producer error that fails every outstanding record; the forwarder then rebuilds the producer.
+   The guarantee does not cover librdkafka's per-message timeout (`message.timeout.ms`, measured
+   from each record's enqueue: an earlier record would time out alone while a later one, with a
+   later deadline, stays queued and is delivered first once the cluster is back), so that timeout
+   is infinite and the forwarder keeps its own **delivery timeout** (120 s) per producer
+   generation: once the oldest outstanding record has waited that long, every partition with a
+   record on the producer is fenced and all of its queued and in-flight records are purged at
+   once, so every partition restarts at its first undelivered record on a new producer. A purged
+   in-flight request may still be written by the broker, but only as an in-order prefix of that
+   producer's records (the broker checks the sequence numbers), so the first copy of every record
+   stays in order.
 3. **The fence.** Once a record of a partition fails, every later record of that partition the
    forwarder receives is answered `NotAttempted` without being sent, until the partition restarts:
    a record at or below the failed offset, or one the claim marks as the partition head (`restart`,
@@ -115,7 +125,13 @@ Failures are classified: a real delivery failure is `Failed` (counts against
 `shadow_max_retries`); a record fenced, failed only because the producer went fatal on another
 record's error (the first failure of a fatal producer generation is taken as its cause), purged by a
 settings change, or received while shadow mode is off is `NotAttempted` and does not consume its
-retry budget.
+retry budget. Of the records purged by the delivery timeout, the lowest outstanding record of each
+local partition that has been outstanding for at least half the timeout is `Failed` (the record
+the partition waits on); the records behind it, and a head sent less than half a timeout ago (a
+partition that was flowing), are `NotAttempted`. In a persistent outage each stuck partition's head
+therefore fails once per timeout and is dead-lettered after `shadow_max_retries` timeouts, and the
+next record becomes the head; a partial outage (one external partition stuck) also re-sends the
+other partitions' in-flight records once per timeout, which can duplicate them.
 
 Trade-off: with the gapless guarantee one poison record (for example one over the external topic's
 `max.message.bytes`) makes the producer fatal on each attempt, so every partition's in-flight
@@ -204,7 +220,7 @@ Acks are applied in three statements per tick (delivered, failed, not attempted)
 Failed bumps `retry_count`, records the error, starts the backoff and counts `messages_failed`; at the
 cap the row is a dead letter, logged once. Not attempted only closes the attempt. A row whose attempt
 is still open but that this worker no longer tracks (worker restart, or an in-flight entry evicted
-after 150 s, above librdkafka's 120 s message timeout) lost its ack: the claim takes it again and
+after 150 s, above the forwarder's 120 s delivery timeout) lost its ack: the claim takes it again and
 counts the lost attempt as a failure, so a forward that never answers still reaches the cap. A dead
 letter stays pending until it is replayed (`kafka.replay_shadow_messages`) or the cap is raised.
 
