@@ -13,6 +13,22 @@ use crate::kafka::constants::{
     API_KEY_INCREMENTAL_ALTER_CONFIGS, ERROR_CORRUPT_MESSAGE,
 };
 
+/// [`super::parse_request`] as the listener runs it: a Produce whose records wait for room
+/// to decode is finished ([`finish_request`]) before it is returned.
+fn parse_request(
+    frame: BytesMut,
+    response_tx: UnboundedSender<KafkaResponse>,
+) -> Result<Option<KafkaRequest>> {
+    match super::parse_request(frame, response_tx) {
+        Ok(Some(request)) => tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("a test runtime")
+            .block_on(finish_request(request)),
+        other => other,
+    }
+}
+
 /// Correlation id [`decode`] sends and checks.
 const CORRELATION_ID: i32 = 42;
 
@@ -136,7 +152,7 @@ fn corrupt_produce_frame(acks: i16) -> BytesMut {
     t.partition_data = vec![p];
     let mut req = ProduceRequest::default();
     req.acks = acks;
-    req.timeout_ms = 1000;
+    req.timeout_ms = 30_000;
     req.topic_data = vec![t];
     frame(&req, 7, 77)
 }
@@ -192,7 +208,7 @@ fn gzip_bomb_frame(partitions: i32, per_partition: usize, acks: i16) -> BytesMut
     }
     let mut req = ProduceRequest::default();
     req.acks = acks;
-    req.timeout_ms = 1000;
+    req.timeout_ms = 30_000;
     req.topic_data = vec![t];
     frame(&req, 7, 78)
 }
@@ -242,7 +258,7 @@ fn produce_frame_of(batch: &bytes::Bytes, partitions: i32, acks: i16) -> BytesMu
     }
     let mut req = ProduceRequest::default();
     req.acks = acks;
-    req.timeout_ms = 1000;
+    req.timeout_ms = 30_000;
     req.topic_data = vec![t];
     frame(&req, 7, 79)
 }
@@ -287,15 +303,14 @@ fn test_produce_of_tiny_records_past_the_request_limit_is_refused() {
 /// is dropped.
 #[test]
 fn test_large_compressed_produce_within_the_limit_decodes() {
-    use crate::kafka::protocol::decode_budget::{DECODED_BUDGET_BYTES, DECODED_REMAINING};
-    use std::sync::atomic::Ordering;
+    use crate::kafka::protocol::decode_budget::{DECODED, DECODED_BUDGET_BYTES};
     let request = parse_to_request(gzip_bomb_frame(2, 5_000_000, 1));
     let RequestBody::Produce(produce) = &request.body else {
         panic!("expected a Produce request");
     };
     let held = produce.decoded.bytes();
     assert!(held >= 10_000_000, "charged {held}");
-    assert!(DECODED_REMAINING.load(Ordering::Relaxed) <= DECODED_BUDGET_BYTES - held);
+    assert!(DECODED.remaining() <= DECODED_BUDGET_BYTES - held);
     let values: usize = produce
         .topic_data
         .iter()

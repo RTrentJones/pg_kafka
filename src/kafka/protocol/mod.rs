@@ -21,7 +21,7 @@ mod recordbatch;
 pub(crate) use recordbatch::test_batches as recordbatch_test_batches;
 
 pub use decode_budget::{DecodeBudget, DecodedCharge};
-pub use decoding::parse_request;
+pub use decoding::{finish_request, parse_request};
 pub use encoding::encode_response;
 pub use recordbatch::{
     least_decoded_memory, parse_record_batch, parse_record_batch_with_metadata,

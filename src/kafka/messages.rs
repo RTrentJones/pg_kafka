@@ -429,6 +429,7 @@ mod tests {
                 topic_data: vec![],
                 transactional_id: None,
                 decoded: crate::kafka::protocol::DecodedCharge::default(),
+                pending: None,
             }),
             response_tx: orig_tx,
         };

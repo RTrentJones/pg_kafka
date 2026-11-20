@@ -73,6 +73,19 @@ pg_kafka.compression_type = 'gzip'
   anything decodes. Past that every partition is answered MESSAGE_TOO_LARGE (Kafka streams
   validation and has no such limit), so a request of over ~1.1 million records, or a request
   of small records near the 100 MB frame limit, is refused.
+- A request whose records take more than 2 MiB decoded (a default-size 1 MiB request that
+  is compressed, or of records under some 200 bytes) decodes off the network I/O threads, at
+  most two such decodes at a time. A request that finds both taken waits its turn (in arrival
+  order, one request per connection at a time; the connection reads nothing more meanwhile),
+  and so does any request that finds the 512 MiB of decoded records waiting for the database
+  full, until room comes free. The wait is at most half the request's `timeout_ms` and at most
+  10 s (Java and librdkafka send their `request.timeout.ms`, 30 s by default, so the answer
+  reaches them first); past it the request is answered REQUEST_TIMED_OUT (7) on every
+  partition and nothing is written. Clients retry it (an idempotent producer keeps its order;
+  a non-idempotent one with several requests in flight may reorder, as on any retriable
+  error). Kafka has no such limit on decoding: when its request queue is full
+  (`queued.max.requests`, 500) or it lacks memory for requests (`queued.max.request.bytes`,
+  unbounded by default) it stops reading connections, and its clients time out on their own. An acks=0 request that times out closes its connection.
 - zstd frames may declare a window of at most 2^27 bytes (128 MiB), as in Kafka; a decoder's
   window counts toward that limit as it fills (as much again as the decoded bytes, up to the
   window). A larger window is CORRUPT_MESSAGE (Kafka 3.7: UNKNOWN_SERVER_ERROR). zstd on
@@ -640,9 +653,11 @@ reference: [AUTHENTICATION.md](AUTHENTICATION.md).
   `max_bytes`). `TCP_NODELAY` is set on every socket. SASL credential lookups are rate limited
   per IP address (10/s, burst 20; Kafka has none). A connection closed for a bad frame, a timeout
   or an acks=0 error first delivers the responses of every request it read before (up to 30 s).
-  Decoded Produce records waiting for the DB thread hold at most 512 MiB together; a request that
-  would exceed it closes its connection. Decodes of more than 1 MiB run off the I/O threads, at
-  most two at a time.
+  Decoded Produce records waiting for the DB thread hold at most 512 MiB together, and decodes
+  of more than 2 MiB run off the I/O threads, at most two at a time; a request that finds no
+  room waits for it, up to 10 s, and is then answered REQUEST_TIMED_OUT (see §2). A request's
+  frame counts against the frame budget while it waits, as an incomplete frame does (one the
+  exhausted budget cannot take is answered REQUEST_TIMED_OUT at once).
 
 ## Compatibility Testing
 

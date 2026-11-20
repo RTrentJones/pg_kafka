@@ -11,7 +11,9 @@
 //! reading responses fills its TCP receive window, the writer blocks, permits stop
 //! coming back and the reader stops reading: the raw request bytes a connection holds are
 //! bounded (what a Produce's compressed records decode to is bounded by
-//! `protocol::decode_budget`) and the backpressure reaches the client through TCP.
+//! `protocol::decode_budget`) and the backpressure reaches the client through TCP. A Produce
+//! that waits for room to decode stops the reader until it has decoded, so a connection
+//! waits for one such decode at a time.
 
 use bytes::BytesMut;
 use futures::stream::{Stream, StreamExt};
@@ -277,7 +279,20 @@ where
             return Err(Close::Protocol);
         }
 
-        match protocol::parse_request(frame, response_tx) {
+        let parsed = match protocol::parse_request(frame, response_tx) {
+            // A Produce whose records wait for room to decode waits here, holding no thread:
+            // this connection reads nothing more meanwhile, so it waits for one decode at a
+            // time and its requests reach the DB thread in the order they were sent.
+            Ok(Some(request)) => {
+                tokio::select! {
+                    biased;
+                    _ = &mut self.writer_gone => return Err(Close::WriterGone),
+                    finished = protocol::finish_request(request) => finished,
+                }
+            }
+            other => other,
+        };
+        match parsed {
             // Before SASL authentication the network thread answers ApiVersions itself,
             // as Kafka's authenticator does: an anonymous peer never reaches the one DB
             // thread, so it cannot delay authenticated clients' requests or the
