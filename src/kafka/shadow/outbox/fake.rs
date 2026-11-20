@@ -69,6 +69,10 @@ pub struct State {
     pub ongoing_txns: std::collections::HashSet<(i64, i16)>,
     /// Make `ongoing_transactions` fail (None).
     pub fail_ongoing_lookup: bool,
+    /// Make `apply_delivered` fail (`Err`).
+    pub fail_apply_delivered: bool,
+    /// Make `apply_delivered` raise (panic, as a Postgres ERROR unwinds).
+    pub raise_in_apply_delivered: bool,
     /// Make `claim_due_outbox_rows` fail.
     pub fail_claim: bool,
     /// What `current_transaction_id` returns.
@@ -353,6 +357,13 @@ impl ShadowDb for InMemoryShadowDb {
 
     fn apply_delivered(&self, rows: &[(RowKey, i64)], metrics: bool) -> Result<usize> {
         let mut s = self.state();
+        if s.fail_apply_delivered {
+            return Err(KafkaError::Internal("apply_delivered failed".to_string()));
+        }
+        if s.raise_in_apply_delivered {
+            drop(s);
+            panic!("ERROR: apply_delivered raised");
+        }
         let now = s.now_ms;
         let mut n = 0;
         for &(key, external_offset) in rows {

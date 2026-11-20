@@ -4,7 +4,9 @@
 //! - a full librdkafka queue holds back only the records behind it, not the
 //!   sync-mode response timeouts;
 //! - the transaction-timeout sweep drops the forward buffers of the
-//!   transactions it aborts.
+//!   transactions it aborts;
+//! - an ERROR while applying forward acks loses no ack (no lost-attempt count,
+//!   no duplicate delivery).
 
 use crate::common::{create_db_client, create_producer, TestResult};
 use crate::setup::TestContext;
@@ -14,7 +16,9 @@ use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 use std::time::{Duration, Instant};
 use tokio_postgres::Client;
 
-use super::external_client::{get_internal_bootstrap_servers, verify_external_kafka_ready};
+use super::external_client::{
+    count_external_messages, get_internal_bootstrap_servers, verify_external_kafka_ready,
+};
 use super::helpers::{enable_shadow_mode, ShadowMode, ShadowTopicConfig, SyncMode, WriteMode};
 
 fn config(mode: ShadowMode, sync_mode: SyncMode) -> ShadowTopicConfig {
@@ -367,6 +371,109 @@ pub async fn test_shadow_timed_out_transaction_buffer_is_dropped() -> TestResult
 
     drop(producer);
     ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// An ERROR while the worker applies a delivery ack (here a trigger that
+/// refuses to mark the row delivered) rolls the application back. The ack is
+/// applied again on a later tick: the row is delivered without a lost attempt
+/// counted against it and without being forwarded twice.
+pub async fn test_shadow_ack_application_error_loses_no_ack() -> TestResult {
+    println!("=== Test: an ERROR applying acks loses no ack ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("shadow-ack-error").await;
+    verify_external_kafka_ready().await?;
+    enable_shadow_mode(
+        ctx.db(),
+        &topic,
+        &config(ShadowMode::Shadow, SyncMode::Async),
+    )
+    .await?;
+    let id = topic_id(ctx.db(), &topic).await?;
+    let trigger = format!("kt_refuse_ack_{id}");
+    ctx.db()
+        .batch_execute(&format!(
+            "CREATE FUNCTION public.{trigger}() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN
+                 IF NEW.topic_id = {id} AND NEW.external_offset IS NOT NULL
+                    AND OLD.external_offset IS NULL THEN
+                     RAISE EXCEPTION 'kafka_test: delivery ack refused';
+                 END IF;
+                 RETURN NEW;
+             END $$;
+             CREATE TRIGGER {trigger} BEFORE UPDATE ON kafka.shadow_tracking
+                 FOR EACH ROW EXECUTE FUNCTION public.{trigger}();"
+        ))
+        .await?;
+
+    let result = async {
+        println!("Step 1: produce one record; its delivery ack fails to apply...");
+        let producer = create_producer()?;
+        producer
+            .send(
+                FutureRecord::to(&topic).key("k").payload("once"),
+                Duration::from_secs(10),
+            )
+            .await
+            .map_err(|(e, _)| e)?;
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        let (delivered, retries): (bool, i32) = {
+            let row = ctx
+                .db()
+                .query_one(
+                    "SELECT external_offset IS NOT NULL, retry_count \
+                     FROM kafka.shadow_tracking WHERE topic_id = $1",
+                    &[&id],
+                )
+                .await?;
+            (row.get(0), row.get(1))
+        };
+        assert!(!delivered, "the trigger refuses the delivered mark");
+        println!("  while refused: retry_count={retries}");
+
+        println!("Step 2: drop the trigger; the kept ack is applied...");
+        ctx.db()
+            .batch_execute(&format!("DROP TRIGGER {trigger} ON kafka.shadow_tracking"))
+            .await?;
+        let start = Instant::now();
+        while undelivered(ctx.db(), id).await? > 0 {
+            if start.elapsed() > Duration::from_secs(60) {
+                return Err("the row was not delivered within 60 s".into());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let retry_count: i32 = ctx
+            .db()
+            .query_one(
+                "SELECT retry_count FROM kafka.shadow_tracking WHERE topic_id = $1",
+                &[&id],
+            )
+            .await?
+            .get(0);
+        assert_eq!(
+            retry_count, 0,
+            "the ack was lost: its attempt was counted as failed and re-sent"
+        );
+        let external = count_external_messages(&topic, Duration::from_secs(5)).await?;
+        assert_eq!(external, 1, "forwarded {external} times");
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await
+    .map_err(|e| e.to_string());
+
+    if let Err(e) = ctx
+        .db()
+        .batch_execute(&format!(
+            "DROP TRIGGER IF EXISTS {trigger} ON kafka.shadow_tracking; \
+             DROP FUNCTION IF EXISTS public.{trigger}()"
+        ))
+        .await
+    {
+        eprintln!("⚠️  cleanup: failed to drop trigger {trigger}: {e}");
+    }
+    ctx.cleanup().await?;
+    result?;
     println!("✅ Test PASSED\n");
     Ok(())
 }

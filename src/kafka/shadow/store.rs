@@ -175,6 +175,11 @@ pub struct ShadowStore<S: KafkaStore, D: ShadowDb = SpiShadowDb> {
     poll_requested: AtomicBool,
     /// Consecutive failed outbox ticks and the pause they imposed.
     outbox_failures: Mutex<TickFailures>,
+    /// Acks taken off the channel and not yet applied. They stay here until
+    /// their statement succeeds, so an ERROR (which rolls the ack application
+    /// back) or a failed statement re-applies them on the next tick instead of
+    /// losing them.
+    unapplied_acks: Mutex<Vec<ForwardAck>>,
 }
 
 /// The outbox tick's failure backoff.
@@ -221,6 +226,7 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
             sync_pending: Mutex::new(Vec::new()),
             poll_requested: AtomicBool::new(false),
             outbox_failures: Mutex::new(TickFailures::default()),
+            unapplied_acks: Mutex::new(Vec::new()),
         }
     }
 
@@ -682,44 +688,53 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
     /// Drain the currently-available forward acks and finalize their outbox
     /// rows, a few statements per tick whatever the number of acks.
     /// Non-blocking. Returns the number of acks applied.
+    ///
+    /// Acks whose statement fails, and every ack of a tick whose application
+    /// raised an ERROR (the caller's subtransaction rolls it back), are applied
+    /// again on the next tick, before new ones. Their rows stay in flight
+    /// meanwhile, so the poll does not re-send them.
     pub fn drain_forward_acks(&self) -> usize {
-        let mut acks: Vec<ForwardAck> = Vec::new();
-        {
+        let acks: Vec<ForwardAck> = {
+            let mut unapplied = lock(&self.unapplied_acks);
             let guard = read_lock(&self.forward_ack_rx);
             if let Some(rx) = guard.as_ref() {
-                while acks.len() < MAX_ACKS_PER_TICK {
+                while unapplied.len() < MAX_ACKS_PER_TICK {
                     match rx.try_recv() {
-                        Ok(ack) => acks.push(ack),
+                        Ok(ack) => unapplied.push(ack),
                         Err(_) => break,
                     }
                 }
             }
-        }
+            unapplied.clone()
+        };
         if acks.len() >= MAX_ACKS_PER_TICK {
             self.poll_requested.store(true, Ordering::Relaxed);
         }
-        self.apply_acks(&acks);
-        acks.len()
+        // Reached only when no statement raised an ERROR.
+        let retry = self.apply_acks(&acks);
+        let applied = acks.len() - retry.len();
+        *lock(&self.unapplied_acks) = retry;
+        applied
     }
 
-    /// Finalize outbox rows from forward acks.
+    /// Finalize outbox rows from forward acks. Returns the acks whose
+    /// statement failed, to be applied again.
     ///
     /// Delivered → external offset recorded; the row is done. Failed → the row
     /// stays pending with `retry_count + 1` and the error, and is re-attempted
     /// after its backoff; at `pg_kafka.shadow_max_retries` it is a dead letter.
     /// NotAttempted → the attempt is closed without counting. The forward metric
-    /// is counted exactly once, on the transition.
-    fn apply_acks(&self, acks: &[ForwardAck]) {
+    /// is counted exactly once, on the transition. A row leaves the in-flight
+    /// set (and may be claimed again) only once every statement has run.
+    fn apply_acks(&self, acks: &[ForwardAck]) -> Vec<ForwardAck> {
         if acks.is_empty() {
-            return;
+            return Vec::new();
         }
         let settings = self.db.settings();
         let mut delivered: Vec<(RowKey, i64)> = Vec::new();
         let mut failed: Vec<(RowKey, String)> = Vec::new();
         let mut not_attempted: Vec<RowKey> = Vec::new();
         for ack in acks {
-            // The forward has resolved, so the row may be claimed again.
-            self.inflight.complete(&ack.row);
             match &ack.outcome {
                 ForwardOutcome::Delivered(x) => delivered.push((ack.row, *x)),
                 ForwardOutcome::Failed(e) => failed.push((ack.row, e.clone())),
@@ -727,6 +742,7 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
             }
         }
 
+        let mut delivered_ok = true;
         match self
             .db
             .apply_delivered(&delivered, settings.metrics_enabled)
@@ -736,8 +752,12 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
                     .forwarded
                     .fetch_add(n as u64, Ordering::Relaxed);
             }
-            Err(e) => tracing::warn!("Shadow: failed to apply delivery acks: {:?}", e),
+            Err(e) => {
+                tracing::warn!("Shadow: failed to apply delivery acks (retried): {:?}", e);
+                delivered_ok = false;
+            }
         }
+        let mut failed_ok = true;
         match self
             .db
             .apply_failed(&failed, settings.max_retries, settings.metrics_enabled)
@@ -760,11 +780,35 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
                     );
                 }
             }
-            Err(e) => tracing::warn!("Shadow: failed to apply failure acks: {:?}", e),
+            Err(e) => {
+                tracing::warn!("Shadow: failed to apply failure acks (retried): {:?}", e);
+                failed_ok = false;
+            }
         }
+        let mut not_attempted_ok = true;
         if let Err(e) = self.db.apply_not_attempted(&not_attempted) {
-            tracing::warn!("Shadow: failed to apply not-attempted acks: {:?}", e);
+            tracing::warn!(
+                "Shadow: failed to apply not-attempted acks (retried): {:?}",
+                e
+            );
+            not_attempted_ok = false;
         }
+
+        let mut retry = Vec::new();
+        for ack in acks {
+            let applied = match ack.outcome {
+                ForwardOutcome::Delivered(_) => delivered_ok,
+                ForwardOutcome::Failed(_) => failed_ok,
+                ForwardOutcome::NotAttempted(_) => not_attempted_ok,
+            };
+            if applied {
+                // The forward has resolved, so the row may be claimed again.
+                self.inflight.complete(&ack.row);
+            } else {
+                retry.push(ack.clone());
+            }
+        }
+        retry
     }
 
     /// Reload the per-topic configuration from `kafka.shadow_config` (at

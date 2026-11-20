@@ -600,6 +600,69 @@ fn the_partition_share_is_an_equal_split_of_at_least_one() {
     assert_eq!(per_partition_claim_cap(0, 3), 1);
 }
 
+/// Claim the one seeded row and answer it Delivered on the ack channel.
+fn claimed_and_acked(h: &Harness, key: RowKey) {
+    seed_rows(&h.store, &[key]);
+    assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 1);
+    drop(sent_records(h));
+    h.acks.send(ok_ack(key, 42)).unwrap();
+}
+
+/// After its ack is finally applied the row was delivered exactly once: no lost
+/// attempt counted, not re-sent, the forward metric counted once.
+fn assert_delivered_once(h: &Harness, key: RowKey) {
+    let row = h.store.db().row(key).unwrap();
+    assert_eq!(row.external_offset, Some(42));
+    assert_eq!(row.retry_count, 0, "no attempt counted as lost");
+    assert!(!row.attempt_open);
+    assert_eq!(
+        h.store.db().state().metrics[&key.partition()].messages_forwarded,
+        1
+    );
+    assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 0, "not re-sent");
+}
+
+#[test]
+fn a_failed_ack_statement_keeps_its_acks_for_the_next_tick() {
+    let h = async_harness(16);
+    let key = RowKey::new(T, 0, 3);
+    claimed_and_acked(&h, key);
+
+    h.store.db().state().fail_apply_delivered = true;
+    assert_eq!(h.store.drain_forward_acks(), 0);
+    // The row is still in flight: the poll does not re-send it meanwhile.
+    assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 0);
+    assert_eq!(sent_records(&h).len(), 0);
+
+    h.store.db().state().fail_apply_delivered = false;
+    assert_eq!(h.store.drain_forward_acks(), 1);
+    assert_delivered_once(&h, key);
+}
+
+#[test]
+fn an_error_raised_while_applying_acks_does_not_lose_them() {
+    let h = async_harness(16);
+    let key = RowKey::new(T, 0, 3);
+    claimed_and_acked(&h, key);
+
+    // A Postgres ERROR unwinds out of the ack application (the worker's
+    // subtransaction rolls it back and the tick goes on to poll).
+    h.store.db().state().raise_in_apply_delivered = true;
+    let raised = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        h.store.drain_forward_acks()
+    }));
+    assert!(raised.is_err());
+    assert_eq!(
+        h.store.poll_and_forward_outbox().unwrap(),
+        0,
+        "still in flight"
+    );
+
+    h.store.db().state().raise_in_apply_delivered = false;
+    assert_eq!(h.store.drain_forward_acks(), 1);
+    assert_delivered_once(&h, key);
+}
+
 #[test]
 fn full_forward_channel_closes_the_attempt_without_counting_it() {
     let h = async_harness(1);
