@@ -20,6 +20,7 @@
 //! generated files), connects as a superuser, and has `openssl` on PATH. All tests are
 //! registered `parallel_safe: false` because they restart the listener.
 
+pub mod advertised;
 pub mod api_metrics;
 pub mod pre_auth;
 pub mod tests;
@@ -312,6 +313,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         tests::test_auth_sasl_ssl_roundtrip: sequential,
         tests::test_auth_user_management_sql: sequential,
         tests::test_auth_mutual_tls: sequential,
+        advertised::test_auth_listeners_advertise_configured_addresses: sequential,
         // Before the teardown, which restarts the worker and so resets the counters.
         api_metrics::test_auth_sasl_requests_counted_in_api_metrics: sequential,
         tests::test_auth_teardown_restores_default_listeners: sequential,

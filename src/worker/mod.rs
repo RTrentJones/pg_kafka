@@ -108,7 +108,10 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     let network = network::start(&security, Arc::clone(&runtime_context), &shadow_store);
     stop_network_thread_on_exit(network.shutdown_tx.clone());
 
-    let broker_metadata = BrokerMetadata::new(advertised_host(&config.host), config.port);
+    // The primary listener's advertised address (`pg_kafka.advertised_address`, else
+    // derived from its bind address by the same rule as every other listener).
+    let (advertised_host, advertised_port) = security.listeners[0].advertised.clone();
+    let broker_metadata = BrokerMetadata::new(advertised_host, advertised_port);
     // Consumer group membership, in memory, on this thread only.
     let coordinator = GroupCoordinator::new();
     let env = RequestEnv {
@@ -155,16 +158,6 @@ fn new_shadow_store(config: &Config) -> ShadowStore<PostgresStore> {
         );
     }
     shadow_store
-}
-
-/// The host Metadata and FindCoordinator advertise for the primary listener: clients
-/// cannot connect to the "all interfaces" address 0.0.0.0, so it becomes `localhost`.
-fn advertised_host(bind_host: &str) -> String {
-    if bind_host == "0.0.0.0" || bind_host.is_empty() {
-        "localhost".to_string()
-    } else {
-        bind_host.to_string()
-    }
 }
 
 /// The listener security settings the GUCs describe for the worker's host and port.
@@ -376,18 +369,5 @@ impl MainLoop<'_> {
             &self.features,
             &self.network.inbox,
         );
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_advertised_host_replaces_the_all_interfaces_address() {
-        assert_eq!(advertised_host("0.0.0.0"), "localhost");
-        assert_eq!(advertised_host(""), "localhost");
-        assert_eq!(advertised_host("127.0.0.1"), "127.0.0.1");
-        assert_eq!(advertised_host("broker.internal"), "broker.internal");
     }
 }

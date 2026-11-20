@@ -27,14 +27,28 @@ The primary listener is `pg_kafka.host`:`pg_kafka.port` and speaks
 
 ```sql
 ALTER SYSTEM SET pg_kafka.additional_listeners =
-  'SASL_SSL://0.0.0.0:9093, SSL://:9094';   -- an empty host means pg_kafka.host
+  'SASL_SSL://0.0.0.0:9093@broker.example.com:9093, SSL://:9094';  -- an empty host means pg_kafka.host
 ```
 
-Each listener advertises its own `host:port` in Metadata and FindCoordinator responses
-(Kafka's per-listener `advertised.listeners`; an unspecified bind address advertises
-`localhost`), so a client that bootstrapped on a listener keeps using it. A typical
-deployment keeps the primary listener PLAINTEXT on loopback for local tools and exposes
-only a `SASL_SSL` listener.
+Each listener advertises its own address in Metadata and FindCoordinator responses, so a
+client that bootstrapped on a listener keeps using it. This is Kafka's per-listener
+`advertised.listeners`, written next to the listener it belongs to:
+
+* `PROTOCOL://host:port@advertised_host:advertised_port` advertises the part after `@`
+  (`advertised_port` defaults to the bind port; an IPv6 literal goes in brackets,
+  `@[2001:db8::1]:9093`). For the primary listener the same `host[:port]` goes in
+  `pg_kafka.advertised_address`.
+* Without one, a listener advertises its bind host, except that an unspecified bind
+  address (`0.0.0.0`, `::`) is not something a client can connect to and advertises
+  `localhost`, which serves local clients only. The worker logs a WARNING at start for
+  every listener that is reachable from other hosts but advertises a loopback address:
+  remote clients would bootstrap and then fail to connect.
+
+An advertised address must name a host (not `0.0.0.0` or `::`) and a port from 1 to
+65535 (it may differ from the bind port, behind NAT or a load balancer); a bad one stops
+the worker with an error naming the setting. A typical deployment keeps the primary
+listener PLAINTEXT on loopback for local tools and exposes only a `SASL_SSL` listener
+with its public name after `@`.
 
 Why Kafka's vocabulary rather than one "TLS on/off" switch: Kafka clients are configured
 with `security.protocol=SSL|SASL_SSL|...`, and running several listeners at once lets an
@@ -46,7 +60,8 @@ operator migrate clients one at a time (and lets the E2E suite keep using PLAINT
 | GUC | Default | Meaning |
 |-----|---------|---------|
 | `pg_kafka.security_protocol` | `PLAINTEXT` | Protocol of the primary listener |
-| `pg_kafka.additional_listeners` | empty | Extra `PROTOCOL://host:port` listeners, comma separated |
+| `pg_kafka.additional_listeners` | empty | Extra `PROTOCOL://host:port[@advertised_host[:port]]` listeners, comma separated |
+| `pg_kafka.advertised_address` | empty | `host[:port]` the primary listener advertises (empty: `pg_kafka.host`, `localhost` for `0.0.0.0` / `::`) |
 | `pg_kafka.ssl_cert_file` | empty | PEM certificate chain (required by any SSL / SASL_SSL listener) |
 | `pg_kafka.ssl_key_file` | empty | PEM private key (PKCS#8, PKCS#1 or SEC1) |
 | `pg_kafka.ssl_ca_file` | empty | PEM CA bundle; when set, TLS clients must present a certificate signed by it |

@@ -158,7 +158,8 @@ fn build_listener_securities(
     Ok(settings
         .listeners
         .iter()
-        .map(|spec| {
+        .enumerate()
+        .map(|(i, spec)| {
             Arc::new(ListenerSecurity {
                 protocol: spec.protocol,
                 bind_addr: spec.bind_addr(),
@@ -169,7 +170,8 @@ fn build_listener_securities(
                     .flatten()
                     .map(tokio_rustls::TlsAcceptor::from),
                 sasl_mechanisms: mechanisms.clone(),
-                advertised: spec.advertised.clone(),
+                // The worker's BrokerMetadata already advertises the primary listener.
+                advertised: (i > 0).then(|| spec.advertised.clone()),
                 limits: settings.limits,
             })
         })
