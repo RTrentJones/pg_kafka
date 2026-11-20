@@ -93,15 +93,16 @@ pg_kafka.compression_type = 'gzip'
   epoch, KIP-360, as the Java client does) is accepted when it starts at sequence 0 and
   becomes the producer's epoch
 - ✅ PostgreSQL advisory locks for sequence serialization
-- **Deviation:** a producer with no state on a partition must start at sequence 0 there
-  (OUT_OF_ORDER_SEQUENCE_NUMBER otherwise). Kafka accepts any first sequence from an
-  unknown producer (its producer state can expire with the log); pg_kafka keeps producer
-  state for 7 idle days and refuses a first batch whose predecessors never arrived.
-- **Deviation:** a Produce with a producer id that has no `kafka.producer_ids` row (never
-  issued by InitProducerId, or removed by the retention sweep after 7 idle days) is
-  UNKNOWN_PRODUCER_ID (59). Kafka 3.7 creates the producer's state on the fly and accepts
-  it at sequence 0. Clients get their ids from InitProducerId, so only a producer idle long
-  enough for its state to be removed meets this.
+- ✅ A producer the broker holds no state for (a producer id with no `kafka.producer_ids`
+  row: removed by the retention sweep after 7 idle days, lost with DROP EXTENSION, or never
+  issued here) is accepted as Kafka 3.7 accepts it (KIP-360): its batch is written at
+  whatever sequence it carries, the producer is recorded at the epoch it presents, and its
+  later batches are deduplicated and sequence-checked from there. InitProducerId never
+  hands out a producer id that is recorded this way.
+- **Deviation:** a producer that has state, but none on this partition, must start at
+  sequence 0 there (OUT_OF_ORDER_SEQUENCE_NUMBER otherwise). Kafka keeps producer state
+  per partition and accepts any first sequence on a partition with none; pg_kafka keeps
+  the epoch per producer and refuses a first batch whose predecessors never arrived.
 - Produce responses report `log_append_time_ms = -1` (topics use CreateTime)
 
 **Client Impact:**

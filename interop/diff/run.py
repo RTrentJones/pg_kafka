@@ -72,13 +72,6 @@ KNOWN = {
     ("transactions", "batch_layout"): (
         "deviation", "PROTOCOL_DEVIATIONS.md §7: records are regrouped at read time into one "
         "batch per run of a producer's consecutive offsets (and §4: no control batches)"),
-    ("produce_idempotent", "unknown_pid"): (
-        "deviation", "PROTOCOL_DEVIATIONS.md §3: a producer id InitProducerId never issued "
-        "(or whose state expired) is UNKNOWN_PRODUCER_ID; Kafka 3.7 accepts it at sequence 0"),
-    ("produce_idempotent", "log"): ("deviation", "PROTOCOL_DEVIATIONS.md §3: follows from "
-                                    "unknown_pid (the record is not written)"),
-    ("produce_idempotent", "log.offsets"): ("deviation", "PROTOCOL_DEVIATIONS.md §3: follows "
-                                            "from unknown_pid"),
 }
 
 # Response fields that differ between any two brokers and carry no protocol meaning here.

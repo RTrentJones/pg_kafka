@@ -29,8 +29,8 @@ pub(crate) use delegate::{
 pub use headers::{decode_headers_json, encode_headers_json};
 pub use sequence::{
     batch_last_sequence, next_sequence, stored_last_sequence, transactional_epoch_is_stale,
-    validate_sequence, CachedBatch, ProducerBatch, SequenceCheck, SequenceValidation,
-    PRODUCER_BATCH_CACHE,
+    validate_sequence, validate_unknown_producer, CachedBatch, ProducerBatch, SequenceCheck,
+    SequenceValidation, PRODUCER_BATCH_CACHE,
 };
 
 /// Metadata about a topic (storage layer representation)
