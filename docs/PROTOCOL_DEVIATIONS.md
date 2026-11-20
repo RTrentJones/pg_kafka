@@ -75,19 +75,28 @@ pg_kafka.compression_type = 'gzip'
   of small records near the 100 MB frame limit, is refused.
 - zstd frames may declare a window of at most 2^27 bytes (128 MiB), as in Kafka; a decoder's
   window counts toward that limit as it fills (as much again as the decoded bytes, up to the
-  window). A larger window is CORRUPT_MESSAGE (Kafka 3.7: UNKNOWN_SERVER_ERROR).
-- Each partition's data must be exactly one RecordBatch v2, as in Kafka 3.7 for Produce v3+:
-  a legacy MessageSet (magic 0/1), empty or cut-short data, or a negative record count is
-  INVALID_RECORD, as is a record count that does not match the records (too few or too
-  many), a record with bytes past its fields, a varint longer than 5 bytes, a varlong
-  longer than 10, or a negative header count or header key length; a bad CRC or a batch
-  length shorter than the header is CORRUPT_MESSAGE.
-  Unlike Kafka, which answers only the offending partition, pg_kafka answers every partition
-  of the request with that code and writes none of them.
-- As in Kafka, a negative key, value or header value length is null (a null header value
-  is stored empty) and duplicate header keys are stored, in order (see §7 for what a fetch
-  returns). A header key that is not UTF-8 is accepted and stored with replacement
-  characters, what a Java client reads it as; Kafka stores its bytes.
+  window). A larger window is CORRUPT_MESSAGE (Kafka 3.7: UNKNOWN_SERVER_ERROR). zstd on
+  Produce v3-v6 is UNSUPPORTED_COMPRESSION_TYPE (76), as in Kafka (KIP-110).
+- Each partition's data must be exactly one RecordBatch v2, checked as Kafka 3.7 checks it
+  and answered with the same codes:
+  - INVALID_RECORD: a legacy MessageSet (magic 0/1); empty or cut-short data; a second
+    complete batch; a base offset other than 0; a record count of 0 or less, or one that
+    does not match lastOffsetDelta + 1 or the records (too few or too many); a control
+    batch; a producer id with a negative base sequence; a record with bytes past its
+    fields, a varint longer than 5 bytes, a varlong longer than 10, or a negative header
+    count or header key length.
+  - CORRUPT_MESSAGE: a bad CRC; a batch length under 14, or a v2 batch length shorter than
+    its header; a magic byte outside 0-2 (on the batch or on data after it). Unknown codec
+    ids are CORRUPT_MESSAGE too (Kafka 3.7: UNKNOWN_SERVER_ERROR).
+  - Data after the batch too short to hold another batch is ignored, as Kafka trims it.
+  - As in Kafka, a negative key, value or header value length is null (a null header
+    value is stored empty) and duplicate header keys are stored, in order (see §7 for
+    what a fetch returns). A header key that is not UTF-8 is accepted and stored with
+    replacement characters, what a Java client reads it as; Kafka stores its bytes.
+
+  Unlike Kafka, which answers only the offending partition once the request has parsed,
+  pg_kafka answers every partition of the request with that code and writes none of them
+  (the framing and zstd checks fail the whole request in Kafka too).
 - Server compresses responses based on GUC setting
 
 ### 3. Idempotent Producer ✅ Fully Supported (Phase 9)

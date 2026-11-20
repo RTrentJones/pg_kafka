@@ -19,7 +19,8 @@ use crate::kafka::protocol::decode_budget::{
     MAX_DECODED_REQUEST_BYTES,
 };
 use crate::kafka::protocol::{
-    least_decoded_memory, parse_record_batch_with_metadata, ParsedRecordBatch,
+    least_decoded_memory, parse_record_batch_with_metadata, validate_produce_records,
+    ParsedRecordBatch,
 };
 use crate::kafka::storage::{LogStore, TopicStore};
 
@@ -89,7 +90,7 @@ impl KafkaApi for ProduceApi {
 
     fn decode(
         wire: ProduceRequest,
-        _header: &RequestHeader,
+        header: &RequestHeader,
     ) -> Result<Self::Request, Rejection<Self::Echo>> {
         let acks = wire.acks;
         let requested: TopicPartitions = wire
@@ -113,7 +114,8 @@ impl KafkaApi for ProduceApi {
             });
         }
 
-        let (topic_data, decoded) = match decode_all_records(&wire.topic_data) {
+        let zstd_allowed = header.api_version >= MIN_ZSTD_VERSION;
+        let (topic_data, decoded) = match decode_all_records(&wire.topic_data, zstd_allowed) {
             Ok(decoded) => decoded,
             Err(failure) => {
                 // acks=0 never gets a response: an unsolicited one would be read as the
@@ -224,6 +226,9 @@ impl KafkaApi for ProduceApi {
     }
 }
 
+/// The first Produce version that may carry zstd batches (KIP-110).
+const MIN_ZSTD_VERSION: i16 = 7;
+
 /// Why a Produce request's records did not decode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DecodeFailure {
@@ -284,16 +289,43 @@ fn decode_records(
     Ok((topic_data, budget.into_charge()))
 }
 
+/// What Kafka checks of every partition's data while it parses the request
+/// ([`validate_produce_records`]), before any partition decodes: the first failure fails the
+/// request.
+fn validate_all_records(
+    topics: &[kafka_protocol::messages::produce_request::TopicProduceData],
+    zstd_allowed: bool,
+) -> Result<(), DecodeFailure> {
+    for topic in topics {
+        for partition in &topic.partition_data {
+            let Some(batch) = &partition.records else {
+                continue;
+            };
+            if let Err(code) = validate_produce_records(batch, zstd_allowed) {
+                warn!(
+                    "Refusing the records of topic={}, partition={}: error {code}",
+                    topic.name.0.as_str(),
+                    partition.index
+                );
+                return Err(DecodeFailure::Rejected(code));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Decode the records of `topics`, keeping large decodes off the I/O threads.
 ///
 /// A request whose batches take at most [`INLINE_DECODE_BYTES`] of memory by what they
 /// declare (their bytes and record counts) is decoded in place, within that budget: the
-/// common case of small (compressed or not) batches. One that declares more, or that
-/// expands past it, is decoded by [`run_large_decode`] within [`MAX_DECODED_REQUEST_BYTES`]
-/// (or turned away as [`DecodeFailure::Busy`] when too many already wait for it).
+/// common case of small (compressed or not) batches. One that declares more, or that expands past it, is
+/// decoded by [`run_large_decode`] within [`MAX_DECODED_REQUEST_BYTES`] (or turned away as
+/// [`DecodeFailure::Busy`] when too many already wait for it).
 fn decode_all_records(
     topics: &[kafka_protocol::messages::produce_request::TopicProduceData],
+    zstd_allowed: bool,
 ) -> Result<DecodedTopics, DecodeFailure> {
+    validate_all_records(topics, zstd_allowed)?;
     let declared: usize = topics
         .iter()
         .flat_map(|t| t.partition_data.iter())
@@ -373,5 +405,94 @@ fn emit_produce_notifications<S: TopicStore + LogStore + ?Sized>(
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kafka::protocol::recordbatch_test_batches::{batch_with, record, v, Header};
+    use crate::kafka::protocol::ERROR_UNSUPPORTED_COMPRESSION_TYPE;
+    use kafka_protocol::messages::produce_request::{
+        PartitionProduceData as WirePartition, TopicProduceData as WireTopic,
+    };
+
+    /// One topic of `batches`, one per partition.
+    fn topics(batches: Vec<bytes::Bytes>) -> Vec<WireTopic> {
+        let mut topic = WireTopic::default();
+        topic.name = kafka_protocol::messages::TopicName("t".into());
+        topic.partition_data = (0..)
+            .zip(batches)
+            .map(|(index, batch)| {
+                let mut p = WirePartition::default();
+                p.index = index;
+                p.records = Some(batch);
+                p
+            })
+            .collect();
+        vec![topic]
+    }
+
+    /// A batch of `n` records of a 10-byte key and a `len`-byte value.
+    fn batch_of(n: usize, len: usize) -> bytes::Bytes {
+        let value = vec![b'v'; len];
+        let section: Vec<u8> = (0..n)
+            .flat_map(|i| {
+                let i = i64::try_from(i).unwrap();
+                let value_len = v(i64::try_from(len).unwrap());
+                record(&[
+                    &[0],
+                    &v(0),
+                    &v(i),
+                    &v(10),
+                    b"key-000000",
+                    &value_len,
+                    &value,
+                    &v(0),
+                ])
+            })
+            .collect();
+        batch_with(&section, i32::try_from(n).unwrap(), Header::default())
+    }
+
+    #[test]
+    fn zstd_is_refused_before_produce_v7_before_any_batch_decodes() {
+        use crate::kafka::constants::ERROR_INVALID_RECORD;
+        let x = record(&[&[0], &v(0), &v(0), &v(-1), &v(1), b"x", &v(0)]);
+        let zstd = batch_with(
+            &x,
+            1,
+            Header {
+                attributes: 4,
+                ..Header::default()
+            },
+        );
+        let rejected = |data: Vec<bytes::Bytes>, zstd_allowed| match decode_all_records(
+            &topics(data),
+            zstd_allowed,
+        ) {
+            Err(DecodeFailure::Rejected(code)) => Some(code),
+            _ => None,
+        };
+        // The batch is not zstd data at all: refused for its codec first.
+        assert_eq!(
+            rejected(vec![zstd.clone()], false),
+            Some(ERROR_UNSUPPORTED_COMPRESSION_TYPE)
+        );
+        assert_eq!(
+            rejected(vec![batch_of(1, 1), zstd.clone()], false),
+            Some(ERROR_UNSUPPORTED_COMPRESSION_TYPE),
+            "on any partition"
+        );
+        // From v7 on the codec is accepted and the batch fails to decompress.
+        assert_eq!(
+            rejected(vec![zstd.clone()], true),
+            Some(ERROR_CORRUPT_MESSAGE)
+        );
+        // An earlier partition's framing error comes first, as in Kafka.
+        assert_eq!(
+            rejected(vec![bytes::Bytes::from_static(b"short"), zstd], false),
+            Some(ERROR_INVALID_RECORD)
+        );
     }
 }

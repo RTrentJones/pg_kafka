@@ -467,8 +467,7 @@ pub async fn test_produce_of_data_that_is_not_one_v2_batch_is_refused() -> TestR
     let mut s = TcpStream::connect(("127.0.0.1", PORT)).await?;
 
     let good = plain_batch(&[Bytes::from_static(b"v")], Compression::None);
-    let mut negative_count = good.to_vec();
-    negative_count[57..61].copy_from_slice(&(-1i32).to_be_bytes());
+    let negative_count = batch_with(&tiny_records(1), -1, BatchHeader::default());
     let mut bad_crc = good.to_vec();
     *bad_crc.last_mut().expect("not empty") ^= 1;
     let mut two_legacy = legacy_entry(1, 0, b"one");
@@ -503,11 +502,7 @@ pub async fn test_produce_of_data_that_is_not_one_v2_batch_is_refused() -> TestR
             good.slice(..good.len() - 3),
             INVALID_RECORD,
         ),
-        (
-            "negative record count",
-            negative_count.into(),
-            INVALID_RECORD,
-        ),
+        ("negative record count", negative_count, INVALID_RECORD),
         ("bad CRC", bad_crc.into(), CORRUPT_MESSAGE),
     ];
     for (corr, (what, data, expected)) in (1..).zip(cases) {
@@ -570,6 +565,9 @@ pub async fn test_unsupported_version_acks0_produce_closes_connection() -> TestR
     Ok(())
 }
 
+/// UNSUPPORTED_COMPRESSION_TYPE: zstd on Produce v3-v6.
+const UNSUPPORTED_COMPRESSION_TYPE: i16 = 76;
+
 /// The `headers` column of `topic`'s rows as text, and their keys, in offset order.
 async fn stored_keys_and_headers(
     db: &tokio_postgres::Client,
@@ -588,10 +586,15 @@ async fn stored_keys_and_headers(
         .collect())
 }
 
-/// Batches are read with Kafka 3.7's grammar: a 6-byte timestamp-delta varlong (a 5-byte
-/// varint reader takes the key that follows for headers it charged nothing for) holds just
-/// its key, and duplicate header keys are kept in order and a non-UTF-8 header key is
-/// accepted.
+/// Batches are read with Kafka 3.7's grammar and checks, and nothing else is written:
+/// a 6-byte timestamp-delta varlong (a 5-byte varint reader takes the key that follows
+/// for headers it charged nothing for) holds just its key; duplicate header keys are kept
+/// in order and a non-UTF-8 header key is accepted; a batch of no records (which, from an
+/// idempotent producer, used to enter its batch cache and turn its next batch into a
+/// "duplicate") is INVALID_RECORD, as are a control batch, a lastOffsetDelta that
+/// disagrees with the record count and a base offset other than 0; a magic past 2 is
+/// CORRUPT_MESSAGE; zstd on Produce v3 is UNSUPPORTED_COMPRESSION_TYPE; and bytes after the
+/// batch too few for another batch are ignored.
 pub async fn test_record_batches_are_read_as_kafka_reads_them() -> TestResult {
     use crate::wire::Wire;
     println!("=== Test: record batches read as Kafka 3.7 reads them ===\n");
@@ -600,6 +603,15 @@ pub async fn test_record_batches_are_read_as_kafka_reads_them() -> TestResult {
     let created = create_topics_raw(vec![creatable(&topic, 3, 1)]).await?;
     assert_eq!(created[0].error_code, 0, "{created:?}");
     let mut wire = Wire::connect().await?;
+    let x = record(&[
+        &[0],
+        &varint(0),
+        &varint(0),
+        &varint(-1),
+        &varint(1),
+        b"x",
+        &varint(0),
+    ]);
 
     println!("Step 1: 20 records whose timestamp delta is a 6-byte varlong");
     let mut key = varint(-1);
@@ -662,6 +674,106 @@ pub async fn test_record_batches_are_read_as_kafka_reads_them() -> TestResult {
         "every header, in order"
     );
     println!("✅ stored {headers}");
+
+    println!("Step 3: an idempotent producer's batch of no records, then its first batch");
+    let (code, producer_id, epoch) = wire.init_producer_id(None, 60_000).await?;
+    assert_eq!(code, 0);
+    let idempotent = |count: i32, records: &[u8], base_sequence: i32| {
+        let header = BatchHeader {
+            producer_id,
+            producer_epoch: epoch,
+            base_sequence,
+            last_offset_delta: Some(0),
+            ..BatchHeader::default()
+        };
+        batch_with(records, count, header)
+    };
+    let (code, _) = wire.produce(&topic, 1, idempotent(0, &[], 0), None).await?;
+    assert_eq!(code, INVALID_RECORD, "a batch of no records");
+    for sequence in [0, 1] {
+        let (code, base) = wire
+            .produce(&topic, 1, idempotent(1, &x, sequence), None)
+            .await?;
+        assert_eq!(
+            (code, base),
+            (0, i64::from(sequence)),
+            "sequence {sequence}"
+        );
+    }
+    println!("✅ refused; sequences 0 and 1 then stored at offsets 0 and 1");
+
+    println!("Step 4: batch headers Kafka refuses, and data after a batch it ignores");
+    let with = |header: BatchHeader| batch_with(&x, 1, header);
+    let xy = [
+        x.clone(),
+        record(&[
+            &[0],
+            &varint(0),
+            &varint(1),
+            &varint(-1),
+            &varint(1),
+            b"y",
+            &varint(0),
+        ]),
+    ]
+    .concat();
+    let mut magic9 = with(BatchHeader::default()).to_vec();
+    magic9[16] = 9;
+    let cases: Vec<(&str, Bytes, i16)> = vec![
+        (
+            "a control batch",
+            with(BatchHeader {
+                attributes: 0x20,
+                ..BatchHeader::default()
+            }),
+            INVALID_RECORD,
+        ),
+        (
+            "lastOffsetDelta past the records",
+            batch_with(
+                &xy,
+                2,
+                BatchHeader {
+                    last_offset_delta: Some(5),
+                    ..BatchHeader::default()
+                },
+            ),
+            INVALID_RECORD,
+        ),
+        (
+            "base offset 5",
+            with(BatchHeader {
+                base_offset: 5,
+                ..BatchHeader::default()
+            }),
+            INVALID_RECORD,
+        ),
+        ("magic 9", magic9.into(), CORRUPT_MESSAGE),
+    ];
+    for (what, data, expected) in cases {
+        let (code, _) = wire.produce(&topic, 2, data, None).await?;
+        assert_eq!(code, expected, "{what}");
+        println!("  {what}: {code}");
+    }
+    let zstd = with(BatchHeader {
+        attributes: 4,
+        ..BatchHeader::default()
+    });
+    let mut request = produce_request(&topic, vec![(2, zstd)], -1);
+    request.timeout_ms = 10_000;
+    let response: kafka_protocol::messages::ProduceResponse = wire.call(3, &request).await?;
+    let code = response.responses[0].partition_responses[0].error_code;
+    assert_eq!(code, UNSUPPORTED_COMPRESSION_TYPE, "zstd on Produce v3");
+    println!("  zstd on Produce v3: {code}");
+    assert_eq!(
+        stored_rows(ctx.db(), &topic).await?,
+        23,
+        "nothing more is written"
+    );
+    let trailing = Bytes::from([&with(BatchHeader::default())[..], &[0; 5]].concat());
+    assert_eq!(wire.produce(&topic, 2, trailing, None).await?, (0, 0));
+    assert_eq!(stored_rows(ctx.db(), &topic).await?, 24);
+    println!("✅ refused as Kafka refuses them; 5 trailing bytes ignored");
 
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");

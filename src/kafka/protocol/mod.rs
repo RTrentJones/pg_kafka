@@ -17,11 +17,14 @@ mod decoding;
 mod encoding;
 pub mod framing;
 mod recordbatch;
+#[cfg(test)]
+pub(crate) use recordbatch::test_batches as recordbatch_test_batches;
 
 pub use decode_budget::{DecodeBudget, DecodedCharge};
 pub use decoding::parse_request;
 pub use encoding::encode_response;
 pub use recordbatch::{
-    least_decoded_memory, parse_record_batch, parse_record_batch_with_metadata, ParsedRecordBatch,
-    HEADER_MEMORY, RECORD_MEMORY,
+    least_decoded_memory, parse_record_batch, parse_record_batch_with_metadata,
+    validate_produce_records, ParsedRecordBatch, ERROR_UNSUPPORTED_COMPRESSION_TYPE, HEADER_MEMORY,
+    RECORD_MEMORY,
 };

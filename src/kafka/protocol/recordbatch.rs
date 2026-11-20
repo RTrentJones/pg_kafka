@@ -48,6 +48,8 @@ const BATCH_LENGTH_OFFSET: usize = 8;
 /// baseOffset and batchLength, which batchLength does not count.
 const LOG_OVERHEAD: usize = 12;
 const MAGIC_OFFSET: usize = 16;
+/// The bytes up to and including the magic byte.
+const HEADER_SIZE_UP_TO_MAGIC: usize = MAGIC_OFFSET + 1;
 const CRC_OFFSET: usize = 17;
 /// The CRC covers the batch from its attributes on.
 const ATTRIBUTES_OFFSET: usize = 21;
@@ -57,12 +59,13 @@ const RECORD_COUNT_OFFSET: usize = 57;
 const RECORD_BATCH_OVERHEAD: usize = 61;
 /// The smallest batchLength Kafka reads a magic byte behind (a legacy v0 message's).
 const MIN_BATCH_LENGTH: usize = 14;
-/// The magic byte of a RecordBatch v2.
+/// The magic byte of a RecordBatch v2, the highest there is.
 const RECORD_BATCH_V2_MAGIC: i8 = 2;
 
 /// Attribute bits of a RecordBatch v2.
 const CODEC_MASK: i16 = 0x07;
-/// The codec id of zstd.
+const CONTROL_FLAG: i16 = 0x20;
+/// The codec id of zstd, which Produce carries from v7 on (KIP-110).
 const ZSTD_CODEC: i16 = 4;
 
 /// Memory one record takes while it decodes besides its bytes. Charged from the declared
@@ -96,20 +99,15 @@ fn i32_at(bytes: &[u8], at: usize) -> i32 {
     field.get_i32()
 }
 
-/// Check the framing Kafka checks before it decodes a Produce v3+ partition's records,
-/// and return the batch's size and declared record count.
-///
-/// In Kafka 3.7's order (`ByteBufferLogInputStream.nextBatchSize`, then
-/// `ProduceRequest.validateRecords`): a batchLength too short for any batch, or a v2+ batch
-/// shorter than its header, is CORRUPT_MESSAGE; data holding no complete batch, a batch of
-/// another magic than 2 (a legacy MessageSet) and a negative record count are
-/// INVALID_RECORD.
-fn check_batch_header(batch: &[u8]) -> Result<(usize, usize)> {
-    let no_batch = || invalid("Produce v3+ partition data must hold exactly one record batch");
-    if batch.len() < LOG_OVERHEAD {
-        return Err(no_batch());
+/// The size of the batch at the start of `data` as Kafka 3.7 reads it
+/// (`ByteBufferLogInputStream.nextBatchSize`): `None` when `data` is too short to say, a
+/// batchLength too short for any batch or a magic byte past 2 is CORRUPT_MESSAGE. The size
+/// may exceed `data` (a batch cut short).
+fn next_batch_size(data: &[u8]) -> Result<Option<usize>> {
+    if data.len() < LOG_OVERHEAD {
+        return Ok(None);
     }
-    let batch_length = i32_at(batch, BATCH_LENGTH_OFFSET);
+    let batch_length = i32_at(data, BATCH_LENGTH_OFFSET);
     let Some(batch_length) = usize::try_from(batch_length)
         .ok()
         .filter(|&n| n >= MIN_BATCH_LENGTH)
@@ -118,26 +116,115 @@ fn check_batch_header(batch: &[u8]) -> Result<(usize, usize)> {
             "record batch length {batch_length} is too short"
         )));
     };
-    if batch.len() <= MAGIC_OFFSET {
-        return Err(no_batch());
+    if data.len() < HEADER_SIZE_UP_TO_MAGIC {
+        return Ok(None);
     }
+    let magic = i8::from_be_bytes([data[MAGIC_OFFSET]]);
+    if !(0..=RECORD_BATCH_V2_MAGIC).contains(&magic) {
+        return Err(corrupt(format!("record batch magic {magic} is invalid")));
+    }
+    Ok(Some(batch_length + LOG_OVERHEAD))
+}
+
+/// Check the framing Kafka checks before it reads a Produce v3+ partition's batch, and
+/// return the batch's size.
+///
+/// In Kafka 3.7's order (`ByteBufferLogInputStream`, then `ProduceRequest.validateRecords`):
+/// [`next_batch_size`]'s CORRUPT_MESSAGE; data holding no complete batch is INVALID_RECORD;
+/// a v2 batch shorter than its header is CORRUPT_MESSAGE; a batch of another magic than 2 (a
+/// legacy MessageSet) is INVALID_RECORD.
+fn check_batch_header(batch: &[u8]) -> Result<usize> {
+    let size = next_batch_size(batch)?
+        .filter(|&size| size <= batch.len())
+        .ok_or_else(|| invalid("Produce v3+ partition data must hold exactly one record batch"))?;
     let magic = i8::from_be_bytes([batch[MAGIC_OFFSET]]);
-    if magic >= RECORD_BATCH_V2_MAGIC && batch_length + LOG_OVERHEAD < RECORD_BATCH_OVERHEAD {
+    if magic == RECORD_BATCH_V2_MAGIC && size < RECORD_BATCH_OVERHEAD {
         return Err(corrupt(format!(
-            "record batch length {batch_length} is shorter than its header"
+            "record batch length {} is shorter than its header",
+            size - LOG_OVERHEAD
         )));
-    }
-    if batch.len() < batch_length + LOG_OVERHEAD {
-        return Err(no_batch());
     }
     if magic != RECORD_BATCH_V2_MAGIC {
         return Err(invalid(format!(
             "Produce v3+ carries record batches of magic 2 only, not magic {magic}"
         )));
     }
-    let count = usize::try_from(i32_at(batch, RECORD_COUNT_OFFSET))
-        .map_err(|_| invalid("record batch declares a negative record count"))?;
-    Ok((batch_length + LOG_OVERHEAD, count))
+    Ok(size)
+}
+
+/// Check what follows the batch, as Kafka does: data too short to hold another batch is
+/// ignored (Kafka trims it), a second complete batch is INVALID_RECORD (Produce v3+ carries
+/// exactly one per partition: decoding one and dropping the rest would lose records while
+/// acking them).
+fn check_after_batch(rest: &[u8]) -> Result<()> {
+    match next_batch_size(rest)? {
+        Some(size) if size <= rest.len() => Err(invalid(
+            "Produce v3+ partition data must hold exactly one record batch, not more",
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// UNSUPPORTED_COMPRESSION_TYPE: zstd on Produce before v7.
+pub const ERROR_UNSUPPORTED_COMPRESSION_TYPE: i16 = 76;
+
+/// What Kafka 3.7 checks of a Produce partition's data while it parses the request
+/// (`ProduceRequest.validateRecords`), before any batch is read: one record batch of magic
+/// 2 (`check_batch_header`, `check_after_batch`) and, before Produce v7 (KIP-110), not
+/// zstd. A failure fails the whole request; `Err` is its error code.
+pub fn validate_produce_records(batch: &[u8], zstd_allowed: bool) -> std::result::Result<(), i16> {
+    let size = check_batch_header(batch).map_err(|e| e.to_kafka_error_code())?;
+    let mut attributes = &batch[ATTRIBUTES_OFFSET..ATTRIBUTES_OFFSET + 2];
+    if !zstd_allowed && attributes.get_i16() & CODEC_MASK == ZSTD_CODEC {
+        return Err(ERROR_UNSUPPORTED_COMPRESSION_TYPE);
+    }
+    check_after_batch(&batch[size..]).map_err(|e| e.to_kafka_error_code())
+}
+
+/// The fields of a batch header Kafka 3.7 validates for a client's batch
+/// (`LogValidator.validateBatch`, and `UnifiedLog`'s base-offset check), all
+/// INVALID_RECORD: a base offset other than 0; a lastOffsetDelta, record count or offset
+/// range that disagree (so a batch of no records is refused, and cannot enter an
+/// idempotent producer's batch cache); a control batch; a producer id without a sequence.
+fn validate_batch(batch: &[u8]) -> Result<usize> {
+    let mut fields = batch;
+    let base_offset = fields.get_i64();
+    fields = &fields[ATTRIBUTES_OFFSET - 8..];
+    let attributes = fields.get_i16();
+    let last_offset_delta = fields.get_i32();
+    let mut fields = &batch[PRODUCER_ID_OFFSET..];
+    let producer_id = fields.get_i64();
+    let _producer_epoch = fields.get_i16();
+    let base_sequence = fields.get_i32();
+    let count = fields.get_i32();
+    if base_offset != 0 {
+        return Err(invalid(format!(
+            "record batch base offset is {base_offset}, not 0"
+        )));
+    }
+    if last_offset_delta < 0 {
+        return Err(invalid(format!(
+            "record batch has an invalid offset range (lastOffsetDelta {last_offset_delta})"
+        )));
+    }
+    if count <= 0 {
+        return Err(invalid(format!("record batch declares {count} records")));
+    }
+    if i64::from(last_offset_delta) + 1 != i64::from(count) {
+        return Err(invalid(format!(
+            "record batch declares {count} records over {} offsets",
+            i64::from(last_offset_delta) + 1
+        )));
+    }
+    if attributes & CONTROL_FLAG != 0 {
+        return Err(invalid("clients may not write control batches"));
+    }
+    if producer_id >= 0 && base_sequence < 0 {
+        return Err(invalid(format!(
+            "record batch of producer {producer_id} has sequence {base_sequence}"
+        )));
+    }
+    usize::try_from(count).map_err(|_| invalid("record batch declares a negative record count"))
 }
 
 /// The producer id, epoch and base sequence in the header of a batch that passed
@@ -154,8 +241,9 @@ fn extract_producer_metadata(batch: &[u8]) -> ProducerMetadata {
 /// The least memory `batch` decodes to: its own bytes and its declared records (more if it
 /// is compressed or carries headers). Data that is not a record batch decodes to nothing.
 pub fn least_decoded_memory(batch: &[u8]) -> usize {
-    check_batch_header(batch).map_or(0, |(_, count)| {
-        count
+    check_batch_header(batch).map_or(0, |_| {
+        usize::try_from(i32_at(batch, RECORD_COUNT_OFFSET))
+            .unwrap_or(0)
             .saturating_mul(RECORD_MEMORY)
             .saturating_add(batch.len())
     })
@@ -550,18 +638,11 @@ fn read_records(
 
 /// Parse a partition's record data (one RecordBatch v2) into its records, charging their
 /// memory to `budget` (see the module docs). Checks run in Kafka 3.7's order: the framing
-/// (`check_batch_header`), the CRC32C, then the records.
+/// (`check_batch_header`, `check_after_batch`), the CRC32C, the header fields
+/// (`validate_batch`), then the records.
 pub fn parse_record_batch(batch_bytes: &Bytes, budget: &DecodeBudget) -> Result<Vec<Record>> {
-    let (size, count) = check_batch_header(batch_bytes)?;
-    // Produce v3+ carries exactly one record batch per partition. Decoding one and
-    // ignoring the rest would drop the trailing batches while acking the request; reject
-    // it as Kafka does.
-    if batch_bytes.len() > size {
-        return Err(invalid(format!(
-            "partition data carries more than one record batch ({} trailing bytes)",
-            batch_bytes.len() - size
-        )));
-    }
+    let size = check_batch_header(batch_bytes)?;
+    check_after_batch(&batch_bytes[size..])?;
     let batch = batch_bytes.slice(..size);
     let mut stored_crc = &batch[CRC_OFFSET..ATTRIBUTES_OFFSET];
     let stored_crc = stored_crc.get_u32();
@@ -571,6 +652,7 @@ pub fn parse_record_batch(batch_bytes: &Bytes, budget: &DecodeBudget) -> Result<
             "record batch CRC {stored_crc:#010x} does not match its contents ({crc:#010x})"
         )));
     }
+    let count = validate_batch(&batch)?;
     let mut fields = &batch[ATTRIBUTES_OFFSET..];
     let compression = compression_of(fields.get_i16())?;
     fields.advance(4); // lastOffsetDelta
@@ -898,7 +980,7 @@ mod tests {
             ("cut short", ok.slice(..ok.len() - 3), ERROR_INVALID_RECORD),
             (
                 "negative count",
-                with(57, &(-1i32).to_be_bytes()),
+                raw_batch(&tiny_records(1), -1, false),
                 ERROR_INVALID_RECORD,
             ),
             (
@@ -1290,6 +1372,183 @@ mod tests {
             timestamps,
             [Some(base), Some(base - month), Some(base + (1 << 40))]
         );
+    }
+
+    #[test]
+    fn batch_headers_are_validated_as_kafka_validates_them() {
+        use crate::kafka::constants::{ERROR_CORRUPT_MESSAGE, ERROR_INVALID_RECORD};
+        // Each case as Kafka 3.7 answers it.
+        let x = record(&[&[0], &v(0), &v(0), &v(-1), &v(1), b"x", &v(0)]);
+        let xy = [
+            x.clone(),
+            record(&[&[0], &v(0), &v(1), &v(-1), &v(1), b"y", &v(0)]),
+        ]
+        .concat();
+        let h = Header::default();
+        let ok = batch_with(&x, 1, h);
+        let then = |tail: &[u8]| Bytes::from([&ok[..], tail].concat());
+        let prefix = |length: i32, magic: i8| {
+            let mut b = 0i64.to_be_bytes().to_vec();
+            b.extend_from_slice(&length.to_be_bytes());
+            b.extend_from_slice(&0i32.to_be_bytes());
+            b.extend_from_slice(&magic.to_be_bytes());
+            b
+        };
+        let with_magic = |magic: u8| {
+            let mut b = ok.to_vec();
+            b[16] = magic;
+            Bytes::from(b)
+        };
+        let mut bad_crc = batch_with(&[], 0, h).to_vec();
+        bad_crc[17..21].copy_from_slice(&[0; 4]);
+        let short_v2 = [prefix(30, 2), vec![0; 29]].concat();
+        let refused: [(&str, Bytes, i16); 15] = [
+            ("no records", batch_with(&[], 0, h), ERROR_INVALID_RECORD),
+            (
+                "no records of an idempotent producer",
+                batch_with(
+                    &[],
+                    0,
+                    Header {
+                        producer_id: 7,
+                        producer_epoch: 0,
+                        base_sequence: 0,
+                        last_offset_delta: Some(0),
+                        ..h
+                    },
+                ),
+                ERROR_INVALID_RECORD,
+            ),
+            (
+                "lastOffsetDelta past the records",
+                batch_with(
+                    &xy,
+                    2,
+                    Header {
+                        last_offset_delta: Some(5),
+                        ..h
+                    },
+                ),
+                ERROR_INVALID_RECORD,
+            ),
+            (
+                "lastOffsetDelta short of the records",
+                batch_with(
+                    &xy,
+                    2,
+                    Header {
+                        last_offset_delta: Some(0),
+                        ..h
+                    },
+                ),
+                ERROR_INVALID_RECORD,
+            ),
+            (
+                "a control batch",
+                batch_with(
+                    &x,
+                    1,
+                    Header {
+                        attributes: 0x20,
+                        ..h
+                    },
+                ),
+                ERROR_INVALID_RECORD,
+            ),
+            (
+                "a base offset other than 0",
+                batch_with(
+                    &x,
+                    1,
+                    Header {
+                        base_offset: 5,
+                        ..h
+                    },
+                ),
+                ERROR_INVALID_RECORD,
+            ),
+            (
+                "a producer id without a sequence",
+                batch_with(
+                    &x,
+                    1,
+                    Header {
+                        producer_id: 7,
+                        producer_epoch: 0,
+                        ..h
+                    },
+                ),
+                ERROR_INVALID_RECORD,
+            ),
+            ("magic 9", with_magic(9), ERROR_CORRUPT_MESSAGE),
+            ("magic -1", with_magic(0xff), ERROR_CORRUPT_MESSAGE),
+            (
+                "bad CRC, no records",
+                Bytes::from(bad_crc),
+                ERROR_CORRUPT_MESSAGE,
+            ),
+            ("12 zero bytes after", then(&[0; 12]), ERROR_CORRUPT_MESSAGE),
+            (
+                "a magic 9 header after",
+                then(&prefix(100, 9)),
+                ERROR_CORRUPT_MESSAGE,
+            ),
+            (
+                "a complete short batch after",
+                then(&short_v2),
+                ERROR_INVALID_RECORD,
+            ),
+            (
+                "a cut-short short batch",
+                Bytes::from([prefix(30, 2), vec![0; 3]].concat()),
+                ERROR_INVALID_RECORD,
+            ),
+            (
+                "a short batch, then a batch",
+                Bytes::from([&short_v2[..], &ok[..]].concat()),
+                ERROR_CORRUPT_MESSAGE,
+            ),
+        ];
+        for (what, data, expected) in refused {
+            let err = parse_record_batch(&data, &budget()).unwrap_err();
+            assert_eq!(code(&err), expected, "{what}: {err}");
+        }
+        // Kafka ignores data after the batch that holds no complete batch, takes the
+        // records' offset deltas as they are, and sets the timestamp type itself.
+        let accepted: [(&str, Bytes, usize); 5] = [
+            ("5 bytes after", then(&[0; 5]), 1),
+            ("a batch length after", then(&prefix(20, 2)[..12]), 1),
+            ("a cut-short batch after", then(&prefix(100, 2)), 1),
+            (
+                "offset deltas other than 0, 1, ...",
+                batch_with(
+                    &[
+                        x.clone(),
+                        record(&[&[0], &v(0), &v(7), &v(-1), &v(1), b"y", &v(0)]),
+                    ]
+                    .concat(),
+                    2,
+                    h,
+                ),
+                2,
+            ),
+            (
+                "the log-append-time bit",
+                batch_with(
+                    &x,
+                    1,
+                    Header {
+                        attributes: 0x08,
+                        ..h
+                    },
+                ),
+                1,
+            ),
+        ];
+        for (what, data, records) in accepted {
+            let parsed = parse_record_batch(&data, &budget());
+            assert_eq!(parsed.map(|r| r.len()).ok(), Some(records), "{what}");
+        }
     }
 
     // ========== ParsedRecordBatch Tests ==========
