@@ -24,6 +24,15 @@ const STAGGER: Duration = Duration::from_millis(200);
 const TOGETHER: Duration = Duration::from_millis(100);
 /// The long poll's safety-net interval (`pg_kafka.fetch_poll_interval_ms`, default).
 const SAFETY_NET: Duration = Duration::from_millis(1000);
+/// How far apart the staggered produces' delays (ack after slot) may spread. A delay
+/// common to all of them moves every safety-net phase alike; for three phases to fall
+/// within TOGETHER, one wake-up would have to land 2 * STAGGER - TOGETHER (300 ms) later
+/// relative to another, so a spread well below that keeps the safety net from passing as
+/// the abort's wake-up.
+const LATE: Duration = Duration::from_millis(100);
+/// Timeout-abort attempts: one whose delays spread more than LATE (or whose transaction
+/// timed out before its last produce) is inconclusive and retried.
+const TIMEOUT_ATTEMPTS: usize = 3;
 /// How long a fencing round lets the reader's woken fetch attempt park again.
 const PARK: Duration = Duration::from_millis(250);
 /// Fencing rounds that must prove the wake-up, and the most rounds run for them.
@@ -57,7 +66,10 @@ type Received = (String, Instant, SystemTime);
 /// three of the five records arrive within 100 ms of the first (through the safety net
 /// they arrive 200, 400, 600 and 800 ms after it, whatever the abort's moment, while a
 /// stall of the whole test process shifts them together), and that the first arrives
-/// within 2 s of the abort.
+/// within 2 s of the abort. A wake-up is timed by its produce's ack, which the worker
+/// releases right after the group commit that wakes the reader; an attempt whose acks'
+/// delays after their slots differ by more than 100 ms (an fsync slow for one of them)
+/// cannot space the re-fetches and is run again, up to 3 attempts.
 pub async fn test_transaction_end_wakes_parked_read_committed_fetch() -> TestResult {
     into_test_result(txn_end_wakes().await)
 }
@@ -206,47 +218,96 @@ async fn txn_end_wakes() -> SendResult<()> {
             ));
         }
         wait_for_all(&mut rx, &topics).await?;
-        let timeout_id = unique("txn-wake-timeout");
-        let p = init(timeout_id.clone(), Some("4000")).await?;
-        p.begin_transaction().map_err(boxed)?;
-        futures::future::try_join_all(topics.iter().map(|t| send(&p, t, "pending-timeout")))
-            .await?;
-        // A reader's last wake-up is the produce of its visible record, so each send has
-        // to land in its slot for the safety-net re-fetches to be spaced STAGGER apart.
-        let visible: Vec<String> = (0..READERS)
-            .map(|i| format!("visible-timeout-{i}"))
-            .collect();
-        let first_slot = tokio::time::Instant::now();
-        for (slot, (t, v)) in (0u32..).zip(topics.iter().zip(&visible)) {
-            let at = first_slot + STAGGER * slot;
-            tokio::time::sleep_until(at).await;
-            send(&plain, t, v).await?;
-            let late = at.elapsed();
-            if late > STAGGER / 4 {
-                return Err(format!("{v} landed {late:?} after its slot").into());
+        let mut outcome = None;
+        for attempt in 0..TIMEOUT_ATTEMPTS {
+            let timeout_id = unique("txn-wake-timeout");
+            let p = init(timeout_id.clone(), Some("4000")).await?;
+            p.begin_transaction().map_err(boxed)?;
+            futures::future::try_join_all(topics.iter().map(|t| send(&p, t, "pending-timeout")))
+                .await?;
+            // A reader's last wake-up is the produce of its visible record, so each send
+            // has to land in its slot for the safety-net re-fetches to be spaced STAGGER
+            // apart.
+            let visible: Vec<String> = (0..READERS)
+                .map(|i| format!("visible-timeout-{attempt}-{i}"))
+                .collect();
+            let first_slot = tokio::time::Instant::now();
+            let mut delays = Vec::new();
+            for (slot, (t, v)) in (0u32..).zip(topics.iter().zip(&visible)) {
+                let at = first_slot + STAGGER * slot;
+                tokio::time::sleep_until(at).await;
+                send(&plain, t, v).await?;
+                delays.push(at.elapsed());
             }
+            let spread = delays
+                .iter()
+                .max()
+                .copied()
+                .unwrap_or_default()
+                .saturating_sub(delays.iter().min().copied().unwrap_or_default());
+            let state: String = db
+                .query_one(
+                    "SELECT state FROM kafka.transactions WHERE transactional_id = $1",
+                    &[&timeout_id],
+                )
+                .await
+                .map_err(boxed)?
+                .get(0);
+            let inconclusive = if spread > LATE {
+                Some(format!("acks {delays:?} after their slots"))
+            } else if state != "Ongoing" {
+                Some(format!("the transaction ended ({state}) before the last produce"))
+            } else {
+                None
+            };
+            if let Some(why) = inconclusive {
+                // Let this transaction time out, and every reader take the records it
+                // held back, before the next attempt re-spaces them.
+                println!("  timeout abort attempt {attempt}: {why}; retrying");
+                let deadline = Instant::now() + Duration::from_secs(30);
+                loop {
+                    let state: String = db
+                        .query_one(
+                            "SELECT state FROM kafka.transactions WHERE transactional_id = $1",
+                            &[&timeout_id],
+                        )
+                        .await
+                        .map_err(boxed)?
+                        .get(0);
+                    if state != "Ongoing" {
+                        break;
+                    }
+                    if Instant::now() > deadline {
+                        return Err(format!("{timeout_id} never timed out").into());
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                wait_for_all(&mut rx, &visible).await?;
+                keep.push(p);
+                continue;
+            }
+            println!("  timeout abort attempt {attempt}: acks {delays:?} after their slots");
+            let got = wait_for_all(&mut rx, &visible).await?;
+            let aborted_at: f64 = db
+                .query_one(
+                    "SELECT EXTRACT(EPOCH FROM last_updated_at::timestamptz)::float8
+                     FROM kafka.transactions WHERE transactional_id = $1 AND state = 'CompleteAbort'",
+                    &[&timeout_id],
+                )
+                .await
+                .map_err(boxed)?
+                .get(0);
+            keep.push(p);
+            outcome = Some((visible, got, aborted_at));
+            break;
         }
-        let state: String = db
-            .query_one(
-                "SELECT state FROM kafka.transactions WHERE transactional_id = $1",
-                &[&timeout_id],
+        let Some((visible, got, aborted_at)) = outcome else {
+            return Err(format!(
+                "every one of {TIMEOUT_ATTEMPTS} timeout-abort attempts was inconclusive (acks \
+                 spread more than {LATE:?}, or the transaction ended before the last produce)"
             )
-            .await
-            .map_err(boxed)?
-            .get(0);
-        if state != "Ongoing" {
-            return Err(format!("the transaction ended ({state}) before the last produce").into());
-        }
-        let got = wait_for_all(&mut rx, &visible).await?;
-        let aborted_at: f64 = db
-            .query_one(
-                "SELECT EXTRACT(EPOCH FROM last_updated_at::timestamptz)::float8
-                 FROM kafka.transactions WHERE transactional_id = $1 AND state = 'CompleteAbort'",
-                &[&timeout_id],
-            )
-            .await
-            .map_err(boxed)?
-            .get(0);
+            .into());
+        };
         let first = got
             .values()
             .min_by_key(|(at, _)| *at)
@@ -277,7 +338,6 @@ async fn txn_end_wakes() -> SendResult<()> {
             latency < 2.0,
             "the first read_committed fetch woke {latency:.3} s after the timeout abort"
         );
-        keep.push(p);
         drop(keep);
         Ok(())
     }
