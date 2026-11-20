@@ -223,6 +223,28 @@ pub async fn test_external_primary_dead_letter_serves_local() -> TestResult {
         "a healthy external-primary topic must suppress local reads"
     );
 
+    // Let the first forward's ack land before forcing the dead letter: an ack applied
+    // after the UPDATE would set external_offset again and keep the topic suppressed.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let acked: i64 = ctx
+            .db()
+            .query_one(
+                "SELECT count(*) FROM kafka.shadow_tracking \
+                 WHERE topic_id = $1 AND external_offset IS NOT NULL",
+                &[&topic_id],
+            )
+            .await?
+            .get(0);
+        if acked == 1 {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("the external forward was not acknowledged within 10 s".into());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
     // Force the forward into the dead-letter state (retry cap exhausted, external
     // delivery abandoned): retry_count >= pg_kafka.shadow_max_retries, still un-forwarded.
     ctx.db()
