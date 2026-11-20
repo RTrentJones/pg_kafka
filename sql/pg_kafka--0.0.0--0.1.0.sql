@@ -28,6 +28,14 @@ ALTER TABLE kafka.partition_offsets
 ALTER TABLE kafka.producer_ids ADD COLUMN last_epoch SMALLINT;
 COMMENT ON COLUMN kafka.producer_ids.last_epoch IS 'Epoch before the last bump the producer requested itself (a retry of that InitProducerId gets the current epoch back); NULL after a fencing bump.';
 
+-- Producer ids continue from the upgrade time in milliseconds since the Unix epoch, as
+-- a fresh install starts from its creation time (see bootstrap.sql), and never below an
+-- id already issued.
+SELECT pg_catalog.setval('kafka.producer_ids_producer_id_seq',
+                         GREATEST((extract(epoch FROM clock_timestamp()) * 1000)::bigint,
+                                  (SELECT last_value FROM kafka.producer_ids_producer_id_seq),
+                                  (SELECT COALESCE(MAX(producer_id), 0) FROM kafka.producer_ids)));
+
 -- 1. Time-partition kafka.messages (ADR-001).
 --
 -- The populated 0.0.0 table is not rewritten: it is renamed to kafka.messages_legacy
@@ -703,7 +711,7 @@ GRANT EXECUTE ON FUNCTION kafka.drop_message_partition(regclass, int[]) TO pgkaf
 GRANT SELECT, INSERT, UPDATE ON kafka.partition_offsets TO pgkafka_worker;
 GRANT SELECT, INSERT, UPDATE, DELETE ON kafka.consumer_offsets TO pgkafka_worker;
 GRANT SELECT, INSERT, UPDATE, DELETE ON kafka.producer_ids TO pgkafka_worker;
-GRANT USAGE ON SEQUENCE kafka.producer_ids_producer_id_seq TO pgkafka_worker;
+GRANT USAGE, UPDATE ON SEQUENCE kafka.producer_ids_producer_id_seq TO pgkafka_worker;
 GRANT SELECT, INSERT, UPDATE, DELETE ON kafka.producer_sequences TO pgkafka_worker;
 GRANT SELECT, INSERT, UPDATE, DELETE ON kafka.transactions TO pgkafka_worker;
 GRANT SELECT, INSERT, UPDATE, DELETE ON kafka.txn_pending_offsets TO pgkafka_worker;
@@ -889,7 +897,8 @@ ALTER TABLE kafka.topics ADD CONSTRAINT topics_partitions_range
 -- on every partition: their sequence range and base offset, so a retried batch is
 -- answered with its original offset and anything else out of sequence is refused.
 -- Rows belong to the current epoch only: every epoch change deletes the producer's
--- kafka.producer_sequences rows, and this table follows them (ON DELETE CASCADE).
+-- batches (its kafka.producer_sequences rows stay, at last_sequence -1: the new epoch
+-- starts at 0 there), and they go with their producer_sequences row (ON DELETE CASCADE).
 CREATE TABLE kafka.producer_batches (
     producer_id BIGINT NOT NULL,
     topic_id INT NOT NULL,

@@ -415,8 +415,9 @@ impl GroupCoordinator {
     /// (checked first, so a refused join leaves no group behind), and the coordinator's
     /// memory is bounded (pg_kafka.max_consumer_groups). Room is made by forgetting the
     /// least recently active Empty groups (their committed offsets stay in the database,
-    /// so they remain visible as Empty groups) until the count is below the cap, else the
-    /// join gets the retriable COORDINATOR_NOT_AVAILABLE.
+    /// so they remain visible as Empty groups) until the count is below the cap; when the
+    /// non-Empty groups alone reach the cap, nothing is forgotten and the join gets the
+    /// retriable COORDINATOR_NOT_AVAILABLE.
     fn admit_new_group(
         groups: &mut HashMap<String, ConsumerGroup>,
         params: &JoinGroupParams,
@@ -426,9 +427,15 @@ impl GroupCoordinator {
         if params.protocol_type.is_empty() || params.protocols.is_empty() {
             return Err(inconsistent_protocol(group_id));
         }
+        // Forgetting Empty groups only helps if it can get below the cap; when the groups
+        // in use alone fill it, the join is refused and the Empty groups stay.
+        let in_use = groups
+            .values()
+            .filter(|g| g.state != GroupState::Empty)
+            .count();
         // A reload can lower the cap below the number of groups in memory, so as many
         // Empty groups are forgotten as it takes.
-        while groups.len() >= max_groups {
+        while in_use < max_groups && groups.len() >= max_groups {
             let victim = groups
                 .values()
                 .filter(|g| g.state == GroupState::Empty)

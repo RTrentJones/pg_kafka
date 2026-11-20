@@ -59,6 +59,9 @@ KNOWN = {
                                     "MEMBER_ID_REQUIRED (KIP-394), a first JoinGroup is admitted"),
     ("groups", "join_consumer.first_join"): ("deviation", "PROTOCOL_DEVIATIONS.md §5: no "
                                              "MEMBER_ID_REQUIRED (KIP-394)"),
+    ("produce_idempotent_partitions", "p3_old_epoch_first"): (
+        "deviation", "PROTOCOL_DEVIATIONS.md §3: the epoch is kept per producer, so an older "
+        "epoch is stale on a partition without producer state too"),
     ("transactions", "produce_a"): DEV_MARKERS,
     ("transactions", "lo_latest_uncommitted"): DEV_MARKERS,
     ("transactions", "fetch_uncommitted_from_0.offsets"): DEV_MARKERS,
@@ -387,6 +390,31 @@ def sc_produce_idempotent(t, obs):
     obs_fetch(obs, "log", part, 0, 0)
 
 
+def sc_produce_idempotent_partitions(t, obs):
+    """Producer state is per partition: a known producer's first batch on a partition is
+    accepted at any sequence, and after a client epoch bump a partition with state at the
+    old epoch must restart at 0 while one without state accepts any sequence."""
+    topic = f"diff-pip-{RUN}"
+    create_topics(t, [topic_spec(topic, 4)])
+    b, pid, ep = init_pid(t)
+    obs("init", normalise(t, b))
+
+    def p(partition, values, seq, epoch):
+        return produce_part(produce(t, topic, values, partition=partition, producerId=pid,
+                                    producerEpoch=epoch, baseSequence=seq))
+    obs("p0_seq0", p(0, ["a", "b", "c"], 0, ep))
+    obs("p1_first_seq7", p(1, ["d", "e"], 7, ep))
+    obs("p1_retry_seq7", p(1, ["d", "e"], 7, ep))
+    obs("p1_gap_seq10", p(1, ["x"], 10, ep))
+    obs("p1_seq9", p(1, ["f"], 9, ep))
+    obs("p0_bump_seq0", p(0, ["g"], 0, ep + 1))
+    obs("p1_bumped_seq10", p(1, ["y"], 10, ep + 1))
+    obs("p1_bumped_seq0", p(1, ["h"], 0, ep + 1))
+    obs("p2_bumped_first_seq4", p(2, ["i"], 4, ep + 1))
+    obs("p2_old_epoch", p(2, ["z"], 5, ep))
+    obs("p3_old_epoch_first", p(3, ["z"], 0, ep))
+
+
 def sc_transactions(t, obs):
     topic, txn, group = f"diff-tx-{RUN}", f"diff-tx-{RUN}", f"diff-txg-{RUN}"
     create_topics(t, [topic_spec(topic, 1)])
@@ -597,6 +625,7 @@ SCENARIOS = [
     ("metadata", sc_metadata),
     ("produce_plain", sc_produce_plain),
     ("produce_idempotent", sc_produce_idempotent),
+    ("produce_idempotent_partitions", sc_produce_idempotent_partitions),
     ("transactions", sc_transactions),
     ("list_offsets", sc_list_offsets),
     ("offsets", sc_offsets),

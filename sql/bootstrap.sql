@@ -566,7 +566,7 @@ CREATE TABLE kafka.producer_sequences (
     producer_id BIGINT NOT NULL,
     topic_id INT NOT NULL,
     partition_id INT NOT NULL,
-    last_sequence INT NOT NULL DEFAULT -1,  -- Last successfully written sequence (-1 = none)
+    last_sequence INT NOT NULL DEFAULT -1,  -- Last successfully written sequence (-1 = none at this epoch)
     updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
     CHECK (partition_id >= 0),
     PRIMARY KEY (producer_id, topic_id, partition_id),
@@ -576,8 +576,14 @@ CREATE TABLE kafka.producer_sequences (
 GRANT SELECT ON kafka.producer_ids TO pgkafka_reader;
 GRANT SELECT ON kafka.producer_sequences TO pgkafka_reader;
 GRANT SELECT, INSERT, UPDATE, DELETE ON kafka.producer_ids TO pgkafka_worker;
--- nextval() for new ids and the RV-13 epoch-exhaustion reallocation.
-GRANT USAGE ON SEQUENCE kafka.producer_ids_producer_id_seq TO pgkafka_worker;
+-- nextval() for new ids and the RV-13 epoch-exhaustion reallocation; setval() to move
+-- past a run of ids that producers unknown to the broker already hold.
+GRANT USAGE, UPDATE ON SEQUENCE kafka.producer_ids_producer_id_seq TO pgkafka_worker;
+-- Producer ids start at the creation time in milliseconds since the Unix epoch, so an
+-- extension dropped and created again never hands out an id the earlier installation
+-- issued (to a producer that may still be running and would share its sequence state).
+SELECT pg_catalog.setval('kafka.producer_ids_producer_id_seq',
+                         (extract(epoch FROM clock_timestamp()) * 1000)::bigint);
 GRANT SELECT, INSERT, UPDATE, DELETE ON kafka.producer_sequences TO pgkafka_worker;
 
 COMMENT ON TABLE kafka.producer_ids IS 'Producer ID allocation for idempotent producers. Each idempotent producer gets a unique ID and epoch.';
@@ -598,7 +604,8 @@ COMMENT ON COLUMN kafka.producer_sequences.last_sequence IS 'Last successfully w
 -- on every partition: their sequence range and base offset, so a retried batch is
 -- answered with its original offset and anything else out of sequence is refused.
 -- Rows belong to the current epoch only: every epoch change deletes the producer's
--- kafka.producer_sequences rows, and this table follows them (ON DELETE CASCADE).
+-- batches (its kafka.producer_sequences rows stay, at last_sequence -1: the new epoch
+-- starts at 0 there), and they go with their producer_sequences row (ON DELETE CASCADE).
 CREATE TABLE kafka.producer_batches (
     producer_id BIGINT NOT NULL,
     topic_id INT NOT NULL,

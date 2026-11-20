@@ -205,3 +205,83 @@ pub async fn test_idempotent_sequence_wraps_at_i32_max() -> TestResult {
     println!("✅ Test PASSED\n");
     Ok(())
 }
+
+/// Producer state is per partition, as in Kafka 3.7 (`ProducerAppendInfo.checkSequence`,
+/// checked against the reference broker by interop/diff `produce_idempotent_partitions`):
+/// a known producer's first batch on a partition is accepted at any sequence; after a
+/// client epoch bump, a partition with an entry from the old epoch must restart at 0,
+/// while one without an entry accepts any sequence.
+pub async fn test_idempotent_producer_state_is_per_partition() -> TestResult {
+    println!("=== Test: idempotent producer state is per partition ===\n");
+    let ctx = TestContext::new().await?;
+    let t = topic(&ctx, "idem-per-part", 3).await?;
+    let mut w = Wire::connect().await?;
+    let (err, pid, ep) = w.init_producer_id(None, 60_000).await?;
+    assert_eq!(err, error_codes::NONE);
+    let b = |values: &[&str], seq: i32, epoch: i16| batch(values, pid, epoch, seq, false, None);
+
+    println!("Step 1: First batches on a second partition...");
+    assert_eq!(
+        w.produce(&t, 0, b(&["a", "b", "c"], 0, ep), None).await?,
+        (error_codes::NONE, 0)
+    );
+    assert_eq!(
+        w.produce(&t, 1, b(&["d", "e"], 7, ep), None).await?,
+        (error_codes::NONE, 0),
+        "a known producer's first batch on a partition, at sequence 7"
+    );
+    assert_eq!(
+        w.produce(&t, 1, b(&["d", "e"], 7, ep), None).await?,
+        (error_codes::NONE, 0),
+        "its retry is a duplicate"
+    );
+    assert_eq!(
+        w.produce(&t, 1, b(&["x"], 10, ep), None).await?.0,
+        error_codes::OUT_OF_ORDER_SEQUENCE_NUMBER,
+        "a gap after it"
+    );
+    assert_eq!(
+        w.produce(&t, 1, b(&["f"], 9, ep), None).await?,
+        (error_codes::NONE, 2)
+    );
+    println!("✅ Tracked from its first sequence\n");
+
+    println!("Step 2: A client epoch bump on partition 0...");
+    assert_eq!(
+        w.produce(&t, 0, b(&["g"], 0, ep + 1), None).await?,
+        (error_codes::NONE, 3)
+    );
+    assert_eq!(
+        w.produce(&t, 1, b(&["y"], 10, ep + 1), None).await?.0,
+        error_codes::OUT_OF_ORDER_SEQUENCE_NUMBER,
+        "partition 1 has an entry from the old epoch: the new one starts at 0"
+    );
+    assert_eq!(
+        w.produce(&t, 1, b(&["h"], 0, ep + 1), None).await?,
+        (error_codes::NONE, 3)
+    );
+    assert_eq!(
+        w.produce(&t, 2, b(&["i"], 4, ep + 1), None).await?,
+        (error_codes::NONE, 0),
+        "partition 2 has no entry: any first sequence"
+    );
+    assert_eq!(
+        w.produce(&t, 2, b(&["z"], 5, ep), None).await?.0,
+        error_codes::INVALID_PRODUCER_EPOCH,
+        "the old epoch is fenced"
+    );
+    println!("✅ Old-epoch entries restart at 0, new partitions at any sequence\n");
+
+    let rows: i64 = ctx
+        .db()
+        .query_one(
+            "SELECT COUNT(*) FROM kafka.messages m JOIN kafka.topics t ON t.id = m.topic_id WHERE t.name = $1",
+            &[&t],
+        )
+        .await?
+        .get(0);
+    assert_eq!(rows, 9, "a..i once each");
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}

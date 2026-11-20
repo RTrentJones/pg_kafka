@@ -803,6 +803,24 @@ fn test_lowered_max_groups_evicts_empty_groups_down_to_the_cap() {
 }
 
 #[test]
+fn test_refused_new_group_evicts_no_empty_group() {
+    // Two non-empty groups fill a lowered cap of 2: forgetting the Empty group could not make
+    // room, so the refused join leaves it in memory.
+    let c = GroupCoordinator::new();
+    let m = stable_single(&c, "idle");
+    c.leave_group("idle", &m).unwrap();
+    stable_single(&c, "b");
+    stable_single(&c, "c");
+    c.set_limits(2, 10);
+    assert_eq!(
+        join_error_code(&join(&c, "new", None)),
+        crate::kafka::constants::ERROR_COORDINATOR_NOT_AVAILABLE
+    );
+    assert_eq!(state(&c, "idle"), GroupState::Empty);
+    assert_eq!(c.groups.read().unwrap().len(), 3);
+}
+
+#[test]
 fn test_validate_offset_commit_matches_kafka() {
     use crate::kafka::constants::{
         ERROR_ILLEGAL_GENERATION as IG, ERROR_REBALANCE_IN_PROGRESS as RIP,

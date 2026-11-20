@@ -25,7 +25,11 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         edge_cases::test_idempotent_high_sequence,
         kafka_model::test_idempotent_duplicates_and_epochs_follow_kafka: sequential,
         kafka_model::test_idempotent_sequence_wraps_at_i32_max,
+        kafka_model::test_idempotent_producer_state_is_per_partition,
         unknown_producer::test_unknown_producer_is_accepted_as_new: sequential, // reads the id sequence
         unknown_producer::test_idempotent_producer_survives_pruned_state,
+        unknown_producer::test_pruned_producer_resumes_on_every_partition,
+        unknown_producer::test_producer_id_allocation_skips_recorded_ids: sequential, // reads the id sequence
+        unknown_producer::test_producer_ids_start_from_creation_time,
     ]
 }

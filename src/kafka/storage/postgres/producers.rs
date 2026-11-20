@@ -8,9 +8,9 @@ use super::{internal, internal_unless, PostgresStore};
 use crate::kafka::constants::ERROR_INVALID_PRODUCER_EPOCH;
 use crate::kafka::error::{KafkaError, Result};
 use crate::kafka::storage::{
-    stored_last_sequence, transactional_epoch_is_stale, validate_sequence,
-    validate_unknown_producer, CachedBatch, ProducerBatch, SequenceCheck, SequenceValidation,
-    TransactionalProducer, PRODUCER_BATCH_CACHE,
+    transactional_epoch_is_stale, validate_sequence, validate_unknown_producer, CachedBatch,
+    PartitionSequence, ProducerBatch, SequenceCheck, SequenceValidation, TransactionalProducer,
+    PRODUCER_BATCH_CACHE,
 };
 use pgrx::prelude::*;
 use pgrx::spi::{SpiClient, SpiError};
@@ -27,26 +27,46 @@ fn invalid_producer_epoch(producer_id: i64, epoch: i16, current_epoch: i16) -> K
 }
 
 /// The next producer id from the producer id sequence, or, when a producer already
-/// holds that one, the first free id after the run of held ids it starts. An id can be
+/// holds that one, the first free id after the run of held ids it starts; the sequence
+/// then moves to that id, so later allocations do not walk the run again. An id can be
 /// held out of turn: a Produce from a producer the broker has no state for records the
-/// id it presents (see [`adopt_unknown_producer`]).
+/// id it presents (see [`adopt_unknown_producer`]), up to `i64::MAX`.
 fn next_free_producer_id(client: &mut SpiClient<'_>) -> Result<i64> {
     let row = client
         .update(
-            "SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM kafka.producer_ids WHERE producer_id = n)
-                         THEN n
-                         ELSE (SELECT MIN(p.producer_id) + 1 FROM kafka.producer_ids p
-                               WHERE p.producer_id >= n
+            "WITH seq AS (
+                 SELECT nextval(pg_get_serial_sequence('kafka.producer_ids', 'producer_id')) AS n
+             )
+             SELECT seq.n AS next,
+                    CASE WHEN NOT EXISTS (SELECT 1 FROM kafka.producer_ids WHERE producer_id = seq.n)
+                         THEN seq.n
+                         -- The held run starting at n ends below the first id p whose
+                         -- successor is free; p < i64::MAX keeps p + 1 in range.
+                         ELSE (SELECT p.producer_id + 1 FROM kafka.producer_ids p
+                               WHERE p.producer_id >= seq.n
+                                 AND p.producer_id < 9223372036854775807
                                  AND NOT EXISTS (SELECT 1 FROM kafka.producer_ids q
-                                                 WHERE q.producer_id = p.producer_id + 1))
+                                                 WHERE q.producer_id = p.producer_id + 1)
+                               ORDER BY p.producer_id
+                               LIMIT 1)
                     END AS id
-             FROM nextval(pg_get_serial_sequence('kafka.producer_ids', 'producer_id')) AS n",
+             FROM seq",
             None,
             &[],
         )?
         .first();
-    row.get_by_name("id")?
-        .ok_or_else(|| KafkaError::Internal("no free producer id".into()))
+    let next: Option<i64> = row.get_by_name("next")?;
+    let id: i64 = row
+        .get_by_name("id")?
+        .ok_or_else(|| KafkaError::Internal("no free producer id".into()))?;
+    if next != Some(id) {
+        client.update(
+            "SELECT setval(pg_get_serial_sequence('kafka.producer_ids', 'producer_id'), $1)",
+            None,
+            &[id.into()],
+        )?;
+    }
+    Ok(id)
 }
 
 /// Insert a new producer id at epoch 0 and return `(producer_id, epoch)`.
@@ -84,6 +104,8 @@ pub(super) fn bump_producer_epoch(
 ) -> Result<(i64, i16)> {
     let row = if old_epoch == i16::MAX {
         let new_id = next_free_producer_id(client)?;
+        // The new id starts without state; the old one's entries name nobody.
+        forget_producer_sequences(client, producer_id)?;
         client.update(
             "UPDATE kafka.producer_ids
              SET producer_id = $2, epoch = 0, last_epoch = NULL, last_active_at = NOW()
@@ -110,11 +132,33 @@ pub(super) fn bump_producer_epoch(
     Ok((new_producer_id, new_epoch))
 }
 
-/// Drop a producer's sequence state on every partition (and with it, by cascade, its
-/// remembered batches). A new epoch restarts sequence numbers at 0, so without this
-/// the new epoch's first batches would be judged against the old last sequence and
-/// dropped as duplicates.
-pub(super) fn clear_producer_sequences(
+/// Reset a producer's sequence state on every partition for a new epoch, which
+/// restarts sequence numbers at 0: its remembered batches go, and each partition entry
+/// stays with no last sequence ([`PartitionSequence::EpochStart`]), so the new epoch's
+/// first batch there must start at 0, as in Kafka. Without the reset the new epoch's
+/// batches would be judged against the old last sequence and dropped as duplicates.
+pub(super) fn reset_producer_sequences(
+    client: &mut SpiClient<'_>,
+    producer_id: i64,
+) -> std::result::Result<(), SpiError> {
+    client.update(
+        "DELETE FROM kafka.producer_batches WHERE producer_id = $1",
+        None,
+        &[producer_id.into()],
+    )?;
+    client.update(
+        "UPDATE kafka.producer_sequences SET last_sequence = -1, updated_at = NOW()
+         WHERE producer_id = $1",
+        None,
+        &[producer_id.into()],
+    )?;
+    Ok(())
+}
+
+/// Drop a producer's entries on every partition (and with them, by cascade, its
+/// remembered batches): the id no longer names the producer that wrote them, so its
+/// next holder starts without state ([`PartitionSequence::NoEntry`]).
+fn forget_producer_sequences(
     client: &mut SpiClient<'_>,
     producer_id: i64,
 ) -> std::result::Result<(), SpiError> {
@@ -171,10 +215,10 @@ struct ProducerState {
     transactional: bool,
 }
 
-/// A producer's sequence state on one partition at its current epoch: the last
-/// sequence and the remembered batches (every epoch change deletes both).
+/// A producer's sequence state on one partition: its entry and the remembered batches
+/// (both belong to the current epoch; every epoch change resets them).
 struct PartitionSequenceState {
-    last_sequence: Option<i32>,
+    sequence: PartitionSequence,
     cached: Vec<CachedBatch>,
 }
 
@@ -212,7 +256,7 @@ fn adopt_unknown_producer(
         None,
         &[producer_id.into(), producer_epoch.into()],
     )?;
-    clear_producer_sequences(client, producer_id)?;
+    forget_producer_sequences(client, producer_id)?;
     Ok(())
 }
 
@@ -232,11 +276,16 @@ fn read_partition_sequence_state(
         Some(1),
         &args,
     )?;
-    let last_sequence = if seq_table.is_empty() {
+    let sequence = PartitionSequence::from_stored(if seq_table.is_empty() {
         None
     } else {
-        stored_last_sequence(seq_table.first().get_by_name::<i32, _>("last_sequence")?)
-    };
+        Some(
+            seq_table
+                .first()
+                .get_by_name::<i32, _>("last_sequence")?
+                .unwrap_or(-1),
+        )
+    });
     let batch_table = client.select(
         "SELECT first_sequence, last_sequence, base_offset FROM kafka.producer_batches
          WHERE producer_id = $1 AND topic_id = $2 AND partition_id = $3",
@@ -251,10 +300,7 @@ fn read_partition_sequence_state(
             base_offset: row.get_by_name("base_offset")?.unwrap_or(-1),
         });
     }
-    Ok(PartitionSequenceState {
-        last_sequence,
-        cached,
-    })
+    Ok(PartitionSequenceState { sequence, cached })
 }
 
 /// Act on a [`validate_sequence`] outcome: the produce path's [`SequenceCheck`], the
@@ -295,14 +341,14 @@ fn apply_sequence_validation(
             if new_epoch {
                 // KIP-360: an idempotent producer bumped its own epoch (the Java
                 // client does after an unresolved sequence error). Adopt it, and
-                // drop the old epoch's sequence state on every partition.
+                // reset the old epoch's sequence state on every partition.
                 client.update(
                     "UPDATE kafka.producer_ids SET epoch = $2, last_active_at = NOW()
                      WHERE producer_id = $1 AND epoch < $2",
                     None,
                     &[producer_id.into(), producer_epoch.into()],
                 )?;
-                clear_producer_sequences(client, producer_id)?;
+                reset_producer_sequences(client, producer_id)?;
             }
             Ok(SequenceCheck::Append)
         }
@@ -374,7 +420,7 @@ impl PostgresStore {
             // only after a successful insert.
             let validation = validate_sequence(
                 producer.epoch,
-                partition.last_sequence,
+                partition.sequence,
                 &partition.cached,
                 producer_epoch,
                 base_sequence,

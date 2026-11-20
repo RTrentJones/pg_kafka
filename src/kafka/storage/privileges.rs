@@ -80,12 +80,15 @@ pub const WORKER_TABLE_GRANTS: &[(&str, &[&str])] = &[
     ("kafka.sasl_server_secret", &["SELECT"]),
 ];
 
-/// Sequences behind the SERIAL/BIGSERIAL columns the worker inserts into, plus the
-/// `nextval(pg_get_serial_sequence('kafka.producer_ids', ...))` reallocation (RV-13).
-pub const WORKER_SEQUENCE_GRANTS: &[&str] = &[
-    "kafka.topics_id_seq",
-    "kafka.messages_global_offset_seq",
-    "kafka.producer_ids_producer_id_seq",
+/// Sequence privileges the worker needs: USAGE on the sequences behind the
+/// SERIAL/BIGSERIAL columns it inserts into, and on the producer id sequence for
+/// `nextval(pg_get_serial_sequence('kafka.producer_ids', ...))` (InitProducerId and the
+/// RV-13 reallocation), plus UPDATE there for the `setval` that moves it past a run of
+/// ids producers already hold.
+pub const WORKER_SEQUENCE_GRANTS: &[(&str, &[&str])] = &[
+    ("kafka.topics_id_seq", &["USAGE"]),
+    ("kafka.messages_global_offset_seq", &["USAGE"]),
+    ("kafka.producer_ids_producer_id_seq", &["USAGE", "UPDATE"]),
 ];
 
 /// SECURITY DEFINER functions the worker calls (ADR-001 time partitions): all
@@ -163,11 +166,9 @@ pub fn required_worker_privileges() -> Vec<PrivilegeCheck> {
     for (table, privs) in WORKER_TABLE_GRANTS {
         out.extend(privs.iter().map(|p| check(ObjectKind::Table, table, p)));
     }
-    out.extend(
-        WORKER_SEQUENCE_GRANTS
-            .iter()
-            .map(|seq| check(ObjectKind::Sequence, seq, "USAGE")),
-    );
+    for (seq, privs) in WORKER_SEQUENCE_GRANTS {
+        out.extend(privs.iter().map(|p| check(ObjectKind::Sequence, seq, p)));
+    }
     out.extend(
         WORKER_FUNCTION_GRANTS
             .iter()
@@ -444,6 +445,7 @@ mod tests {
         assert_eq!(rows[0], ("schema", "kafka", "USAGE"));
         assert!(rows.contains(&("table", "kafka.messages", "DELETE")));
         assert!(rows.contains(&("sequence", "kafka.producer_ids_producer_id_seq", "USAGE")));
+        assert!(rows.contains(&("sequence", "kafka.producer_ids_producer_id_seq", "UPDATE")));
         assert!(rows.contains(&(
             "function",
             "kafka.drop_message_partition(regclass, int[])",

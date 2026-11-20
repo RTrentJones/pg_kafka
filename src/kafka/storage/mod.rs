@@ -28,8 +28,8 @@ pub(crate) use delegate::{
 };
 pub use headers::{decode_headers_json, encode_headers_json};
 pub use sequence::{
-    batch_last_sequence, next_sequence, stored_last_sequence, transactional_epoch_is_stale,
-    validate_sequence, validate_unknown_producer, CachedBatch, ProducerBatch, SequenceCheck,
+    batch_last_sequence, next_sequence, transactional_epoch_is_stale, validate_sequence,
+    validate_unknown_producer, CachedBatch, PartitionSequence, ProducerBatch, SequenceCheck,
     SequenceValidation, PRODUCER_BATCH_CACHE,
 };
 
@@ -596,11 +596,12 @@ pub trait ProducerStore {
     /// partition (Kafka's model, see [`validate_sequence`]).
     ///
     /// The batch is appended when it starts right after the partition's last sequence
-    /// (or at 0 on a fresh partition or with a new epoch), and is a duplicate when its
-    /// exact sequence range is one of the producer's last [`PRODUCER_BATCH_CACHE`]
-    /// batches on the partition; then the original base offset is returned. Nothing is
-    /// written for a duplicate or an error; a batch at a new (client-bumped) epoch
-    /// moves the producer's stored epoch and clears its sequence state first.
+    /// (at any sequence on a partition where the producer has no entry, at 0 on one
+    /// whose entry an epoch change reset), and is a duplicate when its exact sequence
+    /// range is one of the producer's last [`PRODUCER_BATCH_CACHE`] batches on the
+    /// partition; then the original base offset is returned. Nothing is written for a
+    /// duplicate or an error; a batch at a new (client-bumped) epoch moves the
+    /// producer's stored epoch and resets its sequence state first.
     ///
     /// # Arguments
     /// * `producer_id` - The producer ID
