@@ -789,9 +789,12 @@ fn stale_in_flight_entries_do_not_use_up_the_in_flight_room() {
     // MAX_INFLIGHT forwards whose acks were lost (a forwarder crash) are stale
     // once evict_after passes: their rows are claimable again, and they must not
     // keep the in-flight room at zero, which would stop every claim for good.
+    // The horizon is wide enough that filling the tracker cannot outlast it on a
+    // slow (instrumented) build; the first poll must still see every entry live.
+    const EVICT: Duration = Duration::from_secs(1);
     let mut h = async_harness(16);
-    h.store.inflight =
-        crate::kafka::shadow::inflight::InflightTracker::new(Duration::from_millis(20));
+    h.store.inflight = crate::kafka::shadow::inflight::InflightTracker::new(EVICT);
+    let filled = Instant::now();
     for o in 0..MAX_INFLIGHT {
         assert!(h
             .store
@@ -804,7 +807,11 @@ fn stale_in_flight_entries_do_not_use_up_the_in_flight_room() {
         0,
         "no room while the entries are live"
     );
-    std::thread::sleep(Duration::from_millis(40));
+    assert!(
+        filled.elapsed() < EVICT,
+        "the first poll ran past the horizon, so it did not test live entries"
+    );
+    std::thread::sleep(EVICT.saturating_sub(filled.elapsed()) + Duration::from_millis(50));
     assert_eq!(
         h.store.poll_and_forward_outbox().unwrap(),
         1,
