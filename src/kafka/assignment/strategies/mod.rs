@@ -9,9 +9,11 @@
 //! # Strategy Selection
 //!
 //! Consumers advertise their supported strategies in JoinGroup, in preference
-//! order. The coordinator (`ConsumerGroup::select_group_protocol`) picks the
-//! leader's most-preferred strategy that every member supports;
-//! `create_strategy()` maps the chosen name to an implementation.
+//! order. The coordinator (`ConsumerGroup::select_group_protocol`) picks one by
+//! Kafka's member vote: among the strategies every member supports, each member
+//! votes for its most-preferred one and the most votes win, ties going to the
+//! leader's preference; `create_strategy()` maps the chosen name to an
+//! implementation.
 
 pub mod range;
 pub mod roundrobin;
