@@ -8,9 +8,11 @@
 
 mod configs;
 mod create_validation;
+mod group_member;
 
 use crate::common::create_admin_client;
-use crate::common::{create_db_client, TestResult};
+use crate::common::{create_db_client, DynResult, TestResult};
+use group_member::GroupMember;
 use rdkafka::admin::{AdminOptions, NewPartitions, NewTopic, TopicReplication};
 use std::time::Duration;
 use uuid::Uuid;
@@ -294,57 +296,58 @@ pub async fn test_delete_group_empty() -> TestResult {
     Ok(())
 }
 
+/// Bound one admin step: a broker that never answers fails the test with the step's
+/// name instead of holding it until the runner's per-test timeout.
+async fn step<T, E: std::fmt::Debug>(
+    name: &str,
+    f: impl std::future::Future<Output = Result<T, E>>,
+) -> DynResult<T> {
+    println!("    {name}...");
+    match tokio::time::timeout(STEP_TIMEOUT, f).await {
+        Ok(r) => r.map_err(|e| format!("{name}: {e:?}").into()),
+        Err(_) => Err(format!("{name}: no answer in {STEP_TIMEOUT:?}").into()),
+    }
+}
+
+/// The bound of one step of the DeleteGroups tests (admin requests time out after
+/// 10 s on the client).
+const STEP_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn group_admin_opts() -> AdminOptions {
+    AdminOptions::new()
+        .operation_timeout(Some(Duration::from_secs(5)))
+        .request_timeout(Some(Duration::from_secs(10)))
+}
+
 /// Test that deleting a group with active members fails
 pub async fn test_delete_group_non_empty() -> TestResult {
-    use crate::common::create_stream_consumer;
-    use rdkafka::consumer::Consumer;
-
     let admin = create_admin_client()?;
     let topic_name = format!("test-delete-group-nonempty-{}", Uuid::new_v4());
     let group_id = format!("test-group-nonempty-{}", Uuid::new_v4());
+    let opts = group_admin_opts();
 
-    // Create a topic first
     let new_topic = NewTopic::new(&topic_name, 1, TopicReplication::Fixed(1));
-    let opts = AdminOptions::new().operation_timeout(Some(Duration::from_secs(5)));
-    let _ = admin.create_topics(&[new_topic], &opts).await?;
+    step("CreateTopics", admin.create_topics(&[new_topic], &opts)).await?;
 
-    // Create a consumer that joins the group
-    let consumer = create_stream_consumer(&group_id)?;
-    consumer.subscribe(&[&topic_name])?;
+    // A Stable member: JoinGroup and SyncGroup answered and the assignment applied.
+    println!("    joining the group...");
+    let member = GroupMember::join(&group_id, &topic_name, STEP_TIMEOUT)?;
 
-    // Wait for the consumer to join the group
-    // StreamConsumer handles the join protocol in the background when subscribed
-    // We need to give it enough time to complete the JoinGroup/SyncGroup exchange
-    tokio::time::sleep(Duration::from_secs(3)).await;
-
-    // Try to delete the group while consumer is active
-    let results = admin.delete_groups(&[&group_id], &opts).await?;
+    let results = step("DeleteGroups", admin.delete_groups(&[&group_id], &opts)).await?;
     assert_eq!(results.len(), 1);
-
-    // Should fail with NON_EMPTY_GROUP
-    let result = &results[0];
-    assert!(
-        result.is_err(),
-        "Deleting non-empty group should fail: {:?}",
-        result.as_ref().ok()
-    );
-
-    let err = result.as_ref().unwrap_err();
-    assert!(
-        format!("{err:?}").contains("NonEmptyGroup")
-            || format!("{err:?}").contains("68")
-            || format!("{err:?}").contains("active"),
-        "Expected NON_EMPTY_GROUP error, got: {err:?}"
-    );
-
-    // Consumer will be dropped here, leaving the group
-    drop(consumer);
-
-    // Cleanup - wait for completion to prevent race conditions with next test
-    if let Err(e) = admin.delete_topics(&[&topic_name], &opts).await {
-        eprintln!("    Cleanup warning: {e:?}");
+    match &results[0] {
+        Err((_, rdkafka::types::RDKafkaErrorCode::NonEmptyGroup)) => {}
+        other => {
+            return Err(
+                format!("group with a member: expected NonEmptyGroup, got {other:?}").into(),
+            )
+        }
     }
 
+    println!("    leaving the group...");
+    member.close(STEP_TIMEOUT)?;
+
+    step("DeleteTopics", admin.delete_topics(&[&topic_name], &opts)).await?;
     println!("    Correctly rejected deletion of non-empty group '{group_id}'");
     Ok(())
 }
@@ -356,29 +359,22 @@ pub async fn test_delete_group_non_empty() -> TestResult {
 /// so the group becomes Empty and DeleteGroups succeeds — otherwise it keeps returning
 /// NON_EMPTY_GROUP long after a clean leave.
 pub async fn test_delete_group_after_leave() -> TestResult {
-    use crate::common::create_stream_consumer;
-    use rdkafka::consumer::Consumer;
-
     let admin = create_admin_client()?;
     let topic_name = format!("test-delete-group-afterleave-{}", Uuid::new_v4());
     let group_id = format!("test-group-afterleave-{}", Uuid::new_v4());
+    let opts = group_admin_opts();
 
     let new_topic = NewTopic::new(&topic_name, 1, TopicReplication::Fixed(1));
-    let opts = AdminOptions::new().operation_timeout(Some(Duration::from_secs(5)));
-    let _ = admin.create_topics(&[new_topic], &opts).await?;
+    step("CreateTopics", admin.create_topics(&[new_topic], &opts)).await?;
 
-    // Join the group, then cleanly leave (dropping the consumer sends LeaveGroup).
-    {
-        let consumer = create_stream_consumer(&group_id)?;
-        consumer.subscribe(&[&topic_name])?;
-        tokio::time::sleep(Duration::from_secs(3)).await; // complete JoinGroup/SyncGroup
-    } // consumer dropped here → LeaveGroup (v3+ members array)
+    // Join, then cleanly leave: the close sends LeaveGroup (v3+ members array) and
+    // completes only once it is answered, so the group is Empty afterwards.
+    println!("    joining the group...");
+    let member = GroupMember::join(&group_id, &topic_name, STEP_TIMEOUT)?;
+    println!("    leaving the group...");
+    member.close(STEP_TIMEOUT)?;
 
-    // Give the broker a moment to process the LeaveGroup and empty the group.
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    // DeleteGroups should now succeed (the group is Empty).
-    let results = admin.delete_groups(&[&group_id], &opts).await?;
+    let results = step("DeleteGroups", admin.delete_groups(&[&group_id], &opts)).await?;
     assert_eq!(results.len(), 1);
     assert!(
         results[0].is_ok(),
@@ -386,11 +382,7 @@ pub async fn test_delete_group_after_leave() -> TestResult {
         results[0].as_ref().err()
     );
 
-    // Cleanup
-    if let Err(e) = admin.delete_topics(&[&topic_name], &opts).await {
-        eprintln!("    Cleanup warning: {e:?}");
-    }
-
+    step("DeleteTopics", admin.delete_topics(&[&topic_name], &opts)).await?;
     println!("    Deleted empty group '{group_id}' after a clean leave");
     Ok(())
 }
