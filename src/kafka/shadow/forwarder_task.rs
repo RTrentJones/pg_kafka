@@ -108,6 +108,9 @@ pub(crate) struct ForwarderCore {
     /// fatal (after its first failure, the cause) or one retired by a settings
     /// change (its outstanding records were purged).
     collateral_generations: std::collections::BTreeSet<u64>,
+    /// Records handed to a producer whose delivery has not resolved, with the
+    /// generation that holds them.
+    outstanding: HashMap<RowKey, u64>,
     holds: HashMap<u64, HoldState>,
     waiting: HashMap<RowKey, Vec<u64>>,
     next_hold: u64,
@@ -146,6 +149,29 @@ impl ForwarderCore {
         *fence = (*fence).min(key.local_offset);
     }
 
+    /// `key` was handed to the producer of `generation`.
+    pub(crate) fn sent(&mut self, key: RowKey, generation: u64) {
+        self.outstanding.insert(key, generation);
+    }
+
+    /// Fence every partition with a record outstanding on `generation`, at its
+    /// lowest such offset. Called when the producer is replaced or goes fatal:
+    /// those records fail, but their failures arrive later, and until then a
+    /// later record of the partition must not go out on the replacement ahead
+    /// of their retry. A record of the generation that is delivered after all
+    /// leaves a fence the partition's next head (`restart`) lifts.
+    pub(crate) fn fence_outstanding(&mut self, generation: u64) {
+        let keys: Vec<RowKey> = self
+            .outstanding
+            .iter()
+            .filter(|(_, &g)| g == generation)
+            .map(|(&key, _)| key)
+            .collect();
+        for key in keys {
+            self.fence(key);
+        }
+    }
+
     /// A producer generation was retired (rebuilt for new settings, its
     /// outstanding records purged): its failures are not delivery failures.
     pub(crate) fn retire_generation(&mut self, generation: u64) {
@@ -165,6 +191,7 @@ impl ForwarderCore {
         result: Result<i64, String>,
         producer_fatal: bool,
     ) {
+        self.outstanding.remove(&key);
         match result {
             Ok(external_offset) => {
                 self.acks.push_back(ForwardAck::new(
@@ -180,6 +207,7 @@ impl ForwarderCore {
                     // The first failure seen of a generation that went fatal is
                     // taken as its cause; every later failure is collateral.
                     self.retire_generation(generation);
+                    self.fence_outstanding(generation);
                 }
                 let outcome = if collateral {
                     ForwardOutcome::NotAttempted(format!(
@@ -337,6 +365,9 @@ impl ProducerSlot {
             }
         }
         if let Some(old) = self.live.take() {
+            // Its outstanding records fail; fence their partitions before the
+            // replacement sends anything, so nothing overtakes their retry.
+            core.fence_outstanding(old.generation);
             if let Some(e) = old.producer.fatal_error() {
                 warn!("Shadow producer is fatal ({e}); rebuilding it");
             } else {
@@ -552,6 +583,7 @@ fn forward_one(
     }
     match producer.enqueue(&record) {
         Ok(future) => {
+            core.sent(key, generation);
             // Test hook (pg_kafka.test_forward_ack_delay_ms, 0 in
             // production): delay the ack past the outbox retry lease. Only
             // this delivery's own future waits; the pipeline keeps going.
@@ -679,6 +711,39 @@ mod tests {
             core.retire_generation(g);
         }
         assert!(core.collateral_generations.len() <= 64);
+    }
+
+    /// A replaced producer's outstanding records fail later; until they do, a
+    /// later record of their partitions must not go out on the replacement.
+    #[test]
+    fn replacing_a_producer_fences_its_outstanding_partitions() {
+        let mut core = ForwarderCore::default();
+        core.sent(RowKey::new(1, 0, 5), 1);
+        core.sent(RowKey::new(1, 0, 6), 1);
+        core.sent(RowKey::new(1, 1, 3), 1);
+        core.on_result(RowKey::new(1, 1, 3), 1, Ok(9), false);
+        core.sent(RowKey::new(1, 2, 8), 2);
+        core.fence_outstanding(1);
+        // Partition 0 waits for the retry of 5, the lowest outstanding offset.
+        assert_eq!(core.admit(&rec(0, 7, false)), Admit::Fenced);
+        // Partition 1's record was delivered and partition 2's is on another
+        // generation: neither is fenced.
+        assert_eq!(core.admit(&rec(1, 4, false)), Admit::Send);
+        assert_eq!(core.admit(&rec(2, 9, false)), Admit::Send);
+        assert_eq!(core.admit(&rec(0, 5, false)), Admit::Send);
+        assert_eq!(core.admit(&rec(0, 7, false)), Admit::Send);
+    }
+
+    /// The first failure of a generation that went fatal fences the partitions
+    /// of its other outstanding records too.
+    #[test]
+    fn a_fatal_failure_fences_the_generations_other_partitions() {
+        let mut core = ForwarderCore::default();
+        core.sent(RowKey::new(1, 0, 1), 3);
+        core.sent(RowKey::new(1, 1, 4), 3);
+        core.on_result(RowKey::new(1, 0, 1), 3, Err("root cause".into()), true);
+        assert_eq!(core.admit(&rec(1, 5, false)), Admit::Fenced);
+        assert_eq!(core.outstanding.len(), 1);
     }
 
     #[test]

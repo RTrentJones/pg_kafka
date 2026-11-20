@@ -106,7 +106,10 @@ of each; see duplicates below). That rests on:
    forwarder receives is answered `NotAttempted` without being sent, until the partition restarts:
    a record at or below the failed offset, or one the claim marks as the partition head (`restart`,
    the lowest pending row, which is how a partition moves on after its failed record is
-   dead-lettered).
+   dead-lettered). When a producer is replaced (settings change) or goes fatal, every partition
+   with a record still outstanding on it is fenced at once, at its lowest outstanding offset:
+   those records fail later, and nothing of their partitions may go out on the replacement ahead
+   of their retry.
 
 Failures are classified: a real delivery failure is `Failed` (counts against
 `shadow_max_retries`); a record fenced, failed only because the producer went fatal on another
