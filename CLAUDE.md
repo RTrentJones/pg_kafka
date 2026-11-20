@@ -260,7 +260,8 @@ must keep:
   `UNIQUE (topic_id, partition_id, partition_offset)` and `UNIQUE (global_offset)`. Leaves are
   extension members. All partition DDL runs in SECURITY DEFINER functions
   (`kafka.ensure_message_partitions`, `drop_message_partition`, `message_partition_contents`,
-  internal `create_message_partition`, and the internal lock helpers `try_maintenance_lock` and `lock_message_tables`; `kafka.message_partitions()` lists the leaves), and the
+  internal `create_message_partition`, and the internal lock helpers `try_maintenance_lock`
+  and `lock_message_tables`; `kafka.message_partitions()` lists the leaves), and the
   drop/trim decisions are pure functions in `storage/retention.rs`. Retention for a window of at
   least one width is leaf-granular; shorter windows and the DEFAULT leaf expire row by row.
   **Never** write an UPDATE that changes `created_at` (it moves rows between leaves), confine a
