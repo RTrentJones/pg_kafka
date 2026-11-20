@@ -20,5 +20,6 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         acks_zero::test_producer_acks_zero,
         ack_visibility::test_produce_ack_implies_committed_visibility: sequential, // Mutates global GUC (test_pre_commit_delay_ms)
         timestamp::test_producer_timestamp_roundtrip,
+        timestamp::test_producer_timestamps_far_from_the_batch_base_roundtrip,
     ]
 }

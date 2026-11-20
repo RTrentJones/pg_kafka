@@ -61,3 +61,83 @@ pub async fn test_producer_timestamp_roundtrip() -> TestResult {
     }
     Err("timed out waiting for the produced message".into())
 }
+
+/// Record timestamps are the batch's base timestamp plus a varlong delta: records 30 days
+/// before the batch's first and 2^36 ms (about 2 years) after it, deltas past the 32 bits of
+/// a varint, are stored and consumed with the timestamps they were sent with. (A 5-byte
+/// varint read of the delta stored other timestamps, or refused the batch.)
+pub async fn test_producer_timestamps_far_from_the_batch_base_roundtrip() -> TestResult {
+    use crate::network::produce_decoding::{batch_with, record, varint, BatchHeader};
+    use crate::wire::Wire;
+    println!("=== Test: record timestamps far from the batch's base timestamp ===\n");
+    let ctx = crate::setup::TestContext::new().await?;
+    let topic = ctx.unique_topic("ts-varlong").await;
+    let created = crate::wire::requests::create_topics_raw(vec![crate::wire::requests::creatable(
+        &topic, 1, 1,
+    )])
+    .await?;
+    assert_eq!(created[0].error_code, 0, "{created:?}");
+
+    let base: i64 = 1_763_600_000_000; // 2025-11-20
+    let month: i64 = 30 * 24 * 3600 * 1000;
+    let deltas = [0, -month, 1 << 36];
+    let section: Vec<u8> = (0..)
+        .zip(deltas)
+        .flat_map(|(i, delta)| {
+            let value = format!("v{i}");
+            record(&[
+                &[0],
+                &varint(delta),
+                &varint(i),
+                &varint(-1),
+                &varint(2),
+                value.as_bytes(),
+                &varint(0),
+            ])
+        })
+        .collect();
+    let header = BatchHeader {
+        base_timestamp: base,
+        ..BatchHeader::default()
+    };
+    let batch = batch_with(&section, 3, header);
+    let mut wire = Wire::connect().await?;
+    assert_eq!(wire.produce(&topic, 0, batch, None).await?, (0, 0));
+    let expected: Vec<i64> = deltas.iter().map(|d| base + d).collect();
+    println!("Produced 3 records at timestamps {expected:?}");
+
+    let stored: Vec<i64> = ctx
+        .db()
+        .query(
+            "SELECT m.timestamp_ms FROM kafka.messages m JOIN kafka.topics t \
+             ON t.id = m.topic_id WHERE t.name = $1 ORDER BY m.partition_offset",
+            &[&topic],
+        )
+        .await?
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(stored, expected, "stored timestamps");
+    println!("✅ stored {stored:?}");
+
+    let consumer = create_base_consumer("ts-varlong-probe")?;
+    let mut assignment = TopicPartitionList::new();
+    assignment.add_partition_offset(&topic, 0, rdkafka::Offset::Beginning)?;
+    consumer.assign(&assignment)?;
+    let mut consumed = Vec::new();
+    let start = std::time::Instant::now();
+    while consumed.len() < 3 && start.elapsed() < TEST_TIMEOUT {
+        if let Some(Ok(msg)) = consumer.poll(POLL_TIMEOUT) {
+            match msg.timestamp() {
+                Timestamp::CreateTime(ms) | Timestamp::LogAppendTime(ms) => consumed.push(ms),
+                Timestamp::NotAvailable => return Err("a record without a timestamp".into()),
+            }
+        }
+    }
+    assert_eq!(consumed, expected, "consumed timestamps");
+    println!("✅ consumed {consumed:?}");
+
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}

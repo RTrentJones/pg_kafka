@@ -593,7 +593,9 @@ pub fn parse_record_batch(batch_bytes: &Bytes, budget: &DecodeBudget) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use super::test_batches::{header_records, raw_batch, record, tiny_records, v};
+    use super::test_batches::{
+        batch_with, header_records, raw_batch, record, tiny_records, v, Header,
+    };
     use super::*;
     use bytes::Bytes;
 
@@ -1263,6 +1265,30 @@ mod tests {
         assert_eq!(
             headers,
             [("a", &b"1"[..]), ("a", b"2"), ("\u{fffd}\u{fffd}", b"")]
+        );
+    }
+
+    #[test]
+    fn timestamp_deltas_are_varlongs() {
+        // A record 30 days older than the batch's first, and one 2^40 ms later: deltas past
+        // the 32 bits of a varint.
+        let base = 1_763_600_000_000i64;
+        let month = 30 * 24 * 3600 * 1000i64;
+        let section = [
+            record(&[&[0], &v(0), &v(0), &v(-1), &v(1), b"u", &v(0)]),
+            record(&[&[0], &v(-month), &v(1), &v(-1), &v(1), b"t", &v(0)]),
+            record(&[&[0], &v(1 << 40), &v(2), &v(-1), &v(-1), &v(0)]),
+        ]
+        .concat();
+        let header = Header {
+            base_timestamp: base,
+            ..Header::default()
+        };
+        let records = parse_record_batch(&batch_with(&section, 3, header), &budget()).unwrap();
+        let timestamps: Vec<Option<i64>> = records.iter().map(|r| r.timestamp).collect();
+        assert_eq!(
+            timestamps,
+            [Some(base), Some(base - month), Some(base + (1 << 40))]
         );
     }
 
