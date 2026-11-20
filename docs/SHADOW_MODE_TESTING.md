@@ -183,6 +183,11 @@ set `pg_kafka.shadow_bootstrap_servers = '127.0.0.1:9093'` (plus the other GUCs 
 suite with `INTERNAL_KAFKA_BOOTSTRAP_SERVERS=127.0.0.1:9093 EXTERNAL_KAFKA_BOOTSTRAP_SERVERS=127.0.0.1:9093`.
 The order test creates and alters an external topic through the admin API, so the broker must allow
 it (the default does).
+The delivery-timeout order test pauses and resumes the broker with the shell commands in
+`EXTERNAL_KAFKA_PAUSE_CMD` / `EXTERNAL_KAFKA_RESUME_CMD` (default `docker pause external_kafka` /
+`docker unpause external_kafka`); without Docker, stop the broker's process instead, for example
+`pkill -STOP -f '[k]afka.Kafka'` / `pkill -CONT -f '[k]afka.Kafka'` (the bracket keeps the pattern
+from matching the `sh -c` that runs it).
 
 ### DNS Resolution
 

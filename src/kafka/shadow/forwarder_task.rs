@@ -38,6 +38,40 @@
 //! `NotAttempted`, so it does not consume the record's retry budget
 //! (`pg_kafka.shadow_max_retries`).
 //!
+//! ## Delivery timeout
+//!
+//! librdkafka's own `message.timeout.ms` is infinite: a record it fails by
+//! timeout is not covered by `enable.gapless.guarantee`, and since the timeout
+//! runs per record from its enqueue, an earlier record would time out while a
+//! later one of the same partition, with a later deadline, stays queued and is
+//! delivered ahead of the earlier one's retry once the external cluster is back.
+//! The forwarder enforces the timeout ([`DELIVERY_TIMEOUT`]) per producer
+//! generation instead: once the oldest record outstanding on a generation has
+//! waited that long, every partition with a record on it is fenced, the
+//! generation is retired and its queued and in-flight records are purged, all
+//! partitions at once, so each partition restarts at its first undelivered
+//! record on a new producer.
+//!
+//! Which of the purged records count as failed attempts: the lowest outstanding
+//! record of each local partition (the one the partition waits on) that has been
+//! outstanding for at least half the timeout. The records behind it are
+//! collateral (the fence would hold them back anyway), and so is a head that
+//! has not had a fair window yet (sent less than half a timeout ago, for
+//! example a healthy partition whose records were flowing). In a persistent
+//! outage every stuck partition's head is outstanding for close to a whole
+//! timeout at each retirement (the outbox backoff, at most 30 s, is under half
+//! of it), so it fails once per cycle and is dead-lettered after
+//! `shadow_max_retries` cycles; the records behind it are not penalized, and
+//! the next one becomes the head once it is dead-lettered.
+//!
+//! Purging in-flight records cannot reorder a partition either: the old
+//! producer's in-flight requests may still be written by the broker (the purge
+//! only voids their acks), but the broker writes a producer's records in
+//! sequence order, so what lands is an in-order prefix of the old generation's
+//! records, and the new producer re-sends from the partition's first record
+//! not acked as delivered. The first copy of every record is therefore in
+//! local order; the old prefix and the re-send can duplicate (at-least-once).
+//!
 //! ## Backpressure
 //!
 //! When librdkafka's local queue is full, the record and every later one wait,
@@ -56,12 +90,13 @@
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError};
 use futures::future::BoxFuture;
 use futures::stream::{FuturesUnordered, StreamExt};
+use std::collections::BTreeSet;
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
-use super::producer::EnqueueError;
+use super::producer::{EnqueueError, DELIVERY_TIMEOUT};
 use super::{
     ForwardAck, ForwardOutcome, ForwardRecord, ForwardRequest, RowKey, ShadowConfig,
     ShadowProducer, SyncHold,
@@ -91,6 +126,13 @@ pub(crate) enum Admit {
     Fenced,
 }
 
+/// A record handed to a producer and not resolved yet.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Outstanding {
+    generation: u64,
+    sent_at: Instant,
+}
+
 struct HoldState {
     remaining: usize,
     deadline: Instant,
@@ -107,10 +149,15 @@ pub(crate) struct ForwarderCore {
     /// Producer generations whose failures are collateral: one that became
     /// fatal (after its first failure, the cause) or one retired by a settings
     /// change (its outstanding records were purged).
-    collateral_generations: std::collections::BTreeSet<u64>,
+    collateral_generations: BTreeSet<u64>,
     /// Records handed to a producer whose delivery has not resolved, with the
-    /// generation that holds them.
-    outstanding: HashMap<RowKey, u64>,
+    /// generation that holds them and when they were handed over.
+    outstanding: HashMap<RowKey, Outstanding>,
+    /// The same records, oldest first (the delivery timeout's queue).
+    by_age: BTreeSet<(Instant, RowKey)>,
+    /// Records of a timed-out generation whose purge counts as a failed
+    /// attempt: generation and error.
+    timed_out: HashMap<RowKey, (u64, String)>,
     holds: HashMap<u64, HoldState>,
     waiting: HashMap<RowKey, Vec<u64>>,
     next_hold: u64,
@@ -149,9 +196,67 @@ impl ForwarderCore {
         *fence = (*fence).min(key.local_offset);
     }
 
-    /// `key` was handed to the producer of `generation`.
-    pub(crate) fn sent(&mut self, key: RowKey, generation: u64) {
-        self.outstanding.insert(key, generation);
+    /// `key` was handed to the producer of `generation` at `now`.
+    pub(crate) fn sent(&mut self, key: RowKey, generation: u64, now: Instant) {
+        let entry = Outstanding {
+            generation,
+            sent_at: now,
+        };
+        if let Some(old) = self.outstanding.insert(key, entry) {
+            self.by_age.remove(&(old.sent_at, key));
+        }
+        self.by_age.insert((now, key));
+    }
+
+    fn resolved(&mut self, key: RowKey) {
+        if let Some(old) = self.outstanding.remove(&key) {
+            self.by_age.remove(&(old.sent_at, key));
+        }
+    }
+
+    /// The generation whose oldest outstanding record has waited `timeout` by
+    /// `now`, if any. Generations already retired are skipped: their records
+    /// were purged and resolve on their own.
+    pub(crate) fn expired_generation(&self, now: Instant, timeout: Duration) -> Option<u64> {
+        let (sent_at, key) = self.by_age.iter().find(|(_, key)| {
+            self.outstanding
+                .get(key)
+                .is_some_and(|o| !self.collateral_generations.contains(&o.generation))
+        })?;
+        let generation = self.outstanding.get(key)?.generation;
+        (now.saturating_duration_since(*sent_at) >= timeout).then_some(generation)
+    }
+
+    /// `generation` ran out of delivery time at `now`: fence its partitions,
+    /// retire it, and pick the records whose purge counts as a failed attempt
+    /// (see the module docs). The caller purges the producer.
+    pub(crate) fn time_out_generation(&mut self, generation: u64, now: Instant, timeout: Duration) {
+        let mut heads: HashMap<(i32, i32), (RowKey, Instant)> = HashMap::new();
+        for (&key, o) in &self.outstanding {
+            if o.generation != generation {
+                continue;
+            }
+            let head = heads.entry(key.partition()).or_insert((key, o.sent_at));
+            if key.local_offset < head.0.local_offset {
+                *head = (key, o.sent_at);
+            }
+        }
+        let reason = format!("not delivered within {timeout:?}");
+        for (key, sent_at) in heads.into_values() {
+            if now.saturating_duration_since(sent_at) >= timeout / 2 {
+                self.timed_out.insert(key, (generation, reason.clone()));
+            }
+        }
+        self.fence_outstanding(generation);
+        self.retire_generation(generation);
+    }
+
+    /// The error of `key` if its failure on `generation` is a timed-out attempt.
+    fn take_timed_out(&mut self, key: RowKey, generation: u64) -> Option<String> {
+        match self.timed_out.get(&key) {
+            Some(&(g, _)) if g == generation => self.timed_out.remove(&key).map(|(_, e)| e),
+            _ => None,
+        }
     }
 
     /// Fence every partition with a record outstanding on `generation`, at its
@@ -164,7 +269,7 @@ impl ForwarderCore {
         let keys: Vec<RowKey> = self
             .outstanding
             .iter()
-            .filter(|(_, &g)| g == generation)
+            .filter(|(_, o)| o.generation == generation)
             .map(|(&key, _)| key)
             .collect();
         for key in keys {
@@ -191,7 +296,8 @@ impl ForwarderCore {
         result: Result<i64, String>,
         producer_fatal: bool,
     ) {
-        self.outstanding.remove(&key);
+        self.resolved(key);
+        let timed_out = self.take_timed_out(key, generation);
         match result {
             Ok(external_offset) => {
                 self.acks.push_back(ForwardAck::new(
@@ -202,6 +308,11 @@ impl ForwarderCore {
             }
             Err(error) => {
                 self.fence(key);
+                if let Some(reason) = timed_out {
+                    self.acks
+                        .push_back(ForwardAck::new(key, ForwardOutcome::Failed(reason)));
+                    return;
+                }
                 let collateral = self.collateral_generations.contains(&generation);
                 if producer_fatal && !collateral {
                     // The first failure seen of a generation that went fatal is
@@ -346,6 +457,9 @@ struct ProducerSlot {
     generation: u64,
     /// The last build error, so a persistent one is logged once.
     last_error: Option<String>,
+    /// Producers replaced after going fatal, by generation, so one whose
+    /// records outlive the delivery timeout can still be purged.
+    replaced: Vec<(u64, Weak<ShadowProducer>)>,
 }
 
 impl ProducerSlot {
@@ -370,10 +484,13 @@ impl ProducerSlot {
             core.fence_outstanding(old.generation);
             if let Some(e) = old.producer.fatal_error() {
                 warn!("Shadow producer is fatal ({e}); rebuilding it");
+                self.replaced.retain(|(_, p)| p.strong_count() > 0);
+                self.replaced
+                    .push((old.generation, Arc::downgrade(&old.producer)));
             } else {
                 info!("Shadow producer settings changed; rebuilding the producer");
                 // Fail the old producer's outstanding records now (instead of
-                // at message.timeout.ms) and do not count them: they are
+                // at the delivery timeout) and do not count them: they are
                 // re-sent by the new producer, in order.
                 core.retire_generation(old.generation);
                 old.producer.purge_outstanding();
@@ -412,6 +529,49 @@ impl ProducerSlot {
                 Err(e)
             }
         }
+    }
+}
+
+impl ProducerSlot {
+    /// `generation` ran out of delivery time: fail every record outstanding on
+    /// it now (see the module docs). The live producer is dropped, so the next
+    /// record builds a new generation.
+    fn time_out(
+        &mut self,
+        core: &mut ForwarderCore,
+        generation: u64,
+        now: Instant,
+        timeout: Duration,
+    ) {
+        core.time_out_generation(generation, now, timeout);
+        let producer = if self
+            .live
+            .as_ref()
+            .is_some_and(|l| l.generation == generation)
+        {
+            self.live.take().map(|l| l.producer)
+        } else {
+            self.replaced
+                .iter()
+                .find(|(g, _)| *g == generation)
+                .and_then(|(_, p)| p.upgrade())
+        };
+        warn!(
+            "Shadow forward not delivered within {timeout:?}; failing every record outstanding \
+             on the producer and rebuilding it"
+        );
+        if let Some(producer) = producer {
+            producer.purge_outstanding();
+        }
+    }
+}
+
+/// The delivery timeout: [`DELIVERY_TIMEOUT`], unless the test GUC
+/// `pg_kafka.test_shadow_delivery_timeout_ms` shortens it.
+fn delivery_timeout(config: &crate::config::Config) -> Duration {
+    match u64::try_from(config.test_shadow_delivery_timeout_ms) {
+        Ok(ms) if ms > 0 => Duration::from_millis(ms),
+        _ => DELIVERY_TIMEOUT,
     }
 }
 
@@ -483,7 +643,12 @@ pub(crate) async fn run_shadow_forwarder(
                 pump(&mut backlog, &runtime_context, &mut core, &mut slot, &mut deliveries);
             }
             _ = tick.tick() => {
-                core.expire_holds(Instant::now());
+                let now = Instant::now();
+                core.expire_holds(now);
+                let timeout = delivery_timeout(&runtime_context.config());
+                if let Some(generation) = core.expired_generation(now, timeout) {
+                    slot.time_out(&mut core, generation, now, timeout);
+                }
                 pump(&mut backlog, &runtime_context, &mut core, &mut slot, &mut deliveries);
                 // A settings change rebuilds the producer (and purges its
                 // outstanding records) even when no new record arrives to
@@ -583,7 +748,7 @@ fn forward_one(
     }
     match producer.enqueue(&record) {
         Ok(future) => {
-            core.sent(key, generation);
+            core.sent(key, generation, Instant::now());
             // Test hook (pg_kafka.test_forward_ack_delay_ms, 0 in
             // production): delay the ack past the outbox retry lease. Only
             // this delivery's own future waits; the pipeline keeps going.
@@ -718,11 +883,11 @@ mod tests {
     #[test]
     fn replacing_a_producer_fences_its_outstanding_partitions() {
         let mut core = ForwarderCore::default();
-        core.sent(RowKey::new(1, 0, 5), 1);
-        core.sent(RowKey::new(1, 0, 6), 1);
-        core.sent(RowKey::new(1, 1, 3), 1);
+        core.sent(RowKey::new(1, 0, 5), 1, Instant::now());
+        core.sent(RowKey::new(1, 0, 6), 1, Instant::now());
+        core.sent(RowKey::new(1, 1, 3), 1, Instant::now());
         core.on_result(RowKey::new(1, 1, 3), 1, Ok(9), false);
-        core.sent(RowKey::new(1, 2, 8), 2);
+        core.sent(RowKey::new(1, 2, 8), 2, Instant::now());
         core.fence_outstanding(1);
         // Partition 0 waits for the retry of 5, the lowest outstanding offset.
         assert_eq!(core.admit(&rec(0, 7, false)), Admit::Fenced);
@@ -739,11 +904,173 @@ mod tests {
     #[test]
     fn a_fatal_failure_fences_the_generations_other_partitions() {
         let mut core = ForwarderCore::default();
-        core.sent(RowKey::new(1, 0, 1), 3);
-        core.sent(RowKey::new(1, 1, 4), 3);
+        core.sent(RowKey::new(1, 0, 1), 3, Instant::now());
+        core.sent(RowKey::new(1, 1, 4), 3, Instant::now());
         core.on_result(RowKey::new(1, 0, 1), 3, Err("root cause".into()), true);
         assert_eq!(core.admit(&rec(1, 5, false)), Admit::Fenced);
         assert_eq!(core.outstanding.len(), 1);
+    }
+
+    const TIMEOUT: Duration = Duration::from_secs(120);
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    #[test]
+    fn a_generation_expires_when_its_oldest_record_reaches_the_timeout() {
+        let mut core = ForwarderCore::default();
+        let t0 = Instant::now();
+        core.sent(RowKey::new(1, 0, 1), 1, t0);
+        core.sent(RowKey::new(1, 0, 2), 1, t0 + secs(60));
+        assert_eq!(core.expired_generation(t0 + secs(119), TIMEOUT), None);
+        assert_eq!(core.expired_generation(t0 + TIMEOUT, TIMEOUT), Some(1));
+        // Once the oldest is delivered, the next one's own clock applies.
+        core.on_result(RowKey::new(1, 0, 1), 1, Ok(0), false);
+        assert_eq!(core.expired_generation(t0 + secs(179), TIMEOUT), None);
+        assert_eq!(core.expired_generation(t0 + secs(180), TIMEOUT), Some(1));
+        core.on_result(RowKey::new(1, 0, 2), 1, Ok(1), false);
+        assert_eq!(core.expired_generation(t0 + secs(999), TIMEOUT), None);
+    }
+
+    /// The staggered-deadline case: a record whose own deadline is later
+    /// fails with the earlier one, and the partition restarts at the earlier
+    /// one, so the later one can never be delivered ahead of its retry.
+    #[test]
+    fn a_timeout_fails_the_whole_generation_and_fences_at_the_first_record() {
+        let mut core = ForwarderCore::default();
+        let t0 = Instant::now();
+        core.sent(RowKey::new(1, 0, 1), 1, t0);
+        core.sent(RowKey::new(1, 0, 2), 1, t0 + secs(60));
+        let now = t0 + TIMEOUT;
+        let generation = core.expired_generation(now, TIMEOUT).unwrap();
+        core.time_out_generation(generation, now, TIMEOUT);
+        // A later record of the partition is held back until 1 restarts it.
+        assert_eq!(core.admit(&rec(0, 3, false)), Admit::Fenced);
+        // The purge reports: only the partition's head counts as an attempt.
+        core.on_result(RowKey::new(1, 0, 2), 1, Err("purged".into()), true);
+        core.on_result(RowKey::new(1, 0, 1), 1, Err("purged".into()), true);
+        let got = outcomes(&mut core);
+        assert!(
+            matches!(got[0].1, ForwardOutcome::NotAttempted(_)),
+            "{got:?}"
+        );
+        assert_eq!(
+            got[1].1,
+            ForwardOutcome::Failed("not delivered within 120s".into())
+        );
+        // Nothing of the retired generation can expire again.
+        assert_eq!(core.expired_generation(now + secs(999), TIMEOUT), None);
+        assert_eq!(core.admit(&rec(0, 2, false)), Admit::Fenced);
+        assert_eq!(core.admit(&rec(0, 1, false)), Admit::Send);
+        assert_eq!(core.admit(&rec(0, 2, false)), Admit::Send);
+    }
+
+    /// Each stuck partition's head counts; a head sent less than half a
+    /// timeout ago (a partition that was flowing) and the records behind a
+    /// head are collateral.
+    #[test]
+    fn a_timeout_counts_each_stuck_head_but_not_young_heads_or_followers() {
+        let mut core = ForwarderCore::default();
+        let t0 = Instant::now();
+        // Partition 0 stuck since t0, partition 1 since t0 + 50 s, partition 2
+        // only has a record sent 10 s before the timeout.
+        core.sent(RowKey::new(1, 0, 4), 7, t0);
+        core.sent(RowKey::new(1, 0, 5), 7, t0 + secs(1));
+        core.sent(RowKey::new(1, 1, 9), 7, t0 + secs(50));
+        core.sent(RowKey::new(1, 1, 10), 7, t0 + secs(51));
+        core.sent(RowKey::new(1, 2, 3), 7, t0 + secs(110));
+        // Another generation is not touched.
+        core.sent(RowKey::new(1, 3, 0), 8, t0 + secs(100));
+        let now = t0 + TIMEOUT;
+        core.time_out_generation(7, now, TIMEOUT);
+        for (p, o) in [(0, 5), (1, 10), (2, 3), (1, 9), (0, 4)] {
+            core.on_result(RowKey::new(1, p, o), 7, Err("purged".into()), true);
+        }
+        let failed: Vec<RowKey> = outcomes(&mut core)
+            .into_iter()
+            .filter(|(_, o)| matches!(o, ForwardOutcome::Failed(_)))
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(failed, vec![RowKey::new(1, 1, 9), RowKey::new(1, 0, 4)]);
+        // Partition 3's record on generation 8 keeps its own clock.
+        assert_eq!(core.expired_generation(now, TIMEOUT), None);
+        assert_eq!(core.expired_generation(t0 + secs(220), TIMEOUT), Some(8));
+        assert_eq!(core.admit(&rec(3, 1, false)), Admit::Send);
+    }
+
+    /// A persistent outage: every cycle fails the stuck head once (it is
+    /// re-sent within the outbox backoff, so it is always older than half a
+    /// timeout at the next retirement), so it reaches the dead-letter cap after
+    /// that many cycles while the record behind it never fails.
+    #[test]
+    fn a_persistent_outage_fails_the_head_once_per_cycle() {
+        let mut core = ForwarderCore::default();
+        let mut now = Instant::now();
+        let (mut head_failures, mut follower_failures) = (0, 0);
+        for generation in 1..=10 {
+            core.sent(RowKey::new(1, 0, 1), generation, now);
+            core.sent(RowKey::new(1, 0, 2), generation, now);
+            now += TIMEOUT;
+            assert_eq!(core.expired_generation(now, TIMEOUT), Some(generation));
+            core.time_out_generation(generation, now, TIMEOUT);
+            core.on_result(RowKey::new(1, 0, 1), generation, Err("purged".into()), true);
+            core.on_result(RowKey::new(1, 0, 2), generation, Err("purged".into()), true);
+            for (key, outcome) in outcomes(&mut core) {
+                if matches!(outcome, ForwardOutcome::Failed(_)) {
+                    if key.local_offset == 1 {
+                        head_failures += 1;
+                    } else {
+                        follower_failures += 1;
+                    }
+                }
+            }
+            // The outbox backoff (at most 30 s) before the re-send.
+            now += secs(30);
+        }
+        assert_eq!((head_failures, follower_failures), (10, 0));
+    }
+
+    /// A timed-out record whose delivery report says it was delivered after
+    /// all (it landed just before the purge) is acked as delivered.
+    #[test]
+    fn a_timed_out_record_delivered_before_the_purge_is_delivered() {
+        let mut core = ForwarderCore::default();
+        let t0 = Instant::now();
+        core.sent(RowKey::new(1, 0, 1), 1, t0);
+        core.time_out_generation(1, t0 + TIMEOUT, TIMEOUT);
+        core.on_result(RowKey::new(1, 0, 1), 1, Ok(42), false);
+        assert_eq!(
+            outcomes(&mut core),
+            vec![(RowKey::new(1, 0, 1), ForwardOutcome::Delivered(42))]
+        );
+        assert!(core.timed_out.is_empty());
+        // A later failure of the same row on a new generation is judged afresh.
+        core.on_result(RowKey::new(1, 0, 1), 2, Err("real".into()), false);
+        assert_eq!(
+            outcomes(&mut core)[0].1,
+            ForwardOutcome::Failed("real".into())
+        );
+    }
+
+    #[test]
+    fn re_sending_an_outstanding_key_keeps_one_entry() {
+        let mut core = ForwarderCore::default();
+        let t0 = Instant::now();
+        core.sent(RowKey::new(1, 0, 1), 1, t0);
+        core.sent(RowKey::new(1, 0, 1), 2, t0 + secs(100));
+        assert_eq!(core.by_age.len(), 1);
+        assert_eq!(core.expired_generation(t0 + TIMEOUT, TIMEOUT), None);
+        core.on_result(RowKey::new(1, 0, 1), 2, Ok(0), false);
+        assert!(core.by_age.is_empty() && core.outstanding.is_empty());
+    }
+
+    #[test]
+    fn the_test_guc_shortens_the_delivery_timeout() {
+        let mut config = crate::config::Config::load();
+        assert_eq!(delivery_timeout(&config), DELIVERY_TIMEOUT);
+        config.test_shadow_delivery_timeout_ms = 6_000;
+        assert_eq!(delivery_timeout(&config), Duration::from_secs(6));
     }
 
     #[test]

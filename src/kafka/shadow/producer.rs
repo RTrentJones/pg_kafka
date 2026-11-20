@@ -42,11 +42,22 @@ use std::time::Duration;
 /// Max in-flight requests per connection. librdkafka requires this to be ≤ 5 for
 /// `enable.idempotence=true` (ordering guarantee), so 5 is the idempotent maximum.
 const PRODUCER_MAX_IN_FLIGHT: &str = "5";
-/// Per-request timeout (30 s) and total message delivery timeout (120 s). One
-/// outbox attempt therefore resolves (delivered or failed) within 120 s, which the
-/// DB thread's in-flight eviction (`INFLIGHT_EVICT_AFTER`, 150 s) relies on.
+/// Per-request timeout (30 s).
 const PRODUCER_REQUEST_TIMEOUT_MS: &str = "30000";
-const PRODUCER_MESSAGE_TIMEOUT_MS: &str = "120000";
+/// librdkafka's per-message timeout: 0, infinite. librdkafka never fails a
+/// record by timeout on its own, because such a failure is not covered by
+/// `enable.gapless.guarantee`: a record that times out alone leaves the later
+/// records of its partition queued, and they would be delivered ahead of its
+/// retry. The forwarder enforces [`DELIVERY_TIMEOUT`] itself instead, failing
+/// every record outstanding on the producer at once (see `forwarder_task`).
+const PRODUCER_MESSAGE_TIMEOUT_MS: &str = "0";
+/// How long a record may stay undelivered on a producer before the forwarder
+/// fails it together with every other record outstanding on that producer.
+/// One outbox attempt therefore resolves (delivered or failed) within about
+/// this long, which the DB thread's in-flight eviction (`INFLIGHT_EVICT_AFTER`,
+/// 150 s) relies on. `pg_kafka.test_shadow_delivery_timeout_ms` shortens it for
+/// tests.
+pub(crate) const DELIVERY_TIMEOUT: Duration = Duration::from_secs(120);
 /// librdkafka's local queue, in KiB (its default is 1 GiB). The queue lives in
 /// the listener worker's memory; 64 MiB holds far more than one claim of
 /// records (whose size librdkafka caps at `message.max.bytes`, 1 MB). A full
@@ -69,8 +80,9 @@ const PRODUCER_QUEUE_MAX_KBYTES: &str = "65536";
 ///   backoff, see `ShadowStore`);
 /// - `shadow_max_retries` is not a librdkafka setting: it is the outbox's
 ///   dead-letter cap (failed delivery attempts per record). Inside one attempt
-///   librdkafka retries as often as `message.timeout.ms` allows (its default
-///   `retries`), which is what idempotence wants.
+///   librdkafka retries (its default `retries`, which is what idempotence
+///   wants) until the record is delivered or the forwarder's
+///   [`DELIVERY_TIMEOUT`] ends the attempt.
 pub(crate) fn build_producer_settings(config: &ShadowConfig) -> Vec<(&'static str, String)> {
     // Basic configuration + security protocol are always set.
     // (SASL_SSL, SASL_PLAINTEXT, SSL, or PLAINTEXT for security.protocol.)
@@ -126,7 +138,9 @@ pub(crate) fn build_producer_settings(config: &ShadowConfig) -> Vec<(&'static st
     // outstanding record instead; the forwarder then rebuilds the producer and
     // the outbox re-sends from the first undelivered offset of each partition,
     // so a record is never delivered after a later record of its local
-    // partition. Duplicates are suppressed only within one producer session
+    // partition. The guarantee does not cover records failed by
+    // `message.timeout.ms`, so that is infinite and the forwarder's own
+    // delivery timeout fails the whole producer instead. Duplicates are suppressed only within one producer session
     // (stable PID): a re-send that crosses a producer rebuild is at-least-once.
     let max_in_flight = PRODUCER_MAX_IN_FLIGHT.to_string();
     settings.push(("enable.idempotence", "true".to_string()));
@@ -345,7 +359,7 @@ mod tests {
     #[test]
     fn test_build_producer_settings_leave_retries_to_librdkafka() {
         // shadow_max_retries is the outbox dead-letter cap. librdkafka keeps
-        // its own (time-bounded) retries, as idempotence wants, and the
+        // its own retries, as idempotence wants, and the
         // ordering guard is on.
         let config = ShadowConfig {
             enabled: true,
@@ -474,6 +488,8 @@ mod tests {
         assert!(has(&s, "linger.ms", "25"));
         assert!(has(&s, "retry.backoff.ms", "200"));
         assert!(has(&s, "request.timeout.ms", "30000"));
-        assert!(has(&s, "message.timeout.ms", "120000"));
+        // Infinite: the forwarder enforces the delivery timeout itself, so a
+        // timeout can never fail one record alone.
+        assert!(has(&s, "message.timeout.ms", "0"));
     }
 }

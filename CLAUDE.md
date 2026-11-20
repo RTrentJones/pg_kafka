@@ -402,7 +402,7 @@ Per-category counts are in `docs/TEST_STRATEGY.md`; `cargo run --release -- --li
 | **compression** | gzip, snappy, lz4, zstd, roundtrip, edge cases |
 | **idempotent** | InitProducerId, deduplication, epoch, multi-partition, Kafka's idempotent model (5-batch cache, original offsets, epochs, sequence wrap), producers the broker holds no state for |
 | **transaction** | Transactions, isolation levels, EOS, fencing, atomicity, timeouts (each transaction's own clock, an exhausted epoch fenced), InitProducerId's presented epoch, validation; read_committed consumers past aborted/cleaned-up/DeleteRecords holes and stopping at an open transaction |
-| **shadow** | External forwarding, SASL/SSL, topic mapping, replay, dial-up, throughput floor, headers/timestamps, order across a retried failure, sync-stall bound, GUC reload, per-partition lag view |
+| **shadow** | External forwarding, SASL/SSL, topic mapping, replay, dial-up, throughput floor, headers/timestamps, order across a retried failure and a delivery timeout, sync-stall bound, GUC reload, per-partition lag view |
 | **long_poll** | Timeout behavior, immediate return, producer wakeup, precision, per-connection task cap, a transaction end waking a read_committed fetch |
 | **error_paths** | Invalid partitions, unknown topics, coordinator errors, protocol/transaction/group regressions |
 | **edge_cases** | Empty topics, large messages, boundary values, retention sweep |

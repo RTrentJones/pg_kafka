@@ -245,6 +245,19 @@ gucs! {
         range: (0, 30_000),
     }
 
+    /// Test-only: the shadow forwarder's delivery timeout in milliseconds, so the E2E
+    /// suite can make an external outage outlast it in seconds instead of the built-in
+    /// 120 s. 0 keeps the built-in value. Never set in production.
+    int TEST_SHADOW_DELIVERY_TIMEOUT_MS = 0 => c"pg_kafka.test_shadow_delivery_timeout_ms" {
+        short: c"TEST ONLY: shadow forwarder delivery timeout (ms); 0 = the built-in 120 s",
+        long: c"Fault-injection knob for the shadow forwarding-order E2E test: how long \
+          a record may stay undelivered before the forwarder fails it and every record \
+          outstanding on the same producer. 0 (default) keeps the built-in 120 s. \
+          Do not set in production. Reloadable via SIGHUP.",
+        context: Sighup,
+        range: (0, 120_000),
+    }
+
     /// RB-1 test-only fault injection: the worker sleeps this long inside the
     /// transaction after a Produce handler and before the commit, widening the
     /// response-send to commit window so the E2E suite can check that an acked produce is
@@ -513,6 +526,8 @@ pub struct Config {
     pub shadow_license_key: String,
     /// Test only: `pg_kafka.test_forward_ack_delay_ms` (see that GUC).
     pub test_forward_ack_delay_ms: i32,
+    /// Test only: `pg_kafka.test_shadow_delivery_timeout_ms` (see that GUC).
+    pub test_shadow_delivery_timeout_ms: i32,
 }
 
 /// Debug output that redacts the credentials.
@@ -544,6 +559,10 @@ impl std::fmt::Debug for Config {
             .field("shadow_metrics_enabled", &self.shadow_metrics_enabled)
             .field("shadow_license_key", &"[REDACTED]")
             .field("test_forward_ack_delay_ms", &self.test_forward_ack_delay_ms)
+            .field(
+                "test_shadow_delivery_timeout_ms",
+                &self.test_shadow_delivery_timeout_ms,
+            )
             .finish()
     }
 }
@@ -581,6 +600,7 @@ impl Config {
             shadow_metrics_enabled: SHADOW_METRICS_ENABLED.get(),
             shadow_license_key: guc_string(&SHADOW_LICENSE_KEY).unwrap_or_default(),
             test_forward_ack_delay_ms: TEST_FORWARD_ACK_DELAY_MS.get(),
+            test_shadow_delivery_timeout_ms: TEST_SHADOW_DELIVERY_TIMEOUT_MS.get(),
         }
     }
 
@@ -612,6 +632,7 @@ impl Config {
             shadow_metrics_enabled: DEFAULT_SHADOW_METRICS_ENABLED,
             shadow_license_key: "eval".to_string(),
             test_forward_ack_delay_ms: 0,
+            test_shadow_delivery_timeout_ms: 0,
         }
     }
 }
