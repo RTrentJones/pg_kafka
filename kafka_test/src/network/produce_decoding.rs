@@ -20,6 +20,8 @@ use tokio::net::TcpStream;
 const MESSAGE_TOO_LARGE: i16 = 10;
 /// CORRUPT_MESSAGE (Java's CorruptRecordException).
 const CORRUPT_MESSAGE: i16 = 2;
+/// INVALID_TIMESTAMP (Java's InvalidTimestampException).
+const INVALID_TIMESTAMP: i16 = 32;
 /// INVALID_RECORD (Java's InvalidRecordException).
 const INVALID_RECORD: i16 = 87;
 
@@ -197,6 +199,8 @@ pub(crate) struct BatchHeader {
     /// `None`: one less than the record count (at least 0).
     pub(crate) last_offset_delta: Option<i32>,
     pub(crate) base_timestamp: i64,
+    /// `None`: the base timestamp.
+    pub(crate) max_timestamp: Option<i64>,
     pub(crate) producer_id: i64,
     pub(crate) producer_epoch: i16,
     pub(crate) base_sequence: i32,
@@ -209,6 +213,7 @@ impl Default for BatchHeader {
             attributes: 0,
             last_offset_delta: None,
             base_timestamp: 0,
+            max_timestamp: None,
             producer_id: -1,
             producer_epoch: -1,
             base_sequence: -1,
@@ -228,7 +233,7 @@ pub(crate) fn batch_with(records: &[u8], record_count: i32, header: BatchHeader)
             .unwrap_or_else(|| record_count.max(1) - 1),
     );
     tail.put_i64(header.base_timestamp); // baseTimestamp
-    tail.put_i64(header.base_timestamp); // maxTimestamp
+    tail.put_i64(header.max_timestamp.unwrap_or(header.base_timestamp));
     tail.put_i64(header.producer_id);
     tail.put_i16(header.producer_epoch);
     tail.put_i32(header.base_sequence);
@@ -774,6 +779,95 @@ pub async fn test_record_batches_are_read_as_kafka_reads_them() -> TestResult {
     assert_eq!(wire.produce(&topic, 2, trailing, None).await?, (0, 0));
     assert_eq!(stored_rows(ctx.db(), &topic).await?, 24);
     println!("✅ refused as Kafka refuses them; 5 trailing bytes ignored");
+
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// A batch's checks run in Kafka 3.7's order (`UnifiedLog.analyzeAndValidateRecords`, then
+/// `LogValidator`): its base offset before its size and CRC, its codec before its header
+/// fields; and a batch that sets the LogAppendTime bit without a maxTimestamp is
+/// INVALID_TIMESTAMP once its records are read. Nothing refused is written.
+pub async fn test_batch_checks_run_in_kafkas_order() -> TestResult {
+    use crate::wire::Wire;
+    println!("=== Test: batch checks in Kafka 3.7's order, LogAppendTime ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("net-order").await;
+    let created = create_topics_raw(vec![creatable(&topic, 1, 1)]).await?;
+    assert_eq!(created[0].error_code, 0, "{created:?}");
+    let mut wire = Wire::connect().await?;
+    let x = record(&[
+        &[0],
+        &varint(0),
+        &varint(0),
+        &varint(-1),
+        &varint(1),
+        b"x",
+        &varint(0),
+    ]);
+    let with = |header: BatchHeader| batch_with(&x, 1, header);
+    let mut base_5_bad_crc = with(BatchHeader {
+        base_offset: 5,
+        ..BatchHeader::default()
+    })
+    .to_vec();
+    base_5_bad_crc[17..21].copy_from_slice(&[0; 4]);
+    // A complete batch of 42 bytes, shorter than a v2 header (61), at base offset 5.
+    let mut short_at_5 = 5i64.to_be_bytes().to_vec();
+    short_at_5.extend_from_slice(&30i32.to_be_bytes());
+    short_at_5.extend_from_slice(&[0, 0, 0, 0, 2]);
+    short_at_5.extend_from_slice(&[0; 25]);
+    let log_append_time = |attributes: i16| {
+        with(BatchHeader {
+            attributes: attributes | 0x08,
+            max_timestamp: Some(-1),
+            ..BatchHeader::default()
+        })
+    };
+    let cases: Vec<(&str, Bytes, i16)> = vec![
+        (
+            "base offset 5 and a bad CRC",
+            base_5_bad_crc.into(),
+            INVALID_RECORD,
+        ),
+        (
+            "a short batch at base offset 5",
+            short_at_5.into(),
+            INVALID_RECORD,
+        ),
+        (
+            "LogAppendTime without a maxTimestamp",
+            log_append_time(0),
+            INVALID_TIMESTAMP,
+        ),
+        (
+            "LogAppendTime without a maxTimestamp, a control batch",
+            log_append_time(0x20),
+            INVALID_RECORD,
+        ),
+    ];
+    for (what, data, expected) in cases {
+        let (code, _) = wire.produce(&topic, 0, data, None).await?;
+        assert_eq!(code, expected, "{what}");
+        println!("  {what}: {code}");
+    }
+    assert_eq!(
+        stored_rows(ctx.db(), &topic).await?,
+        0,
+        "nothing is written"
+    );
+    println!("✅ refused as Kafka refuses them");
+
+    let with_max = with(BatchHeader {
+        attributes: 0x08,
+        base_timestamp: 1_000,
+        max_timestamp: Some(2_000),
+        ..BatchHeader::default()
+    });
+    assert_eq!(wire.produce(&topic, 0, with_max, None).await?, (0, 0));
+    assert_eq!(stored_rows(ctx.db(), &topic).await?, 1);
+    println!("✅ the LogAppendTime bit with a maxTimestamp is accepted");
 
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");

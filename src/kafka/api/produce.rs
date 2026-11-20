@@ -346,7 +346,8 @@ fn decode_records(
                                     name, partition.index, e
                                 );
                                 DecodeFailure::Rejected(match e {
-                                    KafkaError::InvalidRecord { .. } => e.to_kafka_error_code(),
+                                    KafkaError::InvalidRecord { .. }
+                                    | KafkaError::Protocol { .. } => e.to_kafka_error_code(),
                                     _ => ERROR_CORRUPT_MESSAGE,
                                 })
                             }

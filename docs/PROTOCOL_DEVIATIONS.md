@@ -101,6 +101,13 @@ pg_kafka.compression_type = 'gzip'
   - CORRUPT_MESSAGE: a bad CRC; a batch length under 14, or a v2 batch length shorter than
     its header; a magic byte outside 0-2 (on the batch or on data after it). Unknown codec
     ids are CORRUPT_MESSAGE too (Kafka 3.7: UNKNOWN_SERVER_ERROR).
+  - INVALID_TIMESTAMP (32): a batch that sets the LogAppendTime timestamp type with a
+    maxTimestamp of -1, which Kafka refuses on a CreateTime topic (the only kind pg_kafka
+    has). With a maxTimestamp the batch is accepted and its records keep their own
+    timestamps, as Kafka stores it (as CreateTime).
+  - A batch that fails several checks gets the code of the one Kafka checks first: the
+    framing above, the base offset, the header size and CRC, the codec, the header fields,
+    the records, then the LogAppendTime type.
   - Data after the batch too short to hold another batch is ignored, as Kafka trims it.
   - As in Kafka, a negative key, value or header value length is null (a null header
     value is stored empty) and duplicate header keys are stored, in order (see §7 for

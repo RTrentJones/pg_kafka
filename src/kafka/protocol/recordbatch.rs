@@ -27,7 +27,7 @@ use kafka_protocol::records::Compression;
 use tracing::debug;
 
 use super::decode_budget::DecodeBudget;
-use crate::kafka::constants::ERROR_UNSUPPORTED_COMPRESSION_TYPE;
+use crate::kafka::constants::{ERROR_INVALID_TIMESTAMP, ERROR_UNSUPPORTED_COMPRESSION_TYPE};
 use crate::kafka::error::{KafkaError, Result};
 use crate::kafka::messages::{ProducerMetadata, Record, RecordHeader};
 
@@ -54,6 +54,7 @@ const HEADER_SIZE_UP_TO_MAGIC: usize = MAGIC_OFFSET + 1;
 const CRC_OFFSET: usize = 17;
 /// The CRC covers the batch from its attributes on.
 const ATTRIBUTES_OFFSET: usize = 21;
+const MAX_TIMESTAMP_OFFSET: usize = 35;
 const PRODUCER_ID_OFFSET: usize = 43;
 const RECORD_COUNT_OFFSET: usize = 57;
 /// The header of a RecordBatch v2, up to its first record.
@@ -66,6 +67,9 @@ const RECORD_BATCH_V2_MAGIC: i8 = 2;
 /// Attribute bits of a RecordBatch v2.
 const CODEC_MASK: i16 = 0x07;
 const CONTROL_FLAG: i16 = 0x20;
+const LOG_APPEND_TIME_FLAG: i16 = 0x08;
+/// The timestamp of a record that has none (`RecordBatch.NO_TIMESTAMP`).
+const NO_TIMESTAMP: i64 = -1;
 /// The codec id of zstd, which Produce carries from v7 on (KIP-110).
 const ZSTD_CODEC: i16 = 4;
 
@@ -132,19 +136,14 @@ fn next_batch_size(data: &[u8]) -> Result<Option<usize>> {
 ///
 /// In Kafka 3.7's order (`ByteBufferLogInputStream`, then `ProduceRequest.validateRecords`):
 /// [`next_batch_size`]'s CORRUPT_MESSAGE; data holding no complete batch is INVALID_RECORD;
-/// a v2 batch shorter than its header is CORRUPT_MESSAGE; a batch of another magic than 2 (a
-/// legacy MessageSet) is INVALID_RECORD.
+/// a batch of another magic than 2 (a legacy MessageSet) is INVALID_RECORD. The batch may
+/// still be shorter than a v2 header (26 bytes at the least, so its attributes are there);
+/// [`parse_record_batch`] refuses that later, where Kafka does.
 fn check_batch_header(batch: &[u8]) -> Result<usize> {
     let size = next_batch_size(batch)?
         .filter(|&size| size <= batch.len())
         .ok_or_else(|| invalid("Produce v3+ partition data must hold exactly one record batch"))?;
     let magic = i8::from_be_bytes([batch[MAGIC_OFFSET]]);
-    if magic == RECORD_BATCH_V2_MAGIC && size < RECORD_BATCH_OVERHEAD {
-        return Err(corrupt(format!(
-            "record batch length {} is shorter than its header",
-            size - LOG_OVERHEAD
-        )));
-    }
     if magic != RECORD_BATCH_V2_MAGIC {
         return Err(invalid(format!(
             "Produce v3+ carries record batches of magic 2 only, not magic {magic}"
@@ -179,15 +178,13 @@ pub fn validate_produce_records(batch: &[u8], zstd_allowed: bool) -> std::result
     check_after_batch(&batch[size..]).map_err(|e| e.to_kafka_error_code())
 }
 
-/// The fields of a batch header Kafka 3.7 validates for a client's batch
-/// (`LogValidator.validateBatch`, and `UnifiedLog`'s base-offset check), all
-/// INVALID_RECORD: a base offset other than 0; a lastOffsetDelta, record count or offset
-/// range that disagree (so a batch of no records is refused, and cannot enter an
-/// idempotent producer's batch cache); a control batch; a producer id without a sequence.
+/// The fields of a batch header Kafka 3.7 validates for a client's batch once its CRC and
+/// codec passed (`LogValidator.validateBatch`), all INVALID_RECORD: a lastOffsetDelta,
+/// record count or offset range that disagree (so a batch of no records is refused, and
+/// cannot enter an idempotent producer's batch cache); a control batch; a producer id
+/// without a sequence.
 fn validate_batch(batch: &[u8]) -> Result<usize> {
-    let mut fields = batch;
-    let base_offset = fields.get_i64();
-    fields = &fields[ATTRIBUTES_OFFSET - 8..];
+    let mut fields = &batch[ATTRIBUTES_OFFSET..];
     let attributes = fields.get_i16();
     let last_offset_delta = fields.get_i32();
     let mut fields = &batch[PRODUCER_ID_OFFSET..];
@@ -195,11 +192,6 @@ fn validate_batch(batch: &[u8]) -> Result<usize> {
     let _producer_epoch = fields.get_i16();
     let base_sequence = fields.get_i32();
     let count = fields.get_i32();
-    if base_offset != 0 {
-        return Err(invalid(format!(
-            "record batch base offset is {base_offset}, not 0"
-        )));
-    }
     if last_offset_delta < 0 {
         return Err(invalid(format!(
             "record batch has an invalid offset range (lastOffsetDelta {last_offset_delta})"
@@ -239,12 +231,15 @@ fn extract_producer_metadata(batch: &[u8]) -> ProducerMetadata {
 /// The least memory `batch` decodes to: its own bytes and its declared records (more if it
 /// is compressed or carries headers). Data that is not a record batch decodes to nothing.
 pub fn least_decoded_memory(batch: &[u8]) -> usize {
-    check_batch_header(batch).map_or(0, |_| {
-        usize::try_from(i32_at(batch, RECORD_COUNT_OFFSET))
-            .unwrap_or(0)
-            .saturating_mul(RECORD_MEMORY)
-            .saturating_add(batch.len())
-    })
+    match check_batch_header(batch) {
+        Ok(size) if size >= RECORD_BATCH_OVERHEAD => {
+            usize::try_from(i32_at(batch, RECORD_COUNT_OFFSET))
+                .unwrap_or(0)
+                .saturating_mul(RECORD_MEMORY)
+                .saturating_add(batch.len())
+        }
+        _ => 0,
+    }
 }
 
 /// Parse a partition's record data into its records and producer identity, charging the
@@ -634,27 +629,65 @@ fn read_records(
     }
 }
 
-/// Parse a partition's record data (one RecordBatch v2) into its records, charging their
-/// memory to `budget` (see the module docs). Checks run in Kafka 3.7's order: the framing
-/// (`check_batch_header`, `check_after_batch`), the CRC32C, the header fields
-/// (`validate_batch`), then the records.
-pub fn parse_record_batch(batch_bytes: &Bytes, budget: &DecodeBudget) -> Result<Vec<Record>> {
-    let size = check_batch_header(batch_bytes)?;
-    check_after_batch(&batch_bytes[size..])?;
-    let batch = batch_bytes.slice(..size);
-    let mut stored_crc = &batch[CRC_OFFSET..ATTRIBUTES_OFFSET];
-    let stored_crc = stored_crc.get_u32();
+/// What Kafka 3.7 checks of a batch that passed the framing before its fields
+/// (`UnifiedLog.analyzeAndValidateRecords`), in its order: a base offset other than 0 is
+/// INVALID_RECORD; a batch shorter than a v2 header, or a CRC32C that does not match, is
+/// CORRUPT_MESSAGE (`DefaultRecordBatch.isValid`); then the codec ([`compression_of`]).
+fn check_batch_integrity(batch: &[u8]) -> Result<Compression> {
+    let base_offset = (&batch[..8]).get_i64();
+    if base_offset != 0 {
+        return Err(invalid(format!(
+            "record batch base offset is {base_offset}, not 0"
+        )));
+    }
+    if batch.len() < RECORD_BATCH_OVERHEAD {
+        return Err(corrupt(format!(
+            "record batch length {} is shorter than its header",
+            batch.len() - LOG_OVERHEAD
+        )));
+    }
+    let stored_crc = (&batch[CRC_OFFSET..ATTRIBUTES_OFFSET]).get_u32();
     let crc = crc32c::crc32c(&batch[ATTRIBUTES_OFFSET..]);
     if crc != stored_crc {
         return Err(corrupt(format!(
             "record batch CRC {stored_crc:#010x} does not match its contents ({crc:#010x})"
         )));
     }
+    compression_of((&batch[ATTRIBUTES_OFFSET..]).get_i16())
+}
+
+/// Kafka 3.7's timestamp check of a client's records on a CreateTime topic (the only kind
+/// pg_kafka has; `LogValidator.validateTimestamp`): a record of a batch that sets the
+/// LogAppendTime bit takes the batch's maxTimestamp as its timestamp, and when that is
+/// NO_TIMESTAMP the batch is INVALID_TIMESTAMP. Any other timestamp is accepted, as Kafka's
+/// default `log.message.timestamp.{before,after}.max.ms` (unbounded) accept it.
+fn check_log_append_time(attributes: i16, max_timestamp: i64) -> Result<()> {
+    if attributes & LOG_APPEND_TIME_FLAG != 0 && max_timestamp == NO_TIMESTAMP {
+        return Err(KafkaError::Protocol {
+            code: ERROR_INVALID_TIMESTAMP,
+            message: "clients may not set the LogAppendTime timestamp type".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Parse a partition's record data (one RecordBatch v2) into its records, charging their
+/// memory to `budget` (see the module docs). Checks run in Kafka 3.7's order: the framing
+/// (`check_batch_header`, `check_after_batch`), the base offset, header size, CRC32C and
+/// codec (`check_batch_integrity`), the header fields (`validate_batch`), the records,
+/// then their timestamps (`check_log_append_time`, after every record read, as Kafka
+/// collects record errors and fails the batch with them once its records are read).
+pub fn parse_record_batch(batch_bytes: &Bytes, budget: &DecodeBudget) -> Result<Vec<Record>> {
+    let size = check_batch_header(batch_bytes)?;
+    check_after_batch(&batch_bytes[size..])?;
+    let batch = batch_bytes.slice(..size);
+    let compression = check_batch_integrity(&batch)?;
     let count = validate_batch(&batch)?;
     let mut fields = &batch[ATTRIBUTES_OFFSET..];
-    let compression = compression_of(fields.get_i16())?;
+    let attributes = fields.get_i16();
     fields.advance(4); // lastOffsetDelta
     let base_timestamp = fields.get_i64();
+    let max_timestamp = (&batch[MAX_TIMESTAMP_OFFSET..]).get_i64();
     debug!("parse_record_batch: {size} bytes, {count} records, {compression:?}");
 
     let at_the_limit = |what: &dyn std::fmt::Display| {
@@ -668,7 +701,9 @@ pub fn parse_record_batch(batch_bytes: &Bytes, budget: &DecodeBudget) -> Result<
         Err(e) if budget.exhausted().is_some() => return Err(at_the_limit(&e)),
         Err(e) => return Err(corrupt(format!("record batch does not decompress: {e}"))),
     };
-    read_records(&section, count, base_timestamp, budget)
+    let records = read_records(&section, count, base_timestamp, budget)?;
+    check_log_append_time(attributes, max_timestamp)?;
+    Ok(records)
 }
 
 #[cfg(test)]
@@ -1400,7 +1435,33 @@ mod tests {
         let mut bad_crc = batch_with(&[], 0, h).to_vec();
         bad_crc[17..21].copy_from_slice(&[0; 4]);
         let short_v2 = [prefix(30, 2), vec![0; 29]].concat();
-        let refused: [(&str, Bytes, i16); 15] = [
+        let mut base_5_bad_crc = batch_with(
+            &x,
+            1,
+            Header {
+                base_offset: 5,
+                ..h
+            },
+        )
+        .to_vec();
+        base_5_bad_crc[17..21].copy_from_slice(&[0; 4]);
+        let mut short_at_5 = [prefix(30, 2), vec![0; 25]].concat();
+        short_at_5[..8].copy_from_slice(&5i64.to_be_bytes());
+        let log_append_time = |section: &[u8], attributes: i16| {
+            batch_with(
+                section,
+                1,
+                Header {
+                    attributes: attributes | 0x08,
+                    max_timestamp: Some(-1),
+                    ..h
+                },
+            )
+        };
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gzip.write_all(&x).unwrap();
+        let gzip_x = gzip.finish().unwrap();
+        let refused: [(&str, Bytes, i16); 22] = [
             ("no records", batch_with(&[], 0, h), ERROR_INVALID_RECORD),
             (
                 "no records of an idempotent producer",
@@ -1506,6 +1567,55 @@ mod tests {
                 Bytes::from([&short_v2[..], &ok[..]].concat()),
                 ERROR_CORRUPT_MESSAGE,
             ),
+            // Kafka checks the base offset before the batch's size and CRC, and the codec
+            // before the header fields.
+            (
+                "a base offset other than 0 and a bad CRC",
+                Bytes::from(base_5_bad_crc),
+                ERROR_INVALID_RECORD,
+            ),
+            (
+                "a short batch at base offset 5",
+                Bytes::from(short_at_5),
+                ERROR_INVALID_RECORD,
+            ),
+            (
+                "an unknown codec on a control batch",
+                batch_with(
+                    &x,
+                    1,
+                    Header {
+                        attributes: 0x25,
+                        ..h
+                    },
+                ),
+                ERROR_CORRUPT_MESSAGE,
+            ),
+            // The LogAppendTime bit without a maxTimestamp, once the batch and its records
+            // passed every other check.
+            (
+                "LogAppendTime without a maxTimestamp",
+                log_append_time(&x, 0),
+                ERROR_INVALID_TIMESTAMP,
+            ),
+            (
+                "LogAppendTime without a maxTimestamp, gzip",
+                log_append_time(&gzip_x, 1),
+                ERROR_INVALID_TIMESTAMP,
+            ),
+            (
+                "LogAppendTime without a maxTimestamp, a control batch",
+                log_append_time(&x, 0x20),
+                ERROR_INVALID_RECORD,
+            ),
+            (
+                "LogAppendTime without a maxTimestamp, a record with a byte too many",
+                log_append_time(
+                    &record(&[&[0], &v(0), &v(0), &v(-1), &v(-1), &v(0), &[0]]),
+                    0,
+                ),
+                ERROR_INVALID_RECORD,
+            ),
         ];
         for (what, data, expected) in refused {
             let err = parse_record_batch(&data, &budget()).unwrap_err();
@@ -1513,7 +1623,7 @@ mod tests {
         }
         // Kafka ignores data after the batch that holds no complete batch, takes the
         // records' offset deltas as they are, and sets the timestamp type itself.
-        let accepted: [(&str, Bytes, usize); 5] = [
+        let accepted: [(&str, Bytes, usize); 6] = [
             ("5 bytes after", then(&[0; 5]), 1),
             ("a batch length after", then(&prefix(20, 2)[..12]), 1),
             ("a cut-short batch after", then(&prefix(100, 2)), 1),
@@ -1531,12 +1641,24 @@ mod tests {
                 2,
             ),
             (
-                "the log-append-time bit",
+                "the log-append-time bit with a maxTimestamp",
                 batch_with(
                     &x,
                     1,
                     Header {
                         attributes: 0x08,
+                        ..h
+                    },
+                ),
+                1,
+            ),
+            (
+                "CreateTime records without timestamps",
+                batch_with(
+                    &x,
+                    1,
+                    Header {
+                        base_timestamp: -1,
                         ..h
                     },
                 ),
@@ -1616,6 +1738,8 @@ pub(crate) mod test_batches {
         /// `None`: one less than the record count (at least 0).
         pub(crate) last_offset_delta: Option<i32>,
         pub(crate) base_timestamp: i64,
+        /// `None`: the base timestamp.
+        pub(crate) max_timestamp: Option<i64>,
         pub(crate) producer_id: i64,
         pub(crate) producer_epoch: i16,
         pub(crate) base_sequence: i32,
@@ -1628,6 +1752,7 @@ pub(crate) mod test_batches {
                 attributes: 0,
                 last_offset_delta: None,
                 base_timestamp: 0,
+                max_timestamp: None,
                 producer_id: -1,
                 producer_epoch: -1,
                 base_sequence: -1,
@@ -1642,7 +1767,7 @@ pub(crate) mod test_batches {
         tail.put_i16(header.attributes);
         tail.put_i32(header.last_offset_delta.unwrap_or_else(|| count.max(1) - 1));
         tail.put_i64(header.base_timestamp);
-        tail.put_i64(header.base_timestamp);
+        tail.put_i64(header.max_timestamp.unwrap_or(header.base_timestamp));
         tail.put_i64(header.producer_id);
         tail.put_i16(header.producer_epoch);
         tail.put_i32(header.base_sequence);
