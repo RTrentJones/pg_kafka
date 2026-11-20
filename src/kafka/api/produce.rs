@@ -421,13 +421,19 @@ fn record_bytes(topics: &[WireTopicProduceData]) -> usize {
 /// declare ([`declared_memory`]) is decoded in place, within that budget: the common case of
 /// small (compressed or not) batches. One that declares more, or that expands past it, is
 /// left to [`finish_decode`] under a large-decode slot ([`Wait::Slot`]); one that finds the
-/// process-wide budget exhausted waits there for room ([`Wait::Budget`]).
+/// process-wide budget exhausted waits there for room ([`Wait::Budget`]). One that declares
+/// more than a request may hold ([`MAX_DECODED_REQUEST_BYTES`]) can never decode and is
+/// refused at once, never left to wait for a slot it would time out waiting for.
 fn decode_all_records(
     topics: &[WireTopicProduceData],
     zstd_allowed: bool,
 ) -> Result<Decode, DecodeFailure> {
     validate_all_records(topics, zstd_allowed)?;
-    if declared_memory(topics) > INLINE_DECODE_BYTES {
+    let declared = declared_memory(topics);
+    if declared > MAX_DECODED_REQUEST_BYTES {
+        return Err(DecodeFailure::TooLarge);
+    }
+    if declared > INLINE_DECODE_BYTES {
         return Ok(Decode::Pending(Wait::Slot));
     }
     match decode_records(topics, DecodeBudget::new(INLINE_DECODE_BYTES)) {
@@ -717,6 +723,31 @@ mod tests {
         assert!(matches!(
             decode_all_records(&large, true),
             Ok(Decode::Pending(Wait::Slot))
+        ));
+    }
+
+    #[test]
+    fn requests_that_declare_more_than_a_request_may_hold_are_refused_at_once() {
+        use crate::kafka::protocol::recordbatch_test_batches::tiny_records;
+        // 2 million records of 88 bytes each declare 176 MB, past the 100 MB a request may
+        // hold: MESSAGE_TOO_LARGE without waiting for a large-decode slot, where a wait
+        // under saturation would end in REQUEST_TIMED_OUT, which the client retries.
+        let bomb = topics(vec![batch_with(
+            &tiny_records(1),
+            2_000_000,
+            Header::default(),
+        )]);
+        assert!(declared_memory(&bomb) > MAX_DECODED_REQUEST_BYTES);
+        assert!(matches!(
+            decode_all_records(&bomb, true),
+            Err(DecodeFailure::TooLarge)
+        ));
+        assert!(matches!(
+            rejection(DecodeFailure::TooLarge, 1, Vec::new()),
+            Rejection::Reply {
+                error_code: ERROR_MESSAGE_TOO_LARGE,
+                ..
+            }
         ));
     }
 
