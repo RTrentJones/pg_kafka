@@ -236,6 +236,10 @@ pub const ERROR_CORRUPT_MESSAGE: i16 = 2;
 pub const ERROR_UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
 /// REQUEST_TIMED_OUT (retriable): the request timed out, e.g. waiting on a lock.
 pub const ERROR_REQUEST_TIMED_OUT: i16 = 7;
+/// MESSAGE_TOO_LARGE (Java's RecordTooLargeException): a batch, or a Produce request's
+/// decoded records, larger than the broker accepts. The Java producer splits a multi-record
+/// batch it gets this for and retries the halves.
+pub const ERROR_MESSAGE_TOO_LARGE: i16 = 10;
 /// COORDINATOR_NOT_AVAILABLE.
 pub const ERROR_COORDINATOR_NOT_AVAILABLE: i16 = 15;
 /// INVALID_TOPIC_EXCEPTION: a topic name that breaks Kafka's naming rules.

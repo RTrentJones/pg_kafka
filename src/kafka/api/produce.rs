@@ -1,5 +1,6 @@
 //! Produce (0).
 
+use crate::kafka::constants::ERROR_MESSAGE_TOO_LARGE;
 use kafka_protocol::messages::produce_request::ProduceRequest;
 use kafka_protocol::messages::produce_response::{
     PartitionProduceResponse, ProduceResponse, TopicProduceResponse,
@@ -217,11 +218,6 @@ impl KafkaApi for ProduceApi {
         })
     }
 }
-
-/// MESSAGE_TOO_LARGE (Java's RecordTooLargeException): a batch, or here a request, larger
-/// than the broker accepts. The Java producer splits a multi-record batch it gets this for
-/// and retries the halves.
-const ERROR_MESSAGE_TOO_LARGE: i16 = 10;
 
 /// Why a Produce request's records did not decode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -66,7 +66,10 @@ pg_kafka.compression_type = 'gzip'
 
 **Client Impact:**
 - Clients can use any compression type (gzip, snappy, lz4, zstd)
-- Server decompresses messages before storage
+- Server decompresses messages before storage. A request's records may decode to at most
+  100 MB across its partitions; past that every partition is answered MESSAGE_TOO_LARGE (Kafka
+  streams validation and has no such limit). zstd frames may declare at most a 16 MiB window
+  (Kafka's producers use 2^21, or the batch size).
 - Server compresses responses based on GUC setting
 
 ### 3. Idempotent Producer ✅ Fully Supported (Phase 9)
@@ -569,8 +572,9 @@ reference: [AUTHENTICATION.md](AUTHENTICATION.md).
   client that can open a TCP connection to a PLAINTEXT listener can read and write any topic.
 - **Listener security protocols** as in Kafka: `PLAINTEXT`, `SSL`, `SASL_PLAINTEXT`, `SASL_SSL`,
   for the primary listener and for any `pg_kafka.additional_listeners`
-  (`'SASL_SSL://0.0.0.0:9093,...'`). Each listener advertises its own address in
-  Metadata/FindCoordinator. TLS is rustls; mutual TLS when `pg_kafka.ssl_ca_file` is set.
+  (`'SASL_SSL://0.0.0.0:9093@broker.example.com:9093,...'`). Each listener advertises its own
+  address in Metadata/FindCoordinator: the part after `@` (`pg_kafka.advertised_address` for the
+  primary listener), else its bind host (localhost for 0.0.0.0 / ::). TLS is rustls; mutual TLS when `pg_kafka.ssl_ca_file` is set.
 - **SASL:** PLAIN, SCRAM-SHA-256, SCRAM-SHA-512 (`pg_kafka.sasl_enabled_mechanisms`), checked
   against salted SCRAM verifiers in `kafka.sasl_credentials`. GSSAPI and OAUTHBEARER are not
   supported.
@@ -585,7 +589,8 @@ reference: [AUTHENTICATION.md](AUTHENTICATION.md).
   when the worker restarts, not on reload.
 - **Loud by default:** the worker logs a startup `WARNING` for every listener bound to a
   non-loopback address that does not authenticate clients (PLAINTEXT, or SSL without a client
-  CA), and for SASL/PLAIN offered on an exposed SASL_PLAINTEXT listener.
+  CA), for SASL/PLAIN offered on an exposed SASL_PLAINTEXT listener, and for an exposed
+  listener that would advertise a loopback address.
 - **Network edge limits:** connections are capped per listener
   (`pg_kafka.max_connections`, default 1024; Kafka's cap is broker-wide with per-listener
   overrides) and per IP address across listeners (`pg_kafka.max_connections_per_ip`, default 256,
@@ -599,6 +604,9 @@ reference: [AUTHENTICATION.md](AUTHENTICATION.md).
   `max_bytes`). `TCP_NODELAY` is set on every socket. SASL credential lookups are rate limited
   per IP address (10/s, burst 20; Kafka has none). A connection closed for a bad frame, a timeout
   or an acks=0 error first delivers the responses of every request it read before (up to 30 s).
+  Decoded Produce records waiting for the DB thread hold at most 512 MiB together; a request that
+  would exceed it closes its connection. Decodes of more than 1 MiB run off the I/O threads, at
+  most two at a time.
 
 ## Compatibility Testing
 

@@ -9,8 +9,9 @@
 //! its response is on the socket: at most [`MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION`]
 //! requests per connection are read but unanswered. A client that pipelines without
 //! reading responses fills its TCP receive window, the writer blocks, permits stop
-//! coming back and the reader stops reading: the connection's memory is bounded and the
-//! backpressure reaches the client through TCP.
+//! coming back and the reader stops reading: the raw request bytes a connection holds are
+//! bounded (what a Produce's compressed records decode to is bounded by
+//! `protocol::decode_budget`) and the backpressure reaches the client through TCP.
 
 use bytes::BytesMut;
 use futures::stream::{Stream, StreamExt};

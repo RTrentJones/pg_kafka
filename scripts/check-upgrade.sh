@@ -24,7 +24,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PG_CONFIG="${PG_CONFIG:-pg_config}"
 EXT_DIR="$("$PG_CONFIG" --sharedir)/extension"
-OLD_SCRIPT="$ROOT/sql/upgrade-test/pg_kafka--0.0.0.sql"
+OLD_SCRIPT="${OLD_SCRIPT:-$ROOT/sql/upgrade-test/pg_kafka--0.0.0.sql}"
 FRESH_DB="pgkafka_upgrade_fresh_$$"
 OLD_DB="pgkafka_upgrade_old_$$"
 PSQL=(psql -X -q -v ON_ERROR_STOP=1 -At)

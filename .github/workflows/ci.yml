@@ -198,7 +198,10 @@ jobs:
         # The 0.0.0 -> current ALTER EXTENSION UPDATE path must produce exactly the schema of a
         # fresh install and keep data (two scratch databases; the worker serves 'postgres').
         timeout-minutes: 5
-        run: scripts/check-upgrade.sh
+        run: |
+          scripts/check-upgrade.sh
+          # An older 0.0.0 install: naive TIMESTAMP columns and no timestamp_ms.
+          OLD_SCRIPT=sql/upgrade-test/pg_kafka--0.0.0-pre-timestamptz.sql scripts/check-upgrade.sh
 
       - name: Generated GUC reference is current (docs/CONFIGURATION.md)
         timeout-minutes: 2

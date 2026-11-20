@@ -71,7 +71,7 @@ pub fn register_gucs() {
     GucRegistry::define_int_guc(
         c"pg_kafka.max_consumer_groups",
         c"Maximum number of consumer groups held in memory",
-        c"When full, the least recently active Empty group is dropped from memory (its committed offsets stay); if none is Empty, a JoinGroup for a new group gets COORDINATOR_NOT_AVAILABLE. Default 100000. Reloadable.",
+        c"When full, least recently active Empty groups are dropped from memory until the count is below the cap (their committed offsets stay); if none is Empty, a JoinGroup for a new group gets COORDINATOR_NOT_AVAILABLE. Default 100000. Reloadable.",
         &MAX_CONSUMER_GROUPS,
         1,
         MAX_MAX_CONSUMER_GROUPS,

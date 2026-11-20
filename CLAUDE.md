@@ -396,24 +396,24 @@ Per-category counts are in `docs/TEST_STRATEGY.md`; `cargo run --release -- --li
 | **admin** | CreateTopics (incl. validation and the partition cap), DeleteTopics, CreatePartitions, DeleteGroups, DescribeConfigs, IncrementalAlterConfigs, DeleteRecords, per-topic retention |
 | **producer** | Basic produce, batch produce, acks=0, ack-implies-committed, timestamp roundtrip |
 | **consumer** | Basic consume, from offset, multiple messages, headers, fetch record batching |
-| **consumer_group** | Lifecycle, two-member groups, rebalancing, strategies, JoinGroup protocol and member-id rules, no common assignor, offsets-only groups after a restart |
+| **consumer_group** | Lifecycle, two-member groups, rebalancing, strategies, JoinGroup protocol and member-id rules, no common assignor, offsets-only groups after a restart, a silent follower outliving a slow leader's SyncGroup, a lowered group cap |
 | **offset_management** | Commit/fetch, OffsetCommit generation/member rules, boundary conditions, multi-partition, by-timestamp, ListOffsets isolation, OffsetFetch require_stable, no offset reuse |
 | **partition** | Multi-partition topics, key routing, distribution |
 | **compression** | gzip, snappy, lz4, zstd, roundtrip, edge cases |
-| **idempotent** | InitProducerId, deduplication, epoch, multi-partition, Kafka's idempotent model (5-batch cache, original offsets, epochs, sequence wrap) |
-| **transaction** | Transactions, isolation levels, EOS, fencing, atomicity, timeouts, validation; read_committed consumers past aborted/cleaned-up/DeleteRecords holes and stopping at an open transaction |
+| **idempotent** | InitProducerId, deduplication, epoch, multi-partition, Kafka's idempotent model (5-batch cache, original offsets, epochs, sequence wrap), producers the broker holds no state for |
+| **transaction** | Transactions, isolation levels, EOS, fencing, atomicity, timeouts (each transaction's own clock, an exhausted epoch fenced), InitProducerId's presented epoch, validation; read_committed consumers past aborted/cleaned-up/DeleteRecords holes and stopping at an open transaction |
 | **shadow** | External forwarding, SASL/SSL, topic mapping, replay, dial-up, throughput floor, headers/timestamps, order across a retried failure, sync-stall bound, GUC reload, per-partition lag view |
 | **long_poll** | Timeout behavior, immediate return, producer wakeup, precision, per-connection task cap, a transaction end waking a read_committed fetch |
 | **error_paths** | Invalid partitions, unknown topics, coordinator errors, protocol/transaction/group regressions |
 | **edge_cases** | Empty topics, large messages, boundary values, retention sweep |
-| **part** | Time partitions of kafka.messages: whole-leaf retention drops, row-delete fallback, pending-transaction blocking, maintenance and its lock waits, EndTxn during the default-leaf move, least privilege |
+| **part** | Time partitions of kafka.messages: whole-leaf retention drops, row-delete fallback, pending-transaction blocking, maintenance and its lock waits, EndTxn during the default-leaf move, offsets kept after retention empties a partition, least privilege |
 | **concurrent** | Multi-producer, multi-consumer, request pipelining, races, heartbeat liveness lane, heartbeats inside group-commit batches |
 | **negative** | Connection refused, timeouts, expected failures, superuser-only SASL password GUC |
 | **performance** | Throughput baselines, latency percentiles, scaling |
 | **metadata** | Metadata refresh, all topics, nonexistent topic, a corrupt stored partition count |
 | **protocol** | ApiVersions negotiation, correlation ID, unknown API, pipelining, response ordering |
-| **auth** | SASL_PLAINTEXT (PLAIN, SCRAM-SHA-256/512), SSL (+ untrusted CA, mutual TLS), SASL_SSL, wrong passwords, pre-auth gating, user SQL. Sequential: generates certs with the `openssl` CLI, adds listeners 19093-19095 via ALTER SYSTEM and restarts the worker; the last test resets them. Needs the DB host's filesystem and superuser |
-| **network** | Hostile clients at the network edge: frame-budget lockout, >100 MB response, Nagle, acks=0 close / invalid acks, response before close, per-IP and per-listener caps, idle and frame-read deadlines, pre-auth deadline from accept, SASL lookup rate limit, unknown-user SCRAM. Sequential; the `limits` tests add listeners 19096-19098 via ALTER SYSTEM, connect from 127.0.0.x source addresses and need `openssl` |
+| **auth** | SASL_PLAINTEXT (PLAIN, SCRAM-SHA-256/512), SSL (+ untrusted CA, mutual TLS), SASL_SSL, wrong passwords, pre-auth gating and pre-auth ApiVersions on the network thread, advertised addresses, user SQL. Sequential: generates certs with the `openssl` CLI, adds listeners 19093-19095 via ALTER SYSTEM and restarts the worker; the last test resets them. Needs the DB host's filesystem and superuser |
+| **network** | Hostile clients at the network edge: frame-budget lockout, >100 MB response, Nagle, acks=0 close / invalid acks, response before close, per-IP and per-listener caps, idle and frame-read deadlines, pre-auth deadline from accept, SASL lookup rate limit, unknown-user SCRAM, decompression bombs, acks=0 Produce at an unsupported version. Sequential; the `limits` tests add listeners 19096-19098 via ALTER SYSTEM, connect from 127.0.0.x source addresses and need `openssl` |
 | **worker** | Worker lifecycle and robustness: DROP/CREATE/ALTER EXTENSION under load, old 0.0.0 schema, SIGTERM in a lock wait, worker lock_timeout, commit failure. Sequential; needs superuser and the DB host's filesystem |
 
 ### Running E2E Tests with CLI Options
