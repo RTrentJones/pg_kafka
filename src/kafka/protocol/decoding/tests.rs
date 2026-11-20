@@ -123,7 +123,14 @@ fn corrupt_produce_frame(acks: i16) -> BytesMut {
     };
     let mut p = PartitionProduceData::default();
     p.index = 0;
-    p.records = Some(bytes::Bytes::from_static(b"definitely not a record batch"));
+    // A record batch whose CRC does not match.
+    let mut batch = one_record_batch(
+        b"value".to_vec(),
+        kafka_protocol::records::Compression::None,
+    );
+    let last = batch.len() - 1;
+    batch[last] ^= 1;
+    p.records = Some(bytes::Bytes::from(batch));
     let mut t = TopicProduceData::default();
     t.name = topic("t");
     t.partition_data = vec![p];
@@ -136,13 +143,9 @@ fn corrupt_produce_frame(acks: i16) -> BytesMut {
 
 /// A Produce whose partitions each carry `per_partition` bytes of zeros as one
 /// gzip-compressed record: a few hundred KB on the wire however large it decodes.
-fn gzip_bomb_frame(partitions: i32, per_partition: usize, acks: i16) -> BytesMut {
-    use kafka_protocol::messages::produce_request::{
-        PartitionProduceData, ProduceRequest, TopicProduceData,
-    };
-    use kafka_protocol::records::{
-        Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
-    };
+/// One record batch holding one record of `value`.
+fn one_record_batch(value: Vec<u8>, compression: kafka_protocol::records::Compression) -> BytesMut {
+    use kafka_protocol::records::{Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType};
     let record = Record {
         transactional: false,
         control: false,
@@ -154,7 +157,7 @@ fn gzip_bomb_frame(partitions: i32, per_partition: usize, acks: i16) -> BytesMut
         sequence: -1,
         timestamp: 0,
         key: None,
-        value: Some(bytes::Bytes::from(vec![0u8; per_partition])),
+        value: Some(bytes::Bytes::from(value)),
         headers: kafka_protocol::indexmap::IndexMap::default(),
     };
     let mut batch = BytesMut::new();
@@ -163,10 +166,21 @@ fn gzip_bomb_frame(partitions: i32, per_partition: usize, acks: i16) -> BytesMut
         [record].iter(),
         &RecordEncodeOptions {
             version: 2,
-            compression: Compression::Gzip,
+            compression,
         },
     )
     .unwrap();
+    batch
+}
+
+fn gzip_bomb_frame(partitions: i32, per_partition: usize, acks: i16) -> BytesMut {
+    use kafka_protocol::messages::produce_request::{
+        PartitionProduceData, ProduceRequest, TopicProduceData,
+    };
+    let batch = one_record_batch(
+        vec![0u8; per_partition],
+        kafka_protocol::records::Compression::Gzip,
+    );
     let batch = batch.freeze();
     let mut t = TopicProduceData::default();
     t.name = topic("t");

@@ -7,8 +7,8 @@
 //! - `decoding`: the request header ([`parse_request`]); the body goes to the API registry
 //!   (`crate::kafka::api`);
 //! - `encoding`: response frames ([`encode_response`]);
-//! - `recordbatch`: the records of a Produce partition, RecordBatch v2 or legacy
-//!   MessageSet v0/v1 ([`parse_record_batch_with_metadata`]);
+//! - `recordbatch`: the records of a Produce partition, one RecordBatch v2
+//!   ([`parse_record_batch_with_metadata`]);
 //! - [`decode_budget`]: how many decoded record bytes a request, and all requests together,
 //!   may hold.
 

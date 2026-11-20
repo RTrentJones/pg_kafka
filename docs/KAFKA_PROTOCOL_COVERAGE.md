@@ -488,7 +488,7 @@ Consumer Flow (Current):
 | Feature | Standard Kafka | pg_kafka | Notes |
 |---------|---------------|----------|-------|
 | Wire Protocol | v0-v17+ | Per-API ranges, highest advertised is v11 (Fetch) | Flexible (tagged-field) versions supported; the response header version comes from each API's kafka-protocol response type |
-| RecordBatch | v0, v1, v2 | v2 (Produce v3+) | Produce v0-v2 (MessageSet) is not advertised; a legacy MessageSet v0/v1 decode fallback exists for inbound batches |
+| RecordBatch | v0, v1, v2 | v2 (Produce v3+) | Produce v0-v2 (MessageSet) is not advertised; a MessageSet v0/v1 batch in Produce v3+ is INVALID_RECORD, as in Kafka |
 | Compression | All codecs | All codecs | gzip, snappy, lz4, zstd fully supported |
 | Transactions | Yes | Yes | ✅ Phase 10 - EOS with server-side read_committed filtering |
 | SASL/TLS | Yes | Yes | PLAIN, SCRAM-SHA-256/512, TLS + mTLS (see AUTHENTICATION.md) |

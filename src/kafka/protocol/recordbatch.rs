@@ -1,5 +1,5 @@
-//! The records of one Produce partition: RecordBatch v2 (Kafka 0.11+), or the legacy
-//! MessageSet v0/v1 as a fallback.
+//! The records of one Produce partition: exactly one RecordBatch v2, the only record
+//! format of the Produce versions pg_kafka serves (v3+).
 //!
 //! Every decoded byte is charged to the request's [`DecodeBudget`] as it is produced: the
 //! decompressors here write through it and stop at its limit, so a compressed batch can
@@ -11,7 +11,7 @@ use std::io::{self, Write};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use kafka_protocol::records::{Compression, RecordBatchDecoder};
-use tracing::{debug, warn};
+use tracing::debug;
 
 use super::decode_budget::DecodeBudget;
 use crate::kafka::error::{KafkaError, Result};
@@ -30,53 +30,89 @@ pub struct ParsedRecordBatch {
 // baseOffset i64 @0, batchLength i32 @8, partitionLeaderEpoch i32 @12, magic i8 @16,
 // crc u32 @17, attributes i16 @21, lastOffsetDelta i32 @23, baseTimestamp i64 @27,
 // maxTimestamp i64 @35, producerId i64 @43, producerEpoch i16 @51, baseSequence i32 @53,
-// recordsCount i32 @57.
+// recordsCount i32 @57, records @61.
+const BATCH_LENGTH_OFFSET: usize = 8;
+/// baseOffset and batchLength, which batchLength does not count.
+const LOG_OVERHEAD: usize = 12;
 const MAGIC_OFFSET: usize = 16;
 const PRODUCER_ID_OFFSET: usize = 43;
-/// End of baseSequence, the last producer field.
-const PRODUCER_FIELDS_END: usize = 57;
+const RECORD_COUNT_OFFSET: usize = 57;
+/// The header of a RecordBatch v2, up to its first record.
+const RECORD_BATCH_OVERHEAD: usize = 61;
+/// The smallest batchLength Kafka reads a magic byte behind (a legacy v0 message's).
+const MIN_BATCH_LENGTH: usize = 14;
 /// The magic byte of a RecordBatch v2.
 const RECORD_BATCH_V2_MAGIC: i8 = 2;
 
-/// The producer id, epoch and base sequence in a RecordBatch v2 header.
+fn invalid(message: impl Into<String>) -> KafkaError {
+    KafkaError::InvalidRecord {
+        message: message.into(),
+    }
+}
+
+fn corrupt(message: impl Into<String>) -> KafkaError {
+    KafkaError::CorruptMessage {
+        message: message.into(),
+    }
+}
+
+/// A big-endian i32 at `at` of `bytes`, which holds it.
+fn i32_at(bytes: &[u8], at: usize) -> i32 {
+    let mut field = &bytes[at..at + 4];
+    field.get_i32()
+}
+
+/// Check the framing Kafka checks before it decodes a Produce v3+ partition's records,
+/// and return the batch's declared record count.
 ///
-/// A batch too short to hold them yields the zeroed default; any other format (legacy
-/// MessageSet) yields -1 for all three, a non-idempotent producer.
-fn extract_producer_metadata(batch_bytes: &Bytes) -> ProducerMetadata {
-    if batch_bytes.len() < PRODUCER_FIELDS_END {
-        debug!(
-            "RecordBatch too short ({} bytes) for producer metadata, using defaults",
-            batch_bytes.len()
-        );
-        return ProducerMetadata::default();
+/// In Kafka 3.7's order (`ByteBufferLogInputStream.nextBatchSize`, then
+/// `ProduceRequest.validateRecords`): a batchLength too short for any batch, or a v2+ batch
+/// shorter than its header, is CORRUPT_MESSAGE; data holding no complete batch, a batch of
+/// another magic than 2 (a legacy MessageSet) and a negative record count are
+/// INVALID_RECORD.
+fn check_batch_header(batch: &[u8]) -> Result<usize> {
+    let no_batch = || invalid("Produce v3+ partition data must hold exactly one record batch");
+    if batch.len() < LOG_OVERHEAD {
+        return Err(no_batch());
     }
-
-    let magic = i8::from_be_bytes([batch_bytes[MAGIC_OFFSET]]);
+    let batch_length = i32_at(batch, BATCH_LENGTH_OFFSET);
+    let Some(batch_length) = usize::try_from(batch_length)
+        .ok()
+        .filter(|&n| n >= MIN_BATCH_LENGTH)
+    else {
+        return Err(corrupt(format!(
+            "record batch length {batch_length} is too short"
+        )));
+    };
+    if batch.len() <= MAGIC_OFFSET {
+        return Err(no_batch());
+    }
+    let magic = i8::from_be_bytes([batch[MAGIC_OFFSET]]);
+    if magic >= RECORD_BATCH_V2_MAGIC && batch_length + LOG_OVERHEAD < RECORD_BATCH_OVERHEAD {
+        return Err(corrupt(format!(
+            "record batch length {batch_length} is shorter than its header"
+        )));
+    }
+    if batch.len() < batch_length + LOG_OVERHEAD {
+        return Err(no_batch());
+    }
     if magic != RECORD_BATCH_V2_MAGIC {
-        debug!(
-            "RecordBatch magic={magic}, expected 2 (v2 format), using default producer metadata"
-        );
-        return ProducerMetadata {
-            producer_id: -1,
-            producer_epoch: -1,
-            base_sequence: -1,
-        };
+        return Err(invalid(format!(
+            "Produce v3+ carries record batches of magic 2 only, not magic {magic}"
+        )));
     }
+    usize::try_from(i32_at(batch, RECORD_COUNT_OFFSET))
+        .map_err(|_| invalid("record batch declares a negative record count"))
+}
 
-    // In bounds: the length check above covers every field read here.
-    let mut fields = &batch_bytes[PRODUCER_ID_OFFSET..PRODUCER_FIELDS_END];
-    let producer_id = fields.get_i64();
-    let producer_epoch = fields.get_i16();
-    let base_sequence = fields.get_i32();
-
-    debug!(
-        "Extracted producer metadata: producer_id={producer_id}, producer_epoch={producer_epoch}, base_sequence={base_sequence}"
-    );
-
+/// The producer id, epoch and base sequence in the header of a batch that passed
+/// [`check_batch_header`].
+fn extract_producer_metadata(batch: &[u8]) -> ProducerMetadata {
+    let mut fields = &batch[PRODUCER_ID_OFFSET..RECORD_COUNT_OFFSET];
     ProducerMetadata {
-        producer_id,
-        producer_epoch,
-        base_sequence,
+        producer_id: fields.get_i64(),
+        producer_epoch: fields.get_i16(),
+        base_sequence: fields.get_i32(),
     }
 }
 
@@ -86,9 +122,10 @@ pub fn parse_record_batch_with_metadata(
     batch_bytes: &Bytes,
     budget: &DecodeBudget,
 ) -> Result<ParsedRecordBatch> {
+    let records = parse_record_batch(batch_bytes, budget)?;
     Ok(ParsedRecordBatch {
         producer_metadata: extract_producer_metadata(batch_bytes),
-        records: parse_record_batch(batch_bytes, budget)?,
+        records,
     })
 }
 
@@ -203,22 +240,12 @@ fn decompress(
     Ok(out.into_bytes())
 }
 
-/// Parse a partition's record data into its records, charging the decoded bytes to
-/// `budget`.
-///
-/// The data is one RecordBatch v2 (kafka-protocol decodes it, checking the CRC32C, through
-/// `decompress`). Data that does not decode as one is tried as a legacy MessageSet v0/v1,
-/// unless the decode stopped at the end of the budget.
+/// Parse a partition's record data (one RecordBatch v2) into its records, charging the
+/// decoded bytes to `budget`. kafka-protocol decodes the batch, checking its CRC32C, through
+/// `decompress`.
 pub fn parse_record_batch(batch_bytes: &Bytes, budget: &DecodeBudget) -> Result<Vec<Record>> {
-    if batch_bytes.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    debug!("parse_record_batch: received {} bytes", batch_bytes.len());
-    debug!(
-        "First 20 bytes: {:?}",
-        &batch_bytes[..batch_bytes.len().min(20)]
-    );
+    check_batch_header(batch_bytes)?;
+    debug!("parse_record_batch: {} bytes", batch_bytes.len());
 
     let mut batch_buf = batch_bytes.clone();
     let decoded = RecordBatchDecoder::decode_with_custom_compression(
@@ -226,15 +253,13 @@ pub fn parse_record_batch(batch_bytes: &Bytes, budget: &DecodeBudget) -> Result<
         Some(|data: &mut Bytes, compression| decompress(data, compression, budget)),
     );
     match decoded {
-        // Produce v3+ (the only Produce versions pg_kafka accepts) carries exactly one
-        // record batch per partition. Decoding one and ignoring the rest would drop the
-        // trailing batches while acking the request; reject it as Kafka does.
-        Ok(_) if batch_buf.has_remaining() => Err(KafkaError::InvalidRecord {
-            message: format!(
-                "partition data carries more than one record batch ({} trailing bytes)",
-                batch_buf.remaining()
-            ),
-        }),
+        // Produce v3+ carries exactly one record batch per partition. Decoding one and
+        // ignoring the rest would drop the trailing batches while acking the request;
+        // reject it as Kafka does.
+        Ok(_) if batch_buf.has_remaining() => Err(invalid(format!(
+            "partition data carries more than one record batch ({} trailing bytes)",
+            batch_buf.remaining()
+        ))),
         Ok(record_set) => Ok(record_set
             .records
             .into_iter()
@@ -252,167 +277,10 @@ pub fn parse_record_batch(batch_bytes: &Bytes, budget: &DecodeBudget) -> Result<
                 timestamp: Some(record.timestamp),
             })
             .collect()),
-        Err(e) if budget.exhausted().is_some() => Err(KafkaError::CorruptMessage {
-            message: format!("record batch stopped at the decode limit: {e}"),
-        }),
-        Err(e) => {
-            debug!("RecordBatch decode failed ({e}), trying MessageSet v0/v1 format");
-            // The legacy records are copied out of the batch: at most its size.
-            if budget.take(batch_bytes.len()).is_err() {
-                return Err(KafkaError::CorruptMessage {
-                    message: "legacy message set stopped at the decode limit".into(),
-                });
-            }
-            parse_message_set_legacy(batch_bytes, e)
-        }
-    }
-}
-
-/// CRC-32 (IEEE / `java.util.zip.CRC32`, reflected poly 0xEDB88320): the checksum a legacy
-/// MessageSet v0/v1 message carries over its body. Computed bit by bit (these batches are
-/// off the hot path), so no extra dependency is needed.
-fn crc32_ieee(data: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFFu32;
-    for &byte in data {
-        crc ^= u32::from(byte);
-        for _ in 0..8 {
-            crc = if crc & 1 != 0 {
-                (crc >> 1) ^ 0xEDB8_8320
-            } else {
-                crc >> 1
-            };
-        }
-    }
-    !crc
-}
-
-/// Offset (8) + message size (4) in front of each MessageSet entry.
-const MESSAGE_SET_ENTRY_HEADER_BYTES: usize = 12;
-/// Smallest legacy message: CRC (4) + magic (1) + attributes (1).
-const MIN_LEGACY_MESSAGE_BYTES: usize = 6;
-/// Bytes of the CRC in front of a legacy message.
-const LEGACY_CRC_BYTES: usize = 4;
-
-/// A legacy message cut short inside a key or value.
-struct Truncated;
-
-/// An i32-length-prefixed nullable byte string of a legacy message: `None` for a null
-/// (negative length) or absent one.
-fn read_nullable_bytes(
-    msg: &mut Bytes,
-    what: &str,
-) -> std::result::Result<Option<Vec<u8>>, Truncated> {
-    if msg.remaining() < 4 {
-        return Ok(None);
-    }
-    let Ok(len) = usize::try_from(msg.get_i32()) else {
-        return Ok(None);
-    };
-    if msg.remaining() < len {
-        warn!("Insufficient bytes for {what}");
-        return Err(Truncated);
-    }
-    Ok(Some(msg.copy_to_bytes(len).to_vec()))
-}
-
-/// One legacy message (CRC, magic, attributes, optional timestamp, key, value) as a
-/// record, or `None` when it fails its CRC or is cut short. `msg` holds at least
-/// [`MIN_LEGACY_MESSAGE_BYTES`].
-fn parse_legacy_message(msg: &Bytes) -> Option<Record> {
-    // The CRC32 covers everything after the CRC field (magic, attributes, key, value);
-    // a mismatch means a corrupt message, so stop rather than persist garbage. (The
-    // RecordBatch v2 path has its CRC32C checked by the kafka-protocol decoder.)
-    let stored_crc = u32::from_be_bytes([msg[0], msg[1], msg[2], msg[3]]);
-    let computed_crc = crc32_ieee(&msg[LEGACY_CRC_BYTES..]);
-    if stored_crc != computed_crc {
-        warn!(
-            "MessageSet CRC mismatch (corrupt message): stored={stored_crc:#010x} computed={computed_crc:#010x}"
-        );
-        return None;
-    }
-
-    // The size floor keeps these two reads within `msg`.
-    let mut msg = msg.slice(LEGACY_CRC_BYTES..);
-    let magic = msg.get_i8();
-    let _attributes = msg.get_i8(); // compression, timestamp type
-
-    // Message v1 (magic=1) carries an 8-byte timestamp between attributes and the key;
-    // v0 does not.
-    let timestamp = if magic >= 1 {
-        if msg.remaining() < 8 {
-            warn!("Insufficient bytes for v1 message timestamp");
-            return None;
-        }
-        let ts = msg.get_i64();
-        (ts >= 0).then_some(ts)
-    } else {
-        None
-    };
-
-    let key = read_nullable_bytes(&mut msg, "key").ok()?;
-    let value = read_nullable_bytes(&mut msg, "value").ok()?;
-
-    Some(Record {
-        key,
-        value,
-        headers: Vec::new(), // MessageSet v0/v1 has no headers
-        timestamp,           // None for v0; the producer timestamp for v1 (-1 = none)
-    })
-}
-
-/// Parse a legacy MessageSet v0/v1:
-///
-/// ```text
-/// repeated: [offset i64][message size i32][message]
-/// message:  [crc u32][magic i8][attributes i8][timestamp i64, v1 only][key][value]
-/// key/value: [length i32, -1 = null][bytes]
-/// ```
-///
-/// Parsing stops at the first entry that is truncated or fails its CRC; it is an error
-/// only when no record parsed, reported with `original_error` (why the data is not a
-/// RecordBatch v2).
-fn parse_message_set_legacy(
-    batch_bytes: &Bytes,
-    original_error: impl std::fmt::Display,
-) -> Result<Vec<Record>> {
-    let mut buf = batch_bytes.clone();
-    let mut records = Vec::new();
-
-    while buf.remaining() >= MESSAGE_SET_ENTRY_HEADER_BYTES {
-        let _offset = buf.get_i64(); // the broker assigns its own offsets
-        let message_size = buf.get_i32();
-
-        // The size must cover the 6-byte message header and fit what remains. Without the
-        // floor, a crafted size in 0..=5 would pass and the header reads of
-        // `parse_legacy_message` would underflow the buffer and panic on the untrusted
-        // network path.
-        let Some(message_size) = usize::try_from(message_size)
-            .ok()
-            .filter(|&n| (MIN_LEGACY_MESSAGE_BYTES..=buf.remaining()).contains(&n))
-        else {
-            warn!("Invalid message size in MessageSet: {message_size}");
-            break;
-        };
-
-        // Carve out exactly this message so every read of it is bounded by its size.
-        let msg = buf.copy_to_bytes(message_size);
-
-        let Some(record) = parse_legacy_message(&msg) else {
-            break;
-        };
-        records.push(record);
-    }
-
-    if records.is_empty() {
-        Err(KafkaError::encoding(format!(
-            "Failed to parse as both RecordBatch and MessageSet: {original_error}"
-        )))
-    } else {
-        debug!(
-            "Successfully parsed {} records from MessageSet format",
-            records.len()
-        );
-        Ok(records)
+        Err(e) if budget.exhausted().is_some() => Err(corrupt(format!(
+            "record batch stopped at the decode limit: {e}"
+        ))),
+        Err(e) => Err(corrupt(format!("record batch does not decode: {e}"))),
     }
 }
 
@@ -574,7 +442,9 @@ mod tests {
                 producer_epoch: -1,
                 timestamp_type: TimestampType::Creation,
                 offset: i64::try_from(i).unwrap(),
-                sequence: -1,
+                // offset - sequence must not change within a batch, or the encoder starts a
+                // new one.
+                sequence: i32::try_from(i).unwrap() - 1,
                 timestamp: 0,
                 key: None,
                 value: Some(Bytes::from(v.to_string())),
@@ -594,20 +464,25 @@ mod tests {
         buf
     }
 
-    /// One MessageSet entry: offset, message size, `crc`, then `body` (magic, attributes,
-    /// key, value).
-    fn legacy_entry_with_crc(body: &[u8], crc: u32) -> Vec<u8> {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&0i64.to_be_bytes()); // offset (ignored)
-        buf.extend_from_slice(&i32::try_from(4 + body.len()).unwrap().to_be_bytes()); // CRC + body
-        buf.extend_from_slice(&crc.to_be_bytes());
-        buf.extend_from_slice(body);
-        buf
+    /// One legacy MessageSet v0/v1 entry (offset, message size, CRC, magic, attributes,
+    /// a v1 timestamp, a null key and `value`). The broker refuses it before its CRC.
+    fn legacy_entry(magic: u8, attributes: u8, value: &[u8]) -> Vec<u8> {
+        let mut body = vec![magic, attributes];
+        if magic == 1 {
+            body.extend_from_slice(&0i64.to_be_bytes());
+        }
+        body.extend_from_slice(&(-1i32).to_be_bytes());
+        body.extend_from_slice(&i32::try_from(value.len()).unwrap().to_be_bytes());
+        body.extend_from_slice(value);
+        let mut entry = 0i64.to_be_bytes().to_vec();
+        entry.extend_from_slice(&i32::try_from(4 + body.len()).unwrap().to_be_bytes());
+        entry.extend_from_slice(&0u32.to_be_bytes());
+        entry.extend_from_slice(&body);
+        entry
     }
 
-    /// One MessageSet entry with a valid CRC over `body`.
-    fn legacy_entry(body: &[u8]) -> Vec<u8> {
-        legacy_entry_with_crc(body, crc32_ieee(body))
+    fn code(err: &KafkaError) -> i16 {
+        err.to_kafka_error_code()
     }
 
     #[test]
@@ -632,261 +507,104 @@ mod tests {
         );
     }
 
-    // ========== Empty/Edge Case Tests ==========
-
     #[test]
-    fn test_parse_record_batch_empty() {
-        let batch_bytes = Bytes::new();
-        let result = parse_record_batch(&batch_bytes, &budget());
-
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_empty());
+    fn legacy_message_sets_are_invalid_records() {
+        use crate::kafka::constants::ERROR_INVALID_RECORD;
+        // Produce v3+ carries RecordBatch v2 only (Kafka: INVALID_RECORD). A legacy set was
+        // stored before: a gzip wrapper as one garbage record, a cut-short set as its prefix.
+        let mut two = legacy_entry(1, 0, b"one");
+        two.extend_from_slice(&legacy_entry(1, 0, b"two"));
+        let mut cut_short = legacy_entry(0, 0, b"kept");
+        cut_short.extend_from_slice(&legacy_entry(0, 0, b"lost")[..20]);
+        let shapes = [
+            legacy_entry(0, 0, b"v0"),
+            legacy_entry(1, 0, b"v1"),
+            legacy_entry(1, 1, b"gzip wrapper"),
+            two,
+            cut_short,
+        ];
+        for data in shapes {
+            let err = parse_record_batch(&Bytes::from(data.clone()), &budget()).unwrap_err();
+            assert_eq!(code(&err), ERROR_INVALID_RECORD, "{data:?}: {err}");
+        }
     }
 
     #[test]
-    fn test_parse_record_batch_with_metadata_empty() {
-        let batch_bytes = Bytes::new();
-        let result = parse_record_batch_with_metadata(&batch_bytes, &budget());
-
-        assert!(result.is_ok());
-        let parsed = result.unwrap();
-        assert!(parsed.records.is_empty());
-        // Default producer metadata for empty batch (uses ProducerMetadata::default())
-        assert_eq!(parsed.producer_metadata.producer_id, 0);
-        assert_eq!(parsed.producer_metadata.producer_epoch, 0);
-        assert_eq!(parsed.producer_metadata.base_sequence, 0);
-    }
-
-    // ========== Producer Metadata Extraction Tests ==========
-
-    #[test]
-    fn test_extract_producer_metadata_too_short() {
-        // Less than 57 bytes - should return defaults (ProducerMetadata::default())
-        let short_bytes = Bytes::from(vec![0u8; 30]);
-        let metadata = extract_producer_metadata(&short_bytes);
-
-        // Default() returns 0 values
-        assert_eq!(metadata.producer_id, 0);
-        assert_eq!(metadata.producer_epoch, 0);
-        assert_eq!(metadata.base_sequence, 0);
-    }
-
-    #[test]
-    fn test_extract_producer_metadata_wrong_magic() {
-        // Create a buffer with enough bytes but wrong magic (not 2)
-        let mut buf = vec![0u8; 60];
-        buf[16] = 1; // Magic byte = 1 (legacy format)
-
-        let bytes = Bytes::from(buf);
-        let metadata = extract_producer_metadata(&bytes);
-
-        // Should return defaults for non-v2 format
-        assert_eq!(metadata.producer_id, -1);
-        assert_eq!(metadata.producer_epoch, -1);
-        assert_eq!(metadata.base_sequence, -1);
+    fn batch_framing_errors_match_kafka() {
+        use crate::kafka::constants::{ERROR_CORRUPT_MESSAGE, ERROR_INVALID_RECORD};
+        let ok = encode_batch(&["a", "b"]).freeze();
+        assert_eq!(parse_record_batch(&ok, &budget()).unwrap().len(), 2);
+        let with = |at: usize, bytes: &[u8]| {
+            let mut b = ok.to_vec();
+            b[at..at + bytes.len()].copy_from_slice(bytes);
+            Bytes::from(b)
+        };
+        let cases: [(&str, Bytes, i16); 7] = [
+            ("empty", Bytes::new(), ERROR_INVALID_RECORD),
+            ("no magic byte", ok.slice(..16), ERROR_INVALID_RECORD),
+            ("cut short", ok.slice(..ok.len() - 3), ERROR_INVALID_RECORD),
+            (
+                "negative count",
+                with(57, &(-1i32).to_be_bytes()),
+                ERROR_INVALID_RECORD,
+            ),
+            (
+                "zero batch length",
+                with(8, &0i32.to_be_bytes()),
+                ERROR_CORRUPT_MESSAGE,
+            ),
+            (
+                "header cut short",
+                with(8, &40i32.to_be_bytes()),
+                ERROR_CORRUPT_MESSAGE,
+            ),
+            ("bad CRC", with(ok.len() - 1, b"x"), ERROR_CORRUPT_MESSAGE),
+        ];
+        for (what, data, expected) in cases {
+            let err = parse_record_batch(&data, &budget()).unwrap_err();
+            assert_eq!(code(&err), expected, "{what}: {err}");
+        }
     }
 
     #[test]
     fn test_extract_producer_metadata_valid_v2() {
-        // Create a minimal valid RecordBatch v2 header
         let mut buf = vec![0u8; 61];
-
-        // Magic byte at offset 16
-        buf[16] = 2;
-
-        // Producer ID at offset 43 (i64 big-endian)
-        let producer_id: i64 = 12345;
-        buf[43..51].copy_from_slice(&producer_id.to_be_bytes());
-
-        // Producer epoch at offset 51 (i16 big-endian)
-        let producer_epoch: i16 = 5;
-        buf[51..53].copy_from_slice(&producer_epoch.to_be_bytes());
-
-        // Base sequence at offset 53 (i32 big-endian)
-        let base_sequence: i32 = 100;
-        buf[53..57].copy_from_slice(&base_sequence.to_be_bytes());
-
-        let bytes = Bytes::from(buf);
-        let metadata = extract_producer_metadata(&bytes);
-
+        buf[43..51].copy_from_slice(&12345i64.to_be_bytes());
+        buf[51..53].copy_from_slice(&5i16.to_be_bytes());
+        buf[53..57].copy_from_slice(&100i32.to_be_bytes());
+        let metadata = extract_producer_metadata(&buf);
         assert_eq!(metadata.producer_id, 12345);
         assert_eq!(metadata.producer_epoch, 5);
         assert_eq!(metadata.base_sequence, 100);
     }
 
     #[test]
-    fn test_extract_producer_metadata_negative_values() {
-        // Test with -1 values (non-idempotent producer)
-        let mut buf = vec![0u8; 61];
-        buf[16] = 2; // Magic = 2
-
-        // Producer ID = -1
-        buf[43..51].copy_from_slice(&(-1i64).to_be_bytes());
-        // Producer epoch = -1
-        buf[51..53].copy_from_slice(&(-1i16).to_be_bytes());
-        // Base sequence = -1
-        buf[53..57].copy_from_slice(&(-1i32).to_be_bytes());
-
-        let bytes = Bytes::from(buf);
-        let metadata = extract_producer_metadata(&bytes);
-
-        assert_eq!(metadata.producer_id, -1);
-        assert_eq!(metadata.producer_epoch, -1);
-        assert_eq!(metadata.base_sequence, -1);
-    }
-
-    // ========== MessageSet Legacy Format Tests ==========
-
-    #[test]
-    fn test_parse_message_set_legacy_invalid() {
-        // Too short for any valid message
-        let bytes = Bytes::from(vec![0u8; 5]);
-        let result = parse_message_set_legacy(&bytes, "test error");
-
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_message_set_legacy_negative_message_size() {
-        // Create buffer with negative message size
-        let mut buf = vec![0u8; 20];
-        // Offset (8 bytes) - don't care
-        // Message size = -1 (invalid)
-        buf[8..12].copy_from_slice(&(-1i32).to_be_bytes());
-
-        let bytes = Bytes::from(buf);
-        let result = parse_message_set_legacy(&bytes, "test error");
-
-        // Should fail because no valid records parsed
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_message_set_legacy_simple_message() {
-        // Build the message body — everything the CRC covers: magic, attributes, key, value.
-        let mut body = Vec::new();
-        body.push(0); // magic v0
-        body.push(0); // attributes
-        body.extend_from_slice(&(-1i32).to_be_bytes()); // null key
-        body.extend_from_slice(&5i32.to_be_bytes()); // value length
-        body.extend_from_slice(b"hello");
-
-        let buf = legacy_entry(&body);
-
-        let bytes = Bytes::from(buf);
-        let result = parse_message_set_legacy(&bytes, "test error");
-
-        assert!(result.is_ok());
-        let records = result.unwrap();
-        assert_eq!(records.len(), 1);
-        assert!(records[0].key.is_none());
-        assert_eq!(records[0].value, Some(b"hello".to_vec()));
-        assert!(records[0].headers.is_empty()); // Legacy format has no headers
-    }
-
-    #[test]
-    fn test_parse_message_set_legacy_v1_skips_timestamp() {
-        // Message v1 (magic=1) has an 8-byte timestamp between attributes and key. It
-        // must be read as the timestamp, not mistaken for the key length.
-        let mut body = Vec::new();
-        body.push(1); // magic v1
-        body.push(0); // attributes
-        body.extend_from_slice(&1_700_000_000_000i64.to_be_bytes()); // timestamp
-        body.extend_from_slice(&(-1i32).to_be_bytes()); // null key
-        body.extend_from_slice(&2i32.to_be_bytes()); // value length
-        body.extend_from_slice(b"hi");
-
-        let buf = legacy_entry(&body);
-
-        let records = parse_message_set_legacy(&Bytes::from(buf), "test error").unwrap();
-        assert_eq!(records.len(), 1);
-        assert!(records[0].key.is_none());
-        assert_eq!(records[0].value, Some(b"hi".to_vec()));
-        assert_eq!(records[0].timestamp, Some(1_700_000_000_000));
-    }
-
-    #[test]
-    fn test_parse_message_set_legacy_with_key() {
-        // body = magic + attributes + keylen + "key" + vallen + "value"
-        let mut body = Vec::new();
-        body.push(0); // magic
-        body.push(0); // attributes
-        body.extend_from_slice(&3i32.to_be_bytes());
-        body.extend_from_slice(b"key");
-        body.extend_from_slice(&5i32.to_be_bytes());
-        body.extend_from_slice(b"value");
-
-        let buf = legacy_entry(&body);
-
-        let bytes = Bytes::from(buf);
-        let result = parse_message_set_legacy(&bytes, "test error");
-
-        assert!(result.is_ok());
-        let records = result.unwrap();
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].key, Some(b"key".to_vec()));
-        assert_eq!(records[0].value, Some(b"value".to_vec()));
-    }
-
-    #[test]
-    fn test_parse_message_set_legacy_rejects_bad_crc() {
-        // A message whose CRC doesn't match its body is corrupt and must not be parsed into a
-        // record. Build a valid body, then store a deliberately wrong CRC.
-        let mut body = Vec::new();
-        body.push(0); // magic
-        body.push(0); // attributes
-        body.extend_from_slice(&(-1i32).to_be_bytes()); // null key
-        body.extend_from_slice(&5i32.to_be_bytes());
-        body.extend_from_slice(b"hello");
-
-        let wrong_crc = crc32_ieee(&body).wrapping_add(1); // off by one → mismatch
-
-        let buf = legacy_entry_with_crc(&body, wrong_crc);
-
-        let bytes = Bytes::from(buf);
-        // No valid record parses → the function reports an error (and never persists the message).
-        assert!(parse_message_set_legacy(&bytes, "test error").is_err());
-    }
-
-    #[test]
-    fn test_parse_message_set_tiny_message_size_no_panic() {
-        // A message_size in 0..=5 is below the 6-byte message-header floor and must be
-        // rejected, not read as a header (the header reads would underflow and panic).
-        for size in 0i32..=5 {
-            let mut buf = Vec::new();
-            buf.extend_from_slice(&0i64.to_be_bytes()); // offset
-            buf.extend_from_slice(&size.to_be_bytes()); // tiny message_size
-            let bytes = Bytes::from(buf);
-            let result = parse_message_set_legacy(&bytes, "test error");
-            assert!(result.is_err(), "size {size} should yield Err, not panic");
-        }
-    }
-
-    #[test]
-    fn test_parse_message_set_size_exceeds_remaining_no_panic() {
-        // A message_size larger than the remaining buffer is rejected cleanly.
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&0i64.to_be_bytes());
-        buf.extend_from_slice(&1000i32.to_be_bytes()); // claims 1000 bytes
-        buf.extend_from_slice(&[0u8; 4]); // but only 4 follow
-        let bytes = Bytes::from(buf);
-        assert!(parse_message_set_legacy(&bytes, "test error").is_err());
+    fn test_parse_record_batch_with_metadata_reads_the_header() {
+        let parsed =
+            parse_record_batch_with_metadata(&encode_batch(&["x"]).freeze(), &budget()).unwrap();
+        assert_eq!(parsed.records.len(), 1);
+        assert_eq!(parsed.producer_metadata.producer_id, -1);
+        assert_eq!(parsed.producer_metadata.producer_epoch, -1);
+        assert_eq!(parsed.producer_metadata.base_sequence, -1);
     }
 
     proptest::proptest! {
-        // Fuzz the legacy MessageSet parser (hand-rolled code) directly with
-        // [offset][size][maybe-body] framing — it must never panic (returns Ok or Err).
+        // A valid batch with any bytes of its header overwritten: the framing checks read
+        // only bytes they checked are there, so it never panics.
         #[test]
-        fn fuzz_parse_message_set_legacy_never_panics(
-            size in proptest::num::i32::ANY,
-            body in proptest::collection::vec(proptest::num::u8::ANY, 0..256),
+        fn fuzz_batch_header_never_panics(
+            at in 0usize..61,
+            bytes in proptest::collection::vec(proptest::num::u8::ANY, 1..8),
         ) {
-            let mut buf = Vec::new();
-            buf.extend_from_slice(&0i64.to_be_bytes());
-            buf.extend_from_slice(&size.to_be_bytes());
-            buf.extend_from_slice(&body);
-            let bytes = Bytes::from(buf);
-            let _ = parse_message_set_legacy(&bytes, "fuzz");
+            let mut data = encode_batch(&["a", "b"]).to_vec();
+            for (i, b) in bytes.iter().enumerate() {
+                if let Some(slot) = data.get_mut(at + i) {
+                    *slot = *b;
+                }
+            }
+            let _ = parse_record_batch(&Bytes::from(data.clone()), &budget());
+            data.truncate(at);
+            let _ = parse_record_batch(&Bytes::from(data), &budget());
         }
 
         // The full `parse_record_batch` pipeline, including the v2 `RecordBatchDecoder` path,

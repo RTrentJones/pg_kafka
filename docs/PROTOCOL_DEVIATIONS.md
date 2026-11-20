@@ -70,6 +70,11 @@ pg_kafka.compression_type = 'gzip'
   100 MB across its partitions; past that every partition is answered MESSAGE_TOO_LARGE (Kafka
   streams validation and has no such limit). zstd frames may declare at most a 16 MiB window
   (Kafka's producers use 2^21, or the batch size).
+- Each partition's data must be exactly one RecordBatch v2, as in Kafka 3.7 for Produce v3+:
+  a legacy MessageSet (magic 0/1), empty or cut-short data, or a negative record count is
+  INVALID_RECORD; a bad CRC or a batch length shorter than the header is CORRUPT_MESSAGE.
+  Unlike Kafka, which answers only the offending partition, pg_kafka answers every partition
+  of the request with that code and writes none of them.
 - Server compresses responses based on GUC setting
 
 ### 3. Idempotent Producer ✅ Fully Supported (Phase 9)

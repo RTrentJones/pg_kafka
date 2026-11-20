@@ -1,4 +1,4 @@
-//! Fuzz the RecordBatch / legacy MessageSet parser directly (no catch_unwind around it):
+//! Fuzz the RecordBatch parser directly (no catch_unwind around it):
 //! it must return Ok or Err for any bytes, never panic or abort.
 #![no_main]
 
