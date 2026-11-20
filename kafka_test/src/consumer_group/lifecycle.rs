@@ -4,6 +4,7 @@
 //! FindCoordinator → JoinGroup → SyncGroup → Heartbeat → LeaveGroup
 
 use crate::common::{create_producer, TestResult};
+use crate::members::{Member, CLOSE_TIMEOUT};
 use crate::setup::TestContext;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
@@ -57,6 +58,7 @@ pub async fn test_consumer_group_lifecycle() -> TestResult {
         .create()?;
 
     // Subscribe exercises FindCoordinator, JoinGroup, SyncGroup
+    let consumer = Member::new(consumer);
     consumer.subscribe(&[topic.as_str()])?;
     println!("✅ Consumer subscribed (FindCoordinator + JoinGroup + SyncGroup)");
 
@@ -96,7 +98,7 @@ pub async fn test_consumer_group_lifecycle() -> TestResult {
 
     // 5. Graceful shutdown (exercises LeaveGroup)
     println!("\nStep 5: Leaving group (graceful shutdown)...");
-    drop(consumer);
+    consumer.close(CLOSE_TIMEOUT).await?;
     println!("✅ Consumer dropped (LeaveGroup sent)");
 
     // 6. Verify group is empty in database/coordinator
@@ -111,10 +113,11 @@ pub async fn test_consumer_group_lifecycle() -> TestResult {
         .set("enable.auto.commit", "false")
         .create()?;
 
+    let consumer2 = Member::new(consumer2);
     consumer2.subscribe(&[topic.as_str()])?;
     println!("✅ New consumer successfully joined same group");
 
-    drop(consumer2);
+    consumer2.close(CLOSE_TIMEOUT).await?;
 
     ctx.cleanup().await?;
     println!("\n✅ Consumer group lifecycle test PASSED\n");

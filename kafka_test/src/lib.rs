@@ -7,13 +7,15 @@
 //!
 //! Shared infrastructure: [`common`] (client factories, result types), [`setup`]
 //! ([`TestContext`]: unique names, cleanup), [`fixtures`] (builders, waits),
-//! [`assertions`] (database assertions), [`error_codes`] and [`wire`].
+//! [`assertions`] (database assertions), [`members`] (bounded closes of group
+//! consumers), [`error_codes`] and [`wire`].
 
 // Infrastructure modules
 pub mod assertions;
 pub mod common;
 pub mod error_codes;
 pub mod fixtures;
+pub mod members;
 pub mod registry;
 pub mod setup;
 pub mod wire;

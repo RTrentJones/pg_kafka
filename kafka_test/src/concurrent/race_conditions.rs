@@ -6,6 +6,7 @@
 use crate::common::to_i64;
 use crate::common::{create_db_client, create_producer, create_stream_consumer, TestResult};
 use crate::fixtures::TestTopicBuilder;
+use crate::members::{Member, CLOSE_TIMEOUT};
 use crate::setup::TestContext;
 use rdkafka::consumer::Consumer;
 use rdkafka::producer::{FutureRecord, Producer};
@@ -73,7 +74,7 @@ pub async fn test_produce_consume_race() -> TestResult {
     let consumer_count = consumed_count.clone();
     let consumer_handle = tokio::spawn(async move {
         let group_id = format!("race-consumer-{}", Uuid::new_v4());
-        let consumer = create_stream_consumer(&group_id).unwrap();
+        let consumer = Member::new(create_stream_consumer(&group_id).unwrap());
 
         consumer.subscribe(&[&consumer_topic]).unwrap();
 
@@ -91,12 +92,13 @@ pub async fn test_produce_consume_race() -> TestResult {
             }
         }
 
-        count
+        (count, consumer)
     });
 
     // Wait for both
     producer_handle.await?;
-    let consumed = consumer_handle.await?;
+    let (consumed, consumer) = consumer_handle.await?;
+    consumer.close(CLOSE_TIMEOUT).await?;
 
     let produced = produced_count.load(Ordering::SeqCst);
     println!("  Produced: {produced} messages");
@@ -308,6 +310,7 @@ pub async fn test_coordinator_state_race() -> TestResult {
                 let Ok(consumer) = create_stream_consumer(&consumer_group) else {
                     continue;
                 };
+                let consumer = Member::new(consumer);
 
                 // Subscribe and join
                 if consumer.subscribe(&[&topic]).is_err() {
@@ -321,13 +324,17 @@ pub async fn test_coordinator_state_race() -> TestResult {
 
                 // Unsubscribe (triggers leave)
                 consumer.unsubscribe();
+                consumer
+                    .close(CLOSE_TIMEOUT)
+                    .await
+                    .map_err(|e| format!("member {member_id}: {e}"))?;
                 successful_cycles += 1;
 
                 // Brief pause between cycles
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
 
-            successful_cycles
+            Ok::<_, String>(successful_cycles)
         });
 
         handles.push(handle);
@@ -336,7 +343,7 @@ pub async fn test_coordinator_state_race() -> TestResult {
     // Wait for all members
     let mut total_cycles = 0;
     for handle in handles {
-        total_cycles += handle.await?;
+        total_cycles += handle.await??;
     }
 
     println!("  Total successful cycles: {total_cycles}");
@@ -384,7 +391,7 @@ pub async fn test_partition_assignment_race() -> TestResult {
         let grp = group_id.clone();
 
         let handle = tokio::spawn(async move {
-            let consumer = create_stream_consumer(&grp).unwrap();
+            let consumer = Member::new(create_stream_consumer(&grp).unwrap());
 
             // Subscribe
             consumer.subscribe(&[&topic]).unwrap();
@@ -412,7 +419,13 @@ pub async fn test_partition_assignment_race() -> TestResult {
                 }
             }
 
-            (consumer_id, assigned_partitions)
+            // Leaves as soon as it has its partitions, while the others may still be
+            // joining; the close polls this consumer alone, so it cannot wait on theirs.
+            consumer
+                .close(CLOSE_TIMEOUT)
+                .await
+                .map_err(|e| format!("consumer {consumer_id}: {e}"))?;
+            Ok::<_, String>((consumer_id, assigned_partitions))
         });
 
         handles.push(handle);
@@ -421,7 +434,7 @@ pub async fn test_partition_assignment_race() -> TestResult {
     // Collect assignments
     let mut all_assignments: Vec<(i32, Vec<i32>)> = Vec::new();
     for handle in handles {
-        let (id, partitions) = handle.await?;
+        let (id, partitions) = handle.await??;
         println!("  Consumer {id}: partitions {partitions:?}");
         all_assignments.push((id, partitions));
     }
@@ -477,7 +490,7 @@ pub async fn test_group_rejoin_race() -> TestResult {
     for cycle in 0..rejoin_cycles {
         println!("  Cycle {}: ", cycle + 1);
 
-        let consumer = create_stream_consumer(&group_id)?;
+        let consumer = Member::new(create_stream_consumer(&group_id)?);
 
         // Subscribe
         consumer.subscribe(&[&topic.name])?;
@@ -506,6 +519,7 @@ pub async fn test_group_rejoin_race() -> TestResult {
 
         // Unsubscribe triggers leave
         consumer.unsubscribe();
+        consumer.close(CLOSE_TIMEOUT).await?;
 
         // Brief pause before next cycle
         tokio::time::sleep(Duration::from_millis(100)).await;

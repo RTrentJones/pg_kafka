@@ -8,11 +8,10 @@
 
 mod configs;
 mod create_validation;
-mod group_member;
 
 use crate::common::create_admin_client;
 use crate::common::{create_db_client, DynResult, TestResult};
-use group_member::GroupMember;
+use crate::members::GroupMember;
 use rdkafka::admin::{AdminOptions, NewPartitions, NewTopic, TopicReplication};
 use std::time::Duration;
 use uuid::Uuid;

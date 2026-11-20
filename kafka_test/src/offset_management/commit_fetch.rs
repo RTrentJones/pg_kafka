@@ -6,6 +6,7 @@
 use crate::common::{
     create_db_client, create_manual_commit_consumer, create_producer, TestResult, POLL_TIMEOUT,
 };
+use crate::members::{Member, CLOSE_TIMEOUT};
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::message::Message;
@@ -123,6 +124,7 @@ pub async fn test_offset_commit_fetch() -> TestResult {
         .set("enable.auto.commit", "false")
         .create()?;
 
+    let consumer2 = Member::new(consumer2);
     consumer2.subscribe(&[topic])?;
     println!("✅ New consumer created with same group ID");
 
@@ -153,6 +155,7 @@ pub async fn test_offset_commit_fetch() -> TestResult {
         println!("⚠️  No messages received (may be expected if all consumed)");
     }
 
+    consumer2.close(CLOSE_TIMEOUT).await?;
     println!("\n✅ OffsetCommit/OffsetFetch test PASSED\n");
     Ok(())
 }

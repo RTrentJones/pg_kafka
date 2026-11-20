@@ -2,6 +2,7 @@
 
 use crate::common::{get_bootstrap_servers, TestResult};
 use crate::error_codes::KAFKA_STORAGE_ERROR;
+use crate::members::Member;
 use crate::wire::records::batch;
 use crate::wire::Wire;
 use crate::worker::{
@@ -106,6 +107,9 @@ async fn extension_ddl_loop() -> SendResult<()> {
                 .set("allow.auto.create.topics", "true")
                 .create()
                 .expect("consumer");
+            // Closed off the runtime's threads when the task ends: the close may meet a
+            // dropped extension, and the loop's checks do not depend on it.
+            let consumer = Member::new(consumer);
             let _ = consumer.subscribe(&[&topic]);
             while !stop.load(Ordering::Relaxed) {
                 let _ = tokio::time::timeout(Duration::from_millis(200), consumer.recv()).await;
