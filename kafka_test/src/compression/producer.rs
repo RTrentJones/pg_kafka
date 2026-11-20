@@ -4,6 +4,7 @@
 //! The kafka-protocol crate handles decompression automatically.
 
 use crate::common::{get_bootstrap_servers, TestResult};
+use crate::members::{Member, CLOSE_TIMEOUT};
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::message::Message;
@@ -68,6 +69,7 @@ pub async fn test_compressed_producer_gzip() -> TestResult {
     // Consume and verify
     println!("\nStep 3: Consuming messages...");
     let consumer = create_consumer(&group_id)?;
+    let consumer = Member::new(consumer);
     consumer.subscribe(&[&topic])?;
 
     let mut received = 0;
@@ -97,6 +99,7 @@ pub async fn test_compressed_producer_gzip() -> TestResult {
     );
     println!("   Received {received} messages");
 
+    consumer.close(CLOSE_TIMEOUT).await?;
     println!("\n=== Compressed Producer (gzip) PASSED ===\n");
     Ok(())
 }
@@ -130,6 +133,7 @@ pub async fn test_compressed_producer_snappy() -> TestResult {
     // Consume and verify
     println!("\nStep 3: Consuming messages...");
     let consumer = create_consumer(&group_id)?;
+    let consumer = Member::new(consumer);
     consumer.subscribe(&[&topic])?;
 
     let mut received = 0;
@@ -159,6 +163,7 @@ pub async fn test_compressed_producer_snappy() -> TestResult {
     );
     println!("   Received {received} messages");
 
+    consumer.close(CLOSE_TIMEOUT).await?;
     println!("\n=== Compressed Producer (snappy) PASSED ===\n");
     Ok(())
 }
@@ -192,6 +197,7 @@ pub async fn test_compressed_producer_lz4() -> TestResult {
     // Consume and verify
     println!("\nStep 3: Consuming messages...");
     let consumer = create_consumer(&group_id)?;
+    let consumer = Member::new(consumer);
     consumer.subscribe(&[&topic])?;
 
     let mut received = 0;
@@ -221,6 +227,7 @@ pub async fn test_compressed_producer_lz4() -> TestResult {
     );
     println!("   Received {received} messages");
 
+    consumer.close(CLOSE_TIMEOUT).await?;
     println!("\n=== Compressed Producer (lz4) PASSED ===\n");
     Ok(())
 }
@@ -254,6 +261,7 @@ pub async fn test_compressed_producer_zstd() -> TestResult {
     // Consume and verify
     println!("\nStep 3: Consuming messages...");
     let consumer = create_consumer(&group_id)?;
+    let consumer = Member::new(consumer);
     consumer.subscribe(&[&topic])?;
 
     let mut received = 0;
@@ -283,6 +291,7 @@ pub async fn test_compressed_producer_zstd() -> TestResult {
     );
     println!("   Received {received} messages");
 
+    consumer.close(CLOSE_TIMEOUT).await?;
     println!("\n=== Compressed Producer (zstd) PASSED ===\n");
     Ok(())
 }

@@ -10,6 +10,7 @@ use crate::common::{
     create_stream_consumer, create_transactional_producer, get_bootstrap_servers, TestResult,
 };
 use crate::fixtures::{generate_messages, TestTopicBuilder};
+use crate::members::{Member, CLOSE_TIMEOUT};
 use crate::setup::TestContext;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
@@ -258,7 +259,7 @@ pub async fn test_fetch_after_offset_reset() -> TestResult {
 
     // 2. Create consumer with auto.offset.reset=earliest
     println!("Step 2: Creating consumer with auto.offset.reset=earliest...");
-    let consumer = create_stream_consumer(&group)?;
+    let consumer = Member::new(create_stream_consumer(&group)?);
     consumer.subscribe(&[&topic.name])?;
     println!("✅ Consumer subscribed\n");
 
@@ -288,6 +289,7 @@ pub async fn test_fetch_after_offset_reset() -> TestResult {
         assert_eq!(received[0], 0, "Should start from offset 0 with earliest");
         println!("✅ Consumer correctly started from offset 0\n");
     }
+    consumer.close(CLOSE_TIMEOUT).await?;
 
     ctx.cleanup().await?;
     println!("✅ Test: Fetch After Offset Reset PASSED\n");

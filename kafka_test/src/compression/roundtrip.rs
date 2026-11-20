@@ -6,6 +6,7 @@
 //! - Consumer receives decompressed messages
 
 use crate::common::{create_db_client, get_bootstrap_servers, TestResult};
+use crate::members::{Member, CLOSE_TIMEOUT};
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::message::Message;
@@ -97,6 +98,7 @@ pub async fn test_compression_roundtrip() -> TestResult {
     // Step 3: Consume the message
     println!("\nStep 3: Consuming message via Kafka protocol...");
     let consumer = create_consumer(&group_id)?;
+    let consumer = Member::new(consumer);
     consumer.subscribe(&[&topic])?;
 
     let mut received_value = None;
@@ -134,6 +136,7 @@ pub async fn test_compression_roundtrip() -> TestResult {
     );
     println!("   Roundtrip verification successful!");
 
+    consumer.close(CLOSE_TIMEOUT).await?;
     println!("\n=== Compression Roundtrip PASSED ===\n");
     Ok(())
 }

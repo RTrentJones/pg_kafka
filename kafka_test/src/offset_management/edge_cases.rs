@@ -9,6 +9,7 @@
 
 use crate::common::{create_producer, get_bootstrap_servers, TestResult};
 use crate::fixtures::TestTopicBuilder;
+use crate::members::{close_all, Member, CLOSE_TIMEOUT};
 use crate::setup::TestContext;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
@@ -62,6 +63,7 @@ pub async fn test_offset_commit_with_metadata() -> TestResult {
         .set("enable.auto.commit", "false")
         .create()?;
 
+    let consumer = Member::new(consumer);
     consumer.subscribe(&[&topic.name])?;
     println!("  Consumer subscribed");
 
@@ -116,6 +118,7 @@ pub async fn test_offset_commit_with_metadata() -> TestResult {
         println!("  Note: No offset committed (may require explicit commit)");
     }
 
+    consumer.close(CLOSE_TIMEOUT).await?;
     ctx.cleanup().await?;
     println!("\n✅ Offset commit with metadata test PASSED\n");
     Ok(())
@@ -191,6 +194,7 @@ pub async fn test_fetch_offset_new_group() -> TestResult {
         .set("enable.auto.commit", "false")
         .create()?;
 
+    let consumer = Member::new(consumer);
     consumer.subscribe(&[&topic.name])?;
 
     // Should start from earliest
@@ -200,6 +204,7 @@ pub async fn test_fetch_offset_new_group() -> TestResult {
         _ => println!("  Note: No message received"),
     }
 
+    consumer.close(CLOSE_TIMEOUT).await?;
     ctx.cleanup().await?;
     println!("\n✅ Fetch offset from new group test PASSED\n");
     Ok(())
@@ -249,6 +254,7 @@ pub async fn test_offset_reset_policy() -> TestResult {
         .set("enable.auto.commit", "false")
         .create()?;
 
+    let consumer_earliest = Member::new(consumer_earliest);
     consumer_earliest.subscribe(&[&topic.name])?;
 
     // Should receive existing message
@@ -274,6 +280,7 @@ pub async fn test_offset_reset_policy() -> TestResult {
         .set("enable.auto.commit", "false")
         .create()?;
 
+    let consumer_latest = Member::new(consumer_latest);
     consumer_latest.subscribe(&[&topic.name])?;
 
     // Wait for assignment
@@ -317,6 +324,11 @@ pub async fn test_offset_reset_policy() -> TestResult {
         _ => println!("  Note: Latest consumer didn't receive new message"),
     }
 
+    close_all(
+        vec![consumer_earliest.closing(), consumer_latest.closing()],
+        CLOSE_TIMEOUT,
+    )
+    .await?;
     ctx.cleanup().await?;
     println!("\n✅ Offset reset policy test PASSED\n");
     Ok(())
@@ -372,6 +384,7 @@ pub async fn test_offset_commit_multi_partition() -> TestResult {
         .set("enable.auto.commit", "false")
         .create()?;
 
+    let consumer = Member::new(consumer);
     consumer.subscribe(&[&topic.name])?;
     println!("  Consumer subscribed");
 
@@ -432,6 +445,7 @@ pub async fn test_offset_commit_multi_partition() -> TestResult {
         }
     }
 
+    consumer.close(CLOSE_TIMEOUT).await?;
     ctx.cleanup().await?;
     println!("\n✅ Offset commit multi-partition test PASSED\n");
     Ok(())
@@ -479,6 +493,7 @@ pub async fn test_offset_seek() -> TestResult {
         .set("enable.auto.commit", "false")
         .create()?;
 
+    let consumer = Member::new(consumer);
     consumer.subscribe(&[&topic.name])?;
     println!("  Consumer subscribed");
 
@@ -531,6 +546,7 @@ pub async fn test_offset_seek() -> TestResult {
         _ => println!("  Note: No message received after seek"),
     }
 
+    consumer.close(CLOSE_TIMEOUT).await?;
     ctx.cleanup().await?;
     println!("\n✅ Offset seek test PASSED\n");
     Ok(())

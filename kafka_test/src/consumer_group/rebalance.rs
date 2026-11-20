@@ -6,6 +6,7 @@
 //! - Remaining consumers receive new assignments
 
 use crate::common::{create_producer, TestResult};
+use crate::members::{Member, CLOSE_TIMEOUT};
 use crate::setup::TestContext;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
@@ -57,6 +58,7 @@ pub async fn test_rebalance_after_leave() -> TestResult {
         .set("auto.offset.reset", "earliest")
         .create()?;
 
+    let consumer1 = Member::new(consumer1);
     consumer1.subscribe(&[topic.as_str()])?;
     println!("✅ Consumer 1 subscribed");
 
@@ -87,7 +89,7 @@ pub async fn test_rebalance_after_leave() -> TestResult {
 
     // 3. Consumer 1 leaves group (triggers LeaveGroup API)
     println!("\nStep 3: Consumer 1 leaving group...");
-    drop(consumer1);
+    consumer1.close(CLOSE_TIMEOUT).await?;
     tokio::time::sleep(Duration::from_millis(500)).await;
     println!("✅ Consumer 1 left (LeaveGroup sent)");
 
@@ -102,6 +104,7 @@ pub async fn test_rebalance_after_leave() -> TestResult {
         .set("auto.offset.reset", "earliest")
         .create()?;
 
+    let consumer2 = Member::new(consumer2);
     consumer2.subscribe(&[topic.as_str()])?;
     println!("✅ Consumer 2 subscribed");
 
@@ -126,7 +129,7 @@ pub async fn test_rebalance_after_leave() -> TestResult {
     }
     println!("✅ Consumer 2 received {received2} messages");
 
-    drop(consumer2);
+    consumer2.close(CLOSE_TIMEOUT).await?;
 
     ctx.cleanup().await?;
     println!("\n✅ Rebalance after leave test PASSED\n");
@@ -178,6 +181,7 @@ pub async fn test_session_timeout_rebalance() -> TestResult {
         .set("auto.offset.reset", "earliest")
         .create()?;
 
+    let consumer1 = Member::new(consumer1);
     consumer1.subscribe(&[topic.as_str()])?;
 
     // Poll once to ensure membership is established
@@ -187,7 +191,7 @@ pub async fn test_session_timeout_rebalance() -> TestResult {
     // 3. Drop consumer (simulates crash - no LeaveGroup sent)
     // We drop without calling consumer.close() to simulate abrupt failure
     println!("\nStep 3: Simulating consumer crash (no LeaveGroup)...");
-    drop(consumer1);
+    consumer1.close(CLOSE_TIMEOUT).await?;
 
     // Note: In a real crash, the TCP connection would close without LeaveGroup
     // rdkafka may still send LeaveGroup on drop, but the timeout mechanism
@@ -209,6 +213,7 @@ pub async fn test_session_timeout_rebalance() -> TestResult {
         .set("auto.offset.reset", "earliest")
         .create()?;
 
+    let consumer2 = Member::new(consumer2);
     consumer2.subscribe(&[topic.as_str()])?;
     println!("✅ Consumer 2 subscribed successfully");
 
@@ -232,7 +237,7 @@ pub async fn test_session_timeout_rebalance() -> TestResult {
         }
     }
 
-    drop(consumer2);
+    consumer2.close(CLOSE_TIMEOUT).await?;
 
     ctx.cleanup().await?;
     println!("\n✅ Session timeout rebalance test PASSED\n");

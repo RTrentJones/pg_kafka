@@ -2,6 +2,7 @@
 
 use crate::common::{create_stream_consumer, TestResult};
 use crate::fixtures::TestTopicBuilder;
+use crate::members::{Member, CLOSE_TIMEOUT};
 use crate::setup::TestContext;
 use rdkafka::consumer::Consumer;
 use rdkafka::message::Message;
@@ -24,7 +25,7 @@ pub async fn test_produce_while_consuming() -> TestResult {
     let group_id = ctx.unique_group("simultaneous-group").await;
 
     // Start consumer
-    let consumer = create_stream_consumer(&group_id)?;
+    let consumer = Member::new(create_stream_consumer(&group_id)?);
     consumer.subscribe(&[&topic.name])?;
 
     let consumed_clone = consumed.clone();
@@ -39,6 +40,7 @@ pub async fn test_produce_while_consuming() -> TestResult {
                 consumed_clone.fetch_add(1, Ordering::SeqCst);
             }
         }
+        consumer
     });
 
     // Start producer (slight delay to let consumer set up)
@@ -69,7 +71,9 @@ pub async fn test_produce_while_consuming() -> TestResult {
 
     // Wait for both
     let _ = producer_handle.await;
-    let _ = consumer_handle.await;
+    if let Ok(consumer) = consumer_handle.await {
+        consumer.close(CLOSE_TIMEOUT).await?;
+    }
 
     let produced_count = produced.load(Ordering::SeqCst);
     let consumed_count = consumed.load(Ordering::SeqCst);
@@ -108,7 +112,7 @@ pub async fn test_consumer_catches_up() -> TestResult {
 
     // Now start consumer
     let group_id = ctx.unique_group("catch-up-group").await;
-    let consumer = create_stream_consumer(&group_id)?;
+    let consumer = Member::new(create_stream_consumer(&group_id)?);
     consumer.subscribe(&[&topic.name])?;
 
     let mut consumed = 0;
@@ -127,6 +131,7 @@ pub async fn test_consumer_catches_up() -> TestResult {
     println!("   Consumer caught up, received: {consumed}");
     assert!(consumed >= 8, "Should consume at least 8 of 10 messages");
     println!("✅ Consumer successfully caught up");
+    consumer.close(CLOSE_TIMEOUT).await?;
 
     ctx.cleanup().await?;
     println!("\n✅ Consumer catches up test PASSED\n");

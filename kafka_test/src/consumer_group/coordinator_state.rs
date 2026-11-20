@@ -9,6 +9,7 @@
 
 use crate::common::{create_producer, get_bootstrap_servers, TestResult};
 use crate::fixtures::TestTopicBuilder;
+use crate::members::{close_all, Member, CLOSE_TIMEOUT};
 use crate::setup::TestContext;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
@@ -57,6 +58,7 @@ pub async fn test_find_coordinator_bootstrap() -> TestResult {
         .set("enable.auto.commit", "false")
         .create()?;
 
+    let consumer = Member::new(consumer);
     consumer.subscribe(&[&topic.name])?;
     println!("  Consumer subscribed (FindCoordinator called internally)");
 
@@ -97,6 +99,7 @@ pub async fn test_find_coordinator_bootstrap() -> TestResult {
         .await?;
     println!("  Group has committed offsets: {}", group_offsets.is_some());
 
+    consumer.close(CLOSE_TIMEOUT).await?;
     ctx.cleanup().await?;
     println!("\n✅ FindCoordinator bootstrap test PASSED\n");
     Ok(())
@@ -158,7 +161,7 @@ pub async fn test_partition_assignment_strategies() -> TestResult {
             .create()?;
 
         consumer.subscribe(&[&topic.name])?;
-        consumers.push(consumer);
+        consumers.push(Member::new(consumer));
         println!("  Consumer {} created with strategy '{}'", i + 1, strategy);
 
         // Small delay to allow sequential joins
@@ -201,6 +204,11 @@ pub async fn test_partition_assignment_strategies() -> TestResult {
         "At least one consumer should receive messages"
     );
 
+    close_all(
+        consumers.into_iter().map(Member::closing).collect(),
+        CLOSE_TIMEOUT,
+    )
+    .await?;
     ctx.cleanup().await?;
     println!("\n✅ Partition assignment strategies test PASSED\n");
     Ok(())
@@ -248,6 +256,7 @@ pub async fn test_leave_during_rebalance() -> TestResult {
         .set("enable.auto.commit", "false")
         .create()?;
 
+    let consumer1 = Member::new(consumer1);
     consumer1.subscribe(&[&topic.name])?;
     println!("  Consumer 1 subscribed");
 
@@ -265,13 +274,14 @@ pub async fn test_leave_during_rebalance() -> TestResult {
         .set("enable.auto.commit", "false")
         .create()?;
 
+    let consumer2 = Member::new(consumer2);
     consumer2.subscribe(&[&topic.name])?;
     println!("  Consumer 2 subscribed");
 
     // Quickly drop consumer 1 during rebalance
     println!("\nStep 4: Consumer 1 leaving during rebalance...");
     tokio::time::sleep(Duration::from_millis(200)).await;
-    drop(consumer1);
+    consumer1.close(CLOSE_TIMEOUT).await?;
     println!("  Consumer 1 left");
 
     // Wait for group to stabilize
@@ -294,6 +304,7 @@ pub async fn test_leave_during_rebalance() -> TestResult {
         }
     }
 
+    consumer2.close(CLOSE_TIMEOUT).await?;
     ctx.cleanup().await?;
     println!("\n✅ Leave during rebalance test PASSED\n");
     Ok(())
@@ -345,6 +356,7 @@ pub async fn test_heartbeat_keeps_membership() -> TestResult {
         .set("enable.auto.commit", "false")
         .create()?;
 
+    let consumer = Member::new(consumer);
     consumer.subscribe(&[&topic.name])?;
     println!("  Consumer subscribed");
 
@@ -389,6 +401,7 @@ pub async fn test_heartbeat_keeps_membership() -> TestResult {
     // Should have received at least some messages
     assert!(received >= 1, "Should receive at least 1 message");
 
+    consumer.close(CLOSE_TIMEOUT).await?;
     ctx.cleanup().await?;
     println!("\n✅ Heartbeat keeps membership test PASSED\n");
     Ok(())
@@ -441,6 +454,7 @@ pub async fn test_group_state_transitions() -> TestResult {
         .set("enable.auto.commit", "false")
         .create()?;
 
+    let consumer1 = Member::new(consumer1);
     consumer1.subscribe(&[&topic.name])?;
     println!("  Consumer 1 subscribed");
 
@@ -466,7 +480,7 @@ pub async fn test_group_state_transitions() -> TestResult {
 
     // Drop consumer (triggers leave, state: Stable → Empty)
     println!("\nStep 4: Consumer 1 leaving group...");
-    drop(consumer1);
+    consumer1.close(CLOSE_TIMEOUT).await?;
     tokio::time::sleep(Duration::from_millis(500)).await;
     println!("  Consumer 1 left");
 
@@ -481,6 +495,7 @@ pub async fn test_group_state_transitions() -> TestResult {
         .set("enable.auto.commit", "false")
         .create()?;
 
+    let consumer2 = Member::new(consumer2);
     consumer2.subscribe(&[&topic.name])?;
     println!("  Consumer 2 subscribed");
 
@@ -510,6 +525,7 @@ pub async fn test_group_state_transitions() -> TestResult {
         "At least one consumer should receive messages"
     );
 
+    consumer2.close(CLOSE_TIMEOUT).await?;
     ctx.cleanup().await?;
     println!("\n✅ Group state transitions test PASSED\n");
     Ok(())

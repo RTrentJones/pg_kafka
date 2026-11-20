@@ -8,6 +8,7 @@
 
 use crate::common::to_i32;
 use crate::common::{get_bootstrap_servers, TestResult};
+use crate::members::{Member, CLOSE_TIMEOUT};
 use crate::setup::TestContext;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
@@ -84,6 +85,7 @@ pub async fn test_large_value_compression() -> TestResult {
     // 3. Consume and verify
     println!("Step 3: Consuming message...");
     let consumer = create_consumer(&group)?;
+    let consumer = Member::new(consumer);
     consumer.subscribe(&[&topic])?;
 
     let mut received_value: Option<String> = None;
@@ -130,6 +132,7 @@ pub async fn test_large_value_compression() -> TestResult {
     // Note: pg_kafka stores decompressed values in the database
     println!("✅ Database verification complete\n");
 
+    consumer.close(CLOSE_TIMEOUT).await?;
     ctx.cleanup().await?;
     println!("✅ Test: Large Value Compression PASSED\n");
     Ok(())
@@ -204,6 +207,7 @@ pub async fn test_compression_mixed_formats() -> TestResult {
     // 3. Consume all messages
     println!("Step 3: Consuming all messages...");
     let consumer = create_consumer(&group)?;
+    let consumer = Member::new(consumer);
     consumer.subscribe(&[&topic])?;
 
     let mut received_messages: Vec<String> = Vec::new();
@@ -249,6 +253,7 @@ pub async fn test_compression_mixed_formats() -> TestResult {
     assert_eq!(count, 4, "Expected 4 messages in database");
     println!("✅ Database confirms {count} messages\n");
 
+    consumer.close(CLOSE_TIMEOUT).await?;
     ctx.cleanup().await?;
     println!("✅ Test: Mixed Compression Formats PASSED\n");
     Ok(())
@@ -288,6 +293,7 @@ pub async fn test_compression_ratio_verification() -> TestResult {
     // 3. Consume and verify roundtrip
     println!("Step 3: Consuming message...");
     let consumer = create_consumer(&group)?;
+    let consumer = Member::new(consumer);
     consumer.subscribe(&[&topic])?;
 
     let mut received = false;
@@ -321,6 +327,7 @@ pub async fn test_compression_ratio_verification() -> TestResult {
     println!("   Compression happens on the wire protocol only");
     println!("   This is intentional for query-ability\n");
 
+    consumer.close(CLOSE_TIMEOUT).await?;
     ctx.cleanup().await?;
     println!("✅ Test: Compression Ratio Verification PASSED\n");
     Ok(())
@@ -362,6 +369,7 @@ pub async fn test_compression_incompressible_data() -> TestResult {
     // 3. Consume and verify
     println!("Step 3: Consuming message...");
     let consumer = create_consumer(&group)?;
+    let consumer = Member::new(consumer);
     consumer.subscribe(&[&topic])?;
 
     let mut received_data: Option<String> = None;
@@ -384,6 +392,7 @@ pub async fn test_compression_incompressible_data() -> TestResult {
     assert_eq!(received, data, "Content should match original");
     println!("✅ Incompressible data roundtrip verified\n");
 
+    consumer.close(CLOSE_TIMEOUT).await?;
     ctx.cleanup().await?;
     println!("✅ Test: Compression with Incompressible Data PASSED\n");
     Ok(())
@@ -426,6 +435,7 @@ pub async fn test_compression_small_message_overhead() -> TestResult {
     // 3. Consume and verify
     println!("Step 3: Consuming message...");
     let consumer = create_consumer(&group)?;
+    let consumer = Member::new(consumer);
     consumer.subscribe(&[&topic])?;
 
     let mut received_msg: Option<String> = None;
@@ -466,6 +476,7 @@ pub async fn test_compression_small_message_overhead() -> TestResult {
     );
     println!("✅ Database stores original size: {stored_len} bytes\n");
 
+    consumer.close(CLOSE_TIMEOUT).await?;
     ctx.cleanup().await?;
     println!("✅ Test: Small Message Compression Overhead PASSED\n");
     Ok(())

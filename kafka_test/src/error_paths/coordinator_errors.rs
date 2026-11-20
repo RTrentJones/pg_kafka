@@ -6,6 +6,7 @@
 use crate::assertions::{assert_no_committed_offset, assert_offset_committed};
 use crate::common::{create_stream_consumer, TestResult};
 use crate::fixtures::{generate_messages, TestTopicBuilder};
+use crate::members::{close_all, Member, CLOSE_TIMEOUT};
 use crate::setup::TestContext;
 use rdkafka::consumer::Consumer;
 use std::time::Duration;
@@ -29,6 +30,7 @@ pub async fn test_heartbeat_after_leave() -> TestResult {
     let consumer = create_stream_consumer(&group_id)?;
 
     println!("Subscribing consumer to topic...");
+    let consumer = Member::new(consumer);
     consumer.subscribe(&[&topic.name])?;
 
     // Poll to join the group and consume. With auto.offset.reset=earliest and 3 pre-produced
@@ -41,7 +43,7 @@ pub async fn test_heartbeat_after_leave() -> TestResult {
     }
 
     println!("Consumer joined group (received {received}), now dropping (LeaveGroup)...");
-    drop(consumer);
+    consumer.close(CLOSE_TIMEOUT).await?;
 
     // Small delay for LeaveGroup to process
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -75,6 +77,7 @@ pub async fn test_rejoin_after_leave() -> TestResult {
     // First consumer
     println!("Creating first consumer...");
     let consumer1 = create_stream_consumer(&group_id)?;
+    let consumer1 = Member::new(consumer1);
     consumer1.subscribe(&[&topic.name])?;
 
     // Poll to join
@@ -83,13 +86,14 @@ pub async fn test_rejoin_after_leave() -> TestResult {
     }
 
     println!("First consumer joined, leaving...");
-    drop(consumer1);
+    consumer1.close(CLOSE_TIMEOUT).await?;
 
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Second consumer with same group ID
     println!("Creating second consumer with same group ID...");
     let consumer2 = create_stream_consumer(&group_id)?;
+    let consumer2 = Member::new(consumer2);
     consumer2.subscribe(&[&topic.name])?;
 
     // Poll to verify rejoin works
@@ -114,6 +118,7 @@ pub async fn test_rejoin_after_leave() -> TestResult {
 
     println!("Second consumer received {received} messages after rejoining");
 
+    consumer2.close(CLOSE_TIMEOUT).await?;
     ctx.cleanup().await?;
     // QA-3: the first consumer left without committing (auto-commit off), so a second consumer in the
     // same group must rejoin and, starting from earliest, consume the still-available messages.
@@ -199,7 +204,9 @@ pub async fn test_empty_group_id() -> TestResult {
     // QA-3: group membership requires a group.id, so an empty one must be rejected — either at
     // create or at subscribe. It must never yield a consumer that successfully subscribes to a
     // consumer group.
-    let subscribe_succeeded = match result {
+    // The consumer is closed off this thread when dropped: its close is no part of what this
+    // test checks.
+    let subscribe_succeeded = match result.map(Member::new) {
         Ok(consumer) => {
             println!("Consumer created with empty group ID, trying to subscribe...");
             match consumer.subscribe(&[&topic.name]) {
@@ -247,6 +254,7 @@ pub async fn test_multiple_consumers_same_group() -> TestResult {
 
     println!("Creating first consumer...");
     let consumer1 = create_stream_consumer(&group_id)?;
+    let consumer1 = Member::new(consumer1);
     consumer1.subscribe(&[&topic.name])?;
 
     // Let first consumer join
@@ -256,6 +264,7 @@ pub async fn test_multiple_consumers_same_group() -> TestResult {
 
     println!("Creating second consumer (triggers rebalance)...");
     let consumer2 = create_stream_consumer(&group_id)?;
+    let consumer2 = Member::new(consumer2);
     consumer2.subscribe(&[&topic.name])?;
 
     // Let both consumers participate
@@ -283,6 +292,11 @@ pub async fn test_multiple_consumers_same_group() -> TestResult {
 
     println!("   Consumer 1 received: {c1_received}, Consumer 2 received: {c2_received}");
 
+    close_all(
+        vec![consumer1.closing(), consumer2.closing()],
+        CLOSE_TIMEOUT,
+    )
+    .await?;
     ctx.cleanup().await?;
     // QA-3: two consumers in one group over a 2-partition topic with 10 earliest messages must,
     // between them, actually consume something — a rebalance that delivered nothing to either member

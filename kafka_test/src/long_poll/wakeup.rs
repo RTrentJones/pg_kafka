@@ -3,6 +3,7 @@
 //! Tests for producer waking up waiting consumers.
 
 use crate::common::{create_producer, get_bootstrap_servers, TestResult};
+use crate::members::{Member, CLOSE_TIMEOUT};
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::message::Message;
@@ -47,6 +48,7 @@ pub async fn test_long_poll_producer_wakeup() -> TestResult {
         .set("enable.auto.commit", "false")
         .create()?;
 
+    let consumer = Member::new(consumer);
     consumer.subscribe(&[&topic])?;
     println!("   Consumer subscribed");
 
@@ -60,35 +62,39 @@ pub async fn test_long_poll_producer_wakeup() -> TestResult {
 
     // Spawn consumer task
     let consumer_handle = tokio::spawn(async move {
-        println!("\nStep 3: Consumer waiting for message...");
-        let start = Instant::now();
+        let elapsed = async {
+            println!("\nStep 3: Consumer waiting for message...");
+            let start = Instant::now();
 
-        // Poll with long timeout (will be interrupted by producer)
-        loop {
-            if start.elapsed() > Duration::from_secs(10) {
-                println!("   Consumer timeout after 10s");
-                break;
-            }
+            // Poll with long timeout (will be interrupted by producer)
+            loop {
+                if start.elapsed() > Duration::from_secs(10) {
+                    println!("   Consumer timeout after 10s");
+                    break;
+                }
 
-            match tokio::time::timeout(Duration::from_millis(100), consumer.recv()).await {
-                Ok(Ok(msg)) => {
-                    let elapsed = start.elapsed();
-                    let value = msg
-                        .payload()
-                        .map(|v| String::from_utf8_lossy(v).to_string());
-                    if value.as_deref() == Some("wakeup-message") {
-                        println!("   ✅ Consumer received wakeup message in {elapsed:?}");
-                        received_clone.store(true, Ordering::SeqCst);
-                        return elapsed;
+                match tokio::time::timeout(Duration::from_millis(100), consumer.recv()).await {
+                    Ok(Ok(msg)) => {
+                        let elapsed = start.elapsed();
+                        let value = msg
+                            .payload()
+                            .map(|v| String::from_utf8_lossy(v).to_string());
+                        if value.as_deref() == Some("wakeup-message") {
+                            println!("   ✅ Consumer received wakeup message in {elapsed:?}");
+                            received_clone.store(true, Ordering::SeqCst);
+                            return elapsed;
+                        }
                     }
+                    Ok(Err(e)) => {
+                        println!("   Consumer error: {e}");
+                    }
+                    Err(_) => {} // Timeout, keep polling
                 }
-                Ok(Err(e)) => {
-                    println!("   Consumer error: {e}");
-                }
-                Err(_) => {} // Timeout, keep polling
             }
+            start.elapsed()
         }
-        start.elapsed()
+        .await;
+        (elapsed, consumer)
     });
 
     // Wait a bit then produce
@@ -106,7 +112,8 @@ pub async fn test_long_poll_producer_wakeup() -> TestResult {
     println!("   Message produced");
 
     // Wait for consumer
-    let consumer_duration = consumer_handle.await?;
+    let (consumer_duration, consumer) = consumer_handle.await?;
+    consumer.close(CLOSE_TIMEOUT).await?;
     let total_duration = consumer_start.elapsed();
 
     println!("\nStep 5: Verifying timing...");
@@ -165,6 +172,7 @@ pub async fn test_long_poll_multiple_waiters() -> TestResult {
         .set("enable.auto.commit", "false")
         .create()?;
 
+    let consumer = Member::new(consumer);
     consumer.subscribe(&[&topic])?;
     println!("   Consumer subscribed");
 
@@ -225,6 +233,7 @@ pub async fn test_long_poll_multiple_waiters() -> TestResult {
         "Should receive at least 2 of 3 messages, got {received}"
     );
     println!("   Received {received} messages");
+    consumer.close(CLOSE_TIMEOUT).await?;
 
     println!("\n✅ Long poll sequential operations test PASSED\n");
     Ok(())

@@ -4,6 +4,7 @@ use crate::common::DynResult;
 use crate::common::{create_db_client, get_bootstrap_servers, TestResult};
 use crate::error_codes;
 use crate::fixtures::produce_one;
+use crate::members::{close_all, Member, CLOSE_TIMEOUT};
 use crate::setup::TestContext;
 use crate::wire::requests::{
     conn, delete_group, describe, join_now, join_req, leave, list_groups, sync_leader,
@@ -114,6 +115,7 @@ pub async fn test_join_with_no_common_assignor_is_refused() -> TestResult {
             .create()?)
     };
     let a = make("range")?;
+    let a = Member::new(a);
     a.subscribe(&[&topic])?;
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut got = false;
@@ -125,6 +127,7 @@ pub async fn test_join_with_no_common_assignor_is_refused() -> TestResult {
     assert_eq!((state.as_str(), members), ("Stable", 1));
 
     let b = make("cooperative-sticky")?;
+    let b = Member::new(b);
     b.subscribe(&[&topic])?;
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut refused = false;
@@ -155,8 +158,7 @@ pub async fn test_join_with_no_common_assignor_is_refused() -> TestResult {
         again = matches!(a.poll(Duration::from_millis(300)), Some(Ok(_)));
     }
     assert!(again, "A keeps consuming");
-    drop(b);
-    drop(a);
+    close_all(vec![b.closing(), a.closing()], CLOSE_TIMEOUT).await?;
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");
     Ok(())
@@ -183,6 +185,7 @@ pub async fn test_offsets_only_group_is_listed_after_restart() -> TestResult {
             .set("auto.offset.reset", "earliest")
             .set("session.timeout.ms", "10000")
             .create()?;
+        let consumer = Member::new(consumer);
         consumer.subscribe(&[&topic])?;
         let deadline = Instant::now() + Duration::from_secs(30);
         let mut got = false;
@@ -196,7 +199,9 @@ pub async fn test_offsets_only_group_is_listed_after_restart() -> TestResult {
         tpl.add_partition_offset(&topic, 0, rdkafka::Offset::Offset(1))?;
         consumer.commit(&tpl, rdkafka::consumer::CommitMode::Sync)?;
         consumer.unsubscribe();
-    } // dropped: leaves the group
+        // Leaves the group before the restart.
+        consumer.close(CLOSE_TIMEOUT).await?;
+    }
 
     let db = create_db_client().await?;
     crate::auth::restart_listener(&db, &[], &[]).await?;

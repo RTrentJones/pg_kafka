@@ -4,6 +4,7 @@
 
 use crate::common::TestResult;
 use crate::fixtures::TestTopicBuilder;
+use crate::members::{close_all, Member, CLOSE_TIMEOUT};
 use crate::setup::TestContext;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
@@ -196,7 +197,9 @@ pub async fn test_invalid_group_id() -> TestResult {
     // QA-3: an empty group.id is invalid — it must never end up consuming a message. We don't pin
     // *where* it's rejected (librdkafka may reject at create, at subscribe, or just never deliver),
     // only that the invalid configuration cannot silently behave like a valid consumer.
-    let consumed_with_empty_group = match consumer_result {
+    // The consumer is closed off this thread when dropped: its close is no part of what this
+    // test checks.
+    let consumed_with_empty_group = match consumer_result.map(Member::new) {
         Err(e) => {
             println!("   Consumer creation rejected empty group.id (expected): {e}");
             false
@@ -246,6 +249,7 @@ pub async fn test_duplicate_consumer_join() -> TestResult {
         .set("session.timeout.ms", "6000")
         .create()?;
 
+    let consumer1 = Member::new(consumer1);
     consumer1.subscribe(&[&topic.name])?;
     println!("   Consumer 1 joined group: {group_id}");
 
@@ -260,6 +264,7 @@ pub async fn test_duplicate_consumer_join() -> TestResult {
         .set("session.timeout.ms", "6000")
         .create()?;
 
+    let consumer2 = Member::new(consumer2);
     consumer2.subscribe(&[&topic.name])?;
     println!("   Consumer 2 joined same group");
 
@@ -278,6 +283,11 @@ pub async fn test_duplicate_consumer_join() -> TestResult {
     let (ok1, ok2) = (has_topic(&sub1), has_topic(&sub2));
     println!("   subscriptions after rejoin: consumer1={ok1}, consumer2={ok2}");
 
+    close_all(
+        vec![consumer1.closing(), consumer2.closing()],
+        CLOSE_TIMEOUT,
+    )
+    .await?;
     ctx.cleanup().await?;
     if !ok1 || !ok2 {
         return Err("both members must stay subscribed after the rejoin".into());

@@ -2,6 +2,7 @@
 
 use crate::common::{create_stream_consumer, TestResult};
 use crate::fixtures::{generate_messages, TestTopicBuilder};
+use crate::members::{close_all, Member, CLOSE_TIMEOUT};
 use crate::setup::TestContext;
 use rdkafka::consumer::Consumer;
 use std::time::Duration;
@@ -23,6 +24,8 @@ pub async fn test_multiple_consumer_groups() -> TestResult {
     let consumer1 = create_stream_consumer(&group1)?;
     let consumer2 = create_stream_consumer(&group2)?;
 
+    let consumer2 = Member::new(consumer2);
+    let consumer1 = Member::new(consumer1);
     consumer1.subscribe(&[&topic.name])?;
     consumer2.subscribe(&[&topic.name])?;
 
@@ -53,6 +56,11 @@ pub async fn test_multiple_consumer_groups() -> TestResult {
     assert!(c2_count >= 3, "Group 2 should receive at least 3 messages");
     println!("✅ Both consumer groups received messages independently");
 
+    close_all(
+        vec![consumer1.closing(), consumer2.closing()],
+        CLOSE_TIMEOUT,
+    )
+    .await?;
     ctx.cleanup().await?;
     println!("\n✅ Multiple consumer groups test PASSED\n");
     Ok(())
@@ -76,6 +84,8 @@ pub async fn test_consumer_group_two_members() -> TestResult {
     let consumer1 = create_stream_consumer(&group_id)?;
     let consumer2 = create_stream_consumer(&group_id)?;
 
+    let consumer2 = Member::new(consumer2);
+    let consumer1 = Member::new(consumer1);
     consumer1.subscribe(&[&topic.name])?;
     consumer2.subscribe(&[&topic.name])?;
 
@@ -105,6 +115,11 @@ pub async fn test_consumer_group_two_members() -> TestResult {
     assert!(total >= 5, "Combined should receive at least 5 messages");
     println!("✅ Two consumers in same group working");
 
+    close_all(
+        vec![consumer1.closing(), consumer2.closing()],
+        CLOSE_TIMEOUT,
+    )
+    .await?;
     ctx.cleanup().await?;
     println!("\n✅ Consumer group two members test PASSED\n");
     Ok(())
@@ -124,6 +139,7 @@ pub async fn test_consumer_rejoin_after_leave() -> TestResult {
 
     // First consumer
     let consumer1 = create_stream_consumer(&group_id)?;
+    let consumer1 = Member::new(consumer1);
     consumer1.subscribe(&[&topic.name])?;
 
     let mut first_count = 0;
@@ -137,12 +153,13 @@ pub async fn test_consumer_rejoin_after_leave() -> TestResult {
     }
 
     println!("   First consumer received: {first_count}");
-    drop(consumer1);
+    consumer1.close(CLOSE_TIMEOUT).await?;
 
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Second consumer with same group
     let consumer2 = create_stream_consumer(&group_id)?;
+    let consumer2 = Member::new(consumer2);
     consumer2.subscribe(&[&topic.name])?;
 
     let mut second_count = 0;
@@ -157,6 +174,7 @@ pub async fn test_consumer_rejoin_after_leave() -> TestResult {
     println!("   Second consumer (rejoin) received: {second_count}");
     println!("✅ Consumer successfully rejoined group");
 
+    consumer2.close(CLOSE_TIMEOUT).await?;
     ctx.cleanup().await?;
     println!("\n✅ Consumer rejoin after leave test PASSED\n");
     Ok(())
