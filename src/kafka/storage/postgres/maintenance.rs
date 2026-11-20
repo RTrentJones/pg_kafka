@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use super::producers::{bump_producer_epoch, clear_producer_sequences};
+use super::producers::{bump_producer_epoch, reset_producer_sequences};
 use super::{internal, PostgresStore};
 use crate::kafka::error::{KafkaError, Result};
 use crate::kafka::storage::retention::{
@@ -291,7 +291,7 @@ impl PostgresStore {
                     producer_epoch
                 };
                 // The new epoch (or id) restarts sequence numbers.
-                clear_producer_sequences(client, producer_id)?;
+                reset_producer_sequences(client, producer_id)?;
                 client.update(
                     "UPDATE kafka.transactions
                      SET state = 'CompleteAbort', producer_epoch = $2, last_updated_at = NOW()
