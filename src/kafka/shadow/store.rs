@@ -108,6 +108,12 @@ pub struct ShadowMetrics {
 /// How often the worker's outbox tick runs when nothing asked for an earlier one.
 pub const OUTBOX_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
+/// Least time between two outbox ticks, even when one is requested at once: a
+/// requested tick that finds the same rows due again (answered without being
+/// sent, say) then costs at most 200 claims a second instead of the whole DB
+/// thread, and a backlog still drains at up to 200 batches a second.
+pub const OUTBOX_MIN_TICK_SPACING: Duration = Duration::from_millis(5);
+
 /// Max forwards outstanding at once (dispatched, ack not yet applied). The poll
 /// claims no more than the remaining room, so the forward channel (capacity
 /// 10 000, see `worker::network`) never fills with records and a sync hold always finds
@@ -173,6 +179,11 @@ pub struct ShadowStore<S: KafkaStore, D: ShadowDb = SpiShadowDb> {
     /// Set when the outbox tick should run at the next loop iteration instead of
     /// waiting `OUTBOX_POLL_INTERVAL` (sync rows committed, a full claim).
     poll_requested: AtomicBool,
+    /// The last [`drain_forward_acks`](Self::drain_forward_acks) took acks and
+    /// every one was `NotAttempted`: the forwarder is answering without sending
+    /// (fenced partitions, shadow mode off on the network thread), so a claim
+    /// that leaves rows due does not ask for the next tick at once.
+    acks_only_not_attempted: AtomicBool,
     /// Consecutive failed outbox ticks and the pause they imposed.
     outbox_failures: Mutex<TickFailures>,
     /// Acks taken off the channel and not yet applied for good. They stay here
@@ -248,6 +259,7 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
             current_slot: AtomicU64::new(0),
             sync_pending: Mutex::new(Vec::new()),
             poll_requested: AtomicBool::new(false),
+            acks_only_not_attempted: AtomicBool::new(false),
             outbox_failures: Mutex::new(TickFailures::default()),
             unapplied_acks: Mutex::new(Vec::new()),
             staged_acks: Mutex::new(None),
@@ -566,17 +578,37 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
     }
 
     /// Whether the worker's outbox tick should run now, `since_last` after the
-    /// previous one: every `OUTBOX_POLL_INTERVAL`, at once when requested, and
-    /// never during a failure backoff. With `Duration::ZERO`: whether a tick is
-    /// wanted at once, so the worker should not wait for requests first.
+    /// previous one: every `OUTBOX_POLL_INTERVAL`, when requested as soon as
+    /// `OUTBOX_MIN_TICK_SPACING` has passed, and never during a failure backoff.
     pub fn outbox_tick_due(&self, since_last: Duration) -> bool {
-        if lock(&self.outbox_failures)
-            .paused_until
-            .is_some_and(|until| Instant::now() < until)
-        {
+        if self.outbox_paused() {
             return false;
         }
-        self.poll_requested.load(Ordering::Relaxed) || since_last >= OUTBOX_POLL_INTERVAL
+        (self.poll_requested.load(Ordering::Relaxed) && since_last >= OUTBOX_MIN_TICK_SPACING)
+            || since_last >= OUTBOX_POLL_INTERVAL
+    }
+
+    /// How long the worker may wait for requests, `since_last` after the
+    /// previous tick, before a requested tick is due: `None` when no tick is
+    /// requested (or the tick is paused), so the worker's usual wait applies.
+    pub fn outbox_requested_wait(&self, since_last: Duration) -> Option<Duration> {
+        (self.poll_requested.load(Ordering::Relaxed) && !self.outbox_paused())
+            .then(|| OUTBOX_MIN_TICK_SPACING.saturating_sub(since_last))
+    }
+
+    fn outbox_paused(&self) -> bool {
+        lock(&self.outbox_failures)
+            .paused_until
+            .is_some_and(|until| Instant::now() < until)
+    }
+
+    /// Ask for the next tick at once, unless the forwarder answered the last
+    /// drained acks without sending any: the rows it gave back are due again,
+    /// and an immediate tick would only claim them again.
+    fn request_poll(&self) {
+        if !self.acks_only_not_attempted.load(Ordering::Relaxed) {
+            self.poll_requested.store(true, Ordering::Relaxed);
+        }
     }
 
     /// Record how an outbox tick ended. A failure pauses the tick exponentially
@@ -651,6 +683,12 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
                 return Ok(0);
             }
         }
+        // The forwarder answers every record NotAttempted without an external
+        // broker, which leaves it due again: claiming it would only churn the
+        // outbox. The rows wait, and go out once the broker is configured.
+        if !self.db.forwarding_configured() {
+            return Ok(0);
+        }
 
         let settings = self.db.settings();
         let room = MAX_INFLIGHT.saturating_sub(self.inflight.len());
@@ -707,7 +745,7 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
         // refused rows: an immediate poll would claim them again and spin
         // (the worker skips its receive wait while a poll is requested).
         if more_due && not_sent.is_empty() {
-            self.poll_requested.store(true, Ordering::Relaxed);
+            self.request_poll();
         }
         Ok(dispatched)
     }
@@ -739,8 +777,15 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
             }
             unapplied.clone()
         };
+        self.acks_only_not_attempted.store(
+            !acks.is_empty()
+                && acks
+                    .iter()
+                    .all(|ack| matches!(ack.outcome, ForwardOutcome::NotAttempted(_))),
+            Ordering::Relaxed,
+        );
         if acks.len() >= MAX_ACKS_PER_TICK {
-            self.poll_requested.store(true, Ordering::Relaxed);
+            self.request_poll();
         }
         // Reached only when no statement raised an ERROR.
         let staged = self.apply_acks(&acks);

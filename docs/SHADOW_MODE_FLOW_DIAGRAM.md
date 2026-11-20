@@ -27,7 +27,7 @@ commit (group commit)
    sync produce: response handed over ──Hold──────────▶ forwarder holds it until its records
    (other responses released at once)                   are delivered or shadow_sync_timeout_ms
 
-outbox tick (every 250 ms, or at once after a full
+outbox tick (every 250 ms, or 5 ms after the last one after a full
 claim / committed sync rows; backs off after failures)
    1. drain_forward_acks: apply acks in batches  ◀──ForwardAck── delivery reports (never dropped)
    2. poll_and_forward_outbox: claim ≤ batch_size ──ForwardRecord─▶ fence check → librdkafka
@@ -96,7 +96,7 @@ producer sent none, which is what local consumers see). `partition` is left to t
 The records of one local partition reach the external topic in local-offset order (the first copy
 of each; see duplicates below). That rests on:
 
-1. **The claim.** Each claim takes up to an equal share of `shadow_batch_size` from every partition with a row due (its lowest due offsets; partitions holding only dead letters or rows in flight or backing off take no share), round-robin across partitions, and dispatches them in row-key order over one FIFO channel. A claim that leaves rows due is followed by the next one at once. A row is
+1. **The claim.** Each claim takes up to an equal share of `shadow_batch_size` from every partition with a row due (its lowest due offsets; partitions holding only dead letters or rows in flight or backing off take no share), round-robin across partitions, and dispatches them in row-key order over one FIFO channel. A claim that leaves rows due is followed by the next one at once (5 ms at the earliest). A row is
    never claimed behind an earlier row of its partition that is backing off after a failure.
 2. **The producer.** `enable.idempotence=true`, `acks=all`, `max.in.flight.requests.per.connection=5`
    keep the order on the wire through librdkafka's own retries. `enable.gapless.guarantee=true`
@@ -189,7 +189,12 @@ in this worker, whose message still exists, that are not backing off (failed, at
 backing-off row of their partition below them. It opens their attempts and returns payload, headers,
 timestamp, external topic name and the `restart` flag. It reads the pending index up to the limit
 (O(limit), not O(backlog)); the first backing-off row per partition comes from the small partial
-index `idx_shadow_tracking_retrying`. A full claim requests another tick at once.
+index `idx_shadow_tracking_retrying`. A full claim requests another tick at once (at least 5 ms after
+the last), unless every ack the tick applied was `NotAttempted`: the forwarder is answering without
+sending, and the rows it gave back are due again at once, so an immediate tick would only claim them
+again. While `pg_kafka.shadow_bootstrap_servers` is empty nothing is claimed at all (the forwarder
+would answer every record `NotAttempted`): produces keep writing outbox rows, and they are forwarded
+once a broker is configured.
 
 Acks are applied in three statements per tick (delivered, failed, not attempted). Delivered sets
 `external_offset` and counts `messages_forwarded` once per row (a duplicate ack matches nothing).

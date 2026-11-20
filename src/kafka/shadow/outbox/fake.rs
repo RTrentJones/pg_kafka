@@ -52,6 +52,9 @@ pub struct FakeMetrics {
 pub struct State {
     pub enabled: bool,
     pub strict: bool,
+    /// `pg_kafka.shadow_bootstrap_servers` is empty (`forwarding_configured`
+    /// is false).
+    pub bootstrap_unset: bool,
     pub settings: OutboxSettings,
     pub now_ms: i64,
     /// topic_id -> local topic name
@@ -274,6 +277,10 @@ impl ShadowDb for InMemoryShadowDb {
 
     fn external_primary_strict(&self) -> bool {
         self.state().strict
+    }
+
+    fn forwarding_configured(&self) -> bool {
+        !self.state().bootstrap_unset
     }
 
     fn settings(&self) -> OutboxSettings {
