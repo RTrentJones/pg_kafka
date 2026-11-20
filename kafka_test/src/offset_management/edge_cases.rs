@@ -204,6 +204,8 @@ pub async fn test_fetch_offset_new_group() -> TestResult {
         _ => println!("  Note: No message received"),
     }
 
+    // A fetched message holds its partition in librdkafka, whose destroy waits for it.
+    drop(msg);
     consumer.close(CLOSE_TIMEOUT).await?;
     ctx.cleanup().await?;
     println!("\n✅ Fetch offset from new group test PASSED\n");

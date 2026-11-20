@@ -18,6 +18,12 @@
 //! a deadline. A member dropped without being closed (a failed assertion, an early
 //! return) is closed off the test's thread.
 //!
+//! A message fetched from a member must be dropped before the member is closed: the
+//! message keeps its partition referenced, and librdkafka's destroy (the last step of
+//! the close) waits until it is released. The compiler does not catch one held too long
+//! (`BorrowedMessage` has no drop of its own, so its borrow of the consumer ends at its
+//! last use), but the close then fails at its deadline.
+//!
 //! [`GroupMember`] is a member for tests that need a Stable member at a known point: a
 //! `BaseConsumer` the test drives itself, whose join waits until its assignment is
 //! applied and whose close is bounded, and whose failures report the consumer's
