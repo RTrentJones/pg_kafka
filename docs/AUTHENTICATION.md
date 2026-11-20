@@ -95,7 +95,10 @@ the exposed listener's slots; use a firewall or a proxy in front of it for that.
 On a `SASL_PLAINTEXT` or `SASL_SSL` listener a client must authenticate before it can do
 anything: until SaslAuthenticate succeeds, only ApiVersions, SaslHandshake and
 SaslAuthenticate are processed, and any other request closes the connection without a
-response (as Kafka does).
+response (as Kafka does). Before authentication the network thread answers ApiVersions
+itself, as Kafka's authenticator does, so an unauthenticated client never puts work on
+the database thread; only its credential lookup does (rate-limited, below). After
+authentication ApiVersions is served by the database thread like any other request.
 
 * **SaslHandshake** v1. v0, after which tokens are sent unframed, is not supported: it
   is advertised (librdkafka enables SASL only when the broker advertises v0) but a v0
@@ -240,9 +243,6 @@ Not protected:
   without `pg_kafka.ssl_ca_file`: they accept everyone. Keep the PLAINTEXT listener on
   loopback (or firewall it) when you rely on SASL elsewhere. The worker warns about
   non-loopback listeners that do not authenticate.
-* **Pre-authentication ApiVersions**: an unauthenticated client may send ApiVersions,
-  which is served by the database thread like any request (bounded per connection by the
-  in-flight cap).
 * **Revocation**: dropping a user or changing a password does not disconnect existing
   sessions; restart the worker to cut them.
 * **Certificate revocation** (CRLs/OCSP) for client certificates is not checked.

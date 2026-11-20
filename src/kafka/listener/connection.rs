@@ -26,11 +26,14 @@ use super::dispatch::Dispatcher;
 use super::is_peer_disconnect;
 use super::sasl::ConnectionAuth;
 use super::writer::{self, ResponseSlot, WriterContext};
+use crate::kafka::api::{RequestBody, ResponseBody};
 use crate::kafka::auth::session::{is_sasl_api, peek_api_key};
 use crate::kafka::constants::{
     MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, MAX_LONG_POLLS_PER_CONNECTION, MAX_REQUEST_SIZE,
 };
-use crate::kafka::messages::KafkaResponse;
+use crate::kafka::handlers;
+use crate::kafka::messages::{KafkaRequest, KafkaResponse};
+use crate::kafka::metrics::RequestTimer;
 use crate::kafka::protocol;
 use crate::kafka::protocol::framing::{FrameClock, FrameCodec, PRE_AUTH_MAX_FRAME};
 
@@ -190,6 +193,24 @@ fn pre_auth_timeout(peer: &str) -> Close {
     Close::Timeout
 }
 
+fn is_api_versions(request: &KafkaRequest) -> bool {
+    matches!(request.body, RequestBody::ApiVersions(_))
+}
+
+/// Answer an ApiVersions request on this thread, counted in kafka.api_metrics like a DB
+/// thread request. The response is static, so it equals the DB thread's answer.
+fn answer_api_versions(request: &KafkaRequest) {
+    let mut timer = RequestTimer::start(request.header.api_key);
+    let response = KafkaResponse::new(
+        request.header.correlation_id,
+        request.header.api_version,
+        ResponseBody::ApiVersions(handlers::handle_api_versions()),
+    );
+    timer.observe(&response);
+    // A closed slot means the connection is gone; there is nobody to answer.
+    let _ = request.response_tx.send(response);
+}
+
 /// The read side of one connection.
 struct ReadLoop<R> {
     reader: R,
@@ -245,6 +266,7 @@ where
         if let Some(key) = api_key.filter(|k| is_sasl_api(*k)) {
             return self.serve_sasl(key, frame, response_tx).await;
         }
+        let pre_auth = !self.auth.sasl.admits(-1);
         if !self.auth.sasl.admits(api_key.unwrap_or(-1)) {
             warn!(
                 "Closing connection from {} on {}: request api_key={api_key:?} before SASL authentication",
@@ -255,6 +277,14 @@ where
         }
 
         match protocol::parse_request(frame, response_tx) {
+            // Before SASL authentication the network thread answers ApiVersions itself,
+            // as Kafka's authenticator does: an anonymous peer never reaches the one DB
+            // thread, so it cannot delay authenticated clients' requests or the
+            // credential lookups other connections wait for under their pre-auth deadline.
+            Ok(Some(request)) if pre_auth && is_api_versions(&request) => {
+                answer_api_versions(&request);
+                Ok(())
+            }
             Ok(Some(request)) => {
                 if self
                     .dispatcher
@@ -491,6 +521,21 @@ mod tests {
         std::net::SocketAddr,
         crossbeam_channel::Receiver<KafkaRequest>,
     ) {
+        let security = ListenerSecurity {
+            limits,
+            ..ListenerSecurity::plaintext("127.0.0.1:0")
+        };
+        serve_one_on(security, capacity).await
+    }
+
+    /// [`serve_one`] on a listener with the given security.
+    async fn serve_one_on(
+        security: ListenerSecurity,
+        capacity: usize,
+    ) -> (
+        std::net::SocketAddr,
+        crossbeam_channel::Receiver<KafkaRequest>,
+    ) {
         let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = server.local_addr().unwrap();
         let (main_tx, main_rx) = crossbeam_channel::bounded::<KafkaRequest>(capacity);
@@ -498,10 +543,6 @@ mod tests {
         tokio::spawn(async move {
             let (socket, _) = server.accept().await.unwrap();
             let (cred_tx, _cred_rx) = crossbeam_channel::bounded(1);
-            let security = ListenerSecurity {
-                limits,
-                ..ListenerSecurity::plaintext("127.0.0.1:0")
-            };
             let auth = ConnectionAuth::new(
                 "test".into(),
                 Arc::new(security),
@@ -645,6 +686,54 @@ mod tests {
         assert_eq!(i32::from_be_bytes(bytes[4..8].try_into().unwrap()), 3);
         // Counted from the response (its write is activity), not from the request.
         assert!(after >= Duration::from_millis(250), "{after:?}");
+    }
+
+    /// Read one response frame: (correlation id, body after the v0 header).
+    async fn read_response(client: &mut tokio::net::TcpStream) -> (i32, Vec<u8>) {
+        use tokio::io::AsyncReadExt;
+        let mut len = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(3), client.read_exact(&mut len))
+            .await
+            .expect("a response within 3 s")
+            .unwrap();
+        let mut body = vec![0u8; usize::try_from(u32::from_be_bytes(len)).unwrap()];
+        client.read_exact(&mut body).await.unwrap();
+        let correlation_id = i32::from_be_bytes(body[..4].try_into().unwrap());
+        (correlation_id, body[4..].to_vec())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_pre_auth_api_versions_answered_without_the_db_thread() {
+        // On a SASL listener an unauthenticated peer's ApiVersions never reaches the DB
+        // thread: the network thread answers it with the full key list.
+        use kafka_protocol::messages::ApiVersionsResponse;
+        use kafka_protocol::protocol::Decodable;
+        use tokio::io::AsyncWriteExt;
+        let security = ListenerSecurity {
+            protocol: crate::kafka::auth::SecurityProtocol::SaslPlaintext,
+            sasl_mechanisms: Arc::new(vec![crate::kafka::auth::SaslMechanism::Plain]),
+            ..ListenerSecurity::plaintext("127.0.0.1:0")
+        };
+        let (addr, rx) = serve_one_on(security, 1000).await;
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut bytes = api_versions_v0_frame(11);
+        bytes.extend_from_slice(&api_versions_v0_frame(12));
+        client.write_all(&bytes).await.unwrap();
+        for expected in [11, 12] {
+            let (correlation_id, body) = read_response(&mut client).await;
+            assert_eq!(correlation_id, expected);
+            let response = ApiVersionsResponse::decode(&mut bytes::Bytes::from(body), 0).unwrap();
+            assert_eq!(response.error_code, 0);
+            assert_eq!(
+                response.api_keys.len(),
+                crate::kafka::api::APIS.len(),
+                "every API is advertised"
+            );
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "no pre-auth request reaches the DB thread"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

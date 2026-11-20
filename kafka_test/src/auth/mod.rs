@@ -21,6 +21,7 @@
 //! registered `parallel_safe: false` because they restart the listener.
 
 pub mod api_metrics;
+pub mod pre_auth;
 pub mod tests;
 
 use crate::common::{create_db_client, TestResult};
@@ -305,6 +306,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         tests::test_auth_sasl_scram_sha512_roundtrip: sequential,
         tests::test_auth_wrong_password_rejected: sequential,
         tests::test_auth_unauthenticated_request_rejected: sequential,
+        pre_auth::test_auth_pre_auth_api_versions_skips_db_thread: sequential,
         tests::test_auth_plaintext_listener_unaffected: sequential,
         tests::test_auth_tls_roundtrip_and_untrusted_ca: sequential,
         tests::test_auth_sasl_ssl_roundtrip: sequential,
