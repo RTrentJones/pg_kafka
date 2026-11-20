@@ -169,13 +169,24 @@ SELECT pg_kafka_create_user('bob', 'another secret', 8192);
 -- Change the password
 SELECT pg_kafka_alter_user('alice', 'new password');
 -- Install a verifier computed elsewhere: the plaintext never reaches the server.
--- SCRAM-SHA-256 uses PostgreSQL's format, e.g. from libpq PQencryptPasswordConn().
+-- SCRAM-SHA-256 uses PostgreSQL's format, e.g. from libpq PQencryptPasswordConn()
+-- (ASCII passwords only, see below).
 SELECT pg_kafka_set_user_verifier('carol', 'SCRAM-SHA-256$4096:<salt>$<StoredKey>:<ServerKey>');
 -- Drop (returns false if the user did not exist)
 SELECT pg_kafka_drop_user('bob');
 -- List users (no secrets); readable by pgkafka_reader
 SELECT * FROM kafka.sasl_users;
 ```
+
+**Verifiers from libpq or PostgreSQL work for ASCII passwords only.** Kafka clients
+(Java, librdkafka) hash the password's raw UTF-8 bytes; libpq's `PQencryptPasswordConn`
+(and PostgreSQL's own `SCRAM-SHA-256$` passwords) first apply SASLprep (RFC 4013). For a
+password of ASCII characters the two agree: SASLprep leaves ASCII unchanged, and a
+password it rejects (one with an ASCII control character) is hashed as it is. A password
+with non-ASCII characters may be normalized (NFKC, other spaces mapped to a space,
+some characters removed), and no Kafka client then authenticates against that verifier.
+For such a password use `pg_kafka_create_user` / `pg_kafka_alter_user` (they hash the raw
+bytes, like Kafka), or compute the verifier with a tool that applies no SASLprep.
 
 The functions are SECURITY INVOKER: they work for roles that may write
 `kafka.sasl_credentials`, which by default is only superusers (the extension owner).
