@@ -14,10 +14,10 @@ they match the commit they are in.
 
 | Suite | Count | Coverage |
 |-------|-------|----------|
-| Unit Tests | <!--gen:tests-unit-->834<!--/gen--> | Core logic, handlers, storage, protocol, shadow (`src/`, includes in-module proptest fuzz harnesses) |
+| Unit Tests | <!--gen:tests-unit-->844<!--/gen--> | Core logic, handlers, storage, protocol, shadow (`src/`, includes in-module proptest fuzz harnesses) |
 | Property Tests | <!--gen:tests-property-->10<!--/gen--> | `tests/property_tests.rs`: proptest wire-format invariants and boundary tests |
-| E2E Tests | <!--gen:tests-e2e-->328<!--/gen--> | Full protocol integration (`kafka_test/`, per category [below](#e2e-test-categories)) |
-| **Total** | **<!--gen:tests-total-->1172<!--/gen-->** | |
+| E2E Tests | <!--gen:tests-e2e-->338<!--/gen--> | Full protocol integration (`kafka_test/`, per category [below](#e2e-test-categories)) |
+| **Total** | **<!--gen:tests-total-->1192<!--/gen-->** | |
 
 The generator counts with (none of these needs a running broker):
 
@@ -79,16 +79,16 @@ Generated from `kafka_test --list` (what each category covers: CLAUDE.md, "Test 
 | `performance` | 7 |
 | `long_poll` | 11 |
 | `compression` | 10 |
-| `idempotent` | 11 |
+| `idempotent` | 15 |
 | `transaction` | 29 |
-| `shadow` | 40 |
+| `shadow` | 42 |
 | `metadata` | 4 |
 | `protocol` | 5 |
 | `part` | 6 |
-| `auth` | 14 |
-| `network` | 16 |
+| `auth` | 15 |
+| `network` | 19 |
 | `worker` | 6 |
-| **Total** | **328** |
+| **Total** | **338** |
 <!--/gen-->
 
 ### Running E2E Tests
