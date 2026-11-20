@@ -1,7 +1,9 @@
 //! Request framing on the network thread: the 4-byte big-endian length prefix.
 //!
 //! [`FrameCodec`] splits a connection's byte stream into request frames and writes response
-//! frames. It bounds what peers can make the broker hold:
+//! frames. It bounds the raw frames peers can make the broker hold (what a Produce's
+//! compressed records expand to once decoded is bounded separately, by
+//! [`super::decode_budget`]):
 //!
 //! * memory is reserved as payload bytes arrive, never for a length that is merely
 //!   declared, and the global budget ([`FRAME_RESERVE_REMAINING`]) is charged for the bytes

@@ -661,6 +661,7 @@ mod tests {
                 timeout_ms: 1000,
                 topic_data: vec![],
                 transactional_id: None,
+                decoded: crate::kafka::protocol::DecodedCharge::default(),
             }),
         )
     }

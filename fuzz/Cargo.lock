@@ -951,8 +951,10 @@ dependencies = [
  "base64",
  "bytes",
  "crossbeam-channel",
+ "flate2",
  "futures",
  "kafka-protocol",
+ "lz4",
  "murmur2",
  "once_cell",
  "parking_lot",
@@ -963,6 +965,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "serde_json",
+ "snap",
  "thiserror",
  "tokio",
  "tokio-rustls",
@@ -970,6 +973,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "zstd",
 ]
 
 [[package]]

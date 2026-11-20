@@ -39,6 +39,13 @@ futures = "0.3.31"
 # Binary protocol handling
 bytes = "1.11"
 kafka-protocol = "0.17"
+# Record-batch decompressors, driven directly so the decoded size is charged to the
+# request's decode budget as it is produced (protocol/decode_budget.rs). The same versions
+# kafka-protocol uses.
+flate2 = "1.1"
+lz4 = "1.28"
+snap = "1.1"
+zstd = "0.14"
 
 # Concurrency and synchronization
 crossbeam-channel = "0.5.15"
