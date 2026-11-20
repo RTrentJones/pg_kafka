@@ -93,8 +93,16 @@ EXTENSION pg_kafka` has run, without a restart.
   revokes every privilege 0.0.0 granted to PUBLIC on the kafka schema (including
   EXECUTE on `kafka.replay_shadow_messages`), grants read-only access to
   `pgkafka_reader` and the worker's privileges to `pgkafka_worker`;
-- re-applies the two additive columns older 0.0.0 builds may lack
-  (`kafka.topics.retention_ms`, `kafka.partition_offsets.log_start_offset`);
+- brings older 0.0.0 builds to the newest 0.0.0 layout first: it re-applies the
+  additive columns they may lack (`kafka.topics.retention_ms`,
+  `kafka.partition_offsets.log_start_offset`, `kafka.messages.timestamp_ms`, the latter
+  as -1, "no record timestamp", so fetches fall back to `created_at`) and converts the
+  naive `TIMESTAMP` columns of builds before the TIMESTAMPTZ change
+  (`kafka.messages.created_at`, `kafka.transactions.started_at`,
+  `kafka.shadow_tracking.forwarded_at`) to `TIMESTAMPTZ`, reading the stored values in
+  the upgrading session's `TimeZone` (set it to the server's zone if the session's
+  differs). Converting `kafka.messages.created_at` rewrites the table, one more full
+  read and write under the same lock. Layouts older than these are not supported;
 - adds `kafka.producer_ids.last_epoch` (the epoch an InitProducerId retry may present).
 
 After the upgrade:

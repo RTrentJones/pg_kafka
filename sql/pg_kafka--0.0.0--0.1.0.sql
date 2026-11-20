@@ -461,6 +461,31 @@ BEGIN
     END IF;
 END
 $$;
+-- 0.0.0 installs from before BUG-7 (no kafka.messages.timestamp_ms) and RV-10 (naive
+-- TIMESTAMP columns compared with NOW()): ATTACH needs the leaf's columns to be the
+-- parent's, and the other two columns get the type a fresh install has. Converting
+-- created_at rewrites the legacy table (one more full read and write); the naive
+-- values are taken in the session's TimeZone, the zone NOW() was stored in.
+ALTER TABLE kafka.messages_legacy ADD COLUMN IF NOT EXISTS timestamp_ms BIGINT NOT NULL DEFAULT -1;
+DO $$
+DECLARE
+    v_col RECORD;
+BEGIN
+    FOR v_col IN
+        SELECT c.relname, a.attname FROM pg_catalog.pg_attribute a
+        JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'kafka' AND NOT a.attisdropped
+          AND a.atttypid = 'timestamp'::regtype
+          AND (c.relname, a.attname) IN (('messages_legacy', 'created_at'),
+                                         ('transactions', 'started_at'),
+                                         ('shadow_tracking', 'forwarded_at'))
+    LOOP
+        EXECUTE format('ALTER TABLE kafka.%I ALTER COLUMN %I TYPE TIMESTAMPTZ',
+                       v_col.relname, v_col.attname);
+    END LOOP;
+END
+$$;
 DO $$
 DECLARE
     v_upper TIMESTAMPTZ;
