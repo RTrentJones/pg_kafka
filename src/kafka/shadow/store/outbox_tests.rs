@@ -664,6 +664,34 @@ fn an_error_raised_while_applying_acks_does_not_lose_them() {
 }
 
 #[test]
+fn stale_in_flight_entries_do_not_use_up_the_in_flight_room() {
+    // MAX_INFLIGHT forwards whose acks were lost (a forwarder crash) are stale
+    // once evict_after passes: their rows are claimable again, and they must not
+    // keep the in-flight room at zero, which would stop every claim for good.
+    let mut h = async_harness(16);
+    h.store.inflight =
+        crate::kafka::shadow::inflight::InflightTracker::new(Duration::from_millis(20));
+    for o in 0..MAX_INFLIGHT {
+        assert!(h
+            .store
+            .inflight
+            .try_begin(RowKey::new(T + 1, 0, i64::try_from(o).unwrap())));
+    }
+    seed_rows(&h.store, &[RowKey::new(T, 0, 0)]);
+    assert_eq!(
+        h.store.poll_and_forward_outbox().unwrap(),
+        0,
+        "no room while the entries are live"
+    );
+    std::thread::sleep(Duration::from_millis(40));
+    assert_eq!(
+        h.store.poll_and_forward_outbox().unwrap(),
+        1,
+        "the stale entries no longer count against the room"
+    );
+}
+
+#[test]
 fn full_forward_channel_closes_the_attempt_without_counting_it() {
     let h = async_harness(1);
     seed_rows(
