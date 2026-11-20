@@ -11,7 +11,8 @@ use super::producers::{bump_producer_epoch, reset_producer_sequences};
 use super::{internal, PostgresStore};
 use crate::kafka::error::{KafkaError, Result};
 use crate::kafka::storage::retention::{
-    self, LeafAction, TimePartition, RETENTION_DELETE_BATCH, RETENTION_PASS_BUDGET,
+    self, LeafAction, MaintenanceLockWait, TimePartition, MAINTENANCE_LOCK_KEY,
+    RETENTION_DELETE_BATCH, RETENTION_PASS_BUDGET,
 };
 use pgrx::prelude::*;
 use pgrx::spi::SpiClient;
@@ -176,12 +177,25 @@ impl PostgresStore {
     /// (forward only) for every partition they touched, so the reported earliest
     /// offset tracks retention. Consumers positioned before a retention cutoff get a
     /// standard Kafka out-of-range reset, as with a real broker's retention.
+    ///
+    /// Concurrency: the whole pass runs under the partition-maintenance lock
+    /// ([`MAINTENANCE_LOCK_KEY`]), taken before its first statement, so sweeps (the
+    /// worker's and on-demand ones) and partition maintenance never overlap. Without it
+    /// one sweep, holding ROW EXCLUSIVE on kafka.messages and the row locks of its
+    /// deletes, waits for ACCESS EXCLUSIVE to drop a leaf, while another, holding ROW
+    /// EXCLUSIVE too, waits for those rows or for the lock: a deadlock. `lock` says
+    /// whether to queue for the lock or, if another session holds it, skip the pass
+    /// (`Ok(None)`).
     pub fn run_retention_sweep(
         &self,
         message_retention_hours: i32,
         aborted_grace: Duration,
         partition_minutes: i32,
-    ) -> Result<RetentionSweepStats> {
+        lock: MaintenanceLockWait,
+    ) -> Result<Option<RetentionSweepStats>> {
+        if !Self::take_maintenance_lock(lock)? {
+            return Ok(None);
+        }
         let mut stats = RetentionSweepStats {
             aborted_messages: Self::cleanup_aborted_messages(aborted_grace)?,
             ..Default::default()
@@ -206,9 +220,22 @@ impl PostgresStore {
             stats.terminal_transactions = delete_terminal_transactions(client)?;
             stats.stale_producers = delete_stale_producers(client)?;
             stats.shadow_delivered_rows = delete_delivered_shadow_rows(client)?;
-            Ok(stats)
+            Ok(Some(stats))
         })
         .map_err(internal("run_retention_sweep"))
+    }
+
+    /// Take the partition-maintenance lock for this transaction ([`MaintenanceLockWait`]);
+    /// returns whether it is held.
+    fn take_maintenance_lock(lock: MaintenanceLockWait) -> Result<bool> {
+        Spi::connect(|client| {
+            let row = client.select(lock.lock_sql(), Some(1), &[MAINTENANCE_LOCK_KEY.into()])?;
+            Ok(row
+                .first()
+                .get_by_name::<bool, _>("locked")?
+                .unwrap_or(false))
+        })
+        .map_err(internal("take_maintenance_lock"))
     }
 
     /// ADR-001 partition maintenance: make sure time partitions of `partition_minutes`

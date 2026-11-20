@@ -19,6 +19,7 @@ use super::txn::{
 use crate::kafka::metrics::MetricsFlusher;
 use crate::kafka::shadow::ShadowStore;
 use crate::kafka::storage::postgres::ABORTED_MESSAGE_GRACE;
+use crate::kafka::storage::retention::MaintenanceLockWait;
 use crate::kafka::storage::MaintenanceStore;
 use crate::kafka::{GroupCoordinator, InternalNotification, PostgresStore};
 use crate::{pg_log, pg_warning};
@@ -218,6 +219,11 @@ pub(super) fn check_transaction_timeouts(
 /// `pg_kafka.message_retention_hours` (0 = messages kept forever). The time partitions
 /// are brought up to date first, so the sweep decides which leaves to drop on the
 /// current set.
+///
+/// The worker never waits for the partition-maintenance lock (its transaction holds the
+/// schema lock, which a manual maintenance pass holding that lock may be waiting for):
+/// while another session holds it, this pass is skipped. Any ERROR in the pass (a lock
+/// timeout, a deadlock) rolls back its subtransaction only; the next interval retries.
 pub(super) fn run_retention_sweep() {
     run_partition_maintenance();
     let names = TaskNames {
@@ -230,8 +236,12 @@ pub(super) fn run_retention_sweep() {
             crate::config::MESSAGE_RETENTION_HOURS.get(),
             ABORTED_MESSAGE_GRACE,
             crate::config::MESSAGE_PARTITION_MINUTES.get(),
+            MaintenanceLockWait::Skip,
         ) {
-            Ok(stats) if stats.total() > 0 => pg_log!(
+            Ok(None) => pg_warning!(
+                "Retention sweep skipped: another session holds the maintenance lock; will retry"
+            ),
+            Ok(Some(stats)) if stats.total() > 0 => pg_log!(
                 "Retention sweep: {} aborted msg(s), {} expired msg(s), \
                  {} time partition(s) dropped, \
                  {} stale producer(s), {} terminal txn(s), \
@@ -243,7 +253,7 @@ pub(super) fn run_retention_sweep() {
                 stats.terminal_transactions,
                 stats.shadow_delivered_rows
             ),
-            Ok(_) => {}
+            Ok(Some(_)) => {}
             Err(e) => pg_warning!("Retention sweep failed: {e}"),
         }
     });

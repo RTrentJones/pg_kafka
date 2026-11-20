@@ -177,7 +177,9 @@ async fn end_txn_during_move() -> SendResult<()> {
 ///
 /// Asserts: with the maintenance advisory lock held by another session, manual
 /// maintenance returns within 6 s, `drop_message_partition` returns dropped=false
-/// without an error and a retention sweep succeeds; and a drop that waits behind
+/// without an error and a retention sweep (which queues for the lock) ends at its
+/// session's lock_timeout with lock_not_available, then succeeds once the lock is
+/// free; and a drop that waits behind
 /// another session's drop of the same leaf returns dropped=false after it commits.
 pub async fn test_partition_maintenance_lock_waits_are_bounded() -> TestResult {
     into_test_result(maintenance_lock_waits().await)
@@ -234,10 +236,28 @@ async fn maintenance_lock_waits() -> SendResult<()> {
             .await
             .map_err(|e| format!("(c) drop behind a held lock: {e:?}"))?;
         assert!(!row.get::<_, bool>(0), "(c) must not drop without the lock");
-        db.query("SELECT * FROM pg_kafka_run_retention_sweep(0, 3600)", &[])
+        // A sweep queues for the maintenance lock, bounded by the session's
+        // lock_timeout: it fails cleanly (55P03, nothing done) instead of stalling.
+        db.batch_execute("SET lock_timeout = '1s'")
             .await
-            .map_err(|e| format!("(c) sweep behind a held lock: {e:?}"))?;
-        println!("Step 2 (c): drop returned not-dropped, sweep succeeded");
+            .map_err(boxed)?;
+        let t = Instant::now();
+        let swept = db
+            .query("SELECT * FROM pg_kafka_run_retention_sweep(0, 3600)", &[])
+            .await;
+        db.batch_execute("RESET lock_timeout")
+            .await
+            .map_err(boxed)?;
+        match swept {
+            Err(e) if e.code() == Some(&tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE) => {}
+            other => return Err(format!("(c) sweep behind a held lock: {other:?}").into()),
+        }
+        assert!(
+            t.elapsed() < Duration::from_secs(6),
+            "(c) sweep took {:?}",
+            t.elapsed()
+        );
+        println!("Step 2 (c): drop returned not-dropped, sweep hit its lock_timeout");
         Ok(())
     }
     .await;
@@ -276,6 +296,11 @@ async fn maintenance_lock_waits() -> SendResult<()> {
         .map_err(|e| format!("(d) drop of a leaf dropped concurrently: {e:?}"))?;
     assert!(!second, "(d) the waiter must report not-dropped");
     println!("Step 3 (d): the waiting drop returned not-dropped");
+    other
+        .query("SELECT * FROM pg_kafka_run_retention_sweep(0, 3600)", &[])
+        .await
+        .map_err(|e| format!("(c) sweep once the lock is free: {e:?}"))?;
+    println!("Step 4 (c): with the lock free, the sweep succeeds");
     println!("✅ every maintenance lock wait is bounded and handled");
     Ok(())
 }

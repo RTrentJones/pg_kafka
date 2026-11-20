@@ -260,7 +260,7 @@ must keep:
   `UNIQUE (topic_id, partition_id, partition_offset)` and `UNIQUE (global_offset)`. Leaves are
   extension members. All partition DDL runs in SECURITY DEFINER functions
   (`kafka.ensure_message_partitions`, `drop_message_partition`, `message_partition_contents`,
-  internal `create_message_partition`; `kafka.message_partitions()` lists the leaves), and the
+  internal `create_message_partition`, and the internal lock helpers `try_maintenance_lock` and `lock_message_tables`; `kafka.message_partitions()` lists the leaves), and the
   drop/trim decisions are pure functions in `storage/retention.rs`. Retention for a window of at
   least one width is leaf-granular; shorter windows and the DEFAULT leaf expire row by row.
   **Never** write an UPDATE that changes `created_at` (it moves rows between leaves), confine a
@@ -406,7 +406,7 @@ Per-category counts are in `docs/TEST_STRATEGY.md`; `cargo run --release -- --li
 | **long_poll** | Timeout behavior, immediate return, producer wakeup, precision, per-connection task cap, a transaction end waking a read_committed fetch |
 | **error_paths** | Invalid partitions, unknown topics, coordinator errors, protocol/transaction/group regressions |
 | **edge_cases** | Empty topics, large messages, boundary values, retention sweep |
-| **part** | Time partitions of kafka.messages: whole-leaf retention drops, row-delete fallback, pending-transaction blocking, maintenance and its lock waits, EndTxn during the default-leaf move, offsets kept after retention empties a partition, least privilege |
+| **part** | Time partitions of kafka.messages: whole-leaf retention drops, row-delete fallback, pending-transaction blocking, maintenance and its lock waits, EndTxn during the default-leaf move, offsets kept after retention empties a partition, concurrent sweeps against maintenance, the worker's sweep skipping while the maintenance lock is held, least privilege |
 | **concurrent** | Multi-producer, multi-consumer, request pipelining, races, heartbeat liveness lane, heartbeats inside group-commit batches |
 | **negative** | Connection refused, timeouts, expected failures, superuser-only SASL password GUC |
 | **performance** | Throughput baselines, latency percentiles, scaling |
