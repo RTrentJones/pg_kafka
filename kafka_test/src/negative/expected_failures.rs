@@ -112,28 +112,33 @@ pub async fn test_connection_refused() -> TestResult {
 pub async fn test_produce_timeout() -> TestResult {
     println!("=== Test: Produce Timeout ===\n");
 
-    let ctx = TestContext::new().await?;
-    let topic = TestTopicBuilder::new(&ctx, "timeout-test").build().await?;
+    // A broker that accepts the TCP connection and never answers: every send must fail with
+    // the client's own delivery timeout. (Timing a real broker against a 1 ms timeout is a race
+    // the broker can win.)
+    let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = silent.local_addr()?;
+    let hold = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = silent.accept().await {
+            held.push(socket);
+        }
+    });
 
-    // Create producer with very short timeout
     let producer: FutureProducer = ClientConfig::new()
-        .set("bootstrap.servers", crate::common::get_bootstrap_servers())
-        .set("message.timeout.ms", "1") // 1ms timeout - extremely short
+        .set("bootstrap.servers", addr.to_string())
+        .set("message.timeout.ms", "200")
         .create()?;
 
     let mut timeout_count = 0;
-    let mut success_count = 0;
-
     for i in 0..5 {
         let result = producer
             .send(
-                rdkafka::producer::FutureRecord::to(&topic.name)
+                rdkafka::producer::FutureRecord::to("timeout-test")
                     .payload(&format!("message-{i}"))
                     .key(&format!("key-{i}")),
-                Duration::from_millis(1),
+                Duration::from_millis(200),
             )
             .await;
-
         match result {
             Err((e, _)) => {
                 timeout_count += 1;
@@ -141,20 +146,19 @@ pub async fn test_produce_timeout() -> TestResult {
                     println!("   Timeout error (expected): {e}");
                 }
             }
-            Ok(_) => {
-                success_count += 1;
+            Ok(delivery) => {
+                hold.abort();
+                return Err(format!("send {i} to a silent broker succeeded: {delivery:?}").into());
             }
         }
     }
+    hold.abort();
 
-    println!("   Timeouts: {timeout_count}, Successes: {success_count}");
-    // QA-3: a 1ms message.timeout.ms is far below the time a real produce (network + SPI insert)
-    // takes, so at least one of five sends must trip the local delivery timeout. (Returning Err
-    // rather than asserting keeps a failure isolated to this test instead of unwinding the suite.)
-    ctx.cleanup().await?;
-    if timeout_count == 0 {
-        return Err("a 1ms produce timeout should have fired at least once".into());
+    println!("   Timeouts: {timeout_count} of 5");
+    if timeout_count != 5 {
+        return Err(format!("expected 5 delivery timeouts, got {timeout_count}").into());
     }
+    println!("✅ Test PASSED\n");
     Ok(())
 }
 
