@@ -48,8 +48,12 @@ pub static DECODED_REMAINING: AtomicUsize = AtomicUsize::new(DECODED_BUDGET_BYTE
 
 /// Decodes taking up to this much memory run inline on the I/O thread (the cost of moving
 /// them elsewhere would exceed the work); a larger request decodes through
-/// [`run_large_decode`].
-pub const INLINE_DECODE_BYTES: usize = 1024 * 1024;
+/// [`run_large_decode`]. Twice the clients' default request size limit (1 MiB: Java's
+/// `max.request.size`, librdkafka's `message.max.bytes`), so a request of that size decodes
+/// inline unless its records are under some 200 bytes or it is compressed: hostile
+/// requests that fill the large-decode slots and their queue cannot turn such a request
+/// away.
+pub const INLINE_DECODE_BYTES: usize = 2 * 1024 * 1024;
 
 /// How many large decodes may run at once.
 pub const LARGE_DECODE_SLOTS: usize = 2;

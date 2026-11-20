@@ -314,11 +314,24 @@ fn validate_all_records(
     Ok(())
 }
 
+/// The memory the batches of `topics` take decoded by what they declare (their bytes and
+/// record counts), the least they can take.
+fn declared_memory(
+    topics: &[kafka_protocol::messages::produce_request::TopicProduceData],
+) -> usize {
+    topics
+        .iter()
+        .flat_map(|t| t.partition_data.iter())
+        .filter_map(|p| p.records.as_ref())
+        .map(|batch| least_decoded_memory(batch))
+        .fold(0, usize::saturating_add)
+}
+
 /// Decode the records of `topics`, keeping large decodes off the I/O threads.
 ///
 /// A request whose batches take at most [`INLINE_DECODE_BYTES`] of memory by what they
-/// declare (their bytes and record counts) is decoded in place, within that budget: the
-/// common case of small (compressed or not) batches. One that declares more, or that expands past it, is
+/// declare ([`declared_memory`]) is decoded in place, within that budget: the common case of
+/// small (compressed or not) batches. One that declares more, or that expands past it, is
 /// decoded by [`run_large_decode`] within [`MAX_DECODED_REQUEST_BYTES`] (or turned away as
 /// [`DecodeFailure::Busy`] when too many already wait for it).
 fn decode_all_records(
@@ -326,13 +339,7 @@ fn decode_all_records(
     zstd_allowed: bool,
 ) -> Result<DecodedTopics, DecodeFailure> {
     validate_all_records(topics, zstd_allowed)?;
-    let declared: usize = topics
-        .iter()
-        .flat_map(|t| t.partition_data.iter())
-        .filter_map(|p| p.records.as_ref())
-        .map(|batch| least_decoded_memory(batch))
-        .fold(0, usize::saturating_add);
-    if declared <= INLINE_DECODE_BYTES {
+    if declared_memory(topics) <= INLINE_DECODE_BYTES {
         match decode_records(topics, DecodeBudget::new(INLINE_DECODE_BYTES)) {
             Err(DecodeFailure::TooLarge) => {}
             done => return done,
@@ -494,5 +501,26 @@ mod tests {
             rejected(vec![bytes::Bytes::from_static(b"short"), zstd], false),
             Some(ERROR_INVALID_RECORD)
         );
+    }
+
+    #[test]
+    fn requests_of_the_clients_default_size_decode_inline() {
+        // Java's max.request.size and librdkafka's message.max.bytes default to 1 MiB: such
+        // a request of 16 KB batches (the default batch.size) of 1 KB records, or of 200-byte
+        // records, decodes on the I/O thread and never waits for a large-decode slot.
+        for (records, len) in [(15, 1000), (70, 200)] {
+            let batch = batch_of(records, len);
+            let topics = topics(vec![batch.clone(); 1024 * 1024 / batch.len()]);
+            let declared = declared_memory(&topics);
+            assert!(
+                declared <= INLINE_DECODE_BYTES,
+                "{len}-byte records declare {declared}"
+            );
+            let budget = DecodeBudget::new(INLINE_DECODE_BYTES);
+            assert!(
+                decode_records(&topics, budget).is_ok(),
+                "{len}-byte records"
+            );
+        }
     }
 }
