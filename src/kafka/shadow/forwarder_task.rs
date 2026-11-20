@@ -484,6 +484,14 @@ impl ProducerSlot {
             core.fence_outstanding(old.generation);
             if let Some(e) = old.producer.fatal_error() {
                 warn!("Shadow producer is fatal ({e}); rebuilding it");
+                // librdkafka purges only the queues of a fatal producer: a request
+                // already in flight that then fails retriably goes back to a
+                // queue the fatal producer never serves, and with no
+                // per-message timeout its record would never resolve (holding
+                // the producer, its threads and its row). Purge in-flight
+                // records too, so every outstanding record of the generation
+                // resolves now; failures after the first are collateral.
+                old.producer.purge_outstanding();
                 self.replaced.retain(|(_, p)| p.strong_count() > 0);
                 self.replaced
                     .push((old.generation, Arc::downgrade(&old.producer)));

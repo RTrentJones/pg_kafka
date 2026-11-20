@@ -119,7 +119,9 @@ of each; see duplicates below). That rests on:
    dead-lettered). When a producer is replaced (settings change) or goes fatal, every partition
    with a record still outstanding on it is fenced at once, at its lowest outstanding offset:
    those records fail later, and nothing of their partitions may go out on the replacement ahead
-   of their retry.
+   of their retry. A replaced producer's queued and in-flight records are purged, the fatal one's
+   too: librdkafka purges only the queues of a fatal producer, and an in-flight request that then
+   fails retriably would go back to a queue it never serves again.
 
 Failures are classified: a real delivery failure is `Failed` (counts against
 `shadow_max_retries`); a record fenced, failed only because the producer went fatal on another
