@@ -123,7 +123,14 @@ fn corrupt_produce_frame(acks: i16) -> BytesMut {
     };
     let mut p = PartitionProduceData::default();
     p.index = 0;
-    p.records = Some(bytes::Bytes::from_static(b"definitely not a record batch"));
+    // A record batch whose CRC does not match.
+    let mut batch = one_record_batch(
+        b"value".to_vec(),
+        kafka_protocol::records::Compression::None,
+    );
+    let last = batch.len() - 1;
+    batch[last] ^= 1;
+    p.records = Some(bytes::Bytes::from(batch));
     let mut t = TopicProduceData::default();
     t.name = topic("t");
     t.partition_data = vec![p];
@@ -136,13 +143,9 @@ fn corrupt_produce_frame(acks: i16) -> BytesMut {
 
 /// A Produce whose partitions each carry `per_partition` bytes of zeros as one
 /// gzip-compressed record: a few hundred KB on the wire however large it decodes.
-fn gzip_bomb_frame(partitions: i32, per_partition: usize, acks: i16) -> BytesMut {
-    use kafka_protocol::messages::produce_request::{
-        PartitionProduceData, ProduceRequest, TopicProduceData,
-    };
-    use kafka_protocol::records::{
-        Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
-    };
+/// One record batch holding one record of `value`.
+fn one_record_batch(value: Vec<u8>, compression: kafka_protocol::records::Compression) -> BytesMut {
+    use kafka_protocol::records::{Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType};
     let record = Record {
         transactional: false,
         control: false,
@@ -154,7 +157,7 @@ fn gzip_bomb_frame(partitions: i32, per_partition: usize, acks: i16) -> BytesMut
         sequence: -1,
         timestamp: 0,
         key: None,
-        value: Some(bytes::Bytes::from(vec![0u8; per_partition])),
+        value: Some(bytes::Bytes::from(value)),
         headers: kafka_protocol::indexmap::IndexMap::default(),
     };
     let mut batch = BytesMut::new();
@@ -163,10 +166,21 @@ fn gzip_bomb_frame(partitions: i32, per_partition: usize, acks: i16) -> BytesMut
         [record].iter(),
         &RecordEncodeOptions {
             version: 2,
-            compression: Compression::Gzip,
+            compression,
         },
     )
     .unwrap();
+    batch
+}
+
+fn gzip_bomb_frame(partitions: i32, per_partition: usize, acks: i16) -> BytesMut {
+    use kafka_protocol::messages::produce_request::{
+        PartitionProduceData, ProduceRequest, TopicProduceData,
+    };
+    let batch = one_record_batch(
+        vec![0u8; per_partition],
+        kafka_protocol::records::Compression::Gzip,
+    );
     let batch = batch.freeze();
     let mut t = TopicProduceData::default();
     t.name = topic("t");
@@ -211,6 +225,65 @@ fn test_produce_decoding_past_the_request_limit_is_refused() {
     let (tx, mut rx) = channel();
     assert!(parse_request(gzip_bomb_frame(2, 60_000_000, 0), tx).is_err());
     assert!(rx.try_recv().is_err(), "acks=0 must not get a response");
+}
+
+/// A Produce frame of `partitions` partitions, each carrying `batch`.
+fn produce_frame_of(batch: &bytes::Bytes, partitions: i32, acks: i16) -> BytesMut {
+    use kafka_protocol::messages::produce_request::{
+        PartitionProduceData, ProduceRequest, TopicProduceData,
+    };
+    let mut t = TopicProduceData::default();
+    t.name = topic("t");
+    for index in 0..partitions {
+        let mut p = PartitionProduceData::default();
+        p.index = index;
+        p.records = Some(batch.clone());
+        t.partition_data.push(p);
+    }
+    let mut req = ProduceRequest::default();
+    req.acks = acks;
+    req.timeout_ms = 1000;
+    req.topic_data = vec![t];
+    frame(&req, 7, 79)
+}
+
+/// Produce error codes a frame is answered with before it reaches the DB thread.
+fn refused_codes(frame: BytesMut) -> Vec<i16> {
+    let (tx, mut rx) = channel();
+    assert!(
+        parse_request(frame, tx).unwrap().is_none(),
+        "the request must not reach the DB thread"
+    );
+    match rx.try_recv() {
+        Ok(KafkaResponse {
+            body: ResponseBody::Produce(response),
+            ..
+        }) => response.responses[0]
+            .partition_responses
+            .iter()
+            .map(|p| p.error_code)
+            .collect(),
+        other => panic!("expected a per-partition Produce error, got {other:?}"),
+    }
+}
+
+/// Batches of 7-byte records: 2.4 million of them in two 100 KB gzip batches would take
+/// some 600 MB decoded into records. Their declared counts are charged first, so the
+/// request is refused with MESSAGE_TOO_LARGE before any record is built, and quickly.
+#[test]
+fn test_produce_of_tiny_records_past_the_request_limit_is_refused() {
+    use crate::kafka::protocol::recordbatch::test_batches::{raw_batch, tiny_records};
+    let n = 1_200_000;
+    let batch = raw_batch(&tiny_records(n), i32::try_from(n).unwrap(), true);
+    let frame = produce_frame_of(&batch, 2, 1);
+    assert!(frame.len() < 200_000, "{} bytes on the wire", frame.len());
+    let started = std::time::Instant::now();
+    assert_eq!(
+        refused_codes(frame),
+        vec![10, 10],
+        "MESSAGE_TOO_LARGE per partition"
+    );
+    assert!(started.elapsed() < std::time::Duration::from_millis(500));
 }
 
 /// A compressed request that decodes to more than the inline limit but within the request

@@ -3,7 +3,7 @@
 //! One test per attack (frame-budget lockout, oversized response, Nagle, acks=0 close,
 //! invalid acks, response before close, per-IP / per-listener limits, idle and frame
 //! read deadlines, the pre-auth deadline from accept, the SASL lookup rate limit, SCRAM
-//! enumeration, a decompression bomb, an acks=0 Produce at an unsupported version), each
+//! enumeration, decompression, record-count and header bombs, large zstd windows, partition data that is not one RecordBatch v2, an acks=0 Produce at an unsupported version), each
 //! checking that ordinary rdkafka clients keep working while the attack runs.
 //!
 //! `hostile_clients` run against the default configuration. `limits` reconfigure the listener
@@ -163,6 +163,9 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         hostile_clients::test_request_before_closing_frame_is_answered: sequential,
         produce_decoding::test_compressed_produce_past_the_decode_limit_is_refused: sequential,
         produce_decoding::test_unsupported_version_acks0_produce_closes_connection: sequential,
+        produce_decoding::test_produce_of_data_that_is_not_one_v2_batch_is_refused: sequential,
+        produce_decoding::test_record_and_header_bombs_are_refused_before_decoding: sequential,
+        produce_decoding::test_zstd_batches_with_large_windows_are_stored: sequential,
         limits::test_network_limits_setup: sequential,
         limits::test_scram_unknown_user_is_indistinguishable: sequential,
         limits::test_per_ip_connection_limit: sequential,

@@ -1,22 +1,28 @@
 //! How much memory the records of Produce requests may take once decoded.
 //!
-//! A frame's size says little about its records: a gzip or zstd batch of zeros expands about
-//! a thousandfold, so an 800 KB request can decode to gigabytes. The decoded bytes are
-//! therefore bounded while they are produced (every decompressor writes through a
-//! [`DecodeBudget`] and stops at the limit), never checked afterwards:
+//! A frame's size says little about what its records take: a gzip or zstd batch of zeros
+//! expands about a thousandfold, and every record, however small on the wire (7 bytes),
+//! becomes a few hundred bytes of decoded structure. The memory of a decode is therefore
+//! charged to a [`DecodeBudget`] before it is allocated, never checked afterwards: the
+//! records and headers at a fixed cost each, the decoded bytes as the decompressors produce
+//! them (they write through the budget and stop at its limit; see
+//! `super::recordbatch`):
 //!
-//! * per request, at most [`MAX_DECODED_REQUEST_BYTES`] across all its partitions (the
-//!   largest request an uncompressed client may send); beyond that the request is answered
-//!   MESSAGE_TOO_LARGE;
+//! * per request, at most [`MAX_DECODED_REQUEST_BYTES`] across all its partitions; beyond
+//!   that the request is answered MESSAGE_TOO_LARGE;
 //! * across the process, decoded requests that the DB thread has not run yet hold at most
 //!   [`DECODED_BUDGET_BYTES`] ([`DECODED_REMAINING`]); a request that would exceed it closes
 //!   its connection, as an exhausted frame budget does, and the client retries. The decoded
 //!   request keeps its share ([`DecodedCharge`]) until it is dropped after its handler ran.
 //!
+//! What a decode holds at its peak (the decompressed section, kafka-protocol's records and
+//! the copies they are converted to) is at most twice its charge; once converted it holds
+//! no more than its charge.
+//!
 //! Decoding is also kept off the two tokio I/O threads once it is large
 //! ([`run_large_decode`]): at most [`LARGE_DECODE_SLOTS`] such decodes run at once, each on a
-//! thread of its own, so they bound the transient copies too (a decompressed buffer and the
-//! records copied out of it, at most twice the request limit per decode).
+//! thread of its own, and at most [`LARGE_DECODE_WAITERS`] more wait for one; a request
+//! beyond that closes its connection, as an exhausted decode budget does.
 //!
 //! Runs on the network thread, so it logs through `tracing`, never pgrx.
 
@@ -27,11 +33,12 @@ use std::sync::{Condvar, Mutex, PoisonError};
 use super::framing::{charge_frame_budget, release_frame_budget};
 use crate::kafka::constants::MAX_REQUEST_SIZE;
 
-/// The most bytes one Produce request's records may decode to, summed over its partitions.
-/// A compressed request may decode to no more than an uncompressed one may be.
+/// The most memory one Produce request's records may take decoded, summed over its
+/// partitions: the size of the largest request frame, so a compressed request may decode to
+/// no more than an uncompressed one of large records.
 pub const MAX_DECODED_REQUEST_BYTES: usize = MAX_REQUEST_SIZE;
 
-/// The most decoded record bytes all requests waiting for the DB thread may hold together.
+/// The most decoded record memory all requests waiting for the DB thread may hold together.
 pub const DECODED_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 
 const _: () = assert!(MAX_DECODED_REQUEST_BYTES <= DECODED_BUDGET_BYTES);
@@ -39,8 +46,9 @@ const _: () = assert!(MAX_DECODED_REQUEST_BYTES <= DECODED_BUDGET_BYTES);
 /// Remaining process-wide decoded budget, in bytes.
 pub static DECODED_REMAINING: AtomicUsize = AtomicUsize::new(DECODED_BUDGET_BYTES);
 
-/// Decodes up to this many bytes run inline on the I/O thread (the cost of moving them
-/// elsewhere would exceed the work); a larger request decodes through [`run_large_decode`].
+/// Decodes taking up to this much memory run inline on the I/O thread (the cost of moving
+/// them elsewhere would exceed the work); a larger request decodes through
+/// [`run_large_decode`].
 pub const INLINE_DECODE_BYTES: usize = 1024 * 1024;
 
 /// How many large decodes may run at once.
@@ -55,9 +63,9 @@ pub enum Exhausted {
     Global,
 }
 
-/// The decoded-bytes allowance of one request while it decodes. Bytes are charged as they
-/// are produced; whatever is charged is given back when the budget is dropped, unless it
-/// is handed to the decoded request with [`DecodeBudget::into_charge`].
+/// The decoded-memory allowance of one request while it decodes, in bytes. Memory is
+/// charged before it is allocated; whatever is charged is given back when the budget is
+/// dropped, unless it is handed to the decoded request with [`DecodeBudget::into_charge`].
 #[derive(Debug)]
 pub struct DecodeBudget {
     global: &'static AtomicUsize,
@@ -82,7 +90,7 @@ impl DecodeBudget {
         }
     }
 
-    /// Charge `n` more decoded bytes. Fails, charging nothing, when that would pass the
+    /// Charge `n` more bytes. Fails, charging nothing, when that would pass the
     /// budget's limit or the process-wide budget; [`DecodeBudget::exhausted`] then says
     /// which.
     pub fn take(&self, n: usize) -> Result<(), Exhausted> {
@@ -106,6 +114,13 @@ impl DecodeBudget {
         self.exhausted.get()
     }
 
+    /// Give back `n` of the bytes charged (memory a decode no longer holds).
+    pub fn release(&self, n: usize) {
+        let n = n.min(self.charged.get());
+        self.charged.set(self.charged.get() - n);
+        release_frame_budget(self.global, n);
+    }
+
     /// Bytes charged so far.
     pub fn charged(&self) -> usize {
         self.charged.get()
@@ -126,7 +141,7 @@ impl Drop for DecodeBudget {
     }
 }
 
-/// The decoded bytes a request holds of the process-wide budget, given back when it is
+/// The decoded memory a request holds of the process-wide budget, given back when it is
 /// dropped (after the DB thread ran the request, or when the request is discarded).
 #[derive(Debug)]
 pub struct DecodedCharge {
@@ -157,59 +172,96 @@ impl Drop for DecodedCharge {
     }
 }
 
-/// A counting semaphore for blocking threads: [`LARGE_DECODE_SLOTS`] large decodes at once.
-struct Slots {
-    free: Mutex<usize>,
+/// How many requests may wait for a large-decode slot. Each waits on a thread of its own
+/// (a tokio blocking-pool thread), so the bound keeps hostile pipelining from taking that
+/// pool's threads; a request beyond it is turned away at once ([`run_large_decode`]).
+pub const LARGE_DECODE_WAITERS: usize = 8;
+
+/// A counting semaphore for blocking threads with a bounded queue: `slots` decodes at
+/// once, at most `waiters` more waiting.
+pub(crate) struct Slots {
+    state: Mutex<SlotState>,
     freed: Condvar,
+    waiters: usize,
 }
 
-static SLOTS: Slots = Slots {
-    free: Mutex::new(LARGE_DECODE_SLOTS),
-    freed: Condvar::new(),
-};
+struct SlotState {
+    free: usize,
+    waiting: usize,
+}
 
-/// One of [`SLOTS`], given back on drop.
+/// The large decodes of the network thread.
+static SLOTS: Slots = Slots::new(LARGE_DECODE_SLOTS, LARGE_DECODE_WAITERS);
+
+/// One of a [`Slots`], given back on drop.
 struct Slot(&'static Slots);
 
 impl Slots {
-    fn acquire(&'static self) -> Slot {
-        // The counter stays consistent even if a holder panicked, so a poisoned lock is used
-        // as is.
-        let mut free = self.free.lock().unwrap_or_else(PoisonError::into_inner);
-        while *free == 0 {
-            free = self
-                .freed
-                .wait(free)
-                .unwrap_or_else(PoisonError::into_inner);
+    pub(crate) const fn new(slots: usize, waiters: usize) -> Self {
+        Self {
+            state: Mutex::new(SlotState {
+                free: slots,
+                waiting: 0,
+            }),
+            freed: Condvar::new(),
+            waiters,
         }
-        *free -= 1;
-        Slot(self)
+    }
+
+    /// A slot, waiting for one if fewer than `waiters` already wait; `None` otherwise.
+    fn acquire(&'static self) -> Option<Slot> {
+        // The counters stay consistent even if a holder panicked, so a poisoned lock is
+        // used as is.
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.free == 0 {
+            if state.waiting >= self.waiters {
+                return None;
+            }
+            state.waiting += 1;
+            while state.free == 0 {
+                state = self
+                    .freed
+                    .wait(state)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+            state.waiting -= 1;
+        }
+        state.free -= 1;
+        Some(Slot(self))
+    }
+
+    /// Run `decode` under one of these slots, or return `None` at once when every slot is
+    /// taken and the queue is full. See [`run_large_decode`].
+    pub(crate) fn run<R>(&'static self, decode: impl FnOnce() -> R) -> Option<R> {
+        let run = || {
+            let _slot = self.acquire()?;
+            Some(decode())
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(run)
+            }
+            _ => run(),
+        }
     }
 }
 
 impl Drop for Slot {
     fn drop(&mut self) {
-        let mut free = self.0.free.lock().unwrap_or_else(PoisonError::into_inner);
-        *free += 1;
+        let mut state = self.0.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.free += 1;
         self.0.freed.notify_one();
     }
 }
 
 /// Run a large decode: under one of [`LARGE_DECODE_SLOTS`], and, on the multi-threaded
 /// network runtime, through `block_in_place`, so the I/O thread's other connections move to
-/// another thread while it runs (and while it waits for a slot). Elsewhere (unit tests, a
-/// current-thread runtime) it runs in place.
-pub fn run_large_decode<R>(decode: impl FnOnce() -> R) -> R {
-    let run = || {
-        let _slot = SLOTS.acquire();
-        decode()
-    };
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(run)
-        }
-        _ => run(),
-    }
+/// another thread while it runs (and while it waits for a slot). At most
+/// [`LARGE_DECODE_WAITERS`] wait; with the queue full it returns `None` at once, and the
+/// request is turned away like one that finds the decode budget exhausted. Elsewhere (unit
+/// tests, a current-thread runtime) it runs in place.
+pub fn run_large_decode<R>(decode: impl FnOnce() -> R) -> Option<R> {
+    SLOTS.run(decode)
 }
 
 #[cfg(test)]
@@ -261,18 +313,21 @@ mod tests {
     fn large_decodes_run_at_most_slots_at_a_time() {
         use std::sync::atomic::AtomicUsize;
         use std::sync::Arc;
+        static SLOTS: Slots = Slots::new(LARGE_DECODE_SLOTS, 8);
         let running = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
         let threads: Vec<_> = (0..8)
             .map(|_| {
                 let (running, peak) = (Arc::clone(&running), Arc::clone(&peak));
                 std::thread::spawn(move || {
-                    run_large_decode(|| {
-                        let now = running.fetch_add(1, Ordering::SeqCst) + 1;
-                        peak.fetch_max(now, Ordering::SeqCst);
-                        std::thread::sleep(std::time::Duration::from_millis(20));
-                        running.fetch_sub(1, Ordering::SeqCst);
-                    });
+                    SLOTS
+                        .run(|| {
+                            let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                            peak.fetch_max(now, Ordering::SeqCst);
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                            running.fetch_sub(1, Ordering::SeqCst);
+                        })
+                        .expect("eight callers fit two slots and six waiters");
                 })
             })
             .collect();
@@ -284,6 +339,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn large_decodes_leave_the_io_threads_free() {
+        static SLOTS: Slots = Slots::new(LARGE_DECODE_SLOTS, LARGE_DECODE_WAITERS);
         // Two decodes occupying both worker threads' cores must not stall a timer task.
         let ticker = tokio::spawn(async {
             let start = std::time::Instant::now();
@@ -293,7 +349,7 @@ mod tests {
         let busy: Vec<_> = (0..2)
             .map(|_| {
                 tokio::spawn(async {
-                    run_large_decode(|| std::thread::sleep(std::time::Duration::from_millis(400)));
+                    SLOTS.run(|| std::thread::sleep(std::time::Duration::from_millis(400)));
                 })
             })
             .collect();
@@ -312,6 +368,45 @@ mod tests {
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
-        assert_eq!(rt.block_on(async { run_large_decode(|| 7) }), 7);
+        assert_eq!(rt.block_on(async { run_large_decode(|| 7) }), Some(7));
+    }
+
+    #[test]
+    fn waiting_for_a_large_decode_slot_is_bounded() {
+        // Every caller waiting for a slot holds a thread (a blocking-pool thread on the
+        // network runtime), so at most `waiters` may wait; the rest are turned away at
+        // once.
+        use std::sync::Arc;
+        use std::time::Duration;
+        static SLOTS: Slots = Slots::new(2, 8);
+        let inside = Arc::new(AtomicUsize::new(0));
+        let threads: Vec<_> = (0..24)
+            .map(|_| {
+                let inside = Arc::clone(&inside);
+                std::thread::spawn(move || {
+                    inside.fetch_add(1, Ordering::SeqCst);
+                    let ran = SLOTS.run(|| std::thread::sleep(Duration::from_millis(100)));
+                    inside.fetch_sub(1, Ordering::SeqCst);
+                    ran.is_some()
+                })
+            })
+            .collect();
+        std::thread::sleep(Duration::from_millis(50));
+        let held_at_once = inside.load(Ordering::SeqCst);
+        let ran = threads
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .filter(|&ran| ran)
+            .count();
+        assert!(
+            held_at_once <= 2 + 8,
+            "{held_at_once} callers held in the slots at once"
+        );
+        assert_eq!(
+            ran, 10,
+            "two ran at once and eight waited; the rest were turned away"
+        );
+        // With the queue drained, a caller gets a slot again.
+        assert_eq!(SLOTS.run(|| 1), Some(1));
     }
 }

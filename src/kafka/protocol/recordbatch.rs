@@ -1,17 +1,31 @@
-//! The records of one Produce partition: RecordBatch v2 (Kafka 0.11+), or the legacy
-//! MessageSet v0/v1 as a fallback.
+//! The records of one Produce partition: exactly one RecordBatch v2, the only record
+//! format of the Produce versions pg_kafka serves (v3+).
 //!
-//! Every decoded byte is charged to the request's [`DecodeBudget`] as it is produced: the
-//! decompressors here write through it and stop at its limit, so a compressed batch can
-//! never expand past what the request may hold (see [`super::decode_budget`]).
+//! The memory a batch decodes to is charged to the request's [`DecodeBudget`] before it is
+//! allocated (see [`super::decode_budget`]):
+//!
+//! * the records, at [`RECORD_MEMORY`] each, from the record count in the batch header,
+//!   before anything is decompressed;
+//! * the decoded bytes, as the decompressors here produce them: they write through the
+//!   budget and stop at its limit, so a compressed batch never expands past what the
+//!   request may hold;
+//! * the headers, at [`HEADER_MEMORY`] each, and the heap blocks of the copies the records
+//!   are converted to, counted by a walk over the decoded records section that allocates
+//!   nothing and also checks that it holds exactly the declared records, before
+//!   kafka-protocol builds any of them.
+//!
+//! What kafka-protocol's own records took is given back once they are converted.
 //!
 //! Runs on the network thread, so it logs through `tracing`, never pgrx.
 
+use std::cell::Cell;
 use std::io::{self, Write};
+use std::mem::size_of;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use kafka_protocol::records::{Compression, RecordBatchDecoder};
-use tracing::{debug, warn};
+use kafka_protocol::protocol::StrBytes;
+use kafka_protocol::records::{Compression, Record as WireRecord, RecordBatchDecoder};
+use tracing::debug;
 
 use super::decode_budget::DecodeBudget;
 use crate::kafka::error::{KafkaError, Result};
@@ -30,54 +44,119 @@ pub struct ParsedRecordBatch {
 // baseOffset i64 @0, batchLength i32 @8, partitionLeaderEpoch i32 @12, magic i8 @16,
 // crc u32 @17, attributes i16 @21, lastOffsetDelta i32 @23, baseTimestamp i64 @27,
 // maxTimestamp i64 @35, producerId i64 @43, producerEpoch i16 @51, baseSequence i32 @53,
-// recordsCount i32 @57.
+// recordsCount i32 @57, records @61.
+const BATCH_LENGTH_OFFSET: usize = 8;
+/// baseOffset and batchLength, which batchLength does not count.
+const LOG_OVERHEAD: usize = 12;
 const MAGIC_OFFSET: usize = 16;
 const PRODUCER_ID_OFFSET: usize = 43;
-/// End of baseSequence, the last producer field.
-const PRODUCER_FIELDS_END: usize = 57;
+const RECORD_COUNT_OFFSET: usize = 57;
+/// The header of a RecordBatch v2, up to its first record.
+const RECORD_BATCH_OVERHEAD: usize = 61;
+/// The smallest batchLength Kafka reads a magic byte behind (a legacy v0 message's).
+const MIN_BATCH_LENGTH: usize = 14;
 /// The magic byte of a RecordBatch v2.
 const RECORD_BATCH_V2_MAGIC: i8 = 2;
 
-/// The producer id, epoch and base sequence in a RecordBatch v2 header.
+/// Memory of one header in kafka-protocol's decoded record: an `IndexMap` entry (hash, key,
+/// value) and its slots in the map's index table.
+const WIRE_HEADER_MEMORY: usize =
+    size_of::<(u64, StrBytes, Option<Bytes>)>() + 2 * size_of::<usize>();
+
+/// Memory one record takes while it decodes besides its bytes: kafka-protocol's record and
+/// the one it is converted to. Charged from the declared record count before decoding, so
+/// a batch of many tiny records (7 bytes on the wire, 264 here) cannot hold more memory
+/// than the request may.
+pub const RECORD_MEMORY: usize = size_of::<WireRecord>() + size_of::<Record>();
+
+/// Memory one header takes while it decodes besides its bytes (2 bytes on the wire at the
+/// least): in kafka-protocol's record and in ours.
+pub const HEADER_MEMORY: usize = WIRE_HEADER_MEMORY + size_of::<RecordHeader>();
+
+/// What one heap block costs beyond its bytes: the smallest block glibc's malloc hands out
+/// (a 1-byte key copy takes 32), or the bookkeeping and rounding of a larger one.
+const ALLOCATION_OVERHEAD: usize = 32;
+
+fn invalid(message: impl Into<String>) -> KafkaError {
+    KafkaError::InvalidRecord {
+        message: message.into(),
+    }
+}
+
+fn corrupt(message: impl Into<String>) -> KafkaError {
+    KafkaError::CorruptMessage {
+        message: message.into(),
+    }
+}
+
+/// A big-endian i32 at `at` of `bytes`, which holds it.
+fn i32_at(bytes: &[u8], at: usize) -> i32 {
+    let mut field = &bytes[at..at + 4];
+    field.get_i32()
+}
+
+/// Check the framing Kafka checks before it decodes a Produce v3+ partition's records,
+/// and return the batch's declared record count.
 ///
-/// A batch too short to hold them yields the zeroed default; any other format (legacy
-/// MessageSet) yields -1 for all three, a non-idempotent producer.
-fn extract_producer_metadata(batch_bytes: &Bytes) -> ProducerMetadata {
-    if batch_bytes.len() < PRODUCER_FIELDS_END {
-        debug!(
-            "RecordBatch too short ({} bytes) for producer metadata, using defaults",
-            batch_bytes.len()
-        );
-        return ProducerMetadata::default();
+/// In Kafka 3.7's order (`ByteBufferLogInputStream.nextBatchSize`, then
+/// `ProduceRequest.validateRecords`): a batchLength too short for any batch, or a v2+ batch
+/// shorter than its header, is CORRUPT_MESSAGE; data holding no complete batch, a batch of
+/// another magic than 2 (a legacy MessageSet) and a negative record count are
+/// INVALID_RECORD.
+fn check_batch_header(batch: &[u8]) -> Result<usize> {
+    let no_batch = || invalid("Produce v3+ partition data must hold exactly one record batch");
+    if batch.len() < LOG_OVERHEAD {
+        return Err(no_batch());
     }
-
-    let magic = i8::from_be_bytes([batch_bytes[MAGIC_OFFSET]]);
+    let batch_length = i32_at(batch, BATCH_LENGTH_OFFSET);
+    let Some(batch_length) = usize::try_from(batch_length)
+        .ok()
+        .filter(|&n| n >= MIN_BATCH_LENGTH)
+    else {
+        return Err(corrupt(format!(
+            "record batch length {batch_length} is too short"
+        )));
+    };
+    if batch.len() <= MAGIC_OFFSET {
+        return Err(no_batch());
+    }
+    let magic = i8::from_be_bytes([batch[MAGIC_OFFSET]]);
+    if magic >= RECORD_BATCH_V2_MAGIC && batch_length + LOG_OVERHEAD < RECORD_BATCH_OVERHEAD {
+        return Err(corrupt(format!(
+            "record batch length {batch_length} is shorter than its header"
+        )));
+    }
+    if batch.len() < batch_length + LOG_OVERHEAD {
+        return Err(no_batch());
+    }
     if magic != RECORD_BATCH_V2_MAGIC {
-        debug!(
-            "RecordBatch magic={magic}, expected 2 (v2 format), using default producer metadata"
-        );
-        return ProducerMetadata {
-            producer_id: -1,
-            producer_epoch: -1,
-            base_sequence: -1,
-        };
+        return Err(invalid(format!(
+            "Produce v3+ carries record batches of magic 2 only, not magic {magic}"
+        )));
     }
+    usize::try_from(i32_at(batch, RECORD_COUNT_OFFSET))
+        .map_err(|_| invalid("record batch declares a negative record count"))
+}
 
-    // In bounds: the length check above covers every field read here.
-    let mut fields = &batch_bytes[PRODUCER_ID_OFFSET..PRODUCER_FIELDS_END];
-    let producer_id = fields.get_i64();
-    let producer_epoch = fields.get_i16();
-    let base_sequence = fields.get_i32();
-
-    debug!(
-        "Extracted producer metadata: producer_id={producer_id}, producer_epoch={producer_epoch}, base_sequence={base_sequence}"
-    );
-
+/// The producer id, epoch and base sequence in the header of a batch that passed
+/// [`check_batch_header`].
+fn extract_producer_metadata(batch: &[u8]) -> ProducerMetadata {
+    let mut fields = &batch[PRODUCER_ID_OFFSET..RECORD_COUNT_OFFSET];
     ProducerMetadata {
-        producer_id,
-        producer_epoch,
-        base_sequence,
+        producer_id: fields.get_i64(),
+        producer_epoch: fields.get_i16(),
+        base_sequence: fields.get_i32(),
     }
+}
+
+/// The least memory `batch` decodes to: its own bytes and its declared records (more if it
+/// is compressed or carries headers). Data that is not a record batch decodes to nothing.
+pub fn least_decoded_memory(batch: &[u8]) -> usize {
+    check_batch_header(batch).map_or(0, |count| {
+        count
+            .saturating_mul(RECORD_MEMORY)
+            .saturating_add(batch.len())
+    })
 }
 
 /// Parse a partition's record data into its records and producer identity, charging the
@@ -86,34 +165,106 @@ pub fn parse_record_batch_with_metadata(
     batch_bytes: &Bytes,
     budget: &DecodeBudget,
 ) -> Result<ParsedRecordBatch> {
+    let records = parse_record_batch(batch_bytes, budget)?;
     Ok(ParsedRecordBatch {
         producer_metadata: extract_producer_metadata(batch_bytes),
-        records: parse_record_batch(batch_bytes, budget)?,
+        records,
     })
 }
 
-/// zstd frames may ask for a window of at most 2^24 bytes (16 MiB). The decoder allocates
-/// the window a frame header declares before it produces any output, so without a cap a
-/// few bytes could make it allocate zstd's default limit of 128 MiB. Kafka's producers use
-/// windows of 2^21 (Java, level 3) or the batch size (librdkafka, which declares it).
-const ZSTD_WINDOW_LOG_MAX: u32 = 24;
+/// zstd frames may ask for a window of at most 2^27 bytes (128 MiB), zstd's own default
+/// limit and Kafka's: Java producers at `compression.zstd.level` 20-22 (Kafka 3.8+) use
+/// windows of 2^25-2^27. The decoder reserves the window a frame header declares up front
+/// but touches it only as it decodes, so the window is charged as it fills: as much again
+/// as the decoded bytes, up to the declared size ([`zstd_window`]).
+const ZSTD_WINDOW_LOG_MAX: u32 = 27;
+
+/// The first byte of a zstd frame (little-endian magic 0xFD2FB528).
+const ZSTD_MAGIC: u32 = 0xFD2F_B528;
+/// Skippable frames carry magics 0x184D2A50 to 0x184D2A5F and no window.
+const ZSTD_SKIPPABLE_MAGIC: u32 = 0x184D_2A50;
+
+/// The window a zstd frame header declares (RFC 8878 §3.1.1.1): from the Window_Descriptor,
+/// or the content size of a single-segment frame.
+fn zstd_frame_window(frame: &[u8]) -> anyhow::Result<u64> {
+    let header = |n: usize| {
+        frame
+            .get(..n)
+            .ok_or_else(|| anyhow::anyhow!("zstd frame header cut short"))
+    };
+    let magic = u32::from_le_bytes(header(4)?.try_into()?);
+    if magic & 0xFFFF_FFF0 == ZSTD_SKIPPABLE_MAGIC {
+        return Ok(0);
+    }
+    anyhow::ensure!(magic == ZSTD_MAGIC, "not a zstd frame");
+    let descriptor = header(5)?[4];
+    if descriptor & 0x20 == 0 {
+        let window_descriptor = header(6)?[5];
+        let log = 10 + u32::from(window_descriptor >> 3);
+        let base = 1u64 << log;
+        return Ok(base + base / 8 * u64::from(window_descriptor & 7));
+    }
+    // Single segment: the window is the frame content size, after the dictionary id.
+    let dictionary_id_bytes = [0, 1, 2, 4][usize::from(descriptor & 3)];
+    let content_size_bytes = [1, 2, 4, 8][usize::from(descriptor >> 6)];
+    let at = 5 + dictionary_id_bytes;
+    let field = header(at + content_size_bytes)?;
+    let mut size = [0u8; 8];
+    size[..content_size_bytes].copy_from_slice(&field[at..]);
+    let size = u64::from_le_bytes(size);
+    Ok(if content_size_bytes == 2 {
+        size + 256
+    } else {
+        size
+    })
+}
+
+/// The largest window any frame of `data` declares; past 2^[`ZSTD_WINDOW_LOG_MAX`] the data
+/// is refused before the decoder reserves anything. A frame the walk cannot measure ends it:
+/// the decoder reports what is wrong with it.
+fn zstd_window(mut data: &[u8]) -> anyhow::Result<usize> {
+    let mut largest = 0u64;
+    while !data.is_empty() {
+        largest = largest.max(zstd_frame_window(data)?);
+        anyhow::ensure!(
+            largest <= 1u64 << ZSTD_WINDOW_LOG_MAX,
+            "zstd frame declares a window of {largest} bytes"
+        );
+        match zstd::zstd_safe::find_frame_compressed_size(data) {
+            Ok(len) if len > 0 && len <= data.len() => data = &data[len..],
+            _ => break,
+        }
+    }
+    Ok(usize::try_from(largest)?)
+}
 
 /// Decoded output written through a [`DecodeBudget`]: a write that would pass the budget
-/// fails before anything is buffered.
+/// fails before anything is buffered. A decoder's window that fills as it decodes is
+/// charged with the output, up to `window` bytes.
 struct BudgetedWriter<'a> {
     out: BytesMut,
     budget: &'a DecodeBudget,
+    window: usize,
+    window_charged: usize,
 }
 
 impl<'a> BudgetedWriter<'a> {
     fn new(budget: &'a DecodeBudget) -> Self {
+        Self::with_window(budget, 0)
+    }
+
+    fn with_window(budget: &'a DecodeBudget, window: usize) -> Self {
         Self {
             out: BytesMut::new(),
             budget,
+            window,
+            window_charged: 0,
         }
     }
 
+    /// The output; what its window was charged is given back (the decoder is gone).
     fn into_bytes(self) -> Bytes {
+        self.budget.release(self.window_charged);
         self.out.freeze()
     }
 }
@@ -128,7 +279,11 @@ fn over_budget() -> io::Error {
 
 impl Write for BudgetedWriter<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.budget.take(buf.len()).map_err(|_| over_budget())?;
+        let window = buf.len().min(self.window - self.window_charged);
+        self.budget
+            .take(buf.len() + window)
+            .map_err(|_| over_budget())?;
+        self.window_charged += window;
         self.out.put_slice(buf);
         Ok(buf.len())
     }
@@ -195,6 +350,7 @@ fn decompress(
             io::copy(&mut decoder, &mut out)?;
         }
         Compression::Zstd => {
+            out = BudgetedWriter::with_window(budget, zstd_window(&data)?);
             let mut decoder = zstd::stream::read::Decoder::new(data.reader())?;
             decoder.window_log_max(ZSTD_WINDOW_LOG_MAX)?;
             io::copy(&mut decoder, &mut out)?;
@@ -203,221 +359,209 @@ fn decompress(
     Ok(out.into_bytes())
 }
 
-/// Parse a partition's record data into its records, charging the decoded bytes to
-/// `budget`.
-///
-/// The data is one RecordBatch v2 (kafka-protocol decodes it, checking the CRC32C, through
-/// `decompress`). Data that does not decode as one is tried as a legacy MessageSet v0/v1,
-/// unless the decode stopped at the end of the budget.
+/// Read a varint (zigzag-encoded, at most 10 bytes) off the front of `buf`.
+fn read_varint(buf: &mut &[u8]) -> Option<i64> {
+    let mut value = 0u64;
+    for shift in (0..70).step_by(7) {
+        let (&byte, rest) = buf.split_first()?;
+        *buf = rest;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            // Zigzag: the low bit is the sign.
+            let magnitude = i64::try_from(value >> 1).ok()?;
+            let sign = i64::try_from(value & 1).ok()?;
+            return Some(magnitude ^ -sign);
+        }
+    }
+    None
+}
+
+/// What decoding a records section allocates besides its records.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct SectionShape {
+    /// Headers, over all records.
+    headers: usize,
+    /// Heap blocks: a copy of every non-empty key, value, header key and header value, and
+    /// the header maps and vectors of records that have headers.
+    allocations: usize,
+}
+
+/// Skip a varint-length-prefixed byte string (`-1` = null when `nullable`); whether it
+/// holds any bytes (its copy is a heap block).
+fn skip_bytes(buf: &mut &[u8], nullable: bool, what: &str) -> std::result::Result<bool, String> {
+    let len = read_varint(buf).ok_or_else(|| format!("record {what} length cut short"))?;
+    if nullable && len == -1 {
+        return Ok(false);
+    }
+    let len = usize::try_from(len)
+        .ok()
+        .filter(|&n| n <= buf.len())
+        .ok_or_else(|| format!("record {what} length {len} is invalid"))?;
+    *buf = &buf[len..];
+    Ok(len > 0)
+}
+
+/// Heap blocks a record with headers adds: kafka-protocol's map (entries and index table)
+/// and our vector.
+const HEADER_CONTAINER_ALLOCATIONS: usize = 3;
+
+/// The shape of one record body (attributes, timestamp and offset deltas, key, value,
+/// headers), which must be exactly its fields.
+fn scan_record(mut body: &[u8]) -> std::result::Result<SectionShape, String> {
+    let cut_short = || "record cut short".to_string();
+    body = body.get(1..).ok_or_else(cut_short)?; // attributes
+    read_varint(&mut body).ok_or_else(cut_short)?; // timestamp delta
+    read_varint(&mut body).ok_or_else(cut_short)?; // offset delta
+    let mut allocations = usize::from(skip_bytes(&mut body, true, "key")?);
+    allocations += usize::from(skip_bytes(&mut body, true, "value")?);
+    let headers = read_varint(&mut body).ok_or_else(cut_short)?;
+    // Every header takes at least two bytes, which bounds the walk by the body.
+    let headers = usize::try_from(headers)
+        .ok()
+        .filter(|&n| n <= body.len() / 2)
+        .ok_or_else(|| format!("record header count {headers} is invalid"))?;
+    if headers > 0 {
+        allocations += HEADER_CONTAINER_ALLOCATIONS;
+    }
+    for _ in 0..headers {
+        allocations += usize::from(skip_bytes(&mut body, false, "header key")?);
+        allocations += usize::from(skip_bytes(&mut body, true, "header value")?);
+    }
+    if body.is_empty() {
+        Ok(SectionShape {
+            headers,
+            allocations,
+        })
+    } else {
+        Err(format!("record has {} bytes past its fields", body.len()))
+    }
+}
+
+/// The shape of a decoded records section, which must hold exactly `count` well-formed
+/// records (Kafka 3.7 refuses anything else as INVALID_RECORD). Allocates nothing, so a
+/// section can be checked, and what it decodes to charged, before kafka-protocol builds
+/// its records.
+fn scan_records(mut section: &[u8], count: usize) -> std::result::Result<SectionShape, String> {
+    let mut shape = SectionShape::default();
+    for read in 0..count {
+        let size = read_varint(&mut section)
+            .ok_or_else(|| format!("records section holds {read} records, not {count}"))?;
+        let size = usize::try_from(size)
+            .ok()
+            .filter(|&n| n <= section.len())
+            .ok_or_else(|| format!("record size {size} is invalid"))?;
+        let (body, rest) = section.split_at(size);
+        let record = scan_record(body)?;
+        shape.headers += record.headers;
+        shape.allocations += record.allocations;
+        section = rest;
+    }
+    if section.is_empty() {
+        Ok(shape)
+    } else {
+        Err(format!(
+            "{} bytes remain past the {count} records the batch declares",
+            section.len()
+        ))
+    }
+}
+
+/// What the memory of a decode is charged for a section of `shape`, besides its bytes and
+/// its records.
+fn shape_memory(shape: SectionShape) -> usize {
+    shape
+        .headers
+        .saturating_mul(HEADER_MEMORY)
+        .saturating_add(shape.allocations.saturating_mul(ALLOCATION_OVERHEAD))
+}
+
+/// Our record from kafka-protocol's.
+fn convert(record: WireRecord) -> Record {
+    Record {
+        key: record.key.map(|k| k.to_vec()),
+        value: record.value.map(|v| v.to_vec()),
+        headers: record
+            .headers
+            .into_iter()
+            .map(|(key, value)| RecordHeader {
+                key: key.to_string(),
+                value: value.map_or_else(Vec::new, |b| b.to_vec()),
+            })
+            .collect(),
+        timestamp: Some(record.timestamp),
+    }
+}
+
+/// Parse a partition's record data (one RecordBatch v2) into its records, charging their
+/// memory to `budget` (see the module docs). kafka-protocol decodes the batch, checking its
+/// CRC32C, through `decompress` and `scan_records`.
 pub fn parse_record_batch(batch_bytes: &Bytes, budget: &DecodeBudget) -> Result<Vec<Record>> {
-    if batch_bytes.is_empty() {
-        return Ok(Vec::new());
+    let count = check_batch_header(batch_bytes)?;
+    debug!(
+        "parse_record_batch: {} bytes, {count} records",
+        batch_bytes.len()
+    );
+    let at_the_limit = |e: &dyn std::fmt::Display| {
+        corrupt(format!("record batch stopped at the decode limit: {e}"))
+    };
+    if budget.take(count.saturating_mul(RECORD_MEMORY)).is_err() {
+        return Err(at_the_limit(&format!("{count} records")));
     }
 
-    debug!("parse_record_batch: received {} bytes", batch_bytes.len());
-    debug!(
-        "First 20 bytes: {:?}",
-        &batch_bytes[..batch_bytes.len().min(20)]
-    );
-
+    let not_the_declared_records = Cell::new(None);
+    let headers = Cell::new(0usize);
     let mut batch_buf = batch_bytes.clone();
     let decoded = RecordBatchDecoder::decode_with_custom_compression(
         &mut batch_buf,
-        Some(|data: &mut Bytes, compression| decompress(data, compression, budget)),
+        Some(|data: &mut Bytes, compression| {
+            let section = decompress(data, compression, budget)?;
+            match scan_records(&section, count) {
+                Ok(shape) => {
+                    budget
+                        .take(shape_memory(shape))
+                        .map_err(|_| over_budget())?;
+                    headers.set(shape.headers);
+                    Ok(section)
+                }
+                Err(why) => {
+                    not_the_declared_records.set(Some(why));
+                    anyhow::bail!("records section does not match its batch header")
+                }
+            }
+        }),
     );
     match decoded {
-        // Produce v3+ (the only Produce versions pg_kafka accepts) carries exactly one
-        // record batch per partition. Decoding one and ignoring the rest would drop the
-        // trailing batches while acking the request; reject it as Kafka does.
-        Ok(_) if batch_buf.has_remaining() => Err(KafkaError::InvalidRecord {
-            message: format!(
-                "partition data carries more than one record batch ({} trailing bytes)",
-                batch_buf.remaining()
-            ),
-        }),
-        Ok(record_set) => Ok(record_set
-            .records
-            .into_iter()
-            .map(|record| Record {
-                key: record.key.map(|k| k.to_vec()),
-                value: record.value.map(|v| v.to_vec()),
-                headers: record
-                    .headers
-                    .into_iter()
-                    .map(|(key, value)| RecordHeader {
-                        key: key.to_string(),
-                        value: value.map_or_else(Vec::new, |b| b.to_vec()),
-                    })
-                    .collect(),
-                timestamp: Some(record.timestamp),
-            })
-            .collect()),
-        Err(e) if budget.exhausted().is_some() => Err(KafkaError::CorruptMessage {
-            message: format!("record batch stopped at the decode limit: {e}"),
-        }),
-        Err(e) => {
-            debug!("RecordBatch decode failed ({e}), trying MessageSet v0/v1 format");
-            // The legacy records are copied out of the batch: at most its size.
-            if budget.take(batch_bytes.len()).is_err() {
-                return Err(KafkaError::CorruptMessage {
-                    message: "legacy message set stopped at the decode limit".into(),
-                });
+        // Produce v3+ carries exactly one record batch per partition. Decoding one and
+        // ignoring the rest would drop the trailing batches while acking the request;
+        // reject it as Kafka does.
+        Ok(_) if batch_buf.has_remaining() => Err(invalid(format!(
+            "partition data carries more than one record batch ({} trailing bytes)",
+            batch_buf.remaining()
+        ))),
+        Ok(record_set) => {
+            // A fresh vector of exactly the records: collecting in place would keep the
+            // larger allocation of kafka-protocol's records.
+            let mut records = Vec::with_capacity(record_set.records.len());
+            for record in record_set.records {
+                records.push(convert(record));
             }
-            parse_message_set_legacy(batch_bytes, e)
+            budget.release(
+                count.saturating_mul(size_of::<WireRecord>())
+                    + headers.get().saturating_mul(WIRE_HEADER_MEMORY),
+            );
+            Ok(records)
         }
-    }
-}
-
-/// CRC-32 (IEEE / `java.util.zip.CRC32`, reflected poly 0xEDB88320): the checksum a legacy
-/// MessageSet v0/v1 message carries over its body. Computed bit by bit (these batches are
-/// off the hot path), so no extra dependency is needed.
-fn crc32_ieee(data: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFFu32;
-    for &byte in data {
-        crc ^= u32::from(byte);
-        for _ in 0..8 {
-            crc = if crc & 1 != 0 {
-                (crc >> 1) ^ 0xEDB8_8320
-            } else {
-                crc >> 1
-            };
-        }
-    }
-    !crc
-}
-
-/// Offset (8) + message size (4) in front of each MessageSet entry.
-const MESSAGE_SET_ENTRY_HEADER_BYTES: usize = 12;
-/// Smallest legacy message: CRC (4) + magic (1) + attributes (1).
-const MIN_LEGACY_MESSAGE_BYTES: usize = 6;
-/// Bytes of the CRC in front of a legacy message.
-const LEGACY_CRC_BYTES: usize = 4;
-
-/// A legacy message cut short inside a key or value.
-struct Truncated;
-
-/// An i32-length-prefixed nullable byte string of a legacy message: `None` for a null
-/// (negative length) or absent one.
-fn read_nullable_bytes(
-    msg: &mut Bytes,
-    what: &str,
-) -> std::result::Result<Option<Vec<u8>>, Truncated> {
-    if msg.remaining() < 4 {
-        return Ok(None);
-    }
-    let Ok(len) = usize::try_from(msg.get_i32()) else {
-        return Ok(None);
-    };
-    if msg.remaining() < len {
-        warn!("Insufficient bytes for {what}");
-        return Err(Truncated);
-    }
-    Ok(Some(msg.copy_to_bytes(len).to_vec()))
-}
-
-/// One legacy message (CRC, magic, attributes, optional timestamp, key, value) as a
-/// record, or `None` when it fails its CRC or is cut short. `msg` holds at least
-/// [`MIN_LEGACY_MESSAGE_BYTES`].
-fn parse_legacy_message(msg: &Bytes) -> Option<Record> {
-    // The CRC32 covers everything after the CRC field (magic, attributes, key, value);
-    // a mismatch means a corrupt message, so stop rather than persist garbage. (The
-    // RecordBatch v2 path has its CRC32C checked by the kafka-protocol decoder.)
-    let stored_crc = u32::from_be_bytes([msg[0], msg[1], msg[2], msg[3]]);
-    let computed_crc = crc32_ieee(&msg[LEGACY_CRC_BYTES..]);
-    if stored_crc != computed_crc {
-        warn!(
-            "MessageSet CRC mismatch (corrupt message): stored={stored_crc:#010x} computed={computed_crc:#010x}"
-        );
-        return None;
-    }
-
-    // The size floor keeps these two reads within `msg`.
-    let mut msg = msg.slice(LEGACY_CRC_BYTES..);
-    let magic = msg.get_i8();
-    let _attributes = msg.get_i8(); // compression, timestamp type
-
-    // Message v1 (magic=1) carries an 8-byte timestamp between attributes and the key;
-    // v0 does not.
-    let timestamp = if magic >= 1 {
-        if msg.remaining() < 8 {
-            warn!("Insufficient bytes for v1 message timestamp");
-            return None;
-        }
-        let ts = msg.get_i64();
-        (ts >= 0).then_some(ts)
-    } else {
-        None
-    };
-
-    let key = read_nullable_bytes(&mut msg, "key").ok()?;
-    let value = read_nullable_bytes(&mut msg, "value").ok()?;
-
-    Some(Record {
-        key,
-        value,
-        headers: Vec::new(), // MessageSet v0/v1 has no headers
-        timestamp,           // None for v0; the producer timestamp for v1 (-1 = none)
-    })
-}
-
-/// Parse a legacy MessageSet v0/v1:
-///
-/// ```text
-/// repeated: [offset i64][message size i32][message]
-/// message:  [crc u32][magic i8][attributes i8][timestamp i64, v1 only][key][value]
-/// key/value: [length i32, -1 = null][bytes]
-/// ```
-///
-/// Parsing stops at the first entry that is truncated or fails its CRC; it is an error
-/// only when no record parsed, reported with `original_error` (why the data is not a
-/// RecordBatch v2).
-fn parse_message_set_legacy(
-    batch_bytes: &Bytes,
-    original_error: impl std::fmt::Display,
-) -> Result<Vec<Record>> {
-    let mut buf = batch_bytes.clone();
-    let mut records = Vec::new();
-
-    while buf.remaining() >= MESSAGE_SET_ENTRY_HEADER_BYTES {
-        let _offset = buf.get_i64(); // the broker assigns its own offsets
-        let message_size = buf.get_i32();
-
-        // The size must cover the 6-byte message header and fit what remains. Without the
-        // floor, a crafted size in 0..=5 would pass and the header reads of
-        // `parse_legacy_message` would underflow the buffer and panic on the untrusted
-        // network path.
-        let Some(message_size) = usize::try_from(message_size)
-            .ok()
-            .filter(|&n| (MIN_LEGACY_MESSAGE_BYTES..=buf.remaining()).contains(&n))
-        else {
-            warn!("Invalid message size in MessageSet: {message_size}");
-            break;
-        };
-
-        // Carve out exactly this message so every read of it is bounded by its size.
-        let msg = buf.copy_to_bytes(message_size);
-
-        let Some(record) = parse_legacy_message(&msg) else {
-            break;
-        };
-        records.push(record);
-    }
-
-    if records.is_empty() {
-        Err(KafkaError::encoding(format!(
-            "Failed to parse as both RecordBatch and MessageSet: {original_error}"
-        )))
-    } else {
-        debug!(
-            "Successfully parsed {} records from MessageSet format",
-            records.len()
-        );
-        Ok(records)
+        Err(e) if budget.exhausted().is_some() => Err(at_the_limit(&e)),
+        Err(e) => match not_the_declared_records.take() {
+            Some(why) => Err(invalid(why)),
+            None => Err(corrupt(format!("record batch does not decode: {e}"))),
+        },
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::test_batches::{header_records, raw_batch, tiny_records};
     use super::*;
     use bytes::Bytes;
 
@@ -475,10 +619,12 @@ mod tests {
             let records = parse_record_batch(&batch, &budget).unwrap();
             assert_eq!(records.len(), 1, "{compression:?}");
             assert_eq!(records[0].value.as_ref().unwrap().len(), 100_000);
-            // The records section: the value plus a few bytes of record framing.
+            // The records section (the value plus a few bytes of record framing), the
+            // record and the value's heap block.
             let charged = budget.charged();
+            let least = 100_000 + size_of::<Record>() + ALLOCATION_OVERHEAD;
             assert!(
-                (100_000..100_100).contains(&charged),
+                (least..least + 100).contains(&charged),
                 "{compression:?} charged {charged}"
             );
         }
@@ -518,17 +664,63 @@ mod tests {
         assert_eq!(budget.exhausted(), Some(Exhausted::Limit));
     }
 
-    #[test]
-    fn zstd_frames_asking_for_a_huge_window_are_refused() {
-        // A zstd frame whose header declares a 2^27-byte window and no content size: the
-        // decoder would allocate the window up front.
-        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 19).unwrap();
-        encoder.window_log(27).unwrap();
+    /// A zstd frame of `data` with a `window_log` window and no content size, as a Java
+    /// producer's streaming encoder writes it.
+    fn zstd_frame(data: &[u8], level: i32, window_log: u32) -> Vec<u8> {
+        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), level).unwrap();
+        encoder.window_log(window_log).unwrap();
         encoder.include_contentsize(false).unwrap();
-        encoder.write_all(&[7u8; 1000]).unwrap();
-        let frame = encoder.finish().unwrap();
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn zstd_frames_with_windows_up_to_kafkas_limit_decode() {
+        // Kafka 3.8+ producers at compression.zstd.level 22 declare a 2^27-byte window;
+        // Kafka accepts up to that. A larger window is refused before the decoder
+        // reserves it.
+        let data = vec![7u8; 1000];
+        for window_log in [21, 25, 27] {
+            let frame = zstd_frame(&data, 22, window_log);
+            assert_eq!(
+                zstd_window(&frame).unwrap(),
+                1 << window_log,
+                "window 2^{window_log}"
+            );
+            let out = decompress(&mut Bytes::from(frame), Compression::Zstd, &budget());
+            assert_eq!(&out.unwrap()[..], &data[..], "window 2^{window_log}");
+        }
+        let frame = zstd_frame(&data, 19, 28);
         let budget = budget();
         assert!(decompress(&mut Bytes::from(frame), Compression::Zstd, &budget).is_err());
+        assert_eq!(budget.charged(), 0, "refused before decoding");
+    }
+
+    #[test]
+    fn a_zstd_window_is_charged_as_it_fills() {
+        // While it decodes, a window holds as much again as the decoded bytes, up to its
+        // size; it is given back once the decoder is gone.
+        let data: Vec<u8> = (0..4_000_000u32).map(|i| (i % 251) as u8).collect();
+        for (window_log, extra) in [(20, 1 << 20), (25, data.len())] {
+            let frame = zstd_frame(&data, 3, window_log);
+            let peak = DecodeBudget::new(data.len() + extra - 1);
+            assert!(
+                decompress(&mut Bytes::from(frame.clone()), Compression::Zstd, &peak).is_err(),
+                "window 2^{window_log} is charged"
+            );
+            let budget = DecodeBudget::new(data.len() + extra);
+            let out = decompress(&mut Bytes::from(frame), Compression::Zstd, &budget).unwrap();
+            assert_eq!(out.len(), data.len());
+            assert_eq!(budget.charged(), data.len(), "window 2^{window_log}");
+        }
+        // Concatenated frames: the largest window counts; skippable frames have none.
+        let mut frames = vec![0x50, 0x2A, 0x4D, 0x18, 3, 0, 0, 0, 1, 2, 3];
+        frames.extend(zstd_frame(b"small", 3, 10));
+        frames.extend(zstd_frame(b"large", 3, 26));
+        assert_eq!(zstd_window(&frames).unwrap(), 1 << 26);
+        // A single-segment frame's window is its content size.
+        let single = zstd::bulk::compress(&[1u8; 3000], 3).unwrap();
+        assert_eq!(zstd_window(&single).unwrap(), 3000);
     }
 
     #[test]
@@ -574,7 +766,9 @@ mod tests {
                 producer_epoch: -1,
                 timestamp_type: TimestampType::Creation,
                 offset: i64::try_from(i).unwrap(),
-                sequence: -1,
+                // offset - sequence must not change within a batch, or the encoder starts a
+                // new one.
+                sequence: i32::try_from(i).unwrap() - 1,
                 timestamp: 0,
                 key: None,
                 value: Some(Bytes::from(v.to_string())),
@@ -594,20 +788,25 @@ mod tests {
         buf
     }
 
-    /// One MessageSet entry: offset, message size, `crc`, then `body` (magic, attributes,
-    /// key, value).
-    fn legacy_entry_with_crc(body: &[u8], crc: u32) -> Vec<u8> {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&0i64.to_be_bytes()); // offset (ignored)
-        buf.extend_from_slice(&i32::try_from(4 + body.len()).unwrap().to_be_bytes()); // CRC + body
-        buf.extend_from_slice(&crc.to_be_bytes());
-        buf.extend_from_slice(body);
-        buf
+    /// One legacy MessageSet v0/v1 entry (offset, message size, CRC, magic, attributes,
+    /// a v1 timestamp, a null key and `value`). The broker refuses it before its CRC.
+    fn legacy_entry(magic: u8, attributes: u8, value: &[u8]) -> Vec<u8> {
+        let mut body = vec![magic, attributes];
+        if magic == 1 {
+            body.extend_from_slice(&0i64.to_be_bytes());
+        }
+        body.extend_from_slice(&(-1i32).to_be_bytes());
+        body.extend_from_slice(&i32::try_from(value.len()).unwrap().to_be_bytes());
+        body.extend_from_slice(value);
+        let mut entry = 0i64.to_be_bytes().to_vec();
+        entry.extend_from_slice(&i32::try_from(4 + body.len()).unwrap().to_be_bytes());
+        entry.extend_from_slice(&0u32.to_be_bytes());
+        entry.extend_from_slice(&body);
+        entry
     }
 
-    /// One MessageSet entry with a valid CRC over `body`.
-    fn legacy_entry(body: &[u8]) -> Vec<u8> {
-        legacy_entry_with_crc(body, crc32_ieee(body))
+    fn code(err: &KafkaError) -> i16 {
+        err.to_kafka_error_code()
     }
 
     #[test]
@@ -632,261 +831,104 @@ mod tests {
         );
     }
 
-    // ========== Empty/Edge Case Tests ==========
-
     #[test]
-    fn test_parse_record_batch_empty() {
-        let batch_bytes = Bytes::new();
-        let result = parse_record_batch(&batch_bytes, &budget());
-
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_empty());
+    fn legacy_message_sets_are_invalid_records() {
+        use crate::kafka::constants::ERROR_INVALID_RECORD;
+        // Produce v3+ carries RecordBatch v2 only (Kafka: INVALID_RECORD). A legacy set was
+        // stored before: a gzip wrapper as one garbage record, a cut-short set as its prefix.
+        let mut two = legacy_entry(1, 0, b"one");
+        two.extend_from_slice(&legacy_entry(1, 0, b"two"));
+        let mut cut_short = legacy_entry(0, 0, b"kept");
+        cut_short.extend_from_slice(&legacy_entry(0, 0, b"lost")[..20]);
+        let shapes = [
+            legacy_entry(0, 0, b"v0"),
+            legacy_entry(1, 0, b"v1"),
+            legacy_entry(1, 1, b"gzip wrapper"),
+            two,
+            cut_short,
+        ];
+        for data in shapes {
+            let err = parse_record_batch(&Bytes::from(data.clone()), &budget()).unwrap_err();
+            assert_eq!(code(&err), ERROR_INVALID_RECORD, "{data:?}: {err}");
+        }
     }
 
     #[test]
-    fn test_parse_record_batch_with_metadata_empty() {
-        let batch_bytes = Bytes::new();
-        let result = parse_record_batch_with_metadata(&batch_bytes, &budget());
-
-        assert!(result.is_ok());
-        let parsed = result.unwrap();
-        assert!(parsed.records.is_empty());
-        // Default producer metadata for empty batch (uses ProducerMetadata::default())
-        assert_eq!(parsed.producer_metadata.producer_id, 0);
-        assert_eq!(parsed.producer_metadata.producer_epoch, 0);
-        assert_eq!(parsed.producer_metadata.base_sequence, 0);
-    }
-
-    // ========== Producer Metadata Extraction Tests ==========
-
-    #[test]
-    fn test_extract_producer_metadata_too_short() {
-        // Less than 57 bytes - should return defaults (ProducerMetadata::default())
-        let short_bytes = Bytes::from(vec![0u8; 30]);
-        let metadata = extract_producer_metadata(&short_bytes);
-
-        // Default() returns 0 values
-        assert_eq!(metadata.producer_id, 0);
-        assert_eq!(metadata.producer_epoch, 0);
-        assert_eq!(metadata.base_sequence, 0);
-    }
-
-    #[test]
-    fn test_extract_producer_metadata_wrong_magic() {
-        // Create a buffer with enough bytes but wrong magic (not 2)
-        let mut buf = vec![0u8; 60];
-        buf[16] = 1; // Magic byte = 1 (legacy format)
-
-        let bytes = Bytes::from(buf);
-        let metadata = extract_producer_metadata(&bytes);
-
-        // Should return defaults for non-v2 format
-        assert_eq!(metadata.producer_id, -1);
-        assert_eq!(metadata.producer_epoch, -1);
-        assert_eq!(metadata.base_sequence, -1);
+    fn batch_framing_errors_match_kafka() {
+        use crate::kafka::constants::{ERROR_CORRUPT_MESSAGE, ERROR_INVALID_RECORD};
+        let ok = encode_batch(&["a", "b"]).freeze();
+        assert_eq!(parse_record_batch(&ok, &budget()).unwrap().len(), 2);
+        let with = |at: usize, bytes: &[u8]| {
+            let mut b = ok.to_vec();
+            b[at..at + bytes.len()].copy_from_slice(bytes);
+            Bytes::from(b)
+        };
+        let cases: [(&str, Bytes, i16); 7] = [
+            ("empty", Bytes::new(), ERROR_INVALID_RECORD),
+            ("no magic byte", ok.slice(..16), ERROR_INVALID_RECORD),
+            ("cut short", ok.slice(..ok.len() - 3), ERROR_INVALID_RECORD),
+            (
+                "negative count",
+                with(57, &(-1i32).to_be_bytes()),
+                ERROR_INVALID_RECORD,
+            ),
+            (
+                "zero batch length",
+                with(8, &0i32.to_be_bytes()),
+                ERROR_CORRUPT_MESSAGE,
+            ),
+            (
+                "header cut short",
+                with(8, &40i32.to_be_bytes()),
+                ERROR_CORRUPT_MESSAGE,
+            ),
+            ("bad CRC", with(ok.len() - 1, b"x"), ERROR_CORRUPT_MESSAGE),
+        ];
+        for (what, data, expected) in cases {
+            let err = parse_record_batch(&data, &budget()).unwrap_err();
+            assert_eq!(code(&err), expected, "{what}: {err}");
+        }
     }
 
     #[test]
     fn test_extract_producer_metadata_valid_v2() {
-        // Create a minimal valid RecordBatch v2 header
         let mut buf = vec![0u8; 61];
-
-        // Magic byte at offset 16
-        buf[16] = 2;
-
-        // Producer ID at offset 43 (i64 big-endian)
-        let producer_id: i64 = 12345;
-        buf[43..51].copy_from_slice(&producer_id.to_be_bytes());
-
-        // Producer epoch at offset 51 (i16 big-endian)
-        let producer_epoch: i16 = 5;
-        buf[51..53].copy_from_slice(&producer_epoch.to_be_bytes());
-
-        // Base sequence at offset 53 (i32 big-endian)
-        let base_sequence: i32 = 100;
-        buf[53..57].copy_from_slice(&base_sequence.to_be_bytes());
-
-        let bytes = Bytes::from(buf);
-        let metadata = extract_producer_metadata(&bytes);
-
+        buf[43..51].copy_from_slice(&12345i64.to_be_bytes());
+        buf[51..53].copy_from_slice(&5i16.to_be_bytes());
+        buf[53..57].copy_from_slice(&100i32.to_be_bytes());
+        let metadata = extract_producer_metadata(&buf);
         assert_eq!(metadata.producer_id, 12345);
         assert_eq!(metadata.producer_epoch, 5);
         assert_eq!(metadata.base_sequence, 100);
     }
 
     #[test]
-    fn test_extract_producer_metadata_negative_values() {
-        // Test with -1 values (non-idempotent producer)
-        let mut buf = vec![0u8; 61];
-        buf[16] = 2; // Magic = 2
-
-        // Producer ID = -1
-        buf[43..51].copy_from_slice(&(-1i64).to_be_bytes());
-        // Producer epoch = -1
-        buf[51..53].copy_from_slice(&(-1i16).to_be_bytes());
-        // Base sequence = -1
-        buf[53..57].copy_from_slice(&(-1i32).to_be_bytes());
-
-        let bytes = Bytes::from(buf);
-        let metadata = extract_producer_metadata(&bytes);
-
-        assert_eq!(metadata.producer_id, -1);
-        assert_eq!(metadata.producer_epoch, -1);
-        assert_eq!(metadata.base_sequence, -1);
-    }
-
-    // ========== MessageSet Legacy Format Tests ==========
-
-    #[test]
-    fn test_parse_message_set_legacy_invalid() {
-        // Too short for any valid message
-        let bytes = Bytes::from(vec![0u8; 5]);
-        let result = parse_message_set_legacy(&bytes, "test error");
-
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_message_set_legacy_negative_message_size() {
-        // Create buffer with negative message size
-        let mut buf = vec![0u8; 20];
-        // Offset (8 bytes) - don't care
-        // Message size = -1 (invalid)
-        buf[8..12].copy_from_slice(&(-1i32).to_be_bytes());
-
-        let bytes = Bytes::from(buf);
-        let result = parse_message_set_legacy(&bytes, "test error");
-
-        // Should fail because no valid records parsed
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_message_set_legacy_simple_message() {
-        // Build the message body — everything the CRC covers: magic, attributes, key, value.
-        let mut body = Vec::new();
-        body.push(0); // magic v0
-        body.push(0); // attributes
-        body.extend_from_slice(&(-1i32).to_be_bytes()); // null key
-        body.extend_from_slice(&5i32.to_be_bytes()); // value length
-        body.extend_from_slice(b"hello");
-
-        let buf = legacy_entry(&body);
-
-        let bytes = Bytes::from(buf);
-        let result = parse_message_set_legacy(&bytes, "test error");
-
-        assert!(result.is_ok());
-        let records = result.unwrap();
-        assert_eq!(records.len(), 1);
-        assert!(records[0].key.is_none());
-        assert_eq!(records[0].value, Some(b"hello".to_vec()));
-        assert!(records[0].headers.is_empty()); // Legacy format has no headers
-    }
-
-    #[test]
-    fn test_parse_message_set_legacy_v1_skips_timestamp() {
-        // Message v1 (magic=1) has an 8-byte timestamp between attributes and key. It
-        // must be read as the timestamp, not mistaken for the key length.
-        let mut body = Vec::new();
-        body.push(1); // magic v1
-        body.push(0); // attributes
-        body.extend_from_slice(&1_700_000_000_000i64.to_be_bytes()); // timestamp
-        body.extend_from_slice(&(-1i32).to_be_bytes()); // null key
-        body.extend_from_slice(&2i32.to_be_bytes()); // value length
-        body.extend_from_slice(b"hi");
-
-        let buf = legacy_entry(&body);
-
-        let records = parse_message_set_legacy(&Bytes::from(buf), "test error").unwrap();
-        assert_eq!(records.len(), 1);
-        assert!(records[0].key.is_none());
-        assert_eq!(records[0].value, Some(b"hi".to_vec()));
-        assert_eq!(records[0].timestamp, Some(1_700_000_000_000));
-    }
-
-    #[test]
-    fn test_parse_message_set_legacy_with_key() {
-        // body = magic + attributes + keylen + "key" + vallen + "value"
-        let mut body = Vec::new();
-        body.push(0); // magic
-        body.push(0); // attributes
-        body.extend_from_slice(&3i32.to_be_bytes());
-        body.extend_from_slice(b"key");
-        body.extend_from_slice(&5i32.to_be_bytes());
-        body.extend_from_slice(b"value");
-
-        let buf = legacy_entry(&body);
-
-        let bytes = Bytes::from(buf);
-        let result = parse_message_set_legacy(&bytes, "test error");
-
-        assert!(result.is_ok());
-        let records = result.unwrap();
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].key, Some(b"key".to_vec()));
-        assert_eq!(records[0].value, Some(b"value".to_vec()));
-    }
-
-    #[test]
-    fn test_parse_message_set_legacy_rejects_bad_crc() {
-        // A message whose CRC doesn't match its body is corrupt and must not be parsed into a
-        // record. Build a valid body, then store a deliberately wrong CRC.
-        let mut body = Vec::new();
-        body.push(0); // magic
-        body.push(0); // attributes
-        body.extend_from_slice(&(-1i32).to_be_bytes()); // null key
-        body.extend_from_slice(&5i32.to_be_bytes());
-        body.extend_from_slice(b"hello");
-
-        let wrong_crc = crc32_ieee(&body).wrapping_add(1); // off by one → mismatch
-
-        let buf = legacy_entry_with_crc(&body, wrong_crc);
-
-        let bytes = Bytes::from(buf);
-        // No valid record parses → the function reports an error (and never persists the message).
-        assert!(parse_message_set_legacy(&bytes, "test error").is_err());
-    }
-
-    #[test]
-    fn test_parse_message_set_tiny_message_size_no_panic() {
-        // A message_size in 0..=5 is below the 6-byte message-header floor and must be
-        // rejected, not read as a header (the header reads would underflow and panic).
-        for size in 0i32..=5 {
-            let mut buf = Vec::new();
-            buf.extend_from_slice(&0i64.to_be_bytes()); // offset
-            buf.extend_from_slice(&size.to_be_bytes()); // tiny message_size
-            let bytes = Bytes::from(buf);
-            let result = parse_message_set_legacy(&bytes, "test error");
-            assert!(result.is_err(), "size {size} should yield Err, not panic");
-        }
-    }
-
-    #[test]
-    fn test_parse_message_set_size_exceeds_remaining_no_panic() {
-        // A message_size larger than the remaining buffer is rejected cleanly.
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&0i64.to_be_bytes());
-        buf.extend_from_slice(&1000i32.to_be_bytes()); // claims 1000 bytes
-        buf.extend_from_slice(&[0u8; 4]); // but only 4 follow
-        let bytes = Bytes::from(buf);
-        assert!(parse_message_set_legacy(&bytes, "test error").is_err());
+    fn test_parse_record_batch_with_metadata_reads_the_header() {
+        let parsed =
+            parse_record_batch_with_metadata(&encode_batch(&["x"]).freeze(), &budget()).unwrap();
+        assert_eq!(parsed.records.len(), 1);
+        assert_eq!(parsed.producer_metadata.producer_id, -1);
+        assert_eq!(parsed.producer_metadata.producer_epoch, -1);
+        assert_eq!(parsed.producer_metadata.base_sequence, -1);
     }
 
     proptest::proptest! {
-        // Fuzz the legacy MessageSet parser (hand-rolled code) directly with
-        // [offset][size][maybe-body] framing — it must never panic (returns Ok or Err).
+        // A valid batch with any bytes of its header overwritten: the framing checks read
+        // only bytes they checked are there, so it never panics.
         #[test]
-        fn fuzz_parse_message_set_legacy_never_panics(
-            size in proptest::num::i32::ANY,
-            body in proptest::collection::vec(proptest::num::u8::ANY, 0..256),
+        fn fuzz_batch_header_never_panics(
+            at in 0usize..61,
+            bytes in proptest::collection::vec(proptest::num::u8::ANY, 1..8),
         ) {
-            let mut buf = Vec::new();
-            buf.extend_from_slice(&0i64.to_be_bytes());
-            buf.extend_from_slice(&size.to_be_bytes());
-            buf.extend_from_slice(&body);
-            let bytes = Bytes::from(buf);
-            let _ = parse_message_set_legacy(&bytes, "fuzz");
+            let mut data = encode_batch(&["a", "b"]).to_vec();
+            for (i, b) in bytes.iter().enumerate() {
+                if let Some(slot) = data.get_mut(at + i) {
+                    *slot = *b;
+                }
+            }
+            let _ = parse_record_batch(&Bytes::from(data.clone()), &budget());
+            data.truncate(at);
+            let _ = parse_record_batch(&Bytes::from(data), &budget());
         }
 
         // The full `parse_record_batch` pipeline, including the v2 `RecordBatchDecoder` path,
@@ -902,6 +944,149 @@ mod tests {
         ) {
             let _ = parse_record_batch(&Bytes::from(bytes), &budget());
         }
+    }
+
+    #[test]
+    fn the_per_record_and_per_header_costs_are_the_documented_ones() {
+        // docs/PROTOCOL_DEVIATIONS.md (Compression) quotes these.
+        assert_eq!(RECORD_MEMORY, 264);
+        assert_eq!(HEADER_MEMORY, 136);
+    }
+
+    #[test]
+    fn varints_are_zigzag_and_bounded() {
+        let read = |bytes: &[u8]| read_varint(&mut &bytes[..]);
+        assert_eq!(read(&[0]), Some(0));
+        assert_eq!(read(&[1]), Some(-1));
+        assert_eq!(read(&[2]), Some(1));
+        assert_eq!(read(&[0xac, 0x02]), Some(150));
+        assert_eq!(read(&[0x80]), None, "cut short");
+        assert_eq!(read(&[0xff; 11]), None, "longer than 10 bytes");
+        let mut rest = &[0x02u8, 0x7f][..];
+        assert_eq!(read_varint(&mut rest), Some(1));
+        assert_eq!(rest, &[0x7f]);
+    }
+
+    #[test]
+    fn the_section_walk_counts_headers_and_heap_blocks() {
+        // One record: key "k" (a heap block), null value, two headers ("a" -> "xy" and
+        // "b" -> null): blocks for the key, both header keys, one header value, and the
+        // header containers.
+        let body = [0u8, 0, 0, 2, b'k', 1, 4, 2, b'a', 4, b'x', b'y', 2, b'b', 1];
+        let mut section = vec![u8::try_from(body.len() * 2).unwrap()];
+        section.extend_from_slice(&body);
+        assert_eq!(
+            scan_records(&section, 1),
+            Ok(SectionShape {
+                headers: 2,
+                allocations: 4 + HEADER_CONTAINER_ALLOCATIONS
+            })
+        );
+        assert!(scan_records(&section, 2).is_err(), "one record, not two");
+        assert!(scan_records(&section[..section.len() - 1], 1).is_err());
+        // A header count the body cannot hold is refused before it is walked.
+        let mut huge = vec![0u8, 0, 0, 1, 1, 0xfe, 0xff, 0xff, 0xff, 0x0f];
+        huge.insert(0, u8::try_from(huge.len() * 2).unwrap());
+        assert!(scan_records(&huge, 1).unwrap_err().contains("header count"));
+    }
+
+    #[test]
+    fn least_decoded_memory_counts_the_declared_records() {
+        let batch = raw_batch(&tiny_records(1000), 1000, true);
+        assert_eq!(
+            least_decoded_memory(&batch),
+            batch.len() + 1000 * RECORD_MEMORY
+        );
+        assert_eq!(least_decoded_memory(b"not a batch"), 0);
+    }
+
+    #[test]
+    fn a_batch_of_tiny_records_is_charged_their_memory_before_it_decodes() {
+        // 1.5 million 7-byte records: 10 MB decoded, 60 KB of gzip on the wire, and some
+        // 400 MB once decoded into records. The declared count is charged before anything
+        // decompresses, so the batch stops at the request limit having decoded nothing.
+        let n = 1_500_000;
+        let batch = raw_batch(&tiny_records(n), i32::try_from(n).unwrap(), true);
+        assert!(batch.len() < 100_000, "{} bytes on the wire", batch.len());
+        let budget = budget();
+        let started = std::time::Instant::now();
+        let err = parse_record_batch(&batch, &budget).unwrap_err();
+        assert_eq!(budget.exhausted(), Some(Exhausted::Limit), "{err}");
+        assert_eq!(budget.charged(), 0, "nothing decoded");
+        assert!(started.elapsed() < std::time::Duration::from_millis(50));
+
+        // Under the inline limit the same shape stops at a few thousand records.
+        let small = DecodeBudget::new(1024 * 1024);
+        let batch = raw_batch(&tiny_records(150_000), 150_000, true);
+        assert!(parse_record_batch(&batch, &small).is_err());
+        assert_eq!(small.exhausted(), Some(Exhausted::Limit));
+    }
+
+    #[test]
+    fn a_batch_of_tiny_records_within_the_limit_holds_what_it_is_charged() {
+        let n = 10_000;
+        let batch = raw_batch(&tiny_records(n), i32::try_from(n).unwrap(), true);
+        let budget = budget();
+        let records = parse_record_batch(&batch, &budget).unwrap();
+        assert_eq!(records.len(), n);
+        // A fresh vector: collecting in place would keep kafka-protocol's twice-as-large
+        // allocation.
+        assert_eq!(records.capacity(), n);
+        let held = n * size_of::<Record>();
+        assert!(
+            budget.charged() >= held && budget.charged() <= held + 7 * n,
+            "charged {} for {held}",
+            budget.charged()
+        );
+    }
+
+    #[test]
+    fn header_heavy_records_are_charged_their_headers() {
+        // 1000 records of 5000 headers, 2 bytes each: 10 MB decoded, but each header
+        // takes over 100 bytes decoded. They stop at the request limit before
+        // kafka-protocol builds them.
+        let batch = raw_batch(&header_records(1000, 5000), 1000, true);
+        assert!(batch.len() < 1_000_000);
+        let budget = budget();
+        let started = std::time::Instant::now();
+        let err = parse_record_batch(&batch, &budget).unwrap_err();
+        assert_eq!(budget.exhausted(), Some(Exhausted::Limit), "{err}");
+        assert!(budget.charged() <= MAX_DECODED_REQUEST_BYTES);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+
+        // Within the limit, each header is charged.
+        let within = DecodeBudget::new(MAX_DECODED_REQUEST_BYTES);
+        let records =
+            parse_record_batch(&raw_batch(&header_records(10, 100), 10, false), &within).unwrap();
+        // (Their keys are all empty, and a record holds its headers in a map.)
+        assert_eq!(records.len(), 10);
+        assert!(within.charged() >= 1000 * size_of::<RecordHeader>());
+    }
+
+    #[test]
+    fn a_record_count_that_does_not_match_the_records_is_an_invalid_record() {
+        use crate::kafka::constants::ERROR_INVALID_RECORD;
+        // Kafka 3.7 refuses all of these as INVALID_RECORD. One record too few was acked
+        // with the last record dropped, and one too many failed only after decoding all.
+        let section = tiny_records(1000);
+        for count in [999, 1001, 0, 1] {
+            for gzip in [false, true] {
+                let batch = raw_batch(&section, count, gzip);
+                let err = parse_record_batch(&batch, &budget()).unwrap_err();
+                assert_eq!(code(&err), ERROR_INVALID_RECORD, "count {count}: {err}");
+            }
+        }
+        // A record with a byte past its fields.
+        let err = parse_record_batch(&raw_batch(&[14, 0, 0, 0, 1, 1, 0, 0], 1, false), &budget())
+            .unwrap_err();
+        assert_eq!(code(&err), ERROR_INVALID_RECORD, "{err}");
+        // The count that matches decodes.
+        assert_eq!(
+            parse_record_batch(&raw_batch(&section, 1000, true), &budget())
+                .unwrap()
+                .len(),
+            1000
+        );
     }
 
     // ========== ParsedRecordBatch Tests ==========
@@ -937,5 +1122,83 @@ mod tests {
         // Should be Debug printable
         let debug_str = format!("{batch:?}");
         assert!(debug_str.contains("ParsedRecordBatch"));
+    }
+}
+
+/// Record batches built by hand, for tests of what the decoder refuses.
+#[cfg(test)]
+pub(crate) mod test_batches {
+    use bytes::{BufMut, Bytes, BytesMut};
+    use std::io::Write;
+
+    /// CRC-32C (Castagnoli), the checksum of a RecordBatch v2, bit by bit.
+    fn crc32c(data: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        for &byte in data {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = if crc & 1 == 0 {
+                    crc >> 1
+                } else {
+                    (crc >> 1) ^ 0x82F6_3B78
+                };
+            }
+        }
+        !crc
+    }
+
+    /// A RecordBatch v2 built by hand around the records section `section`, declaring
+    /// `count` records and compressed with gzip when `gzip`.
+    pub(crate) fn raw_batch(section: &[u8], count: i32, gzip: bool) -> Bytes {
+        let records = if gzip {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+            encoder.write_all(section).unwrap();
+            encoder.finish().unwrap()
+        } else {
+            section.to_vec()
+        };
+        let mut tail = BytesMut::new();
+        tail.put_i16(i16::from(gzip)); // attributes: the codec
+        tail.put_i32(count.max(1) - 1);
+        tail.put_i64(0);
+        tail.put_i64(0);
+        tail.put_i64(-1);
+        tail.put_i16(-1);
+        tail.put_i32(-1);
+        tail.put_i32(count);
+        tail.put_slice(&records);
+        let mut batch = BytesMut::new();
+        batch.put_i64(0);
+        batch.put_i32(i32::try_from(9 + tail.len()).unwrap());
+        batch.put_i32(0);
+        batch.put_i8(2);
+        batch.put_u32(crc32c(&tail));
+        batch.put_slice(&tail);
+        batch.freeze()
+    }
+
+    /// `n` of the smallest records: 7 bytes each (null key and value, no headers).
+    pub(crate) fn tiny_records(n: usize) -> Vec<u8> {
+        [12u8, 0, 0, 0, 1, 1, 0].repeat(n)
+    }
+
+    /// `n` records of `headers` headers each (an empty key and a null value: 2 bytes).
+    pub(crate) fn header_records(n: usize, headers: usize) -> Vec<u8> {
+        fn varint(v: i64, out: &mut Vec<u8>) {
+            let mut z = ((v << 1) ^ (v >> 63)).cast_unsigned();
+            while z >= 0x80 {
+                out.push(u8::try_from(z & 0x7f).unwrap() | 0x80);
+                z >>= 7;
+            }
+            out.push(u8::try_from(z).unwrap());
+        }
+        let mut body = vec![0u8, 0, 0, 1, 1];
+        varint(i64::try_from(headers).unwrap(), &mut body);
+        body.extend_from_slice(&[0, 1].repeat(headers));
+        let mut record = Vec::new();
+        varint(i64::try_from(body.len()).unwrap(), &mut record);
+        record.extend_from_slice(&body);
+        record.repeat(n)
     }
 }
