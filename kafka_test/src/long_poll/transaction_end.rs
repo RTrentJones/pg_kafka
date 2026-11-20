@@ -22,6 +22,13 @@ const READERS: usize = 5;
 const STAGGER: Duration = Duration::from_millis(200);
 /// How close to the first a reader's record must arrive to count as woken with it.
 const TOGETHER: Duration = Duration::from_millis(100);
+/// The long poll's safety-net interval (`pg_kafka.fetch_poll_interval_ms`, default).
+const SAFETY_NET: Duration = Duration::from_millis(1000);
+/// How long a fencing round lets the reader's woken fetch attempt park again.
+const PARK: Duration = Duration::from_millis(250);
+/// Fencing rounds that must prove the wake-up, and the most rounds run for them.
+const FENCE_PROOFS: usize = 3;
+const FENCE_ROUNDS: usize = 12;
 
 /// A record a reader received: its value and when it arrived.
 type Received = (String, Instant, SystemTime);
@@ -31,9 +38,14 @@ type Received = (String, Instant, SystemTime);
 /// wake a parked read_committed fetch at once, not through the long-poll safety net
 /// (`pg_kafka.fetch_poll_interval_ms`, 1 s).
 ///
-/// Asserts, with a read_committed consumer parked (fetch.wait.max.ms 5000) behind a
-/// pending transaction and a committed record after it: in 5 fencing rounds the
-/// record arrives within 300 ms of the fencing InitProducerId.
+/// Fencing: a read_committed consumer is parked (fetch.wait.max.ms 30000, so its fetch
+/// does not end and restart within a round) behind a pending transaction, and a
+/// committed record is produced after it, which wakes the fetch for the last time
+/// before the fence; the next safety-net re-fetch is therefore at least 1 s after that
+/// produce was sent. A round whose record arrives before then was woken by the fencing
+/// abort, whatever the host's load; one that arrives later proves nothing either way
+/// (a stall, or the safety net). Asserts that 3 rounds (of at most 12) prove the
+/// wake-up, and that every record arrives within 5 s of the fence.
 ///
 /// The timeout abort cannot be timed that way: the worker's sweep picks its moment (every
 /// 10 s), and one wake-up latency cannot tell the notification from the safety net, which
@@ -111,7 +123,7 @@ async fn txn_end_wakes() -> SendResult<()> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Received>();
     let stop = Arc::new(AtomicBool::new(false));
     let mut readers = vec![spawn_reader(
-        assign_consumer(&topic, true, &[("fetch.wait.max.ms", "5000")])?,
+        assign_consumer(&topic, true, &[("fetch.wait.max.ms", "30000")])?,
         tx.clone(),
         stop.clone(),
     )];
@@ -138,23 +150,46 @@ async fn txn_end_wakes() -> SendResult<()> {
         };
         let mut keep = Vec::new();
         let mut current = init(txn_id.clone(), None).await?;
-        for round in 0..5 {
+        let mut proven = 0;
+        for round in 0..FENCE_ROUNDS {
             current.begin_transaction().map_err(boxed)?;
             send(&current, &topic, &format!("pending-{round}")).await?;
             let visible = format!("visible-{round}");
+            // The produce of `visible` is the reader's last wake-up before the fence: its
+            // fetch attempt starts after this instant, so its next safety-net re-fetch
+            // cannot come before `safety_net`.
+            let visible_sent = Instant::now();
             send(&plain, &topic, &visible).await?;
-            tokio::time::sleep(Duration::from_millis(400)).await;
+            let safety_net = visible_sent + SAFETY_NET;
+            // Time for that attempt to find nothing visible and park again.
+            tokio::time::sleep(PARK).await;
             let fenced_by = init(txn_id.clone(), None).await?;
             let after_init = Instant::now();
             let (got, _) = wait_for(&mut rx, &visible).await?;
             let latency = got.saturating_duration_since(after_init);
-            println!("  round {round}: committed record after fencing in {latency:?}");
+            let woken = got < safety_net;
+            println!(
+                "  round {round}: committed record {latency:?} after the fencing InitProducerId \
+                 returned, {} the earliest safety-net re-fetch",
+                if woken { "before" } else { "not before" }
+            );
             assert!(
-                latency < Duration::from_millis(300),
+                latency < Duration::from_secs(5),
                 "round {round}: read_committed fetch woke {latency:?} after the fencing abort"
             );
+            if woken {
+                proven += 1;
+            }
             keep.push(std::mem::replace(&mut current, fenced_by));
+            if proven == FENCE_PROOFS {
+                break;
+            }
         }
+        assert!(
+            proven == FENCE_PROOFS,
+            "only {proven} of {FENCE_ROUNDS} fencing rounds delivered the committed record \
+             before the safety net could have: the fencing abort does not wake the fetch"
+        );
 
         // Transaction-timeout abort (the worker checks every 10 s). The readers' long
         // polls (fetch.wait.max.ms 30000) outlast the wait for the sweep, so a reader's
