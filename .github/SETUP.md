@@ -27,7 +27,7 @@ To ensure all PRs must pass tests before merging:
        - `Build kafka_test`
        - `E2E pg14`, `E2E pg15`, `E2E pg16`, `E2E pg17`, `E2E pg18`
        - `Interop (Java clients, differential vs Kafka)`
-       - `SPI change needs E2E test` (runs on pull requests only)
+       - `SPI change needs E2E test` (from `.github/workflows/spi-e2e-guard.yml`; pull requests only)
      - Codecov reports `codecov/project` and `codecov/patch` as separate statuses once Step 3 is done
    - ✅ **Require branches to be up to date before merging**
    - ✅ **Do not allow bypassing the above settings**
@@ -115,11 +115,15 @@ cancels the run in progress for the same ref. The workflow file is the reference
 | `Lint & Format` | `cargo fmt --check` and `cargo clippy --all-targets -D warnings` for both crates (pg14); the QA-1 coverage-policy check |
 | `Test Suite` | Unit tests with coverage (`cargo llvm-cov --lib --features pg14`), uploaded to Codecov; property tests |
 | `Build kafka_test` | Builds the E2E runner once for the E2E jobs |
-| `E2E pgN` (14-18) | Clippy and unit/property tests on that major, installs the extension into PostgreSQL N (apt.postgresql.org), starts it with `scripts/ci-pg.sh`, runs the functional E2E suite, `scripts/check-upgrade.sh` and the generated-GUC-docs check; pg14 also runs the shadow (against `docker compose`'s `external-kafka`) and performance categories and the test-count docs check |
+| `E2E pgN` (14-18) | Clippy and unit/property tests on that major, installs the extension into PostgreSQL N (apt.postgresql.org), starts it with `scripts/ci-pg.sh`, runs the functional E2E suite, `scripts/check-upgrade.sh` and the generated-GUC-docs check; pg14 also runs the shadow (against `docker compose`'s `external-kafka`) and performance categories and the test-count docs check; pg18 ends with `scripts/postmaster-death-check.sh` (SIGKILL the postmaster, the listener must exit, the cluster must restart) |
 | `Interop (Java clients, differential vs Kafka)` | `interop/run-java-checks.sh` and `interop/diff/run.py` against a reference Apache Kafka 3.7 |
 | `Security Audit` | `cargo audit` and `cargo deny check` for both crates (stable toolchain) |
 | `Verify Lockfile` | `cargo check --locked` for both crates |
-| `SPI change needs E2E test` | Pull requests only: `.github/scripts/require-e2e-for-spi.sh` on the changed files; the `no-e2e-needed` label waives it |
+
+`.github/workflows/spi-e2e-guard.yml` (job `SPI change needs E2E test`) runs on pull requests,
+also when a label is added or removed: `.github/scripts/require-e2e-for-spi.sh` on every changed
+file of the PR (all pages of the files API) and the labels read at run time; the `no-e2e-needed`
+label waives it.
 
 `.github/workflows/fuzz.yml` runs each libFuzzer target in `fuzz/` for 3 minutes on pushes and
 pull requests, and for 30 minutes weekly. `.github/workflows/evidence.yml` runs weekly, on `v*`

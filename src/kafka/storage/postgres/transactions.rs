@@ -351,7 +351,9 @@ impl PostgresStore {
     }
 
     /// Start a transaction from a finished state or continue the Ongoing one of the
-    /// same producer, in one compare-and-swap UPDATE (no check-then-act race).
+    /// same producer, in one compare-and-swap UPDATE (no check-then-act race). The
+    /// timeout clock (`started_at`) starts when the transaction does, as Kafka's
+    /// txnStartTimestamp does on Empty/Complete* -> Ongoing; continuing keeps it.
     pub(super) fn begin_or_continue_transaction(
         transactional_id: &str,
         producer_id: i64,
@@ -366,7 +368,9 @@ impl PostgresStore {
             let updated = client.update(
                 "UPDATE kafka.transactions
                  SET state = 'Ongoing',
-                     started_at = COALESCE(started_at, NOW()),
+                     started_at = CASE WHEN state = 'Ongoing'
+                                       THEN COALESCE(started_at, NOW())
+                                       ELSE NOW() END,
                      last_updated_at = NOW()
                  WHERE transactional_id = $1
                    AND producer_id = $2

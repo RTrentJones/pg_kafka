@@ -12,7 +12,6 @@ use std::time::{Duration, Instant};
 
 use super::batch::notify_transaction_ended;
 use super::network::Inbox;
-use super::schema::SchemaFeatures;
 use super::txn::{
     log_txn_error, run_maintenance_task, run_request_in_subtransaction, worker_transaction,
     TaskNames, TxnError,
@@ -74,13 +73,9 @@ impl Periodic {
 /// ADR-001: one time-partition maintenance pass (`PostgresStore::ensure_time_partitions`):
 /// leaves for now and the next widths, and rows caught by kafka.messages_default moved
 /// into their leaf.
-///
-/// Skipped on a schema without time partitions (an older extension version, see
-/// [`SchemaFeatures`]): the old-schema WARNING already said so, once.
-pub(super) fn run_partition_maintenance(features: &SchemaFeatures) {
-    if !features.time_partitions {
-        return;
-    }
+/// The worker runs no maintenance on a schema older than the library (see
+/// `schema::wait_for_schema_update`), so every object used here exists.
+pub(super) fn run_partition_maintenance() {
     let names = TaskNames {
         task: "Partition maintenance",
         panic: "Partition maintenance",
@@ -221,8 +216,8 @@ pub(super) fn check_transaction_timeouts(
 /// `pg_kafka.message_retention_hours` (0 = messages kept forever). The time partitions
 /// are brought up to date first, so the sweep decides which leaves to drop on the
 /// current set.
-pub(super) fn run_retention_sweep(features: &SchemaFeatures) {
-    run_partition_maintenance(features);
+pub(super) fn run_retention_sweep() {
+    run_partition_maintenance();
     let names = TaskNames {
         task: "Retention sweep",
         panic: "Retention-sweep maintenance",
@@ -254,16 +249,8 @@ pub(super) fn run_retention_sweep(features: &SchemaFeatures) {
 
 /// Publish the broker request metrics to kafka.broker_api_stats / kafka.broker_gauges:
 /// at most once per second and only when they changed (one upsert statement, no SQL at
-/// all otherwise). Skipped on a schema without the metrics tables (an older extension
-/// version).
-pub(super) fn flush_broker_metrics(
-    flusher: &mut MetricsFlusher,
-    features: &SchemaFeatures,
-    inbox: &Inbox,
-) {
-    if !features.broker_metrics {
-        return;
-    }
+/// all otherwise).
+pub(super) fn flush_broker_metrics(flusher: &mut MetricsFlusher, inbox: &Inbox) {
     let Some(batch) = flusher.poll(inbox.requests.len(), inbox.liveness.len()) else {
         return;
     };

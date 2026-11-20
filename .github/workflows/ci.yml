@@ -233,6 +233,19 @@ jobs:
         working-directory: kafka_test
         run: '"$KAFKA_TEST_BIN" --category performance'
 
+      - name: Listener exits with its postmaster (SIGKILL + restart)
+        # Last, because it crashes the cluster: a listener that outlives its postmaster keeps
+        # serving Kafka requests as an orphan and blocks the restart. One major is enough; the
+        # check is in the worker's lifecycle code, not in version-specific bindings.
+        if: matrix.pg == 18
+        timeout-minutes: 3
+        run: |
+          command -v bc >/dev/null || sudo apt-get install -y bc
+          PATH="$(dirname "$PG_CONFIG"):$PATH" \
+          PGDATA="$RUNNER_TEMP/pg/data" PGLOG="$RUNNER_TEMP/pg/server.log" \
+          PG_CTL="$(dirname "$PG_CONFIG")/pg_ctl" \
+            scripts/postmaster-death-check.sh
+
       - name: Postgres log (on failure)
         if: failure()
         run: |
@@ -347,22 +360,3 @@ jobs:
         run: cargo check --locked --features pg14
       - name: Check kafka_test Cargo.lock is up-to-date
         run: cd kafka_test && cargo check --locked
-
-  # QA-1 enforcement (see codecov.yml + CLAUDE.md): the SPI/async files excluded from unit
-  # coverage (and the qa1-guard files) can't be caught by the codecov gate, so a behavioural
-  # change to one of them must ship a kafka_test E2E regression test.
-  spi-e2e-guard:
-    name: SPI change needs E2E test
-    runs-on: ubuntu-24.04
-    if: github.event_name == 'pull_request'
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v4
-      - name: Require a kafka_test change when an SPI/async file changes
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
-        run: |
-          gh pr view "$PR_NUMBER" --json files --jq '.files[].path' \
-            | bash .github/scripts/require-e2e-for-spi.sh

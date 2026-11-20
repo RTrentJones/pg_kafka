@@ -1,12 +1,19 @@
 //! The records of one Produce partition: RecordBatch v2 (Kafka 0.11+), or the legacy
 //! MessageSet v0/v1 as a fallback.
 //!
+//! Every decoded byte is charged to the request's [`DecodeBudget`] as it is produced: the
+//! decompressors here write through it and stop at its limit, so a compressed batch can
+//! never expand past what the request may hold (see [`super::decode_budget`]).
+//!
 //! Runs on the network thread, so it logs through `tracing`, never pgrx.
 
-use bytes::{Buf, Bytes};
-use kafka_protocol::records::RecordBatchDecoder;
+use std::io::{self, Write};
+
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+use kafka_protocol::records::{Compression, RecordBatchDecoder};
 use tracing::{debug, warn};
 
+use super::decode_budget::DecodeBudget;
 use crate::kafka::error::{KafkaError, Result};
 use crate::kafka::messages::{ProducerMetadata, Record, RecordHeader};
 
@@ -73,19 +80,136 @@ fn extract_producer_metadata(batch_bytes: &Bytes) -> ProducerMetadata {
     }
 }
 
-/// Parse a partition's record data into its records and producer identity.
-pub fn parse_record_batch_with_metadata(batch_bytes: &Bytes) -> Result<ParsedRecordBatch> {
+/// Parse a partition's record data into its records and producer identity, charging the
+/// decoded bytes to `budget`.
+pub fn parse_record_batch_with_metadata(
+    batch_bytes: &Bytes,
+    budget: &DecodeBudget,
+) -> Result<ParsedRecordBatch> {
     Ok(ParsedRecordBatch {
         producer_metadata: extract_producer_metadata(batch_bytes),
-        records: parse_record_batch(batch_bytes)?,
+        records: parse_record_batch(batch_bytes, budget)?,
     })
 }
 
-/// Parse a partition's record data into its records.
+/// zstd frames may ask for a window of at most 2^24 bytes (16 MiB). The decoder allocates
+/// the window a frame header declares before it produces any output, so without a cap a
+/// few bytes could make it allocate zstd's default limit of 128 MiB. Kafka's producers use
+/// windows of 2^21 (Java, level 3) or the batch size (librdkafka, which declares it).
+const ZSTD_WINDOW_LOG_MAX: u32 = 24;
+
+/// Decoded output written through a [`DecodeBudget`]: a write that would pass the budget
+/// fails before anything is buffered.
+struct BudgetedWriter<'a> {
+    out: BytesMut,
+    budget: &'a DecodeBudget,
+}
+
+impl<'a> BudgetedWriter<'a> {
+    fn new(budget: &'a DecodeBudget) -> Self {
+        Self {
+            out: BytesMut::new(),
+            budget,
+        }
+    }
+
+    fn into_bytes(self) -> Bytes {
+        self.out.freeze()
+    }
+}
+
+/// The error a decompressor stops with at the end of its budget.
+fn over_budget() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "decoded records exceed the request's limit",
+    )
+}
+
+impl Write for BudgetedWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.budget.take(buf.len()).map_err(|_| over_budget())?;
+        self.out.put_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The xerial framing Kafka's Java client wraps snappy data in: magic, version, compatible
+/// version, then `[length u32][raw snappy block]` repeated.
+const XERIAL_SNAPPY_HEADER: &[u8; 16] = b"\x82SNAPPY\x00\x00\x00\x00\x01\x00\x00\x00\x01";
+
+/// Snappy (xerial-framed or raw), each block's declared length charged before it is
+/// allocated.
+fn decompress_snappy(data: &Bytes, budget: &DecodeBudget) -> anyhow::Result<Bytes> {
+    use snap::raw::{decompress_len, Decoder};
+    let decode_block = |block: &[u8], out: &mut BytesMut| -> anyhow::Result<()> {
+        let len = decompress_len(block)?;
+        budget.take(len).map_err(|_| over_budget())?;
+        let start = out.len();
+        out.resize(start + len, 0);
+        Decoder::new().decompress(block, &mut out[start..])?;
+        Ok(())
+    };
+    let mut out = BytesMut::new();
+    let Some(mut blocks) = data.strip_prefix(&XERIAL_SNAPPY_HEADER[..]) else {
+        decode_block(data, &mut out)?;
+        return Ok(out.freeze());
+    };
+    while !blocks.is_empty() {
+        anyhow::ensure!(blocks.len() >= 4, "snappy block length cut short");
+        let len = usize::try_from(blocks.get_u32())?;
+        anyhow::ensure!(blocks.len() >= len, "snappy block cut short");
+        let (block, rest) = blocks.split_at(len);
+        decode_block(block, &mut out)?;
+        blocks = rest;
+    }
+    Ok(out.freeze())
+}
+
+/// The decompressed records section of a RecordBatch, every byte charged to `budget`
+/// (kafka-protocol's custom decompressor hook, for every codec including none).
+fn decompress(
+    data: &mut Bytes,
+    compression: Compression,
+    budget: &DecodeBudget,
+) -> anyhow::Result<Bytes> {
+    let data = std::mem::take(data);
+    let mut out = BudgetedWriter::new(budget);
+    match compression {
+        Compression::None => {
+            budget.take(data.len()).map_err(|_| over_budget())?;
+            return Ok(data);
+        }
+        Compression::Gzip => {
+            let mut decoder = flate2::write::GzDecoder::new(&mut out);
+            decoder.write_all(&data)?;
+            decoder.finish()?;
+        }
+        Compression::Snappy => return decompress_snappy(&data, budget),
+        Compression::Lz4 => {
+            let mut decoder = lz4::Decoder::new(data.reader())?;
+            io::copy(&mut decoder, &mut out)?;
+        }
+        Compression::Zstd => {
+            let mut decoder = zstd::stream::read::Decoder::new(data.reader())?;
+            decoder.window_log_max(ZSTD_WINDOW_LOG_MAX)?;
+            io::copy(&mut decoder, &mut out)?;
+        }
+    }
+    Ok(out.into_bytes())
+}
+
+/// Parse a partition's record data into its records, charging the decoded bytes to
+/// `budget`.
 ///
-/// The data is one RecordBatch v2 (kafka-protocol decodes it, checking the CRC32C and
-/// decompressing). Data that does not decode as one is tried as a legacy MessageSet v0/v1.
-pub fn parse_record_batch(batch_bytes: &Bytes) -> Result<Vec<Record>> {
+/// The data is one RecordBatch v2 (kafka-protocol decodes it, checking the CRC32C, through
+/// `decompress`). Data that does not decode as one is tried as a legacy MessageSet v0/v1,
+/// unless the decode stopped at the end of the budget.
+pub fn parse_record_batch(batch_bytes: &Bytes, budget: &DecodeBudget) -> Result<Vec<Record>> {
     if batch_bytes.is_empty() {
         return Ok(Vec::new());
     }
@@ -97,7 +221,11 @@ pub fn parse_record_batch(batch_bytes: &Bytes) -> Result<Vec<Record>> {
     );
 
     let mut batch_buf = batch_bytes.clone();
-    match RecordBatchDecoder::decode(&mut batch_buf) {
+    let decoded = RecordBatchDecoder::decode_with_custom_compression(
+        &mut batch_buf,
+        Some(|data: &mut Bytes, compression| decompress(data, compression, budget)),
+    );
+    match decoded {
         // Produce v3+ (the only Produce versions pg_kafka accepts) carries exactly one
         // record batch per partition. Decoding one and ignoring the rest would drop the
         // trailing batches while acking the request; reject it as Kafka does.
@@ -124,8 +252,17 @@ pub fn parse_record_batch(batch_bytes: &Bytes) -> Result<Vec<Record>> {
                 timestamp: Some(record.timestamp),
             })
             .collect()),
+        Err(e) if budget.exhausted().is_some() => Err(KafkaError::CorruptMessage {
+            message: format!("record batch stopped at the decode limit: {e}"),
+        }),
         Err(e) => {
             debug!("RecordBatch decode failed ({e}), trying MessageSet v0/v1 format");
+            // The legacy records are copied out of the batch: at most its size.
+            if budget.take(batch_bytes.len()).is_err() {
+                return Err(KafkaError::CorruptMessage {
+                    message: "legacy message set stopped at the decode limit".into(),
+                });
+            }
             parse_message_set_legacy(batch_bytes, e)
         }
     }
@@ -284,7 +421,145 @@ mod tests {
     use super::*;
     use bytes::Bytes;
 
-    fn encode_batch(values: &[&str]) -> bytes::BytesMut {
+    use crate::kafka::protocol::decode_budget::{Exhausted, MAX_DECODED_REQUEST_BYTES};
+
+    fn budget() -> DecodeBudget {
+        DecodeBudget::new(MAX_DECODED_REQUEST_BYTES)
+    }
+
+    /// One record batch holding a `len`-byte value of zeros, compressed with `compression`.
+    fn zeros_batch(len: usize, compression: Compression) -> Bytes {
+        use kafka_protocol::records::{
+            Record as PRecord, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
+        };
+        let record = PRecord {
+            transactional: false,
+            control: false,
+            partition_leader_epoch: 0,
+            producer_id: -1,
+            producer_epoch: -1,
+            timestamp_type: TimestampType::Creation,
+            offset: 0,
+            sequence: -1,
+            timestamp: 0,
+            key: None,
+            value: Some(Bytes::from(vec![0u8; len])),
+            headers: kafka_protocol::indexmap::IndexMap::default(),
+        };
+        let mut buf = BytesMut::new();
+        RecordBatchEncoder::encode(
+            &mut buf,
+            [record].iter(),
+            &RecordEncodeOptions {
+                version: 2,
+                compression,
+            },
+        )
+        .unwrap();
+        buf.freeze()
+    }
+
+    const CODECS: [Compression; 5] = [
+        Compression::None,
+        Compression::Gzip,
+        Compression::Snappy,
+        Compression::Lz4,
+        Compression::Zstd,
+    ];
+
+    #[test]
+    fn every_codec_decodes_within_the_budget_and_charges_what_it_decoded() {
+        for compression in CODECS {
+            let batch = zeros_batch(100_000, compression);
+            let budget = budget();
+            let records = parse_record_batch(&batch, &budget).unwrap();
+            assert_eq!(records.len(), 1, "{compression:?}");
+            assert_eq!(records[0].value.as_ref().unwrap().len(), 100_000);
+            // The records section: the value plus a few bytes of record framing.
+            let charged = budget.charged();
+            assert!(
+                (100_000..100_100).contains(&charged),
+                "{compression:?} charged {charged}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_decompression_bomb_stops_at_the_limit_while_decompressing() {
+        // 8 MiB of zeros against a 1 MiB budget: every codec stops at the budget, having
+        // charged no more than it, and the batch is not retried as a legacy message set.
+        for compression in CODECS {
+            let batch = zeros_batch(8 * 1024 * 1024, compression);
+            if compression != Compression::None {
+                assert!(batch.len() < 1024 * 1024, "{compression:?} compresses");
+            }
+            let budget = DecodeBudget::new(1024 * 1024);
+            let err = parse_record_batch(&batch, &budget).unwrap_err();
+            assert_eq!(
+                budget.exhausted(),
+                Some(Exhausted::Limit),
+                "{compression:?}"
+            );
+            assert!(budget.charged() <= 1024 * 1024, "{compression:?}");
+            assert!(
+                err.to_string().contains("decode limit"),
+                "{compression:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_limit_spans_the_partitions_of_a_request() {
+        // Two batches that each fit, against one budget that holds only one of them.
+        let batch = zeros_batch(600_000, Compression::Gzip);
+        let budget = DecodeBudget::new(1_000_000);
+        assert!(parse_record_batch(&batch, &budget).is_ok());
+        assert!(parse_record_batch(&batch, &budget).is_err());
+        assert_eq!(budget.exhausted(), Some(Exhausted::Limit));
+    }
+
+    #[test]
+    fn zstd_frames_asking_for_a_huge_window_are_refused() {
+        // A zstd frame whose header declares a 2^27-byte window and no content size: the
+        // decoder would allocate the window up front.
+        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 19).unwrap();
+        encoder.window_log(27).unwrap();
+        encoder.include_contentsize(false).unwrap();
+        encoder.write_all(&[7u8; 1000]).unwrap();
+        let frame = encoder.finish().unwrap();
+        let budget = budget();
+        assert!(decompress(&mut Bytes::from(frame), Compression::Zstd, &budget).is_err());
+    }
+
+    #[test]
+    fn raw_and_framed_snappy_both_decode() {
+        let raw = snap::raw::Encoder::new()
+            .compress_vec(b"hello snappy")
+            .unwrap();
+        let budget = budget();
+        assert_eq!(
+            &decompress(&mut Bytes::from(raw.clone()), Compression::Snappy, &budget).unwrap()[..],
+            b"hello snappy"
+        );
+        let mut framed = XERIAL_SNAPPY_HEADER.to_vec();
+        for _ in 0..2 {
+            framed.extend_from_slice(&u32::try_from(raw.len()).unwrap().to_be_bytes());
+            framed.extend_from_slice(&raw);
+        }
+        assert_eq!(
+            &decompress(
+                &mut Bytes::from(framed.clone()),
+                Compression::Snappy,
+                &budget
+            )
+            .unwrap()[..],
+            b"hello snappyhello snappy"
+        );
+        framed.truncate(framed.len() - 1);
+        assert!(decompress(&mut Bytes::from(framed), Compression::Snappy, &budget).is_err());
+    }
+
+    fn encode_batch(values: &[&str]) -> BytesMut {
         use kafka_protocol::records::{
             Compression, Record as PRecord, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
         };
@@ -306,7 +581,7 @@ mod tests {
                 headers: kafka_protocol::indexmap::IndexMap::default(),
             })
             .collect();
-        let mut buf = bytes::BytesMut::new();
+        let mut buf = BytesMut::new();
         RecordBatchEncoder::encode(
             &mut buf,
             records.iter(),
@@ -340,11 +615,16 @@ mod tests {
         // Produce v3+ allows exactly one batch per partition. Ignoring a second batch while
         // acking the request would lose its records silently, so it is rejected.
         let one = encode_batch(&["a"]);
-        assert_eq!(parse_record_batch(&one.clone().freeze()).unwrap().len(), 1);
+        assert_eq!(
+            parse_record_batch(&one.clone().freeze(), &budget())
+                .unwrap()
+                .len(),
+            1
+        );
 
         let mut two = one;
         two.extend_from_slice(&encode_batch(&["b"]));
-        let err = parse_record_batch(&two.freeze()).unwrap_err();
+        let err = parse_record_batch(&two.freeze(), &budget()).unwrap_err();
         assert!(matches!(err, KafkaError::InvalidRecord { .. }), "{err:?}");
         assert_eq!(
             err.to_kafka_error_code(),
@@ -357,7 +637,7 @@ mod tests {
     #[test]
     fn test_parse_record_batch_empty() {
         let batch_bytes = Bytes::new();
-        let result = parse_record_batch(&batch_bytes);
+        let result = parse_record_batch(&batch_bytes, &budget());
 
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty());
@@ -366,7 +646,7 @@ mod tests {
     #[test]
     fn test_parse_record_batch_with_metadata_empty() {
         let batch_bytes = Bytes::new();
-        let result = parse_record_batch_with_metadata(&batch_bytes);
+        let result = parse_record_batch_with_metadata(&batch_bytes, &budget());
 
         assert!(result.is_ok());
         let parsed = result.unwrap();
@@ -620,7 +900,7 @@ mod tests {
         fn fuzz_parse_record_batch_never_aborts(
             bytes in proptest::collection::vec(proptest::num::u8::ANY, 0..1024),
         ) {
-            let _ = parse_record_batch(&Bytes::from(bytes));
+            let _ = parse_record_batch(&Bytes::from(bytes), &budget());
         }
     }
 

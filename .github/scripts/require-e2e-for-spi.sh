@@ -14,7 +14,8 @@
 # Cargo.lock under kafka_test/ does not count).
 #
 # Usage: pipe the PR's changed file paths (one per line) on stdin.
-#   gh pr view "$PR_NUMBER" --json files --jq '.files[].path' | bash "$0"
+#   gh api --paginate "repos/$REPO/pulls/$PR/files?per_page=100" --jq '.[].filename' | bash "$0"
+# (CI: .github/workflows/spi-e2e-guard.yml).
 # Env:
 #   PR_LABELS  comma-separated PR label names; 'no-e2e-needed' waives the check
 #              (for genuinely test-neutral edits: comments/docs/renames).

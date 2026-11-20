@@ -13,7 +13,7 @@ mod store {
     use crate::kafka::storage::{
         CommittedOffset, FetchedMessage, IsolationLevel, LogStore, MaintenanceStore, OffsetStore,
         ProducerBatch, ProducerStore, SequenceCheck, TopicMetadata, TopicStore, TransactionState,
-        TransactionStore,
+        TransactionStore, TransactionalProducer,
     };
     use mockall::mock;
     use mockall::predicate::*;
@@ -124,6 +124,11 @@ mod store {
                 partition_id: i32,
                 last_sequence: i32,
             ) -> Result<()>;
+            fn transactional_producer<'a>(
+                &self,
+                transactional_id: &'a str,
+            ) -> Result<Option<TransactionalProducer>>;
+            fn remember_previous_epoch(&self, producer_id: i64, previous_epoch: i16) -> Result<()>;
         }
 
         impl TransactionStore for KafkaStore {

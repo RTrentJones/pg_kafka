@@ -184,7 +184,8 @@ pub enum RoleDecision {
     /// Switch to this role.
     Switch(String),
     /// The role does not exist (e.g. `ALTER EXTENSION pg_kafka UPDATE` not run yet):
-    /// keep the superuser and warn, so an upgraded binary on an old schema still works.
+    /// keep the superuser and warn, so an upgraded binary on an old schema can still
+    /// check it (and wait for its update).
     MissingRole(String),
     /// The role exists but lacks these privileges: keep the superuser and warn rather
     /// than fail requests at runtime.

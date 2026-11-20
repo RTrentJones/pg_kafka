@@ -163,11 +163,27 @@ pub fn validate_sequence(
     }
 }
 
+/// Validate the batch of an idempotent producer the broker holds no state for (its
+/// state was pruned after idling, lost with the extension, or never existed here).
+/// Kafka (KIP-360) accepts it at any sequence and tracks the producer from there; only a
+/// negative sequence or record count is out of order.
+pub fn validate_unknown_producer(base_sequence: i32, record_count: i32) -> SequenceValidation {
+    if base_sequence < 0 || record_count < 0 {
+        return SequenceValidation::OutOfOrder {
+            expected_sequence: 0,
+        };
+    }
+    SequenceValidation::Proceed {
+        new_last_sequence: batch_last_sequence(base_sequence, record_count),
+        new_epoch: false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         batch_last_sequence, stored_last_sequence, transactional_epoch_is_stale, validate_sequence,
-        CachedBatch, SequenceValidation,
+        validate_unknown_producer, CachedBatch, SequenceValidation,
     };
 
     fn proceed(last: i32) -> SequenceValidation {
@@ -324,5 +340,14 @@ mod tests {
         // ... an idempotent one is left to validate_sequence (it may bump its epoch).
         assert!(!transactional_epoch_is_stale(false, 2, 3));
         assert!(!transactional_epoch_is_stale(false, 4, 3));
+    }
+
+    #[test]
+    fn an_unknown_producer_is_accepted_at_any_sequence() {
+        assert_eq!(validate_unknown_producer(0, 3), proceed(2));
+        assert_eq!(validate_unknown_producer(5, 1), proceed(5));
+        assert_eq!(validate_unknown_producer(i32::MAX, 2), proceed(0));
+        assert_eq!(validate_unknown_producer(-1, 1), ooo(0));
+        assert_eq!(validate_unknown_producer(0, -1), ooo(0));
     }
 }

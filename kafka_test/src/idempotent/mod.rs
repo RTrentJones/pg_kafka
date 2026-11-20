@@ -11,6 +11,7 @@ mod basic;
 mod deduplication;
 mod edge_cases;
 mod kafka_model;
+mod unknown_producer;
 
 /// The `idempotent` tests, in run order.
 pub fn tests() -> Vec<crate::registry::TestDef> {
@@ -24,5 +25,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         edge_cases::test_idempotent_high_sequence,
         kafka_model::test_idempotent_duplicates_and_epochs_follow_kafka: sequential,
         kafka_model::test_idempotent_sequence_wraps_at_i32_max,
+        unknown_producer::test_unknown_producer_is_accepted_as_new: sequential, // reads the id sequence
+        unknown_producer::test_idempotent_producer_survives_pruned_state,
     ]
 }

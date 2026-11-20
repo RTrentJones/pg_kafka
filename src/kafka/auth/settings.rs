@@ -110,41 +110,111 @@ pub struct ListenerSpec {
     pub protocol: SecurityProtocol,
     pub host: String,
     pub port: i32,
-    /// `None` for the primary listener (the worker's BrokerMetadata already advertises
-    /// it); `Some((host, port))` for an additional listener.
-    pub advertised: Option<(String, i32)>,
+    /// The `(host, port)` clients are told to connect to for this listener.
+    pub advertised: (String, i32),
 }
 
 impl ListenerSpec {
     pub fn bind_addr(&self) -> String {
-        if self.host.contains(':') && !self.host.starts_with('[') {
-            format!("[{}]:{}", self.host, self.port)
-        } else {
-            format!("{}:{}", self.host, self.port)
-        }
+        join_host_port(&self.host, self.port)
+    }
+
+    /// `host:port` clients are told to connect to, for logs.
+    pub fn advertised_addr(&self) -> String {
+        join_host_port(&self.advertised.0, self.advertised.1)
     }
 }
 
-/// The host clients are told to connect to for a bind host (same rule as the primary
-/// listener: an unspecified address is not routable, so advertise `localhost`).
-pub fn advertised_host_for(bind_host: &str) -> String {
-    let h = bind_host.trim_start_matches('[').trim_end_matches(']');
-    if h.is_empty() || h == "0.0.0.0" || h == "::" {
-        "localhost".to_string()
+fn join_host_port(host: &str, port: i32) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
     } else {
-        h.to_string()
+        format!("{host}:{port}")
     }
 }
 
-/// Parse `pg_kafka.additional_listeners`: comma-separated `PROTOCOL://host:port`
-/// (`host` may be empty for `pg_kafka.host`, or a bracketed IPv6 literal).
+/// Split `host:port` (`[v6]:port` for an IPv6 literal) or a bare `host`; the brackets
+/// are removed from the host.
+fn split_host_port(s: &str) -> Result<(&str, Option<&str>), String> {
+    if let Some(rest) = s.strip_prefix('[') {
+        let (host, after) = rest
+            .split_once(']')
+            .ok_or_else(|| format!("'{s}' has an unclosed '['"))?;
+        return match after {
+            "" => Ok((host, None)),
+            _ => after
+                .strip_prefix(':')
+                .map(|port| (host, Some(port)))
+                .ok_or_else(|| format!("'{s}': expected ':port' after ']'")),
+        };
+    }
+    match s.split_once(':') {
+        Some((host, port)) if !port.contains(':') => Ok((host, Some(port))),
+        // No colon, or a bare IPv6 literal (several colons, no brackets): no port.
+        _ => Ok((s, None)),
+    }
+}
+
+/// The address a listener advertises in Metadata/FindCoordinator, for the primary
+/// listener and every additional one alike.
+///
+/// `explicit` is the operator's `host[:port]` (a missing port is the bind port). Without
+/// it the bind host is advertised, except that an unspecified bind address (empty,
+/// `0.0.0.0`, `::`) cannot be connected to, so `localhost` is advertised instead (local
+/// clients only; [`SecuritySettings::warnings`] flags it on an exposed listener).
+pub fn advertised_address(
+    bind_host: &str,
+    bind_port: i32,
+    explicit: Option<&str>,
+) -> Result<(String, i32), String> {
+    let Some(explicit) = explicit.map(str::trim).filter(|e| !e.is_empty()) else {
+        let h = bind_host.trim_start_matches('[').trim_end_matches(']');
+        let unspecified = h.is_empty()
+            || h.parse::<std::net::IpAddr>()
+                .is_ok_and(|a| a.is_unspecified());
+        let host = if unspecified { "localhost" } else { h };
+        return Ok((host.to_string(), bind_port));
+    };
+    let (host, port) = split_host_port(explicit)?;
+    if host.is_empty() {
+        return Err(format!("advertised address '{explicit}' has no host"));
+    }
+    if host
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|a| a.is_unspecified())
+    {
+        return Err(format!(
+            "advertised address '{explicit}': clients cannot connect to {host}; advertise a \
+             host name or address they can reach"
+        ));
+    }
+    let port = match port {
+        None => bind_port,
+        Some(p) => p
+            .parse::<i32>()
+            .ok()
+            .filter(|p| (1..=65535).contains(p))
+            .ok_or_else(|| {
+                format!("advertised address '{explicit}': port must be between 1 and 65535")
+            })?,
+    };
+    Ok((host.to_string(), port))
+}
+
+/// Parse `pg_kafka.additional_listeners`: comma-separated
+/// `PROTOCOL://host:port[@advertised_host[:advertised_port]]` (`host` may be empty for
+/// `pg_kafka.host`; IPv6 literals in brackets).
 pub fn parse_listeners(s: &str, default_host: &str) -> Result<Vec<ListenerSpec>, String> {
     let mut out = Vec::new();
     for raw in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
-        let (proto, addr) = raw
-            .split_once("://")
-            .ok_or_else(|| format!("listener '{raw}' must look like PROTOCOL://host:port"))?;
+        let (proto, addr) = raw.split_once("://").ok_or_else(|| {
+            format!("listener '{raw}' must look like PROTOCOL://host:port[@advertised_host:port]")
+        })?;
         let protocol = SecurityProtocol::parse(proto)?;
+        let (addr, advertised) = match addr.split_once('@') {
+            Some((bind, adv)) => (bind, Some(adv)),
+            None => (addr, None),
+        };
         let (host, port) = addr
             .rsplit_once(':')
             .ok_or_else(|| format!("listener '{raw}' has no port"))?;
@@ -158,11 +228,13 @@ pub fn parse_listeners(s: &str, default_host: &str) -> Result<Vec<ListenerSpec>,
         }
         let host = host.trim_start_matches('[').trim_end_matches(']');
         let host = if host.is_empty() { default_host } else { host }.to_string();
+        let advertised = advertised_address(&host, port, advertised)
+            .map_err(|e| format!("listener '{raw}': {e}"))?;
         out.push(ListenerSpec {
             protocol,
-            advertised: Some((advertised_host_for(&host), port)),
             host,
             port,
+            advertised,
         });
     }
     Ok(out)
@@ -188,6 +260,8 @@ pub struct SecuritySettings {
 pub struct RawSecuritySettings {
     pub security_protocol: String,
     pub additional_listeners: String,
+    /// `pg_kafka.advertised_address`: the primary listener's `host[:port]` for clients.
+    pub advertised_address: String,
     pub ssl_cert_file: String,
     pub ssl_key_file: String,
     pub ssl_ca_file: String,
@@ -209,7 +283,12 @@ impl SecuritySettings {
                 .map_err(|e| format!("pg_kafka.security_protocol: {e}"))?,
             host: primary_host.to_string(),
             port: primary_port,
-            advertised: None,
+            advertised: advertised_address(
+                primary_host,
+                primary_port,
+                Some(raw.advertised_address.as_str()),
+            )
+            .map_err(|e| format!("pg_kafka.advertised_address: {e}"))?,
         };
         let mut listeners = vec![primary];
         listeners.extend(
@@ -285,6 +364,19 @@ impl SecuritySettings {
                     l.bind_addr()
                 ));
             }
+            if exposed && !crate::config::bind_is_publicly_exposed(&l.advertised.0) {
+                out.push(format!(
+                    "pg_kafka listener {}://{} is reachable from other hosts but advertises \
+                     {} in Metadata and FindCoordinator: remote clients bootstrap and then \
+                     fail to connect. Set the address they should use (\
+                     pg_kafka.advertised_address for the primary listener, \
+                     PROTOCOL://host:port@advertised_host:port in \
+                     pg_kafka.additional_listeners).",
+                    l.protocol.name(),
+                    l.bind_addr(),
+                    l.advertised_addr()
+                ));
+            }
             if exposed
                 && l.protocol == SecurityProtocol::SaslPlaintext
                 && self.sasl_mechanisms.contains(&SaslMechanism::Plain)
@@ -313,8 +405,13 @@ crate::config::gucs! {
         context: Sighup,
     }
     string ADDITIONAL_LISTENERS = None => c"pg_kafka.additional_listeners" {
-        short: c"Extra Kafka listeners, e.g. 'SASL_SSL://0.0.0.0:9093,SSL://:9094'",
-        long: c"Comma-separated PROTOCOL://host:port. Each advertises its own host:port in Metadata. Empty (default) = none. Read when the worker starts.",
+        short: c"Extra Kafka listeners, e.g. 'SASL_SSL://0.0.0.0:9093@broker.example.com:9093,SSL://:9094'",
+        long: c"Comma-separated PROTOCOL://host:port[@advertised_host[:advertised_port]]. Each listener advertises its own address in Metadata and FindCoordinator: the part after @ (port defaults to the bind port), else the bind host (localhost for 0.0.0.0 / ::, which then serves local clients only). Empty (default) = none. Read when the worker starts.",
+        context: Sighup,
+    }
+    string ADVERTISED_ADDRESS = None => c"pg_kafka.advertised_address" {
+        short: c"host[:port] the primary listener advertises to clients, e.g. 'broker.example.com:9092'",
+        long: c"Kafka's advertised.listeners for the primary listener: the address Metadata and FindCoordinator tell clients to connect to (port defaults to pg_kafka.port). Empty (default) = pg_kafka.host, or localhost when that is 0.0.0.0 / ::. Read when the worker starts.",
         context: Sighup,
     }
     string SSL_CERT_FILE = None => c"pg_kafka.ssl_cert_file" {
@@ -378,6 +475,7 @@ pub fn raw_from_gucs() -> RawSecuritySettings {
     RawSecuritySettings {
         security_protocol: guc_string(&SECURITY_PROTOCOL),
         additional_listeners: guc_string(&ADDITIONAL_LISTENERS),
+        advertised_address: guc_string(&ADVERTISED_ADDRESS),
         ssl_cert_file: guc_string(&SSL_CERT_FILE),
         ssl_key_file: guc_string(&SSL_KEY_FILE),
         ssl_ca_file: guc_string(&SSL_CA_FILE),
@@ -409,7 +507,7 @@ mod tests {
         let s = SecuritySettings::resolve(&raw("PLAINTEXT", ""), "127.0.0.1", 9092).unwrap();
         assert_eq!(s.listeners.len(), 1);
         assert_eq!(s.listeners[0].protocol, SecurityProtocol::Plaintext);
-        assert_eq!(s.listeners[0].advertised, None);
+        assert_eq!(s.listeners[0].advertised, ("127.0.0.1".into(), 9092));
         assert!(!s.needs_tls() && !s.needs_sasl());
         assert_eq!(s.warnings(), Vec::<String>::new());
     }
@@ -423,11 +521,11 @@ mod tests {
         .unwrap();
         assert_eq!(l.len(), 4);
         assert_eq!(l[0].protocol, SecurityProtocol::SaslPlaintext);
-        assert_eq!(l[0].advertised, Some(("127.0.0.1".into(), 9093)));
+        assert_eq!(l[0].advertised, ("127.0.0.1".into(), 9093));
         assert_eq!(l[1].host, "10.0.0.1");
         assert_eq!(l[2].host, "::1");
         assert_eq!(l[2].bind_addr(), "[::1]:9095");
-        assert_eq!(l[3].advertised, Some(("localhost".into(), 9096)));
+        assert_eq!(l[3].advertised, ("localhost".into(), 9096));
         assert_eq!(parse_listeners("", "h").unwrap(), Vec::new());
     }
 
@@ -452,6 +550,112 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("more than one listener"), "{err}");
         assert!(SecuritySettings::resolve(&raw("KERBEROS", ""), "h", 9092).is_err());
+    }
+
+    #[test]
+    fn advertised_address_for_primary_and_additional_listeners() {
+        // Derived: the bind host, localhost for an unspecified address.
+        for (bind, want) in [
+            ("127.0.0.1", "127.0.0.1"),
+            ("broker.internal", "broker.internal"),
+            ("0.0.0.0", "localhost"),
+            ("::", "localhost"),
+            ("[::]", "localhost"),
+            ("", "localhost"),
+            ("::1", "::1"),
+        ] {
+            assert_eq!(
+                advertised_address(bind, 9092, None).unwrap(),
+                (want.to_string(), 9092),
+                "{bind}"
+            );
+        }
+        // Explicit: host, host:port, [v6]:port, bare v6; blank means derived.
+        let a = |e: &str| advertised_address("0.0.0.0", 9093, Some(e));
+        assert_eq!(a("b.example.com").unwrap(), ("b.example.com".into(), 9093));
+        assert_eq!(
+            a(" b.example.com:443 ").unwrap(),
+            ("b.example.com".into(), 443)
+        );
+        assert_eq!(
+            a("[2001:db8::1]:9000").unwrap(),
+            ("2001:db8::1".into(), 9000)
+        );
+        assert_eq!(a("[2001:db8::1]").unwrap(), ("2001:db8::1".into(), 9093));
+        assert_eq!(a("2001:db8::1").unwrap(), ("2001:db8::1".into(), 9093));
+        assert_eq!(a("  ").unwrap(), ("localhost".into(), 9093));
+        for bad in [
+            ":9093",
+            "0.0.0.0:9093",
+            "[::]",
+            "h:0",
+            "h:70000",
+            "h:x",
+            "[::1",
+            "[::1]9",
+        ] {
+            assert!(a(bad).is_err(), "{bad}");
+        }
+
+        // The same rule for both kinds of listener.
+        let mut r = raw(
+            "SASL_SSL",
+            "SASL_SSL://0.0.0.0:9093@b.example.com:19093,SSL://[::]:9094",
+        );
+        r.ssl_cert_file = "c".into();
+        r.ssl_key_file = "k".into();
+        r.advertised_address = "b.example.com".into();
+        let s = SecuritySettings::resolve(&r, "0.0.0.0", 9092).unwrap();
+        let adv: Vec<_> = s
+            .listeners
+            .iter()
+            .map(ListenerSpec::advertised_addr)
+            .collect();
+        assert_eq!(
+            adv,
+            [
+                "b.example.com:9092",
+                "b.example.com:19093",
+                "localhost:9094"
+            ]
+        );
+        assert_eq!(s.listeners[2].bind_addr(), "[::]:9094");
+        r.advertised_address = "0.0.0.0".into();
+        let err = SecuritySettings::resolve(&r, "0.0.0.0", 9092).unwrap_err();
+        assert!(err.starts_with("pg_kafka.advertised_address:"), "{err}");
+        r.advertised_address = String::new();
+        r.additional_listeners = "SSL://:9094@".into();
+        assert_eq!(
+            SecuritySettings::resolve(&r, "127.0.0.1", 9092)
+                .unwrap()
+                .listeners[1]
+                .advertised,
+            ("127.0.0.1".into(), 9094),
+            "an empty advertised part means derived"
+        );
+        r.additional_listeners = "SSL://:9094@:9095".into();
+        assert!(SecuritySettings::resolve(&r, "127.0.0.1", 9092).is_err());
+    }
+
+    #[test]
+    fn warns_when_an_exposed_listener_advertises_localhost() {
+        let s = SecuritySettings::resolve(&raw("SASL_PLAINTEXT", ""), "0.0.0.0", 9092).unwrap();
+        let w = s.warnings();
+        assert!(
+            w.iter().any(|w| w.contains("advertises localhost:9092")),
+            "{w:?}"
+        );
+        let mut r = raw("SASL_PLAINTEXT", "");
+        r.advertised_address = "10.1.2.3".into();
+        let s = SecuritySettings::resolve(&r, "0.0.0.0", 9092).unwrap();
+        assert!(
+            !s.warnings().iter().any(|w| w.contains("advertises")),
+            "{:?}",
+            s.warnings()
+        );
+        // A loopback bind advertising localhost serves local clients by design.
+        let s = SecuritySettings::resolve(&raw("SASL_PLAINTEXT", ""), "127.0.0.1", 9092).unwrap();
+        assert!(!s.warnings().iter().any(|w| w.contains("advertises")));
     }
 
     #[test]
@@ -489,12 +693,23 @@ mod tests {
         );
         r.ssl_cert_file = "c".into();
         r.ssl_key_file = "k".into();
+        r.advertised_address = "broker.example.com".into();
         let s = SecuritySettings::resolve(&r, "0.0.0.0", 9092).unwrap();
         let w = s.warnings();
-        // PLAINTEXT and SSL (no client CA) are unauthenticated; SASL_PLAINTEXT offers PLAIN.
-        assert_eq!(w.len(), 3, "{w:?}");
+        // PLAINTEXT and SSL (no client CA) are unauthenticated; SASL_PLAINTEXT offers PLAIN;
+        // the two additional listeners advertise localhost.
+        assert_eq!(w.len(), 5, "{w:?}");
+        assert_eq!(
+            w.iter()
+                .filter(|w| w.contains("advertises localhost"))
+                .count(),
+            2,
+            "{w:?}"
+        );
         r.ssl_ca_file = "ca".into();
         r.sasl_enabled_mechanisms = "SCRAM-SHA-256".into();
+        r.additional_listeners =
+            "SASL_PLAINTEXT://0.0.0.0:9093@b.example.com,SSL://0.0.0.0:9094@b.example.com".into();
         let s = SecuritySettings::resolve(&r, "0.0.0.0", 9092).unwrap();
         assert_eq!(s.warnings().len(), 1, "only the PLAINTEXT listener is left");
         // Loopback binds never warn.

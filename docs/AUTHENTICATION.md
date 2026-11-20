@@ -27,14 +27,28 @@ The primary listener is `pg_kafka.host`:`pg_kafka.port` and speaks
 
 ```sql
 ALTER SYSTEM SET pg_kafka.additional_listeners =
-  'SASL_SSL://0.0.0.0:9093, SSL://:9094';   -- an empty host means pg_kafka.host
+  'SASL_SSL://0.0.0.0:9093@broker.example.com:9093, SSL://:9094';  -- an empty host means pg_kafka.host
 ```
 
-Each listener advertises its own `host:port` in Metadata and FindCoordinator responses
-(Kafka's per-listener `advertised.listeners`; an unspecified bind address advertises
-`localhost`), so a client that bootstrapped on a listener keeps using it. A typical
-deployment keeps the primary listener PLAINTEXT on loopback for local tools and exposes
-only a `SASL_SSL` listener.
+Each listener advertises its own address in Metadata and FindCoordinator responses, so a
+client that bootstrapped on a listener keeps using it. This is Kafka's per-listener
+`advertised.listeners`, written next to the listener it belongs to:
+
+* `PROTOCOL://host:port@advertised_host:advertised_port` advertises the part after `@`
+  (`advertised_port` defaults to the bind port; an IPv6 literal goes in brackets,
+  `@[2001:db8::1]:9093`). For the primary listener the same `host[:port]` goes in
+  `pg_kafka.advertised_address`.
+* Without one, a listener advertises its bind host, except that an unspecified bind
+  address (`0.0.0.0`, `::`) is not something a client can connect to and advertises
+  `localhost`, which serves local clients only. The worker logs a WARNING at start for
+  every listener that is reachable from other hosts but advertises a loopback address:
+  remote clients would bootstrap and then fail to connect.
+
+An advertised address must name a host (not `0.0.0.0` or `::`) and a port from 1 to
+65535 (it may differ from the bind port, behind NAT or a load balancer); a bad one stops
+the worker with an error naming the setting. A typical deployment keeps the primary
+listener PLAINTEXT on loopback for local tools and exposes only a `SASL_SSL` listener
+with its public name after `@`.
 
 Why Kafka's vocabulary rather than one "TLS on/off" switch: Kafka clients are configured
 with `security.protocol=SSL|SASL_SSL|...`, and running several listeners at once lets an
@@ -46,7 +60,8 @@ operator migrate clients one at a time (and lets the E2E suite keep using PLAINT
 | GUC | Default | Meaning |
 |-----|---------|---------|
 | `pg_kafka.security_protocol` | `PLAINTEXT` | Protocol of the primary listener |
-| `pg_kafka.additional_listeners` | empty | Extra `PROTOCOL://host:port` listeners, comma separated |
+| `pg_kafka.additional_listeners` | empty | Extra `PROTOCOL://host:port[@advertised_host[:port]]` listeners, comma separated |
+| `pg_kafka.advertised_address` | empty | `host[:port]` the primary listener advertises (empty: `pg_kafka.host`, `localhost` for `0.0.0.0` / `::`) |
 | `pg_kafka.ssl_cert_file` | empty | PEM certificate chain (required by any SSL / SASL_SSL listener) |
 | `pg_kafka.ssl_key_file` | empty | PEM private key (PKCS#8, PKCS#1 or SEC1) |
 | `pg_kafka.ssl_ca_file` | empty | PEM CA bundle; when set, TLS clients must present a certificate signed by it |
@@ -95,7 +110,10 @@ the exposed listener's slots; use a firewall or a proxy in front of it for that.
 On a `SASL_PLAINTEXT` or `SASL_SSL` listener a client must authenticate before it can do
 anything: until SaslAuthenticate succeeds, only ApiVersions, SaslHandshake and
 SaslAuthenticate are processed, and any other request closes the connection without a
-response (as Kafka does).
+response (as Kafka does). Before authentication the network thread answers ApiVersions
+itself, as Kafka's authenticator does, so an unauthenticated client never puts work on
+the database thread; only its credential lookup does (rate-limited, below). After
+authentication ApiVersions is served by the database thread like any other request.
 
 * **SaslHandshake** v1. v0, after which tokens are sent unframed, is not supported: it
   is advertised (librdkafka enables SASL only when the broker advertises v0) but a v0
@@ -151,13 +169,24 @@ SELECT pg_kafka_create_user('bob', 'another secret', 8192);
 -- Change the password
 SELECT pg_kafka_alter_user('alice', 'new password');
 -- Install a verifier computed elsewhere: the plaintext never reaches the server.
--- SCRAM-SHA-256 uses PostgreSQL's format, e.g. from libpq PQencryptPasswordConn().
+-- SCRAM-SHA-256 uses PostgreSQL's format, e.g. from libpq PQencryptPasswordConn()
+-- (ASCII passwords only, see below).
 SELECT pg_kafka_set_user_verifier('carol', 'SCRAM-SHA-256$4096:<salt>$<StoredKey>:<ServerKey>');
 -- Drop (returns false if the user did not exist)
 SELECT pg_kafka_drop_user('bob');
 -- List users (no secrets); readable by pgkafka_reader
 SELECT * FROM kafka.sasl_users;
 ```
+
+**Verifiers from libpq or PostgreSQL work for ASCII passwords only.** Kafka clients
+(Java, librdkafka) hash the password's raw UTF-8 bytes; libpq's `PQencryptPasswordConn`
+(and PostgreSQL's own `SCRAM-SHA-256$` passwords) first apply SASLprep (RFC 4013). For a
+password of ASCII characters the two agree: SASLprep leaves ASCII unchanged, and a
+password it rejects (one with an ASCII control character) is hashed as it is. A password
+with non-ASCII characters may be normalized (NFKC, other spaces mapped to a space,
+some characters removed), and no Kafka client then authenticates against that verifier.
+For such a password use `pg_kafka_create_user` / `pg_kafka_alter_user` (they hash the raw
+bytes, like Kafka), or compute the verifier with a tool that applies no SASLprep.
 
 The functions are SECURITY INVOKER: they work for roles that may write
 `kafka.sasl_credentials`, which by default is only superusers (the extension owner).
@@ -240,9 +269,6 @@ Not protected:
   without `pg_kafka.ssl_ca_file`: they accept everyone. Keep the PLAINTEXT listener on
   loopback (or firewall it) when you rely on SASL elsewhere. The worker warns about
   non-loopback listeners that do not authenticate.
-* **Pre-authentication ApiVersions**: an unauthenticated client may send ApiVersions,
-  which is served by the database thread like any request (bounded per connection by the
-  in-flight cap).
 * **Revocation**: dropping a user or changing a password does not disconnect existing
   sessions; restart the worker to cut them.
 * **Certificate revocation** (CRLs/OCSP) for client certificates is not checked.

@@ -367,15 +367,19 @@ $$;
 -- pending transactional row and every topic with rows in it is listed in
 -- p_expired_topics (the topics the caller found wholly expired in this leaf: its upper
 -- bound is older than the topic's retention window). Never drops the DEFAULT leaf.
--- Returns whether it dropped the leaf and the (topic_id, partition_id) pairs the leaf
--- held, so the caller advances their log_start_offset. Dropping a leaf is equivalent
--- to deleting its rows, which the worker may already do; the function grants no more.
+-- Returns whether it dropped the leaf, the (topic_id, partition_id) pairs the leaf
+-- held and, for each, the offset after the last one it held (MAX + 1, one btree descent
+-- per pair), so the caller advances their log_start_offset and keeps their offset
+-- counter past the dropped offsets even where no counter row existed. Dropping a leaf
+-- is equivalent to deleting its rows, which the worker may already do; the function
+-- grants no more.
 CREATE FUNCTION kafka.drop_message_partition(
     p_partition REGCLASS,
     p_expired_topics INT[],
     OUT dropped BOOLEAN,
     OUT topic_ids INT[],
-    OUT partition_ids INT[]
+    OUT partition_ids INT[],
+    OUT next_offsets BIGINT[]
 )
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
@@ -422,6 +426,12 @@ BEGIN
                    WHERE classid = 'pg_class'::regclass AND objid = p_partition AND deptype = 'e') THEN
             EXECUTE format('ALTER EXTENSION pg_kafka DROP TABLE %s', p_partition);
         END IF;
+        EXECUTE format(
+            'SELECT COALESCE(array_agg((SELECT MAX(l.partition_offset) + 1 FROM %s l
+                                        WHERE l.topic_id = u.t AND l.partition_id = u.p)
+                                       ORDER BY u.n), ''{}'')
+             FROM unnest($1, $2) WITH ORDINALITY AS u(t, p, n)', p_partition)
+        INTO next_offsets USING topic_ids, partition_ids;
         EXECUTE format('DROP TABLE %s', p_partition);
         dropped := true;
     EXCEPTION WHEN lock_not_available THEN
@@ -429,6 +439,7 @@ BEGIN
         dropped := false;
         topic_ids := NULL;
         partition_ids := NULL;
+        next_offsets := NULL;
     END;
 END;
 $$;
@@ -538,6 +549,10 @@ CREATE TABLE kafka.producer_ids (
     epoch SMALLINT NOT NULL DEFAULT 0,
     client_id TEXT,
     transactional_id TEXT,  -- NULL for non-transactional idempotent producers
+    -- The epoch before the last bump the producer asked for itself (InitProducerId
+    -- presenting its own id and epoch), so a retry of that request gets the same epoch
+    -- back; NULL after a fencing bump (Kafka's lastProducerEpoch).
+    last_epoch SMALLINT,
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
     last_active_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
@@ -572,6 +587,8 @@ COMMENT ON COLUMN kafka.producer_ids.producer_id IS 'Unique producer ID allocate
 COMMENT ON COLUMN kafka.producer_ids.epoch IS 'Producer epoch, incremented on each InitProducerId call for same producer. Used for fencing.';
 
 COMMENT ON COLUMN kafka.producer_ids.transactional_id IS 'Optional transactional ID for transactional producers (Phase 10)';
+
+COMMENT ON COLUMN kafka.producer_ids.last_epoch IS 'Epoch before the last bump the producer requested itself (a retry of that InitProducerId gets the current epoch back); NULL after a fencing bump.';
 
 COMMENT ON TABLE kafka.producer_sequences IS 'Sequence number tracking for idempotent producer deduplication';
 

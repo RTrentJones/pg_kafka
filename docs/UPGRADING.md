@@ -13,19 +13,27 @@ as an upgrade script `sql/pg_kafka--<from>--<to>.sql`; `cargo pgrx install` and
    cargo pgrx install --release --pg-config "$(which pg_config)"
    ```
 
-2. Restart Postgres so the new shared library (and its background worker) is loaded.
-   The worker of a new binary serves Kafka clients against the previous schema until
-   step 3. At start (and at every configuration reload) it reads the installed
-   `extversion` and which optional objects exist, and logs **one** WARNING naming what
-   is unavailable (`running against an older pg_kafka schema (version 0.0.0, library
-   0.1.0); unavailable until ALTER EXTENSION pg_kafka UPDATE: ...`); it then skips
-   those features instead of failing every cycle. On a 0.0.0 schema that means: no
-   time-partition maintenance (the retention sweep, including
-   `pg_kafka_run_retention_sweep()`, deletes expired rows row by row from the
-   unpartitioned `kafka.messages`), no broker metrics (`kafka.broker_api_stats` /
-   `kafka.broker_gauges` do not exist), no SASL users (lookups fail, so SASL
-   listeners reject every login). The 0.1.0 role switch falls back to the bootstrap
-   superuser with a WARNING until the role exists.
+2. Restart Postgres so the new shared library (and its background worker) is loaded. The
+   worker of a new binary does **not** serve Kafka clients against the previous schema:
+   the 0.1.0 library's request paths use objects the 0.0.0 schema lacks (every
+   idempotent Produce reads `kafka.producer_batches`, transactions use
+   `kafka.txn_partitions`, SASL logins read `kafka.sasl_credentials` and
+   `kafka.sasl_server_secret`, the shadow outbox needs
+   `kafka.shadow_tracking.attempt_open`, maintenance and the metrics flush need the time
+   partitions and `kafka.broker_api_stats` / `kafka.broker_gauges`). At start it checks
+   for each of them and, on an older schema, logs **one** WARNING (`running against an
+   older pg_kafka schema (version 0.0.0, library 0.1.0): answering Kafka requests with
+   KAFKA_STORAGE_ERROR and running no maintenance until ALTER EXTENSION pg_kafka UPDATE
+   (missing: ...)`). Until step 3, clients see what they see while the extension is
+   dropped: the Kafka port accepts connections, every request (ApiVersions and Metadata
+   included) is answered with the retriable `KAFKA_STORAGE_ERROR` (56), and SASL logins
+   fail (their credential lookups are refused, so the exchange ends in
+   `SASL_AUTHENTICATION_FAILED`). Kafka clients retry those requests, so producers queue
+   their records (up to their own `delivery.timeout.ms` / `message.timeout.ms`) and
+   consumers stall; nothing is written. Keep the window between the restart and step 3
+   short. The worker runs no maintenance in the meantime;
+   `pg_kafka_run_retention_sweep()` still works from SQL (row by row on the
+   unpartitioned 0.0.0 `kafka.messages`).
 
 3. In the database named by `pg_kafka.database`, run:
 
@@ -34,20 +42,27 @@ as an upgrade script `sql/pg_kafka--<from>--<to>.sql`; `cargo pgrx install` and
    SELECT extversion FROM pg_extension WHERE extname = 'pg_kafka';
    ```
 
-4. Nothing else is needed for 0.1.0: at its next configuration reload (at most
-   `pg_kafka.config_reload_interval_ms`, or right away after `SELECT
-   pg_reload_conf()`) the worker sees the new version, logs that all features are
-   enabled, switches to `pg_kafka.run_as_role` if the role now has its privileges,
-   and runs partition maintenance. Terminating the `pg_kafka_listener` backend has
-   the same effect immediately.
+4. Nothing else is needed for 0.1.0: while the schema is older the worker re-checks it
+   every 500 ms, so within half a second of the update's commit it logs `pg_kafka
+   schema is now version 0.1.0: serving Kafka clients`, switches to
+   `pg_kafka.run_as_role` if the role now has its privileges, runs partition
+   maintenance and serves clients, without a restart. Requests clients retried during
+   the window then succeed (an idempotent producer's queued records are acked once, in
+   order).
 
 Upgrade scripts take locks on the tables they alter. Run them in a quiet period on a
 large `kafka.messages`. A running worker does not deadlock with them: every upgrade
 script starts with `SELECT pg_advisory_xact_lock(8099547369649367906)`, the pg_kafka
 schema lock that every worker transaction holds in SHARE mode, so the script waits for
-the worker's current transaction (a request batch, at most a few milliseconds) and the
-worker's next transactions wait (up to `pg_kafka.worker_lock_timeout_ms`, then their
-requests get a retriable error) until the upgrade commits.
+the worker's current transaction and the worker's next transactions wait (up to
+`pg_kafka.worker_lock_timeout_ms`, default 5 s, then their requests get a retriable
+error) until the upgrade commits. The script's wait is usually short, a request batch
+(up to 50 ms of handlers plus its commit), but the worker's maintenance runs in
+transactions too and can hold the lock for seconds: a retention sweep spends up to
+1.5 s on row deletes and then up to 2 s waiting for the locks of each leaf it drops,
+and partition maintenance moves rows out of the DEFAULT leaf in one transaction. The
+upgrade itself holds the lock for as long as it runs (see step 1 of 0.0.0 -> 0.1.0), so
+on a large `kafka.messages` requests fail retriably for most of it.
 
 `DROP EXTENSION pg_kafka` while the worker runs is safe too: every worker transaction
 first takes a share lock on the extension object, which DROP EXTENSION locks before any
@@ -78,18 +93,29 @@ EXTENSION pg_kafka` has run, without a restart.
   revokes every privilege 0.0.0 granted to PUBLIC on the kafka schema (including
   EXECUTE on `kafka.replay_shadow_messages`), grants read-only access to
   `pgkafka_reader` and the worker's privileges to `pgkafka_worker`;
-- re-applies the two additive columns older 0.0.0 builds may lack
-  (`kafka.topics.retention_ms`, `kafka.partition_offsets.log_start_offset`).
+- brings older 0.0.0 builds to the newest 0.0.0 layout first: it re-applies the
+  additive columns they may lack (`kafka.topics.retention_ms`,
+  `kafka.partition_offsets.log_start_offset`, `kafka.messages.timestamp_ms`, the latter
+  as -1, "no record timestamp", so fetches fall back to `created_at`) and converts the
+  naive `TIMESTAMP` columns of builds before the TIMESTAMPTZ change
+  (`kafka.messages.created_at`, `kafka.transactions.started_at`,
+  `kafka.shadow_tracking.forwarded_at`) to `TIMESTAMPTZ`, reading the stored values in
+  the upgrading session's `TimeZone` (set it to the server's zone if the session's
+  differs). Converting `kafka.messages.created_at` rewrites the table, one more full
+  read and write under the same lock. Layouts older than these are not supported;
+- adds `kafka.producer_ids.last_epoch` (the epoch an InitProducerId retry may present).
 
 After the upgrade:
 
 - **Readers.** Roles that read `kafka.*` directly (dashboards, monitoring using
   `kafka.metrics`, ad-hoc queries) need `GRANT pgkafka_reader TO <role>;`. Superusers
   are unaffected.
-- **Worker role.** `pg_kafka.run_as_role` defaults to `pgkafka_worker`. After the
-  restart in step 4 the worker logs `background worker now runs as role
-  'pgkafka_worker'`. Set `pg_kafka.run_as_role = ''` to keep the old behaviour (run as
-  the bootstrap superuser), or name another role with the same privileges.
+- **Worker role.** `pg_kafka.run_as_role` defaults to `pgkafka_worker`. With that
+  default nothing is restarted: once the worker sees the updated schema (step 4) it logs
+  `background worker now runs as role 'pgkafka_worker'`. To keep the old behaviour (run
+  as the bootstrap superuser) set `pg_kafka.run_as_role = ''`, or name another role with
+  the same privileges. The setting is read only at server start (a reload does not
+  change it), so set it in `postgresql.conf` before the restart of step 2.
 - **Roles are cluster-wide.** They are not dropped by `DROP EXTENSION`; drop them by
   hand once no database uses pg_kafka.
 

@@ -28,6 +28,7 @@ fn test_handle_init_producer_id_new_producer() {
         &ctx,
         None,  // No transactional ID
         60000, // New producer
+        None,  // No producer id presented
         Some("test-client"),
     )
     .unwrap();

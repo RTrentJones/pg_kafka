@@ -3,8 +3,8 @@
 //! One test per attack (frame-budget lockout, oversized response, Nagle, acks=0 close,
 //! invalid acks, response before close, per-IP / per-listener limits, idle and frame
 //! read deadlines, the pre-auth deadline from accept, the SASL lookup rate limit, SCRAM
-//! enumeration), each checking that ordinary rdkafka clients keep working while the
-//! attack runs.
+//! enumeration, a decompression bomb, an acks=0 Produce at an unsupported version), each
+//! checking that ordinary rdkafka clients keep working while the attack runs.
 //!
 //! `hostile_clients` run against the default configuration. `limits` reconfigure the listener
 //! (lower caps and timeouts, three extra listeners: PLAINTEXT 19096, SASL_PLAINTEXT
@@ -14,6 +14,7 @@
 //! well-behaved clients on 127.0.0.1. All tests are `parallel_safe: false`.
 
 pub mod hostile_clients;
+pub mod produce_decoding;
 
 use crate::common::DynResult;
 use crate::wire::{correlation_of, read_frame_within, request_frame};
@@ -160,6 +161,8 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         hostile_clients::test_acks0_produce_error_closes_connection: sequential,
         hostile_clients::test_invalid_acks_rejected_and_nothing_written: sequential,
         hostile_clients::test_request_before_closing_frame_is_answered: sequential,
+        produce_decoding::test_compressed_produce_past_the_decode_limit_is_refused: sequential,
+        produce_decoding::test_unsupported_version_acks0_produce_closes_connection: sequential,
         limits::test_network_limits_setup: sequential,
         limits::test_scram_unknown_user_is_indistinguishable: sequential,
         limits::test_per_ip_connection_limit: sequential,

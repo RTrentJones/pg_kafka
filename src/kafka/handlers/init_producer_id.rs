@@ -1,8 +1,9 @@
 //! InitProducerId: producer ids and epochs for idempotent and transactional producers.
 
-use crate::kafka::constants::ERROR_NONE;
+use crate::kafka::constants::{ERROR_NONE, ERROR_PRODUCER_FENCED};
 use crate::kafka::error::Result;
 use crate::kafka::handler_context::HandlerContext;
+use crate::kafka::storage::TransactionalProducer;
 use kafka_protocol::messages::init_producer_id_response::InitProducerIdResponse;
 use kafka_protocol::messages::ProducerId;
 use pgrx::GucSetting;
@@ -19,15 +20,57 @@ pub fn transaction_timeout_is_valid(timeout_ms: i32, max_timeout_ms: i32) -> boo
     timeout_ms > 0 && timeout_ms <= max_timeout_ms
 }
 
+/// What InitProducerId does for a transactional id, given the producer id and epoch
+/// the request presents (v3+, KIP-360) and the id's current producer: Kafka 3.7's
+/// `TransactionCoordinator.handleInitProducerId` / `prepareIncrementProducerEpoch`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TxnInit {
+    /// Move to the next epoch (or a new producer id), fencing the previous holder.
+    /// `requested_by` is the epoch to remember when the current producer asked for the
+    /// bump itself, so a retry of the request is recognised.
+    Bump { requested_by: Option<i16> },
+    /// A retry of a bump the producer already got: answer the current id and epoch.
+    Current { producer_id: i64, epoch: i16 },
+    /// A presented id or epoch that is not the current producer's: PRODUCER_FENCED.
+    Fenced,
+}
+
+/// Decide [`TxnInit`] from the presented `(producer_id, epoch)` (None for -1/-1) and the
+/// transactional id's current producer (None for a new transactional id).
+pub(crate) fn decide_txn_init(
+    presented: Option<(i64, i16)>,
+    current: Option<&TransactionalProducer>,
+) -> TxnInit {
+    let (Some((producer_id, epoch)), Some(current)) = (presented, current) else {
+        // A new producer, or a new transactional id: Kafka accepts any presented id.
+        return TxnInit::Bump { requested_by: None };
+    };
+    if producer_id != current.producer_id {
+        TxnInit::Fenced
+    } else if epoch == current.epoch {
+        TxnInit::Bump {
+            requested_by: Some(epoch),
+        }
+    } else if Some(epoch) == current.previous_epoch {
+        TxnInit::Current {
+            producer_id: current.producer_id,
+            epoch: current.epoch,
+        }
+    } else {
+        TxnInit::Fenced
+    }
+}
+
 /// Handle InitProducerId request
 ///
 /// Allocates a new producer ID or bumps the epoch for an existing producer.
 /// Used by idempotent and transactional producers to get their identity.
 ///
-/// For transactional producers (transactional_id is Some):
-/// - Looks up existing producer by transactional_id
-/// - If found, bumps epoch (fences old producer instances)
-/// - If not found, allocates new producer ID and creates transaction record
+/// For transactional producers (transactional_id is Some), see `decide_txn_init`:
+/// a new transactional id gets a new producer id; an existing one gets its next epoch
+/// (fencing the previous producer) unless the request presents a producer id and epoch
+/// that are not the current producer's (PRODUCER_FENCED) or that a bump already moved
+/// past (the current epoch, without another bump).
 ///
 /// For idempotent-only producers (transactional_id is None) a new producer ID is
 /// allocated; the producer id and epoch the request presents are ignored, as in Kafka 3.7.
@@ -36,6 +79,7 @@ pub fn transaction_timeout_is_valid(timeout_ms: i32, max_timeout_ms: i32) -> boo
 /// * `ctx` - Handler context (store, coordinator, broker metadata, etc.)
 /// * `transactional_id` - Optional transactional ID (for transactional producers)
 /// * `transaction_timeout_ms` - Transaction timeout in ms (for transactional producers)
+/// * `presented` - The producer id and epoch the request presents (None for -1/-1)
 /// * `client_id` - Optional client identifier for debugging
 ///
 /// # Returns
@@ -44,6 +88,7 @@ pub fn handle_init_producer_id(
     ctx: &HandlerContext,
     transactional_id: Option<&str>,
     transaction_timeout_ms: i32,
+    presented: Option<(i64, i16)>,
     client_id: Option<&str>,
 ) -> Result<InitProducerIdResponse> {
     // The GUC is read only for a transactional producer (the bound does not apply to
@@ -57,9 +102,19 @@ pub fn handle_init_producer_id(
         ctx,
         transactional_id,
         transaction_timeout_ms,
+        presented,
         client_id,
         max_timeout_ms,
     )
+}
+
+/// An InitProducerId error response.
+fn init_error(error_code: i16) -> InitProducerIdResponse {
+    let mut response = InitProducerIdResponse::default();
+    response.error_code = error_code;
+    response.producer_id = ProducerId(-1);
+    response.producer_epoch = -1;
+    response
 }
 
 /// [`handle_init_producer_id`] with an explicit `transaction.max.timeout.ms`.
@@ -67,6 +122,7 @@ pub(crate) fn init_producer_id_bounded(
     ctx: &HandlerContext,
     transactional_id: Option<&str>,
     transaction_timeout_ms: i32,
+    presented: Option<(i64, i16)>,
     client_id: Option<&str>,
     max_timeout_ms: i32,
 ) -> Result<InitProducerIdResponse> {
@@ -78,20 +134,32 @@ pub(crate) fn init_producer_id_bounded(
         // Validate the timeout first, as Kafka does (the producer is not
         // touched, so an existing transaction is not fenced by a bad request).
         if !transaction_timeout_is_valid(transaction_timeout_ms, max_timeout_ms) {
-            response.error_code = crate::kafka::constants::ERROR_INVALID_TRANSACTION_TIMEOUT;
-            response.producer_id = ProducerId(-1);
-            response.producer_epoch = -1;
-            return Ok(response);
+            return Ok(init_error(
+                crate::kafka::constants::ERROR_INVALID_TRANSACTION_TIMEOUT,
+            ));
         }
-        // Transactional producer: use transactional_id as the key
-        // This will either:
-        // - Create a new producer ID and transaction record if txn_id is new
-        // - Bump epoch and return existing producer ID if txn_id exists (fencing)
-        let (producer_id, epoch) = store.get_or_create_transactional_producer(
-            txn_id,
-            transaction_timeout_ms,
-            client_id,
-        )?;
+        let current = if presented.is_some() {
+            store.transactional_producer(txn_id)?
+        } else {
+            None
+        };
+        let (producer_id, epoch) = match decide_txn_init(presented, current.as_ref()) {
+            TxnInit::Fenced => return Ok(init_error(ERROR_PRODUCER_FENCED)),
+            TxnInit::Current { producer_id, epoch } => (producer_id, epoch),
+            TxnInit::Bump { requested_by } => {
+                // Either creates a new producer id and transaction record (a new
+                // transactional id) or bumps the epoch, fencing the previous producer.
+                let (producer_id, epoch) = store.get_or_create_transactional_producer(
+                    txn_id,
+                    transaction_timeout_ms,
+                    client_id,
+                )?;
+                if let Some(previous) = requested_by {
+                    store.remember_previous_epoch(producer_id, previous)?;
+                }
+                (producer_id, epoch)
+            }
+        };
 
         response.error_code = ERROR_NONE;
         response.producer_id = ProducerId(producer_id);
@@ -126,6 +194,7 @@ mod tests {
             &ctx,
             Some("tx"),
             timeout_ms,
+            None,
             None,
             crate::kafka::constants::DEFAULT_TRANSACTION_MAX_TIMEOUT_MS,
         )
@@ -163,5 +232,111 @@ mod tests {
             .times(1)
             .returning(|_, _, _| Ok((7, 0)));
         assert_eq!(run_txn(&store, 900_000).error_code, ERROR_NONE);
+    }
+
+    const OWNER: TransactionalProducer = TransactionalProducer {
+        producer_id: 7,
+        epoch: 3,
+        previous_epoch: Some(2),
+    };
+
+    #[test]
+    fn presented_epochs_follow_kafka() {
+        let bump = TxnInit::Bump { requested_by: None };
+        assert_eq!(
+            decide_txn_init(None, Some(&OWNER)),
+            bump,
+            "a new producer fences"
+        );
+        assert_eq!(
+            decide_txn_init(Some((7, 3)), None),
+            bump,
+            "a new transactional id"
+        );
+        assert_eq!(decide_txn_init(None, None), bump);
+        assert_eq!(
+            decide_txn_init(Some((7, 3)), Some(&OWNER)),
+            TxnInit::Bump {
+                requested_by: Some(3)
+            },
+            "the owner at its epoch is bumped"
+        );
+        assert_eq!(
+            decide_txn_init(Some((7, 2)), Some(&OWNER)),
+            TxnInit::Current {
+                producer_id: 7,
+                epoch: 3
+            },
+            "a retry of that bump"
+        );
+        for zombie in [(7, 1), (7, 4), (8, 3), (8, 2)] {
+            assert_eq!(
+                decide_txn_init(Some(zombie), Some(&OWNER)),
+                TxnInit::Fenced,
+                "{zombie:?}"
+            );
+        }
+        let fenced = TransactionalProducer {
+            previous_epoch: None,
+            ..OWNER
+        };
+        assert_eq!(
+            decide_txn_init(Some((7, 2)), Some(&fenced)),
+            TxnInit::Fenced
+        );
+    }
+
+    fn run_presented(store: &MockKafkaStore, presented: (i64, i16)) -> InitProducerIdResponse {
+        let env = TestEnv::new();
+        let ctx = env.ctx(store);
+        init_producer_id_bounded(
+            &ctx,
+            Some("tx"),
+            60_000,
+            Some(presented),
+            None,
+            crate::kafka::constants::DEFAULT_TRANSACTION_MAX_TIMEOUT_MS,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_zombie_is_fenced_without_touching_the_owner() {
+        // No bump expectation: get_or_create_transactional_producer must not run.
+        let mut store = MockKafkaStore::new();
+        store
+            .expect_transactional_producer()
+            .returning(|_| Ok(Some(OWNER)));
+        let r = run_presented(&store, (7, 1));
+        assert_eq!(r.error_code, ERROR_PRODUCER_FENCED);
+        assert_eq!((r.producer_id.0, r.producer_epoch), (-1, -1));
+    }
+
+    #[test]
+    fn a_retry_gets_the_current_epoch_and_the_owner_is_bumped_and_remembered() {
+        let mut store = MockKafkaStore::new();
+        store
+            .expect_transactional_producer()
+            .returning(|_| Ok(Some(OWNER)));
+        let r = run_presented(&store, (7, 2));
+        assert_eq!(
+            (r.error_code, r.producer_id.0, r.producer_epoch),
+            (ERROR_NONE, 7, 3)
+        );
+
+        store
+            .expect_get_or_create_transactional_producer()
+            .times(1)
+            .returning(|_, _, _| Ok((7, 4)));
+        store
+            .expect_remember_previous_epoch()
+            .withf(|&pid, &epoch| pid == 7 && epoch == 3)
+            .times(1)
+            .returning(|_, _| Ok(()));
+        let r = run_presented(&store, (7, 3));
+        assert_eq!(
+            (r.error_code, r.producer_id.0, r.producer_epoch),
+            (ERROR_NONE, 7, 4)
+        );
     }
 }

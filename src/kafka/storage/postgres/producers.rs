@@ -8,8 +8,9 @@ use super::{internal, internal_unless, PostgresStore};
 use crate::kafka::constants::ERROR_INVALID_PRODUCER_EPOCH;
 use crate::kafka::error::{KafkaError, Result};
 use crate::kafka::storage::{
-    stored_last_sequence, transactional_epoch_is_stale, validate_sequence, CachedBatch,
-    ProducerBatch, SequenceCheck, SequenceValidation, PRODUCER_BATCH_CACHE,
+    stored_last_sequence, transactional_epoch_is_stale, validate_sequence,
+    validate_unknown_producer, CachedBatch, ProducerBatch, SequenceCheck, SequenceValidation,
+    TransactionalProducer, PRODUCER_BATCH_CACHE,
 };
 use pgrx::prelude::*;
 use pgrx::spi::{SpiClient, SpiError};
@@ -25,18 +26,42 @@ fn invalid_producer_epoch(producer_id: i64, epoch: i16, current_epoch: i16) -> K
     }
 }
 
+/// The next producer id from the producer id sequence, or, when a producer already
+/// holds that one, the first free id after the run of held ids it starts. An id can be
+/// held out of turn: a Produce from a producer the broker has no state for records the
+/// id it presents (see [`adopt_unknown_producer`]).
+fn next_free_producer_id(client: &mut SpiClient<'_>) -> Result<i64> {
+    let row = client
+        .update(
+            "SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM kafka.producer_ids WHERE producer_id = n)
+                         THEN n
+                         ELSE (SELECT MIN(p.producer_id) + 1 FROM kafka.producer_ids p
+                               WHERE p.producer_id >= n
+                                 AND NOT EXISTS (SELECT 1 FROM kafka.producer_ids q
+                                                 WHERE q.producer_id = p.producer_id + 1))
+                    END AS id
+             FROM nextval(pg_get_serial_sequence('kafka.producer_ids', 'producer_id')) AS n",
+            None,
+            &[],
+        )?
+        .first();
+    row.get_by_name("id")?
+        .ok_or_else(|| KafkaError::Internal("no free producer id".into()))
+}
+
 /// Insert a new producer id at epoch 0 and return `(producer_id, epoch)`.
 pub(super) fn insert_producer_id(
     client: &mut SpiClient<'_>,
     client_id: Option<&str>,
     transactional_id: Option<&str>,
 ) -> Result<(i64, i16)> {
+    let id = next_free_producer_id(client)?;
     let table = client.update(
-        "INSERT INTO kafka.producer_ids (client_id, transactional_id, epoch)
-         VALUES ($1, $2, 0)
+        "INSERT INTO kafka.producer_ids (producer_id, client_id, transactional_id, epoch)
+         VALUES ($1, $2, $3, 0)
          RETURNING producer_id, epoch",
         None,
-        &[client_id.into(), transactional_id.into()],
+        &[id.into(), client_id.into(), transactional_id.into()],
     )?;
     let row = table.first();
     let producer_id: i64 = row
@@ -46,7 +71,8 @@ pub(super) fn insert_producer_id(
     Ok((producer_id, epoch))
 }
 
-/// Move a producer to its next epoch and return `(producer_id, epoch)`. An exhausted
+/// Move a producer to its next epoch and return `(producer_id, epoch)`. The previous
+/// epoch is forgotten (a bump fences it); see [`PostgresStore::remember_previous_epoch`]. An exhausted
 /// epoch (RV-13: `epoch + 1` would overflow the SMALLINT and fail every later
 /// re-init) gets a fresh producer id at epoch 0 instead, as in Kafka; the
 /// transactions foreign key is ON UPDATE CASCADE, so a transaction row follows the new
@@ -56,19 +82,27 @@ pub(super) fn bump_producer_epoch(
     producer_id: i64,
     old_epoch: i16,
 ) -> Result<(i64, i16)> {
-    let sql = if old_epoch == i16::MAX {
-        "UPDATE kafka.producer_ids
-         SET producer_id = nextval(pg_get_serial_sequence('kafka.producer_ids', 'producer_id')),
-             epoch = 0, last_active_at = NOW()
-         WHERE producer_id = $1
-         RETURNING producer_id, epoch"
+    let row = if old_epoch == i16::MAX {
+        let new_id = next_free_producer_id(client)?;
+        client.update(
+            "UPDATE kafka.producer_ids
+             SET producer_id = $2, epoch = 0, last_epoch = NULL, last_active_at = NOW()
+             WHERE producer_id = $1
+             RETURNING producer_id, epoch",
+            None,
+            &[producer_id.into(), new_id.into()],
+        )?
     } else {
-        "UPDATE kafka.producer_ids
-         SET epoch = epoch + 1, last_active_at = NOW()
-         WHERE producer_id = $1
-         RETURNING producer_id, epoch"
-    };
-    let row = client.update(sql, None, &[producer_id.into()])?.first();
+        client.update(
+            "UPDATE kafka.producer_ids
+             SET epoch = epoch + 1, last_epoch = NULL, last_active_at = NOW()
+             WHERE producer_id = $1
+             RETURNING producer_id, epoch",
+            None,
+            &[producer_id.into()],
+        )?
+    }
+    .first();
     let new_producer_id: i64 = row.get_by_name("producer_id")?.unwrap_or(producer_id);
     let new_epoch: i16 = row
         .get_by_name("epoch")?
@@ -144,8 +178,8 @@ struct PartitionSequenceState {
     cached: Vec<CachedBatch>,
 }
 
-/// Read a producer's [`ProducerState`]; UNKNOWN_PRODUCER_ID when it has none.
-fn read_producer_state(client: &SpiClient<'_>, producer_id: i64) -> Result<ProducerState> {
+/// Read a producer's [`ProducerState`]; None when the broker holds none.
+fn read_producer_state(client: &SpiClient<'_>, producer_id: i64) -> Result<Option<ProducerState>> {
     let table = client.select(
         "SELECT epoch, transactional_id IS NOT NULL AS transactional
          FROM kafka.producer_ids
@@ -154,13 +188,32 @@ fn read_producer_state(client: &SpiClient<'_>, producer_id: i64) -> Result<Produ
         &[producer_id.into()],
     )?;
     if table.is_empty() {
-        return Err(KafkaError::unknown_producer_id(producer_id));
+        return Ok(None);
     }
     let row = table.first();
-    Ok(ProducerState {
+    Ok(Some(ProducerState {
         epoch: row.get_by_name("epoch")?.unwrap_or(0),
         transactional: row.get_by_name("transactional")?.unwrap_or(false),
-    })
+    }))
+}
+
+/// Record a producer the broker holds no state for at the id and epoch its batch
+/// carries, as an idempotent (non-transactional) producer, so its later batches are
+/// deduplicated and sequence-checked. Sequence rows left under the id belong to an
+/// earlier holder of it and are dropped.
+fn adopt_unknown_producer(
+    client: &mut SpiClient<'_>,
+    producer_id: i64,
+    producer_epoch: i16,
+) -> Result<()> {
+    client.update(
+        "INSERT INTO kafka.producer_ids (producer_id, epoch) VALUES ($1, $2)
+         ON CONFLICT (producer_id) DO NOTHING",
+        None,
+        &[producer_id.into(), producer_epoch.into()],
+    )?;
+    clear_producer_sequences(client, producer_id)?;
+    Ok(())
 }
 
 /// Read the batch's producer [`PartitionSequenceState`] on its partition.
@@ -293,7 +346,14 @@ impl PostgresStore {
         };
 
         Spi::connect_mut(|client| {
-            let producer = read_producer_state(client, producer_id)?;
+            let Some(producer) = read_producer_state(client, producer_id)? else {
+                crate::pg_debug!(
+                    "No state for producer_id={producer_id}: accepting it as a new producer at epoch {producer_epoch}"
+                );
+                adopt_unknown_producer(client, producer_id, producer_epoch)?;
+                let validation = validate_unknown_producer(base_sequence, record_count);
+                return apply_sequence_validation(client, &batch, validation);
+            };
             if transactional_epoch_is_stale(producer.transactional, producer_epoch, producer.epoch)
             {
                 return Err(invalid_producer_epoch(
@@ -445,5 +505,40 @@ impl PostgresStore {
             Ok(())
         })
         .map_err(internal("record_producer_sequence"))
+    }
+
+    pub(super) fn transactional_producer(
+        transactional_id: &str,
+    ) -> Result<Option<TransactionalProducer>> {
+        Spi::connect(|client| {
+            let table = client.select(
+                "SELECT producer_id, epoch, last_epoch FROM kafka.producer_ids
+                 WHERE transactional_id = $1",
+                Some(1),
+                &[transactional_id.into()],
+            )?;
+            if table.is_empty() {
+                return Ok(None);
+            }
+            let row = table.first();
+            Ok(Some(TransactionalProducer {
+                producer_id: row.get_by_name("producer_id")?.unwrap_or(0),
+                epoch: row.get_by_name("epoch")?.unwrap_or(0),
+                previous_epoch: row.get_by_name("last_epoch")?,
+            }))
+        })
+        .map_err(internal("transactional_producer"))
+    }
+
+    pub(super) fn remember_previous_epoch(producer_id: i64, previous_epoch: i16) -> Result<()> {
+        Spi::connect_mut(|client| {
+            client.update(
+                "UPDATE kafka.producer_ids SET last_epoch = $2 WHERE producer_id = $1",
+                None,
+                &[producer_id.into(), previous_epoch.into()],
+            )?;
+            Ok(())
+        })
+        .map_err(internal("remember_previous_epoch"))
     }
 }

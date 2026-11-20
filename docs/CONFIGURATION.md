@@ -13,12 +13,13 @@ worker starts: reload, then `pg_terminate_backend()` the `pg_kafka_listener` wor
 `SET` it in a session, but only the server-wide value (reload) reaches the worker. A string shown
 as "(unset)" has no boot value; the code then applies the default its description names.
 
-<!--gen:guc-count-->46<!--/gen--> settings:
+<!--gen:guc-count-->47<!--/gen--> settings:
 
 <!--gen:guc-table-->
 | Name | Type | Default | Range | Changes take effect | Description |
 |------|------|---------|-------|---------------------|-------------|
-| `pg_kafka.additional_listeners` | string | (unset) |  | reload | Extra Kafka listeners, e.g. 'SASL_SSL://0.0.0.0:9093,SSL://:9094'. Comma-separated PROTOCOL://host:port. Each advertises its own host:port in Metadata. Empty (default) = none. Read when the worker starts. |
+| `pg_kafka.additional_listeners` | string | (unset) |  | reload | Extra Kafka listeners, e.g. 'SASL_SSL://0.0.0.0:9093@broker.example.com:9093,SSL://:9094'. Comma-separated PROTOCOL://host:port[@advertised_host[:advertised_port]]. Each listener advertises its own address in Metadata and FindCoordinator: the part after @ (port defaults to the bind port), else the bind host (localhost for 0.0.0.0 / ::, which then serves local clients only). Empty (default) = none. Read when the worker starts. |
+| `pg_kafka.advertised_address` | string | (unset) |  | reload | host[:port] the primary listener advertises to clients, e.g. 'broker.example.com:9092'. Kafka's advertised.listeners for the primary listener: the address Metadata and FindCoordinator tell clients to connect to (port defaults to pg_kafka.port). Empty (default) = pg_kafka.host, or localhost when that is 0.0.0.0 / ::. Read when the worker starts. |
 | `pg_kafka.compression_type` | string | (unset) |  | restart | Compression type for FetchResponse encoding. Compression codec for outbound messages: none, gzip, snappy, lz4, zstd. Default: none. |
 | `pg_kafka.config_reload_interval_ms` | integer | `30000` | 100-300000 | reload | Configuration reload interval in milliseconds. How often to reload GUCs and shadow config from the database. Default 30000ms (30s). Tests can set to 1000-2000ms for faster iteration. Reloadable with pg_reload_conf(). |
 | `pg_kafka.connections_max_idle_ms` | integer | `600000` | 100-2147483647 ms | reload | Close Kafka client connections idle for this long. Kafka's connections.max.idle.ms: a connection with no request read, no response written and nothing outstanding for this long is closed. Read when the worker starts. |
