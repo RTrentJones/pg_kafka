@@ -169,8 +169,31 @@ fn raw_batch(section: &[u8], record_count: i32) -> Bytes {
         Ok(())
     })
     .expect("gzip compresses");
+    batch_around(&records, record_count, 1)
+}
+
+/// `section` as one zstd frame of raw (stored) blocks whose header declares a
+/// 2^`window_log`-byte window and no content size, as a streaming encoder writes it.
+fn zstd_raw_frame(section: &[u8], window_log: u8) -> Vec<u8> {
+    let mut frame = 0xFD2F_B528u32.to_le_bytes().to_vec();
+    frame.push(0); // frame header descriptor: no content size, no checksum, no dictionary
+    frame.push((window_log - 10) << 3); // window descriptor
+    let blocks: Vec<&[u8]> = section.chunks(65_536).collect();
+    for (i, block) in blocks.iter().enumerate() {
+        let last = u32::from(i + 1 == blocks.len());
+        let header = last | (u32::try_from(block.len()).expect("64 KiB") << 3); // raw block
+        frame.extend_from_slice(&header.to_le_bytes()[..3]);
+        frame.extend_from_slice(block);
+    }
+    frame
+}
+
+/// A RecordBatch v2 around `records` (compressed with the codec `attributes` names),
+/// declaring `record_count` records, with a valid CRC.
+fn batch_around(records: &[u8], record_count: i32, attributes: i16) -> Bytes {
+    use bytes::BufMut;
     let mut tail = bytes::BytesMut::new();
-    tail.put_i16(1); // attributes: gzip
+    tail.put_i16(attributes);
     tail.put_i32(record_count.max(1) - 1); // lastOffsetDelta
     tail.put_i64(0); // baseTimestamp
     tail.put_i64(0); // maxTimestamp
@@ -178,7 +201,7 @@ fn raw_batch(section: &[u8], record_count: i32) -> Bytes {
     tail.put_i16(-1); // producerEpoch
     tail.put_i32(-1); // baseSequence
     tail.put_i32(record_count);
-    tail.put_slice(&records);
+    tail.put_slice(records);
     let mut batch = bytes::BytesMut::new();
     batch.put_i64(0); // baseOffset
     batch.put_i32(i32::try_from(4 + 1 + 4 + tail.len()).expect("a test batch fits an i32"));
@@ -299,6 +322,36 @@ pub async fn test_record_and_header_bombs_are_refused_before_decoding() -> TestR
     assert!(answers(&mut s, 11).await, "the connection still answers");
     rdkafka_roundtrip(client_config(PORT), &topic, 3).await?;
     println!("✅ stored; rdkafka round trip works");
+
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// zstd batches whose frames declare windows up to 2^27 bytes, Kafka's limit (Java
+/// producers at compression.zstd.level 20-22 use 2^25-2^27), are stored; a larger window is
+/// refused and nothing of it is written.
+pub async fn test_zstd_batches_with_large_windows_are_stored() -> TestResult {
+    println!("=== Test: zstd windows up to 2^27 ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("net-zstd-window").await;
+    let created = create_topics_raw(vec![creatable(&topic, 1, 1)]).await?;
+    assert_eq!(created[0].error_code, 0, "{created:?}");
+    let mut s = TcpStream::connect(("127.0.0.1", PORT)).await?;
+    let section = tiny_records(1000);
+    let zstd = |window_log| batch_around(&zstd_raw_frame(&section, window_log), 1000, 4);
+
+    for (corr, window_log) in (1..).zip([21u8, 25, 27]) {
+        let codes = produce_codes(&mut s, corr, &topic, vec![(0, zstd(window_log))]).await?;
+        assert_eq!(codes, vec![0], "window 2^{window_log}");
+        println!("✅ window 2^{window_log}: stored");
+    }
+    assert_eq!(stored_rows(ctx.db(), &topic).await?, 3000);
+
+    let codes = produce_codes(&mut s, 10, &topic, vec![(0, zstd(28))]).await?;
+    assert_eq!(codes, vec![CORRUPT_MESSAGE], "window 2^28");
+    assert_eq!(stored_rows(ctx.db(), &topic).await?, 3000);
+    println!("✅ window 2^28: refused {codes:?}");
 
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");

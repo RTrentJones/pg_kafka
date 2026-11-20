@@ -172,28 +172,99 @@ pub fn parse_record_batch_with_metadata(
     })
 }
 
-/// zstd frames may ask for a window of at most 2^24 bytes (16 MiB). The decoder allocates
-/// the window a frame header declares before it produces any output, so without a cap a
-/// few bytes could make it allocate zstd's default limit of 128 MiB. Kafka's producers use
-/// windows of 2^21 (Java, level 3) or the batch size (librdkafka, which declares it).
-const ZSTD_WINDOW_LOG_MAX: u32 = 24;
+/// zstd frames may ask for a window of at most 2^27 bytes (128 MiB), zstd's own default
+/// limit and Kafka's: Java producers at `compression.zstd.level` 20-22 (Kafka 3.8+) use
+/// windows of 2^25-2^27. The decoder reserves the window a frame header declares up front
+/// but touches it only as it decodes, so the window is charged as it fills: as much again
+/// as the decoded bytes, up to the declared size ([`zstd_window`]).
+const ZSTD_WINDOW_LOG_MAX: u32 = 27;
+
+/// The first byte of a zstd frame (little-endian magic 0xFD2FB528).
+const ZSTD_MAGIC: u32 = 0xFD2F_B528;
+/// Skippable frames carry magics 0x184D2A50 to 0x184D2A5F and no window.
+const ZSTD_SKIPPABLE_MAGIC: u32 = 0x184D_2A50;
+
+/// The window a zstd frame header declares (RFC 8878 §3.1.1.1): from the Window_Descriptor,
+/// or the content size of a single-segment frame.
+fn zstd_frame_window(frame: &[u8]) -> anyhow::Result<u64> {
+    let header = |n: usize| {
+        frame
+            .get(..n)
+            .ok_or_else(|| anyhow::anyhow!("zstd frame header cut short"))
+    };
+    let magic = u32::from_le_bytes(header(4)?.try_into()?);
+    if magic & 0xFFFF_FFF0 == ZSTD_SKIPPABLE_MAGIC {
+        return Ok(0);
+    }
+    anyhow::ensure!(magic == ZSTD_MAGIC, "not a zstd frame");
+    let descriptor = header(5)?[4];
+    if descriptor & 0x20 == 0 {
+        let window_descriptor = header(6)?[5];
+        let log = 10 + u32::from(window_descriptor >> 3);
+        let base = 1u64 << log;
+        return Ok(base + base / 8 * u64::from(window_descriptor & 7));
+    }
+    // Single segment: the window is the frame content size, after the dictionary id.
+    let dictionary_id_bytes = [0, 1, 2, 4][usize::from(descriptor & 3)];
+    let content_size_bytes = [1, 2, 4, 8][usize::from(descriptor >> 6)];
+    let at = 5 + dictionary_id_bytes;
+    let field = header(at + content_size_bytes)?;
+    let mut size = [0u8; 8];
+    size[..content_size_bytes].copy_from_slice(&field[at..]);
+    let size = u64::from_le_bytes(size);
+    Ok(if content_size_bytes == 2 {
+        size + 256
+    } else {
+        size
+    })
+}
+
+/// The largest window any frame of `data` declares; past 2^[`ZSTD_WINDOW_LOG_MAX`] the data
+/// is refused before the decoder reserves anything. A frame the walk cannot measure ends it:
+/// the decoder reports what is wrong with it.
+fn zstd_window(mut data: &[u8]) -> anyhow::Result<usize> {
+    let mut largest = 0u64;
+    while !data.is_empty() {
+        largest = largest.max(zstd_frame_window(data)?);
+        anyhow::ensure!(
+            largest <= 1u64 << ZSTD_WINDOW_LOG_MAX,
+            "zstd frame declares a window of {largest} bytes"
+        );
+        match zstd::zstd_safe::find_frame_compressed_size(data) {
+            Ok(len) if len > 0 && len <= data.len() => data = &data[len..],
+            _ => break,
+        }
+    }
+    Ok(usize::try_from(largest)?)
+}
 
 /// Decoded output written through a [`DecodeBudget`]: a write that would pass the budget
-/// fails before anything is buffered.
+/// fails before anything is buffered. A decoder's window that fills as it decodes is
+/// charged with the output, up to `window` bytes.
 struct BudgetedWriter<'a> {
     out: BytesMut,
     budget: &'a DecodeBudget,
+    window: usize,
+    window_charged: usize,
 }
 
 impl<'a> BudgetedWriter<'a> {
     fn new(budget: &'a DecodeBudget) -> Self {
+        Self::with_window(budget, 0)
+    }
+
+    fn with_window(budget: &'a DecodeBudget, window: usize) -> Self {
         Self {
             out: BytesMut::new(),
             budget,
+            window,
+            window_charged: 0,
         }
     }
 
+    /// The output; what its window was charged is given back (the decoder is gone).
     fn into_bytes(self) -> Bytes {
+        self.budget.release(self.window_charged);
         self.out.freeze()
     }
 }
@@ -208,7 +279,11 @@ fn over_budget() -> io::Error {
 
 impl Write for BudgetedWriter<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.budget.take(buf.len()).map_err(|_| over_budget())?;
+        let window = buf.len().min(self.window - self.window_charged);
+        self.budget
+            .take(buf.len() + window)
+            .map_err(|_| over_budget())?;
+        self.window_charged += window;
         self.out.put_slice(buf);
         Ok(buf.len())
     }
@@ -275,6 +350,7 @@ fn decompress(
             io::copy(&mut decoder, &mut out)?;
         }
         Compression::Zstd => {
+            out = BudgetedWriter::with_window(budget, zstd_window(&data)?);
             let mut decoder = zstd::stream::read::Decoder::new(data.reader())?;
             decoder.window_log_max(ZSTD_WINDOW_LOG_MAX)?;
             io::copy(&mut decoder, &mut out)?;
@@ -588,17 +664,63 @@ mod tests {
         assert_eq!(budget.exhausted(), Some(Exhausted::Limit));
     }
 
-    #[test]
-    fn zstd_frames_asking_for_a_huge_window_are_refused() {
-        // A zstd frame whose header declares a 2^27-byte window and no content size: the
-        // decoder would allocate the window up front.
-        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 19).unwrap();
-        encoder.window_log(27).unwrap();
+    /// A zstd frame of `data` with a `window_log` window and no content size, as a Java
+    /// producer's streaming encoder writes it.
+    fn zstd_frame(data: &[u8], level: i32, window_log: u32) -> Vec<u8> {
+        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), level).unwrap();
+        encoder.window_log(window_log).unwrap();
         encoder.include_contentsize(false).unwrap();
-        encoder.write_all(&[7u8; 1000]).unwrap();
-        let frame = encoder.finish().unwrap();
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn zstd_frames_with_windows_up_to_kafkas_limit_decode() {
+        // Kafka 3.8+ producers at compression.zstd.level 22 declare a 2^27-byte window;
+        // Kafka accepts up to that. A larger window is refused before the decoder
+        // reserves it.
+        let data = vec![7u8; 1000];
+        for window_log in [21, 25, 27] {
+            let frame = zstd_frame(&data, 22, window_log);
+            assert_eq!(
+                zstd_window(&frame).unwrap(),
+                1 << window_log,
+                "window 2^{window_log}"
+            );
+            let out = decompress(&mut Bytes::from(frame), Compression::Zstd, &budget());
+            assert_eq!(&out.unwrap()[..], &data[..], "window 2^{window_log}");
+        }
+        let frame = zstd_frame(&data, 19, 28);
         let budget = budget();
         assert!(decompress(&mut Bytes::from(frame), Compression::Zstd, &budget).is_err());
+        assert_eq!(budget.charged(), 0, "refused before decoding");
+    }
+
+    #[test]
+    fn a_zstd_window_is_charged_as_it_fills() {
+        // While it decodes, a window holds as much again as the decoded bytes, up to its
+        // size; it is given back once the decoder is gone.
+        let data: Vec<u8> = (0..4_000_000u32).map(|i| (i % 251) as u8).collect();
+        for (window_log, extra) in [(20, 1 << 20), (25, data.len())] {
+            let frame = zstd_frame(&data, 3, window_log);
+            let peak = DecodeBudget::new(data.len() + extra - 1);
+            assert!(
+                decompress(&mut Bytes::from(frame.clone()), Compression::Zstd, &peak).is_err(),
+                "window 2^{window_log} is charged"
+            );
+            let budget = DecodeBudget::new(data.len() + extra);
+            let out = decompress(&mut Bytes::from(frame), Compression::Zstd, &budget).unwrap();
+            assert_eq!(out.len(), data.len());
+            assert_eq!(budget.charged(), data.len(), "window 2^{window_log}");
+        }
+        // Concatenated frames: the largest window counts; skippable frames have none.
+        let mut frames = vec![0x50, 0x2A, 0x4D, 0x18, 3, 0, 0, 0, 1, 2, 3];
+        frames.extend(zstd_frame(b"small", 3, 10));
+        frames.extend(zstd_frame(b"large", 3, 26));
+        assert_eq!(zstd_window(&frames).unwrap(), 1 << 26);
+        // A single-segment frame's window is its content size.
+        let single = zstd::bulk::compress(&[1u8; 3000], 3).unwrap();
+        assert_eq!(zstd_window(&single).unwrap(), 3000);
     }
 
     #[test]

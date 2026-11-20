@@ -71,8 +71,10 @@ pg_kafka.compression_type = 'gzip'
   record (264 bytes) and per header (136 bytes), charged from the declared record count before
   anything decodes. Past that every partition is answered MESSAGE_TOO_LARGE (Kafka streams
   validation and has no such limit), so a request of over ~380,000 records, or a request of
-  small records near the 100 MB frame limit, is refused. zstd frames may declare at most a 16 MiB window
-  (Kafka's producers use 2^21, or the batch size).
+  small records near the 100 MB frame limit, is refused.
+- zstd frames may declare a window of at most 2^27 bytes (128 MiB), as in Kafka; a decoder's
+  window counts toward that limit as it fills (as much again as the decoded bytes, up to the
+  window). A larger window is CORRUPT_MESSAGE (Kafka 3.7: UNKNOWN_SERVER_ERROR).
 - Each partition's data must be exactly one RecordBatch v2, as in Kafka 3.7 for Produce v3+:
   a legacy MessageSet (magic 0/1), empty or cut-short data, or a negative record count is
   INVALID_RECORD, as is a record count that does not match the records (too few or too
