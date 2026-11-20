@@ -105,12 +105,19 @@ fn hello_pg_kafka() -> &'static str {
 ///   0 disables the expired-message delete for this pass.
 /// * `aborted_grace_seconds`: minimum age of `txn_state='aborted'` rows to reclaim
 ///   (the default matches the worker's `ABORTED_MESSAGE_GRACE`; negative means 0).
+///
+/// Sweeps and partition maintenance are serialized: a call first waits for the
+/// partition-maintenance lock (bounded by the session's `lock_timeout`), so a
+/// concurrent pass (another session's, or the worker's) finishes first. Call it in a
+/// transaction of its own: a transaction that already locked kafka.messages could
+/// deadlock with the pass it waits for.
 #[pg_extern(volatile)]
 fn pg_kafka_run_retention_sweep(
     message_retention_hours: default!(Option<i32>, "NULL"),
     aborted_grace_seconds: default!(i64, 60),
 ) -> TableIterator<'static, (name!(category, String), name!(deleted, i64))> {
     use crate::kafka::storage::postgres::PostgresStore;
+    use crate::kafka::storage::retention::MaintenanceLockWait;
 
     let retention_hours =
         message_retention_hours.unwrap_or_else(|| config::MESSAGE_RETENTION_HOURS.get());
@@ -121,8 +128,10 @@ fn pg_kafka_run_retention_sweep(
             retention_hours,
             grace,
             config::MESSAGE_PARTITION_MINUTES.get(),
+            MaintenanceLockWait::Wait,
         )
-        .unwrap_or_else(|e| pgrx::error!("pg_kafka_run_retention_sweep failed: {}", e));
+        .unwrap_or_else(|e| pgrx::error!("pg_kafka_run_retention_sweep failed: {}", e))
+        .unwrap_or_default();
 
     let rows = [
         ("aborted_messages", stats.aborted_messages),

@@ -116,13 +116,41 @@ Maintenance can run in the worker and, at the same time, in any session
   mode (`worker::txn::lock_schema`), and the move takes it EXCLUSIVE, bounded by the function's
   `lock_timeout`; on a timeout the leaf is not created and the next pass retries. The
   upgrade scripts take the same lock first.
-* **Every lock wait in maintenance is bounded and handled.** `ensure_message_partitions`
-  takes its serializing advisory lock (8099547369649367905) inside a `lock_not_available`
-  handler under `lock_timeout = 2s`: a session that ran maintenance and stayed open makes
-  the next pass skip with a WARNING instead of stalling it (and, for the worker, the
-  whole broker). `drop_message_partition` takes the same lock and `ACCESS EXCLUSIVE` on
-  `kafka.messages` inside its handler, so a timeout skips that leaf instead of rolling
-  back the caller's whole sweep.
+* **Sweeps and partition maintenance never overlap.** A retention sweep deletes rows first
+  (the aborted-row cleanup, then the expired rows), which leaves its transaction holding
+  `ROW EXCLUSIVE` on `kafka.messages` and the row locks of its deletes, and drops leaves last,
+  which needs `ACCESS EXCLUSIVE` there. Two sweeps interleaving those steps form a lock cycle
+  (one waits for `ACCESS EXCLUSIVE` behind the other's `ROW EXCLUSIVE`, the other waits for
+  the first's deleted rows or for the maintenance lock) and Postgres aborts one with
+  `deadlock detected`. So every sweep takes the partition-maintenance advisory lock
+  (8099547369649367905) before its first statement and holds it to commit, as
+  `ensure_message_partitions` and `drop_message_partition` do: sweeps and maintenance run one
+  at a time. `pg_kafka_run_retention_sweep()` queues for the lock (bounded by the session's
+  `lock_timeout`; it holds nothing else yet). The worker never waits for it, because its
+  transaction holds the schema lock in SHARE mode, which a manual pass holding the
+  maintenance lock may be waiting for (moving rows out of DEFAULT): its sweep is skipped with
+  a WARNING while another session holds the lock, and the SQL functions only poll for it
+  (`kafka.try_maintenance_lock()`, `pg_try_advisory_xact_lock` until their `lock_timeout`),
+  never queue. Produce and fetch never take this lock, so they are not serialized with
+  maintenance beyond the table locks below.
+* **Partition DDL takes its table locks without deadlocking with worker transactions.**
+  Creating or dropping a leaf locks `kafka.messages` (`ACCESS EXCLUSIVE`) and, to clone or
+  drop the leaf's `topic_id` foreign key, `kafka.topics` (`SHARE ROW EXCLUSIVE`). A worker
+  transaction locks these two tables in either order (a group-commit batch can fetch from
+  one topic and then auto-create another, whose produce upserts `kafka.topics`), so no fixed
+  order avoids a cycle with it. `kafka.lock_message_tables()` takes both (topics, then
+  messages) in attempts of at most 50 ms each, well below `deadlock_timeout`, in a
+  subtransaction whose failure releases both, and retries with a random pause until the
+  caller's `lock_timeout` (2 s in the partition functions) has passed. A worker transaction
+  therefore waits at most one attempt, and one that holds a lock the DDL needs simply makes
+  it retry.
+* **Every lock wait in maintenance is bounded and handled.** A session that ran maintenance
+  and stayed open makes the next pass skip with a WARNING instead of stalling it (and, for
+  the worker, the whole broker). `drop_message_partition` takes its table locks inside a
+  `lock_not_available` handler, so a timeout skips that leaf instead of rolling back the
+  caller's whole sweep. Any ERROR in the worker's maintenance (a lock timeout, a deadlock
+  with a client's own transaction) rolls back that task's subtransaction only; the worker
+  logs a WARNING, keeps serving, and the next interval retries.
 * **A leaf dropped concurrently is "not dropped", not an error.** When two sweeps pick
   the same leaf, the second waits for the first's locks; afterwards
   `drop_message_partition` (and `message_partition_contents`) find the leaf gone and
@@ -137,7 +165,8 @@ SECURITY DEFINER functions owned by the extension owner, each with `SET search_p
 pg_temp`, schema-qualified names and `lock_timeout = 2s` around the DDL (a lock that cannot be had
 in time is a WARNING and a retry next pass, never a stalled worker). EXECUTE is revoked from PUBLIC
 and granted to `pgkafka_worker` only for `ensure_message_partitions`, `message_partition_contents`
-and `drop_message_partition`; `create_message_partition` is internal. Each function refuses any
+and `drop_message_partition`; `create_message_partition` and the lock helpers
+`try_maintenance_lock` and `lock_message_tables` are internal. Each function refuses any
 relation that is not a leaf of `kafka.messages` (and `drop` refuses the DEFAULT leaf), so the
 grant is no wider than the worker's existing INSERT/DELETE on `kafka.messages`: it can create
 leaves of that table and drop leaves whose rows it may delete anyway. The worker reads and writes

@@ -91,6 +91,38 @@ pub fn rotated<T: Clone>(items: &[T], start: usize) -> Vec<T> {
 // Time partitions (ADR-001): kafka.messages is RANGE-partitioned on created_at. The
 // decisions below drive `PostgresStore::run_retention_sweep`.
 
+/// Key of the partition-maintenance advisory lock (`'pg_kafka'` as an int8, one less
+/// than the schema lock). Every pass that deletes rows of kafka.messages or changes its
+/// leaves holds it for its whole transaction: the retention sweep (taken before its
+/// first statement), `kafka.ensure_message_partitions` and
+/// `kafka.drop_message_partition` (through `kafka.try_maintenance_lock()`). A sweep that
+/// deleted rows and then waited for ACCESS EXCLUSIVE on kafka.messages to drop a leaf
+/// would otherwise deadlock with a concurrent sweep holding ROW EXCLUSIVE there and
+/// waiting for those rows (or for this lock).
+pub const MAINTENANCE_LOCK_KEY: i64 = 8_099_547_369_649_367_905;
+
+/// How a retention sweep takes [`MAINTENANCE_LOCK_KEY`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaintenanceLockWait {
+    /// Queue for it (bounded by the session's `lock_timeout`): an on-demand sweep,
+    /// which holds no other lock yet, runs after the pass ahead of it.
+    Wait,
+    /// Take it only if it is free, else skip this pass: the worker, whose transaction
+    /// holds the schema lock in SHARE mode, must never wait for it (a manual
+    /// `create_message_partition` holding it may be waiting for the schema lock).
+    Skip,
+}
+
+impl MaintenanceLockWait {
+    /// The statement that takes the lock, returning one boolean column `locked`.
+    pub fn lock_sql(self) -> &'static str {
+        match self {
+            MaintenanceLockWait::Wait => "SELECT true AS locked FROM pg_advisory_xact_lock($1)",
+            MaintenanceLockWait::Skip => "SELECT pg_try_advisory_xact_lock($1) AS locked",
+        }
+    }
+}
+
 /// Default width of one time partition, minutes (`pg_kafka.message_partition_minutes`).
 pub const DEFAULT_PARTITION_MINUTES: i32 = 1440;
 /// Lower bound of `pg_kafka.message_partition_minutes` (5 minutes).
@@ -390,5 +422,32 @@ mod tests {
         assert!(may_hold_expired(&l, 1_500, 100)); // cutoff 1400 > lower
         assert!(!may_hold_expired(&l, 1_050, 100)); // cutoff 950 <= lower
         assert!(may_hold_expired(&leaf(2, None, None, true), 0, 100));
+    }
+
+    #[test]
+    fn maintenance_lock_statements() {
+        assert_eq!(
+            MaintenanceLockWait::Wait.lock_sql(),
+            "SELECT true AS locked FROM pg_advisory_xact_lock($1)"
+        );
+        assert_eq!(
+            MaintenanceLockWait::Skip.lock_sql(),
+            "SELECT pg_try_advisory_xact_lock($1) AS locked"
+        );
+    }
+
+    /// The SQL partition functions take the same key the sweep does, and nothing there
+    /// queues for it (a queued wait while holding the schema lock could deadlock).
+    #[test]
+    fn maintenance_lock_key_matches_the_partition_functions() {
+        for sql in [
+            include_str!("../../../sql/bootstrap.sql"),
+            include_str!("../../../sql/pg_kafka--0.0.0--0.1.0.sql"),
+        ] {
+            let key = MAINTENANCE_LOCK_KEY.to_string();
+            assert!(sql.contains(&format!("pg_try_advisory_xact_lock({key})")));
+            assert!(!sql.contains(&format!("pg_advisory_xact_lock({key})")));
+            assert!(sql.contains("IF NOT kafka.try_maintenance_lock() THEN"));
+        }
     }
 }

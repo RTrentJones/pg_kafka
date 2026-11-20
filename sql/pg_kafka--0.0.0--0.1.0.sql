@@ -223,6 +223,69 @@ BEGIN
 END;
 $$;
 
+-- Take the partition-maintenance advisory lock (key 8099547369649367905, 'pg_kafka')
+-- for this transaction, polling for it until the caller's lock_timeout has passed:
+-- returns whether it is held (internal). Polling instead of queueing for it, so a
+-- worker transaction (which holds the schema lock in SHARE mode) never sits in a lock
+-- wait for it while its holder waits for the schema lock: no lock cycle through it.
+-- Already held by this transaction (a retention sweep takes it first): true at once.
+CREATE FUNCTION kafka.try_maintenance_lock()
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    v_deadline TIMESTAMPTZ := clock_timestamp()
+        + COALESCE(NULLIF(current_setting('lock_timeout'), '0')::INTERVAL, INTERVAL '2s');
+BEGIN
+    LOOP
+        IF pg_try_advisory_xact_lock(8099547369649367905) THEN
+            RETURN true;
+        END IF;
+        IF clock_timestamp() >= v_deadline THEN
+            RETURN false;
+        END IF;
+        PERFORM pg_sleep(0.01 + random() * 0.04);
+    END LOOP;
+END;
+$$;
+
+-- Lock kafka.topics in SHARE ROW EXCLUSIVE mode and then kafka.messages in ACCESS
+-- EXCLUSIVE mode, what partition DDL needs (internal). Worker transactions lock these
+-- tables in either order (a batch can fetch, then auto-create a topic), so a DDL that
+-- waited for one while holding the other could deadlock with them. Each attempt
+-- therefore waits at most 50 ms (well below deadlock_timeout), in a subtransaction
+-- whose failure releases both locks, and the attempts repeat with a random pause
+-- until the caller's lock_timeout has passed; then lock_not_available is raised.
+CREATE FUNCTION kafka.lock_message_tables()
+RETURNS VOID
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    v_saved TEXT := current_setting('lock_timeout');
+    v_deadline TIMESTAMPTZ := clock_timestamp()
+        + COALESCE(NULLIF(current_setting('lock_timeout'), '0')::INTERVAL, INTERVAL '2s');
+BEGIN
+    LOOP
+        BEGIN
+            PERFORM set_config('lock_timeout', '50ms', true);
+            LOCK TABLE kafka.topics IN SHARE ROW EXCLUSIVE MODE;
+            LOCK TABLE kafka.messages IN ACCESS EXCLUSIVE MODE;
+            PERFORM set_config('lock_timeout', v_saved, true);
+            RETURN;
+        EXCEPTION WHEN lock_not_available THEN
+            -- The subtransaction is rolled back: neither lock is held, and lock_timeout
+            -- is back to v_saved.
+            IF clock_timestamp() >= v_deadline THEN
+                RAISE;
+            END IF;
+        END;
+        PERFORM pg_sleep(0.01 + random() * 0.04);
+    END LOOP;
+END;
+$$;
+
 -- Create the leaf [p_lower, p_upper) (internal; called by ensure_message_partitions).
 -- Rows already in the DEFAULT leaf for that range are moved into the new leaf first
 -- (Postgres refuses CREATE ... PARTITION OF while the default holds such rows). The
@@ -245,19 +308,28 @@ DECLARE
                    || CASE WHEN date_trunc('second', p_lower) = p_lower THEN ''
                            ELSE to_char(p_lower AT TIME ZONE 'UTC', '"_"US') END;
     v_moved BIGINT := 0;
+    v_move BOOLEAN;
 BEGIN
     IF p_lower IS NULL OR p_upper IS NULL OR p_lower >= p_upper THEN
         RAISE EXCEPTION 'invalid partition range [%, %)', p_lower, p_upper;
     END IF;
     BEGIN
-        IF EXISTS (SELECT 1 FROM kafka.messages_default
-                   WHERE created_at >= p_lower AND created_at < p_upper) THEN
+        v_move := EXISTS (SELECT 1 FROM kafka.messages_default
+                          WHERE created_at >= p_lower AND created_at < p_upper);
+        IF v_move THEN
             -- Moving rows (DELETE from the DEFAULT leaf + INSERT into the new leaf) must
             -- not overlap any worker transaction: an UPDATE of the worker (EndTxn's
             -- txn_state change, DeleteRecords) that met a moved row would skip it and
             -- never see its copy. Every worker transaction holds the pg_kafka schema
-            -- lock in SHARE mode; take it EXCLUSIVE (bounded by lock_timeout).
+            -- lock in SHARE mode; take it EXCLUSIVE (bounded by lock_timeout), before
+            -- the table locks, as worker transactions take it before theirs.
             PERFORM pg_advisory_xact_lock(8099547369649367906);
+        END IF;
+        -- CREATE ... PARTITION OF / ATTACH PARTITION lock kafka.messages and, to clone
+        -- the topic_id foreign key, kafka.topics: take both first, without ever
+        -- waiting long enough to deadlock with a worker transaction.
+        PERFORM kafka.lock_message_tables();
+        IF v_move THEN
             EXECUTE format('CREATE TABLE kafka.%I (LIKE kafka.messages INCLUDING DEFAULTS INCLUDING CONSTRAINTS)', v_name);
             EXECUTE format(
                 'WITH moved AS (DELETE FROM kafka.messages_default
@@ -324,15 +396,14 @@ BEGIN
     END IF;
     v_width_s := p_width_minutes::BIGINT * 60;
     v_width := make_interval(secs => v_width_s);
-    -- Serializes concurrent maintenance (worker and a manual call). Key: 'pg_kafka'.
-    -- Bounded: a session that ran maintenance and stayed open must not stall the next
-    -- pass (the worker's included) indefinitely; this pass is skipped instead.
-    BEGIN
-        PERFORM pg_advisory_xact_lock(8099547369649367905);
-    EXCEPTION WHEN lock_not_available THEN
+    -- Serializes concurrent maintenance (worker and manual calls, retention sweeps
+    -- included). Key: 'pg_kafka'. Bounded: a session that ran maintenance and stayed
+    -- open must not stall the next pass (the worker's included) indefinitely; this pass
+    -- is skipped instead.
+    IF NOT kafka.try_maintenance_lock() THEN
         RAISE WARNING 'pg_kafka: partition maintenance skipped: another session holds the maintenance lock; will retry';
         RETURN 0;
-    END;
+    END IF;
     FOR v_bucket IN
         SELECT DISTINCT b FROM (
             SELECT to_timestamp((floor(extract(epoch FROM now()) / v_width_s) + g) * v_width_s) AS b
@@ -398,6 +469,12 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_class WHERE oid = p_partition) THEN
         RETURN;
     END IF;
+    -- The maintenance lock first, before this call locks any table (the leaf check
+    -- below opens every leaf). A retention sweep already holds it.
+    IF NOT kafka.try_maintenance_lock() THEN
+        RAISE WARNING 'pg_kafka: could not drop time partition % (another session holds the maintenance lock); will retry', p_partition;
+        RETURN;
+    END IF;
     IF NOT EXISTS (SELECT 1 FROM kafka.message_partitions() p
                    WHERE p.partition_oid = p_partition AND NOT p.is_default) THEN
         -- message_partitions() opens each leaf, so this check can wait behind a
@@ -410,10 +487,10 @@ BEGIN
     BEGIN
         -- Every lock wait is inside this block, so a lock timeout skips this leaf
         -- (the next sweep retries) instead of failing the caller's whole sweep.
-        PERFORM pg_advisory_xact_lock(8099547369649367905);
-        -- DROP takes ACCESS EXCLUSIVE on the parent; take it first (parent, then leaf,
+        -- DROP takes ACCESS EXCLUSIVE on the parent and, to drop the leaf's foreign
+        -- key, SHARE ROW EXCLUSIVE on kafka.topics; take both first (parent, then leaf,
         -- the order inserts use) so the contents check below cannot race a writer.
-        LOCK TABLE kafka.messages IN ACCESS EXCLUSIVE MODE;
+        PERFORM kafka.lock_message_tables();
         -- Re-check under the locks: a concurrent drop of the same leaf may have
         -- committed while this call waited for them.
         IF NOT EXISTS (SELECT 1 FROM pg_inherits
@@ -451,6 +528,8 @@ $$;
 
 -- Functions are executable by PUBLIC by default: these are for the worker role only.
 REVOKE EXECUTE ON FUNCTION kafka.message_partition_contents(REGCLASS) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION kafka.try_maintenance_lock() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION kafka.lock_message_tables() FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION kafka.create_message_partition(TIMESTAMPTZ, TIMESTAMPTZ) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION kafka.ensure_message_partitions(INT, INT) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION kafka.drop_message_partition(REGCLASS, INT[]) FROM PUBLIC;
