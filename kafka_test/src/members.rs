@@ -17,10 +17,21 @@
 //! none waits on another member's queue, and fails the test when they have not closed by
 //! a deadline. A member dropped without being closed (a failed assertion, an early
 //! return) is closed off the test's thread.
+//!
+//! [`GroupMember`] is a member for tests that need a Stable member at a known point: a
+//! `BaseConsumer` the test drives itself, whose join waits until its assignment is
+//! applied and whose close is bounded, and whose failures report the consumer's
+//! group state.
 
-use crate::common::TestResult;
+use crate::common::{get_bootstrap_servers, DynResult, TestResult};
+use rdkafka::client::ClientContext;
+use rdkafka::config::ClientConfig;
+use rdkafka::consumer::{BaseConsumer, Consumer, ConsumerContext};
+use rdkafka::statistics::Statistics;
+use std::fmt::Write as _;
 use std::ops::Deref;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
 /// The bound on closing the members of a group. A close that waits on a JoinGroup held
@@ -104,5 +115,120 @@ pub async fn close_all(closing: Vec<Closing>, timeout: Duration) -> TestResult {
     } else {
         // The stalled closes finish (or not) on their own threads.
         Err(format!("consumers {open:?} of {total} did not close within {timeout:?}").into())
+    }
+}
+
+/// Keeps the consumer-group part of librdkafka's latest statistics (delivered on the
+/// consumer's queue, so updated whenever the member is polled): the local group and
+/// join states and the requests awaiting a response per broker connection. A stalled
+/// join or close reports it; nothing is printed otherwise.
+#[derive(Clone, Default)]
+pub struct GroupState {
+    latest: Arc<Mutex<Option<String>>>,
+}
+
+impl GroupState {
+    fn report(&self) -> String {
+        match self.latest.lock() {
+            Ok(latest) => latest
+                .clone()
+                .unwrap_or_else(|| "(no statistics delivered yet)".to_string()),
+            Err(_) => "(statistics unavailable)".to_string(),
+        }
+    }
+}
+
+impl ClientContext for GroupState {
+    fn stats(&self, statistics: Statistics) {
+        let mut line = match &statistics.cgrp {
+            Some(g) => format!(
+                "group state {} ({} ms), join state {}, {} rebalance(s), last: {:?}, \
+                 {} assigned partition(s)",
+                g.state,
+                g.stateage,
+                g.join_state,
+                g.rebalance_cnt,
+                g.rebalance_reason,
+                g.assignment_size
+            ),
+            None => "no consumer group state".to_string(),
+        };
+        let mut brokers: Vec<_> = statistics.brokers.values().collect();
+        brokers.sort_by(|a, b| a.name.cmp(&b.name));
+        for b in brokers {
+            let _ = write!(
+                line,
+                "; {} {}: {} awaiting a response, {} queued",
+                b.name, b.state, b.waitresp_cnt, b.outbuf_cnt
+            );
+        }
+        if let Ok(mut latest) = self.latest.lock() {
+            *latest = Some(line);
+        }
+    }
+}
+
+impl ConsumerContext for GroupState {}
+
+/// One member of a consumer group whose join and close are bounded.
+pub struct GroupMember {
+    consumer: Member<BaseConsumer<GroupState>>,
+    state: GroupState,
+}
+
+impl GroupMember {
+    /// Join `group_id` subscribed to `topic`: returns once the member's assignment is
+    /// applied (JoinGroup and SyncGroup answered, the rebalance event served), or fails
+    /// after `timeout`.
+    pub fn join(group_id: &str, topic: &str, timeout: Duration) -> DynResult<Self> {
+        let state = GroupState::default();
+        let consumer: BaseConsumer<GroupState> = ClientConfig::new()
+            .set("bootstrap.servers", get_bootstrap_servers())
+            .set("broker.address.family", "v4")
+            .set("group.id", group_id)
+            .set("session.timeout.ms", "10000")
+            .set("heartbeat.interval.ms", "1000")
+            .set("enable.auto.commit", "false")
+            .set("auto.offset.reset", "earliest")
+            .set("statistics.interval.ms", "500")
+            .create_with_context(state.clone())?;
+        // Dropped off this thread on a failure: the drop could wait on the very join
+        // that failed.
+        let consumer = Member::new(consumer);
+        consumer.subscribe(&[topic])?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            // Serves the rebalance callback that applies the assignment.
+            let _ = consumer.poll(Duration::from_millis(100));
+            if consumer.assignment().is_ok_and(|a| a.count() > 0) {
+                return Ok(GroupMember { consumer, state });
+            }
+            if Instant::now() > deadline {
+                return Err(format!(
+                    "no assignment in group {group_id} after {timeout:?}: {}",
+                    state.report()
+                )
+                .into());
+            }
+        }
+    }
+
+    /// Leave the group (LeaveGroup) and close the consumer, failing after `timeout`.
+    pub fn close(self, timeout: Duration) -> DynResult<()> {
+        let GroupMember { consumer, state } = self;
+        consumer.close_queue()?;
+        let deadline = Instant::now() + timeout;
+        while !consumer.closed() {
+            if Instant::now() > deadline {
+                // `consumer` is dropped off this thread, so the failure is reported now.
+                return Err(format!(
+                    "consumer close did not finish in {timeout:?}: {}",
+                    state.report()
+                )
+                .into());
+            }
+            let _ = consumer.poll(Duration::from_millis(100));
+        }
+        Ok(())
     }
 }
