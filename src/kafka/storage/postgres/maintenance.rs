@@ -4,9 +4,10 @@
 //! The sweep's decisions (which window applies, what to do with a leaf, when to stop)
 //! are pure functions in [`retention`]; this module runs the statements they call for.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use super::producers::{bump_producer_epoch, clear_producer_sequences};
 use super::{internal, PostgresStore};
 use crate::kafka::error::{KafkaError, Result};
 use crate::kafka::storage::retention::{
@@ -100,8 +101,40 @@ impl TopicWindows {
     }
 }
 
-/// `(topic_id, partition_id)` pairs whose log start a sweep must advance.
-type AffectedPartitions = HashSet<(i32, i32)>;
+/// The partitions a sweep removed rows from, each with the offset after the last one
+/// it removed: their log start must advance, and their offset counter must stay past
+/// the removed offsets (a partition written without a `kafka.partition_offsets` row
+/// would otherwise restart at 0 once retention empties it).
+#[derive(Debug, Default)]
+struct AffectedPartitions(HashMap<(i32, i32), i64>);
+
+impl AffectedPartitions {
+    /// Record that offsets before `next_offset` were removed from the partition.
+    fn removed(&mut self, topic_id: i32, partition_id: i32, next_offset: i64) {
+        let entry = self
+            .0
+            .entry((topic_id, partition_id))
+            .or_insert(next_offset);
+        *entry = (*entry).max(next_offset);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Parallel `(topic_ids, partition_ids, next_offsets)` columns for unnest().
+    fn into_columns(self) -> (Vec<i32>, Vec<i32>, Vec<i64>) {
+        let mut topic_ids = Vec::with_capacity(self.0.len());
+        let mut partition_ids = Vec::with_capacity(self.0.len());
+        let mut next_offsets = Vec::with_capacity(self.0.len());
+        for ((topic_id, partition_id), next_offset) in self.0 {
+            topic_ids.push(topic_id);
+            partition_ids.push(partition_id);
+            next_offsets.push(next_offset);
+        }
+        (topic_ids, partition_ids, next_offsets)
+    }
+}
 
 /// A whole number of seconds for SQL interval arithmetic.
 fn whole_seconds(d: Duration) -> i64 {
@@ -162,7 +195,7 @@ impl PostgresStore {
             let leaves = list_leaves(client, partitioned)?;
             let plan = plan_expiry(client, &leaves, &windows, now_ms, width_ms)?;
 
-            let mut affected = AffectedPartitions::new();
+            let mut affected = AffectedPartitions::default();
             stats.expired_messages =
                 delete_expired_rows(client, &plan.work, &leaves, partitioned, &mut affected)?;
             // Whole-leaf drops last, so the ACCESS EXCLUSIVE lock a drop takes on
@@ -238,30 +271,27 @@ impl PostgresStore {
                     &[txn_id.as_str().into()],
                 )?;
 
-                // Fence the timed-out producer, as Kafka does, by bumping its epoch:
-                // otherwise the stalled producer could resume with the same epoch
+                // Fence the timed-out producer, as Kafka does, by moving it to its next
+                // epoch: otherwise the stalled producer could resume with the same epoch
                 // (AddPartitionsToTxn accepts CompleteAbort -> Ongoing), add more
-                // partitions and commit only the part written after the abort. The
-                // guard leaves the epoch alone if it already moved or is exhausted
-                // (the next InitProducerId then allocates a fresh producer id).
-                let bumped = client.update(
-                    "UPDATE kafka.producer_ids SET epoch = epoch + 1
-                     WHERE producer_id = $1 AND epoch = $2 AND epoch < $3
-                     RETURNING epoch",
-                    None,
-                    &[producer_id.into(), producer_epoch.into(), i16::MAX.into()],
-                )?;
-                let new_epoch: i16 = if bumped.is_empty() {
-                    producer_epoch
-                } else {
-                    bumped.first().get_by_name("epoch")?.unwrap_or(producer_epoch)
-                };
-                // The new epoch restarts sequence numbers.
-                client.update(
-                    "DELETE FROM kafka.producer_sequences WHERE producer_id = $1",
-                    None,
+                // partitions and commit only the part written after the abort. An
+                // exhausted epoch gets a fresh producer id instead (bump_producer_epoch,
+                // as for InitProducerId); the transaction row follows it through its ON
+                // UPDATE CASCADE foreign key. An epoch that already moved is left alone.
+                let current = client.select(
+                    "SELECT epoch FROM kafka.producer_ids WHERE producer_id = $1",
+                    Some(1),
                     &[producer_id.into()],
                 )?;
+                let still_current = !current.is_empty()
+                    && current.first().get_by_name::<i16, _>("epoch")? == Some(producer_epoch);
+                let new_epoch = if still_current {
+                    bump_producer_epoch(client, producer_id, producer_epoch)?.1
+                } else {
+                    producer_epoch
+                };
+                // The new epoch (or id) restarts sequence numbers.
+                clear_producer_sequences(client, producer_id)?;
                 client.update(
                     "UPDATE kafka.transactions
                      SET state = 'CompleteAbort', producer_epoch = $2, last_updated_at = NOW()
@@ -537,7 +567,7 @@ fn delete_expired_batch(
                    AND (d.txn_state IS NULL OR d.txn_state <> 'pending')
                  LIMIT $3
              )
-             RETURNING topic_id, partition_id",
+             RETURNING topic_id, partition_id, partition_offset",
             None,
             &[
                 item.topic_id.into(),
@@ -554,7 +584,7 @@ fn delete_expired_batch(
                    AND (d.txn_state IS NULL OR d.txn_state <> 'pending')
                  LIMIT $3
              )
-             RETURNING topic_id, partition_id",
+             RETURNING topic_id, partition_id, partition_offset",
             None,
             &[
                 item.topic_id.into(),
@@ -579,7 +609,7 @@ fn delete_expired_batch(
                          AND m.created_at < NOW() - $2::bigint * INTERVAL '1 millisecond'
                          AND (m.txn_state IS NULL OR m.txn_state <> 'pending')
                        LIMIT $3))
-                 RETURNING topic_id, partition_id",
+                 RETURNING topic_id, partition_id, partition_offset",
                 None,
                 &[
                     item.topic_id.into(),
@@ -597,7 +627,8 @@ fn delete_expired_batch(
         deleted += 1;
         let topic_id: i32 = row.get_by_name("topic_id")?.unwrap_or(0);
         let partition_id: i32 = row.get_by_name("partition_id")?.unwrap_or(0);
-        affected.insert((topic_id, partition_id));
+        let offset: i64 = row.get_by_name("partition_offset")?.unwrap_or(-1);
+        affected.removed(topic_id, partition_id, offset.saturating_add(1));
     }
     Ok(deleted)
 }
@@ -613,7 +644,7 @@ fn drop_leaves(
     let mut dropped = 0;
     for (leaf_oid, expired_topics) in drops {
         let row = client.update(
-            "SELECT dropped, topic_ids, partition_ids
+            "SELECT dropped, topic_ids, partition_ids, next_offsets
              FROM kafka.drop_message_partition($1::bigint::oid::regclass, $2::int4[])",
             None,
             &[i64::from(leaf_oid).into(), expired_topics.into()],
@@ -624,12 +655,13 @@ fn drop_leaves(
             let topic_ids: Vec<Option<i32>> = row.get_by_name("topic_ids")?.unwrap_or_default();
             let partition_ids: Vec<Option<i32>> =
                 row.get_by_name("partition_ids")?.unwrap_or_default();
-            affected.extend(topic_ids.into_iter().zip(partition_ids).filter_map(
-                |pair| match pair {
-                    (Some(t), Some(p)) => Some((t, p)),
-                    _ => None,
-                },
-            ));
+            let next_offsets: Vec<Option<i64>> =
+                row.get_by_name("next_offsets")?.unwrap_or_default();
+            for ((t, p), next) in topic_ids.into_iter().zip(partition_ids).zip(next_offsets) {
+                if let (Some(t), Some(p), Some(next)) = (t, p, next) {
+                    affected.removed(t, p, next);
+                }
+            }
         }
     }
     Ok(dropped)
@@ -645,7 +677,23 @@ fn advance_log_start(client: &mut SpiClient<'_>, affected: AffectedPartitions) -
     if affected.is_empty() {
         return Ok(());
     }
-    let (topic_ids, partition_ids): (Vec<i32>, Vec<i32>) = affected.into_iter().unzip();
+    let (topic_ids, partition_ids, next_offsets) = affected.into_columns();
+    // A partition written without a counter row (direct SQL, rows older than the
+    // counter) gets one now: once its rows are gone nothing else remembers its log end.
+    client.update(
+        "INSERT INTO kafka.partition_offsets (topic_id, partition_id, next_offset)
+         SELECT a.topic_id, a.partition_id, a.next_offset
+         FROM unnest($1::int4[], $2::int4[], $3::int8[]) AS a(topic_id, partition_id, next_offset)
+         ON CONFLICT (topic_id, partition_id) DO UPDATE
+             SET next_offset = GREATEST(kafka.partition_offsets.next_offset,
+                                        EXCLUDED.next_offset)",
+        None,
+        &[
+            topic_ids.clone().into(),
+            partition_ids.clone().into(),
+            next_offsets.into(),
+        ],
+    )?;
     client.update(
         "UPDATE kafka.partition_offsets po
          SET log_start_offset = GREATEST(
@@ -724,4 +772,28 @@ fn delete_delivered_shadow_rows(client: &mut SpiClient<'_>) -> Result<u64> {
         &[whole_seconds(SHADOW_DELIVERED_RETENTION).into()],
     )?;
     Ok(row_count(table.len()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AffectedPartitions;
+
+    #[test]
+    fn affected_partitions_keep_the_highest_removed_offset() {
+        let mut affected = AffectedPartitions::default();
+        assert!(affected.is_empty());
+        affected.removed(1, 0, 5);
+        affected.removed(1, 0, 3);
+        affected.removed(1, 0, 9);
+        affected.removed(2, 1, 1);
+        let (topics, partitions, next) = affected.into_columns();
+        let mut rows: Vec<(i32, i32, i64)> = topics
+            .into_iter()
+            .zip(partitions)
+            .zip(next)
+            .map(|((t, p), n)| (t, p, n))
+            .collect();
+        rows.sort_unstable();
+        assert_eq!(rows, vec![(1, 0, 9), (2, 1, 1)]);
+    }
 }

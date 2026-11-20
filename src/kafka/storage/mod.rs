@@ -29,8 +29,8 @@ pub(crate) use delegate::{
 pub use headers::{decode_headers_json, encode_headers_json};
 pub use sequence::{
     batch_last_sequence, next_sequence, stored_last_sequence, transactional_epoch_is_stale,
-    validate_sequence, CachedBatch, ProducerBatch, SequenceCheck, SequenceValidation,
-    PRODUCER_BATCH_CACHE,
+    validate_sequence, validate_unknown_producer, CachedBatch, ProducerBatch, SequenceCheck,
+    SequenceValidation, PRODUCER_BATCH_CACHE,
 };
 
 /// Metadata about a topic (storage layer representation)
@@ -71,6 +71,21 @@ pub struct FetchedMessage {
     pub producer_id: Option<i64>,
     /// Producer epoch stamped with `producer_id`.
     pub producer_epoch: Option<i16>,
+}
+
+/// The producer that owns a transactional id, as InitProducerId judges a presented
+/// producer id and epoch against it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransactionalProducer {
+    /// Current producer id.
+    pub producer_id: i64,
+    /// Current epoch.
+    pub epoch: i16,
+    /// The epoch before the last bump the current producer asked for itself (an
+    /// InitProducerId presenting its id and epoch); a retry of that request presents it.
+    /// None after any other change of epoch (a new producer fencing the old, a timeout
+    /// abort), as Kafka's lastProducerEpoch.
+    pub previous_epoch: Option<i16>,
 }
 
 /// Committed offset information (internal representation)
@@ -649,6 +664,16 @@ pub trait ProducerStore {
         partition_id: i32,
         last_sequence: i32,
     ) -> Result<()>;
+
+    /// The producer that owns `transactional_id`, if it has one.
+    fn transactional_producer(
+        &self,
+        transactional_id: &str,
+    ) -> Result<Option<TransactionalProducer>>;
+
+    /// Record `previous_epoch` as the epoch before the producer's current one, after a
+    /// bump the producer asked for (see [`TransactionalProducer::previous_epoch`]).
+    fn remember_previous_epoch(&self, producer_id: i64, previous_epoch: i16) -> Result<()>;
 }
 
 /// Transactions: transactional producers, state, transactional writes and offsets, commit/abort.

@@ -23,8 +23,9 @@ use crate::kafka::handlers;
 use crate::kafka::messages::TxnOffsetCommitTopics;
 use crate::kafka::notifications::InternalNotification;
 
-/// InitProducerId: allocate a producer id and epoch (an idempotent producer always gets a
-/// new id; the producer id and epoch the request presents are not read).
+/// InitProducerId: allocate a producer id and epoch. An idempotent producer always gets
+/// a new id; for a transactional id the producer id and epoch the request presents
+/// (v3+) decide between a bump, a retry's answer and PRODUCER_FENCED.
 pub struct InitProducerIdApi;
 
 /// InitProducerId request.
@@ -34,6 +35,8 @@ pub struct InitProducerIdRequestData {
     pub transactional_id: Option<String>,
     /// Transaction timeout (milliseconds).
     pub transaction_timeout_ms: i32,
+    /// The producer id and epoch the request presents (None for -1/-1, and before v3).
+    pub presented: Option<(i64, i16)>,
 }
 
 impl ApiSchema for InitProducerIdApi {
@@ -63,9 +66,22 @@ impl KafkaApi for InitProducerIdApi {
         wire: InitProducerIdRequest,
         _header: &RequestHeader,
     ) -> Result<Self::Request, Rejection<()>> {
+        // Kafka: both -1 is a new producer, an id without an epoch (or the reverse)
+        // is INVALID_REQUEST.
+        let presented = match (wire.producer_id.0, wire.producer_epoch) {
+            (-1, -1) => None,
+            (-1, _) | (_, -1) => {
+                return Err(Rejection::Reply {
+                    error_code: ERROR_INVALID_REQUEST,
+                    echo: None,
+                })
+            }
+            (producer_id, epoch) => Some((producer_id, epoch)),
+        };
         Ok(InitProducerIdRequestData {
             transactional_id: wire.transactional_id.map(|s| s.to_string()),
             transaction_timeout_ms: wire.transaction_timeout_ms,
+            presented,
         })
     }
 
@@ -77,6 +93,7 @@ impl KafkaApi for InitProducerIdApi {
                 &env.ctx,
                 r.transactional_id.as_deref(),
                 r.transaction_timeout_ms,
+                r.presented,
                 header.client_id.as_deref(),
             )
         })
@@ -469,5 +486,37 @@ impl KafkaApi for TxnOffsetCommitApi {
                 r.topics,
             )
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn decode_presented(producer_id: i64, epoch: i16) -> Result<Option<(i64, i16)>, i16> {
+        let mut wire = InitProducerIdRequest::default();
+        wire.transaction_timeout_ms = 60_000;
+        wire.producer_id = kafka_protocol::messages::ProducerId(producer_id);
+        wire.producer_epoch = epoch;
+        let header = RequestHeader {
+            api_key: 22,
+            api_version: 4,
+            correlation_id: 1,
+            client_id: None,
+        };
+        match InitProducerIdApi::decode(wire, &header) {
+            Ok(r) => Ok(r.presented),
+            Err(Rejection::Reply { error_code, .. }) => Err(error_code),
+            Err(_) => Err(i16::MIN),
+        }
+    }
+
+    #[test]
+    fn init_producer_id_presented_id_and_epoch() {
+        assert_eq!(decode_presented(-1, -1), Ok(None));
+        assert_eq!(decode_presented(5, 2), Ok(Some((5, 2))));
+        assert_eq!(decode_presented(0, 0), Ok(Some((0, 0))));
+        assert_eq!(decode_presented(-1, 3), Err(ERROR_INVALID_REQUEST));
+        assert_eq!(decode_presented(5, -1), Err(ERROR_INVALID_REQUEST));
     }
 }
