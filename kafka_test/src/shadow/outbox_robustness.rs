@@ -1,6 +1,8 @@
 //! Shadow tests of the outbox under stress and failure:
 //! - `pg_kafka.shadow_max_retries` refuses 0 (every record gets an attempt);
-//! - one topic's backlog does not starve another topic's records.
+//! - one topic's backlog does not starve another topic's records;
+//! - a full librdkafka queue holds back only the records behind it, not the
+//!   sync-mode response timeouts.
 
 use crate::common::{create_db_client, create_producer, TestResult};
 use crate::setup::TestContext;
@@ -9,7 +11,7 @@ use rdkafka::producer::{FutureProducer, FutureRecord};
 use std::time::{Duration, Instant};
 use tokio_postgres::Client;
 
-use super::external_client::verify_external_kafka_ready;
+use super::external_client::{get_internal_bootstrap_servers, verify_external_kafka_ready};
 use super::helpers::{enable_shadow_mode, ShadowMode, ShadowTopicConfig, SyncMode, WriteMode};
 
 fn config(mode: ShadowMode, sync_mode: SyncMode) -> ShadowTopicConfig {
@@ -20,6 +22,26 @@ fn config(mode: ShadowMode, sync_mode: SyncMode) -> ShadowTopicConfig {
         sync_mode,
         write_mode: WriteMode::DualWrite,
     }
+}
+
+async fn alter_system(db: &Client, sql: &str) -> TestResult {
+    db.execute(sql, &[]).await?;
+    db.execute("SELECT pg_reload_conf()", &[]).await?;
+    // The worker reloads on SIGHUP within ~100 ms; the forwarder reads the
+    // reloaded config on its next record or settings check (~0.5 s).
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    Ok(())
+}
+
+async fn restore_bootstrap_servers(db: &Client) -> TestResult {
+    alter_system(
+        db,
+        &format!(
+            "ALTER SYSTEM SET pg_kafka.shadow_bootstrap_servers = '{}'",
+            get_internal_bootstrap_servers()
+        ),
+    )
+    .await
 }
 
 /// A pg_kafka producer for large or many records.
@@ -179,6 +201,95 @@ pub async fn test_shadow_backlog_does_not_starve_other_topics() -> TestResult {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// With the external cluster unreachable, librdkafka's local queue
+/// (`queue.buffering.max.kbytes`, 64 MiB) fills up. The records behind it wait
+/// in the forwarder's backlog while the forwarder keeps releasing held
+/// sync-mode responses at their timeout.
+pub async fn test_shadow_full_producer_queue_does_not_block_sync_timeouts() -> TestResult {
+    const BIG: usize = 80;
+    const RECORD_BYTES: usize = 900_000;
+    println!("=== Test: a full producer queue does not block sync timeouts ===\n");
+    let ctx = TestContext::new().await?;
+    let big_topic = ctx.unique_topic("shadow-queue-full").await;
+    let sync_topic = ctx.unique_topic("shadow-sync-behind").await;
+    verify_external_kafka_ready().await?;
+    enable_shadow_mode(
+        ctx.db(),
+        &big_topic,
+        &config(ShadowMode::Shadow, SyncMode::Async),
+    )
+    .await?;
+    enable_shadow_mode(
+        ctx.db(),
+        &sync_topic,
+        &config(ShadowMode::Shadow, SyncMode::Sync),
+    )
+    .await?;
+    let db = create_db_client().await?;
+    alter_system(
+        &db,
+        "ALTER SYSTEM SET pg_kafka.shadow_bootstrap_servers = '127.0.0.1:1'",
+    )
+    .await?;
+    alter_system(
+        &db,
+        "ALTER SYSTEM SET pg_kafka.shadow_sync_timeout_ms = 3000",
+    )
+    .await?;
+
+    let result = async {
+        println!("Step 1: {BIG} records of {RECORD_BYTES} bytes (more than the queue holds)...");
+        let producer = bulk_producer()?;
+        let payload = vec![b'q'; RECORD_BYTES];
+        for i in 0..BIG {
+            producer
+                .send(
+                    FutureRecord::<(), _>::to(&big_topic)
+                        .payload(&payload[..])
+                        .partition(0),
+                    Duration::from_secs(30),
+                )
+                .await
+                .map_err(|(e, _)| format!("big record {i}: {e}"))?;
+        }
+        // Let the outbox dispatch them all to the forwarder.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        println!("Step 2: a sync-mode produce behind them...");
+        let sync_producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", crate::common::get_bootstrap_servers())
+            .set("broker.address.family", "v4")
+            .set("message.timeout.ms", "30000")
+            .create()?;
+        let start = Instant::now();
+        let sent = sync_producer
+            .send(
+                FutureRecord::to(&sync_topic).key("k").payload("held"),
+                Duration::from_secs(30),
+            )
+            .await;
+        let held_for = start.elapsed();
+        println!("  sync produce answered after {held_for:?}");
+        sent.map_err(|(e, _)| format!("sync produce failed after {held_for:?}: {e}"))?;
+        assert!(
+            held_for < Duration::from_secs(8),
+            "the sync response must be released at shadow_sync_timeout_ms (3 s), \
+             was held {held_for:?}"
+        );
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await
+    .map_err(|e| e.to_string());
+
+    // Delete the topics (and their outbox rows) before the real cluster is back.
+    ctx.cleanup().await?;
+    alter_system(&db, "ALTER SYSTEM RESET pg_kafka.shadow_sync_timeout_ms").await?;
+    restore_bootstrap_servers(&db).await?;
+    result?;
     println!("✅ Test PASSED\n");
     Ok(())
 }

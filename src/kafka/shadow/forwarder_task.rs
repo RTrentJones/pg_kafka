@@ -38,6 +38,14 @@
 //! `NotAttempted`, so it does not consume the record's retry budget
 //! (`pg_kafka.shadow_max_retries`).
 //!
+//! ## Backpressure
+//!
+//! When librdkafka's local queue is full, the record and every later one wait,
+//! in order, in the forwarder's backlog, retried on a timer of their own. The
+//! loop keeps serving delivery reports, held-response timeouts, the ack flush
+//! and the settings check meanwhile, so a full queue delays only the records
+//! behind it.
+//!
 //! ## Held sync-mode responses
 //!
 //! A [`SyncHold`] carries the buffered response of a committed sync-mode
@@ -65,6 +73,9 @@ const BRIDGE_BATCH: usize = 2048;
 const HOLD_TICK: Duration = Duration::from_millis(20);
 /// Wait between attempts to enqueue into a full librdkafka queue.
 const QUEUE_FULL_BACKOFF: Duration = Duration::from_millis(5);
+/// Records waiting for room in librdkafka's queue at which the forwarder stops
+/// taking new requests from the DB thread (the in-flight cap bounds them anyway).
+const MAX_BACKLOG: usize = 16_384;
 /// How long the bridge thread waits for a request before checking whether
 /// the task is gone.
 const BRIDGE_POLL: Duration = Duration::from_millis(100);
@@ -408,13 +419,14 @@ pub(crate) async fn run_shadow_forwarder(
     let mut tick = tokio::time::interval(HOLD_TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    let mut backlog: VecDeque<ForwardRecord> = VecDeque::new();
     loop {
         if !core.flush_acks(&ack_tx) {
             info!("Forward ack channel closed, stopping shadow forwarder");
             break;
         }
         tokio::select! {
-            batch = batch_rx.recv() => {
+            batch = batch_rx.recv(), if backlog.len() < MAX_BACKLOG => {
                 let Some(batch) = batch else {
                     info!("Forward channel disconnected, stopping shadow forwarder");
                     break;
@@ -422,12 +434,10 @@ pub(crate) async fn run_shadow_forwarder(
                 for message in batch {
                     match message {
                         ForwardRequest::Hold(hold) => core.add_hold(hold, Instant::now()),
-                        ForwardRequest::Record(record) => {
-                            forward_one(record, &runtime_context, &mut core, &mut slot, &mut deliveries)
-                                .await;
-                        }
+                        ForwardRequest::Record(record) => backlog.push_back(record),
                     }
                 }
+                pump(&mut backlog, &runtime_context, &mut core, &mut slot, &mut deliveries);
             }
             Some(delivery) = deliveries.next(), if !deliveries.is_empty() => {
                 if let Err(e) = &delivery.result {
@@ -435,9 +445,15 @@ pub(crate) async fn run_shadow_forwarder(
                 }
                 let fatal = delivery.result.is_err() && delivery.producer.fatal_error().is_some();
                 core.on_result(delivery.key, delivery.generation, delivery.result, fatal);
+                // A delivery frees room in librdkafka's queue.
+                pump(&mut backlog, &runtime_context, &mut core, &mut slot, &mut deliveries);
+            }
+            () = tokio::time::sleep(QUEUE_FULL_BACKOFF), if !backlog.is_empty() => {
+                pump(&mut backlog, &runtime_context, &mut core, &mut slot, &mut deliveries);
             }
             _ = tick.tick() => {
                 core.expire_holds(Instant::now());
+                pump(&mut backlog, &runtime_context, &mut core, &mut slot, &mut deliveries);
                 // A settings change rebuilds the producer (and purges its
                 // outstanding records) even when no new record arrives to
                 // notice it.
@@ -487,19 +503,37 @@ fn bridge_requests(
     }
 }
 
-/// Send one record (or answer it without sending).
-async fn forward_one(
-    record: ForwardRecord,
+/// Hand the backlog to the producer, in order, until it is empty or
+/// librdkafka's queue is full (the rest then waits for the next attempt).
+fn pump(
+    backlog: &mut VecDeque<ForwardRecord>,
     runtime_context: &crate::kafka::RuntimeContext,
     core: &mut ForwarderCore,
     slot: &mut ProducerSlot,
     deliveries: &mut Deliveries,
 ) {
+    while let Some(record) = backlog.pop_front() {
+        if let Some(record) = forward_one(record, runtime_context, core, slot, deliveries) {
+            backlog.push_front(record);
+            return;
+        }
+    }
+}
+
+/// Send one record (or answer it without sending). Returns the record when
+/// librdkafka's queue is full, so it is retried before any later record.
+fn forward_one(
+    record: ForwardRecord,
+    runtime_context: &crate::kafka::RuntimeContext,
+    core: &mut ForwarderCore,
+    slot: &mut ProducerSlot,
+    deliveries: &mut Deliveries,
+) -> Option<ForwardRecord> {
     let key = record.row;
     let config = runtime_context.config();
     if !config.shadow_mode_enabled || config.shadow_bootstrap_servers.is_empty() {
         core.not_attempted(key, "shadow mode is not enabled or not configured");
-        return;
+        return None;
     }
     let (producer, generation) = match slot.current(core, &config) {
         Ok(p) => p,
@@ -507,50 +541,49 @@ async fn forward_one(
             // No producer can be built: a real delivery failure (it is retried
             // and eventually dead-lettered, like any other).
             core.on_result(key, slot.generation, Err(e), false);
-            return;
+            return None;
         }
     };
+    // Checked on every attempt: a record that waited for queue room is fenced
+    // if an earlier record of its partition failed meanwhile.
     if core.admit(&record) == Admit::Fenced {
         core.not_attempted(key, "an earlier record of the partition failed");
-        return;
+        return None;
     }
-    loop {
-        match producer.enqueue(&record) {
-            Ok(future) => {
-                // Test hook (pg_kafka.test_forward_ack_delay_ms, 0 in
-                // production): delay the ack past the outbox retry lease. Only
-                // this delivery's own future waits; the pipeline keeps going.
-                let ack_delay = Duration::from_millis(
-                    u64::try_from(config.test_forward_ack_delay_ms).unwrap_or(0),
-                );
-                deliveries.push(Box::pin(async move {
-                    let result = match future.await {
-                        Ok(Ok((_partition, offset))) => Ok(offset),
-                        Ok(Err((e, _message))) => Err(e.to_string()),
-                        Err(_canceled) => Err("delivery canceled".to_string()),
-                    };
-                    if !ack_delay.is_zero() {
-                        tokio::time::sleep(ack_delay).await;
-                    }
-                    Delivery {
-                        key,
-                        generation,
-                        result,
-                        producer,
-                    }
-                }));
-                return;
-            }
-            Err(EnqueueError::QueueFull) => {
-                // Backpressure: wait for librdkafka to drain, keeping order.
-                producer.poll(Duration::ZERO);
-                tokio::time::sleep(QUEUE_FULL_BACKOFF).await;
-            }
-            Err(EnqueueError::Refused(e)) => {
-                let fatal = producer.fatal_error().is_some();
-                core.on_result(key, generation, Err(e), fatal);
-                return;
-            }
+    match producer.enqueue(&record) {
+        Ok(future) => {
+            // Test hook (pg_kafka.test_forward_ack_delay_ms, 0 in
+            // production): delay the ack past the outbox retry lease. Only
+            // this delivery's own future waits; the pipeline keeps going.
+            let ack_delay =
+                Duration::from_millis(u64::try_from(config.test_forward_ack_delay_ms).unwrap_or(0));
+            deliveries.push(Box::pin(async move {
+                let result = match future.await {
+                    Ok(Ok((_partition, offset))) => Ok(offset),
+                    Ok(Err((e, _message))) => Err(e.to_string()),
+                    Err(_canceled) => Err("delivery canceled".to_string()),
+                };
+                if !ack_delay.is_zero() {
+                    tokio::time::sleep(ack_delay).await;
+                }
+                Delivery {
+                    key,
+                    generation,
+                    result,
+                    producer,
+                }
+            }));
+            None
+        }
+        Err(EnqueueError::QueueFull) => {
+            // Backpressure: serve librdkafka's callbacks so its queue drains.
+            producer.poll(Duration::ZERO);
+            Some(record)
+        }
+        Err(EnqueueError::Refused(e)) => {
+            let fatal = producer.fatal_error().is_some();
+            core.on_result(key, generation, Err(e), fatal);
+            None
         }
     }
 }

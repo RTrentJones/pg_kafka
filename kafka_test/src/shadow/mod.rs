@@ -82,5 +82,6 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         // Outbox under stress and failure
         outbox_robustness::test_shadow_max_retries_refuses_zero: sequential,
         outbox_robustness::test_shadow_backlog_does_not_starve_other_topics: sequential,
+        outbox_robustness::test_shadow_full_producer_queue_does_not_block_sync_timeouts: sequential,
     ]
 }
