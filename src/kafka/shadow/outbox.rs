@@ -86,6 +86,60 @@ pub struct OutboxClaim {
     pub inflight: KeyColumns,
 }
 
+/// How many due rows of one partition a claim of `batch_limit` rows takes
+/// when `partitions` partitions have pending rows: an equal share, at least 1.
+/// A partition with a backlog then cannot fill every claim while the others
+/// (another topic's live traffic, a sync-mode produce waiting for its ack)
+/// wait behind it, and each partition still gets a contiguous run of its
+/// lowest due offsets, so its order holds.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the claim SQL computes the same share (its `share` CTE); the fake ShadowDb calls this"
+    )
+)]
+pub fn per_partition_claim_cap(batch_limit: i64, partitions: usize) -> i64 {
+    let partitions = i64::try_from(partitions.max(1)).unwrap_or(i64::MAX);
+    let limit = batch_limit.max(0);
+    (limit / partitions + i64::from(limit % partitions != 0)).max(1)
+}
+
+/// The result of one outbox claim.
+#[derive(Clone, Debug, Default)]
+pub struct ClaimedRows {
+    /// The claimed records, in row-key order.
+    pub records: Vec<ForwardRecord>,
+    /// The claim's [`per_partition_claim_cap`] (0 when nothing was claimed): a
+    /// partition that got this many rows may have more due.
+    pub partition_share: i64,
+}
+
+impl ClaimedRows {
+    /// Whether more rows are probably due right away: the claim was full, or a
+    /// partition used its whole share.
+    pub fn more_due(&self, batch_limit: usize) -> bool {
+        if self.records.is_empty() {
+            return false;
+        }
+        if self.records.len() >= batch_limit {
+            return true;
+        }
+        let share = usize::try_from(self.partition_share).unwrap_or(usize::MAX);
+        let mut run = 0usize;
+        let mut last = None;
+        for record in &self.records {
+            let part = record.row.partition();
+            run = if last == Some(part) { run + 1 } else { 1 };
+            last = Some(part);
+            if run >= share {
+                return true;
+            }
+        }
+        false
+    }
+}
+
 /// What one batch of failure acks did.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct FailedApplied {
@@ -126,6 +180,10 @@ pub trait ShadowDb {
         producer_epoch: i16,
     ) -> Option<Vec<PendingForwardRecord>>;
 
+    /// Which of these `(producer_id, producer_epoch)` pairs have a transaction
+    /// still Ongoing in `kafka.transactions`. `None` if the lookup failed.
+    fn ongoing_transactions(&self, keys: &[(i64, i16)]) -> Option<Vec<(i64, i16)>>;
+
     /// Claim due outbox rows and return a forward record (payload, headers,
     /// timestamp, external topic name) for each, ordered by row key.
     ///
@@ -139,7 +197,11 @@ pub trait ShadowDb {
     /// lost its ack (worker restart, eviction): it is claimed and that lost
     /// attempt counts as one failure. Claiming opens an attempt and stamps
     /// `forwarded_at`. `restart` is set on the lowest candidate of each partition.
-    fn claim_due_outbox_rows(&self, claim: &OutboxClaim) -> Result<Vec<ForwardRecord>>;
+    ///
+    /// The batch is shared between partitions: at most
+    /// [`per_partition_claim_cap`] due rows of each partition (its lowest ones),
+    /// taken round-robin across partitions up to `batch_limit`.
+    fn claim_due_outbox_rows(&self, claim: &OutboxClaim) -> Result<ClaimedRows>;
 
     /// Mark pending rows delivered at their external offsets (and count them in
     /// `kafka.shadow_metrics` when `metrics`). Returns how many transitioned (a
@@ -344,7 +406,42 @@ impl ShadowDb for SpiShadowDb {
         }
     }
 
-    fn claim_due_outbox_rows(&self, claim: &OutboxClaim) -> Result<Vec<ForwardRecord>> {
+    fn ongoing_transactions(&self, keys: &[(i64, i16)]) -> Option<Vec<(i64, i16)>> {
+        use pgrx::prelude::*;
+        if keys.is_empty() {
+            return Some(Vec::new());
+        }
+        let producer_ids: Vec<i64> = keys.iter().map(|&(id, _)| id).collect();
+        let epochs: Vec<i16> = keys.iter().map(|&(_, epoch)| epoch).collect();
+        let result: std::result::Result<Vec<(i64, i16)>, spi::SpiError> = Spi::connect(|client| {
+            let table = client.select(
+                "SELECT t.producer_id, t.producer_epoch \
+                 FROM kafka.transactions t \
+                 JOIN unnest($1::int8[], $2::int2[]) AS k(id, epoch) \
+                   ON t.producer_id = k.id AND t.producer_epoch = k.epoch \
+                 WHERE t.state = 'Ongoing'",
+                None,
+                &[producer_ids.into(), epochs.into()],
+            )?;
+            let mut ongoing = Vec::new();
+            for row in table {
+                ongoing.push((
+                    row.get_by_name("producer_id")?.unwrap_or(0),
+                    row.get_by_name("producer_epoch")?.unwrap_or(0),
+                ));
+            }
+            Ok(ongoing)
+        });
+        match result {
+            Ok(ongoing) => Some(ongoing),
+            Err(e) => {
+                tracing::warn!("Shadow: failed to read the open transactions: {e:?}");
+                None
+            }
+        }
+    }
+
+    fn claim_due_outbox_rows(&self, claim: &OutboxClaim) -> Result<ClaimedRows> {
         use pgrx::prelude::*;
         #[expect(
             clippy::cast_precision_loss,
@@ -355,8 +452,33 @@ impl ShadowDb for SpiShadowDb {
         Spi::connect_mut(|client| {
             let table = client.update(
                 r"
-                WITH inf AS (
+                WITH RECURSIVE inf AS (
                     SELECT * FROM unnest($3::int4[], $4::int4[], $5::int8[]) AS i(t, p, o)
+                ),
+                -- The partitions with pending rows, found by a skip scan of the
+                -- pending index: one probe per partition, not one per row.
+                parts AS (
+                    (SELECT st.topic_id, st.partition_id
+                     FROM kafka.shadow_tracking st
+                     WHERE st.external_offset IS NULL
+                     ORDER BY st.topic_id, st.partition_id
+                     LIMIT 1)
+                    UNION ALL
+                    SELECT nxt.topic_id, nxt.partition_id
+                    FROM parts
+                    CROSS JOIN LATERAL (
+                        SELECT st.topic_id, st.partition_id
+                        FROM kafka.shadow_tracking st
+                        WHERE st.external_offset IS NULL
+                          AND (st.topic_id, st.partition_id) > (parts.topic_id, parts.partition_id)
+                        ORDER BY st.topic_id, st.partition_id
+                        LIMIT 1
+                    ) nxt
+                ),
+                -- Each partition's share of the batch (see per_partition_claim_cap).
+                share AS (
+                    SELECT GREATEST(1, CEIL($1::numeric / GREATEST(COUNT(*), 1)))::int8 AS k
+                    FROM parts
                 ),
                 -- The first backing-off row of each partition: it failed, its
                 -- attempt is closed and its backoff has not passed. Only failed
@@ -378,32 +500,45 @@ impl ShadowDb for SpiShadowDb {
                             AND inf.o = st.local_offset)
                     GROUP BY st.topic_id, st.partition_id
                 ),
-                -- Due rows in row-key order, read from the pending index and cut
-                -- at the limit: the cost is O(limit), not O(backlog).
+                -- Due rows: the first k of each partition in offset order (read
+                -- from the pending index and cut at k, so the cost is
+                -- O(partitions + limit), not O(backlog)), then taken round-robin
+                -- across partitions up to the limit, so one partition's backlog
+                -- cannot fill every claim while the others wait.
                 due AS (
-                    SELECT st.topic_id, st.partition_id, st.local_offset
-                    FROM kafka.shadow_tracking st
+                    SELECT d.topic_id, d.partition_id, d.local_offset
+                    FROM parts p
+                    CROSS JOIN share
                     LEFT JOIN blocked b
-                      ON b.topic_id = st.topic_id AND b.partition_id = st.partition_id
+                      ON b.topic_id = p.topic_id AND b.partition_id = p.partition_id
                     CROSS JOIN LATERAL (
-                        SELECT 1 FROM kafka.messages m
-                        WHERE m.topic_id = st.topic_id
-                          AND m.partition_id = st.partition_id
-                          AND m.partition_offset = st.local_offset
-                        LIMIT 1
-                    ) has_message
-                    WHERE st.external_offset IS NULL
-                      AND st.retry_count < $2
-                      AND (b.first_blocked IS NULL OR st.local_offset < b.first_blocked)
-                      AND NOT (st.retry_count > 0 AND NOT st.attempt_open
-                               AND st.forwarded_at > NOW() - make_interval(secs =>
-                                   LEAST($6::float8 * power(2::float8, LEAST(st.retry_count - 1, 30)),
-                                         $7::float8) / 1000.0))
-                      AND NOT EXISTS (
-                          SELECT 1 FROM inf
-                          WHERE inf.t = st.topic_id AND inf.p = st.partition_id
-                            AND inf.o = st.local_offset)
-                    ORDER BY st.topic_id, st.partition_id, st.local_offset
+                        SELECT st.topic_id, st.partition_id, st.local_offset,
+                               row_number() OVER (ORDER BY st.local_offset) AS rn
+                        FROM kafka.shadow_tracking st
+                        CROSS JOIN LATERAL (
+                            SELECT 1 FROM kafka.messages m
+                            WHERE m.topic_id = st.topic_id
+                              AND m.partition_id = st.partition_id
+                              AND m.partition_offset = st.local_offset
+                            LIMIT 1
+                        ) has_message
+                        WHERE st.topic_id = p.topic_id
+                          AND st.partition_id = p.partition_id
+                          AND st.external_offset IS NULL
+                          AND st.retry_count < $2
+                          AND (b.first_blocked IS NULL OR st.local_offset < b.first_blocked)
+                          AND NOT (st.retry_count > 0 AND NOT st.attempt_open
+                                   AND st.forwarded_at > NOW() - make_interval(secs =>
+                                       LEAST($6::float8 * power(2::float8, LEAST(st.retry_count - 1, 30)),
+                                             $7::float8) / 1000.0))
+                          AND NOT EXISTS (
+                              SELECT 1 FROM inf
+                              WHERE inf.t = st.topic_id AND inf.p = st.partition_id
+                                AND inf.o = st.local_offset)
+                        ORDER BY st.local_offset
+                        LIMIT share.k
+                    ) d
+                    ORDER BY d.rn, d.topic_id, d.partition_id
                     LIMIT $1
                 ),
                 claimed AS (
@@ -448,8 +583,10 @@ impl ShadowDb for SpiShadowDb {
                        m.headers::text AS headers_json,
                        CASE WHEN m.timestamp_ms >= 0 THEN m.timestamp_ms
                             ELSE (EXTRACT(EPOCH FROM m.created_at) * 1000)::bigint END AS ts,
-                       COALESCE(sc.external_topic_name, t.name) AS external_topic
+                       COALESCE(sc.external_topic_name, t.name) AS external_topic,
+                       share.k        AS share
                 FROM claimed c
+                CROSS JOIN share
                 JOIN kafka.topics t ON t.id = c.topic_id
                 LEFT JOIN kafka.shadow_config sc ON sc.topic_id = c.topic_id
                 -- LATERAL + LIMIT 1: one index probe per claimed row. A plain join
@@ -478,10 +615,11 @@ impl ShadowDb for SpiShadowDb {
                 ],
             )?;
 
-            let mut records: Vec<ForwardRecord> = Vec::new();
+            let mut claimed = ClaimedRows::default();
             for row in table {
+                claimed.partition_share = row.get_by_name("share")?.unwrap_or(0);
                 let headers_json: Option<String> = row.get_by_name("headers_json")?;
-                records.push(ForwardRecord {
+                claimed.records.push(ForwardRecord {
                     row: RowKey::new(
                         row.get_by_name("topic_id")?.unwrap_or(0),
                         row.get_by_name("partition_id")?.unwrap_or(0),
@@ -495,7 +633,7 @@ impl ShadowDb for SpiShadowDb {
                     restart: row.get_by_name("restart")?.unwrap_or(false),
                 });
             }
-            Ok(records)
+            Ok(claimed)
         })
     }
 

@@ -47,6 +47,11 @@ const PRODUCER_MAX_IN_FLIGHT: &str = "5";
 /// DB thread's in-flight eviction (`INFLIGHT_EVICT_AFTER`, 150 s) relies on.
 const PRODUCER_REQUEST_TIMEOUT_MS: &str = "30000";
 const PRODUCER_MESSAGE_TIMEOUT_MS: &str = "120000";
+/// librdkafka's local queue, in KiB (its default is 1 GiB). The queue lives in
+/// the listener worker's memory; 64 MiB holds far more than one claim of
+/// records (whose size librdkafka caps at `message.max.bytes`, 1 MB). A full
+/// queue holds back only the forwarder's later records (see `forwarder_task`).
+const PRODUCER_QUEUE_MAX_KBYTES: &str = "65536";
 
 /// Assemble the ordered librdkafka settings for the shadow forwarding producer.
 ///
@@ -136,6 +141,8 @@ pub(crate) fn build_producer_settings(config: &ShadowConfig) -> Vec<(&'static st
     let message_timeout = PRODUCER_MESSAGE_TIMEOUT_MS.to_string();
     settings.push(("request.timeout.ms", request_timeout));
     settings.push(("message.timeout.ms", message_timeout));
+    let queue_kbytes = PRODUCER_QUEUE_MAX_KBYTES.to_string();
+    settings.push(("queue.buffering.max.kbytes", queue_kbytes));
 
     settings
 }
@@ -348,6 +355,8 @@ mod tests {
         let s = build_producer_settings(&config);
         assert!(!has_key(&s, "retries"));
         assert!(has(&s, "enable.gapless.guarantee", "true"));
+        // The local queue is bounded explicitly, not librdkafka's 1 GiB default.
+        assert!(has(&s, "queue.buffering.max.kbytes", "65536"));
         assert!(has(&s, "partitioner", "murmur2_random"));
     }
 

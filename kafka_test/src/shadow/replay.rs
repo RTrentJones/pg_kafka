@@ -78,8 +78,6 @@ pub async fn test_replay_historical_messages() -> TestResult {
     println!("✅ Shadow mode enabled\n");
 
     // 3. Trigger replay
-    // Note: Replay is triggered by calling a SQL function or through pg_kafka API
-    // The actual implementation depends on how replay is exposed
     println!("Step 4: Triggering replay of historical messages...");
 
     // Get topic_id
@@ -89,30 +87,20 @@ pub async fn test_replay_historical_messages() -> TestResult {
         .await?;
     let topic_id: i32 = row.get(0);
 
-    // Call replay function if it exists, otherwise simulate
-    // Try to call the replay function
-    let replay_result = ctx
+    let queued: i64 = ctx
         .db()
-        .execute(
+        .query_one(
             "SELECT kafka.replay_shadow_messages($1, 0, NULL)",
             &[&topic_id],
         )
-        .await;
-
-    match replay_result {
-        Ok(_) => {
-            println!("✅ Replay function executed\n");
-        }
-        Err(e) => {
-            // Replay function may not exist yet - this is expected during initial testing
-            println!("Note: Replay function not available ({e})");
-            println!("Skipping replay verification - function needs to be implemented\n");
-
-            ctx.cleanup().await?;
-            println!("✅ Test PASSED: Replay test setup complete (replay function pending)\n");
-            return Ok(());
-        }
-    }
+        .await?
+        .get(0);
+    assert_eq!(
+        queued,
+        i64::try_from(message_count)?,
+        "replay re-queues every historical record"
+    );
+    println!("✅ Replay queued {queued} records\n");
 
     // 4. VERIFY
     println!("=== Verification ===\n");

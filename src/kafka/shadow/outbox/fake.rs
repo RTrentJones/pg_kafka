@@ -65,6 +65,14 @@ pub struct State {
     pub configs: Option<Vec<TopicShadowConfig>>,
     /// Make `pending_txn_records` fail (None).
     pub fail_pending_txn_lookup: bool,
+    /// `(producer_id, producer_epoch)` of the Ongoing transactions.
+    pub ongoing_txns: std::collections::HashSet<(i64, i16)>,
+    /// Make `ongoing_transactions` fail (None).
+    pub fail_ongoing_lookup: bool,
+    /// Make `apply_delivered` fail (`Err`).
+    pub fail_apply_delivered: bool,
+    /// Make `apply_delivered` raise (panic, as a Postgres ERROR unwinds).
+    pub raise_in_apply_delivered: bool,
     /// Make `claim_due_outbox_rows` fail.
     pub fail_claim: bool,
     /// What `current_transaction_id` returns.
@@ -157,10 +165,13 @@ impl State {
 }
 
 /// The candidates due now, at most `batch_limit`, each with its `restart` flag
-/// (it is its partition's lowest candidate). Rows in flight or backing off are not
-/// due, and a backing-off row that is not in flight blocks every later row of its
-/// partition, so a retry is never overtaken by a later record.
-fn due_rows(candidates: &[Candidate], batch_limit: i64) -> Vec<(RowKey, bool)> {
+/// (it is its partition's lowest candidate), in key order. Rows in flight or
+/// backing off are not due, and a backing-off row that is not in flight blocks
+/// every later row of its partition, so a retry is never overtaken by a later
+/// record. Each partition contributes its lowest due rows, at most
+/// [`per_partition_claim_cap`] over the `partitions` with pending rows, and the
+/// rows are taken round-robin across partitions up to the limit.
+fn due_rows(candidates: &[Candidate], batch_limit: i64, partitions: usize) -> Vec<(RowKey, bool)> {
     let mut head: HashMap<(i32, i32), i64> = HashMap::new();
     let mut blocked: HashMap<(i32, i32), i64> = HashMap::new();
     for c in candidates {
@@ -170,18 +181,32 @@ fn due_rows(candidates: &[Candidate], batch_limit: i64) -> Vec<(RowKey, bool)> {
             blocked.entry(part).or_insert(c.key.local_offset);
         }
     }
-    candidates
-        .iter()
-        .filter(|c| {
-            !c.in_flight
-                && !c.backing_off
-                && blocked
-                    .get(&c.key.partition())
-                    .is_none_or(|&b| c.key.local_offset < b)
-        })
-        .map(|c| (c.key, head[&c.key.partition()] == c.key.local_offset))
-        .take(usize::try_from(batch_limit).unwrap_or(0))
-        .collect()
+    let cap = usize::try_from(per_partition_claim_cap(batch_limit, partitions)).unwrap_or(0);
+    // Per partition, its first `cap` due rows, ranked from 0.
+    let mut taken: HashMap<(i32, i32), usize> = HashMap::new();
+    let mut ranked: Vec<(usize, RowKey)> = Vec::new();
+    for c in candidates.iter().filter(|c| {
+        !c.in_flight
+            && !c.backing_off
+            && blocked
+                .get(&c.key.partition())
+                .is_none_or(|&b| c.key.local_offset < b)
+    }) {
+        let n = taken.entry(c.key.partition()).or_default();
+        if *n < cap {
+            ranked.push((*n, c.key));
+            *n += 1;
+        }
+    }
+    // ORDER BY rn, topic_id, partition_id LIMIT batch_limit, then key order.
+    ranked.sort_by_key(|&(rank, key)| (rank, key.partition()));
+    ranked.truncate(usize::try_from(batch_limit).unwrap_or(0));
+    let mut due: Vec<(RowKey, bool)> = ranked
+        .into_iter()
+        .map(|(_, key)| (key, head[&key.partition()] == key.local_offset))
+        .collect();
+    due.sort_by_key(|&(key, _)| key);
+    due
 }
 
 /// In-memory [`ShadowDb`].
@@ -289,20 +314,42 @@ impl ShadowDb for InMemoryShadowDb {
         )
     }
 
-    fn claim_due_outbox_rows(&self, claim: &OutboxClaim) -> Result<Vec<ForwardRecord>> {
+    fn ongoing_transactions(&self, keys: &[(i64, i16)]) -> Option<Vec<(i64, i16)>> {
+        let s = self.state();
+        if s.fail_ongoing_lookup {
+            return None;
+        }
+        Some(
+            keys.iter()
+                .copied()
+                .filter(|k| s.ongoing_txns.contains(k))
+                .collect(),
+        )
+    }
+
+    fn claim_due_outbox_rows(&self, claim: &OutboxClaim) -> Result<ClaimedRows> {
         let mut s = self.state();
         if s.fail_claim {
             return Err(KafkaError::Internal("claim failed".to_string()));
         }
         let now = s.now_ms;
         let candidates = s.claim_candidates(claim, now);
-        let due = due_rows(&candidates, claim.batch_limit);
-        let mut out = Vec::new();
+        // The claim's `parts`: every partition with a pending row.
+        let partitions = s
+            .tracking
+            .iter()
+            .filter(|(_, r)| r.external_offset.is_none())
+            .map(|(k, _)| k.partition())
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        let due = due_rows(&candidates, claim.batch_limit, partitions);
+        let mut out = ClaimedRows::default();
         for (key, restart) in due {
             s.open_attempt(key, now);
             // The JOIN with kafka.topics drops a row whose topic is gone.
             if let Some(record) = s.forward_record(key, restart) {
-                out.push(record);
+                out.records.push(record);
+                out.partition_share = per_partition_claim_cap(claim.batch_limit, partitions);
             }
         }
         Ok(out)
@@ -310,6 +357,13 @@ impl ShadowDb for InMemoryShadowDb {
 
     fn apply_delivered(&self, rows: &[(RowKey, i64)], metrics: bool) -> Result<usize> {
         let mut s = self.state();
+        if s.fail_apply_delivered {
+            return Err(KafkaError::Internal("apply_delivered failed".to_string()));
+        }
+        if s.raise_in_apply_delivered {
+            drop(s);
+            panic!("ERROR: apply_delivered raised");
+        }
         let now = s.now_ms;
         let mut n = 0;
         for &(key, external_offset) in rows {

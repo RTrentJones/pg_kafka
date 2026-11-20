@@ -26,6 +26,7 @@ pub mod external_client;
 pub mod helpers;
 mod lag_view;
 pub mod no_duplicates;
+mod outbox_robustness;
 pub mod percentage_routing;
 pub mod pipelined;
 pub mod replay;
@@ -78,5 +79,11 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         pipelined::test_shadow_sync_stall_is_bounded_to_its_own_response: sequential,
         pipelined::test_shadow_gucs_take_effect_on_reload: sequential,
         lag_view::test_shadow_lag_view_is_per_partition,
+        // Outbox under stress and failure
+        outbox_robustness::test_shadow_max_retries_refuses_zero: sequential,
+        outbox_robustness::test_shadow_backlog_does_not_starve_other_topics: sequential,
+        outbox_robustness::test_shadow_full_producer_queue_does_not_block_sync_timeouts: sequential,
+        outbox_robustness::test_shadow_timed_out_transaction_buffer_is_dropped: sequential,
+        outbox_robustness::test_shadow_ack_application_error_loses_no_ack: sequential,
     ]
 }

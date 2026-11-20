@@ -360,8 +360,9 @@ pub const MAX_SHADOW_RETRY_BACKOFF_MS: i32 = 60_000;
 /// dead-lettered.
 pub const DEFAULT_SHADOW_MAX_RETRIES: i32 = 10;
 
-/// Minimum shadow max retries.
-pub const MIN_SHADOW_MAX_RETRIES: i32 = 0;
+/// Minimum shadow max retries. A row is claimed only while `retry_count` is below
+/// the cap, so a cap of 0 would dead-letter every record before its first attempt.
+pub const MIN_SHADOW_MAX_RETRIES: i32 = 1;
 
 /// Maximum shadow max retries.
 pub const MAX_SHADOW_MAX_RETRIES: i32 = 100;

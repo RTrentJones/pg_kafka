@@ -12,6 +12,8 @@
 use super::*;
 use crate::kafka::shadow::config::ShadowMode;
 use crate::kafka::shadow::outbox::fake::InMemoryShadowDb;
+use crate::kafka::shadow::outbox::per_partition_claim_cap;
+use crate::kafka::shadow::ForwardRecord;
 use crate::testing::mocks::MockKafkaStore;
 
 const T: i32 = 7;
@@ -551,6 +553,114 @@ fn batch_size_bounds_the_claim_and_requests_another_poll() {
     assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 1);
     assert!(!h.store.outbox_tick_due(Duration::ZERO));
     assert!(h.store.outbox_tick_due(OUTBOX_POLL_INTERVAL));
+}
+
+#[test]
+fn a_backlog_does_not_starve_other_partitions() {
+    // Topic T has a 100-row backlog (a replay, an outage); topic T + 1 then gets
+    // one record. The claim shares the batch between the partitions, so the
+    // second topic's record goes out with the first claim instead of waiting
+    // behind the whole backlog (and a sync-mode response behind its timeout).
+    let h = async_harness(256);
+    h.store.db().add_topic(T + 1, "other", None);
+    h.store.db().state().settings.batch_size = 10;
+    let backlog: Vec<RowKey> = (0..100).map(|o| RowKey::new(T, 0, o)).collect();
+    seed_rows(&h.store, &backlog);
+    seed_rows(&h.store, &[RowKey::new(T + 1, 0, 0)]);
+
+    assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 6);
+    let sent = sent_records(&h);
+    let keys: Vec<RowKey> = sent.iter().map(|r| r.row).collect();
+    let mut expected: Vec<RowKey> = (0..5).map(|o| RowKey::new(T, 0, o)).collect();
+    expected.push(RowKey::new(T + 1, 0, 0));
+    assert_eq!(
+        keys, expected,
+        "the backlog's lowest offsets, then the other topic"
+    );
+    assert!(
+        h.store.outbox_tick_due(Duration::ZERO),
+        "the backlog used its whole share: poll again at once"
+    );
+
+    // Once the other topic's record is delivered, the next claim continues the
+    // backlog in order, now alone: the whole batch.
+    h.acks.send(ok_ack(RowKey::new(T + 1, 0, 0), 0)).unwrap();
+    h.store.drain_forward_acks();
+    assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 10);
+    assert_eq!(offsets(&sent_records(&h)), (5..15).collect::<Vec<_>>());
+}
+
+#[test]
+fn the_partition_share_is_an_equal_split_of_at_least_one() {
+    assert_eq!(per_partition_claim_cap(1000, 1), 1000);
+    assert_eq!(per_partition_claim_cap(1000, 0), 1000);
+    assert_eq!(per_partition_claim_cap(10, 2), 5);
+    assert_eq!(per_partition_claim_cap(10, 3), 4);
+    assert_eq!(per_partition_claim_cap(10, 40), 1);
+    assert_eq!(per_partition_claim_cap(0, 3), 1);
+}
+
+/// Claim the one seeded row and answer it Delivered on the ack channel.
+fn claimed_and_acked(h: &Harness, key: RowKey) {
+    seed_rows(&h.store, &[key]);
+    assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 1);
+    drop(sent_records(h));
+    h.acks.send(ok_ack(key, 42)).unwrap();
+}
+
+/// After its ack is finally applied the row was delivered exactly once: no lost
+/// attempt counted, not re-sent, the forward metric counted once.
+fn assert_delivered_once(h: &Harness, key: RowKey) {
+    let row = h.store.db().row(key).unwrap();
+    assert_eq!(row.external_offset, Some(42));
+    assert_eq!(row.retry_count, 0, "no attempt counted as lost");
+    assert!(!row.attempt_open);
+    assert_eq!(
+        h.store.db().state().metrics[&key.partition()].messages_forwarded,
+        1
+    );
+    assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 0, "not re-sent");
+}
+
+#[test]
+fn a_failed_ack_statement_keeps_its_acks_for_the_next_tick() {
+    let h = async_harness(16);
+    let key = RowKey::new(T, 0, 3);
+    claimed_and_acked(&h, key);
+
+    h.store.db().state().fail_apply_delivered = true;
+    assert_eq!(h.store.drain_forward_acks(), 0);
+    // The row is still in flight: the poll does not re-send it meanwhile.
+    assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 0);
+    assert_eq!(sent_records(&h).len(), 0);
+
+    h.store.db().state().fail_apply_delivered = false;
+    assert_eq!(h.store.drain_forward_acks(), 1);
+    assert_delivered_once(&h, key);
+}
+
+#[test]
+fn an_error_raised_while_applying_acks_does_not_lose_them() {
+    let h = async_harness(16);
+    let key = RowKey::new(T, 0, 3);
+    claimed_and_acked(&h, key);
+
+    // A Postgres ERROR unwinds out of the ack application (the worker's
+    // subtransaction rolls it back and the tick goes on to poll).
+    h.store.db().state().raise_in_apply_delivered = true;
+    let raised = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        h.store.drain_forward_acks()
+    }));
+    assert!(raised.is_err());
+    assert_eq!(
+        h.store.poll_and_forward_outbox().unwrap(),
+        0,
+        "still in flight"
+    );
+
+    h.store.db().state().raise_in_apply_delivered = false;
+    assert_eq!(h.store.drain_forward_acks(), 1);
+    assert_delivered_once(&h, key);
 }
 
 #[test]

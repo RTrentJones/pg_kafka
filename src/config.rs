@@ -360,7 +360,7 @@ gucs! {
     /// Failed delivery attempts after which an outbox row is dead-lettered.
     int SHADOW_MAX_RETRIES = DEFAULT_SHADOW_MAX_RETRIES => c"pg_kafka.shadow_max_retries" {
         short: c"Failed delivery attempts after which a shadow outbox row is dead-lettered",
-        long: c"A record whose forward failed this many times stays pending in kafka.shadow_tracking but is not retried (re-queue it with kafka.replay_shadow_messages). Raising it revives dead letters below the new cap. Default: 10. Reloadable with pg_reload_conf().",
+        long: c"A record whose forward failed this many times stays pending in kafka.shadow_tracking but is not retried (re-queue it with kafka.replay_shadow_messages). Raising it revives dead letters below the new cap. At least 1: every record gets one attempt. Default: 10. Reloadable with pg_reload_conf().",
         context: Sighup,
         range: (MIN_SHADOW_MAX_RETRIES, MAX_SHADOW_MAX_RETRIES),
     }
@@ -781,7 +781,7 @@ mod tests {
                 MAX_SHADOW_RETRY_BACKOFF_MS,
                 60_000,
             ),
-            ("MIN_SHADOW_MAX_RETRIES", MIN_SHADOW_MAX_RETRIES, 0),
+            ("MIN_SHADOW_MAX_RETRIES", MIN_SHADOW_MAX_RETRIES, 1),
             ("MAX_SHADOW_MAX_RETRIES", MAX_SHADOW_MAX_RETRIES, 100),
             ("MIN_FETCH_POLL_INTERVAL_MS", MIN_FETCH_POLL_INTERVAL_MS, 10),
             (
