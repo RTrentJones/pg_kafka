@@ -781,9 +781,8 @@ mod tests {
             vec![("topic-a", PARTITIONS)],
         );
 
-        let start = std::time::Instant::now();
-        let result = StickyStrategy::with_previous(previous).assign(&input);
-        let elapsed = start.elapsed();
+        let (result, elapsed) =
+            crate::testing::cpu_time(|| StickyStrategy::with_previous(previous).assign(&input));
 
         assert!(
             elapsed < std::time::Duration::from_secs(2),
@@ -1179,9 +1178,7 @@ mod tests {
     }
 
     fn timed(input: &AssignmentInput, strategy: &StickyStrategy) -> AssignmentOutput {
-        let start = std::time::Instant::now();
-        let result = strategy.assign(input);
-        let elapsed = start.elapsed();
+        let (result, elapsed) = crate::testing::cpu_time(|| strategy.assign(input));
         assert!(
             elapsed < std::time::Duration::from_secs(1),
             "sticky assignment took {elapsed:?}"

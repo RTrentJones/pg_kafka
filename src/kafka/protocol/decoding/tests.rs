@@ -277,13 +277,9 @@ fn test_produce_of_tiny_records_past_the_request_limit_is_refused() {
     let batch = raw_batch(&tiny_records(n), i32::try_from(n).unwrap(), true);
     let frame = produce_frame_of(&batch, 2, 1);
     assert!(frame.len() < 200_000, "{} bytes on the wire", frame.len());
-    let started = std::time::Instant::now();
-    assert_eq!(
-        refused_codes(frame),
-        vec![10, 10],
-        "MESSAGE_TOO_LARGE per partition"
-    );
-    assert!(started.elapsed() < std::time::Duration::from_millis(500));
+    let (codes, spent) = crate::testing::cpu_time(|| refused_codes(frame));
+    assert_eq!(codes, vec![10, 10], "MESSAGE_TOO_LARGE per partition");
+    assert!(spent < std::time::Duration::from_millis(500), "{spent:?}");
 }
 
 /// A compressed request that decodes to more than the inline limit but within the request

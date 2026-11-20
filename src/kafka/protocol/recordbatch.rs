@@ -1137,11 +1137,11 @@ mod tests {
         let batch = raw_batch(&tiny_records(n), i32::try_from(n).unwrap(), true);
         assert!(batch.len() < 100_000, "{} bytes on the wire", batch.len());
         let budget = budget();
-        let started = std::time::Instant::now();
-        let err = parse_record_batch(&batch, &budget).unwrap_err();
+        let (err, spent) = crate::testing::cpu_time(|| parse_record_batch(&batch, &budget));
+        let err = err.unwrap_err();
         assert_eq!(budget.exhausted(), Some(Exhausted::Limit), "{err}");
         assert_eq!(budget.charged(), 0, "nothing decoded");
-        assert!(started.elapsed() < std::time::Duration::from_millis(50));
+        assert!(spent < std::time::Duration::from_millis(50), "{spent:?}");
 
         // Under the inline limit the same shape stops at a few thousand records.
         let small = DecodeBudget::new(1024 * 1024);
@@ -1173,11 +1173,11 @@ mod tests {
         let batch = raw_batch(&header_records(1000, 5000), 1000, true);
         assert!(batch.len() < 1_000_000);
         let budget = budget();
-        let started = std::time::Instant::now();
-        let err = parse_record_batch(&batch, &budget).unwrap_err();
+        let (err, spent) = crate::testing::cpu_time(|| parse_record_batch(&batch, &budget));
+        let err = err.unwrap_err();
         assert_eq!(budget.exhausted(), Some(Exhausted::Limit), "{err}");
         assert!(budget.charged() <= MAX_DECODED_REQUEST_BYTES);
-        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(spent < std::time::Duration::from_secs(2), "{spent:?}");
 
         // Within the limit, each header is charged.
         let within = DecodeBudget::new(MAX_DECODED_REQUEST_BYTES);
