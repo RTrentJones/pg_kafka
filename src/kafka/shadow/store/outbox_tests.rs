@@ -78,6 +78,13 @@ fn skipped_ack(key: RowKey) -> ForwardAck {
     ForwardAck::new(key, ForwardOutcome::NotAttempted("fenced".to_string()))
 }
 
+/// One ack application whose transaction committed (the worker's tick).
+fn drain(h: &Harness) -> usize {
+    let applied = h.store.drain_forward_acks();
+    h.store.commit_applied_acks();
+    applied
+}
+
 /// Seed messages and pending outbox rows for `keys`.
 fn seed_rows(store: &Store, keys: &[RowKey]) {
     for &k in keys {
@@ -184,7 +191,7 @@ fn duplicate_success_ack_counts_once() {
     sent_records(&h);
     h.acks.send(ok_ack(RowKey::new(T, 0, 1), 9)).unwrap();
     h.acks.send(ok_ack(RowKey::new(T, 0, 1), 10)).unwrap();
-    assert_eq!(h.store.drain_forward_acks(), 2);
+    assert_eq!(drain(&h), 2);
 
     assert_eq!(
         h.store
@@ -374,7 +381,7 @@ fn in_flight_rows_are_never_reclaimed_and_only_real_failures_count() {
     // Row (T,0,1) fails, (T,1,2) is delivered.
     h.acks.send(err_ack(RowKey::new(T, 0, 1))).unwrap();
     h.acks.send(ok_ack(RowKey::new(T, 1, 2), 500)).unwrap();
-    assert_eq!(h.store.drain_forward_acks(), 2);
+    assert_eq!(drain(&h), 2);
     let failed = h.store.db().row(RowKey::new(T, 0, 1)).unwrap();
     assert_eq!(failed.error_message.as_deref(), Some("broker down"));
     assert_eq!(failed.retry_count, 1);
@@ -422,7 +429,7 @@ fn a_backing_off_row_blocks_later_rows_of_its_partition_only() {
     ] {
         h.acks.send(ack).unwrap();
     }
-    h.store.drain_forward_acks();
+    drain(&h);
     // The fenced rows were not attempted: no retry counted.
     assert_eq!(
         h.store.db().row(RowKey::new(T, 0, 2)).unwrap().retry_count,
@@ -489,7 +496,7 @@ fn failing_forward_is_dead_lettered_and_external_primary_reads_fall_back() {
         for r in &sent[1..] {
             h.acks.send(skipped_ack(r.row)).unwrap();
         }
-        h.store.drain_forward_acks();
+        drain(&h);
         h.store.db().advance_ms(OUTBOX_MAX_BACKOFF_MS + 1);
     }
 
@@ -523,7 +530,7 @@ fn raising_the_retry_cap_revives_dead_letters() {
     seed_rows(&h.store, &[RowKey::new(T, 0, 1)]);
     h.store.poll_and_forward_outbox().unwrap();
     h.acks.send(err_ack(RowKey::new(T, 0, 1))).unwrap();
-    h.store.drain_forward_acks();
+    drain(&h);
     h.store.db().advance_ms(OUTBOX_MAX_BACKOFF_MS + 1);
     sent_records(&h);
     assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 0);
@@ -585,7 +592,7 @@ fn a_backlog_does_not_starve_other_partitions() {
     // Once the other topic's record is delivered, the next claim continues the
     // backlog in order, now alone: the whole batch.
     h.acks.send(ok_ack(RowKey::new(T + 1, 0, 0), 0)).unwrap();
-    h.store.drain_forward_acks();
+    drain(&h);
     assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 10);
     assert_eq!(offsets(&sent_records(&h)), (5..15).collect::<Vec<_>>());
 }
@@ -710,13 +717,13 @@ fn a_failed_ack_statement_keeps_its_acks_for_the_next_tick() {
     claimed_and_acked(&h, key);
 
     h.store.db().state().fail_apply_delivered = true;
-    assert_eq!(h.store.drain_forward_acks(), 0);
+    assert_eq!(drain(&h), 0);
     // The row is still in flight: the poll does not re-send it meanwhile.
     assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 0);
     assert_eq!(sent_records(&h).len(), 0);
 
     h.store.db().state().fail_apply_delivered = false;
-    assert_eq!(h.store.drain_forward_acks(), 1);
+    assert_eq!(drain(&h), 1);
     assert_delivered_once(&h, key);
 }
 
@@ -740,7 +747,40 @@ fn an_error_raised_while_applying_acks_does_not_lose_them() {
     );
 
     h.store.db().state().raise_in_apply_delivered = false;
+    assert_eq!(drain(&h), 1);
+    assert_delivered_once(&h, key);
+}
+
+#[test]
+fn acks_of_a_tick_whose_commit_failed_are_applied_again() {
+    // The ack application ran, then the tick's COMMIT failed: the database
+    // forgot it. Until a commit is reported the acks stay queued and their rows
+    // in flight (no re-send, no lost attempt counted), the counters do not
+    // move, and the next tick applies them again.
+    let h = async_harness(16);
+    let key = RowKey::new(T, 0, 3);
+    claimed_and_acked(&h, key);
+    let before = h.store.db().row(key).unwrap();
+    let metrics_before = h.store.db().state().metrics.clone();
+
     assert_eq!(h.store.drain_forward_acks(), 1);
+    // The rollback of the failed COMMIT.
+    *h.store.db().state().tracking.get_mut(&key).unwrap() = before;
+    h.store.db().state().metrics = metrics_before;
+    assert_eq!(
+        h.store.metrics().forwarded.load(Ordering::Relaxed),
+        0,
+        "nothing counted before the commit"
+    );
+    assert_eq!(
+        h.store.poll_and_forward_outbox().unwrap(),
+        0,
+        "still in flight: not re-sent"
+    );
+    assert_eq!(sent_records(&h).len(), 0);
+
+    assert_eq!(drain(&h), 1, "applied again");
+    assert_eq!(h.store.metrics().forwarded.load(Ordering::Relaxed), 1);
     assert_delivered_once(&h, key);
 }
 
@@ -853,7 +893,7 @@ fn metrics_disabled_still_finalizes_rows() {
     seed_rows(&h.store, &[RowKey::new(T, 0, 1)]);
     h.store.poll_and_forward_outbox().unwrap();
     h.acks.send(ok_ack(RowKey::new(T, 0, 1), 3)).unwrap();
-    h.store.drain_forward_acks();
+    drain(&h);
     assert_eq!(
         h.store
             .db()

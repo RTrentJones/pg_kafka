@@ -7,6 +7,8 @@
 //!   transactions it aborts;
 //! - an ERROR while applying forward acks loses no ack (no lost-attempt count,
 //!   no duplicate delivery);
+//! - a failed COMMIT of the transaction that applied forward acks loses no
+//!   ack either;
 //! - partitions with nothing due take no share of a claim, and a backlog
 //!   drains claim after claim.
 
@@ -459,6 +461,123 @@ pub async fn test_shadow_ack_application_error_loses_no_ack() -> TestResult {
         );
         let external = count_external_messages(&topic, Duration::from_secs(5)).await?;
         assert_eq!(external, 1, "forwarded {external} times");
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await
+    .map_err(|e| e.to_string());
+
+    if let Err(e) = ctx
+        .db()
+        .batch_execute(&format!(
+            "DROP TRIGGER IF EXISTS {trigger} ON kafka.shadow_tracking; \
+             DROP FUNCTION IF EXISTS public.{trigger}()"
+        ))
+        .await
+    {
+        eprintln!("⚠️  cleanup: failed to drop trigger {trigger}: {e}");
+    }
+    ctx.cleanup().await?;
+    result?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// The COMMIT of the outbox tick that applied a delivery ack fails (here a deferred
+/// constraint trigger refuses the delivered mark at commit): the ack application is
+/// rolled back after it ran. The ack is applied again on a later tick, and meanwhile
+/// its row stays in flight: no lost attempt is counted and the record is forwarded once.
+pub async fn test_shadow_failed_tick_commit_loses_no_ack() -> TestResult {
+    const RECORDS: usize = 5;
+    println!("=== Test: a failed COMMIT of the ack application loses no ack ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("shadow-ack-commit").await;
+    verify_external_kafka_ready().await?;
+    enable_shadow_mode(
+        ctx.db(),
+        &topic,
+        &config(ShadowMode::Shadow, SyncMode::Async),
+    )
+    .await?;
+    let id = topic_id(ctx.db(), &topic).await?;
+    let trigger = format!("kt_refuse_ack_commit_{id}");
+    ctx.db()
+        .batch_execute(&format!(
+            "CREATE FUNCTION public.{trigger}() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN
+                 IF NEW.topic_id = {id} AND NEW.external_offset IS NOT NULL
+                    AND OLD.external_offset IS NULL THEN
+                     RAISE EXCEPTION 'kafka_test: delivery ack refused at commit';
+                 END IF;
+                 RETURN NULL;
+             END $$;
+             CREATE CONSTRAINT TRIGGER {trigger} AFTER UPDATE ON kafka.shadow_tracking
+                 DEFERRABLE INITIALLY DEFERRED
+                 FOR EACH ROW EXECUTE FUNCTION public.{trigger}();"
+        ))
+        .await?;
+
+    let result = async {
+        println!(
+            "Step 1: produce {RECORDS} records; every tick applying their acks fails at COMMIT..."
+        );
+        let producer = create_producer()?;
+        for i in 0..RECORDS {
+            producer
+                .send(
+                    FutureRecord::to(&topic)
+                        .key(format!("k{i}").as_str())
+                        .payload("once")
+                        .partition(0),
+                    Duration::from_secs(10),
+                )
+                .await
+                .map_err(|(e, _)| e)?;
+        }
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        let row = ctx
+            .db()
+            .query_one(
+                "SELECT COUNT(*) FILTER (WHERE external_offset IS NOT NULL), \
+                        COALESCE(MAX(retry_count), 0) \
+                 FROM kafka.shadow_tracking WHERE topic_id = $1",
+                &[&id],
+            )
+            .await?;
+        let (delivered, retries): (i64, i32) = (row.get(0), row.get(1));
+        assert_eq!(
+            delivered, 0,
+            "the trigger refuses the delivered mark at commit"
+        );
+        println!("  while refused: max retry_count={retries}");
+
+        println!("Step 2: drop the trigger; the kept acks are applied...");
+        ctx.db()
+            .batch_execute(&format!("DROP TRIGGER {trigger} ON kafka.shadow_tracking"))
+            .await?;
+        let start = Instant::now();
+        while undelivered(ctx.db(), id).await? > 0 {
+            if start.elapsed() > Duration::from_secs(60) {
+                return Err("the rows were not delivered within 60 s".into());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let max_retries: i32 = ctx
+            .db()
+            .query_one(
+                "SELECT MAX(retry_count) FROM kafka.shadow_tracking WHERE topic_id = $1",
+                &[&id],
+            )
+            .await?
+            .get(0);
+        assert_eq!(
+            max_retries, 0,
+            "an ack was lost: its attempt was counted as failed and re-sent"
+        );
+        let external = count_external_messages(&topic, Duration::from_secs(5)).await?;
+        assert_eq!(
+            external, RECORDS,
+            "forwarded {external} records for {RECORDS}"
+        );
         Ok::<(), Box<dyn std::error::Error>>(())
     }
     .await

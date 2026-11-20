@@ -175,11 +175,34 @@ pub struct ShadowStore<S: KafkaStore, D: ShadowDb = SpiShadowDb> {
     poll_requested: AtomicBool,
     /// Consecutive failed outbox ticks and the pause they imposed.
     outbox_failures: Mutex<TickFailures>,
-    /// Acks taken off the channel and not yet applied. They stay here until
-    /// their statement succeeds, so an ERROR (which rolls the ack application
-    /// back) or a failed statement re-applies them on the next tick instead of
-    /// losing them.
+    /// Acks taken off the channel and not yet applied for good. They stay here
+    /// until the transaction that applied them commits, so an ERROR (which rolls
+    /// the ack application back), a failed statement or a failed COMMIT
+    /// re-applies them on the next tick instead of losing them.
     unapplied_acks: Mutex<Vec<ForwardAck>>,
+    /// What the current tick's ack application did, made final by
+    /// `commit_applied_acks` once its transaction committed.
+    staged_acks: Mutex<Option<StagedAcks>>,
+}
+
+/// The effects of one ack application that must wait for its transaction's
+/// commit: until then the rows stay in flight (a rolled-back ack would
+/// otherwise let the poll re-send a delivered row and count a lost attempt),
+/// and nothing is counted or logged (a rolled-back tick would count twice).
+#[derive(Debug, Default)]
+struct StagedAcks {
+    /// The acks whose statement failed: still to apply after the commit.
+    retry: Vec<ForwardAck>,
+    /// Rows whose ack was applied: they leave the in-flight set.
+    resolved: Vec<RowKey>,
+    /// Rows the delivery acks marked delivered.
+    forwarded: u64,
+    /// Rows the failure acks recorded a failure on.
+    failed: u64,
+    /// Rows that reached the dead-letter cap, with their error.
+    dead_lettered: Vec<(RowKey, String)>,
+    /// `pg_kafka.shadow_max_retries` when they were applied (for the WARNING).
+    max_retries: i64,
 }
 
 /// The outbox tick's failure backoff.
@@ -227,6 +250,7 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
             poll_requested: AtomicBool::new(false),
             outbox_failures: Mutex::new(TickFailures::default()),
             unapplied_acks: Mutex::new(Vec::new()),
+            staged_acks: Mutex::new(None),
         }
     }
 
@@ -692,11 +716,16 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
     /// rows, a few statements per tick whatever the number of acks.
     /// Non-blocking. Returns the number of acks applied.
     ///
-    /// Acks whose statement fails, and every ack of a tick whose application
-    /// raised an ERROR (the caller's subtransaction rolls it back), are applied
-    /// again on the next tick, before new ones. Their rows stay in flight
-    /// meanwhile, so the poll does not re-send them.
+    /// The application is part of the caller's transaction, so it is only
+    /// staged here: the caller calls [`commit_applied_acks`](Self::commit_applied_acks)
+    /// once that transaction committed. Until then every ack stays queued and
+    /// its row in flight, so the poll does not re-send it. Acks of a tick that
+    /// never reached that call (an ERROR rolled the application back, the
+    /// COMMIT failed) are applied again by the next call, before new ones; so
+    /// are acks whose statement failed.
     pub fn drain_forward_acks(&self) -> usize {
+        // A staged application whose commit was not reported was rolled back.
+        lock(&self.staged_acks).take();
         let acks: Vec<ForwardAck> = {
             let mut unapplied = lock(&self.unapplied_acks);
             let guard = read_lock(&self.forward_ack_rx);
@@ -714,26 +743,63 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
             self.poll_requested.store(true, Ordering::Relaxed);
         }
         // Reached only when no statement raised an ERROR.
-        let retry = self.apply_acks(&acks);
-        let applied = acks.len() - retry.len();
-        *lock(&self.unapplied_acks) = retry;
+        let staged = self.apply_acks(&acks);
+        let applied = acks.len() - staged.retry.len();
+        *lock(&self.staged_acks) = Some(staged);
         applied
     }
 
-    /// Finalize outbox rows from forward acks. Returns the acks whose
+    /// The transaction of the last [`drain_forward_acks`](Self::drain_forward_acks)
+    /// committed: its applied acks are done (their rows leave the in-flight set
+    /// and may be claimed again), the forwarding counters move, and the dead
+    /// letters it made are logged.
+    pub fn commit_applied_acks(&self) {
+        let Some(staged) = lock(&self.staged_acks).take() else {
+            return;
+        };
+        *lock(&self.unapplied_acks) = staged.retry;
+        for row in &staged.resolved {
+            self.inflight.complete(row);
+        }
+        self.metrics
+            .forwarded
+            .fetch_add(staged.forwarded, Ordering::Relaxed);
+        self.metrics
+            .failed
+            .fetch_add(staged.failed, Ordering::Relaxed);
+        for (key, msg) in staged.dead_lettered {
+            // At the retry cap the poll stops retrying this row (it is
+            // dead-lettered). For an external-primary topic the record then
+            // falls back to local reads unless strict: log loudly.
+            crate::pg_warning!(
+                "shadow forward dead-lettered after {} failed attempts (topic_id={}, partition_id={}, local_offset={}): {} — re-queue it with kafka.replay_shadow_messages(); external-primary reads for this topic fall back to local unless pg_kafka.shadow_external_primary_strict is set",
+                staged.max_retries,
+                key.topic_id,
+                key.partition_id,
+                key.local_offset,
+                msg
+            );
+        }
+    }
+
+    /// Finalize outbox rows from forward acks, in the current transaction.
+    /// Returns what has to wait for its commit, including the acks whose
     /// statement failed, to be applied again.
     ///
     /// Delivered → external offset recorded; the row is done. Failed → the row
     /// stays pending with `retry_count + 1` and the error, and is re-attempted
     /// after its backoff; at `pg_kafka.shadow_max_retries` it is a dead letter.
     /// NotAttempted → the attempt is closed without counting. The forward metric
-    /// is counted exactly once, on the transition. A row leaves the in-flight
-    /// set (and may be claimed again) only once every statement has run.
-    fn apply_acks(&self, acks: &[ForwardAck]) -> Vec<ForwardAck> {
-        if acks.is_empty() {
-            return Vec::new();
-        }
+    /// in `kafka.shadow_metrics` is counted exactly once, on the transition.
+    fn apply_acks(&self, acks: &[ForwardAck]) -> StagedAcks {
         let settings = self.db.settings();
+        let mut staged = StagedAcks {
+            max_retries: settings.max_retries,
+            ..StagedAcks::default()
+        };
+        if acks.is_empty() {
+            return staged;
+        }
         let mut delivered: Vec<(RowKey, i64)> = Vec::new();
         let mut failed: Vec<(RowKey, String)> = Vec::new();
         let mut not_attempted: Vec<RowKey> = Vec::new();
@@ -750,11 +816,7 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
             .db
             .apply_delivered(&delivered, settings.metrics_enabled)
         {
-            Ok(n) => {
-                self.metrics
-                    .forwarded
-                    .fetch_add(n as u64, Ordering::Relaxed);
-            }
+            Ok(n) => staged.forwarded = n as u64,
             Err(e) => {
                 tracing::warn!("Shadow: failed to apply delivery acks (retried): {:?}", e);
                 delivered_ok = false;
@@ -766,22 +828,8 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
             .apply_failed(&failed, settings.max_retries, settings.metrics_enabled)
         {
             Ok(applied) => {
-                self.metrics
-                    .failed
-                    .fetch_add(applied.transitioned as u64, Ordering::Relaxed);
-                for (key, msg) in applied.dead_lettered {
-                    // At the retry cap the poll stops retrying this row (it is
-                    // dead-lettered). For an external-primary topic the record
-                    // then falls back to local reads unless strict — log loudly.
-                    crate::pg_warning!(
-                        "shadow forward dead-lettered after {} failed attempts (topic_id={}, partition_id={}, local_offset={}): {} — re-queue it with kafka.replay_shadow_messages(); external-primary reads for this topic fall back to local unless pg_kafka.shadow_external_primary_strict is set",
-                        settings.max_retries,
-                        key.topic_id,
-                        key.partition_id,
-                        key.local_offset,
-                        msg
-                    );
-                }
+                staged.failed = applied.transitioned as u64;
+                staged.dead_lettered = applied.dead_lettered;
             }
             Err(e) => {
                 tracing::warn!("Shadow: failed to apply failure acks (retried): {:?}", e);
@@ -797,7 +845,6 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
             not_attempted_ok = false;
         }
 
-        let mut retry = Vec::new();
         for ack in acks {
             let applied = match ack.outcome {
                 ForwardOutcome::Delivered(_) => delivered_ok,
@@ -805,13 +852,12 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
                 ForwardOutcome::NotAttempted(_) => not_attempted_ok,
             };
             if applied {
-                // The forward has resolved, so the row may be claimed again.
-                self.inflight.complete(&ack.row);
+                staged.resolved.push(ack.row);
             } else {
-                retry.push(ack.clone());
+                staged.retry.push(ack.clone());
             }
         }
-        retry
+        staged
     }
 
     /// Reload the per-topic configuration from `kafka.shadow_config` (at
