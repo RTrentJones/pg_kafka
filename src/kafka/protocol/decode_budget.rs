@@ -15,9 +15,9 @@
 //!   its connection, as an exhausted frame budget does, and the client retries. The decoded
 //!   request keeps its share ([`DecodedCharge`]) until it is dropped after its handler ran.
 //!
-//! What a decode holds at its peak (the decompressed section, kafka-protocol's records and
-//! the copies they are converted to) is at most twice its charge; once converted it holds
-//! no more than its charge.
+//! What a decode holds at its peak (the decompressed section and the records' copies of
+//! it) is at most twice its charge; once the section is dropped it holds no more than its
+//! charge.
 //!
 //! Decoding is also kept off the two tokio I/O threads once it is large
 //! ([`run_large_decode`]): at most [`LARGE_DECODE_SLOTS`] such decodes run at once, each on a

@@ -188,28 +188,90 @@ fn zstd_raw_frame(section: &[u8], window_log: u8) -> Vec<u8> {
     frame
 }
 
-/// A RecordBatch v2 around `records` (compressed with the codec `attributes` names),
+/// The header fields of a hand-built batch ([`batch_with`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BatchHeader {
+    pub(crate) base_offset: i64,
+    /// Attributes, codec bits included.
+    pub(crate) attributes: i16,
+    /// `None`: one less than the record count (at least 0).
+    pub(crate) last_offset_delta: Option<i32>,
+    pub(crate) base_timestamp: i64,
+    pub(crate) producer_id: i64,
+    pub(crate) producer_epoch: i16,
+    pub(crate) base_sequence: i32,
+}
+
+impl Default for BatchHeader {
+    fn default() -> Self {
+        Self {
+            base_offset: 0,
+            attributes: 0,
+            last_offset_delta: None,
+            base_timestamp: 0,
+            producer_id: -1,
+            producer_epoch: -1,
+            base_sequence: -1,
+        }
+    }
+}
+
+/// A RecordBatch v2 around `records` (compressed with the codec the attributes name),
 /// declaring `record_count` records, with a valid CRC.
-fn batch_around(records: &[u8], record_count: i32, attributes: i16) -> Bytes {
+pub(crate) fn batch_with(records: &[u8], record_count: i32, header: BatchHeader) -> Bytes {
     use bytes::BufMut;
     let mut tail = bytes::BytesMut::new();
-    tail.put_i16(attributes);
-    tail.put_i32(record_count.max(1) - 1); // lastOffsetDelta
-    tail.put_i64(0); // baseTimestamp
-    tail.put_i64(0); // maxTimestamp
-    tail.put_i64(-1); // producerId
-    tail.put_i16(-1); // producerEpoch
-    tail.put_i32(-1); // baseSequence
+    tail.put_i16(header.attributes);
+    tail.put_i32(
+        header
+            .last_offset_delta
+            .unwrap_or_else(|| record_count.max(1) - 1),
+    );
+    tail.put_i64(header.base_timestamp); // baseTimestamp
+    tail.put_i64(header.base_timestamp); // maxTimestamp
+    tail.put_i64(header.producer_id);
+    tail.put_i16(header.producer_epoch);
+    tail.put_i32(header.base_sequence);
     tail.put_i32(record_count);
     tail.put_slice(records);
     let mut batch = bytes::BytesMut::new();
-    batch.put_i64(0); // baseOffset
+    batch.put_i64(header.base_offset);
     batch.put_i32(i32::try_from(4 + 1 + 4 + tail.len()).expect("a test batch fits an i32"));
     batch.put_i32(0); // partitionLeaderEpoch
     batch.put_i8(2); // magic
     batch.put_u32(crc32c::crc32c(&tail));
     batch.put_slice(&tail);
     batch.freeze()
+}
+
+/// A RecordBatch v2 around `records` (compressed with the codec `attributes` names),
+/// declaring `record_count` records, with a valid CRC.
+fn batch_around(records: &[u8], record_count: i32, attributes: i16) -> Bytes {
+    let header = BatchHeader {
+        attributes,
+        ..BatchHeader::default()
+    };
+    batch_with(records, record_count, header)
+}
+
+/// `v` as a zigzag varint (as long as it takes).
+pub(crate) fn varint(v: i64) -> Vec<u8> {
+    let mut z = ((v << 1) ^ (v >> 63)).cast_unsigned();
+    let mut out = Vec::new();
+    while z >= 0x80 {
+        out.push(u8::try_from(z & 0x7f).expect("7 bits") | 0x80);
+        z >>= 7;
+    }
+    out.push(u8::try_from(z).expect("7 bits"));
+    out
+}
+
+/// One record: its body (the concatenated `fields`) behind its varint length.
+pub(crate) fn record(fields: &[&[u8]]) -> Vec<u8> {
+    let body = fields.concat();
+    let mut record = varint(i64::try_from(body.len()).expect("small"));
+    record.extend_from_slice(&body);
+    record
 }
 
 /// `n` of the smallest records: 7 bytes each (null key and value, no headers).
@@ -243,9 +305,9 @@ fn header_records(n: usize, headers: u16) -> Vec<u8> {
     record.repeat(n)
 }
 
-/// Batches that are small decoded but many records or headers, which each take a few
-/// hundred bytes once decoded: their declared record count is charged before anything
-/// decodes and their headers before kafka-protocol builds them, so they are refused with
+/// Batches that are small decoded but many records or headers, which each take some 50 to
+/// 90 bytes once decoded: their declared record count is charged before anything decodes
+/// and their headers before they are built, so they are refused with
 /// MESSAGE_TOO_LARGE quickly and the listener's memory stays bounded. A record count that
 /// does not match the records is INVALID_RECORD, also before the records are built.
 /// Unchecked, these four requests took gigabytes.
@@ -502,6 +564,104 @@ pub async fn test_unsupported_version_acks0_produce_closes_connection() -> TestR
     );
     assert!(answers(&mut s, 3).await, "the acks=1 connection stays open");
     println!("✅ acks=1 v10: UNSUPPORTED_VERSION, connection open");
+
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// The `headers` column of `topic`'s rows as text, and their keys, in offset order.
+async fn stored_keys_and_headers(
+    db: &tokio_postgres::Client,
+    topic: &str,
+) -> DynResult<Vec<(Option<Vec<u8>>, String)>> {
+    Ok(db
+        .query(
+            "SELECT m.key, coalesce(m.headers::text, '') FROM kafka.messages m \
+             JOIN kafka.topics t ON t.id = m.topic_id WHERE t.name = $1 \
+             ORDER BY m.partition_offset",
+            &[&topic],
+        )
+        .await?
+        .iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect())
+}
+
+/// Batches are read with Kafka 3.7's grammar: a 6-byte timestamp-delta varlong (a 5-byte
+/// varint reader takes the key that follows for headers it charged nothing for) holds just
+/// its key, and duplicate header keys are kept in order and a non-UTF-8 header key is
+/// accepted.
+pub async fn test_record_batches_are_read_as_kafka_reads_them() -> TestResult {
+    use crate::wire::Wire;
+    println!("=== Test: record batches read as Kafka 3.7 reads them ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("net-grammar").await;
+    let created = create_topics_raw(vec![creatable(&topic, 3, 1)]).await?;
+    assert_eq!(created[0].error_code, 0, "{created:?}");
+    let mut wire = Wire::connect().await?;
+
+    println!("Step 1: 20 records whose timestamp delta is a 6-byte varlong");
+    let mut key = varint(-1);
+    key.extend(varint(500));
+    for i in 0..500u16 {
+        let (high, low) = (u8::try_from(i / 96)?, u8::try_from(i % 96)?);
+        key.extend_from_slice(&[0x04, 0x20 + high, 0x20 + low, 0x01]);
+    }
+    let key_length = varint(i64::try_from(key.len())?);
+    let shifted = record(&[
+        &[0],
+        &[0x80, 0x80, 0x80, 0x80, 0x80, 0x00],
+        &varint(i64::try_from(key_length.len())?),
+        &key_length,
+        &key,
+        &varint(-1),
+        &varint(0),
+    ]);
+    let batch = batch_with(&shifted.repeat(20), 20, BatchHeader::default());
+    assert_eq!(wire.produce(&topic, 0, batch, None).await?.0, 0);
+    let rows = stored_keys_and_headers(ctx.db(), &topic).await?;
+    assert_eq!(rows.len(), 20);
+    for (stored_key, headers) in &rows {
+        assert_eq!(stored_key.as_deref(), Some(&key[..]), "the key Kafka reads");
+        assert_eq!(headers, "{}", "no headers");
+    }
+    println!(
+        "✅ 20 records, each its {}-byte key and no headers",
+        key.len()
+    );
+
+    println!("Step 2: duplicate and non-UTF-8 header keys");
+    let headed = record(&[
+        &[0],
+        &varint(0),
+        &varint(0),
+        &varint(-1),
+        &varint(1),
+        b"h",
+        &varint(3),
+        &varint(1),
+        b"a",
+        &varint(1),
+        b"1",
+        &varint(1),
+        b"a",
+        &varint(1),
+        b"2",
+        &varint(2),
+        &[0xff, 0xfe],
+        &varint(-1),
+    ]);
+    let batch = batch_with(&headed, 1, BatchHeader::default());
+    assert_eq!(wire.produce(&topic, 0, batch, None).await?.0, 0);
+    let rows = stored_keys_and_headers(ctx.db(), &topic).await?;
+    let headers: serde_json::Value = serde_json::from_str(&rows[20].1)?;
+    assert_eq!(
+        headers,
+        serde_json::json!([["a", "31"], ["a", "32"], ["\u{fffd}\u{fffd}", ""]]),
+        "every header, in order"
+    );
+    println!("✅ stored {headers}");
 
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");

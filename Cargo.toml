@@ -46,6 +46,8 @@ flate2 = "1.1"
 lz4 = "1.28"
 snap = "1.1"
 zstd = "0.14"
+# The RecordBatch v2 checksum (CRC-32C), hardware-accelerated; the version kafka-protocol uses.
+crc32c = "0.6.4"
 
 # Concurrency and synchronization
 crossbeam-channel = "0.5.15"

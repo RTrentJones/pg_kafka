@@ -62,6 +62,77 @@ fn batch(compression: Compression, n: usize) -> Bytes {
     buf.freeze()
 }
 
+/// CRC-32C (Castagnoli), the checksum of a RecordBatch v2, bit by bit.
+fn crc32c(data: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &byte in data {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = if crc & 1 == 0 {
+                crc >> 1
+            } else {
+                (crc >> 1) ^ 0x82F6_3B78
+            };
+        }
+    }
+    !crc
+}
+
+/// `v` as a zigzag varint appended to `out`.
+fn varint(v: i64, out: &mut Vec<u8>) {
+    let mut z = ((v << 1) ^ (v >> 63)).cast_unsigned();
+    while z >= 0x80 {
+        out.push(u8::try_from(z & 0x7f).expect("seven bits") | 0x80);
+        z >>= 7;
+    }
+    out.push(u8::try_from(z).expect("seven bits"));
+}
+
+/// A batch of `n` records whose timestamp delta is a 6-byte varlong (Kafka reads it
+/// whole) and whose key holds what a decoder reading a 5-byte varint there would take for
+/// a null value and `headers` headers.
+fn shifted_varint_batch(n: usize, headers: i64) -> Vec<u8> {
+    let mut key = Vec::new();
+    varint(-1, &mut key);
+    varint(headers, &mut key);
+    for i in 0..headers {
+        let i = u8::try_from(i % 96).expect("under 96");
+        key.extend_from_slice(&[0x04, 0x20, 0x20 + i, 0x01]);
+    }
+    let mut key_length = Vec::new();
+    varint(i64::try_from(key.len()).expect("small"), &mut key_length);
+    let mut body = vec![0u8, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00];
+    varint(i64::try_from(key_length.len()).expect("small"), &mut body);
+    body.extend_from_slice(&key_length);
+    body.extend_from_slice(&key);
+    varint(-1, &mut body);
+    varint(0, &mut body);
+    let mut section = Vec::new();
+    for _ in 0..n {
+        varint(i64::try_from(body.len()).expect("small"), &mut section);
+        section.extend_from_slice(&body);
+    }
+    let count = i32::try_from(n).expect("small");
+    let mut tail = BytesMut::new();
+    tail.put_i16(0);
+    tail.put_i32(count - 1);
+    tail.put_i64(0);
+    tail.put_i64(0);
+    tail.put_i64(-1);
+    tail.put_i16(-1);
+    tail.put_i32(-1);
+    tail.put_i32(count);
+    tail.put_slice(&section);
+    let mut batch = BytesMut::new();
+    batch.put_i64(0);
+    batch.put_i32(i32::try_from(9 + tail.len()).expect("small"));
+    batch.put_i32(0);
+    batch.put_i8(2);
+    batch.put_u32(crc32c(&tail));
+    batch.put_slice(&tail);
+    batch.to_vec()
+}
+
 fn write(dir: &Path, name: &str, data: &[u8]) {
     std::fs::create_dir_all(dir).unwrap();
     std::fs::write(dir.join(format!("seed-{name}")), data).unwrap();
@@ -170,5 +241,6 @@ fn main() {
     ] {
         write(&root.join("record_batch"), name, &batch(c, 4));
     }
+    write(&root.join("record_batch"), "varint-shift", &shifted_varint_batch(4, 64));
     println!("wrote {} request seeds", frames.len());
 }

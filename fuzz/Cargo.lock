@@ -950,6 +950,7 @@ dependencies = [
  "anyhow",
  "base64",
  "bytes",
+ "crc32c",
  "crossbeam-channel",
  "flate2",
  "futures",

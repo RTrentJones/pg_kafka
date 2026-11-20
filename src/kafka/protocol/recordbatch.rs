@@ -1,6 +1,10 @@
 //! The records of one Produce partition: exactly one RecordBatch v2, the only record
 //! format of the Produce versions pg_kafka serves (v3+).
 //!
+//! The batch is read here, field by field, with the grammar of Kafka 3.7's
+//! `DefaultRecordBatch` and `DefaultRecord` (varints and varlongs as `ByteUtils` reads them),
+//! so a record holds exactly what Kafka would store, and what it holds is what was charged.
+//!
 //! The memory a batch decodes to is charged to the request's [`DecodeBudget`] before it is
 //! allocated (see [`super::decode_budget`]):
 //!
@@ -8,23 +12,18 @@
 //!   before anything is decompressed;
 //! * the decoded bytes, as the decompressors here produce them: they write through the
 //!   budget and stop at its limit, so a compressed batch never expands past what the
-//!   request may hold;
-//! * the headers, at [`HEADER_MEMORY`] each, and the heap blocks of the copies the records
-//!   are converted to, counted by a walk over the decoded records section that allocates
-//!   nothing and also checks that it holds exactly the declared records, before
-//!   kafka-protocol builds any of them.
-//!
-//! What kafka-protocol's own records took is given back once they are converted.
+//!   request may hold. The copies the records keep of their keys, values and headers are
+//!   covered by these bytes;
+//! * every heap block of those copies, at [`ALLOCATION_OVERHEAD`], and the headers, at
+//!   [`HEADER_MEMORY`] each, as the records are read.
 //!
 //! Runs on the network thread, so it logs through `tracing`, never pgrx.
 
-use std::cell::Cell;
 use std::io::{self, Write};
 use std::mem::size_of;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use kafka_protocol::protocol::StrBytes;
-use kafka_protocol::records::{Compression, Record as WireRecord, RecordBatchDecoder};
+use kafka_protocol::records::Compression;
 use tracing::debug;
 
 use super::decode_budget::DecodeBudget;
@@ -49,6 +48,9 @@ const BATCH_LENGTH_OFFSET: usize = 8;
 /// baseOffset and batchLength, which batchLength does not count.
 const LOG_OVERHEAD: usize = 12;
 const MAGIC_OFFSET: usize = 16;
+const CRC_OFFSET: usize = 17;
+/// The CRC covers the batch from its attributes on.
+const ATTRIBUTES_OFFSET: usize = 21;
 const PRODUCER_ID_OFFSET: usize = 43;
 const RECORD_COUNT_OFFSET: usize = 57;
 /// The header of a RecordBatch v2, up to its first record.
@@ -58,20 +60,19 @@ const MIN_BATCH_LENGTH: usize = 14;
 /// The magic byte of a RecordBatch v2.
 const RECORD_BATCH_V2_MAGIC: i8 = 2;
 
-/// Memory of one header in kafka-protocol's decoded record: an `IndexMap` entry (hash, key,
-/// value) and its slots in the map's index table.
-const WIRE_HEADER_MEMORY: usize =
-    size_of::<(u64, StrBytes, Option<Bytes>)>() + 2 * size_of::<usize>();
+/// Attribute bits of a RecordBatch v2.
+const CODEC_MASK: i16 = 0x07;
+/// The codec id of zstd.
+const ZSTD_CODEC: i16 = 4;
 
-/// Memory one record takes while it decodes besides its bytes: kafka-protocol's record and
-/// the one it is converted to. Charged from the declared record count before decoding, so
-/// a batch of many tiny records (7 bytes on the wire, 264 here) cannot hold more memory
-/// than the request may.
-pub const RECORD_MEMORY: usize = size_of::<WireRecord>() + size_of::<Record>();
+/// Memory one record takes while it decodes besides its bytes. Charged from the declared
+/// record count before decoding, so a batch of many tiny records (7 bytes on the wire,
+/// 88 here) cannot hold more memory than the request may.
+pub const RECORD_MEMORY: usize = size_of::<Record>();
 
 /// Memory one header takes while it decodes besides its bytes (2 bytes on the wire at the
-/// least): in kafka-protocol's record and in ours.
-pub const HEADER_MEMORY: usize = WIRE_HEADER_MEMORY + size_of::<RecordHeader>();
+/// least).
+pub const HEADER_MEMORY: usize = size_of::<RecordHeader>();
 
 /// What one heap block costs beyond its bytes: the smallest block glibc's malloc hands out
 /// (a 1-byte key copy takes 32), or the bookkeeping and rounding of a larger one.
@@ -96,14 +97,14 @@ fn i32_at(bytes: &[u8], at: usize) -> i32 {
 }
 
 /// Check the framing Kafka checks before it decodes a Produce v3+ partition's records,
-/// and return the batch's declared record count.
+/// and return the batch's size and declared record count.
 ///
 /// In Kafka 3.7's order (`ByteBufferLogInputStream.nextBatchSize`, then
 /// `ProduceRequest.validateRecords`): a batchLength too short for any batch, or a v2+ batch
 /// shorter than its header, is CORRUPT_MESSAGE; data holding no complete batch, a batch of
 /// another magic than 2 (a legacy MessageSet) and a negative record count are
 /// INVALID_RECORD.
-fn check_batch_header(batch: &[u8]) -> Result<usize> {
+fn check_batch_header(batch: &[u8]) -> Result<(usize, usize)> {
     let no_batch = || invalid("Produce v3+ partition data must hold exactly one record batch");
     if batch.len() < LOG_OVERHEAD {
         return Err(no_batch());
@@ -134,8 +135,9 @@ fn check_batch_header(batch: &[u8]) -> Result<usize> {
             "Produce v3+ carries record batches of magic 2 only, not magic {magic}"
         )));
     }
-    usize::try_from(i32_at(batch, RECORD_COUNT_OFFSET))
-        .map_err(|_| invalid("record batch declares a negative record count"))
+    let count = usize::try_from(i32_at(batch, RECORD_COUNT_OFFSET))
+        .map_err(|_| invalid("record batch declares a negative record count"))?;
+    Ok((batch_length + LOG_OVERHEAD, count))
 }
 
 /// The producer id, epoch and base sequence in the header of a batch that passed
@@ -152,7 +154,7 @@ fn extract_producer_metadata(batch: &[u8]) -> ProducerMetadata {
 /// The least memory `batch` decodes to: its own bytes and its declared records (more if it
 /// is compressed or carries headers). Data that is not a record batch decodes to nothing.
 pub fn least_decoded_memory(batch: &[u8]) -> usize {
-    check_batch_header(batch).map_or(0, |count| {
+    check_batch_header(batch).map_or(0, |(_, count)| {
         count
             .saturating_mul(RECORD_MEMORY)
             .saturating_add(batch.len())
@@ -325,14 +327,12 @@ fn decompress_snappy(data: &Bytes, budget: &DecodeBudget) -> anyhow::Result<Byte
     Ok(out.freeze())
 }
 
-/// The decompressed records section of a RecordBatch, every byte charged to `budget`
-/// (kafka-protocol's custom decompressor hook, for every codec including none).
+/// The decompressed records section of a RecordBatch, every byte charged to `budget`.
 fn decompress(
-    data: &mut Bytes,
+    data: Bytes,
     compression: Compression,
     budget: &DecodeBudget,
 ) -> anyhow::Result<Bytes> {
-    let data = std::mem::take(data);
     let mut out = BudgetedWriter::new(budget);
     match compression {
         Compression::None => {
@@ -359,209 +359,241 @@ fn decompress(
     Ok(out.into_bytes())
 }
 
-/// Read a varint (zigzag-encoded, at most 10 bytes) off the front of `buf`.
-fn read_varint(buf: &mut &[u8]) -> Option<i64> {
+/// The codec of a batch's attributes; ids past zstd's are CORRUPT_MESSAGE.
+fn compression_of(attributes: i16) -> Result<Compression> {
+    Ok(match attributes & CODEC_MASK {
+        0 => Compression::None,
+        1 => Compression::Gzip,
+        2 => Compression::Snappy,
+        3 => Compression::Lz4,
+        ZSTD_CODEC => Compression::Zstd,
+        other => return Err(corrupt(format!("unknown compression codec {other}"))),
+    })
+}
+
+/// Kafka's `ByteUtils.readVarint`: a zigzag varint of at most 5 bytes off the front of
+/// `buf`, the bits of the fifth byte past 32 dropped. `None` when it is cut short or its
+/// fifth byte continues.
+fn read_varint(buf: &mut &[u8]) -> Option<i32> {
+    let mut value = 0u32;
+    for shift in (0..35).step_by(7) {
+        let (&byte, rest) = buf.split_first()?;
+        *buf = rest;
+        value |= u32::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Some((value >> 1).cast_signed() ^ -(value & 1).cast_signed());
+        }
+    }
+    None
+}
+
+/// Kafka's `ByteUtils.readVarlong`: a zigzag varlong of at most 10 bytes, the bits of the
+/// tenth byte past 64 dropped.
+fn read_varlong(buf: &mut &[u8]) -> Option<i64> {
     let mut value = 0u64;
     for shift in (0..70).step_by(7) {
         let (&byte, rest) = buf.split_first()?;
         *buf = rest;
         value |= u64::from(byte & 0x7f) << shift;
         if byte & 0x80 == 0 {
-            // Zigzag: the low bit is the sign.
-            let magnitude = i64::try_from(value >> 1).ok()?;
-            let sign = i64::try_from(value & 1).ok()?;
-            return Some(magnitude ^ -sign);
+            return Some((value >> 1).cast_signed() ^ -(value & 1).cast_signed());
         }
     }
     None
 }
 
-/// What decoding a records section allocates besides its records.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct SectionShape {
-    /// Headers, over all records.
-    headers: usize,
-    /// Heap blocks: a copy of every non-empty key, value, header key and header value, and
-    /// the header maps and vectors of records that have headers.
-    allocations: usize,
+/// One record body (`DefaultRecord.readFrom`), read off a records section.
+struct RecordReader<'a> {
+    body: &'a [u8],
+    budget: &'a DecodeBudget,
 }
 
-/// Skip a varint-length-prefixed byte string (`-1` = null when `nullable`); whether it
-/// holds any bytes (its copy is a heap block).
-fn skip_bytes(buf: &mut &[u8], nullable: bool, what: &str) -> std::result::Result<bool, String> {
-    let len = read_varint(buf).ok_or_else(|| format!("record {what} length cut short"))?;
-    if nullable && len == -1 {
-        return Ok(false);
+impl<'a> RecordReader<'a> {
+    fn varint(&mut self, what: &str) -> Result<i32> {
+        read_varint(&mut self.body).ok_or_else(|| invalid(format!("record {what} is invalid")))
     }
-    let len = usize::try_from(len)
-        .ok()
-        .filter(|&n| n <= buf.len())
-        .ok_or_else(|| format!("record {what} length {len} is invalid"))?;
-    *buf = &buf[len..];
-    Ok(len > 0)
-}
 
-/// Heap blocks a record with headers adds: kafka-protocol's map (entries and index table)
-/// and our vector.
-const HEADER_CONTAINER_ALLOCATIONS: usize = 3;
+    fn charge(&self, n: usize) -> Result<()> {
+        self.budget
+            .take(n)
+            .map_err(|_| corrupt("record batch stopped at the decode limit: its records"))
+    }
 
-/// The shape of one record body (attributes, timestamp and offset deltas, key, value,
-/// headers), which must be exactly its fields.
-fn scan_record(mut body: &[u8]) -> std::result::Result<SectionShape, String> {
-    let cut_short = || "record cut short".to_string();
-    body = body.get(1..).ok_or_else(cut_short)?; // attributes
-    read_varint(&mut body).ok_or_else(cut_short)?; // timestamp delta
-    read_varint(&mut body).ok_or_else(cut_short)?; // offset delta
-    let mut allocations = usize::from(skip_bytes(&mut body, true, "key")?);
-    allocations += usize::from(skip_bytes(&mut body, true, "value")?);
-    let headers = read_varint(&mut body).ok_or_else(cut_short)?;
-    // Every header takes at least two bytes, which bounds the walk by the body.
-    let headers = usize::try_from(headers)
-        .ok()
-        .filter(|&n| n <= body.len() / 2)
-        .ok_or_else(|| format!("record header count {headers} is invalid"))?;
-    if headers > 0 {
-        allocations += HEADER_CONTAINER_ALLOCATIONS;
+    /// `len` bytes, or INVALID_RECORD when the body holds fewer.
+    fn bytes(&mut self, len: i32, what: &str) -> Result<&'a [u8]> {
+        let len = usize::try_from(len)
+            .ok()
+            .filter(|&n| n <= self.body.len())
+            .ok_or_else(|| invalid(format!("record {what} length {len} is invalid")))?;
+        let (bytes, rest) = self.body.split_at(len);
+        self.body = rest;
+        Ok(bytes)
     }
-    for _ in 0..headers {
-        allocations += usize::from(skip_bytes(&mut body, false, "header key")?);
-        allocations += usize::from(skip_bytes(&mut body, true, "header value")?);
+
+    /// A copy of `bytes`, its heap block charged (the bytes are the section's).
+    fn copy(&self, bytes: &[u8]) -> Result<Vec<u8>> {
+        if !bytes.is_empty() {
+            self.charge(ALLOCATION_OVERHEAD)?;
+        }
+        Ok(bytes.to_vec())
     }
-    if body.is_empty() {
-        Ok(SectionShape {
+
+    /// A length-prefixed byte string; a negative length is null, as in Kafka.
+    fn nullable(&mut self, what: &str) -> Result<Option<Vec<u8>>> {
+        let len = self.varint(what)?;
+        if len < 0 {
+            return Ok(None);
+        }
+        let bytes = self.bytes(len, what)?;
+        self.copy(bytes).map(Some)
+    }
+
+    /// A header key: never null, read as UTF-8 with replacement characters, as Java's
+    /// `Utils.utf8` reads it.
+    fn header_key(&mut self) -> Result<String> {
+        let len = self.varint("header key length")?;
+        if len < 0 {
+            return Err(invalid(format!(
+                "record header key length {len} is invalid"
+            )));
+        }
+        let bytes = self.bytes(len, "header key")?;
+        if bytes.is_empty() {
+            return Ok(String::new());
+        }
+        if let Ok(key) = std::str::from_utf8(bytes) {
+            self.charge(ALLOCATION_OVERHEAD)?;
+            return Ok(key.to_owned());
+        }
+        // Every invalid byte may become a 3-byte U+FFFD.
+        self.charge(ALLOCATION_OVERHEAD + 2 * bytes.len())?;
+        Ok(String::from_utf8_lossy(bytes).into_owned())
+    }
+
+    /// The record, which must be exactly its fields.
+    fn read(mut self, base_timestamp: i64) -> Result<Record> {
+        let (_attributes, rest) = self
+            .body
+            .split_first()
+            .ok_or_else(|| invalid("record cut short"))?;
+        self.body = rest;
+        let timestamp_delta = read_varlong(&mut self.body)
+            .ok_or_else(|| invalid("record timestamp delta is invalid"))?;
+        self.varint("offset delta")?;
+        let key = self.nullable("key")?;
+        let value = self.nullable("value")?;
+        let count = self.varint("header count")?;
+        // Every header takes at least two bytes, which bounds the count by the body.
+        let count = usize::try_from(count)
+            .ok()
+            .filter(|&n| n <= self.body.len() / 2)
+            .ok_or_else(|| invalid(format!("record header count {count} is invalid")))?;
+        let mut headers = Vec::new();
+        if count > 0 {
+            self.charge(
+                count
+                    .saturating_mul(HEADER_MEMORY)
+                    .saturating_add(ALLOCATION_OVERHEAD),
+            )?;
+            headers.reserve_exact(count);
+        }
+        for _ in 0..count {
+            let key = self.header_key()?;
+            let value = self.nullable("header value")?.unwrap_or_default();
+            headers.push(RecordHeader { key, value });
+        }
+        if !self.body.is_empty() {
+            return Err(invalid(format!(
+                "record has {} bytes past its fields",
+                self.body.len()
+            )));
+        }
+        Ok(Record {
+            key,
+            value,
             headers,
-            allocations,
+            timestamp: Some(base_timestamp.wrapping_add(timestamp_delta)),
         })
-    } else {
-        Err(format!("record has {} bytes past its fields", body.len()))
     }
 }
 
-/// The shape of a decoded records section, which must hold exactly `count` well-formed
-/// records (Kafka 3.7 refuses anything else as INVALID_RECORD). Allocates nothing, so a
-/// section can be checked, and what it decodes to charged, before kafka-protocol builds
-/// its records.
-fn scan_records(mut section: &[u8], count: usize) -> std::result::Result<SectionShape, String> {
-    let mut shape = SectionShape::default();
+/// The records of a decoded records section, which must hold exactly `count` well-formed
+/// records (Kafka 3.7 refuses anything else as INVALID_RECORD). The records themselves were
+/// charged from the count; their heap blocks and headers are charged as they are read.
+fn read_records(
+    mut section: &[u8],
+    count: usize,
+    base_timestamp: i64,
+    budget: &DecodeBudget,
+) -> Result<Vec<Record>> {
+    let mut records = Vec::with_capacity(count);
     for read in 0..count {
         let size = read_varint(&mut section)
-            .ok_or_else(|| format!("records section holds {read} records, not {count}"))?;
+            .ok_or_else(|| invalid(format!("records section holds {read} records, not {count}")))?;
         let size = usize::try_from(size)
             .ok()
             .filter(|&n| n <= section.len())
-            .ok_or_else(|| format!("record size {size} is invalid"))?;
+            .ok_or_else(|| invalid(format!("record size {size} is invalid")))?;
         let (body, rest) = section.split_at(size);
-        let record = scan_record(body)?;
-        shape.headers += record.headers;
-        shape.allocations += record.allocations;
+        records.push(RecordReader { body, budget }.read(base_timestamp)?);
         section = rest;
     }
     if section.is_empty() {
-        Ok(shape)
+        Ok(records)
     } else {
-        Err(format!(
+        Err(invalid(format!(
             "{} bytes remain past the {count} records the batch declares",
             section.len()
-        ))
-    }
-}
-
-/// What the memory of a decode is charged for a section of `shape`, besides its bytes and
-/// its records.
-fn shape_memory(shape: SectionShape) -> usize {
-    shape
-        .headers
-        .saturating_mul(HEADER_MEMORY)
-        .saturating_add(shape.allocations.saturating_mul(ALLOCATION_OVERHEAD))
-}
-
-/// Our record from kafka-protocol's.
-fn convert(record: WireRecord) -> Record {
-    Record {
-        key: record.key.map(|k| k.to_vec()),
-        value: record.value.map(|v| v.to_vec()),
-        headers: record
-            .headers
-            .into_iter()
-            .map(|(key, value)| RecordHeader {
-                key: key.to_string(),
-                value: value.map_or_else(Vec::new, |b| b.to_vec()),
-            })
-            .collect(),
-        timestamp: Some(record.timestamp),
+        )))
     }
 }
 
 /// Parse a partition's record data (one RecordBatch v2) into its records, charging their
-/// memory to `budget` (see the module docs). kafka-protocol decodes the batch, checking its
-/// CRC32C, through `decompress` and `scan_records`.
+/// memory to `budget` (see the module docs). Checks run in Kafka 3.7's order: the framing
+/// (`check_batch_header`), the CRC32C, then the records.
 pub fn parse_record_batch(batch_bytes: &Bytes, budget: &DecodeBudget) -> Result<Vec<Record>> {
-    let count = check_batch_header(batch_bytes)?;
-    debug!(
-        "parse_record_batch: {} bytes, {count} records",
-        batch_bytes.len()
-    );
-    let at_the_limit = |e: &dyn std::fmt::Display| {
-        corrupt(format!("record batch stopped at the decode limit: {e}"))
+    let (size, count) = check_batch_header(batch_bytes)?;
+    // Produce v3+ carries exactly one record batch per partition. Decoding one and
+    // ignoring the rest would drop the trailing batches while acking the request; reject
+    // it as Kafka does.
+    if batch_bytes.len() > size {
+        return Err(invalid(format!(
+            "partition data carries more than one record batch ({} trailing bytes)",
+            batch_bytes.len() - size
+        )));
+    }
+    let batch = batch_bytes.slice(..size);
+    let mut stored_crc = &batch[CRC_OFFSET..ATTRIBUTES_OFFSET];
+    let stored_crc = stored_crc.get_u32();
+    let crc = crc32c::crc32c(&batch[ATTRIBUTES_OFFSET..]);
+    if crc != stored_crc {
+        return Err(corrupt(format!(
+            "record batch CRC {stored_crc:#010x} does not match its contents ({crc:#010x})"
+        )));
+    }
+    let mut fields = &batch[ATTRIBUTES_OFFSET..];
+    let compression = compression_of(fields.get_i16())?;
+    fields.advance(4); // lastOffsetDelta
+    let base_timestamp = fields.get_i64();
+    debug!("parse_record_batch: {size} bytes, {count} records, {compression:?}");
+
+    let at_the_limit = |what: &dyn std::fmt::Display| {
+        corrupt(format!("record batch stopped at the decode limit: {what}"))
     };
     if budget.take(count.saturating_mul(RECORD_MEMORY)).is_err() {
         return Err(at_the_limit(&format!("{count} records")));
     }
-
-    let not_the_declared_records = Cell::new(None);
-    let headers = Cell::new(0usize);
-    let mut batch_buf = batch_bytes.clone();
-    let decoded = RecordBatchDecoder::decode_with_custom_compression(
-        &mut batch_buf,
-        Some(|data: &mut Bytes, compression| {
-            let section = decompress(data, compression, budget)?;
-            match scan_records(&section, count) {
-                Ok(shape) => {
-                    budget
-                        .take(shape_memory(shape))
-                        .map_err(|_| over_budget())?;
-                    headers.set(shape.headers);
-                    Ok(section)
-                }
-                Err(why) => {
-                    not_the_declared_records.set(Some(why));
-                    anyhow::bail!("records section does not match its batch header")
-                }
-            }
-        }),
-    );
-    match decoded {
-        // Produce v3+ carries exactly one record batch per partition. Decoding one and
-        // ignoring the rest would drop the trailing batches while acking the request;
-        // reject it as Kafka does.
-        Ok(_) if batch_buf.has_remaining() => Err(invalid(format!(
-            "partition data carries more than one record batch ({} trailing bytes)",
-            batch_buf.remaining()
-        ))),
-        Ok(record_set) => {
-            // A fresh vector of exactly the records: collecting in place would keep the
-            // larger allocation of kafka-protocol's records.
-            let mut records = Vec::with_capacity(record_set.records.len());
-            for record in record_set.records {
-                records.push(convert(record));
-            }
-            budget.release(
-                count.saturating_mul(size_of::<WireRecord>())
-                    + headers.get().saturating_mul(WIRE_HEADER_MEMORY),
-            );
-            Ok(records)
-        }
-        Err(e) if budget.exhausted().is_some() => Err(at_the_limit(&e)),
-        Err(e) => match not_the_declared_records.take() {
-            Some(why) => Err(invalid(why)),
-            None => Err(corrupt(format!("record batch does not decode: {e}"))),
-        },
-    }
+    let section = match decompress(batch.slice(RECORD_BATCH_OVERHEAD..), compression, budget) {
+        Ok(section) => section,
+        Err(e) if budget.exhausted().is_some() => return Err(at_the_limit(&e)),
+        Err(e) => return Err(corrupt(format!("record batch does not decompress: {e}"))),
+    };
+    read_records(&section, count, base_timestamp, budget)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::test_batches::{header_records, raw_batch, tiny_records};
+    use super::test_batches::{header_records, raw_batch, record, tiny_records, v};
     use super::*;
     use bytes::Bytes;
 
@@ -687,12 +719,12 @@ mod tests {
                 1 << window_log,
                 "window 2^{window_log}"
             );
-            let out = decompress(&mut Bytes::from(frame), Compression::Zstd, &budget());
+            let out = decompress(Bytes::from(frame), Compression::Zstd, &budget());
             assert_eq!(&out.unwrap()[..], &data[..], "window 2^{window_log}");
         }
         let frame = zstd_frame(&data, 19, 28);
         let budget = budget();
-        assert!(decompress(&mut Bytes::from(frame), Compression::Zstd, &budget).is_err());
+        assert!(decompress(Bytes::from(frame), Compression::Zstd, &budget).is_err());
         assert_eq!(budget.charged(), 0, "refused before decoding");
     }
 
@@ -705,11 +737,11 @@ mod tests {
             let frame = zstd_frame(&data, 3, window_log);
             let peak = DecodeBudget::new(data.len() + extra - 1);
             assert!(
-                decompress(&mut Bytes::from(frame.clone()), Compression::Zstd, &peak).is_err(),
+                decompress(Bytes::from(frame.clone()), Compression::Zstd, &peak).is_err(),
                 "window 2^{window_log} is charged"
             );
             let budget = DecodeBudget::new(data.len() + extra);
-            let out = decompress(&mut Bytes::from(frame), Compression::Zstd, &budget).unwrap();
+            let out = decompress(Bytes::from(frame), Compression::Zstd, &budget).unwrap();
             assert_eq!(out.len(), data.len());
             assert_eq!(budget.charged(), data.len(), "window 2^{window_log}");
         }
@@ -730,7 +762,7 @@ mod tests {
             .unwrap();
         let budget = budget();
         assert_eq!(
-            &decompress(&mut Bytes::from(raw.clone()), Compression::Snappy, &budget).unwrap()[..],
+            &decompress(Bytes::from(raw.clone()), Compression::Snappy, &budget).unwrap()[..],
             b"hello snappy"
         );
         let mut framed = XERIAL_SNAPPY_HEADER.to_vec();
@@ -739,16 +771,11 @@ mod tests {
             framed.extend_from_slice(&raw);
         }
         assert_eq!(
-            &decompress(
-                &mut Bytes::from(framed.clone()),
-                Compression::Snappy,
-                &budget
-            )
-            .unwrap()[..],
+            &decompress(Bytes::from(framed.clone()), Compression::Snappy, &budget).unwrap()[..],
             b"hello snappyhello snappy"
         );
         framed.truncate(framed.len() - 1);
-        assert!(decompress(&mut Bytes::from(framed), Compression::Snappy, &budget).is_err());
+        assert!(decompress(Bytes::from(framed), Compression::Snappy, &budget).is_err());
     }
 
     fn encode_batch(values: &[&str]) -> BytesMut {
@@ -931,26 +958,32 @@ mod tests {
             let _ = parse_record_batch(&Bytes::from(data), &budget());
         }
 
-        // The full `parse_record_batch` pipeline, including the v2 `RecordBatchDecoder` path,
-        // must never panic or abort on arbitrary bytes. That holds because the patched
-        // kafka-protocol bounds the record-count `reserve` and the string/bytes
-        // `vec![0; wire_len]` allocations; an unbounded one could `abort()` on an
-        // attacker-controlled count, which no `catch_unwind` can contain. The exact
-        // huge-`record_count` regression test lives in the fork
-        // (`records.rs::huge_record_count_errors_instead_of_aborting`).
+        // The full `parse_record_batch` pipeline must never panic or abort on arbitrary
+        // bytes: every allocation it makes is charged to the budget first, so an
+        // attacker-controlled count or length cannot reach `handle_alloc_error`.
         #[test]
         fn fuzz_parse_record_batch_never_aborts(
             bytes in proptest::collection::vec(proptest::num::u8::ANY, 0..1024),
         ) {
             let _ = parse_record_batch(&Bytes::from(bytes), &budget());
         }
+
+        // Arbitrary records sections behind a valid header and CRC, so the record walk itself
+        // sees the bytes.
+        #[test]
+        fn fuzz_records_sections_never_panic(
+            section in proptest::collection::vec(proptest::num::u8::ANY, 0..512),
+            count in 0i32..64,
+        ) {
+            let _ = parse_record_batch(&raw_batch(&section, count, false), &budget());
+        }
     }
 
     #[test]
     fn the_per_record_and_per_header_costs_are_the_documented_ones() {
         // docs/PROTOCOL_DEVIATIONS.md (Compression) quotes these.
-        assert_eq!(RECORD_MEMORY, 264);
-        assert_eq!(HEADER_MEMORY, 136);
+        assert_eq!(RECORD_MEMORY, 88);
+        assert_eq!(HEADER_MEMORY, 48);
     }
 
     #[test]
@@ -960,34 +993,47 @@ mod tests {
         assert_eq!(read(&[1]), Some(-1));
         assert_eq!(read(&[2]), Some(1));
         assert_eq!(read(&[0xac, 0x02]), Some(150));
+        assert_eq!(read(&[0xfe, 0xff, 0xff, 0xff, 0x0f]), Some(i32::MAX));
+        assert_eq!(read(&[0xff, 0xff, 0xff, 0xff, 0x0f]), Some(i32::MIN));
         assert_eq!(read(&[0x80]), None, "cut short");
-        assert_eq!(read(&[0xff; 11]), None, "longer than 10 bytes");
+        assert_eq!(read(&[0xff; 5]), None, "longer than 5 bytes");
         let mut rest = &[0x02u8, 0x7f][..];
         assert_eq!(read_varint(&mut rest), Some(1));
         assert_eq!(rest, &[0x7f]);
+        let long = |bytes: &[u8]| read_varlong(&mut &bytes[..]);
+        assert_eq!(long(&[0x80, 0x80, 0x80, 0x80, 0x80, 0x00]), Some(0));
+        assert_eq!(
+            long(&[0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01]),
+            Some(i64::MAX)
+        );
+        assert_eq!(long(&[0xff; 10]), None, "longer than 10 bytes");
     }
 
     #[test]
-    fn the_section_walk_counts_headers_and_heap_blocks() {
+    fn headers_and_heap_blocks_are_charged_as_they_are_read() {
         // One record: key "k" (a heap block), null value, two headers ("a" -> "xy" and
         // "b" -> null): blocks for the key, both header keys, one header value, and the
-        // header containers.
+        // header vector.
         let body = [0u8, 0, 0, 2, b'k', 1, 4, 2, b'a', 4, b'x', b'y', 2, b'b', 1];
         let mut section = vec![u8::try_from(body.len() * 2).unwrap()];
         section.extend_from_slice(&body);
+        let budget = budget();
+        let records = read_records(&section, 1, 0, &budget).unwrap();
+        assert_eq!(records[0].headers.len(), 2);
         assert_eq!(
-            scan_records(&section, 1),
-            Ok(SectionShape {
-                headers: 2,
-                allocations: 4 + HEADER_CONTAINER_ALLOCATIONS
-            })
+            budget.charged(),
+            2 * HEADER_MEMORY + 5 * ALLOCATION_OVERHEAD
         );
-        assert!(scan_records(&section, 2).is_err(), "one record, not two");
-        assert!(scan_records(&section[..section.len() - 1], 1).is_err());
-        // A header count the body cannot hold is refused before it is walked.
-        let mut huge = vec![0u8, 0, 0, 1, 1, 0xfe, 0xff, 0xff, 0xff, 0x0f];
+        assert!(
+            read_records(&section, 2, 0, &budget).is_err(),
+            "one record, not two"
+        );
+        assert!(read_records(&section[..section.len() - 1], 1, 0, &budget).is_err());
+        // A header count the body cannot hold is refused before anything is reserved.
+        let mut huge = vec![0u8, 0, 0, 1, 1, 0xfe, 0xff, 0xff, 0xff, 0x07];
         huge.insert(0, u8::try_from(huge.len() * 2).unwrap());
-        assert!(scan_records(&huge, 1).unwrap_err().contains("header count"));
+        let err = read_records(&huge, 1, 0, &budget).unwrap_err();
+        assert!(err.to_string().contains("header count"), "{err}");
     }
 
     #[test]
@@ -1029,8 +1075,6 @@ mod tests {
         let budget = budget();
         let records = parse_record_batch(&batch, &budget).unwrap();
         assert_eq!(records.len(), n);
-        // A fresh vector: collecting in place would keep kafka-protocol's twice-as-large
-        // allocation.
         assert_eq!(records.capacity(), n);
         let held = n * size_of::<Record>();
         assert!(
@@ -1043,8 +1087,7 @@ mod tests {
     #[test]
     fn header_heavy_records_are_charged_their_headers() {
         // 1000 records of 5000 headers, 2 bytes each: 10 MB decoded, but each header
-        // takes over 100 bytes decoded. They stop at the request limit before
-        // kafka-protocol builds them.
+        // takes 48 bytes decoded. They stop at the request limit.
         let batch = raw_batch(&header_records(1000, 5000), 1000, true);
         assert!(batch.len() < 1_000_000);
         let budget = budget();
@@ -1086,6 +1129,140 @@ mod tests {
                 .unwrap()
                 .len(),
             1000
+        );
+    }
+
+    /// A records section of `n` records whose timestamp delta is a 6-byte varlong, and the
+    /// key every record holds. A decoder reading that delta as a 5-byte varint takes its last
+    /// byte for the offset delta and every later field shifted by one: the key bytes then
+    /// read as a null value and `headers` headers.
+    fn shifted_varint_section(n: usize, headers: i64) -> (Vec<u8>, Vec<u8>) {
+        let mut key = v(-1);
+        key.extend(v(headers));
+        for i in 0..headers {
+            let (high, low) = (u8::try_from(i / 96).unwrap(), u8::try_from(i % 96).unwrap());
+            key.extend_from_slice(&[0x04, 0x20 + high, 0x20 + low, 0x01]);
+        }
+        let key_length = v(i64::try_from(key.len()).unwrap());
+        let one = record(&[
+            &[0],
+            &[0x80, 0x80, 0x80, 0x80, 0x80, 0x00],
+            &v(i64::try_from(key_length.len()).unwrap()),
+            &key_length,
+            &key,
+            &v(-1),
+            &v(0),
+        ]);
+        (one.repeat(n), key)
+    }
+
+    #[test]
+    fn records_decode_as_kafka_reads_their_varints() {
+        // Kafka reads the timestamp delta as a varlong of up to 10 bytes. Read as a 5-byte
+        // varint, these records each carried 100 headers the walk charged nothing for.
+        let (section, key) = shifted_varint_section(10, 100);
+        let budget = budget();
+        let records = parse_record_batch(&raw_batch(&section, 10, false), &budget).unwrap();
+        assert_eq!(records.len(), 10);
+        for r in &records {
+            assert!(r.headers.is_empty(), "{} headers", r.headers.len());
+            assert_eq!(r.key.as_deref(), Some(&key[..]));
+            assert_eq!(r.value, None);
+            assert_eq!(r.timestamp, Some(0));
+        }
+        let held: usize = records
+            .iter()
+            .map(|r| size_of::<Record>() + r.key.as_ref().map_or(0, Vec::len))
+            .sum();
+        assert!(
+            budget.charged() >= held,
+            "charged {} for {held}",
+            budget.charged()
+        );
+    }
+
+    #[test]
+    fn varints_follow_kafkas_byte_utils() {
+        use crate::kafka::constants::ERROR_INVALID_RECORD;
+        let one =
+            |fields: &[&[u8]]| parse_record_batch(&raw_batch(&record(fields), 1, false), &budget());
+        let value = [&v(1)[..], b"v"].concat();
+        // A varlong of 10 bytes (bits past 64 dropped) is a timestamp delta; 11 are not.
+        let ten = [[0x80u8; 9].as_slice(), &[0x7f]].concat();
+        assert!(one(&[&[0], &ten, &v(0), &v(-1), &value, &v(0)]).is_ok());
+        let eleven = [[0x80u8; 10].as_slice(), &[0]].concat();
+        let err = one(&[&[0], &eleven, &v(0), &v(-1), &value, &v(0)]).unwrap_err();
+        assert_eq!(code(&err), ERROR_INVALID_RECORD, "{err}");
+        // A varint takes at most 5 bytes; the high bits of the fifth are dropped.
+        let five = [0x80, 0x80, 0x80, 0x80, 0x7f];
+        assert!(one(&[&[0], &v(0), &five, &v(-1), &value, &v(0)]).is_ok());
+        let six = [0x80, 0x80, 0x80, 0x80, 0x80, 0x00];
+        let err = one(&[&[0], &v(0), &six, &v(-1), &value, &v(0)]).unwrap_err();
+        assert_eq!(code(&err), ERROR_INVALID_RECORD, "{err}");
+        let key_length_one = [0x82, 0x80, 0x80, 0x80, 0x10];
+        let r = one(&[&[0], &v(0), &v(0), &key_length_one, b"k", &value, &v(0)]).unwrap();
+        assert_eq!(r[0].key.as_deref(), Some(&b"k"[..]));
+        let overlong_one = [0x82, 0x80, 0x80, 0x80, 0x00];
+        let r = one(&[&[0], &v(0), &v(0), &overlong_one, b"k", &value, &v(0)]).unwrap();
+        assert_eq!(r[0].key.as_deref(), Some(&b"k"[..]));
+        // Any negative key, value or header value length is null; a negative header key
+        // length or header count is invalid.
+        let r = one(&[
+            &[0],
+            &v(0),
+            &v(0),
+            &v(-5),
+            &v(-7),
+            &v(1),
+            &v(1),
+            b"a",
+            &v(-9),
+        ])
+        .unwrap();
+        assert_eq!((r[0].key.as_ref(), r[0].value.as_ref()), (None, None));
+        assert_eq!(r[0].headers.len(), 1);
+        assert_eq!(r[0].headers[0].value, b"");
+        for bad in [
+            one(&[&[0], &v(0), &v(0), &v(-1), &value, &v(1), &v(-1), &v(-1)]),
+            one(&[&[0], &v(0), &v(0), &v(-1), &value, &v(-1)]),
+        ] {
+            assert_eq!(code(&bad.unwrap_err()), ERROR_INVALID_RECORD);
+        }
+    }
+
+    #[test]
+    fn headers_keep_their_order_and_duplicates() {
+        // Kafka keeps every header as sent, duplicate keys included, and reads a key that is
+        // not UTF-8 with replacement characters, as Java's String does.
+        let section = record(&[
+            &[0],
+            &v(0),
+            &v(0),
+            &v(-1),
+            &v(1),
+            b"h",
+            &v(3),
+            &v(1),
+            b"a",
+            &v(1),
+            b"1",
+            &v(1),
+            b"a",
+            &v(1),
+            b"2",
+            &v(2),
+            &[0xff, 0xfe],
+            &v(-1),
+        ]);
+        let records = parse_record_batch(&raw_batch(&section, 1, false), &budget()).unwrap();
+        let headers: Vec<(&str, &[u8])> = records[0]
+            .headers
+            .iter()
+            .map(|h| (h.key.as_str(), h.value.as_slice()))
+            .collect();
+        assert_eq!(
+            headers,
+            [("a", &b"1"[..]), ("a", b"2"), ("\u{fffd}\u{fffd}", b"")]
         );
     }
 
@@ -1147,35 +1324,96 @@ pub(crate) mod test_batches {
         !crc
     }
 
-    /// A RecordBatch v2 built by hand around the records section `section`, declaring
-    /// `count` records and compressed with gzip when `gzip`.
-    pub(crate) fn raw_batch(section: &[u8], count: i32, gzip: bool) -> Bytes {
-        let records = if gzip {
-            let mut encoder =
-                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
-            encoder.write_all(section).unwrap();
-            encoder.finish().unwrap()
-        } else {
-            section.to_vec()
-        };
+    /// The header fields of a batch built by hand ([`batch_with`]).
+    #[derive(Debug, Clone, Copy)]
+    pub(crate) struct Header {
+        pub(crate) base_offset: i64,
+        /// Attributes, codec bits included.
+        pub(crate) attributes: i16,
+        /// `None`: one less than the record count (at least 0).
+        pub(crate) last_offset_delta: Option<i32>,
+        pub(crate) base_timestamp: i64,
+        pub(crate) producer_id: i64,
+        pub(crate) producer_epoch: i16,
+        pub(crate) base_sequence: i32,
+    }
+
+    impl Default for Header {
+        fn default() -> Self {
+            Self {
+                base_offset: 0,
+                attributes: 0,
+                last_offset_delta: None,
+                base_timestamp: 0,
+                producer_id: -1,
+                producer_epoch: -1,
+                base_sequence: -1,
+            }
+        }
+    }
+
+    /// A RecordBatch v2 built by hand around the (already compressed, if the attributes
+    /// say so) records section `records`, declaring `count` records.
+    pub(crate) fn batch_with(records: &[u8], count: i32, header: Header) -> Bytes {
         let mut tail = BytesMut::new();
-        tail.put_i16(i16::from(gzip)); // attributes: the codec
-        tail.put_i32(count.max(1) - 1);
-        tail.put_i64(0);
-        tail.put_i64(0);
-        tail.put_i64(-1);
-        tail.put_i16(-1);
-        tail.put_i32(-1);
+        tail.put_i16(header.attributes);
+        tail.put_i32(header.last_offset_delta.unwrap_or_else(|| count.max(1) - 1));
+        tail.put_i64(header.base_timestamp);
+        tail.put_i64(header.base_timestamp);
+        tail.put_i64(header.producer_id);
+        tail.put_i16(header.producer_epoch);
+        tail.put_i32(header.base_sequence);
         tail.put_i32(count);
-        tail.put_slice(&records);
+        tail.put_slice(records);
         let mut batch = BytesMut::new();
-        batch.put_i64(0);
+        batch.put_i64(header.base_offset);
         batch.put_i32(i32::try_from(9 + tail.len()).unwrap());
         batch.put_i32(0);
         batch.put_i8(2);
         batch.put_u32(crc32c(&tail));
         batch.put_slice(&tail);
         batch.freeze()
+    }
+
+    /// A RecordBatch v2 built by hand around the records section `section`, declaring
+    /// `count` records and compressed with gzip when `gzip`.
+    pub(crate) fn raw_batch(section: &[u8], count: i32, gzip: bool) -> Bytes {
+        if !gzip {
+            return batch_with(section, count, Header::default());
+        }
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        encoder.write_all(section).unwrap();
+        let header = Header {
+            attributes: 1,
+            ..Header::default()
+        };
+        batch_with(&encoder.finish().unwrap(), count, header)
+    }
+
+    /// `v` as a zigzag varint (any length up to 10 bytes) appended to `out`.
+    pub(crate) fn varint(v: i64, out: &mut Vec<u8>) {
+        let mut z = ((v << 1) ^ (v >> 63)).cast_unsigned();
+        while z >= 0x80 {
+            out.push(u8::try_from(z & 0x7f).unwrap() | 0x80);
+            z >>= 7;
+        }
+        out.push(u8::try_from(z).unwrap());
+    }
+
+    /// One record: its body (the concatenated `fields`) behind its varint length.
+    pub(crate) fn record(fields: &[&[u8]]) -> Vec<u8> {
+        let body = fields.concat();
+        let mut record = Vec::new();
+        varint(i64::try_from(body.len()).unwrap(), &mut record);
+        record.extend_from_slice(&body);
+        record
+    }
+
+    /// `v` as a zigzag varint.
+    pub(crate) fn v(v: i64) -> Vec<u8> {
+        let mut out = Vec::new();
+        varint(v, &mut out);
+        out
     }
 
     /// `n` of the smallest records: 7 bytes each (null key and value, no headers).
@@ -1185,14 +1423,6 @@ pub(crate) mod test_batches {
 
     /// `n` records of `headers` headers each (an empty key and a null value: 2 bytes).
     pub(crate) fn header_records(n: usize, headers: usize) -> Vec<u8> {
-        fn varint(v: i64, out: &mut Vec<u8>) {
-            let mut z = ((v << 1) ^ (v >> 63)).cast_unsigned();
-            while z >= 0x80 {
-                out.push(u8::try_from(z & 0x7f).unwrap() | 0x80);
-                z >>= 7;
-            }
-            out.push(u8::try_from(z).unwrap());
-        }
         let mut body = vec![0u8, 0, 0, 1, 1];
         varint(i64::try_from(headers).unwrap(), &mut body);
         body.extend_from_slice(&[0, 1].repeat(headers));
