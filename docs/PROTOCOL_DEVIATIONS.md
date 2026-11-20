@@ -125,6 +125,16 @@ pg_kafka.compression_type = 'gzip'
 - ✅ InitProducerId refuses a transaction timeout <= 0 or above
   `pg_kafka.transaction_max_timeout_ms` (Kafka's `transaction.max.timeout.ms`, default
   900000) with INVALID_TRANSACTION_TIMEOUT (50)
+- ✅ InitProducerId with the producer id and epoch a client presents (v3+, KIP-360), as
+  Kafka 3.7 answers it: the transactional id's current producer at its current epoch is
+  bumped to the next epoch; a retry of that bump (the epoch before it) gets the same
+  epoch back without another bump; any other presented id or epoch (a fenced zombie) is
+  PRODUCER_FENCED (90) and changes nothing. A presented id without an epoch, or the
+  reverse, is INVALID_REQUEST (42). An InitProducerId presenting none (-1/-1) fences
+  the previous producer, after which its retry is fenced too. An idempotent producer
+  always gets a new producer id. **Deviation:** a retry of a re-init that moved the
+  producer to a new id (epoch 32767 exhausted) is PRODUCER_FENCED; Kafka also
+  remembers the previous producer id.
 - ✅ The transaction timeout (`transaction.timeout.ms`) runs from the start of each
   transaction, as Kafka's does; the timeout sweep aborts an expired one and fences its
   producer with the next epoch (a new producer id when the epoch is exhausted)

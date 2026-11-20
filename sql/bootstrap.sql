@@ -549,6 +549,10 @@ CREATE TABLE kafka.producer_ids (
     epoch SMALLINT NOT NULL DEFAULT 0,
     client_id TEXT,
     transactional_id TEXT,  -- NULL for non-transactional idempotent producers
+    -- The epoch before the last bump the producer asked for itself (InitProducerId
+    -- presenting its own id and epoch), so a retry of that request gets the same epoch
+    -- back; NULL after a fencing bump (Kafka's lastProducerEpoch).
+    last_epoch SMALLINT,
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
     last_active_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
@@ -583,6 +587,8 @@ COMMENT ON COLUMN kafka.producer_ids.producer_id IS 'Unique producer ID allocate
 COMMENT ON COLUMN kafka.producer_ids.epoch IS 'Producer epoch, incremented on each InitProducerId call for same producer. Used for fencing.';
 
 COMMENT ON COLUMN kafka.producer_ids.transactional_id IS 'Optional transactional ID for transactional producers (Phase 10)';
+
+COMMENT ON COLUMN kafka.producer_ids.last_epoch IS 'Epoch before the last bump the producer requested itself (a retry of that InitProducerId gets the current epoch back); NULL after a fencing bump.';
 
 COMMENT ON TABLE kafka.producer_sequences IS 'Sequence number tracking for idempotent producer deduplication';
 

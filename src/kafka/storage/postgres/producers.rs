@@ -10,7 +10,7 @@ use crate::kafka::error::{KafkaError, Result};
 use crate::kafka::storage::{
     stored_last_sequence, transactional_epoch_is_stale, validate_sequence,
     validate_unknown_producer, CachedBatch, ProducerBatch, SequenceCheck, SequenceValidation,
-    PRODUCER_BATCH_CACHE,
+    TransactionalProducer, PRODUCER_BATCH_CACHE,
 };
 use pgrx::prelude::*;
 use pgrx::spi::{SpiClient, SpiError};
@@ -71,7 +71,8 @@ pub(super) fn insert_producer_id(
     Ok((producer_id, epoch))
 }
 
-/// Move a producer to its next epoch and return `(producer_id, epoch)`. An exhausted
+/// Move a producer to its next epoch and return `(producer_id, epoch)`. The previous
+/// epoch is forgotten (a bump fences it); see [`PostgresStore::remember_previous_epoch`]. An exhausted
 /// epoch (RV-13: `epoch + 1` would overflow the SMALLINT and fail every later
 /// re-init) gets a fresh producer id at epoch 0 instead, as in Kafka; the
 /// transactions foreign key is ON UPDATE CASCADE, so a transaction row follows the new
@@ -85,7 +86,7 @@ pub(super) fn bump_producer_epoch(
         let new_id = next_free_producer_id(client)?;
         client.update(
             "UPDATE kafka.producer_ids
-             SET producer_id = $2, epoch = 0, last_active_at = NOW()
+             SET producer_id = $2, epoch = 0, last_epoch = NULL, last_active_at = NOW()
              WHERE producer_id = $1
              RETURNING producer_id, epoch",
             None,
@@ -94,7 +95,7 @@ pub(super) fn bump_producer_epoch(
     } else {
         client.update(
             "UPDATE kafka.producer_ids
-             SET epoch = epoch + 1, last_active_at = NOW()
+             SET epoch = epoch + 1, last_epoch = NULL, last_active_at = NOW()
              WHERE producer_id = $1
              RETURNING producer_id, epoch",
             None,
@@ -504,5 +505,40 @@ impl PostgresStore {
             Ok(())
         })
         .map_err(internal("record_producer_sequence"))
+    }
+
+    pub(super) fn transactional_producer(
+        transactional_id: &str,
+    ) -> Result<Option<TransactionalProducer>> {
+        Spi::connect(|client| {
+            let table = client.select(
+                "SELECT producer_id, epoch, last_epoch FROM kafka.producer_ids
+                 WHERE transactional_id = $1",
+                Some(1),
+                &[transactional_id.into()],
+            )?;
+            if table.is_empty() {
+                return Ok(None);
+            }
+            let row = table.first();
+            Ok(Some(TransactionalProducer {
+                producer_id: row.get_by_name("producer_id")?.unwrap_or(0),
+                epoch: row.get_by_name("epoch")?.unwrap_or(0),
+                previous_epoch: row.get_by_name("last_epoch")?,
+            }))
+        })
+        .map_err(internal("transactional_producer"))
+    }
+
+    pub(super) fn remember_previous_epoch(producer_id: i64, previous_epoch: i16) -> Result<()> {
+        Spi::connect_mut(|client| {
+            client.update(
+                "UPDATE kafka.producer_ids SET last_epoch = $2 WHERE producer_id = $1",
+                None,
+                &[producer_id.into(), previous_epoch.into()],
+            )?;
+            Ok(())
+        })
+        .map_err(internal("remember_previous_epoch"))
     }
 }

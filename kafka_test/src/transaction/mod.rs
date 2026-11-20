@@ -13,6 +13,7 @@ mod basic;
 mod eos;
 mod invisible_offsets;
 mod isolation;
+mod producer_epochs;
 mod timeouts;
 mod validation;
 
@@ -47,5 +48,6 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         validation::test_transactional_requests_are_validated,
         timeouts::test_second_transaction_gets_its_own_timeout,
         timeouts::test_timeout_abort_fences_an_exhausted_epoch,
+        producer_epochs::test_init_producer_id_checks_the_presented_epoch,
     ]
 }

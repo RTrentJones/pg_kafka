@@ -94,7 +94,8 @@ EXTENSION pg_kafka` has run, without a restart.
   EXECUTE on `kafka.replay_shadow_messages`), grants read-only access to
   `pgkafka_reader` and the worker's privileges to `pgkafka_worker`;
 - re-applies the two additive columns older 0.0.0 builds may lack
-  (`kafka.topics.retention_ms`, `kafka.partition_offsets.log_start_offset`).
+  (`kafka.topics.retention_ms`, `kafka.partition_offsets.log_start_offset`);
+- adds `kafka.producer_ids.last_epoch` (the epoch an InitProducerId retry may present).
 
 After the upgrade:
 

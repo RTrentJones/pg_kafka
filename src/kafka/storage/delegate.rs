@@ -438,6 +438,19 @@ macro_rules! delegate_producer_store {
         ) -> $crate::kafka::error::Result<()> {
             $via::record_producer_sequence(producer_id, topic_id, partition_id, last_sequence)
         }
+        fn transactional_producer(
+            &self,
+            transactional_id: &str,
+        ) -> $crate::kafka::error::Result<Option<$crate::kafka::storage::TransactionalProducer>> {
+            $via::transactional_producer(transactional_id)
+        }
+        fn remember_previous_epoch(
+            &self,
+            producer_id: i64,
+            previous_epoch: i16,
+        ) -> $crate::kafka::error::Result<()> {
+            $via::remember_previous_epoch(producer_id, previous_epoch)
+        }
     };
     ($via:ident, $field:ident) => {
         fn allocate_producer_id(
@@ -501,6 +514,19 @@ macro_rules! delegate_producer_store {
                 partition_id,
                 last_sequence,
             )
+        }
+        fn transactional_producer(
+            &self,
+            transactional_id: &str,
+        ) -> $crate::kafka::error::Result<Option<$crate::kafka::storage::TransactionalProducer>> {
+            $via::transactional_producer(&self.$field, transactional_id)
+        }
+        fn remember_previous_epoch(
+            &self,
+            producer_id: i64,
+            previous_epoch: i16,
+        ) -> $crate::kafka::error::Result<()> {
+            $via::remember_previous_epoch(&self.$field, producer_id, previous_epoch)
         }
     };
 }

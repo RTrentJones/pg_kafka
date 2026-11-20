@@ -23,6 +23,11 @@ ALTER TABLE kafka.topics ADD COLUMN IF NOT EXISTS retention_ms BIGINT;
 ALTER TABLE kafka.partition_offsets
     ADD COLUMN IF NOT EXISTS log_start_offset BIGINT NOT NULL DEFAULT 0;
 
+-- InitProducerId with a presented producer id and epoch (KIP-360): the epoch a retry of
+-- the producer's own last bump presents.
+ALTER TABLE kafka.producer_ids ADD COLUMN last_epoch SMALLINT;
+COMMENT ON COLUMN kafka.producer_ids.last_epoch IS 'Epoch before the last bump the producer requested itself (a retry of that InitProducerId gets the current epoch back); NULL after a fencing bump.';
+
 -- 1. Time-partition kafka.messages (ADR-001).
 --
 -- The populated 0.0.0 table is not rewritten: it is renamed to kafka.messages_legacy
