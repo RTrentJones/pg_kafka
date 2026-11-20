@@ -440,3 +440,67 @@ pub async fn test_time_partition_maintenance_and_least_privilege() -> TestResult
     println!("✅ Test PASSED\n");
     Ok(())
 }
+
+/// Retention keeps offsets monotonic for a partition that has no
+/// `kafka.partition_offsets` counter row (rows written by direct SQL, or before the
+/// counter existed): emptied by a whole-leaf drop or by row deletes, its next produce
+/// continues after the removed offsets instead of reusing 0.
+pub async fn test_retention_without_offset_counter_keeps_offsets() -> TestResult {
+    println!("=== Test: Retention Without an Offset Counter Keeps Offsets ===\n");
+    let ctx = TestContext::new().await?;
+    let db = ctx.db();
+    let dropped = ctx.unique_topic("part-nocounter-drop").await;
+    let deleted = ctx.unique_topic("part-nocounter-del").await;
+    let keeper = ctx.unique_topic("part-nocounter-keep").await;
+    let w = width_ms(db).await?;
+    let producer = create_producer()?;
+    let five: Vec<String> = (0..5).map(|i| format!("v{i}")).collect();
+
+    println!("Step 1: 5 records each, counters removed, rows aged into past leaves...");
+    produce(&producer, &dropped, &five).await?;
+    produce(&producer, &deleted, &five).await?;
+    produce(&producer, &keeper, &["keep".into()]).await?;
+    db.execute(
+        "DELETE FROM kafka.partition_offsets po USING kafka.topics t
+         WHERE t.id = po.topic_id AND t.name = ANY($1)",
+        &[&vec![dropped.clone(), deleted.clone()]],
+    )
+    .await?;
+    // `dropped` alone in a leaf (dropped whole); `deleted` shares one with an
+    // infinite-retention topic (row deletes).
+    backdate(db, &[(&dropped, 0, 4)], 40 * w).await?;
+    backdate(db, &[(&deleted, 0, 4), (&keeper, 0, 0)], 38 * w).await?;
+    db.query_one("SELECT pg_kafka_run_partition_maintenance()", &[])
+        .await?;
+    set_retention(db, &dropped, 10 * w).await?;
+    set_retention(db, &deleted, 10 * w).await?;
+    set_retention(db, &keeper, -1).await?;
+    println!("✅ Ready\n");
+
+    println!("Step 2: Sweep...");
+    let (expired, dropped_leaves) = sweep(db).await?;
+    println!("   expired_messages={expired} dropped_partitions={dropped_leaves}");
+    assert!(dropped_leaves >= 1 && expired >= 5);
+    assert_eq!(offsets_of(db, &dropped).await?, Vec::<i64>::new());
+    assert_eq!(offsets_of(db, &deleted).await?, Vec::<i64>::new());
+    for t in [&dropped, &deleted] {
+        assert_eq!(
+            log_start(db, t).await?,
+            5,
+            "{t}: log start after the removed offsets"
+        );
+    }
+    println!("✅ Both emptied; log start 5\n");
+
+    println!("Step 3: The next produce continues at 5...");
+    for t in [&dropped, &deleted] {
+        produce(&producer, t, &["after".into()]).await?;
+        assert_eq!(offsets_of(db, t).await?, vec![5], "{t}: no offset reuse");
+    }
+    println!("✅ Offset 5 on both\n");
+
+    ctx.cleanup().await?;
+    sweep(db).await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}

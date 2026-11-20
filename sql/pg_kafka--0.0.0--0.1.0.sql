@@ -359,15 +359,19 @@ $$;
 -- pending transactional row and every topic with rows in it is listed in
 -- p_expired_topics (the topics the caller found wholly expired in this leaf: its upper
 -- bound is older than the topic's retention window). Never drops the DEFAULT leaf.
--- Returns whether it dropped the leaf and the (topic_id, partition_id) pairs the leaf
--- held, so the caller advances their log_start_offset. Dropping a leaf is equivalent
--- to deleting its rows, which the worker may already do; the function grants no more.
+-- Returns whether it dropped the leaf, the (topic_id, partition_id) pairs the leaf
+-- held and, for each, the offset after the last one it held (MAX + 1, one btree descent
+-- per pair), so the caller advances their log_start_offset and keeps their offset
+-- counter past the dropped offsets even where no counter row existed. Dropping a leaf
+-- is equivalent to deleting its rows, which the worker may already do; the function
+-- grants no more.
 CREATE FUNCTION kafka.drop_message_partition(
     p_partition REGCLASS,
     p_expired_topics INT[],
     OUT dropped BOOLEAN,
     OUT topic_ids INT[],
-    OUT partition_ids INT[]
+    OUT partition_ids INT[],
+    OUT next_offsets BIGINT[]
 )
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
@@ -414,6 +418,12 @@ BEGIN
                    WHERE classid = 'pg_class'::regclass AND objid = p_partition AND deptype = 'e') THEN
             EXECUTE format('ALTER EXTENSION pg_kafka DROP TABLE %s', p_partition);
         END IF;
+        EXECUTE format(
+            'SELECT COALESCE(array_agg((SELECT MAX(l.partition_offset) + 1 FROM %s l
+                                        WHERE l.topic_id = u.t AND l.partition_id = u.p)
+                                       ORDER BY u.n), ''{}'')
+             FROM unnest($1, $2) WITH ORDINALITY AS u(t, p, n)', p_partition)
+        INTO next_offsets USING topic_ids, partition_ids;
         EXECUTE format('DROP TABLE %s', p_partition);
         dropped := true;
     EXCEPTION WHEN lock_not_available THEN
@@ -421,6 +431,7 @@ BEGIN
         dropped := false;
         topic_ids := NULL;
         partition_ids := NULL;
+        next_offsets := NULL;
     END;
 END;
 $$;
