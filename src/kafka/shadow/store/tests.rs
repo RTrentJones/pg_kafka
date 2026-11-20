@@ -102,26 +102,30 @@ fn test_unchanged_roles_are_delegated_to_the_inner_store() {
     store.record_producer_sequence(5, 7, 1, 9).unwrap();
 }
 
+/// A buffer created `age` ago.
+fn aged_buffer(age: Duration) -> PendingTxnBuffer {
+    let mut buf = PendingTxnBuffer::from(vec![buffered_record(1)]);
+    buf.first_buffered = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
+    buf
+}
+
 #[test]
-fn test_abort_timed_out_evicts_stale_pending_buffers() {
-    // The storage sweeper force-aborts timed-out transactions without
-    // routing through abort_transaction(), so a buffer for an abandoned
-    // producer must be evicted on the same timeout or it leaks forever.
+fn test_abort_timed_out_drops_the_buffers_of_ended_transactions() {
+    // The storage sweeper force-aborts timed-out transactions without routing
+    // through abort_transaction(): the buffer of a transaction that is no longer
+    // Ongoing must go (it can never be committed), whatever its age, and the
+    // buffer of an open transaction stays, even one older than the default
+    // timeout (its own transaction.timeout.ms may be longer).
     let mut mock = MockKafkaStore::new();
     mock.expect_abort_timed_out_transactions()
         .times(1)
-        .returning(|_| Ok(vec![]));
+        .returning(|_| Ok(vec!["abandoned".to_string()]));
 
     let store = ShadowStore::with_db(mock, InMemoryShadowDb::default());
+    store.db().state().ongoing_txns.insert((1, 0));
     {
         let mut pending = store.pending_txn_messages.write().unwrap();
-        // Stale: first_buffered older than the timeout we will sweep with.
-        let mut stale = PendingTxnBuffer::from(vec![buffered_record(1)]);
-        stale.first_buffered = Instant::now()
-            .checked_sub(Duration::from_secs(120))
-            .unwrap_or_else(Instant::now);
-        pending.insert((1, 0), stale);
-        // Fresh: just buffered, well within the timeout.
+        pending.insert((1, 0), aged_buffer(Duration::from_secs(120)));
         pending.insert((2, 0), PendingTxnBuffer::from(vec![buffered_record(1)]));
     }
 
@@ -131,13 +135,37 @@ fn test_abort_timed_out_evicts_stale_pending_buffers() {
 
     let pending = store.pending_txn_messages.read().unwrap();
     assert!(
-        !pending.contains_key(&(1, 0)),
-        "stale buffer should be evicted by the timeout sweep"
+        pending.contains_key(&(1, 0)),
+        "the open transaction's buffer stays"
     );
     assert!(
-        pending.contains_key(&(2, 0)),
-        "fresh buffer must be retained"
+        !pending.contains_key(&(2, 0)),
+        "the ended transaction's buffer goes"
     );
+}
+
+#[test]
+fn test_abort_timed_out_falls_back_to_age_when_the_lookup_fails() {
+    let mut mock = MockKafkaStore::new();
+    mock.expect_abort_timed_out_transactions()
+        .times(1)
+        .returning(|_| Ok(vec![]));
+
+    let store = ShadowStore::with_db(mock, InMemoryShadowDb::default());
+    store.db().state().fail_ongoing_lookup = true;
+    {
+        let mut pending = store.pending_txn_messages.write().unwrap();
+        pending.insert((1, 0), aged_buffer(Duration::from_secs(120)));
+        pending.insert((2, 0), PendingTxnBuffer::from(vec![buffered_record(1)]));
+    }
+
+    store
+        .abort_timed_out_transactions(Duration::from_secs(60))
+        .unwrap();
+
+    let pending = store.pending_txn_messages.read().unwrap();
+    assert!(!pending.contains_key(&(1, 0)), "stale buffer evicted");
+    assert!(pending.contains_key(&(2, 0)), "fresh buffer retained");
 }
 
 #[test]

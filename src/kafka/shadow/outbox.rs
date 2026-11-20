@@ -180,6 +180,10 @@ pub trait ShadowDb {
         producer_epoch: i16,
     ) -> Option<Vec<PendingForwardRecord>>;
 
+    /// Which of these `(producer_id, producer_epoch)` pairs have a transaction
+    /// still Ongoing in `kafka.transactions`. `None` if the lookup failed.
+    fn ongoing_transactions(&self, keys: &[(i64, i16)]) -> Option<Vec<(i64, i16)>>;
+
     /// Claim due outbox rows and return a forward record (payload, headers,
     /// timestamp, external topic name) for each, ordered by row key.
     ///
@@ -397,6 +401,41 @@ impl ShadowDb for SpiShadowDb {
             Ok(records) => Some(records),
             Err(e) => {
                 tracing::warn!("Shadow: failed to read pending txn records: {:?}", e);
+                None
+            }
+        }
+    }
+
+    fn ongoing_transactions(&self, keys: &[(i64, i16)]) -> Option<Vec<(i64, i16)>> {
+        use pgrx::prelude::*;
+        if keys.is_empty() {
+            return Some(Vec::new());
+        }
+        let producer_ids: Vec<i64> = keys.iter().map(|&(id, _)| id).collect();
+        let epochs: Vec<i16> = keys.iter().map(|&(_, epoch)| epoch).collect();
+        let result: std::result::Result<Vec<(i64, i16)>, spi::SpiError> = Spi::connect(|client| {
+            let table = client.select(
+                "SELECT t.producer_id, t.producer_epoch \
+                 FROM kafka.transactions t \
+                 JOIN unnest($1::int8[], $2::int2[]) AS k(id, epoch) \
+                   ON t.producer_id = k.id AND t.producer_epoch = k.epoch \
+                 WHERE t.state = 'Ongoing'",
+                None,
+                &[producer_ids.into(), epochs.into()],
+            )?;
+            let mut ongoing = Vec::new();
+            for row in table {
+                ongoing.push((
+                    row.get_by_name("producer_id")?.unwrap_or(0),
+                    row.get_by_name("producer_epoch")?.unwrap_or(0),
+                ));
+            }
+            Ok(ongoing)
+        });
+        match result {
+            Ok(ongoing) => Some(ongoing),
+            Err(e) => {
+                tracing::warn!("Shadow: failed to read the open transactions: {e:?}");
                 None
             }
         }

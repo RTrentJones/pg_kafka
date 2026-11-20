@@ -190,16 +190,19 @@ pub(super) fn check_member_timeouts(coordinator: &GroupCoordinator) {
 
 /// Abort transactions that outlived their timeout. An abort ends transactions, so
 /// parked read_committed fetches are woken now (their LSO moved) rather than on the
-/// long-poll safety net.
-pub(super) fn check_transaction_timeouts(notify_tx: &Sender<InternalNotification>) {
+/// long-poll safety net. The sweep runs through the shadow store, which also drops
+/// the forward buffers of the transactions it ended.
+pub(super) fn check_transaction_timeouts(
+    shadow_store: &ShadowStore<PostgresStore>,
+    notify_tx: &Sender<InternalNotification>,
+) {
     let names = TaskNames {
         task: "Transaction-timeout check",
         panic: "Transaction-timeout maintenance",
     };
     let mut aborted_any = false;
     let ran = run_maintenance_task(names, || {
-        let store = PostgresStore::new();
-        match store.abort_timed_out_transactions(DEFAULT_TRANSACTION_TIMEOUT) {
+        match shadow_store.abort_timed_out_transactions(DEFAULT_TRANSACTION_TIMEOUT) {
             Ok(aborted) => {
                 aborted_any = !aborted.is_empty();
                 for txn_id in aborted {

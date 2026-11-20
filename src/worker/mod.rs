@@ -364,7 +364,7 @@ impl MainLoop<'_> {
             self.member_timeouts.ran();
         }
         if self.txn_timeouts.is_due() {
-            check_transaction_timeouts(self.env.notify_tx);
+            check_transaction_timeouts(self.env.shadow_store, self.env.notify_tx);
             self.txn_timeouts.ran();
         }
         if self.retention_sweep.is_due() {

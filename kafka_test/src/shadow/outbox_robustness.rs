@@ -2,12 +2,15 @@
 //! - `pg_kafka.shadow_max_retries` refuses 0 (every record gets an attempt);
 //! - one topic's backlog does not starve another topic's records;
 //! - a full librdkafka queue holds back only the records behind it, not the
-//!   sync-mode response timeouts.
+//!   sync-mode response timeouts;
+//! - the transaction-timeout sweep drops the forward buffers of the
+//!   transactions it aborts.
 
 use crate::common::{create_db_client, create_producer, TestResult};
 use crate::setup::TestContext;
+use crate::worker::ServerLog;
 use rdkafka::config::ClientConfig;
-use rdkafka::producer::{FutureProducer, FutureRecord};
+use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 use std::time::{Duration, Instant};
 use tokio_postgres::Client;
 
@@ -290,6 +293,80 @@ pub async fn test_shadow_full_producer_queue_does_not_block_sync_timeouts() -> T
     alter_system(&db, "ALTER SYSTEM RESET pg_kafka.shadow_sync_timeout_ms").await?;
     restore_bootstrap_servers(&db).await?;
     result?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// A transaction left open by a producer that went away is aborted by the
+/// timeout sweep; the sweep also drops the records the shadow store buffered
+/// for it (they can never be committed), instead of keeping them for the life
+/// of the worker. Needs the server log (the listener's stderr as a file).
+pub async fn test_shadow_timed_out_transaction_buffer_is_dropped() -> TestResult {
+    println!("=== Test: the timeout sweep drops an abandoned transaction's buffer ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("shadow-txn-abandoned").await;
+    verify_external_kafka_ready().await?;
+    enable_shadow_mode(
+        ctx.db(),
+        &topic,
+        &config(ShadowMode::Shadow, SyncMode::Async),
+    )
+    .await?;
+    let log = ServerLog::open(ctx.db())
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or("the server log is not readable (listener stderr is not a regular file)")?;
+    let log_from = log.end();
+
+    println!("Step 1: a transactional produce, never committed (transaction.timeout.ms=2000)...");
+    let txn_id = format!("shadow-abandoned-{}", uuid::Uuid::new_v4());
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", crate::common::get_bootstrap_servers())
+        .set("broker.address.family", "v4")
+        .set("message.timeout.ms", "2000")
+        .set("transaction.timeout.ms", "2000")
+        .set("transactional.id", &txn_id)
+        .create()?;
+    producer.init_transactions(Duration::from_secs(10))?;
+    producer.begin_transaction()?;
+    producer
+        .send(
+            FutureRecord::to(&topic).key("k").payload("abandoned"),
+            Duration::from_secs(5),
+        )
+        .await
+        .map_err(|(e, _)| e)?;
+
+    println!("Step 2: wait for the sweep (every 10 s) to abort it...");
+    let needle = "forward buffer(s) of transactions that are no longer open";
+    let start = Instant::now();
+    loop {
+        if log.since(log_from).contains(needle) {
+            break;
+        }
+        if start.elapsed() > Duration::from_secs(40) {
+            drop(producer);
+            ctx.cleanup().await?;
+            return Err(format!(
+                "no \"{needle}\" in the server log within 40 s: the sweep kept the buffer"
+            )
+            .into());
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let state: String = ctx
+        .db()
+        .query_one(
+            "SELECT state FROM kafka.transactions WHERE transactional_id = $1",
+            &[&txn_id],
+        )
+        .await?
+        .get(0);
+    assert_eq!(state, "CompleteAbort");
+    println!("  buffer dropped after {:?}", start.elapsed());
+
+    drop(producer);
+    ctx.cleanup().await?;
     println!("✅ Test PASSED\n");
     Ok(())
 }

@@ -64,14 +64,9 @@ use std::time::{Duration, Instant};
 type TxnKey = (i64, i16);
 
 /// Buffered transactional forward records plus when the buffer was first
-/// created, so the timeout sweeper can evict an abandoned buffer.
-///
-/// `abort_timed_out_transactions` (the storage-layer sweeper) force-aborts a
-/// timed-out transaction directly in `kafka.transactions` and never routes
-/// through `abort_transaction()`, so without an age-based eviction the in-RAM
-/// buffer for a producer that opened a transaction and vanished would leak
-/// forever. `first_buffered` lets the override drop buffers older than the
-/// transaction timeout, matching the sweeper's own threshold.
+/// created. The timeout sweep drops the buffers of transactions that are no
+/// longer open (`ShadowStore::evict_ended_txn_buffers`); `first_buffered` is
+/// its fallback when the open transactions cannot be read.
 struct PendingTxnBuffer {
     records: Vec<PendingForwardRecord>,
     first_buffered: Instant,
@@ -570,6 +565,46 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
         failures.paused_until = Some(Instant::now() + pause);
         self.poll_requested.store(false, Ordering::Relaxed);
         n.is_power_of_two()
+    }
+
+    /// Drop the forward buffers of transactions that are no longer open.
+    ///
+    /// The storage-layer timeout sweep force-aborts a transaction directly in
+    /// `kafka.transactions` and never routes through `abort_transaction()`, and
+    /// a produce rolled back after buffering leaves its records here too, so
+    /// without this a producer that opened a transaction and vanished would
+    /// keep its buffer for the life of the worker. A buffer whose
+    /// `(producer_id, producer_epoch)` has no Ongoing transaction can never be
+    /// committed (a commit is looked up by that key) and goes. If the lookup
+    /// fails, buffers older than `max_age` (the sweep's timeout) go instead.
+    /// Returns how many were dropped.
+    pub fn evict_ended_txn_buffers(&self, max_age: Duration) -> usize {
+        let keys: std::collections::HashSet<TxnKey> = read_lock(&self.pending_txn_messages)
+            .keys()
+            .copied()
+            .collect();
+        if keys.is_empty() {
+            return 0;
+        }
+        let looked_up: Vec<TxnKey> = keys.iter().copied().collect();
+        let ongoing = self.db.ongoing_transactions(&looked_up);
+        let mut pending = write_lock(&self.pending_txn_messages);
+        let before = pending.len();
+        match ongoing {
+            Some(ongoing) => {
+                let ongoing: std::collections::HashSet<TxnKey> = ongoing.into_iter().collect();
+                // A buffer created after the lookup is kept: it was not looked up.
+                pending.retain(|key, _| ongoing.contains(key) || !keys.contains(key));
+            }
+            None => pending.retain(|_, buf| buf.first_buffered.elapsed() < max_age),
+        }
+        let evicted = before - pending.len();
+        if evicted > 0 {
+            crate::pg_log!(
+                "Shadow: dropped {evicted} forward buffer(s) of transactions that are no longer open"
+            );
+        }
+        evicted
     }
 
     /// Claim a batch of due outbox rows and hand them to the network thread
@@ -1152,24 +1187,7 @@ impl<S: KafkaStore, D: ShadowDb> TransactionStore for ShadowStore<S, D> {
 impl<S: KafkaStore, D: ShadowDb> MaintenanceStore for ShadowStore<S, D> {
     fn abort_timed_out_transactions(&self, timeout: Duration) -> Result<Vec<String>> {
         let aborted = self.inner.abort_timed_out_transactions(timeout)?;
-
-        // The storage-layer sweeper force-aborts timed-out transactions
-        // directly and never routes through abort_transaction(), so the in-RAM
-        // forward buffer for an abandoned producer would leak forever. Evict any
-        // buffer older than the same timeout the sweeper just applied.
-        {
-            let mut pending = write_lock(&self.pending_txn_messages);
-            let before = pending.len();
-            pending.retain(|_, buf| buf.first_buffered.elapsed() < timeout);
-            let evicted = before - pending.len();
-            if evicted > 0 {
-                tracing::debug!(
-                    "Shadow: evicted {} stale pending-txn forward buffer(s) on timeout sweep",
-                    evicted
-                );
-            }
-        }
-
+        self.evict_ended_txn_buffers(timeout);
         Ok(aborted)
     }
 

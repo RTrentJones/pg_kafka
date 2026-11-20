@@ -65,6 +65,10 @@ pub struct State {
     pub configs: Option<Vec<TopicShadowConfig>>,
     /// Make `pending_txn_records` fail (None).
     pub fail_pending_txn_lookup: bool,
+    /// `(producer_id, producer_epoch)` of the Ongoing transactions.
+    pub ongoing_txns: std::collections::HashSet<(i64, i16)>,
+    /// Make `ongoing_transactions` fail (None).
+    pub fail_ongoing_lookup: bool,
     /// Make `claim_due_outbox_rows` fail.
     pub fail_claim: bool,
     /// What `current_transaction_id` returns.
@@ -302,6 +306,19 @@ impl ShadowDb for InMemoryShadowDb {
                     row,
                     key: m.key.clone(),
                 })
+                .collect(),
+        )
+    }
+
+    fn ongoing_transactions(&self, keys: &[(i64, i16)]) -> Option<Vec<(i64, i16)>> {
+        let s = self.state();
+        if s.fail_ongoing_lookup {
+            return None;
+        }
+        Some(
+            keys.iter()
+                .copied()
+                .filter(|k| s.ongoing_txns.contains(k))
                 .collect(),
         )
     }
