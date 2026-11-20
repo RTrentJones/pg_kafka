@@ -27,6 +27,7 @@ use kafka_protocol::records::Compression;
 use tracing::debug;
 
 use super::decode_budget::DecodeBudget;
+use crate::kafka::constants::ERROR_UNSUPPORTED_COMPRESSION_TYPE;
 use crate::kafka::error::{KafkaError, Result};
 use crate::kafka::messages::{ProducerMetadata, Record, RecordHeader};
 
@@ -164,9 +165,6 @@ fn check_after_batch(rest: &[u8]) -> Result<()> {
         _ => Ok(()),
     }
 }
-
-/// UNSUPPORTED_COMPRESSION_TYPE: zstd on Produce before v7.
-pub const ERROR_UNSUPPORTED_COMPRESSION_TYPE: i16 = 76;
 
 /// What Kafka 3.7 checks of a Produce partition's data while it parses the request
 /// (`ProduceRequest.validateRecords`), before any batch is read: one record batch of magic

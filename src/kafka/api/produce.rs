@@ -418,8 +418,8 @@ fn emit_produce_notifications<S: TopicStore + LogStore + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kafka::constants::ERROR_UNSUPPORTED_COMPRESSION_TYPE;
     use crate::kafka::protocol::recordbatch_test_batches::{batch_with, record, v, Header};
-    use crate::kafka::protocol::ERROR_UNSUPPORTED_COMPRESSION_TYPE;
     use kafka_protocol::messages::produce_request::{
         PartitionProduceData as WirePartition, TopicProduceData as WireTopic,
     };

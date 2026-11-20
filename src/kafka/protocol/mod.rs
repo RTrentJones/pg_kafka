@@ -25,6 +25,5 @@ pub use decoding::parse_request;
 pub use encoding::encode_response;
 pub use recordbatch::{
     least_decoded_memory, parse_record_batch, parse_record_batch_with_metadata,
-    validate_produce_records, ParsedRecordBatch, ERROR_UNSUPPORTED_COMPRESSION_TYPE, HEADER_MEMORY,
-    RECORD_MEMORY,
+    validate_produce_records, ParsedRecordBatch, HEADER_MEMORY, RECORD_MEMORY,
 };

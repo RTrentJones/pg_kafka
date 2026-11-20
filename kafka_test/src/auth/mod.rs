@@ -13,7 +13,7 @@
 //! certificates with the `openssl` CLI into `$TMPDIR/pg_kafka_auth_e2e-<pid>`, points the
 //! TLS GUCs at them with ALTER SYSTEM, reloads, and restarts the `pg_kafka_listener`
 //! worker (listener settings are read at worker start), then creates a Kafka user. The
-//! last test ([`test_auth_teardown_restores_default_listeners`]) resets the GUCs and
+//! last test ([`tests::test_auth_teardown_restores_default_listeners`]) resets the GUCs and
 //! restarts the worker again, so the server is left as it was.
 //!
 //! Requirements: the test process runs on the database host (the server reads the

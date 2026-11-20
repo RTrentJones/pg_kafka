@@ -360,10 +360,10 @@ the log:
   clients that do their own abort filtering too (verified with the Java consumer and
   librdkafka); what differs from Kafka is the byte-level batch layout and that
   `read_uncommitted` consumers do not see aborted records once the cleanup deleted them.
-- Header order is preserved (headers are stored as an ordered array of pairs), but
-  duplicate header keys collapse to the last value: the kafka-protocol record type
-  holds headers in a map on both decode and encode. Kafka's wire format permits
-  duplicate keys.
+- Headers are stored as an ordered array of pairs, duplicate keys included, but a fetch
+  returns duplicate header keys collapsed to the last value, in the position of the first:
+  the kafka-protocol record type the fetch encodes with holds headers in a map. Kafka's
+  wire format permits duplicate keys.
 
 Related minor deviations: `throttle_time_ms` is always 0 (no quota system) and
 `log_append_time_ms` is always -1 (LogAppendTime timestamp type is not

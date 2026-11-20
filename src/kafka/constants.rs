@@ -300,6 +300,8 @@ pub const ERROR_UNKNOWN_PRODUCER_ID: i16 = 59;
 pub const ERROR_NON_EMPTY_GROUP: i16 = 68;
 /// GROUP_ID_NOT_FOUND.
 pub const ERROR_GROUP_ID_NOT_FOUND: i16 = 69;
+/// UNSUPPORTED_COMPRESSION_TYPE: zstd on Produce before v7.
+pub const ERROR_UNSUPPORTED_COMPRESSION_TYPE: i16 = 76;
 /// GROUP_MAX_SIZE_REACHED: the consumer group has its configured maximum of members.
 pub const ERROR_GROUP_MAX_SIZE_REACHED: i16 = 81;
 /// INVALID_RECORD: a record (or record batch) failed broker-side validation, e.g. a
