@@ -81,5 +81,6 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         lag_view::test_shadow_lag_view_is_per_partition,
         // Outbox under stress and failure
         outbox_robustness::test_shadow_max_retries_refuses_zero: sequential,
+        outbox_robustness::test_shadow_backlog_does_not_starve_other_topics: sequential,
     ]
 }

@@ -45,8 +45,8 @@ use super::outbox::{
 use super::primary::PrimaryStatus;
 use super::routing::{make_forward_decision, ForwardDecision};
 use super::{
-    lock, read_lock, write_lock, ForwardAck, ForwardOutcome, ForwardRecord, ForwardRequest,
-    HeldRelease, RowKey, SyncHold,
+    lock, read_lock, write_lock, ForwardAck, ForwardOutcome, ForwardRequest, HeldRelease, RowKey,
+    SyncHold,
 };
 use crate::kafka::error::{KafkaError, Result};
 use crate::kafka::messages::Record;
@@ -595,7 +595,7 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
             return Ok(0);
         }
 
-        let records: Vec<ForwardRecord> = self
+        let claim = self
             .db
             .claim_due_outbox_rows(&OutboxClaim {
                 batch_limit: i64::try_from(limit).unwrap_or(i64::MAX),
@@ -607,7 +607,8 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
             .map_err(|e: KafkaError| {
                 super::error::ShadowError::DatabaseError(format!("outbox poll failed: {e}"))
             })?;
-        let claimed = records.len();
+        let more_due = claim.more_due(limit);
+        let records = claim.records;
 
         let mut dispatched = 0usize;
         let mut not_sent: Vec<RowKey> = Vec::new();
@@ -635,8 +636,9 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
                 .apply_not_attempted(&not_sent)
                 .map_err(|e| super::error::ShadowError::DatabaseError(e.to_string()))?;
         }
-        // A full claim means more rows are probably due: poll again at once.
-        if claimed >= limit {
+        // A full claim, or a partition that used its whole share, means more
+        // rows are probably due: poll again at once.
+        if more_due {
             self.poll_requested.store(true, Ordering::Relaxed);
         }
         Ok(dispatched)

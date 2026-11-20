@@ -12,6 +12,8 @@
 use super::*;
 use crate::kafka::shadow::config::ShadowMode;
 use crate::kafka::shadow::outbox::fake::InMemoryShadowDb;
+use crate::kafka::shadow::outbox::per_partition_claim_cap;
+use crate::kafka::shadow::ForwardRecord;
 use crate::testing::mocks::MockKafkaStore;
 
 const T: i32 = 7;
@@ -551,6 +553,51 @@ fn batch_size_bounds_the_claim_and_requests_another_poll() {
     assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 1);
     assert!(!h.store.outbox_tick_due(Duration::ZERO));
     assert!(h.store.outbox_tick_due(OUTBOX_POLL_INTERVAL));
+}
+
+#[test]
+fn a_backlog_does_not_starve_other_partitions() {
+    // Topic T has a 100-row backlog (a replay, an outage); topic T + 1 then gets
+    // one record. The claim shares the batch between the partitions, so the
+    // second topic's record goes out with the first claim instead of waiting
+    // behind the whole backlog (and a sync-mode response behind its timeout).
+    let h = async_harness(256);
+    h.store.db().add_topic(T + 1, "other", None);
+    h.store.db().state().settings.batch_size = 10;
+    let backlog: Vec<RowKey> = (0..100).map(|o| RowKey::new(T, 0, o)).collect();
+    seed_rows(&h.store, &backlog);
+    seed_rows(&h.store, &[RowKey::new(T + 1, 0, 0)]);
+
+    assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 6);
+    let sent = sent_records(&h);
+    let keys: Vec<RowKey> = sent.iter().map(|r| r.row).collect();
+    let mut expected: Vec<RowKey> = (0..5).map(|o| RowKey::new(T, 0, o)).collect();
+    expected.push(RowKey::new(T + 1, 0, 0));
+    assert_eq!(
+        keys, expected,
+        "the backlog's lowest offsets, then the other topic"
+    );
+    assert!(
+        h.store.outbox_tick_due(Duration::ZERO),
+        "the backlog used its whole share: poll again at once"
+    );
+
+    // Once the other topic's record is delivered, the next claim continues the
+    // backlog in order, now alone: the whole batch.
+    h.acks.send(ok_ack(RowKey::new(T + 1, 0, 0), 0)).unwrap();
+    h.store.drain_forward_acks();
+    assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 10);
+    assert_eq!(offsets(&sent_records(&h)), (5..15).collect::<Vec<_>>());
+}
+
+#[test]
+fn the_partition_share_is_an_equal_split_of_at_least_one() {
+    assert_eq!(per_partition_claim_cap(1000, 1), 1000);
+    assert_eq!(per_partition_claim_cap(1000, 0), 1000);
+    assert_eq!(per_partition_claim_cap(10, 2), 5);
+    assert_eq!(per_partition_claim_cap(10, 3), 4);
+    assert_eq!(per_partition_claim_cap(10, 40), 1);
+    assert_eq!(per_partition_claim_cap(0, 3), 1);
 }
 
 #[test]
