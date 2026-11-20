@@ -2,7 +2,7 @@
 //! writes and offsets, commit and abort.
 
 use super::log::TxnStamp;
-use super::producers::{bump_producer_epoch, clear_producer_sequences, insert_producer_id};
+use super::producers::{bump_producer_epoch, insert_producer_id, reset_producer_sequences};
 use super::{internal, internal_unless, is_txn_error, PostgresStore};
 use crate::kafka::error::{KafkaError, Result};
 use crate::kafka::messages::Record;
@@ -138,7 +138,7 @@ fn fence_previous_epoch(
         None,
         &[transactional_id.into()],
     )?;
-    clear_producer_sequences(client, producer_id)?;
+    reset_producer_sequences(client, producer_id)?;
 
     let (new_producer_id, new_epoch) = bump_producer_epoch(client, producer_id, old_epoch)?;
     crate::pg_debug!(

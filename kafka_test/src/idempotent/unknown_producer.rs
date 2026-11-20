@@ -8,6 +8,13 @@ use crate::fixtures::topic_with_partitions as topic;
 use crate::setup::TestContext;
 use crate::wire::records::batch;
 use crate::wire::Wire;
+use bytes::Bytes;
+use kafka_protocol::messages::produce_request::{
+    PartitionProduceData, ProduceRequest, TopicProduceData,
+};
+use kafka_protocol::messages::produce_response::ProduceResponse;
+use kafka_protocol::messages::TopicName;
+use kafka_protocol::protocol::StrBytes;
 use rdkafka::producer::FutureRecord;
 use std::time::Duration;
 use tokio_postgres::Client;
@@ -161,6 +168,114 @@ pub async fn test_idempotent_producer_survives_pruned_state() -> TestResult {
         send(format!("after-{i}")).await?;
     }
     assert_eq!(row_count(db, &t).await?, 4);
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// One Produce v7 request carrying a batch for each of `batches` (partition, records):
+/// `(partition, error_code, base_offset)` per partition, in partition order.
+async fn produce_partitions(
+    w: &mut Wire,
+    topic: &str,
+    batches: Vec<(i32, Bytes)>,
+) -> Result<Vec<(i32, i16, i64)>, Box<dyn std::error::Error>> {
+    let mut t = TopicProduceData::default();
+    t.name = TopicName(StrBytes::from_string(topic.to_string()));
+    t.partition_data = batches
+        .into_iter()
+        .map(|(index, records)| {
+            let mut p = PartitionProduceData::default();
+            p.index = index;
+            p.records = Some(records);
+            p
+        })
+        .collect();
+    let mut req = ProduceRequest::default();
+    req.acks = -1;
+    req.timeout_ms = 10_000;
+    req.topic_data = vec![t];
+    let resp: ProduceResponse = w.call(7, &req).await?;
+    let mut out: Vec<(i32, i16, i64)> = resp
+        .responses
+        .iter()
+        .flat_map(|t| t.partition_responses.iter())
+        .map(|p| (p.index, p.error_code, p.base_offset))
+        .collect();
+    out.sort_unstable();
+    Ok(out)
+}
+
+/// A producer whose state was pruned resumes on several partitions at once, each at the
+/// sequence it had reached there: Kafka keeps producer state per partition and accepts
+/// any first sequence on a partition without state, so the second and later partitions
+/// of the request must not be judged against an expected sequence of 0.
+pub async fn test_pruned_producer_resumes_on_every_partition() -> TestResult {
+    println!("=== Test: Pruned Producer Resumes On Every Partition ===\n");
+    let ctx = TestContext::new().await?;
+    let db = ctx.db();
+    let t = topic(&ctx, "idem-pruned-parts", 3).await?;
+    let mut w = Wire::connect().await?;
+    let (err, pid, ep) = w.init_producer_id(None, 60_000).await?;
+    assert_eq!(err, error_codes::NONE);
+    let b = |values: &[&str], seq: i32| batch(values, pid, ep, seq, false, None);
+
+    println!("Step 1: Sequences 0.. on three partitions, then the state is pruned...");
+    assert_eq!(
+        produce_partitions(
+            &mut w,
+            &t,
+            vec![
+                (0, b(&["a0", "a1"], 0)),
+                (1, b(&["b0", "b1", "b2"], 0)),
+                (2, b(&["c0"], 0)),
+            ],
+        )
+        .await?,
+        vec![
+            (0, error_codes::NONE, 0),
+            (1, error_codes::NONE, 0),
+            (2, error_codes::NONE, 0)
+        ]
+    );
+    forget_producer(db, pid).await?;
+    println!("✅ Pruned\n");
+
+    println!("Step 2: One request continuing every partition at its own sequence...");
+    let resume = || {
+        vec![
+            (0, b(&["a2"], 2)),
+            (1, b(&["b3", "b4"], 3)),
+            (2, b(&["c1"], 1)),
+        ]
+    };
+    let expected = vec![
+        (0, error_codes::NONE, 2),
+        (1, error_codes::NONE, 3),
+        (2, error_codes::NONE, 1),
+    ];
+    assert_eq!(
+        produce_partitions(&mut w, &t, resume()).await?,
+        expected,
+        "every partition is accepted at its sequence"
+    );
+    assert_eq!(
+        produce_partitions(&mut w, &t, resume()).await?,
+        expected,
+        "the retry is a duplicate on every partition, with its original offsets"
+    );
+    assert_eq!(
+        w.produce(&t, 1, b(&["x"], 9), None).await?.0,
+        error_codes::OUT_OF_ORDER_SEQUENCE_NUMBER,
+        "each partition's sequence is tracked again"
+    );
+    println!("✅ Accepted, then deduplicated\n");
+
+    assert_eq!(
+        row_count(db, &t).await?,
+        10,
+        "nothing twice, nothing dropped"
+    );
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");
     Ok(())

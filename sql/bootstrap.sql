@@ -566,7 +566,7 @@ CREATE TABLE kafka.producer_sequences (
     producer_id BIGINT NOT NULL,
     topic_id INT NOT NULL,
     partition_id INT NOT NULL,
-    last_sequence INT NOT NULL DEFAULT -1,  -- Last successfully written sequence (-1 = none)
+    last_sequence INT NOT NULL DEFAULT -1,  -- Last successfully written sequence (-1 = none at this epoch)
     updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
     CHECK (partition_id >= 0),
     PRIMARY KEY (producer_id, topic_id, partition_id),
@@ -598,7 +598,8 @@ COMMENT ON COLUMN kafka.producer_sequences.last_sequence IS 'Last successfully w
 -- on every partition: their sequence range and base offset, so a retried batch is
 -- answered with its original offset and anything else out of sequence is refused.
 -- Rows belong to the current epoch only: every epoch change deletes the producer's
--- kafka.producer_sequences rows, and this table follows them (ON DELETE CASCADE).
+-- batches (its kafka.producer_sequences rows stay, at last_sequence -1: the new epoch
+-- starts at 0 there), and they go with their producer_sequences row (ON DELETE CASCADE).
 CREATE TABLE kafka.producer_batches (
     producer_id BIGINT NOT NULL,
     topic_id INT NOT NULL,

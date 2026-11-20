@@ -90,22 +90,25 @@ pg_kafka.compression_type = 'gzip'
 - ✅ Anything else out of sequence (a gap, an overlap, a range at or below the last
   sequence that was never written, a retry older than the 5 cached batches) is
   OUT_OF_ORDER_SEQUENCE_NUMBER (45); sequences wrap from 2147483647 to 0
+- ✅ Producer state is per partition, as in Kafka: a producer's first batch on a partition
+  where it has no state is accepted at any sequence and tracked from there
 - ✅ Epochs: a Produce with an epoch older than the producer's current one gets
   INVALID_PRODUCER_EPOCH (47), what Kafka 3.7 answers on Produce for idempotent and
   transactional producers alike; a higher epoch (an idempotent producer bumping its own
-  epoch, KIP-360, as the Java client does) is accepted when it starts at sequence 0 and
-  becomes the producer's epoch
+  epoch, KIP-360, as the Java client does) becomes the producer's epoch, and on every
+  partition where the producer wrote at an earlier epoch its first batch at the new epoch
+  must start at sequence 0 (any sequence on a partition where it has no state)
 - ✅ PostgreSQL advisory locks for sequence serialization
 - ✅ A producer the broker holds no state for (a producer id with no `kafka.producer_ids`
   row: removed by the retention sweep after 7 idle days, lost with DROP EXTENSION, or never
   issued here) is accepted as Kafka 3.7 accepts it (KIP-360): its batch is written at
   whatever sequence it carries, the producer is recorded at the epoch it presents, and its
-  later batches are deduplicated and sequence-checked from there. InitProducerId never
-  hands out a producer id that is recorded this way.
-- **Deviation:** a producer that has state, but none on this partition, must start at
-  sequence 0 there (OUT_OF_ORDER_SEQUENCE_NUMBER otherwise). Kafka keeps producer state
-  per partition and accepts any first sequence on a partition with none; pg_kafka keeps
-  the epoch per producer and refuses a first batch whose predecessors never arrived.
+  later batches are deduplicated and sequence-checked from there, on every partition.
+  InitProducerId never hands out a producer id that is recorded this way.
+- **Deviation:** the epoch is kept per producer, not per partition: a batch at an epoch
+  older than the producer's current one is INVALID_PRODUCER_EPOCH on every partition.
+  Kafka compares the epoch with the producer's state on the batch's partition only and
+  accepts an older epoch on a partition where the producer has no state.
 - Produce responses report `log_append_time_ms = -1` (topics use CreateTime)
 
 **Client Impact:**
