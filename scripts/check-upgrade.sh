@@ -116,7 +116,7 @@ WHERE n.nspname = 'kafka' ORDER BY 1;
 -- install's, not only its signature and ACL (for a C function it is the symbol name).
 SELECT 'function ' || p.oid::regprocedure::text || ' ' || coalesce(p.proacl::text, 'default')
        || ' secdef=' || p.prosecdef || ' ' || coalesce(array_to_string(p.proconfig, ','), '')
-       || ' returns ' || pg_get_function_result(p.oid) || ' ' || p.provolatile
+       || ' returns ' || pg_get_function_result(p.oid) || ' ' || p.provolatile::text
        || ' src=' || md5(p.prosrc)
 FROM pg_proc p JOIN pg_depend d ON d.objid = p.oid AND d.deptype = 'e'
 JOIN pg_extension e ON e.oid = d.refobjid AND e.extname = 'pg_kafka'
