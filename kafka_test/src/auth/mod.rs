@@ -309,6 +309,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         tests::test_auth_unauthenticated_request_rejected: sequential,
         pre_auth::test_auth_pre_auth_api_versions_skips_db_thread: sequential,
         pre_auth::test_auth_unanswered_lookup_closes_without_failing_authentication: sequential,
+        pre_auth::test_auth_corrupt_stored_credential_fails_authentication: sequential,
         tests::test_auth_plaintext_listener_unaffected: sequential,
         tests::test_auth_tls_roundtrip_and_untrusted_ca: sequential,
         tests::test_auth_sasl_ssl_roundtrip: sequential,

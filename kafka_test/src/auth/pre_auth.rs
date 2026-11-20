@@ -1,6 +1,7 @@
 //! Before SASL authentication, ApiVersions is answered by the network thread: an
 //! anonymous peer cannot put work on the single DB thread. A credential lookup the DB
-//! thread cannot answer closes the connection instead of failing the authentication.
+//! thread cannot answer closes the connection instead of failing the authentication;
+//! a stored credential that is unusable fails it.
 
 use super::{auth_env, PASSWORD, PLAINTEXT_PORT, SASL_PLAINTEXT_PORT, USER};
 use crate::common::{create_db_client, TestResult};
@@ -140,5 +141,87 @@ pub async fn test_auth_unanswered_lookup_closes_without_failing_authentication()
     let au = roundtrip(&mut s, 2, 2, &plain_authenticate()).await?;
     assert_eq!(au.error_code, 0, "the retried login succeeds");
     println!("✅ the retried login succeeds once the DB thread serves\n");
+    Ok(())
+}
+
+/// A user whose stored credential is corrupt (here a StoredKey of the wrong length, which
+/// the table's constraints let through) fails authentication like a wrong password:
+/// PLAIN is answered SASL_AUTHENTICATION_FAILED and SCRAM runs its exchange as for an
+/// unknown user. A corrupt row is permanent, so closing the connection unanswered (as for
+/// a lookup the DB thread could not answer) would have the client reconnect forever, and
+/// would tell this user apart from an unknown one.
+pub async fn test_auth_corrupt_stored_credential_fails_authentication() -> TestResult {
+    const CORRUPT_USER: &str = "e2e-auth-corrupt";
+    println!("=== Test: a corrupt stored credential fails authentication ===\n");
+    auth_env().await?;
+    let db = create_db_client().await?;
+    db.execute("SELECT pg_kafka_drop_user($1)", &[&CORRUPT_USER])
+        .await?;
+    db.execute(
+        "SELECT pg_kafka_create_user($1, 'pw-corrupt')",
+        &[&CORRUPT_USER],
+    )
+    .await?;
+    let corrupted = db
+        .execute(
+            "UPDATE kafka.sasl_credentials SET stored_key = '\\x00'::bytea WHERE username = $1",
+            &[&CORRUPT_USER],
+        )
+        .await?;
+    println!("Step 1: {corrupted} stored credential(s) of {CORRUPT_USER} corrupted");
+
+    let outcome = async {
+        let answer_within = Duration::from_secs(5);
+        let mut s = TcpStream::connect(("127.0.0.1", SASL_PLAINTEXT_PORT)).await?;
+        let hs = roundtrip(&mut s, 1, 1, &plain_handshake()).await?;
+        assert_eq!(hs.error_code, 0);
+        let mut token = SaslAuthenticateRequest::default();
+        token.auth_bytes = Bytes::from(format!("\0{CORRUPT_USER}\0pw-corrupt").into_bytes());
+        let plain = tokio::time::timeout(answer_within, roundtrip(&mut s, 2, 2, &token))
+            .await
+            .map_err(|_| "PLAIN: SaslAuthenticate neither answered nor closed within 5 s")?
+            .map_err(|e| {
+                format!("PLAIN: closed without an answer ({e}); expected an auth failure")
+            })?;
+        println!("Step 2: PLAIN answered with error {}", plain.error_code);
+
+        let mut s = TcpStream::connect(("127.0.0.1", SASL_PLAINTEXT_PORT)).await?;
+        let mut hs = SaslHandshakeRequest::default();
+        hs.mechanism = StrBytes::from_static_str("SCRAM-SHA-256");
+        let hs = roundtrip(&mut s, 1, 1, &hs).await?;
+        assert_eq!(hs.error_code, 0);
+        let mut first = SaslAuthenticateRequest::default();
+        first.auth_bytes = Bytes::from(format!("n,,n={CORRUPT_USER},r=e2enonce").into_bytes());
+        let scram = tokio::time::timeout(answer_within, roundtrip(&mut s, 2, 2, &first))
+            .await
+            .map_err(|_| "SCRAM: client-first neither answered nor closed within 5 s")?
+            .map_err(|e| format!("SCRAM: closed without an answer ({e}); expected server-first"))?;
+        println!(
+            "Step 3: SCRAM client-first answered with error {} and {:?}",
+            scram.error_code,
+            String::from_utf8_lossy(&scram.auth_bytes)
+        );
+        Ok::<_, Box<dyn std::error::Error>>((plain, scram))
+    }
+    .await
+    .map_err(|e| e.to_string());
+    db.execute("SELECT pg_kafka_drop_user($1)", &[&CORRUPT_USER])
+        .await?;
+
+    let (plain, scram) = outcome?;
+    assert_eq!(
+        plain.error_code,
+        crate::error_codes::SASL_AUTHENTICATION_FAILED,
+        "PLAIN with a corrupt stored credential fails authentication"
+    );
+    assert_eq!(
+        scram.error_code, 0,
+        "SCRAM answers server-first as for any user"
+    );
+    assert!(
+        scram.auth_bytes.starts_with(b"r=e2enonce"),
+        "server-first continues the client's nonce"
+    );
+    println!("✅ Test PASSED\n");
     Ok(())
 }
