@@ -118,6 +118,12 @@ fn offsets(records: &[ForwardRecord]) -> Vec<i64> {
     records.iter().map(|r| r.row.local_offset).collect()
 }
 
+/// Whether the next outbox tick is requested at once (the worker cuts its
+/// receive wait short).
+fn requested(h: &Harness) -> bool {
+    h.store.outbox_requested_wait(Duration::ZERO).is_some()
+}
+
 #[test]
 fn produce_writes_one_pending_outbox_row_per_record() {
     let mut mock = MockKafkaStore::new();
@@ -553,12 +559,9 @@ fn batch_size_bounds_the_claim_and_requests_another_poll() {
     );
 
     assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 2);
-    assert!(
-        h.store.outbox_tick_due(Duration::ZERO),
-        "full claim: poll again"
-    );
+    assert!(requested(&h), "full claim: poll again");
     assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 1);
-    assert!(!h.store.outbox_tick_due(Duration::ZERO));
+    assert!(!requested(&h));
     assert!(h.store.outbox_tick_due(OUTBOX_POLL_INTERVAL));
 }
 
@@ -585,7 +588,7 @@ fn a_backlog_does_not_starve_other_partitions() {
         "the backlog's lowest offsets, then the other topic"
     );
     assert!(
-        h.store.outbox_tick_due(Duration::ZERO),
+        requested(&h),
         "the backlog used its whole share: poll again at once"
     );
 
@@ -641,10 +644,7 @@ fn partitions_with_nothing_due_take_no_share_of_the_claim() {
 
     assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 100);
     assert_eq!(offsets(&sent_records(&h)), (0..100).collect::<Vec<_>>());
-    assert!(
-        h.store.outbox_tick_due(Duration::ZERO),
-        "a full claim asks for another one at once"
-    );
+    assert!(requested(&h), "a full claim asks for another one at once");
     assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 100);
     assert_eq!(offsets(&sent_records(&h)), (100..200).collect::<Vec<_>>());
 }
@@ -666,7 +666,7 @@ fn nothing_due_asks_for_no_immediate_poll() {
     );
     assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 1);
     assert!(
-        !h.store.outbox_tick_due(Duration::ZERO),
+        !requested(&h),
         "a row the full channel refused waits for the next interval"
     );
     drop(sent_records(&h));
@@ -675,7 +675,7 @@ fn nothing_due_asks_for_no_immediate_poll() {
     assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 1);
     drop(sent_records(&h));
     assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 0);
-    assert!(!h.store.outbox_tick_due(Duration::ZERO), "nothing due");
+    assert!(!requested(&h), "nothing due");
 }
 
 #[test]
@@ -959,7 +959,7 @@ fn committed_sync_rows_are_reported_per_request_and_request_a_poll() {
     assert_eq!(holds.get(&slot), Some(&vec![RowKey::new(T, 0, 10)]));
     assert!(!holds.contains_key(&other));
     assert!(h.store.sync_pending.lock().unwrap().is_empty());
-    assert!(h.store.outbox_tick_due(Duration::ZERO));
+    assert!(requested(&h));
     // The DB thread did not wait for anything; the poll sends the row.
     assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 1);
 }
@@ -971,7 +971,7 @@ fn rolled_back_sync_rows_are_not_held() {
     h.store.insert_records(T, 0, &[record(b"a", b"1")]).unwrap();
     // xid 77 never committed (the request's subtransaction rolled back).
     assert!(h.store.take_sync_holds().is_empty());
-    assert!(!h.store.outbox_tick_due(Duration::ZERO));
+    assert!(!requested(&h));
 }
 
 #[test]
@@ -1018,4 +1018,82 @@ fn hold_goes_to_the_forwarder_or_is_released_at_once() {
         }),
     );
     assert_eq!(released.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn a_requested_tick_waits_for_the_minimum_spacing() {
+    let h = async_harness(64);
+    h.store.db().state().settings.batch_size = 1;
+    seed_rows(&h.store, &[RowKey::new(T, 0, 1), RowKey::new(T, 0, 2)]);
+    assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 1);
+    assert_eq!(
+        h.store.outbox_requested_wait(Duration::ZERO),
+        Some(OUTBOX_MIN_TICK_SPACING)
+    );
+    assert!(
+        !h.store.outbox_tick_due(Duration::ZERO),
+        "right after a tick"
+    );
+    assert!(h.store.outbox_tick_due(OUTBOX_MIN_TICK_SPACING));
+    assert_eq!(
+        h.store.outbox_requested_wait(OUTBOX_MIN_TICK_SPACING),
+        Some(Duration::ZERO)
+    );
+}
+
+#[test]
+fn no_broker_configured_claims_nothing() {
+    // The forwarder answers every record NotAttempted without a broker, which
+    // leaves it due again: a claim would only churn the outbox.
+    let h = async_harness(64);
+    h.store.db().state().bootstrap_unset = true;
+    h.store.db().state().settings.batch_size = 2;
+    let keys = [
+        RowKey::new(T, 0, 1),
+        RowKey::new(T, 0, 2),
+        RowKey::new(T, 0, 3),
+    ];
+    seed_rows(&h.store, &keys);
+    assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 0);
+    assert_eq!(sent_records(&h).len(), 0, "nothing sent");
+    assert!(!requested(&h));
+    for key in keys {
+        let row = h.store.db().row(key).unwrap();
+        assert!(!row.attempt_open, "the row was not claimed");
+        assert_eq!(row.retry_count, 0);
+    }
+    // Once a broker is configured the rows go out.
+    h.store.db().state().bootstrap_unset = false;
+    assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 2);
+}
+
+#[test]
+fn acks_all_not_attempted_ask_for_no_immediate_poll() {
+    // The forwarder answering without sending gives the rows back due at
+    // once: a claim right after would take them again, and again.
+    let h = async_harness(64);
+    h.store.db().state().settings.batch_size = 2;
+    let keys = [
+        RowKey::new(T, 0, 1),
+        RowKey::new(T, 0, 2),
+        RowKey::new(T, 0, 3),
+        RowKey::new(T, 0, 4),
+    ];
+    seed_rows(&h.store, &keys);
+    assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 2);
+    assert!(requested(&h), "full claim: poll again");
+    for record in sent_records(&h) {
+        h.acks.send(skipped_ack(record.row)).unwrap();
+    }
+    assert_eq!(drain(&h), 2);
+    assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 2);
+    assert!(!requested(&h), "every drained ack was NotAttempted");
+
+    // A delivery among the acks: the forwarder is sending, a full claim asks again.
+    let sent = sent_records(&h);
+    h.acks.send(ok_ack(sent[0].row, 1)).unwrap();
+    h.acks.send(skipped_ack(sent[1].row)).unwrap();
+    assert_eq!(drain(&h), 2);
+    assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 2);
+    assert!(requested(&h));
 }

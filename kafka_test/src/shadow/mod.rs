@@ -87,5 +87,6 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         outbox_robustness::test_shadow_ack_application_error_loses_no_ack: sequential,
         outbox_robustness::test_shadow_failed_tick_commit_loses_no_ack: sequential,
         outbox_robustness::test_shadow_stuck_partitions_do_not_throttle_a_backlog: sequential,
+        outbox_robustness::test_shadow_unconfigured_broker_does_not_spin_the_worker: sequential,
     ]
 }

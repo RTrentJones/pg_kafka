@@ -10,7 +10,10 @@
 //! - a failed COMMIT of the transaction that applied forward acks loses no
 //!   ack either;
 //! - partitions with nothing due take no share of a claim, and a backlog
-//!   drains claim after claim.
+//!   drains claim after claim;
+//! - with no external broker configured the outbox keeps its rows without
+//!   claiming them over and over (the worker stays idle) and forwards them once
+//!   one is.
 
 use crate::common::{create_db_client, create_producer, TestResult};
 use crate::setup::TestContext;
@@ -723,6 +726,145 @@ pub async fn test_shadow_stuck_partitions_do_not_throttle_a_backlog() -> TestRes
         .await
     {
         eprintln!("⚠️  cleanup: failed to delete the orphan rows: {e}");
+    }
+    ctx.cleanup().await?;
+    result?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// CPU time (user + system, in clock ticks of 1/100 s) the process has used, or
+/// `None` when this process cannot read its /proc entry (the DB runs elsewhere).
+fn cpu_ticks(pid: i32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Fields after the parenthesised command name: state is field 3, utime 14, stime 15.
+    let rest = stat.rsplit_once(')')?.1;
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    Some(fields.get(11)?.parse::<u64>().ok()? + fields.get(12)?.parse::<u64>().ok()?)
+}
+
+/// How often the outbox rows of a topic have been claimed, summed: each claim
+/// stamps `forwarded_at` and opens an attempt, so this is the latest stamp and
+/// the open attempts.
+async fn claim_marks(
+    db: &Client,
+    topic_id: i32,
+) -> Result<(Option<String>, i64), Box<dyn std::error::Error>> {
+    let row = db
+        .query_one(
+            "SELECT max(forwarded_at)::text, count(*) FILTER (WHERE attempt_open) \
+             FROM kafka.shadow_tracking WHERE topic_id = $1",
+            &[&topic_id],
+        )
+        .await?;
+    Ok((row.get(0), row.get(1)))
+}
+
+/// Shadow mode on with `pg_kafka.shadow_bootstrap_servers` empty: the produce
+/// writes its outbox rows, but the worker does not claim them (the forwarder
+/// would answer every one NotAttempted and leave it due again), so with ten claims
+/// worth of rows the worker stays idle instead of re-claiming them
+/// without pause. Once a broker is configured the rows are forwarded.
+pub async fn test_shadow_unconfigured_broker_does_not_spin_the_worker() -> TestResult {
+    const BATCH: i32 = 10;
+    const RECORDS: i32 = 10 * BATCH;
+    const WINDOW: Duration = Duration::from_secs(5);
+    println!("=== Test: no external broker configured, the outbox stays idle ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("shadow-unconfigured").await;
+    verify_external_kafka_ready().await?;
+    enable_shadow_mode(
+        ctx.db(),
+        &topic,
+        &config(ShadowMode::Shadow, SyncMode::Async),
+    )
+    .await?;
+    let topic_id = topic_id(ctx.db(), &topic).await?;
+    let db = create_db_client().await?;
+
+    let result = async {
+        println!("Step 1: shadow_bootstrap_servers = '', shadow_batch_size = {BATCH}...");
+        alter_system(
+            &db,
+            &format!("ALTER SYSTEM SET pg_kafka.shadow_batch_size = {BATCH}"),
+        )
+        .await?;
+        alter_system(&db, "ALTER SYSTEM SET pg_kafka.shadow_bootstrap_servers = ''").await?;
+
+        println!("Step 2: produce {RECORDS} records...");
+        let producer = create_producer()?;
+        for i in 0..RECORDS {
+            let key = format!("k{i}");
+            producer
+                .send(
+                    FutureRecord::to(&topic).key(key.as_bytes()).payload("v"),
+                    Duration::from_secs(10),
+                )
+                .await
+                .map_err(|(e, _)| e)?;
+        }
+        let rows = undelivered(ctx.db(), topic_id).await?;
+        if rows != i64::from(RECORDS) {
+            return Err(format!("{rows} pending outbox rows, expected one per record").into());
+        }
+        // Let the ticks of the produce settle.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        println!("Step 3: watch the worker for {WINDOW:?}...");
+        let pid: i32 = ctx
+            .db()
+            .query_one(
+                "SELECT pid FROM pg_stat_activity WHERE backend_type = 'pg_kafka_listener'",
+                &[],
+            )
+            .await?
+            .get(0);
+        let marks_before = claim_marks(ctx.db(), topic_id).await?;
+        let cpu_before = cpu_ticks(pid);
+        let start = Instant::now();
+        tokio::time::sleep(WINDOW).await;
+        let cpu_after = cpu_ticks(pid);
+        let elapsed = start.elapsed();
+        let marks_after = claim_marks(ctx.db(), topic_id).await?;
+        println!(
+            "  claim marks (latest forwarded_at, open attempts): {marks_before:?} -> {marks_after:?}"
+        );
+        // /proc counts in USER_HZ, 100 per second on Linux.
+        let cpu_share = cpu_before.zip(cpu_after).map(|(before, after)| {
+            let used = Duration::from_millis(after.saturating_sub(before) * 10);
+            println!("  worker CPU: {used:?} in {elapsed:?}");
+            used.as_secs_f64() / elapsed.as_secs_f64()
+        });
+        // Errors, not panics: the cleanup below must still restore the GUCs.
+        if marks_before != marks_after {
+            return Err("the outbox rows were claimed again while no broker is configured".into());
+        }
+        match cpu_share {
+            Some(share) if share >= 0.2 => {
+                return Err(format!(
+                    "the worker used {:.0}% of a CPU with nothing to forward",
+                    share * 100.0
+                )
+                .into());
+            }
+            Some(_) => {}
+            None => println!("  (the worker's /proc entry is not readable here: CPU not checked)"),
+        }
+
+        println!("Step 4: configure the broker again; the rows go out...");
+        restore_bootstrap_servers(&db).await?;
+        let took = drained_within(ctx.db(), topic_id, Duration::from_secs(30)).await?;
+        println!("  {RECORDS} rows forwarded in {took:?}");
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await
+    .map_err(|e| e.to_string());
+
+    if let Err(e) = restore_bootstrap_servers(&db).await {
+        eprintln!("⚠️  cleanup: failed to restore pg_kafka.shadow_bootstrap_servers: {e}");
+    }
+    if let Err(e) = alter_system(&db, "ALTER SYSTEM RESET pg_kafka.shadow_batch_size").await {
+        eprintln!("⚠️  cleanup: failed to reset pg_kafka.shadow_batch_size: {e}");
     }
     ctx.cleanup().await?;
     result?;

@@ -123,7 +123,9 @@ authentication ApiVersions is served by the database thread like any other reque
 * **SaslAuthenticate** v0-v2. A failure gets `SASL_AUTHENTICATION_FAILED` with the
   message "Authentication failed: invalid credentials" after a 100 ms delay, then the
   connection closes, so each connection buys one attempt. The message is the same for a
-  wrong password and an unknown user. A credential lookup the database cannot answer
+  wrong password, an unknown user and a user whose stored credential is unusable (a
+  corrupt `kafka.sasl_credentials` row, logged as a WARNING; set it again with
+  `pg_kafka_alter_user`). A credential lookup the database cannot answer
   (schema missing or older than the library, lock timeout) closes the connection without a
   response, which clients retry; it is not reported as `SASL_AUTHENTICATION_FAILED`.
 * Out-of-order requests (SaslAuthenticate before SaslHandshake, a second SaslHandshake)

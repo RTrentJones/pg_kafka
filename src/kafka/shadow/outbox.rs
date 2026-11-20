@@ -159,6 +159,10 @@ pub trait ShadowDb {
     /// `pg_kafka.shadow_external_primary_strict`.
     fn external_primary_strict(&self) -> bool;
 
+    /// Whether `pg_kafka.shadow_bootstrap_servers` names a broker. The forwarder
+    /// answers every record `NotAttempted` while it is empty.
+    fn forwarding_configured(&self) -> bool;
+
     /// The outbox GUCs, read now.
     fn settings(&self) -> OutboxSettings;
 
@@ -329,6 +333,13 @@ impl ShadowDb for SpiShadowDb {
 
     fn external_primary_strict(&self) -> bool {
         crate::config::SHADOW_EXTERNAL_PRIMARY_STRICT.get()
+    }
+
+    fn forwarding_configured(&self) -> bool {
+        // The forwarder's own test (`forward_one`): an empty value is unset.
+        crate::config::SHADOW_BOOTSTRAP_SERVERS
+            .get()
+            .is_some_and(|servers| !servers.is_empty())
     }
 
     fn settings(&self) -> OutboxSettings {
