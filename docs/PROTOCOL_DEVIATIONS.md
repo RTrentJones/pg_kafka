@@ -105,6 +105,12 @@ pg_kafka.compression_type = 'gzip'
   whatever sequence it carries, the producer is recorded at the epoch it presents, and its
   later batches are deduplicated and sequence-checked from there, on every partition.
   InitProducerId never hands out a producer id that is recorded this way.
+- ✅ Producer ids are never reused by one installation, and start at the time the
+  extension was created (milliseconds since the Unix epoch), so an extension dropped and
+  created again issues ids above the earlier installation's (unless that one issued
+  more ids than milliseconds passed between its creation and the new one's). A producer
+  id that a producer unknown to the broker presents is outside this guarantee: it is the
+  client's.
 - **Deviation:** the epoch is kept per producer, not per partition: a batch at an epoch
   older than the producer's current one is INVALID_PRODUCER_EPOCH on every partition.
   Kafka compares the epoch with the producer's state on the batch's partition only and

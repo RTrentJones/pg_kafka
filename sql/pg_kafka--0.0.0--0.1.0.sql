@@ -28,6 +28,14 @@ ALTER TABLE kafka.partition_offsets
 ALTER TABLE kafka.producer_ids ADD COLUMN last_epoch SMALLINT;
 COMMENT ON COLUMN kafka.producer_ids.last_epoch IS 'Epoch before the last bump the producer requested itself (a retry of that InitProducerId gets the current epoch back); NULL after a fencing bump.';
 
+-- Producer ids continue from the upgrade time in milliseconds since the Unix epoch, as
+-- a fresh install starts from its creation time (see bootstrap.sql), and never below an
+-- id already issued.
+SELECT pg_catalog.setval('kafka.producer_ids_producer_id_seq',
+                         GREATEST((extract(epoch FROM clock_timestamp()) * 1000)::bigint,
+                                  (SELECT last_value FROM kafka.producer_ids_producer_id_seq),
+                                  (SELECT COALESCE(MAX(producer_id), 0) FROM kafka.producer_ids)));
+
 -- 1. Time-partition kafka.messages (ADR-001).
 --
 -- The populated 0.0.0 table is not rewritten: it is renamed to kafka.messages_legacy

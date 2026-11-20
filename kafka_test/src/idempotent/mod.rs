@@ -30,5 +30,6 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         unknown_producer::test_idempotent_producer_survives_pruned_state,
         unknown_producer::test_pruned_producer_resumes_on_every_partition,
         unknown_producer::test_producer_id_allocation_skips_recorded_ids: sequential, // reads the id sequence
+        unknown_producer::test_producer_ids_start_from_creation_time,
     ]
 }

@@ -344,3 +344,32 @@ pub async fn test_producer_id_allocation_skips_recorded_ids() -> TestResult {
     println!("✅ Test PASSED\n");
     Ok(())
 }
+
+/// Producer ids start from the time the extension was created (milliseconds since the
+/// Unix epoch), so an extension dropped and created again never hands out an id an
+/// earlier installation issued to a producer that may still be running.
+pub async fn test_producer_ids_start_from_creation_time() -> TestResult {
+    println!("=== Test: Producer Ids Start From Creation Time ===\n");
+    let ctx = TestContext::new().await?;
+    let mut w = Wire::connect().await?;
+    let (err, pid, _) = w.init_producer_id(None, 60_000).await?;
+    assert_eq!(err, error_codes::NONE);
+    // 2026-01-01T00:00:00Z in milliseconds: every installation is younger than that.
+    let floor: i64 = 1_767_225_600_000;
+    let now_ms: i64 = ctx
+        .db()
+        .query_one(
+            "SELECT (extract(epoch FROM clock_timestamp()) * 1000)::bigint",
+            &[],
+        )
+        .await?
+        .get(0);
+    assert!(
+        (floor..now_ms + 1_000_000).contains(&pid),
+        "producer id {pid} is a creation-time value in [{floor}, now + 10^6)"
+    );
+    println!("✅ InitProducerId gave {pid}\n");
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}

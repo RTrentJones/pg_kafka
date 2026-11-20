@@ -579,6 +579,11 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON kafka.producer_ids TO pgkafka_worker;
 -- nextval() for new ids and the RV-13 epoch-exhaustion reallocation; setval() to move
 -- past a run of ids that producers unknown to the broker already hold.
 GRANT USAGE, UPDATE ON SEQUENCE kafka.producer_ids_producer_id_seq TO pgkafka_worker;
+-- Producer ids start at the creation time in milliseconds since the Unix epoch, so an
+-- extension dropped and created again never hands out an id the earlier installation
+-- issued (to a producer that may still be running and would share its sequence state).
+SELECT pg_catalog.setval('kafka.producer_ids_producer_id_seq',
+                         (extract(epoch FROM clock_timestamp()) * 1000)::bigint);
 GRANT SELECT, INSERT, UPDATE, DELETE ON kafka.producer_sequences TO pgkafka_worker;
 
 COMMENT ON TABLE kafka.producer_ids IS 'Producer ID allocation for idempotent producers. Each idempotent producer gets a unique ID and epoch.';
