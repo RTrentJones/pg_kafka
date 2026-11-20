@@ -202,6 +202,16 @@ pub async fn test_shadow_forwards_headers_and_timestamps() -> TestResult {
     let ctx = TestContext::new().await?;
     let topic = ctx.unique_topic("shadow-headers").await;
     verify_external_kafka_ready().await?;
+    // The record's CreateTime is years old, so on a topic with the broker's default
+    // retention (7 days, by timestamp) the next retention check (every 5 minutes)
+    // deletes it, possibly between the forward and the read below. The external
+    // topic keeps its records forever instead.
+    let admin = external_admin()?;
+    let opts = AdminOptions::new().operation_timeout(Some(Duration::from_secs(10)));
+    let new_topic = NewTopic::new(&topic, 1, TopicReplication::Fixed(1)).set("retention.ms", "-1");
+    for r in admin.create_topics(&[new_topic], &opts).await? {
+        r.map_err(|(t, e)| format!("create {t}: {e}"))?;
+    }
     enable_shadow_mode(ctx.db(), &topic, &async_config(None)).await?;
 
     let producer = create_producer()?;
