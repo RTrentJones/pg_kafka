@@ -16,6 +16,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         time_partitions::test_retention_without_offset_counter_keeps_offsets: sequential,
         lock_races::test_partition_maintenance_lock_waits_are_bounded: sequential,
         lock_races::test_end_txn_during_default_leaf_move: sequential,
+        lock_races::test_wide_maintenance_moving_default_rows_under_load: sequential,
         sweep_concurrency::test_concurrent_sweeps_and_maintenance_do_not_deadlock: sequential,
         sweep_concurrency::test_worker_sweep_skips_while_maintenance_lock_held: sequential,
     ]

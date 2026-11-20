@@ -3,11 +3,14 @@
 use crate::common::create_transactional_producer;
 use crate::common::TestResult;
 use crate::worker::{
-    boxed, into_test_result, read_values, send, session, unique, wait_for_serving_listener,
-    SendResult,
+    boxed, deadlocks, into_test_result, quick_producer, read_values, send, session, unique,
+    wait_for_serving_listener, SendResult, ServerLog,
 };
 use rdkafka::producer::Producer;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio_postgres::Client;
 
 /// The maintenance move (DELETE from kafka.messages_default + INSERT into the new leaf)
 /// must not run concurrently with EndTxn's `UPDATE kafka.messages SET txn_state`: the
@@ -303,4 +306,236 @@ async fn maintenance_lock_waits() -> SendResult<()> {
     println!("Step 4 (c): with the lock free, the sweep succeeds");
     println!("✅ every maintenance lock wait is bounded and handled");
     Ok(())
+}
+
+/// Maintenance passes over this many partition widths of the worker's setting.
+const WIDE_FACTOR: i32 = 7;
+/// Maintenance passes run against the busy worker, each over a fresh layout.
+const WIDE_ROUNDS: i32 = 6;
+/// Concurrent producers keeping the worker's transactions on kafka.messages.
+const WIDE_PRODUCERS: usize = 3;
+
+/// One maintenance pass that creates several leaves, the later of which moves rows out
+/// of the DEFAULT leaf, must not deadlock with a worker transaction. Moving rows needs
+/// the schema lock EXCLUSIVE, which every worker transaction holds SHARE from its start;
+/// an earlier, row-less leaf of the same pass already holds ACCESS EXCLUSIVE on
+/// kafka.messages to commit. A pass that only then queued for the schema lock waits for
+/// a worker transaction that waits for kafka.messages: "deadlock detected".
+///
+/// The layout: a pass `WIDE_FACTOR` times wider than the worker's width (an operator
+/// raising pg_kafka.message_partition_minutes), so the current wide bucket is partly
+/// covered by the worker's leaves and the next is a row-less gap, and rows in the DEFAULT
+/// leaf two wide buckets ahead. Producers keep the worker writing kafka.messages
+/// throughout.
+///
+/// Asserts: every round's `pg_kafka_run_partition_maintenance(width)` succeeds and moves
+/// the DEFAULT rows into a leaf, the producers get every record acked (a worker chosen
+/// as the deadlock victim fails a produce), and neither pg_stat_database nor the server
+/// log (when readable) records a deadlock.
+pub async fn test_wide_maintenance_moving_default_rows_under_load() -> TestResult {
+    into_test_result(wide_maintenance_under_load().await)
+}
+
+async fn wide_maintenance_under_load() -> SendResult<()> {
+    println!("=== Test: multi-leaf maintenance moving DEFAULT rows under load ===\n");
+    let db = session().await?;
+    wait_for_serving_listener(&db, None, Duration::from_secs(30)).await?;
+    let minutes: i32 = db
+        .query_one(
+            "SELECT current_setting('pg_kafka.message_partition_minutes')::int",
+            &[],
+        )
+        .await
+        .map_err(boxed)?
+        .get(0);
+    let width = (minutes * WIDE_FACTOR).min(43_200);
+    let topic = unique("wide-move");
+    let topic_id: i32 = db
+        .query_one(
+            "INSERT INTO kafka.topics (name, partitions) VALUES ($1, 1) RETURNING id",
+            &[&topic],
+        )
+        .await
+        .map_err(boxed)?
+        .get(0);
+    let maintainer = session().await?;
+    maintainer
+        .batch_execute("SET statement_timeout = '30s'")
+        .await
+        .map_err(boxed)?;
+    println!("Step 0: worker width {minutes} min, maintenance width {width} min");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let produce_topics: Vec<String> = (0..WIDE_PRODUCERS)
+        .map(|i| unique(&format!("wide-move-produce-{i}")))
+        .collect();
+    let producing: Vec<_> = produce_topics
+        .iter()
+        .map(|t| {
+            let stop = stop.clone();
+            let t = t.clone();
+            tokio::spawn(async move {
+                let producer = quick_producer("10000")?;
+                let (mut acked, mut errors) = (0u64, Vec::new());
+                while !stop.load(Ordering::SeqCst) {
+                    match send(&producer, &t, "p").await {
+                        Ok(_) => acked += 1,
+                        Err(e) => errors.push(e.to_string()),
+                    }
+                }
+                SendResult::Ok((acked, errors))
+            })
+        })
+        .collect();
+
+    let log = ServerLog::open(&db).await?;
+    let log_from = log.as_ref().map(ServerLog::end);
+    let deadlocks_before = deadlocks(&db).await?;
+    let mut failures = Vec::new();
+    let mut result: SendResult<()> = Ok(());
+    for round in 0..WIDE_ROUNDS {
+        let round_result: SendResult<()> = async {
+            let before = leaf_names(&db).await?;
+            // Rows two wide buckets ahead: no leaf covers them, so they sit in DEFAULT,
+            // and the pass reaches them only after creating the row-less leaves before.
+            db.execute(
+                "INSERT INTO kafka.messages (topic_id, partition_id, partition_offset, value,
+                                             created_at)
+                 SELECT $1, 0, $2::bigint * 10 + g, 'v'::bytea,
+                        to_timestamp((floor(extract(epoch FROM now()) / ($3::int * 60)) + 2)
+                                     * ($3::int * 60)) + $4::int * INTERVAL '1 minute'
+                 FROM generate_series(0::bigint, 9) AS g",
+                &[&topic_id, &i64::from(round), &width, &minutes],
+            )
+            .await
+            .map_err(boxed)?;
+            match maintainer
+                .query_one("SELECT pg_kafka_run_partition_maintenance($1)", &[&width])
+                .await
+            {
+                Ok(row) => {
+                    let created: i64 = row.get(0);
+                    let in_default: i64 = db
+                        .query_one(
+                            "SELECT count(*) FROM kafka.messages_default WHERE topic_id = $1",
+                            &[&topic_id],
+                        )
+                        .await
+                        .map_err(boxed)?
+                        .get(0);
+                    println!("Round {round}: created {created} leaves, {in_default} row(s) left in DEFAULT");
+                    if in_default != 0 {
+                        failures.push(format!("round {round}: {in_default} row(s) not moved"));
+                    }
+                }
+                Err(e) => {
+                    println!("Round {round}: maintenance failed: {}", db_error(&e));
+                    failures.push(format!("round {round}: {}", db_error(&e)));
+                }
+            }
+            // Back to the starting layout: the rows and the leaves this round created.
+            db.execute("DELETE FROM kafka.messages WHERE topic_id = $1", &[&topic_id])
+                .await
+                .map_err(boxed)?;
+            drop_new_leaves(&db, &before).await
+        }
+        .await;
+        if let Err(e) = round_result {
+            result = Err(e);
+            break;
+        }
+    }
+
+    stop.store(true, Ordering::SeqCst);
+    let mut acked = 0;
+    for p in producing {
+        let (n, errors) = p.await.map_err(boxed)??;
+        acked += n;
+        failures.extend(errors.into_iter().map(|e| format!("produce: {e}")));
+    }
+    let deadlocks_after = deadlocks(&db).await?;
+    if let (Some(log), Some(from)) = (&log, log_from) {
+        let logged = log.since(from).matches("deadlock detected").count();
+        if logged > 0 {
+            failures.push(format!("the server log reports {logged} deadlock(s)"));
+        }
+    }
+    let mut names = produce_topics;
+    names.push(topic);
+    db.execute("DELETE FROM kafka.topics WHERE name = ANY($1)", &[&names])
+        .await
+        .map_err(boxed)?;
+    result?;
+    println!(
+        "   {} failure(s), {} new deadlock(s), {acked} record(s) produced meanwhile",
+        failures.len(),
+        deadlocks_after - deadlocks_before
+    );
+    if !failures.is_empty() {
+        return Err(format!(
+            "maintenance under load failed {} time(s): {}",
+            failures.len(),
+            failures.join("; ")
+        )
+        .into());
+    }
+    assert_eq!(
+        deadlocks_after, deadlocks_before,
+        "the database recorded deadlocks during multi-leaf maintenance"
+    );
+    assert!(acked > 0, "the producers must keep getting acks");
+    println!("✅ no deadlock; every pass moved the DEFAULT rows");
+    Ok(())
+}
+
+/// The names of the leaves of kafka.messages.
+async fn leaf_names(db: &Client) -> SendResult<Vec<String>> {
+    let rows = db
+        .query(
+            "SELECT partition_oid::regclass::text FROM kafka.message_partitions()",
+            &[],
+        )
+        .await
+        .map_err(boxed)?;
+    Ok(rows.iter().map(|r| r.get(0)).collect())
+}
+
+/// Drop every leaf not in `before`, retrying a drop that timed out on its locks.
+async fn drop_new_leaves(db: &Client, before: &[String]) -> SendResult<()> {
+    for leaf in leaf_names(db).await? {
+        if before.contains(&leaf) {
+            continue;
+        }
+        let mut dropped = false;
+        for _ in 0..5 {
+            dropped = db
+                .query_one(
+                    "SELECT dropped FROM kafka.drop_message_partition($1::text::regclass, '{}')",
+                    &[&leaf],
+                )
+                .await
+                .map_err(boxed)?
+                .get(0);
+            if dropped {
+                break;
+            }
+        }
+        if !dropped {
+            return Err(format!("could not drop the test's leaf {leaf}").into());
+        }
+    }
+    Ok(())
+}
+
+/// The message and code of a database error ("deadlock detected" and its cycle).
+fn db_error(e: &tokio_postgres::Error) -> String {
+    match e.as_db_error() {
+        Some(d) => format!(
+            "{} ({}){}",
+            d.message(),
+            d.code().code(),
+            d.detail().map_or_else(String::new, |s| format!(": {s}"))
+        ),
+        None => e.to_string(),
+    }
 }

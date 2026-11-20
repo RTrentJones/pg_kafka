@@ -293,7 +293,8 @@ $$;
 -- the tables CREATE EXTENSION made: pg_dump then leaves it out exactly as it leaves
 -- out kafka.messages itself, DROP EXTENSION drops it, and no dump can restore a leaf
 -- without its parent. Returns 1 if created, 0 if a lock could not be taken within
--- lock_timeout (the next maintenance pass retries).
+-- lock_timeout or a move found the schema lock taken (the next maintenance pass
+-- retries).
 CREATE FUNCTION kafka.create_message_partition(p_lower TIMESTAMPTZ, p_upper TIMESTAMPTZ)
 RETURNS INT
 LANGUAGE plpgsql SECURITY DEFINER
@@ -316,14 +317,18 @@ BEGIN
     BEGIN
         v_move := EXISTS (SELECT 1 FROM kafka.messages_default
                           WHERE created_at >= p_lower AND created_at < p_upper);
-        IF v_move THEN
-            -- Moving rows (DELETE from the DEFAULT leaf + INSERT into the new leaf) must
-            -- not overlap any worker transaction: an UPDATE of the worker (EndTxn's
-            -- txn_state change, DeleteRecords) that met a moved row would skip it and
-            -- never see its copy. Every worker transaction holds the pg_kafka schema
-            -- lock in SHARE mode; take it EXCLUSIVE (bounded by lock_timeout), before
-            -- the table locks, as worker transactions take it before theirs.
-            PERFORM pg_advisory_xact_lock(8099547369649367906);
+        -- Moving rows (DELETE from the DEFAULT leaf + INSERT into the new leaf) must not
+        -- overlap any worker transaction: an UPDATE of the worker (EndTxn's txn_state
+        -- change, DeleteRecords) that met a moved row would skip it and never see its
+        -- copy. Every worker transaction holds the pg_kafka schema lock in SHARE mode
+        -- from its start, so a move needs it EXCLUSIVE. ensure_message_partitions
+        -- queues for it before its first leaf, while it holds no table lock; here it is
+        -- only tried, never waited for: an earlier leaf of the same pass holds
+        -- kafka.messages ACCESS EXCLUSIVE to commit, and a worker transaction waiting
+        -- for that table while holding the schema lock would close a lock cycle.
+        IF v_move AND NOT pg_try_advisory_xact_lock(8099547369649367906) THEN
+            RAISE WARNING 'pg_kafka: could not create time partition kafka.% (rows of kafka.messages_default to move, schema lock taken); will retry', v_name;
+            RETURN 0;
         END IF;
         -- CREATE ... PARTITION OF / ATTACH PARTITION lock kafka.messages and, to clone
         -- the topic_id foreign key, kafka.topics: take both first, without ever
@@ -403,6 +408,18 @@ BEGIN
     IF NOT kafka.try_maintenance_lock() THEN
         RAISE WARNING 'pg_kafka: partition maintenance skipped: another session holds the maintenance lock; will retry';
         RETURN 0;
+    END IF;
+    -- Rows in the DEFAULT leaf are moved by some leaf of this pass, and a move needs the
+    -- schema lock EXCLUSIVE (see create_message_partition). Queue for it here, bounded
+    -- by lock_timeout, before any leaf locks kafka.messages: this transaction holds no
+    -- lock a worker transaction waits for, so the wait cannot close a cycle. On a
+    -- timeout the leaves that move rows are left to the next pass; the others are made.
+    IF EXISTS (SELECT 1 FROM kafka.messages_default) THEN
+        BEGIN
+            PERFORM pg_advisory_xact_lock(8099547369649367906);
+        EXCEPTION WHEN lock_not_available THEN
+            RAISE WARNING 'pg_kafka: rows of kafka.messages_default not moved (schema lock wait timed out); will retry';
+        END;
     END IF;
     FOR v_bucket IN
         SELECT DISTINCT b FROM (

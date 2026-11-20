@@ -113,9 +113,17 @@ Maintenance can run in the worker and, at the same time, in any session
   meets a row the move deleted skips it once the move commits and never sees its copy,
   leaving a committed transaction `pending` forever. So every worker transaction
   starts by taking the pg_kafka schema advisory lock (key 8099547369649367906) in SHARE
-  mode (`worker::txn::lock_schema`), and the move takes it EXCLUSIVE, bounded by the function's
-  `lock_timeout`; on a timeout the leaf is not created and the next pass retries. The
-  upgrade scripts take the same lock first.
+  mode (`worker::txn::lock_schema`), and a pass that has rows to move takes it EXCLUSIVE.
+  `ensure_message_partitions` queues for it once, bounded by its `lock_timeout`, when
+  `kafka.messages_default` holds rows, before its first leaf locks any table: a pass that
+  creates several leaves holds `kafka.messages` `ACCESS EXCLUSIVE` from the first to commit,
+  and queueing for the schema lock after that would wait for a worker transaction that
+  waits for `kafka.messages`, a lock cycle. `create_message_partition` then only tries the
+  lock (`pg_try_advisory_xact_lock`, which succeeds at once for the pass that holds it): a
+  leaf whose move finds it taken (the wait timed out, or rows reached DEFAULT after the
+  check) is not created, and the next pass retries; the pass's other leaves are. The
+  upgrade scripts take the same lock first. No other path takes the schema lock after a
+  table lock.
 * **Sweeps and partition maintenance never overlap.** A retention sweep deletes rows first
   (the aborted-row cleanup, then the expired rows), which leaves its transaction holding
   `ROW EXCLUSIVE` on `kafka.messages` and the row locks of its deletes, and drops leaves last,
