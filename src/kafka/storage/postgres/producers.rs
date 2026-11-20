@@ -27,26 +27,46 @@ fn invalid_producer_epoch(producer_id: i64, epoch: i16, current_epoch: i16) -> K
 }
 
 /// The next producer id from the producer id sequence, or, when a producer already
-/// holds that one, the first free id after the run of held ids it starts. An id can be
+/// holds that one, the first free id after the run of held ids it starts; the sequence
+/// then moves to that id, so later allocations do not walk the run again. An id can be
 /// held out of turn: a Produce from a producer the broker has no state for records the
-/// id it presents (see [`adopt_unknown_producer`]).
+/// id it presents (see [`adopt_unknown_producer`]), up to `i64::MAX`.
 fn next_free_producer_id(client: &mut SpiClient<'_>) -> Result<i64> {
     let row = client
         .update(
-            "SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM kafka.producer_ids WHERE producer_id = n)
-                         THEN n
-                         ELSE (SELECT MIN(p.producer_id) + 1 FROM kafka.producer_ids p
-                               WHERE p.producer_id >= n
+            "WITH seq AS (
+                 SELECT nextval(pg_get_serial_sequence('kafka.producer_ids', 'producer_id')) AS n
+             )
+             SELECT seq.n AS next,
+                    CASE WHEN NOT EXISTS (SELECT 1 FROM kafka.producer_ids WHERE producer_id = seq.n)
+                         THEN seq.n
+                         -- The held run starting at n ends below the first id p whose
+                         -- successor is free; p < i64::MAX keeps p + 1 in range.
+                         ELSE (SELECT p.producer_id + 1 FROM kafka.producer_ids p
+                               WHERE p.producer_id >= seq.n
+                                 AND p.producer_id < 9223372036854775807
                                  AND NOT EXISTS (SELECT 1 FROM kafka.producer_ids q
-                                                 WHERE q.producer_id = p.producer_id + 1))
+                                                 WHERE q.producer_id = p.producer_id + 1)
+                               ORDER BY p.producer_id
+                               LIMIT 1)
                     END AS id
-             FROM nextval(pg_get_serial_sequence('kafka.producer_ids', 'producer_id')) AS n",
+             FROM seq",
             None,
             &[],
         )?
         .first();
-    row.get_by_name("id")?
-        .ok_or_else(|| KafkaError::Internal("no free producer id".into()))
+    let next: Option<i64> = row.get_by_name("next")?;
+    let id: i64 = row
+        .get_by_name("id")?
+        .ok_or_else(|| KafkaError::Internal("no free producer id".into()))?;
+    if next != Some(id) {
+        client.update(
+            "SELECT setval(pg_get_serial_sequence('kafka.producer_ids', 'producer_id'), $1)",
+            None,
+            &[id.into()],
+        )?;
+    }
+    Ok(id)
 }
 
 /// Insert a new producer id at epoch 0 and return `(producer_id, epoch)`.

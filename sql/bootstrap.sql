@@ -576,8 +576,9 @@ CREATE TABLE kafka.producer_sequences (
 GRANT SELECT ON kafka.producer_ids TO pgkafka_reader;
 GRANT SELECT ON kafka.producer_sequences TO pgkafka_reader;
 GRANT SELECT, INSERT, UPDATE, DELETE ON kafka.producer_ids TO pgkafka_worker;
--- nextval() for new ids and the RV-13 epoch-exhaustion reallocation.
-GRANT USAGE ON SEQUENCE kafka.producer_ids_producer_id_seq TO pgkafka_worker;
+-- nextval() for new ids and the RV-13 epoch-exhaustion reallocation; setval() to move
+-- past a run of ids that producers unknown to the broker already hold.
+GRANT USAGE, UPDATE ON SEQUENCE kafka.producer_ids_producer_id_seq TO pgkafka_worker;
 GRANT SELECT, INSERT, UPDATE, DELETE ON kafka.producer_sequences TO pgkafka_worker;
 
 COMMENT ON TABLE kafka.producer_ids IS 'Producer ID allocation for idempotent producers. Each idempotent producer gets a unique ID and epoch.';

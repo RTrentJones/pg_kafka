@@ -703,7 +703,7 @@ GRANT EXECUTE ON FUNCTION kafka.drop_message_partition(regclass, int[]) TO pgkaf
 GRANT SELECT, INSERT, UPDATE ON kafka.partition_offsets TO pgkafka_worker;
 GRANT SELECT, INSERT, UPDATE, DELETE ON kafka.consumer_offsets TO pgkafka_worker;
 GRANT SELECT, INSERT, UPDATE, DELETE ON kafka.producer_ids TO pgkafka_worker;
-GRANT USAGE ON SEQUENCE kafka.producer_ids_producer_id_seq TO pgkafka_worker;
+GRANT USAGE, UPDATE ON SEQUENCE kafka.producer_ids_producer_id_seq TO pgkafka_worker;
 GRANT SELECT, INSERT, UPDATE, DELETE ON kafka.producer_sequences TO pgkafka_worker;
 GRANT SELECT, INSERT, UPDATE, DELETE ON kafka.transactions TO pgkafka_worker;
 GRANT SELECT, INSERT, UPDATE, DELETE ON kafka.txn_pending_offsets TO pgkafka_worker;

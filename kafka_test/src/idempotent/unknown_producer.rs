@@ -280,3 +280,67 @@ pub async fn test_pruned_producer_resumes_on_every_partition() -> TestResult {
     println!("✅ Test PASSED\n");
     Ok(())
 }
+
+/// The id InitProducerId allocates skips ids that producers the broker has no state for
+/// recorded (one of them the largest id there is), and moves the id sequence past the
+/// run it skipped.
+pub async fn test_producer_id_allocation_skips_recorded_ids() -> TestResult {
+    println!("=== Test: Producer Id Allocation Skips Recorded Ids ===\n");
+    let ctx = TestContext::new().await?;
+    let db = ctx.db();
+    let t = topic(&ctx, "idem-id-skip", 1).await?;
+    let mut w = Wire::connect().await?;
+
+    println!("Step 1: Unknown producers record i64::MAX and the next three ids...");
+    let next_id: i64 = db
+        .query_one(
+            "SELECT last_value + 1 FROM kafka.producer_ids_producer_id_seq",
+            &[],
+        )
+        .await?
+        .get(0);
+    for pid in [i64::MAX, next_id, next_id + 1, next_id + 2] {
+        assert_eq!(
+            w.produce(&t, 0, batch(&["v"], pid, 0, 0, false, None), None)
+                .await?
+                .0,
+            error_codes::NONE,
+            "producer {pid} is accepted"
+        );
+    }
+    println!("✅ Recorded\n");
+
+    println!("Step 2: InitProducerId...");
+    let (err, fresh, _) = w.init_producer_id(None, 60_000).await?;
+    assert_eq!(err, error_codes::NONE, "InitProducerId still allocates");
+    assert_eq!(fresh, next_id + 3, "the first id after the recorded run");
+    let last_value: i64 = db
+        .query_one(
+            "SELECT last_value FROM kafka.producer_ids_producer_id_seq",
+            &[],
+        )
+        .await?
+        .get(0);
+    assert!(
+        last_value >= next_id + 3,
+        "the sequence moved past the skipped run (last_value {last_value})"
+    );
+    let (err, after, _) = w.init_producer_id(None, 60_000).await?;
+    assert_eq!(err, error_codes::NONE);
+    assert_eq!(after, next_id + 4, "the next allocation needs no skip");
+    println!("✅ Allocated {fresh}, then {after}\n");
+
+    db.execute(
+        "DELETE FROM kafka.producer_sequences WHERE producer_id = ANY($1)",
+        &[&vec![i64::MAX, next_id, next_id + 1, next_id + 2]],
+    )
+    .await?;
+    db.execute(
+        "DELETE FROM kafka.producer_ids WHERE producer_id = ANY($1)",
+        &[&vec![i64::MAX, next_id, next_id + 1, next_id + 2]],
+    )
+    .await?;
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
