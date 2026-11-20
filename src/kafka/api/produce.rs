@@ -118,11 +118,14 @@ impl KafkaApi for ProduceApi {
             Err(failure) => {
                 // acks=0 never gets a response: an unsolicited one would be read as the
                 // reply to the client's next request. Kafka closes the connection instead,
-                // so the client notices. A full process-wide budget closes any connection,
-                // as a full frame budget does; the client reconnects and retries.
+                // so the client notices. A full process-wide budget (or a full queue of large
+                // decodes) closes any connection, as a full frame budget does; the client
+                // reconnects and retries.
                 let error_code = match failure {
                     DecodeFailure::Busy => {
-                        return Err(Rejection::Close("decoded-records budget exhausted"))
+                        return Err(Rejection::Close(
+                            "decoded-records budget exhausted or large decodes queued",
+                        ))
                     }
                     _ if acks == 0 => {
                         return Err(Rejection::Close(
@@ -226,7 +229,7 @@ impl KafkaApi for ProduceApi {
 enum DecodeFailure {
     /// They take more memory than one request may hold ([`MAX_DECODED_REQUEST_BYTES`]).
     TooLarge,
-    /// The process-wide decode budget is exhausted.
+    /// The process-wide decode budget is exhausted, or too many large decodes wait.
     Busy,
     /// A batch is corrupt or invalid: this code on every partition.
     Rejected(i16),
@@ -286,7 +289,8 @@ fn decode_records(
 /// A request whose batches take at most [`INLINE_DECODE_BYTES`] of memory by what they
 /// declare (their bytes and record counts) is decoded in place, within that budget: the
 /// common case of small (compressed or not) batches. One that declares more, or that
-/// expands past it, is decoded by [`run_large_decode`] within [`MAX_DECODED_REQUEST_BYTES`].
+/// expands past it, is decoded by [`run_large_decode`] within [`MAX_DECODED_REQUEST_BYTES`]
+/// (or turned away as [`DecodeFailure::Busy`] when too many already wait for it).
 fn decode_all_records(
     topics: &[kafka_protocol::messages::produce_request::TopicProduceData],
 ) -> Result<DecodedTopics, DecodeFailure> {
@@ -303,6 +307,7 @@ fn decode_all_records(
         }
     }
     run_large_decode(|| decode_records(topics, DecodeBudget::new(MAX_DECODED_REQUEST_BYTES)))
+        .unwrap_or(Err(DecodeFailure::Busy))
 }
 
 /// The `acks` values Kafka accepts (all ISR, none, leader).
