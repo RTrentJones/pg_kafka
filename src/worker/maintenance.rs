@@ -128,15 +128,14 @@ pub(super) fn reload_shadow_config(shadow_store: &ShadowStore<PostgresStore>) {
 }
 
 /// SH-9: one tick of the durable shadow outbox: apply the forward acks the network
-/// thread returned, then dispatch the next due batch. Failures (for example a dropped
-/// schema) pause the tick exponentially and are logged sparsely (`note_outbox_tick`).
+/// thread returned, then dispatch the next due batch, in one transaction; the applied
+/// acks are made final after its commit. Failures (for example a dropped schema) pause
+/// the tick exponentially and are logged sparsely (`note_outbox_tick`).
 pub(super) fn tick_shadow_outbox(shadow_store: &ShadowStore<PostgresStore>) {
     let outcome = worker_transaction(|| {
         // The acks are applied first (marking delivered rows done so the poll does not
-        // re-dispatch them), in a subtransaction of their own: they are consumed from
-        // the channel as they are read, so if they shared the poll's subtransaction a
-        // Postgres ERROR in the poll would roll back the applied acks and lose them
-        // (delivered rows left pending, re-sent, and eventually dead-lettered).
+        // re-dispatch them), in a subtransaction of their own, so a Postgres ERROR in
+        // the poll does not roll their application back with it.
         let mut applied = 0;
         let mut failure: Option<String> = None;
         if let Err(panic_msg) = run_request_in_subtransaction(|| {
@@ -171,8 +170,11 @@ pub(super) fn tick_shadow_outbox(shadow_store: &ShadowStore<PostgresStore>) {
             }
         }
     });
-    if let Err(e) = outcome {
-        log_txn_error("Shadow outbox poll", &e);
+    match outcome {
+        // The acks applied in it are final only now (a failed COMMIT rolls them
+        // back, and the next tick applies them again).
+        Ok(()) => shadow_store.commit_applied_acks(),
+        Err(e) => log_txn_error("Shadow outbox poll", &e),
     }
 }
 

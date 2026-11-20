@@ -78,6 +78,13 @@ fn skipped_ack(key: RowKey) -> ForwardAck {
     ForwardAck::new(key, ForwardOutcome::NotAttempted("fenced".to_string()))
 }
 
+/// One ack application whose transaction committed (the worker's tick).
+fn drain(h: &Harness) -> usize {
+    let applied = h.store.drain_forward_acks();
+    h.store.commit_applied_acks();
+    applied
+}
+
 /// Seed messages and pending outbox rows for `keys`.
 fn seed_rows(store: &Store, keys: &[RowKey]) {
     for &k in keys {
@@ -184,7 +191,7 @@ fn duplicate_success_ack_counts_once() {
     sent_records(&h);
     h.acks.send(ok_ack(RowKey::new(T, 0, 1), 9)).unwrap();
     h.acks.send(ok_ack(RowKey::new(T, 0, 1), 10)).unwrap();
-    assert_eq!(h.store.drain_forward_acks(), 2);
+    assert_eq!(drain(&h), 2);
 
     assert_eq!(
         h.store
@@ -374,7 +381,7 @@ fn in_flight_rows_are_never_reclaimed_and_only_real_failures_count() {
     // Row (T,0,1) fails, (T,1,2) is delivered.
     h.acks.send(err_ack(RowKey::new(T, 0, 1))).unwrap();
     h.acks.send(ok_ack(RowKey::new(T, 1, 2), 500)).unwrap();
-    assert_eq!(h.store.drain_forward_acks(), 2);
+    assert_eq!(drain(&h), 2);
     let failed = h.store.db().row(RowKey::new(T, 0, 1)).unwrap();
     assert_eq!(failed.error_message.as_deref(), Some("broker down"));
     assert_eq!(failed.retry_count, 1);
@@ -422,7 +429,7 @@ fn a_backing_off_row_blocks_later_rows_of_its_partition_only() {
     ] {
         h.acks.send(ack).unwrap();
     }
-    h.store.drain_forward_acks();
+    drain(&h);
     // The fenced rows were not attempted: no retry counted.
     assert_eq!(
         h.store.db().row(RowKey::new(T, 0, 2)).unwrap().retry_count,
@@ -489,7 +496,7 @@ fn failing_forward_is_dead_lettered_and_external_primary_reads_fall_back() {
         for r in &sent[1..] {
             h.acks.send(skipped_ack(r.row)).unwrap();
         }
-        h.store.drain_forward_acks();
+        drain(&h);
         h.store.db().advance_ms(OUTBOX_MAX_BACKOFF_MS + 1);
     }
 
@@ -523,7 +530,7 @@ fn raising_the_retry_cap_revives_dead_letters() {
     seed_rows(&h.store, &[RowKey::new(T, 0, 1)]);
     h.store.poll_and_forward_outbox().unwrap();
     h.acks.send(err_ack(RowKey::new(T, 0, 1))).unwrap();
-    h.store.drain_forward_acks();
+    drain(&h);
     h.store.db().advance_ms(OUTBOX_MAX_BACKOFF_MS + 1);
     sent_records(&h);
     assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 0);
@@ -585,9 +592,90 @@ fn a_backlog_does_not_starve_other_partitions() {
     // Once the other topic's record is delivered, the next claim continues the
     // backlog in order, now alone: the whole batch.
     h.acks.send(ok_ack(RowKey::new(T + 1, 0, 0), 0)).unwrap();
-    h.store.drain_forward_acks();
+    drain(&h);
     assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 10);
     assert_eq!(offsets(&sent_records(&h)), (5..15).collect::<Vec<_>>());
+}
+
+#[test]
+fn partitions_with_nothing_due_take_no_share_of_the_claim() {
+    // Partitions whose pending rows cannot be claimed now (dead letters, which
+    // stay pending until a replay; an orphan pointer whose message retention
+    // deleted; a row in flight; a row backing off after a failure) must not
+    // shrink the share of the partitions that have rows due: a backlog next to
+    // 100 dead-letter partitions still gets the whole batch.
+    let h = async_harness(512);
+    h.store.db().add_topic(T + 1, "stuck", None);
+    h.store.db().state().settings.batch_size = 100;
+    let in_flight = RowKey::new(T + 1, 102, 0);
+    seed_rows(&h.store, &[in_flight]);
+    assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 1);
+    drop(sent_records(&h));
+
+    let cap = h.store.db().state().settings.max_retries;
+    for p in 0..100 {
+        let dead = RowKey::new(T + 1, p, 0);
+        seed_rows(&h.store, &[dead]);
+        h.store
+            .db()
+            .state()
+            .tracking
+            .get_mut(&dead)
+            .unwrap()
+            .retry_count = cap;
+    }
+    let orphan = RowKey::new(T + 1, 100, 0);
+    seed_rows(&h.store, &[orphan]);
+    h.store.db().state().messages.remove(&orphan);
+    let backing_off = RowKey::new(T + 1, 101, 0);
+    seed_rows(&h.store, &[backing_off]);
+    {
+        let mut s = h.store.db().state();
+        let now = s.now_ms;
+        let row = s.tracking.get_mut(&backing_off).unwrap();
+        row.retry_count = 1;
+        row.forwarded_at = Some(now);
+    }
+    let backlog: Vec<RowKey> = (0..300).map(|o| RowKey::new(T, 0, o)).collect();
+    seed_rows(&h.store, &backlog);
+
+    assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 100);
+    assert_eq!(offsets(&sent_records(&h)), (0..100).collect::<Vec<_>>());
+    assert!(
+        h.store.outbox_tick_due(Duration::ZERO),
+        "a full claim asks for another one at once"
+    );
+    assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 100);
+    assert_eq!(offsets(&sent_records(&h)), (100..200).collect::<Vec<_>>());
+}
+
+#[test]
+fn nothing_due_asks_for_no_immediate_poll() {
+    // The worker skips its receive wait while a poll is requested, so a claim
+    // that leaves nothing due, or rows the full forward channel did not take,
+    // must not request one: the worker would spin on the claim.
+    let h = async_harness(1);
+    h.store.db().state().settings.batch_size = 2;
+    seed_rows(
+        &h.store,
+        &[
+            RowKey::new(T, 0, 1),
+            RowKey::new(T, 0, 2),
+            RowKey::new(T, 0, 3),
+        ],
+    );
+    assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 1);
+    assert!(
+        !h.store.outbox_tick_due(Duration::ZERO),
+        "a row the full channel refused waits for the next interval"
+    );
+    drop(sent_records(&h));
+    assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 1);
+    drop(sent_records(&h));
+    assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 1);
+    drop(sent_records(&h));
+    assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 0);
+    assert!(!h.store.outbox_tick_due(Duration::ZERO), "nothing due");
 }
 
 #[test]
@@ -629,13 +717,13 @@ fn a_failed_ack_statement_keeps_its_acks_for_the_next_tick() {
     claimed_and_acked(&h, key);
 
     h.store.db().state().fail_apply_delivered = true;
-    assert_eq!(h.store.drain_forward_acks(), 0);
+    assert_eq!(drain(&h), 0);
     // The row is still in flight: the poll does not re-send it meanwhile.
     assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 0);
     assert_eq!(sent_records(&h).len(), 0);
 
     h.store.db().state().fail_apply_delivered = false;
-    assert_eq!(h.store.drain_forward_acks(), 1);
+    assert_eq!(drain(&h), 1);
     assert_delivered_once(&h, key);
 }
 
@@ -659,8 +747,69 @@ fn an_error_raised_while_applying_acks_does_not_lose_them() {
     );
 
     h.store.db().state().raise_in_apply_delivered = false;
-    assert_eq!(h.store.drain_forward_acks(), 1);
+    assert_eq!(drain(&h), 1);
     assert_delivered_once(&h, key);
+}
+
+#[test]
+fn acks_of_a_tick_whose_commit_failed_are_applied_again() {
+    // The ack application ran, then the tick's COMMIT failed: the database
+    // forgot it. Until a commit is reported the acks stay queued and their rows
+    // in flight (no re-send, no lost attempt counted), the counters do not
+    // move, and the next tick applies them again.
+    let h = async_harness(16);
+    let key = RowKey::new(T, 0, 3);
+    claimed_and_acked(&h, key);
+    let before = h.store.db().row(key).unwrap();
+    let metrics_before = h.store.db().state().metrics.clone();
+
+    assert_eq!(h.store.drain_forward_acks(), 1);
+    // The rollback of the failed COMMIT.
+    *h.store.db().state().tracking.get_mut(&key).unwrap() = before;
+    h.store.db().state().metrics = metrics_before;
+    assert_eq!(
+        h.store.metrics().forwarded.load(Ordering::Relaxed),
+        0,
+        "nothing counted before the commit"
+    );
+    assert_eq!(
+        h.store.poll_and_forward_outbox().unwrap(),
+        0,
+        "still in flight: not re-sent"
+    );
+    assert_eq!(sent_records(&h).len(), 0);
+
+    assert_eq!(drain(&h), 1, "applied again");
+    assert_eq!(h.store.metrics().forwarded.load(Ordering::Relaxed), 1);
+    assert_delivered_once(&h, key);
+}
+
+#[test]
+fn stale_in_flight_entries_do_not_use_up_the_in_flight_room() {
+    // MAX_INFLIGHT forwards whose acks were lost (a forwarder crash) are stale
+    // once evict_after passes: their rows are claimable again, and they must not
+    // keep the in-flight room at zero, which would stop every claim for good.
+    let mut h = async_harness(16);
+    h.store.inflight =
+        crate::kafka::shadow::inflight::InflightTracker::new(Duration::from_millis(20));
+    for o in 0..MAX_INFLIGHT {
+        assert!(h
+            .store
+            .inflight
+            .try_begin(RowKey::new(T + 1, 0, i64::try_from(o).unwrap())));
+    }
+    seed_rows(&h.store, &[RowKey::new(T, 0, 0)]);
+    assert_eq!(
+        h.store.poll_and_forward_outbox().unwrap(),
+        0,
+        "no room while the entries are live"
+    );
+    std::thread::sleep(Duration::from_millis(40));
+    assert_eq!(
+        h.store.poll_and_forward_outbox().unwrap(),
+        1,
+        "the stale entries no longer count against the room"
+    );
 }
 
 #[test]
@@ -744,7 +893,7 @@ fn metrics_disabled_still_finalizes_rows() {
     seed_rows(&h.store, &[RowKey::new(T, 0, 1)]);
     h.store.poll_and_forward_outbox().unwrap();
     h.acks.send(ok_ack(RowKey::new(T, 0, 1), 3)).unwrap();
-    h.store.drain_forward_acks();
+    drain(&h);
     assert_eq!(
         h.store
             .db()

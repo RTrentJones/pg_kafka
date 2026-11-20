@@ -85,5 +85,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         outbox_robustness::test_shadow_full_producer_queue_does_not_block_sync_timeouts: sequential,
         outbox_robustness::test_shadow_timed_out_transaction_buffer_is_dropped: sequential,
         outbox_robustness::test_shadow_ack_application_error_loses_no_ack: sequential,
+        outbox_robustness::test_shadow_failed_tick_commit_loses_no_ack: sequential,
+        outbox_robustness::test_shadow_stuck_partitions_do_not_throttle_a_backlog: sequential,
     ]
 }

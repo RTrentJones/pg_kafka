@@ -54,9 +54,17 @@ impl InflightTracker {
         self.lock().remove(key);
     }
 
-    /// Number of currently registered forwards (stale entries included).
+    /// Number of live forwards. Stale entries (older than `evict_after`: their
+    /// ack was lost, and the claim treats their rows as claimable again) are
+    /// dropped first, so lost acks never use up the in-flight room.
     pub fn len(&self) -> usize {
-        self.lock().len()
+        self.len_at(Instant::now())
+    }
+
+    fn len_at(&self, now: Instant) -> usize {
+        let mut entries = self.lock();
+        entries.retain(|_, started| now.saturating_duration_since(*started) < self.evict_after);
+        entries.len()
     }
 
     /// The live (non-evicted) in-flight keys, shaped for the outbox claim's
@@ -163,6 +171,25 @@ mod tests {
         let live = tracker.live_keys_at(t0 + EVICT);
         assert_eq!(live.topic_ids, vec![1]);
         assert_eq!(live.local_offsets, vec![11]);
+    }
+
+    /// Entries whose ack was lost stop counting once they are stale, so a
+    /// tracker filled with them recovers its room instead of staying full.
+    #[test]
+    fn test_len_drops_stale_entries() {
+        let tracker = InflightTracker::new(EVICT);
+        let t0 = Instant::now();
+        for o in 0..8_192 {
+            assert!(tracker.try_begin_at(RowKey::new(1, 0, o), t0));
+        }
+        assert!(tracker.try_begin_at(RowKey::new(2, 0, 0), t0 + EVICT / 2));
+        assert_eq!(tracker.len_at(t0 + EVICT / 2), 8_193);
+        assert_eq!(tracker.len_at(t0 + EVICT), 1, "only the live entry counts");
+        assert!(
+            !tracker.try_begin_at(RowKey::new(2, 0, 0), t0 + EVICT),
+            "a live entry is kept"
+        );
+        assert!(tracker.try_begin_at(RowKey::new(1, 0, 7), t0 + EVICT));
     }
 
     /// Distinct rows are tracked independently.

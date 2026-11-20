@@ -10,10 +10,11 @@
 #      `ALTER EXTENSION pg_kafka UPDATE`;
 #   4. fails unless B reports the current version, kept its data, and its kafka
 #      schema (columns, indexes, CHECK/foreign-key constraints, table/column/schema/function
-#      ACLs, function bodies, views, roles, the partitioning of kafka.messages) is identical
-#      to A's;
+#      ACLs, function bodies, views, comments, roles, the partitioning of kafka.messages) is
+#      identical to A's;
 #   5. checks the time partitions work on both (ADR-001): maintenance creates leaves,
-#      the converted 0.0.0 leaf drops whole, and pg_dump emits no kafka table.
+#      the converted 0.0.0 leaf drops whole, and pg_dump emits no kafka table (pg_dump
+#      must be present: PG_DUMP names it when it is not in `pg_config --bindir`).
 #
 # Both scratch databases are dropped afterwards. The background worker only serves
 # the database named by pg_kafka.database, so these databases do not disturb it.
@@ -143,6 +144,28 @@ JOIN pg_class t ON t.oid = d.refobjid
 JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = d.refobjsubid
 JOIN pg_namespace n ON n.oid = s.relnamespace
 WHERE n.nspname = 'kafka' AND d.deptype = 'a' ORDER BY 1;
+-- Comments (COMMENT ON) of the schema, its relations, their columns and the extension's
+-- functions: an upgrade that forgets to (re)write one leaves the 0.0.0 text or none.
+-- Leaves are left out: the converted 0.0.0 leaf keeps the comments the 0.0.0
+-- kafka.messages had, which no leaf of a fresh install has.
+SELECT 'comment schema ' || md5(d.description) FROM pg_description d
+WHERE d.classoid = 'pg_namespace'::regclass AND d.objoid = 'kafka'::regnamespace;
+SELECT 'comment ' || c.relname || coalesce('.' || a.attname, '') || ' ' || md5(d.description)
+FROM pg_description d JOIN pg_class c ON c.oid = d.objoid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+LEFT JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = d.objsubid AND d.objsubid > 0
+WHERE d.classoid = 'pg_class'::regclass AND n.nspname = 'kafka'
+  AND c.oid NOT IN (SELECT oid FROM leaves) ORDER BY 1;
+SELECT 'comment function ' || p.oid::regprocedure::text || ' ' || md5(d.description)
+FROM pg_description d JOIN pg_proc p ON p.oid = d.objoid
+JOIN pg_depend dep ON dep.objid = p.oid AND dep.deptype = 'e'
+JOIN pg_extension e ON e.oid = dep.refobjid AND e.extname = 'pg_kafka'
+WHERE d.classoid = 'pg_proc'::regclass ORDER BY 1;
+-- Producer ids start from the extension's creation time (milliseconds since the epoch),
+-- in a fresh install and after the upgrade alike, so a recreated extension never hands
+-- out an id an earlier one used. Only whether the start is time-based is comparable.
+SELECT 'producer-id-seq-time-based ' || (last_value > 1700000000000)
+FROM kafka.producer_ids_producer_id_seq;
 SELECT 'role ' || rolname || ' login=' || rolcanlogin FROM pg_roles
 WHERE rolname IN ('pgkafka_reader', 'pgkafka_worker') ORDER BY 1;
 SQL
@@ -210,9 +233,15 @@ fi
 
 # Leaves are extension members: pg_dump leaves them out exactly like kafka.messages
 # itself (a dump holds CREATE EXTENSION only), so a restore never meets an orphan leaf.
-PG_DUMP="$("$PG_CONFIG" --bindir)/pg_dump"
-if [ -x "$PG_DUMP" ]; then
-  dumped="$("$PG_DUMP" -d "$OLD_DB" | grep -c 'CREATE TABLE kafka\.' || true)"
+PG_DUMP="${PG_DUMP:-$("$PG_CONFIG" --bindir)/pg_dump}"
+if [ ! -x "$PG_DUMP" ]; then
+  echo "ERROR: pg_dump not found at $PG_DUMP (set PG_DUMP); the extension-member check needs it" >&2
+  status=1
+elif ! dump="$("$PG_DUMP" -d "$OLD_DB")"; then
+  echo "ERROR: pg_dump of $OLD_DB failed" >&2
+  status=1
+else
+  dumped="$(grep -c 'CREATE TABLE kafka\.' <<<"$dump" || true)"
   if [ "$dumped" != "0" ]; then
     echo "ERROR: pg_dump emitted $dumped kafka table(s); leaves must be extension members" >&2
     status=1
