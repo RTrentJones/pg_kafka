@@ -6,7 +6,9 @@
 //! - the transaction-timeout sweep drops the forward buffers of the
 //!   transactions it aborts;
 //! - an ERROR while applying forward acks loses no ack (no lost-attempt count,
-//!   no duplicate delivery).
+//!   no duplicate delivery);
+//! - partitions with nothing due take no share of a claim, and a backlog
+//!   drains claim after claim.
 
 use crate::common::{create_db_client, create_producer, TestResult};
 use crate::setup::TestContext;
@@ -471,6 +473,137 @@ pub async fn test_shadow_ack_application_error_loses_no_ack() -> TestResult {
         .await
     {
         eprintln!("⚠️  cleanup: failed to drop trigger {trigger}: {e}");
+    }
+    ctx.cleanup().await?;
+    result?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// Wait until no outbox row of `topic_id` is undelivered; the time it took.
+async fn drained_within(
+    db: &Client,
+    topic_id: i32,
+    limit: Duration,
+) -> Result<Duration, Box<dyn std::error::Error>> {
+    let start = Instant::now();
+    loop {
+        let left = undelivered(db, topic_id).await?;
+        if left == 0 {
+            return Ok(start.elapsed());
+        }
+        if start.elapsed() > limit {
+            return Err(format!("{left} row(s) still undelivered after {limit:?}").into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Partitions whose pending rows cannot be claimed (here 500 orphan pointers whose
+/// messages are gone; dead letters and rows in flight or backing off are alike) take
+/// no share of a claim, so a replayed backlog on another topic still drains at full
+/// claims, not a few rows per claim. And a backlog drains claim after claim: with
+/// `pg_kafka.shadow_batch_size = 10` the worker does not wait for requests between
+/// claims that leave rows due.
+pub async fn test_shadow_stuck_partitions_do_not_throttle_a_backlog() -> TestResult {
+    const BACKLOG: usize = 2_000;
+    const STUCK_PARTITIONS: i32 = 500;
+    println!("=== Test: stuck partitions do not throttle a backlog ===\n");
+    let ctx = TestContext::new().await?;
+    let stuck_topic = ctx.unique_topic("shadow-stuck").await;
+    let backlog_topic = ctx.unique_topic("shadow-unthrottled").await;
+    verify_external_kafka_ready().await?;
+    enable_shadow_mode(
+        ctx.db(),
+        &stuck_topic,
+        &config(ShadowMode::LocalOnly, SyncMode::Async),
+    )
+    .await?;
+    enable_shadow_mode(
+        ctx.db(),
+        &backlog_topic,
+        &config(ShadowMode::LocalOnly, SyncMode::Async),
+    )
+    .await?;
+    let stuck_id = topic_id(ctx.db(), &stuck_topic).await?;
+    let backlog_id = topic_id(ctx.db(), &backlog_topic).await?;
+    let db = create_db_client().await?;
+
+    let result = async {
+        println!("Step 1: {BACKLOG} records stored locally, not forwarded...");
+        let producer = bulk_producer()?;
+        let mut sends = Vec::with_capacity(BACKLOG);
+        for i in 0..BACKLOG {
+            let key = format!("k{i}");
+            let record = FutureRecord::to(&backlog_topic)
+                .key(key.as_bytes())
+                .payload("backlog")
+                .partition(0);
+            sends.push(producer.send_result(record).map_err(|(e, _)| e)?);
+        }
+        for send in sends {
+            send.await?.map_err(|(e, _)| e)?;
+        }
+        enable_shadow_mode(
+            ctx.db(),
+            &backlog_topic,
+            &config(ShadowMode::Shadow, SyncMode::Async),
+        )
+        .await?;
+
+        println!(
+            "Step 2: {STUCK_PARTITIONS} partitions with only orphan outbox rows, then replay..."
+        );
+        ctx.db()
+            .execute(
+                "INSERT INTO kafka.shadow_tracking (topic_id, partition_id, local_offset) \
+                 SELECT $1, g, 1000000 FROM generate_series(0, $2 - 1) AS g",
+                &[&stuck_id, &STUCK_PARTITIONS],
+            )
+            .await?;
+        ctx.db()
+            .query_one(
+                "SELECT kafka.replay_shadow_messages($1, 0, NULL)",
+                &[&backlog_id],
+            )
+            .await?;
+        let took = drained_within(ctx.db(), backlog_id, Duration::from_secs(20)).await?;
+        println!("  drained next to {STUCK_PARTITIONS} stuck partitions in {took:?}");
+        ctx.db()
+            .execute(
+                "DELETE FROM kafka.shadow_tracking WHERE topic_id = $1",
+                &[&stuck_id],
+            )
+            .await?;
+
+        println!("Step 3: shadow_batch_size = 10, replay again...");
+        alter_system(&db, "ALTER SYSTEM SET pg_kafka.shadow_batch_size = 10").await?;
+        ctx.db()
+            .query_one(
+                "SELECT kafka.replay_shadow_messages($1, 0, NULL)",
+                &[&backlog_id],
+            )
+            .await?;
+        // 200 claims: at one claim per 100 ms receive wait this takes 20 s.
+        let took = drained_within(ctx.db(), backlog_id, Duration::from_secs(10)).await?;
+        println!("  {BACKLOG} rows in claims of 10 drained in {took:?}");
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await
+    .map_err(|e| e.to_string());
+
+    if let Err(e) = alter_system(&db, "ALTER SYSTEM RESET pg_kafka.shadow_batch_size").await {
+        eprintln!("⚠️  cleanup: failed to reset pg_kafka.shadow_batch_size: {e}");
+    }
+    if let Err(e) = ctx
+        .db()
+        .execute(
+            "DELETE FROM kafka.shadow_tracking WHERE topic_id = $1",
+            &[&stuck_id],
+        )
+        .await
+    {
+        eprintln!("⚠️  cleanup: failed to delete the orphan rows: {e}");
     }
     ctx.cleanup().await?;
     result?;

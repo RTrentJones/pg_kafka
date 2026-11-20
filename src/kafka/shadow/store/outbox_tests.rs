@@ -591,6 +591,87 @@ fn a_backlog_does_not_starve_other_partitions() {
 }
 
 #[test]
+fn partitions_with_nothing_due_take_no_share_of_the_claim() {
+    // Partitions whose pending rows cannot be claimed now (dead letters, which
+    // stay pending until a replay; an orphan pointer whose message retention
+    // deleted; a row in flight; a row backing off after a failure) must not
+    // shrink the share of the partitions that have rows due: a backlog next to
+    // 100 dead-letter partitions still gets the whole batch.
+    let h = async_harness(512);
+    h.store.db().add_topic(T + 1, "stuck", None);
+    h.store.db().state().settings.batch_size = 100;
+    let in_flight = RowKey::new(T + 1, 102, 0);
+    seed_rows(&h.store, &[in_flight]);
+    assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 1);
+    drop(sent_records(&h));
+
+    let cap = h.store.db().state().settings.max_retries;
+    for p in 0..100 {
+        let dead = RowKey::new(T + 1, p, 0);
+        seed_rows(&h.store, &[dead]);
+        h.store
+            .db()
+            .state()
+            .tracking
+            .get_mut(&dead)
+            .unwrap()
+            .retry_count = cap;
+    }
+    let orphan = RowKey::new(T + 1, 100, 0);
+    seed_rows(&h.store, &[orphan]);
+    h.store.db().state().messages.remove(&orphan);
+    let backing_off = RowKey::new(T + 1, 101, 0);
+    seed_rows(&h.store, &[backing_off]);
+    {
+        let mut s = h.store.db().state();
+        let now = s.now_ms;
+        let row = s.tracking.get_mut(&backing_off).unwrap();
+        row.retry_count = 1;
+        row.forwarded_at = Some(now);
+    }
+    let backlog: Vec<RowKey> = (0..300).map(|o| RowKey::new(T, 0, o)).collect();
+    seed_rows(&h.store, &backlog);
+
+    assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 100);
+    assert_eq!(offsets(&sent_records(&h)), (0..100).collect::<Vec<_>>());
+    assert!(
+        h.store.outbox_tick_due(Duration::ZERO),
+        "a full claim asks for another one at once"
+    );
+    assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 100);
+    assert_eq!(offsets(&sent_records(&h)), (100..200).collect::<Vec<_>>());
+}
+
+#[test]
+fn nothing_due_asks_for_no_immediate_poll() {
+    // The worker skips its receive wait while a poll is requested, so a claim
+    // that leaves nothing due, or rows the full forward channel did not take,
+    // must not request one: the worker would spin on the claim.
+    let h = async_harness(1);
+    h.store.db().state().settings.batch_size = 2;
+    seed_rows(
+        &h.store,
+        &[
+            RowKey::new(T, 0, 1),
+            RowKey::new(T, 0, 2),
+            RowKey::new(T, 0, 3),
+        ],
+    );
+    assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 1);
+    assert!(
+        !h.store.outbox_tick_due(Duration::ZERO),
+        "a row the full channel refused waits for the next interval"
+    );
+    drop(sent_records(&h));
+    assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 1);
+    drop(sent_records(&h));
+    assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 1);
+    drop(sent_records(&h));
+    assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 0);
+    assert!(!h.store.outbox_tick_due(Duration::ZERO), "nothing due");
+}
+
+#[test]
 fn the_partition_share_is_an_equal_split_of_at_least_one() {
     assert_eq!(per_partition_claim_cap(1000, 1), 1000);
     assert_eq!(per_partition_claim_cap(1000, 0), 1000);

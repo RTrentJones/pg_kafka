@@ -543,7 +543,8 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
 
     /// Whether the worker's outbox tick should run now, `since_last` after the
     /// previous one: every `OUTBOX_POLL_INTERVAL`, at once when requested, and
-    /// never during a failure backoff.
+    /// never during a failure backoff. With `Duration::ZERO`: whether a tick is
+    /// wanted at once, so the worker should not wait for requests first.
     pub fn outbox_tick_due(&self, since_last: Duration) -> bool {
         if lock(&self.outbox_failures)
             .paused_until
@@ -678,8 +679,10 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
                 .map_err(|e| super::error::ShadowError::DatabaseError(e.to_string()))?;
         }
         // A full claim, or a partition that used its whole share, means more
-        // rows are probably due: poll again at once.
-        if more_due {
+        // rows are probably due: poll again at once. Not when the channel
+        // refused rows: an immediate poll would claim them again and spin
+        // (the worker skips its receive wait while a poll is requested).
+        if more_due && not_sent.is_empty() {
             self.poll_requested.store(true, Ordering::Relaxed);
         }
         Ok(dispatched)

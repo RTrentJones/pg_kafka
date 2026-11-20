@@ -165,13 +165,14 @@ impl State {
 }
 
 /// The candidates due now, at most `batch_limit`, each with its `restart` flag
-/// (it is its partition's lowest candidate), in key order. Rows in flight or
-/// backing off are not due, and a backing-off row that is not in flight blocks
-/// every later row of its partition, so a retry is never overtaken by a later
-/// record. Each partition contributes its lowest due rows, at most
-/// [`per_partition_claim_cap`] over the `partitions` with pending rows, and the
-/// rows are taken round-robin across partitions up to the limit.
-fn due_rows(candidates: &[Candidate], batch_limit: i64, partitions: usize) -> Vec<(RowKey, bool)> {
+/// (it is its partition's lowest candidate), in key order, and the per-partition
+/// share. Rows in flight or backing off are not due, and a backing-off row that
+/// is not in flight blocks every later row of its partition, so a retry is never
+/// overtaken by a later record. Each partition with a due row contributes its
+/// lowest due rows, at most [`per_partition_claim_cap`] over the partitions with
+/// a due row, and the rows are taken round-robin across partitions up to the
+/// limit.
+fn due_rows(candidates: &[Candidate], batch_limit: i64) -> (Vec<(RowKey, bool)>, i64) {
     let mut head: HashMap<(i32, i32), i64> = HashMap::new();
     let mut blocked: HashMap<(i32, i32), i64> = HashMap::new();
     for c in candidates {
@@ -181,17 +182,28 @@ fn due_rows(candidates: &[Candidate], batch_limit: i64, partitions: usize) -> Ve
             blocked.entry(part).or_insert(c.key.local_offset);
         }
     }
-    let cap = usize::try_from(per_partition_claim_cap(batch_limit, partitions)).unwrap_or(0);
+    let eligible: Vec<&Candidate> = candidates
+        .iter()
+        .filter(|c| {
+            !c.in_flight
+                && !c.backing_off
+                && blocked
+                    .get(&c.key.partition())
+                    .is_none_or(|&b| c.key.local_offset < b)
+        })
+        .collect();
+    // The claim's `due_parts`: only partitions with a due row share the batch.
+    let due_partitions = eligible
+        .iter()
+        .map(|c| c.key.partition())
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    let share = per_partition_claim_cap(batch_limit, due_partitions);
+    let cap = usize::try_from(share).unwrap_or(0);
     // Per partition, its first `cap` due rows, ranked from 0.
     let mut taken: HashMap<(i32, i32), usize> = HashMap::new();
     let mut ranked: Vec<(usize, RowKey)> = Vec::new();
-    for c in candidates.iter().filter(|c| {
-        !c.in_flight
-            && !c.backing_off
-            && blocked
-                .get(&c.key.partition())
-                .is_none_or(|&b| c.key.local_offset < b)
-    }) {
+    for c in eligible {
         let n = taken.entry(c.key.partition()).or_default();
         if *n < cap {
             ranked.push((*n, c.key));
@@ -206,7 +218,7 @@ fn due_rows(candidates: &[Candidate], batch_limit: i64, partitions: usize) -> Ve
         .map(|(_, key)| (key, head[&key.partition()] == key.local_offset))
         .collect();
     due.sort_by_key(|&(key, _)| key);
-    due
+    (due, share)
 }
 
 /// In-memory [`ShadowDb`].
@@ -334,22 +346,14 @@ impl ShadowDb for InMemoryShadowDb {
         }
         let now = s.now_ms;
         let candidates = s.claim_candidates(claim, now);
-        // The claim's `parts`: every partition with a pending row.
-        let partitions = s
-            .tracking
-            .iter()
-            .filter(|(_, r)| r.external_offset.is_none())
-            .map(|(k, _)| k.partition())
-            .collect::<std::collections::HashSet<_>>()
-            .len();
-        let due = due_rows(&candidates, claim.batch_limit, partitions);
+        let (due, share) = due_rows(&candidates, claim.batch_limit);
         let mut out = ClaimedRows::default();
         for (key, restart) in due {
             s.open_attempt(key, now);
             // The JOIN with kafka.topics drops a row whose topic is gone.
             if let Some(record) = s.forward_record(key, restart) {
                 out.records.push(record);
-                out.partition_share = per_partition_claim_cap(claim.batch_limit, partitions);
+                out.partition_share = share;
             }
         }
         Ok(out)

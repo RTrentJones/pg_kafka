@@ -87,11 +87,13 @@ pub struct OutboxClaim {
 }
 
 /// How many due rows of one partition a claim of `batch_limit` rows takes
-/// when `partitions` partitions have pending rows: an equal share, at least 1.
+/// when `partitions` partitions have a row due: an equal share, at least 1.
 /// A partition with a backlog then cannot fill every claim while the others
 /// (another topic's live traffic, a sync-mode produce waiting for its ack)
 /// wait behind it, and each partition still gets a contiguous run of its
-/// lowest due offsets, so its order holds.
+/// lowest due offsets, so its order holds. Partitions whose pending rows are
+/// not due (dead letters, orphans, rows in flight or backing off) take no
+/// share, so they cannot slow the others down.
 #[cfg_attr(
     not(test),
     expect(
@@ -198,9 +200,9 @@ pub trait ShadowDb {
     /// attempt counts as one failure. Claiming opens an attempt and stamps
     /// `forwarded_at`. `restart` is set on the lowest candidate of each partition.
     ///
-    /// The batch is shared between partitions: at most
-    /// [`per_partition_claim_cap`] due rows of each partition (its lowest ones),
-    /// taken round-robin across partitions up to `batch_limit`.
+    /// The batch is shared between the partitions that have a due row: at most
+    /// [`per_partition_claim_cap`] due rows of each (its lowest ones), taken
+    /// round-robin across partitions up to `batch_limit`.
     fn claim_due_outbox_rows(&self, claim: &OutboxClaim) -> Result<ClaimedRows>;
 
     /// Mark pending rows delivered at their external offsets (and count them in
@@ -281,6 +283,39 @@ pub fn topic_config_from_row<R: ConfigColumns>(
         sync_mode: SyncMode::parse(&text("sync_mode")?),
         write_mode: WriteMode::parse(&text("write_mode")?),
     })
+}
+
+/// The claim's due rows of the partition `p` (with its `blocked` row `b`): the
+/// `FROM ... WHERE` of a select over `kafka.shadow_tracking st`, shared by the
+/// probe that finds the partitions with a due row and the select that takes
+/// them, so the two cannot disagree. `$2` is the retry cap, `$6`/`$7` the
+/// backoff base and max, `inf` the in-flight rows.
+macro_rules! due_rows_of_partition {
+    () => {
+        r"
+                        FROM kafka.shadow_tracking st
+                        CROSS JOIN LATERAL (
+                            SELECT 1 FROM kafka.messages m
+                            WHERE m.topic_id = st.topic_id
+                              AND m.partition_id = st.partition_id
+                              AND m.partition_offset = st.local_offset
+                            LIMIT 1
+                        ) has_message
+                        WHERE st.topic_id = p.topic_id
+                          AND st.partition_id = p.partition_id
+                          AND st.external_offset IS NULL
+                          AND st.retry_count < $2
+                          AND (b.first_blocked IS NULL OR st.local_offset < b.first_blocked)
+                          AND NOT (st.retry_count > 0 AND NOT st.attempt_open
+                                   AND st.forwarded_at > NOW() - make_interval(secs =>
+                                       LEAST($6::float8 * power(2::float8, LEAST(st.retry_count - 1, 30)),
+                                             $7::float8) / 1000.0))
+                          AND NOT EXISTS (
+                              SELECT 1 FROM inf
+                              WHERE inf.t = st.topic_id AND inf.p = st.partition_id
+                                AND inf.o = st.local_offset)
+                        "
+    };
 }
 
 /// Production [`ShadowDb`]: SPI and the real GUCs.
@@ -451,7 +486,8 @@ impl ShadowDb for SpiShadowDb {
             (claim.backoff_base_ms as f64, claim.backoff_max_ms as f64);
         Spi::connect_mut(|client| {
             let table = client.update(
-                r"
+                concat!(
+                    r"
                 WITH RECURSIVE inf AS (
                     SELECT * FROM unnest($3::int4[], $4::int4[], $5::int8[]) AS i(t, p, o)
                 ),
@@ -475,11 +511,6 @@ impl ShadowDb for SpiShadowDb {
                         LIMIT 1
                     ) nxt
                 ),
-                -- Each partition's share of the batch (see per_partition_claim_cap).
-                share AS (
-                    SELECT GREATEST(1, CEIL($1::numeric / GREATEST(COUNT(*), 1)))::int8 AS k
-                    FROM parts
-                ),
                 -- The first backing-off row of each partition: it failed, its
                 -- attempt is closed and its backoff has not passed. Only failed
                 -- rows are looked at (idx_shadow_tracking_retrying), so this does
@@ -500,6 +531,25 @@ impl ShadowDb for SpiShadowDb {
                             AND inf.o = st.local_offset)
                     GROUP BY st.topic_id, st.partition_id
                 ),
+                -- The partitions with a row due now (one probe each). Only they
+                -- share the batch: a partition holding only dead letters, orphan
+                -- pointers, or rows in flight or backing off would otherwise take
+                -- a share it cannot use, and with many of them a backlog elsewhere
+                -- would get a few rows per claim.
+                due_parts AS MATERIALIZED (
+                    SELECT p.topic_id, p.partition_id
+                    FROM parts p
+                    LEFT JOIN blocked b
+                      ON b.topic_id = p.topic_id AND b.partition_id = p.partition_id
+                    WHERE EXISTS (SELECT 1 ",
+                    due_rows_of_partition!(),
+                    r")
+                ),
+                -- Each partition's share of the batch (see per_partition_claim_cap).
+                share AS (
+                    SELECT GREATEST(1, CEIL($1::numeric / GREATEST(COUNT(*), 1)))::int8 AS k
+                    FROM due_parts
+                ),
                 -- Due rows: the first k of each partition in offset order (read
                 -- from the pending index and cut at k, so the cost is
                 -- O(partitions + limit), not O(backlog)), then taken round-robin
@@ -507,34 +557,16 @@ impl ShadowDb for SpiShadowDb {
                 -- cannot fill every claim while the others wait.
                 due AS (
                     SELECT d.topic_id, d.partition_id, d.local_offset
-                    FROM parts p
+                    FROM due_parts p
                     CROSS JOIN share
                     LEFT JOIN blocked b
                       ON b.topic_id = p.topic_id AND b.partition_id = p.partition_id
                     CROSS JOIN LATERAL (
                         SELECT st.topic_id, st.partition_id, st.local_offset,
                                row_number() OVER (ORDER BY st.local_offset) AS rn
-                        FROM kafka.shadow_tracking st
-                        CROSS JOIN LATERAL (
-                            SELECT 1 FROM kafka.messages m
-                            WHERE m.topic_id = st.topic_id
-                              AND m.partition_id = st.partition_id
-                              AND m.partition_offset = st.local_offset
-                            LIMIT 1
-                        ) has_message
-                        WHERE st.topic_id = p.topic_id
-                          AND st.partition_id = p.partition_id
-                          AND st.external_offset IS NULL
-                          AND st.retry_count < $2
-                          AND (b.first_blocked IS NULL OR st.local_offset < b.first_blocked)
-                          AND NOT (st.retry_count > 0 AND NOT st.attempt_open
-                                   AND st.forwarded_at > NOW() - make_interval(secs =>
-                                       LEAST($6::float8 * power(2::float8, LEAST(st.retry_count - 1, 30)),
-                                             $7::float8) / 1000.0))
-                          AND NOT EXISTS (
-                              SELECT 1 FROM inf
-                              WHERE inf.t = st.topic_id AND inf.p = st.partition_id
-                                AND inf.o = st.local_offset)
+                        ",
+                    due_rows_of_partition!(),
+                    r"
                         ORDER BY st.local_offset
                         LIMIT share.k
                     ) d
@@ -602,7 +634,8 @@ impl ShadowDb for SpiShadowDb {
                     LIMIT 1
                 ) m ON true
                 ORDER BY c.topic_id, c.partition_id, c.local_offset
-                ",
+                "
+                ),
                 None,
                 &[
                     claim.batch_limit.into(),

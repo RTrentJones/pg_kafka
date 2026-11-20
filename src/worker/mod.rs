@@ -343,7 +343,10 @@ impl MainLoop<'_> {
     }
 
     /// Serve one liveness batch, then wait up to [`RECV_TIMEOUT`] for a main-lane request
-    /// (served with everything queued behind it) or SASL credential lookups.
+    /// (served with everything queued behind it) or SASL credential lookups. The wait is
+    /// skipped when the shadow outbox asked for its next tick at once (a claim that
+    /// left more rows due), so a backlog drains claim after claim instead of one claim
+    /// per [`RECV_TIMEOUT`]; the outbox asks only after a claim that found work.
     ///
     /// DR-12: the liveness lane is drained before the next main-lane request.
     /// Heartbeats are served from the in-memory coordinator in microseconds, and those
@@ -356,6 +359,13 @@ impl MainLoop<'_> {
         if let Ok(request) = inbox.liveness.try_recv() {
             execute_batch(request, &inbox.liveness, None, self.env);
         }
+        let wait = if crate::config::SHADOW_MODE_ENABLED.get()
+            && self.env.shadow_store.outbox_tick_due(Duration::ZERO)
+        {
+            Duration::ZERO
+        } else {
+            RECV_TIMEOUT
+        };
         let received = crossbeam_channel::select! {
             recv(inbox.requests) -> r => r.map_err(|_| RecvTimeoutError::Disconnected),
             recv(inbox.credentials) -> c => {
@@ -364,7 +374,7 @@ impl MainLoop<'_> {
                 }
                 Err(RecvTimeoutError::Timeout)
             },
-            default(RECV_TIMEOUT) => Err(RecvTimeoutError::Timeout),
+            default(wait) => Err(RecvTimeoutError::Timeout),
         };
         match received {
             Ok(request) => {
