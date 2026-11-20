@@ -25,12 +25,17 @@ as an upgrade script `sql/pg_kafka--<from>--<to>.sql`; `cargo pgrx install` and
    older pg_kafka schema (version 0.0.0, library 0.1.0): answering Kafka requests with
    KAFKA_STORAGE_ERROR and running no maintenance until ALTER EXTENSION pg_kafka UPDATE
    (missing: ...)`). Until step 3, clients see what they see while the extension is
-   dropped: the Kafka port accepts connections, every request (ApiVersions and Metadata
-   included) is answered with the retriable `KAFKA_STORAGE_ERROR` (56), and SASL logins
-   fail (their credential lookups are refused, so the exchange ends in
-   `SASL_AUTHENTICATION_FAILED`). Kafka clients retry those requests, so producers queue
-   their records (up to their own `delivery.timeout.ms` / `message.timeout.ms`) and
-   consumers stall; nothing is written. Keep the window between the restart and step 3
+   dropped: the Kafka port accepts connections and every request the worker serves
+   (ApiVersions and Metadata included) is answered with the retriable
+   `KAFKA_STORAGE_ERROR` (56). On a SASL listener the network thread still answers
+   ApiVersions and SaslHandshake, but the credential lookup of the SaslAuthenticate is
+   refused, and the broker then closes the connection without answering it: the
+   credentials were not checked, so it is not reported as `SASL_AUTHENTICATION_FAILED`
+   (which the Java client treats as fatal). Kafka clients reconnect after a disconnect
+   and retry a retriable error, so producers queue their records (up to their own
+   `delivery.timeout.ms` / `message.timeout.ms`) and consumers stall; nothing is
+   written. A SASL client logs a disconnect on every reconnect attempt
+   (`reconnect.backoff.ms`, up to `reconnect.backoff.max.ms`) until step 3. Keep the window between the restart and step 3
    short. The worker runs no maintenance in the meantime;
    `pg_kafka_run_retention_sweep()` still works from SQL (row by row on the
    unpartitioned 0.0.0 `kafka.messages`).

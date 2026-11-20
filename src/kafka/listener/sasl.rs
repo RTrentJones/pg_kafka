@@ -121,6 +121,16 @@ impl ConnectionAuth {
                 let _ = response_tx.send(response);
                 false
             }
+            SaslOutcome::Unavailable { reason } => {
+                timer.mark_error();
+                warn!(
+                    "Closing connection from {} on {} without an answer: SASL credential \
+                     lookup unavailable ({reason}); the client reconnects and retries",
+                    self.peer,
+                    self.security.describe()
+                );
+                false
+            }
             SaslOutcome::Failed { response, reason } => {
                 // Never includes the password; no username either (it may be a mistyped
                 // password).

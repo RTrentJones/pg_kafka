@@ -282,6 +282,12 @@ pub enum SaslOutcome {
         response: KafkaResponse,
         reason: String,
     },
+    /// The credential lookup was not answered (the DB thread refused it while the
+    /// schema is missing or older than the library, timed out, or failed): close the
+    /// connection without a response. The credentials were never checked, so this is
+    /// not an authentication failure, which the Java client treats as fatal; a
+    /// disconnect every Kafka client retries. `reason` is for the server log only.
+    Unavailable { reason: String },
 }
 
 enum State {
@@ -458,7 +464,11 @@ impl SaslSession {
         };
         let stored = match lookup.lookup(&creds.username, None).await {
             Ok(s) => s,
-            Err(e) => return reply.failed(format!("PLAIN: {e}")),
+            Err(e) => {
+                return SaslOutcome::Unavailable {
+                    reason: format!("PLAIN: {e}"),
+                }
+            }
         };
         let principal = format!("User:{}", creds.username);
         if !check_password(creds, stored).await {
@@ -486,7 +496,11 @@ impl SaslSession {
         };
         let stored = match lookup.lookup(&first.username, Some(mechanism)).await {
             Ok(s) => s,
-            Err(e) => return reply.failed(format!("{}: {e}", mechanism.name())),
+            Err(e) => {
+                return SaslOutcome::Unavailable {
+                    reason: format!("{}: {e}", mechanism.name()),
+                }
+            }
         };
         let (known, fake) = match stored {
             StoredCredential::Known(c) => (Some(c), None),
@@ -757,7 +771,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plain_wrong_password_unknown_user_and_db_error_fail() {
+    async fn plain_wrong_password_and_unknown_user_fail() {
         for (lookup, msg) in [
             (
                 MapLookup::with_user("alice", "secret"),
@@ -768,13 +782,6 @@ mod tests {
                 &b"\0bob\0secret"[..],
             ),
             (MapLookup::with_user("alice", "secret"), &b"no-nuls"[..]),
-            (
-                MapLookup {
-                    fail: true,
-                    ..MapLookup::with_user("alice", "secret")
-                },
-                &b"\0alice\0secret"[..],
-            ),
         ] {
             let mut s = SaslSession::new(true, all_mechanisms());
             s.handle(handshake("PLAIN"), &lookup).await;
@@ -782,6 +789,38 @@ mod tests {
             assert_failed(&outcome);
             if let SaslOutcome::Failed { reason, .. } = &outcome {
                 assert!(!reason.contains("secret") && !reason.contains("wrong"));
+            }
+            assert!(!s.is_authenticated() && !s.admits(0));
+        }
+    }
+
+    /// A lookup the DB thread could not answer (old or missing schema, timeout) is no
+    /// verdict on the credentials: the connection closes without an answer, which
+    /// clients retry, instead of a SASL_AUTHENTICATION_FAILED the Java client treats as
+    /// fatal. For PLAIN and for the SCRAM client-first message.
+    #[tokio::test]
+    async fn unanswered_lookup_closes_without_an_authentication_failure() {
+        let lookup = MapLookup {
+            fail: true,
+            ..MapLookup::with_user("alice", "secret")
+        };
+        let scram_first = b"n,,n=alice,r=clientnonce".as_slice();
+        for (mechanism, token) in [
+            ("PLAIN", &b"\0alice\0secret"[..]),
+            ("SCRAM-SHA-256", scram_first),
+            ("SCRAM-SHA-512", scram_first),
+        ] {
+            let mut s = SaslSession::new(true, all_mechanisms());
+            assert_eq!(
+                handshake_error(&s.handle(handshake(mechanism), &lookup).await),
+                0
+            );
+            match s.handle(authenticate(token), &lookup).await {
+                SaslOutcome::Unavailable { reason } => {
+                    assert!(reason.contains("db down"), "{mechanism}: {reason}");
+                    assert!(!reason.contains("secret"), "{mechanism}: {reason}");
+                }
+                other => panic!("{mechanism}: expected a close without answer, got {other:?}"),
             }
             assert!(!s.is_authenticated() && !s.admits(0));
         }
