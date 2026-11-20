@@ -96,7 +96,7 @@ producer sent none, which is what local consumers see). `partition` is left to t
 The records of one local partition reach the external topic in local-offset order (the first copy
 of each; see duplicates below). That rests on:
 
-1. **The claim.** Rows are claimed in row-key order and dispatched over one FIFO channel. A row is
+1. **The claim.** Each claim takes up to an equal share of `shadow_batch_size` from every partition with pending rows (its lowest due offsets), round-robin across partitions, and dispatches them in row-key order over one FIFO channel. A row is
    never claimed behind an earlier row of its partition that is backing off after a failure.
 2. **The producer.** `enable.idempotence=true`, `acks=all`, `max.in.flight.requests.per.connection=5`
    keep the order on the wire through librdkafka's own retries. `enable.gapless.guarantee=true`
