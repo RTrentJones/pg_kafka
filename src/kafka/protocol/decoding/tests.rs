@@ -134,6 +134,109 @@ fn corrupt_produce_frame(acks: i16) -> BytesMut {
     frame(&req, 7, 77)
 }
 
+/// A Produce whose partitions each carry `per_partition` bytes of zeros as one
+/// gzip-compressed record: a few hundred KB on the wire however large it decodes.
+fn gzip_bomb_frame(partitions: i32, per_partition: usize, acks: i16) -> BytesMut {
+    use kafka_protocol::messages::produce_request::{
+        PartitionProduceData, ProduceRequest, TopicProduceData,
+    };
+    use kafka_protocol::records::{
+        Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
+    };
+    let record = Record {
+        transactional: false,
+        control: false,
+        partition_leader_epoch: 0,
+        producer_id: -1,
+        producer_epoch: -1,
+        timestamp_type: TimestampType::Creation,
+        offset: 0,
+        sequence: -1,
+        timestamp: 0,
+        key: None,
+        value: Some(bytes::Bytes::from(vec![0u8; per_partition])),
+        headers: kafka_protocol::indexmap::IndexMap::default(),
+    };
+    let mut batch = BytesMut::new();
+    RecordBatchEncoder::encode(
+        &mut batch,
+        [record].iter(),
+        &RecordEncodeOptions {
+            version: 2,
+            compression: Compression::Gzip,
+        },
+    )
+    .unwrap();
+    let batch = batch.freeze();
+    let mut t = TopicProduceData::default();
+    t.name = topic("t");
+    for index in 0..partitions {
+        let mut p = PartitionProduceData::default();
+        p.index = index;
+        p.records = Some(batch.clone());
+        t.partition_data.push(p);
+    }
+    let mut req = ProduceRequest::default();
+    req.acks = acks;
+    req.timeout_ms = 1000;
+    req.topic_data = vec![t];
+    frame(&req, 7, 78)
+}
+
+/// Two partitions of 60 MB of gzip-compressed zeros: each batch alone is legal, but the
+/// request decodes past the per-request limit. It is refused with MESSAGE_TOO_LARGE on
+/// every partition (and closes an acks=0 connection) instead of being held decoded.
+#[test]
+fn test_produce_decoding_past_the_request_limit_is_refused() {
+    let frame = gzip_bomb_frame(2, 60_000_000, 1);
+    assert!(frame.len() < 1_000_000, "the bomb is small on the wire");
+    let (tx, mut rx) = channel();
+    let parsed = parse_request(frame, tx).unwrap();
+    assert!(parsed.is_none(), "the request must not reach the DB thread");
+    match rx.try_recv() {
+        Ok(KafkaResponse {
+            body: ResponseBody::Produce(response),
+            ..
+        }) => {
+            let codes: Vec<i16> = response.responses[0]
+                .partition_responses
+                .iter()
+                .map(|p| p.error_code)
+                .collect();
+            assert_eq!(codes, vec![10, 10], "MESSAGE_TOO_LARGE per partition");
+        }
+        other => panic!("expected a per-partition Produce error, got {other:?}"),
+    }
+
+    let (tx, mut rx) = channel();
+    assert!(parse_request(gzip_bomb_frame(2, 60_000_000, 0), tx).is_err());
+    assert!(rx.try_recv().is_err(), "acks=0 must not get a response");
+}
+
+/// A compressed request that decodes to more than the inline limit but within the request
+/// limit is decoded (off the I/O thread) and keeps its share of the decode budget until it
+/// is dropped.
+#[test]
+fn test_large_compressed_produce_within_the_limit_decodes() {
+    use crate::kafka::protocol::decode_budget::{DECODED_BUDGET_BYTES, DECODED_REMAINING};
+    use std::sync::atomic::Ordering;
+    let request = parse_to_request(gzip_bomb_frame(2, 5_000_000, 1));
+    let RequestBody::Produce(produce) = &request.body else {
+        panic!("expected a Produce request");
+    };
+    let held = produce.decoded.bytes();
+    assert!(held >= 10_000_000, "charged {held}");
+    assert!(DECODED_REMAINING.load(Ordering::Relaxed) <= DECODED_BUDGET_BYTES - held);
+    let values: usize = produce
+        .topic_data
+        .iter()
+        .flat_map(|t| t.partitions.iter())
+        .flat_map(|p| p.records.iter())
+        .map(|r| r.value.as_ref().map_or(0, Vec::len))
+        .sum();
+    assert_eq!(values, 10_000_000);
+}
+
 /// Every response the decoder queues must encode; when none can be shaped the connection
 /// is closed instead. The seed is FindCoordinator v4 (pg_kafka serves v0-3): an
 /// UNSUPPORTED_VERSION reply with a top-level error code cannot be encoded at v4, which

@@ -391,10 +391,19 @@ fn reject_unsupported_version<A: KafkaApi>(
         A::MIN_VERSION,
         A::MAX_VERSION
     );
+    // A client that expects no response (an acks=0 Produce) cannot be told
+    // UNSUPPORTED_VERSION, and dropping the request would lose it unnoticed: close the
+    // connection, as Kafka does, so the client notices.
+    let no_response = || {
+        Decoded::Close(format!(
+            "{} version {version} is unsupported and the client expects no response",
+            A::NAME
+        ))
+    };
     let echo = match parsed {
-        Some(Ok(request)) if !A::expects_response(request) => return Decoded::Answered,
+        Some(Ok(request)) if !A::expects_response(request) => return no_response(),
         Some(Ok(request)) => Some(A::echo(request)),
-        Some(Err(Rejection::Silent)) => return Decoded::Answered,
+        Some(Err(Rejection::Silent)) => return no_response(),
         Some(Err(Rejection::Close(reason))) => return Decoded::Close((*reason).to_string()),
         Some(Err(Rejection::Reply { echo, .. })) => echo.clone(),
         None => None,

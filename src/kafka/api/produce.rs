@@ -13,6 +13,10 @@ use crate::kafka::error::KafkaError;
 use crate::kafka::handlers;
 use crate::kafka::messages::{PartitionProduceData, ProducerMetadata, TopicProduceData};
 use crate::kafka::notifications::InternalNotification;
+use crate::kafka::protocol::decode_budget::{
+    run_large_decode, DecodeBudget, DecodedCharge, Exhausted, INLINE_DECODE_BYTES,
+    MAX_DECODED_REQUEST_BYTES,
+};
 use crate::kafka::protocol::{parse_record_batch_with_metadata, ParsedRecordBatch};
 use crate::kafka::storage::{LogStore, TopicStore};
 
@@ -20,7 +24,7 @@ use crate::kafka::storage::{LogStore, TopicStore};
 pub struct ProduceApi;
 
 /// Produce request.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ProduceRequestData {
     /// Acknowledgment level (0 = none, 1 = leader, -1 = all ISR).
     pub acks: i16,
@@ -30,6 +34,9 @@ pub struct ProduceRequestData {
     pub topic_data: Vec<TopicProduceData>,
     /// Transactional id of a transactional producer.
     pub transactional_id: Option<String>,
+    /// The decoded records' share of the process-wide decode budget, given back when the
+    /// request is dropped after its handler ran.
+    pub decoded: DecodedCharge,
 }
 
 impl ApiSchema for ProduceApi {
@@ -103,56 +110,38 @@ impl KafkaApi for ProduceApi {
             });
         }
 
-        let mut topic_data = Vec::with_capacity(wire.topic_data.len());
-        for topic in wire.topic_data {
-            let name = topic.name.to_string();
-            let mut partitions = Vec::with_capacity(topic.partition_data.len());
-            for partition in topic.partition_data {
-                let (records, producer_metadata) = match &partition.records {
-                    Some(batch) => match parse_record_batch_with_metadata(batch) {
-                        Ok(ParsedRecordBatch {
-                            records,
-                            producer_metadata,
-                        }) => (records, Some(producer_metadata)),
-                        Err(e) => {
-                            warn!(
-                                "Failed to parse RecordBatch for topic={}, partition={}: {}",
-                                name, partition.index, e
-                            );
-                            // acks=0 never gets a response: an unsolicited one would be read
-                            // as the reply to the client's next request. Kafka closes the
-                            // connection instead, so the client notices.
-                            if acks == 0 {
-                                return Err(Rejection::Close(
-                                    "acks=0 Produce with a corrupt record batch",
-                                ));
-                            }
-                            let error_code = match e {
-                                KafkaError::InvalidRecord { .. } => e.to_kafka_error_code(),
-                                _ => ERROR_CORRUPT_MESSAGE,
-                            };
-                            return Err(Rejection::Reply {
-                                error_code,
-                                echo: Some(requested),
-                            });
-                        }
-                    },
-                    None => (Vec::new(), None),
+        let (topic_data, decoded) = match decode_all_records(&wire.topic_data) {
+            Ok(decoded) => decoded,
+            Err(failure) => {
+                // acks=0 never gets a response: an unsolicited one would be read as the
+                // reply to the client's next request. Kafka closes the connection instead,
+                // so the client notices. A full process-wide budget closes any connection,
+                // as a full frame budget does; the client reconnects and retries.
+                let error_code = match failure {
+                    DecodeFailure::Busy => {
+                        return Err(Rejection::Close("decoded-records budget exhausted"))
+                    }
+                    _ if acks == 0 => {
+                        return Err(Rejection::Close(
+                            "acks=0 Produce with a corrupt or oversized record batch",
+                        ))
+                    }
+                    DecodeFailure::TooLarge => ERROR_MESSAGE_TOO_LARGE,
+                    DecodeFailure::Rejected(code) => code,
                 };
-                partitions.push(PartitionProduceData {
-                    partition_index: partition.index,
-                    records,
-                    producer_metadata,
+                return Err(Rejection::Reply {
+                    error_code,
+                    echo: Some(requested),
                 });
             }
-            topic_data.push(TopicProduceData { name, partitions });
-        }
+        };
 
         Ok(ProduceRequestData {
             acks,
             timeout_ms: wire.timeout_ms,
             topic_data,
             transactional_id: wire.transactional_id.map(|s| s.to_string()),
+            decoded,
         })
     }
 
@@ -227,6 +216,95 @@ impl KafkaApi for ProduceApi {
             Ok(response)
         })
     }
+}
+
+/// MESSAGE_TOO_LARGE (Java's RecordTooLargeException): a batch, or here a request, larger
+/// than the broker accepts. The Java producer splits a multi-record batch it gets this for
+/// and retries the halves.
+const ERROR_MESSAGE_TOO_LARGE: i16 = 10;
+
+/// Why a Produce request's records did not decode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecodeFailure {
+    /// They decode to more than one request may hold ([`MAX_DECODED_REQUEST_BYTES`]).
+    TooLarge,
+    /// The process-wide decode budget is exhausted.
+    Busy,
+    /// A batch is corrupt or invalid: this code on every partition.
+    Rejected(i16),
+}
+
+/// Records of every partition, and their charge to the decode budget.
+type DecodedTopics = (Vec<TopicProduceData>, DecodedCharge);
+
+/// Decode the records of every partition of `topics` within `budget`.
+fn decode_records(
+    topics: &[kafka_protocol::messages::produce_request::TopicProduceData],
+    budget: DecodeBudget,
+) -> Result<DecodedTopics, DecodeFailure> {
+    let mut topic_data = Vec::with_capacity(topics.len());
+    for topic in topics {
+        let name = topic.name.to_string();
+        let mut partitions = Vec::with_capacity(topic.partition_data.len());
+        for partition in &topic.partition_data {
+            let (records, producer_metadata) = match &partition.records {
+                Some(batch) => match parse_record_batch_with_metadata(batch, &budget) {
+                    Ok(ParsedRecordBatch {
+                        records,
+                        producer_metadata,
+                    }) => (records, Some(producer_metadata)),
+                    Err(e) => {
+                        return Err(match budget.exhausted() {
+                            Some(Exhausted::Limit) => DecodeFailure::TooLarge,
+                            Some(Exhausted::Global) => DecodeFailure::Busy,
+                            None => {
+                                warn!(
+                                    "Failed to parse RecordBatch for topic={}, partition={}: {}",
+                                    name, partition.index, e
+                                );
+                                DecodeFailure::Rejected(match e {
+                                    KafkaError::InvalidRecord { .. } => e.to_kafka_error_code(),
+                                    _ => ERROR_CORRUPT_MESSAGE,
+                                })
+                            }
+                        });
+                    }
+                },
+                None => (Vec::new(), None),
+            };
+            partitions.push(PartitionProduceData {
+                partition_index: partition.index,
+                records,
+                producer_metadata,
+            });
+        }
+        topic_data.push(TopicProduceData { name, partitions });
+    }
+    Ok((topic_data, budget.into_charge()))
+}
+
+/// Decode the records of `topics`, keeping large decodes off the I/O threads.
+///
+/// A request whose batches total at most [`INLINE_DECODE_BYTES`] is decoded in place,
+/// within that many decoded bytes: the common case of small (compressed or not) batches.
+/// One that is larger, or that expands past it, is decoded by [`run_large_decode`] within
+/// [`MAX_DECODED_REQUEST_BYTES`].
+fn decode_all_records(
+    topics: &[kafka_protocol::messages::produce_request::TopicProduceData],
+) -> Result<DecodedTopics, DecodeFailure> {
+    let wire_bytes: usize = topics
+        .iter()
+        .flat_map(|t| t.partition_data.iter())
+        .filter_map(|p| p.records.as_ref())
+        .map(bytes::Bytes::len)
+        .sum();
+    if wire_bytes <= INLINE_DECODE_BYTES {
+        match decode_records(topics, DecodeBudget::new(INLINE_DECODE_BYTES)) {
+            Err(DecodeFailure::TooLarge) => {}
+            done => return done,
+        }
+    }
+    run_large_decode(|| decode_records(topics, DecodeBudget::new(MAX_DECODED_REQUEST_BYTES)))
 }
 
 /// The `acks` values Kafka accepts (all ISR, none, leader).
