@@ -15,6 +15,13 @@
 //! instead (for SCRAM-SHA-256 the same `SCRAM-SHA-256$<iter>:<salt>$<StoredKey>:<ServerKey>`
 //! format libpq's `PQencryptPasswordConn` produces), so the plaintext never reaches the
 //! server.
+//!
+//! Kafka clients hash the password's raw UTF-8 bytes; libpq first applies SASLprep. The
+//! two agree for an ASCII password (SASLprep leaves ASCII unchanged, and libpq hashes a
+//! password SASLprep rejects as it is), but a password with non-ASCII characters may be
+//! normalized, and a client then never matches the verifier. A libpq verifier is only
+//! good for an ASCII password; anything else goes through `pg_kafka_create_user` /
+//! `pg_kafka_alter_user` or a verifier computed over the raw bytes.
 
 use super::scram::{ScramCredential, ScramMechanism, MAX_ITERATIONS, MIN_ITERATIONS};
 use pgrx::prelude::*;
@@ -112,7 +119,9 @@ fn pg_kafka_alter_user(username: &str, password: &str, iterations: default!(i32,
 
 /// Install one pre-computed SCRAM verifier
 /// (`SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>`, base64 fields; or
-/// `SCRAM-SHA-512$...`), creating the user if needed. Only that mechanism is set.
+/// `SCRAM-SHA-512$...`), creating the user if needed. Only that mechanism is set. The
+/// verifier must be computed over the password's raw UTF-8 bytes, as Kafka clients send
+/// it: a libpq/PostgreSQL verifier (SASLprep applied) is only valid for an ASCII password.
 #[pg_extern(volatile)]
 fn pg_kafka_set_user_verifier(username: &str, verifier: &str) {
     let cred = ScramCredential::from_verifier(verifier)

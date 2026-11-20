@@ -324,7 +324,8 @@ pg_kafka.max_consumer_groups = 100000      -- groups held in memory (oldest Empt
 
 -- Listener security (read when the worker starts; see docs/AUTHENTICATION.md)
 pg_kafka.security_protocol = 'PLAINTEXT'      -- primary listener: PLAINTEXT, SSL, SASL_PLAINTEXT, SASL_SSL
-pg_kafka.additional_listeners = ''            -- e.g. 'SASL_SSL://0.0.0.0:9093'
+pg_kafka.additional_listeners = ''            -- e.g. 'SASL_SSL://0.0.0.0:9093@broker.example.com:9093'
+pg_kafka.advertised_address = ''              -- host[:port] clients are told for the primary listener
 pg_kafka.ssl_cert_file = ''                   -- PEM chain / key for SSL listeners
 pg_kafka.ssl_key_file = ''
 pg_kafka.ssl_ca_file = ''                     -- set = mutual TLS
