@@ -123,7 +123,9 @@ authentication ApiVersions is served by the database thread like any other reque
 * **SaslAuthenticate** v0-v2. A failure gets `SASL_AUTHENTICATION_FAILED` with the
   message "Authentication failed: invalid credentials" after a 100 ms delay, then the
   connection closes, so each connection buys one attempt. The message is the same for a
-  wrong password and an unknown user.
+  wrong password and an unknown user. A credential lookup the database cannot answer
+  (schema missing or older than the library, lock timeout) closes the connection without a
+  response, which clients retry; it is not reported as `SASL_AUTHENTICATION_FAILED`.
 * Out-of-order requests (SaslAuthenticate before SaslHandshake, a second SaslHandshake)
   get `ILLEGAL_SASL_STATE` and the connection closes. After authentication, and on
   listeners without SASL, both APIs answer `ILLEGAL_SASL_STATE` and the connection stays
