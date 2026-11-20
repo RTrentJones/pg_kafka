@@ -5,8 +5,8 @@
 //! read deadlines, the pre-auth deadline from accept, the SASL lookup rate limit, SCRAM
 //! enumeration, decompression, record-count and header bombs, large zstd windows, partition
 //! data that is not one RecordBatch v2, batches read with Kafka's grammar and header checks,
-//! an acks=0 Produce at an unsupported version), each checking that ordinary rdkafka
-//! clients keep working while the attack runs.
+//! an acks=0 Produce at an unsupported version, a saturated large-decode path), each
+//! checking that ordinary rdkafka clients keep working while the attack runs.
 //!
 //! `hostile_clients` run against the default configuration. `limits` reconfigure the listener
 //! (lower caps and timeouts, three extra listeners: PLAINTEXT 19096, SASL_PLAINTEXT
@@ -16,6 +16,7 @@
 //! well-behaved clients on 127.0.0.1. All tests are `parallel_safe: false`.
 
 pub mod hostile_clients;
+pub mod large_decodes;
 pub mod produce_decoding;
 
 use crate::common::DynResult;
@@ -169,6 +170,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         produce_decoding::test_record_and_header_bombs_are_refused_before_decoding: sequential,
         produce_decoding::test_zstd_batches_with_large_windows_are_stored: sequential,
         produce_decoding::test_record_batches_are_read_as_kafka_reads_them: sequential,
+        large_decodes::test_saturated_large_decodes_wait_instead_of_closing: sequential,
         limits::test_network_limits_setup: sequential,
         limits::test_scram_unknown_user_is_indistinguishable: sequential,
         limits::test_per_ip_connection_limit: sequential,

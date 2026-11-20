@@ -160,7 +160,7 @@ pub async fn test_compressed_produce_past_the_decode_limit_is_refused() -> TestR
 
 /// A RecordBatch v2 built by hand around the records section `section`, gzip-compressed,
 /// declaring `record_count` records, with a valid CRC.
-fn raw_batch(section: &[u8], record_count: i32) -> Bytes {
+pub(crate) fn raw_batch(section: &[u8], record_count: i32) -> Bytes {
     use bytes::BufMut;
     use kafka_protocol::compression::{Compressor, Gzip};
     let mut records = bytes::BytesMut::new();

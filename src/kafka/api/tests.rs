@@ -458,6 +458,7 @@ fn commit_failure_echo_reports_every_produce_partition() {
         }],
         transactional_id: None,
         decoded: crate::kafka::protocol::DecodedCharge::default(),
+        pending: None,
     });
     match body.echo().error_response(9, ERROR_UNKNOWN_SERVER_ERROR) {
         ResponseBody::Produce(r) => {

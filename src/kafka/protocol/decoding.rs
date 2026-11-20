@@ -15,7 +15,8 @@ use crate::kafka::messages::{KafkaRequest, KafkaResponse};
 /// Parse one request frame (the length prefix already removed by the frame codec):
 /// `[RequestHeader][RequestBody]`.
 ///
-/// Returns `Ok(Some(request))` for a request the DB thread must run, `Ok(None)` when the
+/// Returns `Ok(Some(request))` for a request the DB thread must run once
+/// [`finish_request`] has finished it, `Ok(None)` when the
 /// request was already answered here (an error response, or deliberately nothing for an
 /// acks=0 Produce), and `Err` when no response can be shaped and the connection must close
 /// (the header cannot be parsed, or the version has no response format).
@@ -43,6 +44,21 @@ pub fn parse_request(
     })
 }
 
+/// Finish what [`parse_request`] left to do: decode the records of a Produce request that
+/// waited for room to decode (`api::finish_decode`), with the same results as
+/// [`parse_request`]. Runs on the network thread; the wait holds no thread.
+pub async fn finish_request(request: KafkaRequest) -> Result<Option<KafkaRequest>> {
+    decoded_to_result(api::finish_decode(request).await)
+}
+
+fn decoded_to_result(decoded: Decoded) -> Result<Option<KafkaRequest>> {
+    match decoded {
+        Decoded::Request(request) => Ok(Some(request)),
+        Decoded::Answered => Ok(None),
+        Decoded::Close(reason) => Err(KafkaError::encoding(reason)),
+    }
+}
+
 fn parse_request_inner(
     mut frame: BytesMut,
     response_tx: UnboundedSender<KafkaResponse>,
@@ -66,9 +82,7 @@ fn parse_request_inner(
     );
 
     match api::decode_body(&mut frame, header, response_tx) {
-        Ok(Decoded::Request(request)) => Ok(Some(request)),
-        Ok(Decoded::Answered) => Ok(None),
-        Ok(Decoded::Close(reason)) => Err(KafkaError::encoding(reason)),
+        Ok(decoded) => decoded_to_result(decoded),
         Err((header, response_tx)) => {
             // An API key the crate knows but pg_kafka does not serve: there is no
             // registered response schema, so answer with the generic error frame.
