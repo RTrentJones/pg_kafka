@@ -34,8 +34,13 @@ This document lists intentional deviations from the official Kafka protocol spec
 - Errors are not returned to the client (per acks=0 contract); as in Kafka, any error
   (a partition error, a corrupt batch, a failed commit) **closes the connection** after the
   partitions that succeeded are committed, so the client refreshes its metadata
-- `acks` other than -1, 0 and 1 is answered `INVALID_REQUIRED_ACKS` (21) on every
-  partition and nothing is written, as in Kafka
+- `acks` other than -1, 0 and 1 is answered `INVALID_REQUIRED_ACKS` (21) and nothing is
+  written, as in Kafka, after the checks Kafka makes first: a first batch it cannot size
+  (CORRUPT_MESSAGE) or a transactional batch without a transactional id
+  (TRANSACTIONAL_ID_AUTHORIZATION_FAILED) on every partition, then per partition an unknown
+  topic or partition (UNKNOWN_TOPIC_OR_PARTITION) and data that is not one RecordBatch v2
+  or zstd before v7 (INVALID_RECORD, UNSUPPORTED_COMPRESSION_TYPE); every other partition is
+  INVALID_REQUIRED_ACKS whatever its records hold (they are not decoded)
 - Long-polling consumers are notified if write succeeds
 - Idempotency/transactional validation is intentionally skipped for acks=0
 

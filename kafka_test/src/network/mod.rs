@@ -179,6 +179,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         decode_work::test_refused_partitions_do_not_hold_the_io_threads: sequential,
         decode_work::test_refused_partitions_do_not_monopolize_the_decode_slots: sequential,
         decode_work::test_repeated_partition_entries_are_answered_once: sequential,
+        hostile_clients::test_invalid_acks_answers_in_kafkas_order: sequential,
         limits::test_network_limits_setup: sequential,
         limits::test_scram_unknown_user_is_indistinguishable: sequential,
         limits::test_per_ip_connection_limit: sequential,

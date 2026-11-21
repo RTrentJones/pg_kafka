@@ -155,17 +155,29 @@ impl KafkaApi for ProduceApi {
             })
             .collect();
 
-        // Kafka accepts only acks -1, 0 and 1; anything else is
-        // answered INVALID_REQUIRED_ACKS on every partition and nothing is written.
+        let zstd_allowed = header.api_version >= MIN_ZSTD_VERSION;
+        // Kafka accepts only acks -1, 0 and 1; anything else is answered
+        // INVALID_REQUIRED_ACKS and nothing is written, once the checks Kafka makes before
+        // the log append passed (`invalid_acks_answers`).
         if !valid_acks(acks) {
             warn!("Rejecting Produce with invalid acks={acks}");
-            return Err(Rejection::Reply {
-                error_code: ERROR_INVALID_REQUIRED_ACKS,
-                echo: Some(requested),
+            let refused = invalid_acks_answers(
+                &wire.topic_data,
+                zstd_allowed,
+                wire.transactional_id.is_some(),
+            )
+            .map_err(|failure| rejection(failure, acks, requested))?;
+            return Ok(ProduceRequestData {
+                acks,
+                timeout_ms: wire.timeout_ms,
+                topic_data: Vec::new(),
+                refused,
+                transactional_id: wire.transactional_id.map(|s| s.to_string()),
+                decoded: DecodedCharge::default(),
+                pending: None,
             });
         }
 
-        let zstd_allowed = header.api_version >= MIN_ZSTD_VERSION;
         let decode = decode_all_records(
             &wire.topic_data,
             zstd_allowed,
@@ -569,6 +581,38 @@ fn last_entry_per_partition(topics: Vec<WireTopicProduceData>) -> Vec<WireTopicP
         }
     }
     out
+}
+
+/// The answers of a Produce whose `acks` Kafka refuses, in Kafka 3.7's order: what it reads
+/// of the request first ([`check_first_batches`]) fails the whole request; then a partition
+/// whose data `ProduceRequest.validateRecords` refuses gets that error
+/// ([`validate_produce_records`]); every other partition is INVALID_REQUIRED_ACKS
+/// (`ReplicaManager.appendRecords` checks acks before the log append, so records are not
+/// decoded). Partitions of unknown topics are answered UNKNOWN_TOPIC_OR_PARTITION once
+/// looked up, as every refused partition is.
+fn invalid_acks_answers(
+    topics: &[WireTopicProduceData],
+    zstd_allowed: bool,
+    has_transactional_id: bool,
+) -> Result<Vec<RefusedPartition>, DecodeFailure> {
+    check_first_batches(topics, has_transactional_id)?;
+    Ok(topics
+        .iter()
+        .flat_map(|topic| {
+            topic
+                .partition_data
+                .iter()
+                .map(|partition| RefusedPartition {
+                    topic: topic.name.to_string(),
+                    partition: partition.index,
+                    error_code: partition
+                        .records
+                        .as_ref()
+                        .and_then(|batch| validate_produce_records(batch, zstd_allowed).err())
+                        .unwrap_or(ERROR_INVALID_REQUIRED_ACKS),
+                })
+        })
+        .collect())
 }
 
 /// Decode the records of `topics` at once if that can be done on the I/O thread.
@@ -1470,5 +1514,43 @@ mod tests {
             ("c".into(), vec![]),
         ];
         assert_eq!(got, want);
+    }
+
+    #[test]
+    fn invalid_acks_are_answered_after_kafkas_earlier_checks() {
+        use crate::kafka::constants::{ERROR_INVALID_RECORD, ERROR_INVALID_REQUIRED_ACKS};
+        let good = batch_of(1, 1);
+        let mut bad_crc = good.to_vec();
+        *bad_crc.last_mut().unwrap() ^= 1;
+        let two = bytes::Bytes::from([&good[..], &good[..]].concat());
+        let answers = invalid_acks_answers(
+            &topics(vec![bad_crc.into(), two, good.clone()]),
+            true,
+            false,
+        )
+        .unwrap();
+        let codes: Vec<(i32, i16)> = answers
+            .iter()
+            .map(|r| (r.partition, r.error_code))
+            .collect();
+        assert_eq!(
+            codes,
+            vec![
+                (0, ERROR_INVALID_REQUIRED_ACKS),
+                (1, ERROR_INVALID_RECORD),
+                (2, ERROR_INVALID_REQUIRED_ACKS)
+            ]
+        );
+        let mut short_length = good.to_vec();
+        short_length[8..12].copy_from_slice(&13i32.to_be_bytes());
+        assert_eq!(
+            invalid_acks_answers(&topics(vec![short_length.into()]), true, false).unwrap_err(),
+            DecodeFailure::Rejected(ERROR_CORRUPT_MESSAGE)
+        );
+        assert_eq!(
+            invalid_acks_answers(&topics(vec![good, transactional_batch()]), true, false)
+                .unwrap_err(),
+            DecodeFailure::Rejected(ERROR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED)
+        );
     }
 }
