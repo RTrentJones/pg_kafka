@@ -93,5 +93,8 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         outbox_robustness::test_shadow_claims_stay_fast_behind_a_large_backlog: sequential, // Mutates global GUCs (test_forward_ack_delay_ms, shadow_bootstrap_servers, jit, shadow_batch_size)
         outbox_robustness::test_shadow_claims_stay_fast_with_a_tiny_work_mem: sequential, // Mutates global GUCs (test_forward_ack_delay_ms, shadow_bootstrap_servers, work_mem, jit)
         outbox_robustness::test_shadow_claims_are_not_jit_compiled: sequential, // Mutates global GUCs (test_forward_ack_delay_ms, shadow_bootstrap_servers, jit*)
+        outbox_robustness::test_shadow_worker_stays_idle_beside_a_blocked_partition: sequential, // Mutates shadow_bootstrap_servers; measures the worker's CPU
+        outbox_robustness::test_shadow_worker_stays_idle_beside_dead_letters: sequential, // Mutates shadow_bootstrap_servers; measures the worker's CPU
+        outbox_robustness::test_shadow_dead_letters_follow_the_retry_cap: sequential, // Mutates shadow_bootstrap_servers, shadow_max_retries
     ]
 }

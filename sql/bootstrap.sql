@@ -887,18 +887,24 @@ CREATE TABLE kafka.shadow_tracking (
     PRIMARY KEY (topic_id, partition_id, local_offset),
     FOREIGN KEY (topic_id) REFERENCES kafka.topics(id) ON DELETE CASCADE,
     -- A claim opens an attempt; its ack closes it.
-    attempt_open BOOLEAN NOT NULL DEFAULT false
+    attempt_open BOOLEAN NOT NULL DEFAULT false,
+    -- retry_count >= pg_kafka.shadow_max_retries (a dead letter), as of the last
+    -- outbox claim, which sets it before it claims. It keys the indexes below, so a
+    -- claim skips the dead letters by an index condition instead of reading them.
+    dead BOOLEAN NOT NULL DEFAULT false
 );
 
+-- Pending rows, live ones (dead = false) in offset order per partition.
 CREATE INDEX idx_shadow_tracking_pending
-ON kafka.shadow_tracking(topic_id, partition_id, local_offset)
+ON kafka.shadow_tracking(topic_id, partition_id, dead, local_offset)
 WHERE external_offset IS NULL;
 
--- Failed, still pending rows: the outbox claim finds each partition's first
--- backing-off row here without scanning the whole backlog.
+-- Failed (or dead), still pending rows: the outbox claim finds each partition's
+-- first backing-off row here without scanning the whole backlog, and the rows
+-- whose dead flag the retry cap changed by two index ranges per partition.
 CREATE INDEX idx_shadow_tracking_retrying
-ON kafka.shadow_tracking(topic_id, partition_id, local_offset)
-WHERE external_offset IS NULL AND retry_count > 0;
+ON kafka.shadow_tracking(topic_id, partition_id, dead, retry_count, local_offset)
+WHERE external_offset IS NULL AND (retry_count > 0 OR dead);
 
 CREATE INDEX idx_shadow_tracking_errors
 ON kafka.shadow_tracking(topic_id, partition_id)
@@ -947,7 +953,8 @@ BEGIN
             forwarded_at    = NULL,
             error_message   = NULL,
             retry_count     = 0,
-            attempt_open    = false;
+            attempt_open    = false,
+            dead            = false;
     GET DIAGNOSTICS v_count = ROW_COUNT;
     RETURN v_count;
 END;
@@ -1051,6 +1058,7 @@ COMMENT ON TABLE kafka.shadow_metrics IS 'Aggregated shadow mode metrics per top
 COMMENT ON VIEW kafka.shadow_status IS 'Unified view of shadow mode health, lag, and error counts.';
 COMMENT ON COLUMN kafka.shadow_tracking.retry_count IS 'Failed delivery attempts. At pg_kafka.shadow_max_retries the row is a dead letter (pending, never retried) until replayed or the cap is raised.';
 COMMENT ON COLUMN kafka.shadow_tracking.attempt_open IS 'True while a forward of the row is in flight (claimed, not yet acked).';
+COMMENT ON COLUMN kafka.shadow_tracking.dead IS 'retry_count >= pg_kafka.shadow_max_retries as of the last outbox claim (kept current by the worker; indexed so claims skip dead letters).';
 COMMENT ON VIEW kafka.shadow_partition_status IS 'Per-partition shadow forwarding state: lag (records still to forward), dead letters, in-flight forwards, metrics.';
 
 -- replay_shadow_messages writes the outbox with the caller's rights, so it is not

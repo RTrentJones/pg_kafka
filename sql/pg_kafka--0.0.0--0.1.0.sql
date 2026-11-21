@@ -1108,15 +1108,27 @@ COMMENT ON TABLE kafka.sasl_server_secret IS 'Secret keying the fake SCRAM salts
 ALTER TABLE kafka.shadow_tracking
     ADD COLUMN attempt_open BOOLEAN NOT NULL DEFAULT false;
 GRANT SELECT (attempt_open) ON kafka.shadow_tracking TO pgkafka_reader;
--- Failed, still pending rows: the outbox claim finds each partition's first
--- backing-off row here without scanning the whole backlog.
+-- dead: retry_count >= pg_kafka.shadow_max_retries as of the last outbox claim,
+-- which sets it before it claims (so the first claim after the upgrade marks the
+-- existing dead letters). It keys both pending indexes, so a claim skips the dead
+-- letters by an index condition instead of reading them.
+ALTER TABLE kafka.shadow_tracking
+    ADD COLUMN dead BOOLEAN NOT NULL DEFAULT false;
+DROP INDEX kafka.idx_shadow_tracking_pending;
+CREATE INDEX idx_shadow_tracking_pending
+ON kafka.shadow_tracking(topic_id, partition_id, dead, local_offset)
+WHERE external_offset IS NULL;
+-- Failed (or dead), still pending rows: the outbox claim finds each partition's
+-- first backing-off row here without scanning the whole backlog, and the rows
+-- whose dead flag the retry cap changed by two index ranges per partition.
 CREATE INDEX idx_shadow_tracking_retrying
-ON kafka.shadow_tracking(topic_id, partition_id, local_offset)
-WHERE external_offset IS NULL AND retry_count > 0;
+ON kafka.shadow_tracking(topic_id, partition_id, dead, retry_count, local_offset)
+WHERE external_offset IS NULL AND (retry_count > 0 OR dead);
 COMMENT ON COLUMN kafka.shadow_tracking.retry_count IS 'Failed delivery attempts. At pg_kafka.shadow_max_retries the row is a dead letter (pending, never retried) until replayed or the cap is raised.';
 COMMENT ON COLUMN kafka.shadow_tracking.attempt_open IS 'True while a forward of the row is in flight (claimed, not yet acked).';
+COMMENT ON COLUMN kafka.shadow_tracking.dead IS 'retry_count >= pg_kafka.shadow_max_retries as of the last outbox claim (kept current by the worker; indexed so claims skip dead letters).';
 
--- Replay also closes any open attempt.
+-- Replay also closes any open attempt and clears the dead flag.
 CREATE OR REPLACE FUNCTION kafka.replay_shadow_messages(
     p_topic_id INT,
     p_from_offset BIGINT DEFAULT 0,
@@ -1139,7 +1151,8 @@ BEGIN
             forwarded_at    = NULL,
             error_message   = NULL,
             retry_count     = 0,
-            attempt_open    = false;
+            attempt_open    = false,
+            dead            = false;
     GET DIAGNOSTICS v_count = ROW_COUNT;
     RETURN v_count;
 END;

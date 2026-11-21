@@ -16,7 +16,9 @@
 //!   one is;
 //! - a claim does not slow down with the number of rows in flight (the
 //!   in-flight exclusion is a hash lookup, not a scan per pending row), with
-//!   the size of the backlog, with a tiny `work_mem`, or with JIT.
+//!   the size of the backlog, with a tiny `work_mem`, or with JIT;
+//! - a partition behind a backing-off head, or holding dead letters, does not
+//!   make every claim read its pending rows (the worker stays idle beside it).
 
 use crate::common::{create_db_client, create_producer, TestResult};
 use crate::setup::TestContext;
@@ -1154,4 +1156,311 @@ pub async fn test_shadow_claims_are_not_jit_compiled() -> TestResult {
         },
     )
     .await
+}
+
+/// Pending rows of a partition with nothing due must cost a claim nothing: every
+/// outbox tick (every 250 ms on the DB thread, whether anything is due or not)
+/// probes each partition with pending rows for its first due row. A topic of
+/// `records` pending rows is written while no broker is configured, `stall` (SQL,
+/// `$1` the topic id) leaves none of them due, the broker is configured, and the
+/// worker's CPU over 10 s, with nothing to forward, is compared with its CPU over
+/// 10 s before, with an empty outbox. Needs the DB host's `/proc` (skipped without it).
+/// The share of a CPU the process `pid` uses over `window`; `None` if its `/proc`
+/// entry is not readable.
+async fn cpu_share(pid: i32, window: Duration) -> Option<f64> {
+    let before = cpu_ticks(pid)?;
+    let start = Instant::now();
+    tokio::time::sleep(window).await;
+    let after = cpu_ticks(pid)?;
+    // /proc counts in USER_HZ, 100 per second on Linux.
+    let used = Duration::from_millis(after.saturating_sub(before) * 10);
+    Some(used.as_secs_f64() / start.elapsed().as_secs_f64())
+}
+
+async fn idle_beside_a_stall(name: &str, records: usize, stall: &str, failure: &str) -> TestResult {
+    const WINDOW: Duration = Duration::from_secs(10);
+    /// The share of a CPU the stalled rows may add (measured numbers at the callers).
+    const MAX_EXTRA_CPU_SHARE: f64 = 0.03;
+    println!("=== Test: {name} ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("shadow-stalled").await;
+    verify_external_kafka_ready().await?;
+    enable_shadow_mode(
+        ctx.db(),
+        &topic,
+        &config(ShadowMode::Shadow, SyncMode::Async),
+    )
+    .await?;
+    let topic_id = topic_id(ctx.db(), &topic).await?;
+    let db = create_db_client().await?;
+
+    let result = async {
+        let pid: i32 = ctx
+            .db()
+            .query_one(
+                "SELECT pid FROM pg_stat_activity WHERE backend_type = 'pg_kafka_listener'",
+                &[],
+            )
+            .await?
+            .get(0);
+        println!("Step 0: the worker's CPU over {WINDOW:?} with an empty outbox...");
+        let Some(idle) = cpu_share(pid, WINDOW).await else {
+            println!("⚠️  SKIPPED: the worker's /proc entry is not readable here");
+            return Ok(());
+        };
+        println!("  {:.1}% of a CPU", idle * 100.0);
+
+        println!("Step 1: no broker configured; produce {records} records...");
+        alter_system(
+            &db,
+            "ALTER SYSTEM SET pg_kafka.shadow_bootstrap_servers = ''",
+        )
+        .await?;
+        let producer = bulk_producer()?;
+        // In rounds the producer's queue (200 000 messages) holds.
+        for round in (0..records).collect::<Vec<_>>().chunks(100_000) {
+            let mut pending = Vec::with_capacity(round.len());
+            for i in round {
+                let key = format!("k{}", i % 97);
+                pending.push(
+                    producer
+                        .send_result(FutureRecord::to(&topic).key(key.as_bytes()).payload("v"))
+                        .map_err(|(e, _)| e)?,
+                );
+            }
+            for f in pending {
+                f.await?.map_err(|(e, _)| e)?;
+            }
+        }
+        let rows = undelivered(ctx.db(), topic_id).await?;
+        if rows != i64::try_from(records)? {
+            return Err(format!("{rows} pending outbox rows, expected {records}").into());
+        }
+
+        println!("Step 2: stall them: {stall}");
+        let stalled = db.execute(stall, &[&topic_id]).await?;
+        println!("  {stalled} rows changed");
+        if stalled == 0 {
+            return Err("the stall changed no outbox row".into());
+        }
+
+        println!("Step 3: configure the broker; let the first ticks run, then VACUUM ANALYZE...");
+        restore_bootstrap_servers(&db).await?;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        // As autovacuum would after the stall's mass update (and what the first
+        // claims changed).
+        db.execute("VACUUM ANALYZE kafka.shadow_tracking", &[])
+            .await?;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let rows = undelivered(ctx.db(), topic_id).await?;
+        if rows != i64::try_from(records)? {
+            return Err(format!(
+                "{rows} of {records} stalled rows left pending: some were forwarded"
+            )
+            .into());
+        }
+
+        println!("Step 4: the worker's CPU over {WINDOW:?} beside the stalled rows...");
+        let share = cpu_share(pid, WINDOW)
+            .await
+            .ok_or("the worker's /proc entry is no longer readable")?;
+        let extra = share - idle;
+        println!(
+            "  {:.1}% of a CPU, {:.1} points over the empty outbox",
+            share * 100.0,
+            extra * 100.0
+        );
+        println!("SHADOW_STALLED_EXTRA_CPU_POINTS={:.1}", extra * 100.0);
+        let rows = undelivered(ctx.db(), topic_id).await?;
+        if rows != i64::try_from(records)? {
+            return Err(format!(
+                "{rows} of {records} stalled rows left pending: some were forwarded"
+            )
+            .into());
+        }
+        if extra >= MAX_EXTRA_CPU_SHARE {
+            return Err(format!(
+                "the stalled rows added {:.1}% of a CPU (bound {:.0}%) with nothing due: {failure}",
+                extra * 100.0,
+                MAX_EXTRA_CPU_SHARE * 100.0
+            )
+            .into());
+        }
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await
+    .map_err(|e| e.to_string());
+
+    if let Err(e) = restore_bootstrap_servers(&db).await {
+        eprintln!("⚠️  cleanup: failed to restore pg_kafka.shadow_bootstrap_servers: {e}");
+    }
+    ctx.cleanup().await?;
+    result?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// Behind a backing-off head (a failed row whose backoff has not passed) nothing of
+/// its partition is due, and the claim's probe stopped there only by a filter: it
+/// read the partition's whole backlog on every tick. Here the head of a
+/// 300 000-row backlog backs off (its last attempt stamped an hour ahead, so it
+/// stays blocked) and the idle worker is measured. On PG17 here the stalled rows
+/// added 9.4 points of a CPU with the filter, 0.1 with the index condition; the
+/// 3-point bound leaves >= 3x either way.
+pub async fn test_shadow_worker_stays_idle_beside_a_blocked_partition() -> TestResult {
+    idle_beside_a_stall(
+        "the worker stays idle beside a blocked partition",
+        300_000,
+        "UPDATE kafka.shadow_tracking \
+         SET retry_count = 1, attempt_open = false, forwarded_at = NOW() + interval '1 hour' \
+         WHERE (topic_id, partition_id, local_offset) IN ( \
+             SELECT topic_id, partition_id, MIN(local_offset) \
+             FROM kafka.shadow_tracking WHERE topic_id = $1 \
+             GROUP BY topic_id, partition_id)",
+        "a claim reads the backlog behind a backing-off head",
+    )
+    .await
+}
+
+/// Dead letters (rows at `pg_kafka.shadow_max_retries`) stay pending until replayed
+/// or the cap is raised, and every claim read past all of them: in its probe of
+/// their partition and in its search for backing-off rows. Here 300 000 rows are
+/// dead-lettered and the idle worker is measured. On PG17 here they added 10.9
+/// points of a CPU read on every tick, at most 0.1 skipped by the dead flag.
+pub async fn test_shadow_worker_stays_idle_beside_dead_letters() -> TestResult {
+    idle_beside_a_stall(
+        "the worker stays idle beside dead letters",
+        300_000,
+        "UPDATE kafka.shadow_tracking \
+         SET retry_count = current_setting('pg_kafka.shadow_max_retries')::int \
+         WHERE topic_id = $1",
+        "a claim reads the dead letters",
+    )
+    .await
+}
+
+/// Dead letters follow `pg_kafka.shadow_max_retries` as it changes: rows at the cap
+/// are not forwarded; raising the cap above their retry count forwards them; lowering
+/// it to the retry count of due rows stops them; a replay forwards them again. (The
+/// claim keeps a per-row dead flag in step with the cap, so each change must reach it.)
+pub async fn test_shadow_dead_letters_follow_the_retry_cap() -> TestResult {
+    const RECORDS: usize = 200;
+    println!("=== Test: dead letters follow pg_kafka.shadow_max_retries ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("shadow-dead-cap").await;
+    verify_external_kafka_ready().await?;
+    enable_shadow_mode(
+        ctx.db(),
+        &topic,
+        &config(ShadowMode::Shadow, SyncMode::Async),
+    )
+    .await?;
+    let topic_id = topic_id(ctx.db(), &topic).await?;
+    let db = create_db_client().await?;
+    let delivered = |n: i64| i64::try_from(RECORDS).map(|r| r - n);
+
+    let result = async {
+        let producer = bulk_producer()?;
+        let produce = || async {
+            let mut pending = Vec::with_capacity(RECORDS);
+            for i in 0..RECORDS {
+                let key = format!("k{i}");
+                pending.push(
+                    producer
+                        .send_result(FutureRecord::to(&topic).key(key.as_bytes()).payload("v"))
+                        .map_err(|(e, _)| e)?,
+                );
+            }
+            for f in pending {
+                f.await?.map_err(|(e, _)| e)?;
+            }
+            Ok::<(), Box<dyn std::error::Error>>(())
+        };
+        let cap: i32 = db
+            .query_one(
+                "SELECT current_setting('pg_kafka.shadow_max_retries')::int",
+                &[],
+            )
+            .await?
+            .get(0);
+
+        println!("Step 1: no broker; {RECORDS} records dead-lettered at the cap ({cap})...");
+        alter_system(
+            &db,
+            "ALTER SYSTEM SET pg_kafka.shadow_bootstrap_servers = ''",
+        )
+        .await?;
+        produce().await?;
+        db.execute(
+            "UPDATE kafka.shadow_tracking \
+             SET retry_count = $2, forwarded_at = NOW() - interval '1 hour' \
+             WHERE topic_id = $1",
+            &[&topic_id, &cap],
+        )
+        .await?;
+        restore_bootstrap_servers(&db).await?;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let left = undelivered(ctx.db(), topic_id).await?;
+        if delivered(left)? != 0 {
+            return Err(format!("{} dead letters were forwarded", delivered(left)?).into());
+        }
+
+        println!(
+            "Step 2: raise the cap to {}; they are forwarded...",
+            cap + 1
+        );
+        alter_system(
+            &db,
+            &format!("ALTER SYSTEM SET pg_kafka.shadow_max_retries = {}", cap + 1),
+        )
+        .await?;
+        let took = drained_within(ctx.db(), topic_id, Duration::from_secs(30)).await?;
+        println!("  forwarded in {took:?}");
+
+        println!("Step 3: no broker; {RECORDS} more records with 3 failures each...");
+        alter_system(
+            &db,
+            "ALTER SYSTEM SET pg_kafka.shadow_bootstrap_servers = ''",
+        )
+        .await?;
+        produce().await?;
+        db.execute(
+            "UPDATE kafka.shadow_tracking \
+             SET retry_count = 3, forwarded_at = NOW() - interval '1 hour' \
+             WHERE topic_id = $1 AND external_offset IS NULL",
+            &[&topic_id],
+        )
+        .await?;
+        println!("Step 4: lower the cap to 3 and configure the broker; nothing is forwarded...");
+        alter_system(&db, "ALTER SYSTEM SET pg_kafka.shadow_max_retries = 3").await?;
+        restore_bootstrap_servers(&db).await?;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let left = undelivered(ctx.db(), topic_id).await?;
+        if left != i64::try_from(RECORDS)? {
+            return Err(format!("{left} of {RECORDS} rows at the lowered cap left pending").into());
+        }
+
+        println!("Step 5: replay them; they are forwarded...");
+        db.execute(
+            "SELECT kafka.replay_shadow_messages($1, 0, NULL)",
+            &[&topic_id],
+        )
+        .await?;
+        let took = drained_within(ctx.db(), topic_id, Duration::from_secs(30)).await?;
+        println!("  forwarded in {took:?}");
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await
+    .map_err(|e| e.to_string());
+
+    if let Err(e) = alter_system(&db, "ALTER SYSTEM RESET pg_kafka.shadow_max_retries").await {
+        eprintln!("⚠️  cleanup: failed to reset pg_kafka.shadow_max_retries: {e}");
+    }
+    if let Err(e) = restore_bootstrap_servers(&db).await {
+        eprintln!("⚠️  cleanup: failed to restore pg_kafka.shadow_bootstrap_servers: {e}");
+    }
+    ctx.cleanup().await?;
+    result?;
+    println!("✅ Test PASSED\n");
+    Ok(())
 }

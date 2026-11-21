@@ -289,54 +289,12 @@ pub fn topic_config_from_row<R: ConfigColumns>(
     })
 }
 
-/// The claim's due rows of the partition `p` (with its `blocked` row `b`): the
-/// `FROM ... WHERE` of a select over `kafka.shadow_tracking st`, shared by the
-/// probe that finds the partitions with a due row and the select that takes
-/// them, so the two cannot disagree. `$2` is the retry cap, `$6`/`$7` the
-/// backoff base and max, `inf` the in-flight rows.
-///
-/// The in-flight rows are excluded with `NOT IN (SELECT ... FROM inf)`, not a
-/// correlated `NOT EXISTS`: Postgres runs the uncorrelated `NOT IN` as a hashed
-/// subplan built once per claim, while the `NOT EXISTS` was planned as a nested
-/// loop anti join that scanned all of `inf` for every pending row it passed. With
-/// thousands of rows in flight (up to `MAX_INFLIGHT`) at the head of a backlog, that
-/// made each claim O(in flight x scanned): a claim behind 8 000 in-flight rows of
-/// a 20 000-row backlog took 5.3 s that way, 0.26 s this way.
-/// Every column on both sides is NOT NULL, so `NOT IN` means exactly `NOT EXISTS`.
-macro_rules! due_rows_of_partition {
+/// The partitions with pending rows (CTE `parts`), found by a skip scan of the
+/// pending index: one probe per partition, not one per row. Shared by the claim
+/// and [`DEAD_LETTER_SYNC_SQL`]. Ends with the CTE's closing parenthesis.
+macro_rules! pending_partitions {
     () => {
         r"
-                        FROM kafka.shadow_tracking st
-                        CROSS JOIN LATERAL (
-                            SELECT 1 FROM kafka.messages m
-                            WHERE m.topic_id = st.topic_id
-                              AND m.partition_id = st.partition_id
-                              AND m.partition_offset = st.local_offset
-                            LIMIT 1
-                        ) has_message
-                        WHERE st.topic_id = p.topic_id
-                          AND st.partition_id = p.partition_id
-                          AND st.external_offset IS NULL
-                          AND st.retry_count < $2
-                          AND (b.first_blocked IS NULL OR st.local_offset < b.first_blocked)
-                          AND NOT (st.retry_count > 0 AND NOT st.attempt_open
-                                   AND st.forwarded_at > NOW() - make_interval(secs =>
-                                       LEAST($6::float8 * power(2::float8, LEAST(st.retry_count - 1, 30)),
-                                             $7::float8) / 1000.0))
-                          AND (st.topic_id, st.partition_id, st.local_offset)
-                              NOT IN (SELECT inf.t, inf.p, inf.o FROM inf)
-                        "
-    };
-}
-
-/// The outbox claim (`SpiShadowDb::claim_due_outbox_rows`); its parameters are listed there.
-const CLAIM_DUE_OUTBOX_ROWS_SQL: &str = concat!(
-    r"
-        WITH RECURSIVE inf AS (
-            SELECT * FROM unnest($3::int4[], $4::int4[], $5::int8[]) AS i(t, p, o)
-        ),
-        -- The partitions with pending rows, found by a skip scan of the
-        -- pending index: one probe per partition, not one per row.
         parts AS (
             (SELECT st.topic_id, st.partition_id
              FROM kafka.shadow_tracking st
@@ -354,24 +312,144 @@ const CLAIM_DUE_OUTBOX_ROWS_SQL: &str = concat!(
                 ORDER BY st.topic_id, st.partition_id
                 LIMIT 1
             ) nxt
+        )"
+    };
+}
+
+/// Make `kafka.shadow_tracking.dead` equal `retry_count >= $1` (the retry cap) on
+/// every pending row, run before each claim. `dead` keys both pending indexes, so the
+/// claim skips a partition's dead letters by an index condition instead of reading
+/// them on every claim; this statement keeps it current when a failure reaches the
+/// cap, when the cap is raised (dead letters below it are due again) or lowered, and
+/// after a replay or a hand edit of `retry_count`. It reads only the rows it changes,
+/// found by two index ranges per partition of idx_shadow_tracking_retrying
+/// (`topic_id, partition_id, dead, retry_count, ...`), so it costs O(partitions) when
+/// nothing changed, whatever the number of dead letters. The rows are updated by ctid
+/// (a TID scan), never by a join the planner could turn into a scan of the table.
+const DEAD_LETTER_SYNC_SQL: &str = concat!(
+    r"
+        WITH RECURSIVE",
+    pending_partitions!(),
+    r",
+        stale AS (
+            SELECT s.ctid
+            FROM parts p
+            CROSS JOIN LATERAL (
+                SELECT st.ctid
+                FROM kafka.shadow_tracking st
+                WHERE st.topic_id = p.topic_id
+                  AND st.partition_id = p.partition_id
+                  AND st.external_offset IS NULL
+                  AND st.dead
+                  AND st.retry_count < $1
+                UNION ALL
+                SELECT st.ctid
+                FROM kafka.shadow_tracking st
+                WHERE st.topic_id = p.topic_id
+                  AND st.partition_id = p.partition_id
+                  AND st.external_offset IS NULL
+                  AND NOT st.dead
+                  AND st.retry_count > 0
+                  AND st.retry_count >= $1
+            ) s
+        )
+        UPDATE kafka.shadow_tracking st
+        SET dead = st.retry_count >= $1
+        WHERE st.ctid = ANY (ARRAY(SELECT stale.ctid FROM stale))
+          AND st.external_offset IS NULL
+          AND st.dead IS DISTINCT FROM (st.retry_count >= $1)
+        "
+);
+
+/// The claim's due rows of the partition `p` (with its `blocked` row `b`): the
+/// `FROM ... WHERE` of a select over `kafka.shadow_tracking st`, shared by the
+/// probe that finds the partitions with a due row and the select that takes
+/// them, so the two cannot disagree. `$2` is the retry cap, `$6`/`$7` the
+/// backoff base and max, `inf` the in-flight rows.
+///
+/// The in-flight rows are excluded with `NOT IN (SELECT ... FROM inf)`, not a
+/// correlated `NOT EXISTS`: Postgres runs the uncorrelated `NOT IN` as a hashed
+/// subplan built once per claim, while the `NOT EXISTS` was planned as a nested
+/// loop anti join that scanned all of `inf` for every pending row it passed. With
+/// thousands of rows in flight (up to `MAX_INFLIGHT`) at the head of a backlog, that
+/// made each claim O(in flight x scanned): a claim behind 8 000 in-flight rows of
+/// a 20 000-row backlog took 5.3 s that way, 0.26 s this way.
+/// Every column on both sides is NOT NULL, so `NOT IN` means exactly `NOT EXISTS`.
+///
+/// Every condition that bounds the scan is an index condition of
+/// `idx_shadow_tracking_pending` (`topic_id, partition_id, dead, local_offset`), so
+/// the scan starts at the partition's first live row and stops at its first blocked
+/// one: `NOT st.dead` skips the dead letters ([`DEAD_LETTER_SYNC_SQL`] has just made
+/// `dead` equal `retry_count >= $2`; the `retry_count` test stays as a filter), and the
+/// blocked bound is a `COALESCE` with the largest `int8` (`local_offset` is NOT NULL,
+/// so it means `b.first_blocked IS NULL OR st.local_offset < b.first_blocked`). Written
+/// as that `OR` it was a filter: behind a backing-off head the probe walked the
+/// partition's whole backlog on every claim and found nothing (a 100-row claim on PG17
+/// took 20-28 ms beside 150 000 rows behind a backing-off head, 1.5-2 ms with the index
+/// condition, linear in the backlog); dead letters were walked the same way (52-78 ms
+/// behind 100 000 dead letters at a partition's head, 2-6 ms skipping them).
+macro_rules! due_rows_of_partition {
+    () => {
+        r"
+                        FROM kafka.shadow_tracking st
+                        CROSS JOIN LATERAL (
+                            SELECT 1 FROM kafka.messages m
+                            WHERE m.topic_id = st.topic_id
+                              AND m.partition_id = st.partition_id
+                              AND m.partition_offset = st.local_offset
+                            LIMIT 1
+                        ) has_message
+                        WHERE st.topic_id = p.topic_id
+                          AND st.partition_id = p.partition_id
+                          AND st.external_offset IS NULL
+                          AND NOT st.dead
+                          AND st.retry_count < $2
+                          AND st.local_offset < COALESCE(b.first_blocked, 9223372036854775807)
+                          AND NOT (st.retry_count > 0 AND NOT st.attempt_open
+                                   AND st.forwarded_at > NOW() - make_interval(secs =>
+                                       LEAST($6::float8 * power(2::float8, LEAST(st.retry_count - 1, 30)),
+                                             $7::float8) / 1000.0))
+                          AND (st.topic_id, st.partition_id, st.local_offset)
+                              NOT IN (SELECT inf.t, inf.p, inf.o FROM inf)
+                        "
+    };
+}
+
+/// The outbox claim (`SpiShadowDb::claim_due_outbox_rows`); its parameters are listed there.
+const CLAIM_DUE_OUTBOX_ROWS_SQL: &str = concat!(
+    r"
+        WITH RECURSIVE inf AS (
+            SELECT * FROM unnest($3::int4[], $4::int4[], $5::int8[]) AS i(t, p, o)
         ),
+        -- The partitions with pending rows.",
+    pending_partitions!(),
+    r",
         -- The first backing-off row of each partition: it failed, its
-        -- attempt is closed and its backoff has not passed. Only failed
-        -- rows are looked at (idx_shadow_tracking_retrying), so this does
-        -- not grow with the backlog.
+        -- attempt is closed and its backoff has not passed. Only the
+        -- partition's failed live rows are looked at (the index range
+        -- (topic_id, partition_id, NOT dead, retry_count 1 .. $2 - 1) of
+        -- idx_shadow_tracking_retrying), so this grows neither with the
+        -- backlog nor with the dead letters.
         blocked AS MATERIALIZED (
-            SELECT st.topic_id, st.partition_id, MIN(st.local_offset) AS first_blocked
-            FROM kafka.shadow_tracking st
-            WHERE st.external_offset IS NULL
-              AND st.retry_count > 0
-              AND st.retry_count < $2
-              AND NOT st.attempt_open
-              AND st.forwarded_at > NOW() - make_interval(secs =>
-                  LEAST($6::float8 * power(2::float8, LEAST(st.retry_count - 1, 30)),
-                        $7::float8) / 1000.0)
-              AND (st.topic_id, st.partition_id, st.local_offset)
-                  NOT IN (SELECT inf.t, inf.p, inf.o FROM inf)
-            GROUP BY st.topic_id, st.partition_id
+            SELECT p.topic_id, p.partition_id, fb.first_blocked
+            FROM parts p
+            CROSS JOIN LATERAL (
+                SELECT MIN(st.local_offset) AS first_blocked
+                FROM kafka.shadow_tracking st
+                WHERE st.topic_id = p.topic_id
+                  AND st.partition_id = p.partition_id
+                  AND st.external_offset IS NULL
+                  AND NOT st.dead
+                  AND st.retry_count > 0
+                  AND st.retry_count < $2
+                  AND NOT st.attempt_open
+                  AND st.forwarded_at > NOW() - make_interval(secs =>
+                      LEAST($6::float8 * power(2::float8, LEAST(st.retry_count - 1, 30)),
+                            $7::float8) / 1000.0)
+                  AND (st.topic_id, st.partition_id, st.local_offset)
+                      NOT IN (SELECT inf.t, inf.p, inf.o FROM inf)
+            ) fb
+            WHERE fb.first_blocked IS NOT NULL
         ),
         -- The partitions with a row due now (one probe each). Only they
         -- share the batch: a partition holding only dead letters, orphan
@@ -450,6 +528,7 @@ const CLAIM_DUE_OUTBOX_ROWS_SQL: &str = concat!(
                 WHERE lo.topic_id = p.topic_id
                   AND lo.partition_id = p.partition_id
                   AND lo.external_offset IS NULL
+                  AND NOT lo.dead
                   AND lo.retry_count < $2
                 ORDER BY lo.local_offset
                 LIMIT 1
@@ -539,13 +618,17 @@ const RESTORE_CLAIM_SETTINGS_SQL: &str =
     "SELECT set_config('work_mem', $1, true), set_config('jit', $2, true)";
 
 impl SpiShadowDb {
-    /// Run [`CLAIM_DUE_OUTBOX_ROWS_SQL`] (parameters in [`ShadowDb::claim_due_outbox_rows`]).
+    /// Run [`DEAD_LETTER_SYNC_SQL`], then [`CLAIM_DUE_OUTBOX_ROWS_SQL`] (parameters in
+    /// [`ShadowDb::claim_due_outbox_rows`]).
     fn run_claim(
         client: &mut pgrx::spi::SpiClient<'_>,
         claim: &OutboxClaim,
         backoff_base_ms: f64,
         backoff_max_ms: f64,
     ) -> Result<ClaimedRows> {
+        // A statement of its own: the claim's CTEs would read `dead` as it was
+        // before an UPDATE in the same statement.
+        client.update(DEAD_LETTER_SYNC_SQL, None, &[claim.max_retries.into()])?;
         let table = client.update(
             CLAIM_DUE_OUTBOX_ROWS_SQL,
             None,
@@ -1022,6 +1105,84 @@ mod tests {
                 .ends_with("ORDER BY st.local_offset LIMIT 1 ) any_due"),
             "{due_parts}"
         );
+    }
+
+    /// What bounds a probe of a partition's pending rows is an index condition of
+    /// `(topic_id, partition_id, dead, local_offset)`, never a filter: written as
+    /// `b.first_blocked IS NULL OR st.local_offset < b.first_blocked`, the blocked bound
+    /// was a filter and a backing-off head made every claim read the partition's whole
+    /// backlog; without `NOT dead` every claim read the dead letters (the E2E
+    /// `test_shadow_worker_stays_idle_beside_a_blocked_partition` and
+    /// `..._beside_dead_letters` measure both).
+    #[test]
+    fn the_claim_skips_blocked_rows_and_dead_letters_by_index_conditions() {
+        let squash = |sql: &str| {
+            sql.lines()
+                .filter(|l| !l.trim_start().starts_with("--"))
+                .collect::<Vec<_>>()
+                .join(" ")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let due = squash(due_rows_of_partition!());
+        assert!(
+            due.contains("AND NOT st.dead AND st.retry_count < $2"),
+            "{due}"
+        );
+        assert_eq!(
+            "9223372036854775807",
+            i64::MAX.to_string(),
+            "the COALESCE bound is the largest local_offset"
+        );
+        assert!(
+            due.contains("AND st.local_offset < COALESCE(b.first_blocked, 9223372036854775807)"),
+            "{due}"
+        );
+        assert!(!due.contains(" OR "), "no OR in the probe's bounds: {due}");
+        let claim = squash(CLAIM_DUE_OUTBOX_ROWS_SQL);
+        let section = |from: &str, to: &str| {
+            let start = claim.find(from).unwrap();
+            claim[start..start + claim[start..].find(to).unwrap()].to_string()
+        };
+        let blocked = section("blocked AS MATERIALIZED (", "due_parts AS");
+        assert!(
+            blocked.contains("FROM parts p CROSS JOIN LATERAL"),
+            "{blocked}"
+        );
+        assert!(
+            blocked.contains("AND NOT st.dead AND st.retry_count > 0 AND st.retry_count < $2"),
+            "{blocked}"
+        );
+        let heads = section("heads AS MATERIALIZED (", "claimed AS");
+        assert!(
+            heads.contains("AND NOT lo.dead AND lo.retry_count < $2"),
+            "{heads}"
+        );
+        // The claim and the dead-flag sync walk the same partitions.
+        let parts = squash(pending_partitions!());
+        assert!(claim.contains(&parts));
+        let sync = squash(DEAD_LETTER_SYNC_SQL);
+        assert!(sync.contains(&parts));
+    }
+
+    /// The sync before each claim makes `dead` equal `retry_count >= cap` on every
+    /// pending row whose flag is wrong, reading only those rows (an index range each
+    /// way per partition) and updating them by ctid.
+    #[test]
+    fn the_dead_flag_sync_reads_only_the_rows_it_changes() {
+        let sync = DEAD_LETTER_SYNC_SQL
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        // Dead letters a raised cap revives (retry_count 0 too: a hand edit or replay).
+        assert!(sync.contains("AND st.dead AND st.retry_count < $1 UNION ALL"));
+        // Rows at a (lowered) cap; retry_count > 0 matches the retrying index predicate.
+        assert!(sync.contains("AND NOT st.dead AND st.retry_count > 0 AND st.retry_count >= $1 )"));
+        assert!(sync.contains("SET dead = st.retry_count >= $1"));
+        assert!(sync.contains("WHERE st.ctid = ANY (ARRAY(SELECT stale.ctid FROM stale))"));
+        assert!(sync.contains("AND st.dead IS DISTINCT FROM (st.retry_count >= $1)"));
+        assert_eq!(sync.matches("st.external_offset IS NULL").count(), 5);
     }
 
     /// The claim runs with a `work_mem` floor and without JIT, set transaction-locally
