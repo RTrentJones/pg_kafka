@@ -116,12 +116,14 @@ pg_kafka.compression_type = 'gzip'
 - The decoding time of a request is bounded too, checked between 16 KiB chunks of compressed
   input and between partitions, for every codec: compressed input can cost much while
   decoding to nothing (gzip of empty dynamic-Huffman blocks costs some 200 ns per byte, so a
-  94 MB batch of them would decode for 15 s). A decode on a network I/O thread stops after
-  20 ms and decodes again off the I/O threads (a legitimate 1 MB request decodes there in
-  about 1 ms; 6 MiB of output, the work limit, in about 10 ms). Off them it stops after 2 s:
-  the partition decoding and those after it are answered REQUEST_TIMED_OUT (7), which clients
-  retry (80 MB of gzip-compressed 1 KB records decode in 0.13 s, the 400 MB work limit in
-  some 0.6 s). Measured on a release build; Kafka has no such limit.
+  94 MB batch of them would decode for 15 s). The time counted is the decoding thread's CPU
+  time, so a busy machine slows a decode down without refusing it. A decode on a network
+  I/O thread stops after 20 ms and decodes again off the I/O threads (a legitimate 1 MB
+  request of gzip-compressed 1 KB records of hex digits, compressed about 1.75:1, decodes in
+  about 5 ms; 6 MiB of their output, the work limit, in about 50 ms). Off them it stops
+  after 2 s: the partition decoding and those after it are answered REQUEST_TIMED_OUT (7),
+  which clients retry (a request at the 100 MB limit, 85 MB of such records, decodes in
+  about 0.5 s). Measured on a release build; Kafka has no such limit.
 - As in Kafka 3.7 (`KafkaApis.handleProduceRequest` collects a request's partitions in maps),
   a partition named more than once in a request, in one topic entry or in several, is
   answered once and written at most once: the last of its entries that
