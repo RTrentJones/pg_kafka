@@ -3,8 +3,9 @@
 
 use crate::common::TestResult;
 use crate::error_codes::{
-    ILLEGAL_GENERATION, INVALID_GROUP_ID, INVALID_PRODUCER_EPOCH, INVALID_PRODUCER_ID_MAPPING,
-    INVALID_TXN_STATE, NONE, REBALANCE_IN_PROGRESS, UNKNOWN_MEMBER_ID, UNKNOWN_TOPIC_OR_PARTITION,
+    ILLEGAL_GENERATION, INCONSISTENT_GROUP_PROTOCOL, INVALID_GROUP_ID, INVALID_PRODUCER_EPOCH,
+    INVALID_PRODUCER_ID_MAPPING, INVALID_SESSION_TIMEOUT, INVALID_TXN_STATE, NONE,
+    REBALANCE_IN_PROGRESS, UNKNOWN_MEMBER_ID, UNKNOWN_TOPIC_OR_PARTITION,
 };
 use crate::fixtures::TestTopicBuilder;
 use crate::setup::TestContext;
@@ -844,8 +845,8 @@ async fn stable_group(wire: &mut Wire, group: &str) -> crate::common::DynResult<
     Ok((joined.member_id.to_string(), joined.generation_id))
 }
 
-/// TxnOffsetCommit v3's member and generation checks, as a Kafka 3.7 broker answers them
-/// (pg_kafka let generation -1 through whatever the member id):
+/// Group member checks as a Kafka 3.7 broker answers them. TxnOffsetCommit v3 (pg_kafka let
+/// generation -1 through whatever the member id, and fenced CompletingRebalance):
 /// - a group with members: generation -1 with a member id it does not know is
 ///   UNKNOWN_MEMBER_ID, with one of its members ILLEGAL_GENERATION, with no member id it
 ///   commits;
@@ -853,11 +854,15 @@ async fn stable_group(wire: &mut Wire, group: &str) -> crate::common::DynResult<
 /// - a CompletingRebalance group (joined, not synced): its member's current generation
 ///   commits (the transactional path checks no group state), where a plain OffsetCommit
 ///   is REBALANCE_IN_PROGRESS.
-pub async fn test_txn_offset_commit_member_checks_match_kafka() -> TestResult {
+///
+/// JoinGroup v5 errors carry the request's member id (pg_kafka answered ""):
+/// INVALID_SESSION_TIMEOUT, UNKNOWN_MEMBER_ID of a new or an existing group, and
+/// INCONSISTENT_GROUP_PROTOCOL of a known member; a new member's carry none.
+pub async fn test_group_member_checks_match_kafka() -> TestResult {
     use kafka_protocol::messages::leave_group_request::LeaveGroupRequest;
     use kafka_protocol::messages::leave_group_response::LeaveGroupResponse;
 
-    println!("=== Test: TxnOffsetCommit member and generation checks ===\n");
+    println!("=== Test: TxnOffsetCommit and JoinGroup member checks ===\n");
     let ctx = TestContext::new().await?;
     let topic = TestTopicBuilder::new(&ctx, "parity-txn-member")
         .build()
@@ -998,6 +1003,49 @@ pub async fn test_txn_offset_commit_member_checks_match_kafka() -> TestResult {
     assert_eq!(pending, expected, "the accepted commits are pending");
     assert_eq!(wire.end_txn(&txn, producer_id, epoch, false).await?, NONE);
     println!("✅ Only the accepted commits are stored\n");
+
+    println!("Step 5: JoinGroup errors carry the request's member id...");
+    let fresh = ctx.unique_group("parity-txn-member-fresh").await;
+    let mut join_error = async |group: &str, member: &str, timeout: i32, protocol_type: &str| {
+        let r = join_v5(&mut wire, group, member, timeout, protocol_type).await?;
+        Ok::<_, Box<dyn std::error::Error>>((
+            r.error_code,
+            r.generation_id,
+            r.member_id.to_string(),
+        ))
+    };
+    let error = |code: i16, member: &str| (code, -1, member.to_string());
+    assert_eq!(
+        join_error(&fresh, "zz", 1, "consumer").await?,
+        error(INVALID_SESSION_TIMEOUT, "zz"),
+        "invalid session timeout"
+    );
+    assert_eq!(
+        join_error(&fresh, "", 1, "consumer").await?,
+        error(INVALID_SESSION_TIMEOUT, ""),
+        "invalid session timeout, new member"
+    );
+    assert_eq!(
+        join_error(&fresh, "zz", 30_000, "consumer").await?,
+        error(UNKNOWN_MEMBER_ID, "zz"),
+        "unknown member of a new group"
+    );
+    assert_eq!(
+        join_error(&live, "zz", 30_000, "consumer").await?,
+        error(UNKNOWN_MEMBER_ID, "zz"),
+        "unknown member of an existing group"
+    );
+    assert_eq!(
+        join_error(&live, &member, 30_000, "other").await?,
+        error(INCONSISTENT_GROUP_PROTOCOL, &member),
+        "another protocol type, known member"
+    );
+    assert_eq!(
+        join_error(&live, "", 30_000, "other").await?,
+        error(INCONSISTENT_GROUP_PROTOCOL, ""),
+        "another protocol type, new member"
+    );
+    println!("✅ 26 / 25 / 23 with the member id, as Kafka answers them\n");
 
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");

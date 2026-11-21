@@ -171,8 +171,12 @@ where
         request.client_id
     );
 
+    // Kafka 3.7 answers a JoinGroup error with the request's member id
+    // (`JoinGroupResult(memberId, error)`): INVALID_SESSION_TIMEOUT, UNKNOWN_MEMBER_ID,
+    // INCONSISTENT_GROUP_PROTOCOL and the rest, checked against a 3.7 broker.
+    let member_id = request.member_id.clone();
     if let Some(error_code) = session_timeout_refusal(request.session_timeout_ms) {
-        respond(crate::kafka::response_builders::build_join_group_error_response(error_code));
+        respond(join_group_error_response(error_code, member_id));
         return;
     }
     let protocols: Vec<(String, Vec<u8>)> = request
@@ -181,7 +185,7 @@ where
         .map(|p| (p.name, p.metadata))
         .collect();
     if let Some(error_code) = protocols_refusal(&protocols) {
-        respond(crate::kafka::response_builders::build_join_group_error_response(error_code));
+        respond(join_group_error_response(error_code, member_id));
         return;
     }
     ctx.coordinator.set_limits(
@@ -214,6 +218,7 @@ where
                 outcome,
                 protocol_type,
                 fallback_protocol,
+                member_id,
             ));
         }),
     );
@@ -260,20 +265,31 @@ fn protocols_refusal(protocols: &[(String, Vec<u8>)]) -> Option<i16> {
     Some(crate::kafka::constants::ERROR_INVALID_REQUEST)
 }
 
+/// A JoinGroup error response carrying the request's `member_id`, as Kafka 3.7 answers
+/// every JoinGroup error but GROUP_MAX_SIZE_REACHED, which it answers with no member id
+/// (only a new member is refused for the group's size; a known member always rejoins).
+fn join_group_error_response(error_code: i16, member_id: String) -> JoinGroupResponse {
+    let mut response = crate::kafka::response_builders::build_join_group_error_response(error_code);
+    if error_code != crate::kafka::constants::ERROR_GROUP_MAX_SIZE_REACHED {
+        response.member_id = member_id.into();
+    }
+    response
+}
+
 /// Build the JoinGroup response for a coordinator outcome. Errors map to their Kafka
-/// error code (UnknownMemberId, RebalanceInProgress, GroupMaxSizeReached, ...).
+/// error code (UnknownMemberId, RebalanceInProgress, GroupMaxSizeReached, ...) and carry
+/// the request's `member_id` ([`join_group_error_response`]).
 fn build_join_group_response(
     outcome: crate::kafka::coordinator::JoinOutcome,
     protocol_type: String,
     fallback_protocol: Option<String>,
+    member_id: String,
 ) -> JoinGroupResponse {
     let result = match outcome {
         Ok(result) => result,
         Err(e) => {
             crate::pg_warning!("Failed to handle JoinGroup request: {}", e);
-            return crate::kafka::response_builders::build_join_group_error_response(
-                e.to_kafka_error_code(),
-            );
+            return join_group_error_response(e.to_kafka_error_code(), member_id);
         }
     };
 
@@ -731,7 +747,10 @@ pub fn handle_list_groups(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kafka::constants::{ERROR_INVALID_SESSION_TIMEOUT, ERROR_REBALANCE_IN_PROGRESS};
+    use crate::kafka::constants::{
+        ERROR_INCONSISTENT_GROUP_PROTOCOL, ERROR_INVALID_SESSION_TIMEOUT,
+        ERROR_REBALANCE_IN_PROGRESS, ERROR_UNKNOWN_MEMBER_ID,
+    };
     use crate::kafka::error::KafkaError;
     use crate::kafka::messages::{JoinGroupProtocol, SyncGroupAssignment};
     use crate::kafka::{BrokerMetadata, GroupCoordinator};
@@ -883,6 +902,63 @@ mod tests {
         // The Kafka minimum (6s) is admitted.
         let ok = take(&f.join("g2", "", 6000)).expect("answered immediately");
         assert_eq!(ok.error_code, ERROR_NONE);
+    }
+
+    /// Kafka 3.7 answers JoinGroup errors with the request's member id (checked against a
+    /// 3.7 broker): INVALID_SESSION_TIMEOUT, UNKNOWN_MEMBER_ID on a new or an existing
+    /// group, and INCONSISTENT_GROUP_PROTOCOL of a known member; a new member's has none.
+    #[test]
+    fn test_handle_join_group_errors_echo_the_member_id() {
+        let f = Fixture::new();
+        let answer = |slot: &ResponseSlot| {
+            let r = take(slot).expect("answered immediately");
+            (r.error_code, r.generation_id, r.member_id.to_string())
+        };
+        let error = |code: i16, member: &str| (code, -1, member.to_string());
+        assert_eq!(
+            answer(&f.join("g", "zz", 100)),
+            error(ERROR_INVALID_SESSION_TIMEOUT, "zz")
+        );
+        assert_eq!(
+            answer(&f.join("g", "", 100)),
+            error(ERROR_INVALID_SESSION_TIMEOUT, "")
+        );
+        assert_eq!(
+            answer(&f.join("g", "zz", 30_000)),
+            error(ERROR_UNKNOWN_MEMBER_ID, "zz")
+        );
+        let member = f.join_now("g", "").member_id.to_string();
+        assert_eq!(
+            answer(&f.join("g", "zz", 30_000)),
+            error(ERROR_UNKNOWN_MEMBER_ID, "zz")
+        );
+        let join_as = |member: &str| {
+            let slot: ResponseSlot = Arc::new(Mutex::new(None));
+            let writer = slot.clone();
+            handle_join_group(
+                &f.ctx(),
+                JoinGroupRequestData {
+                    group_id: "g".to_string(),
+                    member_id: member.to_string(),
+                    client_id: "test-client".to_string(),
+                    group_instance_id: None,
+                    session_timeout_ms: 30_000,
+                    rebalance_timeout_ms: 60_000,
+                    protocol_type: "other".to_string(),
+                    protocols: vec![JoinGroupProtocol {
+                        name: "range".to_string(),
+                        metadata: vec![],
+                    }],
+                },
+                move |response| *writer.lock().unwrap() = Some(response),
+            );
+            answer(&slot)
+        };
+        assert_eq!(
+            join_as(&member),
+            error(ERROR_INCONSISTENT_GROUP_PROTOCOL, &member)
+        );
+        assert_eq!(join_as(""), error(ERROR_INCONSISTENT_GROUP_PROTOCOL, ""));
     }
 
     #[test]

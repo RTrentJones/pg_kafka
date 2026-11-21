@@ -106,9 +106,11 @@ pub struct JoinGroupApi;
 impl ApiSchema for JoinGroupApi {
     type Wire = JoinGroupRequest;
 
-    /// The member id to answer with. Kafka echoes the request's on INVALID_GROUP_ID and
-    /// answers `""` otherwise (JoinGroupRequest.getErrorResponse), so only the empty group
-    /// id refusal carries one.
+    /// The member id an error response carries. Kafka 3.7 echoes the request's on the
+    /// coordinator's errors (INVALID_GROUP_ID here, refused before the handler; the
+    /// handler's own refusals, such as INVALID_SESSION_TIMEOUT and UNKNOWN_MEMBER_ID,
+    /// carry it themselves) and answers `""` on a request that fails otherwise
+    /// (JoinGroupRequest.getErrorResponse), so only the empty group id refusal carries one.
     type Echo = String;
     const NAME: &'static str = "JoinGroup";
     const MIN_VERSION: i16 = 0;

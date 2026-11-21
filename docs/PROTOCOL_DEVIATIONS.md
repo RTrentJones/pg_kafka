@@ -392,6 +392,10 @@ pg_kafka.compression_type = 'gzip'
   protocol is chosen by Kafka's member vote (each member votes for its most preferred protocol
   that all members support; ties go to the leader's preference, where Kafka's order is
   unspecified). JoinGroup error responses before v7 carry protocol_name "" (non-nullable there).
+  As in Kafka 3.7 (checked against a 3.7 broker), a JoinGroup error carries the request's member
+  id: INVALID_GROUP_ID, INVALID_SESSION_TIMEOUT, UNKNOWN_MEMBER_ID and
+  INCONSISTENT_GROUP_PROTOCOL of a known member echo it (a new member's is ""), and
+  GROUP_MAX_SIZE_REACHED, which only a new member gets, carries none.
 - ✅ OffsetCommit follows Kafka 3.7: generation -1 (simple consumers, `kafka-consumer-groups
   --reset-offsets`) is accepted only for an unknown or Empty group (any member id); a group with
   members answers UNKNOWN_MEMBER_ID to a non-member and ILLEGAL_GENERATION to a wrong
