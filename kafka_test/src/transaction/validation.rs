@@ -509,6 +509,12 @@ pub async fn test_non_transactional_batch_inside_an_open_transaction_is_refused(
             error_codes::INVALID_TXN_STATE,
         ),
         (
+            ib(ep + 1, 5),
+            None,
+            "a bumped epoch not at sequence 0",
+            error_codes::OUT_OF_ORDER_SEQUENCE_NUMBER,
+        ),
+        (
             ib(ep + 1, 0),
             None,
             "a bumped epoch",
@@ -544,7 +550,7 @@ pub async fn test_non_transactional_batch_inside_an_open_transaction_is_refused(
         (error_codes::NONE, 2),
         "the transaction goes on at the next sequence, at its epoch"
     );
-    println!("✅ refused 48 after the epoch and sequence checks\n");
+    println!("✅ refused 48 after the epoch and sequence checks, the epoch unmoved\n");
 
     println!("Step 3: abort; nothing of the refused batches is visible...");
     assert_eq!(w.end_txn(&tx, pid, ep, false).await?, error_codes::NONE);

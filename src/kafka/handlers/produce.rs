@@ -3,7 +3,8 @@
 
 use super::helpers::validate_ongoing_transaction;
 use crate::kafka::constants::{
-    ERROR_INVALID_PRODUCER_EPOCH, ERROR_INVALID_TXN_STATE, ERROR_NONE, ERROR_UNKNOWN_SERVER_ERROR,
+    ERROR_INVALID_PRODUCER_EPOCH, ERROR_INVALID_TXN_STATE, ERROR_NONE,
+    ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER, ERROR_UNKNOWN_SERVER_ERROR,
     ERROR_UNKNOWN_TOPIC_OR_PARTITION,
 };
 use crate::kafka::error::{KafkaError, Result};
@@ -12,7 +13,8 @@ use crate::kafka::messages::{ProducerMetadata, Record, RefusedPartition, TopicPr
 use crate::kafka::partitioner::compute_partition;
 use crate::kafka::response_builders::build_produce_partition_error_response;
 use crate::kafka::storage::{
-    batch_last_sequence, KafkaStore, LogStore, ProducerBatch, SequenceCheck, TopicStore,
+    batch_last_sequence, validate_sequence, KafkaStore, LogStore, PartitionSequence, ProducerBatch,
+    SequenceCheck, SequenceValidation, TopicStore,
 };
 use kafka_protocol::messages::produce_response::{
     PartitionProduceResponse, ProduceResponse, TopicProduceResponse,
@@ -364,8 +366,9 @@ fn produce_partition(
 
     // A non-transactional batch of a producer whose open transaction wrote to the
     // partition: Kafka 3.7 (`ProducerAppendInfo`) refuses it INVALID_TXN_STATE after the
-    // epoch and sequence checks. One at a higher epoch is refused before the sequence
-    // check, which would move the producer's stored epoch, so that nothing changes.
+    // epoch and sequence checks. One at a higher epoch is judged here, without the stored
+    // sequence check, which would move the producer's stored epoch, so that nothing
+    // changes ([`bumped_epoch_in_open_transaction`]).
     let open_txn_epoch = match seq_meta.filter(|m| !m.is_transactional) {
         Some(meta) => {
             match store.open_txn_epoch_on_partition(meta.producer_id, topic_id, partition_index) {
@@ -377,7 +380,10 @@ fn produce_partition(
     };
     if let (Some(meta), Some(epoch)) = (seq_meta, open_txn_epoch) {
         if meta.producer_epoch > epoch {
-            return failed_partition(partition_index, ERROR_INVALID_TXN_STATE);
+            return failed_partition(
+                partition_index,
+                bumped_epoch_in_open_transaction(epoch, meta, record_count),
+            );
         }
     }
 
@@ -429,6 +435,30 @@ fn produce_partition(
         );
     }
     appended_partition(store, topic_id, partition_index, base_offset)
+}
+
+/// The error for a non-transactional batch at a higher epoch than its producer's open
+/// transaction `open_epoch`, on a partition that transaction wrote to. Kafka 3.7's order
+/// (`ProducerAppendInfo.appendDataBatch`): the sequence check first, where the
+/// transaction's records give the producer an entry on the partition, so the bumped epoch
+/// must start at sequence 0 (OUT_OF_ORDER_SEQUENCE_NUMBER otherwise, [`validate_sequence`]);
+/// then INVALID_TXN_STATE. Either way nothing is stored.
+fn bumped_epoch_in_open_transaction(
+    open_epoch: i16,
+    meta: &ProducerMetadata,
+    record_count: i32,
+) -> i16 {
+    match validate_sequence(
+        open_epoch,
+        PartitionSequence::EpochStart,
+        &[],
+        meta.producer_epoch,
+        meta.base_sequence,
+        record_count,
+    ) {
+        SequenceValidation::OutOfOrder { .. } => ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER,
+        _ => ERROR_INVALID_TXN_STATE,
+    }
 }
 
 /// Why a partition cannot be written, if it cannot: it is outside the topic, or its batch
@@ -749,8 +779,8 @@ mod tests {
 
     /// A non-transactional batch of a producer whose Ongoing transaction wrote to the
     /// partition is INVALID_TXN_STATE, after the epoch and sequence checks (a higher epoch
-    /// before the sequence check), and nothing is written; without such a transaction it
-    /// is written.
+    /// without the stored check: it must start at sequence 0), and nothing is written;
+    /// without such a transaction it is written.
     #[test]
     fn a_non_transactional_batch_inside_an_open_transaction_is_refused() {
         let idempotent = |epoch| ProducerMetadata {
@@ -788,6 +818,14 @@ mod tests {
         assert_eq!(produce(None, 2, append()), (ERROR_NONE, 4));
         assert_eq!(produce(Some(2), 2, append()), (ERROR_INVALID_TXN_STATE, -1));
         assert_eq!(produce(Some(2), 3, None), (ERROR_INVALID_TXN_STATE, -1));
+        let bumped_at = |seq| {
+            let mut m = idempotent(3);
+            m.base_sequence = seq;
+            bumped_epoch_in_open_transaction(2, &m, 1)
+        };
+        assert_eq!(bumped_at(5), ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER);
+        assert_eq!(bumped_at(-1), ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER);
+        assert_eq!(bumped_at(0), ERROR_INVALID_TXN_STATE);
         assert_eq!(
             produce(
                 Some(2),

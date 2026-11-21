@@ -261,8 +261,9 @@ pg_kafka.compression_type = 'gzip'
   topic that did not exist does not count either, but Produce auto-creates it (§10) and then
   refuses the other producer's batch there on its own, 49, where Kafka answers 3); and a non-transactional batch of a producer whose open transaction has written
   to the partition is INVALID_TXN_STATE (48), with or without a transactional id in the
-  request, after the epoch and sequence checks (a partition the transaction only added
-  takes it, committed). **Deviation:** transactional batches of one producer id at two
+  request, after the epoch and sequence checks (one at a bumped epoch must start at
+  sequence 0, OUT_OF_ORDER_SEQUENCE_NUMBER otherwise, and moves no stored epoch; a
+  partition the transaction only added takes it, committed). **Deviation:** transactional batches of one producer id at two
   epochs are checked per epoch (the current epoch's written, the other refused); Kafka
   verifies all of them with the epoch of whichever partition its request map yields first,
   so it refuses or accepts them all. AddPartitionsToTxn,
