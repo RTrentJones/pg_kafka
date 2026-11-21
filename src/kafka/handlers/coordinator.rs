@@ -556,10 +556,27 @@ pub fn handle_describe_groups(
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
+    // Whether each group the coordinator does not hold has committed offsets, in one
+    // lookup however many groups the request names.
+    let unheld: Vec<String> = groups
+        .iter()
+        .filter(|g| !coordinator_groups.contains_key(*g))
+        .cloned()
+        .collect();
+    let with_offsets = if unheld.is_empty() {
+        Ok(std::collections::HashSet::new())
+    } else {
+        ctx.store
+            .groups_with_offsets(&unheld)
+            .map_err(|e| e.to_kafka_error_code())
+    };
     for group_id in groups {
         let described_group = match coordinator_groups.get(&group_id) {
             Some(group) => describe_held_group(&group_id, group),
-            None => describe_unheld_group(ctx, &group_id),
+            None => describe_unheld_group(
+                &group_id,
+                with_offsets.as_ref().map(|g| g.contains(&group_id)),
+            ),
         };
         response.groups.push(described_group);
     }
@@ -622,14 +639,18 @@ fn describe_member(member: &GroupMember, protocol_name: Option<&String>) -> Desc
 /// `kafka-consumer-groups --describe` show its offsets and lag. Without offsets it does not
 /// exist: for the versions we advertise (v0-5) Kafka reports that as success with state
 /// Dead (GROUP_ID_NOT_FOUND only applies from v6).
-fn describe_unheld_group(ctx: &HandlerContext, group_id: &str) -> DescribedGroup {
+/// `has_offsets` is whether it has any, or the error code of a failed lookup.
+fn describe_unheld_group(
+    group_id: &str,
+    has_offsets: std::result::Result<bool, &i16>,
+) -> DescribedGroup {
     let mut described_group = DescribedGroup::default();
     described_group.group_id = GroupId(StrBytes::from_string(group_id.to_string()));
     described_group.protocol_data = StrBytes::from_static_str("");
-    let (error_code, state, protocol_type) = match ctx.store.group_has_offsets(group_id) {
+    let (error_code, state, protocol_type) = match has_offsets {
         Ok(true) => (ERROR_NONE, "Empty", "consumer"),
         Ok(false) => (ERROR_NONE, "Dead", ""),
-        Err(e) => (e.to_kafka_error_code(), "", ""),
+        Err(&code) => (code, "", ""),
     };
     described_group.error_code = error_code;
     described_group.group_state = StrBytes::from_static_str(state);
@@ -730,7 +751,9 @@ mod tests {
         fn new() -> Self {
             // Groups unknown to the coordinator are looked up by their offsets.
             let mut store = MockKafkaStore::new();
-            store.expect_group_has_offsets().returning(|_| Ok(false));
+            store
+                .expect_groups_with_offsets()
+                .returning(|_| Ok(std::collections::HashSet::new()));
             store.expect_list_offset_groups().returning(|| Ok(vec![]));
             Self {
                 store,
@@ -1144,7 +1167,9 @@ mod tests {
         assert!(coordinator.groups.is_poisoned(), "lock should be poisoned");
 
         let mut store = MockKafkaStore::new();
-        store.expect_group_has_offsets().returning(|_| Ok(false));
+        store
+            .expect_groups_with_offsets()
+            .returning(|_| Ok(std::collections::HashSet::new()));
         store.expect_list_offset_groups().returning(|| Ok(vec![]));
         let broker = BrokerMetadata::new("localhost".to_string(), 9092);
         let ctx = HandlerContext::new(
@@ -1163,9 +1188,13 @@ mod tests {
 
     fn offsets_store(groups: &'static [&'static str]) -> MockKafkaStore {
         let mut store = MockKafkaStore::new();
-        store
-            .expect_group_has_offsets()
-            .returning(move |g| Ok(groups.contains(&g)));
+        store.expect_groups_with_offsets().returning(move |asked| {
+            Ok(asked
+                .iter()
+                .filter(|g| groups.contains(&g.as_str()))
+                .cloned()
+                .collect())
+        });
         store
             .expect_list_offset_groups()
             .returning(move || Ok(groups.iter().map(ToString::to_string).collect()));

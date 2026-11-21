@@ -3,7 +3,7 @@
 use crate::kafka::constants::*;
 use crate::kafka::handlers::configs;
 use crate::testing::mocks::MockKafkaStore;
-use crate::testing::TestEnv;
+use crate::testing::{expect_topics, TestEnv};
 
 // ========== DescribeConfigs Handler Tests (API 32) ==========
 
@@ -27,12 +27,12 @@ fn find_config<'a>(
 #[test]
 fn test_handle_describe_configs_retention_sources() {
     let mut mock = MockKafkaStore::new();
-    mock.expect_get_topic_id().returning(|name| {
-        Ok(if name == "with-override" {
-            Some(1)
+    expect_topics(&mut mock, |name| {
+        Ok(Some(if name == "with-override" {
+            (1, 1)
         } else {
-            Some(2)
-        })
+            (2, 1)
+        }))
     });
     mock.expect_get_topic_retention_ms()
         .returning(|topic_id| Ok(if topic_id == 1 { Some(60_000) } else { None }));
@@ -68,7 +68,7 @@ fn test_handle_describe_configs_retention_sources() {
 #[test]
 fn test_handle_describe_configs_key_filter() {
     let mut mock = MockKafkaStore::new();
-    mock.expect_get_topic_id().returning(|_| Ok(Some(1)));
+    expect_topics(&mut mock, |_| Ok(Some((1, 1))));
     mock.expect_get_topic_retention_ms().returning(|_| Ok(None));
 
     let env = TestEnv::new();
@@ -94,7 +94,7 @@ fn test_handle_describe_configs_key_filter() {
 #[test]
 fn test_handle_describe_configs_errors() {
     let mut mock = MockKafkaStore::new();
-    mock.expect_get_topic_id().returning(|_| Ok(None));
+    expect_topics(&mut mock, |_| Ok(None));
 
     let env = TestEnv::new();
     let ctx = env.ctx(&mock);
@@ -122,7 +122,7 @@ fn test_handle_describe_configs_errors() {
 #[test]
 fn test_handle_incremental_alter_configs_set_and_delete() {
     let mut mock = MockKafkaStore::new();
-    mock.expect_get_topic_id().returning(|_| Ok(Some(7)));
+    expect_topics(&mut mock, |_| Ok(Some((7, 1))));
     mock.expect_set_topic_retention_ms()
         .with(
             mockall::predicate::eq(7),
@@ -152,7 +152,7 @@ fn test_handle_incremental_alter_configs_set_and_delete() {
             ),
             (
                 RESOURCE_TYPE_TOPIC,
-                "t".to_string(),
+                "u".to_string(),
                 vec![("retention.ms".to_string(), OP_DELETE, None)],
             ),
         ],
@@ -168,7 +168,7 @@ fn test_handle_incremental_alter_configs_set_and_delete() {
 #[test]
 fn test_handle_incremental_alter_configs_validate_only() {
     let mut mock = MockKafkaStore::new();
-    mock.expect_get_topic_id().returning(|_| Ok(Some(7)));
+    expect_topics(&mut mock, |_| Ok(Some((7, 1))));
     mock.expect_set_topic_retention_ms().times(0);
 
     let env = TestEnv::new();
@@ -192,7 +192,7 @@ fn test_handle_incremental_alter_configs_validate_only() {
 #[test]
 fn test_handle_incremental_alter_configs_rejections() {
     let mut mock = MockKafkaStore::new();
-    mock.expect_get_topic_id().returning(|_| Ok(Some(7)));
+    expect_topics(&mut mock, |_| Ok(Some((7, 1))));
     mock.expect_set_topic_retention_ms().times(0);
 
     let env = TestEnv::new();
@@ -212,12 +212,12 @@ fn test_handle_incremental_alter_configs_rejections() {
             ),
             (
                 RESOURCE_TYPE_TOPIC,
-                "t".to_string(),
+                "u".to_string(),
                 vec![("retention.ms".to_string(), OP_SET, Some("abc".to_string()))],
             ),
             (
                 RESOURCE_TYPE_TOPIC,
-                "t".to_string(),
+                "v".to_string(),
                 // Valid SET followed by an invalid APPEND: the valid one
                 // must NOT be applied (all-or-nothing per resource).
                 vec![
@@ -242,9 +242,7 @@ fn test_handle_incremental_alter_configs_rejections() {
 #[test]
 fn test_handle_delete_records_success_and_minus_one() {
     let mut mock = MockKafkaStore::new();
-    mock.expect_get_topic_id().returning(|_| Ok(Some(3)));
-    mock.expect_get_topic_partition_count()
-        .returning(|_| Ok(Some(1)));
+    expect_topics(&mut mock, |_| Ok(Some((3, 2))));
     mock.expect_get_high_watermark().returning(|_, _| Ok(10));
     mock.expect_delete_records_before()
         .with(
@@ -257,7 +255,7 @@ fn test_handle_delete_records_success_and_minus_one() {
     mock.expect_delete_records_before()
         .with(
             mockall::predicate::eq(3),
-            mockall::predicate::eq(0),
+            mockall::predicate::eq(1),
             mockall::predicate::eq(10i64), // -1 resolved to the HWM
         )
         .times(1)
@@ -267,7 +265,7 @@ fn test_handle_delete_records_success_and_minus_one() {
     let ctx = env.ctx(&mock);
 
     let response =
-        configs::handle_delete_records(&ctx, vec![("t".to_string(), vec![(0, 5), (0, -1)])])
+        configs::handle_delete_records(&ctx, vec![("t".to_string(), vec![(0, 5), (1, -1)])])
             .unwrap();
 
     let partitions = &response.topics[0].partitions;
@@ -282,10 +280,7 @@ fn test_handle_delete_records_success_and_minus_one() {
 #[test]
 fn test_handle_delete_records_errors() {
     let mut mock = MockKafkaStore::new();
-    mock.expect_get_topic_id()
-        .returning(|name| Ok(if name == "known" { Some(3) } else { None }));
-    mock.expect_get_topic_partition_count()
-        .returning(|name| Ok(if name == "known" { Some(1) } else { None }));
+    expect_topics(&mut mock, |name| Ok((name == "known").then_some((3, 1))));
     mock.expect_get_high_watermark().returning(|_, _| Ok(10));
     mock.expect_delete_records_before().times(0);
 
@@ -308,4 +303,95 @@ fn test_handle_delete_records_errors() {
         response.topics[1].partitions[0].error_code,
         ERROR_UNKNOWN_TOPIC_OR_PARTITION
     );
+}
+
+/// Kafka 3.7 refuses every entry of a resource named twice in IncrementalAlterConfigs
+/// (INVALID_REQUEST) and alters nothing for it; other resources are altered.
+#[test]
+fn test_handle_incremental_alter_configs_repeated_resource_is_refused() {
+    let mut mock = MockKafkaStore::new();
+    expect_topics(&mut mock, |_| Ok(Some((7, 1))));
+    mock.expect_set_topic_retention_ms()
+        .with(
+            mockall::predicate::eq(7),
+            mockall::predicate::eq(Some(5i64)),
+        )
+        .times(1)
+        .returning(|_, _| Ok(()));
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
+    let set = |name: &str, ms: &str| {
+        (
+            RESOURCE_TYPE_TOPIC,
+            name.to_string(),
+            vec![("retention.ms".to_string(), OP_SET, Some(ms.to_string()))],
+        )
+    };
+    let response = configs::handle_incremental_alter_configs(
+        &ctx,
+        vec![set("t", "1"), set("other", "5"), set("t", "2")],
+        false,
+    )
+    .unwrap();
+    let codes: Vec<i16> = response.responses.iter().map(|r| r.error_code).collect();
+    assert_eq!(
+        codes,
+        [ERROR_INVALID_REQUEST, ERROR_NONE, ERROR_INVALID_REQUEST]
+    );
+    assert_eq!(
+        response.responses[0].error_message.as_deref(),
+        Some("Each resource must appear at most once.")
+    );
+}
+
+/// DeleteRecords acts on a repeated partition once, with its last entry, and answers it
+/// once (Kafka 3.7 collects the partitions into a map).
+#[test]
+fn test_handle_delete_records_repeated_partition_is_deleted_once() {
+    let mut mock = MockKafkaStore::new();
+    expect_topics(&mut mock, |_| Ok(Some((3, 1))));
+    mock.expect_get_high_watermark()
+        .times(1)
+        .returning(|_, _| Ok(10));
+    mock.expect_delete_records_before()
+        .with(
+            mockall::predicate::eq(3),
+            mockall::predicate::eq(0),
+            mockall::predicate::eq(4i64),
+        )
+        .times(1)
+        .returning(|_, _, before| Ok(before));
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
+    let response = configs::handle_delete_records(
+        &ctx,
+        vec![
+            ("t".to_string(), vec![(0, 2), (0, 7)]),
+            ("t".to_string(), vec![(0, 4)]),
+        ],
+    )
+    .unwrap();
+    assert_eq!(response.topics.len(), 1);
+    assert_eq!(response.topics[0].partitions.len(), 1);
+    assert_eq!(response.topics[0].partitions[0].low_watermark, 4);
+}
+
+/// DescribeConfigs answers every entry of a repeated topic but reads its configs once.
+#[test]
+fn test_handle_describe_configs_repeated_topic_is_read_once() {
+    let mut mock = MockKafkaStore::new();
+    expect_topics(&mut mock, |_| Ok(Some((1, 1))));
+    mock.expect_get_topic_retention_ms()
+        .times(1)
+        .returning(|_| Ok(None));
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
+    let response = configs::handle_describe_configs(
+        &ctx,
+        vec![(RESOURCE_TYPE_TOPIC, "t".to_string(), None); 1000],
+        0,
+    )
+    .unwrap();
+    assert_eq!(response.results.len(), 1000);
+    assert!(response.results.iter().all(|r| r.error_code == ERROR_NONE));
 }

@@ -24,6 +24,7 @@ mod store {
 
         impl TopicStore for KafkaStore {
             fn get_or_create_topic<'a>(&self, name: &'a str, default_partitions: i32) -> Result<(i32, i32)>;
+            fn get_or_create_topics<'a>(&self, names: &'a [String], partition_count: i32) -> Result<Vec<TopicMetadata>>;
             fn get_topic_metadata<'a>(&self, names: Option<&'a [String]>) -> Result<Vec<TopicMetadata>>;
             fn topic_exists<'a>(&self, name: &'a str) -> Result<bool>;
             fn create_topic<'a>(&self, name: &'a str, partition_count: i32) -> Result<i32>;
@@ -33,7 +34,7 @@ mod store {
             fn set_topic_partition_count<'a>(&self, name: &'a str, partition_count: i32) -> Result<()>;
             fn get_topic_retention_ms(&self, topic_id: i32) -> Result<Option<i64>>;
             fn set_topic_retention_ms(&self, topic_id: i32, retention_ms: Option<i64>) -> Result<()>;
-                fn find_colliding_topic<'a>(&self, name: &'a str) -> Result<Option<String>>;
+                fn colliding_topics<'a>(&self, names: &'a [String]) -> Result<Vec<String>>;
         }
 
         impl LogStore for KafkaStore {
@@ -77,16 +78,10 @@ mod store {
                 offset: i64,
                 metadata: Option<&'a str>,
             ) -> Result<()>;
-            fn fetch_offset<'a>(
-                &self,
-                group_id: &'a str,
-                topic_id: i32,
-                partition_id: i32,
-            ) -> Result<Option<CommittedOffset>>;
             fn fetch_all_offsets<'a>(&self, group_id: &'a str) -> Result<Vec<(String, i32, CommittedOffset)>>;
             fn delete_consumer_group_offsets<'a>(&self, group_id: &'a str) -> Result<()>;
                 fn list_offset_groups(&self) -> Result<Vec<String>>;
-            fn group_has_offsets<'a>(&self, group_id: &'a str) -> Result<bool>;
+            fn groups_with_offsets<'a>(&self, group_ids: &'a [String]) -> Result<std::collections::HashSet<String>>;
             fn pending_txn_offset_partitions<'a>(&self, group_id: &'a str) -> Result<Vec<(String, i32)>>;
         }
 

@@ -344,34 +344,6 @@ fn test_mock_commit_offset() {
 }
 
 #[test]
-fn test_mock_fetch_offset_found() {
-    let mut mock = MockKafkaStore::new();
-
-    mock.expect_fetch_offset().returning(|_, _, _| {
-        Ok(Some(CommittedOffset {
-            offset: 42,
-            metadata: Some("my-metadata".to_string()),
-        }))
-    });
-
-    let result = mock.fetch_offset("group", 1, 0).unwrap();
-    assert!(result.is_some());
-    let offset = result.unwrap();
-    assert_eq!(offset.offset, 42);
-    assert_eq!(offset.metadata, Some("my-metadata".to_string()));
-}
-
-#[test]
-fn test_mock_fetch_offset_not_found() {
-    let mut mock = MockKafkaStore::new();
-
-    mock.expect_fetch_offset().returning(|_, _, _| Ok(None));
-
-    let result = mock.fetch_offset("group", 1, 0).unwrap();
-    assert!(result.is_none());
-}
-
-#[test]
 fn test_mock_fetch_all_offsets() {
     let mut mock = MockKafkaStore::new();
 

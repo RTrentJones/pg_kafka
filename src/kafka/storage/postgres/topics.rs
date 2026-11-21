@@ -28,15 +28,26 @@ impl PostgresStore {
             "PostgresStore::get_or_create_topic: '{name}' (default_partitions={default_partitions})"
         );
 
+        // Look the topic up first and insert only a missing one: an upsert that updates the
+        // existing row writes a new row version on every call, and one request that names
+        // a topic thousands of times would then walk an ever longer version chain.
         Spi::connect_mut(|client| {
-            let table = client.update(
-                "INSERT INTO kafka.topics (name, partitions)
-                 VALUES ($1, $2)
-                 ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
-                 RETURNING id, partitions",
-                None,
-                &[name.into(), default_partitions.into()],
-            )?;
+            let lookup = "SELECT id, partitions FROM kafka.topics WHERE name = $1";
+            let mut table = client.select(lookup, Some(1), &[name.into()])?;
+            if table.is_empty() {
+                table = client.update(
+                    "INSERT INTO kafka.topics (name, partitions)
+                     VALUES ($1, $2)
+                     ON CONFLICT (name) DO NOTHING
+                     RETURNING id, partitions",
+                    None,
+                    &[name.into(), default_partitions.into()],
+                )?;
+            }
+            if table.is_empty() {
+                // Created by another session since the lookup.
+                table = client.select(lookup, Some(1), &[name.into()])?;
+            }
 
             let row = table.first();
             let topic_id: i32 = row
@@ -50,6 +61,42 @@ impl PostgresStore {
             Ok((topic_id, partition_count))
         })
         .map_err(internal("get_or_create_topic"))
+    }
+
+    pub(super) fn get_or_create_topics(
+        names: &[String],
+        partition_count: i32,
+    ) -> Result<Vec<TopicMetadata>> {
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        Spi::connect_mut(|client| {
+            // The insert's snapshot does not see its own rows, so the topics it created come
+            // from RETURNING and the ones that already existed from the table.
+            let table = client.update(
+                "WITH created AS (
+                     INSERT INTO kafka.topics (name, partitions)
+                     SELECT n, $2 FROM unnest($1::text[]) AS n
+                     ON CONFLICT (name) DO NOTHING
+                     RETURNING id, name, partitions
+                 )
+                 SELECT id, name, partitions FROM created
+                 UNION ALL
+                 SELECT id, name, partitions FROM kafka.topics
+                 WHERE name = ANY($1::text[])",
+                None,
+                &[names.to_vec().into(), partition_count.into()],
+            )?;
+            Ok(topic_rows(table)?
+                .into_iter()
+                .map(|(name, id, partition_count)| TopicMetadata {
+                    name,
+                    id,
+                    partition_count,
+                })
+                .collect())
+        })
+        .map_err(internal("get_or_create_topics"))
     }
 
     /// The named topics in request order (one statement, not one per name), or every
@@ -186,24 +233,30 @@ impl PostgresStore {
         .map_err(internal("set_topic_partition_count"))
     }
 
-    /// A topic whose name equals `name` once '.' and '_' are treated as equal (Kafka's
-    /// metric-name collision rule), other than `name` itself.
-    pub(super) fn find_colliding_topic(name: &str) -> Result<Option<String>> {
+    /// The topics whose name equals one of `names` once '.' and '_' are treated as equal
+    /// (Kafka's metric-name collision rule), the names themselves included, sorted.
+    pub(super) fn colliding_topics(names: &[String]) -> Result<Vec<String>> {
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let normalized: Vec<String> = names.iter().map(|n| n.replace('.', "_")).collect();
         Spi::connect(|client| {
-            let mut table = client.select(
+            let table = client.select(
                 "SELECT name FROM kafka.topics
-                 WHERE replace(name, '.', '_') = replace($1, '.', '_') AND name <> $1
-                 ORDER BY name
-                 LIMIT 1",
-                Some(1),
-                &[name.into()],
+                 WHERE replace(name, '.', '_') = ANY($1::text[])
+                 ORDER BY name",
+                None,
+                &[normalized.into()],
             )?;
-            match table.next() {
-                Some(row) => Ok(row.get_by_name::<String, _>("name")?),
-                None => Ok(None),
+            let mut found = Vec::new();
+            for row in table {
+                if let Some(name) = row.get_by_name::<String, _>("name")? {
+                    found.push(name);
+                }
             }
+            Ok(found)
         })
-        .map_err(internal("find_colliding_topic"))
+        .map_err(internal("colliding_topics"))
     }
 
     pub(super) fn get_topic_retention_ms(topic_id: i32) -> Result<Option<i64>> {

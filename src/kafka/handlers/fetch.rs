@@ -1,9 +1,9 @@
 //! Fetch and ListOffsets: reading records (isolation-aware, re-encoded as RecordBatch v2) and
 //! resolving offsets by position or timestamp.
 
-use super::helpers::resolve_topic;
+use super::helpers::{merge_by_partition, resolve_topics};
 use crate::kafka::constants::{
-    ERROR_KAFKA_STORAGE_ERROR, ERROR_NONE, ERROR_OFFSET_OUT_OF_RANGE,
+    ERROR_INVALID_REQUEST, ERROR_KAFKA_STORAGE_ERROR, ERROR_NONE, ERROR_OFFSET_OUT_OF_RANGE,
     ERROR_UNKNOWN_TOPIC_OR_PARTITION,
 };
 use crate::kafka::error::Result;
@@ -25,6 +25,7 @@ use kafka_protocol::protocol::StrBytes;
 use kafka_protocol::records::{
     Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
 };
+use std::collections::{HashMap, HashSet};
 
 /// Handle Fetch request
 ///
@@ -301,36 +302,43 @@ pub fn handle_fetch_with_max_bytes(
         isolation_level,
         compression: ctx.compression,
     };
-    let mut responses = Vec::new();
-
-    for topic_fetch in topic_data {
-        // Topic id and partition count in one lookup; a missing topic (or a failed
-        // lookup) is reported on every requested partition.
-        let partitions = match resolve_topic(store, &topic_fetch.name) {
-            Ok(Some((topic_id, partition_count))) => {
+    // Kafka 3.7 reads a repeated partition once, at its last entry's offset, and answers
+    // it once (its fetch data is a map by partition).
+    let topic_data = merge_by_partition(
+        topic_data.into_iter().map(|t| (t.name, t.partitions)),
+        |p| p.partition_index,
+    );
+    let resolved = resolve_topics(store, topic_data.iter().map(|(name, _)| name.as_str()));
+    let mut responses = Vec::with_capacity(topic_data.len());
+    for (name, requested) in topic_data {
+        let found = match &resolved {
+            Ok(found) => found
+                .get(&name)
+                .copied()
+                .ok_or(ERROR_UNKNOWN_TOPIC_OR_PARTITION),
+            Err(code) => Err(*code),
+        };
+        // A missing topic (or a failed lookup) is reported on every requested partition.
+        let partitions = match found {
+            Ok((topic_id, partition_count)) => {
                 let topic = TopicPartitions {
                     id: topic_id,
                     partition_count,
                 };
-                topic_fetch
-                    .partitions
+                requested
                     .iter()
                     .map(|partition| {
                         fetch_partition(store, topic, partition, settings, &mut budget)
                     })
                     .collect()
             }
-            unresolved => {
-                let error_code = unresolved.err().unwrap_or(ERROR_UNKNOWN_TOPIC_OR_PARTITION);
-                topic_fetch
-                    .partitions
-                    .iter()
-                    .map(|p| partition_error(p.partition_index, error_code))
-                    .collect()
-            }
+            Err(error_code) => requested
+                .iter()
+                .map(|p| partition_error(p.partition_index, error_code))
+                .collect(),
         };
         let mut topic_response = FetchableTopicResponse::default();
-        topic_response.topic = TopicName(StrBytes::from_string(topic_fetch.name));
+        topic_response.topic = TopicName(StrBytes::from_string(name));
         topic_response.partitions = partitions;
         responses.push(topic_response);
     }
@@ -575,41 +583,62 @@ pub fn handle_list_offsets(
     topics: Vec<ListOffsetsTopicData>,
     isolation_level: IsolationLevel,
 ) -> Result<ListOffsetsResponse> {
+    // Kafka 3.7 answers every entry of a partition the request names more than once
+    // INVALID_REQUEST and looks nothing up for it.
+    let mut named: HashMap<(&str, i32), usize> = HashMap::new();
+    for topic in &topics {
+        for p in &topic.partitions {
+            *named.entry((&topic.name, p.partition_index)).or_default() += 1;
+        }
+    }
+    let repeated: HashSet<(String, i32)> = named
+        .into_iter()
+        .filter(|&(_, n)| n > 1)
+        .map(|((name, partition), _)| (name.to_string(), partition))
+        .collect();
+    let resolved = resolve_topics(ctx.store, topics.iter().map(|t| t.name.as_str()));
     let mut kafka_response = ListOffsetsResponse::default();
     kafka_response.throttle_time_ms = 0;
     kafka_response.topics = topics
         .into_iter()
-        .map(|topic| list_topic_offsets(ctx.store, topic, isolation_level))
-        .collect();
-    Ok(kafka_response)
-}
-
-/// Answer one ListOffsets topic: a missing topic (or a failed lookup) is reported on
-/// every requested partition.
-fn list_topic_offsets(
-    store: &dyn KafkaStore,
-    topic: ListOffsetsTopicData,
-    isolation_level: IsolationLevel,
-) -> ListOffsetsTopicResponse {
-    let partitions = match resolve_topic(store, &topic.name) {
-        Ok(Some((topic_id, partition_count))) => topic
-            .partitions
-            .iter()
-            .map(|p| list_offsets_partition(store, topic_id, partition_count, p, isolation_level))
-            .collect(),
-        unresolved => {
-            let error_code = unresolved.err().unwrap_or(ERROR_UNKNOWN_TOPIC_OR_PARTITION);
-            topic
+        .map(|topic| {
+            let found = match &resolved {
+                Ok(found) => Ok(found.get(&topic.name).copied()),
+                Err(code) => Err(*code),
+            };
+            let partitions = topic
                 .partitions
                 .iter()
-                .map(|p| list_offsets_error(p.partition_index, error_code))
-                .collect()
-        }
-    };
-    let mut topic_response = ListOffsetsTopicResponse::default();
-    topic_response.name = TopicName(StrBytes::from_string(topic.name));
-    topic_response.partitions = partitions;
-    topic_response
+                .map(|p| {
+                    if !repeated.is_empty()
+                        && repeated.contains(&(topic.name.clone(), p.partition_index))
+                    {
+                        return list_offsets_error(p.partition_index, ERROR_INVALID_REQUEST);
+                    }
+                    match found {
+                        Ok(Some((topic_id, partition_count))) => list_offsets_partition(
+                            ctx.store,
+                            topic_id,
+                            partition_count,
+                            p,
+                            isolation_level,
+                        ),
+                        // A missing topic (or a failed lookup) is reported on every
+                        // requested partition.
+                        Ok(None) => {
+                            list_offsets_error(p.partition_index, ERROR_UNKNOWN_TOPIC_OR_PARTITION)
+                        }
+                        Err(code) => list_offsets_error(p.partition_index, code),
+                    }
+                })
+                .collect();
+            let mut topic_response = ListOffsetsTopicResponse::default();
+            topic_response.name = TopicName(StrBytes::from_string(topic.name));
+            topic_response.partitions = partitions;
+            topic_response
+        })
+        .collect();
+    Ok(kafka_response)
 }
 
 /// Answer one ListOffsets partition of a resolved topic.

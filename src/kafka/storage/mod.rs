@@ -13,6 +13,7 @@
 //! encoding, sequence validation, retention planning, the role grants) lives in
 //! submodules that unit tests reach without a database.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use super::error::Result;
@@ -247,6 +248,15 @@ pub trait TopicStore {
     /// Tuple of (topic_id, partition_count) on success, error otherwise
     fn get_or_create_topic(&self, name: &str, default_partitions: i32) -> Result<(i32, i32)>;
 
+    /// Create each of `names` that does not exist with `partition_count` partitions, in one
+    /// statement however many names: the topics of `names` afterwards, created or not, in
+    /// no particular order.
+    fn get_or_create_topics(
+        &self,
+        names: &[String],
+        partition_count: i32,
+    ) -> Result<Vec<TopicMetadata>>;
+
     /// Get metadata for topics
     ///
     /// # Arguments
@@ -327,9 +337,10 @@ pub trait TopicStore {
     ///   clear the override and fall back to the global GUC
     fn set_topic_retention_ms(&self, topic_id: i32, retention_ms: Option<i64>) -> Result<()>;
 
-    /// An existing topic whose name collides with `name` once '.' and '_' are treated as equal
-    /// (Kafka's metric-name collision rule), other than `name` itself; `None` if there is none.
-    fn find_colliding_topic(&self, name: &str) -> Result<Option<String>>;
+    /// Every existing topic whose name equals one of `names` once '.' and '_' are treated as
+    /// equal (Kafka's metric-name collision rule), the names themselves included, sorted;
+    /// one statement however many names.
+    fn colliding_topics(&self, names: &[String]) -> Result<Vec<String>>;
 }
 
 /// The message log: append, read (with isolation), offset bounds and truncation.
@@ -526,22 +537,6 @@ pub trait OffsetStore {
         metadata: Option<&str>,
     ) -> Result<()>;
 
-    /// Fetch committed offset for a consumer group partition
-    ///
-    /// # Arguments
-    /// * `group_id` - Consumer group ID
-    /// * `topic_id` - Topic ID
-    /// * `partition_id` - Partition ID
-    ///
-    /// # Returns
-    /// Committed offset info, or None if not committed
-    fn fetch_offset(
-        &self,
-        group_id: &str,
-        topic_id: i32,
-        partition_id: i32,
-    ) -> Result<Option<CommittedOffset>>;
-
     /// Fetch all committed offsets for a consumer group
     ///
     /// # Arguments
@@ -565,8 +560,8 @@ pub trait OffsetStore {
     /// them (e.g. after a worker restart), as Kafka reports them as Empty groups.
     fn list_offset_groups(&self) -> Result<Vec<String>>;
 
-    /// Whether `group_id` has at least one committed offset.
-    fn group_has_offsets(&self, group_id: &str) -> Result<bool>;
+    /// Which of `group_ids` have at least one committed offset, in one statement.
+    fn groups_with_offsets(&self, group_ids: &[String]) -> Result<HashSet<String>>;
     /// The `(topic name, partition)` pairs of `group_id` that have a transactional
     /// offset commit (TxnOffsetCommit) whose transaction has not ended yet. OffsetFetch
     /// with `require_stable` (KIP-447) answers UNSTABLE_OFFSET_COMMIT for them.

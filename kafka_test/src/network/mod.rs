@@ -16,6 +16,7 @@
 //! well-behaved clients on 127.0.0.1. All tests are `parallel_safe: false`.
 
 pub mod decode_work;
+pub mod fanout;
 pub mod hostile_clients;
 pub mod large_decodes;
 pub mod produce_decoding;
@@ -189,6 +190,24 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         decode_work::test_input_that_decodes_to_nothing_is_bounded_in_time: sequential,
         decode_work::test_a_long_topic_name_is_held_once_per_topic: sequential,
         hostile_clients::test_invalid_acks_answers_in_kafkas_order: sequential,
+        fanout::test_metadata_of_a_repeated_name_is_answered_once: sequential,
+        fanout::test_metadata_of_many_missing_names_is_answered_quickly: sequential,
+        fanout::test_metadata_auto_creates_many_names_together: sequential,
+        fanout::test_list_offsets_of_a_repeated_partition_is_refused_quickly: sequential,
+        fanout::test_list_offsets_of_many_missing_topics_is_answered_quickly: sequential,
+        fanout::test_offset_commit_of_a_repeated_partition_is_answered_quickly: sequential,
+        fanout::test_offset_fetch_of_a_repeated_partition_is_answered_quickly: sequential,
+        fanout::test_delete_records_of_a_repeated_partition_is_answered_quickly: sequential,
+        fanout::test_create_topics_of_many_names_is_answered_quickly: sequential,
+        fanout::test_delete_topics_of_many_missing_names_is_answered_quickly: sequential,
+        fanout::test_create_partitions_of_many_missing_names_is_answered_quickly: sequential,
+        fanout::test_describe_configs_of_a_repeated_topic_is_answered_quickly: sequential,
+        fanout::test_incremental_alter_configs_of_a_repeated_topic_is_answered_quickly: sequential,
+        fanout::test_add_partitions_to_txn_of_a_repeated_topic_is_answered_quickly: sequential,
+        fanout::test_txn_offset_commit_of_a_repeated_partition_is_answered_quickly: sequential,
+        fanout::test_delete_groups_of_many_groups_is_answered_quickly: sequential,
+        fanout::test_describe_groups_of_many_groups_is_answered_quickly: sequential,
+        fanout::test_fetch_of_a_repeated_partition_is_answered_quickly: sequential,
         limits::test_network_limits_setup: sequential,
         limits::test_scram_unknown_user_is_indistinguishable: sequential,
         limits::test_per_ip_connection_limit: sequential,

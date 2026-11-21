@@ -444,9 +444,7 @@ fn test_txn_offset_commit_success() {
     mock.expect_get_transaction_state()
         .returning(|_| Ok(Some(TransactionState::Ongoing)));
     mock.expect_txn_has_group().returning(|_, _| Ok(true));
-    mock.expect_get_topic_id().returning(|_| Ok(Some(1)));
-    mock.expect_get_topic_partition_count()
-        .returning(|_| Ok(Some(3)));
+    crate::testing::expect_topics(&mut mock, |_| Ok(Some((1, 3))));
     mock.expect_store_txn_pending_offset()
         .times(1)
         .returning(|_, _, _, _, _, _| Ok(()));
@@ -486,9 +484,7 @@ fn test_txn_offset_commit_multiple_partitions() {
     mock.expect_get_transaction_state()
         .returning(|_| Ok(Some(TransactionState::Ongoing)));
     mock.expect_txn_has_group().returning(|_, _| Ok(true));
-    mock.expect_get_topic_id().returning(|_| Ok(Some(1)));
-    mock.expect_get_topic_partition_count()
-        .returning(|_| Ok(Some(3)));
+    crate::testing::expect_topics(&mut mock, |_| Ok(Some((1, 3))));
     // Should be called 3 times, once for each partition
     mock.expect_store_txn_pending_offset()
         .times(3)
@@ -531,7 +527,7 @@ fn test_txn_offset_commit_unknown_topic() {
         .returning(|_| Ok(Some(TransactionState::Ongoing)));
     mock.expect_txn_has_group().returning(|_, _| Ok(true));
     // Topic doesn't exist
-    mock.expect_get_topic_id().returning(|_| Ok(None));
+    crate::testing::expect_topics(&mut mock, |_| Ok(None));
 
     // Create HandlerContext AFTER setting expectations
     let env = TestEnv::new();
@@ -631,9 +627,7 @@ fn test_txn_offset_commit_store_error() {
     mock.expect_get_transaction_state()
         .returning(|_| Ok(Some(TransactionState::Ongoing)));
     mock.expect_txn_has_group().returning(|_, _| Ok(true));
-    mock.expect_get_topic_id().returning(|_| Ok(Some(1)));
-    mock.expect_get_topic_partition_count()
-        .returning(|_| Ok(Some(3)));
+    crate::testing::expect_topics(&mut mock, |_| Ok(Some((1, 3))));
     // Store fails
     mock.expect_store_txn_pending_offset()
         .returning(|_, _, _, _, _, _| Err(KafkaError::database("store failed")));

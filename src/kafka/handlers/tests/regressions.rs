@@ -263,9 +263,7 @@ fn txn_offset_commit_checks_partition_range() {
     mock.expect_get_transaction_state()
         .returning(|_| Ok(Some(TransactionState::Ongoing)));
     mock.expect_txn_has_group().returning(|_, _| Ok(true));
-    mock.expect_get_topic_id().returning(|_| Ok(Some(1)));
-    mock.expect_get_topic_partition_count()
-        .returning(|_| Ok(Some(1)));
+    crate::testing::expect_topics(&mut mock, |_| Ok(Some((1, 1))));
     mock.expect_store_txn_pending_offset()
         .withf(|_, _, _, partition, _, _| *partition == 0)
         .times(1)
@@ -298,7 +296,8 @@ fn txn_offset_commit_checks_partition_range() {
 #[test]
 fn describe_unknown_group_is_dead_not_server_error() {
     let mut mock = MockKafkaStore::new();
-    mock.expect_group_has_offsets().returning(|_| Ok(false));
+    mock.expect_groups_with_offsets()
+        .returning(|_| Ok(std::collections::HashSet::new()));
     let env = TestEnv::new();
     let ctx = env.ctx(&mock);
     let response = coordinator::handle_describe_groups(&ctx, vec!["missing".to_string()]).unwrap();

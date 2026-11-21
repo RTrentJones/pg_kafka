@@ -1,6 +1,6 @@
 //! Transaction handlers: AddPartitionsToTxn, AddOffsetsToTxn, EndTxn and TxnOffsetCommit.
 
-use super::helpers::validate_ongoing_transaction;
+use super::helpers::{merge_by_partition, resolve_topics, validate_ongoing_transaction};
 use crate::kafka::constants::{
     ERROR_INVALID_TXN_STATE, ERROR_NONE, ERROR_OPERATION_NOT_ATTEMPTED, ERROR_UNKNOWN_SERVER_ERROR,
     ERROR_UNKNOWN_TOPIC_OR_PARTITION,
@@ -77,7 +77,7 @@ pub fn handle_add_partitions_to_txn(
     }
 
     // Register the partitions: a transactional Produce is accepted only for them.
-    let partitions: Vec<(i32, i32)> = resolved
+    let mut partitions: Vec<(i32, i32)> = resolved
         .iter()
         .flat_map(|(_, results)| {
             results
@@ -85,6 +85,9 @@ pub fn handle_add_partitions_to_txn(
                 .filter_map(|(partition_id, r)| r.ok().map(|topic_id| (topic_id, *partition_id)))
         })
         .collect();
+    // A repeated entry is answered each time it is named but registered once.
+    partitions.sort_unstable();
+    partitions.dedup();
     store.add_txn_partitions(transactional_id, &partitions)?;
 
     Ok(add_partitions_response(&resolved, ERROR_NONE))
@@ -96,10 +99,14 @@ fn resolve_txn_partitions(
     store: &dyn KafkaStore,
     topics: &[(String, Vec<i32>)],
 ) -> Vec<ResolvedTopic> {
+    let resolved = resolve_topics(store, topics.iter().map(|(name, _)| name.as_str()));
     topics
         .iter()
         .map(|(topic_name, partition_ids)| {
-            let topic = super::helpers::resolve_topic(store, topic_name);
+            let topic = match &resolved {
+                Ok(found) => Ok(found.get(topic_name).copied()),
+                Err(code) => Err(*code),
+            };
             let results = partition_ids
                 .iter()
                 .map(|&partition_id| {
@@ -287,6 +294,9 @@ pub fn handle_txn_offset_commit(
     topics: TxnOffsetCommitTopics,
 ) -> Result<TxnOffsetCommitResponse> {
     let store = ctx.store;
+    // Kafka 3.7 collects the partitions into a map: a repeated partition is stored once,
+    // with its last entry, and answered once.
+    let topics: TxnOffsetCommitTopics = merge_by_partition(topics, |p| p.0);
 
     // Fence a zombie EOS consumer. A member committing offsets inside a
     // transaction with a stale group generation (or an unknown member id) must be
@@ -322,11 +332,20 @@ pub fn handle_txn_offset_commit(
         ));
     }
 
+    let resolved = resolve_topics(store, topics.iter().map(|(name, _)| name.as_str()));
     let mut response = TxnOffsetCommitResponse::default();
     response.topics = topics
         .into_iter()
         .map(|(topic_name, partitions)| {
-            store_txn_topic_offsets(store, transactional_id, group_id, topic_name, partitions)
+            let topic = match &resolved {
+                Ok(found) => Ok(found.get(&topic_name).copied()),
+                Err(code) => Err(*code),
+            };
+            let txn = PendingOffsets {
+                transactional_id,
+                group_id,
+            };
+            store_txn_topic_offsets(store, txn, topic, topic_name, partitions)
         })
         .collect();
     Ok(response)
@@ -337,17 +356,15 @@ pub fn handle_txn_offset_commit(
 /// `[0, partition_count)` is UNKNOWN_TOPIC_OR_PARTITION instead of a stored offset.
 fn store_txn_topic_offsets(
     store: &dyn KafkaStore,
-    transactional_id: &str,
-    group_id: &str,
+    txn: PendingOffsets<'_>,
+    topic: std::result::Result<Option<(i32, i32)>, i16>,
     topic_name: String,
     partitions: Vec<(i32, i64, Option<String>)>,
 ) -> TxnOffsetCommitResponseTopic {
-    let topic = store.get_topic_id(&topic_name).and_then(|id| match id {
-        Some(id) => Ok(store
-            .get_topic_partition_count(&topic_name)?
-            .map(|count| (id, count))),
-        None => Ok(None),
-    });
+    let PendingOffsets {
+        transactional_id,
+        group_id,
+    } = txn;
     let partition_results = partitions
         .into_iter()
         .map(|(partition_id, offset, metadata)| {
@@ -369,7 +386,7 @@ fn store_txn_topic_offsets(
                     Err(_) => ERROR_UNKNOWN_SERVER_ERROR,
                 },
                 Ok(None) => ERROR_UNKNOWN_TOPIC_OR_PARTITION,
-                Err(_) => ERROR_UNKNOWN_SERVER_ERROR,
+                Err(code) => *code,
             };
             let mut partition_result = TxnOffsetCommitResponsePartition::default();
             partition_result.partition_index = partition_id;
@@ -381,6 +398,13 @@ fn store_txn_topic_offsets(
     topic_result.name = TopicName(StrBytes::from_string(topic_name));
     topic_result.partitions = partition_results;
     topic_result
+}
+
+/// The transaction and group a TxnOffsetCommit stores pending offsets for.
+#[derive(Clone, Copy)]
+struct PendingOffsets<'a> {
+    transactional_id: &'a str,
+    group_id: &'a str,
 }
 
 /// An AddPartitionsToTxn (v0-3) response reporting `error_code` on every requested
@@ -504,6 +528,70 @@ mod tests {
             .unwrap();
         assert_eq!(neg.partition_error_code, ERROR_UNKNOWN_TOPIC_OR_PARTITION);
         assert_eq!(zero.partition_error_code, ERROR_OPERATION_NOT_ATTEMPTED);
+    }
+
+    /// Every AddPartitionsToTxn entry is answered (as Kafka 3.7 does), but the topics are
+    /// looked up in one statement and a repeated partition is registered once.
+    #[test]
+    fn test_add_partitions_to_txn_repeated_topic_is_looked_up_once() {
+        let mut store = MockKafkaStore::new();
+        store.expect_get_topic_metadata().times(1).returning(|_| {
+            Ok(vec![crate::kafka::storage::TopicMetadata {
+                name: "t".to_string(),
+                id: 1,
+                partition_count: 2,
+            }])
+        });
+        store
+            .expect_begin_or_continue_transaction()
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+        store
+            .expect_add_txn_partitions()
+            .withf(|_, partitions| partitions == [(1, 0), (1, 1)])
+            .times(1)
+            .returning(|_, _| Ok(()));
+        let env = TestEnv::new();
+        let ctx = env.ctx(&store);
+        let mut topics = vec![("t".to_string(), vec![0, 0]); 10_000];
+        topics.push(("t".to_string(), vec![1]));
+        let resp = handle_add_partitions_to_txn(&ctx, "txn-1", 1, 0, &topics).unwrap();
+        assert_eq!(resp.results_by_topic_v3_and_below.len(), 10_001);
+        assert!(resp
+            .results_by_topic_v3_and_below
+            .iter()
+            .flat_map(|t| &t.results_by_partition)
+            .all(|p| p.partition_error_code == ERROR_NONE));
+    }
+
+    /// TxnOffsetCommit stores a repeated partition once, with its last entry, and answers
+    /// it once (Kafka 3.7 collects the partitions into a map).
+    #[test]
+    fn test_txn_offset_commit_repeated_partition_is_stored_once() {
+        let mut store = MockKafkaStore::new();
+        store
+            .expect_validate_transaction()
+            .returning(|_, _, _| Ok(()));
+        store
+            .expect_get_transaction_state()
+            .returning(|_| Ok(Some(crate::kafka::storage::TransactionState::Ongoing)));
+        store.expect_txn_has_group().returning(|_, _| Ok(true));
+        crate::testing::expect_topics(&mut store, |_| Ok(Some((1, 1))));
+        store
+            .expect_store_txn_pending_offset()
+            .withf(|_, _, _, partition, offset, _| (*partition, *offset) == (0, 9_999))
+            .times(1)
+            .returning(|_, _, _, _, _, _| Ok(()));
+        let env = TestEnv::new();
+        let ctx = env.ctx(&store);
+        let topics = vec![
+            ("t".to_string(), (0..9_000).map(|i| (0, i, None)).collect()),
+            ("t".to_string(), vec![(0, 9_999, None)]),
+        ];
+        let resp = handle_txn_offset_commit(&ctx, "txn", 1, 0, "g", -1, "", topics).unwrap();
+        assert_eq!(resp.topics.len(), 1);
+        assert_eq!(resp.topics[0].partitions.len(), 1);
+        assert_eq!(resp.topics[0].partitions[0].error_code, ERROR_NONE);
     }
 
     #[test]

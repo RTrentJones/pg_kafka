@@ -19,6 +19,13 @@ macro_rules! delegate_topic_store {
         ) -> $crate::kafka::error::Result<(i32, i32)> {
             $via::get_or_create_topic(name, default_partitions)
         }
+        fn get_or_create_topics(
+            &self,
+            names: &[String],
+            partition_count: i32,
+        ) -> $crate::kafka::error::Result<Vec<$crate::kafka::storage::TopicMetadata>> {
+            $via::get_or_create_topics(names, partition_count)
+        }
         fn get_topic_metadata(
             &self,
             names: Option<&[String]>,
@@ -67,8 +74,8 @@ macro_rules! delegate_topic_store {
         ) -> $crate::kafka::error::Result<()> {
             $via::set_topic_retention_ms(topic_id, retention_ms)
         }
-        fn find_colliding_topic(&self, name: &str) -> $crate::kafka::error::Result<Option<String>> {
-            $via::find_colliding_topic(name)
+        fn colliding_topics(&self, names: &[String]) -> $crate::kafka::error::Result<Vec<String>> {
+            $via::colliding_topics(names)
         }
     };
     ($via:ident, $field:ident) => {
@@ -78,6 +85,13 @@ macro_rules! delegate_topic_store {
             default_partitions: i32,
         ) -> $crate::kafka::error::Result<(i32, i32)> {
             $via::get_or_create_topic(&self.$field, name, default_partitions)
+        }
+        fn get_or_create_topics(
+            &self,
+            names: &[String],
+            partition_count: i32,
+        ) -> $crate::kafka::error::Result<Vec<$crate::kafka::storage::TopicMetadata>> {
+            $via::get_or_create_topics(&self.$field, names, partition_count)
         }
         fn get_topic_metadata(
             &self,
@@ -127,8 +141,8 @@ macro_rules! delegate_topic_store {
         ) -> $crate::kafka::error::Result<()> {
             $via::set_topic_retention_ms(&self.$field, topic_id, retention_ms)
         }
-        fn find_colliding_topic(&self, name: &str) -> $crate::kafka::error::Result<Option<String>> {
-            $via::find_colliding_topic(&self.$field, name)
+        fn colliding_topics(&self, names: &[String]) -> $crate::kafka::error::Result<Vec<String>> {
+            $via::colliding_topics(&self.$field, names)
         }
     };
 }
@@ -332,9 +346,6 @@ macro_rules! delegate_offset_store {
         fn commit_offset(&self, group_id: &str, topic_id: i32, partition_id: i32, offset: i64, metadata: Option<&str>) -> $crate::kafka::error::Result<()> {
             $via::commit_offset(group_id, topic_id, partition_id, offset, metadata)
         }
-        fn fetch_offset(&self, group_id: &str, topic_id: i32, partition_id: i32) -> $crate::kafka::error::Result<Option<$crate::kafka::storage::CommittedOffset>> {
-            $via::fetch_offset(group_id, topic_id, partition_id)
-        }
         fn fetch_all_offsets(&self, group_id: &str) -> $crate::kafka::error::Result<Vec<(String, i32, $crate::kafka::storage::CommittedOffset)>> {
             $via::fetch_all_offsets(group_id)
         }
@@ -344,8 +355,8 @@ macro_rules! delegate_offset_store {
         fn list_offset_groups(&self) -> $crate::kafka::error::Result<Vec<String>> {
             $via::list_offset_groups()
         }
-        fn group_has_offsets(&self, group_id: &str) -> $crate::kafka::error::Result<bool> {
-            $via::group_has_offsets(group_id)
+        fn groups_with_offsets(&self, group_ids: &[String]) -> $crate::kafka::error::Result<std::collections::HashSet<String>> {
+            $via::groups_with_offsets(group_ids)
         }
         fn pending_txn_offset_partitions(&self, group_id: &str) -> $crate::kafka::error::Result<Vec<(String, i32)>> {
             $via::pending_txn_offset_partitions(group_id)
@@ -354,9 +365,6 @@ macro_rules! delegate_offset_store {
     ($via:ident, $field:ident) => {
         fn commit_offset(&self, group_id: &str, topic_id: i32, partition_id: i32, offset: i64, metadata: Option<&str>) -> $crate::kafka::error::Result<()> {
             $via::commit_offset(&self.$field, group_id, topic_id, partition_id, offset, metadata)
-        }
-        fn fetch_offset(&self, group_id: &str, topic_id: i32, partition_id: i32) -> $crate::kafka::error::Result<Option<$crate::kafka::storage::CommittedOffset>> {
-            $via::fetch_offset(&self.$field, group_id, topic_id, partition_id)
         }
         fn fetch_all_offsets(&self, group_id: &str) -> $crate::kafka::error::Result<Vec<(String, i32, $crate::kafka::storage::CommittedOffset)>> {
             $via::fetch_all_offsets(&self.$field, group_id)
@@ -367,8 +375,8 @@ macro_rules! delegate_offset_store {
         fn list_offset_groups(&self) -> $crate::kafka::error::Result<Vec<String>> {
             $via::list_offset_groups(&self.$field)
         }
-        fn group_has_offsets(&self, group_id: &str) -> $crate::kafka::error::Result<bool> {
-            $via::group_has_offsets(&self.$field, group_id)
+        fn groups_with_offsets(&self, group_ids: &[String]) -> $crate::kafka::error::Result<std::collections::HashSet<String>> {
+            $via::groups_with_offsets(&self.$field, group_ids)
         }
         fn pending_txn_offset_partitions(&self, group_id: &str) -> $crate::kafka::error::Result<Vec<(String, i32)>> {
             $via::pending_txn_offset_partitions(&self.$field, group_id)

@@ -5,6 +5,7 @@ use super::{internal, PostgresStore};
 use crate::kafka::error::Result;
 use crate::kafka::storage::CommittedOffset;
 use pgrx::prelude::*;
+use std::collections::HashSet;
 
 impl PostgresStore {
     pub(super) fn commit_offset(
@@ -45,34 +46,6 @@ impl PostgresStore {
             Ok(())
         })
         .map_err(internal("commit_offset"))
-    }
-
-    pub(super) fn fetch_offset(
-        group_id: &str,
-        topic_id: i32,
-        partition_id: i32,
-    ) -> Result<Option<CommittedOffset>> {
-        Spi::connect(|client| {
-            let query = "SELECT committed_offset, metadata
-                 FROM kafka.consumer_offsets
-                 WHERE group_id = $1 AND topic_id = $2 AND partition_id = $3";
-
-            let mut table = client.select(
-                query,
-                Some(1),
-                &[group_id.into(), topic_id.into(), partition_id.into()],
-            )?;
-
-            if let Some(row) = table.next() {
-                let offset: i64 = row.get_by_name("committed_offset")?.unwrap_or(-1);
-                let metadata: Option<String> = row.get_by_name("metadata")?;
-
-                Ok(Some(CommittedOffset { offset, metadata }))
-            } else {
-                Ok(None)
-            }
-        })
-        .map_err(internal("fetch_offset"))
     }
 
     /// Every committed offset of a group as `(topic name, partition, offset)`, sorted.
@@ -143,16 +116,26 @@ impl PostgresStore {
         .map_err(internal("list_offset_groups"))
     }
 
-    pub(super) fn group_has_offsets(group_id: &str) -> Result<bool> {
+    pub(super) fn groups_with_offsets(group_ids: &[String]) -> Result<HashSet<String>> {
+        if group_ids.is_empty() {
+            return Ok(HashSet::new());
+        }
         Spi::connect(|client| {
             let table = client.select(
-                "SELECT 1 FROM kafka.consumer_offsets WHERE group_id = $1 LIMIT 1",
-                Some(1),
-                &[group_id.into()],
+                "SELECT DISTINCT group_id FROM kafka.consumer_offsets
+                 WHERE group_id = ANY($1::text[])",
+                None,
+                &[group_ids.to_vec().into()],
             )?;
-            Ok(!table.is_empty())
+            let mut groups = HashSet::new();
+            for row in table {
+                if let Some(g) = row.get_by_name::<String, _>("group_id")? {
+                    groups.insert(g);
+                }
+            }
+            Ok(groups)
         })
-        .map_err(internal("group_has_offsets"))
+        .map_err(internal("groups_with_offsets"))
     }
 
     pub(super) fn pending_txn_offset_partitions(group_id: &str) -> Result<Vec<(String, i32)>> {

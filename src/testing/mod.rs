@@ -1,6 +1,7 @@
 //! Test doubles and fixtures for unit tests that cannot use the PostgreSQL runtime.
 //!
 //! - [`mocks::MockKafkaStore`]: a storage double with mockall expectations.
+//! - [`expect_topics`]: answer the store's batched topic lookups from a per-name function.
 //! - [`TestEnv`]: the coordinator and broker metadata a [`HandlerContext`] borrows.
 //! - [`cpu_time`]: how long a closure ran on the CPU, for tests that bound a cost.
 //! - [`growth`]: how a closure's CPU time grows with its input, for tests that bound a
@@ -15,7 +16,8 @@ pub mod mocks;
 
 pub use heap::heap_peak;
 
-use crate::kafka::storage::KafkaStore;
+use crate::kafka::error::Result;
+use crate::kafka::storage::{KafkaStore, TopicMetadata};
 use crate::kafka::{BrokerMetadata, GroupCoordinator, HandlerContext};
 use kafka_protocol::records::Compression;
 use std::time::{Duration, Instant};
@@ -56,6 +58,29 @@ fn thread_cpu() -> Option<Duration> {
     let stat = std::fs::read_to_string("/proc/thread-self/schedstat").ok()?;
     let nanos = stat.split_whitespace().next()?.parse().ok()?;
     Some(Duration::from_nanos(nanos))
+}
+
+/// Answer `store`'s lookups of named topics (`get_topic_metadata(Some(..))`, one statement
+/// for all the names) from `topic`: a name's `(topic id, partition count)`, `None` for a
+/// topic that does not exist. An `Err` for any name fails the whole lookup, as the
+/// statement would.
+pub fn expect_topics(
+    store: &mut mocks::MockKafkaStore,
+    topic: impl Fn(&str) -> Result<Option<(i32, i32)>> + Send + 'static,
+) {
+    store.expect_get_topic_metadata().returning(move |names| {
+        let mut found = Vec::new();
+        for name in names.unwrap_or_default() {
+            if let Some((id, partition_count)) = topic(name)? {
+                found.push(TopicMetadata {
+                    id,
+                    name: name.clone(),
+                    partition_count,
+                });
+            }
+        }
+        Ok(found)
+    });
 }
 
 /// What a handler test needs besides its store: a fresh coordinator and broker

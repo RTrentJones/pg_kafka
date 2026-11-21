@@ -1,8 +1,6 @@
 //! OffsetCommit and OffsetFetch: a consumer group's committed offsets.
 
-use super::helpers::{
-    resolve_topic, resolve_topic_id, topic_resolution_error_code, TopicResolution,
-};
+use super::helpers::{merge_by_partition, resolve_topics};
 use crate::kafka::constants::{
     ERROR_NONE, ERROR_UNKNOWN_TOPIC_OR_PARTITION, ERROR_UNSTABLE_OFFSET_COMMIT,
 };
@@ -34,6 +32,7 @@ pub fn handle_offset_commit(
 ) -> Result<OffsetCommitResponse> {
     let mut response = OffsetCommitResponse::default();
     response.throttle_time_ms = 0;
+    let topics = merge_commit_topics(topics);
 
     // Reject zombie commits. A member committing with a stale generation (or an unknown
     // member id) for a live group must be rejected with ILLEGAL_GENERATION / UNKNOWN_MEMBER_ID
@@ -58,11 +57,30 @@ pub fn handle_offset_commit(
         return Ok(response);
     }
 
+    let resolved = resolve_topics(ctx.store, topics.iter().map(|t| t.name.as_str()));
     response.topics = topics
         .into_iter()
-        .map(|topic| commit_topic_offsets(ctx.store, group_id, topic))
+        .map(|topic| {
+            let found = match &resolved {
+                Ok(found) => Ok(found.get(&topic.name).copied()),
+                Err(code) => Err(*code),
+            };
+            commit_topic_offsets(ctx.store, group_id, topic, found)
+        })
         .collect();
     Ok(response)
+}
+
+/// The request's topics with each repeated partition merged into one entry holding its
+/// last offset: Kafka 3.7 collects a commit's partitions into a map, stores each once and
+/// answers each once.
+fn merge_commit_topics(topics: Vec<OffsetCommitTopicData>) -> Vec<OffsetCommitTopicData> {
+    merge_by_partition(topics.into_iter().map(|t| (t.name, t.partitions)), |p| {
+        p.partition_index
+    })
+    .into_iter()
+    .map(|(name, partitions)| OffsetCommitTopicData { name, partitions })
+    .collect()
 }
 
 /// Commit one topic's offsets and answer for each of its partitions.
@@ -70,8 +88,9 @@ fn commit_topic_offsets(
     store: &dyn KafkaStore,
     group_id: &str,
     topic: OffsetCommitTopicData,
+    found: std::result::Result<Option<(i32, i32)>, i16>,
 ) -> OffsetCommitResponseTopic {
-    let partitions = match resolve_topic(store, &topic.name) {
+    let partitions = match found {
         Ok(Some((topic_id, partition_count))) => topic
             .partitions
             .iter()
@@ -179,10 +198,7 @@ pub fn handle_offset_fetch(
     kafka_response.error_code = ERROR_NONE;
     match topics {
         Some(topics) => {
-            kafka_response.topics = topics
-                .into_iter()
-                .map(|topic| fetch_topic_offsets(store, group_id, topic, &unstable))
-                .collect();
+            kafka_response.topics = fetch_requested_offsets(store, group_id, topics, &unstable);
         }
         // A fetch-all storage failure is a top-level error: a success with no offsets
         // reads to a consumer as "no committed offsets", and it may reset.
@@ -194,53 +210,74 @@ pub fn handle_offset_fetch(
     Ok(kafka_response)
 }
 
-/// The committed offsets of one requested topic's partitions.
-fn fetch_topic_offsets(
+/// The committed offsets of the requested partitions: each distinct topic once, with each
+/// distinct partition once, in the order first named (Kafka 3.7 answers a repeated
+/// partition once). The topics are looked up together and the group's offsets read in one
+/// statement, whatever the number of entries; a failed lookup or read is reported on every
+/// partition it affects.
+fn fetch_requested_offsets(
     store: &dyn KafkaStore,
     group_id: &str,
-    topic: OffsetFetchTopicData,
+    topics: Vec<OffsetFetchTopicData>,
     unstable: &HashSet<(String, i32)>,
-) -> OffsetFetchResponseTopic {
-    let partitions = match resolve_topic_id(store, &topic.name) {
-        TopicResolution::Found(topic_id) => topic
-            .partition_indexes
-            .iter()
-            .map(|&partition_index| {
-                let offset = store.fetch_offset(group_id, topic_id, partition_index);
-                if unstable.contains(&(topic.name.clone(), partition_index)) {
-                    return offset_partition(partition_index, ERROR_UNSTABLE_OFFSET_COMMIT, None);
-                }
-                match offset {
-                    Ok(committed) => offset_partition(partition_index, ERROR_NONE, committed),
-                    Err(e) => {
-                        if e.is_server_error() {
-                            crate::pg_warning!(
-                                "Failed to fetch offset for group='{}', topic_id={}, partition={}: {}",
-                                group_id,
-                                topic_id,
-                                partition_index,
-                                e
-                            );
-                        }
-                        offset_partition(partition_index, e.to_kafka_error_code(), None)
-                    }
-                }
+) -> Vec<OffsetFetchResponseTopic> {
+    let topics = merge_by_partition(
+        topics.into_iter().map(|t| (t.name, t.partition_indexes)),
+        |&p| p,
+    );
+    let resolved = resolve_topics(store, topics.iter().map(|(name, _)| name.as_str()));
+    let any_found = resolved.as_ref().is_ok_and(|found| !found.is_empty());
+    let committed: std::result::Result<HashMap<(String, i32), CommittedOffset>, i16> = if any_found
+    {
+        store
+            .fetch_all_offsets(group_id)
+            .map(|offsets| {
+                offsets
+                    .into_iter()
+                    .map(|(topic, partition, offset)| ((topic, partition), offset))
+                    .collect()
             })
-            .collect(),
-        // A missing topic (or a failed lookup) is reported on every requested partition.
-        resolution => {
-            let error_code = topic_resolution_error_code(&resolution);
-            topic
-                .partition_indexes
-                .iter()
-                .map(|&partition_index| offset_partition(partition_index, error_code, None))
-                .collect()
-        }
+            .map_err(|e| {
+                crate::pg_warning!("Failed to fetch offsets for group='{}': {}", group_id, e);
+                e.to_kafka_error_code()
+            })
+    } else {
+        Ok(HashMap::new())
     };
-    let mut topic_response = OffsetFetchResponseTopic::default();
-    topic_response.name = TopicName(StrBytes::from_string(topic.name));
-    topic_response.partitions = partitions;
-    topic_response
+    topics
+        .into_iter()
+        .map(|(name, partition_indexes)| {
+            let topic_error = match &resolved {
+                Ok(found) if found.contains_key(&name) => committed.as_ref().err().copied(),
+                // A missing topic (or a failed lookup) is reported on every requested
+                // partition.
+                Ok(_) => Some(ERROR_UNKNOWN_TOPIC_OR_PARTITION),
+                Err(code) => Some(*code),
+            };
+            let partitions = partition_indexes
+                .into_iter()
+                .map(|partition_index| {
+                    if let Some(code) = topic_error {
+                        return offset_partition(partition_index, code, None);
+                    }
+                    let key = (name.clone(), partition_index);
+                    if unstable.contains(&key) {
+                        return offset_partition(
+                            partition_index,
+                            ERROR_UNSTABLE_OFFSET_COMMIT,
+                            None,
+                        );
+                    }
+                    let offset = committed.as_ref().ok().and_then(|c| c.get(&key)).cloned();
+                    offset_partition(partition_index, ERROR_NONE, offset)
+                })
+                .collect();
+            let mut topic_response = OffsetFetchResponseTopic::default();
+            topic_response.name = TopicName(StrBytes::from_string(name));
+            topic_response.partitions = partitions;
+            topic_response
+        })
+        .collect()
 }
 
 /// Every committed offset of the group, by topic, or the error code of a failed read.
@@ -383,11 +420,16 @@ mod tests {
                 partition_count: 2,
             }])
         });
-        store.expect_fetch_offset().returning(|_, _, _| {
-            Ok(Some(CommittedOffset {
-                offset: 5,
-                metadata: None,
-            }))
+        store.expect_fetch_all_offsets().returning(|_| {
+            Ok((0..2)
+                .map(|p| {
+                    let offset = CommittedOffset {
+                        offset: 5,
+                        metadata: None,
+                    };
+                    ("t".to_string(), p, offset)
+                })
+                .collect())
         });
         store
             .expect_pending_txn_offset_partitions()
@@ -415,5 +457,105 @@ mod tests {
             .partitions
             .iter()
             .all(|p| p.committed_offset == 5));
+    }
+
+    /// Kafka 3.7 stores a repeated OffsetCommit partition once, with its last entry, and
+    /// answers it once, however many entries name it.
+    #[test]
+    fn test_offset_commit_repeated_partition_is_stored_once() {
+        use crate::kafka::messages::{OffsetCommitPartitionData, OffsetCommitTopicData};
+        let mut store = MockKafkaStore::new();
+        crate::testing::expect_topics(&mut store, |_| Ok(Some((1, 2))));
+        store
+            .expect_commit_offset()
+            .withf(|_, _, p, offset, _| (*p, *offset) == (0, 9_999))
+            .times(1)
+            .returning(|_, _, _, _, _| Ok(()));
+        store
+            .expect_commit_offset()
+            .withf(|_, _, p, offset, _| (*p, *offset) == (1, 7))
+            .times(1)
+            .returning(|_, _, _, _, _| Ok(()));
+        let env = TestEnv::new();
+        let ctx = env.ctx(&store);
+        let entry = |partition_index, committed_offset| OffsetCommitPartitionData {
+            partition_index,
+            committed_offset,
+            metadata: None,
+        };
+        let mut first: Vec<_> = (0..10_000).map(|i| entry(0, i)).collect();
+        first.insert(1, entry(1, 7));
+        let topics = vec![
+            OffsetCommitTopicData {
+                name: "t".to_string(),
+                partitions: first,
+            },
+            OffsetCommitTopicData {
+                name: "t".to_string(),
+                partitions: vec![entry(0, 9_999)],
+            },
+        ];
+        let resp = handle_offset_commit(&ctx, "g", -1, "", topics).unwrap();
+        assert_eq!(resp.topics.len(), 1);
+        let parts: Vec<(i32, i16)> = resp.topics[0]
+            .partitions
+            .iter()
+            .map(|p| (p.partition_index, p.error_code))
+            .collect();
+        assert_eq!(parts, [(0, ERROR_NONE), (1, ERROR_NONE)]);
+    }
+
+    /// OffsetFetch answers each distinct partition once and reads the group's offsets in
+    /// one statement however many entries the request has.
+    #[test]
+    fn test_offset_fetch_repeated_partition_is_answered_once() {
+        use crate::kafka::messages::OffsetFetchTopicData;
+        type Answer = (String, Vec<(i32, i16, i64)>);
+        let mut store = MockKafkaStore::new();
+        crate::testing::expect_topics(&mut store, |name| Ok((name == "t").then_some((1, 1))));
+        store.expect_fetch_all_offsets().times(1).returning(|_| {
+            let offset = CommittedOffset {
+                offset: 6,
+                metadata: None,
+            };
+            Ok(vec![("t".to_string(), 0, offset)])
+        });
+        let env = TestEnv::new();
+        let ctx = env.ctx(&store);
+        let topic = |name: &str, partition_indexes: Vec<i32>| OffsetFetchTopicData {
+            name: name.to_string(),
+            partition_indexes,
+        };
+        let topics = vec![
+            topic("t", vec![0; 40_000]),
+            topic("missing", vec![0, 0]),
+            topic("t", vec![9, 0]),
+        ];
+        let resp = handle_offset_fetch(&ctx, "g", Some(topics), false).unwrap();
+        let answers: Vec<Answer> = resp
+            .topics
+            .iter()
+            .map(|t| {
+                let parts = t
+                    .partitions
+                    .iter()
+                    .map(|p| (p.partition_index, p.error_code, p.committed_offset))
+                    .collect();
+                (t.name.0.to_string(), parts)
+            })
+            .collect();
+        assert_eq!(
+            answers,
+            [
+                (
+                    "t".to_string(),
+                    vec![(0, ERROR_NONE, 6), (9, ERROR_NONE, -1)]
+                ),
+                (
+                    "missing".to_string(),
+                    vec![(0, ERROR_UNKNOWN_TOPIC_OR_PARTITION, -1)]
+                ),
+            ]
+        );
     }
 }

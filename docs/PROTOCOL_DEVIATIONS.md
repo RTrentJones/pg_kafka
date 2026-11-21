@@ -527,7 +527,9 @@ honored; producer CreateTime timestamps are preserved).
 
 **Status:** Always enabled for Produce
 **Kafka Behavior:** Governed by the broker setting `auto.create.topics.enable` (default `true`, commonly disabled in production)
-**pg_kafka Behavior:** There is no broker-level switch. Topics are always auto-created on first produce. A Metadata request also auto-creates requested topics unless the client sends `allow_auto_topic_creation=false` (Metadata v4+), in which case a missing topic is reported as UNKNOWN_TOPIC_OR_PARTITION
+**pg_kafka Behavior:** There is no broker-level switch. Topics are always auto-created on first produce. A Metadata request also auto-creates requested topics unless the client sends `allow_auto_topic_creation=false` (Metadata v4+), in which case a missing topic is reported as UNKNOWN_TOPIC_OR_PARTITION. An auto-created topic is answered at once with its partitions (Kafka 3.7 answers UNKNOWN_TOPIC_OR_PARTITION until its controller has created it, and the client retries).
+
+Metadata answers each distinct requested name once, however often the request repeats it, as Kafka 3.7 does, and creates the missing ones in one statement.
 
 **Client Impact:**
 - Typos in topic names create unwanted topics
@@ -578,6 +580,7 @@ honored; producer CreateTime timestamps are preserved).
 - **DescribeConfigs** supports only TOPIC resources and reports only `retention.ms` and `cleanup.policy` (always `delete`; there is no log compaction). BROKER and other resource types return INVALID_REQUEST. Versions v1-v4 only (the kafka-protocol crate does not implement v0).
 - **IncrementalAlterConfigs** accepts only SET/DELETE of `retention.ms` on TOPIC resources. Any other key or operation (APPEND/SUBTRACT) fails the whole resource with INVALID_CONFIG rather than being silently accepted.
 - **AlterConfigs (33)** is not implemented.
+- **Repeated entries follow Kafka 3.7** (checked against a 3.7 broker). OffsetCommit, TxnOffsetCommit, DeleteRecords, OffsetFetch and Fetch act on a partition the request names more than once a single time, with its last entry, and answer it once, under one entry per distinct topic; ListOffsets answers every entry of a repeated partition INVALID_REQUEST; DeleteTopics and CreatePartitions answer a repeated name with one INVALID_REQUEST "Duplicate topic name." entry; IncrementalAlterConfigs answers every entry of a repeated resource INVALID_REQUEST "Each resource must appear at most once."; DescribeConfigs and AddPartitionsToTxn answer every entry. Whatever a request repeats, its topics (and, for DescribeGroups/DeleteGroups, its groups' committed offsets) are looked up in one statement, so a small request cannot hold the DB thread, which serves every client, for one round trip per entry. Remaining difference: entries are answered in the order first named; Kafka answers merged entries in no particular order.
 
 ## API Version Support
 

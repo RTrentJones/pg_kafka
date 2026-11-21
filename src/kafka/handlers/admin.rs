@@ -15,7 +15,7 @@ use kafka_protocol::messages::delete_topics_response::{
 use kafka_protocol::messages::{GroupId, TopicName};
 use kafka_protocol::protocol::StrBytes;
 
-use super::helpers::validate_topic_name;
+use super::helpers::{resolve_topics, validate_topic_name};
 use crate::kafka::constants::{
     ERROR_GROUP_ID_NOT_FOUND, ERROR_INVALID_PARTITIONS, ERROR_INVALID_REPLICATION_FACTOR,
     ERROR_INVALID_REQUEST, ERROR_INVALID_TOPIC_EXCEPTION, ERROR_NONE, ERROR_NON_EMPTY_GROUP,
@@ -24,6 +24,7 @@ use crate::kafka::constants::{
 use crate::kafka::error::Result;
 use crate::kafka::handler_context::HandlerContext;
 use crate::kafka::messages::{CreatePartitionsTopicRequest, CreateTopicRequest};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// Handle CreateTopics request
 ///
@@ -45,25 +46,37 @@ pub fn handle_create_topics(
 
     // A name given more than once fails as a whole, reported once (Kafka answers one
     // INVALID_REQUEST entry and creates nothing for it).
-    let mut seen = std::collections::HashMap::<String, usize>::new();
-    for t in &topics {
-        *seen.entry(t.name.clone()).or_default() += 1;
-    }
-    let mut reported = std::collections::HashSet::<String>::new();
+    let repeated = repeated_names(topics.iter().map(|t| t.name.as_str()));
+    // The existing topics the names equal or collide with, in one lookup however many
+    // topics the request names.
+    let wanted: Vec<String> = topics
+        .iter()
+        .filter(|t| !repeated.contains(&t.name) && validate_topic_name(&t.name).is_ok())
+        .map(|t| t.name.clone())
+        .collect();
+    let mut existing = if wanted.is_empty() {
+        Ok(ExistingTopics::new(Vec::new()))
+    } else {
+        ctx.store
+            .colliding_topics(&wanted)
+            .map(ExistingTopics::new)
+            .map_err(|e| format!("Error checking topic: {e}"))
+    };
+    let mut reported = HashSet::new();
 
     let mut results = Vec::new();
     for topic in topics {
         if !reported.insert(topic.name.clone()) {
             continue;
         }
-        results.push(if seen.get(&topic.name).copied().unwrap_or(0) > 1 {
+        results.push(if repeated.contains(&topic.name) {
             failed_topic(
                 &topic.name,
                 ERROR_INVALID_REQUEST,
                 "Duplicate topic name.".to_string(),
             )
         } else {
-            create_topic_result(ctx, &topic, max_partitions, validate_only)
+            create_topic_result(ctx, &topic, max_partitions, validate_only, &mut existing)
         });
     }
 
@@ -79,8 +92,9 @@ fn create_topic_result(
     topic: &CreateTopicRequest,
     max_partitions: i32,
     validate_only: bool,
+    existing: &mut std::result::Result<ExistingTopics, String>,
 ) -> CreatableTopicResult {
-    let num_partitions = match validate_new_topic(ctx, topic, max_partitions) {
+    let num_partitions = match validate_new_topic(ctx, topic, max_partitions, existing) {
         Ok(num_partitions) => num_partitions,
         Err((code, message)) => return failed_topic(&topic.name, code, message),
     };
@@ -88,7 +102,12 @@ fn create_topic_result(
         return created_topic(&topic.name, num_partitions);
     }
     match ctx.store.create_topic(&topic.name, num_partitions) {
-        Ok(_topic_id) => created_topic(&topic.name, num_partitions),
+        Ok(_topic_id) => {
+            if let Ok(existing) = existing {
+                existing.add(topic.name.clone());
+            }
+            created_topic(&topic.name, num_partitions)
+        }
         Err(e) => failed_topic(
             &topic.name,
             ERROR_UNKNOWN_SERVER_ERROR,
@@ -104,8 +123,8 @@ fn validate_new_topic(
     ctx: &HandlerContext,
     topic: &CreateTopicRequest,
     max_partitions: i32,
+    existing: &std::result::Result<ExistingTopics, String>,
 ) -> std::result::Result<i32, (i16, String)> {
-    let store = ctx.store;
     // Length, charset, and "."/".." in addition to empty.
     validate_topic_name(&topic.name)
         .map_err(|msg| (ERROR_INVALID_TOPIC_EXCEPTION, msg.to_string()))?;
@@ -128,13 +147,10 @@ fn validate_new_topic(
     validate_replication_factor(topic.replication_factor)
         .map_err(|msg| (ERROR_INVALID_REPLICATION_FACTOR, msg))?;
 
-    let lookup_failed = |e| {
-        (
-            ERROR_UNKNOWN_SERVER_ERROR,
-            format!("Error checking topic: {e}"),
-        )
-    };
-    if store.topic_exists(&topic.name).map_err(lookup_failed)? {
+    let existing = existing
+        .as_ref()
+        .map_err(|message| (ERROR_UNKNOWN_SERVER_ERROR, message.clone()))?;
+    if existing.contains(&topic.name) {
         return Err((
             ERROR_TOPIC_ALREADY_EXISTS,
             format!("Topic '{}' already exists.", topic.name),
@@ -142,10 +158,7 @@ fn validate_new_topic(
     }
     // Kafka rejects a name that collides with an existing one once '.' and '_' are
     // treated as equal (their metric names would clash).
-    if let Some(existing) = store
-        .find_colliding_topic(&topic.name)
-        .map_err(lookup_failed)?
-    {
+    if let Some(existing) = existing.colliding(&topic.name) {
         return Err((
             ERROR_INVALID_TOPIC_EXCEPTION,
             format!(
@@ -155,6 +168,64 @@ fn validate_new_topic(
         ));
     }
     Ok(num_partitions)
+}
+
+/// The existing topics a CreateTopics request's names equal or collide with (once '.' and
+/// '_' are treated as equal), with the topics the request creates added as it goes.
+struct ExistingTopics {
+    /// Topic names by their name with '.' replaced by '_', sorted.
+    by_normalized: HashMap<String, BTreeSet<String>>,
+}
+
+impl ExistingTopics {
+    fn new(names: Vec<String>) -> Self {
+        let mut existing = Self {
+            by_normalized: HashMap::new(),
+        };
+        for name in names {
+            existing.add(name);
+        }
+        existing
+    }
+
+    fn add(&mut self, name: String) {
+        self.by_normalized
+            .entry(name.replace('.', "_"))
+            .or_default()
+            .insert(name);
+    }
+
+    fn contains(&self, name: &str) -> bool {
+        self.by_normalized
+            .get(&name.replace('.', "_"))
+            .is_some_and(|names| names.contains(name))
+    }
+
+    /// The first existing topic, by name, that collides with `name` and is not `name`.
+    fn colliding(&self, name: &str) -> Option<&String> {
+        self.by_normalized
+            .get(&name.replace('.', "_"))?
+            .iter()
+            .find(|existing| *existing != name)
+    }
+}
+
+/// The names `names` gives more than once.
+fn repeated_names<'a>(names: impl IntoIterator<Item = &'a str>) -> HashSet<String> {
+    let mut seen = HashSet::new();
+    names
+        .into_iter()
+        .filter(|name| !seen.insert(*name))
+        .map(str::to_string)
+        .collect()
+}
+
+/// `names` without repeats, in the order first given.
+fn once_each(names: Vec<String>) -> impl Iterator<Item = String> {
+    let mut seen = HashSet::new();
+    names
+        .into_iter()
+        .filter(move |name| seen.insert(name.clone()))
 }
 
 /// A CreateTopics result for a refused topic.
@@ -204,13 +275,26 @@ pub fn handle_delete_topics(
 ) -> Result<DeleteTopicsResponse> {
     let store = ctx.store;
     let mut results = Vec::new();
+    let repeated = repeated_names(topic_names.iter().map(String::as_str));
+    // Every topic in one lookup however many the request names.
+    let found = resolve_topics(store, topic_names.iter().map(String::as_str));
 
-    for topic_name in topic_names {
+    for topic_name in once_each(topic_names) {
         let mut result = DeletableTopicResult::default();
         result.name = Some(TopicName(StrBytes::from_string(topic_name.clone())));
+        if repeated.contains(&topic_name) {
+            // Kafka 3.7 answers a name given more than once with one INVALID_REQUEST
+            // entry and deletes nothing for it.
+            result.error_code = ERROR_INVALID_REQUEST;
+            result.error_message = Some(StrBytes::from_static_str("Duplicate topic name."));
+            results.push(result);
+            continue;
+        }
 
-        // Check if topic exists
-        match store.get_topic_id(&topic_name) {
+        match found
+            .as_ref()
+            .map(|found| found.get(&topic_name).map(|&(id, _)| id))
+        {
             Ok(Some(topic_id)) => {
                 // Delete the topic (cascades to messages and consumer_offsets)
                 match store.delete_topic(topic_id) {
@@ -229,11 +313,9 @@ pub fn handle_delete_topics(
                 result.error_code = ERROR_UNKNOWN_TOPIC_OR_PARTITION;
                 result.error_message = Some(StrBytes::from_static_str("This topic does not exist"));
             }
-            Err(e) => {
-                result.error_code = ERROR_UNKNOWN_SERVER_ERROR;
-                result.error_message = Some(StrBytes::from_string(format!(
-                    "Error looking up topic: {e}"
-                )));
+            Err(&code) => {
+                result.error_code = code;
+                result.error_message = Some(StrBytes::from_static_str("Error looking up topic"));
             }
         }
 
@@ -257,13 +339,30 @@ pub fn handle_create_partitions(
 ) -> Result<CreatePartitionsResponse> {
     let store = ctx.store;
     let mut results = Vec::new();
+    let repeated = repeated_names(topics.iter().map(|t| t.name.as_str()));
+    // Every topic in one lookup however many the request names.
+    let found = resolve_topics(store, topics.iter().map(|t| t.name.as_str()));
+    let mut reported = HashSet::new();
 
     for topic in topics {
+        if !reported.insert(topic.name.clone()) {
+            continue;
+        }
         let mut result = CreatePartitionsTopicResult::default();
         result.name = TopicName(StrBytes::from_string(topic.name.clone()));
+        if repeated.contains(&topic.name) {
+            // Kafka 3.7 answers a name given more than once with one INVALID_REQUEST
+            // entry and changes nothing for it.
+            result.error_code = ERROR_INVALID_REQUEST;
+            result.error_message = Some(StrBytes::from_static_str("Duplicate topic name."));
+            results.push(result);
+            continue;
+        }
 
-        // Get current partition count
-        match store.get_topic_partition_count(&topic.name) {
+        match found
+            .as_ref()
+            .map(|found| found.get(&topic.name).map(|&(_, count)| count))
+        {
             Ok(Some(current_count)) => {
                 if topic.count < current_count {
                     result.error_code = ERROR_INVALID_PARTITIONS;
@@ -307,11 +406,9 @@ pub fn handle_create_partitions(
                 result.error_code = ERROR_UNKNOWN_TOPIC_OR_PARTITION;
                 result.error_message = Some(StrBytes::from_static_str("Topic does not exist"));
             }
-            Err(e) => {
-                result.error_code = ERROR_UNKNOWN_SERVER_ERROR;
-                result.error_message = Some(StrBytes::from_string(format!(
-                    "Error looking up topic: {e}"
-                )));
+            Err(&code) => {
+                result.error_code = code;
+                result.error_message = Some(StrBytes::from_static_str("Error looking up topic"));
             }
         }
 
@@ -335,6 +432,18 @@ pub fn handle_delete_groups(
     let store = ctx.store;
     let coordinator = ctx.coordinator;
     let mut results = Vec::new();
+    // Which of the groups the coordinator does not hold have committed offsets, in one
+    // lookup however many groups the request names.
+    let unheld: Vec<String> = group_names
+        .iter()
+        .filter(|g| coordinator.get_group_state(g).is_none())
+        .cloned()
+        .collect();
+    let mut with_offsets = if unheld.is_empty() {
+        Ok(HashSet::new())
+    } else {
+        store.groups_with_offsets(&unheld)
+    };
 
     for group_name in group_names {
         let mut result = DeletableGroupResult::default();
@@ -369,10 +478,16 @@ pub fn handle_delete_groups(
                 // A group the coordinator does not hold exists only through its
                 // committed offsets (an Empty group, as DescribeGroups/ListGroups report it).
                 // Without any, it does not exist: GROUP_ID_NOT_FOUND, as Kafka answers.
-                match store.group_has_offsets(&group_name) {
-                    Ok(false) => result.error_code = ERROR_GROUP_ID_NOT_FOUND,
-                    Ok(true) => match store.delete_consumer_group_offsets(&group_name) {
-                        Ok(()) => result.error_code = ERROR_NONE,
+                // A group deleted by an earlier entry of the request no longer exists.
+                match &mut with_offsets {
+                    Ok(groups) if !groups.contains(&group_name) => {
+                        result.error_code = ERROR_GROUP_ID_NOT_FOUND;
+                    }
+                    Ok(groups) => match store.delete_consumer_group_offsets(&group_name) {
+                        Ok(()) => {
+                            groups.remove(&group_name);
+                            result.error_code = ERROR_NONE;
+                        }
                         Err(e) => result.error_code = e.to_kafka_error_code(),
                     },
                     Err(e) => result.error_code = e.to_kafka_error_code(),
@@ -411,8 +526,7 @@ mod tests {
     #[test]
     fn test_create_topics_success() {
         let mut store = MockKafkaStore::new();
-        store.expect_topic_exists().returning(|_| Ok(false));
-        store.expect_find_colliding_topic().returning(|_| Ok(None));
+        store.expect_colliding_topics().returning(|_| Ok(vec![]));
         store.expect_create_topic().returning(|_, _| Ok(1));
 
         let topics = vec![CreateTopicRequest {
@@ -456,8 +570,7 @@ mod tests {
         // num_partitions = -1 means "broker default" (pg_kafka.default_partitions);
         // 0 is not a valid partition count.
         let mut store = MockKafkaStore::new();
-        store.expect_topic_exists().returning(|_| Ok(false));
-        store.expect_find_colliding_topic().returning(|_| Ok(None));
+        store.expect_colliding_topics().returning(|_| Ok(vec![]));
         store
             .expect_create_topic()
             .withf(|name, n| name == "defaulted" && *n == 6)
@@ -495,8 +608,7 @@ mod tests {
     #[test]
     fn test_create_topics_validate_only() {
         let mut store = MockKafkaStore::new();
-        store.expect_topic_exists().returning(|_| Ok(false));
-        store.expect_find_colliding_topic().returning(|_| Ok(None));
+        store.expect_colliding_topics().returning(|_| Ok(vec![]));
         // create_topic should NOT be called when validate_only is true
 
         let topics = vec![CreateTopicRequest {
@@ -518,7 +630,9 @@ mod tests {
     #[test]
     fn test_create_topics_already_exists() {
         let mut store = MockKafkaStore::new();
-        store.expect_topic_exists().returning(|_| Ok(true));
+        store
+            .expect_colliding_topics()
+            .returning(|names| Ok(names.to_vec()));
 
         let topics = vec![CreateTopicRequest {
             name: "existing-topic".to_string(),
@@ -539,7 +653,7 @@ mod tests {
     #[test]
     fn test_delete_topics_success() {
         let mut store = MockKafkaStore::new();
-        store.expect_get_topic_id().returning(|_| Ok(Some(1)));
+        crate::testing::expect_topics(&mut store, |_| Ok(Some((1, 1))));
         store.expect_delete_topic().returning(|_| Ok(()));
 
         let coordinator = crate::kafka::GroupCoordinator::new();
@@ -556,7 +670,7 @@ mod tests {
     #[test]
     fn test_delete_topics_not_found() {
         let mut store = MockKafkaStore::new();
-        store.expect_get_topic_id().returning(|_| Ok(None));
+        crate::testing::expect_topics(&mut store, |_| Ok(None));
 
         let coordinator = crate::kafka::GroupCoordinator::new();
         let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
@@ -574,9 +688,7 @@ mod tests {
     #[test]
     fn test_create_partitions_success() {
         let mut store = MockKafkaStore::new();
-        store
-            .expect_get_topic_partition_count()
-            .returning(|_| Ok(Some(1)));
+        crate::testing::expect_topics(&mut store, |_| Ok(Some((1, 1))));
         store
             .expect_set_topic_partition_count()
             .returning(|_, _| Ok(()));
@@ -600,9 +712,7 @@ mod tests {
     #[test]
     fn test_create_partitions_cannot_decrease() {
         let mut store = MockKafkaStore::new();
-        store
-            .expect_get_topic_partition_count()
-            .returning(|_| Ok(Some(5)));
+        crate::testing::expect_topics(&mut store, |_| Ok(Some((1, 5))));
 
         let topics = vec![CreatePartitionsTopicRequest {
             name: "test-topic".to_string(),
@@ -624,9 +734,7 @@ mod tests {
         // Increasing to the current count is a no-op and must be rejected with
         // INVALID_PARTITIONS, not silently succeed.
         let mut store = MockKafkaStore::new();
-        store
-            .expect_get_topic_partition_count()
-            .returning(|_| Ok(Some(3)));
+        crate::testing::expect_topics(&mut store, |_| Ok(Some((1, 3))));
 
         let topics = vec![CreatePartitionsTopicRequest {
             name: "test-topic".to_string(),
@@ -662,7 +770,9 @@ mod tests {
         // A group absent from the coordinator but holding committed offsets is an Empty
         // group: its offsets are deleted and the result is NONE.
         let mut store = MockKafkaStore::new();
-        store.expect_group_has_offsets().returning(|_| Ok(true));
+        store
+            .expect_groups_with_offsets()
+            .returning(|groups| Ok(groups.iter().cloned().collect()));
         store
             .expect_delete_consumer_group_offsets()
             .times(1)
@@ -697,7 +807,9 @@ mod tests {
     fn test_delete_groups_nonexistent_group_is_not_found() {
         // Kafka answers GROUP_ID_NOT_FOUND for a group that has neither members nor offsets.
         let mut store = MockKafkaStore::new();
-        store.expect_group_has_offsets().returning(|_| Ok(false));
+        store
+            .expect_groups_with_offsets()
+            .returning(|_| Ok(HashSet::new()));
         store.expect_delete_consumer_group_offsets().times(0);
         let coordinator = crate::kafka::GroupCoordinator::new();
         let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
@@ -711,8 +823,7 @@ mod tests {
         // A huge partition count is refused before anything is stored; stored, it would make
         // every Metadata request allocate for it.
         let mut store = MockKafkaStore::new();
-        store.expect_topic_exists().returning(|_| Ok(false));
-        store.expect_find_colliding_topic().returning(|_| Ok(None));
+        store.expect_colliding_topics().returning(|_| Ok(vec![]));
         store
             .expect_create_topic()
             .withf(|name, n| name == "at-cap" && *n == 10_000)
@@ -747,8 +858,7 @@ mod tests {
     #[test]
     fn test_create_topics_minus_one_default_is_capped() {
         let mut store = MockKafkaStore::new();
-        store.expect_topic_exists().returning(|_| Ok(false));
-        store.expect_find_colliding_topic().returning(|_| Ok(None));
+        store.expect_colliding_topics().returning(|_| Ok(vec![]));
         store
             .expect_create_topic()
             .withf(|_, n| *n == crate::kafka::limits::DEFAULT_MAX_PARTITIONS_PER_TOPIC)
@@ -770,8 +880,7 @@ mod tests {
     #[test]
     fn test_create_topics_replication_factor() {
         let mut store = MockKafkaStore::new();
-        store.expect_topic_exists().returning(|_| Ok(false));
-        store.expect_find_colliding_topic().returning(|_| Ok(None));
+        store.expect_colliding_topics().returning(|_| Ok(vec![]));
         store.expect_create_topic().times(2).returning(|_, _| Ok(1));
         let coordinator = crate::kafka::GroupCoordinator::new();
         let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
@@ -811,8 +920,7 @@ mod tests {
         // Kafka: one INVALID_REQUEST result for the repeated name, nothing created for it;
         // the other topics are unaffected.
         let mut store = MockKafkaStore::new();
-        store.expect_topic_exists().returning(|_| Ok(false));
-        store.expect_find_colliding_topic().returning(|_| Ok(None));
+        store.expect_colliding_topics().returning(|_| Ok(vec![]));
         store
             .expect_create_topic()
             .withf(|name, _| name == "other")
@@ -836,10 +944,9 @@ mod tests {
     #[test]
     fn test_create_topics_name_collision() {
         let mut store = MockKafkaStore::new();
-        store.expect_topic_exists().returning(|_| Ok(false));
         store
-            .expect_find_colliding_topic()
-            .returning(|_| Ok(Some("a.b".to_string())));
+            .expect_colliding_topics()
+            .returning(|_| Ok(vec!["a.b".to_string()]));
         store.expect_create_topic().times(0);
         let coordinator = crate::kafka::GroupCoordinator::new();
         let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
@@ -855,9 +962,7 @@ mod tests {
     #[test]
     fn test_create_partitions_over_cap_rejected() {
         let mut store = MockKafkaStore::new();
-        store
-            .expect_get_topic_partition_count()
-            .returning(|_| Ok(Some(1)));
+        crate::testing::expect_topics(&mut store, |_| Ok(Some((1, 1))));
         store.expect_set_topic_partition_count().times(0);
         let coordinator = crate::kafka::GroupCoordinator::new();
         let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
@@ -872,5 +977,78 @@ mod tests {
         )
         .unwrap();
         assert_eq!(response.results[0].error_code, ERROR_INVALID_PARTITIONS);
+    }
+
+    /// Kafka 3.7 answers a DeleteTopics name given more than once with one INVALID_REQUEST
+    /// entry and deletes nothing for it.
+    #[test]
+    fn test_delete_topics_repeated_name_is_one_invalid_request() {
+        let mut store = MockKafkaStore::new();
+        crate::testing::expect_topics(&mut store, |name| Ok(Some((i32::from(name == "x"), 1))));
+        store
+            .expect_delete_topic()
+            .with(mockall::predicate::eq(1))
+            .times(1)
+            .returning(|_| Ok(()));
+        let coordinator = crate::kafka::GroupCoordinator::new();
+        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = ctx_for(&store, &coordinator, &broker);
+        let mut names = vec!["dup".to_string(); 10_000];
+        names.insert(1, "x".to_string());
+        let response = handle_delete_topics(&ctx, names).unwrap();
+        let answers: Vec<(String, i16)> = response
+            .responses
+            .iter()
+            .map(|r| {
+                let name = r
+                    .name
+                    .as_ref()
+                    .map_or_else(String::new, |n| n.0.to_string());
+                (name, r.error_code)
+            })
+            .collect();
+        assert_eq!(
+            answers,
+            [
+                ("dup".to_string(), ERROR_INVALID_REQUEST),
+                ("x".to_string(), ERROR_NONE)
+            ]
+        );
+    }
+
+    /// Kafka 3.7 answers a CreatePartitions name given more than once with one
+    /// INVALID_REQUEST entry and changes nothing for it.
+    #[test]
+    fn test_create_partitions_repeated_name_is_one_invalid_request() {
+        let mut store = MockKafkaStore::new();
+        crate::testing::expect_topics(&mut store, |_| Ok(Some((1, 1))));
+        store
+            .expect_set_topic_partition_count()
+            .withf(|name, count| name == "x" && *count == 2)
+            .times(1)
+            .returning(|_, _| Ok(()));
+        let coordinator = crate::kafka::GroupCoordinator::new();
+        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = ctx_for(&store, &coordinator, &broker);
+        let request = |name: &str| CreatePartitionsTopicRequest {
+            name: name.to_string(),
+            count: 2,
+        };
+        let response = handle_create_partitions(
+            &ctx,
+            vec![request("dup"), request("x"), request("dup")],
+            false,
+        )
+        .unwrap();
+        let codes: Vec<(&str, i16)> = response
+            .results
+            .iter()
+            .map(|r| (r.name.0.as_str(), r.error_code))
+            .collect();
+        assert_eq!(codes, [("dup", ERROR_INVALID_REQUEST), ("x", ERROR_NONE)]);
+        assert_eq!(
+            response.results[0].error_message.as_deref(),
+            Some("Duplicate topic name.")
+        );
     }
 }

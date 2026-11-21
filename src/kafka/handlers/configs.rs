@@ -25,12 +25,14 @@ use kafka_protocol::messages::incremental_alter_configs_response::{
 use kafka_protocol::messages::TopicName;
 use kafka_protocol::protocol::StrBytes;
 
+use super::helpers::{merge_by_partition, resolve_topics};
 use crate::kafka::constants::{
     ERROR_INVALID_CONFIG, ERROR_INVALID_REQUEST, ERROR_NONE, ERROR_OFFSET_OUT_OF_RANGE,
     ERROR_UNKNOWN_TOPIC_OR_PARTITION,
 };
 use crate::kafka::error::{KafkaError, Result};
 use crate::kafka::handler_context::HandlerContext;
+use std::collections::{HashMap, HashSet};
 
 /// Kafka resource type for topics (DescribeConfigs/IncrementalAlterConfigs).
 const RESOURCE_TYPE_TOPIC: i8 = 2;
@@ -49,6 +51,7 @@ const OP_SET: i8 = 0;
 const OP_DELETE: i8 = 1;
 
 /// One reportable topic config: (name, value, source, type).
+#[derive(Clone)]
 struct TopicConfigEntry {
     name: &'static str,
     value: String,
@@ -109,6 +112,17 @@ pub fn handle_describe_configs(
     global_retention_hours: i32,
 ) -> Result<DescribeConfigsResponse> {
     let mut results = Vec::with_capacity(resources.len());
+    // The topics in one lookup, and each topic's configs read once however often the
+    // request names it (Kafka answers every entry).
+    let topics = resolve_topics(
+        ctx.store,
+        resources
+            .iter()
+            .filter(|(resource_type, _, _)| *resource_type == RESOURCE_TYPE_TOPIC)
+            .map(|(_, name, _)| name.as_str()),
+    );
+    let mut configs_of: HashMap<i32, std::result::Result<Vec<TopicConfigEntry>, (i16, String)>> =
+        HashMap::new();
 
     for (resource_type, resource_name, requested_keys) in resources {
         let mut result = DescribeConfigsResult::default()
@@ -126,15 +140,24 @@ pub fn handle_describe_configs(
 
         // A storage failure is reported on this resource only (error_code + message);
         // a handler `Err` would reach the client as an empty, error-free response.
-        let lookup = ctx
-            .store
-            .get_topic_id(&resource_name)
-            .and_then(|id| match id {
-                Some(topic_id) => {
-                    effective_topic_configs(ctx, topic_id, global_retention_hours).map(Some)
-                }
+        let lookup = match &topics {
+            Ok(found) => match found.get(&resource_name) {
+                Some(&(topic_id, _)) => configs_of
+                    .entry(topic_id)
+                    .or_insert_with(|| {
+                        effective_topic_configs(ctx, topic_id, global_retention_hours).map_err(
+                            |e| {
+                                warn_if_server_error("describe configs for", &resource_name, &e);
+                                (e.to_kafka_error_code(), e.to_string())
+                            },
+                        )
+                    })
+                    .clone()
+                    .map(Some),
                 None => Ok(None),
-            });
+            },
+            Err(code) => Err((*code, format!("Failed to look up topic '{resource_name}'"))),
+        };
         match lookup {
             Ok(Some(configs)) => {
                 let wanted = |name: &str| match &requested_keys {
@@ -162,10 +185,9 @@ pub fn handle_describe_configs(
                     "Unknown topic '{resource_name}'"
                 )));
             }
-            Err(e) => {
-                warn_if_server_error("describe configs for", &resource_name, &e);
-                result.error_code = e.to_kafka_error_code();
-                result.error_message = Some(StrBytes::from_string(e.to_string()));
+            Err((error_code, message)) => {
+                result.error_code = error_code;
+                result.error_message = Some(StrBytes::from_string(message));
             }
         }
         results.push(result);
@@ -201,13 +223,47 @@ pub fn handle_incremental_alter_configs(
     resources: crate::kafka::messages::AlterConfigsResources,
     validate_only: bool,
 ) -> Result<IncrementalAlterConfigsResponse> {
+    // Kafka 3.7 refuses every entry of a resource named more than once, without acting
+    // on any of them.
+    let mut named: HashMap<(i8, &str), usize> = HashMap::new();
+    for (resource_type, resource_name, _) in &resources {
+        *named.entry((*resource_type, resource_name)).or_default() += 1;
+    }
+    let repeated: HashSet<(i8, String)> = named
+        .into_iter()
+        .filter(|&(_, n)| n > 1)
+        .map(|((resource_type, name), _)| (resource_type, name.to_string()))
+        .collect();
+    let topics = resolve_topics(
+        ctx.store,
+        resources
+            .iter()
+            .filter(|(resource_type, _, _)| *resource_type == RESOURCE_TYPE_TOPIC)
+            .map(|(_, name, _)| name.as_str()),
+    );
     let responses = resources
         .into_iter()
         .map(|(resource_type, resource_name, configs)| {
             let mut resp = AlterConfigsResourceResponse::default()
                 .with_resource_type(resource_type)
                 .with_resource_name(StrBytes::from_string(resource_name.clone()));
-            match alter_topic_configs(ctx, resource_type, &resource_name, &configs, validate_only) {
+            let resource = Resource {
+                kind: resource_type,
+                name: &resource_name,
+                topic: topics
+                    .as_ref()
+                    .map(|found| found.get(&resource_name).map(|&(id, _)| id))
+                    .map_err(|&code| code),
+            };
+            let outcome = if repeated.contains(&(resource_type, resource_name.clone())) {
+                Err((
+                    ERROR_INVALID_REQUEST,
+                    "Each resource must appear at most once.".to_string(),
+                ))
+            } else {
+                alter_topic_configs(ctx, resource, &configs, validate_only)
+            };
+            match outcome {
                 Ok(()) => resp.error_code = ERROR_NONE,
                 Err((error_code, message)) => {
                     resp.error_code = error_code;
@@ -225,11 +281,15 @@ pub fn handle_incremental_alter_configs(
 /// resource's error code and message if it is refused.
 fn alter_topic_configs(
     ctx: &HandlerContext,
-    resource_type: i8,
-    resource_name: &str,
+    resource: Resource<'_>,
     configs: &[(String, i8, Option<String>)],
     validate_only: bool,
 ) -> std::result::Result<(), (i16, String)> {
+    let Resource {
+        kind: resource_type,
+        name: resource_name,
+        topic,
+    } = resource;
     if resource_type != RESOURCE_TYPE_TOPIC {
         return Err((
             ERROR_INVALID_REQUEST,
@@ -240,10 +300,8 @@ fn alter_topic_configs(
         warn_if_server_error("alter configs for", resource_name, &e);
         (e.to_kafka_error_code(), e.to_string())
     };
-    let topic_id = ctx
-        .store
-        .get_topic_id(resource_name)
-        .map_err(storage_error)?
+    let topic_id = topic
+        .map_err(|code| (code, format!("Failed to look up topic '{resource_name}'")))?
         .ok_or_else(|| {
             (
                 ERROR_UNKNOWN_TOPIC_OR_PARTITION,
@@ -261,6 +319,15 @@ fn alter_topic_configs(
             .map_err(storage_error)?;
     }
     Ok(())
+}
+
+/// An IncrementalAlterConfigs resource: its type, its name and, for a topic, the topic's
+/// id (`None` for a topic that does not exist) or the error code of a failed lookup.
+#[derive(Clone, Copy)]
+struct Resource<'a> {
+    kind: i8,
+    name: &'a str,
+    topic: std::result::Result<Option<i32>, i16>,
 }
 
 /// A topic's `retention.ms` alteration.
@@ -304,21 +371,21 @@ pub fn handle_delete_records(
     ctx: &HandlerContext,
     topics: Vec<(String, Vec<(i32, i64)>)>,
 ) -> Result<DeleteRecordsResponse> {
+    // Kafka 3.7 collects the partitions into a map: a repeated partition is truncated
+    // once, to its last entry's offset, and answered once.
+    let topics = merge_by_partition(topics, |&(partition, _)| partition);
+    // The topics in one lookup. Unknown topic and a storage failure are both reported on
+    // every requested partition of the topic (`Err` holds the error code).
+    let found = resolve_topics(ctx.store, topics.iter().map(|(name, _)| name.as_str()));
     let mut topic_results = Vec::with_capacity(topics.len());
 
     for (topic_name, partitions) in topics {
-        // Resolve the topic once. Unknown topic and a storage failure are both reported
-        // on every requested partition of this topic (`Err` holds the error code).
-        let resolved: std::result::Result<(i32, i32), i16> = match (
-            ctx.store.get_topic_id(&topic_name),
-            ctx.store.get_topic_partition_count(&topic_name),
-        ) {
-            (Ok(Some(id)), Ok(Some(count))) => Ok((id, count)),
-            (Ok(_), Ok(_)) => Err(ERROR_UNKNOWN_TOPIC_OR_PARTITION),
-            (Err(e), _) | (_, Err(e)) => {
-                warn_if_server_error("delete records from", &topic_name, &e);
-                Err(e.to_kafka_error_code())
-            }
+        let resolved: std::result::Result<(i32, i32), i16> = match &found {
+            Ok(found) => found
+                .get(&topic_name)
+                .copied()
+                .ok_or(ERROR_UNKNOWN_TOPIC_OR_PARTITION),
+            Err(code) => Err(*code),
         };
         let mut partition_results = Vec::with_capacity(partitions.len());
 

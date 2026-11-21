@@ -21,8 +21,8 @@ use crate::kafka::messages::{
     CreatePartitionsTopicRequest, CreateTopicRequest, JoinGroupProtocol, ListOffsetsPartitionData,
     ListOffsetsTopicData, OffsetCommitPartitionData, OffsetCommitTopicData,
 };
-use crate::kafka::storage::TopicMetadata;
 use crate::kafka::{BrokerMetadata, GroupCoordinator, HandlerContext};
+use crate::testing::expect_topics;
 use crate::testing::mocks::MockKafkaStore;
 use kafka_protocol::records::Compression;
 use mockall::predicate::eq;
@@ -54,22 +54,14 @@ fn with_ctx_coord<R>(
     f(&ctx)
 }
 
-fn topic_meta(name: &str, id: i32, partitions: i32) -> TopicMetadata {
-    TopicMetadata {
-        name: name.to_string(),
-        id,
-        partition_count: partitions,
-    }
-}
-
-/// Mock `get_topic_metadata`: "bad" fails, "ok" resolves to id 1 (4 partitions).
+/// Mock the batched topic lookup: any request naming "bad" fails; every other topic has
+/// id 1 and 4 partitions.
 fn metadata_ok_or_fail(store: &mut MockKafkaStore) {
-    store.expect_get_topic_metadata().returning(|names| {
-        let name = names.and_then(|n| n.first()).cloned().unwrap_or_default();
+    expect_topics(store, |name| {
         if name == "bad" {
             Err(boom())
         } else {
-            Ok(vec![topic_meta(&name, 1, 4)])
+            Ok(Some((1, 4)))
         }
     });
 }
@@ -91,13 +83,12 @@ fn commit_topic(name: &str, partitions: &[i32]) -> OffsetCommitTopicData {
 }
 
 #[test]
-fn offset_commit_topic_lookup_failure_errors_every_partition_of_that_topic() {
+fn offset_commit_topic_lookup_failure_errors_every_partition() {
+    // The topics are looked up once for the request: a failed lookup errors every
+    // partition, commits nothing, and is no handler Err.
     let mut store = MockKafkaStore::new();
     metadata_ok_or_fail(&mut store);
-    store
-        .expect_commit_offset()
-        .times(1)
-        .returning(|_, _, _, _, _| Ok(()));
+    store.expect_commit_offset().times(0);
 
     let resp = with_ctx(&store, |ctx| {
         handle_offset_commit(
@@ -111,12 +102,11 @@ fn offset_commit_topic_lookup_failure_errors_every_partition_of_that_topic() {
     .expect("a storage failure must not become a handler Err");
 
     assert_eq!(resp.topics.len(), 2);
-    let bad = &resp.topics[0];
-    assert_eq!(bad.partitions.len(), 2);
-    for p in &bad.partitions {
+    let partitions: Vec<_> = resp.topics.iter().flat_map(|t| &t.partitions).collect();
+    assert_eq!(partitions.len(), 3);
+    for p in partitions {
         assert_eq!(p.error_code, ERROR_UNKNOWN_SERVER_ERROR);
     }
-    assert_eq!(resp.topics[1].partitions[0].error_code, ERROR_NONE);
 }
 
 #[test]
@@ -161,6 +151,25 @@ fn list_topic(name: &str, partitions: &[(i32, i64)]) -> ListOffsetsTopicData {
 
 #[test]
 fn list_offsets_storage_failures_are_reported_per_partition() {
+    // A failed topic lookup (one for the request) errors every partition.
+    let mut store = MockKafkaStore::new();
+    metadata_ok_or_fail(&mut store);
+    let resp = with_ctx(&store, |ctx| {
+        handle_list_offsets(
+            ctx,
+            vec![
+                list_topic("bad", &[(0, -1), (1, -1)]),
+                list_topic("ok", &[(0, -1)]),
+            ],
+            crate::kafka::storage::IsolationLevel::ReadUncommitted,
+        )
+    })
+    .unwrap();
+    for p in resp.topics.iter().flat_map(|t| &t.partitions) {
+        assert_eq!(p.error_code, ERROR_UNKNOWN_SERVER_ERROR);
+    }
+
+    // A failed read errors only its partition.
     let mut store = MockKafkaStore::new();
     metadata_ok_or_fail(&mut store);
     store
@@ -174,23 +183,56 @@ fn list_offsets_storage_failures_are_reported_per_partition() {
     let resp = with_ctx(&store, |ctx| {
         handle_list_offsets(
             ctx,
-            vec![
-                list_topic("bad", &[(0, -1), (1, -1)]),
-                list_topic("ok", &[(0, -2), (1, -1), (2, 1_000)]),
-            ],
+            vec![list_topic("ok", &[(0, -2), (1, -1), (2, 1_000)])],
             crate::kafka::storage::IsolationLevel::ReadUncommitted,
         )
     })
     .unwrap();
 
-    for p in &resp.topics[0].partitions {
-        assert_eq!(p.error_code, ERROR_UNKNOWN_SERVER_ERROR);
-    }
-    let ok = &resp.topics[1].partitions;
+    let ok = &resp.topics[0].partitions;
     assert_eq!(ok[0].error_code, ERROR_UNKNOWN_SERVER_ERROR); // earliest failed
     assert_eq!(ok[1].error_code, ERROR_NONE);
     assert_eq!(ok[1].offset, 7);
     assert_eq!(ok[2].error_code, ERROR_UNKNOWN_SERVER_ERROR); // timestamp failed
+}
+
+/// Kafka 3.7 answers every entry of a partition a ListOffsets request names more than
+/// once INVALID_REQUEST and reads nothing for it; other partitions are answered.
+#[test]
+fn list_offsets_repeated_partition_is_invalid_request() {
+    let mut store = MockKafkaStore::new();
+    metadata_ok_or_fail(&mut store);
+    store
+        .expect_get_high_watermark()
+        .times(1)
+        .returning(|_, _| Ok(7));
+    let mut repeated = vec![(0, -1); 20_000];
+    repeated.push((1, -1));
+    let resp = with_ctx(&store, |ctx| {
+        handle_list_offsets(
+            ctx,
+            vec![list_topic("ok", &repeated), list_topic("ok", &[(0, -1)])],
+            crate::kafka::storage::IsolationLevel::ReadUncommitted,
+        )
+    })
+    .unwrap();
+    assert_eq!(resp.topics.len(), 2);
+    let codes: Vec<(i32, i16)> = resp
+        .topics
+        .iter()
+        .flat_map(|t| {
+            t.partitions
+                .iter()
+                .map(|p| (p.partition_index, p.error_code))
+        })
+        .collect();
+    assert_eq!(codes.len(), 20_002);
+    assert!(codes.iter().all(|&(p, code)| code
+        == if p == 0 {
+            ERROR_INVALID_REQUEST
+        } else {
+            ERROR_NONE
+        }));
 }
 
 // ========== DescribeGroups ==========
@@ -198,7 +240,9 @@ fn list_offsets_storage_failures_are_reported_per_partition() {
 #[test]
 fn describe_groups_answers_every_requested_group() {
     let mut store = MockKafkaStore::new();
-    store.expect_group_has_offsets().returning(|_| Ok(false));
+    store
+        .expect_groups_with_offsets()
+        .returning(|_| Ok(std::collections::HashSet::new()));
     let resp = with_ctx(&store, |ctx| {
         handle_describe_groups(ctx, vec!["a".to_string(), "b".to_string(), "a".to_string()])
     })
@@ -210,7 +254,9 @@ fn describe_groups_answers_every_requested_group() {
 #[test]
 fn describe_groups_survives_a_poisoned_coordinator_lock() {
     let mut store = MockKafkaStore::new();
-    store.expect_group_has_offsets().returning(|_| Ok(false));
+    store
+        .expect_groups_with_offsets()
+        .returning(|_| Ok(std::collections::HashSet::new()));
     let coordinator = GroupCoordinator::new();
     let groups = coordinator.groups.clone();
     let _ = std::thread::spawn(move || {
@@ -239,16 +285,24 @@ fn create_req(name: &str) -> CreateTopicRequest {
 }
 
 #[test]
-fn create_topics_storage_failures_are_per_topic() {
+fn create_topics_storage_failures_are_reported_on_the_topics_they_affect() {
+    // The existing topics are looked up once for the request: a failed lookup refuses
+    // every topic it would have checked; a failed create refuses only its topic.
     let mut store = MockKafkaStore::new();
-    store.expect_topic_exists().returning(|name| {
-        if name == "exists-fails" {
-            Err(boom())
-        } else {
-            Ok(false)
-        }
-    });
-    store.expect_find_colliding_topic().returning(|_| Ok(None));
+    store.expect_colliding_topics().returning(|_| Err(boom()));
+    store.expect_create_topic().times(0);
+    let resp = with_ctx(&store, |ctx| {
+        handle_create_topics(ctx, vec![create_req("a"), create_req("b")], false)
+    })
+    .unwrap();
+    assert_eq!(resp.topics.len(), 2);
+    for t in &resp.topics {
+        assert_eq!(t.error_code, ERROR_UNKNOWN_SERVER_ERROR);
+        assert!(t.error_message.is_some());
+    }
+
+    let mut store = MockKafkaStore::new();
+    store.expect_colliding_topics().returning(|_| Ok(vec![]));
     store.expect_create_topic().returning(|name, _| {
         if name == "create-fails" {
             Err(boom())
@@ -256,78 +310,78 @@ fn create_topics_storage_failures_are_per_topic() {
             Ok(9)
         }
     });
-
     let resp = with_ctx(&store, |ctx| {
         handle_create_topics(
             ctx,
-            vec![
-                create_req("exists-fails"),
-                create_req("create-fails"),
-                create_req("fine"),
-            ],
+            vec![create_req("create-fails"), create_req("fine")],
             false,
         )
     })
     .unwrap();
-
-    assert_eq!(resp.topics.len(), 3);
+    assert_eq!(resp.topics.len(), 2);
     assert_eq!(resp.topics[0].error_code, ERROR_UNKNOWN_SERVER_ERROR);
     assert!(resp.topics[0].error_message.is_some());
-    assert_eq!(resp.topics[1].error_code, ERROR_UNKNOWN_SERVER_ERROR);
-    assert!(resp.topics[1].error_message.is_some());
-    assert_eq!(resp.topics[2].error_code, ERROR_NONE);
-    assert_eq!(resp.topics[2].num_partitions, 2);
+    assert_eq!(resp.topics[1].error_code, ERROR_NONE);
+    assert_eq!(resp.topics[1].num_partitions, 2);
 }
 
 // ========== DeleteTopics ==========
 
 #[test]
-fn delete_topics_storage_failures_are_per_topic() {
+fn delete_topics_storage_failures_are_reported_on_the_topics_they_affect() {
+    // The topics are looked up once for the request: a failed lookup errors every topic.
     let mut store = MockKafkaStore::new();
-    store.expect_get_topic_id().returning(|name| match name {
-        "lookup-fails" => Err(boom()),
-        "delete-fails" => Ok(Some(1)),
-        _ => Ok(Some(2)),
+    expect_topics(&mut store, |_| Err(boom()));
+    store.expect_delete_topic().times(0);
+    let resp = with_ctx(&store, |ctx| {
+        handle_delete_topics(ctx, vec!["a".to_string(), "b".to_string()])
+    })
+    .unwrap();
+    let codes: Vec<i16> = resp.responses.iter().map(|r| r.error_code).collect();
+    assert_eq!(codes, vec![ERROR_UNKNOWN_SERVER_ERROR; 2]);
+
+    // A failed delete errors only its topic.
+    let mut store = MockKafkaStore::new();
+    expect_topics(&mut store, |name| {
+        Ok(Some(if name == "delete-fails" {
+            (1, 1)
+        } else {
+            (2, 1)
+        }))
     });
     store
         .expect_delete_topic()
         .returning(|id| if id == 1 { Err(boom()) } else { Ok(()) });
-
     let resp = with_ctx(&store, |ctx| {
-        handle_delete_topics(
-            ctx,
-            vec![
-                "lookup-fails".to_string(),
-                "delete-fails".to_string(),
-                "fine".to_string(),
-            ],
-        )
+        handle_delete_topics(ctx, vec!["delete-fails".to_string(), "fine".to_string()])
     })
     .unwrap();
-
     let codes: Vec<i16> = resp.responses.iter().map(|r| r.error_code).collect();
-    assert_eq!(
-        codes,
-        vec![
-            ERROR_UNKNOWN_SERVER_ERROR,
-            ERROR_UNKNOWN_SERVER_ERROR,
-            ERROR_NONE
-        ]
-    );
+    assert_eq!(codes, vec![ERROR_UNKNOWN_SERVER_ERROR, ERROR_NONE]);
 }
 
 // ========== CreatePartitions ==========
 
 #[test]
-fn create_partitions_storage_failures_are_per_topic() {
+fn create_partitions_storage_failures_are_reported_on_the_topics_they_affect() {
+    let req = |name: &str| CreatePartitionsTopicRequest {
+        name: name.to_string(),
+        count: 3,
+    };
+    // The topics are looked up once for the request: a failed lookup errors every topic.
     let mut store = MockKafkaStore::new();
-    store.expect_get_topic_partition_count().returning(|name| {
-        if name == "lookup-fails" {
-            Err(boom())
-        } else {
-            Ok(Some(1))
-        }
-    });
+    expect_topics(&mut store, |_| Err(boom()));
+    store.expect_set_topic_partition_count().times(0);
+    let resp = with_ctx(&store, |ctx| {
+        handle_create_partitions(ctx, vec![req("a"), req("b")], false)
+    })
+    .unwrap();
+    let codes: Vec<i16> = resp.results.iter().map(|r| r.error_code).collect();
+    assert_eq!(codes, vec![ERROR_UNKNOWN_SERVER_ERROR; 2]);
+
+    // A failed change errors only its topic.
+    let mut store = MockKafkaStore::new();
+    expect_topics(&mut store, |_| Ok(Some((1, 1))));
     store
         .expect_set_topic_partition_count()
         .returning(|name, _| {
@@ -337,29 +391,12 @@ fn create_partitions_storage_failures_are_per_topic() {
                 Ok(())
             }
         });
-
-    let req = |name: &str| CreatePartitionsTopicRequest {
-        name: name.to_string(),
-        count: 3,
-    };
     let resp = with_ctx(&store, |ctx| {
-        handle_create_partitions(
-            ctx,
-            vec![req("lookup-fails"), req("set-fails"), req("fine")],
-            false,
-        )
+        handle_create_partitions(ctx, vec![req("set-fails"), req("fine")], false)
     })
     .unwrap();
-
     let codes: Vec<i16> = resp.results.iter().map(|r| r.error_code).collect();
-    assert_eq!(
-        codes,
-        vec![
-            ERROR_UNKNOWN_SERVER_ERROR,
-            ERROR_UNKNOWN_SERVER_ERROR,
-            ERROR_NONE
-        ]
-    );
+    assert_eq!(codes, vec![ERROR_UNKNOWN_SERVER_ERROR, ERROR_NONE]);
 }
 
 // ========== DeleteGroups ==========
@@ -426,7 +463,9 @@ fn delete_groups_offset_delete_failure_is_per_group_and_keeps_the_group() {
 #[test]
 fn delete_groups_unknown_group_storage_failure_is_reported() {
     let mut store = MockKafkaStore::new();
-    store.expect_group_has_offsets().returning(|_| Ok(true));
+    store
+        .expect_groups_with_offsets()
+        .returning(|groups| Ok(groups.iter().cloned().collect()));
     store
         .expect_delete_consumer_group_offsets()
         .returning(|_| Err(boom()));
@@ -440,25 +479,18 @@ fn delete_groups_unknown_group_storage_failure_is_reported() {
 // ========== DescribeConfigs ==========
 
 #[test]
-fn describe_configs_topic_lookup_failure_is_per_resource() {
+fn describe_configs_topic_lookup_failure_errors_every_topic_resource() {
+    // The topics are looked up once for the request: a failed lookup errors every topic
+    // resource, with an empty config list, and no handler Err.
     let mut store = MockKafkaStore::new();
-    store.expect_get_topic_id().returning(|name| {
-        if name == "bad" {
-            Err(boom())
-        } else {
-            Ok(Some(1))
-        }
-    });
-    store
-        .expect_get_topic_retention_ms()
-        .returning(|_| Ok(None));
+    expect_topics(&mut store, |_| Err(boom()));
 
     let resp = with_ctx(&store, |ctx| {
         handle_describe_configs(
             ctx,
             vec![
-                (RESOURCE_TYPE_TOPIC, "bad".to_string(), None),
-                (RESOURCE_TYPE_TOPIC, "ok".to_string(), None),
+                (RESOURCE_TYPE_TOPIC, "a".to_string(), None),
+                (RESOURCE_TYPE_TOPIC, "b".to_string(), None),
             ],
             0,
         )
@@ -466,27 +498,23 @@ fn describe_configs_topic_lookup_failure_is_per_resource() {
     .expect("a storage failure must not become a handler Err");
 
     assert_eq!(resp.results.len(), 2);
-    assert_eq!(resp.results[0].error_code, ERROR_UNKNOWN_SERVER_ERROR);
-    assert!(resp.results[0].error_message.is_some());
-    assert_eq!(
-        resp.results[0].configs,
-        [] as [kafka_protocol::messages::describe_configs_response::DescribeConfigsResourceResult;
-            0]
-    );
-    assert_eq!(resp.results[1].error_code, ERROR_NONE);
-    assert_ne!(
-        resp.results[1].configs,
-        [] as [kafka_protocol::messages::describe_configs_response::DescribeConfigsResourceResult;
-            0]
-    );
+    for r in &resp.results {
+        assert_eq!(r.error_code, ERROR_UNKNOWN_SERVER_ERROR);
+        assert!(r.error_message.is_some());
+        assert_eq!(
+            r.configs,
+            [] as [kafka_protocol::messages::describe_configs_response::DescribeConfigsResourceResult;
+                0]
+        );
+    }
 }
 
 #[test]
 fn describe_configs_retention_lookup_failure_is_per_resource() {
     let mut store = MockKafkaStore::new();
-    store
-        .expect_get_topic_id()
-        .returning(|name| Ok(Some(if name == "bad" { 1 } else { 2 })));
+    expect_topics(&mut store, |name| {
+        Ok(Some(if name == "bad" { (1, 1) } else { (2, 1) }))
+    });
     store.expect_get_topic_retention_ms().returning(|id| {
         if id == 1 {
             Err(boom())
@@ -527,42 +555,35 @@ fn set_retention(name: &str, ms: &str) -> AlterResource {
 }
 
 #[test]
-fn incremental_alter_configs_topic_lookup_failure_is_per_resource() {
+fn incremental_alter_configs_topic_lookup_failure_errors_every_topic_resource() {
+    // The topics are looked up once for the request: a failed lookup errors every topic
+    // resource, alters nothing, and is no handler Err.
     let mut store = MockKafkaStore::new();
-    store.expect_get_topic_id().returning(|name| {
-        if name == "bad" {
-            Err(boom())
-        } else {
-            Ok(Some(4))
-        }
-    });
-    store
-        .expect_set_topic_retention_ms()
-        .with(eq(4), eq(Some(1_000i64)))
-        .times(1)
-        .returning(|_, _| Ok(()));
+    expect_topics(&mut store, |_| Err(boom()));
+    store.expect_set_topic_retention_ms().times(0);
 
     let resp = with_ctx(&store, |ctx| {
         handle_incremental_alter_configs(
             ctx,
-            vec![set_retention("bad", "1000"), set_retention("ok", "1000")],
+            vec![set_retention("a", "1000"), set_retention("b", "1000")],
             false,
         )
     })
     .expect("a storage failure must not become a handler Err");
 
     assert_eq!(resp.responses.len(), 2);
-    assert_eq!(resp.responses[0].error_code, ERROR_UNKNOWN_SERVER_ERROR);
-    assert!(resp.responses[0].error_message.is_some());
-    assert_eq!(resp.responses[1].error_code, ERROR_NONE);
+    for r in &resp.responses {
+        assert_eq!(r.error_code, ERROR_UNKNOWN_SERVER_ERROR);
+        assert!(r.error_message.is_some());
+    }
 }
 
 #[test]
 fn incremental_alter_configs_write_failure_does_not_stop_later_resources() {
     let mut store = MockKafkaStore::new();
-    store
-        .expect_get_topic_id()
-        .returning(|name| Ok(Some(if name == "first" { 1 } else { 2 })));
+    expect_topics(&mut store, |name| {
+        Ok(Some(if name == "first" { (1, 1) } else { (2, 1) }))
+    });
     store
         .expect_set_topic_retention_ms()
         .with(eq(1), eq(Some(1_000i64)))
@@ -595,7 +616,7 @@ fn incremental_alter_configs_write_failure_does_not_stop_later_resources() {
 #[test]
 fn incremental_alter_configs_applies_a_resource_with_one_write() {
     let mut store = MockKafkaStore::new();
-    store.expect_get_topic_id().returning(|_| Ok(Some(4)));
+    expect_topics(&mut store, |_| Ok(Some((4, 1))));
     store
         .expect_set_topic_retention_ms()
         .with(eq(4), eq(Some(3_000i64)))
@@ -624,7 +645,7 @@ fn incremental_alter_configs_applies_a_resource_with_one_write() {
 #[test]
 fn incremental_alter_configs_last_delete_wins() {
     let mut store = MockKafkaStore::new();
-    store.expect_get_topic_id().returning(|_| Ok(Some(4)));
+    expect_topics(&mut store, |_| Ok(Some((4, 1))));
     store
         .expect_set_topic_retention_ms()
         .with(eq(4), eq(None))
@@ -653,7 +674,7 @@ fn incremental_alter_configs_last_delete_wins() {
 #[test]
 fn incremental_alter_configs_empty_resource_writes_nothing() {
     let mut store = MockKafkaStore::new();
-    store.expect_get_topic_id().returning(|_| Ok(Some(4)));
+    expect_topics(&mut store, |_| Ok(Some((4, 1))));
     store.expect_set_topic_retention_ms().times(0);
 
     let resp = with_ctx(&store, |ctx| {
@@ -670,62 +691,36 @@ fn incremental_alter_configs_empty_resource_writes_nothing() {
 // ========== DeleteRecords ==========
 
 #[test]
-fn delete_records_topic_lookup_failure_errors_every_partition_of_that_topic() {
-    for fail_count in [false, true] {
-        let mut store = MockKafkaStore::new();
-        store.expect_get_topic_id().returning(move |name| {
-            if name == "bad" && !fail_count {
-                Err(boom())
-            } else {
-                Ok(Some(if name == "bad" { 1 } else { 2 }))
-            }
-        });
-        store
-            .expect_get_topic_partition_count()
-            .returning(move |name| {
-                if name == "bad" && fail_count {
-                    Err(boom())
-                } else {
-                    Ok(Some(2))
-                }
-            });
-        store.expect_get_high_watermark().returning(|_, _| Ok(10));
-        store
-            .expect_delete_records_before()
-            .with(eq(2), eq(0), eq(5i64))
-            .times(1)
-            .returning(|_, _, before| Ok(before));
+fn delete_records_topic_lookup_failure_errors_every_partition() {
+    // The topics are looked up once for the request: a failed lookup errors every
+    // partition, deletes nothing, and is no handler Err.
+    let mut store = MockKafkaStore::new();
+    expect_topics(&mut store, |_| Err(boom()));
+    store.expect_delete_records_before().times(0);
 
-        let resp = with_ctx(&store, |ctx| {
-            handle_delete_records(
-                ctx,
-                vec![
-                    ("bad".to_string(), vec![(0, 5), (1, 5)]),
-                    ("ok".to_string(), vec![(0, 5)]),
-                ],
-            )
-        })
-        .expect("a storage failure must not become a handler Err");
+    let resp = with_ctx(&store, |ctx| {
+        handle_delete_records(
+            ctx,
+            vec![
+                ("bad".to_string(), vec![(0, 5), (1, 5)]),
+                ("ok".to_string(), vec![(0, 5)]),
+            ],
+        )
+    })
+    .expect("a storage failure must not become a handler Err");
 
-        let bad = &resp.topics[0].partitions;
-        assert_eq!(bad.len(), 2, "fail_count={fail_count}");
-        for p in bad {
-            assert_eq!(p.error_code, ERROR_UNKNOWN_SERVER_ERROR);
-            assert_eq!(p.low_watermark, -1);
-        }
-        let ok = &resp.topics[1].partitions[0];
-        assert_eq!(ok.error_code, ERROR_NONE);
-        assert_eq!(ok.low_watermark, 5);
+    let partitions: Vec<_> = resp.topics.iter().flat_map(|t| &t.partitions).collect();
+    assert_eq!(partitions.len(), 3);
+    for p in partitions {
+        assert_eq!(p.error_code, ERROR_UNKNOWN_SERVER_ERROR);
+        assert_eq!(p.low_watermark, -1);
     }
 }
 
 #[test]
 fn delete_records_partition_failures_do_not_stop_later_partitions() {
     let mut store = MockKafkaStore::new();
-    store.expect_get_topic_id().returning(|_| Ok(Some(3)));
-    store
-        .expect_get_topic_partition_count()
-        .returning(|_| Ok(Some(3)));
+    expect_topics(&mut store, |_| Ok(Some((3, 3))));
     store.expect_get_high_watermark().returning(
         |_, partition| {
             if partition == 0 {

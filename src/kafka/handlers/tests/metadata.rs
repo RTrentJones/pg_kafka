@@ -42,13 +42,17 @@ fn test_handle_metadata_all_topics() {
 fn test_handle_metadata_specific_topic() {
     let mut mock = MockKafkaStore::new();
 
-    // get_or_create_topic returns (topic_id, partition_count) in one call.
-    mock.expect_get_or_create_topic()
-        .with(
-            mockall::predicate::eq("my-topic"),
-            mockall::predicate::always(),
-        )
-        .returning(|_, _| Ok((5, 1))); // (topic_id=5, partition_count=1)
+    // A missing topic is created once it was looked up.
+    crate::testing::expect_topics(&mut mock, |_| Ok(None));
+    mock.expect_get_or_create_topics()
+        .withf(|names, _| names == ["my-topic"])
+        .returning(|_, partition_count| {
+            Ok(vec![TopicMetadata {
+                name: "my-topic".to_string(),
+                id: 5,
+                partition_count,
+            }])
+        });
 
     // Create HandlerContext AFTER setting expectations
     let env = TestEnv::new();
@@ -63,7 +67,7 @@ fn test_handle_metadata_specific_topic() {
 #[test]
 fn test_handle_metadata_no_auto_create_missing_topic() {
     // With allow_auto_topic_creation = false, a missing requested topic must be reported
-    // as UNKNOWN_TOPIC_OR_PARTITION and NOT created. Not setting expect_get_or_create_topic means
+    // as UNKNOWN_TOPIC_OR_PARTITION and NOT created. Not setting expect_get_or_create_topics means
     // the mock panics if the handler tries to create — proving the no-create contract.
     let mut mock = MockKafkaStore::new();
     mock.expect_get_topic_metadata().returning(|_| Ok(vec![])); // topic doesn't exist
@@ -109,4 +113,61 @@ fn test_handle_metadata_storage_error_propagates() {
 
     let result = metadata::handle_metadata(&ctx, None, true);
     assert!(result.is_err());
+}
+
+/// Kafka 3.7 answers each distinct requested name once: a name repeated 10,000 times is
+/// looked up once (one statement for every name), created once (one statement for every
+/// missing name) and answered once.
+#[test]
+fn test_handle_metadata_repeated_name_is_answered_once() {
+    let mut mock = MockKafkaStore::new();
+    mock.expect_get_topic_metadata()
+        .withf(|names| names.is_some_and(|n| n.len() == 3))
+        .times(1)
+        .returning(|_| {
+            Ok(vec![TopicMetadata {
+                name: "exists".to_string(),
+                id: 1,
+                partition_count: 2,
+            }])
+        });
+    mock.expect_get_or_create_topics()
+        .withf(|names, _| names == ["new"])
+        .times(1)
+        .returning(|_, _| {
+            Ok(vec![TopicMetadata {
+                name: "new".to_string(),
+                id: 2,
+                partition_count: 1,
+            }])
+        });
+
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
+    let mut names = Vec::new();
+    for _ in 0..10_000 {
+        names.extend(["new", "exists", "bad name"].map(String::from));
+    }
+    let response = metadata::handle_metadata(&ctx, Some(names), true).unwrap();
+    let topics: Vec<(String, i16, usize)> = response
+        .topics
+        .iter()
+        .map(|t| {
+            (
+                t.name
+                    .as_ref()
+                    .map_or_else(String::new, |n| n.0.to_string()),
+                t.error_code,
+                t.partitions.len(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        topics,
+        [
+            ("new".to_string(), ERROR_NONE, 1),
+            ("exists".to_string(), ERROR_NONE, 2),
+            ("bad name".to_string(), ERROR_INVALID_TOPIC_EXCEPTION, 0),
+        ]
+    );
 }
