@@ -25,9 +25,26 @@ use super::{ApiEnv, ApiSchema, Call, KafkaApi, Lane, Rejection, RequestHeader};
 use crate::kafka::dispatch::RequestOutcome;
 pub use crate::kafka::handlers::JoinGroupRequestData;
 
+use crate::kafka::constants::ERROR_INVALID_GROUP_ID;
 use crate::kafka::handlers;
 use crate::kafka::messages::{JoinGroupProtocol, MemberIdentity, SyncGroupAssignment};
 use crate::kafka::response_builders as rb;
+
+/// Refuse an empty group id with INVALID_GROUP_ID, answered without touching any group.
+///
+/// Kafka 3.7 (`GroupCoordinator.isValidGroupId`) accepts `""` only on OffsetCommit,
+/// OffsetFetch, DescribeGroups and DeleteGroups; JoinGroup, SyncGroup, Heartbeat, LeaveGroup
+/// and TxnOffsetCommit need a real group (TxnOffsetCommit checks it in its handler, which
+/// also tells unknown partitions apart). FindCoordinator and AddOffsetsToTxn take `""`.
+fn require_group_id<E>(group_id: &GroupId, echo: impl FnOnce() -> E) -> Result<(), Rejection<E>> {
+    if group_id.is_empty() {
+        return Err(Rejection::Reply {
+            error_code: ERROR_INVALID_GROUP_ID,
+            echo: Some(echo()),
+        });
+    }
+    Ok(())
+}
 
 /// FindCoordinator: which broker coordinates a group or transactional id.
 pub struct FindCoordinatorApi;
@@ -88,13 +105,21 @@ pub struct JoinGroupApi;
 
 impl ApiSchema for JoinGroupApi {
     type Wire = JoinGroupRequest;
-    type Echo = ();
+
+    /// The member id to answer with. Kafka echoes the request's on INVALID_GROUP_ID and
+    /// answers `""` otherwise (JoinGroupRequest.getErrorResponse), so only the empty group
+    /// id refusal carries one.
+    type Echo = String;
     const NAME: &'static str = "JoinGroup";
     const MIN_VERSION: i16 = 0;
     const MAX_VERSION: i16 = 7;
 
-    fn error_response(_echo: Option<&()>, _version: i16, error_code: i16) -> JoinGroupResponse {
-        rb::build_join_group_error_response(error_code)
+    fn error_response(echo: Option<&String>, version: i16, error_code: i16) -> JoinGroupResponse {
+        let mut response = rb::build_join_group_error_response(error_code);
+        if let Some(member_id) = echo {
+            response.member_id = member_id.clone().into();
+        }
+        handlers::normalize_join_group_response(response, version)
     }
 
     fn response_has_error(response: &JoinGroupResponse) -> bool {
@@ -111,7 +136,8 @@ impl KafkaApi for JoinGroupApi {
     fn decode(
         wire: JoinGroupRequest,
         header: &RequestHeader,
-    ) -> Result<Self::Request, Rejection<()>> {
+    ) -> Result<Self::Request, Rejection<String>> {
+        require_group_id(&wire.group_id, || wire.member_id.to_string())?;
         Ok(JoinGroupRequestData {
             group_id: wire.group_id.to_string(),
             member_id: wire.member_id.to_string(),
@@ -131,7 +157,9 @@ impl KafkaApi for JoinGroupApi {
         })
     }
 
-    fn echo(_request: &Self::Request) {}
+    fn echo(_request: &Self::Request) -> String {
+        String::new()
+    }
 
     /// The response may come from a later JoinGroup, a LeaveGroup or the timeout sweep, so
     /// it answers on the client's own sender through a `JoinGroupReply` (which answers
@@ -188,6 +216,7 @@ impl KafkaApi for HeartbeatApi {
         wire: HeartbeatRequest,
         _header: &RequestHeader,
     ) -> Result<Self::Request, Rejection<()>> {
+        require_group_id(&wire.group_id, || ())?;
         Ok(HeartbeatRequestData {
             group_id: wire.group_id.to_string(),
             generation_id: wire.generation_id,
@@ -242,6 +271,7 @@ impl KafkaApi for LeaveGroupApi {
         wire: LeaveGroupRequest,
         _header: &RequestHeader,
     ) -> Result<Self::Request, Rejection<()>> {
+        require_group_id(&wire.group_id, || ())?;
         Ok(LeaveGroupRequestData {
             group_id: wire.group_id.to_string(),
             member_id: wire.member_id.to_string(),
@@ -306,6 +336,7 @@ impl KafkaApi for SyncGroupApi {
         wire: SyncGroupRequest,
         _header: &RequestHeader,
     ) -> Result<Self::Request, Rejection<()>> {
+        require_group_id(&wire.group_id, || ())?;
         Ok(SyncGroupRequestData {
             group_id: wire.group_id.to_string(),
             generation_id: wire.generation_id,
@@ -532,5 +563,113 @@ impl KafkaApi for DeleteGroupsApi {
         call.run(request, |r, _| {
             handlers::handle_delete_groups(&env.ctx, r.groups_names)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn header(api_key: i16, api_version: i16) -> RequestHeader {
+        RequestHeader {
+            api_key,
+            api_version,
+            correlation_id: 1,
+            client_id: None,
+        }
+    }
+
+    /// The code a decode refused with (`None` when it decoded).
+    fn refused<R, E>(decoded: Result<R, Rejection<E>>) -> Option<(i16, Option<E>)> {
+        match decoded {
+            Ok(_) => None,
+            Err(Rejection::Reply { error_code, echo }) => Some((error_code, echo)),
+            Err(Rejection::Silent | Rejection::Close(_)) => panic!("refused without a reply"),
+        }
+    }
+
+    /// Kafka 3.7 answers JoinGroup, SyncGroup, Heartbeat and LeaveGroup for the empty group
+    /// id with INVALID_GROUP_ID; JoinGroup echoes the request's member id.
+    #[test]
+    fn empty_group_id_is_invalid_group_id() {
+        let join = |group: &str| {
+            let mut wire = JoinGroupRequest::default();
+            wire.group_id = GroupId(group.to_string().into());
+            wire.member_id = "zz".to_string().into();
+            refused(JoinGroupApi::decode(wire, &header(11, 5)))
+        };
+        let (code, echo) = join("").unwrap();
+        assert_eq!(code, ERROR_INVALID_GROUP_ID);
+        let response = JoinGroupApi::error_response(echo.as_ref(), 5, code);
+        assert_eq!(
+            (
+                response.error_code,
+                response.generation_id,
+                response.member_id.as_str()
+            ),
+            (ERROR_INVALID_GROUP_ID, -1, "zz")
+        );
+        // protocol_name is nullable only from v7; Kafka sends "" before.
+        assert_eq!(response.protocol_name.as_deref(), Some(""));
+        let v7 = JoinGroupApi::error_response(None, 7, ERROR_INVALID_GROUP_ID);
+        assert_eq!(v7.protocol_name, None);
+        assert!(join("g").is_none());
+        // Every other JoinGroup error answers with no member id, as Kafka's
+        // JoinGroupRequest.getErrorResponse does.
+        let echo = JoinGroupApi::echo(&JoinGroupRequestData {
+            group_id: "g".to_string(),
+            member_id: "zz".to_string(),
+            client_id: "c".to_string(),
+            group_instance_id: None,
+            session_timeout_ms: 10_000,
+            rebalance_timeout_ms: 10_000,
+            protocol_type: "consumer".to_string(),
+            protocols: vec![],
+        });
+        assert_eq!(
+            JoinGroupApi::error_response(Some(&echo), 5, 35)
+                .member_id
+                .as_str(),
+            ""
+        );
+
+        let heartbeat = |group: &str| {
+            let mut wire = HeartbeatRequest::default();
+            wire.group_id = GroupId(group.to_string().into());
+            refused(HeartbeatApi::decode(wire, &header(12, 4))).map(|(code, _)| code)
+        };
+        let sync = |group: &str| {
+            let mut wire = SyncGroupRequest::default();
+            wire.group_id = GroupId(group.to_string().into());
+            refused(SyncGroupApi::decode(wire, &header(14, 4))).map(|(code, _)| code)
+        };
+        let leave = |group: &str| {
+            let mut wire = LeaveGroupRequest::default();
+            wire.group_id = GroupId(group.to_string().into());
+            refused(LeaveGroupApi::decode(wire, &header(13, 4))).map(|(code, _)| code)
+        };
+        for decoded in [heartbeat, sync, leave] {
+            assert_eq!(decoded(""), Some(ERROR_INVALID_GROUP_ID));
+            assert_eq!(decoded("g"), None);
+        }
+        // LeaveGroup v3+ answers the code at the top level, with no member results.
+        let response = LeaveGroupApi::error_response(None, 4, ERROR_INVALID_GROUP_ID);
+        assert_eq!(response.error_code, ERROR_INVALID_GROUP_ID);
+        assert_eq!(response.members.len(), 0);
+    }
+
+    /// DescribeGroups, DeleteGroups and FindCoordinator decode the empty group id, as Kafka 3.7
+    /// serves it there (OffsetCommit and OffsetFetch have no group id check at decode).
+    #[test]
+    fn empty_group_id_is_accepted_where_kafka_accepts_it() {
+        let mut describe = DescribeGroupsRequest::default();
+        describe.groups = vec![GroupId(String::new().into())];
+        assert!(refused(DescribeGroupsApi::decode(describe, &header(15, 5))).is_none());
+        let mut delete = DeleteGroupsRequest::default();
+        delete.groups_names = vec![GroupId(String::new().into())];
+        assert!(refused(DeleteGroupsApi::decode(delete, &header(42, 2))).is_none());
+        let mut find = FindCoordinatorRequest::default();
+        find.key = String::new().into();
+        assert!(refused(FindCoordinatorApi::decode(find, &header(10, 3))).is_none());
     }
 }

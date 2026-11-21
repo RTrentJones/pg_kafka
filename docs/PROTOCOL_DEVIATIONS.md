@@ -303,7 +303,13 @@ pg_kafka.compression_type = 'gzip'
   transaction did not add with AddOffsetsToTxn it is INVALID_TXN_STATE (48) on every
   partition and version and stores nothing, as in Kafka 3.7. **Deviation:** Kafka verifies
   the group's `__consumer_offsets` partition, so a group sharing that partition with an
-  added one is accepted there; pg_kafka checks the group itself
+  added one is accepted there; pg_kafka checks the group itself. As in Kafka 3.7, the
+  transaction is checked before the group member: a fenced or unknown producer, a
+  transaction that is not ongoing and a group not added win over a stale generation or an
+  unknown member id (UNKNOWN_MEMBER_ID / ILLEGAL_GENERATION only once the transaction checks
+  out). Whatever refuses the commit, a partition that does not exist is
+  UNKNOWN_TOPIC_OR_PARTITION (Kafka filters those out before it asks the coordinator) and
+  the refusal's code goes only to the partitions that exist
 - ✅ Read-committed isolation level filters pending/aborted messages
 - ✅ Transactional producer fencing via epoch
 
@@ -382,8 +388,20 @@ pg_kafka.compression_type = 'gzip'
 - ✅ OffsetCommit follows Kafka 3.7: generation -1 (simple consumers, `kafka-consumer-groups
   --reset-offsets`) is accepted only for an unknown or Empty group (any member id); a group with
   members answers UNKNOWN_MEMBER_ID to a non-member and ILLEGAL_GENERATION to a wrong
-  generation (also -1 from a member); a generation >= 0 for a group the coordinator does not
-  know gets ILLEGAL_GENERATION. (TxnOffsetCommit keeps its own rules.)
+  generation (also -1 from a member); a generation >= 0 for a group without members gets
+  UNKNOWN_MEMBER_ID when the group has committed offsets (Kafka holds it as an Empty group,
+  also when none of its members joined since the worker started) and ILLEGAL_GENERATION when
+  it has neither members nor offsets. A refused commit answers a partition that does not
+  exist UNKNOWN_TOPIC_OR_PARTITION, its code going only to the partitions that exist, as Kafka
+  filters those out before it asks the coordinator. (TxnOffsetCommit keeps its own rules.)
+- ✅ The empty group id follows Kafka 3.7 (`GroupCoordinator.isValidGroupId`, checked against a
+  3.7 broker): OffsetCommit, OffsetFetch, DescribeGroups and DeleteGroups accept `""` like any
+  other group id, and FindCoordinator and AddOffsetsToTxn take it too; JoinGroup, SyncGroup,
+  Heartbeat, LeaveGroup and TxnOffsetCommit answer INVALID_GROUP_ID (24) and change nothing.
+  JoinGroup's answer echoes the request's member id with generation -1; LeaveGroup v3+ answers
+  at the top level with no member results; TxnOffsetCommit answers every partition, before
+  any producer or transaction check, except a partition that does not exist, which is
+  UNKNOWN_TOPIC_OR_PARTITION.
 - ✅ Groups known only by their committed offsets (none of their members joined since the
   worker started, e.g. after a restart, or the group was reclaimed from memory) are reported by
   ListGroups and DescribeGroups as Empty groups with protocol type "consumer", so

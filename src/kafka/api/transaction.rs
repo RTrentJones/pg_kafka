@@ -519,7 +519,7 @@ impl KafkaApi for TxnOffsetCommitApi {
     }
 
     fn handle(request: Self::Request, call: Call<Self>, env: &ApiEnv<'_>) -> RequestOutcome {
-        call.run(request, |r, _| {
+        call.run(request, |r, header| {
             handlers::handle_txn_offset_commit(
                 &env.ctx,
                 &r.transactional_id,
@@ -530,6 +530,21 @@ impl KafkaApi for TxnOffsetCommitApi {
                 &r.member_id,
                 r.topics,
             )
+            .map(|mut response| {
+                // A refused transaction is answered on every partition that exists.
+                for p in response
+                    .topics
+                    .iter_mut()
+                    .flat_map(|t| t.partitions.iter_mut())
+                {
+                    p.error_code = fenced_code(
+                        p.error_code,
+                        header.api_version,
+                        TXN_OFFSET_COMMIT_FENCED_SINCE,
+                    );
+                }
+                response
+            })
         })
     }
 }

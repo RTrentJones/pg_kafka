@@ -251,6 +251,10 @@ pub const ERROR_ILLEGAL_GENERATION: i16 = 22;
 /// INCONSISTENT_GROUP_PROTOCOL: a JoinGroup whose protocol type or protocols do not match
 /// the group's.
 pub const ERROR_INCONSISTENT_GROUP_PROTOCOL: i16 = 23;
+/// INVALID_GROUP_ID: an empty group id on a group API that needs a real group (Kafka 3.7's
+/// `GroupCoordinator.isValidGroupId` accepts `""` only for OffsetCommit, OffsetFetch,
+/// DescribeGroups and DeleteGroups).
+pub const ERROR_INVALID_GROUP_ID: i16 = 24;
 /// UNKNOWN_MEMBER_ID.
 pub const ERROR_UNKNOWN_MEMBER_ID: i16 = 25;
 /// INVALID_SESSION_TIMEOUT: a session timeout outside the broker's accepted range
@@ -433,6 +437,7 @@ mod tests {
         assert_eq!(ERROR_UNKNOWN_SERVER_ERROR, -1);
         assert_eq!(ERROR_CORRUPT_MESSAGE, 2);
         assert_eq!(ERROR_UNKNOWN_TOPIC_OR_PARTITION, 3);
+        assert_eq!(ERROR_INVALID_GROUP_ID, 24);
         assert_eq!(ERROR_INVALID_TIMESTAMP, 32);
         assert_eq!(ERROR_UNSUPPORTED_VERSION, 35);
         assert_eq!(ERROR_INVALID_PARTITIONS, 37);

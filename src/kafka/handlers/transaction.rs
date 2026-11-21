@@ -1,9 +1,11 @@
 //! Transaction handlers: AddPartitionsToTxn, AddOffsetsToTxn, EndTxn and TxnOffsetCommit.
 
+use std::collections::HashMap;
+
 use super::helpers::{merge_by_partition, resolve_topics, validate_ongoing_transaction};
 use crate::kafka::constants::{
-    ERROR_INVALID_TXN_STATE, ERROR_NONE, ERROR_OPERATION_NOT_ATTEMPTED, ERROR_UNKNOWN_SERVER_ERROR,
-    ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+    ERROR_INVALID_GROUP_ID, ERROR_INVALID_TXN_STATE, ERROR_NONE, ERROR_OPERATION_NOT_ATTEMPTED,
+    ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
 };
 use crate::kafka::error::{KafkaError, Result};
 use crate::kafka::handler_context::HandlerContext;
@@ -298,49 +300,61 @@ pub fn handle_txn_offset_commit(
     // with its last entry, and answered once.
     let topics: TxnOffsetCommitTopics = merge_by_partition(topics, |p| p.0);
 
-    // Fence a zombie EOS consumer. A member committing offsets inside a
-    // transaction with a stale group generation (or an unknown member id) must be
-    // rejected with ILLEGAL_GENERATION / UNKNOWN_MEMBER_ID, the same fence as on the
-    // non-transactional OffsetCommit path. The producer-epoch fence
-    // alone does not cover KIP-447 (the new owner uses a *different*
-    // transactional_id, so the zombie keeps a valid epoch). Simple consumers /
-    // pre-v3 clients (generation -1) are exempt inside validate_commit.
-    if let Err(e) = ctx
-        .coordinator
-        .validate_commit(group_id, member_id, generation_id)
-    {
-        return Ok(txn_offset_commit_error_response(
-            &topics,
-            e.to_kafka_error_code(),
-        ));
+    // Kafka 3.7 answers a partition that does not exist UNKNOWN_TOPIC_OR_PARTITION before
+    // anything else (KafkaApis filters those out before it asks the coordinator), so every
+    // refusal below answers only the partitions that exist.
+    let resolved = match resolve_topics(store, topics.iter().map(|(name, _)| name.as_str())) {
+        Ok(found) => found,
+        Err(code) => return Ok(txn_offset_commit_error_response(&topics, code)),
+    };
+
+    let refusal = 'refusal: {
+        // An empty group id is refused before the transaction is looked at
+        // (GroupCoordinator.validateGroupStatus): INVALID_GROUP_ID, nothing stored.
+        if group_id.is_empty() {
+            break 'refusal Some(ERROR_INVALID_GROUP_ID);
+        }
+        // The transaction comes next, as in Kafka 3.7 (GroupCoordinator.handleTxnCommitOffsets
+        // verifies the producer and the transaction before it looks at the group): a fenced
+        // or unknown producer, a transaction that is not ongoing, or a group the transaction
+        // has not added wins over a stale generation or an unknown member.
+        match validate_ongoing_transaction(
+            store,
+            transactional_id,
+            producer_id,
+            producer_epoch,
+            "TxnOffsetCommit",
+        ) {
+            Err(e) if e.is_server_error() => return Err(e),
+            Err(e) => break 'refusal Some(e.to_kafka_error_code()),
+            Ok(()) => {}
+        }
+        // Kafka 3.7 verifies that the transaction holds the group's offsets partition
+        // (added by AddOffsetsToTxn) and answers INVALID_TXN_STATE otherwise.
+        if !store.txn_has_group(transactional_id, group_id)? {
+            break 'refusal Some(ERROR_INVALID_TXN_STATE);
+        }
+        // Then fence a zombie EOS consumer. A member committing offsets inside a
+        // transaction with a stale group generation (or an unknown member id) must be
+        // rejected with ILLEGAL_GENERATION / UNKNOWN_MEMBER_ID, the same fence as on the
+        // non-transactional OffsetCommit path. The producer-epoch fence
+        // alone does not cover KIP-447 (the new owner uses a *different*
+        // transactional_id, so the zombie keeps a valid epoch). Simple consumers /
+        // pre-v3 clients (generation -1) are exempt inside validate_commit.
+        ctx.coordinator
+            .validate_commit(group_id, member_id, generation_id)
+            .err()
+            .map(|e| e.to_kafka_error_code())
+    };
+    if let Some(code) = refusal {
+        return Ok(txn_offset_commit_refused_response(&topics, &resolved, code));
     }
 
-    validate_ongoing_transaction(
-        store,
-        transactional_id,
-        producer_id,
-        producer_epoch,
-        "TxnOffsetCommit",
-    )?;
-    // Kafka 3.7 verifies that the transaction holds the group's offsets partition
-    // (added by AddOffsetsToTxn) and answers INVALID_TXN_STATE on every partition
-    // otherwise, storing nothing.
-    if !store.txn_has_group(transactional_id, group_id)? {
-        return Ok(txn_offset_commit_error_response(
-            &topics,
-            ERROR_INVALID_TXN_STATE,
-        ));
-    }
-
-    let resolved = resolve_topics(store, topics.iter().map(|(name, _)| name.as_str()));
     let mut response = TxnOffsetCommitResponse::default();
     response.topics = topics
         .into_iter()
         .map(|(topic_name, partitions)| {
-            let topic = match &resolved {
-                Ok(found) => Ok(found.get(&topic_name).copied()),
-                Err(code) => Err(*code),
-            };
+            let topic = resolved.get(&topic_name).copied();
             let txn = PendingOffsets {
                 transactional_id,
                 group_id,
@@ -351,13 +365,39 @@ pub fn handle_txn_offset_commit(
     Ok(response)
 }
 
+/// Whether `partition` of `topic` exists, by the topics `resolved` found.
+fn partition_exists(resolved: &HashMap<String, (i32, i32)>, topic: &str, partition: i32) -> bool {
+    resolved
+        .get(topic)
+        .is_some_and(|(_, count)| (0..*count).contains(&partition))
+}
+
+/// A refused TxnOffsetCommit: `error_code` on every partition that exists,
+/// UNKNOWN_TOPIC_OR_PARTITION on the rest; nothing stored.
+fn txn_offset_commit_refused_response(
+    topics: &TxnOffsetCommitTopics,
+    resolved: &HashMap<String, (i32, i32)>,
+    error_code: i16,
+) -> TxnOffsetCommitResponse {
+    let mut response = txn_offset_commit_error_response(topics, error_code);
+    for topic in &mut response.topics {
+        let name = topic.name.0.to_string();
+        for p in &mut topic.partitions {
+            if !partition_exists(resolved, &name, p.partition_index) {
+                p.error_code = ERROR_UNKNOWN_TOPIC_OR_PARTITION;
+            }
+        }
+    }
+    response
+}
+
 /// Store one topic's offsets as pending offsets of the transaction and answer for each
 /// partition. The partition range check mirrors AddPartitionsToTxn: a partition outside
 /// `[0, partition_count)` is UNKNOWN_TOPIC_OR_PARTITION instead of a stored offset.
 fn store_txn_topic_offsets(
     store: &dyn KafkaStore,
     txn: PendingOffsets<'_>,
-    topic: std::result::Result<Option<(i32, i32)>, i16>,
+    topic: Option<(i32, i32)>,
     topic_name: String,
     partitions: Vec<(i32, i64, Option<String>)>,
 ) -> TxnOffsetCommitResponseTopic {
@@ -368,16 +408,16 @@ fn store_txn_topic_offsets(
     let partition_results = partitions
         .into_iter()
         .map(|(partition_id, offset, metadata)| {
-            let error_code = match &topic {
-                Ok(Some((_, partition_count)))
-                    if partition_id < 0 || partition_id >= *partition_count =>
+            let error_code = match topic {
+                Some((_, partition_count))
+                    if partition_id < 0 || partition_id >= partition_count =>
                 {
                     ERROR_UNKNOWN_TOPIC_OR_PARTITION
                 }
-                Ok(Some((topic_id, _))) => match store.store_txn_pending_offset(
+                Some((topic_id, _)) => match store.store_txn_pending_offset(
                     transactional_id,
                     group_id,
-                    *topic_id,
+                    topic_id,
                     partition_id,
                     offset,
                     metadata.as_deref(),
@@ -385,8 +425,7 @@ fn store_txn_topic_offsets(
                     Ok(()) => ERROR_NONE,
                     Err(_) => ERROR_UNKNOWN_SERVER_ERROR,
                 },
-                Ok(None) => ERROR_UNKNOWN_TOPIC_OR_PARTITION,
-                Err(code) => *code,
+                None => ERROR_UNKNOWN_TOPIC_OR_PARTITION,
             };
             let mut partition_result = TxnOffsetCommitResponsePartition::default();
             partition_result.partition_index = partition_id;
@@ -600,8 +639,17 @@ mod tests {
         // unknown / stale group membership must be fenced with UNKNOWN_MEMBER_ID,
         // not silently accepted. The producer-epoch fence alone does not cover this
         // (KIP-447: the new owner uses a different transactional_id). The fence
-        // returns before any store access, so the mock needs no expectations.
-        let store = MockKafkaStore::new();
+        // comes after the transaction checks and before any offset is stored.
+        let mut store = MockKafkaStore::new();
+        crate::testing::expect_topics(&mut store, |_| Ok(Some((1, 1))));
+        store
+            .expect_validate_transaction()
+            .returning(|_, _, _| Ok(()));
+        store
+            .expect_get_transaction_state()
+            .returning(|_| Ok(Some(crate::kafka::storage::TransactionState::Ongoing)));
+        store.expect_txn_has_group().returning(|_, _| Ok(true));
+        store.expect_store_txn_pending_offset().never();
         let env = TestEnv::new();
         let ctx = env.ctx(&store);
 

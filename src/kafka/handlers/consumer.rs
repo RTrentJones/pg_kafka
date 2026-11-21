@@ -2,7 +2,8 @@
 
 use super::helpers::{merge_by_partition, resolve_topics};
 use crate::kafka::constants::{
-    ERROR_NONE, ERROR_UNKNOWN_TOPIC_OR_PARTITION, ERROR_UNSTABLE_OFFSET_COMMIT,
+    ERROR_NONE, ERROR_UNKNOWN_MEMBER_ID, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+    ERROR_UNSTABLE_OFFSET_COMMIT,
 };
 use crate::kafka::error::Result;
 use crate::kafka::handler_context::HandlerContext;
@@ -34,30 +35,19 @@ pub fn handle_offset_commit(
     response.throttle_time_ms = 0;
     let topics = merge_commit_topics(topics);
 
+    // Kafka 3.7 answers a partition that does not exist UNKNOWN_TOPIC_OR_PARTITION before
+    // anything else (KafkaApis filters those out before it asks the coordinator), so a
+    // refused commit answers its code only on the partitions that exist.
+    let resolved = resolve_topics(ctx.store, topics.iter().map(|t| t.name.as_str()));
+
     // Reject zombie commits. A member committing with a stale generation (or an unknown
     // member id) for a live group must be rejected with ILLEGAL_GENERATION / UNKNOWN_MEMBER_ID
     // rather than silently persisting an offset. Kafka 3.7's rules, see
     // `GroupCoordinator::validate_offset_commit` (generation -1 only for an unknown/Empty group).
-    if let Err(e) = ctx
-        .coordinator
-        .validate_offset_commit(group_id, member_id, generation_id)
-    {
-        let error_code = e.to_kafka_error_code();
-        response.topics = topics
-            .into_iter()
-            .map(|topic| {
-                let partitions = topic
-                    .partitions
-                    .iter()
-                    .map(|p| commit_partition(p.partition_index, error_code))
-                    .collect();
-                commit_topic(topic.name, partitions)
-            })
-            .collect();
-        return Ok(response);
-    }
-
-    let resolved = resolve_topics(ctx.store, topics.iter().map(|t| t.name.as_str()));
+    let refusal = match &resolved {
+        Ok(_) => offset_commit_refusal(ctx, group_id, member_id, generation_id)?,
+        Err(_) => None,
+    };
     response.topics = topics
         .into_iter()
         .map(|topic| {
@@ -65,10 +55,68 @@ pub fn handle_offset_commit(
                 Ok(found) => Ok(found.get(&topic.name).copied()),
                 Err(code) => Err(*code),
             };
-            commit_topic_offsets(ctx.store, group_id, topic, found)
+            match refusal {
+                Some(error_code) => refuse_topic(topic, found, error_code),
+                None => commit_topic_offsets(ctx.store, group_id, topic, found),
+            }
         })
         .collect();
     Ok(response)
+}
+
+/// Answer a refused commit for one topic: `error_code` on each partition that exists,
+/// UNKNOWN_TOPIC_OR_PARTITION on the rest.
+fn refuse_topic(
+    topic: OffsetCommitTopicData,
+    found: std::result::Result<Option<(i32, i32)>, i16>,
+    error_code: i16,
+) -> OffsetCommitResponseTopic {
+    let partitions = topic
+        .partitions
+        .iter()
+        .map(|p| {
+            let exists =
+                matches!(found, Ok(Some((_, count))) if (0..count).contains(&p.partition_index));
+            let code = if exists {
+                error_code
+            } else {
+                ERROR_UNKNOWN_TOPIC_OR_PARTITION
+            };
+            commit_partition(p.partition_index, code)
+        })
+        .collect();
+    commit_topic(topic.name, partitions)
+}
+
+/// Why an OffsetCommit is refused, as an error code (`None` when it may commit).
+///
+/// Kafka 3.7 keeps a group that has committed offsets as an Empty group even when no member
+/// joined since (it loads them from `__consumer_offsets`), so a generation >= 0 for such a
+/// group names a member it does not have: UNKNOWN_MEMBER_ID. Only a group with neither
+/// members nor offsets answers a generation >= 0 ILLEGAL_GENERATION. The coordinator does
+/// not hold offsets-only groups, so this asks the store, and only on that path.
+fn offset_commit_refusal(
+    ctx: &HandlerContext,
+    group_id: &str,
+    member_id: &str,
+    generation_id: i32,
+) -> Result<Option<i16>> {
+    let Err(e) = ctx
+        .coordinator
+        .validate_offset_commit(group_id, member_id, generation_id)
+    else {
+        return Ok(None);
+    };
+    if generation_id >= 0
+        && ctx.coordinator.get_group_state(group_id).is_none()
+        && ctx
+            .store
+            .groups_with_offsets(&[group_id.to_string()])?
+            .contains(group_id)
+    {
+        return Ok(Some(ERROR_UNKNOWN_MEMBER_ID));
+    }
+    Ok(Some(e.to_kafka_error_code()))
 }
 
 /// The request's topics with each repeated partition merged into one entry holding its

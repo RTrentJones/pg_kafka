@@ -2,7 +2,10 @@
 //! because rdkafka does not expose the fields involved.
 
 use crate::common::TestResult;
-use crate::error_codes::{NONE, UNKNOWN_TOPIC_OR_PARTITION};
+use crate::error_codes::{
+    ILLEGAL_GENERATION, INVALID_GROUP_ID, INVALID_PRODUCER_EPOCH, INVALID_PRODUCER_ID_MAPPING,
+    INVALID_TXN_STATE, NONE, UNKNOWN_MEMBER_ID, UNKNOWN_TOPIC_OR_PARTITION,
+};
 use crate::fixtures::TestTopicBuilder;
 use crate::setup::TestContext;
 use crate::wire::records::{batch, now_ms};
@@ -213,6 +216,589 @@ pub async fn test_idempotent_reinit_with_an_old_producer_id_gets_a_new_one() -> 
         .await?;
     assert_eq!(code, NONE, "the new id produces from sequence 0");
     println!("✅ every re-init got a fresh producer id\n");
+
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// The empty group id, as Kafka 3.7 answers it (`GroupCoordinator.isValidGroupId`):
+/// JoinGroup, Heartbeat, SyncGroup, LeaveGroup and TxnOffsetCommit refuse it with
+/// INVALID_GROUP_ID and change nothing, while AddOffsetsToTxn and DescribeGroups take it.
+/// TxnOffsetCommit refuses it before any transaction check (no AddPartitionsToTxn yet, an
+/// Ongoing transaction, the group added) and answers a partition that does not exist
+/// UNKNOWN_TOPIC_OR_PARTITION.
+pub async fn test_empty_group_id_is_invalid_group_id() -> TestResult {
+    use kafka_protocol::messages::describe_groups_request::DescribeGroupsRequest;
+    use kafka_protocol::messages::describe_groups_response::DescribeGroupsResponse;
+    use kafka_protocol::messages::heartbeat_request::HeartbeatRequest;
+    use kafka_protocol::messages::heartbeat_response::HeartbeatResponse;
+    use kafka_protocol::messages::join_group_request::{
+        JoinGroupRequest, JoinGroupRequestProtocol,
+    };
+    use kafka_protocol::messages::join_group_response::JoinGroupResponse;
+    use kafka_protocol::messages::leave_group_request::{LeaveGroupRequest, MemberIdentity};
+    use kafka_protocol::messages::leave_group_response::LeaveGroupResponse;
+    use kafka_protocol::messages::sync_group_request::SyncGroupRequest;
+    use kafka_protocol::messages::sync_group_response::SyncGroupResponse;
+    use kafka_protocol::messages::txn_offset_commit_request::{
+        TxnOffsetCommitRequest, TxnOffsetCommitRequestPartition, TxnOffsetCommitRequestTopic,
+    };
+    use kafka_protocol::messages::txn_offset_commit_response::TxnOffsetCommitResponse;
+    use kafka_protocol::messages::TransactionalId;
+
+    println!("=== Test: the empty group id is INVALID_GROUP_ID ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = TestTopicBuilder::new(&ctx, "parity-empty-group")
+        .build()
+        .await?
+        .name;
+    let txn = ctx.unique_group("parity-empty-group-txn").await;
+    let missing = ctx.unique_topic("parity-empty-group-missing").await;
+    let empty = || GroupId(StrBytes::from_static_str(""));
+    let member = || StrBytes::from_static_str("zz");
+    let mut wire = Wire::connect().await?;
+
+    println!("Step 1: group membership APIs with group id \"\"...");
+    let mut join = JoinGroupRequest::default();
+    join.group_id = empty();
+    join.session_timeout_ms = 10_000;
+    join.rebalance_timeout_ms = 10_000;
+    join.member_id = member();
+    join.protocol_type = StrBytes::from_static_str("consumer");
+    let mut protocol = JoinGroupRequestProtocol::default();
+    protocol.name = StrBytes::from_static_str("range");
+    join.protocols = vec![protocol];
+    let joined: JoinGroupResponse = wire.call(5, &join).await?;
+    assert_eq!(
+        (
+            joined.error_code,
+            joined.generation_id,
+            joined.member_id.as_str()
+        ),
+        (INVALID_GROUP_ID, -1, "zz"),
+        "JoinGroup echoes the member id"
+    );
+    assert_eq!(
+        joined.protocol_name.as_deref(),
+        Some(""),
+        "protocol_name is not nullable before v7"
+    );
+    join.member_id = StrBytes::from_static_str("");
+    let joined: JoinGroupResponse = wire.call(5, &join).await?;
+    assert_eq!(
+        (joined.error_code, joined.member_id.as_str()),
+        (INVALID_GROUP_ID, ""),
+        "JoinGroup without a member id"
+    );
+
+    let mut heartbeat = HeartbeatRequest::default();
+    heartbeat.group_id = empty();
+    heartbeat.generation_id = 1;
+    heartbeat.member_id = member();
+    let beat: HeartbeatResponse = wire.call(3, &heartbeat).await?;
+    assert_eq!(beat.error_code, INVALID_GROUP_ID, "Heartbeat");
+
+    let mut sync = SyncGroupRequest::default();
+    sync.group_id = empty();
+    sync.generation_id = 1;
+    sync.member_id = member();
+    let synced: SyncGroupResponse = wire.call(3, &sync).await?;
+    assert_eq!(
+        (synced.error_code, synced.assignment.len()),
+        (INVALID_GROUP_ID, 0),
+        "SyncGroup"
+    );
+
+    let mut leave = LeaveGroupRequest::default();
+    leave.group_id = empty();
+    let mut leaving = MemberIdentity::default();
+    leaving.member_id = member();
+    leave.members = vec![leaving];
+    let left: LeaveGroupResponse = wire.call(3, &leave).await?;
+    assert_eq!(
+        (left.error_code, left.members.len()),
+        (INVALID_GROUP_ID, 0),
+        "LeaveGroup v3 answers at the top level"
+    );
+
+    // Nothing joined: the group "" does not exist.
+    let mut describe = DescribeGroupsRequest::default();
+    describe.groups = vec![empty()];
+    let described: DescribeGroupsResponse = wire.call(0, &describe).await?;
+    let group = &described.groups[0];
+    assert_eq!(
+        (
+            group.error_code,
+            group.group_state.as_str(),
+            group.members.len()
+        ),
+        (NONE, "Dead", 0),
+        "DescribeGroups takes \"\" and finds no group"
+    );
+    println!("✅ INVALID_GROUP_ID, no group created\n");
+
+    println!("Step 2: TxnOffsetCommit with group id \"\" through a transaction...");
+    let txn_offset_commit = |producer_id: i64, epoch: i16| {
+        let partition = |partition_index| {
+            let mut p = TxnOffsetCommitRequestPartition::default();
+            p.partition_index = partition_index;
+            p.committed_offset = 5;
+            p.committed_leader_epoch = -1;
+            p
+        };
+        let topic_entry = |name: &str, partitions: &[i32]| {
+            let mut t = TxnOffsetCommitRequestTopic::default();
+            t.name = TopicName(StrBytes::from_string(name.to_string()));
+            t.partitions = partitions.iter().copied().map(partition).collect();
+            t
+        };
+        let mut req = TxnOffsetCommitRequest::default();
+        req.transactional_id = TransactionalId(StrBytes::from_string(txn.clone()));
+        req.group_id = empty();
+        req.producer_id = ProducerId(producer_id);
+        req.producer_epoch = epoch;
+        req.generation_id = 5;
+        req.member_id = member();
+        req.topics = vec![topic_entry(&topic, &[0, 7]), topic_entry(&missing, &[0])];
+        req
+    };
+    let codes = |resp: TxnOffsetCommitResponse| -> Vec<(String, i32, i16)> {
+        resp.topics
+            .iter()
+            .flat_map(|t| {
+                t.partitions
+                    .iter()
+                    .map(move |p| (t.name.to_string(), p.partition_index, p.error_code))
+            })
+            .collect()
+    };
+    let expected = vec![
+        (topic.clone(), 0, INVALID_GROUP_ID),
+        (topic.clone(), 7, UNKNOWN_TOPIC_OR_PARTITION),
+        (missing.clone(), 0, UNKNOWN_TOPIC_OR_PARTITION),
+    ];
+
+    let unknown: TxnOffsetCommitResponse = wire.call(3, &txn_offset_commit(999_999, 3)).await?;
+    assert_eq!(codes(unknown), expected, "a producer the broker never saw");
+    let (code, producer_id, epoch) = wire.init_producer_id(Some(&txn), 60_000).await?;
+    assert_eq!(code, NONE);
+    let before_add: TxnOffsetCommitResponse =
+        wire.call(3, &txn_offset_commit(producer_id, epoch)).await?;
+    assert_eq!(codes(before_add), expected, "before AddPartitionsToTxn");
+    assert_eq!(
+        wire.add_partitions(&txn, producer_id, epoch, &[(topic.as_str(), &[0])])
+            .await?,
+        vec![(topic.clone(), 0, NONE)]
+    );
+    let ongoing: TxnOffsetCommitResponse =
+        wire.call(3, &txn_offset_commit(producer_id, epoch)).await?;
+    assert_eq!(codes(ongoing), expected, "Ongoing, group not added");
+    let fenced: TxnOffsetCommitResponse = wire
+        .call(3, &txn_offset_commit(producer_id, epoch + 1))
+        .await?;
+    assert_eq!(codes(fenced), expected, "a wrong epoch");
+    assert_eq!(
+        wire.add_offsets(&txn, producer_id, epoch, "").await?,
+        NONE,
+        "AddOffsetsToTxn takes \"\""
+    );
+    let added: TxnOffsetCommitResponse =
+        wire.call(3, &txn_offset_commit(producer_id, epoch)).await?;
+    assert_eq!(codes(added), expected, "after AddOffsetsToTxn(\"\")");
+    assert_eq!(wire.end_txn(&txn, producer_id, epoch, true).await?, NONE);
+    let (code, offsets) = wire.offset_fetch("", &topic, &[0], false).await?;
+    assert_eq!(
+        (code, offsets),
+        (NONE, vec![(0, -1, NONE)]),
+        "nothing committed"
+    );
+    println!("✅ INVALID_GROUP_ID before every transaction check, nothing committed\n");
+
+    println!("=== Database Verification ===\n");
+    let stored: i64 = ctx
+        .db()
+        .query_one(
+            "SELECT (SELECT COUNT(*) FROM kafka.consumer_offsets o JOIN kafka.topics t
+                       ON o.topic_id = t.id WHERE t.name = $1)
+                  + (SELECT COUNT(*) FROM kafka.txn_pending_offsets WHERE transactional_id = $2)",
+            &[&topic, &txn],
+        )
+        .await?
+        .get(0);
+    assert_eq!(stored, 0, "no committed or pending offsets");
+    println!("✅ No offsets stored\n");
+
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// TxnOffsetCommit v3 of offset 5 to `entries` (`(topic, partitions)`), as a member of
+/// `generation`: the `(topic, partition, error)` of each answered partition.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one argument per TxnOffsetCommit field the test varies"
+)]
+async fn txn_offset_commit_v3(
+    wire: &mut Wire,
+    transactional_id: &str,
+    group: &str,
+    producer_id: i64,
+    epoch: i16,
+    generation: i32,
+    member: &str,
+    entries: &[(&str, &[i32])],
+) -> crate::common::DynResult<Vec<(String, i32, i16)>> {
+    use kafka_protocol::messages::txn_offset_commit_request::{
+        TxnOffsetCommitRequest, TxnOffsetCommitRequestPartition, TxnOffsetCommitRequestTopic,
+    };
+    use kafka_protocol::messages::txn_offset_commit_response::TxnOffsetCommitResponse;
+    use kafka_protocol::messages::TransactionalId;
+    let mut req = TxnOffsetCommitRequest::default();
+    req.transactional_id = TransactionalId(StrBytes::from_string(transactional_id.to_string()));
+    req.group_id = GroupId(StrBytes::from_string(group.to_string()));
+    req.producer_id = ProducerId(producer_id);
+    req.producer_epoch = epoch;
+    req.generation_id = generation;
+    req.member_id = StrBytes::from_string(member.to_string());
+    req.topics = entries
+        .iter()
+        .map(|(name, partitions)| {
+            let mut t = TxnOffsetCommitRequestTopic::default();
+            t.name = TopicName(StrBytes::from_string(name.to_string()));
+            t.partitions = partitions
+                .iter()
+                .map(|&partition_index| {
+                    let mut p = TxnOffsetCommitRequestPartition::default();
+                    p.partition_index = partition_index;
+                    p.committed_offset = 5;
+                    p.committed_leader_epoch = -1;
+                    p
+                })
+                .collect();
+            t
+        })
+        .collect();
+    let resp: TxnOffsetCommitResponse = wire.call(3, &req).await?;
+    Ok(resp
+        .topics
+        .iter()
+        .flat_map(|t| {
+            t.partitions
+                .iter()
+                .map(move |p| (t.name.to_string(), p.partition_index, p.error_code))
+        })
+        .collect())
+}
+
+/// A refused TxnOffsetCommit answers a partition that does not exist
+/// UNKNOWN_TOPIC_OR_PARTITION and the refusal's code only on the partitions that exist, as
+/// Kafka 3.7 does (it filters unknown partitions out before it asks the coordinator), for
+/// every refusal: an unknown producer, an Empty transaction, a group not added, a fenced
+/// epoch, a stale member. Nothing is stored.
+pub async fn test_refused_txn_offset_commit_answers_unknown_partitions() -> TestResult {
+    println!("=== Test: a refused TxnOffsetCommit answers unknown partitions 3 ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = TestTopicBuilder::new(&ctx, "parity-txn-refused")
+        .build()
+        .await?
+        .name;
+    let missing = ctx.unique_topic("parity-txn-refused-missing").await;
+    let group = ctx.unique_group("parity-txn-refused").await;
+    let txn = ctx.unique_group("parity-txn-refused-txn").await;
+    let entries: [(&str, &[i32]); 2] = [(&topic, &[0, 7]), (&missing, &[0])];
+    let answered = |code| {
+        vec![
+            (topic.clone(), 0, code),
+            (topic.clone(), 7, UNKNOWN_TOPIC_OR_PARTITION),
+            (missing.clone(), 0, UNKNOWN_TOPIC_OR_PARTITION),
+        ]
+    };
+    let mut wire = Wire::connect().await?;
+
+    println!("Step 1: refusals before the transaction is Ongoing...");
+    let unknown =
+        txn_offset_commit_v3(&mut wire, &txn, &group, 999_999, 3, -1, "", &entries).await?;
+    assert_eq!(
+        unknown,
+        answered(INVALID_PRODUCER_ID_MAPPING),
+        "unknown producer"
+    );
+    let (code, producer_id, epoch) = wire.init_producer_id(Some(&txn), 60_000).await?;
+    assert_eq!(code, NONE);
+    let empty = txn_offset_commit_v3(
+        &mut wire,
+        &txn,
+        &group,
+        producer_id,
+        epoch,
+        -1,
+        "",
+        &entries,
+    )
+    .await?;
+    assert_eq!(empty, answered(INVALID_TXN_STATE), "Empty transaction");
+
+    println!("Step 2: refusals of an Ongoing transaction...");
+    assert_eq!(
+        wire.add_partitions(&txn, producer_id, epoch, &[(topic.as_str(), &[0])])
+            .await?,
+        vec![(topic.clone(), 0, NONE)]
+    );
+    let not_added = txn_offset_commit_v3(
+        &mut wire,
+        &txn,
+        &group,
+        producer_id,
+        epoch,
+        -1,
+        "",
+        &entries,
+    )
+    .await?;
+    assert_eq!(not_added, answered(INVALID_TXN_STATE), "group not added");
+    let fenced = txn_offset_commit_v3(
+        &mut wire,
+        &txn,
+        &group,
+        producer_id,
+        epoch + 1,
+        -1,
+        "",
+        &entries,
+    )
+    .await?;
+    assert_eq!(fenced, answered(INVALID_PRODUCER_EPOCH), "fenced epoch");
+    let wrong_id = txn_offset_commit_v3(
+        &mut wire,
+        &txn,
+        &group,
+        producer_id + 1,
+        epoch,
+        -1,
+        "",
+        &entries,
+    )
+    .await?;
+    assert_eq!(
+        wrong_id,
+        answered(INVALID_PRODUCER_ID_MAPPING),
+        "another producer id"
+    );
+    assert_eq!(
+        wire.add_offsets(&txn, producer_id, epoch, &group).await?,
+        NONE
+    );
+    let zombie = txn_offset_commit_v3(
+        &mut wire,
+        &txn,
+        &group,
+        producer_id,
+        epoch,
+        5,
+        "zombie",
+        &entries,
+    )
+    .await?;
+    assert_eq!(zombie, answered(UNKNOWN_MEMBER_ID), "stale member");
+    println!("✅ Every refusal answers only the partitions that exist\n");
+
+    println!("=== Database Verification ===\n");
+    let pending: i64 = ctx
+        .db()
+        .query_one(
+            "SELECT COUNT(*) FROM kafka.txn_pending_offsets WHERE transactional_id = $1",
+            &[&txn],
+        )
+        .await?
+        .get(0);
+    assert_eq!(pending, 0, "no pending offsets");
+    assert_eq!(wire.end_txn(&txn, producer_id, epoch, false).await?, NONE);
+    println!("✅ Nothing stored\n");
+
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// OffsetCommit v8 of `offset` to `entries` (`(topic, partitions)`) as `member` of
+/// `generation`: the `(topic, partition, error)` of each answered partition.
+async fn offset_commit_v8(
+    wire: &mut Wire,
+    group: &str,
+    generation: i32,
+    member: &str,
+    offset: i64,
+    entries: &[(&str, &[i32])],
+) -> crate::common::DynResult<Vec<(String, i32, i16)>> {
+    let mut req = OffsetCommitRequest::default();
+    req.group_id = GroupId(StrBytes::from_string(group.to_string()));
+    req.generation_id_or_member_epoch = generation;
+    req.member_id = StrBytes::from_string(member.to_string());
+    req.topics = entries
+        .iter()
+        .map(|(name, partitions)| {
+            let mut t = OffsetCommitRequestTopic::default();
+            t.name = TopicName(StrBytes::from_string(name.to_string()));
+            t.partitions = partitions
+                .iter()
+                .map(|&partition_index| {
+                    let mut p = OffsetCommitRequestPartition::default();
+                    p.partition_index = partition_index;
+                    p.committed_offset = offset;
+                    p.committed_leader_epoch = -1;
+                    p
+                })
+                .collect();
+            t
+        })
+        .collect();
+    let resp: OffsetCommitResponse = wire.call(8, &req).await?;
+    Ok(resp
+        .topics
+        .iter()
+        .flat_map(|t| {
+            t.partitions
+                .iter()
+                .map(move |p| (t.name.to_string(), p.partition_index, p.error_code))
+        })
+        .collect())
+}
+
+/// The committed offset of `group` on partition 0 of `topic` (-1 for none), read from the
+/// database.
+async fn committed_offset(
+    ctx: &TestContext,
+    group: &str,
+    topic: &str,
+) -> crate::common::DynResult<i64> {
+    Ok(ctx
+        .db()
+        .query_one(
+            "SELECT COALESCE(MAX(o.committed_offset), -1) FROM kafka.consumer_offsets o
+               JOIN kafka.topics t ON o.topic_id = t.id
+              WHERE o.group_id = $1 AND t.name = $2 AND o.partition_id = 0",
+            &[&group, &topic],
+        )
+        .await?
+        .get(0))
+}
+
+/// OffsetCommit with a generation >= 0, as Kafka 3.7 answers it: ILLEGAL_GENERATION for a
+/// group with neither members nor offsets, UNKNOWN_MEMBER_ID for a group known only by its
+/// committed offsets (an Empty group in Kafka), ILLEGAL_GENERATION for a stale generation of
+/// a live group; generation -1 commits to a group without members. Refused commits store
+/// nothing.
+pub async fn test_offset_commit_generation_for_offsets_only_group() -> TestResult {
+    use kafka_protocol::messages::join_group_request::{
+        JoinGroupRequest, JoinGroupRequestProtocol,
+    };
+    use kafka_protocol::messages::join_group_response::JoinGroupResponse;
+    use kafka_protocol::messages::sync_group_request::SyncGroupRequest;
+    use kafka_protocol::messages::sync_group_response::SyncGroupResponse;
+
+    println!("=== Test: OffsetCommit generation for an offsets-only group ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = TestTopicBuilder::new(&ctx, "parity-offsets-only")
+        .build()
+        .await?
+        .name;
+    let group = ctx.unique_group("parity-offsets-only").await;
+    let live = ctx.unique_group("parity-offsets-live").await;
+    let entries: [(&str, &[i32]); 1] = [(&topic, &[0])];
+    let answered = |code| vec![(topic.clone(), 0, code)];
+    let mut wire = Wire::connect().await?;
+
+    println!("Step 1: a group with neither members nor offsets...");
+    let unknown = offset_commit_v8(&mut wire, &group, 5, "zz", 1, &entries).await?;
+    assert_eq!(unknown, answered(ILLEGAL_GENERATION), "no such group");
+    assert_eq!(committed_offset(&ctx, &group, &topic).await?, -1);
+
+    println!("Step 2: generation -1 commits, then the group is known by its offsets...");
+    let simple = offset_commit_v8(&mut wire, &group, -1, "", 1, &entries).await?;
+    assert_eq!(simple, answered(NONE), "generation -1");
+    assert_eq!(committed_offset(&ctx, &group, &topic).await?, 1);
+    let member = offset_commit_v8(&mut wire, &group, 5, "zz", 2, &entries).await?;
+    assert_eq!(
+        member,
+        answered(UNKNOWN_MEMBER_ID),
+        "offsets-only, generation 5"
+    );
+    let no_member = offset_commit_v8(&mut wire, &group, 0, "", 2, &entries).await?;
+    assert_eq!(
+        no_member,
+        answered(UNKNOWN_MEMBER_ID),
+        "offsets-only, generation 0"
+    );
+    assert_eq!(
+        committed_offset(&ctx, &group, &topic).await?,
+        1,
+        "refused commits store nothing"
+    );
+
+    println!("Step 3: a stale generation of a live group...");
+    let mut join = JoinGroupRequest::default();
+    join.group_id = GroupId(StrBytes::from_string(live.clone()));
+    join.session_timeout_ms = 30_000;
+    join.rebalance_timeout_ms = 30_000;
+    join.protocol_type = StrBytes::from_static_str("consumer");
+    let mut protocol = JoinGroupRequestProtocol::default();
+    protocol.name = StrBytes::from_static_str("range");
+    join.protocols = vec![protocol];
+    let joined: JoinGroupResponse = wire.call(3, &join).await?;
+    assert_eq!(joined.error_code, NONE);
+    let mut sync = SyncGroupRequest::default();
+    sync.group_id = join.group_id.clone();
+    sync.generation_id = joined.generation_id;
+    sync.member_id = joined.member_id.clone();
+    let synced: SyncGroupResponse = wire.call(3, &sync).await?;
+    assert_eq!(synced.error_code, NONE);
+    let member_id = joined.member_id.to_string();
+    let stale = offset_commit_v8(
+        &mut wire,
+        &live,
+        joined.generation_id + 1,
+        &member_id,
+        1,
+        &entries,
+    )
+    .await?;
+    assert_eq!(stale, answered(ILLEGAL_GENERATION), "stale generation");
+    assert_eq!(committed_offset(&ctx, &live, &topic).await?, -1);
+    println!("✅ 22 / 0 / 25 / 22 as Kafka answers them\n");
+
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// A refused OffsetCommit answers a partition that does not exist
+/// UNKNOWN_TOPIC_OR_PARTITION and the refusal's code only on the partitions that exist, as
+/// Kafka 3.7 does (it filters unknown partitions out before it asks the coordinator).
+pub async fn test_refused_offset_commit_answers_unknown_partitions() -> TestResult {
+    println!("=== Test: a refused OffsetCommit answers unknown partitions 3 ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = TestTopicBuilder::new(&ctx, "parity-commit-refused")
+        .build()
+        .await?
+        .name;
+    let missing = ctx.unique_topic("parity-commit-refused-missing").await;
+    let group = ctx.unique_group("parity-commit-refused").await;
+    let entries: [(&str, &[i32]); 2] = [(&topic, &[0, 7]), (&missing, &[0])];
+    let answered = |code| {
+        vec![
+            (topic.clone(), 0, code),
+            (topic.clone(), 7, UNKNOWN_TOPIC_OR_PARTITION),
+            (missing.clone(), 0, UNKNOWN_TOPIC_OR_PARTITION),
+        ]
+    };
+    let mut wire = Wire::connect().await?;
+
+    let unknown = offset_commit_v8(&mut wire, &group, 5, "zz", 1, &entries).await?;
+    assert_eq!(unknown, answered(ILLEGAL_GENERATION), "no such group");
+    assert_eq!(committed_offset(&ctx, &group, &topic).await?, -1);
+    println!("✅ ILLEGAL_GENERATION only where the partition exists\n");
 
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");
