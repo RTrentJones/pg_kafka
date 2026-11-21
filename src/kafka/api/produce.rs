@@ -509,7 +509,7 @@ fn decode_records(
             });
         }
         drop(refusals);
-        if !partitions.is_empty() || topic.partition_data.is_empty() {
+        if !partitions.is_empty() {
             topic_data.push(TopicProduceData { name, partitions });
         }
     }
@@ -724,7 +724,7 @@ struct OneEntryPerPartition {
 /// (records or none), or failing that the last one, which is refused as it decodes; when
 /// an entry validation accepts is kept, the last refused entry's error is its answer
 /// (`refused_entries`). Topic entries of one name merge into the first, a partition at
-/// the place of its first entry.
+/// the place of its first entry; a topic left with no partition entry is dropped.
 ///
 /// A request of distinct partitions in increasing order per topic, what clients send, is
 /// kept as it is. Otherwise what this holds besides the request is some 30 bytes per
@@ -760,6 +760,11 @@ fn last_entry_per_partition(
         });
     }
     drop(first_of);
+    // A topic none of whose entries names a partition is not answered at all: Kafka 3.7
+    // answers each partition it was sent and nothing else, so it neither answers nor
+    // auto-creates such a topic, whether the request is written, refused (invalid acks,
+    // a transactional request) or sent with acks=0.
+    topics.retain(|t| !t.partition_data.is_empty());
     let mut refused_entries = Vec::new();
     for topic in &mut topics {
         let name = topic.name.0.as_str();
@@ -1912,7 +1917,6 @@ mod tests {
         let want: Kept<'_> = vec![
             ("a".into(), vec![(0, b"3"), (1, b"5"), (2, b"6")]),
             ("b".into(), vec![(0, b"4")]),
-            ("c".into(), vec![]),
         ];
         assert_eq!(got, want);
     }
@@ -2185,6 +2189,61 @@ mod tests {
             .map(|r| (r.partition, r.error_code))
             .collect();
         assert_eq!(refused, vec![(0, ERROR_UNKNOWN_SERVER_ERROR)]);
+    }
+
+    /// Kafka 3.7 answers a Produce topic entry that names no partition with no entry at
+    /// all and does not create the topic (checked against a 3.7 broker, for acks -1, 0
+    /// and 5 and a transactional request): it is gone once decoded, so neither the
+    /// handler (which would auto-create it), the invalid-acks answer nor the echo of an
+    /// error response sees it. A name repeated with a partition elsewhere is answered for
+    /// that partition.
+    #[test]
+    fn a_topic_entry_without_partitions_is_dropped() {
+        let named = |name: &str, batches: Vec<bytes::Bytes>| {
+            let mut topic = topics(batches).remove(0);
+            topic.name = kafka_protocol::messages::TopicName(name.to_string().into());
+            topic
+        };
+        let header = RequestHeader {
+            api_key: 0,
+            api_version: 7,
+            correlation_id: 1,
+            client_id: None,
+        };
+        for (acks, transactional_id) in [(-1, None), (0, None), (5, None), (1, Some("tx"))] {
+            let mut wire = ProduceRequest::default();
+            wire.acks = acks;
+            wire.timeout_ms = 1000;
+            wire.transactional_id = transactional_id
+                .map(|id: &str| kafka_protocol::messages::TransactionalId(id.into()));
+            wire.topic_data = vec![
+                named("zp1", vec![]),
+                named("t", vec![]),
+                named("zp2", vec![]),
+                named("t", vec![value_batch(b"a")]),
+                named("zp1", vec![]),
+            ];
+            let request = ProduceApi::decode(wire, &header).expect("decodes");
+            let mut answered: Vec<String> = ProduceApi::echo(&request)
+                .into_iter()
+                .map(|(name, partitions)| format!("{name}{partitions:?}"))
+                .collect();
+            answered.extend(request.topic_data.iter().map(|t| t.name.clone()));
+            answered.extend(request.refused.iter().map(|r| r.topic.to_string()));
+            assert!(
+                answered.iter().all(|a| a.starts_with('t')),
+                "acks={acks}: {answered:?}"
+            );
+            assert_eq!(answered[0], "t[0]", "acks={acks}");
+        }
+
+        // Only entries without partitions: nothing to answer, nothing to create.
+        let mut wire = ProduceRequest::default();
+        wire.acks = -1;
+        wire.topic_data = vec![named("zp1", vec![]), named("zp2", vec![])];
+        let request = ProduceApi::decode(wire, &header).expect("decodes");
+        assert!(request.topic_data.is_empty() && request.refused.is_empty());
+        assert_eq!(ProduceApi::echo(&request), TopicPartitions::new());
     }
 
     #[test]

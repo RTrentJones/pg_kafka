@@ -12,12 +12,14 @@ mod basic;
 mod batch;
 mod invalid_names;
 mod timestamp;
+mod zero_partitions;
 
 /// The `producer` tests, in run order.
 pub fn tests() -> Vec<crate::registry::TestDef> {
     crate::test_defs!["producer";
         basic::test_producer,
         invalid_names::test_produce_to_an_invalid_topic_name_is_unknown_topic,
+        zero_partitions::test_produce_topic_entries_without_partitions_answer_nothing,
         batch::test_batch_produce,
         acks_zero::test_producer_acks_zero,
         ack_visibility::test_produce_ack_implies_committed_visibility: sequential, // Mutates global GUC (test_pre_commit_delay_ms)
