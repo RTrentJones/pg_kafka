@@ -8,13 +8,15 @@
 //!   cost's growth.
 //! - [`heap_peak`]: the most heap memory a closure held at once, for tests that bound
 //!   what a decode holds.
+//! - [`heap_allocated`]: the heap memory a closure allocated in all, for tests that bound
+//!   what it copies.
 
 #![cfg(test)]
 
 pub mod heap;
 pub mod mocks;
 
-pub use heap::heap_peak;
+pub use heap::{heap_allocated, heap_peak};
 
 use crate::kafka::error::Result;
 use crate::kafka::storage::{KafkaStore, TopicMetadata};

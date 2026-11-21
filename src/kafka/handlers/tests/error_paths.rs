@@ -235,6 +235,33 @@ fn list_offsets_repeated_partition_is_invalid_request() {
         }));
 }
 
+/// Repeated partitions of a long topic name cost nothing per entry: the 2,500 repeated
+/// partitions of a 32 KB name each held a copy of the name (80 MB), so a 1 MB request
+/// could make the DB thread allocate a gigabyte.
+#[test]
+fn list_offsets_repeated_partitions_do_not_copy_the_name() {
+    let name = "n".repeat(32 * 1024);
+    let mut store = MockKafkaStore::new();
+    expect_topics(&mut store, |_| Ok(Some((1, 1 << 20))));
+    let partitions: Vec<(i32, i64)> = (0..5_000).map(|i| (i / 2, -1)).collect();
+    let topics = vec![list_topic(&name, &partitions)];
+    let (resp, peak) = crate::testing::heap_peak(|| {
+        with_ctx(&store, |ctx| {
+            handle_list_offsets(
+                ctx,
+                topics,
+                crate::kafka::storage::IsolationLevel::ReadUncommitted,
+            )
+        })
+    });
+    let resp = resp.unwrap();
+    assert!(resp.topics[0]
+        .partitions
+        .iter()
+        .all(|p| p.error_code == ERROR_INVALID_REQUEST));
+    assert!(peak < 4 << 20, "held {peak} bytes besides the request");
+}
+
 // ========== DescribeGroups ==========
 
 #[test]

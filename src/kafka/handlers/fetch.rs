@@ -591,17 +591,32 @@ pub fn handle_list_offsets(
             *named.entry((&topic.name, p.partition_index)).or_default() += 1;
         }
     }
-    let repeated: HashSet<(String, i32)> = named
-        .into_iter()
-        .filter(|&(_, n)| n > 1)
-        .map(|((name, partition), _)| (name.to_string(), partition))
+    // The repeated partitions of each topic entry, by entry position: keyed by the entry
+    // rather than by a copy of its name, so a long name repeated over many partitions
+    // costs nothing per partition.
+    let repeated: Vec<HashSet<i32>> = topics
+        .iter()
+        .map(|topic| {
+            topic
+                .partitions
+                .iter()
+                .map(|p| p.partition_index)
+                .filter(|&partition| {
+                    named
+                        .get(&(topic.name.as_str(), partition))
+                        .is_some_and(|&n| n > 1)
+                })
+                .collect()
+        })
         .collect();
+    drop(named);
     let resolved = resolve_topics(ctx.store, topics.iter().map(|t| t.name.as_str()));
     let mut kafka_response = ListOffsetsResponse::default();
     kafka_response.throttle_time_ms = 0;
     kafka_response.topics = topics
         .into_iter()
-        .map(|topic| {
+        .zip(repeated)
+        .map(|(topic, repeated)| {
             let found = match &resolved {
                 Ok(found) => Ok(found.get(&topic.name).copied()),
                 Err(code) => Err(*code),
@@ -610,9 +625,7 @@ pub fn handle_list_offsets(
                 .partitions
                 .iter()
                 .map(|p| {
-                    if !repeated.is_empty()
-                        && repeated.contains(&(topic.name.clone(), p.partition_index))
-                    {
+                    if repeated.contains(&p.partition_index) {
                         return list_offsets_error(p.partition_index, ERROR_INVALID_REQUEST);
                     }
                     match found {

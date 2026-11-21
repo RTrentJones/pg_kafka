@@ -168,6 +168,9 @@ fn commit_partition(partition_index: i32, error_code: i16) -> OffsetCommitRespon
     partition
 }
 
+/// The partitions of each topic, by name, with a pending transactional offset commit.
+type Unstable = HashMap<String, HashSet<i32>>;
+
 /// Handle OffsetFetch request
 ///
 /// Fetches committed offsets for a consumer group
@@ -184,14 +187,12 @@ pub fn handle_offset_fetch(
 ) -> Result<OffsetFetchResponse> {
     let store = ctx.store;
     // Partitions with a pending transactional commit (require_stable only).
-    let unstable: HashSet<(String, i32)> = if require_stable {
-        store
-            .pending_txn_offset_partitions(group_id)?
-            .into_iter()
-            .collect()
-    } else {
-        HashSet::new()
-    };
+    let mut unstable = Unstable::new();
+    if require_stable {
+        for (topic, partition) in store.pending_txn_offset_partitions(group_id)? {
+            unstable.entry(topic).or_default().insert(partition);
+        }
+    }
 
     let mut kafka_response = OffsetFetchResponse::default();
     kafka_response.throttle_time_ms = 0;
@@ -219,7 +220,7 @@ fn fetch_requested_offsets(
     store: &dyn KafkaStore,
     group_id: &str,
     topics: Vec<OffsetFetchTopicData>,
-    unstable: &HashSet<(String, i32)>,
+    unstable: &Unstable,
 ) -> Vec<OffsetFetchResponseTopic> {
     let topics = merge_by_partition(
         topics.into_iter().map(|t| (t.name, t.partition_indexes)),
@@ -227,15 +228,21 @@ fn fetch_requested_offsets(
     );
     let resolved = resolve_topics(store, topics.iter().map(|(name, _)| name.as_str()));
     let any_found = resolved.as_ref().is_ok_and(|found| !found.is_empty());
-    let committed: std::result::Result<HashMap<(String, i32), CommittedOffset>, i16> = if any_found
-    {
+    // By topic name, then partition: an entry is looked up by the name it already holds,
+    // never by a copy of it per partition.
+    type Committed = HashMap<String, HashMap<i32, CommittedOffset>>;
+    let committed: std::result::Result<Committed, i16> = if any_found {
         store
             .fetch_all_offsets(group_id)
             .map(|offsets| {
-                offsets
-                    .into_iter()
-                    .map(|(topic, partition, offset)| ((topic, partition), offset))
-                    .collect()
+                let mut committed = Committed::new();
+                for (topic, partition, offset) in offsets {
+                    committed
+                        .entry(topic)
+                        .or_default()
+                        .insert(partition, offset);
+                }
+                committed
             })
             .map_err(|e| {
                 crate::pg_warning!("Failed to fetch offsets for group='{}': {}", group_id, e);
@@ -254,21 +261,24 @@ fn fetch_requested_offsets(
                 Ok(_) => Some(ERROR_UNKNOWN_TOPIC_OR_PARTITION),
                 Err(code) => Some(*code),
             };
+            let topic_unstable = unstable.get(&name);
+            let topic_committed = committed.as_ref().ok().and_then(|c| c.get(&name));
             let partitions = partition_indexes
                 .into_iter()
                 .map(|partition_index| {
                     if let Some(code) = topic_error {
                         return offset_partition(partition_index, code, None);
                     }
-                    let key = (name.clone(), partition_index);
-                    if unstable.contains(&key) {
+                    if topic_unstable.is_some_and(|u| u.contains(&partition_index)) {
                         return offset_partition(
                             partition_index,
                             ERROR_UNSTABLE_OFFSET_COMMIT,
                             None,
                         );
                     }
-                    let offset = committed.as_ref().ok().and_then(|c| c.get(&key)).cloned();
+                    let offset = topic_committed
+                        .and_then(|c| c.get(&partition_index))
+                        .cloned();
                     offset_partition(partition_index, ERROR_NONE, offset)
                 })
                 .collect();
@@ -284,7 +294,7 @@ fn fetch_requested_offsets(
 fn fetch_all_group_offsets(
     store: &dyn KafkaStore,
     group_id: &str,
-    unstable: &HashSet<(String, i32)>,
+    unstable: &Unstable,
 ) -> std::result::Result<Vec<OffsetFetchResponseTopic>, i16> {
     let offsets = store.fetch_all_offsets(group_id).map_err(|e| {
         crate::pg_warning!(
@@ -296,7 +306,10 @@ fn fetch_all_group_offsets(
     })?;
     let mut by_topic: HashMap<String, Vec<OffsetFetchResponsePartition>> = HashMap::new();
     for (topic_name, partition_id, committed) in offsets {
-        let partition = if unstable.contains(&(topic_name.clone(), partition_id)) {
+        let pending = unstable
+            .get(&topic_name)
+            .is_some_and(|u| u.contains(&partition_id));
+        let partition = if pending {
             offset_partition(partition_id, ERROR_UNSTABLE_OFFSET_COMMIT, None)
         } else {
             offset_partition(partition_id, ERROR_NONE, Some(committed))
@@ -503,6 +516,35 @@ mod tests {
             .map(|p| (p.partition_index, p.error_code))
             .collect();
         assert_eq!(parts, [(0, ERROR_NONE), (1, ERROR_NONE)]);
+    }
+
+    /// The partitions of an OffsetFetch topic entry cost nothing per partition in its
+    /// name's length: each looked its committed offset up by a copy of the name, so a 1 MB
+    /// request naming a 32 KB topic with 200,000 partitions copied 6 GB on the DB thread
+    /// (5,000 partitions: 160 MB).
+    #[test]
+    fn test_offset_fetch_partitions_do_not_copy_the_name() {
+        use crate::kafka::messages::OffsetFetchTopicData;
+        let name = "n".repeat(32 * 1024);
+        let mut store = MockKafkaStore::new();
+        crate::testing::expect_topics(&mut store, |_| Ok(Some((1, i32::MAX))));
+        store
+            .expect_fetch_all_offsets()
+            .returning(|_| Ok(Vec::new()));
+        store
+            .expect_pending_txn_offset_partitions()
+            .returning(|_| Ok(Vec::new()));
+        let env = TestEnv::new();
+        let ctx = env.ctx(&store);
+        let topics = vec![OffsetFetchTopicData {
+            name,
+            partition_indexes: (0..5_000).collect(),
+        }];
+        let (resp, allocated) = crate::testing::heap_allocated(|| {
+            handle_offset_fetch(&ctx, "g", Some(topics), true).unwrap()
+        });
+        assert_eq!(resp.topics[0].partitions.len(), 5_000);
+        assert!(allocated < 4 << 20, "allocated {allocated} bytes");
     }
 
     /// OffsetFetch answers each distinct partition once and reads the group's offsets in

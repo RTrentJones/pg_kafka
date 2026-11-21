@@ -12,12 +12,15 @@ thread_local! {
     static LIVE: Cell<isize> = const { Cell::new(0) };
     /// The most `LIVE` reached since [`heap_peak`] reset it.
     static PEAK: Cell<isize> = const { Cell::new(0) };
+    /// Bytes this thread ever allocated, freed or not.
+    static ALLOCATED: Cell<usize> = const { Cell::new(0) };
 }
 
 fn grow(bytes: usize) {
-    let bytes = isize::try_from(bytes).unwrap_or(isize::MAX);
     // `try_with`: a thread being torn down has no counters left, and allocating then is
     // not measured.
+    let _ = ALLOCATED.try_with(|allocated| allocated.set(allocated.get().saturating_add(bytes)));
+    let bytes = isize::try_from(bytes).unwrap_or(isize::MAX);
     let _ = LIVE.try_with(|live| {
         let now = live.get().saturating_add(bytes);
         live.set(now);
@@ -88,9 +91,17 @@ pub fn heap_peak<R>(f: impl FnOnce() -> R) -> (R, usize) {
     (result, usize::try_from(peak - before).unwrap_or(0))
 }
 
+/// Run `f` on this thread and return its result with the bytes it allocated in all, freed
+/// or not: what it copied, for tests that bound copying that holds nothing for long.
+pub fn heap_allocated<R>(f: impl FnOnce() -> R) -> (R, usize) {
+    let before = ALLOCATED.with(Cell::get);
+    let result = f();
+    (result, ALLOCATED.with(Cell::get).saturating_sub(before))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::heap_peak;
+    use super::{heap_allocated, heap_peak};
 
     #[test]
     fn heap_peak_counts_what_a_closure_holds_at_once() {
@@ -105,5 +116,15 @@ mod tests {
             v.reserve_exact(3000);
         });
         assert_eq!(peak, 1000 + 4000, "a reallocation counts both blocks");
+    }
+
+    #[test]
+    fn heap_allocated_counts_what_a_closure_freed_too() {
+        let ((), allocated) = heap_allocated(|| {
+            for _ in 0..10 {
+                drop(vec![0u8; 1000]);
+            }
+        });
+        assert_eq!(allocated, 10_000);
     }
 }
