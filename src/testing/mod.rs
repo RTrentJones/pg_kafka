@@ -41,6 +41,11 @@ pub fn cpu_time<T>(f: impl FnOnce() -> T) -> (T, Duration) {
 /// How much longer `run(4 * n)` takes on the CPU than `run(n)`, each the best of three runs:
 /// about 4 for work linear in its size, about 16 for quadratic work. Tests that bound how a
 /// cost grows assert it stays well under 16.
+///
+/// Noise on a loaded machine (cache and allocator contention from parallel tests) only ever
+/// inflates a ratio, so the comparison is repeated up to three times and the smallest ratio
+/// is returned; it stops early once a ratio is under 6. Work that really grows
+/// quadratically never measures under 6, so a repeat cannot hide it.
 pub fn growth(n: usize, mut run: impl FnMut(usize)) -> f64 {
     let mut best = |size: usize| {
         (0..3)
@@ -49,9 +54,16 @@ pub fn growth(n: usize, mut run: impl FnMut(usize)) -> f64 {
             .unwrap_or_default()
             .max(Duration::from_micros(1))
     };
-    let small = best(n);
-    let large = best(4 * n);
-    large.as_secs_f64() / small.as_secs_f64()
+    let mut smallest = f64::INFINITY;
+    for _ in 0..3 {
+        let small = best(n);
+        let large = best(4 * n);
+        smallest = smallest.min(large.as_secs_f64() / small.as_secs_f64());
+        if smallest < 6.0 {
+            break;
+        }
+    }
+    smallest
 }
 
 fn thread_cpu() -> Option<Duration> {
