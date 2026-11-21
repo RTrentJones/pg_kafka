@@ -539,3 +539,207 @@ fn db_error(e: &tokio_postgres::Error) -> String {
         None => e.to_string(),
     }
 }
+
+/// Rows that reach the DEFAULT leaf while `create_message_partition` waits for its table
+/// locks (after it decided the leaf moves nothing) must not fail the pass: Postgres
+/// refuses `CREATE TABLE ... PARTITION OF` while the DEFAULT leaf holds rows of the new
+/// leaf's range (check_violation). The function re-checks once it holds
+/// `kafka.messages`, when no row can arrive any more, and moves the rows (or skips the
+/// leaf until the next pass).
+///
+/// The layout: the worker's furthest leaf ahead is dropped, so the next pass recreates
+/// it first. A session inserts a row for that range (it lands in DEFAULT) and keeps its
+/// transaction open: the row is invisible to the pass's check, and the session's
+/// `ROW EXCLUSIVE` lock on kafka.messages keeps the pass polling in
+/// `lock_message_tables` until the session commits.
+///
+/// Asserts: the pass succeeds, and the row ends up in the recreated leaf, moved by that
+/// pass or, if it found the schema lock taken and skipped the leaf, by the next; and with
+/// a session holding the schema lock SHARE (as a worker transaction does) during the
+/// race, the pass succeeds, skips the leaf leaving the row in DEFAULT, and the next pass
+/// moves it.
+pub async fn test_rows_reaching_default_during_leaf_lock_wait() -> TestResult {
+    into_test_result(rows_reaching_default_during_lock_wait().await)
+}
+
+async fn rows_reaching_default_during_lock_wait() -> SendResult<()> {
+    println!("=== Test: rows reaching DEFAULT while a new leaf waits for its locks ===\n");
+    let db = session().await?;
+    wait_for_serving_listener(&db, None, Duration::from_secs(30)).await?;
+    let topic = unique("default-race");
+    let topic_id: i32 = db
+        .query_one(
+            "INSERT INTO kafka.topics (name, partitions) VALUES ($1, 1) RETURNING id",
+            &[&topic],
+        )
+        .await
+        .map_err(boxed)?
+        .get(0);
+    let mut result = default_race(&db, topic_id, false).await;
+    if result.is_ok() {
+        db.execute(
+            "DELETE FROM kafka.messages WHERE topic_id = $1",
+            &[&topic_id],
+        )
+        .await
+        .map_err(boxed)?;
+        result = default_race(&db, topic_id, true).await;
+    }
+    // Clean up: the topic's rows go with it; a pass with no race restores the leaf.
+    db.execute("DELETE FROM kafka.topics WHERE id = $1", &[&topic_id])
+        .await
+        .map_err(boxed)?;
+    db.query("SELECT pg_kafka_run_partition_maintenance()", &[])
+        .await
+        .map_err(boxed)?;
+    result
+}
+
+/// One race for the worker's furthest leaf ahead; with `hold_schema_lock`, a session
+/// holds the schema lock SHARE throughout, so the pass cannot move the row.
+async fn default_race(db: &Client, topic_id: i32, hold_schema_lock: bool) -> SendResult<()> {
+    println!("--- schema lock held SHARE by another session: {hold_schema_lock} ---");
+    // The worker's furthest leaf ahead: [b + 2w, b + 3w) for the current bucket b.
+    let (leaf, lower): (String, String) = {
+        let row = db
+            .query_opt(
+                "SELECT p.partition_oid::regclass::text, p.lower_bound::text
+                 FROM kafka.message_partitions() p,
+                      LATERAL (SELECT current_setting('pg_kafka.message_partition_minutes')::bigint
+                                      * 60 AS w) s
+                 WHERE NOT p.is_default
+                   AND p.lower_bound = to_timestamp((floor(extract(epoch FROM now()) / s.w) + 2) * s.w)",
+                &[],
+            )
+            .await
+            .map_err(boxed)?
+            .ok_or("no leaf two widths ahead; did the worker run its partition maintenance?")?;
+        (row.get(0), row.get(1))
+    };
+    let dropped: bool = db
+        .query_one(
+            "SELECT dropped FROM kafka.drop_message_partition($1::text::regclass, '{}')",
+            &[&leaf],
+        )
+        .await
+        .map_err(boxed)?
+        .get(0);
+    if !dropped {
+        return Err(format!("could not drop the empty leaf {leaf}").into());
+    }
+    println!("Step 0: dropped {leaf} (from {lower})");
+
+    let inserter = session().await?;
+    let maintainer = session().await?;
+    maintainer
+        .batch_execute("SET statement_timeout = '30s'")
+        .await
+        .map_err(boxed)?;
+    let maintainer_pid: i32 = maintainer
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .map_err(boxed)?
+        .get(0);
+    let share = session().await?;
+    if hold_schema_lock {
+        share.batch_execute("BEGIN").await.map_err(boxed)?;
+        share
+            .query(
+                "SELECT pg_advisory_xact_lock_shared(8099547369649367906)",
+                &[],
+            )
+            .await
+            .map_err(boxed)?;
+    }
+    inserter.batch_execute("BEGIN").await.map_err(boxed)?;
+    let landed: String = inserter
+        .query_one(
+            "INSERT INTO kafka.messages (topic_id, partition_id, partition_offset, value, created_at)
+             VALUES ($1, 0, 0, 'v'::bytea, $2::text::timestamptz + INTERVAL '1 hour')
+             RETURNING tableoid::regclass::text",
+            &[&topic_id, &lower],
+        )
+        .await
+        .map_err(boxed)?
+        .get(0);
+    if landed != "kafka.messages_default" {
+        inserter.batch_execute("ROLLBACK").await.map_err(boxed)?;
+        return Err(format!("the row landed in {landed}, not the DEFAULT leaf").into());
+    }
+    println!("Step 1: an open transaction inserted a row for that range into DEFAULT");
+
+    let pass = tokio::spawn(async move {
+        maintainer
+            .query_one("SELECT pg_kafka_run_partition_maintenance()", &[])
+            .await
+            .map(|r| r.get::<_, i64>(0))
+    });
+    // The pass polls in lock_message_tables: a lock wait or its sleep between attempts.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut waiting = false;
+    while !waiting && !pass.is_finished() && Instant::now() < deadline {
+        waiting = db
+            .query_one(
+                "SELECT COALESCE(wait_event_type = 'Lock' OR wait_event = 'PgSleep', false)
+                 FROM pg_stat_activity WHERE pid = $1",
+                &[&maintainer_pid],
+            )
+            .await
+            .map_err(boxed)?
+            .get(0);
+        if !waiting {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+    inserter.batch_execute("COMMIT").await.map_err(boxed)?;
+    if !waiting {
+        return Err("the pass did not wait for kafka.messages behind the open insert".into());
+    }
+    println!("Step 2: the pass waited for its table locks; the insert committed meanwhile");
+
+    let created = pass
+        .await
+        .map_err(boxed)?
+        .map_err(|e| format!("maintenance failed: {}", db_error(&e)))?;
+    println!("Step 3: the pass succeeded, created {created} leaf/leaves");
+    if hold_schema_lock {
+        let home: String = db
+            .query_one(
+                "SELECT tableoid::regclass::text FROM kafka.messages WHERE topic_id = $1",
+                &[&topic_id],
+            )
+            .await
+            .map_err(boxed)?
+            .get(0);
+        share.batch_execute("ROLLBACK").await.map_err(boxed)?;
+        assert_eq!(
+            (created, home.as_str()),
+            (0, "kafka.messages_default"),
+            "with the schema lock taken, the pass must skip the leaf and leave the row"
+        );
+        println!("   the leaf was skipped, the row left in DEFAULT; schema lock released");
+    }
+
+    let mut passes = 1;
+    let home = loop {
+        let home: String = db
+            .query_one(
+                "SELECT tableoid::regclass::text FROM kafka.messages WHERE topic_id = $1",
+                &[&topic_id],
+            )
+            .await
+            .map_err(boxed)?
+            .get(0);
+        if home != "kafka.messages_default" || passes == 5 {
+            break home;
+        }
+        passes += 1;
+        println!("   the row is still in DEFAULT (leaf skipped); pass {passes}");
+        db.query("SELECT pg_kafka_run_partition_maintenance()", &[])
+            .await
+            .map_err(|e| format!("maintenance retry failed: {}", db_error(&e)))?;
+    };
+    assert_eq!(home, leaf, "the row must be moved into the recreated leaf");
+    println!("✅ the row was moved into {leaf}");
+    Ok(())
+}

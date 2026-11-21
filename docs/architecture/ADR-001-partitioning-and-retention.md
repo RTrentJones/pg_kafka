@@ -120,10 +120,14 @@ Maintenance can run in the worker and, at the same time, in any session
   and queueing for the schema lock after that would wait for a worker transaction that
   waits for `kafka.messages`, a lock cycle. `create_message_partition` then only tries the
   lock (`pg_try_advisory_xact_lock`, which succeeds at once for the pass that holds it): a
-  leaf whose move finds it taken (the wait timed out, or rows reached DEFAULT after the
-  check) is not created, and the next pass retries; the pass's other leaves are. The
-  upgrade scripts take the same lock first. No other path takes the schema lock after a
-  table lock.
+  leaf whose move finds it taken (the wait timed out, or the pass found DEFAULT empty and
+  did not queue) is not created, and the next pass retries; the pass's other leaves are.
+  Rows can still reach DEFAULT while `create_message_partition` waits for its table locks
+  (`CREATE ... PARTITION OF` would then fail with `check_violation`), so a leaf that had
+  none to move checks again once it holds `kafka.messages`, when none can arrive, and
+  moves the rows on the same terms. Trying the schema lock while holding the tables
+  waits for nothing, so it cannot close a cycle. The upgrade scripts take the same lock
+  first. No other path waits for the schema lock after a table lock.
 * **Sweeps and partition maintenance never overlap.** A retention sweep deletes rows first
   (the aborted-row cleanup, then the expired rows), which leaves its transaction holding
   `ROW EXCLUSIVE` on `kafka.messages` and the row locks of its deletes, and drops leaves last,

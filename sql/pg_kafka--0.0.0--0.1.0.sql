@@ -334,6 +334,18 @@ BEGIN
         -- the topic_id foreign key, kafka.topics: take both first, without ever
         -- waiting long enough to deadlock with a worker transaction.
         PERFORM kafka.lock_message_tables();
+        -- Rows can reach the DEFAULT leaf while lock_message_tables waits, and CREATE
+        -- ... PARTITION OF fails (check_violation) on any of the new leaf's range. With
+        -- kafka.messages held ACCESS EXCLUSIVE none can arrive now: check again and
+        -- move them.
+        IF NOT v_move THEN
+            v_move := EXISTS (SELECT 1 FROM kafka.messages_default
+                              WHERE created_at >= p_lower AND created_at < p_upper);
+            IF v_move AND NOT pg_try_advisory_xact_lock(8099547369649367906) THEN
+                RAISE WARNING 'pg_kafka: could not create time partition kafka.% (rows of kafka.messages_default to move, schema lock taken); will retry', v_name;
+                RETURN 0;
+            END IF;
+        END IF;
         IF v_move THEN
             EXECUTE format('CREATE TABLE kafka.%I (LIKE kafka.messages INCLUDING DEFAULTS INCLUDING CONSTRAINTS)', v_name);
             EXECUTE format(
