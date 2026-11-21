@@ -37,8 +37,9 @@ use std::collections::HashMap;
 /// for another epoch), the transaction must be Ongoing and hold the partition
 /// (INVALID_TXN_STATE). A plain or idempotent batch in the same request is written as it is
 /// without a transactional id, unless its producer's open transaction has written to the
-/// partition (INVALID_TXN_STATE). Transactional batches of two producer ids fail the whole
-/// request (`Err`, INVALID_PRODUCER_ID_MAPPING on every partition, nothing written).
+/// partition (INVALID_TXN_STATE). Transactional batches of two producer ids, to partitions
+/// that exist, fail the whole request (`Err`, INVALID_PRODUCER_ID_MAPPING on every
+/// partition, nothing written).
 ///
 /// # Arguments
 /// * `ctx` - Handler context (store, coordinator, broker metadata, etc.)
@@ -52,7 +53,7 @@ pub fn handle_produce(
     transactional_id: Option<&str>,
 ) -> Result<ProduceResponse> {
     if transactional_id.is_some() {
-        if let Some(producer_id) = second_transactional_producer(&topic_data) {
+        if let Some(producer_id) = second_transactional_producer(ctx.store, &topic_data)? {
             return Err(KafkaError::invalid_producer_id_mapping(producer_id));
         }
     }
@@ -72,11 +73,44 @@ pub fn handle_produce(
 /// there is one. Kafka 3.7 verifies a request's transactional batches as one producer's
 /// (`ReplicaManager.handleProduceAppend`) and fails a request whose transactional
 /// batches carry two producer ids with INVALID_PRODUCER_ID_MAPPING on every partition,
-/// writing nothing.
-fn second_transactional_producer(topic_data: &[TopicProduceData]) -> Option<i64> {
+/// writing nothing. It looks only at the partitions that passed the metadata check
+/// (`KafkaApis.handleProduceRequest` answers the others UNKNOWN_TOPIC_OR_PARTITION
+/// first), so a batch to a partition outside its topic, or to a topic that does not
+/// exist yet, does not count. The topics are looked up (without creating them) only for
+/// a request whose batches carry two producer ids at all.
+fn second_transactional_producer(
+    store: &dyn KafkaStore,
+    topic_data: &[TopicProduceData],
+) -> Result<Option<i64>> {
+    if other_transactional_producer(topic_data, |_| Some(i32::MAX)).is_none() {
+        return Ok(None);
+    }
+    let names: Vec<String> = topic_data.iter().map(|t| t.name.clone()).collect();
+    let partition_counts: HashMap<String, i32> = store
+        .get_topic_metadata(Some(&names))?
+        .into_iter()
+        .map(|t| (t.name, t.partition_count))
+        .collect();
+    Ok(other_transactional_producer(topic_data, |topic| {
+        partition_counts.get(topic).copied()
+    }))
+}
+
+/// A producer id of the transactional batches other than the first one's, among the
+/// partitions that exist: `partition_count` gives a topic's partition count, None for a
+/// topic that does not exist.
+fn other_transactional_producer(
+    topic_data: &[TopicProduceData],
+    partition_count: impl Fn(&str) -> Option<i32>,
+) -> Option<i64> {
     let mut ids = topic_data
         .iter()
-        .flat_map(|t| t.partitions.iter())
+        .flat_map(|t| {
+            let count = partition_count(&t.name).unwrap_or(0);
+            t.partitions
+                .iter()
+                .filter(move |p| (0..count).contains(&p.partition_index))
+        })
         .filter_map(|p| p.producer_metadata.as_ref())
         .filter(|m| m.is_transactional && m.producer_id >= 0)
         .map(|m| m.producer_id);
@@ -590,7 +624,8 @@ mod tests {
     }
 
     /// Transactional batches of two producer ids fail the whole request, before anything
-    /// is looked up or written; other producers' idempotent batches do not count.
+    /// is written; other producers' idempotent batches do not count, nor do batches to
+    /// partitions that do not exist (outside the topic, or of a missing topic).
     #[test]
     fn transactional_batches_of_two_producer_ids_fail_the_request() {
         let with_ids = |ids: &[(i64, bool)]| {
@@ -604,24 +639,43 @@ mod tests {
             }
             data
         };
+        let three = |topic: &str| (topic == "t").then_some(3);
         assert_eq!(
-            second_transactional_producer(&with_ids(&[(7, true), (7, true)])),
+            other_transactional_producer(&with_ids(&[(7, true), (7, true)]), three),
             None
         );
         assert_eq!(
-            second_transactional_producer(&with_ids(&[(7, true), (8, false)])),
+            other_transactional_producer(&with_ids(&[(7, true), (8, false)]), three),
             None
         );
         assert_eq!(
-            second_transactional_producer(&with_ids(&[(-1, true), (7, true)])),
+            other_transactional_producer(&with_ids(&[(-1, true), (7, true)]), three),
             None
         );
         assert_eq!(
-            second_transactional_producer(&with_ids(&[(7, true), (7, true), (9, true)])),
+            other_transactional_producer(&with_ids(&[(7, true), (7, true), (9, true)]), three),
             Some(9)
         );
-        // No store call at all: a MockKafkaStore without expectations panics on one.
-        let mock = MockKafkaStore::new();
+        // Partition 3 is outside the topic, a missing topic has none.
+        let four = with_ids(&[(7, true), (7, true), (7, true), (9, true)]);
+        assert_eq!(other_transactional_producer(&four, three), None);
+        assert_eq!(other_transactional_producer(&four, |_| Some(4)), Some(9));
+        assert_eq!(other_transactional_producer(&four, |_| None), None);
+
+        // Nothing but the metadata lookup before the request fails; one producer id in
+        // the request needs no lookup at all (a MockKafkaStore without expectations
+        // panics on a call).
+        let mut mock = MockKafkaStore::new();
+        mock.expect_get_topic_metadata()
+            .times(1)
+            .returning(|names| {
+                assert_eq!(names, Some(&["t".to_string()][..]));
+                Ok(vec![crate::kafka::storage::TopicMetadata {
+                    name: "t".to_string(),
+                    id: 1,
+                    partition_count: 3,
+                }])
+            });
         let env = TestEnv::new();
         let ctx = env.ctx(&mock);
         let err = handle_produce(
@@ -632,6 +686,65 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.to_kafka_error_code(), ERROR_INVALID_PRODUCER_ID_MAPPING);
+        let store = MockKafkaStore::new();
+        assert_eq!(
+            second_transactional_producer(&store, &with_ids(&[(7, true), (7, true)])).unwrap(),
+            None
+        );
+    }
+
+    /// Kafka writes the owner's batch when the other producer's goes to a partition
+    /// outside the topic, which it answers UNKNOWN_TOPIC_OR_PARTITION.
+    #[test]
+    fn another_producers_batch_outside_the_topic_does_not_fail_the_request() {
+        let mut mock = MockKafkaStore::new();
+        mock.expect_get_topic_metadata().times(1).returning(|_| {
+            Ok(vec![crate::kafka::storage::TopicMetadata {
+                name: "t".to_string(),
+                id: 1,
+                partition_count: 2,
+            }])
+        });
+        mock.expect_get_log_start_offset().returning(|_, _| Ok(0));
+        mock.expect_validate_transaction()
+            .returning(|_, _, _| Ok(()));
+        mock.expect_get_transaction_state()
+            .returning(|_| Ok(Some(TransactionState::Ongoing)));
+        mock.expect_get_or_create_topic()
+            .returning(|_, _| Ok((1, 2)));
+        mock.expect_txn_has_partition()
+            .returning(|_, _, _| Ok(true));
+        mock.expect_check_and_update_sequence()
+            .times(1)
+            .returning(|_, _, _, _, _, _| Ok(SequenceCheck::Append));
+        mock.expect_insert_transactional_records()
+            .times(1)
+            .returning(|_, _, _, _, _| Ok(11));
+        mock.expect_record_producer_batch()
+            .times(1)
+            .returning(|_| Ok(()));
+        let mut data = request(&[0, 9]);
+        data[0].partitions[1].producer_metadata = Some(ProducerMetadata {
+            producer_id: 8,
+            ..meta()
+        });
+        let env = TestEnv::new();
+        let ctx = env.ctx(&mock);
+        let mut got: Vec<(i32, i16, i64)> = handle_produce(&ctx, data, Some(&meta()), Some("tx"))
+            .unwrap()
+            .responses
+            .iter()
+            .flat_map(|t| t.partition_responses.iter())
+            .map(|p| (p.index, p.error_code, p.base_offset))
+            .collect();
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec![
+                (0, ERROR_NONE, 11),
+                (9, ERROR_UNKNOWN_TOPIC_OR_PARTITION, -1)
+            ]
+        );
     }
 
     /// A non-transactional batch of a producer whose Ongoing transaction wrote to the

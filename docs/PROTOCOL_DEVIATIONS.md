@@ -256,7 +256,10 @@ pg_kafka.compression_type = 'gzip'
   without the transactional id (committed, outside the transaction). As in Kafka 3.7,
   transactional batches of two producer ids in one request fail it with
   INVALID_PRODUCER_ID_MAPPING on every partition, plain ones included, and nothing is
-  written; and a non-transactional batch of a producer whose open transaction has written
+  written; only partitions that pass the metadata check count (a batch to a partition
+  outside its topic is UNKNOWN_TOPIC_OR_PARTITION and the owner's batches are written; a
+  topic that did not exist does not count either, but Produce auto-creates it (§10) and then
+  refuses the other producer's batch there on its own, 49, where Kafka answers 3); and a non-transactional batch of a producer whose open transaction has written
   to the partition is INVALID_TXN_STATE (48), with or without a transactional id in the
   request, after the epoch and sequence checks (a partition the transaction only added
   takes it, committed). **Deviation:** transactional batches of one producer id at two

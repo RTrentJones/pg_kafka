@@ -329,7 +329,9 @@ pub async fn test_transactional_produce_is_validated_per_partition() -> TestResu
 /// (`ReplicaManager.handleProduceAppend`): transactional batches of two producer ids fail
 /// the whole request with INVALID_PRODUCER_ID_MAPPING on every partition, plain ones
 /// included, and nothing is written; with acks=0 the connection closes. A transactional
-/// batch next to another producer's idempotent batch is not such a request.
+/// batch next to another producer's idempotent batch is not such a request, nor is one
+/// whose other producer's batch goes to a partition the metadata check refuses first
+/// (outside its topic, or of a topic that does not exist).
 pub async fn test_transactional_batches_of_two_producers_are_refused() -> TestResult {
     println!("=== Test: transactional batches of two producer ids are refused ===\n");
     let ctx = TestContext::new().await?;
@@ -409,6 +411,55 @@ pub async fn test_transactional_batches_of_two_producers_are_refused() -> TestRe
         "the owner's sequence did not move with the refused requests"
     );
     println!("✅ written\n");
+
+    println!("Step 5: another producer's batch where Kafka finds no partition...");
+    let missing = ctx.unique_topic("txn-two-pids-missing").await;
+    let added = w.add_partitions(&tx, pid, ep, &[(&t, &[0])]).await?;
+    assert!(added.iter().all(|(_, _, e)| *e == error_codes::NONE));
+    assert_eq!(
+        codes(
+            &mut w,
+            &t,
+            vec![(0, tb(pid, ep, 1)), (9, tb(pid2, ep2, 0))],
+            Some(&tx)
+        )
+        .await?,
+        vec![
+            (0, error_codes::NONE),
+            (9, error_codes::UNKNOWN_TOPIC_OR_PARTITION)
+        ],
+        "a partition outside the topic does not count"
+    );
+    // A topic that did not exist does not count either; Produce auto-creates it, and the
+    // other producer's batch is then refused there on its own.
+    let mut answers: Vec<(bool, i32, i16)> = w
+        .produce_many(
+            &[
+                (t.as_str(), vec![(0, tb(pid, ep, 2))]),
+                (missing.as_str(), vec![(0, tb(pid2, ep2, 0))]),
+            ],
+            Some(&tx),
+        )
+        .await?
+        .into_iter()
+        .map(|(name, p, code, _)| (name == missing, p, code))
+        .collect();
+    answers.sort_unstable();
+    assert_eq!(
+        answers,
+        vec![
+            (false, 0, error_codes::NONE),
+            (true, 0, INVALID_PRODUCER_ID_MAPPING)
+        ]
+    );
+    assert_eq!(w.end_txn(&tx, pid, ep, true).await?, error_codes::NONE);
+    assert_eq!(
+        rows(&ctx, &t).await?,
+        vec![(0, None, 3), (2, None, 1)],
+        "the owner's batches written"
+    );
+    assert_eq!(rows(&ctx, &missing).await?, vec![]);
+    println!("✅ the owner's batches written, the others refused on their own\n");
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");
     Ok(())
