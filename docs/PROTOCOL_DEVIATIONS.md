@@ -115,10 +115,16 @@ pg_kafka.compression_type = 'gzip'
   several partitions that each decode large batches and are refused is answered differently.
 - As in Kafka 3.7 (`KafkaApis.handleProduceRequest` collects a request's partitions in maps),
   a partition named more than once in a request, in one topic entry or in several, is
-  answered once, for its last entry; the earlier entries are neither decoded nor written.
-  Kafka also answers the error of an earlier entry that fails `ProduceRequest.validateRecords`
-  (data that is not one RecordBatch v2, zstd before v7) while it writes the last one;
-  pg_kafka answers and writes the last entry only.
+  answered once and written at most once: the last of its entries that
+  `ProduceRequest.validateRecords` accepts (one RecordBatch v2, no zstd before v7) is decoded
+  and written, the others are neither; if any of its entries fails that check, the last such
+  failure is its answer, whether or not another entry was written (a valid entry and one of
+  two batches, in either order: the valid one written, INVALID_RECORD answered). The first
+  batch of every entry, kept or not, is read before (a transactional batch without a
+  transactional id, a batch whose length cannot be read, fail the whole request). Checked
+  against a 3.7 broker. Differences: a partition of a topic that does not exist is
+  auto-created by its written entry while answered UNKNOWN_TOPIC_OR_PARTITION for its
+  failed one (Kafka creates nothing).
 - zstd frames may declare a window of at most 2^27 bytes (128 MiB), as in Kafka; a decoder's
   window counts toward that limit as it fills (as much again as the decoded bytes, up to the
   window). A larger window is CORRUPT_MESSAGE (Kafka 3.7: UNKNOWN_SERVER_ERROR). zstd on

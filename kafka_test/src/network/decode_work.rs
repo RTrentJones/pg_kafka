@@ -435,3 +435,101 @@ pub async fn test_a_produce_of_many_refused_topics_is_answered_quickly() -> Test
     println!("✅ Test PASSED\n");
     Ok(())
 }
+
+/// TRANSACTIONAL_ID_AUTHORIZATION_FAILED.
+const TRANSACTIONAL_ID_AUTHORIZATION_FAILED: i16 = 53;
+/// INVALID_RECORD.
+const INVALID_RECORD: i16 = 87;
+
+/// The values stored in `topic`'s partition `partition`, in offset order.
+async fn stored_values(ctx: &TestContext, topic: &str, partition: i32) -> DynResult<Vec<String>> {
+    Ok(ctx
+        .db()
+        .query(
+            "SELECT convert_from(m.value, 'UTF8') FROM kafka.messages m
+             JOIN kafka.topics t ON t.id = m.topic_id
+             WHERE t.name = $1 AND m.partition_id = $2 ORDER BY m.partition_offset",
+            &[&topic, &partition],
+        )
+        .await?
+        .iter()
+        .map(|r| r.get(0))
+        .collect())
+}
+
+/// Kafka 3.7 reads the first batch of every entry of a Produce as sent before it keeps
+/// one entry per partition, and of a partition's entries writes the last one
+/// `ProduceRequest.validateRecords` accepts while answering the last one it refuses:
+/// a replaced transactional batch without a transactional id, or a replaced batch whose
+/// length cannot be read, still fails the whole request; a valid entry beside one of two
+/// batches is written and answered INVALID_RECORD, in either order.
+pub async fn test_repeated_entries_are_checked_as_kafka_checks_them() -> TestResult {
+    use crate::wire::records::batch;
+    println!("=== Test: repeated partition entries are checked as Kafka checks them ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("net-dup-check").await;
+    let created = create_topics_raw(vec![creatable(&topic, 2, 1)]).await?;
+    assert_eq!(created[0].error_code, 0, "{created:?}");
+    let mut wire = Wire::connect().await?;
+    let value = |v: &str| plain_batch(&[Bytes::from(v.to_string())], Compression::None);
+    let codes = |got: Vec<(String, i32, i16, i64)>| -> Vec<(i32, i16)> {
+        got.into_iter().map(|(_, p, code, _)| (p, code)).collect()
+    };
+    let two = |b: Bytes| Bytes::from([&b[..], &b[..]].concat());
+
+    println!("Step 1: a replaced transactional batch, no transactional id");
+    let txn = batch(&["t"], 7, 0, 0, true, None);
+    let got = wire
+        .produce_many(
+            &[(&topic, vec![(0, txn), (0, value("a")), (1, value("b"))])],
+            None,
+        )
+        .await?;
+    assert_eq!(
+        codes(got),
+        vec![
+            (0, TRANSACTIONAL_ID_AUTHORIZATION_FAILED),
+            (1, TRANSACTIONAL_ID_AUTHORIZATION_FAILED)
+        ]
+    );
+    println!("Step 2: a replaced batch of length 13");
+    let mut short = value("x").to_vec();
+    short[8..12].copy_from_slice(&13i32.to_be_bytes());
+    let got = wire
+        .produce_many(
+            &[(
+                &topic,
+                vec![(0, Bytes::from(short)), (0, value("a")), (1, value("b"))],
+            )],
+            None,
+        )
+        .await?;
+    assert_eq!(codes(got), vec![(0, CORRUPT_MESSAGE), (1, CORRUPT_MESSAGE)]);
+    assert_eq!(stored_rows(ctx.db(), &topic).await?, 0, "nothing written");
+    println!("✅ the whole request refused; nothing written");
+
+    println!("Step 3: a valid entry, then one of two batches; then the other order");
+    let got = wire
+        .produce_many(
+            &[(&topic, vec![(0, value("a")), (0, two(value("b")))])],
+            None,
+        )
+        .await?;
+    assert_eq!(codes(got), vec![(0, INVALID_RECORD)]);
+    let got = wire
+        .produce_many(
+            &[(&topic, vec![(0, two(value("c"))), (0, value("d"))])],
+            None,
+        )
+        .await?;
+    assert_eq!(codes(got), vec![(0, INVALID_RECORD)]);
+    assert_eq!(
+        stored_values(&ctx, &topic, 0).await?,
+        vec!["a".to_string(), "d".to_string()]
+    );
+    println!("✅ the valid entry written, INVALID_RECORD answered");
+
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}

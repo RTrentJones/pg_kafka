@@ -180,6 +180,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         decode_work::test_refused_partitions_do_not_monopolize_the_decode_slots: sequential,
         decode_work::test_repeated_partition_entries_are_answered_once: sequential,
         decode_work::test_a_produce_of_many_refused_topics_is_answered_quickly: sequential,
+        decode_work::test_repeated_entries_are_checked_as_kafka_checks_them: sequential,
         hostile_clients::test_invalid_acks_answers_in_kafkas_order: sequential,
         limits::test_network_limits_setup: sequential,
         limits::test_scram_unknown_user_is_indistinguishable: sequential,
