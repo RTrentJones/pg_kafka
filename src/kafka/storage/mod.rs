@@ -249,8 +249,9 @@ pub trait TopicStore {
     fn get_or_create_topic(&self, name: &str, default_partitions: i32) -> Result<(i32, i32)>;
 
     /// Create each of `names` that does not exist with `partition_count` partitions, in one
-    /// statement however many names: the topics of `names` afterwards, created or not, in
-    /// no particular order.
+    /// statement however many names: the topics of `names` afterwards, created here, before
+    /// or concurrently by another session, in no particular order. (A name another session
+    /// commits while the insert waits on it takes a second statement to read.)
     fn get_or_create_topics(
         &self,
         names: &[String],

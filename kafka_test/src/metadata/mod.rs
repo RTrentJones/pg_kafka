@@ -1,5 +1,6 @@
 //! Metadata API edge case tests
 
+mod concurrent_create;
 mod corrupt_partition_count;
 
 use crate::common::{create_producer, get_bootstrap_servers, TestResult};
@@ -185,5 +186,6 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         test_metadata_nonexistent_topic,
         test_metadata_refresh_after_create,
         corrupt_partition_count::test_metadata_survives_corrupt_partition_count: sequential, // drops and restores the CHECK constraint on kafka.topics
+        concurrent_create::test_metadata_auto_create_sees_a_concurrently_created_topic: sequential, // holds the DB thread on a row lock for 0.8 s
     ]
 }

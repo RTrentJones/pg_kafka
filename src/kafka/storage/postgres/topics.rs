@@ -87,7 +87,29 @@ impl PostgresStore {
                 None,
                 &[names.to_vec().into(), partition_count.into()],
             )?;
-            Ok(topic_rows(table)?
+            let mut rows = topic_rows(table)?;
+            // A name another session inserted and committed while the insert waited on it
+            // is in neither half: the insert skips it and the SELECT reads the statement's
+            // snapshot, taken before that commit. A second statement, with a new snapshot,
+            // sees it (as get_or_create_topic re-selects).
+            let missing: Vec<String> = {
+                let found: std::collections::HashSet<&str> =
+                    rows.iter().map(|(name, _, _)| name.as_str()).collect();
+                names
+                    .iter()
+                    .filter(|name| !found.contains(name.as_str()))
+                    .cloned()
+                    .collect()
+            };
+            if !missing.is_empty() {
+                let table = client.select(
+                    "SELECT id, name, partitions FROM kafka.topics WHERE name = ANY($1::text[])",
+                    None,
+                    &[missing.into()],
+                )?;
+                rows.extend(topic_rows(table)?);
+            }
+            Ok(rows
                 .into_iter()
                 .map(|(name, id, partition_count)| TopicMetadata {
                     name,
