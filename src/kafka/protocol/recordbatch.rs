@@ -376,7 +376,9 @@ fn zstd_frame_window(frame: &[u8]) -> anyhow::Result<u64> {
 
 /// The largest window any frame of `data` declares; past 2^[`ZSTD_WINDOW_LOG_MAX`] the data
 /// is refused before the decoder reserves anything. A frame the walk cannot measure ends it:
-/// the decoder reports what is wrong with it.
+/// the decoder reports what is wrong with it. The walk reads every block header, checking
+/// the decode's time as the decoder does ([`InputClock`]): a frame of empty blocks has one
+/// header every 3 bytes.
 fn zstd_window(mut data: &[u8], budget: &DecodeBudget) -> anyhow::Result<usize> {
     let mut largest = 0u64;
     let mut clock = InputClock::new(budget);
@@ -386,15 +388,66 @@ fn zstd_window(mut data: &[u8], budget: &DecodeBudget) -> anyhow::Result<usize> 
             largest <= 1u64 << ZSTD_WINDOW_LOG_MAX,
             "zstd frame declares a window of {largest} bytes"
         );
-        match zstd::zstd_safe::find_frame_compressed_size(data) {
-            Ok(len) if len > 0 && len <= data.len() => {
-                clock.consumed(len)?;
-                data = &data[len..];
-            }
+        match zstd_frame_size(data, &mut clock)? {
+            Some(len) if len > 0 => data = &data[len..],
             _ => break,
         }
     }
     Ok(usize::try_from(largest)?)
+}
+
+/// The bytes the zstd frame at the start of `data` takes (RFC 8878 §3.1): its header, its
+/// blocks and its checksum, or a skippable frame's header and content; `None` when `data`
+/// cuts it short or it has a reserved block type. Each block's header and content are
+/// counted on `clock`.
+fn zstd_frame_size(data: &[u8], clock: &mut InputClock<'_>) -> io::Result<Option<usize>> {
+    let byte = |at: usize| data.get(at).copied().map(usize::from);
+    let Some(magic) = data.get(..4).and_then(|m| <[u8; 4]>::try_from(m).ok()) else {
+        return Ok(None);
+    };
+    if u32::from_le_bytes(magic) & 0xFFFF_FFF0 == ZSTD_SKIPPABLE_MAGIC {
+        let Some(size) = data.get(4..8).and_then(|m| <[u8; 4]>::try_from(m).ok()) else {
+            return Ok(None);
+        };
+        let len = usize::try_from(u32::from_le_bytes(size))
+            .ok()
+            .and_then(|size| size.checked_add(8))
+            .filter(|&len| len <= data.len());
+        if let Some(len) = len {
+            clock.consumed(len)?;
+        }
+        return Ok(len);
+    }
+    let Some(descriptor) = byte(4) else {
+        return Ok(None);
+    };
+    let single_segment = descriptor & 0x20 != 0;
+    let content_size_bytes = match descriptor >> 6 {
+        0 => usize::from(single_segment),
+        flag => [0, 2, 4, 8][flag],
+    };
+    let mut at =
+        5 + usize::from(!single_segment) + [0, 1, 2, 4][descriptor & 3] + content_size_bytes;
+    loop {
+        let (Some(b0), Some(b1), Some(b2)) = (byte(at), byte(at + 1), byte(at + 2)) else {
+            return Ok(None);
+        };
+        let header = b0 | b1 << 8 | b2 << 16;
+        let content = match (header >> 1) & 3 {
+            0 | 2 => header >> 3,
+            1 => 1,
+            _ => return Ok(None),
+        };
+        at += 3 + content;
+        clock.consumed(3 + content)?;
+        if header & 1 == 1 {
+            break;
+        }
+    }
+    if descriptor & 0x04 != 0 {
+        at += 4;
+    }
+    Ok((at <= data.len()).then_some(at))
 }
 
 /// Decoded output written through a [`DecodeBudget`]: the buffer's capacity is charged
@@ -1409,6 +1462,67 @@ mod tests {
         // A single-segment frame's window is its content size.
         let single = zstd::bulk::compress(&[1u8; 3000], 3).unwrap();
         assert_eq!(zstd_window(&single, &budget()).unwrap(), 3000);
+    }
+
+    /// A zstd frame of `blocks` empty raw blocks (3 bytes each) and a final one.
+    fn zstd_frame_of_empty_blocks(blocks: usize) -> Vec<u8> {
+        // Magic, a descriptor of no content size and no checksum, a 1 KiB window.
+        let mut frame = vec![0x28, 0xB5, 0x2F, 0xFD, 0, 0];
+        frame.extend_from_slice(&[0, 0, 0].repeat(blocks));
+        frame.extend_from_slice(&[1, 0, 0]);
+        frame
+    }
+
+    /// The frame walk measures frames as zstd does, whatever their header: a checksum, a
+    /// single segment, a dictionary id, a skippable frame; a frame cut short is not
+    /// measured.
+    #[test]
+    fn the_zstd_frame_walk_measures_frames_as_zstd_does() {
+        let data: Vec<u8> = (0..300_000u32).map(|i| (i % 7) as u8).collect();
+        let mut checksummed = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+        checksummed.include_checksum(true).unwrap();
+        checksummed.write_all(&data).unwrap();
+        let mut with_dictionary = zstd::bulk::compress(b"tiny", 3).unwrap();
+        // A dictionary id of one byte (descriptor bits 0-1), after the descriptor.
+        with_dictionary[4] |= 1;
+        with_dictionary.insert(5, 9);
+        let frames = [
+            checksummed.finish().unwrap(),
+            zstd::bulk::compress(&data, 3).unwrap(),
+            zstd::bulk::compress(&[], 1).unwrap(),
+            zstd_frame(&data, 3, 20),
+            with_dictionary,
+            zstd_frame_of_empty_blocks(1000),
+            vec![0x5F, 0x2A, 0x4D, 0x18, 3, 0, 0, 0, 1, 2, 3],
+        ];
+        let budget = budget();
+        for frame in &frames {
+            let mut clock = InputClock::new(&budget);
+            let expected = zstd::zstd_safe::find_frame_compressed_size(frame).unwrap();
+            let mut with_more = frame.clone();
+            with_more.extend_from_slice(b"next frame");
+            assert_eq!(
+                zstd_frame_size(&with_more, &mut clock).unwrap(),
+                Some(expected)
+            );
+            assert_eq!(
+                zstd_frame_size(&frame[..frame.len() - 1], &mut clock).unwrap(),
+                None
+            );
+        }
+    }
+
+    /// The window walk checks the decode's time inside a frame: a frame of 33 million
+    /// empty blocks (99 MB) stops at its first check once the time has passed, instead of
+    /// being walked whole first (some 140 ms).
+    #[test]
+    fn the_zstd_window_walk_checks_the_time_inside_a_frame() {
+        let frame = zstd_frame_of_empty_blocks(33_000_000);
+        let budget = budget().limit_time(Duration::ZERO);
+        let (walked, spent) = crate::testing::cpu_time(|| zstd_window(&frame, &budget));
+        assert!(walked.is_err());
+        assert_eq!(budget.exhausted(), Some(Exhausted::Time));
+        assert!(spent < Duration::from_millis(20), "walked for {spent:?}");
     }
 
     #[test]
