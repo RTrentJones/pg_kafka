@@ -189,6 +189,7 @@ fn test_add_offsets_success() {
 #[test]
 fn test_txn_offset_commit_group_not_added() {
     let mut mock = MockKafkaStore::new();
+    topics_with_partitions(&mut mock, 2);
     mock.expect_validate_transaction()
         .returning(|_, _, _| Ok(()));
     mock.expect_get_transaction_state()
@@ -556,6 +557,8 @@ fn test_txn_offset_commit_unknown_topic() {
 #[test]
 fn test_txn_offset_commit_invalid_state_empty() {
     let mut mock = MockKafkaStore::new();
+    topics_with_partitions(&mut mock, 1);
+    mock.expect_store_txn_pending_offset().never();
 
     mock.expect_validate_transaction()
         .returning(|_, _, _| Ok(()));
@@ -580,16 +583,18 @@ fn test_txn_offset_commit_invalid_state_empty() {
         topics,
     );
 
-    assert!(result.is_err());
-    match result.unwrap_err() {
-        KafkaError::InvalidTxnState { .. } => {}
-        e => panic!("Expected InvalidTransactionState error, got {e:?}"),
-    }
+    // A refused transaction is answered on every partition, not as a handler error.
+    assert_eq!(
+        result.unwrap().topics[0].partitions[0].error_code,
+        ERROR_INVALID_TXN_STATE
+    );
 }
 
 #[test]
 fn test_txn_offset_commit_producer_fenced() {
     let mut mock = MockKafkaStore::new();
+    topics_with_partitions(&mut mock, 1);
+    mock.expect_store_txn_pending_offset().never();
 
     mock.expect_validate_transaction()
         .returning(|_, _, _| Err(KafkaError::producer_fenced(1000, 0, 1)));
@@ -611,11 +616,11 @@ fn test_txn_offset_commit_producer_fenced() {
         topics,
     );
 
-    assert!(result.is_err());
-    match result.unwrap_err() {
-        KafkaError::ProducerFenced { .. } => {}
-        e => panic!("Expected ProducerFenced error, got {e:?}"),
-    }
+    // PRODUCER_FENCED here; TxnOffsetCommitApi answers it INVALID_PRODUCER_EPOCH on v0-3.
+    assert_eq!(
+        result.unwrap().topics[0].partitions[0].error_code,
+        ERROR_PRODUCER_FENCED
+    );
 }
 
 #[test]
@@ -693,6 +698,7 @@ fn zombie_txn_offset_commit(
 #[test]
 fn test_txn_offset_commit_group_not_added_wins_over_stale_generation() {
     let mut mock = MockKafkaStore::new();
+    topics_with_partitions(&mut mock, 1);
     mock.expect_validate_transaction()
         .times(1)
         .returning(|_, _, _| Ok(()));
@@ -713,15 +719,16 @@ fn test_txn_offset_commit_group_not_added_wins_over_stale_generation() {
 #[test]
 fn test_txn_offset_commit_fenced_epoch_wins_over_stale_generation() {
     let mut mock = MockKafkaStore::new();
+    topics_with_partitions(&mut mock, 1);
     mock.expect_validate_transaction()
         .times(1)
         .returning(|_, _, _| Err(KafkaError::producer_fenced(1000, 0, 1)));
     mock.expect_txn_has_group().never();
     mock.expect_store_txn_pending_offset().never();
-    match zombie_txn_offset_commit(&mock, "consumer-group", 0) {
-        Err(KafkaError::ProducerFenced { .. }) => {}
-        other => panic!("Expected ProducerFenced, got {other:?}"),
-    }
+    assert_eq!(
+        zombie_txn_offset_commit(&mock, "consumer-group", 0).unwrap(),
+        vec![ERROR_PRODUCER_FENCED]
+    );
 }
 
 /// Once the transaction and the group check out, an unknown member is UNKNOWN_MEMBER_ID
@@ -729,6 +736,7 @@ fn test_txn_offset_commit_fenced_epoch_wins_over_stale_generation() {
 #[test]
 fn test_txn_offset_commit_added_group_unknown_member() {
     let mut mock = MockKafkaStore::new();
+    topics_with_partitions(&mut mock, 1);
     mock.expect_validate_transaction()
         .times(1)
         .returning(|_, _, _| Ok(()));
@@ -789,4 +797,107 @@ fn test_txn_offset_commit_empty_group_id() {
             ),
         ]
     );
+}
+
+/// Kafka 3.7 answers a partition that does not exist UNKNOWN_TOPIC_OR_PARTITION whatever
+/// refuses the commit (KafkaApis filters those out before it asks the coordinator): the
+/// refusal's code goes only to the partitions that exist, and nothing is stored.
+#[test]
+fn test_txn_offset_commit_refusal_spares_unknown_partitions() {
+    type Setup = fn(&mut MockKafkaStore);
+    let ongoing: Setup = |mock| {
+        mock.expect_validate_transaction()
+            .returning(|_, _, _| Ok(()));
+        mock.expect_get_transaction_state()
+            .returning(|_| Ok(Some(TransactionState::Ongoing)));
+    };
+    let cases: [(&str, Setup, i16); 5] = [
+        (
+            "unknown producer",
+            |mock| {
+                mock.expect_validate_transaction()
+                    .returning(|txn, _, _| Err(KafkaError::transactional_id_not_found(txn)));
+            },
+            ERROR_INVALID_PRODUCER_ID_MAPPING,
+        ),
+        (
+            "fenced epoch",
+            |mock| {
+                mock.expect_validate_transaction()
+                    .returning(|_, _, _| Err(KafkaError::producer_fenced(1000, 0, 1)));
+            },
+            ERROR_PRODUCER_FENCED,
+        ),
+        (
+            "not Ongoing",
+            |mock| {
+                mock.expect_validate_transaction()
+                    .returning(|_, _, _| Ok(()));
+                mock.expect_get_transaction_state()
+                    .returning(|_| Ok(Some(TransactionState::Empty)));
+            },
+            ERROR_INVALID_TXN_STATE,
+        ),
+        (
+            "group not added",
+            |mock| {
+                mock.expect_validate_transaction()
+                    .returning(|_, _, _| Ok(()));
+                mock.expect_get_transaction_state()
+                    .returning(|_| Ok(Some(TransactionState::Ongoing)));
+                mock.expect_txn_has_group().returning(|_, _| Ok(false));
+            },
+            ERROR_INVALID_TXN_STATE,
+        ),
+        (
+            "unknown member",
+            |mock| {
+                mock.expect_txn_has_group().returning(|_, _| Ok(true));
+            },
+            ERROR_UNKNOWN_MEMBER_ID,
+        ),
+    ];
+    for (name, setup, code) in cases {
+        let mut mock = MockKafkaStore::new();
+        topics_with_partitions(&mut mock, 2);
+        if name == "unknown member" {
+            ongoing(&mut mock);
+        }
+        setup(&mut mock);
+        mock.expect_store_txn_pending_offset().never();
+        let env = TestEnv::new();
+        let ctx = env.ctx(&mock);
+        let topics = vec![
+            (
+                "test-topic".to_string(),
+                vec![(0, 1i64, None), (7, 1, None)],
+            ),
+            ("missing-topic".to_string(), vec![(0, 1i64, None)]),
+        ];
+        let response = transaction::handle_txn_offset_commit(
+            &ctx,
+            "txn-1",
+            1000,
+            0,
+            "consumer-group",
+            5,
+            "zombie",
+            topics,
+        )
+        .unwrap();
+        let codes: Vec<i16> = response
+            .topics
+            .iter()
+            .flat_map(|t| t.partitions.iter().map(|p| p.error_code))
+            .collect();
+        assert_eq!(
+            codes,
+            vec![
+                code,
+                ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+                ERROR_UNKNOWN_TOPIC_OR_PARTITION
+            ],
+            "{name}"
+        );
+    }
 }

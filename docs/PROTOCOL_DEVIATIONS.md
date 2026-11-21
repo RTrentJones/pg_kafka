@@ -307,7 +307,9 @@ pg_kafka.compression_type = 'gzip'
   transaction is checked before the group member: a fenced or unknown producer, a
   transaction that is not ongoing and a group not added win over a stale generation or an
   unknown member id (UNKNOWN_MEMBER_ID / ILLEGAL_GENERATION only once the transaction checks
-  out)
+  out). Whatever refuses the commit, a partition that does not exist is
+  UNKNOWN_TOPIC_OR_PARTITION (Kafka filters those out before it asks the coordinator) and
+  the refusal's code goes only to the partitions that exist
 - ✅ Read-committed isolation level filters pending/aborted messages
 - ✅ Transactional producer fencing via epoch
 
