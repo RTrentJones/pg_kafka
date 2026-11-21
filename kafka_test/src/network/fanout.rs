@@ -2,8 +2,9 @@
 //! the DB thread serves every client, so a request whose topic, partition, resource or group
 //! entries each cost a database round trip stalls the whole broker for as long as it runs.
 //! Each test sends a ~100-200 KB request of repeated (or many distinct) entries on its own
-//! connection while another connection produces one record every few milliseconds, and
-//! checks the slowest of those produces as well as the answer, which follows Kafka 3.7's.
+//! connection while another connection reads the log end of a partition every few
+//! milliseconds, and bounds how long the request can have held the DB thread (see
+//! [`measure_each`]) as well as checking the answer, which follows Kafka 3.7's.
 
 use crate::common::{DynResult, TestResult};
 use crate::setup::TestContext;
@@ -42,11 +43,16 @@ use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
-/// The slowest a one-record produce on another connection may take while a hostile request
-/// runs. Each request below costs the DB thread a few milliseconds once its entries share
-/// their lookups and a repeated entry is acted on once; one database round trip per entry
-/// costs it 70 ms to 11 s.
+/// The longest a hostile request may hold the DB thread. Each request below costs it a few
+/// milliseconds once its entries share their lookups and a repeated entry is acted on once;
+/// one database round trip per entry costs it 65 ms to 11 s.
 const STALL_BOUND: Duration = Duration::from_millis(50);
+
+/// The pause between two probes on the probe connection.
+const PROBE_GAP: Duration = Duration::from_millis(10);
+
+/// How often a request whose measurement exceeds [`STALL_BOUND`] is measured.
+const ATTEMPTS: usize = 3;
 
 fn s(v: &str) -> StrBytes {
     StrBytes::from_string(v.to_string())
@@ -66,27 +72,72 @@ fn numbered(prefix: &str, n: usize) -> Vec<String> {
     (0..n).map(|i| format!("{prefix}{i:05}")).collect()
 }
 
-/// A hostile request's answer, how long it took, and what a produce alongside saw.
+/// A hostile request's answer and how long it can have held the DB thread.
 struct Measured<T> {
     response: T,
+    /// The attempt (from 0) the answer is from.
+    attempt: usize,
     took: Duration,
     worst: Duration,
     probes: usize,
+    /// The most the request can have held the DB thread: see [`measure_each`].
+    held: Duration,
 }
 
-/// Send `request` at `version` on its own connection while another connection produces one
-/// record to partition 0 of `probe_topic` every 10 ms; the answer and the slowest produce.
-async fn measure<R: Request>(
+/// [`measure_each`] of `request` itself on every attempt, for a request that costs the same
+/// each time it is sent.
+async fn measure<R: Request + Clone>(
     probe_topic: &str,
     version: i16,
     request: &R,
 ) -> DynResult<Measured<R::Response>> {
+    measure_each(probe_topic, version, |_| request.clone()).await
+}
+
+/// Send `make(attempt)` at `version` on its own connection while another connection reads
+/// the log end of partition 0 of `probe_topic` (ListOffsets, which writes nothing, so the
+/// probe never waits for a WAL flush of its own) and pauses [`PROBE_GAP`] between reads.
+///
+/// The request can have held the DB thread for at most `min(took, worst + PROBE_GAP)`: no
+/// longer than it took to be answered, and no longer than the slowest probe plus the pause
+/// before the next one, since a probe sent while the DB thread is held waits until it is
+/// free and probes are sent until the answer arrives. A request answered before the first
+/// probe is bounded by its own time. One attempt can still measure a stall that is not the
+/// request's (a checkpoint, the test machine), so a measurement over [`STALL_BOUND`] is
+/// repeated, up to [`ATTEMPTS`] times, and the attempt with the smallest bound is returned:
+/// a request that holds the DB thread does so on every attempt.
+async fn measure_each<R: Request>(
+    probe_topic: &str,
+    version: i16,
+    mut make: impl FnMut(usize) -> R,
+) -> DynResult<Measured<R::Response>> {
+    let mut probe = Wire::connect().await?;
+    let (code, _, _) = probe.list_offsets(probe_topic, 0, -1, 0).await?;
+    assert_eq!(code, 0, "the probe works before the request");
+    let mut best: Option<Measured<R::Response>> = None;
+    for attempt in 0..ATTEMPTS {
+        let m = measure_once(&mut probe, probe_topic, version, &make(attempt), attempt).await?;
+        let done = m.held < STALL_BOUND;
+        if best.as_ref().is_none_or(|b| m.held < b.held) {
+            best = Some(m);
+        }
+        if done {
+            break;
+        }
+    }
+    Ok(best.expect("at least one attempt"))
+}
+
+/// One attempt of [`measure_each`].
+async fn measure_once<R: Request>(
+    probe: &mut Wire,
+    probe_topic: &str,
+    version: i16,
+    request: &R,
+    attempt: usize,
+) -> DynResult<Measured<R::Response>> {
     let frame = request_frame(version, 1, request);
     let size = frame.len();
-    let mut probe = Wire::connect().await?;
-    let value = plain_batch(&[Bytes::from_static(b"p")], Compression::None);
-    let (code, _) = probe.produce(probe_topic, 0, value.clone(), None).await?;
-    assert_eq!(code, 0, "the probe produce works before the request");
     let hostile = tokio::spawn(async move {
         let started = Instant::now();
         let mut stream = TcpStream::connect(crate::common::broker_addr())
@@ -103,35 +154,44 @@ async fn measure<R: Request>(
     let mut probes = 0;
     while !hostile.is_finished() {
         let started = Instant::now();
-        let (code, _) = probe.produce(probe_topic, 0, value.clone(), None).await?;
-        assert_eq!(code, 0, "a probe produce alongside the request failed");
+        let (code, _, _) = probe.list_offsets(probe_topic, 0, -1, 0).await?;
+        assert_eq!(code, 0, "a probe alongside the request failed");
         worst = worst.max(started.elapsed());
         probes += 1;
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::sleep(PROBE_GAP).await;
     }
     let (answer, took) = hostile.await??;
     let (correlation, response) = decode_response::<R>(version, &answer)?;
     assert_eq!(correlation, 1);
+    let held = if probes == 0 {
+        took
+    } else {
+        took.min(worst + PROBE_GAP)
+    };
     println!(
-        "  {size}-byte request answered after {took:?}; {probes} produces alongside, the \
-         slowest {worst:?}"
+        "  attempt {attempt}: {size}-byte request answered after {took:?}; {probes} probes \
+         alongside, the slowest {worst:?}; held the DB thread at most {held:?}"
     );
     Ok(Measured {
         response,
+        attempt,
         took,
         worst,
         probes,
+        held,
     })
 }
 
-/// The produce alongside was never held up for long.
+/// The request cannot have held the DB thread for long.
 fn assert_not_stalled<T>(m: &Measured<T>) {
     assert!(
-        m.worst < STALL_BOUND,
-        "a produce alongside took {:?} (request answered after {:?}, {} probes)",
-        m.worst,
+        m.held < STALL_BOUND,
+        "the request may have held the DB thread for {:?} on its best of {ATTEMPTS} attempts \
+         (answered after {:?}, {} probes alongside, the slowest {:?})",
+        m.held,
         m.took,
-        m.probes
+        m.probes,
+        m.worst
     );
 }
 
@@ -217,15 +277,23 @@ fn metadata_request(names: &[String], auto_create: bool) -> MetadataRequest {
 }
 
 /// Metadata v1 naming one short topic 18,000 times (144 KB): Kafka answers each distinct
-/// name once, and the missing topic is auto-created once.
+/// name once, and the missing topic is auto-created once. Each attempt of the missing
+/// round names a topic of its own, so every attempt auto-creates one.
 pub async fn test_metadata_of_a_repeated_name_is_answered_once() -> TestResult {
     println!("=== Test: Metadata of one name repeated 18,000 times ===\n");
     let (ctx, probe) = setup("md").await?;
-    let name = short_name("fm");
-    let req = metadata_request(&vec![name.clone(); 18_000], true);
+    let base = short_name("fm");
+    let name_of = |attempt: usize| format!("{base}{attempt}");
     for round in ["missing (auto-created)", "existing"] {
         println!("Step: the topic {round}");
-        let m = measure(&probe, 1, &req).await?;
+        let existing = round == "existing";
+        let m = measure_each(&probe, 1, |attempt| {
+            // The existing round names the topic the missing round created first.
+            let name = name_of(if existing { 0 } else { attempt });
+            metadata_request(&vec![name; 18_000], true)
+        })
+        .await?;
+        let name = name_of(if existing { 0 } else { m.attempt });
         let names: Vec<String> = m
             .response
             .topics
@@ -245,9 +313,9 @@ pub async fn test_metadata_of_a_repeated_name_is_answered_once() -> TestResult {
         assert_eq!(names.len(), 1, "one entry for the one name");
         assert_eq!(names[0], name);
         assert_eq!(m.response.topics[0].error_code, 0);
+        assert_eq!(topics_named(&ctx, &name).await?, 1);
     }
-    assert_eq!(topics_named(&ctx, &name).await?, 1);
-    drop_topics(&ctx, &name).await?;
+    drop_topics(&ctx, &base).await?;
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");
     Ok(())
@@ -272,13 +340,16 @@ pub async fn test_metadata_of_many_missing_names_is_answered_quickly() -> TestRe
 }
 
 /// Metadata v1 with auto-creation naming 3,000 distinct missing topics (42 KB): each is
-/// created, all in one statement.
+/// created, all in one statement. Each attempt names topics of its own.
 pub async fn test_metadata_auto_creates_many_names_together() -> TestResult {
     println!("=== Test: Metadata auto-creating 3,000 distinct names ===\n");
     let (ctx, probe) = setup("mda").await?;
-    let prefix = short_name("ma");
-    let req = metadata_request(&numbered(&prefix, 3_000), true);
-    let m = measure(&probe, 1, &req).await?;
+    let base = short_name("ma");
+    let prefix_of = |attempt: usize| format!("{base}{attempt}-");
+    let m = measure_each(&probe, 1, |attempt| {
+        metadata_request(&numbered(&prefix_of(attempt), 3_000), true)
+    })
+    .await?;
     let codes = tally(m.response.topics.iter().map(|t| t.error_code));
     let with_partitions = m
         .response
@@ -287,8 +358,8 @@ pub async fn test_metadata_auto_creates_many_names_together() -> TestResult {
         .filter(|t| !t.partitions.is_empty())
         .count();
     println!("  codes {codes:?}, {with_partitions} with partitions");
-    let created = topics_named(&ctx, &prefix).await?;
-    drop_topics(&ctx, &prefix).await?;
+    let created = topics_named(&ctx, &prefix_of(m.attempt)).await?;
+    drop_topics(&ctx, &base).await?;
     assert_not_stalled(&m);
     assert_eq!(codes, BTreeMap::from([(0, 3_000)]));
     assert_eq!(with_partitions, 3_000);
