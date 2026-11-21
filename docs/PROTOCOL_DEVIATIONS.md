@@ -70,9 +70,20 @@ pg_kafka.compression_type = 'gzip'
 - Server decompresses messages before storage. A request's records may take at most 100 MB
   of memory once decoded, across its partitions: their decoded bytes plus a fixed cost per
   record (88 bytes) and per header (48 bytes), charged from the declared record count before
-  anything decodes. Past that every partition is answered MESSAGE_TOO_LARGE (Kafka streams
-  validation and has no such limit), so a request of over ~1.1 million records, or a request
-  of small records near the 100 MB frame limit, is refused.
+  anything decodes. A partition that does not fit in what its request may still hold is
+  answered MESSAGE_TOO_LARGE (10) on its own and nothing of it is written; the request's
+  other partitions are written, as Kafka answers a batch past `message.max.bytes`. Kafka
+  streams validation and has no such limit: it accepts such a partition when its batch is
+  within `message.max.bytes` (1 MiB by default; a gzip batch of 150 MB of zeros is some
+  150 KB), and pg_kafka has no `message.max.bytes`, so it accepts an uncompressed batch over
+  1 MiB that Kafka answers MESSAGE_TOO_LARGE. A batch whose declared records alone take
+  more than 100 MB (over ~1.1 million records), or snappy data declaring more than 100 MB
+  decoded, is refused MESSAGE_TOO_LARGE before anything decodes; Kafka answers a
+  compressed one INVALID_RECORD when its records do not match the count (UNKNOWN_SERVER_ERROR
+  for snappy data that does not decompress). An uncompressed batch whose records section is
+  too short to hold its declared count (at 7 bytes a record) is INVALID_RECORD, as in Kafka.
+  A partition refused for any reason, even after it decoded, no longer counts against the
+  partitions after it.
 - A request whose records take more than 2 MiB decoded (a default-size 1 MiB request that
   is compressed, or of records under some 200 bytes) decodes off the network I/O threads, at
   most two such decodes at a time. A request that finds both taken waits its turn (in arrival
@@ -124,7 +135,10 @@ pg_kafka.compression_type = 'gzip'
   (outside 0-2) cannot be read fails the whole request, CORRUPT_MESSAGE on every
   partition, as Kafka reads every partition's first batch before it looks at any
   partition (it stops at the first transactional batch, and so does pg_kafka); past a
-  partition's first batch, the same data refuses that partition only. Where Kafka 3.7
+  partition's first batch, the same data refuses that partition only. A request whose
+  first transactional batch comes without a transactional id is answered
+  TRANSACTIONAL_ID_AUTHORIZATION_FAILED (53) on every partition and nothing of it is
+  written (an acks=0 one closes its connection), as Kafka refuses it. Where Kafka 3.7
   answers UNKNOWN_SERVER_ERROR (an unknown codec id, a zstd window past 2^27, data that
   does not decompress) pg_kafka answers CORRUPT_MESSAGE on that partition; Kafka fails the
   whole request for an unknown codec id on Produce v3-v6.

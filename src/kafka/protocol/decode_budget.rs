@@ -9,8 +9,10 @@
 //! them (they write through the budget and stop at its limit; see
 //! `super::recordbatch`):
 //!
-//! * per request, at most [`MAX_DECODED_REQUEST_BYTES`] across all its partitions; beyond
-//!   that the request is answered MESSAGE_TOO_LARGE;
+//! * per request, at most [`MAX_DECODED_REQUEST_BYTES`] across all its partitions; a
+//!   partition that does not fit in what its request may still hold is answered
+//!   MESSAGE_TOO_LARGE on its own, and what its decode charged is given back, as is the
+//!   charge of any partition refused after it began to decode;
 //! * across the process, decoded requests that the DB thread has not run yet hold at most
 //!   [`DECODED_BUDGET_BYTES`] ([`DECODED`]). The decoded request keeps its share
 //!   ([`DecodedCharge`]) until it is dropped after its handler ran.
@@ -20,7 +22,14 @@
 //! section's buffer is charged by its capacity before it grows, and shrunk to its bytes
 //! once decoded, the spare capacity given back. Measured for every codec, at most 2.0
 //! times, besides the decompressors' fixed state (`recordbatch`'s
-//! `a_decode_holds_at_most_twice_its_charge`). The charge a decoded request keeps (its
+//! `a_decode_holds_at_most_twice_its_charge`). The measurement counts every allocation of
+//! the decode, the decompressors' own included: gzip and snappy decode in Rust, zstd's
+//! contexts allocate through Rust's allocator (its whole window, which is charged as it
+//! fills), and lz4's block buffers, which its C library allocates with `malloc`, are
+//! measured through lz4's allocator hook and added. lz4's buffers are fixed by the frame's
+//! block size and not charged: some 128 KiB at Kafka's default 64 KiB blocks, at most about
+//! 8.1 MiB at 4 MiB blocks, per decode running
+//! (`lz4_block_buffers_are_fixed_by_the_frame_header`). The charge a decoded request keeps (its
 //! section's bytes) may be half the most it charged while the section grew; once the
 //! section is dropped the request holds no more than that charge.
 //!
@@ -219,6 +228,14 @@ impl DecodeBudget {
         let n = n.min(self.charged.get());
         self.charged.set(self.charged.get() - n);
         self.pool.give_back(n);
+    }
+
+    /// Give back everything charged since [`Self::charged`] was `mark`, and forget which
+    /// limit a charge ran into since: the decode of a refused partition, whose memory is
+    /// freed, so that it does not count against the partitions after it.
+    pub fn rewind(&self, mark: usize) {
+        self.release(self.charged.get().saturating_sub(mark));
+        self.exhausted.set(None);
     }
 
     /// Bytes this budget may still charge before its limit (the process-wide budget may

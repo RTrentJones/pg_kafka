@@ -9,7 +9,9 @@
 //! allocated (see [`super::decode_budget`]):
 //!
 //! * the records, at [`RECORD_MEMORY`] each, from the record count in the batch header,
-//!   before anything is decompressed;
+//!   before anything is decompressed. A batch whose records alone take more than any
+//!   request may hold ([`MAX_DECODED_REQUEST_BYTES`]) is refused MESSAGE_TOO_LARGE before
+//!   anything is charged, and so is snappy data declaring more;
 //! * the decoded bytes, as the decompressors here produce them: they write through the
 //!   budget, which is charged their buffer's capacity before it grows, and stop at its
 //!   limit, so a compressed batch never expands past what the request may hold. The
@@ -27,8 +29,10 @@ use bytes::{Buf, Bytes};
 use kafka_protocol::records::Compression;
 use tracing::debug;
 
-use super::decode_budget::DecodeBudget;
-use crate::kafka::constants::{ERROR_INVALID_TIMESTAMP, ERROR_UNSUPPORTED_COMPRESSION_TYPE};
+use super::decode_budget::{DecodeBudget, MAX_DECODED_REQUEST_BYTES};
+use crate::kafka::constants::{
+    ERROR_INVALID_TIMESTAMP, ERROR_MESSAGE_TOO_LARGE, ERROR_UNSUPPORTED_COMPRESSION_TYPE,
+};
 use crate::kafka::error::{KafkaError, Result};
 use crate::kafka::messages::{ProducerMetadata, Record, RecordHeader};
 
@@ -84,6 +88,11 @@ pub const RECORD_MEMORY: usize = size_of::<Record>();
 /// least).
 pub const HEADER_MEMORY: usize = size_of::<RecordHeader>();
 
+/// The fewest bytes a record takes in a records section: its size varint and six one-byte
+/// fields (attributes, timestamp delta, offset delta, key length, value length, header
+/// count).
+const MIN_RECORD_SIZE: usize = 7;
+
 /// What one heap block costs beyond its bytes: the smallest block glibc's malloc hands out
 /// (a 1-byte key copy takes 32), or the bookkeeping and rounding of a larger one.
 const ALLOCATION_OVERHEAD: usize = 32;
@@ -96,6 +105,15 @@ fn invalid(message: impl Into<String>) -> KafkaError {
 
 fn corrupt(message: impl Into<String>) -> KafkaError {
     KafkaError::CorruptMessage {
+        message: message.into(),
+    }
+}
+
+/// MESSAGE_TOO_LARGE: a batch that by what it declares takes more memory decoded than any
+/// request may hold, whatever else the request holds.
+fn too_large(message: impl Into<String>) -> KafkaError {
+    KafkaError::Protocol {
+        code: ERROR_MESSAGE_TOO_LARGE,
         message: message.into(),
     }
 }
@@ -245,17 +263,53 @@ fn extract_producer_metadata(batch: &[u8]) -> ProducerMetadata {
     }
 }
 
-/// The least memory `batch` decodes to: its own bytes and its declared records (more if it
-/// is compressed or carries headers). Data that is not a record batch decodes to nothing.
-pub fn least_decoded_memory(batch: &[u8]) -> usize {
-    match check_batch_header(batch) {
-        Ok(size) if size >= RECORD_BATCH_OVERHEAD => {
-            usize::try_from(i32_at(batch, RECORD_COUNT_OFFSET))
-                .unwrap_or(0)
-                .saturating_mul(RECORD_MEMORY)
-                .saturating_add(batch.len())
+/// A batch that passed every check Kafka makes before it reads the records.
+struct Presized {
+    compression: Compression,
+    count: usize,
+}
+
+/// The checks of a batch (one that passed [`check_batch_header`], cut to its size) before
+/// its records are read or anything is charged: [`check_batch_integrity`],
+/// [`validate_batch`], then two that bound what it may decode to. An uncompressed section
+/// too short to hold the declared records is INVALID_RECORD, as Kafka answers once it runs
+/// out of records; a batch whose declared records (and uncompressed section) alone take
+/// more than any request may hold is MESSAGE_TOO_LARGE, as it could never decode.
+fn presize(batch: &[u8]) -> Result<Presized> {
+    let compression = check_batch_integrity(batch)?;
+    let count = validate_batch(batch)?;
+    let section = batch.len() - RECORD_BATCH_OVERHEAD;
+    let mut least = count.saturating_mul(RECORD_MEMORY);
+    if compression == Compression::None {
+        if count > section / MIN_RECORD_SIZE {
+            return Err(invalid(format!(
+                "a records section of {section} bytes cannot hold {count} records"
+            )));
         }
-        _ => 0,
+        least = least.saturating_add(section);
+    }
+    if least > MAX_DECODED_REQUEST_BYTES {
+        return Err(too_large(format!(
+            "record batch of {count} records takes at least {least} bytes decoded"
+        )));
+    }
+    Ok(Presized { compression, count })
+}
+
+/// The least memory a Produce partition's data decodes to: its own bytes and its declared
+/// records (more if it is compressed or carries headers). Data refused before its records
+/// are read ([`validate_produce_records`], then the checks [`parse_record_batch`] makes
+/// first) decodes to nothing.
+pub fn least_decoded_memory(batch: &[u8], zstd_allowed: bool) -> usize {
+    if validate_produce_records(batch, zstd_allowed).is_err() {
+        return 0;
+    }
+    match check_batch_header(batch).and_then(|size| presize(&batch[..size])) {
+        Ok(presized) => presized
+            .count
+            .saturating_mul(RECORD_MEMORY)
+            .saturating_add(batch.len()),
+        Err(_) => 0,
     }
 }
 
@@ -444,6 +498,18 @@ fn snappy_blocks(data: &[u8]) -> impl Iterator<Item = anyhow::Result<&[u8]>> {
     })
 }
 
+/// Decoded data that declares more bytes than any request may hold.
+#[derive(Debug)]
+struct NeverFits(usize);
+
+impl std::fmt::Display for NeverFits {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "snappy data declares {} decoded bytes", self.0)
+    }
+}
+
+impl std::error::Error for NeverFits {}
+
 /// Snappy (xerial-framed or raw): the blocks' declared lengths are summed and charged, and
 /// the output allocated once at that size, before any block decodes.
 fn decompress_snappy(data: &Bytes, budget: &DecodeBudget) -> anyhow::Result<Bytes> {
@@ -451,6 +517,9 @@ fn decompress_snappy(data: &Bytes, budget: &DecodeBudget) -> anyhow::Result<Byte
     let mut total = 0usize;
     for block in snappy_blocks(data) {
         total = total.saturating_add(decompress_len(block?)?);
+    }
+    if total > MAX_DECODED_REQUEST_BYTES {
+        return Err(NeverFits(total).into());
     }
     budget.take(total).map_err(|_| over_budget())?;
     let mut out = vec![0; total];
@@ -739,15 +808,18 @@ fn check_log_append_time(attributes: i16, max_timestamp: i64) -> Result<()> {
 /// Parse a partition's record data (one RecordBatch v2) into its records, charging their
 /// memory to `budget` (see the module docs). Checks run in Kafka 3.7's order: the framing
 /// (`check_batch_header`, `check_after_batch`), the base offset, header size, CRC32C and
-/// codec (`check_batch_integrity`), the header fields (`validate_batch`), the records,
-/// then their timestamps (`check_log_append_time`, after every record read, as Kafka
-/// collects record errors and fails the batch with them once its records are read).
+/// codec (`check_batch_integrity`), the header fields (`validate_batch`), what the batch
+/// may decode to (`presize`), the records, then their timestamps
+/// (`check_log_append_time`, after every record read, as Kafka collects record errors and
+/// fails the batch with them once its records are read).
+///
+/// What a failed parse charged stays charged to `budget` (the caller gives it back,
+/// `DecodeBudget::rewind`); the memory it stood for is freed when this returns.
 pub fn parse_record_batch(batch_bytes: &Bytes, budget: &DecodeBudget) -> Result<Vec<Record>> {
     let size = check_batch_header(batch_bytes)?;
     check_after_batch(&batch_bytes[size..])?;
     let batch = batch_bytes.slice(..size);
-    let compression = check_batch_integrity(&batch)?;
-    let count = validate_batch(&batch)?;
+    let Presized { compression, count } = presize(&batch)?;
     let mut fields = &batch[ATTRIBUTES_OFFSET..];
     let attributes = fields.get_i16();
     fields.advance(4); // lastOffsetDelta
@@ -763,6 +835,7 @@ pub fn parse_record_batch(batch_bytes: &Bytes, budget: &DecodeBudget) -> Result<
     }
     let section = match decompress(batch.slice(RECORD_BATCH_OVERHEAD..), compression, budget) {
         Ok(section) => section,
+        Err(e) if e.is::<NeverFits>() => return Err(too_large(e.to_string())),
         Err(e) if budget.exhausted().is_some() => return Err(at_the_limit(&e)),
         Err(e) => return Err(corrupt(format!("record batch does not decompress: {e}"))),
     };
@@ -869,9 +942,138 @@ mod tests {
     }
 
     /// What the decompressors and record readers hold beyond their charge besides the
-    /// decoded bytes: their own state (inflate's window, an lz4 frame's block buffer, a
+    /// decoded bytes: their own state (inflate's window, an lz4 frame's block buffers, a
     /// zstd context), which does not grow with the batch.
     const DECODER_STATE: usize = 512 * 1024;
+
+    /// lz4's frame decoder allocates its block buffers with the C runtime's `malloc`, which
+    /// [`crate::testing::heap_peak`] does not see (gzip and snappy decode in Rust; zstd's
+    /// contexts allocate through Rust's allocator, the `with-rust-allocator` feature).
+    /// This decodes the lz4 frame `frame` with a context created through lz4frame.h's
+    /// allocator hook (`LZ4F_createDecompressionContext_advanced`), its allocations going
+    /// through Rust's allocator, and returns what it held at most: what decoding the same
+    /// frame makes lz4 allocate, as its buffers depend on the frame header only (they are
+    /// allocated as it is read and kept to the end).
+    mod lz4_c {
+        use std::alloc::{alloc, dealloc, Layout};
+        use std::ffi::c_void;
+        use std::ptr::{null, null_mut};
+
+        /// Bytes before each block holding its allocation size (and keeping malloc's
+        /// 16-byte alignment).
+        const HEADER: usize = 16;
+
+        unsafe extern "C" fn rust_alloc(_opaque: *mut c_void, size: usize) -> *mut c_void {
+            let Ok(layout) = Layout::from_size_align(size.saturating_add(HEADER), HEADER) else {
+                return null_mut();
+            };
+            // SAFETY: the layout's size is at least HEADER, never zero.
+            let base = unsafe { alloc(layout) };
+            if base.is_null() {
+                return null_mut();
+            }
+            #[expect(
+                clippy::cast_ptr_alignment,
+                reason = "the allocation is aligned to HEADER, 16 bytes"
+            )]
+            // SAFETY: `base` is valid for `layout.size()` bytes and aligned for a usize; the
+            // block handed out starts HEADER bytes in, within the allocation.
+            unsafe {
+                base.cast::<usize>().write(layout.size());
+                base.add(HEADER).cast()
+            }
+        }
+
+        unsafe extern "C" fn rust_free(_opaque: *mut c_void, address: *mut c_void) {
+            if address.is_null() {
+                return;
+            }
+            // SAFETY: lz4 frees only blocks `rust_alloc` handed out, HEADER bytes past the
+            // start of an allocation whose size it wrote there, with this layout.
+            unsafe {
+                let base = address.cast::<u8>().sub(HEADER);
+                #[expect(
+                    clippy::cast_ptr_alignment,
+                    reason = "the allocation is aligned to HEADER, 16 bytes"
+                )]
+                let size = base.cast::<usize>().read();
+                dealloc(base, Layout::from_size_align_unchecked(size, HEADER));
+            }
+        }
+
+        /// `LZ4F_CustomMem`.
+        #[repr(C)]
+        struct CustomMem {
+            alloc: unsafe extern "C" fn(*mut c_void, usize) -> *mut c_void,
+            calloc: Option<unsafe extern "C" fn(*mut c_void, usize) -> *mut c_void>,
+            free: unsafe extern "C" fn(*mut c_void, *mut c_void),
+            opaque: *mut c_void,
+        }
+
+        /// `LZ4F_VERSION`.
+        const LZ4F_VERSION: u32 = 100;
+
+        extern "C" {
+            fn LZ4F_createDecompressionContext_advanced(
+                custom_mem: CustomMem,
+                version: u32,
+            ) -> *mut c_void;
+            fn LZ4F_decompress(
+                ctx: *mut c_void,
+                dst: *mut u8,
+                dst_size: *mut usize,
+                src: *const u8,
+                src_size: *mut usize,
+                options: *const c_void,
+            ) -> usize;
+            fn LZ4F_freeDecompressionContext(ctx: *mut c_void) -> usize;
+            fn LZ4F_isError(code: usize) -> u32;
+        }
+
+        pub(super) fn peak(frame: &[u8]) -> usize {
+            let ((), peak) = crate::testing::heap_peak(|| {
+                let mem = CustomMem {
+                    alloc: rust_alloc,
+                    calloc: None,
+                    free: rust_free,
+                    opaque: null_mut(),
+                };
+                // SAFETY: `mem`'s functions allocate and free as lz4 expects of malloc and
+                // free; the context is freed below.
+                let ctx = unsafe { LZ4F_createDecompressionContext_advanced(mem, LZ4F_VERSION) };
+                assert!(!ctx.is_null());
+                let mut out = vec![0u8; 64 * 1024];
+                let mut src = frame;
+                loop {
+                    let mut dst_size = out.len();
+                    let mut src_size = src.len();
+                    // SAFETY: `out` and `src` are valid for the sizes passed; lz4 writes back
+                    // how much it wrote and read, within them.
+                    let hint = unsafe {
+                        LZ4F_decompress(
+                            ctx,
+                            out.as_mut_ptr(),
+                            &raw mut dst_size,
+                            src.as_ptr(),
+                            &raw mut src_size,
+                            null(),
+                        )
+                    };
+                    // SAFETY: a pure function of its argument.
+                    assert_eq!(unsafe { LZ4F_isError(hint) }, 0, "the frame decodes");
+                    src = &src[src_size..];
+                    if hint == 0 || (src.is_empty() && dst_size == 0) {
+                        break;
+                    }
+                }
+                // SAFETY: `ctx` came from LZ4F_createDecompressionContext_advanced and is
+                // not used again.
+                unsafe { LZ4F_freeDecompressionContext(ctx) };
+            });
+            // The 64 KiB output buffer is this measurement's, not lz4's.
+            peak - 64 * 1024
+        }
+    }
 
     #[test]
     fn a_decode_holds_at_most_twice_its_charge() {
@@ -885,15 +1087,54 @@ mod tests {
                 many_records_batch(2000, 600, compression),
             ] {
                 let budget = budget();
-                let (records, peak) =
+                let (records, rust) =
                     crate::testing::heap_peak(|| parse_record_batch(&batch, &budget).unwrap());
+                let c = if compression == Compression::Lz4 {
+                    lz4_c::peak(&batch[RECORD_BATCH_OVERHEAD..])
+                } else {
+                    0
+                };
+                let peak = rust + c;
                 let charged = budget.most_charged();
+                println!(
+                    "{compression:?}: held {peak} ({c} by lz4's C side) for a charge of {charged}"
+                );
                 assert!(
                     peak <= 2 * charged + DECODER_STATE,
                     "{compression:?}: held {peak} bytes for a charge of {charged}"
                 );
                 drop(records);
             }
+        }
+    }
+
+    #[test]
+    fn lz4_block_buffers_are_fixed_by_the_frame_header() {
+        // What lz4 allocates in C for a frame is set by its block size and mode alone, not
+        // by how much it decodes: some 2 x 64 KiB at Kafka's (and Java's) default block
+        // size, up to 2 x 4 MiB + 128 KiB at the largest a frame may name. It is not
+        // charged; at most two inline and two large decodes run at once.
+        let frame = |len: usize, block_size| {
+            let mut encoder = lz4::EncoderBuilder::new()
+                .block_size(block_size)
+                .build(Vec::new())
+                .unwrap();
+            encoder.write_all(&vec![0u8; len]).unwrap();
+            let (frame, result) = encoder.finish();
+            result.unwrap();
+            frame
+        };
+        for (block_size, block) in [
+            (lz4::BlockSize::Max64KB, 64 << 10),
+            (lz4::BlockSize::Max4MB, 4 << 20),
+        ] {
+            let small = lz4_c::peak(&frame(1000, block_size.clone()));
+            let large = lz4_c::peak(&frame(20_000_000, block_size));
+            assert_eq!(small, large, "{block} bytes a block");
+            assert!(
+                (2 * block..=2 * block + (128 << 10) + 1024).contains(&large),
+                "{block} bytes a block: {large}"
+            );
         }
     }
 
@@ -1311,32 +1552,102 @@ mod tests {
     fn least_decoded_memory_counts_the_declared_records() {
         let batch = raw_batch(&tiny_records(1000), 1000, true);
         assert_eq!(
-            least_decoded_memory(&batch),
+            least_decoded_memory(&batch, true),
             batch.len() + 1000 * RECORD_MEMORY
         );
-        assert_eq!(least_decoded_memory(b"not a batch"), 0);
+        assert_eq!(least_decoded_memory(b"not a batch", true), 0);
+        // Batches refused before they decode take nothing: their records do not match
+        // their count, or take more than any request may hold.
+        let section = tiny_records(1000);
+        assert_eq!(
+            least_decoded_memory(&raw_batch(&section, 1001, false), true),
+            0
+        );
+        let n = 1_200_000;
+        let too_many = raw_batch(&tiny_records(n), i32::try_from(n).unwrap(), false);
+        assert_eq!(least_decoded_memory(&too_many, true), 0);
     }
 
     #[test]
     fn a_batch_of_tiny_records_is_charged_their_memory_before_it_decodes() {
         // 1.5 million 7-byte records: 10 MB decoded, 60 KB of gzip on the wire, and some
-        // 400 MB once decoded into records. The declared count is charged before anything
-        // decompresses, so the batch stops at the request limit having decoded nothing.
+        // 130 MB once decoded into records, more than any request may hold. Refused
+        // MESSAGE_TOO_LARGE from the declared count, before anything is charged or
+        // decompressed.
         let n = 1_500_000;
         let batch = raw_batch(&tiny_records(n), i32::try_from(n).unwrap(), true);
         assert!(batch.len() < 100_000, "{} bytes on the wire", batch.len());
         let budget = budget();
         let (err, spent) = crate::testing::cpu_time(|| parse_record_batch(&batch, &budget));
         let err = err.unwrap_err();
-        assert_eq!(budget.exhausted(), Some(Exhausted::Limit), "{err}");
-        assert_eq!(budget.charged(), 0, "nothing decoded");
+        assert_eq!(code(&err), ERROR_MESSAGE_TOO_LARGE, "{err}");
+        assert_eq!(budget.exhausted(), None, "{err}");
+        assert_eq!(budget.charged(), 0, "nothing charged");
         assert!(spent < std::time::Duration::from_millis(50), "{spent:?}");
 
-        // Under the inline limit the same shape stops at a few thousand records.
+        // Within the request limit, the count is charged before anything decompresses:
+        // against the inline limit the same shape stops at once, having decoded nothing.
         let small = DecodeBudget::new(1024 * 1024);
         let batch = raw_batch(&tiny_records(150_000), 150_000, true);
         assert!(parse_record_batch(&batch, &small).is_err());
         assert_eq!(small.exhausted(), Some(Exhausted::Limit));
+        assert_eq!(small.charged(), 0, "nothing decoded");
+    }
+
+    #[test]
+    fn records_an_uncompressed_section_cannot_hold_are_refused_before_they_are_charged() {
+        use crate::kafka::constants::ERROR_INVALID_RECORD;
+        // One 7-byte record declared as 2 million, consistent with lastOffsetDelta: Kafka
+        // answers INVALID_RECORD once it runs out of records; so does this, before the
+        // 176 MB of records are charged.
+        let batch = raw_batch(&tiny_records(1), 2_000_000, false);
+        let budget = budget();
+        let err = parse_record_batch(&batch, &budget).unwrap_err();
+        assert_eq!(code(&err), ERROR_INVALID_RECORD, "{err}");
+        assert_eq!(budget.charged(), 0);
+        // Seven bytes a record is the least there is: a section that holds them decodes.
+        let section = tiny_records(1000);
+        assert_eq!(
+            parse_record_batch(&raw_batch(&section, 1000, false), &budget)
+                .unwrap()
+                .len(),
+            1000
+        );
+    }
+
+    #[test]
+    fn snappy_declaring_more_than_a_request_may_hold_is_refused_before_it_is_charged() {
+        // A raw snappy block whose preamble declares 4 GB - 1, and xerial blocks summing
+        // past 100 MB: MESSAGE_TOO_LARGE, nothing charged for the output.
+        let raw = batch_with(
+            &[0xff, 0xff, 0xff, 0xff, 0x0f, 0, 0, 0, 0],
+            1,
+            Header {
+                attributes: 2,
+                ..Header::default()
+            },
+        );
+        let block = [0x80, 0x80, 0x80, 0x19, 0];
+        let mut xerial = XERIAL_SNAPPY_HEADER.to_vec();
+        for _ in 0..2 {
+            xerial.extend_from_slice(&u32::try_from(block.len()).unwrap().to_be_bytes());
+            xerial.extend_from_slice(&block);
+        }
+        let xerial = batch_with(
+            &xerial,
+            1,
+            Header {
+                attributes: 2,
+                ..Header::default()
+            },
+        );
+        for batch in [raw, xerial] {
+            let budget = budget();
+            let err = parse_record_batch(&batch, &budget).unwrap_err();
+            assert_eq!(code(&err), ERROR_MESSAGE_TOO_LARGE, "{err}");
+            assert_eq!(budget.exhausted(), None);
+            assert_eq!(budget.charged(), RECORD_MEMORY, "the one record only");
+        }
     }
 
     #[test]
@@ -1721,8 +2032,10 @@ mod tests {
                 Bytes::from([&short_v2[..], &ok[..]].concat()),
                 ERROR_CORRUPT_MESSAGE,
             ),
-            // Kafka checks the base offset before the batch's size and CRC, and the codec
-            // before the header fields.
+            // Kafka checks the base offset before the batch's size and CRC. The codec is
+            // checked before the header fields here too; an unknown codec id is
+            // CORRUPT_MESSAGE, where Kafka answers UNKNOWN_SERVER_ERROR whatever the header
+            // fields hold (a documented deviation).
             (
                 "a base offset other than 0 and a bad CRC",
                 Bytes::from(base_5_bad_crc),
