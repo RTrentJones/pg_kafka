@@ -83,7 +83,7 @@ mod store {
             fn delete_consumer_group_offsets<'a>(&self, group_id: &'a str) -> Result<()>;
                 fn list_offset_groups(&self) -> Result<Vec<String>>;
             fn groups_with_offsets<'a>(&self, group_ids: &'a [String]) -> Result<std::collections::HashSet<String>>;
-            fn pending_txn_offset_partitions<'a>(&self, group_id: &'a str) -> Result<Vec<(String, i32)>>;
+            fn pending_txn_offset_partitions<'a>(&self, group_id: &'a str, partitions: Option<&'a [(i32, i32)]>) -> Result<Vec<(String, i32)>>;
         }
 
         impl ProducerStore for KafkaStore {

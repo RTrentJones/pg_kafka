@@ -595,6 +595,73 @@ pub async fn test_offset_fetch_reads_only_the_requested_partitions() -> TestResu
     Ok(())
 }
 
+/// OffsetFetch v7 with require_stable (what the Java consumer sends under read_committed)
+/// of two partitions, while an open transaction holds 300,000 pending offsets of another
+/// group and 200,000 of this group's other partitions: only the requested partitions'
+/// pending offsets are read. Reading the group's pending partitions (with no index that
+/// leads with the group, a scan of every group's) held the DB thread for every such fetch.
+pub async fn test_require_stable_offset_fetch_reads_only_the_requested_pending_partitions(
+) -> TestResult {
+    println!("=== Test: require_stable OffsetFetch beside 500,000 pending offsets ===\n");
+    let (ctx, probe) = setup("ofs").await?;
+    let group = ctx.unique_group("net-fan-ofs").await;
+    let other_group = ctx.unique_group("net-fan-ofs-other").await;
+    let (txn, pid, epoch) = transactional_producer(&ctx).await?;
+    let mut w = Wire::connect().await?;
+    assert_eq!(w.add_offsets(&txn, pid, epoch, &group).await?, 0);
+    ctx.db()
+        .execute(
+            "INSERT INTO kafka.txn_pending_offsets
+                 (transactional_id, group_id, topic_id, partition_id, pending_offset)
+             SELECT $1, g.group_id, t.id, p, p
+             FROM kafka.topics t,
+                  (VALUES ($2, 300000), ($3, 200000)) AS g(group_id, n),
+                  generate_series(0, g.n - 1) AS p
+             WHERE t.name = $4 AND (g.group_id = $2 OR p <> 8)",
+            &[&txn, &other_group, &group, &probe],
+        )
+        .await?;
+    ctx.db()
+        .execute("ANALYZE kafka.txn_pending_offsets", &[])
+        .await?;
+    let mut t = OffsetFetchRequestTopic::default();
+    t.name = topic_name(&probe);
+    t.partition_indexes = vec![7, 8];
+    let mut req = OffsetFetchRequest::default();
+    req.group_id = GroupId(s(&group));
+    req.topics = Some(vec![t]);
+    req.require_stable = true;
+    let m = measure(&probe, 7, &req).await?;
+    let answers: Vec<(i32, i64, i16)> = m
+        .response
+        .topics
+        .iter()
+        .flat_map(|t| {
+            t.partitions
+                .iter()
+                .map(|p| (p.partition_index, p.committed_offset, p.error_code))
+        })
+        .collect();
+    println!(
+        "  answered {answers:?} (top-level {})",
+        m.response.error_code
+    );
+    assert_not_stalled(&m);
+    assert_eq!(m.response.error_code, 0);
+    assert_eq!(
+        answers,
+        vec![
+            (7, -1, crate::error_codes::UNSTABLE_OFFSET_COMMIT),
+            (8, -1, 0)
+        ],
+        "the pending partition is unstable, the other has no offset"
+    );
+    assert_eq!(w.end_txn(&txn, pid, epoch, false).await?, 0);
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
 /// DeleteRecords v0 of partition 0 of one topic 15,000 times (180 KB): Kafka truncates the
 /// partition once, to its last entry's offset, and answers it once.
 pub async fn test_delete_records_of_a_repeated_partition_is_answered_quickly() -> TestResult {

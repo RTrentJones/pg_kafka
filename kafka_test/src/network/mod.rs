@@ -198,6 +198,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         fanout::test_offset_commit_of_a_repeated_partition_is_answered_quickly: sequential,
         fanout::test_offset_fetch_of_a_repeated_partition_is_answered_quickly: sequential,
         fanout::test_offset_fetch_reads_only_the_requested_partitions: sequential,
+        fanout::test_require_stable_offset_fetch_reads_only_the_requested_pending_partitions: sequential,
         fanout::test_delete_records_of_a_repeated_partition_is_answered_quickly: sequential,
         fanout::test_create_topics_of_many_names_is_answered_quickly: sequential,
         fanout::test_delete_topics_of_many_missing_names_is_answered_quickly: sequential,

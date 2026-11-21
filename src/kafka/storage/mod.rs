@@ -574,9 +574,14 @@ pub trait OffsetStore {
     /// Which of `group_ids` have at least one committed offset, in one statement.
     fn groups_with_offsets(&self, group_ids: &[String]) -> Result<HashSet<String>>;
     /// The `(topic name, partition)` pairs of `group_id` that have a transactional
-    /// offset commit (TxnOffsetCommit) whose transaction has not ended yet. OffsetFetch
-    /// with `require_stable` (KIP-447) answers UNSTABLE_OFFSET_COMMIT for them.
-    fn pending_txn_offset_partitions(&self, group_id: &str) -> Result<Vec<(String, i32)>>;
+    /// offset commit (TxnOffsetCommit) whose transaction has not ended yet: among
+    /// `partitions` (`(topic_id, partition_id)`) when given, of the whole group otherwise.
+    /// OffsetFetch with `require_stable` (KIP-447) answers UNSTABLE_OFFSET_COMMIT for them.
+    fn pending_txn_offset_partitions(
+        &self,
+        group_id: &str,
+        partitions: Option<&[(i32, i32)]>,
+    ) -> Result<Vec<(String, i32)>>;
 }
 
 /// Idempotent producer state: producer ids, epochs and sequence numbers.

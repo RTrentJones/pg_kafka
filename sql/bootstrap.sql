@@ -789,6 +789,12 @@ CREATE TABLE kafka.txn_pending_offsets (
     PRIMARY KEY (transactional_id, group_id, topic_id, partition_id)
 );
 
+-- Pending offsets by group: OffsetFetch with require_stable (KIP-447, the Java consumer
+-- under read_committed) asks for the group's pending partitions, and the primary key leads
+-- with the transactional id, so without this every group's pending rows would be scanned.
+CREATE INDEX idx_txn_pending_offsets_group
+ON kafka.txn_pending_offsets(group_id, topic_id, partition_id);
+
 -- Unique index for transactional_id lookup (fencing - one producer per transactional_id)
 CREATE UNIQUE INDEX idx_producer_ids_txn_id_unique
 ON kafka.producer_ids(transactional_id)

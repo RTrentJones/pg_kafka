@@ -1049,6 +1049,12 @@ CREATE INDEX idx_transactions_ongoing_producer
 ON kafka.transactions(producer_id)
 WHERE state = 'Ongoing';
 
+-- Pending offsets by group: OffsetFetch with require_stable (KIP-447, the Java consumer
+-- under read_committed) asks for the group's pending partitions, and the primary key leads
+-- with the transactional id, so without this every group's pending rows would be scanned.
+CREATE INDEX idx_txn_pending_offsets_group
+ON kafka.txn_pending_offsets(group_id, topic_id, partition_id);
+
 GRANT SELECT ON kafka.producer_batches TO pgkafka_reader;
 GRANT SELECT ON kafka.txn_partitions TO pgkafka_reader;
 GRANT SELECT, INSERT, UPDATE, DELETE ON kafka.producer_batches TO pgkafka_worker;

@@ -234,29 +234,40 @@ pub fn handle_offset_fetch(
     require_stable: bool,
 ) -> Result<OffsetFetchResponse> {
     let store = ctx.store;
-    // Partitions with a pending transactional commit (require_stable only).
-    let mut unstable = Unstable::new();
-    if require_stable {
-        for (topic, partition) in store.pending_txn_offset_partitions(group_id)? {
-            unstable.entry(topic).or_default().insert(partition);
-        }
-    }
-
     let mut kafka_response = OffsetFetchResponse::default();
     kafka_response.throttle_time_ms = 0;
     kafka_response.error_code = ERROR_NONE;
-    match topics {
-        Some(topics) => {
-            kafka_response.topics = fetch_requested_offsets(store, group_id, topics, &unstable);
-        }
+    if let Some(topics) = topics {
+        kafka_response.topics = fetch_requested_offsets(store, group_id, topics, require_stable)?;
+    } else {
+        let unstable = if require_stable {
+            unstable_partitions(store, group_id, None)?
+        } else {
+            Unstable::new()
+        };
         // A fetch-all storage failure is a top-level error: a success with no offsets
         // reads to a consumer as "no committed offsets", and it may reset.
-        None => match fetch_all_group_offsets(store, group_id, &unstable) {
+        match fetch_all_group_offsets(store, group_id, &unstable) {
             Ok(topics) => kafka_response.topics = topics,
             Err(error_code) => kafka_response.error_code = error_code,
-        },
+        }
     }
     Ok(kafka_response)
+}
+
+/// The partitions of `group_id` with a pending transactional commit (require_stable):
+/// among `requested` (`(topic_id, partition)`) only when given, so another transaction's
+/// many pending partitions of the group are not read for a request that names a few.
+fn unstable_partitions(
+    store: &dyn KafkaStore,
+    group_id: &str,
+    requested: Option<&[(i32, i32)]>,
+) -> Result<Unstable> {
+    let mut unstable = Unstable::new();
+    for (topic, partition) in store.pending_txn_offset_partitions(group_id, requested)? {
+        unstable.entry(topic).or_default().insert(partition);
+    }
+    Ok(unstable)
 }
 
 /// The committed offsets of the requested partitions: each distinct topic once, with each
@@ -268,8 +279,8 @@ fn fetch_requested_offsets(
     store: &dyn KafkaStore,
     group_id: &str,
     topics: Vec<OffsetFetchTopicData>,
-    unstable: &Unstable,
-) -> Vec<OffsetFetchResponseTopic> {
+    require_stable: bool,
+) -> Result<Vec<OffsetFetchResponseTopic>> {
     let topics = merge_by_partition(
         topics.into_iter().map(|t| (t.name, t.partition_indexes)),
         |&p| p,
@@ -284,6 +295,11 @@ fn fetch_requested_offsets(
             .flat_map(|(topic_id, partitions)| partitions.iter().map(move |&p| (topic_id, p)))
             .collect(),
         Err(_) => Vec::new(),
+    };
+    let unstable = if require_stable {
+        unstable_partitions(store, group_id, Some(&requested))?
+    } else {
+        Unstable::new()
     };
     let mut committed: std::result::Result<HashMap<(i32, i32), CommittedOffset>, i16> =
         if requested.is_empty() {
@@ -303,7 +319,7 @@ fn fetch_requested_offsets(
                 })
         };
     drop(requested);
-    topics
+    Ok(topics
         .into_iter()
         .map(|(name, partition_indexes)| {
             let (topic_id, topic_error) = match &resolved {
@@ -343,7 +359,7 @@ fn fetch_requested_offsets(
             topic_response.partitions = partitions;
             topic_response
         })
-        .collect()
+        .collect())
 }
 
 /// Every committed offset of the group, by topic, or the error code of a failed read.
@@ -501,10 +517,12 @@ mod tests {
                 })
                 .collect())
         });
+        // Only the requested partitions are read (KIP-447 require_stable).
         store
             .expect_pending_txn_offset_partitions()
+            .withf(|group, partitions| group == "g" && *partitions == Some(&[(1, 0), (1, 1)][..]))
             .times(1)
-            .returning(|_| Ok(vec![("t".to_string(), 0)]));
+            .returning(|_, _| Ok(vec![("t".to_string(), 0)]));
         let env = TestEnv::new();
         let ctx = env.ctx(&store);
         let topics = || {
@@ -527,6 +545,41 @@ mod tests {
             .partitions
             .iter()
             .all(|p| p.committed_offset == 5));
+    }
+
+    /// A require_stable fetch of all the group's offsets reads the group's pending
+    /// partitions whatever they are: no partition list.
+    #[test]
+    fn test_offset_fetch_all_require_stable_reads_the_groups_pending_partitions() {
+        let mut store = MockKafkaStore::new();
+        store.expect_fetch_all_offsets().returning(|_| {
+            let offset = |offset| CommittedOffset {
+                offset,
+                metadata: None,
+            };
+            Ok(vec![
+                ("t".to_string(), 0, offset(5)),
+                ("t".to_string(), 1, offset(6)),
+            ])
+        });
+        store
+            .expect_pending_txn_offset_partitions()
+            .withf(|group, partitions| group == "g" && partitions.is_none())
+            .times(1)
+            .returning(|_, _| Ok(vec![("t".to_string(), 1)]));
+        let env = TestEnv::new();
+        let ctx = env.ctx(&store);
+        let resp = handle_offset_fetch(&ctx, "g", None, true).unwrap();
+        let mut parts: Vec<(i32, i16, i64)> = resp.topics[0]
+            .partitions
+            .iter()
+            .map(|p| (p.partition_index, p.error_code, p.committed_offset))
+            .collect();
+        parts.sort_unstable();
+        assert_eq!(
+            parts,
+            vec![(0, ERROR_NONE, 5), (1, ERROR_UNSTABLE_OFFSET_COMMIT, -1)]
+        );
     }
 
     /// Kafka 3.7 stores a repeated OffsetCommit partition once, with its last entry, and
@@ -590,7 +643,7 @@ mod tests {
             .returning(|_, _| Ok(Vec::new()));
         store
             .expect_pending_txn_offset_partitions()
-            .returning(|_| Ok(Vec::new()));
+            .returning(|_, _| Ok(Vec::new()));
         let env = TestEnv::new();
         let ctx = env.ctx(&store);
         let topics = vec![OffsetFetchTopicData {

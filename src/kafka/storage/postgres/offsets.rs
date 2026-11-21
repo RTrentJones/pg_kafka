@@ -173,17 +173,44 @@ impl PostgresStore {
         .map_err(internal("groups_with_offsets"))
     }
 
-    pub(super) fn pending_txn_offset_partitions(group_id: &str) -> Result<Vec<(String, i32)>> {
+    /// The `(topic name, partition)` pairs of `group_id` with a pending transactional
+    /// offset: of `partitions` (`(topic_id, partition_id)`) only, by index lookups, when
+    /// given; of the whole group otherwise. Both lead with the group on
+    /// `idx_txn_pending_offsets_group`, so another group's open transaction is never read.
+    pub(super) fn pending_txn_offset_partitions(
+        group_id: &str,
+        partitions: Option<&[(i32, i32)]>,
+    ) -> Result<Vec<(String, i32)>> {
         // KIP-447 require_stable: rows exist only while the transaction that wrote them
         // is open (EndTxn, the timeout sweep and InitProducerId delete them).
+        if partitions.is_some_and(<[(i32, i32)]>::is_empty) {
+            return Ok(Vec::new());
+        }
         Spi::connect(|client| {
-            let table = client.select(
-                "SELECT DISTINCT t.name, p.partition_id
-                 FROM kafka.txn_pending_offsets p JOIN kafka.topics t ON t.id = p.topic_id
-                 WHERE p.group_id = $1",
-                None,
-                &[group_id.into()],
-            )?;
+            let table = match partitions {
+                Some(partitions) => {
+                    let (topic_ids, partition_ids): (Vec<i32>, Vec<i32>) =
+                        partitions.iter().copied().unzip();
+                    client.select(
+                        "SELECT DISTINCT t.name, p.partition_id
+                         FROM unnest($2::int[], $3::int[]) AS r(topic_id, partition_id)
+                         JOIN kafka.txn_pending_offsets p
+                           ON p.group_id = $1
+                          AND p.topic_id = r.topic_id
+                          AND p.partition_id = r.partition_id
+                         JOIN kafka.topics t ON t.id = p.topic_id",
+                        None,
+                        &[group_id.into(), topic_ids.into(), partition_ids.into()],
+                    )?
+                }
+                None => client.select(
+                    "SELECT DISTINCT t.name, p.partition_id
+                     FROM kafka.txn_pending_offsets p JOIN kafka.topics t ON t.id = p.topic_id
+                     WHERE p.group_id = $1",
+                    None,
+                    &[group_id.into()],
+                )?,
+            };
             let mut out = Vec::new();
             for row in table {
                 let name: String = row.get_by_name("name")?.unwrap_or_default();

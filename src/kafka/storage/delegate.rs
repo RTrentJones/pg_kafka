@@ -361,8 +361,8 @@ macro_rules! delegate_offset_store {
         fn groups_with_offsets(&self, group_ids: &[String]) -> $crate::kafka::error::Result<std::collections::HashSet<String>> {
             $via::groups_with_offsets(group_ids)
         }
-        fn pending_txn_offset_partitions(&self, group_id: &str) -> $crate::kafka::error::Result<Vec<(String, i32)>> {
-            $via::pending_txn_offset_partitions(group_id)
+        fn pending_txn_offset_partitions(&self, group_id: &str, partitions: Option<&[(i32, i32)]>) -> $crate::kafka::error::Result<Vec<(String, i32)>> {
+            $via::pending_txn_offset_partitions(group_id, partitions)
         }
     };
     ($via:ident, $field:ident) => {
@@ -384,8 +384,8 @@ macro_rules! delegate_offset_store {
         fn groups_with_offsets(&self, group_ids: &[String]) -> $crate::kafka::error::Result<std::collections::HashSet<String>> {
             $via::groups_with_offsets(&self.$field, group_ids)
         }
-        fn pending_txn_offset_partitions(&self, group_id: &str) -> $crate::kafka::error::Result<Vec<(String, i32)>> {
-            $via::pending_txn_offset_partitions(&self.$field, group_id)
+        fn pending_txn_offset_partitions(&self, group_id: &str, partitions: Option<&[(i32, i32)]>) -> $crate::kafka::error::Result<Vec<(String, i32)>> {
+            $via::pending_txn_offset_partitions(&self.$field, group_id, partitions)
         }
     };
 }
