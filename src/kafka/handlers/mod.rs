@@ -29,8 +29,8 @@ pub use configs::{
 pub use consumer::{handle_offset_commit, handle_offset_fetch};
 pub use coordinator::{
     handle_describe_groups, handle_find_coordinator, handle_heartbeat, handle_join_group,
-    handle_leave_group, handle_list_groups, handle_sync_group, JoinGroupReply,
-    JoinGroupRequestData, SyncGroupReply,
+    handle_leave_group, handle_list_groups, handle_sync_group, normalize_join_group_response,
+    JoinGroupReply, JoinGroupRequestData, SyncGroupReply,
 };
 pub use fetch::{handle_fetch, handle_fetch_with_max_bytes, handle_list_offsets};
 pub use helpers::{resolve_topic_id, topic_resolution_error_code, TopicResolution};

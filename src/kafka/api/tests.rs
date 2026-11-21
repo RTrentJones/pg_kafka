@@ -46,6 +46,25 @@ fn encode_default_request(api_key: i16, version: i16, buf: &mut BytesMut) {
             panic!("no sample for api_key {}", api_key);
         };
     }
+    // The group APIs refuse the empty default group id (INVALID_GROUP_ID); name one.
+    macro_rules! with_group {
+        ($($t:ty),*) => {
+            $(
+                if api_key == <$t as WireRequest>::KEY {
+                    let mut request = <$t>::default();
+                    request.group_id = GroupId(kafka_protocol::protocol::StrBytes::from_static_str("g"));
+                    request.encode(buf, version).unwrap();
+                    return;
+                }
+            )*
+        };
+    }
+    with_group!(
+        JoinGroupRequest,
+        HeartbeatRequest,
+        LeaveGroupRequest,
+        SyncGroupRequest
+    );
     enc!(
         ApiVersionsRequest,
         MetadataRequest,
@@ -55,10 +74,6 @@ fn encode_default_request(api_key: i16, version: i16, buf: &mut BytesMut) {
         OffsetCommitRequest,
         OffsetFetchRequest,
         FindCoordinatorRequest,
-        JoinGroupRequest,
-        HeartbeatRequest,
-        LeaveGroupRequest,
-        SyncGroupRequest,
         DescribeGroupsRequest,
         ListGroupsRequest,
         CreateTopicsRequest,

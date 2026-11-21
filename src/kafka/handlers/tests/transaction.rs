@@ -743,3 +743,50 @@ fn test_txn_offset_commit_added_group_unknown_member() {
         vec![ERROR_UNKNOWN_MEMBER_ID]
     );
 }
+
+/// Kafka 3.7 refuses the empty group id before looking at the transaction (no transaction
+/// expectations here, so a transaction lookup would panic): INVALID_GROUP_ID on every
+/// partition that exists, UNKNOWN_TOPIC_OR_PARTITION on the rest, nothing stored.
+#[test]
+fn test_txn_offset_commit_empty_group_id() {
+    let mut mock = MockKafkaStore::new();
+    topics_with_partitions(&mut mock, 2);
+    mock.expect_store_txn_pending_offset().never();
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
+    let topics = vec![
+        (
+            "test-topic".to_string(),
+            vec![(0, 1i64, None), (2, 1, None), (0, 3, None)],
+        ),
+        ("missing-topic".to_string(), vec![(0, 1i64, None)]),
+    ];
+    let response =
+        transaction::handle_txn_offset_commit(&ctx, "nosuch", 999, 3, "", 5, "zombie", topics)
+            .unwrap();
+    let codes: Vec<(String, i32, i16)> = response
+        .topics
+        .iter()
+        .flat_map(|t| {
+            t.partitions
+                .iter()
+                .map(move |p| (t.name.0.to_string(), p.partition_index, p.error_code))
+        })
+        .collect();
+    assert_eq!(
+        codes,
+        vec![
+            ("test-topic".to_string(), 0, ERROR_INVALID_GROUP_ID),
+            (
+                "test-topic".to_string(),
+                2,
+                ERROR_UNKNOWN_TOPIC_OR_PARTITION
+            ),
+            (
+                "missing-topic".to_string(),
+                0,
+                ERROR_UNKNOWN_TOPIC_OR_PARTITION
+            ),
+        ]
+    );
+}

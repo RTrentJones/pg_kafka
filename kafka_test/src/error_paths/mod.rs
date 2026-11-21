@@ -88,5 +88,6 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         kafka_parity::test_list_offsets_without_a_matching_record_is_offset_minus_one,
         kafka_parity::test_offset_commit_to_a_missing_partition_is_refused,
         kafka_parity::test_idempotent_reinit_with_an_old_producer_id_gets_a_new_one,
+        kafka_parity::test_empty_group_id_is_invalid_group_id,
     ]
 }

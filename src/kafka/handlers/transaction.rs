@@ -2,8 +2,8 @@
 
 use super::helpers::{merge_by_partition, resolve_topics, validate_ongoing_transaction};
 use crate::kafka::constants::{
-    ERROR_INVALID_TXN_STATE, ERROR_NONE, ERROR_OPERATION_NOT_ATTEMPTED, ERROR_UNKNOWN_SERVER_ERROR,
-    ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+    ERROR_INVALID_GROUP_ID, ERROR_INVALID_TXN_STATE, ERROR_NONE, ERROR_OPERATION_NOT_ATTEMPTED,
+    ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
 };
 use crate::kafka::error::{KafkaError, Result};
 use crate::kafka::handler_context::HandlerContext;
@@ -298,6 +298,14 @@ pub fn handle_txn_offset_commit(
     // with its last entry, and answered once.
     let topics: TxnOffsetCommitTopics = merge_by_partition(topics, |p| p.0);
 
+    // Kafka 3.7 refuses an empty group id before it looks at the transaction
+    // (GroupCoordinator.validateGroupStatus): INVALID_GROUP_ID on every partition of a
+    // known topic, nothing stored. Unknown partitions are filtered out before the
+    // coordinator is asked, so they keep UNKNOWN_TOPIC_OR_PARTITION.
+    if group_id.is_empty() {
+        return Ok(txn_offset_commit_invalid_group_response(store, &topics));
+    }
+
     // The transaction comes first, as in Kafka 3.7 (GroupCoordinator.handleTxnCommitOffsets
     // verifies the producer and the transaction before it looks at the group): a fenced
     // or unknown producer, a transaction that is not ongoing, or a group the transaction
@@ -402,6 +410,32 @@ fn store_txn_topic_offsets(
     topic_result.name = TopicName(StrBytes::from_string(topic_name));
     topic_result.partitions = partition_results;
     topic_result
+}
+
+/// The answer to a TxnOffsetCommit for the empty group id: UNKNOWN_TOPIC_OR_PARTITION for a
+/// partition that does not exist, INVALID_GROUP_ID for the rest (and the lookup's own code
+/// on every partition if the topics cannot be read).
+fn txn_offset_commit_invalid_group_response(
+    store: &dyn KafkaStore,
+    topics: &TxnOffsetCommitTopics,
+) -> TxnOffsetCommitResponse {
+    let resolved = resolve_topics(store, topics.iter().map(|(name, _)| name.as_str()));
+    let mut response = txn_offset_commit_error_response(topics, ERROR_INVALID_GROUP_ID);
+    for topic in &mut response.topics {
+        let found = resolved
+            .as_ref()
+            .map(|found| found.get(topic.name.0.as_str()));
+        for p in &mut topic.partitions {
+            p.error_code = match found {
+                Ok(Some((_, count))) if (0..*count).contains(&p.partition_index) => {
+                    ERROR_INVALID_GROUP_ID
+                }
+                Ok(_) => ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+                Err(code) => *code,
+            };
+        }
+    }
+    response
 }
 
 /// The transaction and group a TxnOffsetCommit stores pending offsets for.
