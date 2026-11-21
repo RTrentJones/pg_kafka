@@ -70,9 +70,8 @@ pub fn handle_metadata(
 
 /// The Metadata entries of the requested `names` (distinct, in request order: Kafka 3.7
 /// answers each distinct name once), looked up together. With auto-creation a missing
-/// topic is created (all of them in one statement), and a missing name Kafka would not
-/// accept is INVALID_TOPIC_EXCEPTION; without it a missing topic is
-/// UNKNOWN_TOPIC_OR_PARTITION.
+/// topic is created; without it a missing topic is UNKNOWN_TOPIC_OR_PARTITION, and either
+/// way a missing name Kafka would not accept is INVALID_TOPIC_EXCEPTION and not created.
 fn requested_topic_metadata(
     ctx: &HandlerContext,
     names: &[String],
@@ -121,12 +120,13 @@ fn requested_topic_metadata(
             if let Some(&(_, partition_count)) = found.get(name) {
                 return topic_metadata_for(name.clone(), partition_count);
             }
-            // A missing name is unknown, or with auto-creation invalid if Kafka would not
-            // accept it (or the failure to create it).
+            // Kafka 3.7 reports a missing name it would not accept as invalid, with or
+            // without auto-creation, and any other missing name as unknown (or as the
+            // failure to create it).
             let error_code = match (super::helpers::validate_topic_name(name), create_failed) {
-                (Err(_), _) if allow_auto_topic_creation => ERROR_INVALID_TOPIC_EXCEPTION,
+                (Err(_), _) => ERROR_INVALID_TOPIC_EXCEPTION,
                 (Ok(()), Some(code)) => code,
-                _ => ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+                (Ok(()), None) => ERROR_UNKNOWN_TOPIC_OR_PARTITION,
             };
             crate::kafka::build_topic_metadata(name.clone(), error_code, vec![])
         })

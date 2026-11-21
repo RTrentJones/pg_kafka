@@ -171,3 +171,24 @@ fn test_handle_metadata_repeated_name_is_answered_once() {
         ]
     );
 }
+
+/// Without auto-creation Kafka 3.7 still reports a missing name it would not accept
+/// INVALID_TOPIC_EXCEPTION, and a valid missing name UNKNOWN_TOPIC_OR_PARTITION.
+#[test]
+fn test_handle_metadata_no_auto_create_invalid_name_is_invalid_topic() {
+    let mut mock = MockKafkaStore::new();
+    mock.expect_get_topic_metadata().returning(|_| Ok(vec![]));
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
+    let names = vec!["l".repeat(250), "ok-name".to_string(), "..".to_string()];
+    let response = metadata::handle_metadata(&ctx, Some(names), false).unwrap();
+    let codes: Vec<i16> = response.topics.iter().map(|t| t.error_code).collect();
+    assert_eq!(
+        codes,
+        [
+            ERROR_INVALID_TOPIC_EXCEPTION,
+            ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+            ERROR_INVALID_TOPIC_EXCEPTION
+        ]
+    );
+}

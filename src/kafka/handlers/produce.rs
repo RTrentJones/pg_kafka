@@ -241,9 +241,16 @@ fn produce_topic(
                         e
                     );
                 }
+                // Kafka 3.7 writes only to partitions that exist and answers any other
+                // UNKNOWN_TOPIC_OR_PARTITION, whatever the name: a name it would not
+                // accept is not a topic either.
+                let error_code = match e {
+                    KafkaError::InvalidTopic { .. } => ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+                    _ => e.to_kafka_error_code(),
+                };
                 return build_produce_partition_error_response(
                     std::slice::from_ref(&topic),
-                    e.to_kafka_error_code(),
+                    error_code,
                 )
                 .responses
                 .remove(0);
@@ -975,6 +982,27 @@ mod tests {
             (p.error_code, p.base_offset, p.log_start_offset),
             (ERROR_NONE, 4, -1)
         );
+    }
+
+    /// Kafka 3.7 answers a Produce to a topic that does not exist
+    /// UNKNOWN_TOPIC_OR_PARTITION whatever its name: a name it would not accept (too
+    /// long, bad characters, "..") is not created and gets the same answer, not
+    /// INVALID_TOPIC_EXCEPTION.
+    #[test]
+    fn produce_to_an_invalid_name_is_unknown_topic_or_partition() {
+        let mut mock = MockKafkaStore::new();
+        mock.expect_get_topic_metadata().returning(|_| Ok(vec![]));
+        mock.expect_get_or_create_topic().times(0);
+        let env = TestEnv::new();
+        let ctx = env.ctx(&mock);
+        for name in ["l".repeat(250), "bad name!".to_string(), "..".to_string()] {
+            let mut topic_data = request(&[0]);
+            topic_data[0].name.clone_from(&name);
+            topic_data[0].partitions[0].producer_metadata = None;
+            let resp = handle_produce(&ctx, topic_data, None, None).unwrap();
+            let p = &resp.responses[0].partition_responses[0];
+            assert_eq!(p.error_code, ERROR_UNKNOWN_TOPIC_OR_PARTITION, "{name}");
+        }
     }
 
     /// A refused partition is UNKNOWN_TOPIC_OR_PARTITION when its topic does not exist or

@@ -529,7 +529,7 @@ honored; producer CreateTime timestamps are preserved).
 **Kafka Behavior:** Governed by the broker setting `auto.create.topics.enable` (default `true`, commonly disabled in production)
 **pg_kafka Behavior:** There is no broker-level switch. Topics are always auto-created on first produce. A Metadata request also auto-creates requested topics unless the client sends `allow_auto_topic_creation=false` (Metadata v4+), in which case a missing topic is reported as UNKNOWN_TOPIC_OR_PARTITION. An auto-created topic is answered at once with its partitions (Kafka 3.7 answers UNKNOWN_TOPIC_OR_PARTITION until its controller has created it, and the client retries).
 
-Metadata answers each distinct requested name once, however often the request repeats it, as Kafka 3.7 does, and creates the missing ones in one statement.
+As in Kafka 3.7 (checked against a 3.7 broker): a name Kafka does not accept (longer than 249 characters, a character outside `[a-zA-Z0-9._-]`, `.` or `..`) is never created; Metadata reports it INVALID_TOPIC_EXCEPTION with or without auto-creation, and Produce answers UNKNOWN_TOPIC_OR_PARTITION, as for any partition that does not exist. Metadata answers each distinct requested name once, however often the request repeats it.
 
 **Client Impact:**
 - Typos in topic names create unwanted topics
