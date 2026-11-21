@@ -225,11 +225,22 @@ impl KafkaApi for ProduceApi {
                 )
             })
             .collect();
+        if request.refused.is_empty() {
+            return echo;
+        }
+        // Topic names are unique in `topic_data`; a refused partition joins its topic's
+        // entry through a map, so a request of many topics echoes in linear time.
+        let mut topic_at: std::collections::HashMap<String, usize> = echo
+            .iter()
+            .enumerate()
+            .map(|(at, (name, _))| (name.clone(), at))
+            .collect();
         for refused in &request.refused {
-            match echo.iter_mut().find(|(name, _)| *name == refused.topic) {
-                Some((_, partitions)) => partitions.push(refused.partition),
-                None => echo.push((refused.topic.clone(), vec![refused.partition])),
-            }
+            let at = *topic_at.entry(refused.topic.clone()).or_insert_with(|| {
+                echo.push((refused.topic.clone(), Vec::new()));
+                echo.len() - 1
+            });
+            echo[at].1.push(refused.partition);
         }
         echo
     }
@@ -526,14 +537,28 @@ fn declared_memory(topics: &[WireTopicProduceData], zstd_allowed: bool) -> usize
         .fold(0, usize::saturating_add)
 }
 
-/// Add the answers of refused partitions to `response`, under their topics.
+/// Add the answers of refused partitions to `response`, under their topics, in time linear
+/// in the topics of both.
 fn merge_topic_responses(response: &mut ProduceResponse, refused: Vec<TopicProduceResponse>) {
+    if refused.is_empty() {
+        return;
+    }
+    let mut topic_at: std::collections::HashMap<kafka_protocol::messages::TopicName, usize> =
+        response
+            .responses
+            .iter()
+            .enumerate()
+            .map(|(at, t)| (t.name.clone(), at))
+            .collect();
     for topic in refused {
-        match response.responses.iter_mut().find(|t| t.name == topic.name) {
-            Some(answered) => answered
+        match topic_at.entry(topic.name.clone()) {
+            std::collections::hash_map::Entry::Occupied(at) => response.responses[*at.get()]
                 .partition_responses
                 .extend(topic.partition_responses),
-            None => response.responses.push(topic),
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(response.responses.len());
+                response.responses.push(topic);
+            }
         }
     }
 }
@@ -1100,6 +1125,59 @@ mod tests {
             ProduceApi::echo(&produce),
             vec![("a".to_string(), vec![1]), ("b".to_string(), vec![0])],
             "an error response answers the refused partitions too"
+        );
+    }
+
+    /// Echoing a request and merging its refused partitions' answers take time linear in
+    /// its topics: both run on the DB thread for every Produce, and a request may name
+    /// tens of thousands of topics of one refused partition each.
+    #[test]
+    fn refused_partitions_merge_and_echo_in_linear_time() {
+        let name = |i: usize| format!("q{i:07}");
+        let topics = |n: usize| -> Vec<TopicProduceResponse> {
+            (0..n)
+                .map(|i| {
+                    let mut topic = TopicProduceResponse::default();
+                    topic.name = kafka_protocol::messages::TopicName(name(i).into());
+                    topic.partition_responses = vec![PartitionProduceResponse::default()];
+                    topic
+                })
+                .collect()
+        };
+        let growth = crate::testing::growth(5_000, |n| {
+            let mut response = ProduceResponse::default();
+            response.responses = topics(n);
+            merge_topic_responses(&mut response, topics(2 * n).split_off(n / 2));
+            assert_eq!(response.responses.len(), 2 * n);
+        });
+        assert!(
+            growth < 8.0,
+            "merge: 4x the topics took {growth:.1}x the time"
+        );
+
+        let (request, _rx) = pending_request(1, Wait::Slot, std::time::Duration::from_secs(1));
+        let RequestBody::Produce(mut produce) = request.body else {
+            panic!("a Produce request");
+        };
+        let growth = crate::testing::growth(5_000, |n| {
+            produce.topic_data = (0..n)
+                .map(|i| TopicProduceData {
+                    name: name(i),
+                    partitions: Vec::new(),
+                })
+                .collect();
+            produce.refused = (n / 2..2 * n)
+                .map(|i| RefusedPartition {
+                    topic: name(i),
+                    partition: 0,
+                    error_code: 2,
+                })
+                .collect();
+            assert_eq!(ProduceApi::echo(&produce).len(), 2 * n);
+        });
+        assert!(
+            growth < 8.0,
+            "echo: 4x the topics took {growth:.1}x the time"
         );
     }
 

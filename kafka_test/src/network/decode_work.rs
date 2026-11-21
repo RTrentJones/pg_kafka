@@ -356,3 +356,82 @@ pub async fn test_repeated_partition_entries_are_answered_once() -> TestResult {
     println!("✅ Test PASSED\n");
     Ok(())
 }
+
+/// Topics of the many-topics request: one partition each, of empty records, some 630 KB
+/// on the wire.
+const MANY_TOPICS: usize = 30_000;
+
+/// A Produce naming 30,000 topics that do not exist, one partition of empty records each:
+/// every partition is refused and answered UNKNOWN_TOPIC_OR_PARTITION on the DB thread.
+/// Answering takes time linear in the topics, so the request is answered quickly and a
+/// produce on another connection meanwhile is not held up behind it.
+pub async fn test_a_produce_of_many_refused_topics_is_answered_quickly() -> TestResult {
+    use kafka_protocol::messages::produce_request::{PartitionProduceData, TopicProduceData};
+    use kafka_protocol::messages::TopicName;
+    use kafka_protocol::protocol::StrBytes;
+    println!("=== Test: a Produce of many refused topics is answered quickly ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("net-many-probe").await;
+    let prefix = ctx.unique_topic("net-many").await;
+    let created = create_topics_raw(vec![creatable(&topic, 1, 1)]).await?;
+    assert_eq!(created[0].error_code, 0, "{created:?}");
+
+    let mut request = ProduceRequest::default();
+    request.acks = -1;
+    request.timeout_ms = 30_000;
+    request.topic_data = (0..MANY_TOPICS)
+        .map(|i| {
+            let mut p = PartitionProduceData::default();
+            p.index = 0;
+            p.records = Some(Bytes::new());
+            let mut t = TopicProduceData::default();
+            t.name = TopicName(StrBytes::from_string(format!("{prefix}-{i:06}")));
+            t.partition_data = vec![p];
+            t
+        })
+        .collect();
+    let frame = request_frame(7, 1, &request);
+    println!(
+        "Step 1: one request of {MANY_TOPICS} topics ({} bytes), produces alongside",
+        frame.len()
+    );
+    let mut probe = Wire::connect().await?;
+    let value = plain_batch(&[Bytes::from_static(b"p")], Compression::None);
+    let (code, _) = probe.produce(&topic, 0, value.clone(), None).await?;
+    assert_eq!(code, 0);
+    let many = tokio::spawn(spawned_produce(frame, 1));
+    let mut worst = Duration::ZERO;
+    let mut probes = 0;
+    while !many.is_finished() {
+        let started = Instant::now();
+        let (code, _) = probe.produce(&topic, 0, value.clone(), None).await?;
+        assert_eq!(code, 0);
+        worst = worst.max(started.elapsed());
+        probes += 1;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let (codes, answers, took) = many.await??;
+    println!("  answered {answers} partitions {codes:?} after {took:?}");
+    println!("  {probes} produces alongside, the slowest {worst:?}");
+    assert_eq!(answers, MANY_TOPICS);
+    assert_eq!(codes, BTreeSet::from([UNKNOWN_TOPIC_OR_PARTITION]));
+    assert!(took < Duration::from_secs(3), "answered after {took:?}");
+    assert!(
+        worst < Duration::from_secs(2),
+        "a produce alongside took {worst:?}"
+    );
+    let created: i64 = ctx
+        .db()
+        .query_one(
+            "SELECT count(*) FROM kafka.topics WHERE name LIKE $1 || '-%'",
+            &[&prefix],
+        )
+        .await?
+        .get(0);
+    assert_eq!(created, 0, "no refused topic is created");
+    println!("✅ answered quickly; the produce alongside was not held up");
+
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
