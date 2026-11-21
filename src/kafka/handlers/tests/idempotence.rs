@@ -50,6 +50,8 @@ fn test_handle_produce_with_idempotent_producer_success() {
         .returning(|_, _| Ok((1, 1)));
 
     // Expect sequence check to pass (returns true = insert)
+    mock.expect_open_txn_epoch_on_partition()
+        .returning(|_, _, _| Ok(None));
     mock.expect_check_and_update_sequence()
         .times(1)
         .returning(|_, _, _, _, _, _| Ok(crate::kafka::storage::SequenceCheck::Append));
@@ -108,6 +110,8 @@ fn test_handle_produce_insert_failure_does_not_advance_sequence() {
     let mut mock = MockKafkaStore::new();
     mock.expect_get_or_create_topic()
         .returning(|_, _| Ok((1, 1)));
+    mock.expect_open_txn_epoch_on_partition()
+        .returning(|_, _, _| Ok(None));
     mock.expect_check_and_update_sequence()
         .times(1)
         .returning(|_, _, _, _, _, _| Ok(crate::kafka::storage::SequenceCheck::Append));
@@ -154,6 +158,8 @@ fn test_handle_produce_duplicate_sequence_rejected() {
         .returning(|_, _| Ok((1, 1)));
 
     // Sequence check detects duplicate (returns Ok(false) - skip insert, return success)
+    mock.expect_open_txn_epoch_on_partition()
+        .returning(|_, _, _| Ok(None));
     mock.expect_check_and_update_sequence()
         .times(1)
         .returning(|_, _, _, _, _, _| {
@@ -203,6 +209,8 @@ fn test_handle_produce_out_of_order_sequence_rejected() {
         .returning(|_, _| Ok((1, 1)));
 
     // Sequence check fails with out-of-order error
+    mock.expect_open_txn_epoch_on_partition()
+        .returning(|_, _, _| Ok(None));
     mock.expect_check_and_update_sequence()
         .times(1)
         .returning(|_, _, _, _, _, _| Err(KafkaError::out_of_order_sequence(1000, 0, 15, 10)));

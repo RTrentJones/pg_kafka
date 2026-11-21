@@ -324,3 +324,194 @@ pub async fn test_transactional_produce_is_validated_per_partition() -> TestResu
     println!("✅ Test PASSED\n");
     Ok(())
 }
+
+/// Kafka 3.7 verifies a Produce request's transactional batches as one producer's
+/// (`ReplicaManager.handleProduceAppend`): transactional batches of two producer ids fail
+/// the whole request with INVALID_PRODUCER_ID_MAPPING on every partition, plain ones
+/// included, and nothing is written; with acks=0 the connection closes. A transactional
+/// batch next to another producer's idempotent batch is not such a request.
+pub async fn test_transactional_batches_of_two_producers_are_refused() -> TestResult {
+    println!("=== Test: transactional batches of two producer ids are refused ===\n");
+    let ctx = TestContext::new().await?;
+    let t = topic(&ctx, "txn-two-pids", 3).await?;
+    let tx = ctx.unique_topic("txn-two-pids-tx").await;
+    let other = ctx.unique_topic("txn-two-pids-other").await;
+    let mut w = Wire::connect().await?;
+    let (err, pid, ep) = w.init_producer_id(Some(&tx), 60_000).await?;
+    assert_eq!(err, error_codes::NONE);
+    let (err, pid2, ep2) = w.init_producer_id(Some(&other), 60_000).await?;
+    assert_eq!(err, error_codes::NONE);
+    let added = w.add_partitions(&tx, pid, ep, &[(&t, &[0, 1])]).await?;
+    assert!(added.iter().all(|(_, _, e)| *e == error_codes::NONE));
+    let tb = |pid, ep, seq| batch(&["t"], pid, ep, seq, true, None);
+    let plain = || batch(&["p"], -1, -1, -1, false, None);
+    let refused = vec![
+        (0, INVALID_PRODUCER_ID_MAPPING),
+        (1, INVALID_PRODUCER_ID_MAPPING),
+        (2, INVALID_PRODUCER_ID_MAPPING),
+    ];
+
+    println!("Step 1: the owner's batch first, then another producer's...");
+    assert_eq!(
+        codes(
+            &mut w,
+            &t,
+            vec![(0, tb(pid, ep, 0)), (1, tb(pid2, ep2, 0)), (2, plain())],
+            Some(&tx)
+        )
+        .await?,
+        refused
+    );
+    println!("Step 2: another producer's batch first...");
+    assert_eq!(
+        codes(
+            &mut w,
+            &t,
+            vec![(0, tb(pid2, ep2, 0)), (1, tb(pid, ep, 0)), (2, plain())],
+            Some(&tx)
+        )
+        .await?,
+        refused
+    );
+    println!("Step 3: acks=0...");
+    assert!(
+        acks0_closes(
+            &t,
+            vec![(0, tb(pid, ep, 0)), (1, tb(pid2, ep2, 0)), (2, plain())],
+            &tx
+        )
+        .await?,
+        "the refused request closes the connection"
+    );
+    assert_eq!(rows(&ctx, &t).await?, vec![], "nothing written");
+    println!("✅ every partition refused 49, nothing written\n");
+
+    println!("Step 4: the owner alone, with another producer's idempotent batch...");
+    let (err, idem, idem_ep) = w.init_producer_id(None, 60_000).await?;
+    assert_eq!(err, error_codes::NONE);
+    assert_eq!(
+        codes(
+            &mut w,
+            &t,
+            vec![
+                (0, tb(pid, ep, 0)),
+                (2, batch(&["i"], idem, idem_ep, 0, false, None))
+            ],
+            Some(&tx)
+        )
+        .await?,
+        vec![(0, error_codes::NONE), (2, error_codes::NONE)]
+    );
+    assert_eq!(w.end_txn(&tx, pid, ep, true).await?, error_codes::NONE);
+    assert_eq!(
+        rows(&ctx, &t).await?,
+        vec![(0, None, 1), (2, None, 1)],
+        "the owner's sequence did not move with the refused requests"
+    );
+    println!("✅ written\n");
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// Kafka 3.7 refuses a non-transactional batch of a producer whose open transaction has
+/// written to the partition with INVALID_TXN_STATE (`ProducerAppendInfo`), with or without
+/// a transactional id in the request, after the epoch and sequence checks, and changes
+/// nothing; on a partition the transaction has not written to it is written committed.
+pub async fn test_non_transactional_batch_inside_an_open_transaction_is_refused() -> TestResult {
+    println!("=== Test: a non-transactional batch inside an open transaction ===\n");
+    let ctx = TestContext::new().await?;
+    let t = topic(&ctx, "txn-nontxn", 2).await?;
+    let tx = ctx.unique_topic("txn-nontxn-tx").await;
+    let mut w = Wire::connect().await?;
+    w.init_producer_id(Some(&tx), 60_000).await?;
+    let (err, pid, ep) = w.init_producer_id(Some(&tx), 60_000).await?;
+    assert_eq!((err, ep), (error_codes::NONE, 1));
+    let tb = |seq| batch(&["t"], pid, ep, seq, true, None);
+    let ib = |epoch, seq| batch(&["i"], pid, epoch, seq, false, None);
+    assert_eq!(
+        w.add_partitions(&tx, pid, ep, &[(&t, &[0])]).await?[0].2,
+        error_codes::NONE
+    );
+
+    println!("Step 1: added but not written: written committed...");
+    assert_eq!(
+        w.produce(&t, 0, ib(ep, 0), Some(&tx)).await?,
+        (error_codes::NONE, 0)
+    );
+    assert_eq!(
+        w.produce(&t, 0, tb(1), Some(&tx)).await?,
+        (error_codes::NONE, 1)
+    );
+    println!("Step 2: written to: refused...");
+    for (batch, txn, what, code) in [
+        (
+            ib(ep, 2),
+            Some(tx.as_str()),
+            "with the transactional id",
+            error_codes::INVALID_TXN_STATE,
+        ),
+        (
+            ib(ep, 2),
+            None,
+            "without it",
+            error_codes::INVALID_TXN_STATE,
+        ),
+        (
+            ib(ep + 1, 0),
+            None,
+            "a bumped epoch",
+            error_codes::INVALID_TXN_STATE,
+        ),
+        (
+            ib(ep - 1, 2),
+            None,
+            "a stale epoch",
+            error_codes::INVALID_PRODUCER_EPOCH,
+        ),
+        (
+            ib(ep, 7),
+            None,
+            "a sequence gap",
+            error_codes::OUT_OF_ORDER_SEQUENCE_NUMBER,
+        ),
+    ] {
+        assert_eq!(w.produce(&t, 0, batch, txn).await?.0, code, "{what}");
+    }
+    assert_eq!(
+        w.produce(&t, 0, ib(ep, 0), None).await?,
+        (error_codes::NONE, 0),
+        "a retry of the batch written before is still answered with its offset"
+    );
+    assert_eq!(
+        w.produce(&t, 1, ib(ep, 0), None).await?,
+        (error_codes::NONE, 0),
+        "another partition"
+    );
+    assert_eq!(
+        w.produce(&t, 0, tb(2), Some(&tx)).await?,
+        (error_codes::NONE, 2),
+        "the transaction goes on at the next sequence, at its epoch"
+    );
+    println!("✅ refused 48 after the epoch and sequence checks\n");
+
+    println!("Step 3: abort; nothing of the refused batches is visible...");
+    assert_eq!(w.end_txn(&tx, pid, ep, false).await?, error_codes::NONE);
+    assert_eq!(
+        rows(&ctx, &t).await?,
+        vec![
+            (0, None, 1),
+            (0, Some("aborted".to_string()), 2),
+            (1, None, 1)
+        ]
+    );
+    assert_eq!(
+        w.produce(&t, 0, ib(ep, 3), None).await?,
+        (error_codes::NONE, 3),
+        "after the transaction the producer writes there again"
+    );
+    println!("✅ the aborted transaction's rows only\n");
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}

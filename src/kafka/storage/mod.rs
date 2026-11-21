@@ -648,6 +648,16 @@ pub trait ProducerStore {
         partition_id: i32,
     ) -> Result<bool>;
 
+    /// The epoch of `producer_id`'s Ongoing transaction when that transaction has written
+    /// records to `(topic_id, partition_id)` (they are pending there); None otherwise. A
+    /// non-transactional batch of the producer there is INVALID_TXN_STATE, as in Kafka.
+    fn open_txn_epoch_on_partition(
+        &self,
+        producer_id: i64,
+        topic_id: i32,
+        partition_id: i32,
+    ) -> Result<Option<i16>>;
+
     /// Persist a producer's advanced `last_sequence` AFTER a successful insert (RV-8).
     ///
     /// `check_and_update_sequence` only validates, so the advance happens only once

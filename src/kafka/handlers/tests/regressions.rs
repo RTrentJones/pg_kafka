@@ -38,6 +38,8 @@ fn idempotent_produce_uses_each_partitions_own_sequence() {
     mock.expect_get_log_start_offset().returning(|_, _| Ok(0));
     mock.expect_get_or_create_topic()
         .returning(|_, _| Ok((1, 2)));
+    mock.expect_open_txn_epoch_on_partition()
+        .returning(|_, _, _| Ok(None));
     mock.expect_check_and_update_sequence()
         .with(eq(1000), eq(0), eq(1), eq(0), eq(5), eq(1))
         .times(1)

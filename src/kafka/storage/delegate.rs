@@ -429,6 +429,14 @@ macro_rules! delegate_producer_store {
         ) -> $crate::kafka::error::Result<bool> {
             $via::txn_has_partition(transactional_id, topic_id, partition_id)
         }
+        fn open_txn_epoch_on_partition(
+            &self,
+            producer_id: i64,
+            topic_id: i32,
+            partition_id: i32,
+        ) -> $crate::kafka::error::Result<Option<i16>> {
+            $via::open_txn_epoch_on_partition(producer_id, topic_id, partition_id)
+        }
         fn record_producer_sequence(
             &self,
             producer_id: i64,
@@ -499,6 +507,14 @@ macro_rules! delegate_producer_store {
             partition_id: i32,
         ) -> $crate::kafka::error::Result<bool> {
             $via::txn_has_partition(&self.$field, transactional_id, topic_id, partition_id)
+        }
+        fn open_txn_epoch_on_partition(
+            &self,
+            producer_id: i64,
+            topic_id: i32,
+            partition_id: i32,
+        ) -> $crate::kafka::error::Result<Option<i16>> {
+            $via::open_txn_epoch_on_partition(&self.$field, producer_id, topic_id, partition_id)
         }
         fn record_producer_sequence(
             &self,

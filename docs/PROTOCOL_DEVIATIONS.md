@@ -238,7 +238,16 @@ pg_kafka.compression_type = 'gzip'
   transactional id is unknown or another producer id owns it, INVALID_PRODUCER_EPOCH (47)
   for another epoch, and INVALID_TXN_STATE (48) when the transaction does not hold the
   partition; a plain or idempotent batch in the same request is written as it would be
-  without the transactional id (committed, outside the transaction). AddPartitionsToTxn,
+  without the transactional id (committed, outside the transaction). As in Kafka 3.7,
+  transactional batches of two producer ids in one request fail it with
+  INVALID_PRODUCER_ID_MAPPING on every partition, plain ones included, and nothing is
+  written; and a non-transactional batch of a producer whose open transaction has written
+  to the partition is INVALID_TXN_STATE (48), with or without a transactional id in the
+  request, after the epoch and sequence checks (a partition the transaction only added
+  takes it, committed). **Deviation:** transactional batches of one producer id at two
+  epochs are checked per epoch (the current epoch's written, the other refused); Kafka
+  verifies all of them with the epoch of whichever partition its request map yields first,
+  so it refuses or accepts them all. AddPartitionsToTxn,
   AddOffsetsToTxn, TxnOffsetCommit and EndTxn answer another producer id, and a
   transactional id without state, INVALID_PRODUCER_ID_MAPPING too, as Kafka does. **Deviation:** a transactional id whose
   transaction is not Ongoing (none was started with AddPartitionsToTxn, or it is complete)

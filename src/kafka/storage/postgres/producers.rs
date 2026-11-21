@@ -4,7 +4,7 @@
 //! The sequence rules themselves are the pure [`validate_sequence`]; this module reads
 //! the state it needs and persists what it decides.
 
-use super::{internal, internal_unless, PostgresStore};
+use super::{internal, internal_unless, select_cached, PostgresStore, INT4OID, INT8OID};
 use crate::kafka::constants::ERROR_INVALID_PRODUCER_EPOCH;
 use crate::kafka::error::{KafkaError, Result};
 use crate::kafka::storage::{
@@ -536,6 +536,44 @@ impl PostgresStore {
             Ok(!table.is_empty())
         })
         .map_err(internal("txn_has_partition"))
+    }
+
+    /// Every idempotent batch asks, so the first statement is the cheap one: an Ongoing
+    /// transaction of the producer that added the partition (none for a producer without
+    /// a transactional id). Only then are the partition's pending rows looked at.
+    pub(super) fn open_txn_epoch_on_partition(
+        producer_id: i64,
+        topic_id: i32,
+        partition_id: i32,
+    ) -> Result<Option<i16>> {
+        Spi::connect(|client| {
+            let open = select_cached(
+                client,
+                "SELECT t.producer_epoch FROM kafka.transactions t
+                 JOIN kafka.txn_partitions p ON p.transactional_id = t.transactional_id
+                 WHERE t.producer_id = $1 AND t.state = 'Ongoing'
+                   AND p.topic_id = $2 AND p.partition_id = $3",
+                &[INT8OID, INT4OID, INT4OID],
+                &[producer_id.into(), topic_id.into(), partition_id.into()],
+            )?;
+            let Some(epoch) = open.into_iter().next().map(|row| row.get::<i16>(1)) else {
+                return Ok(None);
+            };
+            let epoch = epoch?.ok_or_else(|| KafkaError::Database {
+                message: "Unexpected NULL in transactions.producer_epoch".to_string(),
+            })?;
+            let written = select_cached(
+                client,
+                "SELECT 1 FROM kafka.messages
+                 WHERE topic_id = $1 AND partition_id = $2 AND producer_id = $3
+                   AND txn_state = 'pending'
+                 LIMIT 1",
+                &[INT4OID, INT4OID, INT8OID],
+                &[topic_id.into(), partition_id.into(), producer_id.into()],
+            )?;
+            Ok((!written.is_empty()).then_some(epoch))
+        })
+        .map_err(internal("open_txn_epoch_on_partition"))
     }
 
     /// RV-8: persist the advanced last sequence, only after the records are inserted

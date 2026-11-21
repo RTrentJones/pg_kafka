@@ -36,7 +36,9 @@ use std::collections::HashMap;
 /// id (INVALID_PRODUCER_ID_MAPPING otherwise, for an unknown id too; INVALID_PRODUCER_EPOCH
 /// for another epoch), the transaction must be Ongoing and hold the partition
 /// (INVALID_TXN_STATE). A plain or idempotent batch in the same request is written as it is
-/// without a transactional id.
+/// without a transactional id, unless its producer's open transaction has written to the
+/// partition (INVALID_TXN_STATE). Transactional batches of two producer ids fail the whole
+/// request (`Err`, INVALID_PRODUCER_ID_MAPPING on every partition, nothing written).
 ///
 /// # Arguments
 /// * `ctx` - Handler context (store, coordinator, broker metadata, etc.)
@@ -49,6 +51,11 @@ pub fn handle_produce(
     producer_metadata: Option<&ProducerMetadata>,
     transactional_id: Option<&str>,
 ) -> Result<ProduceResponse> {
+    if transactional_id.is_some() {
+        if let Some(producer_id) = second_transactional_producer(&topic_data) {
+            return Err(KafkaError::invalid_producer_id_mapping(producer_id));
+        }
+    }
     let mut transaction = TransactionCheck {
         transactional_id,
         owners: HashMap::new(),
@@ -59,6 +66,22 @@ pub fn handle_produce(
         .map(|topic| produce_topic(ctx, topic, producer_metadata, &mut transaction))
         .collect();
     Ok(kafka_response)
+}
+
+/// A producer id of the request's transactional batches other than the first one's, if
+/// there is one. Kafka 3.7 verifies a request's transactional batches as one producer's
+/// (`ReplicaManager.handleProduceAppend`) and fails a request whose transactional
+/// batches carry two producer ids with INVALID_PRODUCER_ID_MAPPING on every partition,
+/// writing nothing.
+fn second_transactional_producer(topic_data: &[TopicProduceData]) -> Option<i64> {
+    let mut ids = topic_data
+        .iter()
+        .flat_map(|t| t.partitions.iter())
+        .filter_map(|p| p.producer_metadata.as_ref())
+        .filter(|m| m.is_transactional && m.producer_id >= 0)
+        .map(|m| m.producer_id);
+    let first = ids.next()?;
+    ids.find(|&id| id != first)
 }
 
 /// The transaction of a request's transactional batches, checked once per producer id and
@@ -297,6 +320,25 @@ fn produce_partition(
     let record_count = i32::try_from(records.len())
         .expect("a request of at most MAX_REQUEST_SIZE bytes holds fewer than i32::MAX records");
 
+    // A non-transactional batch of a producer whose open transaction wrote to the
+    // partition: Kafka 3.7 (`ProducerAppendInfo`) refuses it INVALID_TXN_STATE after the
+    // epoch and sequence checks. One at a higher epoch is refused before the sequence
+    // check, which would move the producer's stored epoch, so that nothing changes.
+    let open_txn_epoch = match seq_meta.filter(|m| !m.is_transactional) {
+        Some(meta) => {
+            match store.open_txn_epoch_on_partition(meta.producer_id, topic_id, partition_index) {
+                Ok(epoch) => epoch,
+                Err(e) => return failed_partition(partition_index, e.to_kafka_error_code()),
+            }
+        }
+        None => None,
+    };
+    if let (Some(meta), Some(epoch)) = (seq_meta, open_txn_epoch) {
+        if meta.producer_epoch > epoch {
+            return failed_partition(partition_index, ERROR_INVALID_TXN_STATE);
+        }
+    }
+
     // Validate an idempotent producer's sequence before inserting.
     if let Some(meta) = seq_meta {
         match store.check_and_update_sequence(
@@ -307,6 +349,9 @@ fn produce_partition(
             meta.base_sequence,
             record_count,
         ) {
+            Ok(SequenceCheck::Append) if open_txn_epoch.is_some() => {
+                return failed_partition(partition_index, ERROR_INVALID_TXN_STATE);
+            }
             Ok(SequenceCheck::Append) => {}
             // A retry of an appended batch: success with the original base offset and
             // nothing inserted (Kafka's idempotent producer semantics).
@@ -536,6 +581,107 @@ mod tests {
         out
     }
 
+    /// Transactional batches of two producer ids fail the whole request, before anything
+    /// is looked up or written; other producers' idempotent batches do not count.
+    #[test]
+    fn transactional_batches_of_two_producer_ids_fail_the_request() {
+        let with_ids = |ids: &[(i64, bool)]| {
+            let mut data = request(&(0..).take(ids.len()).collect::<Vec<i32>>());
+            for (p, &(producer_id, is_transactional)) in data[0].partitions.iter_mut().zip(ids) {
+                p.producer_metadata = Some(ProducerMetadata {
+                    producer_id,
+                    is_transactional,
+                    ..meta()
+                });
+            }
+            data
+        };
+        assert_eq!(
+            second_transactional_producer(&with_ids(&[(7, true), (7, true)])),
+            None
+        );
+        assert_eq!(
+            second_transactional_producer(&with_ids(&[(7, true), (8, false)])),
+            None
+        );
+        assert_eq!(
+            second_transactional_producer(&with_ids(&[(-1, true), (7, true)])),
+            None
+        );
+        assert_eq!(
+            second_transactional_producer(&with_ids(&[(7, true), (7, true), (9, true)])),
+            Some(9)
+        );
+        // No store call at all: a MockKafkaStore without expectations panics on one.
+        let mock = MockKafkaStore::new();
+        let env = TestEnv::new();
+        let ctx = env.ctx(&mock);
+        let err = handle_produce(
+            &ctx,
+            with_ids(&[(7, true), (9, true)]),
+            Some(&meta()),
+            Some("tx"),
+        )
+        .unwrap_err();
+        assert_eq!(err.to_kafka_error_code(), ERROR_INVALID_PRODUCER_ID_MAPPING);
+    }
+
+    /// A non-transactional batch of a producer whose Ongoing transaction wrote to the
+    /// partition is INVALID_TXN_STATE, after the epoch and sequence checks (a higher epoch
+    /// before the sequence check), and nothing is written; without such a transaction it
+    /// is written.
+    #[test]
+    fn a_non_transactional_batch_inside_an_open_transaction_is_refused() {
+        let idempotent = |epoch| ProducerMetadata {
+            producer_epoch: epoch,
+            is_transactional: false,
+            ..meta()
+        };
+        let produce = |open: Option<i16>, epoch: i16, check: Option<Result<SequenceCheck>>| {
+            let mut mock = MockKafkaStore::new();
+            mock.expect_get_or_create_topic()
+                .returning(|_, _| Ok((1, 1)));
+            mock.expect_open_txn_epoch_on_partition()
+                .times(1)
+                .returning(move |pid, topic, partition| {
+                    assert_eq!((pid, topic, partition), (7, 1, 0));
+                    Ok(open)
+                });
+            let mut check = check;
+            mock.expect_check_and_update_sequence()
+                .times(usize::from(check.is_some()))
+                .returning(move |_, _, _, _, _, _| check.take().unwrap());
+            mock.expect_insert_records().returning(|_, _, _| Ok(4));
+            mock.expect_record_producer_batch().returning(|_| Ok(()));
+            mock.expect_get_log_start_offset().returning(|_, _| Ok(0));
+            let mut data = request(&[0]);
+            data[0].partitions[0].producer_metadata = Some(idempotent(epoch));
+            let env = TestEnv::new();
+            let ctx = env.ctx(&mock);
+            let p = handle_produce(&ctx, data, None, None).unwrap().responses[0]
+                .partition_responses[0]
+                .clone();
+            (p.error_code, p.base_offset)
+        };
+        let append = || Some(Ok(SequenceCheck::Append));
+        assert_eq!(produce(None, 2, append()), (ERROR_NONE, 4));
+        assert_eq!(produce(Some(2), 2, append()), (ERROR_INVALID_TXN_STATE, -1));
+        assert_eq!(produce(Some(2), 3, None), (ERROR_INVALID_TXN_STATE, -1));
+        assert_eq!(
+            produce(
+                Some(2),
+                2,
+                Some(Ok(SequenceCheck::Duplicate { base_offset: 1 }))
+            ),
+            (ERROR_NONE, 1),
+            "a retry of an earlier batch is still answered with its offset"
+        );
+        assert_eq!(
+            produce(Some(2), 1, Some(Err(KafkaError::producer_fenced(7, 1, 2)))),
+            (ERROR_INVALID_PRODUCER_EPOCH, -1)
+        );
+    }
+
     /// Kafka: a transactional Produce to a partition the transaction never added
     /// (AddPartitionsToTxn) is INVALID_TXN_STATE, and nothing is written.
     #[test]
@@ -602,6 +748,8 @@ mod tests {
     #[test]
     fn a_partition_without_records_takes_no_producer_state() {
         let mut mock = MockKafkaStore::new();
+        mock.expect_open_txn_epoch_on_partition()
+            .returning(|_, _, _| Ok(None));
         mock.expect_get_or_create_topic()
             .returning(|_, _| Ok((1, 2)));
         mock.expect_check_and_update_sequence()

@@ -117,6 +117,12 @@ mod store {
                 topic_id: i32,
                 partition_id: i32,
             ) -> Result<bool>;
+            fn open_txn_epoch_on_partition(
+                &self,
+                producer_id: i64,
+                topic_id: i32,
+                partition_id: i32,
+            ) -> Result<Option<i16>>;
             fn record_producer_sequence(
                 &self,
                 producer_id: i64,
