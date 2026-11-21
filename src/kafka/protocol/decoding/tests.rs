@@ -133,19 +133,24 @@ fn txn_id(s: &'static str) -> TransactionalId {
 
 // ========== Malformed input ==========
 
-fn corrupt_produce_frame(acks: i16) -> BytesMut {
+fn corrupt_produce_frame(acks: i16, unsizable: bool) -> BytesMut {
     use kafka_protocol::messages::produce_request::{
         PartitionProduceData, ProduceRequest, TopicProduceData,
     };
     let mut p = PartitionProduceData::default();
     p.index = 0;
-    // A record batch whose CRC does not match.
+    // A record batch whose CRC does not match, or whose batch length (13) is too short
+    // for any batch.
     let mut batch = one_record_batch(
         b"value".to_vec(),
         kafka_protocol::records::Compression::None,
     );
-    let last = batch.len() - 1;
-    batch[last] ^= 1;
+    if unsizable {
+        batch[8..12].copy_from_slice(&13i32.to_be_bytes());
+    } else {
+        let last = batch.len() - 1;
+        batch[last] ^= 1;
+    }
     p.records = Some(bytes::Bytes::from(batch));
     let mut t = TopicProduceData::default();
     t.name = topic("t");
@@ -364,14 +369,41 @@ fn test_unsupported_version_reply_always_encodes() {
 #[test]
 fn test_corrupt_produce_acks0_gets_no_response() {
     let (tx, mut rx) = channel();
-    assert!(parse_request(corrupt_produce_frame(0), tx).is_err());
+    assert!(parse_request(corrupt_produce_frame(0, true), tx).is_err());
     assert!(rx.try_recv().is_err(), "acks=0 must not get a response");
 }
 
+/// A partition whose batch fails validation is refused on its own: the request goes on to
+/// the DB thread, which answers that partition with its error and writes the others.
+#[test]
+fn test_corrupt_produce_partition_is_refused_on_its_own() {
+    for acks in [0, 1] {
+        let (tx, mut rx) = channel();
+        let request = parse_request(corrupt_produce_frame(acks, false), tx)
+            .unwrap()
+            .expect("the request is passed on");
+        let RequestBody::Produce(produce) = request.body else {
+            panic!("expected a Produce request");
+        };
+        assert!(produce.topic_data.is_empty(), "nothing to write");
+        assert_eq!(
+            produce.refused,
+            vec![crate::kafka::messages::RefusedPartition {
+                topic: "t".to_string(),
+                partition: 0,
+                error_code: ERROR_CORRUPT_MESSAGE,
+            }]
+        );
+        assert!(rx.try_recv().is_err(), "answered by the DB thread");
+    }
+}
+
+/// A first batch that cannot be sized fails the whole request (Kafka 3.7 reads every
+/// partition's first batch before it answers any partition).
 #[test]
 fn test_corrupt_produce_reports_error_per_partition() {
     let (tx, mut rx) = channel();
-    assert!(parse_request(corrupt_produce_frame(1), tx)
+    assert!(parse_request(corrupt_produce_frame(1, true), tx)
         .unwrap()
         .is_none());
     match rx.try_recv() {

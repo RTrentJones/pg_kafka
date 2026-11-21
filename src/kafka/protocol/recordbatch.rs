@@ -69,6 +69,7 @@ const RECORD_BATCH_V2_MAGIC: i8 = 2;
 const CODEC_MASK: i16 = 0x07;
 const CONTROL_FLAG: i16 = 0x20;
 const LOG_APPEND_TIME_FLAG: i16 = 0x08;
+const TRANSACTIONAL_FLAG: i16 = 0x10;
 /// The timestamp of a record that has none (`RecordBatch.NO_TIMESTAMP`).
 const NO_TIMESTAMP: i64 = -1;
 /// The codec id of zstd, which Produce carries from v7 on (KIP-110).
@@ -166,10 +167,10 @@ fn check_after_batch(rest: &[u8]) -> Result<()> {
     }
 }
 
-/// What Kafka 3.7 checks of a Produce partition's data while it parses the request
-/// (`ProduceRequest.validateRecords`), before any batch is read: one record batch of magic
-/// 2 (`check_batch_header`, `check_after_batch`) and, before Produce v7 (KIP-110), not
-/// zstd. A failure fails the whole request; `Err` is its error code.
+/// What Kafka 3.7 checks of a Produce partition's data before it reads its batch
+/// (`ProduceRequest.validateRecords`): one record batch of magic 2 (`check_batch_header`,
+/// `check_after_batch`) and, before Produce v7 (KIP-110), not zstd. A failure refuses this
+/// partition only; `Err` is its error code.
 pub fn validate_produce_records(batch: &[u8], zstd_allowed: bool) -> std::result::Result<(), i16> {
     let size = check_batch_header(batch).map_err(|e| e.to_kafka_error_code())?;
     let mut attributes = &batch[ATTRIBUTES_OFFSET..ATTRIBUTES_OFFSET + 2];
@@ -177,6 +178,21 @@ pub fn validate_produce_records(batch: &[u8], zstd_allowed: bool) -> std::result
         return Err(ERROR_UNSUPPORTED_COMPRESSION_TYPE);
     }
     check_after_batch(&batch[size..]).map_err(|e| e.to_kafka_error_code())
+}
+
+/// Whether a partition's first batch is transactional, as Kafka 3.7 reads it before it
+/// looks at any partition (`RequestUtils.hasTransactionalRecords`, which stops at the first
+/// transactional batch of the request). `Err` is CORRUPT_MESSAGE when the first batch's
+/// length or magic cannot be read (`next_batch_size`): that fails the whole request.
+/// Data holding no complete batch, or a legacy one, is not transactional.
+pub fn first_batch_is_transactional(data: &[u8]) -> std::result::Result<bool, i16> {
+    match next_batch_size(data) {
+        Err(e) => Err(e.to_kafka_error_code()),
+        Ok(Some(size)) if size <= data.len() => Ok(i8::from_be_bytes([data[MAGIC_OFFSET]])
+            == RECORD_BATCH_V2_MAGIC
+            && (&data[ATTRIBUTES_OFFSET..]).get_i16() & TRANSACTIONAL_FLAG != 0),
+        Ok(_) => Ok(false),
+    }
 }
 
 /// The fields of a batch header Kafka 3.7 validates for a client's batch once its CRC and

@@ -659,6 +659,7 @@ mod tests {
             RequestBody::Produce(ProduceRequestData {
                 acks,
                 timeout_ms: 1000,
+                refused: Vec::new(),
                 topic_data: vec![],
                 transactional_id: None,
                 decoded: crate::kafka::protocol::DecodedCharge::default(),

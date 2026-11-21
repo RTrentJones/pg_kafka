@@ -114,9 +114,20 @@ pg_kafka.compression_type = 'gzip'
     what a fetch returns). A header key that is not UTF-8 is accepted and stored with
     replacement characters, what a Java client reads it as; Kafka stores its bytes.
 
-  Unlike Kafka, which answers only the offending partition once the request has parsed,
-  pg_kafka answers every partition of the request with that code and writes none of them
-  (the framing and zstd checks fail the whole request in Kafka too).
+  As in Kafka 3.7, each partition is answered on its own: a partition whose data fails a
+  check gets that code and nothing of it is written, while the request's other partitions
+  are written (an acks=0 request with a refused partition writes the others, then closes
+  its connection). A refused partition of a topic that does not exist, or outside its
+  topic, is UNKNOWN_TOPIC_OR_PARTITION whatever its data, and the topic is not created
+  for it. A refused partition leaves its idempotent producer's sequence and its
+  transaction as they were. Only a first batch whose length (under 14) or magic byte
+  (outside 0-2) cannot be read fails the whole request, CORRUPT_MESSAGE on every
+  partition, as Kafka reads every partition's first batch before it looks at any
+  partition (it stops at the first transactional batch, and so does pg_kafka); past a
+  partition's first batch, the same data refuses that partition only. Where Kafka 3.7
+  answers UNKNOWN_SERVER_ERROR (an unknown codec id, a zstd window past 2^27, data that
+  does not decompress) pg_kafka answers CORRUPT_MESSAGE on that partition; Kafka fails the
+  whole request for an unknown codec id on Produce v3-v6.
 - Server compresses responses based on GUC setting
 
 ### 3. Idempotent Producer ✅ Fully Supported (Phase 9)

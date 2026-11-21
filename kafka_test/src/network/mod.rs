@@ -171,6 +171,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         produce_decoding::test_zstd_batches_with_large_windows_are_stored: sequential,
         produce_decoding::test_record_batches_are_read_as_kafka_reads_them: sequential,
         produce_decoding::test_batch_checks_run_in_kafkas_order: sequential,
+        produce_decoding::test_produce_validation_answers_each_partition: sequential,
         large_decodes::test_saturated_large_decodes_wait_instead_of_closing: sequential,
         limits::test_network_limits_setup: sequential,
         limits::test_scram_unknown_user_is_indistinguishable: sequential,

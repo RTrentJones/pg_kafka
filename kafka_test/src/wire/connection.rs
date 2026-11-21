@@ -93,6 +93,42 @@ impl Wire {
         Ok((p.error_code, p.base_offset))
     }
 
+    /// Produce v7 (acks=-1) of several topics' partitions in one request: every
+    /// partition's `(topic, partition, error_code, base_offset)`, sorted.
+    pub async fn produce_many(
+        &mut self,
+        topics: &[(&str, Vec<(i32, Bytes)>)],
+        transactional_id: Option<&str>,
+    ) -> Result<Vec<(String, i32, i16, i64)>> {
+        let mut req = ProduceRequest::default();
+        req.acks = -1;
+        req.timeout_ms = 10_000;
+        req.transactional_id = transactional_id.map(txn_id);
+        for (name, parts) in topics {
+            let mut t = TopicProduceData::default();
+            t.name = topic_name(name);
+            for (index, records) in parts {
+                let mut p = PartitionProduceData::default();
+                p.index = *index;
+                p.records = Some(records.clone());
+                t.partition_data.push(p);
+            }
+            req.topic_data.push(t);
+        }
+        let resp: ProduceResponse = self.call(7, &req).await?;
+        let mut out: Vec<_> = resp
+            .responses
+            .iter()
+            .flat_map(|t| {
+                t.partition_responses
+                    .iter()
+                    .map(|p| (t.name.to_string(), p.index, p.error_code, p.base_offset))
+            })
+            .collect();
+        out.sort();
+        Ok(out)
+    }
+
     /// InitProducerId v1: `(error_code, producer_id, epoch)`.
     pub async fn init_producer_id(
         &mut self,

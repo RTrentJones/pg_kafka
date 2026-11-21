@@ -20,7 +20,8 @@ use crate::kafka::dispatch::RequestOutcome;
 use crate::kafka::error::KafkaError;
 use crate::kafka::handlers;
 use crate::kafka::messages::{
-    KafkaRequest, KafkaResponse, PartitionProduceData, ProducerMetadata, TopicProduceData,
+    KafkaRequest, KafkaResponse, PartitionProduceData, ProducerMetadata, RefusedPartition,
+    TopicProduceData,
 };
 use crate::kafka::notifications::InternalNotification;
 use crate::kafka::protocol::decode_budget::{
@@ -28,8 +29,8 @@ use crate::kafka::protocol::decode_budget::{
     INLINE_DECODE_BYTES, LARGE_DECODES, MAX_DECODED_REQUEST_BYTES,
 };
 use crate::kafka::protocol::{
-    least_decoded_memory, parse_record_batch_with_metadata, validate_produce_records,
-    ParsedRecordBatch,
+    first_batch_is_transactional, least_decoded_memory, parse_record_batch_with_metadata,
+    validate_produce_records, ParsedRecordBatch,
 };
 use crate::kafka::storage::{LogStore, TopicStore};
 
@@ -43,8 +44,10 @@ pub struct ProduceRequestData {
     pub acks: i16,
     /// Acknowledgment timeout (milliseconds).
     pub timeout_ms: i32,
-    /// Topic → partitions → records.
+    /// Topic → partitions → records, of the partitions whose records decoded.
     pub topic_data: Vec<TopicProduceData>,
+    /// The partitions whose records failed validation, answered with their own errors.
+    pub refused: Vec<RefusedPartition>,
     /// Transactional id of a transactional producer.
     pub transactional_id: Option<String>,
     /// The decoded records' share of the process-wide decode budget, given back when the
@@ -60,6 +63,7 @@ pub struct ProduceRequestData {
 /// `protocol::decode_budget`).
 pub struct PendingRecords {
     topics: Arc<Vec<WireTopicProduceData>>,
+    zstd_allowed: bool,
     requested: TopicPartitions,
     wait: Wait,
     deadline: tokio::time::Instant,
@@ -159,20 +163,21 @@ impl KafkaApi for ProduceApi {
         let zstd_allowed = header.api_version >= MIN_ZSTD_VERSION;
         let decode = decode_all_records(&wire.topic_data, zstd_allowed);
         let transactional_id = wire.transactional_id.map(|s| s.to_string());
-        let (topic_data, decoded, pending) = match decode {
-            Ok(Decode::Done((topic_data, decoded))) => (topic_data, decoded, None),
+        let (DecodedTopics(topic_data, refused, decoded), pending) = match decode {
+            Ok(Decode::Done(done)) => (done, None),
             Ok(Decode::Pending(wait)) => {
                 let Some(frame) = HeldFrame::charge(record_bytes(&wire.topic_data)) else {
                     return Err(rejection(DecodeFailure::TimedOut, acks, requested));
                 };
                 let pending = PendingRecords {
                     topics: Arc::new(wire.topic_data),
+                    zstd_allowed,
                     requested,
                     wait,
                     deadline: tokio::time::Instant::now() + decode_wait(wire.timeout_ms),
                     _frame: frame,
                 };
-                (Vec::new(), DecodedCharge::default(), Some(pending))
+                (DecodedTopics::default(), Some(pending))
             }
             Err(failure) => return Err(rejection(failure, acks, requested)),
         };
@@ -181,6 +186,7 @@ impl KafkaApi for ProduceApi {
             acks,
             timeout_ms: wire.timeout_ms,
             topic_data,
+            refused,
             transactional_id,
             decoded,
             pending,
@@ -188,7 +194,7 @@ impl KafkaApi for ProduceApi {
     }
 
     fn echo(request: &Self::Request) -> TopicPartitions {
-        request
+        let mut echo: TopicPartitions = request
             .topic_data
             .iter()
             .map(|t| {
@@ -197,7 +203,14 @@ impl KafkaApi for ProduceApi {
                     t.partitions.iter().map(|p| p.partition_index).collect(),
                 )
             })
-            .collect()
+            .collect();
+        for refused in &request.refused {
+            match echo.iter_mut().find(|(name, _)| *name == refused.topic) {
+                Some((_, partitions)) => partitions.push(refused.partition),
+                None => echo.push((refused.topic.clone(), vec![refused.partition])),
+            }
+        }
+        echo
     }
 
     /// The broker sends NO response frame at all for acks=0 (a reply desyncs clients
@@ -226,10 +239,11 @@ impl KafkaApi for ProduceApi {
             let close = || {
                 let _ = response_tx.send(KafkaResponse::new(-1, -1, ResponseBody::CloseConnection));
             };
+            let refused = !request.refused.is_empty();
             return match handlers::handle_produce(&env.ctx, request.topic_data, None, None) {
                 Ok(response) => {
                     emit_produce_notifications(&response, store, env.notify_tx);
-                    if acks0_must_close(&response) {
+                    if refused || acks0_must_close(&response) {
                         close();
                     }
                     RequestOutcome::Commit
@@ -246,15 +260,20 @@ impl KafkaApi for ProduceApi {
 
         // The long-poll wake-up runs inside the guarded handler, so a Postgres ERROR in its
         // SPI reads is answered like a handler panic instead of escaping unguarded.
+        //
+        // Refused partitions are answered before the others are written, so a topic that
+        // a valid partition auto-creates is still unknown to them, as it was to the client.
         call.run(request, |r, _| {
+            let refused = handlers::answer_refused_partitions(store, &r.refused)?;
             let producer_metadata = extract_producer_metadata(&r.topic_data);
-            let response = handlers::handle_produce(
+            let mut response = handlers::handle_produce(
                 &env.ctx,
                 r.topic_data,
                 producer_metadata.as_ref(),
                 r.transactional_id.as_deref(),
             )?;
             emit_produce_notifications(&response, store, env.notify_tx);
+            merge_topic_responses(&mut response, refused);
             Ok(response)
         })
     }
@@ -275,7 +294,7 @@ enum DecodeFailure {
     TimedOut,
     /// The decoder panicked.
     Panicked,
-    /// A batch is corrupt or invalid: this code on every partition.
+    /// A first batch Kafka cannot size: this code on every partition.
     Rejected(i16),
 }
 
@@ -317,41 +336,69 @@ enum Decode {
     Pending(Wait),
 }
 
-/// Records of every partition, and their charge to the decode budget.
-type DecodedTopics = (Vec<TopicProduceData>, DecodedCharge);
+/// The records of the partitions that decoded, the partitions refused, and the decoded
+/// records' charge to the decode budget.
+#[derive(Debug, Default)]
+struct DecodedTopics(Vec<TopicProduceData>, Vec<RefusedPartition>, DecodedCharge);
 
-/// Decode the records of every partition of `topics` within `budget`.
+/// The records of one partition, or the error that refuses it: Kafka 3.7 validates each
+/// partition on its own (`KafkaApis.handleProduceRequest` answers a partition whose data
+/// `ProduceRequest.validateRecords` refuses with that error, and the log append that
+/// validates the batch fails that partition only), and writes the others.
+fn decode_partition(
+    batch: &bytes::Bytes,
+    zstd_allowed: bool,
+    budget: &DecodeBudget,
+) -> Result<Result<ParsedRecordBatch, i16>, DecodeFailure> {
+    if let Err(code) = validate_produce_records(batch, zstd_allowed) {
+        return Ok(Err(code));
+    }
+    match parse_record_batch_with_metadata(batch, budget) {
+        Ok(parsed) => Ok(Ok(parsed)),
+        Err(e) => match budget.exhausted() {
+            Some(Exhausted::Limit) => Err(DecodeFailure::TooLarge),
+            Some(Exhausted::Global) => Err(DecodeFailure::Busy(budget.wanted())),
+            None => Ok(Err(match e {
+                KafkaError::InvalidRecord { .. } | KafkaError::Protocol { .. } => {
+                    e.to_kafka_error_code()
+                }
+                _ => ERROR_CORRUPT_MESSAGE,
+            })),
+        },
+    }
+}
+
+/// Decode the records of every partition of `topics` within `budget`. A topic all of whose
+/// partitions are refused is left out of the decoded topics, so nothing is written to it
+/// (and it is not auto-created).
 fn decode_records(
-    topics: &[kafka_protocol::messages::produce_request::TopicProduceData],
+    topics: &[WireTopicProduceData],
+    zstd_allowed: bool,
     budget: DecodeBudget,
 ) -> Result<DecodedTopics, DecodeFailure> {
     let mut topic_data = Vec::with_capacity(topics.len());
+    let mut refused = Vec::new();
     for topic in topics {
         let name = topic.name.to_string();
         let mut partitions = Vec::with_capacity(topic.partition_data.len());
         for partition in &topic.partition_data {
             let (records, producer_metadata) = match &partition.records {
-                Some(batch) => match parse_record_batch_with_metadata(batch, &budget) {
+                Some(batch) => match decode_partition(batch, zstd_allowed, &budget)? {
                     Ok(ParsedRecordBatch {
                         records,
                         producer_metadata,
                     }) => (records, Some(producer_metadata)),
-                    Err(e) => {
-                        return Err(match budget.exhausted() {
-                            Some(Exhausted::Limit) => DecodeFailure::TooLarge,
-                            Some(Exhausted::Global) => DecodeFailure::Busy(budget.wanted()),
-                            None => {
-                                warn!(
-                                    "Failed to parse RecordBatch for topic={}, partition={}: {}",
-                                    name, partition.index, e
-                                );
-                                DecodeFailure::Rejected(match e {
-                                    KafkaError::InvalidRecord { .. }
-                                    | KafkaError::Protocol { .. } => e.to_kafka_error_code(),
-                                    _ => ERROR_CORRUPT_MESSAGE,
-                                })
-                            }
+                    Err(error_code) => {
+                        warn!(
+                            "Refusing the records of topic={name}, partition={}: error {error_code}",
+                            partition.index
+                        );
+                        refused.push(RefusedPartition {
+                            topic: name.clone(),
+                            partition: partition.index,
+                            error_code,
                         });
+                        continue;
                     }
                 },
                 None => (Vec::new(), None),
@@ -362,47 +409,62 @@ fn decode_records(
                 producer_metadata,
             });
         }
-        topic_data.push(TopicProduceData { name, partitions });
+        if !partitions.is_empty() || topic.partition_data.is_empty() {
+            topic_data.push(TopicProduceData { name, partitions });
+        }
     }
-    Ok((topic_data, budget.into_charge()))
+    Ok(DecodedTopics(topic_data, refused, budget.into_charge()))
 }
 
-/// What Kafka checks of every partition's data while it parses the request
-/// ([`validate_produce_records`]), before any partition decodes: the first failure fails the
-/// request.
-fn validate_all_records(
-    topics: &[kafka_protocol::messages::produce_request::TopicProduceData],
-    zstd_allowed: bool,
-) -> Result<(), DecodeFailure> {
+/// What Kafka 3.7 reads of the request before it looks at any partition
+/// (`RequestUtils.hasTransactionalRecords`, [`first_batch_is_transactional`]): the first
+/// batch of each partition, in order, until one is transactional. One whose length or
+/// magic cannot be read fails the whole request with CORRUPT_MESSAGE.
+fn check_first_batches(topics: &[WireTopicProduceData]) -> Result<(), DecodeFailure> {
     for topic in topics {
         for partition in &topic.partition_data {
             let Some(batch) = &partition.records else {
                 continue;
             };
-            if let Err(code) = validate_produce_records(batch, zstd_allowed) {
-                warn!(
-                    "Refusing the records of topic={}, partition={}: error {code}",
-                    topic.name.0.as_str(),
-                    partition.index
-                );
-                return Err(DecodeFailure::Rejected(code));
+            match first_batch_is_transactional(batch) {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(code) => {
+                    warn!(
+                        "Refusing a Produce request: the first batch of topic={}, partition={} cannot be sized",
+                        topic.name.0.as_str(),
+                        partition.index
+                    );
+                    return Err(DecodeFailure::Rejected(code));
+                }
             }
         }
     }
     Ok(())
 }
 
-/// The memory the batches of `topics` take decoded by what they declare (their bytes and
-/// record counts), the least they can take.
-fn declared_memory(
-    topics: &[kafka_protocol::messages::produce_request::TopicProduceData],
-) -> usize {
+/// The memory the batches of `topics` that pass validation take decoded by what they
+/// declare (their bytes and record counts), the least they can take.
+fn declared_memory(topics: &[WireTopicProduceData], zstd_allowed: bool) -> usize {
     topics
         .iter()
         .flat_map(|t| t.partition_data.iter())
         .filter_map(|p| p.records.as_ref())
+        .filter(|batch| validate_produce_records(batch, zstd_allowed).is_ok())
         .map(|batch| least_decoded_memory(batch))
         .fold(0, usize::saturating_add)
+}
+
+/// Add the answers of refused partitions to `response`, under their topics.
+fn merge_topic_responses(response: &mut ProduceResponse, refused: Vec<TopicProduceResponse>) {
+    for topic in refused {
+        match response.responses.iter_mut().find(|t| t.name == topic.name) {
+            Some(answered) => answered
+                .partition_responses
+                .extend(topic.partition_responses),
+            None => response.responses.push(topic),
+        }
+    }
 }
 
 /// The bytes of the record batches of `topics` (what holding the request's frame holds).
@@ -428,15 +490,15 @@ fn decode_all_records(
     topics: &[WireTopicProduceData],
     zstd_allowed: bool,
 ) -> Result<Decode, DecodeFailure> {
-    validate_all_records(topics, zstd_allowed)?;
-    let declared = declared_memory(topics);
+    check_first_batches(topics)?;
+    let declared = declared_memory(topics, zstd_allowed);
     if declared > MAX_DECODED_REQUEST_BYTES {
         return Err(DecodeFailure::TooLarge);
     }
     if declared > INLINE_DECODE_BYTES {
         return Ok(Decode::Pending(Wait::Slot));
     }
-    match decode_records(topics, DecodeBudget::new(INLINE_DECODE_BYTES)) {
+    match decode_records(topics, zstd_allowed, DecodeBudget::new(INLINE_DECODE_BYTES)) {
         Ok(done) => Ok(Decode::Done(done)),
         Err(DecodeFailure::TooLarge) => Ok(Decode::Pending(Wait::Slot)),
         Err(DecodeFailure::Busy(wanted)) => Ok(Decode::Pending(Wait::Budget(wanted))),
@@ -456,15 +518,24 @@ async fn decode_pending(pending: &PendingRecords) -> Result<DecodedTopics, Decod
                 }
                 let topics = &pending.topics;
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    decode_records(topics, DecodeBudget::new(INLINE_DECODE_BYTES))
+                    decode_records(
+                        topics,
+                        pending.zstd_allowed,
+                        DecodeBudget::new(INLINE_DECODE_BYTES),
+                    )
                 }))
                 .unwrap_or(Err(DecodeFailure::Panicked))
             }
             Wait::Slot => {
                 let topics = Arc::clone(&pending.topics);
+                let zstd_allowed = pending.zstd_allowed;
                 LARGE_DECODES
                     .run(pending.deadline, move || {
-                        decode_records(&topics, DecodeBudget::new(MAX_DECODED_REQUEST_BYTES))
+                        decode_records(
+                            &topics,
+                            zstd_allowed,
+                            DecodeBudget::new(MAX_DECODED_REQUEST_BYTES),
+                        )
                     })
                     .await
                     .unwrap_or_else(|not_run| {
@@ -501,8 +572,9 @@ pub async fn finish_decode(mut request: KafkaRequest) -> Decoded {
         return Decoded::Request(request);
     };
     match decode_pending(&pending).await {
-        Ok((topic_data, decoded)) => {
+        Ok(DecodedTopics(topic_data, refused, decoded)) => {
             produce.topic_data = topic_data;
+            produce.refused = refused;
             produce.decoded = decoded;
             Decoded::Request(request)
         }
@@ -648,9 +720,31 @@ mod tests {
         batch_with(&section, i32::try_from(n).unwrap(), Header::default())
     }
 
+    /// The partitions decoded, and the partitions refused with their codes.
+    type Outcome = (Vec<i32>, Vec<(i32, i16)>);
+
+    /// What a request of `data` (one batch per partition) decodes to; `Err` for a request
+    /// refused whole.
+    fn outcome(data: Vec<bytes::Bytes>, zstd_allowed: bool) -> Result<Outcome, DecodeFailure> {
+        let Decode::Done(DecodedTopics(topic_data, refused, _)) =
+            decode_all_records(&topics(data), zstd_allowed)?
+        else {
+            panic!("a small request decodes inline");
+        };
+        Ok((
+            topic_data
+                .iter()
+                .flat_map(|t| t.partitions.iter().map(|p| p.partition_index))
+                .collect(),
+            refused
+                .iter()
+                .map(|r| (r.partition, r.error_code))
+                .collect(),
+        ))
+    }
+
     #[test]
-    fn zstd_is_refused_before_produce_v7_before_any_batch_decodes() {
-        use crate::kafka::constants::ERROR_INVALID_RECORD;
+    fn zstd_is_refused_before_produce_v7_on_its_partition() {
         let x = record(&[&[0], &v(0), &v(0), &v(-1), &v(1), b"x", &v(0)]);
         let zstd = batch_with(
             &x,
@@ -660,32 +754,152 @@ mod tests {
                 ..Header::default()
             },
         );
-        let rejected = |data: Vec<bytes::Bytes>, zstd_allowed| match decode_all_records(
-            &topics(data),
-            zstd_allowed,
-        ) {
-            Err(DecodeFailure::Rejected(code)) => Some(code),
-            _ => None,
-        };
         // The batch is not zstd data at all: refused for its codec first.
         assert_eq!(
-            rejected(vec![zstd.clone()], false),
-            Some(ERROR_UNSUPPORTED_COMPRESSION_TYPE)
-        );
-        assert_eq!(
-            rejected(vec![batch_of(1, 1), zstd.clone()], false),
-            Some(ERROR_UNSUPPORTED_COMPRESSION_TYPE),
-            "on any partition"
+            outcome(vec![zstd.clone(), batch_of(1, 1)], false),
+            Ok((vec![1], vec![(0, ERROR_UNSUPPORTED_COMPRESSION_TYPE)]))
         );
         // From v7 on the codec is accepted and the batch fails to decompress.
         assert_eq!(
-            rejected(vec![zstd.clone()], true),
-            Some(ERROR_CORRUPT_MESSAGE)
+            outcome(vec![batch_of(1, 1), zstd], true),
+            Ok((vec![0], vec![(1, ERROR_CORRUPT_MESSAGE)]))
         );
-        // An earlier partition's framing error comes first, as in Kafka.
+    }
+
+    #[test]
+    fn each_partition_is_validated_on_its_own() {
+        use crate::kafka::constants::ERROR_INVALID_RECORD;
+        let good = batch_of(1, 1);
+        let mut bad_crc = good.to_vec();
+        *bad_crc.last_mut().unwrap() ^= 1;
+        let two = bytes::Bytes::from([&good[..], &good[..]].concat());
         assert_eq!(
-            rejected(vec![bytes::Bytes::from_static(b"short"), zstd], false),
-            Some(ERROR_INVALID_RECORD)
+            outcome(
+                vec![bad_crc.into(), good.clone(), two, bytes::Bytes::new()],
+                true
+            ),
+            Ok((
+                vec![1],
+                vec![
+                    (0, ERROR_CORRUPT_MESSAGE),
+                    (2, ERROR_INVALID_RECORD),
+                    (3, ERROR_INVALID_RECORD)
+                ]
+            ))
+        );
+        // A topic all of whose partitions are refused is not passed on (nor created).
+        let bad = bytes::Bytes::from_static(b"short");
+        let Ok(Decode::Done(DecodedTopics(topic_data, refused, _))) =
+            decode_all_records(&topics(vec![bad]), true)
+        else {
+            panic!("decodes inline");
+        };
+        assert!(topic_data.is_empty());
+        assert_eq!(refused.len(), 1);
+    }
+
+    #[test]
+    fn only_a_first_batch_that_cannot_be_sized_fails_the_whole_request() {
+        let good = batch_of(1, 1);
+        // A batch length under 14, and a magic byte past 2: Kafka cannot size the batch.
+        let mut short_length = good.to_vec();
+        short_length[8..12].copy_from_slice(&13i32.to_be_bytes());
+        let mut magic_9 = good.to_vec();
+        magic_9[16] = 9;
+        for first in [short_length.clone(), magic_9] {
+            assert_eq!(
+                outcome(vec![good.clone(), first.into()], true),
+                Err(DecodeFailure::Rejected(ERROR_CORRUPT_MESSAGE))
+            );
+        }
+        // Past the first batch of a partition, only that partition is refused.
+        let after = bytes::Bytes::from([&good[..], &short_length[..12]].concat());
+        assert_eq!(
+            outcome(vec![after, good.clone()], true),
+            Ok((vec![1], vec![(0, ERROR_CORRUPT_MESSAGE)]))
+        );
+        // Kafka stops reading first batches at the first transactional one.
+        let transactional = batch_with(
+            &record(&[&[0], &v(0), &v(0), &v(-1), &v(1), b"t", &v(0)]),
+            1,
+            Header {
+                attributes: 0x10,
+                producer_id: 7,
+                producer_epoch: 0,
+                base_sequence: 0,
+                ..Header::default()
+            },
+        );
+        assert_eq!(
+            outcome(vec![transactional, short_length.into()], true),
+            Ok((vec![0], vec![(1, ERROR_CORRUPT_MESSAGE)]))
+        );
+    }
+
+    #[test]
+    fn refused_partitions_are_merged_under_their_topics_and_echoed() {
+        let answered = |name: &str, partitions: &[(i32, i16)]| {
+            let mut topic = TopicProduceResponse::default();
+            topic.name = kafka_protocol::messages::TopicName(name.to_string().into());
+            topic.partition_responses = partitions
+                .iter()
+                .map(|&(index, error_code)| {
+                    let mut p = PartitionProduceResponse::default();
+                    p.index = index;
+                    p.error_code = error_code;
+                    p
+                })
+                .collect();
+            topic
+        };
+        let mut response = ProduceResponse::default();
+        response.responses = vec![answered("a", &[(0, 0)])];
+        merge_topic_responses(
+            &mut response,
+            vec![answered("a", &[(1, 2)]), answered("b", &[(0, 3)])],
+        );
+        let got: Vec<(String, i32, i16)> = response
+            .responses
+            .iter()
+            .flat_map(|t| {
+                t.partition_responses
+                    .iter()
+                    .map(|p| (t.name.to_string(), p.index, p.error_code))
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("a".to_string(), 0, 0),
+                ("a".to_string(), 1, 2),
+                ("b".to_string(), 0, 3)
+            ]
+        );
+
+        let (request, _rx) = pending_request(1, Wait::Slot, std::time::Duration::from_secs(1));
+        let RequestBody::Produce(mut produce) = request.body else {
+            panic!("a Produce request");
+        };
+        produce.topic_data = vec![TopicProduceData {
+            name: "a".to_string(),
+            partitions: Vec::new(),
+        }];
+        produce.refused = vec![
+            RefusedPartition {
+                topic: "a".to_string(),
+                partition: 1,
+                error_code: 2,
+            },
+            RefusedPartition {
+                topic: "b".to_string(),
+                partition: 0,
+                error_code: 2,
+            },
+        ];
+        assert_eq!(
+            ProduceApi::echo(&produce),
+            vec![("a".to_string(), vec![1]), ("b".to_string(), vec![0])],
+            "an error response answers the refused partitions too"
         );
     }
 
@@ -697,14 +911,14 @@ mod tests {
         for (records, len) in [(15, 1000), (70, 200)] {
             let batch = batch_of(records, len);
             let topics = topics(vec![batch.clone(); 1024 * 1024 / batch.len()]);
-            let declared = declared_memory(&topics);
+            let declared = declared_memory(&topics, true);
             assert!(
                 declared <= INLINE_DECODE_BYTES,
                 "{len}-byte records declare {declared}"
             );
             let budget = DecodeBudget::new(INLINE_DECODE_BYTES);
             assert!(
-                decode_records(&topics, budget).is_ok(),
+                decode_records(&topics, true, budget).is_ok(),
                 "{len}-byte records"
             );
         }
@@ -719,7 +933,7 @@ mod tests {
         ));
         // 3000 records of 1000 bytes declare more than the inline limit.
         let large = topics(vec![batch_of(3000, 1000)]);
-        assert!(declared_memory(&large) > INLINE_DECODE_BYTES);
+        assert!(declared_memory(&large, true) > INLINE_DECODE_BYTES);
         assert!(matches!(
             decode_all_records(&large, true),
             Ok(Decode::Pending(Wait::Slot))
@@ -737,7 +951,7 @@ mod tests {
             2_000_000,
             Header::default(),
         )]);
-        assert!(declared_memory(&bomb) > MAX_DECODED_REQUEST_BYTES);
+        assert!(declared_memory(&bomb, true) > MAX_DECODED_REQUEST_BYTES);
         assert!(matches!(
             decode_all_records(&bomb, true),
             Err(DecodeFailure::TooLarge)
@@ -765,6 +979,7 @@ mod tests {
         let pending = PendingRecords {
             requested: vec![("t".to_string(), vec![0, 1])],
             topics: Arc::new(wire),
+            zstd_allowed: true,
             wait,
             deadline: tokio::time::Instant::now() + wait_for,
             _frame: HeldFrame::charge(0).unwrap(),
@@ -781,6 +996,7 @@ mod tests {
                 acks,
                 timeout_ms: 30_000,
                 topic_data: Vec::new(),
+                refused: Vec::new(),
                 transactional_id: None,
                 decoded: DecodedCharge::default(),
                 pending: Some(pending),
