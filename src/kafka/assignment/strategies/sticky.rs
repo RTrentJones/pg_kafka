@@ -76,6 +76,17 @@ impl StickyStrategy {
                 continue;
             };
             for (topic, prev_partitions) in &prev_assignment.topic_partitions {
+                // The previous assignment is the leader's, whatever names it carries: the
+                // topic is looked up once, and only a topic that exists is keyed per
+                // partition, so a long name over many partitions is not copied or hashed
+                // per partition.
+                let Some(topic) = input
+                    .topic_partitions
+                    .get_key_value(topic)
+                    .map(|(name, _)| name)
+                else {
+                    continue;
+                };
                 if !subscription.topics.contains(topic) {
                     continue;
                 }
@@ -800,6 +811,29 @@ mod tests {
             .collect();
         all.sort_unstable();
         assert_eq!(all, (0..PARTITIONS).collect::<Vec<_>>());
+    }
+
+    /// A previous assignment is the leader's SyncGroup, whatever names it carries: a name
+    /// that is no topic, subscribed to and over many partitions, costs nothing per
+    /// partition. Each partition copied and hashed the name, so four times the name took
+    /// four times as long.
+    #[test]
+    fn test_previous_partitions_of_a_long_name_cost_nothing_per_partition() {
+        let growth = crate::testing::flat_growth(8 * 1024, |len| {
+            let name = "n".repeat(len);
+            let mut previous = HashMap::new();
+            previous.insert(
+                "m".to_string(),
+                make_assignment(vec![(name.as_str(), (0..10_000).collect())]),
+            );
+            let input = make_input(vec![("m", vec![name.as_str(), "t"])], vec![("t", 1)]);
+            let result = StickyStrategy::with_previous(previous).assign(&input);
+            assert_eq!(result["m"].partitions("t"), vec![0]);
+        });
+        assert!(
+            growth < 2.0,
+            "4x the name length took {growth:.1}x the time"
+        );
     }
 
     #[test]

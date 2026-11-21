@@ -584,11 +584,22 @@ pub fn handle_list_offsets(
     isolation_level: IsolationLevel,
 ) -> Result<ListOffsetsResponse> {
     // Kafka 3.7 answers every entry of a partition the request names more than once
-    // INVALID_REQUEST and looks nothing up for it.
-    let mut named: HashMap<(&str, i32), usize> = HashMap::new();
-    for topic in &topics {
+    // INVALID_REQUEST and looks nothing up for it. Each distinct name is numbered once per
+    // topic entry and partitions are keyed by that number, so a long name repeated over
+    // many partitions is hashed once, not once per partition.
+    let mut name_at: HashMap<&str, usize> = HashMap::new();
+    let numbers: Vec<usize> = topics
+        .iter()
+        .map(|topic| {
+            let next = name_at.len();
+            *name_at.entry(topic.name.as_str()).or_insert(next)
+        })
+        .collect();
+    drop(name_at);
+    let mut named: HashMap<(usize, i32), usize> = HashMap::new();
+    for (topic, &number) in topics.iter().zip(&numbers) {
         for p in &topic.partitions {
-            *named.entry((&topic.name, p.partition_index)).or_default() += 1;
+            *named.entry((number, p.partition_index)).or_default() += 1;
         }
     }
     // The repeated partitions of each topic entry, by entry position: keyed by the entry
@@ -596,16 +607,13 @@ pub fn handle_list_offsets(
     // costs nothing per partition.
     let repeated: Vec<HashSet<i32>> = topics
         .iter()
-        .map(|topic| {
+        .zip(&numbers)
+        .map(|(topic, &number)| {
             topic
                 .partitions
                 .iter()
                 .map(|p| p.partition_index)
-                .filter(|&partition| {
-                    named
-                        .get(&(topic.name.as_str(), partition))
-                        .is_some_and(|&n| n > 1)
-                })
+                .filter(|&partition| named.get(&(number, partition)).is_some_and(|&n| n > 1))
                 .collect()
         })
         .collect();

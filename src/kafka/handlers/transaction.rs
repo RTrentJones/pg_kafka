@@ -365,25 +365,19 @@ pub fn handle_txn_offset_commit(
     Ok(response)
 }
 
-/// Whether `partition` of `topic` exists, by the topics `resolved` found.
-fn partition_exists(resolved: &HashMap<String, (i32, i32)>, topic: &str, partition: i32) -> bool {
-    resolved
-        .get(topic)
-        .is_some_and(|(_, count)| (0..*count).contains(&partition))
-}
-
 /// A refused TxnOffsetCommit: `error_code` on every partition that exists,
-/// UNKNOWN_TOPIC_OR_PARTITION on the rest; nothing stored.
+/// UNKNOWN_TOPIC_OR_PARTITION on the rest; nothing stored. Each topic is looked up once,
+/// not once per partition: a long name over many partitions would be hashed per entry.
 fn txn_offset_commit_refused_response(
     topics: &TxnOffsetCommitTopics,
     resolved: &HashMap<String, (i32, i32)>,
     error_code: i16,
 ) -> TxnOffsetCommitResponse {
     let mut response = txn_offset_commit_error_response(topics, error_code);
-    for topic in &mut response.topics {
-        let name = topic.name.0.to_string();
+    for (topic, (name, _)) in response.topics.iter_mut().zip(topics) {
+        let count = resolved.get(name).map_or(0, |&(_, count)| count);
         for p in &mut topic.partitions {
-            if !partition_exists(resolved, &name, p.partition_index) {
+            if !(0..count).contains(&p.partition_index) {
                 p.error_code = ERROR_UNKNOWN_TOPIC_OR_PARTITION;
             }
         }

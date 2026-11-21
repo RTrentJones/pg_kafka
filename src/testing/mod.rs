@@ -48,7 +48,19 @@ pub fn cpu_time<T>(f: impl FnOnce() -> T) -> (T, Duration) {
 /// inflates a ratio, so the comparison is repeated up to three times and the smallest ratio
 /// is returned; it stops early once a ratio is under 6. Work that really grows
 /// quadratically never measures under 6, so a repeat cannot hide it.
-pub fn growth(n: usize, mut run: impl FnMut(usize)) -> f64 {
+pub fn growth(n: usize, run: impl FnMut(usize)) -> f64 {
+    growth_under(6.0, 3, n, run)
+}
+
+/// [`growth`] for work that should not grow with `n` at all (about 1; about 4 if it is
+/// linear): repeated up to five times, stopping early once a ratio is under 2.
+pub fn flat_growth(n: usize, run: impl FnMut(usize)) -> f64 {
+    growth_under(2.0, 5, n, run)
+}
+
+/// The smallest ratio of `run(4 * n)` to `run(n)` over up to `rounds` comparisons,
+/// stopping early once one is under `enough`.
+fn growth_under(enough: f64, rounds: usize, n: usize, mut run: impl FnMut(usize)) -> f64 {
     let mut best = |size: usize| {
         (0..3)
             .map(|_| cpu_time(|| run(size)).1)
@@ -57,11 +69,11 @@ pub fn growth(n: usize, mut run: impl FnMut(usize)) -> f64 {
             .max(Duration::from_micros(1))
     };
     let mut smallest = f64::INFINITY;
-    for _ in 0..3 {
+    for _ in 0..rounds {
         let small = best(n);
         let large = best(4 * n);
         smallest = smallest.min(large.as_secs_f64() / small.as_secs_f64());
-        if smallest < 6.0 {
+        if smallest < enough {
             break;
         }
     }

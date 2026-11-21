@@ -901,3 +901,32 @@ fn test_txn_offset_commit_refusal_spares_unknown_partitions() {
         );
     }
 }
+
+/// A refused TxnOffsetCommit looks each topic up once, not once per partition: a long
+/// name over many partitions was hashed per partition, so four times the name took four
+/// times as long.
+#[test]
+fn test_txn_offset_commit_refusal_costs_nothing_per_partition_for_the_name() {
+    let mut mock = MockKafkaStore::new();
+    topics_with_partitions(&mut mock, 1 << 20);
+    mock.expect_store_txn_pending_offset().never();
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
+    let growth = crate::testing::flat_growth(8 * 1024, |len| {
+        let topics = vec![(
+            "n".repeat(len),
+            (0..10_000).map(|p| (p, 1i64, None)).collect(),
+        )];
+        let response =
+            transaction::handle_txn_offset_commit(&ctx, "nosuch", 999, 3, "", 5, "", topics)
+                .unwrap();
+        assert!(response.topics[0]
+            .partitions
+            .iter()
+            .all(|p| p.error_code == ERROR_INVALID_GROUP_ID));
+    });
+    assert!(
+        growth < 2.0,
+        "4x the name length took {growth:.1}x the time"
+    );
+}

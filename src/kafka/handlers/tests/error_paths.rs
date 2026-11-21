@@ -262,6 +262,34 @@ fn list_offsets_repeated_partitions_do_not_copy_the_name() {
     assert!(peak < 4 << 20, "held {peak} bytes besides the request");
 }
 
+/// Finding a ListOffsets request's repeated partitions costs nothing per partition entry
+/// for the topic's name: keyed by the full name, each of a 32 KB name's 60,000 partition
+/// entries (a 1 MB request) hashed the name twice, about 1.8 s of DB-thread CPU. Four
+/// times the name length at the same entries must cost about the same.
+#[test]
+fn list_offsets_repeated_partitions_cost_nothing_per_entry_for_the_name() {
+    let mut store = MockKafkaStore::new();
+    // No partition of the topic exists, so no entry reads the store.
+    expect_topics(&mut store, |_| Ok(Some((1, 0))));
+    let partitions: Vec<(i32, i64)> = (0..10_000).map(|i| (i, -1)).collect();
+    let growth = crate::testing::flat_growth(8 * 1024, |len| {
+        let topics = vec![list_topic(&"n".repeat(len), &partitions)];
+        let resp = with_ctx(&store, |ctx| {
+            handle_list_offsets(
+                ctx,
+                topics,
+                crate::kafka::storage::IsolationLevel::ReadUncommitted,
+            )
+        })
+        .unwrap();
+        assert_eq!(resp.topics[0].partitions.len(), partitions.len());
+    });
+    assert!(
+        growth < 2.0,
+        "4x the name length took {growth:.1}x the time"
+    );
+}
+
 // ========== DescribeGroups ==========
 
 #[test]
