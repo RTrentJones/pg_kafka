@@ -545,7 +545,8 @@ fn db_error(e: &tokio_postgres::Error) -> String {
 /// refuses `CREATE TABLE ... PARTITION OF` while the DEFAULT leaf holds rows of the new
 /// leaf's range (check_violation). The function re-checks once it holds
 /// `kafka.messages`, when no row can arrive any more, and moves the rows (or skips the
-/// leaf until the next pass).
+/// leaf until the next pass). The re-check reads the caller's snapshot, which under
+/// REPEATABLE READ predates the row's commit: the leaf is skipped then.
 ///
 /// The layout: the worker's furthest leaf ahead is dropped, so the next pass recreates
 /// it first. A session inserts a row for that range (it lands in DEFAULT) and keeps its
@@ -556,8 +557,8 @@ fn db_error(e: &tokio_postgres::Error) -> String {
 /// Asserts: the pass succeeds, and the row ends up in the recreated leaf, moved by that
 /// pass or, if it found the schema lock taken and skipped the leaf, by the next; and with
 /// a session holding the schema lock SHARE (as a worker transaction does) during the
-/// race, the pass succeeds, skips the leaf leaving the row in DEFAULT, and the next pass
-/// moves it.
+/// race, or with the pass run inside a REPEATABLE READ transaction, the pass succeeds,
+/// skips the leaf leaving the row in DEFAULT, and the next pass moves it.
 pub async fn test_rows_reaching_default_during_leaf_lock_wait() -> TestResult {
     into_test_result(rows_reaching_default_during_lock_wait().await)
 }
@@ -576,7 +577,7 @@ async fn rows_reaching_default_during_lock_wait() -> SendResult<()> {
         .map_err(boxed)?
         .get(0);
     let mut result = Ok(());
-    for race in [Race::Plain, Race::SchemaLockHeld] {
+    for race in [Race::Plain, Race::SchemaLockHeld, Race::RepeatableRead] {
         result = default_race(&db, topic_id, race).await;
         if result.is_err() {
             break;
@@ -605,6 +606,9 @@ enum Race {
     Plain,
     /// A session holds the schema lock SHARE throughout, so the pass cannot move the row.
     SchemaLockHeld,
+    /// The pass runs in a REPEATABLE READ transaction whose snapshot predates the row's
+    /// commit, so its re-check misses the row and the leaf's DDL meets it.
+    RepeatableRead,
 }
 
 /// One race for the worker's furthest leaf ahead.
@@ -687,10 +691,25 @@ async fn default_race(db: &Client, topic_id: i32, race: Race) -> SendResult<()> 
     println!("Step 1: an open transaction inserted a row for that range into DEFAULT");
 
     let pass = tokio::spawn(async move {
-        maintainer
+        let repeatable_read = race == Race::RepeatableRead;
+        if repeatable_read {
+            maintainer
+                .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+                .await?;
+        }
+        let created = maintainer
             .query_one("SELECT pg_kafka_run_partition_maintenance()", &[])
             .await
-            .map(|r| r.get::<_, i64>(0))
+            .map(|r| r.get::<_, i64>(0));
+        if repeatable_read {
+            let end = if created.is_ok() {
+                "COMMIT"
+            } else {
+                "ROLLBACK"
+            };
+            maintainer.batch_execute(end).await?;
+        }
+        created
     });
     // The pass polls in lock_message_tables; one of its attempts waits for
     // kafka.messages (or kafka.topics) behind the open insert. Its sleeps between
@@ -722,7 +741,7 @@ async fn default_race(db: &Client, topic_id: i32, race: Race) -> SendResult<()> 
         .map_err(boxed)?
         .map_err(|e| format!("maintenance failed: {}", db_error(&e)))?;
     println!("Step 3: the pass succeeded, created {created} leaf/leaves");
-    if race == Race::SchemaLockHeld {
+    if race != Race::Plain {
         let home: String = db
             .query_one(
                 "SELECT tableoid::regclass::text FROM kafka.messages WHERE topic_id = $1",
@@ -731,7 +750,9 @@ async fn default_race(db: &Client, topic_id: i32, race: Race) -> SendResult<()> 
             .await
             .map_err(boxed)?
             .get(0);
-        share.batch_execute("ROLLBACK").await.map_err(boxed)?;
+        if race == Race::SchemaLockHeld {
+            share.batch_execute("ROLLBACK").await.map_err(boxed)?;
+        }
         assert_eq!(
             (created, home.as_str()),
             (0, "kafka.messages_default"),

@@ -125,7 +125,10 @@ Maintenance can run in the worker and, at the same time, in any session
   Rows can still reach DEFAULT while `create_message_partition` waits for its table locks
   (`CREATE ... PARTITION OF` would then fail with `check_violation`), so a leaf that had
   none to move checks again once it holds `kafka.messages`, when none can arrive, and
-  moves the rows on the same terms. Trying the schema lock while holding the tables
+  moves the rows on the same terms. That check reads the transaction's snapshot: a manual
+  pass under `REPEATABLE READ` or `SERIALIZABLE` does not see rows committed during the
+  wait, so a `check_violation` from the leaf's DDL skips the leaf (a WARNING, as for a lock
+  timeout) and a later pass moves the rows. Trying the schema lock while holding the tables
   waits for nothing, so it cannot close a cycle. The upgrade scripts take the same lock
   first. No other path waits for the schema lock after a table lock.
 * **Sweeps and partition maintenance never overlap.** A retention sweep deletes rows first

@@ -293,8 +293,8 @@ $$;
 -- the tables CREATE EXTENSION made: pg_dump then leaves it out exactly as it leaves
 -- out kafka.messages itself, DROP EXTENSION drops it, and no dump can restore a leaf
 -- without its parent. Returns 1 if created, 0 if a lock could not be taken within
--- lock_timeout or a move found the schema lock taken (the next maintenance pass
--- retries).
+-- lock_timeout, a move found the schema lock taken, or the DEFAULT leaf holds rows of
+-- the range the caller's snapshot does not see (the next maintenance pass retries).
 CREATE FUNCTION kafka.create_message_partition(p_lower TIMESTAMPTZ, p_upper TIMESTAMPTZ)
 RETURNS INT
 LANGUAGE plpgsql SECURITY DEFINER
@@ -337,7 +337,9 @@ BEGIN
         -- Rows can reach the DEFAULT leaf while lock_message_tables waits, and CREATE
         -- ... PARTITION OF fails (check_violation) on any of the new leaf's range. With
         -- kafka.messages held ACCESS EXCLUSIVE none can arrive now: check again and
-        -- move them.
+        -- move them. The check reads the transaction's snapshot, so under REPEATABLE
+        -- READ or SERIALIZABLE (a manual pass) it misses rows committed during the
+        -- wait; the check_violation handler below skips the leaf then.
         IF NOT v_move THEN
             v_move := EXISTS (SELECT 1 FROM kafka.messages_default
                               WHERE created_at >= p_lower AND created_at < p_upper);
@@ -374,9 +376,16 @@ BEGIN
                          AND deptype = 'e') THEN
             EXECUTE format('ALTER EXTENSION pg_kafka ADD TABLE kafka.%I', v_name);
         END IF;
-    EXCEPTION WHEN lock_not_available THEN
-        RAISE WARNING 'pg_kafka: could not create time partition kafka.% (lock timeout); will retry', v_name;
-        RETURN 0;
+    EXCEPTION
+        WHEN lock_not_available THEN
+            RAISE WARNING 'pg_kafka: could not create time partition kafka.% (lock timeout); will retry', v_name;
+            RETURN 0;
+        -- The DEFAULT leaf holds rows of the range this transaction's snapshot does not
+        -- see (committed after a REPEATABLE READ or SERIALIZABLE snapshot was taken):
+        -- the leaf is skipped and a later pass, with a newer snapshot, moves them.
+        WHEN check_violation THEN
+            RAISE WARNING 'pg_kafka: could not create time partition kafka.% (kafka.messages_default holds rows of its range this snapshot does not see); will retry', v_name;
+            RETURN 0;
     END;
     IF v_moved > 0 THEN
         RAISE LOG 'pg_kafka: created time partition kafka.% and moved % row(s) into it from kafka.messages_default',
