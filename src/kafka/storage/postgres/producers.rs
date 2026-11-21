@@ -538,9 +538,10 @@ impl PostgresStore {
         .map_err(internal("txn_has_partition"))
     }
 
-    /// Every idempotent batch asks, so the first statement is the cheap one: an Ongoing
-    /// transaction of the producer that added the partition (none for a producer without
-    /// a transactional id). Only then are the partition's pending rows looked at.
+    /// Every non-transactional idempotent batch asks, so the first statement is the cheap
+    /// one: the producer's Ongoing transaction (an index lookup,
+    /// `idx_transactions_ongoing_producer`; none for a producer without a transactional
+    /// id) that added the partition. Only then are the partition's pending rows looked at.
     pub(super) fn open_txn_epoch_on_partition(
         producer_id: i64,
         topic_id: i32,

@@ -1042,6 +1042,13 @@ CREATE TABLE kafka.txn_partitions (
     PRIMARY KEY (transactional_id, topic_id, partition_id)
 );
 
+-- Ongoing transactions by producer id: every non-transactional idempotent batch asks
+-- whether its producer has an open transaction (open_txn_epoch_on_partition), and a plain
+-- idempotent producer has none, so the lookup must not scan every open transaction.
+CREATE INDEX idx_transactions_ongoing_producer
+ON kafka.transactions(producer_id)
+WHERE state = 'Ongoing';
+
 GRANT SELECT ON kafka.producer_batches TO pgkafka_reader;
 GRANT SELECT ON kafka.txn_partitions TO pgkafka_reader;
 GRANT SELECT, INSERT, UPDATE, DELETE ON kafka.producer_batches TO pgkafka_worker;

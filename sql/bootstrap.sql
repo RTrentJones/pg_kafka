@@ -768,6 +768,13 @@ CREATE INDEX idx_transactions_timeout
 ON kafka.transactions(state, started_at)
 WHERE state = 'Ongoing';
 
+-- Ongoing transactions by producer id: every non-transactional idempotent batch asks
+-- whether its producer has an open transaction (open_txn_epoch_on_partition), and a plain
+-- idempotent producer has none, so the lookup must not scan every open transaction.
+CREATE INDEX idx_transactions_ongoing_producer
+ON kafka.transactions(producer_id)
+WHERE state = 'Ongoing';
+
 -- Pending transactional offsets table: Stores offset commits within an active transaction
 -- These offsets are moved to consumer_offsets on commit, deleted on abort
 CREATE TABLE kafka.txn_pending_offsets (
