@@ -15,7 +15,8 @@
 //!   claiming them over and over (the worker stays idle) and forwards them once
 //!   one is;
 //! - a claim does not slow down with the number of rows in flight (the
-//!   in-flight exclusion is a hash lookup, not a scan per pending row).
+//!   in-flight exclusion is a hash lookup, not a scan per pending row) or with
+//!   the size of the backlog.
 
 use crate::common::{create_db_client, create_producer, TestResult};
 use crate::setup::TestContext;
@@ -896,29 +897,32 @@ async fn claimed(db: &Client, topic_id: i32) -> Result<i64, Box<dyn std::error::
         .get(0))
 }
 
-/// A claim skips the rows already in flight, and its cost must not grow with
-/// their number: with the in-flight exclusion a correlated scan of the in-flight
-/// list per pending row passed, claim k of a backlog cost O((k x batch)^2), and
-/// filling the worker's 8 192-row in-flight window took ~15-20 s (each claim
-/// stalling every request on the DB thread); with a hashed lookup it takes well
-/// under a second.
-///
-/// The backlog is written while no broker is configured (nothing is claimed),
-/// and acks are held back (`pg_kafka.test_forward_ack_delay_ms`), so every claimed
-/// row stays in flight; the test times how long the claims take to fill the window,
-/// from the first claimed row.
-pub async fn test_shadow_claims_stay_fast_with_a_full_in_flight_window() -> TestResult {
-    const RECORDS: usize = 10_000;
-    // The worker's MAX_INFLIGHT: claims stop once this many rows are in flight.
-    const WINDOW: i64 = 8_192;
-    // From the first claimed row to a full window, measured on a dev machine:
-    // 0.3-0.4 s with the hashed exclusion, 10-15 s with the old scan; CI runners
-    // are ~2x slower, so this leaves >= 3x either way.
-    const BOUND: Duration = Duration::from_secs(3);
+/// How [`time_claims`] sets up and times the claims of a backlog.
+struct ClaimRun {
+    /// Records written while no broker is configured: the backlog.
+    records: usize,
+    /// Claimed rows to time, from the first claimed row.
+    rows: i64,
+    /// Fails the test if claiming `rows` takes longer.
+    bound: Duration,
+    /// `ANALYZE kafka.shadow_tracking` once the backlog is written, so the planner
+    /// sees its size (autovacuum would, a little later).
+    analyze: bool,
+    /// Server settings (`name`, `value`) set for the claims, then reset.
+    settings: &'static [(&'static str, &'static str)],
+    /// What a run over the bound means.
+    failure: &'static str,
+}
+
+/// Write a backlog while no broker is configured (nothing is claimed), hold acks
+/// back (`pg_kafka.test_forward_ack_delay_ms`) so every claimed row stays in
+/// flight, configure the broker and time the claims from the first claimed row
+/// until `run.rows` are claimed; then release the acks and let the backlog drain.
+async fn time_claims(name: &str, run: &ClaimRun) -> TestResult {
     const ACK_DELAY_MS: i32 = 15_000;
-    println!("=== Test: claims stay fast with a full in-flight window ===\n");
+    println!("=== Test: {name} ===\n");
     let ctx = TestContext::new().await?;
-    let topic = ctx.unique_topic("shadow-inflight-window").await;
+    let topic = ctx.unique_topic("shadow-claim-time").await;
     verify_external_kafka_ready().await?;
     enable_shadow_mode(
         ctx.db(),
@@ -928,17 +932,18 @@ pub async fn test_shadow_claims_stay_fast_with_a_full_in_flight_window() -> Test
     .await?;
     let topic_id = topic_id(ctx.db(), &topic).await?;
     let db = create_db_client().await?;
+    let records = run.records;
 
     let result = async {
-        println!("Step 1: no broker configured; produce {RECORDS} records...");
+        println!("Step 1: no broker configured; produce {records} records...");
         alter_system(
             &db,
             "ALTER SYSTEM SET pg_kafka.shadow_bootstrap_servers = ''",
         )
         .await?;
         let producer = bulk_producer()?;
-        let mut pending = Vec::with_capacity(RECORDS);
-        for i in 0..RECORDS {
+        let mut pending = Vec::with_capacity(records);
+        for i in 0..records {
             let key = format!("k{}", i % 97);
             pending.push(
                 producer
@@ -951,19 +956,28 @@ pub async fn test_shadow_claims_stay_fast_with_a_full_in_flight_window() -> Test
         }
         let rows = undelivered(ctx.db(), topic_id).await?;
         let taken = claimed(ctx.db(), topic_id).await?;
-        if rows != i64::try_from(RECORDS)? || taken != 0 {
+        if rows != i64::try_from(records)? || taken != 0 {
             return Err(format!(
-                "{rows} pending outbox rows ({taken} claimed), expected {RECORDS} unclaimed"
+                "{rows} pending outbox rows ({taken} claimed), expected {records} unclaimed"
             )
             .into());
         }
+        if run.analyze {
+            db.execute("ANALYZE kafka.shadow_tracking", &[]).await?;
+        }
 
-        println!("Step 2: hold acks {ACK_DELAY_MS} ms, configure the broker, time the claims...");
-        alter_system(
-            &db,
+        println!("Step 2: hold acks {ACK_DELAY_MS} ms, set {:?}, configure the broker, time the claims...", run.settings);
+        db.execute(
             &format!("ALTER SYSTEM SET pg_kafka.test_forward_ack_delay_ms = {ACK_DELAY_MS}"),
+            &[],
         )
         .await?;
+        for (setting, value) in run.settings {
+            db.execute(&format!("ALTER SYSTEM SET {setting} = '{value}'"), &[])
+                .await?;
+        }
+        db.execute("SELECT pg_reload_conf()", &[]).await?;
+        tokio::time::sleep(Duration::from_millis(700)).await;
         // Timed from the first claimed row, so the reload's latency is not counted.
         db.execute(
             &format!(
@@ -976,37 +990,57 @@ pub async fn test_shadow_claims_stay_fast_with_a_full_in_flight_window() -> Test
         db.execute("SELECT pg_reload_conf()", &[]).await?;
         let reloaded = Instant::now();
         let mut first_claim: Option<Instant> = None;
-        let filled = loop {
+        let took = loop {
             let taken = claimed(ctx.db(), topic_id).await?;
             if taken > 0 && first_claim.is_none() {
                 first_claim = Some(Instant::now());
             }
-            if taken >= WINDOW {
+            if taken >= run.rows {
                 break first_claim.map_or(Duration::ZERO, |t| t.elapsed());
             }
             if reloaded.elapsed() > Duration::from_secs(60) {
-                return Err(format!("only {taken} of {WINDOW} rows claimed after 60 s").into());
+                return Err(format!(
+                    "only {taken} of {} rows claimed after 60 s: {}",
+                    run.rows, run.failure
+                )
+                .into());
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         };
-        println!("  the in-flight window ({WINDOW} rows) filled in {filled:?} (bound {BOUND:?})");
-        if filled > BOUND {
+        println!(
+            "  {} rows claimed in {took:?} (bound {:?})",
+            run.rows, run.bound
+        );
+        println!("SHADOW_CLAIM_TIME_MS={}", took.as_millis());
+        if took > run.bound {
             return Err(format!(
-                "claiming {WINDOW} rows behind a growing in-flight window took {filled:?}, \
-                 over {BOUND:?}: a claim's cost grows with the rows in flight"
+                "claiming {} rows took {took:?}, over {:?}: {}",
+                run.rows, run.bound, run.failure
             )
             .into());
         }
 
-        println!("Step 3: release the acks; the backlog drains...");
+        println!("Step 3: reset the settings, release the acks; the backlog drains...");
+        for (setting, _) in run.settings {
+            db.execute(&format!("ALTER SYSTEM RESET {setting}"), &[])
+                .await?;
+        }
         alter_system(&db, "ALTER SYSTEM RESET pg_kafka.test_forward_ack_delay_ms").await?;
-        let took = drained_within(ctx.db(), topic_id, Duration::from_secs(90)).await?;
+        let took = drained_within(ctx.db(), topic_id, Duration::from_secs(120)).await?;
         println!("  drained {took:?} later");
         Ok::<(), Box<dyn std::error::Error>>(())
     }
     .await
     .map_err(|e| e.to_string());
 
+    for (setting, _) in run.settings {
+        if let Err(e) = db
+            .execute(&format!("ALTER SYSTEM RESET {setting}"), &[])
+            .await
+        {
+            eprintln!("⚠️  cleanup: failed to reset {setting}: {e}");
+        }
+    }
     if let Err(e) = alter_system(&db, "ALTER SYSTEM RESET pg_kafka.test_forward_ack_delay_ms").await
     {
         eprintln!("⚠️  cleanup: failed to reset pg_kafka.test_forward_ack_delay_ms: {e}");
@@ -1018,4 +1052,53 @@ pub async fn test_shadow_claims_stay_fast_with_a_full_in_flight_window() -> Test
     result?;
     println!("✅ Test PASSED\n");
     Ok(())
+}
+
+/// A claim skips the rows already in flight, and its cost must not grow with
+/// their number: with the in-flight exclusion a correlated scan of the in-flight
+/// list per pending row passed, claim k of a backlog cost O((k x batch)^2), and
+/// filling the worker's 8 192-row in-flight window took ~15-20 s (each claim
+/// stalling every request on the DB thread); with a hashed lookup it takes well
+/// under a second. Timed from the first claimed row until the window is full.
+pub async fn test_shadow_claims_stay_fast_with_a_full_in_flight_window() -> TestResult {
+    time_claims(
+        "claims stay fast with a full in-flight window",
+        &ClaimRun {
+            records: 10_000,
+            // The worker's MAX_INFLIGHT: claims stop once this many rows are in flight.
+            rows: 8_192,
+            // Measured on a dev machine: 0.3-0.4 s with the hashed exclusion, 10-15 s
+            // with the old scan; CI runners are ~2x slower, so this leaves >= 3x
+            // either way.
+            bound: Duration::from_secs(3),
+            analyze: false,
+            settings: &[],
+            failure: "a claim's cost grows with the rows in flight",
+        },
+    )
+    .await
+}
+
+/// A claim's cost must not grow with the backlog. Its probe for the partitions
+/// with a due row was a `WHERE EXISTS`, which the planner turned into a hash
+/// semi join over every pending row (a seq scan of the outbox and a message
+/// probe per row) for single-partition backlogs of 100 000-200 000 rows: ~200 ms
+/// per claim however small. A backlog of 150 000 rows is written and analyzed
+/// (as autovacuum would), then claims of 50 rows are timed until 2 000 rows are
+/// in flight (40 claims). JIT is off so only the plan is measured. On PG17 here:
+/// 0.45-0.55 s with the ordered LATERAL probe, 10.6 s with the semi join; the
+/// 3 s bound leaves >= 3x either way allowing for CI runners ~2x slower.
+pub async fn test_shadow_claims_stay_fast_behind_a_large_backlog() -> TestResult {
+    time_claims(
+        "claims stay fast behind a large backlog",
+        &ClaimRun {
+            records: 150_000,
+            rows: 2_000,
+            bound: Duration::from_secs(3),
+            analyze: true,
+            settings: &[("jit", "off"), ("pg_kafka.shadow_batch_size", "50")],
+            failure: "a claim's cost grows with the backlog",
+        },
+    )
+    .await
 }

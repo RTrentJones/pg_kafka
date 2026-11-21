@@ -90,5 +90,6 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         outbox_robustness::test_shadow_stuck_partitions_do_not_throttle_a_backlog: sequential,
         outbox_robustness::test_shadow_unconfigured_broker_does_not_spin_the_worker: sequential,
         outbox_robustness::test_shadow_claims_stay_fast_with_a_full_in_flight_window: sequential, // Mutates global GUCs (test_forward_ack_delay_ms, shadow_bootstrap_servers)
+        outbox_robustness::test_shadow_claims_stay_fast_behind_a_large_backlog: sequential, // Mutates global GUCs (test_forward_ack_delay_ms, shadow_bootstrap_servers, jit, shadow_batch_size)
     ]
 }

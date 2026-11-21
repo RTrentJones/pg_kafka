@@ -377,15 +377,26 @@ const CLAIM_DUE_OUTBOX_ROWS_SQL: &str = concat!(
         -- share the batch: a partition holding only dead letters, orphan
         -- pointers, or rows in flight or backing off would otherwise take
         -- a share it cannot use, and with many of them a backlog elsewhere
-        -- would get a few rows per claim.
+        -- would get a few rows per claim. The probe is a LATERAL subquery cut
+        -- at the partition's first due row in offset order, not WHERE EXISTS:
+        -- the planner may flatten an EXISTS into a semi join, and with a
+        -- 100 000-200 000-row backlog in one partition it chose a hash semi
+        -- join that read every pending row (and probed messages for each) on
+        -- every claim. The ORDER BY keeps the probe on the pending index:
+        -- without it the planner may take a seq scan expected to stop early,
+        -- which first reads every delivered row kept for diagnostics.
         due_parts AS MATERIALIZED (
             SELECT p.topic_id, p.partition_id
             FROM parts p
             LEFT JOIN blocked b
               ON b.topic_id = p.topic_id AND b.partition_id = p.partition_id
-            WHERE EXISTS (SELECT 1 ",
+            CROSS JOIN LATERAL (
+                SELECT 1 ",
     due_rows_of_partition!(),
-    r")
+    r"
+                ORDER BY st.local_offset
+                LIMIT 1
+            ) any_due
         ),
         -- Each partition's share of the batch (see per_partition_claim_cap).
         share AS (
@@ -934,6 +945,30 @@ mod tests {
         assert!(
             !returning.contains("SELECT"),
             "no subquery per claimed row in RETURNING: {returning}"
+        );
+    }
+
+    /// `due_parts` finds a partition's first due row with an ordered LATERAL ... LIMIT 1
+    /// (an index probe that stops there), never an EXISTS the planner may turn into a
+    /// semi join over every pending row (the E2E
+    /// `test_shadow_claims_stay_fast_behind_a_large_backlog` times it).
+    #[test]
+    fn the_due_partition_probe_stops_at_the_first_due_row() {
+        let sql: String = CLAIM_DUE_OUTBOX_ROWS_SQL
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let sql = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(!sql.contains("EXISTS"), "no (NOT) EXISTS: {sql}");
+        let start = sql.find("due_parts AS MATERIALIZED (").unwrap();
+        let due_parts = &sql[start..sql[start..].find("), share AS").unwrap() + start];
+        assert!(due_parts.contains("CROSS JOIN LATERAL ( SELECT 1 FROM kafka.shadow_tracking st"));
+        assert!(
+            due_parts
+                .trim_end()
+                .ends_with("ORDER BY st.local_offset LIMIT 1 ) any_due"),
+            "{due_parts}"
         );
     }
 
