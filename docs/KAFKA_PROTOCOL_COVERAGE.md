@@ -10,60 +10,66 @@
 
 | Metric | Value |
 |--------|-------|
-| **API Coverage** | 26 of ~50 standard Kafka APIs (52%) |
+| **API Coverage** | <!--gen:api-coverage-->28 of ~50 standard Kafka APIs (56%)<!--/gen--> |
 | **Build Status** | ✅ Compiles with zero warnings |
-| **Test Suite** | 746 unit tests + 10 property tests + 221 E2E tests |
+| **Test Suite** | Unit + property + E2E; counts in [TEST_STRATEGY.md](TEST_STRATEGY.md#test-summary) |
 | **Architecture** | Repository Pattern with typed errors |
 | **Client Compatibility** | ✅ kcat, rdkafka, and the Apache Kafka 3.7 Java clients (console/verifiable producer and consumer, consumer groups, transactions) verified |
 
 ---
 
-## Implemented APIs (26 total)
+## Implemented APIs (<!--gen:api-count-->28<!--/gen--> total)
 
-Version ranges below are the ones advertised in the ApiVersions response and enforced on inbound requests (`API_VERSION_RANGES` in `src/kafka/response_builders.rs`). A request above its range is rejected with UNSUPPORTED_VERSION; a request below it closes the connection, as Kafka does (the minimums are the lowest versions the kafka-protocol crate can decode and encode). ApiVersions outside v0-v3 is answered in the v0 format with UNSUPPORTED_VERSION and the full key list (KIP-511).
+Version ranges below are the ones advertised in the ApiVersions response and enforced on inbound requests (each API's `MIN_VERSION`/`MAX_VERSION` in `src/kafka/api/`). A request above its range is answered with UNSUPPORTED_VERSION in the requested version (echoing the requested topics/partitions/groups where the response has no top-level error code); a request below it closes the connection, as Kafka does (the minimums are the lowest versions the kafka-protocol crate can decode and encode). A body that does not decode gets INVALID_REQUEST; see PROTOCOL_DEVIATIONS.md, "Error responses". ApiVersions outside v0-v3 is answered in the v0 format with UNSUPPORTED_VERSION and the full key list (KIP-511).
 
 ### 1. Core Metadata (2 APIs) ✅ 100% Coverage
 | API | Key | Versions | Status | Notes |
 |-----|-----|----------|--------|-------|
-| ApiVersions | 18 | v0-v3 | ✅ Complete | Returns supported API versions |
-| Metadata | 3 | v0-v10 | ✅ Complete | Topic and broker discovery; v4+ `allow_auto_topic_creation=false` is honored; v10 `topic_id` is left as the zero UUID |
+| ApiVersions | 18 | <!--gen:api-vversions:ApiVersions-->v0-v3<!--/gen--> | ✅ Complete | Returns supported API versions |
+| Metadata | 3 | <!--gen:api-vversions:Metadata-->v0-v10<!--/gen--> | ✅ Complete | Topic and broker discovery; v4+ `allow_auto_topic_creation=false` is honored; v10 `topic_id` is left as the zero UUID |
 
 ### 2. Producer (2 APIs) ✅ 100% Coverage
 | API | Key | Versions | Status | Notes |
 |-----|-----|----------|--------|-------|
-| Produce | 0 | v3-v9 | ✅ Complete | RecordBatch v2 format with sequence validation |
-| InitProducerId | 22 | v0-v4 | ✅ Complete | Allocate producer ID for idempotency |
+| Produce | 0 | <!--gen:api-vversions:Produce-->v3-v9<!--/gen--> | ✅ Complete | RecordBatch v2 format with sequence validation |
+| InitProducerId | 22 | <!--gen:api-vversions:InitProducerId-->v0-v4<!--/gen--> | ✅ Complete | Allocate producer ID for idempotency |
 
 **Implementation Notes (Phase 9)**:
 - ✅ Idempotent producer support with sequence validation
-- ✅ Deduplication (DUPLICATE_SEQUENCE_NUMBER, OUT_OF_ORDER_SEQUENCE_NUMBER)
-- ✅ Producer epoch fencing (PRODUCER_FENCED)
+- ✅ Deduplication, Kafka's model: a retry of one of the producer's last 5 batches
+  on the partition is acked with its original base offset and not re-written (as in Kafka,
+  DUPLICATE_SEQUENCE_NUMBER is never returned); anything else out of sequence is
+  OUT_OF_ORDER_SEQUENCE_NUMBER; sequences wrap at 2147483647
+- ✅ Producer epoch fencing: a stale epoch on Produce is INVALID_PRODUCER_EPOCH (47, as
+  Kafka 3.7); a client-bumped epoch (KIP-360) is accepted from sequence 0
 - ✅ Full transaction support via Phase 10 APIs (see Transaction APIs section)
 
 ### 3. Consumer - Data Access (4 APIs) ✅ 100% Coverage
 | API | Key | Versions | Status | Notes |
 |-----|-----|----------|--------|-------|
-| Fetch | 1 | v4-v11 | ✅ Complete | Read messages with long polling support (capped at v11: v13+ drops topic names for topic IDs) |
-| OffsetCommit | 8 | v2-v8 | ✅ Complete | Commit consumed offsets |
-| OffsetFetch | 9 | v1-v7 | ✅ Complete | Retrieve committed offsets (v8+ not supported) |
-| ListOffsets | 2 | v1-v7 | ✅ Complete | Get earliest/latest/by-timestamp offsets |
+| Fetch | 1 | <!--gen:api-vversions:Fetch-->v4-v11<!--/gen--> | ✅ Complete | Read messages with long polling support (capped at v11: v13+ drops topic names for topic IDs) |
+| OffsetCommit | 8 | <!--gen:api-vversions:OffsetCommit-->v2-v8<!--/gen--> | ✅ Complete | Commit consumed offsets |
+| OffsetFetch | 9 | <!--gen:api-vversions:OffsetFetch-->v1-v7<!--/gen--> | ✅ Complete | Retrieve committed offsets (v8+ not supported) |
+| ListOffsets | 2 | <!--gen:api-vversions:ListOffsets-->v1-v7<!--/gen--> | ✅ Complete | Get earliest/latest/by-timestamp offsets |
 
 **Implementation Notes:**
-- ✅ ListOffsets supports special timestamps (-2 = earliest, -1 = latest) and arbitrary timestamp lookup (earliest offset whose record timestamp ≥ target; AUDIT-2026-06 BUG-7 + CONF-7)
-- ✅ OffsetFetch limited to v0-v7 (v8+ requires different response format)
+- ✅ ListOffsets supports special timestamps (-2 = earliest, -1 = latest: the LSO for read_committed, -3 = max timestamp, KIP-734) and arbitrary timestamp lookup (earliest offset whose record timestamp ≥ target), bounded by the readable end like Kafka; an unknown partition is UNKNOWN_TOPIC_OR_PARTITION
+- ✅ OffsetFetch v7 `require_stable` (KIP-447): UNSTABLE_OFFSET_COMMIT for partitions with a pending transactional offset commit
+- ✅ Fetch returns records grouped into one RecordBatch per run of a producer's consecutive offsets, and a control batch over offsets a consumer cannot see (aborted, cleaned up) so its position reaches the end (see PROTOCOL_DEVIATIONS.md §7)
+- ✅ OffsetFetch limited to <!--gen:api-vversions:OffsetFetch-->v1-v7<!--/gen--> (v8+ requires different response format)
 - ✅ All consumer data access APIs fully functional
 - ✅ Long polling with max_wait_ms/min_bytes support
 
 ### 4. Consumer Group Coordinator (7 APIs) ✅ 100% Coverage
 | API | Key | Versions | Status | Notes |
 |-----|-----|----------|--------|-------|
-| FindCoordinator | 10 | v0-v3 | ✅ Complete | Discover group coordinator |
-| JoinGroup | 11 | v0-v7 | ✅ Complete | Join group, get member ID |
-| Heartbeat | 12 | v0-v4 | ✅ Complete | Maintain membership, returns REBALANCE_IN_PROGRESS |
-| LeaveGroup | 13 | v0-v4 | ✅ Complete | Graceful departure, triggers rebalance |
-| SyncGroup | 14 | v0-v4 | ✅ Complete | Partition assignment sync |
-| DescribeGroups | 15 | v0-v5 | ✅ Complete | Get consumer group state and members |
-| ListGroups | 16 | v0-v4 | ✅ Complete | List all consumer groups |
+| FindCoordinator | 10 | <!--gen:api-vversions:FindCoordinator-->v0-v3<!--/gen--> | ✅ Complete | Discover group coordinator |
+| JoinGroup | 11 | <!--gen:api-vversions:JoinGroup-->v0-v7<!--/gen--> | ✅ Complete | Join group, get member ID |
+| Heartbeat | 12 | <!--gen:api-vversions:Heartbeat-->v0-v4<!--/gen--> | ✅ Complete | Maintain membership, returns REBALANCE_IN_PROGRESS |
+| LeaveGroup | 13 | <!--gen:api-vversions:LeaveGroup-->v0-v4<!--/gen--> | ✅ Complete | Graceful departure, triggers rebalance |
+| SyncGroup | 14 | <!--gen:api-vversions:SyncGroup-->v0-v4<!--/gen--> | ✅ Complete | Partition assignment sync |
+| DescribeGroups | 15 | <!--gen:api-vversions:DescribeGroups-->v0-v5<!--/gen--> | ✅ Complete | Get consumer group state and members |
+| ListGroups | 16 | <!--gen:api-vversions:ListGroups-->v0-v4<!--/gen--> | ✅ Complete | List all consumer groups |
 
 **Implementation Notes (Phase 5 Complete)**:
 - In-memory coordinator state (ephemeral, rebuilt on restart)
@@ -76,10 +82,10 @@ Version ranges below are the ones advertised in the ApiVersions response and enf
 ### 5. Admin APIs (4 APIs) ✅ 100% Coverage (Phase 6)
 | API | Key | Versions | Status | Notes |
 |-----|-----|----------|--------|-------|
-| CreateTopics | 19 | v2-v5 | ✅ Complete | Create topics with partition count |
-| DeleteTopics | 20 | v1-v4 | ✅ Complete | Delete topics and messages |
-| CreatePartitions | 37 | v0-v2 | ✅ Complete | Add partitions to existing topics |
-| DeleteGroups | 42 | v0-v2 | ✅ Complete | Delete consumer groups |
+| CreateTopics | 19 | <!--gen:api-vversions:CreateTopics-->v2-v5<!--/gen--> | ✅ Complete | Create topics with partition count |
+| DeleteTopics | 20 | <!--gen:api-vversions:DeleteTopics-->v1-v4<!--/gen--> | ✅ Complete | Delete topics and messages |
+| CreatePartitions | 37 | <!--gen:api-vversions:CreatePartitions-->v0-v2<!--/gen--> | ✅ Complete | Add partitions to existing topics |
+| DeleteGroups | 42 | <!--gen:api-vversions:DeleteGroups-->v0-v2<!--/gen--> | ✅ Complete | Delete consumer groups |
 
 **Implementation Notes (Phase 6):**
 - ✅ CreateTopics respects the partition count parameter (`num_partitions = -1` uses `pg_kafka.default_partitions`; `0` or other values below 1 return INVALID_PARTITIONS); per-topic `configs`, replica assignments, and `replication_factor` are ignored (the response always reports replication factor 1)
@@ -91,29 +97,47 @@ Version ranges below are the ones advertised in the ApiVersions response and enf
 ### 6. Transaction APIs (4 APIs) ✅ 100% Coverage
 | API | Key | Versions | Status | Notes |
 |-----|-----|----------|--------|-------|
-| AddPartitionsToTxn | 24 | v0-v3 | ✅ Complete | Register partitions in transaction |
-| AddOffsetsToTxn | 25 | v0-v3 | ✅ Complete | Include consumer offsets in transaction |
-| EndTxn | 26 | v0-v3 | ✅ Complete | Commit or abort transaction |
-| TxnOffsetCommit | 28 | v0-v3 | ✅ Complete | Commit offsets atomically within transaction |
+| AddPartitionsToTxn | 24 | <!--gen:api-vversions:AddPartitionsToTxn-->v0-v3<!--/gen--> | ✅ Complete | Register partitions in transaction |
+| AddOffsetsToTxn | 25 | <!--gen:api-vversions:AddOffsetsToTxn-->v0-v3<!--/gen--> | ✅ Complete | Include consumer offsets in transaction |
+| EndTxn | 26 | <!--gen:api-vversions:EndTxn-->v0-v3<!--/gen--> | ✅ Complete | Commit or abort transaction |
+| TxnOffsetCommit | 28 | <!--gen:api-vversions:TxnOffsetCommit-->v0-v3<!--/gen--> | ✅ Complete | Commit offsets atomically within transaction |
 
 **Implementation Notes (Phase 10):**
 - ✅ Full exactly-once semantics (EOS)
 - ✅ Read-committed isolation level for consumers
 - ✅ Transaction state machine (Empty → Ongoing → CompleteCommit/CompleteAbort). EndTxn applies the outcome in a single PostgreSQL transaction, so the PrepareCommit/PrepareAbort states are defined but never persisted
 - ✅ Transactional producer fencing via epoch
-- ✅ Pending/aborted messages filtered for read_committed consumers
+- ✅ Pending/aborted messages filtered server-side for read_committed consumers; a fetch over
+  only hidden offsets returns a control batch so the consumer moves past them (see
+  PROTOCOL_DEVIATIONS.md §7)
+- ✅ Validation as Kafka: InitProducerId timeout bound (`pg_kafka.transaction_max_timeout_ms`,
+  INVALID_TRANSACTION_TIMEOUT), AddPartitionsToTxn never creates topics
+  (UNKNOWN_TOPIC_OR_PARTITION, others OPERATION_NOT_ATTEMPTED), a transactional Produce
+  to a partition not added to the transaction is INVALID_TXN_STATE
 
 ### 7. Configuration & Log Management (3 APIs) ✅
 | API | Key | Versions | Status | Notes |
 |-----|-----|----------|--------|-------|
-| DescribeConfigs | 32 | v1-v4 | ✅ Complete | TOPIC resources only: `retention.ms` and `cleanup.policy=delete` |
-| IncrementalAlterConfigs | 44 | v0-v1 | ✅ Complete | SET/DELETE of `retention.ms` per topic only |
-| DeleteRecords | 21 | v0-v2 | ✅ Complete | Truncate a partition below an offset |
+| DescribeConfigs | 32 | <!--gen:api-vversions:DescribeConfigs-->v1-v4<!--/gen--> | ✅ Complete | TOPIC resources only: `retention.ms` and `cleanup.policy=delete` |
+| IncrementalAlterConfigs | 44 | <!--gen:api-vversions:IncrementalAlterConfigs-->v0-v1<!--/gen--> | ✅ Complete | SET/DELETE of `retention.ms` per topic only |
+| DeleteRecords | 21 | <!--gen:api-vversions:DeleteRecords-->v0-v2<!--/gen--> | ✅ Complete | Truncate a partition below an offset |
 
 **Implementation Notes:**
 - ✅ DescribeConfigs reports `retention.ms` with its real value and source (DYNAMIC_TOPIC when a per-topic override is set, otherwise DEFAULT derived from `pg_kafka.message_retention_hours`, `-1` = infinite); non-topic resources get INVALID_REQUEST and unknown topics UNKNOWN_TOPIC_OR_PARTITION. Min version is v1 because the kafka-protocol crate implements v1-v4 only
 - ✅ IncrementalAlterConfigs persists `retention.ms` to `kafka.topics.retention_ms`, which the retention sweep enforces; any other key or operation (APPEND/SUBTRACT) is rejected with INVALID_CONFIG, all-or-nothing per resource; `validate_only` runs the checks without applying
 - ✅ DeleteRecords treats offset `-1` as "truncate to the high watermark", returns OFFSET_OUT_OF_RANGE for offsets past the high watermark, and persists the new log start offset (`kafka.partition_offsets.log_start_offset`) so ListOffsets(EARLIEST) and Fetch `log_start_offset` do not regress
+
+### 8. Security APIs (2 APIs) ✅
+| API | Key | Versions | Status | Notes |
+|-----|-----|----------|--------|-------|
+| SaslHandshake | 17 | <!--gen:api-vversions:SaslHandshake-->v0-v1<!--/gen--> | ✅ Complete | Mechanism negotiation; v0 (unframed tokens) advertised but answered UNSUPPORTED_VERSION |
+| SaslAuthenticate | 36 | <!--gen:api-vversions:SaslAuthenticate-->v0-v2<!--/gen--> | ✅ Complete | PLAIN, SCRAM-SHA-256, SCRAM-SHA-512; no re-authentication (`session_lifetime_ms` 0) |
+
+**Implementation Notes:**
+- ✅ Kafka-style listener security protocols (PLAINTEXT, SSL, SASL_PLAINTEXT, SASL_SSL), several listeners at once, TLS via rustls with optional mutual TLS
+- ✅ Credentials are SCRAM verifiers in `kafka.sasl_credentials` (never passwords), managed with SQL functions
+- ✅ Handled on the network thread per connection; only the credential lookup reaches the DB thread
+- ❌ No ACLs: an authenticated principal may do everything. See [AUTHENTICATION.md](AUTHENTICATION.md)
 
 ---
 
@@ -121,34 +145,32 @@ Version ranges below are the ones advertised in the ApiVersions response and enf
 
 **Source**: [Apache Kafka Protocol Guide](https://kafka.apache.org/protocol.html)
 **Total Standard Kafka APIs**: ~50
-**Implemented**: 26 (52%)
-**Unimplemented**: ~24 (48%)
+**Implemented**: <!--gen:api-coverage-->28 of ~50 standard Kafka APIs (56%)<!--/gen-->
+**Unimplemented**: ~22 (44%)
 
 This section analyzes all unimplemented APIs, their use cases, and priority for drop-in Kafka replacement.
 
 ---
 
-### Security & Authentication (7 APIs) - Priority: Medium/Low
+### Security & Authentication (5 remaining APIs) - Priority: Low
 
 | API | Key | Use Case | Drop-In Priority |
 |-----|-----|----------|------------------|
-| **SaslHandshake** | 17 | Initiates SASL authentication, negotiates mechanism (PLAIN, SCRAM, GSSAPI, OAUTHBEARER) | Medium - Required if clients use `security.protocol=SASL_*` |
-| **SaslAuthenticate** | 36 | Performs actual SASL authentication exchange after handshake | Medium - Required with SaslHandshake |
 | **CreateAcls** | 30 | Creates access control lists (e.g., "user X can produce to topic Y") | Low - Use PostgreSQL GRANT/REVOKE |
 | **DescribeAcls** | 29 | Lists existing ACL rules for auditing/debugging permissions | Low - Admin utility |
 | **DeleteAcls** | 31 | Removes ACL rules | Low - Admin utility |
 | **DescribeUserScramCredentials** | 50 | Lists SCRAM credentials for users (SCRAM-SHA-256/512 auth) | Low - Only for SCRAM auth |
 | **AlterUserScramCredentials** | 51 | Creates/updates/deletes SCRAM credentials | Low - Only for SCRAM auth |
 
-**pg_kafka Approach**: Rely on PostgreSQL's native authentication (pg_hba.conf, SSL, LDAP) instead of implementing Kafka-level auth.
+**pg_kafka Approach**: SaslHandshake/SaslAuthenticate are implemented (§8 above); SCRAM users are managed with SQL functions instead of the SCRAM credential APIs, and there are no ACLs yet (an authenticated principal may do everything).
 
-**Client Impact**: Clients configured with `security.protocol=SASL_*` will fail to connect without SaslHandshake/SaslAuthenticate. Most internal deployments use `PLAINTEXT` or `SSL` (no SASL).
+**Client Impact**: `kafka-configs --alter --entity-type users` and ACL tooling do not work; SASL clients connect normally.
 
 ---
 
 ### Transactions (3 remaining APIs) - Priority: Low
 
-**Note:** 4 of 7 transaction APIs are now implemented (Phase 10). See "Implemented APIs" section above.
+**Note:** 4 of 7 transaction APIs are implemented (Phase 10). See "Implemented APIs" section above.
 
 | API | Key | Use Case | Drop-In Priority |
 |-----|-----|----------|------------------|
@@ -359,7 +381,7 @@ This section analyzes all unimplemented APIs, their use cases, and priority for 
 | Priority | APIs | Rationale | Client Impact Without Implementation |
 |----------|------|-----------|-------------------------------------|
 | **Critical** | ✅ InitProducerId (22) | **ALREADY IMPLEMENTED** - librdkafka defaults to idempotence | Clients fail or require `enable.idempotence=false` |
-| **High** | SaslHandshake (17), SaslAuthenticate (36) | Required for authenticated deployments | Clients configured with SASL fail to connect |
+| **High** | ✅ SaslHandshake (17), SaslAuthenticate (36) | **IMPLEMENTED** (no ACLs) | — |
 | **Medium** | ✅ DescribeConfigs (32), ✅ IncrementalAlterConfigs (44) | **ALREADY IMPLEMENTED** (retention.ms honest-minimal) | — |
 | **Medium** | ✅ DeleteRecords (21) | **ALREADY IMPLEMENTED** | — |
 | **Low** | OffsetDelete (47), DescribeCluster (60) | Admin utilities | Minor admin CLI failures |
@@ -368,27 +390,23 @@ This section analyzes all unimplemented APIs, their use cases, and priority for 
 ### Recommendation for Drop-In Replacement
 
 **Current State**:
-```
-26 APIs (produce/consume, coordinator, transactions, admin, config/log management)
-= 99% of produce/consume workloads covered
-```
+<!--gen:api-count-->28<!--/gen--> APIs (produce/consume, coordinator, transactions, admin, config/log
+management, SASL), covering the produce/consume workloads.
 
-**Comfortable Drop-In (Add 1 API)**:
+**Comfortable Drop-In (add 1 API)**:
 ```
 ✅ DescribeConfigs (32)    - Already implemented
 ✅ DeleteRecords (21)      - Already implemented
 + DescribeCluster (60)     - Admin tools work (easy to stub)
-= 27 APIs total (54% coverage)
 ```
 
-**With Authentication (Add 2 More)**:
+**With Authentication**:
 ```
-+ SaslHandshake (17)
-+ SaslAuthenticate (36)
-= 29 APIs total (58% coverage)
+✅ SaslHandshake (17)      - Already implemented
+✅ SaslAuthenticate (36)   - Already implemented
 ```
 
-**Verdict**: pg_kafka is already a viable drop-in replacement for **most Kafka workloads**. The remaining ~24 APIs are either:
+**Verdict**: pg_kafka is already a viable drop-in replacement for **most Kafka workloads**. The remaining standard APIs are either:
 - Advanced or monitoring features (transaction admin APIs, share groups)
 - Multi-broker operations (replication, leader election)
 - Admin utilities (can be done via SQL)
@@ -469,11 +487,12 @@ Consumer Flow (Current):
 ### Protocol Version Support
 | Feature | Standard Kafka | pg_kafka | Notes |
 |---------|---------------|----------|-------|
-| Wire Protocol | v0-v17+ | Per-API ranges, highest advertised is v11 (Fetch) | Flexible (tagged-field) versions supported; the threshold is per API (see `get_flexible_format_threshold` in `constants.rs`) |
-| RecordBatch | v0, v1, v2 | v2 (Produce v3+) | Produce v0-v2 (MessageSet) is not advertised; a legacy MessageSet v0/v1 decode fallback exists for inbound batches |
+| Wire Protocol | v0-v17+ | Per-API ranges, highest advertised is v11 (Fetch) | Flexible (tagged-field) versions supported; the response header version comes from each API's kafka-protocol response type |
+| RecordBatch | v0, v1, v2 | v2 (Produce v3+) | Produce v0-v2 (MessageSet) is not advertised; a MessageSet v0/v1 batch in Produce v3+ is INVALID_RECORD, as in Kafka |
 | Compression | All codecs | All codecs | gzip, snappy, lz4, zstd fully supported |
 | Transactions | Yes | Yes | ✅ Phase 10 - EOS with server-side read_committed filtering |
-| SASL/ACLs | Yes | No | Use PostgreSQL auth |
+| SASL/TLS | Yes | Yes | PLAIN, SCRAM-SHA-256/512, TLS + mTLS (see AUTHENTICATION.md) |
+| ACLs | Yes | No | Not implemented: authenticated principals may do everything |
 
 ### Consumer Groups
 | Feature | Standard Kafka | pg_kafka | Status |
@@ -499,53 +518,20 @@ Consumer Flow (Current):
 - **Testing**: E2E tests with rdkafka
 - **Documentation**: Comprehensive design docs
 
-### Test Coverage (746 unit tests + 10 property tests + 221 E2E tests)
+### Test Coverage
 
-| Category | Count | Location |
-|----------|-------|----------|
-| Shadow mode | 128 | `src/kafka/shadow/` |
-| Handler logic | 107 | `src/kafka/handlers/` |
-| Protocol encoding/decoding | 105 | `src/kafka/protocol/` (incl. 4 in-module proptests) |
-| Assignment strategies | 69 | `src/kafka/assignment/` |
-| Storage layer | 53 | `src/kafka/storage/` |
-| Messages | 53 | `src/kafka/messages.rs` |
-| Config | 36 | `src/config.rs` |
-| Response builders | 35 | `src/kafka/response_builders.rs` |
-| Testing infrastructure | 23 | `src/testing/` |
-| Error handling | 22 | `src/kafka/error.rs` |
-| Other | 82 | Coordinator (28), constants (14), partitioner (9), dispatch (8), pending fetches (7), listener, context, broker metadata, handler context, worker |
-| **Unit Total** | **713** | |
-| **Property Tests** | **10** | `tests/property_tests.rs` |
-| **E2E Test Suite** | **202** | `kafka_test/` |
-
-**E2E Test Categories (221 tests):**
-- Admin APIs (19 tests, incl. 4 DescribeConfigs/IncrementalAlterConfigs/DeleteRecords/retention tests)
-- Producer (5 tests)
-- Consumer (4 tests)
-- Consumer Groups (13 tests)
-- Offset Management (10 tests)
-- Partitioning (9 tests)
-- Compression (10 tests)
-- Idempotent (7 tests)
-- Transaction (20 tests)
-- Shadow (27 tests)
-- Long Polling (10 tests)
-- Error Paths (21 tests)
-- Edge Cases (13 tests)
-- Concurrent Operations (14 tests)
-- Negative (5 tests)
-- Performance (7 tests)
-- Metadata (3 tests)
-- Protocol (5 tests)
+Unit tests (`src/`, per module), property tests (`tests/property_tests.rs`) and the E2E
+suite (`kafka_test/`, 18 categories). Counts per module and per E2E category are kept in
+one place: [TEST_STRATEGY.md](TEST_STRATEGY.md#test-summary).
 
 ---
 
 ## Conclusion
 
-**Current State**: Comprehensive Kafka-compatible broker with 26 APIs implemented
-**Coverage**: 52% of standard Kafka protocol (full producer/consumer/coordinator/admin/transaction/config support)
+**Current State**: Comprehensive Kafka-compatible broker with <!--gen:api-count-->28<!--/gen--> APIs implemented
+**Coverage**: <!--gen:api-coverage-->28 of ~50 standard Kafka APIs (56%)<!--/gen--> (full producer/consumer/coordinator/admin/transaction/config support)
 **Architecture**: Clean, maintainable, well-documented with Repository Pattern
-**Test Status**: ~977 tests passing (746 unit + 10 property + 221 E2E; CI is the source of truth) ✅
+**Test Status**: CI-gated; counts in [TEST_STRATEGY.md](TEST_STRATEGY.md#test-summary)
 
 **Readiness**:
 - ✅ **Producer**: Production-ready with idempotency, transactions, and compression
@@ -568,7 +554,7 @@ Consumer Flow (Current):
 5. ✅ SASL/SSL authentication to external Kafka
 6. ✅ Per-topic shadow configuration
 7. ✅ Historical message replay to external Kafka
-8. ✅ 128 shadow mode unit tests, 47 transaction/shadow E2E tests
+8. ✅ Unit and E2E coverage for transactions and shadow mode
 
 **Future Phases**:
 1. Cooperative rebalancing (KIP-429)
@@ -577,8 +563,8 @@ Consumer Flow (Current):
 
 ---
 
-**Overall Assessment**: Phase 11 Complete - pg_kafka provides full producer/consumer support with idempotency, transactions, compression, long polling, multi-partition topics, admin APIs, and shadow mode. The implementation features clean architecture (Repository Pattern), comprehensive test coverage (~925 tests), and typed error handling with full Kafka error code mapping.
+**Overall Assessment**: Phase 11 Complete - pg_kafka provides full producer/consumer support with idempotency, transactions, compression, long polling, multi-partition topics, admin APIs, and shadow mode. The implementation features clean architecture (Repository Pattern), comprehensive test coverage (unit, property and E2E), and typed error handling with full Kafka error code mapping.
 
 **Last Updated:** 2026-10-29
 **Phase:** 11 Complete (Shadow Mode)
-**Tests:** ~977 tests (746 unit + 10 property + 221 E2E; CI is the source of truth)
+**Tests:** counts in [TEST_STRATEGY.md](TEST_STRATEGY.md#test-summary)

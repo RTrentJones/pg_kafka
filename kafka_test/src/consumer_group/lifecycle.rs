@@ -3,7 +3,9 @@
 //! Validates the full consumer group coordinator protocol:
 //! FindCoordinator → JoinGroup → SyncGroup → Heartbeat → LeaveGroup
 
-use crate::common::{create_producer, TestResult};
+use crate::common::{create_producer, get_bootstrap_servers, TestResult};
+use crate::members::{Member, CLOSE_TIMEOUT};
+use crate::setup::TestContext;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::message::Message;
@@ -22,20 +24,21 @@ use std::time::Duration;
 pub async fn test_consumer_group_lifecycle() -> TestResult {
     println!("=== Test: Consumer Group Lifecycle ===\n");
 
-    let topic = "lifecycle-test-topic";
-    let group_id = "lifecycle-test-group";
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("lifecycle-test-topic").await;
+    let group_id = ctx.unique_group("lifecycle-test-group").await;
 
     // 1. Produce some test messages
     println!("Step 1: Producing test messages...");
     let producer = create_producer()?;
 
     for i in 0..3 {
-        let value = format!("Lifecycle test message {}", i);
+        let value = format!("Lifecycle test message {i}");
         producer
             .send(
-                FutureRecord::to(topic)
+                FutureRecord::to(&topic)
                     .payload(&value)
-                    .key(&format!("key-{}", i)),
+                    .key(&format!("key-{i}")),
                 Duration::from_secs(5),
             )
             .await
@@ -46,8 +49,8 @@ pub async fn test_consumer_group_lifecycle() -> TestResult {
     // 2. Create consumer and join group (exercises FindCoordinator + JoinGroup)
     println!("\nStep 2: Creating consumer and joining group...");
     let consumer: StreamConsumer = ClientConfig::new()
-        .set("bootstrap.servers", "localhost:9092")
-        .set("group.id", group_id)
+        .set("bootstrap.servers", get_bootstrap_servers())
+        .set("group.id", &group_id)
         .set("session.timeout.ms", "10000")
         .set("heartbeat.interval.ms", "1000")
         .set("enable.auto.commit", "false")
@@ -55,7 +58,8 @@ pub async fn test_consumer_group_lifecycle() -> TestResult {
         .create()?;
 
     // Subscribe exercises FindCoordinator, JoinGroup, SyncGroup
-    consumer.subscribe(&[topic])?;
+    let consumer = Member::new(consumer);
+    consumer.subscribe(&[topic.as_str()])?;
     println!("✅ Consumer subscribed (FindCoordinator + JoinGroup + SyncGroup)");
 
     // 3. Poll for messages (exercises Fetch + implicit Heartbeats)
@@ -75,7 +79,7 @@ pub async fn test_consumer_group_lifecycle() -> TestResult {
                 );
             }
             Ok(Err(e)) => {
-                println!("   ⚠️  Consumer error: {}", e);
+                println!("   ⚠️  Consumer error: {e}");
             }
             Err(_) => {
                 println!("   (polling...)");
@@ -83,18 +87,18 @@ pub async fn test_consumer_group_lifecycle() -> TestResult {
         }
     }
 
-    println!("✅ Received {} messages", received);
+    println!("✅ Received {received} messages");
 
     // 4. Commit offsets (exercises OffsetCommit)
     println!("\nStep 4: Committing offsets...");
     match consumer.commit_consumer_state(rdkafka::consumer::CommitMode::Sync) {
-        Ok(_) => println!("✅ Offsets committed"),
-        Err(e) => println!("   ⚠️  Commit warning: {} (may be expected)", e),
+        Ok(()) => println!("✅ Offsets committed"),
+        Err(e) => println!("   ⚠️  Commit warning: {e} (may be expected)"),
     }
 
     // 5. Graceful shutdown (exercises LeaveGroup)
     println!("\nStep 5: Leaving group (graceful shutdown)...");
-    drop(consumer);
+    consumer.close(CLOSE_TIMEOUT).await?;
     println!("✅ Consumer dropped (LeaveGroup sent)");
 
     // 6. Verify group is empty in database/coordinator
@@ -103,17 +107,19 @@ pub async fn test_consumer_group_lifecycle() -> TestResult {
 
     // Create new consumer to verify group is joinable
     let consumer2: StreamConsumer = ClientConfig::new()
-        .set("bootstrap.servers", "localhost:9092")
-        .set("group.id", group_id)
+        .set("bootstrap.servers", get_bootstrap_servers())
+        .set("group.id", &group_id)
         .set("session.timeout.ms", "6000")
         .set("enable.auto.commit", "false")
         .create()?;
 
-    consumer2.subscribe(&[topic])?;
+    let consumer2 = Member::new(consumer2);
+    consumer2.subscribe(&[topic.as_str()])?;
     println!("✅ New consumer successfully joined same group");
 
-    drop(consumer2);
+    consumer2.close(CLOSE_TIMEOUT).await?;
 
+    ctx.cleanup().await?;
     println!("\n✅ Consumer group lifecycle test PASSED\n");
     Ok(())
 }

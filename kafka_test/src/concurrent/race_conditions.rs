@@ -3,8 +3,10 @@
 //! Tests for race conditions and concurrent access patterns that could
 //! expose synchronization bugs in the coordinator, storage, and handlers.
 
+use crate::common::to_i64;
 use crate::common::{create_db_client, create_producer, create_stream_consumer, TestResult};
 use crate::fixtures::TestTopicBuilder;
+use crate::members::{Member, CLOSE_TIMEOUT};
 use crate::setup::TestContext;
 use rdkafka::consumer::Consumer;
 use rdkafka::producer::{FutureRecord, Producer};
@@ -43,12 +45,12 @@ pub async fn test_produce_consume_race() -> TestResult {
         let producer = create_producer().unwrap();
 
         for i in 0..messages_to_produce {
-            let value = format!("race-message-{}", i);
+            let value = format!("race-message-{i}");
             let result = producer
                 .send(
                     FutureRecord::to(&producer_topic)
                         .payload(&value)
-                        .key(&format!("key-{}", i)),
+                        .key(&format!("key-{i}")),
                     Duration::from_secs(5),
                 )
                 .await;
@@ -72,7 +74,7 @@ pub async fn test_produce_consume_race() -> TestResult {
     let consumer_count = consumed_count.clone();
     let consumer_handle = tokio::spawn(async move {
         let group_id = format!("race-consumer-{}", Uuid::new_v4());
-        let consumer = create_stream_consumer(&group_id).unwrap();
+        let consumer = Member::new(create_stream_consumer(&group_id).unwrap());
 
         consumer.subscribe(&[&consumer_topic]).unwrap();
 
@@ -86,20 +88,21 @@ pub async fn test_produce_consume_race() -> TestResult {
                     consumer_count.fetch_add(1, Ordering::SeqCst);
                 }
                 Ok(Err(_)) => break,
-                Err(_) => continue, // Timeout, keep trying
+                Err(_) => {} // Timeout, keep trying
             }
         }
 
-        count
+        (count, consumer)
     });
 
     // Wait for both
     producer_handle.await?;
-    let consumed = consumer_handle.await?;
+    let (consumed, consumer) = consumer_handle.await?;
+    consumer.close(CLOSE_TIMEOUT).await?;
 
     let produced = produced_count.load(Ordering::SeqCst);
-    println!("  Produced: {} messages", produced);
-    println!("  Consumed: {} messages\n", consumed);
+    println!("  Produced: {produced} messages");
+    println!("  Consumed: {consumed} messages\n");
 
     // Verify database has all messages
     let db_count: i64 = ctx
@@ -113,9 +116,10 @@ pub async fn test_produce_consume_race() -> TestResult {
         .await?
         .get(0);
 
-    println!("  Database count: {}", db_count);
+    println!("  Database count: {db_count}");
     assert_eq!(
-        db_count, produced as i64,
+        db_count,
+        i64::try_from(produced)?,
         "Database should have all produced messages"
     );
 
@@ -135,9 +139,9 @@ pub async fn test_produce_consume_race() -> TestResult {
 
     for (i, offset) in offsets.iter().enumerate() {
         assert_eq!(
-            *offset, i as i64,
-            "Offset {} should be {} (no gaps)",
-            i, offset
+            *offset,
+            to_i64(i),
+            "Offset {i} should be {offset} (no gaps)"
         );
     }
     println!("  Offsets are sequential (no gaps)\n");
@@ -169,7 +173,7 @@ pub async fn test_offset_commit_race() -> TestResult {
         producer
             .send(
                 FutureRecord::to(&topic.name)
-                    .payload(&format!("msg-{}", i))
+                    .payload(&format!("msg-{i}"))
                     .key("key"),
                 Duration::from_secs(5),
             )
@@ -207,7 +211,7 @@ pub async fn test_offset_commit_race() -> TestResult {
 
             for i in 0..commits_per_task {
                 // Each committer tries to commit different offsets
-                let offset = (committer_id * commits_per_task + i) as i64;
+                let offset = i64::from(committer_id * commits_per_task + i);
 
                 let result = client
                     .execute(
@@ -216,7 +220,7 @@ pub async fn test_offset_commit_race() -> TestResult {
                          ON CONFLICT (group_id, topic_id, partition_id)
                          DO UPDATE SET committed_offset = GREATEST(kafka.consumer_offsets.committed_offset, EXCLUDED.committed_offset),
                                        commit_timestamp = NOW()",
-                        &[&group, &tid, &offset, &format!("committer-{}", committer_id)],
+                        &[&group, &tid, &offset, &format!("committer-{committer_id}")],
                     )
                     .await;
 
@@ -255,8 +259,8 @@ pub async fn test_offset_commit_race() -> TestResult {
     let final_offset: i64 = final_row.get(0);
     let max_committed = all_committed.iter().max().copied().unwrap_or(0);
 
-    println!("  Final committed offset: {}", final_offset);
-    println!("  Max committed value: {}", max_committed);
+    println!("  Final committed offset: {final_offset}");
+    println!("  Max committed value: {max_committed}");
 
     assert_eq!(
         final_offset, max_committed,
@@ -302,11 +306,11 @@ pub async fn test_coordinator_state_race() -> TestResult {
             let mut successful_cycles = 0;
 
             for _ in 0..cycles {
-                let consumer_group = format!("{}-m{}", grp, member_id);
-                let consumer = match create_stream_consumer(&consumer_group) {
-                    Ok(c) => c,
-                    Err(_) => continue,
+                let consumer_group = format!("{grp}-m{member_id}");
+                let Ok(consumer) = create_stream_consumer(&consumer_group) else {
+                    continue;
                 };
+                let consumer = Member::new(consumer);
 
                 // Subscribe and join
                 if consumer.subscribe(&[&topic]).is_err() {
@@ -320,13 +324,17 @@ pub async fn test_coordinator_state_race() -> TestResult {
 
                 // Unsubscribe (triggers leave)
                 consumer.unsubscribe();
+                consumer
+                    .close(CLOSE_TIMEOUT)
+                    .await
+                    .map_err(|e| format!("member {member_id}: {e}"))?;
                 successful_cycles += 1;
 
                 // Brief pause between cycles
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
 
-            successful_cycles
+            Ok::<_, String>(successful_cycles)
         });
 
         handles.push(handle);
@@ -335,10 +343,10 @@ pub async fn test_coordinator_state_race() -> TestResult {
     // Wait for all members
     let mut total_cycles = 0;
     for handle in handles {
-        total_cycles += handle.await?;
+        total_cycles += handle.await??;
     }
 
-    println!("  Total successful cycles: {}", total_cycles);
+    println!("  Total successful cycles: {total_cycles}");
     assert!(
         total_cycles > 0,
         "Should have at least some successful cycles"
@@ -383,7 +391,7 @@ pub async fn test_partition_assignment_race() -> TestResult {
         let grp = group_id.clone();
 
         let handle = tokio::spawn(async move {
-            let consumer = create_stream_consumer(&grp).unwrap();
+            let consumer = Member::new(create_stream_consumer(&grp).unwrap());
 
             // Subscribe
             consumer.subscribe(&[&topic]).unwrap();
@@ -401,7 +409,7 @@ pub async fn test_partition_assignment_race() -> TestResult {
                     let partitions: Vec<i32> = assignment
                         .elements()
                         .iter()
-                        .map(|e| e.partition())
+                        .map(rdkafka::topic_partition_list::TopicPartitionListElem::partition)
                         .collect();
 
                     if !partitions.is_empty() {
@@ -411,7 +419,13 @@ pub async fn test_partition_assignment_race() -> TestResult {
                 }
             }
 
-            (consumer_id, assigned_partitions)
+            // Leaves as soon as it has its partitions, while the others may still be
+            // joining; the close polls this consumer alone, so it cannot wait on theirs.
+            consumer
+                .close(CLOSE_TIMEOUT)
+                .await
+                .map_err(|e| format!("consumer {consumer_id}: {e}"))?;
+            Ok::<_, String>((consumer_id, assigned_partitions))
         });
 
         handles.push(handle);
@@ -420,8 +434,8 @@ pub async fn test_partition_assignment_race() -> TestResult {
     // Collect assignments
     let mut all_assignments: Vec<(i32, Vec<i32>)> = Vec::new();
     for handle in handles {
-        let (id, partitions) = handle.await?;
-        println!("  Consumer {}: partitions {:?}", id, partitions);
+        let (id, partitions) = handle.await??;
+        println!("  Consumer {id}: partitions {partitions:?}");
         all_assignments.push((id, partitions));
     }
 
@@ -432,7 +446,7 @@ pub async fn test_partition_assignment_race() -> TestResult {
             if assigned_partitions.contains(p) {
                 // This could happen with RangeAssignor - some partitions may be assigned to multiple
                 // consumers during brief rebalance windows. Log but don't fail.
-                println!("  Note: Partition {} assigned to multiple consumers (expected during rebalance)", p);
+                println!("  Note: Partition {p} assigned to multiple consumers (expected during rebalance)");
             }
             if !assigned_partitions.contains(p) {
                 assigned_partitions.push(*p);
@@ -441,7 +455,7 @@ pub async fn test_partition_assignment_race() -> TestResult {
     }
 
     // At least some partitions should be assigned
-    println!("  Unique partitions assigned: {:?}", assigned_partitions);
+    println!("  Unique partitions assigned: {assigned_partitions:?}");
     assert!(
         !assigned_partitions.is_empty(),
         "At least one partition should be assigned"
@@ -476,7 +490,7 @@ pub async fn test_group_rejoin_race() -> TestResult {
     for cycle in 0..rejoin_cycles {
         println!("  Cycle {}: ", cycle + 1);
 
-        let consumer = create_stream_consumer(&group_id)?;
+        let consumer = Member::new(create_stream_consumer(&group_id)?);
 
         // Subscribe
         consumer.subscribe(&[&topic.name])?;
@@ -484,11 +498,8 @@ pub async fn test_group_rejoin_race() -> TestResult {
         // Poll a few times to establish membership
         let mut joined = false;
         for _ in 0..5 {
-            match tokio::time::timeout(Duration::from_millis(500), consumer.recv()).await {
-                Ok(Ok(_)) => {}
-                Ok(Err(_)) => {}
-                Err(_) => {} // Timeout
-            }
+            // A message, an error or a timeout: any of them lets the group make progress.
+            let _ = tokio::time::timeout(Duration::from_millis(500), consumer.recv()).await;
 
             // Check if we have an assignment (indicates successful join)
             if let Ok(assignment) = consumer.assignment() {
@@ -508,15 +519,13 @@ pub async fn test_group_rejoin_race() -> TestResult {
 
         // Unsubscribe triggers leave
         consumer.unsubscribe();
+        consumer.close(CLOSE_TIMEOUT).await?;
 
         // Brief pause before next cycle
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    println!(
-        "\n  Successful joins: {}/{}",
-        successful_joins, rejoin_cycles
-    );
+    println!("\n  Successful joins: {successful_joins}/{rejoin_cycles}");
 
     // At least some joins should succeed
     assert!(

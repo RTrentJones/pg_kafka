@@ -3,7 +3,8 @@
 //! Validates that messages can be produced via Kafka protocol
 //! and are correctly stored in the PostgreSQL database.
 
-use crate::common::{create_db_client, create_producer, TestResult};
+use crate::common::{create_producer, TestResult};
+use crate::setup::TestContext;
 use rdkafka::producer::FutureRecord;
 use std::time::Duration;
 
@@ -17,40 +18,42 @@ use std::time::Duration;
 pub async fn test_producer() -> TestResult {
     println!("=== Test: Producer Functionality ===\n");
 
-    // Create a Kafka producer pointing to pg_kafka on port 9092
+    // Create a Kafka producer pointing to pg_kafka
     println!("Creating Kafka producer...");
     let producer = create_producer()?;
     println!("✅ Producer created\n");
 
+    // Unique per run, so a re-run against the same database does not see the
+    // previous run's rows.
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("test-topic").await;
+
     // Send a test message
-    println!("Sending message to topic 'test-topic'...");
-    let topic = "test-topic";
+    println!("Sending message to topic '{topic}'...");
     let key = "test-key";
     let payload = "Hello from rdkafka test client!";
 
     let (partition, offset) = producer
         .send(
-            FutureRecord::to(topic).payload(payload).key(key),
+            FutureRecord::to(&topic).payload(payload).key(key),
             Duration::from_secs(5),
         )
         .await
         .map_err(|(err, _msg)| {
-            println!("❌ Failed to deliver message: {}", err);
+            println!("❌ Failed to deliver message: {err}");
             err
         })?;
 
     println!("✅ Message delivered successfully!");
-    println!("   Topic: {}", topic);
-    println!("   Partition: {}", partition);
-    println!("   Offset: {}", offset);
+    println!("   Topic: {topic}");
+    println!("   Partition: {partition}");
+    println!("   Offset: {offset}");
 
     // === AUTOMATED VERIFICATION ===
     println!("\n=== Automated Database Verification ===");
 
     // Connect to PostgreSQL
-    println!("Connecting to PostgreSQL...");
-    let client = create_db_client().await?;
-    println!("✅ Connected to database\n");
+    let client = ctx.db();
 
     // Verify topic was created
     println!("Checking topic creation...");
@@ -64,7 +67,7 @@ pub async fn test_producer() -> TestResult {
     let topic_name: String = topic_row.get(1);
 
     assert_eq!(topic_name, topic, "Topic name mismatch");
-    println!("✅ Topic '{}' created with id={}", topic_name, topic_id);
+    println!("✅ Topic '{topic_name}' created with id={topic_id}");
 
     // Verify message was inserted
     println!("\nChecking message insertion...");
@@ -96,9 +99,9 @@ pub async fn test_producer() -> TestResult {
     assert_eq!(db_value, payload.as_bytes(), "Payload mismatch");
 
     println!("✅ Message verified in database:");
-    println!("   Topic ID: {}", db_topic_id);
-    println!("   Partition: {}", db_partition);
-    println!("   Offset: {}", db_offset);
+    println!("   Topic ID: {db_topic_id}");
+    println!("   Partition: {db_partition}");
+    println!("   Offset: {db_offset}");
     println!("   Key: {}", String::from_utf8_lossy(&db_key));
     println!("   Value: {}", String::from_utf8_lossy(&db_value));
 
@@ -110,8 +113,9 @@ pub async fn test_producer() -> TestResult {
         )
         .await?;
     let message_count: i64 = count_row.get(0);
-    println!("\n✅ Total messages in '{}': {}", topic, message_count);
+    println!("\n✅ Total messages in '{topic}': {message_count}");
 
+    ctx.cleanup().await?;
     println!("✅ Producer test PASSED\n");
 
     Ok(())

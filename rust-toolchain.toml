@@ -1,3 +1,8 @@
 [toolchain]
-channel = "nightly"
+# A dated nightly, so local builds and CI use the same compiler (pgrx 0.16.1 needs nightly for
+# the edition2024 `home` crate). nightly-2026-11-08 is rustc 1.102.0-nightly (f5cedb83a
+# 2026-11-07). Bump deliberately: change the date here, then run cargo clippy --all-targets
+# -- -D warnings on both crates, since new nightlies add lints.
+channel = "nightly-2026-11-08"
 components = ["rustfmt", "clippy"]
+profile = "minimal"

@@ -1,43 +1,53 @@
 # Test Strategy
 
 **Status:** Phase 11 Complete (Shadow Mode)
-**Last Updated:** 2026-10-29
+**Last Updated:** 2026-11-18
 
 ---
 
 ## Test Summary
 
-| Category | Count | Coverage |
-|----------|-------|----------|
-| Unit Tests | 746 | Core logic, handlers, storage, protocol, shadow (`src/`, includes 4 in-module proptest fuzz harnesses) |
-| Property Tests | 10 | `tests/property_tests.rs`: 8 proptest wire-format invariants + 2 boundary tests (CI-run) |
-| E2E Tests | 202 | Full protocol integration (`kafka_test/`) |
-| **Total** | **~925** | **Comprehensive** |
+**This section is the one place the repository states test counts.** Other docs
+(`README.md`, `CLAUDE.md`, `docs/*`) link here instead of repeating numbers. The numbers below
+are generated (`scripts/gen-docs.py --write --only tests`) and CI fails when they are stale, so
+they match the commit they are in.
 
-> DR-22 (DEEP-REVIEW-2026-07): counts here are refreshed manually and drift as
-> tests land — **the CI run is the source of truth.** Regenerate with
-> `cargo test --features pg14 --lib` (unit), `cargo test --features pg14 --test property_tests`
-> (property), `grep -c wrap_test! kafka_test/src/main.rs` (E2E).
+| Suite | Count | Coverage |
+|-------|-------|----------|
+| Unit Tests | <!--gen:tests-unit-->967<!--/gen--> | Core logic, handlers, storage, protocol, shadow (`src/`, includes in-module proptest fuzz harnesses) |
+| Property Tests | <!--gen:tests-property-->10<!--/gen--> | `tests/property_tests.rs`: proptest wire-format invariants and boundary tests |
+| E2E Tests | <!--gen:tests-e2e-->395<!--/gen--> | Full protocol integration (`kafka_test/`, per category [below](#e2e-test-categories)) |
+| **Total** | **<!--gen:tests-total-->1372<!--/gen-->** | |
+
+The generator counts with (none of these needs a running broker):
+
+```bash
+cargo test --features pg14 --lib -- --list | grep -c ': test$'                # unit
+cargo test --features pg14 --test property_tests -- --list | grep -c ': test$'  # property
+cd kafka_test && cargo run --release -- --list                                 # E2E per category
+```
+
+`kafka_test`'s own runner unit tests (`cargo test --bin kafka_test` in `kafka_test/`)
+are not counted above.
 
 ---
 
-## Unit Test Distribution (indicative)
+## Unit Test Distribution
 
-| Module | Tests | Focus |
-|--------|-------|-------|
-| Shadow Mode (`kafka/shadow/`) | 128 | External forwarding, SASL/SSL settings, licensing, routing, outbox, config |
-| Handler Logic (`kafka/handlers/`) | 107 | All 26 API handlers, mostly with MockKafkaStore (`handlers/tests.rs` holds 80) |
-| Protocol (`kafka/protocol/`) | 105 | Decoding, encoding, RecordBatch framing, 4 proptest fuzz harnesses |
-| Assignment (`kafka/assignment/`) | 69 | Range, RoundRobin, Sticky algorithms, subscription/assignment codecs |
-| Storage Layer (`kafka/storage/tests.rs`) | 53 | KafkaStore trait, types, mock verification |
-| Messages | 53 | Request/response types, size estimators |
-| Config | 36 | GUC configuration |
-| Response Builders | 35 | Response construction |
-| Coordinator | 28 | Group state management |
-| Testing Infrastructure (`testing/`) | 23 | Mocks, helpers |
-| Error Handling | 22 | Error code mapping, typed errors |
-| Partitioner | 9 | Murmur2 hash, key-based routing |
-| Other | 45 | Constants, dispatch, pending fetches, broker metadata, context, listener, worker |
+Where the unit tests live (`cargo test --features pg14 --lib <module path> -- --list` counts one
+module):
+
+| Module | Focus |
+|--------|-------|
+| Shadow Mode (`kafka/shadow/`) | External forwarding, SASL/SSL settings, licensing, routing, outbox, config |
+| Handler Logic (`kafka/handlers/`) | Every API handler, mostly with MockKafkaStore (`handlers/tests.rs`) |
+| Protocol (`kafka/protocol/`) | Decoding, encoding, RecordBatch framing, proptest fuzz harnesses |
+| Assignment (`kafka/assignment/`) | Range, RoundRobin, Sticky algorithms, subscription/assignment codecs |
+| Storage Layer (`kafka/storage/`) | Store role traits, types, mock verification, retention and partition-drop planning, privileges |
+| API Registry (`kafka/api/`) | Every advertised version encodes, error-response echoes, network-thread APIs, generated docs |
+| Authentication (`kafka/auth/`) | SCRAM (RFC 5802/7677 vectors), PLAIN, session rules, listener and TLS config |
+| Messages, response builders, coordinator, errors, partitioner, config | Request/response types, group state, error-code mapping, murmur2, GUC defaults |
+| Testing Infrastructure (`testing/`) | Mocks, helpers |
 
 ### Running Unit Tests
 
@@ -49,28 +59,37 @@ cargo test --features pg14                           # both
 
 ---
 
-## E2E Test Categories (221 tests)
+## E2E Test Categories
 
-| Category | Tests | Purpose |
-|----------|-------|---------|
-| Admin APIs (`admin`) | 19 | CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups, DescribeConfigs, IncrementalAlterConfigs, DeleteRecords, per-topic retention |
-| Producer (`producer`) | 5 | Basic produce, batch produce, acks=0, ack-implies-visibility, timestamps |
-| Consumer (`consumer`) | 4 | Basic consume, headers, from offset, multiple messages |
-| Consumer Groups (`consumer_group`) | 13 | Lifecycle, two-member, rebalance, strategies |
-| Offset Management (`offset_management`) | 10 | Commit/fetch, boundaries, no offset reuse, ListOffsets by timestamp, multi-partition |
-| Partitioning (`partition`) | 9 | Multi-partition produce, key routing, distribution |
-| Compression (`compression`) | 10 | gzip, snappy, lz4, zstd, roundtrip, edge cases |
-| Idempotent (`idempotent`) | 7 | InitProducerId, deduplication, epoch, multi-partition |
-| Transaction (`transaction`) | 20 | EOS, isolation levels, LSO, fencing, timeouts, atomicity |
-| Shadow (`shadow`) | 27 | Dual-write, external-only/local-only, percentage dial-up, topic mapping, outbox, transactions, replay |
-| Long Polling (`long_poll`) | 10 | Timeout, immediate return, producer wakeup, precision, per-connection cap |
-| Error Paths (`error_paths`) | 21 | Invalid partitions, unknown topics, coordinator errors |
-| Edge Cases (`edge_cases`) | 13 | Empty topics, large messages, boundary values, retention sweep |
-| Concurrent (`concurrent`) | 14 | Multi-producer, multi-consumer, pipelining, races, heartbeat bypass |
-| Negative (`negative`) | 5 | Connection refused, timeouts, invalid operations, superuser-only GUC |
-| Performance (`performance`) | 7 | Throughput baselines, latency percentiles, scaling |
-| Metadata (`metadata`) | 3 | Metadata refresh, all topics, nonexistent topic |
-| Protocol (`protocol`) | 5 | ApiVersions negotiation, correlation ID, unknown API, pipelining, ordering with long poll |
+Generated from `kafka_test --list` (what each category covers: CLAUDE.md, "Test Categories").
+
+<!--gen:tests-e2e-categories-->
+| Category | Tests |
+|----------|-------|
+| `admin` | 21 |
+| `producer` | 8 |
+| `consumer` | 5 |
+| `offset_management` | 13 |
+| `consumer_group` | 18 |
+| `partition` | 9 |
+| `error_paths` | 70 |
+| `edge_cases` | 13 |
+| `concurrent` | 15 |
+| `negative` | 5 |
+| `performance` | 7 |
+| `long_poll` | 11 |
+| `compression` | 10 |
+| `idempotent` | 16 |
+| `transaction` | 35 |
+| `shadow` | 44 |
+| `metadata` | 5 |
+| `protocol` | 5 |
+| `part` | 10 |
+| `auth` | 16 |
+| `network` | 53 |
+| `worker` | 6 |
+| **Total** | **395** |
+<!--/gen-->
 
 ### Running E2E Tests
 
@@ -92,8 +111,40 @@ cd kafka_test && cargo run --release -- --exclude performance --exclude shadow
 ```
 
 Other flags: `--sequential` (disable parallelism; runs are parallel by default),
-`--concurrency <N>` (default 16), `--json`, `--list`, `--verbose`. The runner reads
+`--concurrency <N>` (default 16), `--timeout-secs <N>` (per-test timeout, default 300),
+`--json`, `--list`, `--verbose`. The runner reads
 `DATABASE_URL` and falls back to `host=localhost port=28814 user=postgres dbname=postgres`.
+
+---
+
+## Real-Client and Differential Checks (`interop/`)
+
+Two harnesses check pg_kafka against Apache Kafka's own clients and against a real Kafka broker.
+Both run in CI (job `interop`, PostgreSQL 18) and locally against any running pg_kafka:
+
+```bash
+# Reference broker: single-node KRaft Kafka 3.7 on 127.0.0.1:9093
+interop/kafka-ref.sh start /path/to/kafka_2.13-3.7.0 /tmp/kref
+
+# Java tools and clients: verifiable producer + 3 verifiable consumers through a rebalance
+# (no loss, no duplicates, bounded rebalances), consumer-groups --describe lag, get-offsets,
+# transactional perf-test + read_committed consumer, TransactionalMessageCopier with random
+# aborts, aborted / open transactions at the tail, SASL SCRAM-SHA-256/512 + PLAIN, Kafka Streams
+KAFKA_HOME=/path/to/kafka_2.13-3.7.0 PGHOST=127.0.0.1 PGPORT=28814 PGUSER=postgres \
+  interop/run-java-checks.sh [--only name,...] [--list]
+
+# The same raw request sequences against pg_kafka and Kafka, normalised and compared
+KAFKA_HOME=/path/to/kafka_2.13-3.7.0 python3 interop/diff/run.py --pg 127.0.0.1:9092 --kafka 127.0.0.1:9093
+```
+
+`interop/diff/KafkaWire.java` encodes and decodes with Kafka's generated protocol classes, so
+every API and version is read exactly as the Java client reads it. Every difference the
+differential harness finds is classified in `KNOWN` (`interop/diff/run.py`) as a documented
+deviation (with its `PROTOCOL_DEVIATIONS.md` section) or a bug; an unclassified difference fails
+the run. Checks and observations marked as bugs (`XFAIL`) do not fail the run; once fixed they
+report `XPASS` and the mark should be removed. The Java checks pass against the reference broker
+itself (`BOOTSTRAP=127.0.0.1:9093`, skipping the two that need pg_kafka's SQL), which is how they
+were validated.
 
 ---
 
@@ -111,6 +162,11 @@ Other flags: `--sequential` (disable parallelism; runs are parallel by default),
 - Test isolation via unique topic/group names (test id plus a UUID prefix)
 - Database verification via tokio-postgres
 - Run in parallel by default; tests marked `parallel_safe: false` are run separately
+- Each test runs in its own tokio task: a panic (failed `assert!`) is reported as
+  FAILED with the panic message, and a test still running after `--timeout-secs` is
+  aborted and reported FAILED, so one bad test never ends the run without a summary
+- Every test creates its own topics and groups (`TestContext::unique_topic` /
+  `unique_group` or a UUID suffix), so the suite can be re-run against the same database
 
 ---
 
@@ -131,7 +187,7 @@ pg_kafka uses `PGC_POSTMASTER` GUC variables that must be defined before Postgre
 | 1-2 | Producer/Metadata | Protocol encoding | Basic produce |
 | 3 | Consumer | Fetch handlers | Consumer tests |
 | 3B | Coordinator | Group state tests | Group lifecycle |
-| 4 | Assignment | 69 assignment-module tests | Multi-member |
+| 4 | Assignment | Assignment-module tests | Multi-member |
 | 5 | Rebalancing | Timeout detection | Session timeout |
 | 6 | Admin APIs | Handler tests | Create/delete ops |
 | 7 | Partitioning | Murmur2 hash | Key routing |
@@ -144,30 +200,21 @@ pg_kafka uses `PGC_POSTMASTER` GUC variables that must be defined before Postgre
 
 ## CI/CD Integration
 
-The `Test Suite` job in `.github/workflows/ci.yml` runs every suite (abridged):
+`.github/workflows/ci.yml` (PostgreSQL from apt.postgresql.org through
+`.github/actions/setup-pg`, toolchain from `rust-toolchain.toml`):
 
-```yaml
-- name: Run unit tests and generate coverage
-  run: cargo llvm-cov --lib --features pg14 --lcov --output-path lcov.info
+| Job | What it runs |
+|-----|--------------|
+| `Lint & Format` | `cargo fmt --check` and clippy `-D warnings` on both crates (pg14), the QA-1 policy check (`.github/scripts/check-coverage-policy.sh`) |
+| `Test Suite` | unit tests under `cargo llvm-cov` (pg14, uploaded to Codecov; includes the API-docs drift test), property tests |
+| `Build kafka_test` | the E2E runner, once, shared with the `e2e` legs as an artifact |
+| `E2E pg14` … `E2E pg18` | per major: clippy, unit and property tests, `cargo pgrx install` into that PostgreSQL, `scripts/ci-pg.sh start`, the functional E2E suite (`--exclude performance --exclude shadow`, 25 min step timeout), `scripts/check-upgrade.sh`, the generated GUC reference check; pg14 also the test-count check and the `shadow` and `performance` categories |
+| `Interop` | `interop/run-java-checks.sh` and `interop/diff/run.py` on PG18 against Kafka 3.7 (see above) |
+| `Security Audit`, `Verify Lockfile`, `SPI change needs E2E test` | `cargo audit` + `cargo deny`; `--locked` checks; the QA-1 guard (pull requests) |
 
-- name: Run property tests
-  run: cargo test --features pg14 --test property_tests
-
-# ... install the extension, add it to shared_preload_libraries, cargo pgrx start pg14 ...
-
-- name: Run Functional E2E Tests
-  run: cd kafka_test && cargo run --release -- --exclude performance --exclude shadow
-
-- name: Run Shadow Mode E2E Tests      # against the external-kafka docker compose service
-  run: cd kafka_test && cargo run --release -- --category shadow
-
-- name: Run Performance E2E Tests      # blocking; conservative regression floors
-  run: cd kafka_test && cargo run --release -- --category performance
-```
-
-Separate jobs cover lint/format (`Lint & Format`), `cargo audit` + `cargo deny` (`Security Audit`),
-lockfile freshness (`Verify Lockfile`), compile + unit tests on PostgreSQL 15/16/17 (`pg-matrix`), and the
-QA-1 guard (`spi-e2e-guard`, pull requests only).
+The functional suite took 4.5 minutes (223 tests, including the auth category's listener
+restarts) on PG18 in a 4-core sandbox; the step timeout leaves about a 5x margin and the job
+timeout (90 min) covers a cold build.
 
 ---
 
@@ -211,31 +258,23 @@ See `codecov.yml` for configuration details.
 
 ### Intentionally Uncovered Code
 
-Some code cannot be unit tested due to pgrx/SPI dependencies. These are excluded (via the `ignore:` list in
-`codecov.yml`, mirrored here):
+Code that calls SPI, runs inside the background worker or drives the tokio listener cannot run in
+a unit test. `codecov.yml` is the one list of it: its `ignore:` entries are excluded from the
+coverage figures (each with its reason), and its `# qa1-guard:` lines name the files that mix SPI
+with unit-tested logic and so stay in them.
 
-| File | Reason | Tested By |
-|------|--------|-----------|
-| `src/kafka/storage/postgres.rs` | SPI calls | E2E tests |
-| `src/worker.rs` | Main loop, SPI | E2E tests |
-| `src/kafka/listener.rs` | Async runtime | E2E tests |
-| `src/kafka/shadow/store.rs` | SPI (wraps `PostgresStore`) | E2E (shadow) tests |
-| `src/kafka/handler_context.rs` | Holds the `MockStore` test double | Handler unit tests |
-| `src/lib.rs` | `_PG_init` hook | E2E tests |
-| `src/bin/**`, `**/*_embed.rs` | pgrx-generated | N/A |
-
-**QA-1 guard:** because unit coverage cannot see these files, the `spi-e2e-guard` CI job
-(`.github/scripts/require-e2e-for-spi.sh`) fails a pull request that changes any `src/` entry in this
-list without also changing a Rust file under `kafka_test/src/`. The `no-e2e-needed` label waives it for
-test-neutral edits.
-
-**Note:** `src/config.rs` is **not** excluded — its parse/validation/default logic is unit-tested and
-subject to the coverage targets (it was previously listed here in error).
+**QA-1 guard:** because unit coverage cannot see this code, the `spi-e2e-guard` CI job
+(`.github/scripts/require-e2e-for-spi.sh`) fails a pull request that changes a file on either
+list without also changing a Rust file under `kafka_test/src/`. The `no-e2e-needed` label waives
+it for test-neutral edits. `.github/scripts/check-coverage-policy.sh` (lint job) keeps the lists
+honest: it fails when a `src/` file calls SPI (`Spi::*`, `BackgroundWorker::*`, `#[pg_extern]`)
+without being on one of them, when a listed file does not exist, or when the guard does not fire
+for a listed file.
 
 See `docs/PGRX_TESTING_GUIDE.md` for the full testing strategy.
 
 ---
 
-**Test Count:** ~977 (746 unit + 10 property + 221 E2E; CI is the source of truth)
+**Test Count:** see [Test Summary](#test-summary)
 **Coverage Target:** 80%+ (testable code)
 **All Tests Passing:** ✅

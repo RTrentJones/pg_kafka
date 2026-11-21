@@ -38,12 +38,12 @@ pub async fn test_idempotent_producer_basic() -> TestResult {
     println!("✅ Idempotent producer created (enable.idempotence=true)\n");
 
     // Send multiple messages
-    println!("Sending test messages to topic '{}'...", topic);
+    println!("Sending test messages to topic '{topic}'...");
     let num_messages: i64 = 3;
 
     for i in 0..num_messages {
-        let key = format!("key-{}", i);
-        let payload = format!("Idempotent test message {}", i);
+        let key = format!("key-{i}");
+        let payload = format!("Idempotent test message {i}");
 
         let (partition, offset) = producer
             .send(
@@ -52,23 +52,20 @@ pub async fn test_idempotent_producer_basic() -> TestResult {
             )
             .await
             .map_err(|(err, _msg)| {
-                println!("❌ Failed to deliver message {}: {}", i, err);
+                println!("❌ Failed to deliver message {i}: {err}");
                 err
             })?;
 
-        println!(
-            "✅ Message {} delivered: partition={}, offset={}",
-            i, partition, offset
-        );
+        println!("✅ Message {i} delivered: partition={partition}, offset={offset}");
     }
 
     // Flush to ensure all messages are sent
     producer.flush(Duration::from_secs(5)).map_err(|e| {
-        println!("❌ Failed to flush producer: {}", e);
+        println!("❌ Failed to flush producer: {e}");
         e
     })?;
 
-    println!("✅ All {} messages delivered successfully\n", num_messages);
+    println!("✅ All {num_messages} messages delivered successfully\n");
 
     // === DATABASE VERIFICATION ===
     println!("=== Database Verification ===\n");
@@ -86,7 +83,7 @@ pub async fn test_idempotent_producer_basic() -> TestResult {
     let topic_name: String = topic_row.get(1);
 
     assert_eq!(topic_name, topic, "Topic name mismatch");
-    println!("✅ Topic '{}' created with id={}\n", topic_name, topic_id);
+    println!("✅ Topic '{topic_name}' created with id={topic_id}\n");
 
     // Verify all messages were inserted (RB-1 makes a single read correct;
     // poll as defense-in-depth against non-barrier timing).
@@ -101,10 +98,9 @@ pub async fn test_idempotent_producer_basic() -> TestResult {
 
     assert_eq!(
         message_count, num_messages,
-        "Message count mismatch! Expected {}, got {}",
-        num_messages, message_count
+        "Message count mismatch! Expected {num_messages}, got {message_count}"
     );
-    println!("✅ All {} messages stored in database\n", message_count);
+    println!("✅ All {message_count} messages stored in database\n");
 
     // Verify producer ID schema exists (Phase 9)
     println!("=== Phase 9 Schema Verification ===\n");

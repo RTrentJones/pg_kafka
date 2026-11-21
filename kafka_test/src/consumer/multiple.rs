@@ -4,6 +4,7 @@
 //! from a topic in sequence.
 
 use crate::common::{create_base_consumer, create_producer, TestResult, POLL_TIMEOUT};
+use crate::setup::TestContext;
 use rdkafka::consumer::Consumer;
 use rdkafka::message::Message;
 use rdkafka::producer::FutureRecord;
@@ -20,35 +21,36 @@ use std::time::Duration;
 pub async fn test_consumer_multiple_messages() -> TestResult {
     println!("=== Test: Consumer Multiple Messages ===\n");
 
-    let topic = "multi-message-topic";
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("multi-message-topic").await;
     let message_count = 5;
     let partition = 0;
 
     // 1. Produce multiple messages
-    println!("Step 1: Producing {} messages...", message_count);
+    println!("Step 1: Producing {message_count} messages...");
     let producer = create_producer()?;
 
     for i in 0..message_count {
-        let key = format!("key-{}", i);
-        let value = format!("Message number {}", i);
+        let key = format!("key-{i}");
+        let value = format!("Message number {i}");
 
         producer
             .send(
-                FutureRecord::to(topic).payload(&value).key(&key),
+                FutureRecord::to(&topic).payload(&value).key(&key),
                 Duration::from_secs(5),
             )
             .await
             .map_err(|(err, _msg)| err)?;
     }
 
-    println!("✅ {} messages produced", message_count);
+    println!("✅ {message_count} messages produced");
 
     // 2. Consume all messages using manual partition assignment
-    println!("\nStep 2: Consuming {} messages...", message_count);
-    let consumer = create_base_consumer("manual-multi-consumer")?;
+    println!("\nStep 2: Consuming {message_count} messages...");
+    let consumer = create_base_consumer(&ctx.unique_group("manual-multi-consumer").await)?;
 
     let mut assignment = TopicPartitionList::new();
-    assignment.add_partition_offset(topic, partition, rdkafka::Offset::Beginning)?;
+    assignment.add_partition_offset(&topic, partition, rdkafka::Offset::Beginning)?;
     consumer.assign(&assignment)?;
 
     let mut received_count = 0;
@@ -60,18 +62,15 @@ pub async fn test_consumer_multiple_messages() -> TestResult {
             Some(Ok(msg)) => {
                 let msg_value = msg
                     .payload()
-                    .map(|v| String::from_utf8_lossy(v).to_string())
-                    .unwrap_or_default();
+                    .map_or_default(|v| String::from_utf8_lossy(v).to_string());
 
-                println!("   Received: {}", msg_value);
+                println!("   Received: {msg_value}");
                 received_count += 1;
             }
             Some(Err(e)) => {
-                println!("⚠️  Consumer error: {}", e);
+                println!("⚠️  Consumer error: {e}");
             }
-            None => {
-                continue;
-            }
+            None => {}
         }
     }
 
@@ -79,8 +78,9 @@ pub async fn test_consumer_multiple_messages() -> TestResult {
         received_count, message_count,
         "Did not receive all messages"
     );
-    println!("✅ All {} messages received", received_count);
+    println!("✅ All {received_count} messages received");
 
+    ctx.cleanup().await?;
     println!("\n✅ Multiple messages test PASSED\n");
     Ok(())
 }

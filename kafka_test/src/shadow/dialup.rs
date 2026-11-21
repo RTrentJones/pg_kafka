@@ -3,6 +3,7 @@
 //! High-volume tests producing 500 messages at various percentages to verify
 //! allocation accuracy and metrics tracking.
 
+use crate::common::to_f64;
 use crate::common::{create_batch_producer, TestResult};
 use crate::setup::TestContext;
 use rdkafka::producer::FutureRecord;
@@ -20,23 +21,17 @@ async fn run_dialup_test(
     expected_min_pct: f64,
     expected_max_pct: f64,
 ) -> TestResult {
-    println!(
-        "=== Test: Dial-Up {}% Forwarding ({} messages) ===\n",
-        percentage, MESSAGE_COUNT
-    );
+    println!("=== Test: Dial-Up {percentage}% Forwarding ({MESSAGE_COUNT} messages) ===\n");
 
     // 1. SETUP
     let ctx = TestContext::new().await?;
-    let topic = ctx.unique_topic(&format!("dialup-{}", percentage)).await;
+    let topic = ctx.unique_topic(&format!("dialup-{percentage}")).await;
 
     println!("Step 1: Verifying external Kafka is ready...");
     verify_external_kafka_ready().await?;
     println!("✅ External Kafka ready\n");
 
-    println!(
-        "Step 2: Enabling shadow mode with {}% forwarding...",
-        percentage
-    );
+    println!("Step 2: Enabling shadow mode with {percentage}% forwarding...");
     enable_shadow_mode(
         ctx.db(),
         &topic,
@@ -52,15 +47,12 @@ async fn run_dialup_test(
     println!("✅ Shadow mode enabled\n");
 
     // 2. ACTION - Produce 500 messages with unique keys
-    println!(
-        "Step 3: Producing {} messages to pg_kafka...",
-        MESSAGE_COUNT
-    );
+    println!("Step 3: Producing {MESSAGE_COUNT} messages to pg_kafka...");
     let producer = create_batch_producer()?;
 
     for i in 0..MESSAGE_COUNT {
-        let key = format!("dialup-{}-key-{}", percentage, i);
-        let value = format!("dialup-{}-value-{}", percentage, i);
+        let key = format!("dialup-{percentage}-key-{i}");
+        let value = format!("dialup-{percentage}-value-{i}");
         producer
             .send(
                 FutureRecord::to(&topic)
@@ -71,7 +63,7 @@ async fn run_dialup_test(
             .await
             .map_err(|(e, _)| e)?;
     }
-    println!("✅ {} messages produced\n", MESSAGE_COUNT);
+    println!("✅ {MESSAGE_COUNT} messages produced\n");
 
     // 3. VERIFY
     println!("=== Verification ===\n");
@@ -86,10 +78,10 @@ async fn run_dialup_test(
     let forwarded = external_messages.len();
     let skipped = MESSAGE_COUNT - forwarded;
 
-    let actual_percentage = (forwarded as f64 / MESSAGE_COUNT as f64) * 100.0;
+    let actual_percentage = (to_f64(forwarded) / to_f64(MESSAGE_COUNT)) * 100.0;
 
-    println!("  Produced:  {}", MESSAGE_COUNT);
-    println!("  Forwarded: {} ({:.1}%)", forwarded, actual_percentage);
+    println!("  Produced:  {MESSAGE_COUNT}");
+    println!("  Forwarded: {forwarded} ({actual_percentage:.1}%)");
     println!(
         "  Skipped:   {} ({:.1}%)\n",
         skipped,
@@ -100,36 +92,30 @@ async fn run_dialup_test(
     if percentage == 0 {
         // 0% should be exactly 0
         if forwarded != 0 {
-            return Err(format!("Expected 0 forwarded for 0%, got {}", forwarded).into());
+            return Err(format!("Expected 0 forwarded for 0%, got {forwarded}").into());
         }
         println!("✅ Exactly 0 messages forwarded (as expected for 0%)\n");
     } else if percentage == 100 {
         // 100% should be exactly all
         if forwarded != MESSAGE_COUNT {
-            return Err(format!(
-                "Expected {} forwarded for 100%, got {}",
-                MESSAGE_COUNT, forwarded
-            )
-            .into());
+            return Err(
+                format!("Expected {MESSAGE_COUNT} forwarded for 100%, got {forwarded}").into(),
+            );
         }
-        println!(
-            "✅ All {} messages forwarded (as expected for 100%)\n",
-            MESSAGE_COUNT
-        );
+        println!("✅ All {MESSAGE_COUNT} messages forwarded (as expected for 100%)\n");
     } else {
         // Other percentages within tolerance
         let tolerance = (expected_max_pct - expected_min_pct) / 2.0;
-        let expected_pct = (expected_min_pct + expected_max_pct) / 2.0;
+        let expected_pct = f64::midpoint(expected_min_pct, expected_max_pct);
         assert_percentage_in_range(forwarded, MESSAGE_COUNT, expected_pct, tolerance)?;
         println!(
-            "✅ Forwarding percentage {:.1}% within expected range ({:.0}%-{:.0}%)\n",
-            actual_percentage, expected_min_pct, expected_max_pct
+            "✅ Forwarding percentage {actual_percentage:.1}% within expected range ({expected_min_pct:.0}%-{expected_max_pct:.0}%)\n"
         );
     }
 
     // 4. CLEANUP
     ctx.cleanup().await?;
-    println!("✅ Test PASSED: Dial-Up {}% Forwarding\n", percentage);
+    println!("✅ Test PASSED: Dial-Up {percentage}% Forwarding\n");
     Ok(())
 }
 

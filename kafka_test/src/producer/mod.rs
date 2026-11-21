@@ -10,10 +10,20 @@ mod ack_visibility;
 mod acks_zero;
 mod basic;
 mod batch;
+mod invalid_names;
 mod timestamp;
+mod zero_partitions;
 
-pub use ack_visibility::test_produce_ack_implies_committed_visibility;
-pub use acks_zero::test_producer_acks_zero;
-pub use basic::test_producer;
-pub use batch::test_batch_produce;
-pub use timestamp::test_producer_timestamp_roundtrip;
+/// The `producer` tests, in run order.
+pub fn tests() -> Vec<crate::registry::TestDef> {
+    crate::test_defs!["producer";
+        basic::test_producer,
+        invalid_names::test_produce_to_an_invalid_topic_name_is_unknown_topic,
+        zero_partitions::test_produce_topic_entries_without_partitions_answer_nothing,
+        batch::test_batch_produce,
+        acks_zero::test_producer_acks_zero,
+        ack_visibility::test_produce_ack_implies_committed_visibility: sequential, // Mutates global GUC (test_pre_commit_delay_ms)
+        timestamp::test_producer_timestamp_roundtrip,
+        timestamp::test_producer_timestamps_far_from_the_batch_base_roundtrip,
+    ]
+}

@@ -1,0 +1,87 @@
+# libFuzzer targets for the network edge (cargo-fuzz).
+#
+#   cargo install cargo-fuzz
+#   cd fuzz && cargo +nightly fuzz run frame_codec    -- -max_total_time=300
+#   cd fuzz && cargo +nightly fuzz run request_decode -- -max_total_time=300
+#   cd fuzz && cargo +nightly fuzz run record_batch   -- -max_total_time=300
+#
+# The pg_kafka crate needs pgrx's build environment (PGRX_PG_CONFIG_PATH or ~/.pgrx),
+# as for `cargo test`. Seed corpora live in fuzz/corpus/<target>/ (regenerate with
+# `cargo run --bin gen_corpus`).
+[package]
+name = "pg_kafka-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+libfuzzer-sys = "0.4"
+pg_kafka = { path = "..", default-features = false, features = ["pg14"] }
+bytes = "1.11"
+tokio = { version = "1.48", features = ["sync"] }
+tokio-util = { version = "0.7.17", features = ["codec"] }
+kafka-protocol = "0.17"
+
+# Not part of any parent workspace.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+panic = "unwind"
+
+[[bin]]
+name = "frame_codec"
+path = "fuzz_targets/frame_codec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "request_decode"
+path = "fuzz_targets/request_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "record_batch"
+path = "fuzz_targets/record_batch.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gen_corpus"
+path = "src/gen_corpus.rs"
+test = false
+doc = false
+bench = false
+
+# Same kafka-protocol fork as the root crate (bounded allocations / decompression); keep the
+# rev in lockstep with ../Cargo.toml.
+[patch.crates-io]
+kafka-protocol = { git = "https://github.com/RTrentJones/kafka-protocol-rs", rev = "642043e3a6681e51e2b6d37e5c8b69c2db633ea6" }
+
+[lints.rust]
+unused_qualifications = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+doc_markdown = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+similar_names = "allow"
+too_many_lines = "allow"
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
+dbg_macro = "warn"
+todo = "warn"

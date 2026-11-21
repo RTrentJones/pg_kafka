@@ -125,7 +125,7 @@ pub async fn verify_external_kafka_ready() -> TestResult {
     use rdkafka::producer::Producer;
 
     let bootstrap_servers = get_external_bootstrap_servers();
-    eprintln!("DEBUG: Verifying external Kafka at {}", bootstrap_servers);
+    eprintln!("DEBUG: Verifying external Kafka at {bootstrap_servers}");
 
     let producer = match create_external_producer() {
         Ok(p) => {
@@ -133,7 +133,7 @@ pub async fn verify_external_kafka_ready() -> TestResult {
             p
         }
         Err(e) => {
-            eprintln!("DEBUG: Failed to create producer: {:?}", e);
+            eprintln!("DEBUG: Failed to create producer: {e:?}");
             return Err(e);
         }
     };
@@ -145,7 +145,7 @@ pub async fn verify_external_kafka_ready() -> TestResult {
             Ok(())
         }
         Err(e) => {
-            eprintln!("DEBUG: Failed to fetch metadata: {:?}", e);
+            eprintln!("DEBUG: Failed to fetch metadata: {e:?}");
             Err(Box::new(e))
         }
     }
@@ -178,14 +178,14 @@ pub async fn consume_from_external(
         match consumer.poll(Duration::from_millis(100)) {
             Some(Ok(msg)) => {
                 messages.push(ExternalMessage {
-                    key: msg.key().map(|k| k.to_vec()),
-                    value: msg.payload().map(|v| v.to_vec()),
+                    key: msg.key().map(<[u8]>::to_vec),
+                    value: msg.payload().map(<[u8]>::to_vec),
                     partition: msg.partition(),
                     offset: msg.offset(),
                 });
             }
             Some(Err(e)) => {
-                eprintln!("Error consuming from external Kafka: {}", e);
+                eprintln!("Error consuming from external Kafka: {e}");
             }
             None => {}
         }

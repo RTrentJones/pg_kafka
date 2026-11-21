@@ -1,0 +1,71 @@
+name: Set up PostgreSQL + cargo-pgrx
+description: >
+  Install PostgreSQL <major> from apt.postgresql.org (server, headers, pg_config), the build
+  dependencies, the cargo-pgrx version Cargo.lock pins, and point pgrx at that PostgreSQL.
+  Optionally restore the Rust build cache. Exports PG_CONFIG. Run it after the Rust toolchain
+  is installed.
+inputs:
+  pg:
+    description: PostgreSQL major version (14-18)
+    required: true
+  owned:
+    description: >
+      Make the extension install directories writable by the runner user, so
+      `cargo pgrx install` and scripts/check-upgrade.sh work without sudo.
+    default: 'false'
+  cache-prefix:
+    description: Swatinem/rust-cache prefix-key; empty means no build cache.
+    default: ''
+runs:
+  using: composite
+  steps:
+    - name: Install PostgreSQL ${{ inputs.pg }} (pgdg) and build dependencies
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y postgresql-common
+        sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+        # -server-dev-N has the headers + pg_config bindgen needs; `cargo pgrx init` also
+        # runs initdb, which lives in the server package.
+        sudo apt-get install -y "postgresql-${{ inputs.pg }}" "postgresql-server-dev-${{ inputs.pg }}" \
+          libpq-dev libreadline-dev zlib1g-dev flex bison libxml2-dev libxslt-dev \
+          libssl-dev libsasl2-dev libzstd-dev netcat-openbsd openssl
+        # The packaged cluster is not used (tests run their own, scripts/ci-pg.sh).
+        sudo systemctl stop postgresql || true
+        echo "PG_CONFIG=/usr/lib/postgresql/${{ inputs.pg }}/bin/pg_config" >> "$GITHUB_ENV"
+
+    - name: Make the extension directories writable
+      if: inputs.owned == 'true'
+      shell: bash
+      run: sudo chown -R "$USER" "$("$PG_CONFIG" --pkglibdir)" "$("$PG_CONFIG" --sharedir)/extension"
+
+    # cargo-pgrx must be the version of the pgrx crate, so it is read from Cargo.lock.
+    - name: Read the pgrx version from Cargo.lock
+      id: pgrx
+      shell: bash
+      run: |
+        version="$(awk '$0 == "name = \"pgrx\"" { getline; gsub(/version = |"/, ""); print; exit }' Cargo.lock)"
+        if [ -z "$version" ]; then echo "::error::no pgrx package in Cargo.lock"; exit 1; fi
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+
+    - name: Cache cargo-pgrx binary
+      id: cache-cargo-pgrx
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/bin/cargo-pgrx
+        key: ${{ runner.os }}-cargo-pgrx-bin-${{ steps.pgrx.outputs.version }}
+
+    - name: Install cargo-pgrx ${{ steps.pgrx.outputs.version }}
+      if: steps.cache-cargo-pgrx.outputs.cache-hit != 'true'
+      shell: bash
+      run: cargo install --locked cargo-pgrx --version "${{ steps.pgrx.outputs.version }}"
+
+    - name: Point pgrx at PostgreSQL ${{ inputs.pg }}
+      shell: bash
+      run: cargo pgrx init "--pg${{ inputs.pg }}" "$PG_CONFIG"
+
+    - name: Rust build cache
+      if: inputs.cache-prefix != ''
+      uses: Swatinem/rust-cache@v2
+      with:
+        prefix-key: ${{ inputs.cache-prefix }}

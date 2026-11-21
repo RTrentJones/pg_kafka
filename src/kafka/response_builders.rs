@@ -1,92 +1,47 @@
-// Response builder utilities for kafka-protocol types
-//
-// This module provides helper functions to construct kafka-protocol response types.
-// By centralizing this logic, we keep worker.rs clean and focused on business logic.
+//! Builders for kafka-protocol response values the handlers and the API registry share:
+//! the ApiVersions list, Metadata pieces, and the error responses of the APIs whose error
+//! lives in a top-level field.
+//!
+//! The full error response of every API (echoing requested topics/partitions/groups where
+//! the response has no top-level code) is `KafkaApi::error_response` in
+//! `crate::kafka::api`.
 
 use kafka_protocol::messages::api_versions_response::{ApiVersion, ApiVersionsResponse};
+use kafka_protocol::messages::find_coordinator_response::FindCoordinatorResponse;
+use kafka_protocol::messages::heartbeat_response::HeartbeatResponse;
+use kafka_protocol::messages::init_producer_id_response::InitProducerIdResponse;
+use kafka_protocol::messages::join_group_response::JoinGroupResponse;
+use kafka_protocol::messages::leave_group_response::LeaveGroupResponse;
+use kafka_protocol::messages::list_groups_response::ListGroupsResponse;
 use kafka_protocol::messages::metadata_response::{
-    MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic,
+    MetadataResponse, MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic,
 };
-use kafka_protocol::messages::produce_response::ProduceResponse;
-use kafka_protocol::messages::{BrokerId, TopicName};
+use kafka_protocol::messages::produce_response::{
+    PartitionProduceResponse, ProduceResponse, TopicProduceResponse,
+};
+use kafka_protocol::messages::sync_group_response::SyncGroupResponse;
+use kafka_protocol::messages::{BrokerId, ProducerId, TopicName};
 
-use super::constants::*;
+use crate::kafka::constants::ERROR_NONE;
+use crate::kafka::messages::TopicProduceData;
 
-/// The single source of truth for the request versions pg_kafka supports, as
-/// `(api_key, min_version, max_version)`. This table is used both to *advertise* supported versions
-/// in the ApiVersions response and to *enforce* them on inbound requests (CONF-6, see
-/// `decoding::parse_request_inner`) — keeping the two in lockstep so we never accept a version we
-/// don't advertise.
-///
-/// Notable caps:
-/// - Produce min 3: we only support the RecordBatch format (v3+); v0-2 use the legacy MessageSet
-///   format the kafka-protocol crate doesn't decode.
-/// - Fetch max 11: KIP-516 (v13) drops the topic *name* in favour of topic IDs, but pg_kafka
-///   resolves topics by name only, so a v13 client would get UNKNOWN_TOPIC_OR_PARTITION. v11 is the
-///   highest version that still carries the topic name.
-/// - OffsetFetch max 7: v8+ changed the response shape to support multiple groups, which we don't
-///   implement yet.
-/// - Metadata max 10: v10 (KIP-516) added a per-topic `topic_id` to the *response*; pg_kafka resolves
-///   by name and leaves it as the zero UUID, which by-name clients ignore. We advertise (and serve)
-///   v10 because clients with an explicit broker version that don't down-negotiate — notably Sarama
-///   `V2_8_0_0` — send Metadata v10 unconditionally; rejecting it broke their bootstrap (the rejection
-///   is an error frame strict decoders can't parse). v11+ adds fields/semantics we don't serve.
-/// - Minimums follow the kafka-protocol crate: it cannot decode or encode Fetch v0-3,
-///   ListOffsets v0, OffsetCommit v0-1, OffsetFetch v0, CreateTopics v0-1 or DeleteTopics v0,
-///   so advertising them made a negotiating client's first request drop the connection. The
-///   `every_advertised_version_encodes` test keeps the table and the crate in step.
-pub const API_VERSION_RANGES: &[(i16, i16, i16)] = &[
-    (API_KEY_API_VERSIONS, 0, 3),
-    (API_KEY_METADATA, 0, 10),
-    (API_KEY_PRODUCE, 3, 9),
-    (API_KEY_FETCH, 4, 11),
-    (API_KEY_LIST_OFFSETS, 1, 7),
-    (API_KEY_OFFSET_COMMIT, 2, 8),
-    (API_KEY_OFFSET_FETCH, 1, 7),
-    (API_KEY_FIND_COORDINATOR, 0, 3),
-    (API_KEY_JOIN_GROUP, 0, 7),
-    (API_KEY_HEARTBEAT, 0, 4),
-    (API_KEY_LEAVE_GROUP, 0, 4),
-    (API_KEY_SYNC_GROUP, 0, 4),
-    (API_KEY_DESCRIBE_GROUPS, 0, 5),
-    (API_KEY_LIST_GROUPS, 0, 4),
-    (API_KEY_CREATE_TOPICS, 2, 5),
-    (API_KEY_DELETE_TOPICS, 1, 4),
-    (API_KEY_CREATE_PARTITIONS, 0, 2),
-    (API_KEY_DELETE_GROUPS, 0, 2),
-    (API_KEY_INIT_PRODUCER_ID, 0, 4),
-    (API_KEY_ADD_PARTITIONS_TO_TXN, 0, 3),
-    (API_KEY_ADD_OFFSETS_TO_TXN, 0, 3),
-    (API_KEY_END_TXN, 0, 3),
-    (API_KEY_TXN_OFFSET_COMMIT, 0, 3),
-    (API_KEY_DELETE_RECORDS, 0, 2),
-    // DescribeConfigs min 1: the kafka-protocol crate implements v1-4 only
-    // (v0 lacks per-config source/synonym metadata); every mainstream admin
-    // client negotiates >= 1.
-    (API_KEY_DESCRIBE_CONFIGS, 1, 4),
-    (API_KEY_INCREMENTAL_ALTER_CONFIGS, 0, 1),
-];
-
-/// Return the supported `(min_version, max_version)` for an API key, or `None` if the key is not
-/// one pg_kafka handles. Backs CONF-6 request-version enforcement.
-pub fn supported_version_range(api_key: i16) -> Option<(i16, i16)> {
-    API_VERSION_RANGES
-        .iter()
-        .find(|(key, _, _)| *key == api_key)
-        .map(|(_, min, max)| (*min, *max))
-}
-
-/// Build an ApiVersionsResponse advertising the versions in [`API_VERSION_RANGES`].
+/// Build an ApiVersionsResponse advertising every registered API (`crate::kafka::api::APIS`)
+/// with its supported version range. The same ranges are enforced on decode, so
+/// pg_kafka never accepts a version it does not advertise. The minimums follow the
+/// kafka-protocol crate (it cannot decode or encode Fetch v0-3, ListOffsets v0,
+/// OffsetCommit v0-1, OffsetFetch v0, CreateTopics v0-1, DeleteTopics v0 or
+/// DescribeConfigs v0); `api::tests::every_advertised_version_encodes` keeps the registry and
+/// the crate in step.
 pub fn build_api_versions_response() -> ApiVersionsResponse {
     let mut response = ApiVersionsResponse::default();
     response.error_code = ERROR_NONE;
     response.throttle_time_ms = 0;
 
-    for &(api_key, min_version, max_version) in API_VERSION_RANGES {
+    for info in crate::kafka::api::APIS {
         let mut av = ApiVersion::default();
-        av.api_key = api_key;
-        av.min_version = min_version;
-        av.max_version = max_version;
+        av.api_key = info.key;
+        av.min_version = info.min_version;
+        av.max_version = info.max_version;
         response.api_keys.push(av);
     }
 
@@ -140,9 +95,8 @@ pub fn build_produce_response() -> ProduceResponse {
 }
 
 /// Build an error MetadataResponse for protocol-level errors
-pub fn build_metadata_error_response(
-) -> kafka_protocol::messages::metadata_response::MetadataResponse {
-    let mut response = kafka_protocol::messages::metadata_response::MetadataResponse::default();
+pub fn build_metadata_error_response() -> MetadataResponse {
+    let mut response = MetadataResponse::default();
     response.throttle_time_ms = 0;
     response.cluster_id = None;
     response.controller_id = BrokerId(-1);
@@ -150,48 +104,17 @@ pub fn build_metadata_error_response(
     response
 }
 
-// ========== Error Response Builders ==========
-// These functions build API-specific error responses with the error code
-// embedded in the correct location for each Kafka API.
-
-use kafka_protocol::messages::create_partitions_response::CreatePartitionsResponse;
-use kafka_protocol::messages::create_topics_response::CreateTopicsResponse;
-use kafka_protocol::messages::delete_groups_response::DeleteGroupsResponse;
-use kafka_protocol::messages::delete_topics_response::DeleteTopicsResponse;
-use kafka_protocol::messages::describe_groups_response::DescribeGroupsResponse;
-use kafka_protocol::messages::fetch_response::FetchResponse;
-use kafka_protocol::messages::find_coordinator_response::FindCoordinatorResponse;
-use kafka_protocol::messages::heartbeat_response::HeartbeatResponse;
-use kafka_protocol::messages::init_producer_id_response::InitProducerIdResponse;
-use kafka_protocol::messages::join_group_response::JoinGroupResponse;
-use kafka_protocol::messages::leave_group_response::LeaveGroupResponse;
-use kafka_protocol::messages::list_groups_response::ListGroupsResponse;
-use kafka_protocol::messages::list_offsets_response::ListOffsetsResponse;
-use kafka_protocol::messages::offset_commit_response::OffsetCommitResponse;
-use kafka_protocol::messages::offset_fetch_response::OffsetFetchResponse;
-use kafka_protocol::messages::sync_group_response::SyncGroupResponse;
-
-/// Build a ProduceResponse with an error code (top-level error, no topic data)
-pub fn build_produce_error_response(_error_code: i16) -> ProduceResponse {
-    // ProduceResponse doesn't have a top-level error_code field.
-    // Errors are per-topic/partition. Return empty response for protocol-level errors.
-    let mut response = ProduceResponse::default();
-    response.throttle_time_ms = 0;
-    response
-}
+// ========== Error responses ==========
 
 /// A ProduceResponse reporting `error_code` on every requested partition.
 pub fn build_produce_partition_error_response(
-    topic_data: &[crate::kafka::messages::TopicProduceData],
+    topic_data: &[TopicProduceData],
     error_code: i16,
-) -> kafka_protocol::messages::produce_response::ProduceResponse {
-    use kafka_protocol::messages::produce_response::{
-        PartitionProduceResponse, TopicProduceResponse,
-    };
+) -> ProduceResponse {
     let mut response = build_produce_response();
     for topic in topic_data {
         let mut t = TopicProduceResponse::default();
-        t.name = kafka_protocol::messages::TopicName(topic.name.clone().into());
+        t.name = TopicName(topic.name.clone().into());
         for p in &topic.partitions {
             let mut pr = PartitionProduceResponse::default();
             pr.index = p.partition_index;
@@ -203,31 +126,6 @@ pub fn build_produce_partition_error_response(
         }
         response.responses.push(t);
     }
-    response
-}
-
-/// Build a FetchResponse with an error code
-pub fn build_fetch_error_response(error_code: i16) -> FetchResponse {
-    let mut response = FetchResponse::default();
-    response.throttle_time_ms = 0;
-    response.error_code = error_code;
-    response
-}
-
-/// Build an OffsetCommitResponse with an error code (empty topics)
-pub fn build_offset_commit_error_response(_error_code: i16) -> OffsetCommitResponse {
-    // OffsetCommitResponse doesn't have a top-level error_code.
-    // Errors are per-topic/partition. Return empty response.
-    let mut response = OffsetCommitResponse::default();
-    response.throttle_time_ms = 0;
-    response
-}
-
-/// Build an OffsetFetchResponse with an error code
-pub fn build_offset_fetch_error_response(error_code: i16) -> OffsetFetchResponse {
-    let mut response = OffsetFetchResponse::default();
-    response.throttle_time_ms = 0;
-    response.error_code = error_code;
     response
 }
 
@@ -279,23 +177,6 @@ pub fn build_leave_group_error_response(error_code: i16) -> LeaveGroupResponse {
     response
 }
 
-/// Build a ListOffsetsResponse with an error code (empty topics)
-pub fn build_list_offsets_error_response(_error_code: i16) -> ListOffsetsResponse {
-    // ListOffsetsResponse doesn't have a top-level error_code.
-    // Errors are per-topic/partition. Return empty response.
-    let mut response = ListOffsetsResponse::default();
-    response.throttle_time_ms = 0;
-    response
-}
-
-/// Build a DescribeGroupsResponse with an error code (empty groups)
-pub fn build_describe_groups_error_response(_error_code: i16) -> DescribeGroupsResponse {
-    // DescribeGroupsResponse errors are per-group. Return empty response.
-    let mut response = DescribeGroupsResponse::default();
-    response.throttle_time_ms = 0;
-    response
-}
-
 /// Build a ListGroupsResponse with an error code
 pub fn build_list_groups_error_response(error_code: i16) -> ListGroupsResponse {
     let mut response = ListGroupsResponse::default();
@@ -304,65 +185,8 @@ pub fn build_list_groups_error_response(error_code: i16) -> ListGroupsResponse {
     response
 }
 
-/// Build a CreateTopicsResponse with an error code (empty topics)
-pub fn build_create_topics_error_response(_error_code: i16) -> CreateTopicsResponse {
-    // CreateTopicsResponse errors are per-topic. Return empty response.
-    let mut response = CreateTopicsResponse::default();
-    response.throttle_time_ms = 0;
-    response
-}
-
-/// Build a DeleteTopicsResponse with an error code (empty responses)
-pub fn build_delete_topics_error_response(_error_code: i16) -> DeleteTopicsResponse {
-    // DeleteTopicsResponse errors are per-topic. Return empty response.
-    let mut response = DeleteTopicsResponse::default();
-    response.throttle_time_ms = 0;
-    response
-}
-
-/// Build a CreatePartitionsResponse with an error code (empty results)
-pub fn build_create_partitions_error_response(_error_code: i16) -> CreatePartitionsResponse {
-    // CreatePartitionsResponse errors are per-topic. Return empty response.
-    let mut response = CreatePartitionsResponse::default();
-    response.throttle_time_ms = 0;
-    response
-}
-
-/// Build a DeleteGroupsResponse with an error code (empty results)
-pub fn build_delete_groups_error_response(_error_code: i16) -> DeleteGroupsResponse {
-    // DeleteGroupsResponse errors are per-group. Return empty response.
-    let mut response = DeleteGroupsResponse::default();
-    response.throttle_time_ms = 0;
-    response
-}
-
-/// Build a DeleteRecordsResponse with an error code (empty results)
-pub fn build_delete_records_error_response(
-    _error_code: i16,
-) -> kafka_protocol::messages::delete_records_response::DeleteRecordsResponse {
-    // DeleteRecordsResponse errors are per-partition. Return empty response.
-    kafka_protocol::messages::delete_records_response::DeleteRecordsResponse::default()
-}
-
-/// Build a DescribeConfigsResponse with an error code (empty results)
-pub fn build_describe_configs_error_response(
-    _error_code: i16,
-) -> kafka_protocol::messages::describe_configs_response::DescribeConfigsResponse {
-    // DescribeConfigsResponse errors are per-resource. Return empty response.
-    kafka_protocol::messages::describe_configs_response::DescribeConfigsResponse::default()
-}
-
-/// Build an IncrementalAlterConfigsResponse with an error code (empty results)
-pub fn build_incremental_alter_configs_error_response(
-    _error_code: i16,
-) -> kafka_protocol::messages::incremental_alter_configs_response::IncrementalAlterConfigsResponse {
-    // Errors are per-resource. Return empty response.
-    kafka_protocol::messages::incremental_alter_configs_response::IncrementalAlterConfigsResponse::default()
-}
-
-/// Build an InitProducerIdResponse with an error code (Phase 9)
+/// Build an InitProducerIdResponse with an error code
 pub fn build_init_producer_id_error_response(error_code: i16) -> InitProducerIdResponse {
-    use kafka_protocol::messages::ProducerId;
     let mut response = InitProducerIdResponse::default();
     response.throttle_time_ms = 0;
     response.error_code = error_code;
@@ -371,198 +195,10 @@ pub fn build_init_producer_id_error_response(error_code: i16) -> InitProducerIdR
     response
 }
 
-/// Build a *decodable*, API-specific error response for a request whose `api_key` is known.
-///
-/// Wraps the matching `build_*_error_response` builder in the corresponding [`KafkaResponse`] variant,
-/// tagged with the request's `api_version` so the existing encoder writes it at the version the client
-/// sent. The protocol layer prefers this over the hand-rolled `KafkaResponse::Error` frame, which uses
-/// a fixed v0 header that strict clients (e.g. Sarama) mis-decode and panic on. Used by the
-/// request-version-range rejection (CONF-6) and the per-API decode-failure arms in `decoding.rs`.
-///
-/// Returns `None` for an `api_key` with no typed error builder — ApiVersions (which never reaches the
-/// error path) and the transaction APIs — so the caller falls back to the generic frame, which is then
-/// only reachable on a truly-unknown `api_key` or a builder-less API's malformed-input path.
-pub fn error_response_for(
-    api_key: i16,
-    api_version: i16,
-    correlation_id: i32,
-    error_code: i16,
-) -> Option<crate::kafka::messages::KafkaResponse> {
-    use crate::kafka::messages::KafkaResponse;
-    let response = match api_key {
-        API_KEY_METADATA => KafkaResponse::Metadata {
-            correlation_id,
-            api_version,
-            response: build_metadata_error_response(),
-        },
-        API_KEY_PRODUCE => KafkaResponse::Produce {
-            correlation_id,
-            api_version,
-            response: build_produce_error_response(error_code),
-        },
-        API_KEY_FETCH => KafkaResponse::Fetch {
-            correlation_id,
-            api_version,
-            response: build_fetch_error_response(error_code),
-        },
-        API_KEY_LIST_OFFSETS => KafkaResponse::ListOffsets {
-            correlation_id,
-            api_version,
-            response: build_list_offsets_error_response(error_code),
-        },
-        API_KEY_OFFSET_COMMIT => KafkaResponse::OffsetCommit {
-            correlation_id,
-            api_version,
-            response: build_offset_commit_error_response(error_code),
-        },
-        API_KEY_OFFSET_FETCH => KafkaResponse::OffsetFetch {
-            correlation_id,
-            api_version,
-            response: build_offset_fetch_error_response(error_code),
-        },
-        API_KEY_FIND_COORDINATOR => KafkaResponse::FindCoordinator {
-            correlation_id,
-            api_version,
-            response: build_find_coordinator_error_response(error_code),
-        },
-        API_KEY_JOIN_GROUP => KafkaResponse::JoinGroup {
-            correlation_id,
-            api_version,
-            response: build_join_group_error_response(error_code),
-        },
-        API_KEY_SYNC_GROUP => KafkaResponse::SyncGroup {
-            correlation_id,
-            api_version,
-            response: build_sync_group_error_response(error_code),
-        },
-        API_KEY_HEARTBEAT => KafkaResponse::Heartbeat {
-            correlation_id,
-            api_version,
-            response: build_heartbeat_error_response(error_code),
-        },
-        API_KEY_LEAVE_GROUP => KafkaResponse::LeaveGroup {
-            correlation_id,
-            api_version,
-            response: build_leave_group_error_response(error_code),
-        },
-        API_KEY_DESCRIBE_GROUPS => KafkaResponse::DescribeGroups {
-            correlation_id,
-            api_version,
-            response: build_describe_groups_error_response(error_code),
-        },
-        API_KEY_LIST_GROUPS => KafkaResponse::ListGroups {
-            correlation_id,
-            api_version,
-            response: build_list_groups_error_response(error_code),
-        },
-        API_KEY_CREATE_TOPICS => KafkaResponse::CreateTopics {
-            correlation_id,
-            api_version,
-            response: build_create_topics_error_response(error_code),
-        },
-        API_KEY_DELETE_TOPICS => KafkaResponse::DeleteTopics {
-            correlation_id,
-            api_version,
-            response: build_delete_topics_error_response(error_code),
-        },
-        API_KEY_CREATE_PARTITIONS => KafkaResponse::CreatePartitions {
-            correlation_id,
-            api_version,
-            response: build_create_partitions_error_response(error_code),
-        },
-        API_KEY_DELETE_GROUPS => KafkaResponse::DeleteGroups {
-            correlation_id,
-            api_version,
-            response: build_delete_groups_error_response(error_code),
-        },
-        API_KEY_INIT_PRODUCER_ID => KafkaResponse::InitProducerId {
-            correlation_id,
-            api_version,
-            response: build_init_producer_id_error_response(error_code),
-        },
-        API_KEY_DELETE_RECORDS => KafkaResponse::DeleteRecords {
-            correlation_id,
-            api_version,
-            response: build_delete_records_error_response(error_code),
-        },
-        API_KEY_DESCRIBE_CONFIGS => KafkaResponse::DescribeConfigs {
-            correlation_id,
-            api_version,
-            response: build_describe_configs_error_response(error_code),
-        },
-        API_KEY_INCREMENTAL_ALTER_CONFIGS => KafkaResponse::IncrementalAlterConfigs {
-            correlation_id,
-            api_version,
-            response: build_incremental_alter_configs_error_response(error_code),
-        },
-        // Transaction APIs. AddPartitionsToTxn and TxnOffsetCommit carry their errors per
-        // partition, so without the request this is an empty (decodable) response; AddOffsetsToTxn
-        // and EndTxn have a top-level error code.
-        API_KEY_ADD_PARTITIONS_TO_TXN => KafkaResponse::AddPartitionsToTxn {
-            correlation_id,
-            api_version,
-            response: {
-                let mut r = kafka_protocol::messages::add_partitions_to_txn_response::AddPartitionsToTxnResponse::default();
-                r.error_code = error_code; // v4+ only
-                r
-            },
-        },
-        API_KEY_ADD_OFFSETS_TO_TXN => KafkaResponse::AddOffsetsToTxn {
-            correlation_id,
-            api_version,
-            response: {
-                let mut r = kafka_protocol::messages::add_offsets_to_txn_response::AddOffsetsToTxnResponse::default();
-                r.error_code = error_code;
-                r
-            },
-        },
-        API_KEY_END_TXN => KafkaResponse::EndTxn {
-            correlation_id,
-            api_version,
-            response: {
-                let mut r = kafka_protocol::messages::end_txn_response::EndTxnResponse::default();
-                r.error_code = error_code;
-                r
-            },
-        },
-        API_KEY_TXN_OFFSET_COMMIT => KafkaResponse::TxnOffsetCommit {
-            correlation_id,
-            api_version,
-            response: kafka_protocol::messages::txn_offset_commit_response::TxnOffsetCommitResponse::default(),
-        },
-        _ => return None,
-    };
-    Some(response)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn every_advertised_version_encodes() {
-        // Each advertised (api_key, version) must have a response the encoder accepts;
-        // otherwise a client that negotiates that version loses its connection on the
-        // first reply.
-        for &(api_key, min_version, max_version) in API_VERSION_RANGES {
-            for version in min_version..=max_version {
-                let response = if api_key == API_KEY_API_VERSIONS {
-                    Some(crate::kafka::messages::KafkaResponse::ApiVersions {
-                        correlation_id: 1,
-                        api_version: version,
-                        response: build_api_versions_response(),
-                    })
-                } else {
-                    error_response_for(api_key, version, 1, ERROR_NONE)
-                };
-                let response = response
-                    .unwrap_or_else(|| panic!("no response builder for api_key {}", api_key));
-                crate::kafka::protocol::encode_response(response).unwrap_or_else(|e| {
-                    panic!("api_key {} v{} does not encode: {}", api_key, version, e)
-                });
-            }
-        }
-    }
+    use crate::kafka::constants::*;
 
     // ========== API Versions Response Tests ==========
 
@@ -573,8 +209,8 @@ mod tests {
         assert_eq!(response.error_code, ERROR_NONE);
         assert_eq!(response.throttle_time_ms, 0);
 
-        // Should have 26 API versions (all supported APIs)
-        assert_eq!(response.api_keys.len(), 26);
+        // Should have 28 API versions (all supported APIs)
+        assert_eq!(response.api_keys.len(), 28);
 
         // Verify ApiVersions entry
         let api_versions = response
@@ -603,7 +239,7 @@ mod tests {
         assert_eq!(metadata.min_version, 0);
         assert_eq!(metadata.max_version, 10);
 
-        // Verify InitProducerId entry (Phase 9)
+        // Verify InitProducerId entry
         let init_producer = response
             .api_keys
             .iter()
@@ -612,7 +248,7 @@ mod tests {
         assert_eq!(init_producer.min_version, 0);
         assert_eq!(init_producer.max_version, 4);
 
-        // Verify transaction APIs (Phase 10)
+        // Verify transaction APIs
         let add_partitions = response
             .api_keys
             .iter()
@@ -661,31 +297,6 @@ mod tests {
         assert!(api_keys.contains(&API_KEY_DELETE_GROUPS));
     }
 
-    #[test]
-    fn test_supported_version_range_matches_advertised() {
-        // The enforcement table (CONF-6) must agree with what ApiVersions advertises.
-        assert_eq!(supported_version_range(API_KEY_PRODUCE), Some((3, 9)));
-        assert_eq!(supported_version_range(API_KEY_FETCH), Some((4, 11)));
-        assert_eq!(supported_version_range(API_KEY_METADATA), Some((0, 10)));
-        assert_eq!(supported_version_range(API_KEY_OFFSET_FETCH), Some((1, 7)));
-
-        // Every advertised API has a matching enforcement range, and vice versa.
-        let advertised = build_api_versions_response();
-        for entry in &advertised.api_keys {
-            assert_eq!(
-                supported_version_range(entry.api_key),
-                Some((entry.min_version, entry.max_version)),
-                "api_key {} advertised but enforcement range differs",
-                entry.api_key
-            );
-        }
-
-        // An API key pg_kafka doesn't handle has no range (so enforcement skips it and the
-        // dispatcher's unsupported-api-key path handles it instead).
-        assert_eq!(supported_version_range(17), None); // SaslHandshake — not implemented
-        assert_eq!(supported_version_range(9999), None);
-    }
-
     // ========== Metadata Builder Tests ==========
 
     #[test]
@@ -727,7 +338,7 @@ mod tests {
 
         assert_eq!(topic.error_code, ERROR_UNKNOWN_TOPIC_OR_PARTITION);
         assert_eq!(topic.name.unwrap().0.as_str(), "unknown-topic");
-        assert!(topic.partitions.is_empty());
+        assert_eq!(topic.partitions, [] as [MetadataResponsePartition; 0]);
     }
 
     #[test]
@@ -758,49 +369,7 @@ mod tests {
         let response = build_produce_response();
 
         assert_eq!(response.throttle_time_ms, 0);
-        assert!(response.responses.is_empty());
-    }
-
-    #[test]
-    fn test_build_produce_error_response() {
-        let response = build_produce_error_response(ERROR_UNKNOWN_TOPIC_OR_PARTITION);
-
-        // ProduceResponse doesn't have top-level error, so we just verify it's valid
-        assert_eq!(response.throttle_time_ms, 0);
-    }
-
-    // ========== Fetch Response Tests ==========
-
-    #[test]
-    fn test_build_fetch_error_response() {
-        let response = build_fetch_error_response(ERROR_UNKNOWN_TOPIC_OR_PARTITION);
-
-        assert_eq!(response.throttle_time_ms, 0);
-        assert_eq!(response.error_code, ERROR_UNKNOWN_TOPIC_OR_PARTITION);
-    }
-
-    #[test]
-    fn test_build_fetch_error_response_none() {
-        let response = build_fetch_error_response(ERROR_NONE);
-
-        assert_eq!(response.error_code, ERROR_NONE);
-    }
-
-    // ========== Offset Commit/Fetch Response Tests ==========
-
-    #[test]
-    fn test_build_offset_commit_error_response() {
-        let response = build_offset_commit_error_response(ERROR_NOT_COORDINATOR);
-
-        assert_eq!(response.throttle_time_ms, 0);
-    }
-
-    #[test]
-    fn test_build_offset_fetch_error_response() {
-        let response = build_offset_fetch_error_response(ERROR_NOT_COORDINATOR);
-
-        assert_eq!(response.throttle_time_ms, 0);
-        assert_eq!(response.error_code, ERROR_NOT_COORDINATOR);
+        assert_eq!(response.responses, [] as [TopicProduceResponse; 0]);
     }
 
     // ========== Coordinator Response Tests ==========
@@ -856,55 +425,11 @@ mod tests {
     // ========== List/Describe Response Tests ==========
 
     #[test]
-    fn test_build_list_offsets_error_response() {
-        let response = build_list_offsets_error_response(ERROR_UNKNOWN_TOPIC_OR_PARTITION);
-
-        assert_eq!(response.throttle_time_ms, 0);
-    }
-
-    #[test]
-    fn test_build_describe_groups_error_response() {
-        let response = build_describe_groups_error_response(ERROR_NOT_COORDINATOR);
-
-        assert_eq!(response.throttle_time_ms, 0);
-    }
-
-    #[test]
     fn test_build_list_groups_error_response() {
         let response = build_list_groups_error_response(ERROR_COORDINATOR_NOT_AVAILABLE);
 
         assert_eq!(response.throttle_time_ms, 0);
         assert_eq!(response.error_code, ERROR_COORDINATOR_NOT_AVAILABLE);
-    }
-
-    // ========== Admin API Response Tests ==========
-
-    #[test]
-    fn test_build_create_topics_error_response() {
-        let response = build_create_topics_error_response(ERROR_TOPIC_ALREADY_EXISTS);
-
-        assert_eq!(response.throttle_time_ms, 0);
-    }
-
-    #[test]
-    fn test_build_delete_topics_error_response() {
-        let response = build_delete_topics_error_response(ERROR_UNKNOWN_TOPIC_OR_PARTITION);
-
-        assert_eq!(response.throttle_time_ms, 0);
-    }
-
-    #[test]
-    fn test_build_create_partitions_error_response() {
-        let response = build_create_partitions_error_response(ERROR_INVALID_PARTITIONS);
-
-        assert_eq!(response.throttle_time_ms, 0);
-    }
-
-    #[test]
-    fn test_build_delete_groups_error_response() {
-        let response = build_delete_groups_error_response(ERROR_NON_EMPTY_GROUP);
-
-        assert_eq!(response.throttle_time_ms, 0);
     }
 
     // ========== Idempotent Producer Response Tests ==========
@@ -935,100 +460,7 @@ mod tests {
         assert_eq!(response.throttle_time_ms, 0);
         assert!(response.cluster_id.is_none());
         assert_eq!(response.controller_id.0, -1);
-        assert!(response.brokers.is_empty());
-        assert!(response.topics.is_empty());
-    }
-
-    // ========== error_response_for dispatcher (decodable protocol errors) ==========
-
-    #[test]
-    fn test_error_response_for_known_api_is_typed_and_versioned() {
-        use crate::kafka::messages::KafkaResponse;
-        // Fetch has a top-level error_code → it is carried through, tagged with the request version.
-        match error_response_for(API_KEY_FETCH, 11, 42, ERROR_UNSUPPORTED_VERSION) {
-            Some(KafkaResponse::Fetch {
-                correlation_id,
-                api_version,
-                response,
-            }) => {
-                assert_eq!(correlation_id, 42);
-                assert_eq!(api_version, 11);
-                assert_eq!(response.error_code, ERROR_UNSUPPORTED_VERSION);
-            }
-            _ => panic!("expected a typed Fetch error response"),
-        }
-        // Metadata carries no top-level error_code, but still maps to a decodable Metadata variant.
-        assert!(matches!(
-            error_response_for(API_KEY_METADATA, 10, 1, ERROR_UNSUPPORTED_VERSION),
-            Some(KafkaResponse::Metadata {
-                api_version: 10,
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn test_error_response_for_builderless_or_unknown_api_is_none() {
-        // Every handled API has a typed error builder (the transaction APIs included); only an
-        // unknown key falls back to the generic frame.
-        assert!(error_response_for(API_KEY_END_TXN, 3, 1, ERROR_UNSUPPORTED_VERSION).is_some());
-        assert!(error_response_for(9999, 0, 1, ERROR_UNSUPPORTED_VERSION).is_none());
-    }
-
-    #[test]
-    fn test_error_response_for_config_and_log_apis() {
-        use crate::kafka::messages::KafkaResponse;
-        // The three APIs added alongside RB-1 each map to their typed error
-        // response, tagged with the request version.
-        assert!(matches!(
-            error_response_for(API_KEY_DELETE_RECORDS, 1, 7, ERROR_UNSUPPORTED_VERSION),
-            Some(KafkaResponse::DeleteRecords {
-                correlation_id: 7,
-                api_version: 1,
-                ..
-            })
-        ));
-        assert!(matches!(
-            error_response_for(API_KEY_DESCRIBE_CONFIGS, 4, 8, ERROR_UNSUPPORTED_VERSION),
-            Some(KafkaResponse::DescribeConfigs {
-                correlation_id: 8,
-                api_version: 4,
-                ..
-            })
-        ));
-        assert!(matches!(
-            error_response_for(
-                API_KEY_INCREMENTAL_ALTER_CONFIGS,
-                1,
-                9,
-                ERROR_UNSUPPORTED_VERSION
-            ),
-            Some(KafkaResponse::IncrementalAlterConfigs {
-                correlation_id: 9,
-                api_version: 1,
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn test_new_error_builders_are_defaultish() {
-        // The three new builders return empty (per-partition/per-resource error)
-        // responses; exercised for coverage and to assert they don't panic.
-        assert!(
-            build_delete_records_error_response(ERROR_UNKNOWN_SERVER_ERROR)
-                .topics
-                .is_empty()
-        );
-        assert!(
-            build_describe_configs_error_response(ERROR_UNKNOWN_SERVER_ERROR)
-                .results
-                .is_empty()
-        );
-        assert!(
-            build_incremental_alter_configs_error_response(ERROR_UNKNOWN_SERVER_ERROR)
-                .responses
-                .is_empty()
-        );
+        assert_eq!(response.brokers, [] as [MetadataResponseBroker; 0]);
+        assert_eq!(response.topics, [] as [MetadataResponseTopic; 0]);
     }
 }

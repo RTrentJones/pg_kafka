@@ -1,0 +1,1255 @@
+//! Produce requests whose records the broker must refuse while decoding them: compressed
+//! batches that expand past the per-request decode limit (a decompression bomb), partition
+//! data that is not exactly one RecordBatch v2, and an acks=0 Produce at a version the
+//! broker does not serve.
+
+use super::{answers, client_config, port, rdkafka_roundtrip, stored_rows, time_until_closed};
+use crate::common::{DynResult, TestResult};
+use crate::setup::TestContext;
+use crate::wire::records::plain_batch;
+use crate::wire::requests::{creatable, create_topics_raw, produce_request};
+use crate::wire::{decode_response, read_frame_within, request_frame};
+use bytes::Bytes;
+use kafka_protocol::messages::ProduceRequest;
+use kafka_protocol::records::Compression;
+use std::time::{Duration, Instant};
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
+
+/// MESSAGE_TOO_LARGE (Java's RecordTooLargeException).
+const MESSAGE_TOO_LARGE: i16 = 10;
+/// CORRUPT_MESSAGE (Java's CorruptRecordException).
+const CORRUPT_MESSAGE: i16 = 2;
+/// INVALID_TIMESTAMP (Java's InvalidTimestampException).
+const INVALID_TIMESTAMP: i16 = 32;
+/// INVALID_RECORD (Java's InvalidRecordException).
+const INVALID_RECORD: i16 = 87;
+
+/// The broker's per-request limit on decoded record bytes (MAX_REQUEST_SIZE).
+const DECODE_LIMIT: usize = 100_000_000;
+
+/// Send a Produce v7 with `parts` and return each partition's error code.
+async fn produce_codes(
+    stream: &mut TcpStream,
+    corr: i32,
+    topic: &str,
+    parts: Vec<(i32, Bytes)>,
+) -> DynResult<Vec<i16>> {
+    let request = produce_request(topic, parts, 1);
+    let frame = request_frame(7, corr, &request);
+    println!("  request frame: {} bytes", frame.len());
+    stream.write_all(&frame).await?;
+    let response = read_frame_within(stream, Duration::from_secs(60))
+        .await?
+        .ok_or("connection closed instead of a produce response")?;
+    let (c, resp) = decode_response::<ProduceRequest>(7, &response)?;
+    assert_eq!(c, corr);
+    Ok(resp.responses[0]
+        .partition_responses
+        .iter()
+        .map(|p| p.error_code)
+        .collect())
+}
+
+/// The listener backend's resident memory (kB), after resetting its peak, or `None` when
+/// this process cannot read the backend's /proc entry (the DB runs elsewhere, or as
+/// another user).
+pub(super) async fn reset_listener_peak(ctx: &TestContext) -> DynResult<Option<(i32, u64)>> {
+    let pid: i32 = ctx
+        .db()
+        .query_one(
+            "SELECT pid FROM pg_stat_activity WHERE backend_type = 'pg_kafka_listener'",
+            &[],
+        )
+        .await?
+        .get(0);
+    if std::fs::write(format!("/proc/{pid}/clear_refs"), "5").is_err() {
+        return Ok(None);
+    }
+    Ok(proc_kb(pid, "VmRSS:").map(|rss| (pid, rss)))
+}
+
+/// A `/proc/<pid>/status` field in kB.
+pub(super) fn proc_kb(pid: i32, field: &str) -> Option<u64> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    status
+        .lines()
+        .find(|l| l.starts_with(field))?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
+/// A compressed partition that decodes past what its request may still hold is refused
+/// with MESSAGE_TOO_LARGE on its own and nothing of it is written, while the partitions
+/// that fit are; its decode stops at the limit, so the broker's memory stays bounded
+/// however far the batches would expand, and the broker keeps serving. A large compressed
+/// request within the limit is stored.
+pub async fn test_compressed_produce_past_the_decode_limit_is_refused() -> TestResult {
+    println!("=== Test: decompression bomb refused while decoding ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("net-bomb").await;
+    let created = create_topics_raw(vec![creatable(&topic, 8, 1)]).await?;
+    assert_eq!(created[0].error_code, 0, "{created:?}");
+    let mut s = TcpStream::connect(("127.0.0.1", port())).await?;
+    let zeros = |n: usize| Bytes::from(vec![0u8; n]);
+
+    println!(
+        "Step 1: one gzip batch of {} bytes of zeros",
+        DECODE_LIMIT + 1_000_000
+    );
+    let gzip = plain_batch(&[zeros(DECODE_LIMIT + 1_000_000)], Compression::Gzip);
+    let codes = produce_codes(&mut s, 1, &topic, vec![(0, gzip)]).await?;
+    assert_eq!(codes, vec![MESSAGE_TOO_LARGE]);
+    println!("✅ refused: {codes:?}");
+
+    println!("Step 2: two gzip batches of 60 MB (each legal, 120 MB together)");
+    let gzip = plain_batch(&[zeros(60_000_000)], Compression::Gzip);
+    let codes = produce_codes(&mut s, 2, &topic, vec![(0, gzip.clone()), (1, gzip)]).await?;
+    assert_eq!(codes, vec![0, MESSAGE_TOO_LARGE]);
+    assert_eq!(
+        stored_rows(ctx.db(), &topic).await?,
+        1,
+        "the first is written"
+    );
+    println!("✅ the first stored, the second refused: {codes:?}");
+
+    println!("Step 3: eight gzip batches of 101 MB (808 MB decoded) under a memory watch");
+    let peak_watch = reset_listener_peak(&ctx).await?;
+    let gzip = plain_batch(&[zeros(DECODE_LIMIT + 1_000_000)], Compression::Gzip);
+    let parts = (0..8).map(|p| (p, gzip.clone())).collect();
+    let codes = produce_codes(&mut s, 3, &topic, parts).await?;
+    assert_eq!(codes, vec![MESSAGE_TOO_LARGE; 8]);
+    match peak_watch.and_then(|(pid, rss)| Some((rss, proc_kb(pid, "VmHWM:")?))) {
+        Some((rss, peak)) => {
+            let grew_mb = peak.saturating_sub(rss) / 1024;
+            println!(
+                "  listener RSS {} MB, peak while decoding +{grew_mb} MB",
+                rss / 1024
+            );
+            // Each decode stops at the 100 MB limit (plus the copies of what it decoded so
+            // far) and is freed before the next; holding the 808 MB the batches expand to
+            // would show here.
+            assert!(grew_mb < 300, "decoding grew the listener by {grew_mb} MB");
+        }
+        None => println!("  (listener memory not readable from here; skipping the RSS check)"),
+    }
+    println!("✅ refused: {codes:?}");
+
+    assert_eq!(
+        stored_rows(ctx.db(), &topic).await?,
+        1,
+        "nothing more is written"
+    );
+
+    println!("Step 4: the broker still serves, and a 20 MB compressed request is stored");
+    assert!(answers(&mut s, 4).await, "the connection still answers");
+    let ok = plain_batch(&[zeros(10_000_000)], Compression::Lz4);
+    let codes = produce_codes(&mut s, 5, &topic, vec![(0, ok.clone()), (1, ok)]).await?;
+    assert_eq!(codes, vec![0, 0]);
+    let stored: i64 = ctx
+        .db()
+        .query_one(
+            "SELECT coalesce(sum(octet_length(m.value)), 0)::bigint FROM kafka.messages m \
+             JOIN kafka.topics t ON t.id = m.topic_id WHERE t.name = $1",
+            &[&topic],
+        )
+        .await?
+        .get(0);
+    assert_eq!(stored, 80_000_000, "60 MB from step 2, 20 MB now");
+    rdkafka_roundtrip(client_config(port()), &topic, 3).await?;
+    println!("✅ stored {stored} bytes; rdkafka round trip works");
+
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// A RecordBatch v2 built by hand around the records section `section`, gzip-compressed,
+/// declaring `record_count` records, with a valid CRC.
+pub(crate) fn raw_batch(section: &[u8], record_count: i32) -> Bytes {
+    use bytes::BufMut;
+    use kafka_protocol::compression::{Compressor, Gzip};
+    let mut records = bytes::BytesMut::new();
+    Gzip::compress(&mut records, |tmp: &mut bytes::BytesMut| {
+        tmp.put_slice(section);
+        Ok(())
+    })
+    .expect("gzip compresses");
+    batch_around(&records, record_count, 1)
+}
+
+/// `section` as one zstd frame of raw (stored) blocks whose header declares a
+/// 2^`window_log`-byte window and no content size, as a streaming encoder writes it.
+fn zstd_raw_frame(section: &[u8], window_log: u8) -> Vec<u8> {
+    let mut frame = 0xFD2F_B528u32.to_le_bytes().to_vec();
+    frame.push(0); // frame header descriptor: no content size, no checksum, no dictionary
+    frame.push((window_log - 10) << 3); // window descriptor
+    let blocks: Vec<&[u8]> = section.chunks(65_536).collect();
+    for (i, block) in blocks.iter().enumerate() {
+        let last = u32::from(i + 1 == blocks.len());
+        let header = last | (u32::try_from(block.len()).expect("64 KiB") << 3); // raw block
+        frame.extend_from_slice(&header.to_le_bytes()[..3]);
+        frame.extend_from_slice(block);
+    }
+    frame
+}
+
+/// The header fields of a hand-built batch ([`batch_with`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BatchHeader {
+    pub(crate) base_offset: i64,
+    /// Attributes, codec bits included.
+    pub(crate) attributes: i16,
+    /// `None`: one less than the record count (at least 0).
+    pub(crate) last_offset_delta: Option<i32>,
+    pub(crate) base_timestamp: i64,
+    /// `None`: the base timestamp.
+    pub(crate) max_timestamp: Option<i64>,
+    pub(crate) producer_id: i64,
+    pub(crate) producer_epoch: i16,
+    pub(crate) base_sequence: i32,
+}
+
+impl Default for BatchHeader {
+    fn default() -> Self {
+        Self {
+            base_offset: 0,
+            attributes: 0,
+            last_offset_delta: None,
+            base_timestamp: 0,
+            max_timestamp: None,
+            producer_id: -1,
+            producer_epoch: -1,
+            base_sequence: -1,
+        }
+    }
+}
+
+/// A RecordBatch v2 around `records` (compressed with the codec the attributes name),
+/// declaring `record_count` records, with a valid CRC.
+pub(crate) fn batch_with(records: &[u8], record_count: i32, header: BatchHeader) -> Bytes {
+    use bytes::BufMut;
+    let mut tail = bytes::BytesMut::new();
+    tail.put_i16(header.attributes);
+    tail.put_i32(
+        header
+            .last_offset_delta
+            .unwrap_or_else(|| record_count.max(1) - 1),
+    );
+    tail.put_i64(header.base_timestamp); // baseTimestamp
+    tail.put_i64(header.max_timestamp.unwrap_or(header.base_timestamp));
+    tail.put_i64(header.producer_id);
+    tail.put_i16(header.producer_epoch);
+    tail.put_i32(header.base_sequence);
+    tail.put_i32(record_count);
+    tail.put_slice(records);
+    let mut batch = bytes::BytesMut::new();
+    batch.put_i64(header.base_offset);
+    batch.put_i32(i32::try_from(4 + 1 + 4 + tail.len()).expect("a test batch fits an i32"));
+    batch.put_i32(0); // partitionLeaderEpoch
+    batch.put_i8(2); // magic
+    batch.put_u32(crc32c::crc32c(&tail));
+    batch.put_slice(&tail);
+    batch.freeze()
+}
+
+/// A RecordBatch v2 around `records` (compressed with the codec `attributes` names),
+/// declaring `record_count` records, with a valid CRC.
+fn batch_around(records: &[u8], record_count: i32, attributes: i16) -> Bytes {
+    let header = BatchHeader {
+        attributes,
+        ..BatchHeader::default()
+    };
+    batch_with(records, record_count, header)
+}
+
+/// `v` as a zigzag varint (as long as it takes).
+pub(crate) fn varint(v: i64) -> Vec<u8> {
+    let mut z = ((v << 1) ^ (v >> 63)).cast_unsigned();
+    let mut out = Vec::new();
+    while z >= 0x80 {
+        out.push(u8::try_from(z & 0x7f).expect("7 bits") | 0x80);
+        z >>= 7;
+    }
+    out.push(u8::try_from(z).expect("7 bits"));
+    out
+}
+
+/// One record: its body (the concatenated `fields`) behind its varint length.
+pub(crate) fn record(fields: &[&[u8]]) -> Vec<u8> {
+    let body = fields.concat();
+    let mut record = varint(i64::try_from(body.len()).expect("small"));
+    record.extend_from_slice(&body);
+    record
+}
+
+/// `n` of the smallest records: 7 bytes each (null key and value, no headers).
+fn tiny_records(n: usize) -> Vec<u8> {
+    [12u8, 0, 0, 0, 1, 1, 0].repeat(n)
+}
+
+/// `n` records of `headers` headers each, every header 2 bytes (an empty key and a null
+/// value).
+fn header_records(n: usize, headers: u16) -> Vec<u8> {
+    let zigzag = u32::from(headers) << 1;
+    let mut count = Vec::new();
+    let mut z = zigzag;
+    while z >= 0x80 {
+        count.push(u8::try_from(z & 0x7f).expect("7 bits") | 0x80);
+        z >>= 7;
+    }
+    count.push(u8::try_from(z).expect("7 bits"));
+    let mut body = vec![0u8, 0, 0, 1, 1];
+    body.extend_from_slice(&count);
+    body.extend_from_slice(&[0, 1].repeat(usize::from(headers)));
+    let mut size = Vec::new();
+    let mut z = u32::try_from(body.len()).expect("small") << 1;
+    while z >= 0x80 {
+        size.push(u8::try_from(z & 0x7f).expect("7 bits") | 0x80);
+        z >>= 7;
+    }
+    size.push(u8::try_from(z).expect("7 bits"));
+    let mut record = size;
+    record.extend_from_slice(&body);
+    record.repeat(n)
+}
+
+/// Batches that are small decoded but many records or headers, which each take some 50 to
+/// 90 bytes once decoded: their declared record count is charged before anything decodes
+/// and their headers before they are built, so they are refused with
+/// MESSAGE_TOO_LARGE quickly and the listener's memory stays bounded. A record count that
+/// does not match the records is INVALID_RECORD, also before the records are built.
+/// Unchecked, these four requests took gigabytes.
+pub async fn test_record_and_header_bombs_are_refused_before_decoding() -> TestResult {
+    println!("=== Test: record-count and header bombs refused before decoding ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("net-rec-bomb").await;
+    let created = create_topics_raw(vec![creatable(&topic, 4, 1)]).await?;
+    assert_eq!(created[0].error_code, 0, "{created:?}");
+    let mut s = TcpStream::connect(("127.0.0.1", port())).await?;
+    let peak_watch = reset_listener_peak(&ctx).await?;
+    let timed = |started: Instant, what: &str| {
+        let took = started.elapsed();
+        println!("  {what}: answered in {took:?}");
+        assert!(took < Duration::from_secs(2), "{what} took {took:?}");
+    };
+
+    let n = 1_300_000;
+    println!("Step 1: three gzip batches of {n} 7-byte records (27 MB decoded)");
+    let tiny = raw_batch(&tiny_records(n), i32::try_from(n)?);
+    let parts = (0..3).map(|p| (p, tiny.clone())).collect();
+    let started = Instant::now();
+    let codes = produce_codes(&mut s, 1, &topic, parts).await?;
+    timed(started, "tiny records");
+    assert_eq!(codes, vec![MESSAGE_TOO_LARGE; 3]);
+    println!("✅ refused: {codes:?}");
+
+    println!("Step 2: one gzip batch of 1000 records of 8192 2-byte headers (16 MB decoded)");
+    let headers = raw_batch(&header_records(1000, 8192), 1000);
+    let started = Instant::now();
+    let codes = produce_codes(&mut s, 2, &topic, vec![(0, headers)]).await?;
+    timed(started, "header-heavy records");
+    assert_eq!(codes, vec![MESSAGE_TOO_LARGE]);
+    println!("✅ refused: {codes:?}");
+
+    println!("Step 3: record counts that do not match the records");
+    let section = tiny_records(300_000);
+    for (corr, count) in (3..).zip([299_999, 300_001, 0]) {
+        let started = Instant::now();
+        let codes =
+            produce_codes(&mut s, corr, &topic, vec![(1, raw_batch(&section, count))]).await?;
+        timed(started, &format!("300000 records declared as {count}"));
+        assert_eq!(codes, vec![INVALID_RECORD], "declared {count}");
+    }
+    println!("✅ refused as INVALID_RECORD");
+
+    match peak_watch.and_then(|(pid, rss)| Some((rss, proc_kb(pid, "VmHWM:")?))) {
+        Some((rss, peak)) => {
+            let grew_mb = peak.saturating_sub(rss) / 1024;
+            println!(
+                "  listener RSS {} MB, peak while decoding +{grew_mb} MB",
+                rss / 1024
+            );
+            assert!(grew_mb < 300, "decoding grew the listener by {grew_mb} MB");
+        }
+        None => println!("  (listener memory not readable from here; skipping the RSS check)"),
+    }
+    assert_eq!(
+        stored_rows(ctx.db(), &topic).await?,
+        0,
+        "nothing is written"
+    );
+
+    println!("Step 4: the matching count is stored, and the broker still serves");
+    let codes = produce_codes(
+        &mut s,
+        10,
+        &topic,
+        vec![(2, raw_batch(&tiny_records(1000), 1000))],
+    )
+    .await?;
+    assert_eq!(codes, vec![0]);
+    assert_eq!(stored_rows(ctx.db(), &topic).await?, 1000);
+    assert!(answers(&mut s, 11).await, "the connection still answers");
+    rdkafka_roundtrip(client_config(port()), &topic, 3).await?;
+    println!("✅ stored; rdkafka round trip works");
+
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// zstd batches whose frames declare windows up to 2^27 bytes, Kafka's limit (Java
+/// producers at compression.zstd.level 20-22 use 2^25-2^27), are stored; a larger window is
+/// refused and nothing of it is written.
+pub async fn test_zstd_batches_with_large_windows_are_stored() -> TestResult {
+    println!("=== Test: zstd windows up to 2^27 ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("net-zstd-window").await;
+    let created = create_topics_raw(vec![creatable(&topic, 1, 1)]).await?;
+    assert_eq!(created[0].error_code, 0, "{created:?}");
+    let mut s = TcpStream::connect(("127.0.0.1", port())).await?;
+    let section = tiny_records(1000);
+    let zstd = |window_log| batch_around(&zstd_raw_frame(&section, window_log), 1000, 4);
+
+    for (corr, window_log) in (1..).zip([21u8, 25, 27]) {
+        let codes = produce_codes(&mut s, corr, &topic, vec![(0, zstd(window_log))]).await?;
+        assert_eq!(codes, vec![0], "window 2^{window_log}");
+        println!("✅ window 2^{window_log}: stored");
+    }
+    assert_eq!(stored_rows(ctx.db(), &topic).await?, 3000);
+
+    let codes = produce_codes(&mut s, 10, &topic, vec![(0, zstd(28))]).await?;
+    assert_eq!(codes, vec![CORRUPT_MESSAGE], "window 2^28");
+    assert_eq!(stored_rows(ctx.db(), &topic).await?, 3000);
+    println!("✅ window 2^28: refused {codes:?}");
+
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// CRC-32 (IEEE), the checksum of a legacy message.
+fn crc32_ieee(data: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &byte in data {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = if crc & 1 == 0 {
+                crc >> 1
+            } else {
+                (crc >> 1) ^ 0xEDB8_8320
+            };
+        }
+    }
+    !crc
+}
+
+/// One legacy MessageSet v0/v1 entry holding `value` (offset, size, CRC, magic,
+/// attributes, a v1 timestamp, a null key, the value), well-formed.
+fn legacy_entry(magic: u8, attributes: u8, value: &[u8]) -> Vec<u8> {
+    let mut body = vec![magic, attributes];
+    if magic == 1 {
+        body.extend_from_slice(&0i64.to_be_bytes());
+    }
+    body.extend_from_slice(&(-1i32).to_be_bytes());
+    body.extend_from_slice(&i32::try_from(value.len()).expect("small").to_be_bytes());
+    body.extend_from_slice(value);
+    let mut entry = 0i64.to_be_bytes().to_vec();
+    entry.extend_from_slice(&i32::try_from(4 + body.len()).expect("small").to_be_bytes());
+    entry.extend_from_slice(&crc32_ieee(&body).to_be_bytes());
+    entry.extend_from_slice(&body);
+    entry
+}
+
+/// Partition data that is not exactly one RecordBatch v2 is refused as Kafka 3.7 refuses
+/// it, and nothing is written: legacy MessageSets (Produce v3+ carries magic 2 only; one
+/// was stored before, a gzip wrapper as one garbage record and a cut-short set as its
+/// prefix), empty or cut-short data and a negative record count are INVALID_RECORD, a bad
+/// CRC is CORRUPT_MESSAGE.
+pub async fn test_produce_of_data_that_is_not_one_v2_batch_is_refused() -> TestResult {
+    println!("=== Test: Produce v3+ partition data must be one RecordBatch v2 ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("net-magic").await;
+    let created = create_topics_raw(vec![creatable(&topic, 1, 1)]).await?;
+    assert_eq!(created[0].error_code, 0, "{created:?}");
+    let mut s = TcpStream::connect(("127.0.0.1", port())).await?;
+
+    let good = plain_batch(&[Bytes::from_static(b"v")], Compression::None);
+    let negative_count = batch_with(&tiny_records(1), -1, BatchHeader::default());
+    let mut bad_crc = good.to_vec();
+    *bad_crc.last_mut().expect("not empty") ^= 1;
+    let mut two_legacy = legacy_entry(1, 0, b"one");
+    two_legacy.extend_from_slice(&legacy_entry(1, 0, b"two"));
+    let mut cut_short_legacy = legacy_entry(0, 0, b"kept");
+    cut_short_legacy.extend_from_slice(&legacy_entry(0, 0, b"lost")[..20]);
+    let cases: Vec<(&str, Bytes, i16)> = vec![
+        (
+            "legacy v0",
+            legacy_entry(0, 0, b"v0").into(),
+            INVALID_RECORD,
+        ),
+        (
+            "legacy v1",
+            legacy_entry(1, 0, b"v1").into(),
+            INVALID_RECORD,
+        ),
+        (
+            "legacy gzip wrapper",
+            legacy_entry(1, 1, b"zz").into(),
+            INVALID_RECORD,
+        ),
+        ("two legacy messages", two_legacy.into(), INVALID_RECORD),
+        (
+            "cut-short legacy set",
+            cut_short_legacy.into(),
+            INVALID_RECORD,
+        ),
+        ("empty", Bytes::new(), INVALID_RECORD),
+        (
+            "cut-short batch",
+            good.slice(..good.len() - 3),
+            INVALID_RECORD,
+        ),
+        ("negative record count", negative_count, INVALID_RECORD),
+        ("bad CRC", bad_crc.into(), CORRUPT_MESSAGE),
+    ];
+    for (corr, (what, data, expected)) in (1..).zip(cases) {
+        let codes = produce_codes(&mut s, corr, &topic, vec![(0, data)]).await?;
+        assert_eq!(codes, vec![expected], "{what}");
+        println!("✅ {what}: {codes:?}");
+    }
+    assert_eq!(
+        stored_rows(ctx.db(), &topic).await?,
+        0,
+        "nothing is written"
+    );
+
+    let codes = produce_codes(&mut s, 100, &topic, vec![(0, good)]).await?;
+    assert_eq!(codes, vec![0]);
+    assert_eq!(stored_rows(ctx.db(), &topic).await?, 1);
+    println!("✅ a valid batch on the same connection is stored");
+
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// An acks=0 Produce at a version the broker does not serve (v10; it serves 3-9) gets no
+/// response, so it cannot be told UNSUPPORTED_VERSION: the broker closes the connection,
+/// as Kafka does, instead of dropping the records unnoticed.
+pub async fn test_unsupported_version_acks0_produce_closes_connection() -> TestResult {
+    println!("=== Test: acks=0 Produce at an unsupported version closes ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("net-acks0-v10").await;
+    let batch = plain_batch(&[Bytes::from_static(b"lost?")], Compression::None);
+
+    let mut s = TcpStream::connect(("127.0.0.1", port())).await?;
+    let request = produce_request(&topic, vec![(0, batch.clone())], 0);
+    s.write_all(&request_frame(10, 1, &request)).await?;
+    let closed = time_until_closed(&mut s, Duration::from_secs(5)).await;
+    assert!(
+        closed.is_some(),
+        "acks=0 Produce v10 must close the connection"
+    );
+    println!("✅ closed after {:?}", closed.unwrap_or_default());
+
+    // acks=1 at the same version is answered UNSUPPORTED_VERSION; the connection stays.
+    let mut s = TcpStream::connect(("127.0.0.1", port())).await?;
+    let request = produce_request(&topic, vec![(0, batch)], 1);
+    s.write_all(&request_frame(10, 2, &request)).await?;
+    let response = read_frame_within(&mut s, Duration::from_secs(5))
+        .await?
+        .ok_or("acks=1 v10 closed instead of answering")?;
+    let (_, resp) = decode_response::<ProduceRequest>(10, &response)?;
+    assert_eq!(
+        resp.responses[0].partition_responses[0].error_code,
+        crate::error_codes::UNSUPPORTED_VERSION
+    );
+    assert!(answers(&mut s, 3).await, "the acks=1 connection stays open");
+    println!("✅ acks=1 v10: UNSUPPORTED_VERSION, connection open");
+
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// UNSUPPORTED_COMPRESSION_TYPE: zstd on Produce v3-v6.
+const UNSUPPORTED_COMPRESSION_TYPE: i16 = 76;
+
+/// The `headers` column of `topic`'s rows as text, and their keys, in offset order.
+async fn stored_keys_and_headers(
+    db: &tokio_postgres::Client,
+    topic: &str,
+) -> DynResult<Vec<(Option<Vec<u8>>, String)>> {
+    Ok(db
+        .query(
+            "SELECT m.key, coalesce(m.headers::text, '') FROM kafka.messages m \
+             JOIN kafka.topics t ON t.id = m.topic_id WHERE t.name = $1 \
+             ORDER BY m.partition_offset",
+            &[&topic],
+        )
+        .await?
+        .iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect())
+}
+
+/// Batches are read with Kafka 3.7's grammar and checks, and nothing else is written:
+/// a 6-byte timestamp-delta varlong (a 5-byte varint reader takes the key that follows
+/// for headers it charged nothing for) holds just its key; duplicate header keys are kept
+/// in order and a non-UTF-8 header key is accepted; a batch of no records (which, from an
+/// idempotent producer, used to enter its batch cache and turn its next batch into a
+/// "duplicate") is INVALID_RECORD, as are a control batch, a lastOffsetDelta that
+/// disagrees with the record count and a base offset other than 0; a magic past 2 is
+/// CORRUPT_MESSAGE; zstd on Produce v3 is UNSUPPORTED_COMPRESSION_TYPE; and bytes after the
+/// batch too few for another batch are ignored.
+pub async fn test_record_batches_are_read_as_kafka_reads_them() -> TestResult {
+    use crate::wire::Wire;
+    println!("=== Test: record batches read as Kafka 3.7 reads them ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("net-grammar").await;
+    let created = create_topics_raw(vec![creatable(&topic, 3, 1)]).await?;
+    assert_eq!(created[0].error_code, 0, "{created:?}");
+    let mut wire = Wire::connect().await?;
+    let x = record(&[
+        &[0],
+        &varint(0),
+        &varint(0),
+        &varint(-1),
+        &varint(1),
+        b"x",
+        &varint(0),
+    ]);
+
+    println!("Step 1: 20 records whose timestamp delta is a 6-byte varlong");
+    let mut key = varint(-1);
+    key.extend(varint(500));
+    for i in 0..500u16 {
+        let (high, low) = (u8::try_from(i / 96)?, u8::try_from(i % 96)?);
+        key.extend_from_slice(&[0x04, 0x20 + high, 0x20 + low, 0x01]);
+    }
+    let key_length = varint(i64::try_from(key.len())?);
+    let shifted = record(&[
+        &[0],
+        &[0x80, 0x80, 0x80, 0x80, 0x80, 0x00],
+        &varint(i64::try_from(key_length.len())?),
+        &key_length,
+        &key,
+        &varint(-1),
+        &varint(0),
+    ]);
+    let batch = batch_with(&shifted.repeat(20), 20, BatchHeader::default());
+    assert_eq!(wire.produce(&topic, 0, batch, None).await?.0, 0);
+    let rows = stored_keys_and_headers(ctx.db(), &topic).await?;
+    assert_eq!(rows.len(), 20);
+    for (stored_key, headers) in &rows {
+        assert_eq!(stored_key.as_deref(), Some(&key[..]), "the key Kafka reads");
+        assert_eq!(headers, "{}", "no headers");
+    }
+    println!(
+        "✅ 20 records, each its {}-byte key and no headers",
+        key.len()
+    );
+
+    println!("Step 2: duplicate and non-UTF-8 header keys");
+    let headed = record(&[
+        &[0],
+        &varint(0),
+        &varint(0),
+        &varint(-1),
+        &varint(1),
+        b"h",
+        &varint(3),
+        &varint(1),
+        b"a",
+        &varint(1),
+        b"1",
+        &varint(1),
+        b"a",
+        &varint(1),
+        b"2",
+        &varint(2),
+        &[0xff, 0xfe],
+        &varint(-1),
+    ]);
+    let batch = batch_with(&headed, 1, BatchHeader::default());
+    assert_eq!(wire.produce(&topic, 0, batch, None).await?.0, 0);
+    let rows = stored_keys_and_headers(ctx.db(), &topic).await?;
+    let headers: serde_json::Value = serde_json::from_str(&rows[20].1)?;
+    assert_eq!(
+        headers,
+        serde_json::json!([["a", "31"], ["a", "32"], ["\u{fffd}\u{fffd}", ""]]),
+        "every header, in order"
+    );
+    println!("✅ stored {headers}");
+
+    println!("Step 3: an idempotent producer's batch of no records, then its first batch");
+    let (code, producer_id, epoch) = wire.init_producer_id(None, 60_000).await?;
+    assert_eq!(code, 0);
+    let idempotent = |count: i32, records: &[u8], base_sequence: i32| {
+        let header = BatchHeader {
+            producer_id,
+            producer_epoch: epoch,
+            base_sequence,
+            last_offset_delta: Some(0),
+            ..BatchHeader::default()
+        };
+        batch_with(records, count, header)
+    };
+    let (code, _) = wire.produce(&topic, 1, idempotent(0, &[], 0), None).await?;
+    assert_eq!(code, INVALID_RECORD, "a batch of no records");
+    for sequence in [0, 1] {
+        let (code, base) = wire
+            .produce(&topic, 1, idempotent(1, &x, sequence), None)
+            .await?;
+        assert_eq!(
+            (code, base),
+            (0, i64::from(sequence)),
+            "sequence {sequence}"
+        );
+    }
+    println!("✅ refused; sequences 0 and 1 then stored at offsets 0 and 1");
+
+    println!("Step 4: batch headers Kafka refuses, and data after a batch it ignores");
+    let with = |header: BatchHeader| batch_with(&x, 1, header);
+    let xy = [
+        x.clone(),
+        record(&[
+            &[0],
+            &varint(0),
+            &varint(1),
+            &varint(-1),
+            &varint(1),
+            b"y",
+            &varint(0),
+        ]),
+    ]
+    .concat();
+    let mut magic9 = with(BatchHeader::default()).to_vec();
+    magic9[16] = 9;
+    let cases: Vec<(&str, Bytes, i16)> = vec![
+        (
+            "a control batch",
+            with(BatchHeader {
+                attributes: 0x20,
+                ..BatchHeader::default()
+            }),
+            INVALID_RECORD,
+        ),
+        (
+            "lastOffsetDelta past the records",
+            batch_with(
+                &xy,
+                2,
+                BatchHeader {
+                    last_offset_delta: Some(5),
+                    ..BatchHeader::default()
+                },
+            ),
+            INVALID_RECORD,
+        ),
+        (
+            "base offset 5",
+            with(BatchHeader {
+                base_offset: 5,
+                ..BatchHeader::default()
+            }),
+            INVALID_RECORD,
+        ),
+        ("magic 9", magic9.into(), CORRUPT_MESSAGE),
+    ];
+    for (what, data, expected) in cases {
+        let (code, _) = wire.produce(&topic, 2, data, None).await?;
+        assert_eq!(code, expected, "{what}");
+        println!("  {what}: {code}");
+    }
+    let zstd = with(BatchHeader {
+        attributes: 4,
+        ..BatchHeader::default()
+    });
+    let mut request = produce_request(&topic, vec![(2, zstd)], -1);
+    request.timeout_ms = 10_000;
+    let response: kafka_protocol::messages::ProduceResponse = wire.call(3, &request).await?;
+    let code = response.responses[0].partition_responses[0].error_code;
+    assert_eq!(code, UNSUPPORTED_COMPRESSION_TYPE, "zstd on Produce v3");
+    println!("  zstd on Produce v3: {code}");
+    assert_eq!(
+        stored_rows(ctx.db(), &topic).await?,
+        23,
+        "nothing more is written"
+    );
+    let trailing = Bytes::from([&with(BatchHeader::default())[..], &[0; 5]].concat());
+    assert_eq!(wire.produce(&topic, 2, trailing, None).await?, (0, 0));
+    assert_eq!(stored_rows(ctx.db(), &topic).await?, 24);
+    println!("✅ refused as Kafka refuses them; 5 trailing bytes ignored");
+
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// A batch's checks run in Kafka 3.7's order (`UnifiedLog.analyzeAndValidateRecords`, then
+/// `LogValidator`): its base offset before its size and CRC, its codec before its header
+/// fields; and a batch that sets the LogAppendTime bit without a maxTimestamp is
+/// INVALID_TIMESTAMP once its records are read. Nothing refused is written.
+pub async fn test_batch_checks_run_in_kafkas_order() -> TestResult {
+    use crate::wire::Wire;
+    println!("=== Test: batch checks in Kafka 3.7's order, LogAppendTime ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("net-order").await;
+    let created = create_topics_raw(vec![creatable(&topic, 1, 1)]).await?;
+    assert_eq!(created[0].error_code, 0, "{created:?}");
+    let mut wire = Wire::connect().await?;
+    let x = record(&[
+        &[0],
+        &varint(0),
+        &varint(0),
+        &varint(-1),
+        &varint(1),
+        b"x",
+        &varint(0),
+    ]);
+    let with = |header: BatchHeader| batch_with(&x, 1, header);
+    let mut base_5_bad_crc = with(BatchHeader {
+        base_offset: 5,
+        ..BatchHeader::default()
+    })
+    .to_vec();
+    base_5_bad_crc[17..21].copy_from_slice(&[0; 4]);
+    // A complete batch of 42 bytes, shorter than a v2 header (61), at base offset 5.
+    let mut short_at_5 = 5i64.to_be_bytes().to_vec();
+    short_at_5.extend_from_slice(&30i32.to_be_bytes());
+    short_at_5.extend_from_slice(&[0, 0, 0, 0, 2]);
+    short_at_5.extend_from_slice(&[0; 25]);
+    let log_append_time = |attributes: i16| {
+        with(BatchHeader {
+            attributes: attributes | 0x08,
+            max_timestamp: Some(-1),
+            ..BatchHeader::default()
+        })
+    };
+    let cases: Vec<(&str, Bytes, i16)> = vec![
+        (
+            "base offset 5 and a bad CRC",
+            base_5_bad_crc.into(),
+            INVALID_RECORD,
+        ),
+        (
+            "a short batch at base offset 5",
+            short_at_5.into(),
+            INVALID_RECORD,
+        ),
+        (
+            "LogAppendTime without a maxTimestamp",
+            log_append_time(0),
+            INVALID_TIMESTAMP,
+        ),
+        (
+            "LogAppendTime without a maxTimestamp, a control batch",
+            log_append_time(0x20),
+            INVALID_RECORD,
+        ),
+    ];
+    for (what, data, expected) in cases {
+        let (code, _) = wire.produce(&topic, 0, data, None).await?;
+        assert_eq!(code, expected, "{what}");
+        println!("  {what}: {code}");
+    }
+    assert_eq!(
+        stored_rows(ctx.db(), &topic).await?,
+        0,
+        "nothing is written"
+    );
+    println!("✅ refused as Kafka refuses them");
+
+    let with_max = with(BatchHeader {
+        attributes: 0x08,
+        base_timestamp: 1_000,
+        max_timestamp: Some(2_000),
+        ..BatchHeader::default()
+    });
+    assert_eq!(wire.produce(&topic, 0, with_max, None).await?, (0, 0));
+    assert_eq!(stored_rows(ctx.db(), &topic).await?, 1);
+    println!("✅ the LogAppendTime bit with a maxTimestamp is accepted");
+
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// UNKNOWN_TOPIC_OR_PARTITION.
+const UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
+
+/// Whether the broker has a topic named `topic`.
+async fn topic_exists(db: &tokio_postgres::Client, topic: &str) -> DynResult<bool> {
+    Ok(db
+        .query_one(
+            "SELECT count(*) FROM kafka.topics WHERE name = $1",
+            &[&topic],
+        )
+        .await?
+        .get::<_, i64>(0)
+        == 1)
+}
+
+/// Produce validation answers each partition, as Kafka 3.7 does
+/// (`KafkaApis.handleProduceRequest`): a partition whose data fails validation gets its own
+/// error and the request's valid partitions are written; a partition of an unknown topic,
+/// or outside its topic, is UNKNOWN_TOPIC_OR_PARTITION whatever its data (the topic is not
+/// created for it). Only a first batch whose length or magic Kafka cannot read
+/// (`RequestUtils.hasTransactionalRecords`) fails the whole request, CORRUPT_MESSAGE on
+/// every partition. A refused partition leaves an idempotent producer's sequence and a
+/// transaction alone, and an acks=0 request with one closes the connection after its
+/// valid partitions are written.
+pub async fn test_produce_validation_answers_each_partition() -> TestResult {
+    use crate::wire::records::batch;
+    use crate::wire::Wire;
+    println!("=== Test: Produce validation answers each partition ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("net-per-part").await;
+    let unknown = ctx.unique_topic("net-per-part-unknown").await;
+    let created = create_topics_raw(vec![creatable(&topic, 3, 1)]).await?;
+    assert_eq!(created[0].error_code, 0, "{created:?}");
+    let mut wire = Wire::connect().await?;
+    let good = || plain_batch(&[Bytes::from_static(b"v")], Compression::None);
+    let bad_crc = |batch: Bytes| {
+        let mut b = batch.to_vec();
+        *b.last_mut().expect("not empty") ^= 1;
+        Bytes::from(b)
+    };
+    // A batch length under 14: Kafka cannot size the batch.
+    let mut unsizable = 0i64.to_be_bytes().to_vec();
+    unsizable.extend_from_slice(&13i32.to_be_bytes());
+    unsizable.extend_from_slice(&[0; 14]);
+    let unsizable = Bytes::from(unsizable);
+
+    println!("Step 1: one request, partitions refused for different reasons");
+    let two_batches = Bytes::from([&good()[..], &good()[..]].concat());
+    let got = wire
+        .produce_many(
+            &[
+                (
+                    &topic,
+                    vec![
+                        (0, bad_crc(good())),
+                        (1, good()),
+                        (2, two_batches),
+                        (7, bad_crc(good())),
+                    ],
+                ),
+                (&unknown, vec![(0, bad_crc(good()))]),
+            ],
+            None,
+        )
+        .await?;
+    let codes: Vec<(String, i32, i16)> =
+        got.iter().map(|(t, p, c, _)| (t.clone(), *p, *c)).collect();
+    let mut expected = vec![
+        (topic.clone(), 0, CORRUPT_MESSAGE),
+        (topic.clone(), 1, 0),
+        (topic.clone(), 2, INVALID_RECORD),
+        (topic.clone(), 7, UNKNOWN_TOPIC_OR_PARTITION),
+        (unknown.clone(), 0, UNKNOWN_TOPIC_OR_PARTITION),
+    ];
+    expected.sort();
+    assert_eq!(codes, expected);
+    assert_eq!(
+        stored_rows(ctx.db(), &topic).await?,
+        1,
+        "the valid partition"
+    );
+    assert!(!topic_exists(ctx.db(), &unknown).await?, "not created");
+    println!("✅ {codes:?}; the valid partition stored, the unknown topic not created");
+
+    println!("Step 2: a first batch Kafka cannot size fails the whole request");
+    for other in [&topic, &unknown] {
+        let got = wire
+            .produce_many(
+                &[
+                    (other, vec![(0, unsizable.clone())]),
+                    (&topic, vec![(1, good())]),
+                ],
+                None,
+            )
+            .await?;
+        assert!(
+            got.iter().all(|(_, _, code, _)| *code == CORRUPT_MESSAGE),
+            "{got:?}"
+        );
+    }
+    let trailing = Bytes::from([&good()[..], &unsizable[..12]].concat());
+    let got = wire
+        .produce_many(&[(&topic, vec![(0, trailing), (1, good())])], None)
+        .await?;
+    let codes: Vec<i16> = got.iter().map(|(_, _, code, _)| *code).collect();
+    assert_eq!(
+        codes,
+        vec![CORRUPT_MESSAGE, 0],
+        "after the first batch: that partition"
+    );
+    assert_eq!(stored_rows(ctx.db(), &topic).await?, 2);
+    println!("✅ every partition CORRUPT_MESSAGE; past the first batch only its partition");
+
+    println!("Step 3: zstd on Produce v3 is refused on its partition only");
+    let zstd = batch_with(
+        &good()[61..],
+        1,
+        BatchHeader {
+            attributes: 4,
+            ..BatchHeader::default()
+        },
+    );
+    let mut request = produce_request(&topic, vec![(0, zstd), (1, good())], -1);
+    request.timeout_ms = 10_000;
+    let response: kafka_protocol::messages::ProduceResponse = wire.call(3, &request).await?;
+    let mut codes: Vec<(i32, i16)> = response.responses[0]
+        .partition_responses
+        .iter()
+        .map(|p| (p.index, p.error_code))
+        .collect();
+    codes.sort_unstable();
+    assert_eq!(codes, vec![(0, UNSUPPORTED_COMPRESSION_TYPE), (1, 0)]);
+    assert_eq!(stored_rows(ctx.db(), &topic).await?, 3);
+    println!("✅ {codes:?}");
+
+    println!("Step 4: an idempotent producer's refused partition keeps its sequence");
+    let (code, producer_id, epoch) = wire.init_producer_id(None, 60_000).await?;
+    assert_eq!(code, 0);
+    let seq0 = || batch(&["i"], producer_id, epoch, 0, false, None);
+    let got = wire
+        .produce_many(&[(&topic, vec![(0, bad_crc(seq0())), (1, seq0())])], None)
+        .await?;
+    let codes: Vec<i16> = got.iter().map(|(_, _, code, _)| *code).collect();
+    assert_eq!(codes, vec![CORRUPT_MESSAGE, 0]);
+    assert_eq!(
+        wire.produce(&topic, 0, seq0(), None).await?.0,
+        0,
+        "sequence 0 on p0"
+    );
+    assert_eq!(stored_rows(ctx.db(), &topic).await?, 5);
+    println!("✅ refused, then its sequence 0 accepted");
+
+    println!("Step 5: a transaction writes its valid partition");
+    let txn = format!("{topic}-txn");
+    let (code, producer_id, epoch) = wire.init_producer_id(Some(&txn), 60_000).await?;
+    assert_eq!(code, 0);
+    let added = wire
+        .add_partitions(&txn, producer_id, epoch, &[(&topic, &[0, 1])])
+        .await?;
+    assert!(added.iter().all(|(_, _, code)| *code == 0), "{added:?}");
+    let txn_batch = || batch(&["t"], producer_id, epoch, 0, true, None);
+    let got = wire
+        .produce_many(
+            &[(&topic, vec![(0, txn_batch()), (1, bad_crc(txn_batch()))])],
+            Some(&txn),
+        )
+        .await?;
+    let codes: Vec<i16> = got.iter().map(|(_, _, code, _)| *code).collect();
+    assert_eq!(codes, vec![0, CORRUPT_MESSAGE]);
+    assert_eq!(wire.end_txn(&txn, producer_id, epoch, true).await?, 0);
+    let committed: i64 = ctx
+        .db()
+        .query_one(
+            "SELECT count(*) FROM kafka.messages m JOIN kafka.topics t ON t.id = m.topic_id \
+             WHERE t.name = $1 AND m.txn_state IS NULL",
+            &[&topic],
+        )
+        .await?
+        .get(0);
+    assert_eq!(committed, 6, "the transaction's valid partition committed");
+    println!("✅ [0, CORRUPT_MESSAGE]; the transaction commits its partition");
+
+    println!("Step 6: acks=0 writes the valid partition, then closes");
+    let mut s = TcpStream::connect(("127.0.0.1", port())).await?;
+    let request = produce_request(&topic, vec![(0, bad_crc(good())), (1, good())], 0);
+    s.write_all(&request_frame(7, 1, &request)).await?;
+    assert!(
+        time_until_closed(&mut s, Duration::from_secs(10))
+            .await
+            .is_some(),
+        "the connection closes"
+    );
+    assert_eq!(stored_rows(ctx.db(), &topic).await?, 7);
+    println!("✅ closed; the valid partition stored");
+
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// Each partition's error code of a Produce of `parts` to `topic`, in partition order.
+async fn partition_codes(
+    wire: &mut crate::wire::Wire,
+    topic: &str,
+    parts: Vec<(i32, Bytes)>,
+    transactional_id: Option<&str>,
+) -> DynResult<Vec<i16>> {
+    let got = wire
+        .produce_many(&[(topic, parts)], transactional_id)
+        .await?;
+    Ok(got.iter().map(|(_, _, code, _)| *code).collect())
+}
+
+/// The request-wide decode limit composes with per-partition answers as Kafka 3.7 answers
+/// them: a partition whose records do not match its count is INVALID_RECORD however many it
+/// declares, a partition refused after it decoded leaves its memory to the partitions after
+/// it, and a partition that does not fit in what its request may still hold is
+/// MESSAGE_TOO_LARGE on its own (Kafka refuses a batch past `message.max.bytes` so). The
+/// other partitions are written in every case. Each request below was refused whole, and
+/// nothing of it written.
+pub async fn test_the_decode_limit_refuses_partitions_on_their_own() -> TestResult {
+    use crate::wire::Wire;
+    println!("=== Test: the decode limit refuses partitions on their own ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("net-limit-part").await;
+    let created = create_topics_raw(vec![creatable(&topic, 2, 1)]).await?;
+    assert_eq!(created[0].error_code, 0, "{created:?}");
+    let mut wire = Wire::connect().await?;
+    let good = || plain_batch(&[Bytes::from_static(b"v")], Compression::None);
+    let zeros = |n: usize| Bytes::from(vec![0u8; n]);
+    let one = tiny_records(1);
+
+    println!("Step 1: one record declared as 2 million (176 MB of records), next to a valid one");
+    for (what, last_offset_delta) in [("lastOffsetDelta 0", Some(0)), ("consistent", None)] {
+        let liar = batch_with(
+            &one,
+            2_000_000,
+            BatchHeader {
+                last_offset_delta,
+                ..BatchHeader::default()
+            },
+        );
+        let codes = partition_codes(&mut wire, &topic, vec![(0, good()), (1, liar)], None).await?;
+        assert_eq!(codes, vec![0, INVALID_RECORD], "{what}");
+    }
+    assert_eq!(stored_rows(ctx.db(), &topic).await?, 2);
+    println!("✅ [0, INVALID_RECORD]; the valid partition stored");
+
+    println!("Step 2: 1.1 million records declared (97 MB) over one, then a 4 MB gzip batch");
+    let liar = batch_with(&one, 1_100_000, BatchHeader::default());
+    let gzip = plain_batch(&[zeros(4_000_000)], Compression::Gzip);
+    let codes = partition_codes(&mut wire, &topic, vec![(0, liar), (1, gzip)], None).await?;
+    assert_eq!(codes, vec![INVALID_RECORD, 0]);
+    assert_eq!(stored_rows(ctx.db(), &topic).await?, 3);
+    println!("✅ [INVALID_RECORD, 0]");
+
+    println!("Step 3: 60 MB refused for its LogAppendTime type once decoded, then 60 MB");
+    let section = plain_batch(&[zeros(60_000_000)], Compression::Gzip);
+    let log_append_time = batch_with(
+        &section[61..],
+        1,
+        BatchHeader {
+            attributes: 0x09,
+            max_timestamp: Some(-1),
+            ..BatchHeader::default()
+        },
+    );
+    let codes = partition_codes(
+        &mut wire,
+        &topic,
+        vec![(0, log_append_time), (1, section.clone())],
+        None,
+    )
+    .await?;
+    assert_eq!(codes, vec![INVALID_TIMESTAMP, 0]);
+    assert_eq!(stored_rows(ctx.db(), &topic).await?, 4);
+    println!("✅ [INVALID_TIMESTAMP, 0]");
+
+    println!("Step 4: a valid partition, then 150 MB of gzip-compressed zeros");
+    let big = plain_batch(&[zeros(150_000_000)], Compression::Gzip);
+    let codes = partition_codes(&mut wire, &topic, vec![(0, good()), (1, big)], None).await?;
+    assert_eq!(codes, vec![0, MESSAGE_TOO_LARGE]);
+    assert_eq!(stored_rows(ctx.db(), &topic).await?, 5);
+    println!("✅ [0, MESSAGE_TOO_LARGE]");
+
+    println!("Step 5: snappy data declaring 4 GB, then a valid partition");
+    let snappy = batch_around(&[0xff, 0xff, 0xff, 0xff, 0x0f, 0, 0, 0, 0], 1, 2);
+    let codes = partition_codes(&mut wire, &topic, vec![(0, snappy), (1, good())], None).await?;
+    assert_eq!(codes, vec![MESSAGE_TOO_LARGE, 0]);
+    assert_eq!(stored_rows(ctx.db(), &topic).await?, 6);
+    println!("✅ [MESSAGE_TOO_LARGE, 0]");
+
+    println!("Step 6: acks=0 with a partition declaring 2 million records writes the other");
+    let mut s = TcpStream::connect(("127.0.0.1", port())).await?;
+    let liar = batch_with(&one, 2_000_000, BatchHeader::default());
+    let request = produce_request(&topic, vec![(0, good()), (1, liar)], 0);
+    s.write_all(&request_frame(7, 1, &request)).await?;
+    assert!(
+        time_until_closed(&mut s, Duration::from_secs(10))
+            .await
+            .is_some(),
+        "the connection closes"
+    );
+    assert_eq!(stored_rows(ctx.db(), &topic).await?, 7);
+    println!("✅ closed; the valid partition stored");
+
+    rdkafka_roundtrip(client_config(port()), &topic, 3).await?;
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// TRANSACTIONAL_ID_AUTHORIZATION_FAILED.
+const TRANSACTIONAL_ID_AUTHORIZATION_FAILED: i16 = 53;
+
+/// A Produce carrying a transactional batch without a transactional id is refused on every
+/// partition with TRANSACTIONAL_ID_AUTHORIZATION_FAILED and nothing of it is written, as
+/// Kafka 3.7 refuses it (`KafkaApis.handleProduceRequest`). Its records were written as
+/// committed, outside any transaction.
+pub async fn test_transactional_batches_need_a_transactional_id() -> TestResult {
+    use crate::wire::records::batch;
+    use crate::wire::Wire;
+    println!("=== Test: transactional batches need a transactional id ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("net-txn-noid").await;
+    let created = create_topics_raw(vec![creatable(&topic, 2, 1)]).await?;
+    assert_eq!(created[0].error_code, 0, "{created:?}");
+    let mut wire = Wire::connect().await?;
+    let txn = format!("{topic}-txn");
+    let (code, producer_id, epoch) = wire.init_producer_id(Some(&txn), 60_000).await?;
+    assert_eq!(code, 0);
+    let added = wire
+        .add_partitions(&txn, producer_id, epoch, &[(&topic, &[0, 1])])
+        .await?;
+    assert!(added.iter().all(|(_, _, code)| *code == 0), "{added:?}");
+    let transactional = || batch(&["t"], producer_id, epoch, 0, true, None);
+    let good = || plain_batch(&[Bytes::from_static(b"v")], Compression::None);
+
+    println!("Step 1: a transactional batch without a transactional id, first or second");
+    for parts in [
+        vec![(0, transactional()), (1, good())],
+        vec![(0, good()), (1, transactional())],
+    ] {
+        let codes = partition_codes(&mut wire, &topic, parts, None).await?;
+        assert_eq!(codes, vec![TRANSACTIONAL_ID_AUTHORIZATION_FAILED; 2]);
+    }
+    assert_eq!(stored_rows(ctx.db(), &topic).await?, 0, "nothing written");
+    println!("✅ TRANSACTIONAL_ID_AUTHORIZATION_FAILED on every partition; nothing written");
+
+    println!("Step 2: acks=0 closes the connection and writes nothing");
+    let mut s = TcpStream::connect(("127.0.0.1", port())).await?;
+    let request = produce_request(&topic, vec![(0, good()), (1, transactional())], 0);
+    s.write_all(&request_frame(7, 1, &request)).await?;
+    assert!(
+        time_until_closed(&mut s, Duration::from_secs(10))
+            .await
+            .is_some(),
+        "the connection closes"
+    );
+    assert_eq!(stored_rows(ctx.db(), &topic).await?, 0, "nothing written");
+    println!("✅ closed; nothing written");
+
+    println!("Step 3: with its transactional id the same batch is written in the transaction");
+    let codes = partition_codes(&mut wire, &topic, vec![(0, transactional())], Some(&txn)).await?;
+    assert_eq!(codes, vec![0]);
+    assert_eq!(wire.end_txn(&txn, producer_id, epoch, true).await?, 0);
+    assert_eq!(stored_rows(ctx.db(), &topic).await?, 1);
+    println!("✅ written and committed");
+
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}

@@ -2,6 +2,7 @@
 //!
 //! Validates transactional producer commit/abort flows using rdkafka.
 
+use crate::common::to_i64;
 use crate::common::{create_db_client, create_transactional_producer, TestResult};
 use rdkafka::producer::{FutureRecord, Producer};
 use std::time::Duration;
@@ -44,7 +45,7 @@ pub async fn test_transactional_producer_commit() -> TestResult {
     // Produce a message within the transaction
     let key = "txn-key-1";
     let payload = "Transactional message for commit test";
-    println!("Producing message to topic '{}'...", topic);
+    println!("Producing message to topic '{topic}'...");
 
     let (partition, offset) = producer
         .send(
@@ -53,13 +54,10 @@ pub async fn test_transactional_producer_commit() -> TestResult {
         )
         .await
         .map_err(|(err, _msg)| {
-            println!("  Failed to deliver message: {}", err);
+            println!("  Failed to deliver message: {err}");
             err
         })?;
-    println!(
-        "  Message queued: partition={}, offset={}\n",
-        partition, offset
-    );
+    println!("  Message queued: partition={partition}, offset={offset}\n");
 
     // Commit the transaction
     println!("Committing transaction...");
@@ -83,9 +81,9 @@ pub async fn test_transactional_producer_commit() -> TestResult {
             let producer_id: i64 = row.get(1);
             let producer_epoch: i16 = row.get(2);
             println!("  Transaction row found:");
-            println!("    state: {}", state);
-            println!("    producer_id: {}", producer_id);
-            println!("    producer_epoch: {}", producer_epoch);
+            println!("    state: {state}");
+            println!("    producer_id: {producer_id}");
+            println!("    producer_epoch: {producer_epoch}");
 
             assert_eq!(
                 state, "CompleteCommit",
@@ -117,8 +115,8 @@ pub async fn test_transactional_producer_commit() -> TestResult {
     let msg_producer_id: Option<i64> = msg_row.get(1);
 
     println!("  Message row:");
-    println!("    txn_state: {:?}", txn_state);
-    println!("    producer_id: {:?}", msg_producer_id);
+    println!("    txn_state: {txn_state:?}");
+    println!("    producer_id: {msg_producer_id:?}");
 
     assert!(
         txn_state.is_none(),
@@ -168,7 +166,7 @@ pub async fn test_transactional_producer_abort() -> TestResult {
     // Produce a message within the transaction
     let key = "txn-key-abort";
     let payload = "Transactional message for abort test";
-    println!("Producing message to topic '{}'...", topic);
+    println!("Producing message to topic '{topic}'...");
 
     let (partition, offset) = producer
         .send(
@@ -177,13 +175,10 @@ pub async fn test_transactional_producer_abort() -> TestResult {
         )
         .await
         .map_err(|(err, _msg)| {
-            println!("  Failed to deliver message: {}", err);
+            println!("  Failed to deliver message: {err}");
             err
         })?;
-    println!(
-        "  Message queued: partition={}, offset={}\n",
-        partition, offset
-    );
+    println!("  Message queued: partition={partition}, offset={offset}\n");
 
     // Abort the transaction
     println!("Aborting transaction...");
@@ -207,9 +202,9 @@ pub async fn test_transactional_producer_abort() -> TestResult {
             let producer_id: i64 = row.get(1);
             let producer_epoch: i16 = row.get(2);
             println!("  Transaction row found:");
-            println!("    state: {}", state);
-            println!("    producer_id: {}", producer_id);
-            println!("    producer_epoch: {}", producer_epoch);
+            println!("    state: {state}");
+            println!("    producer_id: {producer_id}");
+            println!("    producer_epoch: {producer_epoch}");
 
             assert_eq!(
                 state, "CompleteAbort",
@@ -240,7 +235,7 @@ pub async fn test_transactional_producer_abort() -> TestResult {
     let txn_state: Option<String> = msg_row.get(0);
 
     println!("  Message row:");
-    println!("    txn_state: {:?}", txn_state);
+    println!("    txn_state: {txn_state:?}");
 
     assert_eq!(
         txn_state,
@@ -259,7 +254,7 @@ pub async fn test_transactional_producer_abort() -> TestResult {
         .await?
         .get(0);
 
-    println!("  Visible messages (txn_state IS NULL): {}", visible_count);
+    println!("  Visible messages (txn_state IS NULL): {visible_count}");
     assert_eq!(
         visible_count, 0,
         "Aborted message should not be visible to read_committed"
@@ -321,10 +316,7 @@ pub async fn test_transactional_batch() -> TestResult {
             )
             .await
             .map_err(|(err, _msg)| err)?;
-        println!(
-            "  Queued: key={}, partition={}, offset={}",
-            key, partition, offset
-        );
+        println!("  Queued: key={key}, partition={partition}, offset={offset}");
         offsets.push(offset);
     }
     println!();
@@ -351,10 +343,10 @@ pub async fn test_transactional_batch() -> TestResult {
         .await?
         .get(0);
 
-    println!("  Visible messages: {}", visible_count);
+    println!("  Visible messages: {visible_count}");
     assert_eq!(
         visible_count,
-        messages.len() as i64,
+        to_i64(messages.len()),
         "All {} messages should be visible after commit",
         messages.len()
     );
@@ -411,7 +403,7 @@ pub async fn test_producer_fencing() -> TestResult {
             }
         }
     };
-    println!("  First producer epoch: {}", epoch1);
+    println!("  First producer epoch: {epoch1}");
 
     // Begin transaction on first producer
     println!("\nBeginning transaction on first producer...");
@@ -468,19 +460,14 @@ pub async fn test_producer_fencing() -> TestResult {
             }
         }
     };
-    println!("  Second producer epoch: {}", epoch2);
+    println!("  Second producer epoch: {epoch2}");
 
     // Verify epoch was bumped
     assert!(
         epoch2 > epoch1,
-        "Second producer epoch ({}) should be greater than first ({})",
-        epoch2,
-        epoch1
+        "Second producer epoch ({epoch2}) should be greater than first ({epoch1})"
     );
-    println!(
-        "  Epoch bumped: {} -> {} (fencing confirmed)\n",
-        epoch1, epoch2
-    );
+    println!("  Epoch bumped: {epoch1} -> {epoch2} (fencing confirmed)\n");
 
     // Try to produce with the fenced producer
     println!("Attempting to produce with fenced producer...");
@@ -494,10 +481,7 @@ pub async fn test_producer_fencing() -> TestResult {
     match result2 {
         Ok((partition, offset)) => {
             // Message was queued - try to commit (this should fail)
-            println!(
-                "  Message queued: partition={}, offset={}",
-                partition, offset
-            );
+            println!("  Message queued: partition={partition}, offset={offset}");
             println!("  Attempting to commit with fenced producer...");
 
             let commit_result = producer1.commit_transaction(Duration::from_secs(10));
@@ -520,7 +504,7 @@ pub async fn test_producer_fencing() -> TestResult {
                             .get(0);
 
                         // If first message visible but second isn't, fencing worked
-                        println!("  Visible messages: {}", visible_count);
+                        println!("  Visible messages: {visible_count}");
                         if visible_count <= 1 {
                             println!("  Fencing prevented duplicate commits");
                         }
@@ -529,7 +513,7 @@ pub async fn test_producer_fencing() -> TestResult {
                 Err(e) => {
                     // Expected! The fenced producer should fail
                     let err_str = e.to_string().to_lowercase();
-                    println!("  Commit failed as expected: {}", e);
+                    println!("  Commit failed as expected: {e}");
 
                     let is_fencing_error = err_str.contains("fenced")
                         || err_str.contains("epoch")
@@ -547,7 +531,7 @@ pub async fn test_producer_fencing() -> TestResult {
         Err((err, _msg)) => {
             // The produce itself failed - this is also valid fencing behavior
             let err_str = err.to_string().to_lowercase();
-            println!("  Produce failed: {}", err);
+            println!("  Produce failed: {err}");
 
             let is_fencing_error = err_str.contains("fenced")
                 || err_str.contains("epoch")
@@ -574,11 +558,8 @@ pub async fn test_producer_fencing() -> TestResult {
     let final_state: String = txn_state.get(0);
     let final_epoch: i16 = txn_state.get(1);
 
-    println!("  Transaction state: {}", final_state);
-    println!(
-        "  Current epoch: {} (should match second producer: {})",
-        final_epoch, epoch2
-    );
+    println!("  Transaction state: {final_state}");
+    println!("  Current epoch: {final_epoch} (should match second producer: {epoch2})");
 
     // The epoch should be the newer one (from producer2)
     assert_eq!(final_epoch, epoch2, "Epoch should match second producer");

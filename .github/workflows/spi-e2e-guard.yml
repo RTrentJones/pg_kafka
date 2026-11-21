@@ -1,0 +1,46 @@
+name: QA-1 guard
+
+# QA-1 enforcement (see codecov.yml + CLAUDE.md): the SPI/async files excluded from unit
+# coverage (and the qa1-guard files) can't be caught by the codecov gate, so a behavioural
+# change to one of them must ship a kafka_test E2E regression test.
+#
+# A workflow of its own so that adding or removing the 'no-e2e-needed' label re-runs only this
+# check: `labeled`/`unlabeled` in ci.yml would restart (and, through its concurrency group,
+# cancel) the whole build.
+on:
+  pull_request:
+    branches: [ main ]
+    types: [ opened, synchronize, reopened, labeled, unlabeled ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  spi-e2e-guard:
+    name: SPI change needs E2E test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require a kafka_test change when an SPI/async file changes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          # Every changed path, all pages (the API returns at most 100 per page and the
+          # first page alone would pass a large PR unchecked); a rename counts under both its
+          # old and its new name. Fetched first so an API failure fails the job instead of
+          # feeding the guard an empty list.
+          gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files?per_page=100" \
+            --jq '.[] | .filename, (.previous_filename // empty)' > "$RUNNER_TEMP/changed"
+          # The labels as they are now, not as the triggering event saw them, so a re-run
+          # after labelling sees the label.
+          PR_LABELS="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" \
+            --jq '[.labels[].name] | join(",")')"
+          export PR_LABELS
+          bash .github/scripts/require-e2e-for-spi.sh < "$RUNNER_TEMP/changed"

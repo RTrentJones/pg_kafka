@@ -17,9 +17,9 @@ From inside the devcontainer, run:
 
 # Or run individual steps:
 ./scripts/run-shadow-tests.sh --setup-only    # Setup only (Docker + PostgreSQL + build)
-./scripts/run-shadow-tests.sh --test-only     # Build the test client if stale, then run tests (assumes setup done)
-./scripts/run-shadow-tests.sh --docker-only   # Just start Docker containers
-./scripts/run-shadow-tests.sh --skip-docker   # Skip Docker, just setup PostgreSQL
+./scripts/run-shadow-tests.sh --test-only     # Build the test client, then run tests (assumes setup done)
+./scripts/run-shadow-tests.sh --docker-only   # Just start the external Kafka container
+./scripts/run-shadow-tests.sh --skip-docker   # Everything but starting the container
 
 # Run a specific test
 ./scripts/run-shadow-tests.sh --test test_dual_write_sync
@@ -27,21 +27,20 @@ From inside the devcontainer, run:
 
 ## What the Script Does
 
-1. **Start Docker containers** - Starts `external_kafka` if not running (recreates it if it is running but unhealthy), then waits for the broker API, metadata requests, and topic creation to work
-2. **Build pg_kafka extension** - Compiles with `cargo build --features pg14`
-3. **Restart PostgreSQL** - Uses `./scripts/restart.sh` to load the extension
-4. **Configure GUCs** - Sets the shadow mode PostgreSQL parameters with `ALTER SYSTEM`:
+1. **Start external Kafka** - Starts `external_kafka` (recreates it if it is running but unhealthy), then waits for the broker API and for topic creation to work, and warns if the container's address is not the `172.18.0.2` that `docker-compose.yml` advertises
+2. **Rebuild and restart PostgreSQL** - `PG_MAJOR=14 ./scripts/restart.sh` builds and installs the extension and restarts the pgrx-managed PostgreSQL 14, keeping the data
+3. **Configure GUCs** - Sets the shadow mode PostgreSQL parameters with `ALTER SYSTEM`:
    - `pg_kafka.shadow_mode_enabled = 'true'`
    - `pg_kafka.shadow_bootstrap_servers = '<kafka_ip>:9095'`
    - `pg_kafka.shadow_security_protocol = 'PLAINTEXT'`
    - `pg_kafka.shadow_max_retries = '20'`
    - `pg_kafka.shadow_retry_backoff_ms = '500'`
    - `pg_kafka.config_reload_interval_ms = '2000'`
-5. **Reload and wait** - Runs `SELECT pg_reload_conf()` and waits 1 second; the background worker handles the SIGHUP on its next loop iteration (every 100 ms), so no reload-interval wait is needed
-6. **Build test client** - Compiles `kafka_test` in release mode if the binary is missing or older than `kafka_test/src`
-7. **Run tests** - Executes the `shadow` test category (or the single test passed with `--test`)
+4. **Reload and wait** - Runs `SELECT pg_reload_conf()` and waits 1 second; the background worker handles the SIGHUP on its next loop iteration (at most 100 ms later), so no reload-interval wait is needed
+5. **Build the test client** - `cargo build --release` in `kafka_test/`
+6. **Run tests** - Executes the `shadow` test category (or the single test passed with `--test`)
 
-Each test also re-applies the GUCs it needs through `enable_shadow_mode()` in `kafka_test/src/shadow/helpers.rs`, so step 4 mainly matters for manual runs.
+Each test also re-applies the GUCs it needs through `enable_shadow_mode()` in `kafka_test/src/shadow/helpers.rs`, so step 3 mainly matters for manual runs.
 
 ## Network Architecture
 
@@ -50,6 +49,36 @@ The shadow mode tests require communication between:
 1. **Host machine**: Runs E2E test code, connects to external Kafka via `localhost:9093`
 2. **pg_kafka_dev container**: Runs PostgreSQL with pg_kafka extension
 3. **external_kafka container**: External Kafka broker for shadow forwarding
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                              HOST MACHINE                                     │
+│                                                                              │
+│   ┌────────────────────────────────────────────────────────────────────┐    │
+│   │  E2E Test Process (kafka_test)                                      │    │
+│   │  Connects to external Kafka via localhost:9093 (EXTERNAL listener)  │    │
+│   │  Connects to PostgreSQL / pg_kafka via forwarded ports              │    │
+│   └──────────────────────────────┬─────────────────────────────────────┘    │
+│                                  │ Port forwarding                           │
+│                                  ▼                                           │
+├──────────────── DOCKER NETWORK pg_kafka_network (172.18.0.0/16) ────────────┤
+│                                                                              │
+│   ┌─────────────────────┐         ┌─────────────────────────────────┐       │
+│   │   pg_kafka_dev      │         │   external-kafka  (172.18.0.2)  │       │
+│   │   container         │         │                                 │       │
+│   │                     │────────▶│   :9095 CONTAINER listener      │       │
+│   │   pg_kafka extension│ docker  │   Advertises: 172.18.0.2:9095   │       │
+│   │   GUC set by tests: │ network │                                 │       │
+│   │   172.18.0.2:9095   │         │   :9094 INTERNAL (inter-broker) │       │
+│   │                     │         │   Advertises: external-kafka:9094│      │
+│   │                     │         │                                 │       │
+│   │                     │         │   :9093 EXTERNAL listener       │◀──────┤
+│   │                     │         │   Advertises: localhost:9093    │  port │
+│   └─────────────────────┘         │                                 │  fwd  │
+│                                   │   :29094 CONTROLLER (KRaft)     │       │
+│                                   └─────────────────────────────────┘       │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
 
 ### Kafka Listeners
 
@@ -120,6 +149,11 @@ Column values: `mode` is `local_only` or `shadow`; `forward_percentage` is 0-100
 
 ## Troubleshooting
 
+### External Kafka Not Running
+
+The tests first fetch metadata from the broker on `localhost:9093` and fail after 10 s with the
+metadata error when it is down. Start it with `docker compose up -d external-kafka`.
+
 ### Connection Refused Errors
 
 If you see errors like:
@@ -129,18 +163,31 @@ external-kafka:9095/1: Connect to ipv4#172.23.0.2:9095 failed: Connection refuse
 
 The IP `172.23.0.2` is stale. Fix by:
 
-1. Verify actual Kafka IP: `docker inspect external_kafka | grep IPAddress`
+1. Verify actual Kafka IP: `docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' external_kafka`
 2. If it is not `172.18.0.2`, another network on the host may already claim the `172.18.0.0/16` subnet; free it, or change the subnet, `ipv4_address`, and CONTAINER advertised listener together in `docker-compose.yml` and set `INTERNAL_KAFKA_BOOTSTRAP_SERVERS` to match
 3. Recreate Kafka container: `docker-compose up -d --force-recreate external-kafka`
-4. Restart PostgreSQL: `./scripts/restart.sh`
+4. Restart PostgreSQL: `./scripts/restart.sh` (rebuilds and restarts, keeping the data; `--fresh` would also drop and recreate the extension, deleting all pg_kafka data)
 
-### Producer Cache Issues
+### Producer Settings Changes
 
-If the producer uses old bootstrap servers after a GUC change:
+The forwarding producer lives in the network thread (`run_shadow_forwarder` in
+`src/kafka/shadow/forwarder_task.rs`). It is rebuilt whenever any producer GUC changes (bootstrap
+servers, security protocol, SASL, CA, batch size, linger, backoff), within about 0.5 s of the reload
+(`SELECT pg_reload_conf()`); no restart is needed. Every shadow GUC is `Sighup`: set it with
+`ALTER SYSTEM` (a session `SET` is refused).
 
-1. The forwarding producer lives in the network thread (`run_shadow_forwarder` in `src/kafka/listener.rs`) and is rebuilt when the reloaded `pg_kafka.shadow_bootstrap_servers` differs from the value it was built with
-2. Make sure the change was reloaded (`SELECT pg_reload_conf()`); the forwarder reads the worker's reloaded config snapshot
-3. Other producer settings (batch size, linger, retries, SASL/SSL) are applied only when the producer is rebuilt, so restart PostgreSQL to force a fresh producer: `./scripts/restart.sh`
+### Running Against a Local Kafka Without Docker
+
+Any Apache Kafka reachable from Postgres works. For example, a KRaft broker on `127.0.0.1:9093`:
+set `pg_kafka.shadow_bootstrap_servers = '127.0.0.1:9093'` (plus the other GUCs above) and run the
+suite with `INTERNAL_KAFKA_BOOTSTRAP_SERVERS=127.0.0.1:9093 EXTERNAL_KAFKA_BOOTSTRAP_SERVERS=127.0.0.1:9093`.
+The order test creates and alters an external topic through the admin API, so the broker must allow
+it (the default does).
+The delivery-timeout order test pauses and resumes the broker with the shell commands in
+`EXTERNAL_KAFKA_PAUSE_CMD` / `EXTERNAL_KAFKA_RESUME_CMD` (default `docker pause external_kafka` /
+`docker unpause external_kafka`); without Docker, stop the broker's process instead, for example
+`pkill -STOP -f '[k]afka.Kafka'` / `pkill -CONT -f '[k]afka.Kafka'` (the bracket keeps the pattern
+from matching the `sh -c` that runs it).
 
 ### DNS Resolution
 
@@ -153,13 +200,13 @@ Should show `172.18.0.2` (or current actual IP). If it shows a different IP, Doc
 
 ## Test Categories
 
-The `shadow` category registers 27 tests in `kafka_test/src/main.rs`, all `parallel_safe: false`:
+The `shadow` category's tests are listed in `tests()` in `kafka_test/src/shadow/mod.rs`; all but `test_shadow_lag_view_is_per_partition` are sequential (`cargo run --release -- --list` prints the live set under `shadow:`):
 
 | Test | Description |
 |------|-------------|
 | `test_dual_write_sync` | DualWrite + sync: stored locally and delivered to external Kafka |
 | `test_dual_write_async` | DualWrite + async: stored locally and delivered by the outbox poll |
-| `test_async_forwarding_no_duplicates_on_slow_ack` | Issue #93: with `pg_kafka.test_forward_ack_delay_ms` holding acks past the 5 s retry lease, each record reaches external Kafka exactly once |
+| `test_async_forwarding_no_duplicates_on_slow_ack` | With `pg_kafka.test_forward_ack_delay_ms` holding acks for 6.5 s, each record reaches external Kafka exactly once and no attempt is re-claimed (`retry_count` stays 0) |
 | `test_external_only_mode` | ExternalOnly (external-primary): delivered externally, stored locally, but a pg_kafka consumer reads nothing |
 | `test_local_only_mode` | `mode = 'local_only'`: stored locally, not forwarded |
 | `test_reload_clears_deleted_topic_config` | Deleting a `kafka.shadow_config` row stops forwarding after reload |
@@ -174,9 +221,15 @@ The `shadow` category registers 27 tests in `kafka_test/src/main.rs`, all `paral
 | `test_committed_txn_leaves_no_orphan_outbox_rows` | A committed transaction leaves no outbox rows without a backing message |
 | `test_dual_write_external_down` | DualWrite (async): the local write succeeds regardless of forwarding. It runs against the normal broker config and does not take the broker down |
 | `test_external_only_fallback` | ExternalOnly produce succeeds. It accepts either local count, and with the current code the record is always stored locally |
-| `test_external_primary_dead_letter_serves_local` | RV-6: once a forward is dead-lettered (`retry_count >= 10`), an external-primary topic serves the record locally |
+| `test_external_primary_dead_letter_serves_local` | Once a forward is dead-lettered (`retry_count >= pg_kafka.shadow_max_retries`), an external-primary topic serves the record locally |
 | `test_replay_historical_messages` | `kafka.replay_shadow_messages()` re-queues stored messages and they are forwarded |
 | `test_replay_skips_aborted_records` | Replay never re-queues aborted transactional records |
+| `test_shadow_forward_throughput` | 20 000 records forwarded end to end at ≥ 2000 msg/s with no failed attempts (pipelined forwarder) |
+| `test_shadow_forwards_headers_and_timestamps` | Record headers (in order, binary values) and the producer's CreateTime reach the external topic |
+| `test_shadow_order_preserved_across_a_retried_failure` | An external topic rejects the batch holding an oversized record until its `max.message.bytes` is raised; nothing after the failed record is delivered before its retry and the external order equals the local order |
+| `test_shadow_sync_stall_is_bounded_to_its_own_response` | External cluster unreachable: a sync produce is held ~`shadow_sync_timeout_ms` (3 s) while produces to another topic stay < 1 s |
+| `test_shadow_gucs_take_effect_on_reload` | Session `SET` of shadow GUCs is refused; a security-protocol change rebuilds the producer; `shadow_metrics_enabled = off` writes no metrics; sampled-out records are counted in `messages_skipped` |
+| `test_shadow_lag_view_is_per_partition` | `kafka.shadow_partition_status` / `kafka.shadow_status` report lag, dead letters and in-flight counts per partition (needs no external Kafka; runs in the shadow job with the rest of the category) |
 
 ## Running Tests
 

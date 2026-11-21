@@ -4,8 +4,7 @@ This document outlines performance benchmarks, tuning recommendations, and archi
 
 ## Measured pg_kafka Performance (the numbers that matter)
 
-> DR-23 (DEEP-REVIEW-2026-07): this section supersedes the external benchmark
-> below as the headline. pg_kafka's own measured numbers live in the evidence
+> pg_kafka's own measured numbers live in the evidence
 > pipeline — `evidence/bench/` regenerates `bench.json` in the `evidence` workflow
 > (`.github/workflows/evidence.yml`: weekly, on `v*` tags, or on demand) and the results
 > render at [rtrentjones.dev/pg_kafka](https://rtrentjones.dev/pg_kafka).
@@ -18,7 +17,7 @@ This document outlines performance benchmarks, tuning recommendations, and archi
 For current figures, see `bench.json` on the `evidence` branch (produce/consume
 throughput, latency percentiles, raw-INSERT floor, shadow-forwarding rates).
 The E2E performance suite (`kafka_test --category performance`) enforces
-regression floors in CI (DR-18).
+regression floors in CI.
 
 ### Architecture ceiling
 
@@ -26,10 +25,10 @@ Every Produce/Fetch/Offset/Txn request executes on **one** DB thread, one at a
 time. This makes the in-memory coordinator and check-then-act SQL race-free
 without locks, at the cost of a hard single-core ceiling for SPI work.
 Throughput levers, in order: batching (one Produce carrying N records costs
-~one insert), fetch byte budgets (DR-9 fills max_bytes in bounded query
+~one insert), fetch byte budgets (max_bytes is filled in bounded query
 loops), connection pipelining (safe — responses stay ordered per connection),
 and vertical DB tuning. Heartbeats travel on a dedicated liveness lane that the
-worker drains before the main request queue (DR-12), so group liveness does not
+worker drains before the main request queue, so group liveness does not
 degrade with produce load.
 
 ## Background: PostgreSQL as a message store (external benchmark)
@@ -74,32 +73,10 @@ UPDATE messages SET is_read = TRUE WHERE id = $1;
 **pg_kafka Status:**
 - ✅ We do NOT use `is_read` columns
 - ✅ We use offset-based reads (Kafka pattern)
-- ✅ Time-based retention ships as a bounded `DELETE` sweep (see "Retention & lifecycle GUCs" below)
-- ⚠️ `kafka.messages` is not partitioned, so retention reclaims space through `DELETE` + `VACUUM`, not `DROP`
-
-**Proposed (ADR-001, not implemented):**
-Table partitioning with automatic partition dropping:
-
-```sql
--- Partition by time range (e.g., daily)
-CREATE TABLE kafka.messages (
-    topic_id INT NOT NULL,
-    partition_id INT NOT NULL,
-    global_offset BIGSERIAL,
-    partition_offset BIGINT NOT NULL,
-    key BYTEA,
-    value BYTEA,
-    headers JSONB,
-    created_at TIMESTAMP NOT NULL DEFAULT NOW()
-) PARTITION BY RANGE (created_at);
-
--- Create partitions automatically
-CREATE TABLE kafka.messages_2026_01_01 PARTITION OF kafka.messages
-    FOR VALUES FROM ('2026-01-01') TO ('2026-01-02');
-
--- Drop old partitions (retention policy)
-DROP TABLE kafka.messages_2025_12_01;  -- O(1) operation, not O(n)
-```
+- ✅ `kafka.messages` is time-partitioned on `created_at` (ADR-001, 0.1.0): retention drops whole
+  leaves (`DROP TABLE`, no dead tuples, no VACUUM debt) wherever every row in a leaf is expired, and
+  falls back to the bounded `DELETE` sweep only for leaves shared with a longer-lived topic and for
+  topics whose window is shorter than one leaf (see "Retention & lifecycle GUCs" below)
 
 ### 2. SKIP LOCKED Destroys Ordering
 
@@ -192,6 +169,24 @@ synchronous_commit = on         -- For acks=-1 (wait for WAL flush)
 - pg_kafka has no GUC of its own for this. The worker's transactions follow the server's
   `synchronous_commit` setting, so `off` trades durability of the latest commits for throughput
   for every acks level.
+- Group commit: the worker runs every request already queued (up to 64, or about 50 ms of work,
+  and never past a waiting Heartbeat) in ONE top-level transaction, each request in its own
+  subtransaction, and releases their responses only after that single commit. Concurrent and
+  pipelined producers therefore share one WAL flush instead of paying one each, which lifts the
+  ~220 requests/s fsync ceiling of the old one-transaction-per-request design. A lone request
+  still commits on its own, with no added wait.
+- There is deliberately no "wait for more requests" delay (like Postgres's `commit_delay`). One
+  was built and measured (2026-11, PG14, fsync on, eight Java producers with
+  `max.in.flight.requests.per.connection=1`, `batch.size=0`, server-side rate from
+  `kafka.messages.created_at`). While one batch flushes, the other producers' requests queue, so
+  the next batch already carries about 5 of the 8 possible requests (one record each on a
+  one-partition topic) or about 35 records (eight partitions). A wait cannot add requests that
+  the clients have not sent, so it only lengthened every round: one partition fell from 1,165 to
+  1,014 records/s at 0.5 ms and 630 at 5 ms; eight partitions went from 2,600-2,730 to
+  2,450-2,520 records/s at 1 ms (three runs each). With few in-flight requests, throughput is
+  bounded by the fsync rate times the number of requests the clients keep in flight; raise
+  client concurrency (`max.in.flight.requests.per.connection`, `linger.ms`, more producers) or,
+  if losing the latest commits on a crash is acceptable, `synchronous_commit = off`.
 
 #### 4. Huge Pages (Large Instances)
 
@@ -317,61 +312,21 @@ LIMIT $4;
 - Naturally supports replayability (restart from any offset)
 - Multiple consumers can read same data
 
-### 2. ⚠️ Partitioning Strategy (Proposed, not implemented)
+### 2. ✅ Partitioning Strategy (0.1.0)
 
-**Decision (ADR-001, still proposed):** Implement time-based partitioning with automatic retention.
-Retention itself has since shipped without partitioning, as a bounded `DELETE` sweep (see below).
+`kafka.messages` is `PARTITION BY RANGE (created_at)` with leaves of
+`pg_kafka.message_partition_minutes` (default one day) plus a DEFAULT leaf. See
+[ADR-001 "As built"](architecture/ADR-001-partitioning-and-retention.md#as-built-010) for the
+layout, uniqueness, least-privilege DDL and upgrade. Costs to keep in mind:
 
-**Why:**
-- Prevents infinite table growth
-- Enables O(1) deletion of old data (drop partition vs DELETE)
-- Keeps active partition small for index efficiency
-- Aligns with Kafka's segment-based storage
-
-**Implementation Plan:**
-```sql
--- Phase 3: Partition by created_at (daily partitions)
-CREATE TABLE kafka.messages (
-    ...
-    created_at TIMESTAMP NOT NULL DEFAULT NOW()
-) PARTITION BY RANGE (created_at);
-
--- Automatic partition management (cron job or background worker)
-CREATE OR REPLACE FUNCTION kafka.create_next_partition()
-RETURNS void AS $$
-DECLARE
-    partition_date DATE := CURRENT_DATE + INTERVAL '1 day';
-    partition_name TEXT := 'kafka.messages_' || TO_CHAR(partition_date, 'YYYY_MM_DD');
-BEGIN
-    EXECUTE format(
-        'CREATE TABLE IF NOT EXISTS %I PARTITION OF kafka.messages
-         FOR VALUES FROM (%L) TO (%L)',
-        partition_name,
-        partition_date,
-        partition_date + INTERVAL '1 day'
-    );
-END;
-$$ LANGUAGE plpgsql;
-
--- Retention policy (drop partitions older than 7 days)
-CREATE OR REPLACE FUNCTION kafka.drop_old_partitions()
-RETURNS void AS $$
-DECLARE
-    retention_days INT := 7;
-    cutoff_date DATE := CURRENT_DATE - retention_days;
-    partition_name TEXT;
-BEGIN
-    FOR partition_name IN
-        SELECT tablename FROM pg_tables
-        WHERE schemaname = 'kafka'
-        AND tablename LIKE 'messages_%'
-        AND tablename < 'messages_' || TO_CHAR(cutoff_date, 'YYYY_MM_DD')
-    LOOP
-        EXECUTE format('DROP TABLE IF EXISTS kafka.%I', partition_name);
-    END LOOP;
-END;
-$$ LANGUAGE plpgsql;
-```
+- Fetch/ListOffsets/HWM lookups do not name `created_at`, so they probe every leaf's
+  `(topic_id, partition_id, partition_offset)` btree: one descent per leaf. Keep the leaf count
+  modest (retention / width + 4); do not combine a tiny width with a long retention. Planning such a
+  statement expands every leaf, so the hot read statements run through kept prepared plans
+  (`select_cached` in `storage/postgres.rs`).
+- Retention of a leaf is a `DROP TABLE`. On 1M expired rows (PG15 sandbox): 0.35 s and 0.16 MB of WAL
+  with 0 dead tuples, versus 2.9 s, 240 MB of WAL and 1M dead tuples (plus a 0.37 s VACUUM) for the
+  row-delete sweep, and the table shrinks to the retained data instead of keeping its size.
 
 ### 3. ✅ Separate Consumer Offsets Table (Phase 3)
 
@@ -413,20 +368,26 @@ CREATE TABLE kafka.consumer_offsets (
 
 ## Retention & lifecycle GUCs (shipped)
 
-> DR-23: earlier revisions of this document described `pg_kafka.retention_days`,
-> `pg_kafka.partition_interval`, and `pg_kafka.autovacuum_aggressive` — none of
-> which were ever implemented. What actually ships (DR-1/DR-2):
-
 ```sql
 -- Time-based retention for kafka.messages, enforced by the worker's periodic
 -- retention sweep (60s cadence, at most 10,000 rows per DELETE). 0 (default)
 -- keeps forever. Range 0-87600; reloadable with SIGHUP (pg_reload_conf()).
 pg_kafka.message_retention_hours = 168   -- e.g. 7 days
 
+-- Width of one time partition of kafka.messages (minutes, default 1440 = one day,
+-- 5-43200, SIGHUP). Windows >= one width are enforced a leaf at a time (a row lives
+-- at most window + width, like Kafka segment retention); shorter windows row by row.
+pg_kafka.message_partition_minutes = 1440
+
+-- On-demand partition maintenance: create the leaves for now and the next two
+-- widths and move rows the DEFAULT leaf caught. Returns the number created.
+SELECT pg_kafka_run_partition_maintenance();
+
 -- On-demand sweep + report (also reclaims aborted transactional rows and prunes
 -- stale producers, terminal transactions, and delivered shadow-outbox rows).
 -- Arguments: message_retention_hours (NULL = use the GUC), aborted_grace_seconds
--- (default 60). Returns one (category, deleted) row per category.
+-- (default 60). Returns one (category, deleted) row per category, including
+-- dropped_partitions (whole leaves dropped).
 SELECT * FROM pg_kafka_run_retention_sweep();
 ```
 
@@ -438,8 +399,8 @@ enforced by the same sweep: a value `>= 0` applies even when the global GUC is
 partition up to an offset on demand.
 
 Aggressive autovacuum for the high-churn counter tables is applied by
-`sql/tune_autovacuum.sql` (DR-5). Native table partitioning remains future work
-(ADR-001).
+`sql/tune_autovacuum.sql`. Time partitioning and partition-drop retention:
+ADR-001 "As built".
 
 ### Suggested System Configuration
 
@@ -582,6 +543,6 @@ These ideas predate the outbox-based implementation described above.
 
 ---
 
-**Status:** Phase 11 Complete. Shadow mode, transactions, idempotent producer, and compression support are fully implemented. Time-based retention (global GUC plus per-topic `retention.ms`) ships as a bounded `DELETE` sweep. Native table partitioning is still planned (ADR-001).
+**Status:** Phase 11 Complete. Retention (global GUC plus per-topic `retention.ms`) drops whole time partitions of `kafka.messages` where it can and deletes row by row in bounded batches elsewhere (ADR-001).
 
-**Last Updated:** 2026-10-29
+**Last Updated:** 2026-11-19

@@ -3,6 +3,7 @@
 //! Tests for max_wait_ms behavior in FetchRequest.
 
 use crate::common::{create_producer, get_bootstrap_servers, TestResult};
+use crate::members::{Member, CLOSE_TIMEOUT};
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::producer::FutureRecord;
@@ -44,6 +45,7 @@ pub async fn test_long_poll_immediate_return() -> TestResult {
         .set("enable.auto.commit", "false")
         .create()?;
 
+    let consumer = Member::new(consumer);
     consumer.subscribe(&[&topic])?;
     println!("   Consumer subscribed");
 
@@ -65,14 +67,14 @@ pub async fn test_long_poll_immediate_return() -> TestResult {
 
     let total_duration = start.elapsed();
     println!("\nStep 4: Verifying timing...");
-    println!("   Total duration for 5 polls: {:?}", total_duration);
+    println!("   Total duration for 5 polls: {total_duration:?}");
 
     // 5 polls should complete in well under 3 seconds with max_wait_ms=0
     assert!(
         total_duration < Duration::from_secs(3),
-        "Polls should complete quickly with max_wait_ms=0, took {:?}",
-        total_duration
+        "Polls should complete quickly with max_wait_ms=0, took {total_duration:?}"
     );
+    consumer.close(CLOSE_TIMEOUT).await?;
 
     println!("\n✅ Long poll immediate return test PASSED\n");
     Ok(())
@@ -113,6 +115,7 @@ pub async fn test_long_poll_timeout() -> TestResult {
         .set("enable.auto.commit", "false")
         .create()?;
 
+    let consumer = Member::new(consumer);
     consumer.subscribe(&[&topic])?;
     println!("   Consumer subscribed");
 
@@ -127,10 +130,10 @@ pub async fn test_long_poll_timeout() -> TestResult {
     let result = tokio::time::timeout(Duration::from_secs(5), consumer.recv()).await;
     let poll_duration = poll_start.elapsed();
 
-    println!("   Poll returned in {:?}", poll_duration);
+    println!("   Poll returned in {poll_duration:?}");
     match &result {
         Ok(Ok(_)) => println!("   Result: received message"),
-        Ok(Err(e)) => println!("   Result: error - {}", e),
+        Ok(Err(e)) => println!("   Result: error - {e}"),
         Err(_) => println!("   Result: timeout"),
     }
 
@@ -138,12 +141,9 @@ pub async fn test_long_poll_timeout() -> TestResult {
     // The poll should take at least 1 second (accounting for network overhead)
     // but no more than 6 seconds (max_wait_ms + overhead + our timeout)
     if poll_duration >= Duration::from_millis(1000) {
-        println!("   ✓ Poll waited for data (took {:?})", poll_duration);
+        println!("   ✓ Poll waited for data (took {poll_duration:?})");
     } else {
-        println!(
-            "   Note: Poll returned quickly ({:?}) - this is acceptable",
-            poll_duration
-        );
+        println!("   Note: Poll returned quickly ({poll_duration:?}) - this is acceptable");
         println!("   (rdkafka may batch requests or server had no data)");
     }
 
@@ -152,6 +152,8 @@ pub async fn test_long_poll_timeout() -> TestResult {
         poll_duration < Duration::from_secs(10),
         "Poll should complete within reasonable time"
     );
+    drop(result);
+    consumer.close(CLOSE_TIMEOUT).await?;
 
     println!("\n✅ Long poll timeout test PASSED\n");
     Ok(())

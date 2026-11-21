@@ -37,7 +37,7 @@ impl TestContext {
         // Spawn connection handler
         tokio::spawn(async move {
             if let Err(e) = connection.await {
-                eprintln!("PostgreSQL connection error: {}", e);
+                eprintln!("PostgreSQL connection error: {e}");
             }
         });
 
@@ -97,10 +97,7 @@ impl TestContext {
                 )
                 .await
             {
-                eprintln!(
-                    "⚠️  cleanup: failed to delete messages for '{}': {}",
-                    topic, e
-                );
+                eprintln!("⚠️  cleanup: failed to delete messages for '{topic}': {e}");
             }
 
             if let Err(e) = self
@@ -108,7 +105,7 @@ impl TestContext {
                 .execute("DELETE FROM kafka.topics WHERE name = $1", &[topic])
                 .await
             {
-                eprintln!("⚠️  cleanup: failed to delete topic '{}': {}", topic, e);
+                eprintln!("⚠️  cleanup: failed to delete topic '{topic}': {e}");
             }
         }
 
@@ -121,10 +118,7 @@ impl TestContext {
                 )
                 .await
             {
-                eprintln!(
-                    "⚠️  cleanup: failed to delete offsets for group '{}': {}",
-                    group, e
-                );
+                eprintln!("⚠️  cleanup: failed to delete offsets for group '{group}': {e}");
             }
         }
 
@@ -147,15 +141,14 @@ impl Drop for TestContext {
 
         // DR-19: if there is no runtime (shutdown path), say so — a silent no-op
         // here leaks rows into the next run with no trace in the output.
-        let handle = match tokio::runtime::Handle::try_current() {
-            Ok(h) => Some(h),
-            Err(_) => {
-                eprintln!(
-                    "⚠️  TestContext dropped outside a tokio runtime — drop-based cleanup \
-                     skipped (prefer calling ctx.cleanup().await explicitly)"
-                );
-                None
-            }
+        let handle = if let Ok(h) = tokio::runtime::Handle::try_current() {
+            Some(h)
+        } else {
+            eprintln!(
+                "⚠️  TestContext dropped outside a tokio runtime — drop-based cleanup \
+                 skipped (prefer calling ctx.cleanup().await explicitly)"
+            );
+            None
         };
         if let Some(handle) = handle {
             handle.spawn(async move {
@@ -188,13 +181,13 @@ impl Drop for TestContext {
     }
 }
 
-/// Verify that the pg_kafka server is ready to accept connections
-pub async fn verify_server_ready() -> TestResult {
+/// Verify that the pg_kafka server is ready to accept connections (blocks for up to 5 s).
+pub fn verify_server_ready() -> TestResult {
     use rdkafka::config::ClientConfig;
     use rdkafka::producer::{FutureProducer, Producer};
 
     let producer: FutureProducer = ClientConfig::new()
-        .set("bootstrap.servers", "localhost:9092")
+        .set("bootstrap.servers", crate::common::get_bootstrap_servers())
         .set("message.timeout.ms", "5000")
         .create()?;
 
@@ -212,7 +205,7 @@ pub async fn verify_database_ready() -> TestResult {
 
     tokio::spawn(async move {
         if let Err(e) = connection.await {
-            eprintln!("PostgreSQL connection error: {}", e);
+            eprintln!("PostgreSQL connection error: {e}");
         }
     });
 

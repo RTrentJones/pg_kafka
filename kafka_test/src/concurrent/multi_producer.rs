@@ -1,5 +1,6 @@
 //! Multi-producer concurrent tests
 
+use crate::common::to_i64;
 use crate::common::TestResult;
 use crate::fixtures::TestTopicBuilder;
 use crate::setup::TestContext;
@@ -28,8 +29,8 @@ pub async fn test_concurrent_producers_same_topic() -> TestResult {
             let mut offsets = Vec::new();
 
             for i in 0..messages_per_producer {
-                let value = format!("producer-{}-msg-{}", producer_id, i);
-                let key = format!("key-{}-{}", producer_id, i);
+                let value = format!("producer-{producer_id}-msg-{i}");
+                let key = format!("key-{producer_id}-{i}");
 
                 let result = producer
                     .send(
@@ -58,7 +59,7 @@ pub async fn test_concurrent_producers_same_topic() -> TestResult {
         total_produced += offsets.len();
     }
 
-    println!("   Total messages produced: {}", total_produced);
+    println!("   Total messages produced: {total_produced}");
     assert_eq!(total_produced, num_producers * messages_per_producer);
 
     // Verify in database
@@ -73,8 +74,8 @@ pub async fn test_concurrent_producers_same_topic() -> TestResult {
         .await?;
 
     let db_count: i64 = row.get(0);
-    assert_eq!(db_count, (num_producers * messages_per_producer) as i64);
-    println!("✅ All {} messages verified in database", db_count);
+    assert_eq!(db_count, to_i64(num_producers * messages_per_producer));
+    println!("✅ All {db_count} messages verified in database");
 
     ctx.cleanup().await?;
     println!("\n✅ Concurrent producers same topic test PASSED\n");
@@ -104,13 +105,13 @@ pub async fn test_concurrent_producers_different_partitions() -> TestResult {
             let mut errors = Vec::new();
 
             for i in 0..5 {
-                let value = format!("partition-{}-msg-{}", partition, i);
+                let value = format!("partition-{partition}-msg-{i}");
 
                 let result = producer
                     .send(
                         rdkafka::producer::FutureRecord::to(&topic_name)
                             .payload(&value)
-                            .key(&format!("key-{}", i))
+                            .key(&format!("key-{i}"))
                             .partition(partition),
                         std::time::Duration::from_secs(10),
                     )
@@ -118,7 +119,7 @@ pub async fn test_concurrent_producers_different_partitions() -> TestResult {
 
                 match result {
                     Ok(_) => count += 1,
-                    Err((e, _)) => errors.push(format!("partition {}: {}", partition, e)),
+                    Err((e, _)) => errors.push(format!("partition {partition}: {e}")),
                 }
             }
 
@@ -140,16 +141,15 @@ pub async fn test_concurrent_producers_different_partitions() -> TestResult {
     if !all_errors.is_empty() {
         println!("   Errors encountered:");
         for err in &all_errors {
-            println!("     - {}", err);
+            println!("     - {err}");
         }
     }
 
     assert_eq!(
         total, 15,
-        "Expected 15 messages (3 partitions * 5 each), got {}",
-        total
+        "Expected 15 messages (3 partitions * 5 each), got {total}"
     );
-    println!("✅ Produced {} messages across 3 partitions", total);
+    println!("✅ Produced {total} messages across 3 partitions");
 
     // Verify each partition has 5 messages
     for partition in 0..3i32 {
@@ -164,7 +164,7 @@ pub async fn test_concurrent_producers_different_partitions() -> TestResult {
             .await?;
 
         let count: i64 = row.get(0);
-        assert_eq!(count, 5, "Partition {} should have 5 messages", partition);
+        assert_eq!(count, 5, "Partition {partition} should have 5 messages");
     }
     println!("✅ Each partition has correct message count");
 

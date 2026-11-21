@@ -138,12 +138,12 @@ pub async fn test_external_only_fallback() -> TestResult {
     let row = ctx
         .db()
         .query_one(
-            r#"
+            r"
         SELECT COUNT(*) as count
         FROM kafka.messages m
         JOIN kafka.topics t ON m.topic_id = t.id
         WHERE t.name = $1
-        "#,
+        ",
             &[&topic],
         )
         .await?;
@@ -207,8 +207,7 @@ pub async fn test_external_primary_dead_letter_serves_local() -> TestResult {
 
     // Control: while the forward is not dead-lettered, an external-primary topic
     // suppresses local reads (the consumer sees nothing).
-    let consumer: BaseConsumer =
-        create_read_committed_consumer(&format!("g-deadletter-{}", topic))?;
+    let consumer: BaseConsumer = create_read_committed_consumer(&format!("g-deadletter-{topic}"))?;
     let mut tpl = TopicPartitionList::new();
     tpl.add_partition_offset(&topic, 0, rdkafka::Offset::Beginning)?;
     consumer.assign(&tpl)?;
@@ -224,11 +223,34 @@ pub async fn test_external_primary_dead_letter_serves_local() -> TestResult {
         "a healthy external-primary topic must suppress local reads"
     );
 
+    // Let the first forward's ack land before forcing the dead letter: an ack applied
+    // after the UPDATE would set external_offset again and keep the topic suppressed.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let acked: i64 = ctx
+            .db()
+            .query_one(
+                "SELECT count(*) FROM kafka.shadow_tracking \
+                 WHERE topic_id = $1 AND external_offset IS NOT NULL",
+                &[&topic_id],
+            )
+            .await?
+            .get(0);
+        if acked == 1 {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("the external forward was not acknowledged within 10 s".into());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
     // Force the forward into the dead-letter state (retry cap exhausted, external
-    // delivery abandoned): retry_count >= MAX_FORWARD_RETRIES (10), still un-forwarded.
+    // delivery abandoned): retry_count >= pg_kafka.shadow_max_retries, still un-forwarded.
     ctx.db()
         .execute(
-            "UPDATE kafka.shadow_tracking SET external_offset = NULL, retry_count = 10 WHERE topic_id = $1",
+            "UPDATE kafka.shadow_tracking SET external_offset = NULL, \
+             retry_count = current_setting('pg_kafka.shadow_max_retries')::int WHERE topic_id = $1",
             &[&topic_id],
         )
         .await?;

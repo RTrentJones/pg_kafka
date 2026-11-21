@@ -68,7 +68,7 @@ async function readStatus(db, name) {
 }
 
 // Outbox rows: external_offset IS NOT NULL = a forward finalized; IS NULL = still pending. error_message
-// is withheld from PUBLIC (SEC-8), so never SELECT * here — only the granted columns (retry_count is one).
+// is not granted to pgkafka_reader, so select only the granted columns (retry_count is one).
 async function readTracking(db, id) {
   const r = await db.query(
     `SELECT count(*) FILTER (WHERE external_offset IS NOT NULL)::int AS finalized,

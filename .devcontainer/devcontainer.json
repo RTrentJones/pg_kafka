@@ -45,13 +45,15 @@
     }
   },
   // Ports to forward
+  // pgrx runs PostgreSQL 14 on 28814; pg_kafka listens on 127.0.0.1:9092 inside the
+  // container, which VS Code's forwarding reaches (it tunnels to the container's localhost).
   "forwardPorts": [
-    5432,
+    28814,
     9092
   ],
   "portsAttributes": {
-    "5432": {
-      "label": "PostgreSQL",
+    "28814": {
+      "label": "PostgreSQL (pgrx pg14)",
       "onAutoForward": "notify"
     },
     "9092": {
@@ -59,13 +61,9 @@
       "onAutoForward": "notify"
     }
   },
-  // Post-create commands removed - base image already has nightly toolchain
-  // rust-toolchain.toml ensures correct version is used automatically
-  // Run 'rustup update' manually if needed (may fail with cross-device link error)
-  // Environment variables (DR-25, DEEP-REVIEW-2026-07: these were top-level keys,
-  // which is not a valid devcontainer property — they were silently ignored.
-  // containerEnv is the supported mechanism. Also removed a stray extra closing
-  // brace that made the file invalid JSON.)
+  // No post-create command: the image (Dockerfile.dev) has the toolchain and rustup picks the
+  // pinned one from rust-toolchain.toml. RUSTUP_PERMIT_COPY_RENAME lets rustup install across
+  // the bind mount's device boundary.
   "containerEnv": {
     "RUST_LOG": "info",
     "RUSTUP_PERMIT_COPY_RENAME": "true"

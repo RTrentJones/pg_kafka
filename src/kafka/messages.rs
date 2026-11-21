@@ -1,15 +1,14 @@
-// Message types module for pg_kafka
-//
-// This module defines the message types used to communicate between
-// the network thread (tokio) and the database thread (main BGWorker).
-//
-// ## Two-Thread Architecture
-//
-// - Network thread: Parses Kafka requests, sends via crossbeam channel
-// - Database thread: Receives requests, processes via SPI, sends responses
-// - Response channel: Per-connection tokio mpsc for async response handling
-//
-// The crossbeam channel is created in worker.rs and passed to the listener.
+//! What travels between the network thread and the DB thread.
+//!
+//! [`KafkaRequest`] and [`KafkaResponse`] are the envelopes around the per-API bodies, which
+//! the API registry (`crate::kafka::api`) generates; [`RequestLanes`] are the two channels
+//! requests cross on, created in `worker::network` and handed to the listener; the remaining types
+//! are the request data the handlers take.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use crate::kafka::api::{Lane, RequestBody, RequestHeader, ResponseBody};
 
 /// Type alias for TxnOffsetCommit topic data: (topic_name, [(partition, offset, metadata)])
 pub type TxnOffsetCommitTopics = Vec<(String, Vec<(i32, i64, Option<String>)>)>;
@@ -18,16 +17,15 @@ pub type TxnOffsetCommitTopics = Vec<(String, Vec<(i32, i64, Option<String>)>)>;
 /// (resource_type, resource_name, [(config_name, operation, value)])
 pub type AlterConfigsResources = Vec<(i8, String, Vec<(String, i8, Option<String>)>)>;
 
-/// DR-12 (DEEP-REVIEW-2026-07): the two request lanes from the network thread to
-/// the single DB thread.
+/// The two request lanes from the network thread to the single DB thread.
 ///
-/// All requests used to share one FIFO channel, so a heavy Produce (large UNNEST,
-/// advisory-lock wait) delayed every queued Heartbeat behind it — and under DB
-/// pressure, delayed heartbeats cascade into spurious consumer-group rebalances,
-/// a self-amplifying failure mode. Heartbeat is served purely from the in-memory
-/// coordinator, so it now travels on a dedicated `liveness` lane that the worker
-/// drains *before* taking the next main-lane request. A heartbeat can still wait
-/// behind the one request currently executing, but never behind the queue.
+/// On one FIFO channel a heavy Produce (large UNNEST, advisory-lock wait) would delay
+/// every queued Heartbeat behind it, and under DB pressure delayed heartbeats cascade into
+/// spurious consumer-group rebalances, which add more load. Heartbeat is served purely from
+/// the in-memory coordinator, so it travels on a dedicated `liveness` lane that the worker
+/// drains *before* taking the next main-lane request: a heartbeat can wait behind the one
+/// request executing, never behind the queue. Which lane an API uses is
+/// [`crate::kafka::api::KafkaApi::LANE`].
 #[derive(Clone)]
 pub struct RequestLanes {
     /// Everything except liveness traffic (Produce, Fetch, Metadata, ...).
@@ -39,732 +37,71 @@ pub struct RequestLanes {
 impl RequestLanes {
     /// Pick the lane for a parsed request.
     pub fn route(&self, request: &KafkaRequest) -> &crossbeam_channel::Sender<KafkaRequest> {
-        match request {
-            KafkaRequest::Heartbeat { .. } => &self.liveness,
-            _ => &self.main,
+        match request.body.lane() {
+            Lane::Liveness => &self.liveness,
+            Lane::Main => &self.main,
         }
     }
 }
 
-/// Kafka request types that can be sent from async tasks to the main worker thread
+/// A parsed request on its way from the network thread to the DB thread.
 #[derive(Debug)]
-pub enum KafkaRequest {
-    /// ApiVersions request - asks which API versions the broker supports
-    ApiVersions {
-        /// Correlation ID from client - MUST be echoed back in response
-        correlation_id: i32,
-        /// Optional client identifier string
-        client_id: Option<String>,
-        /// API version from the request (needed for response encoding)
-        api_version: i16,
-        /// Channel to send the response back to the specific connection
-        /// Using tokio::sync::mpsc for async-friendly response delivery
-        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
-    },
-    /// Metadata request - asks for topic and broker metadata
-    Metadata {
-        /// Correlation ID from client - MUST be echoed back in response
-        correlation_id: i32,
-        /// Optional client identifier string
-        client_id: Option<String>,
-        /// API version from the request (needed for response encoding)
-        api_version: i16,
-        /// List of topics to get metadata for (None = all topics)
-        topics: Option<Vec<String>>,
-        /// Whether the broker may auto-create requested topics that don't exist. This is the v4+
-        /// wire flag (`allow_auto_topic_creation`); it defaults to true for older versions. CONF-2:
-        /// when false, a missing requested topic is reported as UNKNOWN_TOPIC_OR_PARTITION rather
-        /// than being created.
-        allow_auto_topic_creation: bool,
-        /// Channel to send the response back to the specific connection
-        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
-    },
-    /// Produce request - write messages to topic partitions
-    Produce {
-        /// Correlation ID from client - MUST be echoed back in response
-        correlation_id: i32,
-        /// Optional client identifier string
-        client_id: Option<String>,
-        /// API version from the request (needed for response encoding)
-        api_version: i16,
-        /// Acknowledgment level (0=none, 1=leader, -1=all ISR)
-        acks: i16,
-        /// Timeout for waiting for acknowledgments (milliseconds)
-        timeout_ms: i32,
-        /// Topic data (topic → partitions → records)
-        topic_data: Vec<TopicProduceData>,
-        /// Optional transactional ID for transactional producers (Phase 10)
-        transactional_id: Option<String>,
-        /// Channel to send the response back to the specific connection
-        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
-    },
-    /// Fetch request - read messages from topic partitions
-    Fetch {
-        /// Correlation ID from client - MUST be echoed back in response
-        correlation_id: i32,
-        /// Optional client identifier string
-        client_id: Option<String>,
-        /// API version from the request (needed for response encoding)
-        api_version: i16,
-        /// Maximum time to wait for data (milliseconds) - used for long polling
-        max_wait_ms: i32,
-        /// Minimum bytes to wait for before responding (for batching efficiency)
-        min_bytes: i32,
-        /// Maximum bytes to return (total across all partitions)
-        max_bytes: i32,
-        /// Isolation level (0=READ_UNCOMMITTED, 1=READ_COMMITTED) - Phase 10
-        isolation_level: i8,
-        /// Topic-partition fetch data
-        topic_data: Vec<TopicFetchData>,
-        /// Channel to send the response back to the specific connection
-        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
-    },
-    /// OffsetCommit request - commit consumed offsets for a consumer group
-    OffsetCommit {
-        /// Correlation ID from client - MUST be echoed back in response
-        correlation_id: i32,
-        /// Optional client identifier string
-        client_id: Option<String>,
-        /// API version from the request (needed for response encoding)
-        api_version: i16,
-        /// Consumer group ID
-        group_id: String,
-        /// Generation the committing member believes it holds (-1 for a simple consumer with no
-        /// active membership). CONF-1: validated against the coordinator to reject zombie commits.
-        generation_id: i32,
-        /// Member id of the committing consumer ("" for a simple consumer).
-        member_id: String,
-        /// Topic-partition offset data to commit
-        topics: Vec<OffsetCommitTopicData>,
-        /// Channel to send the response back to the specific connection
-        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
-    },
-    /// OffsetFetch request - fetch committed offsets for a consumer group
-    OffsetFetch {
-        /// Correlation ID from client - MUST be echoed back in response
-        correlation_id: i32,
-        /// Optional client identifier string
-        client_id: Option<String>,
-        /// API version from the request (needed for response encoding)
-        api_version: i16,
-        /// Consumer group ID
-        group_id: String,
-        /// Topics to fetch offsets for (None = all topics)
-        topics: Option<Vec<OffsetFetchTopicData>>,
-        /// Channel to send the response back to the specific connection
-        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
-    },
-    /// FindCoordinator request - discover the coordinator for a consumer group
-    FindCoordinator {
-        /// Correlation ID from client - MUST be echoed back in response
-        correlation_id: i32,
-        /// Optional client identifier string
-        client_id: Option<String>,
-        /// API version from the request (needed for response encoding)
-        api_version: i16,
-        /// Coordinator key (consumer group ID for consumer groups)
-        key: String,
-        /// Key type (0 = consumer group, 1 = transaction coordinator)
-        key_type: i8,
-        /// Channel to send the response back to the specific connection
-        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
-    },
-    /// JoinGroup request - consumer joins a consumer group
-    JoinGroup {
-        /// Correlation ID from client - MUST be echoed back in response
-        correlation_id: i32,
-        /// Optional client identifier string
-        client_id: Option<String>,
-        /// API version from the request (needed for response encoding)
-        api_version: i16,
-        /// Consumer group ID
-        group_id: String,
-        /// Session timeout in milliseconds
-        session_timeout_ms: i32,
-        /// Rebalance timeout in milliseconds (v1+)
-        rebalance_timeout_ms: i32,
-        /// Member ID ("" for first join, assigned ID for rejoin)
-        member_id: String,
-        /// Static group instance ID for static membership (v5+)
-        group_instance_id: Option<String>,
-        /// Protocol type (e.g., "consumer")
-        protocol_type: String,
-        /// Supported assignment strategies with metadata
-        protocols: Vec<JoinGroupProtocol>,
-        /// Channel to send the response back to the specific connection
-        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
-    },
-    /// SyncGroup request - synchronize partition assignments
-    SyncGroup {
-        /// Correlation ID from client - MUST be echoed back in response
-        correlation_id: i32,
-        /// Optional client identifier string
-        client_id: Option<String>,
-        /// API version from the request (needed for response encoding)
-        api_version: i16,
-        /// Consumer group ID
-        group_id: String,
-        /// Generation ID from JoinGroup response
-        generation_id: i32,
-        /// Member ID from JoinGroup response
-        member_id: String,
-        /// Static group instance ID (v3+)
-        group_instance_id: Option<String>,
-        /// Protocol type (v5+)
-        protocol_type: Option<String>,
-        /// Protocol name (v5+)
-        protocol_name: Option<String>,
-        /// Partition assignments (only leader sends non-empty)
-        assignments: Vec<SyncGroupAssignment>,
-        /// Channel to send the response back to the specific connection
-        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
-    },
-    /// Heartbeat request - maintain consumer group membership
-    Heartbeat {
-        /// Correlation ID from client - MUST be echoed back in response
-        correlation_id: i32,
-        /// Optional client identifier string
-        client_id: Option<String>,
-        /// API version from the request (needed for response encoding)
-        api_version: i16,
-        /// Consumer group ID
-        group_id: String,
-        /// Generation ID from JoinGroup response
-        generation_id: i32,
-        /// Member ID from JoinGroup response
-        member_id: String,
-        /// Static group instance ID (v3+)
-        group_instance_id: Option<String>,
-        /// Channel to send the response back to the specific connection
-        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
-    },
-    /// LeaveGroup request - consumer leaves a consumer group
-    LeaveGroup {
-        /// Correlation ID from client - MUST be echoed back in response
-        correlation_id: i32,
-        /// Optional client identifier string
-        client_id: Option<String>,
-        /// API version from the request (needed for response encoding)
-        api_version: i16,
-        /// Consumer group ID
-        group_id: String,
-        /// Member ID from JoinGroup response (v0-v2)
-        member_id: String,
-        /// Members leaving (v3+, batch support)
-        members: Vec<MemberIdentity>,
-        /// Channel to send the response back to the specific connection
-        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
-    },
-    /// ListOffsets request - query earliest/latest offsets for partitions
-    ListOffsets {
-        /// Correlation ID from client - MUST be echoed back in response
-        correlation_id: i32,
-        /// Optional client identifier string
-        client_id: Option<String>,
-        /// API version from the request (needed for response encoding)
-        api_version: i16,
-        /// Replica ID (-1 for consumer, broker ID for replicas)
-        replica_id: i32,
-        /// Isolation level (0=READ_UNCOMMITTED, 1=READ_COMMITTED) - v2+
-        isolation_level: i8,
-        /// Topics to list offsets for
-        topics: Vec<ListOffsetsTopicData>,
-        /// Channel to send the response back to the specific connection
-        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
-    },
-    /// DescribeGroups request - get consumer group state and members
-    DescribeGroups {
-        /// Correlation ID from client - MUST be echoed back in response
-        correlation_id: i32,
-        /// Optional client identifier string
-        client_id: Option<String>,
-        /// API version from the request (needed for response encoding)
-        api_version: i16,
-        /// List of group IDs to describe
-        groups: Vec<String>,
-        /// Include authorized operations (v3+)
-        include_authorized_operations: bool,
-        /// Channel to send the response back to the specific connection
-        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
-    },
-    /// ListGroups request - list all consumer groups
-    ListGroups {
-        /// Correlation ID from client - MUST be echoed back in response
-        correlation_id: i32,
-        /// Optional client identifier string
-        client_id: Option<String>,
-        /// API version from the request (needed for response encoding)
-        api_version: i16,
-        /// States filter (v4+) - empty means all states
-        states_filter: Vec<String>,
-        /// Channel to send the response back to the specific connection
-        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
-    },
-    /// CreateTopics request - create topics programmatically (Phase 6)
-    CreateTopics {
-        /// Correlation ID from client - MUST be echoed back in response
-        correlation_id: i32,
-        /// Optional client identifier string
-        client_id: Option<String>,
-        /// API version from the request (needed for response encoding)
-        api_version: i16,
-        /// Topics to create with configuration
-        topics: Vec<CreateTopicRequest>,
-        /// Timeout for the request in milliseconds
-        timeout_ms: i32,
-        /// If true, check if topics can be created but don't actually create them
-        validate_only: bool,
-        /// Channel to send the response back to the specific connection
-        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
-    },
-    /// DeleteTopics request - delete topics programmatically (Phase 6)
-    DeleteTopics {
-        /// Correlation ID from client - MUST be echoed back in response
-        correlation_id: i32,
-        /// Optional client identifier string
-        client_id: Option<String>,
-        /// API version from the request (needed for response encoding)
-        api_version: i16,
-        /// Topic names to delete
-        topic_names: Vec<String>,
-        /// Timeout for the request in milliseconds
-        timeout_ms: i32,
-        /// Channel to send the response back to the specific connection
-        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
-    },
-    /// CreatePartitions request - add partitions to existing topics (Phase 6)
-    CreatePartitions {
-        /// Correlation ID from client - MUST be echoed back in response
-        correlation_id: i32,
-        /// Optional client identifier string
-        client_id: Option<String>,
-        /// API version from the request (needed for response encoding)
-        api_version: i16,
-        /// Topics with new partition counts
-        topics: Vec<CreatePartitionsTopicRequest>,
-        /// Timeout for the request in milliseconds
-        timeout_ms: i32,
-        /// If true, check if partitions can be created but don't actually create them
-        validate_only: bool,
-        /// Channel to send the response back to the specific connection
-        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
-    },
-    /// DeleteGroups request - delete consumer groups (Phase 6)
-    DeleteGroups {
-        /// Correlation ID from client - MUST be echoed back in response
-        correlation_id: i32,
-        /// Optional client identifier string
-        client_id: Option<String>,
-        /// API version from the request (needed for response encoding)
-        api_version: i16,
-        /// Group IDs to delete
-        groups_names: Vec<String>,
-        /// Channel to send the response back to the specific connection
-        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
-    },
-    /// InitProducerId request - allocate producer IDs for idempotent producers (Phase 9)
-    InitProducerId {
-        /// Correlation ID from client - MUST be echoed back in response
-        correlation_id: i32,
-        /// Optional client identifier string
-        client_id: Option<String>,
-        /// API version from the request (needed for response encoding)
-        api_version: i16,
-        /// Optional transactional ID (for transactional producers - Phase 10)
-        transactional_id: Option<String>,
-        /// Transaction timeout in milliseconds (for transactional producers)
-        transaction_timeout_ms: i32,
-        /// Existing producer ID for reconnection (-1 for new producer)
-        producer_id: i64,
-        /// Existing producer epoch for reconnection (-1 for new producer)
-        producer_epoch: i16,
-        /// Channel to send the response back to the specific connection
-        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
-    },
-    /// AddPartitionsToTxn request - register partitions in a transaction (Phase 10)
-    AddPartitionsToTxn {
-        /// Correlation ID from client - MUST be echoed back in response
-        correlation_id: i32,
-        /// Optional client identifier string
-        client_id: Option<String>,
-        /// API version from the request (needed for response encoding)
-        api_version: i16,
-        /// Transactional ID
-        transactional_id: String,
-        /// Producer ID
-        producer_id: i64,
-        /// Producer epoch
-        producer_epoch: i16,
-        /// Topics and partitions to add
-        topics: Vec<(String, Vec<i32>)>,
-        /// Channel to send the response back
-        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
-    },
-    /// AddOffsetsToTxn request - add consumer offsets to a transaction (Phase 10)
-    AddOffsetsToTxn {
-        /// Correlation ID from client - MUST be echoed back in response
-        correlation_id: i32,
-        /// Optional client identifier string
-        client_id: Option<String>,
-        /// API version from the request (needed for response encoding)
-        api_version: i16,
-        /// Transactional ID
-        transactional_id: String,
-        /// Producer ID
-        producer_id: i64,
-        /// Producer epoch
-        producer_epoch: i16,
-        /// Consumer group ID
-        group_id: String,
-        /// Channel to send the response back
-        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
-    },
-    /// EndTxn request - commit or abort a transaction (Phase 10)
-    EndTxn {
-        /// Correlation ID from client - MUST be echoed back in response
-        correlation_id: i32,
-        /// Optional client identifier string
-        client_id: Option<String>,
-        /// API version from the request (needed for response encoding)
-        api_version: i16,
-        /// Transactional ID
-        transactional_id: String,
-        /// Producer ID
-        producer_id: i64,
-        /// Producer epoch
-        producer_epoch: i16,
-        /// true = commit, false = abort
-        committed: bool,
-        /// Channel to send the response back
-        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
-    },
-    /// TxnOffsetCommit request - commit offsets as part of a transaction (Phase 10)
-    TxnOffsetCommit {
-        /// Correlation ID from client - MUST be echoed back in response
-        correlation_id: i32,
-        /// Optional client identifier string
-        client_id: Option<String>,
-        /// API version from the request (needed for response encoding)
-        api_version: i16,
-        /// Transactional ID
-        transactional_id: String,
-        /// Consumer group ID
-        group_id: String,
-        /// Producer ID
-        producer_id: i64,
-        /// Producer epoch
-        producer_epoch: i16,
-        /// Consumer-group generation (KIP-447 `generation_id_or_member_epoch`);
-        /// -1 for a simple consumer / pre-v3 client (exempt from group fencing).
-        generation_id: i32,
-        /// Consumer-group member id (empty for a simple consumer / pre-v3 client).
-        member_id: String,
-        /// Topics with partition offsets
-        topics: TxnOffsetCommitTopics,
-        /// Channel to send the response back
-        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
-    },
-    /// DeleteRecords request - truncate partitions below an offset (API 21)
-    DeleteRecords {
-        /// Correlation ID from client - MUST be echoed back in response
-        correlation_id: i32,
-        /// Optional client identifier string
-        client_id: Option<String>,
-        /// API version from the request (needed for response encoding)
-        api_version: i16,
-        /// Topics with per-partition truncation offsets:
-        /// (topic_name, [(partition_id, before_offset)]); before_offset == -1
-        /// means "truncate to the high watermark".
-        topics: Vec<(String, Vec<(i32, i64)>)>,
-        /// Timeout for the request in milliseconds
-        timeout_ms: i32,
-        /// Channel to send the response back
-        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
-    },
-    /// DescribeConfigs request - read entity configs (API 32)
-    DescribeConfigs {
-        /// Correlation ID from client - MUST be echoed back in response
-        correlation_id: i32,
-        /// Optional client identifier string
-        client_id: Option<String>,
-        /// API version from the request (needed for response encoding)
-        api_version: i16,
-        /// Requested resources: (resource_type, resource_name, requested keys —
-        /// None/empty = all known configs)
-        resources: Vec<(i8, String, Option<Vec<String>>)>,
-        /// Channel to send the response back
-        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
-    },
-    /// IncrementalAlterConfigs request - SET/DELETE individual configs (API 44)
-    IncrementalAlterConfigs {
-        /// Correlation ID from client - MUST be echoed back in response
-        correlation_id: i32,
-        /// Optional client identifier string
-        client_id: Option<String>,
-        /// API version from the request (needed for response encoding)
-        api_version: i16,
-        /// Requested alterations: (resource_type, resource_name,
-        /// [(config_name, operation, value)]) where operation is the wire enum
-        /// (0=SET, 1=DELETE, 2=APPEND, 3=SUBTRACT)
-        resources: AlterConfigsResources,
-        /// If true, validate without applying
-        validate_only: bool,
-        /// Channel to send the response back
-        response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
-    },
+pub struct KafkaRequest {
+    /// API key, version, correlation id and client id.
+    pub header: RequestHeader,
+    /// The API-specific request.
+    pub body: RequestBody,
+    /// Where the response goes (the connection's per-request slot).
+    pub response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
 }
 
-/// Kafka response types sent back from main thread to async tasks
-///
-/// Phase 2 Refactoring: We wrap kafka-protocol response types directly to eliminate
-/// the verbose conversion code in protocol.rs::encode_response()
+impl KafkaRequest {
+    /// Replace this request's response channel, returning the previous sender.
+    ///
+    /// The worker swaps in a same-typed buffer channel before dispatching
+    /// the request and forwards buffered responses to the returned (real) sender
+    /// only after `BackgroundWorker::transaction` has committed, so a client can
+    /// never observe an ack for state that is not yet durable/visible (RB-1).
+    ///
+    /// APIs whose reply the coordinator may hold past the request's transaction
+    /// ([`crate::kafka::api::KafkaApi::DEFERRED_REPLY`]: JoinGroup, SyncGroup) are the
+    /// exceptions. Neither writes to the database, so there is nothing to commit first.
+    /// Their own sender is left in place, `new_tx` is dropped, and a closed sender is
+    /// returned, so the worker's flush and commit-failure paths deliver nothing for them.
+    pub fn swap_response_tx(
+        &mut self,
+        new_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
+    ) -> tokio::sync::mpsc::UnboundedSender<KafkaResponse> {
+        if self.body.deferred_reply() {
+            drop(new_tx);
+            let (closed_tx, _) = tokio::sync::mpsc::unbounded_channel();
+            closed_tx
+        } else {
+            std::mem::replace(&mut self.response_tx, new_tx)
+        }
+    }
+}
+
+/// A response on its way from the DB thread (or the decoder) to the connection writer.
 #[derive(Debug, Clone)]
-pub enum KafkaResponse {
-    /// ApiVersions response - wraps kafka-protocol's ApiVersionsResponse
-    ApiVersions {
-        /// Correlation ID from request - client uses this to match responses
-        correlation_id: i32,
-        /// API version to use for encoding the response
-        api_version: i16,
-        /// The kafka-protocol response struct (ready to encode)
-        response: kafka_protocol::messages::api_versions_response::ApiVersionsResponse,
-    },
-    /// Metadata response - wraps kafka-protocol's MetadataResponse
-    Metadata {
-        /// Correlation ID from request
-        correlation_id: i32,
-        /// API version from the request (needed for response encoding)
-        api_version: i16,
-        /// The kafka-protocol response struct (ready to encode)
-        response: kafka_protocol::messages::metadata_response::MetadataResponse,
-    },
-    /// Produce response - wraps kafka-protocol's ProduceResponse
-    Produce {
-        /// Correlation ID from request
-        correlation_id: i32,
-        /// API version from the request (needed for response encoding)
-        api_version: i16,
-        /// The kafka-protocol response struct (ready to encode)
-        response: kafka_protocol::messages::produce_response::ProduceResponse,
-    },
-    /// Fetch response - wraps kafka-protocol's FetchResponse
-    Fetch {
-        /// Correlation ID from request
-        correlation_id: i32,
-        /// API version from the request (needed for response encoding)
-        api_version: i16,
-        /// The kafka-protocol response struct (ready to encode)
-        response: kafka_protocol::messages::fetch_response::FetchResponse,
-    },
-    /// OffsetCommit response - wraps kafka-protocol's OffsetCommitResponse
-    OffsetCommit {
-        /// Correlation ID from request
-        correlation_id: i32,
-        /// API version from the request (needed for response encoding)
-        api_version: i16,
-        /// The kafka-protocol response struct (ready to encode)
-        response: kafka_protocol::messages::offset_commit_response::OffsetCommitResponse,
-    },
-    /// OffsetFetch response - wraps kafka-protocol's OffsetFetchResponse
-    OffsetFetch {
-        /// Correlation ID from request
-        correlation_id: i32,
-        /// API version from the request (needed for response encoding)
-        api_version: i16,
-        /// The kafka-protocol response struct (ready to encode)
-        response: kafka_protocol::messages::offset_fetch_response::OffsetFetchResponse,
-    },
-    /// FindCoordinator response - wraps kafka-protocol's FindCoordinatorResponse
-    FindCoordinator {
-        /// Correlation ID from request
-        correlation_id: i32,
-        /// API version from the request (needed for response encoding)
-        api_version: i16,
-        /// The kafka-protocol response struct (ready to encode)
-        response: kafka_protocol::messages::find_coordinator_response::FindCoordinatorResponse,
-    },
-    /// JoinGroup response - wraps kafka-protocol's JoinGroupResponse
-    JoinGroup {
-        /// Correlation ID from request
-        correlation_id: i32,
-        /// API version from the request (needed for response encoding)
-        api_version: i16,
-        /// The kafka-protocol response struct (ready to encode)
-        response: kafka_protocol::messages::join_group_response::JoinGroupResponse,
-    },
-    /// SyncGroup response - wraps kafka-protocol's SyncGroupResponse
-    SyncGroup {
-        /// Correlation ID from request
-        correlation_id: i32,
-        /// API version from the request (needed for response encoding)
-        api_version: i16,
-        /// The kafka-protocol response struct (ready to encode)
-        response: kafka_protocol::messages::sync_group_response::SyncGroupResponse,
-    },
-    /// Heartbeat response - wraps kafka-protocol's HeartbeatResponse
-    Heartbeat {
-        /// Correlation ID from request
-        correlation_id: i32,
-        /// API version from the request (needed for response encoding)
-        api_version: i16,
-        /// The kafka-protocol response struct (ready to encode)
-        response: kafka_protocol::messages::heartbeat_response::HeartbeatResponse,
-    },
-    /// LeaveGroup response - wraps kafka-protocol's LeaveGroupResponse
-    LeaveGroup {
-        /// Correlation ID from request
-        correlation_id: i32,
-        /// API version from the request (needed for response encoding)
-        api_version: i16,
-        /// The kafka-protocol response struct (ready to encode)
-        response: kafka_protocol::messages::leave_group_response::LeaveGroupResponse,
-    },
-    /// ListOffsets response - wraps kafka-protocol's ListOffsetsResponse
-    ListOffsets {
-        /// Correlation ID from request
-        correlation_id: i32,
-        /// API version from the request (needed for response encoding)
-        api_version: i16,
-        /// The kafka-protocol response struct (ready to encode)
-        response: kafka_protocol::messages::list_offsets_response::ListOffsetsResponse,
-    },
-    /// DescribeGroups response - wraps kafka-protocol's DescribeGroupsResponse
-    DescribeGroups {
-        /// Correlation ID from request
-        correlation_id: i32,
-        /// API version from the request (needed for response encoding)
-        api_version: i16,
-        /// The kafka-protocol response struct (ready to encode)
-        response: kafka_protocol::messages::describe_groups_response::DescribeGroupsResponse,
-    },
-    /// ListGroups response - wraps kafka-protocol's ListGroupsResponse
-    ListGroups {
-        /// Correlation ID from request
-        correlation_id: i32,
-        /// API version from the request (needed for response encoding)
-        api_version: i16,
-        /// The kafka-protocol response struct (ready to encode)
-        response: kafka_protocol::messages::list_groups_response::ListGroupsResponse,
-    },
-    /// CreateTopics response - wraps kafka-protocol's CreateTopicsResponse
-    CreateTopics {
-        /// Correlation ID from request
-        correlation_id: i32,
-        /// API version from the request (needed for response encoding)
-        api_version: i16,
-        /// The kafka-protocol response struct (ready to encode)
-        response: kafka_protocol::messages::create_topics_response::CreateTopicsResponse,
-    },
-    /// DeleteTopics response - wraps kafka-protocol's DeleteTopicsResponse
-    DeleteTopics {
-        /// Correlation ID from request
-        correlation_id: i32,
-        /// API version from the request (needed for response encoding)
-        api_version: i16,
-        /// The kafka-protocol response struct (ready to encode)
-        response: kafka_protocol::messages::delete_topics_response::DeleteTopicsResponse,
-    },
-    /// CreatePartitions response - wraps kafka-protocol's CreatePartitionsResponse
-    CreatePartitions {
-        /// Correlation ID from request
-        correlation_id: i32,
-        /// API version from the request (needed for response encoding)
-        api_version: i16,
-        /// The kafka-protocol response struct (ready to encode)
-        response: kafka_protocol::messages::create_partitions_response::CreatePartitionsResponse,
-    },
-    /// DeleteGroups response - wraps kafka-protocol's DeleteGroupsResponse
-    DeleteGroups {
-        /// Correlation ID from request
-        correlation_id: i32,
-        /// API version from the request (needed for response encoding)
-        api_version: i16,
-        /// The kafka-protocol response struct (ready to encode)
-        response: kafka_protocol::messages::delete_groups_response::DeleteGroupsResponse,
-    },
-    /// InitProducerId response - wraps kafka-protocol's InitProducerIdResponse (Phase 9)
-    InitProducerId {
-        /// Correlation ID from request
-        correlation_id: i32,
-        /// API version from the request (needed for response encoding)
-        api_version: i16,
-        /// The kafka-protocol response struct (ready to encode)
-        response: kafka_protocol::messages::init_producer_id_response::InitProducerIdResponse,
-    },
-    /// AddPartitionsToTxn response (Phase 10)
-    AddPartitionsToTxn {
-        /// Correlation ID from request
-        correlation_id: i32,
-        /// API version from the request
-        api_version: i16,
-        /// The kafka-protocol response struct
-        response:
-            kafka_protocol::messages::add_partitions_to_txn_response::AddPartitionsToTxnResponse,
-    },
-    /// AddOffsetsToTxn response (Phase 10)
-    AddOffsetsToTxn {
-        /// Correlation ID from request
-        correlation_id: i32,
-        /// API version from the request
-        api_version: i16,
-        /// The kafka-protocol response struct
-        response: kafka_protocol::messages::add_offsets_to_txn_response::AddOffsetsToTxnResponse,
-    },
-    /// EndTxn response (Phase 10)
-    EndTxn {
-        /// Correlation ID from request
-        correlation_id: i32,
-        /// API version from the request
-        api_version: i16,
-        /// The kafka-protocol response struct
-        response: kafka_protocol::messages::end_txn_response::EndTxnResponse,
-    },
-    /// TxnOffsetCommit response (Phase 10)
-    TxnOffsetCommit {
-        /// Correlation ID from request
-        correlation_id: i32,
-        /// API version from the request
-        api_version: i16,
-        /// The kafka-protocol response struct
-        response: kafka_protocol::messages::txn_offset_commit_response::TxnOffsetCommitResponse,
-    },
-    /// Error response for unsupported or malformed requests
-    /// DeleteRecords response - wraps kafka-protocol's DeleteRecordsResponse
-    DeleteRecords {
-        /// Correlation ID from request
-        correlation_id: i32,
-        /// API version to use for encoding the response
-        api_version: i16,
-        /// The kafka-protocol response struct (ready to encode)
-        response: kafka_protocol::messages::delete_records_response::DeleteRecordsResponse,
-    },
-    /// DescribeConfigs response - wraps kafka-protocol's DescribeConfigsResponse
-    DescribeConfigs {
-        /// Correlation ID from request
-        correlation_id: i32,
-        /// API version to use for encoding the response
-        api_version: i16,
-        /// The kafka-protocol response struct (ready to encode)
-        response: kafka_protocol::messages::describe_configs_response::DescribeConfigsResponse,
-    },
-    /// IncrementalAlterConfigs response - wraps kafka-protocol's response
-    IncrementalAlterConfigs {
-        /// Correlation ID from request
-        correlation_id: i32,
-        /// API version to use for encoding the response
-        api_version: i16,
-        /// The kafka-protocol response struct (ready to encode)
-        response:
-            kafka_protocol::messages::incremental_alter_configs_response::IncrementalAlterConfigsResponse,
-    },
-    Error {
-        /// Correlation ID from request
-        correlation_id: i32,
-        /// Error code (Kafka error codes)
-        error_code: i16,
-        /// Human-readable error message
-        error_message: Option<String>,
-    },
+pub struct KafkaResponse {
+    /// Correlation id of the request it answers.
+    pub correlation_id: i32,
+    /// Version to encode the body at.
+    pub api_version: i16,
+    /// The API-specific response body.
+    pub body: ResponseBody,
+}
+
+impl KafkaResponse {
+    /// A response envelope.
+    pub fn new(correlation_id: i32, api_version: i16, body: ResponseBody) -> Self {
+        Self {
+            correlation_id,
+            api_version,
+            body,
+        }
+    }
 }
 
 /// Data for producing to a topic
@@ -776,6 +113,55 @@ pub struct TopicProduceData {
     pub partitions: Vec<PartitionProduceData>,
 }
 
+/// A Produce partition whose data failed Kafka's validation before or while it decoded:
+/// nothing of it is written, and it is answered with its own error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefusedPartition {
+    /// Topic name, one allocation shared by the refused partitions of a topic entry: a
+    /// partition entry takes 8 bytes on the wire and a name up to the whole frame, so a copy
+    /// per partition would take memory of the frame's size squared.
+    pub topic: Arc<str>,
+    /// Partition ID
+    pub partition: i32,
+    /// The error validation found (UNKNOWN_TOPIC_OR_PARTITION takes its place when the
+    /// topic or partition does not exist).
+    pub error_code: i16,
+}
+
+/// The places of the topics of refused partitions in a list of topics, by name. The
+/// refused partitions of a topic entry share one name ([`RefusedPartition::topic`]) and come
+/// one after another, so a name is hashed once per such run, not once per partition: a
+/// request of a long name and many partitions would otherwise hash the name per partition,
+/// time of the frame's size squared.
+#[derive(Debug, Default)]
+pub struct TopicPlaces {
+    at: HashMap<Arc<str>, usize>,
+    last: Option<(Arc<str>, usize)>,
+}
+
+impl TopicPlaces {
+    /// Places for `names`, the first at 0.
+    pub fn of<'a>(names: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut places = Self::default();
+        for (at, name) in names.into_iter().enumerate() {
+            places.at.entry(Arc::from(name)).or_insert(at);
+        }
+        places
+    }
+
+    /// The place of `topic`; `add` places a name not seen yet and returns its place.
+    pub fn place(&mut self, topic: &Arc<str>, add: impl FnOnce() -> usize) -> usize {
+        if let Some((last, at)) = &self.last {
+            if Arc::ptr_eq(last, topic) {
+                return *at;
+            }
+        }
+        let at = *self.at.entry(Arc::clone(topic)).or_insert_with(add);
+        self.last = Some((Arc::clone(topic), at));
+        at
+    }
+}
+
 /// Data for producing to a partition
 #[derive(Debug, Clone)]
 pub struct PartitionProduceData {
@@ -783,8 +169,8 @@ pub struct PartitionProduceData {
     pub partition_index: i32,
     /// Records to write
     pub records: Vec<Record>,
-    /// Producer metadata extracted from RecordBatch header (Phase 9)
-    /// None for non-idempotent producers or when metadata extraction fails
+    /// Producer metadata from the RecordBatch header; `None` when the partition carried no
+    /// record data (null records).
     pub producer_metadata: Option<ProducerMetadata>,
 }
 
@@ -801,10 +187,8 @@ pub struct Record {
     pub timestamp: Option<i64>,
 }
 
-/// Producer metadata from RecordBatch header (Phase 9 - Idempotent Producer)
-///
-/// This struct captures the producer identity and sequence information
-/// from a RecordBatch for idempotent producer validation.
+/// The producer identity and sequence of a RecordBatch, for idempotent-producer
+/// validation.
 #[derive(Debug, Clone, Default)]
 pub struct ProducerMetadata {
     /// Producer ID allocated by InitProducerId (-1 for non-idempotent producers)
@@ -813,6 +197,9 @@ pub struct ProducerMetadata {
     pub producer_epoch: i16,
     /// Base sequence number for this batch (first record's sequence)
     pub base_sequence: i32,
+    /// Whether the batch is transactional (its records belong to the producer's
+    /// transaction).
+    pub is_transactional: bool,
 }
 
 /// Record header (key-value metadata)
@@ -822,281 +209,6 @@ pub struct RecordHeader {
     pub key: String,
     /// Header value (binary data)
     pub value: Vec<u8>,
-}
-
-// ============================================================================
-// Approximate byte-size estimators
-// ============================================================================
-// QA-4: these once fed a byte-weighted backpressure tracker that was never wired in (the request
-// channel is count-bounded); that dead module was removed. They are kept as request memory-size
-// utilities.
-
-impl Record {
-    /// Calculate the approximate in-memory byte size of this record.
-    ///
-    /// This is an estimate of memory usage, not the exact wire format size.
-    pub fn approx_byte_size(&self) -> usize {
-        let key_size = self.key.as_ref().map(|k| k.len()).unwrap_or(0);
-        let value_size = self.value.as_ref().map(|v| v.len()).unwrap_or(0);
-        let headers_size: usize = self
-            .headers
-            .iter()
-            .map(|h| h.key.len() + h.value.len())
-            .sum();
-        // Base struct overhead (~64 bytes for Options, Vec, etc.)
-        64 + key_size + value_size + headers_size
-    }
-}
-
-impl TopicProduceData {
-    /// Calculate approximate byte size of this topic data for backpressure tracking.
-    pub fn approx_byte_size(&self) -> usize {
-        let name_size = self.name.len();
-        let partitions_size: usize = self.partitions.iter().map(|p| p.approx_byte_size()).sum();
-        // Base struct overhead
-        32 + name_size + partitions_size
-    }
-}
-
-impl PartitionProduceData {
-    /// Calculate approximate byte size of this partition data for backpressure tracking.
-    pub fn approx_byte_size(&self) -> usize {
-        let records_size: usize = self.records.iter().map(|r| r.approx_byte_size()).sum();
-        // Base struct overhead + producer metadata (~48 bytes)
-        48 + records_size
-    }
-}
-
-impl KafkaRequest {
-    /// Calculate approximate byte size of this request for backpressure tracking.
-    ///
-    /// This is used to implement byte-weighted channel backpressure.
-    /// Only Produce requests have significant memory footprint from message payloads.
-    /// Other requests are assigned a minimum overhead value.
-    pub fn approx_byte_size(&self) -> usize {
-        match self {
-            KafkaRequest::Produce { topic_data, .. } => {
-                let data_size: usize = topic_data.iter().map(|t| t.approx_byte_size()).sum();
-                // Include response channel and other field overhead
-                256 + data_size
-            }
-            // Other requests have minimal memory footprint
-            // Assign a conservative estimate for struct overhead
-            _ => 512,
-        }
-    }
-
-    /// Wire identifiers of this request: `(api_key, api_version, correlation_id)`.
-    ///
-    /// Used by the worker's response-after-commit barrier (RB-1) to build an
-    /// API-typed error frame when the surrounding transaction fails after the
-    /// handler already buffered a success response.
-    pub fn wire_ids(&self) -> (i16, i16, i32) {
-        use crate::kafka::constants::*;
-        match self {
-            KafkaRequest::ApiVersions {
-                correlation_id,
-                api_version,
-                ..
-            } => (API_KEY_API_VERSIONS, *api_version, *correlation_id),
-            KafkaRequest::Metadata {
-                correlation_id,
-                api_version,
-                ..
-            } => (API_KEY_METADATA, *api_version, *correlation_id),
-            KafkaRequest::Produce {
-                correlation_id,
-                api_version,
-                ..
-            } => (API_KEY_PRODUCE, *api_version, *correlation_id),
-            KafkaRequest::Fetch {
-                correlation_id,
-                api_version,
-                ..
-            } => (API_KEY_FETCH, *api_version, *correlation_id),
-            KafkaRequest::OffsetCommit {
-                correlation_id,
-                api_version,
-                ..
-            } => (API_KEY_OFFSET_COMMIT, *api_version, *correlation_id),
-            KafkaRequest::OffsetFetch {
-                correlation_id,
-                api_version,
-                ..
-            } => (API_KEY_OFFSET_FETCH, *api_version, *correlation_id),
-            KafkaRequest::FindCoordinator {
-                correlation_id,
-                api_version,
-                ..
-            } => (API_KEY_FIND_COORDINATOR, *api_version, *correlation_id),
-            KafkaRequest::JoinGroup {
-                correlation_id,
-                api_version,
-                ..
-            } => (API_KEY_JOIN_GROUP, *api_version, *correlation_id),
-            KafkaRequest::SyncGroup {
-                correlation_id,
-                api_version,
-                ..
-            } => (API_KEY_SYNC_GROUP, *api_version, *correlation_id),
-            KafkaRequest::Heartbeat {
-                correlation_id,
-                api_version,
-                ..
-            } => (API_KEY_HEARTBEAT, *api_version, *correlation_id),
-            KafkaRequest::LeaveGroup {
-                correlation_id,
-                api_version,
-                ..
-            } => (API_KEY_LEAVE_GROUP, *api_version, *correlation_id),
-            KafkaRequest::ListOffsets {
-                correlation_id,
-                api_version,
-                ..
-            } => (API_KEY_LIST_OFFSETS, *api_version, *correlation_id),
-            KafkaRequest::DescribeGroups {
-                correlation_id,
-                api_version,
-                ..
-            } => (API_KEY_DESCRIBE_GROUPS, *api_version, *correlation_id),
-            KafkaRequest::ListGroups {
-                correlation_id,
-                api_version,
-                ..
-            } => (API_KEY_LIST_GROUPS, *api_version, *correlation_id),
-            KafkaRequest::CreateTopics {
-                correlation_id,
-                api_version,
-                ..
-            } => (API_KEY_CREATE_TOPICS, *api_version, *correlation_id),
-            KafkaRequest::DeleteTopics {
-                correlation_id,
-                api_version,
-                ..
-            } => (API_KEY_DELETE_TOPICS, *api_version, *correlation_id),
-            KafkaRequest::CreatePartitions {
-                correlation_id,
-                api_version,
-                ..
-            } => (API_KEY_CREATE_PARTITIONS, *api_version, *correlation_id),
-            KafkaRequest::DeleteGroups {
-                correlation_id,
-                api_version,
-                ..
-            } => (API_KEY_DELETE_GROUPS, *api_version, *correlation_id),
-            KafkaRequest::InitProducerId {
-                correlation_id,
-                api_version,
-                ..
-            } => (API_KEY_INIT_PRODUCER_ID, *api_version, *correlation_id),
-            KafkaRequest::AddPartitionsToTxn {
-                correlation_id,
-                api_version,
-                ..
-            } => (API_KEY_ADD_PARTITIONS_TO_TXN, *api_version, *correlation_id),
-            KafkaRequest::AddOffsetsToTxn {
-                correlation_id,
-                api_version,
-                ..
-            } => (API_KEY_ADD_OFFSETS_TO_TXN, *api_version, *correlation_id),
-            KafkaRequest::EndTxn {
-                correlation_id,
-                api_version,
-                ..
-            } => (API_KEY_END_TXN, *api_version, *correlation_id),
-            KafkaRequest::TxnOffsetCommit {
-                correlation_id,
-                api_version,
-                ..
-            } => (API_KEY_TXN_OFFSET_COMMIT, *api_version, *correlation_id),
-            KafkaRequest::DeleteRecords {
-                correlation_id,
-                api_version,
-                ..
-            } => (API_KEY_DELETE_RECORDS, *api_version, *correlation_id),
-            KafkaRequest::DescribeConfigs {
-                correlation_id,
-                api_version,
-                ..
-            } => (API_KEY_DESCRIBE_CONFIGS, *api_version, *correlation_id),
-            KafkaRequest::IncrementalAlterConfigs {
-                correlation_id,
-                api_version,
-                ..
-            } => (
-                API_KEY_INCREMENTAL_ALTER_CONFIGS,
-                *api_version,
-                *correlation_id,
-            ),
-        }
-    }
-
-    /// Replace this request's response channel, returning the previous sender.
-    ///
-    /// RB-1: the worker swaps in a same-typed buffer channel before dispatching
-    /// the request and forwards buffered responses to the returned (real) sender
-    /// only after `BackgroundWorker::transaction` has committed, so a client can
-    /// never observe an ack for state that is not yet durable/visible.
-    pub fn swap_response_tx(
-        &mut self,
-        new_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
-    ) -> tokio::sync::mpsc::UnboundedSender<KafkaResponse> {
-        match self {
-            KafkaRequest::ApiVersions { response_tx, .. }
-            | KafkaRequest::Metadata { response_tx, .. }
-            | KafkaRequest::Produce { response_tx, .. }
-            | KafkaRequest::Fetch { response_tx, .. }
-            | KafkaRequest::OffsetCommit { response_tx, .. }
-            | KafkaRequest::OffsetFetch { response_tx, .. }
-            | KafkaRequest::FindCoordinator { response_tx, .. }
-            | KafkaRequest::JoinGroup { response_tx, .. }
-            | KafkaRequest::SyncGroup { response_tx, .. }
-            | KafkaRequest::Heartbeat { response_tx, .. }
-            | KafkaRequest::LeaveGroup { response_tx, .. }
-            | KafkaRequest::ListOffsets { response_tx, .. }
-            | KafkaRequest::DescribeGroups { response_tx, .. }
-            | KafkaRequest::ListGroups { response_tx, .. }
-            | KafkaRequest::CreateTopics { response_tx, .. }
-            | KafkaRequest::DeleteTopics { response_tx, .. }
-            | KafkaRequest::CreatePartitions { response_tx, .. }
-            | KafkaRequest::DeleteGroups { response_tx, .. }
-            | KafkaRequest::InitProducerId { response_tx, .. }
-            | KafkaRequest::AddPartitionsToTxn { response_tx, .. }
-            | KafkaRequest::AddOffsetsToTxn { response_tx, .. }
-            | KafkaRequest::EndTxn { response_tx, .. }
-            | KafkaRequest::TxnOffsetCommit { response_tx, .. }
-            | KafkaRequest::DeleteRecords { response_tx, .. }
-            | KafkaRequest::DescribeConfigs { response_tx, .. }
-            | KafkaRequest::IncrementalAlterConfigs { response_tx, .. } => {
-                std::mem::replace(response_tx, new_tx)
-            }
-        }
-    }
-}
-
-/// Response for a topic in ProduceResponse
-#[derive(Debug, Clone)]
-pub struct TopicProduceResponse {
-    /// Topic name
-    pub name: String,
-    /// Per-partition responses
-    pub partitions: Vec<PartitionProduceResponse>,
-}
-
-/// Response for a partition in ProduceResponse
-#[derive(Debug, Clone)]
-pub struct PartitionProduceResponse {
-    /// Partition ID
-    pub partition_index: i32,
-    /// Error code (0 = success)
-    pub error_code: i16,
-    /// Base offset assigned to the first message in the batch
-    /// This is the partition_offset (NOT global_offset)
-    pub base_offset: i64,
-    /// Timestamp when the log was appended (-1 if not used)
-    pub log_append_time: i64,
-    /// Earliest available offset in this partition (-1 if not tracked)
-    pub log_start_offset: i64,
 }
 
 /// Data for fetching from a topic
@@ -1200,7 +312,7 @@ pub struct ListOffsetsPartitionData {
 
 // ========== Admin API Request Types ==========
 
-/// Request data for creating a single topic (Phase 6)
+/// Request data for creating a single topic.
 #[derive(Debug, Clone)]
 pub struct CreateTopicRequest {
     /// Topic name
@@ -1211,7 +323,7 @@ pub struct CreateTopicRequest {
     pub replication_factor: i16,
 }
 
-/// Request data for adding partitions to a topic (Phase 6)
+/// Request data for adding partitions to a topic.
 #[derive(Debug, Clone)]
 pub struct CreatePartitionsTopicRequest {
     /// Topic name
@@ -1220,8 +332,7 @@ pub struct CreatePartitionsTopicRequest {
     pub count: i32,
 }
 
-// ========== From implementations for type conversions ==========
-// These reduce boilerplate conversion code in decoding.rs
+// ========== Conversions from the wire types ==========
 
 impl From<kafka_protocol::messages::join_group_request::JoinGroupRequestProtocol>
     for JoinGroupProtocol
@@ -1266,19 +377,31 @@ impl From<kafka_protocol::messages::list_offsets_request::ListOffsetsPartition>
     }
 }
 
-// Note: The request channel is now created in worker.rs and passed explicitly
-// to the listener. This enables:
-// - Bounded channels for backpressure (10,000 capacity)
-// - Cleaner ownership model (no global static)
-// - Easier testing with injected channels
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kafka::api::{HeartbeatRequestData, ProduceRequestData, SyncGroupRequestData};
 
-    // ========== RequestLanes Tests (DR-12) ==========
+    fn header(api_key: i16, correlation_id: i32) -> RequestHeader {
+        RequestHeader {
+            api_key,
+            api_version: 0,
+            correlation_id,
+            client_id: None,
+        }
+    }
 
-    /// DR-12: Heartbeat must route to the liveness lane; everything else to the
+    fn unknown_api_response(correlation_id: i32) -> KafkaResponse {
+        KafkaResponse::new(
+            correlation_id,
+            0,
+            ResponseBody::UnknownApi { error_code: 0 },
+        )
+    }
+
+    // ========== RequestLanes Tests ==========
+
+    /// Heartbeat must route to the liveness lane; everything else to the
     /// main lane. Misrouting either way silently loses the liveness guarantee
     /// (heartbeats queue behind produce) or starves the main lane's ordering.
     #[test]
@@ -1291,14 +414,14 @@ mod tests {
         };
         let (response_tx, _response_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let heartbeat = KafkaRequest::Heartbeat {
-            correlation_id: 1,
-            client_id: None,
-            api_version: 0,
-            group_id: "g".to_string(),
-            generation_id: 1,
-            member_id: "m".to_string(),
-            group_instance_id: None,
+        let heartbeat = KafkaRequest {
+            header: header(crate::kafka::constants::API_KEY_HEARTBEAT, 1),
+            body: RequestBody::Heartbeat(HeartbeatRequestData {
+                group_id: "g".to_string(),
+                generation_id: 1,
+                member_id: "m".to_string(),
+                group_instance_id: None,
+            }),
             response_tx: response_tx.clone(),
         };
         lanes.route(&heartbeat).send(heartbeat).unwrap();
@@ -1311,10 +434,9 @@ mod tests {
             "Heartbeat must not land on the main lane"
         );
 
-        let api_versions = KafkaRequest::ApiVersions {
-            correlation_id: 2,
-            client_id: None,
-            api_version: 0,
+        let api_versions = KafkaRequest {
+            header: header(crate::kafka::constants::API_KEY_API_VERSIONS, 2),
+            body: RequestBody::ApiVersions(crate::kafka::api::ApiVersionsRequestData),
             response_tx,
         };
         lanes.route(&api_versions).send(api_versions).unwrap();
@@ -1328,9 +450,24 @@ mod tests {
         );
     }
 
+    /// Only Heartbeat uses the liveness lane, and only JoinGroup/SyncGroup defer their
+    /// reply; every other registered API takes the main lane and the commit barrier.
+    #[test]
+    fn test_lane_and_deferred_reply_per_api() {
+        use crate::kafka::constants::*;
+        for info in crate::kafka::api::tests::worker_apis() {
+            let liveness = info.key == API_KEY_HEARTBEAT;
+            let deferred = info.key == API_KEY_JOIN_GROUP || info.key == API_KEY_SYNC_GROUP;
+            let body = crate::kafka::api::tests::sample_request(info.key);
+            assert_eq!(body.api_key(), info.key);
+            assert_eq!(body.lane() == Lane::Liveness, liveness, "{}", info.name);
+            assert_eq!(body.deferred_reply(), deferred, "{}", info.name);
+        }
+    }
+
     // ========== RB-1 barrier accessor tests ==========
 
-    /// RB-1: `swap_response_tx` must install the new sender on the request and
+    /// `swap_response_tx` must install the new sender on the request and
     /// hand back the original one. If the swap silently returned the wrong end,
     /// the worker's post-commit flush would deliver responses to the buffer
     /// instead of the client (hang) or vice versa (barrier bypassed).
@@ -1339,422 +476,97 @@ mod tests {
         let (orig_tx, mut orig_rx) = tokio::sync::mpsc::unbounded_channel();
         let (buf_tx, mut buf_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let mut request = KafkaRequest::Produce {
-            correlation_id: 7,
-            client_id: None,
-            api_version: 9,
-            acks: 1,
-            timeout_ms: 1000,
-            topic_data: vec![],
-            transactional_id: None,
+        let mut request = KafkaRequest {
+            header: header(crate::kafka::constants::API_KEY_PRODUCE, 7),
+            body: RequestBody::Produce(ProduceRequestData {
+                acks: 1,
+                timeout_ms: 1000,
+                refused: Vec::new(),
+                topic_data: vec![],
+                transactional_id: None,
+                decoded: crate::kafka::protocol::DecodedCharge::default(),
+                pending: None,
+            }),
             response_tx: orig_tx,
         };
 
         let returned = request.swap_response_tx(buf_tx);
 
         // The returned sender is the original: sending on it reaches orig_rx.
-        returned
-            .send(KafkaResponse::Error {
-                correlation_id: 7,
-                error_code: 0,
-                error_message: None,
-            })
-            .unwrap();
+        returned.send(unknown_api_response(7)).unwrap();
         assert!(
             orig_rx.try_recv().is_ok(),
             "returned sender must be the original"
         );
 
         // The request now holds the buffer sender: a handler-side send lands in buf_rx.
-        if let KafkaRequest::Produce { response_tx, .. } = &request {
-            response_tx
-                .send(KafkaResponse::Error {
-                    correlation_id: 7,
-                    error_code: 0,
-                    error_message: None,
-                })
-                .unwrap();
-        }
+        request.response_tx.send(unknown_api_response(7)).unwrap();
         assert!(
             buf_rx.try_recv().is_ok(),
             "request must now hold the new sender"
         );
     }
 
-    /// Build one of every `KafkaRequest` variant (minimal fields) paired with
-    /// its expected `api_key`, all sharing `tx`. Drives the exhaustive
-    /// wire_ids / swap_response_tx coverage below.
-    fn all_request_variants(
-        tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
-    ) -> Vec<(i16, KafkaRequest)> {
-        use crate::kafka::constants::*;
-        vec![
-            (
-                API_KEY_API_VERSIONS,
-                KafkaRequest::ApiVersions {
-                    correlation_id: 1,
-                    client_id: None,
-                    api_version: 0,
-                    response_tx: tx.clone(),
-                },
-            ),
-            (
-                API_KEY_METADATA,
-                KafkaRequest::Metadata {
-                    correlation_id: 2,
-                    client_id: None,
-                    api_version: 0,
-                    topics: None,
-                    allow_auto_topic_creation: true,
-                    response_tx: tx.clone(),
-                },
-            ),
-            (
-                API_KEY_PRODUCE,
-                KafkaRequest::Produce {
-                    correlation_id: 3,
-                    client_id: None,
-                    api_version: 9,
-                    acks: 1,
-                    timeout_ms: 0,
-                    topic_data: vec![],
-                    transactional_id: None,
-                    response_tx: tx.clone(),
-                },
-            ),
-            (
-                API_KEY_FETCH,
-                KafkaRequest::Fetch {
-                    correlation_id: 4,
-                    client_id: None,
-                    api_version: 4,
-                    max_wait_ms: 0,
-                    min_bytes: 0,
-                    max_bytes: 0,
-                    isolation_level: 0,
-                    topic_data: vec![],
-                    response_tx: tx.clone(),
-                },
-            ),
-            (
-                API_KEY_OFFSET_COMMIT,
-                KafkaRequest::OffsetCommit {
-                    correlation_id: 5,
-                    client_id: None,
-                    api_version: 0,
-                    group_id: "g".to_string(),
-                    generation_id: -1,
-                    member_id: String::new(),
-                    topics: vec![],
-                    response_tx: tx.clone(),
-                },
-            ),
-            (
-                API_KEY_OFFSET_FETCH,
-                KafkaRequest::OffsetFetch {
-                    correlation_id: 6,
-                    client_id: None,
-                    api_version: 0,
-                    group_id: "g".to_string(),
-                    topics: None,
-                    response_tx: tx.clone(),
-                },
-            ),
-            (
-                API_KEY_FIND_COORDINATOR,
-                KafkaRequest::FindCoordinator {
-                    correlation_id: 7,
-                    client_id: None,
-                    api_version: 0,
-                    key: "g".to_string(),
-                    key_type: 0,
-                    response_tx: tx.clone(),
-                },
-            ),
-            (
-                API_KEY_JOIN_GROUP,
-                KafkaRequest::JoinGroup {
-                    correlation_id: 8,
-                    client_id: None,
-                    api_version: 0,
-                    group_id: "g".to_string(),
-                    session_timeout_ms: 0,
-                    rebalance_timeout_ms: 0,
-                    member_id: String::new(),
-                    group_instance_id: None,
-                    protocol_type: "consumer".to_string(),
-                    protocols: vec![],
-                    response_tx: tx.clone(),
-                },
-            ),
-            (
-                API_KEY_SYNC_GROUP,
-                KafkaRequest::SyncGroup {
-                    correlation_id: 9,
-                    client_id: None,
-                    api_version: 0,
-                    group_id: "g".to_string(),
-                    generation_id: 0,
-                    member_id: String::new(),
-                    group_instance_id: None,
-                    protocol_type: None,
-                    protocol_name: None,
-                    assignments: vec![],
-                    response_tx: tx.clone(),
-                },
-            ),
-            (
-                API_KEY_HEARTBEAT,
-                KafkaRequest::Heartbeat {
-                    correlation_id: 10,
-                    client_id: None,
-                    api_version: 4,
-                    group_id: "g".to_string(),
-                    generation_id: 1,
-                    member_id: "m".to_string(),
-                    group_instance_id: None,
-                    response_tx: tx.clone(),
-                },
-            ),
-            (
-                API_KEY_LEAVE_GROUP,
-                KafkaRequest::LeaveGroup {
-                    correlation_id: 11,
-                    client_id: None,
-                    api_version: 0,
-                    group_id: "g".to_string(),
-                    member_id: "m".to_string(),
-                    members: vec![],
-                    response_tx: tx.clone(),
-                },
-            ),
-            (
-                API_KEY_LIST_OFFSETS,
-                KafkaRequest::ListOffsets {
-                    correlation_id: 12,
-                    client_id: None,
-                    api_version: 0,
-                    replica_id: -1,
-                    isolation_level: 0,
-                    topics: vec![],
-                    response_tx: tx.clone(),
-                },
-            ),
-            (
-                API_KEY_DESCRIBE_GROUPS,
-                KafkaRequest::DescribeGroups {
-                    correlation_id: 13,
-                    client_id: None,
-                    api_version: 0,
-                    groups: vec![],
-                    include_authorized_operations: false,
-                    response_tx: tx.clone(),
-                },
-            ),
-            (
-                API_KEY_LIST_GROUPS,
-                KafkaRequest::ListGroups {
-                    correlation_id: 14,
-                    client_id: None,
-                    api_version: 0,
-                    states_filter: vec![],
-                    response_tx: tx.clone(),
-                },
-            ),
-            (
-                API_KEY_CREATE_TOPICS,
-                KafkaRequest::CreateTopics {
-                    correlation_id: 15,
-                    client_id: None,
-                    api_version: 5,
-                    topics: vec![],
-                    timeout_ms: 0,
-                    validate_only: false,
-                    response_tx: tx.clone(),
-                },
-            ),
-            (
-                API_KEY_DELETE_TOPICS,
-                KafkaRequest::DeleteTopics {
-                    correlation_id: 16,
-                    client_id: None,
-                    api_version: 0,
-                    topic_names: vec![],
-                    timeout_ms: 0,
-                    response_tx: tx.clone(),
-                },
-            ),
-            (
-                API_KEY_CREATE_PARTITIONS,
-                KafkaRequest::CreatePartitions {
-                    correlation_id: 17,
-                    client_id: None,
-                    api_version: 0,
-                    topics: vec![],
-                    timeout_ms: 0,
-                    validate_only: false,
-                    response_tx: tx.clone(),
-                },
-            ),
-            (
-                API_KEY_DELETE_GROUPS,
-                KafkaRequest::DeleteGroups {
-                    correlation_id: 18,
-                    client_id: None,
-                    api_version: 0,
-                    groups_names: vec![],
-                    response_tx: tx.clone(),
-                },
-            ),
-            (
-                API_KEY_INIT_PRODUCER_ID,
-                KafkaRequest::InitProducerId {
-                    correlation_id: 19,
-                    client_id: None,
-                    api_version: 4,
-                    transactional_id: None,
-                    transaction_timeout_ms: 0,
-                    producer_id: -1,
-                    producer_epoch: -1,
-                    response_tx: tx.clone(),
-                },
-            ),
-            (
-                API_KEY_ADD_PARTITIONS_TO_TXN,
-                KafkaRequest::AddPartitionsToTxn {
-                    correlation_id: 20,
-                    client_id: None,
-                    api_version: 0,
-                    transactional_id: "t".to_string(),
-                    producer_id: 1,
-                    producer_epoch: 0,
-                    topics: vec![],
-                    response_tx: tx.clone(),
-                },
-            ),
-            (
-                API_KEY_ADD_OFFSETS_TO_TXN,
-                KafkaRequest::AddOffsetsToTxn {
-                    correlation_id: 21,
-                    client_id: None,
-                    api_version: 0,
-                    transactional_id: "t".to_string(),
-                    producer_id: 1,
-                    producer_epoch: 0,
-                    group_id: "g".to_string(),
-                    response_tx: tx.clone(),
-                },
-            ),
-            (
-                API_KEY_END_TXN,
-                KafkaRequest::EndTxn {
-                    correlation_id: 22,
-                    client_id: None,
-                    api_version: 0,
-                    transactional_id: "t".to_string(),
-                    producer_id: 1,
-                    producer_epoch: 0,
-                    committed: true,
-                    response_tx: tx.clone(),
-                },
-            ),
-            (
-                API_KEY_TXN_OFFSET_COMMIT,
-                KafkaRequest::TxnOffsetCommit {
-                    correlation_id: 23,
-                    client_id: None,
-                    api_version: 3,
-                    transactional_id: "t".to_string(),
-                    group_id: "g".to_string(),
-                    producer_id: 1,
-                    producer_epoch: 0,
-                    generation_id: -1,
-                    member_id: String::new(),
-                    topics: vec![],
-                    response_tx: tx.clone(),
-                },
-            ),
-            (
-                API_KEY_DELETE_RECORDS,
-                KafkaRequest::DeleteRecords {
-                    correlation_id: 24,
-                    client_id: None,
-                    api_version: 1,
-                    topics: vec![],
-                    timeout_ms: 0,
-                    response_tx: tx.clone(),
-                },
-            ),
-            (
-                API_KEY_DESCRIBE_CONFIGS,
-                KafkaRequest::DescribeConfigs {
-                    correlation_id: 25,
-                    client_id: None,
-                    api_version: 1,
-                    resources: vec![],
-                    response_tx: tx.clone(),
-                },
-            ),
-            (
-                API_KEY_INCREMENTAL_ALTER_CONFIGS,
-                KafkaRequest::IncrementalAlterConfigs {
-                    correlation_id: 26,
-                    client_id: None,
-                    api_version: 0,
-                    resources: vec![],
-                    validate_only: false,
-                    response_tx: tx,
-                },
-            ),
-        ]
-    }
-
-    /// RB-1: `wire_ids` must report the correct `api_key` for EVERY variant —
-    /// a wrong key would make the client mis-decode the commit-failure error
-    /// frame. Exhaustive so a newly-added variant that forgets its arm fails.
+    /// Every non-deferred API gets the buffer installed by `swap_response_tx`.
     #[test]
-    fn test_wire_ids_mapping_all_variants() {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let variants = all_request_variants(tx);
-        assert_eq!(variants.len(), 26, "one entry per KafkaRequest variant");
-        for (expected_api_key, request) in &variants {
-            let (api_key, api_version, correlation_id) = request.wire_ids();
-            assert_eq!(
-                api_key, *expected_api_key,
-                "wire_ids api_key mismatch for correlation_id={correlation_id}"
-            );
-            assert!(api_version >= 0);
-            assert!(correlation_id > 0);
-        }
-    }
-
-    /// RB-1: `swap_response_tx` must succeed for EVERY variant (the barrier
-    /// swaps the sender on whatever request arrives).
-    #[test]
-    fn test_swap_response_tx_all_variants() {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        for (_api_key, mut request) in all_request_variants(tx) {
+    fn test_swap_response_tx_all_apis() {
+        for info in crate::kafka::api::tests::worker_apis() {
+            let (orig_tx, mut orig_rx) = tokio::sync::mpsc::unbounded_channel();
             let (buf_tx, mut buf_rx) = tokio::sync::mpsc::unbounded_channel();
-            let _returned = request.swap_response_tx(buf_tx);
-            // The request now holds the buffer sender: a handler-side send lands
-            // in buf_rx, proving the swap installed the new channel.
-            let (_a, _v, correlation_id) = request.wire_ids();
-            request
-                .swap_response_tx({
-                    let (t, _r) = tokio::sync::mpsc::unbounded_channel();
-                    t
-                }) // swap again to reach the buffered sender we just installed
-                .send(KafkaResponse::Error {
-                    correlation_id,
-                    error_code: 0,
-                    error_message: None,
-                })
-                .unwrap();
-            assert!(
-                buf_rx.try_recv().is_ok(),
-                "swap must install the new sender"
-            );
+            let mut request = KafkaRequest {
+                header: header(info.key, 1),
+                body: crate::kafka::api::tests::sample_request(info.key),
+                response_tx: orig_tx,
+            };
+            let deferred = request.body.deferred_reply();
+            let returned = request.swap_response_tx(buf_tx);
+            request.response_tx.send(unknown_api_response(1)).unwrap();
+            if deferred {
+                assert!(
+                    returned.send(unknown_api_response(1)).is_err(),
+                    "{}",
+                    info.name
+                );
+                assert!(buf_rx.try_recv().is_err(), "{}", info.name);
+                assert!(orig_rx.try_recv().is_ok(), "{}", info.name);
+            } else {
+                assert!(buf_rx.try_recv().is_ok(), "{}", info.name);
+                returned.send(unknown_api_response(1)).unwrap();
+                assert!(orig_rx.try_recv().is_ok(), "{}", info.name);
+            }
         }
+    }
+
+    /// SyncGroup, like JoinGroup, keeps the client's own sender: a follower's SyncGroup
+    /// may be answered after its transaction, when the leader syncs.
+    #[test]
+    fn test_swap_response_tx_leaves_sync_group_sender() {
+        let (orig_tx, mut orig_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (buf_tx, mut buf_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut request = KafkaRequest {
+            header: header(crate::kafka::constants::API_KEY_SYNC_GROUP, 4),
+            body: RequestBody::SyncGroup(SyncGroupRequestData {
+                group_id: "g".to_string(),
+                generation_id: 1,
+                member_id: "m".to_string(),
+                group_instance_id: None,
+                protocol_type: None,
+                protocol_name: None,
+                assignments: vec![],
+            }),
+            response_tx: orig_tx,
+        };
+        let returned = request.swap_response_tx(buf_tx);
+        assert!(
+            returned.send(unknown_api_response(4)).is_err(),
+            "returned sender is closed"
+        );
+        assert!(buf_rx.try_recv().is_err(), "the buffer is not installed");
+        request.response_tx.send(unknown_api_response(4)).unwrap();
+        assert!(
+            orig_rx.try_recv().is_ok(),
+            "the request keeps the client sender"
+        );
     }
 
     // ========== RecordHeader Tests ==========
@@ -1772,10 +584,10 @@ mod tests {
     #[test]
     fn test_record_header_with_empty_key() {
         let header = RecordHeader {
-            key: "".to_string(),
+            key: String::new(),
             value: b"value".to_vec(),
         };
-        assert!(header.key.is_empty());
+        assert_eq!(header.key, "");
         assert_eq!(header.value, b"value".to_vec());
     }
 
@@ -1786,7 +598,7 @@ mod tests {
             value: vec![],
         };
         assert_eq!(header.key, "key");
-        assert!(header.value.is_empty());
+        assert_eq!(header.value, [] as [u8; 0]);
     }
 
     #[test]
@@ -1806,7 +618,7 @@ mod tests {
             key: "debug-key".to_string(),
             value: vec![0xDE, 0xAD],
         };
-        let debug_str = format!("{:?}", header);
+        let debug_str = format!("{header:?}");
         assert!(debug_str.contains("debug-key"));
         assert!(debug_str.contains("RecordHeader"));
     }
@@ -1836,12 +648,12 @@ mod tests {
                 key: "h1".to_string(),
                 value: b"v1".to_vec(),
             }],
-            timestamp: Some(1234567890123),
+            timestamp: Some(1_234_567_890_123),
         };
         assert_eq!(record.key, Some(b"my-key".to_vec()));
         assert_eq!(record.value, Some(b"my-value".to_vec()));
         assert_eq!(record.headers.len(), 1);
-        assert_eq!(record.timestamp, Some(1234567890123));
+        assert_eq!(record.timestamp, Some(1_234_567_890_123));
     }
 
     #[test]
@@ -1924,6 +736,7 @@ mod tests {
             producer_id: 12345,
             producer_epoch: 5,
             base_sequence: 100,
+            is_transactional: false,
         };
         assert_eq!(meta.producer_id, 12345);
         assert_eq!(meta.producer_epoch, 5);
@@ -1937,6 +750,7 @@ mod tests {
             producer_id: -1,
             producer_epoch: -1,
             base_sequence: -1,
+            is_transactional: false,
         };
         assert_eq!(meta.producer_id, -1);
         assert_eq!(meta.producer_epoch, -1);
@@ -1949,6 +763,7 @@ mod tests {
             producer_id: 999,
             producer_epoch: 7,
             base_sequence: 42,
+            is_transactional: false,
         };
         let cloned = meta.clone();
         assert_eq!(cloned.producer_id, meta.producer_id);
@@ -2026,6 +841,7 @@ mod tests {
                 producer_id: 100,
                 producer_epoch: 1,
                 base_sequence: 0,
+                is_transactional: false,
             }),
         };
         assert_eq!(data.partition_index, 5);
@@ -2072,11 +888,11 @@ mod tests {
         let data = PartitionFetchData {
             partition_index: 3,
             fetch_offset: 12345,
-            partition_max_bytes: 1048576,
+            partition_max_bytes: 1_048_576,
         };
         assert_eq!(data.partition_index, 3);
         assert_eq!(data.fetch_offset, 12345);
-        assert_eq!(data.partition_max_bytes, 1048576);
+        assert_eq!(data.partition_max_bytes, 1_048_576);
     }
 
     // ========== OffsetCommitTopicData Tests ==========
@@ -2221,9 +1037,9 @@ mod tests {
         let data = ListOffsetsPartitionData {
             partition_index: 1,
             current_leader_epoch: 5,
-            timestamp: 1704067200000, // 2024-01-01 00:00:00 UTC
+            timestamp: 1_704_067_200_000, // 2024-01-01 00:00:00 UTC
         };
-        assert_eq!(data.timestamp, 1704067200000);
+        assert_eq!(data.timestamp, 1_704_067_200_000);
         assert_eq!(data.current_leader_epoch, 5);
     }
 
@@ -2262,228 +1078,5 @@ mod tests {
         };
         assert_eq!(req.name, "expand-topic");
         assert_eq!(req.count, 10);
-    }
-
-    // ========== TopicProduceResponse Tests ==========
-
-    #[test]
-    fn test_topic_produce_response() {
-        let resp = TopicProduceResponse {
-            name: "resp-topic".to_string(),
-            partitions: vec![PartitionProduceResponse {
-                partition_index: 0,
-                error_code: 0,
-                base_offset: 100,
-                log_append_time: -1,
-                log_start_offset: 0,
-            }],
-        };
-        assert_eq!(resp.name, "resp-topic");
-        assert_eq!(resp.partitions.len(), 1);
-        assert_eq!(resp.partitions[0].base_offset, 100);
-    }
-
-    // ========== PartitionProduceResponse Tests ==========
-
-    #[test]
-    fn test_partition_produce_response_success() {
-        let resp = PartitionProduceResponse {
-            partition_index: 0,
-            error_code: 0,
-            base_offset: 50,
-            log_append_time: 1234567890123,
-            log_start_offset: 0,
-        };
-        assert_eq!(resp.error_code, 0);
-        assert_eq!(resp.base_offset, 50);
-        assert_eq!(resp.log_append_time, 1234567890123);
-    }
-
-    #[test]
-    fn test_partition_produce_response_error() {
-        let resp = PartitionProduceResponse {
-            partition_index: 1,
-            error_code: 3, // UNKNOWN_TOPIC_OR_PARTITION
-            base_offset: -1,
-            log_append_time: -1,
-            log_start_offset: -1,
-        };
-        assert_eq!(resp.error_code, 3);
-        assert_eq!(resp.base_offset, -1);
-    }
-
-    // ========== approx_byte_size Tests (ADR-002) ==========
-
-    #[test]
-    fn test_record_approx_byte_size_empty() {
-        let record = Record {
-            key: None,
-            value: None,
-            headers: vec![],
-            timestamp: None,
-        };
-        // Base overhead is 64 bytes
-        assert_eq!(record.approx_byte_size(), 64);
-    }
-
-    #[test]
-    fn test_record_approx_byte_size_with_key_and_value() {
-        let record = Record {
-            key: Some(b"my-key".to_vec()),     // 6 bytes
-            value: Some(b"my-value".to_vec()), // 8 bytes
-            headers: vec![],
-            timestamp: None,
-        };
-        // 64 (base) + 6 (key) + 8 (value) = 78
-        assert_eq!(record.approx_byte_size(), 78);
-    }
-
-    #[test]
-    fn test_record_approx_byte_size_with_headers() {
-        let record = Record {
-            key: Some(b"k".to_vec()),   // 1 byte
-            value: Some(b"v".to_vec()), // 1 byte
-            headers: vec![
-                RecordHeader {
-                    key: "h1".to_string(), // 2 bytes
-                    value: b"v1".to_vec(), // 2 bytes
-                },
-                RecordHeader {
-                    key: "header2".to_string(), // 7 bytes
-                    value: b"value2".to_vec(),  // 6 bytes
-                },
-            ],
-            timestamp: None,
-        };
-        // 64 (base) + 1 (key) + 1 (value) + (2+2) + (7+6) = 64 + 2 + 17 = 83
-        assert_eq!(record.approx_byte_size(), 83);
-    }
-
-    #[test]
-    fn test_record_approx_byte_size_large_payload() {
-        let large_value = vec![0u8; 1_000_000]; // 1 MB
-        let record = Record {
-            key: None,
-            value: Some(large_value),
-            headers: vec![],
-            timestamp: None,
-        };
-        // 64 (base) + 0 (key) + 1_000_000 (value) = 1_000_064
-        assert_eq!(record.approx_byte_size(), 1_000_064);
-    }
-
-    #[test]
-    fn test_partition_produce_data_approx_byte_size_empty() {
-        let data = PartitionProduceData {
-            partition_index: 0,
-            records: vec![],
-            producer_metadata: None,
-        };
-        // Base overhead is 48 bytes
-        assert_eq!(data.approx_byte_size(), 48);
-    }
-
-    #[test]
-    fn test_partition_produce_data_approx_byte_size_with_records() {
-        let data = PartitionProduceData {
-            partition_index: 0,
-            records: vec![
-                Record {
-                    key: None,
-                    value: None,
-                    headers: vec![],
-                    timestamp: None,
-                },
-                Record {
-                    key: Some(b"key".to_vec()),     // 3 bytes
-                    value: Some(b"value".to_vec()), // 5 bytes
-                    headers: vec![],
-                    timestamp: None,
-                },
-            ],
-            producer_metadata: None,
-        };
-        // 48 (base) + 64 (record1) + (64 + 3 + 5) (record2) = 48 + 64 + 72 = 184
-        assert_eq!(data.approx_byte_size(), 184);
-    }
-
-    #[test]
-    fn test_topic_produce_data_approx_byte_size_empty() {
-        let data = TopicProduceData {
-            name: "test".to_string(), // 4 bytes
-            partitions: vec![],
-        };
-        // 32 (base) + 4 (name) = 36
-        assert_eq!(data.approx_byte_size(), 36);
-    }
-
-    #[test]
-    fn test_topic_produce_data_approx_byte_size_with_partitions() {
-        let data = TopicProduceData {
-            name: "my-topic".to_string(), // 8 bytes
-            partitions: vec![PartitionProduceData {
-                partition_index: 0,
-                records: vec![],
-                producer_metadata: None,
-            }],
-        };
-        // 32 (base) + 8 (name) + 48 (partition) = 88
-        assert_eq!(data.approx_byte_size(), 88);
-    }
-
-    #[test]
-    fn test_kafka_request_approx_byte_size_non_produce() {
-        // Non-Produce requests have minimal overhead (512 bytes)
-        // We can't easily construct a full KafkaRequest without tokio runtime,
-        // so we test the Produce variant calculation instead
-        // This test documents the expected behavior for non-Produce requests
-        let record = Record {
-            key: Some(b"key".to_vec()),
-            value: Some(b"value".to_vec()),
-            headers: vec![],
-            timestamp: None,
-        };
-        // Verify record size calculation works correctly
-        let expected_size = 64 + 3 + 5; // base + key + value
-        assert_eq!(record.approx_byte_size(), expected_size);
-    }
-
-    #[test]
-    fn test_approx_byte_size_accumulation() {
-        // Test that sizes accumulate correctly through the hierarchy
-        let record1 = Record {
-            key: Some(vec![0u8; 100]),
-            value: Some(vec![0u8; 200]),
-            headers: vec![],
-            timestamp: None,
-        };
-        let record2 = Record {
-            key: Some(vec![0u8; 50]),
-            value: Some(vec![0u8; 150]),
-            headers: vec![],
-            timestamp: None,
-        };
-
-        let partition = PartitionProduceData {
-            partition_index: 0,
-            records: vec![record1.clone(), record2.clone()],
-            producer_metadata: None,
-        };
-
-        let topic = TopicProduceData {
-            name: "test".to_string(),
-            partitions: vec![partition.clone()],
-        };
-
-        // Verify the hierarchy accumulates correctly
-        let r1_size = record1.approx_byte_size(); // 64 + 100 + 200 = 364
-        let r2_size = record2.approx_byte_size(); // 64 + 50 + 150 = 264
-        let part_size = partition.approx_byte_size(); // 48 + 364 + 264 = 676
-        let topic_size = topic.approx_byte_size(); // 32 + 4 + 676 = 712
-
-        assert_eq!(r1_size, 364);
-        assert_eq!(r2_size, 264);
-        assert_eq!(part_size, 676);
-        assert_eq!(topic_size, 712);
     }
 }

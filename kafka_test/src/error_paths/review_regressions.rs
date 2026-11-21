@@ -31,7 +31,7 @@ async fn produce_txn(
     producer.init_transactions(Duration::from_secs(10))?;
     producer.begin_transaction()?;
     for i in 0..count {
-        let value = format!("{}-{}", label, i);
+        let value = format!("{label}-{i}");
         producer
             .send(
                 FutureRecord::<(), _>::to(topic)
@@ -64,12 +64,11 @@ pub async fn test_producer_restart_new_epoch_records_are_stored() -> TestResult 
     produce_txn(&txn_id, &topic, 3, "second").await?;
 
     let stored = count_messages(&ctx, &topic).await?;
-    println!("   committed records stored: {}", stored);
+    println!("   committed records stored: {stored}");
     if stored != 13 {
         return Err(format!(
-            "expected 13 committed records after the restart, found {} \
-             (the new epoch's batches were dropped as duplicates)",
-            stored
+            "expected 13 committed records after the restart, found {stored} \
+             (the new epoch's batches were dropped as duplicates)"
         )
         .into());
     }
@@ -133,10 +132,7 @@ pub async fn test_active_idempotent_producer_survives_retention_sweep() -> TestR
         )
         .await?
         .get(0);
-    println!(
-        "   producer {} rows after sweep: {}",
-        producer_id, still_there
-    );
+    println!("   producer {producer_id} rows after sweep: {still_there}");
     if still_there != 1 {
         return Err("the sweep pruned a producer that is still producing".into());
     }
@@ -151,8 +147,9 @@ pub async fn test_active_idempotent_producer_survives_retention_sweep() -> TestR
 
 /// A producer fenced by a newer instance (same transactional.id) must get an error
 /// when it tries to write again, and nothing it sends may become visible. The fenced
-/// AddPartitionsToTxn used to come back as an empty response (its top-level error
-/// field only exists from v4, and the broker advertises v0-3), which reads as success.
+/// A fenced producer's AddPartitionsToTxn carries its error per partition: the
+/// top-level error field only exists from v4 and the broker advertises v0-3, so an
+/// empty response would read as success.
 pub async fn test_fenced_producer_cannot_write() -> TestResult {
     println!("=== Test: Fenced Producer Cannot Write ===\n");
 
@@ -187,26 +184,25 @@ pub async fn test_fenced_producer_cannot_write() -> TestResult {
             .map_err(|e| e.to_string())
     }
     .await;
-    println!("   zombie outcome: {:?}", outcome);
+    println!("   zombie outcome: {outcome:?}");
 
     let visible = count_messages(&ctx, &topic.name).await?;
     let fatal = zombie.client().fatal_error();
-    println!(
-        "   committed records: {}, fatal error: {:?}",
-        visible, fatal
-    );
+    println!("   committed records: {visible}, fatal error: {fatal:?}");
     if outcome.is_ok() {
         return Err("the fenced producer's transaction was reported as committed".into());
     }
     // The broker must tell the client it was fenced (a fatal ProducerFenced error),
     // not leave it to time out.
     match fatal {
-        Some((rdkafka::types::RDKafkaErrorCode::Fenced, _))
-        | Some((rdkafka::types::RDKafkaErrorCode::ProducerFenced, _)) => {}
+        Some((
+            rdkafka::types::RDKafkaErrorCode::Fenced
+            | rdkafka::types::RDKafkaErrorCode::ProducerFenced,
+            _,
+        )) => {}
         other => {
             return Err(format!(
-                "expected rdkafka to record a fatal ProducerFenced error, got {:?}",
-                other
+                "expected rdkafka to record a fatal ProducerFenced error, got {other:?}"
             )
             .into())
         }
@@ -223,51 +219,26 @@ pub async fn test_fenced_producer_cannot_write() -> TestResult {
 
 // ----- wire-level protocol regressions -----
 
-use bytes::{Buf, BufMut, BytesMut};
-use kafka_protocol::messages::produce_request::{
-    PartitionProduceData, ProduceRequest, TopicProduceData,
-};
+use crate::common::broker_addr;
+use crate::wire::records::{encode, plain_record};
+use crate::wire::requests::produce_request;
+use crate::wire::{raw_frame, read_frame_within, request_frame};
+use bytes::{Buf, Bytes};
 use kafka_protocol::messages::TopicName;
 use kafka_protocol::protocol::StrBytes;
-use kafka_protocol::records::{
-    Compression, Record as PRecord, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
-};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use kafka_protocol::records::Compression;
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
-const BROKER: &str = "localhost:9092";
+/// How long a test waits for a response (or for the connection to close).
+const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Write a raw request frame with a v1 (non-flexible) header and an empty client id.
-async fn send_raw(
-    stream: &mut TcpStream,
-    api_key: i16,
-    version: i16,
-    correlation_id: i32,
-    body: &[u8],
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut frame = BytesMut::new();
-    frame.put_i32((2 + 2 + 4 + 2 + body.len()) as i32);
-    frame.put_i16(api_key);
-    frame.put_i16(version);
-    frame.put_i32(correlation_id);
-    frame.put_i16(-1);
-    frame.extend_from_slice(body);
-    stream.write_all(&frame).await?;
-    Ok(())
-}
-
-/// Read one response frame, or None if the broker closed the connection.
-async fn read_raw(stream: &mut TcpStream) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
-    let mut size = [0u8; 4];
-    match tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut size)).await? {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => return Ok(None),
-        Err(e) => return Err(e.into()),
-    }
-    let mut body = vec![0u8; i32::from_be_bytes(size) as usize];
-    stream.read_exact(&mut body).await?;
-    Ok(Some(body))
+/// One batch with one plain record holding `value`.
+fn value_batch(value: &str) -> Bytes {
+    encode(
+        &[plain_record(0, None, value.as_bytes())],
+        Compression::None,
+    )
 }
 
 /// ApiVersions above the supported range is answered in the v0 format with
@@ -275,40 +246,31 @@ async fn read_raw(stream: &mut TcpStream) -> Result<Option<Vec<u8>>, Box<dyn std
 /// that drops the connection.
 pub async fn test_api_versions_above_range_negotiates_down() -> TestResult {
     println!("=== Test: ApiVersions Above Range Negotiates Down ===\n");
-    let mut stream = TcpStream::connect(BROKER).await?;
+    let mut stream = TcpStream::connect(broker_addr()).await?;
     // ApiVersions v3+ uses the flexible request header (v2), which ends with an empty
     // tagged-field section after the client id; the body is likewise just tagged fields.
-    let mut frame = BytesMut::new();
-    frame.put_i16(18);
-    frame.put_i16(5);
-    frame.put_i32(501);
-    frame.put_i16(-1); // null client id
-    frame.put_u8(0); // header tagged fields
-    frame.put_u8(0); // body tagged fields
-    let mut sized = BytesMut::new();
-    sized.put_i32(frame.len() as i32);
-    sized.extend_from_slice(&frame);
-    stream.write_all(&sized).await?;
-    let body = read_raw(&mut stream)
+    // Header tagged fields, then body tagged fields.
+    stream.write_all(&raw_frame(18, 5, 501, &[0, 0])).await?;
+    let body = read_frame_within(&mut stream, READ_TIMEOUT)
         .await?
         .ok_or("the broker closed the connection instead of answering ApiVersions v5")?;
     let mut b = &body[..];
     assert_eq!(b.get_i32(), 501, "correlation id");
     let error_code = b.get_i16();
     let key_count = b.get_i32();
-    println!("   error_code={} api_keys={}", error_code, key_count);
+    println!("   error_code={error_code} api_keys={key_count}");
     assert_eq!(error_code, 35, "UNSUPPORTED_VERSION");
     assert!(key_count > 0, "the key list lets the client pick a version");
     println!("✅ Test PASSED\n");
     Ok(())
 }
 
-/// Fetch v0-3 used to be advertised although the protocol crate cannot encode
-/// them. The advertised range now starts at v4, and a v4 fetch works.
+/// The advertised Fetch range starts at v4 (the protocol crate cannot encode v0-3), and
+/// a v4 fetch works.
 pub async fn test_fetch_advertised_minimum_is_usable() -> TestResult {
     println!("=== Test: Fetch Advertised Minimum Is Usable ===\n");
-    let mut stream = TcpStream::connect(BROKER).await?;
-    let response = crate::error_paths::bug_hunt::roundtrip(
+    let mut stream = TcpStream::connect(broker_addr()).await?;
+    let response = crate::wire::roundtrip(
         &mut stream,
         0,
         502,
@@ -331,11 +293,11 @@ pub async fn test_fetch_advertised_minimum_is_usable() -> TestResult {
         .with_partitions(1)
         .build()
         .await?;
-    let fetched = crate::error_paths::bug_hunt::roundtrip(
+    let fetched = crate::wire::roundtrip(
         &mut stream,
         fetch.min_version,
         503,
-        &crate::error_paths::bug_hunt::fetch_request(&topic.name, 0, 0, 0),
+        &crate::wire::requests::fetch_request(&topic.name, 0, 0, 0),
     )
     .await?;
     assert_eq!(fetched.responses[0].partitions[0].error_code, 0);
@@ -344,51 +306,8 @@ pub async fn test_fetch_advertised_minimum_is_usable() -> TestResult {
     Ok(())
 }
 
-fn record_batch(value: &str) -> BytesMut {
-    let record = PRecord {
-        transactional: false,
-        control: false,
-        partition_leader_epoch: 0,
-        producer_id: -1,
-        producer_epoch: -1,
-        timestamp_type: TimestampType::Creation,
-        offset: 0,
-        sequence: -1,
-        timestamp: 0,
-        key: None,
-        value: Some(bytes::Bytes::from(value.to_string())),
-        headers: Default::default(),
-    };
-    let mut buf = BytesMut::new();
-    RecordBatchEncoder::encode(
-        &mut buf,
-        [record].iter(),
-        &RecordEncodeOptions {
-            version: 2,
-            compression: Compression::None,
-        },
-    )
-    .expect("encode record batch");
-    buf
-}
-
-fn produce_request(topic: &str, records: bytes::Bytes, acks: i16) -> ProduceRequest {
-    let mut p = PartitionProduceData::default();
-    p.index = 0;
-    p.records = Some(records);
-    let mut t = TopicProduceData::default();
-    t.name = TopicName(StrBytes::from_string(topic.to_string()));
-    t.partition_data = vec![p];
-    let mut req = ProduceRequest::default();
-    req.acks = acks;
-    req.timeout_ms = 5000;
-    req.topic_data = vec![t];
-    req
-}
-
-/// Produce v3+ allows one record batch per partition. A second batch used to be
-/// dropped while the request was acked; it must now be rejected (INVALID_RECORD)
-/// with nothing stored.
+/// Produce v3+ allows one record batch per partition. A request with a second batch is
+/// rejected (INVALID_RECORD) with nothing stored, not acked with the second dropped.
 pub async fn test_produce_two_batches_in_one_partition_is_rejected() -> TestResult {
     println!("=== Test: Two Record Batches In One Partition Are Rejected ===\n");
     let ctx = TestContext::new().await?;
@@ -396,15 +315,14 @@ pub async fn test_produce_two_batches_in_one_partition_is_rejected() -> TestResu
         .with_partitions(1)
         .build()
         .await?;
-    let mut two = record_batch("first");
-    two.extend_from_slice(&record_batch("second"));
+    let two = Bytes::from([value_batch("first"), value_batch("second")].concat());
 
-    let mut stream = TcpStream::connect(BROKER).await?;
-    let response = crate::error_paths::bug_hunt::roundtrip(
+    let mut stream = TcpStream::connect(broker_addr()).await?;
+    let response = crate::wire::roundtrip(
         &mut stream,
         7,
         504,
-        &produce_request(&topic.name, two.freeze(), 1),
+        &produce_request(&topic.name, vec![(0, two)], 1),
     )
     .await?;
     let p = &response.responses[0].partition_responses[0];
@@ -414,11 +332,11 @@ pub async fn test_produce_two_batches_in_one_partition_is_rejected() -> TestResu
     assert_eq!(stored, 0, "neither batch may be stored");
 
     // A single batch is still accepted.
-    let ok = crate::error_paths::bug_hunt::roundtrip(
+    let ok = crate::wire::roundtrip(
         &mut stream,
         7,
         505,
-        &produce_request(&topic.name, record_batch("only").freeze(), 1),
+        &produce_request(&topic.name, vec![(0, value_batch("only"))], 1),
     )
     .await?;
     assert_eq!(ok.responses[0].partition_responses[0].error_code, 0);
@@ -437,36 +355,30 @@ pub async fn test_corrupt_acks0_produce_sends_no_reply() -> TestResult {
         .with_partitions(1)
         .build()
         .await?;
-    let mut stream = TcpStream::connect(BROKER).await?;
+    let mut stream = TcpStream::connect(broker_addr()).await?;
 
     // Fire-and-forget produce with garbage in place of a record batch...
     let req = produce_request(
         &topic.name,
-        bytes::Bytes::from_static(b"not a record batch at all"),
+        vec![(0, Bytes::from_static(b"not a record batch at all"))],
         0,
     );
-    let mut header = kafka_protocol::messages::RequestHeader::default();
-    header.request_api_key = 0;
-    header.request_api_version = 7;
-    header.correlation_id = 506;
-    let mut body = BytesMut::new();
-    use kafka_protocol::protocol::Encodable;
-    header.encode(&mut body, 1)?;
-    req.encode(&mut body, 7)?;
-    let mut frame = BytesMut::new();
-    frame.put_i32(body.len() as i32);
-    frame.extend_from_slice(&body);
-    stream.write_all(&frame).await?;
+    stream.write_all(&request_frame(7, 506, &req)).await?;
 
-    // ...then an ordinary request: its reply must be the first frame we read.
-    send_raw(&mut stream, 18, 0, 507, &[]).await?;
-    let first = read_raw(&mut stream).await?.ok_or("connection closed")?;
-    let correlation = (&first[..]).get_i32();
-    println!("   first reply correlation id: {}", correlation);
-    assert_eq!(
-        correlation, 507,
-        "the acks=0 produce must not have been answered"
-    );
+    // ...then an ordinary request. As in Kafka, an acks=0 produce that fails
+    // closes the connection (so the client notices) instead of being silently dropped;
+    // it is never answered, so no frame at all may arrive before the close.
+    let _ = stream.write_all(&raw_frame(18, 0, 507, &[])).await; // may race the close
+    match read_frame_within(&mut stream, READ_TIMEOUT).await? {
+        None => println!("   connection closed without a reply"),
+        Some(frame) => {
+            let correlation = (&frame[..]).get_i32();
+            return Err(format!(
+                "expected the connection to close, got a frame (correlation id {correlation})"
+            )
+            .into());
+        }
+    }
 
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");
@@ -475,9 +387,9 @@ pub async fn test_corrupt_acks0_produce_sends_no_reply() -> TestResult {
 
 // ----- storage / transaction regressions -----
 
-/// A topic with a huge retention.ms (i64::MAX is a common "forever") used to
-/// overflow the sweep's interval arithmetic, rolling back the whole sweep and
-/// stopping retention for every topic.
+/// A topic with a huge retention.ms (i64::MAX is a common "forever") must not overflow
+/// the sweep's interval arithmetic, which would roll back the whole sweep and stop
+/// retention for every topic.
 pub async fn test_huge_retention_ms_does_not_break_sweep() -> TestResult {
     println!("=== Test: Huge retention.ms Does Not Break The Sweep ===\n");
     let ctx = TestContext::new().await?;
@@ -513,15 +425,12 @@ pub async fn test_huge_retention_ms_does_not_break_sweep() -> TestResult {
         .db()
         .query("SELECT * FROM pg_kafka_run_retention_sweep(0, 60)", &[])
         .await;
-    println!("   sweep result: {:?}", swept.as_ref().map(|r| r.len()));
-    swept.map_err(|e| format!("the retention sweep failed: {}", e))?;
+    println!("   sweep result: {:?}", swept.as_ref().map(Vec::len));
+    swept.map_err(|e| format!("the retention sweep failed: {e}"))?;
 
     let kept = count_messages(&ctx, &forever.name).await?;
     let dropped = count_messages(&ctx, &expiring.name).await?;
-    println!(
-        "   forever topic: {} row(s), retention 0 topic: {} row(s)",
-        kept, dropped
-    );
+    println!("   forever topic: {kept} row(s), retention 0 topic: {dropped} row(s)");
     assert_eq!(kept, 1, "retention.ms = i64::MAX keeps the record");
     assert_eq!(
         dropped, 0,
@@ -580,11 +489,9 @@ pub async fn test_timed_out_transaction_cannot_be_resumed() -> TestResult {
             break;
         }
         if std::time::Instant::now() > deadline {
-            return Err(format!(
-                "the timeout sweep never aborted the transaction (state {})",
-                state
-            )
-            .into());
+            return Err(
+                format!("the timeout sweep never aborted the transaction (state {state})").into(),
+            );
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
@@ -607,10 +514,7 @@ pub async fn test_timed_out_transaction_cannot_be_resumed() -> TestResult {
     }
     .await;
     let committed = count_messages(&ctx, &topic.name).await?;
-    println!(
-        "   resumed commit: {:?}; committed rows: {}",
-        outcome, committed
-    );
+    println!("   resumed commit: {outcome:?}; committed rows: {committed}");
     assert!(outcome.is_err(), "a timed-out transaction must not commit");
     assert_eq!(
         committed, 0,
@@ -624,7 +528,7 @@ pub async fn test_timed_out_transaction_cannot_be_resumed() -> TestResult {
 /// EndTxn retried after a lost response finds the transaction already finished
 /// with the requested outcome; Kafka answers NONE, not INVALID_TXN_STATE.
 pub async fn test_end_txn_retry_is_idempotent() -> TestResult {
-    use crate::error_paths::bug_hunt::roundtrip;
+    use crate::wire::roundtrip;
     use kafka_protocol::messages::add_partitions_to_txn_request::{
         AddPartitionsToTxnRequest, AddPartitionsToTxnTopic,
     };
@@ -638,7 +542,7 @@ pub async fn test_end_txn_retry_is_idempotent() -> TestResult {
         .build()
         .await?;
     let txn_id = format!("review-endtxn-{}", uuid::Uuid::new_v4());
-    let mut stream = TcpStream::connect(BROKER).await?;
+    let mut stream = TcpStream::connect(broker_addr()).await?;
 
     let mut init = InitProducerIdRequest::default();
     init.transactional_id = Some(TransactionalId(StrBytes::from_string(txn_id.clone())));
@@ -683,8 +587,8 @@ pub async fn test_end_txn_retry_is_idempotent() -> TestResult {
     Ok(())
 }
 
-/// Metadata (and Produce) auto-creation used to skip the topic-name rules
-/// CreateTopics enforces, creating topics such as "bad name/x".
+/// Metadata (and Produce) auto-creation applies the topic-name rules CreateTopics
+/// enforces, so no topic such as "bad name/x" is created.
 pub async fn test_auto_create_rejects_invalid_topic_name() -> TestResult {
     use kafka_protocol::messages::metadata_request::{MetadataRequest, MetadataRequestTopic};
     println!("=== Test: Auto-Create Rejects Invalid Topic Name ===\n");
@@ -695,8 +599,8 @@ pub async fn test_auto_create_rejects_invalid_topic_name() -> TestResult {
     let mut req = MetadataRequest::default();
     req.topics = Some(vec![t]);
     req.allow_auto_topic_creation = true;
-    let mut stream = TcpStream::connect(BROKER).await?;
-    let response = crate::error_paths::bug_hunt::roundtrip(&mut stream, 4, 701, &req).await?;
+    let mut stream = TcpStream::connect(broker_addr()).await?;
+    let response = crate::wire::roundtrip(&mut stream, 4, 701, &req).await?;
     let code = response.topics[0].error_code;
     let rows = ctx
         .db()
@@ -710,8 +614,7 @@ pub async fn test_auto_create_rejects_invalid_topic_name() -> TestResult {
     Ok(())
 }
 
-/// Headers come back in the order the producer sent them (they used to come back
-/// sorted by key).
+/// Headers come back in the order the producer sent them, not sorted by key.
 pub async fn test_headers_keep_their_order() -> TestResult {
     use rdkafka::consumer::{BaseConsumer, Consumer};
     use rdkafka::message::{Header, Headers, Message, OwnedHeaders};
@@ -756,14 +659,13 @@ pub async fn test_headers_keep_their_order() -> TestResult {
         if let Some(Ok(msg)) = consumer.poll(Duration::from_millis(500)) {
             break msg
                 .headers()
-                .map(|hs| hs.iter().map(|h| h.key.to_string()).collect())
-                .unwrap_or_default();
+                .map_or_default(|hs| hs.iter().map(|h| h.key.to_string()).collect());
         }
         if std::time::Instant::now() > deadline {
             return Err("no record consumed".into());
         }
     };
-    println!("   header keys: {:?}", keys);
+    println!("   header keys: {keys:?}");
     assert_eq!(keys, vec!["zeta", "alpha", "mu"]);
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");
@@ -773,8 +675,8 @@ pub async fn test_headers_keep_their_order() -> TestResult {
 // ----- consumer-group coordinator regressions -----
 
 mod group_wire {
-    use super::*;
-    use crate::error_paths::bug_hunt::roundtrip;
+    use super::{Bytes, Duration, StrBytes, TcpStream, TopicName};
+    use crate::wire::roundtrip;
     use kafka_protocol::messages::heartbeat_request::HeartbeatRequest;
     use kafka_protocol::messages::join_group_request::{
         JoinGroupRequest, JoinGroupRequestProtocol,
@@ -802,7 +704,7 @@ mod group_wire {
     ) -> Result<Joined, Box<dyn std::error::Error>> {
         let mut p = JoinGroupRequestProtocol::default();
         p.name = StrBytes::from_static_str("range");
-        p.metadata = bytes::Bytes::copy_from_slice(metadata);
+        p.metadata = Bytes::copy_from_slice(metadata);
         let mut req = JoinGroupRequest::default();
         req.group_id = GroupId(StrBytes::from_string(group.to_string()));
         req.session_timeout_ms = 30000;
@@ -838,7 +740,7 @@ mod group_wire {
             .map(|(m, a)| {
                 let mut x = SyncGroupRequestAssignment::default();
                 x.member_id = StrBytes::from_string(m.to_string());
-                x.assignment = bytes::Bytes::copy_from_slice(a);
+                x.assignment = Bytes::copy_from_slice(a);
                 x
             })
             .collect();
@@ -858,6 +760,28 @@ mod group_wire {
         req.generation_id = generation;
         req.member_id = StrBytes::from_string(member_id.to_string());
         Ok(roundtrip(s, 3, corr, &req).await?.error_code)
+    }
+
+    /// Heartbeat until the group reports REBALANCE_IN_PROGRESS (27), or give up after
+    /// 5 s and return the last code. Heartbeat travels on the worker's liveness lane,
+    /// so it can overtake a JoinGroup still queued on the main lane.
+    pub async fn heartbeat_until_rebalance(
+        s: &mut TcpStream,
+        group: &str,
+        member_id: &str,
+        generation: i32,
+        corr: i32,
+    ) -> Result<i16, Box<dyn std::error::Error>> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut corr = corr;
+        loop {
+            let code = heartbeat(s, group, member_id, generation, corr).await?;
+            if code == 27 || std::time::Instant::now() > deadline {
+                return Ok(code);
+            }
+            corr += 1000;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
     }
 
     pub async fn commit(
@@ -885,18 +809,19 @@ mod group_wire {
     }
 }
 
-/// The coordinator's rebalance behaviour as seen by a client:
-/// - when a new member starts a rebalance, members still on the old generation get
-///   REBALANCE_IN_PROGRESS from Heartbeat (not ILLEGAL_GENERATION, which clients
-///   treat as "partitions lost") and can still commit offsets for their revoked
-///   partitions;
+/// The coordinator's rebalance behaviour as seen by a client (JoinGroup responses are
+/// held until the join phase completes, so each member uses its own connection):
+/// - when a new member starts a rebalance, its JoinGroup waits while the existing
+///   members still hold the current generation: Heartbeat gives them
+///   REBALANCE_IN_PROGRESS (not ILLEGAL_GENERATION, which clients treat as
+///   "partitions lost") and their revoke-time OffsetCommit is accepted and stored;
+///   once they rejoin, all three members get the same, next generation;
 /// - a follower that rejoins a stable group with unchanged metadata keeps its
-///   assignment and generation (it used to lose the assignment and force another
-///   rebalance);
+///   assignment and generation (no needless rebalance);
 /// - Heartbeat for a group the coordinator does not know returns UNKNOWN_MEMBER_ID
-///   so the client rejoins (it used to get COORDINATOR_NOT_AVAILABLE).
+///   so the client rejoins (not COORDINATOR_NOT_AVAILABLE).
 pub async fn test_group_rebalance_keeps_old_generation_usable() -> TestResult {
-    use group_wire::*;
+    use group_wire::{commit, heartbeat, heartbeat_until_rebalance, join, sync};
     println!("=== Test: Rebalance Keeps The Old Generation Usable ===\n");
     let ctx = TestContext::new().await?;
     let topic = crate::fixtures::TestTopicBuilder::new(&ctx, "review-group")
@@ -904,31 +829,53 @@ pub async fn test_group_rebalance_keeps_old_generation_usable() -> TestResult {
         .build()
         .await?;
     let group = ctx.unique_group("review-group").await;
-    let mut s = TcpStream::connect(BROKER).await?;
+    let mut sa = TcpStream::connect(broker_addr()).await?;
+    let mut sb = TcpStream::connect(broker_addr()).await?;
+    let mut sc = TcpStream::connect(broker_addr()).await?;
 
-    // Stable group {a (leader), b}.
-    let a = join(&mut s, &group, "", b"sub", 800).await?;
-    let b = join(&mut s, &group, "", b"sub", 801).await?;
-    let a = join(&mut s, &group, &a.member_id, b"sub", 802).await?;
+    // Stable group {a (leader), b}: a joins alone, b's join waits for a to rejoin.
+    let a = join(&mut sa, &group, "", b"sub", 800).await?;
+    let a_id = a.member_id.clone();
+    // (Errors are stringified inside `tokio::join!`: a pending branch's output is held
+    // across awaits, and the test future must be Send.)
+    let (b, a) = tokio::join!(
+        async {
+            join(&mut sb, &group, "", b"sub", 801)
+                .await
+                .map_err(|e| e.to_string())
+        },
+        async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let hb = heartbeat_until_rebalance(&mut sa, &group, &a_id, a.generation, 802)
+                .await
+                .map_err(|e| e.to_string())?;
+            assert_eq!(hb, 27, "REBALANCE_IN_PROGRESS tells a to rejoin");
+            join(&mut sa, &group, &a_id, b"sub", 803)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    );
+    let (a, b) = (a?, b?);
     assert_eq!(a.leader, a.member_id);
+    assert_eq!(a.generation, b.generation, "both get the same generation");
     let gen = a.generation;
     let (code, _) = sync(
-        &mut s,
+        &mut sa,
         &group,
         &a.member_id,
         gen,
         &[(&a.member_id, b"assign-a"), (&b.member_id, b"assign-b")],
-        803,
+        804,
     )
     .await?;
     assert_eq!(code, 0, "leader sync");
-    let (code, got) = sync(&mut s, &group, &b.member_id, gen, &[], 804).await?;
+    let (code, got) = sync(&mut sb, &group, &b.member_id, gen, &[], 805).await?;
     assert_eq!((code, got.as_slice()), (0, b"assign-b".as_slice()));
-    println!("Step 1: stable at generation {}", gen);
+    println!("Step 1: stable at generation {gen}");
 
     // A follower rejoining with the same metadata keeps generation and assignment.
-    let b2 = join(&mut s, &group, &b.member_id, b"sub", 805).await?;
-    let (code, got) = sync(&mut s, &group, &b.member_id, b2.generation, &[], 806).await?;
+    let b2 = join(&mut sb, &group, &b.member_id, b"sub", 806).await?;
+    let (code, got) = sync(&mut sb, &group, &b.member_id, b2.generation, &[], 807).await?;
     println!(
         "   follower rejoin: generation {} -> {}, sync code {} assignment {:?}",
         gen,
@@ -942,17 +889,48 @@ pub async fn test_group_rebalance_keeps_old_generation_usable() -> TestResult {
     );
     assert_eq!((code, got.as_slice()), (0, b"assign-b".as_slice()));
 
-    // A new member starts a rebalance; a and b still hold `gen`.
-    let c = join(&mut s, &group, "", b"sub", 807).await?;
-    assert!(c.generation > gen);
-    let hb = heartbeat(&mut s, &group, &a.member_id, gen, 808).await?;
-    let commit_code = commit(&mut s, &group, &b.member_id, gen, &topic.name, 5, 809).await?;
-    println!(
-        "   during rebalance: old-generation heartbeat={} commit={}",
-        hb, commit_code
+    // A new member starts a rebalance; its join waits while a and b still hold `gen`.
+    let (c, rest) = tokio::join!(
+        async {
+            join(&mut sc, &group, "", b"sub", 808)
+                .await
+                .map_err(|e| e.to_string())
+        },
+        async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let hb = heartbeat_until_rebalance(&mut sa, &group, &a.member_id, gen, 809)
+                .await
+                .map_err(|e| e.to_string())?;
+            let commit_code = commit(&mut sb, &group, &b.member_id, gen, &topic.name, 5, 810)
+                .await
+                .map_err(|e| e.to_string())?;
+            println!("   during rebalance: current-generation heartbeat={hb} commit={commit_code}");
+            assert_eq!(hb, 27, "REBALANCE_IN_PROGRESS, so the member rejoins");
+            assert_eq!(commit_code, 0, "the revoke-time commit must be accepted");
+            let (a3, b3) = tokio::join!(
+                async {
+                    join(&mut sa, &group, &a.member_id, b"sub", 811)
+                        .await
+                        .map_err(|e| e.to_string())
+                },
+                async {
+                    join(&mut sb, &group, &b.member_id, b"sub", 812)
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+            );
+            Ok::<_, String>((a3?, b3?))
+        }
     );
-    assert_eq!(hb, 27, "REBALANCE_IN_PROGRESS, so the member rejoins");
-    assert_eq!(commit_code, 0, "the revoke-time commit must be accepted");
+    let (c, (a3, b3)) = (c?, rest?);
+    println!(
+        "   after rejoin: generations a={} b={} c={}",
+        a3.generation, b3.generation, c.generation
+    );
+    assert_eq!(a3.generation, gen + 1);
+    assert_eq!(b3.generation, gen + 1);
+    assert_eq!(c.generation, gen + 1);
+    assert_eq!(c.leader, a.member_id, "the leader keeps leading");
     let stored: i64 = ctx
         .db()
         .query_one(
@@ -964,8 +942,8 @@ pub async fn test_group_rebalance_keeps_old_generation_usable() -> TestResult {
     assert_eq!(stored, 5);
 
     // Unknown group.
-    let unknown = heartbeat(&mut s, "review-no-such-group", "m", 1, 810).await?;
-    println!("   heartbeat for an unknown group: {}", unknown);
+    let unknown = heartbeat(&mut sa, "review-no-such-group", "m", 1, 813).await?;
+    println!("   heartbeat for an unknown group: {unknown}");
     assert_eq!(unknown, 25, "UNKNOWN_MEMBER_ID");
 
     ctx.cleanup().await?;

@@ -1,15 +1,27 @@
-// Produce handler
-//
-// Handles ProduceRequest - writing messages to topics.
-// Phase 7: Added server-side partition routing for partition_index == -1
-// Phase 9: Added idempotent producer sequence validation
-// Phase 10: Added transactional mode support
+//! Produce: writes records to their partitions, with key routing for partition -1,
+//! idempotent sequence checks and transactional writes.
 
-use crate::kafka::constants::{ERROR_NONE, ERROR_UNKNOWN_TOPIC_OR_PARTITION};
-use crate::kafka::error::Result;
+use super::helpers::validate_ongoing_transaction;
+use crate::kafka::constants::{
+    ERROR_INVALID_PRODUCER_EPOCH, ERROR_INVALID_TXN_STATE, ERROR_NONE,
+    ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER, ERROR_UNKNOWN_SERVER_ERROR,
+    ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+};
+use crate::kafka::error::{KafkaError, Result};
 use crate::kafka::handler_context::HandlerContext;
-use crate::kafka::messages::ProducerMetadata;
+use crate::kafka::messages::{
+    ProducerMetadata, Record, RefusedPartition, TopicPlaces, TopicProduceData,
+};
 use crate::kafka::partitioner::compute_partition;
+use crate::kafka::response_builders::build_produce_partition_error_response;
+use crate::kafka::storage::{
+    batch_last_sequence, validate_sequence, KafkaStore, LogStore, PartitionSequence, ProducerBatch,
+    SequenceCheck, SequenceValidation, TopicStore,
+};
+use kafka_protocol::messages::produce_response::{
+    PartitionProduceResponse, ProduceResponse, TopicProduceResponse,
+};
+use kafka_protocol::messages::TopicName;
 use std::collections::HashMap;
 
 /// Handle Produce request
@@ -22,289 +34,1159 @@ use std::collections::HashMap;
 /// - Records become visible when the transaction commits
 /// - Records are marked 'aborted' if the transaction aborts
 ///
+/// As in Kafka 3.7 (`ReplicaManager.appendRecords` verifies the transactional batches of a
+/// request with the transaction coordinator), only a partition whose batch is transactional
+/// is checked against the transaction, on its own: its producer must own the transactional
+/// id (INVALID_PRODUCER_ID_MAPPING otherwise, for an unknown id too; INVALID_PRODUCER_EPOCH
+/// for another epoch), the transaction must be Ongoing and hold the partition
+/// (INVALID_TXN_STATE). A plain or idempotent batch in the same request is written as it is
+/// without a transactional id, unless its producer's open transaction has written to the
+/// partition (INVALID_TXN_STATE). Transactional batches of two producer ids, to partitions
+/// that exist, fail the whole request (`Err`, INVALID_PRODUCER_ID_MAPPING on every
+/// partition, nothing written).
+///
 /// # Arguments
 /// * `ctx` - Handler context (store, coordinator, broker metadata, etc.)
 /// * `topic_data` - Topics and records to produce
-/// * `producer_metadata` - Optional producer metadata for idempotent producers (Phase 9)
-/// * `transactional_id` - Optional transactional ID for transactional producers (Phase 10)
+/// * `producer_metadata` - Request-level producer metadata (idempotent and transactional producers)
+/// * `transactional_id` - Transactional ID for transactional producers
 pub fn handle_produce(
     ctx: &HandlerContext,
-    topic_data: Vec<crate::kafka::messages::TopicProduceData>,
+    topic_data: Vec<TopicProduceData>,
     producer_metadata: Option<&ProducerMetadata>,
     transactional_id: Option<&str>,
-) -> Result<kafka_protocol::messages::produce_response::ProduceResponse> {
-    let store = ctx.store;
-    let default_partitions = ctx.default_partitions;
-    // Phase 10: Validate transaction state if transactional. ProduceResponse has no
-    // top-level error code, so a request-level failure (fenced epoch, unknown
-    // transactional id, transaction not Ongoing) is reported on every requested
-    // partition; an empty response would leave the client without the error.
-    if let Some(txn_id) = transactional_id {
-        if let Some(meta) = producer_metadata {
-            if meta.producer_id >= 0 {
-                if let Err(e) = validate_ongoing_transaction(store, txn_id, meta) {
-                    return Ok(
-                        crate::kafka::response_builders::build_produce_partition_error_response(
-                            &topic_data,
-                            e.to_kafka_error_code(),
-                        ),
-                    );
-                }
-            }
+) -> Result<ProduceResponse> {
+    if transactional_id.is_some() {
+        if let Some(producer_id) = second_transactional_producer(ctx.store, &topic_data)? {
+            return Err(KafkaError::invalid_producer_id_mapping(producer_id));
         }
     }
+    let mut transaction = TransactionCheck {
+        transactional_id,
+        owners: HashMap::new(),
+    };
     let mut kafka_response = crate::kafka::build_produce_response();
-
-    // Process each topic
-    for topic in topic_data {
-        let topic_name: String = topic.name.clone();
-
-        // Get or create topic (returns both topic_id and partition_count in single query).
-        // A failure here is reported on this topic's partitions only.
-        let (topic_id, partition_count) =
-            match super::helpers::get_or_create_valid_topic(store, &topic_name, default_partitions)
-            {
-                Ok(found) => found,
-                Err(e) => {
-                    if e.is_server_error() {
-                        crate::pg_warning!(
-                            "Failed to resolve topic '{}' for produce: {}",
-                            topic_name,
-                            e
-                        );
-                    }
-                    let code = e.to_kafka_error_code();
-                    kafka_response.responses.push(
-                        crate::kafka::response_builders::build_produce_partition_error_response(
-                            std::slice::from_ref(&topic),
-                            code,
-                        )
-                        .responses
-                        .remove(0),
-                    );
-                    continue;
-                }
-            };
-
-        // Build topic response
-        let mut topic_response =
-            kafka_protocol::messages::produce_response::TopicProduceResponse::default();
-        topic_response.name = kafka_protocol::messages::TopicName(topic_name.clone().into());
-
-        // Group records by computed partition, keeping each partition's own producer
-        // metadata: every RecordBatch carries its own base_sequence, so partitions must
-        // not share one request-level sequence number.
-        // When partition_index == -1, use key-based routing.
-        let mut records_by_partition: HashMap<
-            i32,
-            (
-                Vec<crate::kafka::messages::Record>,
-                Option<ProducerMetadata>,
-            ),
-        > = HashMap::new();
-        // Error responses for partitions that cannot be grouped (see below).
-        let mut rejected_partitions: Vec<i32> = Vec::new();
-
-        for partition_data in topic.partitions {
-            let explicit_partition = partition_data.partition_index;
-            // Per-partition metadata; fall back to the request-level metadata only when
-            // the batch carried none (e.g. a legacy MessageSet).
-            let partition_meta = partition_data
-                .producer_metadata
-                .or_else(|| producer_metadata.cloned());
-            let is_idempotent = partition_meta.as_ref().is_some_and(|m| m.producer_id >= 0);
-
-            if explicit_partition == -1 {
-                // An idempotent batch's sequence numbers are tracked per partition.
-                // Splitting one batch across several partitions by key would record
-                // the whole batch's sequence range on each of them and break the
-                // producer's next batch, so server-side routing is refused here.
-                if is_idempotent {
-                    rejected_partitions.push(explicit_partition);
-                    continue;
-                }
-                // Server-side partition routing based on key
-                for record in partition_data.records {
-                    let target_partition =
-                        compute_partition(record.key.as_deref(), partition_count, -1);
-                    records_by_partition
-                        .entry(target_partition)
-                        .or_insert_with(|| (Vec::new(), None))
-                        .0
-                        .push(record);
-                }
-            } else {
-                // Explicit partition - use as-is
-                let entry = records_by_partition
-                    .entry(explicit_partition)
-                    .or_insert_with(|| (Vec::new(), None));
-                entry.0.extend(partition_data.records);
-                if entry.1.is_none() {
-                    entry.1 = partition_meta;
-                }
-            }
-        }
-
-        for partition_index in rejected_partitions {
-            let mut partition_response =
-                kafka_protocol::messages::produce_response::PartitionProduceResponse::default();
-            partition_response.index = partition_index;
-            partition_response.error_code = ERROR_UNKNOWN_TOPIC_OR_PARTITION;
-            partition_response.base_offset = -1;
-            partition_response.log_append_time_ms = -1;
-            partition_response.log_start_offset = -1;
-            topic_response.partition_responses.push(partition_response);
-        }
-
-        // Process each partition group
-        for (partition_index, (records, partition_meta)) in records_by_partition {
-            let mut partition_response =
-                kafka_protocol::messages::produce_response::PartitionProduceResponse::default();
-            partition_response.index = partition_index;
-
-            // Validate partition index against actual partition count
-            if partition_index < 0 || partition_index >= partition_count {
-                partition_response.error_code = ERROR_UNKNOWN_TOPIC_OR_PARTITION;
-                partition_response.base_offset = -1;
-                partition_response.log_append_time_ms = -1;
-                partition_response.log_start_offset = -1;
-                topic_response.partition_responses.push(partition_response);
-                continue;
-            }
-
-            // Sequence metadata for this partition (idempotent producers only).
-            let seq_meta = partition_meta.as_ref().filter(|m| m.producer_id >= 0);
-
-            // Phase 9: Validate sequence for idempotent producers BEFORE inserting
-            let should_insert = if let Some(meta) = seq_meta {
-                // Idempotent producer - check and update sequence
-                match store.check_and_update_sequence(
-                    meta.producer_id,
-                    meta.producer_epoch,
-                    topic_id,
-                    partition_index,
-                    meta.base_sequence,
-                    records.len() as i32,
-                ) {
-                    Ok(should_insert) => should_insert, // true=insert, false=duplicate (skip insert)
-                    Err(e) => {
-                        // Sequence validation failed - return error for this partition
-                        partition_response.error_code = e.to_kafka_error_code();
-                        partition_response.base_offset = -1;
-                        partition_response.log_append_time_ms = -1;
-                        partition_response.log_start_offset = -1;
-                        topic_response.partition_responses.push(partition_response);
-                        continue;
-                    }
-                }
-            } else {
-                true // Non-idempotent producer - always insert
-            };
-
-            // Insert records (skip for duplicates)
-            if should_insert {
-                // Phase 10: Use transactional insert if transactional_id is set
-                let insert_result = if transactional_id.is_some() {
-                    if let Some(meta) = producer_metadata {
-                        store.insert_transactional_records(
-                            topic_id,
-                            partition_index,
-                            &records,
-                            meta.producer_id,
-                            meta.producer_epoch,
-                        )
-                    } else {
-                        // Transactional mode requires producer metadata
-                        Err(crate::kafka::error::KafkaError::Internal(
-                            "Transactional produce requires producer metadata".to_string(),
-                        ))
-                    }
-                } else {
-                    store.insert_records(topic_id, partition_index, &records)
-                };
-
-                match insert_result {
-                    Ok(base_offset) => {
-                        partition_response.error_code = ERROR_NONE;
-                        partition_response.base_offset = base_offset;
-                        partition_response.log_append_time_ms = -1;
-                        partition_response.log_start_offset = -1;
-
-                        // RV-8: advance the idempotent producer's sequence only AFTER the
-                        // insert has succeeded. If the insert had failed, the sequence
-                        // would stay un-advanced and a retry re-inserts, instead of being
-                        // dropped as a false duplicate. new_last_sequence matches the value
-                        // validate_sequence would have stored (base + count - 1).
-                        if let Some(meta) = seq_meta {
-                            let new_last_sequence = meta.base_sequence + records.len() as i32 - 1;
-                            if let Err(e) = store.record_producer_sequence(
-                                meta.producer_id,
-                                topic_id,
-                                partition_index,
-                                new_last_sequence,
-                            ) {
-                                crate::pg_warning!(
-                                    "Failed to record producer sequence (topic_id={}, partition={}): {}",
-                                    topic_id,
-                                    partition_index,
-                                    e
-                                );
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        // Use typed error's Kafka error code for proper protocol response
-                        let error_code = e.to_kafka_error_code();
-                        if e.is_server_error() {
-                            crate::pg_warning!(
-                                "Failed to insert records for topic_id={}, partition={}: {}",
-                                topic_id,
-                                partition_index,
-                                e
-                            );
-                        }
-                        partition_response.error_code = error_code;
-                        partition_response.base_offset = -1;
-                        partition_response.log_append_time_ms = -1;
-                        partition_response.log_start_offset = -1;
-                    }
-                }
-            } else {
-                // Duplicate detected - return success (error_code=0) but skip insert
-                // This is the correct Kafka idempotency behavior
-                partition_response.error_code = ERROR_NONE;
-                // The original batch's offset is not stored, so report it as unknown
-                // (-1) rather than claim offset 0, which the client would record.
-                partition_response.base_offset = -1;
-                partition_response.log_append_time_ms = -1;
-                partition_response.log_start_offset = -1;
-            }
-
-            topic_response.partition_responses.push(partition_response);
-        }
-
-        kafka_response.responses.push(topic_response);
-    }
-
+    kafka_response.responses = topic_data
+        .into_iter()
+        .map(|topic| produce_topic(ctx, topic, producer_metadata, &mut transaction))
+        .collect();
     Ok(kafka_response)
 }
 
-/// Check that `txn_id` belongs to this producer/epoch and is in the Ongoing state.
-fn validate_ongoing_transaction(
-    store: &dyn crate::kafka::storage::KafkaStore,
-    txn_id: &str,
+/// A producer id of the request's transactional batches other than the first one's, if
+/// there is one. Kafka 3.7 verifies a request's transactional batches as one producer's
+/// (`ReplicaManager.handleProduceAppend`) and fails a request whose transactional
+/// batches carry two producer ids with INVALID_PRODUCER_ID_MAPPING on every partition,
+/// writing nothing. It looks only at the partitions that passed the metadata check
+/// (`KafkaApis.handleProduceRequest` answers the others UNKNOWN_TOPIC_OR_PARTITION
+/// first), so a batch to a partition outside its topic, or to a topic that does not
+/// exist yet, does not count. The topics are looked up (without creating them) only for
+/// a request whose batches carry two producer ids at all.
+fn second_transactional_producer(
+    store: &dyn KafkaStore,
+    topic_data: &[TopicProduceData],
+) -> Result<Option<i64>> {
+    if other_transactional_producer(topic_data, |_| Some(i32::MAX)).is_none() {
+        return Ok(None);
+    }
+    let names: Vec<String> = topic_data.iter().map(|t| t.name.clone()).collect();
+    let partition_counts: HashMap<String, i32> = store
+        .get_topic_metadata(Some(&names))?
+        .into_iter()
+        .map(|t| (t.name, t.partition_count))
+        .collect();
+    Ok(other_transactional_producer(topic_data, |topic| {
+        partition_counts.get(topic).copied()
+    }))
+}
+
+/// A producer id of the transactional batches other than the first one's, among the
+/// partitions that exist: `partition_count` gives a topic's partition count, None for a
+/// topic that does not exist.
+fn other_transactional_producer(
+    topic_data: &[TopicProduceData],
+    partition_count: impl Fn(&str) -> Option<i32>,
+) -> Option<i64> {
+    let mut ids = topic_data
+        .iter()
+        .flat_map(|t| {
+            let count = partition_count(&t.name).unwrap_or(0);
+            t.partitions
+                .iter()
+                .filter(move |p| (0..count).contains(&p.partition_index))
+        })
+        .filter_map(|p| p.producer_metadata.as_ref())
+        .filter(|m| m.is_transactional && m.producer_id >= 0)
+        .map(|m| m.producer_id);
+    let first = ids.next()?;
+    ids.find(|&id| id != first)
+}
+
+/// The transaction of a request's transactional batches, checked once per producer id and
+/// epoch.
+struct TransactionCheck<'a> {
+    transactional_id: Option<&'a str>,
+    /// Per producer id and epoch: the error that refuses its transactional batches, if any.
+    owners: HashMap<(i64, i16), Option<i16>>,
+}
+
+impl<'a> TransactionCheck<'a> {
+    /// The transactional id a partition's batch is written under: the request's, when the
+    /// batch is transactional.
+    fn of(&self, meta: Option<&ProducerMetadata>) -> Option<&'a str> {
+        self.transactional_id
+            .filter(|_| meta.is_some_and(|m| m.is_transactional))
+    }
+
+    /// Why the transaction of `meta`'s producer refuses its batches, if it does: the
+    /// producer does not own `txn_id`, or its transaction is not Ongoing.
+    fn refusal(
+        &mut self,
+        store: &dyn KafkaStore,
+        txn_id: &str,
+        meta: &ProducerMetadata,
+    ) -> Option<i16> {
+        *self
+            .owners
+            .entry((meta.producer_id, meta.producer_epoch))
+            .or_insert_with(|| {
+                validate_ongoing_transaction(
+                    store,
+                    txn_id,
+                    meta.producer_id,
+                    meta.producer_epoch,
+                    "Produce",
+                )
+                .err()
+                .map(|e| produce_error_code(&e))
+            })
+    }
+}
+
+/// Answer the partitions whose records failed validation, by topic: as Kafka 3.7 does
+/// (`KafkaApis.handleProduceRequest`), a partition of a topic that does not exist, or
+/// outside its topic, is UNKNOWN_TOPIC_OR_PARTITION whatever its data; any other gets the
+/// error validation found. Looks the topics up without creating them, in one statement.
+/// Topics are answered in the order they are first named, in time linear in the refused
+/// partitions (a request may name hundreds of thousands of topics).
+pub fn answer_refused_partitions<S: TopicStore + ?Sized>(
+    store: &S,
+    refused: &[RefusedPartition],
+) -> Result<Vec<TopicProduceResponse>> {
+    if refused.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut topic_at = TopicPlaces::default();
+    let mut by_topic: Vec<(&str, Vec<&RefusedPartition>)> = Vec::new();
+    for partition in refused {
+        let at = topic_at.place(&partition.topic, || {
+            by_topic.push((&partition.topic, Vec::new()));
+            by_topic.len() - 1
+        });
+        by_topic[at].1.push(partition);
+    }
+    let names: Vec<String> = by_topic
+        .iter()
+        .map(|(name, _)| (*name).to_string())
+        .collect();
+    let partition_counts: HashMap<String, i32> = store
+        .get_topic_metadata(Some(&names))?
+        .into_iter()
+        .map(|t| (t.name, t.partition_count))
+        .collect();
+    Ok(by_topic
+        .into_iter()
+        .map(|(name, partitions)| {
+            let count = partition_counts.get(name).copied();
+            let mut topic = TopicProduceResponse::default();
+            topic.partition_responses = partitions
+                .into_iter()
+                .map(|p| {
+                    let exists = count.is_some_and(|count| (0..count).contains(&p.partition));
+                    failed_partition(
+                        p.partition,
+                        if exists {
+                            p.error_code
+                        } else {
+                            ERROR_UNKNOWN_TOPIC_OR_PARTITION
+                        },
+                    )
+                })
+                .collect();
+            topic.name = TopicName(name.to_string().into());
+            topic
+        })
+        .collect())
+}
+
+/// Write one topic's records and answer for its partitions. A failure to resolve (or
+/// create) the topic is reported on this topic's partitions only.
+fn produce_topic(
+    ctx: &HandlerContext,
+    topic: TopicProduceData,
+    producer_metadata: Option<&ProducerMetadata>,
+    transaction: &mut TransactionCheck<'_>,
+) -> TopicProduceResponse {
+    let store = ctx.store;
+    // Topic id and partition count in one query.
+    let (topic_id, partition_count) =
+        match super::helpers::get_or_create_valid_topic(store, &topic.name, ctx.default_partitions)
+        {
+            Ok(found) => found,
+            Err(e) => {
+                if e.is_server_error() {
+                    crate::pg_warning!(
+                        "Failed to resolve topic '{}' for produce: {}",
+                        topic.name,
+                        e
+                    );
+                }
+                // Kafka 3.7 writes only to partitions that exist and answers any other
+                // UNKNOWN_TOPIC_OR_PARTITION, whatever the name: a name it would not
+                // accept is not a topic either.
+                let error_code = match e {
+                    KafkaError::InvalidTopic { .. } => ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+                    _ => e.to_kafka_error_code(),
+                };
+                return build_produce_partition_error_response(
+                    std::slice::from_ref(&topic),
+                    error_code,
+                )
+                .responses
+                .remove(0);
+            }
+        };
+
+    let mut topic_response = TopicProduceResponse::default();
+    topic_response.name = TopicName(topic.name.clone().into());
+    let target = TargetTopic {
+        id: topic_id,
+        partition_count,
+    };
+    let (by_partition, rejected) = group_by_partition(topic, partition_count, producer_metadata);
+    for partition_index in rejected {
+        topic_response.partition_responses.push(failed_partition(
+            partition_index,
+            ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+        ));
+    }
+    for (partition_index, (records, partition_meta)) in by_partition {
+        topic_response.partition_responses.push(produce_partition(
+            store,
+            target,
+            partition_index,
+            &records,
+            partition_meta.as_ref(),
+            transaction,
+        ));
+    }
+    topic_response
+}
+
+/// The topic a produce writes to.
+#[derive(Clone, Copy)]
+struct TargetTopic {
+    id: i32,
+    partition_count: i32,
+}
+
+/// One partition's records and its producer metadata.
+type PartitionRecords = (Vec<Record>, Option<ProducerMetadata>);
+
+/// Group a topic's records by target partition, keeping each partition's own producer
+/// metadata: every RecordBatch carries its own base_sequence, so partitions must not
+/// share one request-level sequence number. Records sent to partition -1 are routed by
+/// key. Also returns the partitions that are refused before grouping (an idempotent
+/// batch sent to -1).
+fn group_by_partition(
+    topic: TopicProduceData,
+    partition_count: i32,
+    producer_metadata: Option<&ProducerMetadata>,
+) -> (HashMap<i32, PartitionRecords>, Vec<i32>) {
+    let mut by_partition: HashMap<i32, PartitionRecords> = HashMap::new();
+    let mut rejected = Vec::new();
+    for partition_data in topic.partitions {
+        let explicit_partition = partition_data.partition_index;
+        // Per-partition metadata; fall back to the request-level metadata only when the
+        // batch carried none (e.g. a legacy MessageSet).
+        let partition_meta = partition_data
+            .producer_metadata
+            .or_else(|| producer_metadata.cloned());
+        let is_idempotent = partition_meta.as_ref().is_some_and(|m| m.producer_id >= 0);
+
+        if explicit_partition == -1 {
+            // An idempotent batch's sequence numbers are tracked per partition. Splitting
+            // one batch across several partitions by key would record the whole batch's
+            // sequence range on each of them and break the producer's next batch, so
+            // server-side routing is refused for it.
+            if is_idempotent {
+                rejected.push(explicit_partition);
+                continue;
+            }
+            for record in partition_data.records {
+                let target = compute_partition(record.key.as_deref(), partition_count, -1);
+                by_partition
+                    .entry(target)
+                    .or_insert_with(|| (Vec::new(), None))
+                    .0
+                    .push(record);
+            }
+        } else {
+            let entry = by_partition
+                .entry(explicit_partition)
+                .or_insert_with(|| (Vec::new(), None));
+            entry.0.extend(partition_data.records);
+            if entry.1.is_none() {
+                entry.1 = partition_meta;
+            }
+        }
+    }
+    (by_partition, rejected)
+}
+
+/// Write one partition's records and answer for it.
+fn produce_partition(
+    store: &dyn KafkaStore,
+    topic: TargetTopic,
+    partition_index: i32,
+    records: &[Record],
+    partition_meta: Option<&ProducerMetadata>,
+    transaction: &mut TransactionCheck<'_>,
+) -> PartitionProduceResponse {
+    let topic_id = topic.id;
+    let transactional_id = transaction.of(partition_meta);
+    if let Some(error_code) =
+        partition_refusal(store, topic, partition_index, partition_meta, transaction)
+    {
+        return failed_partition(partition_index, error_code);
+    }
+
+    // No batch, no producer state: a partition without records (decoding refuses null
+    // records first) is neither sequence-checked nor remembered as a batch, which would
+    // take the producer's next real batch there for a duplicate.
+    if records.is_empty() {
+        return failed_partition(partition_index, ERROR_UNKNOWN_SERVER_ERROR);
+    }
+
+    // Sequence metadata for this partition (idempotent producers only).
+    let seq_meta = partition_meta.filter(|m| m.producer_id >= 0);
+    let record_count = i32::try_from(records.len())
+        .expect("a request of at most MAX_REQUEST_SIZE bytes holds fewer than i32::MAX records");
+
+    // A non-transactional batch of a producer whose open transaction wrote to the
+    // partition: Kafka 3.7 (`ProducerAppendInfo`) refuses it INVALID_TXN_STATE after the
+    // epoch and sequence checks. One at a higher epoch is judged here, without the stored
+    // sequence check, which would move the producer's stored epoch, so that nothing
+    // changes ([`bumped_epoch_in_open_transaction`]).
+    let open_txn_epoch = match seq_meta.filter(|m| !m.is_transactional) {
+        Some(meta) => {
+            match store.open_txn_epoch_on_partition(meta.producer_id, topic_id, partition_index) {
+                Ok(epoch) => epoch,
+                Err(e) => return failed_partition(partition_index, e.to_kafka_error_code()),
+            }
+        }
+        None => None,
+    };
+    if let (Some(meta), Some(epoch)) = (seq_meta, open_txn_epoch) {
+        if meta.producer_epoch > epoch {
+            return failed_partition(
+                partition_index,
+                bumped_epoch_in_open_transaction(epoch, meta, record_count),
+            );
+        }
+    }
+
+    // Validate an idempotent producer's sequence before inserting.
+    if let Some(meta) = seq_meta {
+        match store.check_and_update_sequence(
+            meta.producer_id,
+            meta.producer_epoch,
+            topic_id,
+            partition_index,
+            meta.base_sequence,
+            record_count,
+        ) {
+            Ok(SequenceCheck::Append) if open_txn_epoch.is_some() => {
+                return failed_partition(partition_index, ERROR_INVALID_TXN_STATE);
+            }
+            Ok(SequenceCheck::Append) => {}
+            // A retry of an appended batch: success with the original base offset and
+            // nothing inserted (Kafka's idempotent producer semantics).
+            Ok(SequenceCheck::Duplicate { base_offset }) => {
+                return appended_partition(store, topic_id, partition_index, base_offset);
+            }
+            Err(e) => return failed_partition(partition_index, produce_error_code(&e)),
+        }
+    }
+
+    let base_offset = match insert_partition_records(
+        store,
+        topic_id,
+        partition_index,
+        records,
+        partition_meta.filter(|_| transactional_id.is_some()),
+    ) {
+        Ok(base_offset) => base_offset,
+        Err(error_code) => return failed_partition(partition_index, error_code),
+    };
+
+    // The producer's sequence advances only after the insert succeeded, so a failed
+    // insert leaves it in place and the retry is inserted instead of being dropped as a
+    // false duplicate.
+    if let Some(meta) = seq_meta {
+        record_appended_batch(
+            store,
+            meta,
+            topic_id,
+            partition_index,
+            record_count,
+            base_offset,
+        );
+    }
+    appended_partition(store, topic_id, partition_index, base_offset)
+}
+
+/// The error for a non-transactional batch at a higher epoch than its producer's open
+/// transaction `open_epoch`, on a partition that transaction wrote to. Kafka 3.7's order
+/// (`ProducerAppendInfo.appendDataBatch`): the sequence check first, where the
+/// transaction's records give the producer an entry on the partition, so the bumped epoch
+/// must start at sequence 0 (OUT_OF_ORDER_SEQUENCE_NUMBER otherwise, [`validate_sequence`]);
+/// then INVALID_TXN_STATE. Either way nothing is stored.
+fn bumped_epoch_in_open_transaction(
+    open_epoch: i16,
     meta: &ProducerMetadata,
-) -> Result<()> {
-    store.validate_transaction(txn_id, meta.producer_id, meta.producer_epoch)?;
-    match store.get_transaction_state(txn_id)? {
-        Some(crate::kafka::storage::TransactionState::Ongoing) => Ok(()),
-        Some(other) => Err(crate::kafka::error::KafkaError::invalid_txn_state(
-            txn_id,
-            format!("{:?}", other),
-            "Produce",
-        )),
-        None => Err(crate::kafka::error::KafkaError::transactional_id_not_found(
-            txn_id,
-        )),
+    record_count: i32,
+) -> i16 {
+    match validate_sequence(
+        open_epoch,
+        PartitionSequence::EpochStart,
+        &[],
+        meta.producer_epoch,
+        meta.base_sequence,
+        record_count,
+    ) {
+        SequenceValidation::OutOfOrder { .. } => ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER,
+        _ => ERROR_INVALID_TXN_STATE,
+    }
+}
+
+/// Why a partition cannot be written, if it cannot: it is outside the topic, or its batch
+/// is transactional and the transaction refuses it ([`TransactionCheck::refusal`]) or does
+/// not hold the partition (AddPartitionsToTxn), which Kafka answers INVALID_TXN_STATE.
+fn partition_refusal(
+    store: &dyn KafkaStore,
+    topic: TargetTopic,
+    partition_index: i32,
+    partition_meta: Option<&ProducerMetadata>,
+    transaction: &mut TransactionCheck<'_>,
+) -> Option<i16> {
+    if partition_index < 0 || partition_index >= topic.partition_count {
+        return Some(ERROR_UNKNOWN_TOPIC_OR_PARTITION);
+    }
+    let txn_id = transaction.of(partition_meta)?;
+    let meta = partition_meta?;
+    if let Some(code) = transaction.refusal(store, txn_id, meta) {
+        return Some(code);
+    }
+    match store.txn_has_partition(txn_id, topic.id, partition_index) {
+        Ok(true) => None,
+        Ok(false) => Some(ERROR_INVALID_TXN_STATE),
+        Err(e) => Some(e.to_kafka_error_code()),
+    }
+}
+
+/// Insert the records (pending in the transaction of `transactional`, the metadata of a
+/// transactional batch): their base offset, or the partition's error code.
+fn insert_partition_records(
+    store: &dyn KafkaStore,
+    topic_id: i32,
+    partition_index: i32,
+    records: &[Record],
+    transactional: Option<&ProducerMetadata>,
+) -> std::result::Result<i64, i16> {
+    let inserted = match transactional {
+        Some(meta) => store.insert_transactional_records(
+            topic_id,
+            partition_index,
+            records,
+            meta.producer_id,
+            meta.producer_epoch,
+        ),
+        None => store.insert_records(topic_id, partition_index, records),
+    };
+    inserted.map_err(|e| {
+        if e.is_server_error() {
+            crate::pg_warning!(
+                "Failed to insert records for topic_id={}, partition={}: {}",
+                topic_id,
+                partition_index,
+                e
+            );
+        }
+        e.to_kafka_error_code()
+    })
+}
+
+/// Remember an appended idempotent batch with its offset, so a retry of it is answered
+/// with that offset. The records are already written, so a failure only logs.
+fn record_appended_batch(
+    store: &dyn KafkaStore,
+    meta: &ProducerMetadata,
+    topic_id: i32,
+    partition_index: i32,
+    record_count: i32,
+    base_offset: i64,
+) {
+    if let Err(e) = store.record_producer_batch(ProducerBatch {
+        producer_id: meta.producer_id,
+        topic_id,
+        partition_id: partition_index,
+        first_sequence: meta.base_sequence,
+        last_sequence: batch_last_sequence(meta.base_sequence, record_count),
+        base_offset,
+    }) {
+        crate::pg_warning!(
+            "Failed to record producer sequence (topic_id={}, partition={}): {}",
+            topic_id,
+            partition_index,
+            e
+        );
+    }
+}
+
+/// A partition answer for records stored at `base_offset`.
+fn appended_partition(
+    store: &dyn KafkaStore,
+    topic_id: i32,
+    partition_index: i32,
+    base_offset: i64,
+) -> PartitionProduceResponse {
+    let mut response = PartitionProduceResponse::default();
+    response.index = partition_index;
+    response.error_code = ERROR_NONE;
+    response.base_offset = base_offset;
+    response.log_append_time_ms = -1;
+    response.log_start_offset = reported_log_start_offset(store, topic_id, partition_index);
+    response
+}
+
+/// A partition answer for records that were not stored.
+fn failed_partition(partition_index: i32, error_code: i16) -> PartitionProduceResponse {
+    let mut response = PartitionProduceResponse::default();
+    response.index = partition_index;
+    response.error_code = error_code;
+    response.base_offset = -1;
+    response.log_append_time_ms = -1;
+    response.log_start_offset = -1;
+    response
+}
+
+/// The Produce error code for `e`. A stale epoch is INVALID_PRODUCER_EPOCH (47) on
+/// Produce in Kafka 3.7, for idempotent and transactional producers alike (since
+/// Kafka 2.7 PRODUCER_FENCED is no longer sent in a produce response), so a fenced
+/// transactional epoch maps to it too.
+fn produce_error_code(e: &KafkaError) -> i16 {
+    match e {
+        KafkaError::ProducerFenced { .. } => ERROR_INVALID_PRODUCER_EPOCH,
+        _ => e.to_kafka_error_code(),
+    }
+}
+
+/// The log start offset a successful partition response reports, as Kafka does. The
+/// records are already written, so a failed lookup does not fail the produce: the
+/// field is then -1, the value Kafka sends when it has none.
+fn reported_log_start_offset(store: &dyn LogStore, topic_id: i32, partition_id: i32) -> i64 {
+    store
+        .get_log_start_offset(topic_id, partition_id)
+        .unwrap_or_else(|e| {
+            crate::pg_warning!(
+                "Failed to read the log start offset (topic_id={}, partition={}): {}",
+                topic_id,
+                partition_id,
+                e
+            );
+            -1
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kafka::constants::ERROR_INVALID_PRODUCER_ID_MAPPING;
+    use crate::kafka::error::KafkaError;
+    use crate::kafka::messages::{PartitionProduceData, Record, TopicProduceData};
+    use crate::kafka::storage::TransactionState;
+    use crate::testing::mocks::MockKafkaStore;
+    use crate::testing::TestEnv;
+
+    fn request(partitions: &[i32]) -> Vec<TopicProduceData> {
+        vec![TopicProduceData {
+            name: "t".to_string(),
+            partitions: partitions
+                .iter()
+                .map(|&p| PartitionProduceData {
+                    partition_index: p,
+                    records: vec![Record {
+                        key: None,
+                        value: Some(b"v".to_vec()),
+                        headers: vec![],
+                        timestamp: None,
+                    }],
+                    producer_metadata: Some(meta()),
+                })
+                .collect(),
+        }]
+    }
+
+    fn meta() -> ProducerMetadata {
+        ProducerMetadata {
+            producer_id: 7,
+            producer_epoch: 2,
+            base_sequence: 0,
+            is_transactional: true,
+        }
+    }
+
+    fn run(mock: &MockKafkaStore, partitions: &[i32], txn: Option<&str>) -> Vec<(i32, i16, i64)> {
+        let env = TestEnv::new();
+        let ctx = env.ctx(mock);
+        let mut out: Vec<(i32, i16, i64)> =
+            handle_produce(&ctx, request(partitions), Some(&meta()), txn)
+                .unwrap()
+                .responses
+                .iter()
+                .flat_map(|t| t.partition_responses.iter())
+                .map(|p| (p.index, p.error_code, p.base_offset))
+                .collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// Transactional batches of two producer ids fail the whole request, before anything
+    /// is written; other producers' idempotent batches do not count, nor do batches to
+    /// partitions that do not exist (outside the topic, or of a missing topic).
+    #[test]
+    fn transactional_batches_of_two_producer_ids_fail_the_request() {
+        let with_ids = |ids: &[(i64, bool)]| {
+            let mut data = request(&(0..).take(ids.len()).collect::<Vec<i32>>());
+            for (p, &(producer_id, is_transactional)) in data[0].partitions.iter_mut().zip(ids) {
+                p.producer_metadata = Some(ProducerMetadata {
+                    producer_id,
+                    is_transactional,
+                    ..meta()
+                });
+            }
+            data
+        };
+        let three = |topic: &str| (topic == "t").then_some(3);
+        assert_eq!(
+            other_transactional_producer(&with_ids(&[(7, true), (7, true)]), three),
+            None
+        );
+        assert_eq!(
+            other_transactional_producer(&with_ids(&[(7, true), (8, false)]), three),
+            None
+        );
+        assert_eq!(
+            other_transactional_producer(&with_ids(&[(-1, true), (7, true)]), three),
+            None
+        );
+        assert_eq!(
+            other_transactional_producer(&with_ids(&[(7, true), (7, true), (9, true)]), three),
+            Some(9)
+        );
+        // Partition 3 is outside the topic, a missing topic has none.
+        let four = with_ids(&[(7, true), (7, true), (7, true), (9, true)]);
+        assert_eq!(other_transactional_producer(&four, three), None);
+        assert_eq!(other_transactional_producer(&four, |_| Some(4)), Some(9));
+        assert_eq!(other_transactional_producer(&four, |_| None), None);
+
+        // Nothing but the metadata lookup before the request fails; one producer id in
+        // the request needs no lookup at all (a MockKafkaStore without expectations
+        // panics on a call).
+        let mut mock = MockKafkaStore::new();
+        mock.expect_get_topic_metadata()
+            .times(1)
+            .returning(|names| {
+                assert_eq!(names, Some(&["t".to_string()][..]));
+                Ok(vec![crate::kafka::storage::TopicMetadata {
+                    name: "t".to_string(),
+                    id: 1,
+                    partition_count: 3,
+                }])
+            });
+        let env = TestEnv::new();
+        let ctx = env.ctx(&mock);
+        let err = handle_produce(
+            &ctx,
+            with_ids(&[(7, true), (9, true)]),
+            Some(&meta()),
+            Some("tx"),
+        )
+        .unwrap_err();
+        assert_eq!(err.to_kafka_error_code(), ERROR_INVALID_PRODUCER_ID_MAPPING);
+        let store = MockKafkaStore::new();
+        assert_eq!(
+            second_transactional_producer(&store, &with_ids(&[(7, true), (7, true)])).unwrap(),
+            None
+        );
+    }
+
+    /// Kafka writes the owner's batch when the other producer's goes to a partition
+    /// outside the topic, which it answers UNKNOWN_TOPIC_OR_PARTITION.
+    #[test]
+    fn another_producers_batch_outside_the_topic_does_not_fail_the_request() {
+        let mut mock = MockKafkaStore::new();
+        mock.expect_get_topic_metadata().times(1).returning(|_| {
+            Ok(vec![crate::kafka::storage::TopicMetadata {
+                name: "t".to_string(),
+                id: 1,
+                partition_count: 2,
+            }])
+        });
+        mock.expect_get_log_start_offset().returning(|_, _| Ok(0));
+        mock.expect_validate_transaction()
+            .returning(|_, _, _| Ok(()));
+        mock.expect_get_transaction_state()
+            .returning(|_| Ok(Some(TransactionState::Ongoing)));
+        mock.expect_get_or_create_topic()
+            .returning(|_, _| Ok((1, 2)));
+        mock.expect_txn_has_partition()
+            .returning(|_, _, _| Ok(true));
+        mock.expect_check_and_update_sequence()
+            .times(1)
+            .returning(|_, _, _, _, _, _| Ok(SequenceCheck::Append));
+        mock.expect_insert_transactional_records()
+            .times(1)
+            .returning(|_, _, _, _, _| Ok(11));
+        mock.expect_record_producer_batch()
+            .times(1)
+            .returning(|_| Ok(()));
+        let mut data = request(&[0, 9]);
+        data[0].partitions[1].producer_metadata = Some(ProducerMetadata {
+            producer_id: 8,
+            ..meta()
+        });
+        let env = TestEnv::new();
+        let ctx = env.ctx(&mock);
+        let mut got: Vec<(i32, i16, i64)> = handle_produce(&ctx, data, Some(&meta()), Some("tx"))
+            .unwrap()
+            .responses
+            .iter()
+            .flat_map(|t| t.partition_responses.iter())
+            .map(|p| (p.index, p.error_code, p.base_offset))
+            .collect();
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec![
+                (0, ERROR_NONE, 11),
+                (9, ERROR_UNKNOWN_TOPIC_OR_PARTITION, -1)
+            ]
+        );
+    }
+
+    /// A non-transactional batch of a producer whose Ongoing transaction wrote to the
+    /// partition is INVALID_TXN_STATE, after the epoch and sequence checks (a higher epoch
+    /// without the stored check: it must start at sequence 0), and nothing is written;
+    /// without such a transaction it is written.
+    #[test]
+    fn a_non_transactional_batch_inside_an_open_transaction_is_refused() {
+        let idempotent = |epoch| ProducerMetadata {
+            producer_epoch: epoch,
+            is_transactional: false,
+            ..meta()
+        };
+        let produce = |open: Option<i16>, epoch: i16, check: Option<Result<SequenceCheck>>| {
+            let mut mock = MockKafkaStore::new();
+            mock.expect_get_or_create_topic()
+                .returning(|_, _| Ok((1, 1)));
+            mock.expect_open_txn_epoch_on_partition()
+                .times(1)
+                .returning(move |pid, topic, partition| {
+                    assert_eq!((pid, topic, partition), (7, 1, 0));
+                    Ok(open)
+                });
+            let mut check = check;
+            mock.expect_check_and_update_sequence()
+                .times(usize::from(check.is_some()))
+                .returning(move |_, _, _, _, _, _| check.take().unwrap());
+            mock.expect_insert_records().returning(|_, _, _| Ok(4));
+            mock.expect_record_producer_batch().returning(|_| Ok(()));
+            mock.expect_get_log_start_offset().returning(|_, _| Ok(0));
+            let mut data = request(&[0]);
+            data[0].partitions[0].producer_metadata = Some(idempotent(epoch));
+            let env = TestEnv::new();
+            let ctx = env.ctx(&mock);
+            let p = handle_produce(&ctx, data, None, None).unwrap().responses[0]
+                .partition_responses[0]
+                .clone();
+            (p.error_code, p.base_offset)
+        };
+        let append = || Some(Ok(SequenceCheck::Append));
+        assert_eq!(produce(None, 2, append()), (ERROR_NONE, 4));
+        assert_eq!(produce(Some(2), 2, append()), (ERROR_INVALID_TXN_STATE, -1));
+        assert_eq!(produce(Some(2), 3, None), (ERROR_INVALID_TXN_STATE, -1));
+        let bumped_at = |seq| {
+            let mut m = idempotent(3);
+            m.base_sequence = seq;
+            bumped_epoch_in_open_transaction(2, &m, 1)
+        };
+        assert_eq!(bumped_at(5), ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER);
+        assert_eq!(bumped_at(-1), ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER);
+        assert_eq!(bumped_at(0), ERROR_INVALID_TXN_STATE);
+        assert_eq!(
+            produce(
+                Some(2),
+                2,
+                Some(Ok(SequenceCheck::Duplicate { base_offset: 1 }))
+            ),
+            (ERROR_NONE, 1),
+            "a retry of an earlier batch is still answered with its offset"
+        );
+        assert_eq!(
+            produce(Some(2), 1, Some(Err(KafkaError::producer_fenced(7, 1, 2)))),
+            (ERROR_INVALID_PRODUCER_EPOCH, -1)
+        );
+    }
+
+    /// Kafka: a transactional Produce to a partition the transaction never added
+    /// (AddPartitionsToTxn) is INVALID_TXN_STATE, and nothing is written.
+    #[test]
+    fn transactional_produce_to_an_unregistered_partition_is_refused() {
+        let mut mock = MockKafkaStore::new();
+        mock.expect_get_log_start_offset().returning(|_, _| Ok(0));
+        mock.expect_validate_transaction()
+            .returning(|_, _, _| Ok(()));
+        mock.expect_get_transaction_state()
+            .returning(|_| Ok(Some(TransactionState::Ongoing)));
+        mock.expect_get_or_create_topic()
+            .returning(|_, _| Ok((1, 2)));
+        mock.expect_txn_has_partition()
+            .returning(|_, _, p| Ok(p == 0));
+        mock.expect_check_and_update_sequence()
+            .times(1)
+            .returning(|_, _, _, _, _, _| Ok(SequenceCheck::Append));
+        mock.expect_insert_transactional_records()
+            .times(1)
+            .returning(|_, _, _, _, _| Ok(11));
+        mock.expect_record_producer_batch()
+            .times(1)
+            .returning(|_| Ok(()));
+        assert_eq!(
+            run(&mock, &[0, 1], Some("tx")),
+            vec![(0, ERROR_NONE, 11), (1, ERROR_INVALID_TXN_STATE, -1)]
+        );
+    }
+
+    /// Kafka reports the partition's log start offset on a successful produce, for an
+    /// appended batch and for a retried duplicate alike.
+    #[test]
+    fn successful_produce_reports_the_log_start_offset() {
+        let mut mock = MockKafkaStore::new();
+        mock.expect_get_or_create_topic()
+            .returning(|_, _| Ok((1, 2)));
+        mock.expect_check_and_update_sequence()
+            .returning(|_, _, _, partition, _, _| {
+                Ok(if partition == 0 {
+                    SequenceCheck::Append
+                } else {
+                    SequenceCheck::Duplicate { base_offset: 3 }
+                })
+            });
+        mock.expect_insert_records().returning(|_, _, _| Ok(11));
+        mock.expect_record_producer_batch().returning(|_| Ok(()));
+        mock.expect_get_log_start_offset()
+            .returning(|_, partition| Ok(5 + i64::from(partition)));
+        let env = TestEnv::new();
+        let ctx = env.ctx(&mock);
+        let response = handle_produce(&ctx, request(&[0, 1]), Some(&meta()), None).unwrap();
+        let mut got: Vec<(i32, i16, i64, i64)> = response.responses[0]
+            .partition_responses
+            .iter()
+            .map(|p| (p.index, p.error_code, p.base_offset, p.log_start_offset))
+            .collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![(0, ERROR_NONE, 11, 5), (1, ERROR_NONE, 3, 6)]);
+    }
+
+    /// A partition without records takes no producer state: it is refused
+    /// UNKNOWN_SERVER_ERROR without a sequence check or a remembered batch, even with the
+    /// request's producer metadata, while the request's other partitions are written.
+    #[test]
+    fn a_partition_without_records_takes_no_producer_state() {
+        let mut mock = MockKafkaStore::new();
+        mock.expect_open_txn_epoch_on_partition()
+            .returning(|_, _, _| Ok(None));
+        mock.expect_get_or_create_topic()
+            .returning(|_, _| Ok((1, 2)));
+        mock.expect_check_and_update_sequence()
+            .times(1)
+            .returning(|_, _, _, partition, _, _| {
+                assert_eq!(partition, 0);
+                Ok(SequenceCheck::Append)
+            });
+        mock.expect_insert_records()
+            .times(1)
+            .returning(|_, _, _| Ok(0));
+        mock.expect_record_producer_batch()
+            .times(1)
+            .returning(|batch| {
+                assert_eq!(batch.partition_id, 0);
+                Ok(())
+            });
+        mock.expect_get_log_start_offset().returning(|_, _| Ok(0));
+        let mut data = request(&[0, 1]);
+        data[0].partitions[1].records.clear();
+        data[0].partitions[1].producer_metadata = None;
+        let idempotent = ProducerMetadata {
+            is_transactional: false,
+            ..meta()
+        };
+        for p in &mut data[0].partitions {
+            p.producer_metadata = p.producer_metadata.as_ref().map(|_| idempotent.clone());
+        }
+        let env = TestEnv::new();
+        let ctx = env.ctx(&mock);
+        let response = handle_produce(&ctx, data, Some(&idempotent), None).unwrap();
+        let mut got: Vec<(i32, i16, i64)> = response.responses[0]
+            .partition_responses
+            .iter()
+            .map(|p| (p.index, p.error_code, p.base_offset))
+            .collect();
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec![(0, ERROR_NONE, 0), (1, ERROR_UNKNOWN_SERVER_ERROR, -1)]
+        );
+    }
+
+    /// A failed log-start lookup after the records are written leaves the produce
+    /// successful and reports -1.
+    #[test]
+    fn log_start_lookup_failure_keeps_the_produce_successful() {
+        let mut mock = MockKafkaStore::new();
+        mock.expect_get_or_create_topic()
+            .returning(|_, _| Ok((1, 1)));
+        mock.expect_check_and_update_sequence()
+            .returning(|_, _, _, _, _, _| Ok(SequenceCheck::Append));
+        mock.expect_insert_records().returning(|_, _, _| Ok(4));
+        mock.expect_record_producer_batch().returning(|_| Ok(()));
+        mock.expect_get_log_start_offset()
+            .returning(|_, _| Err(KafkaError::Internal("boom".into())));
+        let env = TestEnv::new();
+        let ctx = env.ctx(&mock);
+        let response = handle_produce(&ctx, request(&[0]), Some(&meta()), None).unwrap();
+        let p = &response.responses[0].partition_responses[0];
+        assert_eq!(
+            (p.error_code, p.base_offset, p.log_start_offset),
+            (ERROR_NONE, 4, -1)
+        );
+    }
+
+    /// Kafka 3.7 answers a Produce to a topic that does not exist
+    /// UNKNOWN_TOPIC_OR_PARTITION whatever its name: a name it would not accept (too
+    /// long, bad characters, "..") is not created and gets the same answer, not
+    /// INVALID_TOPIC_EXCEPTION.
+    #[test]
+    fn produce_to_an_invalid_name_is_unknown_topic_or_partition() {
+        let mut mock = MockKafkaStore::new();
+        mock.expect_get_topic_metadata().returning(|_| Ok(vec![]));
+        mock.expect_get_or_create_topic().times(0);
+        let env = TestEnv::new();
+        let ctx = env.ctx(&mock);
+        for name in ["l".repeat(250), "bad name!".to_string(), "..".to_string()] {
+            let mut topic_data = request(&[0]);
+            topic_data[0].name.clone_from(&name);
+            topic_data[0].partitions[0].producer_metadata = None;
+            let resp = handle_produce(&ctx, topic_data, None, None).unwrap();
+            let p = &resp.responses[0].partition_responses[0];
+            assert_eq!(p.error_code, ERROR_UNKNOWN_TOPIC_OR_PARTITION, "{name}");
+        }
+    }
+
+    /// A refused partition is UNKNOWN_TOPIC_OR_PARTITION when its topic does not exist or
+    /// it is outside its topic, as in Kafka 3.7, and otherwise gets its validation error;
+    /// the topics are looked up, never created, in one call.
+    #[test]
+    fn refused_partitions_of_unknown_topics_are_unknown_topic_or_partition() {
+        use crate::kafka::constants::ERROR_CORRUPT_MESSAGE;
+        use crate::kafka::storage::TopicMetadata;
+        let mut mock = MockKafkaStore::new();
+        mock.expect_get_topic_metadata()
+            .times(1)
+            .returning(|names| {
+                assert_eq!(names, Some(&["t".to_string(), "gone".to_string()][..]));
+                Ok(vec![TopicMetadata {
+                    name: "t".to_string(),
+                    id: 1,
+                    partition_count: 2,
+                }])
+            });
+        let refused = |topic: &str, partition| RefusedPartition {
+            topic: topic.into(),
+            partition,
+            error_code: ERROR_CORRUPT_MESSAGE,
+        };
+        let answered = answer_refused_partitions(
+            &mock,
+            &[
+                refused("t", 1),
+                refused("gone", 0),
+                refused("t", 2),
+                refused("t", -1),
+            ],
+        )
+        .unwrap();
+        let got: Vec<(String, i32, i16)> = answered
+            .iter()
+            .flat_map(|t| {
+                t.partition_responses
+                    .iter()
+                    .map(|p| (t.name.to_string(), p.index, p.error_code))
+            })
+            .collect();
+        let t = |p, code| ("t".to_string(), p, code);
+        assert_eq!(
+            got,
+            vec![
+                t(1, ERROR_CORRUPT_MESSAGE),
+                t(2, ERROR_UNKNOWN_TOPIC_OR_PARTITION),
+                t(-1, ERROR_UNKNOWN_TOPIC_OR_PARTITION),
+                ("gone".to_string(), 0, ERROR_UNKNOWN_TOPIC_OR_PARTITION),
+            ]
+        );
+        assert_eq!(
+            answer_refused_partitions(&MockKafkaStore::new(), &[])
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    /// Answering refused partitions takes time linear in them: a request of tens of
+    /// thousands of topics of one refused partition each (a few hundred KB on the wire) is
+    /// answered on the DB thread at once, not in seconds.
+    #[test]
+    fn refused_partitions_are_answered_in_linear_time() {
+        use crate::kafka::constants::ERROR_CORRUPT_MESSAGE;
+        use crate::kafka::storage::TopicMetadata;
+        let mut mock = MockKafkaStore::new();
+        mock.expect_get_topic_metadata().returning(|names| {
+            Ok(names
+                .unwrap_or_default()
+                .iter()
+                .map(|name| TopicMetadata {
+                    name: name.clone(),
+                    id: 1,
+                    partition_count: 1,
+                })
+                .collect())
+        });
+        let refused = |n: usize| -> Vec<RefusedPartition> {
+            (0..n)
+                .map(|i| RefusedPartition {
+                    topic: format!("q{i:07}").into(),
+                    partition: 0,
+                    error_code: ERROR_CORRUPT_MESSAGE,
+                })
+                .collect()
+        };
+        let growth = crate::testing::growth(8_000, |n| {
+            let refused = refused(n);
+            let answered = answer_refused_partitions(&mock, &refused).unwrap();
+            assert_eq!(answered.len(), n);
+        });
+        assert!(growth < 8.0, "4x the topics took {growth:.1}x the time");
+        let many = refused(60_000);
+        let (answered, spent) =
+            crate::testing::cpu_time(|| answer_refused_partitions(&mock, &many).unwrap());
+        assert_eq!(answered.len(), 60_000);
+        assert!(spent < std::time::Duration::from_millis(500), "{spent:?}");
+    }
+
+    /// Kafka 3.7 checks only the transactional batches of a transactional Produce against
+    /// the transaction, once per producer, each partition on its own: an unknown
+    /// transactional id (or another producer's) refuses them INVALID_PRODUCER_ID_MAPPING,
+    /// and a plain batch beside them is written outside the transaction.
+    #[test]
+    fn only_transactional_batches_are_checked_against_the_transaction() {
+        let mut mock = MockKafkaStore::new();
+        mock.expect_get_log_start_offset().returning(|_, _| Ok(0));
+        mock.expect_get_or_create_topic()
+            .returning(|_, _| Ok((1, 3)));
+        mock.expect_validate_transaction()
+            .times(1)
+            .returning(|id, _, _| Err(KafkaError::transactional_id_not_found(id)));
+        mock.expect_insert_records().times(1).returning(|_, p, _| {
+            assert_eq!(p, 2);
+            Ok(4)
+        });
+        let mut data = request(&[0, 1, 2]);
+        data[0].partitions[2].producer_metadata = Some(ProducerMetadata {
+            producer_id: -1,
+            producer_epoch: -1,
+            base_sequence: -1,
+            is_transactional: false,
+        });
+        let env = TestEnv::new();
+        let ctx = env.ctx(&mock);
+        let mut got: Vec<(i32, i16)> = handle_produce(&ctx, data, Some(&meta()), Some("tx"))
+            .unwrap()
+            .responses
+            .iter()
+            .flat_map(|t| t.partition_responses.iter())
+            .map(|p| (p.index, p.error_code))
+            .collect();
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec![
+                (0, ERROR_INVALID_PRODUCER_ID_MAPPING),
+                (1, ERROR_INVALID_PRODUCER_ID_MAPPING),
+                (2, ERROR_NONE)
+            ]
+        );
+
+        // Another producer id owning the transactional id is the same answer.
+        let mut mock = MockKafkaStore::new();
+        mock.expect_get_or_create_topic()
+            .returning(|_, _| Ok((1, 1)));
+        mock.expect_validate_transaction()
+            .returning(|_, pid, _| Err(KafkaError::invalid_producer_id_mapping(pid)));
+        assert_eq!(
+            run(&mock, &[0], Some("tx")),
+            vec![(0, ERROR_INVALID_PRODUCER_ID_MAPPING, -1)]
+        );
+    }
+
+    /// Kafka 3.7 answers a stale epoch on Produce with INVALID_PRODUCER_EPOCH (47),
+    /// for transactional producers too (was PRODUCER_FENCED, 90).
+    #[test]
+    fn stale_epoch_is_invalid_producer_epoch() {
+        let mut mock = MockKafkaStore::new();
+        mock.expect_get_or_create_topic()
+            .returning(|_, _| Ok((1, 1)));
+        mock.expect_validate_transaction()
+            .returning(|_, _, _| Err(KafkaError::producer_fenced(7, 2, 3)));
+        assert_eq!(
+            run(&mock, &[0], Some("tx")),
+            vec![(0, ERROR_INVALID_PRODUCER_EPOCH, -1)]
+        );
+
+        let mut mock = MockKafkaStore::new();
+        mock.expect_get_or_create_topic()
+            .returning(|_, _| Ok((1, 1)));
+        mock.expect_check_and_update_sequence()
+            .returning(|_, _, _, _, _, _| {
+                Err(KafkaError::Protocol {
+                    code: ERROR_INVALID_PRODUCER_EPOCH,
+                    message: "stale".into(),
+                })
+            });
+        assert_eq!(
+            run(&mock, &[0], None),
+            vec![(0, ERROR_INVALID_PRODUCER_EPOCH, -1)]
+        );
     }
 }

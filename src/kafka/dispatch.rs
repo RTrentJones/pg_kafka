@@ -1,82 +1,78 @@
-// Request dispatch helpers for the Kafka protocol handler
-//
-// This module provides utilities to reduce boilerplate in process_request().
-// Each handler follows the same pattern:
-// 1. Call handler function
-// 2. On success: wrap result and send response
-// 3. On error: log, create error response, send
-//
-// The dispatch_response() function encapsulates this pattern.
+//! Running one handler on the DB thread and answering it exactly once.
+//!
+//! [`dispatch_response`] sends the handler's response on success; on a handler `Err` it
+//! sends the API's error response and reports [`RequestOutcome::Rollback`]; on a panic it
+//! sends UNKNOWN_SERVER_ERROR and re-raises, so the request's subtransaction rolls back.
+//! Every API reaches it through `crate::kafka::api::Call::run`.
 
 use crate::kafka::constants::ERROR_UNKNOWN_SERVER_ERROR;
 use crate::kafka::error::KafkaError;
 use crate::kafka::messages::KafkaResponse;
-use crate::{pg_log, pg_warning};
-use kafka_protocol::messages::produce_response::ProduceResponse;
+use crate::{pg_debug, pg_warning};
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use tokio::sync::mpsc::UnboundedSender;
 
-/// Unwind payload a handler `Err` uses to roll back the request's subtransaction.
+/// What the worker must do with a request's subtransaction once its handler has
+/// sent a response.
 ///
 /// A handler that fails part-way through may already have written to the database
 /// (e.g. IncrementalAlterConfigs applied resource 1, then failed on resource 2). The
 /// client is told the request failed, so those writes must not commit. The request
-/// runs inside `worker::run_request_in_subtransaction`, which rolls back on any
-/// unwind; `dispatch_response` sends the error response and then unwinds with this
-/// marker, which the worker recognises and does not report as a panic. `resume_unwind`
-/// does not run the panic hook, so nothing is printed.
-pub struct RollbackRequest;
+/// runs inside `worker::txn::run_request_in_subtransaction`, which releases the
+/// subtransaction on `Commit` and rolls it back on `Rollback`. Panics (including
+/// Postgres ERRORs, which pgrx surfaces as panics) are not an outcome: they still
+/// unwind, and the subtransaction wrapper's `catch_unwind` rolls them back.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestOutcome {
+    /// Keep the request's writes (they commit with the surrounding transaction).
+    Commit,
+    /// Discard the request's writes; its error response has already been sent.
+    Rollback,
+}
 
-/// Dispatch a handler result to the response channel.
+/// A closure that returns nothing (maintenance work) keeps its writes.
+impl From<()> for RequestOutcome {
+    fn from((): ()) -> Self {
+        RequestOutcome::Commit
+    }
+}
+
+/// Run `handler`, wrap its result with `wrap_response` and send it on `response_tx`.
 ///
-/// This eliminates repetitive error handling boilerplate across all request handlers.
-/// It handles both success and error cases uniformly:
-/// - On success: wraps the result using the provided wrapper function and sends
-/// - On error: wraps the error using the error wrapper function and sends an API-specific error response
-///
-/// # Type Parameters
-/// * `R` - The handler's successful response type
-/// * `F` - Handler function type
-/// * `W` - Response wrapper function type
-/// * `E` - Error wrapper function type
-///
-/// # Arguments
-/// * `handler_name` - Name of the handler for logging
-/// * `response_tx` - Channel to send the response
-/// * `handler` - The handler function to call
-/// * `wrap_response` - Function to wrap successful result into KafkaResponse
-/// * `wrap_error` - Function to wrap error code into API-specific KafkaResponse
+/// A handler `Err` is answered with `wrap_error(code)` and returns
+/// [`RequestOutcome::Rollback`] (the handler may have written before failing, and the client
+/// is told the request failed). A panic in `handler` or `wrap_response` is answered with
+/// `wrap_error(UNKNOWN_SERVER_ERROR)` and then re-raised. `handler_name` names the API in
+/// the logs.
 pub fn dispatch_response<R, F, W, E>(
     handler_name: &str,
-    response_tx: UnboundedSender<KafkaResponse>,
+    response_tx: &UnboundedSender<KafkaResponse>,
     handler: F,
     wrap_response: W,
     wrap_error: E,
-) where
+) -> RequestOutcome
+where
     F: FnOnce() -> Result<R, KafkaError>,
     W: FnOnce(R) -> KafkaResponse,
     E: FnOnce(i16) -> KafkaResponse,
 {
-    // BUG-5: a handler panic (including a Postgres ERROR, which pgrx surfaces as a Rust panic) must
-    // not leave the client hanging until its request timeout. Catch the panic, reply
-    // UNKNOWN_SERVER_ERROR, then re-raise the original payload so the surrounding subtransaction
-    // still rolls back the request's partial writes (see worker::run_request_in_subtransaction).
-    // The panic branch does only Rust work (channel send + response construction, Rust allocator) —
-    // no Postgres calls — so it is safe to run before FlushErrorState at the subtransaction boundary.
-    // RV-3: the guard must also cover the success response *builder*
-    // (`wrap_response`), not just `handler`. Building the response inside the
-    // catch_unwind means a panic there (e.g. a Postgres ERROR in a builder that
-    // reads SPI) still replies UNKNOWN_SERVER_ERROR instead of dropping
-    // `response_tx` unsent and hanging the client to its timeout. The error/panic
-    // responses are pure enum construction, built after the guard and always sent.
+    // A handler panic (a Postgres ERROR surfaces as one) must not leave the client waiting
+    // until its request timeout: reply UNKNOWN_SERVER_ERROR, then re-raise the payload so the
+    // surrounding subtransaction still rolls back the request's partial writes (see
+    // worker::txn::run_request_in_subtransaction). The guard covers the success response builder
+    // too, since a builder may read SPI. The panic branch does only Rust work (channel send,
+    // enum construction, no Postgres calls), so it is safe before FlushErrorState at the
+    // subtransaction boundary.
     let guarded = catch_unwind(AssertUnwindSafe(|| handler().map(wrap_response)));
     match guarded {
         Ok(Ok(response)) => {
             if let Err(e) = response_tx.send(response) {
                 pg_warning!("Failed to send {} response: {}", handler_name, e);
             } else {
-                pg_log!("{} response sent successfully", handler_name);
+                pg_debug!("{} response sent successfully", handler_name);
             }
+            RequestOutcome::Commit
         }
         Ok(Err(e)) => {
             pg_warning!("Failed to handle {} request: {}", handler_name, e);
@@ -84,95 +80,25 @@ pub fn dispatch_response<R, F, W, E>(
             if let Err(send_err) = response_tx.send(error_response) {
                 pg_warning!("Failed to send error response: {}", send_err);
             }
-            // Discard any writes the handler made before failing (see RollbackRequest).
-            resume_unwind(Box::new(RollbackRequest));
+            // Discard any writes the handler made before failing.
+            RequestOutcome::Rollback
         }
         Err(panic) => {
             pg_warning!(
                 "{} handler panicked; replying UNKNOWN_SERVER_ERROR and rolling back",
                 handler_name
             );
-            let error_response = wrap_error(ERROR_UNKNOWN_SERVER_ERROR);
-            let _ = response_tx.send(error_response);
+            // A closed channel only means the client is gone; the panic is re-raised anyway.
+            let _ = response_tx.send(wrap_error(ERROR_UNKNOWN_SERVER_ERROR));
             resume_unwind(panic);
         }
     }
 }
 
-/// Dispatch a handler that cannot fail (always returns Ok).
-///
-/// For handlers like ApiVersions that don't use storage and can't fail.
-pub fn dispatch_infallible<R, F, W>(
-    handler_name: &str,
-    response_tx: UnboundedSender<KafkaResponse>,
-    handler: F,
-    wrap_response: W,
-) where
-    F: FnOnce() -> R,
-    W: FnOnce(R) -> KafkaResponse,
-{
-    let result = handler();
-    let response = wrap_response(result);
-    if let Err(e) = response_tx.send(response) {
-        pg_warning!("Failed to send {} response: {}", handler_name, e);
-    } else {
-        pg_log!("{} response sent successfully", handler_name);
-    }
-}
-
-/// Produce-specific wrapper around [`dispatch_response`] (RA-3).
-///
-/// The Produce `acks >= 1` path can't go through the generic enum dispatch
-/// because it needs a success side-effect (waking long-poll consumers) and the
-/// `acks = 0` no-response special case lives next to it. It used to hand-roll the
-/// `Ok`/`Err` match and send, which skipped panic safety: a handler panic (a
-/// Postgres ERROR surfaces through pgrx as a Rust panic) sent no response and the
-/// client hung to its timeout. This helper restores the same `catch_unwind`
-/// behaviour as `dispatch_response` — panic → reply UNKNOWN_SERVER_ERROR → resume
-/// so the surrounding subtransaction still rolls back — while wiring the Produce
-/// response shape and an `on_success` hook.
-pub fn dispatch_produce<H, N>(
-    response_tx: UnboundedSender<KafkaResponse>,
-    correlation_id: i32,
-    api_version: i16,
-    handler: H,
-    on_success: N,
-) where
-    H: FnOnce() -> Result<ProduceResponse, KafkaError>,
-    N: FnOnce(&ProduceResponse),
-{
-    // RV-3: run the `on_success` side-effect (waking long-poll consumers, which
-    // issues its own SPI reads) INSIDE the guarded handler, not in `wrap_response`
-    // — `dispatch_response` runs `wrap_response` *outside* its `catch_unwind`.
-    // Otherwise a Postgres ERROR in the notification path surfaces as an unguarded
-    // pgrx panic: no response is sent (the RA-3 client hang, reopened) and the
-    // already-successful produce is rolled back. Inside the guard, such a panic
-    // instead replies UNKNOWN_SERVER_ERROR and resumes (rollback; the produce is
-    // retryable), and `wrap_response` stays pure enum construction.
-    dispatch_response(
-        "Produce",
-        response_tx,
-        move || {
-            let response = handler()?;
-            on_success(&response);
-            Ok(response)
-        },
-        move |response| KafkaResponse::Produce {
-            correlation_id,
-            api_version,
-            response,
-        },
-        move |error_code| KafkaResponse::Produce {
-            correlation_id,
-            api_version,
-            response: crate::kafka::response_builders::build_produce_error_response(error_code),
-        },
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kafka::api::ResponseBody;
     use crate::kafka::error::KafkaError;
     use tokio::sync::mpsc;
 
@@ -180,27 +106,20 @@ mod tests {
     fn test_dispatch_response_success() {
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        dispatch_response(
+        let outcome = dispatch_response(
             "Test",
-            tx,
+            &tx,
             || Ok::<i32, KafkaError>(100),
-            |result| KafkaResponse::Error {
-                correlation_id: result,
-                error_code: 0,
-                error_message: None,
-            },
-            |error_code| KafkaResponse::Error {
-                correlation_id: 42,
-                error_code,
-                error_message: Some("error".to_string()),
-            },
+            |result| KafkaResponse::new(result, 0, ResponseBody::UnknownApi { error_code: 0 }),
+            |error_code| KafkaResponse::new(42, 0, ResponseBody::UnknownApi { error_code }),
         );
+        assert_eq!(outcome, RequestOutcome::Commit);
 
         let response = rx.try_recv().expect("Should receive response");
         match response {
-            KafkaResponse::Error {
+            KafkaResponse {
                 correlation_id,
-                error_code,
+                body: ResponseBody::UnknownApi { error_code, .. },
                 ..
             } => {
                 assert_eq!(correlation_id, 100); // We used result as correlation_id in wrapper
@@ -214,65 +133,53 @@ mod tests {
     fn test_dispatch_response_error() {
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        // A handler error sends the error response, then unwinds with RollbackRequest
-        // so the request's subtransaction discards any partial writes.
-        let unwound = catch_unwind(AssertUnwindSafe(|| {
-            dispatch_response(
-                "Test",
-                tx,
-                || Err::<i32, KafkaError>(KafkaError::Internal("test error".into())),
-                |_result| KafkaResponse::Error {
-                    correlation_id: 0,
-                    error_code: 0,
-                    error_message: None,
-                },
-                |error_code| KafkaResponse::Error {
-                    correlation_id: 42,
-                    error_code,
-                    error_message: Some("API-specific error".to_string()),
-                },
-            )
-        }));
-        let payload = unwound.expect_err("a handler error must unwind to roll back");
-        assert!(payload.is::<RollbackRequest>());
+        // A handler error sends the error response, then reports Rollback (an
+        // ordinary return, not an unwind) so the request's subtransaction discards
+        // any partial writes.
+        let outcome = dispatch_response(
+            "Test",
+            &tx,
+            || Err::<i32, KafkaError>(KafkaError::Internal("test error".into())),
+            |_result| KafkaResponse::new(0, 0, ResponseBody::UnknownApi { error_code: 0 }),
+            |error_code| KafkaResponse::new(42, 0, ResponseBody::UnknownApi { error_code }),
+        );
+        assert_eq!(outcome, RequestOutcome::Rollback);
 
         let response = rx.try_recv().expect("Should receive error response");
         match response {
-            KafkaResponse::Error {
+            KafkaResponse {
                 correlation_id,
-                error_code,
-                error_message,
+                body: ResponseBody::UnknownApi { error_code },
+                ..
             } => {
                 assert_eq!(correlation_id, 42);
                 // Error code for Internal is -1 (see error.rs)
                 assert_eq!(error_code, -1);
-                assert_eq!(error_message.unwrap(), "API-specific error");
             }
             _ => panic!("Expected error response"),
         }
     }
 
     #[test]
+    fn test_unit_converts_to_commit() {
+        // Maintenance closures return (); the subtransaction wrapper treats that
+        // as Commit.
+        assert_eq!(RequestOutcome::from(()), RequestOutcome::Commit);
+    }
+
+    #[test]
     fn test_dispatch_response_handler_panic_replies_and_resumes() {
-        // BUG-5: a panicking handler must still produce a response (so the client is not left
+        // A panicking handler must still produce a response (so the client is not left
         // hanging) AND re-raise the panic (so the surrounding subtransaction rolls back).
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            dispatch_response(
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            let _ = dispatch_response(
                 "Test",
-                tx,
+                &tx,
                 || -> Result<i32, KafkaError> { panic!("handler boom") },
-                |result| KafkaResponse::Error {
-                    correlation_id: result,
-                    error_code: 0,
-                    error_message: None,
-                },
-                |error_code| KafkaResponse::Error {
-                    correlation_id: 42,
-                    error_code,
-                    error_message: None,
-                },
+                |result| KafkaResponse::new(result, 0, ResponseBody::UnknownApi { error_code: 0 }),
+                |error_code| KafkaResponse::new(42, 0, ResponseBody::UnknownApi { error_code }),
             );
         }));
 
@@ -281,9 +188,9 @@ mod tests {
 
         // ...but an error response was sent first, so the client is not left hanging.
         match rx.try_recv().expect("error response should have been sent") {
-            KafkaResponse::Error {
+            KafkaResponse {
                 correlation_id,
-                error_code,
+                body: ResponseBody::UnknownApi { error_code, .. },
                 ..
             } => {
                 assert_eq!(correlation_id, 42);
@@ -295,23 +202,18 @@ mod tests {
 
     #[test]
     fn test_dispatch_response_builder_panic_replies_and_resumes() {
-        // RV-3: a panic in the SUCCESS response builder (`wrap_response`) — not
-        // just the handler — must still reply UNKNOWN_SERVER_ERROR and re-raise,
-        // so the client isn't left hanging. This fails before `wrap_response` was
-        // moved inside the guard.
+        // A panic in the success response builder (`wrap_response`), not just in the
+        // handler, must still reply UNKNOWN_SERVER_ERROR and re-raise, so the client is not
+        // left waiting.
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            dispatch_response(
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            let _ = dispatch_response(
                 "Test",
-                tx,
+                &tx,
                 || Ok::<i32, KafkaError>(7),
                 |_result| -> KafkaResponse { panic!("builder boom") },
-                |error_code| KafkaResponse::Error {
-                    correlation_id: 42,
-                    error_code,
-                    error_message: None,
-                },
+                |error_code| KafkaResponse::new(42, 0, ResponseBody::UnknownApi { error_code }),
             );
         }));
 
@@ -320,136 +222,15 @@ mod tests {
 
         // ...but an error response was sent first, so the client is not left hanging.
         match rx.try_recv().expect("error response should have been sent") {
-            KafkaResponse::Error {
+            KafkaResponse {
                 correlation_id,
-                error_code,
+                body: ResponseBody::UnknownApi { error_code, .. },
                 ..
             } => {
                 assert_eq!(correlation_id, 42);
                 assert_eq!(error_code, ERROR_UNKNOWN_SERVER_ERROR);
             }
             _ => panic!("Expected Error response"),
-        }
-    }
-
-    #[test]
-    fn test_dispatch_infallible() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-
-        dispatch_infallible(
-            "Test",
-            tx,
-            || 42,
-            |result| KafkaResponse::Error {
-                correlation_id: result,
-                error_code: 0,
-                error_message: None,
-            },
-        );
-
-        let response = rx.try_recv().expect("Should receive response");
-        match response {
-            KafkaResponse::Error { correlation_id, .. } => {
-                assert_eq!(correlation_id, 42);
-            }
-            _ => panic!("Unexpected response type"),
-        }
-    }
-
-    #[test]
-    fn test_dispatch_produce_success_runs_on_success_and_sends() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let ran = std::cell::Cell::new(false);
-        dispatch_produce(
-            tx,
-            3,
-            2,
-            || Ok(crate::kafka::response_builders::build_produce_error_response(0)),
-            |_resp| ran.set(true),
-        );
-        assert!(ran.get(), "on_success should run on Ok");
-        match rx.try_recv().expect("a Produce response should be sent") {
-            KafkaResponse::Produce {
-                correlation_id,
-                api_version,
-                ..
-            } => {
-                assert_eq!(correlation_id, 3);
-                assert_eq!(api_version, 2);
-            }
-            _ => panic!("expected a Produce response"),
-        }
-    }
-
-    #[test]
-    fn test_dispatch_produce_panic_replies_produce_error_and_resumes() {
-        // RA-3: a panicking Produce handler must still send a Produce response
-        // (client not left hanging) AND re-raise so the subtransaction rolls back.
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            dispatch_produce(
-                tx,
-                7,
-                9,
-                || -> Result<ProduceResponse, KafkaError> { panic!("produce boom") },
-                |_resp| {},
-            );
-        }));
-        assert!(
-            outcome.is_err(),
-            "panic must be re-raised so the subtransaction rolls back"
-        );
-        match rx
-            .try_recv()
-            .expect("a Produce response must have been sent before resume")
-        {
-            KafkaResponse::Produce {
-                correlation_id,
-                api_version,
-                ..
-            } => {
-                assert_eq!(correlation_id, 7);
-                assert_eq!(api_version, 9);
-            }
-            _ => panic!("expected a Produce response"),
-        }
-    }
-
-    #[test]
-    fn test_dispatch_produce_panic_in_on_success_replies_and_resumes() {
-        // RV-3: a panic in the on_success side-effect (e.g. a Postgres ERROR in the
-        // long-poll notification's SPI reads) must be caught like a handler panic —
-        // reply a Produce error (no client hang) AND re-raise (subtransaction
-        // rollback). Before the fix on_success ran outside the catch_unwind, so its
-        // panic escaped unguarded: no response was sent and the acked produce rolled
-        // back silently.
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            dispatch_produce(
-                tx,
-                11,
-                4,
-                || Ok(crate::kafka::response_builders::build_produce_error_response(0)),
-                |_resp| panic!("notify boom"),
-            );
-        }));
-        assert!(
-            outcome.is_err(),
-            "an on_success panic must re-raise so the subtransaction rolls back"
-        );
-        match rx
-            .try_recv()
-            .expect("a Produce error response must be sent before resume")
-        {
-            KafkaResponse::Produce {
-                correlation_id,
-                api_version,
-                ..
-            } => {
-                assert_eq!(correlation_id, 11);
-                assert_eq!(api_version, 4);
-            }
-            _ => panic!("expected a Produce response"),
         }
     }
 }

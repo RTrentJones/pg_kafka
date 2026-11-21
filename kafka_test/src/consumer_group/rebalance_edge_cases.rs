@@ -2,7 +2,8 @@
 //!
 //! Tests for edge cases in consumer group rebalancing.
 
-use crate::common::{create_producer, TestResult};
+use crate::common::{create_producer, get_bootstrap_servers, TestResult};
+use crate::members::{close_all, Member, CLOSE_TIMEOUT};
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::producer::FutureRecord;
@@ -22,8 +23,8 @@ pub async fn test_rapid_rebalance_cycles() -> TestResult {
         producer
             .send(
                 FutureRecord::to(&topic)
-                    .payload(&format!("msg-{}", i))
-                    .key(&format!("key-{}", i)),
+                    .payload(&format!("msg-{i}"))
+                    .key(&format!("key-{i}")),
                 Duration::from_secs(5),
             )
             .await
@@ -36,26 +37,27 @@ pub async fn test_rapid_rebalance_cycles() -> TestResult {
         println!("Cycle {}: Join 2 consumers, then leave...", cycle + 1);
 
         let c1: StreamConsumer = ClientConfig::new()
-            .set("bootstrap.servers", "localhost:9092")
+            .set("bootstrap.servers", get_bootstrap_servers())
             .set("group.id", &group_id)
             .set("session.timeout.ms", "10000")
             .set("enable.auto.commit", "false")
             .create()?;
+        let c1 = Member::new(c1);
         c1.subscribe(&[&topic])?;
         let _ = tokio::time::timeout(Duration::from_millis(300), c1.recv()).await;
 
         let c2: StreamConsumer = ClientConfig::new()
-            .set("bootstrap.servers", "localhost:9092")
+            .set("bootstrap.servers", get_bootstrap_servers())
             .set("group.id", &group_id)
             .set("session.timeout.ms", "10000")
             .set("enable.auto.commit", "false")
             .create()?;
+        let c2 = Member::new(c2);
         c2.subscribe(&[&topic])?;
         let _ = tokio::time::timeout(Duration::from_millis(300), c2.recv()).await;
 
         tokio::time::sleep(Duration::from_millis(200)).await;
-        drop(c1);
-        drop(c2);
+        close_all(vec![c1.closing(), c2.closing()], CLOSE_TIMEOUT).await?;
         tokio::time::sleep(Duration::from_millis(300)).await;
         println!("  Cycle {} complete", cycle + 1);
     }
@@ -63,14 +65,16 @@ pub async fn test_rapid_rebalance_cycles() -> TestResult {
     // Verify final join works
     println!("\nStep 2: Verifying group accepts new member...");
     let final_c: StreamConsumer = ClientConfig::new()
-        .set("bootstrap.servers", "localhost:9092")
+        .set("bootstrap.servers", get_bootstrap_servers())
         .set("group.id", &group_id)
         .set("session.timeout.ms", "10000")
         .set("enable.auto.commit", "false")
         .create()?;
+    let final_c = Member::new(final_c);
     final_c.subscribe(&[&topic])?;
     let _ = tokio::time::timeout(Duration::from_millis(500), final_c.recv()).await;
     println!("  Final consumer subscribed");
+    final_c.close(CLOSE_TIMEOUT).await?;
 
     println!("\n✅ Rapid rebalance cycles test PASSED\n");
     Ok(())
@@ -89,8 +93,8 @@ pub async fn test_heartbeat_during_rebalance_window() -> TestResult {
         producer
             .send(
                 FutureRecord::to(&topic)
-                    .payload(&format!("msg-{}", i))
-                    .key(&format!("key-{}", i)),
+                    .payload(&format!("msg-{i}"))
+                    .key(&format!("key-{i}")),
                 Duration::from_secs(5),
             )
             .await
@@ -100,22 +104,24 @@ pub async fn test_heartbeat_during_rebalance_window() -> TestResult {
 
     println!("\nStep 2: Consumer 1 joining...");
     let c1: StreamConsumer = ClientConfig::new()
-        .set("bootstrap.servers", "localhost:9092")
+        .set("bootstrap.servers", get_bootstrap_servers())
         .set("group.id", &group_id)
         .set("session.timeout.ms", "10000")
         .set("enable.auto.commit", "false")
         .create()?;
+    let c1 = Member::new(c1);
     c1.subscribe(&[&topic])?;
     let _ = tokio::time::timeout(Duration::from_millis(500), c1.recv()).await;
     println!("  Consumer 1 joined");
 
     println!("\nStep 3: Consumer 2 joining (triggers rebalance)...");
     let c2: StreamConsumer = ClientConfig::new()
-        .set("bootstrap.servers", "localhost:9092")
+        .set("bootstrap.servers", get_bootstrap_servers())
         .set("group.id", &group_id)
         .set("session.timeout.ms", "10000")
         .set("enable.auto.commit", "false")
         .create()?;
+    let c2 = Member::new(c2);
     c2.subscribe(&[&topic])?;
     let _ = tokio::time::timeout(Duration::from_millis(500), c2.recv()).await;
     println!("  Consumer 2 joined");
@@ -126,6 +132,7 @@ pub async fn test_heartbeat_during_rebalance_window() -> TestResult {
     let _ = tokio::time::timeout(Duration::from_secs(1), c1.recv()).await;
     let _ = tokio::time::timeout(Duration::from_secs(1), c2.recv()).await;
     println!("\nStep 4: Both consumers polled");
+    close_all(vec![c1.closing(), c2.closing()], CLOSE_TIMEOUT).await?;
 
     println!("\n✅ Heartbeat during rebalance window test PASSED\n");
     Ok(())
@@ -144,8 +151,8 @@ pub async fn test_multiple_concurrent_timeouts() -> TestResult {
         producer
             .send(
                 FutureRecord::to(&topic)
-                    .payload(&format!("msg-{}", i))
-                    .key(&format!("key-{}", i)),
+                    .payload(&format!("msg-{i}"))
+                    .key(&format!("key-{i}")),
                 Duration::from_secs(5),
             )
             .await
@@ -157,11 +164,12 @@ pub async fn test_multiple_concurrent_timeouts() -> TestResult {
     let mut consumers = Vec::new();
     for i in 0..3 {
         let c: StreamConsumer = ClientConfig::new()
-            .set("bootstrap.servers", "localhost:9092")
+            .set("bootstrap.servers", get_bootstrap_servers())
             .set("group.id", &group_id)
             .set("session.timeout.ms", "6000")
             .set("enable.auto.commit", "false")
             .create()?;
+        let c = Member::new(c);
         c.subscribe(&[&topic])?;
         let _ = tokio::time::timeout(Duration::from_millis(300), c.recv()).await;
         consumers.push(c);
@@ -169,19 +177,25 @@ pub async fn test_multiple_concurrent_timeouts() -> TestResult {
     }
 
     println!("\nStep 3: Dropping all consumers...");
-    drop(consumers);
+    close_all(
+        consumers.into_iter().map(Member::closing).collect(),
+        CLOSE_TIMEOUT,
+    )
+    .await?;
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     println!("\nStep 4: New consumer joining...");
     let new_c: StreamConsumer = ClientConfig::new()
-        .set("bootstrap.servers", "localhost:9092")
+        .set("bootstrap.servers", get_bootstrap_servers())
         .set("group.id", &group_id)
         .set("session.timeout.ms", "10000")
         .set("enable.auto.commit", "false")
         .create()?;
+    let new_c = Member::new(new_c);
     new_c.subscribe(&[&topic])?;
     let _ = tokio::time::timeout(Duration::from_secs(2), new_c.recv()).await;
     println!("  New consumer joined");
+    new_c.close(CLOSE_TIMEOUT).await?;
 
     println!("\n✅ Multiple concurrent timeouts test PASSED\n");
     Ok(())
@@ -207,28 +221,31 @@ pub async fn test_rebalance_with_minimal_session_timeout() -> TestResult {
 
     println!("\nStep 2: Consumer joining with 6s timeout...");
     let c1: StreamConsumer = ClientConfig::new()
-        .set("bootstrap.servers", "localhost:9092")
+        .set("bootstrap.servers", get_bootstrap_servers())
         .set("group.id", &group_id)
         .set("session.timeout.ms", "6000")
         .set("enable.auto.commit", "false")
         .create()?;
+    let c1 = Member::new(c1);
     c1.subscribe(&[&topic])?;
     let _ = tokio::time::timeout(Duration::from_millis(500), c1.recv()).await;
     println!("  Consumer 1 joined");
 
     println!("\nStep 3: Dropping consumer...");
-    drop(c1);
+    c1.close(CLOSE_TIMEOUT).await?;
 
     println!("\nStep 4: New consumer joining...");
     let c2: StreamConsumer = ClientConfig::new()
-        .set("bootstrap.servers", "localhost:9092")
+        .set("bootstrap.servers", get_bootstrap_servers())
         .set("group.id", &group_id)
         .set("session.timeout.ms", "10000")
         .set("enable.auto.commit", "false")
         .create()?;
+    let c2 = Member::new(c2);
     c2.subscribe(&[&topic])?;
     let _ = tokio::time::timeout(Duration::from_secs(2), c2.recv()).await;
     println!("  New consumer joined");
+    c2.close(CLOSE_TIMEOUT).await?;
 
     println!("\n✅ Rebalance with minimal session timeout test PASSED\n");
     Ok(())
@@ -247,8 +264,8 @@ pub async fn test_rebalance_mixed_timeout_values() -> TestResult {
         producer
             .send(
                 FutureRecord::to(&topic)
-                    .payload(&format!("msg-{}", i))
-                    .key(&format!("key-{}", i)),
+                    .payload(&format!("msg-{i}"))
+                    .key(&format!("key-{i}")),
                 Duration::from_secs(5),
             )
             .await
@@ -258,22 +275,24 @@ pub async fn test_rebalance_mixed_timeout_values() -> TestResult {
 
     println!("\nStep 2: Consumer A joining (6s timeout)...");
     let ca: StreamConsumer = ClientConfig::new()
-        .set("bootstrap.servers", "localhost:9092")
+        .set("bootstrap.servers", get_bootstrap_servers())
         .set("group.id", &group_id)
         .set("session.timeout.ms", "6000")
         .set("enable.auto.commit", "false")
         .create()?;
+    let ca = Member::new(ca);
     ca.subscribe(&[&topic])?;
     let _ = tokio::time::timeout(Duration::from_millis(500), ca.recv()).await;
     println!("  Consumer A joined");
 
     println!("\nStep 3: Consumer B joining (10s timeout)...");
     let cb: StreamConsumer = ClientConfig::new()
-        .set("bootstrap.servers", "localhost:9092")
+        .set("bootstrap.servers", get_bootstrap_servers())
         .set("group.id", &group_id)
         .set("session.timeout.ms", "10000")
         .set("enable.auto.commit", "false")
         .create()?;
+    let cb = Member::new(cb);
     cb.subscribe(&[&topic])?;
     let _ = tokio::time::timeout(Duration::from_millis(500), cb.recv()).await;
     println!("  Consumer B joined");
@@ -281,20 +300,21 @@ pub async fn test_rebalance_mixed_timeout_values() -> TestResult {
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     println!("\nStep 4: Dropping both consumers...");
-    drop(ca);
-    drop(cb);
+    close_all(vec![ca.closing(), cb.closing()], CLOSE_TIMEOUT).await?;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     println!("\nStep 5: New consumer joining...");
     let new_c: StreamConsumer = ClientConfig::new()
-        .set("bootstrap.servers", "localhost:9092")
+        .set("bootstrap.servers", get_bootstrap_servers())
         .set("group.id", &group_id)
         .set("session.timeout.ms", "10000")
         .set("enable.auto.commit", "false")
         .create()?;
+    let new_c = Member::new(new_c);
     new_c.subscribe(&[&topic])?;
     let _ = tokio::time::timeout(Duration::from_secs(2), new_c.recv()).await;
     println!("  New consumer joined");
+    new_c.close(CLOSE_TIMEOUT).await?;
 
     println!("\n✅ Rebalance mixed timeout values test PASSED\n");
     Ok(())

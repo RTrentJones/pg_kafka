@@ -4,6 +4,7 @@
 //! The kafka-protocol crate handles decompression automatically.
 
 use crate::common::{get_bootstrap_servers, TestResult};
+use crate::members::{Member, CLOSE_TIMEOUT};
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::message::Message;
@@ -56,18 +57,19 @@ pub async fn test_compressed_producer_gzip() -> TestResult {
         producer
             .send(
                 FutureRecord::to(&topic)
-                    .payload(&format!("gzip-message-{}", i))
-                    .key(&format!("key-{}", i)),
+                    .payload(&format!("gzip-message-{i}"))
+                    .key(&format!("key-{i}")),
                 Duration::from_secs(5),
             )
             .await
             .map_err(|(err, _)| err)?;
-        println!("   Produced gzip-message-{}", i);
+        println!("   Produced gzip-message-{i}");
     }
 
     // Consume and verify
     println!("\nStep 3: Consuming messages...");
     let consumer = create_consumer(&group_id)?;
+    let consumer = Member::new(consumer);
     consumer.subscribe(&[&topic])?;
 
     let mut received = 0;
@@ -81,23 +83,23 @@ pub async fn test_compressed_producer_gzip() -> TestResult {
                 if let Some(v) = &value {
                     if v.starts_with("gzip-message-") {
                         received += 1;
-                        println!("   Received: {}", v);
+                        println!("   Received: {v}");
                     }
                 }
             }
-            Ok(Err(e)) => println!("   Error: {}", e),
-            Err(_) => continue,
+            Ok(Err(e)) => println!("   Error: {e}"),
+            Err(_) => {}
         }
     }
 
     println!("\nStep 4: Verifying results...");
     assert!(
         received >= 2,
-        "Should receive at least 2 of 3 messages, got {}",
-        received
+        "Should receive at least 2 of 3 messages, got {received}"
     );
-    println!("   Received {} messages", received);
+    println!("   Received {received} messages");
 
+    consumer.close(CLOSE_TIMEOUT).await?;
     println!("\n=== Compressed Producer (gzip) PASSED ===\n");
     Ok(())
 }
@@ -119,18 +121,19 @@ pub async fn test_compressed_producer_snappy() -> TestResult {
         producer
             .send(
                 FutureRecord::to(&topic)
-                    .payload(&format!("snappy-message-{}", i))
-                    .key(&format!("key-{}", i)),
+                    .payload(&format!("snappy-message-{i}"))
+                    .key(&format!("key-{i}")),
                 Duration::from_secs(5),
             )
             .await
             .map_err(|(err, _)| err)?;
-        println!("   Produced snappy-message-{}", i);
+        println!("   Produced snappy-message-{i}");
     }
 
     // Consume and verify
     println!("\nStep 3: Consuming messages...");
     let consumer = create_consumer(&group_id)?;
+    let consumer = Member::new(consumer);
     consumer.subscribe(&[&topic])?;
 
     let mut received = 0;
@@ -144,23 +147,23 @@ pub async fn test_compressed_producer_snappy() -> TestResult {
                 if let Some(v) = &value {
                     if v.starts_with("snappy-message-") {
                         received += 1;
-                        println!("   Received: {}", v);
+                        println!("   Received: {v}");
                     }
                 }
             }
-            Ok(Err(e)) => println!("   Error: {}", e),
-            Err(_) => continue,
+            Ok(Err(e)) => println!("   Error: {e}"),
+            Err(_) => {}
         }
     }
 
     println!("\nStep 4: Verifying results...");
     assert!(
         received >= 2,
-        "Should receive at least 2 of 3 messages, got {}",
-        received
+        "Should receive at least 2 of 3 messages, got {received}"
     );
-    println!("   Received {} messages", received);
+    println!("   Received {received} messages");
 
+    consumer.close(CLOSE_TIMEOUT).await?;
     println!("\n=== Compressed Producer (snappy) PASSED ===\n");
     Ok(())
 }
@@ -182,18 +185,19 @@ pub async fn test_compressed_producer_lz4() -> TestResult {
         producer
             .send(
                 FutureRecord::to(&topic)
-                    .payload(&format!("lz4-message-{}", i))
-                    .key(&format!("key-{}", i)),
+                    .payload(&format!("lz4-message-{i}"))
+                    .key(&format!("key-{i}")),
                 Duration::from_secs(5),
             )
             .await
             .map_err(|(err, _)| err)?;
-        println!("   Produced lz4-message-{}", i);
+        println!("   Produced lz4-message-{i}");
     }
 
     // Consume and verify
     println!("\nStep 3: Consuming messages...");
     let consumer = create_consumer(&group_id)?;
+    let consumer = Member::new(consumer);
     consumer.subscribe(&[&topic])?;
 
     let mut received = 0;
@@ -207,23 +211,23 @@ pub async fn test_compressed_producer_lz4() -> TestResult {
                 if let Some(v) = &value {
                     if v.starts_with("lz4-message-") {
                         received += 1;
-                        println!("   Received: {}", v);
+                        println!("   Received: {v}");
                     }
                 }
             }
-            Ok(Err(e)) => println!("   Error: {}", e),
-            Err(_) => continue,
+            Ok(Err(e)) => println!("   Error: {e}"),
+            Err(_) => {}
         }
     }
 
     println!("\nStep 4: Verifying results...");
     assert!(
         received >= 2,
-        "Should receive at least 2 of 3 messages, got {}",
-        received
+        "Should receive at least 2 of 3 messages, got {received}"
     );
-    println!("   Received {} messages", received);
+    println!("   Received {received} messages");
 
+    consumer.close(CLOSE_TIMEOUT).await?;
     println!("\n=== Compressed Producer (lz4) PASSED ===\n");
     Ok(())
 }
@@ -245,18 +249,19 @@ pub async fn test_compressed_producer_zstd() -> TestResult {
         producer
             .send(
                 FutureRecord::to(&topic)
-                    .payload(&format!("zstd-message-{}", i))
-                    .key(&format!("key-{}", i)),
+                    .payload(&format!("zstd-message-{i}"))
+                    .key(&format!("key-{i}")),
                 Duration::from_secs(5),
             )
             .await
             .map_err(|(err, _)| err)?;
-        println!("   Produced zstd-message-{}", i);
+        println!("   Produced zstd-message-{i}");
     }
 
     // Consume and verify
     println!("\nStep 3: Consuming messages...");
     let consumer = create_consumer(&group_id)?;
+    let consumer = Member::new(consumer);
     consumer.subscribe(&[&topic])?;
 
     let mut received = 0;
@@ -270,23 +275,23 @@ pub async fn test_compressed_producer_zstd() -> TestResult {
                 if let Some(v) = &value {
                     if v.starts_with("zstd-message-") {
                         received += 1;
-                        println!("   Received: {}", v);
+                        println!("   Received: {v}");
                     }
                 }
             }
-            Ok(Err(e)) => println!("   Error: {}", e),
-            Err(_) => continue,
+            Ok(Err(e)) => println!("   Error: {e}"),
+            Err(_) => {}
         }
     }
 
     println!("\nStep 4: Verifying results...");
     assert!(
         received >= 2,
-        "Should receive at least 2 of 3 messages, got {}",
-        received
+        "Should receive at least 2 of 3 messages, got {received}"
     );
-    println!("   Received {} messages", received);
+    println!("   Received {received} messages");
 
+    consumer.close(CLOSE_TIMEOUT).await?;
     println!("\n=== Compressed Producer (zstd) PASSED ===\n");
     Ok(())
 }

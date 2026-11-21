@@ -4,18 +4,18 @@
 # site can embed it with zero client JS. Best-effort: warns and leaves no session.svg if the tools
 # aren't available (the site falls back to its committed placeholder).
 # Usage: scripts/record-session.sh <out-dir>
-set -uo pipefail
+set -euo pipefail
 OUT_DIR="${1:-$PWD}"
 mkdir -p "$OUT_DIR"
-# Force IPv4: pg_kafka binds 0.0.0.0:9092, but kcat/librdkafka resolve "localhost" to ::1 first and
-# get connection-refused — which aborted the recording after the first command.
+# Force IPv4: pg_kafka binds an IPv4 address (127.0.0.1 by default), but kcat/librdkafka resolve
+# "localhost" to ::1 first and get connection-refused.
 BROKER="${PG_KAFKA_BROKER:-127.0.0.1:9092}"
 BROKER="${BROKER/localhost/127.0.0.1}"
 export BROKER
-# psql opens its pager (less) when stdout is a tty — inside asciinema's pty that hangs forever, which
-# truncated the recording right at the SELECT. Disable it; force psql onto IPv4 too.
+# psql opens its pager (less) when stdout is a tty, and inside asciinema's pty that hangs forever.
+# Disable it; force psql onto IPv4 too.
 export PAGER=cat PSQL_PAGER=cat
-[ -n "${PGHOST:-}" ] && export PGHOST="${PGHOST/localhost/127.0.0.1}"
+if [ -n "${PGHOST:-}" ]; then export PGHOST="${PGHOST/localhost/127.0.0.1}"; fi
 CAST="$(mktemp --suffix=.cast)"
 INNER="$(mktemp --suffix=.sh)"
 # The benchmark fills kafka.messages with 1KB payloads first, so filter to the demo key and decode
@@ -55,5 +55,8 @@ else
   echo "::warning::svg-term not installed (or empty cast) — no session.svg produced"
 fi
 
-[ -s "$OUT_DIR/session.svg" ] && echo "wrote $OUT_DIR/session.svg" || echo "::warning::session.svg not produced"
-exit 0
+if [ -s "$OUT_DIR/session.svg" ]; then
+  echo "wrote $OUT_DIR/session.svg"
+else
+  echo "::warning::session.svg not produced"
+fi

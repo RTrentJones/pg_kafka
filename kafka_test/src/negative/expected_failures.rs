@@ -4,6 +4,7 @@
 
 use crate::common::TestResult;
 use crate::fixtures::TestTopicBuilder;
+use crate::members::{close_all, Member, CLOSE_TIMEOUT};
 use crate::setup::TestContext;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
@@ -11,8 +12,8 @@ use rdkafka::producer::FutureProducer;
 use std::time::Duration;
 
 /// SEC-8: the external-Kafka SASL password GUC must be readable only by superusers, so an
-/// ordinary DB role cannot read the cleartext credential via `SHOW`. The fix locks it down with
-/// `SUPERUSER_ONLY | NO_SHOW_ALL` (mirroring the license-key GUC).
+/// ordinary DB role cannot read the cleartext credential via `SHOW` (`SUPERUSER_ONLY |
+/// NO_SHOW_ALL`, like the license-key GUC).
 pub async fn test_sasl_password_guc_is_superuser_only() -> TestResult {
     println!("=== Test: shadow_sasl_password GUC is superuser-only (SEC-8) ===\n");
     let ctx = TestContext::new().await?;
@@ -48,9 +49,8 @@ pub async fn test_sasl_password_guc_is_superuser_only() -> TestResult {
     }
     println!("✅ a non-superuser cannot read the SASL password GUC");
 
-    // DR-21 (DEEP-REVIEW-2026-07): the USERNAME must have the same lockdown — it
-    // identifies the external-broker principal, and before DR-21 it was visible
-    // in pg_settings to every role while the password was superuser-only.
+    // The USERNAME has the same lockdown: it identifies the external-broker principal
+    // (DR-21, DEEP-REVIEW-2026-07).
     db.simple_query("SET ROLE sec8_unpriv_probe").await?;
     let unpriv_user_read = db.simple_query("SHOW pg_kafka.shadow_sasl_username").await;
     db.simple_query("RESET ROLE").await?;
@@ -90,7 +90,7 @@ pub async fn test_connection_refused() -> TestResult {
 
             match result {
                 Err((kafka_error, _)) => {
-                    println!("   Expected failure occurred: {}", kafka_error);
+                    println!("   Expected failure occurred: {kafka_error}");
                 }
                 Ok(_) => {
                     // QA-3: producing to a broker that isn't listening (localhost:19999) must NOT
@@ -101,7 +101,7 @@ pub async fn test_connection_refused() -> TestResult {
         }
         Err(e) => {
             // Failing to even build the client is also an acceptable "refused" outcome.
-            println!("   Producer creation failed (expected): {}", e);
+            println!("   Producer creation failed (expected): {e}");
         }
     }
 
@@ -113,52 +113,53 @@ pub async fn test_connection_refused() -> TestResult {
 pub async fn test_produce_timeout() -> TestResult {
     println!("=== Test: Produce Timeout ===\n");
 
-    let ctx = TestContext::new().await?;
-    let topic = TestTopicBuilder::new(&ctx, "timeout-test").build().await?;
+    // A broker that accepts the TCP connection and never answers: every send must fail with
+    // the client's own delivery timeout. (Timing a real broker against a 1 ms timeout is a race
+    // the broker can win.)
+    let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = silent.local_addr()?;
+    let hold = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = silent.accept().await {
+            held.push(socket);
+        }
+    });
 
-    // Create producer with very short timeout
     let producer: FutureProducer = ClientConfig::new()
-        .set("bootstrap.servers", crate::common::get_bootstrap_servers())
-        .set("message.timeout.ms", "1") // 1ms timeout - extremely short
+        .set("bootstrap.servers", addr.to_string())
+        .set("message.timeout.ms", "200")
         .create()?;
 
     let mut timeout_count = 0;
-    let mut success_count = 0;
-
     for i in 0..5 {
         let result = producer
             .send(
-                rdkafka::producer::FutureRecord::to(&topic.name)
-                    .payload(&format!("message-{}", i))
-                    .key(&format!("key-{}", i)),
-                Duration::from_millis(1),
+                rdkafka::producer::FutureRecord::to("timeout-test")
+                    .payload(&format!("message-{i}"))
+                    .key(&format!("key-{i}")),
+                Duration::from_millis(200),
             )
             .await;
-
         match result {
             Err((e, _)) => {
                 timeout_count += 1;
                 if i == 0 {
-                    println!("   Timeout error (expected): {}", e);
+                    println!("   Timeout error (expected): {e}");
                 }
             }
-            Ok(_) => {
-                success_count += 1;
+            Ok(delivery) => {
+                hold.abort();
+                return Err(format!("send {i} to a silent broker succeeded: {delivery:?}").into());
             }
         }
     }
+    hold.abort();
 
-    println!(
-        "   Timeouts: {}, Successes: {}",
-        timeout_count, success_count
-    );
-    // QA-3: a 1ms message.timeout.ms is far below the time a real produce (network + SPI insert)
-    // takes, so at least one of five sends must trip the local delivery timeout. (Returning Err
-    // rather than asserting keeps a failure isolated to this test instead of unwinding the suite.)
-    ctx.cleanup().await?;
-    if timeout_count == 0 {
-        return Err("a 1ms produce timeout should have fired at least once".into());
+    println!("   Timeouts: {timeout_count} of 5");
+    if timeout_count != 5 {
+        return Err(format!("expected 5 delivery timeouts, got {timeout_count}").into());
     }
+    println!("✅ Test PASSED\n");
     Ok(())
 }
 
@@ -196,23 +197,22 @@ pub async fn test_invalid_group_id() -> TestResult {
     // QA-3: an empty group.id is invalid — it must never end up consuming a message. We don't pin
     // *where* it's rejected (librdkafka may reject at create, at subscribe, or just never deliver),
     // only that the invalid configuration cannot silently behave like a valid consumer.
-    let consumed_with_empty_group = match consumer_result {
+    // The consumer is closed off this thread when dropped: its close is no part of what this
+    // test checks.
+    let consumed_with_empty_group = match consumer_result.map(Member::new) {
         Err(e) => {
-            println!(
-                "   Consumer creation rejected empty group.id (expected): {}",
-                e
-            );
+            println!("   Consumer creation rejected empty group.id (expected): {e}");
             false
         }
         Ok(consumer) => match consumer.subscribe(&[&topic.name]) {
             Err(e) => {
-                println!("   Subscribe rejected empty group.id (expected): {}", e);
+                println!("   Subscribe rejected empty group.id (expected): {e}");
                 false
             }
-            Ok(_) => match tokio::time::timeout(Duration::from_secs(2), consumer.recv()).await {
+            Ok(()) => match tokio::time::timeout(Duration::from_secs(2), consumer.recv()).await {
                 Ok(Ok(_)) => true, // a real delivery — that's the regression we guard against
                 Ok(Err(e)) => {
-                    println!("   Recv error (expected): {}", e);
+                    println!("   Recv error (expected): {e}");
                     false
                 }
                 Err(_) => {
@@ -249,8 +249,9 @@ pub async fn test_duplicate_consumer_join() -> TestResult {
         .set("session.timeout.ms", "6000")
         .create()?;
 
+    let consumer1 = Member::new(consumer1);
     consumer1.subscribe(&[&topic.name])?;
-    println!("   Consumer 1 joined group: {}", group_id);
+    println!("   Consumer 1 joined group: {group_id}");
 
     // Let first consumer establish itself
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -263,6 +264,7 @@ pub async fn test_duplicate_consumer_join() -> TestResult {
         .set("session.timeout.ms", "6000")
         .create()?;
 
+    let consumer2 = Member::new(consumer2);
     consumer2.subscribe(&[&topic.name])?;
     println!("   Consumer 2 joined same group");
 
@@ -281,6 +283,11 @@ pub async fn test_duplicate_consumer_join() -> TestResult {
     let (ok1, ok2) = (has_topic(&sub1), has_topic(&sub2));
     println!("   subscriptions after rejoin: consumer1={ok1}, consumer2={ok2}");
 
+    close_all(
+        vec![consumer1.closing(), consumer2.closing()],
+        CLOSE_TIMEOUT,
+    )
+    .await?;
     ctx.cleanup().await?;
     if !ok1 || !ok2 {
         return Err("both members must stay subscribed after the rejoin".into());

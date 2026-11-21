@@ -1,53 +1,29 @@
-//! DR-12 (DEEP-REVIEW-2026-07): heartbeat liveness-lane test.
+//! Heartbeat liveness lane (DR-12, DEEP-REVIEW-2026-07).
 //!
-//! Before DR-12 every request shared one FIFO channel into the single DB
-//! thread, so a Heartbeat queued behind a backlog of heavy Produce work waited
-//! for the whole queue — and under sustained DB pressure that cascades into
-//! spurious consumer-group rebalances. Heartbeats now travel on a dedicated
-//! liveness lane the worker drains before each main-lane request.
+//! Heartbeats travel on a dedicated liveness lane the worker drains before each
+//! main-lane request. On one FIFO channel into the single DB thread a Heartbeat
+//! queued behind a backlog of heavy Produce work would wait for the whole queue,
+//! and under sustained DB pressure that cascades into spurious consumer-group
+//! rebalances.
 //!
-//! Fail-before/pass-after: this test floods the main lane with large pipelined
-//! Produce requests from one connection, then sends a Heartbeat on a second
-//! connection mid-flood and asserts it answers long before the flood drains.
-//! Pre-DR-12 the heartbeat's response arrives only after the produce backlog
-//! ahead of it, tripping the latency assertion.
+//! The test floods the main lane with large pipelined Produce requests from one
+//! connection, then sends a Heartbeat on a second connection mid-flood and asserts
+//! it answers long before the flood drains.
 
+use crate::common::to_i32;
 use crate::common::TestResult;
-use crate::idempotent::protocol_encoding::{read_response, send_request};
-use bytes::{BufMut, Bytes, BytesMut};
+use crate::wire::requests::sequenced_produce_request;
+use crate::wire::{read_raw_response, request_frame};
 use kafka_protocol::messages::heartbeat_request::HeartbeatRequest;
-use kafka_protocol::messages::{GroupId, RequestHeader};
-use kafka_protocol::protocol::{Encodable, StrBytes};
+use kafka_protocol::messages::GroupId;
+use kafka_protocol::protocol::StrBytes;
 use std::time::{Duration, Instant};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use uuid::Uuid;
 
-const API_KEY_HEARTBEAT: i16 = 12;
 const FLOOD_REQUESTS: usize = 400;
 const FLOOD_PAYLOAD_BYTES: usize = 512 * 1024;
-
-fn encode_heartbeat_request(correlation_id: i32, group_id: &str) -> Bytes {
-    let mut request = HeartbeatRequest::default();
-    request.group_id = GroupId(StrBytes::from_string(group_id.to_string()));
-    request.generation_id = 1;
-    request.member_id = StrBytes::from_static_str("liveness-probe-member");
-
-    // Heartbeat v0 with header v1 (non-flexible) — matches the produce helper style.
-    let header = RequestHeader::default()
-        .with_request_api_key(API_KEY_HEARTBEAT)
-        .with_request_api_version(0)
-        .with_correlation_id(correlation_id)
-        .with_client_id(Some(StrBytes::from_static_str("liveness-probe")));
-
-    let mut body_buf = BytesMut::new();
-    header.encode(&mut body_buf, 1).unwrap();
-    request.encode(&mut body_buf, 0).unwrap();
-
-    let mut buf = BytesMut::new();
-    buf.put_i32(body_buf.len() as i32);
-    buf.put(body_buf);
-    buf.freeze()
-}
 
 pub async fn test_heartbeat_bypasses_produce_backlog() -> TestResult {
     println!("=== Test: Heartbeat Bypasses Produce Backlog (DR-12) ===\n");
@@ -76,21 +52,21 @@ pub async fn test_heartbeat_bypasses_produce_backlog() -> TestResult {
         // the backlog is what we want), then drain all responses.
         let writer_payload = payload;
         for i in 0..FLOOD_REQUESTS {
-            let req = crate::idempotent::protocol_encoding::encode_produce_request(
-                1000 + i as i32,
+            let req = sequenced_produce_request(
                 &flood_topic,
                 0,
                 -1, // non-idempotent
                 -1,
                 -1,
-                vec![&writer_payload],
+                &[&writer_payload],
             );
-            send_request(&mut stream, &req)
+            stream
+                .write_all(&request_frame(7, 1000 + to_i32(i), &req))
                 .await
                 .map_err(|e| e.to_string())?;
         }
         for _ in 0..FLOOD_REQUESTS {
-            read_response(&mut stream)
+            read_raw_response(&mut stream)
                 .await
                 .map_err(|e| e.to_string())?;
         }
@@ -103,61 +79,57 @@ pub async fn test_heartbeat_bypasses_produce_backlog() -> TestResult {
     //    heartbeat takes the same lane as a valid one. A heartbeat can
     //    legitimately wait behind the ONE request currently executing (which can
     //    be slow if it hits a checkpoint/WAL stall), so probe several times and
-    //    judge the fastest: pre-DR-12 every probe waits for the whole remaining
-    //    queue, so even the minimum stays large.
+    //    judge the fastest: on a shared lane every probe waits for the whole
+    //    remaining queue, so even the minimum stays large.
     tokio::time::sleep(Duration::from_millis(150)).await;
     println!("Step 2: Sending heartbeat probes mid-flood...");
     let mut hb_stream = TcpStream::connect(&bootstrap).await?;
+    let mut heartbeat = HeartbeatRequest::default();
+    heartbeat.group_id = GroupId(StrBytes::from_string(group.clone()));
+    heartbeat.generation_id = 1;
+    heartbeat.member_id = StrBytes::from_static_str("liveness-probe-member");
     let mut hb_rtt = Duration::MAX;
     for probe in 0..3 {
-        let hb_req = encode_heartbeat_request(42 + probe, &group);
         let hb_start = Instant::now();
-        send_request(&mut hb_stream, &hb_req)
+        hb_stream
+            .write_all(&request_frame(0, 42 + probe, &heartbeat))
             .await
-            .map_err(|e| format!("heartbeat send failed: {}", e))?;
-        tokio::time::timeout(Duration::from_secs(30), read_response(&mut hb_stream))
+            .map_err(|e| format!("heartbeat send failed: {e}"))?;
+        tokio::time::timeout(Duration::from_secs(30), read_raw_response(&mut hb_stream))
             .await
             .map_err(|_| "heartbeat response timed out entirely")?
-            .map_err(|e| format!("heartbeat read failed: {}", e))?;
+            .map_err(|e| format!("heartbeat read failed: {e}"))?;
         let rtt = hb_start.elapsed();
-        println!("  Heartbeat probe {} RTT: {:?}", probe, rtt);
+        println!("  Heartbeat probe {probe} RTT: {rtt:?}");
         hb_rtt = hb_rtt.min(rtt);
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
-    println!("  Best heartbeat RTT: {:?}", hb_rtt);
+    println!("  Best heartbeat RTT: {hb_rtt:?}");
 
     // 3. Wait for the flood to drain and compare.
     let flood_total = flood_task
         .await?
-        .map_err(|e| format!("flood task failed: {}", e))?;
-    println!("  Flood drained in: {:?}\n", flood_total);
+        .map_err(|e| format!("flood task failed: {e}"))?;
+    println!("  Flood drained in: {flood_total:?}\n");
 
     // 4. Assertions. If the machine drained the flood too fast to build a real
     //    backlog, the probe proves nothing — pass with a warning rather than
     //    flake (the assertion is meaningful on any CI-class machine).
     if flood_total < Duration::from_millis(1500) {
         println!(
-            "⚠️  Flood drained in {:?} (<1.5s) — backlog too small to exercise the lane; inconclusive pass",
-            flood_total
+            "⚠️  Flood drained in {flood_total:?} (<1.5s) — backlog too small to exercise the lane; inconclusive pass"
         );
         return Ok(());
     }
     assert!(
         hb_rtt < Duration::from_millis(1000),
-        "Heartbeat took {:?} while the produce backlog drained in {:?} — liveness traffic is queueing behind the main lane (DR-12 regression)",
-        hb_rtt,
-        flood_total
+        "Heartbeat took {hb_rtt:?} while the produce backlog drained in {flood_total:?} — liveness traffic is queueing behind the main lane (DR-12 regression)"
     );
     assert!(
         hb_rtt < flood_total / 2,
-        "Heartbeat RTT {:?} is not meaningfully faster than the {:?} backlog — liveness lane not effective",
-        hb_rtt,
-        flood_total
+        "Heartbeat RTT {hb_rtt:?} is not meaningfully faster than the {flood_total:?} backlog — liveness lane not effective"
     );
-    println!(
-        "  ✅ Heartbeat answered in {:?} despite {:?} backlog\n",
-        hb_rtt, flood_total
-    );
+    println!("  ✅ Heartbeat answered in {hb_rtt:?} despite {flood_total:?} backlog\n");
 
     println!("✅ Test PASSED\n");
     Ok(())

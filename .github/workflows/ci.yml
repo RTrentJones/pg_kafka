@@ -14,22 +14,25 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  PGRX_VERSION: "0.16.1"
-  PG_VERSION: "14.20"
 
 permissions:
   contents: read
   pull-requests: write
 
+# Every job gets PostgreSQL from apt.postgresql.org and the cargo-pgrx that Cargo.lock pins
+# through .github/actions/setup-pg (no pgrx source download), and the Rust toolchain from
+# rust-toolchain.toml (a dated nightly pin, the single source of truth for local builds and CI;
+# actions-rust-lang/setup-rust-toolchain reads it when no toolchain is given).
+
 jobs:
-  # Quick checks that run in parallel with the main test suite
   lint:
     name: Lint & Format
-    runs-on: ubuntu-latest
+    # Pinned: on ubuntu-26.04 pgrx 0.16.1's bindgen generates incomplete PostgreSQL bindings
+    # (RelationData without rd_tableam), so nothing that links pgrx-pg-sys compiles there.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      # DR-14: no explicit toolchain — the action reads rust-toolchain.toml,
-      # which pins a dated nightly (single source of truth for local + CI).
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: rustfmt, clippy
@@ -40,41 +43,15 @@ jobs:
       - name: Check formatting (kafka_test)
         run: cd kafka_test && cargo fmt -- --check
 
-      # pgrx setup required for clippy (pgrx-pg-sys needs PostgreSQL headers)
-      - name: Install System Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libpq-dev libreadline-dev zlib1g-dev flex bison libxml2-dev libxslt-dev libssl-dev libsasl2-dev libzstd-dev
+      - name: QA-1 coverage policy (codecov.yml lists every SPI file; the guard fires for each)
+        run: bash .github/scripts/check-coverage-policy.sh
 
-      - name: Cache cargo-pgrx binary
-        id: cache-cargo-pgrx
-        uses: actions/cache@v4
+      - uses: ./.github/actions/setup-pg
         with:
-          path: ~/.cargo/bin/cargo-pgrx
-          key: ${{ runner.os }}-cargo-pgrx-bin-${{ env.PGRX_VERSION }}
-
-      - name: Install pgrx
-        if: steps.cache-cargo-pgrx.outputs.cache-hit != 'true'
-        run: cargo install --locked cargo-pgrx --version ${{ env.PGRX_VERSION }}
-
-      - name: Cache pgrx PostgreSQL Binaries
-        id: cache-pgrx
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.pgrx/14.*
-            ~/.pgrx/14.*_unpack
-            ~/.pgrx/config.toml
-          key: ${{ runner.os }}-pgrx-pg14-${{ env.PGRX_VERSION }}-pg${{ env.PG_VERSION }}-v2
-          restore-keys: |
-            ${{ runner.os }}-pgrx-pg14-${{ env.PGRX_VERSION }}-
-
-      - name: Initialize pgrx
-        if: steps.cache-pgrx.outputs.cache-hit != 'true'
-        run: cargo pgrx init --pg14 download
+          pg: 14
 
       - name: Run clippy
-        # DR-16: --all-targets so test code is linted too
+        # --all-targets so test code is linted too. The other majors are linted in `e2e`.
         run: cargo clippy --all-targets --features pg14 -- -D warnings
 
       - name: Run clippy (kafka_test)
@@ -82,304 +59,277 @@ jobs:
 
   test:
     name: Test Suite
-    runs-on: ubuntu-latest
-    needs: lint  # Only run tests if lint passes
-
+    runs-on: ubuntu-24.04
+    needs: lint
+    timeout-minutes: 60
     steps:
-    # ------------------------------------------------------------------
-    # CLEAN SETUP: Prepare the runner environment
-    # ------------------------------------------------------------------
-    - name: Checkout code
-      uses: actions/checkout@v4
-      # Fetches pg_kafka code so the runner can access it.
+      - uses: actions/checkout@v4
 
-    - name: Free disk space
-      # pgrx builds are large (~1-2GB) and can exhaust runner disk space
-      # Remove unused preinstalled software to free ~10GB
-      run: |
-        echo "Disk space before cleanup:"
-        df -h /
-        sudo rm -rf /usr/share/dotnet
-        sudo rm -rf /opt/ghc
-        sudo rm -rf /usr/local/share/boost
-        sudo rm -rf /usr/local/lib/android
-        sudo apt-get clean
-        echo "Disk space after cleanup:"
-        df -h /
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: llvm-tools-preview
 
-    - name: Install Rust toolchain
-      # DR-14: toolchain comes from rust-toolchain.toml (dated nightly pin)
-      uses: actions-rust-lang/setup-rust-toolchain@v1
-      with:
-        # 'rustfmt' for style checks, 'clippy' for linting
-        components: rustfmt, clippy, llvm-tools-preview
+      - uses: ./.github/actions/setup-pg
+        with:
+          pg: 14
+          cache-prefix: v3-cov
 
-    # Install system deps BEFORE Rust Cache so librdkafka builds with zstd support
-    - name: Install System Dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y libpq-dev libreadline-dev zlib1g-dev flex bison libxml2-dev libxslt-dev libssl-dev libsasl2-dev libzstd-dev netcat-openbsd
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
 
-    - name: Rust Cache
-      uses: Swatinem/rust-cache@v2
-      with:
-        # Cache version - bump when system dependencies change (e.g., adding libzstd-dev)
-        prefix-key: v2
-        # cache the main workspace AND the kafka_test crate
-        workspaces: |
-          . -> target
-          kafka_test -> kafka_test/target
-      # intelligently caches Rust dependencies to speed up builds significantly.
+      - name: Run unit tests and generate coverage
+        # pg_kafka uses PGC_POSTMASTER GUCs, which `cargo pgrx test` cannot load (it creates
+        # the extension after the server started), so unit tests here are the non-SPI ones;
+        # everything SPI is covered by the E2E jobs. The unit tests include
+        # kafka::api::docs::generated_api_docs, the drift check of the docs generated from the
+        # API registry.
+        run: cargo llvm-cov --lib --features pg14 --lcov --output-path lcov.info
+        env:
+          RUSTFLAGS: ""
 
-    # ------------------------------------------------------------------
-    # OPTIMIZATION: Cache the CLI tool to avoid compiling it every run
-    # ------------------------------------------------------------------
-    - name: Cache cargo-pgrx binary
-      id: cache-cargo-pgrx
-      uses: actions/cache@v4
-      with:
-        path: ~/.cargo/bin/cargo-pgrx
-        # Cache key includes runner OS and version, but NOT Cargo.lock
-        key: ${{ runner.os }}-cargo-pgrx-bin-${{ env.PGRX_VERSION }}
+      - name: Run property tests
+        # tests/property_tests.rs is an integration target, which `cargo llvm-cov --lib`
+        # never compiles.
+        run: cargo test --features pg14 --test property_tests
+        env:
+          RUSTFLAGS: ""
 
-    - name: Install pgrx
-      if: steps.cache-cargo-pgrx.outputs.cache-hit != 'true'
-      # Installs the pgrx CLI tool which we use to manage the Postgres lifecycle
-      run: cargo install --locked cargo-pgrx --version ${{ env.PGRX_VERSION }}
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: lcov.info
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: true
 
-    # ------------------------------------------------------------------
-    # OPTIMIZATION: Cache Postgres binaries (~/.pgrx)
-    # CRITICAL: Only cache the compiled binaries, NOT runtime files
-    # ------------------------------------------------------------------
-    - name: Cache pgrx PostgreSQL Binaries
-      id: cache-pgrx
-      uses: actions/cache@v4
-      with:
-        path: |
-          ~/.pgrx/14.*
-          ~/.pgrx/14.*_unpack
-          ~/.pgrx/config.toml
-        # Stable key - only invalidate when pgrx or PG version changes
-        key: ${{ runner.os }}-pgrx-pg14-${{ env.PGRX_VERSION }}-pg${{ env.PG_VERSION }}-v2
-        restore-keys: |
-          ${{ runner.os }}-pgrx-pg14-${{ env.PGRX_VERSION }}-
+  # The E2E runner does not depend on the PostgreSQL major: build it once.
+  kafka-test-build:
+    name: Build kafka_test
+    runs-on: ubuntu-24.04
+    needs: lint
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Install librdkafka build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev libsasl2-dev libzstd-dev zlib1g-dev
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v3-kt
+          workspaces: kafka_test -> kafka_test/target
+      - name: Build
+        run: cd kafka_test && cargo build --release --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kafka_test
+          path: kafka_test/target/release/kafka_test
+          retention-days: 3
 
-    - name: Initialize pgrx
-      if: steps.cache-pgrx.outputs.cache-hit != 'true'
-      # Downloads and compiles PostgreSQL 14 (~25 minutes on cold cache)
-      run: cargo pgrx init --pg14 download
+  # Every supported major, for real: build + unit/property tests + clippy on that major,
+  # install the extension into PostgreSQL N, run the functional E2E suite and the 0.0.0 -> 0.1.0
+  # upgrade check against it. PG14 also runs the shadow and performance categories and the
+  # test-count drift check.
+  e2e:
+    name: E2E pg${{ matrix.pg }}
+    runs-on: ubuntu-24.04
+    needs: [lint, kafka-test-build]
+    # Cold build ~20 min + suite (~5 min measured on 4 cores, 223 functional tests including
+    # listener restarts) + shadow/performance on pg14.
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [14, 15, 16, 17, 18]
+    env:
+      FEATURES: --no-default-features --features pg${{ matrix.pg }}
+    steps:
+      - uses: actions/checkout@v4
 
-    # ------------------------------------------------------------------
-    # UNIT TESTING: Non-SPI tests only
-    # ------------------------------------------------------------------
-    - name: Install cargo-llvm-cov
-      uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: ./.github/actions/free-disk-space
 
-    - name: Run unit tests and generate coverage
-      # Note: We skip 'cargo pgrx test' because pg_kafka uses PGC_POSTMASTER GUCs
-      # which require shared_preload_libraries BEFORE Postgres starts.
-      # cargo pgrx test creates the extension AFTER starting Postgres, causing:
-      # "FATAL: cannot create PGC_POSTMASTER variables after startup"
-      #
-      # Instead, we run non-SPI unit tests here (protocol, encoding, helpers).
-      # SPI/integration tests are in kafka_test/ E2E suite below.
-      run: cargo llvm-cov --lib --features pg14 --lcov --output-path lcov.info
-      env:
-        # Override RUSTFLAGS to avoid -D warnings (pgrx macros cause false positives)
-        RUSTFLAGS: ""
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: clippy
 
-    - name: Run property tests
-      # DR-18: tests/property_tests.rs is an integration target, which
-      # `cargo llvm-cov --lib` never compiles — before this step the proptest
-      # suite existed but never ran anywhere.
-      run: cargo test --features pg14 --test property_tests
-      env:
-        RUSTFLAGS: ""
+      - uses: ./.github/actions/setup-pg
+        with:
+          pg: ${{ matrix.pg }}
+          owned: 'true'
+          cache-prefix: v3-pg${{ matrix.pg }}
 
-    - name: Upload to Codecov
-      uses: codecov/codecov-action@v5
-      with:
-        files: lcov.info
-        token: ${{ secrets.CODECOV_TOKEN }}
-        fail_ci_if_error: true  # Fail CI if coverage drops below threshold
+      - name: Clippy (pg${{ matrix.pg }})
+        run: cargo clippy --all-targets $FEATURES -- -D warnings
 
-    # ------------------------------------------------------------------
-    # E2E TESTING: Full system test with external client
-    # ------------------------------------------------------------------
-    - name: Install Extension
-      # Compiles the release build of the pg_kafka extension and copies the .so and .control
-      # files into the pgrx-managed Postgres installation directories.
-      run: |
-        # Debug: List pgrx directory contents
-        echo "Contents of ~/.pgrx:"
-        ls -la ~/.pgrx/
+      - name: Unit tests (pg${{ matrix.pg }})
+        run: cargo test --lib $FEATURES
+        env:
+          RUSTFLAGS: ""
 
-        # Find pg_config in the pgrx directory structure
-        PG_CONFIG=$(find ~/.pgrx -name pg_config -type f -executable 2>/dev/null | grep "14\." | head -n 1)
+      - name: Property tests (pg${{ matrix.pg }})
+        run: cargo test --test property_tests $FEATURES
+        env:
+          RUSTFLAGS: ""
 
-        if [ -z "$PG_CONFIG" ]; then
-          echo "Error: Could not find pg_config for PostgreSQL 14."
-          echo "Searching for any pg_config files:"
-          find ~/.pgrx -name pg_config -type f
-          exit 1
-        fi
+      - name: Install the extension into PostgreSQL ${{ matrix.pg }}
+        run: cargo pgrx install --release --pg-config "$PG_CONFIG"
 
-        echo "Found pg_config at: $PG_CONFIG"
+      - uses: actions/download-artifact@v4
+        with:
+          name: kafka_test
+          path: ${{ runner.temp }}/kt
+      - name: Locate kafka_test
+        run: |
+          chmod +x "$RUNNER_TEMP/kt/kafka_test"
+          echo "KAFKA_TEST_BIN=$RUNNER_TEMP/kt/kafka_test" >> "$GITHUB_ENV"
 
-        # Verify it works
-        $PG_CONFIG --version
+      - name: Start PostgreSQL with pg_kafka preloaded
+        timeout-minutes: 3
+        run: scripts/ci-pg.sh start "$RUNNER_TEMP/pg"
 
-        # Add to PATH and install
-        export PATH="$(dirname $PG_CONFIG):$PATH"
-        cargo pgrx install --release --pg-config="$PG_CONFIG"
+      - name: Functional E2E tests
+        # Measured 4.5 min on PG18 in a 4-core sandbox; the margin covers slow runners.
+        timeout-minutes: 25
+        working-directory: kafka_test
+        run: '"$KAFKA_TEST_BIN" --exclude performance --exclude shadow --timeout-secs 300'
 
-    - name: Initialize Postgres Data Directory
-      # pgrx creates the data directory on first start, so we do a quick start/stop
-      # to ensure it exists before we modify the config
-      run: |
-        # Start postgres to create the data directory
-        cargo pgrx start pg14 || true
-        sleep 2
-        # Stop it so we can modify the config
-        cargo pgrx stop pg14 || true
-        sleep 1
+      - name: Check extension upgrade path
+        # The 0.0.0 -> current ALTER EXTENSION UPDATE path must produce exactly the schema of a
+        # fresh install and keep data (two scratch databases; the worker serves 'postgres').
+        timeout-minutes: 5
+        run: |
+          scripts/check-upgrade.sh
+          # An older 0.0.0 install: naive TIMESTAMP columns and no timestamp_ms.
+          OLD_SCRIPT=sql/upgrade-test/pg_kafka--0.0.0-pre-timestamptz.sql scripts/check-upgrade.sh
 
-    - name: Configure Postgres for Background Worker
-      # CRITICAL STEP:
-      # The pg_kafka background worker requires 'BgWorkerStartTime::PostmasterStart'.
-      # For this to work, the library must be loaded when Postgres boots up.
-      # We append it to shared_preload_libraries in the config file.
-      run: |
-        # Find the pgrx data directory (should exist now after initialization)
-        PG14_DATA_DIR=$(find ~/.pgrx -maxdepth 1 -type d -name "data-14*" | head -n 1)
-        if [ -z "$PG14_DATA_DIR" ]; then
-          echo "Error: Could not find pgrx-managed Postgres 14 data directory."
-          ls -la ~/.pgrx/
-          exit 1
-        fi
-        echo "Using Postgres data directory at: $PG14_DATA_DIR"
+      - name: Generated GUC reference is current (docs/CONFIGURATION.md)
+        timeout-minutes: 2
+        run: python3 scripts/gen-docs.py --check --only gucs
 
-        # Check if already configured (idempotency)
-        if ! grep -q "shared_preload_libraries.*pg_kafka" "$PG14_DATA_DIR/postgresql.conf"; then
-          # Use printf to ensure a preceding newline, preventing config corruption
-          printf "\nshared_preload_libraries = 'pg_kafka'\npg_kafka.host = '0.0.0.0'\n" >> "$PG14_DATA_DIR/postgresql.conf"
-          echo "Configuration updated to preload pg_kafka."
-        else
-          echo "pg_kafka already configured in shared_preload_libraries."
-        fi
+      - name: Generated test counts are current (docs/TEST_STRATEGY.md)
+        if: matrix.pg == 14
+        timeout-minutes: 20
+        run: python3 scripts/gen-docs.py --check --only tests
+        env:
+          GEN_DOCS_FEATURES: ${{ env.FEATURES }}
 
-    - name: Start Postgres
-      # Boots the pgrx-managed Postgres 14 instance.
-      # Because we configured shared_preload_libraries above, the background worker will start now.
-      run: cargo pgrx start pg14
+      - name: Start external Kafka (shadow tests)
+        if: matrix.pg == 14
+        uses: ./.github/actions/start-external-kafka
 
-    - name: Create Extension and Prepare DB
-      run: |
-        # 1. Find the pgrx data directory and dynamic port
-        PG14_DATA_DIR=$(find ~/.pgrx -maxdepth 1 -type d -name "data-14*" | head -n 1)
-        if [ -z "$PG14_DATA_DIR" ]; then
-          echo "Error: Could not find pgrx-managed Postgres 14 data directory."
-          exit 1
-        fi
-        PG_PORT=$(grep "port =" "$PG14_DATA_DIR/postgresql.conf" | awk '{print $3}')
-        echo "PG_PORT=$PG_PORT" >> $GITHUB_ENV
+      - name: Shadow mode E2E tests
+        if: matrix.pg == 14
+        timeout-minutes: 15
+        working-directory: kafka_test
+        run: '"$KAFKA_TEST_BIN" --category shadow'
 
-        # 2. Run CREATE EXTENSION in the postgres database
-        # IMPORTANT: The background worker connects to 'postgres' database via SPI,
-        # so the extension (and its schema) must be created there.
-        DB_USER=$(whoami)
-        echo "DB_USER=$DB_USER" >> $GITHUB_ENV
-        echo "Using database user: $DB_USER"
-        psql -h localhost -p $PG_PORT -U "$DB_USER" -d postgres -c "CREATE EXTENSION IF NOT EXISTS pg_kafka;"
+      - name: Stop external Kafka
+        if: always() && matrix.pg == 14
+        run: docker compose down -v || true
 
-    - name: Wait for Kafka Port
-      # Ensure the background worker has actually bound to the port before testing
-      timeout-minutes: 1
-      run: |
-        echo "Waiting for port 9092..."
-        timeout 30s bash -c 'until nc -z 127.0.0.1 9092; do sleep 1; done'
-        echo "Port 9092 is open!"
-        # DR-17: no extra sleep — the worker binds the port only after full init
-        # (GUCs read, channels built), and requests received before the loop's
-        # first iteration simply queue on the request channel. The historical
-        # 'sleep 3' papered over the worker's 10s wait-for-schema retry, which
-        # the port probe above already covers.
+      - name: Performance E2E tests
+        # Blocking. The thresholds are conservative floors (~5-10x below dev-machine
+        # measurements), so this fails only on order-of-magnitude regressions.
+        if: matrix.pg == 14
+        timeout-minutes: 10
+        working-directory: kafka_test
+        run: '"$KAFKA_TEST_BIN" --category performance'
 
-    - name: Run Functional E2E Tests
-      # Runs functional tests (excludes performance and shadow tests which run separately)
-      timeout-minutes: 10
-      run: |
-        cd kafka_test
-        cargo run --release -- --exclude performance --exclude shadow
-      env:
-        # Pass the dynamically discovered port to the test runner
-        # IMPORTANT: Use 'postgres' database since that's where the worker connects via SPI
-        DATABASE_URL: postgresql://${{ env.DB_USER }}@localhost:${{ env.PG_PORT }}/postgres
+      - name: Listener exits with its postmaster (SIGKILL + restart)
+        # Last, because it crashes the cluster: a listener that outlives its postmaster keeps
+        # serving Kafka requests as an orphan and blocks the restart. One major is enough; the
+        # check is in the worker's lifecycle code, not in version-specific bindings.
+        if: matrix.pg == 18
+        timeout-minutes: 3
+        run: |
+          command -v bc >/dev/null || sudo apt-get install -y bc
+          PATH="$(dirname "$PG_CONFIG"):$PATH" \
+          PGDATA="$RUNNER_TEMP/pg/data" PGLOG="$RUNNER_TEMP/pg/server.log" \
+          PG_CTL="$(dirname "$PG_CONFIG")/pg_ctl" \
+            scripts/postmaster-death-check.sh
 
-    # Start external Kafka for shadow mode tests
-    - name: Start External Kafka
-      run: |
-        docker compose up -d external-kafka
-        echo "Waiting for Kafka to be healthy..."
-        timeout 60 bash -c 'until docker compose ps external-kafka | grep -q "(healthy)"; do
-          echo "Waiting for Kafka healthcheck..."
-          sleep 2
-        done'
-        echo "External Kafka is ready"
+      - name: Postgres log (on failure)
+        if: failure()
+        run: |
+          scripts/ci-pg.sh log "$RUNNER_TEMP/pg" | tail -300
+          ss -tlnp | grep -E '9092|1909[3-5]' || echo "no pg_kafka listener"
 
-    # Run shadow mode E2E tests (now required to pass)
-    - name: Run Shadow Mode E2E Tests
-      timeout-minutes: 15
-      run: |
-        cd kafka_test
-        cargo run --release -- --category shadow
-      env:
-        DATABASE_URL: postgresql://${{ env.DB_USER }}@localhost:${{ env.PG_PORT }}/postgres
+      - name: Stop PostgreSQL
+        if: always()
+        run: scripts/ci-pg.sh stop "$RUNNER_TEMP/pg"
 
-    # Cleanup external Kafka
-    - name: Stop External Kafka
-      if: always()
-      run: |
-        docker compose down -v
-
-    - name: Run Performance E2E Tests
-      # DR-18: BLOCKING (was continue-on-error). The thresholds inside the tests
-      # are conservative floors (~5-10x below dev-machine measurements), so this
-      # only fails on order-of-magnitude regressions, not runner variance.
-      timeout-minutes: 5
-      run: |
-        cd kafka_test
-        cargo run --release -- --category performance
-      env:
-        DATABASE_URL: postgresql://${{ env.DB_USER }}@localhost:${{ env.PG_PORT }}/postgres
-
-    - name: Dump Postgres Logs (On Failure)
-      if: failure()
-      run: |
-        echo "=== Postgres Logs ==="
-        find ~/.pgrx -name "14.log" -exec cat {} + 2>/dev/null || \
-        find ~/.pgrx -name "logfile" -exec tail -100 {} + 2>/dev/null || \
-        echo "No log files found"
-        echo ""
-        echo "=== Port 9092 Status ==="
-        ss -tlnp | grep 9092 || echo "Port 9092 not listening"
-
-    # ------------------------------------------------------------------
-    # TEARDOWN: Cleanup
-    # ------------------------------------------------------------------
-    - name: Stop pgrx
-      if: always()
-      # Ensures the background Postgres process is killed, freeing resources.
-      run: cargo pgrx stop pg14
+  # Real Kafka clients against pg_kafka: the Apache Kafka 3.7 Java tools (interop/run-java-checks.sh)
+  # and the differential harness that replays the same raw requests against pg_kafka and a real
+  # Kafka broker (interop/diff/). Known failures are listed in the scripts (XFAIL in
+  # java_checks.py, KNOWN in diff/run.py); one that passes is reported as XPASS and fails the job.
+  interop:
+    name: Interop (Java clients, differential vs Kafka)
+    runs-on: ubuntu-24.04
+    needs: lint
+    timeout-minutes: 75
+    env:
+      KAFKA_VERSION: "3.7.0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: ./.github/actions/setup-pg
+        with:
+          pg: 18
+          owned: 'true'
+          cache-prefix: v3-interop
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Cache the Kafka distribution
+        id: cache-kafka
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/kafka_2.13-${{ env.KAFKA_VERSION }}
+          key: kafka-2.13-${{ env.KAFKA_VERSION }}
+      - name: Download Kafka ${{ env.KAFKA_VERSION }}
+        if: steps.cache-kafka.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL "https://archive.apache.org/dist/kafka/$KAFKA_VERSION/kafka_2.13-$KAFKA_VERSION.tgz" \
+            | tar -xz -C "$RUNNER_TEMP"
+      - name: Install the extension
+        run: cargo pgrx install --release --pg-config "$PG_CONFIG"
+      - name: Start PostgreSQL with pg_kafka preloaded
+        timeout-minutes: 3
+        run: scripts/ci-pg.sh start "$RUNNER_TEMP/pg"
+      - name: Start the reference Kafka broker (127.0.0.1:9093)
+        timeout-minutes: 3
+        run: interop/kafka-ref.sh start "$RUNNER_TEMP/kafka_2.13-$KAFKA_VERSION" "$RUNNER_TEMP/kref"
+      - name: Java client checks
+        timeout-minutes: 30
+        run: interop/run-java-checks.sh
+        env:
+          KAFKA_HOME: ${{ runner.temp }}/kafka_2.13-${{ env.KAFKA_VERSION }}
+      - name: Differential test against Apache Kafka
+        timeout-minutes: 10
+        run: python3 interop/diff/run.py --pg 127.0.0.1:9092 --kafka 127.0.0.1:9093
+        env:
+          KAFKA_HOME: ${{ runner.temp }}/kafka_2.13-${{ env.KAFKA_VERSION }}
+      - name: Logs (on failure)
+        if: failure()
+        run: |
+          scripts/ci-pg.sh log "$RUNNER_TEMP/pg" | tail -300
+          tail -100 "$RUNNER_TEMP/kref/server.log" || true
+      - name: Stop
+        if: always()
+        run: |
+          interop/kafka-ref.sh stop "$RUNNER_TEMP/kafka_2.13-$KAFKA_VERSION" "$RUNNER_TEMP/kref" || true
+          scripts/ci-pg.sh stop "$RUNNER_TEMP/pg"
 
   # Security audit for known vulnerabilities.
-  # DR-16: BLOCKING (was continue-on-error). Both lockfiles are scanned — the
-  # kafka_test crate has its own Cargo.lock that previously escaped every gate.
-  # cargo-deny additionally enforces license policy and pins the allowed git
-  # sources to the patched kafka-protocol fork (see deny.toml).
+  # Blocking. Both lockfiles are scanned — the kafka_test crate has its own Cargo.lock.
+  # cargo-deny additionally enforces license policy and pins the allowed git sources to the
+  # patched kafka-protocol fork (see deny.toml).
   security:
     name: Security Audit
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -401,125 +351,15 @@ jobs:
   # Verify Cargo.lock is up-to-date
   lockfile:
     name: Verify Lockfile
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      # DR-14: toolchain from rust-toolchain.toml
       - uses: actions-rust-lang/setup-rust-toolchain@v1
-
-      # pgrx setup required for cargo check (pgrx-pg-sys needs PostgreSQL headers)
-      - name: Install System Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libpq-dev libreadline-dev zlib1g-dev flex bison libxml2-dev libxslt-dev libssl-dev libsasl2-dev libzstd-dev
-
-      - name: Cache cargo-pgrx binary
-        id: cache-cargo-pgrx
-        uses: actions/cache@v4
+      - uses: ./.github/actions/setup-pg
         with:
-          path: ~/.cargo/bin/cargo-pgrx
-          key: ${{ runner.os }}-cargo-pgrx-bin-${{ env.PGRX_VERSION }}
-
-      - name: Install pgrx
-        if: steps.cache-cargo-pgrx.outputs.cache-hit != 'true'
-        run: cargo install --locked cargo-pgrx --version ${{ env.PGRX_VERSION }}
-
-      - name: Cache pgrx PostgreSQL Binaries
-        id: cache-pgrx
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.pgrx/14.*
-            ~/.pgrx/14.*_unpack
-            ~/.pgrx/config.toml
-          key: ${{ runner.os }}-pgrx-pg14-${{ env.PGRX_VERSION }}-pg${{ env.PG_VERSION }}-v2
-          restore-keys: |
-            ${{ runner.os }}-pgrx-pg14-${{ env.PGRX_VERSION }}-
-
-      - name: Initialize pgrx
-        if: steps.cache-pgrx.outputs.cache-hit != 'true'
-        run: cargo pgrx init --pg14 download
-
+          pg: 14
       - name: Check Cargo.lock is up-to-date
-        # Use cargo check --locked to verify lockfile matches Cargo.toml
-        # This will fail if Cargo.lock needs updating
         run: cargo check --locked --features pg14
-
       - name: Check kafka_test Cargo.lock is up-to-date
         run: cd kafka_test && cargo check --locked
-
-  # DR-15 (DEEP-REVIEW-2026-07): the crate advertises pg13–pg18 features but CI
-  # historically built pg14 only, so breakage on other majors shipped undetected.
-  # This matrix compiles and unit-tests against system PostgreSQL from apt.pgdg
-  # (no pgrx source download — headers are all bindgen needs), catching per-major
-  # API breaks cheaply. The full E2E suite still runs on pg14 in `test`.
-  pg-matrix:
-    name: Check pg${{ matrix.pg }}
-    runs-on: ubuntu-latest
-    needs: lint
-    strategy:
-      fail-fast: false
-      matrix:
-        pg: [15, 16, 17]
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-
-      - name: Install PostgreSQL ${{ matrix.pg }} (pgdg)
-        # Both packages are required: -server-dev-N has the headers + pg_config
-        # that bindgen needs, but `cargo pgrx init` also runs initdb, which lives
-        # in the full postgresql-N server package.
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y postgresql-common
-          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
-          sudo apt-get install -y postgresql-${{ matrix.pg }} \
-            postgresql-server-dev-${{ matrix.pg }} \
-            libsasl2-dev libzstd-dev libssl-dev
-
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: v2-pg${{ matrix.pg }}
-
-      - name: Cache cargo-pgrx binary
-        id: cache-cargo-pgrx
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/bin/cargo-pgrx
-          key: ${{ runner.os }}-cargo-pgrx-bin-${{ env.PGRX_VERSION }}
-
-      - name: Install pgrx
-        if: steps.cache-cargo-pgrx.outputs.cache-hit != 'true'
-        run: cargo install --locked cargo-pgrx --version ${{ env.PGRX_VERSION }}
-
-      - name: Initialize pgrx against system PostgreSQL
-        run: cargo pgrx init --pg${{ matrix.pg }} /usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
-
-      - name: Check
-        run: cargo check --no-default-features --features pg${{ matrix.pg }}
-
-      - name: Unit tests
-        run: cargo test --no-default-features --features pg${{ matrix.pg }} --lib
-        env:
-          RUSTFLAGS: ""
-
-  # QA-1 enforcement (see codecov.yml + CLAUDE.md): the SPI/async files excluded
-  # from unit coverage can't be caught by the codecov gate, so a behavioural change
-  # to one of them must ship a kafka_test E2E regression test. This makes that
-  # mitigation a machine check instead of a prose policy a reviewer might miss.
-  spi-e2e-guard:
-    name: SPI change needs E2E test
-    runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
-    steps:
-      - uses: actions/checkout@v4
-      - name: Require a kafka_test change when an SPI/async file changes
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
-        run: |
-          gh pr view "$PR_NUMBER" --json files --jq '.files[].path' \
-            | bash .github/scripts/require-e2e-for-spi.sh

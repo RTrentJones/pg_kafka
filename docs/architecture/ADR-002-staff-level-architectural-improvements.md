@@ -3,15 +3,15 @@
 ## Status
 Accepted
 
-### Implementation status (2026-10-29)
+### Implementation status
 
 The decisions below are kept as recorded. Their current state in the code:
 
 | Decision | State in the code |
 |----------|-------------------|
-| 1. Byte-weighted backpressure | **Not implemented.** The `RequestSize` / `pending_bytes` / `MAX_PENDING_BYTES` tracker was never wired in and was removed (QA-4). The request channel is count-bounded (`REQUEST_CHANNEL_CAPACITY = 10_000` in `src/worker.rs`, plus a 1,000-slot Heartbeat liveness lane). The listener enqueues with `try_send` and an async retry so a full channel waits without blocking the tokio runtime (SEC-4). Memory is bounded instead by `MAX_REQUEST_SIZE` (100,000,000 bytes per frame) and `MAX_CONNECTIONS` (1,024 concurrent connections, SEC-3) in `src/kafka/constants.rs`. The `approx_byte_size` estimators in `src/kafka/messages.rs` remain as utilities. |
-| 2. Shadow mode outbox | **Implemented, with a different drain model.** `ShadowStore` (`src/kafka/shadow/store.rs`) inserts a pending `kafka.shadow_tracking` row in the same transaction as the local write. A periodic DB-thread poll (not only startup) claims up to 256 due rows, the network thread forwards them, and the row is finalized (`external_offset` set) on ack. Failed rows retry up to 10 times and are then left as dead letters, re-queueable with `kafka.replay_shadow_messages`. Delivered rows are pruned by the retention sweep. Delivery is at-least-once, not exactly-once (see Consequences). |
-| 3. Dynamic fetch sizing | **Implemented without the GUC.** `PostgresStore::fetch_records` sums `pg_column_size(key) + pg_column_size(value) + 64` in a running window and stops at `max_bytes`. There is no `fetch_initial_estimate_bytes` GUC. |
+| 1. Byte-weighted backpressure | **Not implemented.** The request channel is count-bounded (`REQUEST_CHANNEL_CAPACITY = 10_000` in `src/worker/network.rs`, plus a 1,000-slot Heartbeat liveness lane, `LIVENESS_CHANNEL_CAPACITY`). The listener enqueues with `try_send` and an async retry, so a full channel waits without blocking the tokio runtime. Memory is bounded instead by `MAX_REQUEST_SIZE` (100,000,000 bytes per frame, `src/kafka/constants.rs`) and the connection caps `pg_kafka.max_connections` (per listener, default 1024) and `pg_kafka.max_connections_per_ip` (default 256). |
+| 2. Shadow mode outbox | **Implemented, with a different drain model.** `ShadowStore` (`src/kafka/shadow/store.rs`) inserts a pending `kafka.shadow_tracking` row in the same transaction as the local write. A periodic DB-thread poll claims up to `pg_kafka.shadow_batch_size` (default 1000) due rows, the network-thread forwarder sends them, and the row is finalized (`external_offset` set) on ack. A row that fails `pg_kafka.shadow_max_retries` times (default 10) is left as a dead letter, re-queueable with `kafka.replay_shadow_messages`. Delivered rows are pruned by the retention sweep. Delivery is at-least-once, not exactly-once (see Consequences). |
+| 3. Dynamic fetch sizing | **Implemented without the GUC.** `PostgresStore`'s fetch sums `pg_column_size(key) + pg_column_size(value) + 64` in a running window and stops at `max_bytes`. There is no `fetch_initial_estimate_bytes` GUC. |
 | 4. Unified metrics view | **Implemented** as `kafka.metrics` in `sql/bootstrap.sql` with columns `(category, metric, value, unit)`. Message count and size are O(1) catalog estimates (`reltuples`, `pg_table_size`), not `count(*)`. |
 
 ## Context

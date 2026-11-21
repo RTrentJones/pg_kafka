@@ -63,7 +63,9 @@ impl AssignmentStrategy for RangeStrategy {
                 continue;
             }
 
-            let num_members = subscribed_members.len() as i32;
+            // Saturating is exact: with more members than i32::MAX (and so than partitions),
+            // every partition goes to its own member either way.
+            let num_members = i32::try_from(subscribed_members.len()).unwrap_or(i32::MAX);
             let num_partitions = *partition_count;
 
             // Calculate range distribution
@@ -75,11 +77,7 @@ impl AssignmentStrategy for RangeStrategy {
             for (member_idx, member_id) in subscribed_members.iter().enumerate() {
                 // First `extra_partitions` members get one additional partition
                 let range_size = base_range
-                    + if (member_idx as i32) < extra_partitions {
-                        1
-                    } else {
-                        0
-                    };
+                    + i32::from(i32::try_from(member_idx).is_ok_and(|i| i < extra_partitions));
 
                 if range_size > 0 {
                     let partitions: Vec<i32> =
@@ -183,9 +181,9 @@ mod tests {
 
         assert_eq!(result["member-1"].partitions("topic-a"), vec![0]);
         assert_eq!(result["member-2"].partitions("topic-a"), vec![1]);
-        assert!(result["member-3"].partitions("topic-a").is_empty());
-        assert!(result["member-4"].partitions("topic-a").is_empty());
-        assert!(result["member-5"].partitions("topic-a").is_empty());
+        assert_eq!(result["member-3"].partitions("topic-a"), [] as [i32; 0]);
+        assert_eq!(result["member-4"].partitions("topic-a"), [] as [i32; 0]);
+        assert_eq!(result["member-5"].partitions("topic-a"), [] as [i32; 0]);
     }
 
     #[test]
@@ -218,8 +216,8 @@ mod tests {
         let result = strategy.assign(&input);
 
         assert_eq!(result["member-1"].partitions("topic-a"), vec![0]);
-        assert!(result["member-2"].partitions("topic-a").is_empty());
-        assert!(result["member-3"].partitions("topic-a").is_empty());
+        assert_eq!(result["member-2"].partitions("topic-a"), [] as [i32; 0]);
+        assert_eq!(result["member-3"].partitions("topic-a"), [] as [i32; 0]);
     }
 
     #[test]
@@ -264,7 +262,7 @@ mod tests {
         assert_eq!(result["member-2"].partitions("topic-a"), vec![2, 3]);
 
         // topic-b: only member-2 -> all 4
-        assert!(result["member-1"].partitions("topic-b").is_empty());
+        assert_eq!(result["member-1"].partitions("topic-b"), [] as [i32; 0]);
         assert_eq!(result["member-2"].partitions("topic-b"), vec![0, 1, 2, 3]);
     }
 
@@ -281,7 +279,7 @@ mod tests {
 
         // member-1 gets topic-a, no one gets topic-b
         assert_eq!(result["member-1"].partitions("topic-a"), vec![0, 1, 2, 3]);
-        assert!(result["member-1"].partitions("topic-b").is_empty());
+        assert_eq!(result["member-1"].partitions("topic-b"), [] as [i32; 0]);
     }
 
     #[test]
@@ -291,7 +289,7 @@ mod tests {
         let strategy = RangeStrategy::new();
         let result = strategy.assign(&input);
 
-        assert!(result["member-1"].partitions("topic-a").is_empty());
+        assert_eq!(result["member-1"].partitions("topic-a"), [] as [i32; 0]);
     }
 
     #[test]
