@@ -3,7 +3,7 @@
 
 use super::helpers::validate_ongoing_transaction;
 use crate::kafka::constants::{
-    ERROR_INVALID_PRODUCER_EPOCH, ERROR_INVALID_TXN_STATE, ERROR_NONE,
+    ERROR_INVALID_PRODUCER_EPOCH, ERROR_INVALID_TXN_STATE, ERROR_NONE, ERROR_UNKNOWN_SERVER_ERROR,
     ERROR_UNKNOWN_TOPIC_OR_PARTITION,
 };
 use crate::kafka::error::{KafkaError, Result};
@@ -283,6 +283,13 @@ fn produce_partition(
         partition_refusal(store, topic, partition_index, partition_meta, transaction)
     {
         return failed_partition(partition_index, error_code);
+    }
+
+    // No batch, no producer state: a partition without records (decoding refuses null
+    // records first) is neither sequence-checked nor remembered as a batch, which would
+    // take the producer's next real batch there for a duplicate.
+    if records.is_empty() {
+        return failed_partition(partition_index, ERROR_UNKNOWN_SERVER_ERROR);
     }
 
     // Sequence metadata for this partition (idempotent producers only).
@@ -587,6 +594,55 @@ mod tests {
             .collect();
         got.sort_unstable();
         assert_eq!(got, vec![(0, ERROR_NONE, 11, 5), (1, ERROR_NONE, 3, 6)]);
+    }
+
+    /// A partition without records takes no producer state: it is refused
+    /// UNKNOWN_SERVER_ERROR without a sequence check or a remembered batch, even with the
+    /// request's producer metadata, while the request's other partitions are written.
+    #[test]
+    fn a_partition_without_records_takes_no_producer_state() {
+        let mut mock = MockKafkaStore::new();
+        mock.expect_get_or_create_topic()
+            .returning(|_, _| Ok((1, 2)));
+        mock.expect_check_and_update_sequence()
+            .times(1)
+            .returning(|_, _, _, partition, _, _| {
+                assert_eq!(partition, 0);
+                Ok(SequenceCheck::Append)
+            });
+        mock.expect_insert_records()
+            .times(1)
+            .returning(|_, _, _| Ok(0));
+        mock.expect_record_producer_batch()
+            .times(1)
+            .returning(|batch| {
+                assert_eq!(batch.partition_id, 0);
+                Ok(())
+            });
+        mock.expect_get_log_start_offset().returning(|_, _| Ok(0));
+        let mut data = request(&[0, 1]);
+        data[0].partitions[1].records.clear();
+        data[0].partitions[1].producer_metadata = None;
+        let idempotent = ProducerMetadata {
+            is_transactional: false,
+            ..meta()
+        };
+        for p in &mut data[0].partitions {
+            p.producer_metadata = p.producer_metadata.as_ref().map(|_| idempotent.clone());
+        }
+        let env = TestEnv::new();
+        let ctx = env.ctx(&mock);
+        let response = handle_produce(&ctx, data, Some(&idempotent), None).unwrap();
+        let mut got: Vec<(i32, i16, i64)> = response.responses[0]
+            .partition_responses
+            .iter()
+            .map(|p| (p.index, p.error_code, p.base_offset))
+            .collect();
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec![(0, ERROR_NONE, 0), (1, ERROR_UNKNOWN_SERVER_ERROR, -1)]
+        );
     }
 
     /// A failed log-start lookup after the records are written leaves the produce

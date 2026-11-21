@@ -192,6 +192,10 @@ pg_kafka.compression_type = 'gzip'
   epoch, KIP-360, as the Java client does) becomes the producer's epoch, and on every
   partition where the producer wrote at an earlier epoch its first batch at the new epoch
   must start at sequence 0 (any sequence on a partition where it has no state)
+- ✅ A partition whose records are null is refused UNKNOWN_SERVER_ERROR (-1), as Kafka 3.7
+  answers it, and the request's other partitions are written (with acks=0 the refusal
+  closes the connection); no producer state is taken from it, so the producer's next
+  batch there is checked against its earlier batches only
 - ✅ PostgreSQL advisory locks for sequence serialization
 - ✅ A producer the broker holds no state for (a producer id with no `kafka.producer_ids`
   row: removed by the retention sweep after 7 idle days, lost with DROP EXTENSION, or never

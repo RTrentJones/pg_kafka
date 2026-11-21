@@ -17,7 +17,7 @@ use super::{
 };
 use crate::kafka::constants::{
     ERROR_CORRUPT_MESSAGE, ERROR_INVALID_REQUIRED_ACKS, ERROR_NONE,
-    ERROR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED,
+    ERROR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED, ERROR_UNKNOWN_SERVER_ERROR,
 };
 use crate::kafka::dispatch::RequestOutcome;
 use crate::kafka::error::KafkaError;
@@ -441,17 +441,28 @@ fn decode_records(
         let name = topic.name.to_string();
         let mut partitions = Vec::with_capacity(topic.partition_data.len());
         for partition in &topic.partition_data {
-            let (records, producer_metadata) = match &partition.records {
-                Some(batch) => match decode_partition(batch, zstd_allowed, &budget, over_limit)? {
+            // Null records: Kafka 3.7 fails the partition UNKNOWN_SERVER_ERROR (its append
+            // has no batch to read) and writes the others. Refused here, it never reaches
+            // the handler, so no producer state is taken from it.
+            let Some(batch) = &partition.records else {
+                refused.push(RefusedPartition {
+                    topic: name.clone(),
+                    partition: partition.index,
+                    error_code: ERROR_UNKNOWN_SERVER_ERROR,
+                });
+                continue;
+            };
+            let (records, producer_metadata) =
+                match decode_partition(batch, zstd_allowed, &budget, over_limit)? {
                     Ok(ParsedRecordBatch {
                         records,
                         producer_metadata,
                     }) => (records, Some(producer_metadata)),
                     Err(error_code) => {
                         warn!(
-                            "Refusing the records of topic={name}, partition={}: error {error_code}",
-                            partition.index
-                        );
+                        "Refusing the records of topic={name}, partition={}: error {error_code}",
+                        partition.index
+                    );
                         refused.push(RefusedPartition {
                             topic: name.clone(),
                             partition: partition.index,
@@ -459,9 +470,7 @@ fn decode_records(
                         });
                         continue;
                     }
-                },
-                None => (Vec::new(), None),
-            };
+                };
             partitions.push(PartitionProduceData {
                 partition_index: partition.index,
                 records,
@@ -1520,6 +1529,38 @@ mod tests {
             ("c".into(), vec![]),
         ];
         assert_eq!(got, want);
+    }
+
+    #[test]
+    fn a_partition_with_null_records_is_refused() {
+        let mut data = topics(vec![batch_of(1, 1), batch_of(1, 1)]);
+        data[0].partition_data[1].records = None;
+        let DecodedTopics(decoded, refused, _) =
+            decode_records(&data, true, inline_budget(), OverLimit::Refuse).unwrap();
+        let written: Vec<(i32, usize, bool)> = decoded
+            .iter()
+            .flat_map(|t| t.partitions.iter())
+            .map(|p| {
+                (
+                    p.partition_index,
+                    p.records.len(),
+                    p.producer_metadata.is_some(),
+                )
+            })
+            .collect();
+        assert_eq!(written, vec![(0, 1, true)]);
+        let refused: Vec<(&str, i32, i16)> = refused
+            .iter()
+            .map(|r| (r.topic.as_str(), r.partition, r.error_code))
+            .collect();
+        assert_eq!(refused, vec![("t", 1, ERROR_UNKNOWN_SERVER_ERROR)]);
+
+        // A topic whose only partition is null is left out (not auto-created).
+        data[0].partition_data.remove(0);
+        let DecodedTopics(decoded, refused, _) =
+            decode_records(&data, true, inline_budget(), OverLimit::Refuse).unwrap();
+        assert!(decoded.is_empty());
+        assert_eq!(refused.len(), 1);
     }
 
     #[test]
