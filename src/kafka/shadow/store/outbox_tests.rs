@@ -645,6 +645,26 @@ fn a_dead_flag_sync_counts_only_once_its_tick_committed() {
     assert_eq!(dead_flag_syncs(&h).len(), 1);
 }
 
+/// A sync staged by a tick whose commit was never reported is dropped by the next
+/// tick, even when that tick claims nothing (no broker configured) and commits:
+/// otherwise its commit would make the rolled-back sync count.
+#[test]
+fn a_rolled_back_sync_is_not_made_final_by_a_later_tick_without_a_claim() {
+    let h = async_harness(16);
+    // Tick N: the poll syncs and stages; the transaction rolls back.
+    h.store.drain_forward_acks();
+    h.store.poll_and_forward_outbox().unwrap();
+    assert_eq!(dead_flag_syncs(&h).len(), 1);
+    // Tick N+1: no broker, so the poll returns before any claim; it commits.
+    h.store.db().state().bootstrap_unset = true;
+    committed_poll(&h);
+    assert_eq!(dead_flag_syncs(&h), Vec::<i64>::new());
+    // The broker is back: the sync of tick N never counted, so the claim syncs.
+    h.store.db().state().bootstrap_unset = false;
+    committed_poll(&h);
+    assert_eq!(dead_flag_syncs(&h).len(), 1);
+}
+
 #[test]
 fn batch_size_bounds_the_claim_and_requests_another_poll() {
     let h = async_harness(64);
