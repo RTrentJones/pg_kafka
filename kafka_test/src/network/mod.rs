@@ -182,6 +182,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         decode_work::test_a_produce_of_many_refused_topics_is_answered_quickly: sequential,
         decode_work::test_repeated_entries_are_checked_as_kafka_checks_them: sequential,
         decode_work::test_input_that_decodes_to_nothing_is_bounded_in_time: sequential,
+        decode_work::test_a_long_topic_name_is_held_once_per_topic: sequential,
         hostile_clients::test_invalid_acks_answers_in_kafkas_order: sequential,
         limits::test_network_limits_setup: sequential,
         limits::test_scram_unknown_user_is_indistinguishable: sequential,

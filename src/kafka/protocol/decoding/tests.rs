@@ -385,7 +385,7 @@ fn test_corrupt_produce_partition_is_refused_on_its_own() {
         assert_eq!(
             produce.refused,
             vec![crate::kafka::messages::RefusedPartition {
-                topic: "t".to_string(),
+                topic: "t".into(),
                 partition: 0,
                 error_code: ERROR_CORRUPT_MESSAGE,
             }]

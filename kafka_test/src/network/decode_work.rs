@@ -680,3 +680,136 @@ pub async fn test_input_that_decodes_to_nothing_is_bounded_in_time() -> TestResu
     println!("✅ Test PASSED\n");
     Ok(())
 }
+
+/// Partition entries of the long-name requests below: some 200 KB on the wire each.
+const LONG_NAME_ENTRIES: i32 = 20_000;
+/// A topic name as long as a frame allows (Kafka answers a name this long, of a topic that
+/// cannot exist, UNKNOWN_TOPIC_OR_PARTITION on every partition).
+const LONG_NAME_BYTES: usize = 32_000;
+
+/// How much the listener's peak memory grew (MB) while `send` ran, or `None` when this
+/// process cannot read the backend's /proc entry.
+async fn listener_growth_mb<F: std::future::Future<Output = DynResult<()>>>(
+    ctx: &TestContext,
+    send: F,
+) -> DynResult<Option<u64>> {
+    use super::produce_decoding::{proc_kb, reset_listener_peak};
+    let watch = reset_listener_peak(ctx).await?;
+    send.await?;
+    Ok(watch.and_then(|(pid, rss)| Some(proc_kb(pid, "VmHWM:")?.saturating_sub(rss) / 1024)))
+}
+
+/// A Produce and a long-polling Fetch of one 32,000-byte topic name and 20,000 partition
+/// entries (8 and 16 bytes each on the wire): the broker holds the name once per topic,
+/// not once per partition (640 MB for one 200 KB request), answers every partition
+/// UNKNOWN_TOPIC_OR_PARTITION, as Kafka 3.7 does, and keeps serving.
+pub async fn test_a_long_topic_name_is_held_once_per_topic() -> TestResult {
+    use kafka_protocol::messages::fetch_request::{FetchPartition, FetchTopic};
+    use kafka_protocol::messages::produce_request::{PartitionProduceData, TopicProduceData};
+    use kafka_protocol::messages::{FetchRequest, TopicName};
+    use kafka_protocol::protocol::StrBytes;
+    println!("=== Test: a long topic name is held once per topic ===\n");
+    let ctx = TestContext::new().await?;
+    let name = TopicName(StrBytes::from_string("n".repeat(LONG_NAME_BYTES)));
+
+    println!("Step 1: Produce, {LONG_NAME_ENTRIES} partitions of null records");
+    let mut produce = ProduceRequest::default();
+    produce.acks = 1;
+    produce.timeout_ms = 30_000;
+    let mut topic = TopicProduceData::default();
+    topic.name = name.clone();
+    topic.partition_data = (0..LONG_NAME_ENTRIES)
+        .map(|i| {
+            let mut p = PartitionProduceData::default();
+            p.index = i;
+            p
+        })
+        .collect();
+    produce.topic_data = vec![topic];
+    let frame = request_frame(7, 1, &produce);
+    println!("  request frame: {} bytes", frame.len());
+    let mut s = TcpStream::connect(("127.0.0.1", PORT)).await?;
+    let mut produced = None;
+    let grew = listener_growth_mb(&ctx, async {
+        s.write_all(&frame).await?;
+        let response = read_frame_within(&mut s, Duration::from_secs(60))
+            .await?
+            .ok_or("connection closed instead of a produce response")?;
+        produced = Some(decode_response::<ProduceRequest>(7, &response)?.1);
+        Ok(())
+    })
+    .await?;
+    let produced = produced.ok_or("no produce response")?;
+    assert_eq!(produced.responses.len(), 1, "one topic answered");
+    let codes: Vec<i16> = produced.responses[0]
+        .partition_responses
+        .iter()
+        .map(|p| p.error_code)
+        .collect();
+    assert_eq!(codes.len(), usize::try_from(LONG_NAME_ENTRIES)?);
+    assert!(codes.iter().all(|&c| c == UNKNOWN_TOPIC_OR_PARTITION));
+    check_growth("produce", grew);
+
+    println!("Step 2: a long-polling Fetch v4, {LONG_NAME_ENTRIES} partitions");
+    let mut fetch = FetchRequest::default();
+    fetch.replica_id = (-1).into();
+    fetch.max_wait_ms = 500;
+    fetch.min_bytes = 1;
+    fetch.max_bytes = 1 << 20;
+    let mut topic = FetchTopic::default();
+    topic.topic = name;
+    topic.partitions = (0..LONG_NAME_ENTRIES)
+        .map(|i| {
+            let mut p = FetchPartition::default();
+            p.partition = i;
+            p.partition_max_bytes = 1 << 20;
+            p
+        })
+        .collect();
+    fetch.topics = vec![topic];
+    let frame = request_frame(4, 2, &fetch);
+    println!("  request frame: {} bytes", frame.len());
+    let mut fetched = None;
+    let grew = listener_growth_mb(&ctx, async {
+        s.write_all(&frame).await?;
+        let response = read_frame_within(&mut s, Duration::from_secs(60))
+            .await?
+            .ok_or("connection closed instead of a fetch response")?;
+        fetched = Some(decode_response::<FetchRequest>(4, &response)?.1);
+        Ok(())
+    })
+    .await?;
+    let fetched = fetched.ok_or("no fetch response")?;
+    assert_eq!(fetched.responses.len(), 1, "one topic answered");
+    assert_eq!(
+        fetched.responses[0].partitions.len(),
+        usize::try_from(LONG_NAME_ENTRIES)?
+    );
+    assert!(fetched.responses[0]
+        .partitions
+        .iter()
+        .all(|p| p.error_code == UNKNOWN_TOPIC_OR_PARTITION));
+    check_growth("fetch", grew);
+
+    let mut probe = TcpStream::connect(("127.0.0.1", PORT)).await?;
+    probe.write_all(&api_versions_frame(3)).await?;
+    let answered = read_frame_within(&mut probe, Duration::from_secs(10)).await?;
+    assert!(answered.is_some(), "the broker still answers");
+    println!("✅ answered; the broker still serves");
+
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// Assert the listener grew by little: the request itself is 200 KB; a copy of the name
+/// per partition would be 640 MB.
+fn check_growth(what: &str, grew: Option<u64>) {
+    match grew {
+        Some(grew) => {
+            println!("  {what}: listener peak +{grew} MB");
+            assert!(grew < 64, "{what} grew the listener by {grew} MB");
+        }
+        None => println!("  (listener memory not readable from here; skipping the RSS check)"),
+    }
+}
