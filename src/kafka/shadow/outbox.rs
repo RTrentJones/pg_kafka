@@ -120,10 +120,9 @@ pub struct ClaimedRows {
     /// The claim's [`per_partition_claim_cap`] (0 when nothing was claimed): a
     /// partition that got this many rows may have more due.
     pub partition_share: i64,
-    /// Set when the claim ran the dead-flag sync ([`OutboxClaim::sync_dead_flags`]):
-    /// the xid of the (sub)transaction that wrote its changes, 0 when it changed
-    /// nothing. The flags agree with the cap once that xid committed.
-    pub dead_flags_synced: Option<u32>,
+    /// Whether the claim ran the dead-flag sync ([`OutboxClaim::sync_dead_flags`]).
+    /// The flags agree with the cap once the claim's transaction committed.
+    pub dead_flags_synced: bool,
 }
 
 impl ClaimedRows {
@@ -344,7 +343,8 @@ macro_rules! pending_partitions {
 ///   the first claim on a schema found current again (`forget_dead_flags_sync`),
 ///   a claim whose cap differs from the cap of the last sync (a reload changed
 ///   `pg_kafka.shadow_max_retries`) or of a failure ack applied since, and a claim
-///   after a sync that did not commit (`ShadowStore::dead_flags_current`).
+///   after a sync whose tick did not commit (a sync counts only once its tick's
+///   transaction committed: `ShadowStore::commit_applied_acks`).
 ///
 /// A hand edit of `retry_count` outside these paths is picked up at the next worker
 /// start or cap change: until then a dead letter lowered below the cap by hand (not
@@ -652,20 +652,15 @@ impl SpiShadowDb {
     /// Run [`DEAD_LETTER_SYNC_SQL`] if the claim asks for it, then
     /// [`CLAIM_DUE_OUTBOX_ROWS_SQL`] (parameters in [`ShadowDb::claim_due_outbox_rows`]).
     fn run_claim(
-        self,
         client: &mut pgrx::spi::SpiClient<'_>,
         claim: &OutboxClaim,
         backoff_base_ms: f64,
         backoff_max_ms: f64,
     ) -> Result<ClaimedRows> {
-        let mut dead_flags_synced = None;
         if claim.sync_dead_flags {
             // A statement of its own: the claim's CTEs would read `dead` as it was
             // before an UPDATE in the same statement.
             client.update(DEAD_LETTER_SYNC_SQL, None, &[claim.max_retries.into()])?;
-            // The claim's subtransaction has written nothing before it, so an xid is
-            // assigned only if the sync changed a row.
-            dead_flags_synced = Some(self.current_transaction_id());
         }
         let table = client.update(
             CLAIM_DUE_OUTBOX_ROWS_SQL,
@@ -682,7 +677,7 @@ impl SpiShadowDb {
         )?;
 
         let mut claimed = ClaimedRows {
-            dead_flags_synced,
+            dead_flags_synced: claim.sync_dead_flags,
             ..ClaimedRows::default()
         };
         for row in table {
@@ -883,7 +878,7 @@ impl ShadowDb for SpiShadowDb {
             let saved = saved.first();
             let work_mem: Option<String> = saved.get_by_name("work_mem")?;
             let jit: Option<String> = saved.get_by_name("jit")?;
-            let claimed = self.run_claim(client, claim, backoff_base_ms, backoff_max_ms);
+            let claimed = Self::run_claim(client, claim, backoff_base_ms, backoff_max_ms);
             client.update(
                 RESTORE_CLAIM_SETTINGS_SQL,
                 None,

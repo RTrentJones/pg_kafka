@@ -198,21 +198,15 @@ pub struct ShadowStore<S: KafkaStore, D: ShadowDb = SpiShadowDb> {
     /// What the current tick's ack application did, made final by
     /// `commit_applied_acks` once its transaction committed.
     staged_acks: Mutex<Option<StagedAcks>>,
-    /// The last full dead-flag sync: `kafka.shadow_tracking.dead` agrees with
-    /// this cap on every pending row, once its xid committed. `None` until the
-    /// first claim, and whenever the flags may disagree with the cap the claims
-    /// use (see `DEAD_LETTER_SYNC_SQL` in `outbox.rs`).
-    dead_flags: Mutex<Option<DeadFlagsSync>>,
-}
-
-/// A full dead-flag sync ([`ShadowStore::dead_flags_current`]).
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct DeadFlagsSync {
-    /// The retry cap it synced the flags to.
-    cap: i64,
-    /// The xid that wrote its changes; 0 once known committed, or when it changed
-    /// nothing.
-    xid: u32,
+    /// The cap of the last full dead-flag sync whose transaction committed:
+    /// `kafka.shadow_tracking.dead` agrees with it on every pending row. `None`
+    /// until the first claim, and whenever the flags may disagree with the cap the
+    /// claims use (see `DEAD_LETTER_SYNC_SQL` in `outbox.rs`).
+    dead_flags: Mutex<Option<i64>>,
+    /// The cap of a sync run by the current tick's poll, made final by
+    /// `commit_applied_acks` once its transaction committed (as the acks are), so
+    /// no transaction's status is ever looked up after the fact.
+    staged_dead_flags: Mutex<Option<i64>>,
 }
 
 /// The effects of one ack application that must wait for its transaction's
@@ -283,6 +277,7 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
             unapplied_acks: Mutex::new(Vec::new()),
             staged_acks: Mutex::new(None),
             dead_flags: Mutex::new(None),
+            staged_dead_flags: Mutex::new(None),
         }
     }
 
@@ -734,11 +729,8 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
                 self.forget_dead_flags_sync();
                 super::error::ShadowError::DatabaseError(format!("outbox poll failed: {e}"))
             })?;
-        if let Some(xid) = claim.dead_flags_synced {
-            *lock(&self.dead_flags) = Some(DeadFlagsSync {
-                cap: settings.max_retries,
-                xid,
-            });
+        if claim.dead_flags_synced {
+            *lock(&self.staged_dead_flags) = Some(settings.max_retries);
         }
         let more_due = claim.more_due(limit);
         let records = claim.records;
@@ -780,33 +772,24 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
     }
 
     /// Whether `kafka.shadow_tracking.dead` agrees with `cap` on every pending row,
-    /// so the claim can skip the full sync: the last sync used `cap`, it committed
-    /// (or changed nothing), and no failure ack used another cap since. Every other
-    /// change of `retry_count` keeps `dead` in its own statement. Called inside the
-    /// tick's transaction, about a sync of an earlier, finished one.
+    /// so the claim can skip the full sync: the last committed sync used `cap` and
+    /// no failure ack used another cap since. Every other change of `retry_count`
+    /// keeps `dead` in its own statement.
     fn dead_flags_current(&self, cap: i64) -> bool {
-        let mut synced = lock(&self.dead_flags);
-        match *synced {
-            Some(DeadFlagsSync { cap: c, xid }) if c == cap => {
-                if xid == 0 {
-                    return true;
-                }
-                if self.db.transaction_committed(xid) {
-                    // Checked once: an old xid's clog may be truncated later.
-                    *synced = Some(DeadFlagsSync { cap, xid: 0 });
-                    return true;
-                }
-                *synced = None;
-                false
-            }
-            _ => false,
-        }
+        *lock(&self.dead_flags) == Some(cap)
     }
 
     /// Make the next claim run the full dead-flag sync: the flags may disagree with
     /// the cap (the schema was dropped, recreated or upgraded under the worker).
     pub fn forget_dead_flags_sync(&self) {
         *lock(&self.dead_flags) = None;
+        lock(&self.staged_dead_flags).take();
+    }
+
+    /// The current tick's poll failed or was rolled back: a sync it ran did not
+    /// take effect, so it is not made final at the commit.
+    pub fn discard_staged_poll(&self) {
+        lock(&self.staged_dead_flags).take();
     }
 
     /// Drain the currently-available forward acks and finalize their outbox
@@ -821,8 +804,10 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
     /// COMMIT failed) are applied again by the next call, before new ones; so
     /// are acks whose statement failed.
     pub fn drain_forward_acks(&self) -> usize {
-        // A staged application whose commit was not reported was rolled back.
+        // A staged application (or sync) whose commit was not reported was
+        // rolled back.
         lock(&self.staged_acks).take();
+        lock(&self.staged_dead_flags).take();
         let acks: Vec<ForwardAck> = {
             let mut unapplied = lock(&self.unapplied_acks);
             let guard = read_lock(&self.forward_ack_rx);
@@ -858,6 +843,9 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
     /// and may be claimed again), the forwarding counters move, and the dead
     /// letters it made are logged.
     pub fn commit_applied_acks(&self) {
+        if let Some(cap) = lock(&self.staged_dead_flags).take() {
+            *lock(&self.dead_flags) = Some(cap);
+        }
         let Some(staged) = lock(&self.staged_acks).take() else {
             return;
         };
@@ -931,7 +919,7 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
             // The failures set `dead` with this tick's cap: if the last sync used
             // another one, the next claim must sync (even if the cap reverts first).
             let mut synced = lock(&self.dead_flags);
-            if synced.is_some_and(|s| s.cap != settings.max_retries) {
+            if synced.is_some_and(|cap| cap != settings.max_retries) {
                 *synced = None;
             }
         }

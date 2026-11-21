@@ -358,7 +358,7 @@ impl ShadowDb for InMemoryShadowDb {
         let mut out = ClaimedRows::default();
         if claim.sync_dead_flags {
             s.dead_flag_syncs.push(claim.max_retries);
-            out.dead_flags_synced = Some(s.current_xid);
+            out.dead_flags_synced = true;
         }
         let candidates = s.claim_candidates(claim, now);
         let (due, share) = due_rows(&candidates, claim.batch_limit);

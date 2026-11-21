@@ -160,6 +160,9 @@ pub(super) fn tick_shadow_outbox(shadow_store: &ShadowStore<PostgresStore>) {
         if let Err(panic_msg) = result {
             poll_error = Some(format!("poll failed, rolled back: {panic_msg}"));
         }
+        if poll_error.is_some() {
+            shadow_store.discard_staged_poll();
+        }
         match failure.or(poll_error) {
             Some(msg) => {
                 if shadow_store.note_outbox_tick(false) {

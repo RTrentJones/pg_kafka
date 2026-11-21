@@ -1402,7 +1402,9 @@ pub async fn test_shadow_worker_stays_idle_beside_dead_letters() -> TestResult {
 /// Dead letters follow `pg_kafka.shadow_max_retries` as it changes: rows at the cap
 /// are not forwarded; raising the cap above their retry count forwards them; lowering
 /// it to the retry count of due rows stops them; a replay forwards them again. (The
-/// claim keeps a per-row dead flag in step with the cap, so each change must reach it.)
+/// claim keeps a per-row dead flag in step with the cap, so each change must reach it:
+/// step 1 checks the flags were set by the sync a cap change makes, and step 2 that
+/// the sync clears them again.)
 pub async fn test_shadow_dead_letters_follow_the_retry_cap() -> TestResult {
     const RECORDS: usize = 200;
     println!("=== Test: dead letters follow pg_kafka.shadow_max_retries ===\n");
@@ -1436,15 +1438,19 @@ pub async fn test_shadow_dead_letters_follow_the_retry_cap() -> TestResult {
             }
             Ok::<(), Box<dyn std::error::Error>>(())
         };
-        let cap: i32 = db
+        let current: i32 = db
             .query_one(
                 "SELECT current_setting('pg_kafka.shadow_max_retries')::int",
                 &[],
             )
             .await?
             .get(0);
+        // A cap other than the current one: the reload that sets it makes the worker
+        // sync the flags, so the dead letters below are flagged and step 2 needs the
+        // sync to revive them (a hand edit alone is not synced).
+        let cap: i32 = if current == 5 { 6 } else { 5 };
 
-        println!("Step 1: no broker; {RECORDS} records dead-lettered at the cap ({cap})...");
+        println!("Step 1: no broker; {RECORDS} records dead-lettered at a new cap ({cap})...");
         alter_system(
             &db,
             "ALTER SYSTEM SET pg_kafka.shadow_bootstrap_servers = ''",
@@ -1458,8 +1464,33 @@ pub async fn test_shadow_dead_letters_follow_the_retry_cap() -> TestResult {
             &[&topic_id, &cap],
         )
         .await?;
+        alter_system(
+            &db,
+            &format!("ALTER SYSTEM SET pg_kafka.shadow_max_retries = {cap}"),
+        )
+        .await?;
         restore_bootstrap_servers(&db).await?;
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let unflagged: i64 = db
+                .query_one(
+                    "SELECT COUNT(*) FROM kafka.shadow_tracking \
+                     WHERE topic_id = $1 AND external_offset IS NULL AND NOT dead",
+                    &[&topic_id],
+                )
+                .await?
+                .get(0);
+            if unflagged == 0 {
+                break;
+            }
+            if Instant::now() > deadline {
+                return Err(format!(
+                    "{unflagged} of {RECORDS} rows at cap {cap} have no dead flag after 30 s"
+                )
+                .into());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         let left = undelivered(ctx.db(), topic_id).await?;
         if delivered(left)? != 0 {
             return Err(format!("{} dead letters were forwarded", delivered(left)?).into());
