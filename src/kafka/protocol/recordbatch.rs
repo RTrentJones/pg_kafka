@@ -942,9 +942,138 @@ mod tests {
     }
 
     /// What the decompressors and record readers hold beyond their charge besides the
-    /// decoded bytes: their own state (inflate's window, an lz4 frame's block buffer, a
+    /// decoded bytes: their own state (inflate's window, an lz4 frame's block buffers, a
     /// zstd context), which does not grow with the batch.
     const DECODER_STATE: usize = 512 * 1024;
+
+    /// lz4's frame decoder allocates its block buffers with the C runtime's `malloc`, which
+    /// [`crate::testing::heap_peak`] does not see (gzip and snappy decode in Rust; zstd's
+    /// contexts allocate through Rust's allocator, the `with-rust-allocator` feature).
+    /// This decodes the lz4 frame `frame` with a context created through lz4frame.h's
+    /// allocator hook (`LZ4F_createDecompressionContext_advanced`), its allocations going
+    /// through Rust's allocator, and returns what it held at most: what decoding the same
+    /// frame makes lz4 allocate, as its buffers depend on the frame header only (they are
+    /// allocated as it is read and kept to the end).
+    mod lz4_c {
+        use std::alloc::{alloc, dealloc, Layout};
+        use std::ffi::c_void;
+        use std::ptr::{null, null_mut};
+
+        /// Bytes before each block holding its allocation size (and keeping malloc's
+        /// 16-byte alignment).
+        const HEADER: usize = 16;
+
+        unsafe extern "C" fn rust_alloc(_opaque: *mut c_void, size: usize) -> *mut c_void {
+            let Ok(layout) = Layout::from_size_align(size.saturating_add(HEADER), HEADER) else {
+                return null_mut();
+            };
+            // SAFETY: the layout's size is at least HEADER, never zero.
+            let base = unsafe { alloc(layout) };
+            if base.is_null() {
+                return null_mut();
+            }
+            #[expect(
+                clippy::cast_ptr_alignment,
+                reason = "the allocation is aligned to HEADER, 16 bytes"
+            )]
+            // SAFETY: `base` is valid for `layout.size()` bytes and aligned for a usize; the
+            // block handed out starts HEADER bytes in, within the allocation.
+            unsafe {
+                base.cast::<usize>().write(layout.size());
+                base.add(HEADER).cast()
+            }
+        }
+
+        unsafe extern "C" fn rust_free(_opaque: *mut c_void, address: *mut c_void) {
+            if address.is_null() {
+                return;
+            }
+            // SAFETY: lz4 frees only blocks `rust_alloc` handed out, HEADER bytes past the
+            // start of an allocation whose size it wrote there, with this layout.
+            unsafe {
+                let base = address.cast::<u8>().sub(HEADER);
+                #[expect(
+                    clippy::cast_ptr_alignment,
+                    reason = "the allocation is aligned to HEADER, 16 bytes"
+                )]
+                let size = base.cast::<usize>().read();
+                dealloc(base, Layout::from_size_align_unchecked(size, HEADER));
+            }
+        }
+
+        /// `LZ4F_CustomMem`.
+        #[repr(C)]
+        struct CustomMem {
+            alloc: unsafe extern "C" fn(*mut c_void, usize) -> *mut c_void,
+            calloc: Option<unsafe extern "C" fn(*mut c_void, usize) -> *mut c_void>,
+            free: unsafe extern "C" fn(*mut c_void, *mut c_void),
+            opaque: *mut c_void,
+        }
+
+        /// `LZ4F_VERSION`.
+        const LZ4F_VERSION: u32 = 100;
+
+        extern "C" {
+            fn LZ4F_createDecompressionContext_advanced(
+                custom_mem: CustomMem,
+                version: u32,
+            ) -> *mut c_void;
+            fn LZ4F_decompress(
+                ctx: *mut c_void,
+                dst: *mut u8,
+                dst_size: *mut usize,
+                src: *const u8,
+                src_size: *mut usize,
+                options: *const c_void,
+            ) -> usize;
+            fn LZ4F_freeDecompressionContext(ctx: *mut c_void) -> usize;
+            fn LZ4F_isError(code: usize) -> u32;
+        }
+
+        pub(super) fn peak(frame: &[u8]) -> usize {
+            let ((), peak) = crate::testing::heap_peak(|| {
+                let mem = CustomMem {
+                    alloc: rust_alloc,
+                    calloc: None,
+                    free: rust_free,
+                    opaque: null_mut(),
+                };
+                // SAFETY: `mem`'s functions allocate and free as lz4 expects of malloc and
+                // free; the context is freed below.
+                let ctx = unsafe { LZ4F_createDecompressionContext_advanced(mem, LZ4F_VERSION) };
+                assert!(!ctx.is_null());
+                let mut out = vec![0u8; 64 * 1024];
+                let mut src = frame;
+                loop {
+                    let mut dst_size = out.len();
+                    let mut src_size = src.len();
+                    // SAFETY: `out` and `src` are valid for the sizes passed; lz4 writes back
+                    // how much it wrote and read, within them.
+                    let hint = unsafe {
+                        LZ4F_decompress(
+                            ctx,
+                            out.as_mut_ptr(),
+                            &raw mut dst_size,
+                            src.as_ptr(),
+                            &raw mut src_size,
+                            null(),
+                        )
+                    };
+                    // SAFETY: a pure function of its argument.
+                    assert_eq!(unsafe { LZ4F_isError(hint) }, 0, "the frame decodes");
+                    src = &src[src_size..];
+                    if hint == 0 || (src.is_empty() && dst_size == 0) {
+                        break;
+                    }
+                }
+                // SAFETY: `ctx` came from LZ4F_createDecompressionContext_advanced and is
+                // not used again.
+                unsafe { LZ4F_freeDecompressionContext(ctx) };
+            });
+            // The 64 KiB output buffer is this measurement's, not lz4's.
+            peak - 64 * 1024
+        }
+    }
 
     #[test]
     fn a_decode_holds_at_most_twice_its_charge() {
@@ -958,15 +1087,54 @@ mod tests {
                 many_records_batch(2000, 600, compression),
             ] {
                 let budget = budget();
-                let (records, peak) =
+                let (records, rust) =
                     crate::testing::heap_peak(|| parse_record_batch(&batch, &budget).unwrap());
+                let c = if compression == Compression::Lz4 {
+                    lz4_c::peak(&batch[RECORD_BATCH_OVERHEAD..])
+                } else {
+                    0
+                };
+                let peak = rust + c;
                 let charged = budget.most_charged();
+                println!(
+                    "{compression:?}: held {peak} ({c} by lz4's C side) for a charge of {charged}"
+                );
                 assert!(
                     peak <= 2 * charged + DECODER_STATE,
                     "{compression:?}: held {peak} bytes for a charge of {charged}"
                 );
                 drop(records);
             }
+        }
+    }
+
+    #[test]
+    fn lz4_block_buffers_are_fixed_by_the_frame_header() {
+        // What lz4 allocates in C for a frame is set by its block size and mode alone, not
+        // by how much it decodes: some 2 x 64 KiB at Kafka's (and Java's) default block
+        // size, up to 2 x 4 MiB + 128 KiB at the largest a frame may name. It is not
+        // charged; at most two inline and two large decodes run at once.
+        let frame = |len: usize, block_size| {
+            let mut encoder = lz4::EncoderBuilder::new()
+                .block_size(block_size)
+                .build(Vec::new())
+                .unwrap();
+            encoder.write_all(&vec![0u8; len]).unwrap();
+            let (frame, result) = encoder.finish();
+            result.unwrap();
+            frame
+        };
+        for (block_size, block) in [
+            (lz4::BlockSize::Max64KB, 64 << 10),
+            (lz4::BlockSize::Max4MB, 4 << 20),
+        ] {
+            let small = lz4_c::peak(&frame(1000, block_size.clone()));
+            let large = lz4_c::peak(&frame(20_000_000, block_size));
+            assert_eq!(small, large, "{block} bytes a block");
+            assert!(
+                (2 * block..=2 * block + (128 << 10) + 1024).contains(&large),
+                "{block} bytes a block: {large}"
+            );
         }
     }
 

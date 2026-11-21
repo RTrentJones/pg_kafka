@@ -22,7 +22,14 @@
 //! section's buffer is charged by its capacity before it grows, and shrunk to its bytes
 //! once decoded, the spare capacity given back. Measured for every codec, at most 2.0
 //! times, besides the decompressors' fixed state (`recordbatch`'s
-//! `a_decode_holds_at_most_twice_its_charge`). The charge a decoded request keeps (its
+//! `a_decode_holds_at_most_twice_its_charge`). The measurement counts every allocation of
+//! the decode, the decompressors' own included: gzip and snappy decode in Rust, zstd's
+//! contexts allocate through Rust's allocator (its whole window, which is charged as it
+//! fills), and lz4's block buffers, which its C library allocates with `malloc`, are
+//! measured through lz4's allocator hook and added. lz4's buffers are fixed by the frame's
+//! block size and not charged: some 128 KiB at Kafka's default 64 KiB blocks, at most about
+//! 8.1 MiB at 4 MiB blocks, per decode running
+//! (`lz4_block_buffers_are_fixed_by_the_frame_header`). The charge a decoded request keeps (its
 //! section's bytes) may be half the most it charged while the section grew; once the
 //! section is dropped the request holds no more than that charge.
 //!
