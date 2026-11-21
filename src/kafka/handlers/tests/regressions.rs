@@ -262,6 +262,7 @@ fn txn_offset_commit_checks_partition_range() {
         .returning(|_, _, _| Ok(()));
     mock.expect_get_transaction_state()
         .returning(|_| Ok(Some(TransactionState::Ongoing)));
+    mock.expect_txn_has_group().returning(|_, _| Ok(true));
     mock.expect_get_topic_id().returning(|_| Ok(Some(1)));
     mock.expect_get_topic_partition_count()
         .returning(|_| Ok(Some(1)));

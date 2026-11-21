@@ -538,6 +538,31 @@ impl PostgresStore {
         .map_err(internal("txn_has_partition"))
     }
 
+    pub(super) fn add_txn_group(transactional_id: &str, group_id: &str) -> Result<()> {
+        Spi::connect_mut(|client| {
+            client.update(
+                "INSERT INTO kafka.txn_groups (transactional_id, group_id) VALUES ($1, $2)
+                 ON CONFLICT DO NOTHING",
+                None,
+                &[transactional_id.into(), group_id.into()],
+            )?;
+            Ok(())
+        })
+        .map_err(internal("add_txn_group"))
+    }
+
+    pub(super) fn txn_has_group(transactional_id: &str, group_id: &str) -> Result<bool> {
+        Spi::connect(|client| {
+            let table = client.select(
+                "SELECT 1 FROM kafka.txn_groups WHERE transactional_id = $1 AND group_id = $2",
+                Some(1),
+                &[transactional_id.into(), group_id.into()],
+            )?;
+            Ok(!table.is_empty())
+        })
+        .map_err(internal("txn_has_group"))
+    }
+
     /// Every non-transactional idempotent batch asks, so the first statement is the cheap
     /// one: the producer's Ongoing transaction (an index lookup,
     /// `idx_transactions_ongoing_producer`; none for a producer without a transactional

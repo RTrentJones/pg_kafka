@@ -83,28 +83,38 @@ impl TxnRow {
 /// The states a new transaction may start from.
 const STARTABLE_STATES: &str = "Empty, CompleteCommit, or CompleteAbort";
 
-/// A new transaction starts with an empty partition registry. Called right before a
+/// A new transaction starts with empty partition and group registries. Called right before a
 /// transactional id moves from a finished state (Empty, CompleteCommit, CompleteAbort)
 /// to Ongoing; it deletes nothing for an Ongoing transaction or for a producer that
 /// does not own the transactional id.
-fn clear_finished_txn_partitions(
+fn clear_finished_txn_registries(
     client: &mut SpiClient<'_>,
     transactional_id: &str,
     producer_id: i64,
     producer_epoch: i16,
 ) -> std::result::Result<(), SpiError> {
+    let args = [
+        transactional_id.into(),
+        producer_id.into(),
+        producer_epoch.into(),
+    ];
     client.update(
-        "DELETE FROM kafka.txn_partitions p
+        "DELETE FROM kafka.txn_partitions r
          USING kafka.transactions t
-         WHERE p.transactional_id = $1 AND t.transactional_id = $1
+         WHERE r.transactional_id = $1 AND t.transactional_id = $1
            AND t.producer_id = $2 AND t.producer_epoch = $3
            AND t.state IN ('Empty', 'CompleteCommit', 'CompleteAbort')",
         None,
-        &[
-            transactional_id.into(),
-            producer_id.into(),
-            producer_epoch.into(),
-        ],
+        &args,
+    )?;
+    client.update(
+        "DELETE FROM kafka.txn_groups r
+         USING kafka.transactions t
+         WHERE r.transactional_id = $1 AND t.transactional_id = $1
+           AND t.producer_id = $2 AND t.producer_epoch = $3
+           AND t.state IN ('Empty', 'CompleteCommit', 'CompleteAbort')",
+        None,
+        &args,
     )?;
     Ok(())
 }
@@ -136,9 +146,14 @@ fn fence_previous_epoch(
         None,
         &[transactional_id.into()],
     )?;
-    // The aborted transaction's partition registry goes with it.
+    // The aborted transaction's partition and group registries go with it.
     client.update(
         "DELETE FROM kafka.txn_partitions WHERE transactional_id = $1",
+        None,
+        &[transactional_id.into()],
+    )?;
+    client.update(
+        "DELETE FROM kafka.txn_groups WHERE transactional_id = $1",
         None,
         &[transactional_id.into()],
     )?;
@@ -326,7 +341,7 @@ impl PostgresStore {
         );
 
         Spi::connect_mut(|client| {
-            clear_finished_txn_partitions(client, transactional_id, producer_id, producer_epoch)?;
+            clear_finished_txn_registries(client, transactional_id, producer_id, producer_epoch)?;
             let started = client.update(
                 "UPDATE kafka.transactions
                  SET state = 'Ongoing', started_at = NOW(), last_updated_at = NOW()
@@ -368,7 +383,7 @@ impl PostgresStore {
         );
 
         Spi::connect_mut(|client| {
-            clear_finished_txn_partitions(client, transactional_id, producer_id, producer_epoch)?;
+            clear_finished_txn_registries(client, transactional_id, producer_id, producer_epoch)?;
             let updated = client.update(
                 "UPDATE kafka.transactions
                  SET state = 'Ongoing',

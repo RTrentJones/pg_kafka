@@ -429,6 +429,20 @@ macro_rules! delegate_producer_store {
         ) -> $crate::kafka::error::Result<bool> {
             $via::txn_has_partition(transactional_id, topic_id, partition_id)
         }
+        fn add_txn_group(
+            &self,
+            transactional_id: &str,
+            group_id: &str,
+        ) -> $crate::kafka::error::Result<()> {
+            $via::add_txn_group(transactional_id, group_id)
+        }
+        fn txn_has_group(
+            &self,
+            transactional_id: &str,
+            group_id: &str,
+        ) -> $crate::kafka::error::Result<bool> {
+            $via::txn_has_group(transactional_id, group_id)
+        }
         fn open_txn_epoch_on_partition(
             &self,
             producer_id: i64,
@@ -507,6 +521,20 @@ macro_rules! delegate_producer_store {
             partition_id: i32,
         ) -> $crate::kafka::error::Result<bool> {
             $via::txn_has_partition(&self.$field, transactional_id, topic_id, partition_id)
+        }
+        fn add_txn_group(
+            &self,
+            transactional_id: &str,
+            group_id: &str,
+        ) -> $crate::kafka::error::Result<()> {
+            $via::add_txn_group(&self.$field, transactional_id, group_id)
+        }
+        fn txn_has_group(
+            &self,
+            transactional_id: &str,
+            group_id: &str,
+        ) -> $crate::kafka::error::Result<bool> {
+            $via::txn_has_group(&self.$field, transactional_id, group_id)
         }
         fn open_txn_epoch_on_partition(
             &self,

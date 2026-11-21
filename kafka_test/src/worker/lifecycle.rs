@@ -324,7 +324,7 @@ async fn old_schema() -> SendResult<()> {
 }
 
 /// The 0.0.0 schema lacks tables the library's request paths use (kafka.producer_batches
-/// for every idempotent Produce, kafka.txn_partitions for transactions,
+/// for every idempotent Produce, kafka.txn_partitions and kafka.txn_groups for transactions,
 /// kafka.sasl_credentials for SASL, shadow_tracking.attempt_open for the outbox), so a
 /// library newer than its schema does not serve clients: it answers every request with
 /// the retriable KAFKA_STORAGE_ERROR until `ALTER EXTENSION pg_kafka UPDATE`, and serves

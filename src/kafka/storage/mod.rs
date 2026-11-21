@@ -648,6 +648,16 @@ pub trait ProducerStore {
         partition_id: i32,
     ) -> Result<bool>;
 
+    /// Register a consumer group in the open transaction of `transactional_id`
+    /// (AddOffsetsToTxn). A TxnOffsetCommit is accepted only for a registered group. The
+    /// registry is cleared with the partitions'
+    /// ([`add_txn_partitions`](Self::add_txn_partitions)).
+    fn add_txn_group(&self, transactional_id: &str, group_id: &str) -> Result<()>;
+
+    /// Whether `group_id` was registered for the current transaction of
+    /// `transactional_id` with [`add_txn_group`](Self::add_txn_group).
+    fn txn_has_group(&self, transactional_id: &str, group_id: &str) -> Result<bool>;
+
     /// The epoch of `producer_id`'s Ongoing transaction when that transaction has written
     /// records to `(topic_id, partition_id)` (they are pending there); None otherwise. A
     /// non-transactional batch of the producer there is INVALID_TXN_STATE, as in Kafka.

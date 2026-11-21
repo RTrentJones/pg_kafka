@@ -41,11 +41,11 @@ const REQUIRED_TABLES: [&str; 11] = [
 /// The objects of the current schema (0.1.0) that the library's request and maintenance
 /// paths use and an older extension version lacks, each with the SQL test for it. The
 /// 0.0.0 schema has none of them: every idempotent Produce reads kafka.producer_batches,
-/// transactions use kafka.txn_partitions, SASL logins read kafka.sasl_credentials and
+/// transactions use kafka.txn_partitions and kafka.txn_groups, SASL logins read kafka.sasl_credentials and
 /// kafka.sasl_server_secret, the shadow outbox claims through
 /// kafka.shadow_tracking.attempt_open, and partition maintenance and the metrics flush
 /// need the time partitions and the broker metrics tables.
-const CURRENT_SCHEMA_OBJECTS: [(&str, &str); 8] = [
+const CURRENT_SCHEMA_OBJECTS: [(&str, &str); 9] = [
     (
         "kafka.producer_batches",
         "to_regclass('kafka.producer_batches') IS NOT NULL",
@@ -53,6 +53,10 @@ const CURRENT_SCHEMA_OBJECTS: [(&str, &str); 8] = [
     (
         "kafka.txn_partitions",
         "to_regclass('kafka.txn_partitions') IS NOT NULL",
+    ),
+    (
+        "kafka.txn_groups",
+        "to_regclass('kafka.txn_groups') IS NOT NULL",
     ),
     (
         "kafka.sasl_credentials",
@@ -359,6 +363,7 @@ mod tests {
         for name in [
             "kafka.producer_batches",
             "kafka.txn_partitions",
+            "kafka.txn_groups",
             "kafka.sasl_credentials",
             "kafka.sasl_server_secret",
             "kafka.shadow_tracking.attempt_open",

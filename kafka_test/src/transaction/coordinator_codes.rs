@@ -267,3 +267,64 @@ pub async fn test_unknown_transactional_id_is_invalid_producer_id_mapping() -> T
     println!("✅ Test PASSED\n");
     Ok(())
 }
+
+/// Kafka 3.7 accepts a TxnOffsetCommit only for a group the transaction added with
+/// AddOffsetsToTxn (the transaction verification of the group's offsets partition):
+/// inside an Ongoing transaction that never added the group it is INVALID_TXN_STATE on
+/// every version (0 to 3) and nothing is stored; once the group is added the commit is
+/// accepted, and the next transaction starts without it.
+pub async fn test_txn_offset_commit_needs_the_group_added() -> TestResult {
+    println!("=== Test: TxnOffsetCommit for a group not added with AddOffsetsToTxn ===\n");
+    let ctx = TestContext::new().await?;
+    let t = topic(&ctx, "txn-toc-group", 1).await?;
+    let group = ctx.unique_group("txn-toc-group").await;
+    let other = ctx.unique_group("txn-toc-other").await;
+    let mut w = Wire::connect().await?;
+    for version in 0..=3 {
+        let (id, pid, epoch) = bumped(&mut w, "toc-group").await?;
+        let mut txn = Txn { w: &mut w, id };
+        let owner = (pid, epoch);
+        assert_eq!(txn.add_partitions(1, owner, &t).await?, error_codes::NONE);
+        assert_eq!(
+            txn.commit_offset(version, owner, &group, &t).await?,
+            error_codes::INVALID_TXN_STATE,
+            "TxnOffsetCommit v{version} before AddOffsetsToTxn"
+        );
+        assert_eq!(txn.add_offsets(1, owner, &group).await?, error_codes::NONE);
+        assert_eq!(
+            txn.commit_offset(version, owner, &other, &t).await?,
+            error_codes::INVALID_TXN_STATE,
+            "TxnOffsetCommit v{version} for another group"
+        );
+        assert_eq!(
+            txn.commit_offset(version, owner, &group, &t).await?,
+            error_codes::NONE,
+            "TxnOffsetCommit v{version} after AddOffsetsToTxn"
+        );
+        let stored: Vec<String> = ctx
+            .db()
+            .query(
+                "SELECT group_id FROM kafka.txn_pending_offsets WHERE transactional_id = $1",
+                &[&txn.id],
+            )
+            .await?
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+        assert_eq!(stored, vec![group.clone()], "only the added group's offset");
+        assert_eq!(txn.end(1, owner, true).await?, error_codes::NONE);
+
+        // The next transaction of the id starts without the group.
+        assert_eq!(txn.add_partitions(1, owner, &t).await?, error_codes::NONE);
+        assert_eq!(
+            txn.commit_offset(version, owner, &group, &t).await?,
+            error_codes::INVALID_TXN_STATE,
+            "TxnOffsetCommit v{version} in the next transaction"
+        );
+        assert_eq!(txn.end(1, owner, false).await?, error_codes::NONE);
+        println!("✅ v{version}");
+    }
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}

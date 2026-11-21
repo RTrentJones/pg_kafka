@@ -52,6 +52,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         validation::test_non_transactional_batch_inside_an_open_transaction_is_refused,
         coordinator_codes::test_fenced_epoch_code_follows_the_request_version,
         coordinator_codes::test_unknown_transactional_id_is_invalid_producer_id_mapping,
+        coordinator_codes::test_txn_offset_commit_needs_the_group_added,
         timeouts::test_second_transaction_gets_its_own_timeout,
         timeouts::test_timeout_abort_fences_an_exhausted_epoch,
         producer_epochs::test_init_producer_id_checks_the_presented_epoch,

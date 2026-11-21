@@ -293,9 +293,14 @@ pg_kafka.compression_type = 'gzip'
 - ✅ The transaction timeout (`transaction.timeout.ms`) runs from the start of each
   transaction, as Kafka's does; the timeout sweep aborts an expired one and fences its
   producer with the next epoch (a new producer id when the epoch is exhausted)
-- ✅ AddOffsetsToTxn includes consumer offsets in transaction
+- ✅ AddOffsetsToTxn includes consumer offsets in transaction: it registers the group in
+  the open transaction (`kafka.txn_groups`, cleared with `kafka.txn_partitions`)
 - ✅ EndTxn commits or aborts atomically
-- ✅ TxnOffsetCommit commits offsets within transaction context
+- ✅ TxnOffsetCommit commits offsets within transaction context; for a group the
+  transaction did not add with AddOffsetsToTxn it is INVALID_TXN_STATE (48) on every
+  partition and version and stores nothing, as in Kafka 3.7. **Deviation:** Kafka verifies
+  the group's `__consumer_offsets` partition, so a group sharing that partition with an
+  added one is accepted there; pg_kafka checks the group itself
 - ✅ Read-committed isolation level filters pending/aborted messages
 - ✅ Transactional producer fencing via epoch
 

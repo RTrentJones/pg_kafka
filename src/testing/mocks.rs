@@ -117,6 +117,8 @@ mod store {
                 topic_id: i32,
                 partition_id: i32,
             ) -> Result<bool>;
+            fn add_txn_group<'a, 'b>(&self, transactional_id: &'a str, group_id: &'b str) -> Result<()>;
+            fn txn_has_group<'a, 'b>(&self, transactional_id: &'a str, group_id: &'b str) -> Result<bool>;
             fn open_txn_epoch_on_partition(
                 &self,
                 producer_id: i64,

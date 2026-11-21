@@ -69,13 +69,14 @@ pub const WORKER_TABLE_GRANTS: &[(&str, &[&str])] = &[
     ("kafka.shadow_metrics", &["SELECT", "INSERT", "UPDATE"]),
     // SASL credential lookups (kafka/auth/credentials.rs), read only.
     ("kafka.sasl_credentials", &["SELECT"]),
-    // The idempotent batch cache (upsert + trim) and the partitions registered in
-    // each open transaction.
+    // The idempotent batch cache (upsert + trim) and the partitions and groups
+    // registered in each open transaction.
     (
         "kafka.producer_batches",
         &["SELECT", "INSERT", "UPDATE", "DELETE"],
     ),
     ("kafka.txn_partitions", &["SELECT", "INSERT", "DELETE"]),
+    ("kafka.txn_groups", &["SELECT", "INSERT", "DELETE"]),
     // The unknown-user fake-credential secret (kafka/auth/credentials.rs).
     ("kafka.sasl_server_secret", &["SELECT"]),
 ];

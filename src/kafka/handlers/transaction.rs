@@ -2,7 +2,7 @@
 
 use super::helpers::validate_ongoing_transaction;
 use crate::kafka::constants::{
-    ERROR_NONE, ERROR_OPERATION_NOT_ATTEMPTED, ERROR_UNKNOWN_SERVER_ERROR,
+    ERROR_INVALID_TXN_STATE, ERROR_NONE, ERROR_OPERATION_NOT_ATTEMPTED, ERROR_UNKNOWN_SERVER_ERROR,
     ERROR_UNKNOWN_TOPIC_OR_PARTITION,
 };
 use crate::kafka::error::{KafkaError, Result};
@@ -167,11 +167,14 @@ pub fn handle_add_offsets_to_txn(
     transactional_id: &str,
     producer_id: i64,
     producer_epoch: i16,
-    _group_id: &str,
+    group_id: &str,
 ) -> Result<AddOffsetsToTxnResponse> {
     let store = ctx.store;
     // Atomically begin or continue the transaction
     store.begin_or_continue_transaction(transactional_id, producer_id, producer_epoch)?;
+    // Kafka adds the group's offsets partition to the transaction; TxnOffsetCommit is
+    // then accepted for the group.
+    store.add_txn_group(transactional_id, group_id)?;
 
     // Note: In Kafka, this returns the coordinator for the consumer group.
     // In our single-node implementation, we are always the coordinator.
@@ -256,7 +259,8 @@ pub fn handle_end_txn(
 /// Handle TxnOffsetCommit request
 ///
 /// Commits offsets as part of a transaction. Unlike regular offset commits,
-/// these are stored pending and only become visible when the transaction commits.
+/// these are stored pending and only become visible when the transaction commits. A
+/// group the transaction did not add with AddOffsetsToTxn is refused INVALID_TXN_STATE.
 ///
 /// # Arguments
 /// * `ctx` - Handler context (store, coordinator, broker metadata, etc.)
@@ -308,6 +312,15 @@ pub fn handle_txn_offset_commit(
         producer_epoch,
         "TxnOffsetCommit",
     )?;
+    // Kafka 3.7 verifies that the transaction holds the group's offsets partition
+    // (added by AddOffsetsToTxn) and answers INVALID_TXN_STATE on every partition
+    // otherwise, storing nothing.
+    if !store.txn_has_group(transactional_id, group_id)? {
+        return Ok(txn_offset_commit_error_response(
+            &topics,
+            ERROR_INVALID_TXN_STATE,
+        ));
+    }
 
     let mut response = TxnOffsetCommitResponse::default();
     response.topics = topics

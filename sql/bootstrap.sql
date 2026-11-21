@@ -829,6 +829,20 @@ GRANT SELECT ON kafka.txn_partitions TO pgkafka_reader;
 GRANT SELECT, INSERT, DELETE ON kafka.txn_partitions TO pgkafka_worker;
 COMMENT ON TABLE kafka.txn_partitions IS 'Partitions added (AddPartitionsToTxn) to the open transaction of each transactional id.';
 
+-- Consumer groups added (AddOffsetsToTxn) to the open transaction of a transactional id.
+-- A TxnOffsetCommit for any other group is refused with INVALID_TXN_STATE, as in Kafka.
+-- Cleared with kafka.txn_partitions.
+CREATE TABLE kafka.txn_groups (
+    transactional_id TEXT NOT NULL
+        REFERENCES kafka.transactions (transactional_id) ON DELETE CASCADE,
+    group_id TEXT NOT NULL,
+    PRIMARY KEY (transactional_id, group_id)
+);
+
+GRANT SELECT ON kafka.txn_groups TO pgkafka_reader;
+GRANT SELECT, INSERT, DELETE ON kafka.txn_groups TO pgkafka_worker;
+COMMENT ON TABLE kafka.txn_groups IS 'Consumer groups added (AddOffsetsToTxn) to the open transaction of each transactional id.';
+
 -- =============================================================================
 -- Shadow mode
 -- =============================================================================

@@ -17,7 +17,7 @@ as an upgrade script `sql/pg_kafka--<from>--<to>.sql`; `cargo pgrx install` and
    worker of a new binary does **not** serve Kafka clients against the previous schema:
    the 0.1.0 library's request paths use objects the 0.0.0 schema lacks (every
    idempotent Produce reads `kafka.producer_batches`, transactions use
-   `kafka.txn_partitions`, SASL logins read `kafka.sasl_credentials` and
+   `kafka.txn_partitions` and `kafka.txn_groups`, SASL logins read `kafka.sasl_credentials` and
    `kafka.sasl_server_secret`, the shadow outbox needs
    `kafka.shadow_tracking.attempt_open`, maintenance and the metrics flush need the time
    partitions and `kafka.broker_api_stats` / `kafka.broker_gauges`). At start it checks

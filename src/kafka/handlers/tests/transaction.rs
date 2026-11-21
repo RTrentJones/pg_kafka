@@ -168,6 +168,11 @@ fn test_add_offsets_success() {
     // Atomic begin_or_continue_transaction handles state transition
     mock.expect_begin_or_continue_transaction()
         .returning(|_, _, _| Ok(()));
+    // The group is registered in the transaction, for TxnOffsetCommit.
+    mock.expect_add_txn_group()
+        .withf(|txn, group| txn == "txn-1" && group == "consumer-group")
+        .times(1)
+        .returning(|_, _| Ok(()));
 
     // Create HandlerContext AFTER setting expectations
     let env = TestEnv::new();
@@ -177,6 +182,47 @@ fn test_add_offsets_success() {
         transaction::handle_add_offsets_to_txn(&ctx, "txn-1", 1000, 0, "consumer-group").unwrap();
 
     assert_eq!(response.error_code, ERROR_NONE);
+}
+
+/// Kafka 3.7: a TxnOffsetCommit for a group the Ongoing transaction did not add with
+/// AddOffsetsToTxn is INVALID_TXN_STATE on every partition, and nothing is stored.
+#[test]
+fn test_txn_offset_commit_group_not_added() {
+    let mut mock = MockKafkaStore::new();
+    mock.expect_validate_transaction()
+        .returning(|_, _, _| Ok(()));
+    mock.expect_get_transaction_state()
+        .returning(|_| Ok(Some(TransactionState::Ongoing)));
+    mock.expect_txn_has_group()
+        .withf(|txn, group| txn == "txn-1" && group == "consumer-group")
+        .returning(|_, _| Ok(false));
+    mock.expect_store_txn_pending_offset().never();
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
+    let topics = vec![(
+        "test-topic".to_string(),
+        vec![(0, 1i64, None), (1, 2i64, None)],
+    )];
+    let response = transaction::handle_txn_offset_commit(
+        &ctx,
+        "txn-1",
+        1000,
+        0,
+        "consumer-group",
+        -1,
+        "",
+        topics,
+    )
+    .unwrap();
+    let codes: Vec<i16> = response.topics[0]
+        .partitions
+        .iter()
+        .map(|p| p.error_code)
+        .collect();
+    assert_eq!(
+        codes,
+        vec![ERROR_INVALID_TXN_STATE, ERROR_INVALID_TXN_STATE]
+    );
 }
 
 #[test]
@@ -397,6 +443,7 @@ fn test_txn_offset_commit_success() {
         .returning(|_, _, _| Ok(()));
     mock.expect_get_transaction_state()
         .returning(|_| Ok(Some(TransactionState::Ongoing)));
+    mock.expect_txn_has_group().returning(|_, _| Ok(true));
     mock.expect_get_topic_id().returning(|_| Ok(Some(1)));
     mock.expect_get_topic_partition_count()
         .returning(|_| Ok(Some(3)));
@@ -438,6 +485,7 @@ fn test_txn_offset_commit_multiple_partitions() {
         .returning(|_, _, _| Ok(()));
     mock.expect_get_transaction_state()
         .returning(|_| Ok(Some(TransactionState::Ongoing)));
+    mock.expect_txn_has_group().returning(|_, _| Ok(true));
     mock.expect_get_topic_id().returning(|_| Ok(Some(1)));
     mock.expect_get_topic_partition_count()
         .returning(|_| Ok(Some(3)));
@@ -481,6 +529,7 @@ fn test_txn_offset_commit_unknown_topic() {
         .returning(|_, _, _| Ok(()));
     mock.expect_get_transaction_state()
         .returning(|_| Ok(Some(TransactionState::Ongoing)));
+    mock.expect_txn_has_group().returning(|_, _| Ok(true));
     // Topic doesn't exist
     mock.expect_get_topic_id().returning(|_| Ok(None));
 
@@ -581,6 +630,7 @@ fn test_txn_offset_commit_store_error() {
         .returning(|_, _, _| Ok(()));
     mock.expect_get_transaction_state()
         .returning(|_| Ok(Some(TransactionState::Ongoing)));
+    mock.expect_txn_has_group().returning(|_, _| Ok(true));
     mock.expect_get_topic_id().returning(|_| Ok(Some(1)));
     mock.expect_get_topic_partition_count()
         .returning(|_| Ok(Some(3)));

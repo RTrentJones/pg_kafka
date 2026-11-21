@@ -234,7 +234,7 @@ CREATE TABLE kafka.producer_sequences (
 
 -- Also: kafka.partition_offsets (per-partition offset counter + log start offset),
 -- kafka.producer_batches (the last 5 batches per producer and partition, for duplicates),
--- kafka.transactions / txn_partitions / txn_pending_offsets (Phase 10), the shadow-mode
+-- kafka.transactions / txn_partitions / txn_groups / txn_pending_offsets (Phase 10), the shadow-mode
 -- tables kafka.shadow_config / shadow_tracking / shadow_metrics (Phase 11), the SASL
 -- credentials (kafka.sasl_credentials, kafka.sasl_server_secret), the broker metrics
 -- tables, and the views kafka.metrics, api_metrics, broker_metrics, consumer_lag,
