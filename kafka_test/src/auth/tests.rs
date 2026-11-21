@@ -1,8 +1,8 @@
 //! The auth E2E tests (see `auth/mod.rs` for the listener setup).
 
 use super::{
-    auth_env, cert_path, configure_listeners, remove_certificates, restart_listener, PASSWORD,
-    PLAINTEXT_PORT, SASL_PLAINTEXT_PORT, SASL_SSL_PORT, SSL_PORT, USER,
+    auth_env, cert_path, configure_listeners, plaintext_port, remove_certificates,
+    restart_listener, PASSWORD, SASL_PLAINTEXT_PORT, SASL_SSL_PORT, SSL_PORT, USER,
 };
 use crate::common::{create_db_client, TestResult};
 use crate::error_codes;
@@ -405,18 +405,18 @@ pub async fn test_auth_unauthenticated_request_rejected() -> TestResult {
 pub async fn test_auth_plaintext_listener_unaffected() -> TestResult {
     println!("=== Test: PLAINTEXT listener keeps serving without auth ===\n");
     auth_env().await?;
-    let mut s = TcpStream::connect(("127.0.0.1", PLAINTEXT_PORT)).await?;
+    let mut s = TcpStream::connect(("127.0.0.1", plaintext_port())).await?;
     let hs = roundtrip(&mut s, 1, 1, &handshake("PLAIN")).await?;
     assert_eq!(hs.error_code, error_codes::ILLEGAL_SASL_STATE);
     let au = roundtrip(&mut s, 2, 2, &authenticate(plain_token(USER, PASSWORD))).await?;
     assert_eq!(au.error_code, error_codes::ILLEGAL_SASL_STATE);
     let md = roundtrip(&mut s, 4, 3, &MetadataRequest::default()).await?;
     assert_eq!(md.brokers.len(), 1);
-    assert_eq!(md.brokers[0].port, i32::from(PLAINTEXT_PORT));
+    assert_eq!(md.brokers[0].port, i32::from(plaintext_port()));
     println!("✅ SASL APIs answer ILLEGAL_SASL_STATE; Metadata still served");
     round_trip(
-        client_config(PLAINTEXT_PORT, "plaintext"),
-        PLAINTEXT_PORT,
+        client_config(plaintext_port(), "plaintext"),
+        plaintext_port(),
         "auth-plaintext",
     )
     .await?;

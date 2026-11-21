@@ -40,7 +40,7 @@ async fn heartbeat_flood(stop: Arc<AtomicBool>) -> SendResult<u64> {
     request.member_id = StrBytes::from_static_str("heartbeat-flood-member");
     let burst: Vec<u8> = request_frame(0, 7, &request).repeat(32);
 
-    let stream = tokio::net::TcpStream::connect("127.0.0.1:9092")
+    let stream = tokio::net::TcpStream::connect(crate::common::broker_addr())
         .await
         .map_err(boxed)?;
     let (mut reader, mut writer) = stream.into_split();

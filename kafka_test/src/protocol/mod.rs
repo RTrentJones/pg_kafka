@@ -18,7 +18,7 @@ use tokio::net::TcpStream;
 pub async fn test_api_versions_negotiation() -> TestResult {
     println!("=== Test: API Versions Negotiation ===\n");
 
-    let mut stream = TcpStream::connect("localhost:9092").await?;
+    let mut stream = TcpStream::connect(crate::common::broker_addr()).await?;
     stream.set_nodelay(true)?;
 
     println!("Step 1: Connected to broker\n");
@@ -64,7 +64,7 @@ pub async fn test_api_versions_negotiation() -> TestResult {
 pub async fn test_correlation_id_preserved() -> TestResult {
     println!("=== Test: Correlation ID Preserved ===\n");
 
-    let mut stream = TcpStream::connect("localhost:9092").await?;
+    let mut stream = TcpStream::connect(crate::common::broker_addr()).await?;
     stream.set_nodelay(true)?;
 
     println!("Step 1: Connected to broker\n");
@@ -107,7 +107,7 @@ pub async fn test_correlation_id_preserved() -> TestResult {
 pub async fn test_unknown_api_key_handling() -> TestResult {
     println!("=== Test: Unknown API Key Handling ===\n");
 
-    let mut stream = TcpStream::connect("localhost:9092").await?;
+    let mut stream = TcpStream::connect(crate::common::broker_addr()).await?;
     stream.set_nodelay(true)?;
 
     println!("Step 1: Connected to broker\n");
@@ -150,7 +150,7 @@ pub async fn test_unknown_api_key_handling() -> TestResult {
 pub async fn test_protocol_request_pipelining() -> TestResult {
     println!("=== Test: Request Pipelining ===\n");
 
-    let mut stream = TcpStream::connect("localhost:9092").await?;
+    let mut stream = TcpStream::connect(crate::common::broker_addr()).await?;
     stream.set_nodelay(true)?;
 
     println!("Step 1: Connected to broker\n");
@@ -256,7 +256,7 @@ pub async fn test_response_ordering_with_long_poll() -> TestResult {
         .map_err(|(err, _)| err)?;
     println!("Step 1: Topic created with one message\n");
 
-    let mut stream = TcpStream::connect("localhost:9092").await?;
+    let mut stream = TcpStream::connect(crate::common::broker_addr()).await?;
     stream.set_nodelay(true)?;
 
     // Fetch from offset 1 (the high watermark): no data available, so the

@@ -7,6 +7,7 @@
 
 use super::external_client::{consume_from_external, verify_external_kafka_ready};
 use super::helpers::{enable_shadow_mode, ShadowMode, ShadowTopicConfig, SyncMode, WriteMode};
+use crate::common::broker_addr;
 use crate::common::TestResult;
 use crate::setup::TestContext;
 use crate::wire::records::{encode, plain_record};
@@ -14,8 +15,6 @@ use kafka_protocol::messages::produce_request::ProduceRequest;
 use kafka_protocol::records::Compression;
 use std::time::Duration;
 use tokio::net::TcpStream;
-
-const BROKER: &str = "localhost:9092";
 
 /// One acks=1 produce carrying one record per listed partition, in order.
 fn produce_request(topic: &str, partitions: &[(i32, &str)]) -> ProduceRequest {
@@ -90,7 +89,7 @@ pub async fn test_sync_forward_skips_rolled_back_request() -> TestResult {
         .await?;
 
     let outcome = async {
-        let mut stream = TcpStream::connect(BROKER).await?;
+        let mut stream = TcpStream::connect(broker_addr()).await?;
         let failed = crate::wire::roundtrip(
             &mut stream,
             7,

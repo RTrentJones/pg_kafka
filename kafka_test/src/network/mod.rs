@@ -35,7 +35,12 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpSocket, TcpStream};
 
-pub const PORT: u16 = 9092;
+/// The default PLAINTEXT listener's port ([`broker_port`](crate::common::broker_port)).
+/// These tests reach it on the database host's loopback addresses, from chosen source
+/// addresses.
+pub fn port() -> u16 {
+    crate::common::broker_port()
+}
 
 /// Connect to `127.0.0.1:port` from the loopback source address `src`.
 pub async fn connect_from(src: Ipv4Addr, port: u16) -> std::io::Result<TcpStream> {

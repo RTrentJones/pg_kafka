@@ -2,7 +2,7 @@
 
 mod corrupt_partition_count;
 
-use crate::common::{create_producer, TestResult};
+use crate::common::{create_producer, get_bootstrap_servers, TestResult};
 use crate::setup::TestContext;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::producer::FutureRecord;
@@ -37,7 +37,7 @@ pub async fn test_metadata_all_topics() -> TestResult {
 
     // Create consumer and fetch metadata for all topics
     let consumer: StreamConsumer = ClientConfig::new()
-        .set("bootstrap.servers", "localhost:9092")
+        .set("bootstrap.servers", get_bootstrap_servers())
         .set("group.id", &ctx.unique_group("meta").await)
         .create()?;
 
@@ -79,7 +79,7 @@ pub async fn test_metadata_nonexistent_topic() -> TestResult {
     let nonexistent_topic = format!("nonexistent-{}", uuid::Uuid::new_v4());
 
     let consumer: StreamConsumer = ClientConfig::new()
-        .set("bootstrap.servers", "localhost:9092")
+        .set("bootstrap.servers", get_bootstrap_servers())
         .set("group.id", &ctx.unique_group("meta").await)
         .create()?;
 
@@ -128,7 +128,7 @@ pub async fn test_metadata_refresh_after_create() -> TestResult {
     let ctx = TestContext::new().await?;
 
     let consumer: StreamConsumer = ClientConfig::new()
-        .set("bootstrap.servers", "localhost:9092")
+        .set("bootstrap.servers", get_bootstrap_servers())
         .set("group.id", &ctx.unique_group("meta").await)
         .create()?;
 

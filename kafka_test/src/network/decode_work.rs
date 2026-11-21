@@ -5,7 +5,7 @@
 
 use super::large_decodes::hex_value;
 use super::produce_decoding::{batch_with, raw_batch, record, varint, BatchHeader};
-use super::{api_versions_frame, stored_rows, PORT};
+use super::{api_versions_frame, port, stored_rows};
 use crate::common::{DynResult, TestResult};
 use crate::setup::TestContext;
 use crate::wire::records::plain_batch;
@@ -78,7 +78,7 @@ fn zstd_rle_batch() -> Bytes {
 /// and how long that took.
 async fn send_produce(frame: Vec<u8>, corr: i32) -> DynResult<(BTreeSet<i16>, usize, Duration)> {
     let started = Instant::now();
-    let mut s = TcpStream::connect(("127.0.0.1", PORT)).await?;
+    let mut s = TcpStream::connect(("127.0.0.1", port())).await?;
     s.write_all(&frame).await?;
     let response = read_frame_within(&mut s, Duration::from_secs(120))
         .await?
@@ -113,7 +113,7 @@ async fn worst_api_versions(during: Duration) -> DynResult<(Duration, usize)> {
     let mut calls = 0;
     while Instant::now() < end {
         let started = Instant::now();
-        let mut s = TcpStream::connect(("127.0.0.1", PORT)).await?;
+        let mut s = TcpStream::connect(("127.0.0.1", port())).await?;
         s.write_all(&api_versions_frame(5)).await?;
         let frame = read_frame_within(&mut s, Duration::from_secs(30))
             .await?

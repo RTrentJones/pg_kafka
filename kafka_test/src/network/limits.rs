@@ -3,8 +3,8 @@
 //! rate limit and the unknown-user SCRAM fake credential.
 
 use super::{
-    answers, api_versions_frame, client_config, connect_from, rdkafka_roundtrip, time_until_closed,
-    PORT,
+    answers, api_versions_frame, client_config, connect_from, port, rdkafka_roundtrip,
+    time_until_closed,
 };
 use crate::auth::{cert_path, ensure_certificates, remove_certificates, restart_listener};
 use crate::common::create_db_client;
@@ -149,10 +149,10 @@ async fn rejected(src: Ipv4Addr, port: u16) -> DynResult<bool> {
 pub async fn test_per_ip_connection_limit() -> TestResult {
     println!("=== Test: per-IP connection limit ===\n");
     let attacker = Ipv4Addr::new(127, 0, 0, 2);
-    let mut conns = open_answering(attacker, PORT, MAX_PER_IP).await?;
+    let mut conns = open_answering(attacker, port(), MAX_PER_IP).await?;
     println!("Step 1: {MAX_PER_IP} connections from {attacker}");
     assert!(
-        rejected(attacker, PORT).await?,
+        rejected(attacker, port()).await?,
         "connection over the per-IP cap"
     );
     assert!(
@@ -160,11 +160,11 @@ pub async fn test_per_ip_connection_limit() -> TestResult {
         "the per-IP cap spans listeners"
     );
     println!("✅ the next connection from {attacker} is closed at accept");
-    let mut other = connect_from(Ipv4Addr::new(127, 0, 0, 3), PORT).await?;
+    let mut other = connect_from(Ipv4Addr::new(127, 0, 0, 3), port()).await?;
     assert!(answers(&mut other, 1).await, "another IP is unaffected");
     conns.pop();
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let mut again = connect_from(attacker, PORT).await?;
+    let mut again = connect_from(attacker, port()).await?;
     assert!(
         answers(&mut again, 2).await,
         "a closed connection frees its slot"
@@ -173,14 +173,14 @@ pub async fn test_per_ip_connection_limit() -> TestResult {
 
     let ctx = TestContext::new().await?;
     let topic = ctx.unique_topic("net-per-ip").await;
-    rdkafka_roundtrip(client_config(PORT), &topic, 10).await?;
+    rdkafka_roundtrip(client_config(port()), &topic, 10).await?;
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");
     Ok(())
 }
 
 /// Each listener has its own `pg_kafka.max_connections`, so a flood on one
-/// (here 19096) does not lock clients out of another (9092).
+/// (here 19096) does not lock clients out of another (the default one).
 pub async fn test_per_listener_connection_limit() -> TestResult {
     println!("=== Test: per-listener connection limit ===\n");
     let mut conns = open_answering(Ipv4Addr::new(127, 0, 0, 3), PLAIN_PORT, MAX_PER_IP).await?;
@@ -195,11 +195,14 @@ pub async fn test_per_listener_connection_limit() -> TestResult {
     println!("Step 1: {} connections on {}", conns.len(), PLAIN_PORT);
     let fresh = Ipv4Addr::new(127, 0, 0, 5);
     assert!(rejected(fresh, PLAIN_PORT).await?, "listener 19096 is full");
-    let mut s = connect_from(fresh, PORT).await?;
-    assert!(answers(&mut s, 1).await, "listener 9092 still accepts");
+    let mut s = connect_from(fresh, port()).await?;
+    assert!(
+        answers(&mut s, 1).await,
+        "the default listener still accepts"
+    );
     let ctx = TestContext::new().await?;
     let topic = ctx.unique_topic("net-per-listener").await;
-    rdkafka_roundtrip(client_config(PORT), &topic, 10).await?;
+    rdkafka_roundtrip(client_config(port()), &topic, 10).await?;
     drop(conns);
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");
@@ -215,7 +218,7 @@ pub async fn test_idle_and_frame_read_timeouts_close_connections() -> TestResult
     let low = Duration::from_millis(IDLE_MS - 500);
     let high = Duration::from_millis(IDLE_MS + 3000);
 
-    let mut idle = TcpStream::connect(("127.0.0.1", PORT)).await?;
+    let mut idle = TcpStream::connect(("127.0.0.1", port())).await?;
     assert!(answers(&mut idle, 1).await);
     let t = time_until_closed(&mut idle, Duration::from_secs(10))
         .await
@@ -224,7 +227,7 @@ pub async fn test_idle_and_frame_read_timeouts_close_connections() -> TestResult
     println!("✅ idle connection closed after {t:?}");
 
     // A slow sender: a 1000-byte frame, one byte every 500 ms.
-    let mut slow = connect_from(Ipv4Addr::new(127, 0, 0, 6), PORT).await?;
+    let mut slow = connect_from(Ipv4Addr::new(127, 0, 0, 6), port()).await?;
     slow.write_all(&1000i32.to_be_bytes()).await?;
     let started = Instant::now();
     let mut closed_after = None;
@@ -250,8 +253,8 @@ pub async fn test_idle_and_frame_read_timeouts_close_connections() -> TestResult
     // Real clients: records produced 5 s apart (longer than the idle timeout) all arrive.
     let ctx = TestContext::new().await?;
     let topic = ctx.unique_topic("net-idle").await;
-    let producer: FutureProducer = client_config(PORT).create()?;
-    let mut ccfg = client_config(PORT);
+    let producer: FutureProducer = client_config(port()).create()?;
+    let mut ccfg = client_config(port());
     ccfg.set("group.id", format!("net-{}", uuid::Uuid::new_v4()))
         .set("enable.auto.commit", "false");
     let send = |i: i32| {

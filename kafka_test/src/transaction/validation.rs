@@ -168,7 +168,7 @@ async fn acks0_closes(
     request.transactional_id = Some(TransactionalId(StrBytes::from_string(
         transactional_id.to_string(),
     )));
-    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", 9092)).await?;
+    let mut s = tokio::net::TcpStream::connect(crate::common::broker_addr()).await?;
     s.write_all(&crate::wire::request_frame(7, 1, &request))
         .await?;
     Ok(closes(&mut s).await)

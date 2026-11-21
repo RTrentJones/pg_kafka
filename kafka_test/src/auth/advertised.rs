@@ -4,7 +4,7 @@
 //! address the listener binds.
 
 use super::{
-    auth_env, configure_listeners, restart_listener, PASSWORD, PLAINTEXT_PORT, SASL_PLAINTEXT_PORT,
+    auth_env, configure_listeners, plaintext_port, restart_listener, PASSWORD, SASL_PLAINTEXT_PORT,
     SASL_SSL_PORT, SSL_PORT, USER,
 };
 use crate::common::{create_db_client, DynResult, TestResult};
@@ -17,7 +17,7 @@ use kafka_protocol::protocol::StrBytes;
 use tokio::net::TcpStream;
 use tokio_postgres::Client;
 
-const PRIMARY_ADVERTISED: (&str, i32) = ("primary.pgkafka.test", 29092);
+const PRIMARY_ADVERTISED: (&str, i32) = ("primary.pgkafka.test", 29192);
 const SASL_ADVERTISED: (&str, i32) = ("sasl.pgkafka.test", 29093);
 
 /// The listeners of `auth/mod.rs`, with an advertised address on the SASL_PLAINTEXT one.
@@ -76,14 +76,17 @@ async fn check(db: &Client) -> TestResult {
     restart_listener(db, &[SASL_PLAINTEXT_PORT, SSL_PORT, SASL_SSL_PORT], &[]).await?;
     println!("Step 1: listener restarted with advertised addresses set");
 
-    let mut plain = TcpStream::connect(("127.0.0.1", PLAINTEXT_PORT)).await?;
+    let mut plain = TcpStream::connect(("127.0.0.1", plaintext_port())).await?;
     let want = (PRIMARY_ADVERTISED.0.to_string(), PRIMARY_ADVERTISED.1);
     assert_eq!(
         advertised(&mut plain).await?,
         [want.clone(), want],
         "the primary listener advertises pg_kafka.advertised_address"
     );
-    println!("✅ PLAINTEXT 127.0.0.1:{PLAINTEXT_PORT} advertises {PRIMARY_ADVERTISED:?}");
+    println!(
+        "✅ PLAINTEXT 127.0.0.1:{} advertises {PRIMARY_ADVERTISED:?}",
+        plaintext_port()
+    );
 
     let mut sasl = sasl_connection().await?;
     let want = (SASL_ADVERTISED.0.to_string(), SASL_ADVERTISED.1);
@@ -113,7 +116,7 @@ pub async fn test_auth_listeners_advertise_configured_addresses() -> TestResult 
     outcome?;
 
     // Without the setting the bind address is advertised again.
-    let mut plain = TcpStream::connect(("127.0.0.1", PLAINTEXT_PORT)).await?;
+    let mut plain = TcpStream::connect(("127.0.0.1", plaintext_port())).await?;
     let [broker, _] = advertised(&mut plain).await?;
     assert_ne!(broker.0, PRIMARY_ADVERTISED.0, "the reset applies");
     println!("✅ after the reset the primary listener advertises {broker:?}\n");

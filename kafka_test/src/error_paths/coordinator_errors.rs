@@ -196,7 +196,7 @@ pub async fn test_empty_group_id() -> TestResult {
     // Try to create consumer with empty group ID
     // This might fail at client level or server level
     let result: Result<rdkafka::consumer::StreamConsumer, _> = rdkafka::config::ClientConfig::new()
-        .set("bootstrap.servers", "localhost:9092")
+        .set("bootstrap.servers", crate::common::get_bootstrap_servers())
         .set("group.id", "") // Empty group ID
         .set("session.timeout.ms", "6000")
         .create();

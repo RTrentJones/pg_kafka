@@ -159,7 +159,7 @@ impl TestTopic {
         messages: &[TestMessage],
     ) -> Result<Vec<i64>, Box<dyn std::error::Error>> {
         let producer: FutureProducer = ClientConfig::new()
-            .set("bootstrap.servers", "localhost:9092")
+            .set("bootstrap.servers", crate::common::get_bootstrap_servers())
             .set("message.timeout.ms", "10000")
             .create()?;
 
@@ -236,7 +236,7 @@ impl<'a> TestConsumerBuilder<'a> {
         let group_id = self.ctx.unique_group(&self.base_group).await;
 
         let consumer: BaseConsumer = ClientConfig::new()
-            .set("bootstrap.servers", "localhost:9092")
+            .set("bootstrap.servers", crate::common::get_bootstrap_servers())
             .set("group.id", &group_id)
             .set("session.timeout.ms", self.session_timeout_ms.to_string())
             .set("enable.auto.commit", self.auto_commit.to_string())
@@ -252,7 +252,7 @@ impl<'a> TestConsumerBuilder<'a> {
         let group_id = self.ctx.unique_group(&self.base_group).await;
 
         let consumer: StreamConsumer = ClientConfig::new()
-            .set("bootstrap.servers", "localhost:9092")
+            .set("bootstrap.servers", crate::common::get_bootstrap_servers())
             .set("group.id", &group_id)
             .set("session.timeout.ms", self.session_timeout_ms.to_string())
             .set("enable.auto.commit", self.auto_commit.to_string())
@@ -300,7 +300,7 @@ impl TestProducerBuilder {
 
     pub fn build(self) -> Result<FutureProducer, Box<dyn std::error::Error>> {
         let mut config = ClientConfig::new();
-        config.set("bootstrap.servers", "localhost:9092");
+        config.set("bootstrap.servers", crate::common::get_bootstrap_servers());
         config.set("message.timeout.ms", self.timeout_ms.to_string());
 
         if let Some(batch_size) = self.batch_size {

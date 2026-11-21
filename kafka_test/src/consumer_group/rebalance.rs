@@ -5,7 +5,7 @@
 //! - REBALANCE_IN_PROGRESS error forces client to rejoin
 //! - Remaining consumers receive new assignments
 
-use crate::common::{create_producer, TestResult};
+use crate::common::{create_producer, get_bootstrap_servers, TestResult};
 use crate::members::{Member, CLOSE_TIMEOUT};
 use crate::setup::TestContext;
 use rdkafka::config::ClientConfig;
@@ -50,7 +50,7 @@ pub async fn test_rebalance_after_leave() -> TestResult {
     // 2. Consumer 1 joins and consumes some messages
     println!("\nStep 2: Consumer 1 joining group and consuming...");
     let consumer1: StreamConsumer = ClientConfig::new()
-        .set("bootstrap.servers", "localhost:9092")
+        .set("bootstrap.servers", get_bootstrap_servers())
         .set("group.id", &group_id)
         .set("session.timeout.ms", "10000")
         .set("heartbeat.interval.ms", "1000")
@@ -96,7 +96,7 @@ pub async fn test_rebalance_after_leave() -> TestResult {
     // 4. Consumer 2 joins the same group - should work cleanly
     println!("\nStep 4: Consumer 2 joining same group...");
     let consumer2: StreamConsumer = ClientConfig::new()
-        .set("bootstrap.servers", "localhost:9092")
+        .set("bootstrap.servers", get_bootstrap_servers())
         .set("group.id", &group_id)
         .set("session.timeout.ms", "10000")
         .set("heartbeat.interval.ms", "1000")
@@ -173,7 +173,7 @@ pub async fn test_session_timeout_rebalance() -> TestResult {
     // 2. Consumer joins with short session timeout
     println!("\nStep 2: Consumer joining with short session timeout...");
     let consumer1: StreamConsumer = ClientConfig::new()
-        .set("bootstrap.servers", "localhost:9092")
+        .set("bootstrap.servers", get_bootstrap_servers())
         .set("group.id", &group_id)
         .set("session.timeout.ms", "6000") // 6 second timeout
         .set("heartbeat.interval.ms", "2000")
@@ -205,7 +205,7 @@ pub async fn test_session_timeout_rebalance() -> TestResult {
     // 5. New consumer joins - should work if member was removed
     println!("\nStep 5: New consumer joining group...");
     let consumer2: StreamConsumer = ClientConfig::new()
-        .set("bootstrap.servers", "localhost:9092")
+        .set("bootstrap.servers", get_bootstrap_servers())
         .set("group.id", &group_id)
         .set("session.timeout.ms", "10000")
         .set("heartbeat.interval.ms", "1000")

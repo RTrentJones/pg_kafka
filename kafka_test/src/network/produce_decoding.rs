@@ -3,7 +3,7 @@
 //! data that is not exactly one RecordBatch v2, and an acks=0 Produce at a version the
 //! broker does not serve.
 
-use super::{answers, client_config, rdkafka_roundtrip, stored_rows, time_until_closed, PORT};
+use super::{answers, client_config, port, rdkafka_roundtrip, stored_rows, time_until_closed};
 use crate::common::{DynResult, TestResult};
 use crate::setup::TestContext;
 use crate::wire::records::plain_batch;
@@ -92,7 +92,7 @@ pub async fn test_compressed_produce_past_the_decode_limit_is_refused() -> TestR
     let topic = ctx.unique_topic("net-bomb").await;
     let created = create_topics_raw(vec![creatable(&topic, 8, 1)]).await?;
     assert_eq!(created[0].error_code, 0, "{created:?}");
-    let mut s = TcpStream::connect(("127.0.0.1", PORT)).await?;
+    let mut s = TcpStream::connect(("127.0.0.1", port())).await?;
     let zeros = |n: usize| Bytes::from(vec![0u8; n]);
 
     println!(
@@ -158,7 +158,7 @@ pub async fn test_compressed_produce_past_the_decode_limit_is_refused() -> TestR
         .await?
         .get(0);
     assert_eq!(stored, 80_000_000, "60 MB from step 2, 20 MB now");
-    rdkafka_roundtrip(client_config(PORT), &topic, 3).await?;
+    rdkafka_roundtrip(client_config(port()), &topic, 3).await?;
     println!("✅ stored {stored} bytes; rdkafka round trip works");
 
     ctx.cleanup().await?;
@@ -328,7 +328,7 @@ pub async fn test_record_and_header_bombs_are_refused_before_decoding() -> TestR
     let topic = ctx.unique_topic("net-rec-bomb").await;
     let created = create_topics_raw(vec![creatable(&topic, 4, 1)]).await?;
     assert_eq!(created[0].error_code, 0, "{created:?}");
-    let mut s = TcpStream::connect(("127.0.0.1", PORT)).await?;
+    let mut s = TcpStream::connect(("127.0.0.1", port())).await?;
     let peak_watch = reset_listener_peak(&ctx).await?;
     let timed = |started: Instant, what: &str| {
         let took = started.elapsed();
@@ -393,7 +393,7 @@ pub async fn test_record_and_header_bombs_are_refused_before_decoding() -> TestR
     assert_eq!(codes, vec![0]);
     assert_eq!(stored_rows(ctx.db(), &topic).await?, 1000);
     assert!(answers(&mut s, 11).await, "the connection still answers");
-    rdkafka_roundtrip(client_config(PORT), &topic, 3).await?;
+    rdkafka_roundtrip(client_config(port()), &topic, 3).await?;
     println!("✅ stored; rdkafka round trip works");
 
     ctx.cleanup().await?;
@@ -410,7 +410,7 @@ pub async fn test_zstd_batches_with_large_windows_are_stored() -> TestResult {
     let topic = ctx.unique_topic("net-zstd-window").await;
     let created = create_topics_raw(vec![creatable(&topic, 1, 1)]).await?;
     assert_eq!(created[0].error_code, 0, "{created:?}");
-    let mut s = TcpStream::connect(("127.0.0.1", PORT)).await?;
+    let mut s = TcpStream::connect(("127.0.0.1", port())).await?;
     let section = tiny_records(1000);
     let zstd = |window_log| batch_around(&zstd_raw_frame(&section, window_log), 1000, 4);
 
@@ -475,7 +475,7 @@ pub async fn test_produce_of_data_that_is_not_one_v2_batch_is_refused() -> TestR
     let topic = ctx.unique_topic("net-magic").await;
     let created = create_topics_raw(vec![creatable(&topic, 1, 1)]).await?;
     assert_eq!(created[0].error_code, 0, "{created:?}");
-    let mut s = TcpStream::connect(("127.0.0.1", PORT)).await?;
+    let mut s = TcpStream::connect(("127.0.0.1", port())).await?;
 
     let good = plain_batch(&[Bytes::from_static(b"v")], Compression::None);
     let negative_count = batch_with(&tiny_records(1), -1, BatchHeader::default());
@@ -546,7 +546,7 @@ pub async fn test_unsupported_version_acks0_produce_closes_connection() -> TestR
     let topic = ctx.unique_topic("net-acks0-v10").await;
     let batch = plain_batch(&[Bytes::from_static(b"lost?")], Compression::None);
 
-    let mut s = TcpStream::connect(("127.0.0.1", PORT)).await?;
+    let mut s = TcpStream::connect(("127.0.0.1", port())).await?;
     let request = produce_request(&topic, vec![(0, batch.clone())], 0);
     s.write_all(&request_frame(10, 1, &request)).await?;
     let closed = time_until_closed(&mut s, Duration::from_secs(5)).await;
@@ -557,7 +557,7 @@ pub async fn test_unsupported_version_acks0_produce_closes_connection() -> TestR
     println!("✅ closed after {:?}", closed.unwrap_or_default());
 
     // acks=1 at the same version is answered UNSUPPORTED_VERSION; the connection stays.
-    let mut s = TcpStream::connect(("127.0.0.1", PORT)).await?;
+    let mut s = TcpStream::connect(("127.0.0.1", port())).await?;
     let request = produce_request(&topic, vec![(0, batch)], 1);
     s.write_all(&request_frame(10, 2, &request)).await?;
     let response = read_frame_within(&mut s, Duration::from_secs(5))
@@ -1063,7 +1063,7 @@ pub async fn test_produce_validation_answers_each_partition() -> TestResult {
     println!("✅ [0, CORRUPT_MESSAGE]; the transaction commits its partition");
 
     println!("Step 6: acks=0 writes the valid partition, then closes");
-    let mut s = TcpStream::connect(("127.0.0.1", PORT)).await?;
+    let mut s = TcpStream::connect(("127.0.0.1", port())).await?;
     let request = produce_request(&topic, vec![(0, bad_crc(good())), (1, good())], 0);
     s.write_all(&request_frame(7, 1, &request)).await?;
     assert!(
@@ -1173,7 +1173,7 @@ pub async fn test_the_decode_limit_refuses_partitions_on_their_own() -> TestResu
     println!("✅ [MESSAGE_TOO_LARGE, 0]");
 
     println!("Step 6: acks=0 with a partition declaring 2 million records writes the other");
-    let mut s = TcpStream::connect(("127.0.0.1", PORT)).await?;
+    let mut s = TcpStream::connect(("127.0.0.1", port())).await?;
     let liar = batch_with(&one, 2_000_000, BatchHeader::default());
     let request = produce_request(&topic, vec![(0, good()), (1, liar)], 0);
     s.write_all(&request_frame(7, 1, &request)).await?;
@@ -1186,7 +1186,7 @@ pub async fn test_the_decode_limit_refuses_partitions_on_their_own() -> TestResu
     assert_eq!(stored_rows(ctx.db(), &topic).await?, 7);
     println!("✅ closed; the valid partition stored");
 
-    rdkafka_roundtrip(client_config(PORT), &topic, 3).await?;
+    rdkafka_roundtrip(client_config(port()), &topic, 3).await?;
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");
     Ok(())
@@ -1230,7 +1230,7 @@ pub async fn test_transactional_batches_need_a_transactional_id() -> TestResult 
     println!("✅ TRANSACTIONAL_ID_AUTHORIZATION_FAILED on every partition; nothing written");
 
     println!("Step 2: acks=0 closes the connection and writes nothing");
-    let mut s = TcpStream::connect(("127.0.0.1", PORT)).await?;
+    let mut s = TcpStream::connect(("127.0.0.1", port())).await?;
     let request = produce_request(&topic, vec![(0, good()), (1, transactional())], 0);
     s.write_all(&request_frame(7, 1, &request)).await?;
     assert!(

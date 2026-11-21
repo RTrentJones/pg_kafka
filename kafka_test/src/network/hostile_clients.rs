@@ -1,8 +1,8 @@
 //! Hostile clients against the listener in its default configuration.
 
 use super::{
-    answers, api_versions_frame, client_config, connect_from, rdkafka_roundtrip, stored_rows,
-    time_until_closed, PORT,
+    answers, api_versions_frame, client_config, connect_from, port, rdkafka_roundtrip, stored_rows,
+    time_until_closed,
 };
 use crate::common::to_i32;
 use crate::common::{DynResult, TestResult};
@@ -112,14 +112,14 @@ pub async fn test_partial_frames_cannot_exhaust_the_frame_budget() -> TestResult
         99_999_999,
         36_870_907,
     ] {
-        let mut h = connect_from(attacker, PORT).await?;
+        let mut h = connect_from(attacker, port()).await?;
         h.write_all(&len.to_be_bytes()).await?;
         hogs.push(h);
     }
     tokio::time::sleep(Duration::from_millis(300)).await;
     println!("Step 1: 6 hogs hold declared frames of ~536 MB");
 
-    let mut victim = TcpStream::connect(("127.0.0.1", PORT)).await?;
+    let mut victim = TcpStream::connect(("127.0.0.1", port())).await?;
     assert!(
         answers(&mut victim, 1).await,
         "a small ApiVersions must be served while the hogs hold their prefixes"
@@ -131,7 +131,7 @@ pub async fn test_partial_frames_cannot_exhaust_the_frame_budget() -> TestResult
     assert_eq!(base, 0);
     println!("✅ 2 MiB produce accepted");
 
-    rdkafka_roundtrip(client_config(PORT), &topic, 10).await?;
+    rdkafka_roundtrip(client_config(port()), &topic, 10).await?;
     println!("✅ rdkafka produce/consume works during the attack");
 
     for h in &mut hogs {
@@ -153,7 +153,7 @@ pub async fn test_response_larger_than_the_request_limit_is_delivered() -> TestR
     println!("=== Test: >100 MB fetch response ===\n");
     let ctx = TestContext::new().await?;
     let topic = ctx.unique_topic("net-big").await;
-    let mut s = TcpStream::connect(("127.0.0.1", PORT)).await?;
+    let mut s = TcpStream::connect(("127.0.0.1", port())).await?;
     let created: CreateTopicsResponse =
         crate::wire::roundtrip(&mut s, 2, 1, &create_topic_request(&topic, 2)).await?;
     assert_eq!(created.topics[0].error_code, 0);
@@ -200,7 +200,7 @@ pub async fn test_response_larger_than_the_request_limit_is_delivered() -> TestR
 /// client's delayed ACK (~40 ms on Linux).
 pub async fn test_pipelined_requests_are_not_delayed_by_nagle() -> TestResult {
     println!("=== Test: TCP_NODELAY ===\n");
-    let mut s = TcpStream::connect(("127.0.0.1", PORT)).await?;
+    let mut s = TcpStream::connect(("127.0.0.1", port())).await?;
     s.set_nodelay(true)?;
     let mut times = Vec::new();
     for round in 0..20 {
@@ -228,7 +228,7 @@ pub async fn test_pipelined_requests_are_not_delayed_by_nagle() -> TestResult {
     // A real client: 50 sequential acks=1 produces.
     let ctx = TestContext::new().await?;
     let topic = ctx.unique_topic("net-nodelay").await;
-    rdkafka_roundtrip(client_config(PORT), &topic, 50).await?;
+    rdkafka_roundtrip(client_config(port()), &topic, 50).await?;
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");
     Ok(())
@@ -240,7 +240,7 @@ pub async fn test_acks0_produce_error_closes_connection() -> TestResult {
     println!("=== Test: acks=0 error closes the connection ===\n");
     let ctx = TestContext::new().await?;
     let topic = ctx.unique_topic("net-acks0").await;
-    let mut s = TcpStream::connect(("127.0.0.1", PORT)).await?;
+    let mut s = TcpStream::connect(("127.0.0.1", port())).await?;
     produce_ok(&mut s, 1, &topic, b"seed").await?;
 
     // A good acks=0 produce: no response, connection stays open.
@@ -280,7 +280,7 @@ pub async fn test_acks0_produce_error_closes_connection() -> TestResult {
     );
 
     // Mixed: partition 0 is written, then the connection closes.
-    let mut s = TcpStream::connect(("127.0.0.1", PORT)).await?;
+    let mut s = TcpStream::connect(("127.0.0.1", port())).await?;
     let mixed = produce_request(
         &topic,
         vec![
@@ -306,7 +306,7 @@ pub async fn test_acks0_produce_error_closes_connection() -> TestResult {
     println!("✅ mixed acks=0: good partition committed, connection closed");
 
     // A real acks=0 client keeps producing normally.
-    let mut cfg = client_config(PORT);
+    let mut cfg = client_config(port());
     cfg.set("acks", "0");
     let producer: FutureProducer = cfg.create()?;
     for i in 0..5 {
@@ -342,7 +342,7 @@ pub async fn test_invalid_acks_rejected_and_nothing_written() -> TestResult {
     )])
     .await?;
     assert_eq!(created[0].error_code, 0, "{created:?}");
-    let mut s = TcpStream::connect(("127.0.0.1", PORT)).await?;
+    let mut s = TcpStream::connect(("127.0.0.1", port())).await?;
     for (i, acks) in [2i16, -2, 5, i16::MAX].into_iter().enumerate() {
         let req = produce_request(
             &topic,
@@ -447,7 +447,7 @@ pub async fn test_invalid_acks_answers_in_kafkas_order() -> TestResult {
     bad_crc[17..21].copy_from_slice(&[0, 0, 0, 0]);
     let two_batches = Bytes::from([ok().to_vec(), ok().to_vec()].concat());
     let t = |p, code| (topic.clone(), p, code);
-    let mut s = TcpStream::connect(("127.0.0.1", PORT)).await?;
+    let mut s = TcpStream::connect(("127.0.0.1", port())).await?;
     let cases: Vec<Case<'_>> = vec![
         (
             "transactional batch, no transactional id",
@@ -506,11 +506,11 @@ pub async fn test_request_before_closing_frame_is_answered() -> TestResult {
     println!("=== Test: responses before close ===\n");
     let ctx = TestContext::new().await?;
     let topic = ctx.unique_topic("net-close").await;
-    let mut s = TcpStream::connect(("127.0.0.1", PORT)).await?;
+    let mut s = TcpStream::connect(("127.0.0.1", port())).await?;
     produce_ok(&mut s, 1, &topic, b"seed").await?;
 
     // (a) A long poll at the end of the partition (500 ms), then a bad frame.
-    let mut s = TcpStream::connect(("127.0.0.1", PORT)).await?;
+    let mut s = TcpStream::connect(("127.0.0.1", port())).await?;
     let mut bytes = request_frame(4, 7, &fetch(&topic, &[0], 1, 500, 1024 * 1024));
     bytes.extend_from_slice(&BAD_FRAME);
     let t0 = Instant::now();
@@ -525,7 +525,7 @@ pub async fn test_request_before_closing_frame_is_answered() -> TestResult {
         .is_some());
 
     // (b) An acks=1 produce followed at once by a bad frame: committed and answered.
-    let mut s = TcpStream::connect(("127.0.0.1", PORT)).await?;
+    let mut s = TcpStream::connect(("127.0.0.1", port())).await?;
     let req = produce_request(
         &topic,
         vec![(
@@ -551,7 +551,7 @@ pub async fn test_request_before_closing_frame_is_answered() -> TestResult {
     println!("✅ acks=1 produce answered and committed");
 
     // (c) Pipelined ApiVersions, then a bad frame: all answered, in order.
-    let mut s = TcpStream::connect(("127.0.0.1", PORT)).await?;
+    let mut s = TcpStream::connect(("127.0.0.1", port())).await?;
     let mut bytes = Vec::new();
     for i in 0..20 {
         bytes.extend_from_slice(&api_versions_frame(100 + i));

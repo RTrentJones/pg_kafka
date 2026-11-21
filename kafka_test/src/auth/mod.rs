@@ -1,7 +1,7 @@
 //! E2E tests for the `auth` stream: TLS and SASL (PLAIN, SCRAM-SHA-256/512) on the
 //! Kafka listener, with real rdkafka clients.
 //!
-//! The default suite runs against the PLAINTEXT listener on 9092, which stays
+//! The default suite runs against the PLAINTEXT listener (`KAFKA_BOOTSTRAP_SERVERS`), which stays
 //! unauthenticated. These tests add three listeners next to it, through the
 //! `pg_kafka.additional_listeners` GUC:
 //!
@@ -34,7 +34,11 @@ use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio_postgres::Client;
 
-pub const PLAINTEXT_PORT: u16 = 9092;
+/// The default PLAINTEXT listener's port ([`broker_port`](crate::common::broker_port)),
+/// reached on 127.0.0.1 like the listeners these tests add.
+pub fn plaintext_port() -> u16 {
+    crate::common::broker_port()
+}
 pub const SASL_PLAINTEXT_PORT: u16 = 19093;
 pub const SSL_PORT: u16 = 19094;
 pub const SASL_SSL_PORT: u16 = 19095;
@@ -231,7 +235,7 @@ async fn port_open(port: u16) -> bool {
 
 async fn plaintext_answers() -> bool {
     let attempt = async {
-        let mut s = TcpStream::connect(("127.0.0.1", PLAINTEXT_PORT)).await?;
+        let mut s = TcpStream::connect(("127.0.0.1", plaintext_port())).await?;
         let r = roundtrip(&mut s, 0, 1, &ApiVersionsRequest::default()).await?;
         Ok::<i16, Box<dyn std::error::Error>>(r.error_code)
     };
@@ -241,7 +245,8 @@ async fn plaintext_answers() -> bool {
     )
 }
 
-/// Terminate the listener worker and wait until its replacement serves 9092 and
+/// Terminate the listener worker and wait until its replacement serves the PLAINTEXT
+/// listener ([`plaintext_port`]) and
 /// every port in `open` (and none in `closed`).
 pub async fn restart_listener(db: &Client, open: &[u16], closed: &[u16]) -> DynResult<()> {
     let old = listener_pid(db).await?;

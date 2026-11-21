@@ -5,6 +5,7 @@
 //! The code under test lives in `src/worker/` / `src/lib.rs`, which unit
 //! coverage cannot see (QA-1), so these drive the running broker.
 
+use crate::common::broker_addr;
 use crate::common::to_i64;
 use crate::common::{create_db_client, create_producer, TestResult};
 use crate::setup::TestContext;
@@ -20,8 +21,6 @@ use kafka_protocol::records::Compression;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
-
-const BROKER: &str = "localhost:9092";
 
 /// The listener worker's pid, from pg_stat_activity (`backend_type` is the
 /// bgworker type, registered as "pg_kafka_listener" in `_PG_init`).
@@ -46,7 +45,7 @@ async fn listener_pid(ctx: &TestContext) -> Result<Option<i32>, Box<dyn std::err
 /// One ApiVersions round trip on a fresh connection, with a short timeout.
 async fn broker_answers_api_versions() -> bool {
     let attempt = async {
-        let mut stream = TcpStream::connect(BROKER).await?;
+        let mut stream = TcpStream::connect(broker_addr()).await?;
         let response = roundtrip(&mut stream, 0, 1, &ApiVersionsRequest::default()).await?;
         Ok::<i16, Box<dyn std::error::Error>>(response.error_code)
     };
@@ -107,7 +106,8 @@ pub async fn test_worker_restarts_after_terminate() -> TestResult {
     let new_pid = new_pid.ok_or("no new pg_kafka_listener appeared within 20 s")?;
     assert!(
         serving,
-        "new listener pid {new_pid} did not serve ApiVersions on {BROKER} within 20 s"
+        "new listener pid {new_pid} did not serve ApiVersions on {} within 20 s",
+        broker_addr()
     );
     println!("Step 3: new listener pid {new_pid} serves the port");
 
@@ -224,7 +224,7 @@ pub async fn test_failed_request_rolls_back_alone() -> TestResult {
         &produce_value(&topic.name, "b"),
     ));
 
-    let mut stream = TcpStream::connect(BROKER).await?;
+    let mut stream = TcpStream::connect(broker_addr()).await?;
     stream.write_all(&frames).await?;
     stream.flush().await?;
     println!("Step 1: pipelined Produce, failing EndTxn, Produce");
@@ -251,7 +251,7 @@ pub async fn test_failed_request_rolls_back_alone() -> TestResult {
     );
     assert_eq!(count_messages(&ctx, &topic.name).await?, 2);
 
-    let mut fresh = TcpStream::connect(BROKER).await?;
+    let mut fresh = TcpStream::connect(broker_addr()).await?;
     let versions = roundtrip(&mut fresh, 0, 4, &ApiVersionsRequest::default()).await?;
     assert_eq!(
         versions.error_code, 0,
@@ -383,7 +383,7 @@ pub async fn test_group_commit_pipelined_produces_in_order() -> TestResult {
             &produce_value(&topic.name, &format!("pipelined-{i}")),
         ));
     }
-    let mut stream = TcpStream::connect(BROKER).await?;
+    let mut stream = TcpStream::connect(broker_addr()).await?;
     stream.write_all(&frames).await?;
     stream.flush().await?;
 

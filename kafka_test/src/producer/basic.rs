@@ -18,7 +18,7 @@ use std::time::Duration;
 pub async fn test_producer() -> TestResult {
     println!("=== Test: Producer Functionality ===\n");
 
-    // Create a Kafka producer pointing to pg_kafka on port 9092
+    // Create a Kafka producer pointing to pg_kafka
     println!("Creating Kafka producer...");
     let producer = create_producer()?;
     println!("✅ Producer created\n");

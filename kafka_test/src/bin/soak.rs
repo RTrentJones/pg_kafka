@@ -48,7 +48,8 @@ struct Args {
         default_value = "host=127.0.0.1 port=28814 user=postgres dbname=postgres"
     )]
     db: String,
-    #[arg(long, default_value = "127.0.0.1:9092")]
+    /// Default: `KAFKA_BOOTSTRAP_SERVERS`, else pg_kafka's default listener.
+    #[arg(long, default_value_t = kafka_test::common::get_bootstrap_servers())]
     bootstrap: String,
     /// Allowed growth of the listener's RSS over one incarnation, in MiB.
     #[arg(long, default_value_t = 128)]

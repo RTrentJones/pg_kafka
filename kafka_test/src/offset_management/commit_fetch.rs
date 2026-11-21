@@ -118,7 +118,7 @@ pub async fn test_offset_commit_fetch() -> TestResult {
     // 5. Create a new consumer and verify it resumes from committed offset
     println!("\nStep 5: Creating new consumer to verify resume from committed offset...");
     let consumer2: StreamConsumer = ClientConfig::new()
-        .set("bootstrap.servers", "localhost:9092")
+        .set("bootstrap.servers", crate::common::get_bootstrap_servers())
         .set("group.id", group_id) // Same group ID
         .set("session.timeout.ms", "6000")
         .set("enable.auto.commit", "false")

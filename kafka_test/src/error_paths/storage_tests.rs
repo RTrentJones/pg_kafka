@@ -6,6 +6,7 @@
 //! which unit coverage cannot see, so each test drives the broker or the SQL entry point
 //! and checks the stored state.
 
+use crate::common::broker_addr;
 use crate::common::{create_db_client, get_bootstrap_servers, TestResult};
 use crate::fixtures::{generate_messages, TestMessage, TestTopicBuilder};
 use crate::setup::TestContext;
@@ -15,8 +16,6 @@ use rdkafka::config::ClientConfig;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use std::time::Duration;
 use tokio::net::TcpStream;
-
-const BROKER: &str = "localhost:9092";
 
 /// Number of expired rows seeded by the retention test: well above one sweep batch
 /// (10,000 rows), so a sweep must loop to catch up.
@@ -170,7 +169,7 @@ pub async fn test_fetch_bounds_from_single_statement() -> TestResult {
         )
         .await?;
 
-    let mut stream = TcpStream::connect(BROKER).await?;
+    let mut stream = TcpStream::connect(broker_addr()).await?;
     stream.set_nodelay(true)?;
 
     println!("Step 2: read_committed fetch from offset 2...");
@@ -249,7 +248,7 @@ pub async fn test_fetch_honours_request_max_bytes() -> TestResult {
         req
     };
 
-    let mut stream = TcpStream::connect(BROKER).await?;
+    let mut stream = TcpStream::connect(broker_addr()).await?;
     stream.set_nodelay(true)?;
 
     println!("Step 1: max_bytes = 1...");

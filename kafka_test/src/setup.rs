@@ -187,7 +187,7 @@ pub fn verify_server_ready() -> TestResult {
     use rdkafka::producer::{FutureProducer, Producer};
 
     let producer: FutureProducer = ClientConfig::new()
-        .set("bootstrap.servers", "localhost:9092")
+        .set("bootstrap.servers", crate::common::get_bootstrap_servers())
         .set("message.timeout.ms", "5000")
         .create()?;
 

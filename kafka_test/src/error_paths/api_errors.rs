@@ -7,6 +7,7 @@
 //! Each response must decode completely in the request's version, which is what a strict
 //! client does with it.
 
+use crate::common::broker_addr;
 use crate::common::to_i32;
 use crate::common::TestResult;
 use crate::error_codes;
@@ -25,8 +26,6 @@ use kafka_protocol::protocol::{Decodable, HeaderVersion, StrBytes};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
-
-const BROKER: &str = "localhost:9092";
 
 type BoxError = Box<dyn std::error::Error>;
 
@@ -76,7 +75,7 @@ fn topic(name: &str) -> TopicName {
 /// echoed topics/partitions/groups.
 pub async fn test_unsupported_versions_get_typed_error_responses() -> TestResult {
     println!("=== Test: Unsupported Versions Get Typed Error Responses ===\n");
-    let mut stream = TcpStream::connect(BROKER).await?;
+    let mut stream = TcpStream::connect(broker_addr()).await?;
 
     // Metadata v11 (max 10): no top-level code; the requested topic carries it.
     let mut request = MetadataRequest::default();
@@ -173,7 +172,7 @@ pub async fn test_truncated_body_gets_invalid_request() -> TestResult {
     }
 
     println!("=== Test: Truncated Body Gets INVALID_REQUEST ===\n");
-    let mut stream = TcpStream::connect(BROKER).await?;
+    let mut stream = TcpStream::connect(broker_addr()).await?;
 
     let mut heartbeat = HeartbeatRequest::default();
     heartbeat.group_id = GroupId(StrBytes::from_static_str("api-errors-group"));
@@ -266,7 +265,7 @@ pub async fn test_handler_failure_gets_typed_error_response() -> TestResult {
     println!("✅ ListOffsets: UNKNOWN_SERVER_ERROR on both partitions");
 
     // After the GRANT the same request succeeds again.
-    let mut stream = TcpStream::connect(BROKER).await?;
+    let mut stream = TcpStream::connect(broker_addr()).await?;
     let response: ListOffsetsResponse = exchange(
         &mut stream,
         &request_frame(5, 302, &list_offsets(&topic_name)),
@@ -303,7 +302,7 @@ fn list_offsets(topic_name: &str) -> ListOffsetsRequest {
 }
 
 async fn list_offsets_while_revoked(topic_name: &str) -> Result<ListOffsetsResponse, BoxError> {
-    let mut stream = TcpStream::connect(BROKER).await?;
+    let mut stream = TcpStream::connect(broker_addr()).await?;
     let response = exchange(
         &mut stream,
         &request_frame(5, 301, &list_offsets(topic_name)),
@@ -343,8 +342,8 @@ pub async fn test_request_sees_rows_committed_during_its_batch() -> TestResult {
     let mut stale = 0;
     for attempt in 0..5 {
         let fresh = ctx.unique_topic("api-snap-new").await;
-        let mut blocked = TcpStream::connect(BROKER).await?;
-        let mut fetcher = TcpStream::connect(BROKER).await?;
+        let mut blocked = TcpStream::connect(broker_addr()).await?;
+        let mut fetcher = TcpStream::connect(broker_addr()).await?;
 
         let txn = locker.transaction().await?;
         txn.execute(

@@ -51,9 +51,35 @@ pub fn get_database_url() -> String {
         .unwrap_or_else(|_| "host=localhost port=28814 user=postgres dbname=postgres".to_string())
 }
 
-/// Get Kafka bootstrap servers from KAFKA_BOOTSTRAP_SERVERS env var or use default
+/// The broker under test when `KAFKA_BOOTSTRAP_SERVERS` is unset: pg_kafka's default
+/// listener (`pg_kafka.port` 9092) on this host. Every test reaches the broker through
+/// [`get_bootstrap_servers`], [`broker_addr`] or [`broker_port`], never a literal address.
+pub const DEFAULT_BOOTSTRAP_SERVERS: &str = "localhost:9092";
+
+/// The broker under test as an rdkafka `bootstrap.servers` list: `KAFKA_BOOTSTRAP_SERVERS`,
+/// or [`DEFAULT_BOOTSTRAP_SERVERS`].
 pub fn get_bootstrap_servers() -> String {
-    env::var("KAFKA_BOOTSTRAP_SERVERS").unwrap_or_else(|_| "localhost:9092".to_string())
+    env::var("KAFKA_BOOTSTRAP_SERVERS").unwrap_or_else(|_| DEFAULT_BOOTSTRAP_SERVERS.to_string())
+}
+
+/// The first `host:port` of [`get_bootstrap_servers`], for raw TCP connections
+/// (`TcpStream::connect(broker_addr())`). A `PLAINTEXT://` prefix is dropped.
+pub fn broker_addr() -> String {
+    let servers = get_bootstrap_servers();
+    let first = servers.split(',').next().unwrap_or_default().trim();
+    first
+        .rsplit_once("://")
+        .map_or(first, |(_, addr)| addr)
+        .to_string()
+}
+
+/// The port of [`broker_addr`], for tests that connect to the listener on the database
+/// host's loopback addresses (`network`, `auth`).
+pub fn broker_port() -> u16 {
+    let addr = broker_addr();
+    addr.rsplit_once(':')
+        .and_then(|(_, port)| port.parse().ok())
+        .unwrap_or_else(|| panic!("KAFKA_BOOTSTRAP_SERVERS: no port in {addr:?}"))
 }
 
 /// Create a new database client connection

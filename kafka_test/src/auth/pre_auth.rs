@@ -3,7 +3,7 @@
 //! thread cannot answer closes the connection instead of failing the authentication;
 //! a stored credential that is unusable fails it.
 
-use super::{auth_env, PASSWORD, PLAINTEXT_PORT, SASL_PLAINTEXT_PORT, USER};
+use super::{auth_env, plaintext_port, PASSWORD, SASL_PLAINTEXT_PORT, USER};
 use crate::common::{create_db_client, TestResult};
 use crate::wire::{recv, roundtrip, send};
 use bytes::Bytes;
@@ -29,7 +29,7 @@ pub async fn test_auth_pre_auth_api_versions_skips_db_thread() -> TestResult {
         .await?;
     let outcome = async {
         // Put the DB thread into the lock wait.
-        let mut plain = TcpStream::connect(("127.0.0.1", PLAINTEXT_PORT)).await?;
+        let mut plain = TcpStream::connect(("127.0.0.1", plaintext_port())).await?;
         send(&mut plain, 3, 1, &ApiVersionsRequest::default()).await?;
         let stalled = tokio::time::timeout(
             Duration::from_millis(800),

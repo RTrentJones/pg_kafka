@@ -219,6 +219,7 @@ pub async fn test_fenced_producer_cannot_write() -> TestResult {
 
 // ----- wire-level protocol regressions -----
 
+use crate::common::broker_addr;
 use crate::wire::records::{encode, plain_record};
 use crate::wire::requests::produce_request;
 use crate::wire::{raw_frame, read_frame_within, request_frame};
@@ -228,8 +229,6 @@ use kafka_protocol::protocol::StrBytes;
 use kafka_protocol::records::Compression;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
-
-const BROKER: &str = "localhost:9092";
 
 /// How long a test waits for a response (or for the connection to close).
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
@@ -247,7 +246,7 @@ fn value_batch(value: &str) -> Bytes {
 /// that drops the connection.
 pub async fn test_api_versions_above_range_negotiates_down() -> TestResult {
     println!("=== Test: ApiVersions Above Range Negotiates Down ===\n");
-    let mut stream = TcpStream::connect(BROKER).await?;
+    let mut stream = TcpStream::connect(broker_addr()).await?;
     // ApiVersions v3+ uses the flexible request header (v2), which ends with an empty
     // tagged-field section after the client id; the body is likewise just tagged fields.
     // Header tagged fields, then body tagged fields.
@@ -270,7 +269,7 @@ pub async fn test_api_versions_above_range_negotiates_down() -> TestResult {
 /// a v4 fetch works.
 pub async fn test_fetch_advertised_minimum_is_usable() -> TestResult {
     println!("=== Test: Fetch Advertised Minimum Is Usable ===\n");
-    let mut stream = TcpStream::connect(BROKER).await?;
+    let mut stream = TcpStream::connect(broker_addr()).await?;
     let response = crate::wire::roundtrip(
         &mut stream,
         0,
@@ -318,7 +317,7 @@ pub async fn test_produce_two_batches_in_one_partition_is_rejected() -> TestResu
         .await?;
     let two = Bytes::from([value_batch("first"), value_batch("second")].concat());
 
-    let mut stream = TcpStream::connect(BROKER).await?;
+    let mut stream = TcpStream::connect(broker_addr()).await?;
     let response = crate::wire::roundtrip(
         &mut stream,
         7,
@@ -356,7 +355,7 @@ pub async fn test_corrupt_acks0_produce_sends_no_reply() -> TestResult {
         .with_partitions(1)
         .build()
         .await?;
-    let mut stream = TcpStream::connect(BROKER).await?;
+    let mut stream = TcpStream::connect(broker_addr()).await?;
 
     // Fire-and-forget produce with garbage in place of a record batch...
     let req = produce_request(
@@ -543,7 +542,7 @@ pub async fn test_end_txn_retry_is_idempotent() -> TestResult {
         .build()
         .await?;
     let txn_id = format!("review-endtxn-{}", uuid::Uuid::new_v4());
-    let mut stream = TcpStream::connect(BROKER).await?;
+    let mut stream = TcpStream::connect(broker_addr()).await?;
 
     let mut init = InitProducerIdRequest::default();
     init.transactional_id = Some(TransactionalId(StrBytes::from_string(txn_id.clone())));
@@ -600,7 +599,7 @@ pub async fn test_auto_create_rejects_invalid_topic_name() -> TestResult {
     let mut req = MetadataRequest::default();
     req.topics = Some(vec![t]);
     req.allow_auto_topic_creation = true;
-    let mut stream = TcpStream::connect(BROKER).await?;
+    let mut stream = TcpStream::connect(broker_addr()).await?;
     let response = crate::wire::roundtrip(&mut stream, 4, 701, &req).await?;
     let code = response.topics[0].error_code;
     let rows = ctx
@@ -830,9 +829,9 @@ pub async fn test_group_rebalance_keeps_old_generation_usable() -> TestResult {
         .build()
         .await?;
     let group = ctx.unique_group("review-group").await;
-    let mut sa = TcpStream::connect(BROKER).await?;
-    let mut sb = TcpStream::connect(BROKER).await?;
-    let mut sc = TcpStream::connect(BROKER).await?;
+    let mut sa = TcpStream::connect(broker_addr()).await?;
+    let mut sb = TcpStream::connect(broker_addr()).await?;
+    let mut sc = TcpStream::connect(broker_addr()).await?;
 
     // Stable group {a (leader), b}: a joins alone, b's join waits for a to rejoin.
     let a = join(&mut sa, &group, "", b"sub", 800).await?;

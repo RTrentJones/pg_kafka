@@ -6,6 +6,7 @@
 //! connection's response stream, exactly as it blocks a real client's coordinator
 //! connection.
 
+use crate::common::broker_addr;
 use crate::common::TestResult;
 use crate::error_codes;
 use crate::setup::TestContext;
@@ -21,7 +22,6 @@ use kafka_protocol::protocol::StrBytes;
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 
-const BROKER: &str = "localhost:9092";
 const JOIN_VERSION: i16 = 5;
 
 fn join_request(group: &str, member_id: &str, session_timeout_ms: i32) -> JoinGroupRequest {
@@ -189,8 +189,8 @@ pub async fn test_join_group_held_until_all_members_rejoin() -> TestResult {
     println!("=== Test: JoinGroup Held Until All Members Rejoin ===\n");
     let ctx = TestContext::new().await?;
     let group = ctx.unique_group("coord-hold").await;
-    let mut conn_a = TcpStream::connect(BROKER).await?;
-    let mut conn_b = TcpStream::connect(BROKER).await?;
+    let mut conn_a = TcpStream::connect(broker_addr()).await?;
+    let mut conn_b = TcpStream::connect(broker_addr()).await?;
 
     println!("Step 1: first member joins an empty group (completes at once)...");
     let a = join_now(&mut conn_a, &group, "", 1).await?;
@@ -282,8 +282,8 @@ pub async fn test_held_join_completed_by_session_timeout_sweep() -> TestResult {
     println!("=== Test: Held JoinGroup Completed By The Timeout Sweep ===\n");
     let ctx = TestContext::new().await?;
     let group = ctx.unique_group("coord-sweep").await;
-    let mut conn_a = TcpStream::connect(BROKER).await?;
-    let mut conn_b = TcpStream::connect(BROKER).await?;
+    let mut conn_a = TcpStream::connect(broker_addr()).await?;
+    let mut conn_b = TcpStream::connect(broker_addr()).await?;
 
     println!("Step 1: first member joins with the minimum 6s session timeout...");
     send_join(&mut conn_a, &group, "", 6_000, 1).await?;
@@ -327,8 +327,8 @@ pub async fn test_held_join_completed_by_leave_group() -> TestResult {
     println!("=== Test: Held JoinGroup Completed By LeaveGroup ===\n");
     let ctx = TestContext::new().await?;
     let group = ctx.unique_group("coord-leave").await;
-    let mut conn_a = TcpStream::connect(BROKER).await?;
-    let mut conn_b = TcpStream::connect(BROKER).await?;
+    let mut conn_a = TcpStream::connect(broker_addr()).await?;
+    let mut conn_b = TcpStream::connect(broker_addr()).await?;
 
     let a = join_now(&mut conn_a, &group, "", 1).await?;
     let a_id = a.member_id.to_string();
@@ -363,8 +363,8 @@ pub async fn test_follower_sync_held_until_leader_syncs() -> TestResult {
     println!("=== Test: Follower SyncGroup Held Until The Leader Syncs ===\n");
     let ctx = TestContext::new().await?;
     let group = ctx.unique_group("coord-sync-hold").await;
-    let mut conn_a = TcpStream::connect(BROKER).await?;
-    let mut conn_b = TcpStream::connect(BROKER).await?;
+    let mut conn_a = TcpStream::connect(broker_addr()).await?;
+    let mut conn_b = TcpStream::connect(broker_addr()).await?;
 
     println!("Step 1: form a two-member generation...");
     let a = join_now(&mut conn_a, &group, "", 1).await?;

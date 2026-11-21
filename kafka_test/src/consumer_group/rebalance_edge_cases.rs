@@ -2,7 +2,7 @@
 //!
 //! Tests for edge cases in consumer group rebalancing.
 
-use crate::common::{create_producer, TestResult};
+use crate::common::{create_producer, get_bootstrap_servers, TestResult};
 use crate::members::{close_all, Member, CLOSE_TIMEOUT};
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
@@ -37,7 +37,7 @@ pub async fn test_rapid_rebalance_cycles() -> TestResult {
         println!("Cycle {}: Join 2 consumers, then leave...", cycle + 1);
 
         let c1: StreamConsumer = ClientConfig::new()
-            .set("bootstrap.servers", "localhost:9092")
+            .set("bootstrap.servers", get_bootstrap_servers())
             .set("group.id", &group_id)
             .set("session.timeout.ms", "10000")
             .set("enable.auto.commit", "false")
@@ -47,7 +47,7 @@ pub async fn test_rapid_rebalance_cycles() -> TestResult {
         let _ = tokio::time::timeout(Duration::from_millis(300), c1.recv()).await;
 
         let c2: StreamConsumer = ClientConfig::new()
-            .set("bootstrap.servers", "localhost:9092")
+            .set("bootstrap.servers", get_bootstrap_servers())
             .set("group.id", &group_id)
             .set("session.timeout.ms", "10000")
             .set("enable.auto.commit", "false")
@@ -65,7 +65,7 @@ pub async fn test_rapid_rebalance_cycles() -> TestResult {
     // Verify final join works
     println!("\nStep 2: Verifying group accepts new member...");
     let final_c: StreamConsumer = ClientConfig::new()
-        .set("bootstrap.servers", "localhost:9092")
+        .set("bootstrap.servers", get_bootstrap_servers())
         .set("group.id", &group_id)
         .set("session.timeout.ms", "10000")
         .set("enable.auto.commit", "false")
@@ -104,7 +104,7 @@ pub async fn test_heartbeat_during_rebalance_window() -> TestResult {
 
     println!("\nStep 2: Consumer 1 joining...");
     let c1: StreamConsumer = ClientConfig::new()
-        .set("bootstrap.servers", "localhost:9092")
+        .set("bootstrap.servers", get_bootstrap_servers())
         .set("group.id", &group_id)
         .set("session.timeout.ms", "10000")
         .set("enable.auto.commit", "false")
@@ -116,7 +116,7 @@ pub async fn test_heartbeat_during_rebalance_window() -> TestResult {
 
     println!("\nStep 3: Consumer 2 joining (triggers rebalance)...");
     let c2: StreamConsumer = ClientConfig::new()
-        .set("bootstrap.servers", "localhost:9092")
+        .set("bootstrap.servers", get_bootstrap_servers())
         .set("group.id", &group_id)
         .set("session.timeout.ms", "10000")
         .set("enable.auto.commit", "false")
@@ -164,7 +164,7 @@ pub async fn test_multiple_concurrent_timeouts() -> TestResult {
     let mut consumers = Vec::new();
     for i in 0..3 {
         let c: StreamConsumer = ClientConfig::new()
-            .set("bootstrap.servers", "localhost:9092")
+            .set("bootstrap.servers", get_bootstrap_servers())
             .set("group.id", &group_id)
             .set("session.timeout.ms", "6000")
             .set("enable.auto.commit", "false")
@@ -186,7 +186,7 @@ pub async fn test_multiple_concurrent_timeouts() -> TestResult {
 
     println!("\nStep 4: New consumer joining...");
     let new_c: StreamConsumer = ClientConfig::new()
-        .set("bootstrap.servers", "localhost:9092")
+        .set("bootstrap.servers", get_bootstrap_servers())
         .set("group.id", &group_id)
         .set("session.timeout.ms", "10000")
         .set("enable.auto.commit", "false")
@@ -221,7 +221,7 @@ pub async fn test_rebalance_with_minimal_session_timeout() -> TestResult {
 
     println!("\nStep 2: Consumer joining with 6s timeout...");
     let c1: StreamConsumer = ClientConfig::new()
-        .set("bootstrap.servers", "localhost:9092")
+        .set("bootstrap.servers", get_bootstrap_servers())
         .set("group.id", &group_id)
         .set("session.timeout.ms", "6000")
         .set("enable.auto.commit", "false")
@@ -236,7 +236,7 @@ pub async fn test_rebalance_with_minimal_session_timeout() -> TestResult {
 
     println!("\nStep 4: New consumer joining...");
     let c2: StreamConsumer = ClientConfig::new()
-        .set("bootstrap.servers", "localhost:9092")
+        .set("bootstrap.servers", get_bootstrap_servers())
         .set("group.id", &group_id)
         .set("session.timeout.ms", "10000")
         .set("enable.auto.commit", "false")
@@ -275,7 +275,7 @@ pub async fn test_rebalance_mixed_timeout_values() -> TestResult {
 
     println!("\nStep 2: Consumer A joining (6s timeout)...");
     let ca: StreamConsumer = ClientConfig::new()
-        .set("bootstrap.servers", "localhost:9092")
+        .set("bootstrap.servers", get_bootstrap_servers())
         .set("group.id", &group_id)
         .set("session.timeout.ms", "6000")
         .set("enable.auto.commit", "false")
@@ -287,7 +287,7 @@ pub async fn test_rebalance_mixed_timeout_values() -> TestResult {
 
     println!("\nStep 3: Consumer B joining (10s timeout)...");
     let cb: StreamConsumer = ClientConfig::new()
-        .set("bootstrap.servers", "localhost:9092")
+        .set("bootstrap.servers", get_bootstrap_servers())
         .set("group.id", &group_id)
         .set("session.timeout.ms", "10000")
         .set("enable.auto.commit", "false")
@@ -305,7 +305,7 @@ pub async fn test_rebalance_mixed_timeout_values() -> TestResult {
 
     println!("\nStep 5: New consumer joining...");
     let new_c: StreamConsumer = ClientConfig::new()
-        .set("bootstrap.servers", "localhost:9092")
+        .set("bootstrap.servers", get_bootstrap_servers())
         .set("group.id", &group_id)
         .set("session.timeout.ms", "10000")
         .set("enable.auto.commit", "false")

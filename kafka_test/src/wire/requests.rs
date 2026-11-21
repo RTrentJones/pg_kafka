@@ -1,5 +1,6 @@
 //! One-call raw requests for the admin and consumer-group APIs.
 
+use crate::common::broker_addr;
 use crate::common::DynResult;
 use crate::wire::records::batch;
 use crate::wire::roundtrip;
@@ -25,14 +26,12 @@ use kafka_protocol::protocol::StrBytes;
 use std::time::Duration;
 use tokio::net::TcpStream;
 
-pub(crate) const BROKER: &str = "127.0.0.1:9092";
-
 pub(crate) fn s(v: &str) -> StrBytes {
     StrBytes::from_string(v.to_string())
 }
 
 pub(crate) async fn conn() -> DynResult<TcpStream> {
-    Ok(TcpStream::connect(BROKER).await?)
+    Ok(TcpStream::connect(broker_addr()).await?)
 }
 
 pub(crate) fn creatable(name: &str, partitions: i32, rf: i16) -> CreatableTopic {

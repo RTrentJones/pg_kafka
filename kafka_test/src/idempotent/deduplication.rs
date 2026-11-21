@@ -44,8 +44,11 @@ pub async fn test_true_deduplication_manual_replay() -> TestResult {
     let topic = ctx.unique_topic("dedup-manual").await;
 
     // Step 1: Connect to broker via raw TCP
-    println!("Step 1: Connecting to broker at 127.0.0.1:9092...");
-    let mut stream = TcpStream::connect("127.0.0.1:9092").await?;
+    println!(
+        "Step 1: Connecting to broker at {}...",
+        crate::common::broker_addr()
+    );
+    let mut stream = TcpStream::connect(crate::common::broker_addr()).await?;
     println!("✅ Connected to broker\n");
 
     // Step 2: Send InitProducerId request to get a producer_id

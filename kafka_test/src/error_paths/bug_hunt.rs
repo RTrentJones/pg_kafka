@@ -3,6 +3,7 @@
 //! handler behaviour. They speak the wire protocol directly so each request is exactly
 //! the one under test.
 
+use crate::common::broker_addr;
 use crate::common::to_i32;
 use crate::common::TestResult;
 use crate::fixtures::{generate_messages, TestTopicBuilder};
@@ -20,8 +21,6 @@ use tokio::net::TcpStream;
 use crate::wire::requests::fetch_request;
 use crate::wire::{raw_frame, read_raw_response, roundtrip};
 
-const BROKER: &str = "localhost:9092";
-
 /// Bug 6 (+ the long-poll path in `src/kafka/listener/long_poll.rs`): fetching a partition that does not
 /// exist, or an offset past the high watermark, returns the matching error code, and
 /// does so straight away instead of after max_wait_ms.
@@ -35,7 +34,7 @@ pub async fn test_fetch_bad_partition_or_offset_returns_error() -> TestResult {
         .await?;
     topic.produce(&generate_messages(3, "m")).await?;
 
-    let mut stream = TcpStream::connect(BROKER).await?;
+    let mut stream = TcpStream::connect(broker_addr()).await?;
     stream.set_nodelay(true)?;
 
     // (partition, offset, expected error code)
@@ -115,7 +114,7 @@ pub async fn test_fetch_into_cleaned_up_aborted_rows_is_in_range() -> TestResult
         .get(0);
     assert_eq!(surviving, 1, "offset 0 should have been cleaned up");
 
-    let mut stream = TcpStream::connect(BROKER).await?;
+    let mut stream = TcpStream::connect(broker_addr()).await?;
     stream.set_nodelay(true)?;
     let response = roundtrip(&mut stream, 4, 150, &fetch_request(&topic.name, 0, 0, 0)).await?;
     let p = &response.responses[0].partitions[0];
@@ -174,7 +173,7 @@ pub async fn test_txn_offset_commit_failure_reports_partition_errors() -> TestRe
     req.producer_epoch = 0;
     req.topics = vec![t];
 
-    let mut stream = TcpStream::connect(BROKER).await?;
+    let mut stream = TcpStream::connect(broker_addr()).await?;
     stream.set_nodelay(true)?;
     let response = roundtrip(&mut stream, 0, 200, &req).await?;
 
@@ -236,7 +235,7 @@ pub async fn test_create_topics_default_and_zero_partitions() -> TestResult {
     req.topics = vec![topic(&defaulted, -1), topic(&zero, 0)];
     req.timeout_ms = 5000;
 
-    let mut stream = TcpStream::connect(BROKER).await?;
+    let mut stream = TcpStream::connect(broker_addr()).await?;
     stream.set_nodelay(true)?;
     // v5: CreatableTopicResult.num_partitions only exists from v5 on.
     let response = roundtrip(&mut stream, 5, 300, &req).await?;
@@ -290,7 +289,7 @@ pub async fn test_frame_budget_released_on_mid_frame_disconnect() -> TestResult 
 
     // Abandon more frames than the budget can hold (8 x 100 MB > 512 MiB).
     for i in 0..8 {
-        let mut stream = TcpStream::connect(BROKER).await?;
+        let mut stream = TcpStream::connect(broker_addr()).await?;
 
         println!("=== Test: Frame Budget Released on Mid-Frame Disconnect ===\n");
 
@@ -307,7 +306,7 @@ pub async fn test_frame_budget_released_on_mid_frame_disconnect() -> TestResult 
     // A fresh large frame must still be admitted. When the budget is exhausted the
     // listener errors the decode and closes the connection at once (read returns EOF);
     // when it is admitted the connection stays open waiting for the payload.
-    let mut stream = TcpStream::connect(BROKER).await?;
+    let mut stream = TcpStream::connect(broker_addr()).await?;
     stream.write_all(&DECLARED.to_be_bytes()).await?;
     stream.flush().await?;
     let mut probe = [0u8; 1];
@@ -324,7 +323,7 @@ pub async fn test_frame_budget_released_on_mid_frame_disconnect() -> TestResult 
 
     // The broker still serves ordinary requests.
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let mut stream = TcpStream::connect(BROKER).await?;
+    let mut stream = TcpStream::connect(broker_addr()).await?;
     stream.write_all(&raw_frame(18, 0, 4242, &[])).await?;
     let (correlation_id, _) =
         tokio::time::timeout(Duration::from_secs(5), read_raw_response(&mut stream)).await??;

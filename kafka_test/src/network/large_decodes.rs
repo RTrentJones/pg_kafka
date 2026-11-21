@@ -4,7 +4,7 @@
 //! it waits its turn and is answered.
 
 use super::produce_decoding::{raw_batch, record, varint};
-use super::{client_config, connect_from, rdkafka_roundtrip, stored_rows, PORT};
+use super::{client_config, connect_from, port, rdkafka_roundtrip, stored_rows};
 use crate::common::{DynResult, TestResult};
 use crate::setup::TestContext;
 use crate::wire::records::plain_batch;
@@ -60,7 +60,7 @@ async fn flood(
     closed: Arc<AtomicUsize>,
 ) {
     while !stop.load(Ordering::Relaxed) {
-        let Ok(stream) = connect_from(src, PORT).await else {
+        let Ok(stream) = connect_from(src, port()).await else {
             tokio::time::sleep(Duration::from_millis(20)).await;
             continue;
         };
@@ -90,7 +90,7 @@ async fn flood(
 /// partition's error code, or an error when the broker closes the connection instead.
 async fn legit_produce(frame: &[u8], corr: i32) -> DynResult<(i16, Duration)> {
     let started = Instant::now();
-    let mut s = TcpStream::connect(("127.0.0.1", PORT)).await?;
+    let mut s = TcpStream::connect(("127.0.0.1", port())).await?;
     s.write_all(frame).await?;
     let response = read_frame_within(&mut s, Duration::from_secs(40))
         .await?
@@ -126,7 +126,7 @@ pub async fn test_saturated_large_decodes_wait_instead_of_closing() -> TestResul
     println!("  bomb frame: {} bytes", bomb_frame.len());
     // One check first: a bomb alone is refused, not stored.
     {
-        let mut s = TcpStream::connect(("127.0.0.1", PORT)).await?;
+        let mut s = TcpStream::connect(("127.0.0.1", port())).await?;
         s.write_all(&bomb_frame).await?;
         let response = read_frame_within(&mut s, Duration::from_secs(30))
             .await?
@@ -199,7 +199,7 @@ pub async fn test_saturated_large_decodes_wait_instead_of_closing() -> TestResul
         }
     }
     println!("Step 3: an rdkafka gzip producer works during the attack");
-    let mut cfg = client_config(PORT);
+    let mut cfg = client_config(port());
     cfg.set("compression.type", "gzip");
     let rd_topic = ctx.unique_topic("net-large-rd").await;
     let roundtrip = rdkafka_roundtrip(cfg, &rd_topic, 3)

@@ -113,7 +113,11 @@ cd kafka_test && cargo run --release -- --exclude performance --exclude shadow
 Other flags: `--sequential` (disable parallelism; runs are parallel by default),
 `--concurrency <N>` (default 16), `--timeout-secs <N>` (per-test timeout, default 300),
 `--json`, `--list`, `--verbose`. The runner reads
-`DATABASE_URL` and falls back to `host=localhost port=28814 user=postgres dbname=postgres`.
+`DATABASE_URL` and falls back to `host=localhost port=28814 user=postgres dbname=postgres`, and
+reaches the broker through `KAFKA_BOOTSTRAP_SERVERS` (default `localhost:9092`) only: rdkafka
+clients get the list, raw-protocol tests connect to its first address, and the `network` and
+`auth` categories (which connect from chosen loopback source addresses on the database host)
+use its port on 127.0.0.1.
 
 ---
 

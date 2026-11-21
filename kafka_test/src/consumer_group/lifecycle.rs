@@ -3,7 +3,7 @@
 //! Validates the full consumer group coordinator protocol:
 //! FindCoordinator → JoinGroup → SyncGroup → Heartbeat → LeaveGroup
 
-use crate::common::{create_producer, TestResult};
+use crate::common::{create_producer, get_bootstrap_servers, TestResult};
 use crate::members::{Member, CLOSE_TIMEOUT};
 use crate::setup::TestContext;
 use rdkafka::config::ClientConfig;
@@ -49,7 +49,7 @@ pub async fn test_consumer_group_lifecycle() -> TestResult {
     // 2. Create consumer and join group (exercises FindCoordinator + JoinGroup)
     println!("\nStep 2: Creating consumer and joining group...");
     let consumer: StreamConsumer = ClientConfig::new()
-        .set("bootstrap.servers", "localhost:9092")
+        .set("bootstrap.servers", get_bootstrap_servers())
         .set("group.id", &group_id)
         .set("session.timeout.ms", "10000")
         .set("heartbeat.interval.ms", "1000")
@@ -107,7 +107,7 @@ pub async fn test_consumer_group_lifecycle() -> TestResult {
 
     // Create new consumer to verify group is joinable
     let consumer2: StreamConsumer = ClientConfig::new()
-        .set("bootstrap.servers", "localhost:9092")
+        .set("bootstrap.servers", get_bootstrap_servers())
         .set("group.id", &group_id)
         .set("session.timeout.ms", "6000")
         .set("enable.auto.commit", "false")
