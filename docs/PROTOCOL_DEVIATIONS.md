@@ -388,8 +388,10 @@ pg_kafka.compression_type = 'gzip'
 - ✅ OffsetCommit follows Kafka 3.7: generation -1 (simple consumers, `kafka-consumer-groups
   --reset-offsets`) is accepted only for an unknown or Empty group (any member id); a group with
   members answers UNKNOWN_MEMBER_ID to a non-member and ILLEGAL_GENERATION to a wrong
-  generation (also -1 from a member); a generation >= 0 for a group the coordinator does not
-  know gets ILLEGAL_GENERATION. (TxnOffsetCommit keeps its own rules.)
+  generation (also -1 from a member); a generation >= 0 for a group without members gets
+  UNKNOWN_MEMBER_ID when the group has committed offsets (Kafka holds it as an Empty group,
+  also when none of its members joined since the worker started) and ILLEGAL_GENERATION when
+  it has neither members nor offsets. (TxnOffsetCommit keeps its own rules.)
 - ✅ The empty group id follows Kafka 3.7 (`GroupCoordinator.isValidGroupId`, checked against a
   3.7 broker): OffsetCommit, OffsetFetch, DescribeGroups and DeleteGroups accept `""` like any
   other group id, and FindCoordinator and AddOffsetsToTxn take it too; JoinGroup, SyncGroup,

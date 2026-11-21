@@ -231,3 +231,42 @@ fn test_handle_offset_fetch_all_offsets() {
     // Should have 2 topics
     assert_eq!(response.topics.len(), 2);
 }
+
+/// An OffsetCommit with a generation >= 0 for a group the coordinator does not hold: Kafka
+/// 3.7 answers UNKNOWN_MEMBER_ID when the group has committed offsets (it is an Empty group
+/// there) and ILLEGAL_GENERATION when it has none; nothing is stored either way.
+#[test]
+fn test_handle_offset_commit_generation_for_offsets_only_group() {
+    let commit = |has_offsets: bool, generation: i32, member: &str| {
+        let mut mock = MockKafkaStore::new();
+        mock.expect_groups_with_offsets()
+            .withf(|groups| groups == ["offsets-only".to_string()])
+            .times(1)
+            .returning(move |groups| {
+                Ok(if has_offsets {
+                    groups.iter().cloned().collect()
+                } else {
+                    std::collections::HashSet::new()
+                })
+            });
+        mock.expect_commit_offset().never();
+        let env = TestEnv::new();
+        let ctx = env.ctx(&mock);
+        let topics = vec![OffsetCommitTopicData {
+            name: "t".to_string(),
+            partitions: vec![OffsetCommitPartitionData {
+                partition_index: 0,
+                committed_offset: 10,
+                metadata: None,
+            }],
+        }];
+        consumer::handle_offset_commit(&ctx, "offsets-only", generation, member, topics)
+            .unwrap()
+            .topics[0]
+            .partitions[0]
+            .error_code
+    };
+    assert_eq!(commit(true, 5, "zz"), ERROR_UNKNOWN_MEMBER_ID);
+    assert_eq!(commit(true, 0, ""), ERROR_UNKNOWN_MEMBER_ID);
+    assert_eq!(commit(false, 5, "zz"), ERROR_ILLEGAL_GENERATION);
+}

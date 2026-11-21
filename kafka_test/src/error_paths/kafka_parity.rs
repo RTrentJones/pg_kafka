@@ -3,8 +3,8 @@
 
 use crate::common::TestResult;
 use crate::error_codes::{
-    INVALID_GROUP_ID, INVALID_PRODUCER_EPOCH, INVALID_PRODUCER_ID_MAPPING, INVALID_TXN_STATE, NONE,
-    UNKNOWN_MEMBER_ID, UNKNOWN_TOPIC_OR_PARTITION,
+    ILLEGAL_GENERATION, INVALID_GROUP_ID, INVALID_PRODUCER_EPOCH, INVALID_PRODUCER_ID_MAPPING,
+    INVALID_TXN_STATE, NONE, UNKNOWN_MEMBER_ID, UNKNOWN_TOPIC_OR_PARTITION,
 };
 use crate::fixtures::TestTopicBuilder;
 use crate::setup::TestContext;
@@ -616,6 +616,157 @@ pub async fn test_refused_txn_offset_commit_answers_unknown_partitions() -> Test
     assert_eq!(pending, 0, "no pending offsets");
     assert_eq!(wire.end_txn(&txn, producer_id, epoch, false).await?, NONE);
     println!("✅ Nothing stored\n");
+
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// OffsetCommit v8 of `offset` to `entries` (`(topic, partitions)`) as `member` of
+/// `generation`: the `(topic, partition, error)` of each answered partition.
+async fn offset_commit_v8(
+    wire: &mut Wire,
+    group: &str,
+    generation: i32,
+    member: &str,
+    offset: i64,
+    entries: &[(&str, &[i32])],
+) -> crate::common::DynResult<Vec<(String, i32, i16)>> {
+    let mut req = OffsetCommitRequest::default();
+    req.group_id = GroupId(StrBytes::from_string(group.to_string()));
+    req.generation_id_or_member_epoch = generation;
+    req.member_id = StrBytes::from_string(member.to_string());
+    req.topics = entries
+        .iter()
+        .map(|(name, partitions)| {
+            let mut t = OffsetCommitRequestTopic::default();
+            t.name = TopicName(StrBytes::from_string(name.to_string()));
+            t.partitions = partitions
+                .iter()
+                .map(|&partition_index| {
+                    let mut p = OffsetCommitRequestPartition::default();
+                    p.partition_index = partition_index;
+                    p.committed_offset = offset;
+                    p.committed_leader_epoch = -1;
+                    p
+                })
+                .collect();
+            t
+        })
+        .collect();
+    let resp: OffsetCommitResponse = wire.call(8, &req).await?;
+    Ok(resp
+        .topics
+        .iter()
+        .flat_map(|t| {
+            t.partitions
+                .iter()
+                .map(move |p| (t.name.to_string(), p.partition_index, p.error_code))
+        })
+        .collect())
+}
+
+/// The committed offset of `group` on partition 0 of `topic` (-1 for none), read from the
+/// database.
+async fn committed_offset(
+    ctx: &TestContext,
+    group: &str,
+    topic: &str,
+) -> crate::common::DynResult<i64> {
+    Ok(ctx
+        .db()
+        .query_one(
+            "SELECT COALESCE(MAX(o.committed_offset), -1) FROM kafka.consumer_offsets o
+               JOIN kafka.topics t ON o.topic_id = t.id
+              WHERE o.group_id = $1 AND t.name = $2 AND o.partition_id = 0",
+            &[&group, &topic],
+        )
+        .await?
+        .get(0))
+}
+
+/// OffsetCommit with a generation >= 0, as Kafka 3.7 answers it: ILLEGAL_GENERATION for a
+/// group with neither members nor offsets, UNKNOWN_MEMBER_ID for a group known only by its
+/// committed offsets (an Empty group in Kafka), ILLEGAL_GENERATION for a stale generation of
+/// a live group; generation -1 commits to a group without members. Refused commits store
+/// nothing.
+pub async fn test_offset_commit_generation_for_offsets_only_group() -> TestResult {
+    use kafka_protocol::messages::join_group_request::{
+        JoinGroupRequest, JoinGroupRequestProtocol,
+    };
+    use kafka_protocol::messages::join_group_response::JoinGroupResponse;
+    use kafka_protocol::messages::sync_group_request::SyncGroupRequest;
+    use kafka_protocol::messages::sync_group_response::SyncGroupResponse;
+
+    println!("=== Test: OffsetCommit generation for an offsets-only group ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = TestTopicBuilder::new(&ctx, "parity-offsets-only")
+        .build()
+        .await?
+        .name;
+    let group = ctx.unique_group("parity-offsets-only").await;
+    let live = ctx.unique_group("parity-offsets-live").await;
+    let entries: [(&str, &[i32]); 1] = [(&topic, &[0])];
+    let answered = |code| vec![(topic.clone(), 0, code)];
+    let mut wire = Wire::connect().await?;
+
+    println!("Step 1: a group with neither members nor offsets...");
+    let unknown = offset_commit_v8(&mut wire, &group, 5, "zz", 1, &entries).await?;
+    assert_eq!(unknown, answered(ILLEGAL_GENERATION), "no such group");
+    assert_eq!(committed_offset(&ctx, &group, &topic).await?, -1);
+
+    println!("Step 2: generation -1 commits, then the group is known by its offsets...");
+    let simple = offset_commit_v8(&mut wire, &group, -1, "", 1, &entries).await?;
+    assert_eq!(simple, answered(NONE), "generation -1");
+    assert_eq!(committed_offset(&ctx, &group, &topic).await?, 1);
+    let member = offset_commit_v8(&mut wire, &group, 5, "zz", 2, &entries).await?;
+    assert_eq!(
+        member,
+        answered(UNKNOWN_MEMBER_ID),
+        "offsets-only, generation 5"
+    );
+    let no_member = offset_commit_v8(&mut wire, &group, 0, "", 2, &entries).await?;
+    assert_eq!(
+        no_member,
+        answered(UNKNOWN_MEMBER_ID),
+        "offsets-only, generation 0"
+    );
+    assert_eq!(
+        committed_offset(&ctx, &group, &topic).await?,
+        1,
+        "refused commits store nothing"
+    );
+
+    println!("Step 3: a stale generation of a live group...");
+    let mut join = JoinGroupRequest::default();
+    join.group_id = GroupId(StrBytes::from_string(live.clone()));
+    join.session_timeout_ms = 30_000;
+    join.rebalance_timeout_ms = 30_000;
+    join.protocol_type = StrBytes::from_static_str("consumer");
+    let mut protocol = JoinGroupRequestProtocol::default();
+    protocol.name = StrBytes::from_static_str("range");
+    join.protocols = vec![protocol];
+    let joined: JoinGroupResponse = wire.call(3, &join).await?;
+    assert_eq!(joined.error_code, NONE);
+    let mut sync = SyncGroupRequest::default();
+    sync.group_id = join.group_id.clone();
+    sync.generation_id = joined.generation_id;
+    sync.member_id = joined.member_id.clone();
+    let synced: SyncGroupResponse = wire.call(3, &sync).await?;
+    assert_eq!(synced.error_code, NONE);
+    let member_id = joined.member_id.to_string();
+    let stale = offset_commit_v8(
+        &mut wire,
+        &live,
+        joined.generation_id + 1,
+        &member_id,
+        1,
+        &entries,
+    )
+    .await?;
+    assert_eq!(stale, answered(ILLEGAL_GENERATION), "stale generation");
+    assert_eq!(committed_offset(&ctx, &live, &topic).await?, -1);
+    println!("✅ 22 / 0 / 25 / 22 as Kafka answers them\n");
 
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");
