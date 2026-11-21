@@ -27,6 +27,13 @@ use tokio::net::TcpStream;
 /// The shipped default of `pg_kafka.fetch_poll_interval_ms` (the long-poll safety net).
 const DEFAULT_SAFETY_NET_MS: u64 = 1000;
 
+/// When the wake-up test produces, after the fetch started: 0.2 s past a safety-net re-run.
+const PRODUCE_AT: Duration = Duration::from_millis(2_200);
+/// How soon after the produce's ack a woken fetch must answer.
+const PROMPT: Duration = Duration::from_millis(300);
+/// Wake-up attempts before an inconclusive test fails.
+const ATTEMPTS: usize = 3;
+
 async fn produce_seed(topic: &str) -> Result<(), Box<dyn std::error::Error>> {
     let producer = create_producer()?;
     producer
@@ -56,14 +63,14 @@ async fn high_watermark(ctx: &TestContext, topic: &str) -> Result<i64, Box<dyn s
 }
 
 /// Start one raw long-poll Fetch (v4) on its own connection. Resolves to the time from
-/// just before the request was sent until its response arrived, and whether the response
-/// carried records.
+/// just before the request was sent until its response arrived, whether the response
+/// carried records, and the instant the response arrived.
 fn spawn_long_poll(
     topic: String,
     offset: i64,
     max_wait_ms: i32,
     isolation_level: i8,
-) -> tokio::task::JoinHandle<Result<(Duration, bool), String>> {
+) -> tokio::task::JoinHandle<Result<(Duration, bool, Instant), String>> {
     tokio::spawn(async move {
         let mut stream = TcpStream::connect(get_bootstrap_servers())
             .await
@@ -74,13 +81,14 @@ fn spawn_long_poll(
         let response = roundtrip(&mut stream, 4, 7, &request)
             .await
             .map_err(|e| format!("fetch failed: {e}"))?;
-        let elapsed = sent.elapsed();
+        let received = Instant::now();
+        let elapsed = received.duration_since(sent);
         let has_records = response.responses.iter().any(|t| {
             t.partitions
                 .iter()
                 .any(|p| p.records.as_ref().is_some_and(|r| !r.is_empty()))
         });
-        Ok((elapsed, has_records))
+        Ok((elapsed, has_records, received))
     })
 }
 
@@ -132,7 +140,7 @@ pub async fn test_listener_idle_long_poll_does_not_refetch() -> TestResult {
         )
         .await?;
 
-    let (elapsed, has_records) = fetch.await??;
+    let (elapsed, has_records, _) = fetch.await??;
     println!("   response after {elapsed:?}, has_records={has_records}");
 
     assert!(
@@ -158,8 +166,10 @@ pub async fn test_listener_idle_long_poll_does_not_refetch() -> TestResult {
 /// A produce must wake a waiting long poll at once, not at the next safety-net tick.
 ///
 /// The fetch waits at the log end (max_wait_ms = 10 s); the produce is sent 2.2 s later,
-/// i.e. 0.2 s after a safety-net tick (ticks at ~1 s, ~2 s, ~3 s). Notification delivery is
-/// well under 400 ms; the safety net alone would take ~800 ms.
+/// i.e. 0.2 s after a safety-net tick (ticks at ~1 s, ~2 s, ~3 s). The response must come
+/// within 300 ms of the produce's ack (both follow the same commit, so a slow fsync delays
+/// them alike); the safety net alone would deliver at the ~3 s tick. An ack landing within
+/// 300 ms of that tick cannot be told apart from it, and the attempt is repeated.
 pub async fn test_listener_produce_wakes_long_poll_promptly() -> TestResult {
     // Metadata for the test topic too.
     use rdkafka::producer::Producer;
@@ -169,7 +179,6 @@ pub async fn test_listener_produce_wakes_long_poll_promptly() -> TestResult {
     let ctx = TestContext::new().await?;
     let topic = ctx.unique_topic("listener-wake-lp").await;
     produce_seed(&topic).await?;
-    let hwm = high_watermark(&ctx, &topic).await?;
     let producer = create_producer()?;
     // Warm the producer up (connection + metadata) on another topic, so the timing
     // below measures the broker's wake-up and not a fresh client's first send.
@@ -185,44 +194,65 @@ pub async fn test_listener_produce_wakes_long_poll_promptly() -> TestResult {
         .client()
         .fetch_metadata(Some(&topic), Duration::from_secs(5))?;
 
-    println!("Step 1: long poll at offset {hwm} (max_wait_ms=10000)...");
-    let started = Instant::now();
-    let fetch = spawn_long_poll(topic.clone(), hwm, 10_000, 0);
+    // The fetch is woken by the produce's commit, so its response is measured from the
+    // produce's ack (sent after that same commit), which leaves the produce's own commit
+    // and fsync time out. The safety net re-runs the fetch about every
+    // DEFAULT_SAFETY_NET_MS from its start; an ack that lands so close to the next
+    // re-run that the two cannot be told apart makes the attempt inconclusive, and the
+    // test tries again.
+    let next_safety_net = Duration::from_millis(3 * DEFAULT_SAFETY_NET_MS);
+    for attempt in 1..=ATTEMPTS {
+        let hwm = high_watermark(&ctx, &topic).await?;
+        println!("Step 1 (attempt {attempt}/{ATTEMPTS}): long poll at offset {hwm} (max_wait_ms=10000)...");
+        let started = Instant::now();
+        let fetch = spawn_long_poll(topic.clone(), hwm, 10_000, 0);
 
-    tokio::time::sleep(Duration::from_millis(2_200)).await;
-    println!("Step 2: producing the wake-up record...");
-    let produce_started = started.elapsed();
-    producer
-        .send(
-            FutureRecord::to(&topic)
-                .key("wake")
-                .payload("wake")
-                .partition(0),
-            Duration::from_secs(5),
-        )
-        .await
-        .map_err(|(e, _)| e)?;
+        tokio::time::sleep(PRODUCE_AT).await;
+        println!("Step 2: producing the wake-up record...");
+        let produce_started = Instant::now();
+        producer
+            .send(
+                FutureRecord::to(&topic)
+                    .key("wake")
+                    .payload("wake")
+                    .partition(0),
+                Duration::from_secs(5),
+            )
+            .await
+            .map_err(|(e, _)| e)?;
+        let acked = Instant::now();
 
-    let (elapsed, has_records) = fetch.await??;
-    let after_produce = elapsed.saturating_sub(produce_started);
-    println!("   response {after_produce:?} after the produce started (total {elapsed:?})");
+        let (elapsed, has_records, received) = fetch.await??;
+        let after_ack = received.saturating_duration_since(acked);
+        println!(
+            "   produce acked {:?} after it started; response {after_ack:?} after the ack (fetch waited {elapsed:?})",
+            acked.duration_since(produce_started)
+        );
 
-    assert!(
-        has_records,
-        "the woken fetch must return the produced record"
-    );
-    assert!(
-        elapsed >= produce_started,
-        "the fetch must have waited for the produce"
-    );
-    assert!(
-        after_produce < Duration::from_millis(400),
-        "a produce must wake the waiting fetch at once; took {after_produce:?}"
-    );
-
-    ctx.cleanup().await?;
-    println!("✅ Test PASSED\n");
-    Ok(())
+        assert!(
+            has_records,
+            "the woken fetch must return the produced record"
+        );
+        assert!(
+            received >= produce_started,
+            "the fetch must have waited for the produce"
+        );
+        if acked.duration_since(started) + PROMPT >= next_safety_net {
+            println!("   the ack landed too close to the next safety-net re-run; retrying");
+            continue;
+        }
+        assert!(
+            after_ack < PROMPT,
+            "a produce must wake the waiting fetch at once; the response came {after_ack:?} after the ack"
+        );
+        ctx.cleanup().await?;
+        println!("✅ Test PASSED\n");
+        return Ok(());
+    }
+    Err(format!(
+        "every attempt's ack landed within {PROMPT:?} of a safety-net re-run; the wake-up could not be measured"
+    )
+    .into())
 }
 
 /// A read_committed long poll must return promptly after the transaction commits.
@@ -263,7 +293,7 @@ pub async fn test_listener_read_committed_long_poll_wakes_on_commit() -> TestRes
     let commit_started = started.elapsed();
     producer.commit_transaction(Duration::from_secs(10))?;
 
-    let (elapsed, has_records) = fetch.await??;
+    let (elapsed, has_records, _) = fetch.await??;
     let after_commit = elapsed.saturating_sub(commit_started);
     println!("   response {after_commit:?} after the commit started (total {elapsed:?})");
 
