@@ -294,6 +294,15 @@ pub fn topic_config_from_row<R: ConfigColumns>(
 /// probe that finds the partitions with a due row and the select that takes
 /// them, so the two cannot disagree. `$2` is the retry cap, `$6`/`$7` the
 /// backoff base and max, `inf` the in-flight rows.
+///
+/// The in-flight rows are excluded with `NOT IN (SELECT ... FROM inf)`, not a
+/// correlated `NOT EXISTS`: Postgres runs the uncorrelated `NOT IN` as a hashed
+/// subplan built once per claim, while the `NOT EXISTS` was planned as a nested
+/// loop anti join that scanned all of `inf` for every pending row it passed. With
+/// thousands of rows in flight (up to `MAX_INFLIGHT`) at the head of a backlog, that
+/// made each claim O(in flight x scanned): a claim behind 8 000 in-flight rows of
+/// a 20 000-row backlog took 5.3 s that way, 0.26 s this way.
+/// Every column on both sides is NOT NULL, so `NOT IN` means exactly `NOT EXISTS`.
 macro_rules! due_rows_of_partition {
     () => {
         r"
@@ -314,13 +323,178 @@ macro_rules! due_rows_of_partition {
                                    AND st.forwarded_at > NOW() - make_interval(secs =>
                                        LEAST($6::float8 * power(2::float8, LEAST(st.retry_count - 1, 30)),
                                              $7::float8) / 1000.0))
-                          AND NOT EXISTS (
-                              SELECT 1 FROM inf
-                              WHERE inf.t = st.topic_id AND inf.p = st.partition_id
-                                AND inf.o = st.local_offset)
+                          AND (st.topic_id, st.partition_id, st.local_offset)
+                              NOT IN (SELECT inf.t, inf.p, inf.o FROM inf)
                         "
     };
 }
+
+/// The outbox claim (`SpiShadowDb::claim_due_outbox_rows`); its parameters are listed there.
+const CLAIM_DUE_OUTBOX_ROWS_SQL: &str = concat!(
+    r"
+        WITH RECURSIVE inf AS (
+            SELECT * FROM unnest($3::int4[], $4::int4[], $5::int8[]) AS i(t, p, o)
+        ),
+        -- The partitions with pending rows, found by a skip scan of the
+        -- pending index: one probe per partition, not one per row.
+        parts AS (
+            (SELECT st.topic_id, st.partition_id
+             FROM kafka.shadow_tracking st
+             WHERE st.external_offset IS NULL
+             ORDER BY st.topic_id, st.partition_id
+             LIMIT 1)
+            UNION ALL
+            SELECT nxt.topic_id, nxt.partition_id
+            FROM parts
+            CROSS JOIN LATERAL (
+                SELECT st.topic_id, st.partition_id
+                FROM kafka.shadow_tracking st
+                WHERE st.external_offset IS NULL
+                  AND (st.topic_id, st.partition_id) > (parts.topic_id, parts.partition_id)
+                ORDER BY st.topic_id, st.partition_id
+                LIMIT 1
+            ) nxt
+        ),
+        -- The first backing-off row of each partition: it failed, its
+        -- attempt is closed and its backoff has not passed. Only failed
+        -- rows are looked at (idx_shadow_tracking_retrying), so this does
+        -- not grow with the backlog.
+        blocked AS MATERIALIZED (
+            SELECT st.topic_id, st.partition_id, MIN(st.local_offset) AS first_blocked
+            FROM kafka.shadow_tracking st
+            WHERE st.external_offset IS NULL
+              AND st.retry_count > 0
+              AND st.retry_count < $2
+              AND NOT st.attempt_open
+              AND st.forwarded_at > NOW() - make_interval(secs =>
+                  LEAST($6::float8 * power(2::float8, LEAST(st.retry_count - 1, 30)),
+                        $7::float8) / 1000.0)
+              AND (st.topic_id, st.partition_id, st.local_offset)
+                  NOT IN (SELECT inf.t, inf.p, inf.o FROM inf)
+            GROUP BY st.topic_id, st.partition_id
+        ),
+        -- The partitions with a row due now (one probe each). Only they
+        -- share the batch: a partition holding only dead letters, orphan
+        -- pointers, or rows in flight or backing off would otherwise take
+        -- a share it cannot use, and with many of them a backlog elsewhere
+        -- would get a few rows per claim.
+        due_parts AS MATERIALIZED (
+            SELECT p.topic_id, p.partition_id
+            FROM parts p
+            LEFT JOIN blocked b
+              ON b.topic_id = p.topic_id AND b.partition_id = p.partition_id
+            WHERE EXISTS (SELECT 1 ",
+    due_rows_of_partition!(),
+    r")
+        ),
+        -- Each partition's share of the batch (see per_partition_claim_cap).
+        share AS (
+            SELECT GREATEST(1, CEIL($1::numeric / GREATEST(COUNT(*), 1)))::int8 AS k
+            FROM due_parts
+        ),
+        -- Due rows: the first k of each partition in offset order (read
+        -- from the pending index and cut at k, so the cost is
+        -- O(partitions + limit), not O(backlog)), then taken round-robin
+        -- across partitions up to the limit, so one partition's backlog
+        -- cannot fill every claim while the others wait.
+        due AS (
+            SELECT d.topic_id, d.partition_id, d.local_offset
+            FROM due_parts p
+            CROSS JOIN share
+            LEFT JOIN blocked b
+              ON b.topic_id = p.topic_id AND b.partition_id = p.partition_id
+            CROSS JOIN LATERAL (
+                SELECT st.topic_id, st.partition_id, st.local_offset,
+                       row_number() OVER (ORDER BY st.local_offset) AS rn
+                ",
+    due_rows_of_partition!(),
+    r"
+                ORDER BY st.local_offset
+                LIMIT share.k
+            ) d
+            ORDER BY d.rn, d.topic_id, d.partition_id
+            LIMIT $1
+        ),
+        -- Each due partition's head: its lowest pending, non-dead row whose
+        -- message exists. A claimed row restarts its partition when nothing
+        -- lies below it, i.e. when it is at or below the head. Found once per
+        -- partition, not once per claimed row: every probe walks the pending
+        -- index from the partition's start, past the entries of rows forwarded
+        -- since the last vacuum, so a per-row probe made a claim cost
+        -- O(claimed x forwarded). MATERIALIZED: inlined, the planner put it
+        -- inside the update's nested loop and probed it once per row again.
+        heads AS MATERIALIZED (
+            SELECT p.topic_id, p.partition_id, h.local_offset AS head
+            FROM due_parts p
+            CROSS JOIN LATERAL (
+                SELECT lo.local_offset
+                FROM kafka.shadow_tracking lo
+                CROSS JOIN LATERAL (
+                    SELECT 1 FROM kafka.messages m
+                    WHERE m.topic_id = lo.topic_id
+                      AND m.partition_id = lo.partition_id
+                      AND m.partition_offset = lo.local_offset
+                    LIMIT 1
+                ) lo_message
+                WHERE lo.topic_id = p.topic_id
+                  AND lo.partition_id = p.partition_id
+                  AND lo.external_offset IS NULL
+                  AND lo.retry_count < $2
+                ORDER BY lo.local_offset
+                LIMIT 1
+            ) h
+        ),
+        claimed AS (
+            -- An attempt that is still open here lost its ack (the worker
+            -- restarted, or the in-flight entry was evicted): count it as
+            -- one failure so a forward that never answers still reaches
+            -- the dead-letter cap. A fresh claim counts nothing; real
+            -- failures are counted by their ack.
+            UPDATE kafka.shadow_tracking st
+            SET forwarded_at = NOW(),
+                attempt_open = true,
+                retry_count = st.retry_count + CASE WHEN st.attempt_open THEN 1 ELSE 0 END
+            FROM due
+            LEFT JOIN heads h
+              ON h.topic_id = due.topic_id AND h.partition_id = due.partition_id
+            WHERE st.topic_id = due.topic_id
+              AND st.partition_id = due.partition_id
+              AND st.local_offset = due.local_offset
+            RETURNING st.topic_id, st.partition_id, st.local_offset,
+                      -- restart: no lower pending, non-dead row of the
+                      -- partition whose message exists (the partition head).
+                      (h.head IS NULL OR h.head >= st.local_offset) AS restart
+        )
+        SELECT c.topic_id    AS topic_id,
+               c.partition_id AS partition_id,
+               c.local_offset AS local_offset,
+               c.restart      AS restart,
+               m.key          AS msg_key,
+               m.value        AS msg_value,
+               m.headers::text AS headers_json,
+               CASE WHEN m.timestamp_ms >= 0 THEN m.timestamp_ms
+                    ELSE (EXTRACT(EPOCH FROM m.created_at) * 1000)::bigint END AS ts,
+               COALESCE(sc.external_topic_name, t.name) AS external_topic,
+               share.k        AS share
+        FROM claimed c
+        CROSS JOIN share
+        JOIN kafka.topics t ON t.id = c.topic_id
+        LEFT JOIN kafka.shadow_config sc ON sc.topic_id = c.topic_id
+        -- LATERAL + LIMIT 1: one index probe per claimed row. A plain join
+        -- is planned from the CTE's 1-row estimate and matched every
+        -- claimed row against all of the topic's messages (5 s for 1000
+        -- rows of a 20 000-row backlog).
+        JOIN LATERAL (
+            SELECT m.key, m.value, m.headers, m.timestamp_ms, m.created_at
+            FROM kafka.messages m
+            WHERE m.topic_id = c.topic_id
+              AND m.partition_id = c.partition_id
+              AND m.partition_offset = c.local_offset
+            LIMIT 1
+        ) m ON true
+        ORDER BY c.topic_id, c.partition_id, c.local_offset
+        "
+);
 
 /// Production [`ShadowDb`]: SPI and the real GUCs.
 #[derive(Debug, Default, Clone, Copy)]
@@ -497,156 +671,7 @@ impl ShadowDb for SpiShadowDb {
             (claim.backoff_base_ms as f64, claim.backoff_max_ms as f64);
         Spi::connect_mut(|client| {
             let table = client.update(
-                concat!(
-                    r"
-                WITH RECURSIVE inf AS (
-                    SELECT * FROM unnest($3::int4[], $4::int4[], $5::int8[]) AS i(t, p, o)
-                ),
-                -- The partitions with pending rows, found by a skip scan of the
-                -- pending index: one probe per partition, not one per row.
-                parts AS (
-                    (SELECT st.topic_id, st.partition_id
-                     FROM kafka.shadow_tracking st
-                     WHERE st.external_offset IS NULL
-                     ORDER BY st.topic_id, st.partition_id
-                     LIMIT 1)
-                    UNION ALL
-                    SELECT nxt.topic_id, nxt.partition_id
-                    FROM parts
-                    CROSS JOIN LATERAL (
-                        SELECT st.topic_id, st.partition_id
-                        FROM kafka.shadow_tracking st
-                        WHERE st.external_offset IS NULL
-                          AND (st.topic_id, st.partition_id) > (parts.topic_id, parts.partition_id)
-                        ORDER BY st.topic_id, st.partition_id
-                        LIMIT 1
-                    ) nxt
-                ),
-                -- The first backing-off row of each partition: it failed, its
-                -- attempt is closed and its backoff has not passed. Only failed
-                -- rows are looked at (idx_shadow_tracking_retrying), so this does
-                -- not grow with the backlog.
-                blocked AS MATERIALIZED (
-                    SELECT st.topic_id, st.partition_id, MIN(st.local_offset) AS first_blocked
-                    FROM kafka.shadow_tracking st
-                    WHERE st.external_offset IS NULL
-                      AND st.retry_count > 0
-                      AND st.retry_count < $2
-                      AND NOT st.attempt_open
-                      AND st.forwarded_at > NOW() - make_interval(secs =>
-                          LEAST($6::float8 * power(2::float8, LEAST(st.retry_count - 1, 30)),
-                                $7::float8) / 1000.0)
-                      AND NOT EXISTS (
-                          SELECT 1 FROM inf
-                          WHERE inf.t = st.topic_id AND inf.p = st.partition_id
-                            AND inf.o = st.local_offset)
-                    GROUP BY st.topic_id, st.partition_id
-                ),
-                -- The partitions with a row due now (one probe each). Only they
-                -- share the batch: a partition holding only dead letters, orphan
-                -- pointers, or rows in flight or backing off would otherwise take
-                -- a share it cannot use, and with many of them a backlog elsewhere
-                -- would get a few rows per claim.
-                due_parts AS MATERIALIZED (
-                    SELECT p.topic_id, p.partition_id
-                    FROM parts p
-                    LEFT JOIN blocked b
-                      ON b.topic_id = p.topic_id AND b.partition_id = p.partition_id
-                    WHERE EXISTS (SELECT 1 ",
-                    due_rows_of_partition!(),
-                    r")
-                ),
-                -- Each partition's share of the batch (see per_partition_claim_cap).
-                share AS (
-                    SELECT GREATEST(1, CEIL($1::numeric / GREATEST(COUNT(*), 1)))::int8 AS k
-                    FROM due_parts
-                ),
-                -- Due rows: the first k of each partition in offset order (read
-                -- from the pending index and cut at k, so the cost is
-                -- O(partitions + limit), not O(backlog)), then taken round-robin
-                -- across partitions up to the limit, so one partition's backlog
-                -- cannot fill every claim while the others wait.
-                due AS (
-                    SELECT d.topic_id, d.partition_id, d.local_offset
-                    FROM due_parts p
-                    CROSS JOIN share
-                    LEFT JOIN blocked b
-                      ON b.topic_id = p.topic_id AND b.partition_id = p.partition_id
-                    CROSS JOIN LATERAL (
-                        SELECT st.topic_id, st.partition_id, st.local_offset,
-                               row_number() OVER (ORDER BY st.local_offset) AS rn
-                        ",
-                    due_rows_of_partition!(),
-                    r"
-                        ORDER BY st.local_offset
-                        LIMIT share.k
-                    ) d
-                    ORDER BY d.rn, d.topic_id, d.partition_id
-                    LIMIT $1
-                ),
-                claimed AS (
-                    -- An attempt that is still open here lost its ack (the worker
-                    -- restarted, or the in-flight entry was evicted): count it as
-                    -- one failure so a forward that never answers still reaches
-                    -- the dead-letter cap. A fresh claim counts nothing; real
-                    -- failures are counted by their ack.
-                    UPDATE kafka.shadow_tracking st
-                    SET forwarded_at = NOW(),
-                        attempt_open = true,
-                        retry_count = st.retry_count + CASE WHEN st.attempt_open THEN 1 ELSE 0 END
-                    FROM due
-                    WHERE st.topic_id = due.topic_id
-                      AND st.partition_id = due.partition_id
-                      AND st.local_offset = due.local_offset
-                    RETURNING st.topic_id, st.partition_id, st.local_offset,
-                              -- restart: no lower pending, non-dead row of the
-                              -- partition whose message exists (the partition head).
-                              NOT EXISTS (
-                                  SELECT 1 FROM kafka.shadow_tracking lo
-                                  CROSS JOIN LATERAL (
-                                      SELECT 1 FROM kafka.messages m
-                                      WHERE m.topic_id = lo.topic_id
-                                        AND m.partition_id = lo.partition_id
-                                        AND m.partition_offset = lo.local_offset
-                                      LIMIT 1
-                                  ) lo_message
-                                  WHERE lo.topic_id = st.topic_id
-                                    AND lo.partition_id = st.partition_id
-                                    AND lo.local_offset < st.local_offset
-                                    AND lo.external_offset IS NULL
-                                    AND lo.retry_count < $2
-                              ) AS restart
-                )
-                SELECT c.topic_id    AS topic_id,
-                       c.partition_id AS partition_id,
-                       c.local_offset AS local_offset,
-                       c.restart      AS restart,
-                       m.key          AS msg_key,
-                       m.value        AS msg_value,
-                       m.headers::text AS headers_json,
-                       CASE WHEN m.timestamp_ms >= 0 THEN m.timestamp_ms
-                            ELSE (EXTRACT(EPOCH FROM m.created_at) * 1000)::bigint END AS ts,
-                       COALESCE(sc.external_topic_name, t.name) AS external_topic,
-                       share.k        AS share
-                FROM claimed c
-                CROSS JOIN share
-                JOIN kafka.topics t ON t.id = c.topic_id
-                LEFT JOIN kafka.shadow_config sc ON sc.topic_id = c.topic_id
-                -- LATERAL + LIMIT 1: one index probe per claimed row. A plain join
-                -- is planned from the CTE's 1-row estimate and matched every
-                -- claimed row against all of the topic's messages (5 s for 1000
-                -- rows of a 20 000-row backlog).
-                JOIN LATERAL (
-                    SELECT m.key, m.value, m.headers, m.timestamp_ms, m.created_at
-                    FROM kafka.messages m
-                    WHERE m.topic_id = c.topic_id
-                      AND m.partition_id = c.partition_id
-                      AND m.partition_offset = c.local_offset
-                    LIMIT 1
-                ) m ON true
-                ORDER BY c.topic_id, c.partition_id, c.local_offset
-                "
-                ),
+                CLAIM_DUE_OUTBOX_ROWS_SQL,
                 None,
                 &[
                     claim.batch_limit.into(),
@@ -872,6 +897,45 @@ mod tests {
     use super::*;
     use crate::kafka::shadow::config::{ShadowMode, SyncMode, WriteMode};
     use std::collections::HashMap;
+
+    /// The claim's cost must not grow with the rows in flight or with the claim's
+    /// size beyond linear (the E2E `test_shadow_claims_stay_fast_with_a_full_in_flight_window`
+    /// times it; the plan itself needs SPI): the in-flight rows are excluded by an
+    /// uncorrelated NOT IN, which Postgres hashes once per claim, never by a
+    /// correlated scan of `inf` per pending row; and the restart flag reads each
+    /// partition's head once (a materialized CTE), not a probe per claimed row.
+    #[test]
+    fn the_claim_has_no_per_row_scan_of_the_in_flight_rows() {
+        let sql: String = CLAIM_DUE_OUTBOX_ROWS_SQL
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let sql = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            !sql.contains("SELECT 1 FROM inf"),
+            "correlated in-flight scan: {sql}"
+        );
+        assert_eq!(
+            sql.matches("FROM inf").count(),
+            sql.matches("NOT IN (SELECT inf.t, inf.p, inf.o FROM inf)")
+                .count(),
+            "every read of inf is an uncorrelated NOT IN"
+        );
+        assert_eq!(
+            sql.matches("NOT IN (SELECT inf.t, inf.p, inf.o FROM inf)")
+                .count(),
+            3
+        );
+        assert!(sql.contains("heads AS MATERIALIZED ("));
+        assert!(sql.contains("(h.head IS NULL OR h.head >= st.local_offset) AS restart"));
+        let returning = &sql[sql.find("RETURNING").expect("the claim returns its rows")..];
+        let returning = &returning[..returning.find(") SELECT").expect("the claimed CTE ends")];
+        assert!(
+            !returning.contains("SELECT"),
+            "no subquery per claimed row in RETURNING: {returning}"
+        );
+    }
 
     /// A config row: a column is a value, NULL, or unreadable (`Err`).
     #[derive(Default)]
