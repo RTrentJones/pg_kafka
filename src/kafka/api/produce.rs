@@ -30,8 +30,8 @@ use crate::kafka::messages::{
 use crate::kafka::notifications::InternalNotification;
 use crate::kafka::protocol::decode_budget::{
     decode_wait, DecodeBudget, DecodedCharge, Exhausted, HeldFrame, NotRun, DECODED,
-    INLINE_DECODE_BYTES, INLINE_DECODE_WORK_BYTES, LARGE_DECODES, MAX_DECODED_REQUEST_BYTES,
-    SLOT_DECODE_WORK_BYTES,
+    INLINE_DECODE_BYTES, INLINE_DECODE_TIME, INLINE_DECODE_WORK_BYTES, LARGE_DECODES,
+    MAX_DECODED_REQUEST_BYTES, SLOT_DECODE_TIME, SLOT_DECODE_WORK_BYTES,
 };
 use crate::kafka::protocol::{
     first_batch_is_transactional, least_decoded_memory, parse_record_batch_with_metadata,
@@ -348,8 +348,9 @@ const MIN_ZSTD_VERSION: i16 = 7;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DecodeFailure {
     /// A partition takes more memory than the inline limit leaves it
-    /// ([`INLINE_DECODE_BYTES`]): the request decodes again under a large-decode slot,
-    /// where a partition that does not fit is refused on its own.
+    /// ([`INLINE_DECODE_BYTES`]), or the decode more work or time than an I/O thread may
+    /// give it: the request decodes again under a large-decode slot, where a partition
+    /// that does not fit is refused on its own.
     TooLarge,
     /// The process-wide decode budget lacks room: it needs this much free in all.
     Busy(usize),
@@ -439,6 +440,13 @@ fn decode_partition(
         // are refused without decoding.
         return Ok(Err(ERROR_MESSAGE_TOO_LARGE));
     }
+    if budget.check_time().is_err() {
+        // The request decoded as long as it may.
+        return match over_limit {
+            OverLimit::Retry => Err(DecodeFailure::TooLarge),
+            OverLimit::Refuse => Ok(Err(ERROR_REQUEST_TIMED_OUT)),
+        };
+    }
     let mark = budget.charged();
     let e = match parse_record_batch_with_metadata(batch, budget) {
         Ok(parsed) => return Ok(Ok(parsed)),
@@ -446,10 +454,13 @@ fn decode_partition(
     };
     let code = match budget.exhausted() {
         Some(Exhausted::Global) => return Err(DecodeFailure::Busy(budget.wanted())),
-        Some(Exhausted::Limit | Exhausted::Work) if over_limit == OverLimit::Retry => {
+        Some(Exhausted::Limit | Exhausted::Work | Exhausted::Time)
+            if over_limit == OverLimit::Retry =>
+        {
             return Err(DecodeFailure::TooLarge)
         }
         Some(Exhausted::Limit | Exhausted::Work) => ERROR_MESSAGE_TOO_LARGE,
+        Some(Exhausted::Time) => ERROR_REQUEST_TIMED_OUT,
         None => match e {
             KafkaError::InvalidRecord { .. } | KafkaError::Protocol { .. } => {
                 e.to_kafka_error_code()
@@ -623,12 +634,14 @@ fn record_bytes(topics: &[WireTopicProduceData]) -> usize {
         .fold(0, usize::saturating_add)
 }
 
-/// The budget of a decode on an I/O thread: at most [`INLINE_DECODE_BYTES`] held and
-/// [`INLINE_DECODE_WORK_BYTES`] decoded, so that partitions refused after they decode cannot
-/// keep the thread decoding (past either the request decodes again under a large-decode
-/// slot).
+/// The budget of a decode on an I/O thread: at most [`INLINE_DECODE_BYTES`] held,
+/// [`INLINE_DECODE_WORK_BYTES`] decoded and [`INLINE_DECODE_TIME`] spent, so that neither
+/// partitions refused after they decode nor input that decodes to little can keep the
+/// thread decoding (past any of them the request decodes again under a large-decode slot).
 fn inline_budget() -> DecodeBudget {
-    DecodeBudget::new(INLINE_DECODE_BYTES).limit_work(INLINE_DECODE_WORK_BYTES)
+    DecodeBudget::new(INLINE_DECODE_BYTES)
+        .limit_work(INLINE_DECODE_WORK_BYTES)
+        .limit_time(INLINE_DECODE_TIME)
 }
 
 /// The entries of a Produce request, one per partition ([`last_entry_per_partition`]).
@@ -885,7 +898,8 @@ async fn decode_pending(pending: &PendingRecords) -> Result<DecodedTopics, Decod
                             &topics,
                             zstd_allowed,
                             DecodeBudget::new(MAX_DECODED_REQUEST_BYTES)
-                                .limit_work(SLOT_DECODE_WORK_BYTES),
+                                .limit_work(SLOT_DECODE_WORK_BYTES)
+                                .limit_time(SLOT_DECODE_TIME),
                             OverLimit::Refuse,
                         )
                     })
@@ -1362,6 +1376,50 @@ mod tests {
         assert!(
             growth < 8.0,
             "echo: 4x the topics took {growth:.1}x the time"
+        );
+    }
+
+    /// Input that decodes to nothing (1.7 MB of empty gzip blocks, some 0.35 s to decode)
+    /// leaves an I/O thread after the inline decode time and decodes again under a slot,
+    /// where the decode time refuses it and the partitions after it REQUEST_TIMED_OUT.
+    #[test]
+    fn input_that_decodes_to_nothing_is_bounded_by_the_decode_time() {
+        use crate::kafka::protocol::recordbatch_test_batches::gzip_empty_blocks_batch;
+        let batch = gzip_empty_blocks_batch(150_000);
+        let data = topics(vec![batch.clone(), batch.clone(), batch]);
+        let (decode, spent) = crate::testing::cpu_time(|| decode_all_records(&data, true));
+        assert!(
+            matches!(decode, Ok(Decode::Pending(Wait::Slot))),
+            "{decode:?}"
+        );
+        assert!(
+            spent < INLINE_DECODE_TIME + std::time::Duration::from_millis(80),
+            "{spent:?} on the I/O thread"
+        );
+
+        let limit = std::time::Duration::from_millis(30);
+        let slot = DecodeBudget::new(MAX_DECODED_REQUEST_BYTES)
+            .limit_work(SLOT_DECODE_WORK_BYTES)
+            .limit_time(limit);
+        let (decoded, spent) =
+            crate::testing::cpu_time(|| decode_records(&data, true, slot, OverLimit::Refuse));
+        let DecodedTopics(topic_data, refused, _) = decoded.unwrap();
+        assert!(topic_data.is_empty());
+        let codes: Vec<(i32, i16)> = refused
+            .iter()
+            .map(|r| (r.partition, r.error_code))
+            .collect();
+        assert_eq!(
+            codes,
+            vec![
+                (0, ERROR_REQUEST_TIMED_OUT),
+                (1, ERROR_REQUEST_TIMED_OUT),
+                (2, ERROR_REQUEST_TIMED_OUT)
+            ]
+        );
+        assert!(
+            spent < limit + std::time::Duration::from_millis(80),
+            "{spent:?} in the slot"
         );
     }
 

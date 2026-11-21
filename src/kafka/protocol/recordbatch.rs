@@ -377,8 +377,9 @@ fn zstd_frame_window(frame: &[u8]) -> anyhow::Result<u64> {
 /// The largest window any frame of `data` declares; past 2^[`ZSTD_WINDOW_LOG_MAX`] the data
 /// is refused before the decoder reserves anything. A frame the walk cannot measure ends it:
 /// the decoder reports what is wrong with it.
-fn zstd_window(mut data: &[u8]) -> anyhow::Result<usize> {
+fn zstd_window(mut data: &[u8], budget: &DecodeBudget) -> anyhow::Result<usize> {
     let mut largest = 0u64;
+    let mut clock = InputClock::new(budget);
     while !data.is_empty() {
         largest = largest.max(zstd_frame_window(data)?);
         anyhow::ensure!(
@@ -386,7 +387,10 @@ fn zstd_window(mut data: &[u8]) -> anyhow::Result<usize> {
             "zstd frame declares a window of {largest} bytes"
         );
         match zstd::zstd_safe::find_frame_compressed_size(data) {
-            Ok(len) if len > 0 && len <= data.len() => data = &data[len..],
+            Ok(len) if len > 0 && len <= data.len() => {
+                clock.consumed(len)?;
+                data = &data[len..];
+            }
             _ => break,
         }
     }
@@ -471,6 +475,52 @@ impl Write for BudgetedWriter<'_> {
     }
 }
 
+/// The compressed input a decoder reads between checks of its decode's time
+/// ([`DecodeBudget::check_time`]): at some 200 ns per byte, the slowest input known (gzip of
+/// empty blocks), about 3 ms of decoding.
+const INPUT_CHUNK: usize = 16 * 1024;
+
+/// Counts the compressed input a decode consumed, checking its time at the first input and
+/// then once per [`INPUT_CHUNK`].
+struct InputClock<'a> {
+    budget: &'a DecodeBudget,
+    since_check: usize,
+}
+
+impl<'a> InputClock<'a> {
+    fn new(budget: &'a DecodeBudget) -> Self {
+        Self {
+            budget,
+            since_check: INPUT_CHUNK,
+        }
+    }
+
+    /// `n` more bytes consumed; fails once the decode's time has passed.
+    fn consumed(&mut self, n: usize) -> io::Result<()> {
+        self.since_check += n;
+        if self.since_check >= INPUT_CHUNK {
+            self.since_check = 0;
+            self.budget.check_time().map_err(|_| over_budget())?;
+        }
+        Ok(())
+    }
+}
+
+/// A decoder's compressed input, read at most [`INPUT_CHUNK`] at a time with the decode's
+/// time checked before each read.
+struct MeteredInput<'a, R> {
+    inner: R,
+    budget: &'a DecodeBudget,
+}
+
+impl<R: io::Read> io::Read for MeteredInput<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.budget.check_time().map_err(|_| over_budget())?;
+        let n = buf.len().min(INPUT_CHUNK);
+        self.inner.read(&mut buf[..n])
+    }
+}
+
 /// The xerial framing Kafka's Java client wraps snappy data in: magic, version, compatible
 /// version, then `[length u32][raw snappy block]` repeated.
 const XERIAL_SNAPPY_HEADER: &[u8; 16] = b"\x82SNAPPY\x00\x00\x00\x00\x01\x00\x00\x00\x01";
@@ -515,9 +565,12 @@ impl std::error::Error for NeverFits {}
 /// the output allocated once at that size, before any block decodes.
 fn decompress_snappy(data: &Bytes, budget: &DecodeBudget) -> anyhow::Result<Bytes> {
     use snap::raw::{decompress_len, Decoder};
+    let mut clock = InputClock::new(budget);
     let mut total = 0usize;
     for block in snappy_blocks(data) {
-        total = total.saturating_add(decompress_len(block?)?);
+        let block = block?;
+        clock.consumed(block.len() + 4)?;
+        total = total.saturating_add(decompress_len(block)?);
     }
     if total > MAX_DECODED_REQUEST_BYTES {
         return Err(NeverFits(total).into());
@@ -527,6 +580,7 @@ fn decompress_snappy(data: &Bytes, budget: &DecodeBudget) -> anyhow::Result<Byte
     let mut at = 0;
     for block in snappy_blocks(data) {
         let block = block?;
+        clock.consumed(block.len() + 4)?;
         let len = decompress_len(block)?;
         Decoder::new().decompress(block, &mut out[at..at + len])?;
         at += len;
@@ -548,17 +602,28 @@ fn decompress(
         }
         Compression::Gzip => {
             let mut decoder = flate2::write::GzDecoder::new(&mut out);
-            decoder.write_all(&data)?;
+            for chunk in data.chunks(INPUT_CHUNK) {
+                budget.check_time().map_err(|_| over_budget())?;
+                decoder.write_all(chunk)?;
+            }
             decoder.finish()?;
         }
         Compression::Snappy => return decompress_snappy(&data, budget),
         Compression::Lz4 => {
-            let mut decoder = lz4::Decoder::new(data.reader())?;
+            let input = MeteredInput {
+                inner: data.reader(),
+                budget,
+            };
+            let mut decoder = lz4::Decoder::new(input)?;
             io::copy(&mut decoder, &mut out)?;
         }
         Compression::Zstd => {
-            out = BudgetedWriter::with_window(budget, zstd_window(&data)?);
-            let mut decoder = zstd::stream::read::Decoder::new(data.reader())?;
+            out = BudgetedWriter::with_window(budget, zstd_window(&data, budget)?);
+            let input = MeteredInput {
+                inner: data.reader(),
+                budget,
+            };
+            let mut decoder = zstd::stream::read::Decoder::new(input)?;
             decoder.window_log_max(ZSTD_WINDOW_LOG_MAX)?;
             io::copy(&mut decoder, &mut out)?;
         }
@@ -854,6 +919,7 @@ mod tests {
     use bytes::{Bytes, BytesMut};
 
     use crate::kafka::protocol::decode_budget::{Exhausted, MAX_DECODED_REQUEST_BYTES};
+    use std::time::Duration;
 
     fn budget() -> DecodeBudget {
         DecodeBudget::new(MAX_DECODED_REQUEST_BYTES)
@@ -898,6 +964,76 @@ mod tests {
         Compression::Lz4,
         Compression::Zstd,
     ];
+
+    /// Every codec checks the decode's time as it reads its input: with no time left a
+    /// batch stops at its first check, refused at the limit, whatever its codec.
+    #[test]
+    fn every_codec_stops_when_the_decode_time_has_passed() {
+        for compression in CODECS {
+            let batch = zeros_batch(100_000, compression);
+            assert!(
+                parse_record_batch(&batch, &budget().limit_time(Duration::from_secs(60))).is_ok()
+            );
+            if compression == Compression::None {
+                continue;
+            }
+            let budget = budget().limit_time(Duration::ZERO);
+            let err = parse_record_batch(&batch, &budget).unwrap_err();
+            assert_eq!(
+                budget.exhausted(),
+                Some(Exhausted::Time),
+                "{compression:?}: {err}"
+            );
+            assert!(budget.out_of_time());
+        }
+    }
+
+    /// Input that decodes to nothing is bounded by the decode's time: 1.7 MB of empty
+    /// gzip blocks (some 0.35 s of decoding, charging nothing) stops at a 20 ms limit after
+    /// at most one more chunk of input, and snappy's and zstd's framing walks do too.
+    #[test]
+    fn input_that_decodes_to_nothing_stops_at_the_decode_time() {
+        use super::test_batches::gzip_empty_blocks_batch;
+        let limit = Duration::from_millis(20);
+        let gzip = gzip_empty_blocks_batch(150_000);
+        assert!(gzip.len() > 1_500_000, "{} bytes", gzip.len());
+        let mut snappy = XERIAL_SNAPPY_HEADER.to_vec();
+        for _ in 0..400_000 {
+            snappy.extend_from_slice(&[0, 0, 0, 1, 0]);
+        }
+        let snappy = batch_with(
+            &snappy,
+            1,
+            Header {
+                attributes: 2,
+                ..Header::default()
+            },
+        );
+        let empty_zstd = zstd::bulk::compress(&[], 1).unwrap();
+        let zstd = batch_with(
+            &empty_zstd.repeat(200_000),
+            1,
+            Header {
+                attributes: 4,
+                ..Header::default()
+            },
+        );
+        for (name, batch) in [("gzip", gzip), ("snappy", snappy), ("zstd", zstd)] {
+            let budget = budget().limit_time(limit);
+            let (err, spent) = crate::testing::cpu_time(|| parse_record_batch(&batch, &budget));
+            assert!(err.is_err(), "{name}");
+            assert_eq!(budget.exhausted(), Some(Exhausted::Time), "{name}");
+            assert_eq!(
+                budget.charged(),
+                RECORD_MEMORY,
+                "{name}: only the record charged"
+            );
+            assert!(
+                spent < limit + Duration::from_millis(80),
+                "{name}: {spent:?}"
+            );
+        }
+    }
 
     #[test]
     fn every_codec_decodes_within_the_budget_and_charges_what_it_decoded() {
@@ -1235,7 +1371,7 @@ mod tests {
         for window_log in [21, 25, 27] {
             let frame = zstd_frame(&data, 22, window_log);
             assert_eq!(
-                zstd_window(&frame).unwrap(),
+                zstd_window(&frame, &budget()).unwrap(),
                 1 << window_log,
                 "window 2^{window_log}"
             );
@@ -1269,10 +1405,10 @@ mod tests {
         let mut frames = vec![0x50, 0x2A, 0x4D, 0x18, 3, 0, 0, 0, 1, 2, 3];
         frames.extend(zstd_frame(b"small", 3, 10));
         frames.extend(zstd_frame(b"large", 3, 26));
-        assert_eq!(zstd_window(&frames).unwrap(), 1 << 26);
+        assert_eq!(zstd_window(&frames, &budget()).unwrap(), 1 << 26);
         // A single-segment frame's window is its content size.
         let single = zstd::bulk::compress(&[1u8; 3000], 3).unwrap();
-        assert_eq!(zstd_window(&single).unwrap(), 3000);
+        assert_eq!(zstd_window(&single, &budget()).unwrap(), 3000);
     }
 
     #[test]
@@ -1591,7 +1727,7 @@ mod tests {
         assert_eq!(code(&err), ERROR_MESSAGE_TOO_LARGE, "{err}");
         assert_eq!(budget.exhausted(), None, "{err}");
         assert_eq!(budget.charged(), 0, "nothing charged");
-        assert!(spent < std::time::Duration::from_millis(50), "{spent:?}");
+        assert!(spent < Duration::from_millis(50), "{spent:?}");
 
         // Within the request limit, the count is charged before anything decompresses:
         // against the inline limit the same shape stops at once, having decoded nothing.
@@ -1685,7 +1821,7 @@ mod tests {
         let err = err.unwrap_err();
         assert_eq!(budget.exhausted(), Some(Exhausted::Limit), "{err}");
         assert!(budget.charged() <= MAX_DECODED_REQUEST_BYTES);
-        assert!(spent < std::time::Duration::from_secs(2), "{spent:?}");
+        assert!(spent < Duration::from_secs(2), "{spent:?}");
 
         // Within the limit, each header is charged.
         let within = DecodeBudget::new(MAX_DECODED_REQUEST_BYTES);
@@ -2298,6 +2434,73 @@ pub(crate) mod test_batches {
         let mut out = Vec::new();
         varint(v, &mut out);
         out
+    }
+
+    /// A gzip stream of `blocks` dynamic-Huffman deflate blocks that decode to nothing
+    /// (each declares its own code tables, some 11 bytes), then a final empty block: the
+    /// input that costs a decoder most per byte, decoding no output.
+    pub(crate) fn gzip_of_empty_blocks(blocks: usize) -> Vec<u8> {
+        struct Bits {
+            acc: u64,
+            n: u32,
+            out: Vec<u8>,
+        }
+        impl Bits {
+            fn put(&mut self, value: u64, bits: u32) {
+                self.acc |= value << self.n;
+                self.n += bits;
+                while self.n >= 8 {
+                    self.out.push(u8::try_from(self.acc & 0xff).unwrap());
+                    self.acc >>= 8;
+                    self.n -= 8;
+                }
+            }
+        }
+        // The order code-length code lengths are sent in (RFC 1951 §3.2.7).
+        const ORDER: [u8; 18] = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1];
+        let mut bits = Bits {
+            acc: 0,
+            n: 0,
+            out: vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff],
+        };
+        for _ in 0..blocks {
+            // Not final, dynamic; 257 literal/length codes, 1 distance code, 18
+            // code-length codes, of which only 1 and 18 have (1-bit) codes.
+            bits.put(0, 1);
+            bits.put(2, 2);
+            bits.put(0, 5);
+            bits.put(0, 5);
+            bits.put(14, 4);
+            for symbol in ORDER {
+                bits.put(u64::from(symbol == 1 || symbol == 18), 3);
+            }
+            // Literals 0-255 have no code (18 repeats zero: 138 + 118), the end of block
+            // and the one distance code length 1.
+            for (value, n) in [(0, 1), (1, 1), (127, 7), (1, 1), (106, 7), (0, 1), (0, 1)] {
+                bits.put(value, n);
+            }
+            bits.put(1, 1); // end of block
+        }
+        bits.put(1, 1); // final, fixed: end of block (seven zero bits)
+        bits.put(1, 2);
+        bits.put(0, 7);
+        if bits.n > 0 {
+            bits.out.push(u8::try_from(bits.acc & 0xff).unwrap());
+        }
+        bits.out.extend_from_slice(&[0; 8]); // CRC-32 and length of nothing
+        bits.out
+    }
+
+    /// A batch of one record whose gzip section is [`gzip_of_empty_blocks`].
+    pub(crate) fn gzip_empty_blocks_batch(blocks: usize) -> Bytes {
+        batch_with(
+            &gzip_of_empty_blocks(blocks),
+            1,
+            Header {
+                attributes: 1,
+                ..Header::default()
+            },
+        )
     }
 
     /// `n` of the smallest records: 7 bytes each (null key and value, no headers).

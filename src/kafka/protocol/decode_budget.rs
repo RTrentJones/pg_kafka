@@ -18,6 +18,11 @@
 //!   refused partition decoded is freed, but the time spent decoding it is not, so a request
 //!   of many partitions that each decode much and are then refused cannot decode without
 //!   end;
+//! * per request, the decoding time ([`DecodeBudget::limit_time`]), checked between chunks
+//!   of compressed input and between partitions: what a decode charges bounds the work its
+//!   output takes, not the work its input takes, and input can cost much while decoding to
+//!   nothing (gzip of empty dynamic-Huffman blocks, some 200 ns per byte, or snappy and
+//!   zstd framing of empty blocks or frames);
 //! * across the process, decoded requests that the DB thread has not run yet hold at most
 //!   [`DECODED_BUDGET_BYTES`] ([`DECODED`]). The decoded request keeps its share
 //!   ([`DecodedCharge`]) until it is dropped after its handler ran.
@@ -90,16 +95,31 @@ pub const INLINE_DECODE_BYTES: usize = 2 * 1024 * 1024;
 const WORK_PER_KEPT_BYTE: usize = 3;
 
 /// The most decoding work (everything charged, given back or not) a decode on an I/O thread
-/// may do; past it the request decodes again under a large-decode slot. A few milliseconds
-/// of decoding.
+/// may do; past it the request decodes again under a large-decode slot. Some 10 ms of
+/// decoding output-bound data (gzip of 1 KB records decodes at about 650 MB/s in a release
+/// build); a legitimate 1 MB request decodes in about 1 ms.
 pub const INLINE_DECODE_WORK_BYTES: usize = WORK_PER_KEPT_BYTE * INLINE_DECODE_BYTES;
 
 /// The most decoding work a request may do under a large-decode slot: what a request that
 /// fits may take, and as much again for partitions refused after they decoded (one refused
 /// at the request limit, or many smaller). Past it the request's other partitions are
-/// refused MESSAGE_TOO_LARGE without decoding, so no request holds a slot for longer than
-/// decoding this much takes (a fraction of a second).
+/// refused MESSAGE_TOO_LARGE without decoding: decoding this much output takes some 0.6 s
+/// (80 MB of gzip-compressed 1 KB records decode in 0.13 s in a release build). Input
+/// that decodes to little is bounded by [`SLOT_DECODE_TIME`] instead.
 pub const SLOT_DECODE_WORK_BYTES: usize = (WORK_PER_KEPT_BYTE + 1) * MAX_DECODED_REQUEST_BYTES;
+
+/// The longest a decode on an I/O thread may run; past it the request decodes again under
+/// a large-decode slot. The work limit bounds what a decode charges, not what its input
+/// costs, which may decode to nothing: this bounds that too, checked between chunks of
+/// input ([`DecodeBudget::check_time`]). An I/O thread decodes for at most this and one
+/// chunk (some 3 ms of the slowest input), twice what a decode at its work limit takes.
+pub const INLINE_DECODE_TIME: Duration = Duration::from_millis(20);
+
+/// The longest a decode under a large-decode slot may run; past it the partition decoding
+/// and those after it are refused REQUEST_TIMED_OUT (UNKNOWN_TOPIC_OR_PARTITION for those
+/// of an unknown topic), so no request holds a slot longer than this and one chunk of
+/// input: some three times what a decode at [`SLOT_DECODE_WORK_BYTES`] takes.
+pub const SLOT_DECODE_TIME: Duration = Duration::from_secs(2);
 
 /// How many large decodes may run at once.
 pub const LARGE_DECODE_SLOTS: usize = 2;
@@ -129,6 +149,8 @@ pub enum Exhausted {
     Work,
     /// The process-wide budget.
     Global,
+    /// The decode's time ([`DecodeBudget::limit_time`]).
+    Time,
 }
 
 /// A process-wide budget of decoded bytes, with a wake-up for those waiting for some of it.
@@ -199,6 +221,8 @@ pub struct DecodeBudget {
     work: Cell<usize>,
     work_limit: usize,
     work_exhausted: Cell<bool>,
+    deadline: Option<std::time::Instant>,
+    out_of_time: Cell<bool>,
 }
 
 impl DecodeBudget {
@@ -219,6 +243,8 @@ impl DecodeBudget {
             work: Cell::new(0),
             work_limit: usize::MAX,
             work_exhausted: Cell::new(false),
+            deadline: None,
+            out_of_time: Cell::new(false),
         }
     }
 
@@ -228,6 +254,37 @@ impl DecodeBudget {
     pub fn limit_work(mut self, bytes: usize) -> Self {
         self.work_limit = bytes;
         self
+    }
+
+    /// Limit the decode to `limit` from now: [`Self::check_time`] fails once it has passed.
+    /// Unlimited by default.
+    #[must_use]
+    pub fn limit_time(mut self, limit: Duration) -> Self {
+        self.deadline = Some(std::time::Instant::now() + limit);
+        self
+    }
+
+    /// Whether the decode may go on, checked between chunks of its input and between
+    /// partitions: fails once its time limit has passed, and from then on
+    /// ([`DecodeBudget::exhausted`] is then [`Exhausted::Time`]). What a decode charges
+    /// bounds only the work its output takes; this bounds the work its input takes, which
+    /// may decode to nothing (a gzip stream of empty blocks costs some 200 ns per byte).
+    pub fn check_time(&self) -> Result<(), Exhausted> {
+        let passed = self.out_of_time.get()
+            || self
+                .deadline
+                .is_some_and(|deadline| std::time::Instant::now() >= deadline);
+        if passed {
+            self.out_of_time.set(true);
+            self.exhausted.set(Some(Exhausted::Time));
+            return Err(Exhausted::Time);
+        }
+        Ok(())
+    }
+
+    /// Whether the decode's time limit has passed: the request may decode nothing more.
+    pub fn out_of_time(&self) -> bool {
+        self.out_of_time.get()
     }
 
     /// Charge `n` more bytes. Fails, charging nothing, when that would pass the
@@ -277,7 +334,7 @@ impl DecodeBudget {
     /// Give back everything charged since [`Self::charged`] was `mark`, and forget which
     /// limit a charge ran into since: the decode of a refused partition, whose memory is
     /// freed, so that it does not count against the partitions after it. Its work still
-    /// counts ([`Self::work_exhausted`] stays set).
+    /// counts ([`Self::work_exhausted`] and [`Self::out_of_time`] stay set).
     pub fn rewind(&self, mark: usize) {
         self.release(self.charged.get().saturating_sub(mark));
         self.exhausted.set(None);
