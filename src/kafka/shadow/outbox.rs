@@ -511,6 +511,77 @@ const CLAIM_DUE_OUTBOX_ROWS_SQL: &str = concat!(
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SpiShadowDb;
 
+/// The claim's floor for `work_mem`. Its three `NOT IN (SELECT ... FROM inf)` exclusions are
+/// hashed subplans only when the in-flight list (up to `MAX_INFLIGHT`, 8 192 rows, a few
+/// hundred kB hashed) fits in the hash memory limit; below it Postgres rescans the list for
+/// every pending row it passes (10 s per claim with 8 000 rows in flight at `work_mem = 64kB`).
+const CLAIM_WORK_MEM: &str = "4MB";
+
+/// Read the current `work_mem` and `jit`, then set them for the claim, transaction-locally:
+/// `work_mem` at least [`CLAIM_WORK_MEM`] (never lowered), and JIT off. The claim's cost
+/// estimate grows with the backlog and crosses `jit_above_cost` (and the inline/optimize
+/// thresholds), and compiling it costs more than running it (57 ms to 0.9 s per claim
+/// where the server has llvmjit). `$1` is [`CLAIM_WORK_MEM`].
+const CLAIM_SETTINGS_SQL: &str = "
+    SELECT o.work_mem, o.jit,
+           set_config('work_mem',
+                      CASE WHEN pg_size_bytes(o.work_mem) < pg_size_bytes($1)
+                           THEN $1 ELSE o.work_mem END,
+                      true) AS claim_work_mem,
+           set_config('jit', 'off', true) AS claim_jit
+    FROM (SELECT current_setting('work_mem') AS work_mem,
+                 current_setting('jit') AS jit
+          OFFSET 0) o";
+
+/// Put back what [`CLAIM_SETTINGS_SQL`] read (`$1` work_mem, `$2` jit), so the rest of the
+/// worker's transaction runs with its own settings.
+const RESTORE_CLAIM_SETTINGS_SQL: &str =
+    "SELECT set_config('work_mem', $1, true), set_config('jit', $2, true)";
+
+impl SpiShadowDb {
+    /// Run [`CLAIM_DUE_OUTBOX_ROWS_SQL`] (parameters in [`ShadowDb::claim_due_outbox_rows`]).
+    fn run_claim(
+        client: &mut pgrx::spi::SpiClient<'_>,
+        claim: &OutboxClaim,
+        backoff_base_ms: f64,
+        backoff_max_ms: f64,
+    ) -> Result<ClaimedRows> {
+        let table = client.update(
+            CLAIM_DUE_OUTBOX_ROWS_SQL,
+            None,
+            &[
+                claim.batch_limit.into(),
+                claim.max_retries.into(),
+                claim.inflight.topic_ids.clone().into(),
+                claim.inflight.partition_ids.clone().into(),
+                claim.inflight.local_offsets.clone().into(),
+                backoff_base_ms.into(),
+                backoff_max_ms.into(),
+            ],
+        )?;
+
+        let mut claimed = ClaimedRows::default();
+        for row in table {
+            claimed.partition_share = row.get_by_name("share")?.unwrap_or(0);
+            let headers_json: Option<String> = row.get_by_name("headers_json")?;
+            claimed.records.push(ForwardRecord {
+                row: RowKey::new(
+                    row.get_by_name("topic_id")?.unwrap_or(0),
+                    row.get_by_name("partition_id")?.unwrap_or(0),
+                    row.get_by_name("local_offset")?.unwrap_or(0),
+                ),
+                topic_name: row.get_by_name("external_topic")?.unwrap_or_default(),
+                key: row.get_by_name("msg_key")?,
+                value: row.get_by_name("msg_value")?,
+                headers: crate::kafka::storage::decode_headers_json(headers_json.as_deref()),
+                timestamp_ms: row.get_by_name("ts")?,
+                restart: row.get_by_name("restart")?.unwrap_or(false),
+            });
+        }
+        Ok(claimed)
+    }
+}
+
 impl ShadowDb for SpiShadowDb {
     fn shadow_mode_enabled(&self) -> bool {
         crate::config::SHADOW_MODE_ENABLED.get()
@@ -681,39 +752,20 @@ impl ShadowDb for SpiShadowDb {
         let (backoff_base_ms, backoff_max_ms) =
             (claim.backoff_base_ms as f64, claim.backoff_max_ms as f64);
         Spi::connect_mut(|client| {
-            let table = client.update(
-                CLAIM_DUE_OUTBOX_ROWS_SQL,
+            // The claim's planner settings, for this statement alone (see
+            // CLAIM_SETTINGS_SQL); restored below whatever the claim returns. A
+            // Postgres ERROR aborts the subtransaction, which undoes them anyway.
+            let saved = client.update(CLAIM_SETTINGS_SQL, None, &[CLAIM_WORK_MEM.into()])?;
+            let saved = saved.first();
+            let work_mem: Option<String> = saved.get_by_name("work_mem")?;
+            let jit: Option<String> = saved.get_by_name("jit")?;
+            let claimed = Self::run_claim(client, claim, backoff_base_ms, backoff_max_ms);
+            client.update(
+                RESTORE_CLAIM_SETTINGS_SQL,
                 None,
-                &[
-                    claim.batch_limit.into(),
-                    claim.max_retries.into(),
-                    claim.inflight.topic_ids.clone().into(),
-                    claim.inflight.partition_ids.clone().into(),
-                    claim.inflight.local_offsets.clone().into(),
-                    backoff_base_ms.into(),
-                    backoff_max_ms.into(),
-                ],
+                &[work_mem.into(), jit.into()],
             )?;
-
-            let mut claimed = ClaimedRows::default();
-            for row in table {
-                claimed.partition_share = row.get_by_name("share")?.unwrap_or(0);
-                let headers_json: Option<String> = row.get_by_name("headers_json")?;
-                claimed.records.push(ForwardRecord {
-                    row: RowKey::new(
-                        row.get_by_name("topic_id")?.unwrap_or(0),
-                        row.get_by_name("partition_id")?.unwrap_or(0),
-                        row.get_by_name("local_offset")?.unwrap_or(0),
-                    ),
-                    topic_name: row.get_by_name("external_topic")?.unwrap_or_default(),
-                    key: row.get_by_name("msg_key")?,
-                    value: row.get_by_name("msg_value")?,
-                    headers: crate::kafka::storage::decode_headers_json(headers_json.as_deref()),
-                    timestamp_ms: row.get_by_name("ts")?,
-                    restart: row.get_by_name("restart")?.unwrap_or(false),
-                });
-            }
-            Ok(claimed)
+            claimed
         })
     }
 
@@ -970,6 +1022,37 @@ mod tests {
                 .ends_with("ORDER BY st.local_offset LIMIT 1 ) any_due"),
             "{due_parts}"
         );
+    }
+
+    /// The claim runs with a `work_mem` floor and without JIT, set transaction-locally
+    /// (`set_config(.., true)`, undone by a rollback of the poll's subtransaction) and put
+    /// back after it, so no other statement of the worker's transaction sees them. The
+    /// floor is only ever raised to, never lowered.
+    #[test]
+    fn the_claim_runs_with_a_work_mem_floor_and_without_jit() {
+        let squash = |sql: &str| sql.split_whitespace().collect::<Vec<_>>().join(" ");
+        let settings = squash(CLAIM_SETTINGS_SQL);
+        assert!(settings.contains("set_config('jit', 'off', true)"));
+        assert!(settings.contains(
+            "set_config('work_mem', CASE WHEN pg_size_bytes(o.work_mem) < pg_size_bytes($1) \
+             THEN $1 ELSE o.work_mem END, true)"
+        ));
+        // The old values are read before they are changed.
+        assert!(settings.contains("current_setting('work_mem') AS work_mem"));
+        assert!(settings.contains("OFFSET 0) o"));
+        let restore = squash(RESTORE_CLAIM_SETTINGS_SQL);
+        assert_eq!(
+            restore,
+            "SELECT set_config('work_mem', $1, true), set_config('jit', $2, true)"
+        );
+        assert_eq!(
+            settings.matches(", true)").count(),
+            2,
+            "both settings are local"
+        );
+        // 8 192 in-flight keys hashed take a few hundred kB; the floor leaves room.
+        let mb: u64 = CLAIM_WORK_MEM.trim_end_matches("MB").parse().unwrap();
+        assert!(mb * 1024 * 1024 >= 8 * 8_192 * 64);
     }
 
     /// A config row: a column is a value, NULL, or unreadable (`Err`).

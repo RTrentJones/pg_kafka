@@ -15,8 +15,8 @@
 //!   claiming them over and over (the worker stays idle) and forwards them once
 //!   one is;
 //! - a claim does not slow down with the number of rows in flight (the
-//!   in-flight exclusion is a hash lookup, not a scan per pending row) or with
-//!   the size of the backlog.
+//!   in-flight exclusion is a hash lookup, not a scan per pending row), with
+//!   the size of the backlog, with a tiny `work_mem`, or with JIT.
 
 use crate::common::{create_db_client, create_producer, TestResult};
 use crate::setup::TestContext;
@@ -1098,6 +1098,59 @@ pub async fn test_shadow_claims_stay_fast_behind_a_large_backlog() -> TestResult
             analyze: true,
             settings: &[("jit", "off"), ("pg_kafka.shadow_batch_size", "50")],
             failure: "a claim's cost grows with the backlog",
+        },
+    )
+    .await
+}
+
+/// The claim's in-flight exclusions are hashed only when the in-flight list fits
+/// in the hash memory limit; with a tiny `work_mem` Postgres rescans the list for
+/// every pending row it passes (10 s per claim with 8 000 rows in flight at
+/// 64 kB). The claim raises `work_mem` for itself, so the in-flight window fills
+/// as fast as with the default: on PG17 here 0.23 s, 22 s without the floor.
+pub async fn test_shadow_claims_stay_fast_with_a_tiny_work_mem() -> TestResult {
+    time_claims(
+        "claims stay fast with a tiny work_mem",
+        &ClaimRun {
+            records: 10_000,
+            rows: 8_192,
+            bound: Duration::from_secs(3),
+            analyze: false,
+            settings: &[("work_mem", "64kB"), ("jit", "off")],
+            failure: "the claim ran with the server's tiny work_mem",
+        },
+    )
+    .await
+}
+
+/// The claim's cost estimate grows with the backlog and crosses `jit_above_cost`;
+/// compiling it costs far more than running it. The claim turns JIT off for
+/// itself: with the JIT thresholds at 1 000 (every claim, and no trivial
+/// statement, crosses them) the in-flight window fills as fast as without JIT:
+/// on PG17 here 0.27-0.32 s, 11.2 s with each claim compiled. Skipped where the
+/// server has no JIT provider (llvmjit).
+pub async fn test_shadow_claims_are_not_jit_compiled() -> TestResult {
+    let db = create_db_client().await?;
+    let available: bool = db.query_one("SELECT pg_jit_available()", &[]).await?.get(0);
+    if !available {
+        println!("=== Test: claims are not JIT-compiled ===\n");
+        println!("⚠️  SKIPPED: the server has no JIT provider (pg_jit_available() is false)\n");
+        return Ok(());
+    }
+    time_claims(
+        "claims are not JIT-compiled",
+        &ClaimRun {
+            records: 10_000,
+            rows: 8_192,
+            bound: Duration::from_secs(3),
+            analyze: false,
+            settings: &[
+                ("jit", "on"),
+                ("jit_above_cost", "1000"),
+                ("jit_inline_above_cost", "1000"),
+                ("jit_optimize_above_cost", "1000"),
+            ],
+            failure: "the claim was JIT-compiled",
         },
     )
     .await
