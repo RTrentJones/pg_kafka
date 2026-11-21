@@ -475,9 +475,40 @@ fn test_validate_commit_by_state() {
         c.validate_commit("unknown-group", "m", 1),
         Err(KafkaError::UnknownMemberId { .. })
     ));
-    // Simple consumers (generation < 0) are not validated.
+    // Generation -1 with an empty member id is not validated.
     assert!(c.validate_commit("g", "", -1).is_ok());
     assert!(c.validate_commit("unknown-group", "", -1).is_ok());
+}
+
+/// Kafka 3.7 (checked against a 3.7 broker) fences a transactional commit of generation -1
+/// that names a member: a group with members answers UNKNOWN_MEMBER_ID to a member id it
+/// does not know and ILLEGAL_GENERATION to one of its members; a group without members
+/// (unknown, or Empty) accepts it whatever the member id.
+#[test]
+fn test_validate_commit_generation_minus_one_with_a_member_id() {
+    let c = GroupCoordinator::new();
+    let a = joined(&join(&c, "g", None)).member_id;
+    c.sync_now("g".to_string(), a.clone(), 1, vec![(a.clone(), vec![1])])
+        .unwrap();
+    assert!(matches!(
+        c.validate_commit("g", "zz", -1),
+        Err(KafkaError::UnknownMemberId { .. })
+    ));
+    assert!(matches!(
+        c.validate_commit("g", &a, -1),
+        Err(KafkaError::IllegalGeneration { .. })
+    ));
+    assert!(c.validate_commit("g", "", -1).is_ok());
+    assert!(c.validate_commit("unknown-group", "zz", -1).is_ok());
+
+    c.leave_group("g", &a).unwrap();
+    assert_eq!(state(&c, "g"), GroupState::Empty);
+    assert!(c.validate_commit("g", "zz", -1).is_ok());
+    assert!(c.validate_commit("g", &a, -1).is_ok());
+    assert!(matches!(
+        c.validate_commit("g", "", 1),
+        Err(KafkaError::UnknownMemberId { .. })
+    ));
 }
 
 #[test]

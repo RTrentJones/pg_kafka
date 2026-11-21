@@ -804,3 +804,159 @@ pub async fn test_refused_offset_commit_answers_unknown_partitions() -> TestResu
     println!("✅ Test PASSED\n");
     Ok(())
 }
+
+/// JoinGroup v5 of `group` as `member`, protocol type `protocol_type` and one "range"
+/// protocol.
+async fn join_v5(
+    wire: &mut Wire,
+    group: &str,
+    member: &str,
+    session_timeout_ms: i32,
+    protocol_type: &str,
+) -> crate::common::DynResult<kafka_protocol::messages::join_group_response::JoinGroupResponse> {
+    use kafka_protocol::messages::join_group_request::{
+        JoinGroupRequest, JoinGroupRequestProtocol,
+    };
+    let mut join = JoinGroupRequest::default();
+    join.group_id = GroupId(StrBytes::from_string(group.to_string()));
+    join.session_timeout_ms = session_timeout_ms;
+    join.rebalance_timeout_ms = 30_000;
+    join.member_id = StrBytes::from_string(member.to_string());
+    join.protocol_type = StrBytes::from_string(protocol_type.to_string());
+    let mut protocol = JoinGroupRequestProtocol::default();
+    protocol.name = StrBytes::from_static_str("range");
+    join.protocols = vec![protocol];
+    wire.call(5, &join).await
+}
+
+/// A one-member group `group`, joined and synced (Stable): its member id and generation.
+async fn stable_group(wire: &mut Wire, group: &str) -> crate::common::DynResult<(String, i32)> {
+    use kafka_protocol::messages::sync_group_request::SyncGroupRequest;
+    use kafka_protocol::messages::sync_group_response::SyncGroupResponse;
+    let joined = join_v5(wire, group, "", 30_000, "consumer").await?;
+    assert_eq!(joined.error_code, NONE, "join {group}");
+    let mut sync = SyncGroupRequest::default();
+    sync.group_id = GroupId(StrBytes::from_string(group.to_string()));
+    sync.generation_id = joined.generation_id;
+    sync.member_id = joined.member_id.clone();
+    let synced: SyncGroupResponse = wire.call(3, &sync).await?;
+    assert_eq!(synced.error_code, NONE, "sync {group}");
+    Ok((joined.member_id.to_string(), joined.generation_id))
+}
+
+/// TxnOffsetCommit v3's member and generation checks, as a Kafka 3.7 broker answers them
+/// (pg_kafka let generation -1 through whatever the member id):
+/// - a group with members: generation -1 with a member id it does not know is
+///   UNKNOWN_MEMBER_ID, with one of its members ILLEGAL_GENERATION, with no member id it
+///   commits;
+/// - an unknown or Empty group: generation -1 commits whatever the member id.
+pub async fn test_txn_offset_commit_member_checks_match_kafka() -> TestResult {
+    use kafka_protocol::messages::leave_group_request::LeaveGroupRequest;
+    use kafka_protocol::messages::leave_group_response::LeaveGroupResponse;
+
+    println!("=== Test: TxnOffsetCommit member and generation checks ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = TestTopicBuilder::new(&ctx, "parity-txn-member")
+        .build()
+        .await?
+        .name;
+    let live = ctx.unique_group("parity-txn-member-live").await;
+    let unknown = ctx.unique_group("parity-txn-member-unknown").await;
+    let empty = ctx.unique_group("parity-txn-member-empty").await;
+    let txn = ctx.unique_group("parity-txn-member-txn").await;
+    let entries: [(&str, &[i32]); 1] = [(&topic, &[0])];
+    let answered = |code| vec![(topic.clone(), 0, code)];
+    let mut wire = Wire::connect().await?;
+
+    println!("Step 1: a Stable group, an Empty one, and a transaction that added them...");
+    let (member, _generation) = stable_group(&mut wire, &live).await?;
+    let (left_member, _) = stable_group(&mut wire, &empty).await?;
+    let mut leave = LeaveGroupRequest::default();
+    leave.group_id = GroupId(StrBytes::from_string(empty.clone()));
+    leave.member_id = StrBytes::from_string(left_member.clone());
+    let left: LeaveGroupResponse = wire.call(0, &leave).await?;
+    assert_eq!(left.error_code, NONE, "leave");
+    let (code, producer_id, epoch) = wire.init_producer_id(Some(&txn), 60_000).await?;
+    assert_eq!(code, NONE);
+    assert_eq!(
+        wire.add_partitions(&txn, producer_id, epoch, &[(topic.as_str(), &[0])])
+            .await?,
+        vec![(topic.clone(), 0, NONE)]
+    );
+    for group in [&live, &unknown, &empty] {
+        assert_eq!(
+            wire.add_offsets(&txn, producer_id, epoch, group).await?,
+            NONE
+        );
+    }
+    let mut commit = async |group: &str, generation: i32, member: &str| {
+        txn_offset_commit_v3(
+            &mut wire,
+            &txn,
+            group,
+            producer_id,
+            epoch,
+            generation,
+            member,
+            &entries,
+        )
+        .await
+    };
+
+    println!("Step 2: generation -1 to the Stable group...");
+    assert_eq!(
+        commit(&live, -1, "zz").await?,
+        answered(UNKNOWN_MEMBER_ID),
+        "generation -1, unknown member"
+    );
+    assert_eq!(
+        commit(&live, -1, &member).await?,
+        answered(ILLEGAL_GENERATION),
+        "generation -1, the group's member"
+    );
+    assert_eq!(
+        commit(&live, -1, "").await?,
+        answered(NONE),
+        "generation -1, no member id"
+    );
+
+    println!("Step 3: generation -1 with a member id to groups without members...");
+    assert_eq!(
+        commit(&unknown, -1, "zz").await?,
+        answered(NONE),
+        "unknown group"
+    );
+    assert_eq!(
+        commit(&empty, -1, "zz").await?,
+        answered(NONE),
+        "Empty group"
+    );
+    assert_eq!(
+        commit(&empty, -1, &left_member).await?,
+        answered(NONE),
+        "Empty group, its former member"
+    );
+    println!("✅ 25 / 22 / 0, and 0 without members, as Kafka answers them\n");
+
+    println!("=== Database Verification ===\n");
+    let pending: Vec<String> = ctx
+        .db()
+        .query(
+            "SELECT group_id FROM kafka.txn_pending_offsets WHERE transactional_id = $1
+              ORDER BY group_id",
+            &[&txn],
+        )
+        .await?
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    let mut expected = vec![live.clone(), unknown.clone(), empty.clone()];
+    expected.sort();
+    assert_eq!(pending, expected, "the accepted commits are pending");
+    assert_eq!(wire.end_txn(&txn, producer_id, epoch, false).await?, NONE);
+    println!("✅ Only the accepted commits are stored\n");
+
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}

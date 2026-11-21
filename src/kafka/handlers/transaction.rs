@@ -339,8 +339,9 @@ pub fn handle_txn_offset_commit(
         // rejected with ILLEGAL_GENERATION / UNKNOWN_MEMBER_ID, the same fence as on the
         // non-transactional OffsetCommit path. The producer-epoch fence
         // alone does not cover KIP-447 (the new owner uses a *different*
-        // transactional_id, so the zombie keeps a valid epoch). Simple consumers /
-        // pre-v3 clients (generation -1) are exempt inside validate_commit.
+        // transactional_id, so the zombie keeps a valid epoch). Generation -1 is
+        // exempt inside validate_commit for a group without members or with an empty
+        // member id (pre-v3 clients), as in Kafka 3.7.
         ctx.coordinator
             .validate_commit(group_id, member_id, generation_id)
             .err()

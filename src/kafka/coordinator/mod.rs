@@ -655,12 +655,16 @@ impl GroupCoordinator {
         }
     }
 
-    /// Validate an OffsetCommit against the live group state to reject zombie commits.
-    ///
-    /// A simple consumer with no active group membership commits with `generation_id < 0` and is not
-    /// validated. Otherwise the commit's member id and generation must match the current ones — an
-    /// unknown member yields `UnknownMemberId` (checked first, as Kafka does) and a stale
-    /// generation `IllegalGeneration`.
+    /// Validate a TxnOffsetCommit's member and generation against the live group state, as
+    /// Kafka 3.7 does (checked against a 3.7 broker), to reject zombie commits:
+    /// - a group with no members (unknown here, or Empty) takes generation < 0 whatever the
+    ///   member id (a pre-v3 client, or a producer committing outside group management);
+    /// - a group with members takes generation < 0 only with an empty member id; a member
+    ///   id the group does not know gets `UnknownMemberId`, and one of its members
+    ///   `IllegalGeneration` (generation -1 is not its generation);
+    /// - otherwise the member must be in the group (`UnknownMemberId`, checked first, as
+    ///   Kafka does; a group this coordinator has no record of has no members) and the
+    ///   generation must be the current one (`IllegalGeneration`).
     ///
     /// A generation-bearing commit for a group this coordinator has *no record of* is fenced
     /// with `UnknownMemberId` (a zombie whose group was reaped by the empty-group sweep, or whose
@@ -681,17 +685,21 @@ impl GroupCoordinator {
         member_id: &str,
         generation_id: i32,
     ) -> Result<()> {
-        if generation_id < 0 {
-            return Ok(());
-        }
-
         let groups = self.groups.read().map_err(|e| {
             KafkaError::Internal(format!("Failed to acquire groups read lock: {e}"))
         })?;
 
         let Some(group) = groups.get(group_id) else {
-            return Err(KafkaError::unknown_member(group_id, member_id));
+            return if generation_id < 0 {
+                Ok(())
+            } else {
+                Err(KafkaError::unknown_member(group_id, member_id))
+            };
         };
+
+        if generation_id < 0 && (group.members.is_empty() || member_id.is_empty()) {
+            return Ok(());
+        }
 
         if !group.members.contains_key(member_id) {
             return Err(KafkaError::unknown_member(group_id, member_id));
@@ -726,8 +734,8 @@ impl GroupCoordinator {
     ///   REBALANCE_IN_PROGRESS, and PreparingRebalance accepts the commit of a member that has not
     ///   rejoined yet (see [`Self::validate_commit`]).
     ///
-    /// [`Self::validate_commit`] keeps the older rules for TxnOffsetCommit, where Kafka exempts
-    /// transactional commits from the Empty-group requirement.
+    /// [`Self::validate_commit`] has TxnOffsetCommit's rules, where Kafka exempts transactional
+    /// commits from the Empty-group requirement.
     pub fn validate_offset_commit(
         &self,
         group_id: &str,

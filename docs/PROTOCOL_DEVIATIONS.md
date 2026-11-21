@@ -309,7 +309,12 @@ pg_kafka.compression_type = 'gzip'
   unknown member id (UNKNOWN_MEMBER_ID / ILLEGAL_GENERATION only once the transaction checks
   out). Whatever refuses the commit, a partition that does not exist is
   UNKNOWN_TOPIC_OR_PARTITION (Kafka filters those out before it asks the coordinator) and
-  the refusal's code goes only to the partitions that exist
+  the refusal's code goes only to the partitions that exist. The member checks are Kafka
+  3.7's (checked against a 3.7 broker): a group without members (unknown, or Empty) takes
+  generation -1 whatever the member id; a group with members takes generation -1 only with
+  an empty member id, and answers UNKNOWN_MEMBER_ID to a member id it does not know and
+  ILLEGAL_GENERATION to one of its members; a generation >= 0 must be the current one, of a
+  member of the group
 - ✅ Read-committed isolation level filters pending/aborted messages
 - ✅ Transactional producer fencing via epoch
 
