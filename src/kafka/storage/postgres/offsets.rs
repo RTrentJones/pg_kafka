@@ -78,6 +78,41 @@ impl PostgresStore {
         .map_err(internal("fetch_all_offsets"))
     }
 
+    /// The committed offsets of `group_id` for `partitions` (`(topic_id, partition_id)`),
+    /// as `(topic_id, partition_id, offset)`: index lookups of the requested partitions
+    /// only, however many offsets the group has.
+    pub(super) fn fetch_offsets(
+        group_id: &str,
+        partitions: &[(i32, i32)],
+    ) -> Result<Vec<(i32, i32, CommittedOffset)>> {
+        if partitions.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (topic_ids, partition_ids): (Vec<i32>, Vec<i32>) = partitions.iter().copied().unzip();
+        Spi::connect(|client| {
+            let table = client.select(
+                "SELECT co.topic_id, co.partition_id, co.committed_offset, co.metadata
+                 FROM unnest($2::int[], $3::int[]) AS r(topic_id, partition_id)
+                 JOIN kafka.consumer_offsets co
+                   ON co.group_id = $1
+                  AND co.topic_id = r.topic_id
+                  AND co.partition_id = r.partition_id",
+                None,
+                &[group_id.into(), topic_ids.into(), partition_ids.into()],
+            )?;
+            let mut results = Vec::with_capacity(table.len());
+            for row in table {
+                let topic_id: i32 = row.get_by_name("topic_id")?.unwrap_or(0);
+                let partition_id: i32 = row.get_by_name("partition_id")?.unwrap_or(0);
+                let offset: i64 = row.get_by_name("committed_offset")?.unwrap_or(-1);
+                let metadata: Option<String> = row.get_by_name("metadata")?;
+                results.push((topic_id, partition_id, CommittedOffset { offset, metadata }));
+            }
+            Ok(results)
+        })
+        .map_err(internal("fetch_offsets"))
+    }
+
     pub(super) fn delete_consumer_group_offsets(group_id: &str) -> Result<()> {
         crate::pg_debug!(
             "PostgresStore::delete_consumer_group_offsets: '{}'",

@@ -546,6 +546,16 @@ pub trait OffsetStore {
     /// Map of (topic_name, partition_id) -> CommittedOffset
     fn fetch_all_offsets(&self, group_id: &str) -> Result<Vec<(String, i32, CommittedOffset)>>;
 
+    /// The committed offsets of `group_id` for `partitions` (`(topic_id, partition_id)`
+    /// pairs), as `(topic_id, partition_id, offset)` in no particular order; a partition
+    /// without one is left out. One statement, reading only the requested partitions, so
+    /// OffsetFetch of a few partitions costs the same however many offsets the group has.
+    fn fetch_offsets(
+        &self,
+        group_id: &str,
+        partitions: &[(i32, i32)],
+    ) -> Result<Vec<(i32, i32, CommittedOffset)>>;
+
     /// Delete all committed offsets for a consumer group
     ///
     /// # Arguments

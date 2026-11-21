@@ -79,6 +79,7 @@ mod store {
                 metadata: Option<&'a str>,
             ) -> Result<()>;
             fn fetch_all_offsets<'a>(&self, group_id: &'a str) -> Result<Vec<(String, i32, CommittedOffset)>>;
+            fn fetch_offsets<'a>(&self, group_id: &'a str, partitions: &'a [(i32, i32)]) -> Result<Vec<(i32, i32, CommittedOffset)>>;
             fn delete_consumer_group_offsets<'a>(&self, group_id: &'a str) -> Result<()>;
                 fn list_offset_groups(&self) -> Result<Vec<String>>;
             fn groups_with_offsets<'a>(&self, group_ids: &'a [String]) -> Result<std::collections::HashSet<String>>;

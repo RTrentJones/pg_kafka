@@ -515,6 +515,86 @@ pub async fn test_offset_fetch_of_a_repeated_partition_is_answered_quickly() -> 
     Ok(())
 }
 
+/// An OffsetFetch partition's answer: partition, offset, metadata and error code.
+type FetchedOffset = (i32, i64, Option<String>, i16);
+
+/// OffsetFetch v1 of three partitions for a group with 200,000 committed offsets: only the
+/// requested partitions are read. Reading all the group's offsets (joined with the topics
+/// and sorted) for any named partition held the DB thread some 200 ms per request.
+pub async fn test_offset_fetch_reads_only_the_requested_partitions() -> TestResult {
+    println!("=== Test: OffsetFetch of 3 partitions of a group with 200,000 offsets ===\n");
+    let (ctx, probe) = setup("ofg").await?;
+    let group = ctx.unique_group("net-fan-ofg").await;
+    let other = short_topic("og", 1).await?;
+    ctx.db()
+        .execute(
+            "INSERT INTO kafka.consumer_offsets
+                 (group_id, topic_id, partition_id, committed_offset, metadata)
+             SELECT $1, t.id, p, p * 10, 'm' || p
+             FROM kafka.topics t, generate_series(0, 199999) AS p
+             WHERE t.name = $2",
+            &[&group, &probe],
+        )
+        .await?;
+    ctx.db()
+        .execute("ANALYZE kafka.consumer_offsets", &[])
+        .await?;
+    let topic = |name: &str, partitions: Vec<i32>| {
+        let mut t = OffsetFetchRequestTopic::default();
+        t.name = topic_name(name);
+        t.partition_indexes = partitions;
+        t
+    };
+    let mut req = OffsetFetchRequest::default();
+    req.group_id = GroupId(s(&group));
+    req.topics = Some(vec![
+        topic(&probe, vec![123_456, 0, 300_000]),
+        topic(&other, vec![0]),
+    ]);
+    let m = measure(&probe, 1, &req).await?;
+    let answers: Vec<(String, Vec<FetchedOffset>)> = m
+        .response
+        .topics
+        .iter()
+        .map(|t| {
+            let parts = t
+                .partitions
+                .iter()
+                .map(|p| {
+                    let metadata = p.metadata.as_ref().map(ToString::to_string);
+                    (
+                        p.partition_index,
+                        p.committed_offset,
+                        metadata,
+                        p.error_code,
+                    )
+                })
+                .collect();
+            (t.name.0.to_string(), parts)
+        })
+        .collect();
+    println!("  answered {answers:?}");
+    assert_not_stalled(&m);
+    assert_eq!(
+        answers,
+        vec![
+            (
+                probe.clone(),
+                vec![
+                    (123_456, 1_234_560, Some("m123456".to_string()), 0),
+                    (0, 0, Some("m0".to_string()), 0),
+                    (300_000, -1, Some(String::new()), 0),
+                ]
+            ),
+            (other.clone(), vec![(0, -1, Some(String::new()), 0)]),
+        ]
+    );
+    drop_topics(&ctx, &other).await?;
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
 /// DeleteRecords v0 of partition 0 of one topic 15,000 times (180 KB): Kafka truncates the
 /// partition once, to its last entry's offset, and answers it once.
 pub async fn test_delete_records_of_a_repeated_partition_is_answered_quickly() -> TestResult {

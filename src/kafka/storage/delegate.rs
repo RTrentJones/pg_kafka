@@ -349,6 +349,9 @@ macro_rules! delegate_offset_store {
         fn fetch_all_offsets(&self, group_id: &str) -> $crate::kafka::error::Result<Vec<(String, i32, $crate::kafka::storage::CommittedOffset)>> {
             $via::fetch_all_offsets(group_id)
         }
+        fn fetch_offsets(&self, group_id: &str, partitions: &[(i32, i32)]) -> $crate::kafka::error::Result<Vec<(i32, i32, $crate::kafka::storage::CommittedOffset)>> {
+            $via::fetch_offsets(group_id, partitions)
+        }
         fn delete_consumer_group_offsets(&self, group_id: &str) -> $crate::kafka::error::Result<()> {
             $via::delete_consumer_group_offsets(group_id)
         }
@@ -368,6 +371,9 @@ macro_rules! delegate_offset_store {
         }
         fn fetch_all_offsets(&self, group_id: &str) -> $crate::kafka::error::Result<Vec<(String, i32, $crate::kafka::storage::CommittedOffset)>> {
             $via::fetch_all_offsets(&self.$field, group_id)
+        }
+        fn fetch_offsets(&self, group_id: &str, partitions: &[(i32, i32)]) -> $crate::kafka::error::Result<Vec<(i32, i32, $crate::kafka::storage::CommittedOffset)>> {
+            $via::fetch_offsets(&self.$field, group_id, partitions)
         }
         fn delete_consumer_group_offsets(&self, group_id: &str) -> $crate::kafka::error::Result<()> {
             $via::delete_consumer_group_offsets(&self.$field, group_id)

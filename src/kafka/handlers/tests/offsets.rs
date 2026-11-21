@@ -138,16 +138,18 @@ fn test_handle_offset_fetch_found() {
         }])
     });
 
-    mock.expect_fetch_all_offsets().returning(|_| {
-        Ok(vec![(
-            "test-topic".to_string(),
-            0,
-            CommittedOffset {
-                offset: 42,
-                metadata: Some("test-metadata".to_string()),
-            },
-        )])
-    });
+    mock.expect_fetch_offsets()
+        .withf(|group, partitions| group == "test-group" && partitions == [(1, 0)])
+        .returning(|_, _| {
+            Ok(vec![(
+                1,
+                0,
+                CommittedOffset {
+                    offset: 42,
+                    metadata: Some("test-metadata".to_string()),
+                },
+            )])
+        });
 
     let topics = Some(vec![OffsetFetchTopicData {
         name: "test-topic".to_string(),
@@ -178,7 +180,7 @@ fn test_handle_offset_fetch_not_found() {
     });
 
     // No committed offset
-    mock.expect_fetch_all_offsets().returning(|_| Ok(vec![]));
+    mock.expect_fetch_offsets().returning(|_, _| Ok(vec![]));
 
     let topics = Some(vec![OffsetFetchTopicData {
         name: "test-topic".to_string(),
