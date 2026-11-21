@@ -424,11 +424,13 @@ pub fn handle_create_partitions(
 /// Handle DeleteGroups request
 ///
 /// Deletes consumer groups. Groups with active members cannot be deleted
-/// (returns NON_EMPTY_GROUP error).
+/// (returns NON_EMPTY_GROUP error). A group named more than once is deleted and answered
+/// once, as Kafka 3.7 does (it deletes `groupIds.toSet`).
 pub fn handle_delete_groups(
     ctx: &HandlerContext,
     group_names: Vec<String>,
 ) -> Result<DeleteGroupsResponse> {
+    let group_names: Vec<String> = once_each(group_names).collect();
     let store = ctx.store;
     let coordinator = ctx.coordinator;
     let mut results = Vec::new();
@@ -439,7 +441,7 @@ pub fn handle_delete_groups(
         .filter(|g| coordinator.get_group_state(g).is_none())
         .cloned()
         .collect();
-    let mut with_offsets = if unheld.is_empty() {
+    let with_offsets = if unheld.is_empty() {
         Ok(HashSet::new())
     } else {
         store.groups_with_offsets(&unheld)
@@ -478,16 +480,12 @@ pub fn handle_delete_groups(
                 // A group the coordinator does not hold exists only through its
                 // committed offsets (an Empty group, as DescribeGroups/ListGroups report it).
                 // Without any, it does not exist: GROUP_ID_NOT_FOUND, as Kafka answers.
-                // A group deleted by an earlier entry of the request no longer exists.
-                match &mut with_offsets {
+                match &with_offsets {
                     Ok(groups) if !groups.contains(&group_name) => {
                         result.error_code = ERROR_GROUP_ID_NOT_FOUND;
                     }
-                    Ok(groups) => match store.delete_consumer_group_offsets(&group_name) {
-                        Ok(()) => {
-                            groups.remove(&group_name);
-                            result.error_code = ERROR_NONE;
-                        }
+                    Ok(_) => match store.delete_consumer_group_offsets(&group_name) {
+                        Ok(()) => result.error_code = ERROR_NONE,
                         Err(e) => result.error_code = e.to_kafka_error_code(),
                     },
                     Err(e) => result.error_code = e.to_kafka_error_code(),
@@ -801,6 +799,41 @@ mod tests {
             num_partitions: partitions,
             replication_factor: rf,
         }
+    }
+
+    /// Kafka 3.7 answers one result per distinct group (checked against a 3.7 broker:
+    /// `["gdup", "gdup", "nosuchg", "nosuchg"]` is `[("gdup", NONE), ("nosuchg",
+    /// GROUP_ID_NOT_FOUND)]`) and deletes a repeated group once.
+    #[test]
+    fn test_delete_groups_answers_a_repeated_group_once() {
+        let mut store = MockKafkaStore::new();
+        store
+            .expect_groups_with_offsets()
+            .withf(|groups| groups == ["gdup", "nosuchg"])
+            .times(1)
+            .returning(|_| Ok(HashSet::from(["gdup".to_string()])));
+        store
+            .expect_delete_consumer_group_offsets()
+            .withf(|group| group == "gdup")
+            .times(1)
+            .returning(|_| Ok(()));
+        let coordinator = crate::kafka::GroupCoordinator::new();
+        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = ctx_for(&store, &coordinator, &broker);
+        let names = ["gdup", "gdup", "nosuchg", "nosuchg", "gdup"].map(String::from);
+        let response = handle_delete_groups(&ctx, names.to_vec()).unwrap();
+        let answers: Vec<(String, i16)> = response
+            .results
+            .iter()
+            .map(|r| (r.group_id.0.to_string(), r.error_code))
+            .collect();
+        assert_eq!(
+            answers,
+            [
+                ("gdup".to_string(), ERROR_NONE),
+                ("nosuchg".to_string(), ERROR_GROUP_ID_NOT_FOUND)
+            ]
+        );
     }
 
     #[test]
