@@ -575,15 +575,18 @@ async fn rows_reaching_default_during_lock_wait() -> SendResult<()> {
         .await
         .map_err(boxed)?
         .get(0);
-    let mut result = default_race(&db, topic_id, false).await;
-    if result.is_ok() {
+    let mut result = Ok(());
+    for race in [Race::Plain, Race::SchemaLockHeld] {
+        result = default_race(&db, topic_id, race).await;
+        if result.is_err() {
+            break;
+        }
         db.execute(
             "DELETE FROM kafka.messages WHERE topic_id = $1",
             &[&topic_id],
         )
         .await
         .map_err(boxed)?;
-        result = default_race(&db, topic_id, true).await;
     }
     // Clean up: the topic's rows go with it; a pass with no race restores the leaf.
     db.execute("DELETE FROM kafka.topics WHERE id = $1", &[&topic_id])
@@ -595,10 +598,23 @@ async fn rows_reaching_default_during_lock_wait() -> SendResult<()> {
     result
 }
 
-/// One race for the worker's furthest leaf ahead; with `hold_schema_lock`, a session
-/// holds the schema lock SHARE throughout, so the pass cannot move the row.
-async fn default_race(db: &Client, topic_id: i32, hold_schema_lock: bool) -> SendResult<()> {
-    println!("--- schema lock held SHARE by another session: {hold_schema_lock} ---");
+/// How the pass of [`default_race`] meets the row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Race {
+    /// The pass sees the row once it holds `kafka.messages` and moves it.
+    Plain,
+    /// A session holds the schema lock SHARE throughout, so the pass cannot move the row.
+    SchemaLockHeld,
+}
+
+/// One race for the worker's furthest leaf ahead.
+async fn default_race(db: &Client, topic_id: i32, race: Race) -> SendResult<()> {
+    println!("--- {race:?} ---");
+    // A pass first: right after a bucket boundary the worker's next pass may not have
+    // made the new furthest leaf yet.
+    db.query("SELECT pg_kafka_run_partition_maintenance()", &[])
+        .await
+        .map_err(boxed)?;
     // The worker's furthest leaf ahead: [b + 2w, b + 3w) for the current bucket b.
     let (leaf, lower): (String, String) = {
         let row = db
@@ -641,7 +657,7 @@ async fn default_race(db: &Client, topic_id: i32, hold_schema_lock: bool) -> Sen
         .map_err(boxed)?
         .get(0);
     let share = session().await?;
-    if hold_schema_lock {
+    if race == Race::SchemaLockHeld {
         share.batch_execute("BEGIN").await.map_err(boxed)?;
         share
             .query(
@@ -655,7 +671,9 @@ async fn default_race(db: &Client, topic_id: i32, hold_schema_lock: bool) -> Sen
     let landed: String = inserter
         .query_one(
             "INSERT INTO kafka.messages (topic_id, partition_id, partition_offset, value, created_at)
-             VALUES ($1, 0, 0, 'v'::bytea, $2::text::timestamptz + INTERVAL '1 hour')
+             VALUES ($1, 0, 0, 'v'::bytea, $2::text::timestamptz
+                     + current_setting('pg_kafka.message_partition_minutes')::int
+                       * INTERVAL '30 seconds')
              RETURNING tableoid::regclass::text",
             &[&topic_id, &lower],
         )
@@ -674,13 +692,15 @@ async fn default_race(db: &Client, topic_id: i32, hold_schema_lock: bool) -> Sen
             .await
             .map(|r| r.get::<_, i64>(0))
     });
-    // The pass polls in lock_message_tables: a lock wait or its sleep between attempts.
+    // The pass polls in lock_message_tables; one of its attempts waits for
+    // kafka.messages (or kafka.topics) behind the open insert. Its sleeps between
+    // attempts are not matched: try_maintenance_lock sleeps the same way.
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut waiting = false;
     while !waiting && !pass.is_finished() && Instant::now() < deadline {
         waiting = db
             .query_one(
-                "SELECT COALESCE(wait_event_type = 'Lock' OR wait_event = 'PgSleep', false)
+                "SELECT COALESCE(wait_event_type = 'Lock' AND wait_event = 'relation', false)
                  FROM pg_stat_activity WHERE pid = $1",
                 &[&maintainer_pid],
             )
@@ -702,7 +722,7 @@ async fn default_race(db: &Client, topic_id: i32, hold_schema_lock: bool) -> Sen
         .map_err(boxed)?
         .map_err(|e| format!("maintenance failed: {}", db_error(&e)))?;
     println!("Step 3: the pass succeeded, created {created} leaf/leaves");
-    if hold_schema_lock {
+    if race == Race::SchemaLockHeld {
         let home: String = db
             .query_one(
                 "SELECT tableoid::regclass::text FROM kafka.messages WHERE topic_id = $1",
@@ -715,9 +735,9 @@ async fn default_race(db: &Client, topic_id: i32, hold_schema_lock: bool) -> Sen
         assert_eq!(
             (created, home.as_str()),
             (0, "kafka.messages_default"),
-            "with the schema lock taken, the pass must skip the leaf and leave the row"
+            "the pass must skip the leaf and leave the row ({race:?})"
         );
-        println!("   the leaf was skipped, the row left in DEFAULT; schema lock released");
+        println!("   the leaf was skipped, the row left in DEFAULT");
     }
 
     let mut passes = 1;
