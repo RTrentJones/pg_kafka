@@ -337,6 +337,11 @@ pub async fn test_invalid_acks_rejected_and_nothing_written() -> TestResult {
     println!("=== Test: invalid acks ===\n");
     let ctx = TestContext::new().await?;
     let topic = ctx.unique_topic("net-acks").await;
+    let created = crate::wire::requests::create_topics_raw(vec![crate::wire::requests::creatable(
+        &topic, 1, 1,
+    )])
+    .await?;
+    assert_eq!(created[0].error_code, 0, "{created:?}");
     let mut s = TcpStream::connect(("127.0.0.1", PORT)).await?;
     for (i, acks) in [2i16, -2, 5, i16::MAX].into_iter().enumerate() {
         let req = produce_request(
@@ -373,6 +378,122 @@ pub async fn test_invalid_acks_rejected_and_nothing_written() -> TestResult {
         );
     }
     assert_eq!(stored_rows(ctx.db(), &topic).await?, 2);
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// Each partition's error code of a Produce of `parts` to `topic` (and `extra` to another
+/// topic) at `version` with `acks`, in request order.
+async fn produce_codes_at(
+    s: &mut TcpStream,
+    version: i16,
+    corr: i32,
+    request: &ProduceRequest,
+) -> DynResult<Vec<(String, i32, i16)>> {
+    let resp: ProduceResponse = crate::wire::roundtrip(s, version, corr, request).await?;
+    let mut out: Vec<_> = resp
+        .responses
+        .iter()
+        .flat_map(|t| {
+            t.partition_responses
+                .iter()
+                .map(|p| (t.name.to_string(), p.index, p.error_code))
+        })
+        .collect();
+    out.sort();
+    Ok(out)
+}
+
+/// A case: what it is, the partitions of the request, the answers.
+type Case<'a> = (&'a str, Vec<(i32, Bytes)>, Vec<(String, i32, i16)>);
+
+/// Kafka 3.7 checks `acks` after what it reads of the request first and of each partition
+/// before the log append (`KafkaApis.handleProduceRequest`, then
+/// `ReplicaManager.appendRecords`): a transactional batch without a transactional id is
+/// TRANSACTIONAL_ID_AUTHORIZATION_FAILED and a first batch it cannot size CORRUPT_MESSAGE,
+/// on every partition; a partition of an unknown topic is UNKNOWN_TOPIC_OR_PARTITION and
+/// one that fails `ProduceRequest.validateRecords` gets that error; every other partition,
+/// whatever its records hold, is INVALID_REQUIRED_ACKS. Nothing is written.
+pub async fn test_invalid_acks_answers_in_kafkas_order() -> TestResult {
+    use super::produce_decoding::{batch_with, BatchHeader};
+    println!("=== Test: invalid acks answered in Kafka's order ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("net-acks-order").await;
+    let missing = ctx.unique_topic("net-acks-missing").await;
+    let created = crate::wire::requests::create_topics_raw(vec![crate::wire::requests::creatable(
+        &topic, 2, 1,
+    )])
+    .await?;
+    assert_eq!(created[0].error_code, 0, "{created:?}");
+    let ok = || plain_batch(&[Bytes::from_static(b"no")], Compression::None);
+    let one = [12u8, 0, 0, 0, 1, 1, 0];
+    let txn = batch_with(
+        &one,
+        1,
+        BatchHeader {
+            attributes: 0x10,
+            producer_id: 7,
+            producer_epoch: 0,
+            base_sequence: 0,
+            ..BatchHeader::default()
+        },
+    );
+    let mut len13 = vec![0u8; 8];
+    len13.extend_from_slice(&13i32.to_be_bytes());
+    len13.extend_from_slice(&[0, 0, 0, 0, 2]);
+    len13.extend_from_slice(&[0; 13]);
+    let mut bad_crc = ok().to_vec();
+    bad_crc[17..21].copy_from_slice(&[0, 0, 0, 0]);
+    let two_batches = Bytes::from([ok().to_vec(), ok().to_vec()].concat());
+    let t = |p, code| (topic.clone(), p, code);
+    let mut s = TcpStream::connect(("127.0.0.1", PORT)).await?;
+    let cases: Vec<Case<'_>> = vec![
+        (
+            "transactional batch, no transactional id",
+            vec![(0, txn), (1, ok())],
+            vec![t(0, 53), t(1, 53)],
+        ),
+        (
+            "first batch of length 13",
+            vec![(0, Bytes::from(len13)), (1, ok())],
+            vec![t(0, 2), t(1, 2)],
+        ),
+        (
+            "bad CRC",
+            vec![(0, Bytes::from(bad_crc)), (1, ok())],
+            vec![t(0, 21), t(1, 21)],
+        ),
+        (
+            "two batches",
+            vec![(0, two_batches), (1, ok())],
+            vec![t(0, 87), t(1, 21)],
+        ),
+        (
+            "outside the topic",
+            vec![(0, ok()), (7, ok())],
+            vec![t(0, 21), t(7, 3)],
+        ),
+    ];
+    for (i, (what, parts, expected)) in cases.into_iter().enumerate() {
+        let request = produce_request(&topic, parts, 5);
+        let got = produce_codes_at(&mut s, 7, to_i32(i), &request).await?;
+        assert_eq!(got, expected, "{what}");
+        println!("✅ {what}: {got:?}");
+    }
+    let mut request = produce_request(&topic, vec![(0, ok())], 5);
+    let mut other = produce_request(&missing, vec![(0, ok())], 5);
+    request.topic_data.append(&mut other.topic_data);
+    let got = produce_codes_at(&mut s, 7, 20, &request).await?;
+    let mut expected = vec![t(0, 21), (missing.clone(), 0, 3)];
+    expected.sort();
+    assert_eq!(got, expected, "unknown topic");
+    let zstd = plain_batch(&[Bytes::from_static(b"z")], Compression::Zstd);
+    let request = produce_request(&topic, vec![(0, zstd), (1, ok())], 5);
+    let got = produce_codes_at(&mut s, 3, 21, &request).await?;
+    assert_eq!(got, vec![t(0, 76), t(1, 21)], "zstd at v3");
+    assert_eq!(stored_rows(ctx.db(), &topic).await?, 0, "nothing written");
+    println!("✅ nothing written");
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");
     Ok(())

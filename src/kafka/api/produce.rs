@@ -29,7 +29,8 @@ use crate::kafka::messages::{
 use crate::kafka::notifications::InternalNotification;
 use crate::kafka::protocol::decode_budget::{
     decode_wait, DecodeBudget, DecodedCharge, Exhausted, HeldFrame, NotRun, DECODED,
-    INLINE_DECODE_BYTES, LARGE_DECODES, MAX_DECODED_REQUEST_BYTES,
+    INLINE_DECODE_BYTES, INLINE_DECODE_WORK_BYTES, LARGE_DECODES, MAX_DECODED_REQUEST_BYTES,
+    SLOT_DECODE_WORK_BYTES,
 };
 use crate::kafka::protocol::{
     first_batch_is_transactional, least_decoded_memory, parse_record_batch_with_metadata,
@@ -138,10 +139,11 @@ impl KafkaApi for ProduceApi {
     type Request = ProduceRequestData;
 
     fn decode(
-        wire: ProduceRequest,
+        mut wire: ProduceRequest,
         header: &RequestHeader,
     ) -> Result<Self::Request, Rejection<Self::Echo>> {
         let acks = wire.acks;
+        wire.topic_data = last_entry_per_partition(std::mem::take(&mut wire.topic_data));
         let requested: TopicPartitions = wire
             .topic_data
             .iter()
@@ -153,17 +155,29 @@ impl KafkaApi for ProduceApi {
             })
             .collect();
 
-        // Kafka accepts only acks -1, 0 and 1; anything else is
-        // answered INVALID_REQUIRED_ACKS on every partition and nothing is written.
+        let zstd_allowed = header.api_version >= MIN_ZSTD_VERSION;
+        // Kafka accepts only acks -1, 0 and 1; anything else is answered
+        // INVALID_REQUIRED_ACKS and nothing is written, once the checks Kafka makes before
+        // the log append passed (`invalid_acks_answers`).
         if !valid_acks(acks) {
             warn!("Rejecting Produce with invalid acks={acks}");
-            return Err(Rejection::Reply {
-                error_code: ERROR_INVALID_REQUIRED_ACKS,
-                echo: Some(requested),
+            let refused = invalid_acks_answers(
+                &wire.topic_data,
+                zstd_allowed,
+                wire.transactional_id.is_some(),
+            )
+            .map_err(|failure| rejection(failure, acks, requested))?;
+            return Ok(ProduceRequestData {
+                acks,
+                timeout_ms: wire.timeout_ms,
+                topic_data: Vec::new(),
+                refused,
+                transactional_id: wire.transactional_id.map(|s| s.to_string()),
+                decoded: DecodedCharge::default(),
+                pending: None,
             });
         }
 
-        let zstd_allowed = header.api_version >= MIN_ZSTD_VERSION;
         let decode = decode_all_records(
             &wire.topic_data,
             zstd_allowed,
@@ -233,9 +247,9 @@ impl KafkaApi for ProduceApi {
         );
         let store = env.ctx.store;
         if request.acks == 0 {
-            // Best effort, no response. Idempotency and transactions
-            // need acks >= 1 to mean anything, so neither is applied here. A request-level
-            // failure rolls back like the acks >= 1 path.
+            // No response. The records are checked as with acks >= 1 (an idempotent
+            // producer's sequence, a transactional batch's transaction), as Kafka checks
+            // them. A request-level failure rolls back like the acks >= 1 path.
             //
             // As in Kafka, any error (a partition error, or the whole
             // request failing) closes the connection, so the client refreshes its metadata
@@ -247,7 +261,13 @@ impl KafkaApi for ProduceApi {
                 let _ = response_tx.send(KafkaResponse::new(-1, -1, ResponseBody::CloseConnection));
             };
             let refused = !request.refused.is_empty();
-            return match handlers::handle_produce(&env.ctx, request.topic_data, None, None) {
+            let producer_metadata = extract_producer_metadata(&request.topic_data);
+            return match handlers::handle_produce(
+                &env.ctx,
+                request.topic_data,
+                producer_metadata.as_ref(),
+                request.transactional_id.as_deref(),
+            ) {
                 Ok(response) => {
                     emit_produce_notifications(&response, store, env.notify_tx);
                     if refused || acks0_must_close(&response) {
@@ -379,6 +399,11 @@ fn decode_partition(
     if let Err(code) = validate_produce_records(batch, zstd_allowed) {
         return Ok(Err(code));
     }
+    if budget.work_exhausted() {
+        // The request decoded all it may (refused partitions' work included): the rest
+        // are refused without decoding.
+        return Ok(Err(ERROR_MESSAGE_TOO_LARGE));
+    }
     let mark = budget.charged();
     let e = match parse_record_batch_with_metadata(batch, budget) {
         Ok(parsed) => return Ok(Ok(parsed)),
@@ -386,10 +411,10 @@ fn decode_partition(
     };
     let code = match budget.exhausted() {
         Some(Exhausted::Global) => return Err(DecodeFailure::Busy(budget.wanted())),
-        Some(Exhausted::Limit) if over_limit == OverLimit::Retry => {
+        Some(Exhausted::Limit | Exhausted::Work) if over_limit == OverLimit::Retry => {
             return Err(DecodeFailure::TooLarge)
         }
-        Some(Exhausted::Limit) => ERROR_MESSAGE_TOO_LARGE,
+        Some(Exhausted::Limit | Exhausted::Work) => ERROR_MESSAGE_TOO_LARGE,
         None => match e {
             KafkaError::InvalidRecord { .. } | KafkaError::Protocol { .. } => {
                 e.to_kafka_error_code()
@@ -523,6 +548,79 @@ fn record_bytes(topics: &[WireTopicProduceData]) -> usize {
         .fold(0, usize::saturating_add)
 }
 
+/// The budget of a decode on an I/O thread: at most [`INLINE_DECODE_BYTES`] held and
+/// [`INLINE_DECODE_WORK_BYTES`] decoded, so that partitions refused after they decode cannot
+/// keep the thread decoding (past either the request decodes again under a large-decode
+/// slot).
+fn inline_budget() -> DecodeBudget {
+    DecodeBudget::new(INLINE_DECODE_BYTES).limit_work(INLINE_DECODE_WORK_BYTES)
+}
+
+/// One entry per partition, the last one the request names, as Kafka 3.7 keeps them
+/// (`KafkaApis.handleProduceRequest` collects a request's partitions in maps keyed by topic
+/// and partition, so a later entry replaces an earlier one, in its topic entry or in another
+/// of the same name): an earlier entry is neither decoded, written nor answered. Topic
+/// entries of one name merge into the first.
+fn last_entry_per_partition(topics: Vec<WireTopicProduceData>) -> Vec<WireTopicProduceData> {
+    let entries: usize = topics.iter().map(|t| t.partition_data.len()).sum();
+    let mut topic_at: std::collections::HashMap<kafka_protocol::messages::TopicName, usize> =
+        std::collections::HashMap::with_capacity(topics.len());
+    let mut partition_at: std::collections::HashMap<(usize, i32), usize> =
+        std::collections::HashMap::with_capacity(entries);
+    let mut out: Vec<WireTopicProduceData> = Vec::with_capacity(topics.len());
+    for mut topic in topics {
+        let partitions = std::mem::take(&mut topic.partition_data);
+        let t = *topic_at.entry(topic.name.clone()).or_insert_with(|| {
+            out.push(topic);
+            out.len() - 1
+        });
+        for partition in partitions {
+            match partition_at.entry((t, partition.index)) {
+                std::collections::hash_map::Entry::Occupied(at) => {
+                    out[t].partition_data[*at.get()] = partition;
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(out[t].partition_data.len());
+                    out[t].partition_data.push(partition);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The answers of a Produce whose `acks` Kafka refuses, in Kafka 3.7's order: what it reads
+/// of the request first ([`check_first_batches`]) fails the whole request; then a partition
+/// whose data `ProduceRequest.validateRecords` refuses gets that error
+/// ([`validate_produce_records`]); every other partition is INVALID_REQUIRED_ACKS
+/// (`ReplicaManager.appendRecords` checks acks before the log append, so records are not
+/// decoded). Partitions of unknown topics are answered UNKNOWN_TOPIC_OR_PARTITION once
+/// looked up, as every refused partition is.
+fn invalid_acks_answers(
+    topics: &[WireTopicProduceData],
+    zstd_allowed: bool,
+    has_transactional_id: bool,
+) -> Result<Vec<RefusedPartition>, DecodeFailure> {
+    check_first_batches(topics, has_transactional_id)?;
+    Ok(topics
+        .iter()
+        .flat_map(|topic| {
+            topic
+                .partition_data
+                .iter()
+                .map(|partition| RefusedPartition {
+                    topic: topic.name.to_string(),
+                    partition: partition.index,
+                    error_code: partition
+                        .records
+                        .as_ref()
+                        .and_then(|batch| validate_produce_records(batch, zstd_allowed).err())
+                        .unwrap_or(ERROR_INVALID_REQUIRED_ACKS),
+                })
+        })
+        .collect())
+}
+
 /// Decode the records of `topics` at once if that can be done on the I/O thread.
 ///
 /// A request whose batches take at most [`INLINE_DECODE_BYTES`] of memory by what they
@@ -542,12 +640,7 @@ fn decode_all_records(
     if declared_memory(topics, zstd_allowed) > INLINE_DECODE_BYTES {
         return Ok(Decode::Pending(Wait::Slot));
     }
-    match decode_records(
-        topics,
-        zstd_allowed,
-        DecodeBudget::new(INLINE_DECODE_BYTES),
-        OverLimit::Retry,
-    ) {
+    match decode_records(topics, zstd_allowed, inline_budget(), OverLimit::Retry) {
         Ok(done) => Ok(Decode::Done(done)),
         Err(DecodeFailure::TooLarge) => Ok(Decode::Pending(Wait::Slot)),
         Err(DecodeFailure::Busy(wanted)) => Ok(Decode::Pending(Wait::Budget(wanted))),
@@ -570,7 +663,7 @@ async fn decode_pending(pending: &PendingRecords) -> Result<DecodedTopics, Decod
                     decode_records(
                         topics,
                         pending.zstd_allowed,
-                        DecodeBudget::new(INLINE_DECODE_BYTES),
+                        inline_budget(),
                         OverLimit::Retry,
                     )
                 }))
@@ -584,7 +677,8 @@ async fn decode_pending(pending: &PendingRecords) -> Result<DecodedTopics, Decod
                         decode_records(
                             &topics,
                             zstd_allowed,
-                            DecodeBudget::new(MAX_DECODED_REQUEST_BYTES),
+                            DecodeBudget::new(MAX_DECODED_REQUEST_BYTES)
+                                .limit_work(SLOT_DECODE_WORK_BYTES),
                             OverLimit::Refuse,
                         )
                     })
@@ -1291,5 +1385,178 @@ mod tests {
             p.pending = None;
         }
         assert!(matches!(finish_decode(request).await, Decoded::Request(_)));
+    }
+
+    /// A gzip batch of one record of `n` zeros with LogAppendTime and maxTimestamp -1: a
+    /// few KB on the wire, it decodes `n` bytes and is then refused INVALID_TIMESTAMP.
+    fn refused_after_decoding(n: usize) -> bytes::Bytes {
+        use std::io::Write;
+        let zeros = vec![0u8; n];
+        let section = record(&[
+            &[0],
+            &v(0),
+            &v(0),
+            &v(-1),
+            &v(i64::try_from(n).unwrap()),
+            &zeros,
+            &v(0),
+        ]);
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        gz.write_all(&section).unwrap();
+        batch_with(
+            &gz.finish().unwrap(),
+            1,
+            Header {
+                attributes: 0x09,
+                max_timestamp: Some(-1),
+                ..Header::default()
+            },
+        )
+    }
+
+    #[test]
+    fn refused_partitions_count_against_the_inline_decode_work() {
+        use crate::kafka::constants::ERROR_INVALID_TIMESTAMP;
+        // One partition decoding 1 MB and refused decodes inline.
+        assert_eq!(
+            outcome(vec![refused_after_decoding(1 << 20)], true),
+            Ok((vec![], vec![(0, ERROR_INVALID_TIMESTAMP)]))
+        );
+        // Eight declare little but would decode 8 MB on the I/O thread: left to a slot.
+        let data = topics(vec![refused_after_decoding(1 << 20); 8]);
+        assert!(declared_memory(&data, true) <= INLINE_DECODE_BYTES);
+        assert!(matches!(
+            decode_all_records(&data, true, false),
+            Ok(Decode::Pending(Wait::Slot))
+        ));
+    }
+
+    #[test]
+    fn refused_partitions_count_against_the_slot_decode_work() {
+        use crate::kafka::constants::ERROR_INVALID_TIMESTAMP;
+        // Against a 3 MB limit and 6 MB of work, partitions decoding 1 MB each and refused:
+        // a few decode, the rest are refused without decoding (the valid last one too).
+        let mut batches = vec![refused_after_decoding(1 << 20); 20];
+        batches.push(batch_of(1, 1));
+        let data = topics(batches);
+        let budget = DecodeBudget::new(3_000_000).limit_work(6_000_000);
+        let DecodedTopics(topic_data, refused, _) =
+            decode_records(&data, true, budget, OverLimit::Refuse).unwrap();
+        assert!(topic_data.is_empty());
+        let codes: Vec<i16> = refused.iter().map(|r| r.error_code).collect();
+        let decoded = codes
+            .iter()
+            .take_while(|&&c| c == ERROR_INVALID_TIMESTAMP)
+            .count();
+        assert!((1..=6).contains(&decoded), "{codes:?}");
+        assert!(
+            codes[decoded..]
+                .iter()
+                .all(|&c| c == ERROR_MESSAGE_TOO_LARGE),
+            "{codes:?}"
+        );
+        assert_eq!(codes.len(), 21);
+        // The slot's work limit, four times the request limit, leaves room for a partition
+        // refused at the request limit besides partitions that fit.
+        assert_eq!(SLOT_DECODE_WORK_BYTES, 4 * MAX_DECODED_REQUEST_BYTES);
+        let limit = 3_000_000;
+        let budget = DecodeBudget::new(limit).limit_work(4 * limit);
+        let data = topics(vec![
+            refused_after_decoding(limit + 1),
+            refused_after_decoding(1_500_000),
+            batch_of(1000, 1000),
+        ]);
+        let DecodedTopics(topic_data, refused, _) =
+            decode_records(&data, true, budget, OverLimit::Refuse).unwrap();
+        let refused: Vec<(i32, i16)> = refused
+            .iter()
+            .map(|r| (r.partition, r.error_code))
+            .collect();
+        assert_eq!(
+            refused,
+            vec![(0, ERROR_MESSAGE_TOO_LARGE), (1, ERROR_INVALID_TIMESTAMP)]
+        );
+        assert_eq!(topic_data[0].partitions[0].partition_index, 2);
+    }
+
+    /// Each topic's partitions and their data, in order.
+    type Kept<'a> = Vec<(String, Vec<(i32, &'a [u8])>)>;
+
+    #[test]
+    fn only_the_last_entry_of_a_partition_is_kept() {
+        let entry = |index, data: &'static [u8]| {
+            let mut p = WirePartition::default();
+            p.index = index;
+            p.records = Some(bytes::Bytes::from_static(data));
+            p
+        };
+        let topic = |name: &'static str, partitions| {
+            let mut t = WireTopic::default();
+            t.name = kafka_protocol::messages::TopicName(name.into());
+            t.partition_data = partitions;
+            t
+        };
+        let kept = last_entry_per_partition(vec![
+            topic("a", vec![entry(0, b"1"), entry(1, b"2"), entry(0, b"3")]),
+            topic("b", vec![entry(0, b"4")]),
+            topic("a", vec![entry(1, b"5"), entry(2, b"6")]),
+            topic("c", vec![]),
+        ]);
+        let got: Kept<'_> = kept
+            .iter()
+            .map(|t| {
+                (
+                    t.name.to_string(),
+                    t.partition_data
+                        .iter()
+                        .map(|p| (p.index, &p.records.as_ref().unwrap()[..]))
+                        .collect(),
+                )
+            })
+            .collect();
+        let want: Kept<'_> = vec![
+            ("a".into(), vec![(0, b"3"), (1, b"5"), (2, b"6")]),
+            ("b".into(), vec![(0, b"4")]),
+            ("c".into(), vec![]),
+        ];
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn invalid_acks_are_answered_after_kafkas_earlier_checks() {
+        use crate::kafka::constants::{ERROR_INVALID_RECORD, ERROR_INVALID_REQUIRED_ACKS};
+        let good = batch_of(1, 1);
+        let mut bad_crc = good.to_vec();
+        *bad_crc.last_mut().unwrap() ^= 1;
+        let two = bytes::Bytes::from([&good[..], &good[..]].concat());
+        let answers = invalid_acks_answers(
+            &topics(vec![bad_crc.into(), two, good.clone()]),
+            true,
+            false,
+        )
+        .unwrap();
+        let codes: Vec<(i32, i16)> = answers
+            .iter()
+            .map(|r| (r.partition, r.error_code))
+            .collect();
+        assert_eq!(
+            codes,
+            vec![
+                (0, ERROR_INVALID_REQUIRED_ACKS),
+                (1, ERROR_INVALID_RECORD),
+                (2, ERROR_INVALID_REQUIRED_ACKS)
+            ]
+        );
+        let mut short_length = good.to_vec();
+        short_length[8..12].copy_from_slice(&13i32.to_be_bytes());
+        assert_eq!(
+            invalid_acks_answers(&topics(vec![short_length.into()]), true, false).unwrap_err(),
+            DecodeFailure::Rejected(ERROR_CORRUPT_MESSAGE)
+        );
+        assert_eq!(
+            invalid_acks_answers(&topics(vec![good, transactional_batch()]), true, false)
+                .unwrap_err(),
+            DecodeFailure::Rejected(ERROR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED)
+        );
     }
 }

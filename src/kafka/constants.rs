@@ -286,6 +286,9 @@ pub const ERROR_DUPLICATE_SEQUENCE_NUMBER: i16 = 46;
 pub const ERROR_INVALID_PRODUCER_EPOCH: i16 = 47;
 /// INVALID_TXN_STATE: an invalid transaction state transition.
 pub const ERROR_INVALID_TXN_STATE: i16 = 48;
+/// INVALID_PRODUCER_ID_MAPPING: the producer id does not own the transactional id (or the
+/// transactional id is unknown, on Produce).
+pub const ERROR_INVALID_PRODUCER_ID_MAPPING: i16 = 49;
 /// INVALID_TRANSACTION_TIMEOUT: an InitProducerId timeout <= 0 or above
 /// `transaction.max.timeout.ms`.
 pub const ERROR_INVALID_TRANSACTION_TIMEOUT: i16 = 50;
@@ -439,6 +442,7 @@ mod tests {
         assert_eq!(ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER, 45);
         assert_eq!(ERROR_DUPLICATE_SEQUENCE_NUMBER, 46);
         assert_eq!(ERROR_INVALID_TXN_STATE, 48);
+        assert_eq!(ERROR_INVALID_PRODUCER_ID_MAPPING, 49);
         assert_eq!(ERROR_CONCURRENT_TRANSACTIONS, 51);
         assert_eq!(ERROR_UNKNOWN_PRODUCER_ID, 59);
         assert_eq!(ERROR_PRODUCER_FENCED, 90);

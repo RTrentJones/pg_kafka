@@ -46,6 +46,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         invisible_offsets::test_consumers_pass_delete_records_gap,
         invisible_offsets::test_read_committed_consumer_stops_at_open_transaction,
         validation::test_transactional_requests_are_validated,
+        validation::test_transactional_produce_is_validated_per_partition,
         timeouts::test_second_transaction_gets_its_own_timeout,
         timeouts::test_timeout_abort_fences_an_exhausted_epoch,
         producer_epochs::test_init_producer_id_checks_the_presented_epoch,

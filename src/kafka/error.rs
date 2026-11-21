@@ -8,11 +8,11 @@ use thiserror::Error;
 
 use crate::kafka::constants::{
     ERROR_COORDINATOR_NOT_AVAILABLE, ERROR_CORRUPT_MESSAGE, ERROR_DUPLICATE_SEQUENCE_NUMBER,
-    ERROR_ILLEGAL_GENERATION, ERROR_INVALID_PARTITIONS, ERROR_INVALID_RECORD,
-    ERROR_INVALID_TOPIC_EXCEPTION, ERROR_INVALID_TXN_STATE, ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER,
-    ERROR_PRODUCER_FENCED, ERROR_REBALANCE_IN_PROGRESS, ERROR_TRANSACTIONAL_ID_NOT_FOUND,
-    ERROR_UNKNOWN_MEMBER_ID, ERROR_UNKNOWN_PRODUCER_ID, ERROR_UNKNOWN_SERVER_ERROR,
-    ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+    ERROR_ILLEGAL_GENERATION, ERROR_INVALID_PARTITIONS, ERROR_INVALID_PRODUCER_ID_MAPPING,
+    ERROR_INVALID_RECORD, ERROR_INVALID_TOPIC_EXCEPTION, ERROR_INVALID_TXN_STATE,
+    ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER, ERROR_PRODUCER_FENCED, ERROR_REBALANCE_IN_PROGRESS,
+    ERROR_TRANSACTIONAL_ID_NOT_FOUND, ERROR_UNKNOWN_MEMBER_ID, ERROR_UNKNOWN_PRODUCER_ID,
+    ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
 };
 
 /// A failed request, typed by what went wrong; [`KafkaError::to_kafka_error_code`] gives the
@@ -93,6 +93,10 @@ pub enum KafkaError {
         expected_epoch: i16,
     },
 
+    /// The producer id does not own the transactional id (another producer id does).
+    #[error("Producer {producer_id} does not own the transactional id")]
+    InvalidProducerIdMapping { producer_id: i64 },
+
     /// Unknown producer ID (producer ID not found in storage)
     #[error("Unknown producer ID: {producer_id}")]
     UnknownProducerId { producer_id: i64 },
@@ -163,6 +167,7 @@ impl KafkaError {
             KafkaError::DuplicateSequence { .. } => ERROR_DUPLICATE_SEQUENCE_NUMBER,
             KafkaError::OutOfOrderSequence { .. } => ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER,
             KafkaError::ProducerFenced { .. } => ERROR_PRODUCER_FENCED,
+            KafkaError::InvalidProducerIdMapping { .. } => ERROR_INVALID_PRODUCER_ID_MAPPING,
             KafkaError::UnknownProducerId { .. } => ERROR_UNKNOWN_PRODUCER_ID,
 
             KafkaError::TransactionalIdNotFound { .. } => ERROR_TRANSACTIONAL_ID_NOT_FOUND,
@@ -254,6 +259,11 @@ impl KafkaError {
             epoch,
             expected_epoch,
         }
+    }
+
+    /// A [`KafkaError::InvalidProducerIdMapping`].
+    pub fn invalid_producer_id_mapping(producer_id: i64) -> Self {
+        KafkaError::InvalidProducerIdMapping { producer_id }
     }
 
     /// An [`KafkaError::UnknownProducerId`].
@@ -392,6 +402,12 @@ mod tests {
                 ERROR_PRODUCER_FENCED,
                 false,
                 "Producer fenced: producer 100 epoch 1 is older than current epoch 2",
+            ),
+            (
+                KafkaError::invalid_producer_id_mapping(998),
+                ERROR_INVALID_PRODUCER_ID_MAPPING,
+                false,
+                "998",
             ),
             (
                 KafkaError::unknown_producer_id(999),

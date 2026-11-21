@@ -34,10 +34,16 @@ This document lists intentional deviations from the official Kafka protocol spec
 - Errors are not returned to the client (per acks=0 contract); as in Kafka, any error
   (a partition error, a corrupt batch, a failed commit) **closes the connection** after the
   partitions that succeeded are committed, so the client refreshes its metadata
-- `acks` other than -1, 0 and 1 is answered `INVALID_REQUIRED_ACKS` (21) on every
-  partition and nothing is written, as in Kafka
+- `acks` other than -1, 0 and 1 is answered `INVALID_REQUIRED_ACKS` (21) and nothing is
+  written, as in Kafka, after the checks Kafka makes first: a first batch it cannot size
+  (CORRUPT_MESSAGE) or a transactional batch without a transactional id
+  (TRANSACTIONAL_ID_AUTHORIZATION_FAILED) on every partition, then per partition an unknown
+  topic or partition (UNKNOWN_TOPIC_OR_PARTITION) and data that is not one RecordBatch v2
+  or zstd before v7 (INVALID_RECORD, UNSUPPORTED_COMPRESSION_TYPE); every other partition is
+  INVALID_REQUIRED_ACKS whatever its records hold (they are not decoded)
 - Long-polling consumers are notified if write succeeds
-- Idempotency/transactional validation is intentionally skipped for acks=0
+- Idempotent sequences and transactions are checked as with acks >= 1, as in Kafka: an
+  out-of-sequence or refused transactional batch is an error, which closes the connection
 
 **Trade-offs:**
 - True fire-and-forget semantics (client doesn't wait)
@@ -97,6 +103,22 @@ pg_kafka.compression_type = 'gzip'
   error). Kafka has no such limit on decoding: when its request queue is full
   (`queued.max.requests`, 500) or it lacks memory for requests (`queued.max.request.bytes`,
   unbounded by default) it stops reading connections, and its clients time out on their own. An acks=0 request that times out closes its connection.
+- The decoding work of a request is bounded as well as its memory: every byte its decode
+  charged counts, given back or not, so partitions refused after they decoded (INVALID_TIMESTAMP,
+  a record count that does not match, MESSAGE_TOO_LARGE at the limit) cannot make one request
+  decode without end. On a network I/O thread a request may decode 6 MiB (three times the
+  2 MiB it may hold there); past that it decodes again off the I/O threads. There it may
+  decode 400 MB (four times the 100 MB it may hold: what a request that fits takes, and room
+  for refused partitions besides); past that its other partitions are refused
+  MESSAGE_TOO_LARGE without decoding (UNKNOWN_TOPIC_OR_PARTITION for those of an unknown
+  topic). Kafka decodes every partition on its request handler threads; only a request of
+  several partitions that each decode large batches and are refused is answered differently.
+- As in Kafka 3.7 (`KafkaApis.handleProduceRequest` collects a request's partitions in maps),
+  a partition named more than once in a request, in one topic entry or in several, is
+  answered once, for its last entry; the earlier entries are neither decoded nor written.
+  Kafka also answers the error of an earlier entry that fails `ProduceRequest.validateRecords`
+  (data that is not one RecordBatch v2, zstd before v7) while it writes the last one;
+  pg_kafka answers and writes the last entry only.
 - zstd frames may declare a window of at most 2^27 bytes (128 MiB), as in Kafka; a decoder's
   window counts toward that limit as it fills (as much again as the decoded bytes, up to the
   window). A larger window is CORRUPT_MESSAGE (Kafka 3.7: UNKNOWN_SERVER_ERROR). zstd on
@@ -206,6 +228,20 @@ pg_kafka.compression_type = 'gzip'
   INVALID_TXN_STATE (48), as Kafka 3.6+ does. AddPartitionsToTxn does not create topics: an
   unknown topic or partition is UNKNOWN_TOPIC_OR_PARTITION and the request's other
   partitions get OPERATION_NOT_ATTEMPTED (55), nothing is added
+- ✅ A transactional Produce is checked per partition, as Kafka 3.7 verifies the
+  transactional batches of a request with its transaction coordinator: a partition whose
+  batch is transactional is refused INVALID_PRODUCER_ID_MAPPING (49) when the
+  transactional id is unknown or another producer id owns it, INVALID_PRODUCER_EPOCH (47)
+  for another epoch, and INVALID_TXN_STATE (48) when the transaction does not hold the
+  partition; a plain or idempotent batch in the same request is written as it would be
+  without the transactional id (committed, outside the transaction). AddPartitionsToTxn,
+  AddOffsetsToTxn, TxnOffsetCommit and EndTxn answer another producer id
+  INVALID_PRODUCER_ID_MAPPING too, as Kafka does. **Deviation:** a transactional id whose
+  transaction is not Ongoing (none was started with AddPartitionsToTxn, or it is complete)
+  refuses its transactional batches INVALID_TXN_STATE; Kafka answers so for a partition
+  the transaction does not hold, which is the same case for every client. Another epoch on
+  AddPartitionsToTxn, AddOffsetsToTxn and TxnOffsetCommit is PRODUCER_FENCED (90); Kafka 3.7
+  answers INVALID_PRODUCER_EPOCH (47)
 - ✅ InitProducerId refuses a transaction timeout <= 0 or above
   `pg_kafka.transaction_max_timeout_ms` (Kafka's `transaction.max.timeout.ms`, default
   900000) with INVALID_TRANSACTION_TIMEOUT (50)
