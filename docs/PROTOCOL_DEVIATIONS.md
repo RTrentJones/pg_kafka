@@ -239,9 +239,12 @@ pg_kafka.compression_type = 'gzip'
   transactional id without state, INVALID_PRODUCER_ID_MAPPING too, as Kafka does. **Deviation:** a transactional id whose
   transaction is not Ongoing (none was started with AddPartitionsToTxn, or it is complete)
   refuses its transactional batches INVALID_TXN_STATE; Kafka answers so for a partition
-  the transaction does not hold, which is the same case for every client. Another epoch on
-  AddPartitionsToTxn, AddOffsetsToTxn and TxnOffsetCommit is PRODUCER_FENCED (90); Kafka 3.7
-  answers INVALID_PRODUCER_EPOCH (47)
+  the transaction does not hold, which is the same case for every client.
+- ✅ A fenced producer epoch (another epoch than the transactional id's current one) is
+  answered by request version as Kafka 3.7 answers it (KIP-588): PRODUCER_FENCED (90) on
+  AddPartitionsToTxn, AddOffsetsToTxn and EndTxn from v2 and on InitProducerId from v4,
+  INVALID_PRODUCER_EPOCH (47) on the versions before, and INVALID_PRODUCER_EPOCH on every
+  TxnOffsetCommit and Produce version
 - ✅ InitProducerId refuses a transaction timeout <= 0 or above
   `pg_kafka.transaction_max_timeout_ms` (Kafka's `transaction.max.timeout.ms`, default
   900000) with INVALID_TRANSACTION_TIMEOUT (50)
@@ -249,7 +252,7 @@ pg_kafka.compression_type = 'gzip'
   Kafka 3.7 answers it: the transactional id's current producer at its current epoch is
   bumped to the next epoch; a retry of that bump (the epoch before it) gets the same
   epoch back without another bump; any other presented id or epoch (a fenced zombie) is
-  PRODUCER_FENCED (90) and changes nothing. A presented id without an epoch, or the
+  fenced (PRODUCER_FENCED, INVALID_PRODUCER_EPOCH before v4) and changes nothing. A presented id without an epoch, or the
   reverse, is INVALID_REQUEST (42). An InitProducerId presenting none (-1/-1) fences
   the previous producer, after which its retry is fenced too. An idempotent producer
   always gets a new producer id. **Deviation:** a retry of a re-init that moved the

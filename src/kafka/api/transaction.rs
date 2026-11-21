@@ -17,11 +17,34 @@ use kafka_protocol::messages::TopicName;
 
 use super::produce::notify_best_effort;
 use super::{ApiEnv, ApiSchema, Call, KafkaApi, Rejection, RequestHeader, TopicPartitions};
-use crate::kafka::constants::ERROR_INVALID_REQUEST;
+use crate::kafka::constants::{
+    ERROR_INVALID_PRODUCER_EPOCH, ERROR_INVALID_REQUEST, ERROR_PRODUCER_FENCED,
+};
 use crate::kafka::dispatch::RequestOutcome;
 use crate::kafka::handlers;
 use crate::kafka::messages::TxnOffsetCommitTopics;
 use crate::kafka::notifications::InternalNotification;
+
+/// The code a fenced producer epoch is answered with at `version`. KIP-588 (Kafka 2.7)
+/// answers it PRODUCER_FENCED from the version each transaction API took for it,
+/// `fenced_since`; Kafka 3.7 converts it to INVALID_PRODUCER_EPOCH for the versions
+/// before (`KafkaApis`), the code older clients know. Any other code is unchanged.
+fn fenced_code(code: i16, version: i16, fenced_since: i16) -> i16 {
+    if code == ERROR_PRODUCER_FENCED && version < fenced_since {
+        ERROR_INVALID_PRODUCER_EPOCH
+    } else {
+        code
+    }
+}
+
+/// The first InitProducerId version answered PRODUCER_FENCED.
+const INIT_PRODUCER_ID_FENCED_SINCE: i16 = 4;
+/// The first AddPartitionsToTxn, AddOffsetsToTxn and EndTxn version answered
+/// PRODUCER_FENCED.
+const TXN_FENCED_SINCE: i16 = 2;
+/// TxnOffsetCommit is never answered PRODUCER_FENCED: Kafka 3.7's group coordinator
+/// answers a fenced epoch INVALID_PRODUCER_EPOCH at every version.
+const TXN_OFFSET_COMMIT_FENCED_SINCE: i16 = i16::MAX;
 
 /// InitProducerId: allocate a producer id and epoch. An idempotent producer always gets
 /// a new id; for a transactional id the producer id and epoch the request presents
@@ -46,12 +69,12 @@ impl ApiSchema for InitProducerIdApi {
     const MIN_VERSION: i16 = 0;
     const MAX_VERSION: i16 = 4;
 
-    fn error_response(
-        _echo: Option<&()>,
-        _version: i16,
-        error_code: i16,
-    ) -> InitProducerIdResponse {
-        crate::kafka::response_builders::build_init_producer_id_error_response(error_code)
+    fn error_response(_echo: Option<&()>, version: i16, error_code: i16) -> InitProducerIdResponse {
+        crate::kafka::response_builders::build_init_producer_id_error_response(fenced_code(
+            error_code,
+            version,
+            INIT_PRODUCER_ID_FENCED_SINCE,
+        ))
     }
 
     fn response_has_error(response: &InitProducerIdResponse) -> bool {
@@ -96,6 +119,14 @@ impl KafkaApi for InitProducerIdApi {
                 r.presented,
                 header.client_id.as_deref(),
             )
+            .map(|mut response| {
+                response.error_code = fenced_code(
+                    response.error_code,
+                    header.api_version,
+                    INIT_PRODUCER_ID_FENCED_SINCE,
+                );
+                response
+            })
         })
     }
 }
@@ -126,9 +157,10 @@ impl ApiSchema for AddPartitionsToTxnApi {
     /// Top-level error code (v4+) plus the code on every requested partition (v0-3).
     fn error_response(
         echo: Option<&TopicPartitions>,
-        _version: i16,
+        version: i16,
         error_code: i16,
     ) -> AddPartitionsToTxnResponse {
+        let error_code = fenced_code(error_code, version, TXN_FENCED_SINCE);
         let mut response = AddPartitionsToTxnResponse::default();
         response.throttle_time_ms = 0;
         response.error_code = error_code;
@@ -214,7 +246,7 @@ impl KafkaApi for AddPartitionsToTxnApi {
     }
 
     fn handle(request: Self::Request, call: Call<Self>, env: &ApiEnv<'_>) -> RequestOutcome {
-        call.run(request, |r, _| {
+        call.run(request, |r, header| {
             handlers::handle_add_partitions_to_txn(
                 &env.ctx,
                 &r.transactional_id,
@@ -222,6 +254,18 @@ impl KafkaApi for AddPartitionsToTxnApi {
                 r.producer_epoch,
                 &r.topics,
             )
+            .map(|mut response| {
+                // A refused transaction is answered on every partition.
+                for p in response
+                    .results_by_topic_v3_and_below
+                    .iter_mut()
+                    .flat_map(|t| t.results_by_partition.iter_mut())
+                {
+                    p.partition_error_code =
+                        fenced_code(p.partition_error_code, header.api_version, TXN_FENCED_SINCE);
+                }
+                response
+            })
         })
     }
 }
@@ -251,12 +295,12 @@ impl ApiSchema for AddOffsetsToTxnApi {
 
     fn error_response(
         _echo: Option<&()>,
-        _version: i16,
+        version: i16,
         error_code: i16,
     ) -> AddOffsetsToTxnResponse {
         let mut response = AddOffsetsToTxnResponse::default();
         response.throttle_time_ms = 0;
-        response.error_code = error_code;
+        response.error_code = fenced_code(error_code, version, TXN_FENCED_SINCE);
         response
     }
 
@@ -318,10 +362,10 @@ impl ApiSchema for EndTxnApi {
     const MIN_VERSION: i16 = 0;
     const MAX_VERSION: i16 = 3;
 
-    fn error_response(_echo: Option<&()>, _version: i16, error_code: i16) -> EndTxnResponse {
+    fn error_response(_echo: Option<&()>, version: i16, error_code: i16) -> EndTxnResponse {
         let mut response = EndTxnResponse::default();
         response.throttle_time_ms = 0;
-        response.error_code = error_code;
+        response.error_code = fenced_code(error_code, version, TXN_FENCED_SINCE);
         response
     }
 
@@ -406,9 +450,10 @@ impl ApiSchema for TxnOffsetCommitApi {
     /// would read as success).
     fn error_response(
         echo: Option<&TxnOffsetCommitTopics>,
-        _version: i16,
+        version: i16,
         error_code: i16,
     ) -> TxnOffsetCommitResponse {
+        let error_code = fenced_code(error_code, version, TXN_OFFSET_COMMIT_FENCED_SINCE);
         match echo {
             Some(topics) => handlers::txn_offset_commit_error_response(topics, error_code),
             None => TxnOffsetCommitResponse::default(),
@@ -509,6 +554,58 @@ mod tests {
             Err(Rejection::Reply { error_code, .. }) => Err(error_code),
             Err(_) => Err(i16::MIN),
         }
+    }
+
+    #[test]
+    fn a_fenced_epoch_is_invalid_producer_epoch_before_kip_588_versions() {
+        use crate::kafka::constants::{ERROR_INVALID_PRODUCER_ID_MAPPING, ERROR_NONE};
+        let fenced =
+            |version| (0..4).map(move |since| fenced_code(ERROR_PRODUCER_FENCED, version, since));
+        assert_eq!(
+            fenced(2).collect::<Vec<_>>(),
+            [
+                ERROR_PRODUCER_FENCED,
+                ERROR_PRODUCER_FENCED,
+                ERROR_PRODUCER_FENCED,
+                ERROR_INVALID_PRODUCER_EPOCH
+            ]
+        );
+        for code in [
+            ERROR_NONE,
+            ERROR_INVALID_PRODUCER_ID_MAPPING,
+            ERROR_INVALID_PRODUCER_EPOCH,
+        ] {
+            assert_eq!(fenced_code(code, 0, 2), code);
+        }
+        let answers = |version| {
+            let end = EndTxnApi::error_response(None, version, ERROR_PRODUCER_FENCED).error_code;
+            let offsets =
+                AddOffsetsToTxnApi::error_response(None, version, ERROR_PRODUCER_FENCED).error_code;
+            let echo: TopicPartitions = vec![("t".to_string(), vec![0])];
+            let partitions =
+                AddPartitionsToTxnApi::error_response(Some(&echo), version, ERROR_PRODUCER_FENCED);
+            let init =
+                InitProducerIdApi::error_response(None, version, ERROR_PRODUCER_FENCED).error_code;
+            let commit_echo: TxnOffsetCommitTopics = vec![("t".to_string(), vec![(0, 1, None)])];
+            let commit = TxnOffsetCommitApi::error_response(
+                Some(&commit_echo),
+                version,
+                ERROR_PRODUCER_FENCED,
+            );
+            (
+                end,
+                offsets,
+                partitions.results_by_topic_v3_and_below[0].results_by_partition[0]
+                    .partition_error_code,
+                init,
+                commit.topics[0].partitions[0].error_code,
+            )
+        };
+        let (old, new) = (ERROR_INVALID_PRODUCER_EPOCH, ERROR_PRODUCER_FENCED);
+        assert_eq!(answers(1), (old, old, old, old, old));
+        assert_eq!(answers(2), (new, new, new, old, old));
+        assert_eq!(answers(3), (new, new, new, old, old));
+        assert_eq!(answers(4), (new, new, new, new, old));
     }
 
     #[test]
