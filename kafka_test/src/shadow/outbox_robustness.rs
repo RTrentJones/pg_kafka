@@ -348,32 +348,42 @@ pub async fn test_shadow_timed_out_transaction_buffer_is_dropped() -> TestResult
         .await
         .map_err(|(e, _)| e)?;
 
-    println!("Step 2: wait for the sweep (every 10 s) to abort it...");
+    // The log line does not name the transaction (a sweep can drop the buffer of
+    // another test's abandoned transaction too), so this transaction's abort is
+    // awaited as well: once the sweep that aborted it has run, its buffer is gone,
+    // and the line is in the log.
+    println!("Step 2: wait for the sweep (every 10 s) to abort it and drop its buffer...");
     let needle = "forward buffer(s) of transactions that are no longer open";
     let start = Instant::now();
     loop {
-        if log.since(log_from).contains(needle) {
+        let state: Option<String> = ctx
+            .db()
+            .query_opt(
+                "SELECT state FROM kafka.transactions WHERE transactional_id = $1",
+                &[&txn_id],
+            )
+            .await?
+            .map(|row| row.get(0));
+        let aborted = state.as_deref() == Some("CompleteAbort");
+        if aborted && log.since(log_from).contains(needle) {
             break;
         }
         if start.elapsed() > Duration::from_secs(40) {
             drop(producer);
             ctx.cleanup().await?;
             return Err(format!(
-                "no \"{needle}\" in the server log within 40 s: the sweep kept the buffer"
+                "within 40 s the transaction is {state:?} (expected CompleteAbort) and \
+                 \"{needle}\" is {}in the server log",
+                if log.since(log_from).contains(needle) {
+                    ""
+                } else {
+                    "not "
+                }
             )
             .into());
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    let state: String = ctx
-        .db()
-        .query_one(
-            "SELECT state FROM kafka.transactions WHERE transactional_id = $1",
-            &[&txn_id],
-        )
-        .await?
-        .get(0);
-    assert_eq!(state, "CompleteAbort");
     println!("  buffer dropped after {:?}", start.elapsed());
 
     drop(producer);
