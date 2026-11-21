@@ -303,7 +303,11 @@ pg_kafka.compression_type = 'gzip'
   transaction did not add with AddOffsetsToTxn it is INVALID_TXN_STATE (48) on every
   partition and version and stores nothing, as in Kafka 3.7. **Deviation:** Kafka verifies
   the group's `__consumer_offsets` partition, so a group sharing that partition with an
-  added one is accepted there; pg_kafka checks the group itself
+  added one is accepted there; pg_kafka checks the group itself. As in Kafka 3.7, the
+  transaction is checked before the group member: a fenced or unknown producer, a
+  transaction that is not ongoing and a group not added win over a stale generation or an
+  unknown member id (UNKNOWN_MEMBER_ID / ILLEGAL_GENERATION only once the transaction checks
+  out)
 - ✅ Read-committed isolation level filters pending/aborted messages
 - ✅ Transactional producer fencing via epoch
 

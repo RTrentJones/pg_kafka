@@ -655,3 +655,91 @@ fn test_txn_offset_commit_store_error() {
         ERROR_UNKNOWN_SERVER_ERROR
     );
 }
+
+// ========== TxnOffsetCommit check order (Kafka 3.7) ==========
+
+/// A TxnOffsetCommit from a stale member ("zombie", generation 5) of a group the
+/// coordinator does not know, answered with the codes of its partition.
+fn zombie_txn_offset_commit(
+    mock: &MockKafkaStore,
+    group_id: &str,
+    producer_epoch: i16,
+) -> crate::kafka::error::Result<Vec<i16>> {
+    let env = TestEnv::new();
+    let ctx = env.ctx(mock);
+    let topics = vec![("test-topic".to_string(), vec![(0, 1i64, None)])];
+    transaction::handle_txn_offset_commit(
+        &ctx,
+        "txn-1",
+        1000,
+        producer_epoch,
+        group_id,
+        5,
+        "zombie",
+        topics,
+    )
+    .map(|response| {
+        response
+            .topics
+            .iter()
+            .flat_map(|t| t.partitions.iter())
+            .map(|p| p.error_code)
+            .collect()
+    })
+}
+
+/// Kafka 3.7 verifies the transaction before the member: a group the Ongoing transaction
+/// did not add is INVALID_TXN_STATE even when the generation is stale.
+#[test]
+fn test_txn_offset_commit_group_not_added_wins_over_stale_generation() {
+    let mut mock = MockKafkaStore::new();
+    mock.expect_validate_transaction()
+        .times(1)
+        .returning(|_, _, _| Ok(()));
+    mock.expect_get_transaction_state()
+        .returning(|_| Ok(Some(TransactionState::Ongoing)));
+    mock.expect_txn_has_group()
+        .times(1)
+        .returning(|_, _| Ok(false));
+    mock.expect_store_txn_pending_offset().never();
+    assert_eq!(
+        zombie_txn_offset_commit(&mock, "consumer-group", 0).unwrap(),
+        vec![ERROR_INVALID_TXN_STATE]
+    );
+}
+
+/// A fenced producer epoch wins over a stale generation: the fence error (answered as
+/// INVALID_PRODUCER_EPOCH or PRODUCER_FENCED by version), not UNKNOWN_MEMBER_ID.
+#[test]
+fn test_txn_offset_commit_fenced_epoch_wins_over_stale_generation() {
+    let mut mock = MockKafkaStore::new();
+    mock.expect_validate_transaction()
+        .times(1)
+        .returning(|_, _, _| Err(KafkaError::producer_fenced(1000, 0, 1)));
+    mock.expect_txn_has_group().never();
+    mock.expect_store_txn_pending_offset().never();
+    match zombie_txn_offset_commit(&mock, "consumer-group", 0) {
+        Err(KafkaError::ProducerFenced { .. }) => {}
+        other => panic!("Expected ProducerFenced, got {other:?}"),
+    }
+}
+
+/// Once the transaction and the group check out, an unknown member is UNKNOWN_MEMBER_ID
+/// and nothing is stored; the transaction was verified first.
+#[test]
+fn test_txn_offset_commit_added_group_unknown_member() {
+    let mut mock = MockKafkaStore::new();
+    mock.expect_validate_transaction()
+        .times(1)
+        .returning(|_, _, _| Ok(()));
+    mock.expect_get_transaction_state()
+        .returning(|_| Ok(Some(TransactionState::Ongoing)));
+    mock.expect_txn_has_group()
+        .times(1)
+        .returning(|_, _| Ok(true));
+    mock.expect_store_txn_pending_offset().never();
+    assert_eq!(
+        zombie_txn_offset_commit(&mock, "consumer-group", 0).unwrap(),
+        vec![ERROR_UNKNOWN_MEMBER_ID]
+    );
+}

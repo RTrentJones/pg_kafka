@@ -298,23 +298,10 @@ pub fn handle_txn_offset_commit(
     // with its last entry, and answered once.
     let topics: TxnOffsetCommitTopics = merge_by_partition(topics, |p| p.0);
 
-    // Fence a zombie EOS consumer. A member committing offsets inside a
-    // transaction with a stale group generation (or an unknown member id) must be
-    // rejected with ILLEGAL_GENERATION / UNKNOWN_MEMBER_ID, the same fence as on the
-    // non-transactional OffsetCommit path. The producer-epoch fence
-    // alone does not cover KIP-447 (the new owner uses a *different*
-    // transactional_id, so the zombie keeps a valid epoch). Simple consumers /
-    // pre-v3 clients (generation -1) are exempt inside validate_commit.
-    if let Err(e) = ctx
-        .coordinator
-        .validate_commit(group_id, member_id, generation_id)
-    {
-        return Ok(txn_offset_commit_error_response(
-            &topics,
-            e.to_kafka_error_code(),
-        ));
-    }
-
+    // The transaction comes first, as in Kafka 3.7 (GroupCoordinator.handleTxnCommitOffsets
+    // verifies the producer and the transaction before it looks at the group): a fenced
+    // or unknown producer, a transaction that is not ongoing, or a group the transaction
+    // has not added wins over a stale generation or an unknown member.
     validate_ongoing_transaction(
         store,
         transactional_id,
@@ -329,6 +316,23 @@ pub fn handle_txn_offset_commit(
         return Ok(txn_offset_commit_error_response(
             &topics,
             ERROR_INVALID_TXN_STATE,
+        ));
+    }
+
+    // Then fence a zombie EOS consumer. A member committing offsets inside a
+    // transaction with a stale group generation (or an unknown member id) must be
+    // rejected with ILLEGAL_GENERATION / UNKNOWN_MEMBER_ID, the same fence as on the
+    // non-transactional OffsetCommit path. The producer-epoch fence
+    // alone does not cover KIP-447 (the new owner uses a *different*
+    // transactional_id, so the zombie keeps a valid epoch). Simple consumers /
+    // pre-v3 clients (generation -1) are exempt inside validate_commit.
+    if let Err(e) = ctx
+        .coordinator
+        .validate_commit(group_id, member_id, generation_id)
+    {
+        return Ok(txn_offset_commit_error_response(
+            &topics,
+            e.to_kafka_error_code(),
         ));
     }
 
@@ -600,8 +604,16 @@ mod tests {
         // unknown / stale group membership must be fenced with UNKNOWN_MEMBER_ID,
         // not silently accepted. The producer-epoch fence alone does not cover this
         // (KIP-447: the new owner uses a different transactional_id). The fence
-        // returns before any store access, so the mock needs no expectations.
-        let store = MockKafkaStore::new();
+        // comes after the transaction checks and before any offset is stored.
+        let mut store = MockKafkaStore::new();
+        store
+            .expect_validate_transaction()
+            .returning(|_, _, _| Ok(()));
+        store
+            .expect_get_transaction_state()
+            .returning(|_| Ok(Some(crate::kafka::storage::TransactionState::Ongoing)));
+        store.expect_txn_has_group().returning(|_, _| Ok(true));
+        store.expect_store_txn_pending_offset().never();
         let env = TestEnv::new();
         let ctx = env.ctx(&store);
 
