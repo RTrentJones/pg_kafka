@@ -581,13 +581,10 @@ impl AuthenticateReply {
 /// [`MAX_CONCURRENT_PASSWORD_CHECKS`] at a time. An unknown user costs the same PBKDF2
 /// as a known one (against a fake credential) and then fails.
 async fn check_password(creds: super::plain::PlainCredentials, stored: StoredCredential) -> bool {
-    let Ok(_permit) = PASSWORD_CHECKS.acquire().await else {
-        return false;
-    };
     // An unknown user's fake credential imitates the stored credentials'
     // iteration count, so the PBKDF2 costs (and the response time) match a real user's
     // to within the spread of the stored iteration counts.
-    tokio::task::spawn_blocking(move || match stored {
+    limited_blocking(&PASSWORD_CHECKS, move || match stored {
         StoredCredential::Known(cred) if cred.validate().is_ok() => {
             cred.verify_password(&creds.password)
         }
@@ -603,6 +600,27 @@ async fn check_password(creds: super::plain::PlainCredentials, stored: StoredCre
     })
     .await
     .unwrap_or(false)
+}
+
+/// Run `work` on the blocking pool once `limit` has a permit, and return its result
+/// (`None` if it panicked).
+///
+/// The permit moves into the blocking task, so it is held until `work` ends even when the
+/// caller stops waiting: a connection whose pre-authentication deadline drops this future
+/// mid-check cannot free its permit while its PBKDF2 still runs, which would let
+/// unauthenticated clients run more checks at once than `limit` allows.
+async fn limited_blocking<R: Send + 'static>(
+    limit: &'static tokio::sync::Semaphore,
+    work: impl FnOnce() -> R + Send + 'static,
+) -> Option<R> {
+    // The semaphores this is used with are never closed.
+    let permit = limit.acquire().await.ok()?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
+    .ok()
 }
 
 #[cfg(test)]
@@ -1007,5 +1025,31 @@ mod tests {
             // Correlation id first.
             assert_eq!(&bytes[..4], &5i32.to_be_bytes());
         }
+    }
+
+    /// A password check whose caller stops waiting keeps its permit until the PBKDF2 ends:
+    /// a cancelled check must not let another one start alongside it.
+    #[tokio::test]
+    async fn a_cancelled_check_holds_its_permit_until_the_work_ends() {
+        static LIMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let (started, running) = tokio::sync::oneshot::channel();
+        let check = tokio::spawn(limited_blocking(&LIMIT, move || {
+            let _ = started.send(());
+            let _ = wait.recv();
+        }));
+        running.await.expect("the work started");
+        check.abort();
+        let _ = check.await;
+        assert_eq!(
+            LIMIT.available_permits(),
+            0,
+            "the permit was released while the work still ran"
+        );
+        release.send(()).expect("the work is waiting");
+        let freed = tokio::time::timeout(Duration::from_secs(10), LIMIT.acquire())
+            .await
+            .expect("the permit comes back once the work ends");
+        drop(freed);
     }
 }
